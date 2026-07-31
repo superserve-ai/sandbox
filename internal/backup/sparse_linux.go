@@ -76,8 +76,16 @@ func (r *packedReader) Read(p []byte) (int, error) {
 		}
 		n, err := r.f.ReadAt(p, ext.Offset+r.pos)
 		r.pos += int64(n)
-		if err == io.EOF && r.pos == ext.Length {
-			err = nil
+		if err == io.EOF {
+			if r.pos == ext.Length {
+				err = nil
+			} else {
+				// The file shrank under us (a newer pause rewrote it).
+				// io.EOF here would let io.Copy treat the short stream as
+				// success and finalize a truncated object; surface it as a
+				// real error instead.
+				err = ErrTruncatedSource
+			}
 		}
 		return n, err
 	}

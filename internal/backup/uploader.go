@@ -29,9 +29,13 @@ type GenerationManifest struct {
 	VMDVersion string         `json:"vmd_version,omitempty"`
 }
 
-// ManifestFile describes one packed artifact object.
+// ManifestFile describes one packed artifact object. Object is the exact
+// object name within the generation prefix, which embeds the packing
+// fingerprint: the extent table in this entry describes that object and
+// no other, even across retries that repacked a physically changed file.
 type ManifestFile struct {
 	Name       string   `json:"name"`
+	Object     string   `json:"object"`
 	SHA256     string   `json:"sha256"` // digest of the full apparent content
 	Size       int64    `json:"size"`   // apparent size
 	PackedSize int64    `json:"packed_size"`
@@ -126,7 +130,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task Task) (completed bool, _
 	for _, file := range task.Files {
 		mf, err := u.uploadFile(ctx, task, file)
 		if err != nil {
-			if os.IsNotExist(err) || errors.Is(err, errSourceChanged) {
+			if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
 				// The artifact vanished or mutated between enqueue and
 				// upload (sandbox deleted or resumed, local GC won the
 				// race). Nothing valid to back up under this content
@@ -186,7 +190,13 @@ func (u *Uploader) uploadFile(ctx context.Context, task Task, file TaskFile) (Ma
 			Msg("backup source changed since pause; abandoning generation")
 		return ManifestFile{}, errSourceChanged
 	}
-	object, err := SandboxObject(task.SandboxID, task.Generation, file.Name)
+	// The object name embeds the packing fingerprint: a retry over a
+	// physically relaid file (same apparent content, different extents)
+	// maps to a fresh object instead of deduping against bytes packed with
+	// a different table, so the manifest's extent table always describes
+	// the exact object it points at.
+	objectName := file.Name + ".p" + PackFingerprint(extents, apparent)
+	object, err := SandboxObject(task.SandboxID, task.Generation, objectName)
 	if err != nil {
 		return ManifestFile{}, err
 	}
@@ -209,6 +219,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task Task, file TaskFile) (Ma
 	}
 	return ManifestFile{
 		Name:       file.Name,
+		Object:     objectName,
 		SHA256:     file.SHA256,
 		Size:       apparent,
 		PackedSize: PackedSize(extents),

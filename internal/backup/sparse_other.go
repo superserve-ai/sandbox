@@ -22,11 +22,28 @@ func Extents(f *os.File) ([]Extent, int64, error) {
 }
 
 // NewPackedReader streams the given extents in order via section readers,
-// honoring arbitrary extent tables so behavior matches linux exactly.
+// honoring arbitrary extent tables so behavior matches linux exactly,
+// including surfacing ErrTruncatedSource when the file ends early.
 func NewPackedReader(f *os.File, extents []Extent) io.Reader {
 	readers := make([]io.Reader, 0, len(extents))
 	for _, e := range extents {
 		readers = append(readers, io.NewSectionReader(f, e.Offset, e.Length))
 	}
-	return io.MultiReader(readers...)
+	return &exactLengthReader{r: io.MultiReader(readers...), want: PackedSize(extents)}
+}
+
+// exactLengthReader converts a premature EOF into ErrTruncatedSource.
+type exactLengthReader struct {
+	r    io.Reader
+	want int64
+	got  int64
+}
+
+func (e *exactLengthReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	e.got += int64(n)
+	if err == io.EOF && e.got != e.want {
+		err = ErrTruncatedSource
+	}
+	return n, err
 }

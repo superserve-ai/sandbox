@@ -46,6 +46,21 @@ func (m *memStore) Create(_ context.Context, object string, r io.Reader) error {
 	return nil
 }
 
+// packedName is the fingerprint-suffixed object name uploadFile derives.
+func packedName(t *testing.T, path, name string) string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	extents, apparent, err := Extents(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return name + ".p" + PackFingerprint(extents, apparent)
+}
+
 func digestOf(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
@@ -89,10 +104,12 @@ func TestUploaderShipsGenerationAndAcks(t *testing.T) {
 	}
 
 	// Both artifacts plus the manifest object, packed content intact.
-	if got := string(store.objects["sandboxes/sb-1/gen-abc/overlay.ext4"]); got != "diskdata" {
+	overlayObj := "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[0].Path, "overlay.ext4")
+	vmstateObj := "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[1].Path, "vmstate.snap")
+	if got := string(store.objects[overlayObj]); got != "diskdata" {
 		t.Fatalf("overlay object = %q", got)
 	}
-	if got := string(store.objects["sandboxes/sb-1/gen-abc/vmstate.snap"]); got != "state" {
+	if got := string(store.objects[vmstateObj]); got != "state" {
 		t.Fatalf("vmstate object = %q", got)
 	}
 	var gen GenerationManifest
@@ -101,6 +118,9 @@ func TestUploaderShipsGenerationAndAcks(t *testing.T) {
 	}
 	if gen.SandboxID != "sb-1" || len(gen.Files) != 2 || gen.Files[0].SHA256 != digestOf([]byte("diskdata")) {
 		t.Fatalf("manifest = %+v", gen)
+	}
+	if gen.Files[0].Object != packedName(t, task.Files[0].Path, "overlay.ext4") {
+		t.Fatalf("manifest object binding = %q", gen.Files[0].Object)
 	}
 	if len(verified) != 1 || verified[0].Generation != "gen-abc" {
 		t.Fatalf("verified hook = %+v", verified)
@@ -113,10 +133,10 @@ func TestUploaderShipsGenerationAndAcks(t *testing.T) {
 func TestUploaderRetriesOnStoreFailure(t *testing.T) {
 	j, _ := testJournal(t)
 	store := newMemStore()
-	store.fail["sandboxes/sb-1/gen-abc/vmstate.snap"] = errors.New("transient")
 	u := &Uploader{Journal: j, Store: store}
 
 	task := writeTask(t, t.TempDir())
+	store.fail["sandboxes/sb-1/gen-abc/"+packedName(t, task.Files[1].Path, "vmstate.snap")] = errors.New("transient")
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +154,7 @@ func TestUploaderRetriesOnStoreFailure(t *testing.T) {
 
 	// Clear the fault; after backoff the retry completes and dedupes the
 	// already-written overlay object.
-	delete(store.fail, "sandboxes/sb-1/gen-abc/vmstate.snap")
+	delete(store.fail, "sandboxes/sb-1/gen-abc/"+packedName(t, task.Files[1].Path, "vmstate.snap"))
 	if _, err := u.drainOne(context.Background(), now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +305,7 @@ func TestUploaderWithholdsManifestOnMidStreamMutation(t *testing.T) {
 	task := writeTask(t, t.TempDir())
 	store := &midStreamMutator{
 		memStore: newMemStore(),
-		target:   "sandboxes/sb-1/gen-abc/overlay.ext4",
+		target:   "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[0].Path, "overlay.ext4"),
 		hook: func() {
 			// Mutate AFTER the pre-check passed and mid-upload: the second
 			// half of the stream ships different bytes.
@@ -312,5 +332,55 @@ func TestUploaderWithholdsManifestOnMidStreamMutation(t *testing.T) {
 	}
 	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
 		t.Fatalf("task still pending: %v", counts)
+	}
+}
+
+func TestUploaderAbandonsTruncatedSource(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	store := &midStreamMutator{
+		memStore: newMemStore(),
+		target:   "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[0].Path, "overlay.ext4"),
+		hook: func() {
+			// A newer pause rewrote the file smaller mid-stream.
+			if err := os.Truncate(task.Files[0].Path, 2); err != nil {
+				t.Error(err)
+			}
+		},
+	}
+	u := &Uploader{Journal: j, Store: store}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.objects["sandboxes/sb-1/gen-abc/manifest.json"]; ok {
+		t.Fatal("manifest written despite truncated source")
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("truncated task still pending: %v", counts)
+	}
+}
+
+func TestJournalStaleIndexHeals(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
+	task := Task{SandboxID: "sb", Generation: "gen", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a corrupt-entry drop that removed the queue row but left
+	// the index entry behind: re-enqueue must heal, not stay blocked.
+	if err := j.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(journalBucket).Delete(task.key())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 1 {
+		t.Fatalf("stale index blocked re-enqueue: %v", counts)
 	}
 }

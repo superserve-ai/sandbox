@@ -54,13 +54,23 @@ type Journal struct {
 	db *bolt.DB
 }
 
-var journalBucket = []byte("backup_upload_queue")
+var (
+	journalBucket = []byte("backup_upload_queue")
+	// indexBucket maps sandbox/generation identity to the pending queue
+	// key, so enqueue dedupe is one point lookup instead of a scan of the
+	// whole backlog (which grows during bucket outages, and the scan held
+	// a write transaction that blocked uploader acks).
+	indexBucket = []byte("backup_upload_index")
+)
 
 // NewJournal opens (creating if needed) the journal bucket in db. The
 // caller owns the bolt DB; sharing vmd's state DB keeps one fsync domain.
 func NewJournal(db *bolt.DB) (*Journal, error) {
 	err := db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(journalBucket)
+		if _, err := tx.CreateBucketIfNotExists(journalBucket); err != nil {
+			return err
+		}
+		_, err := tx.CreateBucketIfNotExists(indexBucket)
 		return err
 	})
 	if err != nil {
@@ -73,6 +83,11 @@ func NewJournal(db *bolt.DB) (*Journal, error) {
 // uniqueness. Bolt iterates keys in byte order, so Next is a prefix scan.
 func (t *Task) key() []byte {
 	return []byte(fmt.Sprintf("%d/%020d/%s", t.Priority, t.EnqueuedAt.UnixNano(), t.Generation))
+}
+
+// indexKey is the pending-generation identity for the dedupe index.
+func (t *Task) indexKey() []byte {
+	return []byte(t.SandboxID + "\x00" + t.Generation)
 }
 
 // Enqueue adds a task. A task for the same generation that is already
@@ -91,19 +106,17 @@ func (j *Journal) Enqueue(task Task) error {
 		return err
 	}
 	return j.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(journalBucket)
-		duplicate := false
-		_ = b.ForEach(func(_, v []byte) error {
-			var t Task
-			if json.Unmarshal(v, &t) == nil && t.Generation == task.Generation && t.SandboxID == task.SandboxID {
-				duplicate = true
-			}
-			return nil
-		})
-		if duplicate {
+		queue := tx.Bucket(journalBucket)
+		idx := tx.Bucket(indexBucket)
+		// One point lookup; a stale index entry (its queue key gone, e.g.
+		// the entry was dropped as corrupt) self-heals by overwriting.
+		if qk := idx.Get(task.indexKey()); qk != nil && queue.Get(qk) != nil {
 			return nil
 		}
-		return b.Put(task.key(), val)
+		if err := queue.Put(task.key(), val); err != nil {
+			return err
+		}
+		return idx.Put(task.indexKey(), task.key())
 	})
 }
 
@@ -157,7 +170,10 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 // generation is verified in the bucket.
 func (j *Journal) Ack(task Task) error {
 	return j.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(journalBucket).Delete(task.key())
+		if err := tx.Bucket(journalBucket).Delete(task.key()); err != nil {
+			return err
+		}
+		return tx.Bucket(indexBucket).Delete(task.indexKey())
 	})
 }
 
