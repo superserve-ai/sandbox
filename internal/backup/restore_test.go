@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -165,8 +166,17 @@ func TestRestoreGenerationFailsOnCorruptObject(t *testing.T) {
 	uploadFixture(t, store, task)
 
 	// Flip one byte inside the packed overlay object: the rebuilt file's
-	// apparent digest can no longer match the manifest.
-	object := "sandboxes/sb-restore/gen-r1/overlay.ext4"
+	// apparent digest can no longer match the manifest. The object name
+	// embeds the packing fingerprint, so find it by its stem.
+	var object string
+	for name := range store.objects {
+		if strings.HasPrefix(name, "sandboxes/sb-restore/gen-r1/overlay.ext4.p") {
+			object = name
+		}
+	}
+	if object == "" {
+		t.Fatal("packed overlay object not found in store")
+	}
 	corrupted := bytes.Clone(store.objects[object])
 	corrupted[10] ^= 0xFF
 	store.objects[object] = corrupted
@@ -197,6 +207,32 @@ func TestRestoreGenerationMissingManifestIsIncomplete(t *testing.T) {
 	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"))
 	if !errors.Is(err, ErrGenerationIncomplete) {
 		t.Fatalf("err = %v, want ErrGenerationIncomplete", err)
+	}
+}
+
+func TestRestoreGenerationRejectsEntryWithoutObject(t *testing.T) {
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+
+	// A manifest entry without its recorded object name cannot be fetched
+	// safely: deriving the name from the file name would break the binding
+	// between extent table and packing.
+	manifestObject := "sandboxes/sb-restore/gen-r1/manifest.json"
+	var manifest GenerationManifest
+	if err := json.Unmarshal(store.objects[manifestObject], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Files[0].Object = ""
+	mutated, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.objects[manifestObject] = mutated
+
+	_, err = RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"))
+	if err == nil || !strings.Contains(err.Error(), "no object name") {
+		t.Fatalf("err = %v, want rejection of entry without object name", err)
 	}
 }
 

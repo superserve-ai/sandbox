@@ -200,11 +200,21 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 // size rematerializes trailing holes. Interior holes are simply never
 // written, so on filesystems with hole tracking the restored file is as
 // sparse as the original.
+//
+// The object is fetched by the manifest entry's recorded Object name, never
+// derived from the file name: the name embeds the packing fingerprint, so
+// this entry's extent table describes exactly the object it points at.
 func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string, mf ManifestFile, dest string) error {
+	if mf.Object == "" {
+		return fmt.Errorf("manifest entry records no object name")
+	}
+	if err := validSegment(mf.Object); err != nil {
+		return fmt.Errorf("manifest object name: %w", err)
+	}
 	if err := validExtents(mf); err != nil {
 		return err
 	}
-	object, err := SandboxObject(sandboxID, generation, mf.Name)
+	object, err := SandboxObject(sandboxID, generation, mf.Object)
 	if err != nil {
 		return err
 	}
