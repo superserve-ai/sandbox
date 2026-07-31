@@ -1201,13 +1201,28 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, fmt.Errorf("restore snapshot: %w", err)
 	}
 
+	inst.mu.RLock()
+	wasUnverified := inst.Unverified
+	inst.mu.RUnlock()
+	if wasUnverified {
+		// The relaunch of an unverified crash-window record is the one resume
+		// that verifies readiness synchronously: clearing the marker blind
+		// would let a same-artifact restore retry adopt an unready VM without
+		// its gate, and leaving it set would make every resume retry relaunch
+		// and roll the guest back again. Normal resumes stay readiness-blind
+		// (detached probe below). The guest was just relaunched from its
+		// snapshot, so the failure teardown discards nothing of value.
+		if verr := m.waitForBoxd(ctx, inst.IP, 30*time.Second); verr != nil {
+			m.stopUnitDuringRestoreError(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("boxd not ready after relaunch of unverified vm %s: %w", vmID, verr)
+		}
+	}
+
 	inst.mu.Lock()
 	inst.PID = pid
 	inst.SocketPath = socketPath
 	inst.Status = StatusRunning
-	// A completed relaunch supersedes an interrupted restore's optimistic
-	// marker; left set, every resume retry would refuse adoption and roll
-	// the guest back again.
 	inst.Unverified = false
 	inst.DirtyTracked = dirtyTracked
 	// Record the file actually resumed from (callers may pass an explicit path

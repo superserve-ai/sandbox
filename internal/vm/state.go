@@ -138,7 +138,8 @@ type VMRecord struct {
 	// persist clears it right after verification, so a durable true means a
 	// crash before readiness was proven. Restore adoption re-verifies such
 	// records before adopting (and clears the marker); resume adoption
-	// refuses them, and a completed resume relaunch clears the marker.
+	// refuses them, and a resume relaunch verifies readiness synchronously
+	// before clearing the marker.
 	Unverified   bool   `json:"unverified,omitempty"`
 	RunDirID     string `json:"rundir_id"`
 	Namespace    string `json:"namespace"`
