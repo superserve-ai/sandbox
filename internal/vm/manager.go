@@ -2141,6 +2141,20 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.markTemplateRestored(warmthPath)
 
 	<-persistDone
+	if !optimisticOK && !m.persistState(inst) {
+		// The record could not be made durable, so the VM would be invisible
+		// to the next reattach — a zombie unit after any vmd restart, and no
+		// recreate-later scheme can distinguish this from a record a destroy
+		// or the reconciler deleted. Fail the restore instead; the retry only
+		// costs latency when the store is already broken.
+		m.stopUnitDuringRestoreError(vmID)
+		if !inPlace {
+			m.netMgr.CleanupVM(vmID)
+		}
+		cleanupAfterRestoreFailure()
+		m.setStatus(vmID, StatusError)
+		return nil, fmt.Errorf("vm %s restored but its state could not be persisted", vmID)
+	}
 	inst.mu.Lock()
 	inst.Unverified = false
 	inst.mu.Unlock()
@@ -2174,7 +2188,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	go func() {
 		defer sentrylog.Recover("restore-verified-persist")
 		defer handoff()
-		m.persistVerified(inst, !optimisticOK)
+		m.persistStateIfPresent(inst)
 	}()
 
 	log.Info().
@@ -2937,37 +2951,6 @@ func (m *Manager) persistStateIfPresent(inst *VMInstance) bool {
 		return true
 	}
 	return wrote
-}
-
-// persistVerified makes inst's verified state durable after readiness was
-// proven. mayCreate must be set ONLY when the optimistic write failed
-// outright: then no record was ever durable — so no deleter can have been
-// targeting it, and the reconciler's markStale (which deletes the record
-// BEFORE untracking) is out of play — yet without one the running VM is
-// invisible to the next reattach, so it is recreated under the
-// persist-then-verify undo against a racing DestroyVM (which untracks before
-// deleting). When the optimistic write landed, absence can only mean a
-// deletion, and recreating would resurrect a destroyed or reconciled VM.
-func (m *Manager) persistVerified(inst *VMInstance, mayCreate bool) {
-	if m.persistStateIfPresent(inst) {
-		return
-	}
-	if !mayCreate {
-		return
-	}
-	m.mu.RLock()
-	_, tracked := m.vms[inst.ID]
-	m.mu.RUnlock()
-	if !tracked {
-		return
-	}
-	m.persistState(inst)
-	m.mu.RLock()
-	_, tracked = m.vms[inst.ID]
-	m.mu.RUnlock()
-	if !tracked {
-		m.deleteState(inst.ID)
-	}
 }
 
 // recordDeleted reports whether vmID's record is gone from the store (deleted

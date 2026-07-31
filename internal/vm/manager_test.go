@@ -1473,79 +1473,25 @@ func TestRestoreVMSnapshot_UnverifiedRecordAfterRestart_ReverifiedAndAdopted(t *
 	}
 }
 
-// persistVerified must be able to recreate a record whose optimistic write
-// failed (the VM would otherwise be invisible to the next reattach) without
-// resurrecting one a concurrent destroy deleted.
-func TestPersistVerified(t *testing.T) {
-	newStore := func(t *testing.T) *StateStore {
-		t.Helper()
-		s, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { s.Close() })
-		return s
+// A restore whose state cannot be made durable must not report success: the
+// VM would be invisible to the next reattach, and no later recreate can
+// distinguish a failed initial write from a record a destroy or the
+// reconciler deleted. Pinned here at the store layer: a persist into a
+// closed store reports failure rather than logging and claiming success.
+func TestPersistStateReportsFailure(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	t.Run("present record is updated", func(t *testing.T) {
-		store := newStore(t)
-		inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Unverified: true}
-		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
-		m.persistState(inst)
-		inst.Unverified = false
-		m.persistVerified(inst, false)
-		rec, err := store.Get("vm-1")
-		if err != nil || rec == nil {
-			t.Fatalf("get: rec=%v err=%v", rec, err)
-		}
-		if rec.Unverified {
-			t.Fatal("verified state must land on the existing record")
-		}
-	})
-
-	t.Run("never-written record for a tracked VM is created", func(t *testing.T) {
-		store := newStore(t)
-		inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
-		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
-		m.persistVerified(inst, true) // the optimistic write failed
-		rec, err := store.Get("vm-1")
-		if err != nil || rec == nil {
-			t.Fatalf("a tracked VM's record must be recreated, got rec=%v err=%v", rec, err)
-		}
-	})
-
-	t.Run("deleted record for a tracked VM is not recreated", func(t *testing.T) {
-		// The reconciler's markStale deletes the record BEFORE untracking, so
-		// a tracked VM with a written-then-missing record may be mid-reconcile
-		// — recreating would leave a durable record for a torn-down VM.
-		store := newStore(t)
-		inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
-		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
-		m.persistState(inst)
-		if err := store.Delete("vm-1"); err != nil {
-			t.Fatal(err)
-		}
-		m.persistVerified(inst, false) // optimistic write landed; absence means deletion
-		rec, err := store.Get("vm-1")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if rec != nil {
-			t.Fatal("a deleted record must not be resurrected mid-reconcile")
-		}
-	})
-
-	t.Run("missing record for an untracked VM stays deleted", func(t *testing.T) {
-		store := newStore(t)
-		inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
-		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
-		m.persistVerified(inst, true) // a destroy already untracked and deleted it
-		rec, err := store.Get("vm-1")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if rec != nil {
-			t.Fatal("a destroyed VM's record must not be resurrected")
-		}
-	})
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+	if !m.persistState(inst) {
+		t.Fatal("persist into a healthy store must report success")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if m.persistState(inst) {
+		t.Fatal("persist into a broken store must report failure, not log and claim success")
+	}
 }
