@@ -414,3 +414,84 @@ func TestRecoverPendingBackupsDropsSupersededRecords(t *testing.T) {
 	default:
 	}
 }
+
+// An inconclusive at-rest proof (the liveness probe cannot confirm the
+// unit dead) must keep the pending record: only a provably superseded
+// pause may delete it, and a transient probe failure is not that.
+func TestRehashKeepsRecordWhenProofInconclusive(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return false },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+
+	pb := PendingBackup{VMID: "vm-1", SnapshotPath: snap, DiskPath: disk, Token: newPendingToken()}
+	if err := st.PutPendingBackup(pb); err != nil {
+		t.Fatal(err)
+	}
+	m.rehashPendingBackup(context.Background(), pb, zerolog.Nop())
+
+	pending, err := st.ListPendingBackups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending records = %d, want the inconclusive record kept", len(pending))
+	}
+}
+
+// An older pause's worker must not delete the record a newer pause has
+// since written over the same VM-ID key.
+func TestOlderWorkerCannotDeleteNewerPendingRecord(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	older := PendingBackup{VMID: "vm-1", SnapshotPath: "/a", DiskPath: "/b", Token: newPendingToken()}
+	newer := PendingBackup{VMID: "vm-1", SnapshotPath: "/c", DiskPath: "/d", Token: newPendingToken()}
+	if err := st.PutPendingBackup(older); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutPendingBackup(newer); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeletePendingBackupIf(older.VMID, older.Token); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := st.ListPendingBackups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Token != newer.Token {
+		t.Fatalf("pending = %+v, want only the newer record", pending)
+	}
+	// The rightful owner still can.
+	if err := st.DeletePendingBackupIf(newer.VMID, newer.Token); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = st.ListPendingBackups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending = %+v, want empty after owner delete", pending)
+	}
+}

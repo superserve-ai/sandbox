@@ -2,7 +2,9 @@ package vm
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -71,7 +73,10 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	// or deploy inside its window would otherwise erase the only record
 	// that this pause needs coverage. Startup recovery re-runs pending
 	// records once reattach has rebuilt the instance map.
-	pb := PendingBackup{VMID: vmID, SnapshotPath: snapshotPath, DiskPath: diskPath, DiskBasePath: diskBasePath}
+	pb := PendingBackup{
+		VMID: vmID, SnapshotPath: snapshotPath, DiskPath: diskPath, DiskBasePath: diskBasePath,
+		Token: newPendingToken(),
+	}
 	m.persistPendingBackup(pb, log)
 	if pauseManifestComplete(manifest) {
 		// The hashes are good; only the journal write failed. Retry the
@@ -81,7 +86,7 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 		// neither a rehash nor a still-paused sandbox.
 		log.Warn().Str("vm_id", vmID).
 			Msg("pause backup journal write failed; retrying enqueue")
-		go m.retryEnqueue(vmID, manifest, log)
+		go m.retryEnqueue(pb, manifest, log)
 		return manifest
 	}
 	log.Warn().Str("vm_id", vmID).
@@ -104,37 +109,55 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 	defer cancel()
-	before, err := os.Stat(pb.DiskPath)
-	if err != nil || !m.atRest(rctx, pb.VMID, pb.SnapshotPath) {
+	// Superseded (the instance is no longer paused on this snapshot)
+	// deletes the record: a resume, destroy, or newer pause owns coverage
+	// now. Everything merely INCONCLUSIVE (a stat error, a liveness probe
+	// that cannot prove death, a disk that changed under a still-paused
+	// instance) keeps the record instead: deleting on a transient failure
+	// would permanently drop coverage the next recovery could earn.
+	if !m.pausedAt(pb.VMID, pb.SnapshotPath) {
 		log.Warn().Str("vm_id", pb.VMID).
-			Msg("pause backup dropped: sandbox no longer at-rest for rehash")
-		m.deletePendingBackup(pb.VMID, log)
+			Msg("pause backup superseded: sandbox no longer paused on this snapshot")
+		m.deletePendingBackupIf(pb, log)
+		return
+	}
+	before, err := os.Stat(pb.DiskPath)
+	if err != nil || !m.unitConfirmedDead(rctx, pb.VMID) {
+		log.Warn().Err(err).Str("vm_id", pb.VMID).
+			Msg("pause backup rehash inconclusive; keeping pending record")
 		return
 	}
 	retried := collectPauseManifest(rctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, log)
+	if !m.pausedAt(pb.VMID, pb.SnapshotPath) {
+		log.Warn().Str("vm_id", pb.VMID).
+			Msg("pause backup superseded during rehash")
+		m.deletePendingBackupIf(pb, log)
+		return
+	}
 	after, err := os.Stat(pb.DiskPath)
 	if err != nil || !os.SameFile(before, after) ||
 		!before.ModTime().Equal(after.ModTime()) || before.Size() != after.Size() ||
-		!m.atRest(rctx, pb.VMID, pb.SnapshotPath) {
-		log.Warn().Str("vm_id", pb.VMID).
-			Msg("pause backup dropped: disk changed during rehash")
-		m.deletePendingBackup(pb.VMID, log)
+		!m.unitConfirmedDead(rctx, pb.VMID) {
+		log.Warn().Err(err).Str("vm_id", pb.VMID).
+			Msg("pause backup rehash not provably at-rest; keeping pending record")
 		return
 	}
 	if m.enqueueBackup(pb.VMID, retried) {
-		m.deletePendingBackup(pb.VMID, log)
+		m.deletePendingBackupIf(pb, log)
 		return
 	}
 	if !pauseManifestComplete(retried) {
+		// At-rest and still unhashable: the artifacts themselves are the
+		// problem, and retrying cannot improve on it.
 		log.Error().Str("vm_id", pb.VMID).
 			Msg("pause backup dropped: rehash also produced no enqueueable manifest")
-		m.deletePendingBackup(pb.VMID, log)
+		m.deletePendingBackupIf(pb, log)
 		return
 	}
 	// The rehash earned a complete manifest; a transient journal failure
 	// must not throw it away when the synchronous path's equivalent
 	// failure gets retries.
-	m.retryEnqueue(pb.VMID, retried, log)
+	m.retryEnqueue(pb, retried, log)
 }
 
 // RecoverPendingBackups re-runs every pause that still owed its backup
@@ -162,17 +185,17 @@ func (m *Manager) RecoverPendingBackups(ctx context.Context, log zerolog.Logger)
 // and no still-paused sandbox is needed (the uploader's pre-verification
 // catches divergence). Bounded backoff; a journal that keeps failing
 // leaves the pending record for the next boot's recovery.
-func (m *Manager) retryEnqueue(vmID string, manifest []ManifestEntry, log zerolog.Logger) {
+func (m *Manager) retryEnqueue(pb PendingBackup, manifest []ManifestEntry, log zerolog.Logger) {
 	delay := time.Second
 	for attempt := 0; attempt < enqueueRetryAttempts; attempt++ {
 		time.Sleep(delay)
 		delay *= 2
-		if m.enqueueBackup(vmID, manifest) {
-			m.deletePendingBackup(vmID, log)
+		if m.enqueueBackup(pb.VMID, manifest) {
+			m.deletePendingBackupIf(pb, log)
 			return
 		}
 	}
-	log.Error().Str("vm_id", vmID).
+	log.Error().Str("vm_id", pb.VMID).
 		Msg("pause backup journal writes kept failing; pending record kept for recovery")
 }
 
@@ -195,6 +218,25 @@ func (m *Manager) deletePendingBackup(vmID string, log zerolog.Logger) {
 	if err := m.state.DeletePendingBackup(vmID); err != nil {
 		log.Error().Err(err).Str("vm_id", vmID).Msg("clear pending backup failed")
 	}
+}
+
+// deletePendingBackupIf clears the record only while pb's token still
+// owns it: async workers may outlive the pause that spawned them, and a
+// newer pause's record must survive an older worker's cleanup.
+func (m *Manager) deletePendingBackupIf(pb PendingBackup, log zerolog.Logger) {
+	if m.state == nil {
+		return
+	}
+	if err := m.state.DeletePendingBackupIf(pb.VMID, pb.Token); err != nil {
+		log.Error().Err(err).Str("vm_id", pb.VMID).Msg("clear pending backup failed")
+	}
+}
+
+// pendingTokenCounter disambiguates tokens minted in the same nanosecond.
+var pendingTokenCounter atomic.Uint64
+
+func newPendingToken() string {
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), pendingTokenCounter.Add(1))
 }
 
 // atRest reports whether a sandbox's artifacts are provably not being

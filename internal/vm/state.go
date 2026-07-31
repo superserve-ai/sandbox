@@ -615,6 +615,10 @@ type PendingBackup struct {
 	SnapshotPath string `json:"snapshot_path"`
 	DiskPath     string `json:"disk_path"`
 	DiskBasePath string `json:"disk_base_path,omitempty"`
+	// Token identifies which pause owns the record: rows are keyed by VM
+	// ID, so a later pause's Put replaces an older one, and the older
+	// pause's async worker must not delete the newer record.
+	Token string `json:"token,omitempty"`
 }
 
 // PutPendingBackup records (or refreshes) a pause's owed backup.
@@ -632,6 +636,24 @@ func (s *StateStore) PutPendingBackup(p PendingBackup) error {
 func (s *StateStore) DeletePendingBackup(vmID string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(pendingBackupBucketName).Delete([]byte(vmID))
+	})
+}
+
+// DeletePendingBackupIf clears the marker only while the given token
+// still owns it: an older pause's async worker finishing late must not
+// erase the record a newer pause has since written over the same key.
+func (s *StateStore) DeletePendingBackupIf(vmID, token string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(pendingBackupBucketName)
+		v := b.Get([]byte(vmID))
+		if v == nil {
+			return nil
+		}
+		var cur PendingBackup
+		if json.Unmarshal(v, &cur) == nil && cur.Token != token {
+			return nil
+		}
+		return b.Delete([]byte(vmID))
 	})
 }
 

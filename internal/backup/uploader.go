@@ -82,6 +82,13 @@ func (u *Uploader) Run(ctx context.Context) error {
 	// notified: the outbox is the only record of those.
 	u.flushNotifications()
 	for {
+		// Checked every iteration: a successful Nack after a canceled
+		// upload returns (worked, nil), and without this check a queued
+		// backlog would be drained (and pointlessly nacked) task by task
+		// before the idle select ever observed cancellation.
+		if ctx.Err() != nil {
+			return nil
+		}
 		worked, err := u.drainOne(ctx, time.Now())
 		if err != nil {
 			if ctx.Err() != nil {

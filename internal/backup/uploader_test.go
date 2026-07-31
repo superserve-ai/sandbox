@@ -621,3 +621,29 @@ func TestHashApparentCancelsMidExtent(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled from inside the extent read", err)
 	}
 }
+
+// A canceled context must stop the drain loop before it touches the
+// backlog: each canceled upload nacks successfully (worked, nil), so
+// without a per-iteration check the whole queue gets drained and nacked
+// before the idle select ever sees the cancellation.
+func TestRunStopsPromptlyWhenCanceled(t *testing.T) {
+	j, _ := testJournal(t)
+	for _, id := range []string{"sb-1", "sb-2"} {
+		if err := j.Enqueue(Task{SandboxID: id, Generation: "gen", EnqueuedAt: time.Unix(1, 0)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	u := &Uploader{Journal: j, Store: newMemStore()}
+	if err := u.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	task, ok, err := j.Next(time.Unix(2, 0))
+	if err != nil || !ok {
+		t.Fatalf("backlog should be untouched: ok=%v err=%v", ok, err)
+	}
+	if task.Attempts != 0 {
+		t.Fatalf("task attempts = %d, want 0 (nothing drained after cancel)", task.Attempts)
+	}
+}
