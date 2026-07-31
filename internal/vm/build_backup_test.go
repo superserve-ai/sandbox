@@ -21,6 +21,9 @@ func writeBuildFixture(t *testing.T, dir string) []byte {
 	if err := os.WriteFile(filepath.Join(dir, "mem.snap"), []byte("memory image"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "vmstate.snap"), []byte("vm state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	meta := []byte(`{"snapshot_path":"vmstate.snap","mem_path":"mem.snap","size_bytes":12}`)
 	if err := os.WriteFile(filepath.Join(dir, buildMetaFilename), meta, 0o644); err != nil {
 		t.Fatal(err)
@@ -72,8 +75,8 @@ func TestBackupBuildArtifactsHashesAndEnqueuesWithHook(t *testing.T) {
 	for _, f := range task.Files {
 		names[f.Name] = true
 	}
-	if !names["mem.snap"] || !names[buildMetaFilename] {
-		t.Fatalf("task files = %v, want mem.snap and %s", names, buildMetaFilename)
+	if !names["mem.snap"] || !names["vmstate.snap"] || !names[buildMetaFilename] {
+		t.Fatalf("task files = %v, want mem.snap, vmstate.snap and %s", names, buildMetaFilename)
 	}
 
 	raw, err := os.ReadFile(filepath.Join(dir, buildMetaFilename))
@@ -88,5 +91,26 @@ func TestBackupBuildArtifactsHashesAndEnqueuesWithHook(t *testing.T) {
 	}
 	if len(rewritten.Artifacts) == 0 {
 		t.Fatal("build.meta.json not stamped with artifact digests")
+	}
+}
+
+// A required artifact that is absent before enumeration never reaches the
+// hasher, so the hashed set looks internally complete while build.meta.json
+// knows better. The declared set is the completeness authority: a missing
+// declared artifact must keep the build out of the backup queue.
+func TestBackupBuildArtifactsRefusesMissingDeclaredArtifact(t *testing.T) {
+	dir := t.TempDir()
+	writeBuildFixture(t, dir)
+	if err := os.Remove(filepath.Join(dir, "vmstate.snap")); err != nil {
+		t.Fatal(err)
+	}
+
+	var tasks []backup.Task
+	m := &Manager{}
+	m.SetBackupEnqueue(func(task backup.Task) { tasks = append(tasks, task) })
+	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", zerolog.Nop())
+
+	if len(tasks) != 0 {
+		t.Fatalf("enqueued %d tasks despite a missing declared artifact, want 0", len(tasks))
 	}
 }

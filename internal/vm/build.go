@@ -236,6 +236,27 @@ func (m *Manager) backupBuildArtifacts(ctx context.Context, templateID, buildVMI
 			Msg("build artifact set hashed incompletely; build not enqueued for backup")
 		return
 	}
+	// Directory enumeration only proves what exists, not what should: an
+	// artifact that was never written (or already deleted) never reaches
+	// the hasher, so `complete` alone would bless the gap. Judge the set
+	// against the paths build.meta.json declares before publishing.
+	meta, err := readBuildMetaJSON(snapshotDir)
+	if err != nil {
+		log.Warn().Err(err).Msg("build manifest: reread build.meta.json failed; build not enqueued for backup")
+		return
+	}
+	hashed := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		hashed[e.FileName] = true
+	}
+	for _, p := range []string{meta.SnapshotPath, meta.MemFilePath, meta.RootfsPath, meta.BasePath, meta.DeltaPath} {
+		if p == "" || hashed[filepath.Base(p)] {
+			continue
+		}
+		log.Warn().Str("artifact", filepath.Base(p)).
+			Msg("required build artifact missing from hashed set; build not enqueued for backup")
+		return
+	}
 	if err := writeBuildDigests(snapshotDir, entries); err != nil {
 		log.Warn().Err(err).Msg("recording artifact digests into build.meta.json failed")
 	}
