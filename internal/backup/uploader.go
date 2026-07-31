@@ -314,13 +314,13 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 // stagingSweepInterval paces the running staged-base sweep.
 const stagingSweepInterval = 30 * time.Minute
 
-// objectName routes an object into the task owner's prefix. Sandbox
-// generations are content-addressed under the generation key; template
-// builds are immutable per build id, so templates/<template>/<build>/ is
-// already a stable address and needs no generation segment.
+// objectName routes an object into the task owner's prefix. Both owners
+// keep the content-addressed generation segment: build ids are reusable
+// across rebuilds of a template, so the generation is what stops a rebuild
+// from deduping against a previous build's objects (see TemplateObject).
 func (t Task) objectName(fileName string) (string, error) {
 	if t.TemplateID != "" {
-		return TemplateObject(t.TemplateID, t.BuildID, fileName)
+		return TemplateObject(t.TemplateID, t.BuildID, t.Generation, fileName)
 	}
 	return SandboxObject(t.SandboxID, t.Generation, fileName)
 }

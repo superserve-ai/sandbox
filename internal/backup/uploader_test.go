@@ -337,9 +337,9 @@ func TestUploaderRoutesTemplateTasks(t *testing.T) {
 		}
 	}
 
-	// Template artifacts land under templates/<template>/<build>/ with the
-	// fingerprint-suffixed object names, content intact.
-	prefix := "templates/tpl-1/build-tpl-1/"
+	// Template artifacts land under templates/<template>/<build>/<generation>/
+	// with the fingerprint-suffixed object names, content intact.
+	prefix := "templates/tpl-1/build-tpl-1/" + tpl.Generation + "/"
 	for _, f := range tpl.Files {
 		obj := prefix + packedName(t, f.Path, f.Name)
 		if got := string(store.objects[obj]); digestOf([]byte(got)) != f.SHA256 {
