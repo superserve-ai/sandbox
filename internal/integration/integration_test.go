@@ -5320,6 +5320,33 @@ func TestIntegration_FinalizePause_GenerationModes(t *testing.T) {
 	if headID != head4 {
 		t.Fatalf("head = %s, want newest generation %s", headID, head4)
 	}
+	// Partial-manifest size semantics: a sized finalize followed by a
+	// zero-size one (partial manifest) carries the prior size forward.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	memPath := "/snapshots/" + sid + "/mem.snap"
+	if _, err := testQueries.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
+		ID: sandboxID, TeamID: teamID, Path: "p5", MemPath: &memPath, SizeBytes: 4096, Trigger: "pause",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testQueries.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
+		ID: sandboxID, TeamID: teamID, Path: "p6", MemPath: &memPath, SizeBytes: 0, Trigger: "pause",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var lastSize int64
+	if err := testPool.QueryRow(ctx,
+		`SELECT size_bytes FROM snapshot WHERE sandbox_id = $1 ORDER BY generation DESC LIMIT 1`, sandboxID).Scan(&lastSize); err != nil {
+		t.Fatal(err)
+	}
+	if lastSize != 4096 {
+		t.Fatalf("partial-manifest generation size = %d, want prior size 4096 carried forward", lastSize)
+	}
 	// A stale finalize is still rejected whole in generations mode.
 	mem := "/snapshots/" + sid + "/mem.snap"
 	if _, err := routedFinalize(ctx, t, db.FinalizePauseParams{

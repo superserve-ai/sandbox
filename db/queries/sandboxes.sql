@@ -491,7 +491,17 @@ WITH target AS (
 ),
 inserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation)
-  SELECT target.id, target.team_id, @path, @mem_path, @size_bytes, @trigger,
+  SELECT target.id, target.team_id, @path, @mem_path,
+         -- A non-positive total means the manifest was partial (hash budget
+         -- exhausted or a file failed to hash): carry the prior head's
+         -- known size forward as the best available estimate, mirroring
+         -- the legacy upsert's keep-prior semantics. The incomplete
+         -- manifest itself is surfaced by coverage monitoring.
+         CASE WHEN @size_bytes > 0 THEN @size_bytes
+              ELSE COALESCE((SELECT s.size_bytes FROM snapshot s
+                             WHERE s.sandbox_id = target.id
+                             ORDER BY s.generation DESC LIMIT 1), 0) END,
+         @trigger,
          COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1
   FROM target
   RETURNING snapshot.id AS snap_id

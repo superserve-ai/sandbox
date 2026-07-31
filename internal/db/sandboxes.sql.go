@@ -1240,7 +1240,17 @@ WITH target AS (
 ),
 inserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation)
-  SELECT target.id, target.team_id, $3, $4, $5, $6,
+  SELECT target.id, target.team_id, $3, $4,
+         -- A non-positive total means the manifest was partial (hash budget
+         -- exhausted or a file failed to hash): carry the prior head's
+         -- known size forward as the best available estimate, mirroring
+         -- the legacy upsert's keep-prior semantics. The incomplete
+         -- manifest itself is surfaced by coverage monitoring.
+         CASE WHEN $5 > 0 THEN $5
+              ELSE COALESCE((SELECT s.size_bytes FROM snapshot s
+                             WHERE s.sandbox_id = target.id
+                             ORDER BY s.generation DESC LIMIT 1), 0) END,
+         $6,
          COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1
   FROM target
   RETURNING snapshot.id AS snap_id
@@ -1270,17 +1280,17 @@ RETURNING inserted.snap_id::uuid AS snapshot_id
 `
 
 type FinalizePauseGenerationParams struct {
-	ID                uuid.UUID `json:"id"`
-	TeamID            uuid.UUID `json:"team_id"`
-	Path              string    `json:"path"`
-	MemPath           *string   `json:"mem_path"`
-	SizeBytes         int64     `json:"size_bytes"`
-	Trigger           string    `json:"trigger"`
-	ManifestFileNames []string  `json:"manifest_file_names"`
-	ManifestPaths     []string  `json:"manifest_paths"`
-	ManifestSizes     []int64   `json:"manifest_sizes"`
-	ManifestDigests   []string  `json:"manifest_digests"`
-	ManifestBasePaths []string  `json:"manifest_base_paths"`
+	ID                uuid.UUID   `json:"id"`
+	TeamID            uuid.UUID   `json:"team_id"`
+	Path              string      `json:"path"`
+	MemPath           *string     `json:"mem_path"`
+	SizeBytes         interface{} `json:"size_bytes"`
+	Trigger           string      `json:"trigger"`
+	ManifestFileNames []string    `json:"manifest_file_names"`
+	ManifestPaths     []string    `json:"manifest_paths"`
+	ManifestSizes     []int64     `json:"manifest_sizes"`
+	ManifestDigests   []string    `json:"manifest_digests"`
+	ManifestBasePaths []string    `json:"manifest_base_paths"`
 }
 
 // Generations-mode finalize: INSERT a new snapshot row per pause instead of
