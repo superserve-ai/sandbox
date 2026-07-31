@@ -282,6 +282,93 @@ func TestJournalEnqueueDedupesPendingGeneration(t *testing.T) {
 	}
 }
 
+func writeTemplateTask(t *testing.T, dir string) Task {
+	t.Helper()
+	contents := []struct{ name, data string }{
+		{"vmstate.snap", "tpl-state"},
+		{"mem.snap", "tpl-mem"},
+		{"rootfs.delta", "tpl-delta"},
+	}
+	files := make([]TaskFile, 0, len(contents))
+	for _, c := range contents {
+		path := filepath.Join(dir, c.name)
+		if err := os.WriteFile(path, []byte(c.data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, TaskFile{
+			Name:   c.name,
+			Path:   path,
+			SHA256: digestOf([]byte(c.data)),
+			Size:   int64(len(c.data)),
+		})
+	}
+	return Task{
+		TemplateID: "tpl-1",
+		BuildID:    "build-tpl-1",
+		Generation: GenerationKey(files),
+		Priority:   PriorityPause,
+		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 1, 0, time.UTC),
+		Files:      files,
+	}
+}
+
+func TestUploaderRoutesTemplateTasks(t *testing.T) {
+	j, _ := testJournal(t)
+	store := newMemStore()
+	var verified []Task
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+
+	// Mixed queue: a sandbox pause and a template build, both pause priority.
+	sandbox := writeTask(t, t.TempDir())
+	tpl := writeTemplateTask(t, t.TempDir())
+	for _, task := range []Task{sandbox, tpl} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := tpl.EnqueuedAt.Add(time.Minute)
+	for {
+		worked, err := u.drainOne(context.Background(), now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !worked {
+			break
+		}
+	}
+
+	// Template artifacts land under templates/<template>/<build>/ with the
+	// fingerprint-suffixed object names, content intact.
+	prefix := "templates/tpl-1/build-tpl-1/"
+	for _, f := range tpl.Files {
+		obj := prefix + packedName(t, f.Path, f.Name)
+		if got := string(store.objects[obj]); digestOf([]byte(got)) != f.SHA256 {
+			t.Fatalf("template object %s = %q", obj, got)
+		}
+	}
+	// Completion marker lives under the same prefix and carries the template identity.
+	var gen GenerationManifest
+	if err := json.Unmarshal(store.objects[prefix+ManifestObject], &gen); err != nil {
+		t.Fatalf("template manifest object: %v", err)
+	}
+	if gen.TemplateID != "tpl-1" || gen.BuildID != "build-tpl-1" || gen.SandboxID != "" {
+		t.Fatalf("template manifest identity = %+v", gen)
+	}
+	if gen.Generation != tpl.Generation || len(gen.Files) != len(tpl.Files) {
+		t.Fatalf("template manifest = %+v", gen)
+	}
+	// The sandbox task in the same queue drained to its own prefix.
+	if _, ok := store.objects["sandboxes/sb-1/gen-abc/"+ManifestObject]; !ok {
+		t.Fatal("sandbox manifest missing from mixed drain")
+	}
+	if len(verified) != 2 {
+		t.Fatalf("verified hooks = %+v", verified)
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("queue not drained: %v", counts)
+	}
+}
+
 func keysOf(m map[string][]byte) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {

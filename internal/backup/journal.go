@@ -48,8 +48,14 @@ type TaskFile struct {
 // generation key is content-addressed, so re-running a task lands on the
 // same object names and the bucket's create-only precondition makes
 // duplicates a no-op.
+//
+// Exactly one owner is set: SandboxID for pause generations, TemplateID
+// (always with the BuildID that produced the artifacts) for template
+// builds. The owner picks the object prefix; see Task.objectName.
 type Task struct {
-	SandboxID  string     `json:"sandbox_id"`
+	SandboxID  string     `json:"sandbox_id,omitempty"`
+	TemplateID string     `json:"template_id,omitempty"`
+	BuildID    string     `json:"build_id,omitempty"`
 	Generation string     `json:"generation"`
 	Files      []TaskFile `json:"files"`
 	Priority   Priority   `json:"priority"`
@@ -164,9 +170,16 @@ func (t *Task) key() []byte {
 	return []byte(fmt.Sprintf("%d/%020d/%s/%s", t.Priority, t.readyAt().UnixNano(), t.SandboxID, t.Generation))
 }
 
-// indexKey is the pending-generation identity for the dedupe index.
+// indexKey is the pending-generation identity for the dedupe index. The
+// owner segment is the sandbox id or the template/build pair, so template
+// tasks dedupe on their own identity and can never collide with a sandbox
+// task sharing a generation key.
 func (t *Task) indexKey() []byte {
-	return []byte(t.SandboxID + "\x00" + t.Generation)
+	owner := t.SandboxID
+	if t.TemplateID != "" {
+		owner = t.TemplateID + "\x00" + t.BuildID
+	}
+	return []byte(owner + "\x00" + t.Generation)
 }
 
 // Enqueue adds a task. A task for the same generation that is already
@@ -174,8 +187,14 @@ func (t *Task) indexKey() []byte {
 // upload harmless, but there is no reason to do the work twice (idempotent
 // pause retries re-enqueue the identical generation).
 func (j *Journal) Enqueue(task Task) error {
-	if task.Generation == "" || task.SandboxID == "" {
-		return fmt.Errorf("task missing identity: %+v", task)
+	if task.Generation == "" {
+		return fmt.Errorf("task missing generation: %+v", task)
+	}
+	if (task.SandboxID == "") == (task.TemplateID == "") {
+		return fmt.Errorf("task must identify exactly one of sandbox or template: %+v", task)
+	}
+	if task.TemplateID != "" && task.BuildID == "" {
+		return fmt.Errorf("template task missing build id: %+v", task)
 	}
 	if task.EnqueuedAt.IsZero() {
 		task.EnqueuedAt = time.Now().UTC()

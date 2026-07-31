@@ -114,3 +114,32 @@ func TestJournalNackBackoffAndPersistence(t *testing.T) {
 		t.Fatalf("pending = %v err=%v", counts, err)
 	}
 }
+
+func TestJournalEnqueueRequiresExactlyOneOwner(t *testing.T) {
+	j, _ := testJournal(t)
+	cases := []struct {
+		name    string
+		task    Task
+		wantErr bool
+	}{
+		{"sandbox task", Task{SandboxID: "sb", Generation: "g1"}, false},
+		{"template task", Task{TemplateID: "tpl", BuildID: "b1", Generation: "g2"}, false},
+		{"both owners", Task{SandboxID: "sb", TemplateID: "tpl", BuildID: "b1", Generation: "g3"}, true},
+		{"no owner", Task{Generation: "g4"}, true},
+		{"template without build id", Task{TemplateID: "tpl", Generation: "g5"}, true},
+		{"no generation", Task{SandboxID: "sb"}, true},
+	}
+	for _, tc := range cases {
+		err := j.Enqueue(tc.task)
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("%s: err = %v, wantErr = %v", tc.name, err, tc.wantErr)
+		}
+	}
+	// Template tasks dedupe on their own identity like sandbox tasks do.
+	if err := j.Enqueue(Task{TemplateID: "tpl", BuildID: "b1", Generation: "g2"}); err != nil {
+		t.Fatal(err)
+	}
+	if counts, _ := j.Pending(); counts[PriorityBestEffort]+counts[PriorityCheckpoint]+counts[PriorityPause] != 2 {
+		t.Fatalf("pending after dedupe = %v", counts)
+	}
+}

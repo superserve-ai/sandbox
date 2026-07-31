@@ -23,7 +23,9 @@ import (
 // extent tables. A generation without its manifest object is incomplete
 // and never restored from.
 type GenerationManifest struct {
-	SandboxID  string         `json:"sandbox_id"`
+	SandboxID  string         `json:"sandbox_id,omitempty"`
+	TemplateID string         `json:"template_id,omitempty"`
+	BuildID    string         `json:"build_id,omitempty"`
 	Generation string         `json:"generation"`
 	Files      []ManifestFile `json:"files"`
 	VMDVersion string         `json:"vmd_version,omitempty"`
@@ -164,8 +166,7 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	}
 	completed, err := u.uploadTask(ctx, &task)
 	if err != nil {
-		u.Log.Warn().Err(err).
-			Str("sandbox_id", task.SandboxID).
+		task.logOwner(u.Log.Warn().Err(err)).
 			Str("generation", task.Generation).
 			Int("attempts", task.Attempts+1).
 			Msg("backup upload failed; will retry")
@@ -244,6 +245,8 @@ func baseTaskFile(file TaskFile) (TaskFile, error) {
 func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, _ error) {
 	gen := GenerationManifest{
 		SandboxID:  task.SandboxID,
+		TemplateID: task.TemplateID,
+		BuildID:    task.BuildID,
 		Generation: task.Generation,
 		VMDVersion: u.VMDVersion,
 	}
@@ -256,7 +259,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				// upload (sandbox deleted or resumed, local GC won the
 				// race). Nothing valid to back up under this content
 				// address; the generation is abandoned, not retried.
-				u.Log.Warn().Str("path", file.Path).Str("sandbox_id", task.SandboxID).
+				task.logOwner(u.Log.Warn().Str("path", file.Path)).
 					Msg("backup source file gone; abandoning generation")
 				return false, nil
 			}
@@ -294,7 +297,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 			gen.Files = append(gen.Files, bmf)
 		}
 	}
-	manifestObject, err := SandboxObject(task.SandboxID, task.Generation, ManifestObject)
+	manifestObject, err := task.objectName(ManifestObject)
 	if err != nil {
 		return false, err
 	}
@@ -310,6 +313,25 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 
 // stagingSweepInterval paces the running staged-base sweep.
 const stagingSweepInterval = 30 * time.Minute
+
+// objectName routes an object into the task owner's prefix. Sandbox
+// generations are content-addressed under the generation key; template
+// builds are immutable per build id, so templates/<template>/<build>/ is
+// already a stable address and needs no generation segment.
+func (t Task) objectName(fileName string) (string, error) {
+	if t.TemplateID != "" {
+		return TemplateObject(t.TemplateID, t.BuildID, fileName)
+	}
+	return SandboxObject(t.SandboxID, t.Generation, fileName)
+}
+
+// logOwner stamps the task's owning identity onto a log event.
+func (t Task) logOwner(e *zerolog.Event) *zerolog.Event {
+	if t.TemplateID != "" {
+		return e.Str("template_id", t.TemplateID).Str("build_id", t.BuildID)
+	}
+	return e.Str("sandbox_id", t.SandboxID)
+}
 
 // errSourceChanged marks a source file whose current content no longer
 // matches the digest recorded at pause time: the sandbox resumed and
@@ -381,7 +403,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		objectName = object
 	} else {
 		objectName = file.Name + ".p" + PackFingerprint(extents, apparent)
-		object, err = SandboxObject(task.SandboxID, task.Generation, objectName)
+		object, err = task.objectName(objectName)
 		if err != nil {
 			return ManifestFile{}, err
 		}
@@ -507,7 +529,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 	}
 	return ManifestFile{
 		Name:       file.Name,
-		Object:     objectName,
+		Object:     suffixedName,
 		SHA256:     file.SHA256,
 		BasePath:   file.BasePath,
 		BaseSHA256: file.BaseSHA256,
