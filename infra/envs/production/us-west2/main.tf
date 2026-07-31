@@ -194,8 +194,10 @@ module "sandbox_host" {
   internal_ip   = "10.1.0.2"
   tags          = ["vmd-usw2"]
   labels = merge(local.sandbox_host_labels, {
-    component    = "vmd"
-    sandbox_role = "vmd"
+    component                  = "vmd"
+    sandbox_role               = "vmd"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
 
   service_account_email = data.google_service_account.api_runner.email
@@ -247,6 +249,8 @@ module "backup_storage" {
   ]
 
   labels = merge(local.common_labels, {
-    component = "backup"
+    component                  = "backup"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_snapshots_and_files"
   })
 }
