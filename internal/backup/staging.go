@@ -2,6 +2,7 @@ package backup
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,17 +10,21 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// StageTask hard-links a task's artifact files into the uploader-owned
-// staging tree and rewrites the task's paths to the links. Sandbox
-// teardown can then unlink the originals freely: the inodes survive
-// through the links until the uploader acks, so a destroy racing a
-// queued upload no longer erases the generation the retention model
-// promises to keep. Links are free on the same filesystem; a link
-// failure (cross-device, permissions) falls back to the original path
-// for that file, preserving the old best-effort behavior.
+// StageTask snapshots a task's artifact files into the uploader-owned
+// staging tree and rewrites the task's paths to the copies. Sandbox
+// teardown can then remove the originals freely, and a resume or later
+// pause writing through the original inode cannot mutate the staged
+// bytes: the copy is immutable, which a hard link is not (it shares the
+// inode the guest reopens). Reflink clones make the snapshot free where
+// the filesystem supports them; otherwise a sparse-aware copy ships
+// only the data extents, which for pause artifacts is small. A staging
+// failure falls back to the original path for that file, preserving the
+// old best-effort behavior.
 //
-// Idempotent per generation: a retry whose link already exists reuses
-// it, which also covers re-enqueues after the originals are gone.
+// Idempotent per generation: generations are content-addressed, so an
+// existing staged file for this generation already holds these bytes
+// and is reused (which also covers re-enqueues after the originals are
+// gone).
 func StageTask(root string, task *Task) error {
 	if root == "" {
 		return nil
@@ -30,20 +35,66 @@ func StageTask(root string, task *Task) error {
 	}
 	for i, f := range task.Files {
 		staged := filepath.Join(dir, f.Name)
-		if err := os.Link(f.Path, staged); err != nil {
-			if os.IsExist(err) {
-				task.Files[i].Path = staged
-				continue
-			}
-			if _, statErr := os.Stat(staged); statErr == nil {
-				task.Files[i].Path = staged
-				continue
-			}
+		if _, err := os.Stat(staged); err == nil {
+			task.Files[i].Path = staged
+			continue
+		}
+		if err := snapshotFile(staged, f.Path); err != nil {
 			return fmt.Errorf("stage %s: %w", f.Name, err)
 		}
 		task.Files[i].Path = staged
 	}
 	return nil
+}
+
+// snapshotFile copies src to dst preserving sparseness, via reflink
+// clone when available. Written to a temp name and renamed so a crash
+// mid-copy never leaves a plausible-looking partial staged file.
+func snapshotFile(dst, src string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	fi, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := cloneFile(out, in); err != nil {
+		extents, _, xerr := Extents(in)
+		if xerr != nil {
+			out.Close()
+			os.Remove(tmp)
+			return xerr
+		}
+		for _, e := range extents {
+			if _, err := out.Seek(e.Offset, io.SeekStart); err != nil {
+				out.Close()
+				os.Remove(tmp)
+				return err
+			}
+			if _, err := io.Copy(out, io.NewSectionReader(in, e.Offset, e.Length)); err != nil {
+				out.Close()
+				os.Remove(tmp)
+				return err
+			}
+		}
+		if err := out.Truncate(fi.Size()); err != nil {
+			out.Close()
+			os.Remove(tmp)
+			return err
+		}
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
 
 // removeStagedTask deletes a task's staging directory once the task is

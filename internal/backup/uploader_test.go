@@ -801,3 +801,44 @@ func TestNextSkipsDeferredPriorityWithoutScanning(t *testing.T) {
 		t.Fatalf("nacked task not acked cleanly: %v", counts)
 	}
 }
+
+// The staged snapshot must be immutable: a resume writing through the
+// original inode after staging must not change what uploads. A hard
+// link would fail this test; a copy or reflink passes.
+func TestStagedBytesImmuneToSourceMutation(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	data := []byte("pause-time artifact bytes")
+	orig := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(orig, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	task := Task{
+		SandboxID:  "sb",
+		Generation: "gen",
+		EnqueuedAt: time.Unix(1, 0),
+		Files:      []TaskFile{{Name: "rootfs.ext4", Path: orig, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))}},
+	}
+	if err := StageTask(staging, &task); err != nil {
+		t.Fatal(err)
+	}
+
+	// The resume race: guest writes land through the original name.
+	if err := os.WriteFile(orig, []byte("post-resume guest writes!!"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	j, _ := testJournal(t)
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store, StagingRoot: staging}
+	if _, err := u.drainOne(context.Background(), time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.objects["sandboxes/sb/gen/manifest.json"]; !ok {
+		t.Fatal("upload did not complete from the staged snapshot (mutation leaked through)")
+	}
+}
