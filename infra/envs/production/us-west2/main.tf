@@ -35,6 +35,13 @@ locals {
     region      = local.region
   }
 
+  sandbox_host_labels = merge(local.common_labels, {
+    owner              = "platform"
+    project            = "sandbox"
+    dataclassification = "confidential"
+    application        = "sandbox-host"
+  })
+
   api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
 }
 module "network" {
@@ -186,7 +193,7 @@ module "sandbox_host" {
   subnet        = module.network.subnetwork_self_link
   internal_ip   = "10.1.0.2"
   tags          = ["vmd-usw2"]
-  labels = merge(local.common_labels, {
+  labels = merge(local.sandbox_host_labels, {
     component    = "vmd"
     sandbox_role = "vmd"
   })
