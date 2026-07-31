@@ -584,3 +584,66 @@ func TestPendingSweepRetriesRetainedRecords(t *testing.T) {
 		t.Fatal("sweep never retried the retained record")
 	}
 }
+
+// A failed initial persist must self-heal: a worker keeping its record
+// re-persists it, so the keep decision survives the process. Simulated
+// by never writing the record before the worker runs.
+func TestWorkerHealsMissingPendingRecord(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return false },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+
+	// The record's initial persist "failed": the store is empty.
+	pb := PendingBackup{VMID: "vm-1", SnapshotPath: snap, DiskPath: disk, Token: newPendingToken()}
+	m.rehashPendingBackup(context.Background(), pb, zerolog.Nop())
+
+	pending, err := st.ListPendingBackups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Token != pb.Token {
+		t.Fatalf("pending = %+v, want the healed record", pending)
+	}
+}
+
+// Healing must not clobber a newer pause's record.
+func TestHealCannotClobberNewerRecord(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	older := PendingBackup{VMID: "vm-1", SnapshotPath: "/a", DiskPath: "/b", Token: newPendingToken()}
+	newer := PendingBackup{VMID: "vm-1", SnapshotPath: "/c", DiskPath: "/d", Token: newPendingToken()}
+	if err := st.PutPendingBackup(newer); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutPendingBackupIfOwner(older); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := st.ListPendingBackups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Token != newer.Token {
+		t.Fatalf("pending = %+v, want the newer record untouched", pending)
+	}
+}

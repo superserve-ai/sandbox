@@ -133,6 +133,7 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	if err != nil || !m.unitConfirmedDead(rctx, pb.VMID) {
 		log.Warn().Err(err).Str("vm_id", pb.VMID).
 			Msg("pause backup rehash inconclusive; keeping pending record")
+		m.healPendingBackup(pb, log)
 		return
 	}
 	retried := collectPauseManifest(rctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, log)
@@ -148,6 +149,7 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		!m.unitConfirmedDead(rctx, pb.VMID) {
 		log.Warn().Err(err).Str("vm_id", pb.VMID).
 			Msg("pause backup rehash not provably at-rest; keeping pending record")
+		m.healPendingBackup(pb, log)
 		return
 	}
 	if m.enqueueBackup(pb.VMID, retried) {
@@ -167,6 +169,7 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		}
 		log.Warn().Str("vm_id", pb.VMID).
 			Msg("pause backup rehash failed transiently; keeping pending record")
+		m.healPendingBackup(pb, log)
 		return
 	}
 	// The rehash earned a complete manifest; a transient journal failure
@@ -246,6 +249,7 @@ func (m *Manager) retryEnqueue(pb PendingBackup, manifest []ManifestEntry, log z
 	}
 	log.Error().Str("vm_id", pb.VMID).
 		Msg("pause backup journal writes kept failing; pending record kept for recovery")
+	m.healPendingBackup(pb, log)
 }
 
 // persistPendingBackup and deletePendingBackup tolerate a nil state
@@ -278,6 +282,19 @@ func (m *Manager) deletePendingBackupIf(pb PendingBackup, log zerolog.Logger) {
 	}
 	if err := m.state.DeletePendingBackupIf(pb.VMID, pb.Token); err != nil {
 		log.Error().Err(err).Str("vm_id", pb.VMID).Msg("clear pending backup failed")
+	}
+}
+
+// healPendingBackup re-persists a worker's record on every keep-path:
+// the initial persist can fail (disk exhaustion, transient I/O), and a
+// keep decision without a durable record would evaporate with the
+// process. Owner-guarded, so a newer pause's record is never clobbered.
+func (m *Manager) healPendingBackup(pb PendingBackup, log zerolog.Logger) {
+	if m.state == nil {
+		return
+	}
+	if err := m.state.PutPendingBackupIfOwner(pb); err != nil {
+		log.Error().Err(err).Str("vm_id", pb.VMID).Msg("re-persist pending backup failed")
 	}
 }
 
