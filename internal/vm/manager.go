@@ -1651,8 +1651,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// fallback reverts without destroying). No unit stop — boxd-dead
 			// does not prove guest-dead, and killing a live guest over a
 			// wedged agent is the false-negative the removed probe fell into;
-			// the reconciler owns a truly dead unit.
-			m.setStatus(vmID, StatusError)
+			// the reconciler owns a truly dead unit. persistStateIfPresent,
+			// not setStatus: a destroy racing this branch must not have its
+			// record deletion overwritten by an unconditional put.
+			existing.mu.Lock()
+			existing.Status = StatusError
+			existing.mu.Unlock()
+			m.persistStateIfPresent(existing)
 			return nil, fmt.Errorf("adopted VM %s boxd not ready: %w", vmID, err)
 		}
 		// The wait stretched the adoption window; re-check identity after it,
