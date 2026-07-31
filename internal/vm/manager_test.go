@@ -1493,7 +1493,7 @@ func TestPersistVerified(t *testing.T) {
 		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
 		m.persistState(inst)
 		inst.Unverified = false
-		m.persistVerified(inst)
+		m.persistVerified(inst, false)
 		rec, err := store.Get("vm-1")
 		if err != nil || rec == nil {
 			t.Fatalf("get: rec=%v err=%v", rec, err)
@@ -1503,14 +1503,35 @@ func TestPersistVerified(t *testing.T) {
 		}
 	})
 
-	t.Run("missing record for a tracked VM is created", func(t *testing.T) {
+	t.Run("never-written record for a tracked VM is created", func(t *testing.T) {
 		store := newStore(t)
 		inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
 		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
-		m.persistVerified(inst) // the optimistic write never landed
+		m.persistVerified(inst, true) // the optimistic write failed
 		rec, err := store.Get("vm-1")
 		if err != nil || rec == nil {
 			t.Fatalf("a tracked VM's record must be recreated, got rec=%v err=%v", rec, err)
+		}
+	})
+
+	t.Run("deleted record for a tracked VM is not recreated", func(t *testing.T) {
+		// The reconciler's markStale deletes the record BEFORE untracking, so
+		// a tracked VM with a written-then-missing record may be mid-reconcile
+		// — recreating would leave a durable record for a torn-down VM.
+		store := newStore(t)
+		inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+		m.persistState(inst)
+		if err := store.Delete("vm-1"); err != nil {
+			t.Fatal(err)
+		}
+		m.persistVerified(inst, false) // optimistic write landed; absence means deletion
+		rec, err := store.Get("vm-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec != nil {
+			t.Fatal("a deleted record must not be resurrected mid-reconcile")
 		}
 	})
 
@@ -1518,7 +1539,7 @@ func TestPersistVerified(t *testing.T) {
 		store := newStore(t)
 		inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
 		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
-		m.persistVerified(inst) // a destroy already untracked and deleted it
+		m.persistVerified(inst, true) // a destroy already untracked and deleted it
 		rec, err := store.Get("vm-1")
 		if err != nil {
 			t.Fatal(err)

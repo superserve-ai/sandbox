@@ -2096,10 +2096,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.Unverified = true
 	inst.mu.Unlock()
 	persistDone := make(chan struct{})
+	optimisticOK := false
 	go func() {
 		defer sentrylog.Recover("restore-persist")
 		defer close(persistDone)
-		m.persistState(inst)
+		optimisticOK = m.persistState(inst)
 	}()
 
 	tBoxdStart := time.Now()
@@ -2173,7 +2174,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	go func() {
 		defer sentrylog.Recover("restore-verified-persist")
 		defer handoff()
-		m.persistVerified(inst)
+		m.persistVerified(inst, !optimisticOK)
 	}()
 
 	log.Info().
@@ -2909,16 +2910,18 @@ func (m *Manager) setStatus(vmID string, s VMStatus) {
 // persistState writes the current VM state to BoltDB. No-op if no state
 // store is configured. Errors are logged but not returned — BoltDB is a
 // cache, not a source of truth.
-func (m *Manager) persistState(inst *VMInstance) {
+func (m *Manager) persistState(inst *VMInstance) bool {
 	if m.state == nil {
-		return
+		return true
 	}
 	if isBuildVM(inst.ID) {
-		return
+		return true
 	}
 	if err := m.state.Put(toRecord(inst)); err != nil {
 		m.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to persist VM state to BoltDB")
+		return false
 	}
+	return true
 }
 
 // persistStateIfPresent persists inst only if its record still exists (atomic),
@@ -2937,17 +2940,21 @@ func (m *Manager) persistStateIfPresent(inst *VMInstance) bool {
 }
 
 // persistVerified makes inst's verified state durable after readiness was
-// proven. PutIfPresent alone cannot recreate a record whose optimistic write
-// failed, and without one the running VM is invisible to the next reattach —
-// so a missing record for a still-tracked VM is recreated under the
-// persist-then-verify undo. That recheck is conclusive because every destroy
-// path untracks the VM before deleting its record.
-func (m *Manager) persistVerified(inst *VMInstance) {
+// proven. mayCreate must be set ONLY when the optimistic write failed
+// outright: then no record was ever durable — so no deleter can have been
+// targeting it, and the reconciler's markStale (which deletes the record
+// BEFORE untracking) is out of play — yet without one the running VM is
+// invisible to the next reattach, so it is recreated under the
+// persist-then-verify undo against a racing DestroyVM (which untracks before
+// deleting). When the optimistic write landed, absence can only mean a
+// deletion, and recreating would resurrect a destroyed or reconciled VM.
+func (m *Manager) persistVerified(inst *VMInstance, mayCreate bool) {
 	if m.persistStateIfPresent(inst) {
 		return
 	}
-	// Absent record: either a destroy raced (leave it deleted) or the
-	// optimistic write failed and never created it.
+	if !mayCreate {
+		return
+	}
 	m.mu.RLock()
 	_, tracked := m.vms[inst.ID]
 	m.mu.RUnlock()
