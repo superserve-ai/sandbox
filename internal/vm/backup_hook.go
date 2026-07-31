@@ -26,6 +26,28 @@ func (m *Manager) SetBackupEnqueue(fn func(backup.Task) error) {
 // acceptable and losing the pause's backup is not.
 const pauseRehashBudget = 10 * time.Minute
 
+// enqueueRetryAttempts bounds re-enqueues of a complete manifest whose
+// journal write failed. The digests already describe pause-time bytes,
+// so these retries need neither hashing nor a still-paused sandbox.
+const enqueueRetryAttempts = 3
+
+// pauseManifestComplete reports whether the manifest carries both durable
+// artifacts a restore needs. The pair is the unit of durability: a
+// disk-only generation would publish a manifest that restore rejects,
+// and a vmstate-only one has no filesystem at all.
+func pauseManifestComplete(manifest []ManifestEntry) bool {
+	var disk, vmstate bool
+	for _, e := range manifest {
+		switch e.FileName {
+		case "rootfs.ext4":
+			disk = true
+		case "vmstate.snap":
+			vmstate = true
+		}
+	}
+	return disk && vmstate
+}
+
 // backupPause hashes a pause's durable artifacts and enqueues them for
 // backup. When the synchronous attempt cannot produce an enqueueable
 // manifest (the RPC deadline left no hash budget, or an artifact failed
@@ -40,7 +62,29 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	if m.backupEnqueue == nil {
 		return manifest
 	}
-	if m.enqueueBackup(vmID, manifest) {
+	if pauseManifestComplete(manifest) {
+		if m.enqueueBackup(vmID, manifest) {
+			return manifest
+		}
+		// The hashes are good; only the journal write failed. Retry the
+		// write with the manifest already in hand: its digests describe
+		// pause-time bytes whatever the sandbox does next (the uploader's
+		// pre-verification catches any divergence), so this retry needs
+		// neither a rehash nor a still-paused sandbox.
+		log.Warn().Str("vm_id", vmID).
+			Msg("pause backup journal write failed; retrying enqueue")
+		go func() {
+			delay := time.Second
+			for attempt := 0; attempt < enqueueRetryAttempts; attempt++ {
+				time.Sleep(delay)
+				delay *= 2
+				if m.enqueueBackup(vmID, manifest) {
+					return
+				}
+			}
+			log.Error().Str("vm_id", vmID).
+				Msg("pause backup dropped: journal writes kept failing")
+		}()
 		return manifest
 	}
 	log.Warn().Str("vm_id", vmID).
@@ -109,12 +153,8 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) bool {
 	if m.backupEnqueue == nil || len(manifest) == 0 {
 		return false
 	}
-	hasDisk := false
 	files := make([]backup.TaskFile, 0, len(manifest))
 	for _, e := range manifest {
-		if e.FileName == "rootfs.ext4" {
-			hasDisk = true
-		}
 		files = append(files, backup.TaskFile{
 			Name:     e.FileName,
 			Path:     e.Path,
@@ -123,9 +163,9 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) bool {
 			BasePath: e.BasePath,
 		})
 	}
-	if !hasDisk {
+	if !pauseManifestComplete(manifest) {
 		m.log.Warn().Str("vm_id", vmID).
-			Msg("pause manifest has no disk digest; generation not enqueued for backup")
+			Msg("pause manifest missing a durable artifact digest; generation not enqueued for backup")
 		return false
 	}
 	if err := m.backupEnqueue(backup.Task{

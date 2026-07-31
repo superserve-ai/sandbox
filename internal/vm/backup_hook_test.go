@@ -146,3 +146,85 @@ func TestBackupPauseRetriesWhenJournalWriteFails(t *testing.T) {
 		t.Fatalf("enqueue attempts = %d, want the sync attempt plus the async retry", got)
 	}
 }
+
+// A complete manifest whose journal write failed is re-enqueued as-is:
+// the retry must carry the pause-time digests, not rehash whatever the
+// disk holds by then, and it must not require the sandbox to stay
+// paused for the retry window.
+func TestBackupPauseRetriesEnqueueWithoutRehashing(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("pause-time bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var calls atomic.Int32
+	tasks := make(chan backup.Task, 1)
+	// Deliberately NOT paused: the enqueue retry must not care.
+	m := &Manager{vms: map[string]*VMInstance{
+		"vm-1": {Status: StatusRunning, SnapshotPath: snap},
+	}}
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		if calls.Add(1) == 1 {
+			return errors.New("transient journal failure")
+		}
+		tasks <- task
+		return nil
+	})
+
+	manifest := m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+	if !pauseManifestComplete(manifest) {
+		t.Fatalf("synchronous manifest incomplete: %v", manifest)
+	}
+	var wantDisk string
+	for _, e := range manifest {
+		if e.FileName == "rootfs.ext4" {
+			wantDisk = e.SHA256
+		}
+	}
+	// Mutate the disk after the sync attempt: a rehash would pick these
+	// bytes up, the enqueue retry must not.
+	if err := os.WriteFile(disk, []byte("post-resume bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case task := <-tasks:
+		for _, f := range task.Files {
+			if f.Name == "rootfs.ext4" && f.SHA256 != wantDisk {
+				t.Fatalf("retried disk digest %s, want pause-time %s (manifest was rehashed)", f.SHA256, wantDisk)
+			}
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("enqueue retry never delivered the task")
+	}
+}
+
+// A manifest whose vmstate hash failed must not enqueue: restore needs
+// the disk and vmstate pair, and a disk-only generation would publish a
+// manifest describing an unrestorable set.
+func TestBackupPauseNeverEnqueuesWithoutVMStateDigest(t *testing.T) {
+	dir := t.TempDir()
+	disk := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(disk, []byte("disk bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	missingSnap := filepath.Join(dir, "vmstate.snap")
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{vms: map[string]*VMInstance{
+		"vm-1": {Status: StatusPaused, SnapshotPath: missingSnap},
+	}}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	m.backupPause(context.Background(), "vm-1", missingSnap, disk, "", zerolog.Nop())
+
+	select {
+	case task := <-tasks:
+		t.Fatalf("enqueued %+v despite a missing vmstate digest", task)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
