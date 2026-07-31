@@ -249,7 +249,7 @@ type Manager struct {
 	state       *StateStore // persistent local state (BoltDB); nil = no persistence
 	// backupEnqueue hands finalized pause manifests to the durability
 	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
-	backupEnqueue func(backup.Task)
+	backupEnqueue func(backup.Task) error
 
 	// launcherReady gates the launcher launch path: false → launches use the
 	// legacy path. Set when the namespace is built/validated; kept in sync by
@@ -923,14 +923,6 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	}
 	stopCancel()
 
-	// Hash the durable artifacts once the unit is stopped and the files are
-	// at rest. Runs under its own budget derived from the RPC deadline (see
-	// collectPauseManifest): large disks must not pin this handler past the
-	// pause RPC cap, or the control plane times out and retries against an
-	// already-stopped unit; a budget-exhausted hash just yields a partial
-	// manifest, never a late response.
-	manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
-
 	inst.mu.Lock()
 	inst.Status = StatusPaused
 	inst.SnapshotPath = snapshotPath
@@ -940,6 +932,17 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	inst.mu.Unlock()
 
 	m.persistState(inst)
+
+	// Hash the durable artifacts once the unit is stopped and the files are
+	// at rest. Runs under its own budget derived from the RPC deadline (see
+	// collectPauseManifest): large disks must not pin this handler past the
+	// pause RPC cap, or the control plane times out and retries against an
+	// already-stopped unit; a budget-exhausted hash just yields a partial
+	// manifest, never a late response. Runs AFTER the paused status is
+	// recorded: the async rehash proves at-rest bytes against that status,
+	// and hashing before the flip would make it drop every retry.
+	manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
+
 	log.Info().Msg("VM paused")
 	return snapshotPath, memPath, manifest, nil
 }

@@ -2,8 +2,10 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,7 +32,7 @@ func TestBackupPauseRetriesAsynchronouslyWhenBudgetExhausted(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{
 		"vm-1": {Status: StatusPaused, SnapshotPath: snap},
 	}}
-	m.SetBackupEnqueue(func(task backup.Task) { tasks <- task })
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
 	defer cancel()
@@ -69,7 +71,7 @@ func TestBackupPauseNeverEnqueuesWithoutDiskDigest(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{
 		"vm-1": {Status: StatusPaused, SnapshotPath: snap},
 	}}
-	m.SetBackupEnqueue(func(task backup.Task) { tasks <- task })
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
 	m.backupPause(context.Background(), "vm-1", snap, filepath.Join(dir, "missing.ext4"), "", zerolog.Nop())
 
@@ -97,7 +99,7 @@ func TestBackupPauseDropsRehashWhenSandboxNotAtRest(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{
 		"vm-1": {Status: StatusRunning, SnapshotPath: snap},
 	}}
-	m.SetBackupEnqueue(func(task backup.Task) { tasks <- task })
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
 	defer cancel()
@@ -109,5 +111,38 @@ func TestBackupPauseDropsRehashWhenSandboxNotAtRest(t *testing.T) {
 	case task := <-tasks:
 		t.Fatalf("rehash enqueued %+v for a running sandbox", task)
 	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// A journal write that fails must count as not-enqueued so the async
+// retry runs; success was previously reported on a logged-and-dropped
+// error, leaving the pause uncovered with no retry at all.
+func TestBackupPauseRetriesWhenJournalWriteFails(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var calls atomic.Int32
+	m := &Manager{vms: map[string]*VMInstance{
+		"vm-1": {Status: StatusPaused, SnapshotPath: snap},
+	}}
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		calls.Add(1)
+		return errors.New("no space left on device")
+	})
+
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+
+	deadline := time.Now().Add(10 * time.Second)
+	for calls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := calls.Load(); got < 2 {
+		t.Fatalf("enqueue attempts = %d, want the sync attempt plus the async retry", got)
 	}
 }

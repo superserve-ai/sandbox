@@ -12,8 +12,11 @@ import (
 
 // SetBackupEnqueue installs the durability pipeline's enqueue hook. Called
 // once at startup before VMs exist, same pattern as SetStateStore. A nil
-// hook (backup disabled) makes pause behave exactly as before.
-func (m *Manager) SetBackupEnqueue(fn func(backup.Task)) {
+// hook (backup disabled) makes pause behave exactly as before. The hook
+// returns the journal write's error so callers can retry: an enqueue that
+// fails (disk exhaustion, I/O error) and only logs would report the pause
+// as covered while nothing reached BoltDB.
+func (m *Manager) SetBackupEnqueue(fn func(backup.Task) error) {
 	m.backupEnqueue = fn
 }
 
@@ -125,7 +128,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) bool {
 			Msg("pause manifest has no disk digest; generation not enqueued for backup")
 		return false
 	}
-	m.backupEnqueue(backup.Task{
+	if err := m.backupEnqueue(backup.Task{
 		SandboxID: vmID,
 		// Keyed on every artifact digest: any changed artifact means a new
 		// generation, so create-only dedupe can never mix old and new
@@ -133,6 +136,10 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) bool {
 		Generation: backup.GenerationKey(files),
 		Files:      files,
 		Priority:   backup.PriorityPause,
-	})
+	}); err != nil {
+		m.log.Error().Err(err).Str("vm_id", vmID).
+			Msg("backup enqueue failed; pause not journaled")
+		return false
+	}
 	return true
 }

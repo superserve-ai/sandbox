@@ -500,11 +500,7 @@ func main() {
 			Log:        log.With().Str("component", "backup").Logger(),
 			VMDVersion: os.Getenv("SENTRY_RELEASE"),
 		}
-		mgr.SetBackupEnqueue(func(t backup.Task) {
-			if err := journal.Enqueue(t); err != nil {
-				log.Error().Err(err).Str("sandbox_id", t.SandboxID).Msg("backup enqueue failed")
-			}
-		})
+		mgr.SetBackupEnqueue(journal.Enqueue)
 		// The uploader must fully stop before the journal and GCS client
 		// close under it: a verification or Nack cut off mid-write leaves
 		// a finalized object the journal never recorded, which the
