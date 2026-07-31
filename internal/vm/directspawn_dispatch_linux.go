@@ -2,7 +2,9 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -51,6 +53,19 @@ func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVM
 			}
 		}
 		pid, err = m.startFirecrackerDirect(ctx, vmID, socketPath, perVMRootfs, basePath, netNS)
+		if err != nil && errors.Is(err, fs.ErrNotExist) {
+			// The delegated scope is gone (keeper died, drained scope GC'd).
+			// Scope-gone proves no cgroup FC survives for this ID (a populated
+			// child would have pinned the scope), so a unit launch cannot
+			// double-spawn. The deploy guard restarting the keeper restores
+			// the cgroup path with no re-arm.
+			m.log.Error().Str("vm_id", vmID).Err(err).Msg("direct spawn scope missing; falling back to unit supervision")
+			// The unit is only provably fresh for a first-life create; any
+			// prior life (or prior cgroup record) must take the guarded path.
+			fallbackFresh := freshUnit && !hadPriorLife && !cgroupSupervised(existing)
+			pid, err = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, basePath, netNS, fallbackFresh)
+			return pid, SupervisionUnit, err
+		}
 		return pid, SupervisionCgroup, err
 	}
 	pid, err = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, basePath, netNS, freshUnit)
@@ -191,6 +206,10 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 	console, err := openVMConsole(m.cfg.RunDir, vmID)
 	if err != nil {
 		cgDir.Close()
+		// An abandoned empty cgroup plus the cgroup-supervised record the
+		// caller persists sits outside every reaper's rules and wedges
+		// drain-check.
+		_ = m.cgroups.removeVMCgroup(context.WithoutCancel(ctx), vmID)
 		return 0, fmt.Errorf("open vm console: %w", err)
 	}
 

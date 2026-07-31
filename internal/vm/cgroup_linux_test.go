@@ -3,6 +3,8 @@ package vm
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -257,5 +259,19 @@ func TestSafeVMCgroupDirRejectsTraversal(t *testing.T) {
 	}
 	if got, err := tree.safeVMCgroupDir("vm-123"); err != nil || got != "/sys/fs/cgroup/x/vms/vm-123" {
 		t.Fatalf("valid id: got %q err %v", got, err)
+	}
+}
+
+// The keeper-death fallback keys on ErrNotExist surviving createVMCgroup's
+// wrapping: a missing parent scope must stay errors.Is-detectable, or the
+// unit-supervision fallback silently stops firing.
+func TestCreateVMCgroupMissingScopeIsNotExist(t *testing.T) {
+	tree := &cgroupTree{vms: filepath.Join(t.TempDir(), "gone", "vms")}
+	_, err := tree.createVMCgroup("vm-1")
+	if err == nil {
+		t.Fatal("expected error for a missing parent scope")
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("missing-scope error must be fs.ErrNotExist-detectable, got: %v", err)
 	}
 }
