@@ -1078,6 +1078,14 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	// to the snapshot, so return the live instance — same guard as the
 	// stateless restore path.
 	if existing := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
+		// A Running record can predate readiness verification (the persist
+		// overlaps the boxd wait, and a vmd restart in that window reattaches
+		// it), so adoption must re-verify. A bounded WAIT, not a single probe:
+		// a warming VM passes, a completed prior restore answers in ~1ms, and
+		// only a truly dead boxd fails — the caller's error path owns cleanup.
+		if err := m.waitForBoxd(ctx, existing.IP, 30*time.Second); err != nil {
+			return nil, fmt.Errorf("adopted VM %s boxd not ready: %w", vmID, err)
+		}
 		log.Info().Msg("resume: VM already running and healthy, returning it")
 		return existing, nil
 	}
@@ -2018,10 +2026,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	// Resume-path parity: Running means the vCPUs are live; boxd readiness is
-	// verified below and still fails the restore. Stamping + persisting here
-	// overlaps the BoltDB fsync with the boxd wait instead of paying them
-	// serially.
-	m.setStatus(vmID, StatusRunning)
+	// verified below and still fails the restore. The status is set directly —
+	// setStatus would persist synchronously, serializing the very fsync the
+	// goroutine overlaps with the boxd wait.
+	inst.mu.Lock()
+	inst.Status = StatusRunning
+	inst.mu.Unlock()
 	persistDone := make(chan struct{})
 	go func() {
 		defer sentrylog.Recover("restore-persist")
@@ -2035,10 +2045,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// evicted) legitimately needs more than a warm same-host resume, and a
 	// timeout here is destructive — the error path below tears down the VM.
 	if err := m.waitForBoxd(ctx, hostIP, 30*time.Second); err != nil {
-		// The optimistic record must not outlive the teardown (join first so
-		// the delete cannot race the write).
+		// Join before setStatus(StatusError) persists, or the goroutine's
+		// Running write could land after the Error write.
 		<-persistDone
-		m.deleteState(vmID)
 		m.stopUnitDuringRestoreError(vmID)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
