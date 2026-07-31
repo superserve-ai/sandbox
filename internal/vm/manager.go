@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/presence"
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -246,6 +247,9 @@ type Manager struct {
 	egressProxy *network.EgressProxy
 	log         zerolog.Logger
 	state       *StateStore // persistent local state (BoltDB); nil = no persistence
+	// backupEnqueue hands finalized pause manifests to the durability
+	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
+	backupEnqueue func(backup.Task)
 
 	// launcherReady gates the launcher launch path: false → launches use the
 	// legacy path. Set when the namespace is built/validated; kept in sync by
@@ -782,7 +786,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			return "", "", nil, status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
 		}
 		log.Info().Msg("pause: VM already paused, returning existing snapshot")
-		return snapshotPath, memPath, collectPauseManifest(ctx, snapshotPath, retryDiskPath, retryDiskBase, log), nil
+		manifest := collectPauseManifest(ctx, snapshotPath, retryDiskPath, retryDiskBase, log)
+		m.enqueueBackup(vmID, manifest)
+		return snapshotPath, memPath, manifest, nil
 	}
 	inst.mu.RUnlock()
 
@@ -925,6 +931,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// already-stopped unit; a budget-exhausted hash just yields a partial
 	// manifest, never a late response.
 	manifest = collectPauseManifest(ctx, snapshotPath, diskPath, diskBasePath, log)
+	m.enqueueBackup(vmID, manifest)
 
 	inst.mu.Lock()
 	inst.Status = StatusPaused

@@ -1,8 +1,11 @@
 package main
 
 import (
+	"cloud.google.com/go/storage"
 	"context"
 	"fmt"
+	bolt "go.etcd.io/bbolt"
+	"golang.org/x/time/rate"
 	"net"
 	"os"
 	"os/exec"
@@ -23,6 +26,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/blocklist"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/network"
@@ -462,6 +466,48 @@ func main() {
 	}
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
+
+	// ---- Backup uploader ----
+	// Ships each pause's durable artifacts (disk overlay + vmstate) to the
+	// cell's backup bucket, content-addressed and create-only. Disabled
+	// unless BACKUP_BUCKET is set; the journal makes uploads crash-safe
+	// across vmd restarts, and the bandwidth cap keeps backups from
+	// competing with guest traffic.
+	if bucket := os.Getenv("BACKUP_BUCKET"); bucket != "" {
+		journalPath := envOrDefault("BACKUP_JOURNAL_PATH", filepath.Join(filepath.Dir(cfg.RunDir), "backup.db"))
+		bdb, err := bolt.Open(journalPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
+		if err != nil {
+			log.Fatal().Err(err).Str("path", journalPath).Msg("failed to open backup journal")
+		}
+		lc.addCloser("backup journal", func(_ context.Context) error { return bdb.Close() })
+		journal, err := backup.NewJournal(bdb)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to init backup journal")
+		}
+		gcsClient, err := storage.NewClient(ctx)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to create GCS client for backup")
+		}
+		lc.addCloser("backup gcs client", func(_ context.Context) error { return gcsClient.Close() })
+		mbps, _ := strconv.Atoi(envOrDefault("BACKUP_BANDWIDTH_MBPS", "100"))
+		if mbps <= 0 {
+			mbps = 100
+		}
+		uploader := &backup.Uploader{
+			Journal:    journal,
+			Store:      backup.NewGCSStore(gcsClient, bucket),
+			Limiter:    rate.NewLimiter(rate.Limit(mbps)*1024*1024, 32<<20),
+			Log:        log.With().Str("component", "backup").Logger(),
+			VMDVersion: os.Getenv("SENTRY_RELEASE"),
+		}
+		mgr.SetBackupEnqueue(func(t backup.Task) {
+			if err := journal.Enqueue(t); err != nil {
+				log.Error().Err(err).Str("sandbox_id", t.SandboxID).Msg("backup enqueue failed")
+			}
+		})
+		lc.start("backup uploader", func() error { return uploader.Run(ctx) })
+		log.Info().Str("bucket", bucket).Int("bandwidth_mbps", mbps).Msg("backup uploader enabled")
+	}
 
 	// ---- gRPC server ----
 	// Bind and serve BEFORE the reattach so a restart doesn't refuse connections
