@@ -2017,12 +2017,28 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
+	// Resume-path parity: Running means the vCPUs are live; boxd readiness is
+	// verified below and still fails the restore. Stamping + persisting here
+	// overlaps the BoltDB fsync with the boxd wait instead of paying them
+	// serially.
+	m.setStatus(vmID, StatusRunning)
+	persistDone := make(chan struct{})
+	go func() {
+		defer sentrylog.Recover("restore-persist")
+		defer close(persistDone)
+		m.persistState(inst)
+	}()
+
 	tBoxdStart := time.Now()
 	// Same window as first boot: a restore that has to fault its memory and
 	// overlay from cold storage (first resume of a migrated VM, page cache
 	// evicted) legitimately needs more than a warm same-host resume, and a
 	// timeout here is destructive — the error path below tears down the VM.
 	if err := m.waitForBoxd(ctx, hostIP, 30*time.Second); err != nil {
+		// The optimistic record must not outlive the teardown (join first so
+		// the delete cannot race the write).
+		<-persistDone
+		m.deleteState(vmID)
 		m.stopUnitDuringRestoreError(vmID)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
@@ -2040,11 +2056,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// secs_since_template_restore reflects real warmth for either backend.
 	m.markTemplateRestored(warmthPath)
 
-	m.setStatus(vmID, StatusRunning)
-	m.persistState(inst)
+	<-persistDone
 	// Persist-then-verify: checking AFTER the write leaves no window — a
 	// concurrent DestroyVM either erased the record itself or is caught here,
-	// and we erase our write and tear down instead of resurrecting it.
+	// and we erase our write and tear down instead of resurrecting it. The
+	// join above keeps the write happened-before this check.
 	m.mu.RLock()
 	_, stillTracked := m.vms[vmID]
 	m.mu.RUnlock()
