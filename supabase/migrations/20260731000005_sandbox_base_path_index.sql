@@ -28,6 +28,21 @@ BEGIN;
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '10s';
 
+-- IF NOT EXISTS matches by name only: an interrupted concurrent pre-build
+-- leaves an INVALID index that would be silently kept, recording this
+-- migration as applied while both queries still sequential-scan. Fail the
+-- push instead; the fix is DROP INDEX + re-run the pre-build above.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_index
+    WHERE indexrelid = to_regclass('public.idx_sandbox_base_path_active')
+      AND NOT indisvalid
+  ) THEN
+    RAISE EXCEPTION 'idx_sandbox_base_path_active exists but is INVALID (interrupted concurrent build); DROP INDEX idx_sandbox_base_path_active, re-run the concurrent pre-build, then retry this push';
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_sandbox_base_path_active
   ON sandbox(base_path)
   WHERE base_path IS NOT NULL AND destroyed_at IS NULL;
