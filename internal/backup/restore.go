@@ -168,13 +168,12 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 // open, verify, and cleanup in the restore runs relative to that pinned
 // descriptor.
 //
-// The leaf is checked through a Root on the parent: a symlink at dir must
-// never be followed, whether pre-planted (the plain Lstat and the pinned
-// re-check both refuse it) or swapped in concurrently. os.Root methods do
-// follow symlinks, but only confined within the root (absolute targets and
-// escapes error), so even a leaf link raced past the re-check cannot
-// anchor the restore outside dir's parent; and once the Root is open it
-// tracks the directory itself, unaffected by later renames at the path.
+// A symlink at dir itself must never be followed, whether pre-planted
+// (the plain Lstat refuses it with a clear error) or swapped in
+// concurrently: openRootNoFollow makes the open itself reject a symlink
+// leaf, atomically in the kernel on linux, so there is no check-to-open
+// window. Once the Root is open it tracks the directory itself,
+// unaffected by later renames at the path.
 func openFreshDir(dir string) (*os.Root, error) {
 	dir = filepath.Clean(dir)
 	if fi, err := os.Lstat(dir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
@@ -183,20 +182,7 @@ func openFreshDir(dir string) (*os.Root, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("dest dir: %w", err)
 	}
-	parent, err := os.OpenRoot(filepath.Dir(dir))
-	if err != nil {
-		return nil, fmt.Errorf("dest dir parent: %w", err)
-	}
-	defer parent.Close()
-	base := filepath.Base(dir)
-	fi, err := parent.Lstat(base)
-	if err != nil {
-		return nil, fmt.Errorf("dest dir: %w", err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("dest dir %s is a symlink: restore only writes into a real directory", dir)
-	}
-	root, err := parent.OpenRoot(base)
+	root, err := openRootNoFollow(filepath.Dir(dir), filepath.Base(dir))
 	if err != nil {
 		return nil, fmt.Errorf("dest dir: %w", err)
 	}

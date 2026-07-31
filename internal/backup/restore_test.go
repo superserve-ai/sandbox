@@ -262,6 +262,42 @@ func TestRestoreGenerationRejectsManifestMissingEntries(t *testing.T) {
 	}
 }
 
+func TestOpenRootNoFollowRejectsSymlinkLeaf(t *testing.T) {
+	// The leaf being a symlink at open time must be rejected by the open
+	// itself (kernel-atomic O_NOFOLLOW on linux; Lstat approximation
+	// elsewhere), exactly the swap a raced check would miss.
+	parent := t.TempDir()
+	target := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(parent, "leaf")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := openRootNoFollow(parent, "leaf")
+	if err == nil {
+		root.Close()
+		t.Fatal("openRootNoFollow followed a symlink leaf")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("err = %v, want symlink rejection", err)
+	}
+	// A real directory leaf opens fine and the root is usable.
+	if err := os.Mkdir(filepath.Join(parent, "realdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root, err = openRootNoFollow(parent, "realdir")
+	if err != nil {
+		t.Fatalf("open real directory: %v", err)
+	}
+	defer root.Close()
+	f, err := root.OpenFile("probe", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		t.Fatalf("create through no-follow root: %v", err)
+	}
+	f.Close()
+	if _, err := os.Stat(filepath.Join(parent, "realdir", "probe")); err != nil {
+		t.Fatalf("probe file not in the opened directory: %v", err)
+	}
+}
+
 func TestRestoreRootPinsDirAcrossSwap(t *testing.T) {
 	// Once the destination Root is open it tracks the directory itself: a
 	// symlink swapped in at the path afterwards must not redirect writes,
