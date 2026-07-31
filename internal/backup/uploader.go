@@ -237,11 +237,8 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// re-pause may then trust a dedupe of this object.
 		if !task.HasVerified(object) {
 			task.VerifiedObjects = append(task.VerifiedObjects, object)
-			if err := u.Journal.Update(*task); err != nil {
-				return ManifestFile{}, fmt.Errorf("persist verification of %s: %w", object, err)
-			}
 		}
-		if err := u.Journal.MarkVerified(object, time.Now()); err != nil {
+		if err := u.Journal.RecordVerification(*task, object, time.Now()); err != nil {
 			return ManifestFile{}, fmt.Errorf("record verification of %s: %w", object, err)
 		}
 	} else if !task.HasVerified(object) {

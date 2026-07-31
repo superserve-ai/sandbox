@@ -43,4 +43,13 @@ func TestGenerationKey(t *testing.T) {
 	if changed == k1 {
 		t.Fatal("changed vmstate digest did not change the generation key")
 	}
+	// A re-based overlay with unchanged bytes is a different generation:
+	// the manifest pairs it with a different base image.
+	rebased := GenerationKey([]TaskFile{
+		{Name: "rootfs.ext4", SHA256: "aaaa", BasePath: "/templates/t/b2/base.ext4"},
+		base[1],
+	})
+	if rebased == k1 {
+		t.Fatal("changed base dependency did not change the generation key")
+	}
 }

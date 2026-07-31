@@ -235,6 +235,25 @@ func (j *Journal) MarkVerified(object string, now time.Time) error {
 	})
 }
 
+// RecordVerification persists BOTH verification records in one
+// transaction: the task's own progress (survives nacks) and the durable
+// history (survives acks). Atomicity is the point: a crash between two
+// separate writes would leave a task that trusts its dedupe while the
+// history never learns of the object, silently degrading later unchanged
+// re-pauses to abandonment.
+func (j *Journal) RecordVerification(task Task, object string, now time.Time) error {
+	val, err := json.Marshal(task)
+	if err != nil {
+		return err
+	}
+	return j.db.Update(func(tx *bolt.Tx) error {
+		if err := tx.Bucket(journalBucket).Put(task.key(), val); err != nil {
+			return err
+		}
+		return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
+	})
+}
+
 // WasVerified reports whether any task ever digest-verified this object
 // within the retention window.
 func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
