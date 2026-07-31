@@ -16,12 +16,19 @@ DROP VIEW IF EXISTS analytics.weekly_team_sandbox_count;
 -- since a plan being deactivated today doesn't undo what was effective
 -- during its actual assignment window. LATERAL correlates the resolution
 -- to each row's own hour_start.
+--
+-- Usage recorded before a resource's first effective rate (real gap: usage
+-- starts 2026-04-14, payg rates start 2026-06-17, the platform's actual
+-- pricing launch date) has no rate to resolve, so COALESCE prices it at 0
+-- rather than leaving spend_usd NULL — otherwise panel-side SUM() silently
+-- drops those hours instead of reflecting that pre-launch usage was
+-- genuinely unpriced.
 CREATE OR REPLACE VIEW analytics.team_hourly_spend AS
 SELECT t.name AS team_name,
        u.hour_start,
-       (u.vcpu_seconds * vcpu_rate.price_usd
-        + u.memory_mib_seconds / 1024 * mem_rate.price_usd
-        + u.storage_mib_seconds / 1024 * storage_rate.price_usd
+       (u.vcpu_seconds * COALESCE(vcpu_rate.price_usd, 0)
+        + u.memory_mib_seconds / 1024 * COALESCE(mem_rate.price_usd, 0)
+        + u.storage_mib_seconds / 1024 * COALESCE(storage_rate.price_usd, 0)
        )::numeric(14,6) AS spend_usd
 FROM team_billing_usage_hourly u
 JOIN team t ON t.id = u.team_id
