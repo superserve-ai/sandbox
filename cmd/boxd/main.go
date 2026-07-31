@@ -126,6 +126,7 @@ func main() {
 	}
 	mux.Handle(boxdpbconnect.NewProcessServiceHandler(procService))
 	mux.Handle(boxdpbconnect.NewFilesystemServiceHandler(&filesystemService{}))
+	mux.Handle(boxdpbconnect.NewDesktopServiceHandler(newDesktopService()))
 
 	// Raw HTTP endpoints (file content transfer + health + init + exec).
 	mux.HandleFunc("/files", handleFiles)
