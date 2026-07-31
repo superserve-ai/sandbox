@@ -155,7 +155,7 @@ func TestJournalQueueKeysScopedByOwner(t *testing.T) {
 			break
 		}
 		owners[task.owner()] = true
-		if err := j.Ack(task); err != nil {
+		if err := j.Ack(task, false); err != nil {
 			t.Fatal(err)
 		}
 	}

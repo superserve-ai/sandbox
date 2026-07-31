@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -65,7 +67,10 @@ func TestBackupBuildArtifactsHashesAndEnqueuesWithHook(t *testing.T) {
 
 	var tasks []backup.Task
 	m := &Manager{}
-	m.SetBackupEnqueue(func(task backup.Task) { tasks = append(tasks, task) })
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		tasks = append(tasks, task)
+		return nil
+	})
 	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", zerolog.Nop())
 
 	if len(tasks) != 1 {
@@ -111,7 +116,10 @@ func TestBackupBuildArtifactsRefusesMissingDeclaredArtifact(t *testing.T) {
 
 	var tasks []backup.Task
 	m := &Manager{}
-	m.SetBackupEnqueue(func(task backup.Task) { tasks = append(tasks, task) })
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		tasks = append(tasks, task)
+		return nil
+	})
 	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", zerolog.Nop())
 
 	if len(tasks) != 0 {
@@ -165,7 +173,10 @@ func TestAdoptedBuildWithoutStampedDigestsRerunsBackup(t *testing.T) {
 
 	tasks := make(chan backup.Task, 2)
 	m := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
-	m.SetBackupEnqueue(func(task backup.Task) { tasks <- task })
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		tasks <- task
+		return nil
+	})
 
 	snap, ok := m.GetBuildStatus("build-tpl")
 	if !ok || snap.Status != BuildStatusReady {
@@ -204,7 +215,7 @@ func TestAdoptedBuildWithStampedDigestsEnqueuesWithoutRehash(t *testing.T) {
 
 	// Stamp via the normal completion pipeline.
 	stamper := &Manager{}
-	stamper.SetBackupEnqueue(func(backup.Task) {})
+	stamper.SetBackupEnqueue(func(backup.Task) error { return nil })
 	stamper.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", zerolog.Nop())
 	stamped, err := readStampedBuildDigests(dir)
 	if err != nil || len(stamped) == 0 {
@@ -227,7 +238,10 @@ func TestAdoptedBuildWithStampedDigestsEnqueuesWithoutRehash(t *testing.T) {
 
 	tasks := make(chan backup.Task, 2)
 	m := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
-	m.SetBackupEnqueue(func(task backup.Task) { tasks <- task })
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		tasks <- task
+		return nil
+	})
 	if snap, ok := m.GetBuildStatus("build-tpl"); !ok || snap.Status != BuildStatusReady {
 		t.Fatalf("adoption = %+v ok=%v, want ready", snap, ok)
 	}
@@ -277,5 +291,59 @@ func TestAdoptedBuildWithoutHookDoesNothing(t *testing.T) {
 	}
 	if !bytes.Equal(got, meta) {
 		t.Fatalf("build.meta.json rewritten with backup disabled:\n%s", got)
+	}
+}
+
+// A journal write that fails transiently must not be swallowed: the
+// completion path returns without blocking (the retry backoff runs off
+// the build path) and the task is re-enqueued from the digests already in
+// hand, no rehash. The hook fails once, then succeeds; the delivered task
+// must carry the digests stamped during the original hash pass.
+func TestBackupBuildArtifactsRetriesFailedEnqueue(t *testing.T) {
+	dir := t.TempDir()
+	writeBuildFixture(t, dir)
+
+	var calls atomic.Int32
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{}
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		if calls.Add(1) == 1 {
+			return errors.New("journal unavailable")
+		}
+		tasks <- task
+		return nil
+	})
+
+	start := time.Now()
+	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", zerolog.Nop())
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("build path blocked %v on enqueue retry; retry must be async", elapsed)
+	}
+
+	task := waitForTask(t, tasks)
+	if calls.Load() < 2 {
+		t.Fatalf("hook called %d times, want a retry after the failure", calls.Load())
+	}
+	if task.TemplateID != "tpl" || task.BuildID != "build-tpl" {
+		t.Fatalf("task owner = %q/%q, want tpl/build-tpl", task.TemplateID, task.BuildID)
+	}
+	// The retried task is rebuilt from the manifest in hand: its digests
+	// are exactly the ones stamped into build.meta.json by the original
+	// (only) hash pass.
+	stamped, err := readStampedBuildDigests(dir)
+	if err != nil || len(stamped) == 0 {
+		t.Fatalf("stamped digests = %v err=%v", stamped, err)
+	}
+	recorded := make(map[string]string, len(stamped))
+	for _, d := range stamped {
+		recorded[d.Name] = d.SHA256
+	}
+	for _, f := range task.Files {
+		if f.Name == buildMetaFilename {
+			continue
+		}
+		if recorded[f.Name] != f.SHA256 {
+			t.Fatalf("retried digest for %s = %s, want stamped %s", f.Name, f.SHA256, recorded[f.Name])
+		}
 	}
 }

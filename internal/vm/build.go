@@ -282,7 +282,37 @@ func (m *Manager) finishBuildBackupEnqueue(ctx context.Context, templateID, buil
 		SizeBytes: size,
 		SHA256:    sum,
 	})
-	m.enqueueTemplateBackup(templateID, buildVMID, entries)
+	if m.enqueueTemplateBackup(templateID, buildVMID, entries) {
+		return
+	}
+	// Only the journal write failed; the digests in hand describe the
+	// finished artifacts and are already stamped into build.meta.json, so
+	// the retry needs no rehash. Async so neither build completion nor a
+	// status poll ever blocks on journal recovery, mirroring the pause
+	// path's retryEnqueue. Unlike pause, no pending marker is persisted:
+	// the stamped meta IS the durable retry state, and the next process's
+	// adopted-build reconciliation rebuilds this exact task from it.
+	log.Warn().Msg("template backup journal write failed; retrying enqueue")
+	go m.retryTemplateEnqueue(templateID, buildVMID, entries, log)
+}
+
+// retryTemplateEnqueue re-attempts a template build's journal write with
+// bounded backoff. Exhausted retries leave recovery to the adopted-build
+// reconciliation after the next restart (the in-memory registry keeps
+// serving the build meanwhile, so within this process the gap is
+// log-and-monitoring surfaced, never silently closed).
+func (m *Manager) retryTemplateEnqueue(templateID, buildVMID string, entries []ManifestEntry, log zerolog.Logger) {
+	delay := time.Second
+	for attempt := 0; attempt < enqueueRetryAttempts; attempt++ {
+		time.Sleep(delay)
+		delay *= 2
+		if m.enqueueTemplateBackup(templateID, buildVMID, entries) {
+			log.Info().Int("attempt", attempt+1).Msg("template backup enqueued after retry")
+			return
+		}
+	}
+	log.Error().Str("template_id", templateID).Str("build_vm_id", buildVMID).
+		Msg("template backup journal writes kept failing; build stays unjournaled until restart reconciliation")
 }
 
 // readStampedBuildDigests returns the artifact digests writeBuildDigests

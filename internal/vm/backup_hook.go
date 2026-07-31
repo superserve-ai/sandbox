@@ -721,14 +721,15 @@ func rebuildTask(vmID string, manifest []ManifestEntry) backup.Task {
 }
 
 // enqueueTemplateBackup hands a completed template build's hashed artifact
-// set to the backup pipeline. Same contract as enqueueBackup: a nil hook
-// (backup disabled) is a no-op, and the enqueue is a local journal write
-// that must never fail the build. Template builds ride the pause priority:
-// a finished build is user-visible durability exactly like a pause, and
-// build volume is far too low to starve the pause lane.
-func (m *Manager) enqueueTemplateBackup(templateID, buildID string, manifest []ManifestEntry) {
+// set to the backup pipeline, reporting whether a task was enqueued. Same
+// contract as enqueueBackup: a nil hook (backup disabled) is a no-op, and
+// the enqueue is a local journal write that must never fail the build; the
+// caller owns retrying a failed write. Template builds ride the pause
+// priority: a finished build is user-visible durability exactly like a
+// pause, and build volume is far too low to starve the pause lane.
+func (m *Manager) enqueueTemplateBackup(templateID, buildID string, manifest []ManifestEntry) bool {
 	if m.backupEnqueue == nil || len(manifest) == 0 {
-		return
+		return false
 	}
 	files := make([]backup.TaskFile, 0, len(manifest))
 	for _, e := range manifest {
@@ -739,11 +740,16 @@ func (m *Manager) enqueueTemplateBackup(templateID, buildID string, manifest []M
 			Size:   e.SizeBytes,
 		})
 	}
-	m.backupEnqueue(backup.Task{
+	if err := m.backupEnqueue(backup.Task{
 		TemplateID: templateID,
 		BuildID:    buildID,
 		Generation: backup.GenerationKey(files),
 		Files:      files,
 		Priority:   backup.PriorityPause,
-	})
+	}); err != nil {
+		m.log.Error().Err(err).Str("template_id", templateID).Str("build_vm_id", buildID).
+			Msg("backup enqueue failed; build not journaled")
+		return false
+	}
+	return true
 }
