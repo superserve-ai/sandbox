@@ -12,28 +12,27 @@ DROP VIEW IF EXISTS analytics.weekly_team_sandbox_count;
 -- resolving against the current wall clock would retroactively reprice
 -- all history on every plan/rate change. Mirrors the point-in-time
 -- pattern in db/queries/billing.sql (ListPricingRatesForPlanAt), not the
--- current-state pattern (GetTeamActivePricingPlan) — no p.active filter,
+-- current-state pattern (GetTeamActivePricingPlan): no p.active filter,
 -- since a plan being deactivated today doesn't undo what was effective
 -- during its actual assignment window. LATERAL correlates the resolution
 -- to each row's own hour_start.
 --
 -- Usage before the platform's single, actual pricing-launch instant (the
--- earliest effective_from across all of pricing_rate — 2026-06-17 today)
--- prices at 0: that usage was genuinely unpriced pre-launch, a historical
--- fact independent of team or plan. Past that instant, a resource with no
--- matching rate resolves to NULL instead of 0, whether that's a one-off
--- gap between two rate periods or a custom plan that never defined the
--- resource at all — same "can't price this" signal
--- handlers_platform_billing.go's pricing_unavailable surfaces, deliberately
--- not silently zeroed. A single fixed launch instant (not a per-resource
--- "first rate ever seen") matters here: the latter would zero an eternally
--- incomplete plan's missing resource forever, not just during launch.
+-- earliest effective_from across all of pricing_rate) prices at 0: that
+-- usage was genuinely unpriced pre-launch, a historical fact independent
+-- of team or plan. Past that instant, a resource with no matching rate
+-- resolves to NULL instead of 0, whether that's a one-off gap between two
+-- rate periods or a custom plan that never defined the resource at all,
+-- the same "can't price this" signal handlers_platform_billing.go's
+-- pricing_unavailable surfaces, deliberately not silently zeroed. A
+-- single fixed launch instant (not a per-resource "first rate ever seen")
+-- matters here: the latter would zero an eternally incomplete plan's
+-- missing resource forever, not just during launch.
 --
--- SUM() in the panel query drops NULL rows the same way it would drop a
--- genuinely-zero one, so today this doesn't surface as an incomplete total
--- in the UI — acceptable for now since team_pricing_plan is empty (every
--- team is on payg, which prices all three resources), so there is no live
--- gap to flag. Revisit if a non-payg plan is ever assigned.
+-- NULL propagates through the row's spend_usd sum, and SUM(spend_usd) in
+-- the panel query skips NULL inputs, so panels summing spend exclude
+-- unpriceable hours from a team's total rather than understating it with
+-- a fabricated zero.
 CREATE OR REPLACE VIEW analytics.team_hourly_spend AS
 SELECT t.name AS team_name,
        u.hour_start,
