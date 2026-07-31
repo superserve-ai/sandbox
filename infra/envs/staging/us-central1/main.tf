@@ -322,3 +322,29 @@ module "observability" {
   }
   labels = local.common_labels
 }
+
+# Durability tier for the host's local artifacts (sandbox snapshots, template
+# builds); mirrors the production cells so the uploader and restore tooling
+# exercise the same IAM shape (write-only host, dedicated GC identity) before
+# they ever run in prod.
+module "backup_storage" {
+  source = "../../../modules/backup-storage"
+
+  project_id  = local.project_id
+  environment = local.environment
+  location    = local.region
+  bucket_name = "superserve-artifact-backup-${local.resource_suffix}"
+
+  # Not suffixed with resource_suffix: "superserve-backup-gc-staging-usc1"
+  # would exceed the 30-char SA account_id cap. Same for the restore reader.
+  gc_service_account_id      = "superserve-backup-gc-staging"
+  restore_service_account_id = "superserve-backup-ro-staging"
+
+  writer_members = [
+    "serviceAccount:${module.iam.service_account_emails["superserve_api"]}",
+  ]
+
+  labels = merge(local.common_labels, {
+    component = "backup"
+  })
+}

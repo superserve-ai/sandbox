@@ -304,3 +304,28 @@ module "observability" {
   }
   labels = local.common_labels
 }
+
+# Durability tier for the host's local-SSD artifacts (sandbox snapshots,
+# template builds). The vmd host runs as the shared api-runner SA, so that SA
+# is the writer: create+read on this bucket, never delete — deletes belong to
+# the module's dedicated GC identity, which nothing on the host runs as.
+module "backup_storage" {
+  source = "../../../modules/backup-storage"
+
+  project_id  = local.project_id
+  environment = local.environment
+  location    = local.region
+  bucket_name = "superserve-artifact-backup-${local.resource_suffix}"
+
+  gc_service_account_id = "superserve-backup-gc-${local.resource_suffix}"
+
+  restore_service_account_id = "superserve-backup-ro-${local.resource_suffix}"
+
+  writer_members = [
+    "serviceAccount:${data.google_service_account.api_runner.email}",
+  ]
+
+  labels = merge(local.common_labels, {
+    component = "backup"
+  })
+}
