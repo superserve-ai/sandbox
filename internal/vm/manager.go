@@ -2104,10 +2104,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// evicted) legitimately needs more than a warm same-host resume, and a
 	// timeout here is destructive — the error path below tears down the VM.
 	if err := m.waitForBoxd(ctx, hostIP, 30*time.Second); err != nil {
-		// Join before setStatus(StatusError) persists, or the goroutine's
-		// Running write could land after the Error write. Mirror the success
-		// path's post-join check: a concurrent destroy erased the record, and
-		// the joined write must not resurrect it — setStatus alone can't fix
+		// Teardown first — none of it touches BoltDB, so a stalled persist
+		// cannot keep the failed restore's unit and network alive.
+		m.stopUnitDuringRestoreError(vmID)
+		if !inPlace {
+			m.netMgr.CleanupVM(vmID)
+		}
+		cleanupAfterRestoreFailure()
+		// Join before the durable writes, or the goroutine's Running write
+		// could land after the Error write. Mirror the success path's
+		// post-join check: a concurrent destroy erased the record, and the
+		// joined write must not resurrect it — setStatus alone can't fix
 		// this (it no-ops on an untracked VM).
 		<-persistDone
 		m.mu.RLock()
@@ -2116,11 +2123,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if !stillTracked {
 			m.deleteState(vmID)
 		}
-		m.stopUnitDuringRestoreError(vmID)
-		if !inPlace {
-			m.netMgr.CleanupVM(vmID)
-		}
-		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
