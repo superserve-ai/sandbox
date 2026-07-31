@@ -177,6 +177,23 @@ func (u *Uploader) flushNotifications() {
 	}
 }
 
+// baseTaskFile synthesizes the shared upload entry for an overlay's
+// base image. Size comes from the live file: the digest check subsumes
+// it (a size change changes the digest).
+func baseTaskFile(file TaskFile) (TaskFile, error) {
+	fi, err := os.Stat(file.BasePath)
+	if err != nil {
+		return TaskFile{}, err
+	}
+	return TaskFile{
+		Name:   "base.ext4",
+		Path:   file.BasePath,
+		SHA256: file.BaseSHA256,
+		Size:   fi.Size(),
+		Shared: true,
+	}, nil
+}
+
 // uploadTask ships every artifact of a generation, then its manifest
 // object. Objects are content-addressed and create-only, so retries after
 // partial progress re-cover already-written objects as no-ops. completed
@@ -191,6 +208,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 		Generation: task.Generation,
 		VMDVersion: u.VMDVersion,
 	}
+	uploadedBases := map[string]bool{}
 	for _, file := range task.Files {
 		mf, err := u.uploadFile(ctx, task, file)
 		if err != nil {
@@ -206,6 +224,36 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 			return false, err
 		}
 		gen.Files = append(gen.Files, mf)
+		// An overlay's holes are backed by its base image, and the bucket
+		// is the only copy that survives host loss: a generation whose
+		// manifest names a base that exists nowhere durable is not
+		// restorable. The base ships as a bucket-wide content-addressed
+		// object, so every sandbox on the base dedupes against one
+		// upload; the digest recorded at pause time is the pre-verify
+		// authority, so a base rebuilt since then abandons the
+		// generation exactly like any mutated source.
+		if file.BaseSHA256 != "" && !uploadedBases[file.BaseSHA256] {
+			bf, err := baseTaskFile(file)
+			if err != nil {
+				if os.IsNotExist(err) {
+					u.Log.Warn().Str("path", file.BasePath).Str("sandbox_id", task.SandboxID).
+						Msg("backup base image gone; abandoning generation")
+					return false, nil
+				}
+				return false, err
+			}
+			bmf, err := u.uploadFile(ctx, task, bf)
+			if err != nil {
+				if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
+					u.Log.Warn().Str("path", bf.Path).Str("sandbox_id", task.SandboxID).
+						Msg("backup base image gone or rebuilt; abandoning generation")
+					return false, nil
+				}
+				return false, err
+			}
+			uploadedBases[file.BaseSHA256] = true
+			gen.Files = append(gen.Files, bmf)
+		}
 	}
 	manifestObject, err := SandboxObject(task.SandboxID, task.Generation, ManifestObject)
 	if err != nil {
@@ -259,10 +307,19 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 	// maps to a fresh object instead of deduping against bytes packed with
 	// a different table, so the manifest's extent table always describes
 	// the exact object it points at.
-	objectName := file.Name + ".p" + PackFingerprint(extents, apparent)
-	object, err := SandboxObject(task.SandboxID, task.Generation, objectName)
-	if err != nil {
-		return ManifestFile{}, err
+	var object, objectName string
+	if file.Shared {
+		// Shared objects live outside the generation prefix, so the
+		// manifest records the full object path rather than a name
+		// relative to the generation.
+		object = SharedBaseObject(file.SHA256, PackFingerprint(extents, apparent))
+		objectName = object
+	} else {
+		objectName = file.Name + ".p" + PackFingerprint(extents, apparent)
+		object, err = SandboxObject(task.SandboxID, task.Generation, objectName)
+		if err != nil {
+			return ManifestFile{}, err
+		}
 	}
 	// The stream hasher digests the apparent content of what is ACTUALLY
 	// shipped (packed bytes as streamed, zeros for the holes), closing the

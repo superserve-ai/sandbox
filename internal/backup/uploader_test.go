@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -840,5 +841,125 @@ func TestStagedBytesImmuneToSourceMutation(t *testing.T) {
 	}
 	if _, ok := store.objects["sandboxes/sb/gen/manifest.json"]; !ok {
 		t.Fatal("upload did not complete from the staged snapshot (mutation leaked through)")
+	}
+}
+
+// An overlay generation must ship its base bytes: the bucket is the only
+// copy that survives host loss, and the base uploads as one bucket-wide
+// content-addressed object that a second sandbox on the same base
+// dedupes against instead of re-uploading.
+func TestOverlayGenerationUploadsSharedBase(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.ext4")
+	baseData := []byte("base image bytes shared by the template")
+	if err := os.WriteFile(base, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseSum := sha256.Sum256(baseData)
+	baseSHA := hex.EncodeToString(baseSum[:])
+
+	makeTask := func(id string) Task {
+		data := []byte("overlay bytes for " + id)
+		p := filepath.Join(dir, id+".overlay")
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(data)
+		return Task{
+			SandboxID:  id,
+			Generation: "gen-" + id,
+			EnqueuedAt: time.Unix(1, 0),
+			Files: []TaskFile{{
+				Name: "rootfs.ext4", Path: p,
+				SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data)),
+				BasePath: base, BaseSHA256: baseSHA,
+			}},
+		}
+	}
+
+	j, _ := testJournal(t)
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store}
+	for _, id := range []string{"sb-x", "sb-y"} {
+		if err := j.Enqueue(makeTask(id)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := u.drainOne(context.Background(), time.Unix(2, 0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var baseObjects, manifests int
+	for name := range store.objects {
+		if strings.HasPrefix(name, "bases/"+baseSHA+".p") {
+			baseObjects++
+		}
+		if strings.HasSuffix(name, "/manifest.json") {
+			manifests++
+		}
+	}
+	if baseObjects != 1 {
+		t.Fatalf("base objects = %d, want exactly one shared upload", baseObjects)
+	}
+	if manifests != 2 {
+		t.Fatalf("manifests = %d, want both generations complete", manifests)
+	}
+	// Both manifests reference the shared base object by full path.
+	var gen GenerationManifest
+	if err := json.Unmarshal(store.objects["sandboxes/sb-y/gen-sb-y/manifest.json"], &gen); err != nil {
+		t.Fatal(err)
+	}
+	foundBase := false
+	for _, f := range gen.Files {
+		if f.Name == "base.ext4" && strings.HasPrefix(f.Object, "bases/"+baseSHA) {
+			foundBase = true
+		}
+	}
+	if !foundBase {
+		t.Fatalf("manifest lacks the shared base entry: %+v", gen.Files)
+	}
+}
+
+// A base rebuilt since the pause abandons the generation exactly like
+// any mutated source: its recorded digest no longer matches the bytes.
+func TestRebuiltBaseAbandonsGeneration(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(base, []byte("original base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("original base"))
+	overlay := filepath.Join(dir, "rootfs.ext4")
+	odata := []byte("overlay bytes")
+	if err := os.WriteFile(overlay, odata, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	osum := sha256.Sum256(odata)
+	task := Task{
+		SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0),
+		Files: []TaskFile{{
+			Name: "rootfs.ext4", Path: overlay,
+			SHA256: hex.EncodeToString(osum[:]), Size: int64(len(odata)),
+			BasePath: base, BaseSHA256: hex.EncodeToString(sum[:]),
+		}},
+	}
+	if err := os.WriteFile(base, []byte("REBUILT base!"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	j, _ := testJournal(t)
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store}
+	if _, err := u.drainOne(context.Background(), time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.objects["sandboxes/sb/gen/manifest.json"]; ok {
+		t.Fatal("manifest published over a rebuilt base")
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("abandoned generation not acked: %v", counts)
 	}
 }

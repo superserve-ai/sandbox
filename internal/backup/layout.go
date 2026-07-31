@@ -68,6 +68,14 @@ func SandboxObject(sandboxID, generation, fileName string) (string, error) {
 }
 
 // TemplateObject names an artifact object within a template build.
+// SharedBaseObject names a bucket-wide content-addressed base image
+// object: bases/<sha256>.p<fingerprint>. The digest addresses the bytes
+// and the fingerprint binds the extent table, so identical bases from
+// any sandbox or host converge on one immutable object.
+func SharedBaseObject(sha256, fingerprint string) string {
+	return "bases/" + sha256 + ".p" + fingerprint
+}
+
 func TemplateObject(templateID, buildID, fileName string) (string, error) {
 	if err := validSegment(templateID); err != nil {
 		return "", fmt.Errorf("template id: %w", err)

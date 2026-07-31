@@ -33,6 +33,14 @@ func StageTask(root string, task *Task) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	// Make the directory chain itself durable: the rename fsync below
+	// covers entries in dir, not dir's own existence.
+	if err := syncDir(filepath.Join(root, task.SandboxID)); err != nil {
+		return err
+	}
+	if err := syncDir(root); err != nil {
+		return err
+	}
 	for i, f := range task.Files {
 		staged := filepath.Join(dir, f.Name)
 		if _, err := os.Stat(staged); err == nil {
@@ -90,11 +98,35 @@ func snapshotFile(dst, src string) error {
 			return err
 		}
 	}
+	// The journal enqueue that will reference this path is fsynced by
+	// BoltDB; the staged bytes and their directory entry must be durable
+	// FIRST, or a power loss can leave a journal pointing at a missing
+	// or torn staged file, which a restart would misread as an abandoned
+	// source.
+	if err := out.Sync(); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
 	if err := out.Close(); err != nil {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, dst)
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return syncDir(filepath.Dir(dst))
+}
+
+// syncDir fsyncs a directory so the entries inside it are durable.
+func syncDir(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // removeStagedTask deletes a task's staging directory once the task is

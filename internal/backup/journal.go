@@ -35,6 +35,12 @@ type TaskFile struct {
 	// identity is its bytes, not its path, so a rebuilt base at the same
 	// path yields a different generation.
 	BaseSHA256 string `json:"base_sha256,omitempty"`
+	// Shared marks a content-addressed artifact stored once bucket-wide
+	// (under the bases/ prefix) rather than inside the generation: base
+	// images are multi-GB and common to every sandbox on the template,
+	// so each base version uploads exactly once fleet-wide and every
+	// generation's manifest points at the same immutable object.
+	Shared bool `json:"shared,omitempty"`
 }
 
 // Task is one generation awaiting upload. Tasks are idempotent: the
