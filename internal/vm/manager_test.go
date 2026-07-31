@@ -1474,10 +1474,9 @@ func TestRestoreVMSnapshot_UnverifiedRecordAfterRestart_ReverifiedAndAdopted(t *
 }
 
 // A restore whose state cannot be made durable must not report success: the
-// VM would be invisible to the next reattach, and no later recreate can
-// distinguish a failed initial write from a record a destroy or the
-// reconciler deleted. Pinned here at the store layer: a persist into a
-// closed store reports failure rather than logging and claiming success.
+// VM would be invisible to the next reattach. Pinned here at the store
+// layer: a persist into a closed store reports failure rather than logging
+// and claiming success.
 func TestPersistStateReportsFailure(t *testing.T) {
 	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

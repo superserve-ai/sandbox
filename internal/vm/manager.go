@@ -2158,10 +2158,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	<-persistDone
 	if !optimisticOK && !m.persistState(inst) {
 		// The record could not be made durable, so the VM would be invisible
-		// to the next reattach — a zombie unit after any vmd restart, and no
-		// recreate-later scheme can distinguish this from a record a destroy
-		// or the reconciler deleted. Fail the restore instead; the retry only
-		// costs latency when the store is already broken.
+		// to the next reattach — a zombie unit after any vmd restart. Fail
+		// the restore; the retry only costs latency when the store is
+		// already broken.
 		m.stopUnitDuringRestoreError(vmID)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
