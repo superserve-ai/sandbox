@@ -59,7 +59,17 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 }
 
 func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) (*vmdpb.ResumeVMResponse, error) {
-	inst, err := a.mgr.ResumeVM(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath())
+	// Hold the lifecycle lock across restore + readiness gate + injection +
+	// abort: a retry that arrived mid-injection would otherwise adopt the
+	// running instance, report success, and then have it stopped by this
+	// request's abort. Under the lock the retry waits its turn instead.
+	unlockOp, err := a.mgr.lockVMOp(ctx, req.GetVmId())
+	if err != nil {
+		return nil, err
+	}
+	defer unlockOp()
+
+	inst, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath())
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +82,7 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		// guest whose agent never came back. /health answers from memory, so
 		// this stays immune to the in-guest disk stalls /init is prone to.
 		if err := a.mgr.waitForBoxd(ctx, inst.IP, 10*time.Second); err != nil {
-			a.mgr.AbortResume(req.GetVmId(), inst.PID)
+			a.mgr.abortResumeLocked(req.GetVmId())
 			return nil, status.Errorf(codes.Unavailable, "boxd not reachable after resume: %v", err)
 		}
 		// Hostname-only: stamp it in the background. The guest's first disk
@@ -107,7 +117,7 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		// this failure fails the resume — and the VM must not be left running
 		// behind it, or the record and the host diverge until an adoption or
 		// reconciler pass happens to converge them.
-		a.mgr.AbortResume(req.GetVmId(), inst.PID)
+		a.mgr.abortResumeLocked(req.GetVmId())
 		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
 
@@ -196,6 +206,14 @@ func (a *GRPCAdapter) InjectSandboxEnv(ctx context.Context, req *vmdpb.InjectSan
 	if vmID == "" {
 		return nil, status.Error(codes.InvalidArgument, "vm_id is required")
 	}
+	// Serialize with resume and with other injects: /init merges last-writer-
+	// wins, so a timed-out delivery being retried must not replay an older
+	// binding set over a newer one applied in between.
+	unlockOp, err := a.mgr.lockVMOp(ctx, vmID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockOp()
 	inst, err := a.mgr.GetVMInfo(ctx, vmID)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "vm %s: %v", vmID, err)

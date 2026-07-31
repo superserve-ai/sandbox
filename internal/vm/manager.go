@@ -1032,9 +1032,6 @@ func fileExists(path string) bool {
 
 // ResumeVM restores a paused VM from its snapshot using a mount namespace.
 func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
-	log := m.log.With().Str("vm_id", vmID).Logger()
-	tEntry := time.Now()
-
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate resume
 	// waits, then is recognized as a retry rather than relaunching.
 	unlockOp, err := m.lockVMOp(ctx, vmID)
@@ -1042,6 +1039,17 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		return nil, err
 	}
 	defer unlockOp()
+	return m.resumeVMLocked(ctx, vmID, snapshotPath, memPath)
+}
+
+// resumeVMLocked is ResumeVM's body; the caller must hold vmID's lifecycle
+// lock. Split out so the gRPC adapter can keep the lock held across the
+// post-restore steps (readiness gate, env injection, abort-on-failure) —
+// otherwise a concurrent retry can adopt the instance between this returning
+// and those steps acting on it.
+func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
+	log := m.log.With().Str("vm_id", vmID).Logger()
+	tEntry := time.Now()
 
 	inst, err := m.getInstance(vmID)
 	if err != nil {
@@ -2940,31 +2948,25 @@ func isReservedRunDirName(name string) bool {
 	return name == templateDirName || name == TemplatesDirName
 }
 
-// AbortResume reverts a freshly-resumed VM back to Paused when a post-restore
-// step fails after ResumeVM returned. The unit is stopped and the record
-// re-marked Paused so the host matches the caller's view of a failed resume.
-// A restore never mutates the snapshot artifacts it resumed from, so a later
-// resume simply restores them again.
+// abortResumeLocked reverts a freshly-resumed VM back to Paused when a
+// post-restore step fails; the caller must hold vmID's lifecycle lock,
+// continuously since the resume it is aborting — that continuity is what
+// guarantees no retry has adopted the instance in between. The unit is
+// stopped and the record re-marked Paused so the host matches the caller's
+// view of a failed resume. A restore never mutates the snapshot artifacts it
+// resumed from, so a later resume simply restores them again.
 //
-// expectPID is the PID the aborting caller's resume produced; the abort is
-// skipped when the VM has since moved on (destroyed, or re-resumed by a
-// retry with a fresh Firecracker), so a stale abort can't stop a healthy
-// successor. The op lock serializes against concurrent lifecycle work; if
-// another op holds it, that op owns the VM's fate and the abort yields.
-func (m *Manager) AbortResume(vmID string, expectPID int) {
-	unlock, ok := m.tryLockVMOp(vmID)
-	if !ok {
-		return
-	}
-	defer unlock()
+// DestroyVM bypasses the lifecycle lock (see vmOpLocks), so a concurrent
+// destroy is still possible; its deletions are handled by the guards below.
+func (m *Manager) abortResumeLocked(vmID string) {
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return
 	}
 	inst.mu.Lock()
-	stale := inst.Status != StatusRunning || inst.PID != expectPID
+	running := inst.Status == StatusRunning
 	inst.mu.Unlock()
-	if stale {
+	if !running {
 		return
 	}
 	m.stopUnitDuringRestoreError(vmID)
@@ -2972,9 +2974,9 @@ func (m *Manager) AbortResume(vmID string, expectPID int) {
 	inst.Status = StatusPaused
 	inst.DirtyTracked = false // FC process stopped; a fresh resume re-arms tracking.
 	inst.mu.Unlock()
-	// Conditional: DestroyVM bypasses the op lock (see vmOpLocks) and may have
-	// deleted the record after the staleness check above; it owns the teardown
-	// then, and an unconditional write would resurrect a destroyed VM's record.
+	// Conditional: a concurrent destroy may have deleted the record; it owns
+	// the teardown then, and an unconditional write would resurrect a
+	// destroyed VM's record.
 	m.persistStateIfPresent(inst)
 }
 
