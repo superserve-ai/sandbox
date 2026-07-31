@@ -79,10 +79,17 @@ var boxdInitClient = &http.Client{
 }
 
 // postBoxdInitRetried retries a failed /init once. /init merges env vars and
-// re-applies the hostname, so a duplicate delivery is harmless.
-func postBoxdInitRetried(ctx context.Context, vmIP string, envVars map[string]string, hostname string) error {
+// re-applies the hostname, so a duplicate delivery to the same VM is
+// harmless. stillOwner re-checks that the target VM still owns vmIP before
+// the retry fires: a destroy (which bypasses the lifecycle lock) can release
+// the slot after the first attempt, and the payload may carry credentials
+// that must never reach whatever VM claims the IP next.
+func postBoxdInitRetried(ctx context.Context, vmIP string, envVars map[string]string, hostname string, stillOwner func() bool) error {
 	err := postBoxdInit(ctx, vmIP, envVars, hostname)
 	if err == nil || ctx.Err() != nil {
+		return err
+	}
+	if stillOwner != nil && !stillOwner() {
 		return err
 	}
 	return postBoxdInit(ctx, vmIP, envVars, hostname)

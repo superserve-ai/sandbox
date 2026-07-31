@@ -92,15 +92,15 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			defer sentrylog.Recover("resume-hostname-stamp")
 			stampCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
+			// Slot IPs are recycled after destroy; re-check before each
+			// attempt so a delayed stamp can't label a different VM. The
+			// sub-ms check-to-connect window that remains is inherent to
+			// every IP-addressed boxd call racing a destroy; closing it
+			// takes a destroy-cancelled launch context, systemically.
+			owner := a.ipOwnerCheck(id, ip)
 			var lastErr error
 			for attempt := 0; attempt < 2; attempt++ {
-				// Slot IPs are recycled after destroy; re-check before each
-				// attempt so a delayed stamp can't label a different VM. The
-				// sub-ms check-to-connect window that remains is inherent to
-				// every IP-addressed boxd call racing a destroy; closing it
-				// takes a destroy-cancelled launch context, systemically.
-				cur, err := a.mgr.getInstance(id)
-				if err != nil || cur.IP != ip || cur.Status != StatusRunning {
+				if !owner() {
 					return
 				}
 				if lastErr = postBoxdInit(stampCtx, ip, nil, vmHostname(id)); lastErr == nil {
@@ -112,7 +112,7 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			}
 			a.mgr.log.Warn().Err(lastErr).Str("vm_id", id).Msg("background hostname stamp failed after resume")
 		}(inst.IP, inst.ID)
-	} else if err := postBoxdInitRetried(ctx, inst.IP, req.GetEnvVars(), vmHostname(inst.ID)); err != nil {
+	} else if err := postBoxdInitRetried(ctx, inst.IP, req.GetEnvVars(), vmHostname(inst.ID), a.ipOwnerCheck(inst.ID, inst.IP)); err != nil {
 		// Env vars must be in place before the caller unblocks user code, so
 		// this failure fails the resume — and the VM must not be left running
 		// behind it, or the record and the host diverge until an adoption or
@@ -226,10 +226,25 @@ func (a *GRPCAdapter) InjectSandboxEnv(ctx context.Context, req *vmdpb.InjectSan
 	if jwt != "" {
 		envVars = InjectHTTPSProxyEnvWithJWT(envVars, a.sandboxProxyURL, jwt)
 	}
-	if err := postBoxdInitRetried(ctx, inst.IP, envVars, vmHostname(vmID)); err != nil {
+	if err := postBoxdInitRetried(ctx, inst.IP, envVars, vmHostname(vmID), a.ipOwnerCheck(vmID, inst.IP)); err != nil {
 		return nil, status.Errorf(codes.Internal, "post-init failed: %v", err)
 	}
 	return &vmdpb.InjectSandboxEnvResponse{VmId: vmID}, nil
+}
+
+// ipOwnerCheck returns a predicate reporting whether vmID still exists, still
+// owns ip, and is still Running — the retry gate for /init deliveries.
+func (a *GRPCAdapter) ipOwnerCheck(vmID, ip string) func() bool {
+	return func() bool {
+		cur, err := a.mgr.getInstance(vmID)
+		if err != nil {
+			return false
+		}
+		cur.mu.Lock()
+		ok := cur.IP == ip && cur.Status == StatusRunning
+		cur.mu.Unlock()
+		return ok
+	}
 }
 
 // DeleteSnapshot unlinks the vmstate + memory files for a previous snapshot.
