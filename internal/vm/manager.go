@@ -94,6 +94,7 @@ type VMInstance struct {
 	TAPDevice    string
 	MACAddress   string
 	Status       VMStatus
+	Unverified   bool // Running persisted before boxd readiness (see VMRecord)
 	Config       VMConfig
 	RunDirID     string // Directory name under RunDir for this VM's files.
 	Namespace    string // Network namespace name.
@@ -2071,6 +2072,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// overlaps with the boxd wait.
 	inst.mu.Lock()
 	inst.Status = StatusRunning
+	inst.Unverified = true
 	inst.mu.Unlock()
 	persistDone := make(chan struct{})
 	go func() {
@@ -2115,6 +2117,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.markTemplateRestored(warmthPath)
 
 	<-persistDone
+	// Verified in memory only: the durable flag stays set until any later
+	// persist, so it survives exactly (and only) a crash before this point.
+	inst.mu.Lock()
+	inst.Unverified = false
+	inst.mu.Unlock()
 	// Persist-then-verify: checking AFTER the write leaves no window — a
 	// concurrent DestroyVM either erased the record itself or is caught here,
 	// and we erase our write and tear down instead of resurrecting it. The
@@ -3557,9 +3564,12 @@ func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) *VMIns
 	}
 	existing.mu.RLock()
 	running := existing.Status == StatusRunning
+	unverified := existing.Unverified
 	sameArtifacts := existing.SnapshotPath == snapshotPath && existing.MemFilePath == memPath
 	existing.mu.RUnlock()
-	if !running || !sameArtifacts {
+	// A reattached crash-window record never proved readiness; refusing it
+	// routes the caller to a fresh, fully-verified restore.
+	if !running || unverified || !sameArtifacts {
 		return nil
 	}
 	// Process-level liveness, not boxd readiness: a record can read Running

@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -1268,5 +1269,50 @@ func TestInstanceRunning(t *testing.T) {
 	}
 	if m.instanceRunning("absent") {
 		t.Fatal("absent instance must not report running")
+	}
+}
+
+// A reattached crash-window record (Running persisted before readiness) must
+// not be adopted; the caller falls through to a fresh, verified restore. The
+// durable flag must also stay off the wire for verified records so rollback
+// binaries read them unchanged.
+func TestRetriedLaunchTargetRefusesUnverifiedRecord(t *testing.T) {
+	orig := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = orig }()
+
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
+		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
+		MemFilePath:  "/snapshots/vm-1/mem.snap",
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
+	if got := mgr.retriedLaunchTarget("vm-1", existing.SnapshotPath, existing.MemFilePath); got != nil {
+		t.Fatal("an unverified Running record must not be adopted")
+	}
+
+	existing.Unverified = false
+	if got := mgr.retriedLaunchTarget("vm-1", existing.SnapshotPath, existing.MemFilePath); got == nil {
+		t.Fatal("a verified Running record must still be adoptable")
+	}
+
+	out, err := json.Marshal(toRecord(existing))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "unverified") {
+		t.Fatalf("verified records must omit the unverified key, got %s", out)
+	}
+	unv := toRecord(&VMInstance{ID: "u", Status: StatusRunning, Unverified: true})
+	round, err := json.Marshal(unv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back VMRecord
+	if err := json.Unmarshal(round, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back.Unverified {
+		t.Fatal("unverified must survive the record round-trip")
 	}
 }
