@@ -17,18 +17,36 @@ DROP VIEW IF EXISTS analytics.weekly_team_sandbox_count;
 -- during its actual assignment window. LATERAL correlates the resolution
 -- to each row's own hour_start.
 --
--- Usage recorded before a resource's first effective rate (real gap: usage
--- starts 2026-04-14, payg rates start 2026-06-17, the platform's actual
--- pricing launch date) has no rate to resolve, so COALESCE prices it at 0
--- rather than leaving spend_usd NULL — otherwise panel-side SUM() silently
--- drops those hours instead of reflecting that pre-launch usage was
--- genuinely unpriced.
+-- Usage recorded before a resource ever had ANY effective rate (real gap:
+-- usage starts 2026-04-14, payg rates start 2026-06-17, the platform's
+-- actual pricing launch date) prices at 0 — deliberately, that usage was
+-- genuinely unpriced pre-launch. But per Codex review on this PR, that must
+-- stay narrow: if a rate exists for the resource/plan at some point but not
+-- for this specific hour (an incomplete custom plan, or an unintended gap
+-- between two rate periods), spend_usd resolves to NULL instead, the same
+-- "can't price this" signal handlers_platform_billing.go's pricing_unavailable
+-- surfaces — not silently zeroed, which would understate a real charge.
+-- SUM() in the panel query drops NULL rows same as it would drop a
+-- genuinely-zero row, so a pricing gap still needs separate investigation
+-- if the total looks off; this view doesn't error on it.
 CREATE OR REPLACE VIEW analytics.team_hourly_spend AS
 SELECT t.name AS team_name,
        u.hour_start,
-       (u.vcpu_seconds * COALESCE(vcpu_rate.price_usd, 0)
-        + u.memory_mib_seconds / 1024 * COALESCE(mem_rate.price_usd, 0)
-        + u.storage_mib_seconds / 1024 * COALESCE(storage_rate.price_usd, 0)
+       (CASE
+            WHEN vcpu_rate.price_usd IS NOT NULL THEN u.vcpu_seconds * vcpu_rate.price_usd
+            WHEN vcpu_rate.first_effective_from IS NULL OR u.hour_start < vcpu_rate.first_effective_from THEN 0
+            ELSE NULL
+        END
+        + CASE
+            WHEN mem_rate.price_usd IS NOT NULL THEN u.memory_mib_seconds / 1024 * mem_rate.price_usd
+            WHEN mem_rate.first_effective_from IS NULL OR u.hour_start < mem_rate.first_effective_from THEN 0
+            ELSE NULL
+        END
+        + CASE
+            WHEN storage_rate.price_usd IS NOT NULL THEN u.storage_mib_seconds / 1024 * storage_rate.price_usd
+            WHEN storage_rate.first_effective_from IS NULL OR u.hour_start < storage_rate.first_effective_from THEN 0
+            ELSE NULL
+        END
        )::numeric(14,6) AS spend_usd
 FROM team_billing_usage_hourly u
 JOIN team t ON t.id = u.team_id
@@ -45,31 +63,34 @@ CROSS JOIN LATERAL (
     ), 'payg') AS plan_key
 ) tp
 LEFT JOIN LATERAL (
-    SELECT price_usd FROM pricing_rate r
-    JOIN pricing_plan p ON p.key = r.plan_key
-    WHERE r.plan_key = tp.plan_key AND r.resource = 'vcpu'
-      AND r.effective_from <= u.hour_start
-      AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
-    ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
-    LIMIT 1
+    SELECT
+        (SELECT r.price_usd FROM pricing_rate r
+         WHERE r.plan_key = tp.plan_key AND r.resource = 'vcpu'
+           AND r.effective_from <= u.hour_start
+           AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
+         ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC LIMIT 1) AS price_usd,
+        (SELECT MIN(r.effective_from) FROM pricing_rate r
+         WHERE r.plan_key = tp.plan_key AND r.resource = 'vcpu') AS first_effective_from
 ) vcpu_rate ON true
 LEFT JOIN LATERAL (
-    SELECT price_usd FROM pricing_rate r
-    JOIN pricing_plan p ON p.key = r.plan_key
-    WHERE r.plan_key = tp.plan_key AND r.resource = 'memory_gib'
-      AND r.effective_from <= u.hour_start
-      AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
-    ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
-    LIMIT 1
+    SELECT
+        (SELECT r.price_usd FROM pricing_rate r
+         WHERE r.plan_key = tp.plan_key AND r.resource = 'memory_gib'
+           AND r.effective_from <= u.hour_start
+           AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
+         ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC LIMIT 1) AS price_usd,
+        (SELECT MIN(r.effective_from) FROM pricing_rate r
+         WHERE r.plan_key = tp.plan_key AND r.resource = 'memory_gib') AS first_effective_from
 ) mem_rate ON true
 LEFT JOIN LATERAL (
-    SELECT price_usd FROM pricing_rate r
-    JOIN pricing_plan p ON p.key = r.plan_key
-    WHERE r.plan_key = tp.plan_key AND r.resource = 'storage_gib'
-      AND r.effective_from <= u.hour_start
-      AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
-    ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
-    LIMIT 1
+    SELECT
+        (SELECT r.price_usd FROM pricing_rate r
+         WHERE r.plan_key = tp.plan_key AND r.resource = 'storage_gib'
+           AND r.effective_from <= u.hour_start
+           AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
+         ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC LIMIT 1) AS price_usd,
+        (SELECT MIN(r.effective_from) FROM pricing_rate r
+         WHERE r.plan_key = tp.plan_key AND r.resource = 'storage_gib') AS first_effective_from
 ) storage_rate ON true;
 
 -- One row per sandbox creation event.
