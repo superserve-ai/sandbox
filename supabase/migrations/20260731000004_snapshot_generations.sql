@@ -7,6 +7,12 @@
 -- the index is the contract phase, shipped separately once every writer
 -- understands generations; at that moment finalizes start inserting real
 -- history rows with no code change.
+--
+-- Contract-phase precondition: the index drop also requires vmd to stage
+-- each pause's artifacts under per-generation paths first. History rows
+-- sharing the per-VM vmstate/mem paths that pauses overwrite in place
+-- would describe bytes that no longer exist for every generation but the
+-- newest.
 ALTER TABLE snapshot ADD COLUMN generation bigint NOT NULL DEFAULT 1;
 ALTER TABLE snapshot ADD COLUMN name text CHECK (name IS NULL OR char_length(name) BETWEEN 1 AND 64);
 

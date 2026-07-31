@@ -410,7 +410,11 @@ upserted AS (
     -- Compatibility mode while snapshot_sandbox_unique exists: history is
     -- still one row, but the generation counter advances so consumers see
     -- monotonic generations before and after the contract-phase index drop.
+    -- created_at refreshes with it: the row describes THIS pause's
+    -- artifacts, and after the flip it sits alongside real history rows
+    -- whose timestamps mean insertion time.
     generation = snapshot.generation + 1,
+    created_at = now(),
     -- A finalize that has no complete manifest passes 0 (hash budget
     -- exhausted or a file failed to hash); keep the recorded size instead
     -- of clobbering it back to zero.
