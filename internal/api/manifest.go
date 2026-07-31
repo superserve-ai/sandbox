@@ -1,11 +1,6 @@
 package api
 
 import (
-	"context"
-
-	"github.com/google/uuid"
-	"github.com/rs/zerolog/log"
-
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
@@ -15,29 +10,22 @@ import (
 // verification, but not a trustworthy total for snapshot.size_bytes.
 var pauseManifestFiles = []string{"vmstate.snap", "rootfs.ext4"}
 
-// recordSnapshotManifest replaces a snapshot row's per-file integrity
-// manifest with this pause's set, atomically: stale rows from a previous
-// pause never survive a partial re-hash looking current. Best-effort: the
-// pause's durability does not depend on the manifest landing (a missing or
-// partial manifest is surfaced by coverage monitoring), so failures are
-// logged, never propagated to the pause path.
-func recordSnapshotManifest(ctx context.Context, q *db.Queries, snapshotID uuid.UUID, manifest []vmdclient.ManifestEntry) {
-	params := db.ReplaceSnapshotManifestParams{
-		SnapshotID: snapshotID,
-	}
+// applyManifest flattens a pause's manifest entries into FinalizePause's
+// array parameters, so the manifest is replaced in the same statement that
+// finalizes the pause. That statement's status guard is what makes stale
+// writes impossible: a finalize landing after another pause has already
+// finalized matches zero rows and writes nothing, manifest included. It
+// also sets SizeBytes from the manifest when the set is complete; partial
+// manifests pass 0 and the query keeps the previously recorded size.
+func applyManifest(p *db.FinalizePauseParams, manifest []vmdclient.ManifestEntry) {
 	for _, e := range manifest {
-		params.FileNames = append(params.FileNames, e.FileName)
-		params.Paths = append(params.Paths, e.Path)
-		params.Sizes = append(params.Sizes, e.SizeBytes)
-		params.Digests = append(params.Digests, e.SHA256)
-		params.BasePaths = append(params.BasePaths, e.BasePath)
+		p.ManifestFileNames = append(p.ManifestFileNames, e.FileName)
+		p.ManifestPaths = append(p.ManifestPaths, e.Path)
+		p.ManifestSizes = append(p.ManifestSizes, e.SizeBytes)
+		p.ManifestDigests = append(p.ManifestDigests, e.SHA256)
+		p.ManifestBasePaths = append(p.ManifestBasePaths, e.BasePath)
 	}
-	if err := q.ReplaceSnapshotManifest(ctx, params); err != nil {
-		log.Error().Err(err).
-			Str("snapshot_id", snapshotID.String()).
-			Int("files", len(manifest)).
-			Msg("replace snapshot manifest failed")
-	}
+	p.SizeBytes = manifestCompleteBytes(manifest)
 }
 
 // manifestCompleteBytes sums entry sizes only when the manifest covers the

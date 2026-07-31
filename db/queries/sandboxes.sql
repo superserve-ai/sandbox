@@ -397,12 +397,12 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming';
 -- the UPSERT.
 WITH target AS (
   SELECT id, team_id FROM sandbox
-  WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+  WHERE id = @id AND team_id = @team_id AND destroyed_at IS NULL
     AND status IN ('pausing', 'resuming')
 ),
 upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
-  SELECT target.id, target.team_id, $3, $4, $5, $6 FROM target
+  SELECT target.id, target.team_id, @path, @mem_path, @size_bytes, @trigger FROM target
   ON CONFLICT (sandbox_id)
   DO UPDATE SET
     path = EXCLUDED.path,
@@ -416,15 +416,37 @@ upserted AS (
     trigger = EXCLUDED.trigger
   RETURNING snapshot.id AS snap_id
 ),
--- The pause that produced this finalize rewrote the artifacts on disk, so
--- existing manifest rows describe the previous pause's content. Clear them
--- atomically with the finalize: the fresh manifest lands best-effort right
--- after, and if that write fails the snapshot must show "no integrity
--- data" (coverage monitoring surfaces it), never stale hashes that look
--- current for rewritten files.
+-- This pause rewrote the artifacts on disk, so the snapshot's manifest is
+-- replaced in the same statement that finalizes the pause. Folding it in
+-- (rather than a separate best-effort write) makes the manifest inherit
+-- the status guard above: a finalize that lands late, after another pause
+-- already finalized, matches zero rows and writes nothing, so an older
+-- manifest can never overwrite a newer one. A pause whose hashing was
+-- skipped or partial leaves exactly its partial set, never stale rows.
+fresh AS (
+  SELECT unnest(@manifest_file_names::text[]) AS file_name,
+         unnest(@manifest_paths::text[])      AS path,
+         unnest(@manifest_sizes::bigint[])    AS size_bytes,
+         unnest(@manifest_digests::text[])    AS sha256,
+         unnest(@manifest_base_paths::text[]) AS base_path
+),
+kept AS (
+  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
+  SELECT u.snap_id, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
+  FROM upserted u CROSS JOIN fresh f
+  ON CONFLICT (snapshot_id, file_name) WHERE snapshot_id IS NOT NULL
+  DO UPDATE SET
+      path = EXCLUDED.path,
+      size_bytes = EXCLUDED.size_bytes,
+      sha256 = EXCLUDED.sha256,
+      base_path = EXCLUDED.base_path,
+      created_at = now()
+  RETURNING id
+),
 cleared AS (
   DELETE FROM artifact_manifest
   WHERE snapshot_id IN (SELECT snap_id FROM upserted)
+    AND id NOT IN (SELECT id FROM kept)
 )
 UPDATE sandbox
 SET snapshot_id = (SELECT snap_id FROM upserted),
@@ -435,7 +457,7 @@ SET snapshot_id = (SELECT snap_id FROM upserted),
     auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
     updated_at = now()
 FROM upserted
-WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+WHERE sandbox.id = @id AND sandbox.team_id = @team_id AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
 RETURNING upserted.snap_id::uuid AS snapshot_id;
 

@@ -733,22 +733,20 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		// Overlay preserved; flip resuming → paused via FinalizePause.
 		fctx, fcancel := context.WithTimeout(revertCtx, vmdTimeout)
 		defer fcancel()
-		snapID, ferr := h.DB.FinalizePause(fctx, db.FinalizePauseParams{
-			ID:        sandboxID,
-			TeamID:    teamID,
-			Path:      snapPath,
-			MemPath:   &memPath,
-			SizeBytes: manifestCompleteBytes(manifest),
-			Trigger:   "resume_revert",
-		})
-		if ferr != nil {
+		params := db.FinalizePauseParams{
+			ID:      sandboxID,
+			TeamID:  teamID,
+			Path:    snapPath,
+			MemPath: &memPath,
+			Trigger: "resume_revert",
+		}
+		applyManifest(&params, manifest)
+		if _, ferr := h.DB.FinalizePause(fctx, params); ferr != nil {
 			// VM is safely paused; only bookkeeping failed. Best-effort status
 			// flip — the reconciler is the backstop.
 			log.Error().Err(ferr).Str("sandbox_id", sandboxID.String()).Msg("resume revert: FinalizePause failed, best-effort revert to paused")
 			revertToPaused()
-			return
 		}
-		recordSnapshotManifest(fctx, h.DB, snapID, manifest)
 	}
 
 	// Re-read and push after the VM is present. A publication mutation can race
@@ -2448,15 +2446,15 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	h.asyncBookkeeping("finalize-pause", func() {
 		fctx, fcancel := context.WithTimeout(finalizeCtx, asyncTimeout)
 		defer fcancel()
-		snapID, err := h.DB.FinalizePause(fctx, db.FinalizePauseParams{
-			ID:        sandboxID,
-			TeamID:    teamID,
-			Path:      snapshotPath,
-			MemPath:   &memPath,
-			SizeBytes: manifestCompleteBytes(manifest),
-			Trigger:   "pause",
-		})
-		if err != nil {
+		params := db.FinalizePauseParams{
+			ID:      sandboxID,
+			TeamID:  teamID,
+			Path:    snapshotPath,
+			MemPath: &memPath,
+			Trigger: "pause",
+		}
+		applyManifest(&params, manifest)
+		if _, err := h.DB.FinalizePause(fctx, params); err != nil {
 			// ErrNoRows means the sandbox was soft-deleted between BeginPause
 			// and FinalizePause (a rare race with DeleteSandbox). The VM is
 			// already stopped and its snapshot files are on disk — nothing to
@@ -2468,7 +2466,6 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async DB FinalizePause failed — sandbox may be stuck in 'pausing'")
 			return
 		}
-		recordSnapshotManifest(fctx, h.DB, snapID, manifest)
 	})
 
 	// Interval was already closed at BeginPause; FinalizePause is the

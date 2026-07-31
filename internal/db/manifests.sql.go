@@ -8,7 +8,6 @@ package db
 import (
 	"context"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -57,58 +56,4 @@ func (q *Queries) ListSnapshotManifest(ctx context.Context, snapshotID pgtype.UU
 		return nil, err
 	}
 	return items, nil
-}
-
-const replaceSnapshotManifest = `-- name: ReplaceSnapshotManifest :exec
-WITH fresh AS (
-    SELECT unnest($2::text[])  AS file_name,
-           unnest($3::text[])       AS path,
-           unnest($4::bigint[])     AS size_bytes,
-           unnest($5::text[])     AS sha256,
-           unnest($6::text[])  AS base_path
-),
-kept AS (
-    INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
-    SELECT $1::uuid, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
-    FROM fresh f
-    ON CONFLICT (snapshot_id, file_name) WHERE snapshot_id IS NOT NULL
-    DO UPDATE SET
-        path = EXCLUDED.path,
-        size_bytes = EXCLUDED.size_bytes,
-        sha256 = EXCLUDED.sha256,
-        base_path = EXCLUDED.base_path,
-        created_at = now()
-    RETURNING id
-)
-DELETE FROM artifact_manifest
-WHERE snapshot_id = $1::uuid
-  AND id NOT IN (SELECT id FROM kept)
-`
-
-type ReplaceSnapshotManifestParams struct {
-	SnapshotID uuid.UUID `json:"snapshot_id"`
-	FileNames  []string  `json:"file_names"`
-	Paths      []string  `json:"paths"`
-	Sizes      []int64   `json:"sizes"`
-	Digests    []string  `json:"digests"`
-	BasePaths  []string  `json:"base_paths"`
-}
-
-// Atomically replace a snapshot's entire manifest set. Upsert the fresh
-// entries, then delete any row the fresh set no longer contains: a re-pause
-// that hashes fewer files than the previous pause (e.g. one hash failed)
-// must not leave the old row behind looking current, because the artifact
-// content it describes changed with the new pause. Single statement, so
-// there is no window with a half-replaced set. An empty fresh set clears
-// the snapshot's manifest entirely.
-func (q *Queries) ReplaceSnapshotManifest(ctx context.Context, arg ReplaceSnapshotManifestParams) error {
-	_, err := q.db.Exec(ctx, replaceSnapshotManifest,
-		arg.SnapshotID,
-		arg.FileNames,
-		arg.Paths,
-		arg.Sizes,
-		arg.Digests,
-		arg.BasePaths,
-	)
-	return err
 }
