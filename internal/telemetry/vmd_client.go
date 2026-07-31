@@ -44,7 +44,7 @@ func (c *instrumentedVMDClient) DestroyInstance(ctx context.Context, instanceID 
 	return c.next.DestroyInstance(ctx, instanceID, force)
 }
 
-func (c *instrumentedVMDClient) PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error) {
+func (c *instrumentedVMDClient) PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, err error) {
 	started := time.Now()
 	defer func() { c.record(ctx, "PauseVM", started, err) }()
 	return c.next.PauseInstance(ctx, instanceID, snapshotDir)
@@ -56,7 +56,7 @@ func (c *instrumentedVMDClient) ResumeInstance(ctx context.Context, instanceID, 
 	return c.next.ResumeInstance(ctx, instanceID, snapshotPath, memPath)
 }
 
-func (c *instrumentedVMDClient) RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error) {
+func (c *instrumentedVMDClient) RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, err error) {
 	started := time.Now()
 	defer func() { c.record(ctx, "CreateVM", started, err) }()
 	return c.next.RestoreSnapshot(ctx, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID, previewAccess, previewPorts, previewPolicyRevision, envVars)

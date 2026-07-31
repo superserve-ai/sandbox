@@ -264,6 +264,16 @@ func seedFixture(t *testing.T) *fixture {
 			pair.snap, pair.sb, f.team, snapDir)
 		mustExec(t, srcPool, `UPDATE sandbox SET snapshot_id = $2 WHERE id = $1`, pair.sb, pair.snap)
 	}
+	// Integrity manifest rows: one through each parent kind, so the copy
+	// scope's snapshot and template branches are both exercised.
+	mustExec(t, srcPool, `
+		INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256)
+		VALUES ($1, 'rootfs.ext4', '/srv/sandboxes/'||$2::text||'/rootfs.ext4', 4096,
+		        repeat('ab', 32))`, f.snap1, f.sb1)
+	mustExec(t, srcPool, `
+		INSERT INTO artifact_manifest (template_id, file_name, path, size_bytes, sha256)
+		VALUES ($1, 'base.ext4', '/srv/templates/'||$2::text||'/base.ext4', 8192,
+		        repeat('cd', 32))`, f.tpl, f.tpl)
 	// Destroyed sandbox: copied for history, excluded from artifact dirs.
 	mustExec(t, srcPool, `
 		INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id,
@@ -411,6 +421,7 @@ func seedFixture(t *testing.T) *fixture {
 		"template_build":                     1,
 		"sandbox":                            4,
 		"snapshot":                           2,
+		"artifact_manifest":                  2,
 		"sandbox_secret":                     1,
 		"sandbox_active_interval":            2,
 		"sandbox_compute_billing_interval":   2,

@@ -748,19 +748,22 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 // PauseVM (snapshot + stop)
 // ---------------------------------------------------------------------------
 
-// PauseVM snapshots the VM state and then stops the process.
-func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, err error) {
+// PauseVM snapshots the VM state and then stops the process. The returned
+// manifest carries integrity metadata (sha256 + size) for the pause's
+// durable artifacts (disk state + vmstate); see collectPauseManifest for
+// what is included and why memory files are not.
+func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, manifest []ManifestEntry, err error) {
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate pause
 	// waits, then hits the already-paused guard.
 	unlockOp, err := m.lockVMOp(ctx, vmID)
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 	defer unlockOp()
 
 	inst, err := m.getInstance(vmID)
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
@@ -768,16 +771,18 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// Retried pause (response lost mid-RPC): re-snapshotting a stopped VM
 	// dials a dead socket and ends with the record deleted. Return the
 	// recorded artifacts instead — after confirming they still exist, like
-	// ResumeVM does before acting on a record.
+	// ResumeVM does before acting on a record. The manifest is recomputed
+	// from the on-disk files (retries are rare; correctness over cost).
 	inst.mu.RLock()
 	if inst.Status == StatusPaused && inst.SnapshotPath != "" && inst.MemFilePath != "" {
 		snapshotPath, memPath = inst.SnapshotPath, inst.MemFilePath
+		retryDiskPath, retryDiskBase := inst.DiskPath, inst.Config.BasePath
 		inst.mu.RUnlock()
 		if !fileExists(snapshotPath) || !fileExists(memPath) {
-			return "", "", status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
+			return "", "", nil, status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
 		}
 		log.Info().Msg("pause: VM already paused, returning existing snapshot")
-		return snapshotPath, memPath, nil
+		return snapshotPath, memPath, collectPauseManifest(ctx, snapshotPath, retryDiskPath, retryDiskBase, log), nil
 	}
 	inst.mu.RUnlock()
 
@@ -785,7 +790,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID)
 	}
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
-		return "", "", fmt.Errorf("create snapshot dir: %w", err)
+		return "", "", nil, fmt.Errorf("create snapshot dir: %w", err)
 	}
 
 	snapshotPath = filepath.Join(snapshotDir, "vmstate.snap")
@@ -797,6 +802,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	dirtyTracked := inst.DirtyTracked
 	instBaseMem := inst.BaseMemPath
 	instMemFile := inst.MemFilePath
+	diskPath := inst.DiskPath
+	diskBasePath := inst.Config.BasePath
 	inst.mu.RUnlock()
 
 	// Layered incremental: a template-created, dirty-tracked VM writes a diff overlay
@@ -863,13 +870,13 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 				// .base gone the restore is refused regardless.
 				_ = os.Remove(layeredBaseSidecarPath(memPath))
 				_ = os.Remove(presence.SidecarPath(memPath))
-				return "", "", m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
+				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
 			}
 			m.verifyPresenceRefreshed(memPath, saveStart, log)
 		} else {
 			memPath, baseMemPath = fullPath, ""
 			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
-				return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 			}
 		}
 	default:
@@ -880,12 +887,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		if shouldWriteDiff(m.cfg.IncrementalSnapshotEnabled, dirtyTracked, memPath, instMemFile, fileExists(memPath)) {
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating diff snapshot")
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
-				return "", "", m.handleVMError(vmID, fmt.Errorf("create diff snapshot: %w", err))
+				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create diff snapshot: %w", err))
 			}
 		} else {
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating snapshot")
 			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
-				return "", "", m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 			}
 		}
 	}
@@ -911,6 +918,14 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	}
 	stopCancel()
 
+	// Hash the durable artifacts once the unit is stopped and the files are
+	// at rest. Runs under its own budget derived from the RPC deadline (see
+	// collectPauseManifest): large disks must not pin this handler past the
+	// pause RPC cap, or the control plane times out and retries against an
+	// already-stopped unit; a budget-exhausted hash just yields a partial
+	// manifest, never a late response.
+	manifest = collectPauseManifest(ctx, snapshotPath, diskPath, diskBasePath, log)
+
 	inst.mu.Lock()
 	inst.Status = StatusPaused
 	inst.SnapshotPath = snapshotPath
@@ -921,7 +936,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 
 	m.persistState(inst)
 	log.Info().Msg("VM paused")
-	return snapshotPath, memPath, nil
+	return snapshotPath, memPath, manifest, nil
 }
 
 // shouldWriteDiff reports whether a pause may write a Diff instead of a Full.
@@ -1605,6 +1620,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// lazyReattach loads a paused VM the background reattach hasn't reached.
 	m.lazyReattach(vmID)
 	if existing := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
+		// The adopted VM keeps its stamped policy without re-validation, and
+		// the response still attests it: sound only while every vmd generation
+		// that could have served the prior attempt stamps the request's policy
+		// itself. A generation that changes stamping must add a
+		// request-vs-stamped comparison here.
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
 	}
