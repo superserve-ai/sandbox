@@ -323,6 +323,27 @@ func TestHashApparentHonorsCancellationMidExtent(t *testing.T) {
 	}
 }
 
+func TestHashApparentReportsTruncatedSource(t *testing.T) {
+	// The file shrank after its extent table was captured (a resume rewrote
+	// it): the short read must classify as ErrTruncatedSource so the
+	// generation is abandoned, not retried against a moving target.
+	path := filepath.Join(t.TempDir(), "shrunk")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0xDD}, 2<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := os.Truncate(path, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hashApparent(context.Background(), f, []Extent{{Offset: 0, Length: 2 << 20}}, 2<<20); !errors.Is(err, ErrTruncatedSource) {
+		t.Fatalf("err = %v, want ErrTruncatedSource", err)
+	}
+}
+
 func TestListGenerationsReportsOnlyComplete(t *testing.T) {
 	task := writeRestoreFixture(t, t.TempDir())
 	store := newMemBlobs()
