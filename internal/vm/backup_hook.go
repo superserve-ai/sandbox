@@ -12,6 +12,12 @@ import (
 	"github.com/superserve-ai/sandbox/internal/backup"
 )
 
+// SetBackupStaging points the enqueue path at the uploader's hard-link
+// staging tree. Same startup-only pattern as SetBackupEnqueue.
+func (m *Manager) SetBackupStaging(dir string) {
+	m.backupStaging = dir
+}
+
 // SetBackupEnqueue installs the durability pipeline's enqueue hook. Called
 // once at startup before VMs exist, same pattern as SetStateStore. A nil
 // hook (backup disabled) makes pause behave exactly as before. The hook
@@ -417,7 +423,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) bool {
 			Msg("pause manifest missing a durable artifact digest; generation not enqueued for backup")
 		return false
 	}
-	if err := m.backupEnqueue(backup.Task{
+	task := backup.Task{
 		SandboxID: vmID,
 		// Keyed on every artifact digest: any changed artifact means a new
 		// generation, so create-only dedupe can never mix old and new
@@ -425,7 +431,19 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) bool {
 		Generation: backup.GenerationKey(files),
 		Files:      files,
 		Priority:   backup.PriorityPause,
-	}); err != nil {
+	}
+	// Stage before enqueueing: teardown of a destroyed sandbox unlinks
+	// the artifacts, and the queued upload must survive it to honor the
+	// retention promise for deleted sandboxes. Hard links pin the inodes
+	// until the uploader acks; on a staging failure the original paths
+	// remain, preserving the previous best-effort behavior.
+	if m.backupStaging != "" {
+		if err := backup.StageTask(m.backupStaging, &task); err != nil {
+			m.log.Warn().Err(err).Str("vm_id", vmID).
+				Msg("backup staging failed; uploading from original paths")
+		}
+	}
+	if err := m.backupEnqueue(task); err != nil {
 		m.log.Error().Err(err).Str("vm_id", vmID).
 			Msg("backup enqueue failed; pause not journaled")
 		return false

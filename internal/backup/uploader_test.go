@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -645,5 +646,85 @@ func TestRunStopsPromptlyWhenCanceled(t *testing.T) {
 	}
 	if task.Attempts != 0 {
 		t.Fatalf("task attempts = %d, want 0 (nothing drained after cancel)", task.Attempts)
+	}
+}
+
+// A destroy racing a queued upload unlinks the original artifacts; the
+// staged hard links must carry the upload to completion anyway, and the
+// ack must clear the staging directory.
+func TestStagedUploadSurvivesSourceDeletion(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staging := filepath.Join(dir, "staging")
+	data := []byte("artifact bytes that outlive the sandbox")
+	orig := filepath.Join(src, "rootfs.ext4")
+	if err := os.WriteFile(orig, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	task := Task{
+		SandboxID:  "sb",
+		Generation: "gen",
+		EnqueuedAt: time.Unix(1, 0),
+		Files:      []TaskFile{{Name: "rootfs.ext4", Path: orig, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))}},
+	}
+	if err := StageTask(staging, &task); err != nil {
+		t.Fatal(err)
+	}
+	if task.Files[0].Path == orig {
+		t.Fatal("staging did not rewrite the task path")
+	}
+
+	j, _ := testJournal(t)
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	// The teardown race: originals gone before the drain.
+	if err := os.RemoveAll(src); err != nil {
+		t.Fatal(err)
+	}
+
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store, StagingRoot: staging}
+	worked, err := u.drainOne(context.Background(), time.Unix(2, 0))
+	if err != nil || !worked {
+		t.Fatalf("drainOne = %v/%v", worked, err)
+	}
+	if len(store.objects) == 0 {
+		t.Fatal("nothing uploaded from the staged links")
+	}
+	if _, err := os.Stat(filepath.Join(staging, "sb", "gen")); !os.IsNotExist(err) {
+		t.Fatalf("staged generation not cleaned after ack: %v", err)
+	}
+}
+
+// The startup sweep removes staged residue with no journal task and
+// keeps generations that are still queued.
+func TestSweepStagingKeepsOnlyPending(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	for _, g := range []string{"sb1/gen-pending", "sb2/gen-orphan"} {
+		if err := os.MkdirAll(filepath.Join(staging, g), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(staging, g, "rootfs.ext4"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	j, _ := testJournal(t)
+	if err := j.Enqueue(Task{SandboxID: "sb1", Generation: "gen-pending", EnqueuedAt: time.Unix(1, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	SweepStaging(staging, j, zerolog.Nop())
+
+	if _, err := os.Stat(filepath.Join(staging, "sb1", "gen-pending")); err != nil {
+		t.Fatalf("pending generation swept: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(staging, "sb2")); !os.IsNotExist(err) {
+		t.Fatalf("orphan generation kept: %v", err)
 	}
 }

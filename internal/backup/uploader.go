@@ -68,6 +68,9 @@ type Uploader struct {
 	OnVerified func(Task)
 	// Tick is the idle poll interval. 0 → 1s.
 	Tick time.Duration
+	// StagingRoot is the hard-link staging tree; finished tasks get
+	// their staged generation removed. Empty disables staging cleanup.
+	StagingRoot string
 }
 
 // Run drains the journal until ctx ends. Crash-safe by construction: work
@@ -132,6 +135,7 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	if err := u.Journal.Ack(task, completed && u.OnVerified != nil); err != nil {
 		return true, err
 	}
+	removeStagedTask(u.StagingRoot, task)
 	u.flushNotifications()
 	return true, nil
 }

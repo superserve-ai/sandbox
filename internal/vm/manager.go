@@ -250,6 +250,9 @@ type Manager struct {
 	// backupEnqueue hands finalized pause manifests to the durability
 	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
 	backupEnqueue func(backup.Task) error
+	// backupStaging is the uploader's hard-link staging tree; empty
+	// means artifacts upload from their original paths.
+	backupStaging string
 	// unitDead overrides the systemd unit-dead probe in tests; nil means
 	// the real probe. See unitConfirmedDead.
 	unitDead func(ctx context.Context, vmID string) bool

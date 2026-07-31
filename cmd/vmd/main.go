@@ -500,6 +500,16 @@ func main() {
 			Log:        log.With().Str("component", "backup").Logger(),
 			VMDVersion: os.Getenv("SENTRY_RELEASE"),
 		}
+		// Staging pins enqueued artifacts via hard links so sandbox
+		// teardown cannot erase a queued generation; the sweep clears
+		// residue from crashes between staging and enqueue.
+		stagingRoot := filepath.Join(filepath.Dir(cfg.RunDir), "backup-staging")
+		if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
+			log.Fatal().Err(err).Str("path", stagingRoot).Msg("failed to create backup staging dir")
+		}
+		backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
+		uploader.StagingRoot = stagingRoot
+		mgr.SetBackupStaging(stagingRoot)
 		mgr.SetBackupEnqueue(journal.Enqueue)
 		// The uploader must fully stop before the journal and GCS client
 		// close under it: a verification or Nack cut off mid-write leaves

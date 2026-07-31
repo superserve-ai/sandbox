@@ -265,6 +265,17 @@ func (j *Journal) RecordVerification(task Task, object string, now time.Time) er
 	})
 }
 
+// HasPending reports whether a task for this generation is still queued.
+func (j *Journal) HasPending(sandboxID, generation string) (bool, error) {
+	var ok bool
+	err := j.db.View(func(tx *bolt.Tx) error {
+		t := Task{SandboxID: sandboxID, Generation: generation}
+		ok = tx.Bucket(indexBucket).Get(t.indexKey()) != nil
+		return nil
+	})
+	return ok, err
+}
+
 // WasVerified reports whether any task ever digest-verified this object
 // within the retention window.
 func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
