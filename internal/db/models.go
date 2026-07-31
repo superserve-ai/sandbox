@@ -170,6 +170,25 @@ type Activity struct {
 	SecretName   *string     `json:"secret_name"`
 }
 
+type AnalyticsActiveSandboxCount struct {
+	ActiveSandboxes int64 `json:"active_sandboxes"`
+}
+
+type AnalyticsDailySandboxStart struct {
+	Day    pgtype.Date `json:"day"`
+	Starts int64       `json:"starts"`
+}
+
+type AnalyticsWeeklyTeamSandboxCount struct {
+	TeamName     string `json:"team_name"`
+	SandboxCount int64  `json:"sandbox_count"`
+}
+
+type AnalyticsWeeklyTeamSpend struct {
+	TeamName string         `json:"team_name"`
+	SpendUsd pgtype.Numeric `json:"spend_usd"`
+}
+
 type AnalyticsWeeklyUserMetric struct {
 	WeekStart       pgtype.Date `json:"week_start"`
 	Signups         int64       `json:"signups"`
