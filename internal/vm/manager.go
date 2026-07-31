@@ -3481,7 +3481,18 @@ func (m *Manager) resolveAndSetPID(vmID string) {
 	inst.PID = pid
 	inst.mu.Unlock()
 
-	m.persistState(inst)
+	// The persist must join the vm op critical section: unserialized, its
+	// snapshot could commit after the launching op's own writes (e.g. the
+	// restore's verified persist) and regress them. The in-memory PID above
+	// is set regardless — the launching op's persists carry it, and any
+	// later persist repairs a skipped one. IfPresent because destroy
+	// bypasses this lock and its record deletion must win.
+	unlock, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	m.persistStateIfPresent(inst)
 	m.log.Debug().Str("vm_id", vmID).Int("pid", pid).Msg("resolved systemd MainPID")
 }
 
