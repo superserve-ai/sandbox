@@ -115,6 +115,55 @@ func TestJournalNackBackoffAndPersistence(t *testing.T) {
 	}
 }
 
+// Generations are content-addressed, so distinct owners can legitimately
+// share one generation. Queue keys must stay unique per owner even at the
+// same enqueue tick, or one owner's backup would be silently overwritten.
+func TestJournalQueueKeysScopedByOwner(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
+	tasks := []Task{
+		{SandboxID: "sb-1", Generation: "shared-gen", Priority: PriorityPause, EnqueuedAt: base},
+		{TemplateID: "tpl-a", BuildID: "build-tpl-a", Generation: "shared-gen", Priority: PriorityPause, EnqueuedAt: base},
+		{TemplateID: "tpl-b", BuildID: "build-tpl-b", Generation: "shared-gen", Priority: PriorityPause, EnqueuedAt: base},
+	}
+
+	keys := make(map[string]int, len(tasks))
+	for i, task := range tasks {
+		k := string(task.key())
+		if prev, dup := keys[k]; dup {
+			t.Fatalf("tasks %d and %d collide on queue key %q", prev, i, k)
+		}
+		keys[k] = i
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// All three survive as distinct pending entries and drain independently.
+	counts, err := j.Pending()
+	if err != nil || counts[PriorityPause] != 3 {
+		t.Fatalf("pending = %v err=%v, want 3 pause tasks", counts, err)
+	}
+	owners := make(map[string]bool, len(tasks))
+	now := base.Add(time.Minute)
+	for {
+		task, ok, err := j.Next(now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			break
+		}
+		owners[task.owner()] = true
+		if err := j.Ack(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(owners) != 3 {
+		t.Fatalf("drained owners = %v, want 3 distinct owners", owners)
+	}
+}
+
 func TestJournalEnqueueRequiresExactlyOneOwner(t *testing.T) {
 	j, _ := testJournal(t)
 	cases := []struct {

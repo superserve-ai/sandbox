@@ -157,6 +157,16 @@ func (t *Task) readyAt() time.Time {
 	return t.EnqueuedAt
 }
 
+// owner is the task's full owner identity: the sandbox id for pause
+// generations, the template/build pair for template builds. NUL-joined so
+// the pair can never alias a sandbox id or another template's pair.
+func (t *Task) owner() string {
+	if t.TemplateID != "" {
+		return t.TemplateID + "\x00" + t.BuildID
+	}
+	return t.SandboxID
+}
+
 // key orders the queue: priority, then READINESS time, then the owner
 // and generation for uniqueness. Readiness rather than enqueue time is
 // load-bearing for outage backlogs: deferred tasks sort behind runnable
@@ -164,10 +174,11 @@ func (t *Task) readyAt() time.Time {
 // priority instead of scanning every deferred entry on each drain and
 // idle tick. The owner segment is load-bearing too: generations are
 // content-addressed, so two untouched sandboxes cloned from one template
-// share a generation, and without the owner a same-tick enqueue would
-// collide keys and silently drop one sandbox's backup.
+// (or two template builds producing identical artifacts) share a
+// generation, and without the owner a same-tick enqueue would collide
+// keys and silently drop one owner's backup.
 func (t *Task) key() []byte {
-	return []byte(fmt.Sprintf("%d/%020d/%s/%s", t.Priority, t.readyAt().UnixNano(), t.SandboxID, t.Generation))
+	return []byte(fmt.Sprintf("%d/%020d/%s/%s", t.Priority, t.readyAt().UnixNano(), t.owner(), t.Generation))
 }
 
 // indexKey is the pending-generation identity for the dedupe index. The
@@ -175,11 +186,7 @@ func (t *Task) key() []byte {
 // tasks dedupe on their own identity and can never collide with a sandbox
 // task sharing a generation key.
 func (t *Task) indexKey() []byte {
-	owner := t.SandboxID
-	if t.TemplateID != "" {
-		owner = t.TemplateID + "\x00" + t.BuildID
-	}
-	return []byte(owner + "\x00" + t.Generation)
+	return []byte(t.owner() + "\x00" + t.Generation)
 }
 
 // Enqueue adds a task. A task for the same generation that is already

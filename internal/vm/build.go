@@ -216,6 +216,15 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 // enqueued. The build itself still succeeds; the gap is surfaced by the
 // warn log and coverage monitoring, never papered over.
 func (m *Manager) backupBuildArtifacts(ctx context.Context, templateID, buildVMID, snapshotDir, basePath string, log zerolog.Logger) {
+	// No enqueue hook means backup is disabled on this host (BACKUP_BUCKET
+	// unset). Bail before any hashing: the digests exist to feed the backup
+	// journal, and with no consumer the only effect would be delaying every
+	// successful build by up to buildHashBudget plus the metadata hash while
+	// the build's claimed network slot sits idle. Same gate as the pause
+	// path, just hoisted ahead of the hashing instead of inside the enqueue.
+	if m.backupEnqueue == nil {
+		return
+	}
 	entries, complete := collectBuildManifest(ctx, snapshotDir, []string{basePath}, log)
 	if len(entries) == 0 {
 		log.Warn().Str("dir", snapshotDir).
