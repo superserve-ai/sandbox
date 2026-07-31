@@ -2057,7 +2057,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 
 	// Resume-path parity: Running means the vCPUs are live; boxd readiness is
-	// verified below and still fails the restore. The status is set directly —
+	// verified below and still fails the restore. The proxy consequently sees
+	// Running during the wait (as it always has on resume). KNOWN NARROW GAP:
+	// a vmd crash inside this window leaves a Running-unverified record that
+	// ResumeVM's readiness-blind adoption would accept; the designed fix is an
+	// omitempty unverified marker cleared lazily by any later persist —
+	// tracked separately, not patched here. The status is set directly —
 	// setStatus would persist synchronously, serializing the very fsync the
 	// goroutine overlaps with the boxd wait.
 	inst.mu.Lock()
