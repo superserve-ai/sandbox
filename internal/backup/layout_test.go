@@ -52,4 +52,13 @@ func TestGenerationKey(t *testing.T) {
 	if rebased == k1 {
 		t.Fatal("changed base dependency did not change the generation key")
 	}
+	// A base rebuilt in place: same path, different bytes. The path
+	// cannot see it; the base content digest must.
+	rebuilt := GenerationKey([]TaskFile{
+		{Name: "rootfs.ext4", SHA256: "aaaa", BasePath: "/templates/t/b1/base.ext4", BaseSHA256: "ffff"},
+		base[1],
+	})
+	if rebuilt == k1 {
+		t.Fatal("changed base contents did not change the generation key")
+	}
 }

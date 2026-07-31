@@ -156,11 +156,12 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) bool {
 	files := make([]backup.TaskFile, 0, len(manifest))
 	for _, e := range manifest {
 		files = append(files, backup.TaskFile{
-			Name:     e.FileName,
-			Path:     e.Path,
-			SHA256:   e.SHA256,
-			Size:     e.SizeBytes,
-			BasePath: e.BasePath,
+			Name:       e.FileName,
+			Path:       e.Path,
+			SHA256:     e.SHA256,
+			Size:       e.SizeBytes,
+			BasePath:   e.BasePath,
+			BaseSHA256: e.BaseSHA256,
 		})
 	}
 	if !pauseManifestComplete(manifest) {

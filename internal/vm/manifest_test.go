@@ -48,7 +48,11 @@ func TestCollectPauseManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	entries := collectPauseManifest(context.Background(), vmstate, rootfs, "/base/base.ext4", zerolog.Nop())
+	base := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(base, []byte("basedata"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries := collectPauseManifest(context.Background(), vmstate, rootfs, base, zerolog.Nop())
 	if len(entries) != 2 {
 		t.Fatalf("entries = %d, want 2", len(entries))
 	}
@@ -61,7 +65,7 @@ func TestCollectPauseManifest(t *testing.T) {
 		t.Errorf("vmstate entry wrong: %+v", vs)
 	}
 	rf, ok := byName["rootfs.ext4"]
-	if !ok || rf.Path != rootfs || rf.SizeBytes != 8 || rf.BasePath != "/base/base.ext4" {
+	if !ok || rf.Path != rootfs || rf.SizeBytes != 8 || rf.BasePath != base || rf.BaseSHA256 == "" {
 		t.Errorf("rootfs entry wrong: %+v", rf)
 	}
 	if rf.SHA256 == "" || len(rf.SHA256) != 64 {
@@ -103,5 +107,50 @@ func TestCollectPauseManifestSkipsWithoutBudget(t *testing.T) {
 	defer cancel()
 	if entries := collectPauseManifest(ctx, vmstate, "", "", zerolog.Nop()); entries != nil {
 		t.Fatalf("expected nil manifest with no budget, got %+v", entries)
+	}
+}
+
+// The disk entry must carry the base image's content digest: the base's
+// identity is its bytes, and a base rebuilt in place (same path, new
+// contents) must surface as a different dependency.
+func TestCollectPauseManifestBindsBaseContents(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "overlay.ext4")
+	base := filepath.Join(dir, "base.ext4")
+	for p, data := range map[string]string{snap: "vm state", disk: "overlay", base: "base v1"} {
+		if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first := collectPauseManifest(context.Background(), snap, disk, base, zerolog.Nop())
+	var firstBase string
+	for _, e := range first {
+		if e.FileName == "rootfs.ext4" {
+			if e.BasePath != base || e.BaseSHA256 == "" {
+				t.Fatalf("disk entry = %+v, want base path and content digest", e)
+			}
+			firstBase = e.BaseSHA256
+		}
+	}
+	if firstBase == "" {
+		t.Fatal("no disk entry in manifest")
+	}
+
+	// Rebuild the base in place; ensure the mtime moves even on coarse
+	// filesystem clocks.
+	if err := os.WriteFile(base, []byte("base v2 bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(base, later, later); err != nil {
+		t.Fatal(err)
+	}
+	second := collectPauseManifest(context.Background(), snap, disk, base, zerolog.Nop())
+	for _, e := range second {
+		if e.FileName == "rootfs.ext4" && e.BaseSHA256 == firstBase {
+			t.Fatal("rebuilt base kept the old content digest (stale cache)")
+		}
 	}
 }

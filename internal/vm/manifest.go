@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -21,6 +23,11 @@ type ManifestEntry struct {
 	SizeBytes int64
 	SHA256    string
 	BasePath  string
+	// BaseSHA256 is the base file's content digest. The path alone is not
+	// an identity: a base rebuilt or restored with different bytes at the
+	// same path changes the effective filesystem under an unchanged
+	// overlay, and only the content digest makes that a new generation.
+	BaseSHA256 string
 }
 
 const (
@@ -107,12 +114,22 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 			log.Warn().Err(err).Str("path", path).Msg("pause manifest: hash failed, entry skipped")
 			return
 		}
+		var baseSum string
+		if basePath != "" {
+			baseSum, err = baseDigest(hctx, basePath)
+			if err != nil {
+				log.Warn().Err(err).Str("path", basePath).
+					Msg("pause manifest: base digest failed, entry skipped")
+				return
+			}
+		}
 		entries = append(entries, ManifestEntry{
-			FileName:  name,
-			Path:      path,
-			SizeBytes: size,
-			SHA256:    sum,
-			BasePath:  basePath,
+			FileName:   name,
+			Path:       path,
+			SizeBytes:  size,
+			SHA256:     sum,
+			BasePath:   basePath,
+			BaseSHA256: baseSum,
 		})
 	}
 	// vmstate first: tiny and guaranteed inside any budget, so even a
@@ -125,4 +142,50 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 		Dur("budget", budget).
 		Msg("pause manifest computed")
 	return entries
+}
+
+// baseDigestCache memoizes content digests of overlay base images, keyed
+// by path plus stat identity (device, inode, size, mtime). Bases are
+// immutable template artifacts shared by many sandboxes, so a multi-GB
+// base hashes once per boot instead of once per pause; any change to the
+// file's identity misses the cache and rehashes.
+var baseDigestCache sync.Map
+
+// baseDigest returns the content digest of a base image, cached. The
+// identity is re-checked after hashing: a base swapped mid-hash yields
+// an error (and an incomplete manifest, which the retry path owns)
+// rather than a digest describing bytes of two different files.
+func baseDigest(ctx context.Context, path string) (string, error) {
+	key, err := baseIdentity(path)
+	if err != nil {
+		return "", err
+	}
+	if v, ok := baseDigestCache.Load(key); ok {
+		return v.(string), nil
+	}
+	sum, _, err := hashFile(ctx, path)
+	if err != nil {
+		return "", err
+	}
+	after, err := baseIdentity(path)
+	if err != nil {
+		return "", err
+	}
+	if after != key {
+		return "", fmt.Errorf("base image %s changed while hashing", path)
+	}
+	baseDigestCache.Store(key, sum)
+	return sum, nil
+}
+
+func baseIdentity(path string) (string, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", fmt.Errorf("base image %s: no stat identity", path)
+	}
+	return fmt.Sprintf("%s|%d|%d|%d|%d", path, st.Dev, st.Ino, fi.Size(), fi.ModTime().UnixNano()), nil
 }

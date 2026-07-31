@@ -21,15 +21,17 @@ import (
 )
 
 // GenerationKey derives a generation's content address from the full
-// artifact set, base dependencies included. Keying on a single artifact
-// would let the others drift: a re-pause with an unchanged disk but a
-// fresh vmstate would reuse the old prefix, and an overlay re-based onto
-// a different base image with unchanged bytes would dedupe onto a
-// manifest pairing it with the wrong base.
+// artifact set, base dependencies included by content digest. Keying on
+// a single artifact would let the others drift: a re-pause with an
+// unchanged disk but a fresh vmstate would reuse the old prefix, and an
+// overlay whose base was re-pointed OR rebuilt in place with different
+// bytes would dedupe onto a manifest pairing it with the wrong base
+// contents (the overlay digest cannot see this: holes hash as zeros, not
+// as base bytes).
 func GenerationKey(files []TaskFile) string {
 	lines := make([]string, 0, len(files))
 	for _, f := range files {
-		lines = append(lines, f.Name+"="+f.SHA256+"="+f.BasePath)
+		lines = append(lines, f.Name+"="+f.SHA256+"="+f.BasePath+"="+f.BaseSHA256)
 	}
 	sort.Strings(lines)
 	h := sha256.New()

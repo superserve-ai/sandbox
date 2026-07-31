@@ -42,6 +42,7 @@ type ManifestFile struct {
 	// holes are backed by this file's contents, so a restore of the
 	// overlay alone is incomplete without it (the consistency-pair rule).
 	BasePath   string   `json:"base_path,omitempty"`
+	BaseSHA256 string   `json:"base_sha256,omitempty"`
 	PackedSize int64    `json:"packed_size"`
 	Extents    []Extent `json:"extents"`
 }
@@ -306,6 +307,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		Object:     objectName,
 		SHA256:     file.SHA256,
 		BasePath:   file.BasePath,
+		BaseSHA256: file.BaseSHA256,
 		Size:       apparent,
 		PackedSize: PackedSize(extents),
 		Extents:    extents,
