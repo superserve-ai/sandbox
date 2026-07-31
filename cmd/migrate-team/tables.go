@@ -28,6 +28,11 @@ const profileScope = `id IN (
 // sandboxScope covers tables keyed by sandbox_id without a team_id column.
 const sandboxScope = `sandbox_id IN (SELECT id FROM sandbox WHERE team_id = $1)`
 
+// manifestScope covers artifact_manifest, whose rows hang off exactly one of
+// snapshot or template (no team_id column of their own).
+const manifestScope = `(snapshot_id IN (SELECT id FROM snapshot WHERE team_id = $1)
+	OR template_id IN (SELECT id FROM template WHERE team_id = $1))`
+
 type tableSpec struct {
 	name  string
 	scope string
@@ -86,6 +91,9 @@ var migratedTables = []tableSpec{
 	// circular sandbox.snapshot_id ↔ snapshot.sandbox_id FK is relinked.
 	{"sandbox", "team_id = $1"},
 	{"snapshot", "team_id = $1"},
+	// Integrity manifests hang off snapshots and templates; both parents
+	// are in scope by this point in the FK order.
+	{"artifact_manifest", manifestScope},
 	{"sandbox_secret", sandboxScope},
 	{"sandbox_active_interval", "team_id = $1"},
 	{"sandbox_compute_billing_interval", "team_id = $1"},

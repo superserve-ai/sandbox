@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -86,5 +87,21 @@ func TestCollectPauseManifestDegradesOnMissingFiles(t *testing.T) {
 	entries = collectPauseManifest(context.Background(), vmstate, "", "", zerolog.Nop())
 	if len(entries) != 1 {
 		t.Fatalf("expected only vmstate entry, got %+v", entries)
+	}
+}
+
+func TestCollectPauseManifestSkipsWithoutBudget(t *testing.T) {
+	dir := t.TempDir()
+	vmstate := filepath.Join(dir, "vmstate.snap")
+	if err := os.WriteFile(vmstate, []byte("state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deadline already inside the safety margin: hashing must be skipped
+	// entirely, not stretched past the RPC deadline.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second))
+	defer cancel()
+	if entries := collectPauseManifest(ctx, vmstate, "", "", zerolog.Nop()); entries != nil {
+		t.Fatalf("expected nil manifest with no budget, got %+v", entries)
 	}
 }

@@ -716,10 +716,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// resumable 'paused' state. Prefer leak over loss.
 	pauseAndRevert := func() {
 		pctx, pcancel := context.WithTimeout(revertCtx, vmdTimeout)
-		// Manifest discarded: the revert reuses the prior pause's unchanged
-		// artifacts, whose manifest rows already exist; SizeBytes 0 below
-		// leaves the recorded size in place (FinalizePause keeps >0 values).
-		snapPath, memPath, _, perr := vmd.PauseInstance(pctx, sandboxID.String(), "")
+		// The revert re-snapshots the VM, and the guest may have run and
+		// dirtied the disk before the failed finalize was detected, so the
+		// artifacts on disk are fresh. Record their manifest below; keeping
+		// the pre-resume hashes would leave stale integrity data.
+		snapPath, memPath, manifest, perr := vmd.PauseInstance(pctx, sandboxID.String(), "")
 		pcancel()
 		if perr != nil {
 			// VM unreachable — nothing to preserve; mark failed rather than
@@ -732,19 +733,22 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		// Overlay preserved; flip resuming → paused via FinalizePause.
 		fctx, fcancel := context.WithTimeout(revertCtx, vmdTimeout)
 		defer fcancel()
-		if _, ferr := h.DB.FinalizePause(fctx, db.FinalizePauseParams{
+		snapID, ferr := h.DB.FinalizePause(fctx, db.FinalizePauseParams{
 			ID:        sandboxID,
 			TeamID:    teamID,
 			Path:      snapPath,
 			MemPath:   &memPath,
-			SizeBytes: 0, // snapshot size isn't tracked for pauses (matches PauseSandbox)
+			SizeBytes: manifestCompleteBytes(manifest),
 			Trigger:   "resume_revert",
-		}); ferr != nil {
+		})
+		if ferr != nil {
 			// VM is safely paused; only bookkeeping failed. Best-effort status
 			// flip — the reconciler is the backstop.
 			log.Error().Err(ferr).Str("sandbox_id", sandboxID.String()).Msg("resume revert: FinalizePause failed, best-effort revert to paused")
 			revertToPaused()
+			return
 		}
+		recordSnapshotManifest(fctx, h.DB, snapID, manifest)
 	}
 
 	// Re-read and push after the VM is present. A publication mutation can race

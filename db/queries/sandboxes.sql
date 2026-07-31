@@ -407,14 +407,24 @@ upserted AS (
   DO UPDATE SET
     path = EXCLUDED.path,
     mem_path = EXCLUDED.mem_path,
-    -- A finalize that has no fresh measurement passes 0 (resume_revert
-    -- reuses the prior pause's unchanged artifacts); keep the recorded
-    -- size instead of clobbering it back to zero.
+    -- A finalize that has no complete manifest passes 0 (hash budget
+    -- exhausted or a file failed to hash); keep the recorded size instead
+    -- of clobbering it back to zero.
     size_bytes = CASE WHEN EXCLUDED.size_bytes > 0
                       THEN EXCLUDED.size_bytes
                       ELSE snapshot.size_bytes END,
     trigger = EXCLUDED.trigger
   RETURNING snapshot.id AS snap_id
+),
+-- The pause that produced this finalize rewrote the artifacts on disk, so
+-- existing manifest rows describe the previous pause's content. Clear them
+-- atomically with the finalize: the fresh manifest lands best-effort right
+-- after, and if that write fails the snapshot must show "no integrity
+-- data" (coverage monitoring surfaces it), never stale hashes that look
+-- current for rewritten files.
+cleared AS (
+  DELETE FROM artifact_manifest
+  WHERE snapshot_id IN (SELECT snap_id FROM upserted)
 )
 UPDATE sandbox
 SET snapshot_id = (SELECT snap_id FROM upserted),

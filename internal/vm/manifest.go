@@ -29,10 +29,6 @@ const (
 	// cut short: a paused VM whose pause "times out" gets retried against an
 	// already-stopped unit, which is the worse failure.
 	hashSafetyMargin = 3 * time.Second
-	// hashBudgetFloor guarantees a minimum hashing window when the caller's
-	// deadline is nearly consumed: vmstate is tiny and small disks are cheap,
-	// so a few seconds usually still completes the set.
-	hashBudgetFloor = 5 * time.Second
 	// hashBudgetCap bounds hashing when the caller has no deadline.
 	hashBudgetCap = 60 * time.Second
 )
@@ -75,23 +71,27 @@ func hashFile(ctx context.Context, path string) (string, int64, error) {
 // no durability gain.
 //
 // Hashing runs under its own budget: the caller's remaining deadline minus
-// a safety margin (so the RPC response always gets out), floored so a
-// nearly-spent deadline still hashes the small entries, capped when there
-// is no deadline. Detached from the caller's cancellation: a paused VM
-// should get its integrity record even if the client gave up. A file that
-// misses the budget or fails to hash is skipped with a warning rather than
-// failing the pause; the control plane records the partial set as partial
-// (it never publishes a partial total as the snapshot size), and coverage
-// monitoring surfaces the incomplete manifest downstream.
+// a safety margin (so the RPC response always gets out), capped when there
+// is no deadline. When the deadline leaves no usable budget, hashing is
+// skipped entirely rather than stretched past the RPC cap; the finalize
+// clears the snapshot's previous manifest rows, so a skipped hash yields
+// "no integrity data" (surfaced by coverage monitoring), never stale
+// hashes. Detached from the caller's cancellation: a paused VM should get
+// its integrity record even if the client gave up. A file that misses the
+// budget or fails to hash is likewise skipped with a warning rather than
+// failing the pause; the control plane never publishes a partial total as
+// the snapshot size.
 func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBasePath string, log zerolog.Logger) []ManifestEntry {
 	budget := hashBudgetCap
 	if dl, ok := ctx.Deadline(); ok {
-		if rem := time.Until(dl) - hashSafetyMargin; rem < budget {
+		rem := time.Until(dl) - hashSafetyMargin
+		if rem <= 0 {
+			log.Warn().Msg("pause manifest: no hashing budget left before RPC deadline, skipping")
+			return nil
+		}
+		if rem < budget {
 			budget = rem
 		}
-	}
-	if budget < hashBudgetFloor {
-		budget = hashBudgetFloor
 	}
 	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
 	defer cancel()
