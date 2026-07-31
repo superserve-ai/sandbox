@@ -21,6 +21,12 @@ provider "google" {
 }
 
 locals {
+  cloud_ids_mirrored_subnet_self_links = [
+    module.network.subnetwork_self_link,
+  ]
+}
+
+locals {
   project_id             = var.project_id
   environment            = var.environment
   region                 = var.region
@@ -253,4 +259,17 @@ module "backup_storage" {
     "vanta-contains-user-data" = "true"
     "vanta-user-data-stored"   = "customer_sandbox_snapshots_and_files"
   })
+}
+
+module "cloud_ids" {
+  source = "../../../modules/cloud-ids"
+
+  project_id                 = local.project_id
+  region                     = local.region
+  zone                       = local.zone
+  network_self_link          = module.network.network_self_link
+  endpoint_name              = "superserve-ids-${local.resource_suffix}"
+  mirrored_subnet_self_links = local.cloud_ids_mirrored_subnet_self_links
+  notification_channel_ids   = var.notification_channel_ids
+  labels                     = local.common_labels
 }
