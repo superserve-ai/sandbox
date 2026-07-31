@@ -275,6 +275,28 @@ func TestRestoreGenerationRefusesPopulatedDest(t *testing.T) {
 	}
 }
 
+func TestRestoreGenerationRefusesSymlinkDest(t *testing.T) {
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+
+	// destDir itself is a pre-planted symlink: following it would redirect
+	// the restore outside the requested path.
+	target := t.TempDir()
+	destDir := filepath.Join(t.TempDir(), "dest")
+	if err := os.Symlink(target, destDir); err != nil {
+		t.Fatal(err)
+	}
+	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir)
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("err = %v, want symlink refusal", err)
+	}
+	entries, readErr := os.ReadDir(target)
+	if readErr != nil || len(entries) != 0 {
+		t.Fatalf("symlink target written to: %d entries, err=%v", len(entries), readErr)
+	}
+}
+
 func TestRestoreFileNeverOpensExistingDest(t *testing.T) {
 	task := writeRestoreFixture(t, t.TempDir())
 	store := newMemBlobs()
@@ -287,11 +309,17 @@ func TestRestoreFileNeverOpensExistingDest(t *testing.T) {
 	// A file that appears between the emptiness check and the open (a
 	// concurrent restore, or a planted symlink): O_EXCL must refuse it,
 	// report the file as not created, and leave it untouched.
-	dest := filepath.Join(t.TempDir(), "overlay.ext4")
+	destDir := t.TempDir()
+	dest := filepath.Join(destDir, "overlay.ext4")
 	if err := os.WriteFile(dest, []byte("someone else's file"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	madeFile, err := restoreFile(context.Background(), store, task.SandboxID, task.Generation, manifest.Files[0], dest)
+	root, err := os.OpenRoot(destDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	madeFile, err := restoreFile(context.Background(), store, task.SandboxID, task.Generation, manifest.Files[0], root)
 	if err == nil || !errors.Is(err, os.ErrExist) {
 		t.Fatalf("err = %v, want ErrExist", err)
 	}

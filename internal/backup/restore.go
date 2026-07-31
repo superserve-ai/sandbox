@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -129,10 +128,19 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 	if err := ensureFreshDir(destDir); err != nil {
 		return nil, err
 	}
+	// Pin the destination: every per-file open, verify, and cleanup below is
+	// relative to this directory descriptor, so a symlink swapped in for
+	// destDir (or planted inside it) after the freshness check cannot
+	// redirect writes elsewhere.
+	root, err := os.OpenRoot(destDir)
+	if err != nil {
+		return nil, fmt.Errorf("dest dir: %w", err)
+	}
+	defer root.Close()
 	var created []string
 	fail := func(err error) (*GenerationManifest, error) {
-		for _, p := range created {
-			os.Remove(p)
+		for _, name := range created {
+			root.Remove(name)
 		}
 		return nil, err
 	}
@@ -142,10 +150,9 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 		if err := validSegment(mf.Name); err != nil {
 			return fail(fmt.Errorf("manifest file name: %w", err))
 		}
-		dest := filepath.Join(destDir, mf.Name)
-		madeFile, err := restoreFile(ctx, r, sandboxID, generation, mf, dest)
+		madeFile, err := restoreFile(ctx, r, sandboxID, generation, mf, root)
 		if madeFile {
-			created = append(created, dest)
+			created = append(created, mf.Name)
 		}
 		if err != nil {
 			return fail(fmt.Errorf("restore %s: %w", mf.Name, err))
@@ -155,7 +162,7 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 	// verification cannot leave earlier files implicitly blessed: either
 	// the whole set passes or the whole set is gone.
 	for _, mf := range manifest.Files {
-		if err := verifyFile(ctx, filepath.Join(destDir, mf.Name), mf); err != nil {
+		if err := verifyFile(ctx, root, mf); err != nil {
 			return fail(fmt.Errorf("verify %s: %w", mf.Name, err))
 		}
 	}
@@ -165,6 +172,12 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 // ensureFreshDir creates destDir (and parents) or accepts an existing but
 // empty directory. Anything else is refused; see RestoreGeneration.
 func ensureFreshDir(dir string) error {
+	// A symlink at dir itself would be followed by MkdirAll and everything
+	// after it, redirecting the restore to wherever it points. Require a
+	// real directory (or nothing) at the path.
+	if fi, err := os.Lstat(dir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("dest dir %s is a symlink: restore only writes into a real directory", dir)
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("dest dir: %w", err)
 	}
@@ -215,12 +228,13 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 // derived from the file name: the name embeds the packing fingerprint, so
 // this entry's extent table describes exactly the object it points at.
 //
-// The destination is opened O_EXCL: ensureFreshDir's emptiness check and
-// this open are separate operations, so exclusive creation is what
-// guarantees an existing file (or a symlink planted in between) is never
-// opened, truncated, or followed. madeFile reports whether this call
-// created dest, and only then may the caller's failure cleanup remove it.
-func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string, mf ManifestFile, dest string) (madeFile bool, _ error) {
+// The destination is opened O_EXCL relative to the pinned root:
+// ensureFreshDir's emptiness check and this open are separate operations,
+// so exclusive fd-relative creation is what guarantees an existing file
+// (or a symlink planted in between) is never opened, truncated, or
+// followed. madeFile reports whether this call created the file, and only
+// then may the caller's failure cleanup remove it.
+func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string, mf ManifestFile, root *os.Root) (madeFile bool, _ error) {
 	if mf.Object == "" {
 		return false, fmt.Errorf("manifest entry records no object name")
 	}
@@ -239,7 +253,7 @@ func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string
 		return false, err
 	}
 	defer rc.Close()
-	f, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := root.OpenFile(mf.Name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return false, err
 	}
@@ -284,9 +298,11 @@ func validExtents(mf ManifestFile) error {
 
 // verifyFile recomputes the full apparent digest of the rebuilt file with
 // the same logic the uploader used (hashApparent over the manifest's extent
-// table) and compares it to the manifest's recorded digest.
-func verifyFile(ctx context.Context, path string, mf ManifestFile) error {
-	f, err := os.Open(path)
+// table) and compares it to the manifest's recorded digest. The open is
+// relative to the pinned root so verification reads the file that was
+// written, not something swapped in at the path.
+func verifyFile(ctx context.Context, root *os.Root, mf ManifestFile) error {
+	f, err := root.Open(mf.Name)
 	if err != nil {
 		return err
 	}
