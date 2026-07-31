@@ -24,7 +24,9 @@ DROP VIEW IF EXISTS analytics.weekly_team_sandbox_count;
 -- (20260617000003_billing_pricing_credits.sql), pinned as a literal
 -- rather than computed as MIN(effective_from) over pricing_rate: a later
 -- rate inserted with an earlier effective_from must not move the
--- boundary and flip already-zero-priced hours to NULL.
+-- boundary and flip already-zero-priced hours to NULL. The boundary
+-- check comes before the rate match in each CASE for the same reason: a
+-- backdated rate must not start charging pre-launch hours either.
 -- Past that instant, a resource with no matching rate
 -- resolves to NULL instead of 0, whether that's a one-off gap between two
 -- rate periods or a custom plan that never defined the resource at all,
@@ -41,12 +43,15 @@ DROP VIEW IF EXISTS analytics.weekly_team_sandbox_count;
 CREATE OR REPLACE VIEW analytics.team_hourly_spend AS
 SELECT t.name AS team_name,
        u.hour_start,
-       (CASE WHEN vcpu_rate.price_usd IS NOT NULL THEN u.vcpu_seconds * vcpu_rate.price_usd
-             WHEN u.hour_start < pl.at THEN 0 ELSE NULL END
-        + CASE WHEN mem_rate.price_usd IS NOT NULL THEN u.memory_mib_seconds / 1024 * mem_rate.price_usd
-             WHEN u.hour_start < pl.at THEN 0 ELSE NULL END
-        + CASE WHEN storage_rate.price_usd IS NOT NULL THEN u.storage_mib_seconds / 1024 * storage_rate.price_usd
-             WHEN u.hour_start < pl.at THEN 0 ELSE NULL END
+       (CASE WHEN u.hour_start < pl.at THEN 0
+             WHEN vcpu_rate.price_usd IS NOT NULL THEN u.vcpu_seconds * vcpu_rate.price_usd
+             ELSE NULL END
+        + CASE WHEN u.hour_start < pl.at THEN 0
+             WHEN mem_rate.price_usd IS NOT NULL THEN u.memory_mib_seconds / 1024 * mem_rate.price_usd
+             ELSE NULL END
+        + CASE WHEN u.hour_start < pl.at THEN 0
+             WHEN storage_rate.price_usd IS NOT NULL THEN u.storage_mib_seconds / 1024 * storage_rate.price_usd
+             ELSE NULL END
        )::numeric(14,6) AS spend_usd
 FROM team_billing_usage_hourly u
 JOIN team t ON t.id = u.team_id
