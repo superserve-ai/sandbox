@@ -1003,6 +1003,44 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	}
 }
 
+// A destroy landing inside the adoption readiness wait must not be reported
+// as a successful restore.
+func TestRestoreVMSnapshot_DestroyedDuringAdoptionWait_Fails(t *testing.T) {
+	orig := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = orig }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(_ context.Context, m *Manager, _ string) error {
+		m.mu.Lock()
+		delete(m.vms, "vm-1") // destroy races the wait
+		m.mu.Unlock()
+		return nil
+	}
+	defer func() { adoptionBoxdReady = origReady }()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		vms:        map[string]*VMInstance{"vm-1": existing},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	if _, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0); err == nil {
+		t.Fatal("a VM destroyed during the adoption wait must not restore successfully")
+	}
+}
+
 // The crash-window guard: a reattached Running record whose restore was
 // interrupted before readiness must not be adopted as a successful create.
 func TestRestoreVMSnapshot_AdoptedButBoxdNeverReady_Fails(t *testing.T) {

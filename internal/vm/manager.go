@@ -1642,6 +1642,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			m.stopUnitDuringRestoreError(vmID)
 			return nil, fmt.Errorf("adopted VM %s boxd not ready: %w", vmID, err)
 		}
+		// The wait stretched the adoption window; re-check identity after it,
+		// as the fresh-restore path does, so a destroy landing mid-wait
+		// cannot be reported as a successful restore.
+		m.mu.RLock()
+		still := m.vms[vmID] == existing
+		m.mu.RUnlock()
+		if !still {
+			return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
+		}
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
 	}
