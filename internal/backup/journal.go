@@ -81,6 +81,13 @@ var (
 	// whole backlog (which grows during bucket outages, and the scan held
 	// a write transaction that blocked uploader acks).
 	indexBucket = []byte("backup_upload_index")
+	// outboxBucket holds completed tasks whose OnVerified notification
+	// has not yet been delivered. Written in the same transaction as the
+	// ack that deletes the task, so no crash window exists in which the
+	// generation is complete but the completion signal is lost; entries
+	// are deleted only after the callback returns, making delivery
+	// at-least-once (consumers must be idempotent).
+	outboxBucket = []byte("backup_verified_outbox")
 	// verifiedBucket records object names whose streamed bytes were
 	// digest-verified, OUTLIVING the tasks that verified them: an
 	// unchanged re-pause re-enqueues an already-completed generation, and
@@ -107,7 +114,7 @@ var pruneCursorKey = []byte("\x00prune_cursor")
 // caller owns the bolt DB; sharing vmd's state DB keeps one fsync domain.
 func NewJournal(db *bolt.DB) (*Journal, error) {
 	err := db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket} {
+		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket, outboxBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -273,10 +280,14 @@ func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
 	return ok, err
 }
 
-// Ack removes a completed task. Called only after every object of the
-// generation is verified in the bucket. Piggybacks a bounded lazy prune
-// of expired verification history.
-func (j *Journal) Ack(task Task) error {
+// Ack removes a finished task. Called only after every object of the
+// generation is verified in the bucket (or the task was abandoned).
+// notify additionally records the task in the notification outbox within
+// the SAME transaction: the ack that makes the task's completion
+// otherwise unrecoverable is the last durable moment to remember that a
+// completion signal is still owed. Piggybacks a bounded lazy prune of
+// expired verification history.
+func (j *Journal) Ack(task Task, notify bool) error {
 	now := time.Now()
 	return j.db.Update(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(journalBucket).Delete(task.key()); err != nil {
@@ -284,6 +295,15 @@ func (j *Journal) Ack(task Task) error {
 		}
 		if err := tx.Bucket(indexBucket).Delete(task.indexKey()); err != nil {
 			return err
+		}
+		if notify {
+			val, err := json.Marshal(task)
+			if err != nil {
+				return err
+			}
+			if err := tx.Bucket(outboxBucket).Put(task.indexKey(), val); err != nil {
+				return err
+			}
 		}
 		// Bounded incremental prune: examine at most pruneExamineLimit
 		// entries per ack, resuming from a persisted cursor position and
@@ -366,4 +386,28 @@ func (j *Journal) Pending() (map[Priority]int, error) {
 		})
 	})
 	return counts, err
+}
+
+// PendingNotifications returns completed tasks whose OnVerified signal
+// has not been confirmed delivered. Corrupt entries are skipped (and
+// swept by ClearNotification when their key is next written).
+func (j *Journal) PendingNotifications() ([]Task, error) {
+	var tasks []Task
+	err := j.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(outboxBucket).ForEach(func(k, v []byte) error {
+			var t Task
+			if json.Unmarshal(v, &t) == nil {
+				tasks = append(tasks, t)
+			}
+			return nil
+		})
+	})
+	return tasks, err
+}
+
+// ClearNotification confirms delivery of a task's completion signal.
+func (j *Journal) ClearNotification(task Task) error {
+	return j.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(outboxBucket).Delete(task.indexKey())
+	})
 }

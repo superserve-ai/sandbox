@@ -60,7 +60,10 @@ type Uploader struct {
 	VMDVersion string
 	// OnVerified fires after a task's generation is fully in the bucket
 	// (manifest object written) and acked. This is the signal downstream
-	// bookkeeping and local-staging GC key on.
+	// bookkeeping and local-staging GC key on. Delivery is at-least-once:
+	// the signal is held durably in the journal's outbox until the
+	// callback returns, and a restart redelivers undelivered signals, so
+	// the callback must tolerate duplicates.
 	OnVerified func(Task)
 	// Tick is the idle poll interval. 0 → 1s.
 	Tick time.Duration
@@ -74,6 +77,9 @@ func (u *Uploader) Run(ctx context.Context) error {
 	if tick <= 0 {
 		tick = time.Second
 	}
+	// Deliver completion signals a previous process acked but never
+	// notified: the outbox is the only record of those.
+	u.flushNotifications()
 	for {
 		worked, err := u.drainOne(ctx, time.Now())
 		if err != nil {
@@ -110,13 +116,34 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 			Msg("backup upload failed; will retry")
 		return true, u.Journal.Nack(task, now)
 	}
-	if err := u.Journal.Ack(task); err != nil {
+	if err := u.Journal.Ack(task, completed && u.OnVerified != nil); err != nil {
 		return true, err
 	}
-	if completed && u.OnVerified != nil {
-		u.OnVerified(task)
-	}
+	u.flushNotifications()
 	return true, nil
+}
+
+// flushNotifications delivers every outboxed completion signal and
+// confirms each only after the callback returns. Failures to load or
+// clear are logged and retried on the next flush, never dropped.
+func (u *Uploader) flushNotifications() {
+	if u.OnVerified == nil {
+		return
+	}
+	pending, err := u.Journal.PendingNotifications()
+	if err != nil {
+		u.Log.Warn().Err(err).Msg("backup notification outbox read failed")
+		return
+	}
+	for _, t := range pending {
+		u.OnVerified(t)
+		if err := u.Journal.ClearNotification(t); err != nil {
+			u.Log.Warn().Err(err).
+				Str("sandbox_id", t.SandboxID).
+				Str("generation", t.Generation).
+				Msg("backup notification clear failed; will redeliver")
+		}
+	}
 }
 
 // uploadTask ships every artifact of a generation, then its manifest

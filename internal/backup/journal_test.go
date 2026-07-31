@@ -49,7 +49,7 @@ func TestJournalPriorityAndFIFO(t *testing.T) {
 			break
 		}
 		got = append(got, task.Generation)
-		if err := j.Ack(task); err != nil {
+		if err := j.Ack(task, false); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -489,7 +489,7 @@ func TestJournalPruneSweepsHistoryAcrossAcks(t *testing.T) {
 	task := Task{SandboxID: "sb", Generation: "g", Priority: PriorityPause,
 		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)}
 	for i := 0; i < 5; i++ {
-		if err := j.Ack(task); err != nil {
+		if err := j.Ack(task, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -506,5 +506,54 @@ func TestJournalPruneSweepsHistoryAcrossAcks(t *testing.T) {
 	}
 	if remaining != 0 {
 		t.Fatalf("expired history not fully swept: %d entries remain", remaining)
+	}
+}
+
+// A crash between the ack transaction and the OnVerified callback must
+// not lose the completion signal: the outbox entry written inside the
+// ack is redelivered by the next process's startup flush.
+func TestVerifiedNotificationSurvivesCrashBeforeDelivery(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the first process: ack with notification owed, then crash
+	// before any delivery (no flush runs).
+	if err := j.Ack(task, true); err != nil {
+		t.Fatal(err)
+	}
+
+	var delivered []Task
+	u := &Uploader{Journal: j, OnVerified: func(t Task) { delivered = append(delivered, t) }}
+	u.flushNotifications()
+	if len(delivered) != 1 || delivered[0].SandboxID != "sb" || delivered[0].Generation != "gen" {
+		t.Fatalf("delivered = %+v, want the acked task once", delivered)
+	}
+	// Confirmed delivery is not repeated.
+	u.flushNotifications()
+	if len(delivered) != 1 {
+		t.Fatalf("redelivered after confirmation: %+v", delivered)
+	}
+}
+
+// An abandoned task acks without a notification: nothing was made
+// durable, so no completion signal may ever fire, before or after a
+// restart.
+func TestAbandonedAckLeavesNoNotification(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(task, false); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := j.PendingNotifications()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("outbox = %+v, want empty", pending)
 	}
 }
