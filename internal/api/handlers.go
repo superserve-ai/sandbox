@@ -741,7 +741,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			Trigger: "resume_revert",
 		}
 		applyManifest(&params, manifest)
-		if _, ferr := h.DB.FinalizePause(fctx, params); ferr != nil {
+		if _, ferr := h.finalizePause(fctx, params); ferr != nil {
 			// VM is safely paused; only bookkeeping failed. Best-effort status
 			// flip — the reconciler is the backstop.
 			log.Error().Err(ferr).Str("sandbox_id", sandboxID.String()).Msg("resume revert: FinalizePause failed, best-effort revert to paused")
@@ -2454,7 +2454,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 			Trigger: "pause",
 		}
 		applyManifest(&params, manifest)
-		if _, err := h.DB.FinalizePause(fctx, params); err != nil {
+		if _, err := h.finalizePause(fctx, params); err != nil {
 			// ErrNoRows means the sandbox was soft-deleted between BeginPause
 			// and FinalizePause (a rare race with DeleteSandbox). The VM is
 			// already stopped and its snapshot files are on disk — nothing to

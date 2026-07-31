@@ -32,6 +32,13 @@ locals {
     region      = local.region
   }
 
+  sandbox_host_labels = merge(local.common_labels, {
+    owner              = "platform"
+    project            = "sandbox"
+    dataclassification = "confidential"
+    application        = "sandbox-host"
+  })
+
   staging_otlp_endpoint = "http://10.0.0.2:4318"
 }
 
@@ -224,7 +231,7 @@ module "sandbox_host" {
   internal_ip = "10.0.0.2"
   tags        = ["superserve-vmd"]
 
-  labels = merge(local.common_labels, {
+  labels = merge(local.sandbox_host_labels, {
     component    = "vmd"
     sandbox_role = "vmd"
   })

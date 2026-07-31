@@ -32,6 +32,13 @@ locals {
     managed_by  = "terraform"
     region      = local.region
   }
+
+  sandbox_host_labels = merge(local.common_labels, {
+    owner              = "platform"
+    project            = "sandbox"
+    dataclassification = "confidential"
+    application        = "sandbox-host"
+  })
 }
 
 module "network" {
@@ -244,7 +251,7 @@ module "sandbox_host" {
   # this stays a no-op adoption: sandbox_status is still "provisioning" live;
   # flipping it to "ready" (to match the deployment-registry selector) is a
   # separate, intentional change, not part of this import PR.
-  labels = merge(local.common_labels, {
+  labels = merge(local.sandbox_host_labels, {
     component               = "vmd"
     sandbox_role            = "vmd"
     sandbox_status          = "provisioning"
