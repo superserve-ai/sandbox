@@ -75,7 +75,6 @@ var boxdInitClient = &http.Client{
 	Transport: &http.Transport{DisableKeepAlives: true},
 }
 
-
 // postBoxdInit sends sandbox-level configuration (env vars, hostname) to
 // boxd's /init endpoint.
 func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, hostname string) error {

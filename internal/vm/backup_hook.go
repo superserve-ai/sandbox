@@ -33,10 +33,11 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) {
 			hasDisk = true
 		}
 		files = append(files, backup.TaskFile{
-			Name:   e.FileName,
-			Path:   e.Path,
-			SHA256: e.SHA256,
-			Size:   e.SizeBytes,
+			Name:     e.FileName,
+			Path:     e.Path,
+			SHA256:   e.SHA256,
+			Size:     e.SizeBytes,
+			BasePath: e.BasePath,
 		})
 	}
 	if !hasDisk {

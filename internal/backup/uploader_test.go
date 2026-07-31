@@ -30,21 +30,25 @@ func newMemStore() *memStore {
 	return &memStore{objects: map[string][]byte{}, fail: map[string]error{}}
 }
 
-func (m *memStore) Create(_ context.Context, object string, r io.Reader) error {
+func (m *memStore) Create(_ context.Context, object string, r io.Reader) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err, ok := m.fail[object]; ok {
-		return err
+		return false, err
 	}
 	if _, exists := m.objects[object]; exists {
-		return nil // create-only dedupe, mirrors the 412-as-success path
+		// Dedupe consumes the stream anyway, mirroring the small-object
+		// case where the writer buffers everything before the 412: stream
+		// consumption must prove nothing about what is stored.
+		_, _ = io.Copy(io.Discard, r)
+		return false, nil
 	}
 	data, err := io.ReadAll(r)
 	if err != nil {
-		return err
+		return false, err
 	}
 	m.objects[object] = data
-	return nil
+	return true, nil
 }
 
 // packedName is the fingerprint-suffixed object name uploadFile derives.
@@ -83,7 +87,7 @@ func writeTask(t *testing.T, dir string) Task {
 		Priority:   PriorityPause,
 		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC),
 		Files: []TaskFile{
-			{Name: "overlay.ext4", Path: overlay, SHA256: digestOf([]byte("diskdata")), Size: 8},
+			{Name: "overlay.ext4", Path: overlay, SHA256: digestOf([]byte("diskdata")), Size: 8, BasePath: "/snapshots/templates/tpl/build/base.ext4"},
 			{Name: "vmstate.snap", Path: vmstate, SHA256: digestOf([]byte("state")), Size: 5},
 		},
 	}
@@ -122,6 +126,9 @@ func TestUploaderShipsGenerationAndAcks(t *testing.T) {
 	}
 	if gen.Files[0].Object != packedName(t, task.Files[0].Path, "overlay.ext4") {
 		t.Fatalf("manifest object binding = %q", gen.Files[0].Object)
+	}
+	if gen.Files[0].BasePath != "/snapshots/templates/tpl/build/base.ext4" {
+		t.Fatalf("overlay base dependency dropped from manifest: %+v", gen.Files[0])
 	}
 	if len(verified) != 1 || verified[0].Generation != "gen-abc" {
 		t.Fatalf("verified hook = %+v", verified)
@@ -282,23 +289,23 @@ type midStreamMutator struct {
 	fired  bool
 }
 
-func (m *midStreamMutator) Create(ctx context.Context, object string, r io.Reader) error {
+func (m *midStreamMutator) Create(ctx context.Context, object string, r io.Reader) (bool, error) {
 	if object != m.target || m.fired {
 		return m.memStore.Create(ctx, object, r)
 	}
 	m.fired = true
 	var buf bytes.Buffer
 	if _, err := io.CopyN(&buf, r, 4); err != nil {
-		return err
+		return false, err
 	}
 	m.hook()
 	if _, err := io.Copy(&buf, r); err != nil {
-		return err
+		return false, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.objects[object] = buf.Bytes()
-	return nil
+	return true, nil
 }
 
 func TestUploaderWithholdsManifestOnMidStreamMutation(t *testing.T) {

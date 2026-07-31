@@ -28,6 +28,9 @@ type TaskFile struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
 	Size   int64  `json:"size"`
+	// BasePath carries an overlay's base-image dependency through to the
+	// generation manifest; empty for standalone files.
+	BasePath string `json:"base_path,omitempty"`
 }
 
 // Task is one generation awaiting upload. Tasks are idempotent: the

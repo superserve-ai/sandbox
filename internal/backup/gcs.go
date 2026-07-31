@@ -14,11 +14,13 @@ import (
 // writes. The host identity holds objectCreator and nothing else, so there
 // is deliberately no read, list, or delete here.
 type BlobStore interface {
-	// Create writes an object if and only if it does not already exist.
-	// An already-existing object is success: object names are
-	// content-addressed, so an existing object IS the bytes we were about
-	// to write (a completed earlier attempt or an unchanged re-pause).
-	Create(ctx context.Context, object string, r io.Reader) error
+	// Create writes an object if and only if it does not already exist,
+	// reporting whether THIS call created it. created=false (the object
+	// already existed) is not an error, but callers must not infer
+	// anything about the existing bytes from it: with small objects the
+	// writer buffers the whole stream before the precondition failure
+	// arrives, so stream consumption says nothing about what is stored.
+	Create(ctx context.Context, object string, r io.Reader) (created bool, err error)
 }
 
 // GCSStore implements BlobStore against a bucket using ifGenerationMatch=0
@@ -33,7 +35,7 @@ func NewGCSStore(client *storage.Client, bucket string) *GCSStore {
 	return &GCSStore{bucket: client.Bucket(bucket)}
 }
 
-func (s *GCSStore) Create(ctx context.Context, object string, r io.Reader) error {
+func (s *GCSStore) Create(ctx context.Context, object string, r io.Reader) (bool, error) {
 	// The writer gets its own cancelable context: on a mid-copy failure the
 	// resumable session must be ABORTED, not closed. Close after a partial
 	// copy would finalize a truncated object, and create-only semantics
@@ -48,19 +50,19 @@ func (s *GCSStore) Create(ctx context.Context, object string, r io.Reader) error
 		if isPreconditionExists(err) {
 			cancel()
 			_ = w.Close()
-			return nil
+			return false, nil
 		}
 		cancel() // abort the session so Close cannot finalize partial data
 		_ = w.Close()
-		return fmt.Errorf("write %s: %w", object, err)
+		return false, fmt.Errorf("write %s: %w", object, err)
 	}
 	if err := w.Close(); err != nil {
 		if isPreconditionExists(err) {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("finalize %s: %w", object, err)
+		return false, fmt.Errorf("finalize %s: %w", object, err)
 	}
-	return nil
+	return true, nil
 }
 
 func isPreconditionExists(err error) bool {

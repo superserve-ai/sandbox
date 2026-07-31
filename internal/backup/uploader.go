@@ -34,10 +34,14 @@ type GenerationManifest struct {
 // fingerprint: the extent table in this entry describes that object and
 // no other, even across retries that repacked a physically changed file.
 type ManifestFile struct {
-	Name       string   `json:"name"`
-	Object     string   `json:"object"`
-	SHA256     string   `json:"sha256"` // digest of the full apparent content
-	Size       int64    `json:"size"`   // apparent size
+	Name   string `json:"name"`
+	Object string `json:"object"`
+	SHA256 string `json:"sha256"` // digest of the full apparent content
+	Size   int64  `json:"size"`   // apparent size
+	// BasePath records an overlay's base-image dependency: the overlay's
+	// holes are backed by this file's contents, so a restore of the
+	// overlay alone is incomplete without it (the consistency-pair rule).
+	BasePath   string   `json:"base_path,omitempty"`
 	PackedSize int64    `json:"packed_size"`
 	Extents    []Extent `json:"extents"`
 }
@@ -153,7 +157,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 	if err != nil {
 		return false, err
 	}
-	if err := u.Store.Create(ctx, manifestObject, &limitedReader{r: bytes.NewReader(payload), limiter: u.Limiter, ctx: ctx}); err != nil {
+	if _, err := u.Store.Create(ctx, manifestObject, &limitedReader{r: bytes.NewReader(payload), limiter: u.Limiter, ctx: ctx}); err != nil {
 		return false, fmt.Errorf("manifest object: %w", err)
 	}
 	return true, nil
@@ -211,12 +215,19 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 	// never restored from; the orphaned artifact object is inert.
 	hasher := newApparentStreamHasher(NewPackedReader(f, extents), extents, apparent)
 	reader := &limitedReader{r: hasher, limiter: u.Limiter, ctx: ctx}
-	if err := u.Store.Create(ctx, object, reader); err != nil {
+	created, err := u.Store.Create(ctx, object, reader)
+	if err != nil {
 		return ManifestFile{}, err
 	}
-	if shipped, complete := hasher.finish(); complete {
-		if shipped != file.SHA256 {
+	if created {
+		// The store wrote exactly the bytes that flowed through the
+		// hasher; anything short of full consumption with a matching
+		// digest means the stored object is not what the manifest would
+		// claim.
+		shipped, complete := hasher.finish()
+		if !complete || shipped != file.SHA256 {
 			u.Log.Warn().Str("path", file.Path).Str("want", file.SHA256).Str("got", shipped).
+				Bool("fully_streamed", complete).
 				Msg("backup source changed during upload; abandoning generation")
 			return ManifestFile{}, errSourceChanged
 		}
@@ -234,13 +245,15 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 			return ManifestFile{}, fmt.Errorf("record verification of %s: %w", object, err)
 		}
 	} else if !task.HasVerified(object) {
-		// The store deduped an object this task never verified. It may be
-		// a completed earlier upload (an unchanged re-pause after the
-		// original task acked) or the residue of a crash between finalize
-		// and verification. The durable verification history is the
-		// discriminator; without it, abandon rather than publish a
-		// manifest over bytes nothing can vouch for (this identity cannot
-		// read them back).
+		// The object already existed (dedupe). Stream consumption proves
+		// nothing here: small objects buffer fully before the
+		// precondition failure arrives. The object may be a completed
+		// earlier upload (unchanged re-pause after the original task
+		// acked) or the residue of a crash between finalize and
+		// verification; the durable verification history is the only
+		// discriminator, and without it the generation is abandoned
+		// rather than completed over bytes nothing can vouch for (this
+		// identity cannot read them back).
 		wasVerified, err := u.Journal.WasVerified(object, time.Now())
 		if err != nil {
 			return ManifestFile{}, err
@@ -255,6 +268,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		Name:       file.Name,
 		Object:     objectName,
 		SHA256:     file.SHA256,
+		BasePath:   file.BasePath,
 		Size:       apparent,
 		PackedSize: PackedSize(extents),
 		Extents:    extents,
