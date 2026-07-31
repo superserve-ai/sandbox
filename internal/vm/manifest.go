@@ -242,43 +242,65 @@ func baseIdentity(path string) (string, error) {
 
 // collectBuildManifest hashes every artifact file in a completed build's
 // snapshot directory except build.meta.json, which the caller rewrites with
-// these digests afterwards and hashes separately. Detached from the
-// caller's cancellation like collectPauseManifest: a build that already
-// produced valid artifacts should get its integrity record even if the
-// caller gives up during finalize. A file that misses the budget or fails
-// to hash is skipped with a warning; the caller decides whether what
-// remains is worth enqueueing.
-func collectBuildManifest(ctx context.Context, snapshotDir string, log zerolog.Logger) []ManifestEntry {
+// these digests afterwards and hashes separately, plus any extraPaths that
+// live outside the directory (the overlay base image sits in the run dir
+// but is required to restore the template). Detached from the caller's
+// cancellation like collectPauseManifest: a build that already produced
+// valid artifacts should get its integrity record even if the caller gives
+// up during finalize.
+//
+// complete reports whether EVERY artifact hashed. A file that misses the
+// budget or fails to hash is skipped with a warning and flips complete to
+// false; callers building a durable generation must not publish a partial
+// set (the manifest object's presence means restorable), so they treat
+// !complete as "do not enqueue".
+func collectBuildManifest(ctx context.Context, snapshotDir string, extraPaths []string, log zerolog.Logger) (entries []ManifestEntry, complete bool) {
 	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), buildHashBudget)
 	defer cancel()
 
 	dirEntries, err := os.ReadDir(snapshotDir)
 	if err != nil {
 		log.Warn().Err(err).Str("dir", snapshotDir).Msg("build manifest: read artifact dir failed")
-		return nil
+		return nil, false
 	}
 	start := time.Now()
-	entries := make([]ManifestEntry, 0, len(dirEntries))
-	for _, de := range dirEntries {
-		if !de.Type().IsRegular() || de.Name() == buildMetaFilename {
-			continue
+	complete = true
+	entries = make([]ManifestEntry, 0, len(dirEntries)+len(extraPaths))
+	seen := make(map[string]bool, len(dirEntries)+len(extraPaths))
+	add := func(name, path string) {
+		if seen[name] {
+			return
 		}
-		path := filepath.Join(snapshotDir, de.Name())
+		seen[name] = true
 		sum, size, err := hashFile(hctx, path)
 		if err != nil {
-			log.Warn().Err(err).Str("path", path).Msg("build manifest: hash failed, entry skipped")
-			continue
+			log.Warn().Err(err).Str("path", path).Msg("build manifest: hash failed")
+			complete = false
+			return
 		}
 		entries = append(entries, ManifestEntry{
-			FileName:  de.Name(),
+			FileName:  name,
 			Path:      path,
 			SizeBytes: size,
 			SHA256:    sum,
 		})
 	}
+	for _, de := range dirEntries {
+		if !de.Type().IsRegular() || de.Name() == buildMetaFilename {
+			continue
+		}
+		add(de.Name(), filepath.Join(snapshotDir, de.Name()))
+	}
+	for _, p := range extraPaths {
+		if p == "" {
+			continue
+		}
+		add(filepath.Base(p), p)
+	}
 	log.Info().
 		Int("files", len(entries)).
+		Bool("complete", complete).
 		Int64("manifest_hash_ms", time.Since(start).Milliseconds()).
 		Msg("build manifest computed")
-	return entries
+	return entries, complete
 }

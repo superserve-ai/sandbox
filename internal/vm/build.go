@@ -198,21 +198,33 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	// recorded above), stamp the digests into build.meta.json, and enqueue
 	// the build for backup. Best-effort by design: the artifacts on disk
 	// are valid regardless, so nothing in here fails the build.
-	m.backupBuildArtifacts(ctx, req.TemplateID, buildVMID, snapshotDir, log)
+	m.backupBuildArtifacts(ctx, req.TemplateID, buildVMID, snapshotDir, result.BasePath, log)
 
 	log.Info().Dur("total", time.Since(buildStart)).Msg("template build complete")
 	return result, nil
 }
 
-// backupBuildArtifacts makes a finished build's artifact directory durable:
-// hash the artifact set, record the digests into build.meta.json so the
-// on-host artifacts carry their integrity data the way pause artifacts do,
-// then enqueue the set (build.meta.json included) into the backup journal.
-func (m *Manager) backupBuildArtifacts(ctx context.Context, templateID, buildVMID, snapshotDir string, log zerolog.Logger) {
-	entries := collectBuildManifest(ctx, snapshotDir, log)
+// backupBuildArtifacts makes a finished build's artifact set durable: hash
+// the snapshot directory plus the base image build.meta.json references
+// (it lives in the run dir but the template is not restorable without it),
+// record the digests into build.meta.json so the on-host artifacts carry
+// their integrity data the way pause artifacts do, then enqueue the set
+// (build.meta.json included) into the backup journal.
+//
+// Fails closed on completeness: the manifest object's presence in the
+// bucket means "restorable", so a set missing even one artifact is never
+// enqueued. The build itself still succeeds; the gap is surfaced by the
+// warn log and coverage monitoring, never papered over.
+func (m *Manager) backupBuildArtifacts(ctx context.Context, templateID, buildVMID, snapshotDir, basePath string, log zerolog.Logger) {
+	entries, complete := collectBuildManifest(ctx, snapshotDir, []string{basePath}, log)
 	if len(entries) == 0 {
 		log.Warn().Str("dir", snapshotDir).
 			Msg("build manifest hashed no artifacts; build not enqueued for backup")
+		return
+	}
+	if !complete {
+		log.Warn().Str("dir", snapshotDir).
+			Msg("build artifact set hashed incompletely; build not enqueued for backup")
 		return
 	}
 	if err := writeBuildDigests(snapshotDir, entries); err != nil {
@@ -224,16 +236,17 @@ func (m *Manager) backupBuildArtifacts(ctx context.Context, templateID, buildVMI
 	metaPath := filepath.Join(snapshotDir, buildMetaFilename)
 	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 	defer cancel()
-	if sum, size, err := hashFile(hctx, metaPath); err != nil {
-		log.Warn().Err(err).Msg("hashing build.meta.json failed; backed-up set omits it")
-	} else {
-		entries = append(entries, ManifestEntry{
-			FileName:  buildMetaFilename,
-			Path:      metaPath,
-			SizeBytes: size,
-			SHA256:    sum,
-		})
+	sum, size, err := hashFile(hctx, metaPath)
+	if err != nil {
+		log.Warn().Err(err).Msg("hashing build.meta.json failed; build not enqueued for backup")
+		return
 	}
+	entries = append(entries, ManifestEntry{
+		FileName:  buildMetaFilename,
+		Path:      metaPath,
+		SizeBytes: size,
+		SHA256:    sum,
+	})
 	m.enqueueTemplateBackup(templateID, buildVMID, entries)
 }
 
