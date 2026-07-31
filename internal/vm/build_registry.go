@@ -204,7 +204,14 @@ func (m *Manager) GetBuildStatus(buildVMID string) (BuildStatusSnapshot, bool) {
 	}
 	m.buildsMu.RUnlock()
 	// Not in memory — consult durable artifacts on disk (no lock held).
-	return loadDurableBuild(m.cfg.SnapshotDir, buildVMID)
+	snap, ok := loadDurableBuild(m.cfg.SnapshotDir, buildVMID)
+	if ok {
+		// An adopted build finished under a previous vmd process, which may
+		// have exited before enqueueing it for backup; make sure the
+		// journal knows about it (idempotent, async).
+		m.reconcileAdoptedBuildBackup(snap)
+	}
+	return snap, ok
 }
 
 // loadDurableBuild adopts a completed build from its on-disk artifacts. To

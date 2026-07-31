@@ -3,10 +3,14 @@ package vm
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -112,5 +116,166 @@ func TestBackupBuildArtifactsRefusesMissingDeclaredArtifact(t *testing.T) {
 
 	if len(tasks) != 0 {
 		t.Fatalf("enqueued %d tasks despite a missing declared artifact, want 0", len(tasks))
+	}
+}
+
+// writeAdoptableBuildFixture lays a completed build out under the templates
+// tree the way loadDurableBuild expects: snapshotRoot/templates/<tpl>/<build>/
+// with the artifacts and a build.meta.json whose declared paths are absolute
+// (adoption stats them). Returns the build dir.
+func writeAdoptableBuildFixture(t *testing.T, root, templateID, buildVMID string) string {
+	t.Helper()
+	dir := filepath.Join(root, TemplatesDirName, templateID, buildVMID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mem.snap"), []byte("memory image"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "vmstate.snap"), []byte("vm state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta := fmt.Sprintf(`{"snapshot_path":%q,"mem_path":%q,"size_bytes":12}`,
+		filepath.Join(dir, "vmstate.snap"), filepath.Join(dir, "mem.snap"))
+	if err := os.WriteFile(filepath.Join(dir, buildMetaFilename), []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// waitForTask receives one enqueued task or fails the test.
+func waitForTask(t *testing.T, tasks <-chan backup.Task) backup.Task {
+	t.Helper()
+	select {
+	case task := <-tasks:
+		return task
+	case <-time.After(10 * time.Second):
+		t.Fatal("no backup task enqueued for adopted build")
+		return backup.Task{}
+	}
+}
+
+// A vmd exit after template-builder wrote build.meta.json but before the
+// backup enqueue leaves a durable build with no journal record and no
+// stamped digests. Adopting it via GetBuildStatus must rerun the full
+// hashing pipeline and enqueue the set.
+func TestAdoptedBuildWithoutStampedDigestsRerunsBackup(t *testing.T) {
+	root := t.TempDir()
+	dir := writeAdoptableBuildFixture(t, root, "tpl", "build-tpl")
+
+	tasks := make(chan backup.Task, 2)
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
+	m.SetBackupEnqueue(func(task backup.Task) { tasks <- task })
+
+	snap, ok := m.GetBuildStatus("build-tpl")
+	if !ok || snap.Status != BuildStatusReady {
+		t.Fatalf("adoption = %+v ok=%v, want ready", snap, ok)
+	}
+	task := waitForTask(t, tasks)
+	if task.TemplateID != "tpl" || task.BuildID != "build-tpl" {
+		t.Fatalf("task owner = %q/%q, want tpl/build-tpl", task.TemplateID, task.BuildID)
+	}
+	want := sha256.Sum256([]byte("memory image"))
+	var got string
+	for _, f := range task.Files {
+		if f.Name == "mem.snap" {
+			got = f.SHA256
+		}
+	}
+	if got != hex.EncodeToString(want[:]) {
+		t.Fatalf("mem.snap digest = %s, want freshly hashed %s", got, hex.EncodeToString(want[:]))
+	}
+	// The rerun also stamps the digests, so the next restart takes the
+	// cheap recorded-digest path.
+	stamped, err := readStampedBuildDigests(dir)
+	if err != nil || len(stamped) == 0 {
+		t.Fatalf("stamped digests after rerun = %v err=%v", stamped, err)
+	}
+}
+
+// A build whose digests were already stamped must be re-enqueued from the
+// record, not re-hashed: multi-GiB artifacts cannot be re-read on every
+// restart. Observable: mutate an artifact after stamping; the enqueued
+// digest still matches the stamp, proving no re-hash happened (the uploader
+// verifies bytes against the digest later and fails closed on divergence).
+func TestAdoptedBuildWithStampedDigestsEnqueuesWithoutRehash(t *testing.T) {
+	root := t.TempDir()
+	dir := writeAdoptableBuildFixture(t, root, "tpl", "build-tpl")
+
+	// Stamp via the normal completion pipeline.
+	stamper := &Manager{}
+	stamper.SetBackupEnqueue(func(backup.Task) {})
+	stamper.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", zerolog.Nop())
+	stamped, err := readStampedBuildDigests(dir)
+	if err != nil || len(stamped) == 0 {
+		t.Fatalf("fixture not stamped: %v err=%v", stamped, err)
+	}
+	var recorded string
+	for _, d := range stamped {
+		if d.Name == "mem.snap" {
+			recorded = d.SHA256
+		}
+	}
+	if recorded == "" {
+		t.Fatal("mem.snap missing from stamped digests")
+	}
+
+	// Diverge the bytes on disk; a re-hash would notice, the record won't.
+	if err := os.WriteFile(filepath.Join(dir, "mem.snap"), []byte("mutated bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := make(chan backup.Task, 2)
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
+	m.SetBackupEnqueue(func(task backup.Task) { tasks <- task })
+	if snap, ok := m.GetBuildStatus("build-tpl"); !ok || snap.Status != BuildStatusReady {
+		t.Fatalf("adoption = %+v ok=%v, want ready", snap, ok)
+	}
+	task := waitForTask(t, tasks)
+	var got string
+	for _, f := range task.Files {
+		if f.Name == "mem.snap" {
+			got = f.SHA256
+		}
+	}
+	if got != recorded {
+		t.Fatalf("mem.snap digest = %s, want recorded %s (artifact was re-hashed)", got, recorded)
+	}
+
+	// Repeat polls must not spawn another reconcile: the per-process guard
+	// is taken synchronously, so nothing new can ever land on the channel.
+	if _, ok := m.GetBuildStatus("build-tpl"); !ok {
+		t.Fatal("second adoption lookup failed")
+	}
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case extra := <-tasks:
+		t.Fatalf("second status poll enqueued another task: %+v", extra)
+	default:
+	}
+}
+
+// Backup disabled: adoption still reports the build ready but touches
+// nothing, mirroring the completion path's nil-hook gate.
+func TestAdoptedBuildWithoutHookDoesNothing(t *testing.T) {
+	root := t.TempDir()
+	dir := writeAdoptableBuildFixture(t, root, "tpl", "build-tpl")
+	meta, err := os.ReadFile(filepath.Join(dir, buildMetaFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
+	snap, ok := m.GetBuildStatus("build-tpl")
+	if !ok || snap.Status != BuildStatusReady {
+		t.Fatalf("adoption = %+v ok=%v, want ready", snap, ok)
+	}
+	time.Sleep(50 * time.Millisecond)
+	got, err := os.ReadFile(filepath.Join(dir, buildMetaFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, meta) {
+		t.Fatalf("build.meta.json rewritten with backup disabled:\n%s", got)
 	}
 }

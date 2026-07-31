@@ -264,6 +264,12 @@ type Manager struct {
 	pendingSweepInterval time.Duration
 	// rehashSlots bounds concurrent recovery/sweep rehash workers.
 	rehashSlots chan struct{}
+	// adoptedBuildBackups guards backup reconciliation of completed builds
+	// adopted from disk after a restart: one reconcile launch per build per
+	// process. Cross-process dedupe is the journal's job (owner +
+	// generation index); this map only keeps repeated status polls from
+	// spawning concurrent hash runs. See reconcileAdoptedBuildBackup.
+	adoptedBuildBackups sync.Map
 
 	// launcherReady gates the launcher launch path: false → launches use the
 	// legacy path. Set when the namespace is built/validated; kept in sync by

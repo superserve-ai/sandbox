@@ -260,9 +260,14 @@ func (m *Manager) backupBuildArtifacts(ctx context.Context, templateID, buildVMI
 	if err := writeBuildDigests(snapshotDir, entries); err != nil {
 		log.Warn().Err(err).Msg("recording artifact digests into build.meta.json failed")
 	}
-	// Hash build.meta.json last so the backed-up copy is the one carrying
-	// the digests it was just given; its own digest travels in the task
-	// (and the generation manifest), never inside itself.
+	m.finishBuildBackupEnqueue(ctx, templateID, buildVMID, snapshotDir, entries, log)
+}
+
+// finishBuildBackupEnqueue hashes build.meta.json last so the backed-up
+// copy is the one carrying the digests it was given by writeBuildDigests;
+// its own digest travels in the task (and the generation manifest), never
+// inside itself. Then the whole set goes to the journal.
+func (m *Manager) finishBuildBackupEnqueue(ctx context.Context, templateID, buildVMID, snapshotDir string, entries []ManifestEntry, log zerolog.Logger) {
 	metaPath := filepath.Join(snapshotDir, buildMetaFilename)
 	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 	defer cancel()
@@ -278,6 +283,87 @@ func (m *Manager) backupBuildArtifacts(ctx context.Context, templateID, buildVMI
 		SHA256:    sum,
 	})
 	m.enqueueTemplateBackup(templateID, buildVMID, entries)
+}
+
+// readStampedBuildDigests returns the artifact digests writeBuildDigests
+// previously stamped into build.meta.json; nil when the build never got
+// that far (crash before or during hashing).
+func readStampedBuildDigests(snapshotDir string) ([]buildArtifactDigest, error) {
+	data, err := os.ReadFile(filepath.Join(snapshotDir, buildMetaFilename))
+	if err != nil {
+		return nil, err
+	}
+	var meta struct {
+		Artifacts []buildArtifactDigest `json:"artifacts"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
+	return meta.Artifacts, nil
+}
+
+// reconcileAdoptedBuildBackup re-enters an adopted completed build into the
+// backup pipeline. A vmd exit between template-builder writing
+// build.meta.json and the enqueue (a window as long as the hash budget)
+// leaves a durable, adoptable build with no journal record; without this,
+// such a template would stay unbacked until rebuilt. Runs once per build
+// per process, asynchronously, so adoption (a status read path) is never
+// serialized behind hash budgets.
+//
+// Two cases, keyed on whether writeBuildDigests already stamped the meta:
+//
+//   - no stamped digests: the crash predates hashing, so run the full
+//     pipeline (hash, stamp, enqueue) exactly as build completion would.
+//   - stamped digests: rebuild the task from the recorded digests instead
+//     of re-hashing multi-GiB artifacts on every restart. The journal
+//     dedupes by owner + generation so repeat adoptions are no-ops, and
+//     the uploader re-verifies streamed bytes against these digests, so a
+//     divergence between record and disk fails closed there.
+func (m *Manager) reconcileAdoptedBuildBackup(snap BuildStatusSnapshot) {
+	if m.backupEnqueue == nil || snap.Status != BuildStatusReady || snap.Result == nil {
+		return
+	}
+	if _, already := m.adoptedBuildBackups.LoadOrStore(snap.BuildVMID, struct{}{}); already {
+		return
+	}
+	templateID, buildVMID, res := snap.TemplateID, snap.BuildVMID, snap.Result
+	dir := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, templateID, buildVMID)
+	log := m.log.With().Str("template_id", templateID).Str("build_vm_id", buildVMID).Logger()
+	go func() {
+		stamped, err := readStampedBuildDigests(dir)
+		if err != nil || len(stamped) == 0 {
+			log.Info().Err(err).
+				Msg("adopted build has no stamped digests; running backup hashing")
+			m.backupBuildArtifacts(context.Background(), templateID, buildVMID, dir, res.BasePath, log)
+			return
+		}
+		entries := make([]ManifestEntry, 0, len(stamped)+1)
+		for _, d := range stamped {
+			path := filepath.Join(dir, d.Name)
+			if _, statErr := os.Stat(path); statErr != nil {
+				// The base image lives in the run dir, not the snapshot
+				// dir; anything else unresolvable means the stamp no
+				// longer matches the disk, so re-hash from scratch.
+				if res.BasePath != "" && d.Name == filepath.Base(res.BasePath) {
+					path = res.BasePath
+				} else {
+					log.Warn().Str("artifact", d.Name).
+						Msg("stamped artifact not on disk; running backup hashing")
+					m.backupBuildArtifacts(context.Background(), templateID, buildVMID, dir, res.BasePath, log)
+					return
+				}
+			}
+			entries = append(entries, ManifestEntry{
+				FileName:  d.Name,
+				Path:      path,
+				SizeBytes: d.SizeBytes,
+				SHA256:    d.SHA256,
+			})
+		}
+		log.Info().Int("files", len(entries)).
+			Msg("adopted build re-enqueued for backup from stamped digests")
+		m.finishBuildBackupEnqueue(context.Background(), templateID, buildVMID, dir, entries, log)
+	}()
 }
 
 // buildLogPipe parses NDJSON lines from template-builder's stdout and
