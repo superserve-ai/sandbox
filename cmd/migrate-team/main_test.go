@@ -272,8 +272,8 @@ func seedFixture(t *testing.T) *fixture {
 		        repeat('ab', 32))`, f.snap1, f.sb1)
 	mustExec(t, srcPool, `
 		INSERT INTO artifact_manifest (template_id, file_name, path, size_bytes, sha256)
-		VALUES ($1, 'base.ext4', '/srv/templates/'||$1::text||'/base.ext4', 8192,
-		        repeat('cd', 32))`, f.tpl)
+		VALUES ($1, 'base.ext4', '/srv/templates/'||$2::text||'/base.ext4', 8192,
+		        repeat('cd', 32))`, f.tpl, f.tpl)
 	// Destroyed sandbox: copied for history, excluded from artifact dirs.
 	mustExec(t, srcPool, `
 		INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id,
