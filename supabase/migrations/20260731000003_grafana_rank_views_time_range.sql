@@ -8,41 +8,14 @@ DROP VIEW IF EXISTS analytics.weekly_team_spend;
 DROP VIEW IF EXISTS analytics.weekly_team_sandbox_count;
 
 -- One row per team per billing hour. Plan/rate resolution mirrors
--- db/queries/billing.sql (GetTeamActivePricingPlan + ranked_rates), same
--- reasoning as before: a team's usage prices against its own plan, and
--- rate selection is deterministic even with multiple effective_to IS NULL
--- rows for a resource.
+-- db/queries/billing.sql (GetTeamActivePricingPlan + ranked_rates), except
+-- effective_at is each row's own u.hour_start rather than now(): this view
+-- is queried over arbitrary historical ranges, so pricing must reflect what
+-- was actually in effect during that hour. Resolving against now() instead
+-- would retroactively reprice all history on every plan/rate change and
+-- misprice any range spanning a transition entirely at today's rates
+-- (caught in review on #304). LATERAL correlates the resolution per row.
 CREATE OR REPLACE VIEW analytics.team_hourly_spend AS
-WITH team_plan AS (
-    SELECT t.id AS team_id,
-           COALESCE((
-               SELECT tpp.plan_key
-               FROM team_pricing_plan tpp
-               JOIN pricing_plan p ON p.key = tpp.plan_key
-               WHERE tpp.team_id = t.id
-                 AND p.active
-                 AND tpp.effective_from <= now()
-                 AND (tpp.effective_to IS NULL OR tpp.effective_to > now())
-               ORDER BY tpp.effective_from DESC
-               LIMIT 1
-           ), 'payg') AS plan_key
-    FROM team t
-),
-ranked_rates AS (
-    SELECT r.plan_key, r.resource, r.price_usd,
-           row_number() OVER (
-               PARTITION BY r.plan_key, r.resource, r.unit
-               ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
-           ) AS rate_rank
-    FROM pricing_rate r
-    JOIN pricing_plan p ON p.key = r.plan_key
-    WHERE p.active
-      AND r.effective_from <= now()
-      AND (r.effective_to IS NULL OR r.effective_to > now())
-),
-current_rates AS (
-    SELECT plan_key, resource, price_usd FROM ranked_rates WHERE rate_rank = 1
-)
 SELECT t.name AS team_name,
        u.hour_start,
        (u.vcpu_seconds * vcpu_rate.price_usd
@@ -51,10 +24,46 @@ SELECT t.name AS team_name,
        )::numeric(14,6) AS spend_usd
 FROM team_billing_usage_hourly u
 JOIN team t ON t.id = u.team_id
-JOIN team_plan tp ON tp.team_id = u.team_id
-LEFT JOIN current_rates vcpu_rate ON vcpu_rate.plan_key = tp.plan_key AND vcpu_rate.resource = 'vcpu'
-LEFT JOIN current_rates mem_rate ON mem_rate.plan_key = tp.plan_key AND mem_rate.resource = 'memory_gib'
-LEFT JOIN current_rates storage_rate ON storage_rate.plan_key = tp.plan_key AND storage_rate.resource = 'storage_gib';
+CROSS JOIN LATERAL (
+    SELECT COALESCE((
+        SELECT tpp.plan_key
+        FROM team_pricing_plan tpp
+        JOIN pricing_plan p ON p.key = tpp.plan_key
+        WHERE tpp.team_id = u.team_id
+          AND p.active
+          AND tpp.effective_from <= u.hour_start
+          AND (tpp.effective_to IS NULL OR tpp.effective_to > u.hour_start)
+        ORDER BY tpp.effective_from DESC
+        LIMIT 1
+    ), 'payg') AS plan_key
+) tp
+LEFT JOIN LATERAL (
+    SELECT price_usd FROM pricing_rate r
+    JOIN pricing_plan p ON p.key = r.plan_key
+    WHERE r.plan_key = tp.plan_key AND r.resource = 'vcpu' AND p.active
+      AND r.effective_from <= u.hour_start
+      AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
+    ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
+    LIMIT 1
+) vcpu_rate ON true
+LEFT JOIN LATERAL (
+    SELECT price_usd FROM pricing_rate r
+    JOIN pricing_plan p ON p.key = r.plan_key
+    WHERE r.plan_key = tp.plan_key AND r.resource = 'memory_gib' AND p.active
+      AND r.effective_from <= u.hour_start
+      AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
+    ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
+    LIMIT 1
+) mem_rate ON true
+LEFT JOIN LATERAL (
+    SELECT price_usd FROM pricing_rate r
+    JOIN pricing_plan p ON p.key = r.plan_key
+    WHERE r.plan_key = tp.plan_key AND r.resource = 'storage_gib' AND p.active
+      AND r.effective_from <= u.hour_start
+      AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
+    ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC
+    LIMIT 1
+) storage_rate ON true;
 
 -- One row per sandbox creation event.
 CREATE OR REPLACE VIEW analytics.team_sandbox_events AS
