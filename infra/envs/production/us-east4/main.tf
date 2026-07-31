@@ -252,10 +252,12 @@ module "sandbox_host" {
   # flipping it to "ready" (to match the deployment-registry selector) is a
   # separate, intentional change, not part of this import PR.
   labels = merge(local.sandbox_host_labels, {
-    component               = "vmd"
-    sandbox_role            = "vmd"
-    sandbox_status          = "provisioning"
-    "goog-ops-agent-policy" = "v2-template-1-7-0"
+    component                  = "vmd"
+    sandbox_role               = "vmd"
+    sandbox_status             = "provisioning"
+    "goog-ops-agent-policy"    = "v2-template-1-7-0"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
 
   service_account_email = data.google_service_account.api_runner.email
@@ -333,6 +335,8 @@ module "backup_storage" {
   ]
 
   labels = merge(local.common_labels, {
-    component = "backup"
+    component                  = "backup"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_snapshots_and_files"
   })
 }
