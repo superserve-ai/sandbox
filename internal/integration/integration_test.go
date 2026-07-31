@@ -5231,3 +5231,127 @@ func TestIntegration_FinalizePause_StaleFinalizeCannotOverwriteManifest(t *testi
 		t.Fatalf("after stale write: manifest = %v, want B's untouched", got)
 	}
 }
+
+// The generations expand ships with the legacy unique index retained:
+// finalizes upsert in place (generation advancing) until the contract phase
+// drops the index, at which point the same binary starts inserting real
+// history rows. Exercise both modes and the flip on real Postgres.
+func TestIntegration_FinalizePause_GenerationModes(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"generation-modes"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	finalize := func(trigger string) uuid.UUID {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+			t.Fatalf("force pausing: %v", err)
+		}
+		mem := "/snapshots/" + sid + "/mem.snap"
+		snapID, err := routedFinalize(ctx, t, db.FinalizePauseParams{
+			ID:      sandboxID,
+			TeamID:  teamID,
+			Path:    "/snapshots/" + sid + "/vmstate.snap",
+			MemPath: &mem,
+			Trigger: trigger,
+		})
+		if err != nil {
+			t.Fatalf("finalize (%s): %v", trigger, err)
+		}
+		return snapID
+	}
+	genOf := func(snapID uuid.UUID) (rows int, maxGen int64) {
+		t.Helper()
+		if err := testPool.QueryRow(ctx,
+			`SELECT count(*), max(generation) FROM snapshot WHERE sandbox_id = $1`, sandboxID).
+			Scan(&rows, &maxGen); err != nil {
+			t.Fatal(err)
+		}
+		_ = snapID
+		return rows, maxGen
+	}
+
+	// Legacy mode: one row, generation advancing in place.
+	finalize("pause")
+	finalize("pause")
+	rows, gen := genOf(uuid.Nil)
+	if rows != 1 || gen != 2 {
+		t.Fatalf("legacy mode: rows=%d gen=%d, want 1 row at generation 2", rows, gen)
+	}
+
+	// Contract phase: drop the legacy index (this test DB only). The same
+	// finalize path must start inserting history rows.
+	if _, err := testPool.Exec(ctx, `DROP INDEX IF EXISTS snapshot_sandbox_unique`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(),
+			`CREATE UNIQUE INDEX IF NOT EXISTS snapshot_sandbox_unique ON snapshot (sandbox_id)`)
+	})
+	// History requires removing the pre-existing row conflict source: the
+	// index recreate in cleanup needs one row per sandbox, so this test
+	// deletes its history rows before cleanup runs.
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(),
+			`DELETE FROM snapshot WHERE sandbox_id = $1 AND id NOT IN (
+			   SELECT snapshot_id FROM sandbox WHERE id = $1 AND snapshot_id IS NOT NULL)`, sandboxID)
+	})
+
+	head3 := finalize("pause")
+	head4 := finalize("timeout")
+	rows, gen = genOf(uuid.Nil)
+	if rows != 3 || gen != 4 {
+		t.Fatalf("generations mode: rows=%d maxGen=%d, want 3 rows up to generation 4", rows, gen)
+	}
+	if head3 == head4 {
+		t.Fatal("generations mode reused a snapshot row")
+	}
+	// The head moved to the newest generation and resume still finds it.
+	var headID uuid.UUID
+	if err := testPool.QueryRow(ctx, `SELECT snapshot_id FROM sandbox WHERE id = $1`, sandboxID).Scan(&headID); err != nil {
+		t.Fatal(err)
+	}
+	if headID != head4 {
+		t.Fatalf("head = %s, want newest generation %s", headID, head4)
+	}
+	// A stale finalize is still rejected whole in generations mode.
+	mem := "/snapshots/" + sid + "/mem.snap"
+	if _, err := routedFinalize(ctx, t, db.FinalizePauseParams{
+		ID: sandboxID, TeamID: teamID, Path: "p", MemPath: &mem, Trigger: "pause",
+	}); err == nil {
+		t.Fatal("stale finalize succeeded in generations mode")
+	}
+}
+
+// routedFinalize mirrors the control plane's mode routing: legacy upsert
+// while snapshot_sandbox_unique exists, generation inserts after the
+// contract phase drops it.
+func routedFinalize(ctx context.Context, t *testing.T, params db.FinalizePauseParams) (uuid.UUID, error) {
+	t.Helper()
+	legacy, err := testQueries.HasLegacySnapshotUnique(ctx)
+	if err != nil {
+		t.Fatalf("probe legacy index: %v", err)
+	}
+	if legacy {
+		return testQueries.FinalizePause(ctx, params)
+	}
+	return testQueries.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
+		ID:                params.ID,
+		TeamID:            params.TeamID,
+		Path:              params.Path,
+		MemPath:           params.MemPath,
+		SizeBytes:         params.SizeBytes,
+		Trigger:           params.Trigger,
+		ManifestFileNames: params.ManifestFileNames,
+		ManifestPaths:     params.ManifestPaths,
+		ManifestSizes:     params.ManifestSizes,
+		ManifestDigests:   params.ManifestDigests,
+		ManifestBasePaths: params.ManifestBasePaths,
+	})
+}

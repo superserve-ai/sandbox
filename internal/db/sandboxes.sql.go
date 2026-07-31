@@ -1128,6 +1128,10 @@ upserted AS (
   DO UPDATE SET
     path = EXCLUDED.path,
     mem_path = EXCLUDED.mem_path,
+    -- Compatibility mode while snapshot_sandbox_unique exists: history is
+    -- still one row, but the generation counter advances so consumers see
+    -- monotonic generations before and after the contract-phase index drop.
+    generation = snapshot.generation + 1,
     -- A finalize that has no complete manifest passes 0 (hash budget
     -- exhausted or a file failed to hash); keep the recorded size instead
     -- of clobbering it back to zero.
@@ -1207,6 +1211,83 @@ type FinalizePauseParams struct {
 // skipped or partial leaves exactly its partial set, never stale rows.
 func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, finalizePause,
+		arg.ID,
+		arg.TeamID,
+		arg.Path,
+		arg.MemPath,
+		arg.SizeBytes,
+		arg.Trigger,
+		arg.ManifestFileNames,
+		arg.ManifestPaths,
+		arg.ManifestSizes,
+		arg.ManifestDigests,
+		arg.ManifestBasePaths,
+	)
+	var snapshot_id uuid.UUID
+	err := row.Scan(&snapshot_id)
+	return snapshot_id, err
+}
+
+const finalizePauseGeneration = `-- name: FinalizePauseGeneration :one
+WITH target AS (
+  SELECT id, team_id FROM sandbox
+  WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+    AND status IN ('pausing', 'resuming')
+),
+inserted AS (
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation)
+  SELECT target.id, target.team_id, $3, $4, $5, $6,
+         COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1
+  FROM target
+  RETURNING snapshot.id AS snap_id
+),
+fresh AS (
+  SELECT unnest($7::text[]) AS file_name,
+         unnest($8::text[])      AS path,
+         unnest($9::bigint[])    AS size_bytes,
+         unnest($10::text[])    AS sha256,
+         unnest($11::text[]) AS base_path
+),
+manifested AS (
+  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
+  SELECT i.snap_id, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
+  FROM inserted i CROSS JOIN fresh f
+  RETURNING id
+)
+UPDATE sandbox
+SET snapshot_id = (SELECT snap_id FROM inserted),
+    status = 'paused',
+    auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
+    updated_at = now()
+FROM inserted
+WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+  AND sandbox.status IN ('pausing', 'resuming')
+RETURNING inserted.snap_id::uuid AS snapshot_id
+`
+
+type FinalizePauseGenerationParams struct {
+	ID                uuid.UUID `json:"id"`
+	TeamID            uuid.UUID `json:"team_id"`
+	Path              string    `json:"path"`
+	MemPath           *string   `json:"mem_path"`
+	SizeBytes         int64     `json:"size_bytes"`
+	Trigger           string    `json:"trigger"`
+	ManifestFileNames []string  `json:"manifest_file_names"`
+	ManifestPaths     []string  `json:"manifest_paths"`
+	ManifestSizes     []int64   `json:"manifest_sizes"`
+	ManifestDigests   []string  `json:"manifest_digests"`
+	ManifestBasePaths []string  `json:"manifest_base_paths"`
+}
+
+// Generations-mode finalize: INSERT a new snapshot row per pause instead of
+// overwriting, and move the sandbox head to it. Same status guard as the
+// legacy finalize, and the guard carries the same two protections forward:
+// a late finalize (status no longer pausing/resuming) matches zero rows and
+// writes nothing, and a retry after a lost-response success is a no-op for
+// the same reason. Prior generations' rows and manifests are untouched;
+// that is the point.
+func (q *Queries) FinalizePauseGeneration(ctx context.Context, arg FinalizePauseGenerationParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, finalizePauseGeneration,
 		arg.ID,
 		arg.TeamID,
 		arg.Path,
@@ -1437,6 +1518,21 @@ func (q *Queries) GetSandboxWithPreviewPolicy(ctx context.Context, arg GetSandbo
 		&i.Access,
 	)
 	return i, err
+}
+
+const hasLegacySnapshotUnique = `-- name: HasLegacySnapshotUnique :one
+SELECT (to_regclass('public.snapshot_sandbox_unique') IS NOT NULL)::bool AS legacy
+`
+
+// Rolling-deploy probe: while the legacy one-snapshot-per-sandbox unique
+// index exists, finalizes must run the upsert (FinalizePause); once the
+// contract phase drops it, finalizes insert real generation rows
+// (FinalizePauseGeneration). Probed per finalize; pauses are low-rate.
+func (q *Queries) HasLegacySnapshotUnique(ctx context.Context) (bool, error) {
+	row := q.db.QueryRow(ctx, hasLegacySnapshotUnique)
+	var legacy bool
+	err := row.Scan(&legacy)
+	return legacy, err
 }
 
 const listPinnedBuildPaths = `-- name: ListPinnedBuildPaths :many

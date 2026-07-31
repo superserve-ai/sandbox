@@ -407,6 +407,10 @@ upserted AS (
   DO UPDATE SET
     path = EXCLUDED.path,
     mem_path = EXCLUDED.mem_path,
+    -- Compatibility mode while snapshot_sandbox_unique exists: history is
+    -- still one row, but the generation counter advances so consumers see
+    -- monotonic generations before and after the contract-phase index drop.
+    generation = snapshot.generation + 1,
     -- A finalize that has no complete manifest passes 0 (hash budget
     -- exhausted or a file failed to hash); keep the recorded size instead
     -- of clobbering it back to zero.
@@ -460,6 +464,56 @@ FROM upserted
 WHERE sandbox.id = @id AND sandbox.team_id = @team_id AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
 RETURNING upserted.snap_id::uuid AS snapshot_id;
+
+-- name: HasLegacySnapshotUnique :one
+-- Rolling-deploy probe: while the legacy one-snapshot-per-sandbox unique
+-- index exists, finalizes must run the upsert (FinalizePause); once the
+-- contract phase drops it, finalizes insert real generation rows
+-- (FinalizePauseGeneration). Probed per finalize; pauses are low-rate.
+SELECT (to_regclass('public.snapshot_sandbox_unique') IS NOT NULL)::bool AS legacy;
+
+-- name: FinalizePauseGeneration :one
+-- Generations-mode finalize: INSERT a new snapshot row per pause instead of
+-- overwriting, and move the sandbox head to it. Same status guard as the
+-- legacy finalize, and the guard carries the same two protections forward:
+-- a late finalize (status no longer pausing/resuming) matches zero rows and
+-- writes nothing, and a retry after a lost-response success is a no-op for
+-- the same reason. Prior generations' rows and manifests are untouched;
+-- that is the point.
+WITH target AS (
+  SELECT id, team_id FROM sandbox
+  WHERE id = @id AND team_id = @team_id AND destroyed_at IS NULL
+    AND status IN ('pausing', 'resuming')
+),
+inserted AS (
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation)
+  SELECT target.id, target.team_id, @path, @mem_path, @size_bytes, @trigger,
+         COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1
+  FROM target
+  RETURNING snapshot.id AS snap_id
+),
+fresh AS (
+  SELECT unnest(@manifest_file_names::text[]) AS file_name,
+         unnest(@manifest_paths::text[])      AS path,
+         unnest(@manifest_sizes::bigint[])    AS size_bytes,
+         unnest(@manifest_digests::text[])    AS sha256,
+         unnest(@manifest_base_paths::text[]) AS base_path
+),
+manifested AS (
+  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
+  SELECT i.snap_id, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
+  FROM inserted i CROSS JOIN fresh f
+  RETURNING id
+)
+UPDATE sandbox
+SET snapshot_id = (SELECT snap_id FROM inserted),
+    status = 'paused',
+    auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
+    updated_at = now()
+FROM inserted
+WHERE sandbox.id = @id AND sandbox.team_id = @team_id AND sandbox.destroyed_at IS NULL
+  AND sandbox.status IN ('pausing', 'resuming')
+RETURNING inserted.snap_id::uuid AS snapshot_id;
 
 -- name: UpdateSandboxNetworkConfig :exec
 UPDATE sandbox
