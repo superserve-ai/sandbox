@@ -262,6 +262,8 @@ type Manager struct {
 	// pendingSweepInterval overrides the pending-backup sweep pace in
 	// tests; 0 means pendingBackupSweepInterval.
 	pendingSweepInterval time.Duration
+	// rehashSlots bounds concurrent recovery/sweep rehash workers.
+	rehashSlots chan struct{}
 
 	// launcherReady gates the launcher launch path: false → launches use the
 	// legacy path. Set when the namespace is built/validated; kept in sync by

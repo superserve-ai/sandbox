@@ -71,6 +71,17 @@ type Uploader struct {
 	// StagingRoot is the hard-link staging tree; finished tasks get
 	// their staged generation removed. Empty disables staging cleanup.
 	StagingRoot string
+	// Now overrides the wall clock in tests; nil means time.Now. Used
+	// for failure-time backoff, where the drain-start time would let a
+	// late failure retry immediately.
+	Now func() time.Time
+}
+
+func (u *Uploader) clock() time.Time {
+	if u.Now != nil {
+		return u.Now()
+	}
+	return time.Now()
 }
 
 // Run drains the journal until ctx ends. Crash-safe by construction: work
@@ -130,7 +141,10 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 			Str("generation", task.Generation).
 			Int("attempts", task.Attempts+1).
 			Msg("backup upload failed; will retry")
-		return true, u.Journal.Nack(task, now)
+		// Backoff counts from the FAILURE, not the drain start: a long
+		// upload that fails late would otherwise already be past its
+		// NotBefore and retry immediately.
+		return true, u.Journal.Nack(task, u.clock())
 	}
 	if err := u.Journal.Ack(task, completed && u.OnVerified != nil); err != nil {
 		return true, err

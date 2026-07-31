@@ -150,6 +150,8 @@ func TestUploaderRetriesOnStoreFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := task.EnqueuedAt.Add(time.Minute)
+	fake := now
+	u.Now = func() time.Time { return fake }
 	if _, err := u.drainOne(context.Background(), now); err != nil {
 		t.Fatal(err)
 	}
@@ -164,6 +166,7 @@ func TestUploaderRetriesOnStoreFailure(t *testing.T) {
 	// Clear the fault; after backoff the retry completes and dedupes the
 	// already-written overlay object.
 	delete(store.fail, "sandboxes/sb-1/gen-abc/"+packedName(t, task.Files[1].Path, "vmstate.snap"))
+	fake = now.Add(time.Hour)
 	if _, err := u.drainOne(context.Background(), now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -726,5 +729,75 @@ func TestSweepStagingKeepsOnlyPending(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(staging, "sb2")); !os.IsNotExist(err) {
 		t.Fatalf("orphan generation kept: %v", err)
+	}
+}
+
+// Backoff must count from the failure, not the drain start: a drain that
+// began long ago but fails now schedules its retry in the real future.
+func TestNackBackoffCountsFromFailureTime(t *testing.T) {
+	j, _ := testJournal(t)
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store}
+
+	task := writeTask(t, t.TempDir())
+	store.fail["sandboxes/sb-1/gen-abc/"+packedName(t, task.Files[1].Path, "vmstate.snap")] = errors.New("transient")
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	// Drain "started" at the ancient enqueue time; the failure happens at
+	// failTime. The retry must be scheduled after failTime, so the task
+	// is NOT runnable immediately after the failure.
+	failTime := task.EnqueuedAt.Add(48 * time.Hour)
+	u.Now = func() time.Time { return failTime }
+	if _, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := j.Next(failTime); err != nil || ok {
+		t.Fatalf("task runnable immediately after a late failure (ok=%v err=%v)", ok, err)
+	}
+	if _, ok, err := j.Next(failTime.Add(time.Hour)); err != nil || !ok {
+		t.Fatalf("task not runnable after backoff elapsed (ok=%v err=%v)", ok, err)
+	}
+}
+
+// A deferred high-priority task must not hide runnable lower-priority
+// work, and finding it must not require scanning the deferred backlog:
+// readiness-ordered keys let Next seek straight to the next priority.
+func TestNextSkipsDeferredPriorityWithoutScanning(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
+	pause := Task{SandboxID: "sb-a", Generation: "g1", EnqueuedAt: base, Priority: PriorityPause}
+	if err := j.Enqueue(pause); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Nack(pause, base.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	ckpt := Task{SandboxID: "sb-b", Generation: "g2", EnqueuedAt: base, Priority: PriorityCheckpoint}
+	if err := j.Enqueue(ckpt); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nack at +60s with attempt-1 backoff (2s) defers until +62s.
+	got, ok, err := j.Next(base.Add(61 * time.Second))
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	if got.SandboxID != "sb-b" {
+		t.Fatalf("Next = %s, want the runnable checkpoint task", got.SandboxID)
+	}
+	// After the pause task's backoff elapses it outranks the checkpoint.
+	got, ok, err = j.Next(base.Add(time.Hour))
+	if err != nil || !ok || got.SandboxID != "sb-a" {
+		t.Fatalf("Next after backoff = %+v/%v/%v, want the pause task", got, ok, err)
+	}
+	// The nack re-keyed the row; ack through the same task state must
+	// clear it (index and queue agree on the new key).
+	nacked := got
+	if err := j.Ack(nacked, false); err != nil {
+		t.Fatal(err)
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("nacked task not acked cleanly: %v", counts)
 	}
 }

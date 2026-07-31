@@ -769,3 +769,48 @@ func TestHealIsNewestWins(t *testing.T) {
 		t.Fatalf("pending = %+v, want older heal rejected", pending)
 	}
 }
+
+// A paused VM the startup reattach has not loaded (empty instance map,
+// durable record present) is NOT superseded: recovery must still finish
+// its backup instead of deleting the marker.
+func TestRecoveryTrustsDurableRecordWhenMapUnloaded(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	// The durable record says paused; the map has not been rebuilt.
+	if err := st.Put(VMRecord{ID: "vm-1", Status: StatusPaused, SnapshotPath: snap}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutPendingBackup(newPendingBackup("vm-1", snap, disk, "")); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	m.RecoverPendingBackups(context.Background(), zerolog.Nop())
+
+	select {
+	case task := <-tasks:
+		if task.SandboxID != "vm-1" {
+			t.Fatalf("recovered task owner = %q", task.SandboxID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("unloaded-but-paused record treated as superseded")
+	}
+}

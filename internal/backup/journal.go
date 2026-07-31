@@ -131,14 +131,26 @@ func NewJournal(db *bolt.DB) (*Journal, error) {
 	return &Journal{db: db}, nil
 }
 
-// key orders the queue: priority, then enqueue time, then the owner and
-// generation for uniqueness. The owner is load-bearing: generations are
+// readyAt is when the task becomes runnable: its enqueue time until a
+// Nack defers it. Keys sort by it so Next never scans deferred work.
+func (t *Task) readyAt() time.Time {
+	if t.NotBefore.After(t.EnqueuedAt) {
+		return t.NotBefore
+	}
+	return t.EnqueuedAt
+}
+
+// key orders the queue: priority, then READINESS time, then the owner
+// and generation for uniqueness. Readiness rather than enqueue time is
+// load-bearing for outage backlogs: deferred tasks sort behind runnable
+// ones within their priority, so Next examines at most one entry per
+// priority instead of scanning every deferred entry on each drain and
+// idle tick. The owner segment is load-bearing too: generations are
 // content-addressed, so two untouched sandboxes cloned from one template
-// share a generation, and without the owner segment a same-tick enqueue
-// would collide keys and silently drop one sandbox's backup. Bolt
-// iterates keys in byte order, so Next is a prefix scan.
+// share a generation, and without the owner a same-tick enqueue would
+// collide keys and silently drop one sandbox's backup.
 func (t *Task) key() []byte {
-	return []byte(fmt.Sprintf("%d/%020d/%s/%s", t.Priority, t.EnqueuedAt.UnixNano(), t.SandboxID, t.Generation))
+	return []byte(fmt.Sprintf("%d/%020d/%s/%s", t.Priority, t.readyAt().UnixNano(), t.SandboxID, t.Generation))
 }
 
 // indexKey is the pending-generation identity for the dedupe index.
@@ -177,31 +189,34 @@ func (j *Journal) Enqueue(task Task) error {
 }
 
 // Next returns the highest-priority runnable task (NotBefore in the past),
-// or ok=false when the queue has nothing runnable. A corrupt entry must
-// never wedge the queue: it is deleted (self-healing) rather than surfaced
-// as a permanent error, and the scan continues past it.
+// or ok=false when the queue has nothing runnable. Keys sort by
+// readiness within each priority, so the first decodable entry of a
+// priority answers for the whole priority: not ready means nothing
+// behind it is ready either, and the cursor seeks straight to the next
+// priority. A corrupt entry must never wedge the queue: it is deleted
+// (self-healing) rather than surfaced as a permanent error, and the scan
+// continues past it.
 func (j *Journal) Next(now time.Time) (Task, bool, error) {
 	var task Task
 	var corrupt [][]byte
 	found := false
 	err := j.db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(journalBucket).Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
+		for k, v := c.First(); k != nil; {
 			var t Task
 			if err := json.Unmarshal(v, &t); err != nil {
 				corrupt = append(corrupt, append([]byte(nil), k...))
+				k, v = c.Next()
 				continue
 			}
-			if t.NotBefore.After(now) {
-				continue
+			if !t.NotBefore.After(now) {
+				task = t
+				found = true
+				break
 			}
-			task = t
-			found = true
-			// Stop here: decoding the rest of a large outage backlog per
-			// drain would make draining quadratic. Corrupt entries sorted
-			// after this point are dropped by later calls as the queue
-			// empties toward them.
-			break
+			// Earliest entry of this priority is deferred: skip the
+			// whole priority.
+			k, v = c.Seek(append([]byte(fmt.Sprintf("%d", t.Priority+1)), '/'))
 		}
 		return nil
 	})
@@ -383,7 +398,11 @@ func (j *Journal) Nack(task Task, now time.Time) error {
 		if err := b.Delete(old); err != nil {
 			return err
 		}
-		return b.Put(task.key(), val)
+		if err := b.Put(task.key(), val); err != nil {
+			return err
+		}
+		// The deferral re-keyed the row; the dedupe index must follow.
+		return tx.Bucket(indexBucket).Put(task.indexKey(), task.key())
 	})
 }
 

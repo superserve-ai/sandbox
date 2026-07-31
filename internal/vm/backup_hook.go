@@ -127,17 +127,26 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	defer m.pendingInFlight.Delete(pb.VMID)
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 	defer cancel()
-	// Superseded (the instance is no longer paused on this snapshot)
-	// deletes the record: a resume, destroy, or newer pause owns coverage
-	// now. Everything merely INCONCLUSIVE (a stat error, a liveness probe
-	// that cannot prove death, a disk that changed under a still-paused
-	// instance) keeps the record instead: deleting on a transient failure
-	// would permanently drop coverage the next recovery could earn.
-	if !m.pausedAt(pb.VMID, pb.SnapshotPath) {
+	// Superseded (the sandbox is provably no longer paused on this
+	// snapshot) deletes the record: a resume, destroy, or newer pause
+	// owns coverage now. Everything merely INCONCLUSIVE (a stat error, a
+	// liveness probe that cannot prove death, an instance the startup
+	// reattach has not loaded yet, a disk that changed under a
+	// still-paused instance) keeps the record instead: deleting on a
+	// transient state would permanently drop coverage the next recovery
+	// could earn.
+	switch m.pendingVerdict(pb.VMID, pb.SnapshotPath) {
+	case pendingSuperseded:
 		log.Warn().Str("vm_id", pb.VMID).
 			Msg("pause backup superseded: sandbox no longer paused on this snapshot")
 		m.deletePendingBackupIf(pb, log)
 		return
+	case pendingInconclusive:
+		log.Warn().Str("vm_id", pb.VMID).
+			Msg("pause backup inconclusive: sandbox state unreadable; keeping pending record")
+		m.healPendingBackup(pb, log)
+		return
+	case pendingEligible:
 	}
 	before, err := os.Stat(pb.DiskPath)
 	if err != nil || !m.unitConfirmedDead(rctx, pb.VMID) {
@@ -168,7 +177,13 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		}
 	}
 	retried := collectPauseManifest(rctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, log)
-	if !m.pausedAt(pb.VMID, pb.SnapshotPath) {
+	if v := m.pendingVerdict(pb.VMID, pb.SnapshotPath); v != pendingEligible {
+		if v == pendingInconclusive {
+			log.Warn().Str("vm_id", pb.VMID).
+				Msg("pause backup inconclusive after rehash; keeping pending record")
+			m.healPendingBackup(pb, log)
+			return
+		}
 		log.Warn().Str("vm_id", pb.VMID).
 			Msg("pause backup superseded during rehash")
 		m.deletePendingBackupIf(pb, log)
@@ -209,6 +224,13 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	m.retryEnqueue(pb, retried, log)
 }
 
+// pendingRehashConcurrency bounds concurrent recovery/sweep rehash
+// workers: a restart with a backlog must not start one full-file rehash
+// per sandbox and saturate the host's disk bandwidth (the upload limiter
+// caps network, not hashing). Saturated passes stop early; the sweep
+// retries the remainder.
+const pendingRehashConcurrency = 2
+
 // pendingBackupSweepInterval paces retries of retained pending records:
 // a record kept on an inconclusive proof or transient failure must not
 // wait for the next process restart to try again.
@@ -225,6 +247,7 @@ func (m *Manager) RecoverPendingBackups(ctx context.Context, log zerolog.Logger)
 	if m.backupEnqueue == nil || m.state == nil {
 		return
 	}
+	m.rehashSlots = make(chan struct{}, pendingRehashConcurrency)
 	m.runPendingBackups(ctx, log)
 	interval := m.pendingSweepInterval
 	if interval <= 0 {
@@ -251,8 +274,19 @@ func (m *Manager) runPendingBackups(ctx context.Context, log zerolog.Logger) {
 		return
 	}
 	for _, pb := range pending {
+		select {
+		case m.rehashSlots <- struct{}{}:
+		default:
+			// All slots busy: the rest of the backlog waits for the next
+			// sweep rather than piling up unbounded hash work.
+			log.Info().Msg("pending backup slots saturated; remaining records wait for the next sweep")
+			return
+		}
 		log.Info().Str("vm_id", pb.VMID).Msg("retrying pending pause backup")
-		go m.rehashPendingBackup(ctx, pb, log)
+		go func(pb PendingBackup) {
+			defer func() { <-m.rehashSlots }()
+			m.rehashPendingBackup(ctx, pb, log)
+		}(pb)
 	}
 }
 
@@ -353,6 +387,50 @@ var pendingTokenCounter atomic.Uint64
 // newest-wins and needs to compare ownership age.
 func newPendingToken() string {
 	return fmt.Sprintf("%020d-%012d", time.Now().UnixNano(), pendingTokenCounter.Add(1))
+}
+
+// pendingVerdict classifies a pending record against the sandbox's
+// current state. The in-memory map alone cannot answer: startup reattach
+// may not have loaded a paused VM yet (or exited early), and mistaking
+// not-yet-loaded for destroyed would delete coverage the sandbox is
+// still owed. The durable record is the authority when the map has no
+// entry: present-and-paused on this snapshot is eligible, definitively
+// absent is superseded (destroyed), and an unreadable store is
+// inconclusive.
+type pendingVerdictKind int
+
+const (
+	pendingEligible pendingVerdictKind = iota
+	pendingSuperseded
+	pendingInconclusive
+)
+
+func (m *Manager) pendingVerdict(vmID, snapshotPath string) pendingVerdictKind {
+	m.mu.RLock()
+	inst, ok := m.vms[vmID]
+	m.mu.RUnlock()
+	if ok {
+		inst.mu.RLock()
+		defer inst.mu.RUnlock()
+		if inst.Status == StatusPaused && inst.SnapshotPath == snapshotPath {
+			return pendingEligible
+		}
+		return pendingSuperseded
+	}
+	if m.state == nil {
+		return pendingSuperseded
+	}
+	rec, err := m.state.Get(vmID)
+	if err != nil {
+		return pendingInconclusive
+	}
+	if rec == nil {
+		return pendingSuperseded
+	}
+	if rec.Status == StatusPaused && rec.SnapshotPath == snapshotPath {
+		return pendingEligible
+	}
+	return pendingSuperseded
 }
 
 // atRest reports whether a sandbox's artifacts are provably not being
