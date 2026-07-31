@@ -220,23 +220,36 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 				Msg("backup source changed during upload; abandoning generation")
 			return ManifestFile{}, errSourceChanged
 		}
-		// Persist that this task verified these exact object bytes BEFORE
-		// any further progress: a retry after a crash may then trust a
-		// dedupe of this object.
-		if !task.HasVerified(objectName) {
-			task.VerifiedObjects = append(task.VerifiedObjects, objectName)
+		// Persist that these exact object bytes were verified BEFORE any
+		// further progress, both in the task (survives nacks) and in the
+		// durable history (survives acks): a later retry or an unchanged
+		// re-pause may then trust a dedupe of this object.
+		if !task.HasVerified(object) {
+			task.VerifiedObjects = append(task.VerifiedObjects, object)
 			if err := u.Journal.Update(*task); err != nil {
-				return ManifestFile{}, fmt.Errorf("persist verification of %s: %w", objectName, err)
+				return ManifestFile{}, fmt.Errorf("persist verification of %s: %w", object, err)
 			}
 		}
-	} else if !task.HasVerified(objectName) {
-		// The store deduped an object this task never verified: possibly
-		// the residue of a crash between finalize and verification, whose
-		// bytes nothing can vouch for (this identity cannot read them
-		// back). Abandon rather than publish a manifest over them.
-		u.Log.Warn().Str("object", objectName).Str("sandbox_id", task.SandboxID).
-			Msg("deduped object was never verified by this task; abandoning generation")
-		return ManifestFile{}, errSourceChanged
+		if err := u.Journal.MarkVerified(object, time.Now()); err != nil {
+			return ManifestFile{}, fmt.Errorf("record verification of %s: %w", object, err)
+		}
+	} else if !task.HasVerified(object) {
+		// The store deduped an object this task never verified. It may be
+		// a completed earlier upload (an unchanged re-pause after the
+		// original task acked) or the residue of a crash between finalize
+		// and verification. The durable verification history is the
+		// discriminator; without it, abandon rather than publish a
+		// manifest over bytes nothing can vouch for (this identity cannot
+		// read them back).
+		wasVerified, err := u.Journal.WasVerified(object, time.Now())
+		if err != nil {
+			return ManifestFile{}, err
+		}
+		if !wasVerified {
+			u.Log.Warn().Str("object", object).Str("sandbox_id", task.SandboxID).
+				Msg("deduped object has no verification history; abandoning generation")
+			return ManifestFile{}, errSourceChanged
+		}
 	}
 	return ManifestFile{
 		Name:       file.Name,

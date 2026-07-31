@@ -78,17 +78,31 @@ var (
 	// whole backlog (which grows during bucket outages, and the scan held
 	// a write transaction that blocked uploader acks).
 	indexBucket = []byte("backup_upload_index")
+	// verifiedBucket records object names whose streamed bytes were
+	// digest-verified, OUTLIVING the tasks that verified them: an
+	// unchanged re-pause re-enqueues an already-completed generation, and
+	// its dedupes must be distinguishable from crash residue after the
+	// original task was acked. Entries carry a timestamp and are pruned
+	// lazily on ack.
+	verifiedBucket = []byte("backup_verified_objects")
 )
+
+// verifiedRetention bounds how long verification history is kept. Long
+// enough to cover any plausible re-enqueue of an unchanged generation;
+// after expiry a dedupe degrades to abandonment, which is safe (the
+// generation is already complete in the bucket).
+const verifiedRetention = 14 * 24 * time.Hour
 
 // NewJournal opens (creating if needed) the journal bucket in db. The
 // caller owns the bolt DB; sharing vmd's state DB keeps one fsync domain.
 func NewJournal(db *bolt.DB) (*Journal, error) {
 	err := db.Update(func(tx *bolt.Tx) error {
-		if _, err := tx.CreateBucketIfNotExists(journalBucket); err != nil {
-			return err
+		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket} {
+			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
+				return err
+			}
 		}
-		_, err := tx.CreateBucketIfNotExists(indexBucket)
-		return err
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create journal bucket: %w", err)
@@ -199,14 +213,58 @@ func (j *Journal) Update(task Task) error {
 	})
 }
 
+// MarkVerified durably records that an object's streamed bytes were
+// digest-verified, surviving task completion.
+func (j *Journal) MarkVerified(object string, now time.Time) error {
+	return j.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
+	})
+}
+
+// WasVerified reports whether any task ever digest-verified this object
+// within the retention window.
+func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
+	var ok bool
+	err := j.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(verifiedBucket).Get([]byte(object))
+		if v == nil {
+			return nil
+		}
+		var ns int64
+		if _, err := fmt.Sscanf(string(v), "%d", &ns); err != nil {
+			return nil // unparsable entry counts as absent
+		}
+		ok = now.Sub(time.Unix(0, ns)) <= verifiedRetention
+		return nil
+	})
+	return ok, err
+}
+
 // Ack removes a completed task. Called only after every object of the
-// generation is verified in the bucket.
+// generation is verified in the bucket. Piggybacks a bounded lazy prune
+// of expired verification history.
 func (j *Journal) Ack(task Task) error {
+	now := time.Now()
 	return j.db.Update(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(journalBucket).Delete(task.key()); err != nil {
 			return err
 		}
-		return tx.Bucket(indexBucket).Delete(task.indexKey())
+		if err := tx.Bucket(indexBucket).Delete(task.indexKey()); err != nil {
+			return err
+		}
+		vb := tx.Bucket(verifiedBucket)
+		c := vb.Cursor()
+		pruned := 0
+		for k, v := c.First(); k != nil && pruned < 128; k, v = c.Next() {
+			var ns int64
+			if _, err := fmt.Sscanf(string(v), "%d", &ns); err != nil || now.Sub(time.Unix(0, ns)) > verifiedRetention {
+				if err := c.Delete(); err != nil {
+					return err
+				}
+				pruned++
+			}
+		}
+		return nil
 	})
 }
 

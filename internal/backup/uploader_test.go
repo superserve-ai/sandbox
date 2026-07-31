@@ -412,3 +412,41 @@ func TestUploaderAbandonsUnverifiedDedupedObject(t *testing.T) {
 		t.Fatalf("task still pending: %v", counts)
 	}
 }
+
+func TestUploaderTrustsHistoryForUnchangedRepause(t *testing.T) {
+	j, _ := testJournal(t)
+	store := newMemStore()
+	var verified []Task
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+
+	// First pause: full upload, verified, acked.
+	task := writeTask(t, t.TempDir())
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(verified) != 1 {
+		t.Fatalf("first pause not verified: %+v", verified)
+	}
+
+	// Unchanged re-pause: same content, same generation, fresh task after
+	// the original was acked. Every object dedupes; the durable history
+	// must let it complete instead of abandoning it as crash residue.
+	repause := task
+	repause.EnqueuedAt = task.EnqueuedAt.Add(time.Hour)
+	repause.VerifiedObjects = nil
+	if err := j.Enqueue(repause); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), repause.EnqueuedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(verified) != 2 {
+		t.Fatalf("unchanged re-pause abandoned instead of completing: %+v", verified)
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("re-pause task still pending: %v", counts)
+	}
+}
