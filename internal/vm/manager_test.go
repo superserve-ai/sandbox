@@ -966,6 +966,9 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	orig := vmUnitDead
 	vmUnitDead = func(string) bool { return false } // unit alive
 	defer func() { vmUnitDead = orig }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil } // boxd healthy
+	defer func() { adoptionBoxdReady = origReady }()
 
 	dir := t.TempDir()
 	snapPath := filepath.Join(dir, "vmstate.snap")
@@ -997,6 +1000,41 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	mgr.mu.RUnlock()
 	if still != existing {
 		t.Fatal("existing instance must remain tracked untouched")
+	}
+}
+
+// The crash-window guard: a reattached Running record whose restore was
+// interrupted before readiness must not be adopted as a successful create.
+func TestRestoreVMSnapshot_AdoptedButBoxdNeverReady_Fails(t *testing.T) {
+	orig := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = orig }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error {
+		return errors.New("boxd never became ready")
+	}
+	defer func() { adoptionBoxdReady = origReady }()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		vms:        map[string]*VMInstance{"vm-1": existing},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	if _, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0); err == nil {
+		t.Fatal("adopting an unverified VM must fail when boxd never becomes ready")
 	}
 }
 

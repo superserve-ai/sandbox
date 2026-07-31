@@ -1078,14 +1078,8 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	// to the snapshot, so return the live instance — same guard as the
 	// stateless restore path.
 	if existing := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
-		// A Running record can predate readiness verification (the persist
-		// overlaps the boxd wait, and a vmd restart in that window reattaches
-		// it), so adoption must re-verify. A bounded WAIT, not a single probe:
-		// a warming VM passes, a completed prior restore answers in ~1ms, and
-		// only a truly dead boxd fails — the caller's error path owns cleanup.
-		if err := m.waitForBoxd(ctx, existing.IP, 30*time.Second); err != nil {
-			return nil, fmt.Errorf("adopted VM %s boxd not ready: %w", vmID, err)
-		}
+		// Resume's contract never blocks on boxd (the readiness probe is
+		// detached telemetry), so adoption matches: record + live unit suffice.
 		log.Info().Msg("resume: VM already running and healthy, returning it")
 		return existing, nil
 	}
@@ -1633,6 +1627,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// that could have served the prior attempt stamps the request's policy
 		// itself. A generation that changes stamping must add a
 		// request-vs-stamped comparison here.
+		// A Running record can also predate readiness verification (the
+		// persist overlaps the boxd wait; a vmd restart in that window
+		// reattaches it), so restore adoption re-verifies — a bounded WAIT,
+		// not a single probe, so a warming VM passes. Resume adoption
+		// deliberately skips this (detached-probe contract).
+		if err := adoptionBoxdReady(ctx, m, existing.IP); err != nil {
+			return nil, fmt.Errorf("adopted VM %s boxd not ready: %w", vmID, err)
+		}
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
 	}
@@ -3491,6 +3493,12 @@ var vmUnitDead = func(vmID string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return unitDefinitelyDead(ctx, systemdUnitName(vmID))
+}
+
+// adoptionBoxdReady is the restore-adoption readiness gate, a var for the
+// same test seam vmUnitDead uses.
+var adoptionBoxdReady = func(ctx context.Context, m *Manager, ip string) error {
+	return m.waitForBoxd(ctx, ip, 30*time.Second)
 }
 
 func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) *VMInstance {
