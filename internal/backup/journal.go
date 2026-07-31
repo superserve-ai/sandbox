@@ -43,6 +43,23 @@ type Task struct {
 	Attempts   int        `json:"attempts"`
 	// NotBefore delays retry after a failure (exponential backoff).
 	NotBefore time.Time `json:"not_before,omitempty"`
+	// VerifiedObjects records objects whose streamed bytes this task has
+	// already digest-verified, persisted before further progress. On a
+	// retry, a create-only dedupe is trusted ONLY for objects listed here:
+	// an existing object this task never verified may be the residue of a
+	// crash between finalize and verification, so the generation is
+	// abandoned rather than completed over unverifiable bytes.
+	VerifiedObjects []string `json:"verified_objects,omitempty"`
+}
+
+// HasVerified reports whether this task already verified object.
+func (t *Task) HasVerified(object string) bool {
+	for _, o := range t.VerifiedObjects {
+		if o == object {
+			return true
+		}
+	}
+	return false
 }
 
 // Journal is the crash-safe upload queue. Enqueue is called in the pause
@@ -167,6 +184,19 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 		}
 	}
 	return task, found, nil
+}
+
+// Update rewrites a pending task in place (same key: identity fields are
+// immutable). Used to persist per-object verification progress so a retry
+// after a crash knows which deduped objects it may trust.
+func (j *Journal) Update(task Task) error {
+	val, err := json.Marshal(task)
+	if err != nil {
+		return err
+	}
+	return j.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(journalBucket).Put(task.key(), val)
+	})
 }
 
 // Ack removes a completed task. Called only after every object of the

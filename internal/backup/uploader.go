@@ -97,7 +97,7 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	if err != nil || !ok {
 		return false, err
 	}
-	completed, err := u.uploadTask(ctx, task)
+	completed, err := u.uploadTask(ctx, &task)
 	if err != nil {
 		u.Log.Warn().Err(err).
 			Str("sandbox_id", task.SandboxID).
@@ -121,7 +121,9 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 // is false when the generation was abandoned (source files gone): the
 // task is done, but nothing was made durable, so verification hooks must
 // not fire.
-func (u *Uploader) uploadTask(ctx context.Context, task Task) (completed bool, _ error) {
+// task is a pointer so verification progress recorded during the attempt
+// survives into the Nack that re-persists the task on failure.
+func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, _ error) {
 	gen := GenerationManifest{
 		SandboxID:  task.SandboxID,
 		Generation: task.Generation,
@@ -165,7 +167,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task Task) (completed bool, _
 // resume's next pause enqueues the corrective generation under a new key.
 var errSourceChanged = os.ErrNotExist
 
-func (u *Uploader) uploadFile(ctx context.Context, task Task, file TaskFile) (ManifestFile, error) {
+func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (ManifestFile, error) {
 	if file.Name == ManifestObject {
 		return ManifestFile{}, fmt.Errorf("artifact name %q collides with the manifest object", file.Name)
 	}
@@ -212,9 +214,28 @@ func (u *Uploader) uploadFile(ctx context.Context, task Task, file TaskFile) (Ma
 	if err := u.Store.Create(ctx, object, reader); err != nil {
 		return ManifestFile{}, err
 	}
-	if shipped, complete := hasher.finish(); complete && shipped != file.SHA256 {
-		u.Log.Warn().Str("path", file.Path).Str("want", file.SHA256).Str("got", shipped).
-			Msg("backup source changed during upload; abandoning generation")
+	if shipped, complete := hasher.finish(); complete {
+		if shipped != file.SHA256 {
+			u.Log.Warn().Str("path", file.Path).Str("want", file.SHA256).Str("got", shipped).
+				Msg("backup source changed during upload; abandoning generation")
+			return ManifestFile{}, errSourceChanged
+		}
+		// Persist that this task verified these exact object bytes BEFORE
+		// any further progress: a retry after a crash may then trust a
+		// dedupe of this object.
+		if !task.HasVerified(objectName) {
+			task.VerifiedObjects = append(task.VerifiedObjects, objectName)
+			if err := u.Journal.Update(*task); err != nil {
+				return ManifestFile{}, fmt.Errorf("persist verification of %s: %w", objectName, err)
+			}
+		}
+	} else if !task.HasVerified(objectName) {
+		// The store deduped an object this task never verified: possibly
+		// the residue of a crash between finalize and verification, whose
+		// bytes nothing can vouch for (this identity cannot read them
+		// back). Abandon rather than publish a manifest over them.
+		u.Log.Warn().Str("object", objectName).Str("sandbox_id", task.SandboxID).
+			Msg("deduped object was never verified by this task; abandoning generation")
 		return ManifestFile{}, errSourceChanged
 	}
 	return ManifestFile{

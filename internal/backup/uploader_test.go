@@ -384,3 +384,31 @@ func TestJournalStaleIndexHeals(t *testing.T) {
 		t.Fatalf("stale index blocked re-enqueue: %v", counts)
 	}
 }
+
+func TestUploaderAbandonsUnverifiedDedupedObject(t *testing.T) {
+	j, _ := testJournal(t)
+	store := newMemStore()
+	task := writeTask(t, t.TempDir())
+	// Residue of a crash between finalize and verification: the object
+	// exists (with bytes nothing can vouch for; simulate corruption), but
+	// this task's journal entry records no verification of it.
+	overlayObj := "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[0].Path, "overlay.ext4")
+	store.objects[overlayObj] = []byte("CORRUPT!")
+	var verified []Task
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.objects["sandboxes/sb-1/gen-abc/manifest.json"]; ok {
+		t.Fatal("manifest published over an unverified deduped object")
+	}
+	if len(verified) != 0 {
+		t.Fatal("verification hook fired")
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("task still pending: %v", counts)
+	}
+}
