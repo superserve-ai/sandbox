@@ -92,7 +92,10 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		// gate, so gate explicitly: a resume must not report success for a
 		// guest whose agent never came back. /health answers from memory, so
 		// this stays immune to the in-guest disk stalls /init is prone to.
-		if err := a.mgr.waitForBoxd(ctx, inst.IP, 10*time.Second); err != nil {
+		// 30s matches the restore path's readiness window: a cold-storage
+		// resume legitimately needs longer than a warm one, and this timeout
+		// is destructive (the error path below tears the VM down).
+		if err := a.mgr.waitForBoxd(ctx, inst.IP, 30*time.Second); err != nil {
 			a.mgr.abortResumeLocked(req.GetVmId())
 			return nil, status.Errorf(codes.Unavailable, "boxd not reachable after resume: %v", err)
 		}
