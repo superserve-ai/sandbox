@@ -250,6 +250,12 @@ func (a *GRPCAdapter) InjectSandboxEnv(ctx context.Context, req *vmdpb.InjectSan
 
 // ipOwnerCheck returns a predicate reporting whether vmID still exists, still
 // owns ip, and is still Running — the retry gate for /init deliveries.
+//
+// The instance record alone is not enough: DestroyVM releases the network
+// slot before it removes the instance, so mid-destroy the record still shows
+// Running with the old IP while the slot is already claimable by another VM.
+// The network manager's device table is the slot's actual owner ledger, so a
+// nil lookup there vetoes the delivery.
 func (a *GRPCAdapter) ipOwnerCheck(vmID, ip string) func() bool {
 	return func() bool {
 		cur, err := a.mgr.getInstance(vmID)
@@ -259,7 +265,7 @@ func (a *GRPCAdapter) ipOwnerCheck(vmID, ip string) func() bool {
 		cur.mu.Lock()
 		ok := cur.IP == ip && cur.Status == StatusRunning
 		cur.mu.Unlock()
-		return ok
+		return ok && a.mgr.netMgr.GetVMNetInfo(vmID) != nil
 	}
 }
 
