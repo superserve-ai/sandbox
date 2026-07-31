@@ -17,10 +17,15 @@ DROP VIEW IF EXISTS analytics.weekly_team_sandbox_count;
 -- during its actual assignment window. LATERAL correlates the resolution
 -- to each row's own hour_start.
 --
--- Usage before the platform's single, actual pricing-launch instant (the
--- earliest effective_from across all of pricing_rate) prices at 0: that
--- usage was genuinely unpriced pre-launch, a historical fact independent
--- of team or plan. Past that instant, a resource with no matching rate
+-- Usage before the platform's single, actual pricing-launch instant
+-- prices at 0: that usage was genuinely unpriced pre-launch, a
+-- historical fact independent of team or plan. The instant is the
+-- effective_from of the initial payg rates
+-- (20260617000003_billing_pricing_credits.sql), pinned as a literal
+-- rather than computed as MIN(effective_from) over pricing_rate: a later
+-- rate inserted with an earlier effective_from must not move the
+-- boundary and flip already-zero-priced hours to NULL.
+-- Past that instant, a resource with no matching rate
 -- resolves to NULL instead of 0, whether that's a one-off gap between two
 -- rate periods or a custom plan that never defined the resource at all,
 -- the same "can't price this" signal handlers_platform_billing.go's
@@ -45,7 +50,7 @@ SELECT t.name AS team_name,
        )::numeric(14,6) AS spend_usd
 FROM team_billing_usage_hourly u
 JOIN team t ON t.id = u.team_id
-CROSS JOIN (SELECT MIN(effective_from) AS at FROM pricing_rate) pl
+CROSS JOIN (SELECT '2026-06-17 00:00:00+00'::timestamptz AS at) pl
 CROSS JOIN LATERAL (
     SELECT COALESCE((
         SELECT tpp.plan_key
