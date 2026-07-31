@@ -3,7 +3,10 @@ package backup
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -70,7 +73,9 @@ func (u *Uploader) Run(ctx context.Context) error {
 			}
 			u.Log.Error().Err(err).Msg("backup drain error")
 		}
-		if !worked {
+		// Sleep when idle AND after errors: a persistently failing journal
+		// (e.g. disk full) must back off, not busy-spin.
+		if !worked || err != nil {
 			select {
 			case <-ctx.Done():
 				return nil
@@ -120,10 +125,11 @@ func (u *Uploader) uploadTask(ctx context.Context, task Task) (completed bool, _
 	for _, file := range task.Files {
 		mf, err := u.uploadFile(ctx, task, file)
 		if err != nil {
-			if os.IsNotExist(err) {
-				// The artifact vanished between enqueue and upload (sandbox
-				// deleted, local GC won the race). Nothing to back up; the
-				// generation is abandoned, not retried forever.
+			if os.IsNotExist(err) || errors.Is(err, errSourceChanged) {
+				// The artifact vanished or mutated between enqueue and
+				// upload (sandbox deleted or resumed, local GC won the
+				// race). Nothing valid to back up under this content
+				// address; the generation is abandoned, not retried.
 				u.Log.Warn().Str("path", file.Path).Str("sandbox_id", task.SandboxID).
 					Msg("backup source file gone; abandoning generation")
 				return false, nil
@@ -146,7 +152,18 @@ func (u *Uploader) uploadTask(ctx context.Context, task Task) (completed bool, _
 	return true, nil
 }
 
+// errSourceChanged marks a source file whose current content no longer
+// matches the digest recorded at pause time: the sandbox resumed and
+// mutated the disk before the upload drained. Shipping those bytes under
+// the old content address would create a generation whose objects
+// contradict their manifest, so the generation is abandoned instead; the
+// resume's next pause enqueues the corrective generation under a new key.
+var errSourceChanged = os.ErrNotExist
+
 func (u *Uploader) uploadFile(ctx context.Context, task Task, file TaskFile) (ManifestFile, error) {
+	if file.Name == ManifestObject {
+		return ManifestFile{}, fmt.Errorf("artifact name %q collides with the manifest object", file.Name)
+	}
 	f, err := os.Open(file.Path)
 	if err != nil {
 		return ManifestFile{}, err
@@ -155,6 +172,22 @@ func (u *Uploader) uploadFile(ctx context.Context, task Task, file TaskFile) (Ma
 	extents, apparent, err := Extents(f)
 	if err != nil {
 		return ManifestFile{}, fmt.Errorf("extents %s: %w", file.Path, err)
+	}
+	// Verify the source still matches the digest recorded at pause time
+	// before any bytes ship. Data extents are read twice (verify, then
+	// upload); at tens of MB per artifact the second pass is page-cache
+	// warm. A residual race remains between this check and the upload
+	// completing; a mutated upload in that window fails restore-side
+	// digest verification and the generation is simply unusable, never
+	// silently wrong.
+	sum, err := hashApparent(ctx, f, extents, apparent)
+	if err != nil {
+		return ManifestFile{}, fmt.Errorf("verify %s: %w", file.Path, err)
+	}
+	if sum != file.SHA256 {
+		u.Log.Warn().Str("path", file.Path).Str("want", file.SHA256).Str("got", sum).
+			Msg("backup source changed since pause; abandoning generation")
+		return ManifestFile{}, errSourceChanged
 	}
 	object, err := SandboxObject(task.SandboxID, task.Generation, file.Name)
 	if err != nil {
@@ -171,6 +204,43 @@ func (u *Uploader) uploadFile(ctx context.Context, task Task, file TaskFile) (Ma
 		PackedSize: PackedSize(extents),
 		Extents:    extents,
 	}, nil
+}
+
+// hashApparent digests the file's full apparent content from its extent
+// table: data extents from disk, holes as zeros without touching disk.
+// This must equal the pause manifest's digest, and restore recomputes the
+// same thing after rebuilding the sparse file.
+func hashApparent(ctx context.Context, f *os.File, extents []Extent, apparent int64) (string, error) {
+	h := sha256.New()
+	zeros := make([]byte, 1<<20)
+	var pos int64
+	writeZeros := func(upTo int64) error {
+		for pos < upTo {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			n := upTo - pos
+			if n > int64(len(zeros)) {
+				n = int64(len(zeros))
+			}
+			h.Write(zeros[:n])
+			pos += n
+		}
+		return nil
+	}
+	for _, e := range extents {
+		if err := writeZeros(e.Offset); err != nil {
+			return "", err
+		}
+		if _, err := io.Copy(h, io.NewSectionReader(f, e.Offset, e.Length)); err != nil {
+			return "", err
+		}
+		pos = e.Offset + e.Length
+	}
+	if err := writeZeros(apparent); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // limitedReader applies the bandwidth cap per read. A nil limiter means

@@ -75,9 +75,10 @@ func (t *Task) key() []byte {
 	return []byte(fmt.Sprintf("%d/%020d/%s", t.Priority, t.EnqueuedAt.UnixNano(), t.Generation))
 }
 
-// Enqueue adds a task; re-enqueueing the same generation at the same
-// priority is a no-op if it is already pending (the content address makes
-// duplicates harmless anyway).
+// Enqueue adds a task. A task for the same generation that is already
+// pending is not enqueued again: content addressing makes the duplicate
+// upload harmless, but there is no reason to do the work twice (idempotent
+// pause retries re-enqueue the identical generation).
 func (j *Journal) Enqueue(task Task) error {
 	if task.Generation == "" || task.SandboxID == "" {
 		return fmt.Errorf("task missing identity: %+v", task)
@@ -90,32 +91,66 @@ func (j *Journal) Enqueue(task Task) error {
 		return err
 	}
 	return j.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(journalBucket).Put(task.key(), val)
+		b := tx.Bucket(journalBucket)
+		duplicate := false
+		_ = b.ForEach(func(_, v []byte) error {
+			var t Task
+			if json.Unmarshal(v, &t) == nil && t.Generation == task.Generation && t.SandboxID == task.SandboxID {
+				duplicate = true
+			}
+			return nil
+		})
+		if duplicate {
+			return nil
+		}
+		return b.Put(task.key(), val)
 	})
 }
 
 // Next returns the highest-priority runnable task (NotBefore in the past),
-// or ok=false when the queue has nothing runnable.
+// or ok=false when the queue has nothing runnable. A corrupt entry must
+// never wedge the queue: it is deleted (self-healing) rather than surfaced
+// as a permanent error, and the scan continues past it.
 func (j *Journal) Next(now time.Time) (Task, bool, error) {
 	var task Task
+	var corrupt [][]byte
 	found := false
 	err := j.db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(journalBucket).Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			var t Task
 			if err := json.Unmarshal(v, &t); err != nil {
-				return fmt.Errorf("corrupt journal entry %q: %w", k, err)
+				corrupt = append(corrupt, append([]byte(nil), k...))
+				continue
 			}
 			if t.NotBefore.After(now) {
 				continue
 			}
-			task = t
-			found = true
-			return nil
+			if !found {
+				task = t
+				found = true
+			}
 		}
 		return nil
 	})
-	return task, found, err
+	if err != nil {
+		return Task{}, false, err
+	}
+	if len(corrupt) > 0 {
+		err = j.db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket(journalBucket)
+			for _, k := range corrupt {
+				if derr := b.Delete(k); derr != nil {
+					return derr
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return Task{}, false, fmt.Errorf("drop corrupt journal entries: %w", err)
+		}
+	}
+	return task, found, nil
 }
 
 // Ack removes a completed task. Called only after every object of the
@@ -154,10 +189,10 @@ func (j *Journal) Nack(task Task, now time.Time) error {
 func (j *Journal) Pending() (map[Priority]int, error) {
 	counts := map[Priority]int{}
 	err := j.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(journalBucket).ForEach(func(k, v []byte) error {
+		return tx.Bucket(journalBucket).ForEach(func(_, v []byte) error {
 			var t Task
 			if err := json.Unmarshal(v, &t); err != nil {
-				return fmt.Errorf("corrupt journal entry %q: %w", k, err)
+				return nil // corrupt entries are dropped by Next, not counted
 			}
 			counts[t.Priority]++
 			return nil

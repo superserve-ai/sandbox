@@ -21,16 +21,12 @@ func Extents(f *os.File) ([]Extent, int64, error) {
 	return []Extent{{Offset: 0, Length: fi.Size()}}, fi.Size(), nil
 }
 
-// NewPackedReader on non-linux platforms reads the extents via ReadAt like
-// the linux implementation; with the single-extent table above it is a plain
-// sequential read.
+// NewPackedReader streams the given extents in order via section readers,
+// honoring arbitrary extent tables so behavior matches linux exactly.
 func NewPackedReader(f *os.File, extents []Extent) io.Reader {
-	if len(extents) == 0 {
-		return emptyReader{}
+	readers := make([]io.Reader, 0, len(extents))
+	for _, e := range extents {
+		readers = append(readers, io.NewSectionReader(f, e.Offset, e.Length))
 	}
-	return io.NewSectionReader(f, extents[0].Offset, extents[0].Length)
+	return io.MultiReader(readers...)
 }
-
-type emptyReader struct{}
-
-func (emptyReader) Read([]byte) (int, error) { return 0, io.EOF }
