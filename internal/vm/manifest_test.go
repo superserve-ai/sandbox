@@ -154,3 +154,25 @@ func TestCollectPauseManifestBindsBaseContents(t *testing.T) {
 		}
 	}
 }
+
+// A caller joining (or starting) a base hash must honor its own budget:
+// an exhausted context returns promptly instead of riding the flight's
+// longer budget past the pause RPC deadline.
+func TestBaseDigestHonorsCallerContext(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(base, []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if _, err := baseDigest(ctx, base); err == nil {
+		// A cache hit from an earlier test sharing the same identity is
+		// impossible: the path is unique per t.TempDir.
+		t.Fatal("baseDigest succeeded under a canceled context")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("baseDigest blocked %v under a canceled context", elapsed)
+	}
+}

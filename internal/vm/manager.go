@@ -970,6 +970,13 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
 	} else {
 		log.Warn().Msg("pause backup skipped: unit not confirmed stopped, bytes may still be changing")
+		// The pause still owes its backup. Leave a pending marker: the
+		// periodic sweep retries it, and its at-rest proof passes once
+		// the reconciler reclaims the straggler unit.
+		m.persistPendingBackup(PendingBackup{
+			VMID: vmID, SnapshotPath: snapshotPath, DiskPath: diskPath, DiskBasePath: diskBasePath,
+			Token: newPendingToken(),
+		}, log)
 	}
 
 	log.Info().Msg("VM paused")

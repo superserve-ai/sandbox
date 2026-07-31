@@ -115,6 +115,11 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		return
 	}
 	defer m.pendingInFlight.Delete(pb.VMID)
+	// First act: make the record durable. The launching pause's persist
+	// can have failed, and a crash before the first keep-path would then
+	// leave no trace; healing here shrinks the undurable window to this
+	// line instead of the whole hash.
+	m.healPendingBackup(pb, log)
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 	defer cancel()
 	// Superseded (the instance is no longer paused on this snapshot)
@@ -238,6 +243,7 @@ func fileMissing(path string) bool {
 // catches divergence). Bounded backoff; a journal that keeps failing
 // leaves the pending record for the next boot's recovery.
 func (m *Manager) retryEnqueue(pb PendingBackup, manifest []ManifestEntry, log zerolog.Logger) {
+	m.healPendingBackup(pb, log)
 	delay := time.Second
 	for attempt := 0; attempt < enqueueRetryAttempts; attempt++ {
 		time.Sleep(delay)

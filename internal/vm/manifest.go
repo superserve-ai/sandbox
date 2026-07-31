@@ -169,11 +169,19 @@ func baseDigest(ctx context.Context, path string) (string, error) {
 	if v, ok := baseDigestCache.Load(key); ok {
 		return v.(string), nil
 	}
-	v, err, _ := baseDigestGroup.Do(key, func() (any, error) {
+	// DoChan rather than Do: a joiner must honor its own hash budget. A
+	// synchronous pause joining a hash started under the async rehash's
+	// ten-minute budget would otherwise block far past the pause RPC
+	// deadline. The in-flight hash keeps running for callers that can
+	// still use it; this caller just degrades to an incomplete manifest,
+	// which the retry path owns.
+	ch := baseDigestGroup.DoChan(key, func() (any, error) {
 		if v, ok := baseDigestCache.Load(key); ok {
 			return v.(string), nil
 		}
-		sum, _, err := hashFile(ctx, path)
+		hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
+		defer cancel()
+		sum, _, err := hashFile(hctx, path)
 		if err != nil {
 			return "", err
 		}
@@ -187,10 +195,15 @@ func baseDigest(ctx context.Context, path string) (string, error) {
 		baseDigestCache.Store(key, sum)
 		return sum, nil
 	})
-	if err != nil {
-		return "", err
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return "", res.Err
+		}
+		return res.Val.(string), nil
+	case <-ctx.Done():
+		return "", ctx.Err()
 	}
-	return v.(string), nil
 }
 
 func baseIdentity(path string) (string, error) {
