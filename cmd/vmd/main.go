@@ -493,10 +493,12 @@ func main() {
 		if mbps <= 0 {
 			mbps = 100
 		}
+		// Megabits per second, as the name says: 1 Mbit/s = 125000 B/s.
+		bytesPerSec := rate.Limit(mbps) * 125000
 		uploader := &backup.Uploader{
 			Journal:    journal,
 			Store:      backup.NewGCSStore(gcsClient, bucket),
-			Limiter:    rate.NewLimiter(rate.Limit(mbps)*1024*1024, 32<<20),
+			Limiter:    rate.NewLimiter(bytesPerSec, 32<<20),
 			Log:        log.With().Str("component", "backup").Logger(),
 			VMDVersion: os.Getenv("SENTRY_RELEASE"),
 		}

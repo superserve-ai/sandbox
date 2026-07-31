@@ -1114,3 +1114,27 @@ func TestEnqueueDedupeUpgradesPaths(t *testing.T) {
 		t.Fatalf("queued path = %s, want the staged upgrade", got.Files[0].Path)
 	}
 }
+
+// Clone-only staging on a filesystem without reflink support degrades
+// cleanly: nothing staged, original paths untouched, no error.
+func TestStageTaskCloneFallsBackWithoutReflink(t *testing.T) {
+	dir := t.TempDir()
+	orig := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(orig, []byte("bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := Task{SandboxID: "sb", Generation: "gen",
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: orig, SHA256: "aa"}}}
+	all, err := StageTaskClone(filepath.Join(dir, "staging"), &task)
+	if err != nil {
+		t.Fatalf("clone-only staging errored: %v", err)
+	}
+	// This test tree may or may not sit on a reflink filesystem; either
+	// every file staged or none did, and unstaged files keep originals.
+	if !all && task.Files[0].Path != orig {
+		t.Fatalf("unstaged file path rewritten to %s", task.Files[0].Path)
+	}
+	if all && task.Files[0].Path == orig {
+		t.Fatal("allStaged reported but path not rewritten")
+	}
+}

@@ -360,8 +360,20 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		}
 		next := *task
 		next.VerifiedObjects = verified
-		if err := u.Journal.RecordVerification(next, object, time.Now()); err != nil {
-			return ManifestFile{}, fmt.Errorf("record verification of %s: %w", object, err)
+		// The object is finalized and stream-verified; losing this write
+		// would make the retry see an unverified dedupe and abandon a
+		// generation whose bytes are provably good. Retry the record a
+		// few times before surrendering to the Nack: if BoltDB stays
+		// down, the whole pipeline is down with it anyway.
+		var recErr error
+		for attempt, delay := 0, 100*time.Millisecond; attempt < 3; attempt, delay = attempt+1, delay*2 {
+			if recErr = u.Journal.RecordVerification(next, object, u.clock()); recErr == nil {
+				break
+			}
+			time.Sleep(delay)
+		}
+		if recErr != nil {
+			return ManifestFile{}, fmt.Errorf("record verification of %s: %w", object, recErr)
 		}
 		task.VerifiedObjects = verified
 	} else if file.Shared {

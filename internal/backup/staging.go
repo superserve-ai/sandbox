@@ -26,27 +26,47 @@ import (
 // and is reused (which also covers re-enqueues after the originals are
 // gone).
 func StageTask(root string, task *Task) error {
+	_, err := stageTask(root, task, false)
+	return err
+}
+
+// StageTaskClone stages with reflink clones only, skipping the byte-copy
+// fallback: cheap enough to run inline under the pause operation lock,
+// where quiescence is guaranteed and no at-rest proof is needed. Returns
+// whether EVERY file (bases included) was staged; partially staged tasks
+// keep original paths for the unstaged files and the caller falls back
+// to the off-lock worker for those.
+func StageTaskClone(root string, task *Task) (bool, error) {
+	return stageTask(root, task, true)
+}
+
+func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 	if root == "" {
-		return nil
+		return false, nil
 	}
+	all := true
 	dir := filepath.Join(root, task.SandboxID, task.Generation)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+		return false, err
 	}
 	// Make the directory chain itself durable: the rename fsync below
 	// covers entries in dir, not dir's own existence.
 	if err := syncDir(filepath.Join(root, task.SandboxID)); err != nil {
-		return err
+		return false, err
 	}
 	if err := syncDir(root); err != nil {
-		return err
+		return false, err
 	}
 	for i, f := range task.Files {
 		staged := filepath.Join(dir, f.Name)
 		if _, err := os.Stat(staged); err == nil {
 			task.Files[i].Path = staged
-		} else if err := snapshotFile(staged, f.Path); err != nil {
-			return fmt.Errorf("stage %s: %w", f.Name, err)
+		} else if err := snapshotFileMode(staged, f.Path, cloneOnly); err != nil {
+			if cloneOnly {
+				all = false
+			} else {
+				return false, fmt.Errorf("stage %s: %w", f.Name, err)
+			}
 		} else {
 			task.Files[i].Path = staged
 		}
@@ -58,21 +78,62 @@ func StageTask(root string, task *Task) error {
 		if f.BaseSHA256 != "" && f.BasePath != "" {
 			basesDir := filepath.Join(root, "bases")
 			if err := os.MkdirAll(basesDir, 0o700); err != nil {
-				return err
+				return false, err
 			}
 			stagedBase := filepath.Join(basesDir, f.BaseSHA256)
 			if _, err := os.Stat(stagedBase); err != nil {
-				if err := snapshotFile(stagedBase, f.BasePath); err != nil {
-					return fmt.Errorf("stage base %s: %w", f.BaseSHA256, err)
+				if err := snapshotFileMode(stagedBase, f.BasePath, cloneOnly); err != nil {
+					if cloneOnly {
+						all = false
+						continue
+					}
+					return false, fmt.Errorf("stage base %s: %w", f.BaseSHA256, err)
 				}
 				if err := syncDir(basesDir); err != nil {
-					return err
+					return false, err
 				}
 			}
 			task.Files[i].BasePath = stagedBase
 		}
 	}
-	return nil
+	return all, nil
+}
+
+// snapshotFileMode is snapshotFile with an optional clone-only mode
+// that fails fast instead of copying bytes.
+func snapshotFileMode(dst, src string, cloneOnly bool) error {
+	if !cloneOnly {
+		return snapshotFile(dst, src)
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := cloneFile(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return syncDir(filepath.Dir(dst))
 }
 
 // snapshotFile copies src to dst preserving sparseness, via reflink

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -79,6 +80,17 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
 	m.persistPendingBackup(pb, log)
 	if pauseManifestComplete(manifest) {
+		// Clone-staging runs inline: PauseVM still holds the VM op lock,
+		// so nothing can resume and no at-rest proof is needed, and a
+		// reflink costs microseconds. Only the byte-copy fallback (non
+		// reflink filesystems) defers to the worker; a destroy racing
+		// that worker is the residual, and only on such filesystems.
+		if m.backupStaging != "" {
+			t := rebuildTask(vmID, manifest)
+			if all, err := backup.StageTaskClone(m.backupStaging, &t); err == nil && all {
+				manifest = manifestWithTaskPaths(manifest, t)
+			}
+		}
 		go m.finishPauseEnqueue(pb, manifest, log)
 		return manifest
 	}
@@ -188,8 +200,17 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		m.healPendingBackup(pb, log)
 		return
 	}
-	if ok, _ := m.enqueueBackup(pb.VMID, retried); ok {
-		m.deletePendingBackupIf(pb, log)
+	if ok, staged := m.enqueueBackup(pb.VMID, retried); ok {
+		if staged {
+			m.deletePendingBackupIf(pb, log)
+			return
+		}
+		// Journaled from mutable paths (staging failed even at rest):
+		// the marker stays so a later sweep can upgrade the queued
+		// entry, exactly like the pause path's unstaged handoff.
+		log.Warn().Str("vm_id", pb.VMID).
+			Msg("rehash enqueued unstaged; keeping marker for staging upgrade")
+		m.healPendingBackup(pb, log)
 		return
 	}
 	if !pauseManifestComplete(retried) {
@@ -542,7 +563,12 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) (bool, bo
 	// With staging disabled there is nothing to upgrade later: the
 	// original paths ARE the handoff, as before staging existed.
 	staged := m.backupStaging == ""
-	if m.backupStaging != "" {
+	if m.backupStaging != "" && taskFullyStaged(m.backupStaging, task) {
+		// Already snapshotted (inline clone under the pause op lock, or
+		// a re-enqueue of staged paths): nothing mutable remains, so no
+		// at-rest proof is needed.
+		staged = true
+	} else if m.backupStaging != "" {
 		snapPath, diskPath := "", ""
 		for _, f := range task.Files {
 			switch f.Name {
@@ -575,6 +601,40 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) (bool, bo
 		return false, false
 	}
 	return true, staged
+}
+
+// manifestWithTaskPaths mirrors a staged task's rewritten paths back
+// onto the manifest entries, so downstream enqueue rebuilds see the
+// staged locations.
+func manifestWithTaskPaths(manifest []ManifestEntry, task backup.Task) []ManifestEntry {
+	byName := map[string]backup.TaskFile{}
+	for _, f := range task.Files {
+		byName[f.Name] = f
+	}
+	out := make([]ManifestEntry, len(manifest))
+	copy(out, manifest)
+	for i, e := range out {
+		if f, ok := byName[e.FileName]; ok {
+			out[i].Path = f.Path
+			out[i].BasePath = f.BasePath
+		}
+	}
+	return out
+}
+
+// taskFullyStaged reports whether every task path (bases included)
+// already lives under the staging root.
+func taskFullyStaged(root string, task backup.Task) bool {
+	prefix := root + string(os.PathSeparator)
+	for _, f := range task.Files {
+		if !strings.HasPrefix(f.Path, prefix) {
+			return false
+		}
+		if f.BasePath != "" && !strings.HasPrefix(f.BasePath, prefix) {
+			return false
+		}
+	}
+	return len(task.Files) > 0
 }
 
 // rebuildTask reconstructs the enqueue task from the manifest with its
