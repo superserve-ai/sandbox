@@ -67,9 +67,23 @@ func pauseManifestComplete(manifest []ManifestEntry) bool {
 // and the uploader's pre-verification abandons that generation, which is
 // the same safe outcome as any mutated source.
 func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath, diskBasePath string, log zerolog.Logger) []ManifestEntry {
+	// Pin the base identity BEFORE hashing: the marker must carry the
+	// pre-hash identity, or a base swapped during the hash is laundered
+	// into the record as the legitimate dependency.
+	pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
 	manifest := collectPauseManifest(ctx, snapshotPath, diskPath, diskBasePath, log)
 	if m.backupEnqueue == nil {
 		return manifest
+	}
+	if diskBasePath != "" {
+		if cur, err := baseIdentity(diskBasePath); err != nil || cur != pb.BaseIdentity {
+			// The hashed base cannot be proven to be the pause-time one:
+			// strip the disk entry so the manifest is incomplete and the
+			// rehash path (which re-pins and re-proves) owns it.
+			log.Warn().Err(err).Str("vm_id", vmID).
+				Msg("base identity changed across pause hash; deferring to rehash")
+			manifest = withoutDiskEntry(manifest)
+		}
 	}
 	// The RPC path stops at a millisecond marker write: staging copies
 	// artifact bytes when reflink is unavailable, and neither that nor
@@ -77,7 +91,6 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	// already spent its budget. The marker is the durable intent; the
 	// detached worker stages, enqueues, and clears it, and a crash in
 	// between leaves the marker for startup recovery.
-	pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
 	m.persistPendingBackup(pb, log)
 	if pauseManifestComplete(manifest) {
 		// Clone-staging runs inline: PauseVM still holds the VM op lock,
@@ -179,6 +192,26 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		}
 	}
 	retried := collectPauseManifest(rctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, log)
+	if pb.DiskBasePath != "" {
+		// Re-check AFTER hashing too: the disk hash can run for minutes,
+		// and a base swapped inside that window would have been stat'ed
+		// fresh and recorded as the dependency, which the uploader
+		// cannot catch (the recorded digest matches the new base's
+		// bytes). The pre-hash check alone leaves that window open.
+		cur, err := baseIdentity(pb.DiskBasePath)
+		if err != nil {
+			log.Warn().Err(err).Str("vm_id", pb.VMID).
+				Msg("pause backup rehash inconclusive: base identity unreadable after hash; keeping pending record")
+			m.healPendingBackup(pb, log)
+			return
+		}
+		if cur != pb.BaseIdentity {
+			log.Error().Str("vm_id", pb.VMID).
+				Msg("pause backup dropped: base replaced during rehash")
+			m.deletePendingBackupIf(pb, log)
+			return
+		}
+	}
 	if v := m.pendingVerdict(pb.VMID, pb.SnapshotPath); v != pendingEligible {
 		if v == pendingInconclusive {
 			log.Warn().Str("vm_id", pb.VMID).
@@ -315,7 +348,14 @@ func fileMissing(path string) bool {
 // a destroy racing the instants before staging lands surfaces as a
 // vanished source and the marker clears as superseded on a later sweep.
 func (m *Manager) finishPauseEnqueue(pb PendingBackup, manifest []ManifestEntry, log zerolog.Logger) {
+	// Same single-worker-per-VM guard as the rehash: a sweep worker for
+	// this VM racing us would double-stage and double-enqueue; heal
+	// first so a busy exit still leaves the durable marker.
 	m.healPendingBackup(pb, log)
+	if _, busy := m.pendingInFlight.LoadOrStore(pb.VMID, struct{}{}); busy {
+		return
+	}
+	defer m.pendingInFlight.Delete(pb.VMID)
 	ok, staged := m.enqueueBackup(pb.VMID, manifest)
 	if ok {
 		if staged {
@@ -347,8 +387,16 @@ func (m *Manager) retryEnqueue(pb PendingBackup, manifest []ManifestEntry, log z
 	for attempt := 0; attempt < enqueueRetryAttempts; attempt++ {
 		time.Sleep(delay)
 		delay *= 2
-		if ok, _ := m.enqueueBackup(pb.VMID, manifest); ok {
-			m.deletePendingBackupIf(pb, log)
+		if ok, staged := m.enqueueBackup(pb.VMID, manifest); ok {
+			if staged {
+				m.deletePendingBackupIf(pb, log)
+				return
+			}
+			// Journaled but from mutable paths: keep the marker so the
+			// sweep can upgrade the queued row, like every other path.
+			log.Warn().Str("vm_id", pb.VMID).
+				Msg("retry enqueued unstaged; keeping marker for staging upgrade")
+			m.healPendingBackup(pb, log)
 			return
 		}
 	}
@@ -366,15 +414,6 @@ func (m *Manager) persistPendingBackup(pb PendingBackup, log zerolog.Logger) {
 	}
 	if err := m.state.PutPendingBackup(pb); err != nil {
 		log.Error().Err(err).Str("vm_id", pb.VMID).Msg("persist pending backup failed")
-	}
-}
-
-func (m *Manager) deletePendingBackup(vmID string, log zerolog.Logger) {
-	if m.state == nil {
-		return
-	}
-	if err := m.state.DeletePendingBackup(vmID); err != nil {
-		log.Error().Err(err).Str("vm_id", vmID).Msg("clear pending backup failed")
 	}
 }
 
@@ -579,14 +618,14 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) (bool, bo
 			}
 		}
 		before, statErr := os.Stat(diskPath)
-		if statErr == nil && m.atRest(context.Background(), vmID, snapPath) {
+		if statErr == nil && m.atRest(probeCtx(), vmID, snapPath) {
 			if err := backup.StageTask(m.backupStaging, &task); err != nil {
 				m.log.Warn().Err(err).Str("vm_id", vmID).
 					Msg("backup staging failed; uploading from original paths")
 			} else if after, err := os.Stat(diskPath); err == nil &&
 				os.SameFile(before, after) &&
 				before.ModTime().Equal(after.ModTime()) && before.Size() == after.Size() &&
-				m.atRest(context.Background(), vmID, snapPath) {
+				m.atRest(probeCtx(), vmID, snapPath) {
 				staged = true
 			} else {
 				m.log.Warn().Str("vm_id", vmID).
@@ -595,12 +634,34 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) (bool, bo
 			}
 		}
 	}
+	task.Staged = staged && m.backupStaging != ""
 	if err := m.backupEnqueue(task); err != nil {
 		m.log.Error().Err(err).Str("vm_id", vmID).
 			Msg("backup enqueue failed; pause not journaled")
 		return false, false
 	}
 	return true, staged
+}
+
+// probeCtx bounds a systemd liveness probe: these run on detached
+// workers whose own contexts are generous, and an unresponsive systemd
+// must fail the probe (inconclusive) rather than hang the worker.
+func probeCtx() context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = cancel // bounded by the deadline; the probe is short-lived
+	return ctx
+}
+
+// withoutDiskEntry strips the rootfs entry, rendering the manifest
+// incomplete so the retry machinery owns the pause.
+func withoutDiskEntry(manifest []ManifestEntry) []ManifestEntry {
+	out := manifest[:0:0]
+	for _, e := range manifest {
+		if e.FileName != "rootfs.ext4" {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // manifestWithTaskPaths mirrors a staged task's rewritten paths back

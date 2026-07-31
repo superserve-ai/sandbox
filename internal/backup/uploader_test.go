@@ -485,10 +485,17 @@ func TestJournalSameContentSandboxesDoNotCollide(t *testing.T) {
 func TestJournalPruneSweepsHistoryAcrossAcks(t *testing.T) {
 	j, _ := testJournal(t)
 	old := time.Now().Add(-30 * 24 * time.Hour)
-	for i := 0; i < 200; i++ {
-		if err := j.MarkVerified(fmt.Sprintf("sandboxes/sb/gen/obj-%03d", i), old); err != nil {
-			t.Fatal(err)
+	if err := j.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(verifiedBucket)
+		for i := 0; i < 200; i++ {
+			if err := b.Put([]byte(fmt.Sprintf("sandboxes/sb/gen/obj-%03d", i)),
+				[]byte(fmt.Sprintf("%d", old.UnixNano()))); err != nil {
+				return err
+			}
 		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	// Each ack examines a bounded slice; successive acks sweep the rest.
 	task := Task{SandboxID: "sb", Generation: "g", Priority: PriorityPause,
@@ -1102,6 +1109,7 @@ func TestEnqueueDedupeUpgradesPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	staged := orig
+	staged.Staged = true
 	staged.Files = []TaskFile{{Name: "rootfs.ext4", Path: "/staging/sb/gen/rootfs.ext4", SHA256: "aa"}}
 	if err := j.Enqueue(staged); err != nil {
 		t.Fatal(err)
@@ -1110,8 +1118,17 @@ func TestEnqueueDedupeUpgradesPaths(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Next = %v/%v", ok, err)
 	}
-	if got.Files[0].Path != "/staging/sb/gen/rootfs.ext4" {
-		t.Fatalf("queued path = %s, want the staged upgrade", got.Files[0].Path)
+	if got.Files[0].Path != "/staging/sb/gen/rootfs.ext4" || !got.Staged {
+		t.Fatalf("queued task = %+v, want the staged upgrade", got)
+	}
+	// The upgrade is one-way: a later mutable-path enqueue of the same
+	// generation must not downgrade the staged row.
+	if err := j.Enqueue(orig); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err = j.Next(base.Add(time.Minute))
+	if err != nil || !ok || got.Files[0].Path != "/staging/sb/gen/rootfs.ext4" {
+		t.Fatalf("staged row downgraded: %+v", got)
 	}
 }
 

@@ -3,6 +3,7 @@ package backup
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -63,6 +64,10 @@ type Task struct {
 	// crash between finalize and verification, so the generation is
 	// abandoned rather than completed over unverifiable bytes.
 	VerifiedObjects []string `json:"verified_objects,omitempty"`
+	// Staged records that every file path (bases included) points into
+	// the uploader-owned staging tree; the dedupe upgrade in Enqueue is
+	// one-way toward staged.
+	Staged bool `json:"staged,omitempty"`
 }
 
 // HasVerified reports whether this task already verified object.
@@ -190,12 +195,23 @@ func (j *Journal) Enqueue(task Task) error {
 				// mutable original paths (staging proof failed on the
 				// pause path) and a later at-rest retry the staged ones.
 				// The generation is content-addressed, so the digests are
-				// identical either way; adopting the newer paths makes
-				// the queued upload survive teardown. Scheduling state
-				// (attempts, NotBefore, position) stays with the row.
+				// identical either way; adopting the STAGED paths makes
+				// the queued upload survive teardown, and the guard is
+				// one-way so a later mutable-path enqueue never
+				// downgrades a staged row. Scheduling state (attempts,
+				// NotBefore, position) stays with the row.
 				var cur Task
-				if json.Unmarshal(existing, &cur) == nil {
+				if err := json.Unmarshal(existing, &cur); err != nil {
+					// An undecodable row must not swallow the incoming
+					// task as a silent dedupe: replace it.
+					if err := queue.Put(qk, val); err != nil {
+						return err
+					}
+					return idx.Put(task.indexKey(), qk)
+				}
+				if task.Staged && !cur.Staged {
 					cur.Files = task.Files
+					cur.Staged = true
 					upgraded, err := json.Marshal(cur)
 					if err != nil {
 						return err
@@ -250,7 +266,16 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 	if len(corrupt) > 0 {
 		err = j.db.Update(func(tx *bolt.Tx) error {
 			b := tx.Bucket(journalBucket)
+			idx := tx.Bucket(indexBucket)
 			for _, k := range corrupt {
+				// The key embeds priority/readyAt/sandbox/generation;
+				// the dangling index entry would otherwise pin staged
+				// files (HasPending true) forever.
+				if parts := strings.SplitN(string(k), "/", 4); len(parts) == 4 {
+					if derr := idx.Delete([]byte(parts[2] + "\x00" + parts[3])); derr != nil {
+						return derr
+					}
+				}
 				if derr := b.Delete(k); derr != nil {
 					return derr
 				}
@@ -264,27 +289,6 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 	return task, found, nil
 }
 
-// Update rewrites a pending task in place (same key: identity fields are
-// immutable). Used to persist per-object verification progress so a retry
-// after a crash knows which deduped objects it may trust.
-func (j *Journal) Update(task Task) error {
-	val, err := json.Marshal(task)
-	if err != nil {
-		return err
-	}
-	return j.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(journalBucket).Put(task.key(), val)
-	})
-}
-
-// MarkVerified durably records that an object's streamed bytes were
-// digest-verified, surviving task completion.
-func (j *Journal) MarkVerified(object string, now time.Time) error {
-	return j.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
-	})
-}
-
 // RecordVerification persists BOTH verification records in one
 // transaction: the task's own progress (survives nacks) and the durable
 // history (survives acks). Atomicity is the point: a crash between two
@@ -292,12 +296,14 @@ func (j *Journal) MarkVerified(object string, now time.Time) error {
 // history never learns of the object, silently degrading later unchanged
 // re-pauses to abandonment.
 func (j *Journal) RecordVerification(task Task, object string, now time.Time) error {
-	val, err := json.Marshal(task)
-	if err != nil {
-		return err
-	}
 	return j.db.Update(func(tx *bolt.Tx) error {
-		if err := tx.Bucket(journalBucket).Put(task.key(), val); err != nil {
+		b := tx.Bucket(journalBucket)
+		mergeRow(b.Get(task.key()), &task)
+		val, err := json.Marshal(task)
+		if err != nil {
+			return err
+		}
+		if err := b.Put(task.key(), val); err != nil {
 			return err
 		}
 		return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
@@ -322,6 +328,29 @@ func (j *Journal) PendingBaseSHAs() (map[string]bool, error) {
 		})
 	})
 	return out, err
+}
+
+// Load returns the current stored row for a task's identity, if any:
+// the abandonment path re-reads it so a concurrent staged upgrade is
+// retried from its snapshots instead of being acked away.
+func (j *Journal) Load(task Task) (Task, bool, error) {
+	var cur Task
+	found := false
+	err := j.db.View(func(tx *bolt.Tx) error {
+		qk := tx.Bucket(indexBucket).Get(task.indexKey())
+		if qk == nil {
+			return nil
+		}
+		v := tx.Bucket(journalBucket).Get(qk)
+		if v == nil {
+			return nil
+		}
+		if json.Unmarshal(v, &cur) == nil {
+			found = true
+		}
+		return nil
+	})
+	return cur, found, err
 }
 
 // HasPending reports whether a task for this generation is still queued.
@@ -423,7 +452,12 @@ func (j *Journal) Ack(task Task, notify bool) error {
 }
 
 // Nack records a failed attempt and reschedules with exponential backoff
-// (capped), keeping the task durable for retry across restarts.
+// (capped), keeping the task durable for retry across restarts. The
+// stored row is the authority for Files, Staged, and accumulated
+// verification: a concurrent dedupe may have upgraded the row's paths
+// to staged snapshots while this attempt ran on the pre-upgrade copy,
+// and persisting the caller's snapshot verbatim would silently undo the
+// upgrade after its marker was already cleared.
 func (j *Journal) Nack(task Task, now time.Time) error {
 	old := task.key()
 	task.Attempts++
@@ -433,12 +467,13 @@ func (j *Journal) Nack(task Task, now time.Time) error {
 		backoff = maxBackoff
 	}
 	task.NotBefore = now.Add(backoff)
-	val, err := json.Marshal(task)
-	if err != nil {
-		return err
-	}
 	return j.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(journalBucket)
+		mergeRow(b.Get(old), &task)
+		val, err := json.Marshal(task)
+		if err != nil {
+			return err
+		}
 		if err := b.Delete(old); err != nil {
 			return err
 		}
@@ -448,6 +483,32 @@ func (j *Journal) Nack(task Task, now time.Time) error {
 		// The deferral re-keyed the row; the dedupe index must follow.
 		return tx.Bucket(indexBucket).Put(task.indexKey(), task.key())
 	})
+}
+
+// mergeRow folds the stored row's authoritative fields into the
+// caller's task snapshot: Files and Staged always come from the row
+// when it holds a staged upgrade, and verification history is unioned.
+func mergeRow(existing []byte, task *Task) {
+	if existing == nil {
+		return
+	}
+	var cur Task
+	if json.Unmarshal(existing, &cur) != nil {
+		return
+	}
+	if cur.Staged && !task.Staged {
+		task.Files = cur.Files
+		task.Staged = true
+	}
+	seen := make(map[string]bool, len(task.VerifiedObjects))
+	for _, o := range task.VerifiedObjects {
+		seen[o] = true
+	}
+	for _, o := range cur.VerifiedObjects {
+		if !seen[o] {
+			task.VerifiedObjects = append(task.VerifiedObjects, o)
+		}
+	}
 }
 
 // Pending reports queue depth per priority, the uploader's lag gauge.

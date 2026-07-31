@@ -636,13 +636,6 @@ func (s *StateStore) PutPendingBackup(p PendingBackup) error {
 	})
 }
 
-// DeletePendingBackup clears a pause's owed-backup marker.
-func (s *StateStore) DeletePendingBackup(vmID string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(pendingBackupBucketName).Delete([]byte(vmID))
-	})
-}
-
 // PutPendingBackupIfOwner writes the marker when the slot is empty,
 // owned by the same token, or owned by an OLDER token (tokens are
 // fixed-width creation-ordered): healing re-persists a record to repair

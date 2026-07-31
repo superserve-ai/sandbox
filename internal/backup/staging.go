@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/singleflight"
 )
 
 // StageTask snapshots a task's artifact files into the uploader-owned
@@ -99,22 +100,39 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 	return all, nil
 }
 
+// stagingFlights serializes concurrent writers of one staged
+// destination: two VMs pausing on the same template base would otherwise
+// race multi-GB copies of bases/<sha>, and a shared fixed temp name
+// would let one writer truncate the other mid-copy and publish a torn
+// file under a name that is never re-staged.
+var stagingFlights singleflight.Group
+
 // snapshotFileMode is snapshotFile with an optional clone-only mode
 // that fails fast instead of copying bytes.
 func snapshotFileMode(dst, src string, cloneOnly bool) error {
-	if !cloneOnly {
-		return snapshotFile(dst, src)
-	}
+	_, err, _ := stagingFlights.Do(dst, func() (any, error) {
+		if _, err := os.Stat(dst); err == nil {
+			return nil, nil // a concurrent flight already published it
+		}
+		if cloneOnly {
+			return nil, snapshotClone(dst, src)
+		}
+		return nil, snapshotFile(dst, src)
+	})
+	return err
+}
+
+func snapshotClone(dst, src string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	tmp := dst + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	out, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp*")
 	if err != nil {
 		return err
 	}
+	tmp := out.Name()
 	if err := cloneFile(out, in); err != nil {
 		out.Close()
 		os.Remove(tmp)
@@ -149,11 +167,11 @@ func snapshotFile(dst, src string) error {
 	if err != nil {
 		return err
 	}
-	tmp := dst + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	out, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp*")
 	if err != nil {
 		return err
 	}
+	tmp := out.Name()
 	if err := cloneFile(out, in); err != nil {
 		extents, _, xerr := Extents(in)
 		if xerr != nil {

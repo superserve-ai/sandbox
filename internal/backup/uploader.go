@@ -95,6 +95,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 	// Deliver completion signals a previous process acked but never
 	// notified: the outbox is the only record of those.
 	u.flushNotifications()
+	lastSweep := u.clock()
 	for {
 		// Checked every iteration: a successful Nack after a canceled
 		// upload returns (worked, nil), and without this check a queued
@@ -103,7 +104,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		worked, err := u.drainOne(ctx, time.Now())
+		worked, err := u.drainOne(ctx, u.clock())
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -123,6 +124,14 @@ func (u *Uploader) Run(ctx context.Context) error {
 			// race with a crash) would otherwise wait for the next ack,
 			// which on an idle host never comes.
 			u.flushNotifications()
+			// Staged shared bases are real copies on non-reflink hosts
+			// and outlive their tasks by design; sweep them against the
+			// journal periodically, not only at boot, or a long-running
+			// host accumulates multi-GB residue.
+			if u.StagingRoot != "" && u.clock().Sub(lastSweep) > stagingSweepInterval {
+				lastSweep = u.clock()
+				SweepStaging(u.StagingRoot, u.Journal, u.Log)
+			}
 		}
 	}
 }
@@ -145,6 +154,17 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 		// upload that fails late would otherwise already be past its
 		// NotBefore and retry immediately.
 		return true, u.Journal.Nack(task, u.clock())
+	}
+	if !completed && !task.Staged {
+		// Abandonment of a mutable-path task: a concurrent dedupe may
+		// have upgraded the row to staged snapshots that would survive
+		// whatever deleted our sources. Leave the upgraded row for the
+		// next drain instead of acking it away.
+		if cur, ok, lerr := u.Journal.Load(task); lerr == nil && ok && cur.Staged {
+			u.Log.Info().Str("sandbox_id", task.SandboxID).
+				Msg("abandoned mutable-path attempt; staged row retained for retry")
+			return true, nil
+		}
 	}
 	if err := u.Journal.Ack(task, completed && u.OnVerified != nil); err != nil {
 		return true, err
@@ -269,13 +289,16 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 	return true, nil
 }
 
+// stagingSweepInterval paces the running staged-base sweep.
+const stagingSweepInterval = 30 * time.Minute
+
 // errSourceChanged marks a source file whose current content no longer
 // matches the digest recorded at pause time: the sandbox resumed and
 // mutated the disk before the upload drained. Shipping those bytes under
 // the old content address would create a generation whose objects
 // contradict their manifest, so the generation is abandoned instead; the
 // resume's next pause enqueues the corrective generation under a new key.
-var errSourceChanged = os.ErrNotExist
+var errSourceChanged = errors.New("backup source changed since pause")
 
 func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (ManifestFile, error) {
 	if file.Name == ManifestObject {
@@ -400,7 +423,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// discriminator, and without it the generation is abandoned
 		// rather than completed over bytes nothing can vouch for (this
 		// identity cannot read them back).
-		wasVerified, err := u.Journal.WasVerified(object, time.Now())
+		wasVerified, err := u.Journal.WasVerified(object, u.clock())
 		if err != nil {
 			return ManifestFile{}, err
 		}
