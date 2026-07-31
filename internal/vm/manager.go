@@ -786,8 +786,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			return "", "", nil, status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
 		}
 		log.Info().Msg("pause: VM already paused, returning existing snapshot")
-		manifest := collectPauseManifest(ctx, snapshotPath, retryDiskPath, retryDiskBase, log)
-		m.enqueueBackup(vmID, manifest)
+		manifest := m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, log)
 		return snapshotPath, memPath, manifest, nil
 	}
 	inst.mu.RUnlock()
@@ -930,8 +929,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// pause RPC cap, or the control plane times out and retries against an
 	// already-stopped unit; a budget-exhausted hash just yields a partial
 	// manifest, never a late response.
-	manifest = collectPauseManifest(ctx, snapshotPath, diskPath, diskBasePath, log)
-	m.enqueueBackup(vmID, manifest)
+	manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
 
 	inst.mu.Lock()
 	inst.Status = StatusPaused

@@ -1,6 +1,11 @@
 package vm
 
 import (
+	"context"
+	"time"
+
+	"github.com/rs/zerolog"
+
 	"github.com/superserve-ai/sandbox/internal/backup"
 )
 
@@ -11,20 +16,57 @@ func (m *Manager) SetBackupEnqueue(fn func(backup.Task)) {
 	m.backupEnqueue = fn
 }
 
-// enqueueBackup hands a pause's manifest to the backup pipeline. The
-// generation is content-addressed over every artifact digest, so genuine
-// retries converge on the same immutable objects while any changed
-// artifact starts a fresh generation. A manifest
-// without a disk entry (hash skipped or failed) has no durable generation
-// to ship; it is skipped here and surfaced by coverage monitoring, never
-// guessed at.
+// pauseRehashBudget bounds the asynchronous rehash of a pause whose
+// synchronous hashing was skipped or partial. Generous by design: the
+// retry runs off the RPC path, where a large disk taking minutes is
+// acceptable and losing the pause's backup is not.
+const pauseRehashBudget = 10 * time.Minute
+
+// backupPause hashes a pause's durable artifacts and enqueues them for
+// backup. When the synchronous attempt cannot produce an enqueueable
+// manifest (the RPC deadline left no hash budget, or an artifact failed
+// to hash), it retries once asynchronously with its own budget instead
+// of dropping the pause: a warn log is not durable coverage, and a host
+// loss after a silently skipped enqueue loses the pause outright. If the
+// sandbox resumes while the rehash runs, the digests capture torn bytes
+// and the uploader's pre-verification abandons that generation, which is
+// the same safe outcome as any mutated source.
+func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath, diskBasePath string, log zerolog.Logger) []ManifestEntry {
+	manifest := collectPauseManifest(ctx, snapshotPath, diskPath, diskBasePath, log)
+	if m.backupEnqueue == nil {
+		return manifest
+	}
+	if m.enqueueBackup(vmID, manifest) {
+		return manifest
+	}
+	log.Warn().Str("vm_id", vmID).
+		Msg("pause backup not enqueueable synchronously; retrying with async rehash")
+	go func() {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
+		defer cancel()
+		retried := collectPauseManifest(rctx, snapshotPath, diskPath, diskBasePath, log)
+		if !m.enqueueBackup(vmID, retried) {
+			log.Error().Str("vm_id", vmID).
+				Msg("pause backup dropped: rehash also produced no enqueueable manifest")
+		}
+	}()
+	return manifest
+}
+
+// enqueueBackup hands a pause's manifest to the backup pipeline,
+// reporting whether a task was enqueued. The generation is
+// content-addressed over every artifact digest, so genuine retries
+// converge on the same immutable objects while any changed artifact
+// starts a fresh generation. A manifest without a disk entry (hash
+// skipped or failed) has no durable generation to ship; it is never
+// guessed at, and backupPause owns retrying it.
 //
 // Enqueue is a local BoltDB write (milliseconds) and must never fail the
 // pause: the artifacts on disk are valid regardless, and the journal is
 // the retry mechanism, not the caller.
-func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) {
+func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) bool {
 	if m.backupEnqueue == nil || len(manifest) == 0 {
-		return
+		return false
 	}
 	hasDisk := false
 	files := make([]backup.TaskFile, 0, len(manifest))
@@ -43,7 +85,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) {
 	if !hasDisk {
 		m.log.Warn().Str("vm_id", vmID).
 			Msg("pause manifest has no disk digest; generation not enqueued for backup")
-		return
+		return false
 	}
 	m.backupEnqueue(backup.Task{
 		SandboxID: vmID,
@@ -54,4 +96,5 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) {
 		Files:      files,
 		Priority:   backup.PriorityPause,
 	})
+	return true
 }

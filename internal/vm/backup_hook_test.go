@@ -1,0 +1,77 @@
+package vm
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/backup"
+)
+
+// A pause whose RPC deadline left no hashing budget must still reach the
+// journal: the synchronous attempt is skipped, and the async rehash
+// (which carries its own budget) enqueues the generation.
+func TestBackupPauseRetriesAsynchronouslyWhenBudgetExhausted(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(snap, []byte("vm state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(disk, []byte("disk bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{}
+	m.SetBackupEnqueue(func(task backup.Task) { tasks <- task })
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
+	defer cancel()
+	manifest := m.backupPause(ctx, "vm-1", snap, disk, "", zerolog.Nop())
+	if len(manifest) != 0 {
+		t.Fatalf("synchronous manifest = %v, want none under an expired deadline", manifest)
+	}
+
+	select {
+	case task := <-tasks:
+		names := make(map[string]bool, len(task.Files))
+		for _, f := range task.Files {
+			names[f.Name] = true
+		}
+		if !names["vmstate.snap"] || !names["rootfs.ext4"] {
+			t.Fatalf("async task files = %v, want vmstate.snap and rootfs.ext4", names)
+		}
+		if task.SandboxID != "vm-1" || task.Generation == "" {
+			t.Fatalf("task = %+v, want owner vm-1 with a generation key", task)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("async rehash never enqueued the pause")
+	}
+}
+
+// A rehash that still cannot produce a disk digest (artifact gone) drops
+// the pause with an error log but never enqueues a partial generation.
+func TestBackupPauseNeverEnqueuesWithoutDiskDigest(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	if err := os.WriteFile(snap, []byte("vm state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{}
+	m.SetBackupEnqueue(func(task backup.Task) { tasks <- task })
+
+	m.backupPause(context.Background(), "vm-1", snap, filepath.Join(dir, "missing.ext4"), "", zerolog.Nop())
+
+	select {
+	case task := <-tasks:
+		t.Fatalf("enqueued %+v despite a missing disk digest", task)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
