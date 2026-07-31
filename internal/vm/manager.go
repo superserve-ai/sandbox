@@ -1605,6 +1605,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// lazyReattach loads a paused VM the background reattach hasn't reached.
 	m.lazyReattach(vmID)
 	if existing := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
+		// The adopted VM keeps its stamped policy without re-validation, and
+		// the response still attests it: sound only while every vmd generation
+		// that could have served the prior attempt stamps the request's policy
+		// itself. A generation that changes stamping must add a
+		// request-vs-stamped comparison here.
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
 	}

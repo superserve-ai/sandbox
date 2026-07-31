@@ -664,7 +664,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// Single attempt under whatever remains of the sequence budget:
 			// the fallback is already the second recovery layer.
 			fctx, fcancel := context.WithTimeout(bootCtx, vmdTimeout)
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, nil)
+			// The echo is not consulted here: the post-restore policy reapply
+			// below is this path's attestation.
+			ipAddress, actualVcpu, actualMemMiB, _, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, nil)
 			fcancel()
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
@@ -1978,8 +1980,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
 	tVmdStart := time.Now()
+	// The closure runs synchronously inside retryTransientBoot; a retry
+	// overwrites the capture with the attempt that produced the returned VM.
+	var previewProtocol string
 	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryTransientBoot(c.Request.Context(), sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
-		return vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars)
+		ip, vcpu, memMiB, protocol, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars)
+		previewProtocol = protocol
+		return ip, vcpu, memMiB, err
 	})
 	tVmdEnd := time.Now()
 
@@ -2071,14 +2078,28 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
-	// Re-attest the live VMD after RestoreSnapshot. The host capability was
-	// checked before boot, but VMD can roll back in that window; an older VMD
-	// ignores the additive RestoreSnapshot policy fields and would otherwise
-	// create a legacy/all-port VM. The new RPC is deliberately required even
-	// for initial revision zero. Do this before env injection or any 201-visible
-	// side effects so failure tears the VM down without exposing it.
-	if err := vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), previewAccess, nil, 0); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD preview policy attestation failed after restore")
+	// The boot must attest the preview policy was applied, before env
+	// injection or any 201-visible side effects, so failure tears the VM down
+	// without exposing it.
+	switch previewProtocol {
+	case preview.HostCapabilityPorts:
+		// Attested in the boot response.
+	case "":
+		// A VMD from before the response echo. It may still enforce the
+		// policy (the echo is newer than enforcement), so attest the way its
+		// generation supports: the policy RPC, which fails Unimplemented on a
+		// truly pre-policy VMD. Remove once the fleet echoes.
+		log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd boot response carries no preview attestation; attesting via the policy RPC (version skew)")
+		if err := vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), previewAccess, nil, 0); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD preview policy attestation failed after restore")
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+			respondError(c, ErrInternal)
+			return
+		}
+	default:
+		// An unrecognized echo — fail closed rather than guess what it
+		// enforces.
+		log.Error().Str("sandbox_id", sandboxID.String()).Str("preview_protocol", previewProtocol).Msg("VMD attested an unknown preview protocol at restore")
 		h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
 		respondError(c, ErrInternal)
 		return

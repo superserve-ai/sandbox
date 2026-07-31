@@ -41,6 +41,10 @@ type stubVMD struct {
 	updatePreviewFn  func(ctx context.Context, id, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error
 	injectEnvFn      func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
 	listDirFn        func(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error)
+	// restorePreviewProtocol overrides the boot response's attestation echo;
+	// nil echoes the current capability. Point at "" to model a vmd from
+	// before the echo existed.
+	restorePreviewProtocol *string
 }
 
 type stubScheduler struct {
@@ -75,15 +79,19 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string) (string, uint32, uint32, string, error) {
+	protocol := preview.HostCapabilityPorts
+	if s.restorePreviewProtocol != nil {
+		protocol = *s.restorePreviewProtocol
+	}
 	if s.restorePolicyFn != nil {
 		s.restorePolicyFn(previewAccess, previewPorts, previewPolicyRevision)
 	}
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
-		return ip, 1, 1024, err
+		return ip, 1, 1024, protocol, err
 	}
-	return "10.0.0.1", 1, 1024, nil
+	return "10.0.0.1", 1, 1024, protocol, nil
 }
 func (s *stubVMD) DeleteSnapshot(ctx context.Context, id, snapshotPath, memPath string) error {
 	if s.deleteSnapshotFn != nil {
@@ -1764,7 +1772,6 @@ func TestCreateSandbox_Success(t *testing.T) {
 	var restoredAccess string
 	var restoredPorts map[int32]vmdclient.PortPolicy
 	var restoredRevision int64
-	var attested bool
 	var insertedSandboxID, policySandboxID uuid.UUID
 	var insertedPolicyAccess string
 	scheduler := &stubScheduler{hostID: "public-host"}
@@ -1773,18 +1780,15 @@ func TestCreateSandbox_Success(t *testing.T) {
 		restorePolicyFn: func(access string, ports map[int32]vmdclient.PortPolicy, revision int64) {
 			restoredAccess, restoredPorts, restoredRevision = access, ports, revision
 		},
-		updatePreviewFn: func(_ context.Context, _ string, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
-			attested = true
-			if access != preview.AccessPublic || ports != nil || revision != 0 {
-				t.Errorf("live policy attestation = (%q, %#v, %d), want (public, nil, 0)", access, ports, revision)
-			}
+		updatePreviewFn: func(_ context.Context, _ string, _ string, _ map[int32]vmdclient.PortPolicy, _ int64) error {
+			t.Error("create must not issue a separate policy RPC — attestation rides the boot response")
 			return nil
 		},
 	}
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -1834,9 +1838,6 @@ func TestCreateSandbox_Success(t *testing.T) {
 	if restoredAccess != "public" || restoredPorts != nil || restoredRevision != 0 {
 		t.Errorf("restored preview policy = (%q, %#v, %d), want (public, nil, 0)", restoredAccess, restoredPorts, restoredRevision)
 	}
-	if !attested {
-		t.Error("create did not attest the live VMD after restore")
-	}
 	if insertedSandboxID == uuid.Nil || !policyInsertedAtomically || policySandboxID != insertedSandboxID || insertedPolicyAccess != preview.AccessPublic {
 		t.Errorf("inserted policy = (sandbox=%s access=%q), want sandbox=%s access=%q", policySandboxID, insertedPolicyAccess, insertedSandboxID, preview.AccessPublic)
 	}
@@ -1856,7 +1857,7 @@ func TestCreateSandbox_PrivateUsesBrowserCapablePlacementAndAttestation(t *testi
 	teamID := uuid.New()
 	sandboxID := uuid.New()
 	scheduler := &stubScheduler{hostID: "private-host"}
-	var restored, attested bool
+	var restored bool
 	var policyAccess string
 	var checkedCapabilities []string
 
@@ -1867,11 +1868,8 @@ func TestCreateSandbox_PrivateUsesBrowserCapablePlacementAndAttestation(t *testi
 				t.Errorf("restore policy = (%q, %#v, %d), want (private, nil, 0)", access, ports, revision)
 			}
 		},
-		updatePreviewFn: func(_ context.Context, _ string, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
-			attested = true
-			if access != preview.AccessPrivate || ports != nil || revision != 0 {
-				t.Errorf("attested policy = (%q, %#v, %d), want (private, nil, 0)", access, ports, revision)
-			}
+		updatePreviewFn: func(_ context.Context, _ string, _ string, _ map[int32]vmdclient.PortPolicy, _ int64) error {
+			t.Error("create must not issue a separate policy RPC — attestation rides the boot response")
 			return nil
 		},
 	}
@@ -1925,8 +1923,8 @@ func TestCreateSandbox_PrivateUsesBrowserCapablePlacementAndAttestation(t *testi
 	if !reflect.DeepEqual(checkedCapabilities, wantCaps) {
 		t.Fatalf("post-selection checks = %#v, want %#v", checkedCapabilities, wantCaps)
 	}
-	if policyAccess != preview.AccessPrivate || !restored || !attested {
-		t.Fatalf("private create policy = %q restored=%v attested=%v", policyAccess, restored, attested)
+	if policyAccess != preview.AccessPrivate || !restored {
+		t.Fatalf("private create policy = %q restored=%v", policyAccess, restored)
 	}
 }
 
@@ -1972,24 +1970,36 @@ func TestCreateSandbox_RechecksCapabilitiesAfterSchedulerSelection(t *testing.T)
 	}
 }
 
-func TestCreateSandbox_PreviewAttestationFailureFailsClosed(t *testing.T) {
+// The boot echo drives attestation: an unknown echo fails closed; an empty
+// echo (a vmd from before the field) falls back to the policy RPC, whose
+// failure also fails closed.
+func TestCreateSandbox_PreviewAttestationSkewAndFailClosed(t *testing.T) {
+	empty, bogus := "", "bogus-protocol"
 	tests := []struct {
-		name string
-		err  error
+		name       string
+		echo       *string
+		rpcErr     error
+		wantStatus int
+		wantRPC    bool
 	}{
-		{name: "old vmd unimplemented", err: status.Error(codes.Unimplemented, "unknown method UpdateSandboxPreviewPolicy")},
-		{name: "policy update failed", err: status.Error(codes.Internal, "policy persistence failed")},
-		{name: "revision zero policy mismatch", err: status.Error(codes.FailedPrecondition, "revision zero conflicts with stored policy")},
+		{name: "empty echo falls back to the policy RPC", echo: &empty, wantStatus: http.StatusCreated, wantRPC: true},
+		{name: "empty echo and pre-policy vmd fails closed", echo: &empty, rpcErr: status.Error(codes.Unimplemented, "unknown method UpdateSandboxPreviewPolicy"), wantStatus: http.StatusInternalServerError, wantRPC: true},
+		{name: "unknown echo fails closed", echo: &bogus, wantStatus: http.StatusInternalServerError},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			teamID := uuid.New()
 			sandboxID := uuid.New()
-			var destroyed, injected bool
+			var destroyed, injected, rpcCalled bool
 			vmd := &stubVMD{
-				updatePreviewFn: func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error {
-					return tt.err
+				restorePreviewProtocol: tt.echo,
+				updatePreviewFn: func(_ context.Context, _ string, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
+					rpcCalled = true
+					if access != preview.AccessPublic || ports != nil || revision != 0 {
+						t.Errorf("fallback attestation = (%q, %#v, %d), want (public, nil, 0)", access, ports, revision)
+					}
+					return tt.rpcErr
 				},
 				destroyFn: func(context.Context, string, bool) error {
 					destroyed = true
@@ -2003,7 +2013,7 @@ func TestCreateSandbox_PreviewAttestationFailureFailsClosed(t *testing.T) {
 			mock := &mockDBTX{
 				queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 					switch {
-					case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+					case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
 						return previewCapableHostRow()
 					case strings.Contains(sql, "INSERT INTO sandbox"):
 						return sandboxRow(db.Sandbox{
@@ -2025,8 +2035,17 @@ func TestCreateSandbox_PreviewAttestationFailureFailsClosed(t *testing.T) {
 			w := httptest.NewRecorder()
 			setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
 
-			if w.Code != http.StatusInternalServerError {
-				t.Fatalf("status = %d, want 500; body: %s", w.Code, w.Body.String())
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tt.wantStatus, w.Body.String())
+			}
+			if rpcCalled != tt.wantRPC {
+				t.Fatalf("policy RPC called = %v, want %v", rpcCalled, tt.wantRPC)
+			}
+			if tt.wantStatus == http.StatusCreated {
+				if destroyed {
+					t.Fatal("successful fallback attestation must not destroy the VM")
+				}
+				return
 			}
 			if !destroyed {
 				t.Fatal("VM was not destroyed after preview attestation failure")
@@ -2054,7 +2073,7 @@ func TestCreateSandbox_InjectEnvUnimplementedTolerated(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2108,7 +2127,7 @@ func TestCreateSandbox_InjectEnvErrorFails(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2174,7 +2193,7 @@ func newHostnameStampEnv(t *testing.T, stampErr error) *hostnameStampEnv {
 	}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2327,7 +2346,7 @@ func TestCreateSandbox_QuotaExceeded(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2376,7 +2395,7 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2761,7 +2780,7 @@ func TestCreateSandbox_WithMetadata(t *testing.T) {
 	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2824,7 +2843,7 @@ func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
 	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")) {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {

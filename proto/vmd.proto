@@ -367,6 +367,12 @@ message RestoreSnapshotResponse {
   string ip_address = 3;
   uint32 pid = 4;
   ResourceLimits resource_limits = 5;
+  // Attests that this vmd applied the request's preview policy fields. The
+  // value is frozen at "preview_ports_v1"; future capabilities are attested
+  // additively, never by changing it (the proxy protocol header precedent).
+  // Empty means the vmd predates this field — it may still enforce, so
+  // callers attest such vmds via UpdateSandboxPreviewPolicy instead.
+  string preview_protocol = 6;
 }
 
 // InjectSandboxEnv pushes env vars into a running sandbox's boxd. When

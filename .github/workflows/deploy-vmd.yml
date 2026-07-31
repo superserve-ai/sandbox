@@ -25,6 +25,7 @@ on:
       - 'cmd/boxd/**'
       - 'cmd/template-builder/**'
       - 'cmd/secretsproxy/**'
+      - 'proto/**'
       - 'internal/vm/**'
       - 'internal/network/**'
       - 'internal/builder/**'
