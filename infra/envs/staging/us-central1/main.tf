@@ -336,8 +336,9 @@ module "backup_storage" {
   bucket_name = "superserve-artifact-backup-${local.resource_suffix}"
 
   # Not suffixed with resource_suffix: "superserve-backup-gc-staging-usc1"
-  # would exceed the 30-char SA account_id cap.
-  gc_service_account_id = "superserve-backup-gc-staging"
+  # would exceed the 30-char SA account_id cap. Same for the restore reader.
+  gc_service_account_id      = "superserve-backup-gc-staging"
+  restore_service_account_id = "superserve-backup-ro-staging"
 
   writer_members = [
     "serviceAccount:${module.iam.service_account_emails["superserve_api"]}",

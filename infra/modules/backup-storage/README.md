@@ -12,7 +12,7 @@ by database IDs, never by host-local absolute paths, so a restore can land the
 files on any replacement host:
 
 ```
-sandboxes/<sandbox_id>/<generation>/            vmstate.snap, mem.snap|mem.diff, disk files, manifest
+sandboxes/<sandbox_id>/<generation>/            vmstate.snap, disk files, manifest (mem files never upload: filesystem-only durability)
 templates/<template_id>/<build_id>/             vmstate.snap, mem.snap, *.delta, base.ext4, build.meta.json, manifest
 ```
 
@@ -24,13 +24,27 @@ generation is recorded in the control-plane database.
 
 | Identity | Roles | Can |
 | --- | --- | --- |
-| vmd host SA (`writer_members`) | `objectCreator` + `objectViewer` | create new objects, read/list for idempotency and restore |
+| vmd host SA (`writer_members`) | `objectCreator` only | create new objects, nothing else |
+| dedicated restore SA (created by this module) | `objectViewer` | read/list, for restore tooling and drills via impersonation |
 | dedicated GC SA (created by this module) | `objectAdmin` | delete objects past the retention window |
 
-Writers cannot delete **or overwrite** (overwriting an existing object name
-requires `storage.objects.delete`), so a compromised host cannot destroy or
-corrupt existing backups. The GC service account is control-plane-only: no
-host or runtime service may run as it.
+Writers cannot **read** (the runtime identity is currently shared across
+cells, so read access on it would let a compromise in any host or API
+exfiltrate every cell's backups), cannot delete, and cannot **overwrite**
+(overwriting an existing object name requires `storage.objects.delete`).
+Uploader idempotency uses an `ifGenerationMatch=0` precondition instead of
+get/list: a 412 response means the object already exists and is treated as
+success.
+
+The restore and GC service accounts are control-plane/tooling-only: no host
+or runtime service may run as them, and impersonation grants are managed
+out-of-band (admin-held, same pattern as the KMS grants).
+
+Known limit: write-side cell isolation. Both cells' hosts currently run as
+the same shared SA, so a compromised host can still create (pollute) objects
+in the other cell's bucket, though it can read or destroy nothing. Full
+isolation needs per-cell host service accounts, which requires a host
+stop/start to change the attached SA; tracked as follow-up work.
 
 ## Retention model (layered)
 

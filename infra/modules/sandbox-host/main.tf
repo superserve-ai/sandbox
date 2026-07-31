@@ -79,6 +79,10 @@ resource "google_compute_instance" "this" {
 
     ignore_changes = [
       advanced_machine_features,
+      # Persistent disks attached out-of-band (e.g. the staging
+      # superserve-sandbox-data disk) are managed outside this module, like
+      # scratch disks: a plan must never detach a live disk it didn't create.
+      attached_disk,
       boot_disk,
       metadata,
       network_interface[0].access_config,

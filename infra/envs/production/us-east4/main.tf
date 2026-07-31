@@ -319,6 +319,8 @@ module "backup_storage" {
 
   gc_service_account_id = "superserve-backup-gc-${local.resource_suffix}"
 
+  restore_service_account_id = "superserve-backup-ro-${local.resource_suffix}"
+
   writer_members = [
     "serviceAccount:${data.google_service_account.api_runner.email}",
   ]

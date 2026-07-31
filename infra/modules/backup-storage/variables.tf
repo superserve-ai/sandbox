@@ -25,8 +25,18 @@ variable "storage_class" {
 }
 
 variable "writer_members" {
-  description = "IAM members (serviceAccount:... form) granted create+read but never delete. The vmd host SA belongs here."
+  description = "IAM members (serviceAccount:... form) granted object create only: no read, no delete, no overwrite. The vmd host SA belongs here."
   type        = list(string)
+}
+
+variable "restore_service_account_id" {
+  description = "Account ID for the dedicated read-only restore service account. Nothing runs as it; restore tooling impersonates it via out-of-band grants."
+  type        = string
+
+  validation {
+    condition     = length(var.restore_service_account_id) >= 6 && length(var.restore_service_account_id) <= 30
+    error_message = "Service account account_id must be 6-30 characters."
+  }
 }
 
 variable "gc_service_account_id" {

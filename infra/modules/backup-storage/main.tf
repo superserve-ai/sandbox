@@ -66,10 +66,14 @@ resource "google_storage_bucket" "backup" {
   }
 }
 
-# Writers (the vmd host SA) can create and read objects but not delete or
-# overwrite them: objectCreator carries storage.objects.create only, and an
-# overwrite of an existing object name also requires storage.objects.delete.
-# A compromised host therefore cannot destroy or corrupt existing backups.
+# Writers (the vmd host SA) can create objects and nothing else: objectCreator
+# carries storage.objects.create only. No read (a compromised host or API
+# cannot exfiltrate backups, its own cell's or another's, since the runtime
+# identity is currently shared across cells), no delete, and no overwrite
+# (replacing an existing object name also requires storage.objects.delete).
+# Uploader idempotency therefore cannot rely on get/list: uploads use an
+# ifGenerationMatch=0 precondition, and a 412 means the object already exists,
+# which the uploader treats as success.
 resource "google_storage_bucket_iam_member" "writer_create" {
   for_each = toset(var.writer_members)
 
@@ -78,12 +82,21 @@ resource "google_storage_bucket_iam_member" "writer_create" {
   member = each.value
 }
 
-resource "google_storage_bucket_iam_member" "writer_view" {
-  for_each = toset(var.writer_members)
+# Reads are reserved for a dedicated per-cell restore identity that nothing on
+# the hosts or in the runtime serves as. Restore tooling and drills impersonate
+# it; the impersonation grants are managed out-of-band (admin-held, same
+# pattern as the KMS grants) so the shared runtime identity never gains read.
+resource "google_service_account" "restore" {
+  project      = var.project_id
+  account_id   = var.restore_service_account_id
+  display_name = "Artifact backup restore reader (${var.environment})"
+  description  = "Read-only access to the ${var.bucket_name} backup bucket for restore tooling and drills. No host or runtime service may run as this identity; impersonation is granted out-of-band."
+}
 
+resource "google_storage_bucket_iam_member" "restore_view" {
   bucket = google_storage_bucket.backup.name
   role   = "roles/storage.objectViewer"
-  member = each.value
+  member = "serviceAccount:${google_service_account.restore.email}"
 }
 
 # Deletes are reserved for a dedicated control-plane GC identity that nothing
@@ -104,15 +117,16 @@ resource "google_storage_bucket_iam_member" "gc_admin" {
 
 locals {
   backup_storage_contract = {
-    project_id          = var.project_id
-    environment         = var.environment
-    bucket              = google_storage_bucket.backup.name
-    location            = var.location
-    writer_members      = var.writer_members
-    gc_service_account  = google_service_account.gc.email
-    soft_delete_seconds = var.soft_delete_retention_seconds
-    noncurrent_days     = var.noncurrent_version_retention_days
-    kms_key_name        = var.kms_key_name
-    labels              = var.labels
+    project_id              = var.project_id
+    environment             = var.environment
+    bucket                  = google_storage_bucket.backup.name
+    location                = var.location
+    writer_members          = var.writer_members
+    gc_service_account      = google_service_account.gc.email
+    restore_service_account = google_service_account.restore.email
+    soft_delete_seconds     = var.soft_delete_retention_seconds
+    noncurrent_days         = var.noncurrent_version_retention_days
+    kms_key_name            = var.kms_key_name
+    labels                  = var.labels
   }
 }
