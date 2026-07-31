@@ -1613,7 +1613,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if lerr != nil {
 		return nil, lerr
 	}
-	defer unlockOp()
+	// nil-guarded: the success path hands the unlock to its background
+	// persist goroutine so the durable verified write stays inside the
+	// critical section.
+	defer func() {
+		if unlockOp != nil {
+			unlockOp()
+		}
+	}()
 
 	// Retried restore (response lost mid-RPC): re-restoring a VM the prior
 	// attempt brought up would roll the guest back to the snapshot. A live
@@ -2117,8 +2124,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.markTemplateRestored(warmthPath)
 
 	<-persistDone
-	// Verified in memory only: the durable flag stays set until any later
-	// persist, so it survives exactly (and only) a crash before this point.
 	inst.mu.Lock()
 	inst.Unverified = false
 	inst.mu.Unlock()
@@ -2139,6 +2144,21 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 	}
 	tPersisted := time.Now()
+
+	// The cleared flag must land durably: a vmd restart would otherwise
+	// reattach this verified VM as unverified, and a duplicate delivery
+	// would relaunch it, rolling the guest back. Off the response path, but
+	// the unlock handoff keeps the write inside the vm op critical section,
+	// so a lifecycle op arriving right after the response cannot have its
+	// persist overwritten by this one. Destroy bypasses the op lock;
+	// PutIfPresent refuses to resurrect its record deletion.
+	handoff := unlockOp
+	unlockOp = nil
+	go func() {
+		defer sentrylog.Recover("restore-verified-persist")
+		defer handoff()
+		m.persistStateIfPresent(inst)
+	}()
 
 	log.Info().
 		Int("pid", pid).

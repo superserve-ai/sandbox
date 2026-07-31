@@ -134,8 +134,9 @@ type VMRecord struct {
 	Status     VMStatus `json:"status"`
 	// Unverified marks a Running record persisted before boxd readiness was
 	// confirmed (the persist overlaps the wait). Absent/false — including on
-	// every record from before the field — means verified; any later persist
-	// clears it. Adoption refuses unverified records.
+	// every record from before the field — means verified; a background
+	// persist clears it right after verification, so a durable true means a
+	// crash before readiness was proven. Adoption refuses unverified records.
 	Unverified   bool   `json:"unverified,omitempty"`
 	RunDirID     string `json:"rundir_id"`
 	Namespace    string `json:"namespace"`

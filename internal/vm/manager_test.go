@@ -1316,3 +1316,68 @@ func TestRetriedLaunchTargetRefusesUnverifiedRecord(t *testing.T) {
 		t.Fatal("unverified must survive the record round-trip")
 	}
 }
+
+// The durable half of verification: the background persist after a successful
+// readiness wait clears the unverified marker in BoltDB, so after a vmd
+// restart a duplicate delivery adopts the live VM instead of refusing the
+// record and relaunching it (which rolls the guest back to its snapshot).
+func TestRestoreVMSnapshot_VerifiedRecordAfterRestart_Adopted(t *testing.T) {
+	orig := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = orig }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil } // boxd healthy
+	defer func() { adoptionBoxdReady = origReady }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	mgr := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+	mgr.persistState(inst) // the optimistic pre-wait persist
+
+	// What the success path runs once readiness is proven.
+	inst.mu.Lock()
+	inst.Unverified = false
+	inst.mu.Unlock()
+	mgr.persistStateIfPresent(inst)
+
+	// Simulated vmd restart: only the durable record survives.
+	rec, err := store.Get("vm-1")
+	if err != nil || rec == nil {
+		t.Fatalf("record must survive the restart: %v", err)
+	}
+	if rec.Unverified {
+		t.Fatal("the verified clear must be durable, not in-memory only")
+	}
+	reloaded := toInstance(*rec)
+	mgr2 := &Manager{
+		log:        zerolog.Nop(),
+		state:      store,
+		vms:        map[string]*VMInstance{"vm-1": reloaded},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	got, err := mgr2.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
+	if err != nil {
+		t.Fatalf("duplicate delivery after restart must adopt the live VM, got %v", err)
+	}
+	if got != reloaded {
+		t.Fatal("expected adoption of the reattached instance, not a relaunch")
+	}
+}
