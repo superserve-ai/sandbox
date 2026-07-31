@@ -598,3 +598,26 @@ func TestFailedVerificationWriteNotCarriedIntoTask(t *testing.T) {
 		t.Fatalf("task carries unverified trust %v after failed verification write", task.VerifiedObjects)
 	}
 }
+
+// Cancellation must land inside a dense extent, not only between
+// extents: the shutdown join waits on this hash, and a single large
+// extent would otherwise be read to completion after cancel.
+func TestHashApparentCancelsMidExtent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dense.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), 1<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = hashApparent(ctx, f, []Extent{{Offset: 0, Length: 1 << 20}}, 1<<20)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled from inside the extent read", err)
+	}
+}

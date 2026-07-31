@@ -340,7 +340,12 @@ func hashApparent(ctx context.Context, f *os.File, extents []Extent, apparent in
 		if err := writeZeros(e.Offset); err != nil {
 			return "", err
 		}
-		if _, err := io.Copy(h, io.NewSectionReader(f, e.Offset, e.Length)); err != nil {
+		// The section reader is wrapped so cancellation lands between
+		// reads of a large dense extent, not only between extents: the
+		// shutdown join waits on this loop, and an uncancelable multi-GB
+		// read on a slow filesystem would outlive the join's deadline and
+		// leave the loop touching closed dependencies.
+		if _, err := io.Copy(h, &ctxReader{ctx: ctx, r: io.NewSectionReader(f, e.Offset, e.Length)}); err != nil {
 			return "", err
 		}
 		pos = e.Offset + e.Length
@@ -349,6 +354,20 @@ func hashApparent(ctx context.Context, f *os.File, extents []Extent, apparent in
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// ctxReader fails the next Read once ctx is canceled, making plain
+// readers (section readers over artifact files) cancelable mid-stream.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // limitedReader applies the bandwidth cap per read. A nil limiter means
