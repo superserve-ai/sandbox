@@ -170,6 +170,25 @@ type Activity struct {
 	SecretName   *string     `json:"secret_name"`
 }
 
+type AnalyticsActiveSandboxCount struct {
+	ActiveSandboxes int64 `json:"active_sandboxes"`
+}
+
+type AnalyticsDailySandboxStart struct {
+	Day    pgtype.Date `json:"day"`
+	Starts int64       `json:"starts"`
+}
+
+type AnalyticsWeeklyTeamSandboxCount struct {
+	TeamName     string `json:"team_name"`
+	SandboxCount int64  `json:"sandbox_count"`
+}
+
+type AnalyticsWeeklyTeamSpend struct {
+	TeamName string         `json:"team_name"`
+	SpendUsd pgtype.Numeric `json:"spend_usd"`
+}
+
 type AnalyticsWeeklyUserMetric struct {
 	WeekStart       pgtype.Date `json:"week_start"`
 	Signups         int64       `json:"signups"`
@@ -194,6 +213,20 @@ type ApiKey struct {
 	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 	CreatedAt  time.Time          `json:"created_at"`
+}
+
+type ArtifactManifest struct {
+	ID          uuid.UUID   `json:"id"`
+	SnapshotID  pgtype.UUID `json:"snapshot_id"`
+	TemplateID  pgtype.UUID `json:"template_id"`
+	FileName    string      `json:"file_name"`
+	Path        string      `json:"path"`
+	SizeBytes   int64       `json:"size_bytes"`
+	Sha256      string      `json:"sha256"`
+	BasePath    *string     `json:"base_path"`
+	GuestKernel *string     `json:"guest_kernel"`
+	VmdVersion  *string     `json:"vmd_version"`
+	CreatedAt   time.Time   `json:"created_at"`
 }
 
 type AuditLog struct {

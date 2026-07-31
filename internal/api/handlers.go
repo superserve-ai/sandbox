@@ -664,7 +664,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// Single attempt under whatever remains of the sequence budget:
 			// the fallback is already the second recovery layer.
 			fctx, fcancel := context.WithTimeout(bootCtx, vmdTimeout)
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, nil)
+			// The echo is not consulted here: the post-restore policy reapply
+			// below is this path's attestation.
+			ipAddress, actualVcpu, actualMemMiB, _, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, nil)
 			fcancel()
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
@@ -714,7 +716,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// resumable 'paused' state. Prefer leak over loss.
 	pauseAndRevert := func() {
 		pctx, pcancel := context.WithTimeout(revertCtx, vmdTimeout)
-		snapPath, memPath, perr := vmd.PauseInstance(pctx, sandboxID.String(), "")
+		// The revert re-snapshots the VM, and the guest may have run and
+		// dirtied the disk before the failed finalize was detected, so the
+		// artifacts on disk are fresh. Record their manifest below; keeping
+		// the pre-resume hashes would leave stale integrity data.
+		snapPath, memPath, manifest, perr := vmd.PauseInstance(pctx, sandboxID.String(), "")
 		pcancel()
 		if perr != nil {
 			// VM unreachable — nothing to preserve; mark failed rather than
@@ -727,14 +733,15 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		// Overlay preserved; flip resuming → paused via FinalizePause.
 		fctx, fcancel := context.WithTimeout(revertCtx, vmdTimeout)
 		defer fcancel()
-		if _, ferr := h.DB.FinalizePause(fctx, db.FinalizePauseParams{
-			ID:        sandboxID,
-			TeamID:    teamID,
-			Path:      snapPath,
-			MemPath:   &memPath,
-			SizeBytes: 0, // snapshot size isn't tracked for pauses (matches PauseSandbox)
-			Trigger:   "resume_revert",
-		}); ferr != nil {
+		params := db.FinalizePauseParams{
+			ID:      sandboxID,
+			TeamID:  teamID,
+			Path:    snapPath,
+			MemPath: &memPath,
+			Trigger: "resume_revert",
+		}
+		applyManifest(&params, manifest)
+		if _, ferr := h.DB.FinalizePause(fctx, params); ferr != nil {
 			// VM is safely paused; only bookkeeping failed. Best-effort status
 			// flip — the reconciler is the backstop.
 			log.Error().Err(ferr).Str("sandbox_id", sandboxID.String()).Msg("resume revert: FinalizePause failed, best-effort revert to paused")
@@ -1978,8 +1985,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
 	tVmdStart := time.Now()
+	// The closure runs synchronously inside retryTransientBoot; a retry
+	// overwrites the capture with the attempt that produced the returned VM.
+	var previewProtocol string
 	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryTransientBoot(c.Request.Context(), sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
-		return vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars)
+		ip, vcpu, memMiB, protocol, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars)
+		previewProtocol = protocol
+		return ip, vcpu, memMiB, err
 	})
 	tVmdEnd := time.Now()
 
@@ -2071,14 +2083,28 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
-	// Re-attest the live VMD after RestoreSnapshot. The host capability was
-	// checked before boot, but VMD can roll back in that window; an older VMD
-	// ignores the additive RestoreSnapshot policy fields and would otherwise
-	// create a legacy/all-port VM. The new RPC is deliberately required even
-	// for initial revision zero. Do this before env injection or any 201-visible
-	// side effects so failure tears the VM down without exposing it.
-	if err := vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), previewAccess, nil, 0); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD preview policy attestation failed after restore")
+	// The boot must attest the preview policy was applied, before env
+	// injection or any 201-visible side effects, so failure tears the VM down
+	// without exposing it.
+	switch previewProtocol {
+	case preview.HostCapabilityPorts:
+		// Attested in the boot response.
+	case "":
+		// A VMD from before the response echo. It may still enforce the
+		// policy (the echo is newer than enforcement), so attest the way its
+		// generation supports: the policy RPC, which fails Unimplemented on a
+		// truly pre-policy VMD. Remove once the fleet echoes.
+		log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd boot response carries no preview attestation; attesting via the policy RPC (version skew)")
+		if err := vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), previewAccess, nil, 0); err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD preview policy attestation failed after restore")
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+			respondError(c, ErrInternal)
+			return
+		}
+	default:
+		// An unrecognized echo — fail closed rather than guess what it
+		// enforces.
+		log.Error().Str("sandbox_id", sandboxID.String()).Str("preview_protocol", previewProtocol).Msg("VMD attested an unknown preview protocol at restore")
 		h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
 		respondError(c, ErrInternal)
 		return
@@ -2283,12 +2309,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // row to active would drift it against a paused VM; PauseVM is idempotent, so
 // the retry returns the recorded snapshot and the row converges to paused.
 // NotFound is terminal — the VM is genuinely gone.
-func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id string) (snapshotPath, memPath string, err error) {
+func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, err error) {
 	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
-	snapshotPath, memPath, err = vmd.PauseInstance(ctx, id, "")
+	snapshotPath, memPath, manifest, err = vmd.PauseInstance(ctx, id, "")
 	cancel()
 	if err == nil || isVMDNotFound(err) {
-		return snapshotPath, memPath, err
+		return snapshotPath, memPath, manifest, err
 	}
 	// Detach from the request ctx: the client's deadline may already have
 	// fired, but the reconciliation to a consistent state must still run.
@@ -2358,7 +2384,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	}
 
 	// Call VMD to pause and snapshot the VM.
-	snapshotPath, memPath, err := pauseWithRetry(c.Request.Context(), vmd, sandboxID.String())
+	snapshotPath, memPath, manifest, err := pauseWithRetry(c.Request.Context(), vmd, sandboxID.String())
 	if err != nil {
 		// VMD says the VM doesn't exist — it crashed or was removed out-of-band.
 		// Mark the sandbox failed and return 410 Gone. No revert — the VM is
@@ -2420,14 +2446,15 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	h.asyncBookkeeping("finalize-pause", func() {
 		fctx, fcancel := context.WithTimeout(finalizeCtx, asyncTimeout)
 		defer fcancel()
-		if _, err := h.DB.FinalizePause(fctx, db.FinalizePauseParams{
-			ID:        sandboxID,
-			TeamID:    teamID,
-			Path:      snapshotPath,
-			MemPath:   &memPath,
-			SizeBytes: 0,
-			Trigger:   "pause",
-		}); err != nil {
+		params := db.FinalizePauseParams{
+			ID:      sandboxID,
+			TeamID:  teamID,
+			Path:    snapshotPath,
+			MemPath: &memPath,
+			Trigger: "pause",
+		}
+		applyManifest(&params, manifest)
+		if _, err := h.DB.FinalizePause(fctx, params); err != nil {
 			// ErrNoRows means the sandbox was soft-deleted between BeginPause
 			// and FinalizePause (a rare race with DeleteSandbox). The VM is
 			// already stopped and its snapshot files are on disk — nothing to
@@ -2437,6 +2464,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 				return
 			}
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async DB FinalizePause failed — sandbox may be stuck in 'pausing'")
+			return
 		}
 	})
 

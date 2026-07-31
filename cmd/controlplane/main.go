@@ -385,15 +385,25 @@ func (c *grpcVMDClient) DestroyInstance(ctx context.Context, vmID string, force 
 	return nil
 }
 
-func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir string) (string, string, error) {
+func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir string) (string, string, []vmdclient.ManifestEntry, error) {
 	resp, err := c.client.PauseVM(ctx, &vmdpb.PauseVMRequest{
 		VmId:        vmID,
 		SnapshotDir: snapshotDir,
 	})
 	if err != nil {
-		return "", "", fmt.Errorf("gRPC PauseVM: %w", err)
+		return "", "", nil, fmt.Errorf("gRPC PauseVM: %w", err)
 	}
-	return resp.SnapshotPath, resp.MemFilePath, nil
+	manifest := make([]vmdclient.ManifestEntry, 0, len(resp.GetManifest()))
+	for _, e := range resp.GetManifest() {
+		manifest = append(manifest, vmdclient.ManifestEntry{
+			FileName:  e.GetFileName(),
+			Path:      e.GetPath(),
+			SizeBytes: e.GetSizeBytes(),
+			SHA256:    e.GetSha256(),
+			BasePath:  e.GetBasePath(),
+		})
+	}
+	return resp.SnapshotPath, resp.MemFilePath, manifest, nil
 }
 
 func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string) (string, uint32, uint32, error) {
@@ -417,7 +427,7 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. For
 // sandboxes with secrets the caller passes envVars=nil and pushes env via
 // InjectSandboxEnv after minting a JWT against the returned source IP.
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string) (string, uint32, uint32, string, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
 		VmId:                  vmID,
 		SnapshotPath:          snapshotPath,
@@ -432,14 +442,14 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 		EnvVars:               envVars,
 	})
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("gRPC RestoreSnapshot: %w", err)
+		return "", 0, 0, "", fmt.Errorf("gRPC RestoreSnapshot: %w", err)
 	}
 	var vcpu, mem uint32
 	if rl := resp.GetResourceLimits(); rl != nil {
 		vcpu = rl.GetVcpuCount()
 		mem = rl.GetMemoryMib()
 	}
-	return resp.IpAddress, vcpu, mem, nil
+	return resp.IpAddress, vcpu, mem, resp.GetPreviewProtocol(), nil
 }
 
 func previewPortsToProto(ports map[int32]vmdclient.PortPolicy) []*vmdpb.PreviewPort {
