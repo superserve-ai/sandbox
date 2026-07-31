@@ -322,12 +322,15 @@ func (m *Manager) atRest(ctx context.Context, vmID, snapshotPath string) bool {
 }
 
 // unitConfirmedDead consults systemd (overridable for tests via the
-// unitDead field) about whether the sandbox's unit is definitely stopped.
+// unitDead field) about whether the sandbox's unit is fully down. The
+// probe requires a terminal state: unitDefinitelyDead's weaker "not
+// active" answer calls a deactivating unit dead while its Firecracker
+// may still be flushing guest writes.
 func (m *Manager) unitConfirmedDead(ctx context.Context, vmID string) bool {
 	if m.unitDead != nil {
 		return m.unitDead(ctx, vmID)
 	}
-	return unitDefinitelyDead(ctx, systemdUnitName(vmID))
+	return unitFullyDown(ctx, systemdUnitName(vmID))
 }
 
 // pausedAt reports whether the sandbox is currently paused on exactly

@@ -966,17 +966,25 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// Firecracker keeps writing the overlay, and the recorded StatusPaused
 	// would satisfy the rehash's at-rest proof while the bytes are live. A
 	// later retry pause backs the artifacts up once the unit is truly dead.
-	if stopConfirmed {
+	// stopConfirmed alone is the RPC's notion of a finished stop, which
+	// deliberately includes a still-deactivating unit; hashing needs the
+	// stronger fully-down claim, so the gate reconfirms with the same
+	// probe the at-rest proof uses.
+	if stopConfirmed && m.unitConfirmedDead(ctx, vmID) {
 		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
 	} else {
-		log.Warn().Msg("pause backup skipped: unit not confirmed stopped, bytes may still be changing")
-		// The pause still owes its backup. Leave a pending marker: the
-		// periodic sweep retries it, and its at-rest proof passes once
-		// the reconciler reclaims the straggler unit.
-		m.persistPendingBackup(PendingBackup{
+		log.Warn().Msg("pause backup deferred: unit not confirmed fully down, bytes may still be changing")
+		// The pause still owes its backup. Leave a pending marker AND a
+		// worker: the worker's first act re-persists the marker (healing
+		// a transiently failed write here), its at-rest proof holds the
+		// backup off until the unit is truly down, and the periodic
+		// sweep keeps retrying after the worker gives up.
+		pb := PendingBackup{
 			VMID: vmID, SnapshotPath: snapshotPath, DiskPath: diskPath, DiskBasePath: diskBasePath,
 			Token: newPendingToken(),
-		}, log)
+		}
+		m.persistPendingBackup(pb, log)
+		go m.rehashPendingBackup(ctx, pb, log)
 	}
 
 	log.Info().Msg("VM paused")
