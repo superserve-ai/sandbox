@@ -967,8 +967,9 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	orig := vmUnitDead
 	vmUnitDead = func(string) bool { return false } // unit alive
 	defer func() { vmUnitDead = orig }()
+	gated := false
 	origReady := adoptionBoxdReady
-	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil } // boxd healthy
+	adoptionBoxdReady = func(context.Context, *Manager, string) error { gated = true; return nil }
 	defer func() { adoptionBoxdReady = origReady }()
 
 	dir := t.TempDir()
@@ -995,6 +996,9 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	}
 	if inst != existing {
 		t.Fatal("expected the existing running instance, not a re-restore")
+	}
+	if gated {
+		t.Fatal("a verified record must adopt without the readiness gate — a wedged boxd must not be able to demote it")
 	}
 	mgr.mu.RLock()
 	still := mgr.vms["vm-1"]
@@ -1027,7 +1031,7 @@ func TestRestoreVMSnapshot_AdoptionWaitCanceled_LeavesVMUntouched(t *testing.T) 
 		}
 	}
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
 		SnapshotPath: snapPath, MemFilePath: memPath,
 	}
 	mgr := &Manager{
@@ -1071,7 +1075,7 @@ func TestRestoreVMSnapshot_DestroyedDuringAdoptionWait_Fails(t *testing.T) {
 		}
 	}
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
 		SnapshotPath: snapPath, MemFilePath: memPath,
 	}
 	mgr := &Manager{
@@ -1106,7 +1110,7 @@ func TestRestoreVMSnapshot_AdoptedButBoxdNeverReady_Fails(t *testing.T) {
 		}
 	}
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
 		SnapshotPath: snapPath, MemFilePath: memPath,
 	}
 	mgr := &Manager{
@@ -1175,6 +1179,28 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	}
 	if inst != existing {
 		t.Fatal("expected the existing running instance, not a relaunch")
+	}
+}
+
+// Resume adoption is readiness-blind, so it must not adopt a record whose
+// readiness was never proven — it falls through to a fresh launch instead.
+func TestResumeVM_UnverifiedRecord_NotAdopted(t *testing.T) {
+	orig := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = orig }()
+
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
+		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
+		MemFilePath:  "/snapshots/vm-1/mem.snap",
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
+
+	// The fallthrough fails on the missing snapshot files — the assertion is
+	// only that the unverified record was not returned as a healthy VM.
+	inst, err := mgr.ResumeVM(context.Background(), "vm-1", "", "")
+	if err == nil && inst == existing {
+		t.Fatal("an unverified record must not be adopted by the readiness-blind resume path")
 	}
 }
 
@@ -1248,7 +1274,7 @@ func TestRestoreVMSnapshot_RunningRecordButUnitDead_NotReturned(t *testing.T) {
 	}
 	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
 
-	if got := m.retriedLaunchTarget("vm-1", snapPath, memPath); got != nil {
+	if got, _ := m.retriedLaunchTarget("vm-1", snapPath, memPath); got != nil {
 		t.Fatal("a dead-unit Running record must not be returned as a retry target")
 	}
 }
@@ -1276,7 +1302,7 @@ func TestInstanceRunning(t *testing.T) {
 // not be adopted; the caller falls through to a fresh, verified restore. The
 // durable flag must also stay off the wire for verified records so rollback
 // binaries read them unchanged.
-func TestRetriedLaunchTargetRefusesUnverifiedRecord(t *testing.T) {
+func TestRetriedLaunchTargetFlagsUnverifiedRecord(t *testing.T) {
 	orig := vmUnitDead
 	vmUnitDead = func(string) bool { return false } // unit alive
 	defer func() { vmUnitDead = orig }()
@@ -1287,13 +1313,15 @@ func TestRetriedLaunchTargetRefusesUnverifiedRecord(t *testing.T) {
 		MemFilePath:  "/snapshots/vm-1/mem.snap",
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
-	if got := mgr.retriedLaunchTarget("vm-1", existing.SnapshotPath, existing.MemFilePath); got != nil {
-		t.Fatal("an unverified Running record must not be adopted")
+	got, needsVerify := mgr.retriedLaunchTarget("vm-1", existing.SnapshotPath, existing.MemFilePath)
+	if got == nil || !needsVerify {
+		t.Fatal("an unverified Running record must be returned flagged for verification")
 	}
 
 	existing.Unverified = false
-	if got := mgr.retriedLaunchTarget("vm-1", existing.SnapshotPath, existing.MemFilePath); got == nil {
-		t.Fatal("a verified Running record must still be adoptable")
+	got, needsVerify = mgr.retriedLaunchTarget("vm-1", existing.SnapshotPath, existing.MemFilePath)
+	if got == nil || needsVerify {
+		t.Fatal("a verified Running record must be adoptable without verification")
 	}
 
 	out, err := json.Marshal(toRecord(existing))
@@ -1379,5 +1407,68 @@ func TestRestoreVMSnapshot_VerifiedRecordAfterRestart_Adopted(t *testing.T) {
 	}
 	if got != reloaded {
 		t.Fatal("expected adoption of the reattached instance, not a relaunch")
+	}
+}
+
+// A crash between the response and the background verified persist leaves a
+// durable unverified record for a live VM. The next duplicate delivery must
+// re-verify and adopt it — and heal the marker — rather than relaunching it
+// and rolling the guest back.
+func TestRestoreVMSnapshot_UnverifiedRecordAfterRestart_ReverifiedAndAdopted(t *testing.T) {
+	orig := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = orig }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil } // boxd healthy
+	defer func() { adoptionBoxdReady = origReady }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	mgr := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+	mgr.persistState(inst)
+	// Crash here: the verified persist never ran.
+
+	rec, err := store.Get("vm-1")
+	if err != nil || rec == nil {
+		t.Fatalf("record must survive the restart: %v", err)
+	}
+	reloaded := toInstance(*rec)
+	mgr2 := &Manager{
+		log:        zerolog.Nop(),
+		state:      store,
+		vms:        map[string]*VMInstance{"vm-1": reloaded},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	got, err := mgr2.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
+	if err != nil {
+		t.Fatalf("a healthy unverified VM must be re-verified and adopted, got %v", err)
+	}
+	if got != reloaded {
+		t.Fatal("expected adoption of the reattached instance, not a relaunch")
+	}
+	healed, err := store.Get("vm-1")
+	if err != nil || healed == nil {
+		t.Fatal(err)
+	}
+	if healed.Unverified {
+		t.Fatal("successful re-verification must clear the durable marker")
 	}
 }

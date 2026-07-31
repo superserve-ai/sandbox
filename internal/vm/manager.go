@@ -1078,9 +1078,11 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	// the prior attempt. Relaunching would kill it and roll the guest back
 	// to the snapshot, so return the live instance — same guard as the
 	// stateless restore path.
-	if existing := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
+	if existing, needsVerify := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil && !needsVerify {
 		// Resume's contract never blocks on boxd (the readiness probe is
 		// detached telemetry), so adoption matches: record + live unit suffice.
+		// An unverified target is the one exception — this path cannot verify
+		// it, so it falls through to a fresh, fully-verified launch.
 		log.Info().Msg("resume: VM already running and healthy, returning it")
 		return existing, nil
 	}
@@ -1628,53 +1630,62 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// restore slot (or fails on the semaphore when all slots are busy).
 	// lazyReattach loads a paused VM the background reattach hasn't reached.
 	m.lazyReattach(vmID)
-	if existing := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
+	if existing, needsVerify := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
 		// The adopted VM keeps its stamped policy without re-validation, and
 		// the response still attests it: sound only while every vmd generation
 		// that could have served the prior attempt stamps the request's policy
 		// itself. A generation that changes stamping must add a
 		// request-vs-stamped comparison here.
-		// A Running record can also predate readiness verification (the
-		// persist overlaps the boxd wait; a vmd restart in that window
-		// reattaches it), so restore adoption re-verifies — a bounded WAIT,
-		// not a single probe, so a warming VM passes. Resume adoption
-		// deliberately skips this (detached-probe contract).
-		if err := adoptionBoxdReady(ctx, m, existing.IP); err != nil {
-			// Classify before acting: only a definitive timeout says anything
-			// about the VM.
+		if needsVerify {
+			// An unverified record never proved boxd readiness (crash between
+			// the optimistic persist and the verified one), so verify before
+			// adopting — a bounded WAIT, not a single probe, so a warming VM
+			// passes. Verified records adopt without this gate: readiness was
+			// proven once, and a wedged boxd here must not demote a live VM.
+			if err := adoptionBoxdReady(ctx, m, existing.IP); err != nil {
+				// Classify before acting: only a definitive timeout says
+				// anything about the VM.
+				m.mu.RLock()
+				still := m.vms[vmID] == existing
+				m.mu.RUnlock()
+				if !still {
+					// A destroy raced the wait; match the sibling destroyed-paths.
+					return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
+				}
+				if ctx.Err() != nil {
+					// The caller went away — no verdict on the VM, no teardown.
+					return nil, fmt.Errorf("adopted VM %s readiness unverified: %w", vmID, err)
+				}
+				// Definitive exhaustion: flip out of Running so the
+				// readiness-blind resume adoption cannot resurrect it (the
+				// resume fallback reverts without destroying). No unit stop —
+				// boxd-dead does not prove guest-dead, and killing a live
+				// guest over a wedged agent is the false-negative the removed
+				// probe fell into; the reconciler owns a truly dead unit.
+				// persistStateIfPresent, not setStatus: a destroy racing this
+				// branch must not have its record deletion overwritten by an
+				// unconditional put.
+				existing.mu.Lock()
+				existing.Status = StatusError
+				existing.mu.Unlock()
+				m.persistStateIfPresent(existing)
+				return nil, fmt.Errorf("adopted VM %s boxd not ready: %w", vmID, err)
+			}
+			// The wait stretched the adoption window; re-check identity after
+			// it, as the fresh-restore path does, so a destroy landing
+			// mid-wait cannot be reported as a successful restore.
 			m.mu.RLock()
 			still := m.vms[vmID] == existing
 			m.mu.RUnlock()
 			if !still {
-				// A destroy raced the wait; match the sibling destroyed-paths.
 				return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 			}
-			if ctx.Err() != nil {
-				// The caller went away — no verdict on the VM, no teardown.
-				return nil, fmt.Errorf("adopted VM %s readiness unverified: %w", vmID, err)
-			}
-			// Definitive exhaustion: flip out of Running so the
-			// readiness-blind resume adoption cannot resurrect it (the resume
-			// fallback reverts without destroying). No unit stop — boxd-dead
-			// does not prove guest-dead, and killing a live guest over a
-			// wedged agent is the false-negative the removed probe fell into;
-			// the reconciler owns a truly dead unit. persistStateIfPresent,
-			// not setStatus: a destroy racing this branch must not have its
-			// record deletion overwritten by an unconditional put.
+			// Readiness is now proven; make that durable so the next restart
+			// reattaches a verified record instead of re-gating it forever.
 			existing.mu.Lock()
-			existing.Status = StatusError
+			existing.Unverified = false
 			existing.mu.Unlock()
 			m.persistStateIfPresent(existing)
-			return nil, fmt.Errorf("adopted VM %s boxd not ready: %w", vmID, err)
-		}
-		// The wait stretched the adoption window; re-check identity after it,
-		// as the fresh-restore path does, so a destroy landing mid-wait
-		// cannot be reported as a successful restore.
-		m.mu.RLock()
-		still := m.vms[vmID] == existing
-		m.mu.RUnlock()
-		if !still {
-			return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 		}
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
@@ -3550,7 +3561,8 @@ func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Dur
 
 // retriedLaunchTarget returns the tracked instance for vmID when a resume or
 // restore request is a retry of one that already completed: Running with the
-// SAME artifacts (a different snapshot must replace the VM as before).
+// SAME artifacts (a different snapshot must replace the VM as before). The
+// second result is true when the record is unverified (see VMRecord).
 //
 // Called while holding vmID's lifecycle lock, so Status is trustworthy: no
 // concurrent op is mid-flight, and a Running instance is a finished prior
@@ -3574,22 +3586,20 @@ var adoptionBoxdReady = func(ctx context.Context, m *Manager, ip string) error {
 	return m.waitForBoxd(ctx, ip, 30*time.Second)
 }
 
-func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) *VMInstance {
+func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) (*VMInstance, bool) {
 	m.mu.RLock()
 	existing := m.vms[vmID]
 	m.mu.RUnlock()
 	if existing == nil {
-		return nil
+		return nil, false
 	}
 	existing.mu.RLock()
 	running := existing.Status == StatusRunning
 	unverified := existing.Unverified
 	sameArtifacts := existing.SnapshotPath == snapshotPath && existing.MemFilePath == memPath
 	existing.mu.RUnlock()
-	// A reattached crash-window record never proved readiness; refusing it
-	// routes the caller to a fresh, fully-verified restore.
-	if !running || unverified || !sameArtifacts {
-		return nil
+	if !running || !sameArtifacts {
+		return nil, false
 	}
 	// Process-level liveness, not boxd readiness: a record can read Running
 	// while the firecracker died (crash while vmd was down, then a
@@ -3598,13 +3608,17 @@ func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) *VMIns
 	// warming one — the trap the removed boxd probe fell into. Inconclusive
 	// (systemctl slow) reads as alive: never relaunch on doubt.
 	if vmUnitDead(vmID) {
-		return nil
+		return nil, false
 	}
 	m.mu.RLock()
 	still := m.vms[vmID] == existing
 	m.mu.RUnlock()
 	if !still {
-		return nil
+		return nil, false
 	}
-	return existing
+	// needsVerify: a reattached crash-window record never proved boxd
+	// readiness. Restore adoption re-verifies such a target before adopting;
+	// resume adoption cannot verify (readiness-blind contract) and must
+	// refuse it.
+	return existing, unverified
 }
