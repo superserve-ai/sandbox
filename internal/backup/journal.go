@@ -139,10 +139,13 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 			if t.NotBefore.After(now) {
 				continue
 			}
-			if !found {
-				task = t
-				found = true
-			}
+			task = t
+			found = true
+			// Stop here: decoding the rest of a large outage backlog per
+			// drain would make draining quadratic. Corrupt entries sorted
+			// after this point are dropped by later calls as the queue
+			// empties toward them.
+			break
 		}
 		return nil
 	})
