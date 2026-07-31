@@ -36,10 +36,16 @@ DROP VIEW IF EXISTS analytics.weekly_team_sandbox_count;
 -- matters here: the latter would zero an eternally incomplete plan's
 -- missing resource forever, not just during launch.
 --
--- NULL propagates through the row's spend_usd sum, and SUM(spend_usd) in
--- the panel query skips NULL inputs, so panels summing spend exclude
--- unpriceable hours from a team's total rather than understating it with
--- a fabricated zero.
+-- A plain SUM(spend_usd) ignores NULL rows, so a range mixing priced and
+-- unpriceable hours would still return a plausible-looking partial total
+-- instead of surfacing the gap — the same silent-understatement failure
+-- mode this view exists to avoid. Aggregating queries (the Grafana panel
+-- included) must poison the whole total instead:
+--   SELECT team_name,
+--          CASE WHEN bool_and(spend_usd IS NOT NULL) THEN SUM(spend_usd) ELSE NULL END
+--   FROM analytics.team_hourly_spend
+--   GROUP BY team_name
+-- See TestAnalyticsTeamHourlySpend_MixedRangePoisonsAggregate.
 CREATE OR REPLACE VIEW analytics.team_hourly_spend AS
 SELECT t.name AS team_name,
        u.hour_start,
