@@ -253,6 +253,12 @@ type Manager struct {
 	// unitDead overrides the systemd unit-dead probe in tests; nil means
 	// the real probe. See unitConfirmedDead.
 	unitDead func(ctx context.Context, vmID string) bool
+	// pendingInFlight guards one pending-backup worker per VM across the
+	// startup recovery and the periodic sweep.
+	pendingInFlight sync.Map
+	// pendingSweepInterval overrides the pending-backup sweep pace in
+	// tests; 0 means pendingBackupSweepInterval.
+	pendingSweepInterval time.Duration
 
 	// launcherReady gates the launcher launch path: false → launches use the
 	// legacy path. Set when the namespace is built/validated; kept in sync by

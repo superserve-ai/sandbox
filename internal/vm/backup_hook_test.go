@@ -495,3 +495,92 @@ func TestOlderWorkerCannotDeleteNewerPendingRecord(t *testing.T) {
 		t.Fatalf("pending = %+v, want empty after owner delete", pending)
 	}
 }
+
+// An at-rest rehash whose hashing fails while the artifacts still exist
+// is transient: the record must survive for the sweep. Simulated by
+// making the disk path a directory, which stats fine but cannot hash.
+func TestRehashKeepsRecordOnTransientHashFailure(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	if err := os.WriteFile(snap, []byte("vm state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	diskDir := filepath.Join(dir, "rootfs.ext4")
+	if err := os.Mkdir(diskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+
+	pb := PendingBackup{VMID: "vm-1", SnapshotPath: snap, DiskPath: diskDir, Token: newPendingToken()}
+	if err := st.PutPendingBackup(pb); err != nil {
+		t.Fatal(err)
+	}
+	m.rehashPendingBackup(context.Background(), pb, zerolog.Nop())
+
+	pending, err := st.ListPendingBackups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending = %d, want transient failure to keep the record", len(pending))
+	}
+}
+
+// A record kept on an inconclusive proof must retry within this process
+// via the periodic sweep, not only at the next restart.
+func TestPendingSweepRetriesRetainedRecords(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// The probe is inconclusive at first, then confirms death: the sweep
+	// must pick the record up once the world settles.
+	var dead atomic.Bool
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		state:                st,
+		vms:                  map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead:             func(context.Context, string) bool { return dead.Load() },
+		pendingSweepInterval: 20 * time.Millisecond,
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	if err := st.PutPendingBackup(PendingBackup{VMID: "vm-1", SnapshotPath: snap, DiskPath: disk, Token: newPendingToken()}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.RecoverPendingBackups(ctx, zerolog.Nop())
+	time.Sleep(50 * time.Millisecond)
+	dead.Store(true)
+
+	select {
+	case task := <-tasks:
+		if task.SandboxID != "vm-1" {
+			t.Fatalf("swept task owner = %q, want vm-1", task.SandboxID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("sweep never retried the retained record")
+	}
+}

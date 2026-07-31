@@ -107,6 +107,14 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 // not change across the hash. Terminal outcomes clear the pending
 // record; only exhausted journal retries keep it for the next boot.
 func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) {
+	// One worker per VM: the periodic sweep and startup recovery may both
+	// find the same record while a worker is mid-hash, and a second
+	// concurrent hash of the same multi-GB artifacts buys nothing (the
+	// journal already dedupes the enqueue).
+	if _, busy := m.pendingInFlight.LoadOrStore(pb.VMID, struct{}{}); busy {
+		return
+	}
+	defer m.pendingInFlight.Delete(pb.VMID)
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 	defer cancel()
 	// Superseded (the instance is no longer paused on this snapshot)
@@ -147,11 +155,18 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		return
 	}
 	if !pauseManifestComplete(retried) {
-		// At-rest and still unhashable: the artifacts themselves are the
-		// problem, and retrying cannot improve on it.
-		log.Error().Str("vm_id", pb.VMID).
-			Msg("pause backup dropped: rehash also produced no enqueueable manifest")
-		m.deletePendingBackupIf(pb, log)
+		// Unhashable while at rest: only a provably MISSING artifact is
+		// unrecoverable (nothing will bring the file back for this
+		// pause). A transient open or read failure on files that still
+		// exist keeps the record; the periodic sweep retries it.
+		if fileMissing(pb.SnapshotPath) || fileMissing(pb.DiskPath) {
+			log.Error().Str("vm_id", pb.VMID).
+				Msg("pause backup dropped: artifact missing at rest")
+			m.deletePendingBackupIf(pb, log)
+			return
+		}
+		log.Warn().Str("vm_id", pb.VMID).
+			Msg("pause backup rehash failed transiently; keeping pending record")
 		return
 	}
 	// The rehash earned a complete manifest; a transient journal failure
@@ -160,24 +175,58 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	m.retryEnqueue(pb, retried, log)
 }
 
+// pendingBackupSweepInterval paces retries of retained pending records:
+// a record kept on an inconclusive proof or transient failure must not
+// wait for the next process restart to try again.
+const pendingBackupSweepInterval = 5 * time.Minute
+
 // RecoverPendingBackups re-runs every pause that still owed its backup
-// enqueue when the previous process exited. Call after reattach has
-// rebuilt the instance map: the at-rest proof reads it, and an empty map
-// would drop every record as superseded. No-op when backup is disabled
-// or persistence is off.
+// enqueue when the previous process exited, then keeps sweeping
+// periodically so records retained on transient failures retry within
+// this process's lifetime. Call after reattach has rebuilt the instance
+// map: the at-rest proof reads it, and an empty map would drop every
+// record as superseded. No-op when backup is disabled or persistence is
+// off.
 func (m *Manager) RecoverPendingBackups(ctx context.Context, log zerolog.Logger) {
 	if m.backupEnqueue == nil || m.state == nil {
 		return
 	}
+	m.runPendingBackups(ctx, log)
+	interval := m.pendingSweepInterval
+	if interval <= 0 {
+		interval = pendingBackupSweepInterval
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				m.runPendingBackups(ctx, log)
+			}
+		}
+	}()
+}
+
+func (m *Manager) runPendingBackups(ctx context.Context, log zerolog.Logger) {
 	pending, err := m.state.ListPendingBackups()
 	if err != nil {
 		log.Error().Err(err).Msg("pending backup recovery: list failed")
 		return
 	}
 	for _, pb := range pending {
-		log.Info().Str("vm_id", pb.VMID).Msg("recovering pending pause backup")
+		log.Info().Str("vm_id", pb.VMID).Msg("retrying pending pause backup")
 		go m.rehashPendingBackup(ctx, pb, log)
 	}
+}
+
+// fileMissing reports a definite ENOENT; any other stat outcome (success
+// or transient error) is not proof of absence.
+func fileMissing(path string) bool {
+	_, err := os.Stat(path)
+	return os.IsNotExist(err)
 }
 
 // retryEnqueue re-attempts a journal write for a manifest whose digests
