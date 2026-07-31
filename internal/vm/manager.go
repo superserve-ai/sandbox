@@ -914,10 +914,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// converges anyway: the control plane retries pause to paused rather than
 	// reverting, and a straggler unit is reclaimed by the reconciler.
 	unit := systemdUnitName(vmID)
+	stopConfirmed := true
 	stopCtx, stopCancel := context.WithTimeout(ctx, stopUnitBudget)
 	if err := stopUnit(stopCtx, unit); err != nil {
 		log.Warn().Err(err).Msg("systemctl stop failed during pause; retrying")
 		if serr := stopUnit(stopCtx, unit); serr != nil && !unitDefinitelyDead(stopCtx, unit) {
+			stopConfirmed = false
 			log.Error().Err(serr).Msg("unit still running after pause; reconciler will reclaim it")
 		}
 	}
@@ -940,8 +942,16 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// already-stopped unit; a budget-exhausted hash just yields a partial
 	// manifest, never a late response. Runs AFTER the paused status is
 	// recorded: the async rehash proves at-rest bytes against that status,
-	// and hashing before the flip would make it drop every retry.
-	manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
+	// and hashing before the flip would make it drop every retry. Skipped
+	// entirely when the unit is not confirmed stopped: a still-running
+	// Firecracker keeps writing the overlay, and the recorded StatusPaused
+	// would satisfy the rehash's at-rest proof while the bytes are live. A
+	// later retry pause backs the artifacts up once the unit is truly dead.
+	if stopConfirmed {
+		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
+	} else {
+		log.Warn().Msg("pause backup skipped: unit not confirmed stopped, bytes may still be changing")
+	}
 
 	log.Info().Msg("VM paused")
 	return snapshotPath, memPath, manifest, nil

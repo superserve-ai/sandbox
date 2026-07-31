@@ -73,18 +73,7 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 		// neither a rehash nor a still-paused sandbox.
 		log.Warn().Str("vm_id", vmID).
 			Msg("pause backup journal write failed; retrying enqueue")
-		go func() {
-			delay := time.Second
-			for attempt := 0; attempt < enqueueRetryAttempts; attempt++ {
-				time.Sleep(delay)
-				delay *= 2
-				if m.enqueueBackup(vmID, manifest) {
-					return
-				}
-			}
-			log.Error().Str("vm_id", vmID).
-				Msg("pause backup dropped: journal writes kept failing")
-		}()
+		go m.retryEnqueue(vmID, manifest, log)
 		return manifest
 	}
 	log.Warn().Str("vm_id", vmID).
@@ -116,11 +105,36 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 			return
 		}
 		if !m.enqueueBackup(vmID, retried) {
-			log.Error().Str("vm_id", vmID).
-				Msg("pause backup dropped: rehash also produced no enqueueable manifest")
+			if !pauseManifestComplete(retried) {
+				log.Error().Str("vm_id", vmID).
+					Msg("pause backup dropped: rehash also produced no enqueueable manifest")
+				return
+			}
+			// The rehash earned a complete manifest; a transient journal
+			// failure must not throw it away when the synchronous path's
+			// equivalent failure gets retries.
+			m.retryEnqueue(vmID, retried, log)
 		}
 	}()
 	return manifest
+}
+
+// retryEnqueue re-attempts a journal write for a manifest whose digests
+// already describe at-rest bytes: only the write failed, so no rehash
+// and no still-paused sandbox is needed (the uploader's pre-verification
+// catches divergence). Bounded backoff; a journal that keeps failing
+// drops the pause with an error log.
+func (m *Manager) retryEnqueue(vmID string, manifest []ManifestEntry, log zerolog.Logger) {
+	delay := time.Second
+	for attempt := 0; attempt < enqueueRetryAttempts; attempt++ {
+		time.Sleep(delay)
+		delay *= 2
+		if m.enqueueBackup(vmID, manifest) {
+			return
+		}
+	}
+	log.Error().Str("vm_id", vmID).
+		Msg("pause backup dropped: journal writes kept failing")
 }
 
 // pausedAt reports whether the sandbox is currently paused on exactly

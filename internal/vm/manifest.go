@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/singleflight"
 )
 
 // ManifestEntry describes one durable artifact file finalized by a pause:
@@ -151,6 +152,11 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 // file's identity misses the cache and rehashes.
 var baseDigestCache sync.Map
 
+// baseDigestGroup coalesces concurrent cache misses for the same base
+// identity: a batch of overlay sandboxes pausing together against a cold
+// base must produce one hash, not one per pause.
+var baseDigestGroup singleflight.Group
+
 // baseDigest returns the content digest of a base image, cached. The
 // identity is re-checked after hashing: a base swapped mid-hash yields
 // an error (and an incomplete manifest, which the retry path owns)
@@ -163,19 +169,28 @@ func baseDigest(ctx context.Context, path string) (string, error) {
 	if v, ok := baseDigestCache.Load(key); ok {
 		return v.(string), nil
 	}
-	sum, _, err := hashFile(ctx, path)
+	v, err, _ := baseDigestGroup.Do(key, func() (any, error) {
+		if v, ok := baseDigestCache.Load(key); ok {
+			return v.(string), nil
+		}
+		sum, _, err := hashFile(ctx, path)
+		if err != nil {
+			return "", err
+		}
+		after, err := baseIdentity(path)
+		if err != nil {
+			return "", err
+		}
+		if after != key {
+			return "", fmt.Errorf("base image %s changed while hashing", path)
+		}
+		baseDigestCache.Store(key, sum)
+		return sum, nil
+	})
 	if err != nil {
 		return "", err
 	}
-	after, err := baseIdentity(path)
-	if err != nil {
-		return "", err
-	}
-	if after != key {
-		return "", fmt.Errorf("base image %s changed while hashing", path)
-	}
-	baseDigestCache.Store(key, sum)
-	return sum, nil
+	return v.(string), nil
 }
 
 func baseIdentity(path string) (string, error) {

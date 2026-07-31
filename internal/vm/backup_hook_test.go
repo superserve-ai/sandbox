@@ -228,3 +228,52 @@ func TestBackupPauseNeverEnqueuesWithoutVMStateDigest(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 	}
 }
+
+// A transient journal failure after a successful rehash must get the
+// same retries as the synchronous complete-manifest path: the rehash
+// earned the manifest, one flaky write must not drop it.
+func TestBackupPauseRetriesJournalWriteAfterRehash(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var calls atomic.Int32
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{vms: map[string]*VMInstance{
+		"vm-1": {Status: StatusPaused, SnapshotPath: snap},
+	}}
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		// First attempt is the rehash's own enqueue; fail it once.
+		if calls.Add(1) == 1 {
+			return errors.New("transient journal failure")
+		}
+		tasks <- task
+		return nil
+	})
+
+	// Expired deadline: the synchronous path hashes nothing, so the first
+	// enqueue attempt happens inside the rehash goroutine.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
+	defer cancel()
+	if got := m.backupPause(ctx, "vm-1", snap, disk, "", zerolog.Nop()); len(got) != 0 {
+		t.Fatalf("synchronous manifest = %v, want none", got)
+	}
+
+	select {
+	case task := <-tasks:
+		names := make(map[string]bool, len(task.Files))
+		for _, f := range task.Files {
+			names[f.Name] = true
+		}
+		if !names["rootfs.ext4"] || !names["vmstate.snap"] {
+			t.Fatalf("retried task files = %v, want the full pair", names)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("journal retry after rehash never delivered the task")
+	}
+}
