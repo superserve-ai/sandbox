@@ -396,9 +396,15 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming';
 -- One snapshot per sandbox; the unique index on snapshot.sandbox_id keys
 -- the UPSERT.
 WITH target AS (
+  -- FOR UPDATE is load-bearing: the data-modifying CTEs below run even
+  -- when the final UPDATE matches zero rows, so eligibility must be
+  -- decided under the row lock. A concurrent finalize blocks here, then
+  -- re-evaluates the status against the committed row and reads nothing,
+  -- which keeps every downstream CTE empty instead of writing stray rows.
   SELECT id, team_id FROM sandbox
   WHERE id = @id AND team_id = @team_id AND destroyed_at IS NULL
     AND status IN ('pausing', 'resuming')
+  FOR UPDATE
 ),
 upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
@@ -485,9 +491,16 @@ SELECT (to_regclass('public.snapshot_sandbox_unique') IS NOT NULL)::bool AS lega
 -- the same reason. Prior generations' rows and manifests are untouched;
 -- that is the point.
 WITH target AS (
+  -- FOR UPDATE serializes generation allocation and gates the CTE writes:
+  -- without it, two overlapping finalizes could both read the same
+  -- max(generation) and both insert, and PostgreSQL would keep the losing
+  -- statement's CTE inserts even though its final UPDATE matched zero
+  -- rows. Under the lock the loser re-reads a no-longer-eligible status,
+  -- target is empty, and nothing downstream writes.
   SELECT id, team_id FROM sandbox
   WHERE id = @id AND team_id = @team_id AND destroyed_at IS NULL
     AND status IN ('pausing', 'resuming')
+  FOR UPDATE
 ),
 inserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation)

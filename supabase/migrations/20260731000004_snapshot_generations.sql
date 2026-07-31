@@ -16,5 +16,11 @@
 ALTER TABLE snapshot ADD COLUMN generation bigint NOT NULL DEFAULT 1;
 ALTER TABLE snapshot ADD COLUMN name text CHECK (name IS NULL OR char_length(name) BETWEEN 1 AND 64);
 
-CREATE INDEX snapshot_sandbox_generation
+-- UNIQUE is the backstop for generation allocation: finalizes serialize
+-- on the sandbox row lock, so a duplicate (sandbox_id, generation) can
+-- only arise from a bug, and it must surface as an insert error rather
+-- than silently forked history. Existing rows all hold the default
+-- generation 1 and at most one row per sandbox (legacy unique index), so
+-- the index creates cleanly.
+CREATE UNIQUE INDEX snapshot_sandbox_generation
     ON snapshot (sandbox_id, generation DESC);

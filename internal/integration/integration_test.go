@@ -25,6 +25,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -5359,6 +5360,132 @@ func TestIntegration_FinalizePause_GenerationModes(t *testing.T) {
 // routedFinalize mirrors the control plane's mode routing: legacy upsert
 // while snapshot_sandbox_unique exists, generation inserts after the
 // contract phase drops it.
+// Two finalizers racing the same pause must produce exactly one new
+// generation: the loser's statement takes the sandbox row lock second,
+// re-reads a no-longer-eligible status, and writes nothing at all, not
+// even through its data-modifying CTEs. Without the lock both would read
+// the same max(generation) and the loser's snapshot and manifest inserts
+// would survive its zero-row head update.
+func TestIntegration_FinalizePause_ConcurrentFinalizesAllocateOneGeneration(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"concurrent-finalize"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	// Generations mode (this test DB only), same pattern as
+	// TestIntegration_FinalizePause_GenerationModes.
+	if _, err := testPool.Exec(ctx, `DROP INDEX IF EXISTS snapshot_sandbox_unique`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(),
+			`CREATE UNIQUE INDEX IF NOT EXISTS snapshot_sandbox_unique ON snapshot (sandbox_id)`)
+	})
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(),
+			`DELETE FROM snapshot WHERE sandbox_id = $1 AND id NOT IN (
+			   SELECT snapshot_id FROM sandbox WHERE id = $1 AND snapshot_id IS NOT NULL)`, sandboxID)
+	})
+
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+
+	mem := "/snapshots/" + sid + "/mem.snap"
+	finalizeWith := func(path, digest string) (uuid.UUID, error) {
+		return testQueries.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
+			ID: sandboxID, TeamID: teamID, Path: path, MemPath: &mem, SizeBytes: 1024, Trigger: "pause",
+			ManifestFileNames: []string{"vmstate.snap"},
+			ManifestPaths:     []string{path},
+			ManifestSizes:     []int64{1024},
+			ManifestDigests:   []string{digest},
+			ManifestBasePaths: []string{""},
+		})
+	}
+
+	var wg sync.WaitGroup
+	ids := make([]uuid.UUID, 2)
+	errs := make([]error, 2)
+	inputs := []struct{ path, digest string }{
+		{"/snapshots/" + sid + "/a/vmstate.snap", strings.Repeat("a", 64)},
+		{"/snapshots/" + sid + "/b/vmstate.snap", strings.Repeat("b", 64)},
+	}
+	for i := range inputs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i], errs[i] = finalizeWith(inputs[i].path, inputs[i].digest)
+		}(i)
+	}
+	wg.Wait()
+
+	winners := 0
+	var winner uuid.UUID
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			winners++
+			winner = ids[i]
+		case errors.Is(err, pgx.ErrNoRows):
+			// The loser reads an ineligible status under the lock and
+			// returns zero rows, exactly like a stale finalize.
+		default:
+			t.Fatalf("finalizer %d failed unexpectedly: %v", i, err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("winners = %d, want exactly 1", winners)
+	}
+
+	var rows int
+	var maxGen int64
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*), max(generation) FROM snapshot WHERE sandbox_id = $1`, sandboxID).Scan(&rows, &maxGen); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 || maxGen != 1 {
+		t.Fatalf("snapshot rows=%d maxGen=%d, want exactly one row at generation 1", rows, maxGen)
+	}
+	var distinct int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(DISTINCT generation) FROM snapshot WHERE sandbox_id = $1`, sandboxID).Scan(&distinct); err != nil {
+		t.Fatal(err)
+	}
+	if distinct != rows {
+		t.Fatalf("duplicate generations: %d rows, %d distinct", rows, distinct)
+	}
+
+	// The head points at the winner, and only the winner's manifest exists.
+	var headID uuid.UUID
+	if err := testPool.QueryRow(ctx, `SELECT snapshot_id FROM sandbox WHERE id = $1`, sandboxID).Scan(&headID); err != nil {
+		t.Fatal(err)
+	}
+	if headID != winner {
+		t.Fatalf("head = %s, want winner %s", headID, winner)
+	}
+	var manifests int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM artifact_manifest m JOIN snapshot s ON s.id = m.snapshot_id WHERE s.sandbox_id = $1`, sandboxID).Scan(&manifests); err != nil {
+		t.Fatal(err)
+	}
+	if manifests != 1 {
+		t.Fatalf("manifest rows = %d, want only the winner's single entry", manifests)
+	}
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM sandbox WHERE id = $1`, sandboxID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "paused" {
+		t.Fatalf("status = %q, want paused", status)
+	}
+}
+
 func routedFinalize(ctx context.Context, t *testing.T, params db.FinalizePauseParams) (uuid.UUID, error) {
 	t.Helper()
 	legacy, err := testQueries.HasLegacySnapshotUnique(ctx)
