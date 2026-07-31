@@ -262,6 +262,48 @@ func TestRestoreGenerationRejectsManifestMissingEntries(t *testing.T) {
 	}
 }
 
+func TestVerifyFileDetectsDataWrittenIntoDeclaredHole(t *testing.T) {
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+	destDir := filepath.Join(t.TempDir(), "restored")
+	if _, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	var manifest GenerationManifest
+	if err := json.Unmarshal(store.objects[genObject(task, ManifestObject)], &manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bytes landing inside a manifest-declared hole (the fixture overlay is
+	// hole from 64KiB to 2MiB): verification must hash what is actually in
+	// the file, so this cannot pass as synthetic zeros.
+	f, err := os.OpenFile(filepath.Join(destDir, "overlay.ext4"), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(bytes.Repeat([]byte{0xEE}, 4096), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.OpenRoot(destDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	verr := verifyFile(context.Background(), root, manifest.Files[0])
+	if verr == nil || !strings.Contains(verr.Error(), "sha256 mismatch") {
+		t.Fatalf("err = %v, want sha256 mismatch for data written into a declared hole", verr)
+	}
+	// The untouched file still verifies against the same manifest entry.
+	if err := verifyFile(context.Background(), root, manifest.Files[1]); err != nil {
+		t.Fatalf("untouched file failed verification: %v", err)
+	}
+}
+
 func TestOpenRootNoFollowRejectsSymlinkLeaf(t *testing.T) {
 	// The leaf being a symlink at open time must be rejected by the open
 	// itself (kernel-atomic O_NOFOLLOW on linux; Lstat approximation

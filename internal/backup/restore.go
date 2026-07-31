@@ -324,25 +324,33 @@ func validExtents(mf ManifestFile) error {
 	return nil
 }
 
-// verifyFile recomputes the full apparent digest of the rebuilt file with
-// the same logic the uploader used (hashApparent over the manifest's extent
-// table) and compares it to the manifest's recorded digest. The open is
-// relative to the pinned root so verification reads the file that was
-// written, not something swapped in at the path.
+// verifyFile recomputes the full apparent digest of the rebuilt file and
+// compares it to the manifest's recorded digest. The open is relative to
+// the pinned root so verification reads the file that was written, not
+// something swapped in at the path.
+//
+// The extent geometry is derived from the restored file itself, never
+// taken from the manifest: hashing manifest-declared holes as synthetic
+// zeros would miss bytes written into a hole after materialization, and
+// verification would bless contents it never read. From the file's own
+// geometry, a hole hashed as zeros is genuinely a hole on disk (nothing
+// can hide there) and every data extent is read back. On filesystems
+// without hole tracking this degrades to hashing the complete file,
+// correct, just not compact.
 func verifyFile(ctx context.Context, root *os.Root, mf ManifestFile) error {
 	f, err := root.Open(mf.Name)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	fi, err := f.Stat()
+	extents, apparent, err := Extents(f)
 	if err != nil {
-		return err
+		return fmt.Errorf("extents: %w", err)
 	}
-	if fi.Size() != mf.Size {
-		return fmt.Errorf("apparent size %d, manifest records %d", fi.Size(), mf.Size)
+	if apparent != mf.Size {
+		return fmt.Errorf("apparent size %d, manifest records %d", apparent, mf.Size)
 	}
-	sum, err := hashApparent(ctx, f, mf.Extents, mf.Size)
+	sum, err := hashApparent(ctx, f, extents, apparent)
 	if err != nil {
 		return err
 	}
