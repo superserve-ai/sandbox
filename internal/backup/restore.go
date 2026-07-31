@@ -192,6 +192,13 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 	if err := json.NewDecoder(rc).Decode(&manifest); err != nil {
 		return nil, fmt.Errorf("parse manifest %s: %w", object, err)
 	}
+	// The manifest records its own identity; a manifest copied or misplaced
+	// under another prefix could otherwise restore a different sandbox's
+	// generation with every digest passing.
+	if manifest.SandboxID != sandboxID || manifest.Generation != generation {
+		return nil, fmt.Errorf("manifest identity mismatch: %s records %s/%s, requested %s/%s",
+			object, manifest.SandboxID, manifest.Generation, sandboxID, generation)
+	}
 	return &manifest, nil
 }
 

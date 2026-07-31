@@ -15,6 +15,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"cloud.google.com/go/storage"
 
@@ -42,7 +44,12 @@ func main() {
 		os.Exit(2)
 	}
 
-	ctx := context.Background()
+	// A canceled context is how RestoreGeneration's all-or-nothing cleanup
+	// runs on SIGINT/SIGTERM: default signal handling would kill the process
+	// mid-write and leave a partial destination the fresh-directory check
+	// then rejects on retry.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	client, err := storage.NewClient(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "storage client: %v\n", err)

@@ -210,6 +210,23 @@ func TestRestoreGenerationMissingManifestIsIncomplete(t *testing.T) {
 	}
 }
 
+func TestRestoreGenerationRejectsMisplacedManifest(t *testing.T) {
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+
+	// Copy the whole generation under another sandbox's prefix, the way a
+	// bucket-side mistake would: every digest still verifies, so only the
+	// manifest's recorded identity can catch the misplacement.
+	for name, data := range store.objects {
+		store.objects[strings.Replace(name, "sb-restore", "sb-victim", 1)] = data
+	}
+	_, err := RestoreGeneration(context.Background(), store, "sb-victim", task.Generation, filepath.Join(t.TempDir(), "restored"))
+	if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("err = %v, want manifest identity mismatch", err)
+	}
+}
+
 func TestRestoreGenerationRejectsEntryWithoutObject(t *testing.T) {
 	task := writeRestoreFixture(t, t.TempDir())
 	store := newMemBlobs()
