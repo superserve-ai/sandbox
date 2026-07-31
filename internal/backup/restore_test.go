@@ -275,6 +275,54 @@ func TestRestoreGenerationRefusesPopulatedDest(t *testing.T) {
 	}
 }
 
+func TestRestoreFileNeverOpensExistingDest(t *testing.T) {
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+	var manifest GenerationManifest
+	if err := json.Unmarshal(store.objects["sandboxes/sb-restore/gen-r1/manifest.json"], &manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	// A file that appears between the emptiness check and the open (a
+	// concurrent restore, or a planted symlink): O_EXCL must refuse it,
+	// report the file as not created, and leave it untouched.
+	dest := filepath.Join(t.TempDir(), "overlay.ext4")
+	if err := os.WriteFile(dest, []byte("someone else's file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	madeFile, err := restoreFile(context.Background(), store, task.SandboxID, task.Generation, manifest.Files[0], dest)
+	if err == nil || !errors.Is(err, os.ErrExist) {
+		t.Fatalf("err = %v, want ErrExist", err)
+	}
+	if madeFile {
+		t.Fatal("restoreFile claims to have created a pre-existing file")
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil || string(got) != "someone else's file" {
+		t.Fatalf("pre-existing file disturbed: %q err=%v", got, err)
+	}
+}
+
+func TestHashApparentHonorsCancellationMidExtent(t *testing.T) {
+	// A dense file is a single extent; cancellation must interrupt hashing
+	// inside it, not only at hole boundaries.
+	path := filepath.Join(t.TempDir(), "dense")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0xCC}, 4<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := hashApparent(ctx, f, []Extent{{Offset: 0, Length: 4 << 20}}, 4<<20); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
 func TestListGenerationsReportsOnlyComplete(t *testing.T) {
 	task := writeRestoreFixture(t, t.TempDir())
 	store := newMemBlobs()

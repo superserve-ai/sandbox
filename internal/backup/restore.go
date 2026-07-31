@@ -143,8 +143,11 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 			return fail(fmt.Errorf("manifest file name: %w", err))
 		}
 		dest := filepath.Join(destDir, mf.Name)
-		created = append(created, dest)
-		if err := restoreFile(ctx, r, sandboxID, generation, mf, dest); err != nil {
+		madeFile, err := restoreFile(ctx, r, sandboxID, generation, mf, dest)
+		if madeFile {
+			created = append(created, dest)
+		}
+		if err != nil {
 			return fail(fmt.Errorf("restore %s: %w", mf.Name, err))
 		}
 	}
@@ -211,47 +214,54 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 // The object is fetched by the manifest entry's recorded Object name, never
 // derived from the file name: the name embeds the packing fingerprint, so
 // this entry's extent table describes exactly the object it points at.
-func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string, mf ManifestFile, dest string) error {
+//
+// The destination is opened O_EXCL: ensureFreshDir's emptiness check and
+// this open are separate operations, so exclusive creation is what
+// guarantees an existing file (or a symlink planted in between) is never
+// opened, truncated, or followed. madeFile reports whether this call
+// created dest, and only then may the caller's failure cleanup remove it.
+func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string, mf ManifestFile, dest string) (madeFile bool, _ error) {
 	if mf.Object == "" {
-		return fmt.Errorf("manifest entry records no object name")
+		return false, fmt.Errorf("manifest entry records no object name")
 	}
 	if err := validSegment(mf.Object); err != nil {
-		return fmt.Errorf("manifest object name: %w", err)
+		return false, fmt.Errorf("manifest object name: %w", err)
 	}
 	if err := validExtents(mf); err != nil {
-		return err
+		return false, err
 	}
 	object, err := SandboxObject(sandboxID, generation, mf.Object)
 	if err != nil {
-		return err
+		return false, err
 	}
 	rc, err := r.NewReader(ctx, object)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer rc.Close()
-	f, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		return err
+		return false, err
 	}
+	madeFile = true
 	defer f.Close()
 	for _, e := range mf.Extents {
 		if err := ctx.Err(); err != nil {
-			return err
+			return madeFile, err
 		}
 		if _, err := io.CopyN(io.NewOffsetWriter(f, e.Offset), rc, e.Length); err != nil {
-			return fmt.Errorf("extent at %d: %w", e.Offset, err)
+			return madeFile, fmt.Errorf("extent at %d: %w", e.Offset, err)
 		}
 	}
 	// The packed object must hold exactly the extent table's bytes; trailing
 	// data means object and manifest disagree.
 	if n, _ := io.CopyN(io.Discard, rc, 1); n != 0 {
-		return fmt.Errorf("packed object longer than extent table (%d bytes)", PackedSize(mf.Extents))
+		return madeFile, fmt.Errorf("packed object longer than extent table (%d bytes)", PackedSize(mf.Extents))
 	}
 	if err := f.Truncate(mf.Size); err != nil {
-		return err
+		return madeFile, err
 	}
-	return f.Close()
+	return madeFile, f.Close()
 }
 
 // validExtents rejects extent tables that could not have come from the
