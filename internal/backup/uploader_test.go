@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -448,5 +449,55 @@ func TestUploaderTrustsHistoryForUnchangedRepause(t *testing.T) {
 	}
 	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
 		t.Fatalf("re-pause task still pending: %v", counts)
+	}
+}
+
+func TestJournalSameContentSandboxesDoNotCollide(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
+	// Two untouched clones of one template: identical content-addressed
+	// generation, identical enqueue tick. Both backups must survive.
+	a := Task{SandboxID: "sb-a", Generation: "samegen", Priority: PriorityPause, EnqueuedAt: base}
+	b := Task{SandboxID: "sb-b", Generation: "samegen", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Enqueue(b); err != nil {
+		t.Fatal(err)
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 2 {
+		t.Fatalf("same-tick same-content enqueues collided: %v", counts)
+	}
+}
+
+func TestJournalPruneSweepsHistoryAcrossAcks(t *testing.T) {
+	j, _ := testJournal(t)
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	for i := 0; i < 200; i++ {
+		if err := j.MarkVerified(fmt.Sprintf("sandboxes/sb/gen/obj-%03d", i), old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Each ack examines a bounded slice; successive acks sweep the rest.
+	task := Task{SandboxID: "sb", Generation: "g", Priority: PriorityPause,
+		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)}
+	for i := 0; i < 5; i++ {
+		if err := j.Ack(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	remaining := 0
+	if err := j.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(verifiedBucket).ForEach(func(k, _ []byte) error {
+			if string(k) != string(pruneCursorKey) {
+				remaining++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expired history not fully swept: %d entries remain", remaining)
 	}
 }

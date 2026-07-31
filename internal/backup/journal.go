@@ -93,6 +93,13 @@ var (
 // generation is already complete in the bucket).
 const verifiedRetention = 14 * 24 * time.Hour
 
+// pruneExamineLimit bounds verification-history entries examined per ack.
+const pruneExamineLimit = 64
+
+// pruneCursorKey persists the prune resume position inside the bucket
+// (prefixed so it sorts apart from object names, which never start NUL).
+var pruneCursorKey = []byte("\x00prune_cursor")
+
 // NewJournal opens (creating if needed) the journal bucket in db. The
 // caller owns the bolt DB; sharing vmd's state DB keeps one fsync domain.
 func NewJournal(db *bolt.DB) (*Journal, error) {
@@ -110,10 +117,14 @@ func NewJournal(db *bolt.DB) (*Journal, error) {
 	return &Journal{db: db}, nil
 }
 
-// key orders the queue: priority, then enqueue time, then generation for
-// uniqueness. Bolt iterates keys in byte order, so Next is a prefix scan.
+// key orders the queue: priority, then enqueue time, then the owner and
+// generation for uniqueness. The owner is load-bearing: generations are
+// content-addressed, so two untouched sandboxes cloned from one template
+// share a generation, and without the owner segment a same-tick enqueue
+// would collide keys and silently drop one sandbox's backup. Bolt
+// iterates keys in byte order, so Next is a prefix scan.
 func (t *Task) key() []byte {
-	return []byte(fmt.Sprintf("%d/%020d/%s", t.Priority, t.EnqueuedAt.UnixNano(), t.Generation))
+	return []byte(fmt.Sprintf("%d/%020d/%s/%s", t.Priority, t.EnqueuedAt.UnixNano(), t.SandboxID, t.Generation))
 }
 
 // indexKey is the pending-generation identity for the dedupe index.
@@ -252,19 +263,46 @@ func (j *Journal) Ack(task Task) error {
 		if err := tx.Bucket(indexBucket).Delete(task.indexKey()); err != nil {
 			return err
 		}
+		// Bounded incremental prune: examine at most pruneExamineLimit
+		// entries per ack, resuming from a persisted cursor position and
+		// wrapping, so every ack does O(1) work while the whole history
+		// still gets swept over successive acks.
 		vb := tx.Bucket(verifiedBucket)
 		c := vb.Cursor()
-		pruned := 0
-		for k, v := c.First(); k != nil && pruned < 128; k, v = c.Next() {
-			var ns int64
-			if _, err := fmt.Sscanf(string(v), "%d", &ns); err != nil || now.Sub(time.Unix(0, ns)) > verifiedRetention {
-				if err := c.Delete(); err != nil {
-					return err
-				}
-				pruned++
-			}
+		start := vb.Get(pruneCursorKey)
+		var k, v []byte
+		if start != nil {
+			k, v = c.Seek(start)
+		} else {
+			k, v = c.First()
 		}
-		return nil
+		// seen counts every visited key (cursor sentinel included) so the
+		// loop terminates even when only the sentinel remains.
+		for seen := 0; seen < pruneExamineLimit; seen++ {
+			if k == nil {
+				k, v = c.First()
+				if k == nil {
+					break
+				}
+			}
+			if string(k) != string(pruneCursorKey) {
+				var ns int64
+				if _, err := fmt.Sscanf(string(v), "%d", &ns); err != nil || now.Sub(time.Unix(0, ns)) > verifiedRetention {
+					if err := c.Delete(); err != nil {
+						return err
+					}
+				}
+			}
+			k, v = c.Next()
+		}
+		var next []byte
+		if k != nil {
+			next = append([]byte(nil), k...)
+		}
+		if next == nil {
+			return vb.Delete(pruneCursorKey)
+		}
+		return vb.Put(pruneCursorKey, next)
 	})
 }
 
