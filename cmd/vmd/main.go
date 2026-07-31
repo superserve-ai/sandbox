@@ -505,7 +505,28 @@ func main() {
 				log.Error().Err(err).Str("sandbox_id", t.SandboxID).Msg("backup enqueue failed")
 			}
 		})
-		lc.start("backup uploader", func() error { return uploader.Run(ctx) })
+		// The uploader must fully stop before the journal and GCS client
+		// close under it: a verification or Nack cut off mid-write leaves
+		// a finalized object the journal never recorded, which the
+		// create-only retry later treats as an unverified dedupe and
+		// abandons. Closers run LIFO, so registering this join after the
+		// journal and client closers stops the loop first; Run finishes
+		// its current task's journal writes before returning.
+		upCtx, upCancel := context.WithCancel(ctx)
+		upDone := make(chan struct{})
+		lc.addCloser("backup uploader", func(sctx context.Context) error {
+			upCancel()
+			select {
+			case <-upDone:
+				return nil
+			case <-sctx.Done():
+				return fmt.Errorf("backup uploader did not stop: %w", sctx.Err())
+			}
+		})
+		lc.start("backup uploader", func() error {
+			defer close(upDone)
+			return uploader.Run(upCtx)
+		})
 		log.Info().Str("bucket", bucket).Int("bandwidth_mbps", mbps).Msg("backup uploader enabled")
 	}
 
