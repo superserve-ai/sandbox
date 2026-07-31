@@ -2048,8 +2048,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// timeout here is destructive — the error path below tears down the VM.
 	if err := m.waitForBoxd(ctx, hostIP, 30*time.Second); err != nil {
 		// Join before setStatus(StatusError) persists, or the goroutine's
-		// Running write could land after the Error write.
+		// Running write could land after the Error write. Mirror the success
+		// path's post-join check: a concurrent destroy erased the record, and
+		// the joined write must not resurrect it — setStatus alone can't fix
+		// this (it no-ops on an untracked VM).
 		<-persistDone
+		m.mu.RLock()
+		_, stillTracked := m.vms[vmID]
+		m.mu.RUnlock()
+		if !stillTracked {
+			m.deleteState(vmID)
+		}
 		m.stopUnitDuringRestoreError(vmID)
 		if !inPlace {
 			m.netMgr.CleanupVM(vmID)
