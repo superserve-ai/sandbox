@@ -31,9 +31,9 @@ WITH rates AS (
     WHERE plan_key = 'payg' AND effective_to IS NULL
 )
 SELECT t.name AS team_name,
-       SUM(u.vcpu_seconds) * (SELECT price_usd FROM rates WHERE resource = 'vcpu')
+       (SUM(u.vcpu_seconds) * (SELECT price_usd FROM rates WHERE resource = 'vcpu')
        + SUM(u.memory_mib_seconds) / 1024 * (SELECT price_usd FROM rates WHERE resource = 'memory_gib')
-       + SUM(u.storage_mib_seconds) / 1024 * (SELECT price_usd FROM rates WHERE resource = 'storage_gib')
+       + SUM(u.storage_mib_seconds) / 1024 * (SELECT price_usd FROM rates WHERE resource = 'storage_gib'))::numeric(14,6)
        AS spend_usd
 FROM team_billing_usage_hourly u
 JOIN team t ON t.id = u.team_id
