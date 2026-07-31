@@ -96,6 +96,11 @@ func (u *Uploader) Run(ctx context.Context) error {
 				return nil
 			case <-time.After(tick):
 			}
+			// Retry any undelivered completion signal on the idle tick:
+			// a flush that failed (or a ClearNotification that lost its
+			// race with a crash) would otherwise wait for the next ack,
+			// which on an idle host never comes.
+			u.flushNotifications()
 		}
 	}
 }
@@ -261,13 +266,21 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// Persist that these exact object bytes were verified BEFORE any
 		// further progress, both in the task (survives nacks) and in the
 		// durable history (survives acks): a later retry or an unchanged
-		// re-pause may then trust a dedupe of this object.
+		// re-pause may then trust a dedupe of this object. The in-memory
+		// task adopts the record only after the durable write commits:
+		// trust that reached disk in neither place must not ride into the
+		// Nack, or the retry would dedupe against history that does not
+		// exist.
+		verified := task.VerifiedObjects
 		if !task.HasVerified(object) {
-			task.VerifiedObjects = append(task.VerifiedObjects, object)
+			verified = append(append([]string(nil), task.VerifiedObjects...), object)
 		}
-		if err := u.Journal.RecordVerification(*task, object, time.Now()); err != nil {
+		next := *task
+		next.VerifiedObjects = verified
+		if err := u.Journal.RecordVerification(next, object, time.Now()); err != nil {
 			return ManifestFile{}, fmt.Errorf("record verification of %s: %w", object, err)
 		}
+		task.VerifiedObjects = verified
 	} else if !task.HasVerified(object) {
 		// The object already existed (dedupe). Stream consumption proves
 		// nothing here: small objects buffer fully before the

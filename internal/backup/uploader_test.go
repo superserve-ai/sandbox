@@ -557,3 +557,44 @@ func TestAbandonedAckLeavesNoNotification(t *testing.T) {
 		t.Fatalf("outbox = %+v, want empty", pending)
 	}
 }
+
+// A verification write that never reached disk must not ride into the
+// Nack inside the task's VerifiedObjects: the retry would then trust a
+// dedupe against durable history that does not exist.
+func TestFailedVerificationWriteNotCarriedIntoTask(t *testing.T) {
+	dir := t.TempDir()
+	db, err := bolt.Open(filepath.Join(dir, "backup.db"), 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := NewJournal(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data := []byte("artifact bytes")
+	path := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	task := Task{
+		SandboxID:  "sb",
+		Generation: "gen",
+		EnqueuedAt: time.Unix(1, 0),
+		Files:      []TaskFile{{Name: "rootfs.ext4", Path: path, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))}},
+	}
+
+	// Force the durable verification write to fail after the object
+	// itself uploads and verifies cleanly.
+	db.Close()
+
+	u := &Uploader{Journal: j, Store: newMemStore()}
+	_, err = u.uploadFile(context.Background(), &task, task.Files[0])
+	if err == nil {
+		t.Fatal("uploadFile succeeded despite a failed verification write")
+	}
+	if len(task.VerifiedObjects) != 0 {
+		t.Fatalf("task carries unverified trust %v after failed verification write", task.VerifiedObjects)
+	}
+}

@@ -27,6 +27,7 @@ on:
       - 'cmd/secretsproxy/**'
       - 'proto/**'
       - 'internal/vm/**'
+      - 'internal/backup/**'
       - 'internal/network/**'
       - 'internal/builder/**'
       - 'internal/db/**'
