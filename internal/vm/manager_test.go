@@ -981,7 +981,7 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 		}
 	}
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5",
 		SnapshotPath: snapPath, MemFilePath: memPath,
 	}
 	mgr := &Manager{
@@ -1031,7 +1031,7 @@ func TestRestoreVMSnapshot_AdoptionWaitCanceled_LeavesVMUntouched(t *testing.T) 
 		}
 	}
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
 		SnapshotPath: snapPath, MemFilePath: memPath,
 	}
 	mgr := &Manager{
@@ -1075,7 +1075,7 @@ func TestRestoreVMSnapshot_DestroyedDuringAdoptionWait_Fails(t *testing.T) {
 		}
 	}
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
 		SnapshotPath: snapPath, MemFilePath: memPath,
 	}
 	mgr := &Manager{
@@ -1110,7 +1110,7 @@ func TestRestoreVMSnapshot_AdoptedButBoxdNeverReady_Fails(t *testing.T) {
 		}
 	}
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
 		SnapshotPath: snapPath, MemFilePath: memPath,
 	}
 	mgr := &Manager{
@@ -1145,7 +1145,7 @@ func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
 	// The live VM was restored from other artifacts: the request must NOT
 	// short-circuit to it, even with boxd healthy.
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5",
 		SnapshotPath: filepath.Join(dir, "old-vmstate.snap"),
 		MemFilePath:  filepath.Join(dir, "old-mem.snap"),
 	}
@@ -1167,7 +1167,7 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	defer func() { vmUnitDead = orig }()
 
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5",
 		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
 		MemFilePath:  "/snapshots/vm-1/mem.snap",
 	}
@@ -1190,7 +1190,7 @@ func TestResumeVM_UnverifiedRecord_NotAdopted(t *testing.T) {
 	defer func() { vmUnitDead = orig }()
 
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
 		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
 		MemFilePath:  "/snapshots/vm-1/mem.snap",
 	}
@@ -1269,7 +1269,7 @@ func TestRestoreVMSnapshot_RunningRecordButUnitDead_NotReturned(t *testing.T) {
 		}
 	}
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5",
 		SnapshotPath: snapPath, MemFilePath: memPath,
 	}
 	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
@@ -1308,7 +1308,7 @@ func TestRetriedLaunchTargetFlagsUnverifiedRecord(t *testing.T) {
 	defer func() { vmUnitDead = orig }()
 
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
 		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
 		MemFilePath:  "/snapshots/vm-1/mem.snap",
 	}
@@ -1373,7 +1373,7 @@ func TestRestoreVMSnapshot_VerifiedRecordAfterRestart_Adopted(t *testing.T) {
 	}
 
 	inst := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
 		SnapshotPath: snapPath, MemFilePath: memPath,
 	}
 	mgr := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
@@ -1438,7 +1438,7 @@ func TestRestoreVMSnapshot_UnverifiedRecordAfterRestart_ReverifiedAndAdopted(t *
 	}
 
 	inst := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
 		SnapshotPath: snapPath, MemFilePath: memPath,
 	}
 	mgr := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
