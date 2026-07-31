@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -248,4 +249,68 @@ func keysOf(m map[string][]byte) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// midStreamMutator reads half of an object's stream, invokes the hook (the
+// test mutates the source file there), then reads the rest: the shape of a
+// sandbox resuming while the bandwidth-capped upload is in flight.
+type midStreamMutator struct {
+	*memStore
+	target string
+	hook   func()
+	fired  bool
+}
+
+func (m *midStreamMutator) Create(ctx context.Context, object string, r io.Reader) error {
+	if object != m.target || m.fired {
+		return m.memStore.Create(ctx, object, r)
+	}
+	m.fired = true
+	var buf bytes.Buffer
+	if _, err := io.CopyN(&buf, r, 4); err != nil {
+		return err
+	}
+	m.hook()
+	if _, err := io.Copy(&buf, r); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.objects[object] = buf.Bytes()
+	return nil
+}
+
+func TestUploaderWithholdsManifestOnMidStreamMutation(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	store := &midStreamMutator{
+		memStore: newMemStore(),
+		target:   "sandboxes/sb-1/gen-abc/overlay.ext4",
+		hook: func() {
+			// Mutate AFTER the pre-check passed and mid-upload: the second
+			// half of the stream ships different bytes.
+			if err := os.WriteFile(task.Files[0].Path, []byte("diskMUTA"), 0o644); err != nil {
+				t.Error(err)
+			}
+		},
+	}
+	var verified []Task
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	// The artifact object may exist (inert orphan), but the completion
+	// marker must not, the hook must not fire, and the task is done.
+	if _, ok := store.objects["sandboxes/sb-1/gen-abc/manifest.json"]; ok {
+		t.Fatal("manifest written despite mid-stream mutation")
+	}
+	if len(verified) != 0 {
+		t.Fatal("verification hook fired despite mid-stream mutation")
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("task still pending: %v", counts)
+	}
 }

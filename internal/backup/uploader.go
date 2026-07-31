@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"time"
@@ -174,12 +175,8 @@ func (u *Uploader) uploadFile(ctx context.Context, task Task, file TaskFile) (Ma
 		return ManifestFile{}, fmt.Errorf("extents %s: %w", file.Path, err)
 	}
 	// Verify the source still matches the digest recorded at pause time
-	// before any bytes ship. Data extents are read twice (verify, then
-	// upload); at tens of MB per artifact the second pass is page-cache
-	// warm. A residual race remains between this check and the upload
-	// completing; a mutated upload in that window fails restore-side
-	// digest verification and the generation is simply unusable, never
-	// silently wrong.
+	// before any bytes ship: a cheap early abort for the common mutation
+	// case (the sandbox resumed before the drain).
 	sum, err := hashApparent(ctx, f, extents, apparent)
 	if err != nil {
 		return ManifestFile{}, fmt.Errorf("verify %s: %w", file.Path, err)
@@ -193,9 +190,22 @@ func (u *Uploader) uploadFile(ctx context.Context, task Task, file TaskFile) (Ma
 	if err != nil {
 		return ManifestFile{}, err
 	}
-	reader := &limitedReader{r: NewPackedReader(f, extents), limiter: u.Limiter, ctx: ctx}
+	// The stream hasher digests the apparent content of what is ACTUALLY
+	// shipped (packed bytes as streamed, zeros for the holes), closing the
+	// window the pre-check cannot: a mutation while the bandwidth-capped
+	// upload streams would ship bytes that no longer match the recorded
+	// digest. On mismatch the generation is abandoned before its manifest
+	// object is written, and a generation without its completion marker is
+	// never restored from; the orphaned artifact object is inert.
+	hasher := newApparentStreamHasher(NewPackedReader(f, extents), extents, apparent)
+	reader := &limitedReader{r: hasher, limiter: u.Limiter, ctx: ctx}
 	if err := u.Store.Create(ctx, object, reader); err != nil {
 		return ManifestFile{}, err
+	}
+	if shipped, complete := hasher.finish(); complete && shipped != file.SHA256 {
+		u.Log.Warn().Str("path", file.Path).Str("want", file.SHA256).Str("got", shipped).
+			Msg("backup source changed during upload; abandoning generation")
+		return ManifestFile{}, errSourceChanged
 	}
 	return ManifestFile{
 		Name:       file.Name,
@@ -265,4 +275,73 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// apparentStreamHasher digests the apparent content of the bytes flowing
+// through it: packed data as streamed, plus zeros for the holes between
+// extents, so its sum is directly comparable to the pause manifest digest.
+type apparentStreamHasher struct {
+	r        io.Reader
+	extents  []Extent
+	apparent int64
+	h        hash.Hash
+	idx      int   // extent currently being consumed
+	inExt    int64 // data bytes consumed within extents[idx]
+	pos      int64 // apparent offset hashed so far
+	zeros    []byte
+	consumed int64 // total packed bytes seen
+}
+
+func newApparentStreamHasher(r io.Reader, extents []Extent, apparent int64) *apparentStreamHasher {
+	return &apparentStreamHasher{r: r, extents: extents, apparent: apparent, h: sha256.New(), zeros: make([]byte, 64<<10)}
+}
+
+func (a *apparentStreamHasher) hashZerosTo(target int64) {
+	for a.pos < target {
+		n := target - a.pos
+		if n > int64(len(a.zeros)) {
+			n = int64(len(a.zeros))
+		}
+		a.h.Write(a.zeros[:n])
+		a.pos += n
+	}
+}
+
+func (a *apparentStreamHasher) Read(p []byte) (int, error) {
+	n, err := a.r.Read(p)
+	rest := p[:n]
+	for len(rest) > 0 && a.idx < len(a.extents) {
+		ext := a.extents[a.idx]
+		a.hashZerosTo(ext.Offset)
+		remain := ext.Length - a.inExt
+		take := int64(len(rest))
+		if take > remain {
+			take = remain
+		}
+		a.h.Write(rest[:take])
+		a.inExt += take
+		a.pos += take
+		rest = rest[take:]
+		if a.inExt == ext.Length {
+			a.idx++
+			a.inExt = 0
+		}
+	}
+	a.consumed += int64(n)
+	return n, err
+}
+
+// finish returns the digest of the streamed apparent content and whether
+// the stream was fully consumed. A create-only store that already had the
+// object (dedupe, the 412 path) consumes none or only part of the stream;
+// those stored bytes were stream-verified when the object was first
+// written, so the caller skips the comparison instead of failing. The one
+// gap, a crash between an object's create and its verification followed by
+// a mutation, is caught by restore-side digest verification.
+func (a *apparentStreamHasher) finish() (string, bool) {
+	if a.consumed != PackedSize(a.extents) {
+		return "", false
+	}
+	a.hashZerosTo(a.apparent)
+	return hex.EncodeToString(a.h.Sum(nil)), true
 }
