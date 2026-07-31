@@ -226,5 +226,10 @@ func baseIdentity(path string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("base image %s: no stat identity", path)
 	}
-	return fmt.Sprintf("%s|%d|%d|%d|%d", path, st.Dev, st.Ino, fi.Size(), fi.ModTime().UnixNano()), nil
+	// ctime is load-bearing: a timestamp-preserving in-place rewrite can
+	// keep the device, inode, size, and restored mtime all identical,
+	// but userspace cannot set ctime back, so any content or metadata
+	// change is visible there.
+	return fmt.Sprintf("%s|%d|%d|%d|%d|%d",
+		path, st.Dev, st.Ino, fi.Size(), fi.ModTime().UnixNano(), st.Ctim.Nano()), nil
 }

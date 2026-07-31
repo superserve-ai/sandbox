@@ -196,3 +196,41 @@ func TestHashBudgetFollowsCallerDeadline(t *testing.T) {
 		t.Fatal("sub-margin deadline should yield no budget")
 	}
 }
+
+// A base rewritten in place with its mtime restored (same inode, same
+// size) must still miss the digest cache: ctime cannot be forged from
+// userspace, so the identity sees the rewrite.
+func TestBaseDigestDetectsTimestampPreservingRewrite(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(base, []byte("basebytesv1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1, err := baseDigest(context.Background(), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Kernel inode timestamps come from the coarse clock (jiffy
+	// granularity), so a rewrite in the same tick would share the ctime;
+	// real timestamp-preserving copies are never that fast.
+	time.Sleep(50 * time.Millisecond)
+	// Same length, different bytes, mtime restored.
+	if err := os.WriteFile(base, []byte("basebytesv2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(base, fi.ModTime(), fi.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	v2, err := baseDigest(context.Background(), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v1 == v2 {
+		t.Fatal("timestamp-preserving rewrite served the stale cached digest")
+	}
+}
