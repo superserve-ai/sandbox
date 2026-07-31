@@ -786,7 +786,17 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			return "", "", nil, status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
 		}
 		log.Info().Msg("pause: VM already paused, returning existing snapshot")
-		manifest := m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, log)
+		// The recorded StatusPaused is not proof the unit stopped: the
+		// original pause records it even when both stop attempts failed
+		// (skipping that attempt's backup). This retry must not launder
+		// that skip through a status the at-rest checks trust, so it
+		// backs up only once the unit is confirmed dead.
+		var manifest []ManifestEntry
+		if unitDefinitelyDead(ctx, systemdUnitName(vmID)) {
+			manifest = m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, log)
+		} else {
+			log.Warn().Msg("pause backup skipped on retry: unit not confirmed dead")
+		}
 		return snapshotPath, memPath, manifest, nil
 	}
 	inst.mu.RUnlock()
