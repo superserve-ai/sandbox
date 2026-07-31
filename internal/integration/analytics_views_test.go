@@ -12,11 +12,11 @@ import (
 
 // A mixed range (one hour with a matching rate for every resource, one hour
 // missing a resource's rate) must poison the aggregate to NULL rather than
-// silently returning the priced hour's subtotal — see the Grafana panel
-// query for analytics.team_hourly_spend, which uses this exact
-// bool_and(spend_usd IS NOT NULL) pattern. Reviewed on #304 (Alejandro):
-// SUM() alone ignores NULL rows, so a partial gap would still look like a
-// plausible total instead of surfacing as incomplete.
+// silently returning the priced hour's subtotal, matching the Grafana
+// panel query for analytics.team_hourly_spend and its
+// bool_and(spend_usd IS NOT NULL) pattern. SUM() alone ignores NULL rows,
+// so a partial gap would still look like a plausible total instead of
+// surfacing as incomplete.
 func TestAnalyticsTeamHourlySpend_MixedRangePoisonsAggregate(t *testing.T) {
 	ctx := context.Background()
 	suffix := uuid.NewString()[:8]
