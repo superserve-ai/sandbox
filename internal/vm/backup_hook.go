@@ -108,15 +108,17 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	// find the same record while a worker is mid-hash, and a second
 	// concurrent hash of the same multi-GB artifacts buys nothing (the
 	// journal already dedupes the enqueue).
+	// Heal BEFORE the busy guard: a newer pause whose initial persist
+	// failed while an older worker holds the in-flight slot would
+	// otherwise exit here with neither a durable marker nor a worker.
+	// Healing is newest-wins, so this durably records the newest pause
+	// even when it cannot run yet; the sweep picks it up after the older
+	// worker's exact-token cleanup no-ops against it.
+	m.healPendingBackup(pb, log)
 	if _, busy := m.pendingInFlight.LoadOrStore(pb.VMID, struct{}{}); busy {
 		return
 	}
 	defer m.pendingInFlight.Delete(pb.VMID)
-	// First act: make the record durable. The launching pause's persist
-	// can have failed, and a crash before the first keep-path would then
-	// leave no trace; healing here shrinks the undurable window to this
-	// line instead of the whole hash.
-	m.healPendingBackup(pb, log)
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 	defer cancel()
 	// Superseded (the instance is no longer paused on this snapshot)
@@ -341,8 +343,10 @@ func newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath string) Pending
 // pendingTokenCounter disambiguates tokens minted in the same nanosecond.
 var pendingTokenCounter atomic.Uint64
 
+// Tokens are fixed-width so lexical order is creation order: healing is
+// newest-wins and needs to compare ownership age.
 func newPendingToken() string {
-	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), pendingTokenCounter.Add(1))
+	return fmt.Sprintf("%020d-%012d", time.Now().UnixNano(), pendingTokenCounter.Add(1))
 }
 
 // atRest reports whether a sandbox's artifacts are provably not being

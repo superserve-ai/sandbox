@@ -708,3 +708,64 @@ func TestRehashRefusesReplacedBase(t *testing.T) {
 		t.Fatalf("pending = %+v, want the unrecoverable record dropped", pending)
 	}
 }
+
+// A newer pause whose initial persist failed while an older worker holds
+// the in-flight slot must still leave a durable marker: the heal runs
+// before the busy guard and is newest-wins.
+func TestBusyGuardStillPersistsNewerMarker(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	m := &Manager{
+		state:    st,
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+	// An older worker holds the slot.
+	m.pendingInFlight.Store("vm-1", struct{}{})
+
+	pb := newPendingBackup("vm-1", "/snap", "/disk", "")
+	m.rehashPendingBackup(context.Background(), pb, zerolog.Nop())
+
+	pending, err := st.ListPendingBackups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Token != pb.Token {
+		t.Fatalf("pending = %+v, want the newer marker persisted despite the busy worker", pending)
+	}
+}
+
+// Healing replaces an older pause's stale row but never a newer one.
+func TestHealIsNewestWins(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	older := newPendingBackup("vm-1", "/a", "/b", "")
+	newer := newPendingBackup("vm-1", "/c", "/d", "")
+
+	if err := st.PutPendingBackup(older); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutPendingBackupIfOwner(newer); err != nil {
+		t.Fatal(err)
+	}
+	pending, _ := st.ListPendingBackups()
+	if len(pending) != 1 || pending[0].Token != newer.Token {
+		t.Fatalf("pending = %+v, want newer to replace older", pending)
+	}
+	if err := st.PutPendingBackupIfOwner(older); err != nil {
+		t.Fatal(err)
+	}
+	pending, _ = st.ListPendingBackups()
+	if len(pending) != 1 || pending[0].Token != newer.Token {
+		t.Fatalf("pending = %+v, want older heal rejected", pending)
+	}
+}

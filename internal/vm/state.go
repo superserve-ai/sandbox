@@ -643,10 +643,11 @@ func (s *StateStore) DeletePendingBackup(vmID string) error {
 	})
 }
 
-// PutPendingBackupIfOwner writes the marker only when the slot is empty
-// or already owned by the same token: async workers re-persist their
-// record to heal a failed initial write, and must not overwrite the
-// record of a newer pause that has since claimed the key.
+// PutPendingBackupIfOwner writes the marker when the slot is empty,
+// owned by the same token, or owned by an OLDER token (tokens are
+// fixed-width creation-ordered): healing re-persists a record to repair
+// a failed initial write, and the newest pause always wins the slot
+// while a newer record is never overwritten by an older worker.
 func (s *StateStore) PutPendingBackupIfOwner(p PendingBackup) error {
 	data, err := json.Marshal(p)
 	if err != nil {
@@ -656,7 +657,7 @@ func (s *StateStore) PutPendingBackupIfOwner(p PendingBackup) error {
 		b := tx.Bucket(pendingBackupBucketName)
 		if v := b.Get([]byte(p.VMID)); v != nil {
 			var cur PendingBackup
-			if json.Unmarshal(v, &cur) == nil && cur.Token != p.Token {
+			if json.Unmarshal(v, &cur) == nil && cur.Token > p.Token {
 				return nil
 			}
 		}
