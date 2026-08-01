@@ -312,6 +312,22 @@ func (u *Uploader) verificationKey(object string) string {
 	return u.Store.Identity() + "\x00" + object
 }
 
+// verifiedHere reports whether this task or this host's history has
+// verified the object against the current bucket, accepting records
+// written by pre-scoping binaries (plain object names) as a fallback:
+// those were only ever earned against the host's single configured
+// bucket, and refusing them would abandon generations that are provably
+// complete. Scoped records are the only kind written going forward.
+func (u *Uploader) verifiedHere(task *Task, object string) (bool, error) {
+	if task.HasVerified(u.verificationKey(object)) || task.HasVerified(object) {
+		return true, nil
+	}
+	if ok, err := u.Journal.WasVerified(u.verificationKey(object), u.clock()); err != nil || ok {
+		return ok, err
+	}
+	return u.Journal.WasVerified(object, u.clock())
+}
+
 func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (ManifestFile, error) {
 	if file.Name == ManifestObject {
 		return ManifestFile{}, fmt.Errorf("artifact name %q collides with the manifest object", file.Name)
@@ -366,12 +382,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// was pre-verified above, the name embeds digest and packing
 		// fingerprint, and the extent table here describes this host's
 		// packing of content the history already vouches for.
-		verified := task.HasVerified(u.verificationKey(object))
-		if !verified {
-			if ok, err := u.Journal.WasVerified(u.verificationKey(object), u.clock()); err == nil && ok {
-				verified = true
-			}
-		}
+		verified, _ := u.verifiedHere(task, object)
 		if verified {
 			u.Log.Info().Str("object", object).
 				Msg("shared object verified previously; skipping stream")
@@ -464,7 +475,9 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 			return ManifestFile{}, fmt.Errorf("record shared dedupe of %s: %w", object, err)
 		}
 		task.VerifiedObjects = next.VerifiedObjects
-	} else if !task.HasVerified(u.verificationKey(object)) {
+	} else if ok, err := u.verifiedHere(task, object); err != nil {
+		return ManifestFile{}, err
+	} else if !ok {
 		// The object already existed (dedupe). Stream consumption proves
 		// nothing here: small objects buffer fully before the
 		// precondition failure arrives. The object may be a completed
@@ -474,15 +487,9 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// discriminator, and without it the generation is abandoned
 		// rather than completed over bytes nothing can vouch for (this
 		// identity cannot read them back).
-		wasVerified, err := u.Journal.WasVerified(u.verificationKey(object), u.clock())
-		if err != nil {
-			return ManifestFile{}, err
-		}
-		if !wasVerified {
-			u.Log.Warn().Str("object", object).Str("sandbox_id", task.SandboxID).
-				Msg("deduped object has no verification history; abandoning generation")
-			return ManifestFile{}, errSourceChanged
-		}
+		u.Log.Warn().Str("object", object).Str("sandbox_id", task.SandboxID).
+			Msg("deduped object has no verification history; abandoning generation")
+		return ManifestFile{}, errSourceChanged
 	}
 	return ManifestFile{
 		Name:       file.Name,

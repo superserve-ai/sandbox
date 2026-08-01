@@ -1372,3 +1372,46 @@ func ageStagingTree(t *testing.T, root string) {
 		return nil
 	})
 }
+
+// Verification records written by pre-scoping binaries carry plain
+// object names; refusing them after an upgrade would abandon
+// generations that are provably complete. The legacy fallback honors
+// them for the current bucket.
+func TestLegacyUnscopedVerificationRecordsStillTrusted(t *testing.T) {
+	dir := t.TempDir()
+	j, _ := testJournal(t)
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store}
+
+	data := []byte("artifact")
+	path := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	files := []TaskFile{{Name: "rootfs.ext4", Path: path, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data))}}
+	task := Task{SandboxID: "sb", Generation: GenerationKey(files), Files: files, EnqueuedAt: time.Unix(1, 0)}
+
+	// Pre-create the object (dedupe on upload) and seed a LEGACY
+	// unscoped verification record, as a pre-upgrade binary would have.
+	f, _ := os.Open(path)
+	extents, apparent, err := Extents(f)
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, _ := SandboxObject("sb", task.Generation, "rootfs.ext4.p"+PackFingerprint(extents, apparent))
+	store.objects[object] = []byte("already uploaded")
+	seed := Task{SandboxID: "seed", Generation: "seed-gen", EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(seed); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordVerification(seed, object, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	completed, err := u.uploadTask(context.Background(), &task)
+	if err != nil || !completed {
+		t.Fatalf("upload with legacy record: completed=%v err=%v (want dedupe trusted)", completed, err)
+	}
+}
