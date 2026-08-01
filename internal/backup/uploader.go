@@ -301,6 +301,17 @@ const stagingSweepInterval = 30 * time.Minute
 // resume's next pause enqueues the corrective generation under a new key.
 var errSourceChanged = errors.New("backup source changed since pause")
 
+// verificationKey scopes a verification record to the destination
+// bucket: history is proof that THIS bucket holds verified bytes under
+// the name, and a host repointed at a different bucket must re-establish
+// existence by streaming rather than trusting records earned elsewhere.
+// (Deletion from the same bucket is a control-plane GC invariant: a
+// shared base may only be reaped when no manifest references it, with
+// enough grace to cover in-flight generations.)
+func (u *Uploader) verificationKey(object string) string {
+	return u.Store.Identity() + "\x00" + object
+}
+
 func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (ManifestFile, error) {
 	if file.Name == ManifestObject {
 		return ManifestFile{}, fmt.Errorf("artifact name %q collides with the manifest object", file.Name)
@@ -355,9 +366,9 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// was pre-verified above, the name embeds digest and packing
 		// fingerprint, and the extent table here describes this host's
 		// packing of content the history already vouches for.
-		verified := task.HasVerified(object)
+		verified := task.HasVerified(u.verificationKey(object))
 		if !verified {
-			if ok, err := u.Journal.WasVerified(object, u.clock()); err == nil && ok {
+			if ok, err := u.Journal.WasVerified(u.verificationKey(object), u.clock()); err == nil && ok {
 				verified = true
 			}
 		}
@@ -408,8 +419,8 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// Nack, or the retry would dedupe against history that does not
 		// exist.
 		verified := task.VerifiedObjects
-		if !task.HasVerified(object) {
-			verified = append(append([]string(nil), task.VerifiedObjects...), object)
+		if !task.HasVerified(u.verificationKey(object)) {
+			verified = append(append([]string(nil), task.VerifiedObjects...), u.verificationKey(object))
 		}
 		next := *task
 		next.VerifiedObjects = verified
@@ -420,7 +431,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// down, the whole pipeline is down with it anyway.
 		var recErr error
 		for attempt, delay := 0, 100*time.Millisecond; attempt < 3; attempt, delay = attempt+1, delay*2 {
-			if recErr = u.Journal.RecordVerification(next, object, u.clock()); recErr == nil {
+			if recErr = u.Journal.RecordVerification(next, u.verificationKey(object), u.clock()); recErr == nil {
 				break
 			}
 			time.Sleep(delay)
@@ -446,14 +457,14 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		u.Log.Info().Str("object", object).
 			Msg("shared object already present; trusting content-addressed dedupe")
 		next := *task
-		if !next.HasVerified(object) {
-			next.VerifiedObjects = append(append([]string(nil), task.VerifiedObjects...), object)
+		if !next.HasVerified(u.verificationKey(object)) {
+			next.VerifiedObjects = append(append([]string(nil), task.VerifiedObjects...), u.verificationKey(object))
 		}
-		if err := u.Journal.RecordVerification(next, object, u.clock()); err != nil {
+		if err := u.Journal.RecordVerification(next, u.verificationKey(object), u.clock()); err != nil {
 			return ManifestFile{}, fmt.Errorf("record shared dedupe of %s: %w", object, err)
 		}
 		task.VerifiedObjects = next.VerifiedObjects
-	} else if !task.HasVerified(object) {
+	} else if !task.HasVerified(u.verificationKey(object)) {
 		// The object already existed (dedupe). Stream consumption proves
 		// nothing here: small objects buffer fully before the
 		// precondition failure arrives. The object may be a completed
@@ -463,7 +474,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// discriminator, and without it the generation is abandoned
 		// rather than completed over bytes nothing can vouch for (this
 		// identity cannot read them back).
-		wasVerified, err := u.Journal.WasVerified(object, u.clock())
+		wasVerified, err := u.Journal.WasVerified(u.verificationKey(object), u.clock())
 		if err != nil {
 			return ManifestFile{}, err
 		}

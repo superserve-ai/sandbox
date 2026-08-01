@@ -35,6 +35,8 @@ func newMemStore() *memStore {
 	return &memStore{objects: map[string][]byte{}, fail: map[string]error{}, creates: map[string]int{}}
 }
 
+func (m *memStore) Identity() string { return "test-bucket" }
+
 func (m *memStore) Create(_ context.Context, object string, r io.Reader) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1299,9 +1301,14 @@ func TestSharedDedupeRecordsHistoryForFutureSkips(t *testing.T) {
 	if store.creates[baseObject] != 1 {
 		t.Fatalf("base Create calls = %d, want exactly the deduped attempt", store.creates[baseObject])
 	}
-	ok, err := j.WasVerified(baseObject, time.Now())
+	ok, err := j.WasVerified("test-bucket\x00"+baseObject, time.Now())
 	if err != nil || !ok {
 		t.Fatalf("dedupe not recorded in verification history: ok=%v err=%v", ok, err)
+	}
+	// A different bucket's identity must not see this history.
+	other, err := j.WasVerified("other-bucket\x00"+baseObject, time.Now())
+	if err != nil || other {
+		t.Fatalf("verification history leaked across buckets: ok=%v err=%v", other, err)
 	}
 }
 

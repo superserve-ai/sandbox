@@ -21,6 +21,10 @@ type BlobStore interface {
 	// writer buffers the whole stream before the precondition failure
 	// arrives, so stream consumption says nothing about what is stored.
 	Create(ctx context.Context, object string, r io.Reader) (created bool, err error)
+	// Identity names the destination (the bucket) so verification
+	// records can be scoped to it: history earned against one bucket
+	// proves nothing about another.
+	Identity() string
 }
 
 // GCSStore implements BlobStore against a bucket using ifGenerationMatch=0
@@ -28,12 +32,15 @@ type BlobStore interface {
 // is the dedupe signal, not an error.
 type GCSStore struct {
 	bucket *storage.BucketHandle
+	name   string
 }
 
 // NewGCSStore builds a store for the cell's backup bucket.
 func NewGCSStore(client *storage.Client, bucket string) *GCSStore {
-	return &GCSStore{bucket: client.Bucket(bucket)}
+	return &GCSStore{bucket: client.Bucket(bucket), name: bucket}
 }
+
+func (s *GCSStore) Identity() string { return s.name }
 
 func (s *GCSStore) Create(ctx context.Context, object string, r io.Reader) (bool, error) {
 	// The writer gets its own cancelable context: on a mid-copy failure the
