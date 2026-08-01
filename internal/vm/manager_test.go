@@ -1143,3 +1143,37 @@ func TestInstanceRunning(t *testing.T) {
 		t.Fatal("absent instance must not report running")
 	}
 }
+
+// A socket-missing record whose unit stop cannot be confirmed must keep its
+// BoltDB record: deleting it would leave a live Firecracker no record points
+// to, invisible to the next reattach. In this environment systemd is absent,
+// so the stop fails and the dead-probe is inconclusive — exactly the
+// unconfirmed case.
+func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst != nil || ok {
+		t.Fatal("a socket-missing record must not reattach as live")
+	}
+	present, err := store.Has("vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !present {
+		t.Fatal("an unconfirmed stop must keep the record so the unit stays findable")
+	}
+}

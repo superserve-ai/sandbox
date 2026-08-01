@@ -2276,9 +2276,15 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				// The unit is still active, so stop Firecracker before we forget
 				// the record and tear down its netns — otherwise it keeps running
 				// as an orphan burning CPU/RAM and holding TAP fds in a namespace
-				// we're about to delete out from under it.
-				if err := stopUnit(ctx, systemdUnitName(rec.ID)); err != nil {
-					log.Warn().Err(err).Msg("systemctl stop failed for socket-missing VM")
+				// we're about to delete out from under it. The stop gets its own
+				// budget (this ctx may be nearly spent), and an unconfirmed stop
+				// keeps the record: the next reattach retries it and the
+				// reconciler still knows the unit, while deleting on an
+				// unconfirmed stop would leave a live unit no record points to.
+				unit := systemdUnitName(rec.ID)
+				if err := stopUnitWithBudget(ctx, unit); err != nil && !unitDefinitelyDead(ctx, unit) {
+					log.Warn().Err(err).Msg("unit not confirmed stopped; keeping record for retry")
+					return nil, false
 				}
 				m.state.Delete(rec.ID)
 				m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)

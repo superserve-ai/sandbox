@@ -172,7 +172,7 @@ func stopJobResult(unit, res string) error {
 // among ready cases), and a completed job's signal may have been lost with the
 // connection — check both before reporting failure, so a stop that actually
 // finished never reads as failed. The probe is detached and bounded: at most
-// 2s past a spent caller deadline, buying one truthful answer; it changes only
+// 2s past the spent stop context, buying one truthful answer; it changes only
 // the reported outcome, never any persisted state.
 func settleExpiredStopWait(ctx context.Context, unit string, ch <-chan string, waitErr error) error {
 	select {
@@ -303,8 +303,9 @@ func unitActiveState(ctx context.Context, unit string) (activeNow, handled bool)
 }
 
 // stopUnitBudget covers `systemctl stop` blocking up to TimeoutStopSec plus
-// margin for host I/O contention. The pause path caps its whole stop phase
-// at this OR the caller's remaining deadline, whichever is shorter.
+// margin for host I/O contention. The pause path runs its whole stop phase
+// (both attempts + dead-check) on this budget, detached from the caller's
+// deadline.
 const stopUnitBudget = 15 * time.Second
 
 // stopUnitWithBudget stops a unit on a detached context with its own budget,
