@@ -38,6 +38,8 @@ func newMemBlobs() *memBlobs {
 	}
 }
 
+func (m *memBlobs) Identity() string { return "test-bucket" }
+
 func (m *memBlobs) Create(_ context.Context, object string, r io.Reader) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
