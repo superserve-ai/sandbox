@@ -408,9 +408,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// Flip the DB row with the already-grace-qualified reap: Drift 1
 		// cleared its marker while the unit was active, so leaving the row
 		// Active would advertise a dead sandbox for another full grace.
+		// Compare-and-set: a relaunch queued on the lock (or a resume the
+		// control plane already started) owns the row now, not this pass's
+		// snapshot.
 		if dbSandboxes != nil {
 			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
-				r.markFailedInDB(ctx, id)
+				r.markFailedInDBIfActive(ctx, id)
 			}
 		}
 		r.writeAudit(ctx, id, "error_unit_stop", "live unit for error-status record", "boltdb_error_unit_active")
@@ -930,6 +933,25 @@ func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) {
 	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()
 	if err := r.cfg.DB.MarkSandboxFailed(qctx, id); err != nil {
+		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to mark sandbox failed in DB")
+	}
+}
+
+// markFailedInDBIfActive is markFailedInDB with compare-and-set semantics:
+// the row flips only while it still reads 'active', so an action taken from
+// a pass-start snapshot cannot overwrite a concurrent relaunch's row.
+func (r *Reconciler) markFailedInDBIfActive(ctx context.Context, vmID string) {
+	if r.cfg.DB == nil {
+		return
+	}
+	id, err := uuid.Parse(vmID)
+	if err != nil {
+		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: invalid vm_id for DB mark-failed")
+		return
+	}
+	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
+	if err := r.cfg.DB.MarkSandboxFailedIfActive(qctx, id); err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to mark sandbox failed in DB")
 	}
 }

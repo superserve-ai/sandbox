@@ -1908,6 +1908,35 @@ func (q *Queries) MarkSandboxFailed(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
+const markSandboxFailedIfActive = `-- name: MarkSandboxFailedIfActive :exec
+WITH failed AS (
+  UPDATE sandbox
+  SET status = 'failed', auto_delete_at = NULL, updated_at = now()
+  WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL AND sandbox.status = 'active'
+  RETURNING id
+),
+closed_active AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
+  WHERE sandbox_id IN (SELECT id FROM failed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+UPDATE sandbox_compute_billing_interval
+SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
+WHERE sandbox_id IN (SELECT id FROM failed)
+  AND ended_at IS NULL
+`
+
+// Compare-and-set variant of MarkSandboxFailed for actions taken from a
+// pass-start snapshot: the row flips only while it still reads 'active', so
+// a relaunch or resume that already moved it on is never overwritten. Same
+// atomic interval close.
+func (q *Queries) MarkSandboxFailedIfActive(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markSandboxFailedIfActive, id)
+	return err
+}
+
 const markSandboxFailedInTeam = `-- name: MarkSandboxFailedInTeam :exec
 WITH failed AS (
   UPDATE sandbox

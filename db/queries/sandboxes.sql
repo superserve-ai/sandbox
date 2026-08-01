@@ -304,6 +304,29 @@ SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
 WHERE sandbox_id IN (SELECT id FROM failed)
   AND ended_at IS NULL;
 
+-- name: MarkSandboxFailedIfActive :exec
+-- Compare-and-set variant of MarkSandboxFailed for actions taken from a
+-- pass-start snapshot: the row flips only while it still reads 'active', so
+-- a relaunch or resume that already moved it on is never overwritten. Same
+-- atomic interval close.
+WITH failed AS (
+  UPDATE sandbox
+  SET status = 'failed', auto_delete_at = NULL, updated_at = now()
+  WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL AND sandbox.status = 'active'
+  RETURNING id
+),
+closed_active AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
+  WHERE sandbox_id IN (SELECT id FROM failed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+UPDATE sandbox_compute_billing_interval
+SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
+WHERE sandbox_id IN (SELECT id FROM failed)
+  AND ended_at IS NULL;
+
 -- name: MarkSandboxFailedInTeam :exec
 -- Like MarkSandboxFailed but with a team_id tenant check, used by handler
 -- and reaper paths that know which team owns the sandbox. Same atomic
