@@ -2289,9 +2289,10 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				// we're about to delete out from under it. An unconfirmed stop
 				// keeps the record — deleting it would leave a live unit no
 				// record points to — but flipped to Error: a socket-less VM can
-				// never be managed again, so no retry may adopt it. Recovery is
-				// the caller-driven relaunch or destroy, both of which stop the
-				// unit on their own budget.
+				// never be managed again, so no retry may adopt it. A
+				// caller-driven relaunch or destroy stops the unit on its own
+				// budget; failing that, the reconciler's error-unit rule reaps
+				// it.
 				if !staleUnitStopConfirmed(ctx, systemdUnitName(rec.ID)) {
 					rec.Status = StatusError
 					if err := m.state.Put(rec); err != nil {

@@ -348,6 +348,47 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
+	// Drift 8: BoltDB record in Error but its systemd unit is still active.
+	// Reattach parks an unmanageable VM this way (unit alive, API socket
+	// gone, stop unconfirmed) so no request path adopts it; no other rule
+	// stops the unit, which otherwise burns CPU/RAM until a user-driven
+	// relaunch or destroy. Keyed on BoltDB + systemd only, so it runs in
+	// both DB modes; statuses are fetched per active unit to keep the
+	// common pass ID-only.
+	errorRecord := func(id string) bool {
+		if bolted != nil {
+			rec, ok := bolted[id]
+			return ok && rec.Status == StatusError
+		}
+		if _, ok := boltedIDs[id]; !ok {
+			return false
+		}
+		rec, err := r.mgr.state.Get(id)
+		return err == nil && rec != nil && rec.Status == StatusError
+	}
+	for id := range active {
+		if !errorRecord(id) {
+			continue
+		}
+		if !r.gracePeriodElapsed("errunit:"+id, now) {
+			continue
+		}
+		if !r.consumeAutoFailBudget(id) {
+			r.writeAudit(ctx, id, "budget_exhausted", "error_unit_stop suppressed by rate limit", "boltdb_error_unit_active")
+			continue
+		}
+		log.Warn().Str("vm_id", id).Str("drift", "boltdb_error_unit_active").
+			Msg("error-status VM with live unit — stopping")
+		if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
+			log.Error().Err(err).Str("vm_id", id).Msg("failed to stop error-status unit")
+			continue
+		}
+		removeUnitDropIn(id)
+		r.markStale(id)
+		r.writeAudit(ctx, id, "error_unit_stop", "live unit for error-status record", "boltdb_error_unit_active")
+		r.clearDrift("errunit:" + id)
+	}
+
 	// Drift 7: systemd unit active, DB says paused — an interrupted pause
 	// stop left the old firecracker pinning guest RAM; stop it. DB rows
 	// only: a mid-resume sandbox reads 'resuming' there, clearing the
