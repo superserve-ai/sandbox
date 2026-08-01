@@ -368,23 +368,40 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	}
 	for id := range active {
 		if !errorRecord(id) {
+			r.clearDrift("errunit:" + id)
 			continue
 		}
 		if !r.gracePeriodElapsed("errunit:"+id, now) {
 			continue
 		}
+		// Drift 7's discipline: lock before spending budget, then recheck
+		// the AUTHORITATIVE in-memory record — a relaunch can complete
+		// mid-pass (flip the record to Running, own the unit name, release
+		// the lock), and stopping then would kill the fresh VM.
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue
+		}
+		if r.mgr.instanceRunning(id) {
+			unlockOp()
+			r.clearDrift("errunit:" + id)
+			continue
+		}
 		if !r.consumeAutoFailBudget(id) {
+			unlockOp()
 			r.writeAudit(ctx, id, "budget_exhausted", "error_unit_stop suppressed by rate limit", "boltdb_error_unit_active")
 			continue
 		}
 		log.Warn().Str("vm_id", id).Str("drift", "boltdb_error_unit_active").
 			Msg("error-status VM with live unit — stopping")
 		if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
+			unlockOp()
 			log.Error().Err(err).Str("vm_id", id).Msg("failed to stop error-status unit")
 			continue
 		}
 		removeUnitDropIn(id)
 		r.markStale(id)
+		unlockOp()
 		r.writeAudit(ctx, id, "error_unit_stop", "live unit for error-status record", "boltdb_error_unit_active")
 		r.clearDrift("errunit:" + id)
 	}
