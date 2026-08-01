@@ -15,6 +15,13 @@ import (
 // the parent; os.Root confinement still prevents anchoring outside it.
 // This is a weaker guarantee than linux, where the kernel rejects a
 // symlink leaf in the open syscall itself; production hosts are linux.
+// makeDirNoFollow on non-linux platforms is the portable creation: it
+// resolves ancestors normally and can follow ancestor symlinks, a weaker
+// guarantee than the linux no-symlink walk. Production hosts are linux.
+func makeDirNoFollow(dir string) error {
+	return makeDirPortable(dir)
+}
+
 func openRootNoFollow(parentPath, base string) (*os.Root, error) {
 	parent, err := os.OpenRoot(parentPath)
 	if err != nil {

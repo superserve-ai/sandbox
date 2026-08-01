@@ -276,22 +276,14 @@ func openFreshDir(dir string) (*os.Root, error) {
 	if fi, err := os.Lstat(dir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("dest dir %s is a symlink: restore only writes into a real directory", dir)
 	}
-	// Mkdir on the leaf, never MkdirAll over the full path: MkdirAll
-	// re-resolves the whole path, so a symlink swapped in after the Lstat
-	// above would get directories created at its target (a side effect
-	// only, the no-follow open below still rejects the leaf, but a restore
-	// must not scribble directories elsewhere either). Mkdir on an
-	// existing leaf, symlink included, is EEXIST and creates nothing.
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			if perr := os.MkdirAll(filepath.Dir(dir), 0o755); perr != nil {
-				return nil, fmt.Errorf("dest dir parent: %w", perr)
-			}
-			err = os.Mkdir(dir, 0o755)
-		}
-		if err != nil && !errors.Is(err, fs.ErrExist) {
-			return nil, fmt.Errorf("dest dir: %w", err)
-		}
+	// Creation must be as symlink-strict as the open: Mkdir and MkdirAll
+	// resolve ancestors normally, so a symlinked ancestor would get the
+	// destination created at its target even though the no-follow open
+	// below then rejects the path. On linux makeDirNoFollow walks and
+	// creates the hierarchy without following any symlink; elsewhere it
+	// falls back to portable creation with the weaker guarantee.
+	if err := makeDirNoFollow(dir); err != nil {
+		return nil, fmt.Errorf("dest dir: %w", err)
 	}
 	root, err := openRootNoFollow(filepath.Dir(dir), filepath.Base(dir))
 	if err != nil {
@@ -315,6 +307,26 @@ func openFreshDir(dir string) (*os.Root, error) {
 		return nil, fmt.Errorf("dest dir %s is not empty: restore refuses to overwrite existing content, use a fresh directory", dir)
 	}
 	return root, nil
+}
+
+// makeDirPortable creates dir and any missing parents with the standard
+// library primitives. Ancestor components are resolved normally, so a
+// symlinked ancestor IS followed: this is the weaker-guarantee path used
+// on platforms without a no-symlink traversal (and as the linux fallback
+// when openat2 is unavailable). Mkdir on an existing leaf, symlink
+// included, is EEXIST and creates nothing at the leaf itself.
+func makeDirPortable(dir string) error {
+	err := os.Mkdir(dir, 0o755)
+	if errors.Is(err, fs.ErrNotExist) {
+		if perr := os.MkdirAll(filepath.Dir(dir), 0o755); perr != nil {
+			return fmt.Errorf("parent: %w", perr)
+		}
+		err = os.Mkdir(dir, 0o755)
+	}
+	if err != nil && !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	return nil
 }
 
 func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation string, report ProgressFunc) (*GenerationManifest, error) {
