@@ -94,8 +94,21 @@ func (u *Uploader) Run(ctx context.Context) error {
 	}
 	// Claim pre-scoping verification records for the configured bucket
 	// before any lookup can miss them; idempotent after the first boot.
-	if err := u.Journal.MigrateVerificationScope(u.Store.Identity()); err != nil {
-		u.Log.Error().Err(err).Msg("verification scope migration failed")
+	// The drain must not start until this lands: a lookup missing a
+	// still-unmigrated record would abandon a generation the record
+	// protects, so a transient failure (full disk) retries rather than
+	// being logged past.
+	for {
+		if err := u.Journal.MigrateVerificationScope(u.Store.Identity()); err == nil {
+			break
+		} else {
+			u.Log.Error().Err(err).Msg("verification scope migration failed; retrying before draining")
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(tick):
+		}
 	}
 	// Deliver completion signals a previous process acked but never
 	// notified: the outbox is the only record of those.
