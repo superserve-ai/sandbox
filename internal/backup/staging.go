@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/singleflight"
@@ -58,9 +59,20 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 	if err := syncDir(root); err != nil {
 		return false, err
 	}
+	// The sweep's grace stats the generation DIRECTORY, and directory
+	// mtimes do not move when children are rewritten, so reuse renews
+	// the directory itself under the same flight key the sweep locks.
+	// Renewal can JOIN an in-flight sweep deletion instead of executing
+	// (singleflight coalesces same-key callers), so the directory is
+	// re-created after the flight returns; children lost to that race
+	// re-stage below via their own existence checks.
+	renewStaged(dir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false, err
+	}
 	for i, f := range task.Files {
 		staged := filepath.Join(dir, f.Name)
-		if _, err := os.Stat(staged); err == nil {
+		if renewedExists(staged) {
 			task.Files[i].Path = staged
 		} else if err := snapshotFileMode(staged, f.Path, cloneOnly); err != nil {
 			if cloneOnly {
@@ -82,7 +94,14 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 				return false, err
 			}
 			stagedBase := filepath.Join(basesDir, f.BaseSHA256)
-			if _, err := os.Stat(stagedBase); err != nil {
+			// Reuse renews the mtime under the sweep's grace: an aged
+			// unreferenced base being adopted by a new pause must not
+			// be reaped by a sweep holding a reference snapshot taken
+			// before this enqueue. A renewal that joined an in-flight
+			// deletion re-checks and falls through to re-staging.
+			if renewedExists(stagedBase) {
+				// kept: renewed under the sweep's flight key.
+			} else {
 				if err := snapshotFileMode(stagedBase, f.BasePath, cloneOnly); err != nil {
 					if cloneOnly {
 						all = false
@@ -244,9 +263,54 @@ func removeStagedTask(root string, task Task) {
 	_ = os.Remove(filepath.Dir(dir))
 }
 
+// stagingSweepGrace protects the stage-then-enqueue handoff: workers
+// stage files BEFORE the journal write, so the journal is not yet the
+// liveness authority for very fresh entries, and a sweep landing in
+// that window would delete files whose task is about to reference them
+// (the worker would then enqueue as staged, clear its marker, and the
+// uploader would abandon the missing files: a permanently lost pause).
+// The handoff takes seconds; an hour of grace costs only residue delay.
+const stagingSweepGrace = time.Hour
+
+// renewStaged bumps a reused staged entry's mtime inside its staging
+// flight, making it fresh under the sweep grace. Callers must re-check
+// existence afterwards: singleflight coalesces same-key callers, so a
+// renewal arriving during the sweep's deletion flight JOINS it (the
+// renewal closure never runs) and the path is gone on return.
+func renewStaged(path string) {
+	_, _, _ = stagingFlights.Do(path, func() (any, error) {
+		now := time.Now()
+		_ = os.Chtimes(path, now, now)
+		return nil, nil
+	})
+}
+
+// renewedExists renews the entry and reports whether it survived: false
+// means the renewal joined a concurrent deletion and the caller must
+// re-stage.
+func renewedExists(path string) bool {
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	renewStaged(path)
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// fresherThan reports whether the entry's mtime is within grace of now;
+// stat failures count as fresh (fail safe: keep, the next sweep decides).
+func fresherThan(path string, grace time.Duration) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return true
+	}
+	return time.Since(fi.ModTime()) < grace
+}
+
 // SweepStaging removes staged generations with no pending journal task:
 // residue of a crash between staging and enqueue, or of an ack whose
-// cleanup was interrupted. Run at startup before the uploader drains.
+// cleanup was interrupted. Runs at startup before the uploader drains
+// and periodically from the drain loop thereafter.
 func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 	if root == "" {
 		return
@@ -278,8 +342,18 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 				continue
 			}
 			for _, b := range bases {
+				staged := filepath.Join(root, "bases", b.Name())
 				if !referenced[b.Name()] {
-					_ = os.RemoveAll(filepath.Join(root, "bases", b.Name()))
+					// Serialize with renewStaged and re-check freshness
+					// inside the flight: a pause adopting this base
+					// concurrently either renews first (we skip) or
+					// waits for the delete and re-stages.
+					_, _, _ = stagingFlights.Do(staged, func() (any, error) {
+						if !fresherThan(staged, stagingSweepGrace) {
+							_ = os.RemoveAll(staged)
+						}
+						return nil, nil
+					})
 				}
 			}
 			continue
@@ -298,8 +372,14 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 				log.Warn().Err(err).Msg("backup staging sweep: journal lookup failed")
 				continue
 			}
+			staged := filepath.Join(sbDir, g.Name())
 			if !pending {
-				_ = os.RemoveAll(filepath.Join(sbDir, g.Name()))
+				_, _, _ = stagingFlights.Do(staged, func() (any, error) {
+					if !fresherThan(staged, stagingSweepGrace) {
+						_ = os.RemoveAll(staged)
+					}
+					return nil, nil
+				})
 			}
 		}
 		_ = os.Remove(sbDir)

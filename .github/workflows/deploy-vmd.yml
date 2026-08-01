@@ -153,6 +153,7 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          BACKUP_BUCKET: superserve-artifact-backup-use4
           # use4 is the "use" cell's Supabase + control plane.
           CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_PROD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
