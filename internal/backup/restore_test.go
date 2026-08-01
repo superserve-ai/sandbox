@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,10 +26,16 @@ import (
 type memBlobs struct {
 	mu      sync.Mutex
 	objects map[string][]byte
+	created map[string]time.Time
+	clock   time.Time
 }
 
 func newMemBlobs() *memBlobs {
-	return &memBlobs{objects: map[string][]byte{}}
+	return &memBlobs{
+		objects: map[string][]byte{},
+		created: map[string]time.Time{},
+		clock:   time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC),
+	}
 }
 
 func (m *memBlobs) Create(_ context.Context, object string, r io.Reader) (bool, error) {
@@ -41,6 +49,8 @@ func (m *memBlobs) Create(_ context.Context, object string, r io.Reader) (bool, 
 		return false, err
 	}
 	m.objects[object] = data
+	m.clock = m.clock.Add(time.Minute)
+	m.created[object] = m.clock
 	return true, nil
 }
 
@@ -54,16 +64,16 @@ func (m *memBlobs) NewReader(_ context.Context, object string) (io.ReadCloser, e
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
-func (m *memBlobs) List(_ context.Context, prefix string) ([]string, error) {
+func (m *memBlobs) List(_ context.Context, prefix string) ([]ObjectInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var names []string
+	var objects []ObjectInfo
 	for name := range m.objects {
 		if strings.HasPrefix(name, prefix) {
-			names = append(names, name)
+			objects = append(objects, ObjectInfo{Name: name, Created: m.created[name]})
 		}
 	}
-	return names, nil
+	return objects, nil
 }
 
 // writeRestoreFixture builds the source artifacts: a genuinely sparse disk
@@ -141,7 +151,7 @@ func TestRestoreGenerationRoundTrip(t *testing.T) {
 	uploadFixture(t, store, task)
 
 	destDir := filepath.Join(t.TempDir(), "restored")
-	manifest, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir)
+	manifest, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir, nil)
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -167,6 +177,24 @@ func TestRestoreGenerationRoundTrip(t *testing.T) {
 			t.Fatalf("digest for %s = %s, want %s", tf.Name, manifest.Files[i].SHA256, tf.SHA256)
 		}
 	}
+	// The completion marker is written last and is the completeness
+	// authority: it must exist, parse, and record this generation. The
+	// destination holds exactly the manifest's files plus the marker.
+	markerData, err := os.ReadFile(filepath.Join(destDir, ManifestObject))
+	if err != nil {
+		t.Fatalf("completion marker: %v", err)
+	}
+	var marker GenerationManifest
+	if err := json.Unmarshal(markerData, &marker); err != nil {
+		t.Fatalf("completion marker parse: %v", err)
+	}
+	if marker.SandboxID != task.SandboxID || marker.Generation != task.Generation {
+		t.Fatalf("marker identity = %s/%s", marker.SandboxID, marker.Generation)
+	}
+	entries, err := os.ReadDir(destDir)
+	if err != nil || len(entries) != len(task.Files)+1 {
+		t.Fatalf("dest entries = %d err=%v, want files plus marker", len(entries), err)
+	}
 }
 
 func TestRestoreGenerationFailsOnCorruptObject(t *testing.T) {
@@ -191,7 +219,7 @@ func TestRestoreGenerationFailsOnCorruptObject(t *testing.T) {
 	store.objects[object] = corrupted
 
 	destDir := filepath.Join(t.TempDir(), "restored")
-	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir)
+	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir, nil)
 	if err == nil {
 		t.Fatal("restore of corrupted object succeeded")
 	}
@@ -213,7 +241,7 @@ func TestRestoreGenerationMissingManifestIsIncomplete(t *testing.T) {
 	// leaves behind.
 	delete(store.objects, genObject(task, ManifestObject))
 
-	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"))
+	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"), nil)
 	if !errors.Is(err, ErrGenerationIncomplete) {
 		t.Fatalf("err = %v, want ErrGenerationIncomplete", err)
 	}
@@ -230,7 +258,7 @@ func TestRestoreGenerationRejectsMisplacedManifest(t *testing.T) {
 	for name, data := range store.objects {
 		store.objects[strings.Replace(name, "sb-restore", "sb-victim", 1)] = data
 	}
-	_, err := RestoreGeneration(context.Background(), store, "sb-victim", task.Generation, filepath.Join(t.TempDir(), "restored"))
+	_, err := RestoreGeneration(context.Background(), store, "sb-victim", task.Generation, filepath.Join(t.TempDir(), "restored"), nil)
 	if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
 		t.Fatalf("err = %v, want manifest identity mismatch", err)
 	}
@@ -256,7 +284,7 @@ func TestRestoreGenerationRejectsManifestMissingEntries(t *testing.T) {
 	}
 	store.objects[manifestObject] = mutated
 
-	_, err = RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"))
+	_, err = RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"), nil)
 	if err == nil || !strings.Contains(err.Error(), "generation key") {
 		t.Fatalf("err = %v, want generation key mismatch", err)
 	}
@@ -267,7 +295,7 @@ func TestVerifyFileDetectsDataWrittenIntoDeclaredHole(t *testing.T) {
 	store := newMemBlobs()
 	uploadFixture(t, store, task)
 	destDir := filepath.Join(t.TempDir(), "restored")
-	if _, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir); err != nil {
+	if _, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir, nil); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	var manifest GenerationManifest
@@ -400,7 +428,7 @@ func TestRestoreGenerationRejectsEntryWithoutObject(t *testing.T) {
 	}
 	store.objects[manifestObject] = mutated
 
-	_, err = RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"))
+	_, err = RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"), nil)
 	if err == nil || !strings.Contains(err.Error(), "no object name") {
 		t.Fatalf("err = %v, want rejection of entry without object name", err)
 	}
@@ -418,7 +446,7 @@ func TestRestoreGenerationRefusesPopulatedDest(t *testing.T) {
 	if err := os.WriteFile(existing, []byte("operator's earlier restore"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir)
+	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir, nil)
 	if err == nil || !strings.Contains(err.Error(), "not empty") {
 		t.Fatalf("err = %v, want refusal of non-empty dest", err)
 	}
@@ -440,7 +468,7 @@ func TestRestoreGenerationRefusesSymlinkDest(t *testing.T) {
 	if err := os.Symlink(target, destDir); err != nil {
 		t.Fatal(err)
 	}
-	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir)
+	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir, nil)
 	if err == nil || !strings.Contains(err.Error(), "symlink") {
 		t.Fatalf("err = %v, want symlink refusal", err)
 	}
@@ -522,14 +550,14 @@ func TestRestoreGenerationRestoresSharedBasePair(t *testing.T) {
 	uploadFixture(t, store, task)
 
 	destDir := filepath.Join(t.TempDir(), "restored")
-	manifest, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir)
+	manifest, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir, nil)
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	if len(manifest.Files) != 3 {
 		t.Fatalf("manifest files = %d, want overlay+vmstate+base", len(manifest.Files))
 	}
-	got, err := os.ReadFile(filepath.Join(destDir, "base.ext4"))
+	got, err := os.ReadFile(filepath.Join(destDir, SharedBaseName(digestOf(baseData))))
 	if err != nil {
 		t.Fatalf("restored base: %v", err)
 	}
@@ -573,13 +601,13 @@ func TestRestoreGenerationRejectsMissingSharedBaseEntry(t *testing.T) {
 	}
 	store.objects[manifestObject] = mutated
 
-	_, err = RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"))
+	_, err = RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"), nil)
 	if err == nil || !strings.Contains(err.Error(), "consistency pair") {
 		t.Fatalf("err = %v, want consistency pair incomplete", err)
 	}
 }
 
-func TestListGenerationsReportsOnlyComplete(t *testing.T) {
+func TestListGenerationsReportsOnlyCompleteNewestFirst(t *testing.T) {
 	task := writeRestoreFixture(t, t.TempDir())
 	store := newMemBlobs()
 	uploadFixture(t, store, task)
@@ -587,12 +615,375 @@ func TestListGenerationsReportsOnlyComplete(t *testing.T) {
 	store.objects["sandboxes/sb-restore/gen-r2/overlay.ext4"] = []byte("partial")
 	// Another sandbox entirely.
 	store.objects["sandboxes/sb-other/gen-x/manifest.json"] = []byte("{}")
+	// An older and a newer complete generation: an operator under DR
+	// pressure needs the newest first, with its manifest creation time.
+	older := store.created[genObject(task, ManifestObject)].Add(-time.Hour)
+	newer := older.Add(2 * time.Hour)
+	store.objects["sandboxes/sb-restore/gen-older/manifest.json"] = []byte("{}")
+	store.created["sandboxes/sb-restore/gen-older/manifest.json"] = older
+	store.objects["sandboxes/sb-restore/gen-newer/manifest.json"] = []byte("{}")
+	store.created["sandboxes/sb-restore/gen-newer/manifest.json"] = newer
 
 	generations, err := ListGenerations(context.Background(), store, "sb-restore")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(generations) != 1 || generations[0] != task.Generation {
-		t.Fatalf("generations = %v, want [%s]", generations, task.Generation)
+	if len(generations) != 3 {
+		t.Fatalf("generations = %+v, want 3 complete", generations)
+	}
+	if generations[0].Generation != "gen-newer" || generations[1].Generation != task.Generation || generations[2].Generation != "gen-older" {
+		t.Fatalf("order = %+v, want newest first", generations)
+	}
+	if !generations[0].Created.Equal(newer) {
+		t.Fatalf("created = %v, want manifest object creation time %v", generations[0].Created, newer)
+	}
+}
+
+// rewriteManifest parses the stored manifest, applies mutate, and stores
+// it back: the tamper primitive for manifest-integrity tests.
+func rewriteManifest(t *testing.T, store *memBlobs, task Task, mutate func(*GenerationManifest)) {
+	t.Helper()
+	obj := genObject(task, ManifestObject)
+	var manifest GenerationManifest
+	if err := json.Unmarshal(store.objects[obj], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	mutate(&manifest)
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.objects[obj] = data
+}
+
+// baseFixture writes a base image, binds the fixture overlay to it, and
+// returns the uploaded task plus the base bytes.
+func baseFixture(t *testing.T, fill byte) (Task, *memBlobs, []byte) {
+	t.Helper()
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "base-image.ext4")
+	baseData := bytes.Repeat([]byte{fill}, 64<<10)
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writeRestoreFixture(t, dir)
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+	return task, store, baseData
+}
+
+func TestRestoreTwoDistinctBasesRoundTrip(t *testing.T) {
+	// A generation with two overlays on two DIFFERENT bases: the shared
+	// entry names derive from the digests, so both bases must upload,
+	// restore to distinct files, and match byte for byte. A fixed name
+	// would make this generation complete-but-unrestorable.
+	dir := t.TempDir()
+	baseA := bytes.Repeat([]byte{0x33}, 96<<10)
+	baseB := bytes.Repeat([]byte{0x44}, 80<<10)
+	basePathA := filepath.Join(dir, "baseA.ext4")
+	basePathB := filepath.Join(dir, "baseB.ext4")
+	if err := os.WriteFile(basePathA, baseA, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(basePathB, baseB, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writeRestoreFixture(t, dir)
+	overlay2 := filepath.Join(dir, "overlay2.ext4")
+	overlay2Data := bytes.Repeat([]byte{0x55}, 16<<10)
+	if err := os.WriteFile(overlay2, overlay2Data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task.Files[0].BasePath = basePathA
+	task.Files[0].BaseSHA256 = digestOf(baseA)
+	task.Files = append(task.Files, TaskFile{
+		Name: "overlay2.ext4", Path: overlay2, SHA256: digestOf(overlay2Data), Size: int64(len(overlay2Data)),
+		BasePath: basePathB, BaseSHA256: digestOf(baseB),
+	})
+	task.Generation = GenerationKey(task.Files)
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+
+	destDir := filepath.Join(t.TempDir(), "restored")
+	manifest, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir, nil)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if len(manifest.Files) != 5 {
+		t.Fatalf("manifest files = %d, want 3 artifacts plus 2 bases", len(manifest.Files))
+	}
+	for _, want := range []struct {
+		name string
+		data []byte
+	}{
+		{SharedBaseName(digestOf(baseA)), baseA},
+		{SharedBaseName(digestOf(baseB)), baseB},
+	} {
+		got, err := os.ReadFile(filepath.Join(destDir, want.name))
+		if err != nil {
+			t.Fatalf("restored %s: %v", want.name, err)
+		}
+		if !bytes.Equal(got, want.data) {
+			t.Fatalf("restored %s differs from original", want.name)
+		}
+	}
+}
+
+func TestRestoreRejectsDuplicateSharedEntries(t *testing.T) {
+	task, store, _ := baseFixture(t, 0x66)
+	// Duplicate the shared base entry under a fresh name: without the
+	// duplicate check this restores and verifies an extra copy of the
+	// base, silent disk exhaustion inside a "verified" restore.
+	rewriteManifest(t, store, task, func(m *GenerationManifest) {
+		for _, mf := range m.Files {
+			if strings.HasPrefix(mf.Object, "bases/") {
+				dup := mf
+				dup.Name = "base-extra-copy.ext4"
+				m.Files = append(m.Files, dup)
+				return
+			}
+		}
+		t.Fatal("no shared entry in fixture manifest")
+	})
+	destDir := filepath.Join(t.TempDir(), "restored")
+	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir, nil)
+	if err == nil || !strings.Contains(err.Error(), "twice") {
+		t.Fatalf("err = %v, want duplicate shared entry rejection", err)
+	}
+	// Rejected before any file was restored: the destination was never
+	// even created.
+	if _, serr := os.Stat(destDir); !errors.Is(serr, fs.ErrNotExist) {
+		t.Fatalf("dest created despite pre-restore rejection: %v", serr)
+	}
+}
+
+func TestRestoreRejectsDuplicateNames(t *testing.T) {
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+	rewriteManifest(t, store, task, func(m *GenerationManifest) {
+		m.Files = append(m.Files, m.Files[1])
+	})
+	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"), nil)
+	if err == nil || !strings.Contains(err.Error(), "twice") {
+		t.Fatalf("err = %v, want duplicate name rejection", err)
+	}
+}
+
+func TestRestoreRejectsInflatedSize(t *testing.T) {
+	// Size is covered by the generation key: inflating it must fail the
+	// key check instead of driving an effectively unbounded zero hash
+	// during verification.
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+	rewriteManifest(t, store, task, func(m *GenerationManifest) {
+		m.Files[0].Size = 1 << 60
+	})
+	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"), nil)
+	if err == nil || !strings.Contains(err.Error(), "generation key") {
+		t.Fatalf("err = %v, want generation key mismatch for inflated size", err)
+	}
+}
+
+func TestValidExtentsRejectsMalformedTables(t *testing.T) {
+	bad := []ManifestFile{
+		// Offset+Length wraps negative and previously passed both checks.
+		{Size: 1 << 20, Extents: []Extent{{Offset: math.MaxInt64 - 10, Length: 100}}},
+		// First extent wraps, resetting the cursor so {0,50} passed ordering.
+		{Size: 1 << 20, Extents: []Extent{{Offset: 1 << 62, Length: 1 << 62}, {Offset: 0, Length: 50}}},
+		{Size: -1},
+		{Size: math.MaxInt64},
+		{Size: 100, Extents: []Extent{{Offset: -5, Length: 10}}},
+		{Size: 100, Extents: []Extent{{Offset: 0, Length: 0}}},
+		{Size: 100, Extents: []Extent{{Offset: 50, Length: 10}, {Offset: 40, Length: 10}}},
+		{Size: 100, Extents: []Extent{{Offset: 0, Length: 200}}},
+	}
+	for i, mf := range bad {
+		if err := validExtents(mf); err == nil {
+			t.Fatalf("case %d accepted: %+v", i, mf)
+		}
+	}
+	good := ManifestFile{Size: 200, Extents: []Extent{{Offset: 0, Length: 100}, {Offset: 150, Length: 50}}}
+	if err := validExtents(good); err != nil {
+		t.Fatalf("valid table rejected: %v", err)
+	}
+}
+
+func TestRestoreFailsOnTruncatedPackedObject(t *testing.T) {
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+	var object string
+	for name := range store.objects {
+		if strings.HasPrefix(name, genObject(task, "overlay.ext4.p")) {
+			object = name
+		}
+	}
+	if object == "" {
+		t.Fatal("packed overlay object not found")
+	}
+	store.objects[object] = store.objects[object][:len(store.objects[object])-5]
+
+	destDir := filepath.Join(t.TempDir(), "restored")
+	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir, nil)
+	if err == nil || !strings.Contains(err.Error(), "extent at") {
+		t.Fatalf("err = %v, want mid-extent EOF failure", err)
+	}
+	entries, readErr := os.ReadDir(destDir)
+	if readErr == nil && len(entries) != 0 {
+		t.Fatalf("failed restore left %d files in dest", len(entries))
+	}
+}
+
+func TestRestoreRejectsUnboundSharedObjectName(t *testing.T) {
+	task, store, _ := baseFixture(t, 0x77)
+	otherSha := digestOf([]byte("a different base entirely"))
+	rewriteManifest(t, store, task, func(m *GenerationManifest) {
+		for i, mf := range m.Files {
+			if strings.HasPrefix(mf.Object, "bases/") {
+				// Same digest claim, object pointed elsewhere: the name
+				// must embed the entry's digest or fetching is refused.
+				m.Files[i].Object = SharedBaseObject(otherSha, "deadbeef1234")
+				return
+			}
+		}
+		t.Fatal("no shared entry in fixture manifest")
+	})
+	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"), nil)
+	if err == nil || !strings.Contains(err.Error(), "not bound to digest") {
+		t.Fatalf("err = %v, want digest-binding rejection", err)
+	}
+}
+
+func TestRestoreRejectsUnreferencedSharedEntry(t *testing.T) {
+	task, store, _ := baseFixture(t, 0x88)
+	orphanSha := digestOf([]byte("orphan base"))
+	rewriteManifest(t, store, task, func(m *GenerationManifest) {
+		m.Files = append(m.Files, ManifestFile{
+			Name:   SharedBaseName(orphanSha),
+			Object: SharedBaseObject(orphanSha, "deadbeef1234"),
+			SHA256: orphanSha,
+			Size:   16,
+		})
+	})
+	_, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"), nil)
+	if err == nil || !strings.Contains(err.Error(), "no entry depends on") {
+		t.Fatalf("err = %v, want unreferenced shared entry rejection", err)
+	}
+}
+
+// cancelingBlobs cancels the restore context partway through: after the
+// configured number of NewReader calls, later calls cancel first.
+type cancelingBlobs struct {
+	*memBlobs
+	cancel context.CancelFunc
+	after  int
+	calls  int
+}
+
+func (c *cancelingBlobs) NewReader(ctx context.Context, object string) (io.ReadCloser, error) {
+	c.calls++
+	if c.calls > c.after {
+		c.cancel()
+	}
+	return c.memBlobs.NewReader(ctx, object)
+}
+
+func TestRestoreCancellationCleansUp(t *testing.T) {
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Manifest is call 1, first artifact call 2; the context dies before
+	// the second artifact streams.
+	reader := &cancelingBlobs{memBlobs: store, cancel: cancel, after: 2}
+
+	destDir := filepath.Join(t.TempDir(), "restored")
+	_, err := RestoreGeneration(ctx, reader, task.SandboxID, task.Generation, destDir, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	entries, readErr := os.ReadDir(destDir)
+	if readErr == nil && len(entries) != 0 {
+		t.Fatalf("canceled restore left %d files in dest", len(entries))
+	}
+}
+
+func TestRestoreRejectsTraversalName(t *testing.T) {
+	// A hand-built manifest whose key genuinely covers a traversal name:
+	// the key check passes, so the name validation itself must refuse to
+	// let the entry escape the destination.
+	files := []TaskFile{{Name: "../evil", SHA256: digestOf([]byte("x")), Size: 1}}
+	gen := GenerationKey(files)
+	manifest := GenerationManifest{
+		SandboxID:  "sb-evil",
+		Generation: gen,
+		Files: []ManifestFile{{
+			Name: "../evil", Object: "evil.pdeadbeef1234", SHA256: digestOf([]byte("x")), Size: 1,
+			Extents: []Extent{{Offset: 0, Length: 1}},
+		}},
+	}
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newMemBlobs()
+	store.objects["sandboxes/sb-evil/"+gen+"/"+ManifestObject] = payload
+
+	parent := t.TempDir()
+	destDir := filepath.Join(parent, "restored")
+	_, err = RestoreGeneration(context.Background(), store, "sb-evil", gen, destDir, nil)
+	if err == nil || !strings.Contains(err.Error(), "manifest file name") {
+		t.Fatalf("err = %v, want traversal name rejection", err)
+	}
+	if _, serr := os.Stat(filepath.Join(parent, "evil")); !errors.Is(serr, fs.ErrNotExist) {
+		t.Fatal("traversal name escaped the destination")
+	}
+}
+
+func TestConcurrentRestoresSameDest(t *testing.T) {
+	// Two restores racing into one destination: exclusive per-name
+	// creation means exactly one wins, the loser removes nothing it did
+	// not create, and the surviving destination is complete and verified.
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+	destDir := filepath.Join(t.TempDir(), "restored")
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir, nil)
+		}(i)
+	}
+	wg.Wait()
+	winners := 0
+	for _, err := range errs {
+		if err == nil {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("winners = %d (errs %v), want exactly one", winners, errs)
+	}
+	// The surviving destination is complete: marker present, files intact.
+	if _, err := os.Stat(filepath.Join(destDir, ManifestObject)); err != nil {
+		t.Fatalf("completion marker missing after concurrent restore: %v", err)
+	}
+	orig, err := os.ReadFile(task.Files[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(destDir, task.Files[0].Name))
+	if err != nil || !bytes.Equal(orig, got) {
+		t.Fatalf("winner's restore incomplete: err=%v equal=%v", err, bytes.Equal(orig, got))
 	}
 }

@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
@@ -35,10 +38,16 @@ type BlobReader interface {
 	NewReader(ctx context.Context, object string) (io.ReadCloser, error)
 }
 
-// BlobLister enumerates object names under a prefix. Kept separate from
+// BlobLister enumerates objects under a prefix. Kept separate from
 // BlobReader so RestoreGeneration does not demand list permission.
 type BlobLister interface {
-	List(ctx context.Context, prefix string) ([]string, error)
+	List(ctx context.Context, prefix string) ([]ObjectInfo, error)
+}
+
+// ObjectInfo describes one stored object as seen by a listing.
+type ObjectInfo struct {
+	Name    string
+	Created time.Time
 }
 
 // GCSReader implements BlobReader and BlobLister against a bucket. The
@@ -64,51 +73,70 @@ func (g *GCSReader) NewReader(ctx context.Context, object string) (io.ReadCloser
 	return r, nil
 }
 
-func (g *GCSReader) List(ctx context.Context, prefix string) ([]string, error) {
+func (g *GCSReader) List(ctx context.Context, prefix string) ([]ObjectInfo, error) {
 	it := g.bucket.Objects(ctx, &storage.Query{Prefix: prefix})
-	var names []string
+	var objects []ObjectInfo
 	for {
 		attrs, err := it.Next()
 		if errors.Is(err, iterator.Done) {
-			return names, nil
+			return objects, nil
 		}
 		if err != nil {
 			return nil, fmt.Errorf("list %s: %w", prefix, err)
 		}
-		names = append(names, attrs.Name)
+		objects = append(objects, ObjectInfo{Name: attrs.Name, Created: attrs.Created})
 	}
 }
 
-// ListGenerations returns the complete (manifest-bearing) generations of a
-// sandbox, sorted. Prefixes holding artifacts but no manifest are abandoned
-// or in-flight uploads and are deliberately omitted: they are not
-// restorable and listing them would only invite an operator to try.
-func ListGenerations(ctx context.Context, lister BlobLister, sandboxID string) ([]string, error) {
+// GenerationInfo identifies one restorable generation. Created is when
+// the manifest completion object was written: the moment the generation
+// became restorable, which is what an operator choosing between opaque
+// content-addressed keys under DR pressure actually needs to see.
+type GenerationInfo struct {
+	Generation string
+	Created    time.Time
+}
+
+// ListGenerations returns the complete (manifest-bearing) generations of
+// a sandbox, newest first. Prefixes holding artifacts but no manifest are
+// abandoned or in-flight uploads and are deliberately omitted: they are
+// not restorable and listing them would only invite an operator to try.
+func ListGenerations(ctx context.Context, lister BlobLister, sandboxID string) ([]GenerationInfo, error) {
 	if err := validSegment(sandboxID); err != nil {
 		return nil, fmt.Errorf("sandbox id: %w", err)
 	}
 	prefix := fmt.Sprintf("%s/%s/", sandboxPrefix, sandboxID)
-	names, err := lister.List(ctx, prefix)
+	objects, err := lister.List(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
-	var generations []string
-	for _, name := range names {
-		rest := strings.TrimPrefix(name, prefix)
+	var generations []GenerationInfo
+	for _, obj := range objects {
+		rest := strings.TrimPrefix(obj.Name, prefix)
 		gen, file, ok := strings.Cut(rest, "/")
 		if ok && file == ManifestObject {
-			generations = append(generations, gen)
+			generations = append(generations, GenerationInfo{Generation: gen, Created: obj.Created})
 		}
 	}
-	sort.Strings(generations)
+	sort.Slice(generations, func(i, j int) bool {
+		if !generations[i].Created.Equal(generations[j].Created) {
+			return generations[i].Created.After(generations[j].Created)
+		}
+		return generations[i].Generation < generations[j].Generation
+	})
 	return generations, nil
 }
+
+// ProgressFunc receives human-readable progress lines during a restore.
+// A nil ProgressFunc is silent.
+type ProgressFunc func(format string, args ...any)
 
 // RestoreGeneration materializes one complete generation into destDir:
 // fetch the manifest, rebuild each sparse artifact from its packed object
 // and extent table, and verify every file's full apparent content against
 // the manifest digest. destDir must be absent or an empty directory; on
-// success it holds exactly the manifest's files, verified.
+// success it holds exactly the manifest's files, verified and fsynced,
+// plus the completion marker described below.
 //
 // Requiring a fresh destination is deliberate: restoring over existing
 // content would truncate name-colliding files (and follow any symlinks
@@ -121,11 +149,26 @@ func ListGenerations(ctx context.Context, lister BlobLister, sandboxID string) (
 // outcome for a recovery tool; an empty one forces the operator (or the
 // calling recovery flow) to retry or pick another generation, never to
 // boot a half-verified sandbox.
-func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation, destDir string) (*GenerationManifest, error) {
+//
+// Completion marker: after every file verifies, the generation manifest
+// is written to destDir/manifest.json, fsynced, and the directory itself
+// is fsynced, mirroring the upload design where the manifest object is
+// written last. The marker is the completeness authority: a destination
+// without it is a crashed or interrupted restore regardless of which
+// artifact names happen to be present, and no consumer may treat such a
+// directory as restored. Artifact entries named manifest.json are
+// rejected up front so the marker can never collide.
+func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation, destDir string, progress ProgressFunc) (*GenerationManifest, error) {
+	report := func(format string, args ...any) {
+		if progress != nil {
+			progress(format, args...)
+		}
+	}
 	manifest, err := fetchManifest(ctx, r, sandboxID, generation)
 	if err != nil {
 		return nil, err
 	}
+	report("manifest %s/%s: %d files", sandboxID, generation, len(manifest.Files))
 	root, err := openFreshDir(destDir)
 	if err != nil {
 		return nil, err
@@ -133,8 +176,14 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 	defer root.Close()
 	var created []string
 	fail := func(err error) (*GenerationManifest, error) {
+		var cleanupErrs []string
 		for _, name := range created {
-			root.Remove(name)
+			if rerr := root.Remove(name); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+				cleanupErrs = append(cleanupErrs, rerr.Error())
+			}
+		}
+		if len(cleanupErrs) != 0 {
+			err = fmt.Errorf("%w (cleanup also failed, destination must not be reused: %s)", err, strings.Join(cleanupErrs, "; "))
 		}
 		return nil, err
 	}
@@ -144,6 +193,7 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 		if err := validSegment(mf.Name); err != nil {
 			return fail(fmt.Errorf("manifest file name: %w", err))
 		}
+		report("restoring %s (%d bytes packed, %d apparent)", mf.Name, mf.PackedSize, mf.Size)
 		madeFile, err := restoreFile(ctx, r, sandboxID, generation, mf, root)
 		if madeFile {
 			created = append(created, mf.Name)
@@ -159,8 +209,55 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 		if err := verifyFile(ctx, root, mf); err != nil {
 			return fail(fmt.Errorf("verify %s: %w", mf.Name, err))
 		}
+		report("verified %s sha256 %s", mf.Name, mf.SHA256)
 	}
+	madeMarker, err := writeRestoreMarker(root, manifest)
+	if madeMarker {
+		created = append(created, ManifestObject)
+	}
+	if err != nil {
+		return fail(fmt.Errorf("completion marker: %w", err))
+	}
+	// Directory fsync makes the entries themselves durable; each file's
+	// contents were fsynced as it was restored. Without this, power loss
+	// after a reported success could leave a directory whose names are all
+	// present but whose data never reached disk, which a rerun would
+	// refuse as non-empty while looking complete.
+	if err := syncRootDir(root); err != nil {
+		return fail(fmt.Errorf("sync dest dir: %w", err))
+	}
+	report("restore complete: %d files and completion marker durable", len(manifest.Files))
 	return manifest, nil
+}
+
+// writeRestoreMarker writes the fsynced completion marker, last.
+func writeRestoreMarker(root *os.Root, manifest *GenerationManifest) (madeFile bool, _ error) {
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		return false, err
+	}
+	f, err := root.OpenFile(ManifestObject, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return false, err
+	}
+	madeFile = true
+	defer f.Close()
+	if _, err := f.Write(payload); err != nil {
+		return madeFile, err
+	}
+	if err := f.Sync(); err != nil {
+		return madeFile, err
+	}
+	return madeFile, f.Close()
+}
+
+func syncRootDir(root *os.Root) error {
+	d, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // openFreshDir creates dir (and parents) if needed, requires it to be a
@@ -179,8 +276,22 @@ func openFreshDir(dir string) (*os.Root, error) {
 	if fi, err := os.Lstat(dir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("dest dir %s is a symlink: restore only writes into a real directory", dir)
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("dest dir: %w", err)
+	// Mkdir on the leaf, never MkdirAll over the full path: MkdirAll
+	// re-resolves the whole path, so a symlink swapped in after the Lstat
+	// above would get directories created at its target (a side effect
+	// only, the no-follow open below still rejects the leaf, but a restore
+	// must not scribble directories elsewhere either). Mkdir on an
+	// existing leaf, symlink included, is EEXIST and creates nothing.
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			if perr := os.MkdirAll(filepath.Dir(dir), 0o755); perr != nil {
+				return nil, fmt.Errorf("dest dir parent: %w", perr)
+			}
+			err = os.Mkdir(dir, 0o755)
+		}
+		if err != nil && !errors.Is(err, fs.ErrExist) {
+			return nil, fmt.Errorf("dest dir: %w", err)
+		}
 	}
 	root, err := openRootNoFollow(filepath.Dir(dir), filepath.Base(dir))
 	if err != nil {
@@ -220,7 +331,9 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 	}
 	defer rc.Close()
 	var manifest GenerationManifest
-	if err := json.NewDecoder(rc).Decode(&manifest); err != nil {
+	// Real manifests are kilobytes; the cap only bounds what a corrupt or
+	// hostile object can make this process buffer while decoding.
+	if err := json.NewDecoder(io.LimitReader(rc, maxManifestBytes)).Decode(&manifest); err != nil {
 		return nil, fmt.Errorf("parse manifest %s: %w", object, err)
 	}
 	// The manifest records its own identity; a manifest copied or misplaced
@@ -233,21 +346,38 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 	// The manifest must also be self-authenticating: the generation prefix
 	// is the content address GenerationKey derives from the enqueued file
 	// set, so the entries must reproduce it. A manifest with an entry
-	// dropped or a name, digest, or base dependency altered would otherwise
-	// pass the identity check and restore an incomplete or wrong file set
-	// with every remaining digest verifying. Shared base entries are
-	// synthesized at upload time and excluded from the key; they are bound
-	// instead through the consistency-pair check below, whose BaseSHA256
-	// side IS key-covered.
+	// dropped or a name, digest, size, or base dependency altered would
+	// otherwise pass the identity check and restore an incomplete or wrong
+	// file set with every remaining digest verifying. Shared base entries
+	// are synthesized at upload time and excluded from the key; they are
+	// bound instead through the consistency-pair check below, whose
+	// BaseSHA256 side IS key-covered.
+	//
+	// Duplicates are rejected outright before any file is touched: a
+	// duplicated shared entry under a fresh name would otherwise restore
+	// and verify extra copies of a multi-GB base (silent disk exhaustion
+	// inside a "verified" restore), and duplicate names can never
+	// materialize under exclusive per-name creation.
 	files := make([]TaskFile, 0, len(manifest.Files))
 	baseDeps := map[string]bool{}
 	sharedEntries := map[string]bool{}
+	names := map[string]bool{}
 	for _, mf := range manifest.Files {
+		if mf.Name == ManifestObject {
+			return nil, fmt.Errorf("manifest entry named %q collides with the completion marker", mf.Name)
+		}
+		if names[mf.Name] {
+			return nil, fmt.Errorf("manifest lists file name %q twice", mf.Name)
+		}
+		names[mf.Name] = true
 		if isSharedEntry(mf) {
+			if sharedEntries[mf.SHA256] {
+				return nil, fmt.Errorf("manifest lists shared object %s twice", mf.SHA256)
+			}
 			sharedEntries[mf.SHA256] = true
 			continue
 		}
-		files = append(files, TaskFile{Name: mf.Name, SHA256: mf.SHA256, BasePath: mf.BasePath, BaseSHA256: mf.BaseSHA256})
+		files = append(files, TaskFile{Name: mf.Name, SHA256: mf.SHA256, Size: mf.Size, BasePath: mf.BasePath, BaseSHA256: mf.BaseSHA256})
 		if mf.BaseSHA256 != "" {
 			baseDeps[mf.BaseSHA256] = true
 		}
@@ -255,10 +385,10 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 	if key := GenerationKey(files); key != generation {
 		return nil, fmt.Errorf("manifest does not reproduce its generation key: file set derives %s, prefix is %s (entry dropped or altered)", key, generation)
 	}
-	// Consistency pair: an overlay's holes are backed by its base, so a
-	// declared base dependency without its shared entry is not restorable,
-	// and a shared entry no file depends on is not something this
-	// generation may vouch for.
+	// Consistency pair, exact in both directions: an overlay's holes are
+	// backed by its base, so a declared base dependency without its shared
+	// entry is not restorable, and a shared entry no file depends on is
+	// not something this generation may vouch for.
 	for dep := range baseDeps {
 		if !sharedEntries[dep] {
 			return nil, fmt.Errorf("manifest declares base %s but carries no shared entry for it: consistency pair incomplete", dep)
@@ -271,6 +401,12 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 	}
 	return &manifest, nil
 }
+
+// maxManifestBytes bounds the manifest decode; see fetchManifest.
+const maxManifestBytes = 64 << 20
+
+// maxApparentSize bounds a single restored artifact; see validExtents.
+const maxApparentSize = int64(16) << 40
 
 // isSharedEntry reports whether a manifest entry points at a bucket-wide
 // shared object rather than one inside the generation prefix: shared
@@ -344,31 +480,63 @@ func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string
 			return madeFile, fmt.Errorf("extent at %d: %w", e.Offset, err)
 		}
 	}
-	// The packed object must hold exactly the extent table's bytes; trailing
-	// data means object and manifest disagree.
-	if n, _ := io.CopyN(io.Discard, rc, 1); n != 0 {
-		return madeFile, fmt.Errorf("packed object longer than extent table (%d bytes)", PackedSize(mf.Extents))
+	// The packed object must hold exactly the extent table's bytes;
+	// trailing data means object and manifest disagree. A transport error
+	// here is reported as such, not mistaken for a clean end of object.
+	switch n, err := io.CopyN(io.Discard, rc, 1); {
+	case n != 0:
+		extra, _ := io.Copy(io.Discard, rc)
+		return madeFile, fmt.Errorf("packed object is %d bytes, extent table describes %d", PackedSize(mf.Extents)+1+extra, PackedSize(mf.Extents))
+	case err != nil && !errors.Is(err, io.EOF):
+		return madeFile, fmt.Errorf("read past extents: %w", err)
 	}
 	if err := f.Truncate(mf.Size); err != nil {
+		return madeFile, err
+	}
+	// Contents must be on disk before the caller can report a verified
+	// restore; page-cache-only bytes would vanish in a power loss behind a
+	// complete-looking directory.
+	if err := f.Sync(); err != nil {
 		return madeFile, err
 	}
 	return madeFile, f.Close()
 }
 
 // validExtents rejects extent tables that could not have come from the
-// uploader: overlapping or out-of-order runs, or data past the apparent
-// size. The digest check would catch the resulting corruption anyway, but
-// failing on the malformed manifest gives a precise error instead.
+// uploader: negative fields, overlapping or out-of-order runs, offsets
+// that overflow int64, or data past the apparent size. The digest check
+// would catch most resulting corruption anyway, but the extent table
+// drives writes and truncation BEFORE any digest runs, so it must be
+// bounded on its own; and Offset+Length wrapping negative would otherwise
+// reset the monotonic cursor and re-admit anything.
 func validExtents(mf ManifestFile) error {
+	if mf.Size < 0 {
+		return fmt.Errorf("negative apparent size %d", mf.Size)
+	}
+	// Generation-local sizes are covered by the generation key, but shared
+	// base entries are synthesized outside it, so their Size is bound only
+	// by this cap until the digest check, and the digest check itself costs
+	// a zero-hash proportional to Size. Fleet artifacts top out in the
+	// tens of GiB apparent; 16TiB is a physical-plausibility bound, not a
+	// tuning knob.
+	if mf.Size > maxApparentSize {
+		return fmt.Errorf("apparent size %d exceeds the %d bound", mf.Size, int64(maxApparentSize))
+	}
 	var pos int64
 	for _, e := range mf.Extents {
-		if e.Offset < pos || e.Length <= 0 {
-			return fmt.Errorf("malformed extent table at offset %d", e.Offset)
+		if e.Offset < 0 || e.Length <= 0 {
+			return fmt.Errorf("malformed extent {offset %d, length %d}", e.Offset, e.Length)
+		}
+		if e.Offset < pos {
+			return fmt.Errorf("out-of-order or overlapping extent at offset %d", e.Offset)
+		}
+		if e.Length > math.MaxInt64-e.Offset {
+			return fmt.Errorf("extent {offset %d, length %d} overflows", e.Offset, e.Length)
 		}
 		pos = e.Offset + e.Length
 	}
 	if pos > mf.Size {
-		return fmt.Errorf("extent table exceeds apparent size %d", mf.Size)
+		return fmt.Errorf("extent table ends at %d, past apparent size %d", pos, mf.Size)
 	}
 	return nil
 }

@@ -918,7 +918,7 @@ func TestOverlayGenerationUploadsSharedBase(t *testing.T) {
 	}
 	foundBase := false
 	for _, f := range gen.Files {
-		if f.Name == "base.ext4" && strings.HasPrefix(f.Object, "bases/"+baseSHA) {
+		if f.Name == SharedBaseName(baseSHA) && strings.HasPrefix(f.Object, "bases/"+baseSHA) {
 			foundBase = true
 		}
 	}

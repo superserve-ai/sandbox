@@ -28,10 +28,15 @@ import (
 // bytes would dedupe onto a manifest pairing it with the wrong base
 // contents (the overlay digest cannot see this: holes hash as zeros, not
 // as base bytes).
+//
+// Size is in the key even though an honest digest already implies it:
+// restore trusts the recorded size as a resource bound (truncate target,
+// verification span), so a tampered manifest inflating it must fail the
+// key check rather than drive an effectively unbounded zero hash.
 func GenerationKey(files []TaskFile) string {
 	lines := make([]string, 0, len(files))
 	for _, f := range files {
-		lines = append(lines, f.Name+"="+f.SHA256+"="+f.BasePath+"="+f.BaseSHA256)
+		lines = append(lines, fmt.Sprintf("%s=%s=%d=%s=%s", f.Name, f.SHA256, f.Size, f.BasePath, f.BaseSHA256))
 	}
 	sort.Strings(lines)
 	h := sha256.New()

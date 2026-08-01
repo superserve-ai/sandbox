@@ -206,12 +206,25 @@ func baseTaskFile(file TaskFile) (TaskFile, error) {
 		return TaskFile{}, err
 	}
 	return TaskFile{
-		Name:   "base.ext4",
+		Name:   SharedBaseName(file.BaseSHA256),
 		Path:   file.BasePath,
 		SHA256: file.BaseSHA256,
 		Size:   fi.Size(),
 		Shared: true,
 	}, nil
+}
+
+// SharedBaseName derives the manifest file name a shared base entry
+// restores to from its content digest. A fixed name would collide when a
+// generation depends on two different bases: the upload would succeed,
+// but restore's exclusive per-name creation could never materialize both
+// files, a complete-yet-unrestorable generation discovered only at
+// recovery time.
+func SharedBaseName(sha string) string {
+	if len(sha) > 12 {
+		sha = sha[:12]
+	}
+	return "base-" + sha + ".ext4"
 }
 
 // uploadTask ships every artifact of a generation, then its manifest
