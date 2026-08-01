@@ -2307,6 +2307,15 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 					// still-Running row and adopt the socket-less VM. The
 					// in-memory Error keeps it refused either way.
 					inst := toInstance(rec)
+					// Bind network state first, as the normal path below does:
+					// the recovering in-place relaunch reuses this VM's slot
+					// only if the net manager knows it — otherwise it leaks
+					// the reserved slot and allocates a second.
+					if inst.Namespace != "" && inst.IP != "" {
+						if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
+							log.Error().Err(err).Msg("reattach: restore network state failed")
+						}
+					}
 					m.mu.Lock()
 					if cur, ok := m.vms[rec.ID]; ok {
 						m.mu.Unlock()
