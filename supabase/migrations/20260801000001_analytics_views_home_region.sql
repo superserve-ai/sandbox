@@ -11,6 +11,14 @@
 -- sourceDetached helper checks, so it's the correct filter: without it, a
 -- detached team's pre-cutover usage keeps getting ranked on this cell's
 -- dashboards even after it's live on another cell.
+--
+-- All three membership tables have to be checked, matching sourceDetached
+-- exactly, not just team_member: the current membership-management path
+-- (upsertMembership, internal/api/rbac_phase2b.go) only writes
+-- team_memberships, so a live team can have rows there and nothing in the
+-- legacy team_member table. Requiring team_member alone would exclude
+-- that team's real, current usage, not just a detached team's stale
+-- history.
 DROP VIEW IF EXISTS analytics.team_hourly_spend;
 DROP VIEW IF EXISTS analytics.team_sandbox_events;
 
@@ -63,11 +71,15 @@ LEFT JOIN LATERAL (
       AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
     ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC LIMIT 1
 ) storage_rate ON true
-WHERE EXISTS (SELECT 1 FROM team_member tm WHERE tm.team_id = t.id);
+WHERE EXISTS (SELECT 1 FROM team_member tm WHERE tm.team_id = t.id)
+   OR EXISTS (SELECT 1 FROM team_memberships tm WHERE tm.team_id = t.id)
+   OR EXISTS (SELECT 1 FROM user_role_assignments ura WHERE ura.team_id = t.id);
 
 CREATE OR REPLACE VIEW analytics.team_sandbox_events AS
 SELECT t.name AS team_name,
        s.created_at
 FROM sandbox s
 JOIN team t ON t.id = s.team_id
-WHERE EXISTS (SELECT 1 FROM team_member tm WHERE tm.team_id = t.id);
+WHERE EXISTS (SELECT 1 FROM team_member tm WHERE tm.team_id = t.id)
+   OR EXISTS (SELECT 1 FROM team_memberships tm WHERE tm.team_id = t.id)
+   OR EXISTS (SELECT 1 FROM user_role_assignments ura WHERE ura.team_id = t.id);
