@@ -27,6 +27,7 @@ on:
       - 'cmd/secretsproxy/**'
       - 'proto/**'
       - 'internal/vm/**'
+      - 'internal/backup/**'
       - 'internal/network/**'
       - 'internal/builder/**'
       - 'internal/db/**'
@@ -93,6 +94,9 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          # Staging validates the backup uploader first; the production
+          # cells get their buckets after the staging soak.
+          BACKUP_BUCKET: superserve-artifact-backup-staging-usc1
         run: |
           python3 .github/workflows/scripts/deploy-vmd.py
 
