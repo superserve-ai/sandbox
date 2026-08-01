@@ -353,6 +353,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if known && !deleted && !failed {
 				continue
 			}
+			// Error records are Drift 8's (see Drift 1): its halves gate
+			// every record release on the terminal unit state, which this
+			// branch's stop does not.
+			if errorRecord(id) {
+				continue
+			}
 			if !r.gracePeriodElapsed("orphan:"+id, now) {
 				continue
 			}

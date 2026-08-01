@@ -1235,6 +1235,42 @@ func TestReattachRecord_ErrorPersistFails_StillRefusedInMemory(t *testing.T) {
 	}
 }
 
+// A confirmed stop whose record delete fails must also park the refusal:
+// the surviving Running row would otherwise be re-adopted onto a slot this
+// path was about to free.
+func TestReattachRecord_DeleteFailsAfterConfirmedStop_ParksError(t *testing.T) {
+	origDead := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = origDead }()
+	origStop := staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool { return true }
+	defer func() { staleUnitStopConfirmed = origStop }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil { // the delete will fail
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok || inst.Status != StatusError {
+		t.Fatalf("a failed delete must park the refusal, got inst=%+v ok=%v", inst, ok)
+	}
+	if tracked := m.vms["vm-1"]; tracked != inst {
+		t.Fatal("the Error instance must be tracked in memory")
+	}
+}
+
 // A destroy or markStale deleting the record while the stale stop waits owns
 // the teardown: the reattach must abandon, not resurrect the row.
 func TestReattachRecord_DeletedDuringStaleStop_Abandoned(t *testing.T) {

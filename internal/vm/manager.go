@@ -2324,16 +2324,15 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 						confirmed = killUnitSIGKILL(ctx, systemdUnitName(rec.ID))
 					}
 				}
-				if !confirmed {
-					// Publish the Error instance even when the write failed:
-					// left untracked, a lazy reattach would re-read the
-					// still-Running row and adopt the socket-less VM. The
-					// in-memory Error keeps it refused either way.
+				// parkError publishes the in-memory Error refusal for a VM
+				// whose durable state cannot be trusted: left untracked, a
+				// lazy reattach would re-read the Running row and adopt it.
+				parkError := func() (*VMInstance, bool) {
+					rec.Status = StatusError
 					inst := toInstance(rec)
 					// Bind network state first, as the normal path below does:
-					// the recovering in-place relaunch reuses this VM's slot
-					// only if the net manager knows it — otherwise it leaks
-					// the reserved slot and allocates a second.
+					// a recovering relaunch or destroy frees this VM's slot
+					// only if the net manager knows it.
 					if inst.Namespace != "" && inst.IP != "" {
 						if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
 							log.Error().Err(err).Msg("reattach: restore network state failed")
@@ -2342,7 +2341,6 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 					m.mu.Lock()
 					if cur, ok := m.vms[rec.ID]; ok {
 						m.mu.Unlock()
-						log.Warn().Msg("unit not confirmed stopped; VM already tracked")
 						return cur, true
 					}
 					m.vms[rec.ID] = inst
@@ -2353,10 +2351,20 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 						m.undoReattach(rec.ID)
 						return nil, false
 					}
-					log.Warn().Msg("unit not confirmed stopped; record kept as error")
 					return inst, true
 				}
-				m.state.Delete(rec.ID)
+				if !confirmed {
+					log.Warn().Msg("unit not confirmed stopped; record kept as error")
+					return parkError()
+				}
+				if derr := m.state.Delete(rec.ID); derr != nil {
+					// The Running row survives with its unit dead; untracked,
+					// a lazy reattach would re-adopt it onto a slot this path
+					// was about to free. Park the refusal instead — markStale
+					// retries the delete on later passes.
+					log.Error().Err(derr).Msg("failed to delete stale record; parking as error")
+					return parkError()
+				}
 				m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
 				return nil, false
 			}
