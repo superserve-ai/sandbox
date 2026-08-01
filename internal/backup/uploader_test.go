@@ -26,15 +26,19 @@ type memStore struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	fail    map[string]error
+	// creates counts Create calls per object, streamed or deduped: the
+	// shared-base skip is about never issuing the call at all.
+	creates map[string]int
 }
 
 func newMemStore() *memStore {
-	return &memStore{objects: map[string][]byte{}, fail: map[string]error{}}
+	return &memStore{objects: map[string][]byte{}, fail: map[string]error{}, creates: map[string]int{}}
 }
 
 func (m *memStore) Create(_ context.Context, object string, r io.Reader) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.creates[object]++
 	if err, ok := m.fail[object]; ok {
 		return false, err
 	}
@@ -1153,5 +1157,145 @@ func TestStageTaskCloneFallsBackWithoutReflink(t *testing.T) {
 	}
 	if all && task.Files[0].Path == orig {
 		t.Fatal("allStaged reported but path not rewritten")
+	}
+}
+
+// A shared base this host already verified must not be streamed again:
+// prod bases are multi-GB and every generation re-references them, so a
+// redundant stream per generation pins the bandwidth cap and puts the
+// drain permanently behind the pause arrival rate.
+func TestSharedBaseUploadsOnceThenSkipsTheStream(t *testing.T) {
+	dir := t.TempDir()
+	j, _ := testJournal(t)
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store}
+
+	base := filepath.Join(dir, "base.ext4")
+	baseData := bytes.Repeat([]byte("B"), 4096)
+	if err := os.WriteFile(base, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseSum := sha256.Sum256(baseData)
+	baseSHA := hex.EncodeToString(baseSum[:])
+
+	makeTask := func(id, overlayData string) Task {
+		overlay := filepath.Join(dir, id+"-overlay.ext4")
+		if err := os.WriteFile(overlay, []byte(overlayData), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		snap := filepath.Join(dir, id+"-vmstate.snap")
+		if err := os.WriteFile(snap, []byte(id+" state"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		oSum := sha256.Sum256([]byte(overlayData))
+		sSum := sha256.Sum256([]byte(id + " state"))
+		files := []TaskFile{
+			{Name: "vmstate.snap", Path: snap, SHA256: hex.EncodeToString(sSum[:]), Size: int64(len(id + " state"))},
+			{Name: "rootfs.ext4", Path: overlay, SHA256: hex.EncodeToString(oSum[:]), Size: int64(len(overlayData)),
+				BasePath: base, BaseSHA256: baseSHA},
+		}
+		return Task{SandboxID: id, Generation: GenerationKey(files), Files: files, EnqueuedAt: time.Unix(1, 0)}
+	}
+
+	t1 := makeTask("sb-one", "overlay one")
+	if completed, err := u.uploadTask(context.Background(), &t1); err != nil || !completed {
+		t.Fatalf("first upload: completed=%v err=%v", completed, err)
+	}
+	var baseObject string
+	for o := range store.objects {
+		if strings.HasPrefix(o, "bases/") {
+			baseObject = o
+		}
+	}
+	if baseObject == "" {
+		t.Fatal("no shared base object uploaded")
+	}
+	if store.creates[baseObject] != 1 {
+		t.Fatalf("base Create calls after first task = %d, want 1", store.creates[baseObject])
+	}
+
+	t2 := makeTask("sb-two", "overlay two")
+	if completed, err := u.uploadTask(context.Background(), &t2); err != nil || !completed {
+		t.Fatalf("second upload: completed=%v err=%v", completed, err)
+	}
+	if store.creates[baseObject] != 1 {
+		t.Fatalf("base Create calls after second task = %d, want the stream skipped entirely", store.creates[baseObject])
+	}
+	// The skip still produced a full manifest entry for the base.
+	var mf GenerationManifest
+	manifestObj, _ := SandboxObject("sb-two", t2.Generation, ManifestObject)
+	if err := json.Unmarshal(store.objects[manifestObj], &mf); err != nil {
+		t.Fatal(err)
+	}
+	foundBase := false
+	for _, f := range mf.Files {
+		if f.Object == baseObject {
+			foundBase = true
+			if f.SHA256 != baseSHA || f.Size != int64(len(baseData)) || len(f.Extents) == 0 {
+				t.Fatalf("skipped-stream base entry incomplete: %+v", f)
+			}
+		}
+	}
+	if !foundBase {
+		t.Fatal("second generation's manifest lacks the shared base entry")
+	}
+}
+
+// A shared dedupe against another host's upload is recorded in this
+// host's verification history, so the NEXT generation skips the stream
+// instead of re-discovering the 412 at full base cost every time.
+func TestSharedDedupeRecordsHistoryForFutureSkips(t *testing.T) {
+	dir := t.TempDir()
+	j, _ := testJournal(t)
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store}
+
+	base := filepath.Join(dir, "base.ext4")
+	baseData := []byte("base bytes from another host")
+	if err := os.WriteFile(base, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseSum := sha256.Sum256(baseData)
+	baseSHA := hex.EncodeToString(baseSum[:])
+
+	overlay := filepath.Join(dir, "overlay.ext4")
+	snap := filepath.Join(dir, "vmstate.snap")
+	for p, d := range map[string]string{overlay: "overlay", snap: "state"} {
+		if err := os.WriteFile(p, []byte(d), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oSum := sha256.Sum256([]byte("overlay"))
+	sSum := sha256.Sum256([]byte("state"))
+	files := []TaskFile{
+		{Name: "vmstate.snap", Path: snap, SHA256: hex.EncodeToString(sSum[:]), Size: 5},
+		{Name: "rootfs.ext4", Path: overlay, SHA256: hex.EncodeToString(oSum[:]), Size: 7,
+			BasePath: base, BaseSHA256: baseSHA},
+	}
+	task := Task{SandboxID: "sb", Generation: GenerationKey(files), Files: files, EnqueuedAt: time.Unix(1, 0)}
+
+	// Simulate the other host's prior upload: the object exists, so this
+	// host's first attempt dedupes (412) rather than creating.
+	bf, err := os.Open(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extents, apparent, err := Extents(bf)
+	bf.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseObject := SharedBaseObject(baseSHA, PackFingerprint(extents, apparent))
+	store.objects[baseObject] = []byte("already there")
+
+	if completed, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
+		t.Fatalf("upload: completed=%v err=%v", completed, err)
+	}
+	if store.creates[baseObject] != 1 {
+		t.Fatalf("base Create calls = %d, want exactly the deduped attempt", store.creates[baseObject])
+	}
+	ok, err := j.WasVerified(baseObject, time.Now())
+	if err != nil || !ok {
+		t.Fatalf("dedupe not recorded in verification history: ok=%v err=%v", ok, err)
 	}
 }

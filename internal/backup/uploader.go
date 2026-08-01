@@ -124,14 +124,15 @@ func (u *Uploader) Run(ctx context.Context) error {
 			// race with a crash) would otherwise wait for the next ack,
 			// which on an idle host never comes.
 			u.flushNotifications()
-			// Staged shared bases are real copies on non-reflink hosts
-			// and outlive their tasks by design; sweep them against the
-			// journal periodically, not only at boot, or a long-running
-			// host accumulates multi-GB residue.
-			if u.StagingRoot != "" && u.clock().Sub(lastSweep) > stagingSweepInterval {
-				lastSweep = u.clock()
-				SweepStaging(u.StagingRoot, u.Journal, u.Log)
-			}
+		}
+		// Staged shared bases are real copies on non-reflink hosts and
+		// outlive their tasks by design; sweep them against the journal
+		// periodically. Deliberately OUTSIDE the idle branch: a host
+		// with a standing backlog never idles, and the sweep must not
+		// starve exactly when staged residue accumulates fastest.
+		if u.StagingRoot != "" && u.clock().Sub(lastSweep) > stagingSweepInterval {
+			lastSweep = u.clock()
+			SweepStaging(u.StagingRoot, u.Journal, u.Log)
 		}
 	}
 }
@@ -344,6 +345,35 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 			return ManifestFile{}, err
 		}
 	}
+	if file.Shared {
+		// Skip the stream when this host already verified these exact
+		// object bytes: shared bases are multi-GB, and every generation
+		// on the template re-references the same object, so streaming
+		// just to discover the create-only 412 at finalize would pin the
+		// bandwidth cap on redundant bytes and put the drain loop
+		// permanently behind the pause arrival rate. The local source
+		// was pre-verified above, the name embeds digest and packing
+		// fingerprint, and the extent table here describes this host's
+		// packing of content the history already vouches for.
+		verified := task.HasVerified(object)
+		if !verified {
+			if ok, err := u.Journal.WasVerified(object, u.clock()); err == nil && ok {
+				verified = true
+			}
+		}
+		if verified {
+			u.Log.Info().Str("object", object).
+				Msg("shared object verified previously; skipping stream")
+			return ManifestFile{
+				Name:       file.Name,
+				Object:     objectName,
+				SHA256:     file.SHA256,
+				Size:       apparent,
+				PackedSize: PackedSize(extents),
+				Extents:    extents,
+			}, nil
+		}
+	}
 	// The stream hasher digests the apparent content of what is ACTUALLY
 	// shipped (packed bytes as streamed, zeros for the holes), closing the
 	// window the pre-check cannot: a mutation while the bandwidth-capped
@@ -410,9 +440,19 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// mutated mid-stream, leaving torn bytes squatting the name) is
 		// caught by restore's mandatory digest check, and an operator
 		// re-uploads the base with admin credentials; write-only hosts
-		// cannot self-serve that check by design.
+		// cannot self-serve that check by design. Record the dedupe in
+		// the verification history so later generations skip the stream
+		// instead of re-discovering the 412 the slow way.
 		u.Log.Info().Str("object", object).
 			Msg("shared object already present; trusting content-addressed dedupe")
+		next := *task
+		if !next.HasVerified(object) {
+			next.VerifiedObjects = append(append([]string(nil), task.VerifiedObjects...), object)
+		}
+		if err := u.Journal.RecordVerification(next, object, u.clock()); err != nil {
+			return ManifestFile{}, fmt.Errorf("record shared dedupe of %s: %w", object, err)
+		}
+		task.VerifiedObjects = next.VerifiedObjects
 	} else if !task.HasVerified(object) {
 		// The object already existed (dedupe). Stream consumption proves
 		// nothing here: small objects buffer fully before the
