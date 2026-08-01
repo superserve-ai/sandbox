@@ -180,16 +180,14 @@ type AnalyticsDailySandboxStart struct {
 }
 
 type AnalyticsTeamHourlySpend struct {
-	TeamName   string         `json:"team_name"`
-	HomeRegion string         `json:"home_region"`
-	HourStart  time.Time      `json:"hour_start"`
-	SpendUsd   pgtype.Numeric `json:"spend_usd"`
+	TeamName  string         `json:"team_name"`
+	HourStart time.Time      `json:"hour_start"`
+	SpendUsd  pgtype.Numeric `json:"spend_usd"`
 }
 
 type AnalyticsTeamSandboxEvent struct {
-	TeamName   string    `json:"team_name"`
-	HomeRegion string    `json:"home_region"`
-	CreatedAt  time.Time `json:"created_at"`
+	TeamName  string    `json:"team_name"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type AnalyticsWeeklyUserMetric struct {

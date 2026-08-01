@@ -1,18 +1,21 @@
--- Exposes team.home_region on the per-team analytics views so a cell's
--- Grafana panels can filter to teams actually homed there.
+-- Excludes teams no longer attached to this cell from the per-team
+-- analytics views.
 --
--- When a team migrates between cells, its team_id and historical usage
--- rows can still be present in the source cell's database even though
--- team.home_region now points at the destination cell (rows are copied at
--- cutover, and only the destination cell accrues new usage afterward).
--- Without a region filter, a migrated team's pre-cutover usage still gets
--- ranked on both cells' dashboards for the overlapping window.
+-- When a team migrates between cells, cmd/migrate-team's detach step
+-- deletes the team's membership rows here (team_member, team_memberships,
+-- user_role_assignments -- see membershipTables in cmd/migrate-team/tables.go)
+-- but deliberately retains the team row and its historical usage/sandbox
+-- rows as a cold fallback until purge. team.home_region is not part of
+-- that detach step and does not reflect the move. Membership presence is
+-- the same "is this team still live here" signal cmd/migrate-team's own
+-- sourceDetached helper checks, so it's the correct filter: without it, a
+-- detached team's pre-cutover usage keeps getting ranked on this cell's
+-- dashboards even after it's live on another cell.
 DROP VIEW IF EXISTS analytics.team_hourly_spend;
 DROP VIEW IF EXISTS analytics.team_sandbox_events;
 
 CREATE OR REPLACE VIEW analytics.team_hourly_spend AS
 SELECT t.name AS team_name,
-       t.home_region,
        u.hour_start,
        (CASE WHEN u.hour_start < pl.at THEN 0
              WHEN vcpu_rate.price_usd IS NOT NULL THEN u.vcpu_seconds * vcpu_rate.price_usd
@@ -59,11 +62,12 @@ LEFT JOIN LATERAL (
       AND r.effective_from <= u.hour_start
       AND (r.effective_to IS NULL OR r.effective_to > u.hour_start)
     ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC LIMIT 1
-) storage_rate ON true;
+) storage_rate ON true
+WHERE EXISTS (SELECT 1 FROM team_member tm WHERE tm.team_id = t.id);
 
 CREATE OR REPLACE VIEW analytics.team_sandbox_events AS
 SELECT t.name AS team_name,
-       t.home_region,
        s.created_at
 FROM sandbox s
-JOIN team t ON t.id = s.team_id;
+JOIN team t ON t.id = s.team_id
+WHERE EXISTS (SELECT 1 FROM team_member tm WHERE tm.team_id = t.id);
