@@ -195,6 +195,9 @@ jobs:
           CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_USW }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}
           INTERNAL_API_TOKEN: ${{ secrets.PROD_USW_INTERNAL_API_TOKEN }}
+          # Enables the pause-backup uploader for the cell (validated on
+          # staging first; the bucket is create-only for hosts).
+          BACKUP_BUCKET: superserve-artifact-backup-usw2
         run: |
           # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
           # filter and fan out to every VMD_LABEL match — which would push
