@@ -625,6 +625,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				r.clearDrift("bolt-orphan:" + id)
 				continue
 			}
+			// Error records are Drift 8's (see Drift 1): its halves gate
+			// every record release on the terminal unit state, and a
+			// transitional unit — absent from the active snapshot — would
+			// reach the markStale below with its process still alive.
+			if errorRecord(id) {
+				continue
+			}
 			// Only stopping a live unit is destructive; charge the budget there.
 			// Gate on the fail-closed `active` snapshot (the pass bailed if systemctl
 			// couldn't be listed) so an inconclusive check never frees a live VM's slot.
