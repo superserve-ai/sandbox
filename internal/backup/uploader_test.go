@@ -369,6 +369,67 @@ func TestUploaderRoutesTemplateTasks(t *testing.T) {
 	}
 }
 
+// A template build ships its base image as a regular member of its own
+// generation (the vm side enqueues it without a BaseSHA256 dependency), so
+// the uploader must ship it exactly once under the template prefix and
+// never also route it through the shared bases/ tree.
+func TestTemplateBaseShipsOnceInsideTheGeneration(t *testing.T) {
+	j, _ := testJournal(t)
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store}
+
+	dir := t.TempDir()
+	base := []byte("base image bytes")
+	basePath := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(basePath, base, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files := []TaskFile{{
+		Name:   "base.ext4",
+		Path:   basePath,
+		SHA256: digestOf(base),
+		Size:   int64(len(base)),
+	}}
+	task := Task{
+		TemplateID: "tpl-1",
+		BuildID:    "build-tpl-1",
+		Generation: GenerationKey(files),
+		Priority:   PriorityPause,
+		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 1, 0, time.UTC),
+		Files:      files,
+	}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	prefix := "templates/tpl-1/build-tpl-1/" + task.Generation + "/"
+	baseObjects := 0
+	for obj := range store.objects {
+		if strings.HasPrefix(obj, "bases/") {
+			t.Fatalf("template base leaked into the shared prefix: %s", obj)
+		}
+		if strings.Contains(obj, "base.ext4") {
+			baseObjects++
+			if !strings.HasPrefix(obj, prefix) {
+				t.Fatalf("base object outside the template generation: %s", obj)
+			}
+		}
+	}
+	if baseObjects != 1 {
+		t.Fatalf("base.ext4 shipped %d times, want exactly 1 (objects: %v)", baseObjects, keysOf(store.objects))
+	}
+	var gen GenerationManifest
+	if err := json.Unmarshal(store.objects[prefix+ManifestObject], &gen); err != nil {
+		t.Fatalf("template manifest object: %v", err)
+	}
+	if len(gen.Files) != 1 || gen.Files[0].Name != "base.ext4" || gen.Files[0].BaseSHA256 != "" {
+		t.Fatalf("template manifest files = %+v, want one base.ext4 entry with no base dependency", gen.Files)
+	}
+}
+
 func keysOf(m map[string][]byte) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {

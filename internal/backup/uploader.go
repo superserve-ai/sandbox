@@ -529,7 +529,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 	}
 	return ManifestFile{
 		Name:       file.Name,
-		Object:     suffixedName,
+		Object:     objectName,
 		SHA256:     file.SHA256,
 		BasePath:   file.BasePath,
 		BaseSHA256: file.BaseSHA256,

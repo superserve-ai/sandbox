@@ -733,6 +733,12 @@ func (m *Manager) enqueueTemplateBackup(templateID, buildID string, manifest []M
 	}
 	files := make([]backup.TaskFile, 0, len(manifest))
 	for _, e := range manifest {
+		// No BasePath/BaseSHA256, deliberately: the build's base image is
+		// already a REGULAR member of this artifact set (collectBuildManifest
+		// hashes it via extraPaths), so it ships inside the template's own
+		// generation. Declaring it a base dependency too would make the
+		// uploader also ship it as a shared bases/ object: the same bytes
+		// twice.
 		files = append(files, backup.TaskFile{
 			Name:   e.FileName,
 			Path:   e.Path,
