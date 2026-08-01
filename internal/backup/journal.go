@@ -527,6 +527,67 @@ func (j *Journal) Pending() (map[Priority]int, error) {
 	return counts, err
 }
 
+// verifiedScopeKey marks the verification history as scoped: its value
+// is the bucket the pre-scoping records were claimed for.
+var verifiedScopeKey = []byte("\x00verified_scope")
+
+// MigrateVerificationScope claims every unscoped (pre-upgrade)
+// verification record for the given bucket, exactly once. Pre-scoping
+// binaries only ever verified against the host's single configured
+// bucket, and the deploy that introduces scoping changes no buckets, so
+// claiming at first boot is sound; afterwards lookups are purely scoped
+// and a bucket change misses everything, as it must. Queued tasks'
+// VerifiedObjects entries are rewritten in the same transaction.
+func (j *Journal) MigrateVerificationScope(scope string) error {
+	return j.db.Update(func(tx *bolt.Tx) error {
+		vb := tx.Bucket(verifiedBucket)
+		if vb.Get(verifiedScopeKey) != nil {
+			return nil
+		}
+		type kv struct{ k, v []byte }
+		var moves []kv
+		c := vb.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if len(k) > 0 && k[0] != 0 && !strings.Contains(string(k), "\x00") {
+				moves = append(moves, kv{append([]byte(nil), k...), append([]byte(nil), v...)})
+			}
+		}
+		for _, m := range moves {
+			if err := vb.Put([]byte(scope+"\x00"+string(m.k)), m.v); err != nil {
+				return err
+			}
+			if err := vb.Delete(m.k); err != nil {
+				return err
+			}
+		}
+		qb := tx.Bucket(journalBucket)
+		qc := qb.Cursor()
+		for k, v := qc.First(); k != nil; k, v = qc.Next() {
+			var t Task
+			if json.Unmarshal(v, &t) != nil || len(t.VerifiedObjects) == 0 {
+				continue
+			}
+			changed := false
+			for i, o := range t.VerifiedObjects {
+				if !strings.Contains(o, "\x00") {
+					t.VerifiedObjects[i] = scope + "\x00" + o
+					changed = true
+				}
+			}
+			if changed {
+				nv, err := json.Marshal(t)
+				if err != nil {
+					return err
+				}
+				if err := qb.Put(append([]byte(nil), k...), nv); err != nil {
+					return err
+				}
+			}
+		}
+		return vb.Put(verifiedScopeKey, []byte(scope))
+	})
+}
+
 // PendingNotifications returns completed tasks whose OnVerified signal
 // has not been confirmed delivered. Corrupt entries are skipped (and
 // swept by ClearNotification when their key is next written).
