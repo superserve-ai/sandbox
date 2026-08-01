@@ -317,6 +317,17 @@ func stopUnitWithBudget(ctx context.Context, unit string) error {
 	return stopUnit(c, unit)
 }
 
+// killUnitSIGKILL asks systemd to SIGKILL all of a unit's processes — the
+// escalation when a graceful stop cannot be confirmed and the recorded PID
+// cannot be verified: systemd resolves the unit's live processes itself.
+// Detached and bounded; reports whether the unit is confirmed down after.
+func killUnitSIGKILL(ctx context.Context, unit string) bool {
+	kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = exec.CommandContext(kctx, "systemctl", "kill", "-s", "SIGKILL", unit).Run()
+	return unitDefinitelyDead(kctx, unit)
+}
+
 // unitLingering reports whether the unit has a live or winding-down process
 // (active, activating, or deactivating) — i.e. a restart must wait out a
 // stop phase before the fresh process can bind its socket.

@@ -1231,3 +1231,50 @@ func TestReattachRecord_ErrorPersistFails_StillRefusedInMemory(t *testing.T) {
 		t.Fatal("the Error instance must be tracked in memory")
 	}
 }
+
+// A destroy or markStale deleting the record while the stale stop waits owns
+// the teardown: the reattach must abandon, not resurrect the row.
+func TestReattachRecord_DeletedDuringStaleStop_Abandoned(t *testing.T) {
+	origDead := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = origDead }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	origStop := staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool {
+		if err := store.Delete("vm-1"); err != nil { // markStale races the wait
+			t.Error(err)
+		}
+		return false
+	}
+	defer func() { staleUnitStopConfirmed = origStop }()
+
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst != nil || ok {
+		t.Fatal("a record deleted mid-wait must be abandoned, not published")
+	}
+	present, err := store.Has("vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present {
+		t.Fatal("the deleted record must not be resurrected")
+	}
+	if _, tracked := m.vms["vm-1"]; tracked {
+		t.Fatal("an abandoned reattach must not track the VM")
+	}
+}

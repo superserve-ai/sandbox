@@ -2300,15 +2300,25 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				confirmed := staleUnitStopConfirmed(ctx, systemdUnitName(rec.ID))
 				if !confirmed {
 					rec.Status = StatusError
-					if perr := m.state.Put(rec); perr != nil {
+					wrote, perr := m.state.PutIfPresent(rec)
+					if perr == nil && !wrote {
+						// Deleted while we waited on the stop (destroy or
+						// markStale): whoever deleted it owns the teardown, and
+						// recreating the row would resurrect it and rebind a
+						// freed slot.
+						return nil, false
+					}
+					if perr != nil {
 						log.Error().Err(perr).Msg("failed to persist error status for unstopped VM")
 						// Without a durable refusal, a restart could re-adopt
 						// the Running row. Escalate instead of retrying the
-						// broken store: a pid-verified SIGKILL leaves no live
-						// unit to mis-adopt, and the next pass reaps the
-						// then-dead record.
+						// broken store — kill the unit's processes, by verified
+						// PID or via systemd — so no live unit is left to
+						// mis-adopt; the next pass reaps the then-dead record.
 						if pidIsVMFirecracker(rec.PID, rec.ID) {
 							sigkillPID(rec.PID, 500*time.Millisecond)
+							confirmed = true
+						} else if killUnitSIGKILL(ctx, systemdUnitName(rec.ID)) {
 							confirmed = true
 						}
 					}
@@ -2336,6 +2346,12 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 					}
 					m.vms[rec.ID] = inst
 					m.mu.Unlock()
+					// Commit check, as the Paused path below: a delete landing
+					// between the write and the publish must win.
+					if m.recordDeleted(rec.ID) {
+						m.undoReattach(rec.ID)
+						return nil, false
+					}
 					log.Warn().Msg("unit not confirmed stopped; record kept as error")
 					return inst, true
 				}

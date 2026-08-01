@@ -405,6 +405,14 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		removeUnitDropIn(id)
 		r.markStale(id)
 		unlockOp()
+		// Flip the DB row with the already-grace-qualified reap: Drift 1
+		// cleared its marker while the unit was active, so leaving the row
+		// Active would advertise a dead sandbox for another full grace.
+		if dbSandboxes != nil {
+			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
+				r.markFailedInDB(ctx, id)
+			}
+		}
 		r.writeAudit(ctx, id, "error_unit_stop", "live unit for error-status record", "boltdb_error_unit_active")
 		r.clearDrift("errunit:" + id)
 	}
