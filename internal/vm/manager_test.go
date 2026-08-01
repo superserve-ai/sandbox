@@ -1206,6 +1206,9 @@ func TestReattachRecord_ErrorPersistFails_StillRefusedInMemory(t *testing.T) {
 	origStop := staleUnitStopConfirmed
 	staleUnitStopConfirmed = func(context.Context, string) bool { return false }
 	defer func() { staleUnitStopConfirmed = origStop }()
+	origKill := killUnitSIGKILL
+	killUnitSIGKILL = func(context.Context, string) bool { return false } // escalation inconclusive too
+	defer func() { killUnitSIGKILL = origKill }()
 
 	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

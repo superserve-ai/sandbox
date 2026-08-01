@@ -321,7 +321,8 @@ func stopUnitWithBudget(ctx context.Context, unit string) error {
 // escalation when a graceful stop cannot be confirmed and the recorded PID
 // cannot be verified: systemd resolves the unit's live processes itself.
 // Detached and bounded; reports whether the unit is confirmed down after.
-func killUnitSIGKILL(ctx context.Context, unit string) bool {
+// A var for the same test seam vmUnitDead uses.
+var killUnitSIGKILL = func(ctx context.Context, unit string) bool {
 	kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	_ = exec.CommandContext(kctx, "systemctl", "kill", "-s", "SIGKILL", unit).Run()
