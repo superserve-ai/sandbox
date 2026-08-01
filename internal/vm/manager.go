@@ -2297,11 +2297,23 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				// caller-driven relaunch or destroy stops the unit on its own
 				// budget; failing that, the reconciler's error-unit rule reaps
 				// it.
-				if !staleUnitStopConfirmed(ctx, systemdUnitName(rec.ID)) {
+				confirmed := staleUnitStopConfirmed(ctx, systemdUnitName(rec.ID))
+				if !confirmed {
 					rec.Status = StatusError
-					if err := m.state.Put(rec); err != nil {
-						log.Error().Err(err).Msg("failed to persist error status for unstopped VM")
+					if perr := m.state.Put(rec); perr != nil {
+						log.Error().Err(perr).Msg("failed to persist error status for unstopped VM")
+						// Without a durable refusal, a restart could re-adopt
+						// the Running row. Escalate instead of retrying the
+						// broken store: a pid-verified SIGKILL leaves no live
+						// unit to mis-adopt, and the next pass reaps the
+						// then-dead record.
+						if pidIsVMFirecracker(rec.PID, rec.ID) {
+							sigkillPID(rec.PID, 500*time.Millisecond)
+							confirmed = true
+						}
 					}
+				}
+				if !confirmed {
 					// Publish the Error instance even when the write failed:
 					// left untracked, a lazy reattach would re-read the
 					// still-Running row and adopt the socket-less VM. The

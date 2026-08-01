@@ -1195,3 +1195,39 @@ func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
 		t.Fatalf("kept record must read Error so no retry adopts a socket-less VM, got %s", kept.Status)
 	}
 }
+
+// When the error write fails (broken store) and there is no verifiable pid to
+// escalate against, the VM must still be refused in memory — the only refusal
+// a broken store leaves.
+func TestReattachRecord_ErrorPersistFails_StillRefusedInMemory(t *testing.T) {
+	origDead := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = origDead }()
+	origStop := staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool { return false }
+	defer func() { staleUnitStopConfirmed = origStop }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil { // every later write fails
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok || inst.Status != StatusError {
+		t.Fatalf("a broken store must still yield an in-memory Error refusal, got inst=%+v ok=%v", inst, ok)
+	}
+	if tracked := m.vms["vm-1"]; tracked != inst {
+		t.Fatal("the Error instance must be tracked in memory")
+	}
+}
