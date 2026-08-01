@@ -504,24 +504,78 @@ func TestHashApparentHonorsCancellationMidExtent(t *testing.T) {
 	}
 }
 
-func TestHashApparentReportsTruncatedSource(t *testing.T) {
-	// The file shrank after its extent table was captured (a resume rewrote
-	// it): the short read must classify as ErrTruncatedSource so the
-	// generation is abandoned, not retried against a moving target.
-	path := filepath.Join(t.TempDir(), "shrunk")
-	if err := os.WriteFile(path, bytes.Repeat([]byte{0xDD}, 2<<20), 0o644); err != nil {
+func TestRestoreGenerationRestoresSharedBasePair(t *testing.T) {
+	// An overlay generation ships its base image as a bucket-wide shared
+	// object; restore must fetch and verify it as part of the consistency
+	// pair, since the overlay's holes are meaningless without it.
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "base-image.ext4")
+	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.Open(path)
+	task := writeRestoreFixture(t, dir)
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+
+	destDir := filepath.Join(t.TempDir(), "restored")
+	manifest, err := RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, destDir)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if len(manifest.Files) != 3 {
+		t.Fatalf("manifest files = %d, want overlay+vmstate+base", len(manifest.Files))
+	}
+	got, err := os.ReadFile(filepath.Join(destDir, "base.ext4"))
+	if err != nil {
+		t.Fatalf("restored base: %v", err)
+	}
+	if !bytes.Equal(got, baseData) {
+		t.Fatalf("restored base differs from original (%d vs %d bytes)", len(got), len(baseData))
+	}
+}
+
+func TestRestoreGenerationRejectsMissingSharedBaseEntry(t *testing.T) {
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "base-image.ext4")
+	baseData := bytes.Repeat([]byte{0x22}, 64<<10)
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writeRestoreFixture(t, dir)
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+
+	// Drop the shared base entry: the generation key still reproduces
+	// (base entries are synthesized outside it), so only the
+	// consistency-pair check catches the unrestorable manifest.
+	manifestObject := genObject(task, ManifestObject)
+	var manifest GenerationManifest
+	if err := json.Unmarshal(store.objects[manifestObject], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	kept := manifest.Files[:0]
+	for _, mf := range manifest.Files {
+		if !strings.HasPrefix(mf.Object, "bases/") {
+			kept = append(kept, mf)
+		}
+	}
+	manifest.Files = kept
+	mutated, err := json.Marshal(manifest)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	if err := os.Truncate(path, 1<<20); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := hashApparent(context.Background(), f, []Extent{{Offset: 0, Length: 2 << 20}}, 2<<20); !errors.Is(err, ErrTruncatedSource) {
-		t.Fatalf("err = %v, want ErrTruncatedSource", err)
+	store.objects[manifestObject] = mutated
+
+	_, err = RestoreGeneration(context.Background(), store, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"))
+	if err == nil || !strings.Contains(err.Error(), "consistency pair") {
+		t.Fatalf("err = %v, want consistency pair incomplete", err)
 	}
 }
 

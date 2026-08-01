@@ -231,19 +231,53 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 			object, manifest.SandboxID, manifest.Generation, sandboxID, generation)
 	}
 	// The manifest must also be self-authenticating: the generation prefix
-	// is the content address GenerationKey derives from the full file set,
-	// so the entries must reproduce it. A manifest with an entry dropped or
-	// a name, digest, or base dependency altered would otherwise pass the
-	// identity check and restore an incomplete or wrong file set with every
-	// remaining digest verifying.
+	// is the content address GenerationKey derives from the enqueued file
+	// set, so the entries must reproduce it. A manifest with an entry
+	// dropped or a name, digest, or base dependency altered would otherwise
+	// pass the identity check and restore an incomplete or wrong file set
+	// with every remaining digest verifying. Shared base entries are
+	// synthesized at upload time and excluded from the key; they are bound
+	// instead through the consistency-pair check below, whose BaseSHA256
+	// side IS key-covered.
 	files := make([]TaskFile, 0, len(manifest.Files))
+	baseDeps := map[string]bool{}
+	sharedEntries := map[string]bool{}
 	for _, mf := range manifest.Files {
-		files = append(files, TaskFile{Name: mf.Name, SHA256: mf.SHA256, BasePath: mf.BasePath})
+		if isSharedEntry(mf) {
+			sharedEntries[mf.SHA256] = true
+			continue
+		}
+		files = append(files, TaskFile{Name: mf.Name, SHA256: mf.SHA256, BasePath: mf.BasePath, BaseSHA256: mf.BaseSHA256})
+		if mf.BaseSHA256 != "" {
+			baseDeps[mf.BaseSHA256] = true
+		}
 	}
 	if key := GenerationKey(files); key != generation {
 		return nil, fmt.Errorf("manifest does not reproduce its generation key: file set derives %s, prefix is %s (entry dropped or altered)", key, generation)
 	}
+	// Consistency pair: an overlay's holes are backed by its base, so a
+	// declared base dependency without its shared entry is not restorable,
+	// and a shared entry no file depends on is not something this
+	// generation may vouch for.
+	for dep := range baseDeps {
+		if !sharedEntries[dep] {
+			return nil, fmt.Errorf("manifest declares base %s but carries no shared entry for it: consistency pair incomplete", dep)
+		}
+	}
+	for sha := range sharedEntries {
+		if !baseDeps[sha] {
+			return nil, fmt.Errorf("manifest carries shared object %s that no entry depends on", sha)
+		}
+	}
 	return &manifest, nil
+}
+
+// isSharedEntry reports whether a manifest entry points at a bucket-wide
+// shared object rather than one inside the generation prefix: shared
+// entries record the full object path, generation-local entries a single
+// name segment.
+func isSharedEntry(mf ManifestFile) bool {
+	return strings.Contains(mf.Object, "/")
 }
 
 // restoreFile streams a packed object into place: each extent's bytes land
@@ -266,15 +300,30 @@ func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string
 	if mf.Object == "" {
 		return false, fmt.Errorf("manifest entry records no object name")
 	}
-	if err := validSegment(mf.Object); err != nil {
-		return false, fmt.Errorf("manifest object name: %w", err)
-	}
 	if err := validExtents(mf); err != nil {
 		return false, err
 	}
-	object, err := SandboxObject(sandboxID, generation, mf.Object)
-	if err != nil {
-		return false, err
+	var object string
+	if isSharedEntry(mf) {
+		// Shared base objects live outside the generation prefix under a
+		// content-addressed name. Require the recorded path to embed this
+		// entry's digest: the digest chains back to a key-covered
+		// BaseSHA256, so a tampered manifest cannot point the pair at an
+		// arbitrary bucket object.
+		fp, ok := strings.CutPrefix(mf.Object, SharedBaseObject(mf.SHA256, ""))
+		if !ok || fp == "" || strings.ContainsAny(fp, "/\\") {
+			return false, fmt.Errorf("shared object name %q is not bound to digest %s", mf.Object, mf.SHA256)
+		}
+		object = mf.Object
+	} else {
+		if err := validSegment(mf.Object); err != nil {
+			return false, fmt.Errorf("manifest object name: %w", err)
+		}
+		var err error
+		object, err = SandboxObject(sandboxID, generation, mf.Object)
+		if err != nil {
+			return false, err
+		}
 	}
 	rc, err := r.NewReader(ctx, object)
 	if err != nil {
