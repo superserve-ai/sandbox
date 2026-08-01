@@ -432,7 +432,15 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// Drift 5 on missing DB rows). Grace gives the control plane's own
 	// destroy first claim on the record.
 	reapDeadError := func(id string) {
-		if active[id] || !errorRecord(id) {
+		if active[id] {
+			r.clearDrift("errdead:" + id)
+			return
+		}
+		// The unit is gone, so the active half no longer visits this id —
+		// its grace marker retires here, or a recurrence would inherit the
+		// old timestamp and skip the grace period.
+		r.clearDrift("errunit:" + id)
+		if !errorRecord(id) {
 			r.clearDrift("errdead:" + id)
 			return
 		}
