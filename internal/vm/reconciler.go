@@ -257,6 +257,20 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 
 	now := time.Now()
 
+	// errorRecord reports whether id's BoltDB record reads Error. Statuses
+	// are fetched per candidate id so the common DB-mode pass stays ID-only.
+	errorRecord := func(id string) bool {
+		if bolted != nil {
+			rec, ok := bolted[id]
+			return ok && rec.Status == StatusError
+		}
+		if _, ok := boltedIDs[id]; !ok {
+			return false
+		}
+		rec, err := r.mgr.state.Get(id)
+		return err == nil && rec != nil && rec.Status == StatusError
+	}
+
 	// Drift 1: DB says active, systemd/socket says dead.
 	// Action: mark sandbox failed in DB + clean up BoltDB + in-memory.
 	if dbSandboxes != nil {
@@ -266,6 +280,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			if active[id] {
 				r.clearDrift(id)
+				continue
+			}
+			// Error records are Drift 8's: its halves gate every record
+			// release on the terminal unit state, which this branch does not
+			// probe — a deactivating unit is absent from the active snapshot
+			// while its process may live on.
+			if errorRecord(id) {
 				continue
 			}
 			if !r.gracePeriodElapsed(id, now) {
@@ -353,19 +374,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// gone, stop unconfirmed) so no request path adopts it; no other rule
 	// stops the unit, which otherwise burns CPU/RAM until a user-driven
 	// relaunch or destroy. Keyed on BoltDB + systemd only, so it runs in
-	// both DB modes; statuses are fetched per active unit to keep the
-	// common pass ID-only.
-	errorRecord := func(id string) bool {
-		if bolted != nil {
-			rec, ok := bolted[id]
-			return ok && rec.Status == StatusError
-		}
-		if _, ok := boltedIDs[id]; !ok {
-			return false
-		}
-		rec, err := r.mgr.state.Get(id)
-		return err == nil && rec != nil && rec.Status == StatusError
-	}
+	// both DB modes.
 	for id := range active {
 		if !errorRecord(id) {
 			r.clearDrift("errunit:" + id)
@@ -469,6 +478,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 		r.markStale(id)
 		unlockOp()
+		// Drift 1 skips Error records, so the row flip lands here (still
+		// compare-and-set: a relaunch may own the row by now).
+		if dbSandboxes != nil {
+			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
+				r.markFailedInDBIfActive(ctx, id)
+			}
+		}
 		r.writeAudit(ctx, id, "stale_cleanup", "error record with no unit", "boltdb_error_unit_missing")
 		r.clearDrift("errdead:" + id)
 	}
