@@ -288,10 +288,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// the old behavior: just clean up the stale BoltDB entry.
 	if dbSandboxes == nil {
 		for id, rec := range bolted {
-			// Error records ride along: a reattach parks an unmanageable VM
-			// as Error, and once its unit is gone nothing else would reclaim
-			// the record or its network slot in this mode.
-			if rec.Status != StatusRunning && rec.Status != StatusError {
+			if rec.Status != StatusRunning {
 				continue
 			}
 			if active[id] {
@@ -418,6 +415,48 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 		r.writeAudit(ctx, id, "error_unit_stop", "live unit for error-status record", "boltdb_error_unit_active")
 		r.clearDrift("errunit:" + id)
+	}
+
+	// The dead-unit half of Drift 8: an Error record whose unit is gone —
+	// parked by an error path that stopped the unit, or left when the reap
+	// above stopped the unit but the record deletion failed. No other rule
+	// owns it (Drifts 1/3 key on other unit states, Drift 2 on Running,
+	// Drift 5 on missing DB rows). Grace gives the control plane's own
+	// destroy first claim on the record.
+	reapDeadError := func(id string) {
+		if active[id] || !errorRecord(id) {
+			r.clearDrift("errdead:" + id)
+			return
+		}
+		if !r.gracePeriodElapsed("errdead:"+id, now) {
+			return
+		}
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			return
+		}
+		if r.mgr.instanceRunning(id) {
+			unlockOp()
+			r.clearDrift("errdead:" + id)
+			return
+		}
+		if !r.consumeAutoFailBudget(id) {
+			unlockOp()
+			return
+		}
+		r.markStale(id)
+		unlockOp()
+		r.writeAudit(ctx, id, "stale_cleanup", "error record with no unit", "boltdb_error_unit_missing")
+		r.clearDrift("errdead:" + id)
+	}
+	if bolted != nil {
+		for id := range bolted {
+			reapDeadError(id)
+		}
+	} else {
+		for id := range boltedIDs {
+			reapDeadError(id)
+		}
 	}
 
 	// Drift 7: systemd unit active, DB says paused — an interrupted pause

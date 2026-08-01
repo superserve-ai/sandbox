@@ -2312,15 +2312,15 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 						log.Error().Err(perr).Msg("failed to persist error status for unstopped VM")
 						// Without a durable refusal, a restart could re-adopt
 						// the Running row. Escalate instead of retrying the
-						// broken store — kill the unit's processes, by verified
-						// PID or via systemd — so no live unit is left to
-						// mis-adopt; the next pass reaps the then-dead record.
+						// broken store — kill by verified PID when possible,
+						// then have systemd kill whatever remains — and let
+						// one probe decide: SIGKILL delivery does not prove
+						// exit (a D-state process survives it), and an
+						// unconfirmed kill must not release the record.
 						if pidIsVMFirecracker(rec.PID, rec.ID) {
 							sigkillPID(rec.PID, 500*time.Millisecond)
-							confirmed = true
-						} else if killUnitSIGKILL(ctx, systemdUnitName(rec.ID)) {
-							confirmed = true
 						}
+						confirmed = killUnitSIGKILL(ctx, systemdUnitName(rec.ID))
 					}
 				}
 				if !confirmed {
