@@ -26,6 +26,24 @@ func TestAnalyticsTeamHourlySpend_MixedRangePoisonsAggregate(t *testing.T) {
 		t.Fatalf("create team: %v", err)
 	}
 
+	// analytics.team_hourly_spend filters to teams with a team_member row
+	// (see 20260801000001) — CreateTeam alone doesn't seed one, so without
+	// this the team is invisible to the view regardless of usage seeded
+	// below.
+	profileID := uuid.New()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO profile (id, email, provider, provider_id) VALUES ($1, $2, 'google', $3)`,
+		profileID, "analytics-view-"+suffix+"@example.com", "google-"+suffix,
+	); err != nil {
+		t.Fatalf("seed profile: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO team_member (team_id, profile_id, role) VALUES ($1, $2, 'owner')`,
+		team.ID, profileID,
+	); err != nil {
+		t.Fatalf("seed team_member: %v", err)
+	}
+
 	planKey := "analytics-view-plan-" + suffix
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO pricing_plan (key, name, currency)
