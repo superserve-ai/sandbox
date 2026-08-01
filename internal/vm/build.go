@@ -410,6 +410,19 @@ func (m *Manager) buildActive(buildVMID string) bool {
 //     the full re-hash, which stamps fresh digests and enqueues a correct
 //     new generation instead of abandoning the stale one forever.
 func (m *Manager) reconcileAdoptedBuildBackup(snap BuildStatusSnapshot) {
+	m.reconcileAdoptedBuildBackupMode(snap, false)
+}
+
+// reconcileAdoptedBuildBackupMode reconciles with the caller's choice of
+// slot policy. The sweep passes waitForSlot=true: its glob order is
+// deterministic, so a non-blocking drop would let the same early-sorted
+// builds consume the slots every pass and starve a later build forever;
+// blocking guarantees every match is processed each sweep, still bounded
+// by the slot count (covered builds hold a slot for milliseconds). The
+// request-path caller keeps the non-blocking drop, since an API call
+// must not park behind multi-GB hash work; the sweep covers whatever it
+// drops.
+func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, waitForSlot bool) {
 	if m.backupEnqueue == nil || snap.Status != BuildStatusReady || snap.Result == nil {
 		return
 	}
@@ -417,13 +430,18 @@ func (m *Manager) reconcileAdoptedBuildBackup(snap BuildStatusSnapshot) {
 		return
 	}
 	slots := m.ensureRehashSlots()
-	select {
-	case slots <- struct{}{}:
-	default:
-		// All rehash slots busy: drop this attempt rather than queueing
-		// unbounded hash work; the sweep retries uncovered builds.
-		m.adoptedBuildBackups.Delete(snap.BuildVMID)
-		return
+	if waitForSlot {
+		slots <- struct{}{}
+	} else {
+		select {
+		case slots <- struct{}{}:
+		default:
+			// All rehash slots busy: drop this attempt rather than
+			// queueing unbounded hash work; the sweep retries uncovered
+			// builds.
+			m.adoptedBuildBackups.Delete(snap.BuildVMID)
+			return
+		}
 	}
 	templateID, buildVMID, res := snap.TemplateID, snap.BuildVMID, snap.Result
 	dir := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, templateID, buildVMID)
@@ -551,12 +569,12 @@ func (m *Manager) runTemplateBackupSweep(log zerolog.Logger) {
 		if err != nil || !buildArtifactsPresent(res) {
 			continue // half-written or partially deleted build: not adoptable
 		}
-		m.reconcileAdoptedBuildBackup(BuildStatusSnapshot{
+		m.reconcileAdoptedBuildBackupMode(BuildStatusSnapshot{
 			BuildVMID:  buildVMID,
 			TemplateID: templateID,
 			Status:     BuildStatusReady,
 			Result:     res,
-		})
+		}, true)
 	}
 }
 

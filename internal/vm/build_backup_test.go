@@ -351,3 +351,48 @@ func TestBackupBuildArtifactsRetriesFailedEnqueue(t *testing.T) {
 		}
 	}
 }
+
+// The sweep must process every match even when the rehash slots are
+// held: a non-blocking drop with deterministic glob order would let the
+// same early builds consume the slots each pass and starve a later
+// build forever. The sweep path blocks for a slot instead.
+func TestSweepReconcileWaitsForSlotInsteadOfDropping(t *testing.T) {
+	dir := t.TempDir()
+	writeAdoptableBuildFixture(t, dir, "tpl", "build-tpl")
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	// Occupy every rehash slot, then release them shortly after the
+	// sweep starts: a dropping implementation returns without ever
+	// enqueueing, a blocking one proceeds once slots free.
+	slots := m.ensureRehashSlots()
+	held := cap(slots)
+	for i := 0; i < held; i++ {
+		slots <- struct{}{}
+	}
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		for i := 0; i < held; i++ {
+			<-slots
+		}
+	}()
+
+	res, err := readBuildMetaJSON(filepath.Join(dir, TemplatesDirName, "tpl", "build-tpl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.reconcileAdoptedBuildBackupMode(BuildStatusSnapshot{
+		BuildVMID: "build-tpl", TemplateID: "tpl", Status: BuildStatusReady, Result: res,
+	}, true)
+
+	select {
+	case task := <-tasks:
+		if task.TemplateID != "tpl" {
+			t.Fatalf("task owner = %q, want tpl", task.TemplateID)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("blocking sweep reconcile never enqueued after slots freed")
+	}
+}
