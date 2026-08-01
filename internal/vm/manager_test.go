@@ -1146,10 +1146,19 @@ func TestInstanceRunning(t *testing.T) {
 
 // A socket-missing record whose unit stop cannot be confirmed must keep its
 // BoltDB record: deleting it would leave a live Firecracker no record points
-// to, invisible to the next reattach. In this environment systemd is absent,
-// so the stop fails and the dead-probe is inconclusive — exactly the
-// unconfirmed case.
+// to, invisible to the next reattach.
 func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
+	origDead := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = origDead }()
+	origStop := staleUnitStopConfirmed
+	stoppedUnit := ""
+	staleUnitStopConfirmed = func(_ context.Context, unit string) bool {
+		stoppedUnit = unit
+		return false // stop failed and the unit is not provably down
+	}
+	defer func() { staleUnitStopConfirmed = origStop }()
+
 	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1169,11 +1178,14 @@ func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
 	if inst != nil || ok {
 		t.Fatal("a socket-missing record must not reattach as live")
 	}
-	present, err := store.Has("vm-1")
-	if err != nil {
-		t.Fatal(err)
+	if stoppedUnit != systemdUnitName("vm-1") {
+		t.Fatalf("stop attempted on %q, want the record's unit", stoppedUnit)
 	}
-	if !present {
-		t.Fatal("an unconfirmed stop must keep the record so the unit stays findable")
+	kept, err := store.Get("vm-1")
+	if err != nil || kept == nil {
+		t.Fatalf("an unconfirmed stop must keep the record so the unit stays findable, got rec=%v err=%v", kept, err)
+	}
+	if kept.Status != StatusError {
+		t.Fatalf("kept record must read Error so no retry adopts a socket-less VM, got %s", kept.Status)
 	}
 }

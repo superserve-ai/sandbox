@@ -2228,6 +2228,16 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 // dedupe through the singleflight group. Always nil in production.
 var reattachHook func(vmID string)
 
+// staleUnitStopConfirmed stops a stale record's still-active unit on a
+// detached budget (the reattach ctx may be nearly spent) and reports whether
+// it is confirmed down; a var for the same test seam vmUnitDead uses.
+var staleUnitStopConfirmed = func(ctx context.Context, unit string) bool {
+	if err := stopUnitWithBudget(ctx, unit); err != nil {
+		return unitDefinitelyDead(ctx, unit)
+	}
+	return true
+}
+
 // record. Returns (nil, false) when cleanupStale deleted a dead record.
 //
 // cleanupStale must be false on the request path: the dead-VM check would SIGKILL
@@ -2253,7 +2263,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// dead one is a stale record. Paused VMs legitimately have no unit — they
 	// were stopped at pause and wait for a resume — so they skip these checks.
 	if cleanupStale && rec.Status != StatusPaused {
-		if unitDefinitelyDead(ctx, systemdUnitName(rec.ID)) {
+		if vmUnitDead(rec.ID) {
 			log.Warn().Msg("VM in BoltDB but not running — cleaning up stale record")
 			// Cold-booted VMs (old build path) ran with Setsid and no unit, so
 			// they survive vmd restarts as orphans holding TAP fds — SIGKILL by
@@ -2276,14 +2286,18 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				// The unit is still active, so stop Firecracker before we forget
 				// the record and tear down its netns — otherwise it keeps running
 				// as an orphan burning CPU/RAM and holding TAP fds in a namespace
-				// we're about to delete out from under it. The stop gets its own
-				// budget (this ctx may be nearly spent), and an unconfirmed stop
-				// keeps the record — the next reattach retries it, the reconciler
-				// still knows the unit, and deleting it would leave a live unit
-				// no record points to.
-				unit := systemdUnitName(rec.ID)
-				if err := stopUnitWithBudget(ctx, unit); err != nil && !unitDefinitelyDead(ctx, unit) {
-					log.Warn().Err(err).Msg("unit not confirmed stopped; keeping record for retry")
+				// we're about to delete out from under it. An unconfirmed stop
+				// keeps the record — deleting it would leave a live unit no
+				// record points to — but flipped to Error: a socket-less VM can
+				// never be managed again, so no retry may adopt it. Recovery is
+				// the caller-driven relaunch or destroy, both of which stop the
+				// unit on their own budget.
+				if !staleUnitStopConfirmed(ctx, systemdUnitName(rec.ID)) {
+					rec.Status = StatusError
+					if err := m.state.Put(rec); err != nil {
+						log.Error().Err(err).Msg("failed to persist error status for unstopped VM")
+					}
+					log.Warn().Msg("unit not confirmed stopped; record kept as error")
 					return nil, false
 				}
 				m.state.Delete(rec.ID)
