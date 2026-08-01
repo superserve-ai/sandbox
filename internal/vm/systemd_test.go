@@ -37,7 +37,7 @@ func TestClassifyStopSettle(t *testing.T) {
 	}{
 		{"inactive", false, true, true, true},
 		{"failed", false, true, true, true},
-		{"", true, true, true, true}, // not-loaded == gone
+		{"", true, true, true, true},               // not-loaded == gone
 		{"deactivating", false, true, true, false}, // stop done, marker RETAINED
 		{"activating", false, true, true, false},
 		{"active", false, true, false, false},

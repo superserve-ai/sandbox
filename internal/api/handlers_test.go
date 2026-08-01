@@ -168,6 +168,17 @@ type mockDBTX struct {
 }
 
 func (m *mockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	// The finalize-mode probe runs before every FinalizePause. Unit tests
+	// exercise legacy mode (the index exists until the contract phase), so
+	// answer it centrally instead of scripting it into every test.
+	if strings.Contains(sql, "to_regclass('public.snapshot_sandbox_unique')") {
+		return &mockRow{scanFn: func(dest ...any) error {
+			if b, ok := dest[0].(*bool); ok {
+				*b = true
+			}
+			return nil
+		}}
+	}
 	return m.queryRowFn(ctx, sql, args...)
 }
 

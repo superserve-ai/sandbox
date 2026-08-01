@@ -17,6 +17,10 @@ import (
 var (
 	bucketName              = []byte("vms")
 	previewPolicyBucketName = []byte("vm_preview_policies")
+	// pendingBackupBucketName records pauses whose backup enqueue has not
+	// completed: the async retry goroutine is not a durable record, and a
+	// crash or deploy during its window must not lose the pause's coverage.
+	pendingBackupBucketName = []byte("pending_backups")
 )
 
 // persistedPreviewPolicy is stored separately from VMRecord so a rollback to
@@ -181,6 +185,9 @@ func OpenStateStore(path string) (*StateStore, error) {
 	if err := db.Update(func(tx *bolt.Tx) error {
 		records, err := tx.CreateBucketIfNotExists(bucketName)
 		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(pendingBackupBucketName); err != nil {
 			return err
 		}
 		policies, err := tx.CreateBucketIfNotExists(previewPolicyBucketName)
@@ -598,4 +605,89 @@ func toInstance(rec VMRecord) *VMInstance {
 			BasePath:  rec.BasePath,
 		},
 	}
+}
+
+// PendingBackup is a durable marker that a pause still owes its backup
+// enqueue: the artifact paths to (re)hash and journal. Deleted once the
+// journal write lands or the pause is superseded.
+type PendingBackup struct {
+	VMID         string `json:"vm_id"`
+	SnapshotPath string `json:"snapshot_path"`
+	DiskPath     string `json:"disk_path"`
+	DiskBasePath string `json:"disk_base_path,omitempty"`
+	// Token identifies which pause owns the record: rows are keyed by VM
+	// ID, so a later pause's Put replaces an older one, and the older
+	// pause's async worker must not delete the newer record.
+	Token string `json:"token,omitempty"`
+	// BaseIdentity is the overlay base's stat identity captured when the
+	// marker was created: the rehash must prove it is hashing the
+	// pause-time base, not a same-path replacement.
+	BaseIdentity string `json:"base_identity,omitempty"`
+}
+
+// PutPendingBackup records (or refreshes) a pause's owed backup.
+func (s *StateStore) PutPendingBackup(p PendingBackup) error {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(pendingBackupBucketName).Put([]byte(p.VMID), data)
+	})
+}
+
+// PutPendingBackupIfOwner writes the marker when the slot is empty,
+// owned by the same token, or owned by an OLDER token (tokens are
+// fixed-width creation-ordered): healing re-persists a record to repair
+// a failed initial write, and the newest pause always wins the slot
+// while a newer record is never overwritten by an older worker.
+func (s *StateStore) PutPendingBackupIfOwner(p PendingBackup) error {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(pendingBackupBucketName)
+		if v := b.Get([]byte(p.VMID)); v != nil {
+			var cur PendingBackup
+			if json.Unmarshal(v, &cur) == nil && cur.Token > p.Token {
+				return nil
+			}
+		}
+		return b.Put([]byte(p.VMID), data)
+	})
+}
+
+// DeletePendingBackupIf clears the marker only while the given token
+// still owns it: an older pause's async worker finishing late must not
+// erase the record a newer pause has since written over the same key.
+func (s *StateStore) DeletePendingBackupIf(vmID, token string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(pendingBackupBucketName)
+		v := b.Get([]byte(vmID))
+		if v == nil {
+			return nil
+		}
+		var cur PendingBackup
+		if json.Unmarshal(v, &cur) == nil && cur.Token != token {
+			return nil
+		}
+		return b.Delete([]byte(vmID))
+	})
+}
+
+// ListPendingBackups returns every pause still owing its backup enqueue.
+// Corrupt entries are skipped.
+func (s *StateStore) ListPendingBackups() ([]PendingBackup, error) {
+	var out []PendingBackup
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(pendingBackupBucketName).ForEach(func(k, v []byte) error {
+			var p PendingBackup
+			if json.Unmarshal(v, &p) == nil && p.VMID != "" {
+				out = append(out, p)
+			}
+			return nil
+		})
+	})
+	return out, err
 }

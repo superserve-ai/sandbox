@@ -21,6 +21,12 @@ provider "google" {
 }
 
 locals {
+  cloud_ids_mirrored_subnet_self_links = [
+    module.network.subnetwork_self_link,
+  ]
+}
+
+locals {
   project_id             = var.project_id
   environment            = var.environment
   region                 = var.region
@@ -34,6 +40,13 @@ locals {
     managed_by  = "terraform"
     region      = local.region
   }
+
+  sandbox_host_labels = merge(local.common_labels, {
+    owner              = "platform"
+    project            = "sandbox"
+    dataclassification = "confidential"
+    application        = "sandbox-host"
+  })
 
   api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
 }
@@ -186,9 +199,11 @@ module "sandbox_host" {
   subnet        = module.network.subnetwork_self_link
   internal_ip   = "10.1.0.2"
   tags          = ["vmd-usw2"]
-  labels = merge(local.common_labels, {
-    component    = "vmd"
-    sandbox_role = "vmd"
+  labels = merge(local.sandbox_host_labels, {
+    component                  = "vmd"
+    sandbox_role               = "vmd"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
 
   service_account_email = data.google_service_account.api_runner.email
@@ -240,6 +255,21 @@ module "backup_storage" {
   ]
 
   labels = merge(local.common_labels, {
-    component = "backup"
+    component                  = "backup"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_snapshots_and_files"
   })
+}
+
+module "cloud_ids" {
+  source = "../../../modules/cloud-ids"
+
+  project_id                 = local.project_id
+  region                     = local.region
+  zone                       = local.zone
+  network_self_link          = module.network.network_self_link
+  endpoint_name              = "superserve-ids-${local.resource_suffix}"
+  mirrored_subnet_self_links = local.cloud_ids_mirrored_subnet_self_links
+  notification_channel_ids   = var.notification_channel_ids
+  labels                     = local.common_labels
 }

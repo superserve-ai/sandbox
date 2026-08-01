@@ -312,7 +312,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		Trigger: "timeout",
 	}
 	applyManifest(&params, manifest)
-	if _, err := h.DB.FinalizePause(postCtx, params); err != nil {
+	if _, err := h.finalizePause(postCtx, params); err != nil {
 		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
 		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)

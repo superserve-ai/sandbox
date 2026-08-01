@@ -240,6 +240,19 @@ func classifyStopSettle(state string, notLoaded, ok bool) (stopConfirmed, clearM
 	return false, false // active, reloading, or any other still-up state
 }
 
+// unitFullyDown reports a terminal ActiveState (inactive, failed, or not
+// loaded): the only states in which no Firecracker process can still be
+// writing guest data. Transitional states (deactivating, activating) and
+// inconclusive reads are NOT down; the stop path may report those as a
+// completed stop for RPC purposes, but hashing needs the stronger claim.
+func unitFullyDown(ctx context.Context, unit string) bool {
+	state, notLoaded, ok := unitActiveStateRaw(ctx, unit)
+	if !ok || ctx.Err() != nil {
+		return false
+	}
+	return notLoaded || state == "inactive" || state == "failed"
+}
+
 // unitFailureSummary returns a one-line summary of a unit's
 // Result/SubState for embedding in error messages. Best-effort —
 // returns "unknown" on any error.
