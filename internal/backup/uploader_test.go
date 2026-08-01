@@ -1374,9 +1374,9 @@ func ageStagingTree(t *testing.T, root string) {
 }
 
 // Verification records written by pre-scoping binaries carry plain
-// object names; refusing them after an upgrade would abandon
-// generations that are provably complete. The legacy fallback honors
-// them for the current bucket.
+// object names; the startup migration claims them for the configured
+// bucket exactly once, after which lookups are purely scoped and a
+// bucket change misses everything.
 func TestLegacyUnscopedVerificationRecordsStillTrusted(t *testing.T) {
 	dir := t.TempDir()
 	j, _ := testJournal(t)
@@ -1410,8 +1410,25 @@ func TestLegacyUnscopedVerificationRecordsStillTrusted(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The startup migration (as Run performs) claims the legacy record
+	// for the current bucket.
+	if err := j.MigrateVerificationScope(store.Identity()); err != nil {
+		t.Fatal(err)
+	}
 	completed, err := u.uploadTask(context.Background(), &task)
 	if err != nil || !completed {
-		t.Fatalf("upload with legacy record: completed=%v err=%v (want dedupe trusted)", completed, err)
+		t.Fatalf("upload with migrated record: completed=%v err=%v (want dedupe trusted)", completed, err)
+	}
+
+	// Idempotent, and a bucket change after migration must miss: a
+	// second migration under another scope claims nothing.
+	if err := j.MigrateVerificationScope("other-bucket"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := j.WasVerified("other-bucket\x00"+object, time.Now()); err != nil || ok {
+		t.Fatalf("bucket change saw migrated history: ok=%v err=%v", ok, err)
+	}
+	if ok, err := j.WasVerified(store.Identity()+"\x00"+object, time.Now()); err != nil || !ok {
+		t.Fatalf("migrated record lost: ok=%v err=%v", ok, err)
 	}
 }

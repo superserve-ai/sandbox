@@ -92,6 +92,11 @@ func (u *Uploader) Run(ctx context.Context) error {
 	if tick <= 0 {
 		tick = time.Second
 	}
+	// Claim pre-scoping verification records for the configured bucket
+	// before any lookup can miss them; idempotent after the first boot.
+	if err := u.Journal.MigrateVerificationScope(u.Store.Identity()); err != nil {
+		u.Log.Error().Err(err).Msg("verification scope migration failed")
+	}
 	// Deliver completion signals a previous process acked but never
 	// notified: the outbox is the only record of those.
 	u.flushNotifications()
@@ -313,19 +318,15 @@ func (u *Uploader) verificationKey(object string) string {
 }
 
 // verifiedHere reports whether this task or this host's history has
-// verified the object against the current bucket, accepting records
-// written by pre-scoping binaries (plain object names) as a fallback:
-// those were only ever earned against the host's single configured
-// bucket, and refusing them would abandon generations that are provably
-// complete. Scoped records are the only kind written going forward.
+// verified the object against the current bucket. Lookups are purely
+// scoped: pre-upgrade records are claimed for the then-configured
+// bucket once at startup (MigrateVerificationScope), so a later bucket
+// change correctly misses everything.
 func (u *Uploader) verifiedHere(task *Task, object string) (bool, error) {
-	if task.HasVerified(u.verificationKey(object)) || task.HasVerified(object) {
+	if task.HasVerified(u.verificationKey(object)) {
 		return true, nil
 	}
-	if ok, err := u.Journal.WasVerified(u.verificationKey(object), u.clock()); err != nil || ok {
-		return ok, err
-	}
-	return u.Journal.WasVerified(object, u.clock())
+	return u.Journal.WasVerified(u.verificationKey(object), u.clock())
 }
 
 func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (ManifestFile, error) {

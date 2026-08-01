@@ -59,10 +59,13 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 	if err := syncDir(root); err != nil {
 		return false, err
 	}
+	// The sweep's grace stats the generation DIRECTORY, and directory
+	// mtimes do not move when children are rewritten, so reuse renews
+	// the directory itself under the same flight key the sweep locks.
+	renewStaged(dir)
 	for i, f := range task.Files {
 		staged := filepath.Join(dir, f.Name)
 		if _, err := os.Stat(staged); err == nil {
-			renewStaged(staged)
 			task.Files[i].Path = staged
 		} else if err := snapshotFileMode(staged, f.Path, cloneOnly); err != nil {
 			if cloneOnly {
