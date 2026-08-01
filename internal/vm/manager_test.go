@@ -1175,11 +1175,17 @@ func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
 	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
 
 	inst, ok := m.reattachRecord(context.Background(), rec, true)
-	if inst != nil || ok {
-		t.Fatal("a socket-missing record must not reattach as live")
+	if inst == nil || !ok {
+		t.Fatal("an unconfirmed stop must publish the VM so a lazy reattach cannot re-adopt the Running row")
+	}
+	if inst.Status != StatusError {
+		t.Fatalf("published instance must read Error, got %s", inst.Status)
 	}
 	if stoppedUnit != systemdUnitName("vm-1") {
 		t.Fatalf("stop attempted on %q, want the record's unit", stoppedUnit)
+	}
+	if tracked := m.vms["vm-1"]; tracked != inst {
+		t.Fatal("the Error instance must be tracked in memory")
 	}
 	kept, err := store.Get("vm-1")
 	if err != nil || kept == nil {

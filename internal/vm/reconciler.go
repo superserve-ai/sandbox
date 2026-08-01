@@ -288,7 +288,10 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// the old behavior: just clean up the stale BoltDB entry.
 	if dbSandboxes == nil {
 		for id, rec := range bolted {
-			if rec.Status != StatusRunning {
+			// Error records ride along: a reattach parks an unmanageable VM
+			// as Error, and once its unit is gone nothing else would reclaim
+			// the record or its network slot in this mode.
+			if rec.Status != StatusRunning && rec.Status != StatusError {
 				continue
 			}
 			if active[id] {

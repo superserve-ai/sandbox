@@ -2230,10 +2230,14 @@ var reattachHook func(vmID string)
 
 // staleUnitStopConfirmed stops a stale record's still-active unit on a
 // detached budget (the reattach ctx may be nearly spent) and reports whether
-// it is confirmed down; a var for the same test seam vmUnitDead uses.
+// it is confirmed down; a var for the same test seam vmUnitDead uses. The
+// fallback probe detaches too: the budgeted stop can outlast the reattach
+// ctx, and probing on the spent ctx would read a finished stop as alive.
 var staleUnitStopConfirmed = func(ctx context.Context, unit string) bool {
 	if err := stopUnitWithBudget(ctx, unit); err != nil {
-		return unitDefinitelyDead(ctx, unit)
+		pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		return unitDefinitelyDead(pctx, unit)
 	}
 	return true
 }
@@ -2298,8 +2302,21 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 					if err := m.state.Put(rec); err != nil {
 						log.Error().Err(err).Msg("failed to persist error status for unstopped VM")
 					}
+					// Publish the Error instance even when the write failed:
+					// left untracked, a lazy reattach would re-read the
+					// still-Running row and adopt the socket-less VM. The
+					// in-memory Error keeps it refused either way.
+					inst := toInstance(rec)
+					m.mu.Lock()
+					if cur, ok := m.vms[rec.ID]; ok {
+						m.mu.Unlock()
+						log.Warn().Msg("unit not confirmed stopped; VM already tracked")
+						return cur, true
+					}
+					m.vms[rec.ID] = inst
+					m.mu.Unlock()
 					log.Warn().Msg("unit not confirmed stopped; record kept as error")
-					return nil, false
+					return inst, true
 				}
 				m.state.Delete(rec.ID)
 				m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
