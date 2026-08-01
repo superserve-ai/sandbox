@@ -399,6 +399,14 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			log.Error().Err(err).Str("vm_id", id).Msg("failed to stop error-status unit")
 			continue
 		}
+		// A nil stop can still mean a deactivating unit (the expired-wait
+		// settle reports those complete); releasing the record and namespace
+		// needs the terminal claim. Not yet down → the record stays for the
+		// dead half to retry once it is.
+		if !unitFullyDown(ctx, systemdUnitName(id)) {
+			unlockOp()
+			continue
+		}
 		removeUnitDropIn(id)
 		r.markStale(id)
 		unlockOp()
@@ -438,6 +446,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		if r.mgr.instanceRunning(id) {
 			unlockOp()
 			r.clearDrift("errdead:" + id)
+			return
+		}
+		// Absence from the active-only snapshot is not terminal — an
+		// activating or deactivating unit still has a process, and markStale
+		// releases the record and namespace. Probe before spending budget.
+		if !unitFullyDown(ctx, systemdUnitName(id)) {
+			unlockOp()
 			return
 		}
 		if !r.consumeAutoFailBudget(id) {

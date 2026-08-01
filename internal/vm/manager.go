@@ -2231,17 +2231,16 @@ var reattachHook func(vmID string)
 // staleUnitStopConfirmed stops a stale record's still-active unit on a
 // detached budget (the reattach ctx may be nearly spent) and reports whether
 // it is confirmed down; a var for the same test seam vmUnitDead uses. The
-// fallback probe detaches too — the budgeted stop can outlast the reattach
-// ctx, and probing on the spent ctx would read a finished stop as alive —
-// and requires the unit FULLY down, not merely deactivating: the caller
-// releases the record and namespace on true.
+// terminal probe decides regardless of the stop's reported outcome: a nil
+// stop can still mean a deactivating unit (the expired-wait settle reports
+// those complete), and the caller releases the record and namespace on
+// true. The probe detaches — the budgeted stop can outlast the reattach
+// ctx, and probing on a spent ctx would read a finished stop as alive.
 var staleUnitStopConfirmed = func(ctx context.Context, unit string) bool {
-	if err := stopUnitWithBudget(ctx, unit); err != nil {
-		pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-		defer cancel()
-		return unitFullyDown(pctx, unit)
-	}
-	return true
+	_ = stopUnitWithBudget(ctx, unit)
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	return unitFullyDown(pctx, unit)
 }
 
 // record. Returns (nil, false) when cleanupStale deleted a dead record.
