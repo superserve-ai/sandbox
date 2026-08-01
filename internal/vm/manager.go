@@ -2278,9 +2278,9 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				// as an orphan burning CPU/RAM and holding TAP fds in a namespace
 				// we're about to delete out from under it. The stop gets its own
 				// budget (this ctx may be nearly spent), and an unconfirmed stop
-				// keeps the record: the next reattach retries it and the
-				// reconciler still knows the unit, while deleting on an
-				// unconfirmed stop would leave a live unit no record points to.
+				// keeps the record — the next reattach retries it, the reconciler
+				// still knows the unit, and deleting it would leave a live unit
+				// no record points to.
 				unit := systemdUnitName(rec.ID)
 				if err := stopUnitWithBudget(ctx, unit); err != nil && !unitDefinitelyDead(ctx, unit) {
 					log.Warn().Err(err).Msg("unit not confirmed stopped; keeping record for retry")
