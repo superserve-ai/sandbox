@@ -8,12 +8,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/singleflight"
+
+	"github.com/superserve-ai/sandbox/internal/backup"
 )
 
 // ManifestEntry describes one durable artifact file finalized by a pause:
@@ -266,12 +269,21 @@ func collectBuildManifest(ctx context.Context, snapshotDir string, extraPaths []
 	start := time.Now()
 	complete = true
 	entries = make([]ManifestEntry, 0, len(dirEntries)+len(extraPaths))
-	seen := make(map[string]bool, len(dirEntries)+len(extraPaths))
+	seen := make(map[string]string, len(dirEntries)+len(extraPaths))
 	add := func(name, path string) {
-		if seen[name] {
+		if prev, dup := seen[name]; dup {
+			// Same path twice is the intentional dedupe (a base copied
+			// into the snapshot dir); two different files sharing a
+			// basename is ambiguity the artifact set must not paper
+			// over, since object names are basenames.
+			if prev != path {
+				log.Warn().Str("name", name).Str("kept", prev).Str("dropped", path).
+					Msg("build manifest: basename collision between artifacts")
+				complete = false
+			}
 			return
 		}
-		seen[name] = true
+		seen[name] = path
 		sum, size, err := hashFile(hctx, path)
 		if err != nil {
 			log.Warn().Err(err).Str("path", path).Msg("build manifest: hash failed")
@@ -287,6 +299,16 @@ func collectBuildManifest(ctx context.Context, snapshotDir string, extraPaths []
 	}
 	for _, de := range dirEntries {
 		if !de.Type().IsRegular() || de.Name() == buildMetaFilename {
+			continue
+		}
+		// Crash residue and reserved names are not artifacts: a *.tmp is
+		// a torn writeBuildDigests replacement that the next stamp will
+		// rename away (the enqueued path would dangle), and a file named
+		// like the bucket's manifest object would collide with the
+		// generation's completion marker and poison the task.
+		if strings.HasSuffix(de.Name(), ".tmp") || de.Name() == backup.ManifestObject {
+			log.Warn().Str("name", de.Name()).
+				Msg("build manifest: skipping non-artifact file")
 			continue
 		}
 		add(de.Name(), filepath.Join(snapshotDir, de.Name()))

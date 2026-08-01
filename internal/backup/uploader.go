@@ -181,12 +181,21 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 		// whatever deleted our sources. Leave the upgraded row for the
 		// next drain instead of acking it away.
 		if cur, ok, lerr := u.Journal.Load(task); lerr == nil && ok && cur.Staged {
-			u.Log.Info().Str("sandbox_id", task.SandboxID).
+			task.logOwner(u.Log.Info()).
 				Msg("abandoned mutable-path attempt; staged row retained for retry")
 			return true, nil
 		}
 	}
-	if err := u.Journal.Ack(task, completed && u.OnVerified != nil); err != nil {
+	if !completed && task.TemplateID != "" {
+		// Operator-visible by design: an abandoned template generation has
+		// no automatic corrective pause behind it the way a sandbox does;
+		// the recovery sweep re-reconciles from the on-host artifacts, but
+		// a template whose artifacts diverged from their stamps needs eyes.
+		task.logOwner(u.Log.Error()).
+			Str("generation", task.Generation).
+			Msg("template backup generation abandoned")
+	}
+	if err := u.Journal.Ack(task, completed, completed && u.OnVerified != nil); err != nil {
 		return true, err
 	}
 	removeStagedTask(u.StagingRoot, task)
@@ -209,8 +218,7 @@ func (u *Uploader) flushNotifications() {
 	for _, t := range pending {
 		u.OnVerified(t)
 		if err := u.Journal.ClearNotification(t); err != nil {
-			u.Log.Warn().Err(err).
-				Str("sandbox_id", t.SandboxID).
+			t.logOwner(u.Log.Warn().Err(err)).
 				Str("generation", t.Generation).
 				Msg("backup notification clear failed; will redeliver")
 		}
@@ -278,7 +286,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 			bf, err := baseTaskFile(file)
 			if err != nil {
 				if os.IsNotExist(err) {
-					u.Log.Warn().Str("path", file.BasePath).Str("sandbox_id", task.SandboxID).
+					task.logOwner(u.Log.Warn().Str("path", file.BasePath)).
 						Msg("backup base image gone; abandoning generation")
 					return false, nil
 				}
@@ -287,7 +295,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 			bmf, err := u.uploadFile(ctx, task, bf)
 			if err != nil {
 				if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
-					u.Log.Warn().Str("path", bf.Path).Str("sandbox_id", task.SandboxID).
+					task.logOwner(u.Log.Warn().Str("path", bf.Path)).
 						Msg("backup base image gone or rebuilt; abandoning generation")
 					return false, nil
 				}
@@ -318,7 +326,7 @@ const stagingSweepInterval = 30 * time.Minute
 // keep the content-addressed generation segment: build ids are reusable
 // across rebuilds of a template, so the generation is what stops a rebuild
 // from deduping against a previous build's objects (see TemplateObject).
-func (t Task) objectName(fileName string) (string, error) {
+func (t *Task) objectName(fileName string) (string, error) {
 	if t.TemplateID != "" {
 		return TemplateObject(t.TemplateID, t.BuildID, t.Generation, fileName)
 	}
@@ -326,7 +334,7 @@ func (t Task) objectName(fileName string) (string, error) {
 }
 
 // logOwner stamps the task's owning identity onto a log event.
-func (t Task) logOwner(e *zerolog.Event) *zerolog.Event {
+func (t *Task) logOwner(e *zerolog.Event) *zerolog.Event {
 	if t.TemplateID != "" {
 		return e.Str("template_id", t.TemplateID).Str("build_id", t.BuildID)
 	}
@@ -523,7 +531,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// discriminator, and without it the generation is abandoned
 		// rather than completed over bytes nothing can vouch for (this
 		// identity cannot read them back).
-		u.Log.Warn().Str("object", object).Str("sandbox_id", task.SandboxID).
+		task.logOwner(u.Log.Warn().Str("object", object)).
 			Msg("deduped object has no verification history; abandoning generation")
 		return ManifestFile{}, errSourceChanged
 	}

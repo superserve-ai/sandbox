@@ -49,7 +49,7 @@ func TestJournalPriorityAndFIFO(t *testing.T) {
 			break
 		}
 		got = append(got, task.Generation)
-		if err := j.Ack(task, false); err != nil {
+		if err := j.Ack(task, false, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -115,6 +115,48 @@ func TestJournalNackBackoffAndPersistence(t *testing.T) {
 	}
 }
 
+// Ack with completed=true leaves a durable owner+generation record that
+// survives the queue row's deletion: it is what recovery sweeps consult
+// to avoid re-uploading generations that already reached the bucket.
+func TestJournalRecordsCompletions(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{TemplateID: "tpl", BuildID: "b1", Generation: "gen-1", EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if covered, err := j.Covered(task); err != nil || !covered {
+		t.Fatalf("pending task not covered: %v err=%v", covered, err)
+	}
+	if done, err := j.WasCompleted(task); err != nil || done {
+		t.Fatalf("WasCompleted before ack = %v err=%v", done, err)
+	}
+	if err := j.Ack(task, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if done, err := j.WasCompleted(task); err != nil || !done {
+		t.Fatalf("WasCompleted after completed ack = %v err=%v", done, err)
+	}
+	if covered, err := j.Covered(task); err != nil || !covered {
+		t.Fatalf("completed task not covered: %v err=%v", covered, err)
+	}
+
+	// An abandoned ack records nothing: the generation never became
+	// durable, so recovery must be free to retry it.
+	abandoned := Task{TemplateID: "tpl", BuildID: "b1", Generation: "gen-2", EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 1, 0, time.UTC)}
+	if err := j.Enqueue(abandoned); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(abandoned, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if done, _ := j.WasCompleted(abandoned); done {
+		t.Fatal("abandoned ack recorded a completion")
+	}
+	if covered, _ := j.Covered(abandoned); covered {
+		t.Fatal("abandoned generation reported covered")
+	}
+}
+
 // Generations are content-addressed, so distinct owners can legitimately
 // share one generation. Queue keys must stay unique per owner even at the
 // same enqueue tick, or one owner's backup would be silently overwritten.
@@ -155,7 +197,7 @@ func TestJournalQueueKeysScopedByOwner(t *testing.T) {
 			break
 		}
 		owners[task.owner()] = true
-		if err := j.Ack(task, false); err != nil {
+		if err := j.Ack(task, false, false); err != nil {
 			t.Fatal(err)
 		}
 	}

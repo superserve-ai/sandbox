@@ -10,8 +10,12 @@ import (
 )
 
 // Priority orders upload work. Lower value uploads first: a pause or an
-// on-demand snapshot is user-visible durability; periodic checkpoints and
-// (later) memory-tier components are opportunistic and must never delay it.
+// on-demand snapshot is user-visible durability; template builds,
+// periodic checkpoints, and (later) memory-tier components are
+// recoverable or rebuildable and must never delay it. A multi-GiB
+// template upload at pause priority would head-of-line block every pause
+// backup for minutes at the bandwidth cap, and a pause is unique user
+// data while a template can be rebuilt.
 type Priority uint8
 
 const (
@@ -116,6 +120,13 @@ var (
 	// original task was acked. Entries carry a timestamp and are pruned
 	// lazily on ack.
 	verifiedBucket = []byte("backup_verified_objects")
+	// completionsBucket records owner+generation pairs whose generation
+	// fully reached the bucket (manifest object written, task acked as
+	// completed). Kept indefinitely: rows are tiny, and this record is
+	// what lets recovery sweeps distinguish "already durable, skip" from
+	// "never made it, reconcile", without which a swept owner would be
+	// re-uploaded on every pass after its task was acked away.
+	completionsBucket = []byte("backup_completed_generations")
 )
 
 // verifiedRetention bounds how long verification history is kept. Long
@@ -135,7 +146,7 @@ var pruneCursorKey = []byte("\x00prune_cursor")
 // caller owns the bolt DB; sharing vmd's state DB keeps one fsync domain.
 func NewJournal(db *bolt.DB) (*Journal, error) {
 	err := db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket, outboxBucket} {
+		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket, outboxBucket, completionsBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -390,6 +401,31 @@ func (j *Journal) HasPending(sandboxID, generation string) (bool, error) {
 	return ok, err
 }
 
+// WasCompleted reports whether this task's owner+generation was ever
+// acked as completed (its generation fully verified in the bucket). Only
+// the task's identity fields (owner and Generation) are consulted.
+func (j *Journal) WasCompleted(task Task) (bool, error) {
+	var ok bool
+	err := j.db.View(func(tx *bolt.Tx) error {
+		ok = tx.Bucket(completionsBucket).Get(task.indexKey()) != nil
+		return nil
+	})
+	return ok, err
+}
+
+// Covered reports whether this task's owner+generation needs no new
+// enqueue: it is either still pending in the queue or already recorded
+// as completed. The recovery sweeps' gate.
+func (j *Journal) Covered(task Task) (bool, error) {
+	var ok bool
+	err := j.db.View(func(tx *bolt.Tx) error {
+		ok = tx.Bucket(indexBucket).Get(task.indexKey()) != nil ||
+			tx.Bucket(completionsBucket).Get(task.indexKey()) != nil
+		return nil
+	})
+	return ok, err
+}
+
 // WasVerified reports whether any task ever digest-verified this object
 // within the retention window.
 func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
@@ -411,12 +447,15 @@ func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
 
 // Ack removes a finished task. Called only after every object of the
 // generation is verified in the bucket (or the task was abandoned).
-// notify additionally records the task in the notification outbox within
-// the SAME transaction: the ack that makes the task's completion
-// otherwise unrecoverable is the last durable moment to remember that a
-// completion signal is still owed. Piggybacks a bounded lazy prune of
-// expired verification history.
-func (j *Journal) Ack(task Task, notify bool) error {
+// completed records the owner+generation in the durable completions
+// bucket within the SAME transaction: the ack deletes the queue row, so
+// this record is the only survivor telling recovery sweeps the
+// generation is already in the bucket. notify additionally records the
+// task in the notification outbox, likewise transactionally: the ack
+// that makes the task's completion otherwise unrecoverable is the last
+// durable moment to remember that a completion signal is still owed.
+// Piggybacks a bounded lazy prune of expired verification history.
+func (j *Journal) Ack(task Task, completed, notify bool) error {
 	now := time.Now()
 	return j.db.Update(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(journalBucket).Delete(task.key()); err != nil {
@@ -424,6 +463,11 @@ func (j *Journal) Ack(task Task, notify bool) error {
 		}
 		if err := tx.Bucket(indexBucket).Delete(task.indexKey()); err != nil {
 			return err
+		}
+		if completed {
+			if err := tx.Bucket(completionsBucket).Put(task.indexKey(), []byte(fmt.Sprintf("%d", now.UnixNano()))); err != nil {
+				return err
+			}
 		}
 		if notify {
 			val, err := json.Marshal(task)

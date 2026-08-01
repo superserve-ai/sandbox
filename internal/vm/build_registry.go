@@ -241,7 +241,7 @@ func buildArtifactsPresent(r *BuildTemplateResult) bool {
 	if r == nil || r.SnapshotPath == "" || r.MemFilePath == "" {
 		return false
 	}
-	for _, p := range []string{r.SnapshotPath, r.MemFilePath, r.BasePath, r.DeltaPath, r.RootfsPath} {
+	for _, p := range r.declaredArtifactPaths() {
 		if p == "" {
 			continue
 		}

@@ -47,7 +47,7 @@ func TestBackupBuildArtifactsSkipsAllHashingWhenHookNil(t *testing.T) {
 	meta := writeBuildFixture(t, dir)
 
 	m := &Manager{} // no SetBackupEnqueue: backup disabled
-	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", zerolog.Nop())
+	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", nil, zerolog.Nop())
 
 	got, err := os.ReadFile(filepath.Join(dir, buildMetaFilename))
 	if err != nil {
@@ -71,7 +71,7 @@ func TestBackupBuildArtifactsHashesAndEnqueuesWithHook(t *testing.T) {
 		tasks = append(tasks, task)
 		return nil
 	})
-	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", zerolog.Nop())
+	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", nil, zerolog.Nop())
 
 	if len(tasks) != 1 {
 		t.Fatalf("enqueued %d tasks, want 1", len(tasks))
@@ -120,7 +120,7 @@ func TestBackupBuildArtifactsRefusesMissingDeclaredArtifact(t *testing.T) {
 		tasks = append(tasks, task)
 		return nil
 	})
-	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", zerolog.Nop())
+	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", nil, zerolog.Nop())
 
 	if len(tasks) != 0 {
 		t.Fatalf("enqueued %d tasks despite a missing declared artifact, want 0", len(tasks))
@@ -216,7 +216,7 @@ func TestAdoptedBuildWithStampedDigestsEnqueuesWithoutRehash(t *testing.T) {
 	// Stamp via the normal completion pipeline.
 	stamper := &Manager{}
 	stamper.SetBackupEnqueue(func(backup.Task) error { return nil })
-	stamper.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", zerolog.Nop())
+	stamper.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", nil, zerolog.Nop())
 	stamped, err := readStampedBuildDigests(dir)
 	if err != nil || len(stamped) == 0 {
 		t.Fatalf("fixture not stamped: %v err=%v", stamped, err)
@@ -231,17 +231,21 @@ func TestAdoptedBuildWithStampedDigestsEnqueuesWithoutRehash(t *testing.T) {
 		t.Fatal("mem.snap missing from stamped digests")
 	}
 
-	// Diverge the bytes on disk; a re-hash would notice, the record won't.
-	if err := os.WriteFile(filepath.Join(dir, "mem.snap"), []byte("mutated bytes"), 0o644); err != nil {
+	// Diverge the bytes on disk at the SAME size (the size check guards
+	// truncation, not content); a re-hash would notice, the record won't.
+	if err := os.WriteFile(filepath.Join(dir, "mem.snap"), []byte("MEMORY IMAGE"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	tasks := make(chan backup.Task, 2)
+	var covered atomic.Bool
 	m := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
 	m.SetBackupEnqueue(func(task backup.Task) error {
+		covered.Store(true) // journal now holds the generation
 		tasks <- task
 		return nil
 	})
+	m.SetBackupCovered(func(backup.Task) (bool, error) { return covered.Load(), nil })
 	if snap, ok := m.GetBuildStatus("build-tpl"); !ok || snap.Status != BuildStatusReady {
 		t.Fatalf("adoption = %+v ok=%v, want ready", snap, ok)
 	}
@@ -256,12 +260,12 @@ func TestAdoptedBuildWithStampedDigestsEnqueuesWithoutRehash(t *testing.T) {
 		t.Fatalf("mem.snap digest = %s, want recorded %s (artifact was re-hashed)", got, recorded)
 	}
 
-	// Repeat polls must not spawn another reconcile: the per-process guard
-	// is taken synchronously, so nothing new can ever land on the channel.
+	// Repeat polls re-run the reconcile but the covered check stops the
+	// re-enqueue: nothing new lands on the channel.
 	if _, ok := m.GetBuildStatus("build-tpl"); !ok {
 		t.Fatal("second adoption lookup failed")
 	}
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	select {
 	case extra := <-tasks:
 		t.Fatalf("second status poll enqueued another task: %+v", extra)
@@ -315,7 +319,7 @@ func TestBackupBuildArtifactsRetriesFailedEnqueue(t *testing.T) {
 	})
 
 	start := time.Now()
-	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", zerolog.Nop())
+	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", nil, zerolog.Nop())
 	if elapsed := time.Since(start); elapsed >= time.Second {
 		t.Fatalf("build path blocked %v on enqueue retry; retry must be async", elapsed)
 	}

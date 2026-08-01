@@ -253,6 +253,14 @@ func removeStagedTask(root string, task Task) {
 	if root == "" || len(task.Files) == 0 {
 		return
 	}
+	// Template tasks are never staged (their artifacts are immutable on
+	// disk), and with an empty SandboxID the path math below would land
+	// on root/<generation> and the trailing Remove would target the
+	// staging root itself. Harmless today (recreated on demand) but a
+	// trap for any refactor that assumes the root persists.
+	if task.SandboxID == "" {
+		return
+	}
 	dir := filepath.Join(root, task.SandboxID, task.Generation)
 	if !strings.HasPrefix(dir, root+string(os.PathSeparator)) {
 		return
