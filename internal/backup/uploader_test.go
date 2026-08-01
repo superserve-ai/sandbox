@@ -734,6 +734,9 @@ func TestSweepStagingKeepsOnlyPending(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Age everything past the handoff grace: this test pins the
+	// journal-authority behavior, not the fresh-entry protection.
+	ageStagingTree(t, staging)
 	SweepStaging(staging, j, zerolog.Nop())
 
 	if _, err := os.Stat(filepath.Join(staging, "sb1", "gen-pending")); err != nil {
@@ -1089,6 +1092,7 @@ func TestStagedBaseSurvivesTemplateGC(t *testing.T) {
 		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/gone", SHA256: "x", BaseSHA256: hex.EncodeToString(baseSum[:])}}}); err != nil {
 		t.Fatal(err)
 	}
+	ageStagingTree(t, staging)
 	SweepStaging(staging, j, zerolog.Nop())
 	if _, err := os.Stat(filepath.Join(staging, "bases", hex.EncodeToString(baseSum[:]))); err != nil {
 		t.Fatalf("referenced staged base swept: %v", err)
@@ -1096,6 +1100,7 @@ func TestStagedBaseSurvivesTemplateGC(t *testing.T) {
 	if err := j.Ack(Task{SandboxID: "sb2", Generation: "g2", EnqueuedAt: time.Unix(3, 0)}, false); err != nil {
 		t.Fatal(err)
 	}
+	ageStagingTree(t, staging)
 	SweepStaging(staging, j, zerolog.Nop())
 	if _, err := os.Stat(filepath.Join(staging, "bases", hex.EncodeToString(baseSum[:]))); !os.IsNotExist(err) {
 		t.Fatalf("unreferenced staged base kept: %v", err)
@@ -1298,4 +1303,65 @@ func TestSharedDedupeRecordsHistoryForFutureSkips(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("dedupe not recorded in verification history: ok=%v err=%v", ok, err)
 	}
+}
+
+// A freshly staged generation whose journal enqueue has not landed yet
+// must survive the sweep: staging precedes the journal write, so the
+// journal is not the liveness authority inside the handoff window.
+func TestSweepStagingSparesFreshUnjournaledEntries(t *testing.T) {
+	root := t.TempDir()
+	j, _ := testJournal(t)
+	genDir := filepath.Join(root, "sb-1", "gen-1")
+	if err := os.MkdirAll(genDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(genDir, "rootfs.ext4"), []byte("staged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	baseDir := filepath.Join(root, "bases")
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	freshBase := filepath.Join(baseDir, "aaaa")
+	if err := os.WriteFile(freshBase, []byte("fresh base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	SweepStaging(root, j, zerolog.Nop())
+
+	if _, err := os.Stat(filepath.Join(genDir, "rootfs.ext4")); err != nil {
+		t.Fatalf("fresh unjournaled generation swept: %v", err)
+	}
+	if _, err := os.Stat(freshBase); err != nil {
+		t.Fatalf("fresh unreferenced base swept: %v", err)
+	}
+
+	// Age both past the grace and sweep again: now the journal decides,
+	// and with no pending task they go.
+	old := time.Now().Add(-2 * time.Hour)
+	for _, p := range []string{genDir, filepath.Join(genDir, "rootfs.ext4"), freshBase} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	SweepStaging(root, j, zerolog.Nop())
+	if _, err := os.Stat(genDir); !os.IsNotExist(err) {
+		t.Fatal("aged unjournaled generation survived the sweep")
+	}
+	if _, err := os.Stat(freshBase); !os.IsNotExist(err) {
+		t.Fatal("aged unreferenced base survived the sweep")
+	}
+}
+
+// ageStagingTree pushes every staged entry's mtime past the sweep's
+// handoff grace so tests exercise the journal-authority decision.
+func ageStagingTree(t *testing.T, root string) {
+	t.Helper()
+	old := time.Now().Add(-2 * time.Hour)
+	_ = filepath.Walk(root, func(path string, _ os.FileInfo, err error) error {
+		if err == nil {
+			_ = os.Chtimes(path, old, old)
+		}
+		return nil
+	})
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/singleflight"
@@ -247,6 +248,25 @@ func removeStagedTask(root string, task Task) {
 // SweepStaging removes staged generations with no pending journal task:
 // residue of a crash between staging and enqueue, or of an ack whose
 // cleanup was interrupted. Run at startup before the uploader drains.
+// stagingSweepGrace protects the stage-then-enqueue handoff: workers
+// stage files BEFORE the journal write, so the journal is not yet the
+// liveness authority for very fresh entries, and a sweep landing in
+// that window would delete files whose task is about to reference them
+// (the worker would then enqueue as staged, clear its marker, and the
+// uploader would abandon the missing files: a permanently lost pause).
+// The handoff takes seconds; an hour of grace costs only residue delay.
+const stagingSweepGrace = time.Hour
+
+// fresherThan reports whether the entry's mtime is within grace of now;
+// stat failures count as fresh (fail safe: keep, the next sweep decides).
+func fresherThan(path string, grace time.Duration) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return true
+	}
+	return time.Since(fi.ModTime()) < grace
+}
+
 func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 	if root == "" {
 		return
@@ -278,8 +298,9 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 				continue
 			}
 			for _, b := range bases {
-				if !referenced[b.Name()] {
-					_ = os.RemoveAll(filepath.Join(root, "bases", b.Name()))
+				staged := filepath.Join(root, "bases", b.Name())
+				if !referenced[b.Name()] && !fresherThan(staged, stagingSweepGrace) {
+					_ = os.RemoveAll(staged)
 				}
 			}
 			continue
@@ -298,8 +319,9 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 				log.Warn().Err(err).Msg("backup staging sweep: journal lookup failed")
 				continue
 			}
-			if !pending {
-				_ = os.RemoveAll(filepath.Join(sbDir, g.Name()))
+			staged := filepath.Join(sbDir, g.Name())
+			if !pending && !fresherThan(staged, stagingSweepGrace) {
+				_ = os.RemoveAll(staged)
 			}
 		}
 		_ = os.Remove(sbDir)
