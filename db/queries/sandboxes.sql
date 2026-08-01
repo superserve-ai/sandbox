@@ -304,15 +304,17 @@ SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
 WHERE sandbox_id IN (SELECT id FROM failed)
   AND ended_at IS NULL;
 
--- name: MarkSandboxFailedIfActive :exec
--- Compare-and-set variant of MarkSandboxFailed for actions taken from a
--- pass-start snapshot: the row flips only while it still reads 'active', so
--- a relaunch or resume that already moved it on is never overwritten. Same
+-- name: MarkSandboxFailedIfUnchanged :exec
+-- Version-guarded variant of MarkSandboxFailed for actions taken from a
+-- pass-start snapshot: the row flips only if untouched since the observation
+-- (every lifecycle transition bumps updated_at), so a relaunch or resume
+-- that moved it on — even back to 'active' — is never overwritten. Same
 -- atomic interval close.
 WITH failed AS (
   UPDATE sandbox
   SET status = 'failed', auto_delete_at = NULL, updated_at = now()
-  WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL AND sandbox.status = 'active'
+  WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
+    AND sandbox.status = 'active' AND sandbox.updated_at = $2
   RETURNING id
 ),
 closed_active AS (

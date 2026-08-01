@@ -1908,11 +1908,12 @@ func (q *Queries) MarkSandboxFailed(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
-const markSandboxFailedIfActive = `-- name: MarkSandboxFailedIfActive :exec
+const markSandboxFailedIfUnchanged = `-- name: MarkSandboxFailedIfUnchanged :exec
 WITH failed AS (
   UPDATE sandbox
   SET status = 'failed', auto_delete_at = NULL, updated_at = now()
-  WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL AND sandbox.status = 'active'
+  WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
+    AND sandbox.status = 'active' AND sandbox.updated_at = $2
   RETURNING id
 ),
 closed_active AS (
@@ -1928,12 +1929,18 @@ WHERE sandbox_id IN (SELECT id FROM failed)
   AND ended_at IS NULL
 `
 
-// Compare-and-set variant of MarkSandboxFailed for actions taken from a
-// pass-start snapshot: the row flips only while it still reads 'active', so
-// a relaunch or resume that already moved it on is never overwritten. Same
+type MarkSandboxFailedIfUnchangedParams struct {
+	ID        uuid.UUID `json:"id"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Version-guarded variant of MarkSandboxFailed for actions taken from a
+// pass-start snapshot: the row flips only if untouched since the observation
+// (every lifecycle transition bumps updated_at), so a relaunch or resume
+// that moved it on — even back to 'active' — is never overwritten. Same
 // atomic interval close.
-func (q *Queries) MarkSandboxFailedIfActive(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, markSandboxFailedIfActive, id)
+func (q *Queries) MarkSandboxFailedIfUnchanged(ctx context.Context, arg MarkSandboxFailedIfUnchangedParams) error {
+	_, err := q.db.Exec(ctx, markSandboxFailedIfUnchanged, arg.ID, arg.UpdatedAt)
 	return err
 }
 

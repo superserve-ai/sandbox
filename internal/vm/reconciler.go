@@ -257,9 +257,21 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 
 	now := time.Now()
 
-	// errorRecord reports whether id's BoltDB record reads Error. Statuses
-	// are fetched per candidate id so the common DB-mode pass stays ID-only.
+	// errorRecord reports whether id's record reads Error. The tracked
+	// in-memory instance is authoritative when present: reattach can park an
+	// Error instance whose durable write failed (row still Running), and that
+	// VM must still be owned by the error rules. Statuses are fetched per
+	// candidate id so the common DB-mode pass stays ID-only.
 	errorRecord := func(id string) bool {
+		r.mgr.mu.RLock()
+		inst := r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if inst != nil {
+			inst.mu.RLock()
+			st := inst.Status
+			inst.mu.RUnlock()
+			return st == StatusError
+		}
 		if bolted != nil {
 			rec, ok := bolted[id]
 			return ok && rec.Status == StatusError
@@ -427,7 +439,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// snapshot.
 		if dbSandboxes != nil {
 			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
-				r.markFailedInDBIfActive(ctx, id)
+				r.markFailedInDBIfUnchanged(ctx, id, sb.Sandbox.UpdatedAt)
 			}
 		}
 		r.writeAudit(ctx, id, "error_unit_stop", "live unit for error-status record", "boltdb_error_unit_active")
@@ -482,7 +494,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// compare-and-set: a relaunch may own the row by now).
 		if dbSandboxes != nil {
 			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
-				r.markFailedInDBIfActive(ctx, id)
+				r.markFailedInDBIfUnchanged(ctx, id, sb.Sandbox.UpdatedAt)
 			}
 		}
 		r.writeAudit(ctx, id, "stale_cleanup", "error record with no unit", "boltdb_error_unit_missing")
@@ -1015,10 +1027,11 @@ func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) {
 	}
 }
 
-// markFailedInDBIfActive is markFailedInDB with compare-and-set semantics:
-// the row flips only while it still reads 'active', so an action taken from
-// a pass-start snapshot cannot overwrite a concurrent relaunch's row.
-func (r *Reconciler) markFailedInDBIfActive(ctx context.Context, vmID string) {
+// markFailedInDBIfUnchanged is markFailedInDB version-guarded on the
+// pass-start observation: the row flips only if untouched since (every
+// lifecycle transition bumps updated_at), so a stale snapshot cannot
+// overwrite a concurrent relaunch's row — even one that is 'active' again.
+func (r *Reconciler) markFailedInDBIfUnchanged(ctx context.Context, vmID string, observed time.Time) {
 	if r.cfg.DB == nil {
 		return
 	}
@@ -1029,7 +1042,7 @@ func (r *Reconciler) markFailedInDBIfActive(ctx context.Context, vmID string) {
 	}
 	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()
-	if err := r.cfg.DB.MarkSandboxFailedIfActive(qctx, id); err != nil {
+	if err := r.cfg.DB.MarkSandboxFailedIfUnchanged(qctx, db.MarkSandboxFailedIfUnchangedParams{ID: id, UpdatedAt: observed}); err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to mark sandbox failed in DB")
 	}
 }
