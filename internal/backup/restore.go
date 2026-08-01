@@ -164,7 +164,7 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 			progress(format, args...)
 		}
 	}
-	manifest, err := fetchManifest(ctx, r, sandboxID, generation)
+	manifest, err := fetchManifest(ctx, r, sandboxID, generation, report)
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +317,7 @@ func openFreshDir(dir string) (*os.Root, error) {
 	return root, nil
 }
 
-func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation string) (*GenerationManifest, error) {
+func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation string, report ProgressFunc) (*GenerationManifest, error) {
 	object, err := SandboxObject(sandboxID, generation, ManifestObject)
 	if err != nil {
 		return nil, err
@@ -382,8 +382,19 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 			baseDeps[mf.BaseSHA256] = true
 		}
 	}
+	// Two accepted derivations: the current formula (Size in the key) and
+	// the legacy pre-Size formula. Buckets hold generations uploaded under
+	// the legacy formula, and refusing them would make history
+	// unrestorable; a legacy match loses key coverage of Size only, which
+	// the per-entry cap in validExtents bounds regardless of key version.
 	if key := GenerationKey(files); key != generation {
-		return nil, fmt.Errorf("manifest does not reproduce its generation key: file set derives %s, prefix is %s (entry dropped or altered)", key, generation)
+		if legacy := generationKeyLegacy(files); legacy == generation {
+			report("generation key verified via the legacy pre-size derivation")
+		} else {
+			return nil, fmt.Errorf("manifest does not reproduce its generation key: file set derives %s (legacy %s), prefix is %s (entry dropped or altered)", key, legacy, generation)
+		}
+	} else {
+		report("generation key verified via the current derivation")
 	}
 	// Consistency pair, exact in both directions: an overlay's holes are
 	// backed by its base, so a declared base dependency without its shared
@@ -513,12 +524,13 @@ func validExtents(mf ManifestFile) error {
 	if mf.Size < 0 {
 		return fmt.Errorf("negative apparent size %d", mf.Size)
 	}
-	// Generation-local sizes are covered by the generation key, but shared
-	// base entries are synthesized outside it, so their Size is bound only
-	// by this cap until the digest check, and the digest check itself costs
-	// a zero-hash proportional to Size. Fleet artifacts top out in the
-	// tens of GiB apparent; 16TiB is a physical-plausibility bound, not a
-	// tuning knob.
+	// The cap applies to every entry regardless of key version: shared
+	// base entries are synthesized outside the generation key, and legacy
+	// pre-size generations never covered Size at all, so for both the cap
+	// is the only bound before the digest check, and the digest check
+	// itself costs a zero-hash proportional to Size. Fleet artifacts top
+	// out in the tens of GiB apparent; 16TiB is a physical-plausibility
+	// bound, not a tuning knob.
 	if mf.Size > maxApparentSize {
 		return fmt.Errorf("apparent size %d exceeds the %d bound", mf.Size, int64(maxApparentSize))
 	}

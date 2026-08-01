@@ -987,3 +987,84 @@ func TestConcurrentRestoresSameDest(t *testing.T) {
 		t.Fatalf("winner's restore incomplete: err=%v equal=%v", err, bytes.Equal(orig, got))
 	}
 }
+
+// legacyFixture re-homes an uploaded generation under the legacy pre-size
+// key: exactly what a bucket written before Size joined the key holds.
+func legacyFixture(t *testing.T, store *memBlobs, task Task) Task {
+	t.Helper()
+	legacy := task
+	legacy.Generation = generationKeyLegacy(task.Files)
+	oldPrefix := "sandboxes/" + task.SandboxID + "/" + task.Generation + "/"
+	newPrefix := "sandboxes/" + legacy.SandboxID + "/" + legacy.Generation + "/"
+	var names []string
+	for name := range store.objects {
+		if strings.HasPrefix(name, oldPrefix) {
+			names = append(names, name)
+		}
+	}
+	for _, name := range names {
+		store.objects[newPrefix+strings.TrimPrefix(name, oldPrefix)] = store.objects[name]
+		delete(store.objects, name)
+	}
+	rewriteManifest(t, store, legacy, func(m *GenerationManifest) {
+		m.Generation = legacy.Generation
+	})
+	return legacy
+}
+
+func TestRestoreAcceptsLegacyKeyGeneration(t *testing.T) {
+	// Buckets hold generations uploaded before Size joined the key, and
+	// journal tasks carrying legacy keys survive vmd upgrades: restore
+	// must verify them under the legacy derivation and say so.
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+	legacy := legacyFixture(t, store, task)
+
+	var lines []string
+	progress := func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}
+	destDir := filepath.Join(t.TempDir(), "restored")
+	manifest, err := RestoreGeneration(context.Background(), store, legacy.SandboxID, legacy.Generation, destDir, progress)
+	if err != nil {
+		t.Fatalf("legacy restore: %v", err)
+	}
+	if manifest.Generation != legacy.Generation {
+		t.Fatalf("manifest generation = %s, want %s", manifest.Generation, legacy.Generation)
+	}
+	orig, err := os.ReadFile(task.Files[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(destDir, task.Files[0].Name))
+	if err != nil || !bytes.Equal(orig, got) {
+		t.Fatalf("legacy restore content mismatch: err=%v", err)
+	}
+	sawLegacy := false
+	for _, l := range lines {
+		if strings.Contains(l, "legacy") {
+			sawLegacy = true
+		}
+	}
+	if !sawLegacy {
+		t.Fatalf("progress never reported the legacy derivation: %q", lines)
+	}
+}
+
+func TestRestoreLegacyGenerationBoundsInflatedSize(t *testing.T) {
+	// A legacy key does not cover Size, so the per-entry cap is the only
+	// bound between a tampered size and an effectively unbounded zero
+	// hash during verification.
+	task := writeRestoreFixture(t, t.TempDir())
+	store := newMemBlobs()
+	uploadFixture(t, store, task)
+	legacy := legacyFixture(t, store, task)
+	rewriteManifest(t, store, legacy, func(m *GenerationManifest) {
+		m.Files[0].Size = maxApparentSize + 1
+	})
+	_, err := RestoreGeneration(context.Background(), store, legacy.SandboxID, legacy.Generation, filepath.Join(t.TempDir(), "restored"), nil)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("err = %v, want size bound rejection", err)
+	}
+}
