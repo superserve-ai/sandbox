@@ -239,10 +239,11 @@ func baseTaskFile(file TaskFile) (TaskFile, error) {
 // but restore's exclusive per-name creation could never materialize both
 // files, a complete-yet-unrestorable generation discovered only at
 // recovery time.
+// SharedBaseName carries the FULL digest: distinct bases must map to
+// distinct restored file names unconditionally, and a truncated prefix
+// would let a (however unlikely) collision produce a generation that
+// uploads completely but is rejected at restore for duplicate names.
 func SharedBaseName(sha string) string {
-	if len(sha) > 12 {
-		sha = sha[:12]
-	}
 	return "base-" + sha + ".ext4"
 }
 
