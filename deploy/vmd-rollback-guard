@@ -50,9 +50,19 @@ if [ -z "$evidence" ]; then
     fi
     # A byte-level scan, so a stale copy of a deleted record on a free page can
     # block a legitimately drained rollback — the safe direction. The error
-    # text carries the remediation.
-    if grep -qa '"supervision":"cgroup"' "$STATE" 2>/dev/null; then
-        evidence="cgroup-supervision records in ${STATE}"
+    # text carries the remediation. With every direct-spawn VM paused there
+    # are no cgroup directories, so this file is the ONLY evidence — a scan
+    # error must block, not read as a clean miss. A missing file is a clean
+    # miss: a host that never ran vmd has no store and no records.
+    if [ -e "$STATE" ]; then
+        grep -qa '"supervision":"cgroup"' "$STATE" 2>/dev/null
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            evidence="cgroup-supervision records in ${STATE}"
+        elif [ "$rc" -ne 1 ]; then
+            echo "vmd-rollback-guard: cannot scan ${STATE}; refusing to start a vmd without cgroup supervision" >&2
+            exit 1
+        fi
     fi
 fi
 

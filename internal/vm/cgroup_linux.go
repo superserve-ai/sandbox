@@ -492,11 +492,16 @@ func (t *cgroupTree) createVMCgroup(vmID string) (*os.File, error) {
 	if err := os.Mkdir(dir, 0o755); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("mkdir vm cgroup: %w", err)
 	}
+	// Failures past the mkdir remove the group: nothing was cloned into it,
+	// and a leftover empty dir behind a persisted record is invisible to the
+	// empty-group reap (which skips recorded IDs) yet blocks drain-check.
 	if err := os.WriteFile(filepath.Join(dir, "memory.oom.group"), []byte("1"), 0o644); err != nil {
+		_ = os.Remove(dir)
 		return nil, fmt.Errorf("set oom.group: %w", err)
 	}
 	f, err := os.Open(dir)
 	if err != nil {
+		_ = os.Remove(dir)
 		return nil, fmt.Errorf("open vm cgroup dir: %w", err)
 	}
 	return f, nil
