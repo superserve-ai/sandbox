@@ -745,7 +745,17 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	// then completes. cgroup.kill for a wedged FC (uninterruptible I/O) is exactly
 	// this case, but so is any record/reality drift.
 	if m.cgroupStillLive(vmID) {
-		return status.Errorf(codes.Unavailable, "vm %s stop unconfirmed (cgroup process still live); retry after it exits", vmID)
+		// Stop what the probe found rather than only refusing: the record's
+		// mode can be stale (a verify throwaway's failed cleanup leaves a
+		// cgroup FC on a unit-mode record), destroy's intent is death in
+		// either mode, and in BoltDB-only mode no drift rule reclaims a live
+		// group behind an existing record. stopVM's cgroup arm kills, reaps,
+		// and removes on its own detached budget; only a group that still
+		// won't die refuses.
+		_ = m.stopVM(ctx, vmID, SupervisionCgroup)
+		if m.cgroupStillLive(vmID) {
+			return status.Errorf(codes.Unavailable, "vm %s stop unconfirmed (cgroup process still live); retry after it exits", vmID)
+		}
 	}
 	removeUnitDropIn(vmID)
 

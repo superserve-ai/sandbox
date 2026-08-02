@@ -92,6 +92,8 @@ BUNDLE_FILES = [
     "deploy/superserve-vmd.service",
     "deploy/superserve-vmd.socket",
     "deploy/superserve-vms.service",
+    "deploy/vmd-rollback-guard",
+    "deploy/superserve-vmd-rollback-guard.conf",
     "deploy/superserve-secretsproxy.service",
     "deploy/firecracker@.service",
     "deploy/firecracker-netns@.service",
@@ -252,6 +254,13 @@ def main() -> int:
             sudo install -m 0644 {extract_dir}/deploy/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
             sudo install -m 0644 {extract_dir}/deploy/sandboxes.slice /etc/systemd/system/sandboxes.slice
             sudo install -m 0644 {extract_dir}/deploy/superserve-vms.service /etc/systemd/system/superserve-vms.service
+            # Host-resident rollback guard: survives deploys of older revisions
+            # (their scripts predate the drain gate above and never remove
+            # drop-ins), so a guard-less script cannot install a pre-cgroup
+            # binary over live direct-spawn VMs unnoticed.
+            sudo install -m 0755 {extract_dir}/deploy/vmd-rollback-guard {install_dir}/vmd-rollback-guard
+            sudo install -d -m 0755 /etc/systemd/system/superserve-vmd.service.d
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-rollback-guard.conf /etc/systemd/system/superserve-vmd.service.d/10-rollback-guard.conf
             sudo systemctl daemon-reload
             sudo systemctl enable --quiet superserve-vmd.socket
             # Delegated cgroup subtree for direct-spawn VMs. Enable for boot, but
