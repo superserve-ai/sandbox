@@ -275,4 +275,3 @@ func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
 		SizeBytes:      meta.SizeBytes,
 	}, nil
 }
-

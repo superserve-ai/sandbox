@@ -163,7 +163,9 @@ func TestHostCapabilityBatchGateLocksExactActiveHeartbeat(t *testing.T) {
 	if start < 0 {
 		t.Fatal("HostHasCapabilities query block is missing")
 	}
-	end := strings.Index(queries[start:], "-- name: MarkHostUnhealthy :exec")
+	// The unlocked variant follows immediately; bound the locked block at it so
+	// this assertion covers only the FOR SHARE query.
+	end := strings.Index(queries[start:], "-- name: HostHasCapabilitiesUnlocked :one")
 	if end < 0 {
 		t.Fatal("HostHasCapabilities query terminator is missing")
 	}
@@ -184,5 +186,72 @@ func TestHostCapabilityBatchGateLocksExactActiveHeartbeat(t *testing.T) {
 	}
 	if got := strings.Count(query, "WHERE NOT EXISTS"); got != 2 {
 		t.Fatalf("batch capability relational division has %d NOT EXISTS clauses, want 2", got)
+	}
+}
+
+// The unlocked variant used on the create/resume pre-flight paths must run the
+// same relational division against the same active-heartbeat host, but WITHOUT
+// the row lock — that is the whole point of the second query (a burst of
+// pre-flight checks must not serialize behind the host's heartbeat writer).
+func TestHostHasCapabilitiesUnlockedRunsSameDivisionWithoutRowLock(t *testing.T) {
+	path := filepath.Join("..", "..", "db", "queries", "hosts.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read host queries: %v", err)
+	}
+	queries := string(raw)
+	start := strings.Index(queries, "-- name: HostHasCapabilitiesUnlocked :one")
+	if start < 0 {
+		t.Fatal("HostHasCapabilitiesUnlocked query block is missing")
+	}
+	end := strings.Index(queries[start:], "-- name: MarkHostUnhealthy :exec")
+	if end < 0 {
+		t.Fatal("HostHasCapabilitiesUnlocked query terminator is missing")
+	}
+	query := queries[start : start+end]
+	for _, required := range []string{
+		"WITH target_host AS MATERIALIZED",
+		"WHERE id = sqlc.arg('host_id')",
+		"status = 'active'",
+		"last_heartbeat_at IS NOT NULL",
+		"unnest(sqlc.arg('required_capabilities')::text[])",
+		"hc.host_id = h.id",
+		"hc.heartbeat_at = h.last_heartbeat_at",
+	} {
+		if !strings.Contains(query, required) {
+			t.Errorf("unlocked capability gate is missing %q", required)
+		}
+	}
+	if strings.Contains(query, "FOR SHARE") {
+		t.Fatal("unlocked capability gate must not take a row lock (FOR SHARE)")
+	}
+	if got := strings.Count(query, "WHERE NOT EXISTS"); got != 2 {
+		t.Fatalf("unlocked relational division has %d NOT EXISTS clauses, want 2", got)
+	}
+}
+
+// The standalone policy query and the joined sandbox+policy query must derive
+// the effective access identically — a precedence change applied to one but
+// not the other would make read responses disagree with the policy engine.
+func TestEffectiveAccessExpressionMatchesAcrossQueries(t *testing.T) {
+	path := filepath.Join("..", "..", "db", "queries", "sandboxes.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read sandbox queries: %v", err)
+	}
+	queries := string(raw)
+	const expr = "COALESCE(p.default_access, p.access, 'legacy_public')::text AS access"
+	for _, name := range []string{"-- name: GetSandboxPreviewPolicy :one", "-- name: GetSandboxWithPreviewPolicy :one"} {
+		start := strings.Index(queries, name)
+		if start < 0 {
+			t.Fatalf("query block %q is missing", name)
+		}
+		end := strings.Index(queries[start:], ";")
+		if end < 0 {
+			t.Fatalf("query block %q has no terminator", name)
+		}
+		if !strings.Contains(queries[start:start+end], expr) {
+			t.Errorf("%q lost the shared effective-access expression %q", name, expr)
+		}
 	}
 }

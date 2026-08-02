@@ -937,7 +937,7 @@ func TestPauseVM_AlreadyPaused_ReturnsRecordedSnapshot(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
 
-	snap, mem, err := mgr.PauseVM(context.Background(), "vm-1", "")
+	snap, mem, _, err := mgr.PauseVM(context.Background(), "vm-1", "")
 	if err != nil {
 		t.Fatalf("retried pause of a paused VM should succeed, got %v", err)
 	}
@@ -956,7 +956,7 @@ func TestPauseVM_AlreadyPausedButArtifactsMissing_Fails(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
 
-	_, _, err := mgr.PauseVM(context.Background(), "vm-1", "")
+	_, _, _, err := mgr.PauseVM(context.Background(), "vm-1", "")
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition for dangling artifacts, got %v", err)
 	}

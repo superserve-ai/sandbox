@@ -170,6 +170,26 @@ type Activity struct {
 	SecretName   *string     `json:"secret_name"`
 }
 
+type AnalyticsActiveSandboxCount struct {
+	ActiveSandboxes int64 `json:"active_sandboxes"`
+}
+
+type AnalyticsDailySandboxStart struct {
+	Day    pgtype.Date `json:"day"`
+	Starts int64       `json:"starts"`
+}
+
+type AnalyticsTeamHourlySpend struct {
+	TeamName  string         `json:"team_name"`
+	HourStart time.Time      `json:"hour_start"`
+	SpendUsd  pgtype.Numeric `json:"spend_usd"`
+}
+
+type AnalyticsTeamSandboxEvent struct {
+	TeamName  string    `json:"team_name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type AnalyticsWeeklyUserMetric struct {
 	WeekStart       pgtype.Date `json:"week_start"`
 	Signups         int64       `json:"signups"`
@@ -194,6 +214,20 @@ type ApiKey struct {
 	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 	CreatedAt  time.Time          `json:"created_at"`
+}
+
+type ArtifactManifest struct {
+	ID          uuid.UUID   `json:"id"`
+	SnapshotID  pgtype.UUID `json:"snapshot_id"`
+	TemplateID  pgtype.UUID `json:"template_id"`
+	FileName    string      `json:"file_name"`
+	Path        string      `json:"path"`
+	SizeBytes   int64       `json:"size_bytes"`
+	Sha256      string      `json:"sha256"`
+	BasePath    *string     `json:"base_path"`
+	GuestKernel *string     `json:"guest_kernel"`
+	VmdVersion  *string     `json:"vmd_version"`
+	CreatedAt   time.Time   `json:"created_at"`
 }
 
 type AuditLog struct {
@@ -542,14 +576,16 @@ type Secret struct {
 }
 
 type Snapshot struct {
-	ID        uuid.UUID `json:"id"`
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	TeamID    uuid.UUID `json:"team_id"`
-	Path      string    `json:"path"`
-	SizeBytes int64     `json:"size_bytes"`
-	Trigger   string    `json:"trigger"`
-	CreatedAt time.Time `json:"created_at"`
-	MemPath   *string   `json:"mem_path"`
+	ID         uuid.UUID `json:"id"`
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	TeamID     uuid.UUID `json:"team_id"`
+	Path       string    `json:"path"`
+	SizeBytes  int64     `json:"size_bytes"`
+	Trigger    string    `json:"trigger"`
+	CreatedAt  time.Time `json:"created_at"`
+	MemPath    *string   `json:"mem_path"`
+	Generation int64     `json:"generation"`
+	Name       *string   `json:"name"`
 }
 
 type Team struct {
