@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -53,7 +52,7 @@ func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVM
 			}
 		}
 		pid, err = m.startFirecrackerDirect(ctx, vmID, socketPath, perVMRootfs, basePath, netNS)
-		if err != nil && errors.Is(err, fs.ErrNotExist) {
+		if err != nil && errors.Is(err, errScopeGone) {
 			// The delegated scope is gone (keeper died, drained scope GC'd).
 			// Scope-gone proves no cgroup FC survives for this ID (a populated
 			// child would have pinned the scope), so a unit launch cannot

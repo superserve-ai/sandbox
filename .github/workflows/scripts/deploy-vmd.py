@@ -215,15 +215,14 @@ def main() -> int:
             if grep -qa cgroup-supervision {install_dir}/vmd 2>/dev/null && ! grep -qa cgroup-supervision {extract_dir}/bin/vmd; then
                 echo "incoming vmd lacks cgroup-supervision — verifying host is drained before downgrade"
                 sudo systemctl stop superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
-                # drain-check only needs VMD_STATE_PATH / RUN_DIR to find the DB.
-                # Extract them as LITERAL values (systemd env files are literal
-                # KEY=value; dot-sourcing would execute $()/backticks in secret
-                # values as root) and pass them explicitly. Empty = drain-check's
-                # own defaults apply.
-                DC_STATE=$(sudo sed -n 's/^VMD_STATE_PATH=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -1)
-                DC_RUN=$(sudo sed -n 's/^RUN_DIR=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -1)
+                # The capable vmd records its resolved state path in the
+                # breadcrumb (arming requires the write), so read that instead
+                # of re-parsing env files with systemd's grammar. Empty (a
+                # capable host that never armed) = drain-check's own defaults
+                # apply; the host-resident start guard backstops either way.
+                DC_STATE=$(sudo head -n 1 /var/lib/sandbox/vmd-state-path 2>/dev/null || true)
                 set +e
-                sudo env VMD_STATE_PATH="$DC_STATE" RUN_DIR="$DC_RUN" {install_dir}/vmd drain-check
+                sudo env VMD_STATE_PATH="$DC_STATE" {install_dir}/vmd drain-check
                 DRAIN_RC=$?
                 set -e
                 if [ "$DRAIN_RC" -ne 0 ]; then

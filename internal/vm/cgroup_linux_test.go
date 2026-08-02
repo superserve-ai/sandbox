@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -272,17 +271,30 @@ func TestSafeVMCgroupDirRejectsTraversal(t *testing.T) {
 	}
 }
 
-// The keeper-death fallback keys on ErrNotExist surviving createVMCgroup's
-// wrapping: a missing parent scope must stay errors.Is-detectable, or the
-// unit-supervision fallback silently stops firing.
-func TestCreateVMCgroupMissingScopeIsNotExist(t *testing.T) {
+// The keeper-death fallback keys on the scope-gone sentinel surviving
+// createVMCgroup's wrapping: a missing parent scope must stay
+// errors.Is-detectable, or the unit-supervision fallback silently stops
+// firing. Deliberately NOT bare fs.ErrNotExist — later launch stages can
+// wrap ENOENT and must not trigger the fallback (a transient socket failure
+// would convert a cgroup VM to unit supervision).
+func TestCreateVMCgroupMissingScopeIsScopeGone(t *testing.T) {
 	tree := &cgroupTree{vms: filepath.Join(t.TempDir(), "gone", "vms")}
 	_, err := tree.createVMCgroup("vm-1")
 	if err == nil {
 		t.Fatal("expected error for a missing parent scope")
 	}
-	if !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("missing-scope error must be fs.ErrNotExist-detectable, got: %v", err)
+	if !errors.Is(err, errScopeGone) {
+		t.Fatalf("missing-scope error must be errScopeGone-detectable, got: %v", err)
+	}
+	// A missing parent must be the ONLY producer: a plain failed mkdir under
+	// a present scope stays a non-sentinel error.
+	present := &cgroupTree{vms: t.TempDir()}
+	blocker := filepath.Join(present.vms, "vm-2")
+	if werr := os.WriteFile(blocker, []byte("x"), 0o644); werr != nil {
+		t.Fatal(werr)
+	}
+	if _, err := present.createVMCgroup("vm-2"); err == nil || errors.Is(err, errScopeGone) {
+		t.Fatalf("non-scope mkdir failure must not read as scope-gone, got: %v", err)
 	}
 }
 

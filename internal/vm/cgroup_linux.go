@@ -49,6 +49,11 @@ type cgroupTree struct {
 	keeper string // vms/keeper — the keeper process's leaf
 }
 
+// errScopeGone marks a launch failure caused by the delegated VM scope
+// itself being absent — the only failure the dispatch may answer with a
+// unit-supervision fallback.
+var errScopeGone = errors.New("delegated vm scope missing")
+
 // DisableDirectSpawn forces the unit path for new launches regardless of the
 // configured flag; management of existing cgroup VMs is unaffected. For
 // arming prerequisites outside ArmDirectSpawn's view (the state-path
@@ -496,6 +501,14 @@ func (t *cgroupTree) createVMCgroup(vmID string) (*os.File, error) {
 		return nil, err
 	}
 	if err := os.Mkdir(dir, 0o755); err != nil && !os.IsExist(err) {
+		if os.IsNotExist(err) {
+			// The parent scope is gone (keeper died, drained scope GC'd) —
+			// the ONE condition the launch dispatch may fall back to unit
+			// supervision on. A dedicated sentinel, not bare fs.ErrNotExist:
+			// later launch stages (socket waits) can wrap ENOENT too, and a
+			// transient failure there must not convert the VM's mode.
+			return nil, fmt.Errorf("%w: mkdir vm cgroup: %v", errScopeGone, err)
+		}
 		return nil, fmt.Errorf("mkdir vm cgroup: %w", err)
 	}
 	// Failures past the mkdir remove the group: nothing was cloned into it,
