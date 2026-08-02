@@ -19,6 +19,12 @@ Slice=sandboxes.slice
 Delegate=yes
 KillMode=process
 Restart=no
+# Every direct-spawn VM's processes and THREADS share this one service's task
+# ceiling (per-unit VMs never did). Left unset, systemd's TasksMax default —
+# 15% of kernel.threads-max, host-size dependent — becomes an invisible fleet
+# cap that binds as clone3 EAGAIN at create. Fleet task containment is a
+# deliberate slice/host decision, not a service default.
+TasksMax=infinity
 
 [Install]
 WantedBy=multi-user.target

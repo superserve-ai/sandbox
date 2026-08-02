@@ -152,6 +152,27 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	if !sandboxesSliceReserved() {
 		return false, fmt.Errorf("sandboxes.slice has no effective memory ceiling with a host reserve — refusing to arm")
 	}
+	// Every direct VM's threads share the vms service's ONE pids ceiling
+	// (per-unit VMs each had their own), and systemd's derived TasksMax
+	// default is host-size dependent — small hosts inherit a cap that binds
+	// as clone3 EAGAIN at create. The shipped unit sets TasksMax=infinity;
+	// validate the effective value on the layers this repo owns.
+	for _, p := range []string{
+		filepath.Join(tree.vms, "pids.max"),
+		filepath.Join(cgroupMount, "sandboxes.slice", "pids.max"),
+	} {
+		data, perr := os.ReadFile(p)
+		if perr != nil {
+			if os.IsNotExist(perr) {
+				continue // pids controller not enabled at this layer: no bound
+			}
+			return false, fmt.Errorf("read %s: %w — refusing to arm", p, perr)
+		}
+		if !pidsCeilingAdequate(string(data)) {
+			return false, fmt.Errorf("%s = %q caps the fleet's shared task count — set TasksMax=infinity on %s; refusing to arm",
+				p, strings.TrimSpace(string(data)), vmsUnitName)
+		}
+	}
 	// The guest console is untrusted; the only bound on its file is the
 	// Firecracker serial cap. Refuse to arm on a binary that doesn't advertise
 	// it, or a direct-spawned guest could fill the host disk.
@@ -367,6 +388,24 @@ func sandboxesSliceReserved() bool {
 		return false
 	}
 	return capLeavesReserve(max, total)
+}
+
+// minDirectSpawnPids is the smallest numeric pids.max accepted at arm time:
+// the fleet ceiling is a few thousand VMs at roughly a dozen tasks each
+// (VMM + vCPUs + API), so 64k gives at least 2x headroom while rejecting
+// the small-host class of systemd's derived TasksMax default.
+const minDirectSpawnPids = 65536
+
+// pidsCeilingAdequate parses a cgroup pids.max value: "max" (unbounded) or a
+// numeric bound with fleet headroom passes; anything else — including an
+// unparseable value — fails closed.
+func pidsCeilingAdequate(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "max" {
+		return true
+	}
+	n, err := strconv.ParseUint(s, 10, 64)
+	return err == nil && n >= minDirectSpawnPids
 }
 
 // capLeavesReserve reports whether a memory.max of max bytes leaves a host

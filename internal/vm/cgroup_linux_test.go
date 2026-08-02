@@ -275,3 +275,27 @@ func TestCreateVMCgroupMissingScopeIsNotExist(t *testing.T) {
 		t.Fatalf("missing-scope error must be fs.ErrNotExist-detectable, got: %v", err)
 	}
 }
+
+// A pids ceiling passes only as "max" or with real fleet headroom; systemd's
+// small-host derived defaults and garbage both fail closed.
+func TestPidsCeilingAdequate(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"max", true},
+		{"max\n", true},
+		{"1048576", true},
+		{"65536", true},
+		{"65535", false},
+		{"4915", false}, // systemd's documented small-host TasksMax default
+		{"0", false},
+		{"", false},
+		{"unlimited", false},
+	}
+	for _, tc := range cases {
+		if got := pidsCeilingAdequate(tc.in); got != tc.want {
+			t.Errorf("pidsCeilingAdequate(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
