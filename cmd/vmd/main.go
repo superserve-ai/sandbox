@@ -258,6 +258,8 @@ func (lc *lifecycle) shutdown(ctx context.Context) {
 // treat any non-zero as "do not downgrade". Run with vmd stopped — the store
 // read lock and the cgroup scan both need the daemon quiescent.
 func runDrainCheck() int {
+	// deploy/vmd-rollback-guard mirrors this derivation in shell; a change
+	// here must change it in step, or the guard scans the wrong store.
 	statePath := envOrDefault("VMD_STATE_PATH",
 		filepath.Join(filepath.Dir(envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir")), "vmd.db"))
 	rep, err := vm.CheckDrained(context.Background(), statePath)
