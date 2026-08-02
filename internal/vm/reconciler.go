@@ -344,7 +344,14 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// Recover the netns from the live process BEFORE the kill, or the
 		// slot/veth/ns leaks: an untracked VM has no device record, so
 		// CleanupVMOrNamespace can only reclaim it given the namespace name.
+		// A protected survivor whose process just exited has no pid to read —
+		// fall back to the mapping the startup reap preserved.
 		nsName := r.mgr.netMgr.NamespaceForPID(r.mgr.cgroups.firstPID(id))
+		if nsName == "" {
+			if v, ok := r.mgr.survivorNS.Load(id); ok {
+				nsName = v.(string)
+			}
+		}
 		if err := r.mgr.stopVM(ctx, id, SupervisionCgroup); err != nil {
 			// If only the rmdir failed, the emptied group drops out of the
 			// populated active-set next pass and this drift never revisits it —
@@ -354,6 +361,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// survivor. Skip on an inconclusive read so a live FC keeps its tap.
 			if pop, perr := r.mgr.cgroups.vmCgroupPopulated(id); perr == nil && !pop {
 				r.mgr.netMgr.CleanupVMOrNamespace(id, nsName)
+				r.mgr.survivorNS.Delete(id)
 				if rerr := r.mgr.cgroups.removeVMCgroup(ctx, id); rerr == nil {
 					unlockOp()
 					r.writeAudit(ctx, id, "orphan_stop", "recordless cgroup survivor (rmdir retried)", "cgroup_orphan_no_record")
@@ -366,6 +374,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			continue
 		}
 		r.mgr.netMgr.CleanupVMOrNamespace(id, nsName)
+		r.mgr.survivorNS.Delete(id)
 		unlockOp()
 		r.writeAudit(ctx, id, "orphan_stop", "recordless cgroup survivor", "cgroup_orphan_no_record")
 		r.clearDrift("cgrouporphan:" + id)
@@ -434,6 +443,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 					log.Warn().Err(err).Str("vm_id", id).Msg("failed to reap empty recordless cgroup — retrying next pass")
 					unlockOp()
 					continue
+				}
+				// A protected survivor's process is gone, so the mapping
+				// preserved at startup is the only route left to its reserved
+				// slot and veth; spend it or they stay held until restart.
+				if ns, ok := r.mgr.survivorNS.LoadAndDelete(id); ok {
+					r.mgr.netMgr.CleanupVMOrNamespace(id, ns.(string))
 				}
 				unlockOp()
 				r.writeAudit(ctx, id, "orphan_reap", "empty recordless cgroup directory", "cgroup_empty_no_record")

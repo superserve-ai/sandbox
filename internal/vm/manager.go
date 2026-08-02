@@ -284,6 +284,13 @@ type Manager struct {
 	// process owns (vmID → chan directSpawnResult, buffered 1). Kill paths
 	// wait on the channel, never on kill(0) polls — zombies answer polls.
 	reapers sync.Map
+	// survivorNS preserves vmID → netns for a protected recordless survivor
+	// whose startup kill could not be confirmed. Once that process exits on
+	// its own, its pid — the only other route to the namespace — is gone, so
+	// the empty-group reap must spend this mapping to release the reserved
+	// slot and veth. In-memory only: a restart rebuilds reservations from
+	// scratch and the startup sweep reclaims unprotected namespaces.
+	survivorNS sync.Map
 	// orphanScanDone gates the fresh-unit linger skip: it is set only after
 	// startup reattach successfully listed active units and registered the
 	// BoltDB-missing ones as unconfirmed stops. Until then (or forever, if
@@ -2592,6 +2599,7 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) []string {
 			if ns != "" {
 				if pop, perr := m.cgroups.vmCgroupPopulated(id); perr != nil || pop {
 					m.netMgr.ReserveSlotsAbove(map[string]string{id: ns})
+					m.survivorNS.Store(id, ns)
 					protected = append(protected, ns)
 				}
 			}
