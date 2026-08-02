@@ -49,6 +49,12 @@ type cgroupTree struct {
 	keeper string // vms/keeper — the keeper process's leaf
 }
 
+// DisableDirectSpawn forces the unit path for new launches regardless of the
+// configured flag; management of existing cgroup VMs is unaffected. For
+// arming prerequisites outside ArmDirectSpawn's view (the state-path
+// breadcrumb the rollback guard depends on). Startup-only, pre-arm.
+func (m *Manager) DisableDirectSpawn() { m.cfg.DirectSpawn = false }
+
 // ArmDirectSpawn enables the cgroup launch path for NEW VMs when the flag is
 // set AND the host proves the survival property. Returns (armed, err):
 // (false, nil) flag off; (false, err) requested but a precondition failed —

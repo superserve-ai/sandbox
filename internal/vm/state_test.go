@@ -2,6 +2,7 @@ package vm
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -1117,5 +1118,27 @@ func TestPutIfPresent(t *testing.T) {
 	}
 	if has, _ := s.Has("vm-1"); has {
 		t.Fatal("record resurrected after delete — PutIfPresent must be a no-op")
+	}
+}
+
+// The rollback guard finds the store solely through this file, so the write
+// must be atomic-replace with the exact resolved path.
+func TestWriteStateBreadcrumb(t *testing.T) {
+	at := filepath.Join(t.TempDir(), "nested", "state-path")
+	if err := writeStateBreadcrumbTo(at, "/somewhere/vm state/vmd.db"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "/somewhere/vm state/vmd.db\n" {
+		t.Fatalf("content %q", b)
+	}
+	if err := writeStateBreadcrumbTo(at, "/elsewhere/vmd.db"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ = os.ReadFile(at); string(b) != "/elsewhere/vmd.db\n" {
+		t.Fatalf("content after rewrite %q", b)
 	}
 }

@@ -3,6 +3,8 @@ package vm
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -200,6 +202,33 @@ func (s Supervision) String() string {
 // cgroupSupervised reports whether a supervision value means the VM has no
 // systemd unit and lives in a per-VM cgroup.
 func cgroupSupervised(s Supervision) bool { return s == SupervisionCgroup }
+
+// StateBreadcrumbPath is the fixed, non-configurable location where vmd
+// records its RESOLVED state-store path. The host-resident rollback guard
+// reads it instead of re-deriving the path from env files, so the two can
+// never disagree about grammar; direct-spawn arming requires the write, so
+// "cgroup records exist without a breadcrumb" is unrepresentable.
+const StateBreadcrumbPath = "/var/lib/sandbox/vmd-state-path"
+
+// WriteStateBreadcrumb records the resolved state path atomically
+// (write+rename), so the guard never reads a torn value.
+func WriteStateBreadcrumb(statePath string) error {
+	return writeStateBreadcrumbTo(StateBreadcrumbPath, statePath)
+}
+
+func writeStateBreadcrumbTo(at, statePath string) error {
+	if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
+		return fmt.Errorf("state breadcrumb dir: %w", err)
+	}
+	tmp := at + ".tmp"
+	if err := os.WriteFile(tmp, []byte(statePath+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write state breadcrumb: %w", err)
+	}
+	if err := os.Rename(tmp, at); err != nil {
+		return fmt.Errorf("commit state breadcrumb: %w", err)
+	}
+	return nil
+}
 
 // StateStore wraps a BoltDB database for VM state persistence.
 type StateStore struct {

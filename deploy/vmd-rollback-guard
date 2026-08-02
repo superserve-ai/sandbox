@@ -15,16 +15,13 @@
 set -u
 BIN="${1:-/usr/local/bin/vmd}"
 
-# systemd strips one layer of matched quotes from EnvironmentFile values
-# before vmd sees them; the literal extraction below must do the same or a
-# quoted path resolves to a nonexistent quoted name.
-unquote() {
-    case $1 in
-        '"'*'"') set -- "${1#\"}"; printf '%s' "${1%\"}" ;;
-        "'"*"'") set -- "${1#\'}"; printf '%s' "${1%\'}" ;;
-        *) printf '%s' "$1" ;;
-    esac
-}
+# The capable vmd records its RESOLVED state path at a fixed location at
+# startup, and arming direct spawn requires that write — so "cgroup records
+# exist but no breadcrumb" is unrepresentable. Reading it means this guard
+# never parses env files (systemd's EnvironmentFile grammar — quotes,
+# escapes, continuations — belongs to systemd) and cannot disagree with the
+# daemon about where the store lives.
+BREADCRUMB=/var/lib/sandbox/vmd-state-path
 
 if grep -qa cgroup-supervision "$BIN" 2>/dev/null; then
     exit 0
@@ -48,16 +45,16 @@ if [ -n "$VMS_CG" ] && [ -d "/sys/fs/cgroup${VMS_CG}" ]; then
     [ -n "$child" ] && evidence="live VM cgroup ${child}"
 fi
 if [ -z "$evidence" ]; then
-    # Literal extraction (systemd env files are literal KEY=value); dot-sourcing
-    # would execute substitutions in secret values as root. The fallback
-    # mirrors vmd's own derivation — VMD_STATE_PATH, else vmd.db beside
-    # RUN_DIR — or a host with a custom RUN_DIR and only PAUSED direct-spawn
-    # VMs (no live cgroups) would be scanned at the wrong path and pass.
-    STATE=$(unquote "$(sed -n 's/^VMD_STATE_PATH=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -1)")
-    if [ -z "$STATE" ]; then
-        RUN=$(unquote "$(sed -n 's/^RUN_DIR=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -1)")
-        [ -n "$RUN" ] || RUN=/var/lib/sandbox/rundir
-        STATE="$(dirname "$RUN")/vmd.db"
+    # A missing breadcrumb means no capable vmd ever armed here, so only the
+    # default location could hold records; a present-but-unreadable one must
+    # block — with every direct-spawn VM paused it is the only route to the
+    # store.
+    STATE=/var/lib/sandbox/vmd.db
+    if [ -e "$BREADCRUMB" ]; then
+        if ! STATE=$(head -n 1 "$BREADCRUMB" 2>/dev/null) || [ -z "$STATE" ]; then
+            echo "vmd-rollback-guard: cannot read the recorded state path; refusing to start a vmd without cgroup supervision" >&2
+            exit 1
+        fi
     fi
     # A byte-level scan, so a stale copy of a deleted record on a free page can
     # block a legitimately drained rollback — the safe direction. The error

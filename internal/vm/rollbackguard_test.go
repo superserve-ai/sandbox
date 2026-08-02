@@ -31,8 +31,9 @@ func newGuardWorld(t *testing.T) *guardWorld {
 	w := &guardWorld{t: t, dir: dir}
 	rewritten := string(src)
 	for from, to := range map[string]string{
-		"/etc/sandbox/vmd.env": filepath.Join(dir, "vmd.env"),
-		"/sys/fs/cgroup":       filepath.Join(dir, "cgfs"),
+		"/var/lib/sandbox/vmd-state-path": filepath.Join(dir, "state-path"),
+		"/var/lib/sandbox/vmd.db":         filepath.Join(dir, "default.db"),
+		"/sys/fs/cgroup":                  filepath.Join(dir, "cgfs"),
 	} {
 		if !strings.Contains(rewritten, from) {
 			t.Fatalf("guard script no longer references %q — update this harness", from)
@@ -151,17 +152,16 @@ func TestRollbackGuard(t *testing.T) {
 			t.Fatalf("rc=%d, want allow", rc)
 		}
 	})
-	t.Run("cgroup records at the default state path block", func(t *testing.T) {
+	t.Run("no breadcrumb, records at the default path block", func(t *testing.T) {
 		w := newGuardWorld(t)
-		w.writeFile("vmd.env", "RUN_DIR="+filepath.Join(w.dir, "state", "rundir")+"\n")
-		w.writeFile("state/vmd.db", cgroupRecordJSON(t))
+		w.writeFile("default.db", cgroupRecordJSON(t))
 		if rc := w.run(oldBinary); rc == 0 {
-			t.Fatal("records at the RUN_DIR-derived path must block")
+			t.Fatal("records at the default path must block")
 		}
 	})
 	t.Run("clean record miss allows", func(t *testing.T) {
 		w := newGuardWorld(t)
-		w.writeFile("vmd.env", "VMD_STATE_PATH="+filepath.Join(w.dir, "plain.db")+"\n")
+		w.writeFile("state-path", filepath.Join(w.dir, "plain.db")+"\n")
 		w.writeFile("plain.db", "no records here")
 		if rc := w.run(oldBinary); rc != 0 {
 			t.Fatalf("rc=%d, want allow", rc)
@@ -172,7 +172,7 @@ func TestRollbackGuard(t *testing.T) {
 			t.Skip("root reads through 0000 modes")
 		}
 		w := newGuardWorld(t)
-		w.writeFile("vmd.env", "VMD_STATE_PATH="+filepath.Join(w.dir, "locked.db")+"\n")
+		w.writeFile("state-path", filepath.Join(w.dir, "locked.db")+"\n")
 		w.writeFile("locked.db", "whatever")
 		if err := os.Chmod(filepath.Join(w.dir, "locked.db"), 0); err != nil {
 			t.Fatal(err)
@@ -183,25 +183,24 @@ func TestRollbackGuard(t *testing.T) {
 	})
 	t.Run("missing state file allows", func(t *testing.T) {
 		w := newGuardWorld(t)
-		w.writeFile("vmd.env", "VMD_STATE_PATH="+filepath.Join(w.dir, "never-created.db")+"\n")
+		w.writeFile("state-path", filepath.Join(w.dir, "never-created.db")+"\n")
 		if rc := w.run(oldBinary); rc != 0 {
 			t.Fatalf("rc=%d, want allow", rc)
 		}
 	})
-	t.Run("double-quoted state path with a space blocks on records", func(t *testing.T) {
+	t.Run("breadcrumbed path with a space blocks on records", func(t *testing.T) {
 		w := newGuardWorld(t)
-		w.writeFile("vmd.env", fmt.Sprintf("VMD_STATE_PATH=%q\n", filepath.Join(w.dir, "vm state", "vmd.db")))
+		w.writeFile("state-path", filepath.Join(w.dir, "vm state", "vmd.db")+"\n")
 		w.writeFile("vm state/vmd.db", cgroupRecordJSON(t))
 		if rc := w.run(oldBinary); rc == 0 {
-			t.Fatal("a systemd-quoted path must be unquoted before the scan")
+			t.Fatal("records at the breadcrumbed path must block")
 		}
 	})
-	t.Run("single-quoted RUN_DIR derivation blocks on records", func(t *testing.T) {
+	t.Run("empty breadcrumb blocks", func(t *testing.T) {
 		w := newGuardWorld(t)
-		w.writeFile("vmd.env", "RUN_DIR='"+filepath.Join(w.dir, "vm state", "rundir")+"'\n")
-		w.writeFile("vm state/vmd.db", cgroupRecordJSON(t))
+		w.writeFile("state-path", "\n")
 		if rc := w.run(oldBinary); rc == 0 {
-			t.Fatal("a single-quoted RUN_DIR must derive the real state path")
+			t.Fatal("an unreadable recorded state path must block")
 		}
 	})
 }
