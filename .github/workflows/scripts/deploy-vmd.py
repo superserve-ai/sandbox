@@ -264,9 +264,10 @@ def main() -> int:
             # re-adopts the existing scope; boot-time start is covered by WantedBy.
             sudo systemctl enable --quiet superserve-vms.service
             # A bootstrapped keeper is never restarted (below), so the unit
-            # file's TasksMax cannot reach a running service via daemon-reload
-            # alone. Apply it to the live unit; the unit file covers boot.
-            sudo systemctl set-property --runtime superserve-vms.service TasksMax=infinity 2>/dev/null || true
+            # file's cgroup properties cannot reach a running service via
+            # daemon-reload alone. Apply them to the live unit; the unit file
+            # covers boot.
+            sudo systemctl set-property --runtime superserve-vms.service TasksMax=infinity CPUWeight=10000 IOWeight=10000 2>/dev/null || true
             VMS_CG=$(systemctl show -p ControlGroup --value superserve-vms.service 2>/dev/null || true)
             # -print -quit (find exits itself after the first hit) instead of
             # piping to grep -q: under set -o pipefail, grep closing the pipe

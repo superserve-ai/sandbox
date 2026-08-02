@@ -25,6 +25,15 @@ Restart=no
 # cap that binds as clone3 EAGAIN at create. Fleet task containment is a
 # deliberate slice/host decision, not a service default.
 TasksMax=infinity
+# The slice's CPU/IO accounting enables weight-based sharing among its
+# children, where every legacy firecracker@ unit is one peer and this service
+# — holding the ENTIRE direct population — is also one peer at the default
+# weight 100. At host saturation during mixed-mode migration that starves the
+# direct fleet to a single legacy VM's share. The maximum weight makes this
+# service weigh as much as 100 legacy peers; per-VM fairness inside the
+# subtree stays with the kernel scheduler (see the slice's CPUQuota note).
+CPUWeight=10000
+IOWeight=10000
 
 [Install]
 WantedBy=multi-user.target
