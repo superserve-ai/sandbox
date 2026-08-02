@@ -380,14 +380,30 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		r.clearDrift("cgrouporphan:" + id)
 	}
 
-	// Drift 0b: empty recordless cgroup directory. A per-VM group whose FC has
-	// exited but that was never removed (a recordless survivor whose process
-	// left on its own, or an rmdir that failed transiently) stays OUT of the
-	// populated active-set, so Drift 0 never revisits it — and it keeps counting
-	// against drain-check until a restart. Reap the leftover directory, after
-	// grace + op-lock, re-checking it is still empty and recordless so an
-	// in-flight launch's fresh group is never removed. Non-destructive (an empty
-	// group has no process to kill), so it doesn't consume the auto-fail budget.
+	// Drift 0b: empty cgroup directory no record owns. A per-VM group whose FC
+	// has exited but that was never removed (a recordless survivor whose
+	// process left on its own, an rmdir that failed transiently, or a verify
+	// throwaway's leftover behind a unit-mode record) stays OUT of the
+	// populated active-set, so Drift 0 never revisits it — and it keeps
+	// counting against drain-check until a restart. Reap the leftover
+	// directory, after grace + op-lock, re-checking it is still empty and
+	// unowned so an in-flight launch's fresh group is never removed.
+	// Non-destructive (an empty group has no process to kill), so it doesn't
+	// consume the auto-fail budget.
+	cgroupOwnedByRecord := func(id string) bool {
+		if dbSandboxes == nil {
+			rec, ok := bolted[id]
+			return ok && cgroupSupervised(rec.Supervision)
+		}
+		if _, ok := boltedIDs[id]; !ok {
+			return false
+		}
+		rec, err := r.mgr.state.Get(id)
+		if err != nil {
+			return true // unreadable: conservative, treat as owned
+		}
+		return rec != nil && cgroupSupervised(rec.Supervision)
+	}
 	if r.mgr.cgroups != nil {
 		if cgDirs, cgErr := r.mgr.cgroups.scanVMCgroups(); cgErr == nil {
 			for _, id := range cgDirs {
@@ -399,13 +415,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				// not on janitorial removal of an already-empty dir. An in-flight
 				// build is populated (caught below) or holds the op-lock; only an
 				// empty leftover is reaped, and rmdir is non-destructive.
-				inBolt := false
-				if dbSandboxes == nil {
-					_, inBolt = bolted[id]
-				} else {
-					_, inBolt = boltedIDs[id]
-				}
-				if inBolt {
+				//
+				// Only a record that CLAIMS cgroup supervision owns its dir. A
+				// unit-mode record over an empty group (a verify throwaway's
+				// rmdir that failed on a paused legacy VM) is rubble no other
+				// rule reaps, yet it counts against drain-check forever.
+				// Unreadable reads as owned (conservative).
+				if cgroupOwnedByRecord(id) {
 					continue
 				}
 				r.mgr.mu.RLock()
@@ -423,7 +439,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				}
 				// Re-check under the lock: an in-flight launch may have persisted
 				// a record, published an instance, or forked FC into the group.
-				if has, _ := r.mgr.state.Has(id); has {
+				if cgroupOwnedByRecord(id) {
 					unlockOp()
 					r.clearDrift("cgroupempty:" + id)
 					continue
@@ -519,6 +535,15 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			failed := known && sb.Sandbox.Status == db.SandboxStatusFailed
 			if known && !deleted && !failed {
 				continue
+			}
+			// A recordless cgroup id is Drift 0's: it recovers the netns from
+			// the live pid before killing, under the op lock — this branch's
+			// markStale would read no record and leak the slot, and both
+			// rules would spend auto-fail budget on the same VM.
+			if supervisionOf[id] == SupervisionCgroup {
+				if _, ok := boltedIDs[id]; !ok {
+					continue
+				}
 			}
 			if !r.gracePeriodElapsed("orphan:"+id, now) {
 				continue

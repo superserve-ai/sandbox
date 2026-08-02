@@ -1411,7 +1411,10 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	// on the cgroup path), or the FC and its cgroup outlive the verify.
 	// freshUnit=false: a verify throwaway reuses the VM's id, so the linger
 	// query must run.
-	_, verifySupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, inst.Supervision, true, false)
+	inst.mu.RLock()
+	verifyExisting := inst.Supervision
+	inst.mu.RUnlock()
+	_, verifySupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, verifyExisting, true, false)
 	// Register the mode-aware stop BEFORE the error branch: a cgroup launch that
 	// forked FC but failed socket-readiness (kill unconfirmed) returns cgroup
 	// mode with an error and leaves a live throwaway, so the deferred stop must
@@ -2333,6 +2336,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// disagreement: a crash mid unit→cgroup flip leaves the record still
 	// saying unit over a live cgroup; a crash mid-resume leaves a Paused
 	// record with a live half-restored FC.
+	supervisionCorrected := false
 	if m.cgroups != nil {
 		if pop, perr := m.cgroups.vmCgroupPopulated(rec.ID); perr == nil && pop {
 			// Stamp cgroup mode FIRST, unconditionally: even if the kill
@@ -2343,6 +2347,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			// reattach), so capture the disagreement before overwriting it —
 			// only an ACTUAL correction is worth a WARN, not every reattach.
 			wasNonCgroup := !cgroupSupervised(rec.Supervision)
+			supervisionCorrected = wasNonCgroup
 			rec.Supervision = SupervisionCgroup
 			if rec.Status == StatusPaused {
 				// A paused VM has no live process — this is a mid-resume
@@ -2442,7 +2447,16 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// reattach (the gate is open, so deletes race the background pass); otherwise
 	// undo the in-memory reattach.
 	if rec.Status == StatusPaused {
-		if m.recordDeleted(rec.ID) {
+		// The paused branch is deliberately read-only (no mass rewrite of
+		// every paused record at startup) — except a supervision correction,
+		// which must land durably or a second restart resolves the record
+		// back to unit.
+		if supervisionCorrected {
+			if !m.persistStateIfPresent(inst) {
+				m.undoReattach(rec.ID)
+				return nil, false
+			}
+		} else if m.recordDeleted(rec.ID) {
 			m.undoReattach(rec.ID)
 			return nil, false
 		}

@@ -1,10 +1,12 @@
 package vm
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -32,7 +34,10 @@ func newGuardWorld(t *testing.T) *guardWorld {
 		"/etc/sandbox/vmd.env": filepath.Join(dir, "vmd.env"),
 		"/sys/fs/cgroup":       filepath.Join(dir, "cgfs"),
 	} {
-		rewritten = replaceAllOrFatal(t, rewritten, from, to)
+		if !strings.Contains(rewritten, from) {
+			t.Fatalf("guard script no longer references %q — update this harness", from)
+		}
+		rewritten = strings.ReplaceAll(rewritten, from, to)
 	}
 	w.guard = filepath.Join(dir, "guard.sh")
 	if err := os.WriteFile(w.guard, []byte(rewritten), 0o755); err != nil {
@@ -45,30 +50,17 @@ func newGuardWorld(t *testing.T) *guardWorld {
 	return w
 }
 
-func replaceAllOrFatal(t *testing.T, s, from, to string) string {
+// cgroupRecordJSON is a state-file fixture built from REAL marshal bytes: the
+// guard's grep pattern is coupled to VMRecord's json tag and the
+// SupervisionCgroup value by nothing else, so hand-written JSON here would
+// keep passing after a rename that silently breaks the guard on real hosts.
+func cgroupRecordJSON(t *testing.T) string {
 	t.Helper()
-	out := ""
-	for {
-		i := indexOf(s, from)
-		if i < 0 {
-			break
-		}
-		out += s[:i] + to
-		s = s[i+len(from):]
+	b, err := json.Marshal(VMRecord{ID: "vm-1", Supervision: SupervisionCgroup})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if out == "" {
-		t.Fatalf("guard script no longer references %q — update this harness", from)
-	}
-	return out + s
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
+	return string(b)
 }
 
 // systemctl installs a PATH shim: exit rc, printing out for `show`.
@@ -162,7 +154,7 @@ func TestRollbackGuard(t *testing.T) {
 	t.Run("cgroup records at the default state path block", func(t *testing.T) {
 		w := newGuardWorld(t)
 		w.writeFile("vmd.env", "RUN_DIR="+filepath.Join(w.dir, "state", "rundir")+"\n")
-		w.writeFile("state/vmd.db", `{"id":"x","supervision":"cgroup"}`)
+		w.writeFile("state/vmd.db", cgroupRecordJSON(t))
 		if rc := w.run(oldBinary); rc == 0 {
 			t.Fatal("records at the RUN_DIR-derived path must block")
 		}
@@ -199,7 +191,7 @@ func TestRollbackGuard(t *testing.T) {
 	t.Run("double-quoted state path with a space blocks on records", func(t *testing.T) {
 		w := newGuardWorld(t)
 		w.writeFile("vmd.env", fmt.Sprintf("VMD_STATE_PATH=%q\n", filepath.Join(w.dir, "vm state", "vmd.db")))
-		w.writeFile("vm state/vmd.db", `{"supervision":"cgroup"}`)
+		w.writeFile("vm state/vmd.db", cgroupRecordJSON(t))
 		if rc := w.run(oldBinary); rc == 0 {
 			t.Fatal("a systemd-quoted path must be unquoted before the scan")
 		}
@@ -207,7 +199,7 @@ func TestRollbackGuard(t *testing.T) {
 	t.Run("single-quoted RUN_DIR derivation blocks on records", func(t *testing.T) {
 		w := newGuardWorld(t)
 		w.writeFile("vmd.env", "RUN_DIR='"+filepath.Join(w.dir, "vm state", "rundir")+"'\n")
-		w.writeFile("vm state/vmd.db", `{"supervision":"cgroup"}`)
+		w.writeFile("vm state/vmd.db", cgroupRecordJSON(t))
 		if rc := w.run(oldBinary); rc == 0 {
 			t.Fatal("a single-quoted RUN_DIR must derive the real state path")
 		}
