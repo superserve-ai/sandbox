@@ -15,6 +15,16 @@ import (
 // no live process, so only the record catches it) and fail closed on a missing
 // store rather than read it as drained.
 func TestCheckDrainedCountsCgroupRecords(t *testing.T) {
+	// CheckDrained resolves the vms unit's scope via dbus/systemctl before
+	// counting records; on a host without systemd the lookup fails closed and
+	// the count under test is never reached. Shim the definitive absent
+	// answer (unit not loaded, no scope) so the test is hermetic everywhere.
+	shim := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shim, "systemctl"), []byte("#!/bin/sh\necho \"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
+
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vmd.db")
 	store, err := OpenStateStore(path)
