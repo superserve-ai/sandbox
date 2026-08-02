@@ -15,6 +15,17 @@
 set -u
 BIN="${1:-/usr/local/bin/vmd}"
 
+# systemd strips one layer of matched quotes from EnvironmentFile values
+# before vmd sees them; the literal extraction below must do the same or a
+# quoted path resolves to a nonexistent quoted name.
+unquote() {
+    case $1 in
+        '"'*'"') set -- "${1#\"}"; printf '%s' "${1%\"}" ;;
+        "'"*"'") set -- "${1#\'}"; printf '%s' "${1%\'}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 if grep -qa cgroup-supervision "$BIN" 2>/dev/null; then
     exit 0
 fi
@@ -42,9 +53,9 @@ if [ -z "$evidence" ]; then
     # mirrors vmd's own derivation — VMD_STATE_PATH, else vmd.db beside
     # RUN_DIR — or a host with a custom RUN_DIR and only PAUSED direct-spawn
     # VMs (no live cgroups) would be scanned at the wrong path and pass.
-    STATE=$(sed -n 's/^VMD_STATE_PATH=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -1)
+    STATE=$(unquote "$(sed -n 's/^VMD_STATE_PATH=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -1)")
     if [ -z "$STATE" ]; then
-        RUN=$(sed -n 's/^RUN_DIR=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -1)
+        RUN=$(unquote "$(sed -n 's/^RUN_DIR=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -1)")
         [ -n "$RUN" ] || RUN=/var/lib/sandbox/rundir
         STATE="$(dirname "$RUN")/vmd.db"
     fi
