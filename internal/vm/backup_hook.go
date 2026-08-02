@@ -164,7 +164,7 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	case pendingEligible:
 	}
 	before, err := os.Stat(pb.DiskPath)
-	if err != nil || !m.unitConfirmedDead(rctx, pb.VMID) {
+	if err != nil || !m.vmConfirmedAtRest(rctx, pb.VMID) {
 		log.Warn().Err(err).Str("vm_id", pb.VMID).
 			Msg("pause backup rehash inconclusive; keeping pending record")
 		m.healPendingBackup(pb, log)
@@ -227,7 +227,7 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	after, err := os.Stat(pb.DiskPath)
 	if err != nil || !os.SameFile(before, after) ||
 		!before.ModTime().Equal(after.ModTime()) || before.Size() != after.Size() ||
-		!m.unitConfirmedDead(rctx, pb.VMID) {
+		!m.vmConfirmedAtRest(rctx, pb.VMID) {
 		log.Warn().Err(err).Str("vm_id", pb.VMID).
 			Msg("pause backup rehash not provably at-rest; keeping pending record")
 		m.healPendingBackup(pb, log)
@@ -518,17 +518,25 @@ func (m *Manager) pendingVerdict(vmID, snapshotPath string) pendingVerdictKind {
 // its stop attempts failed, and resume starts the unit before flipping
 // the status away from paused.
 func (m *Manager) atRest(ctx context.Context, vmID, snapshotPath string) bool {
-	return m.pausedAt(vmID, snapshotPath) && m.unitConfirmedDead(ctx, vmID)
+	return m.pausedAt(vmID, snapshotPath) && m.vmConfirmedAtRest(ctx, vmID)
 }
 
-// unitConfirmedDead consults systemd (overridable for tests via the
-// unitDead field) about whether the sandbox's unit is fully down. The
-// probe requires a terminal state: unitDefinitelyDead's weaker "not
-// active" answer calls a deactivating unit dead while its Firecracker
-// may still be flushing guest writes.
-func (m *Manager) unitConfirmedDead(ctx context.Context, vmID string) bool {
+// vmConfirmedAtRest reports whether the sandbox's Firecracker is fully
+// stopped so its artifacts are byte-stable — the at-rest proof every backup
+// gates on. Mode-aware: a unit VM needs its unit in a TERMINAL state
+// (unitFullyDown, not the weaker "not active" that calls a deactivating unit
+// dead while it may still flush guest writes); a cgroup VM needs its group
+// CONCLUSIVELY empty (cgroupDefinitelyDead — an unreadable or populated group
+// is not at rest). Without the cgroup branch a direct-spawned VM would probe
+// a nonexistent unit, read vacuously "down", and back up bytes still in
+// flight. Overridable for tests via the unitDead seam, which stands in for
+// the whole probe regardless of mode.
+func (m *Manager) vmConfirmedAtRest(ctx context.Context, vmID string) bool {
 	if m.unitDead != nil {
 		return m.unitDead(ctx, vmID)
+	}
+	if cgroupSupervised(m.supervisionForVM(vmID)) {
+		return m.cgroupDefinitelyDead(vmID)
 	}
 	return unitFullyDown(ctx, systemdUnitName(vmID))
 }

@@ -863,3 +863,48 @@ func TestStagingFallsBackAndKeepsMarkerWhenNotAtRest(t *testing.T) {
 		t.Fatalf("pending = %d, want the marker kept for a staging upgrade", len(pending))
 	}
 }
+
+// The at-rest oracle must be mode-aware: a cgroup VM has no systemd unit, so
+// the unit probe would read it vacuously dead and back up bytes still in
+// flight. A populated group is NOT at rest; a conclusively-empty one is.
+func TestVMConfirmedAtRestCgroupMode(t *testing.T) {
+	dir := t.TempDir()
+	tree := &cgroupTree{vms: dir}
+	vmID := "vm-1"
+	if err := os.MkdirAll(tree.vmCgroupDir(vmID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	events := filepath.Join(tree.vmCgroupDir(vmID), "cgroup.events")
+
+	m := &Manager{
+		log:     zerolog.Nop(),
+		cgroups: tree,
+		vms:     map[string]*VMInstance{vmID: {ID: vmID, Supervision: SupervisionCgroup}},
+	}
+
+	if err := os.WriteFile(events, []byte("populated 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if m.vmConfirmedAtRest(context.Background(), vmID) {
+		t.Fatal("a populated cgroup must not read as at-rest")
+	}
+
+	if err := os.WriteFile(events, []byte("populated 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !m.vmConfirmedAtRest(context.Background(), vmID) {
+		t.Fatal("a conclusively-empty cgroup must read as at-rest")
+	}
+
+	// Unreadable events (a non-not-exist read error) is inconclusive, never
+	// at-rest. A directory in the file's place forces that error.
+	if err := os.Remove(events); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(events, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if m.vmConfirmedAtRest(context.Background(), vmID) {
+		t.Fatal("an unreadable cgroup must not read as at-rest")
+	}
+}

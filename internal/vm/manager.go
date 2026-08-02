@@ -272,7 +272,7 @@ type Manager struct {
 	// means artifacts upload from their original paths.
 	backupStaging string
 	// unitDead overrides the systemd unit-dead probe in tests; nil means
-	// the real probe. See unitConfirmedDead.
+	// the real probe. See vmConfirmedAtRest.
 	unitDead func(ctx context.Context, vmID string) bool
 	// pendingInFlight guards one pending-backup worker per VM across the
 	// startup recovery and the periodic sweep.
@@ -873,7 +873,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// that skip through a status the at-rest checks trust, so it
 		// backs up only once the unit is confirmed dead.
 		var manifest []ManifestEntry
-		if m.unitConfirmedDead(ctx, vmID) {
+		if m.vmConfirmedAtRest(ctx, vmID) {
 			manifest = m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, log)
 		} else {
 			log.Warn().Msg("pause backup skipped on retry: unit not confirmed dead")
@@ -1045,7 +1045,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// deliberately includes a still-deactivating unit; hashing needs the
 	// stronger fully-down claim, so the gate reconfirms with the same
 	// probe the at-rest proof uses.
-	if stopConfirmed && m.unitConfirmedDead(ctx, vmID) {
+	if stopConfirmed && m.vmConfirmedAtRest(ctx, vmID) {
 		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
 	} else if m.backupEnqueue != nil {
 		log.Warn().Msg("pause backup deferred: unit not confirmed fully down, bytes may still be changing")
