@@ -19,10 +19,21 @@ if grep -qa cgroup-supervision "$BIN" 2>/dev/null; then
     exit 0
 fi
 
+# Fail closed on inspection failure: a lookup error is not evidence of
+# absence, and a survivor from the crash window between spawn and persist
+# has a cgroup but no record — if the scope cannot be read, the byte scan
+# below alone cannot clear the host.
 evidence=""
-VMS_CG=$(systemctl show -p ControlGroup --value superserve-vms.service 2>/dev/null || true)
-if [ -n "$VMS_CG" ]; then
-    child=$(find "/sys/fs/cgroup${VMS_CG}" -mindepth 1 -maxdepth 1 -type d ! -name keeper -print -quit 2>/dev/null || true)
+if ! VMS_CG=$(systemctl show -p ControlGroup --value superserve-vms.service 2>/dev/null); then
+    echo "vmd-rollback-guard: cannot inspect the delegated VM scope (systemctl failed); refusing to start a vmd without cgroup supervision" >&2
+    exit 1
+fi
+if [ -n "$VMS_CG" ] && [ -d "/sys/fs/cgroup${VMS_CG}" ]; then
+    if ! children=$(find "/sys/fs/cgroup${VMS_CG}" -mindepth 1 -maxdepth 1 -type d ! -name keeper 2>/dev/null); then
+        echo "vmd-rollback-guard: cannot read the delegated VM scope; refusing to start a vmd without cgroup supervision" >&2
+        exit 1
+    fi
+    child=$(printf '%s\n' "$children" | sed -n 1p)
     [ -n "$child" ] && evidence="live VM cgroup ${child}"
 fi
 if [ -z "$evidence" ]; then
