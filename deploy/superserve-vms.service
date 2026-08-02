@@ -30,7 +30,10 @@ TasksMax=infinity
 # — holding the ENTIRE direct population — is also one peer at the default
 # weight 100. At host saturation during mixed-mode migration that starves the
 # direct fleet to a single legacy VM's share. The maximum weight makes this
-# service weigh as much as 100 legacy peers; per-VM fairness inside the
+# service weigh as much as 100 legacy peers — a static bound that re-inverts
+# only past 100 simultaneously busy legacy VMs; if mixed-mode ever needs
+# true proportionality, the reconciler knows both populations each pass and
+# can set-property the weight dynamically. Per-VM fairness inside the
 # subtree stays with the kernel scheduler (see the slice's CPUQuota note).
 CPUWeight=10000
 IOWeight=10000
