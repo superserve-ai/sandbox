@@ -27,9 +27,16 @@ if [ -n "$VMS_CG" ]; then
 fi
 if [ -z "$evidence" ]; then
     # Literal extraction (systemd env files are literal KEY=value); dot-sourcing
-    # would execute substitutions in secret values as root.
+    # would execute substitutions in secret values as root. The fallback
+    # mirrors vmd's own derivation — VMD_STATE_PATH, else vmd.db beside
+    # RUN_DIR — or a host with a custom RUN_DIR and only PAUSED direct-spawn
+    # VMs (no live cgroups) would be scanned at the wrong path and pass.
     STATE=$(sed -n 's/^VMD_STATE_PATH=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -1)
-    [ -n "$STATE" ] || STATE=/var/lib/sandbox/vmd.db
+    if [ -z "$STATE" ]; then
+        RUN=$(sed -n 's/^RUN_DIR=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -1)
+        [ -n "$RUN" ] || RUN=/var/lib/sandbox/rundir
+        STATE="$(dirname "$RUN")/vmd.db"
+    fi
     # A byte-level scan, so a stale copy of a deleted record on a free page can
     # block a legitimately drained rollback — the safe direction. The error
     # text carries the remediation.
