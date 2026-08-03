@@ -141,31 +141,52 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 		}
 	}
 	m.cgroups = tree // existing cgroup VMs are now manageable
+
+	// The launch validations qualify every NEW FC process — a fresh create
+	// AND a cgroup record's relaunch on resume — so they run in manage-only
+	// mode too (reaching here with the flag off implies cgroup VMs exist).
+	// A failure there degrades relaunches to a refusal, never to an
+	// unvalidated spawn: e.g. a KillMode drift would let a keeper stop kill
+	// every VM resumed into the scope.
+	verr := m.validateDirectLaunchPath(ctx, tree)
+	if verr == nil {
+		m.launchPathValidated.Store(true)
+	} else if !wantArm {
+		m.log.Warn().Err(verr).Msg("direct launch path failed validation — cgroup VM resumes will refuse until repaired")
+	}
 	if !wantArm {
 		return false, nil // manage-only (rollback / drain)
 	}
+	if verr != nil {
+		return false, verr
+	}
+	m.directSpawnArmed.Store(true)
+	return true, nil
+}
 
-	// --- Arm-only: needed for NEW launches, not to manage existing VMs, so a
-	// failure gates arming without blocking manage-only. ---
-	//
-	// A dead keeper leaves the unit "failed"; refuse to arm NEW launches. The
-	// scope was still adopted above (systemd keeps a failed-but-populated unit's
+// validateDirectLaunchPath verifies everything a NEW direct-spawned process
+// depends on, beyond what managing existing ones needs: the keeper's survival
+// property, the shared memory/pids ceilings, the capped-console Firecracker,
+// and the launch tooling. Gates arming and cgroup relaunches alike.
+func (m *Manager) validateDirectLaunchPath(ctx context.Context, tree *cgroupTree) error {
+	// A dead keeper leaves the unit "failed"; refuse NEW launches. The scope
+	// was still adopted (systemd keeps a failed-but-populated unit's
 	// ControlGroup), so existing VMs stay managed — block new, service the live.
 	if !unitIsActive(ctx, vmsUnitName) {
-		return false, fmt.Errorf("%s is not active — cannot arm direct spawn", vmsUnitName)
+		return fmt.Errorf("%s is not active — cannot arm direct spawn", vmsUnitName)
 	}
 	if !unitDelegated(ctx, vmsUnitName) {
-		return false, fmt.Errorf("%s is not Delegate=yes — direct spawn needs a delegated subtree", vmsUnitName)
+		return fmt.Errorf("%s is not Delegate=yes — direct spawn needs a delegated subtree", vmsUnitName)
 	}
 	// KillMode=process on the vms service is load-bearing: a stop/restart of it
 	// must signal only the keeper, never cascade into the VM children.
 	if km := unitStringProperty(ctx, vmsUnitName, "Service", "KillMode"); km != "process" {
-		return false, fmt.Errorf("%s KillMode=%q, need \"process\" — a scope stop would kill every VM", vmsUnitName, km)
+		return fmt.Errorf("%s KillMode=%q, need \"process\" — a scope stop would kill every VM", vmsUnitName, km)
 	}
 	// sandboxes.slice is the single ceiling both legacy and direct VMs share; a
 	// drifted, missing, or ineffective cap removes the OOM reserve.
 	if !sandboxesSliceReserved() {
-		return false, fmt.Errorf("sandboxes.slice has no effective memory ceiling with a host reserve — refusing to arm")
+		return fmt.Errorf("sandboxes.slice has no effective memory ceiling with a host reserve — refusing to arm")
 	}
 	// Every direct VM's threads share the vms service's ONE pids ceiling
 	// (per-unit VMs each had their own), and systemd's derived TasksMax
@@ -181,18 +202,18 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 			if os.IsNotExist(perr) {
 				continue // pids controller not enabled at this layer: no bound
 			}
-			return false, fmt.Errorf("read %s: %w — refusing to arm", p, perr)
+			return fmt.Errorf("read %s: %w — refusing to arm", p, perr)
 		}
 		if !pidsCeilingAdequate(string(data)) {
-			return false, fmt.Errorf("%s = %q caps the fleet's shared task count — set TasksMax=infinity on %s; refusing to arm",
+			return fmt.Errorf("%s = %q caps the fleet's shared task count — set TasksMax=infinity on %s; refusing to arm",
 				p, strings.TrimSpace(string(data)), vmsUnitName)
 		}
 	}
 	// The guest console is untrusted; the only bound on its file is the
-	// Firecracker serial cap. Refuse to arm on a binary that doesn't advertise
-	// it, or a direct-spawned guest could fill the host disk.
+	// Firecracker serial cap. Refuse a binary that doesn't advertise it, or a
+	// direct-spawned guest could fill the host disk.
 	if !firecrackerAdvertisesCap(ctx, m.cfg.FirecrackerBin, "serial-console-cap") {
-		return false, fmt.Errorf("firecracker %q lacks serial-console-cap — cannot arm direct spawn", m.cfg.FirecrackerBin)
+		return fmt.Errorf("firecracker %q lacks serial-console-cap — cannot arm direct spawn", m.cfg.FirecrackerBin)
 	}
 	// directSpawnScript prepends prlimit to every launch; if it's absent from
 	// the restricted launch PATH the chain exits before Firecracker starts.
@@ -200,10 +221,9 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	// so arming refuses rather than routing every create/resume through a path
 	// that silently fails.
 	if !prlimitOnLaunchPath() {
-		return false, fmt.Errorf("prlimit not found on the direct-spawn launch PATH (%s) — every direct launch would exit before firecracker; refusing to arm", directSpawnPATH)
+		return fmt.Errorf("prlimit not found on the direct-spawn launch PATH (%s) — every direct launch would exit before firecracker; refusing to arm", directSpawnPATH)
 	}
-	m.directSpawnArmed.Store(true)
-	return true, nil
+	return nil
 }
 
 // firecrackerAdvertisesCap reports whether the firecracker binary lists cap

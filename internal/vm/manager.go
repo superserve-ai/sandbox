@@ -296,8 +296,12 @@ type Manager struct {
 	// ArmDirectSpawn succeeds. directSpawnArmed gates NEW launches onto the
 	// cgroup path — existing VMs always follow their record's Supervision
 	// regardless of the flag, so both modes coexist through the migration.
-	cgroups          *cgroupTree
-	directSpawnArmed atomic.Bool
+	// launchPathValidated reports the arm-only launch validations passed this
+	// boot; every cgroup launch (fresh or a record's relaunch) requires it,
+	// so manage-only mode never forks a new FC into an unvalidated scope.
+	cgroups             *cgroupTree
+	directSpawnArmed    atomic.Bool
+	launchPathValidated atomic.Bool
 	// reapers holds the per-VM exit channel for direct-spawned children this
 	// process owns (vmID → chan directSpawnResult, buffered 1). Kill paths
 	// wait on the channel, never on kill(0) polls — zombies answer polls.

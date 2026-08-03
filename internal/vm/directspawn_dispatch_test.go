@@ -77,6 +77,20 @@ func TestVmDefinitelyDeadInconclusiveIsAlive(t *testing.T) {
 	}
 }
 
+// A cgroup launch forks a new process, so it requires the validated launch
+// path — a cgroup record in manage-only mode (validation failed or never ran)
+// must refuse, keeping the record's mode, not fork into an unvalidated scope.
+func TestLaunchFirecrackerRefusesUnvalidatedCgroupLaunch(t *testing.T) {
+	m := &Manager{cgroups: &cgroupTree{vms: t.TempDir()}}
+	_, sup, err := m.launchFirecracker(t.Context(), "vm-1", "", "", "", "", SupervisionCgroup, true, false)
+	if err == nil {
+		t.Fatal("unvalidated launch path must refuse a cgroup relaunch")
+	}
+	if sup != SupervisionCgroup {
+		t.Fatalf("refusal must keep the record's mode, got %q", sup)
+	}
+}
+
 // Only a cgroup-supervised instance claims a per-VM dir; a unit-mode instance
 // over an empty leftover group must stay reap-eligible (see the empty-cgroup
 // reaper in runOnce).
