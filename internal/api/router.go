@@ -116,6 +116,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/sandboxes/:sandbox_id/egress_rules", h.GetSandboxEgressRules)
 		internal.GET("/teams/:team_id/sandboxes", h.ListPlatformTeamSandboxes)
 		internal.GET("/teams/:team_id/sandboxes/:sandbox_id", h.GetPlatformTeamSandbox)
+		internal.GET("/billing", h.ListPlatformBilling)
 
 		// RBAC Phase 2b platform recovery and internal team administration.
 		internal.GET("/teams/:team_id/members", h.ListPlatformTeamMembers)

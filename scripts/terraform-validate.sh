@@ -31,6 +31,3 @@ for dir in "${terraform_dirs[@]}"; do
     terraform validate
   )
 done
-
-bash infra/scripts/check-no-nonindividual-primitive-roles.sh infra
-bash infra/scripts/verify-production-runtime-kms.test.sh

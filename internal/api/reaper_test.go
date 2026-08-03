@@ -75,6 +75,16 @@ func (m *reaperMockDBTX) Query(ctx context.Context, sql string, args ...any) (pg
 }
 
 func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	// The finalize-mode probe runs before every FinalizePause; answer it
+	// centrally (legacy mode) ahead of per-test scripts, same as mockDBTX.
+	if strings.Contains(sql, "to_regclass('public.snapshot_sandbox_unique')") {
+		return &mockRow{scanFn: func(dest ...any) error {
+			if b, ok := dest[0].(*bool); ok {
+				*b = true
+			}
+			return nil
+		}}
+	}
 	if m.queryRowFn != nil {
 		return m.queryRowFn(ctx, sql, args...)
 	}
