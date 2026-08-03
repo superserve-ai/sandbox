@@ -3150,10 +3150,7 @@ func (m *Manager) supervisionForVM(vmID string) Supervision {
 
 // instanceClaimsCgroup reports whether a tracked in-memory instance exists for
 // vmID AND is cgroup-supervised. Unlike supervisionForVM it does NOT fall back
-// to the record (that is checked separately, with its own unreadable-is-owned
-// rule) and an absent instance reads as no claim — the empty-cgroup reaper uses
-// it to protect only a dir a live cgroup instance owns, letting a unit-mode
-// instance over an empty leftover group stay reap-eligible.
+// to the record or default to unit; an absent instance reads as no claim.
 func (m *Manager) instanceClaimsCgroup(vmID string) bool {
 	m.mu.RLock()
 	inst, ok := m.vms[vmID]

@@ -77,11 +77,9 @@ func TestVmDefinitelyDeadInconclusiveIsAlive(t *testing.T) {
 	}
 }
 
-// The empty-cgroup reaper protects a dir only when the tracked instance CLAIMS
-// cgroup supervision. A unit-mode instance over an empty leftover group (a
-// verify throwaway that launched cgroup-mode on an armed host, then failed the
-// rmdir) does not own the dir, so it must stay reap-eligible — otherwise the
-// leftover counts against drain-check forever.
+// Only a cgroup-supervised instance claims a per-VM dir; a unit-mode instance
+// over an empty leftover group must stay reap-eligible (see the empty-cgroup
+// reaper in runOnce).
 func TestInstanceClaimsCgroup(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{
 		"cgvm":   {Supervision: SupervisionCgroup},
