@@ -2667,9 +2667,10 @@ func (m *Manager) ReserveStartupSlots(context.Context) bool {
 // live FC would break death-before-recycle. Drift-0 releases the reservation
 // via CleanupVMOrNamespace once the FC is finally dead.
 //
-// sweepSafe is false when a live survivor's namespace could NOT be resolved
-// (or the cgroup scan failed): the sweep can't be told which ns to spare, so
-// the caller must skip it entirely rather than reclaim that live FC's tap.
+// sweepSafe is false when a possible live survivor's namespace could NOT be
+// resolved (or its record read, or the cgroup scan, failed): the sweep can't
+// be told which ns to spare, so the caller must skip it entirely rather than
+// reclaim that live FC's tap.
 func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) (protected []string, sweepSafe bool) {
 	if m.cgroups == nil || m.state == nil {
 		return nil, true // not managing cgroup VMs — no survivors to spare
@@ -2689,7 +2690,14 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) (protected []stri
 		// only in the reconciler, which runs post-gate where a build may be
 		// in-flight.
 		if has, herr := m.state.Has(id); herr != nil || has {
-			continue // recorded (reattach owns it) or unreadable (conservative)
+			if herr != nil {
+				// Unreadable: skip the kill (conservative), but this VM may be
+				// a live recordless survivor whose slot and ns are now in NO
+				// protected set — the sweep must not run on this startup.
+				sweepSafe = false
+				m.log.Warn().Err(herr).Str("vm_id", id).Msg("record lookup failed for cgroup survivor — skipping startup orphan sweep")
+			}
+			continue // recorded (reattach owns it) or unreadable
 		}
 		m.log.Warn().Str("vm_id", id).Msg("recordless cgroup survivor at startup — reaping")
 		// Capture the netns before the kill: an FC that survives it is still in

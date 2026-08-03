@@ -1143,3 +1143,22 @@ func TestInstanceRunning(t *testing.T) {
 		t.Fatal("absent instance must not report running")
 	}
 }
+
+// A failed record lookup for a cgroup survivor skips the kill but leaves the
+// VM in no protected set, so it must also disable the startup orphan sweep —
+// otherwise the sweep could reclaim a live FC's namespace.
+func TestReapRecordlessCgroupVMsUnreadableRecordDisablesSweep(t *testing.T) {
+	vms := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vms, "vm-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close() // every read now errors — the unreadable-record case
+	m := &Manager{log: zerolog.Nop(), cgroups: &cgroupTree{vms: vms}, state: store}
+	if _, sweepSafe := m.ReapRecordlessCgroupVMs(t.Context()); sweepSafe {
+		t.Fatal("unreadable record for a cgroup survivor must disable the sweep")
+	}
+}
