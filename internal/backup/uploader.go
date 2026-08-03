@@ -92,6 +92,24 @@ func (u *Uploader) Run(ctx context.Context) error {
 	if tick <= 0 {
 		tick = time.Second
 	}
+	// Claim pre-scoping verification records for the configured bucket
+	// before any lookup can miss them; idempotent after the first boot.
+	// The drain must not start until this lands: a lookup missing a
+	// still-unmigrated record would abandon a generation the record
+	// protects, so a transient failure (full disk) retries rather than
+	// being logged past.
+	for {
+		if err := u.Journal.MigrateVerificationScope(u.Store.Identity()); err == nil {
+			break
+		} else {
+			u.Log.Error().Err(err).Msg("verification scope migration failed; retrying before draining")
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(tick):
+		}
+	}
 	// Deliver completion signals a previous process acked but never
 	// notified: the outbox is the only record of those.
 	u.flushNotifications()
@@ -124,14 +142,15 @@ func (u *Uploader) Run(ctx context.Context) error {
 			// race with a crash) would otherwise wait for the next ack,
 			// which on an idle host never comes.
 			u.flushNotifications()
-			// Staged shared bases are real copies on non-reflink hosts
-			// and outlive their tasks by design; sweep them against the
-			// journal periodically, not only at boot, or a long-running
-			// host accumulates multi-GB residue.
-			if u.StagingRoot != "" && u.clock().Sub(lastSweep) > stagingSweepInterval {
-				lastSweep = u.clock()
-				SweepStaging(u.StagingRoot, u.Journal, u.Log)
-			}
+		}
+		// Staged shared bases are real copies on non-reflink hosts and
+		// outlive their tasks by design; sweep them against the journal
+		// periodically. Deliberately OUTSIDE the idle branch: a host
+		// with a standing backlog never idles, and the sweep must not
+		// starve exactly when staged residue accumulates fastest.
+		if u.StagingRoot != "" && u.clock().Sub(lastSweep) > stagingSweepInterval {
+			lastSweep = u.clock()
+			SweepStaging(u.StagingRoot, u.Journal, u.Log)
 		}
 	}
 }
@@ -300,6 +319,29 @@ const stagingSweepInterval = 30 * time.Minute
 // resume's next pause enqueues the corrective generation under a new key.
 var errSourceChanged = errors.New("backup source changed since pause")
 
+// verificationKey scopes a verification record to the destination
+// bucket: history is proof that THIS bucket holds verified bytes under
+// the name, and a host repointed at a different bucket must re-establish
+// existence by streaming rather than trusting records earned elsewhere.
+// (Deletion from the same bucket is a control-plane GC invariant: a
+// shared base may only be reaped when no manifest references it, with
+// enough grace to cover in-flight generations.)
+func (u *Uploader) verificationKey(object string) string {
+	return u.Store.Identity() + "\x00" + object
+}
+
+// verifiedHere reports whether this task or this host's history has
+// verified the object against the current bucket. Lookups are purely
+// scoped: pre-upgrade records are claimed for the then-configured
+// bucket once at startup (MigrateVerificationScope), so a later bucket
+// change correctly misses everything.
+func (u *Uploader) verifiedHere(task *Task, object string) (bool, error) {
+	if task.HasVerified(u.verificationKey(object)) {
+		return true, nil
+	}
+	return u.Journal.WasVerified(u.verificationKey(object), u.clock())
+}
+
 func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (ManifestFile, error) {
 	if file.Name == ManifestObject {
 		return ManifestFile{}, fmt.Errorf("artifact name %q collides with the manifest object", file.Name)
@@ -344,6 +386,30 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 			return ManifestFile{}, err
 		}
 	}
+	if file.Shared {
+		// Skip the stream when this host already verified these exact
+		// object bytes: shared bases are multi-GB, and every generation
+		// on the template re-references the same object, so streaming
+		// just to discover the create-only 412 at finalize would pin the
+		// bandwidth cap on redundant bytes and put the drain loop
+		// permanently behind the pause arrival rate. The local source
+		// was pre-verified above, the name embeds digest and packing
+		// fingerprint, and the extent table here describes this host's
+		// packing of content the history already vouches for.
+		verified, _ := u.verifiedHere(task, object)
+		if verified {
+			u.Log.Info().Str("object", object).
+				Msg("shared object verified previously; skipping stream")
+			return ManifestFile{
+				Name:       file.Name,
+				Object:     objectName,
+				SHA256:     file.SHA256,
+				Size:       apparent,
+				PackedSize: PackedSize(extents),
+				Extents:    extents,
+			}, nil
+		}
+	}
 	// The stream hasher digests the apparent content of what is ACTUALLY
 	// shipped (packed bytes as streamed, zeros for the holes), closing the
 	// window the pre-check cannot: a mutation while the bandwidth-capped
@@ -378,8 +444,8 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// Nack, or the retry would dedupe against history that does not
 		// exist.
 		verified := task.VerifiedObjects
-		if !task.HasVerified(object) {
-			verified = append(append([]string(nil), task.VerifiedObjects...), object)
+		if !task.HasVerified(u.verificationKey(object)) {
+			verified = append(append([]string(nil), task.VerifiedObjects...), u.verificationKey(object))
 		}
 		next := *task
 		next.VerifiedObjects = verified
@@ -390,7 +456,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// down, the whole pipeline is down with it anyway.
 		var recErr error
 		for attempt, delay := 0, 100*time.Millisecond; attempt < 3; attempt, delay = attempt+1, delay*2 {
-			if recErr = u.Journal.RecordVerification(next, object, u.clock()); recErr == nil {
+			if recErr = u.Journal.RecordVerification(next, u.verificationKey(object), u.clock()); recErr == nil {
 				break
 			}
 			time.Sleep(delay)
@@ -410,10 +476,22 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// mutated mid-stream, leaving torn bytes squatting the name) is
 		// caught by restore's mandatory digest check, and an operator
 		// re-uploads the base with admin credentials; write-only hosts
-		// cannot self-serve that check by design.
+		// cannot self-serve that check by design. Record the dedupe in
+		// the verification history so later generations skip the stream
+		// instead of re-discovering the 412 the slow way.
 		u.Log.Info().Str("object", object).
 			Msg("shared object already present; trusting content-addressed dedupe")
-	} else if !task.HasVerified(object) {
+		next := *task
+		if !next.HasVerified(u.verificationKey(object)) {
+			next.VerifiedObjects = append(append([]string(nil), task.VerifiedObjects...), u.verificationKey(object))
+		}
+		if err := u.Journal.RecordVerification(next, u.verificationKey(object), u.clock()); err != nil {
+			return ManifestFile{}, fmt.Errorf("record shared dedupe of %s: %w", object, err)
+		}
+		task.VerifiedObjects = next.VerifiedObjects
+	} else if ok, err := u.verifiedHere(task, object); err != nil {
+		return ManifestFile{}, err
+	} else if !ok {
 		// The object already existed (dedupe). Stream consumption proves
 		// nothing here: small objects buffer fully before the
 		// precondition failure arrives. The object may be a completed
@@ -423,15 +501,9 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// discriminator, and without it the generation is abandoned
 		// rather than completed over bytes nothing can vouch for (this
 		// identity cannot read them back).
-		wasVerified, err := u.Journal.WasVerified(object, u.clock())
-		if err != nil {
-			return ManifestFile{}, err
-		}
-		if !wasVerified {
-			u.Log.Warn().Str("object", object).Str("sandbox_id", task.SandboxID).
-				Msg("deduped object has no verification history; abandoning generation")
-			return ManifestFile{}, errSourceChanged
-		}
+		u.Log.Warn().Str("object", object).Str("sandbox_id", task.SandboxID).
+			Msg("deduped object has no verification history; abandoning generation")
+		return ManifestFile{}, errSourceChanged
 	}
 	return ManifestFile{
 		Name:       file.Name,
