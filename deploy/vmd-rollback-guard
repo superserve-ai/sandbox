@@ -16,8 +16,9 @@ set -u
 BIN="${1:-/usr/local/bin/vmd}"
 
 # The capable vmd records its RESOLVED state path at a fixed location at
-# startup, and arming direct spawn requires that write — so "cgroup records
-# exist but no breadcrumb" is unrepresentable. Reading it means this guard
+# startup, and both arming direct spawn AND managing existing cgroup records
+# require that write (it refuses to start otherwise) — so "cgroup records
+# exist but no current breadcrumb" is unrepresentable. Reading it means this guard
 # never parses env files (systemd's EnvironmentFile grammar — quotes,
 # escapes, continuations — belongs to systemd) and cannot disagree with the
 # daemon about where the store lives.

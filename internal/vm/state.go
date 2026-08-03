@@ -210,8 +210,9 @@ func cgroupSupervised(s Supervision) bool { return s == SupervisionCgroup }
 // StateBreadcrumbPath is the fixed, non-configurable location where vmd
 // records its RESOLVED state-store path. The host-resident rollback guard
 // reads it instead of re-deriving the path from env files, so the two can
-// never disagree about grammar; direct-spawn arming requires the write, so
-// "cgroup records exist without a breadcrumb" is unrepresentable.
+// never disagree about grammar; ArmDirectSpawn requires the write before
+// arming OR managing cgroup records, so "cgroup records exist without a
+// current breadcrumb" is unrepresentable.
 const StateBreadcrumbPath = "/var/lib/sandbox/vmd-state-path"
 
 // WriteStateBreadcrumb records the resolved state path atomically
@@ -238,6 +239,9 @@ func writeStateBreadcrumbTo(at, statePath string) error {
 type StateStore struct {
 	db *bolt.DB
 }
+
+// Path returns the resolved filesystem path of the open store.
+func (s *StateStore) Path() string { return s.db.Path() }
 
 // OpenStateStore opens (or creates) the BoltDB file at path.
 func OpenStateStore(path string) (*StateStore, error) {

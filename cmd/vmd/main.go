@@ -503,17 +503,10 @@ func main() {
 	}
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
-	// The rollback guard finds the store through this breadcrumb, never by
-	// re-deriving the path from env files — so arming must not proceed if
-	// the breadcrumb cannot be written, or records could be created that a
-	// later rollback scan would miss.
-	if err := vm.WriteStateBreadcrumb(statePath); err != nil {
-		log.Error().Err(err).Msg("cannot record the state path for the rollback guard — direct spawn will not arm")
-		mgr.DisableDirectSpawn()
-	}
 
 	// Arm direct spawn AFTER the state store is attached (hasCgroupRecords
-	// reads it to decide rollback-management) and BEFORE ReattachAll (its
+	// reads it to decide rollback-management; the rollback-guard breadcrumb
+	// is written from its resolved path) and BEFORE ReattachAll (its
 	// cgroup-orphan scan needs the delegated subtree). Arms only when the
 	// unit's config proves the survival property (Delegate + KillMode=
 	// process); a refusal degrades new launches to the unit path but still

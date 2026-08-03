@@ -54,12 +54,6 @@ type cgroupTree struct {
 // unit-supervision fallback.
 var errScopeGone = errors.New("delegated vm scope missing")
 
-// DisableDirectSpawn forces the unit path for new launches regardless of the
-// configured flag; management of existing cgroup VMs is unaffected. For
-// arming prerequisites outside ArmDirectSpawn's view (the state-path
-// breadcrumb the rollback guard depends on). Startup-only, pre-arm.
-func (m *Manager) DisableDirectSpawn() { m.cfg.DirectSpawn = false }
-
 // ArmDirectSpawn enables the cgroup launch path for NEW VMs when the flag is
 // set AND the host proves the survival property. Returns (armed, err):
 // (false, nil) flag off; (false, err) requested but a precondition failed —
@@ -122,6 +116,16 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 
 	// --- Management-critical: must hold BEFORE declaring existing cgroup VMs
 	// manageable, so manage-only mode never claims a VM it cannot stop. ---
+	// The breadcrumb first: the rollback guard finds the store only through
+	// it, and a paused fleet leaves no live cgroup dirs — the record scan is
+	// then the guard's ONLY evidence. Operating (or creating) cgroup records
+	// with a failed or stale breadcrumb would let a later rollback scan the
+	// wrong path, read "drained", and install a binary that mishandles them.
+	if m.state != nil {
+		if err := WriteStateBreadcrumb(m.state.Path()); err != nil {
+			return false, fatalIfManaging(fmt.Errorf("record state path for the rollback guard: %w", err))
+		}
+	}
 	if _, err := os.Stat(filepath.Join(cgroupMount, "cgroup.controllers")); err != nil {
 		return false, fatalIfManaging(fmt.Errorf("cgroup v2 unified hierarchy required: %w", err))
 	}
