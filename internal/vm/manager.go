@@ -1009,12 +1009,19 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	inst.mu.RUnlock()
 	stopConfirmed := true
 	stopCtx, stopCancel := context.WithTimeout(ctx, stopUnitBudget)
-	if err := m.stopVM(stopCtx, vmID, pauseSupervision); err != nil {
-		log.Warn().Err(err).Msg("stop failed during pause; retrying")
-		if serr := m.stopVM(stopCtx, vmID, pauseSupervision); serr != nil &&
-			!m.vmDefinitelyDead(stopCtx, vmID, pauseSupervision) {
+	stopErr := m.stopVM(stopCtx, vmID, pauseSupervision)
+	if stopErr != nil {
+		log.Warn().Err(stopErr).Msg("stop failed during pause")
+		// Retry only the unit path (a transient systemctl failure). The cgroup
+		// kill already SIGKILLs and waits the group empty on its own detached
+		// budget, so a second call is a redundant kill that spends a second
+		// full budget past the RPC without reviving a wedged FC.
+		if !cgroupSupervised(pauseSupervision) {
+			stopErr = m.stopVM(stopCtx, vmID, pauseSupervision)
+		}
+		if stopErr != nil && !m.vmDefinitelyDead(stopCtx, vmID, pauseSupervision) {
 			stopConfirmed = false
-			log.Error().Err(serr).Msg("VM still running after pause; reconciler will reclaim it")
+			log.Error().Err(stopErr).Msg("VM still running after pause; reconciler will reclaim it")
 		}
 	}
 	stopCancel()
