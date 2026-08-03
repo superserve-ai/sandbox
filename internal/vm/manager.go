@@ -2419,7 +2419,10 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// record with a live half-restored FC.
 	supervisionCorrected := false
 	if m.cgroups != nil {
-		if pop, perr := m.cgroups.vmCgroupPopulated(rec.ID); perr == nil && pop {
+		// An unreadable cgroup.events reads as populated (fail-closed): falling
+		// through to the stale unit mode would free networking under a live
+		// cgroup FC that the unit liveness check reads as dead.
+		if pop, perr := m.cgroups.vmCgroupPopulated(rec.ID); perr != nil || pop {
 			// Stamp cgroup mode FIRST, unconditionally: even if the kill
 			// below fails (host contention), the published record must never
 			// say unit over a live cgroup, or a later destroy stops a

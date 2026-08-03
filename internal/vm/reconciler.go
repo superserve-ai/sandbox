@@ -329,8 +329,10 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			continue // a launch/op holds the lock; re-evaluate next tick
 		}
 		// Re-check under the lock: a launch may have persisted the record or
-		// published the instance since the snapshot at the top of the pass.
-		if has, _ := r.mgr.state.Has(id); has {
+		// published the instance since the snapshot at the top of the pass. A
+		// read error reads as recorded (fail-closed) — a transient Has failure
+		// must not classify a freshly recorded live VM as recordless and kill it.
+		if has, herr := r.mgr.state.Has(id); herr != nil || has {
 			unlockOp()
 			r.clearDrift("cgrouporphan:" + id)
 			continue
