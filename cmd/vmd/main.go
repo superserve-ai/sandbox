@@ -719,12 +719,18 @@ func main() {
 	// The reap reserves the slots of survivors it couldn't confirm dead, so
 	// both the pool and the adoption pass below skip them; protectedNs carries
 	// their namespaces so the non-adoption sweep keeps them too.
-	protectedNs := mgr.ReapRecordlessCgroupVMs(ctx)
+	protectedNs, sweepSafe := mgr.ReapRecordlessCgroupVMs(ctx)
 	adoptNetPool := envOrDefault("VMD_NET_POOL_ADOPT", "false") == "true"
 	if !adoptNetPool {
 		// Under adoption, orphan namespaces are warm-pool candidates instead
 		// of garbage; the adoption pass below validates or sweeps each one.
-		mgr.SweepStartupOrphanNamespaces(protectedNs...)
+		// Skip the sweep when the reap couldn't guarantee a live survivor's
+		// ns is spared (see ReapRecordlessCgroupVMs).
+		if sweepSafe {
+			mgr.SweepStartupOrphanNamespaces(protectedNs...)
+		} else {
+			log.Warn().Msg("skipping startup orphan namespace sweep: an unresolved live cgroup survivor could be reclaimed")
+		}
 	}
 
 	// Launcher launch path, enabled per host via VMD_LAUNCH_VIA_LAUNCHER_NS.

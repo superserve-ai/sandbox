@@ -2663,16 +2663,22 @@ func (m *Manager) ReserveStartupSlots(context.Context) bool {
 // orphan sweep keeps it too. Either reclaim path recycling the slot under a
 // live FC would break death-before-recycle. Drift-0 releases the reservation
 // via CleanupVMOrNamespace once the FC is finally dead.
-func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) []string {
+//
+// sweepSafe is false when a live survivor's namespace could NOT be resolved
+// (or the cgroup scan failed): the sweep can't be told which ns to spare, so
+// the caller must skip it entirely rather than reclaim that live FC's tap.
+func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) (protected []string, sweepSafe bool) {
 	if m.cgroups == nil || m.state == nil {
-		return nil
+		return nil, true // not managing cgroup VMs — no survivors to spare
 	}
 	cgIDs, err := m.cgroups.scanVMCgroups()
 	if err != nil {
-		m.log.Warn().Err(err).Msg("failed to scan vm cgroups for recordless reap")
-		return nil
+		// Can't enumerate cgroups, so can't rule out a live survivor: the
+		// sweep must not run this startup.
+		m.log.Warn().Err(err).Msg("failed to scan vm cgroups for recordless reap — skipping startup orphan sweep")
+		return nil, false
 	}
-	var protected []string
+	sweepSafe = true
 	for _, id := range cgIDs {
 		// Build VMs ARE reaped here: pre-gate every cgroup is a previous-life
 		// survivor, and a build's cgroup is recordless (persistState omits build
@@ -2688,19 +2694,27 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) []string {
 		ns := m.netMgr.NamespaceForPID(m.cgroups.firstPID(id))
 		if serr := m.stopVM(ctx, id, SupervisionCgroup); serr != nil {
 			m.log.Error().Err(serr).Str("vm_id", id).Msg("failed to reap recordless cgroup")
-			// Only protect when the FC is not provably dead (still populated or
-			// unreadable). A confirmed-empty group whose rmdir merely failed is
-			// dead — its slot is genuinely free to reclaim.
-			if ns != "" {
-				if pop, perr := m.cgroups.vmCgroupPopulated(id); perr != nil || pop {
+			// Liveness decides first — populated or unreadable == maybe-alive.
+			// A confirmed-empty group whose rmdir merely failed is dead, its
+			// slot genuinely free to reclaim.
+			if pop, perr := m.cgroups.vmCgroupPopulated(id); perr != nil || pop {
+				if ns != "" {
 					m.netMgr.ReserveSlotsAbove(map[string]string{id: ns})
 					m.survivorNS.Store(id, ns)
 					protected = append(protected, ns)
+				} else {
+					// Alive, but its namespace couldn't be resolved (a
+					// transient /proc read), so this specific slot can't be
+					// spared by name. The one-time sweep must not run, or it
+					// would reclaim the live FC's tap; a later boot reclaims
+					// genuine orphans once the read succeeds.
+					sweepSafe = false
+					m.log.Warn().Str("vm_id", id).Msg("live recordless survivor with unresolved netns — skipping startup orphan sweep")
 				}
 			}
 		}
 	}
-	return protected
+	return protected, sweepSafe
 }
 
 // collectStartupSlots returns vmID→namespace for every record that has one, so
