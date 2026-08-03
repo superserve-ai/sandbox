@@ -426,18 +426,14 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				// build is populated (caught below) or holds the op-lock; only an
 				// empty leftover is reaped, and rmdir is non-destructive.
 				//
-				// Only a record that CLAIMS cgroup supervision owns its dir. A
-				// unit-mode record over an empty group (a verify throwaway's
-				// rmdir that failed on a paused legacy VM) is rubble no other
-				// rule reaps, yet it counts against drain-check forever.
-				// Unreadable reads as owned (conservative).
-				if cgroupOwnedByRecord(id) {
-					continue
-				}
-				r.mgr.mu.RLock()
-				_, hasInst := r.mgr.vms[id]
-				r.mgr.mu.RUnlock()
-				if hasInst {
+				// The dir is owned only if the record OR the tracked instance
+				// CLAIMS cgroup supervision. A unit-mode record/instance over an
+				// empty group (a verify throwaway's rmdir that failed on a paused
+				// legacy VM) is rubble no other rule reaps, yet it counts against
+				// drain-check forever — a live unit instance does NOT own it.
+				// Unreadable record reads as owned (conservative); the op-lock and
+				// the populated re-check below guard an in-flight cgroup launch.
+				if cgroupOwnedByRecord(id) || r.mgr.instanceClaimsCgroup(id) {
 					continue
 				}
 				if !r.gracePeriodElapsed("cgroupempty:"+id, now) {
@@ -449,16 +445,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				}
 				// Re-check under the lock: an in-flight launch may have persisted
 				// a record, published an instance, or forked FC into the group.
-				if cgroupOwnedByRecord(id) {
+				if cgroupOwnedByRecord(id) || r.mgr.instanceClaimsCgroup(id) {
 					unlockOp()
 					r.clearDrift("cgroupempty:" + id)
-					continue
-				}
-				r.mgr.mu.RLock()
-				_, hasInst = r.mgr.vms[id]
-				r.mgr.mu.RUnlock()
-				if hasInst {
-					unlockOp()
 					continue
 				}
 				if pop, perr := r.mgr.cgroups.vmCgroupPopulated(id); perr != nil || pop {
