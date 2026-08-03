@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -329,4 +330,63 @@ func keysOf(m map[string]sandboxDirInfo) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// The direct-spawn service weight must track the LIVE direct-VM count (100
+// per VM = one legacy peer each), clamp to cgroup v2's [100, 10000], skip the
+// set-property when unchanged, and only run when managing cgroup VMs.
+func TestAdjustDirectSpawnWeight(t *testing.T) {
+	orig := setUnitWeight
+	var got []int
+	setUnitWeight = func(_ context.Context, _ string, w int) error { got = append(got, w); return nil }
+	defer func() { setUnitWeight = orig }()
+
+	tree := &cgroupTree{vms: t.TempDir()} // non-nil => managing cgroup VMs
+	r := &Reconciler{mgr: &Manager{cgroups: tree, log: zerolog.Nop()}}
+
+	sup := func(ids ...string) (map[string]bool, map[string]Supervision) {
+		a := map[string]bool{}
+		s := map[string]Supervision{}
+		for _, id := range ids {
+			a[id] = true
+			s[id] = SupervisionCgroup
+		}
+		// A legacy unit in the set must NOT count toward the weight.
+		a["legacy-1"] = true
+		s["legacy-1"] = SupervisionUnit
+		return a, s
+	}
+
+	// 3 live direct VMs -> 300.
+	a, s := sup("d1", "d2", "d3")
+	r.adjustDirectSpawnWeight(context.Background(), a, s)
+	// Same count again -> no second call.
+	r.adjustDirectSpawnWeight(context.Background(), a, s)
+	// Zero direct VMs -> floor 100.
+	r.adjustDirectSpawnWeight(context.Background(), map[string]bool{"legacy-1": true}, map[string]Supervision{"legacy-1": SupervisionUnit})
+	// 200 direct VMs -> clamped to 10000.
+	many := []string{}
+	for i := 0; i < 200; i++ {
+		many = append(many, "d"+strconv.Itoa(i))
+	}
+	a2, s2 := sup(many...)
+	r.adjustDirectSpawnWeight(context.Background(), a2, s2)
+
+	want := []int{300, 100, 10000}
+	if len(got) != len(want) {
+		t.Fatalf("set-property calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("call %d weight = %d, want %d (all: %v)", i, got[i], want[i], got)
+		}
+	}
+
+	// Not managing cgroup VMs => never touches the weight.
+	got = nil
+	r2 := &Reconciler{mgr: &Manager{cgroups: nil, log: zerolog.Nop()}}
+	r2.adjustDirectSpawnWeight(context.Background(), a, s)
+	if len(got) != 0 {
+		t.Fatalf("unarmed reconciler set weight %v, want none", got)
+	}
 }

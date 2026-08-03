@@ -115,6 +115,10 @@ type Reconciler struct {
 	// prevKeptLive is the prior disk pass's protected live-sandbox count, used
 	// to detect a keep-set collapse. -1 until the first pass. Run loop only.
 	prevKeptLive int
+	// lastVmsWeight is the CPU/IO weight last applied to the direct-spawn
+	// service, so a pass that finds the same live direct-VM count skips the
+	// set-property. 0 until the first adjustment. Run loop only.
+	lastVmsWeight int
 }
 
 // NewReconciler creates a reconciler bound to a Manager.
@@ -227,6 +231,10 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 		}
 	}
+
+	// Keep the direct-spawn service's scheduling weight proportional to how
+	// many direct VMs actually compete, now that both populations are known.
+	r.adjustDirectSpawnWeight(ctx, active, supervisionOf)
 
 	// Presence convergence rides the reconcile tick: give every quiesced legacy
 	// overlay its side-car, then persist the converged marker. No-op (one
@@ -1041,6 +1049,55 @@ func dirSize(ctx context.Context, paths []string) int64 {
 		})
 	}
 	return total
+}
+
+// legacyUnitWeight is a legacy firecracker@ unit's default CPU/IO weight;
+// the direct-spawn service carries it per live direct VM (see below).
+const legacyUnitWeight = 100
+
+// maxUnitWeight is cgroup v2's cpu.weight/io.weight ceiling. Capping here past
+// ~100 live direct VMs only under-weights direct VMs — the safe direction,
+// never starving legacy.
+const maxUnitWeight = 10000
+
+// adjustDirectSpawnWeight keeps the direct-spawn service's scheduling weight
+// proportional to the number of direct VMs that actually compete (populated
+// cgroups in the running set). At legacyUnitWeight per live VM, each direct
+// VM weighs exactly one legacy peer, so the two populations share the slice
+// fairly at ANY mix — the property a static weight cannot hold, since it is
+// correct only at one population size (and over-weights direct VMs, starving
+// legacy under contention, precisely when direct VMs are few — early
+// migration). Runs each pass; set-property only fires when the count changed.
+func (r *Reconciler) adjustDirectSpawnWeight(ctx context.Context, active map[string]bool, supervisionOf map[string]Supervision) {
+	if r.mgr.cgroups == nil {
+		return // not managing cgroup VMs — the service holds only the idle keeper
+	}
+	live := 0
+	for id := range active {
+		if supervisionOf[id] == SupervisionCgroup {
+			live++
+		}
+	}
+	weight := live * legacyUnitWeight
+	if weight < legacyUnitWeight {
+		weight = legacyUnitWeight // an empty population still weighs one idle peer
+	}
+	if weight > maxUnitWeight {
+		weight = maxUnitWeight
+	}
+	if weight == r.lastVmsWeight {
+		return
+	}
+	if err := setUnitWeight(ctx, vmsUnitName, weight); err != nil {
+		// Left unrecorded so the next pass retries; the boot-time unit file
+		// value holds until it succeeds.
+		r.mgr.log.Warn().Err(err).Int("weight", weight).Int("live_direct", live).
+			Msg("reconciler: failed to set direct-spawn service weight")
+		return
+	}
+	r.mgr.log.Info().Int("weight", weight).Int("live_direct", live).
+		Msg("reconciler: adjusted direct-spawn service scheduling weight")
+	r.lastVmsWeight = weight
 }
 
 // gracePeriodElapsed records the first-seen timestamp for a drifted ID and
