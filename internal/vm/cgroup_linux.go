@@ -363,14 +363,20 @@ func adoptVmsScope(ctx context.Context) (*cgroupTree, error) {
 			return nil, fmt.Errorf("move keeper pid %d: %w", pid, err)
 		}
 	}
-	// root's subtree_control gives its children (vms/<id>/) their memory/pids
-	// files — so per-VM memory.oom.group exists and createVMCgroup succeeds.
-	// The parent sandboxes.slice already exposes memory+pids to this scope; a
-	// failure here (it does not) is a fail-closed arm refusal.
-	if err := os.WriteFile(filepath.Join(t.vms, "cgroup.subtree_control"),
-		[]byte("+memory +pids"), 0o644); err != nil {
-		return nil, fmt.Errorf("enable controllers on scope root: %w", err)
+	// root's subtree_control gives its children (vms/<id>/) their controller
+	// files. memory+pids are REQUIRED — per-VM memory.oom.group must exist or
+	// createVMCgroup fails — so a failure here is a fail-closed arm refusal.
+	subtree := filepath.Join(t.vms, "cgroup.subtree_control")
+	if err := os.WriteFile(subtree, []byte("+memory +pids"), 0o644); err != nil {
+		return nil, fmt.Errorf("enable memory/pids on scope root: %w", err)
 	}
+	// cpu+io make each per-VM cgroup its OWN scheduling domain at the default
+	// weight 100 — one peer of every other direct VM and of each legacy
+	// firecracker@ unit, the per-VM isolation adjustDirectSpawnWeight assumes.
+	// Best-effort: a kernel that can't delegate them leaves per-VM CPU to
+	// CFS (per-thread) as before, which is a fairness downgrade, not a
+	// safety one — never worth refusing to arm over.
+	_ = os.WriteFile(subtree, []byte("+cpu +io"), 0o644)
 	return t, nil
 }
 
