@@ -40,15 +40,17 @@ func (m *Manager) cgroupLaunch(existing Supervision) bool {
 // ignored on the cgroup path.
 func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error) {
 	if m.cgroupLaunch(existing) {
-		// Unit→cgroup flip: a legacy unit whose pause-stop timed out may
-		// still be live, and spawning a cgroup FC over it gives two
-		// processes one ID/tap with only the new one ever cleaned up.
+		// A prior life may have left a legacy unit live — a unit whose
+		// pause-stop timed out, or the scope-gone fallback below when vmd
+		// crashed before persisting the unit mode (so even a cgroup record
+		// doesn't prove no unit exists). Spawning a cgroup FC over it gives
+		// two processes one ID/tap with only the new one ever cleaned up.
 		// Stop, then require a terminal state (unitFullyDown, not
 		// unitDefinitelyDead): a wedged stop settles as "deactivating",
 		// which both report as stopped while the old FC is still exiting.
-		// Only for a VM with a prior life still on the unit path; fresh
-		// creates never had a unit.
-		if hadPriorLife && !cgroupSupervised(existing) {
+		// A no-op unit stop costs one D-Bus round trip; fresh creates never
+		// had a unit and skip it.
+		if hadPriorLife {
 			_ = stopUnit(ctx, systemdUnitName(vmID))
 			if !unitFullyDown(ctx, systemdUnitName(vmID)) {
 				return 0, existing, fmt.Errorf("legacy unit for %s not fully down; refusing cgroup launch", vmID)
