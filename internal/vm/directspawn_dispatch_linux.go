@@ -42,13 +42,12 @@ func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVM
 	if m.cgroupLaunch(existing) {
 		// Unit→cgroup flip: a legacy unit whose pause-stop timed out may
 		// still be live, and spawning a cgroup FC over it gives two
-		// processes one ID/tap with only the new one ever cleaned up. Stop
-		// and require a TERMINAL state before launching. unitFullyDown, not
-		// unitDefinitelyDead: a wedged stop settles as "deactivating", which
-		// both stopUnit and unitDefinitelyDead report as stopped while the
-		// old FC can still be exiting — only inactive/failed/not-loaded
-		// proves no process remains. Only for a VM with a prior life still
-		// on the unit path; fresh creates never had a unit.
+		// processes one ID/tap with only the new one ever cleaned up.
+		// Stop, then require a terminal state (unitFullyDown, not
+		// unitDefinitelyDead): a wedged stop settles as "deactivating",
+		// which both report as stopped while the old FC is still exiting.
+		// Only for a VM with a prior life still on the unit path; fresh
+		// creates never had a unit.
 		if hadPriorLife && !cgroupSupervised(existing) {
 			_ = stopUnit(ctx, systemdUnitName(vmID))
 			if !unitFullyDown(ctx, systemdUnitName(vmID)) {
