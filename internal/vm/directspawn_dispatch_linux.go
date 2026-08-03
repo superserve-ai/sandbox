@@ -40,12 +40,10 @@ func (m *Manager) cgroupLaunch(existing Supervision) bool {
 // ignored on the cgroup path.
 func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error) {
 	if m.cgroupLaunch(existing) {
-		// Every cgroup launch forks a NEW process, so it needs the validated
-		// launch path — arming implies it, but a cgroup record reaches here
-		// in manage-only mode too, where the validations may have failed or
-		// never run (flag off). Refuse rather than fork into an unvalidated
-		// scope; the record and the paused VM are untouched, and the arm-time
-		// log names the repair.
+		// Arming implies the validated launch path, but a cgroup record
+		// reaches here in manage-only mode too, where validation may have
+		// failed or never run (flag off). Refuse — the record and the
+		// paused VM stay untouched; the arm-time log names the repair.
 		if !m.launchPathValidated.Load() {
 			return 0, existing, fmt.Errorf("direct launch path not validated on this host; refusing cgroup launch for %s", vmID)
 		}

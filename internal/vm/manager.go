@@ -296,9 +296,9 @@ type Manager struct {
 	// ArmDirectSpawn succeeds. directSpawnArmed gates NEW launches onto the
 	// cgroup path — existing VMs always follow their record's Supervision
 	// regardless of the flag, so both modes coexist through the migration.
-	// launchPathValidated reports the arm-only launch validations passed this
-	// boot; every cgroup launch (fresh or a record's relaunch) requires it,
-	// so manage-only mode never forks a new FC into an unvalidated scope.
+	// launchPathValidated reports the launch validations passed this boot;
+	// every cgroup launch (fresh or relaunch) requires it — see
+	// validateDirectLaunchPath.
 	cgroups             *cgroupTree
 	directSpawnArmed    atomic.Bool
 	launchPathValidated atomic.Bool

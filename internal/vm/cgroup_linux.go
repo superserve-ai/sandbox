@@ -142,12 +142,10 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	}
 	m.cgroups = tree // existing cgroup VMs are now manageable
 
-	// The launch validations qualify every NEW FC process — a fresh create
-	// AND a cgroup record's relaunch on resume — so they run in manage-only
-	// mode too (reaching here with the flag off implies cgroup VMs exist).
-	// A failure there degrades relaunches to a refusal, never to an
-	// unvalidated spawn: e.g. a KillMode drift would let a keeper stop kill
-	// every VM resumed into the scope.
+	// Run the launch validations in manage-only mode too (flag off here
+	// implies cgroup VMs exist): a record's relaunch forks a new FC just
+	// like a fresh create, and a failure must refuse it, never spawn
+	// unvalidated.
 	verr := m.validateDirectLaunchPath(ctx, tree)
 	if verr == nil {
 		m.launchPathValidated.Store(true)
