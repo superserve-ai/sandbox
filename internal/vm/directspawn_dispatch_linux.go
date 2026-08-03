@@ -65,6 +65,13 @@ func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVM
 			pid, err = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, basePath, netNS, fallbackFresh)
 			return pid, SupervisionUnit, err
 		}
+		if err != nil && !m.cgroupStillLive(vmID) {
+			// Launch failed with no surviving cgroup (startFirecrackerDirect
+			// cleans up on every error path): claiming cgroup would persist a
+			// StatusError record for a nonexistent cgroup that blocks
+			// drain-check. Keep the prior mode.
+			return pid, existing, err
+		}
 		return pid, SupervisionCgroup, err
 	}
 	pid, err = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, perVMRootfs, basePath, netNS, freshUnit)
