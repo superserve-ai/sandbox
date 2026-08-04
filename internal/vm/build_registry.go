@@ -81,6 +81,21 @@ func (m *Manager) initBuildRegistry() {
 // unique buildVMID per BuildTemplate invocation.
 func (m *Manager) registerBuild(buildVMID, templateID string, cancel context.CancelFunc) (*buildRecord, error) {
 	m.initBuildRegistry()
+	// An adoption reconcile for this template+build may be mid-flight
+	// with stamped-metadata writes pending; cancel it and AWAIT its exit
+	// before admitting the new build, so a stale reconcile can never
+	// stamp or enqueue over the new build's metadata. Cancellation
+	// propagates into its hashing, so the wait is short; a reconcile
+	// that will not die refuses the registration rather than racing it.
+	if v, ok := m.adoptedBuildBackups.Load(templateID + "\x00" + buildVMID); ok {
+		h := v.(*reconcileHandle)
+		h.cancel()
+		select {
+		case <-h.done:
+		case <-time.After(30 * time.Second):
+			return nil, fmt.Errorf("build %s blocked on an unfinished backup reconcile", buildVMID)
+		}
+	}
 	m.buildsMu.Lock()
 	defer m.buildsMu.Unlock()
 	if existing, ok := m.builds[buildVMID]; ok && !existing.Status.IsTerminal() {
@@ -204,7 +219,14 @@ func (m *Manager) GetBuildStatus(buildVMID string) (BuildStatusSnapshot, bool) {
 	}
 	m.buildsMu.RUnlock()
 	// Not in memory — consult durable artifacts on disk (no lock held).
-	return loadDurableBuild(m.cfg.SnapshotDir, buildVMID)
+	snap, ok := loadDurableBuild(m.cfg.SnapshotDir, buildVMID)
+	if ok {
+		// An adopted build finished under a previous vmd process, which may
+		// have exited before enqueueing it for backup; make sure the
+		// journal knows about it (idempotent, async).
+		m.reconcileAdoptedBuildBackup(snap)
+	}
+	return snap, ok
 }
 
 // loadDurableBuild adopts a completed build from its on-disk artifacts. To
@@ -234,7 +256,7 @@ func buildArtifactsPresent(r *BuildTemplateResult) bool {
 	if r == nil || r.SnapshotPath == "" || r.MemFilePath == "" {
 		return false
 	}
-	for _, p := range []string{r.SnapshotPath, r.MemFilePath, r.BasePath, r.DeltaPath, r.RootfsPath} {
+	for _, p := range r.declaredArtifactPaths() {
 		if p == "" {
 			continue
 		}
