@@ -226,6 +226,22 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 	if err := syncRootDir(root); err != nil {
 		return fail(fmt.Errorf("sync dest dir: %w", err))
 	}
+	// The destination's own dirent lives in its PARENT: without syncing
+	// it, a freshly created destDir can vanish wholesale on power loss
+	// after success was reported, even though its contents were durable.
+	absDest, err := filepath.Abs(destDir)
+	if err != nil {
+		return fail(fmt.Errorf("resolve dest for parent sync: %w", err))
+	}
+	if parent, err := os.Open(filepath.Dir(absDest)); err == nil {
+		serr := parent.Sync()
+		parent.Close()
+		if serr != nil {
+			return fail(fmt.Errorf("sync dest parent: %w", serr))
+		}
+	} else {
+		return fail(fmt.Errorf("open dest parent for sync: %w", err))
+	}
 	report("restore complete: %d files and completion marker durable", len(manifest.Files))
 	return manifest, nil
 }

@@ -566,12 +566,13 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) (bool, bo
 	files := make([]backup.TaskFile, 0, len(manifest))
 	for _, e := range manifest {
 		files = append(files, backup.TaskFile{
-			Name:       e.FileName,
-			Path:       e.Path,
-			SHA256:     e.SHA256,
-			Size:       e.SizeBytes,
-			BasePath:   e.BasePath,
-			BaseSHA256: e.BaseSHA256,
+			Name:           e.FileName,
+			Path:           e.Path,
+			SHA256:         e.SHA256,
+			Size:           e.SizeBytes,
+			BasePath:       e.BasePath,
+			BaseStagedPath: e.BaseStagedPath,
+			BaseSHA256:     e.BaseSHA256,
 		})
 	}
 	if !pauseManifestComplete(manifest) {
@@ -677,7 +678,7 @@ func manifestWithTaskPaths(manifest []ManifestEntry, task backup.Task) []Manifes
 	for i, e := range out {
 		if f, ok := byName[e.FileName]; ok {
 			out[i].Path = f.Path
-			out[i].BasePath = f.BasePath
+			out[i].BaseStagedPath = f.BaseStagedPath
 		}
 	}
 	return out
@@ -691,7 +692,7 @@ func taskFullyStaged(root string, task backup.Task) bool {
 		if !strings.HasPrefix(f.Path, prefix) {
 			return false
 		}
-		if f.BasePath != "" && !strings.HasPrefix(f.BasePath, prefix) {
+		if f.BasePath != "" && !strings.HasPrefix(f.BaseStagedPath, prefix) {
 			return false
 		}
 	}
@@ -704,12 +705,13 @@ func rebuildTask(vmID string, manifest []ManifestEntry) backup.Task {
 	files := make([]backup.TaskFile, 0, len(manifest))
 	for _, e := range manifest {
 		files = append(files, backup.TaskFile{
-			Name:       e.FileName,
-			Path:       e.Path,
-			SHA256:     e.SHA256,
-			Size:       e.SizeBytes,
-			BasePath:   e.BasePath,
-			BaseSHA256: e.BaseSHA256,
+			Name:           e.FileName,
+			Path:           e.Path,
+			SHA256:         e.SHA256,
+			Size:           e.SizeBytes,
+			BasePath:       e.BasePath,
+			BaseStagedPath: e.BaseStagedPath,
+			BaseSHA256:     e.BaseSHA256,
 		})
 	}
 	return backup.Task{

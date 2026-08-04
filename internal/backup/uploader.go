@@ -220,13 +220,19 @@ func (u *Uploader) flushNotifications() {
 // base image. Size comes from the live file: the digest check subsumes
 // it (a size change changes the digest).
 func baseTaskFile(file TaskFile) (TaskFile, error) {
-	fi, err := os.Stat(file.BasePath)
+	// Read from the staged snapshot when one exists; BasePath stays the
+	// recorded identity either way.
+	src := file.BasePath
+	if file.BaseStagedPath != "" {
+		src = file.BaseStagedPath
+	}
+	fi, err := os.Stat(src)
 	if err != nil {
 		return TaskFile{}, err
 	}
 	return TaskFile{
 		Name:   SharedBaseName(file.BaseSHA256),
-		Path:   file.BasePath,
+		Path:   src,
 		SHA256: file.BaseSHA256,
 		Size:   fi.Size(),
 		Shared: true,

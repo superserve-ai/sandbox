@@ -1070,3 +1070,52 @@ func TestRestoreLegacyGenerationBoundsInflatedSize(t *testing.T) {
 		t.Fatalf("err = %v, want size bound rejection", err)
 	}
 }
+
+// A copy-fallback staged task uploads from staged snapshots while the
+// manifest records the pause-time BasePath identity: the generation key
+// recomputation at restore must accept it. This pins the contract that
+// staging never mutates key-covered fields.
+func TestRestoreValidatesStagedCopyFallbackGeneration(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	base := filepath.Join(dir, "base.ext4")
+	overlay := filepath.Join(dir, "overlay.ext4")
+	if err := os.WriteFile(base, []byte("base image bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(overlay, []byte("overlay bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseSum := sha256.Sum256([]byte("base image bytes"))
+	osum := sha256.Sum256([]byte("overlay bytes"))
+
+	files := []TaskFile{{
+		Name: "rootfs.ext4", Path: overlay,
+		SHA256: hex.EncodeToString(osum[:]), Size: int64(len("overlay bytes")),
+		BasePath: base, BaseSHA256: hex.EncodeToString(baseSum[:]),
+	}}
+	task := Task{
+		SandboxID: "sb", Generation: GenerationKey(files), Files: files,
+		EnqueuedAt: time.Unix(1, 0),
+	}
+	// Key computed, THEN staged: the copy-fallback ordering.
+	if err := StageTask(staging, &task); err != nil {
+		t.Fatal(err)
+	}
+
+	j, _ := testJournal(t)
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store}
+	if completed, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
+		t.Fatalf("upload: completed=%v err=%v", completed, err)
+	}
+
+	dest := filepath.Join(dir, "restored")
+	if _, err := RestoreGeneration(context.Background(), &memBlobs{objects: store.objects}, "sb", task.Generation, dest, nil); err != nil {
+		t.Fatalf("restore of staged generation rejected: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "rootfs.ext4"))
+	if err != nil || string(got) != "overlay bytes" {
+		t.Fatalf("restored overlay = %q err=%v", got, err)
+	}
+}
