@@ -605,6 +605,8 @@ func (h *Handlers) logPreviewTokenRotationActivity(reqCtx context.Context, sandb
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
 	defer cancel()
+	// Direct write, not writeActivity: this one is synchronous in the request
+	// (audit-before-response) and must not queue behind bulk lifecycle logging.
 	if _, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
 		SandboxID:    pgtype.UUID{Bytes: sandbox.ID, Valid: true},
 		ResourceType: "sandbox",
