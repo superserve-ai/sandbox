@@ -1566,14 +1566,10 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	// against the stale baseline and miss pages dirtied between resume and this
 	// ad-hoc snapshot. Forces the next pause back to Full.
 	//
-	// In-memory only, deliberately: DirtyTracked is not part of VMRecord (it
-	// describes the live Firecracker process, which a fresh resume re-arms),
-	// so persisting here would write a record identical to the durable one —
-	// no gain, and this path holds no vm-op lock, so that write would be a
-	// full-record clobber able to resurrect fields a concurrent lifecycle op
-	// just changed (Unverified being the one that costs). Adding a persisted
-	// field that this path mutates means giving it the lock first; see
-	// TestToRecordIgnoresDirtyTracked.
+	// Not persisted, deliberately: DirtyTracked is not in VMRecord, so a write
+	// here would duplicate the durable record while clobbering fields a
+	// concurrent lifecycle op just changed — this path holds no vm-op lock.
+	// Persisting from here needs that lock; see TestToRecordIgnoresDirtyTracked.
 	inst.mu.Lock()
 	inst.DirtyTracked = false
 	inst.mu.Unlock()
