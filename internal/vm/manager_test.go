@@ -1189,3 +1189,26 @@ func TestResumeReadyOrAbortAbortsOnGenuineFailure(t *testing.T) {
 		t.Fatalf("genuine failure must abort the resume (revert to Paused), got %s", st)
 	}
 }
+
+// A VM inside DestroyVM's teardown window must not be lazily reattached: doing
+// so would rebind the slot destroy is freeing and hand a live pointer to a
+// recycling IP (the credential-delivery / cross-tenant hazard).
+func TestGetInstanceRefusesResurrectionDuringDestroy(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5", Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{}, vms: map[string]*VMInstance{}}
+
+	m.destroying.Store("vm-1", struct{}{})
+	if _, err := m.getInstance("vm-1"); err == nil {
+		t.Fatal("a VM mid-destroy must not be lazily reattached")
+	}
+	if _, tracked := m.vms["vm-1"]; tracked {
+		t.Fatal("a VM mid-destroy must not be republished to m.vms")
+	}
+}

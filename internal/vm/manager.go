@@ -322,6 +322,14 @@ type Manager struct {
 	// holds the lock until destroy SIGKILLs the process), so blocking it
 	// would turn a recoverable wedge into a permanent hang.
 	vmOpLocks sync.Map
+
+	// destroying holds the vmIDs currently inside DestroyVM, from just before
+	// the slot is freed until teardown completes. A lazy getInstance skips
+	// reattaching a listed VM: without this, a request that misses m.vms
+	// mid-destroy (exec, preview, inject) would reattach the record, rebind
+	// the freed slot, and hand a live pointer to an IP the pool is recycling.
+	// Keyed vmID → struct{}{}; entries are always removed when destroy returns.
+	destroying sync.Map
 }
 
 // trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
@@ -759,6 +767,12 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	if sockPath != "" {
 		_ = os.Remove(sockPath)
 	}
+
+	// Block a concurrent lazy reattach from resurrecting this VM and rebinding
+	// its slot the moment we free it (see the destroying field). Held through
+	// the map/record delete below.
+	m.destroying.Store(vmID, struct{}{})
+	defer m.destroying.Delete(vmID)
 
 	m.netMgr.CleanupVMOrNamespace(vmID, ns)
 
@@ -2387,6 +2401,12 @@ func (m *Manager) reattachByID(vmID string, cleanupStale bool) *VMInstance {
 		m.mu.RUnlock()
 		if ok {
 			return inst, nil
+		}
+		// A VM being destroyed must not be resurrected from its record: the
+		// slot is (or is about to be) freed, so reattaching would rebind a
+		// recycling IP. The record delete finishes the teardown.
+		if _, destroying := m.destroying.Load(vmID); destroying {
+			return (*VMInstance)(nil), nil
 		}
 		rec, err := m.state.Get(vmID)
 		if err != nil || rec == nil {
