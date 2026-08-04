@@ -128,19 +128,29 @@ func (p persistedPreviewPolicy) MarshalJSON() ([]byte, error) {
 // It contains everything VMD needs to reconstruct its in-memory map on
 // startup and reattach to a live Firecracker process.
 type VMRecord struct {
-	ID           string   `json:"id"`
-	PID          int      `json:"pid"`
-	SocketPath   string   `json:"socket_path"`
-	VsockPath    string   `json:"vsock_path,omitempty"`
-	IP           string   `json:"ip"`
-	TAPDevice    string   `json:"tap_device"`
-	MACAddress   string   `json:"mac_address"`
-	Status       VMStatus `json:"status"`
-	RunDirID     string   `json:"rundir_id"`
-	Namespace    string   `json:"namespace"`
-	DiskPath     string   `json:"disk_path"`
-	SnapshotPath string   `json:"snapshot_path,omitempty"`
-	MemFilePath  string   `json:"mem_file_path,omitempty"`
+	ID         string   `json:"id"`
+	PID        int      `json:"pid"`
+	SocketPath string   `json:"socket_path"`
+	VsockPath  string   `json:"vsock_path,omitempty"`
+	IP         string   `json:"ip"`
+	TAPDevice  string   `json:"tap_device"`
+	MACAddress string   `json:"mac_address"`
+	Status     VMStatus `json:"status"`
+	// Unverified marks a Running record persisted before boxd readiness was
+	// confirmed (the persist overlaps the wait). Absent/false — including on
+	// every record from before the field — means verified; a background
+	// persist clears it right after verification, so a durable true means a
+	// crash before readiness was proven. Both restore and resume adoption
+	// re-verify such records before adopting (clearing the marker on
+	// success), a pause clears it (a snapshotted guest was provably live),
+	// and a resume relaunch verifies readiness synchronously before
+	// clearing it.
+	Unverified   bool   `json:"unverified,omitempty"`
+	RunDirID     string `json:"rundir_id"`
+	Namespace    string `json:"namespace"`
+	DiskPath     string `json:"disk_path"`
+	SnapshotPath string `json:"snapshot_path,omitempty"`
+	MemFilePath  string `json:"mem_file_path,omitempty"`
 	// Persisted so a layered (diff-overlay) sandbox resumes correctly after a vmd
 	// restart: non-empty means MemFilePath is an overlay to be served over this
 	// base. Without it, resume would load the overlay standalone and read the
@@ -500,6 +510,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		TAPDevice:                  inst.TAPDevice,
 		MACAddress:                 inst.MACAddress,
 		Status:                     inst.Status,
+		Unverified:                 inst.Unverified,
 		RunDirID:                   inst.RunDirID,
 		Namespace:                  inst.Namespace,
 		DiskPath:                   inst.DiskPath,
@@ -585,6 +596,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		TAPDevice:                  rec.TAPDevice,
 		MACAddress:                 rec.MACAddress,
 		Status:                     rec.Status,
+		Unverified:                 rec.Unverified,
 		RunDirID:                   rec.RunDirID,
 		Namespace:                  rec.Namespace,
 		DiskPath:                   rec.DiskPath,

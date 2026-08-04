@@ -73,6 +73,12 @@ type ReconcilerConfig struct {
 	// DiskTrashRetention is how long a quarantined dir soaks under .trash before
 	// it is permanently removed — the window to spot and reverse a bad reclaim.
 	DiskTrashRetention time.Duration
+	// UnverifiedOrphanGrace is how long a crash-window orphan (a Running but
+	// unverified record behind a live unit) is left alone before the
+	// reconciler stops it. Deliberately far longer than the default grace:
+	// a retry ADOPTS such a VM and keeps the guest's work, so the reaper must
+	// lose that race — it exists only for orphans nobody ever comes back for.
+	UnverifiedOrphanGrace time.Duration
 }
 
 // DefaultReconcilerConfig returns sensible defaults from the design doc.
@@ -87,6 +93,9 @@ func DefaultReconcilerConfig() ReconcilerConfig {
 		DiskReclaimEnabled: false,
 		DiskDeleteBudget:   50,
 		DiskTrashRetention: 72 * time.Hour,
+		// An hour outlasts any live retry loop (the control plane's own
+		// retries are seconds), so adoption always gets first claim.
+		UnverifiedOrphanGrace: time.Hour,
 	}
 }
 
@@ -513,6 +522,67 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
+	// Drift 7b: a crash-window orphan nobody came back for. A restore that
+	// died between its optimistic persist and the verified one leaves a
+	// Running-but-unverified record behind a live unit; the control plane
+	// reverts its row to paused, and Drift 7 then defers forever because the
+	// record says Running. Unverified is what makes that deference wrong:
+	// readiness was never proven, so Running is a claim, not evidence.
+	//
+	// Runs on UnverifiedOrphanGrace, not the default — see that field for why
+	// this rule must lose the race with adoption. The sandbox row and its
+	// snapshot are untouched: only the orphaned process and its slot go, so a
+	// later resume still restores cleanly.
+	if dbSandboxes != nil {
+		for id := range active {
+			sb, known := dbSandboxes[id]
+			if !known || sb.Sandbox.Status != db.SandboxStatusPaused || !r.mgr.instanceUnverifiedRunning(id) {
+				r.clearDrift("unverifiedorphan:" + id)
+				continue
+			}
+			if !r.graceElapsed("unverifiedorphan:"+id, now, r.cfg.UnverifiedOrphanGrace) {
+				continue
+			}
+			// Same discipline as Drift 7: lock before spending budget, then
+			// re-check under it — an adoption completing mid-pass clears the
+			// marker, and stopping then would kill a healed VM.
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			if !r.mgr.instanceUnverifiedRunning(id) {
+				unlockOp()
+				r.clearDrift("unverifiedorphan:" + id)
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
+				r.writeAudit(ctx, id, "budget_exhausted", "unverified_orphan_stop suppressed by rate limit", "unverified_orphan_abandoned")
+				continue
+			}
+			log.Warn().Str("vm_id", id).Str("drift", "unverified_orphan_abandoned").
+				Msg("abandoned crash-window VM — stopping")
+			err := stopUnit(ctx, systemdUnitName(id))
+			if err != nil {
+				unlockOp()
+				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop abandoned crash-window unit")
+				continue
+			}
+			removeUnitDropIn(id)
+			staleErr := r.markStale(id)
+			unlockOp()
+			if staleErr != nil {
+				// The unit is stopped but the record, its map entry and its slot
+				// survive, and no rule matches an inactive unit. Report the
+				// partial cleanup rather than an orphan_stop that did not happen.
+				r.writeAudit(ctx, id, "stale_cleanup_failed", "unit stopped but record not deleted", "unverified_orphan_abandoned")
+				continue
+			}
+			r.writeAudit(ctx, id, "orphan_stop", "crash-window VM never adopted", "unverified_orphan_abandoned")
+			r.clearDrift("unverifiedorphan:" + id)
+		}
+	}
+
 	// Drift 4: DB says paused, snapshot file missing on disk → mark failed.
 	if dbSandboxes != nil {
 		for id, sb := range dbSandboxes {
@@ -932,6 +1002,12 @@ func dirSize(ctx context.Context, paths []string) int64 {
 // transient states (e.g. VMD just started a VM and systemd hasn't fully
 // registered it yet).
 func (r *Reconciler) gracePeriodElapsed(key string, now time.Time) bool {
+	return r.graceElapsed(key, now, r.cfg.GracePeriod)
+}
+
+// graceElapsed is gracePeriodElapsed with an explicit window, for drifts whose
+// safe wait differs from the default (see UnverifiedOrphanGrace).
+func (r *Reconciler) graceElapsed(key string, now time.Time, window time.Duration) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	firstSeen, ok := r.driftSeen[key]
@@ -939,7 +1015,7 @@ func (r *Reconciler) gracePeriodElapsed(key string, now time.Time) bool {
 		r.driftSeen[key] = now
 		return false
 	}
-	return now.Sub(firstSeen) >= r.cfg.GracePeriod
+	return now.Sub(firstSeen) >= window
 }
 
 // clearDrift removes a drift marker once the VM returns to a healthy state.
@@ -1063,7 +1139,12 @@ func (r *Reconciler) refundAutoFailSlot() {
 // markStale deletes the stale BoltDB entry and drops the VM from the
 // in-memory map. The VM is already gone in reality; this just cleans up
 // VMD's cache.
-func (r *Reconciler) markStale(vmID string) {
+//
+// A non-nil error means nothing was cleaned up. Rules that stop the unit
+// before calling this must not report success on one: stopping the unit
+// retires the very condition their next pass matches on, so the record is
+// left for the startup reattach sweep rather than another pass.
+func (r *Reconciler) markStale(vmID string) error {
 	// Capture the namespace before deleting the record: a VM whose teardown
 	// didn't run (e.g. a vmd timeout mid-DELETE) would otherwise leak its slot.
 	var namespace string
@@ -1071,13 +1152,12 @@ func (r *Reconciler) markStale(vmID string) {
 		namespace = rec.Namespace
 	}
 
-	// Delete from BoltDB first. If this fails, keep the in-memory entry
-	// so the state stays consistent — the reconciler will retry on the
-	// next run. Deleting from the map before BoltDB would cause
-	// ReattachAll to resurrect the stale record on next restart.
+	// Delete from BoltDB first. Deleting from the map before BoltDB would
+	// cause ReattachAll to resurrect the stale record on next restart, so a
+	// failure here abandons the whole cleanup rather than half-applying it.
 	if err := r.mgr.state.Delete(vmID); err != nil {
-		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to delete stale state, will retry")
-		return
+		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to delete stale state")
+		return err
 	}
 
 	r.mgr.mu.Lock()
@@ -1095,4 +1175,5 @@ func (r *Reconciler) markStale(vmID string) {
 
 	r.mgr.log.Warn().Str("component", "reconciler").Str("vm_id", vmID).
 		Str("action", "mark_stale").Msg("reconciler: cleaned up stale VM record")
+	return nil
 }
