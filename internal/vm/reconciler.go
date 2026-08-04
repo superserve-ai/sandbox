@@ -569,8 +569,15 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				continue
 			}
 			removeUnitDropIn(id)
-			r.markStale(id)
+			staleErr := r.markStale(id)
 			unlockOp()
+			if staleErr != nil {
+				// The unit is stopped but the record, its map entry and its slot
+				// survive, and no rule matches an inactive unit. Report the
+				// partial cleanup rather than an orphan_stop that did not happen.
+				r.writeAudit(ctx, id, "stale_cleanup_failed", "unit stopped but record not deleted", "unverified_orphan_abandoned")
+				continue
+			}
 			r.writeAudit(ctx, id, "orphan_stop", "crash-window VM never adopted", "unverified_orphan_abandoned")
 			r.clearDrift("unverifiedorphan:" + id)
 		}
@@ -1132,7 +1139,12 @@ func (r *Reconciler) refundAutoFailSlot() {
 // markStale deletes the stale BoltDB entry and drops the VM from the
 // in-memory map. The VM is already gone in reality; this just cleans up
 // VMD's cache.
-func (r *Reconciler) markStale(vmID string) {
+//
+// A non-nil error means nothing was cleaned up. Rules that stop the unit
+// before calling this must not report success on one: stopping the unit
+// retires the very condition their next pass matches on, so the record is
+// left for the startup reattach sweep rather than another pass.
+func (r *Reconciler) markStale(vmID string) error {
 	// Capture the namespace before deleting the record: a VM whose teardown
 	// didn't run (e.g. a vmd timeout mid-DELETE) would otherwise leak its slot.
 	var namespace string
@@ -1140,13 +1152,12 @@ func (r *Reconciler) markStale(vmID string) {
 		namespace = rec.Namespace
 	}
 
-	// Delete from BoltDB first. If this fails, keep the in-memory entry
-	// so the state stays consistent — the reconciler will retry on the
-	// next run. Deleting from the map before BoltDB would cause
-	// ReattachAll to resurrect the stale record on next restart.
+	// Delete from BoltDB first. Deleting from the map before BoltDB would
+	// cause ReattachAll to resurrect the stale record on next restart, so a
+	// failure here abandons the whole cleanup rather than half-applying it.
 	if err := r.mgr.state.Delete(vmID); err != nil {
-		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to delete stale state, will retry")
-		return
+		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to delete stale state")
+		return err
 	}
 
 	r.mgr.mu.Lock()
@@ -1164,4 +1175,5 @@ func (r *Reconciler) markStale(vmID string) {
 
 	r.mgr.log.Warn().Str("component", "reconciler").Str("vm_id", vmID).
 		Str("action", "mark_stale").Msg("reconciler: cleaned up stale VM record")
+	return nil
 }

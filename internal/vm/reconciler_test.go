@@ -390,3 +390,56 @@ func TestUnverifiedOrphanGrace(t *testing.T) {
 		}
 	})
 }
+
+// markStale's delete is the gate for the whole cleanup: the map entry and the
+// network slot only go once the record is durably gone. Callers that stop the
+// unit first retire the condition their rule matches on, so a swallowed
+// failure would be reported as a completed reap and never revisited.
+func TestMarkStaleReportsDeleteFailure(t *testing.T) {
+	newRec := func(t *testing.T) (*Reconciler, *StateStore) {
+		t.Helper()
+		st, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		if err := st.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{
+			log:   zerolog.Nop(),
+			state: st,
+			vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning, Unverified: true}},
+		}
+		return NewReconciler(m, DefaultReconcilerConfig()), st
+	}
+
+	t.Run("failure leaves the instance tracked", func(t *testing.T) {
+		r, st := newRec(t)
+		if err := st.Close(); err != nil { // the store is gone; the delete cannot land
+			t.Fatal(err)
+		}
+		if err := r.markStale("vm-1"); err == nil {
+			t.Fatal("an undeletable record must be reported, not reaped silently")
+		}
+		r.mgr.mu.RLock()
+		_, tracked := r.mgr.vms["vm-1"]
+		r.mgr.mu.RUnlock()
+		if !tracked {
+			t.Fatal("the instance must stay tracked: dropping it while the record survives lets reattach resurrect it")
+		}
+	})
+
+	t.Run("success drops the instance", func(t *testing.T) {
+		r, _ := newRec(t)
+		if err := r.markStale("vm-1"); err != nil {
+			t.Fatalf("markStale: %v", err)
+		}
+		r.mgr.mu.RLock()
+		_, tracked := r.mgr.vms["vm-1"]
+		r.mgr.mu.RUnlock()
+		if tracked {
+			t.Fatal("a deleted record must not leave its instance tracked")
+		}
+	})
+}
