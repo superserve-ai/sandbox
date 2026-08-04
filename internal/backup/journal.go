@@ -10,8 +10,12 @@ import (
 )
 
 // Priority orders upload work. Lower value uploads first: a pause or an
-// on-demand snapshot is user-visible durability; periodic checkpoints and
-// (later) memory-tier components are opportunistic and must never delay it.
+// on-demand snapshot is user-visible durability; template builds,
+// periodic checkpoints, and (later) memory-tier components are
+// recoverable or rebuildable and must never delay it. A multi-GiB
+// template upload at pause priority would head-of-line block every pause
+// backup for minutes at the bandwidth cap, and a pause is unique user
+// data while a template can be rebuilt.
 type Priority uint8
 
 const (
@@ -54,8 +58,14 @@ type TaskFile struct {
 // generation key is content-addressed, so re-running a task lands on the
 // same object names and the bucket's create-only precondition makes
 // duplicates a no-op.
+//
+// Exactly one owner is set: SandboxID for pause generations, TemplateID
+// (always with the BuildID that produced the artifacts) for template
+// builds. The owner picks the object prefix; see Task.objectName.
 type Task struct {
-	SandboxID  string     `json:"sandbox_id"`
+	SandboxID  string     `json:"sandbox_id,omitempty"`
+	TemplateID string     `json:"template_id,omitempty"`
+	BuildID    string     `json:"build_id,omitempty"`
 	Generation string     `json:"generation"`
 	Files      []TaskFile `json:"files"`
 	Priority   Priority   `json:"priority"`
@@ -116,6 +126,13 @@ var (
 	// original task was acked. Entries carry a timestamp and are pruned
 	// lazily on ack.
 	verifiedBucket = []byte("backup_verified_objects")
+	// completionsBucket records owner+generation pairs whose generation
+	// fully reached the bucket (manifest object written, task acked as
+	// completed). Kept indefinitely: rows are tiny, and this record is
+	// what lets recovery sweeps distinguish "already durable, skip" from
+	// "never made it, reconcile", without which a swept owner would be
+	// re-uploaded on every pass after its task was acked away.
+	completionsBucket = []byte("backup_completed_generations")
 )
 
 // verifiedRetention bounds how long verification history is kept. Long
@@ -135,7 +152,7 @@ var pruneCursorKey = []byte("\x00prune_cursor")
 // caller owns the bolt DB; sharing vmd's state DB keeps one fsync domain.
 func NewJournal(db *bolt.DB) (*Journal, error) {
 	err := db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket, outboxBucket} {
+		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket, outboxBucket, completionsBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -157,6 +174,16 @@ func (t *Task) readyAt() time.Time {
 	return t.EnqueuedAt
 }
 
+// owner is the task's full owner identity: the sandbox id for pause
+// generations, the template/build pair for template builds. NUL-joined so
+// the pair can never alias a sandbox id or another template's pair.
+func (t *Task) owner() string {
+	if t.TemplateID != "" {
+		return t.TemplateID + "\x00" + t.BuildID
+	}
+	return t.SandboxID
+}
+
 // key orders the queue: priority, then READINESS time, then the owner
 // and generation for uniqueness. Readiness rather than enqueue time is
 // load-bearing for outage backlogs: deferred tasks sort behind runnable
@@ -164,15 +191,19 @@ func (t *Task) readyAt() time.Time {
 // priority instead of scanning every deferred entry on each drain and
 // idle tick. The owner segment is load-bearing too: generations are
 // content-addressed, so two untouched sandboxes cloned from one template
-// share a generation, and without the owner a same-tick enqueue would
-// collide keys and silently drop one sandbox's backup.
+// (or two template builds producing identical artifacts) share a
+// generation, and without the owner a same-tick enqueue would collide
+// keys and silently drop one owner's backup.
 func (t *Task) key() []byte {
-	return []byte(fmt.Sprintf("%d/%020d/%s/%s", t.Priority, t.readyAt().UnixNano(), t.SandboxID, t.Generation))
+	return []byte(fmt.Sprintf("%d/%020d/%s/%s", t.Priority, t.readyAt().UnixNano(), t.owner(), t.Generation))
 }
 
-// indexKey is the pending-generation identity for the dedupe index.
+// indexKey is the pending-generation identity for the dedupe index. The
+// owner segment is the sandbox id or the template/build pair, so template
+// tasks dedupe on their own identity and can never collide with a sandbox
+// task sharing a generation key.
 func (t *Task) indexKey() []byte {
-	return []byte(t.SandboxID + "\x00" + t.Generation)
+	return []byte(t.owner() + "\x00" + t.Generation)
 }
 
 // Enqueue adds a task. A task for the same generation that is already
@@ -180,8 +211,14 @@ func (t *Task) indexKey() []byte {
 // upload harmless, but there is no reason to do the work twice (idempotent
 // pause retries re-enqueue the identical generation).
 func (j *Journal) Enqueue(task Task) error {
-	if task.Generation == "" || task.SandboxID == "" {
-		return fmt.Errorf("task missing identity: %+v", task)
+	if task.Generation == "" {
+		return fmt.Errorf("task missing generation: %+v", task)
+	}
+	if (task.SandboxID == "") == (task.TemplateID == "") {
+		return fmt.Errorf("task must identify exactly one of sandbox or template: %+v", task)
+	}
+	if task.TemplateID != "" && task.BuildID == "" {
+		return fmt.Errorf("template task missing build id: %+v", task)
 	}
 	if task.EnqueuedAt.IsZero() {
 		task.EnqueuedAt = time.Now().UTC()
@@ -370,6 +407,40 @@ func (j *Journal) HasPending(sandboxID, generation string) (bool, error) {
 	return ok, err
 }
 
+// WasCompleted reports whether this task's owner+generation was ever
+// acked as completed (its generation fully verified in the bucket). Only
+// the task's identity fields (owner and Generation) are consulted.
+// completionKey scopes a completion record to the destination bucket:
+// a completed generation in one bucket says nothing about another, and
+// an unscoped record would suppress re-upload after BACKUP_BUCKET
+// changes.
+func completionKey(scope string, task Task) []byte {
+	return append([]byte(scope+"\x00"), task.indexKey()...)
+}
+
+func (j *Journal) WasCompleted(scope string, task Task) (bool, error) {
+	var ok bool
+	err := j.db.View(func(tx *bolt.Tx) error {
+		ok = tx.Bucket(completionsBucket).Get(completionKey(scope, task)) != nil
+		return nil
+	})
+	return ok, err
+}
+
+// Covered reports whether this task's owner+generation needs no new
+// enqueue against the given bucket: it is either still pending in the
+// queue or already recorded as completed there. The recovery sweeps'
+// gate.
+func (j *Journal) Covered(scope string, task Task) (bool, error) {
+	var ok bool
+	err := j.db.View(func(tx *bolt.Tx) error {
+		ok = tx.Bucket(indexBucket).Get(task.indexKey()) != nil ||
+			tx.Bucket(completionsBucket).Get(completionKey(scope, task)) != nil
+		return nil
+	})
+	return ok, err
+}
+
 // WasVerified reports whether any task ever digest-verified this object
 // within the retention window.
 func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
@@ -391,12 +462,16 @@ func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
 
 // Ack removes a finished task. Called only after every object of the
 // generation is verified in the bucket (or the task was abandoned).
-// notify additionally records the task in the notification outbox within
-// the SAME transaction: the ack that makes the task's completion
-// otherwise unrecoverable is the last durable moment to remember that a
-// completion signal is still owed. Piggybacks a bounded lazy prune of
-// expired verification history.
-func (j *Journal) Ack(task Task, notify bool) error {
+// completed records the owner+generation in the durable completions
+// bucket within the SAME transaction: the ack deletes the queue row, so
+// this record is the only survivor telling recovery sweeps the
+// generation is already in the bucket. notify additionally records the
+// task in the notification outbox, likewise transactionally: the ack
+// that makes the task's completion otherwise unrecoverable is the last
+// durable moment to remember that a completion signal is still owed.
+// Piggybacks a bounded lazy prune of expired verification history.
+func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
+	completed := completedScope != ""
 	now := time.Now()
 	return j.db.Update(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(journalBucket).Delete(task.key()); err != nil {
@@ -404,6 +479,11 @@ func (j *Journal) Ack(task Task, notify bool) error {
 		}
 		if err := tx.Bucket(indexBucket).Delete(task.indexKey()); err != nil {
 			return err
+		}
+		if completed {
+			if err := tx.Bucket(completionsBucket).Put(completionKey(completedScope, task), []byte(fmt.Sprintf("%d", now.UnixNano()))); err != nil {
+				return err
+			}
 		}
 		if notify {
 			val, err := json.Marshal(task)

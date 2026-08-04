@@ -94,7 +94,6 @@ func SandboxObject(sandboxID, generation, fileName string) (string, error) {
 	return fmt.Sprintf("%s/%s/%s/%s", sandboxPrefix, sandboxID, generation, fileName), nil
 }
 
-// TemplateObject names an artifact object within a template build.
 // SharedBaseObject names a bucket-wide content-addressed base image
 // object: bases/<sha256>.p<fingerprint>. The digest addresses the bytes
 // and the fingerprint binds the extent table, so identical bases from
@@ -103,17 +102,26 @@ func SharedBaseObject(sha256, fingerprint string) string {
 	return "bases/" + sha256 + ".p" + fingerprint
 }
 
-func TemplateObject(templateID, buildID, fileName string) (string, error) {
+// TemplateObject names an artifact object within a template build
+// generation. The generation segment matters even though a finished build
+// is immutable: build ids are reusable (vmd defaults to build-<template>,
+// and a terminal build releases the id for the next rebuild), so without
+// it a rebuild would land on the previous build's prefix and create-only
+// dedupe would silently keep the stale objects.
+func TemplateObject(templateID, buildID, generation, fileName string) (string, error) {
 	if err := validSegment(templateID); err != nil {
 		return "", fmt.Errorf("template id: %w", err)
 	}
 	if err := validSegment(buildID); err != nil {
 		return "", fmt.Errorf("build id: %w", err)
 	}
+	if err := validSegment(generation); err != nil {
+		return "", fmt.Errorf("generation: %w", err)
+	}
 	if err := validSegment(fileName); err != nil {
 		return "", fmt.Errorf("file name: %w", err)
 	}
-	return fmt.Sprintf("%s/%s/%s/%s", templatePrefix, templateID, buildID, fileName), nil
+	return fmt.Sprintf("%s/%s/%s/%s/%s", templatePrefix, templateID, buildID, generation, fileName), nil
 }
 
 // validSegment rejects path traversal and separator injection in object-name

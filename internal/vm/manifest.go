@@ -7,12 +7,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/singleflight"
+
+	"github.com/superserve-ai/sandbox/internal/backup"
 )
 
 // ManifestEntry describes one durable artifact file finalized by a pause:
@@ -42,6 +46,11 @@ const (
 	hashSafetyMargin = 3 * time.Second
 	// hashBudgetCap bounds hashing when the caller has no deadline.
 	hashBudgetCap = 60 * time.Second
+	// buildHashBudget bounds hashing a finished build's artifact set. Builds
+	// are not latency-critical the way pause is, so the budget is generous:
+	// it exists to keep a wedged disk from pinning the build worker forever,
+	// not to shave seconds off the pause RPC.
+	buildHashBudget = 10 * time.Minute
 )
 
 // hashFile streams path through sha256, returning the lowercase hex digest
@@ -235,4 +244,88 @@ func baseIdentity(path string) (string, error) {
 	// change is visible there.
 	return fmt.Sprintf("%s|%d|%d|%d|%d|%d",
 		path, st.Dev, st.Ino, fi.Size(), fi.ModTime().UnixNano(), st.Ctim.Nano()), nil
+}
+
+// collectBuildManifest hashes every artifact file in a completed build's
+// snapshot directory except build.meta.json, which the caller rewrites with
+// these digests afterwards and hashes separately, plus any extraPaths that
+// live outside the directory (the overlay base image sits in the run dir
+// but is required to restore the template). Detached from the caller's
+// cancellation like collectPauseManifest: a build that already produced
+// valid artifacts should get its integrity record even if the caller gives
+// up during finalize.
+//
+// complete reports whether EVERY artifact hashed. A file that misses the
+// budget or fails to hash is skipped with a warning and flips complete to
+// false; callers building a durable generation must not publish a partial
+// set (the manifest object's presence means restorable), so they treat
+// !complete as "do not enqueue".
+func collectBuildManifest(ctx context.Context, snapshotDir string, extraPaths []string, log zerolog.Logger) (entries []ManifestEntry, complete bool) {
+	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), buildHashBudget)
+	defer cancel()
+
+	dirEntries, err := os.ReadDir(snapshotDir)
+	if err != nil {
+		log.Warn().Err(err).Str("dir", snapshotDir).Msg("build manifest: read artifact dir failed")
+		return nil, false
+	}
+	start := time.Now()
+	complete = true
+	entries = make([]ManifestEntry, 0, len(dirEntries)+len(extraPaths))
+	seen := make(map[string]string, len(dirEntries)+len(extraPaths))
+	add := func(name, path string) {
+		if prev, dup := seen[name]; dup {
+			// Same path twice is the intentional dedupe (a base copied
+			// into the snapshot dir); two different files sharing a
+			// basename is ambiguity the artifact set must not paper
+			// over, since object names are basenames.
+			if prev != path {
+				log.Warn().Str("name", name).Str("kept", prev).Str("dropped", path).
+					Msg("build manifest: basename collision between artifacts")
+				complete = false
+			}
+			return
+		}
+		seen[name] = path
+		sum, size, err := hashFile(hctx, path)
+		if err != nil {
+			log.Warn().Err(err).Str("path", path).Msg("build manifest: hash failed")
+			complete = false
+			return
+		}
+		entries = append(entries, ManifestEntry{
+			FileName:  name,
+			Path:      path,
+			SizeBytes: size,
+			SHA256:    sum,
+		})
+	}
+	for _, de := range dirEntries {
+		if !de.Type().IsRegular() || de.Name() == buildMetaFilename {
+			continue
+		}
+		// Crash residue and reserved names are not artifacts: a *.tmp is
+		// a torn writeBuildDigests replacement that the next stamp will
+		// rename away (the enqueued path would dangle), and a file named
+		// like the bucket's manifest object would collide with the
+		// generation's completion marker and poison the task.
+		if strings.HasSuffix(de.Name(), ".tmp") || de.Name() == backup.ManifestObject {
+			log.Warn().Str("name", de.Name()).
+				Msg("build manifest: skipping non-artifact file")
+			continue
+		}
+		add(de.Name(), filepath.Join(snapshotDir, de.Name()))
+	}
+	for _, p := range extraPaths {
+		if p == "" {
+			continue
+		}
+		add(filepath.Base(p), p)
+	}
+	log.Info().
+		Int("files", len(entries)).
+		Bool("complete", complete).
+		Int64("manifest_hash_ms", time.Since(start).Milliseconds()).
+		Msg("build manifest computed")
+	return entries, complete
 }

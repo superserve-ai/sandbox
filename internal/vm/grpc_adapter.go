@@ -69,14 +69,40 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 }
 
 func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) (*vmdpb.ResumeVMResponse, error) {
-	inst, err := a.mgr.ResumeVM(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath())
+	// Hold the lifecycle lock across restore + readiness gate + injection +
+	// abort: a retry that arrived mid-injection would otherwise adopt the
+	// running instance, report success, and then have it stopped by this
+	// request's abort. Under the lock the retry waits its turn instead.
+	unlockOp, err := a.mgr.lockVMOp(ctx, req.GetVmId())
+	if err != nil {
+		return nil, err
+	}
+	defer unlockOp()
+
+	inst, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath())
 	if err != nil {
 		return nil, err
 	}
 
 	// Resume is a no-op for secrets: the agent's HTTPS_PROXY (with its JWT) and
 	// per-binding proxy tokens are in the snapshot and don't need re-injection.
-	if err := postBoxdInit(ctx, inst.IP, req.GetEnvVars(), vmHostname(inst.ID)); err != nil {
+	if len(req.GetEnvVars()) == 0 {
+		// Skipping /init drops the call that doubled as the boxd liveness
+		// gate, so gate explicitly: a resume must not report success for a
+		// guest whose agent never came back. See resumeReadyOrAbort for why
+		// the gate detaches from this ctx. No hostname stamp: the guest's
+		// hostname is kernel UTS state captured in the memory snapshot (set
+		// once at create, before any pause), so restore brings it back — the
+		// same reason the control plane's stateless-resume fallback never
+		// re-stamps.
+		if err := a.mgr.resumeReadyOrAbort(ctx, req.GetVmId(), inst.IP); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "boxd not reachable after resume: %v", err)
+		}
+	} else if err := postBoxdInitRetried(context.WithoutCancel(ctx), inst.IP, req.GetEnvVars(), vmHostname(inst.ID), a.ipOwnerCheck(inst.ID, inst.IP)); err != nil {
+		// Env vars must be in place before the caller unblocks user code, so
+		// this failure aborts the resume. Detached ctx, same reason as the
+		// gate above (see resumeReadyOrAbort).
+		a.mgr.abortResumeLocked(req.GetVmId())
 		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
 
@@ -167,6 +193,14 @@ func (a *GRPCAdapter) InjectSandboxEnv(ctx context.Context, req *vmdpb.InjectSan
 	if vmID == "" {
 		return nil, status.Error(codes.InvalidArgument, "vm_id is required")
 	}
+	// Serialize with resume and with other injects: /init merges last-writer-
+	// wins, so a timed-out delivery being retried must not replay an older
+	// binding set over a newer one applied in between.
+	unlockOp, err := a.mgr.lockVMOp(ctx, vmID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockOp()
 	inst, err := a.mgr.GetVMInfo(ctx, vmID)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "vm %s: %v", vmID, err)
@@ -179,10 +213,22 @@ func (a *GRPCAdapter) InjectSandboxEnv(ctx context.Context, req *vmdpb.InjectSan
 	if jwt != "" {
 		envVars = InjectHTTPSProxyEnvWithJWT(envVars, a.sandboxProxyURL, jwt)
 	}
-	if err := postBoxdInit(ctx, inst.IP, envVars, vmHostname(vmID)); err != nil {
+	if err := postBoxdInitRetried(ctx, inst.IP, envVars, vmHostname(vmID), a.ipOwnerCheck(vmID, inst.IP)); err != nil {
 		return nil, status.Errorf(codes.Internal, "post-init failed: %v", err)
 	}
 	return &vmdpb.InjectSandboxEnvResponse{VmId: vmID}, nil
+}
+
+// ipOwnerCheck returns a predicate reporting whether vmID still exists, still
+// owns ip, and is still Running — the retry gate for /init deliveries.
+//
+// The instance record alone is not enough: DestroyVM releases the network
+// slot before it removes the instance, so mid-destroy the record still shows
+// Running with the old IP while the slot is already claimable by another VM.
+// The network manager's device table is the slot's actual owner ledger, so a
+// nil lookup there vetoes the delivery. See vmOwnsIP.
+func (a *GRPCAdapter) ipOwnerCheck(vmID, ip string) func() bool {
+	return func() bool { return a.mgr.vmOwnsIP(vmID, ip) }
 }
 
 // DeleteSnapshot unlinks the vmstate + memory files for a previous snapshot.

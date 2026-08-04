@@ -513,6 +513,11 @@ func main() {
 		uploader.StagingRoot = stagingRoot
 		mgr.SetBackupStaging(stagingRoot)
 		mgr.SetBackupEnqueue(journal.Enqueue)
+		mgr.SetBackupCovered(func(t backup.Task) (bool, error) {
+			// Coverage is per bucket: a completed generation elsewhere
+			// must not suppress uploading into this one.
+			return journal.Covered(bucket, t)
+		})
 		// The uploader must fully stop before the journal and GCS client
 		// close under it: a verification or Nack cut off mid-write leaves
 		// a finalized object the journal never recorded, which the
@@ -715,8 +720,11 @@ func main() {
 		}
 		// After the instance map is rebuilt: pauses that still owed their
 		// backup enqueue when the previous process exited get their
-		// rehash re-run (no-op when backup is disabled).
+		// rehash re-run, and completed template builds whose generation
+		// never reached the journal get reconciled from their stamped
+		// meta (both no-ops when backup is disabled).
 		mgr.RecoverPendingBackups(ctx, log)
+		mgr.RecoverTemplateBackups(ctx, log)
 	}()
 
 	// ---- Optional DB connection for the reconciler ----
