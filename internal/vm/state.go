@@ -17,6 +17,10 @@ import (
 var (
 	bucketName              = []byte("vms")
 	previewPolicyBucketName = []byte("vm_preview_policies")
+	// pendingBackupBucketName records pauses whose backup enqueue has not
+	// completed: the async retry goroutine is not a durable record, and a
+	// crash or deploy during its window must not lose the pause's coverage.
+	pendingBackupBucketName = []byte("pending_backups")
 )
 
 // persistedPreviewPolicy is stored separately from VMRecord so a rollback to
@@ -124,19 +128,29 @@ func (p persistedPreviewPolicy) MarshalJSON() ([]byte, error) {
 // It contains everything VMD needs to reconstruct its in-memory map on
 // startup and reattach to a live Firecracker process.
 type VMRecord struct {
-	ID           string   `json:"id"`
-	PID          int      `json:"pid"`
-	SocketPath   string   `json:"socket_path"`
-	VsockPath    string   `json:"vsock_path,omitempty"`
-	IP           string   `json:"ip"`
-	TAPDevice    string   `json:"tap_device"`
-	MACAddress   string   `json:"mac_address"`
-	Status       VMStatus `json:"status"`
-	RunDirID     string   `json:"rundir_id"`
-	Namespace    string   `json:"namespace"`
-	DiskPath     string   `json:"disk_path"`
-	SnapshotPath string   `json:"snapshot_path,omitempty"`
-	MemFilePath  string   `json:"mem_file_path,omitempty"`
+	ID         string   `json:"id"`
+	PID        int      `json:"pid"`
+	SocketPath string   `json:"socket_path"`
+	VsockPath  string   `json:"vsock_path,omitempty"`
+	IP         string   `json:"ip"`
+	TAPDevice  string   `json:"tap_device"`
+	MACAddress string   `json:"mac_address"`
+	Status     VMStatus `json:"status"`
+	// Unverified marks a Running record persisted before boxd readiness was
+	// confirmed (the persist overlaps the wait). Absent/false — including on
+	// every record from before the field — means verified; a background
+	// persist clears it right after verification, so a durable true means a
+	// crash before readiness was proven. Both restore and resume adoption
+	// re-verify such records before adopting (clearing the marker on
+	// success), a pause clears it (a snapshotted guest was provably live),
+	// and a resume relaunch verifies readiness synchronously before
+	// clearing it.
+	Unverified   bool   `json:"unverified,omitempty"`
+	RunDirID     string `json:"rundir_id"`
+	Namespace    string `json:"namespace"`
+	DiskPath     string `json:"disk_path"`
+	SnapshotPath string `json:"snapshot_path,omitempty"`
+	MemFilePath  string `json:"mem_file_path,omitempty"`
 	// Persisted so a layered (diff-overlay) sandbox resumes correctly after a vmd
 	// restart: non-empty means MemFilePath is an overlay to be served over this
 	// base. Without it, resume would load the overlay standalone and read the
@@ -181,6 +195,9 @@ func OpenStateStore(path string) (*StateStore, error) {
 	if err := db.Update(func(tx *bolt.Tx) error {
 		records, err := tx.CreateBucketIfNotExists(bucketName)
 		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(pendingBackupBucketName); err != nil {
 			return err
 		}
 		policies, err := tx.CreateBucketIfNotExists(previewPolicyBucketName)
@@ -493,6 +510,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		TAPDevice:                  inst.TAPDevice,
 		MACAddress:                 inst.MACAddress,
 		Status:                     inst.Status,
+		Unverified:                 inst.Unverified,
 		RunDirID:                   inst.RunDirID,
 		Namespace:                  inst.Namespace,
 		DiskPath:                   inst.DiskPath,
@@ -578,6 +596,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		TAPDevice:                  rec.TAPDevice,
 		MACAddress:                 rec.MACAddress,
 		Status:                     rec.Status,
+		Unverified:                 rec.Unverified,
 		RunDirID:                   rec.RunDirID,
 		Namespace:                  rec.Namespace,
 		DiskPath:                   rec.DiskPath,
@@ -598,4 +617,89 @@ func toInstance(rec VMRecord) *VMInstance {
 			BasePath:  rec.BasePath,
 		},
 	}
+}
+
+// PendingBackup is a durable marker that a pause still owes its backup
+// enqueue: the artifact paths to (re)hash and journal. Deleted once the
+// journal write lands or the pause is superseded.
+type PendingBackup struct {
+	VMID         string `json:"vm_id"`
+	SnapshotPath string `json:"snapshot_path"`
+	DiskPath     string `json:"disk_path"`
+	DiskBasePath string `json:"disk_base_path,omitempty"`
+	// Token identifies which pause owns the record: rows are keyed by VM
+	// ID, so a later pause's Put replaces an older one, and the older
+	// pause's async worker must not delete the newer record.
+	Token string `json:"token,omitempty"`
+	// BaseIdentity is the overlay base's stat identity captured when the
+	// marker was created: the rehash must prove it is hashing the
+	// pause-time base, not a same-path replacement.
+	BaseIdentity string `json:"base_identity,omitempty"`
+}
+
+// PutPendingBackup records (or refreshes) a pause's owed backup.
+func (s *StateStore) PutPendingBackup(p PendingBackup) error {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(pendingBackupBucketName).Put([]byte(p.VMID), data)
+	})
+}
+
+// PutPendingBackupIfOwner writes the marker when the slot is empty,
+// owned by the same token, or owned by an OLDER token (tokens are
+// fixed-width creation-ordered): healing re-persists a record to repair
+// a failed initial write, and the newest pause always wins the slot
+// while a newer record is never overwritten by an older worker.
+func (s *StateStore) PutPendingBackupIfOwner(p PendingBackup) error {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(pendingBackupBucketName)
+		if v := b.Get([]byte(p.VMID)); v != nil {
+			var cur PendingBackup
+			if json.Unmarshal(v, &cur) == nil && cur.Token > p.Token {
+				return nil
+			}
+		}
+		return b.Put([]byte(p.VMID), data)
+	})
+}
+
+// DeletePendingBackupIf clears the marker only while the given token
+// still owns it: an older pause's async worker finishing late must not
+// erase the record a newer pause has since written over the same key.
+func (s *StateStore) DeletePendingBackupIf(vmID, token string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(pendingBackupBucketName)
+		v := b.Get([]byte(vmID))
+		if v == nil {
+			return nil
+		}
+		var cur PendingBackup
+		if json.Unmarshal(v, &cur) == nil && cur.Token != token {
+			return nil
+		}
+		return b.Delete([]byte(vmID))
+	})
+}
+
+// ListPendingBackups returns every pause still owing its backup enqueue.
+// Corrupt entries are skipped.
+func (s *StateStore) ListPendingBackups() ([]PendingBackup, error) {
+	var out []PendingBackup
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(pendingBackupBucketName).ForEach(func(k, v []byte) error {
+			var p PendingBackup
+			if json.Unmarshal(v, &p) == nil && p.VMID != "" {
+				out = append(out, p)
+			}
+			return nil
+		})
+	})
+	return out, err
 }

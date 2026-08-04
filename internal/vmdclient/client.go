@@ -15,12 +15,26 @@ type PortPolicy struct {
 	TokenVersion int64
 }
 
+// ManifestEntry is one artifact file's integrity record from a pause: logical
+// name, host path, size, sha256, and (for overlay files) the base file the
+// artifact depends on to be restorable.
+type ManifestEntry struct {
+	FileName  string
+	Path      string
+	SizeBytes int64
+	SHA256    string
+	BasePath  string
+}
+
 // Client defines the subset of the VM daemon gRPC interface used by the
 // control plane. Implementations: grpcVMDClient in cmd/controlplane,
 // stubVMD in tests.
 type Client interface {
 	DestroyInstance(ctx context.Context, instanceID string, force bool) error
-	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, err error)
+	// PauseInstance pauses the VM and returns its snapshot artifacts plus a
+	// per-file integrity manifest (disk state + vmstate; mem files are
+	// host-local only and not manifested).
+	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, manifest []ManifestEntry, err error)
 	// ResumeInstance restores a paused VM.
 	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when
@@ -29,7 +43,10 @@ type Client interface {
 	// deltaDir are populated for overlay-mode templates, empty for legacy.
 	// For sandboxes with secrets the caller passes envVars=nil here and uses
 	// InjectSandboxEnv below once the source IP is known and a JWT is minted.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// previewProtocol echoes the vmd's preview-policy attestation from the
+	// response; empty means the vmd predates preview publication and ignored
+	// the request's policy fields.
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, err error)
 	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
 	// running sandbox's boxd. Idempotent.
 	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error

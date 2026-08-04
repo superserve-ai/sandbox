@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -21,9 +22,13 @@ import (
 const internalRBACToken = "integration-rbac-phase2b-token"
 
 func newInternalRouter(t *testing.T) *gin.Engine {
+	return newInternalRouterWithNow(t, nil)
+}
+
+func newInternalRouterWithNow(t *testing.T, now func() time.Time) *gin.Engine {
 	t.Helper()
 	t.Setenv("INTERNAL_API_TOKEN", internalRBACToken)
-	return newRouter(t)
+	return newRouterWithNow(t, now)
 }
 
 func doInternal(r *gin.Engine, method, path, actorID, body string) *httptest.ResponseRecorder {
