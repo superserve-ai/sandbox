@@ -2267,8 +2267,12 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// Running VMs must have a live systemd unit and a reachable API socket; a
 	// dead one is a stale record. Paused VMs legitimately have no unit — they
 	// were stopped at pause and wait for a resume — so they skip these checks.
+	// Release requires the TERMINAL unit state, not vmUnitDead: deactivating
+	// reads dead there while a wedged FC (a parked Error record's unconfirmed
+	// stop, riding out a restart) may still be exiting — a transitional unit
+	// falls through to the socket path below, which parks it instead.
 	if cleanupStale && rec.Status != StatusPaused {
-		if vmUnitDead(rec.ID) {
+		if vmUnitFullyDown(rec.ID) {
 			log.Warn().Msg("VM in BoltDB but not running — cleaning up stale record")
 			// Cold-booted VMs (old build path) ran with Setsid and no unit, so
 			// they survive vmd restarts as orphans holding TAP fds — SIGKILL by
@@ -3604,6 +3608,16 @@ var vmUnitDead = func(vmID string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return unitDefinitelyDead(ctx, systemdUnitName(vmID))
+}
+
+// vmUnitFullyDown reports a VM's unit in a TERMINAL state (unitFullyDown);
+// swappable in tests. Sites that release a record and its namespace need
+// this claim, not vmUnitDead — deactivating reads dead there while the
+// process may still be exiting.
+var vmUnitFullyDown = func(vmID string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return unitFullyDown(ctx, systemdUnitName(vmID))
 }
 
 func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) *VMInstance {

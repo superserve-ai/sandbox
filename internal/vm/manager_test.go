@@ -1148,9 +1148,9 @@ func TestInstanceRunning(t *testing.T) {
 // BoltDB record: deleting it would leave a live Firecracker no record points
 // to, invisible to the next reattach.
 func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
-	origDead := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = origDead }()
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
+	defer func() { vmUnitFullyDown = origDown }()
 	origStop := staleUnitStopConfirmed
 	stoppedUnit := ""
 	staleUnitStopConfirmed = func(_ context.Context, unit string) bool {
@@ -1200,9 +1200,9 @@ func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
 // escalate against, the VM must still be refused in memory — the only refusal
 // a broken store leaves.
 func TestReattachRecord_ErrorPersistFails_StillRefusedInMemory(t *testing.T) {
-	origDead := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = origDead }()
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
+	defer func() { vmUnitFullyDown = origDown }()
 	origStop := staleUnitStopConfirmed
 	staleUnitStopConfirmed = func(context.Context, string) bool { return false }
 	defer func() { staleUnitStopConfirmed = origStop }()
@@ -1235,13 +1235,54 @@ func TestReattachRecord_ErrorPersistFails_StillRefusedInMemory(t *testing.T) {
 	}
 }
 
+// A parked Error record can ride out a vmd restart while its wedged unit is
+// still deactivating. unitDefinitelyDead reads that state as dead; the eager
+// startup cleanup must instead require the terminal state and park the
+// refusal again — releasing the record would free the namespace under a
+// possibly-live FC.
+func TestReattachRecord_DeactivatingUnit_ParksNotReleases(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // deactivating: not terminal
+	defer func() { vmUnitFullyDown = origDown }()
+	origStop := staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool { return false }
+	defer func() { staleUnitStopConfirmed = origStop }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusError,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok || inst.Status != StatusError {
+		t.Fatalf("a non-terminal unit must re-park the Error refusal, got inst=%+v ok=%v", inst, ok)
+	}
+	kept, err := store.Get("vm-1")
+	if err != nil || kept == nil {
+		t.Fatalf("the record must be kept while the unit is not terminal, got rec=%v err=%v", kept, err)
+	}
+	if kept.Status != StatusError {
+		t.Fatalf("kept record must stay Error, got %s", kept.Status)
+	}
+}
+
 // A confirmed stop whose record delete fails must also park the refusal:
 // the surviving Running row would otherwise be re-adopted onto a slot this
 // path was about to free.
 func TestReattachRecord_DeleteFailsAfterConfirmedStop_ParksError(t *testing.T) {
-	origDead := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = origDead }()
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
+	defer func() { vmUnitFullyDown = origDown }()
 	origStop := staleUnitStopConfirmed
 	staleUnitStopConfirmed = func(context.Context, string) bool { return true }
 	defer func() { staleUnitStopConfirmed = origStop }()
@@ -1274,9 +1315,9 @@ func TestReattachRecord_DeleteFailsAfterConfirmedStop_ParksError(t *testing.T) {
 // A destroy or markStale deleting the record while the stale stop waits owns
 // the teardown: the reattach must abandon, not resurrect the row.
 func TestReattachRecord_DeletedDuringStaleStop_Abandoned(t *testing.T) {
-	origDead := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = origDead }()
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
+	defer func() { vmUnitFullyDown = origDown }()
 
 	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
