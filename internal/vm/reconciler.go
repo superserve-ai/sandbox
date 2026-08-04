@@ -529,11 +529,10 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// record says Running. Unverified is what makes that deference wrong:
 	// readiness was never proven, so Running is a claim, not evidence.
 	//
-	// A retry ADOPTS such a VM (re-verifying first) and keeps everything the
-	// guest did since the snapshot, so this rule must lose that race by
-	// design — hence UnverifiedOrphanGrace rather than the default. The
-	// sandbox row and its snapshot are untouched: only the orphaned process
-	// and its slot go, and a later resume still restores cleanly.
+	// Runs on UnverifiedOrphanGrace, not the default — see that field for why
+	// this rule must lose the race with adoption. The sandbox row and its
+	// snapshot are untouched: only the orphaned process and its slot go, so a
+	// later resume still restores cleanly.
 	if dbSandboxes != nil {
 		for id := range active {
 			sb, known := dbSandboxes[id]

@@ -1352,12 +1352,8 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// its gate, and leaving it set would make every resume retry relaunch
 		// and roll the guest back again. Normal resumes stay readiness-blind
 		// (detached probe below). The guest was just relaunched from its
-		// snapshot, so the failure teardown discards nothing of value — but
-		// only a GENUINE verdict may tear down (see relaunchBoxdReady): a
-		// caller deadline shorter than the guest's warmup would otherwise
-		// truncate every attempt and livelock the sandbox in relaunch-kill
-		// cycles, when a completed wait clears the marker durably and lets
-		// the next retry adopt instantly.
+		// snapshot, so this teardown discards nothing of value — but only a
+		// GENUINE verdict may reach it; see relaunchBoxdReady.
 		if verr := m.relaunchBoxdReady(ctx, inst.IP); verr != nil {
 			m.stopUnitDuringRestoreError(vmID)
 			m.setStatus(vmID, StatusError)
@@ -1823,15 +1819,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 					// The caller went away — no verdict on the VM, no teardown.
 					return nil, fmt.Errorf("adopted VM %s readiness unverified: %w", vmID, err)
 				}
-				// Definitive exhaustion: flip out of Running. That makes the
-				// record un-adoptable, so the retry relaunches from the
-				// snapshot — the only escape from a wedged agent, since
-				// re-adopting one loops forever. It also unblocks cleanup:
-				// the reconciler's live-unit rules defer to a Running
-				// in-memory record, so Error is what lets them stop the unit
-				// if no retry comes. No unit stop here — boxd-dead does not
-				// prove guest-dead, and the retry's relaunch replaces the
-				// unit anyway.
+				// Definitive exhaustion: flip out of Running. That forces the
+				// retry to relaunch — the only escape from a wedged agent,
+				// since re-adopting one loops forever — and unblocks cleanup,
+				// because the reconciler's live-unit rules defer to a Running
+				// record. No unit stop here: boxd-dead does not prove
+				// guest-dead, and the relaunch replaces the unit anyway.
 				// persistStateIfPresent, not setStatus: a destroy racing this
 				// branch must not have its record deletion overwritten by an
 				// unconditional put.
