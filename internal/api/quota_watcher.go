@@ -247,7 +247,10 @@ func (n *SlackQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 	}
 	text := fmt.Sprintf("⚠️ Team *%s* (`%s`) is at %d%% of its %s limit (%d/%d) — consider reaching out.",
 		a.TeamName, a.TeamID, a.Pct, a.Resource, a.Used, a.Limit)
-	body, _ := json.Marshal(map[string]string{"text": text})
+	body, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.webhookURL, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -317,7 +320,10 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 		"subject": "Verify your team on Superserve",
 		"html":    quotaEmailHTML(a),
 	}
-	body, _ := json.Marshal(payload)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err

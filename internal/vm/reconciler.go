@@ -10,10 +10,13 @@ import (
 	"syscall"
 	"time"
 
+	"errors"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	fcmodels "github.com/superserve-ai/sandbox/internal/vm/fc/models"
 )
 
 // trashDirName is the per-root quarantine directory. Orphan dirs are moved to
@@ -280,6 +283,112 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			r.markFailedInDB(ctx, id)
 			r.markStale(id)
 			r.writeAudit(ctx, id, "mark_failed", "VM dead while DB said active", "db_active_systemd_missing")
+		}
+	}
+
+	// Drift 1b: the unit is active but the Firecracker inside is an empty
+	// shell holding no microVM (see fcReportsEmptyShell) — e.g. the unit
+	// was restarted outside vmd, which destroys the guest; the replacement
+	// only becomes a VM again through vmd's own restore path. A mid-launch
+	// VM is briefly "Not started" between unit start and boot; the grace
+	// period (drift must persist across passes) plus the op-lock check and
+	// a re-probe under the lock filter that window.
+	if dbSandboxes != nil {
+		// Probe candidates concurrently under a stage budget: a wedged API
+		// burns its full timeout, and sequential probing would let a few
+		// wedged sockets starve every rule after this one. Budget-cutoff
+		// probes yield errors (non-evidence) and re-examine next pass.
+		var candidates []string
+		for id, sb := range dbSandboxes {
+			if sb.Sandbox.Status != db.SandboxStatusActive || !active[id] {
+				r.clearDrift("fcempty:" + id)
+				continue
+			}
+			candidates = append(candidates, id)
+		}
+		probeCtx, probeCancel := context.WithTimeout(ctx, 6*time.Second)
+		type probeResult struct {
+			empty bool
+			err   error
+		}
+		probes := make(map[string]probeResult, len(candidates))
+		var probeMu sync.Mutex
+		var probeWG sync.WaitGroup
+		probeSem := make(chan struct{}, 16)
+		for _, id := range candidates {
+			probeWG.Add(1)
+			go func(id string) {
+				defer probeWG.Done()
+				probeSem <- struct{}{}
+				defer func() { <-probeSem }()
+				empty, perr := fcProbeShell(probeCtx, filepath.Join(r.mgr.cfg.RunDir, id, "firecracker.sock"))
+				probeMu.Lock()
+				probes[id] = probeResult{empty: empty, err: perr}
+				probeMu.Unlock()
+			}(id)
+		}
+		probeWG.Wait()
+		probeCancel()
+
+		for _, id := range candidates {
+			res := probes[id]
+			if res.err != nil {
+				continue // no evidence either way; drift state untouched
+			}
+			if !res.empty {
+				r.clearDrift("fcempty:" + id)
+				continue
+			}
+			if !r.gracePeriodElapsed("fcempty:"+id, now) {
+				continue
+			}
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			// Re-probe under the lock: a restore may have loaded a microVM
+			// into this process since the pass began.
+			empty, perr := fcProbeShell(ctx, filepath.Join(r.mgr.cfg.RunDir, id, "firecracker.sock"))
+			if perr != nil || !empty {
+				unlockOp()
+				if perr == nil {
+					r.clearDrift("fcempty:" + id)
+				}
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
+				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "fc_empty_shell")
+				continue
+			}
+			log.Warn().Str("vm_id", id).Str("drift", "fc_empty_shell").
+				Msg("unit active but Firecracker holds no microVM — stopping the shell and marking failed")
+			err := stopUnit(ctx, systemdUnitName(id))
+			unlockOp()
+			if err != nil {
+				// Leave the row untouched (a failed row behind a live
+				// unit would strand it). Refund the budget slot only when
+				// the stop provably never happened; an accepted-but-
+				// unconfirmed job may still terminate the unit, and
+				// refunding those would let slow stops evade the budget.
+				if errors.Is(err, errStopNotEnqueued) {
+					r.refundAutoFailSlot()
+					r.writeAudit(ctx, id, "stop_failed", "empty-shell stop not enqueued; slot refunded, retrying next pass", "fc_empty_shell")
+				} else {
+					r.writeAudit(ctx, id, "stop_failed", "empty-shell stop unconfirmed; slot retained, retrying next pass", "fc_empty_shell")
+				}
+				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop empty-shell unit")
+				continue
+			}
+			// The stop is committed; the DB transition must not be lost to
+			// the pass deadline expiring mid-rule (a stranded active row
+			// behind a dead unit costs another grace+budget cycle via the
+			// dead-VM rule). Detach from the pass context, bounded.
+			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			r.markFailedInDB(persistCtx, id)
+			r.markStale(id)
+			r.writeAudit(persistCtx, id, "mark_failed", "empty Firecracker shell while DB said active", "fc_empty_shell")
+			persistCancel()
 		}
 	}
 
@@ -920,6 +1029,35 @@ func (r *Reconciler) consumeAutoFailBudget(vmID string) bool {
 
 	r.autoFailLog = append(r.autoFailLog, now)
 	return true
+}
+
+// fcProbeShell probes the Firecracker API on sock. Only a healthy API
+// affirmatively answering counts either way: empty reports an explicit
+// "Not started" (a shell with no microVM), and a non-nil error means the
+// probe produced no evidence at all — callers must neither act on it nor
+// clear the drift, so a wedged or slow API can only delay this rule, never
+// steer it.
+func fcProbeShell(ctx context.Context, sock string) (empty bool, err error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	state, err := VMState(probeCtx, sock)
+	if err != nil {
+		return false, err
+	}
+	return state == fcmodels.InstanceInfoStateNotStarted, nil
+}
+
+// refundAutoFailSlot returns the most recently consumed auto-fail slot,
+// for when the reserved destructive action did not happen (a failed unit
+// stop): the budget bounds performed actions, so transient failures must
+// not exhaust it. Drift rules run sequentially in the single reconcile
+// pass, so the newest entry is the caller's own reservation.
+func (r *Reconciler) refundAutoFailSlot() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n := len(r.autoFailLog); n > 0 {
+		r.autoFailLog = r.autoFailLog[:n-1]
+	}
 }
 
 // markStale deletes the stale BoltDB entry and drops the VM from the
