@@ -813,6 +813,14 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		}
 		return snapshotPath, memPath, manifest, nil
 	}
+	if inst.Status == StatusError {
+		// A parked Error VM (unmanageable — socket gone, stop unconfirmed)
+		// cannot be snapshotted; attempting it burns a doomed FC-API dial and
+		// returns a generic error the control plane retries against. Fail
+		// fast instead; Drift 8 owns the cleanup.
+		inst.mu.RUnlock()
+		return "", "", nil, status.Errorf(codes.FailedPrecondition, "vm %s is in error state and cannot be paused", vmID)
+	}
 	inst.mu.RUnlock()
 
 	if snapshotDir == "" {
@@ -957,7 +965,14 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	inst.DirtyTracked = false      // FC process is stopping; a fresh resume re-arms tracking.
 	inst.mu.Unlock()
 
-	m.persistState(inst)
+	// If-present, not Put: DestroyVM takes no vm-op lock (by design, to
+	// interrupt wedged ops) and the detached stop widened the window where a
+	// destroy can land mid-pause — a plain Put would resurrect the deleted
+	// record as Paused and a later reattach would rebind its recycled slot.
+	if !m.persistStateIfPresent(inst) {
+		log.Warn().Msg("record deleted during pause stop — destroy owns the teardown")
+		return "", "", nil, status.Errorf(codes.NotFound, "vm %s destroyed during pause", vmID)
+	}
 
 	// Hash the durable artifacts once the unit is stopped and the files are
 	// at rest. Runs under its own budget derived from the RPC deadline (see
@@ -974,8 +989,11 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// stopConfirmed alone is the RPC's notion of a finished stop, which
 	// deliberately includes a still-deactivating unit; hashing needs the
 	// stronger fully-down claim, so the gate reconfirms with the same
-	// probe the at-rest proof uses.
-	if stopConfirmed && m.unitConfirmedDead(ctx, vmID) {
+	// probe the at-rest proof uses. Detached probe ctx: the caller's ctx
+	// may be spent (the stop above detached for exactly that), and probing
+	// on it would fail the gate for every deadline-spent pause even when
+	// the unit is genuinely down.
+	if stopConfirmed && m.unitConfirmedDead(probeCtx(), vmID) {
 		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
 	} else if m.backupEnqueue != nil {
 		log.Warn().Msg("pause backup deferred: unit not confirmed fully down, bytes may still be changing")
@@ -2328,49 +2346,26 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 						confirmed = killUnitSIGKILL(ctx, systemdUnitName(rec.ID))
 					}
 				}
-				// parkError publishes the in-memory Error refusal for a VM
-				// whose durable state cannot be trusted: left untracked, a
-				// lazy reattach would re-read the Running row and adopt it.
-				parkError := func() (*VMInstance, bool) {
-					rec.Status = StatusError
-					inst := toInstance(rec)
-					// Bind network state first, as the normal path below does:
-					// a recovering relaunch or destroy frees this VM's slot
-					// only if the net manager knows it.
-					if inst.Namespace != "" && inst.IP != "" {
-						if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
-							log.Error().Err(err).Msg("reattach: restore network state failed")
-						}
-					}
-					m.mu.Lock()
-					if cur, ok := m.vms[rec.ID]; ok {
-						m.mu.Unlock()
-						return cur, true
-					}
-					m.vms[rec.ID] = inst
-					m.mu.Unlock()
-					// Commit check, as the Paused path below: a delete landing
-					// between the write and the publish must win.
-					if m.recordDeleted(rec.ID) {
-						m.undoReattach(rec.ID)
+				if confirmed {
+					if derr := m.state.Delete(rec.ID); derr == nil {
+						m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
 						return nil, false
+					} else {
+						// The Running row survives with its unit dead;
+						// untracked, a lazy reattach would re-adopt it onto a
+						// slot this path was about to free — markStale retries
+						// the delete on later passes.
+						log.Error().Err(derr).Msg("failed to delete stale record; parking as error")
 					}
-					return inst, true
-				}
-				if !confirmed {
+				} else {
 					log.Warn().Msg("unit not confirmed stopped; record kept as error")
-					return parkError()
 				}
-				if derr := m.state.Delete(rec.ID); derr != nil {
-					// The Running row survives with its unit dead; untracked,
-					// a lazy reattach would re-adopt it onto a slot this path
-					// was about to free. Park the refusal instead — markStale
-					// retries the delete on later passes.
-					log.Error().Err(derr).Msg("failed to delete stale record; parking as error")
-					return parkError()
-				}
-				m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
-				return nil, false
+				// Park the refusal: fall through to the shared bind/publish/
+				// commit tail below with StatusError, so a lazy reattach can
+				// never re-read the Running row and adopt it. The tail's
+				// persist arm tolerates a broken store (publishes in-memory
+				// regardless) and yields to a concurrent delete.
+				rec.Status = StatusError
 			}
 		}
 	}
@@ -2422,7 +2417,11 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			m.undoReattach(rec.ID)
 			return nil, false
 		}
-		log.Info().Int("pid", inst.PID).Str("ip", inst.IP).Msg("reattached to running VM")
+		if inst.Status == StatusError {
+			log.Warn().Msg("VM parked in error state — tracked so no retry adopts it")
+		} else {
+			log.Info().Int("pid", inst.PID).Str("ip", inst.IP).Msg("reattached to running VM")
+		}
 	}
 	return inst, true
 }

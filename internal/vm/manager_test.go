@@ -1358,3 +1358,15 @@ func TestReattachRecord_DeletedDuringStaleStop_Abandoned(t *testing.T) {
 		t.Fatal("an abandoned reattach must not track the VM")
 	}
 }
+
+// A parked Error VM cannot be snapshotted; pause must fail fast with a clear
+// precondition error instead of dialing the dead socket and returning a
+// generic failure the control plane retries against.
+func TestPauseVM_ErrorInstance_FailsFast(t *testing.T) {
+	inst := &VMInstance{ID: "vm-1", Status: StatusError}
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
+	_, _, _, err := m.PauseVM(context.Background(), "vm-1", "")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition for an error-state VM, got %v", err)
+	}
+}
