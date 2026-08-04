@@ -325,6 +325,23 @@ type Manager struct {
 	vmOpLocks sync.Map
 }
 
+// instanceUnverifiedRunning reports whether vmID's tracked instance claims
+// Running but never proved boxd readiness — a crash-window record (see
+// VMRecord.Unverified). Such a record is NOT evidence of a live serving VM,
+// which is what lets the reconciler's orphan rule act on it where the
+// blanket "defer to Running" guard would otherwise protect it forever.
+func (m *Manager) instanceUnverifiedRunning(vmID string) bool {
+	m.mu.RLock()
+	inst, ok := m.vms[vmID]
+	m.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.Status == StatusRunning && inst.Unverified
+}
+
 // instanceRunning reports whether vmID's tracked instance is Running — the
 // authoritative signal that a resume/restore completed, used by the
 // reconciler to avoid stopping a just-relaunched unit.

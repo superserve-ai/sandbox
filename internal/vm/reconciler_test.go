@@ -330,3 +330,63 @@ func keysOf(m map[string]sandboxDirInfo) []string {
 	}
 	return out
 }
+
+// The crash-window orphan rule (Drift 7b) must lose the race with adoption: a
+// retry re-verifies and adopts such a VM, keeping the guest's work, so the
+// reaper may only act on orphans nobody came back for. These pin the four
+// boundaries — the grace one is the regression guard for that race.
+func TestUnverifiedOrphanGrace(t *testing.T) {
+	newRec := func(cfg ReconcilerConfig, inst *VMInstance) *Reconciler {
+		m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+		if inst != nil {
+			m.vms[inst.ID] = inst
+		}
+		return NewReconciler(m, cfg)
+	}
+	cfg := DefaultReconcilerConfig()
+
+	t.Run("verified Running record is never a candidate", func(t *testing.T) {
+		r := newRec(cfg, &VMInstance{ID: "vm-1", Status: StatusRunning}) // no marker
+		if r.mgr.instanceUnverifiedRunning("vm-1") {
+			t.Fatal("a verified Running record must stay protected by the Running deference")
+		}
+	})
+
+	t.Run("unverified Running record is a candidate", func(t *testing.T) {
+		r := newRec(cfg, &VMInstance{ID: "vm-1", Status: StatusRunning, Unverified: true})
+		if !r.mgr.instanceUnverifiedRunning("vm-1") {
+			t.Fatal("an unverified Running record must be reapable — Running was never proven")
+		}
+	})
+
+	t.Run("adoption wins: recent orphan is left alone", func(t *testing.T) {
+		r := newRec(cfg, &VMInstance{ID: "vm-1", Status: StatusRunning, Unverified: true})
+		now := time.Now()
+		if r.graceElapsed("unverifiedorphan:vm-1", now, cfg.UnverifiedOrphanGrace) {
+			t.Fatal("first sighting must never reap")
+		}
+		// Well past the DEFAULT grace, nowhere near the orphan grace: this is
+		// the window in which a customer retry must still be able to adopt.
+		if r.graceElapsed("unverifiedorphan:vm-1", now.Add(5*time.Minute), cfg.UnverifiedOrphanGrace) {
+			t.Fatal("reaper must not outrace adoption — 5min-old orphan must survive")
+		}
+	})
+
+	t.Run("abandoned orphan is reaped once the window passes", func(t *testing.T) {
+		r := newRec(cfg, &VMInstance{ID: "vm-1", Status: StatusRunning, Unverified: true})
+		now := time.Now()
+		r.graceElapsed("unverifiedorphan:vm-1", now, cfg.UnverifiedOrphanGrace) // first sighting
+		if !r.graceElapsed("unverifiedorphan:vm-1", now.Add(cfg.UnverifiedOrphanGrace), cfg.UnverifiedOrphanGrace) {
+			t.Fatal("an abandoned orphan must be reaped once its window elapses")
+		}
+	})
+
+	t.Run("orphan grace far exceeds the default", func(t *testing.T) {
+		// The whole design rests on this ordering; a future tuning change that
+		// inverts it silently reintroduces the reap-before-adopt data loss.
+		if cfg.UnverifiedOrphanGrace <= cfg.GracePeriod {
+			t.Fatalf("orphan grace (%s) must far exceed the default grace (%s)",
+				cfg.UnverifiedOrphanGrace, cfg.GracePeriod)
+		}
+	})
+}

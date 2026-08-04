@@ -73,6 +73,12 @@ type ReconcilerConfig struct {
 	// DiskTrashRetention is how long a quarantined dir soaks under .trash before
 	// it is permanently removed — the window to spot and reverse a bad reclaim.
 	DiskTrashRetention time.Duration
+	// UnverifiedOrphanGrace is how long a crash-window orphan (a Running but
+	// unverified record behind a live unit) is left alone before the
+	// reconciler stops it. Deliberately far longer than the default grace:
+	// a retry ADOPTS such a VM and keeps the guest's work, so the reaper must
+	// lose that race — it exists only for orphans nobody ever comes back for.
+	UnverifiedOrphanGrace time.Duration
 }
 
 // DefaultReconcilerConfig returns sensible defaults from the design doc.
@@ -87,6 +93,9 @@ func DefaultReconcilerConfig() ReconcilerConfig {
 		DiskReclaimEnabled: false,
 		DiskDeleteBudget:   50,
 		DiskTrashRetention: 72 * time.Hour,
+		// An hour outlasts any live retry loop (the control plane's own
+		// retries are seconds), so adoption always gets first claim.
+		UnverifiedOrphanGrace: time.Hour,
 	}
 }
 
@@ -513,6 +522,61 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
+	// Drift 7b: a crash-window orphan nobody came back for. A restore that
+	// died between its optimistic persist and the verified one leaves a
+	// Running-but-unverified record behind a live unit; the control plane
+	// reverts its row to paused, and Drift 7 then defers forever because the
+	// record says Running. Unverified is what makes that deference wrong:
+	// readiness was never proven, so Running is a claim, not evidence.
+	//
+	// A retry ADOPTS such a VM (re-verifying first) and keeps everything the
+	// guest did since the snapshot, so this rule must lose that race by
+	// design — hence UnverifiedOrphanGrace rather than the default. The
+	// sandbox row and its snapshot are untouched: only the orphaned process
+	// and its slot go, and a later resume still restores cleanly.
+	if dbSandboxes != nil {
+		for id := range active {
+			sb, known := dbSandboxes[id]
+			if !known || sb.Sandbox.Status != db.SandboxStatusPaused || !r.mgr.instanceUnverifiedRunning(id) {
+				r.clearDrift("unverifiedorphan:" + id)
+				continue
+			}
+			if !r.graceElapsed("unverifiedorphan:"+id, now, r.cfg.UnverifiedOrphanGrace) {
+				continue
+			}
+			// Same discipline as Drift 7: lock before spending budget, then
+			// re-check under it — an adoption completing mid-pass clears the
+			// marker, and stopping then would kill a healed VM.
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			if !r.mgr.instanceUnverifiedRunning(id) {
+				unlockOp()
+				r.clearDrift("unverifiedorphan:" + id)
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
+				r.writeAudit(ctx, id, "budget_exhausted", "unverified_orphan_stop suppressed by rate limit", "unverified_orphan_abandoned")
+				continue
+			}
+			log.Warn().Str("vm_id", id).Str("drift", "unverified_orphan_abandoned").
+				Msg("abandoned crash-window VM — stopping")
+			err := stopUnit(ctx, systemdUnitName(id))
+			if err != nil {
+				unlockOp()
+				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop abandoned crash-window unit")
+				continue
+			}
+			removeUnitDropIn(id)
+			r.markStale(id)
+			unlockOp()
+			r.writeAudit(ctx, id, "orphan_stop", "crash-window VM never adopted", "unverified_orphan_abandoned")
+			r.clearDrift("unverifiedorphan:" + id)
+		}
+	}
+
 	// Drift 4: DB says paused, snapshot file missing on disk → mark failed.
 	if dbSandboxes != nil {
 		for id, sb := range dbSandboxes {
@@ -932,6 +996,12 @@ func dirSize(ctx context.Context, paths []string) int64 {
 // transient states (e.g. VMD just started a VM and systemd hasn't fully
 // registered it yet).
 func (r *Reconciler) gracePeriodElapsed(key string, now time.Time) bool {
+	return r.graceElapsed(key, now, r.cfg.GracePeriod)
+}
+
+// graceElapsed is gracePeriodElapsed with an explicit window, for drifts whose
+// safe wait differs from the default (see UnverifiedOrphanGrace).
+func (r *Reconciler) graceElapsed(key string, now time.Time, window time.Duration) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	firstSeen, ok := r.driftSeen[key]
@@ -939,7 +1009,7 @@ func (r *Reconciler) gracePeriodElapsed(key string, now time.Time) bool {
 		r.driftSeen[key] = now
 		return false
 	}
-	return now.Sub(firstSeen) >= r.cfg.GracePeriod
+	return now.Sub(firstSeen) >= window
 }
 
 // clearDrift removes a drift marker once the VM returns to a healthy state.
