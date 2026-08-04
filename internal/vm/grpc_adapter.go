@@ -107,10 +107,7 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			stampCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			// Slot IPs are recycled after destroy; re-check before each
-			// attempt so a delayed stamp can't label a different VM. The
-			// sub-ms check-to-connect window that remains is inherent to
-			// every IP-addressed boxd call racing a destroy; closing it
-			// takes a destroy-cancelled launch context, systemically.
+			// attempt so a delayed stamp can't label a different VM.
 			owner := a.ipOwnerCheck(id, ip)
 			var lastErr error
 			for attempt := 0; attempt < 2; attempt++ {
