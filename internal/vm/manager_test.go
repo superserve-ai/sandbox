@@ -1138,7 +1138,7 @@ func TestRestoreVMSnapshot_AdoptedButBoxdNeverReady_Fails(t *testing.T) {
 		t.Fatal("adopting an unverified VM must fail when boxd never becomes ready")
 	}
 	// The failed adoption must break the adoption gates: a Running record
-	// would be resurrected forever by the readiness-blind resume adoption.
+	// would be re-gated by every retry, never converging.
 	existing.mu.RLock()
 	status := existing.Status
 	existing.mu.RUnlock()
@@ -1197,8 +1197,9 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	}
 }
 
-// Resume adoption is readiness-blind, so it must not adopt a record whose
-// readiness was never proven — it falls through to a fresh launch instead.
+// Resume adoption verifies an unverified target before adopting it. When that
+// verdict comes back negative the record is a corpse, so it must not be
+// adopted — the resume falls through to a fresh launch instead.
 func TestResumeVM_UnverifiedRecord_NotAdopted(t *testing.T) {
 	orig := vmUnitDead
 	vmUnitDead = func(string) bool { return false } // unit alive
