@@ -165,7 +165,7 @@ module "api" {
     SUPABASE_URL           = var.supabase_url
     SECRETS_SIGNING_KEY_ID = "v1"
     ALLOW_EPHEMERAL_SEED   = "0"
-    DB_MAX_CONNS           = "12"
+    DB_MAX_CONNS           = "15"
     VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
     # OTEL_* is intentionally omitted here: the live service has no OTEL env, so
