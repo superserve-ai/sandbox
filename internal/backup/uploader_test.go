@@ -927,7 +927,7 @@ func TestOverlayGenerationUploadsSharedBase(t *testing.T) {
 	}
 	foundBase := false
 	for _, f := range gen.Files {
-		if f.Name == "base.ext4" && strings.HasPrefix(f.Object, "bases/"+baseSHA) {
+		if f.Name == SharedBaseName(baseSHA) && strings.HasPrefix(f.Object, "bases/"+baseSHA) {
 			foundBase = true
 		}
 	}
@@ -1064,8 +1064,11 @@ func TestStagedBaseSurvivesTemplateGC(t *testing.T) {
 	if err := StageTask(staging, &task); err != nil {
 		t.Fatal(err)
 	}
-	if task.Files[0].BasePath == base {
+	if task.Files[0].BaseStagedPath == "" {
 		t.Fatal("base path not staged")
+	}
+	if task.Files[0].BasePath != base {
+		t.Fatal("staging mutated the key-covered BasePath identity")
 	}
 	// Template GC deletes the original base and the sandbox artifacts.
 	if err := os.Remove(base); err != nil {
