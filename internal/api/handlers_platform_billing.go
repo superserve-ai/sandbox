@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
@@ -110,16 +112,22 @@ func (h *Handlers) ListPlatformBilling(c *gin.Context) {
 	}
 
 	var payload json.RawMessage
-	if err := h.Pool.QueryRow(
-		c.Request.Context(),
-		platformBillingQueryForSort(params.SortBy),
-		params.Search,
-		params.SortBy,
-		params.SortDir,
-		params.Limit,
-		params.Offset,
-	).Scan(&payload); err != nil {
-		log.Error().Err(err).Msg("platform billing query failed")
+	var queryErr error
+	if h.Now != nil {
+		payload, queryErr = h.queryPlatformBillingWithClock(c.Request.Context(), platformBillingQueryForSort(params.SortBy), params.Search, params.SortBy, params.SortDir, params.Limit, params.Offset)
+	} else {
+		queryErr = h.Pool.QueryRow(
+			c.Request.Context(),
+			platformBillingQueryForSort(params.SortBy),
+			params.Search,
+			params.SortBy,
+			params.SortDir,
+			params.Limit,
+			params.Offset,
+		).Scan(&payload)
+	}
+	if queryErr != nil {
+		log.Error().Err(queryErr).Msg("platform billing query failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -127,6 +135,35 @@ func (h *Handlers) ListPlatformBilling(c *gin.Context) {
 	c.Header("Cache-Control", "private, no-store")
 	c.Header("Vary", "Authorization, X-Actor-User-Id")
 	c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
+}
+
+func (h *Handlers) queryPlatformBillingWithClock(ctx context.Context, query, search, sortBy, sortDir string, limit, offset int64) (json.RawMessage, error) {
+	conn, err := h.Pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	if _, err := tx.Exec(ctx, `SELECT set_config('superserve.billing_now', $1, true)`, h.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return nil, err
+	}
+
+	var payload json.RawMessage
+	if err := tx.QueryRow(ctx, query, search, sortBy, sortDir, limit, offset).Scan(&payload); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return payload, nil
 }
 
 func platformBillingQueryForSort(sortBy string) string {
@@ -140,7 +177,7 @@ func platformBillingQueryForSort(sortBy string) string {
 
 const platformBillingChargesQuery = `
 WITH request_time AS (
-	SELECT now() AS calculated_at
+	SELECT billing_request_now() AS calculated_at
 ),
 team_periods AS (
 	SELECT
@@ -395,7 +432,7 @@ SELECT jsonb_build_object(
 
 const platformBillingMetadataQuery = `
 WITH request_time AS (
-	SELECT now() AS calculated_at
+	SELECT billing_request_now() AS calculated_at
 ),
 team_periods AS (
 	SELECT

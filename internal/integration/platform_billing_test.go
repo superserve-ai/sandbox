@@ -137,7 +137,8 @@ func TestPlatformBillingPaginationTotalsAndPartialFailures(t *testing.T) {
 func TestPlatformBillingUsesCurrentPeriodLedgerToReconstructOpeningBalance(t *testing.T) {
 	ctx := context.Background()
 	teamID, ownerKey := seedTeamAndKey(t)
-	r := newInternalRouter(t)
+	fixedNow := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	r := newInternalRouterWithNow(t, func() time.Time { return fixedNow })
 
 	cw := do(r, "POST", "/sandboxes", ownerKey, `{"name":"platform-billing-ledger"}`)
 	if cw.Code != http.StatusCreated {
@@ -154,8 +155,7 @@ func TestPlatformBillingUsesCurrentPeriodLedgerToReconstructOpeningBalance(t *te
 		t.Fatalf("clear seeded storage billing interval: %v", err)
 	}
 
-	now := time.Now().UTC().Truncate(time.Second)
-	periodStart, periodEnd := billing.CurrentBillingPeriod(now)
+	periodStart, periodEnd := billing.CurrentBillingPeriod(fixedNow)
 	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
 		TeamID:      teamID,
 		PeriodStart: periodStart,
@@ -237,4 +237,271 @@ func TestPlatformBillingUsesCurrentPeriodLedgerToReconstructOpeningBalance(t *te
 	if got := row.Summary["credits_remaining_usd"].(float64); got < -0.000001 || got > 0.000001 {
 		t.Fatalf("credits_remaining_usd = %v, want 0", got)
 	}
+}
+
+func seedPlatformBillingRatesForTest(t *testing.T, ctx context.Context, teamID uuid.UUID, planKey string, effectiveFrom time.Time) {
+	t.Helper()
+
+	insertPricingPlanForTest(t, ctx, planKey, true)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'memory_gib', 'second', 0.0000045, $2),
+			($1, 'storage_gib', 'second', 0.00000003, $2)
+	`, planKey, effectiveFrom); err != nil {
+		t.Fatalf("insert platform billing pricing rates: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, $3)
+	`, teamID, planKey, effectiveFrom); err != nil {
+		t.Fatalf("assign platform billing pricing plan: %v", err)
+	}
+}
+
+func TestPlatformBillingUsesHalfOpenMonthBoundaryForUsage(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	fixedNow := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	r := newInternalRouterWithNow(t, func() time.Time { return fixedNow })
+
+	cw := do(r, "POST", "/sandboxes", ownerKey, `{"name":"platform-billing-month-boundary"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: expected 201, got %d: %s", cw.Code, cw.Body.String())
+	}
+	sandboxID, err := uuid.Parse(mustJSON(t, cw)["id"].(string))
+	if err != nil {
+		t.Fatalf("parse sandbox id: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded compute billing interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_storage_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded storage billing interval: %v", err)
+	}
+
+	periodStart, periodEnd := billing.CurrentBillingPeriod(fixedNow)
+	seedPlatformBillingRatesForTest(t, ctx, teamID, "platform-billing-half-open-"+uuid.NewString(), periodStart.Add(-time.Hour))
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason
+		)
+		VALUES
+			($1, $2, 2, 2048, $3, $4, 'paused'),
+			($1, $2, 2, 2048, $4, $5, 'paused')
+	`, sandboxID, teamID, periodStart.Add(-time.Hour), periodStart, periodStart.Add(time.Hour)); err != nil {
+		t.Fatalf("seed month-boundary compute intervals: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (
+			sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason
+		)
+		VALUES
+			($1, $2, 10240, $3, $4, 'deleted'),
+			($1, $2, 10240, $4, $5, 'deleted')
+	`, sandboxID, teamID, periodStart.Add(-time.Hour), periodStart, periodStart.Add(time.Hour)); err != nil {
+		t.Fatalf("seed month-boundary storage intervals: %v", err)
+	}
+
+	var grantID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, created_at, updated_at)
+		VALUES ($1, 0.060000, 0.020000, 'month boundary opening balance', $2, $2)
+		RETURNING id
+	`, teamID, periodStart.Add(-time.Hour)).Scan(&grantID); err != nil {
+		t.Fatalf("seed credit grant: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_ledger (
+			team_id, grant_id, billing_period_start, billing_period_end, amount_usd, reason
+		)
+		VALUES ($1, $2, $3, $4, 0.040000, 'billing period finalization credit application')
+	`, teamID, grantID, periodStart, periodEnd); err != nil {
+		t.Fatalf("seed july credit ledger: %v", err)
+	}
+
+	actorID := seedPlatformAdminProfile(t)
+	resp := doInternal(
+		r,
+		http.MethodGet,
+		fmt.Sprintf("/internal/billing?search=%s&sort=team_name&order=asc", teamID.String()),
+		actorID.String(),
+		"",
+	)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("platform billing response: %d %s", resp.Code, resp.Body.String())
+	}
+
+	body := decodePlatformBilling(t, resp.Body.Bytes())
+	if len(body.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(body.Rows))
+	}
+	row := body.Rows[0]
+	if row.TeamID != teamID.String() {
+		t.Fatalf("team_id = %s, want %s", row.TeamID, teamID)
+	}
+	if row.Error != nil {
+		t.Fatalf("unexpected billing error: %+v", row.Error)
+	}
+	if row.Summary == nil {
+		t.Fatal("summary missing")
+	}
+
+	billingPeriod, ok := row.Summary["billing_period"].(map[string]any)
+	if !ok {
+		t.Fatalf("billing_period = %T, want map", row.Summary["billing_period"])
+	}
+	start, err := time.Parse(time.RFC3339Nano, billingPeriod["start"].(string))
+	if err != nil {
+		t.Fatalf("parse billing_period.start: %v", err)
+	}
+	if !start.Equal(periodStart) {
+		t.Fatalf("billing_period.start = %s, want %s", start, periodStart)
+	}
+	end, err := time.Parse(time.RFC3339Nano, billingPeriod["end"].(string))
+	if err != nil {
+		t.Fatalf("parse billing_period.end: %v", err)
+	}
+	if !end.Equal(periodEnd) {
+		t.Fatalf("billing_period.end = %s, want %s", end, periodEnd)
+	}
+
+	want := billing.CalculateSummaryCharges(
+		2*3600,
+		2*3600,
+		10*3600,
+		0.000011,
+		0.0000045,
+		0.00000003,
+		0.060000,
+	)
+	assertFloatNear(t, row.Summary["current_charges_usd"].(float64), want.CurrentChargesUSD)
+	assertFloatNear(t, row.Summary["credits_applied_usd"].(float64), want.CreditsAppliedUSD)
+	assertFloatNear(t, row.Summary["credits_remaining_usd"].(float64), want.CreditsRemainingUSD)
+}
+
+func TestPlatformBillingUsesExactMonthBoundaryAtRollover(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	fixedNow := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	r := newInternalRouterWithNow(t, func() time.Time { return fixedNow })
+
+	cw := do(r, "POST", "/sandboxes", ownerKey, `{"name":"platform-billing-month-rollover"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: expected 201, got %d: %s", cw.Code, cw.Body.String())
+	}
+	sandboxID, err := uuid.Parse(mustJSON(t, cw)["id"].(string))
+	if err != nil {
+		t.Fatalf("parse sandbox id: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded compute billing interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_storage_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded storage billing interval: %v", err)
+	}
+
+	periodStart, periodEnd := billing.CurrentBillingPeriod(fixedNow)
+	seedPlatformBillingRatesForTest(t, ctx, teamID, "platform-billing-rollover-"+uuid.NewString(), periodStart.Add(-time.Hour))
+
+	// One interval ends exactly at the boundary, one starts exactly at the
+	// boundary, and one ledger row belongs to the previous month.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason
+		)
+		VALUES
+			($1, $2, 2, 2048, $3, $4, 'paused'),
+			($1, $2, 2, 2048, $4, $5, 'paused')
+	`, sandboxID, teamID, periodStart.Add(-time.Hour), periodStart, periodStart.Add(time.Hour)); err != nil {
+		t.Fatalf("seed rollover compute intervals: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (
+			sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason
+		)
+		VALUES
+			($1, $2, 10240, $3, $4, 'deleted'),
+			($1, $2, 10240, $4, $5, 'deleted')
+	`, sandboxID, teamID, periodStart.Add(-time.Hour), periodStart, periodStart.Add(time.Hour)); err != nil {
+		t.Fatalf("seed rollover storage intervals: %v", err)
+	}
+
+	var grantID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, created_at, updated_at)
+		VALUES ($1, 0.060000, 0.020000, 'month rollover opening balance', $2, $2)
+		RETURNING id
+	`, teamID, periodStart.Add(-time.Hour)).Scan(&grantID); err != nil {
+		t.Fatalf("seed credit grant: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_ledger (
+			team_id, grant_id, billing_period_start, billing_period_end, amount_usd, reason
+		)
+		VALUES ($1, $2, $3, $4, 0.040000, 'billing period finalization credit application')
+	`, teamID, grantID, periodStart.AddDate(0, -1, 0), periodStart); err != nil {
+		t.Fatalf("seed july credit ledger: %v", err)
+	}
+
+	actorID := seedPlatformAdminProfile(t)
+	resp := doInternal(
+		r,
+		http.MethodGet,
+		fmt.Sprintf("/internal/billing?search=%s&sort=team_name&order=asc", teamID.String()),
+		actorID.String(),
+		"",
+	)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("platform billing response: %d %s", resp.Code, resp.Body.String())
+	}
+
+	body := decodePlatformBilling(t, resp.Body.Bytes())
+	if len(body.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(body.Rows))
+	}
+	row := body.Rows[0]
+	if row.TeamID != teamID.String() {
+		t.Fatalf("team_id = %s, want %s", row.TeamID, teamID)
+	}
+	if row.Error != nil {
+		t.Fatalf("unexpected billing error: %+v", row.Error)
+	}
+	if row.Summary == nil {
+		t.Fatal("summary missing")
+	}
+
+	billingPeriod, ok := row.Summary["billing_period"].(map[string]any)
+	if !ok {
+		t.Fatalf("billing_period = %T, want map", row.Summary["billing_period"])
+	}
+	start, err := time.Parse(time.RFC3339Nano, billingPeriod["start"].(string))
+	if err != nil {
+		t.Fatalf("parse billing_period.start: %v", err)
+	}
+	if !start.Equal(periodStart) {
+		t.Fatalf("billing_period.start = %s, want %s", start, periodStart)
+	}
+	end, err := time.Parse(time.RFC3339Nano, billingPeriod["end"].(string))
+	if err != nil {
+		t.Fatalf("parse billing_period.end: %v", err)
+	}
+	if !end.Equal(periodEnd) {
+		t.Fatalf("billing_period.end = %s, want %s", end, periodEnd)
+	}
+
+	want := billing.CalculateSummaryCharges(
+		0,
+		0,
+		0,
+		0.000011,
+		0.0000045,
+		0.00000003,
+		0.020000,
+	)
+	assertFloatNear(t, row.Summary["current_charges_usd"].(float64), want.CurrentChargesUSD)
+	assertFloatNear(t, row.Summary["credits_applied_usd"].(float64), want.CreditsAppliedUSD)
+	assertFloatNear(t, row.Summary["credits_remaining_usd"].(float64), want.CreditsRemainingUSD)
 }
