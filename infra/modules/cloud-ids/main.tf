@@ -66,6 +66,7 @@ resource "google_monitoring_alert_policy" "ids_threats" {
         log_id("ids.googleapis.com/threat")
         AND resource.type="ids.googleapis.com/Endpoint"
         AND resource.labels.id="${var.endpoint_name}"
+        AND jsonPayload.alert_severity!="INFORMATIONAL"
       EOT
     }
   }
