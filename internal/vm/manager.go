@@ -1205,12 +1205,9 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			return existing, nil
 		}
 		// An unverified target is the one case where blindness is unsafe in
-		// BOTH directions: blind adoption could hand back a corpse, blind
-		// refusal relaunches over a possibly-live guest (and a stale marker —
-		// a swallowed clear, a crash before the verified persist — would make
-		// that rollback happen to a HEALTHY VM). Evidence decides, with the
-		// same gate restore adoption uses; success also heals the marker
-		// durably.
+		// BOTH directions: blind adoption hands back a corpse, blind refusal
+		// relaunches over a possibly-live guest. Evidence decides, with the
+		// gate restore adoption uses; success heals the marker durably.
 		if verr := m.verifyBoxdReady(ctx, existing.IP); verr != nil {
 			// A genuine verdict (see verifyBoxdReady): the record is a corpse.
 			// Record it before relaunching: the relaunch can still fail a
@@ -1838,9 +1835,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				// because the reconciler's live-unit rules defer to a Running
 				// record. No unit stop here: boxd-dead does not prove
 				// guest-dead, and the relaunch replaces the unit anyway.
-				// persistStateIfPresent, not setStatus: a destroy racing this
-				// branch must not have its record deletion overwritten by an
-				// unconditional put.
+				// If-present, so a racing destroy's deletion still wins.
 				existing.mu.Lock()
 				existing.Status = StatusError
 				existing.mu.Unlock()
