@@ -1213,16 +1213,11 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// durably.
 		if verr := m.verifyBoxdReady(ctx, existing.IP); verr != nil {
 			// A genuine verdict (see verifyBoxdReady): the record is a corpse.
-			// Record that before relaunching. The relaunch can still fail on a
-			// precondition (missing snapshot, slot, unit start) and those paths
-			// return without touching status — they assume a Paused input — so
-			// the crash-window record's Running claim would survive and keep
-			// advertising a VM that never came back. Paused is the truth: not
-			// serving, snapshot intact. It also frees the reconciler to reap
-			// the corpse's unit (its live-unit rules defer to Running) and
-			// sends the next retry straight to a fresh restore. The marker
-			// stays set — readiness is still unproven, and the relaunch below
-			// reads it to decide it must verify synchronously.
+			// Record it before relaunching: the relaunch can still fail a
+			// precondition, and those paths return without touching status
+			// (they assume a Paused input), leaving the record advertising a
+			// VM that never came back. The marker stays set — readiness is
+			// still unproven, and the relaunch below reads it to verify.
 			existing.mu.Lock()
 			existing.Status = StatusPaused
 			existing.mu.Unlock()
