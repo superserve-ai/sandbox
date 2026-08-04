@@ -3561,10 +3561,14 @@ func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Dur
 	return boxdHealthProbe(ctx, vmIP, timeout)
 }
 
-// boxdResumeReadyBudget bounds the post-resume readiness gate. Sized above the
-// observed cold-memory stall tail (~11s); /health answers from guest memory,
-// so a cold-storage resume needs no more.
-const boxdResumeReadyBudget = 15 * time.Second
+// boxdResumeReadyBudget bounds the post-resume readiness gate. Sized well
+// above the observed ~11s cold-memory stall tail (serving even /health can
+// block on lazily-faulted pages after a UFFD resume), with margin because
+// that stall's root cause is still open and can worsen under host disk
+// pressure. Spent in full only when boxd is genuinely unreachable — a wedged
+// guest — so the generous bound costs nothing on the happy path but keeps a
+// slow-but-healthy resume from being torn down.
+const boxdResumeReadyBudget = 30 * time.Second
 
 // resumeReadyOrAbort confirms boxd answered after a resume, else tears the
 // resume down. The probe runs on a budget DETACHED from the caller's ctx: a
