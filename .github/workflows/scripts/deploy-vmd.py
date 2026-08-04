@@ -16,6 +16,10 @@ Env vars:
   VMD_INSTALL_DIR      required — bin install dir on the host (e.g. /usr/local/bin)
   SHA                  required — commit SHA (only first 8 chars used)
   SENTRY_DSN           optional — upserted into /etc/sandbox/vmd.env when set
+  BACKUP_BUCKET        optional — the cell's artifact backup bucket. Upserted
+                       into vmd.env when set; empty = skip, leaving the
+                       host's backup uploader disabled. Staged rollout:
+                       staging first, production after the staging soak.
   CONTROL_PLANE_URL    optional — control-plane base URL (e.g.
                        https://api.superserve.ai). Upserted into vmd.env when
                        set. vmd reads it via os.Getenv("CONTROL_PLANE_URL").
@@ -95,6 +99,8 @@ BUNDLE_FILES = [
     "deploy/firecracker@.service",
     "deploy/firecracker-netns@.service",
     "deploy/sandboxes.slice",
+    "deploy/needrestart-superserve.conf",
+    "deploy/apt-no-auto-upgrades.conf",
     "scripts/fc-cleanup",
 ]
 
@@ -107,6 +113,7 @@ def main() -> int:
     install_dir = os.environ.get("VMD_INSTALL_DIR", "/usr/local/bin")
     sha = os.environ["SHA"][:8]
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
+    backup_bucket = os.environ.get("BACKUP_BUCKET", "")
     control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
     internal_api_token = os.environ.get("INTERNAL_API_TOKEN", "")
     database_url = os.environ.get("DATABASE_URL", "")
@@ -120,6 +127,8 @@ def main() -> int:
     # full "KEY=value" token, as a literal env-file line via `echo`.
     q_sentry = shlex.quote(sentry_dsn)
     q_sentry_line = shlex.quote(f"SENTRY_DSN={sentry_dsn}")
+    q_backup = shlex.quote(backup_bucket)
+    q_backup_line = shlex.quote(f"BACKUP_BUCKET={backup_bucket}")
     q_cpu = shlex.quote(control_plane_url)
     q_cpu_line = shlex.quote(f"CONTROL_PLANE_URL={control_plane_url}")
     q_dns = shlex.quote(dns_redirect_port)
@@ -222,6 +231,14 @@ def main() -> int:
 
             sudo install -m 0755 {extract_dir}/scripts/fc-cleanup {install_dir}/fc-cleanup
 
+            # Host patching policy: OS packages install only in deliberate
+            # maintenance windows, and library-upgrade tooling must never
+            # restart the VM or platform units. Re-asserted every deploy so a
+            # reimaged or hand-edited host converges back to the policy.
+            sudo install -D -m 0644 {extract_dir}/deploy/needrestart-superserve.conf /etc/needrestart/conf.d/50-superserve.conf
+            sudo install -D -m 0644 {extract_dir}/deploy/apt-no-auto-upgrades.conf /etc/apt/apt.conf.d/99superserve-no-auto-upgrades
+            sudo systemctl disable --now apt-daily-upgrade.timer 2>/dev/null || true
+
             # Inject boxd + rebuild rootfs only when the new binary differs
             # from what's already installed. `-trimpath -ldflags '-s -w'`
             # makes Go builds reproducible, so hashes only differ when
@@ -287,6 +304,13 @@ def main() -> int:
             if [ -n {q_sentry} ]; then
                 sudo sed -i '/^SENTRY_DSN=/d' /etc/sandbox/vmd.env
                 echo {q_sentry_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Upsert BACKUP_BUCKET (the cell's artifact backup bucket).
+            # Empty = skip, leaving the uploader disabled on this host.
+            if [ -n {q_backup} ]; then
+                sudo sed -i '/^BACKUP_BUCKET=/d' /etc/sandbox/vmd.env
+                echo {q_backup_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
             # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes

@@ -291,7 +291,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		return
 	}
 
-	snapshotPath, memPath, err := pauseWithRetry(ctx, vmd, sbx.ID.String())
+	snapshotPath, memPath, manifest, err := pauseWithRetry(ctx, vmd, sbx.ID.String())
 	if err != nil {
 		// Retry (see pauseWithRetry) didn't converge — the VM genuinely
 		// didn't pause, so revert to active and let the next tick retry.
@@ -304,14 +304,15 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	postCtx, postCancel := context.WithTimeout(ctx, vmdTimeout)
 	defer postCancel()
 
-	if _, err := h.DB.FinalizePause(postCtx, db.FinalizePauseParams{
-		ID:        sbx.ID,
-		TeamID:    sbx.TeamID,
-		Path:      snapshotPath,
-		MemPath:   &memPath,
-		SizeBytes: 0,
-		Trigger:   "timeout",
-	}); err != nil {
+	params := db.FinalizePauseParams{
+		ID:      sbx.ID,
+		TeamID:  sbx.TeamID,
+		Path:    snapshotPath,
+		MemPath: &memPath,
+		Trigger: "timeout",
+	}
+	applyManifest(&params, manifest)
+	if _, err := h.finalizePause(postCtx, params); err != nil {
 		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
 		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)

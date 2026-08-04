@@ -80,6 +80,34 @@ SELECT EXISTS (
   )
 );
 
+-- name: HostHasCapabilitiesUnlocked :one
+-- HostHasCapabilities without the row lock, for standalone pre-flight reads
+-- outside a mutation transaction: omitting the lock keeps concurrent checks
+-- from serializing behind the host's heartbeat writer. Transactional callers
+-- that must pin the host across a commit use HostHasCapabilities.
+WITH target_host AS MATERIALIZED (
+  SELECT id, last_heartbeat_at
+  FROM host
+  WHERE id = sqlc.arg('host_id')
+    AND status = 'active'
+    AND last_heartbeat_at IS NOT NULL
+)
+SELECT EXISTS (
+  SELECT 1
+  FROM target_host h
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
+);
+
 -- name: MarkHostUnhealthy :exec
 UPDATE host
 SET status = 'unhealthy', updated_at = now()

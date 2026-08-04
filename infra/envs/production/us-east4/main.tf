@@ -20,6 +20,12 @@ provider "google" {
 }
 
 locals {
+  cloud_ids_mirrored_subnet_self_links = [
+    module.network.subnetwork_self_link,
+  ]
+}
+
+locals {
   project_id             = var.project_id
   environment            = var.environment
   region                 = var.region
@@ -32,6 +38,13 @@ locals {
     managed_by  = "terraform"
     region      = local.region
   }
+
+  sandbox_host_labels = merge(local.common_labels, {
+    owner              = "platform"
+    project            = "sandbox"
+    dataclassification = "confidential"
+    application        = "sandbox-host"
+  })
 }
 
 module "network" {
@@ -90,6 +103,11 @@ module "network" {
   labels = local.common_labels
 }
 
+data "google_service_account" "api_runner" {
+  project    = local.project_id
+  account_id = "superserve-api-runner"
+}
+
 # The CD service account needs Certificate Manager access to read/manage the
 # api.superserve.ai cert map + DNS authorization this cell owns (the plan's
 # import 403'd without it). Granted out-of-band to unblock; imported (see
@@ -104,17 +122,17 @@ resource "google_project_iam_member" "cd_certificatemanager" {
 # A5: us-east4 control plane for the "use" cell.
 #
 # This is a host swap, not a new cell: us-east4 shares the use-cell Supabase,
-# runtime secrets, runner service account, and KMS key with us-central1.
+# runtime secrets, api-runner service account, and KMS key with us-central1.
 # Only the service name, region, and VMD address are region-local — traffic
 # splits between this service and the us-central1 one during cutover, then
 # us-central1 drains. Secrets resolve to the shared (suffix-less) use-cell
 # names via the *_secret_name overrides in terraform.tfvars.
 #
-# No per-root secret IAM here: the API runtime already holds the shared
-# accessor grants (owned by us-central1's new_api_runtime_secrets), and its
-# credentials-kek encrypt/decrypt grant is owned out-of-band. Re-declaring
-# them from this state would double-manage the same bindings. The sandbox host
-# uses a separate runtime identity with no access to those API secrets.
+# No per-root secret IAM here: the shared api-runner SA already holds the
+# runtime accessor grants (owned by us-central1's api_runtime_secrets) and the
+# credentials-kek encrypt/decrypt grant (owned out-of-band). Re-declaring them
+# from this state would double-manage the same bindings — the same split we
+# settled for usw2 in #232/#233.
 module "api" {
   source = "../../../modules/api"
 
@@ -122,7 +140,7 @@ module "api" {
   environment           = local.environment
   region                = local.region
   service_name          = "superserve-api-${local.resource_suffix}"
-  service_account_email = "superserve-api-runtime@${local.project_id}.iam.gserviceaccount.com"
+  service_account_email = data.google_service_account.api_runner.email
   # First create must reference a tag that actually exists, or the initial
   # revision never goes ready and the apply fails. The other regions can carry
   # a ":replace-me" placeholder only because their services already exist and
@@ -219,6 +237,19 @@ module "api_cert_lb" {
   neg_name = "superserve-api-use4-neg"
 }
 
+module "cloud_ids" {
+  source = "../../../modules/cloud-ids"
+
+  project_id                 = local.project_id
+  region                     = local.region
+  zone                       = local.zone
+  network_self_link          = module.network.network_self_link
+  endpoint_name              = "superserve-ids-${local.resource_suffix}"
+  mirrored_subnet_self_links = local.cloud_ids_mirrored_subnet_self_links
+  notification_channel_ids   = var.notification_channel_ids
+  labels                     = local.common_labels
+}
+
 module "sandbox_host" {
   source = "../../../modules/sandbox-host"
 
@@ -239,15 +270,16 @@ module "sandbox_host" {
   # this stays a no-op adoption: sandbox_status is still "provisioning" live;
   # flipping it to "ready" (to match the deployment-registry selector) is a
   # separate, intentional change, not part of this import PR.
-  labels = merge(local.common_labels, {
-    component               = "vmd"
-    sandbox_role            = "vmd"
-    sandbox_status          = "provisioning"
-    "goog-ops-agent-policy" = "v2-template-1-7-0"
+  labels = merge(local.sandbox_host_labels, {
+    component                  = "vmd"
+    sandbox_role               = "vmd"
+    sandbox_status             = "provisioning"
+    "goog-ops-agent-policy"    = "v2-template-1-7-0"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
 
-  service_account_email     = "superserve-sandbox-runtime@${local.project_id}.iam.gserviceaccount.com"
-  allow_stopping_for_update = true
+  service_account_email = data.google_service_account.api_runner.email
 
   # Matches the live us-central1 prod host (Ubuntu 22.04 LTS), NOT this
   # module's typical 24.04 default — the current prod host actually runs
@@ -299,4 +331,31 @@ module "observability" {
     }
   }
   labels = local.common_labels
+}
+
+# Durability tier for the host's local-SSD artifacts (sandbox snapshots,
+# template builds). The vmd host runs as the shared api-runner SA, so that SA
+# is the writer: create+read on this bucket, never delete — deletes belong to
+# the module's dedicated GC identity, which nothing on the host runs as.
+module "backup_storage" {
+  source = "../../../modules/backup-storage"
+
+  project_id  = local.project_id
+  environment = local.environment
+  location    = local.region
+  bucket_name = "superserve-artifact-backup-${local.resource_suffix}"
+
+  gc_service_account_id = "superserve-backup-gc-${local.resource_suffix}"
+
+  restore_service_account_id = "superserve-backup-ro-${local.resource_suffix}"
+
+  writer_members = [
+    "serviceAccount:${data.google_service_account.api_runner.email}",
+  ]
+
+  labels = merge(local.common_labels, {
+    component                  = "backup"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_snapshots_and_files"
+  })
 }

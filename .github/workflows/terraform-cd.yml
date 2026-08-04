@@ -85,7 +85,6 @@ jobs:
   staging-us-central1-infra:
     name: Apply staging/us-central1
     runs-on: ubuntu-latest
-    environment: staging
     needs: [wait-for-migrations]
     permissions:
       contents: read
@@ -202,11 +201,11 @@ jobs:
           scripts/smoke-test-region.sh staging us-central1
           echo "staging/us-central1 API deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
 
-  production-us-west2-infra:
-    name: Apply production/us-west2
+  production-us-central1-bootstrap:
+    name: Bootstrap production/us-central1 project services
     runs-on: ubuntu-latest
     environment: production
-    needs: [production-us-central1-infra]
+    needs: [staging-us-central1-infra]
     permissions:
       contents: read
       id-token: write
@@ -226,11 +225,50 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+      - name: Verify validation dependencies
+        run: |
+          set -euo pipefail
+          command -v jq
+          command -v curl
 
-      - name: Verify production runtime KMS grant
-        run: bash infra/scripts/verify-production-runtime-kms.sh
+      - name: Apply production/us-central1 project services
+        run: |
+          set -euo pipefail
+          echo "## Terraform rollout: production/us-central1 bootstrap" >> "$GITHUB_STEP_SUMMARY"
+          cd infra/envs/production/us-central1
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false \
+            -target=google_project_service.cloud_ids \
+            -target=google_project_service.compute \
+            -target=google_project_service.logging \
+            -target=google_project_service.monitoring \
+            -out=tfplan
+          terraform apply -input=false -auto-approve tfplan
+
+  production-us-west2-infra:
+    name: Apply production/us-west2
+    runs-on: ubuntu-latest
+    environment: production
+    needs: [staging-us-central1-api, production-us-central1-bootstrap]
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: 'true'
+      TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Verify validation dependencies
         run: |
@@ -331,7 +369,7 @@ jobs:
     name: Apply production/us-central1
     runs-on: ubuntu-latest
     environment: production
-    needs: [staging-us-central1-api]
+    needs: [production-us-west2-api]
     permissions:
       contents: read
       id-token: write
@@ -373,15 +411,16 @@ jobs:
   # us-central1 api deploy, so infra-inclusive pushes (which skip Deploy API via
   # its infra_changed guard) still roll the primary to the new image.
   #
-  # The regional root consumes runtime accounts and shared secret grants created
-  # by the central1 bootstrap root, so it must wait for central1 infrastructure.
-  # It also waits for the west2 validated rollout so the two regional host
-  # service-account swaps do not run at the same time.
+  # Branches off staging directly (NOT off the us-west2/us-central1 chain) so a
+  # secondary-region deploy/traffic/smoke failure can never block the primary's
+  # rollout. us-east4 only reads the shared api-runner SA (a data source) and
+  # re-declares no us-central1-owned resource, so it needs no apply ordering
+  # against that cell.
   production-us-east4-infra:
     name: Apply production/us-east4
     runs-on: ubuntu-latest
     environment: production
-    needs: [staging-us-central1-api, production-us-central1-infra, production-us-west2-api]
+    needs: [staging-us-central1-api, production-us-central1-bootstrap]
     permissions:
       contents: read
       id-token: write
@@ -400,12 +439,6 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Verify production runtime KMS grant
-        run: bash infra/scripts/verify-production-runtime-kms.sh
 
       - name: Terraform apply production/us-east4
         run: |

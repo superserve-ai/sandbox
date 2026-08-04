@@ -332,10 +332,12 @@ func (h *Handlers) pushPreviewCredentialPolicy(ctx context.Context, sandbox db.S
 	return "delivered", nil
 }
 
+// requireHostPreviewCapabilities is the standalone request-path pre-flight,
+// served from the positive-only attestation cache (hostcap_cache.go).
+// Authoritative enforcement stays with VMD's post-boot attestation and the
+// transactional validateHostPreviewCapabilities on mutations.
 func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string, capabilities ...string) bool {
-	hasCapabilities, err := h.DB.HostHasCapabilities(c.Request.Context(), db.HostHasCapabilitiesParams{
-		HostID: hostID, RequiredCapabilities: capabilities,
-	})
+	hasCapabilities, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, capabilities)
 	if err != nil {
 		log.Error().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).Msg("DB HostHasCapabilities failed")
 		respondError(c, ErrInternal)

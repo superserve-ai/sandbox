@@ -25,7 +25,9 @@ on:
       - 'cmd/boxd/**'
       - 'cmd/template-builder/**'
       - 'cmd/secretsproxy/**'
+      - 'proto/**'
       - 'internal/vm/**'
+      - 'internal/backup/**'
       - 'internal/network/**'
       - 'internal/builder/**'
       - 'internal/db/**'
@@ -36,6 +38,8 @@ on:
       - 'deploy/firecracker@.service'
       - 'deploy/firecracker-netns@.service'
       - 'deploy/sandboxes.slice'
+      - 'deploy/needrestart-superserve.conf'
+      - 'deploy/apt-no-auto-upgrades.conf'
       - 'scripts/fc-cleanup'
       # The workflow + its deploy script must self-trigger (as deploy-otel does),
       # or a new cell/step lands without ever running until an unrelated vmd
@@ -90,6 +94,9 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          # Staging validates the backup uploader first; the production
+          # cells get their buckets after the staging soak.
+          BACKUP_BUCKET: superserve-artifact-backup-staging-usc1
         run: |
           python3 .github/workflows/scripts/deploy-vmd.py
 
@@ -146,6 +153,7 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          BACKUP_BUCKET: superserve-artifact-backup-use4
           # use4 is the "use" cell's Supabase + control plane.
           CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_PROD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
@@ -188,6 +196,9 @@ jobs:
           CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_USW }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}
           INTERNAL_API_TOKEN: ${{ secrets.PROD_USW_INTERNAL_API_TOKEN }}
+          # Enables the pause-backup uploader for the cell (validated on
+          # staging first; the bucket is create-only for hosts).
+          BACKUP_BUCKET: superserve-artifact-backup-usw2
         run: |
           # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
           # filter and fan out to every VMD_LABEL match — which would push

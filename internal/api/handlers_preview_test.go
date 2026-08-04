@@ -252,7 +252,7 @@ func TestPatchPreviewAccessPersistsPrivateDefaultAndPreservesPortModes(t *testin
 				return sandboxRow(sandbox)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPublic, 0)
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
 				capabilityRequirements = append(capabilityRequirements, append([]string(nil), args[0].([]string)...))
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
@@ -329,7 +329,7 @@ func TestPublishPreviewPortRejectsHostWithoutCapabilityBeforeMutation(t *testing
 				return sandboxRow(sandbox)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPublic, 0)
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
 				return scalarBoolRow(false)
 			case strings.Contains(sql, "AdvanceSandboxPreviewPolicy"), strings.Contains(sql, "PublishPort"), strings.Contains(sql, "LockSandboxForPreviewMutation"):
 				mutated = true
@@ -387,7 +387,7 @@ func TestPublishPrivatePreviewPathsRequireBrowserCapabilityBeforeMutation(t *tes
 						return sandboxRow(sandbox)
 					case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 						return previewPolicyRow(tt.defaultMode, 0)
-					case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+					case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
 						gotCapabilities = append([]string(nil), args[0].([]string)...)
 						return scalarBoolRow(!slices.Contains(gotCapabilities, preview.HostCapabilityPortBrowserAuth))
 					default:
@@ -438,7 +438,7 @@ func TestPublishPreviewPortOmissionPreservesPrivateModeAndPushesRestrictiveSnaps
 				return sandboxRow(sandbox)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRowWithWire(preview.AccessPublic, preview.AccessPrivate, 10)
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
 				return scalarUUIDRow(sandboxID)
@@ -729,7 +729,7 @@ func newPreviewCredentialTestEnv(t *testing.T) *previewCredentialTestEnv {
 				}}
 			case strings.Contains(sql, "-- name: GetPublishedPreviewPort :one"):
 				return getPortRow()
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
 				required, _ := args[0].([]string)
 				e.capabilityChecks = append(e.capabilityChecks, append([]string(nil), required...))
 				available := true

@@ -396,20 +396,71 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming';
 -- One snapshot per sandbox; the unique index on snapshot.sandbox_id keys
 -- the UPSERT.
 WITH target AS (
+  -- FOR UPDATE is load-bearing: the data-modifying CTEs below run even
+  -- when the final UPDATE matches zero rows, so eligibility must be
+  -- decided under the row lock. A concurrent finalize blocks here, then
+  -- re-evaluates the status against the committed row and reads nothing,
+  -- which keeps every downstream CTE empty instead of writing stray rows.
   SELECT id, team_id FROM sandbox
-  WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+  WHERE id = @id AND team_id = @team_id AND destroyed_at IS NULL
     AND status IN ('pausing', 'resuming')
+  FOR UPDATE
 ),
 upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
-  SELECT target.id, target.team_id, $3, $4, $5, $6 FROM target
+  SELECT target.id, target.team_id, @path, @mem_path, @size_bytes, @trigger FROM target
   ON CONFLICT (sandbox_id)
   DO UPDATE SET
     path = EXCLUDED.path,
     mem_path = EXCLUDED.mem_path,
-    size_bytes = EXCLUDED.size_bytes,
+    -- Compatibility mode while snapshot_sandbox_unique exists: history is
+    -- still one row, but the generation counter advances so consumers see
+    -- monotonic generations before and after the contract-phase index drop.
+    -- created_at refreshes with it: the row describes THIS pause's
+    -- artifacts, and after the flip it sits alongside real history rows
+    -- whose timestamps mean insertion time.
+    generation = snapshot.generation + 1,
+    created_at = now(),
+    -- A finalize that has no complete manifest passes 0 (hash budget
+    -- exhausted or a file failed to hash); keep the recorded size instead
+    -- of clobbering it back to zero.
+    size_bytes = CASE WHEN EXCLUDED.size_bytes > 0
+                      THEN EXCLUDED.size_bytes
+                      ELSE snapshot.size_bytes END,
     trigger = EXCLUDED.trigger
   RETURNING snapshot.id AS snap_id
+),
+-- This pause rewrote the artifacts on disk, so the snapshot's manifest is
+-- replaced in the same statement that finalizes the pause. Folding it in
+-- (rather than a separate best-effort write) makes the manifest inherit
+-- the status guard above: a finalize that lands late, after another pause
+-- already finalized, matches zero rows and writes nothing, so an older
+-- manifest can never overwrite a newer one. A pause whose hashing was
+-- skipped or partial leaves exactly its partial set, never stale rows.
+fresh AS (
+  SELECT unnest(@manifest_file_names::text[]) AS file_name,
+         unnest(@manifest_paths::text[])      AS path,
+         unnest(@manifest_sizes::bigint[])    AS size_bytes,
+         unnest(@manifest_digests::text[])    AS sha256,
+         unnest(@manifest_base_paths::text[]) AS base_path
+),
+kept AS (
+  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
+  SELECT u.snap_id, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
+  FROM upserted u CROSS JOIN fresh f
+  ON CONFLICT (snapshot_id, file_name) WHERE snapshot_id IS NOT NULL
+  DO UPDATE SET
+      path = EXCLUDED.path,
+      size_bytes = EXCLUDED.size_bytes,
+      sha256 = EXCLUDED.sha256,
+      base_path = EXCLUDED.base_path,
+      created_at = now()
+  RETURNING id
+),
+cleared AS (
+  DELETE FROM artifact_manifest
+  WHERE snapshot_id IN (SELECT snap_id FROM upserted)
+    AND id NOT IN (SELECT id FROM kept)
 )
 UPDATE sandbox
 SET snapshot_id = (SELECT snap_id FROM upserted),
@@ -420,9 +471,76 @@ SET snapshot_id = (SELECT snap_id FROM upserted),
     auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
     updated_at = now()
 FROM upserted
-WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
+WHERE sandbox.id = @id AND sandbox.team_id = @team_id AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
 RETURNING upserted.snap_id::uuid AS snapshot_id;
+
+-- name: HasLegacySnapshotUnique :one
+-- Rolling-deploy probe: while the legacy one-snapshot-per-sandbox unique
+-- index exists, finalizes must run the upsert (FinalizePause); once the
+-- contract phase drops it, finalizes insert real generation rows
+-- (FinalizePauseGeneration). Probed per finalize; pauses are low-rate.
+SELECT (to_regclass('public.snapshot_sandbox_unique') IS NOT NULL)::bool AS legacy;
+
+-- name: FinalizePauseGeneration :one
+-- Generations-mode finalize: INSERT a new snapshot row per pause instead of
+-- overwriting, and move the sandbox head to it. Same status guard as the
+-- legacy finalize, and the guard carries the same two protections forward:
+-- a late finalize (status no longer pausing/resuming) matches zero rows and
+-- writes nothing, and a retry after a lost-response success is a no-op for
+-- the same reason. Prior generations' rows and manifests are untouched;
+-- that is the point.
+WITH target AS (
+  -- FOR UPDATE serializes generation allocation and gates the CTE writes:
+  -- without it, two overlapping finalizes could both read the same
+  -- max(generation) and both insert, and PostgreSQL would keep the losing
+  -- statement's CTE inserts even though its final UPDATE matched zero
+  -- rows. Under the lock the loser re-reads a no-longer-eligible status,
+  -- target is empty, and nothing downstream writes.
+  SELECT id, team_id FROM sandbox
+  WHERE id = @id AND team_id = @team_id AND destroyed_at IS NULL
+    AND status IN ('pausing', 'resuming')
+  FOR UPDATE
+),
+inserted AS (
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation)
+  SELECT target.id, target.team_id, @path, @mem_path,
+         -- A non-positive total means the manifest was partial (hash budget
+         -- exhausted or a file failed to hash): carry the prior head's
+         -- known size forward as the best available estimate, mirroring
+         -- the legacy upsert's keep-prior semantics. The incomplete
+         -- manifest itself is surfaced by coverage monitoring.
+         CASE WHEN @size_bytes > 0 THEN @size_bytes
+              ELSE COALESCE((SELECT s.size_bytes FROM snapshot s
+                             WHERE s.sandbox_id = target.id
+                             ORDER BY s.generation DESC LIMIT 1), 0) END,
+         @trigger,
+         COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1
+  FROM target
+  RETURNING snapshot.id AS snap_id
+),
+fresh AS (
+  SELECT unnest(@manifest_file_names::text[]) AS file_name,
+         unnest(@manifest_paths::text[])      AS path,
+         unnest(@manifest_sizes::bigint[])    AS size_bytes,
+         unnest(@manifest_digests::text[])    AS sha256,
+         unnest(@manifest_base_paths::text[]) AS base_path
+),
+manifested AS (
+  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
+  SELECT i.snap_id, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
+  FROM inserted i CROSS JOIN fresh f
+  RETURNING id
+)
+UPDATE sandbox
+SET snapshot_id = (SELECT snap_id FROM inserted),
+    status = 'paused',
+    auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
+    updated_at = now()
+FROM inserted
+WHERE sandbox.id = @id AND sandbox.team_id = @team_id AND sandbox.destroyed_at IS NULL
+  AND sandbox.status IN ('pausing', 'resuming')
+RETURNING inserted.snap_id::uuid AS snapshot_id;
 
 -- name: UpdateSandboxNetworkConfig :exec
 UPDATE sandbox
@@ -441,6 +559,15 @@ SELECT
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
   COALESCE(p.access, 'legacy_public')::text AS wire_access,
   COALESCE(p.revision, 0)::bigint AS revision
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL;
+
+-- name: GetSandboxWithPreviewPolicy :one
+-- GetSandbox plus the effective preview access, so read endpoints return
+-- both in one round-trip.
+SELECT sqlc.embed(s),
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL;
