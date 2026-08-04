@@ -1212,9 +1212,8 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// same gate restore adoption uses; success also heals the marker
 		// durably.
 		if verr := m.verifyBoxdReady(ctx, existing.IP); verr != nil {
-			// Silence for the whole gate — a genuine verdict, since the probe
-			// ran its own budget (see verifyBoxdReady): the record is a
-			// corpse. Fall through to the relaunch, resume's remedy for it.
+			// A genuine verdict (see verifyBoxdReady): the record is a corpse.
+			// Fall through to the relaunch, resume's remedy for it.
 			log.Warn().Err(verr).Msg("resume: unverified VM failed readiness — relaunching")
 		} else {
 			if cerr := m.commitVerifiedAdoption(existing); cerr != nil {
@@ -1811,9 +1810,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				if !still {
 					return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 				}
-				// Definitive exhaustion — the probe ran its own budget
-				// regardless of the caller (see verifyBoxdReady), so this is a
-				// verdict. Flip out of Running. That forces the
+				// Definitive exhaustion, a genuine verdict (see
+				// verifyBoxdReady): flip out of Running. That forces the
 				// retry to relaunch — the only escape from a wedged agent,
 				// since re-adopting one loops forever — and unblocks cleanup,
 				// because the reconciler's live-unit rules defer to a Running
