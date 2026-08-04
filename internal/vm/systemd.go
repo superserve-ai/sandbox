@@ -328,7 +328,19 @@ var killUnitSIGKILL = func(ctx context.Context, unit string) bool {
 	kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	_ = exec.CommandContext(kctx, "systemctl", "kill", "-s", "SIGKILL", unit).Run()
-	return unitFullyDown(kctx, unit)
+	// Poll: systemd reaps the unit asynchronously after the signal, so a
+	// single immediate probe reads "deactivating" even for a clean kill and
+	// the confirmed release would never be reachable.
+	for {
+		if unitFullyDown(kctx, unit) {
+			return true
+		}
+		select {
+		case <-kctx.Done():
+			return false
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 // unitLingering reports whether the unit has a live or winding-down process
