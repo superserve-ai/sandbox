@@ -49,7 +49,7 @@ func TestJournalPriorityAndFIFO(t *testing.T) {
 			break
 		}
 		got = append(got, task.Generation)
-		if err := j.Ack(task, false, false); err != nil {
+		if err := j.Ack(task, "", false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -124,19 +124,19 @@ func TestJournalRecordsCompletions(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if covered, err := j.Covered(task); err != nil || !covered {
+	if covered, err := j.Covered("test-bucket", task); err != nil || !covered {
 		t.Fatalf("pending task not covered: %v err=%v", covered, err)
 	}
-	if done, err := j.WasCompleted(task); err != nil || done {
+	if done, err := j.WasCompleted("test-bucket", task); err != nil || done {
 		t.Fatalf("WasCompleted before ack = %v err=%v", done, err)
 	}
-	if err := j.Ack(task, true, false); err != nil {
+	if err := j.Ack(task, "test-bucket", false); err != nil {
 		t.Fatal(err)
 	}
-	if done, err := j.WasCompleted(task); err != nil || !done {
+	if done, err := j.WasCompleted("test-bucket", task); err != nil || !done {
 		t.Fatalf("WasCompleted after completed ack = %v err=%v", done, err)
 	}
-	if covered, err := j.Covered(task); err != nil || !covered {
+	if covered, err := j.Covered("test-bucket", task); err != nil || !covered {
 		t.Fatalf("completed task not covered: %v err=%v", covered, err)
 	}
 
@@ -146,13 +146,13 @@ func TestJournalRecordsCompletions(t *testing.T) {
 	if err := j.Enqueue(abandoned); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(abandoned, false, false); err != nil {
+	if err := j.Ack(abandoned, "", false); err != nil {
 		t.Fatal(err)
 	}
-	if done, _ := j.WasCompleted(abandoned); done {
+	if done, _ := j.WasCompleted("test-bucket", abandoned); done {
 		t.Fatal("abandoned ack recorded a completion")
 	}
-	if covered, _ := j.Covered(abandoned); covered {
+	if covered, _ := j.Covered("test-bucket", abandoned); covered {
 		t.Fatal("abandoned generation reported covered")
 	}
 }
@@ -197,7 +197,7 @@ func TestJournalQueueKeysScopedByOwner(t *testing.T) {
 			break
 		}
 		owners[task.owner()] = true
-		if err := j.Ack(task, false, false); err != nil {
+		if err := j.Ack(task, "", false); err != nil {
 			t.Fatal(err)
 		}
 	}

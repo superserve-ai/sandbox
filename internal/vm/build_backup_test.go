@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -394,5 +395,99 @@ func TestSweepReconcileWaitsForSlotInsteadOfDropping(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("blocking sweep reconcile never enqueued after slots freed")
+	}
+}
+
+// Registering a rebuild cancels an in-flight adoption reconcile for the
+// same template+build and waits for it to exit, so stale stamps can
+// never land after the new build is admitted.
+func TestRegisterBuildCancelsInFlightReconcile(t *testing.T) {
+	dir := t.TempDir()
+	writeAdoptableBuildFixture(t, dir, "tpl", "build-tpl")
+
+	// A hook that blocks keeps the reconcile in flight until cancelled.
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		entered <- struct{}{}
+		<-release
+		return nil
+	})
+	defer close(release)
+
+	res, err := readBuildMetaJSON(filepath.Join(dir, TemplatesDirName, "tpl", "build-tpl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.reconcileAdoptedBuildBackupMode(BuildStatusSnapshot{
+		BuildVMID: "build-tpl", TemplateID: "tpl", Status: BuildStatusReady, Result: res,
+	}, true)
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("reconcile never reached the enqueue hook")
+	}
+
+	// Registration must cancel the reconcile and return once it exits.
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.registerBuild("build-tpl", "tpl", func() {})
+		done <- err
+	}()
+	// The blocked hook ignores cancellation, so release it shortly
+	// after the cancel lands to let the goroutine exit.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		release <- struct{}{}
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("registerBuild after reconcile exit: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("registerBuild never returned")
+	}
+}
+
+// In-flight reconcile keys carry the template: two templates reusing one
+// build id must not starve each other.
+func TestReconcileInFlightKeyIsTemplateScoped(t *testing.T) {
+	dir := t.TempDir()
+	writeAdoptableBuildFixture(t, dir, "tpl-a", "build-1")
+	writeAdoptableBuildFixture(t, dir, "tpl-b", "build-1")
+
+	var mu sync.Mutex
+	owners := map[string]bool{}
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		mu.Lock()
+		owners[task.TemplateID] = true
+		mu.Unlock()
+		return nil
+	})
+
+	for _, tpl := range []string{"tpl-a", "tpl-b"} {
+		res, err := readBuildMetaJSON(filepath.Join(dir, TemplatesDirName, tpl, "build-1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.reconcileAdoptedBuildBackupMode(BuildStatusSnapshot{
+			BuildVMID: "build-1", TemplateID: tpl, Status: BuildStatusReady, Result: res,
+		}, true)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		n := len(owners)
+		mu.Unlock()
+		if n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("owners = %v, want both templates enqueued", owners)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

@@ -465,7 +465,7 @@ func TestTemplateTaskAbandonsCleanlyOnVanishedSource(t *testing.T) {
 	if counts, _ := j.Pending(); counts[PriorityCheckpoint] != 0 {
 		t.Fatalf("journal residue after abandonment: %v", counts)
 	}
-	if done, _ := j.WasCompleted(task); done {
+	if done, _ := j.WasCompleted("test-bucket", task); done {
 		t.Fatal("abandoned template generation recorded as completed")
 	}
 	if len(verified) != 0 {
@@ -720,7 +720,7 @@ func TestJournalPruneSweepsHistoryAcrossAcks(t *testing.T) {
 	task := Task{SandboxID: "sb", Generation: "g", Priority: PriorityPause,
 		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)}
 	for i := 0; i < 5; i++ {
-		if err := j.Ack(task, false, false); err != nil {
+		if err := j.Ack(task, "", false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -751,7 +751,7 @@ func TestVerifiedNotificationSurvivesCrashBeforeDelivery(t *testing.T) {
 	}
 	// Simulate the first process: ack with notification owed, then crash
 	// before any delivery (no flush runs).
-	if err := j.Ack(task, true, true); err != nil {
+	if err := j.Ack(task, "test-bucket", true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -777,7 +777,7 @@ func TestAbandonedAckLeavesNoNotification(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, false, false); err != nil {
+	if err := j.Ack(task, "", false); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := j.PendingNotifications()
@@ -1024,7 +1024,7 @@ func TestNextSkipsDeferredPriorityWithoutScanning(t *testing.T) {
 	// The nack re-keyed the row; ack through the same task state must
 	// clear it (index and queue agree on the new key).
 	nacked := got
-	if err := j.Ack(nacked, false, false); err != nil {
+	if err := j.Ack(nacked, "", false); err != nil {
 		t.Fatal(err)
 	}
 	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
@@ -1312,7 +1312,7 @@ func TestStagedBaseSurvivesTemplateGC(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(staging, "bases", hex.EncodeToString(baseSum[:]))); err != nil {
 		t.Fatalf("referenced staged base swept: %v", err)
 	}
-	if err := j.Ack(Task{SandboxID: "sb2", Generation: "g2", EnqueuedAt: time.Unix(3, 0)}, false, false); err != nil {
+	if err := j.Ack(Task{SandboxID: "sb2", Generation: "g2", EnqueuedAt: time.Unix(3, 0)}, "", false); err != nil {
 		t.Fatal(err)
 	}
 	ageStagingTree(t, staging)

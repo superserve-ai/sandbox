@@ -404,23 +404,32 @@ func (j *Journal) HasPending(sandboxID, generation string) (bool, error) {
 // WasCompleted reports whether this task's owner+generation was ever
 // acked as completed (its generation fully verified in the bucket). Only
 // the task's identity fields (owner and Generation) are consulted.
-func (j *Journal) WasCompleted(task Task) (bool, error) {
+// completionKey scopes a completion record to the destination bucket:
+// a completed generation in one bucket says nothing about another, and
+// an unscoped record would suppress re-upload after BACKUP_BUCKET
+// changes.
+func completionKey(scope string, task Task) []byte {
+	return append([]byte(scope+"\x00"), task.indexKey()...)
+}
+
+func (j *Journal) WasCompleted(scope string, task Task) (bool, error) {
 	var ok bool
 	err := j.db.View(func(tx *bolt.Tx) error {
-		ok = tx.Bucket(completionsBucket).Get(task.indexKey()) != nil
+		ok = tx.Bucket(completionsBucket).Get(completionKey(scope, task)) != nil
 		return nil
 	})
 	return ok, err
 }
 
 // Covered reports whether this task's owner+generation needs no new
-// enqueue: it is either still pending in the queue or already recorded
-// as completed. The recovery sweeps' gate.
-func (j *Journal) Covered(task Task) (bool, error) {
+// enqueue against the given bucket: it is either still pending in the
+// queue or already recorded as completed there. The recovery sweeps'
+// gate.
+func (j *Journal) Covered(scope string, task Task) (bool, error) {
 	var ok bool
 	err := j.db.View(func(tx *bolt.Tx) error {
 		ok = tx.Bucket(indexBucket).Get(task.indexKey()) != nil ||
-			tx.Bucket(completionsBucket).Get(task.indexKey()) != nil
+			tx.Bucket(completionsBucket).Get(completionKey(scope, task)) != nil
 		return nil
 	})
 	return ok, err
@@ -455,7 +464,8 @@ func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
 // that makes the task's completion otherwise unrecoverable is the last
 // durable moment to remember that a completion signal is still owed.
 // Piggybacks a bounded lazy prune of expired verification history.
-func (j *Journal) Ack(task Task, completed, notify bool) error {
+func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
+	completed := completedScope != ""
 	now := time.Now()
 	return j.db.Update(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(journalBucket).Delete(task.key()); err != nil {
@@ -465,7 +475,7 @@ func (j *Journal) Ack(task Task, completed, notify bool) error {
 			return err
 		}
 		if completed {
-			if err := tx.Bucket(completionsBucket).Put(task.indexKey(), []byte(fmt.Sprintf("%d", now.UnixNano()))); err != nil {
+			if err := tx.Bucket(completionsBucket).Put(completionKey(completedScope, task), []byte(fmt.Sprintf("%d", now.UnixNano()))); err != nil {
 				return err
 			}
 		}

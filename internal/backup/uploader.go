@@ -195,7 +195,11 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 			Str("generation", task.Generation).
 			Msg("template backup generation abandoned")
 	}
-	if err := u.Journal.Ack(task, completed, completed && u.OnVerified != nil); err != nil {
+	completedScope := ""
+	if completed {
+		completedScope = u.Store.Identity()
+	}
+	if err := u.Journal.Ack(task, completedScope, completed && u.OnVerified != nil); err != nil {
 		return true, err
 	}
 	removeStagedTask(u.StagingRoot, task)

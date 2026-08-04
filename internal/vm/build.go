@@ -426,7 +426,15 @@ func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, wait
 	if m.backupEnqueue == nil || snap.Status != BuildStatusReady || snap.Result == nil {
 		return
 	}
-	if _, busy := m.adoptedBuildBackups.LoadOrStore(snap.BuildVMID, struct{}{}); busy {
+	// Keyed by template AND build id: build ids are reusable across
+	// templates, and a buildVMID-only key would let one template's
+	// in-flight reconcile permanently starve another's same-named build.
+	inflightKey := snap.TemplateID + "\x00" + snap.BuildVMID
+	handle := &reconcileHandle{done: make(chan struct{})}
+	rctx, rcancel := context.WithCancel(context.Background())
+	handle.cancel = rcancel
+	if _, busy := m.adoptedBuildBackups.LoadOrStore(inflightKey, handle); busy {
+		rcancel()
 		return
 	}
 	slots := m.ensureRehashSlots()
@@ -439,7 +447,9 @@ func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, wait
 			// All rehash slots busy: drop this attempt rather than
 			// queueing unbounded hash work; the sweep retries uncovered
 			// builds.
-			m.adoptedBuildBackups.Delete(snap.BuildVMID)
+			close(handle.done)
+			rcancel()
+			m.adoptedBuildBackups.Delete(inflightKey)
 			return
 		}
 	}
@@ -450,7 +460,9 @@ func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, wait
 	go func() {
 		defer func() {
 			<-slots
-			m.adoptedBuildBackups.Delete(buildVMID)
+			close(handle.done)
+			rcancel()
+			m.adoptedBuildBackups.Delete(inflightKey)
 		}()
 		metaID, err := baseIdentity(metaPath)
 		if err != nil {
@@ -458,6 +470,14 @@ func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, wait
 			return
 		}
 		guard := func() bool {
+			// A registration for this build id cancels rctx and AWAITS
+			// this goroutine's exit, so a guard that honors cancellation
+			// makes the check-and-write atomic with respect to rebuilds:
+			// no stamp or enqueue can land after a new build has been
+			// admitted for the same directory.
+			if rctx.Err() != nil {
+				return false
+			}
 			if m.buildActive(buildVMID) {
 				return false
 			}
@@ -471,7 +491,7 @@ func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, wait
 		if err != nil || len(stamped) == 0 {
 			log.Info().Err(err).
 				Msg("adopted build has no stamped digests; running backup hashing")
-			m.backupBuildArtifacts(context.Background(), templateID, buildVMID, dir, res.BasePath, guard, log)
+			m.backupBuildArtifacts(rctx, templateID, buildVMID, dir, res.BasePath, guard, log)
 			return
 		}
 		entries := make([]ManifestEntry, 0, len(stamped)+1)
@@ -489,7 +509,7 @@ func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, wait
 				if statErr != nil {
 					log.Warn().Str("artifact", d.Name).
 						Msg("stamped artifact not on disk; running backup hashing")
-					m.backupBuildArtifacts(context.Background(), templateID, buildVMID, dir, res.BasePath, guard, log)
+					m.backupBuildArtifacts(rctx, templateID, buildVMID, dir, res.BasePath, guard, log)
 					return
 				}
 			}
@@ -497,7 +517,7 @@ func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, wait
 				log.Warn().Str("artifact", d.Name).
 					Int64("stamped", d.SizeBytes).Int64("on_disk", fi.Size()).
 					Msg("stamped artifact size diverged; running backup hashing")
-				m.backupBuildArtifacts(context.Background(), templateID, buildVMID, dir, res.BasePath, guard, log)
+				m.backupBuildArtifacts(rctx, templateID, buildVMID, dir, res.BasePath, guard, log)
 				return
 			}
 			entries = append(entries, ManifestEntry{
@@ -509,8 +529,15 @@ func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, wait
 		}
 		log.Info().Int("files", len(entries)).
 			Msg("adopted build re-enqueued for backup from stamped digests")
-		m.finishBuildBackupEnqueue(context.Background(), templateID, buildVMID, dir, entries, guard, log)
+		m.finishBuildBackupEnqueue(rctx, templateID, buildVMID, dir, entries, guard, log)
 	}()
+}
+
+// reconcileHandle lets a rebuild registration cancel an in-flight
+// adoption reconcile for the same template+build and await its exit.
+type reconcileHandle struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // RecoverTemplateBackups reconciles every ready on-disk build whose

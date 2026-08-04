@@ -513,7 +513,11 @@ func main() {
 		uploader.StagingRoot = stagingRoot
 		mgr.SetBackupStaging(stagingRoot)
 		mgr.SetBackupEnqueue(journal.Enqueue)
-		mgr.SetBackupCovered(journal.Covered)
+		mgr.SetBackupCovered(func(t backup.Task) (bool, error) {
+			// Coverage is per bucket: a completed generation elsewhere
+			// must not suppress uploading into this one.
+			return journal.Covered(bucket, t)
+		})
 		// The uploader must fully stop before the journal and GCS client
 		// close under it: a verification or Nack cut off mid-write leaves
 		// a finalized object the journal never recorded, which the
