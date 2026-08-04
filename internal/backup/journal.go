@@ -36,6 +36,12 @@ type TaskFile struct {
 	// identity is its bytes, not its path, so a rebuilt base at the same
 	// path yields a different generation.
 	BaseSHA256 string `json:"base_sha256,omitempty"`
+	// BaseStagedPath is where the uploader READS the base image when
+	// staging snapshotted it; BasePath itself never mutates after the
+	// generation key is computed, because it is key-covered and recorded
+	// in the manifest, and rewriting it post-key would make restore's
+	// key recomputation reject the generation.
+	BaseStagedPath string `json:"base_staged_path,omitempty"`
 	// Shared marks a content-addressed artifact stored once bucket-wide
 	// (under the bases/ prefix) rather than inside the generation: base
 	// images are multi-GB and common to every sandbox on the template,

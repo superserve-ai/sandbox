@@ -220,17 +220,37 @@ func (u *Uploader) flushNotifications() {
 // base image. Size comes from the live file: the digest check subsumes
 // it (a size change changes the digest).
 func baseTaskFile(file TaskFile) (TaskFile, error) {
-	fi, err := os.Stat(file.BasePath)
+	// Read from the staged snapshot when one exists; BasePath stays the
+	// recorded identity either way.
+	src := file.BasePath
+	if file.BaseStagedPath != "" {
+		src = file.BaseStagedPath
+	}
+	fi, err := os.Stat(src)
 	if err != nil {
 		return TaskFile{}, err
 	}
 	return TaskFile{
-		Name:   "base.ext4",
-		Path:   file.BasePath,
+		Name:   SharedBaseName(file.BaseSHA256),
+		Path:   src,
 		SHA256: file.BaseSHA256,
 		Size:   fi.Size(),
 		Shared: true,
 	}, nil
+}
+
+// SharedBaseName derives the manifest file name a shared base entry
+// restores to from its content digest. A fixed name would collide when a
+// generation depends on two different bases: the upload would succeed,
+// but restore's exclusive per-name creation could never materialize both
+// files, a complete-yet-unrestorable generation discovered only at
+// recovery time.
+// SharedBaseName carries the FULL digest: distinct bases must map to
+// distinct restored file names unconditionally, and a truncated prefix
+// would let a (however unlikely) collision produce a generation that
+// uploads completely but is rejected at restore for duplicate names.
+func SharedBaseName(sha string) string {
+	return "base-" + sha + ".ext4"
 }
 
 // uploadTask ships every artifact of a generation, then its manifest
