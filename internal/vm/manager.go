@@ -1211,13 +1211,10 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// that rollback happen to a HEALTHY VM). Evidence decides, with the
 		// same gate restore adoption uses; success also heals the marker
 		// durably.
-		if verr := adoptionBoxdReady(ctx, m, existing.IP); verr != nil {
-			if ctx.Err() != nil {
-				// The caller went away — no verdict on the VM, no relaunch.
-				return nil, fmt.Errorf("adopted VM %s readiness unverified: %w", vmID, verr)
-			}
-			// Genuine silence for the whole gate: the record is a corpse.
-			// Fall through to the relaunch — resume's remedy for it.
+		if verr := m.verifyBoxdReady(ctx, existing.IP); verr != nil {
+			// Silence for the whole gate — a genuine verdict, since the probe
+			// ran its own budget (see verifyBoxdReady): the record is a
+			// corpse. Fall through to the relaunch, resume's remedy for it.
 			log.Warn().Err(verr).Msg("resume: unverified VM failed readiness — relaunching")
 		} else {
 			if cerr := m.commitVerifiedAdoption(existing); cerr != nil {
@@ -1353,8 +1350,8 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// and roll the guest back again. Normal resumes stay readiness-blind
 		// (detached probe below). The guest was just relaunched from its
 		// snapshot, so this teardown discards nothing of value — but only a
-		// GENUINE verdict may reach it; see relaunchBoxdReady.
-		if verr := m.relaunchBoxdReady(ctx, inst.IP); verr != nil {
+		// GENUINE verdict may reach it; see verifyBoxdReady.
+		if verr := m.verifyBoxdReady(ctx, inst.IP); verr != nil {
 			m.stopUnitDuringRestoreError(vmID)
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("boxd not ready after relaunch of unverified vm %s: %w", vmID, verr)
@@ -1805,21 +1802,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// adopting — a bounded WAIT, not a single probe, so a warming VM
 			// passes. Verified records adopt without this gate: readiness was
 			// proven once, and a wedged boxd here must not demote a live VM.
-			if err := adoptionBoxdReady(ctx, m, existing.IP); err != nil {
-				// Classify before acting: only a definitive timeout says
-				// anything about the VM.
+			if err := m.verifyBoxdReady(ctx, existing.IP); err != nil {
+				// A destroy racing the wait is the one thing that says nothing
+				// about the VM; match the sibling destroyed-paths.
 				m.mu.RLock()
 				still := m.vms[vmID] == existing
 				m.mu.RUnlock()
 				if !still {
-					// A destroy raced the wait; match the sibling destroyed-paths.
 					return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 				}
-				if ctx.Err() != nil {
-					// The caller went away — no verdict on the VM, no teardown.
-					return nil, fmt.Errorf("adopted VM %s readiness unverified: %w", vmID, err)
-				}
-				// Definitive exhaustion: flip out of Running. That forces the
+				// Definitive exhaustion — the probe ran its own budget
+				// regardless of the caller (see verifyBoxdReady), so this is a
+				// verdict. Flip out of Running. That forces the
 				// retry to relaunch — the only escape from a wedged agent,
 				// since re-adopting one loops forever — and unblocks cleanup,
 				// because the reconciler's live-unit rules defer to a Running
@@ -3844,20 +3838,23 @@ var vmUnitDead = func(vmID string) bool {
 }
 
 // adoptionBoxdReady is the boxd readiness gate for restore adoption and the
-// unverified relaunch (via relaunchBoxdReady); a var for the same test seam
+// unverified relaunch (via verifyBoxdReady); a var for the same test seam
 // vmUnitDead uses.
 var adoptionBoxdReady = func(ctx context.Context, m *Manager, ip string) error {
 	return m.waitForBoxd(ctx, ip, 30*time.Second)
 }
 
-// relaunchBoxdReady verifies a relaunched crash-window VM on a budget DETACHED
-// from the caller's ctx: the relaunch gate's failure path tears the VM down,
-// so a caller disconnect or spent deadline must never masquerade as a dead
-// guest. Detaching also guarantees the wait completes even for an abandoned
-// RPC — the marker is cleared durably and the next retry adopts the verified
-// VM instead of relaunching it. The wall-clock bound inside waitForBoxd still
-// caps the wait.
-func (m *Manager) relaunchBoxdReady(callerCtx context.Context, ip string) error {
+// verifyBoxdReady runs the crash-window readiness gate on a budget DETACHED
+// from the caller's ctx. Every gate outcome is destructive or durable — tear
+// the VM down, flip it out of Running, clear the marker — so a caller
+// disconnect or spent deadline must never masquerade as a dead guest.
+//
+// Detaching is also what makes a verdict reachable at all: callers arrive with
+// a deadline no larger than this gate's own budget and have already spent part
+// of it, so an inherited ctx always expires first and every attempt would end
+// "no verdict", leaving the record unchanged for the next attempt to repeat.
+// The wall-clock bound inside waitForBoxd still caps the wait.
+func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string) error {
 	return adoptionBoxdReady(context.WithoutCancel(callerCtx), m, ip)
 }
 

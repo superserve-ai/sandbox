@@ -1505,7 +1505,7 @@ func TestPersistStateReportsFailure(t *testing.T) {
 // must probe on a ctx detached from the caller: a client disconnect or spent
 // deadline must not masquerade as a dead guest — and a completed wait clears
 // the marker so the next retry adopts instead of relaunching.
-func TestRelaunchBoxdReadyDetachedFromCaller(t *testing.T) {
+func TestVerifyBoxdReadyDetachedFromCaller(t *testing.T) {
 	callerCtx, cancelCaller := context.WithCancel(context.Background())
 	cancelCaller() // caller already gone before the gate runs
 
@@ -1518,7 +1518,7 @@ func TestRelaunchBoxdReadyDetachedFromCaller(t *testing.T) {
 	defer func() { adoptionBoxdReady = orig }()
 
 	m := &Manager{log: zerolog.Nop()}
-	if err := m.relaunchBoxdReady(callerCtx, "192.0.2.5"); err != nil {
+	if err := m.verifyBoxdReady(callerCtx, "192.0.2.5"); err != nil {
 		t.Fatalf("healthy gate must pass, got %v", err)
 	}
 	if gateCtxDone {
@@ -1765,5 +1765,34 @@ func TestCommitResumeState_TrackedVM_Persists(t *testing.T) {
 	}
 	if !present {
 		t.Fatal("a tracked VM's state must be persisted")
+	}
+}
+
+// Callers arrive with a deadline no larger than the gate's own budget and have
+// already spent part of it, so an inherited ctx would always expire first and
+// every attempt would end "no verdict" — leaving the record unchanged for the
+// next attempt to repeat forever. The gate must reach its own verdict anyway.
+func TestVerifyBoxdReadyReachesVerdictUnderShorterCallerDeadline(t *testing.T) {
+	orig := adoptionBoxdReady
+	var sawDeadline bool
+	adoptionBoxdReady = func(ctx context.Context, _ *Manager, _ string) error {
+		_, sawDeadline = ctx.Deadline()
+		return errors.New("boxd silent for the whole budget") // a genuine verdict
+	}
+	defer func() { adoptionBoxdReady = orig }()
+
+	// A caller deadline shorter than the gate's own budget — the common case,
+	// since the control plane's per-attempt budget equals it and the RPC has
+	// already spent part of it before reaching here.
+	callerCtx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+
+	m := &Manager{log: zerolog.Nop()}
+	err := m.verifyBoxdReady(callerCtx, "192.0.2.5")
+	if err == nil {
+		t.Fatal("a silent guest must produce a verdict, not be swallowed")
+	}
+	if sawDeadline {
+		t.Fatal("the gate must not inherit the caller's deadline — it would expire before any verdict")
 	}
 }
