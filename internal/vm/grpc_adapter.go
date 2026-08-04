@@ -255,16 +255,17 @@ func (a *GRPCAdapter) InjectSandboxEnv(ctx context.Context, req *vmdpb.InjectSan
 // slot before it removes the instance, so mid-destroy the record still shows
 // Running with the old IP while the slot is already claimable by another VM.
 // The network manager's device table is the slot's actual owner ledger, so a
-// nil lookup there vetoes the delivery.
+// nil lookup there vetoes the delivery. trackedInstance, never getInstance:
+// the gate must observe the destroy, not undo it (see trackedInstance).
 func (a *GRPCAdapter) ipOwnerCheck(vmID, ip string) func() bool {
 	return func() bool {
-		cur, err := a.mgr.getInstance(vmID)
-		if err != nil {
+		cur := a.mgr.trackedInstance(vmID)
+		if cur == nil {
 			return false
 		}
-		cur.mu.Lock()
+		cur.mu.RLock()
 		ok := cur.IP == ip && cur.Status == StatusRunning
-		cur.mu.Unlock()
+		cur.mu.RUnlock()
 		return ok && a.mgr.netMgr.GetVMNetInfo(vmID) != nil
 	}
 }

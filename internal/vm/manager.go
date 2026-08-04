@@ -324,6 +324,18 @@ type Manager struct {
 	vmOpLocks sync.Map
 }
 
+// trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
+// lazy reattach getInstance performs on a miss. Delivery gates (credential
+// injects) must use this: a lazy reattach inside DestroyVM's window between
+// the map delete and the record delete would resurrect the instance AND
+// rebind its freed network slot, making the gate's own lookup certify an
+// ownership the destroy just revoked.
+func (m *Manager) trackedInstance(vmID string) *VMInstance {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.vms[vmID]
+}
+
 // instanceRunning reports whether vmID's tracked instance is Running — the
 // authoritative signal that a resume/restore completed, used by the
 // reconciler to avoid stopping a just-relaunched unit.
