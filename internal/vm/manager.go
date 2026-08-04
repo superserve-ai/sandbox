@@ -1380,6 +1380,22 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.mu.Unlock()
 
 	m.persistState(inst)
+	// Persist-then-verify, as the restore path does: DestroyVM bypasses the
+	// lifecycle lock, so it can land while this resume runs — most likely
+	// during the unverified readiness wait above, which spends a full budget
+	// detached from the caller. Checking AFTER the write leaves no window:
+	// the destroy either erased the record itself or is caught here, and we
+	// erase our own resurrecting write rather than hand back a destroyed VM.
+	m.mu.RLock()
+	_, stillTracked := m.vms[vmID]
+	m.mu.RUnlock()
+	if !stillTracked {
+		m.deleteState(vmID)
+		// The relaunch above may have started a Firecracker after the
+		// destroy's teardown ran; stop it or it outlives the sandbox.
+		m.stopUnitDuringRestoreError(vmID)
+		return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during resume", vmID)
+	}
 	// Resume-side phase parity with the create path's "restoring snapshot"
 	// line; wait_boxd_ms arrives async on the probe log below. prep spans
 	// the op-lock wait plus the precondition gates, so a duplicate-resume

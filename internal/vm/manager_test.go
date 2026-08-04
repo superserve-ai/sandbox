@@ -1715,3 +1715,45 @@ func TestGetInstanceRefusesResurrectionDuringDestroy(t *testing.T) {
 		t.Fatal("a VM mid-destroy must not be republished to m.vms")
 	}
 }
+
+// DestroyVM bypasses the lifecycle lock, so it can land during a resume —
+// most likely inside the unverified readiness wait. The resume's persist must
+// not resurrect the deleted record and report success.
+func TestResumeVM_DestroyedDuringResume_NotResurrected(t *testing.T) {
+	origDead := vmUnitDead
+	vmUnitDead = func(string) bool { return true } // no live unit to adopt
+	defer func() { vmUnitDead = origDead }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusPaused, SnapshotPath: snapPath, MemFilePath: memPath}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+
+	// Simulate the destroy having completed mid-resume: instance untracked and
+	// record gone, exactly what DestroyVM leaves behind.
+	delete(m.vms, "vm-1")
+
+	// The launch itself fails in this unit-test environment; the assertion is
+	// that no path recreates the record for a VM that was destroyed.
+	_, _ = m.resumeVMLocked(context.Background(), "vm-1", snapPath, memPath)
+
+	present, err := store.Has("vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present {
+		t.Fatal("a resume must not resurrect the record of a VM destroyed mid-flight")
+	}
+}
