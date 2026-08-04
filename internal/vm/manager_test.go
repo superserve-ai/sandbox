@@ -1717,43 +1717,53 @@ func TestGetInstanceRefusesResurrectionDuringDestroy(t *testing.T) {
 }
 
 // DestroyVM bypasses the lifecycle lock, so it can land during a resume —
-// most likely inside the unverified readiness wait. The resume's persist must
-// not resurrect the deleted record and report success.
-func TestResumeVM_DestroyedDuringResume_NotResurrected(t *testing.T) {
-	origDead := vmUnitDead
-	vmUnitDead = func(string) bool { return true } // no live unit to adopt
-	defer func() { vmUnitDead = origDead }()
-
+// most likely inside the unverified readiness wait, which runs a full budget
+// detached from the caller. The resume's persist must not resurrect the
+// deleted record and report success.
+func TestCommitResumeState_DestroyedMidFlight_NotResurrected(t *testing.T) {
 	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
 
-	dir := t.TempDir()
-	snapPath := filepath.Join(dir, "vmstate.snap")
-	memPath := filepath.Join(dir, "mem.snap")
-	for _, p := range []string{snapPath, memPath} {
-		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+	// The destroy already completed: instance untracked, record gone — exactly
+	// what DestroyVM leaves behind while this resume was mid-flight.
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	err = m.commitResumeState(inst)
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("a destroy landing mid-resume must surface NotFound, got %v", err)
 	}
-	inst := &VMInstance{ID: "vm-1", Status: StatusPaused, SnapshotPath: snapPath, MemFilePath: memPath}
-	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+	present, herr := store.Has("vm-1")
+	if herr != nil {
+		t.Fatal(herr)
+	}
+	if present {
+		t.Fatal("the resume persist must be erased, not left resurrecting a destroyed VM")
+	}
+}
 
-	// Simulate the destroy having completed mid-resume: instance untracked and
-	// record gone, exactly what DestroyVM leaves behind.
-	delete(m.vms, "vm-1")
-
-	// The launch itself fails in this unit-test environment; the assertion is
-	// that no path recreates the record for a VM that was destroyed.
-	_, _ = m.resumeVMLocked(context.Background(), "vm-1", snapPath, memPath)
-
-	present, err := store.Has("vm-1")
+// The normal path: a still-tracked VM persists and proceeds.
+func TestCommitResumeState_TrackedVM_Persists(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if present {
-		t.Fatal("a resume must not resurrect the record of a VM destroyed mid-flight")
+	defer store.Close()
+
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+
+	if err := m.commitResumeState(inst); err != nil {
+		t.Fatalf("a tracked VM must commit cleanly, got %v", err)
+	}
+	present, herr := store.Has("vm-1")
+	if herr != nil {
+		t.Fatal(herr)
+	}
+	if !present {
+		t.Fatal("a tracked VM's state must be persisted")
 	}
 }
