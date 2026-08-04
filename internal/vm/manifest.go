@@ -24,6 +24,9 @@ type ManifestEntry struct {
 	SizeBytes int64
 	SHA256    string
 	BasePath  string
+	// BaseStagedPath is the staged snapshot to READ the base from when
+	// staging captured one; BasePath remains the recorded identity.
+	BaseStagedPath string
 	// BaseSHA256 is the base file's content digest. The path alone is not
 	// an identity: a base rebuilt or restored with different bytes at the
 	// same path changes the effective filesystem under an unchanged
