@@ -7,8 +7,8 @@ func TestObjectNames(t *testing.T) {
 	if err != nil || got != "sandboxes/sb-123/abcd1234/overlay.ext4" {
 		t.Fatalf("sandbox object = %q err=%v", got, err)
 	}
-	got, err = TemplateObject("tpl-1", "build-9", "base.ext4")
-	if err != nil || got != "templates/tpl-1/build-9/base.ext4" {
+	got, err = TemplateObject("tpl-1", "build-9", "abcd1234", "base.ext4")
+	if err != nil || got != "templates/tpl-1/build-9/abcd1234/base.ext4" {
 		t.Fatalf("template object = %q err=%v", got, err)
 	}
 }

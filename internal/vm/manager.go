@@ -262,8 +262,22 @@ type Manager struct {
 	// pendingSweepInterval overrides the pending-backup sweep pace in
 	// tests; 0 means pendingBackupSweepInterval.
 	pendingSweepInterval time.Duration
-	// rehashSlots bounds concurrent recovery/sweep rehash workers.
-	rehashSlots chan struct{}
+	// rehashSlots bounds concurrent recovery/sweep rehash workers,
+	// shared by the pause recovery and the template-build sweep; created
+	// lazily via ensureRehashSlots.
+	rehashSlots     chan struct{}
+	rehashSlotsOnce sync.Once
+	// backupCovered probes the journal for whether an owner+generation is
+	// already pending or completed; nil means never covered. See
+	// SetBackupCovered.
+	backupCovered func(backup.Task) (bool, error)
+	// adoptedBuildBackups guards backup reconciliation of completed
+	// builds adopted from disk: one IN-FLIGHT reconcile per build id.
+	// Cross-process and cross-attempt dedupe is the journal's job (owner
+	// + generation index and the completions record); this map only keeps
+	// repeated status polls and overlapping sweeps from spawning
+	// concurrent workers for one build. See reconcileAdoptedBuildBackup.
+	adoptedBuildBackups sync.Map
 
 	// launcherReady gates the launcher launch path: false → launches use the
 	// legacy path. Set when the namespace is built/validated; kept in sync by

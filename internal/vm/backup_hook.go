@@ -29,6 +29,31 @@ func (m *Manager) SetBackupEnqueue(fn func(backup.Task) error) {
 	m.backupEnqueue = fn
 }
 
+// SetBackupCovered installs the journal's coverage probe: whether a
+// task's owner+generation is already pending in the queue or recorded as
+// completed. Recovery sweeps use it to skip work that is already
+// durable; nil (backup disabled, or older wiring) means "never covered",
+// which only costs idempotent re-enqueues the journal dedupes anyway.
+func (m *Manager) SetBackupCovered(fn func(backup.Task) (bool, error)) {
+	m.backupCovered = fn
+}
+
+// retryWithBackoff runs attempt with doubling delays until it succeeds
+// or enqueueRetryAttempts are exhausted, reporting whether it succeeded.
+// The first attempt is already behind the caller; this helper owns only
+// the retries, so it sleeps before every call.
+func retryWithBackoff(attempt func() bool) bool {
+	delay := time.Second
+	for i := 0; i < enqueueRetryAttempts; i++ {
+		time.Sleep(delay)
+		delay *= 2
+		if attempt() {
+			return true
+		}
+	}
+	return false
+}
+
 // pauseRehashBudget bounds the asynchronous rehash of a pause whose
 // synchronous hashing was skipped or partial. Generous by design: the
 // retry runs off the RPC path, where a large disk taking minutes is
@@ -275,6 +300,17 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 // retries the remainder.
 const pendingRehashConcurrency = 2
 
+// ensureRehashSlots lazily creates the shared rehash bound. Both the
+// pause recovery and the template-build sweep route their hashing
+// through this one channel, so their combined disk pressure stays under
+// pendingRehashConcurrency no matter which recovery started first.
+func (m *Manager) ensureRehashSlots() chan struct{} {
+	m.rehashSlotsOnce.Do(func() {
+		m.rehashSlots = make(chan struct{}, pendingRehashConcurrency)
+	})
+	return m.rehashSlots
+}
+
 // pendingBackupSweepInterval paces retries of retained pending records:
 // a record kept on an inconclusive proof or transient failure must not
 // wait for the next process restart to try again.
@@ -291,7 +327,7 @@ func (m *Manager) RecoverPendingBackups(ctx context.Context, log zerolog.Logger)
 	if m.backupEnqueue == nil || m.state == nil {
 		return
 	}
-	m.rehashSlots = make(chan struct{}, pendingRehashConcurrency)
+	m.ensureRehashSlots()
 	m.runPendingBackups(ctx, log)
 	interval := m.pendingSweepInterval
 	if interval <= 0 {
@@ -383,25 +419,26 @@ func (m *Manager) finishPauseEnqueue(pb PendingBackup, manifest []ManifestEntry,
 // leaves the pending record for the next boot's recovery.
 func (m *Manager) retryEnqueue(pb PendingBackup, manifest []ManifestEntry, log zerolog.Logger) {
 	m.healPendingBackup(pb, log)
-	delay := time.Second
-	for attempt := 0; attempt < enqueueRetryAttempts; attempt++ {
-		time.Sleep(delay)
-		delay *= 2
-		if ok, staged := m.enqueueBackup(pb.VMID, manifest); ok {
-			if staged {
-				m.deletePendingBackupIf(pb, log)
-				return
-			}
-			// Journaled but from mutable paths: keep the marker so the
-			// sweep can upgrade the queued row, like every other path.
-			log.Warn().Str("vm_id", pb.VMID).
-				Msg("retry enqueued unstaged; keeping marker for staging upgrade")
-			m.healPendingBackup(pb, log)
-			return
-		}
+	var staged bool
+	enqueued := retryWithBackoff(func() bool {
+		ok, s := m.enqueueBackup(pb.VMID, manifest)
+		staged = s
+		return ok
+	})
+	if !enqueued {
+		log.Error().Str("vm_id", pb.VMID).
+			Msg("pause backup journal writes kept failing; pending record kept for recovery")
+		m.healPendingBackup(pb, log)
+		return
 	}
-	log.Error().Str("vm_id", pb.VMID).
-		Msg("pause backup journal writes kept failing; pending record kept for recovery")
+	if staged {
+		m.deletePendingBackupIf(pb, log)
+		return
+	}
+	// Journaled but from mutable paths: keep the marker so the
+	// sweep can upgrade the queued row, like every other path.
+	log.Warn().Str("vm_id", pb.VMID).
+		Msg("retry enqueued unstaged; keeping marker for staging upgrade")
 	m.healPendingBackup(pb, log)
 }
 
@@ -720,4 +757,55 @@ func rebuildTask(vmID string, manifest []ManifestEntry) backup.Task {
 		Files:      files,
 		Priority:   backup.PriorityPause,
 	}
+}
+
+// enqueueTemplateBackup hands a completed template build's hashed artifact
+// set to the backup pipeline, reporting whether the generation is covered
+// (enqueued now, still pending, or already completed). Same contract as
+// enqueueBackup: a nil hook (backup disabled) is a no-op, and the enqueue
+// is a local journal write that must never fail the build; the caller
+// owns retrying a failed write. Template builds ride the checkpoint
+// priority: a template is rebuildable, so a multi-GiB build upload must
+// never head-of-line block a pause generation, which is unique user data.
+func (m *Manager) enqueueTemplateBackup(templateID, buildID string, manifest []ManifestEntry) bool {
+	if m.backupEnqueue == nil || len(manifest) == 0 {
+		return false
+	}
+	files := make([]backup.TaskFile, 0, len(manifest))
+	for _, e := range manifest {
+		// No BasePath/BaseSHA256, deliberately: the build's base image is
+		// already a REGULAR member of this artifact set (collectBuildManifest
+		// hashes it via extraPaths), so it ships inside the template's own
+		// generation. Declaring it a base dependency too would make the
+		// uploader also ship it as a shared bases/ object: the same bytes
+		// twice.
+		files = append(files, backup.TaskFile{
+			Name:   e.FileName,
+			Path:   e.Path,
+			SHA256: e.SHA256,
+			Size:   e.SizeBytes,
+		})
+	}
+	task := backup.Task{
+		TemplateID: templateID,
+		BuildID:    buildID,
+		Generation: backup.GenerationKey(files),
+		Files:      files,
+		Priority:   backup.PriorityCheckpoint,
+	}
+	// Already pending or already completed means nothing to do: recovery
+	// sweeps and repeated status-poll adoptions funnel through here, and
+	// without this gate an already-acked generation would be re-uploaded
+	// on every pass.
+	if m.backupCovered != nil {
+		if covered, err := m.backupCovered(task); err == nil && covered {
+			return true
+		}
+	}
+	if err := m.backupEnqueue(task); err != nil {
+		m.log.Error().Err(err).Str("template_id", templateID).Str("build_vm_id", buildID).
+			Msg("backup enqueue failed; build not journaled")
+		return false
+	}
+	return true
 }

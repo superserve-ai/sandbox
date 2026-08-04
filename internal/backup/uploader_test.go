@@ -282,6 +282,219 @@ func TestJournalEnqueueDedupesPendingGeneration(t *testing.T) {
 	}
 }
 
+func writeTemplateTask(t *testing.T, dir string) Task {
+	t.Helper()
+	contents := []struct{ name, data string }{
+		{"vmstate.snap", "tpl-state"},
+		{"mem.snap", "tpl-mem"},
+		{"rootfs.delta", "tpl-delta"},
+	}
+	files := make([]TaskFile, 0, len(contents))
+	for _, c := range contents {
+		path := filepath.Join(dir, c.name)
+		if err := os.WriteFile(path, []byte(c.data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, TaskFile{
+			Name:   c.name,
+			Path:   path,
+			SHA256: digestOf([]byte(c.data)),
+			Size:   int64(len(c.data)),
+		})
+	}
+	return Task{
+		TemplateID: "tpl-1",
+		BuildID:    "build-tpl-1",
+		Generation: GenerationKey(files),
+		Priority:   PriorityPause,
+		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 1, 0, time.UTC),
+		Files:      files,
+	}
+}
+
+func TestUploaderRoutesTemplateTasks(t *testing.T) {
+	j, _ := testJournal(t)
+	store := newMemStore()
+	var verified []Task
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+
+	// Mixed queue: a sandbox pause and a template build, both pause priority.
+	sandbox := writeTask(t, t.TempDir())
+	tpl := writeTemplateTask(t, t.TempDir())
+	for _, task := range []Task{sandbox, tpl} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := tpl.EnqueuedAt.Add(time.Minute)
+	for {
+		worked, err := u.drainOne(context.Background(), now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !worked {
+			break
+		}
+	}
+
+	// Template artifacts land under templates/<template>/<build>/<generation>/
+	// with the fingerprint-suffixed object names, content intact.
+	prefix := "templates/tpl-1/build-tpl-1/" + tpl.Generation + "/"
+	for _, f := range tpl.Files {
+		obj := prefix + packedName(t, f.Path, f.Name)
+		if got := string(store.objects[obj]); digestOf([]byte(got)) != f.SHA256 {
+			t.Fatalf("template object %s = %q", obj, got)
+		}
+	}
+	// Completion marker lives under the same prefix and carries the template identity.
+	var gen GenerationManifest
+	if err := json.Unmarshal(store.objects[prefix+ManifestObject], &gen); err != nil {
+		t.Fatalf("template manifest object: %v", err)
+	}
+	if gen.TemplateID != "tpl-1" || gen.BuildID != "build-tpl-1" || gen.SandboxID != "" {
+		t.Fatalf("template manifest identity = %+v", gen)
+	}
+	if gen.Generation != tpl.Generation || len(gen.Files) != len(tpl.Files) {
+		t.Fatalf("template manifest = %+v", gen)
+	}
+	// The sandbox task in the same queue drained to its own prefix.
+	if _, ok := store.objects["sandboxes/sb-1/gen-abc/"+ManifestObject]; !ok {
+		t.Fatal("sandbox manifest missing from mixed drain")
+	}
+	if len(verified) != 2 {
+		t.Fatalf("verified hooks = %+v", verified)
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("queue not drained: %v", counts)
+	}
+}
+
+// A template build ships its base image as a regular member of its own
+// generation (the vm side enqueues it without a BaseSHA256 dependency), so
+// the uploader must ship it exactly once under the template prefix and
+// never also route it through the shared bases/ tree.
+func TestTemplateBaseShipsOnceInsideTheGeneration(t *testing.T) {
+	j, _ := testJournal(t)
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store}
+
+	dir := t.TempDir()
+	base := []byte("base image bytes")
+	basePath := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(basePath, base, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files := []TaskFile{{
+		Name:   "base.ext4",
+		Path:   basePath,
+		SHA256: digestOf(base),
+		Size:   int64(len(base)),
+	}}
+	task := Task{
+		TemplateID: "tpl-1",
+		BuildID:    "build-tpl-1",
+		Generation: GenerationKey(files),
+		Priority:   PriorityPause,
+		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 1, 0, time.UTC),
+		Files:      files,
+	}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	prefix := "templates/tpl-1/build-tpl-1/" + task.Generation + "/"
+	baseObjects := 0
+	for obj := range store.objects {
+		if strings.HasPrefix(obj, "bases/") {
+			t.Fatalf("template base leaked into the shared prefix: %s", obj)
+		}
+		if strings.Contains(obj, "base.ext4") {
+			baseObjects++
+			if !strings.HasPrefix(obj, prefix) {
+				t.Fatalf("base object outside the template generation: %s", obj)
+			}
+		}
+	}
+	if baseObjects != 1 {
+		t.Fatalf("base.ext4 shipped %d times, want exactly 1 (objects: %v)", baseObjects, keysOf(store.objects))
+	}
+	var gen GenerationManifest
+	if err := json.Unmarshal(store.objects[prefix+ManifestObject], &gen); err != nil {
+		t.Fatalf("template manifest object: %v", err)
+	}
+	if len(gen.Files) != 1 || gen.Files[0].Name != "base.ext4" || gen.Files[0].BaseSHA256 != "" {
+		t.Fatalf("template manifest files = %+v, want one base.ext4 entry with no base dependency", gen.Files)
+	}
+}
+
+// A template task whose sources vanished acks cleanly: no journal
+// residue, no completion record (recovery may retry from the artifacts),
+// no verification hook, and the staging root untouched (template tasks
+// are never staged, and the empty-SandboxID path math must not walk the
+// cleanup onto the root itself).
+func TestTemplateTaskAbandonsCleanlyOnVanishedSource(t *testing.T) {
+	j, _ := testJournal(t)
+	store := newMemStore()
+	staging := t.TempDir()
+	var verified []Task
+	u := &Uploader{Journal: j, Store: store, StagingRoot: staging, OnVerified: func(task Task) { verified = append(verified, task) }}
+
+	task := Task{
+		TemplateID: "tpl-1",
+		BuildID:    "build-tpl-1",
+		Generation: "gen-vanished",
+		Priority:   PriorityCheckpoint,
+		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 1, 0, time.UTC),
+		Files: []TaskFile{{
+			Name:   "mem.snap",
+			Path:   filepath.Join(t.TempDir(), "gone", "mem.snap"),
+			SHA256: digestOf([]byte("never written")),
+			Size:   13,
+		}},
+	}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	worked, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute))
+	if err != nil || !worked {
+		t.Fatalf("drain: worked=%v err=%v", worked, err)
+	}
+	if counts, _ := j.Pending(); counts[PriorityCheckpoint] != 0 {
+		t.Fatalf("journal residue after abandonment: %v", counts)
+	}
+	if done, _ := j.WasCompleted("test-bucket", task); done {
+		t.Fatal("abandoned template generation recorded as completed")
+	}
+	if len(verified) != 0 {
+		t.Fatalf("verification hook fired for an abandoned generation: %+v", verified)
+	}
+	if len(store.objects) != 0 {
+		t.Fatalf("abandoned generation shipped objects: %v", keysOf(store.objects))
+	}
+	if _, err := os.Stat(staging); err != nil {
+		t.Fatalf("staging root disturbed by template ack: %v", err)
+	}
+}
+
+// removeStagedTask must never resolve an empty SandboxID into the
+// staging root: root/<generation> plus the trailing parent Remove would
+// target the root itself.
+func TestRemoveStagedTaskIgnoresTemplateTasks(t *testing.T) {
+	root := t.TempDir()
+	removeStagedTask(root, Task{
+		TemplateID: "tpl-1",
+		BuildID:    "b1",
+		Generation: "gen",
+		Files:      []TaskFile{{Name: "mem.snap"}},
+	})
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("staging root removed for a template task: %v", err)
+	}
+}
+
 func keysOf(m map[string][]byte) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -507,7 +720,7 @@ func TestJournalPruneSweepsHistoryAcrossAcks(t *testing.T) {
 	task := Task{SandboxID: "sb", Generation: "g", Priority: PriorityPause,
 		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)}
 	for i := 0; i < 5; i++ {
-		if err := j.Ack(task, false); err != nil {
+		if err := j.Ack(task, "", false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -538,7 +751,7 @@ func TestVerifiedNotificationSurvivesCrashBeforeDelivery(t *testing.T) {
 	}
 	// Simulate the first process: ack with notification owed, then crash
 	// before any delivery (no flush runs).
-	if err := j.Ack(task, true); err != nil {
+	if err := j.Ack(task, "test-bucket", true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -564,7 +777,7 @@ func TestAbandonedAckLeavesNoNotification(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, false); err != nil {
+	if err := j.Ack(task, "", false); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := j.PendingNotifications()
@@ -811,7 +1024,7 @@ func TestNextSkipsDeferredPriorityWithoutScanning(t *testing.T) {
 	// The nack re-keyed the row; ack through the same task state must
 	// clear it (index and queue agree on the new key).
 	nacked := got
-	if err := j.Ack(nacked, false); err != nil {
+	if err := j.Ack(nacked, "", false); err != nil {
 		t.Fatal(err)
 	}
 	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
@@ -1102,7 +1315,7 @@ func TestStagedBaseSurvivesTemplateGC(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(staging, "bases", hex.EncodeToString(baseSum[:]))); err != nil {
 		t.Fatalf("referenced staged base swept: %v", err)
 	}
-	if err := j.Ack(Task{SandboxID: "sb2", Generation: "g2", EnqueuedAt: time.Unix(3, 0)}, false); err != nil {
+	if err := j.Ack(Task{SandboxID: "sb2", Generation: "g2", EnqueuedAt: time.Unix(3, 0)}, "", false); err != nil {
 		t.Fatal(err)
 	}
 	ageStagingTree(t, staging)
