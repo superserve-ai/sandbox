@@ -814,10 +814,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		return snapshotPath, memPath, manifest, nil
 	}
 	if inst.Status == StatusError {
-		// A parked Error VM (unmanageable — socket gone, stop unconfirmed)
-		// cannot be snapshotted; attempting it burns a doomed FC-API dial and
-		// returns a generic error the control plane retries against. Fail
-		// fast instead; Drift 8 owns the cleanup.
+		// A parked Error VM (socket gone, stop unconfirmed) cannot be
+		// snapshotted — fail fast instead of dialing the dead socket and
+		// returning a generic error. Drift 8 owns the cleanup.
 		inst.mu.RUnlock()
 		return "", "", nil, status.Errorf(codes.FailedPrecondition, "vm %s is in error state and cannot be paused", vmID)
 	}
@@ -965,10 +964,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	inst.DirtyTracked = false      // FC process is stopping; a fresh resume re-arms tracking.
 	inst.mu.Unlock()
 
-	// If-present, not Put: DestroyVM takes no vm-op lock (by design, to
-	// interrupt wedged ops) and the detached stop widened the window where a
-	// destroy can land mid-pause — a plain Put would resurrect the deleted
-	// record as Paused and a later reattach would rebind its recycled slot.
+	// If-present, not Put: DestroyVM takes no vm-op lock (by design), and
+	// the detached stop widened the window where a destroy can land
+	// mid-pause — a plain Put would resurrect the deleted record.
 	if !m.persistStateIfPresent(inst) {
 		log.Warn().Msg("record deleted during pause stop — destroy owns the teardown")
 		return "", "", nil, status.Errorf(codes.NotFound, "vm %s destroyed during pause", vmID)
@@ -989,10 +987,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// stopConfirmed alone is the RPC's notion of a finished stop, which
 	// deliberately includes a still-deactivating unit; hashing needs the
 	// stronger fully-down claim, so the gate reconfirms with the same
-	// probe the at-rest proof uses. Detached probe ctx: the caller's ctx
-	// may be spent (the stop above detached for exactly that), and probing
-	// on it would fail the gate for every deadline-spent pause even when
-	// the unit is genuinely down.
+	// probe the at-rest proof uses — on a detached probe ctx, since the
+	// caller's may be spent (the stop above detached for exactly that).
 	if stopConfirmed && m.unitConfirmedDead(probeCtx(), vmID) {
 		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
 	} else if m.backupEnqueue != nil {
@@ -2361,10 +2357,8 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 					log.Warn().Msg("unit not confirmed stopped; record kept as error")
 				}
 				// Park the refusal: fall through to the shared bind/publish/
-				// commit tail below with StatusError, so a lazy reattach can
-				// never re-read the Running row and adopt it. The tail's
-				// persist arm tolerates a broken store (publishes in-memory
-				// regardless) and yields to a concurrent delete.
+				// commit tail with StatusError, so a lazy reattach can never
+				// re-read the Running row and adopt it.
 				rec.Status = StatusError
 			}
 		}

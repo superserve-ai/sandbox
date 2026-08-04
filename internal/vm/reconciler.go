@@ -328,10 +328,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				r.clearDrift(id)
 				continue
 			}
-			// Error records belong to Drift 8 (see its header) — and this
-			// check must consult the INSTANCE, not just rec: a parked Error
-			// whose durable write failed still reads Running here, over a
-			// deactivating unit this rule's absence-gate cannot see.
+			// Error records are Drift 8's (see Drift 1). errorRecord, not
+			// rec.Status: a parked Error whose durable write failed still
+			// reads Running here.
 			if errorRecord(id) {
 				continue
 			}
@@ -494,13 +493,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// activating or deactivating unit still has a process, and markStale
 		// releases the record and namespace. Probe before spending budget.
 		if !unitFullyDown(ctx, systemdUnitName(id)) {
-			// The record and namespace stay held until terminal, but the
-			// sandbox row must not keep reading 'active' through a long
-			// wedge — a parked VM serves nothing, yet the open row keeps
-			// billing and routing to it. Flipping the row frees no resource,
-			// so the terminal gate doesn't apply; CAS so a relaunch that
-			// moved the row on wins, and the next pass's snapshot reads
-			// 'failed' so this fires once per wedge.
+			// The record and namespace stay held until terminal, but the row
+			// must not keep billing and routing through a long wedge — a
+			// parked VM serves nothing, and flipping the row frees no
+			// resource, so the terminal gate doesn't apply. Fires once per
+			// wedge: the next pass's snapshot reads 'failed'.
 			if dbSandboxes != nil {
 				if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive && r.consumeAutoFailBudget(id) {
 					r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
