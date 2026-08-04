@@ -2,8 +2,10 @@ package vm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -326,6 +328,52 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 //     dirty pages overwrite it and it stays a complete, standalone image.
 //   - layered overlay: memPath is fresh/sparse, so it ends up holding only the
 //     changed pages — restored over a separate base, never loaded standalone.
+//
+// VMState reports which state the Firecracker process on socketPath holds
+// its microVM in ("Not started", "Running", "Paused"). A healthy API
+// answering "Not started" is the signature of an empty shell — a live
+// process with no microVM inside — which unit-level liveness cannot
+// distinguish from a running VM.
+//
+// Deliberately a bare HTTP GET rather than the generated client: probes run
+// per-VM on every reconciler pass, so the dial must honor ctx (a socket
+// with a saturated accept queue would otherwise hang the pass forever) and
+// the connection must not linger (a kept-alive FD per probed VM per pass
+// would exhaust descriptors on a large fleet).
+func VMState(ctx context.Context, socketPath string) (string, error) {
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", socketPath)
+		},
+		DisableKeepAlives: true,
+	}
+	defer tr.CloseIdleConnections()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("describe instance: status %d", resp.StatusCode)
+	}
+	var info struct {
+		State string `json:"state"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&info); err != nil {
+		return "", fmt.Errorf("describe instance: %w", err)
+	}
+	if info.State == "" {
+		return "", fmt.Errorf("describe instance: empty state")
+	}
+	return info.State, nil
+}
+
 func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
 	fc := newFCClient(socketPath)
 	ctx := context.Background()
