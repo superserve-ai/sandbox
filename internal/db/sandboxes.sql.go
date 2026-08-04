@@ -1883,6 +1883,7 @@ WITH failed AS (
   -- ever returned to 'paused' by a recovery path.
   SET status = 'failed', auto_delete_at = NULL, updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
+    AND sandbox.updated_at = $2
   RETURNING id
 ),
 closed_active AS (
@@ -1897,50 +1898,23 @@ SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
 WHERE sandbox_id IN (SELECT id FROM failed)
   AND ended_at IS NULL
 `
+
+type MarkSandboxFailedParams struct {
+	ID                uuid.UUID `json:"id"`
+	ObservedUpdatedAt time.Time `json:"observed_updated_at"`
+}
 
 // Used by the reconciler to mark a sandbox failed when VMD detects it is
 // actually gone. No team_id filter — the reconciler runs with host scope,
-// not team scope. The CTE bundles the active-interval close into the same
-// statement so a crash/timeout between the two writes can't leave the
-// interval open and have analytics count the actor as active forever.
-func (q *Queries) MarkSandboxFailed(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, markSandboxFailed, id)
-	return err
-}
-
-const markSandboxFailedIfUnchanged = `-- name: MarkSandboxFailedIfUnchanged :exec
-WITH failed AS (
-  UPDATE sandbox
-  SET status = 'failed', auto_delete_at = NULL, updated_at = now()
-  WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
-    AND sandbox.status = 'active' AND sandbox.updated_at = $2
-  RETURNING id
-),
-closed_active AS (
-  UPDATE sandbox_active_interval
-  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
-  WHERE sandbox_id IN (SELECT id FROM failed)
-    AND ended_at IS NULL
-  RETURNING sandbox_id
-)
-UPDATE sandbox_compute_billing_interval
-SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
-WHERE sandbox_id IN (SELECT id FROM failed)
-  AND ended_at IS NULL
-`
-
-type MarkSandboxFailedIfUnchangedParams struct {
-	ID        uuid.UUID `json:"id"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-// Version-guarded variant of MarkSandboxFailed for actions taken from a
-// pass-start snapshot: the row flips only if untouched since the observation
-// (every lifecycle transition bumps updated_at), so a relaunch or resume
-// that moved it on — even back to 'active' — is never overwritten. Same
-// atomic interval close.
-func (q *Queries) MarkSandboxFailedIfUnchanged(ctx context.Context, arg MarkSandboxFailedIfUnchangedParams) error {
-	_, err := q.db.Exec(ctx, markSandboxFailedIfUnchanged, arg.ID, arg.UpdatedAt)
+// not team scope. Version-guarded: the row flips only if untouched since
+// the reconciler's pass-start observation (every lifecycle transition bumps
+// updated_at), so a stale snapshot can never overwrite a concurrent
+// relaunch or resume that moved the row on. The CTE bundles the
+// active-interval close into the same statement so a crash/timeout between
+// the two writes can't leave the interval open and have analytics count
+// the actor as active forever.
+func (q *Queries) MarkSandboxFailed(ctx context.Context, arg MarkSandboxFailedParams) error {
+	_, err := q.db.Exec(ctx, markSandboxFailed, arg.ID, arg.ObservedUpdatedAt)
 	return err
 }
 

@@ -280,9 +280,13 @@ WHERE host_id = sqlc.arg(host_id)
 -- name: MarkSandboxFailed :exec
 -- Used by the reconciler to mark a sandbox failed when VMD detects it is
 -- actually gone. No team_id filter — the reconciler runs with host scope,
--- not team scope. The CTE bundles the active-interval close into the same
--- statement so a crash/timeout between the two writes can't leave the
--- interval open and have analytics count the actor as active forever.
+-- not team scope. Version-guarded: the row flips only if untouched since
+-- the reconciler's pass-start observation (every lifecycle transition bumps
+-- updated_at), so a stale snapshot can never overwrite a concurrent
+-- relaunch or resume that moved the row on. The CTE bundles the
+-- active-interval close into the same statement so a crash/timeout between
+-- the two writes can't leave the interval open and have analytics count
+-- the actor as active forever.
 WITH failed AS (
   UPDATE sandbox
   -- auto_delete_at is cleared: the deadline is only meaningful in 'paused',
@@ -290,31 +294,7 @@ WITH failed AS (
   -- ever returned to 'paused' by a recovery path.
   SET status = 'failed', auto_delete_at = NULL, updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
-  RETURNING id
-),
-closed_active AS (
-  UPDATE sandbox_active_interval
-  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
-  WHERE sandbox_id IN (SELECT id FROM failed)
-    AND ended_at IS NULL
-  RETURNING sandbox_id
-)
-UPDATE sandbox_compute_billing_interval
-SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
-WHERE sandbox_id IN (SELECT id FROM failed)
-  AND ended_at IS NULL;
-
--- name: MarkSandboxFailedIfUnchanged :exec
--- Version-guarded variant of MarkSandboxFailed for actions taken from a
--- pass-start snapshot: the row flips only if untouched since the observation
--- (every lifecycle transition bumps updated_at), so a relaunch or resume
--- that moved it on — even back to 'active' — is never overwritten. Same
--- atomic interval close.
-WITH failed AS (
-  UPDATE sandbox
-  SET status = 'failed', auto_delete_at = NULL, updated_at = now()
-  WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
-    AND sandbox.status = 'active' AND sandbox.updated_at = $2
+    AND sandbox.updated_at = sqlc.arg(observed_updated_at)
   RETURNING id
 ),
 closed_active AS (

@@ -310,7 +310,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "db_active_systemd_missing").
 				Msg("DB says active but VM is dead — marking failed")
-			r.markFailedInDB(ctx, id)
+			r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
 			r.markStale(id)
 			r.writeAudit(ctx, id, "mark_failed", "VM dead while DB said active", "db_active_systemd_missing")
 		}
@@ -326,6 +326,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			if active[id] {
 				r.clearDrift(id)
+				continue
+			}
+			// Error records belong to Drift 8 (see its header) — and this
+			// check must consult the INSTANCE, not just rec: a parked Error
+			// whose durable write failed still reads Running here, over a
+			// deactivating unit this rule's absence-gate cannot see.
+			if errorRecord(id) {
 				continue
 			}
 			if !r.gracePeriodElapsed(id, now) {
@@ -445,7 +452,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// snapshot.
 		if dbSandboxes != nil {
 			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
-				r.markFailedInDBIfUnchanged(ctx, id, sb.Sandbox.UpdatedAt)
+				r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
 			}
 		}
 		r.writeAudit(ctx, id, "error_unit_stop", "live unit for error-status record", "boltdb_error_unit_active")
@@ -487,6 +494,19 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// activating or deactivating unit still has a process, and markStale
 		// releases the record and namespace. Probe before spending budget.
 		if !unitFullyDown(ctx, systemdUnitName(id)) {
+			// The record and namespace stay held until terminal, but the
+			// sandbox row must not keep reading 'active' through a long
+			// wedge — a parked VM serves nothing, yet the open row keeps
+			// billing and routing to it. Flipping the row frees no resource,
+			// so the terminal gate doesn't apply; CAS so a relaunch that
+			// moved the row on wins, and the next pass's snapshot reads
+			// 'failed' so this fires once per wedge.
+			if dbSandboxes != nil {
+				if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive && r.consumeAutoFailBudget(id) {
+					r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
+					r.writeAudit(ctx, id, "mark_failed", "wedged error VM: row flipped while awaiting terminal unit", "boltdb_error_unit_wedged")
+				}
+			}
 			unlockOp()
 			return
 		}
@@ -500,7 +520,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// compare-and-set: a relaunch may own the row by now).
 		if dbSandboxes != nil {
 			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
-				r.markFailedInDBIfUnchanged(ctx, id, sb.Sandbox.UpdatedAt)
+				r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
 			}
 		}
 		r.writeAudit(ctx, id, "stale_cleanup", "error record with no unit", "boltdb_error_unit_missing")
@@ -599,7 +619,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			log.Warn().Str("vm_id", id).Str("snapshot_path", snapPath).
 				Str("drift", "paused_snapshot_missing").
 				Msg("paused sandbox snapshot file missing — marking failed")
-			r.markFailedInDB(ctx, id)
+			r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
 			r.writeAudit(ctx, id, "mark_failed", "snapshot file missing", "paused_snapshot_missing")
 			r.clearDrift("paused:" + id)
 		}
@@ -1020,11 +1040,14 @@ func (r *Reconciler) clearDrift(key string) {
 // can't consume the whole run's budget.
 const dbQueryTimeout = 5 * time.Second
 
-// markFailedInDB writes status=failed for the given sandbox ID. The
-// underlying MarkSandboxFailed query is a CTE that also closes any open
+// markFailedInDB writes status=failed for the given sandbox ID,
+// version-guarded on the pass-start observation: the row flips only if
+// untouched since (every lifecycle transition bumps updated_at), so a stale
+// snapshot cannot overwrite a concurrent relaunch's row — even one that is
+// 'active' again. The underlying query's CTE also closes any open
 // sandbox_active_interval row atomically, so a crash/timeout between the
 // two writes is unreachable. No-op if the DB is not configured.
-func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) {
+func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string, observed time.Time) {
 	if r.cfg.DB == nil {
 		return
 	}
@@ -1035,27 +1058,7 @@ func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) {
 	}
 	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()
-	if err := r.cfg.DB.MarkSandboxFailed(qctx, id); err != nil {
-		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to mark sandbox failed in DB")
-	}
-}
-
-// markFailedInDBIfUnchanged is markFailedInDB version-guarded on the
-// pass-start observation: the row flips only if untouched since (every
-// lifecycle transition bumps updated_at), so a stale snapshot cannot
-// overwrite a concurrent relaunch's row — even one that is 'active' again.
-func (r *Reconciler) markFailedInDBIfUnchanged(ctx context.Context, vmID string, observed time.Time) {
-	if r.cfg.DB == nil {
-		return
-	}
-	id, err := uuid.Parse(vmID)
-	if err != nil {
-		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: invalid vm_id for DB mark-failed")
-		return
-	}
-	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
-	defer cancel()
-	if err := r.cfg.DB.MarkSandboxFailedIfUnchanged(qctx, db.MarkSandboxFailedIfUnchangedParams{ID: id, UpdatedAt: observed}); err != nil {
+	if err := r.cfg.DB.MarkSandboxFailed(qctx, db.MarkSandboxFailedParams{ID: id, ObservedUpdatedAt: observed}); err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to mark sandbox failed in DB")
 	}
 }
