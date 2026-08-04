@@ -724,6 +724,15 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 		return status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
 	}
 
+	// Tombstone for the whole teardown (see the destroying field): a concurrent
+	// lazy getInstance — exec, preview, inject — must not reattach this VM and
+	// rebind its slot at any point while we're stopping it and freeing that
+	// slot, or an in-flight delivery lands on a recycling IP. A tracked VM
+	// still resolves from m.vms below (the tombstone gates only reattach); an
+	// untracked one takes the record fallback, which carries all teardown needs.
+	m.destroying.Store(vmID, struct{}{})
+	defer m.destroying.Delete(vmID)
+
 	// A paused or post-restart VM may be absent from m.vms. Don't early-return on
 	// that: unit stop and rundir removal are derivable from vmID and must run, or
 	// destroying a paused sandbox leaks its rundir. Process/socket teardown needs
@@ -767,12 +776,6 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	if sockPath != "" {
 		_ = os.Remove(sockPath)
 	}
-
-	// Block a concurrent lazy reattach from resurrecting this VM and rebinding
-	// its slot the moment we free it (see the destroying field). Held through
-	// the map/record delete below.
-	m.destroying.Store(vmID, struct{}{})
-	defer m.destroying.Delete(vmID)
 
 	m.netMgr.CleanupVMOrNamespace(vmID, ns)
 
