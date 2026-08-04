@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -1141,5 +1142,50 @@ func TestInstanceRunning(t *testing.T) {
 	}
 	if m.instanceRunning("absent") {
 		t.Fatal("absent instance must not report running")
+	}
+}
+
+// The post-resume readiness gate must probe on a ctx detached from the
+// caller: a client disconnect mid-gate must not read as a dead guest and tear
+// down a healthy VM the control plane's retry would have adopted.
+func TestResumeReadyOrAbortGateDetachedFromCaller(t *testing.T) {
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	var doneAfterCancel bool
+	orig := boxdHealthProbe
+	boxdHealthProbe = func(ctx context.Context, ip string, timeout time.Duration) error {
+		cancelCaller()                       // client disconnects mid-probe
+		doneAfterCancel = ctx.Err() != nil   // detached gate ctx must NOT be done
+		return nil                           // boxd healthy
+	}
+	defer func() { boxdHealthProbe = orig }()
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	if err := m.resumeReadyOrAbort(callerCtx, "vm-1", "10.0.0.1"); err != nil {
+		t.Fatalf("a healthy gate must pass, got %v", err)
+	}
+	if doneAfterCancel {
+		t.Fatal("readiness gate must survive caller cancellation (detached) — a disconnect must not read as a dead guest")
+	}
+}
+
+// A genuinely unreachable guest (probe fails for the whole budget) must abort
+// the resume: revert the tracked instance to Paused for a clean fresh restore.
+func TestResumeReadyOrAbortAbortsOnGenuineFailure(t *testing.T) {
+	orig := boxdHealthProbe
+	boxdHealthProbe = func(context.Context, string, time.Duration) error {
+		return fmt.Errorf("boxd not ready")
+	}
+	defer func() { boxdHealthProbe = orig }()
+
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}, vms: map[string]*VMInstance{"vm-1": inst}}
+	if err := m.resumeReadyOrAbort(context.Background(), "vm-1", "10.0.0.1"); err == nil {
+		t.Fatal("genuine unreachability must fail the gate")
+	}
+	inst.mu.RLock()
+	st := inst.Status
+	inst.mu.RUnlock()
+	if st != StatusPaused {
+		t.Fatalf("genuine failure must abort the resume (revert to Paused), got %s", st)
 	}
 }

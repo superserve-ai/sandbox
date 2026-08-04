@@ -3553,8 +3553,33 @@ func waitForSocketConnectable(path string, deadline time.Time) error {
 	}
 }
 
+// boxdHealthProbe is the /health poll behind waitForBoxd; a var so tests can
+// drive the readiness gate without a live guest.
+var boxdHealthProbe = waitForHTTPHealth
+
 func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Duration) error {
-	return waitForHTTPHealth(ctx, vmIP, timeout)
+	return boxdHealthProbe(ctx, vmIP, timeout)
+}
+
+// boxdResumeReadyBudget bounds the post-resume readiness gate. Sized above the
+// observed cold-memory stall tail (~11s); /health answers from guest memory,
+// so a cold-storage resume needs no more.
+const boxdResumeReadyBudget = 15 * time.Second
+
+// resumeReadyOrAbort confirms boxd answered after a resume, else tears the
+// resume down. The probe runs on a budget DETACHED from the caller's ctx: a
+// client disconnect or a spent deadline must never read as a dead guest, or
+// the abort would stop a healthy VM the control plane's retry would have
+// adopted (the self-heal path). Only a genuinely unreachable agent — silent
+// for the whole budget — trips the abort, which reverts to the original pause
+// snapshot so the retry does a clean fresh restore. Caller holds the VM's
+// lifecycle lock (abort mutates the record).
+func (m *Manager) resumeReadyOrAbort(callerCtx context.Context, vmID, ip string) error {
+	if err := m.waitForBoxd(context.WithoutCancel(callerCtx), ip, boxdResumeReadyBudget); err != nil {
+		m.abortResumeLocked(vmID)
+		return err
+	}
+	return nil
 }
 
 // retriedLaunchTarget returns the tracked instance for vmID when a resume or

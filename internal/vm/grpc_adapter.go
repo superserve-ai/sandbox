@@ -90,13 +90,11 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 	if len(req.GetEnvVars()) == 0 {
 		// Skipping /init drops the call that doubled as the boxd liveness
 		// gate, so gate explicitly: a resume must not report success for a
-		// guest whose agent never came back. /health answers from memory, so
-		// this stays immune to the in-guest disk stalls /init is prone to.
-		// 30s matches the restore path's readiness window: a cold-storage
-		// resume legitimately needs longer than a warm one, and this timeout
-		// is destructive (the error path below tears the VM down).
-		if err := a.mgr.waitForBoxd(ctx, inst.IP, 30*time.Second); err != nil {
-			a.mgr.abortResumeLocked(req.GetVmId())
+		// guest whose agent never came back. The gate runs on a budget
+		// detached from this ctx (see resumeReadyOrAbort) so a client
+		// disconnect can't masquerade as a dead guest and tear down a healthy
+		// VM the control plane's retry would have adopted.
+		if err := a.mgr.resumeReadyOrAbort(ctx, req.GetVmId(), inst.IP); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "boxd not reachable after resume: %v", err)
 		}
 		// Hostname-only: stamp it in the background. The guest's first disk
@@ -123,11 +121,12 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			}
 			a.mgr.log.Warn().Err(lastErr).Str("vm_id", id).Msg("background hostname stamp failed after resume")
 		}(inst.IP, inst.ID)
-	} else if err := postBoxdInitRetried(ctx, inst.IP, req.GetEnvVars(), vmHostname(inst.ID), a.ipOwnerCheck(inst.ID, inst.IP)); err != nil {
+	} else if err := postBoxdInitRetried(context.WithoutCancel(ctx), inst.IP, req.GetEnvVars(), vmHostname(inst.ID), a.ipOwnerCheck(inst.ID, inst.IP)); err != nil {
 		// Env vars must be in place before the caller unblocks user code, so
-		// this failure fails the resume — and the VM must not be left running
-		// behind it, or the record and the host diverge until an adoption or
-		// reconciler pass happens to converge them.
+		// this failure fails the resume and tears the VM down rather than
+		// diverge the record from the host. Detached ctx, same reason as the
+		// gate above: a client disconnect must not read as an inject failure
+		// and abort a healthy VM.
 		a.mgr.abortResumeLocked(req.GetVmId())
 		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
