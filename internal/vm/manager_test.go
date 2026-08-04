@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -1041,7 +1042,7 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
 
-	inst, err := mgr.ResumeVM(context.Background(), "vm-1", "", "")
+	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "")
 	if err != nil {
 		t.Fatalf("retried resume of a healthy running VM should succeed, got %v", err)
 	}
@@ -1141,5 +1142,98 @@ func TestInstanceRunning(t *testing.T) {
 	}
 	if m.instanceRunning("absent") {
 		t.Fatal("absent instance must not report running")
+	}
+}
+
+// The post-resume readiness gate must probe on a ctx detached from the
+// caller: a client disconnect mid-gate must not read as a dead guest and tear
+// down a healthy VM the control plane's retry would have adopted.
+func TestResumeReadyOrAbortGateDetachedFromCaller(t *testing.T) {
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	var doneAfterCancel bool
+	orig := boxdHealthProbe
+	boxdHealthProbe = func(ctx context.Context, ip string, timeout time.Duration) error {
+		cancelCaller()                       // client disconnects mid-probe
+		doneAfterCancel = ctx.Err() != nil   // detached gate ctx must NOT be done
+		return nil                           // boxd healthy
+	}
+	defer func() { boxdHealthProbe = orig }()
+
+	m := &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}, vms: map[string]*VMInstance{}}
+	// The return value is not asserted here (the ownership re-check needs a
+	// real network slot this bare manager can't provide); this test pins only
+	// that the probe's ctx is detached from the caller.
+	_ = m.resumeReadyOrAbort(callerCtx, "vm-1", "10.0.0.1")
+	if doneAfterCancel {
+		t.Fatal("readiness gate must survive caller cancellation (detached) — a disconnect must not read as a dead guest")
+	}
+}
+
+// A /health that answers after DestroyVM recycled the IP to another VM must
+// not pass the gate: the resume must fail unless THIS VM still owns the slot.
+func TestResumeReadyOrAbortAbortsWhenSlotRecycled(t *testing.T) {
+	orig := boxdHealthProbe
+	boxdHealthProbe = func(context.Context, string, time.Duration) error {
+		return nil // a guest answered on this IP — but maybe the recycled one
+	}
+	defer func() { boxdHealthProbe = orig }()
+
+	// Instance reads Running with the IP, but the net manager holds no slot for
+	// it (GetVMNetInfo nil) — the state after a concurrent destroy freed the IP.
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5"}
+	m := &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}, vms: map[string]*VMInstance{"vm-1": inst}}
+	if err := m.resumeReadyOrAbort(context.Background(), "vm-1", "10.11.0.5"); err == nil {
+		t.Fatal("a healthy /health against an IP the VM no longer owns must fail the resume")
+	}
+	inst.mu.RLock()
+	st := inst.Status
+	inst.mu.RUnlock()
+	if st != StatusPaused {
+		t.Fatalf("ownership loss must abort the resume (revert to Paused), got %s", st)
+	}
+}
+
+// A genuinely unreachable guest (probe fails for the whole budget) must abort
+// the resume: revert the tracked instance to Paused for a clean fresh restore.
+func TestResumeReadyOrAbortAbortsOnGenuineFailure(t *testing.T) {
+	orig := boxdHealthProbe
+	boxdHealthProbe = func(context.Context, string, time.Duration) error {
+		return fmt.Errorf("boxd not ready")
+	}
+	defer func() { boxdHealthProbe = orig }()
+
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}, vms: map[string]*VMInstance{"vm-1": inst}}
+	if err := m.resumeReadyOrAbort(context.Background(), "vm-1", "10.0.0.1"); err == nil {
+		t.Fatal("genuine unreachability must fail the gate")
+	}
+	inst.mu.RLock()
+	st := inst.Status
+	inst.mu.RUnlock()
+	if st != StatusPaused {
+		t.Fatalf("genuine failure must abort the resume (revert to Paused), got %s", st)
+	}
+}
+
+// A VM inside DestroyVM's teardown window must not be lazily reattached: doing
+// so would rebind the slot destroy is freeing and hand a live pointer to a
+// recycling IP (the credential-delivery / cross-tenant hazard).
+func TestGetInstanceRefusesResurrectionDuringDestroy(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5", Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{}, vms: map[string]*VMInstance{}}
+
+	m.destroying.Store("vm-1", struct{}{})
+	if _, err := m.getInstance("vm-1"); err == nil {
+		t.Fatal("a VM mid-destroy must not be lazily reattached")
+	}
+	if _, tracked := m.vms["vm-1"]; tracked {
+		t.Fatal("a VM mid-destroy must not be republished to m.vms")
 	}
 }
