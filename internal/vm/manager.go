@@ -1763,12 +1763,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 					// The caller went away — no verdict on the VM, no teardown.
 					return nil, fmt.Errorf("adopted VM %s readiness unverified: %w", vmID, err)
 				}
-				// Definitive exhaustion: flip out of Running so the
-				// readiness-blind resume adoption cannot resurrect it (the
-				// resume fallback reverts without destroying). No unit stop —
-				// boxd-dead does not prove guest-dead, and killing a live
-				// guest over a wedged agent is the false-negative the removed
-				// probe fell into; the reconciler owns a truly dead unit.
+				// Definitive exhaustion: flip out of Running. That makes the
+				// record un-adoptable, so the retry relaunches from the
+				// snapshot — the only escape from a wedged agent, since
+				// re-adopting one loops forever. It also unblocks cleanup:
+				// the reconciler's live-unit rules defer to a Running
+				// in-memory record, so Error is what lets them stop the unit
+				// if no retry comes. No unit stop here — boxd-dead does not
+				// prove guest-dead, and the retry's relaunch replaces the
+				// unit anyway.
 				// persistStateIfPresent, not setStatus: a destroy racing this
 				// branch must not have its record deletion overwritten by an
 				// unconditional put.
