@@ -10,7 +10,6 @@ import (
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/preview"
-	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -91,34 +90,14 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		// Skipping /init drops the call that doubled as the boxd liveness
 		// gate, so gate explicitly: a resume must not report success for a
 		// guest whose agent never came back. See resumeReadyOrAbort for why
-		// the gate detaches from this ctx.
+		// the gate detaches from this ctx. No hostname stamp: the guest's
+		// hostname is kernel UTS state captured in the memory snapshot (set
+		// once at create, before any pause), so restore brings it back — the
+		// same reason the control plane's stateless-resume fallback never
+		// re-stamps.
 		if err := a.mgr.resumeReadyOrAbort(ctx, req.GetVmId(), inst.IP); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "boxd not reachable after resume: %v", err)
 		}
-		// Hostname-only: stamp it in the background. The guest's first disk
-		// write after a restore can stall transiently, and a cosmetic stamp
-		// must not fail an otherwise-healthy resume.
-		go func(ip, id string) {
-			defer sentrylog.Recover("resume-hostname-stamp")
-			stampCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			// Slot IPs are recycled after destroy; re-check before each
-			// attempt so a delayed stamp can't label a different VM.
-			owner := a.ipOwnerCheck(id, ip)
-			var lastErr error
-			for attempt := 0; attempt < 2; attempt++ {
-				if !owner() {
-					return
-				}
-				if lastErr = postBoxdInit(stampCtx, ip, nil, vmHostname(id)); lastErr == nil {
-					return
-				}
-				if stampCtx.Err() != nil {
-					break
-				}
-			}
-			a.mgr.log.Warn().Err(lastErr).Str("vm_id", id).Msg("background hostname stamp failed after resume")
-		}(inst.IP, inst.ID)
 	} else if err := postBoxdInitRetried(context.WithoutCancel(ctx), inst.IP, req.GetEnvVars(), vmHostname(inst.ID), a.ipOwnerCheck(inst.ID, inst.IP)); err != nil {
 		// Env vars must be in place before the caller unblocks user code, so
 		// this failure aborts the resume. Detached ctx, same reason as the
