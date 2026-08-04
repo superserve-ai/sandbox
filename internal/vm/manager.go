@@ -722,12 +722,11 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 		return status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
 	}
 
-	// Tombstone for the whole teardown (see the destroying field): a concurrent
-	// lazy getInstance — exec, preview, inject — must not reattach this VM and
-	// rebind its slot at any point while we're stopping it and freeing that
-	// slot, or an in-flight delivery lands on a recycling IP. A tracked VM
-	// still resolves from m.vms below (the tombstone gates only reattach); an
-	// untracked one takes the record fallback, which carries all teardown needs.
+	// Tombstone the whole teardown so a concurrent lazy getInstance can't
+	// resurrect this VM onto the slot we're about to free (see the destroying
+	// field). A tracked VM still resolves from m.vms below — this gates only
+	// reattach; an untracked one takes the record fallback, which carries all
+	// teardown needs.
 	m.destroying.Store(vmID, struct{}{})
 	defer m.destroying.Delete(vmID)
 
@@ -2393,9 +2392,8 @@ func (m *Manager) reattachByID(vmID string, cleanupStale bool) *VMInstance {
 		if ok {
 			return inst, nil
 		}
-		// A VM being destroyed must not be resurrected from its record: the
-		// slot is (or is about to be) freed, so reattaching would rebind a
-		// recycling IP. The record delete finishes the teardown.
+		// Being destroyed: don't resurrect from the record onto a freed slot
+		// (see the destroying field).
 		if _, destroying := m.destroying.Load(vmID); destroying {
 			return (*VMInstance)(nil), nil
 		}
