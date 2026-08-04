@@ -1874,3 +1874,41 @@ func TestCreateVMSnapshotDoesNotPersist(t *testing.T) {
 		t.Fatal("CreateVMSnapshot must not persist: it holds no vm-op lock, so a full-record write can clobber a concurrent lifecycle op")
 	}
 }
+
+// The corpse verdict must be durable before relaunching: the relaunch can fail
+// on a precondition and return, so an unrecorded verdict would leave the record
+// still claiming Running. A failed write must refuse the relaunch outright.
+func TestResumeVM_CorpseVerdictUnrecordable_RefusesRelaunch(t *testing.T) {
+	origDead := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive → adoption considered
+	defer func() { vmUnitDead = origDead }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error {
+		return errors.New("boxd silent for the whole budget")
+	}
+	defer func() { adoptionBoxdReady = origReady }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: "/nonexistent/vmstate.snap", MemFilePath: "/nonexistent/mem.snap",
+	}
+	if err := store.Put(toRecord(existing)); err != nil {
+		t.Fatal(err)
+	}
+	store.Close() // every later write fails — the store is broken
+
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
+	_, err = m.resumeVMLocked(context.Background(), "vm-1", "", "")
+	if err == nil {
+		t.Fatal("an unrecordable verdict must fail the resume")
+	}
+	// It must fail ON the verdict, not sail past it into the relaunch and fail
+	// there on the missing artifacts.
+	if !strings.Contains(err.Error(), "record readiness verdict") {
+		t.Fatalf("must refuse at the verdict, got %v", err)
+	}
+}

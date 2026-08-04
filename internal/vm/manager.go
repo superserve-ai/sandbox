@@ -1221,7 +1221,16 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			existing.mu.Lock()
 			existing.Status = StatusPaused
 			existing.mu.Unlock()
-			m.persistStateIfPresent(existing)
+			// The verdict has to be durable BEFORE relaunching: the relaunch
+			// below can fail on a precondition and return, and an undurable
+			// verdict would leave the record still claiming Running. Refuse
+			// instead — the next attempt re-derives the verdict.
+			switch wrote, perr := m.persistStateIfPresent(existing); {
+			case perr != nil:
+				return nil, fmt.Errorf("record readiness verdict for vm %s: %w", vmID, perr)
+			case !wrote:
+				return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during resume", vmID)
+			}
 			log.Warn().Err(verr).Msg("resume: unverified VM failed readiness — relaunching")
 		} else {
 			if cerr := m.commitVerifiedAdoption(existing); cerr != nil {
@@ -1835,7 +1844,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				existing.mu.Lock()
 				existing.Status = StatusError
 				existing.mu.Unlock()
-				m.persistStateIfPresent(existing)
+				// Best-effort: the returned error is the useful one, and an
+				// undurable flip is re-derived by the next attempt's gate.
+				_, _ = m.persistStateIfPresent(existing)
 				return nil, fmt.Errorf("adopted VM %s boxd not ready: %w", vmID, err)
 			}
 			// Readiness is now proven; make that durable so the next restart
@@ -2344,7 +2355,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	go func() {
 		defer sentrylog.Recover("restore-verified-persist")
 		defer handoff()
-		m.persistStateIfPresent(inst)
+		// Best-effort: an undurable clear leaves the marker set, which the
+		// next adoption re-verifies and heals.
+		_, _ = m.persistStateIfPresent(inst)
 	}()
 
 	log.Info().
@@ -2564,7 +2577,9 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		}
 		log.Info().Msg("reattached paused VM")
 	} else {
-		if !m.persistStateIfPresent(inst) {
+		// Only a deletion undoes the reattach; a write error leaves the
+		// record as it was, which the VM still matches.
+		if wrote, perr := m.persistStateIfPresent(inst); perr == nil && !wrote {
 			m.undoReattach(rec.ID)
 			return nil, false
 		}
@@ -3099,19 +3114,21 @@ func (m *Manager) persistState(inst *VMInstance) bool {
 	return true
 }
 
-// persistStateIfPresent persists inst only if its record still exists (atomic),
-// returning false when a concurrent DestroyVM deleted it — so the caller undoes
-// the reattach instead of resurrecting it. No store / write error → true.
-func (m *Manager) persistStateIfPresent(inst *VMInstance) bool {
+// persistStateIfPresent persists inst only if its record still exists (atomic).
+// wrote=false means a concurrent DestroyVM deleted the record: the caller must
+// not resurrect it. A non-nil err means the write itself failed and the durable
+// record is UNCHANGED — a different outcome that must never be read as either
+// "stored" or "deleted", which is why the two travel separately.
+func (m *Manager) persistStateIfPresent(inst *VMInstance) (wrote bool, err error) {
 	if m.state == nil || isBuildVM(inst.ID) {
-		return true
+		return true, nil
 	}
-	wrote, err := m.state.PutIfPresent(toRecord(inst))
+	wrote, err = m.state.PutIfPresent(toRecord(inst))
 	if err != nil {
 		m.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to persist VM state to BoltDB")
-		return true
+		return false, err
 	}
-	return wrote
+	return wrote, nil
 }
 
 // recordDeleted reports whether vmID's record is gone from the store (deleted
@@ -3287,7 +3304,8 @@ func (m *Manager) abortResumeLocked(vmID string) {
 	// Conditional: a concurrent destroy may have deleted the record; it owns
 	// the teardown then, and an unconditional write would resurrect a
 	// destroyed VM's record.
-	m.persistStateIfPresent(inst)
+	// Best-effort: an undurable revert is re-derived by the reconciler.
+	_, _ = m.persistStateIfPresent(inst)
 }
 
 // stopUnitDuringRestoreError stops the per-VM systemd unit when a restore
@@ -3673,7 +3691,8 @@ func (m *Manager) resolveAndSetPID(vmID string) {
 		return
 	}
 	defer unlock()
-	m.persistStateIfPresent(inst)
+	// Best-effort: a later lifecycle persist carries the PID.
+	_, _ = m.persistStateIfPresent(inst)
 	m.log.Debug().Str("vm_id", vmID).Int("pid", pid).Msg("resolved systemd MainPID")
 }
 
@@ -3906,8 +3925,9 @@ func (m *Manager) commitVerifiedAdoption(existing *VMInstance) error {
 	existing.mu.Lock()
 	existing.Unverified = false
 	existing.mu.Unlock()
-	if !m.persistStateIfPresent(existing) {
-		// The record was deleted while we verified; the destroy owns teardown.
+	// Only a deletion aborts the adoption; a write error leaves the marker
+	// set, which the next adoption re-verifies and heals.
+	if wrote, perr := m.persistStateIfPresent(existing); perr == nil && !wrote {
 		return status.Errorf(codes.NotFound, "vm %s was destroyed during restore", existing.ID)
 	}
 	return nil
