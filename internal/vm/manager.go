@@ -3045,8 +3045,11 @@ func isReservedRunDirName(name string) bool {
 // DestroyVM bypasses the lifecycle lock (see vmOpLocks), so a concurrent
 // destroy is still possible; its deletions are handled by the guards below.
 func (m *Manager) abortResumeLocked(vmID string) {
-	inst, err := m.getInstance(vmID)
-	if err != nil {
+	// trackedInstance, never getInstance: in DestroyVM's delete window a
+	// lazy reattach would resurrect the instance and rebind its freed slot
+	// (see trackedInstance). Untracked means the destroy owns the teardown.
+	inst := m.trackedInstance(vmID)
+	if inst == nil {
 		return
 	}
 	inst.mu.Lock()

@@ -34,6 +34,34 @@ func TestIPOwnerCheckDoesNotResurrectMidDestroy(t *testing.T) {
 	}
 }
 
+// abortResumeLocked must also be non-resurrecting: mid-destroy (record
+// durable, instance gone) it must do nothing — not republish the instance,
+// not flip the record to Paused over the destroy's teardown.
+func TestAbortResumeLockedDoesNotResurrectMidDestroy(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}, netMgr: &network.Manager{}}
+
+	m.abortResumeLocked("vm-1")
+
+	if _, tracked := m.vms["vm-1"]; tracked {
+		t.Fatal("abort must not resurrect the destroyed instance")
+	}
+	rec, err := store.Get("vm-1")
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	if rec.Status != StatusRunning {
+		t.Fatalf("abort must not touch the record mid-destroy, got status %s", rec.Status)
+	}
+}
+
 // The remaining veto legs: IP mismatch, non-Running status, a released slot
 // (destroy frees the slot before the instance), and an untracked VM.
 func TestIPOwnerCheckVetoes(t *testing.T) {
