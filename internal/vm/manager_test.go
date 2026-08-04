@@ -1494,3 +1494,28 @@ func TestPersistStateReportsFailure(t *testing.T) {
 		t.Fatal("persist into a broken store must report failure, not log and claim success")
 	}
 }
+
+// The unverified-relaunch readiness gate tears the VM down on failure, so it
+// must probe on a ctx detached from the caller: a client disconnect or spent
+// deadline must not masquerade as a dead guest — and a completed wait clears
+// the marker so the next retry adopts instead of relaunching.
+func TestRelaunchBoxdReadyDetachedFromCaller(t *testing.T) {
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	cancelCaller() // caller already gone before the gate runs
+
+	var gateCtxDone bool
+	orig := adoptionBoxdReady
+	adoptionBoxdReady = func(ctx context.Context, _ *Manager, _ string) error {
+		gateCtxDone = ctx.Err() != nil
+		return nil
+	}
+	defer func() { adoptionBoxdReady = orig }()
+
+	m := &Manager{log: zerolog.Nop()}
+	if err := m.relaunchBoxdReady(callerCtx, "192.0.2.5"); err != nil {
+		t.Fatalf("healthy gate must pass, got %v", err)
+	}
+	if gateCtxDone {
+		t.Fatal("relaunch gate must run on a ctx detached from the caller — a dead caller must not read as a dead guest")
+	}
+}

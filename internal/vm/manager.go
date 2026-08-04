@@ -956,6 +956,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	inst.MemFilePath = memPath
 	inst.BaseMemPath = baseMemPath // template base for a layered overlay; "" when standalone
 	inst.DirtyTracked = false      // FC process is stopping; a fresh resume re-arms tracking.
+	// The crash-window marker describes a RUNNING record persisted before
+	// readiness was proven; a successful pause proves the guest was live and
+	// snapshots fresh artifacts, and its resume relaunches from them anyway.
+	// Carrying the marker into Paused would make every future resume of this
+	// sandbox take the destructive relaunch gate for no reason.
+	inst.Unverified = false
 	inst.mu.Unlock()
 
 	m.persistState(inst)
@@ -1265,8 +1271,13 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		// its gate, and leaving it set would make every resume retry relaunch
 		// and roll the guest back again. Normal resumes stay readiness-blind
 		// (detached probe below). The guest was just relaunched from its
-		// snapshot, so the failure teardown discards nothing of value.
-		if verr := m.waitForBoxd(ctx, inst.IP, 30*time.Second); verr != nil {
+		// snapshot, so the failure teardown discards nothing of value — but
+		// only a GENUINE verdict may tear down (see relaunchBoxdReady): a
+		// caller deadline shorter than the guest's warmup would otherwise
+		// truncate every attempt and livelock the sandbox in relaunch-kill
+		// cycles, when a completed wait clears the marker durably and lets
+		// the next retry adopt instantly.
+		if verr := m.relaunchBoxdReady(ctx, inst.IP); verr != nil {
 			m.stopUnitDuringRestoreError(vmID)
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("boxd not ready after relaunch of unverified vm %s: %w", vmID, verr)
@@ -3682,10 +3693,22 @@ var vmUnitDead = func(vmID string) bool {
 	return unitDefinitelyDead(ctx, systemdUnitName(vmID))
 }
 
-// adoptionBoxdReady is the restore-adoption readiness gate, a var for the
-// same test seam vmUnitDead uses.
+// adoptionBoxdReady is the boxd readiness gate for restore adoption and the
+// unverified relaunch (via relaunchBoxdReady); a var for the same test seam
+// vmUnitDead uses.
 var adoptionBoxdReady = func(ctx context.Context, m *Manager, ip string) error {
 	return m.waitForBoxd(ctx, ip, 30*time.Second)
+}
+
+// relaunchBoxdReady verifies a relaunched crash-window VM on a budget DETACHED
+// from the caller's ctx: the relaunch gate's failure path tears the VM down,
+// so a caller disconnect or spent deadline must never masquerade as a dead
+// guest. Detaching also guarantees the wait completes even for an abandoned
+// RPC — the marker is cleared durably and the next retry adopts the verified
+// VM instead of relaunching it. The wall-clock bound inside waitForBoxd still
+// caps the wait.
+func (m *Manager) relaunchBoxdReady(callerCtx context.Context, ip string) error {
+	return adoptionBoxdReady(context.WithoutCancel(callerCtx), m, ip)
 }
 
 func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) (*VMInstance, bool) {
