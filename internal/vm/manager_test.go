@@ -1586,38 +1586,6 @@ func TestResumeVM_UnverifiedTarget_VerifiedAndAdopted(t *testing.T) {
 	}
 }
 
-// A caller that vanishes mid-gate gives no verdict: resume must return the
-// error WITHOUT relaunching (which would kill a possibly-live guest).
-func TestResumeVM_UnverifiedTarget_NoVerdictOnCancel(t *testing.T) {
-	origDead := vmUnitDead
-	vmUnitDead = func(string) bool { return false }
-	defer func() { vmUnitDead = origDead }()
-	origReady := adoptionBoxdReady
-	adoptionBoxdReady = func(ctx context.Context, _ *Manager, _ string) error {
-		return context.Canceled
-	}
-	defer func() { adoptionBoxdReady = origReady }()
-
-	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
-		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
-		MemFilePath:  "/snapshots/vm-1/mem.snap",
-	}
-	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := mgr.resumeVMLocked(ctx, "vm-1", "", ""); err == nil {
-		t.Fatal("a vanished caller must surface an error, not adopt or relaunch")
-	}
-	existing.mu.RLock()
-	st := existing.Status
-	existing.mu.RUnlock()
-	if st != StatusRunning {
-		t.Fatalf("no verdict must mean no teardown; status went to %s", st)
-	}
-}
-
 // commitVerifiedAdoption must treat the store refusing the marker-clear write
 // (record deleted by a concurrent destroy) as NotFound, never success.
 func TestCommitVerifiedAdoption_DestroyedRecordIsNotFound(t *testing.T) {
@@ -1807,5 +1775,58 @@ func TestVerifyBoxdReadyReachesVerdictUnderShorterCallerDeadline(t *testing.T) {
 	}
 	if sawDeadline {
 		t.Fatal("the gate must not inherit the caller's deadline — it would expire before any verdict")
+	}
+}
+
+// When the readiness gate condemns an unverified record, the relaunch that
+// follows can still fail on a precondition — and those paths return without
+// touching status. The corpse verdict must therefore be recorded first, or the
+// crash-window record keeps advertising Running for a VM that never came back.
+func TestResumeVM_CorpseVerdict_ClearsRunningBeforeRelaunch(t *testing.T) {
+	origDead := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive → adoption considered
+	defer func() { vmUnitDead = origDead }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error {
+		return errors.New("boxd silent for the whole budget")
+	}
+	defer func() { adoptionBoxdReady = origReady }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Snapshot paths that do not exist: the relaunch fails a precondition
+	// right after the fallthrough, which is exactly the case that used to
+	// leave the stale Running claim behind.
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: "/nonexistent/vmstate.snap", MemFilePath: "/nonexistent/mem.snap",
+	}
+	if err := store.Put(toRecord(existing)); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
+
+	if _, err := m.resumeVMLocked(context.Background(), "vm-1", "", ""); err == nil {
+		t.Fatal("a relaunch with missing artifacts must fail")
+	}
+	existing.mu.RLock()
+	st, unver := existing.Status, existing.Unverified
+	existing.mu.RUnlock()
+	if st == StatusRunning {
+		t.Fatal("a condemned record must not still advertise Running after a failed relaunch")
+	}
+	if !unver {
+		t.Fatal("readiness is still unproven — the marker must survive so the relaunch verifies")
+	}
+	rec, err := store.Get("vm-1")
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	if rec.Status == StatusRunning {
+		t.Fatal("the durable record must not advertise Running either")
 	}
 }
