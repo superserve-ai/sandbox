@@ -1913,3 +1913,30 @@ func TestResumeVM_CorpseVerdictUnrecordable_RefusesRelaunch(t *testing.T) {
 		t.Fatalf("must refuse at the verdict, got %v", err)
 	}
 }
+
+// DestroyVM stops the unit and frees the slot before it removes the map entry,
+// so tracked-ness alone would let a resume report success for a VM already
+// being torn down.
+func TestCommitResumeState_DestroyInProgress_NotReportedSuccessful(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	// Still tracked — DestroyVM has not reached removeVM yet — but tombstoned.
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+	m.destroying.Store("vm-1", struct{}{})
+
+	if err := m.commitResumeState(inst); status.Code(err) != codes.NotFound {
+		t.Fatalf("a resume racing an in-progress destroy must surface NotFound, got %v", err)
+	}
+	present, herr := store.Has("vm-1")
+	if herr != nil {
+		t.Fatal(herr)
+	}
+	if present {
+		t.Fatal("the resume's write must be erased for a VM being destroyed")
+	}
+}

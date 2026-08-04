@@ -3893,7 +3893,11 @@ func (m *Manager) commitResumeState(inst *VMInstance) error {
 	m.mu.RLock()
 	_, stillTracked := m.vms[inst.ID]
 	m.mu.RUnlock()
-	if stillTracked {
+	// The map entry outlives most of DestroyVM — it stops the unit and frees
+	// the slot first — so tracked-ness alone would report success for a VM
+	// already being torn down. The tombstone covers the whole teardown.
+	_, destroying := m.destroying.Load(inst.ID)
+	if stillTracked && !destroying {
 		return nil
 	}
 	m.deleteState(inst.ID)
