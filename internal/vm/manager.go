@@ -344,6 +344,25 @@ func (m *Manager) trackedInstance(vmID string) *VMInstance {
 	return m.vms[vmID]
 }
 
+// vmOwnsIP reports whether vmID is still the live owner of ip: tracked,
+// Running, IP-matched, AND holding the network slot per the net manager's
+// device table (the authoritative owner ledger). The tracked instance alone
+// is not enough — DestroyVM frees the slot before it removes the instance, and
+// it takes no lifecycle lock, so a concurrent destroy can recycle ip to
+// another VM while the record still reads Running. Every path that acts on an
+// IP a lock-free destroy could have revoked — credential delivery AND the
+// resume readiness gate — checks this before trusting the answer.
+func (m *Manager) vmOwnsIP(vmID, ip string) bool {
+	inst := m.trackedInstance(vmID)
+	if inst == nil {
+		return false
+	}
+	inst.mu.RLock()
+	ok := inst.IP == ip && inst.Status == StatusRunning
+	inst.mu.RUnlock()
+	return ok && m.netMgr.GetVMNetInfo(vmID) != nil
+}
+
 // instanceRunning reports whether vmID's tracked instance is Running — the
 // authoritative signal that a resume/restore completed, used by the
 // reconciler to avoid stopping a just-relaunched unit.
@@ -3591,6 +3610,16 @@ func (m *Manager) resumeReadyOrAbort(callerCtx context.Context, vmID, ip string)
 	if err := m.waitForBoxd(context.WithoutCancel(callerCtx), ip, boxdResumeReadyBudget); err != nil {
 		m.abortResumeLocked(vmID)
 		return err
+	}
+	// /health answered — but on an IP, not a VM identity. A concurrent
+	// lock-free DestroyVM can recycle ip to another VM mid-probe (likeliest
+	// while a cold-fault resume is slow to answer), so a stranger's guest
+	// could be what replied. Confirm this VM still owns the slot before
+	// reporting the resume ready, or we'd certify a live answer from another
+	// tenant. Ownership loss means the VM was destroyed; abort is a no-op then.
+	if !m.vmOwnsIP(vmID, ip) {
+		m.abortResumeLocked(vmID)
+		return fmt.Errorf("vm %s no longer owns %s after readiness (destroyed mid-resume?)", vmID, ip)
 	}
 	return nil
 }

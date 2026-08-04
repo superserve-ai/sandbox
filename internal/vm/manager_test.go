@@ -1159,12 +1159,37 @@ func TestResumeReadyOrAbortGateDetachedFromCaller(t *testing.T) {
 	}
 	defer func() { boxdHealthProbe = orig }()
 
-	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
-	if err := m.resumeReadyOrAbort(callerCtx, "vm-1", "10.0.0.1"); err != nil {
-		t.Fatalf("a healthy gate must pass, got %v", err)
-	}
+	m := &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}, vms: map[string]*VMInstance{}}
+	// The return value is not asserted here (the ownership re-check needs a
+	// real network slot this bare manager can't provide); this test pins only
+	// that the probe's ctx is detached from the caller.
+	_ = m.resumeReadyOrAbort(callerCtx, "vm-1", "10.0.0.1")
 	if doneAfterCancel {
 		t.Fatal("readiness gate must survive caller cancellation (detached) — a disconnect must not read as a dead guest")
+	}
+}
+
+// A /health that answers after DestroyVM recycled the IP to another VM must
+// not pass the gate: the resume must fail unless THIS VM still owns the slot.
+func TestResumeReadyOrAbortAbortsWhenSlotRecycled(t *testing.T) {
+	orig := boxdHealthProbe
+	boxdHealthProbe = func(context.Context, string, time.Duration) error {
+		return nil // a guest answered on this IP — but maybe the recycled one
+	}
+	defer func() { boxdHealthProbe = orig }()
+
+	// Instance reads Running with the IP, but the net manager holds no slot for
+	// it (GetVMNetInfo nil) — the state after a concurrent destroy freed the IP.
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5"}
+	m := &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}, vms: map[string]*VMInstance{"vm-1": inst}}
+	if err := m.resumeReadyOrAbort(context.Background(), "vm-1", "10.11.0.5"); err == nil {
+		t.Fatal("a healthy /health against an IP the VM no longer owns must fail the resume")
+	}
+	inst.mu.RLock()
+	st := inst.Status
+	inst.mu.RUnlock()
+	if st != StatusPaused {
+		t.Fatalf("ownership loss must abort the resume (revert to Paused), got %s", st)
 	}
 }
 
