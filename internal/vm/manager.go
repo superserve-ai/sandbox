@@ -2242,12 +2242,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
-	// Resume-path parity: Running means the vCPUs are live; boxd readiness is
-	// verified below and still fails the restore. The proxy consequently sees
-	// Running during the wait, as it always has on resume, and a crash in
-	// this window leaves a Running record whose readiness was never verified
-	// — both restore and resume adoption re-verify such records before
-	// adopting them. The status is set directly — setStatus would
+	// Running means the vCPUs are live, which is what lets the persist overlap
+	// the wait below; readiness is still verified there and still fails the
+	// restore. This deliberately adopts the resume path's weaker guarantee —
+	// resume has always published Running before readiness (its probe is
+	// detached telemetry) — where restore previously published only after.
+	// The window itself is not routable: the control plane hands out no usable
+	// sandbox until this RPC returns and it activates the row. What the marker
+	// bounds is the durable case — a crash here leaves a Running record whose
+	// readiness was never proven, and both restore and resume adoption
+	// re-verify such records before adopting them.
+	// The status is set directly — setStatus would
 	// persist synchronously, serializing the very fsync the goroutine
 	// overlaps with the boxd wait.
 	inst.mu.Lock()
