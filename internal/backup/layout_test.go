@@ -52,6 +52,15 @@ func TestGenerationKey(t *testing.T) {
 	if rebased == k1 {
 		t.Fatal("changed base dependency did not change the generation key")
 	}
+	// Size is a restore-side resource bound, so it must be key-covered:
+	// a tampered manifest inflating it has to fail the key check.
+	resized := GenerationKey([]TaskFile{
+		{Name: "rootfs.ext4", SHA256: "aaaa", Size: 1 << 60},
+		base[1],
+	})
+	if resized == k1 {
+		t.Fatal("changed size did not change the generation key")
+	}
 	// A base rebuilt in place: same path, different bytes. The path
 	// cannot see it; the base content digest must.
 	rebuilt := GenerationKey([]TaskFile{

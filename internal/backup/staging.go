@@ -113,7 +113,7 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 					return false, err
 				}
 			}
-			task.Files[i].BasePath = stagedBase
+			task.Files[i].BaseStagedPath = stagedBase
 		}
 	}
 	return all, nil
