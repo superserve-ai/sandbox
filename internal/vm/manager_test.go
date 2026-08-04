@@ -1188,6 +1188,11 @@ func TestResumeVM_UnverifiedRecord_NotAdopted(t *testing.T) {
 	orig := vmUnitDead
 	vmUnitDead = func(string) bool { return false } // unit alive
 	defer func() { vmUnitDead = orig }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error {
+		return errors.New("boxd never became ready") // a genuine corpse verdict
+	}
+	defer func() { adoptionBoxdReady = origReady }()
 
 	existing := &VMInstance{
 		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
@@ -1197,10 +1202,10 @@ func TestResumeVM_UnverifiedRecord_NotAdopted(t *testing.T) {
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
 
 	// The fallthrough fails on the missing snapshot files — the assertion is
-	// only that the unverified record was not returned as a healthy VM.
+	// only that the corpse was not returned as a healthy VM.
 	inst, err := mgr.ResumeVM(context.Background(), "vm-1", "", "")
 	if err == nil && inst == existing {
-		t.Fatal("an unverified record must not be adopted by the readiness-blind resume path")
+		t.Fatal("an unverified record that fails verification must not be adopted")
 	}
 }
 
@@ -1517,5 +1522,102 @@ func TestRelaunchBoxdReadyDetachedFromCaller(t *testing.T) {
 	}
 	if gateCtxDone {
 		t.Fatal("relaunch gate must run on a ctx detached from the caller — a dead caller must not read as a dead guest")
+	}
+}
+
+// An unverified retry target must be VERIFIED and adopted by resume, not
+// blindly refused: refusal relaunches over a possibly-live guest, and a stale
+// marker (swallowed clear, crash before the verified persist) would make that
+// rollback happen to a healthy VM. Success must also heal the marker durably.
+func TestResumeVM_UnverifiedTarget_VerifiedAndAdopted(t *testing.T) {
+	origDead := vmUnitDead
+	vmUnitDead = func(string) bool { return false } // unit alive
+	defer func() { vmUnitDead = origDead }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil }
+	defer func() { adoptionBoxdReady = origReady }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
+		MemFilePath:  "/snapshots/vm-1/mem.snap",
+	}
+	if err := store.Put(toRecord(existing)); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
+
+	inst, err := mgr.ResumeVM(context.Background(), "vm-1", "", "")
+	if err != nil {
+		t.Fatalf("verified adoption must succeed, got %v", err)
+	}
+	if inst != existing {
+		t.Fatal("expected the existing live instance, not a relaunch")
+	}
+	if inst.Unverified {
+		t.Fatal("adoption must clear the marker in memory")
+	}
+	rec, err := store.Get("vm-1")
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	if rec.Unverified {
+		t.Fatal("adoption must clear the marker durably")
+	}
+}
+
+// A caller that vanishes mid-gate gives no verdict: resume must return the
+// error WITHOUT relaunching (which would kill a possibly-live guest).
+func TestResumeVM_UnverifiedTarget_NoVerdictOnCancel(t *testing.T) {
+	origDead := vmUnitDead
+	vmUnitDead = func(string) bool { return false }
+	defer func() { vmUnitDead = origDead }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(ctx context.Context, _ *Manager, _ string) error {
+		return context.Canceled
+	}
+	defer func() { adoptionBoxdReady = origReady }()
+
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
+		MemFilePath:  "/snapshots/vm-1/mem.snap",
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := mgr.ResumeVM(ctx, "vm-1", "", ""); err == nil {
+		t.Fatal("a vanished caller must surface an error, not adopt or relaunch")
+	}
+	existing.mu.RLock()
+	st := existing.Status
+	existing.mu.RUnlock()
+	if st != StatusRunning {
+		t.Fatalf("no verdict must mean no teardown; status went to %s", st)
+	}
+}
+
+// commitVerifiedAdoption must treat the store refusing the marker-clear write
+// (record deleted by a concurrent destroy) as NotFound, never success.
+func TestCommitVerifiedAdoption_DestroyedRecordIsNotFound(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// No record in the store: PutIfPresent refuses — the destroy signal.
+	existing := &VMInstance{ID: "vm-1", Status: StatusRunning, Unverified: true}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
+
+	err = m.commitVerifiedAdoption(existing)
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("a refused marker-clear write must surface NotFound, got %v", err)
 	}
 }

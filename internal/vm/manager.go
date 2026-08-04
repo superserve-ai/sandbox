@@ -1138,13 +1138,36 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	// the prior attempt. Relaunching would kill it and roll the guest back
 	// to the snapshot, so return the live instance — same guard as the
 	// stateless restore path.
-	if existing, needsVerify := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil && !needsVerify {
-		// Resume's contract never blocks on boxd (the readiness probe is
-		// detached telemetry), so adoption matches: record + live unit suffice.
-		// An unverified target is the one exception — this path cannot verify
-		// it, so it falls through to a fresh, fully-verified launch.
-		log.Info().Msg("resume: VM already running and healthy, returning it")
-		return existing, nil
+	if existing, needsVerify := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
+		if !needsVerify {
+			// Resume's contract never blocks on boxd (the readiness probe is
+			// detached telemetry), so adoption matches: record + live unit
+			// suffice.
+			log.Info().Msg("resume: VM already running and healthy, returning it")
+			return existing, nil
+		}
+		// An unverified target is the one case where blindness is unsafe in
+		// BOTH directions: blind adoption could hand back a corpse, blind
+		// refusal relaunches over a possibly-live guest (and a stale marker —
+		// a swallowed clear, a crash before the verified persist — would make
+		// that rollback happen to a HEALTHY VM). Evidence decides, with the
+		// same gate restore adoption uses; success also heals the marker
+		// durably.
+		if verr := adoptionBoxdReady(ctx, m, existing.IP); verr != nil {
+			if ctx.Err() != nil {
+				// The caller went away — no verdict on the VM, no relaunch.
+				return nil, fmt.Errorf("adopted VM %s readiness unverified: %w", vmID, verr)
+			}
+			// Genuine silence for the whole gate: the record is a corpse.
+			// Fall through to the relaunch — resume's remedy for it.
+			log.Warn().Err(verr).Msg("resume: unverified VM failed readiness — relaunching")
+		} else {
+			if cerr := m.commitVerifiedAdoption(existing); cerr != nil {
+				return nil, cerr
+			}
+			log.Info().Msg("resume: unverified VM verified and adopted")
+			return existing, nil
+		}
 	}
 
 	// Verify the snapshot files actually exist on disk. DB can claim
@@ -1755,21 +1778,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				m.persistStateIfPresent(existing)
 				return nil, fmt.Errorf("adopted VM %s boxd not ready: %w", vmID, err)
 			}
-			// The wait stretched the adoption window; re-check identity after
-			// it, as the fresh-restore path does, so a destroy landing
-			// mid-wait cannot be reported as a successful restore.
-			m.mu.RLock()
-			still := m.vms[vmID] == existing
-			m.mu.RUnlock()
-			if !still {
-				return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
-			}
 			// Readiness is now proven; make that durable so the next restart
 			// reattaches a verified record instead of re-gating it forever.
-			existing.mu.Lock()
-			existing.Unverified = false
-			existing.mu.Unlock()
-			m.persistStateIfPresent(existing)
+			if cerr := m.commitVerifiedAdoption(existing); cerr != nil {
+				return nil, cerr
+			}
 		}
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
@@ -3711,6 +3724,29 @@ func (m *Manager) relaunchBoxdReady(callerCtx context.Context, ip string) error 
 	return adoptionBoxdReady(context.WithoutCancel(callerCtx), m, ip)
 }
 
+// commitVerifiedAdoption makes a just-verified crash-window adoption durable:
+// re-check identity after the wait stretched the window, clear the marker,
+// and persist — treating BOTH destroy signals (instance swapped out, store
+// refusing the write) as NotFound, so a destroy racing the verification can
+// never be reported as a successful adoption. Shared by restore and resume
+// adoption so the two paths cannot drift.
+func (m *Manager) commitVerifiedAdoption(existing *VMInstance) error {
+	m.mu.RLock()
+	still := m.vms[existing.ID] == existing
+	m.mu.RUnlock()
+	if !still {
+		return status.Errorf(codes.NotFound, "vm %s was destroyed during restore", existing.ID)
+	}
+	existing.mu.Lock()
+	existing.Unverified = false
+	existing.mu.Unlock()
+	if !m.persistStateIfPresent(existing) {
+		// The record was deleted while we verified; the destroy owns teardown.
+		return status.Errorf(codes.NotFound, "vm %s was destroyed during restore", existing.ID)
+	}
+	return nil
+}
+
 func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) (*VMInstance, bool) {
 	m.mu.RLock()
 	existing := m.vms[vmID]
@@ -3742,8 +3778,7 @@ func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) (*VMIn
 		return nil, false
 	}
 	// needsVerify: a reattached crash-window record never proved boxd
-	// readiness. Restore adoption re-verifies such a target before adopting;
-	// resume adoption cannot verify (readiness-blind contract) and must
-	// refuse it.
+	// readiness. Both adoptions verify such a target with the bounded gate
+	// before adopting; only verified targets adopt blind.
 	return existing, unverified
 }

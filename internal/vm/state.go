@@ -140,10 +140,11 @@ type VMRecord struct {
 	// confirmed (the persist overlaps the wait). Absent/false — including on
 	// every record from before the field — means verified; a background
 	// persist clears it right after verification, so a durable true means a
-	// crash before readiness was proven. Restore adoption re-verifies such
-	// records before adopting (and clears the marker); resume adoption
-	// refuses them, and a resume relaunch verifies readiness synchronously
-	// before clearing the marker.
+	// crash before readiness was proven. Both restore and resume adoption
+	// re-verify such records before adopting (clearing the marker on
+	// success), a pause clears it (a snapshotted guest was provably live),
+	// and a resume relaunch verifies readiness synchronously before
+	// clearing it.
 	Unverified   bool   `json:"unverified,omitempty"`
 	RunDirID     string `json:"rundir_id"`
 	Namespace    string `json:"namespace"`
