@@ -1343,34 +1343,34 @@ WITH compute AS (
     SELECT
         COALESCE(SUM(
             EXTRACT(EPOCH FROM (
-                LEAST(COALESCE(i.ended_at, now()), $1)
+                LEAST(COALESCE(i.ended_at, billing_request_now()), $1)
                 - GREATEST(i.started_at, $2)
             )) * i.vcpu_count
         ), 0)::numeric AS vcpu_seconds,
         COALESCE(SUM(
             EXTRACT(EPOCH FROM (
-                LEAST(COALESCE(i.ended_at, now()), $1)
+                LEAST(COALESCE(i.ended_at, billing_request_now()), $1)
                 - GREATEST(i.started_at, $2)
             )) * i.memory_mib
         ), 0)::numeric AS memory_mib_seconds
     FROM sandbox_compute_billing_interval i
     WHERE i.team_id = $3
       AND i.started_at < $1
-      AND $2 < LEAST(now(), $1)
-      AND COALESCE(i.ended_at, LEAST(now(), $1)) > $2
+      AND $2 < LEAST(billing_request_now(), $1)
+      AND COALESCE(i.ended_at, LEAST(billing_request_now(), $1)) > $2
 ),
 storage AS (
     SELECT COALESCE(SUM(
         EXTRACT(EPOCH FROM (
-            LEAST(COALESCE(i.ended_at, now()), $1)
+            LEAST(COALESCE(i.ended_at, billing_request_now()), $1)
             - GREATEST(i.started_at, $2)
         )) * i.disk_mib
     ), 0)::numeric AS storage_mib_seconds
     FROM sandbox_storage_interval i
     WHERE i.team_id = $3
       AND i.started_at < $1
-      AND $2 < LEAST(now(), $1)
-      AND COALESCE(i.ended_at, LEAST(now(), $1)) > $2
+      AND $2 < LEAST(billing_request_now(), $1)
+      AND COALESCE(i.ended_at, LEAST(billing_request_now(), $1)) > $2
 ),
 usage AS (
     SELECT
