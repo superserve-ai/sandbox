@@ -2577,8 +2577,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		}
 		log.Info().Msg("reattached paused VM")
 	} else {
-		// Only a deletion undoes the reattach; a write error leaves the
-		// record as it was, which the VM still matches.
+		// Only a deletion undoes the reattach (see persistStateIfPresent).
 		if wrote, perr := m.persistStateIfPresent(inst); perr == nil && !wrote {
 			m.undoReattach(rec.ID)
 			return nil, false
@@ -3925,8 +3924,8 @@ func (m *Manager) commitVerifiedAdoption(existing *VMInstance) error {
 	existing.mu.Lock()
 	existing.Unverified = false
 	existing.mu.Unlock()
-	// Only a deletion aborts the adoption; a write error leaves the marker
-	// set, which the next adoption re-verifies and heals.
+	// Only a deletion aborts the adoption; an undurable clear is healed by
+	// the next adoption's re-verify.
 	if wrote, perr := m.persistStateIfPresent(existing); perr == nil && !wrote {
 		return status.Errorf(codes.NotFound, "vm %s was destroyed during restore", existing.ID)
 	}
