@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1828,5 +1829,48 @@ func TestResumeVM_CorpseVerdict_ClearsRunningBeforeRelaunch(t *testing.T) {
 	}
 	if rec.Status == StatusRunning {
 		t.Fatal("the durable record must not advertise Running either")
+	}
+}
+
+// CreateVMSnapshot mutates DirtyTracked without the vm-op lock and deliberately
+// does not persist, because that field is in-memory only — so the write would
+// be a pure clobber, able to resurrect a concurrent lifecycle op's fields (the
+// crash-window marker most damagingly). If DirtyTracked ever becomes durable,
+// this fails: that path then needs the lock before it may persist.
+func TestToRecordIgnoresDirtyTracked(t *testing.T) {
+	base := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTracked: false}
+	dirty := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTracked: true}
+
+	a, err := json.Marshal(toRecord(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(toRecord(dirty))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Fatalf("DirtyTracked is now persisted — CreateVMSnapshot must take the vm-op lock before persisting:\n %s\n %s", a, b)
+	}
+}
+
+// The ad-hoc snapshot path must not write the record at all: it holds no
+// vm-op lock, so any write races whatever lifecycle op is in flight.
+func TestCreateVMSnapshotDoesNotPersist(t *testing.T) {
+	src, err := os.ReadFile("manager.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn := string(src)
+	start := strings.Index(fn, "func (m *Manager) CreateVMSnapshot(")
+	if start < 0 {
+		t.Fatal("CreateVMSnapshot not found")
+	}
+	end := strings.Index(fn[start:], "\nfunc ")
+	if end < 0 {
+		t.Fatal("could not bound CreateVMSnapshot")
+	}
+	if body := fn[start : start+end]; strings.Contains(body, "persistState(") {
+		t.Fatal("CreateVMSnapshot must not persist: it holds no vm-op lock, so a full-record write can clobber a concurrent lifecycle op")
 	}
 }
