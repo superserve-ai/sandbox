@@ -95,7 +95,6 @@ func postBoxdInitRetried(ctx context.Context, vmIP string, envVars map[string]st
 	return postBoxdInit(ctx, vmIP, envVars, hostname)
 }
 
-
 // postBoxdInit sends sandbox-level configuration (env vars, hostname) to
 // boxd's /init endpoint.
 func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, hostname string) error {

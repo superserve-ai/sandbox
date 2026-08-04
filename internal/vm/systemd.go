@@ -108,6 +108,13 @@ func unitMaybeWindingDown(unit string) bool {
 	return ok
 }
 
+// errStopNotEnqueued marks a stop failure where systemd provably never
+// accepted the job, so no destructive effect can follow — the one case a
+// caller may treat as "nothing happened" (e.g. refund a budget
+// reservation). All other stop failures are ambiguous: an accepted job or
+// an interrupted systemctl may still terminate the unit later.
+var errStopNotEnqueued = errors.New("stop job not enqueued")
+
 // stopUnit stops a systemd unit. Idempotent — stopping an already-stopped
 // unit is a no-op. Blocks until the stop job completes.
 func stopUnit(ctx context.Context, unit string) error {
@@ -132,7 +139,9 @@ func stopUnit(ctx context.Context, unit string) error {
 				confirmUnitStopped(unit)
 				return nil // not loaded == already stopped
 			}
-			return fmt.Errorf("stop unit %s: %w", unit, err)
+			// The job was never accepted — the only stop failure with a
+			// provably absent destructive effect (see errStopNotEnqueued).
+			return fmt.Errorf("stop unit %s: %w: %w", unit, err, errStopNotEnqueued)
 		}
 		// systemd accepted the job — from here we only report the outcome,
 		// never re-drive the stop via exec (that would double-execute).
@@ -238,6 +247,19 @@ func classifyStopSettle(state string, notLoaded, ok bool) (stopConfirmed, clearM
 		return true, false
 	}
 	return false, false // active, reloading, or any other still-up state
+}
+
+// unitFullyDown reports a terminal ActiveState (inactive, failed, or not
+// loaded): the only states in which no Firecracker process can still be
+// writing guest data. Transitional states (deactivating, activating) and
+// inconclusive reads are NOT down; the stop path may report those as a
+// completed stop for RPC purposes, but hashing needs the stronger claim.
+func unitFullyDown(ctx context.Context, unit string) bool {
+	state, notLoaded, ok := unitActiveStateRaw(ctx, unit)
+	if !ok || ctx.Err() != nil {
+		return false
+	}
+	return notLoaded || state == "inactive" || state == "failed"
 }
 
 // unitFailureSummary returns a one-line summary of a unit's

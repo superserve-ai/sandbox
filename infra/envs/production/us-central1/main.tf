@@ -20,6 +20,30 @@ provider "google" {
   # impersonate_service_account = "terraform@rayai-dev.iam.gserviceaccount.com"
 }
 
+resource "google_project_service" "cloud_ids" {
+  project            = local.project_id
+  service            = "ids.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_project_service" "compute" {
+  project            = local.project_id
+  service            = "compute.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_project_service" "logging" {
+  project            = local.project_id
+  service            = "logging.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_project_service" "monitoring" {
+  project            = local.project_id
+  service            = "monitoring.googleapis.com"
+  disable_on_destroy = false
+}
+
 locals {
   project_id                = var.project_id
   environment               = var.environment

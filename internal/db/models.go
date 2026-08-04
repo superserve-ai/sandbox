@@ -179,14 +179,15 @@ type AnalyticsDailySandboxStart struct {
 	Starts int64       `json:"starts"`
 }
 
-type AnalyticsWeeklyTeamSandboxCount struct {
-	TeamName     string `json:"team_name"`
-	SandboxCount int64  `json:"sandbox_count"`
+type AnalyticsTeamHourlySpend struct {
+	TeamName  string         `json:"team_name"`
+	HourStart time.Time      `json:"hour_start"`
+	SpendUsd  pgtype.Numeric `json:"spend_usd"`
 }
 
-type AnalyticsWeeklyTeamSpend struct {
-	TeamName string         `json:"team_name"`
-	SpendUsd pgtype.Numeric `json:"spend_usd"`
+type AnalyticsTeamSandboxEvent struct {
+	TeamName  string    `json:"team_name"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type AnalyticsWeeklyUserMetric struct {
@@ -575,14 +576,16 @@ type Secret struct {
 }
 
 type Snapshot struct {
-	ID        uuid.UUID `json:"id"`
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	TeamID    uuid.UUID `json:"team_id"`
-	Path      string    `json:"path"`
-	SizeBytes int64     `json:"size_bytes"`
-	Trigger   string    `json:"trigger"`
-	CreatedAt time.Time `json:"created_at"`
-	MemPath   *string   `json:"mem_path"`
+	ID         uuid.UUID `json:"id"`
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	TeamID     uuid.UUID `json:"team_id"`
+	Path       string    `json:"path"`
+	SizeBytes  int64     `json:"size_bytes"`
+	Trigger    string    `json:"trigger"`
+	CreatedAt  time.Time `json:"created_at"`
+	MemPath    *string   `json:"mem_path"`
+	Generation int64     `json:"generation"`
+	Name       *string   `json:"name"`
 }
 
 type Team struct {
