@@ -2219,7 +2219,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		_, stillTracked := m.vms[vmID]
 		m.mu.RUnlock()
 		if !stillTracked {
+			// The destroy owns the teardown; report it as such, like every
+			// sibling destroy-race path. A generic error here reads as
+			// transient and the control plane retries a destroyed sandbox.
 			m.deleteState(vmID)
+			return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 		}
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
