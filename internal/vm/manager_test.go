@@ -1009,17 +1009,22 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	}
 }
 
-// A caller that vanished mid-wait proves nothing about the VM: no teardown,
-// no status change.
-func TestRestoreVMSnapshot_AdoptionWaitCanceled_LeavesVMUntouched(t *testing.T) {
+// A vanished caller must not stop the gate reaching a verdict. Callers arrive
+// with a deadline no larger than the gate's own budget, so if cancellation
+// meant "no verdict" the record would never flip and every retry would repeat
+// the same wait — the sandbox stuck until the orphan reaper hours later.
+func TestRestoreVMSnapshot_AdoptionWaitCanceled_StillReachesVerdict(t *testing.T) {
 	orig := vmUnitDead
 	vmUnitDead = func(string) bool { return false } // unit alive
 	defer func() { vmUnitDead = orig }()
 	ctx, cancel := context.WithCancel(context.Background())
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(c context.Context, _ *Manager, _ string) error {
-		cancel()
-		return c.Err()
+		cancel() // the caller goes away mid-wait
+		if c.Err() != nil {
+			return c.Err() // inherited ctx: would end "no verdict"
+		}
+		return errors.New("boxd silent for the whole budget") // genuine verdict
 	}
 	defer func() { adoptionBoxdReady = origReady }()
 
@@ -1041,14 +1046,22 @@ func TestRestoreVMSnapshot_AdoptionWaitCanceled_LeavesVMUntouched(t *testing.T) 
 		restoreSem: make(chan struct{}, 1),
 	}
 
-	if _, err := mgr.RestoreVMSnapshot(ctx, "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0); err == nil {
-		t.Fatal("a canceled adoption wait must surface an error")
+	_, err := mgr.RestoreVMSnapshot(ctx, "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
+	if err == nil {
+		t.Fatal("a silent guest must fail the adoption")
 	}
+	// The verdict must come from the PROBE, not from the caller vanishing:
+	// acting on a cancellation would flip a possibly-healthy VM to Error.
+	if errors.Is(err, context.Canceled) {
+		t.Fatal("the gate must not treat caller cancellation as a verdict about the VM")
+	}
+	// The verdict must be applied: Running would leave the record adoptable
+	// and the next retry would repeat this wait forever.
 	existing.mu.RLock()
 	status := existing.Status
 	existing.mu.RUnlock()
-	if status != StatusRunning {
-		t.Fatal("a canceled wait must not change the VM's status")
+	if status != StatusError {
+		t.Fatalf("a definitive verdict must flip the record out of Running, got %s", status)
 	}
 }
 
