@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
@@ -88,6 +89,12 @@ type Handlers struct {
 	asyncMu    sync.Mutex
 	asyncCond  *sync.Cond // lazily created by WaitAsyncBookkeeping, guarded by asyncMu
 	asyncCount int
+
+	// activityGate caps how many activity-log inserts may hold DB connections
+	// at once (see writeActivity). Lazily created so struct-literal
+	// construction keeps working.
+	activityGateOnce sync.Once
+	activityGate     chan struct{}
 
 	// authzSvc is a process-lifetime singleton so its permission cache persists
 	// across requests. Built lazily from Pool on first use.
@@ -258,6 +265,61 @@ const activateSettlePoll = 50 * time.Millisecond
 // so deleting it cannot race a live resume/pause.
 const staleTransitionGrace = 15 * time.Minute
 
+// activityWriteConcurrency caps how many activity inserts may hold DB
+// connections at once. Lifecycle bursts fire these fire-and-forget writes in
+// lockstep with the operations themselves, so ungated they land on the pool
+// exactly when the create path is queueing for the same connections. The
+// writes are already async — waiting costs nothing — and a small cap keeps
+// their pool share negligible under any burst size.
+const activityWriteConcurrency = 2
+
+// writeActivity inserts one activity row while holding an activityGate
+// permit; ctx carries the caller's deadline, which also bounds the wait for
+// a permit. A write that cannot get a permit before the deadline is dropped
+// with a log — activity is observability, and piling more statements onto a
+// pool that is already saturated is the exact failure this gate prevents.
+func (h *Handlers) writeActivity(ctx context.Context, scope string, params db.CreateActivityParams) {
+	if !h.acquireActivityGate(ctx) {
+		activityLogEvent(log.Error().Err(ctx.Err()), scope, params).Msg("activity write dropped waiting for gate")
+		return
+	}
+	defer h.releaseActivityGate()
+	if _, err := h.DB.CreateActivity(ctx, params); err != nil {
+		activityLogEvent(log.Error().Err(err), scope, params).Msg("async activity log failed")
+	}
+}
+
+// acquireActivityGate blocks until a permit is free or ctx expires.
+func (h *Handlers) acquireActivityGate(ctx context.Context) bool {
+	h.activityGateOnce.Do(func() {
+		h.activityGate = make(chan struct{}, activityWriteConcurrency)
+	})
+	select {
+	case h.activityGate <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (h *Handlers) releaseActivityGate() { <-h.activityGate }
+
+// activityLogEvent attaches the identifying fields of an activity write to a
+// log event so gate drops and failed inserts stay attributable.
+func activityLogEvent(e *zerolog.Event, scope string, params db.CreateActivityParams) *zerolog.Event {
+	e = e.Str("scope", scope).Str("category", params.Category).Str("action", params.Action)
+	if params.SandboxID.Valid {
+		e = e.Str("sandbox_id", uuid.UUID(params.SandboxID.Bytes).String())
+	}
+	if params.SecretID.Valid {
+		e = e.Str("secret_id", uuid.UUID(params.SecretID.Bytes).String())
+	}
+	if params.TemplateID.Valid {
+		e = e.Str("template_id", uuid.UUID(params.TemplateID.Bytes).String())
+	}
+	return e
+}
+
 // logSandboxActivity writes a sandbox-scoped activity record in a background
 // goroutine. The request context is stripped of cancellation via
 // context.WithoutCancel so the goroutine is not killed when the HTTP response
@@ -269,7 +331,7 @@ func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID 
 		defer sentrylog.Recover("activity-log")
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
-		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
+		h.writeActivity(ctx, "activity-log", db.CreateActivityParams{
 			SandboxID:    pgtype.UUID{Bytes: sandboxID, Valid: true},
 			ResourceType: "sandbox",
 			TeamID:       teamID,
@@ -281,9 +343,6 @@ func (h *Handlers) logSandboxActivity(reqCtx context.Context, sandboxID, teamID 
 			DurationMs:   durationMs,
 			Metadata:     metadata,
 		})
-		if err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msgf("async %s/%s activity log failed", category, action)
-		}
 	}()
 }
 
@@ -296,7 +355,7 @@ func (h *Handlers) logSecretActivity(reqCtx context.Context, secretID, teamID uu
 		defer sentrylog.Recover("secret-activity-log")
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
-		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
+		h.writeActivity(ctx, "secret-activity-log", db.CreateActivityParams{
 			SecretID:     pgtype.UUID{Bytes: secretID, Valid: true},
 			SecretName:   &secretName,
 			ResourceType: "secret",
@@ -307,9 +366,6 @@ func (h *Handlers) logSecretActivity(reqCtx context.Context, secretID, teamID uu
 			Status:       &status,
 			Metadata:     metadata,
 		})
-		if err != nil {
-			log.Error().Err(err).Str("secret_id", secretID.String()).Msgf("async secret/%s activity log failed", action)
-		}
 	}()
 }
 
@@ -321,7 +377,7 @@ func (h *Handlers) logTemplateActivity(reqCtx context.Context, templateID, teamI
 		defer sentrylog.Recover("template-activity-log")
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
-		_, err := h.DB.CreateActivity(ctx, db.CreateActivityParams{
+		h.writeActivity(ctx, "template-activity-log", db.CreateActivityParams{
 			TemplateID:   pgtype.UUID{Bytes: templateID, Valid: true},
 			ResourceType: "template",
 			TeamID:       teamID,
@@ -331,9 +387,6 @@ func (h *Handlers) logTemplateActivity(reqCtx context.Context, templateID, teamI
 			Status:       &status,
 			Metadata:     metadata,
 		})
-		if err != nil {
-			log.Error().Err(err).Str("template_id", templateID.String()).Msgf("async %s/%s activity log failed", category, action)
-		}
 	}()
 }
 
