@@ -235,12 +235,17 @@ const asyncTimeout = 5 * time.Second
 // fire-and-forget activate write to land. Create/resume respond before the
 // starting/resuming→active flip commits, so the owner's immediate follow-up
 // (create then exec — the canonical SDK flow) may read the pre-flip status;
-// waiting briefly preserves read-your-writes instead of 409ing it. Normally
-// the write lands in single-digit ms, but a hostname-only create's stamp runs
-// before the flip and its guest round trip is bounded by the boxd client's
-// timeout — the window must outlast that bound, or a slow-but-alive guest
-// turns the canonical follow-up into a 409. A genuinely lost write still 409s
-// once the window expires. Var, not const, so tests can shrink it.
+// waiting briefly preserves read-your-writes instead of 409ing it. The write
+// lands in single-digit ms in the common case, which this covers.
+//
+// It deliberately does NOT try to outlast a hostname-only create's pre-flip
+// stamp: that guest round trip can take tens of seconds on a cold-fault stall
+// (bounded by the boxd client timeout, now retried), and a slow-but-alive
+// guest's immediate exec 409s — which the SDK retries against a healthy
+// sandbox. That is the intended trade: a fast 409 + retry beats hanging the
+// exec request for the whole stamp budget, so do not grow this to chase the
+// stamp timeout. A genuinely lost write also 409s once the window expires.
+// Var, not const, so tests can shrink it.
 var activateSettleWindow = 6 * time.Second
 
 // activateSettlePoll is the re-read interval within activateSettleWindow.
