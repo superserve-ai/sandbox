@@ -1359,9 +1359,9 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	wasUnverified := inst.Unverified
 	inst.mu.RUnlock()
 	if wasUnverified {
-		// The relaunch of an unverified crash-window record is the one resume
-		// that verifies readiness synchronously: clearing the marker blind
-		// would let a same-artifact restore retry adopt an unready VM without
+		// The relaunch of an unverified crash-window record verifies readiness
+		// synchronously (as its adoption above does): clearing the marker
+		// blind would let a same-artifact restore retry adopt an unready VM without
 		// its gate, and leaving it set would make every resume retry relaunch
 		// and roll the guest back again. Normal resumes stay readiness-blind
 		// (detached probe below). The guest was just relaunched from its
@@ -2251,8 +2251,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// verified below and still fails the restore. The proxy consequently sees
 	// Running during the wait, as it always has on resume, and a crash in
 	// this window leaves a Running record whose readiness was never verified
-	// — restore adoption re-verifies such records; resume adoption
-	// deliberately does not. The status is set directly — setStatus would
+	// — both restore and resume adoption re-verify such records before
+	// adopting them. The status is set directly — setStatus would
 	// persist synchronously, serializing the very fsync the goroutine
 	// overlaps with the boxd wait.
 	inst.mu.Lock()
