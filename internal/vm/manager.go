@@ -3790,7 +3790,7 @@ func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Dur
 }
 
 // boxdResumeReadyBudget bounds the post-resume readiness gate. Sized well
-// above the observed ~11s cold-memory stall tail (serving even /health can
+// above the multi-second cold-memory stall tail (serving even /health can
 // block on lazily-faulted pages after a UFFD resume), with margin because
 // that stall's root cause is still open and can worsen under host disk
 // pressure. Spent in full only when boxd is genuinely unreachable — a wedged
