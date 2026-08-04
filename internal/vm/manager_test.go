@@ -1042,7 +1042,7 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
 
-	inst, err := mgr.ResumeVM(context.Background(), "vm-1", "", "")
+	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "")
 	if err != nil {
 		t.Fatalf("retried resume of a healthy running VM should succeed, got %v", err)
 	}

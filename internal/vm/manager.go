@@ -348,10 +348,8 @@ func (m *Manager) trackedInstance(vmID string) *VMInstance {
 // authoritative signal that a resume/restore completed, used by the
 // reconciler to avoid stopping a just-relaunched unit.
 func (m *Manager) instanceRunning(vmID string) bool {
-	m.mu.RLock()
-	inst, ok := m.vms[vmID]
-	m.mu.RUnlock()
-	if !ok {
+	inst := m.trackedInstance(vmID)
+	if inst == nil {
 		return false
 	}
 	inst.mu.RLock()
@@ -1128,23 +1126,13 @@ func fileExists(path string) bool {
 // ResumeVM (restore from snapshot)
 // ---------------------------------------------------------------------------
 
-// ResumeVM restores a paused VM from its snapshot using a mount namespace.
-func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
-	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate resume
-	// waits, then is recognized as a retry rather than relaunching.
-	unlockOp, err := m.lockVMOp(ctx, vmID)
-	if err != nil {
-		return nil, err
-	}
-	defer unlockOp()
-	return m.resumeVMLocked(ctx, vmID, snapshotPath, memPath)
-}
-
-// resumeVMLocked is ResumeVM's body; the caller must hold vmID's lifecycle
-// lock. Split out so the gRPC adapter can keep the lock held across the
-// post-restore steps (readiness gate, env injection, abort-on-failure) —
-// otherwise a concurrent retry can adopt the instance between this returning
-// and those steps acting on it.
+// resumeVMLocked restores a paused VM from its snapshot using a mount
+// namespace. The caller must hold vmID's lifecycle lock (see lockVMOp) and
+// keep it held across the post-restore steps — readiness gate, env injection,
+// abort-on-failure — so a concurrent retry can't adopt the instance between
+// this returning and those steps acting on it. The gRPC adapter is the sole
+// caller and owns that lock scope; there is deliberately no self-locking
+// wrapper, which would release the lock before those steps and reopen the race.
 func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
