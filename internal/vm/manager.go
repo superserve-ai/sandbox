@@ -3611,12 +3611,10 @@ func (m *Manager) resumeReadyOrAbort(callerCtx context.Context, vmID, ip string)
 		m.abortResumeLocked(vmID)
 		return err
 	}
-	// /health answered — but on an IP, not a VM identity. A concurrent
-	// lock-free DestroyVM can recycle ip to another VM mid-probe (likeliest
-	// while a cold-fault resume is slow to answer), so a stranger's guest
-	// could be what replied. Confirm this VM still owns the slot before
-	// reporting the resume ready, or we'd certify a live answer from another
-	// tenant. Ownership loss means the VM was destroyed; abort is a no-op then.
+	// /health answered — but on an IP, not a VM identity, and a recycle can
+	// hand ip to a stranger mid-probe (see vmOwnsIP; likeliest while a
+	// cold-fault resume is slow to answer). Re-check ownership before
+	// reporting ready. Ownership loss means destroyed, so abort no-ops.
 	if !m.vmOwnsIP(vmID, ip) {
 		m.abortResumeLocked(vmID)
 		return fmt.Errorf("vm %s no longer owns %s after readiness (destroyed mid-resume?)", vmID, ip)
