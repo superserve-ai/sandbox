@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/presence"
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -246,6 +247,23 @@ type Manager struct {
 	egressProxy *network.EgressProxy
 	log         zerolog.Logger
 	state       *StateStore // persistent local state (BoltDB); nil = no persistence
+	// backupEnqueue hands finalized pause manifests to the durability
+	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
+	backupEnqueue func(backup.Task) error
+	// backupStaging is the uploader's hard-link staging tree; empty
+	// means artifacts upload from their original paths.
+	backupStaging string
+	// unitDead overrides the systemd unit-dead probe in tests; nil means
+	// the real probe. See unitConfirmedDead.
+	unitDead func(ctx context.Context, vmID string) bool
+	// pendingInFlight guards one pending-backup worker per VM across the
+	// startup recovery and the periodic sweep.
+	pendingInFlight sync.Map
+	// pendingSweepInterval overrides the pending-backup sweep pace in
+	// tests; 0 means pendingBackupSweepInterval.
+	pendingSweepInterval time.Duration
+	// rehashSlots bounds concurrent recovery/sweep rehash workers.
+	rehashSlots chan struct{}
 
 	// launcherReady gates the launcher launch path: false → launches use the
 	// legacy path. Set when the namespace is built/validated; kept in sync by
@@ -304,16 +322,53 @@ type Manager struct {
 	// holds the lock until destroy SIGKILLs the process), so blocking it
 	// would turn a recoverable wedge into a permanent hang.
 	vmOpLocks sync.Map
+
+	// destroying holds the vmIDs currently inside DestroyVM, from just before
+	// the slot is freed until teardown completes. A lazy getInstance skips
+	// reattaching a listed VM: without this, a request that misses m.vms
+	// mid-destroy (exec, preview, inject) would reattach the record, rebind
+	// the freed slot, and hand a live pointer to an IP the pool is recycling.
+	// Keyed vmID → struct{}{}; entries are always removed when destroy returns.
+	destroying sync.Map
+}
+
+// trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
+// lazy reattach getInstance performs on a miss. Delivery gates (credential
+// injects) must use this: a lazy reattach inside DestroyVM's window between
+// the map delete and the record delete would resurrect the instance AND
+// rebind its freed network slot, making the gate's own lookup certify an
+// ownership the destroy just revoked.
+func (m *Manager) trackedInstance(vmID string) *VMInstance {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.vms[vmID]
+}
+
+// vmOwnsIP reports whether vmID is still the live owner of ip: tracked,
+// Running, IP-matched, AND holding the network slot per the net manager's
+// device table (the authoritative owner ledger). The tracked instance alone
+// is not enough — DestroyVM frees the slot before it removes the instance, and
+// it takes no lifecycle lock, so a concurrent destroy can recycle ip to
+// another VM while the record still reads Running. Every path that acts on an
+// IP a lock-free destroy could have revoked — credential delivery AND the
+// resume readiness gate — checks this before trusting the answer.
+func (m *Manager) vmOwnsIP(vmID, ip string) bool {
+	inst := m.trackedInstance(vmID)
+	if inst == nil {
+		return false
+	}
+	inst.mu.RLock()
+	ok := inst.IP == ip && inst.Status == StatusRunning
+	inst.mu.RUnlock()
+	return ok && m.netMgr.GetVMNetInfo(vmID) != nil
 }
 
 // instanceRunning reports whether vmID's tracked instance is Running — the
 // authoritative signal that a resume/restore completed, used by the
 // reconciler to avoid stopping a just-relaunched unit.
 func (m *Manager) instanceRunning(vmID string) bool {
-	m.mu.RLock()
-	inst, ok := m.vms[vmID]
-	m.mu.RUnlock()
-	if !ok {
+	inst := m.trackedInstance(vmID)
+	if inst == nil {
 		return false
 	}
 	inst.mu.RLock()
@@ -686,6 +741,14 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 		return status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
 	}
 
+	// Tombstone the whole teardown so a concurrent lazy getInstance can't
+	// resurrect this VM onto the slot we're about to free (see the destroying
+	// field). A tracked VM still resolves from m.vms below — this gates only
+	// reattach; an untracked one takes the record fallback, which carries all
+	// teardown needs.
+	m.destroying.Store(vmID, struct{}{})
+	defer m.destroying.Delete(vmID)
+
 	// A paused or post-restart VM may be absent from m.vms. Don't early-return on
 	// that: unit stop and rundir removal are derivable from vmID and must run, or
 	// destroying a paused sandbox leaks its rundir. Process/socket teardown needs
@@ -782,7 +845,18 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			return "", "", nil, status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
 		}
 		log.Info().Msg("pause: VM already paused, returning existing snapshot")
-		return snapshotPath, memPath, collectPauseManifest(ctx, snapshotPath, retryDiskPath, retryDiskBase, log), nil
+		// The recorded StatusPaused is not proof the unit stopped: the
+		// original pause records it even when both stop attempts failed
+		// (skipping that attempt's backup). This retry must not launder
+		// that skip through a status the at-rest checks trust, so it
+		// backs up only once the unit is confirmed dead.
+		var manifest []ManifestEntry
+		if m.unitConfirmedDead(ctx, vmID) {
+			manifest = m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, log)
+		} else {
+			log.Warn().Msg("pause backup skipped on retry: unit not confirmed dead")
+		}
+		return snapshotPath, memPath, manifest, nil
 	}
 	inst.mu.RUnlock()
 
@@ -909,22 +983,16 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// converges anyway: the control plane retries pause to paused rather than
 	// reverting, and a straggler unit is reclaimed by the reconciler.
 	unit := systemdUnitName(vmID)
+	stopConfirmed := true
 	stopCtx, stopCancel := context.WithTimeout(ctx, stopUnitBudget)
 	if err := stopUnit(stopCtx, unit); err != nil {
 		log.Warn().Err(err).Msg("systemctl stop failed during pause; retrying")
 		if serr := stopUnit(stopCtx, unit); serr != nil && !unitDefinitelyDead(stopCtx, unit) {
+			stopConfirmed = false
 			log.Error().Err(serr).Msg("unit still running after pause; reconciler will reclaim it")
 		}
 	}
 	stopCancel()
-
-	// Hash the durable artifacts once the unit is stopped and the files are
-	// at rest. Runs under its own budget derived from the RPC deadline (see
-	// collectPauseManifest): large disks must not pin this handler past the
-	// pause RPC cap, or the control plane times out and retries against an
-	// already-stopped unit; a budget-exhausted hash just yields a partial
-	// manifest, never a late response.
-	manifest = collectPauseManifest(ctx, snapshotPath, diskPath, diskBasePath, log)
 
 	inst.mu.Lock()
 	inst.Status = StatusPaused
@@ -935,6 +1003,37 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	inst.mu.Unlock()
 
 	m.persistState(inst)
+
+	// Hash the durable artifacts once the unit is stopped and the files are
+	// at rest. Runs under its own budget derived from the RPC deadline (see
+	// collectPauseManifest): large disks must not pin this handler past the
+	// pause RPC cap, or the control plane times out and retries against an
+	// already-stopped unit; a budget-exhausted hash just yields a partial
+	// manifest, never a late response. Runs AFTER the paused status is
+	// recorded: the async rehash proves at-rest bytes against that status,
+	// and hashing before the flip would make it drop every retry. Skipped
+	// entirely when the unit is not confirmed stopped: a still-running
+	// Firecracker keeps writing the overlay, and the recorded StatusPaused
+	// would satisfy the rehash's at-rest proof while the bytes are live. A
+	// later retry pause backs the artifacts up once the unit is truly dead.
+	// stopConfirmed alone is the RPC's notion of a finished stop, which
+	// deliberately includes a still-deactivating unit; hashing needs the
+	// stronger fully-down claim, so the gate reconfirms with the same
+	// probe the at-rest proof uses.
+	if stopConfirmed && m.unitConfirmedDead(ctx, vmID) {
+		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
+	} else if m.backupEnqueue != nil {
+		log.Warn().Msg("pause backup deferred: unit not confirmed fully down, bytes may still be changing")
+		// The pause still owes its backup. Leave a pending marker AND a
+		// worker: the worker's first act re-persists the marker (healing
+		// a transiently failed write here), its at-rest proof holds the
+		// backup off until the unit is truly down, and the periodic
+		// sweep keeps retrying after the worker gives up.
+		pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
+		m.persistPendingBackup(pb, log)
+		go m.rehashPendingBackup(ctx, pb, log)
+	}
+
 	log.Info().Msg("VM paused")
 	return snapshotPath, memPath, manifest, nil
 }
@@ -1045,18 +1144,16 @@ func fileExists(path string) bool {
 // ResumeVM (restore from snapshot)
 // ---------------------------------------------------------------------------
 
-// ResumeVM restores a paused VM from its snapshot using a mount namespace.
-func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
+// resumeVMLocked restores a paused VM from its snapshot using a mount
+// namespace. The caller must hold vmID's lifecycle lock (see lockVMOp) and
+// keep it held across the post-restore steps — readiness gate, env injection,
+// abort-on-failure — so a concurrent retry can't adopt the instance between
+// this returning and those steps acting on it. The gRPC adapter is the sole
+// caller and owns that lock scope; there is deliberately no self-locking
+// wrapper, which would release the lock before those steps and reopen the race.
+func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
-
-	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate resume
-	// waits, then is recognized as a retry rather than relaunching.
-	unlockOp, err := m.lockVMOp(ctx, vmID)
-	if err != nil {
-		return nil, err
-	}
-	defer unlockOp()
 
 	inst, err := m.getInstance(vmID)
 	if err != nil {
@@ -2314,6 +2411,11 @@ func (m *Manager) reattachByID(vmID string, cleanupStale bool) *VMInstance {
 		if ok {
 			return inst, nil
 		}
+		// Being destroyed: don't resurrect from the record onto a freed slot
+		// (see the destroying field).
+		if _, destroying := m.destroying.Load(vmID); destroying {
+			return (*VMInstance)(nil), nil
+		}
 		rec, err := m.state.Get(vmID)
 		if err != nil || rec == nil {
 			return (*VMInstance)(nil), nil
@@ -2960,6 +3062,41 @@ func isReservedRunDirName(name string) bool {
 	return name == templateDirName || name == TemplatesDirName
 }
 
+// abortResumeLocked reverts a freshly-resumed VM back to Paused when a
+// post-restore step fails; the caller must hold vmID's lifecycle lock,
+// continuously since the resume it is aborting — that continuity is what
+// guarantees no retry has adopted the instance in between. The unit is
+// stopped and the record re-marked Paused so the host matches the caller's
+// view of a failed resume. A restore never mutates the snapshot artifacts it
+// resumed from, so a later resume simply restores them again.
+//
+// DestroyVM bypasses the lifecycle lock (see vmOpLocks), so a concurrent
+// destroy is still possible; its deletions are handled by the guards below.
+func (m *Manager) abortResumeLocked(vmID string) {
+	// trackedInstance, never getInstance: in DestroyVM's delete window a
+	// lazy reattach would resurrect the instance and rebind its freed slot
+	// (see trackedInstance). Untracked means the destroy owns the teardown.
+	inst := m.trackedInstance(vmID)
+	if inst == nil {
+		return
+	}
+	inst.mu.Lock()
+	running := inst.Status == StatusRunning
+	inst.mu.Unlock()
+	if !running {
+		return
+	}
+	m.stopUnitDuringRestoreError(vmID)
+	inst.mu.Lock()
+	inst.Status = StatusPaused
+	inst.DirtyTracked = false // FC process stopped; a fresh resume re-arms tracking.
+	inst.mu.Unlock()
+	// Conditional: a concurrent destroy may have deleted the record; it owns
+	// the teardown then, and an unconditional write would resurrect a
+	// destroyed VM's record.
+	m.persistStateIfPresent(inst)
+}
+
 // stopUnitDuringRestoreError stops the per-VM systemd unit when a restore
 // aborts after Firecracker started. Uses a fresh context because the
 // caller's gRPC ctx is often already cancelled (deadline exceeded under
@@ -3444,8 +3581,45 @@ func waitForSocketConnectable(path string, deadline time.Time) error {
 	}
 }
 
+// boxdHealthProbe is the /health poll behind waitForBoxd; a var so tests can
+// drive the readiness gate without a live guest.
+var boxdHealthProbe = waitForHTTPHealth
+
 func (m *Manager) waitForBoxd(ctx context.Context, vmIP string, timeout time.Duration) error {
-	return waitForHTTPHealth(ctx, vmIP, timeout)
+	return boxdHealthProbe(ctx, vmIP, timeout)
+}
+
+// boxdResumeReadyBudget bounds the post-resume readiness gate. Sized well
+// above the observed ~11s cold-memory stall tail (serving even /health can
+// block on lazily-faulted pages after a UFFD resume), with margin because
+// that stall's root cause is still open and can worsen under host disk
+// pressure. Spent in full only when boxd is genuinely unreachable — a wedged
+// guest — so the generous bound costs nothing on the happy path but keeps a
+// slow-but-healthy resume from being torn down.
+const boxdResumeReadyBudget = 30 * time.Second
+
+// resumeReadyOrAbort confirms boxd answered after a resume, else tears the
+// resume down. The probe runs on a budget DETACHED from the caller's ctx: a
+// client disconnect or a spent deadline must never read as a dead guest, or
+// the abort would stop a healthy VM the control plane's retry would have
+// adopted (the self-heal path). Only a genuinely unreachable agent — silent
+// for the whole budget — trips the abort, which reverts to the original pause
+// snapshot so the retry does a clean fresh restore. Caller holds the VM's
+// lifecycle lock (abort mutates the record).
+func (m *Manager) resumeReadyOrAbort(callerCtx context.Context, vmID, ip string) error {
+	if err := m.waitForBoxd(context.WithoutCancel(callerCtx), ip, boxdResumeReadyBudget); err != nil {
+		m.abortResumeLocked(vmID)
+		return err
+	}
+	// /health answered — but on an IP, not a VM identity, and a recycle can
+	// hand ip to a stranger mid-probe (see vmOwnsIP; likeliest while a
+	// cold-fault resume is slow to answer). Re-check ownership before
+	// reporting ready. Ownership loss means destroyed, so abort no-ops.
+	if !m.vmOwnsIP(vmID, ip) {
+		m.abortResumeLocked(vmID)
+		return fmt.Errorf("vm %s no longer owns %s after readiness (destroyed mid-resume?)", vmID, ip)
+	}
+	return nil
 }
 
 // retriedLaunchTarget returns the tracked instance for vmID when a resume or
