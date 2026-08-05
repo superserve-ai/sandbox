@@ -181,7 +181,7 @@ func stopJobResult(unit, res string) error {
 // among ready cases), and a completed job's signal may have been lost with the
 // connection — check both before reporting failure, so a stop that actually
 // finished never reads as failed. The probe is detached and bounded: at most
-// 2s past a spent caller deadline, buying one truthful answer; it changes only
+// 2s past the spent stop context, buying one truthful answer; it changes only
 // the reported outcome, never any persisted state.
 func settleExpiredStopWait(ctx context.Context, unit string, ch <-chan string, waitErr error) error {
 	select {
@@ -312,8 +312,9 @@ func unitActiveState(ctx context.Context, unit string) (activeNow, handled bool)
 }
 
 // stopUnitBudget covers `systemctl stop` blocking up to TimeoutStopSec plus
-// margin for host I/O contention. The pause path caps its whole stop phase
-// at this OR the caller's remaining deadline, whichever is shorter.
+// margin for host I/O contention. The pause path runs its whole stop phase
+// (both attempts + dead-check) on this budget, detached from the caller's
+// deadline.
 const stopUnitBudget = 15 * time.Second
 
 // stopUnitWithBudget stops a unit on a detached context with its own budget,
@@ -323,6 +324,32 @@ func stopUnitWithBudget(ctx context.Context, unit string) error {
 	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopUnitBudget)
 	defer cancel()
 	return stopUnit(c, unit)
+}
+
+// killUnitSIGKILL asks systemd to SIGKILL all of a unit's processes — the
+// escalation when a graceful stop cannot be confirmed and the recorded PID
+// cannot be verified: systemd resolves the unit's live processes itself.
+// Detached and bounded. Confirmation requires the unit FULLY down, not
+// merely deactivating: the caller releases the record and namespace on
+// true, and a D-state process can survive the SIGKILL inside a
+// deactivating unit. A var for the same test seam vmUnitDead uses.
+var killUnitSIGKILL = func(ctx context.Context, unit string) bool {
+	kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = exec.CommandContext(kctx, "systemctl", "kill", "-s", "SIGKILL", unit).Run()
+	// Poll: systemd reaps the unit asynchronously after the signal, so a
+	// single immediate probe reads "deactivating" even for a clean kill and
+	// the confirmed release would never be reachable.
+	for {
+		if unitFullyDown(kctx, unit) {
+			return true
+		}
+		select {
+		case <-kctx.Done():
+			return false
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 // unitLingering reports whether the unit has a live or winding-down process
