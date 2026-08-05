@@ -1614,9 +1614,9 @@ func TestResumeReadyOrAbortGateDetachedFromCaller(t *testing.T) {
 	var doneAfterCancel bool
 	orig := boxdHealthProbe
 	boxdHealthProbe = func(ctx context.Context, ip string, timeout time.Duration) error {
-		cancelCaller()                       // client disconnects mid-probe
-		doneAfterCancel = ctx.Err() != nil   // detached gate ctx must NOT be done
-		return nil                           // boxd healthy
+		cancelCaller()                     // client disconnects mid-probe
+		doneAfterCancel = ctx.Err() != nil // detached gate ctx must NOT be done
+		return nil                         // boxd healthy
 	}
 	defer func() { boxdHealthProbe = orig }()
 
@@ -1938,5 +1938,325 @@ func TestCommitResumeState_DestroyInProgress_NotReportedSuccessful(t *testing.T)
 	}
 	if present {
 		t.Fatal("the resume's write must be erased for a VM being destroyed")
+	}
+}
+
+// A parked Error VM cannot be snapshotted; pause must fail fast with a clear
+// precondition error instead of dialing the dead socket and returning a
+// generic failure the control plane retries against.
+func TestPauseVM_ErrorInstance_FailsFast(t *testing.T) {
+	inst := &VMInstance{ID: "vm-1", Status: StatusError}
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
+	_, _, _, err := m.PauseVM(context.Background(), "vm-1", "")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition for an error-state VM, got %v", err)
+	}
+}
+
+// A parked Error record can ride out a vmd restart while its wedged unit is
+// still deactivating. unitDefinitelyDead reads that state as dead; the eager
+// startup cleanup must instead require the terminal state and park the
+// refusal again — releasing the record would free the namespace under a
+// possibly-live FC.
+func TestReattachRecord_DeactivatingUnit_ParksNotReleases(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // deactivating: not terminal
+	defer func() { vmUnitFullyDown = origDown }()
+	origStop := staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool { return false }
+	defer func() { staleUnitStopConfirmed = origStop }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusError,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok || inst.Status != StatusError {
+		t.Fatalf("a non-terminal unit must re-park the Error refusal, got inst=%+v ok=%v", inst, ok)
+	}
+	kept, err := store.Get("vm-1")
+	if err != nil || kept == nil {
+		t.Fatalf("the record must be kept while the unit is not terminal, got rec=%v err=%v", kept, err)
+	}
+	if kept.Status != StatusError {
+		t.Fatalf("kept record must stay Error, got %s", kept.Status)
+	}
+}
+
+// A confirmed stop whose record delete fails must also park the refusal:
+// the surviving Running row would otherwise be re-adopted onto a slot this
+// path was about to free.
+func TestReattachRecord_DeleteFailsAfterConfirmedStop_ParksError(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
+	defer func() { vmUnitFullyDown = origDown }()
+	origStop := staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool { return true }
+	defer func() { staleUnitStopConfirmed = origStop }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil { // the delete will fail
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok || inst.Status != StatusError {
+		t.Fatalf("a failed delete must park the refusal, got inst=%+v ok=%v", inst, ok)
+	}
+	if tracked := m.vms["vm-1"]; tracked != inst {
+		t.Fatal("the Error instance must be tracked in memory")
+	}
+}
+
+// A destroy or markStale deleting the record while the stale stop waits owns
+// the teardown: the reattach must abandon, not resurrect the row.
+func TestReattachRecord_DeletedDuringStaleStop_Abandoned(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
+	defer func() { vmUnitFullyDown = origDown }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	origStop := staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool {
+		if err := store.Delete("vm-1"); err != nil { // markStale races the wait
+			t.Error(err)
+		}
+		return false
+	}
+	defer func() { staleUnitStopConfirmed = origStop }()
+
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst != nil || ok {
+		t.Fatal("a record deleted mid-wait must be abandoned, not published")
+	}
+	present, err := store.Has("vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present {
+		t.Fatal("the deleted record must not be resurrected")
+	}
+	if _, tracked := m.vms["vm-1"]; tracked {
+		t.Fatal("an abandoned reattach must not track the VM")
+	}
+}
+
+// When the error write fails (broken store) and there is no verifiable pid to
+// escalate against, the VM must still be refused in memory — the only refusal
+// a broken store leaves.
+func TestReattachRecord_ErrorPersistFails_StillRefusedInMemory(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
+	defer func() { vmUnitFullyDown = origDown }()
+	origStop := staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool { return false }
+	defer func() { staleUnitStopConfirmed = origStop }()
+	origKill := killUnitSIGKILL
+	killUnitSIGKILL = func(context.Context, string) bool { return false } // escalation inconclusive too
+	defer func() { killUnitSIGKILL = origKill }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil { // every later write fails
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok || inst.Status != StatusError {
+		t.Fatalf("a broken store must still yield an in-memory Error refusal, got inst=%+v ok=%v", inst, ok)
+	}
+	if tracked := m.vms["vm-1"]; tracked != inst {
+		t.Fatal("the Error instance must be tracked in memory")
+	}
+}
+
+// A socket-missing record whose unit stop cannot be confirmed must keep its
+// BoltDB record: deleting it would leave a live Firecracker no record points
+// to, invisible to the next reattach.
+func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
+	defer func() { vmUnitFullyDown = origDown }()
+	origStop := staleUnitStopConfirmed
+	stoppedUnit := ""
+	staleUnitStopConfirmed = func(_ context.Context, unit string) bool {
+		stoppedUnit = unit
+		return false // stop failed and the unit is not provably down
+	}
+	defer func() { staleUnitStopConfirmed = origStop }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok {
+		t.Fatal("an unconfirmed stop must publish the VM so a lazy reattach cannot re-adopt the Running row")
+	}
+	if inst.Status != StatusError {
+		t.Fatalf("published instance must read Error, got %s", inst.Status)
+	}
+	if stoppedUnit != systemdUnitName("vm-1") {
+		t.Fatalf("stop attempted on %q, want the record's unit", stoppedUnit)
+	}
+	if tracked := m.vms["vm-1"]; tracked != inst {
+		t.Fatal("the Error instance must be tracked in memory")
+	}
+	kept, err := store.Get("vm-1")
+	if err != nil || kept == nil {
+		t.Fatalf("an unconfirmed stop must keep the record so the unit stays findable, got rec=%v err=%v", kept, err)
+	}
+	if kept.Status != StatusError {
+		t.Fatalf("kept record must read Error so no retry adopts a socket-less VM, got %s", kept.Status)
+	}
+}
+
+// The paused status is set in memory before it is persisted, so a failed write
+// leaves the durable record reading Running behind a stopped unit — which the
+// next reattach deletes as stale. The retry must re-record it rather than
+// report a pause whose only trace is in memory.
+func TestPauseVM_RetryRepersistsPausedState(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dbPath := filepath.Join(dir, "vmd.db")
+	store, err := OpenStateStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The durable record still reads Running: the original pause's write failed.
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusPaused,
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	m := &Manager{
+		log:      zerolog.Nop(),
+		state:    store,
+		vms:      map[string]*VMInstance{"vm-1": inst},
+		unitDead: func(context.Context, string) bool { return false }, // skip the retry backup
+	}
+
+	// Retry 1: the store is still refusing writes, so the pause must not be
+	// reported complete.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", dir); err == nil {
+		t.Fatal("a retry that cannot record the paused state must not report success")
+	}
+
+	// Retry 2: the store recovers and the retry makes the paused state durable.
+	reopened, err := OpenStateStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	m.state = reopened
+	gotSnap, gotMem, _, err := m.PauseVM(context.Background(), "vm-1", dir)
+	if err != nil {
+		t.Fatalf("retry must succeed once the store recovers: %v", err)
+	}
+	if gotSnap != snapPath || gotMem != memPath {
+		t.Fatalf("retry must return the recorded artifacts, got %q %q", gotSnap, gotMem)
+	}
+	rec, err := reopened.Get("vm-1")
+	if err != nil || rec == nil {
+		t.Fatalf("record must survive, got rec=%v err=%v", rec, err)
+	}
+	if rec.Status != StatusPaused {
+		t.Fatalf("the retry must make Paused durable, record still reads %v", rec.Status)
+	}
+}
+
+// A resume whose Running write cannot be made durable must fail: the durable
+// record still reads its pre-resume state (Error for a parked VM), and after a
+// vmd restart the error rules would trust it and stop the healthy unit.
+func TestCommitResumeState_UndurableRunning_FailsResume(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, DirtyTracked: true}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+	if err := store.Close(); err != nil { // the Running write cannot land
+		t.Fatal(err)
+	}
+
+	if cerr := m.commitResumeState(inst); cerr == nil {
+		t.Fatal("an undurable Running state must fail the resume, not report success")
+	}
+	inst.mu.RLock()
+	st, dirty := inst.Status, inst.DirtyTracked
+	inst.mu.RUnlock()
+	if st != StatusError {
+		t.Fatalf("instance must be parked Error so a retry cannot adopt the stopped unit, got %v", st)
+	}
+	if dirty {
+		t.Fatal("DirtyTracked must clear with the unit stopped")
 	}
 }

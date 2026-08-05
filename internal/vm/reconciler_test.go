@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -446,6 +447,377 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 	})
 }
 
+// Drift 8 must not retire its marker on a release that did not happen: the
+// record, its instance and its slot are still held, and only the marker keeps
+// the dead-unit half coming back for them.
+func TestFinalizeErrorReap_FailedDeleteKeepsMarker(t *testing.T) {
+	newRec := func() *Reconciler {
+		r := NewReconciler(&Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}, DefaultReconcilerConfig())
+		r.driftSeen["errdead:vm-1"] = time.Now()
+		return r
+	}
+
+	t.Run("failed delete keeps the marker", func(t *testing.T) {
+		r := newRec()
+		r.finalizeErrorReap(context.Background(), "vm-1", "errdead:vm-1", "stale_cleanup",
+			"error record with no unit", "boltdb_error_unit_missing", errors.New("boltdb write failed"))
+		r.mu.Lock()
+		_, kept := r.driftSeen["errdead:vm-1"]
+		r.mu.Unlock()
+		if !kept {
+			t.Fatal("marker must survive a failed release, or nothing revisits the held record and slot")
+		}
+	})
+
+	t.Run("successful delete retires the marker", func(t *testing.T) {
+		r := newRec()
+		r.finalizeErrorReap(context.Background(), "vm-1", "errdead:vm-1", "stale_cleanup",
+			"error record with no unit", "boltdb_error_unit_missing", nil)
+		r.mu.Lock()
+		_, kept := r.driftSeen["errdead:vm-1"]
+		r.mu.Unlock()
+		if kept {
+			t.Fatal("a completed release must retire its marker")
+		}
+	})
+}
+
+// The retry itself: a store that refuses the delete leaves the VM fully owned,
+// and a later pass — once the store recovers — completes the same cleanup.
+func TestMarkStale_FailedDeleteRetriedOnLaterPass(t *testing.T) {
+	stubUnitTerminal(t, true)
+	path := filepath.Join(t.TempDir(), "vmd.db")
+	store, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusError}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	// Pass 1: the store cannot serve the delete.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.markStale(context.Background(), "vm-1"); err == nil {
+		t.Fatal("an undeletable record must report failure")
+	}
+	m.mu.RLock()
+	_, tracked := m.vms["vm-1"]
+	m.mu.RUnlock()
+	if !tracked {
+		t.Fatal("a failed release must keep ownership of the instance and its slot")
+	}
+
+	// Pass 2: the store is healthy again and the same cleanup completes.
+	reopened, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	m.state = reopened
+	if err := r.markStale(context.Background(), "vm-1"); err != nil {
+		t.Fatalf("retry must succeed once the store recovers: %v", err)
+	}
+	m.mu.RLock()
+	_, stillTracked := m.vms["vm-1"]
+	m.mu.RUnlock()
+	if stillTracked {
+		t.Fatal("the completed retry must drop the instance")
+	}
+	if rec, gerr := reopened.Get("vm-1"); gerr != nil || rec != nil {
+		t.Fatalf("the completed retry must delete the record, got rec=%v err=%v", rec, gerr)
+	}
+}
+
+// Only proven absence may flip a paused row to failed: a stat error that is
+// not ErrNotExist says nothing about the artifact, and a present file at the
+// same path is a healed or NEW pause generation the pass snapshot cannot see.
+func TestStatPauseArtifact(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "vmstate.snap")
+	if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if p, cm := statPauseArtifact(f); !p || cm {
+		t.Fatalf("existing artifact: got present=%v confirmedMissing=%v", p, cm)
+	}
+	if p, cm := statPauseArtifact(filepath.Join(dir, "absent.snap")); p || !cm {
+		t.Fatalf("absent artifact: got present=%v confirmedMissing=%v", p, cm)
+	}
+	// A path routed THROUGH a regular file yields ENOTDIR — an error that is
+	// not ErrNotExist, i.e. inconclusive. (Root-proof, unlike a chmod probe.)
+	if p, cm := statPauseArtifact(filepath.Join(f, "child.snap")); p || cm {
+		t.Fatalf("inconclusive stat: got present=%v confirmedMissing=%v", p, cm)
+	}
+}
+
+// The drill-caught regression: a dead unit behind an active row must be
+// reaped even while the in-memory instance still claims Running — nothing
+// updates that record when firecracker dies out from under vmd, so trusting
+// it vetoes every reap. The unit probe is the only valid oracle here.
+func TestReapDeadActiveVMs_StaleRunningRecordDoesNotVetoReap(t *testing.T) {
+	stubUnitTerminal(t, true) // markStale's own terminal guard must not veto the reap in tests
+	newFixture := func(t *testing.T, unitDown bool) (*Reconciler, *StateStore, string, *[]string) {
+		t.Helper()
+		sbID := uuid.New()
+		id := sbID.String()
+		store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		if err := store.Put(VMRecord{ID: id, Status: StatusRunning}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{
+			log:   zerolog.Nop(),
+			state: store,
+			// The stale claim: still Running in memory though the unit is gone.
+			vms: map[string]*VMInstance{id: {ID: id, Status: StatusRunning}},
+		}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		r.driftSeen[id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+
+		origProbe := unitFullyDownProbe
+		unitFullyDownProbe = func(context.Context, string) bool { return unitDown }
+		t.Cleanup(func() { unitFullyDownProbe = origProbe })
+
+		flips := &[]string{}
+		r.markFailed = func(_ context.Context, vmID string, observed db.SandboxStatus) bool {
+			if observed != db.SandboxStatusActive {
+				t.Errorf("Drift 1 must assert the active state it matched, got %v", observed)
+			}
+			*flips = append(*flips, vmID)
+			return true
+		}
+		return r, store, id, flips
+	}
+	rows := func(id string) map[string]db.ListSandboxesByHostRow {
+		sbID := uuid.MustParse(id)
+		return map[string]db.ListSandboxesByHostRow{
+			id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+		}
+	}
+	noError := func(string) bool { return false }
+
+	t.Run("conclusively dead unit is reaped despite the Running claim", func(t *testing.T) {
+		r, store, id, flips := newFixture(t, true)
+		r.reapDeadActiveVMs(context.Background(), zerolog.Nop(), rows(id), map[string]bool{}, noError, time.Now())
+		if len(*flips) != 1 {
+			t.Fatalf("expected exactly one row flip, got %v", *flips)
+		}
+		if rec, _ := store.Get(id); rec != nil {
+			t.Fatal("the stale record must be released")
+		}
+		r.mgr.mu.RLock()
+		_, tracked := r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if tracked {
+			t.Fatal("the stale instance must be dropped")
+		}
+	})
+
+	t.Run("a relaunched unit defers the reap", func(t *testing.T) {
+		r, store, id, flips := newFixture(t, false) // probe: not terminal
+		r.reapDeadActiveVMs(context.Background(), zerolog.Nop(), rows(id), map[string]bool{}, noError, time.Now())
+		if len(*flips) != 0 {
+			t.Fatalf("a live unit must never be failed, got flips %v", *flips)
+		}
+		if rec, _ := store.Get(id); rec == nil {
+			t.Fatal("a live VM's record must survive")
+		}
+	})
+}
+
+// The lock-window race: a resume + re-pause can write a NEW artifact at the
+// same path while this rule waits on the lifecycle lock. The re-stat under
+// the lock must see it and heal rather than fail the fresh generation; an
+// inconclusive stat must defer, and only proven absence may flip the row.
+func TestFailMissingSnapshots_LockWindow(t *testing.T) {
+	newFixture := func(t *testing.T) (*Reconciler, string, *[]string) {
+		t.Helper()
+		sbID := uuid.New()
+		id := sbID.String()
+		m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		r.driftSeen["paused:"+id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+		flips := &[]string{}
+		r.markFailed = func(_ context.Context, vmID string, observed db.SandboxStatus) bool {
+			if observed != db.SandboxStatusPaused {
+				t.Errorf("Drift 4 must assert the paused state it matched, got %v", observed)
+			}
+			*flips = append(*flips, vmID)
+			return true
+		}
+		return r, id, flips
+	}
+	rows := func(id, snapPath string) map[string]db.ListSandboxesByHostRow {
+		sbID := uuid.MustParse(id)
+		return map[string]db.ListSandboxesByHostRow{
+			id: {
+				Sandbox:      db.Sandbox{ID: sbID, Status: db.SandboxStatusPaused, SnapshotID: pgtype.UUID{Bytes: sbID, Valid: true}},
+				SnapshotPath: &snapPath,
+			},
+		}
+	}
+	stubStat := func(t *testing.T, present, missing bool) {
+		t.Helper()
+		orig := statPauseArtifact
+		statPauseArtifact = func(string) (bool, bool) { return present, missing }
+		t.Cleanup(func() { statPauseArtifact = orig })
+	}
+
+	t.Run("new generation written while waiting on the lock heals", func(t *testing.T) {
+		r, id, flips := newFixture(t)
+		stubStat(t, true, false) // the pause completed: artifact present at re-stat
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		if len(*flips) != 0 {
+			t.Fatalf("a fresh pause generation must not be failed, got %v", *flips)
+		}
+		r.mu.Lock()
+		_, kept := r.driftSeen["paused:"+id]
+		r.mu.Unlock()
+		if kept {
+			t.Fatal("a healed sandbox must retire its drift marker")
+		}
+	})
+
+	t.Run("inconclusive stat defers and keeps the marker", func(t *testing.T) {
+		r, id, flips := newFixture(t)
+		stubStat(t, false, false)
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		if len(*flips) != 0 {
+			t.Fatalf("an inconclusive read must never fail a sandbox, got %v", *flips)
+		}
+		r.mu.Lock()
+		_, kept := r.driftSeen["paused:"+id]
+		r.mu.Unlock()
+		if !kept {
+			t.Fatal("a deferred verdict must keep the marker for the next pass")
+		}
+	})
+
+	t.Run("proven absence flips the row", func(t *testing.T) {
+		r, id, flips := newFixture(t)
+		stubStat(t, false, true)
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		if len(*flips) != 1 {
+			t.Fatalf("proven absence must flip exactly once, got %v", *flips)
+		}
+	})
+
+	t.Run("an in-flight lifecycle op defers", func(t *testing.T) {
+		r, id, flips := newFixture(t)
+		stubStat(t, false, true)
+		r.mgr.vmOpCh(id) <- struct{}{} // a pause/resume holds the lock
+		defer func() { <-r.mgr.vmOpCh(id) }()
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		if len(*flips) != 0 {
+			t.Fatalf("a locked VM must defer, got %v", *flips)
+		}
+	})
+}
+
+// stubUnitTerminal swaps the terminal-state probe so release tests do not
+// depend on a live systemd.
+func stubUnitTerminal(t *testing.T, terminal bool) {
+	t.Helper()
+	orig := unitFullyDownCtx
+	unitFullyDownCtx = func(context.Context, string) bool { return terminal }
+	t.Cleanup(func() { unitFullyDownCtx = orig })
+}
+
+// A release must not hand a VM's namespace, IP and tap device back to the pool
+// while its unit still has a process: the next VM would claim a device the old
+// Firecracker still owns. Deferring is safe because the retry comes back.
+func TestMarkStaleDefersWhileUnitNotTerminal(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusError}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	stubUnitTerminal(t, false) // unit still deactivating
+	if err := r.markStale(context.Background(), "vm-1"); !errors.Is(err, errUnitNotTerminal) {
+		t.Fatalf("a non-terminal unit must defer the release, got %v", err)
+	}
+	if rec, _ := store.Get("vm-1"); rec == nil {
+		t.Fatal("the record must survive a deferred release")
+	}
+	m.mu.RLock()
+	_, tracked := m.vms["vm-1"]
+	m.mu.RUnlock()
+	if !tracked {
+		t.Fatal("the instance and its slot must stay owned while the unit lives")
+	}
+	if got := r.pendingReleaseIDs(); len(got) != 1 || got[0] != "vm-1" {
+		t.Fatalf("a deferred release must be remembered for retry, got %v", got)
+	}
+
+	// The unit reaches a terminal state; the deferred release completes.
+	stubUnitTerminal(t, true)
+	r.retryPendingReleases(context.Background())
+	if rec, _ := store.Get("vm-1"); rec != nil {
+		t.Fatal("the retry must release once the unit is terminal")
+	}
+	if got := r.pendingReleaseIDs(); len(got) != 0 {
+		t.Fatalf("a completed release must be forgotten, got %v", got)
+	}
+}
+
+// A deferred release must not be audited as a completed reap, and must not
+// retire the drift marker: the record and its slot are still held. The guard
+// makes deferral the COMMON outcome, so a rule that reported success here
+// would mislabel routine cleanups, not just rare store failures.
+func TestFinalizeRelease_DeferralIsNotSuccess(t *testing.T) {
+	newRec := func() *Reconciler {
+		r := NewReconciler(&Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}, DefaultReconcilerConfig())
+		r.driftSeen["orphan:vm-1"] = time.Now()
+		return r
+	}
+
+	t.Run("deferral keeps the marker", func(t *testing.T) {
+		r := newRec()
+		r.finalizeRelease(context.Background(), "vm-1", "orphan:vm-1", "orphan_stop",
+			"systemd unit with no DB row", "systemd_active_db_missing", errUnitNotTerminal)
+		r.mu.Lock()
+		_, kept := r.driftSeen["orphan:vm-1"]
+		r.mu.Unlock()
+		if !kept {
+			t.Fatal("a deferred release must keep its marker — the slot is still held")
+		}
+	})
+
+	t.Run("completion retires the marker", func(t *testing.T) {
+		r := newRec()
+		r.finalizeRelease(context.Background(), "vm-1", "orphan:vm-1", "orphan_stop",
+			"systemd unit with no DB row", "systemd_active_db_missing", nil)
+		r.mu.Lock()
+		_, kept := r.driftSeen["orphan:vm-1"]
+		r.mu.Unlock()
+		if kept {
+			t.Fatal("a completed release must retire its marker")
+		}
+	})
+}
+
 // A reap whose release fails is remembered and finished on a later pass. No
 // drift rule can do this: they all match on a live unit, and the reap already
 // stopped it, so without this the record and its network slot are held until
@@ -571,98 +943,6 @@ func TestRetryPendingReleases(t *testing.T) {
 		r.mgr.mu.RUnlock()
 		if !still {
 			t.Fatal("the new generation's instance must stay tracked")
-		}
-	})
-}
-
-// stubUnitTerminal swaps the terminal-state probe so release tests do not
-// depend on a live systemd.
-func stubUnitTerminal(t *testing.T, terminal bool) {
-	t.Helper()
-	orig := unitFullyDownCtx
-	unitFullyDownCtx = func(context.Context, string) bool { return terminal }
-	t.Cleanup(func() { unitFullyDownCtx = orig })
-}
-
-// A release must not hand a VM's namespace, IP and tap device back to the pool
-// while its unit still has a process: the next VM would claim a device the old
-// Firecracker still owns. Deferring is safe because the retry comes back.
-func TestMarkStaleDefersWhileUnitNotTerminal(t *testing.T) {
-	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Namespace: "ns-1"}); err != nil {
-		t.Fatal(err)
-	}
-	m := &Manager{
-		log:   zerolog.Nop(),
-		state: store,
-		vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusError}},
-	}
-	r := NewReconciler(m, DefaultReconcilerConfig())
-
-	stubUnitTerminal(t, false) // unit still deactivating
-	if err := r.markStale(context.Background(), "vm-1"); !errors.Is(err, errUnitNotTerminal) {
-		t.Fatalf("a non-terminal unit must defer the release, got %v", err)
-	}
-	if rec, _ := store.Get("vm-1"); rec == nil {
-		t.Fatal("the record must survive a deferred release")
-	}
-	m.mu.RLock()
-	_, tracked := m.vms["vm-1"]
-	m.mu.RUnlock()
-	if !tracked {
-		t.Fatal("the instance and its slot must stay owned while the unit lives")
-	}
-	if got := r.pendingReleaseIDs(); len(got) != 1 || got[0] != "vm-1" {
-		t.Fatalf("a deferred release must be remembered for retry, got %v", got)
-	}
-
-	// The unit reaches a terminal state; the deferred release completes.
-	stubUnitTerminal(t, true)
-	r.retryPendingReleases(context.Background())
-	if rec, _ := store.Get("vm-1"); rec != nil {
-		t.Fatal("the retry must release once the unit is terminal")
-	}
-	if got := r.pendingReleaseIDs(); len(got) != 0 {
-		t.Fatalf("a completed release must be forgotten, got %v", got)
-	}
-}
-
-// A deferred release must not be audited as a completed reap, and must not
-// retire the drift marker: the record and its slot are still held. The guard
-// makes deferral the COMMON outcome, so a rule that reported success here
-// would mislabel routine cleanups, not just rare store failures.
-func TestFinalizeRelease_DeferralIsNotSuccess(t *testing.T) {
-	newRec := func() *Reconciler {
-		r := NewReconciler(&Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}, DefaultReconcilerConfig())
-		r.driftSeen["orphan:vm-1"] = time.Now()
-		return r
-	}
-
-	t.Run("deferral keeps the marker", func(t *testing.T) {
-		r := newRec()
-		r.finalizeRelease(context.Background(), "vm-1", "orphan:vm-1", "orphan_stop",
-			"systemd unit with no DB row", "systemd_active_db_missing", errUnitNotTerminal)
-		r.mu.Lock()
-		_, kept := r.driftSeen["orphan:vm-1"]
-		r.mu.Unlock()
-		if !kept {
-			t.Fatal("a deferred release must keep its marker — the slot is still held")
-		}
-	})
-
-	t.Run("completion retires the marker", func(t *testing.T) {
-		r := newRec()
-		r.finalizeRelease(context.Background(), "vm-1", "orphan:vm-1", "orphan_stop",
-			"systemd unit with no DB row", "systemd_active_db_missing", nil)
-		r.mu.Lock()
-		_, kept := r.driftSeen["orphan:vm-1"]
-		r.mu.Unlock()
-		if kept {
-			t.Fatal("a completed release must retire its marker")
 		}
 	})
 }
