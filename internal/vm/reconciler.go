@@ -126,14 +126,20 @@ type Reconciler struct {
 	// that reaps a live VM matches on an ACTIVE unit, which its own stop then
 	// retires — so without this set, an abandoned release is never revisited.
 	//
-	// The value is the instance tracked when the release was deferred (nil for
-	// an untracked id). The retry proceeds only while m.vms still holds that
-	// EXACT object: any lifecycle op replaces or removes it, and that op owns
-	// cleanup from then on. Status is useless as this signal — nothing updates
-	// a record when firecracker dies out from under vmd, so a stale entry
-	// reads Running forever, and a relaunched-then-paused VM reads Paused —
-	// both indistinguishable by value from the states that must be released.
-	pendingRelease map[string]*VMInstance
+	// The entry holds the instance tracked when the release was deferred (nil
+	// for an untracked id). The retry proceeds only while m.vms still holds
+	// that EXACT object: any lifecycle op replaces or removes it, and that op
+	// owns cleanup from then on. Status is useless as this signal — nothing
+	// updates a record when firecracker dies out from under vmd, so a stale
+	// entry reads Running forever, and a relaunched-then-paused VM reads
+	// Paused — both indistinguishable by value from the states that must be
+	// released.
+	//
+	// marker is the originating rule's drift key, kept alive across the
+	// deferral: retiring the entry must retire that marker too, or a LATER
+	// episode of the same rule for the same id inherits the old timestamp and
+	// skips its grace period.
+	pendingRelease map[string]deferredRelease
 
 	// passCount counts completed reconcile passes, used to run the disk
 	// scan on a slower sub-cadence. Only touched from the single Run loop.
@@ -149,7 +155,7 @@ func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
 		mgr:            mgr,
 		cfg:            cfg,
 		driftSeen:      make(map[string]time.Time),
-		pendingRelease: make(map[string]*VMInstance),
+		pendingRelease: make(map[string]deferredRelease),
 		prevKeptLive:   -1,
 	}
 }
@@ -305,7 +311,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			log.Warn().Str("vm_id", id).Str("drift", "db_active_systemd_missing").
 				Msg("DB says active but VM is dead — marking failed")
 			r.markFailedInDB(ctx, id)
-			releaseErr := r.markStale(id)
+			releaseErr := r.markStale(ctx, id)
 			r.finalizeRelease(ctx, id, "", "mark_failed", "VM dead while DB said active", "db_active_systemd_missing", releaseErr)
 		}
 	}
@@ -410,7 +416,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// dead-VM rule). Detach from the pass context, bounded.
 			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			r.markFailedInDB(persistCtx, id)
-			releaseErr := r.markStale(id)
+			releaseErr := r.markStale(persistCtx, id)
 			r.finalizeRelease(persistCtx, id, "", "mark_failed", "empty Firecracker shell while DB said active", "fc_empty_shell", releaseErr)
 			persistCancel()
 		}
@@ -436,7 +442,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "boltdb_running_unit_missing").
 				Msg("dead Firecracker detected (no DB context)")
-			releaseErr := r.markStale(id)
+			releaseErr := r.markStale(ctx, id)
 			r.finalizeRelease(ctx, id, "", "stale_cleanup", "VM dead, DB unavailable", "boltdb_running_unit_missing", releaseErr)
 		}
 	}
@@ -475,7 +481,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				continue
 			}
 			removeUnitDropIn(id)
-			releaseErr := r.markStale(id)
+			releaseErr := r.markStale(ctx, id)
 			r.finalizeRelease(ctx, id, "orphan:"+id, "orphan_stop", reason, kind, releaseErr)
 		}
 	}
@@ -583,12 +589,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				continue
 			}
 			removeUnitDropIn(id)
-			staleErr := r.markStale(id)
+			staleErr := r.markStale(ctx, id)
 			unlockOp()
 			if staleErr != nil {
 				// The unit is stopped but the record, its map entry and its slot
 				// survive, and no rule matches an inactive unit. Report the
 				// partial cleanup rather than an orphan_stop that did not happen.
+				r.tagPendingRelease(id, "unverifiedorphan:"+id)
 				r.writeAudit(ctx, id, "stale_cleanup_failed", "unit stopped but record not deleted", "unverified_orphan_abandoned")
 				continue
 			}
@@ -666,7 +673,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				}
 				removeUnitDropIn(id)
 			}
-			releaseErr := r.markStale(id)
+			releaseErr := r.markStale(ctx, id)
 			r.finalizeRelease(ctx, id, "bolt-orphan:"+id, "stale_cleanup", "BoltDB entry with no DB row", "boltdb_present_db_missing", releaseErr)
 		}
 	}
@@ -1161,14 +1168,14 @@ func (r *Reconciler) refundAutoFailSlot() {
 // before calling this must not report success on one: stopping the unit
 // retires the very condition their next pass matches on, so the record is
 // left for the startup reattach sweep rather than another pass.
-func (r *Reconciler) markStale(vmID string) error {
+func (r *Reconciler) markStale(ctx context.Context, vmID string) error {
 	// The release hands this VM's namespace, IP and tap device back to the
 	// pool, so it needs the terminal claim: a nil stopUnit only means the job
 	// finished, and absence from the active-unit snapshot is not terminal
 	// either — either way Firecracker may still hold the tap, and the next VM
 	// would claim a device the old process still owns. Fail-closed, so an
 	// inconclusive probe defers rather than releases.
-	if !vmUnitFullyDown(vmID) {
+	if !unitFullyDownCtx(ctx, systemdUnitName(vmID)) {
 		r.notePendingRelease(vmID)
 		return errUnitNotTerminal
 	}
@@ -1209,6 +1216,12 @@ func (r *Reconciler) markStale(vmID string) error {
 	return nil
 }
 
+// unitFullyDownCtx is markStale's terminal-unit oracle, bounded by the
+// caller's ctx so N wedged probes exhaust the pass deadline instead of
+// stacking 2s each past it; a var for tests. An expired ctx fails the probe,
+// which defers — the safe verdict.
+var unitFullyDownCtx = unitFullyDown
+
 // errUnitNotTerminal means the release was deferred, not that it failed: the
 // unit still has a process, so the record and its slot stay owned until a
 // later pass can release them safely.
@@ -1220,6 +1233,7 @@ var errUnitNotTerminal = errors.New("unit not terminal; release deferred")
 // marker is for rules whose only marker markStale clears itself.
 func (r *Reconciler) finalizeRelease(ctx context.Context, vmID, marker, action, reason, driftKind string, releaseErr error) {
 	if releaseErr != nil {
+		r.tagPendingRelease(vmID, marker)
 		r.writeAudit(ctx, vmID, "release_deferred", reason+"; slot still held", driftKind)
 		return
 	}
@@ -1229,12 +1243,33 @@ func (r *Reconciler) finalizeRelease(ctx context.Context, vmID, marker, action, 
 	}
 }
 
+type deferredRelease struct {
+	inst   *VMInstance
+	marker string
+}
+
 func (r *Reconciler) notePendingRelease(vmID string) {
 	r.mgr.mu.RLock()
 	inst := r.mgr.vms[vmID]
 	r.mgr.mu.RUnlock()
 	r.mu.Lock()
-	r.pendingRelease[vmID] = inst
+	e := r.pendingRelease[vmID]
+	e.inst = inst
+	r.pendingRelease[vmID] = e
+	r.mu.Unlock()
+}
+
+// tagPendingRelease attaches the deferring rule's drift marker to an entry
+// notePendingRelease already recorded (markStale notes without rule context).
+func (r *Reconciler) tagPendingRelease(vmID, marker string) {
+	if marker == "" {
+		return
+	}
+	r.mu.Lock()
+	if e, ok := r.pendingRelease[vmID]; ok {
+		e.marker = marker
+		r.pendingRelease[vmID] = e
+	}
 	r.mu.Unlock()
 }
 
@@ -1255,9 +1290,9 @@ func (r *Reconciler) pendingReleaseIDs() []string {
 // and suppress unrelated drift.
 func (r *Reconciler) retryPendingReleases(ctx context.Context) {
 	r.mu.Lock()
-	snapshot := make(map[string]*VMInstance, len(r.pendingRelease))
-	for id, inst := range r.pendingRelease {
-		snapshot[id] = inst
+	snapshot := make(map[string]deferredRelease, len(r.pendingRelease))
+	for id, e := range r.pendingRelease {
+		snapshot[id] = e
 	}
 	r.mu.Unlock()
 	for id, noted := range snapshot {
@@ -1272,18 +1307,22 @@ func (r *Reconciler) retryPendingReleases(ctx context.Context) {
 		r.mgr.mu.RLock()
 		cur := r.mgr.vms[id]
 		r.mgr.mu.RUnlock()
-		if cur != noted {
+		if cur != noted.inst {
 			unlockOp()
 			r.mu.Lock()
 			delete(r.pendingRelease, id)
 			r.mu.Unlock()
+			// The deferral episode is over either way; a surviving marker
+			// would hand its stale timestamp to the id's next episode.
+			r.clearDrift(noted.marker)
 			continue
 		}
-		err := r.markStale(id)
+		err := r.markStale(ctx, id)
 		unlockOp()
 		if err != nil {
 			continue // still unreleasable; the entry survives for the next pass
 		}
+		r.clearDrift(noted.marker)
 		r.writeAudit(ctx, id, "stale_cleanup", "deferred release completed on a later pass", "release_retry")
 	}
 }

@@ -421,7 +421,7 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 		if err := st.Close(); err != nil { // the store is gone; the delete cannot land
 			t.Fatal(err)
 		}
-		if err := r.markStale("vm-1"); err == nil {
+		if err := r.markStale(context.Background(), "vm-1"); err == nil {
 			t.Fatal("an undeletable record must be reported, not reaped silently")
 		}
 		r.mgr.mu.RLock()
@@ -434,7 +434,7 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 
 	t.Run("success drops the instance", func(t *testing.T) {
 		r, _ := newRec(t)
-		if err := r.markStale("vm-1"); err != nil {
+		if err := r.markStale(context.Background(), "vm-1"); err != nil {
 			t.Fatalf("markStale: %v", err)
 		}
 		r.mgr.mu.RLock()
@@ -475,7 +475,7 @@ func TestRetryPendingReleases(t *testing.T) {
 		if err := store.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if err := r.markStale("vm-1"); err == nil {
+		if err := r.markStale(context.Background(), "vm-1"); err == nil {
 			t.Fatal("an undeletable record must report failure")
 		}
 		return r, path
@@ -579,9 +579,9 @@ func TestRetryPendingReleases(t *testing.T) {
 // depend on a live systemd.
 func stubUnitTerminal(t *testing.T, terminal bool) {
 	t.Helper()
-	orig := vmUnitFullyDown
-	vmUnitFullyDown = func(string) bool { return terminal }
-	t.Cleanup(func() { vmUnitFullyDown = orig })
+	orig := unitFullyDownCtx
+	unitFullyDownCtx = func(context.Context, string) bool { return terminal }
+	t.Cleanup(func() { unitFullyDownCtx = orig })
 }
 
 // A release must not hand a VM's namespace, IP and tap device back to the pool
@@ -604,7 +604,7 @@ func TestMarkStaleDefersWhileUnitNotTerminal(t *testing.T) {
 	r := NewReconciler(m, DefaultReconcilerConfig())
 
 	stubUnitTerminal(t, false) // unit still deactivating
-	if err := r.markStale("vm-1"); !errors.Is(err, errUnitNotTerminal) {
+	if err := r.markStale(context.Background(), "vm-1"); !errors.Is(err, errUnitNotTerminal) {
 		t.Fatalf("a non-terminal unit must defer the release, got %v", err)
 	}
 	if rec, _ := store.Get("vm-1"); rec == nil {
@@ -663,6 +663,71 @@ func TestFinalizeRelease_DeferralIsNotSuccess(t *testing.T) {
 		r.mu.Unlock()
 		if kept {
 			t.Fatal("a completed release must retire its marker")
+		}
+	})
+}
+
+// Retiring a deferred release must retire its originating drift marker too:
+// the deferring rule kept the marker alive on purpose, and a later episode of
+// the same rule for the same id would inherit its timestamp — an
+// unverified-orphan reap would then skip UnverifiedOrphanGrace entirely and
+// beat adoption to a brand-new crash window.
+func TestRetryPendingReleases_RetiresOriginMarker(t *testing.T) {
+	stubUnitTerminal(t, true)
+	newRec := func(t *testing.T) (*Reconciler, string, string) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "vmd.db")
+		store, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{
+			log:   zerolog.Nop(),
+			state: store,
+			vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning, Unverified: true}},
+		}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		marker := "unverifiedorphan:vm-1"
+		r.driftSeen[marker] = time.Now().Add(-2 * r.cfg.UnverifiedOrphanGrace)
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.markStale(context.Background(), "vm-1"); err == nil {
+			t.Fatal("an undeletable record must report failure")
+		}
+		r.tagPendingRelease("vm-1", marker) // the deferring rule's keeper
+		return r, path, marker
+	}
+
+	t.Run("successful retry clears it", func(t *testing.T) {
+		r, path, marker := newRec(t)
+		reopened, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		r.mgr.state = reopened
+		r.retryPendingReleases(context.Background())
+		r.mu.Lock()
+		_, kept := r.driftSeen[marker]
+		r.mu.Unlock()
+		if kept {
+			t.Fatal("a completed release must retire the deferring rule's marker")
+		}
+	})
+
+	t.Run("identity void clears it", func(t *testing.T) {
+		r, _, marker := newRec(t)
+		r.mgr.vms["vm-1"] = &VMInstance{ID: "vm-1", Status: StatusRunning} // new generation
+		r.retryPendingReleases(context.Background())
+		r.mu.Lock()
+		_, kept := r.driftSeen[marker]
+		r.mu.Unlock()
+		if kept {
+			t.Fatal("a voided release must retire the old episode's marker")
 		}
 	})
 }
