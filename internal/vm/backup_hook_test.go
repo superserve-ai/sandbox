@@ -151,60 +151,40 @@ func TestBackupPauseRetriesWhenJournalWriteFails(t *testing.T) {
 	}
 }
 
-// A complete manifest whose journal write failed is re-enqueued as-is:
-// the retry must carry the pause-time digests, not rehash whatever the
-// disk holds by then, and it must not require the sandbox to stay
-// paused for the retry window.
-func TestBackupPauseRetriesEnqueueWithoutRehashing(t *testing.T) {
+// The pause RPC path pays no size-dependent cost: backupPause returns
+// only the cheap vmstate entry immediately, and the detached worker
+// hashes and enqueues the full pair under its own budget.
+func TestBackupPauseReturnsVMStateOnlyAndEnqueuesAsync(t *testing.T) {
 	dir := t.TempDir()
 	snap := filepath.Join(dir, "vmstate.snap")
 	disk := filepath.Join(dir, "rootfs.ext4")
 	for _, p := range []string{snap, disk} {
-		if err := os.WriteFile(p, []byte("pause-time bytes"), 0o644); err != nil {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	var calls atomic.Int32
 	tasks := make(chan backup.Task, 1)
-	// Deliberately NOT paused: the enqueue retry must not care.
 	m := &Manager{
-		vms:      map[string]*VMInstance{"vm-1": {Status: StatusRunning, SnapshotPath: snap}},
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
 		unitDead: func(context.Context, string) bool { return true },
 	}
-	m.SetBackupEnqueue(func(task backup.Task) error {
-		if calls.Add(1) == 1 {
-			return errors.New("transient journal failure")
-		}
-		tasks <- task
-		return nil
-	})
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
 	manifest := m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
-	if !pauseManifestComplete(manifest) {
-		t.Fatalf("synchronous manifest incomplete: %v", manifest)
+	if len(manifest) != 1 || manifest[0].FileName != "vmstate.snap" {
+		t.Fatalf("synchronous manifest = %+v, want vmstate only", manifest)
 	}
-	var wantDisk string
-	for _, e := range manifest {
-		if e.FileName == "rootfs.ext4" {
-			wantDisk = e.SHA256
-		}
-	}
-	// Mutate the disk after the sync attempt: a rehash would pick these
-	// bytes up, the enqueue retry must not.
-	if err := os.WriteFile(disk, []byte("post-resume bytes"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	select {
 	case task := <-tasks:
+		names := map[string]bool{}
 		for _, f := range task.Files {
-			if f.Name == "rootfs.ext4" && f.SHA256 != wantDisk {
-				t.Fatalf("retried disk digest %s, want pause-time %s (manifest was rehashed)", f.SHA256, wantDisk)
-			}
+			names[f.Name] = true
+		}
+		if !names["rootfs.ext4"] || !names["vmstate.snap"] {
+			t.Fatalf("async task files = %v, want the full pair", names)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("enqueue retry never delivered the task")
+		t.Fatal("worker never enqueued the pause")
 	}
 }
 
@@ -815,11 +795,12 @@ func TestRecoveryTrustsDurableRecordWhenMapUnloaded(t *testing.T) {
 	}
 }
 
-// A resume winning the race against the staging worker must not produce
-// a staged snapshot of post-resume bytes: the proof fails, the task
-// ships with its original paths, and the marker survives so a later
-// sweep can upgrade the queued entry under a real at-rest proof.
-func TestStagingFallsBackAndKeepsMarkerWhenNotAtRest(t *testing.T) {
+// A resume winning the race against the worker means the pause's bytes
+// cannot be proven at rest: nothing is enqueued (mutable-path uploads
+// mostly abandoned anyway), and the marker survives for the sweep,
+// which supersedes it once the sandbox's next pause covers current
+// state.
+func TestWorkerKeepsMarkerAndSkipsEnqueueWhenNotAtRest(t *testing.T) {
 	dir := t.TempDir()
 	snap := filepath.Join(dir, "vmstate.snap")
 	disk := filepath.Join(dir, "rootfs.ext4")
@@ -836,30 +817,61 @@ func TestStagingFallsBackAndKeepsMarkerWhenNotAtRest(t *testing.T) {
 
 	tasks := make(chan backup.Task, 1)
 	m := &Manager{
-		state:         st,
-		backupStaging: filepath.Join(dir, "staging"),
-		vms:           map[string]*VMInstance{"vm-1": {Status: StatusRunning, SnapshotPath: snap}},
-		unitDead:      func(context.Context, string) bool { return false },
+		state: st,
+		vms:   map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		// The unit never confirms down: the resume won.
+		unitDead: func(context.Context, string) bool { return false },
 	}
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
-	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+	pb := newPendingBackup("vm-1", snap, disk, "")
+	m.persistPendingBackup(pb, zerolog.Nop())
+	m.rehashPendingBackup(context.Background(), pb, zerolog.Nop())
 
 	select {
 	case task := <-tasks:
-		for _, f := range task.Files {
-			if f.Name == "rootfs.ext4" && f.Path != disk {
-				t.Fatalf("disk staged to %s despite a failed at-rest proof", f.Path)
-			}
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("task never enqueued")
+		t.Fatalf("enqueued %+v while not at rest", task)
+	default:
 	}
 	pending, err := st.ListPendingBackups()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pending) != 1 {
-		t.Fatalf("pending = %d, want the marker kept for a staging upgrade", len(pending))
+		t.Fatalf("pending = %+v, want the marker kept for the sweep", pending)
+	}
+}
+
+// The latency regression pin: pause-path backup work must not scale
+// with disk size. An 8GB sparse overlay (the production shape) must not
+// add meaningful synchronous latency; a reintroduced full hash would
+// take seconds even sparse-aware and fail this bound.
+func TestBackupPausePathIsDiskSizeIndependent(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(snap, []byte("vm state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(disk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(8 << 30); err != nil {
+		f.Close()
+		t.Skip("filesystem cannot create an 8GB sparse file")
+	}
+	f.Close()
+
+	m := &Manager{
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return false }, // worker holds off; only the sync path runs
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+
+	start := time.Now()
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("pause-path backup work took %v against an 8GB overlay; the RPC path must be disk-size independent", elapsed)
 	}
 }

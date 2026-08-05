@@ -92,48 +92,22 @@ func pauseManifestComplete(manifest []ManifestEntry) bool {
 // and the uploader's pre-verification abandons that generation, which is
 // the same safe outcome as any mutated source.
 func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath, diskBasePath string, log zerolog.Logger) []ManifestEntry {
-	// Pin the base identity BEFORE hashing: the marker must carry the
-	// pre-hash identity, or a base swapped during the hash is laundered
-	// into the record as the legitimate dependency.
-	pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
-	manifest := collectPauseManifest(ctx, snapshotPath, diskPath, diskBasePath, log)
+	// NOTHING here may scale with disk size. Pause latency is the
+	// product metric the layered-diff campaign bought down from ~10s to
+	// ~500ms, and synchronous manifest hashing put an O(apparent disk
+	// size) term back on this path (a hole-oblivious full read of a
+	// multi-GB overlay whose real data averages tens of MB). All
+	// size-dependent hashing therefore runs in the detached worker under
+	// its at-rest proofs and ten-minute budget; the RPC path pays only a
+	// marker write and a stat, plus the ~tens-of-KB vmstate hash so the
+	// control plane's manifest rows get the one artifact that is cheap
+	// to record synchronously.
+	manifest := collectVMStateEntry(ctx, snapshotPath, log)
 	if m.backupEnqueue == nil {
 		return manifest
 	}
-	if diskBasePath != "" {
-		if cur, err := baseIdentity(diskBasePath); err != nil || cur != pb.BaseIdentity {
-			// The hashed base cannot be proven to be the pause-time one:
-			// strip the disk entry so the manifest is incomplete and the
-			// rehash path (which re-pins and re-proves) owns it.
-			log.Warn().Err(err).Str("vm_id", vmID).
-				Msg("base identity changed across pause hash; deferring to rehash")
-			manifest = withoutDiskEntry(manifest)
-		}
-	}
-	// The RPC path stops at a millisecond marker write: staging copies
-	// artifact bytes when reflink is unavailable, and neither that nor
-	// journal I/O may eat the RPC's remaining deadline after hashing
-	// already spent its budget. The marker is the durable intent; the
-	// detached worker stages, enqueues, and clears it, and a crash in
-	// between leaves the marker for startup recovery.
+	pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
 	m.persistPendingBackup(pb, log)
-	if pauseManifestComplete(manifest) {
-		// Clone-staging runs inline: PauseVM still holds the VM op lock,
-		// so nothing can resume and no at-rest proof is needed, and a
-		// reflink costs microseconds. Only the byte-copy fallback (non
-		// reflink filesystems) defers to the worker; a destroy racing
-		// that worker is the residual, and only on such filesystems.
-		if m.backupStaging != "" {
-			t := rebuildTask(vmID, manifest)
-			if all, err := backup.StageTaskClone(m.backupStaging, &t); err == nil && all {
-				manifest = manifestWithTaskPaths(manifest, t)
-			}
-		}
-		go m.finishPauseEnqueue(pb, manifest, log)
-		return manifest
-	}
-	log.Warn().Str("vm_id", vmID).
-		Msg("pause backup not enqueueable synchronously; retrying with async rehash")
 	go m.rehashPendingBackup(ctx, pb, log)
 	return manifest
 }
@@ -375,41 +349,6 @@ func (m *Manager) runPendingBackups(ctx context.Context, log zerolog.Logger) {
 func fileMissing(path string) bool {
 	_, err := os.Stat(path)
 	return os.IsNotExist(err)
-}
-
-// finishPauseEnqueue completes a fully hashed pause off the RPC path:
-// stage the artifacts (a byte copy when reflink is unavailable), write
-// the journal entry, clear the marker. The digests already describe
-// pause-time bytes, so no rehash and no still-paused sandbox is needed;
-// a destroy racing the instants before staging lands surfaces as a
-// vanished source and the marker clears as superseded on a later sweep.
-func (m *Manager) finishPauseEnqueue(pb PendingBackup, manifest []ManifestEntry, log zerolog.Logger) {
-	// Same single-worker-per-VM guard as the rehash: a sweep worker for
-	// this VM racing us would double-stage and double-enqueue; heal
-	// first so a busy exit still leaves the durable marker.
-	m.healPendingBackup(pb, log)
-	if _, busy := m.pendingInFlight.LoadOrStore(pb.VMID, struct{}{}); busy {
-		return
-	}
-	defer m.pendingInFlight.Delete(pb.VMID)
-	ok, staged := m.enqueueBackup(pb.VMID, manifest)
-	if ok {
-		if staged {
-			m.deletePendingBackupIf(pb, log)
-			return
-		}
-		// Journaled but from mutable paths: the marker stays, and the
-		// sweep's worker retries under the at-rest proof; its enqueue
-		// dedupes against this generation and upgrades the queued paths
-		// to staged ones, after which the marker clears.
-		log.Warn().Str("vm_id", pb.VMID).
-			Msg("pause enqueued unstaged; keeping marker for staging upgrade")
-		m.healPendingBackup(pb, log)
-		return
-	}
-	log.Warn().Str("vm_id", pb.VMID).
-		Msg("pause backup journal write failed; retrying enqueue")
-	m.retryEnqueue(pb, manifest, log)
 }
 
 // retryEnqueue re-attempts a journal write for a manifest whose digests
@@ -688,37 +627,6 @@ func probeCtx() context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	_ = cancel // bounded by the deadline; the probe is short-lived
 	return ctx
-}
-
-// withoutDiskEntry strips the rootfs entry, rendering the manifest
-// incomplete so the retry machinery owns the pause.
-func withoutDiskEntry(manifest []ManifestEntry) []ManifestEntry {
-	out := manifest[:0:0]
-	for _, e := range manifest {
-		if e.FileName != "rootfs.ext4" {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-// manifestWithTaskPaths mirrors a staged task's rewritten paths back
-// onto the manifest entries, so downstream enqueue rebuilds see the
-// staged locations.
-func manifestWithTaskPaths(manifest []ManifestEntry, task backup.Task) []ManifestEntry {
-	byName := map[string]backup.TaskFile{}
-	for _, f := range task.Files {
-		byName[f.Name] = f
-	}
-	out := make([]ManifestEntry, len(manifest))
-	copy(out, manifest)
-	for i, e := range out {
-		if f, ok := byName[e.FileName]; ok {
-			out[i].Path = f.Path
-			out[i].BaseStagedPath = f.BaseStagedPath
-		}
-	}
-	return out
 }
 
 // taskFullyStaged reports whether every task path (bases included)

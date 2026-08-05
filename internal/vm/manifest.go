@@ -84,6 +84,23 @@ func hashFile(ctx context.Context, path string) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
+// collectVMStateEntry hashes ONLY the vmstate file: tens of KB, sub
+// millisecond, safe on the pause RPC path. Everything size-dependent
+// (overlay, base) is the async worker's job; the control plane treats
+// the resulting manifest as partial, exactly like a budget-exhausted
+// hash always did.
+func collectVMStateEntry(ctx context.Context, snapshotPath string, log zerolog.Logger) []ManifestEntry {
+	if snapshotPath == "" {
+		return nil
+	}
+	sum, size, err := hashFile(ctx, snapshotPath)
+	if err != nil {
+		log.Warn().Err(err).Str("path", snapshotPath).Msg("vmstate hash failed; manifest empty")
+		return nil
+	}
+	return []ManifestEntry{{FileName: "vmstate.snap", Path: snapshotPath, SizeBytes: size, SHA256: sum}}
+}
+
 // collectPauseManifest hashes a pause's durable artifacts: the disk state
 // (what the backup tier uploads) plus vmstate.snap (small, cheap local
 // integrity). Memory files are deliberately absent: they never leave the
@@ -116,7 +133,7 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 		if path == "" {
 			return
 		}
-		sum, size, err := hashFile(hctx, path)
+		sum, size, err := backup.HashFileApparent(hctx, path)
 		if err != nil {
 			log.Warn().Err(err).Str("path", path).Msg("pause manifest: hash failed, entry skipped")
 			return
@@ -204,7 +221,7 @@ func baseDigest(ctx context.Context, path string) (string, error) {
 		}
 		hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 		defer cancel()
-		sum, _, err := hashFile(hctx, path)
+		sum, _, err := backup.HashFileApparent(hctx, path)
 		if err != nil {
 			return "", err
 		}
@@ -287,7 +304,7 @@ func collectBuildManifest(ctx context.Context, snapshotDir string, extraPaths []
 			return
 		}
 		seen[name] = path
-		sum, size, err := hashFile(hctx, path)
+		sum, size, err := backup.HashFileApparent(hctx, path)
 		if err != nil {
 			log.Warn().Err(err).Str("path", path).Msg("build manifest: hash failed")
 			complete = false
