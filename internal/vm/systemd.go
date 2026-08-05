@@ -104,8 +104,40 @@ func unitMaybeWindingDown(unit string) bool {
 	if time.Since(vmProcessStart) < processSettleWindow {
 		return true
 	}
+	return unitStopUnconfirmed(unit)
+}
+
+// unitStopUnconfirmed reports a RECORDED stop for this unit that systemd has
+// not yet confirmed done. Narrower than unitMaybeWindingDown on purpose: the
+// launch gate keys on it, and including the young-process window there would
+// stall every launch for the settle window after a vmd restart.
+func unitStopUnconfirmed(unit string) bool {
 	_, ok := recentUnitStops.Load(unit)
 	return ok
+}
+
+// unitStopSettlePoll paces waitUnitStopSettle; a var for tests.
+var unitStopSettlePoll = 250 * time.Millisecond
+
+// waitUnitStopSettle blocks until the unit's recorded stop is confirmed done
+// (confirmUnitStopped clears it when the stop job completes) or ctx expires.
+// Callers gate a launch on this: a stop still in PID1's queue executes against
+// whatever holds the unit name when it lands, so starting before it settles
+// donates the new VM to the old incarnation's cleanup.
+func waitUnitStopSettle(ctx context.Context, unit string) error {
+	if !unitStopUnconfirmed(unit) {
+		return nil
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("unit %s has an unconfirmed stop outstanding: %w", unit, ctx.Err())
+		case <-time.After(unitStopSettlePoll):
+			if !unitStopUnconfirmed(unit) {
+				return nil
+			}
+		}
+	}
 }
 
 // errStopNotEnqueued marks a stop failure where systemd provably never
