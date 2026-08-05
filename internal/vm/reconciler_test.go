@@ -459,13 +459,16 @@ func TestRetryPendingReleases(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Namespace: "ns-1"}); err != nil {
+		// Running is the shape most reap sources leave behind — nothing
+		// updates a record when firecracker dies — and the shape the old
+		// status-keyed void silently discarded.
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
 			t.Fatal(err)
 		}
 		m := &Manager{
 			log:   zerolog.Nop(),
 			state: store,
-			vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusError}},
+			vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning}},
 		}
 		r := NewReconciler(m, DefaultReconcilerConfig())
 		// Pass 1: the store refuses the delete, so the reap is left unfinished.
@@ -518,8 +521,9 @@ func TestRetryPendingReleases(t *testing.T) {
 		}
 		defer reopened.Close()
 		r.mgr.state = reopened
-		// The sandbox came back between passes; the stale decision is void.
-		r.mgr.vms["vm-1"].Status = StatusRunning
+		// A relaunch REPLACES the tracked instance — that pointer swap, not
+		// any status value, is what says a lifecycle op owns the VM now.
+		r.mgr.vms["vm-1"] = &VMInstance{ID: "vm-1", Status: StatusRunning}
 
 		r.retryPendingReleases(context.Background())
 
@@ -534,6 +538,39 @@ func TestRetryPendingReleases(t *testing.T) {
 		}
 		if rec, _ := reopened.Get("vm-1"); rec == nil {
 			t.Fatal("a relaunched VM's record must survive")
+		}
+	})
+	t.Run("a relaunched then re-paused VM is never released", func(t *testing.T) {
+		// The trap a unit-state void would fall into: the new generation
+		// paused, so its unit is terminal — exactly like the stale entry —
+		// and only instance identity tells them apart. Releasing here would
+		// delete a legitimately paused record and free its slot.
+		r, path := newRec(t)
+		reopened, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		r.mgr.state = reopened
+		fresh := &VMInstance{ID: "vm-1", Status: StatusPaused}
+		r.mgr.vms["vm-1"] = fresh
+		if err := reopened.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Namespace: "ns-1"}); err != nil {
+			t.Fatal(err)
+		}
+
+		r.retryPendingReleases(context.Background())
+
+		if got := r.pendingReleaseIDs(); len(got) != 0 {
+			t.Fatalf("the voided entry must be forgotten, got %v", got)
+		}
+		if rec, _ := reopened.Get("vm-1"); rec == nil || rec.Status != StatusPaused {
+			t.Fatalf("the re-paused record must survive untouched, got %v", rec)
+		}
+		r.mgr.mu.RLock()
+		still := r.mgr.vms["vm-1"] == fresh
+		r.mgr.mu.RUnlock()
+		if !still {
+			t.Fatal("the new generation's instance must stay tracked")
 		}
 	})
 }

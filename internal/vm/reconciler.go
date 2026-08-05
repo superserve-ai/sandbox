@@ -125,7 +125,15 @@ type Reconciler struct {
 	// stopped, but whose resource release did not complete. Every drift rule
 	// that reaps a live VM matches on an ACTIVE unit, which its own stop then
 	// retires — so without this set, an abandoned release is never revisited.
-	pendingRelease map[string]struct{}
+	//
+	// The value is the instance tracked when the release was deferred (nil for
+	// an untracked id). The retry proceeds only while m.vms still holds that
+	// EXACT object: any lifecycle op replaces or removes it, and that op owns
+	// cleanup from then on. Status is useless as this signal — nothing updates
+	// a record when firecracker dies out from under vmd, so a stale entry
+	// reads Running forever, and a relaunched-then-paused VM reads Paused —
+	// both indistinguishable by value from the states that must be released.
+	pendingRelease map[string]*VMInstance
 
 	// passCount counts completed reconcile passes, used to run the disk
 	// scan on a slower sub-cadence. Only touched from the single Run loop.
@@ -141,7 +149,7 @@ func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
 		mgr:            mgr,
 		cfg:            cfg,
 		driftSeen:      make(map[string]time.Time),
-		pendingRelease: make(map[string]struct{}),
+		pendingRelease: make(map[string]*VMInstance),
 		prevKeptLive:   -1,
 	}
 }
@@ -1222,8 +1230,11 @@ func (r *Reconciler) finalizeRelease(ctx context.Context, vmID, marker, action, 
 }
 
 func (r *Reconciler) notePendingRelease(vmID string) {
+	r.mgr.mu.RLock()
+	inst := r.mgr.vms[vmID]
+	r.mgr.mu.RUnlock()
 	r.mu.Lock()
-	r.pendingRelease[vmID] = struct{}{}
+	r.pendingRelease[vmID] = inst
 	r.mu.Unlock()
 }
 
@@ -1243,20 +1254,25 @@ func (r *Reconciler) pendingReleaseIDs() []string {
 // no grace: charging again would let one broken store drain the host's budget
 // and suppress unrelated drift.
 func (r *Reconciler) retryPendingReleases(ctx context.Context) {
-	for _, id := range r.pendingReleaseIDs() {
-		// A relaunch between passes voids the reap: the record describes a live
-		// VM again, and releasing it would strand a running Firecracker.
-		if r.mgr.instanceRunning(id) {
-			r.mu.Lock()
-			delete(r.pendingRelease, id)
-			r.mu.Unlock()
-			continue
-		}
+	r.mu.Lock()
+	snapshot := make(map[string]*VMInstance, len(r.pendingRelease))
+	for id, inst := range r.pendingRelease {
+		snapshot[id] = inst
+	}
+	r.mu.Unlock()
+	for id, noted := range snapshot {
 		unlockOp, ok := r.mgr.tryLockVMOp(id)
 		if !ok {
 			continue
 		}
-		if r.mgr.instanceRunning(id) {
+		// Identity, not status: the reap was decided against `noted`, and any
+		// lifecycle op since has replaced or removed the tracked instance —
+		// that op owns cleanup now, and releasing under it would strand a
+		// relaunched VM or delete a legitimately re-paused record.
+		r.mgr.mu.RLock()
+		cur := r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if cur != noted {
 			unlockOp()
 			r.mu.Lock()
 			delete(r.pendingRelease, id)
