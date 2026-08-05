@@ -731,3 +731,81 @@ func TestRetryPendingReleases_RetiresOriginMarker(t *testing.T) {
 		}
 	})
 }
+
+// The in-place claim: adoption clears Unverified and pause flips Status on
+// the SAME tracked object, so pointer identity alone reads an adopted-then-
+// paused VM as the original reap target — and releases a healthy paused
+// record. Any observed mutation of the snapshot must void the entry.
+func TestRetryPendingReleases_InPlaceAdoptionVoids(t *testing.T) {
+	stubUnitTerminal(t, true)
+	path := ""
+	newRec := func(t *testing.T) *Reconciler {
+		t.Helper()
+		path = filepath.Join(t.TempDir(), "vmd.db")
+		store, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{
+			log:   zerolog.Nop(),
+			state: store,
+			vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning, Unverified: true}},
+		}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.markStale(context.Background(), "vm-1"); err == nil {
+			t.Fatal("an undeletable record must report failure")
+		}
+		return r
+	}
+
+	t.Run("adopted then paused, same pointer, is never released", func(t *testing.T) {
+		r := newRec(t)
+		reopened, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		r.mgr.state = reopened
+		// Adoption clears the marker in place; a later pause flips status in
+		// place. Same object throughout — only the snapshot tells the story.
+		inst := r.mgr.vms["vm-1"]
+		inst.mu.Lock()
+		inst.Unverified = false
+		inst.Status = StatusPaused
+		inst.mu.Unlock()
+		if err := reopened.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Namespace: "ns-1"}); err != nil {
+			t.Fatal(err)
+		}
+
+		r.retryPendingReleases(context.Background())
+
+		if rec, _ := reopened.Get("vm-1"); rec == nil || rec.Status != StatusPaused {
+			t.Fatalf("the adopted VM's paused record must survive untouched, got %v", rec)
+		}
+		if got := r.pendingReleaseIDs(); len(got) != 0 {
+			t.Fatalf("the voided entry must be forgotten, got %v", got)
+		}
+	})
+
+	t.Run("an unmutated stale instance is still released", func(t *testing.T) {
+		r := newRec(t)
+		reopened, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		r.mgr.state = reopened
+
+		r.retryPendingReleases(context.Background())
+
+		if rec, _ := reopened.Get("vm-1"); rec != nil {
+			t.Fatal("a genuinely stale record must still be released")
+		}
+	})
+}

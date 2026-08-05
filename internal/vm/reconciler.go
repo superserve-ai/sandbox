@@ -1254,15 +1254,30 @@ func (r *Reconciler) finalizeRelease(ctx context.Context, vmID, marker, action, 
 type deferredRelease struct {
 	inst   *VMInstance
 	marker string
+	// Snapshot of the instance when the release was deferred. Pointer
+	// identity alone only detects REPLACEMENT ops (a fresh relaunch swaps
+	// the map entry); adoption clears Unverified and pause flips Status on
+	// the SAME object. A stale instance is by definition one nothing
+	// updates, so any observed mutation proves a lifecycle op claimed the
+	// VM and the reap decision is void.
+	status     VMStatus
+	unverified bool
 }
 
 func (r *Reconciler) notePendingRelease(vmID string) {
 	r.mgr.mu.RLock()
 	inst := r.mgr.vms[vmID]
 	r.mgr.mu.RUnlock()
+	var st VMStatus
+	var unv bool
+	if inst != nil {
+		inst.mu.RLock()
+		st, unv = inst.Status, inst.Unverified
+		inst.mu.RUnlock()
+	}
 	r.mu.Lock()
 	e := r.pendingRelease[vmID]
-	e.inst = inst
+	e.inst, e.status, e.unverified = inst, st, unv
 	r.pendingRelease[vmID] = e
 	r.mu.Unlock()
 }
@@ -1315,7 +1330,13 @@ func (r *Reconciler) retryPendingReleases(ctx context.Context) {
 		r.mgr.mu.RLock()
 		cur := r.mgr.vms[id]
 		r.mgr.mu.RUnlock()
-		if cur != noted.inst {
+		mutated := false
+		if cur != nil && cur == noted.inst {
+			cur.mu.RLock()
+			mutated = cur.Status != noted.status || cur.Unverified != noted.unverified
+			cur.mu.RUnlock()
+		}
+		if cur != noted.inst || mutated {
 			unlockOp()
 			r.mu.Lock()
 			delete(r.pendingRelease, id)
