@@ -1334,10 +1334,12 @@ func (r *Reconciler) refundAutoFailSlot() {
 }
 
 // finalizeErrorReap records the outcome of a Drift 8 release. A failed delete
-// left the record, its in-memory instance and its network slot held, so the
-// marker must survive: retiring it would both report a cleanup that did not
-// happen and restart the grace period, delaying the retry the dead-unit half
-// would otherwise make on the very next pass.
+// leaves the record, its instance and its network slot held, so the marker
+// survives rather than retiring on a cleanup that did not happen.
+//
+// That also keeps the dead-unit half's retry on the very next pass, its grace
+// already elapsed. The active half gets no such benefit: its marker is retired
+// when the unit leaves the active set, so its retry waits out one more grace.
 func (r *Reconciler) finalizeErrorReap(ctx context.Context, vmID, marker, action, reason, driftKind string, staleErr error) {
 	if staleErr != nil {
 		r.writeAudit(ctx, vmID, "stale_cleanup_failed", reason+"; record not deleted", driftKind)
