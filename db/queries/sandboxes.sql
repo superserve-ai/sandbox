@@ -283,12 +283,10 @@ WHERE host_id = sqlc.arg(host_id)
 -- not team scope. Guarded on the lifecycle state, not on updated_at: that
 -- column moves for metadata and network-config edits too, so a version
 -- compare would silently refuse the flip for a sandbox that is just as dead.
--- The status check is what the reconciler actually means, and a concurrent
--- relaunch or resume is caught by the caller's own re-check under the VM's
--- lifecycle lock. Returns rows affected so a refused flip is not read as a
--- completed one. The CTE bundles the active-interval close into the same
--- statement so a crash/timeout between the two writes can't leave the
--- interval open and have analytics count the actor as active forever.
+-- Returns rows affected so a refused flip is not read as a completed one.
+-- The CTE bundles the active-interval close into the same statement so a
+-- crash/timeout between the two writes can't leave the interval open and
+-- have analytics count the actor as active forever.
 WITH failed AS (
   UPDATE sandbox
   -- auto_delete_at is cleared: the deadline is only meaningful in 'paused',

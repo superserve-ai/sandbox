@@ -1250,11 +1250,9 @@ const dbQueryTimeout = 5 * time.Second
 // 'active' again. The underlying query's CTE also closes any open
 // sandbox_active_interval row atomically, so a crash/timeout between the
 // two writes is unreachable. No-op if the DB is not configured.
-// markFailedInDB flips a sandbox row to failed. Reports whether the row
-// actually moved: the query only touches an 'active' row, so a resume that
-// took the row since the pass snapshot refuses the flip, and a caller that
-// read that as success would clear its drift and audit a transition that
-// never happened.
+// markFailedInDB flips a sandbox row to failed, reporting whether it moved.
+// A refusal means a resume took the row since the pass snapshot, so callers
+// must not audit the transition or clear their drift on it.
 func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) bool {
 	if r.cfg.DB == nil {
 		return true
