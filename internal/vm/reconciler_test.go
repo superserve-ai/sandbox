@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -396,6 +397,7 @@ func TestUnverifiedOrphanGrace(t *testing.T) {
 // unit first retire the condition their rule matches on, so a swallowed
 // failure would be reported as a completed reap and never revisited.
 func TestMarkStaleReportsDeleteFailure(t *testing.T) {
+	stubUnitTerminal(t, true)
 	newRec := func(t *testing.T) (*Reconciler, *StateStore) {
 		t.Helper()
 		st, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
@@ -449,6 +451,7 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 // stopped it, so without this the record and its network slot are held until
 // the next vmd restart.
 func TestRetryPendingReleases(t *testing.T) {
+	stubUnitTerminal(t, true)
 	newRec := func(t *testing.T) (*Reconciler, string) {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), "vmd.db")
@@ -533,4 +536,60 @@ func TestRetryPendingReleases(t *testing.T) {
 			t.Fatal("a relaunched VM's record must survive")
 		}
 	})
+}
+
+// stubUnitTerminal swaps the terminal-state probe so release tests do not
+// depend on a live systemd.
+func stubUnitTerminal(t *testing.T, terminal bool) {
+	t.Helper()
+	orig := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return terminal }
+	t.Cleanup(func() { vmUnitFullyDown = orig })
+}
+
+// A release must not hand a VM's namespace, IP and tap device back to the pool
+// while its unit still has a process: the next VM would claim a device the old
+// Firecracker still owns. Deferring is safe because the retry comes back.
+func TestMarkStaleDefersWhileUnitNotTerminal(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusError}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	stubUnitTerminal(t, false) // unit still deactivating
+	if err := r.markStale("vm-1"); !errors.Is(err, errUnitNotTerminal) {
+		t.Fatalf("a non-terminal unit must defer the release, got %v", err)
+	}
+	if rec, _ := store.Get("vm-1"); rec == nil {
+		t.Fatal("the record must survive a deferred release")
+	}
+	m.mu.RLock()
+	_, tracked := m.vms["vm-1"]
+	m.mu.RUnlock()
+	if !tracked {
+		t.Fatal("the instance and its slot must stay owned while the unit lives")
+	}
+	if got := r.pendingReleaseIDs(); len(got) != 1 || got[0] != "vm-1" {
+		t.Fatalf("a deferred release must be remembered for retry, got %v", got)
+	}
+
+	// The unit reaches a terminal state; the deferred release completes.
+	stubUnitTerminal(t, true)
+	r.retryPendingReleases(context.Background())
+	if rec, _ := store.Get("vm-1"); rec != nil {
+		t.Fatal("the retry must release once the unit is terminal")
+	}
+	if got := r.pendingReleaseIDs(); len(got) != 0 {
+		t.Fatalf("a completed release must be forgotten, got %v", got)
+	}
 }

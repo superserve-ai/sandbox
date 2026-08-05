@@ -3879,6 +3879,16 @@ var vmUnitDead = func(vmID string) bool {
 	return unitDefinitelyDead(ctx, systemdUnitName(vmID))
 }
 
+// vmUnitFullyDown reports a VM's unit in a TERMINAL state; swappable in tests.
+// Sites that release a record and its namespace need this claim, not
+// vmUnitDead — that one reads deactivating as dead, while the process may
+// still hold the tap device.
+var vmUnitFullyDown = func(vmID string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return unitFullyDown(ctx, systemdUnitName(vmID))
+}
+
 // adoptionBoxdReady is the boxd readiness gate for restore adoption and the
 // unverified relaunch (via verifyBoxdReady); a var for the same test seam
 // vmUnitDead uses.

@@ -1159,6 +1159,18 @@ func (r *Reconciler) refundAutoFailSlot() {
 // retires the very condition their next pass matches on, so the record is
 // left for the startup reattach sweep rather than another pass.
 func (r *Reconciler) markStale(vmID string) error {
+	// The release hands this VM's namespace, IP and tap device back to the
+	// pool, so it needs the terminal claim. A nil stopUnit only means the job
+	// finished — the unit can still be deactivating with Firecracker holding
+	// the tap, and absence from the active-unit snapshot is not terminal
+	// either. Releasing then lets the next VM claim a device the old process
+	// still owns. Fail-closed: an inconclusive probe defers rather than
+	// releases, and retryPendingReleases comes back once it settles.
+	if !vmUnitFullyDown(vmID) {
+		r.notePendingRelease(vmID)
+		return errUnitNotTerminal
+	}
+
 	// Capture the namespace before deleting the record: a VM whose teardown
 	// didn't run (e.g. a vmd timeout mid-DELETE) would otherwise leak its slot.
 	var namespace string
@@ -1196,6 +1208,11 @@ func (r *Reconciler) markStale(vmID string) error {
 		Str("action", "mark_stale").Msg("reconciler: cleaned up stale VM record")
 	return nil
 }
+
+// errUnitNotTerminal means the release was deferred, not that it failed: the
+// unit still has a process, so the record and its slot stay owned until a
+// later pass can release them safely.
+var errUnitNotTerminal = errors.New("unit not terminal; release deferred")
 
 func (r *Reconciler) notePendingRelease(vmID string) {
 	r.mu.Lock()
