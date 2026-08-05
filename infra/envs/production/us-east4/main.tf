@@ -168,9 +168,16 @@ module "api" {
     DB_MAX_CONNS           = "15"
     VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
-    # OTEL_* is intentionally omitted here: the live service has no OTEL env, so
-    # adding it would be a production change, not adoption. It lands in a
-    # separate OTEL-parity PR (mirroring us-central1's collector export).
+
+    # Control-plane OTLP metrics export, mirroring the retired us-central1
+    # primary. The host-local superserve-otel-collector receives OTLP on :4318
+    # and forwards to Google Managed Prometheus; the use4 network already admits
+    # the Cloud Run sender range to the host on 4317/4318 (allow_otel_ingress).
+    OTEL_ENVIRONMENT            = local.environment
+    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${module.sandbox_host.internal_ip}:4318"
+    OTEL_EXPORT_INTERVAL        = "15s"
+    OTEL_METRICS_ENABLED        = "true"
+    OTEL_SERVICE_NAME           = "sandbox-controlplane"
   }
 
   secrets = {
