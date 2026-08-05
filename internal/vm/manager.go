@@ -4016,7 +4016,7 @@ func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string) error {
 // destroy either erased the record itself or is caught here, and we erase our
 // own resurrecting write rather than hand back a destroyed VM.
 func (m *Manager) commitResumeState(inst *VMInstance) error {
-	m.persistState(inst)
+	wrote := m.persistState(inst)
 	m.mu.RLock()
 	_, stillTracked := m.vms[inst.ID]
 	m.mu.RUnlock()
@@ -4025,6 +4025,21 @@ func (m *Manager) commitResumeState(inst *VMInstance) error {
 	// already being torn down. The tombstone covers the whole teardown.
 	_, destroying := m.destroying.Load(inst.ID)
 	if stillTracked && !destroying {
+		if !wrote {
+			// Undurable Running must fail the resume (restore's discipline):
+			// the durable record still reads its pre-resume state, and after
+			// a vmd restart the error rules would trust it and stop this
+			// healthy unit. The guest resumed moments ago, so the teardown
+			// discards nothing; the retry relaunches with a fresh persist.
+			// In-memory Error keeps a same-artifact retry from adopting the
+			// unit this teardown is stopping.
+			m.stopUnitDuringRestoreError(inst.ID)
+			inst.mu.Lock()
+			inst.Status = StatusError
+			inst.DirtyTracked = false // unit stopped; a relaunch re-arms tracking
+			inst.mu.Unlock()
+			return fmt.Errorf("vm %s resumed but its state could not be persisted", inst.ID)
+		}
 		return nil
 	}
 	m.deleteState(inst.ID)

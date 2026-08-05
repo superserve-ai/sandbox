@@ -2232,3 +2232,31 @@ func TestPauseVM_RetryRepersistsPausedState(t *testing.T) {
 		t.Fatalf("the retry must make Paused durable, record still reads %v", rec.Status)
 	}
 }
+
+// A resume whose Running write cannot be made durable must fail: the durable
+// record still reads its pre-resume state (Error for a parked VM), and after a
+// vmd restart the error rules would trust it and stop the healthy unit.
+func TestCommitResumeState_UndurableRunning_FailsResume(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, DirtyTracked: true}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+	if err := store.Close(); err != nil { // the Running write cannot land
+		t.Fatal(err)
+	}
+
+	if cerr := m.commitResumeState(inst); cerr == nil {
+		t.Fatal("an undurable Running state must fail the resume, not report success")
+	}
+	inst.mu.RLock()
+	st, dirty := inst.Status, inst.DirtyTracked
+	inst.mu.RUnlock()
+	if st != StatusError {
+		t.Fatalf("instance must be parked Error so a retry cannot adopt the stopped unit, got %v", st)
+	}
+	if dirty {
+		t.Fatal("DirtyTracked must clear with the unit stopped")
+	}
+}
