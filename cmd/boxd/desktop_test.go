@@ -257,6 +257,28 @@ func TestKeyArgs(t *testing.T) {
 			t.Errorf("keyArgs = %v, want a -- guard before the literal text", got)
 		}
 	})
+
+	t.Run("oversized inputs rejected", func(t *testing.T) {
+		if _, err := keyArgs(&pb.KeyEvent{Input: &pb.KeyEvent_Key{Key: strings.Repeat("k", maxKeyLength+1)}}); err == nil {
+			t.Error("expected oversized key to be rejected")
+		}
+		if _, err := keyArgs(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: strings.Repeat("t", maxTextLength+1)}}); err == nil {
+			t.Error("expected oversized text to be rejected")
+		}
+	})
+
+	t.Run("invalid modifiers rejected", func(t *testing.T) {
+		tooMany := make([]string, maxModifiers+1)
+		for i := range tooMany {
+			tooMany[i] = "ctrl"
+		}
+		if _, err := keyArgs(&pb.KeyEvent{Input: &pb.KeyEvent_Key{Key: "c"}, Modifiers: tooMany}); err == nil {
+			t.Error("expected too many modifiers to be rejected")
+		}
+		if _, err := keyArgs(&pb.KeyEvent{Input: &pb.KeyEvent_Key{Key: "c"}, Modifiers: []string{""}}); err == nil {
+			t.Error("expected empty modifier to be rejected")
+		}
+	})
 }
 
 func TestScrollCommands(t *testing.T) {
@@ -329,6 +351,9 @@ func TestScrollCommands(t *testing.T) {
 		if _, err := scrollCommands(0, -(maxScrollRepeat + 1)); err == nil {
 			t.Error("expected error for negative dy exceeding maxScrollRepeat")
 		}
+		if _, err := scrollCommands(-1<<31, 0); err == nil {
+			t.Error("expected minimum int32 delta to be rejected")
+		}
 	})
 }
 
@@ -339,10 +364,14 @@ func TestValidateResizeDims(t *testing.T) {
 		wantErr       bool
 	}{
 		{"valid", 1920, 1080, false},
+		{"minimum", minDesktopWidth, minDesktopHeight, false},
 		{"zero width", 0, 1080, true},
 		{"zero height", 1920, 0, true},
-		{"width too large", maxCoordinate + 1, 1080, true},
-		{"height too large", 1920, maxCoordinate + 1, true},
+		{"width too small", minDesktopWidth - 8, 1080, true},
+		{"height too small", 1920, minDesktopHeight - 1, true},
+		{"width not CVT aligned", 1279, 720, true},
+		{"width too large", maxDesktopDimension + 8, 1080, true},
+		{"height too large", 1920, maxDesktopDimension + 1, true},
 		{"both zero", 0, 0, true},
 	}
 	for _, tc := range cases {
@@ -358,9 +387,42 @@ func TestValidateResizeDims(t *testing.T) {
 	}
 }
 
+func TestConnectedOutput(t *testing.T) {
+	query := []byte("Screen 0: minimum 320 x 200, current 1280 x 800\nscreen connected 1280x800+0+0\n")
+	got, err := connectedOutput(query)
+	if err != nil {
+		t.Fatalf("connectedOutput: %v", err)
+	}
+	if got != "screen" {
+		t.Fatalf("connectedOutput = %q, want screen", got)
+	}
+	if _, err := connectedOutput([]byte("screen disconnected\n")); err == nil {
+		t.Fatal("expected error when no output is connected")
+	}
+}
+
+func TestParseCVTModeline(t *testing.T) {
+	name, args, err := parseCVTModeline([]byte("# 1280x720 59.86 Hz\nModeline \"1280x720_60.00\" 74.50 1280 1344 1472 1664 720 723 728 748 -hsync +vsync\n"))
+	if err != nil {
+		t.Fatalf("parseCVTModeline: %v", err)
+	}
+	if name != "1280x720_60.00" {
+		t.Fatalf("name = %q", name)
+	}
+	if len(args) < 4 || args[0] != name || args[1] != "74.50" {
+		t.Fatalf("args = %v", args)
+	}
+	if _, _, err := parseCVTModeline([]byte("invalid")); err == nil {
+		t.Fatal("expected invalid cvt output to fail")
+	}
+}
+
 func TestAbs32(t *testing.T) {
-	cases := []struct{ in, want int32 }{
-		{5, 5}, {-5, 5}, {0, 0}, {-1, 1},
+	cases := []struct {
+		in   int32
+		want int64
+	}{
+		{5, 5}, {-5, 5}, {0, 0}, {-1, 1}, {-1 << 31, 1 << 31},
 	}
 	for _, tc := range cases {
 		if got := abs32(tc.in); got != tc.want {
@@ -423,6 +485,49 @@ func withFakeBin(t *testing.T, bins map[string]string) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
+func TestDesktopCommandUsesSandboxDisplay(t *testing.T) {
+	withFakeBin(t, map[string]string{
+		"xdotool": `printf '%s' "$DISPLAY"
+`,
+	})
+
+	sandboxCtx := &sandboxContext{}
+	sandboxCtx.merge(map[string]string{"DISPLAY": ":77"}, "", "")
+	service := newDesktopService(sandboxCtx)
+	cmd, err := service.commandContext(context.Background(), "xdotool")
+	if err != nil {
+		t.Fatalf("commandContext: %v", err)
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run fake xdotool: %v", err)
+	}
+	if got, want := string(out), ":77"; got != want {
+		t.Fatalf("DISPLAY = %q, want %q", got, want)
+	}
+}
+
+func TestDesktopCommandDefaultsDisplay(t *testing.T) {
+	withFakeBin(t, map[string]string{
+		"xdotool": `printf '%s' "$DISPLAY"
+`,
+	})
+	t.Setenv("DISPLAY", "")
+
+	service := newDesktopService(nil)
+	cmd, err := service.commandContext(context.Background(), "xdotool")
+	if err != nil {
+		t.Fatalf("commandContext: %v", err)
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run fake xdotool: %v", err)
+	}
+	if got, want := string(out), defaultDesktopDisplay; got != want {
+		t.Fatalf("DISPLAY = %q, want %q", got, want)
+	}
+}
+
 func TestSendPointer_EndToEnd_LogsExactArgs(t *testing.T) {
 	logFile := filepath.Join(t.TempDir(), "args.log")
 	withFakeBin(t, map[string]string{
@@ -431,7 +536,7 @@ exit 0
 `, logFile),
 	})
 
-	s := newDesktopService()
+	s := newDesktopService(nil)
 	resp, err := s.SendPointer(context.Background(), connect.NewRequest(&pb.PointerEvent{
 		X:      42,
 		Y:      7,
@@ -460,7 +565,7 @@ func TestSendPointer_EndToEnd_ExecFailurePropagates(t *testing.T) {
 		"xdotool": "echo 'no display' >&2\nexit 1\n",
 	})
 
-	s := newDesktopService()
+	s := newDesktopService(nil)
 	_, err := s.SendPointer(context.Background(), connect.NewRequest(&pb.PointerEvent{
 		X: 1, Y: 1, Action: pb.PointerAction_POINTER_ACTION_MOVE,
 	}))
@@ -481,7 +586,7 @@ func TestSendPointer_ValidationErrorNeverShellsOut(t *testing.T) {
 	// before exec, this would fail with "executable file not found" instead
 	// of the expected InvalidArgument, so this also proves validation runs
 	// first.
-	s := newDesktopService()
+	s := newDesktopService(nil)
 	_, err := s.SendPointer(context.Background(), connect.NewRequest(&pb.PointerEvent{
 		X: -1, Y: 0,
 	}))
@@ -502,7 +607,7 @@ exit 0
 `, logFile),
 	})
 
-	s := newDesktopService()
+	s := newDesktopService(nil)
 	_, err := s.SendKey(context.Background(), connect.NewRequest(&pb.KeyEvent{
 		Input:     &pb.KeyEvent_Key{Key: "Delete"},
 		Modifiers: []string{"ctrl", "alt"},
@@ -521,7 +626,7 @@ exit 0
 }
 
 func TestSendKey_ValidationErrorNeverShellsOut(t *testing.T) {
-	s := newDesktopService()
+	s := newDesktopService(nil)
 	_, err := s.SendKey(context.Background(), connect.NewRequest(&pb.KeyEvent{}))
 	if err == nil {
 		t.Fatal("expected error when neither key nor text is set")
@@ -540,7 +645,7 @@ exit 0
 `, logFile),
 	})
 
-	s := newDesktopService()
+	s := newDesktopService(nil)
 	_, err := s.Scroll(context.Background(), connect.NewRequest(&pb.ScrollEvent{Dy: 3}))
 	if err != nil {
 		t.Fatalf("Scroll: %v", err)
@@ -558,12 +663,21 @@ exit 0
 func TestResize_EndToEnd(t *testing.T) {
 	logFile := filepath.Join(t.TempDir(), "args.log")
 	withFakeBin(t, map[string]string{
-		"xrandr": fmt.Sprintf(`echo "$@" > %q
+		"xrandr": fmt.Sprintf(`echo "$@" >> %q
+if [ "$1" = "--query" ]; then
+  echo "screen connected 1280x800+0+0"
+fi
 exit 0
 `, logFile),
+		"cvt": `echo '# 1280x720 59.86 Hz'
+echo 'Modeline "1280x720_60.00" 74.50 1280 1344 1472 1664 720 723 728 748 -hsync +vsync'
+`,
+		"xdotool": `if [ "$1" = "getdisplaygeometry" ]; then echo "1280 720"; exit 0; fi
+exit 1
+`,
 	})
 
-	s := newDesktopService()
+	s := newDesktopService(nil)
 	_, err := s.Resize(context.Background(), connect.NewRequest(&pb.DesktopResizeRequest{Width: 1280, Height: 720}))
 	if err != nil {
 		t.Fatalf("Resize: %v", err)
@@ -572,14 +686,20 @@ exit 0
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
-	want := "-s 1280x720\n"
-	if string(got) != want {
-		t.Errorf("xrandr invoked with %q, want %q", got, want)
+	for _, want := range []string{
+		"--query\n",
+		"--newmode 1280x720_60.00 74.50",
+		"--addmode screen 1280x720_60.00\n",
+		"--output screen --mode 1280x720_60.00\n",
+	} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("xrandr log %q does not contain %q", got, want)
+		}
 	}
 }
 
 func TestResize_ValidationErrorNeverShellsOut(t *testing.T) {
-	s := newDesktopService()
+	s := newDesktopService(nil)
 	_, err := s.Resize(context.Background(), connect.NewRequest(&pb.DesktopResizeRequest{Width: 0, Height: 0}))
 	if err == nil {
 		t.Fatal("expected error for zero dimensions")
@@ -598,7 +718,7 @@ func TestResize_ValidationErrorNeverShellsOut(t *testing.T) {
 func newDesktopTestServer(t *testing.T) boxdpbconnect.DesktopServiceClient {
 	t.Helper()
 	mux := http.NewServeMux()
-	mux.Handle(boxdpbconnect.NewDesktopServiceHandler(newDesktopService()))
+	mux.Handle(boxdpbconnect.NewDesktopServiceHandler(newDesktopService(nil)))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return boxdpbconnect.NewDesktopServiceClient(srv.Client(), srv.URL)

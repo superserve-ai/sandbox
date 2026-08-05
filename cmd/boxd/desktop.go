@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -42,6 +44,9 @@ import (
 // filesystemService's pattern.
 type desktopService struct {
 	boxdpbconnect.UnimplementedDesktopServiceHandler
+	ctx        *sandboxContext
+	mutationMu sync.Mutex
+	streamSlot chan struct{}
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +70,10 @@ const screenshotTimeout = 5 * time.Second
 // geometry/resize).
 const xdotoolTimeout = 5 * time.Second
 
+// desktopResizeTimeout covers modeline generation plus the xrandr update and
+// verification sequence.
+const desktopResizeTimeout = 15 * time.Second
+
 // maxConsecutiveCaptureFailures ends the stream after this many capture
 // failures in a row, so a permanently broken X server (crashed Xvfb, no
 // DISPLAY) doesn't spin the ticker forever; a transient single failure is
@@ -84,8 +93,26 @@ const maxCoordinate = 1 << 16 // 65536
 // unbounded burst of xdotool invocations.
 const maxScrollRepeat = 500
 
-func newDesktopService() *desktopService {
-	return &desktopService{}
+const (
+	defaultDesktopDisplay = ":1"
+	maxKeyLength          = 256
+	maxTextLength         = 64 * 1024
+	maxModifiers          = 8
+	maxModifierLength     = 32
+	maxScreenshotBytes    = 32 * 1024 * 1024
+	maxDesktopDimension   = 8192
+	minDesktopWidth       = 320
+	minDesktopHeight      = 200
+)
+
+func newDesktopService(ctx *sandboxContext) *desktopService {
+	if ctx == nil {
+		ctx = &sandboxContext{}
+	}
+	return &desktopService{
+		ctx:        ctx,
+		streamSlot: make(chan struct{}, 1),
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +148,14 @@ func (s *desktopService) Stream(ctx context.Context, req *connect.Request[pb.Fra
 		return connect.NewError(connect.CodeInvalidArgument, err)
 	}
 
-	width, height, err := displayGeometry(ctx)
+	select {
+	case s.streamSlot <- struct{}{}:
+		defer func() { <-s.streamSlot }()
+	default:
+		return connect.NewError(connect.CodeResourceExhausted, errors.New("a desktop frame stream is already active"))
+	}
+
+	width, height, err := s.displayGeometry(ctx)
 	if err != nil {
 		return connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("query display geometry: %w", err))
 	}
@@ -149,7 +183,7 @@ func (s *desktopService) Stream(ctx context.Context, req *connect.Request[pb.Fra
 			_ = stream.Send(&pb.Frame{Event: &pb.Frame_End{End: &pb.FrameEndEvent{Status: "cancelled"}}})
 			return nil
 		case <-ticker.C:
-			img, err := captureScreenshot(ctx)
+			img, err := s.captureScreenshot(ctx)
 			if err != nil {
 				consecutiveFailures++
 				log.Printf("desktop: screenshot capture failed (%d/%d consecutive): %v",
@@ -180,11 +214,14 @@ func (s *desktopService) Stream(ctx context.Context, req *connect.Request[pb.Fra
 // captureScreenshot runs ImageMagick's `import` against the root window and
 // returns the PNG bytes written to stdout. Bound to a per-capture timeout
 // derived from ctx so one wedged capture can't stall the stream forever.
-func captureScreenshot(ctx context.Context) ([]byte, error) {
+func (s *desktopService) captureScreenshot(ctx context.Context) ([]byte, error) {
 	capCtx, cancel := context.WithTimeout(ctx, screenshotTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(capCtx, "import", "-window", "root", "png:-")
+	cmd, err := s.commandContext(capCtx, "import", "-window", "root", "png:-")
+	if err != nil {
+		return nil, fmt.Errorf("resolve import: %w", err)
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, wrapExecErr("import -window root", err)
@@ -192,16 +229,22 @@ func captureScreenshot(ctx context.Context) ([]byte, error) {
 	if len(out) == 0 {
 		return nil, errors.New("import -window root: empty output")
 	}
+	if len(out) > maxScreenshotBytes {
+		return nil, fmt.Errorf("import -window root: screenshot is %d bytes, limit is %d", len(out), maxScreenshotBytes)
+	}
 	return out, nil
 }
 
 // displayGeometry queries the virtual display's current resolution via
 // xdotool, which boxd also uses for pointer/key injection.
-func displayGeometry(ctx context.Context) (width, height uint32, err error) {
+func (s *desktopService) displayGeometry(ctx context.Context) (width, height uint32, err error) {
 	geomCtx, cancel := context.WithTimeout(ctx, xdotoolTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(geomCtx, "xdotool", "getdisplaygeometry")
+	cmd, err := s.commandContext(geomCtx, "xdotool", "getdisplaygeometry")
+	if err != nil {
+		return 0, 0, fmt.Errorf("resolve xdotool: %w", err)
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return 0, 0, wrapExecErr("xdotool getdisplaygeometry", err)
@@ -279,7 +322,9 @@ func (s *desktopService) SendPointer(ctx context.Context, req *connect.Request[p
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
-	if err := runXdotool(ctx, args...); err != nil {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if err := s.runXdotool(ctx, args...); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return connect.NewResponse(&pb.PointerResponse{}), nil
@@ -293,16 +338,30 @@ func (s *desktopService) SendPointer(ctx context.Context, req *connect.Request[p
 // Takes the whole message (rather than just the oneof) because the
 // generated oneof interface type (isKeyEvent_Input) is unexported.
 func keyArgs(msg *pb.KeyEvent) ([]string, error) {
+	if len(msg.GetModifiers()) > maxModifiers {
+		return nil, fmt.Errorf("too many modifiers: %d, max %d", len(msg.GetModifiers()), maxModifiers)
+	}
+	for _, modifier := range msg.GetModifiers() {
+		if modifier == "" || len(modifier) > maxModifierLength || strings.IndexByte(modifier, 0) >= 0 {
+			return nil, fmt.Errorf("invalid modifier %q", modifier)
+		}
+	}
 	switch in := msg.GetInput().(type) {
 	case *pb.KeyEvent_Key:
 		if in.Key == "" {
 			return nil, errors.New("key is empty")
+		}
+		if len(in.Key) > maxKeyLength || strings.IndexByte(in.Key, 0) >= 0 {
+			return nil, fmt.Errorf("key is invalid or exceeds %d bytes", maxKeyLength)
 		}
 		chord := strings.Join(append(append([]string{}, msg.GetModifiers()...), in.Key), "+")
 		return []string{"key", "--", chord}, nil
 	case *pb.KeyEvent_Text:
 		if in.Text == "" {
 			return nil, errors.New("text is empty")
+		}
+		if len(in.Text) > maxTextLength || strings.IndexByte(in.Text, 0) >= 0 {
+			return nil, fmt.Errorf("text is invalid or exceeds %d bytes", maxTextLength)
 		}
 		// Modifiers don't apply to literal text entry; xdotool type has no
 		// concept of a held modifier while typing a string.
@@ -317,7 +376,9 @@ func (s *desktopService) SendKey(ctx context.Context, req *connect.Request[pb.Ke
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
-	if err := runXdotool(ctx, args...); err != nil {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	if err := s.runXdotool(ctx, args...); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return connect.NewResponse(&pb.KeyResponse{}), nil
@@ -364,33 +425,61 @@ func (s *desktopService) Scroll(ctx context.Context, req *connect.Request[pb.Scr
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	for _, args := range cmds {
-		if err := runXdotool(ctx, args...); err != nil {
+		if err := s.runXdotool(ctx, args...); err != nil {
 			return nil, connect.NewError(connect.CodeInternal, err)
 		}
 	}
 	return connect.NewResponse(&pb.ScrollResponse{}), nil
 }
 
-func abs32(v int32) int32 {
+func abs32(v int32) int64 {
 	if v < 0 {
-		return -v
+		return -int64(v)
 	}
-	return v
+	return int64(v)
 }
 
 // ---------------------------------------------------------------------------
 // Resize
 // ---------------------------------------------------------------------------
 
-// validateResizeDims rejects zero and absurdly large dimensions. It doesn't
-// enforce a minimum meaningful resolution beyond nonzero, since that's a
-// policy choice best left to the caller (SDK/console), not boxd.
+// validateResizeDims bounds the framebuffer allocation and requires the width
+// alignment used by VESA CVT modelines.
 func validateResizeDims(width, height uint32) error {
-	if width == 0 || height == 0 || width > maxCoordinate || height > maxCoordinate {
+	if width < minDesktopWidth || height < minDesktopHeight ||
+		width > maxDesktopDimension || height > maxDesktopDimension || width%8 != 0 {
 		return fmt.Errorf("invalid resize dimensions: %dx%d", width, height)
 	}
 	return nil
+}
+
+func connectedOutput(query []byte) (string, error) {
+	for _, line := range strings.Split(string(query), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[1] == "connected" {
+			return fields[0], nil
+		}
+	}
+	return "", fmt.Errorf("xrandr --query: no connected output in %q", bytes.TrimSpace(query))
+}
+
+func parseCVTModeline(output []byte) (string, []string, error) {
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[0] != "Modeline" {
+			continue
+		}
+		name := strings.Trim(fields[1], `"`)
+		if name == "" {
+			break
+		}
+		args := append([]string{name}, fields[2:]...)
+		return name, args, nil
+	}
+	return "", nil, fmt.Errorf("cvt: no modeline in %q", bytes.TrimSpace(output))
 }
 
 func (s *desktopService) Resize(ctx context.Context, req *connect.Request[pb.DesktopResizeRequest]) (*connect.Response[pb.DesktopResizeResponse], error) {
@@ -398,16 +487,78 @@ func (s *desktopService) Resize(ctx context.Context, req *connect.Request[pb.Des
 	if err := validateResizeDims(width, height); err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 
-	// xdotool has no display-resize primitive (getdisplaygeometry is
-	// read-only); xrandr is the standard tool for changing an X11 display's
-	// resolution, so Resize shells out to it instead.
-	resizeCtx, cancel := context.WithTimeout(ctx, xdotoolTimeout)
+	// Xvfb exposes only its initial mode. Generate and attach a CVT modeline
+	// before selecting it so arbitrary supported desktop sizes work rather than
+	// only resolutions that happened to exist at boot.
+	resizeCtx, cancel := context.WithTimeout(ctx, desktopResizeTimeout)
 	defer cancel()
-	mode := fmt.Sprintf("%dx%d", width, height)
-	cmd := exec.CommandContext(resizeCtx, "xrandr", "-s", mode)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, wrapExecErrOutput("xrandr -s "+mode, out, err))
+
+	queryCmd, err := s.commandContext(resizeCtx, "xrandr", "--query")
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("resolve xrandr: %w", err))
+	}
+	query, err := queryCmd.CombinedOutput()
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, wrapExecErrOutput("xrandr --query", query, err))
+	}
+	outputName, err := connectedOutput(query)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
+	}
+
+	cvtCmd, err := s.commandContext(resizeCtx, "cvt", strconv.FormatUint(uint64(width), 10), strconv.FormatUint(uint64(height), 10), "60")
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("resolve cvt: %w", err))
+	}
+	cvtOutput, err := cvtCmd.CombinedOutput()
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, wrapExecErrOutput("cvt", cvtOutput, err))
+	}
+	modeName, modelineArgs, err := parseCVTModeline(cvtOutput)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
+	}
+
+	// Newmode/addmode can legitimately fail when a previous call already
+	// installed the same mode. The final mode switch is authoritative: if it
+	// succeeds, the mode exists and is attached to this output.
+	newModeCmd, err := s.commandContext(resizeCtx, "xrandr", append([]string{"--newmode"}, modelineArgs...)...)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("resolve xrandr: %w", err))
+	}
+	newModeOutput, _ := newModeCmd.CombinedOutput()
+
+	addModeCmd, err := s.commandContext(resizeCtx, "xrandr", "--addmode", outputName, modeName)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("resolve xrandr: %w", err))
+	}
+	addModeOutput, _ := addModeCmd.CombinedOutput()
+
+	setModeCmd, err := s.commandContext(resizeCtx, "xrandr", "--output", outputName, "--mode", modeName)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("resolve xrandr: %w", err))
+	}
+	if setModeOutput, setModeErr := setModeCmd.CombinedOutput(); setModeErr != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf(
+			"set desktop mode %s: %w (newmode: %s; addmode: %s)",
+			modeName,
+			wrapExecErrOutput("xrandr --output", setModeOutput, setModeErr),
+			strings.TrimSpace(string(newModeOutput)),
+			strings.TrimSpace(string(addModeOutput)),
+		))
+	}
+	actualWidth, actualHeight, err := s.displayGeometry(resizeCtx)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("verify resized display: %w", err))
+	}
+	if actualWidth != width || actualHeight != height {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf(
+			"display geometry after resize is %dx%d, want %dx%d",
+			actualWidth, actualHeight, width, height,
+		))
 	}
 
 	return connect.NewResponse(&pb.DesktopResizeResponse{}), nil
@@ -420,16 +571,49 @@ func (s *desktopService) Resize(ctx context.Context, req *connect.Request[pb.Des
 // runXdotool runs xdotool with the given args, bound to a per-call timeout
 // derived from ctx, matching the cancellation convention runProcess uses for
 // user-requested commands.
-func runXdotool(ctx context.Context, args ...string) error {
+func (s *desktopService) runXdotool(ctx context.Context, args ...string) error {
 	callCtx, cancel := context.WithTimeout(ctx, xdotoolTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(callCtx, "xdotool", args...)
+	cmd, err := s.commandContext(callCtx, "xdotool", args...)
+	if err != nil {
+		return fmt.Errorf("resolve xdotool: %w", err)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return wrapExecErrOutput("xdotool "+strings.Join(args, " "), out, err)
 	}
 	return nil
+}
+
+// commandContext gives desktop tools the sandbox's effective environment.
+// In particular, DISPLAY is supplied by the desktop template through /init;
+// boxd itself starts before template defaults are applied and therefore does
+// not inherit that value in its process environment.
+func (s *desktopService) commandContext(ctx context.Context, name string, args ...string) (*exec.Cmd, error) {
+	envVars, _, _ := s.ctx.snapshot()
+
+	pathValue := os.Getenv("PATH")
+	if pathValue == "" {
+		pathValue = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+	display := os.Getenv("DISPLAY")
+	if display == "" {
+		display = defaultDesktopDisplay
+	}
+
+	env := append(os.Environ(), "PATH="+pathValue, "DISPLAY="+display)
+	for key, value := range envVars {
+		env = append(env, key+"="+value)
+	}
+
+	resolved, err := lookPathIn(name, pathFromEnv(env))
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, resolved, args...)
+	cmd.Env = env
+	return cmd, nil
 }
 
 // wrapExecErr wraps an exec error, surfacing stderr (populated by

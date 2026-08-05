@@ -421,7 +421,7 @@ type DesktopServiceClient interface {
 	// requested cadence. Lifecycle mirrors ProcessService.Start: a Start event
 	// reports the display size, Data events carry frames, and an End event
 	// closes the stream (client cancellation or an unrecoverable capture
-	// failure).
+	// failure). Only one frame stream may be active per sandbox.
 	Stream(context.Context, *connect.Request[boxdpb.FrameConfig]) (*connect.ServerStreamForClient[boxdpb.Frame], error)
 	// SendPointer moves the pointer and/or presses/releases/clicks a button.
 	SendPointer(context.Context, *connect.Request[boxdpb.PointerEvent]) (*connect.Response[boxdpb.PointerResponse], error)
@@ -429,7 +429,9 @@ type DesktopServiceClient interface {
 	SendKey(context.Context, *connect.Request[boxdpb.KeyEvent]) (*connect.Response[boxdpb.KeyResponse], error)
 	// Scroll scrolls the viewport under the pointer.
 	Scroll(context.Context, *connect.Request[boxdpb.ScrollEvent]) (*connect.Response[boxdpb.ScrollResponse], error)
-	// Resize changes the virtual display resolution.
+	// Resize changes the virtual display resolution. Width must be a multiple
+	// of 8 between 320 and 8192; height must be between 200 and 8192. Restart an
+	// active frame stream after resizing so its Start dimensions stay current.
 	Resize(context.Context, *connect.Request[boxdpb.DesktopResizeRequest]) (*connect.Response[boxdpb.DesktopResizeResponse], error)
 }
 
@@ -517,7 +519,7 @@ type DesktopServiceHandler interface {
 	// requested cadence. Lifecycle mirrors ProcessService.Start: a Start event
 	// reports the display size, Data events carry frames, and an End event
 	// closes the stream (client cancellation or an unrecoverable capture
-	// failure).
+	// failure). Only one frame stream may be active per sandbox.
 	Stream(context.Context, *connect.Request[boxdpb.FrameConfig], *connect.ServerStream[boxdpb.Frame]) error
 	// SendPointer moves the pointer and/or presses/releases/clicks a button.
 	SendPointer(context.Context, *connect.Request[boxdpb.PointerEvent]) (*connect.Response[boxdpb.PointerResponse], error)
@@ -525,7 +527,9 @@ type DesktopServiceHandler interface {
 	SendKey(context.Context, *connect.Request[boxdpb.KeyEvent]) (*connect.Response[boxdpb.KeyResponse], error)
 	// Scroll scrolls the viewport under the pointer.
 	Scroll(context.Context, *connect.Request[boxdpb.ScrollEvent]) (*connect.Response[boxdpb.ScrollResponse], error)
-	// Resize changes the virtual display resolution.
+	// Resize changes the virtual display resolution. Width must be a multiple
+	// of 8 between 320 and 8192; height must be between 200 and 8192. Restart an
+	// active frame stream after resizing so its Start dimensions stay current.
 	Resize(context.Context, *connect.Request[boxdpb.DesktopResizeRequest]) (*connect.Response[boxdpb.DesktopResizeResponse], error)
 }
 

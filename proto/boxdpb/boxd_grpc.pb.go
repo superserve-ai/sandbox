@@ -528,7 +528,7 @@ type DesktopServiceClient interface {
 	// requested cadence. Lifecycle mirrors ProcessService.Start: a Start event
 	// reports the display size, Data events carry frames, and an End event
 	// closes the stream (client cancellation or an unrecoverable capture
-	// failure).
+	// failure). Only one frame stream may be active per sandbox.
 	Stream(ctx context.Context, in *FrameConfig, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Frame], error)
 	// SendPointer moves the pointer and/or presses/releases/clicks a button.
 	SendPointer(ctx context.Context, in *PointerEvent, opts ...grpc.CallOption) (*PointerResponse, error)
@@ -536,7 +536,9 @@ type DesktopServiceClient interface {
 	SendKey(ctx context.Context, in *KeyEvent, opts ...grpc.CallOption) (*KeyResponse, error)
 	// Scroll scrolls the viewport under the pointer.
 	Scroll(ctx context.Context, in *ScrollEvent, opts ...grpc.CallOption) (*ScrollResponse, error)
-	// Resize changes the virtual display resolution.
+	// Resize changes the virtual display resolution. Width must be a multiple
+	// of 8 between 320 and 8192; height must be between 200 and 8192. Restart an
+	// active frame stream after resizing so its Start dimensions stay current.
 	Resize(ctx context.Context, in *DesktopResizeRequest, opts ...grpc.CallOption) (*DesktopResizeResponse, error)
 }
 
@@ -615,7 +617,7 @@ type DesktopServiceServer interface {
 	// requested cadence. Lifecycle mirrors ProcessService.Start: a Start event
 	// reports the display size, Data events carry frames, and an End event
 	// closes the stream (client cancellation or an unrecoverable capture
-	// failure).
+	// failure). Only one frame stream may be active per sandbox.
 	Stream(*FrameConfig, grpc.ServerStreamingServer[Frame]) error
 	// SendPointer moves the pointer and/or presses/releases/clicks a button.
 	SendPointer(context.Context, *PointerEvent) (*PointerResponse, error)
@@ -623,7 +625,9 @@ type DesktopServiceServer interface {
 	SendKey(context.Context, *KeyEvent) (*KeyResponse, error)
 	// Scroll scrolls the viewport under the pointer.
 	Scroll(context.Context, *ScrollEvent) (*ScrollResponse, error)
-	// Resize changes the virtual display resolution.
+	// Resize changes the virtual display resolution. Width must be a multiple
+	// of 8 between 320 and 8192; height must be between 200 and 8192. Restart an
+	// active frame stream after resizing so its Start dimensions stay current.
 	Resize(context.Context, *DesktopResizeRequest) (*DesktopResizeResponse, error)
 	mustEmbedUnimplementedDesktopServiceServer()
 }

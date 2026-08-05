@@ -10,10 +10,16 @@
         "run": "apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg && echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main' > /etc/apt/sources.list.d/google-chrome.list"
       },
       {
-        "run": "apt-get update && apt-get install -y --no-install-recommends xfce4 xfce4-terminal dbus-x11 xvfb x11vnc novnc websockify google-chrome-stable imagemagick xdotool && rm -rf /var/lib/apt/lists/*"
+        "run": "apt-get update && apt-get install -y --no-install-recommends xfce4 xfce4-terminal dbus-x11 xvfb x11vnc novnc websockify google-chrome-stable imagemagick xdotool xcvt netcat-openbsd && rm -rf /var/lib/apt/lists/*"
+      },
+      {
+        "env": {
+          "key": "DISPLAY",
+          "value": ":1"
+        }
       }
     ],
-    "start_cmd": "Xvfb :1 -screen 0 1280x800x24 -nolisten tcp & sleep 1 && DISPLAY=:1 dbus-launch --exit-with-session xfce4-session & sleep 1 && x11vnc -display :1 -forever -shared -nopw -rfbport 5900 & websockify --web=/usr/share/novnc/ 6080 localhost:5900 &",
-    "ready_cmd": "curl -sf http://localhost:6080/vnc.html >/dev/null"
+    "start_cmd": "export DISPLAY=:1; Xvfb :1 -screen 0 1280x800x24 -nolisten tcp +extension RANDR >/tmp/xvfb.log 2>&1 & sleep 1; dbus-launch --exit-with-session xfce4-session >/tmp/xfce.log 2>&1 & sleep 1; x11vnc -display :1 -forever -shared -nopw -rfbport 5900 >/tmp/x11vnc.log 2>&1 & exec websockify --web=/usr/share/novnc/ 6080 localhost:5900",
+    "ready_cmd": "xdotool getdisplaygeometry >/dev/null && nc -z 127.0.0.1 5900 && curl -sf http://localhost:6080/vnc.html >/dev/null"
   }
 }

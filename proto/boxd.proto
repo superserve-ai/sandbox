@@ -179,7 +179,7 @@ service DesktopService {
   // requested cadence. Lifecycle mirrors ProcessService.Start: a Start event
   // reports the display size, Data events carry frames, and an End event
   // closes the stream (client cancellation or an unrecoverable capture
-  // failure).
+  // failure). Only one frame stream may be active per sandbox.
   rpc Stream(FrameConfig) returns (stream Frame);
 
   // SendPointer moves the pointer and/or presses/releases/clicks a button.
@@ -191,7 +191,9 @@ service DesktopService {
   // Scroll scrolls the viewport under the pointer.
   rpc Scroll(ScrollEvent) returns (ScrollResponse);
 
-  // Resize changes the virtual display resolution.
+  // Resize changes the virtual display resolution. Width must be a multiple
+  // of 8 between 320 and 8192; height must be between 200 and 8192. Restart an
+  // active frame stream after resizing so its Start dimensions stay current.
   rpc Resize(DesktopResizeRequest) returns (DesktopResizeResponse);
 }
 
