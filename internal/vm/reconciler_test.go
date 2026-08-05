@@ -532,3 +532,26 @@ func TestMarkStale_FailedDeleteRetriedOnLaterPass(t *testing.T) {
 		t.Fatalf("the completed retry must delete the record, got rec=%v err=%v", rec, gerr)
 	}
 }
+
+// Only proven absence may flip a paused row to failed: a stat error that is
+// not ErrNotExist says nothing about the artifact, and a present file at the
+// same path is a healed or NEW pause generation the pass snapshot cannot see.
+func TestStatPauseArtifact(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "vmstate.snap")
+	if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if p, cm := statPauseArtifact(f); !p || cm {
+		t.Fatalf("existing artifact: got present=%v confirmedMissing=%v", p, cm)
+	}
+	if p, cm := statPauseArtifact(filepath.Join(dir, "absent.snap")); p || !cm {
+		t.Fatalf("absent artifact: got present=%v confirmedMissing=%v", p, cm)
+	}
+	// A path routed THROUGH a regular file yields ENOTDIR — an error that is
+	// not ErrNotExist, i.e. inconclusive. (Root-proof, unlike a chmod probe.)
+	if p, cm := statPauseArtifact(filepath.Join(f, "child.snap")); p || cm {
+		t.Fatalf("inconclusive stat: got present=%v confirmedMissing=%v", p, cm)
+	}
+}

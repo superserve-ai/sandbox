@@ -326,7 +326,10 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if !ok {
 				continue
 			}
-			if !vmUnitFullyDown(id) {
+			if !unitFullyDown(ctx, systemdUnitName(id)) {
+				// Pass ctx, not a background budget: N wedged probes must
+				// exhaust the pass deadline, not stack past it — an expired
+				// ctx fails the probe and defers, which is the safe verdict.
 				unlockOp()
 				continue
 			}
@@ -338,8 +341,16 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			log.Warn().Str("vm_id", id).Str("drift", "db_active_systemd_missing").
 				Msg("DB says active but VM is dead — marking failed")
 			flipped := r.markFailedInDB(ctx, id, db.SandboxStatusActive)
-			r.markStale(id)
+			staleErr := r.markStale(id)
 			unlockOp()
+			if staleErr != nil {
+				// The row is failed but the record and slot are still held, and
+				// no rule rematches that shape (this one needs an active row).
+				// The release retry is record-keyed and lives outside this
+				// rule; until then the leak is bounded by the next reattach —
+				// but it must be recorded, not silent.
+				r.writeAudit(ctx, id, "stale_cleanup_failed", "row failed but record not deleted", "db_active_systemd_missing")
+			}
 			if !flipped {
 				continue
 			}
@@ -812,7 +823,28 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if !r.gracePeriodElapsed("paused:"+id, now) {
 				continue
 			}
+			// Re-stat under the lifecycle lock before spending budget: a
+			// resume + re-pause since the pass snapshot writes NEW artifacts
+			// at this same path before the row returns to paused, so the row
+			// alone cannot tell the generations apart — the file can. The
+			// lock excludes an in-flight transition; only PROVEN absence may
+			// flip, anything inconclusive defers to the next pass.
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			present, confirmedMissing := statPauseArtifact(snapPath)
+			if present {
+				unlockOp()
+				r.clearDrift("paused:" + id)
+				continue
+			}
+			if !confirmedMissing {
+				unlockOp()
+				continue
+			}
 			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
 				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "paused_snapshot_missing")
 				continue
 			}
@@ -823,7 +855,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// flip asserts. A row that resumed since the pass snapshot refuses
 			// it, and keeping the marker lets the next pass re-evaluate rather
 			// than retiring a transition that never happened.
-			if !r.markFailedInDB(ctx, id, db.SandboxStatusPaused) {
+			flipped := r.markFailedInDB(ctx, id, db.SandboxStatusPaused)
+			unlockOp()
+			if !flipped {
 				continue
 			}
 			r.writeAudit(ctx, id, "mark_failed", "snapshot file missing", "paused_snapshot_missing")
@@ -1238,6 +1272,19 @@ func (r *Reconciler) graceElapsed(key string, now time.Time, window time.Duratio
 		return false
 	}
 	return now.Sub(firstSeen) >= window
+}
+
+// statPauseArtifact classifies a pause artifact for the missing-snapshot rule:
+// present (healed, or a new generation at the same path), confirmedMissing
+// (the only verdict that may flip the row), or neither — EACCES, I/O errors
+// and a spent ctx say nothing about the file, and marking a sandbox failed on
+// a non-answer would fail healthy generations.
+func statPauseArtifact(path string) (present, confirmedMissing bool) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, false
+	}
+	return false, errors.Is(err, os.ErrNotExist)
 }
 
 // clearDrift removes a drift marker once the VM returns to a healthy state.
