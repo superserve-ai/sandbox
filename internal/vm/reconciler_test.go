@@ -422,7 +422,7 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 		if err := st.Close(); err != nil { // the store is gone; the delete cannot land
 			t.Fatal(err)
 		}
-		if err := r.markStale(context.Background(), "vm-1"); err == nil {
+		if err := r.markStale(context.Background(), "vm-1", ""); err == nil {
 			t.Fatal("an undeletable record must be reported, not reaped silently")
 		}
 		r.mgr.mu.RLock()
@@ -435,7 +435,7 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 
 	t.Run("success drops the instance", func(t *testing.T) {
 		r, _ := newRec(t)
-		if err := r.markStale(context.Background(), "vm-1"); err != nil {
+		if err := r.markStale(context.Background(), "vm-1", ""); err != nil {
 			t.Fatalf("markStale: %v", err)
 		}
 		r.mgr.mu.RLock()
@@ -505,7 +505,7 @@ func TestMarkStale_FailedDeleteRetriedOnLaterPass(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.markStale(context.Background(), "vm-1"); err == nil {
+	if err := r.markStale(context.Background(), "vm-1", ""); err == nil {
 		t.Fatal("an undeletable record must report failure")
 	}
 	m.mu.RLock()
@@ -522,7 +522,7 @@ func TestMarkStale_FailedDeleteRetriedOnLaterPass(t *testing.T) {
 	}
 	defer reopened.Close()
 	m.state = reopened
-	if err := r.markStale(context.Background(), "vm-1"); err != nil {
+	if err := r.markStale(context.Background(), "vm-1", ""); err != nil {
 		t.Fatalf("retry must succeed once the store recovers: %v", err)
 	}
 	m.mu.RLock()
@@ -755,7 +755,7 @@ func TestMarkStaleDefersWhileUnitNotTerminal(t *testing.T) {
 	r := NewReconciler(m, DefaultReconcilerConfig())
 
 	stubUnitTerminal(t, false) // unit still deactivating
-	if err := r.markStale(context.Background(), "vm-1"); !errors.Is(err, errUnitNotTerminal) {
+	if err := r.markStale(context.Background(), "vm-1", ""); !errors.Is(err, errUnitNotTerminal) {
 		t.Fatalf("a non-terminal unit must defer the release, got %v", err)
 	}
 	if rec, _ := store.Get("vm-1"); rec == nil {
@@ -847,7 +847,7 @@ func TestRetryPendingReleases(t *testing.T) {
 		if err := store.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if err := r.markStale(context.Background(), "vm-1"); err == nil {
+		if err := r.markStale(context.Background(), "vm-1", ""); err == nil {
 			t.Fatal("an undeletable record must report failure")
 		}
 		return r, path
@@ -975,10 +975,9 @@ func TestRetryPendingReleases_RetiresOriginMarker(t *testing.T) {
 		if err := store.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if err := r.markStale(context.Background(), "vm-1"); err == nil {
+		if err := r.markStale(context.Background(), "vm-1", marker); err == nil {
 			t.Fatal("an undeletable record must report failure")
 		}
-		r.tagPendingRelease("vm-1", marker) // the deferring rule's keeper
 		return r, path, marker
 	}
 
@@ -1038,7 +1037,7 @@ func TestRetryPendingReleases_InPlaceAdoptionVoids(t *testing.T) {
 		if err := store.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if err := r.markStale(context.Background(), "vm-1"); err == nil {
+		if err := r.markStale(context.Background(), "vm-1", ""); err == nil {
 			t.Fatal("an undeletable record must report failure")
 		}
 		return r
@@ -1115,7 +1114,7 @@ func TestFinalizeErrorReap_TagsDeferredRelease(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	staleErr := r.markStale(context.Background(), "vm-1")
+	staleErr := r.markStale(context.Background(), "vm-1", marker)
 	if staleErr == nil {
 		t.Fatal("an undeletable record must report failure")
 	}
@@ -1166,7 +1165,7 @@ func TestHasPendingReleaseStandsAside(t *testing.T) {
 	if !r.consumeAutoFailBudget("vm-1") {
 		t.Fatal("first decision must have budget")
 	}
-	if err := r.markStale(context.Background(), "vm-1"); !errors.Is(err, errUnitNotTerminal) {
+	if err := r.markStale(context.Background(), "vm-1", ""); !errors.Is(err, errUnitNotTerminal) {
 		t.Fatalf("non-terminal unit must defer, got %v", err)
 	}
 	if !r.hasPendingRelease("vm-1") {
@@ -1217,7 +1216,7 @@ func TestRetryPendingReleases_VoidClearsBareIDGrace(t *testing.T) {
 	r := NewReconciler(m, DefaultReconcilerConfig())
 	// The Drift 1/2 shape: grace elapsed under the bare id, then a deferral.
 	r.driftSeen["vm-1"] = time.Now().Add(-2 * r.cfg.GracePeriod)
-	if err := r.markStale(context.Background(), "vm-1"); err == nil {
+	if err := r.markStale(context.Background(), "vm-1", ""); err == nil {
 		t.Fatal("non-terminal unit must defer")
 	}
 

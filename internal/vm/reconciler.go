@@ -427,7 +427,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// dead-VM rule). Detach from the pass context, bounded.
 			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			flipped := r.markFailedInDB(persistCtx, id, db.SandboxStatusActive)
-			releaseErr := r.markStale(persistCtx, id)
+			releaseErr := r.markStale(persistCtx, id, "")
 			if releaseErr != nil {
 				r.finalizeRelease(persistCtx, id, "", "", "empty Firecracker shell while DB said active", "fc_empty_shell", releaseErr)
 			}
@@ -469,7 +469,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "boltdb_running_unit_missing").
 				Msg("dead Firecracker detected (no DB context)")
-			releaseErr := r.markStale(ctx, id)
+			releaseErr := r.markStale(ctx, id, "")
 			r.finalizeRelease(ctx, id, "", "stale_cleanup", "VM dead, DB unavailable", "boltdb_running_unit_missing", releaseErr)
 		}
 	}
@@ -514,7 +514,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				continue
 			}
 			removeUnitDropIn(id)
-			releaseErr := r.markStale(ctx, id)
+			releaseErr := r.markStale(ctx, id, "orphan:"+id)
 			r.finalizeRelease(ctx, id, "orphan:"+id, "orphan_stop", reason, kind, releaseErr)
 		}
 	}
@@ -573,7 +573,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			continue
 		}
 		removeUnitDropIn(id)
-		staleErr := r.markStale(ctx, id)
+		staleErr := r.markStale(ctx, id, "errunit:"+id)
 		unlockOp()
 		// Flip the DB row with the already-grace-qualified reap: Drift 1
 		// cleared its marker while the unit was active, so leaving the row
@@ -654,7 +654,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			unlockOp()
 			return
 		}
-		staleErr := r.markStale(ctx, id)
+		staleErr := r.markStale(ctx, id, "errdead:"+id)
 		unlockOp()
 		// Drift 1 skips Error records, so the row flip lands here (still
 		// compare-and-set: a relaunch may own the row by now).
@@ -779,13 +779,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				continue
 			}
 			removeUnitDropIn(id)
-			staleErr := r.markStale(ctx, id)
+			staleErr := r.markStale(ctx, id, "unverifiedorphan:"+id)
 			unlockOp()
 			if staleErr != nil {
 				// The unit is stopped but the record, its map entry and its slot
 				// survive, and no rule matches an inactive unit. Report the
 				// partial cleanup rather than an orphan_stop that did not happen.
-				r.tagPendingRelease(id, "unverifiedorphan:"+id)
 				r.writeAudit(ctx, id, "stale_cleanup_failed", "unit stopped but record not deleted", "unverified_orphan_abandoned")
 				continue
 			}
@@ -848,7 +847,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				}
 				removeUnitDropIn(id)
 			}
-			releaseErr := r.markStale(ctx, id)
+			releaseErr := r.markStale(ctx, id, "bolt-orphan:"+id)
 			r.finalizeRelease(ctx, id, "bolt-orphan:"+id, "stale_cleanup", "BoltDB entry with no DB row", "boltdb_present_db_missing", releaseErr)
 		}
 	}
@@ -1372,8 +1371,6 @@ func (r *Reconciler) refundAutoFailSlot() {
 // when the unit leaves the active set, so its retry waits out one more grace.
 func (r *Reconciler) finalizeErrorReap(ctx context.Context, vmID, marker, action, reason, driftKind string, staleErr error) {
 	if staleErr != nil {
-		// Same discipline as finalizeRelease — see pendingRelease's marker doc.
-		r.tagPendingRelease(vmID, marker)
 		r.writeAudit(ctx, vmID, "stale_cleanup_failed", reason+"; record not deleted", driftKind)
 		return
 	}
@@ -1389,7 +1386,7 @@ func (r *Reconciler) finalizeErrorReap(ctx context.Context, vmID, marker, action
 // before calling this must not report success on one: stopping the unit
 // retires the very condition their next pass matches on, so the record is
 // left for retryPendingReleases rather than another pass of the rule.
-func (r *Reconciler) markStale(ctx context.Context, vmID string) error {
+func (r *Reconciler) markStale(ctx context.Context, vmID, marker string) error {
 	// The release hands this VM's namespace, IP and tap device back to the
 	// pool, so it needs the terminal claim: a nil stopUnit only means the job
 	// finished, and absence from the active-unit snapshot is not terminal
@@ -1397,7 +1394,7 @@ func (r *Reconciler) markStale(ctx context.Context, vmID string) error {
 	// would claim a device the old process still owns. Fail-closed, so an
 	// inconclusive probe defers rather than releases.
 	if !unitFullyDownCtx(ctx, systemdUnitName(vmID)) {
-		r.notePendingRelease(vmID)
+		r.notePendingRelease(vmID, marker)
 		return errUnitNotTerminal
 	}
 
@@ -1413,7 +1410,7 @@ func (r *Reconciler) markStale(ctx context.Context, vmID string) error {
 	// failure here abandons the whole cleanup rather than half-applying it.
 	if err := r.mgr.state.Delete(vmID); err != nil {
 		// Recorded here, not per rule, so every caller inherits the retry.
-		r.notePendingRelease(vmID)
+		r.notePendingRelease(vmID, marker)
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to delete stale state")
 		return err
 	}
@@ -1454,7 +1451,6 @@ var errUnitNotTerminal = errors.New("unit not terminal; release deferred")
 // marker is for rules whose only marker markStale clears itself.
 func (r *Reconciler) finalizeRelease(ctx context.Context, vmID, marker, action, reason, driftKind string, releaseErr error) {
 	if releaseErr != nil {
-		r.tagPendingRelease(vmID, marker)
 		r.writeAudit(ctx, vmID, "release_deferred", reason+"; slot still held", driftKind)
 		return
 	}
@@ -1478,7 +1474,7 @@ type deferredRelease struct {
 	unverified bool
 }
 
-func (r *Reconciler) notePendingRelease(vmID string) {
+func (r *Reconciler) notePendingRelease(vmID, marker string) {
 	r.mgr.mu.RLock()
 	inst := r.mgr.vms[vmID]
 	r.mgr.mu.RUnlock()
@@ -1491,22 +1487,8 @@ func (r *Reconciler) notePendingRelease(vmID string) {
 	}
 	r.mu.Lock()
 	e := r.pendingRelease[vmID]
-	e.inst, e.status, e.unverified = inst, st, unv
+	e.inst, e.status, e.unverified, e.marker = inst, st, unv, marker
 	r.pendingRelease[vmID] = e
-	r.mu.Unlock()
-}
-
-// tagPendingRelease attaches the deferring rule's drift marker to an entry
-// notePendingRelease already recorded (markStale notes without rule context).
-func (r *Reconciler) tagPendingRelease(vmID, marker string) {
-	if marker == "" {
-		return
-	}
-	r.mu.Lock()
-	if e, ok := r.pendingRelease[vmID]; ok {
-		e.marker = marker
-		r.pendingRelease[vmID] = e
-	}
 	r.mu.Unlock()
 }
 
@@ -1574,7 +1556,7 @@ func (r *Reconciler) retryPendingReleases(ctx context.Context) {
 			r.clearDrift(noted.marker)
 			continue
 		}
-		err := r.markStale(ctx, id)
+		err := r.markStale(ctx, id, noted.marker)
 		unlockOp()
 		if err != nil {
 			continue // still unreleasable; the entry survives for the next pass
@@ -1632,7 +1614,7 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 		log.Warn().Str("vm_id", id).Str("drift", "db_active_systemd_missing").
 			Msg("DB says active but VM is dead — marking failed")
 		flipped := r.markFailed(ctx, id, db.SandboxStatusActive)
-		staleErr := r.markStale(ctx, id)
+		staleErr := r.markStale(ctx, id, "")
 		unlockOp()
 		if staleErr != nil {
 			// The row is failed but the record and slot are still held, and
