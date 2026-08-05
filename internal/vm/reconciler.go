@@ -121,6 +121,14 @@ type Reconciler struct {
 	driftSeen   map[string]time.Time
 	autoFailLog []time.Time // timestamps of recent auto-fail actions
 
+	// pendingRelease holds VMs whose reap was already decided and whose unit
+	// was already stopped, but whose resource release did not complete. Every
+	// drift rule that reaps a live VM matches on an ACTIVE unit, which its own
+	// stop then retires — so once a release is abandoned, no rule ever looks at
+	// that VM again. This set is the only thing that remembers, and
+	// retryPendingReleases is where the decision gets finished.
+	pendingRelease map[string]struct{}
+
 	// passCount counts completed reconcile passes, used to run the disk
 	// scan on a slower sub-cadence. Only touched from the single Run loop.
 	passCount uint64
@@ -132,10 +140,11 @@ type Reconciler struct {
 // NewReconciler creates a reconciler bound to a Manager.
 func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
 	return &Reconciler{
-		mgr:          mgr,
-		cfg:          cfg,
-		driftSeen:    make(map[string]time.Time),
-		prevKeptLive: -1,
+		mgr:            mgr,
+		cfg:            cfg,
+		driftSeen:      make(map[string]time.Time),
+		pendingRelease: make(map[string]struct{}),
+		prevKeptLive:   -1,
 	}
 }
 
@@ -658,6 +667,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
+	// Finish reaps whose release was abandoned earlier. Runs last so a
+	// deferral recorded by this pass is retried on the next one, giving a
+	// stopped unit time to reach a terminal state in between.
+	r.retryPendingReleases(ctx)
+
 	// Drift 6 (detect-only): per-sandbox dirs on disk with no live row. Runs
 	// on a slower sub-cadence so the filesystem walk doesn't ride every tick.
 	r.passCount++
@@ -1156,6 +1170,10 @@ func (r *Reconciler) markStale(vmID string) error {
 	// cause ReattachAll to resurrect the stale record on next restart, so a
 	// failure here abandons the whole cleanup rather than half-applying it.
 	if err := r.mgr.state.Delete(vmID); err != nil {
+		// The caller's rule cannot come back for this: it matched a live unit
+		// and has already stopped it. Remember the unfinished release here so
+		// every caller inherits the retry, rather than each growing its own.
+		r.notePendingRelease(vmID)
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to delete stale state")
 		return err
 	}
@@ -1171,9 +1189,63 @@ func (r *Reconciler) markStale(vmID string) error {
 
 	r.mu.Lock()
 	delete(r.driftSeen, vmID)
+	delete(r.pendingRelease, vmID)
 	r.mu.Unlock()
 
 	r.mgr.log.Warn().Str("component", "reconciler").Str("vm_id", vmID).
 		Str("action", "mark_stale").Msg("reconciler: cleaned up stale VM record")
 	return nil
+}
+
+func (r *Reconciler) notePendingRelease(vmID string) {
+	r.mu.Lock()
+	r.pendingRelease[vmID] = struct{}{}
+	r.mu.Unlock()
+}
+
+func (r *Reconciler) pendingReleaseIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := make([]string, 0, len(r.pendingRelease))
+	for id := range r.pendingRelease {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// retryPendingReleases finishes reaps whose resource release was abandoned.
+//
+// It takes no destructive decision of its own — the rule that stopped the unit
+// already made and budgeted that call, and this only completes it — so it
+// charges no auto-fail budget and waits out no grace period. Charging again
+// would let one broken store drain the host's whole budget and suppress
+// unrelated drift.
+func (r *Reconciler) retryPendingReleases(ctx context.Context) {
+	for _, id := range r.pendingReleaseIDs() {
+		// A relaunch between passes voids the reap: the record describes a live
+		// VM again, and releasing it would strand a running Firecracker.
+		if r.mgr.instanceRunning(id) {
+			r.mu.Lock()
+			delete(r.pendingRelease, id)
+			r.mu.Unlock()
+			continue
+		}
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue
+		}
+		if r.mgr.instanceRunning(id) {
+			unlockOp()
+			r.mu.Lock()
+			delete(r.pendingRelease, id)
+			r.mu.Unlock()
+			continue
+		}
+		err := r.markStale(id)
+		unlockOp()
+		if err != nil {
+			continue // still unreleasable; the entry survives for the next pass
+		}
+		r.writeAudit(ctx, id, "stale_cleanup", "deferred release completed on a later pass", "release_retry")
+	}
 }

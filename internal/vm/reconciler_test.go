@@ -443,3 +443,94 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 		}
 	})
 }
+
+// A reap whose release fails is remembered and finished on a later pass. No
+// drift rule can do this: they all match on a live unit, and the reap already
+// stopped it, so without this the record and its network slot are held until
+// the next vmd restart.
+func TestRetryPendingReleases(t *testing.T) {
+	newRec := func(t *testing.T) (*Reconciler, string) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "vmd.db")
+		store, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Namespace: "ns-1"}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{
+			log:   zerolog.Nop(),
+			state: store,
+			vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusError}},
+		}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		// Pass 1: the store refuses the delete, so the reap is left unfinished.
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.markStale("vm-1"); err == nil {
+			t.Fatal("an undeletable record must report failure")
+		}
+		return r, path
+	}
+
+	t.Run("failed release is remembered", func(t *testing.T) {
+		r, _ := newRec(t)
+		if got := r.pendingReleaseIDs(); len(got) != 1 || got[0] != "vm-1" {
+			t.Fatalf("an abandoned release must be remembered, got %v", got)
+		}
+	})
+
+	t.Run("later pass completes it", func(t *testing.T) {
+		r, path := newRec(t)
+		reopened, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		r.mgr.state = reopened
+
+		r.retryPendingReleases(context.Background())
+
+		if got := r.pendingReleaseIDs(); len(got) != 0 {
+			t.Fatalf("a completed release must be forgotten, got %v", got)
+		}
+		r.mgr.mu.RLock()
+		_, tracked := r.mgr.vms["vm-1"]
+		r.mgr.mu.RUnlock()
+		if tracked {
+			t.Fatal("the completed retry must drop the instance")
+		}
+		if rec, gerr := reopened.Get("vm-1"); gerr != nil || rec != nil {
+			t.Fatalf("the completed retry must delete the record, got rec=%v err=%v", rec, gerr)
+		}
+	})
+
+	t.Run("a relaunched VM voids the reap", func(t *testing.T) {
+		r, path := newRec(t)
+		reopened, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		r.mgr.state = reopened
+		// The sandbox came back between passes; the stale decision is void.
+		r.mgr.vms["vm-1"].Status = StatusRunning
+
+		r.retryPendingReleases(context.Background())
+
+		if got := r.pendingReleaseIDs(); len(got) != 0 {
+			t.Fatalf("a voided reap must be forgotten, got %v", got)
+		}
+		r.mgr.mu.RLock()
+		_, tracked := r.mgr.vms["vm-1"]
+		r.mgr.mu.RUnlock()
+		if !tracked {
+			t.Fatal("a relaunched VM must never be released by the retry")
+		}
+		if rec, _ := reopened.Get("vm-1"); rec == nil {
+			t.Fatal("a relaunched VM's record must survive")
+		}
+	})
+}
