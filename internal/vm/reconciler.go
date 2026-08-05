@@ -1264,15 +1264,15 @@ func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) bool {
 	}
 	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()
-	rows, err := r.cfg.DB.MarkSandboxFailed(qctx, id)
+	flipped, err := r.cfg.DB.MarkSandboxFailed(qctx, id)
 	if err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to mark sandbox failed in DB")
 		return false
 	}
-	if rows == 0 {
+	if flipped == 0 {
 		r.mgr.log.Info().Str("vm_id", vmID).Msg("reconciler: sandbox no longer active; mark-failed skipped")
 	}
-	return rows > 0
+	return flipped > 0
 }
 
 // writeAudit appends a row to the reconciler_log table. No-op if the DB

@@ -277,16 +277,21 @@ WHERE host_id = sqlc.arg(host_id)
   AND destroyed_at IS NOT NULL
   AND destroyed_at > sqlc.arg(destroyed_after);
 
--- name: MarkSandboxFailed :execrows
+-- name: MarkSandboxFailed :one
 -- Used by the reconciler to mark a sandbox failed when VMD detects it is
 -- actually gone. No team_id filter — the reconciler runs with host scope,
 -- not team scope. Guarded on the lifecycle state, not on updated_at: that
 -- column moves for metadata and network-config edits too, so a version
 -- compare would silently refuse the flip for a sandbox that is just as dead.
--- Returns rows affected so a refused flip is not read as a completed one.
--- The CTE bundles the active-interval close into the same statement so a
--- crash/timeout between the two writes can't leave the interval open and
--- have analytics count the actor as active forever.
+-- The CTEs bundle the interval closes into the same statement so a
+-- crash/timeout between the writes can't leave an interval open and have
+-- analytics count the actor as active forever.
+--
+-- Counts the sandbox CTE, not the last statement: the billing interval is
+-- only opened for teams with billing_metrics_write, so its row count reads 0
+-- for a flip that did happen. Postgres runs every data-modifying CTE exactly
+-- once whether or not the primary query reads its output, so selecting from
+-- `failed` still performs both closes.
 WITH failed AS (
   UPDATE sandbox
   -- auto_delete_at is cleared: the deadline is only meaningful in 'paused',
@@ -303,11 +308,15 @@ closed_active AS (
   WHERE sandbox_id IN (SELECT id FROM failed)
     AND ended_at IS NULL
   RETURNING sandbox_id
+),
+closed_billing AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
+  WHERE sandbox_id IN (SELECT id FROM failed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
 )
-UPDATE sandbox_compute_billing_interval
-SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
-WHERE sandbox_id IN (SELECT id FROM failed)
-  AND ended_at IS NULL;
+SELECT count(*) FROM failed;
 
 -- name: MarkSandboxFailedInTeam :exec
 -- Like MarkSandboxFailed but with a team_id tenant check, used by handler
