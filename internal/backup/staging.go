@@ -174,12 +174,36 @@ func StagePending(root, vmID, token string, files map[string]string) (string, ma
 // standard layout, returning the final path per file name.
 func FinishPendingStage(pendingDir, generation string, staged map[string]string) (map[string]string, error) {
 	final := filepath.Join(filepath.Dir(pendingDir), generation)
-	if err := os.Rename(pendingDir, final); err != nil {
-		if os.IsExist(err) {
-			// A prior attempt already renamed identical content.
+	if pendingDir == final {
+		// Recovery re-running after a completed rename.
+	} else if err := os.Rename(pendingDir, final); err != nil {
+		if !os.IsExist(err) && !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		// The destination exists, but existence is not proof of
+		// completeness: the worker staging path also creates generation
+		// directories, and an interrupted one leaves residue under this
+		// exact name. Only a destination holding every expected file at
+		// the staged size may absorb the pending copy; anything less is
+		// replaced by it.
+		complete := true
+		for name, src := range staged {
+			sfi, serr := os.Stat(src)
+			dfi, derr := os.Stat(filepath.Join(final, name))
+			if serr != nil || derr != nil || sfi.Size() != dfi.Size() {
+				complete = false
+				break
+			}
+		}
+		if complete {
 			_ = os.RemoveAll(pendingDir)
 		} else {
-			return nil, err
+			if err := os.RemoveAll(final); err != nil {
+				return nil, err
+			}
+			if err := os.Rename(pendingDir, final); err != nil {
+				return nil, err
+			}
 		}
 	}
 	out := make(map[string]string, len(staged))

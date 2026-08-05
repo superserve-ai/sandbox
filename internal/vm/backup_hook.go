@@ -94,16 +94,12 @@ func pauseManifestComplete(manifest []ManifestEntry) bool {
 // and the uploader's pre-verification abandons that generation, which is
 // the same safe outcome as any mutated source.
 func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath, diskBasePath string, log zerolog.Logger) []ManifestEntry {
-	// NOTHING here may scale with disk size. Pause latency is the
-	// product metric the layered-diff campaign bought down from ~10s to
-	// ~500ms, and synchronous manifest hashing put an O(apparent disk
-	// size) term back on this path (a hole-oblivious full read of a
-	// multi-GB overlay whose real data averages tens of MB). All
-	// size-dependent hashing therefore runs in the detached worker under
-	// its at-rest proofs and ten-minute budget; the RPC path pays only a
-	// marker write and a stat, plus the ~tens-of-KB vmstate hash so the
-	// control plane's manifest rows get the one artifact that is cheap
-	// to record synchronously.
+	// NOTHING here may scale with apparent disk size: pause latency must
+	// track what the guest dirtied, and hashing a sparse overlay's full
+	// apparent content costs seconds regardless of hasher. All
+	// size-dependent hashing runs in the detached worker; the RPC path
+	// pays a marker write, an O(real bytes) staging copy, and the
+	// tens-of-KB vmstate hash for the control plane's manifest rows.
 	manifest := collectVMStateEntry(ctx, snapshotPath, log)
 	if m.backupEnqueue == nil {
 		return manifest
@@ -168,6 +164,7 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 	defer cancel()
 	if pb.StagedDir != "" {
+		pb = m.resolveStagedLocation(pb)
 		// Immutable pause-time copies need no at-rest proof and are
 		// never superseded by a resume or even a destroy: the copies ARE
 		// the pause's bytes, a running guest cannot mutate them, and the
@@ -394,6 +391,21 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 		}
 	}
 	gen := backup.GenerationKey(files)
+	// Persist the FINAL locations before renaming, and require the write
+	// to land: with the marker updated first, a crash at any later point
+	// recovers (the fallback below finds the pending directory when the
+	// rename has not happened yet), while a failed marker write simply
+	// returns with the still-accurate pending-path marker for a later
+	// retry. Proceeding past a failed write would risk a marker pointing
+	// at a path the rename is about to delete.
+	final := pb
+	final.StagedDir = filepath.Join(filepath.Dir(pb.StagedDir), gen)
+	final.SnapshotPath = filepath.Join(final.StagedDir, "vmstate.snap")
+	final.DiskPath = filepath.Join(final.StagedDir, "rootfs.ext4")
+	if !m.persistPendingBackupChecked(final, log) {
+		m.healPendingBackup(pb, log)
+		return
+	}
 	finalPaths, err := backup.FinishPendingStage(pb.StagedDir, gen, map[string]string{
 		"vmstate.snap": pb.SnapshotPath,
 		"rootfs.ext4":  pb.DiskPath,
@@ -401,27 +413,33 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 	if err != nil {
 		log.Warn().Err(err).Str("vm_id", pb.VMID).
 			Msg("staged pause backup: rename to generation failed; keeping pending record")
-		m.healPendingBackup(pb, log)
 		return
 	}
+	pb = final
 	for i := range entries {
 		if p, ok := finalPaths[entries[i].FileName]; ok {
 			entries[i].Path = p
 		}
 	}
-	// Persist the renamed locations BEFORE the enqueue attempt: a crash
-	// past the rename would otherwise leave a durable marker pointing at
-	// the deleted pending directory, and recovery would misread the
-	// generation as missing and drop it.
-	pb.StagedDir = filepath.Dir(finalPaths["rootfs.ext4"])
-	pb.SnapshotPath = finalPaths["vmstate.snap"]
-	pb.DiskPath = finalPaths["rootfs.ext4"]
-	m.healPendingBackup(pb, log)
 	if ok, _ := m.enqueueBackup(pb.VMID, entries); ok {
 		m.deletePendingBackupIf(pb, log)
 		return
 	}
 	go m.retryEnqueue(pb, entries, log)
+}
+
+// persistPendingBackupChecked is persistPendingBackup with a hard
+// success requirement, for ordering-sensitive callers.
+func (m *Manager) persistPendingBackupChecked(pb PendingBackup, log zerolog.Logger) bool {
+	if m.state == nil {
+		return true
+	}
+	if err := m.state.PutPendingBackupIfOwner(pb); err != nil {
+		log.Warn().Err(err).Str("vm_id", pb.VMID).
+			Msg("persist of renamed staged paths failed; keeping pending-path marker")
+		return false
+	}
+	return true
 }
 
 // baseSHAFromEntries returns the disk entry's base digest.
@@ -432,6 +450,25 @@ func baseSHAFromEntries(entries []ManifestEntry) string {
 		}
 	}
 	return ""
+}
+
+// resolveStagedLocation handles the crash window between the marker
+// adopting final generation paths and the rename that creates them: if
+// the marker's staged files are absent but the pause's pending-token
+// directory still exists, the worker resumes from the pending location
+// and re-runs the persist-then-rename sequence.
+func (m *Manager) resolveStagedLocation(pb PendingBackup) PendingBackup {
+	if !fileMissing(pb.DiskPath) || pb.Token == "" {
+		return pb
+	}
+	pendingDir := filepath.Join(filepath.Dir(pb.StagedDir), "pending-"+pb.Token)
+	if _, err := os.Stat(pendingDir); err != nil {
+		return pb
+	}
+	pb.StagedDir = pendingDir
+	pb.SnapshotPath = filepath.Join(pendingDir, "vmstate.snap")
+	pb.DiskPath = filepath.Join(pendingDir, "rootfs.ext4")
+	return pb
 }
 
 // dropStagedPending clears an unrecoverable staged marker and its
