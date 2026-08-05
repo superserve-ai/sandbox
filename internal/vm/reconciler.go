@@ -1351,6 +1351,11 @@ func (r *Reconciler) refundAutoFailSlot() {
 // when the unit leaves the active set, so its retry waits out one more grace.
 func (r *Reconciler) finalizeErrorReap(ctx context.Context, vmID, marker, action, reason, driftKind string, staleErr error) {
 	if staleErr != nil {
+		// Same discipline as finalizeRelease: the deferred entry must carry
+		// this rule's marker, or a completed retry retires the record while
+		// the errunit:/errdead: timestamp lives on to rob the id's next
+		// Error episode of its grace period.
+		r.tagPendingRelease(vmID, marker)
 		r.writeAudit(ctx, vmID, "stale_cleanup_failed", reason+"; record not deleted", driftKind)
 		return
 	}

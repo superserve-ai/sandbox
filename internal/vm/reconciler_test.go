@@ -1089,3 +1089,54 @@ func TestRetryPendingReleases_InPlaceAdoptionVoids(t *testing.T) {
 		}
 	})
 }
+
+// Drift 8's deferral must carry its marker into the pending release, like
+// every other deferring rule: a retry that completes without it retires the
+// record while the errdead: timestamp survives, robbing the id's next Error
+// episode of its grace period.
+func TestFinalizeErrorReap_TagsDeferredRelease(t *testing.T) {
+	stubUnitTerminal(t, true)
+	path := filepath.Join(t.TempDir(), "vmd.db")
+	store, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusError}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	marker := "errdead:vm-1"
+	r.driftSeen[marker] = time.Now().Add(-2 * r.cfg.GracePeriod)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	staleErr := r.markStale(context.Background(), "vm-1")
+	if staleErr == nil {
+		t.Fatal("an undeletable record must report failure")
+	}
+	r.finalizeErrorReap(context.Background(), "vm-1", marker, "stale_cleanup",
+		"error record with no unit", "boltdb_error_unit_missing", staleErr)
+
+	reopened, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	m.state = reopened
+	r.retryPendingReleases(context.Background())
+
+	if rec, _ := reopened.Get("vm-1"); rec != nil {
+		t.Fatal("the retry must complete the release")
+	}
+	r.mu.Lock()
+	_, kept := r.driftSeen[marker]
+	r.mu.Unlock()
+	if kept {
+		t.Fatal("a completed retry must retire the Drift 8 marker it was deferred under")
+	}
+}
