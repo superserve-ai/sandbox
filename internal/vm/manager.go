@@ -874,6 +874,17 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		if !fileExists(snapshotPath) || !fileExists(memPath) {
 			return "", "", nil, status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
 		}
+		// The paused status may only exist in memory: the original pause sets it
+		// before persisting, so a failed write leaves the durable record reading
+		// Running behind a stopped unit — which the next reattach cleans up as
+		// stale, taking the record with it. Re-record before reporting success,
+		// or this retry launders that loss into a completed pause.
+		switch wrote, perr := m.persistStateIfPresent(inst); {
+		case perr != nil:
+			return "", "", nil, fmt.Errorf("record paused state for vm %s: %w", vmID, perr)
+		case !wrote:
+			return "", "", nil, status.Errorf(codes.NotFound, "vm %s destroyed during pause", vmID)
+		}
 		log.Info().Msg("pause: VM already paused, returning existing snapshot")
 		// The recorded StatusPaused is not proof the unit stopped: the
 		// original pause records it even when both stop attempts failed

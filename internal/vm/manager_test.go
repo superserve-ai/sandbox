@@ -2167,3 +2167,68 @@ func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
 		t.Fatalf("kept record must read Error so no retry adopts a socket-less VM, got %s", kept.Status)
 	}
 }
+
+// The paused status is set in memory before it is persisted, so a failed write
+// leaves the durable record reading Running behind a stopped unit — which the
+// next reattach deletes as stale. The retry must re-record it rather than
+// report a pause whose only trace is in memory.
+func TestPauseVM_RetryRepersistsPausedState(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dbPath := filepath.Join(dir, "vmd.db")
+	store, err := OpenStateStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The durable record still reads Running: the original pause's write failed.
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusPaused,
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	m := &Manager{
+		log:      zerolog.Nop(),
+		state:    store,
+		vms:      map[string]*VMInstance{"vm-1": inst},
+		unitDead: func(context.Context, string) bool { return false }, // skip the retry backup
+	}
+
+	// Retry 1: the store is still refusing writes, so the pause must not be
+	// reported complete.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", dir); err == nil {
+		t.Fatal("a retry that cannot record the paused state must not report success")
+	}
+
+	// Retry 2: the store recovers and the retry makes the paused state durable.
+	reopened, err := OpenStateStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	m.state = reopened
+	gotSnap, gotMem, _, err := m.PauseVM(context.Background(), "vm-1", dir)
+	if err != nil {
+		t.Fatalf("retry must succeed once the store recovers: %v", err)
+	}
+	if gotSnap != snapPath || gotMem != memPath {
+		t.Fatalf("retry must return the recorded artifacts, got %q %q", gotSnap, gotMem)
+	}
+	rec, err := reopened.Get("vm-1")
+	if err != nil || rec == nil {
+		t.Fatalf("record must survive, got rec=%v err=%v", rec, err)
+	}
+	if rec.Status != StatusPaused {
+		t.Fatalf("the retry must make Paused durable, record still reads %v", rec.Status)
+	}
+}
