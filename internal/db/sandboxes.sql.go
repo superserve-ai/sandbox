@@ -1875,7 +1875,7 @@ func (q *Queries) LockSandboxForPreviewMutation(ctx context.Context, arg LockSan
 	return id, err
 }
 
-const markSandboxFailed = `-- name: MarkSandboxFailed :exec
+const markSandboxFailed = `-- name: MarkSandboxFailed :execrows
 WITH failed AS (
   UPDATE sandbox
   -- auto_delete_at is cleared: the deadline is only meaningful in 'paused',
@@ -1883,7 +1883,7 @@ WITH failed AS (
   -- ever returned to 'paused' by a recovery path.
   SET status = 'failed', auto_delete_at = NULL, updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
-    AND sandbox.updated_at = $2
+    AND sandbox.status = 'active'
   RETURNING id
 ),
 closed_active AS (
@@ -1899,23 +1899,23 @@ WHERE sandbox_id IN (SELECT id FROM failed)
   AND ended_at IS NULL
 `
 
-type MarkSandboxFailedParams struct {
-	ID                uuid.UUID `json:"id"`
-	ObservedUpdatedAt time.Time `json:"observed_updated_at"`
-}
-
 // Used by the reconciler to mark a sandbox failed when VMD detects it is
 // actually gone. No team_id filter — the reconciler runs with host scope,
-// not team scope. Version-guarded: the row flips only if untouched since
-// the reconciler's pass-start observation (every lifecycle transition bumps
-// updated_at), so a stale snapshot can never overwrite a concurrent
-// relaunch or resume that moved the row on. The CTE bundles the
-// active-interval close into the same statement so a crash/timeout between
-// the two writes can't leave the interval open and have analytics count
-// the actor as active forever.
-func (q *Queries) MarkSandboxFailed(ctx context.Context, arg MarkSandboxFailedParams) error {
-	_, err := q.db.Exec(ctx, markSandboxFailed, arg.ID, arg.ObservedUpdatedAt)
-	return err
+// not team scope. Guarded on the lifecycle state, not on updated_at: that
+// column moves for metadata and network-config edits too, so a version
+// compare would silently refuse the flip for a sandbox that is just as dead.
+// The status check is what the reconciler actually means, and a concurrent
+// relaunch or resume is caught by the caller's own re-check under the VM's
+// lifecycle lock. Returns rows affected so a refused flip is not read as a
+// completed one. The CTE bundles the active-interval close into the same
+// statement so a crash/timeout between the two writes can't leave the
+// interval open and have analytics count the actor as active forever.
+func (q *Queries) MarkSandboxFailed(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, markSandboxFailed, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const markSandboxFailedInTeam = `-- name: MarkSandboxFailedInTeam :exec

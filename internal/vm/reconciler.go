@@ -316,14 +316,33 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if !r.gracePeriodElapsed(id, now) {
 				continue
 			}
+			// Drift 7's discipline: lock BEFORE spending budget, then re-check
+			// the AUTHORITATIVE in-memory record under it. The pass snapshot is
+			// stale by now — a resume can have relaunched this VM since — and
+			// the row's status is the only DB-side guard, so this is what stops
+			// a live VM being failed.
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			if r.mgr.instanceRunning(id) {
+				unlockOp()
+				r.clearDrift(id)
+				continue
+			}
 			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
 				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "db_active_systemd_missing")
 				continue
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "db_active_systemd_missing").
 				Msg("DB says active but VM is dead — marking failed")
-			r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
+			flipped := r.markFailedInDB(ctx, id)
 			r.markStale(id)
+			unlockOp()
+			if !flipped {
+				continue
+			}
 			r.writeAudit(ctx, id, "mark_failed", "VM dead while DB said active", "db_active_systemd_missing")
 		}
 	}
@@ -427,7 +446,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// behind a dead unit costs another grace+budget cycle via the
 			// dead-VM rule). Detach from the pass context, bounded.
 			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-			r.markFailedInDB(persistCtx, id, dbSandboxes[id].Sandbox.UpdatedAt)
+			r.markFailedInDB(persistCtx, id)
 			r.markStale(id)
 			r.writeAudit(persistCtx, id, "mark_failed", "empty Firecracker shell while DB said active", "fc_empty_shell")
 			persistCancel()
@@ -571,7 +590,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// branch below).
 		if dbSandboxes != nil {
 			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
-				r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
+				r.markFailedInDB(ctx, id)
 			}
 		}
 		r.finalizeErrorReap(ctx, id, "errunit:"+id, "error_unit_stop",
@@ -620,7 +639,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// wedge: the next pass's snapshot reads 'failed'.
 			if dbSandboxes != nil {
 				if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive && r.consumeAutoFailBudget(id) {
-					r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
+					r.markFailedInDB(ctx, id)
 					r.writeAudit(ctx, id, "mark_failed", "wedged error VM: row flipped while awaiting terminal unit", "boltdb_error_unit_wedged")
 				}
 			}
@@ -637,7 +656,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// compare-and-set: a relaunch may own the row by now).
 		if dbSandboxes != nil {
 			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
-				r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
+				r.markFailedInDB(ctx, id)
 			}
 		}
 		r.finalizeErrorReap(ctx, id, "errdead:"+id, "stale_cleanup",
@@ -797,7 +816,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			log.Warn().Str("vm_id", id).Str("snapshot_path", snapPath).
 				Str("drift", "paused_snapshot_missing").
 				Msg("paused sandbox snapshot file missing — marking failed")
-			r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
+			r.markFailedInDB(ctx, id)
 			r.writeAudit(ctx, id, "mark_failed", "snapshot file missing", "paused_snapshot_missing")
 			r.clearDrift("paused:" + id)
 		}
@@ -1231,20 +1250,31 @@ const dbQueryTimeout = 5 * time.Second
 // 'active' again. The underlying query's CTE also closes any open
 // sandbox_active_interval row atomically, so a crash/timeout between the
 // two writes is unreachable. No-op if the DB is not configured.
-func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string, observed time.Time) {
+// markFailedInDB flips a sandbox row to failed. Reports whether the row
+// actually moved: the query only touches an 'active' row, so a resume that
+// took the row since the pass snapshot refuses the flip, and a caller that
+// read that as success would clear its drift and audit a transition that
+// never happened.
+func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) bool {
 	if r.cfg.DB == nil {
-		return
+		return true
 	}
 	id, err := uuid.Parse(vmID)
 	if err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: invalid vm_id for DB mark-failed")
-		return
+		return false
 	}
 	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()
-	if err := r.cfg.DB.MarkSandboxFailed(qctx, db.MarkSandboxFailedParams{ID: id, ObservedUpdatedAt: observed}); err != nil {
+	rows, err := r.cfg.DB.MarkSandboxFailed(qctx, id)
+	if err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to mark sandbox failed in DB")
+		return false
 	}
+	if rows == 0 {
+		r.mgr.log.Info().Str("vm_id", vmID).Msg("reconciler: sandbox no longer active; mark-failed skipped")
+	}
+	return rows > 0
 }
 
 // writeAudit appends a row to the reconciler_log table. No-op if the DB
