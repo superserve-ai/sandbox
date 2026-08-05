@@ -90,29 +90,13 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 		// serves every generation on the host (reflink makes it free;
 		// the copy fallback pays once per base, off the RPC path).
 		if f.BaseSHA256 != "" && f.BasePath != "" {
-			basesDir := filepath.Join(root, "bases")
-			if err := os.MkdirAll(basesDir, 0o700); err != nil {
-				return false, err
-			}
-			stagedBase := filepath.Join(basesDir, f.BaseSHA256)
-			// Reuse renews the mtime under the sweep's grace: an aged
-			// unreferenced base being adopted by a new pause must not
-			// be reaped by a sweep holding a reference snapshot taken
-			// before this enqueue. A renewal that joined an in-flight
-			// deletion re-checks and falls through to re-staging.
-			if renewedExists(stagedBase) {
-				// kept: renewed under the sweep's flight key.
-			} else {
-				if err := snapshotFileMode(stagedBase, f.BasePath, cloneOnly); err != nil {
-					if cloneOnly {
-						all = false
-						continue
-					}
-					return false, fmt.Errorf("stage base %s: %w", f.BaseSHA256, err)
+			stagedBase, err := StageSharedBase(root, f.BasePath, f.BaseSHA256, cloneOnly)
+			if err != nil {
+				if cloneOnly {
+					all = false
+					continue
 				}
-				if err := syncDir(basesDir); err != nil {
-					return false, err
-				}
+				return false, fmt.Errorf("stage base %s: %w", f.BaseSHA256, err)
 			}
 			task.Files[i].BaseStagedPath = stagedBase
 		}
@@ -160,6 +144,15 @@ func StagePending(root, vmID, token string, files map[string]string) (string, ma
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", nil, err
 	}
+	// The chain's own dirents must be durable before the Bolt marker
+	// commits, or a power loss leaves a durable marker pointing at a
+	// vanished pending directory.
+	if err := syncDir(filepath.Join(root, vmID)); err != nil {
+		return "", nil, err
+	}
+	if err := syncDir(root); err != nil {
+		return "", nil, err
+	}
 	staged := make(map[string]string, len(files))
 	for name, src := range files {
 		dst := filepath.Join(dir, name)
@@ -197,6 +190,30 @@ func FinishPendingStage(pendingDir, generation string, staged map[string]string)
 		return nil, err
 	}
 	return out, nil
+}
+
+// StageSharedBase ensures a base image's content snapshot exists under
+// the staging root's bases tree and returns its path. Reuse renews the
+// mtime under the sweep's grace: an aged unreferenced base being
+// adopted by a new pause must not be reaped by a sweep holding a
+// reference snapshot taken before this enqueue; a renewal that joined
+// an in-flight deletion re-checks and falls through to re-staging.
+func StageSharedBase(root, basePath, baseSHA string, cloneOnly bool) (string, error) {
+	basesDir := filepath.Join(root, "bases")
+	if err := os.MkdirAll(basesDir, 0o700); err != nil {
+		return "", err
+	}
+	stagedBase := filepath.Join(basesDir, baseSHA)
+	if renewedExists(stagedBase) {
+		return stagedBase, nil
+	}
+	if err := snapshotFileMode(stagedBase, basePath, cloneOnly); err != nil {
+		return "", err
+	}
+	if err := syncDir(basesDir); err != nil {
+		return "", err
+	}
+	return stagedBase, nil
 }
 
 // stagingFlights serializes concurrent writers of one staged

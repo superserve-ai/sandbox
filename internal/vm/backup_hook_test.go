@@ -878,10 +878,10 @@ func TestBackupPausePathIsDiskSizeIndependent(t *testing.T) {
 	}
 }
 
-// The Codex finding on the async move: an immediate resume must not
-// cost the pause its backup. With staging enabled, the pause stages
-// immutable copies inline, and the worker uploads them even though the
-// sandbox is running again by the time it looks.
+// An immediate resume must not cost the pause its backup: with staging
+// enabled, the pause snapshots immutable copies inline under the VM
+// operation lock, and the worker uploads them even though the sandbox
+// is running again by the time it looks.
 func TestFastResumeKeepsBackupViaInlineStaging(t *testing.T) {
 	dir := t.TempDir()
 	staging := filepath.Join(dir, "staging")

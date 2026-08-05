@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -375,6 +376,23 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 			BasePath: e.BasePath, BaseSHA256: e.BaseSHA256,
 		})
 	}
+	// The base joins the staging tree too (immutable, identity-pinned
+	// above), so the enqueued task is FULLY staged and needs no at-rest
+	// fallback, which could not succeed for a resumed sandbox anyway.
+	if pb.DiskBasePath != "" {
+		stagedBase, err := backup.StageSharedBase(m.backupStaging, pb.DiskBasePath, baseSHAFromEntries(entries), false)
+		if err != nil {
+			log.Warn().Err(err).Str("vm_id", pb.VMID).
+				Msg("staged pause backup: base staging failed; keeping pending record")
+			m.healPendingBackup(pb, log)
+			return
+		}
+		for i := range entries {
+			if entries[i].BasePath != "" {
+				entries[i].BaseStagedPath = stagedBase
+			}
+		}
+	}
 	gen := backup.GenerationKey(files)
 	finalPaths, err := backup.FinishPendingStage(pb.StagedDir, gen, map[string]string{
 		"vmstate.snap": pb.SnapshotPath,
@@ -391,11 +409,29 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 			entries[i].Path = p
 		}
 	}
+	// Persist the renamed locations BEFORE the enqueue attempt: a crash
+	// past the rename would otherwise leave a durable marker pointing at
+	// the deleted pending directory, and recovery would misread the
+	// generation as missing and drop it.
+	pb.StagedDir = filepath.Dir(finalPaths["rootfs.ext4"])
+	pb.SnapshotPath = finalPaths["vmstate.snap"]
+	pb.DiskPath = finalPaths["rootfs.ext4"]
+	m.healPendingBackup(pb, log)
 	if ok, _ := m.enqueueBackup(pb.VMID, entries); ok {
 		m.deletePendingBackupIf(pb, log)
 		return
 	}
 	go m.retryEnqueue(pb, entries, log)
+}
+
+// baseSHAFromEntries returns the disk entry's base digest.
+func baseSHAFromEntries(entries []ManifestEntry) string {
+	for _, e := range entries {
+		if e.BaseSHA256 != "" {
+			return e.BaseSHA256
+		}
+	}
+	return ""
 }
 
 // dropStagedPending clears an unrecoverable staged marker and its
