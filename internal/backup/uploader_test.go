@@ -1359,30 +1359,6 @@ func TestEnqueueDedupeUpgradesPaths(t *testing.T) {
 	}
 }
 
-// Clone-only staging on a filesystem without reflink support degrades
-// cleanly: nothing staged, original paths untouched, no error.
-func TestStageTaskCloneFallsBackWithoutReflink(t *testing.T) {
-	dir := t.TempDir()
-	orig := filepath.Join(dir, "rootfs.ext4")
-	if err := os.WriteFile(orig, []byte("bytes"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	task := Task{SandboxID: "sb", Generation: "gen",
-		Files: []TaskFile{{Name: "rootfs.ext4", Path: orig, SHA256: "aa"}}}
-	all, err := StageTaskClone(filepath.Join(dir, "staging"), &task)
-	if err != nil {
-		t.Fatalf("clone-only staging errored: %v", err)
-	}
-	// This test tree may or may not sit on a reflink filesystem; either
-	// every file staged or none did, and unstaged files keep originals.
-	if !all && task.Files[0].Path != orig {
-		t.Fatalf("unstaged file path rewritten to %s", task.Files[0].Path)
-	}
-	if all && task.Files[0].Path == orig {
-		t.Fatal("allStaged reported but path not rewritten")
-	}
-}
-
 // A shared base this host already verified must not be streamed again:
 // prod bases are multi-GB and every generation re-references them, so a
 // redundant stream per generation pins the bandwidth cap and puts the
@@ -1646,5 +1622,118 @@ func TestLegacyUnscopedVerificationRecordsStillTrusted(t *testing.T) {
 	}
 	if ok, err := j.WasVerified(store.Identity()+"\x00"+object, time.Now()); err != nil || !ok {
 		t.Fatalf("migrated record lost: ok=%v err=%v", ok, err)
+	}
+}
+
+// The pending-to-generation absorb requires identical vmstate bytes;
+// residue and byte-divergent destinations are replaced by the complete
+// pending copy.
+func TestFinishPendingStageAbsorbAndReplace(t *testing.T) {
+	root := t.TempDir()
+	mk := func(dir string, vmstate string, withDisk bool) {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "vmstate.snap"), []byte(vmstate), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if withDisk {
+			if err := os.WriteFile(filepath.Join(dir, "rootfs.ext4"), []byte("diskdata"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	stagedOf := func(dir string) map[string]string {
+		return map[string]string{
+			"vmstate.snap": filepath.Join(dir, "vmstate.snap"),
+			"rootfs.ext4":  filepath.Join(dir, "rootfs.ext4"),
+		}
+	}
+
+	// Identical destination: absorbed, pending removed.
+	p1 := filepath.Join(root, "sb", "pending-a")
+	g1 := filepath.Join(root, "sb", "gen-1")
+	mk(p1, "same-state", true)
+	mk(g1, "same-state", true)
+	if _, err := FinishPendingStage(p1, "gen-1", stagedOf(p1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p1); !os.IsNotExist(err) {
+		t.Fatal("identical destination did not absorb the pending copy")
+	}
+
+	// Residue destination (missing disk): replaced by the pending copy.
+	p2 := filepath.Join(root, "sb", "pending-b")
+	g2 := filepath.Join(root, "sb", "gen-2")
+	mk(p2, "state-b", true)
+	mk(g2, "state-b", false)
+	final, err := FinishPendingStage(p2, "gen-2", stagedOf(p2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(final["rootfs.ext4"]); err != nil {
+		t.Fatalf("residue destination not replaced: %v", err)
+	}
+
+	// Byte-divergent vmstate: replaced, never absorbed.
+	p3 := filepath.Join(root, "sb", "pending-c")
+	g3 := filepath.Join(root, "sb", "gen-3")
+	mk(p3, "state-c-pending", true)
+	mk(g3, "state-c-DIFFER!", true)
+	final3, err := FinishPendingStage(p3, "gen-3", stagedOf(p3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(final3["vmstate.snap"])
+	if err != nil || string(got) != "state-c-pending" {
+		t.Fatalf("divergent destination absorbed: %q err=%v", got, err)
+	}
+	_ = g3
+}
+
+// Pending-token directories are protected by the long orphan horizon,
+// not the short residue grace: a renewed (live) one survives sweeps,
+// and only a long-dead orphan is reaped.
+func TestSweepStagingProtectsLivePendingDirs(t *testing.T) {
+	root := t.TempDir()
+	j, _ := testJournal(t)
+	live := filepath.Join(root, "sb", "pending-live")
+	orphan := filepath.Join(root, "sb", "pending-orphan")
+	for _, d := range []string{live, orphan} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Age both past the ordinary grace; the live one got renewed by a
+	// worker two hours ago is still fine, the orphan is ancient.
+	twoHours := time.Now().Add(-2 * time.Hour)
+	ancient := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(live, twoHours, twoHours); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(orphan, ancient, ancient); err != nil {
+		t.Fatal(err)
+	}
+	SweepStaging(root, j, zerolog.Nop())
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("live pending dir swept: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatal("ancient orphan pending dir survived")
+	}
+}
+
+// The RPC-path staging respects the caller's deadline: an exhausted
+// deadline falls back rather than copying.
+func TestStagePendingRespectsDeadline(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "rootfs.ext4")
+	if err := os.WriteFile(src, []byte("bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second))
+	defer cancel()
+	if _, _, err := StagePending(ctx, root, "sb", "tok", "", map[string]string{"rootfs.ext4": src}); !errors.Is(err, ErrStageTooLarge) {
+		t.Fatalf("err = %v, want deadline fallback", err)
 	}
 }

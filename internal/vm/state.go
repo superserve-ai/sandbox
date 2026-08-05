@@ -635,6 +635,13 @@ type PendingBackup struct {
 	// marker was created: the rehash must prove it is hashing the
 	// pause-time base, not a same-path replacement.
 	BaseIdentity string `json:"base_identity,omitempty"`
+	// OrigSnapshotPath and OrigDiskPath preserve the pause-time artifact
+	// locations when staging repointed the primary paths at copies: if
+	// the copies are ever lost (sweep after a very long outage), a
+	// still-paused sandbox can fall back to the at-rest flow over the
+	// originals instead of dropping coverage.
+	OrigSnapshotPath string `json:"orig_snapshot_path,omitempty"`
+	OrigDiskPath     string `json:"orig_disk_path,omitempty"`
 	// StagedDir is the pending staging directory holding immutable
 	// pause-time copies of the mutable artifacts. When set, the worker
 	// hashes those copies and needs no at-rest proof for them: a resume
@@ -692,6 +699,23 @@ func (s *StateStore) DeletePendingBackupIf(vmID, token string) error {
 		}
 		return b.Delete([]byte(vmID))
 	})
+}
+
+// GetPendingBackup returns a VM's pending-backup marker, if any.
+func (s *StateStore) GetPendingBackup(vmID string) (PendingBackup, bool, error) {
+	var p PendingBackup
+	found := false
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(pendingBackupBucketName).Get([]byte(vmID))
+		if v == nil {
+			return nil
+		}
+		if json.Unmarshal(v, &p) == nil && p.VMID != "" {
+			found = true
+		}
+		return nil
+	})
+	return p, found, err
 }
 
 // ListPendingBackups returns every pause still owing its backup enqueue.

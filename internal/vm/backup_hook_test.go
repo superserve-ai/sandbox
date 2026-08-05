@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -869,6 +870,7 @@ func TestBackupPausePathIsDiskSizeIndependent(t *testing.T) {
 		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
 		unitDead: func(context.Context, string) bool { return false }, // worker holds off; only the sync path runs
 	}
+	m.backupStaging = filepath.Join(dir, "staging")
 	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
 
 	start := time.Now()
@@ -924,5 +926,188 @@ func TestFastResumeKeepsBackupViaInlineStaging(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("fast-resumed pause never enqueued from its staged copies")
+	}
+}
+
+// A pin created at pause time keeps the base restorable past template
+// GC: destroy plus base deletion after the pause must still upload the
+// pause-time pair.
+func TestBasePinSurvivesBaseDeletion(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "overlay.ext4")
+	base := filepath.Join(dir, "base.ext4")
+	for p, data := range map[string]string{snap: "vm state", disk: "overlay", base: "base bytes"} {
+		if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusRunning}},
+		unitDead: func(context.Context, string) bool { return false },
+	}
+	m.backupStaging = staging
+	// Hold the worker: enqueue blocks until the base is deleted.
+	proceed := make(chan struct{})
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		<-proceed
+		tasks <- task
+		return nil
+	})
+
+	m.backupPause(context.Background(), "vm-1", snap, disk, base, zerolog.Nop())
+	// Template GC wins the race before the worker uploads.
+	if err := os.Remove(base); err != nil {
+		t.Fatal(err)
+	}
+	close(proceed)
+
+	select {
+	case task := <-tasks:
+		want := sha256.Sum256([]byte("base bytes"))
+		var got string
+		for _, f := range task.Files {
+			if f.BaseSHA256 != "" {
+				got = f.BaseSHA256
+			}
+		}
+		if got != hex.EncodeToString(want[:]) {
+			t.Fatalf("base digest = %s, want the pinned pause-time bytes", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("pinned pause never uploaded after base deletion")
+	}
+}
+
+// An unpinned marker whose base is definitively gone must drop, not
+// spin: ENOENT is terminal, unlike a transient stat failure.
+func TestUnpinnedMissingBaseIsTerminal(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	stagedDir := filepath.Join(dir, "staging", "vm-1", "pending-tok")
+	if err := os.MkdirAll(stagedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"vmstate.snap", "rootfs.ext4"} {
+		if err := os.WriteFile(filepath.Join(stagedDir, n), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := &Manager{state: st, unitDead: func(context.Context, string) bool { return false }}
+	m.backupStaging = filepath.Join(dir, "staging")
+	m.SetBackupEnqueue(func(task backup.Task) error { t.Fatal("must not enqueue"); return nil })
+
+	pb := PendingBackup{
+		VMID: "vm-1", Token: "tok", StagedDir: stagedDir,
+		SnapshotPath: filepath.Join(stagedDir, "vmstate.snap"),
+		DiskPath:     filepath.Join(stagedDir, "rootfs.ext4"),
+		DiskBasePath: filepath.Join(dir, "deleted-base.ext4"),
+		BaseIdentity: "stale",
+	}
+	if err := st.PutPendingBackup(pb); err != nil {
+		t.Fatal(err)
+	}
+	m.rehashPendingBackup(context.Background(), pb, zerolog.Nop())
+	pending, err := st.ListPendingBackups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending = %+v, want terminal drop for a deleted unpinned base", pending)
+	}
+}
+
+// Lost staged copies fall back to the at-rest flow over the recorded
+// original paths when the sandbox is still paused on them.
+func TestLostStagedCopiesFallBackToOriginals(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("original bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.backupStaging = filepath.Join(dir, "staging")
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	gone := filepath.Join(dir, "staging", "vm-1", "pending-tok")
+	pb := PendingBackup{
+		VMID: "vm-1", Token: "tok", StagedDir: gone,
+		SnapshotPath:     filepath.Join(gone, "vmstate.snap"),
+		DiskPath:         filepath.Join(gone, "rootfs.ext4"),
+		OrigSnapshotPath: snap, OrigDiskPath: disk,
+	}
+	if err := st.PutPendingBackup(pb); err != nil {
+		t.Fatal(err)
+	}
+	m.rehashPendingBackup(context.Background(), pb, zerolog.Nop())
+	select {
+	case task := <-tasks:
+		if task.SandboxID != "vm-1" {
+			t.Fatalf("owner = %q", task.SandboxID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("fallback over originals never enqueued")
+	}
+}
+
+// A control-plane pause retry reuses the live marker instead of paying
+// a second staging copy.
+func TestRetryPauseReusesExistingStagedMarker(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return false }, // workers stall; we inspect dirs
+	}
+	m.backupStaging = staging
+	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+
+	entries, err := os.ReadDir(filepath.Join(staging, "vm-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendings := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "pending-") {
+			pendings++
+		}
+	}
+	if pendings != 1 {
+		t.Fatalf("pending dirs = %d, want the retry to reuse the first copy", pendings)
 	}
 }

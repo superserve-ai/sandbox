@@ -1,6 +1,8 @@
 package backup
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -31,16 +33,6 @@ import (
 func StageTask(root string, task *Task) error {
 	_, err := stageTask(root, task, false)
 	return err
-}
-
-// StageTaskClone stages with reflink clones only, skipping the byte-copy
-// fallback: cheap enough to run inline under the pause operation lock,
-// where quiescence is guaranteed and no at-rest proof is needed. Returns
-// whether EVERY file (bases included) was staged; partially staged tasks
-// keep original paths for the unstaged files and the caller falls back
-// to the off-lock worker for those.
-func StageTaskClone(root string, task *Task) (bool, error) {
-	return stageTask(root, task, true)
 }
 
 func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
@@ -122,9 +114,23 @@ var ErrStageTooLarge = errors.New("packed size exceeds the inline staging budget
 // worker can hash them at leisure with no at-rest race. Returns the
 // staged directory and the staged path per file name. The copy is
 // O(real bytes), the same scaling as the pause itself.
-func StagePending(root, vmID, token string, files map[string]string) (string, map[string]string, error) {
+// BasePinName is the hard link StagePending creates to the overlay's
+// base image inside the pending directory. A link is O(1) on the RPC
+// path and keeps the base's inode alive past template GC, so a pause
+// followed by an immediate destroy still ships a restorable pair; the
+// pin also freezes the pause-time bytes, so the worker needs no base
+// identity proofs when one exists.
+const BasePinName = "base.pin"
+
+func StagePending(ctx context.Context, root, vmID, token, basePath string, files map[string]string) (string, map[string]string, error) {
 	if root == "" {
 		return "", nil, errors.New("staging disabled")
+	}
+	// The copy is O(real bytes) but a contended disk makes even that
+	// slow; respect the RPC deadline the way hashing always did, and
+	// fall back to the marker-only path rather than pinning the caller.
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < 3*time.Second {
+		return "", nil, ErrStageTooLarge
 	}
 	if disk, ok := files["rootfs.ext4"]; ok {
 		f, err := os.Open(disk)
@@ -153,8 +159,18 @@ func StagePending(root, vmID, token string, files map[string]string) (string, ma
 	if err := syncDir(root); err != nil {
 		return "", nil, err
 	}
+	if basePath != "" {
+		// Best-effort: EXDEV or a filesystem without hard links loses
+		// only the pin, and the worker falls back to the original base
+		// path with its identity proofs.
+		_ = os.Link(basePath, filepath.Join(dir, BasePinName))
+	}
 	staged := make(map[string]string, len(files))
 	for name, src := range files {
+		if err := ctx.Err(); err != nil {
+			_ = os.RemoveAll(dir)
+			return "", nil, err
+		}
 		dst := filepath.Join(dir, name)
 		if err := snapshotFileMode(dst, src, false); err != nil {
 			_ = os.RemoveAll(dir)
@@ -183,19 +199,12 @@ func FinishPendingStage(pendingDir, generation string, staged map[string]string)
 		// The destination exists, but existence is not proof of
 		// completeness: the worker staging path also creates generation
 		// directories, and an interrupted one leaves residue under this
-		// exact name. Only a destination holding every expected file at
-		// the staged size may absorb the pending copy; anything less is
-		// replaced by it.
-		complete := true
-		for name, src := range staged {
-			sfi, serr := os.Stat(src)
-			dfi, derr := os.Stat(filepath.Join(final, name))
-			if serr != nil || derr != nil || sfi.Size() != dfi.Size() {
-				complete = false
-				break
-			}
-		}
-		if complete {
+		// exact name. Sizes alone are near-informationless for a fixed
+		// geometry image, so absorption additionally requires the
+		// vmstate BYTES to match (tiny, and its digest is effectively
+		// the generation identity); anything less is replaced by the
+		// complete pending copy rather than absorbing it.
+		if pendingAbsorbable(final, pendingDir, staged) {
 			_ = os.RemoveAll(pendingDir)
 		} else {
 			if err := os.RemoveAll(final); err != nil {
@@ -206,6 +215,9 @@ func FinishPendingStage(pendingDir, generation string, staged map[string]string)
 			}
 		}
 	}
+	// Rename preserves the pause-time mtime; renew so the sweep's grace
+	// covers the gap to enqueue.
+	RenewStaged(final)
 	out := make(map[string]string, len(staged))
 	for name := range staged {
 		out[name] = filepath.Join(final, name)
@@ -238,6 +250,22 @@ func StageSharedBase(root, basePath, baseSHA string, cloneOnly bool) (string, er
 		return "", err
 	}
 	return stagedBase, nil
+}
+
+// pendingAbsorbable reports whether an existing destination fully
+// substitutes for the pending copy: every expected file at the staged
+// size, and identical vmstate bytes.
+func pendingAbsorbable(final, pendingDir string, staged map[string]string) bool {
+	for name, src := range staged {
+		sfi, serr := os.Stat(src)
+		dfi, derr := os.Stat(filepath.Join(final, name))
+		if serr != nil || derr != nil || sfi.Size() != dfi.Size() {
+			return false
+		}
+	}
+	want, werr := os.ReadFile(filepath.Join(pendingDir, "vmstate.snap"))
+	got, gerr := os.ReadFile(filepath.Join(final, "vmstate.snap"))
+	return werr == nil && gerr == nil && bytes.Equal(want, got)
 }
 
 // stagingFlights serializes concurrent writers of one staged
@@ -401,11 +429,20 @@ func removeStagedTask(root string, task Task) {
 // The handoff takes seconds; an hour of grace costs only residue delay.
 const stagingSweepGrace = time.Hour
 
+// pendingOrphanHorizon protects pending-token directories, whose
+// liveness the journal cannot see (their marker lives in vmd's state
+// store): live markers renew their directory on every worker pass, so
+// only a directory untouched this long is a true orphan.
+const pendingOrphanHorizon = 24 * time.Hour
+
 // renewStaged bumps a reused staged entry's mtime inside its staging
 // flight, making it fresh under the sweep grace. Callers must re-check
 // existence afterwards: singleflight coalesces same-key callers, so a
 // renewal arriving during the sweep's deletion flight JOINS it (the
 // renewal closure never runs) and the path is gone on return.
+// RenewStaged marks a staged path recently-live under the sweep grace.
+func RenewStaged(path string) { renewStaged(path) }
+
 func renewStaged(path string) {
 	_, _, _ = stagingFlights.Do(path, func() (any, error) {
 		now := time.Now()
@@ -502,6 +539,20 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 				continue
 			}
 			staged := filepath.Join(sbDir, g.Name())
+			if strings.HasPrefix(g.Name(), "pending-") {
+				// Marker-owned: the journal has no row for a pause that
+				// has not enqueued yet. Live markers renew the dir; only
+				// long-dead orphans are reaped.
+				if !fresherThan(staged, pendingOrphanHorizon) {
+					_, _, _ = stagingFlights.Do(staged, func() (any, error) {
+						if !fresherThan(staged, pendingOrphanHorizon) {
+							_ = os.RemoveAll(staged)
+						}
+						return nil, nil
+					})
+				}
+				continue
+			}
 			if !pending {
 				_, _, _ = stagingFlights.Do(staged, func() (any, error) {
 					if !fresherThan(staged, stagingSweepGrace) {

@@ -114,13 +114,29 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	// the marker-only path, whose worker requires the at-rest proof and
 	// concedes fast-resume pauses to supersession.
 	if m.backupStaging != "" {
-		if dir, staged, err := backup.StagePending(m.backupStaging, vmID, pb.Token, map[string]string{
+		// A control-plane retry of the same pause must not pay a second
+		// copy: reuse the existing marker (its staged files, base pin,
+		// and pause-time base identity) when one covers this snapshot.
+		if prev, ok := m.reusablePendingBackup(vmID, snapshotPath); ok {
+			go m.rehashPendingBackup(ctx, prev, log)
+			return manifest
+		}
+		if dir, staged, err := backup.StagePending(ctx, m.backupStaging, vmID, pb.Token, diskBasePath, map[string]string{
 			"vmstate.snap": snapshotPath,
 			"rootfs.ext4":  diskPath,
 		}); err == nil {
+			pb.OrigSnapshotPath = snapshotPath
+			pb.OrigDiskPath = diskPath
 			pb.StagedDir = dir
 			pb.SnapshotPath = staged["vmstate.snap"]
 			pb.DiskPath = staged["rootfs.ext4"]
+			if pin := filepath.Join(dir, backup.BasePinName); diskBasePath != "" {
+				if id, err := baseIdentity(pin); err == nil {
+					// The pin froze the pause-time base; identity now
+					// describes the pin's inode (linking bumps ctime).
+					pb.BaseIdentity = id
+				}
+			}
 		} else if !errors.Is(err, backup.ErrStageTooLarge) {
 			log.Warn().Err(err).Str("vm_id", vmID).
 				Msg("inline pause staging failed; worker will need the at-rest proof")
@@ -134,17 +150,14 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	return manifest
 }
 
-// rehashPendingBackup rehashes a pause's artifacts off the RPC path and
-// enqueues them, proving at-rest bytes rather than assuming them: a
-// resume that writes and then QUIESCES before the hash would otherwise
-// produce digests of post-resume bytes that verify cleanly and publish a
-// manifest pairing a mutated disk with the pause-time vmstate. The proof
-// is threefold: the instance is paused on this snapshot, the systemd
-// unit is confirmed dead (the recorded status alone is not proof: pause
-// records StatusPaused even when its stop attempts failed, and resume
-// starts the unit before flipping the status), and the disk inode did
-// not change across the hash. Terminal outcomes clear the pending
-// record; only exhausted journal retries keep it for the next boot.
+// rehashPendingBackup is the detached owner of a pause's backup. For
+// staged markers it hashes the immutable pending copies (no at-rest
+// proof: a snapshot cannot be mutated by a resume, and destroy
+// retention is the point). For unstaged markers (oversized or failed
+// staging) it runs the at-rest flow over the mutable originals, proving
+// the bytes are not being written before trusting a hash of them.
+// Terminal outcomes clear the pending record; only transient failures
+// keep it for the sweep.
 func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) {
 	// One worker per VM: the periodic sweep and startup recovery may both
 	// find the same record while a worker is mid-hash, and a second
@@ -173,6 +186,13 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		m.enqueueStagedPending(rctx, pb, log)
 		return
 	}
+	m.rehashUnstagedLocked(rctx, pb, log)
+}
+
+// rehashUnstagedLocked is the at-rest flow over mutable original paths,
+// callable only under the pendingInFlight guard (rehashPendingBackup and
+// the staged flow's lost-copies fallback).
+func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, log zerolog.Logger) {
 	// Superseded (the sandbox is provably no longer paused on this
 	// snapshot) deletes the record: a resume, destroy, or newer pause
 	// owns coverage now. Everything merely INCONCLUSIVE (a stat error, a
@@ -327,44 +347,77 @@ const pendingBackupSweepInterval = 5 * time.Minute
 // checks that remain are the base's (the base is not staged: guests
 // never write it, but a template rebuild can replace it).
 func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, log zerolog.Logger) {
-	if pb.DiskBasePath != "" {
-		cur, err := baseIdentity(pb.DiskBasePath)
-		if err != nil {
-			log.Warn().Err(err).Str("vm_id", pb.VMID).
-				Msg("staged pause backup inconclusive: base identity unreadable; keeping pending record")
-			m.healPendingBackup(pb, log)
+	// Every keep-path below renews the staged directory: the sweep's
+	// grace is mtime-based and the journal cannot see pending-token
+	// directories, so liveness is signalled by touch.
+	backup.RenewStaged(pb.StagedDir)
+	if fileMissing(pb.SnapshotPath) || fileMissing(pb.DiskPath) {
+		// The staged copies are gone (orphan sweep after an extreme
+		// outage, manual cleanup). If the sandbox is still paused on the
+		// original artifacts, fall back to the at-rest flow over them
+		// rather than dropping coverage.
+		if pb.OrigSnapshotPath != "" && !fileMissing(pb.OrigDiskPath) {
+			log.Warn().Str("vm_id", pb.VMID).
+				Msg("staged copies missing; falling back to at-rest flow over original paths")
+			fallback := pb
+			fallback.StagedDir = ""
+			fallback.SnapshotPath = pb.OrigSnapshotPath
+			fallback.DiskPath = pb.OrigDiskPath
+			m.healPendingBackup(fallback, log)
+			m.rehashUnstagedLocked(ctx, fallback, log)
 			return
 		}
-		if pb.BaseIdentity == "" || cur != pb.BaseIdentity {
-			log.Error().Str("vm_id", pb.VMID).
-				Msg("staged pause backup dropped: overlay base no longer the pause-time file")
-			m.dropStagedPending(pb, log)
-			return
+		log.Error().Str("vm_id", pb.VMID).
+			Msg("staged pause backup dropped: staged artifacts missing")
+		m.dropStagedPending(pb, log)
+		return
+	}
+	baseSrc := pb.DiskBasePath
+	if pb.DiskBasePath != "" {
+		if pin := filepath.Join(pb.StagedDir, backup.BasePinName); !fileMissing(pin) {
+			// The pin froze the pause-time inode: no identity proof
+			// needed, and template GC cannot invalidate the pair.
+			baseSrc = pin
+		} else {
+			cur, err := baseIdentity(pb.DiskBasePath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					// The base is definitively gone (template GC after a
+					// destroy) and was never pinned: the pair can never
+					// ship. Terminal, not transient.
+					log.Error().Str("vm_id", pb.VMID).
+						Msg("staged pause backup dropped: unpinned base deleted")
+					m.dropStagedPending(pb, log)
+					return
+				}
+				log.Warn().Err(err).Str("vm_id", pb.VMID).
+					Msg("staged pause backup inconclusive: base identity unreadable; keeping pending record")
+				m.healPendingBackup(pb, log)
+				return
+			}
+			if pb.BaseIdentity == "" || cur != pb.BaseIdentity {
+				log.Error().Str("vm_id", pb.VMID).
+					Msg("staged pause backup dropped: overlay base no longer the pause-time file")
+				m.dropStagedPending(pb, log)
+				return
+			}
 		}
 	}
-	entries := collectPauseManifest(ctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, log)
-	if pb.DiskBasePath != "" {
-		cur, err := baseIdentity(pb.DiskBasePath)
-		if err != nil || cur != pb.BaseIdentity {
-			log.Warn().Err(err).Str("vm_id", pb.VMID).
-				Msg("staged pause backup: base changed during hash; keeping pending record")
-			m.healPendingBackup(pb, log)
-			return
-		}
-	}
+	entries := collectPauseManifest(ctx, pb.SnapshotPath, pb.DiskPath, baseSrc, log)
 	if !pauseManifestComplete(entries) {
-		if fileMissing(pb.SnapshotPath) || fileMissing(pb.DiskPath) {
-			// The staged copies themselves are gone (sweep after a long
-			// outage, manual cleanup): nothing recoverable remains.
-			log.Error().Str("vm_id", pb.VMID).
-				Msg("staged pause backup dropped: staged artifacts missing")
-			m.dropStagedPending(pb, log)
-			return
-		}
 		log.Warn().Str("vm_id", pb.VMID).
 			Msg("staged pause backup hash failed transiently; keeping pending record")
 		m.healPendingBackup(pb, log)
 		return
+	}
+	if baseSrc != pb.DiskBasePath {
+		// The manifest hashed the pin; the recorded identity stays the
+		// real base path.
+		for i := range entries {
+			if entries[i].BasePath != "" {
+				entries[i].BasePath = pb.DiskBasePath
+			}
+		}
 	}
 	files := make([]backup.TaskFile, 0, len(entries))
 	for _, e := range entries {
@@ -377,7 +430,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 	// above), so the enqueued task is FULLY staged and needs no at-rest
 	// fallback, which could not succeed for a resumed sandbox anyway.
 	if pb.DiskBasePath != "" {
-		stagedBase, err := backup.StageSharedBase(m.backupStaging, pb.DiskBasePath, baseSHAFromEntries(entries), false)
+		stagedBase, err := backup.StageSharedBase(m.backupStaging, baseSrc, baseSHAFromEntries(entries), false)
 		if err != nil {
 			log.Warn().Err(err).Str("vm_id", pb.VMID).
 				Msg("staged pause backup: base staging failed; keeping pending record")
@@ -425,7 +478,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 		m.deletePendingBackupIf(pb, log)
 		return
 	}
-	go m.retryEnqueue(pb, entries, log)
+	m.retryEnqueue(pb, entries, log)
 }
 
 // persistPendingBackupChecked is persistPendingBackup with a hard
@@ -439,6 +492,16 @@ func (m *Manager) persistPendingBackupChecked(pb PendingBackup, log zerolog.Logg
 			Msg("persist of renamed staged paths failed; keeping pending-path marker")
 		return false
 	}
+	// PutPendingBackupIfOwner silently yields to a NEWER token; confirm
+	// this token still owns the slot before acting on the "persisted"
+	// state, or a stale worker would rename under the newer pause's
+	// marker.
+	cur, ok, err := m.state.GetPendingBackup(pb.VMID)
+	if err != nil || !ok || cur.Token != pb.Token {
+		log.Warn().Str("vm_id", pb.VMID).
+			Msg("newer pause owns the marker; abandoning this worker's rename")
+		return false
+	}
 	return true
 }
 
@@ -450,6 +513,24 @@ func baseSHAFromEntries(entries []ManifestEntry) string {
 		}
 	}
 	return ""
+}
+
+// reusablePendingBackup returns the live marker covering this exact
+// pause (same original snapshot path, staged copies still present), so
+// a control-plane retry of the pause reuses the first copy instead of
+// staging a second.
+func (m *Manager) reusablePendingBackup(vmID, snapshotPath string) (PendingBackup, bool) {
+	if m.state == nil {
+		return PendingBackup{}, false
+	}
+	prev, ok, err := m.state.GetPendingBackup(vmID)
+	if err != nil || !ok || prev.StagedDir == "" {
+		return PendingBackup{}, false
+	}
+	if prev.OrigSnapshotPath != snapshotPath || fileMissing(prev.DiskPath) {
+		return PendingBackup{}, false
+	}
+	return prev, true
 }
 
 // resolveStagedLocation handles the crash window between the marker
@@ -474,7 +555,10 @@ func (m *Manager) resolveStagedLocation(pb PendingBackup) PendingBackup {
 // dropStagedPending clears an unrecoverable staged marker and its
 // pending directory (post-rename generation dirs are ack-owned).
 func (m *Manager) dropStagedPending(pb PendingBackup, log zerolog.Logger) {
-	if pb.StagedDir != "" {
+	// Only pending-token directories are marker-owned; a post-rename
+	// generation directory may be referenced by a queued journal task
+	// and belongs to ack cleanup and the sweep.
+	if pb.StagedDir != "" && strings.HasPrefix(filepath.Base(pb.StagedDir), "pending-") {
 		_ = os.RemoveAll(pb.StagedDir)
 	}
 	m.deletePendingBackupIf(pb, log)
