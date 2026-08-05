@@ -316,18 +316,21 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if !r.gracePeriodElapsed(id, now) {
 				continue
 			}
-			// Drift 7's discipline: lock BEFORE spending budget, then re-check
-			// the AUTHORITATIVE in-memory record under it. The pass snapshot is
-			// stale by now — a resume can have relaunched this VM since — and
-			// the row's status is the only DB-side guard, so this is what stops
-			// a live VM being failed.
+			// Lock before spending budget, then re-probe the UNIT under it —
+			// not instanceRunning: nothing updates the in-memory record when
+			// firecracker dies out from under vmd, so a stale Running instance
+			// is the very state this rule cleans up, and trusting it would
+			// veto every reap. A resume that relaunched mid-pass owns a live
+			// unit again, which this probe sees. Terminal state, not merely
+			// not-active: the reap releases the record and slot, and a
+			// deactivating unit's process may still hold the tap. Fail-closed
+			// — an inconclusive probe defers to the next pass.
 			unlockOp, ok := r.mgr.tryLockVMOp(id)
 			if !ok {
 				continue
 			}
-			if r.mgr.instanceRunning(id) {
+			if !vmUnitFullyDown(id) {
 				unlockOp()
-				r.clearDrift(id)
 				continue
 			}
 			if !r.consumeAutoFailBudget(id) {
