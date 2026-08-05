@@ -446,9 +446,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// behind a dead unit costs another grace+budget cycle via the
 			// dead-VM rule). Detach from the pass context, bounded.
 			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-			r.markFailedInDB(persistCtx, id, db.SandboxStatusActive)
+			flipped := r.markFailedInDB(persistCtx, id, db.SandboxStatusActive)
 			r.markStale(id)
-			r.writeAudit(persistCtx, id, "mark_failed", "empty Firecracker shell while DB said active", "fc_empty_shell")
+			if flipped {
+				r.writeAudit(persistCtx, id, "mark_failed", "empty Firecracker shell while DB said active", "fc_empty_shell")
+			}
 			persistCancel()
 		}
 	}
@@ -639,8 +641,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// wedge: the next pass's snapshot reads 'failed'.
 			if dbSandboxes != nil {
 				if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive && r.consumeAutoFailBudget(id) {
-					r.markFailedInDB(ctx, id, db.SandboxStatusActive)
-					r.writeAudit(ctx, id, "mark_failed", "wedged error VM: row flipped while awaiting terminal unit", "boltdb_error_unit_wedged")
+					if r.markFailedInDB(ctx, id, db.SandboxStatusActive) {
+						r.writeAudit(ctx, id, "mark_failed", "wedged error VM: row flipped while awaiting terminal unit", "boltdb_error_unit_wedged")
+					}
 				}
 			}
 			unlockOp()
