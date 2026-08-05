@@ -559,21 +559,23 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			continue
 		}
 		removeUnitDropIn(id)
-		r.markStale(id)
+		staleErr := r.markStale(id)
 		unlockOp()
 		// Flip the DB row with the already-grace-qualified reap: Drift 1
 		// cleared its marker while the unit was active, so leaving the row
 		// Active would advertise a dead sandbox for another full grace.
 		// Compare-and-set: a relaunch queued on the lock (or a resume the
 		// control plane already started) owns the row now, not this pass's
-		// snapshot.
+		// snapshot. Not gated on the release: the unit is proven down either
+		// way, and the flip frees no resource (same reasoning as the wedge
+		// branch below).
 		if dbSandboxes != nil {
 			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
 				r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
 			}
 		}
-		r.writeAudit(ctx, id, "error_unit_stop", "live unit for error-status record", "boltdb_error_unit_active")
-		r.clearDrift("errunit:" + id)
+		r.finalizeErrorReap(ctx, id, "errunit:"+id, "error_unit_stop",
+			"live unit for error-status record", "boltdb_error_unit_active", staleErr)
 	}
 
 	// The dead-unit half of Drift 8: an Error record whose unit is gone —
@@ -629,7 +631,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			unlockOp()
 			return
 		}
-		r.markStale(id)
+		staleErr := r.markStale(id)
 		unlockOp()
 		// Drift 1 skips Error records, so the row flip lands here (still
 		// compare-and-set: a relaunch may own the row by now).
@@ -638,8 +640,8 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				r.markFailedInDB(ctx, id, sb.Sandbox.UpdatedAt)
 			}
 		}
-		r.writeAudit(ctx, id, "stale_cleanup", "error record with no unit", "boltdb_error_unit_missing")
-		r.clearDrift("errdead:" + id)
+		r.finalizeErrorReap(ctx, id, "errdead:"+id, "stale_cleanup",
+			"error record with no unit", "boltdb_error_unit_missing", staleErr)
 	}
 	if bolted != nil {
 		for id := range bolted {
@@ -1329,6 +1331,20 @@ func (r *Reconciler) refundAutoFailSlot() {
 	if n := len(r.autoFailLog); n > 0 {
 		r.autoFailLog = r.autoFailLog[:n-1]
 	}
+}
+
+// finalizeErrorReap records the outcome of a Drift 8 release. A failed delete
+// left the record, its in-memory instance and its network slot held, so the
+// marker must survive: retiring it would both report a cleanup that did not
+// happen and restart the grace period, delaying the retry the dead-unit half
+// would otherwise make on the very next pass.
+func (r *Reconciler) finalizeErrorReap(ctx context.Context, vmID, marker, action, reason, driftKind string, staleErr error) {
+	if staleErr != nil {
+		r.writeAudit(ctx, vmID, "stale_cleanup_failed", reason+"; record not deleted", driftKind)
+		return
+	}
+	r.writeAudit(ctx, vmID, action, reason, driftKind)
+	r.clearDrift(marker)
 }
 
 // markStale deletes the stale BoltDB entry and drops the VM from the

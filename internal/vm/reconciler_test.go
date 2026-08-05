@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -442,4 +443,92 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 			t.Fatal("a deleted record must not leave its instance tracked")
 		}
 	})
+}
+
+// Drift 8 must not retire its marker on a release that did not happen: the
+// record, its instance and its slot are still held, and only the marker keeps
+// the dead-unit half coming back for them.
+func TestFinalizeErrorReap_FailedDeleteKeepsMarker(t *testing.T) {
+	newRec := func() *Reconciler {
+		r := NewReconciler(&Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}, DefaultReconcilerConfig())
+		r.driftSeen["errdead:vm-1"] = time.Now()
+		return r
+	}
+
+	t.Run("failed delete keeps the marker", func(t *testing.T) {
+		r := newRec()
+		r.finalizeErrorReap(context.Background(), "vm-1", "errdead:vm-1", "stale_cleanup",
+			"error record with no unit", "boltdb_error_unit_missing", errors.New("boltdb write failed"))
+		r.mu.Lock()
+		_, kept := r.driftSeen["errdead:vm-1"]
+		r.mu.Unlock()
+		if !kept {
+			t.Fatal("marker must survive a failed release, or nothing revisits the held record and slot")
+		}
+	})
+
+	t.Run("successful delete retires the marker", func(t *testing.T) {
+		r := newRec()
+		r.finalizeErrorReap(context.Background(), "vm-1", "errdead:vm-1", "stale_cleanup",
+			"error record with no unit", "boltdb_error_unit_missing", nil)
+		r.mu.Lock()
+		_, kept := r.driftSeen["errdead:vm-1"]
+		r.mu.Unlock()
+		if kept {
+			t.Fatal("a completed release must retire its marker")
+		}
+	})
+}
+
+// The retry itself: a store that refuses the delete leaves the VM fully owned,
+// and a later pass — once the store recovers — completes the same cleanup.
+func TestMarkStale_FailedDeleteRetriedOnLaterPass(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vmd.db")
+	store, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusError}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	// Pass 1: the store cannot serve the delete.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.markStale("vm-1"); err == nil {
+		t.Fatal("an undeletable record must report failure")
+	}
+	m.mu.RLock()
+	_, tracked := m.vms["vm-1"]
+	m.mu.RUnlock()
+	if !tracked {
+		t.Fatal("a failed release must keep ownership of the instance and its slot")
+	}
+
+	// Pass 2: the store is healthy again and the same cleanup completes.
+	reopened, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	m.state = reopened
+	if err := r.markStale("vm-1"); err != nil {
+		t.Fatalf("retry must succeed once the store recovers: %v", err)
+	}
+	m.mu.RLock()
+	_, stillTracked := m.vms["vm-1"]
+	m.mu.RUnlock()
+	if stillTracked {
+		t.Fatal("the completed retry must drop the instance")
+	}
+	if rec, gerr := reopened.Get("vm-1"); gerr != nil || rec != nil {
+		t.Fatalf("the completed retry must delete the record, got rec=%v err=%v", rec, gerr)
+	}
 }
