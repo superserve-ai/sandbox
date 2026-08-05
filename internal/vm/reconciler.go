@@ -136,9 +136,17 @@ type Reconciler struct {
 	// released.
 	//
 	// marker is the originating rule's drift key, kept alive across the
-	// deferral: retiring the entry must retire that marker too, or a LATER
-	// episode of the same rule for the same id inherits the old timestamp and
-	// skips its grace period.
+	// deferral: retiring the entry — by completed release OR identity void —
+	// must retire that marker too, or a LATER episode of the same rule for
+	// the same id inherits the old timestamp and skips its grace period.
+	//
+	// The slot is single-marker by choice. Two accepted, fail-safe edges: a
+	// void racing a fresh episode of the same rule clears that episode's new
+	// timestamp (its grace restarts — delays the reap, favors adoption), and
+	// a second rule deferring the same id overwrites the first rule's marker
+	// (that sliver keeps the stale-timestamp bug). Episode-scoped markers
+	// would close both; neither failure is destructive, so they don't pay
+	// for the machinery.
 	pendingRelease map[string]deferredRelease
 
 	// passCount counts completed reconcile passes, used to run the disk
@@ -1312,9 +1320,7 @@ func (r *Reconciler) retryPendingReleases(ctx context.Context) {
 			r.mu.Lock()
 			delete(r.pendingRelease, id)
 			r.mu.Unlock()
-			// The deferral episode is over either way; a surviving marker
-			// would hand its stale timestamp to the id's next episode.
-			r.clearDrift(noted.marker)
+			r.clearDrift(noted.marker) // see pendingRelease: voids retire the marker too
 			continue
 		}
 		err := r.markStale(ctx, id)
