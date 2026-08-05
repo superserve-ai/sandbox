@@ -1060,10 +1060,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// the detached stop widened the window where a destroy can land
 	// mid-pause — a plain Put would resurrect the deleted record.
 	//
-	// A write failure is not a deletion: the durable record still reads
-	// Running while the unit is stopped, so reporting the pause as complete
-	// would leave the control plane and the store disagreeing about a VM that
-	// is already down. Surface it and let the retry re-record the state.
+	// A write failure is not a deletion, and must not report a completed
+	// pause: the retry above re-records the state instead.
 	switch wrote, perr := m.persistStateIfPresent(inst); {
 	case perr != nil:
 		return "", "", nil, fmt.Errorf("record paused state for vm %s: %w", vmID, perr)
