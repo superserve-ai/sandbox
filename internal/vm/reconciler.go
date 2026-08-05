@@ -138,13 +138,7 @@ type Reconciler struct {
 	// stopped, but whose resource release did not complete. Every drift rule
 	// that reaps a live VM matches on an ACTIVE unit, which its own stop then
 	// retires — so without this set, an abandoned release is never revisited.
-	//
-	// The entry holds the instance tracked when the release was deferred (nil
-	// for an untracked id). The retry proceeds only while m.vms still holds
-	// that EXACT object AND its snapshot is unmutated: any lifecycle op
-	// replaces the instance or mutates it in place, and that op owns cleanup
-	// from then on. Status alone is useless as this signal — nothing updates
-	// a record when firecracker dies out from under vmd.
+	// The void semantics live on deferredRelease.
 	//
 	// marker is the originating rule's drift key, kept alive across the
 	// deferral: retiring the entry — by completed release OR void — must
@@ -1351,10 +1345,7 @@ func (r *Reconciler) refundAutoFailSlot() {
 // when the unit leaves the active set, so its retry waits out one more grace.
 func (r *Reconciler) finalizeErrorReap(ctx context.Context, vmID, marker, action, reason, driftKind string, staleErr error) {
 	if staleErr != nil {
-		// Same discipline as finalizeRelease: the deferred entry must carry
-		// this rule's marker, or a completed retry retires the record while
-		// the errunit:/errdead: timestamp lives on to rob the id's next
-		// Error episode of its grace period.
+		// Same discipline as finalizeRelease — see pendingRelease's marker doc.
 		r.tagPendingRelease(vmID, marker)
 		r.writeAudit(ctx, vmID, "stale_cleanup_failed", reason+"; record not deleted", driftKind)
 		return
@@ -1446,15 +1437,16 @@ func (r *Reconciler) finalizeRelease(ctx context.Context, vmID, marker, action, 
 	}
 }
 
+// deferredRelease is a reap decision awaiting its release. The retry proceeds
+// only while m.vms still holds the EXACT instance observed at deferral AND its
+// snapshot is unmutated: pointer identity alone only detects REPLACEMENT ops
+// (a fresh relaunch swaps the map entry), while adoption clears Unverified and
+// pause flips Status on the SAME object. A stale instance is by definition one
+// nothing updates, so any observed mutation proves a lifecycle op claimed the
+// VM — that op owns cleanup, and the reap decision is void.
 type deferredRelease struct {
-	inst   *VMInstance
-	marker string
-	// Snapshot of the instance when the release was deferred. Pointer
-	// identity alone only detects REPLACEMENT ops (a fresh relaunch swaps
-	// the map entry); adoption clears Unverified and pause flips Status on
-	// the SAME object. A stale instance is by definition one nothing
-	// updates, so any observed mutation proves a lifecycle op claimed the
-	// VM and the reap decision is void.
+	inst       *VMInstance
+	marker     string
 	status     VMStatus
 	unverified bool
 }
@@ -1518,11 +1510,8 @@ func (r *Reconciler) retryPendingReleases(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		// Identity AND an unmutated snapshot: the reap was decided against
-		// `noted`, and any lifecycle op since has either replaced the tracked
-		// instance or mutated it in place — that op owns cleanup now, and
-		// releasing under it would strand a relaunched VM or delete a
-		// legitimately re-paused record.
+		// Identity AND an unmutated snapshot decide the void — see
+		// deferredRelease for why either alone is insufficient.
 		r.mgr.mu.RLock()
 		cur := r.mgr.vms[id]
 		r.mgr.mu.RUnlock()
