@@ -1194,3 +1194,44 @@ func TestHasPendingReleaseStandsAside(t *testing.T) {
 		t.Fatal("completion must not charge budget either")
 	}
 }
+
+// Drift 1/2 grace under the BARE vm id and defer with marker "" — a
+// successful markStale clears that id itself, but a void never runs
+// markStale. Without clearing it here, the elapsed timestamp survives the
+// void, and the relaunched VM's next death reaps instantly without grace.
+func TestRetryPendingReleases_VoidClearsBareIDGrace(t *testing.T) {
+	stubUnitTerminal(t, false) // defer the release
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	// The Drift 1/2 shape: grace elapsed under the bare id, then a deferral.
+	r.driftSeen["vm-1"] = time.Now().Add(-2 * r.cfg.GracePeriod)
+	if err := r.markStale(context.Background(), "vm-1"); err == nil {
+		t.Fatal("non-terminal unit must defer")
+	}
+
+	// A relaunch replaces the instance; the retry voids the stale decision.
+	r.mgr.vms["vm-1"] = &VMInstance{ID: "vm-1", Status: StatusRunning}
+	r.retryPendingReleases(context.Background())
+
+	if r.hasPendingRelease("vm-1") {
+		t.Fatal("the void must retire the entry")
+	}
+	r.mu.Lock()
+	_, kept := r.driftSeen["vm-1"]
+	r.mu.Unlock()
+	if kept {
+		t.Fatal("the void must retire the bare-id grace, or the relaunched VM's next death skips its waiting period")
+	}
+}

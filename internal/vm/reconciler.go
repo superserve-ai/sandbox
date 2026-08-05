@@ -1549,7 +1549,13 @@ func (r *Reconciler) retryPendingReleases(ctx context.Context) {
 			r.mu.Lock()
 			delete(r.pendingRelease, id)
 			r.mu.Unlock()
-			r.clearDrift(noted.marker) // see pendingRelease: voids retire the marker too
+			// Voids retire the episode's timestamps (see pendingRelease): the
+			// prefixed marker, and the bare id — Drift 1/2 grace under the bare
+			// id and defer with marker "", relying on markStale to clear it,
+			// which a void never runs. Leaving either hands its elapsed grace
+			// to the id's next episode.
+			r.clearDrift(id)
+			r.clearDrift(noted.marker)
 			continue
 		}
 		err := r.markStale(ctx, id)
