@@ -827,8 +827,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// resume + re-pause since the pass snapshot writes NEW artifacts
 			// at this same path before the row returns to paused, so the row
 			// alone cannot tell the generations apart — the file can. The
-			// lock excludes an in-flight transition; only PROVEN absence may
-			// flip, anything inconclusive defers to the next pass.
+			// lock excludes an in-flight transition.
 			unlockOp, ok := r.mgr.tryLockVMOp(id)
 			if !ok {
 				continue
