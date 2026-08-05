@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -554,4 +555,170 @@ func TestStatPauseArtifact(t *testing.T) {
 	if p, cm := statPauseArtifact(filepath.Join(f, "child.snap")); p || cm {
 		t.Fatalf("inconclusive stat: got present=%v confirmedMissing=%v", p, cm)
 	}
+}
+
+// The drill-caught regression: a dead unit behind an active row must be
+// reaped even while the in-memory instance still claims Running — nothing
+// updates that record when firecracker dies out from under vmd, so trusting
+// it vetoes every reap. The unit probe is the only valid oracle here.
+func TestReapDeadActiveVMs_StaleRunningRecordDoesNotVetoReap(t *testing.T) {
+	newFixture := func(t *testing.T, unitDown bool) (*Reconciler, *StateStore, string, *[]string) {
+		t.Helper()
+		sbID := uuid.New()
+		id := sbID.String()
+		store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		if err := store.Put(VMRecord{ID: id, Status: StatusRunning}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{
+			log:   zerolog.Nop(),
+			state: store,
+			// The stale claim: still Running in memory though the unit is gone.
+			vms: map[string]*VMInstance{id: {ID: id, Status: StatusRunning}},
+		}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		r.driftSeen[id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+
+		origProbe := unitFullyDownProbe
+		unitFullyDownProbe = func(context.Context, string) bool { return unitDown }
+		t.Cleanup(func() { unitFullyDownProbe = origProbe })
+
+		flips := &[]string{}
+		r.markFailed = func(_ context.Context, vmID string, observed db.SandboxStatus) bool {
+			if observed != db.SandboxStatusActive {
+				t.Errorf("Drift 1 must assert the active state it matched, got %v", observed)
+			}
+			*flips = append(*flips, vmID)
+			return true
+		}
+		return r, store, id, flips
+	}
+	rows := func(id string) map[string]db.ListSandboxesByHostRow {
+		sbID := uuid.MustParse(id)
+		return map[string]db.ListSandboxesByHostRow{
+			id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+		}
+	}
+	noError := func(string) bool { return false }
+
+	t.Run("conclusively dead unit is reaped despite the Running claim", func(t *testing.T) {
+		r, store, id, flips := newFixture(t, true)
+		r.reapDeadActiveVMs(context.Background(), zerolog.Nop(), rows(id), map[string]bool{}, noError, time.Now())
+		if len(*flips) != 1 {
+			t.Fatalf("expected exactly one row flip, got %v", *flips)
+		}
+		if rec, _ := store.Get(id); rec != nil {
+			t.Fatal("the stale record must be released")
+		}
+		r.mgr.mu.RLock()
+		_, tracked := r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if tracked {
+			t.Fatal("the stale instance must be dropped")
+		}
+	})
+
+	t.Run("a relaunched unit defers the reap", func(t *testing.T) {
+		r, store, id, flips := newFixture(t, false) // probe: not terminal
+		r.reapDeadActiveVMs(context.Background(), zerolog.Nop(), rows(id), map[string]bool{}, noError, time.Now())
+		if len(*flips) != 0 {
+			t.Fatalf("a live unit must never be failed, got flips %v", *flips)
+		}
+		if rec, _ := store.Get(id); rec == nil {
+			t.Fatal("a live VM's record must survive")
+		}
+	})
+}
+
+// The lock-window race: a resume + re-pause can write a NEW artifact at the
+// same path while this rule waits on the lifecycle lock. The re-stat under
+// the lock must see it and heal rather than fail the fresh generation; an
+// inconclusive stat must defer, and only proven absence may flip the row.
+func TestFailMissingSnapshots_LockWindow(t *testing.T) {
+	newFixture := func(t *testing.T) (*Reconciler, string, *[]string) {
+		t.Helper()
+		sbID := uuid.New()
+		id := sbID.String()
+		m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		r.driftSeen["paused:"+id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+		flips := &[]string{}
+		r.markFailed = func(_ context.Context, vmID string, observed db.SandboxStatus) bool {
+			if observed != db.SandboxStatusPaused {
+				t.Errorf("Drift 4 must assert the paused state it matched, got %v", observed)
+			}
+			*flips = append(*flips, vmID)
+			return true
+		}
+		return r, id, flips
+	}
+	rows := func(id, snapPath string) map[string]db.ListSandboxesByHostRow {
+		sbID := uuid.MustParse(id)
+		return map[string]db.ListSandboxesByHostRow{
+			id: {
+				Sandbox:      db.Sandbox{ID: sbID, Status: db.SandboxStatusPaused, SnapshotID: pgtype.UUID{Bytes: sbID, Valid: true}},
+				SnapshotPath: &snapPath,
+			},
+		}
+	}
+	stubStat := func(t *testing.T, present, missing bool) {
+		t.Helper()
+		orig := statPauseArtifact
+		statPauseArtifact = func(string) (bool, bool) { return present, missing }
+		t.Cleanup(func() { statPauseArtifact = orig })
+	}
+
+	t.Run("new generation written while waiting on the lock heals", func(t *testing.T) {
+		r, id, flips := newFixture(t)
+		stubStat(t, true, false) // the pause completed: artifact present at re-stat
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		if len(*flips) != 0 {
+			t.Fatalf("a fresh pause generation must not be failed, got %v", *flips)
+		}
+		r.mu.Lock()
+		_, kept := r.driftSeen["paused:"+id]
+		r.mu.Unlock()
+		if kept {
+			t.Fatal("a healed sandbox must retire its drift marker")
+		}
+	})
+
+	t.Run("inconclusive stat defers and keeps the marker", func(t *testing.T) {
+		r, id, flips := newFixture(t)
+		stubStat(t, false, false)
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		if len(*flips) != 0 {
+			t.Fatalf("an inconclusive read must never fail a sandbox, got %v", *flips)
+		}
+		r.mu.Lock()
+		_, kept := r.driftSeen["paused:"+id]
+		r.mu.Unlock()
+		if !kept {
+			t.Fatal("a deferred verdict must keep the marker for the next pass")
+		}
+	})
+
+	t.Run("proven absence flips the row", func(t *testing.T) {
+		r, id, flips := newFixture(t)
+		stubStat(t, false, true)
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		if len(*flips) != 1 {
+			t.Fatalf("proven absence must flip exactly once, got %v", *flips)
+		}
+	})
+
+	t.Run("an in-flight lifecycle op defers", func(t *testing.T) {
+		r, id, flips := newFixture(t)
+		stubStat(t, false, true)
+		r.mgr.vmOpCh(id) <- struct{}{} // a pause/resume holds the lock
+		defer func() { <-r.mgr.vmOpCh(id) }()
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		if len(*flips) != 0 {
+			t.Fatalf("a locked VM must defer, got %v", *flips)
+		}
+	})
 }

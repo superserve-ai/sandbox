@@ -12,6 +12,8 @@ import (
 
 	"errors"
 
+	"github.com/rs/zerolog"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -127,16 +129,22 @@ type Reconciler struct {
 	// prevKeptLive is the prior disk pass's protected live-sandbox count, used
 	// to detect a keep-set collapse. -1 until the first pass. Run loop only.
 	prevKeptLive int
+
+	// markFailed flips a sandbox row to failed; a field so rule tests can
+	// capture the flip without a control-plane DB. Defaults to markFailedInDB.
+	markFailed func(ctx context.Context, vmID string, observed db.SandboxStatus) bool
 }
 
 // NewReconciler creates a reconciler bound to a Manager.
 func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
-	return &Reconciler{
+	r := &Reconciler{
 		mgr:          mgr,
 		cfg:          cfg,
 		driftSeen:    make(map[string]time.Time),
 		prevKeptLive: -1,
 	}
+	r.markFailed = r.markFailedInDB
+	return r
 }
 
 // runTimeout bounds each reconciliation pass so a slow DB or stuck
@@ -296,67 +304,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	}
 
 	// Drift 1: DB says active, systemd/socket says dead.
-	// Action: mark sandbox failed in DB + clean up BoltDB + in-memory.
-	if dbSandboxes != nil {
-		for id, sb := range dbSandboxes {
-			if sb.Sandbox.Status != db.SandboxStatusActive {
-				continue
-			}
-			if active[id] {
-				r.clearDrift(id)
-				continue
-			}
-			// Error records are Drift 8's: its halves gate every record
-			// release on the terminal unit state, which this branch does not
-			// probe — a deactivating unit is absent from the active snapshot
-			// while its process may live on.
-			if errorRecord(id) {
-				continue
-			}
-			if !r.gracePeriodElapsed(id, now) {
-				continue
-			}
-			// Lock before spending budget, then re-probe the UNIT under it —
-			// never instanceRunning: nothing updates the in-memory record when
-			// firecracker dies out from under vmd, so a stale Running instance
-			// is the very state this rule cleans up. A resume that relaunched
-			// mid-pass owns a live unit again, which this probe sees; an
-			// inconclusive probe defers to the next pass.
-			unlockOp, ok := r.mgr.tryLockVMOp(id)
-			if !ok {
-				continue
-			}
-			if !unitFullyDown(ctx, systemdUnitName(id)) {
-				// Pass ctx, not a background budget: N wedged probes must
-				// exhaust the pass deadline, not stack past it — an expired
-				// ctx fails the probe and defers, which is the safe verdict.
-				unlockOp()
-				continue
-			}
-			if !r.consumeAutoFailBudget(id) {
-				unlockOp()
-				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "db_active_systemd_missing")
-				continue
-			}
-			log.Warn().Str("vm_id", id).Str("drift", "db_active_systemd_missing").
-				Msg("DB says active but VM is dead — marking failed")
-			flipped := r.markFailedInDB(ctx, id, db.SandboxStatusActive)
-			staleErr := r.markStale(id)
-			unlockOp()
-			if staleErr != nil {
-				// The row is failed but the record and slot are still held, and
-				// no rule rematches that shape (this one needs an active row).
-				// The release retry is record-keyed and lives outside this
-				// rule; until then the leak is bounded by the next reattach —
-				// but it must be recorded, not silent.
-				r.writeAudit(ctx, id, "stale_cleanup_failed", "row failed but record not deleted", "db_active_systemd_missing")
-			}
-			if !flipped {
-				continue
-			}
-			r.writeAudit(ctx, id, "mark_failed", "VM dead while DB said active", "db_active_systemd_missing")
-		}
-	}
+	r.reapDeadActiveVMs(ctx, log, dbSandboxes, active, errorRecord, now)
 
 	// Drift 1b: the unit is active but the Firecracker inside is an empty
 	// shell holding no microVM (see fcReportsEmptyShell) — e.g. the unit
@@ -804,65 +752,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	}
 
 	// Drift 4: DB says paused, snapshot file missing on disk → mark failed.
-	if dbSandboxes != nil {
-		for id, sb := range dbSandboxes {
-			if sb.Sandbox.Status != db.SandboxStatusPaused || !sb.Sandbox.SnapshotID.Valid {
-				continue
-			}
-			// snapshot_path is joined in by ListSandboxesByHost, so this
-			// is a cheap struct field read instead of a per-row DB call.
-			// Skip when the snapshot row has been deleted (rare race).
-			if sb.SnapshotPath == nil || *sb.SnapshotPath == "" {
-				continue
-			}
-			snapPath := *sb.SnapshotPath
-			if _, statErr := os.Stat(snapPath); statErr == nil {
-				r.clearDrift("paused:" + id)
-				continue
-			}
-			if !r.gracePeriodElapsed("paused:"+id, now) {
-				continue
-			}
-			// Re-stat under the lifecycle lock before spending budget: a
-			// resume + re-pause since the pass snapshot writes NEW artifacts
-			// at this same path before the row returns to paused, so the row
-			// alone cannot tell the generations apart — the file can. The
-			// lock excludes an in-flight transition.
-			unlockOp, ok := r.mgr.tryLockVMOp(id)
-			if !ok {
-				continue
-			}
-			present, confirmedMissing := statPauseArtifact(snapPath)
-			if present {
-				unlockOp()
-				r.clearDrift("paused:" + id)
-				continue
-			}
-			if !confirmedMissing {
-				unlockOp()
-				continue
-			}
-			if !r.consumeAutoFailBudget(id) {
-				unlockOp()
-				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "paused_snapshot_missing")
-				continue
-			}
-			log.Warn().Str("vm_id", id).Str("snapshot_path", snapPath).
-				Str("drift", "paused_snapshot_missing").
-				Msg("paused sandbox snapshot file missing — marking failed")
-			// Paused is the state this rule matched on, so that is what the
-			// flip asserts. A row that resumed since the pass snapshot refuses
-			// it, and keeping the marker lets the next pass re-evaluate rather
-			// than retiring a transition that never happened.
-			flipped := r.markFailedInDB(ctx, id, db.SandboxStatusPaused)
-			unlockOp()
-			if !flipped {
-				continue
-			}
-			r.writeAudit(ctx, id, "mark_failed", "snapshot file missing", "paused_snapshot_missing")
-			r.clearDrift("paused:" + id)
-		}
-	}
+	r.failMissingSnapshots(ctx, log, dbSandboxes, now)
 
 	// Drift 5: BoltDB record exists but DB has no corresponding sandbox
 	// row (either never written or soft-deleted). Clean up the BoltDB
@@ -1278,7 +1168,7 @@ func (r *Reconciler) graceElapsed(key string, now time.Time, window time.Duratio
 // (the only verdict that may flip the row), or neither — EACCES, I/O errors
 // and a spent ctx say nothing about the file, and marking a sandbox failed on
 // a non-answer would fail healthy generations.
-func statPauseArtifact(path string) (present, confirmedMissing bool) {
+var statPauseArtifact = func(path string) (present, confirmedMissing bool) {
 	_, err := os.Stat(path)
 	if err == nil {
 		return true, false
@@ -1308,6 +1198,9 @@ const dbQueryTimeout = 5 * time.Second
 // markFailedInDB flips a sandbox row to failed, reporting whether it moved.
 // A refusal means a resume took the row since the pass snapshot, so callers
 // must not audit the transition or clear their drift on it.
+// unitFullyDownProbe is Drift 1's terminal-unit oracle; a var for tests.
+var unitFullyDownProbe = unitFullyDown
+
 func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string, observed db.SandboxStatus) bool {
 	if r.cfg.DB == nil {
 		return true
@@ -1472,4 +1365,133 @@ func (r *Reconciler) markStale(vmID string) error {
 	r.mgr.log.Warn().Str("component", "reconciler").Str("vm_id", vmID).
 		Str("action", "mark_stale").Msg("reconciler: cleaned up stale VM record")
 	return nil
+}
+
+// reapDeadActiveVMs is Drift 1's body: DB says active, systemd says the unit
+// is gone. Extracted so the stale-Running regression stays testable — the
+// rule must reap on unit evidence even while the in-memory record still
+// claims Running.
+func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool, errorRecord func(string) bool, now time.Time) {
+	for id, sb := range dbSandboxes {
+		if sb.Sandbox.Status != db.SandboxStatusActive {
+			continue
+		}
+		if active[id] {
+			r.clearDrift(id)
+			continue
+		}
+		// Error records are Drift 8's: its halves gate every record
+		// release on the terminal unit state, which this branch does not
+		// probe — a deactivating unit is absent from the active snapshot
+		// while its process may live on.
+		if errorRecord(id) {
+			continue
+		}
+		if !r.gracePeriodElapsed(id, now) {
+			continue
+		}
+		// Lock before spending budget, then re-probe the UNIT under it —
+		// never instanceRunning: nothing updates the in-memory record when
+		// firecracker dies out from under vmd, so a stale Running instance
+		// is the very state this rule cleans up. A resume that relaunched
+		// mid-pass owns a live unit again, which this probe sees; an
+		// inconclusive probe defers to the next pass.
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue
+		}
+		if !unitFullyDownProbe(ctx, systemdUnitName(id)) {
+			// Pass ctx, not a background budget: N wedged probes must
+			// exhaust the pass deadline, not stack past it — an expired
+			// ctx fails the probe and defers, which is the safe verdict.
+			unlockOp()
+			continue
+		}
+		if !r.consumeAutoFailBudget(id) {
+			unlockOp()
+			r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "db_active_systemd_missing")
+			continue
+		}
+		log.Warn().Str("vm_id", id).Str("drift", "db_active_systemd_missing").
+			Msg("DB says active but VM is dead — marking failed")
+		flipped := r.markFailed(ctx, id, db.SandboxStatusActive)
+		staleErr := r.markStale(id)
+		unlockOp()
+		if staleErr != nil {
+			// The row is failed but the record and slot are still held, and
+			// no rule rematches that shape (this one needs an active row).
+			// The release retry is record-keyed and lives outside this
+			// rule; until then the leak is bounded by the next reattach —
+			// but it must be recorded, not silent.
+			r.writeAudit(ctx, id, "stale_cleanup_failed", "row failed but record not deleted", "db_active_systemd_missing")
+		}
+		if !flipped {
+			continue
+		}
+		r.writeAudit(ctx, id, "mark_failed", "VM dead while DB said active", "db_active_systemd_missing")
+	}
+}
+
+// failMissingSnapshots is Drift 4's body: a paused row whose snapshot artifact
+// is provably gone. Extracted for the same reason as reapDeadActiveVMs — the
+// lock-window race (a new pause writing the artifact while this rule waits on
+// the lifecycle lock) is only testable with the pass data injectable.
+func (r *Reconciler) failMissingSnapshots(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, now time.Time) {
+	for id, sb := range dbSandboxes {
+		if sb.Sandbox.Status != db.SandboxStatusPaused || !sb.Sandbox.SnapshotID.Valid {
+			continue
+		}
+		// snapshot_path is joined in by ListSandboxesByHost, so this
+		// is a cheap struct field read instead of a per-row DB call.
+		// Skip when the snapshot row has been deleted (rare race).
+		if sb.SnapshotPath == nil || *sb.SnapshotPath == "" {
+			continue
+		}
+		snapPath := *sb.SnapshotPath
+		if _, statErr := os.Stat(snapPath); statErr == nil {
+			r.clearDrift("paused:" + id)
+			continue
+		}
+		if !r.gracePeriodElapsed("paused:"+id, now) {
+			continue
+		}
+		// Re-stat under the lifecycle lock before spending budget: a
+		// resume + re-pause since the pass snapshot writes NEW artifacts
+		// at this same path before the row returns to paused, so the row
+		// alone cannot tell the generations apart — the file can. The
+		// lock excludes an in-flight transition.
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue
+		}
+		present, confirmedMissing := statPauseArtifact(snapPath)
+		if present {
+			unlockOp()
+			r.clearDrift("paused:" + id)
+			continue
+		}
+		if !confirmedMissing {
+			unlockOp()
+			continue
+		}
+		if !r.consumeAutoFailBudget(id) {
+			unlockOp()
+			r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "paused_snapshot_missing")
+			continue
+		}
+		log.Warn().Str("vm_id", id).Str("snapshot_path", snapPath).
+			Str("drift", "paused_snapshot_missing").
+			Msg("paused sandbox snapshot file missing — marking failed")
+		// Paused is the state this rule matched on, so that is what the
+		// flip asserts. A row that resumed since the pass snapshot refuses
+		// it, and keeping the marker lets the next pass re-evaluate rather
+		// than retiring a transition that never happened.
+		flipped := r.markFailed(ctx, id, db.SandboxStatusPaused)
+		unlockOp()
+		if !flipped {
+			continue
+		}
+		r.writeAudit(ctx, id, "mark_failed", "snapshot file missing", "paused_snapshot_missing")
+		r.clearDrift("paused:" + id)
+	}
 }
