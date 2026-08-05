@@ -593,3 +593,39 @@ func TestMarkStaleDefersWhileUnitNotTerminal(t *testing.T) {
 		t.Fatalf("a completed release must be forgotten, got %v", got)
 	}
 }
+
+// A deferred release must not be audited as a completed reap, and must not
+// retire the drift marker: the record and its slot are still held. The guard
+// makes deferral the COMMON outcome, so a rule that reported success here
+// would mislabel routine cleanups, not just rare store failures.
+func TestFinalizeRelease_DeferralIsNotSuccess(t *testing.T) {
+	newRec := func() *Reconciler {
+		r := NewReconciler(&Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}, DefaultReconcilerConfig())
+		r.driftSeen["orphan:vm-1"] = time.Now()
+		return r
+	}
+
+	t.Run("deferral keeps the marker", func(t *testing.T) {
+		r := newRec()
+		r.finalizeRelease(context.Background(), "vm-1", "orphan:vm-1", "orphan_stop",
+			"systemd unit with no DB row", "systemd_active_db_missing", errUnitNotTerminal)
+		r.mu.Lock()
+		_, kept := r.driftSeen["orphan:vm-1"]
+		r.mu.Unlock()
+		if !kept {
+			t.Fatal("a deferred release must keep its marker — the slot is still held")
+		}
+	})
+
+	t.Run("completion retires the marker", func(t *testing.T) {
+		r := newRec()
+		r.finalizeRelease(context.Background(), "vm-1", "orphan:vm-1", "orphan_stop",
+			"systemd unit with no DB row", "systemd_active_db_missing", nil)
+		r.mu.Lock()
+		_, kept := r.driftSeen["orphan:vm-1"]
+		r.mu.Unlock()
+		if kept {
+			t.Fatal("a completed release must retire its marker")
+		}
+	})
+}
