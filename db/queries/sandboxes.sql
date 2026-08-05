@@ -280,9 +280,12 @@ WHERE host_id = sqlc.arg(host_id)
 -- name: MarkSandboxFailed :one
 -- Used by the reconciler to mark a sandbox failed when VMD detects it is
 -- actually gone. No team_id filter — the reconciler runs with host scope,
--- not team scope. Guarded on the lifecycle state, not on updated_at: that
--- column moves for metadata and network-config edits too, so a version
--- compare would silently refuse the flip for a sandbox that is just as dead.
+-- not team scope. Guarded on the lifecycle state the caller observed, not on
+-- updated_at: that column moves for metadata and network-config edits too, so
+-- a version compare would silently refuse the flip for a sandbox that is just
+-- as dead. Callers pass the status their rule matched on — 'active' for a dead
+-- VM, 'paused' for an unusable snapshot — so a row that has moved on since the
+-- pass snapshot is left alone.
 -- The CTEs bundle the interval closes into the same statement so a
 -- crash/timeout between the writes can't leave an interval open and have
 -- analytics count the actor as active forever.
@@ -299,7 +302,7 @@ WITH failed AS (
   -- ever returned to 'paused' by a recovery path.
   SET status = 'failed', auto_delete_at = NULL, updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
-    AND sandbox.status = 'active'
+    AND sandbox.status = sqlc.arg(observed_status)
   RETURNING id
 ),
 closed_active AS (
