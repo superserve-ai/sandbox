@@ -546,6 +546,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			r.clearDrift("errunit:" + id)
 			continue
 		}
+		// A prior pass already decided and charged this reap; its deferred
+		// release owns the id now (see hasPendingRelease).
+		if r.hasPendingRelease(id) {
+			unlockOp()
+			continue
+		}
 		if !r.consumeAutoFailBudget(id) {
 			unlockOp()
 			r.writeAudit(ctx, id, "budget_exhausted", "error_unit_stop suppressed by rate limit", "boltdb_error_unit_active")
@@ -615,6 +621,14 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		if r.mgr.instanceRunning(id) {
 			unlockOp()
 			r.clearDrift("errdead:" + id)
+			return
+		}
+		// A prior pass already decided and charged this reap (the deferral
+		// can arrive here when the active half's stop deferred, or when
+		// markStale's probe went inconclusive after this half's own probe
+		// passed); the retry owns it (see hasPendingRelease).
+		if r.hasPendingRelease(id) {
+			unlockOp()
 			return
 		}
 		// Absence from the active-only snapshot is not terminal — an
@@ -795,10 +809,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if _, ok := dbSandboxes[id]; ok {
 				continue
 			}
-			// A deferred release keeps a dead-unit id matching this rule
-			// forever; the retry owns it (see hasPendingRelease). A LIVE
-			// unit is a fresh decision and still gets stopped below.
-			if !active[id] && r.hasPendingRelease(id) {
+			// A deferred release owns this id (see hasPendingRelease) —
+			// unconditionally: the top-of-pass active snapshot can still read
+			// true for the unit a same-pass Drift 3 just stopped and deferred,
+			// and re-deciding here double-charges the budget. A genuinely
+			// relaunched VM costs one pass: the retry voids its entry.
+			if r.hasPendingRelease(id) {
 				continue
 			}
 			if !r.gracePeriodElapsed("bolt-orphan:"+id, now) {
