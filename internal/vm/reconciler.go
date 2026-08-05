@@ -317,14 +317,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				continue
 			}
 			// Lock before spending budget, then re-probe the UNIT under it —
-			// not instanceRunning: nothing updates the in-memory record when
+			// never instanceRunning: nothing updates the in-memory record when
 			// firecracker dies out from under vmd, so a stale Running instance
-			// is the very state this rule cleans up, and trusting it would
-			// veto every reap. A resume that relaunched mid-pass owns a live
-			// unit again, which this probe sees. Terminal state, not merely
-			// not-active: the reap releases the record and slot, and a
-			// deactivating unit's process may still hold the tap. Fail-closed
-			// — an inconclusive probe defers to the next pass.
+			// is the very state this rule cleans up. A resume that relaunched
+			// mid-pass owns a live unit again, which this probe sees; an
+			// inconclusive probe defers to the next pass.
 			unlockOp, ok := r.mgr.tryLockVMOp(id)
 			if !ok {
 				continue
