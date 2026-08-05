@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -107,6 +108,30 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 		return manifest
 	}
 	pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
+	// Inline sparse staging under the still-held VM operation lock:
+	// copying scales with REAL bytes (the same O(dirtied) scaling as the
+	// pause itself, tens of ms for typical overlays), and the immutable
+	// copies close the fast-resume window entirely: a resume racing the
+	// worker cannot mutate a snapshot, so even an instantly-resumed
+	// pause keeps its backup. Oversized or failed staging falls back to
+	// the marker-only path, whose worker requires the at-rest proof and
+	// concedes fast-resume pauses to supersession.
+	if m.backupStaging != "" {
+		if dir, staged, err := backup.StagePending(m.backupStaging, vmID, pb.Token, map[string]string{
+			"vmstate.snap": snapshotPath,
+			"rootfs.ext4":  diskPath,
+		}); err == nil {
+			pb.StagedDir = dir
+			pb.SnapshotPath = staged["vmstate.snap"]
+			pb.DiskPath = staged["rootfs.ext4"]
+		} else if !errors.Is(err, backup.ErrStageTooLarge) {
+			log.Warn().Err(err).Str("vm_id", vmID).
+				Msg("inline pause staging failed; worker will need the at-rest proof")
+		} else {
+			log.Info().Str("vm_id", vmID).
+				Msg("packed disk exceeds inline staging budget; deferring to at-rest worker")
+		}
+	}
 	m.persistPendingBackup(pb, log)
 	go m.rehashPendingBackup(ctx, pb, log)
 	return manifest
@@ -141,6 +166,15 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	defer m.pendingInFlight.Delete(pb.VMID)
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 	defer cancel()
+	if pb.StagedDir != "" {
+		// Immutable pause-time copies need no at-rest proof and are
+		// never superseded by a resume or even a destroy: the copies ARE
+		// the pause's bytes, a running guest cannot mutate them, and the
+		// retention promise wants a destroyed sandbox's last pause in
+		// the bucket.
+		m.enqueueStagedPending(rctx, pb, log)
+		return
+	}
 	// Superseded (the sandbox is provably no longer paused on this
 	// snapshot) deletes the record: a resume, destroy, or newer pause
 	// owns coverage now. Everything merely INCONCLUSIVE (a stat error, a
@@ -289,6 +323,89 @@ func (m *Manager) ensureRehashSlots() chan struct{} {
 // a record kept on an inconclusive proof or transient failure must not
 // wait for the next process restart to try again.
 const pendingBackupSweepInterval = 5 * time.Minute
+
+// enqueueStagedPending hashes a pause's immutable staged copies and
+// enqueues them. The staged files carry no mutation risk, so the only
+// checks that remain are the base's (the base is not staged: guests
+// never write it, but a template rebuild can replace it).
+func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, log zerolog.Logger) {
+	if pb.DiskBasePath != "" {
+		cur, err := baseIdentity(pb.DiskBasePath)
+		if err != nil {
+			log.Warn().Err(err).Str("vm_id", pb.VMID).
+				Msg("staged pause backup inconclusive: base identity unreadable; keeping pending record")
+			m.healPendingBackup(pb, log)
+			return
+		}
+		if pb.BaseIdentity == "" || cur != pb.BaseIdentity {
+			log.Error().Str("vm_id", pb.VMID).
+				Msg("staged pause backup dropped: overlay base no longer the pause-time file")
+			m.dropStagedPending(pb, log)
+			return
+		}
+	}
+	entries := collectPauseManifest(ctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, log)
+	if pb.DiskBasePath != "" {
+		cur, err := baseIdentity(pb.DiskBasePath)
+		if err != nil || cur != pb.BaseIdentity {
+			log.Warn().Err(err).Str("vm_id", pb.VMID).
+				Msg("staged pause backup: base changed during hash; keeping pending record")
+			m.healPendingBackup(pb, log)
+			return
+		}
+	}
+	if !pauseManifestComplete(entries) {
+		if fileMissing(pb.SnapshotPath) || fileMissing(pb.DiskPath) {
+			// The staged copies themselves are gone (sweep after a long
+			// outage, manual cleanup): nothing recoverable remains.
+			log.Error().Str("vm_id", pb.VMID).
+				Msg("staged pause backup dropped: staged artifacts missing")
+			m.dropStagedPending(pb, log)
+			return
+		}
+		log.Warn().Str("vm_id", pb.VMID).
+			Msg("staged pause backup hash failed transiently; keeping pending record")
+		m.healPendingBackup(pb, log)
+		return
+	}
+	files := make([]backup.TaskFile, 0, len(entries))
+	for _, e := range entries {
+		files = append(files, backup.TaskFile{
+			Name: e.FileName, Path: e.Path, SHA256: e.SHA256, Size: e.SizeBytes,
+			BasePath: e.BasePath, BaseSHA256: e.BaseSHA256,
+		})
+	}
+	gen := backup.GenerationKey(files)
+	finalPaths, err := backup.FinishPendingStage(pb.StagedDir, gen, map[string]string{
+		"vmstate.snap": pb.SnapshotPath,
+		"rootfs.ext4":  pb.DiskPath,
+	})
+	if err != nil {
+		log.Warn().Err(err).Str("vm_id", pb.VMID).
+			Msg("staged pause backup: rename to generation failed; keeping pending record")
+		m.healPendingBackup(pb, log)
+		return
+	}
+	for i := range entries {
+		if p, ok := finalPaths[entries[i].FileName]; ok {
+			entries[i].Path = p
+		}
+	}
+	if ok, _ := m.enqueueBackup(pb.VMID, entries); ok {
+		m.deletePendingBackupIf(pb, log)
+		return
+	}
+	go m.retryEnqueue(pb, entries, log)
+}
+
+// dropStagedPending clears an unrecoverable staged marker and its
+// pending directory (post-rename generation dirs are ack-owned).
+func (m *Manager) dropStagedPending(pb PendingBackup, log zerolog.Logger) {
+	if pb.StagedDir != "" {
+		_ = os.RemoveAll(pb.StagedDir)
+	}
+	m.deletePendingBackupIf(pb, log)
+}
 
 // RecoverPendingBackups re-runs every pause that still owed its backup
 // enqueue when the previous process exited, then keeps sweeping

@@ -635,6 +635,12 @@ type PendingBackup struct {
 	// marker was created: the rehash must prove it is hashing the
 	// pause-time base, not a same-path replacement.
 	BaseIdentity string `json:"base_identity,omitempty"`
+	// StagedDir is the pending staging directory holding immutable
+	// pause-time copies of the mutable artifacts. When set, the worker
+	// hashes those copies and needs no at-rest proof for them: a resume
+	// cannot mutate a snapshot, so an immediately-resumed pause still
+	// gets its backup.
+	StagedDir string `json:"staged_dir,omitempty"`
 }
 
 // PutPendingBackup records (or refreshes) a pause's owed backup.

@@ -2,6 +2,8 @@ package vm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -873,5 +875,54 @@ func TestBackupPausePathIsDiskSizeIndependent(t *testing.T) {
 	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("pause-path backup work took %v against an 8GB overlay; the RPC path must be disk-size independent", elapsed)
+	}
+}
+
+// The Codex finding on the async move: an immediate resume must not
+// cost the pause its backup. With staging enabled, the pause stages
+// immutable copies inline, and the worker uploads them even though the
+// sandbox is running again by the time it looks.
+func TestFastResumeKeepsBackupViaInlineStaging(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(snap, []byte("vm state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(disk, []byte("pause-time disk bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		// The sandbox is ALREADY running again: the resume won the race
+		// before the worker got its verdict.
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusRunning}},
+		unitDead: func(context.Context, string) bool { return false },
+	}
+	m.backupStaging = staging
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+	// Mutate the originals immediately, as a resumed guest would.
+	if err := os.WriteFile(disk, []byte("post-resume bytes!!!"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case task := <-tasks:
+		var diskSHA string
+		for _, f := range task.Files {
+			if f.Name == "rootfs.ext4" {
+				diskSHA = f.SHA256
+			}
+		}
+		want := sha256.Sum256([]byte("pause-time disk bytes"))
+		if diskSHA != hex.EncodeToString(want[:]) {
+			t.Fatalf("task disk digest = %s, want the pause-time bytes", diskSHA)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("fast-resumed pause never enqueued from its staged copies")
 	}
 }

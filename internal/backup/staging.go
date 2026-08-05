@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -117,6 +118,85 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 		}
 	}
 	return all, nil
+}
+
+// inlineStageLimit bounds the packed bytes a pause may copy on the RPC
+// path. Sparse copies scale with REAL bytes, so a typical overlay (tens
+// of MB dirtied) stages in tens of milliseconds; a pathologically dense
+// overlay must not drag the pause RPC back into seconds, and falls back
+// to the marker-only worker path.
+const inlineStageLimit = 256 << 20
+
+// ErrStageTooLarge reports a pause whose packed disk exceeds the inline
+// staging budget.
+var ErrStageTooLarge = errors.New("packed size exceeds the inline staging budget")
+
+// StagePending sparse-copies a pause's mutable artifacts into a
+// pending-token directory under the staging root, called on the pause
+// RPC path WHILE the VM operation lock is held: nothing can resume yet,
+// so the copies are pause-time bytes by construction, and the detached
+// worker can hash them at leisure with no at-rest race. Returns the
+// staged directory and the staged path per file name. The copy is
+// O(real bytes), the same scaling as the pause itself.
+func StagePending(root, vmID, token string, files map[string]string) (string, map[string]string, error) {
+	if root == "" {
+		return "", nil, errors.New("staging disabled")
+	}
+	if disk, ok := files["rootfs.ext4"]; ok {
+		f, err := os.Open(disk)
+		if err != nil {
+			return "", nil, err
+		}
+		extents, _, err := Extents(f)
+		f.Close()
+		if err != nil {
+			return "", nil, err
+		}
+		if PackedSize(extents) > inlineStageLimit {
+			return "", nil, ErrStageTooLarge
+		}
+	}
+	dir := filepath.Join(root, vmID, "pending-"+token)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", nil, err
+	}
+	staged := make(map[string]string, len(files))
+	for name, src := range files {
+		dst := filepath.Join(dir, name)
+		if err := snapshotFileMode(dst, src, false); err != nil {
+			_ = os.RemoveAll(dir)
+			return "", nil, err
+		}
+		staged[name] = dst
+	}
+	if err := syncDir(dir); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", nil, err
+	}
+	return dir, staged, nil
+}
+
+// FinishPendingStage renames a hashed pending directory to its
+// generation name so ack cleanup and the sweep manage it under the
+// standard layout, returning the final path per file name.
+func FinishPendingStage(pendingDir, generation string, staged map[string]string) (map[string]string, error) {
+	final := filepath.Join(filepath.Dir(pendingDir), generation)
+	if err := os.Rename(pendingDir, final); err != nil {
+		if os.IsExist(err) {
+			// A prior attempt already renamed identical content.
+			_ = os.RemoveAll(pendingDir)
+		} else {
+			return nil, err
+		}
+	}
+	out := make(map[string]string, len(staged))
+	for name := range staged {
+		out[name] = filepath.Join(final, name)
+	}
+	if err := syncDir(filepath.Dir(final)); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // stagingFlights serializes concurrent writers of one staged
