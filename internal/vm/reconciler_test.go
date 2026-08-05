@@ -1140,3 +1140,57 @@ func TestFinalizeErrorReap_TagsDeferredRelease(t *testing.T) {
 		t.Fatal("a completed retry must retire the Drift 8 marker it was deferred under")
 	}
 }
+
+// A deferred release keeps its rule's predicate true (Running record, dead
+// unit), so without standing aside the rule re-decides every pass and one
+// wedged record drains the host's five-per-hour budget in minutes,
+// suppressing unrelated destructive reconciliation.
+func TestHasPendingReleaseStandsAside(t *testing.T) {
+	stubUnitTerminal(t, false) // the unit never reaches terminal: every release defers
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	// The rule's first decision: charge once, defer the release.
+	if !r.consumeAutoFailBudget("vm-1") {
+		t.Fatal("first decision must have budget")
+	}
+	if err := r.markStale(context.Background(), "vm-1"); !errors.Is(err, errUnitNotTerminal) {
+		t.Fatalf("non-terminal unit must defer, got %v", err)
+	}
+	if !r.hasPendingRelease("vm-1") {
+		t.Fatal("a deferred release must be visible to the rules")
+	}
+
+	// Later passes: the retry re-drives the release without charging budget…
+	spent := len(r.autoFailLog)
+	for i := 0; i < 10; i++ {
+		r.retryPendingReleases(context.Background())
+	}
+	if len(r.autoFailLog) != spent {
+		t.Fatalf("the retry must never charge budget, spent %d more", len(r.autoFailLog)-spent)
+	}
+	if !r.hasPendingRelease("vm-1") {
+		t.Fatal("a still-deferred release must stay owned by the retry")
+	}
+	// …and the release completes once the unit lands, budget untouched.
+	stubUnitTerminal(t, true)
+	r.retryPendingReleases(context.Background())
+	if r.hasPendingRelease("vm-1") {
+		t.Fatal("the retry must complete once the unit is terminal")
+	}
+	if len(r.autoFailLog) != spent {
+		t.Fatal("completion must not charge budget either")
+	}
+}

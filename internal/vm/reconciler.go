@@ -456,6 +456,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if errorRecord(id) {
 				continue
 			}
+			// A deferred release keeps this rule's predicate true; the retry
+			// owns it now (see hasPendingRelease).
+			if r.hasPendingRelease(id) {
+				continue
+			}
 			if !r.gracePeriodElapsed(id, now) {
 				continue
 			}
@@ -788,6 +793,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// not for every bolted entry.
 		for id := range boltedIDs {
 			if _, ok := dbSandboxes[id]; ok {
+				continue
+			}
+			// A deferred release keeps a dead-unit id matching this rule
+			// forever; the retry owns it (see hasPendingRelease). A LIVE
+			// unit is a fresh decision and still gets stopped below.
+			if !active[id] && r.hasPendingRelease(id) {
 				continue
 			}
 			if !r.gracePeriodElapsed("bolt-orphan:"+id, now) {
@@ -1481,6 +1492,18 @@ func (r *Reconciler) tagPendingRelease(vmID, marker string) {
 		r.pendingRelease[vmID] = e
 	}
 	r.mu.Unlock()
+}
+
+// hasPendingRelease reports a reap already decided for vmID whose release is
+// deferred. Rules whose predicate a deferral preserves (a Running record
+// behind a dead unit) must stand aside for it: re-deciding every pass would
+// re-charge the auto-fail budget — one wedged record drains the host's whole
+// budget in minutes — and re-audit a decision retryPendingReleases already owns.
+func (r *Reconciler) hasPendingRelease(vmID string) bool {
+	r.mu.Lock()
+	_, ok := r.pendingRelease[vmID]
+	r.mu.Unlock()
+	return ok
 }
 
 func (r *Reconciler) pendingReleaseIDs() []string {
