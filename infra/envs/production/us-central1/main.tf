@@ -97,12 +97,29 @@ module "iam" {
       account_id   = "superserve-api-runner"
       display_name = "Superserve API Cloud Run Service Account"
     }
+    grafana_monitoring = {
+      account_id   = "grafana-monitoring"
+      display_name = "Grafana Monitoring"
+    }
   }
   project_bindings = {
     production_host_metric_writer = {
       role = "roles/monitoring.metricWriter"
       members = [
         "serviceAccount:${local.api_service_account_email}"
+      ]
+    }
+    grafana_monitoring_viewer = {
+      role = "roles/monitoring.viewer"
+      members = [
+        "serviceAccount:grafana-monitoring@${local.project_id}.iam.gserviceaccount.com"
+      ]
+    }
+
+    grafana_browser = {
+      role = "roles/browser"
+      members = [
+        "serviceAccount:grafana-monitoring@${local.project_id}.iam.gserviceaccount.com"
       ]
     }
   }
