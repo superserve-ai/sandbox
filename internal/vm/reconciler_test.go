@@ -1269,6 +1269,11 @@ func TestReapDeadActiveVMs_PendingReleaseRedrivesFlipUncharged(t *testing.T) {
 		flips++
 		return true // row moved active→failed
 	}
+	// The reap is still current and still a corpse — the one shape the
+	// uncharged flip re-drive exists for.
+	origProbe := unitFullyDownProbe
+	unitFullyDownProbe = func(context.Context, string) bool { return true }
+	t.Cleanup(func() { unitFullyDownProbe = origProbe })
 	rows := map[string]db.ListSandboxesByHostRow{
 		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
 	}
@@ -1558,5 +1563,54 @@ func TestDriftEpisodesUseNonOwningIdentity(t *testing.T) {
 	m.vms["vm-1"] = &VMInstance{ID: "vm-1", Status: StatusRunning}
 	if r.episodeStillCurrent("vm-1", "vm-1") {
 		t.Fatal("a replacement instance must never inherit its predecessor's episode")
+	}
+}
+
+// The reviewer's race: a same-id relaunch completes between the systemd
+// snapshot (unit reads dead) and the DB snapshot (row reads Active) while an
+// old generation's pending release survives. The flip shortcut must verify
+// the pending reap is still current and still a corpse before touching the
+// row — the status-only CAS would otherwise fail the fresh generation, and
+// the orphan rule would then stop its live unit.
+func TestReapDeadActiveVMs_StalePendingDoesNotFailFreshGeneration(t *testing.T) {
+	stubUnitTerminal(t, false) // defer the old generation's release
+	sbID := uuid.New()
+	id := sbID.String()
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	old := &VMInstance{ID: id, Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{id: old}}
+	if err := store.Put(VMRecord{ID: id, Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	if err := r.markStale(context.Background(), id, ""); err == nil {
+		t.Fatal("non-terminal unit must defer")
+	}
+	// The relaunch replaces the instance; its fresh unit is up, its row Active.
+	m.vms[id] = &VMInstance{ID: id, Status: StatusRunning}
+	origProbe := unitFullyDownProbe
+	unitFullyDownProbe = func(context.Context, string) bool { return false } // fresh unit alive
+	t.Cleanup(func() { unitFullyDownProbe = origProbe })
+	flips := 0
+	r.markFailed = func(context.Context, string, db.SandboxStatus) bool { flips++; return true }
+
+	rows := map[string]db.ListSandboxesByHostRow{
+		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+	}
+	// Stale systemd evidence: the pass snapshot predates the relaunch.
+	r.reapDeadActiveVMs(context.Background(), zerolog.Nop(), rows, map[string]bool{}, func(string) bool { return false }, time.Now())
+
+	if flips != 0 {
+		t.Fatalf("the fresh generation's row must not be failed, flipped %d times", flips)
+	}
+	if r.hasPendingRelease(id) {
+		t.Fatal("the stale entry must be voided, not left to ambush later passes")
+	}
+	if rec, _ := store.Get(id); rec == nil {
+		t.Fatal("the fresh generation's record must survive")
 	}
 }

@@ -1589,6 +1589,32 @@ func (r *Reconciler) hasPendingRelease(vmID string) bool {
 	return ok
 }
 
+// pendingReleaseCurrent reports whether id's deferred entry still describes
+// the tracked instance — same identity+generation verdict the retry uses.
+// Callers hold the vm-op lock; a false verdict means a lifecycle op claimed
+// the VM since the reap was decided, and the entry must be voided, not acted.
+func (r *Reconciler) pendingReleaseCurrent(id string) bool {
+	r.mu.Lock()
+	noted, ok := r.pendingRelease[id]
+	r.mu.Unlock()
+	if !ok {
+		return false
+	}
+	r.mgr.mu.RLock()
+	cur := r.mgr.vms[id]
+	r.mgr.mu.RUnlock()
+	if cur != noted.inst {
+		return false
+	}
+	if cur == nil {
+		return true
+	}
+	cur.mu.RLock()
+	same := cur.gen == noted.gen
+	cur.mu.RUnlock()
+	return same
+}
+
 func (r *Reconciler) pendingReleaseIDs() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1674,10 +1700,28 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 		// hasPendingRelease) — but only the release: nobody else moves a
 		// stuck-active row off a dead VM, so the flip re-drives here,
 		// uncharged (same decision, already budgeted) and CAS-guarded.
+		// Only for a reap that is still CURRENT and still a corpse, verified
+		// under the lock: a same-id relaunch can complete between the systemd
+		// snapshot (unit reads dead) and the DB snapshot (row reads Active),
+		// and the status-only CAS would happily fail the fresh generation.
 		if r.hasPendingRelease(id) {
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			if !r.pendingReleaseCurrent(id) {
+				unlockOp()
+				r.voidPendingRelease(id)
+				continue
+			}
+			if !unitFullyDownProbe(ctx, systemdUnitName(id)) {
+				unlockOp()
+				continue
+			}
 			if r.markFailed(ctx, id, db.SandboxStatusActive) {
 				r.writeAudit(ctx, id, "mark_failed", "VM dead while DB said active", "db_active_systemd_missing")
 			}
+			unlockOp()
 			continue
 		}
 		if !r.graceElapsedFor(id, id, now, r.cfg.GracePeriod) {
