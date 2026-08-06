@@ -2589,16 +2589,23 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			}
 			// Delete-first, like markStale: freeing the slot while the record
 			// survives lets a later reattach of that record rebind a slot the
-			// pool has already handed to someone else. On failure keep both —
-			// the reconciler owns the retry.
-			if derr := m.state.Delete(rec.ID); derr != nil {
-				log.Error().Err(derr).Msg("failed to delete stale record; keeping its slot reserved")
+			// pool has already handed to someone else.
+			if derr := m.state.Delete(rec.ID); derr == nil {
+				// Free this record's namespace/slot directly instead of a broad
+				// re-sweep (which would also delete the warm pool's netns).
+				m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
 				return nil, false
+			} else {
+				// Keep record AND slot — but returning unowned would strand
+				// them: with the DB row already failed, no drift rule matches
+				// a Running record behind a dead unit. Park as Error and fall
+				// through to the publish tail, so Drift 8's dead half owns the
+				// release through the deferred-retry machinery. In-memory
+				// only: the store just refused a delete, a Put would fare no
+				// better, and errorRecord reads the tracked instance first.
+				log.Error().Err(derr).Msg("failed to delete stale record; parking as error with its slot reserved")
+				rec.Status = StatusError
 			}
-			// Free this record's namespace/slot directly instead of a broad
-			// re-sweep (which would also delete the warm pool's netns).
-			m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
-			return nil, false
 		}
 		if rec.SocketPath != "" {
 			if _, statErr := os.Stat(rec.SocketPath); statErr != nil {

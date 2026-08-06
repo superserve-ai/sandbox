@@ -2260,3 +2260,43 @@ func TestCommitResumeState_UndurableRunning_FailsResume(t *testing.T) {
 		t.Fatal("DirtyTracked must clear with the unit stopped")
 	}
 }
+
+// A startup sweep that cannot delete a stale record must not abandon it: with
+// the DB row already failed, no drift rule matches a Running record behind a
+// dead unit, so record and slot would be stranded until yet another restart.
+// Parking it as Error hands it to the error rules' deferred-retry machinery.
+func TestReattachRecord_StaleDeleteFails_ParksAsError(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return true } // unit conclusively gone
+	defer func() { vmUnitFullyDown = origDown }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := VMRecord{ID: "vm-1", Status: StatusRunning} // no namespace: skip netns bind
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil { // the delete cannot land
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if !ok || inst == nil {
+		t.Fatal("an unreleasable stale record must be parked, not abandoned")
+	}
+	inst.mu.RLock()
+	st := inst.Status
+	inst.mu.RUnlock()
+	if st != StatusError {
+		t.Fatalf("the parked record must read Error so the error rules own it, got %v", st)
+	}
+	m.mu.RLock()
+	_, tracked := m.vms["vm-1"]
+	m.mu.RUnlock()
+	if !tracked {
+		t.Fatal("the parked instance must be tracked, or no rule can find it")
+	}
+}
