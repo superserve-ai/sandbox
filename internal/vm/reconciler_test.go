@@ -1299,3 +1299,50 @@ func TestLifecycleClaimVoidsPendingRelease(t *testing.T) {
 		t.Fatalf("the re-paused record must survive untouched, got %v", rec)
 	}
 }
+
+// A deferred release owns only the RELEASE half of Drift 1's reap: the row
+// flip re-drives uncharged (nobody else moves a stuck-active row off a dead
+// VM), and no second auto-fail slot is spent for the same decision.
+func TestReapDeadActiveVMs_PendingReleaseRedrivesFlipUncharged(t *testing.T) {
+	stubUnitTerminal(t, false) // the release stays deferred
+	sbID := uuid.New()
+	id := sbID.String()
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: id, Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{id: {ID: id, Status: StatusRunning}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	if err := r.markStale(context.Background(), id, ""); err == nil {
+		t.Fatal("non-terminal unit must defer")
+	}
+	flips := 0
+	r.markFailed = func(_ context.Context, vmID string, observed db.SandboxStatus) bool {
+		flips++
+		return true // row moved active→failed
+	}
+	rows := map[string]db.ListSandboxesByHostRow{
+		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+	}
+
+	spent := len(r.autoFailLog)
+	r.reapDeadActiveVMs(context.Background(), zerolog.Nop(), rows, map[string]bool{}, func(string) bool { return false }, time.Now())
+
+	if flips != 1 {
+		t.Fatalf("the stuck-active row must be flipped exactly once, got %d", flips)
+	}
+	if len(r.autoFailLog) != spent {
+		t.Fatalf("re-driving an already-budgeted decision must not charge again, spent %d more", len(r.autoFailLog)-spent)
+	}
+	if !r.hasPendingRelease(id) {
+		t.Fatal("the release must stay owned by the retry")
+	}
+}

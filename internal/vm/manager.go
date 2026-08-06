@@ -2587,7 +2587,14 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				sigkillPID(rec.PID, 500*time.Millisecond)
 				log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
 			}
-			m.state.Delete(rec.ID)
+			// Delete-first, like markStale: freeing the slot while the record
+			// survives lets a later reattach of that record rebind a slot the
+			// pool has already handed to someone else. On failure keep both —
+			// the reconciler owns the retry.
+			if derr := m.state.Delete(rec.ID); derr != nil {
+				log.Error().Err(derr).Msg("failed to delete stale record; keeping its slot reserved")
+				return nil, false
+			}
 			// Free this record's namespace/slot directly instead of a broad
 			// re-sweep (which would also delete the warm pool's netns).
 			m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)

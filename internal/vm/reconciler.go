@@ -427,8 +427,8 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			log.Warn().Str("vm_id", id).Str("drift", "fc_empty_shell").
 				Msg("unit active but Firecracker holds no microVM — stopping the shell and marking failed")
 			err := stopUnit(ctx, systemdUnitName(id))
-			unlockOp()
 			if err != nil {
+				unlockOp()
 				// Leave the row untouched (a failed row behind a live
 				// unit would strand it). Refund the budget slot only when
 				// the stop provably never happened; an accepted-but-
@@ -449,7 +449,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// dead-VM rule). Detach from the pass context, bounded.
 			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			flipped := r.markFailedInDB(persistCtx, id, db.SandboxStatusActive)
+			// Still under the vm-op lock: a resume winning the lock between
+			// the terminal probe and the cleanup would have its fresh record
+			// deleted and its live namespace reclaimed.
 			releaseErr := r.markStale(persistCtx, id, "")
+			unlockOp()
 			if releaseErr != nil {
 				r.finalizeRelease(persistCtx, id, "", "", "empty Firecracker shell while DB said active", "fc_empty_shell", releaseErr)
 			}
@@ -491,7 +495,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "boltdb_running_unit_missing").
 				Msg("dead Firecracker detected (no DB context)")
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue // an op owns the VM; its claim voided any pending entry
+			}
 			releaseErr := r.markStale(ctx, id, "")
+			unlockOp()
 			r.finalizeRelease(ctx, id, "", "stale_cleanup", "VM dead, DB unavailable", "boltdb_running_unit_missing", releaseErr)
 		}
 	}
@@ -536,7 +545,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				continue
 			}
 			removeUnitDropIn(id)
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
 			releaseErr := r.markStale(ctx, id, "orphan:"+id)
+			unlockOp()
 			r.finalizeRelease(ctx, id, "orphan:"+id, "orphan_stop", reason, kind, releaseErr)
 		}
 	}
@@ -869,7 +883,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				}
 				removeUnitDropIn(id)
 			}
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
 			releaseErr := r.markStale(ctx, id, "bolt-orphan:"+id)
+			unlockOp()
 			r.finalizeRelease(ctx, id, "bolt-orphan:"+id, "stale_cleanup", "BoltDB entry with no DB row", "boltdb_present_db_missing", releaseErr)
 		}
 	}
@@ -1607,6 +1626,16 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 		// probe — a deactivating unit is absent from the active snapshot
 		// while its process may live on.
 		if errorRecord(id) {
+			continue
+		}
+		// A deferred release owns the release half of this reap (see
+		// hasPendingRelease) — but only the release: nobody else moves a
+		// stuck-active row off a dead VM, so the flip re-drives here,
+		// uncharged (same decision, already budgeted) and CAS-guarded.
+		if r.hasPendingRelease(id) {
+			if r.markFailed(ctx, id, db.SandboxStatusActive) {
+				r.writeAudit(ctx, id, "mark_failed", "VM dead while DB said active", "db_active_systemd_missing")
+			}
 			continue
 		}
 		if !r.gracePeriodElapsed(id, now) {
