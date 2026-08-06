@@ -560,24 +560,28 @@ func (m *Manager) atRest(ctx context.Context, vmID, snapshotPath string) bool {
 
 // vmConfirmedAtRest reports whether the sandbox's Firecracker is fully
 // stopped so its artifacts are byte-stable — the at-rest proof every backup
-// gates on. Mode-aware: a unit VM needs its unit in a TERMINAL state
+// gates on. It requires BOTH possible supervisors quiet, deliberately NOT
+// dispatching on the recorded mode: a crash between a launch and its persist
+// leaves the record's mode behind reality (a scope-gone fallback starts a
+// unit over a cgroup record; an armed resume starts a cgroup FC over a unit
+// record), and the recorded mode's oracle then answers vacuously while the
+// other supervisor's guest is still writing. The unit claim is TERMINAL
 // (unitFullyDown, not the weaker "not active" that calls a deactivating unit
-// dead while it may still flush guest writes); a cgroup VM needs its group
-// CONCLUSIVELY empty (cgroupDefinitelyDead — an unreadable or populated group
-// is not at rest). Without the cgroup branch a direct-spawned VM would probe
-// a nonexistent unit, read vacuously "down", and back up bytes still in
-// flight. Overridable for tests via the unitDead seam, which stands in for
-// the whole probe regardless of mode.
+// dead while it may still flush guest writes); the cgroup claim is a
+// conclusively empty-or-absent group (populated or unreadable is not at
+// rest, and no delegated subtree means no cgroup FC can exist). Overridable
+// for tests via the unitDead seam, which stands in for the whole probe.
 func (m *Manager) vmConfirmedAtRest(ctx context.Context, vmID string) bool {
 	if m.unitDead != nil {
 		return m.unitDead(ctx, vmID)
 	}
-	sup := m.supervisionForVM(vmID)
-	if !knownSupervision(sup) {
-		return false // no oracle applies to an unknown mode — not at rest
+	if !knownSupervision(m.supervisionForVM(vmID)) {
+		// A mode this binary predates may supervise through a mechanism
+		// neither oracle below can see — never at rest.
+		return false
 	}
-	if cgroupSupervised(sup) {
-		return m.cgroupDefinitelyDead(vmID)
+	if m.cgroupStillLive(vmID) {
+		return false
 	}
 	return unitFullyDown(ctx, systemdUnitName(vmID))
 }

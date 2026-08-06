@@ -864,10 +864,12 @@ func TestStagingFallsBackAndKeepsMarkerWhenNotAtRest(t *testing.T) {
 	}
 }
 
-// The at-rest oracle must be mode-aware: a cgroup VM has no systemd unit, so
-// the unit probe would read it vacuously dead and back up bytes still in
-// flight. A populated group is NOT at rest; a conclusively-empty one is.
+// The at-rest oracle must see the cgroup side: a cgroup VM has no systemd
+// unit, so the unit probe alone would read it vacuously dead and back up
+// bytes still in flight. A populated group is NOT at rest; a conclusively-
+// empty one is (with the unit side also quiet).
 func TestVMConfirmedAtRestCgroupMode(t *testing.T) {
+	shimSystemctlDown(t) // the unit side is quiet throughout
 	dir := t.TempDir()
 	tree := &cgroupTree{vms: dir}
 	vmID := "vm-1"
@@ -907,4 +909,61 @@ func TestVMConfirmedAtRestCgroupMode(t *testing.T) {
 	if m.vmConfirmedAtRest(context.Background(), vmID) {
 		t.Fatal("an unreadable cgroup must not read as at-rest")
 	}
+}
+
+// shimSystemctlActive answers every unit query "active" — a live unit.
+func shimSystemctlActive(t *testing.T) {
+	t.Helper()
+	shim := t.TempDir()
+	script := "#!/bin/sh\ncase \"$1\" in\nshow) echo active ;;\nis-active) exit 0 ;;\nesac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(shim, "systemctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// A crash between a launch and its persist leaves the record's mode behind
+// reality: a scope-gone fallback starts a UNIT over a paused cgroup record;
+// an armed resume starts a cgroup FC over a unit record. The at-rest proof
+// must require BOTH supervisors quiet — the recorded mode's own oracle
+// answers vacuously in exactly these windows, and hashing then backs up
+// bytes the other supervisor's guest is still writing.
+func TestVMConfirmedAtRest_RequiresBothSupervisorsQuiet(t *testing.T) {
+	newMgr := func(tree *cgroupTree, sup Supervision) *Manager {
+		return &Manager{
+			log:     zerolog.Nop(),
+			cgroups: tree,
+			vms:     map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusPaused, Supervision: sup}},
+		}
+	}
+
+	t.Run("live fallback unit vetoes a cgroup record", func(t *testing.T) {
+		shimSystemctlActive(t)                // the fallback unit is alive
+		tree := &cgroupTree{vms: t.TempDir()} // no group: the cgroup oracle reads empty
+		if newMgr(tree, SupervisionCgroup).vmConfirmedAtRest(context.Background(), "vm-1") {
+			t.Fatal("a live unit must veto at-rest even when the record says cgroup")
+		}
+	})
+
+	t.Run("live cgroup vetoes a unit record", func(t *testing.T) {
+		shimSystemctlDown(t) // no unit — vacuously down
+		tree := &cgroupTree{vms: t.TempDir()}
+		if err := os.MkdirAll(tree.vmCgroupDir("vm-1"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tree.vmCgroupDir("vm-1"), "cgroup.events"), []byte("populated 1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if newMgr(tree, SupervisionUnit).vmConfirmedAtRest(context.Background(), "vm-1") {
+			t.Fatal("a live cgroup must veto at-rest even when the record says unit")
+		}
+	})
+
+	t.Run("both supervisors quiet reads at rest", func(t *testing.T) {
+		shimSystemctlDown(t)
+		tree := &cgroupTree{vms: t.TempDir()}
+		if !newMgr(tree, SupervisionCgroup).vmConfirmedAtRest(context.Background(), "vm-1") {
+			t.Fatal("no unit and no group must read at rest")
+		}
+	})
 }
