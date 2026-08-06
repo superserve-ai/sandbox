@@ -24,7 +24,7 @@ on:
 jobs:
   deploy-staging:
     if: github.event_name == 'push' || github.event.inputs.environment == 'staging'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: staging
     permissions:
       contents: read
@@ -53,7 +53,7 @@ jobs:
 
   deploy-production:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: production
     permissions:
       contents: read
