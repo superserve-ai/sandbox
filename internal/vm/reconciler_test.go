@@ -1491,3 +1491,49 @@ func TestReapDeadActiveVMs_RepauseABASpared(t *testing.T) {
 		t.Fatalf("the re-paused generation's record must survive, got %v", rec)
 	}
 }
+
+// A healthy row must heal the drift episode: without it, a later orphan
+// observation against the SAME generation (a row that flapped
+// deleted→active→deleted while the VM ran untouched) inherits the old
+// timestamp and stops the unit without serving its own grace.
+func TestStopOrphanUnits_HealThenRecurServesFreshGrace(t *testing.T) {
+	stubUnitTerminal(t, true)
+	sbID := uuid.New()
+	id := sbID.String()
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{id: {ID: id, Status: StatusRunning}}}
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	m.state = store
+	if err := store.Put(VMRecord{ID: id, Status: StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	stopped := 0
+	orig := stopUnitFn
+	stopUnitFn = func(context.Context, string) error { stopped++; return nil }
+	t.Cleanup(func() { stopUnitFn = orig })
+
+	orphan := map[string]db.ListSandboxesByHostRow{} // row absent
+	healthy := map[string]db.ListSandboxesByHostRow{
+		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+	}
+	active := map[string]bool{id: true}
+	noErr := func(string) bool { return false }
+	now := time.Now()
+
+	r.stopOrphanUnits(context.Background(), zerolog.Nop(), orphan, active, noErr, now)  // opens
+	r.stopOrphanUnits(context.Background(), zerolog.Nop(), healthy, active, noErr, now) // heals
+	// Recurs later, same generation, at a time the ORIGINAL episode would
+	// have long satisfied: only a fresh grace may gate the stop.
+	r.stopOrphanUnits(context.Background(), zerolog.Nop(), orphan, active, noErr, now.Add(3*r.cfg.GracePeriod))
+	if stopped != 0 {
+		t.Fatalf("a recurrence after a heal must serve a fresh grace, stopped %d", stopped)
+	}
+	r.stopOrphanUnits(context.Background(), zerolog.Nop(), orphan, active, noErr, now.Add(5*r.cfg.GracePeriod))
+	if stopped != 1 {
+		t.Fatalf("the recurred orphan must be stopped once its own grace elapses, got %d", stopped)
+	}
+}

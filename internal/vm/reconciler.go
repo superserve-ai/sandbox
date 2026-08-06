@@ -800,6 +800,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// not for every bolted entry.
 		for id := range boltedIDs {
 			if _, ok := dbSandboxes[id]; ok {
+				r.clearDrift("bolt-orphan:" + id) // healed; see Drift 3's twin
 				continue
 			}
 			// A deferred release owns this id (see hasPendingRelease) —
@@ -1797,6 +1798,10 @@ func (r *Reconciler) stopOrphanUnits(ctx context.Context, log zerolog.Logger, db
 		deleted := known && sb.Sandbox.Status == db.SandboxStatusDeleted
 		failed := known && sb.Sandbox.Status == db.SandboxStatusFailed
 		if known && !deleted && !failed {
+			// A healthy row heals the episode. Without this, a later orphan
+			// observation against the SAME generation (a row that flapped)
+			// inherits the old timestamp and acts without its grace.
+			r.clearDrift("orphan:" + id)
 			continue
 		}
 		// Error records are Drift 8's (see Drift 1): its halves gate
