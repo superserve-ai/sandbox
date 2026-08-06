@@ -133,6 +133,29 @@ func seedBillingPeriodForStripe(t *testing.T, approved bool, exportEnabled bool)
 	`, teamID, periodStart, periodEnd); err != nil {
 		t.Fatalf("seed billing usage: %v", err)
 	}
+	sandboxID := uuid.New()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id)
+		VALUES ($1, $2, 'stripe-billing-fixture', 'deleted', 1, 1024, 'default')
+	`, sandboxID, teamID); err != nil {
+		t.Fatalf("seed billing sandbox: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason
+		)
+		VALUES ($1, $2, 1, 1024, $3, $4, 'deleted')
+	`, sandboxID, teamID, periodStart, periodStart.Add(2*time.Hour)); err != nil {
+		t.Fatalf("seed billing compute interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (
+			sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason
+		)
+		VALUES ($1, $2, 1024, $3, $4, 'deleted')
+	`, sandboxID, teamID, periodStart, periodStart.Add(time.Hour)); err != nil {
+		t.Fatalf("seed billing storage interval: %v", err)
+	}
 	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
 		TeamID:      teamID,
 		PeriodStart: periodStart,
@@ -245,6 +268,9 @@ func TestIntegration_LiveBillingSendsStripeEventsAndIsIdempotent(t *testing.T) {
 		if got := len(call.Identifier); got > 100 {
 			t.Fatalf("stripe identifier %d length = %d, want <= 100", i, got)
 		}
+		if got := call.Value; got != "7200" {
+			t.Fatalf("stripe call %d quantity = %q, want 7200 seconds", i, got)
+		}
 		wantTimestamp := periodEnd.UTC().Add(-time.Second).Unix()
 		if call.Timestamp != wantTimestamp {
 			t.Fatalf("stripe call %d timestamp = %d, want %d", i, call.Timestamp, wantTimestamp)
@@ -293,6 +319,9 @@ func TestIntegration_CreateStripeCheckoutSessionUsesConfiguredPrice(t *testing.T
 	}
 	if got := stripe.checkoutCalls[0].ClientReferenceID; got != teamID.String() {
 		t.Fatalf("client reference id = %q, want team id %q", got, teamID.String())
+	}
+	if got := stripe.checkoutCalls[0].IdempotencyKey; got == "" {
+		t.Fatal("checkout idempotency key was not set")
 	}
 }
 
@@ -528,6 +557,39 @@ func TestIntegration_TeamBillingUsageDoesNotCreatePeriodsForAdHocWindows(t *test
 	})
 	if !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("ad hoc usage should not create a billing period row, got err=%v", err)
+	}
+}
+
+func TestIntegration_TeamBillingExportPreviewDoesNotCreatePeriods(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+	periodStart := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Hour)
+	periodEnd := periodStart.Add(time.Hour)
+	cw := do(newRouter(t), "POST", "/sandboxes", ownerKey, `{"name":"billing-export-preview-read-only"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: expected 201, got %d: %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded compute billing interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_storage_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded storage billing interval: %v", err)
+	}
+
+	r := newBillingRouter(t, nil)
+	resp := do(r, "GET", "/teams/"+teamID.String()+"/billing/periods/"+apiPeriodID(periodStart, periodEnd)+"/export-preview", viewerKey, "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("billing export preview: expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	_, err := testQueries.GetTeamBillingPeriod(ctx, db.GetTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("export preview should not create a billing period row, got err=%v", err)
 	}
 }
 

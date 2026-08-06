@@ -59,6 +59,7 @@ type StripeCreateCheckoutSessionParams struct {
 	CancelURL         string
 	ClientReferenceID string
 	PriceIDs          []string
+	IdempotencyKey    string
 }
 
 type StripeCheckoutSession struct {
@@ -249,7 +250,7 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 		ID  string `json:"id"`
 		URL string `json:"url"`
 	}
-	if err := c.doForm(ctx, http.MethodPost, "/v1/checkout/sessions", form, &resp, ""); err != nil {
+	if err := c.doForm(ctx, http.MethodPost, "/v1/checkout/sessions", form, &resp, params.IdempotencyKey); err != nil {
 		return StripeCheckoutSession{}, err
 	}
 	return StripeCheckoutSession{ID: resp.ID, URL: resp.URL}, nil
@@ -514,9 +515,9 @@ func (h *Handlers) getTeamBillingExportPreview(c *gin.Context, platform bool) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
-	usage, period, err := h.upsertBillingSnapshot(c.Request.Context(), teamID, periodStart, periodEnd)
+	usage, period, err := h.readBillingSnapshot(c.Request.Context(), teamID, periodStart, periodEnd)
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("upsert billing snapshot for preview failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read billing snapshot for preview failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -807,6 +808,7 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 		if _, ok := submitted[resourceType]; ok {
 			continue
 		}
+		meterValue, ok := stripeMeterQuantity(item.Value)
 		row, err := q.CreateBillingUsageExport(c.Request.Context(), db.CreateBillingUsageExportParams{
 			TeamID:                     teamID,
 			PeriodStart:                periodStart,
@@ -823,12 +825,23 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
+		if !ok {
+			if _, err := q.UpdateBillingUsageExportStatus(c.Request.Context(), db.UpdateBillingUsageExportStatusParams{
+				ID:     row.ID,
+				Status: "skipped_zero",
+			}); err != nil {
+				log.Error().Err(err).Str("team_id", teamID.String()).Msg("mark zero billing export attempt skipped failed")
+				respondError(c, ErrInternal)
+				return
+			}
+			continue
+		}
 
 		err = h.Stripe.ReportMeterEvent(c.Request.Context(), StripeReportMeterEventParams{
 			Identifier: item.Identifier,
 			EventName:  item.EventName,
 			CustomerID: *account.StripeCustomerID,
-			Value:      formatDecimal(item.Value),
+			Value:      meterValue,
 			Timestamp:  periodEnd.UTC().Add(-time.Second).Unix(),
 		})
 		if err != nil {
@@ -1028,6 +1041,7 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		CancelURL:         cancelURL,
 		ClientReferenceID: teamID.String(),
 		PriceIDs:          priceIDs,
+		IdempotencyKey:    checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs),
 	})
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("create Stripe checkout session failed")
@@ -1747,7 +1761,7 @@ func latestSubmittedByResource(rows []db.BillingUsageExport) map[string]db.Billi
 	out := map[string]db.BillingUsageExport{}
 	for _, row := range rows {
 		// `accepted` is retained for older rows; `sent` is the primary success state.
-		if row.Status != "sent" && row.Status != "accepted" {
+		if row.Status != "sent" && row.Status != "accepted" && row.Status != "skipped_zero" {
 			continue
 		}
 		out[row.ResourceType] = row
@@ -1819,6 +1833,18 @@ func numericFromFloat(v float64) pgtype.Numeric {
 
 func formatDecimal(v float64) string {
 	return strconv.FormatFloat(v, 'f', 6, 64)
+}
+
+func stripeMeterQuantity(hours float64) (string, bool) {
+	seconds := math.Round(hours * 3600.0)
+	if seconds <= 0 {
+		return "", false
+	}
+	return strconv.FormatInt(int64(seconds), 10), true
+}
+
+func checkoutSessionIdempotencyKey(teamID uuid.UUID, customerID, successURL, cancelURL string, priceIDs []string) string {
+	return fmt.Sprintf("checkout:%s:%s:%s:%s:%s", teamID.String(), customerID, successURL, cancelURL, strings.Join(priceIDs, ","))
 }
 
 func stringPtr(v string) *string {
