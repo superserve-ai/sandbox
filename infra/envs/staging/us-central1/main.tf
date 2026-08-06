@@ -177,6 +177,10 @@ module "api" {
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
     SUPABASE_URL                = var.supabase_url
     VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host.internal_ip)
+    STRIPE_API_BASE_URL         = "https://api.stripe.com"
+    STRIPE_CHECKOUT_PRICE_IDS   = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
+    STRIPE_API_VERSION          = "2026-05-27.dahlia"
+    APP_ALLOWED_ORIGINS         = "https://console-staging.superserve.ai"
   }
   secrets = {
     SANDBOX_ACCESS_TOKEN_SEED = {
@@ -194,11 +198,22 @@ module "api" {
     SYSTEM_TEAM_ID = {
       secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
     }
+    STRIPE_SECRET_KEY = {
+      secret = google_secret_manager_secret.stripe_secret_key.secret_id
+    }
+
+    STRIPE_WEBHOOK_SECRET = {
+      secret = google_secret_manager_secret.stripe_webhook_secret.secret_id
+    }
   }
   vpc_connector = module.network.vpc_connector_id
   labels        = local.common_labels
 
-  depends_on = [google_secret_manager_secret_iam_member.api_runtime_system_team_id]
+  depends_on = [
+    google_secret_manager_secret_iam_member.api_runtime_system_team_id,
+    google_secret_manager_secret_iam_member.api_runtime_stripe_secret_key,
+    google_secret_manager_secret_iam_member.api_runtime_stripe_webhook_secret,
+  ]
 }
 resource "google_compute_disk" "sandbox_data" {
   project = local.project_id
@@ -232,6 +247,40 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_system_team_id" 
   secret_id = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
+}
+resource "google_secret_manager_secret_iam_member" "api_runtime_stripe_secret_key" {
+  project   = local.project_id
+  secret_id = google_secret_manager_secret.stripe_secret_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_runtime_stripe_webhook_secret" {
+  project   = local.project_id
+  secret_id = google_secret_manager_secret.stripe_webhook_secret.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
+}
+resource "google_secret_manager_secret" "stripe_secret_key" {
+  project   = local.project_id
+  secret_id = "stripe-secret-key-${local.resource_suffix}"
+
+  replication {
+    auto {}
+  }
+
+  labels = local.common_labels
+}
+
+resource "google_secret_manager_secret" "stripe_webhook_secret" {
+  project   = local.project_id
+  secret_id = "stripe-webhook-secret-${local.resource_suffix}"
+
+  replication {
+    auto {}
+  }
+
+  labels = local.common_labels
 }
 
 module "sandbox_host" {
