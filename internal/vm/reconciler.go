@@ -666,10 +666,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			continue
 		}
 		// A nil stop can still mean a deactivating unit (the expired-wait
-		// settle reports those complete); releasing the record and namespace
-		// needs the terminal claim — by the mode the active set saw, or a
-		// cgroup VM's nonexistent unit answers vacuously. Not yet down → the
-		// record stays for the dead half to retry once it is.
+		// settle reports those complete); release needs the mode-aware
+		// terminal claim (vmFullyDown). Not yet down → the record stays for
+		// the dead half to retry once it is.
 		if !r.vmFullyDown(ctx, id, supervisionOf[id]) {
 			unlockOp()
 			continue
@@ -1606,10 +1605,8 @@ func (r *Reconciler) failEmptyShells(ctx context.Context, log zerolog.Logger, db
 				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop empty-shell VM")
 				continue
 			}
-			// Release needs the mode-aware terminal proof before the row flip
-			// and record release — a cgroup shell's nonexistent unit reads
-			// vacuously down, and a unit's nil stop can still mean
-			// deactivating. Not yet down → retry next pass.
+			// The row flip and release need the mode-aware terminal proof
+			// (vmFullyDown); not yet down → retry next pass.
 			if !r.vmFullyDown(ctx, id, supervisionOf[id]) {
 				unlockOp()
 				r.writeAudit(ctx, id, "stop_failed", "empty-shell stop not terminal; retrying next pass", "fc_empty_shell")
@@ -1679,9 +1676,8 @@ func (r *Reconciler) reapUnverifiedOrphans(ctx context.Context, log zerolog.Logg
 				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop abandoned crash-window VM")
 				continue
 			}
-			// Release needs the mode-aware terminal proof: a cgroup VM's
-			// nonexistent unit reads vacuously down, and a unit's nil stop
-			// can still mean deactivating. Not yet down → retry next pass.
+			// Release needs the mode-aware terminal proof (vmFullyDown);
+			// not yet down → retry next pass.
 			if !r.vmFullyDown(ctx, id, supervisionOf[id]) {
 				unlockOp()
 				continue
