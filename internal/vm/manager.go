@@ -102,7 +102,14 @@ type VMInstance struct {
 	// fresh instances need no bump, and inspection ops (env inject,
 	// verification) must NOT bump, or they void retries for VMs they never
 	// touched.
+	//
+	// incarnation is a process-unique, non-owning identity, lazily stamped by
+	// incarnationID at the reconciler's first contact — episodes store this
+	// integer instead of the pointer, so drift bookkeeping can never root a
+	// removed instance, and a fresh instance at a reused address can never
+	// masquerade as its predecessor.
 	gen          uint64
+	incarnation  uint64
 	Config       VMConfig
 	RunDirID     string // Directory name under RunDir for this VM's files.
 	Namespace    string // Network namespace name.
@@ -3221,6 +3228,25 @@ func (m *Manager) getInstance(vmID string) (*VMInstance, error) {
 		return inst, nil
 	}
 	return nil, status.Errorf(codes.NotFound, "vm %s not found", vmID)
+}
+
+// incarnationCounter feeds VMInstance.incarnation; 0 is reserved for
+// "no instance".
+var incarnationCounter atomic.Uint64
+
+// incarnationID returns inst's process-unique identity, stamping it on first
+// use. Nil-safe: no instance is identity 0, which no stamped instance holds.
+func (inst *VMInstance) incarnationID() uint64 {
+	if inst == nil {
+		return 0
+	}
+	inst.mu.Lock()
+	if inst.incarnation == 0 {
+		inst.incarnation = incarnationCounter.Add(1)
+	}
+	v := inst.incarnation
+	inst.mu.Unlock()
+	return v
 }
 
 func (m *Manager) setStatus(vmID string, s VMStatus) {

@@ -463,6 +463,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	if dbSandboxes == nil {
 		for id, rec := range bolted {
 			if rec.Status != StatusRunning {
+				r.clearDrift(id) // predicate stopped matching; see the Drift 3 heal
 				continue
 			}
 			if active[id] {
@@ -1238,7 +1239,7 @@ func (r *Reconciler) graceElapsedFor(key, vmID string, now time.Time, window tim
 	defer r.mu.Unlock()
 	e, ok := r.driftSeen[key]
 	if !ok {
-		r.driftSeen[key] = driftEpisode{at: now, inst: inst, gen: gen}
+		r.driftSeen[key] = newDriftEpisode(now, inst, gen)
 		return false
 	}
 	return now.Sub(e.at) >= window
@@ -1265,9 +1266,15 @@ var statPauseArtifact = func(path string) (present, confirmedMissing bool) {
 // its generation — acting on the stale snapshot would stop the NEW unit, and
 // that destruction lands in this pass, not a later one.
 type driftEpisode struct {
-	at   time.Time
-	inst *VMInstance
-	gen  uint64
+	at time.Time
+	// inc is the instance's NON-OWNING incarnation identity (see
+	// VMInstance.incarnation): the episode must recognize its instance, not
+	// keep it alive — a pointer here would root the whole VMInstance graph in
+	// driftSeen for every episode whose predicate quietly stopped matching,
+	// since disappeared candidates are exactly the ones no loop revisits to
+	// clear.
+	inc uint64
+	gen uint64
 }
 
 // episodeStillCurrent reports whether key's episode still describes vmID's
@@ -1291,11 +1298,15 @@ func (r *Reconciler) episodeStillCurrent(key, vmID string) bool {
 	if !ok {
 		return false
 	}
-	if e.inst == inst && e.gen == gen {
+	if e.inc == inst.incarnationID() && e.gen == gen {
 		return true
 	}
-	r.driftSeen[key] = driftEpisode{at: time.Now(), inst: inst, gen: gen}
+	r.driftSeen[key] = newDriftEpisode(time.Now(), inst, gen)
 	return false
+}
+
+func newDriftEpisode(at time.Time, inst *VMInstance, gen uint64) driftEpisode {
+	return driftEpisode{at: at, inc: inst.incarnationID(), gen: gen}
 }
 
 // clearDrift removes a drift marker once the VM returns to a healthy state.
@@ -1643,6 +1654,9 @@ func (r *Reconciler) retryPendingReleases(ctx context.Context) {
 func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool, errorRecord func(string) bool, now time.Time) {
 	for id, sb := range dbSandboxes {
 		if sb.Sandbox.Status != db.SandboxStatusActive {
+			// The predicate stopped matching; retire the episode so a later
+			// recurrence serves its own grace (see the Drift 3 heal).
+			r.clearDrift(id)
 			continue
 		}
 		if active[id] {

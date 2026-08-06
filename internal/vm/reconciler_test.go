@@ -453,7 +453,7 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 func TestFinalizeErrorReap_FailedDeleteKeepsMarker(t *testing.T) {
 	newRec := func() *Reconciler {
 		r := NewReconciler(&Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}, DefaultReconcilerConfig())
-		r.driftSeen["errdead:vm-1"] = driftEpisode{at: time.Now()}
+		r.driftSeen["errdead:vm-1"] = newDriftEpisode(time.Now(), nil, 0)
 		return r
 	}
 
@@ -587,7 +587,7 @@ func TestReapDeadActiveVMs_StaleRunningRecordDoesNotVetoReap(t *testing.T) {
 		// Bind the pre-seeded episode to the instance, as graceElapsedFor
 		// does: an unbound seed reads as a different generation and the
 		// currentness check would (correctly) restart the episode.
-		r.driftSeen[id] = driftEpisode{at: time.Now().Add(-2 * r.cfg.GracePeriod), inst: m.vms[id]}
+		r.driftSeen[id] = newDriftEpisode(time.Now().Add(-2*r.cfg.GracePeriod), m.vms[id], 0)
 
 		origProbe := unitFullyDownProbe
 		unitFullyDownProbe = func(context.Context, string) bool { return unitDown }
@@ -651,7 +651,7 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 		id := sbID.String()
 		m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
 		r := NewReconciler(m, DefaultReconcilerConfig())
-		r.driftSeen["paused:"+id] = driftEpisode{at: time.Now().Add(-2 * r.cfg.GracePeriod)}
+		r.driftSeen["paused:"+id] = newDriftEpisode(time.Now().Add(-2*r.cfg.GracePeriod), nil, 0)
 		flips := &[]string{}
 		r.markFailed = func(_ context.Context, vmID string, observed db.SandboxStatus) bool {
 			if observed != db.SandboxStatusPaused {
@@ -792,7 +792,7 @@ func TestMarkStaleDefersWhileUnitNotTerminal(t *testing.T) {
 func TestFinalizeRelease_DeferralIsNotSuccess(t *testing.T) {
 	newRec := func() *Reconciler {
 		r := NewReconciler(&Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}, DefaultReconcilerConfig())
-		r.driftSeen["orphan:vm-1"] = driftEpisode{at: time.Now()}
+		r.driftSeen["orphan:vm-1"] = newDriftEpisode(time.Now(), nil, 0)
 		return r
 	}
 
@@ -974,7 +974,7 @@ func TestRetryPendingReleases_RetiresOriginMarker(t *testing.T) {
 		}
 		r := NewReconciler(m, DefaultReconcilerConfig())
 		marker := "unverifiedorphan:vm-1"
-		r.driftSeen[marker] = driftEpisode{at: time.Now().Add(-2 * r.cfg.UnverifiedOrphanGrace)}
+		r.driftSeen[marker] = newDriftEpisode(time.Now().Add(-2*r.cfg.UnverifiedOrphanGrace), nil, 0)
 		if err := store.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -1115,7 +1115,7 @@ func TestFinalizeErrorReap_TagsDeferredRelease(t *testing.T) {
 	}
 	r := NewReconciler(m, DefaultReconcilerConfig())
 	marker := "errdead:vm-1"
-	r.driftSeen[marker] = driftEpisode{at: time.Now().Add(-2 * r.cfg.GracePeriod)}
+	r.driftSeen[marker] = newDriftEpisode(time.Now().Add(-2*r.cfg.GracePeriod), nil, 0)
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1220,7 +1220,7 @@ func TestRetryPendingReleases_VoidClearsBareIDGrace(t *testing.T) {
 	}
 	r := NewReconciler(m, DefaultReconcilerConfig())
 	// The Drift 1/2 shape: grace elapsed under the bare id, then a deferral.
-	r.driftSeen["vm-1"] = driftEpisode{at: time.Now().Add(-2 * r.cfg.GracePeriod)}
+	r.driftSeen["vm-1"] = newDriftEpisode(time.Now().Add(-2*r.cfg.GracePeriod), nil, 0)
 	if err := r.markStale(context.Background(), "vm-1", ""); err == nil {
 		t.Fatal("non-terminal unit must defer")
 	}
@@ -1535,5 +1535,28 @@ func TestStopOrphanUnits_HealThenRecurServesFreshGrace(t *testing.T) {
 	r.stopOrphanUnits(context.Background(), zerolog.Nop(), orphan, active, noErr, now.Add(5*r.cfg.GracePeriod))
 	if stopped != 1 {
 		t.Fatalf("the recurred orphan must be stopped once its own grace elapses, got %d", stopped)
+	}
+}
+
+// Episodes store a non-owning incarnation id, never the pointer: drift
+// bookkeeping must not root removed instances (disappeared candidates are
+// exactly the ones no loop revisits to clear), and a fresh instance — even
+// one reusing the old address — must never inherit its predecessor's episode.
+func TestDriftEpisodesUseNonOwningIdentity(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	instA := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	m.vms["vm-1"] = instA
+	now := time.Now()
+	r.graceElapsedFor("vm-1", "vm-1", now, r.cfg.GracePeriod) // opens, bound to A
+	if !r.episodeStillCurrent("vm-1", "vm-1") {
+		t.Fatal("the episode must be current for the instance it opened against")
+	}
+
+	// A replacement instance with identical field values (gen included).
+	m.vms["vm-1"] = &VMInstance{ID: "vm-1", Status: StatusRunning}
+	if r.episodeStillCurrent("vm-1", "vm-1") {
+		t.Fatal("a replacement instance must never inherit its predecessor's episode")
 	}
 }
