@@ -28,7 +28,7 @@ on:
 jobs:
   migrate-staging:
     name: Migrate Staging
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: staging
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +45,7 @@ jobs:
   migrate-prod:
     name: Migrate Production
     if: github.event_name == 'push' || github.event.inputs.environment == 'production'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: production
     needs: [migrate-staging]
     steps:

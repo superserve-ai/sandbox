@@ -19,7 +19,7 @@ on:
 jobs:
   west2:
     name: Apply production us-west2
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && (inputs.target == 'west2' || inputs.target == 'all')
     environment: production
     permissions:
@@ -75,7 +75,7 @@ jobs:
 
   central1:
     name: Apply production us-central1
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     if: ${{ always() && github.ref == 'refs/heads/main' && (inputs.target == 'central1' || inputs.target == 'all') && (needs.west2.result == 'success' || needs.west2.result == 'skipped') }}
     needs: [west2]
     environment: production
