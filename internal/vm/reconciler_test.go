@@ -1055,7 +1055,9 @@ func TestRetryPendingReleases_InPlaceAdoptionVoids(t *testing.T) {
 		// place. Same object throughout — only the snapshot tells the story.
 		inst := r.mgr.vms["vm-1"]
 		inst.mu.Lock()
+		inst.gen++ // adoption's funnel bumps
 		inst.Unverified = false
+		inst.gen++ // pause's funnel bumps
 		inst.Status = StatusPaused
 		inst.mu.Unlock()
 		if err := reopened.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Namespace: "ns-1"}); err != nil {
@@ -1235,71 +1237,6 @@ func TestRetryPendingReleases_VoidClearsBareIDGrace(t *testing.T) {
 	}
 }
 
-// The ABA the two-field snapshot cannot see: a lifecycle op can drive the
-// SAME instance away from and back to its noted (Status, Unverified) values
-// between passes. The claim hook closes the class at its choke point — every
-// lifecycle op acquires the vm-op lock, and acquiring it voids any release
-// deferred against the instance's predecessor.
-func TestLifecycleClaimVoidsPendingRelease(t *testing.T) {
-	stubUnitTerminal(t, false) // defer the release
-	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Namespace: "ns-1"}); err != nil {
-		t.Fatal(err)
-	}
-	inst := &VMInstance{ID: "vm-1", Status: StatusPaused}
-	m := &Manager{
-		log:   zerolog.Nop(),
-		state: store,
-		vms:   map[string]*VMInstance{"vm-1": inst},
-	}
-	r := NewReconciler(m, DefaultReconcilerConfig())
-	r.driftSeen["bolt-orphan:vm-1"] = time.Now().Add(-2 * r.cfg.GracePeriod)
-	if err := r.markStale(context.Background(), "vm-1", "bolt-orphan:vm-1"); err == nil {
-		t.Fatal("non-terminal unit must defer")
-	}
-
-	// A resume claims the VM, drives it Running, then a pause returns it to
-	// Paused — same pointer, both snapshot fields back to their noted values.
-	unlock, err := m.lockVMOp(context.Background(), "vm-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	inst.mu.Lock()
-	inst.Status = StatusRunning
-	inst.mu.Unlock()
-	unlock()
-	unlock2, err := m.lockVMOp(context.Background(), "vm-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	inst.mu.Lock()
-	inst.Status = StatusPaused
-	inst.mu.Unlock()
-	unlock2()
-
-	if r.hasPendingRelease("vm-1") {
-		t.Fatal("the claim must void the deferred release at the lock, not at state comparison")
-	}
-	r.mu.Lock()
-	_, kept := r.driftSeen["bolt-orphan:vm-1"]
-	r.mu.Unlock()
-	if kept {
-		t.Fatal("the void must retire the episode's marker")
-	}
-
-	// And the retry, running later with the unit now terminal, must not
-	// release the healthy re-paused VM.
-	stubUnitTerminal(t, true)
-	r.retryPendingReleases(context.Background())
-	if rec, _ := store.Get("vm-1"); rec == nil || rec.Status != StatusPaused {
-		t.Fatalf("the re-paused record must survive untouched, got %v", rec)
-	}
-}
-
 // A deferred release owns only the RELEASE half of Drift 1's reap: the row
 // flip re-drives uncharged (nobody else moves a stuck-active row off a dead
 // VM), and no second auto-fail slot is spent for the same decision.
@@ -1347,21 +1284,67 @@ func TestReapDeadActiveVMs_PendingReleaseRedrivesFlipUncharged(t *testing.T) {
 	}
 }
 
-// The reconciler is constructed while the gRPC server is already serving, so
-// the hook's publication must be race-free against concurrent lock
-// acquisitions — this test is the race detector's tripwire for a plain-field
-// regression.
-func TestLifecycleClaimHookPublicationIsRaceFree(t *testing.T) {
-	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for i := 0; i < 500; i++ {
-			if unlock, err := m.lockVMOp(context.Background(), "vm-race"); err == nil {
-				unlock()
-			}
+// The generation is what distinguishes a lifecycle claim from mere lock
+// traffic. Inspection ops (env inject, verification, PID persistence) take
+// the same vm-op lock but bump nothing — a delayed inject against a dead VM
+// must not erase the pending release and strand the record behind a Failed
+// row. And a full round-trip back to the deferred-time state — invisible to
+// any value snapshot — bumps twice, so the retry still voids.
+func TestGenerationSeparatesClaimsFromLockTraffic(t *testing.T) {
+	newRec := func(t *testing.T) (*Reconciler, *VMInstance, string) {
+		t.Helper()
+		stubUnitTerminal(t, false)
+		store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+		if err != nil {
+			t.Fatal(err)
 		}
-	}()
-	NewReconciler(m, DefaultReconcilerConfig()) // publishes the hook mid-traffic
-	<-done
+		t.Cleanup(func() { _ = store.Close() })
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Namespace: "ns-1"}); err != nil {
+			t.Fatal(err)
+		}
+		inst := &VMInstance{ID: "vm-1", Status: StatusPaused}
+		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		if err := r.markStale(context.Background(), "vm-1", "bolt-orphan:vm-1"); err == nil {
+			t.Fatal("non-terminal unit must defer")
+		}
+		return r, inst, "vm-1"
+	}
+
+	t.Run("an inspection op's lock does not void", func(t *testing.T) {
+		r, _, id := newRec(t)
+		unlock, err := r.mgr.lockVMOp(context.Background(), id) // inject-shaped: lock, no bump
+		if err != nil {
+			t.Fatal(err)
+		}
+		unlock()
+		stubUnitTerminal(t, true)
+		r.retryPendingReleases(context.Background())
+		if r.hasPendingRelease(id) {
+			t.Fatal("the retry must complete: no lifecycle op ever claimed the VM")
+		}
+		if rec, _ := r.mgr.state.Get(id); rec != nil {
+			t.Fatal("the stale record must be released despite intervening lock traffic")
+		}
+	})
+
+	t.Run("a round-trip back to the deferred state still voids", func(t *testing.T) {
+		r, inst, id := newRec(t)
+		inst.mu.Lock()
+		inst.gen++ // resume funnel
+		inst.Status = StatusRunning
+		inst.mu.Unlock()
+		inst.mu.Lock()
+		inst.gen++ // pause funnel: back to Paused, values identical to deferral time
+		inst.Status = StatusPaused
+		inst.mu.Unlock()
+		stubUnitTerminal(t, true)
+		r.retryPendingReleases(context.Background())
+		if rec, _ := r.mgr.state.Get(id); rec == nil {
+			t.Fatal("a claimed VM's record must survive the retry")
+		}
+		if r.hasPendingRelease(id) {
+			t.Fatal("the void must retire the entry")
+		}
+	})
 }

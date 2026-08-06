@@ -87,15 +87,24 @@ func (s VMStatus) String() string {
 
 // VMInstance holds the runtime state of a single microVM.
 type VMInstance struct {
-	ID           string
-	PID          int
-	SocketPath   string
-	VsockPath    string
-	IP           string
-	TAPDevice    string
-	MACAddress   string
-	Status       VMStatus
-	Unverified   bool // Running persisted before boxd readiness (see VMRecord)
+	ID         string
+	PID        int
+	SocketPath string
+	VsockPath  string
+	IP         string
+	TAPDevice  string
+	MACAddress string
+	Status     VMStatus
+	Unverified bool // Running persisted before boxd readiness (see VMRecord)
+	// gen counts in-place lifecycle transitions (Status/Unverified writes on
+	// a tracked instance). The reconciler snapshots it when deferring a
+	// release: a changed gen proves a lifecycle op claimed the VM, no matter
+	// what state the op drove it back to. Fresh instances need no bump —
+	// pointer identity already voids across a replacement. Bump under
+	// inst.mu, at every in-place transition, and nowhere else: inspection
+	// ops (env inject, verification) must NOT bump, or they void retries
+	// for VMs they never touched.
+	gen          uint64
 	Config       VMConfig
 	RunDirID     string // Directory name under RunDir for this VM's files.
 	Namespace    string // Network namespace name.
@@ -248,14 +257,6 @@ type Manager struct {
 	egressProxy *network.EgressProxy
 	log         zerolog.Logger
 	state       *StateStore // persistent local state (BoltDB); nil = no persistence
-	// onLifecycleClaim, when set, is invoked with the vmID whenever a
-	// lifecycle op acquires the vm-op lock. The reconciler wires it to void
-	// any release it deferred for that VM: the op now owns the instance, and
-	// a deferred reap decided against its predecessor must not outlive the
-	// claim — no matter what states the op drives the VM through afterwards.
-	// Atomic: the reconciler is constructed after the gRPC server is already
-	// serving, so the write races concurrent lockVMOp reads.
-	onLifecycleClaim atomic.Pointer[func(vmID string)]
 	// backupEnqueue hands finalized pause manifests to the durability
 	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
 	backupEnqueue func(backup.Task) error
@@ -438,12 +439,6 @@ func (m *Manager) lockVMOp(ctx context.Context, vmID string) (func(), error) {
 		if err := ctx.Err(); err != nil {
 			<-ch
 			return nil, err
-		}
-		// Every lifecycle op enters here (the reconciler deliberately uses
-		// tryLockVMOp instead), so this is the one place a claim on the VM
-		// is always visible — see onLifecycleClaim.
-		if claim := m.onLifecycleClaim.Load(); claim != nil {
-			(*claim)(vmID)
 		}
 		return func() { <-ch }, nil
 	case <-ctx.Done():
@@ -1057,6 +1052,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	stopCancel()
 
 	inst.mu.Lock()
+	inst.gen++
 	inst.Status = StatusPaused
 	inst.SnapshotPath = snapshotPath
 	inst.MemFilePath = memPath
@@ -1275,6 +1271,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			// VM that never came back. The marker stays set — readiness is
 			// still unproven, and the relaunch below reads it to verify.
 			existing.mu.Lock()
+			existing.gen++
 			existing.Status = StatusPaused
 			existing.mu.Unlock()
 			// The verdict has to be durable BEFORE relaunching: the relaunch
@@ -1431,6 +1428,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	}
 
 	inst.mu.Lock()
+	inst.gen++
 	inst.PID = pid
 	inst.SocketPath = socketPath
 	inst.Status = StatusRunning
@@ -3224,6 +3222,7 @@ func (m *Manager) setStatus(vmID string, s VMStatus) {
 		return
 	}
 	inst.mu.Lock()
+	inst.gen++
 	inst.Status = s
 	inst.mu.Unlock()
 	m.persistState(inst)
@@ -3430,6 +3429,7 @@ func (m *Manager) abortResumeLocked(vmID string) {
 	}
 	m.stopUnitDuringRestoreError(vmID)
 	inst.mu.Lock()
+	inst.gen++
 	inst.Status = StatusPaused
 	inst.DirtyTracked = false // FC process stopped; a fresh resume re-arms tracking.
 	inst.mu.Unlock()
@@ -4084,6 +4084,7 @@ func (m *Manager) commitVerifiedAdoption(existing *VMInstance) error {
 		return status.Errorf(codes.NotFound, "vm %s was destroyed during restore", existing.ID)
 	}
 	existing.mu.Lock()
+	existing.gen++
 	existing.Unverified = false
 	existing.mu.Unlock()
 	// Only a deletion aborts the adoption; an undurable clear is healed by

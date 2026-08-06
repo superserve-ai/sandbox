@@ -165,12 +165,6 @@ func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
 		prevKeptLive:   -1,
 	}
 	r.markFailed = r.markFailedInDB
-	// A lifecycle op claiming a VM voids any release deferred against its
-	// predecessor — at the lock, so no in-place state round-trip (pause and
-	// resume can return Status and Unverified to their noted values on the
-	// SAME instance) can ever masquerade as the unmutated stale original.
-	claim := r.voidPendingRelease
-	mgr.onLifecycleClaim.Store(&claim)
 	return r
 }
 
@@ -1506,37 +1500,30 @@ func (r *Reconciler) finalizeRelease(ctx context.Context, vmID, marker, action, 
 
 // deferredRelease is a reap decision awaiting its release. The retry proceeds
 // only while m.vms still holds the EXACT instance observed at deferral AND its
-// snapshot is unmutated: pointer identity alone only detects REPLACEMENT ops
-// (a fresh relaunch swaps the map entry), while adoption clears Unverified and
-// pause flips Status on the SAME object. A stale instance is by definition one
-// nothing updates, so any observed mutation proves a lifecycle op claimed the
-// VM — that op owns cleanup, and the reap decision is void.
-//
-// The snapshot cannot see a round-trip that returns both fields to their
-// noted values; onLifecycleClaim closes that class at the vm-op lock, voiding
-// the entry the moment any lifecycle op claims the instance. The comparison
-// below remains as the backstop for anything that mutates without the lock.
+// lifecycle generation is unchanged: pointer identity detects REPLACEMENT ops
+// (a fresh relaunch swaps the map entry), the generation detects in-place
+// claims — including a round-trip that drives the VM away and back to its
+// deferred-time state, which a value snapshot cannot see. A stale instance is
+// by definition one no lifecycle op touches, so it advances neither.
 type deferredRelease struct {
-	inst       *VMInstance
-	marker     string
-	status     VMStatus
-	unverified bool
+	inst   *VMInstance
+	marker string
+	gen    uint64
 }
 
 func (r *Reconciler) notePendingRelease(vmID, marker string) {
 	r.mgr.mu.RLock()
 	inst := r.mgr.vms[vmID]
 	r.mgr.mu.RUnlock()
-	var st VMStatus
-	var unv bool
+	var gen uint64
 	if inst != nil {
 		inst.mu.RLock()
-		st, unv = inst.Status, inst.Unverified
+		gen = inst.gen
 		inst.mu.RUnlock()
 	}
 	r.mu.Lock()
 	e := r.pendingRelease[vmID]
-	e.inst, e.status, e.unverified, e.marker = inst, st, unv, marker
+	e.inst, e.gen, e.marker = inst, gen, marker
 	r.pendingRelease[vmID] = e
 	r.mu.Unlock()
 }
@@ -1580,18 +1567,18 @@ func (r *Reconciler) retryPendingReleases(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		// Identity AND an unmutated snapshot decide the void — see
-		// deferredRelease for why either alone is insufficient.
+		// Identity AND an unchanged lifecycle generation decide the void —
+		// see deferredRelease for why either alone is insufficient.
 		r.mgr.mu.RLock()
 		cur := r.mgr.vms[id]
 		r.mgr.mu.RUnlock()
-		mutated := false
+		claimed := false
 		if cur != nil && cur == noted.inst {
 			cur.mu.RLock()
-			mutated = cur.Status != noted.status || cur.Unverified != noted.unverified
+			claimed = cur.gen != noted.gen
 			cur.mu.RUnlock()
 		}
-		if cur != noted.inst || mutated {
+		if cur != noted.inst || claimed {
 			// Voids retire the episode's timestamps (see pendingRelease): the
 			// prefixed marker, and the bare id — Drift 1/2 grace under the bare
 			// id and defer with marker "", relying on markStale to clear it,
