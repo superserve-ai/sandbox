@@ -14,6 +14,14 @@ output "packet_mirroring_name" {
 }
 
 output "alert_policy_name" {
-  description = "Cloud IDS alert policy name."
-  value       = google_monitoring_alert_policy.ids_threats.name
+  description = "Compatibility alias for the pre-split singular Cloud IDS policy name; points at the HIGH and CRITICAL policy."
+  value       = google_monitoring_alert_policy.ids_high_critical.name
+}
+
+output "alert_policy_names" {
+  description = "Cloud IDS alert policy names keyed by severity band."
+  value = {
+    medium        = google_monitoring_alert_policy.ids_medium.name
+    high_critical = google_monitoring_alert_policy.ids_high_critical.name
+  }
 }
