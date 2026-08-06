@@ -159,6 +159,17 @@ func TestRollbackGuard(t *testing.T) {
 			t.Fatal("records at the default path must block")
 		}
 	})
+	t.Run("unknown supervision mode blocks", func(t *testing.T) {
+		w := newGuardWorld(t)
+		b, err := json.Marshal(VMRecord{ID: "vm-1", Supervision: Supervision("checkpointed")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.writeFile("default.db", string(b))
+		if rc := w.run(oldBinary); rc == 0 {
+			t.Fatal("a record in a mode newer than this guard must block the rollback")
+		}
+	})
 	t.Run("clean record miss allows", func(t *testing.T) {
 		w := newGuardWorld(t)
 		w.writeFile("state-path", filepath.Join(w.dir, "plain.db")+"\n")

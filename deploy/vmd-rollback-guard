@@ -64,10 +64,13 @@ if [ -z "$evidence" ]; then
     # error must block, not read as a clean miss. A missing file is a clean
     # miss: a host that never ran vmd has no store and no records.
     if [ -e "$STATE" ]; then
-        grep -qa '"supervision":"cgroup"' "$STATE" 2>/dev/null
+        # Key presence, not the exact "cgroup" value: unit mode omits the
+        # field entirely, so ANY supervision key is a record an old binary
+        # cannot manage — including modes newer than this guard.
+        grep -qa '"supervision":"' "$STATE" 2>/dev/null
         rc=$?
         if [ "$rc" -eq 0 ]; then
-            evidence="cgroup-supervision records in ${STATE}"
+            evidence="non-unit supervision records in ${STATE}"
         elif [ "$rc" -ne 1 ]; then
             echo "vmd-rollback-guard: cannot scan ${STATE}; refusing to start a vmd without cgroup supervision" >&2
             exit 1

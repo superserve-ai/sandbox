@@ -2352,3 +2352,33 @@ func TestReapRecordlessCgroupVMsUnreadableRecordDisablesSweep(t *testing.T) {
 		t.Fatal("unreadable record for a cgroup survivor must disable the sweep")
 	}
 }
+
+// The reattach half of the demotion handshake: the rollback demotion can
+// rewrite the durable supervision while a lock-free reattach holds a stale
+// record; the paused publish must adopt the fresh durable mode, or the next
+// resume acts on the stale one and re-promotes a demoted record.
+func TestReattachRecord_PausedAdoptsDemotedSupervision(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// The store already holds the DEMOTED record (unit)...
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit}); err != nil {
+		t.Fatal(err)
+	}
+	// ...while this reattach still carries the pre-demotion snapshot (cgroup).
+	stale := VMRecord{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionCgroup}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{}, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), stale, true)
+	if inst == nil || !ok {
+		t.Fatalf("paused reattach must publish, got inst=%v ok=%v", inst, ok)
+	}
+	inst.mu.RLock()
+	got := inst.Supervision
+	inst.mu.RUnlock()
+	if got != SupervisionUnit {
+		t.Fatalf("published instance must adopt the demoted durable mode, got %q", got)
+	}
+}

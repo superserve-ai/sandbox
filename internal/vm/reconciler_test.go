@@ -1094,3 +1094,32 @@ func TestDemotePausedCgroupRecords(t *testing.T) {
 		}
 	})
 }
+
+// The release chokepoint must refuse unknown supervision modes: every rule
+// proves death via the unit and cgroup oracles, and a mode this binary
+// predates may supervise a live FC neither can see. The record, its instance
+// and its slot must all stay owned.
+func TestMarkStaleRefusesUnknownSupervision(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Supervision: Supervision("checkpointed"), Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{
+		"vm-1": {ID: "vm-1", Status: StatusError, Supervision: Supervision("checkpointed")},
+	}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	if err := r.markStale("vm-1"); err == nil {
+		t.Fatal("an unknown supervision mode must refuse release, not delete the record")
+	}
+	if rec, gerr := store.Get("vm-1"); gerr != nil || rec == nil {
+		t.Fatal("the record must survive the refusal")
+	}
+	if _, tracked := m.vms["vm-1"]; !tracked {
+		t.Fatal("the instance must stay tracked")
+	}
+}

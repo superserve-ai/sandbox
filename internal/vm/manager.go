@@ -2917,6 +2917,15 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		} else if m.recordDeleted(rec.ID) {
 			m.undoReattach(rec.ID)
 			return nil, false
+		} else if fresh, ferr := m.state.Get(rec.ID); ferr == nil && fresh != nil && fresh.Supervision != rec.Supervision {
+			// The rollback demotion (reconciler, under the vm-op lock) may
+			// have rewritten the durable mode while this lock-free reattach
+			// was in flight; adopt it, or a resume acts on the stale mode and
+			// re-promotes a demoted record. Skipped when the correction above
+			// ran — that value is proven by the live cgroup, not the store.
+			inst.mu.Lock()
+			inst.Supervision = fresh.Supervision
+			inst.mu.Unlock()
 		}
 		log.Info().Msg("reattached paused VM")
 	} else {

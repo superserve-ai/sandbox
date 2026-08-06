@@ -1478,6 +1478,15 @@ func (r *Reconciler) markStale(vmID string) error {
 		namespace = rec.Namespace
 		supervision = rec.Supervision
 	}
+	// The release chokepoint refuses unknown modes: every reconciler rule
+	// proves death via the unit and cgroup oracles, and a mode this binary
+	// predates may supervise a live FC neither can see. Only a deliberate
+	// destroy may release such a record.
+	if !knownSupervision(supervision) {
+		r.mgr.log.Error().Str("vm_id", vmID).Str("supervision", string(supervision)).
+			Msg("reconciler: unknown supervision mode — refusing release")
+		return fmt.Errorf("unknown supervision mode %q for vm %s: refusing release", supervision, vmID)
+	}
 	// Remove a direct-spawned VM's cgroup dir too, or an emptied group lingers
 	// as an unbounded fleet-size artifact.
 	if cgroupSupervised(supervision) && r.mgr.cgroups != nil {
@@ -1746,37 +1755,39 @@ func (r *Reconciler) demotePausedCgroupRecords(ctx context.Context, log zerolog.
 			unlockOp()
 			continue
 		}
-		// The tracked instance (if any) is the authoritative copy other paths
-		// read; rewrite it and persist through it so memory and disk agree.
+		// A tracked instance that is not paused vetoes the demotion.
 		r.mgr.mu.RLock()
 		inst := r.mgr.vms[id]
 		r.mgr.mu.RUnlock()
 		if inst != nil {
-			inst.mu.Lock()
+			inst.mu.RLock()
 			stillPaused := inst.Status == StatusPaused
-			if stillPaused {
-				inst.Supervision = SupervisionUnit
-			}
-			inst.mu.Unlock()
+			inst.mu.RUnlock()
 			if !stillPaused {
 				unlockOp()
 				continue
 			}
-			if wrote, perr := r.mgr.persistStateIfPresent(inst); perr != nil || !wrote {
-				// Undurable: revert the in-memory flip so memory never says
-				// unit over a durable cgroup record (the unsafe direction).
-				inst.mu.Lock()
-				inst.Supervision = SupervisionCgroup
-				inst.mu.Unlock()
-				unlockOp()
-				continue
+		}
+		// Disk first, then memory, all under the vm-op lock. Reattach
+		// publishes instances lock-free, so one may appear between the read
+		// above and the write: the memory pass below catches an instance
+		// published before it, and reattach's own post-publish re-read of
+		// the durable mode catches one published after — between them every
+		// interleaving converges.
+		cur.Supervision = SupervisionUnit
+		if wrote, perr := r.mgr.state.PutIfPresent(*cur); perr != nil || !wrote {
+			unlockOp()
+			continue
+		}
+		r.mgr.mu.RLock()
+		inst = r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if inst != nil {
+			inst.mu.Lock()
+			if inst.Status == StatusPaused {
+				inst.Supervision = SupervisionUnit
 			}
-		} else {
-			cur.Supervision = SupervisionUnit
-			if wrote, perr := r.mgr.state.PutIfPresent(*cur); perr != nil || !wrote {
-				unlockOp()
-				continue
-			}
+			inst.mu.Unlock()
 		}
 		// The empty group dir would otherwise linger and keep counting
 		// against the drain guard until restart.
