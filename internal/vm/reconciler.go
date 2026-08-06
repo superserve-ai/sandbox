@@ -831,6 +831,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 
 	r.reapUnverifiedOrphans(ctx, log, dbSandboxes, active, supervisionOf, now)
 
+	// Rollback drain: with direct spawn disarmed, paused cgroup records are
+	// demoted back to unit supervision so the fleet converges to a state an
+	// older binary can manage (see demotePausedCgroupRecords).
+	if r.mgr.cgroups != nil && !r.mgr.directSpawnArmed.Load() {
+		r.demotePausedCgroupRecords(ctx, log)
+	}
+
 	// Drift 4: DB says paused, snapshot file missing on disk → mark failed.
 	r.failMissingSnapshots(ctx, log, dbSandboxes, now)
 
@@ -1695,6 +1702,88 @@ func (r *Reconciler) reapUnverifiedOrphans(ctx context.Context, log zerolog.Logg
 			r.writeAudit(ctx, id, "orphan_stop", "crash-window VM never adopted", "unverified_orphan_abandoned")
 			r.clearDrift("unverifiedorphan:" + id)
 		}
+	}
+}
+
+// demotePausedCgroupRecords is the rollback drain. A paused cgroup sandbox
+// has no live process, so its supervision value only matters at the next
+// launch — but a cgroup record always relaunches cgroup, and sandboxes never
+// expire, so with direct spawn disarmed the fleet would otherwise hold
+// cgroup records (and block the downgrade guard) forever. With the flag off,
+// rewrite paused records to unit supervision — under the vm-op lock, re-read,
+// and only with the group conclusively empty — and remove the leftover group
+// dir. Re-arming simply re-promotes on the next launch, so a transient
+// flag-off loses nothing. Non-destructive: no process is touched and no
+// auto-fail budget is spent.
+func (r *Reconciler) demotePausedCgroupRecords(ctx context.Context, log zerolog.Logger) {
+	recs, err := r.mgr.state.All()
+	if err != nil {
+		log.Error().Err(err).Msg("demotion scan: cannot read state store")
+		return
+	}
+	for _, rec := range recs {
+		if ctx.Err() != nil {
+			return
+		}
+		if rec.Status != StatusPaused || !cgroupSupervised(rec.Supervision) || rec.Unverified {
+			continue
+		}
+		id := rec.ID
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue // a resume/destroy is in flight; next pass
+		}
+		// Re-read under the lock: a resume may have relaunched (Running) or a
+		// destroy deleted the record since the scan.
+		cur, gerr := r.mgr.state.Get(id)
+		if gerr != nil || cur == nil || cur.Status != StatusPaused || !cgroupSupervised(cur.Supervision) || cur.Unverified {
+			unlockOp()
+			continue
+		}
+		// Only a conclusively empty group proves no process depends on the
+		// cgroup mode; unreadable or populated defers to the drift rules.
+		if !r.mgr.cgroupDefinitelyDead(id) {
+			unlockOp()
+			continue
+		}
+		// The tracked instance (if any) is the authoritative copy other paths
+		// read; rewrite it and persist through it so memory and disk agree.
+		r.mgr.mu.RLock()
+		inst := r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if inst != nil {
+			inst.mu.Lock()
+			stillPaused := inst.Status == StatusPaused
+			if stillPaused {
+				inst.Supervision = SupervisionUnit
+			}
+			inst.mu.Unlock()
+			if !stillPaused {
+				unlockOp()
+				continue
+			}
+			if wrote, perr := r.mgr.persistStateIfPresent(inst); perr != nil || !wrote {
+				// Undurable: revert the in-memory flip so memory never says
+				// unit over a durable cgroup record (the unsafe direction).
+				inst.mu.Lock()
+				inst.Supervision = SupervisionCgroup
+				inst.mu.Unlock()
+				unlockOp()
+				continue
+			}
+		} else {
+			cur.Supervision = SupervisionUnit
+			if wrote, perr := r.mgr.state.PutIfPresent(*cur); perr != nil || !wrote {
+				unlockOp()
+				continue
+			}
+		}
+		// The empty group dir would otherwise linger and keep counting
+		// against the drain guard until restart.
+		_ = r.mgr.cgroups.removeVMCgroup(context.WithoutCancel(ctx), id)
+		unlockOp()
+		log.Info().Str("vm_id", id).Msg("demoted paused cgroup record to unit supervision for rollback drain")
+		r.writeAudit(ctx, id, "supervision_demoted", "paused cgroup record demoted for rollback drain", "cgroup_drain_demotion")
 	}
 }
 

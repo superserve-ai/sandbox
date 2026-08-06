@@ -996,3 +996,101 @@ func TestFailEmptyShells_CgroupShell_ModeAwareStopAndProof(t *testing.T) {
 		t.Fatal("a conclusively-empty group must complete the flip and release")
 	}
 }
+
+// The rollback drain: with direct spawn disarmed, a paused cgroup record must
+// demote to unit supervision — durably, and in the tracked instance when one
+// exists — but ONLY with the group conclusively empty and no lifecycle op in
+// flight. (Dir removal is not asserted: the fixture's cgroup.events is a real
+// file, so rmdir legitimately fails where a real cgroup's would succeed.)
+func TestDemotePausedCgroupRecords(t *testing.T) {
+	newFixture := func(t *testing.T, events string, inst *VMInstance) (*Reconciler, *StateStore, string) {
+		t.Helper()
+		id := uuid.New().String()
+		tree := cgroupFixtureTree(t, id, events)
+		store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		if err := store.Put(VMRecord{ID: id, Status: StatusPaused, Supervision: SupervisionCgroup}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{log: zerolog.Nop(), state: store, cgroups: tree, vms: map[string]*VMInstance{}}
+		if inst != nil {
+			inst.ID = id
+			m.vms[id] = inst
+		}
+		return NewReconciler(m, DefaultReconcilerConfig()), store, id
+	}
+	supOf := func(store *StateStore, id string) Supervision {
+		rec, err := store.Get(id)
+		if err != nil || rec == nil {
+			return Supervision("gone")
+		}
+		return rec.Supervision
+	}
+
+	t.Run("empty group demotes the tracked instance and the record", func(t *testing.T) {
+		inst := &VMInstance{Status: StatusPaused, Supervision: SupervisionCgroup}
+		r, store, id := newFixture(t, "populated 0\n", inst)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionUnit {
+			t.Fatalf("record must demote to unit, got %q", got)
+		}
+		inst.mu.RLock()
+		got := inst.Supervision
+		inst.mu.RUnlock()
+		if got != SupervisionUnit {
+			t.Fatalf("tracked instance must demote too, got %q", got)
+		}
+	})
+
+	t.Run("untracked record demotes via the store", func(t *testing.T) {
+		r, store, id := newFixture(t, "populated 0\n", nil)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionUnit {
+			t.Fatalf("record must demote to unit, got %q", got)
+		}
+	})
+
+	t.Run("populated group defers", func(t *testing.T) {
+		r, store, id := newFixture(t, "populated 1\n", nil)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionCgroup {
+			t.Fatalf("a populated group must defer the demotion, got %q", got)
+		}
+	})
+
+	t.Run("malformed events defers (unprovably empty)", func(t *testing.T) {
+		r, store, id := newFixture(t, "frozen 0\n", nil)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionCgroup {
+			t.Fatalf("an unprovably-empty group must defer the demotion, got %q", got)
+		}
+	})
+
+	t.Run("a resume that raced to Running defers", func(t *testing.T) {
+		inst := &VMInstance{Status: StatusRunning, Supervision: SupervisionCgroup}
+		r, store, id := newFixture(t, "populated 0\n", inst)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionCgroup {
+			t.Fatalf("a running instance must veto the demotion, got %q", got)
+		}
+		inst.mu.RLock()
+		got := inst.Supervision
+		inst.mu.RUnlock()
+		if got != SupervisionCgroup {
+			t.Fatal("the running instance's mode must be untouched")
+		}
+	})
+
+	t.Run("an in-flight lifecycle op defers", func(t *testing.T) {
+		r, store, id := newFixture(t, "populated 0\n", nil)
+		r.mgr.vmOpCh(id) <- struct{}{}
+		defer func() { <-r.mgr.vmOpCh(id) }()
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionCgroup {
+			t.Fatalf("a locked VM must defer, got %q", got)
+		}
+	})
+}
