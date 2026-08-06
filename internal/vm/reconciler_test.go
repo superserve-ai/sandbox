@@ -584,7 +584,10 @@ func TestReapDeadActiveVMs_StaleRunningRecordDoesNotVetoReap(t *testing.T) {
 			vms: map[string]*VMInstance{id: {ID: id, Status: StatusRunning}},
 		}
 		r := NewReconciler(m, DefaultReconcilerConfig())
-		r.driftSeen[id] = driftEpisode{at: time.Now().Add(-2 * r.cfg.GracePeriod)}
+		// Bind the pre-seeded episode to the instance, as graceElapsedFor
+		// does: an unbound seed reads as a different generation and the
+		// currentness check would (correctly) restart the episode.
+		r.driftSeen[id] = driftEpisode{at: time.Now().Add(-2 * r.cfg.GracePeriod), inst: m.vms[id]}
 
 		origProbe := unitFullyDownProbe
 		unitFullyDownProbe = func(context.Context, string) bool { return unitDown }
@@ -1415,4 +1418,76 @@ func TestStopOrphanUnits_StaleVsClaimedGeneration(t *testing.T) {
 			t.Fatalf("a newly claimed generation must not be stopped, got %v", *stopped)
 		}
 	})
+}
+
+// A nil dbSandboxes is a FAILED DB query, not an empty host. Treating absence
+// of evidence as evidence of orphanhood would stop every active production VM
+// on the host, up to the auto-fail budget, on any DB blip.
+func TestStopOrphanUnits_NilDBStopsNothing(t *testing.T) {
+	stubUnitTerminal(t, true)
+	id := uuid.New().String()
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{id: {ID: id, Status: StatusRunning}}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	stopped := 0
+	orig := stopUnitFn
+	stopUnitFn = func(context.Context, string) error { stopped++; return nil }
+	t.Cleanup(func() { stopUnitFn = orig })
+
+	active := map[string]bool{id: true}
+	noErr := func(string) bool { return false }
+	now := time.Now()
+	r.stopOrphanUnits(context.Background(), zerolog.Nop(), nil, active, noErr, now)
+	r.stopOrphanUnits(context.Background(), zerolog.Nop(), nil, active, noErr, now.Add(2*r.cfg.GracePeriod))
+
+	if stopped != 0 {
+		t.Fatalf("a failed DB query must stop nothing, stopped %d units", stopped)
+	}
+}
+
+// Drift 1's terminal probe cannot distinguish a resume-and-repause from the
+// stale original — the new generation's unit is terminal again. Only the
+// episode's identity+generation binding spares the legitimate paused record.
+func TestReapDeadActiveVMs_RepauseABASpared(t *testing.T) {
+	stubUnitTerminal(t, true)
+	origProbe := unitFullyDownProbe
+	unitFullyDownProbe = func(context.Context, string) bool { return true }
+	t.Cleanup(func() { unitFullyDownProbe = origProbe })
+
+	sbID := uuid.New()
+	id := sbID.String()
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	inst := &VMInstance{ID: id, Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{id: inst}}
+	if err := store.Put(VMRecord{ID: id, Status: StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	r.markFailed = func(context.Context, string, db.SandboxStatus) bool { return true }
+	rows := map[string]db.ListSandboxesByHostRow{
+		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+	}
+	noErr := func(string) bool { return false }
+	now := time.Now()
+
+	// Pass 1 opens the episode against the stale generation.
+	r.reapDeadActiveVMs(context.Background(), zerolog.Nop(), rows, map[string]bool{}, noErr, now)
+	// A resume claims and a pause re-parks the SAME instance; its unit is
+	// terminal again and its record legitimately Paused.
+	inst.mu.Lock()
+	inst.gen += 2
+	inst.Status = StatusPaused
+	inst.mu.Unlock()
+	if err := store.Put(VMRecord{ID: id, Status: StatusPaused}); err != nil {
+		t.Fatal(err)
+	}
+	// Pass 2 acts on the stale evidence.
+	r.reapDeadActiveVMs(context.Background(), zerolog.Nop(), rows, map[string]bool{}, noErr, now.Add(2*r.cfg.GracePeriod))
+
+	if rec, _ := store.Get(id); rec == nil || rec.Status != StatusPaused {
+		t.Fatalf("the re-paused generation's record must survive, got %v", rec)
+	}
 }

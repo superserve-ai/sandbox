@@ -480,12 +480,18 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if r.hasPendingRelease(id) {
 				continue
 			}
-			if !r.gracePeriodElapsed(id, now) {
+			if !r.graceElapsedFor(id, id, now, r.cfg.GracePeriod) {
 				continue
 			}
 			unlockOp, ok := r.mgr.tryLockVMOp(id)
 			if !ok {
 				continue // an op owns the VM; the generation voids any pending entry
+			}
+			// A resume-and-repause since the pass snapshot leaves the unit
+			// terminal again; only the episode tells the generations apart.
+			if !r.episodeStillCurrent(id, id) {
+				unlockOp()
+				continue
 			}
 			// No status re-check: this rule's target is a Running record whose
 			// unit is dead, and nothing flips that record when firecracker
@@ -1659,7 +1665,7 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 			}
 			continue
 		}
-		if !r.gracePeriodElapsed(id, now) {
+		if !r.graceElapsedFor(id, id, now, r.cfg.GracePeriod) {
 			continue
 		}
 		// Lock before spending budget, then re-probe the UNIT under it —
@@ -1667,9 +1673,15 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 		// firecracker dies out from under vmd, so a stale Running instance
 		// is the very state this rule cleans up. A resume that relaunched
 		// mid-pass owns a live unit again, which this probe sees; an
-		// inconclusive probe defers to the next pass.
+		// inconclusive probe defers to the next pass. The probe alone cannot
+		// see a resume-and-repause — the new generation's unit is terminal
+		// again — so the episode check guards the release.
 		unlockOp, ok := r.mgr.tryLockVMOp(id)
 		if !ok {
+			continue
+		}
+		if !r.episodeStillCurrent(id, id) {
+			unlockOp()
 			continue
 		}
 		if !unitFullyDownProbe(ctx, systemdUnitName(id)) {
@@ -1773,6 +1785,13 @@ func (r *Reconciler) failMissingSnapshots(ctx context.Context, log zerolog.Logge
 // — the rule must stop a genuinely stale orphan and must NOT stop a unit
 // whose generation was claimed since the pass snapshot.
 func (r *Reconciler) stopOrphanUnits(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool, errorRecord func(string) bool, now time.Time) {
+	// This rule's ONLY evidence that a unit is an orphan is its DB row being
+	// deleted/failed/absent. A nil map is a FAILED QUERY, not an empty host —
+	// treating it as absence would classify every active unit as an orphan
+	// and stop production VMs up to the budget on any DB blip. Fail closed.
+	if dbSandboxes == nil {
+		return
+	}
 	for id := range active {
 		sb, known := dbSandboxes[id]
 		deleted := known && sb.Sandbox.Status == db.SandboxStatusDeleted
