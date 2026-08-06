@@ -12,13 +12,42 @@ func TestParseCgroupPopulated(t *testing.T) {
 	for body, want := range map[string]bool{
 		"populated 1\nfrozen 0\n": true,
 		"populated 0\nfrozen 0\n": false,
-		"frozen 0\n":              false,
-		"":                        false,
 		"populated 1":             true,
 	} {
-		if got := parseCgroupPopulated(body); got != want {
-			t.Errorf("parseCgroupPopulated(%q) = %v, want %v", body, got, want)
+		got, err := parseCgroupPopulated(body)
+		if err != nil || got != want {
+			t.Errorf("parseCgroupPopulated(%q) = %v, %v; want %v, nil", body, got, err, want)
 		}
+	}
+	// A body without an exact "populated 0|1" line is inconclusive, never
+	// "empty": kill-completion and reap paths consume this, and inconclusive
+	// must read as maybe-alive.
+	for _, body := range []string{"frozen 0\n", "", "populated x\n", "populated \n"} {
+		if _, err := parseCgroupPopulated(body); err == nil {
+			t.Errorf("parseCgroupPopulated(%q) = nil error; want inconclusive error", body)
+		}
+	}
+}
+
+// The oracle-level contract: a readable cgroup.events without a conclusive
+// populated line must surface an error (maybe-alive), never (false, nil) —
+// (false, nil) is "confirmed dead" to kill/reap/drain consumers.
+func TestVMCgroupPopulatedMalformedIsInconclusive(t *testing.T) {
+	tree := &cgroupTree{vms: t.TempDir()}
+	if err := os.Mkdir(tree.vmCgroupDir("vm-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree.vmCgroupDir("vm-1"), "cgroup.events"),
+		[]byte("frozen 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if populated, err := tree.vmCgroupPopulated("vm-1"); err == nil {
+		t.Fatalf("malformed cgroup.events read as conclusive (populated=%v); want error", populated)
+	}
+	// A missing group stays conclusively empty — the legitimate post-rmdir
+	// answer the kill wait depends on.
+	if populated, err := tree.vmCgroupPopulated("gone"); err != nil || populated {
+		t.Fatalf("missing group = (%v, %v); want (false, nil)", populated, err)
 	}
 }
 
