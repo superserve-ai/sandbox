@@ -169,7 +169,8 @@ func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
 	// predecessor — at the lock, so no in-place state round-trip (pause and
 	// resume can return Status and Unverified to their noted values on the
 	// SAME instance) can ever masquerade as the unmutated stale original.
-	mgr.onLifecycleClaim = r.voidPendingRelease
+	claim := r.voidPendingRelease
+	mgr.onLifecycleClaim.Store(&claim)
 	return r
 }
 

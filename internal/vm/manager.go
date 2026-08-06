@@ -253,7 +253,9 @@ type Manager struct {
 	// any release it deferred for that VM: the op now owns the instance, and
 	// a deferred reap decided against its predecessor must not outlive the
 	// claim — no matter what states the op drives the VM through afterwards.
-	onLifecycleClaim func(vmID string)
+	// Atomic: the reconciler is constructed after the gRPC server is already
+	// serving, so the write races concurrent lockVMOp reads.
+	onLifecycleClaim atomic.Pointer[func(vmID string)]
 	// backupEnqueue hands finalized pause manifests to the durability
 	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
 	backupEnqueue func(backup.Task) error
@@ -440,8 +442,8 @@ func (m *Manager) lockVMOp(ctx context.Context, vmID string) (func(), error) {
 		// Every lifecycle op enters here (the reconciler deliberately uses
 		// tryLockVMOp instead), so this is the one place a claim on the VM
 		// is always visible — see onLifecycleClaim.
-		if m.onLifecycleClaim != nil {
-			m.onLifecycleClaim(vmID)
+		if claim := m.onLifecycleClaim.Load(); claim != nil {
+			(*claim)(vmID)
 		}
 		return func() { <-ch }, nil
 	case <-ctx.Done():

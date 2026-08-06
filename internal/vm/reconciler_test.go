@@ -1346,3 +1346,22 @@ func TestReapDeadActiveVMs_PendingReleaseRedrivesFlipUncharged(t *testing.T) {
 		t.Fatal("the release must stay owned by the retry")
 	}
 }
+
+// The reconciler is constructed while the gRPC server is already serving, so
+// the hook's publication must be race-free against concurrent lock
+// acquisitions — this test is the race detector's tripwire for a plain-field
+// regression.
+func TestLifecycleClaimHookPublicationIsRaceFree(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			if unlock, err := m.lockVMOp(context.Background(), "vm-race"); err == nil {
+				unlock()
+			}
+		}
+	}()
+	NewReconciler(m, DefaultReconcilerConfig()) // publishes the hook mid-traffic
+	<-done
+}
