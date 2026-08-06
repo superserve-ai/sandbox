@@ -2119,6 +2119,79 @@ func TestReattachRecord_ErrorPersistFails_StillRefusedInMemory(t *testing.T) {
 // A socket-missing record whose unit stop cannot be confirmed must keep its
 // BoltDB record: deleting it would leave a live Firecracker no record points
 // to, invisible to the next reattach.
+// A record with an unknown supervision mode must be PARKED at reattach, not
+// released: the stale-cleanup's unit probe answers vacuously "down" for a
+// nonexistent unit, and acting on that evidence would delete the record and
+// free the network under whatever the unknown mode left running.
+func TestReattachRecord_UnknownSupervision_ParksUnmanageable(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return true } // the vacuous answer
+	defer func() { vmUnitFullyDown = origDown }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	rec := VMRecord{ID: "vm-1", Status: StatusRunning, Supervision: Supervision("checkpointed"), Namespace: "ns-1"}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{}, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok || inst.Status != StatusError {
+		t.Fatalf("an unknown mode must park as Error, got inst=%+v ok=%v", inst, ok)
+	}
+	kept, err := store.Get("vm-1")
+	if err != nil || kept == nil {
+		t.Fatalf("the record must be kept, got rec=%v err=%v", kept, err)
+	}
+	if kept.Supervision != Supervision("checkpointed") {
+		t.Fatalf("the unknown value must be preserved for the binary that understands it, got %q", kept.Supervision)
+	}
+	if kept.Status != StatusError {
+		t.Fatalf("the refusal must be durable, got %s", kept.Status)
+	}
+}
+
+// A failed restore whose direct-spawned FC survived (populated group, or a
+// kill whose completion cannot be proven) still holds its tap and disk: the
+// failure path must NOT free the network slot or rundir — ownership stays
+// with the record until the reconciler confirms death. Only a confirmed-dead
+// or unit-mode VM releases.
+func TestReleaseFailedRestore_LiveCgroupRetainsOwnership(t *testing.T) {
+	newMgr := func(events string) *Manager {
+		vms := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(vms, "vm-1"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(vms, "vm-1", "cgroup.events"), []byte(events), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}, cgroups: &cgroupTree{vms: vms}}
+	}
+	release := func(m *Manager) bool {
+		cleaned := false
+		m.releaseFailedRestore("vm-1", false, false, func() { cleaned = true })
+		return cleaned
+	}
+
+	if release(newMgr("populated 1\n")) {
+		t.Fatal("a live cgroup FC still holds its disk — the rundir must not be freed")
+	}
+	if release(newMgr("frozen 0\n")) { // malformed events: death unprovable
+		t.Fatal("an unprovable kill must retain ownership, not free the rundir")
+	}
+	if !release(newMgr("populated 0\n")) {
+		t.Fatal("a confirmed-dead VM must release its rundir")
+	}
+	unitMode := &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}}
+	if !release(unitMode) {
+		t.Fatal("a plain unit VM must not be blocked by the cgroup guard")
+	}
+}
+
 func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
 	origDown := vmUnitFullyDown
 	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)

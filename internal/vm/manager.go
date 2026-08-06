@@ -2251,10 +2251,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.Supervision = supervision
 		inst.mu.Unlock()
 		if startErr != nil {
-			if !inPlace {
-				m.netMgr.CleanupVM(vmID)
-			}
-			cleanupAfterRestoreFailure()
+			m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("start firecracker: %w", startErr)
 		}
@@ -2396,16 +2393,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Firecracker is already running; stop the unit before other
 		// cleanup or it leaks. See stopUnitDuringRestoreError comment.
 		m.stopUnitDuringRestoreError(vmID)
-		if !inPlace {
-			// A tap-busy slot is suspect — tear it down rather than recycle it,
-			// so it isn't handed to another create with the same bad tap.
-			if isTapDeviceBusyErr(restoreErr) {
-				m.netMgr.TeardownVM(vmID)
-			} else {
-				m.netMgr.CleanupVM(vmID)
-			}
-		}
-		cleanupAfterRestoreFailure()
+		m.releaseFailedRestore(vmID, inPlace, isTapDeviceBusyErr(restoreErr), cleanupAfterRestoreFailure)
 		m.setStatus(vmID, StatusError)
 		// armLayered may have set DirtyTracked=true on inst before the restore call;
 		// clear it on failure so a lingering instance can't later take a Diff against a
@@ -2471,10 +2459,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Teardown first — none of it touches BoltDB, so a stalled persist
 		// cannot keep the failed restore's unit and network alive.
 		m.stopUnitDuringRestoreError(vmID)
-		if !inPlace {
-			m.netMgr.CleanupVM(vmID)
-		}
-		cleanupAfterRestoreFailure()
+		m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
 		// Join before the durable writes, or the goroutine's Running write
 		// could land after the Error write. Mirror the success path's
 		// post-join check: a concurrent destroy erased the record, and the
@@ -2510,10 +2495,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// the restore; the retry only costs latency when the store is
 		// already broken.
 		m.stopUnitDuringRestoreError(vmID)
-		if !inPlace {
-			m.netMgr.CleanupVM(vmID)
-		}
-		cleanupAfterRestoreFailure()
+		m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("vm %s restored but its state could not be persisted", vmID)
 	}
@@ -2530,10 +2512,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if !stillTracked {
 		m.deleteState(vmID)
 		m.stopUnitDuringRestoreError(vmID)
-		if !inPlace {
-			m.netMgr.CleanupVM(vmID)
-		}
-		cleanupAfterRestoreFailure()
+		m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
 		return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 	}
 	tPersisted := time.Now()
@@ -2759,6 +2738,20 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		}
 	}
 
+	// An unknown supervision mode (store corruption, or a record written by a
+	// NEWER binary) is unmanageable: the dispatchers refuse it, and the stale
+	// cleanup below would probe the wrong oracle — a nonexistent unit reads
+	// vacuously down, releasing record and network under a possibly-live FC.
+	// Park it as Error instead (durable via the publish tail), preserving the
+	// value for the binary that understands it. The live-cgroup correction
+	// above already repaired the one case reality can prove.
+	unmanageableMode := !knownSupervision(rec.Supervision)
+	if unmanageableMode {
+		log.Error().Str("supervision", string(rec.Supervision)).
+			Msg("unknown supervision mode — parking as unmanageable")
+		rec.Status = StatusError
+	}
+
 	// Running VMs must have a live systemd unit and a reachable API socket; a
 	// dead one is a stale record. Paused VMs legitimately have no unit — they
 	// were stopped at pause and wait for a resume — so they skip these checks.
@@ -2766,7 +2759,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// reads dead there while a wedged FC (a parked Error record's unconfirmed
 	// stop, riding out a restart) may still be exiting — a transitional unit
 	// falls through to the socket path below, which parks it instead.
-	if cleanupStale && rec.Status != StatusPaused {
+	if cleanupStale && !unmanageableMode && rec.Status != StatusPaused {
 		var fullyDown bool
 		if cgroupSupervised(rec.Supervision) {
 			// A conclusively empty group is already terminal — there is no
@@ -3784,6 +3777,32 @@ func (m *Manager) abortResumeLocked(vmID string) {
 	// destroyed VM's record.
 	// Best-effort: an undurable revert is re-derived by the reconciler.
 	_, _ = m.persistStateIfPresent(inst)
+}
+
+// releaseFailedRestore frees a failed restore's network slot and rundir —
+// unless a cgroup FC survived the failure (or its death cannot be proven), in
+// which case it still holds the tap and its disk, and freeing either would
+// hand live resources to the next claimant. Ownership (record, rundir, slot)
+// is then retained: the record reads Error with cgroup supervision, and the
+// reconciler's error rules complete the stop and release. Unit-mode VMs are
+// unaffected — cgroupStillLive consults the cgroup, not the record, and is
+// false when no delegated subtree exists.
+func (m *Manager) releaseFailedRestore(vmID string, inPlace, tapBusy bool, cleanupRunDir func()) {
+	if m.cgroupStillLive(vmID) {
+		m.log.Warn().Str("vm_id", vmID).
+			Msg("restore failed with a live cgroup — keeping rundir and network until the reconciler confirms death")
+		return
+	}
+	if !inPlace {
+		// A tap-busy slot is suspect — tear it down rather than recycle it,
+		// so it isn't handed to another create with the same bad tap.
+		if tapBusy {
+			m.netMgr.TeardownVM(vmID)
+		} else {
+			m.netMgr.CleanupVM(vmID)
+		}
+	}
+	cleanupRunDir()
 }
 
 // stopUnitDuringRestoreError stops a VM when a restore aborts after
