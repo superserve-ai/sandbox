@@ -453,7 +453,7 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 func TestFinalizeErrorReap_FailedDeleteKeepsMarker(t *testing.T) {
 	newRec := func() *Reconciler {
 		r := NewReconciler(&Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}, DefaultReconcilerConfig())
-		r.driftSeen["errdead:vm-1"] = time.Now()
+		r.driftSeen["errdead:vm-1"] = driftEpisode{at: time.Now()}
 		return r
 	}
 
@@ -584,7 +584,7 @@ func TestReapDeadActiveVMs_StaleRunningRecordDoesNotVetoReap(t *testing.T) {
 			vms: map[string]*VMInstance{id: {ID: id, Status: StatusRunning}},
 		}
 		r := NewReconciler(m, DefaultReconcilerConfig())
-		r.driftSeen[id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+		r.driftSeen[id] = driftEpisode{at: time.Now().Add(-2 * r.cfg.GracePeriod)}
 
 		origProbe := unitFullyDownProbe
 		unitFullyDownProbe = func(context.Context, string) bool { return unitDown }
@@ -648,7 +648,7 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 		id := sbID.String()
 		m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
 		r := NewReconciler(m, DefaultReconcilerConfig())
-		r.driftSeen["paused:"+id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+		r.driftSeen["paused:"+id] = driftEpisode{at: time.Now().Add(-2 * r.cfg.GracePeriod)}
 		flips := &[]string{}
 		r.markFailed = func(_ context.Context, vmID string, observed db.SandboxStatus) bool {
 			if observed != db.SandboxStatusPaused {
@@ -789,7 +789,7 @@ func TestMarkStaleDefersWhileUnitNotTerminal(t *testing.T) {
 func TestFinalizeRelease_DeferralIsNotSuccess(t *testing.T) {
 	newRec := func() *Reconciler {
 		r := NewReconciler(&Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}, DefaultReconcilerConfig())
-		r.driftSeen["orphan:vm-1"] = time.Now()
+		r.driftSeen["orphan:vm-1"] = driftEpisode{at: time.Now()}
 		return r
 	}
 
@@ -971,7 +971,7 @@ func TestRetryPendingReleases_RetiresOriginMarker(t *testing.T) {
 		}
 		r := NewReconciler(m, DefaultReconcilerConfig())
 		marker := "unverifiedorphan:vm-1"
-		r.driftSeen[marker] = time.Now().Add(-2 * r.cfg.UnverifiedOrphanGrace)
+		r.driftSeen[marker] = driftEpisode{at: time.Now().Add(-2 * r.cfg.UnverifiedOrphanGrace)}
 		if err := store.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -1112,7 +1112,7 @@ func TestFinalizeErrorReap_TagsDeferredRelease(t *testing.T) {
 	}
 	r := NewReconciler(m, DefaultReconcilerConfig())
 	marker := "errdead:vm-1"
-	r.driftSeen[marker] = time.Now().Add(-2 * r.cfg.GracePeriod)
+	r.driftSeen[marker] = driftEpisode{at: time.Now().Add(-2 * r.cfg.GracePeriod)}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1217,7 +1217,7 @@ func TestRetryPendingReleases_VoidClearsBareIDGrace(t *testing.T) {
 	}
 	r := NewReconciler(m, DefaultReconcilerConfig())
 	// The Drift 1/2 shape: grace elapsed under the bare id, then a deferral.
-	r.driftSeen["vm-1"] = time.Now().Add(-2 * r.cfg.GracePeriod)
+	r.driftSeen["vm-1"] = driftEpisode{at: time.Now().Add(-2 * r.cfg.GracePeriod)}
 	if err := r.markStale(context.Background(), "vm-1", ""); err == nil {
 		t.Fatal("non-terminal unit must defer")
 	}
@@ -1349,38 +1349,70 @@ func TestGenerationSeparatesClaimsFromLockTraffic(t *testing.T) {
 	})
 }
 
-// The Drift 1 mistake, re-checked for its siblings: a stale or orphaned VM
-// reads Running in memory until a rule stops it, so no reap rule may treat
-// cached Running as liveness. Pins the predicate direction for Drifts 2/3/5
-// by asserting the reap still happens for a Running-in-memory candidate.
-func TestReapRulesDoNotTrustCachedRunning(t *testing.T) {
-	stubUnitTerminal(t, true) // the unit is conclusively gone
-	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
-	if err != nil {
-		t.Fatal(err)
+// Drives Drift 3 itself — the earlier version of this test called markStale
+// directly and would have passed with the inverted guards still in runOnce.
+// Two directions: a genuinely stale orphan (Running in memory, as every
+// orphan is) must be stopped; a generation claimed since the pass snapshot
+// must not, even though the pass evidence still says orphan.
+func TestStopOrphanUnits_StaleVsClaimedGeneration(t *testing.T) {
+	newFixture := func(t *testing.T) (*Reconciler, string, *[]string) {
+		t.Helper()
+		stubUnitTerminal(t, true)
+		id := uuid.New().String()
+		inst := &VMInstance{ID: id, Status: StatusRunning} // orphans read Running
+		m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{id: inst}}
+		store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		m.state = store
+		if err := store.Put(VMRecord{ID: id, Status: StatusRunning}); err != nil {
+			t.Fatal(err)
+		}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		stopped := &[]string{}
+		orig := stopUnitFn
+		stopUnitFn = func(_ context.Context, unit string) error {
+			*stopped = append(*stopped, unit)
+			return nil
+		}
+		t.Cleanup(func() { stopUnitFn = orig })
+		return r, id, stopped
 	}
-	defer store.Close()
-	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
-		t.Fatal(err)
+	// The pass evidence: unit active, row absent (deleted/missing).
+	drive := func(r *Reconciler, id string) {
+		rows := map[string]db.ListSandboxesByHostRow{}
+		active := map[string]bool{id: true}
+		noErr := func(string) bool { return false }
+		now := time.Now()
+		r.stopOrphanUnits(context.Background(), zerolog.Nop(), rows, active, noErr, now)                          // opens the episode
+		r.stopOrphanUnits(context.Background(), zerolog.Nop(), rows, active, noErr, now.Add(2*r.cfg.GracePeriod)) // grace elapsed
 	}
-	m := &Manager{
-		log:   zerolog.Nop(),
-		state: store,
-		// The stale claim every reap candidate carries.
-		vms: map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning}},
-	}
-	r := NewReconciler(m, DefaultReconcilerConfig())
 
-	if err := r.markStale(context.Background(), "vm-1", ""); err != nil {
-		t.Fatalf("a dead unit's record must be released despite the Running claim: %v", err)
-	}
-	if rec, _ := store.Get("vm-1"); rec != nil {
-		t.Fatal("the stale record must be gone")
-	}
-	m.mu.RLock()
-	_, tracked := m.vms["vm-1"]
-	m.mu.RUnlock()
-	if tracked {
-		t.Fatal("the stale instance must be dropped")
-	}
+	t.Run("a stale orphan is stopped despite reading Running", func(t *testing.T) {
+		r, id, stopped := newFixture(t)
+		drive(r, id)
+		if len(*stopped) != 1 {
+			t.Fatalf("the stale orphan must be stopped, got %v", *stopped)
+		}
+	})
+
+	t.Run("a generation claimed since the snapshot is spared", func(t *testing.T) {
+		r, id, stopped := newFixture(t)
+		rows := map[string]db.ListSandboxesByHostRow{}
+		active := map[string]bool{id: true}
+		noErr := func(string) bool { return false }
+		now := time.Now()
+		r.stopOrphanUnits(context.Background(), zerolog.Nop(), rows, active, noErr, now) // episode opens
+		// A resume completes between the pass snapshot and the rule acting.
+		inst := r.mgr.vms[id]
+		inst.mu.Lock()
+		inst.gen++
+		inst.mu.Unlock()
+		r.stopOrphanUnits(context.Background(), zerolog.Nop(), rows, active, noErr, now.Add(2*r.cfg.GracePeriod))
+		if len(*stopped) != 0 {
+			t.Fatalf("a newly claimed generation must not be stopped, got %v", *stopped)
+		}
+	})
 }
