@@ -1221,6 +1221,10 @@ func waitBookkeeping() {
 }
 
 func newRouter(t *testing.T) *gin.Engine {
+	return newRouterWithNow(t, nil)
+}
+
+func newRouterWithNow(t *testing.T, now func() time.Time) *gin.Engine {
 	t.Helper()
 	cfg := &config.Config{
 		Port:          "0",
@@ -1230,6 +1234,9 @@ func newRouter(t *testing.T) *gin.Engine {
 	}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
 	h.Pool = testPool
+	if now != nil {
+		h.Now = now
+	}
 	registerTestHandlers(h)
 	return api.SetupRouter(t.Context(), h, testPool)
 }
@@ -2680,7 +2687,8 @@ func TestIntegration_TenantUsageDashboardEnabledByDefaultForNewTeams(t *testing.
 func TestIntegration_HourlyRollupBoundsOpenIntervalsAtNow(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
-	r := newRouter(t)
+	fixedNow := time.Date(2026, 8, 4, 12, 30, 0, 0, time.UTC)
+	r := newRouterWithNow(t, func() time.Time { return fixedNow })
 
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO team_feature_flag (team_id, key, enabled)
@@ -2696,12 +2704,9 @@ func TestIntegration_HourlyRollupBoundsOpenIntervalsAtNow(t *testing.T) {
 	}
 	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
 
-	hourStart := time.Now().UTC().Truncate(time.Hour)
+	hourStart := fixedNow.Truncate(time.Hour)
 	hourEnd := hourStart.Add(time.Hour)
-	startedAt := time.Now().UTC().Add(-5 * time.Minute)
-	if startedAt.Before(hourStart) {
-		startedAt = hourStart
-	}
+	startedAt := hourStart
 
 	if _, err := testPool.Exec(ctx, `
 		UPDATE sandbox_compute_billing_interval
@@ -2720,7 +2725,17 @@ func TestIntegration_HourlyRollupBoundsOpenIntervalsAtNow(t *testing.T) {
 		t.Fatalf("set storage interval: %v", err)
 	}
 
-	row, err := testQueries.UpsertTeamBillingUsageHour(ctx, db.UpsertTeamBillingUsageHourParams{
+	tx, err := testPool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = tx.Rollback(ctx)
+	})
+	if _, err := tx.Exec(ctx, `SELECT set_config('superserve.billing_now', $1, true)`, fixedNow.Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("set billing clock: %v", err)
+	}
+	row, err := db.New(tx).UpsertTeamBillingUsageHour(ctx, db.UpsertTeamBillingUsageHourParams{
 		TeamID:    teamID,
 		HourStart: pgtype.Timestamptz{Time: hourStart, Valid: true},
 		HourEnd:   pgtype.Timestamptz{Time: hourEnd, Valid: true},
@@ -3968,6 +3983,68 @@ func TestIntegration_BillingPeriodFinalizationUsesPeriodPricingAndUsageUnits(t *
 	if got := numericFloat64(t, result.Period.NetInvoiceAmountUsd); math.Abs(got-wantCurrent) > 1e-9 {
 		t.Fatalf("net invoice = %v, want %v", got, wantCurrent)
 	}
+}
+
+func TestIntegration_BillingPeriodFinalizationPreservesMonthBoundaryPeriodBounds(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+
+	planKey := "month-boundary-finalization-" + uuid.New().String()
+	periodStart := time.Date(2025, 12, 1, 0, 0, 0, 0, time.UTC)
+	periodEnd := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	rateEffectiveFrom := periodStart.Add(-time.Hour)
+
+	insertPricingPlanForTest(t, ctx, planKey, true)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'memory_gib', 'second', 0.0000045, $2),
+			($1, 'storage_gib', 'second', 0.00000003, $2)
+	`, planKey, rateEffectiveFrom); err != nil {
+		t.Fatalf("insert month-boundary pricing rates: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, $3)
+	`, teamID, planKey, rateEffectiveFrom); err != nil {
+		t.Fatalf("assign month-boundary pricing plan: %v", err)
+	}
+
+	rates, err := testQueries.ListActivePricingRatesForTeamCurrent(ctx, teamID)
+	if err != nil {
+		t.Fatalf("list pricing rates: %v", err)
+	}
+	planRates, err := billing.ValidateSummaryPricingRates(rates)
+	if err != nil {
+		t.Fatalf("validate pricing rates: %v", err)
+	}
+	vcpuRate := numericFloat64(t, planRates["vcpu"].PriceUsd)
+
+	vcpuSeconds := 100000.0
+	gross := vcpuSeconds * vcpuRate
+	scenario := setupBillingFinalizationScenarioAt(t, ctx, teamID, periodStart, periodEnd, vcpuSeconds, []billingFinalizationGrantSpec{
+		{amountUsd: gross * 0.5},
+	})
+
+	result, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, scenario.periodStart, scenario.periodEnd)
+	if err != nil {
+		t.Fatalf("finalize billing period: %v", err)
+	}
+
+	wantGrantRemaining, wantLedgerAmounts := expectedBillingFinalizationConsumption([]billingFinalizationGrantSpec{
+		{amountUsd: gross * 0.5},
+	}, scenario.grantIDs, scenario.periodEnd, scenario.grossCharges)
+	assertBillingFinalizationState(
+		t,
+		teamID,
+		scenario.periodStart,
+		scenario.periodEnd,
+		result,
+		result.Charges.CreditsAppliedUSD,
+		wantGrantRemaining,
+		wantLedgerAmounts,
+	)
 }
 
 func TestIntegration_BillingPeriodFinalizationRoundsFinancialValuesAtMicroBoundary(t *testing.T) {

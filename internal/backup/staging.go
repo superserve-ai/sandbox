@@ -113,7 +113,7 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 					return false, err
 				}
 			}
-			task.Files[i].BasePath = stagedBase
+			task.Files[i].BaseStagedPath = stagedBase
 		}
 	}
 	return all, nil
@@ -251,6 +251,14 @@ func syncDir(path string) error {
 // finished (verified or abandoned). Only paths under root are touched.
 func removeStagedTask(root string, task Task) {
 	if root == "" || len(task.Files) == 0 {
+		return
+	}
+	// Template tasks are never staged (their artifacts are immutable on
+	// disk), and with an empty SandboxID the path math below would land
+	// on root/<generation> and the trailing Remove would target the
+	// staging root itself. Harmless today (recreated on demand) but a
+	// trap for any refactor that assumes the root persists.
+	if task.SandboxID == "" {
 		return
 	}
 	dir := filepath.Join(root, task.SandboxID, task.Generation)
