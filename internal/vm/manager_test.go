@@ -1,8 +1,11 @@
 package vm
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -966,6 +969,10 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	orig := vmDeadForRetry
 	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
 	defer func() { vmDeadForRetry = orig }()
+	gated := false
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error { gated = true; return nil }
+	defer func() { adoptionBoxdReady = origReady }()
 
 	dir := t.TempDir()
 	snapPath := filepath.Join(dir, "vmstate.snap")
@@ -976,7 +983,7 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 		}
 	}
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5",
 		SnapshotPath: snapPath, MemFilePath: memPath,
 	}
 	mgr := &Manager{
@@ -992,11 +999,151 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	if inst != existing {
 		t.Fatal("expected the existing running instance, not a re-restore")
 	}
+	if gated {
+		t.Fatal("a verified record must adopt without the readiness gate — a wedged boxd must not be able to demote it")
+	}
 	mgr.mu.RLock()
 	still := mgr.vms["vm-1"]
 	mgr.mu.RUnlock()
 	if still != existing {
 		t.Fatal("existing instance must remain tracked untouched")
+	}
+}
+
+// A vanished caller must not stop the gate reaching a verdict. Callers arrive
+// with a deadline no larger than the gate's own budget, so if cancellation
+// meant "no verdict" the record would never flip and every retry would repeat
+// the same wait — the sandbox stuck until the orphan reaper hours later.
+func TestRestoreVMSnapshot_AdoptionWaitCanceled_StillReachesVerdict(t *testing.T) {
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
+	ctx, cancel := context.WithCancel(context.Background())
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(c context.Context, _ *Manager, _ string) error {
+		cancel() // the caller goes away mid-wait
+		if c.Err() != nil {
+			return c.Err() // inherited ctx: would end "no verdict"
+		}
+		return errors.New("boxd silent for the whole budget") // genuine verdict
+	}
+	defer func() { adoptionBoxdReady = origReady }()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		vms:        map[string]*VMInstance{"vm-1": existing},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	_, err := mgr.RestoreVMSnapshot(ctx, "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
+	if err == nil {
+		t.Fatal("a silent guest must fail the adoption")
+	}
+	// The verdict must come from the PROBE, not from the caller vanishing:
+	// acting on a cancellation would flip a possibly-healthy VM to Error.
+	if errors.Is(err, context.Canceled) {
+		t.Fatal("the gate must not treat caller cancellation as a verdict about the VM")
+	}
+	// The verdict must be applied: Running would leave the record adoptable
+	// and the next retry would repeat this wait forever.
+	existing.mu.RLock()
+	status := existing.Status
+	existing.mu.RUnlock()
+	if status != StatusError {
+		t.Fatalf("a definitive verdict must flip the record out of Running, got %s", status)
+	}
+}
+
+// A destroy landing inside the adoption readiness wait must not be reported
+// as a successful restore.
+func TestRestoreVMSnapshot_DestroyedDuringAdoptionWait_Fails(t *testing.T) {
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(_ context.Context, m *Manager, _ string) error {
+		m.mu.Lock()
+		delete(m.vms, "vm-1") // destroy races the wait
+		m.mu.Unlock()
+		return nil
+	}
+	defer func() { adoptionBoxdReady = origReady }()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		vms:        map[string]*VMInstance{"vm-1": existing},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	if _, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0); err == nil {
+		t.Fatal("a VM destroyed during the adoption wait must not restore successfully")
+	}
+}
+
+// The crash-window guard: a reattached Running record whose restore was
+// interrupted before readiness must not be adopted as a successful create.
+func TestRestoreVMSnapshot_AdoptedButBoxdNeverReady_Fails(t *testing.T) {
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error {
+		return errors.New("boxd never became ready")
+	}
+	defer func() { adoptionBoxdReady = origReady }()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		vms:        map[string]*VMInstance{"vm-1": existing},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	if _, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0); err == nil {
+		t.Fatal("adopting an unverified VM must fail when boxd never becomes ready")
+	}
+	// The failed adoption must break the adoption gates: a Running record
+	// would be re-gated by every retry, never converging.
+	existing.mu.RLock()
+	status := existing.Status
+	existing.mu.RUnlock()
+	if status == StatusRunning {
+		t.Fatal("a definitively-unready adopted VM must not stay Running")
 	}
 }
 
@@ -1013,7 +1160,7 @@ func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
 	// The live VM was restored from other artifacts: the request must NOT
 	// short-circuit to it, even with boxd healthy.
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5",
 		SnapshotPath: filepath.Join(dir, "old-vmstate.snap"),
 		MemFilePath:  filepath.Join(dir, "old-mem.snap"),
 	}
@@ -1035,18 +1182,46 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	defer func() { vmDeadForRetry = orig }()
 
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5",
 		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
 		MemFilePath:  "/snapshots/vm-1/mem.snap",
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
 
-	inst, err := mgr.ResumeVM(context.Background(), "vm-1", "", "")
+	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "")
 	if err != nil {
 		t.Fatalf("retried resume of a healthy running VM should succeed, got %v", err)
 	}
 	if inst != existing {
 		t.Fatal("expected the existing running instance, not a relaunch")
+	}
+}
+
+// Resume adoption verifies an unverified target before adopting it. When that
+// verdict comes back negative the record is a corpse, so it must not be
+// adopted — the resume falls through to a fresh launch instead.
+func TestResumeVM_UnverifiedRecord_NotAdopted(t *testing.T) {
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error {
+		return errors.New("boxd never became ready") // a genuine corpse verdict
+	}
+	defer func() { adoptionBoxdReady = origReady }()
+
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
+		MemFilePath:  "/snapshots/vm-1/mem.snap",
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
+
+	// The fallthrough fails on the missing snapshot files — the assertion is
+	// only that the corpse was not returned as a healthy VM.
+	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "")
+	if err == nil && inst == existing {
+		t.Fatal("an unverified record that fails verification must not be adopted")
 	}
 }
 
@@ -1115,12 +1290,12 @@ func TestRestoreVMSnapshot_RunningRecordButUnitDead_NotReturned(t *testing.T) {
 		}
 	}
 	existing := &VMInstance{
-		ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5",
+		ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5",
 		SnapshotPath: snapPath, MemFilePath: memPath,
 	}
 	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
 
-	if got := m.retriedLaunchTarget("vm-1", snapPath, memPath); got != nil {
+	if got, _ := m.retriedLaunchTarget("vm-1", snapPath, memPath); got != nil {
 		t.Fatal("a dead-unit Running record must not be returned as a retry target")
 	}
 }
@@ -1141,6 +1316,948 @@ func TestInstanceRunning(t *testing.T) {
 	}
 	if m.instanceRunning("absent") {
 		t.Fatal("absent instance must not report running")
+	}
+}
+
+// A reattached crash-window record (Running persisted before readiness) must
+// not be adopted; the caller falls through to a fresh, verified restore. The
+// durable flag must also stay off the wire for verified records so rollback
+// binaries read them unchanged.
+func TestRetriedLaunchTargetFlagsUnverifiedRecord(t *testing.T) {
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
+
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
+		MemFilePath:  "/snapshots/vm-1/mem.snap",
+	}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
+	got, needsVerify := mgr.retriedLaunchTarget("vm-1", existing.SnapshotPath, existing.MemFilePath)
+	if got == nil || !needsVerify {
+		t.Fatal("an unverified Running record must be returned flagged for verification")
+	}
+
+	existing.Unverified = false
+	got, needsVerify = mgr.retriedLaunchTarget("vm-1", existing.SnapshotPath, existing.MemFilePath)
+	if got == nil || needsVerify {
+		t.Fatal("a verified Running record must be adoptable without verification")
+	}
+
+	out, err := json.Marshal(toRecord(existing))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "unverified") {
+		t.Fatalf("verified records must omit the unverified key, got %s", out)
+	}
+	unv := toRecord(&VMInstance{ID: "u", Status: StatusRunning, Unverified: true})
+	round, err := json.Marshal(unv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back VMRecord
+	if err := json.Unmarshal(round, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back.Unverified {
+		t.Fatal("unverified must survive the record round-trip")
+	}
+}
+
+// The durable half of verification: the background persist after a successful
+// readiness wait clears the unverified marker in BoltDB, so after a vmd
+// restart a duplicate delivery adopts the live VM instead of refusing the
+// record and relaunching it (which rolls the guest back to its snapshot).
+func TestRestoreVMSnapshot_VerifiedRecordAfterRestart_Adopted(t *testing.T) {
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil } // boxd healthy
+	defer func() { adoptionBoxdReady = origReady }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	mgr := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+	mgr.persistState(inst) // the optimistic pre-wait persist
+
+	// What the success path runs once readiness is proven.
+	inst.mu.Lock()
+	inst.Unverified = false
+	inst.mu.Unlock()
+	mgr.persistStateIfPresent(inst)
+
+	// Simulated vmd restart: only the durable record survives.
+	rec, err := store.Get("vm-1")
+	if err != nil || rec == nil {
+		t.Fatalf("record must survive the restart: %v", err)
+	}
+	if rec.Unverified {
+		t.Fatal("the verified clear must be durable, not in-memory only")
+	}
+	reloaded := toInstance(*rec)
+	mgr2 := &Manager{
+		log:        zerolog.Nop(),
+		state:      store,
+		vms:        map[string]*VMInstance{"vm-1": reloaded},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	got, err := mgr2.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
+	if err != nil {
+		t.Fatalf("duplicate delivery after restart must adopt the live VM, got %v", err)
+	}
+	if got != reloaded {
+		t.Fatal("expected adoption of the reattached instance, not a relaunch")
+	}
+}
+
+// A crash between the response and the background verified persist leaves a
+// durable unverified record for a live VM. The next duplicate delivery must
+// re-verify and adopt it — and heal the marker — rather than relaunching it
+// and rolling the guest back.
+func TestRestoreVMSnapshot_UnverifiedRecordAfterRestart_ReverifiedAndAdopted(t *testing.T) {
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil } // boxd healthy
+	defer func() { adoptionBoxdReady = origReady }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	mgr := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+	mgr.persistState(inst)
+	// Crash here: the verified persist never ran.
+
+	rec, err := store.Get("vm-1")
+	if err != nil || rec == nil {
+		t.Fatalf("record must survive the restart: %v", err)
+	}
+	reloaded := toInstance(*rec)
+	mgr2 := &Manager{
+		log:        zerolog.Nop(),
+		state:      store,
+		vms:        map[string]*VMInstance{"vm-1": reloaded},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	got, err := mgr2.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
+	if err != nil {
+		t.Fatalf("a healthy unverified VM must be re-verified and adopted, got %v", err)
+	}
+	if got != reloaded {
+		t.Fatal("expected adoption of the reattached instance, not a relaunch")
+	}
+	healed, err := store.Get("vm-1")
+	if err != nil || healed == nil {
+		t.Fatal(err)
+	}
+	if healed.Unverified {
+		t.Fatal("successful re-verification must clear the durable marker")
+	}
+}
+
+// A restore whose state cannot be made durable must not report success: the
+// VM would be invisible to the next reattach. Pinned here at the store
+// layer: a persist into a closed store reports failure rather than logging
+// and claiming success.
+func TestPersistStateReportsFailure(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+	if !m.persistState(inst) {
+		t.Fatal("persist into a healthy store must report success")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if m.persistState(inst) {
+		t.Fatal("persist into a broken store must report failure, not log and claim success")
+	}
+}
+
+// The unverified-relaunch readiness gate tears the VM down on failure, so it
+// must probe on a ctx detached from the caller: a client disconnect or spent
+// deadline must not masquerade as a dead guest — and a completed wait clears
+// the marker so the next retry adopts instead of relaunching.
+func TestVerifyBoxdReadyDetachedFromCaller(t *testing.T) {
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	cancelCaller() // caller already gone before the gate runs
+
+	var gateCtxDone bool
+	orig := adoptionBoxdReady
+	adoptionBoxdReady = func(ctx context.Context, _ *Manager, _ string) error {
+		gateCtxDone = ctx.Err() != nil
+		return nil
+	}
+	defer func() { adoptionBoxdReady = orig }()
+
+	m := &Manager{log: zerolog.Nop()}
+	if err := m.verifyBoxdReady(callerCtx, "192.0.2.5"); err != nil {
+		t.Fatalf("healthy gate must pass, got %v", err)
+	}
+	if gateCtxDone {
+		t.Fatal("relaunch gate must run on a ctx detached from the caller — a dead caller must not read as a dead guest")
+	}
+}
+
+// An unverified retry target must be VERIFIED and adopted by resume, not
+// blindly refused: refusal relaunches over a possibly-live guest, and a stale
+// marker (swallowed clear, crash before the verified persist) would make that
+// rollback happen to a healthy VM. Success must also heal the marker durably.
+func TestResumeVM_UnverifiedTarget_VerifiedAndAdopted(t *testing.T) {
+	origDead := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = origDead }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil }
+	defer func() { adoptionBoxdReady = origReady }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
+		MemFilePath:  "/snapshots/vm-1/mem.snap",
+	}
+	if err := store.Put(toRecord(existing)); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
+
+	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "")
+	if err != nil {
+		t.Fatalf("verified adoption must succeed, got %v", err)
+	}
+	if inst != existing {
+		t.Fatal("expected the existing live instance, not a relaunch")
+	}
+	if inst.Unverified {
+		t.Fatal("adoption must clear the marker in memory")
+	}
+	rec, err := store.Get("vm-1")
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	if rec.Unverified {
+		t.Fatal("adoption must clear the marker durably")
+	}
+}
+
+// commitVerifiedAdoption must treat the store refusing the marker-clear write
+// (record deleted by a concurrent destroy) as NotFound, never success.
+func TestCommitVerifiedAdoption_DestroyedRecordIsNotFound(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// No record in the store: PutIfPresent refuses — the destroy signal.
+	existing := &VMInstance{ID: "vm-1", Status: StatusRunning, Unverified: true}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
+
+	err = m.commitVerifiedAdoption(existing)
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("a refused marker-clear write must surface NotFound, got %v", err)
+	}
+}
+
+// The post-resume readiness gate must probe on a ctx detached from the
+// caller: a client disconnect mid-gate must not read as a dead guest and tear
+// down a healthy VM the control plane's retry would have adopted.
+func TestResumeReadyOrAbortGateDetachedFromCaller(t *testing.T) {
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	var doneAfterCancel bool
+	orig := boxdHealthProbe
+	boxdHealthProbe = func(ctx context.Context, ip string, timeout time.Duration) error {
+		cancelCaller()                     // client disconnects mid-probe
+		doneAfterCancel = ctx.Err() != nil // detached gate ctx must NOT be done
+		return nil                         // boxd healthy
+	}
+	defer func() { boxdHealthProbe = orig }()
+
+	m := &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}, vms: map[string]*VMInstance{}}
+	// The return value is not asserted here (the ownership re-check needs a
+	// real network slot this bare manager can't provide); this test pins only
+	// that the probe's ctx is detached from the caller.
+	_ = m.resumeReadyOrAbort(callerCtx, "vm-1", "10.0.0.1")
+	if doneAfterCancel {
+		t.Fatal("readiness gate must survive caller cancellation (detached) — a disconnect must not read as a dead guest")
+	}
+}
+
+// A /health that answers after DestroyVM recycled the IP to another VM must
+// not pass the gate: the resume must fail unless THIS VM still owns the slot.
+func TestResumeReadyOrAbortAbortsWhenSlotRecycled(t *testing.T) {
+	orig := boxdHealthProbe
+	boxdHealthProbe = func(context.Context, string, time.Duration) error {
+		return nil // a guest answered on this IP — but maybe the recycled one
+	}
+	defer func() { boxdHealthProbe = orig }()
+
+	// Instance reads Running with the IP, but the net manager holds no slot for
+	// it (GetVMNetInfo nil) — the state after a concurrent destroy freed the IP.
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5"}
+	m := &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}, vms: map[string]*VMInstance{"vm-1": inst}}
+	if err := m.resumeReadyOrAbort(context.Background(), "vm-1", "10.11.0.5"); err == nil {
+		t.Fatal("a healthy /health against an IP the VM no longer owns must fail the resume")
+	}
+	inst.mu.RLock()
+	st := inst.Status
+	inst.mu.RUnlock()
+	if st != StatusPaused {
+		t.Fatalf("ownership loss must abort the resume (revert to Paused), got %s", st)
+	}
+}
+
+// A genuinely unreachable guest (probe fails for the whole budget) must abort
+// the resume: revert the tracked instance to Paused for a clean fresh restore.
+func TestResumeReadyOrAbortAbortsOnGenuineFailure(t *testing.T) {
+	orig := boxdHealthProbe
+	boxdHealthProbe = func(context.Context, string, time.Duration) error {
+		return fmt.Errorf("boxd not ready")
+	}
+	defer func() { boxdHealthProbe = orig }()
+
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}, vms: map[string]*VMInstance{"vm-1": inst}}
+	if err := m.resumeReadyOrAbort(context.Background(), "vm-1", "10.0.0.1"); err == nil {
+		t.Fatal("genuine unreachability must fail the gate")
+	}
+	inst.mu.RLock()
+	st := inst.Status
+	inst.mu.RUnlock()
+	if st != StatusPaused {
+		t.Fatalf("genuine failure must abort the resume (revert to Paused), got %s", st)
+	}
+}
+
+// A VM inside DestroyVM's teardown window must not be lazily reattached: doing
+// so would rebind the slot destroy is freeing and hand a live pointer to a
+// recycling IP (the credential-delivery / cross-tenant hazard).
+func TestGetInstanceRefusesResurrectionDuringDestroy(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, IP: "10.11.0.5", Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{}, vms: map[string]*VMInstance{}}
+
+	m.destroying.Store("vm-1", struct{}{})
+	if _, err := m.getInstance("vm-1"); err == nil {
+		t.Fatal("a VM mid-destroy must not be lazily reattached")
+	}
+	if _, tracked := m.vms["vm-1"]; tracked {
+		t.Fatal("a VM mid-destroy must not be republished to m.vms")
+	}
+}
+
+// DestroyVM bypasses the lifecycle lock, so it can land during a resume —
+// most likely inside the unverified readiness wait, which runs a full budget
+// detached from the caller. The resume's persist must not resurrect the
+// deleted record and report success.
+func TestCommitResumeState_DestroyedMidFlight_NotResurrected(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// The destroy already completed: instance untracked, record gone — exactly
+	// what DestroyVM leaves behind while this resume was mid-flight.
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	err = m.commitResumeState(inst)
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("a destroy landing mid-resume must surface NotFound, got %v", err)
+	}
+	present, herr := store.Has("vm-1")
+	if herr != nil {
+		t.Fatal(herr)
+	}
+	if present {
+		t.Fatal("the resume persist must be erased, not left resurrecting a destroyed VM")
+	}
+}
+
+// The normal path: a still-tracked VM persists and proceeds.
+func TestCommitResumeState_TrackedVM_Persists(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+
+	if err := m.commitResumeState(inst); err != nil {
+		t.Fatalf("a tracked VM must commit cleanly, got %v", err)
+	}
+	present, herr := store.Has("vm-1")
+	if herr != nil {
+		t.Fatal(herr)
+	}
+	if !present {
+		t.Fatal("a tracked VM's state must be persisted")
+	}
+}
+
+// Callers arrive with a deadline no larger than the gate's own budget and have
+// already spent part of it, so an inherited ctx would always expire first and
+// every attempt would end "no verdict" — leaving the record unchanged for the
+// next attempt to repeat forever. The gate must reach its own verdict anyway.
+func TestVerifyBoxdReadyReachesVerdictUnderShorterCallerDeadline(t *testing.T) {
+	orig := adoptionBoxdReady
+	var sawDeadline bool
+	adoptionBoxdReady = func(ctx context.Context, _ *Manager, _ string) error {
+		_, sawDeadline = ctx.Deadline()
+		return errors.New("boxd silent for the whole budget") // a genuine verdict
+	}
+	defer func() { adoptionBoxdReady = orig }()
+
+	// A caller deadline shorter than the gate's own budget — the common case,
+	// since the control plane's per-attempt budget equals it and the RPC has
+	// already spent part of it before reaching here.
+	callerCtx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+
+	m := &Manager{log: zerolog.Nop()}
+	err := m.verifyBoxdReady(callerCtx, "192.0.2.5")
+	if err == nil {
+		t.Fatal("a silent guest must produce a verdict, not be swallowed")
+	}
+	if sawDeadline {
+		t.Fatal("the gate must not inherit the caller's deadline — it would expire before any verdict")
+	}
+}
+
+// When the readiness gate condemns an unverified record, the relaunch that
+// follows can still fail on a precondition — and those paths return without
+// touching status. The corpse verdict must therefore be recorded first, or the
+// crash-window record keeps advertising Running for a VM that never came back.
+func TestResumeVM_CorpseVerdict_ClearsRunningBeforeRelaunch(t *testing.T) {
+	origDead := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive → adoption considered
+	defer func() { vmDeadForRetry = origDead }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error {
+		return errors.New("boxd silent for the whole budget")
+	}
+	defer func() { adoptionBoxdReady = origReady }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Snapshot paths that do not exist: the relaunch fails a precondition
+	// right after the fallthrough, which is exactly the case that used to
+	// leave the stale Running claim behind.
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: "/nonexistent/vmstate.snap", MemFilePath: "/nonexistent/mem.snap",
+	}
+	if err := store.Put(toRecord(existing)); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
+
+	if _, err := m.resumeVMLocked(context.Background(), "vm-1", "", ""); err == nil {
+		t.Fatal("a relaunch with missing artifacts must fail")
+	}
+	existing.mu.RLock()
+	st, unver := existing.Status, existing.Unverified
+	existing.mu.RUnlock()
+	if st == StatusRunning {
+		t.Fatal("a condemned record must not still advertise Running after a failed relaunch")
+	}
+	if !unver {
+		t.Fatal("readiness is still unproven — the marker must survive so the relaunch verifies")
+	}
+	rec, err := store.Get("vm-1")
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	if rec.Status == StatusRunning {
+		t.Fatal("the durable record must not advertise Running either")
+	}
+}
+
+// CreateVMSnapshot mutates DirtyTracked without the vm-op lock and deliberately
+// does not persist, because that field is in-memory only — so the write would
+// be a pure clobber, able to resurrect a concurrent lifecycle op's fields (the
+// crash-window marker most damagingly). If DirtyTracked ever becomes durable,
+// this fails: that path then needs the lock before it may persist.
+func TestToRecordIgnoresDirtyTracked(t *testing.T) {
+	base := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTracked: false}
+	dirty := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTracked: true}
+
+	a, err := json.Marshal(toRecord(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(toRecord(dirty))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Fatalf("DirtyTracked is now persisted — CreateVMSnapshot must take the vm-op lock before persisting:\n %s\n %s", a, b)
+	}
+}
+
+// The ad-hoc snapshot path must not write the record at all: it holds no
+// vm-op lock, so any write races whatever lifecycle op is in flight.
+func TestCreateVMSnapshotDoesNotPersist(t *testing.T) {
+	src, err := os.ReadFile("manager.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn := string(src)
+	start := strings.Index(fn, "func (m *Manager) CreateVMSnapshot(")
+	if start < 0 {
+		t.Fatal("CreateVMSnapshot not found")
+	}
+	end := strings.Index(fn[start:], "\nfunc ")
+	if end < 0 {
+		t.Fatal("could not bound CreateVMSnapshot")
+	}
+	if body := fn[start : start+end]; strings.Contains(body, "persistState(") {
+		t.Fatal("CreateVMSnapshot must not persist: it holds no vm-op lock, so a full-record write can clobber a concurrent lifecycle op")
+	}
+}
+
+// The corpse verdict must be durable before relaunching: the relaunch can fail
+// on a precondition and return, so an unrecorded verdict would leave the record
+// still claiming Running. A failed write must refuse the relaunch outright.
+func TestResumeVM_CorpseVerdictUnrecordable_RefusesRelaunch(t *testing.T) {
+	origDead := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive → adoption considered
+	defer func() { vmDeadForRetry = origDead }()
+	origReady := adoptionBoxdReady
+	adoptionBoxdReady = func(context.Context, *Manager, string) error {
+		return errors.New("boxd silent for the whole budget")
+	}
+	defer func() { adoptionBoxdReady = origReady }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
+		SnapshotPath: "/nonexistent/vmstate.snap", MemFilePath: "/nonexistent/mem.snap",
+	}
+	if err := store.Put(toRecord(existing)); err != nil {
+		t.Fatal(err)
+	}
+	store.Close() // every later write fails — the store is broken
+
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
+	_, err = m.resumeVMLocked(context.Background(), "vm-1", "", "")
+	if err == nil {
+		t.Fatal("an unrecordable verdict must fail the resume")
+	}
+	// It must fail ON the verdict, not sail past it into the relaunch and fail
+	// there on the missing artifacts.
+	if !strings.Contains(err.Error(), "record readiness verdict") {
+		t.Fatalf("must refuse at the verdict, got %v", err)
+	}
+}
+
+// DestroyVM stops the unit and frees the slot before it removes the map entry,
+// so tracked-ness alone would let a resume report success for a VM already
+// being torn down.
+func TestCommitResumeState_DestroyInProgress_NotReportedSuccessful(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	// Still tracked — DestroyVM has not reached removeVM yet — but tombstoned.
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+	m.destroying.Store("vm-1", struct{}{})
+
+	if err := m.commitResumeState(inst); status.Code(err) != codes.NotFound {
+		t.Fatalf("a resume racing an in-progress destroy must surface NotFound, got %v", err)
+	}
+	present, herr := store.Has("vm-1")
+	if herr != nil {
+		t.Fatal(herr)
+	}
+	if present {
+		t.Fatal("the resume's write must be erased for a VM being destroyed")
+	}
+}
+
+// A parked Error VM cannot be snapshotted; pause must fail fast with a clear
+// precondition error instead of dialing the dead socket and returning a
+// generic failure the control plane retries against.
+func TestPauseVM_ErrorInstance_FailsFast(t *testing.T) {
+	inst := &VMInstance{ID: "vm-1", Status: StatusError}
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
+	_, _, _, err := m.PauseVM(context.Background(), "vm-1", "")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition for an error-state VM, got %v", err)
+	}
+}
+
+// A parked Error record can ride out a vmd restart while its wedged unit is
+// still deactivating. unitDefinitelyDead reads that state as dead; the eager
+// startup cleanup must instead require the terminal state and park the
+// refusal again — releasing the record would free the namespace under a
+// possibly-live FC.
+func TestReattachRecord_DeactivatingUnit_ParksNotReleases(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // deactivating: not terminal
+	defer func() { vmUnitFullyDown = origDown }()
+	origStop := staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool { return false }
+	defer func() { staleUnitStopConfirmed = origStop }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusError,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok || inst.Status != StatusError {
+		t.Fatalf("a non-terminal unit must re-park the Error refusal, got inst=%+v ok=%v", inst, ok)
+	}
+	kept, err := store.Get("vm-1")
+	if err != nil || kept == nil {
+		t.Fatalf("the record must be kept while the unit is not terminal, got rec=%v err=%v", kept, err)
+	}
+	if kept.Status != StatusError {
+		t.Fatalf("kept record must stay Error, got %s", kept.Status)
+	}
+}
+
+// A confirmed stop whose record delete fails must also park the refusal:
+// the surviving Running row would otherwise be re-adopted onto a slot this
+// path was about to free.
+func TestReattachRecord_DeleteFailsAfterConfirmedStop_ParksError(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
+	defer func() { vmUnitFullyDown = origDown }()
+	origStop := staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool { return true }
+	defer func() { staleUnitStopConfirmed = origStop }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil { // the delete will fail
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok || inst.Status != StatusError {
+		t.Fatalf("a failed delete must park the refusal, got inst=%+v ok=%v", inst, ok)
+	}
+	if tracked := m.vms["vm-1"]; tracked != inst {
+		t.Fatal("the Error instance must be tracked in memory")
+	}
+}
+
+// A destroy or markStale deleting the record while the stale stop waits owns
+// the teardown: the reattach must abandon, not resurrect the row.
+func TestReattachRecord_DeletedDuringStaleStop_Abandoned(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
+	defer func() { vmUnitFullyDown = origDown }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	origStop := staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool {
+		if err := store.Delete("vm-1"); err != nil { // markStale races the wait
+			t.Error(err)
+		}
+		return false
+	}
+	defer func() { staleUnitStopConfirmed = origStop }()
+
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst != nil || ok {
+		t.Fatal("a record deleted mid-wait must be abandoned, not published")
+	}
+	present, err := store.Has("vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present {
+		t.Fatal("the deleted record must not be resurrected")
+	}
+	if _, tracked := m.vms["vm-1"]; tracked {
+		t.Fatal("an abandoned reattach must not track the VM")
+	}
+}
+
+// When the error write fails (broken store) and there is no verifiable pid to
+// escalate against, the VM must still be refused in memory — the only refusal
+// a broken store leaves.
+func TestReattachRecord_ErrorPersistFails_StillRefusedInMemory(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
+	defer func() { vmUnitFullyDown = origDown }()
+	origStop := staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool { return false }
+	defer func() { staleUnitStopConfirmed = origStop }()
+	origKill := killUnitSIGKILL
+	killUnitSIGKILL = func(context.Context, string) bool { return false } // escalation inconclusive too
+	defer func() { killUnitSIGKILL = origKill }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil { // every later write fails
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok || inst.Status != StatusError {
+		t.Fatalf("a broken store must still yield an in-memory Error refusal, got inst=%+v ok=%v", inst, ok)
+	}
+	if tracked := m.vms["vm-1"]; tracked != inst {
+		t.Fatal("the Error instance must be tracked in memory")
+	}
+}
+
+// A socket-missing record whose unit stop cannot be confirmed must keep its
+// BoltDB record: deleting it would leave a live Firecracker no record points
+// to, invisible to the next reattach.
+func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
+	defer func() { vmUnitFullyDown = origDown }()
+	origStop := staleUnitStopConfirmed
+	stoppedUnit := ""
+	staleUnitStopConfirmed = func(_ context.Context, unit string) bool {
+		stoppedUnit = unit
+		return false // stop failed and the unit is not provably down
+	}
+	defer func() { staleUnitStopConfirmed = origStop }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning,
+		SocketPath: filepath.Join(t.TempDir(), "missing.sock"),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok {
+		t.Fatal("an unconfirmed stop must publish the VM so a lazy reattach cannot re-adopt the Running row")
+	}
+	if inst.Status != StatusError {
+		t.Fatalf("published instance must read Error, got %s", inst.Status)
+	}
+	if stoppedUnit != systemdUnitName("vm-1") {
+		t.Fatalf("stop attempted on %q, want the record's unit", stoppedUnit)
+	}
+	if tracked := m.vms["vm-1"]; tracked != inst {
+		t.Fatal("the Error instance must be tracked in memory")
+	}
+	kept, err := store.Get("vm-1")
+	if err != nil || kept == nil {
+		t.Fatalf("an unconfirmed stop must keep the record so the unit stays findable, got rec=%v err=%v", kept, err)
+	}
+	if kept.Status != StatusError {
+		t.Fatalf("kept record must read Error so no retry adopts a socket-less VM, got %s", kept.Status)
+	}
+}
+
+// The paused status is set in memory before it is persisted, so a failed write
+// leaves the durable record reading Running behind a stopped unit — which the
+// next reattach deletes as stale. The retry must re-record it rather than
+// report a pause whose only trace is in memory.
+func TestPauseVM_RetryRepersistsPausedState(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dbPath := filepath.Join(dir, "vmd.db")
+	store, err := OpenStateStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The durable record still reads Running: the original pause's write failed.
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusPaused,
+		SnapshotPath: snapPath, MemFilePath: memPath,
+	}
+	m := &Manager{
+		log:      zerolog.Nop(),
+		state:    store,
+		vms:      map[string]*VMInstance{"vm-1": inst},
+		unitDead: func(context.Context, string) bool { return false }, // skip the retry backup
+	}
+
+	// Retry 1: the store is still refusing writes, so the pause must not be
+	// reported complete.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", dir); err == nil {
+		t.Fatal("a retry that cannot record the paused state must not report success")
+	}
+
+	// Retry 2: the store recovers and the retry makes the paused state durable.
+	reopened, err := OpenStateStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	m.state = reopened
+	gotSnap, gotMem, _, err := m.PauseVM(context.Background(), "vm-1", dir)
+	if err != nil {
+		t.Fatalf("retry must succeed once the store recovers: %v", err)
+	}
+	if gotSnap != snapPath || gotMem != memPath {
+		t.Fatalf("retry must return the recorded artifacts, got %q %q", gotSnap, gotMem)
+	}
+	rec, err := reopened.Get("vm-1")
+	if err != nil || rec == nil {
+		t.Fatalf("record must survive, got rec=%v err=%v", rec, err)
+	}
+	if rec.Status != StatusPaused {
+		t.Fatalf("the retry must make Paused durable, record still reads %v", rec.Status)
+	}
+}
+
+// A resume whose Running write cannot be made durable must fail: the durable
+// record still reads its pre-resume state (Error for a parked VM), and after a
+// vmd restart the error rules would trust it and stop the healthy unit.
+func TestCommitResumeState_UndurableRunning_FailsResume(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, DirtyTracked: true}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+	if err := store.Close(); err != nil { // the Running write cannot land
+		t.Fatal(err)
+	}
+
+	if cerr := m.commitResumeState(inst); cerr == nil {
+		t.Fatal("an undurable Running state must fail the resume, not report success")
+	}
+	inst.mu.RLock()
+	st, dirty := inst.Status, inst.DirtyTracked
+	inst.mu.RUnlock()
+	if st != StatusError {
+		t.Fatalf("instance must be parked Error so a retry cannot adopt the stopped unit, got %v", st)
+	}
+	if dirty {
+		t.Fatal("DirtyTracked must clear with the unit stopped")
 	}
 }
 

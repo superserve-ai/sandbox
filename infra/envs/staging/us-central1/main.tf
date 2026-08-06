@@ -107,6 +107,10 @@ module "iam" {
       account_id   = "superserve-github-actions"
       display_name = "GitHub Actions CI/CD Service Account"
     }
+    grafana_monitoring = {
+      account_id   = "grafana-monitoring"
+      display_name = "Grafana Monitoring"
+    }
   }
   project_bindings = {
     staging_host_collector_metric_writer = {
@@ -120,6 +124,19 @@ module "iam" {
     cd_network_admin = {
       role    = "roles/compute.networkAdmin"
       members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    grafana_monitoring_viewer = {
+      role = "roles/monitoring.viewer"
+      members = [
+        "serviceAccount:grafana-monitoring@${local.project_id}.iam.gserviceaccount.com"
+      ]
+    }
+
+    grafana_browser = {
+      role = "roles/browser"
+      members = [
+        "serviceAccount:grafana-monitoring@${local.project_id}.iam.gserviceaccount.com"
+      ]
     }
   }
   labels = local.common_labels

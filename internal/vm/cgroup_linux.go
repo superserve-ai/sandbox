@@ -568,17 +568,26 @@ func (t *cgroupTree) vmCgroupPopulated(vmID string) (bool, error) {
 		}
 		return false, err
 	}
-	return parseCgroupPopulated(string(data)), nil
+	return parseCgroupPopulated(string(data))
 }
 
-// parseCgroupPopulated parses a cgroup.events body ("populated 0|1\n...").
-func parseCgroupPopulated(events string) bool {
+// parseCgroupPopulated parses a cgroup.events body. Only an explicit
+// "populated 0" or "populated 1" is conclusive; a missing or malformed line
+// is an error so callers treat the read as maybe-alive, never as empty.
+func parseCgroupPopulated(events string) (bool, error) {
 	for _, line := range strings.Split(events, "\n") {
 		if rest, ok := strings.CutPrefix(line, "populated "); ok {
-			return strings.TrimSpace(rest) == "1"
+			switch strings.TrimSpace(rest) {
+			case "1":
+				return true, nil
+			case "0":
+				return false, nil
+			default:
+				return false, fmt.Errorf("malformed cgroup.events line %q", line)
+			}
 		}
 	}
-	return false
+	return false, fmt.Errorf("no populated line in cgroup.events")
 }
 
 // killVMCgroup SIGKILLs every process in the VM's group (one atomic write)
@@ -752,8 +761,11 @@ func CheckDrained(ctx context.Context, statePath string) (DrainReport, error) {
 		}
 		r.PerVMDirs++
 		data, rerr := os.ReadFile(filepath.Join(r.ScopePath, e.Name(), "cgroup.events"))
-		if rerr == nil && parseCgroupPopulated(string(data)) {
-			r.PopulatedGroups++
+		if rerr != nil && os.IsNotExist(rerr) {
+			continue // group removed mid-scan: conclusively no live process
+		}
+		if pop, perr := parseCgroupPopulated(string(data)); rerr != nil || perr != nil || pop {
+			r.PopulatedGroups++ // unreadable/malformed reads maybe-alive
 		}
 	}
 	return r, nil

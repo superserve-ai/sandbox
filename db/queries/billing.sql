@@ -165,34 +165,34 @@ WITH compute AS (
     SELECT
         COALESCE(SUM(
             EXTRACT(EPOCH FROM (
-                LEAST(COALESCE(i.ended_at, now()), sqlc.arg(hour_end))
+                LEAST(COALESCE(i.ended_at, billing_request_now()), sqlc.arg(hour_end))
                 - GREATEST(i.started_at, sqlc.arg(hour_start))
             )) * i.vcpu_count
         ), 0)::numeric AS vcpu_seconds,
         COALESCE(SUM(
             EXTRACT(EPOCH FROM (
-                LEAST(COALESCE(i.ended_at, now()), sqlc.arg(hour_end))
+                LEAST(COALESCE(i.ended_at, billing_request_now()), sqlc.arg(hour_end))
                 - GREATEST(i.started_at, sqlc.arg(hour_start))
             )) * i.memory_mib
         ), 0)::numeric AS memory_mib_seconds
     FROM sandbox_compute_billing_interval i
     WHERE i.team_id = sqlc.arg(team_id)
       AND i.started_at < sqlc.arg(hour_end)
-      AND sqlc.arg(hour_start) < LEAST(now(), sqlc.arg(hour_end))
-      AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
+      AND sqlc.arg(hour_start) < LEAST(billing_request_now(), sqlc.arg(hour_end))
+      AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
 ),
 storage AS (
     SELECT COALESCE(SUM(
         EXTRACT(EPOCH FROM (
-            LEAST(COALESCE(i.ended_at, now()), sqlc.arg(hour_end))
+            LEAST(COALESCE(i.ended_at, billing_request_now()), sqlc.arg(hour_end))
             - GREATEST(i.started_at, sqlc.arg(hour_start))
         )) * i.disk_mib
     ), 0)::numeric AS storage_mib_seconds
     FROM sandbox_storage_interval i
     WHERE i.team_id = sqlc.arg(team_id)
       AND i.started_at < sqlc.arg(hour_end)
-      AND sqlc.arg(hour_start) < LEAST(now(), sqlc.arg(hour_end))
-      AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
+      AND sqlc.arg(hour_start) < LEAST(billing_request_now(), sqlc.arg(hour_end))
+      AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
 ),
 usage AS (
     SELECT

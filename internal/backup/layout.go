@@ -28,11 +28,38 @@ import (
 // bytes would dedupe onto a manifest pairing it with the wrong base
 // contents (the overlay digest cannot see this: holes hash as zeros, not
 // as base bytes).
+//
+// Size is in the key even though an honest digest already implies it:
+// restore trusts the recorded size as a resource bound (truncate target,
+// verification span), so a tampered manifest inflating it must fail the
+// key check rather than drive an effectively unbounded zero hash.
+//
+// Uploads emit only this formula. Restore additionally accepts the
+// legacy formula below: generations uploaded before Size joined the key
+// exist in every bucket (and journal tasks carrying legacy keys survive
+// vmd upgrades), and a backup tier that cannot restore its own history
+// is not a backup tier. Legacy generations get their resource bounding
+// from the per-entry size cap in restore validation instead.
 func GenerationKey(files []TaskFile) string {
+	lines := make([]string, 0, len(files))
+	for _, f := range files {
+		lines = append(lines, fmt.Sprintf("%s=%s=%d=%s=%s", f.Name, f.SHA256, f.Size, f.BasePath, f.BaseSHA256))
+	}
+	return hashKeyLines(lines)
+}
+
+// generationKeyLegacy is the pre-Size derivation (name=sha=basePath=baseSHA),
+// kept ONLY so restore can verify generations uploaded under it. Nothing
+// may write new generations with this key.
+func generationKeyLegacy(files []TaskFile) string {
 	lines := make([]string, 0, len(files))
 	for _, f := range files {
 		lines = append(lines, f.Name+"="+f.SHA256+"="+f.BasePath+"="+f.BaseSHA256)
 	}
+	return hashKeyLines(lines)
+}
+
+func hashKeyLines(lines []string) string {
 	sort.Strings(lines)
 	h := sha256.New()
 	for _, l := range lines {
@@ -67,7 +94,6 @@ func SandboxObject(sandboxID, generation, fileName string) (string, error) {
 	return fmt.Sprintf("%s/%s/%s/%s", sandboxPrefix, sandboxID, generation, fileName), nil
 }
 
-// TemplateObject names an artifact object within a template build.
 // SharedBaseObject names a bucket-wide content-addressed base image
 // object: bases/<sha256>.p<fingerprint>. The digest addresses the bytes
 // and the fingerprint binds the extent table, so identical bases from
@@ -76,17 +102,26 @@ func SharedBaseObject(sha256, fingerprint string) string {
 	return "bases/" + sha256 + ".p" + fingerprint
 }
 
-func TemplateObject(templateID, buildID, fileName string) (string, error) {
+// TemplateObject names an artifact object within a template build
+// generation. The generation segment matters even though a finished build
+// is immutable: build ids are reusable (vmd defaults to build-<template>,
+// and a terminal build releases the id for the next rebuild), so without
+// it a rebuild would land on the previous build's prefix and create-only
+// dedupe would silently keep the stale objects.
+func TemplateObject(templateID, buildID, generation, fileName string) (string, error) {
 	if err := validSegment(templateID); err != nil {
 		return "", fmt.Errorf("template id: %w", err)
 	}
 	if err := validSegment(buildID); err != nil {
 		return "", fmt.Errorf("build id: %w", err)
 	}
+	if err := validSegment(generation); err != nil {
+		return "", fmt.Errorf("generation: %w", err)
+	}
 	if err := validSegment(fileName); err != nil {
 		return "", fmt.Errorf("file name: %w", err)
 	}
-	return fmt.Sprintf("%s/%s/%s/%s", templatePrefix, templateID, buildID, fileName), nil
+	return fmt.Sprintf("%s/%s/%s/%s/%s", templatePrefix, templateID, buildID, generation, fileName), nil
 }
 
 // validSegment rejects path traversal and separator injection in object-name

@@ -7,8 +7,8 @@ func TestObjectNames(t *testing.T) {
 	if err != nil || got != "sandboxes/sb-123/abcd1234/overlay.ext4" {
 		t.Fatalf("sandbox object = %q err=%v", got, err)
 	}
-	got, err = TemplateObject("tpl-1", "build-9", "base.ext4")
-	if err != nil || got != "templates/tpl-1/build-9/base.ext4" {
+	got, err = TemplateObject("tpl-1", "build-9", "abcd1234", "base.ext4")
+	if err != nil || got != "templates/tpl-1/build-9/abcd1234/base.ext4" {
 		t.Fatalf("template object = %q err=%v", got, err)
 	}
 }
@@ -51,6 +51,15 @@ func TestGenerationKey(t *testing.T) {
 	})
 	if rebased == k1 {
 		t.Fatal("changed base dependency did not change the generation key")
+	}
+	// Size is a restore-side resource bound, so it must be key-covered:
+	// a tampered manifest inflating it has to fail the key check.
+	resized := GenerationKey([]TaskFile{
+		{Name: "rootfs.ext4", SHA256: "aaaa", Size: 1 << 60},
+		base[1],
+	})
+	if resized == k1 {
+		t.Fatal("changed size did not change the generation key")
 	}
 	// A base rebuilt in place: same path, different bytes. The path
 	// cannot see it; the base content digest must.
