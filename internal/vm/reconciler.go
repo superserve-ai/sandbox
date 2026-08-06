@@ -483,15 +483,21 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if !r.gracePeriodElapsed(id, now) {
 				continue
 			}
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue // an op owns the VM; the generation voids any pending entry
+			}
+			if r.mgr.instanceRunning(id) {
+				unlockOp()
+				r.clearDrift(id)
+				continue
+			}
 			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
 				continue
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "boltdb_running_unit_missing").
 				Msg("dead Firecracker detected (no DB context)")
-			unlockOp, ok := r.mgr.tryLockVMOp(id)
-			if !ok {
-				continue // an op owns the VM; its claim voided any pending entry
-			}
 			releaseErr := r.markStale(ctx, id, "")
 			unlockOp()
 			r.finalizeRelease(ctx, id, "", "stale_cleanup", "VM dead, DB unavailable", "boltdb_running_unit_missing", releaseErr)
@@ -519,7 +525,21 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if !r.gracePeriodElapsed("orphan:"+id, now) {
 				continue
 			}
+			// Drift 7's discipline, now covering the STOP too: the lock is
+			// taken before budget or destruction, and the in-memory record is
+			// re-read under it — a create/resume that began after the pass
+			// snapshot would otherwise have its fresh unit killed.
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			if r.mgr.instanceRunning(id) {
+				unlockOp()
+				r.clearDrift("orphan:" + id)
+				continue
+			}
 			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
 				r.writeAudit(ctx, id, "budget_exhausted", "orphan_stop suppressed by rate limit", "systemd_active_db_missing")
 				continue
 			}
@@ -534,14 +554,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			log.Warn().Str("vm_id", id).Str("drift", kind).Msg("orphan systemd unit — stopping")
 			if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
+				unlockOp()
 				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit")
 				continue
 			}
 			removeUnitDropIn(id)
-			unlockOp, ok := r.mgr.tryLockVMOp(id)
-			if !ok {
-				continue
-			}
 			releaseErr := r.markStale(ctx, id, "orphan:"+id)
 			unlockOp()
 			r.finalizeRelease(ctx, id, "orphan:"+id, "orphan_stop", reason, kind, releaseErr)
@@ -860,25 +877,36 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if errorRecord(id) {
 				continue
 			}
+			// The lock is taken before budget or the stop, and the in-memory
+			// record re-read under it: a create whose row insert is still in
+			// flight reads Running here, and killing it would be the stop-vs-
+			// relaunch race, not a reap.
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			if r.mgr.instanceRunning(id) {
+				unlockOp()
+				r.clearDrift("bolt-orphan:" + id)
+				continue
+			}
 			// Only stopping a live unit is destructive; charge the budget there.
 			// Gate on the fail-closed `active` snapshot (the pass bailed if systemctl
 			// couldn't be listed) so an inconclusive check never frees a live VM's slot.
 			if active[id] {
 				if !r.consumeAutoFailBudget(id) {
+					unlockOp()
 					r.writeAudit(ctx, id, "budget_exhausted", "orphan_stop suppressed by rate limit", "boltdb_present_db_missing")
 					continue
 				}
 				log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
 					Msg("live orphan systemd unit with no DB row — stopping")
 				if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
+					unlockOp()
 					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit from BoltDB — leaving for retry")
 					continue
 				}
 				removeUnitDropIn(id)
-			}
-			unlockOp, ok := r.mgr.tryLockVMOp(id)
-			if !ok {
-				continue
 			}
 			releaseErr := r.markStale(ctx, id, "bolt-orphan:"+id)
 			unlockOp()
