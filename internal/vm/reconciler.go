@@ -449,10 +449,8 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// dead-VM rule). Detach from the pass context, bounded.
 			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			flipped := r.markFailedInDB(persistCtx, id, db.SandboxStatusActive)
-			// Still under the vm-op lock: a resume winning the lock between
-			// the terminal probe and the cleanup would have its fresh record
-			// deleted and its live namespace reclaimed.
-			releaseErr := r.markStale(persistCtx, id, "")
+			releaseErr := r.markStale(persistCtx, id, "") // under the lock, per its contract
+
 			unlockOp()
 			if releaseErr != nil {
 				r.finalizeRelease(persistCtx, id, "", "", "empty Firecracker shell while DB said active", "fc_empty_shell", releaseErr)
@@ -1427,6 +1425,10 @@ func (r *Reconciler) finalizeErrorReap(ctx context.Context, vmID, marker, action
 // before calling this must not report success on one: stopping the unit
 // retires the very condition their next pass matches on, so the record is
 // left for retryPendingReleases rather than another pass of the rule.
+//
+// Callers must hold vmID's vm-op lock across the call: a resume winning the
+// lock between the terminal probe and the cleanup would have its fresh
+// record deleted and its live namespace reclaimed.
 func (r *Reconciler) markStale(ctx context.Context, vmID, marker string) error {
 	// The release hands this VM's namespace, IP and tap device back to the
 	// pool, so it needs the terminal claim: a nil stopUnit only means the job
