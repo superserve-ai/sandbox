@@ -877,10 +877,8 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if errorRecord(id) {
 				continue
 			}
-			// The lock is taken before budget or the stop, and the in-memory
-			// record re-read under it: a create whose row insert is still in
-			// flight reads Running here, and killing it would be the stop-vs-
-			// relaunch race, not a reap.
+			// Same discipline as Drift 3; here the Running re-read also
+			// covers a create whose row insert is still in flight.
 			unlockOp, ok := r.mgr.tryLockVMOp(id)
 			if !ok {
 				continue
