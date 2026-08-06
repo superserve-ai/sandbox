@@ -11,7 +11,7 @@ concurrency:
 jobs:
   terraform-fmt:
     name: Terraform Fmt
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -26,7 +26,7 @@ jobs:
 
   terraform-validate:
     name: Terraform Validate
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -41,7 +41,7 @@ jobs:
 
   terraform-plan-summary:
     name: Terraform Plan Summary
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     needs: [terraform-fmt, terraform-validate]
     if: always()
     permissions:
