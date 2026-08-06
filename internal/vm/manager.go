@@ -97,13 +97,11 @@ type VMInstance struct {
 	Status     VMStatus
 	Unverified bool // Running persisted before boxd readiness (see VMRecord)
 	// gen counts in-place lifecycle transitions (Status/Unverified writes on
-	// a tracked instance). The reconciler snapshots it when deferring a
-	// release: a changed gen proves a lifecycle op claimed the VM, no matter
-	// what state the op drove it back to. Fresh instances need no bump —
-	// pointer identity already voids across a replacement. Bump under
-	// inst.mu, at every in-place transition, and nowhere else: inspection
-	// ops (env inject, verification) must NOT bump, or they void retries
-	// for VMs they never touched.
+	// a tracked instance); the reconciler's deferredRelease is its consumer.
+	// Bump under inst.mu, at every in-place transition, and nowhere else:
+	// fresh instances need no bump, and inspection ops (env inject,
+	// verification) must NOT bump, or they void retries for VMs they never
+	// touched.
 	gen          uint64
 	Config       VMConfig
 	RunDirID     string // Directory name under RunDir for this VM's files.
