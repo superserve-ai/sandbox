@@ -733,7 +733,9 @@ func CheckDrained(ctx context.Context, statePath string) (DrainReport, error) {
 		return r, fmt.Errorf("read records: %w", err)
 	}
 	for _, rec := range recs {
-		if cgroupSupervised(rec.Supervision) {
+		// != unit, not == cgroup: an UNKNOWN mode (written by a newer binary)
+		// must also block the rollback — the old binary can't manage it either.
+		if rec.Supervision != SupervisionUnit {
 			r.CgroupRecords++
 		}
 	}

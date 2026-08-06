@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/rs/zerolog"
 )
 
 // The drain guard must count cgroup-supervised records (the paused-VM case has
@@ -226,6 +228,60 @@ func TestDirectSpawnScriptPinsNofile(t *testing.T) {
 		"/usr/local/bin/firecracker", "/run/x/firecracker.sock", "vm-1")
 	if strings.Replace(script, "prlimit --nofile=1024:524288 ", "", 1) != base {
 		t.Fatal("direct-spawn script diverged from the unit script beyond the prlimit hop")
+	}
+}
+
+// An unknown supervision value (store corruption, or a mode written by a
+// newer binary) must read unmanageable/inconclusive at every dispatcher —
+// never default to the unit path, whose vacuous probes against a nonexistent
+// unit would release a live FC's record and network.
+func TestUnknownSupervisionFailsClosed(t *testing.T) {
+	// A systemctl shim answering "unit conclusively down" — exactly the
+	// vacuous answer a nonexistent unit gives on a real host. Without
+	// validation the dispatchers would trust it and release live resources;
+	// every assert below must bite on that, not on a missing systemctl.
+	shim := t.TempDir()
+	script := "#!/bin/sh\ncase \"$1\" in\nshow) echo inactive ;;\nis-active) exit 3 ;;\nesac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(shim, "systemctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	unknown := Supervision("checkpointed")
+	m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: t.TempDir()}, vms: map[string]*VMInstance{
+		"vm-1": {ID: "vm-1", Status: StatusPaused, Supervision: unknown},
+	}}
+
+	if err := m.stopVM(context.Background(), "vm-1", unknown); err == nil || !strings.Contains(err.Error(), "unknown supervision mode") {
+		t.Fatalf("stop must refuse an unknown mode outright, got %v", err)
+	}
+	if m.vmDefinitelyDead(context.Background(), "vm-1", unknown) {
+		t.Fatal("an unknown mode must read maybe-alive even when the unit oracle says dead")
+	}
+	if m.vmConfirmedAtRest(context.Background(), "vm-1") {
+		t.Fatal("an unknown mode must never read at-rest even when the unit oracle says down")
+	}
+	if _, _, err := m.launchFirecracker(context.Background(), "vm-1", "", "", "", "", unknown, false, false); err == nil || !strings.Contains(err.Error(), "unknown supervision mode") {
+		t.Fatalf("a launch over an unknown mode must be refused at dispatch, got %v", err)
+	}
+
+	// The drain guard must count an unknown-mode record against the rollback:
+	// the old binary cannot manage it either.
+	path := filepath.Join(t.TempDir(), "vmd.db")
+	store, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(VMRecord{ID: "u1", Supervision: unknown}); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	rep, err := CheckDrained(context.Background(), path)
+	if err != nil {
+		t.Fatalf("CheckDrained: %v", err)
+	}
+	if rep.CgroupRecords != 1 || rep.Drained() {
+		t.Fatalf("an unknown-mode record must block the rollback drain, got records=%d drained=%v", rep.CgroupRecords, rep.Drained())
 	}
 }
 

@@ -572,7 +572,11 @@ func (m *Manager) vmConfirmedAtRest(ctx context.Context, vmID string) bool {
 	if m.unitDead != nil {
 		return m.unitDead(ctx, vmID)
 	}
-	if cgroupSupervised(m.supervisionForVM(vmID)) {
+	sup := m.supervisionForVM(vmID)
+	if !knownSupervision(sup) {
+		return false // no oracle applies to an unknown mode — not at rest
+	}
+	if cgroupSupervised(sup) {
 		return m.cgroupDefinitelyDead(vmID)
 	}
 	return unitFullyDown(ctx, systemdUnitName(vmID))

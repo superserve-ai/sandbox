@@ -213,6 +213,15 @@ func (s Supervision) String() string {
 	return string(s)
 }
 
+// knownSupervision reports whether s is a mode this binary can dispatch.
+// Anything else (store corruption, or a record written by a NEWER binary
+// with a mode this one predates) is unmanageable: dispatchers must refuse
+// or read inconclusive, never fall through to the unit path — its vacuous
+// probes would release a live non-unit FC's record and network.
+func knownSupervision(s Supervision) bool {
+	return s == SupervisionUnit || s == SupervisionCgroup
+}
+
 // cgroupSupervised reports whether a supervision value means the VM has no
 // systemd unit and lives in a per-VM cgroup.
 func cgroupSupervised(s Supervision) bool { return s == SupervisionCgroup }

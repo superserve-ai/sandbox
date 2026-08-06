@@ -39,6 +39,12 @@ func (m *Manager) cgroupLaunch(existing Supervision) bool {
 // stop before a cgroup launch; freshUnit is the systemd linger-skip hint,
 // ignored on the cgroup path.
 func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error) {
+	if !knownSupervision(existing) {
+		// A launch over an unknown mode could double-spawn: the prior-life
+		// stop below only clears units, and no oracle can prove what an
+		// unknown mode left running.
+		return 0, existing, fmt.Errorf("vm %s has unknown supervision mode %q; refusing launch", vmID, existing)
+	}
 	if m.cgroupLaunch(existing) {
 		// Arming implies the validated launch path, but a cgroup record
 		// reaches here in manage-only mode too, where validation may have
@@ -94,6 +100,11 @@ func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVM
 // group and wait it empty, then rmdir; unit mode: the existing systemd stop.
 // Idempotent — a missing group or unit is a no-op.
 func (m *Manager) stopVM(ctx context.Context, vmID string, supervision Supervision) error {
+	if !knownSupervision(supervision) {
+		// Dispatching unknown to the unit path would no-op against a
+		// nonexistent unit and report the stop clean.
+		return fmt.Errorf("stop vm %s: unknown supervision mode %q", vmID, supervision)
+	}
 	if cgroupSupervised(supervision) {
 		if m.cgroups == nil {
 			return fmt.Errorf("stop cgroup VM %s: no delegated subtree (not armed)", vmID)
@@ -136,6 +147,9 @@ func (m *Manager) awaitReaper(vmID string) {
 // only a real answer says dead — an unreadable cgroup or an inconclusive
 // systemd probe reads as ALIVE, so an overloaded host never reaps a live VM.
 func (m *Manager) vmDefinitelyDead(ctx context.Context, vmID string, supervision Supervision) bool {
+	if !knownSupervision(supervision) {
+		return false // no oracle applies to an unknown mode — maybe-alive
+	}
 	if cgroupSupervised(supervision) {
 		return m.cgroupDefinitelyDead(vmID)
 	}
