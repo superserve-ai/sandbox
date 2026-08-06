@@ -169,6 +169,12 @@ type VMRecord struct {
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
+	// Supervision dispatches liveness/stop/reattach for this VM's current
+	// run. Empty (SupervisionUnit) is canonical for systemd-unit VMs so
+	// records written by this binary stay readable-and-correct under a
+	// rollback binary that predates the field; never write a non-empty
+	// value for unit mode.
+	Supervision string `json:"supervision,omitempty"`
 	// Preview publication policy must survive vmd restarts; old records decode
 	// to empty/legacy behavior for backward compatibility.
 	PreviewAccess            string           `json:"preview_access,omitempty"`
@@ -180,6 +186,20 @@ type VMRecord struct {
 	// are active only when it exactly matches PreviewPolicyRevision.
 	PreviewTokenPolicyRevision int64 `json:"preview_token_policy_revision,omitempty"`
 }
+
+// Supervision values for VMInstance/VMRecord.
+const (
+	// SupervisionUnit: the VM runs as firecracker@<id>.service. Canonically
+	// the empty string — legacy records predate the field.
+	SupervisionUnit = ""
+	// SupervisionCgroup: the VM was direct-spawned into a per-VM cgroup
+	// under vmd's delegated subtree; no systemd unit exists for it.
+	SupervisionCgroup = "cgroup"
+)
+
+// cgroupSupervised reports whether a supervision value means the VM has no
+// systemd unit and lives in a per-VM cgroup.
+func cgroupSupervised(s string) bool { return s == SupervisionCgroup }
 
 // StateStore wraps a BoltDB database for VM state persistence.
 type StateStore struct {
@@ -524,6 +544,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		BasePath:                   inst.Config.BasePath,
 		TeamID:                     inst.TeamID,
 		OwnerID:                    inst.OwnerID,
+		Supervision:                inst.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(inst.PreviewAccess, inst.PreviewPorts),
 		PreviewPorts:               previewPortsToRecord(inst.PreviewPorts),
 		PreviewPortAccess:          previewPortAccessToRecord(inst.PreviewPorts),
@@ -607,6 +628,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,
 		OwnerID:                    rec.OwnerID,
+		Supervision:                rec.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(rec.PreviewAccess, ports),
 		PreviewPorts:               ports,
 		PreviewPolicyRevision:      rec.PreviewPolicyRevision,

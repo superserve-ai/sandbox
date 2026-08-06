@@ -131,6 +131,15 @@ type VMInstance struct {
 	// live FC process, which a fresh resume re-establishes.
 	DirtyTracked bool
 
+	// Supervision records how the current Firecracker run is supervised —
+	// SupervisionUnit (systemd service, the empty string so legacy records
+	// stay canonical) or SupervisionCgroup (direct-spawned under vmd's
+	// delegated subtree). Persisted: liveness, stop, and reattach all
+	// dispatch on it, and it must survive a vmd restart. A resume decides
+	// the mode for the NEW run and must set it before the post-launch
+	// persist.
+	Supervision string
+
 	mu sync.RWMutex
 }
 
