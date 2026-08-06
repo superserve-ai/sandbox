@@ -165,7 +165,29 @@ func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
 		prevKeptLive:   -1,
 	}
 	r.markFailed = r.markFailedInDB
+	// A lifecycle op claiming a VM voids any release deferred against its
+	// predecessor — at the lock, so no in-place state round-trip (pause and
+	// resume can return Status and Unverified to their noted values on the
+	// SAME instance) can ever masquerade as the unmutated stale original.
+	mgr.onLifecycleClaim = r.voidPendingRelease
 	return r
+}
+
+// voidPendingRelease retires a deferred release and all of its episode
+// bookkeeping — entry, prefixed marker, bare-id grace. Shared by the retry's
+// own void exit and the lifecycle-claim hook.
+func (r *Reconciler) voidPendingRelease(vmID string) {
+	r.mu.Lock()
+	e, ok := r.pendingRelease[vmID]
+	if ok {
+		delete(r.pendingRelease, vmID)
+	}
+	r.mu.Unlock()
+	if !ok {
+		return
+	}
+	r.clearDrift(vmID)
+	r.clearDrift(e.marker)
 }
 
 // runTimeout bounds each reconciliation pass so a slow DB or stuck
@@ -1467,6 +1489,11 @@ func (r *Reconciler) finalizeRelease(ctx context.Context, vmID, marker, action, 
 // pause flips Status on the SAME object. A stale instance is by definition one
 // nothing updates, so any observed mutation proves a lifecycle op claimed the
 // VM — that op owns cleanup, and the reap decision is void.
+//
+// The snapshot cannot see a round-trip that returns both fields to their
+// noted values; onLifecycleClaim closes that class at the vm-op lock, voiding
+// the entry the moment any lifecycle op claims the instance. The comparison
+// below remains as the backstop for anything that mutates without the lock.
 type deferredRelease struct {
 	inst       *VMInstance
 	marker     string
@@ -1543,17 +1570,13 @@ func (r *Reconciler) retryPendingReleases(ctx context.Context) {
 			cur.mu.RUnlock()
 		}
 		if cur != noted.inst || mutated {
-			unlockOp()
-			r.mu.Lock()
-			delete(r.pendingRelease, id)
-			r.mu.Unlock()
 			// Voids retire the episode's timestamps (see pendingRelease): the
 			// prefixed marker, and the bare id — Drift 1/2 grace under the bare
 			// id and defer with marker "", relying on markStale to clear it,
 			// which a void never runs. Leaving either hands its elapsed grace
 			// to the id's next episode.
-			r.clearDrift(id)
-			r.clearDrift(noted.marker)
+			unlockOp()
+			r.voidPendingRelease(id)
 			continue
 		}
 		err := r.markStale(ctx, id, noted.marker)

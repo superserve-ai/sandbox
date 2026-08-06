@@ -1234,3 +1234,68 @@ func TestRetryPendingReleases_VoidClearsBareIDGrace(t *testing.T) {
 		t.Fatal("the void must retire the bare-id grace, or the relaunched VM's next death skips its waiting period")
 	}
 }
+
+// The ABA the two-field snapshot cannot see: a lifecycle op can drive the
+// SAME instance away from and back to its noted (Status, Unverified) values
+// between passes. The claim hook closes the class at its choke point — every
+// lifecycle op acquires the vm-op lock, and acquiring it voids any release
+// deferred against the instance's predecessor.
+func TestLifecycleClaimVoidsPendingRelease(t *testing.T) {
+	stubUnitTerminal(t, false) // defer the release
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusPaused}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{"vm-1": inst},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	r.driftSeen["bolt-orphan:vm-1"] = time.Now().Add(-2 * r.cfg.GracePeriod)
+	if err := r.markStale(context.Background(), "vm-1", "bolt-orphan:vm-1"); err == nil {
+		t.Fatal("non-terminal unit must defer")
+	}
+
+	// A resume claims the VM, drives it Running, then a pause returns it to
+	// Paused — same pointer, both snapshot fields back to their noted values.
+	unlock, err := m.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst.mu.Lock()
+	inst.Status = StatusRunning
+	inst.mu.Unlock()
+	unlock()
+	unlock2, err := m.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst.mu.Lock()
+	inst.Status = StatusPaused
+	inst.mu.Unlock()
+	unlock2()
+
+	if r.hasPendingRelease("vm-1") {
+		t.Fatal("the claim must void the deferred release at the lock, not at state comparison")
+	}
+	r.mu.Lock()
+	_, kept := r.driftSeen["bolt-orphan:vm-1"]
+	r.mu.Unlock()
+	if kept {
+		t.Fatal("the void must retire the episode's marker")
+	}
+
+	// And the retry, running later with the unit now terminal, must not
+	// release the healthy re-paused VM.
+	stubUnitTerminal(t, true)
+	r.retryPendingReleases(context.Background())
+	if rec, _ := store.Get("vm-1"); rec == nil || rec.Status != StatusPaused {
+		t.Fatalf("the re-paused record must survive untouched, got %v", rec)
+	}
+}
