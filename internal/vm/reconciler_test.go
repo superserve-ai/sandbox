@@ -1348,3 +1348,39 @@ func TestGenerationSeparatesClaimsFromLockTraffic(t *testing.T) {
 		}
 	})
 }
+
+// The Drift 1 mistake, re-checked for its siblings: a stale or orphaned VM
+// reads Running in memory until a rule stops it, so no reap rule may treat
+// cached Running as liveness. Pins the predicate direction for Drifts 2/3/5
+// by asserting the reap still happens for a Running-in-memory candidate.
+func TestReapRulesDoNotTrustCachedRunning(t *testing.T) {
+	stubUnitTerminal(t, true) // the unit is conclusively gone
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		// The stale claim every reap candidate carries.
+		vms: map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	if err := r.markStale(context.Background(), "vm-1", ""); err != nil {
+		t.Fatalf("a dead unit's record must be released despite the Running claim: %v", err)
+	}
+	if rec, _ := store.Get("vm-1"); rec != nil {
+		t.Fatal("the stale record must be gone")
+	}
+	m.mu.RLock()
+	_, tracked := m.vms["vm-1"]
+	m.mu.RUnlock()
+	if tracked {
+		t.Fatal("the stale instance must be dropped")
+	}
+}

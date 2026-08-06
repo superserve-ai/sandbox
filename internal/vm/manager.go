@@ -1892,6 +1892,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				// guest-dead, and the relaunch replaces the unit anyway.
 				// If-present, so a racing destroy's deletion still wins.
 				existing.mu.Lock()
+				existing.gen++
 				existing.Status = StatusError
 				existing.mu.Unlock()
 				// Best-effort: the returned error is the useful one, and an
@@ -2311,6 +2312,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// persist synchronously, serializing the very fsync the goroutine
 	// overlaps with the boxd wait.
 	inst.mu.Lock()
+	inst.gen++
 	inst.Status = StatusRunning
 	inst.Unverified = true
 	inst.mu.Unlock()
@@ -2378,6 +2380,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("vm %s restored but its state could not be persisted", vmID)
 	}
 	inst.mu.Lock()
+	inst.gen++
 	inst.Unverified = false
 	inst.mu.Unlock()
 	// Persist-then-verify: checking AFTER the write leaves no window — a
@@ -2940,6 +2943,7 @@ func (m *Manager) handleVMError(vmID string, origErr error) error {
 		return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
 	}
 	inst.mu.Lock()
+	inst.gen++
 	inst.Status = StatusStopped
 	inst.mu.Unlock()
 	delete(m.vms, vmID)
@@ -4061,6 +4065,7 @@ func (m *Manager) commitResumeState(inst *VMInstance) error {
 			// unit this teardown is stopping.
 			m.stopUnitDuringRestoreError(inst.ID)
 			inst.mu.Lock()
+			inst.gen++
 			inst.Status = StatusError
 			inst.DirtyTracked = false // unit stopped; a relaunch re-arms tracking
 			inst.mu.Unlock()

@@ -487,11 +487,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if !ok {
 				continue // an op owns the VM; the generation voids any pending entry
 			}
-			if r.mgr.instanceRunning(id) {
-				unlockOp()
-				r.clearDrift(id)
-				continue
-			}
+			// No status re-check: this rule's target is a Running record whose
+			// unit is dead, and nothing flips that record when firecracker
+			// exits — reading Running as liveness would veto every reap (the
+			// mistake Drift 1 made). The lock excludes an in-flight op, and
+			// markStale's own terminal probe runs under it.
 			if !r.consumeAutoFailBudget(id) {
 				unlockOp()
 				continue
@@ -525,17 +525,15 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if !r.gracePeriodElapsed("orphan:"+id, now) {
 				continue
 			}
-			// Drift 7's discipline, now covering the STOP too: the lock is
-			// taken before budget or destruction, and the in-memory record is
-			// re-read under it — a create/resume that began after the pass
-			// snapshot would otherwise have its fresh unit killed.
+			// Lock before budget or the stop, so an in-flight create/resume
+			// (which holds it) is never killed mid-flight. No status re-check:
+			// an orphan that reached Running stays Running in memory until
+			// this rule stops it, so reading that as liveness would veto every
+			// reap — the Drift 1 mistake. A lifecycle op that COMPLETED since
+			// the pass snapshot is caught by the marker: its row moves and the
+			// next pass clears the drift before the grace re-elapses.
 			unlockOp, ok := r.mgr.tryLockVMOp(id)
 			if !ok {
-				continue
-			}
-			if r.mgr.instanceRunning(id) {
-				unlockOp()
-				r.clearDrift("orphan:" + id)
 				continue
 			}
 			if !r.consumeAutoFailBudget(id) {
@@ -877,15 +875,10 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if errorRecord(id) {
 				continue
 			}
-			// Same discipline as Drift 3; here the Running re-read also
-			// covers a create whose row insert is still in flight.
+			// Same discipline as Drift 3, and the same reason for no status
+			// re-check.
 			unlockOp, ok := r.mgr.tryLockVMOp(id)
 			if !ok {
-				continue
-			}
-			if r.mgr.instanceRunning(id) {
-				unlockOp()
-				r.clearDrift("bolt-orphan:" + id)
 				continue
 			}
 			// Only stopping a live unit is destructive; charge the budget there.
