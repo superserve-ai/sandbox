@@ -64,7 +64,7 @@ concurrency:
 jobs:
   seed-staging:
     name: Seed Staging
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: staging
     timeout-minutes: 45
     steps:
@@ -139,7 +139,7 @@ jobs:
   seed-prod:
     name: Seed Production
     if: github.event_name == 'push' || github.event.inputs.environment == 'production'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: production
     # Two blocking seeder invocations (primary, then the usw cell), each with
     # the seeder's default 30-min build wait — 90 covers both plus slack.
