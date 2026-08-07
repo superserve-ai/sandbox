@@ -79,11 +79,12 @@ type StripePortalSession struct {
 }
 
 type StripeReportMeterEventParams struct {
-	Identifier string
-	EventName  string
-	CustomerID string
-	Value      string
-	Timestamp  int64
+	Identifier     string
+	IdempotencyKey string
+	EventName      string
+	CustomerID     string
+	Value          string
+	Timestamp      int64
 }
 
 type stripeHTTPClient struct {
@@ -290,7 +291,7 @@ func (c *stripeHTTPClient) ReportMeterEvent(ctx context.Context, params StripeRe
 	}
 	form.Set("payload[stripe_customer_id]", params.CustomerID)
 	form.Set("payload[value]", params.Value)
-	return c.doForm(ctx, http.MethodPost, "/v1/billing/meter_events", form, nil, params.Identifier)
+	return c.doForm(ctx, http.MethodPost, "/v1/billing/meter_events", form, nil, params.IdempotencyKey)
 }
 
 func (c *stripeHTTPClient) doForm(ctx context.Context, method, path string, form url.Values, out any, idempotencyKey string) error {
@@ -553,7 +554,7 @@ func (h *Handlers) getTeamBillingExportPreview(c *gin.Context, platform bool) {
 	}
 	resourceStates := h.billingResourceStates(storageBillingEnabled)
 
-	items, err := billingPreviewItems(teamID, periodStart, periodEnd, usage, resourceStates)
+	items, err := billingPreviewItems(teamID, periodStart, periodEnd, usage, resourceStates, derefString(account.StripeCustomerID))
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("build billing preview failed")
 		respondError(c, ErrInternal)
@@ -748,15 +749,38 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 		usage = billingTeamUsageFromUpsertRow(usageRow)
 	}
 
-	items, err := billingPreviewItems(teamID, periodStart, periodEnd, usage, resourceStates)
+	items, err := billingPreviewItems(teamID, periodStart, periodEnd, usage, resourceStates, derefString(account.StripeCustomerID))
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("build billing export items failed")
 		respondError(c, ErrInternal)
 		return
 	}
-
+	if err := validateBillingExportItems(items); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	activeResources := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		activeResources[item.ResourceType] = struct{}{}
+	}
+	for i, row := range existing {
+		if (row.Status != "pending" && row.Status != "failed") || hasResource(activeResources, row.ResourceType) {
+			continue
+		}
+		updatedRow, updateErr := q.UpdateBillingUsageExportStatus(ctx, db.UpdateBillingUsageExportStatusParams{
+			ID:     row.ID,
+			Status: "skipped_disabled",
+		})
+		if updateErr != nil {
+			log.Error().Err(updateErr).Str("team_id", teamID.String()).Msg("mark disabled billing export attempt skipped failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		existing[i] = updatedRow
+	}
+	liveExisting = latestLiveExportByResource(existing)
 	if period.Status == "exported" && len(liveExisting) > 0 {
-		if !billingExportAllFinalized(items, liveExisting) {
+		if !billingExportRowsFinalized(existing) {
 			respondErrorMsg(c, "conflict", "billing export is still in progress", http.StatusConflict)
 			return
 		}
@@ -778,6 +802,23 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 	}
 
 	if !exportEnabled {
+		if period.Status == "exported" {
+			if err := tx.Commit(ctx); err != nil {
+				log.Error().Err(err).Str("team_id", teamID.String()).Msg("commit already-exported shadow billing period failed")
+				respondError(c, ErrInternal)
+				return
+			}
+			c.JSON(http.StatusOK, billingExportPreviewResponse{
+				Mode:             mode,
+				PeriodID:         billingPeriodID(periodStart, periodEnd),
+				TeamID:           teamID.String(),
+				Status:           period.Status,
+				StripeCustomerID: account.StripeCustomerID,
+				Items:            items,
+				Attempts:         billingExportAttemptsFromRows(existing),
+			})
+			return
+		}
 		for _, item := range items {
 			resourceType := billingExportResourceType(item.ResourceType)
 			if _, err := q.CreateBillingUsageExport(ctx, db.CreateBillingUsageExportParams{
@@ -852,56 +893,56 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 	}
 
 	if period.Status == "exporting" && !billingExportHasFailedRow(existing) {
-		if !billingExportAllFinalized(items, liveExisting) {
-			respondErrorMsg(c, "conflict", "billing export is still in progress", http.StatusConflict)
-			return
-		}
-		if err := tx.Commit(ctx); err != nil {
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("commit already-finalized billing export failed")
-			respondError(c, ErrInternal)
-			return
-		}
-		exported, err := h.DB.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
-			TeamID:      teamID,
-			PeriodStart: periodStart,
-			PeriodEnd:   periodEnd,
-		})
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				respondErrorMsg(c, "conflict", "billing period could not be marked exported", http.StatusConflict)
+		if billingExportAllFinalized(items, liveExisting) {
+			if err := tx.Commit(ctx); err != nil {
+				log.Error().Err(err).Str("team_id", teamID.String()).Msg("commit already-finalized billing export failed")
+				respondError(c, ErrInternal)
 				return
 			}
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("mark team billing period exported failed")
-			respondError(c, ErrInternal)
+			exported, err := h.DB.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
+				TeamID:      teamID,
+				PeriodStart: periodStart,
+				PeriodEnd:   periodEnd,
+			})
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					respondErrorMsg(c, "conflict", "billing period could not be marked exported", http.StatusConflict)
+					return
+				}
+				log.Error().Err(err).Str("team_id", teamID.String()).Msg("mark team billing period exported failed")
+				respondError(c, ErrInternal)
+				return
+			}
+			updated, err := h.DB.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
+				TeamID:      teamID,
+				PeriodStart: periodStart,
+				PeriodEnd:   periodEnd,
+			})
+			if err != nil {
+				log.Error().Err(err).Str("team_id", teamID.String()).Msg("refresh exported billing attempts failed")
+				respondError(c, ErrInternal)
+				return
+			}
+			c.JSON(http.StatusOK, billingExportPreviewResponse{
+				Mode:             mode,
+				PeriodID:         billingPeriodID(periodStart, periodEnd),
+				TeamID:           teamID.String(),
+				Status:           exported.Status,
+				StripeCustomerID: account.StripeCustomerID,
+				Items:            items,
+				Attempts:         billingExportAttemptsFromRows(updated),
+			})
 			return
 		}
-		updated, err := h.DB.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
-			TeamID:      teamID,
-			PeriodStart: periodStart,
-			PeriodEnd:   periodEnd,
-		})
-		if err != nil {
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("refresh exported billing attempts failed")
-			respondError(c, ErrInternal)
-			return
-		}
-		c.JSON(http.StatusOK, billingExportPreviewResponse{
-			Mode:             mode,
-			PeriodID:         billingPeriodID(periodStart, periodEnd),
-			TeamID:           teamID.String(),
-			Status:           exported.Status,
-			StripeCustomerID: account.StripeCustomerID,
-			Items:            items,
-			Attempts:         billingExportAttemptsFromRows(updated),
-		})
-		return
 	}
 
 	if period.Status == "approved" || period.Status == "exporting" || period.Status == "exported" || len(liveExisting) > 0 {
 		for _, item := range items {
 			resourceType := billingExportResourceType(item.ResourceType)
-			if _, ok := liveExisting[resourceType]; ok {
-				continue
+			if existing, ok := liveExisting[resourceType]; ok {
+				if (existing.Status != "failed" && existing.Status != "skipped_disabled") || existing.StripeMeterEventIdentifier == item.Identifier {
+					continue
+				}
 			}
 			_, meterOK := stripeMeterQuantity(item.Value)
 			status := "pending"
@@ -967,7 +1008,22 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 		if row.Status == "sent" || row.Status == "accepted" || row.Status == "skipped_zero" {
 			continue
 		}
-		meterValue, ok := stripeMeterQuantity(item.Value)
+		if row.Status == "failed" || row.Status == "skipped_disabled" {
+			row, err = h.DB.UpdateBillingUsageExportStatus(ctx, db.UpdateBillingUsageExportStatusParams{
+				ID:     row.ID,
+				Status: "pending",
+			})
+			if err != nil {
+				respondError(c, ErrInternal)
+				return
+			}
+		}
+		rowValue, err := numericFloat64(row.Value)
+		if err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		meterValue, ok := stripeMeterQuantity(rowValue)
 		if !ok {
 			if _, err := h.DB.UpdateBillingUsageExportStatus(ctx, db.UpdateBillingUsageExportStatusParams{
 				ID:     row.ID,
@@ -980,12 +1036,13 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 			continue
 		}
 
-		err := h.Stripe.ReportMeterEvent(ctx, StripeReportMeterEventParams{
-			Identifier: item.Identifier,
-			EventName:  item.EventName,
-			CustomerID: *account.StripeCustomerID,
-			Value:      meterValue,
-			Timestamp:  periodEnd.UTC().Add(-time.Second).Unix(),
+		err = h.Stripe.ReportMeterEvent(ctx, StripeReportMeterEventParams{
+			Identifier:     row.StripeMeterEventIdentifier,
+			IdempotencyKey: stripeMeterEventIdempotencyKey(row.StripeMeterEventIdentifier, row.StripeEventName, derefString(row.StripeCustomerID), meterValue, periodEnd.UTC().Add(-time.Second).Unix()),
+			EventName:      row.StripeEventName,
+			CustomerID:     derefString(row.StripeCustomerID),
+			Value:          meterValue,
+			Timestamp:      periodEnd.UTC().Add(-time.Second).Unix(),
 		})
 		if err != nil {
 			msg := err.Error()
@@ -1003,11 +1060,14 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 		}
 
 		sentAt := h.nowUTC()
-		if _, err := h.DB.UpdateBillingUsageExportStatus(ctx, db.UpdateBillingUsageExportStatusParams{
+		if _, err := h.DB.MarkBillingUsageExportSent(ctx, db.MarkBillingUsageExportSentParams{
 			ID:     row.ID,
-			Status: "sent",
 			SentAt: pgtype.Timestamptz{Time: sentAt, Valid: true},
 		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				respondErrorMsg(c, "conflict", "billing export attempt was superseded", http.StatusConflict)
+				return
+			}
 			log.Error().Err(err).Str("team_id", teamID.String()).Msg("mark billing export sent failed")
 			respondError(c, ErrInternal)
 			return
@@ -1025,7 +1085,7 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 		return
 	}
 	updatedLive = latestLiveExportByResource(updated)
-	if !billingExportAllFinalized(items, updatedLive) {
+	if !billingExportRowsFinalized(updated) {
 		respondErrorMsg(c, "conflict", "billing export is still in progress", http.StatusConflict)
 		return
 	}
@@ -1464,6 +1524,70 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 				customerID = derefString(account.StripeCustomerID)
 			}
 		}
+		period, perr := q.GetTeamBillingPeriodForUpdate(ctx, db.GetTeamBillingPeriodForUpdateParams{
+			TeamID:      teamID,
+			PeriodStart: start,
+			PeriodEnd:   end,
+		})
+		if perr != nil {
+			if errors.Is(perr, pgx.ErrNoRows) {
+				return nil
+			}
+			return perr
+		}
+		if period.FinalizedAt.Valid {
+			return nil
+		}
+		existing, lerr := q.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
+			TeamID:      teamID,
+			PeriodStart: start,
+			PeriodEnd:   end,
+		})
+		if lerr != nil {
+			return lerr
+		}
+		latest := latestLiveExportByResource(existing)[billingExportResourceType(resourceType)]
+		if latest.ID != uuid.Nil && latest.StripeMeterEventIdentifier != identifier {
+			return nil
+		}
+		for i := len(existing) - 1; i >= 0; i-- {
+			row := existing[i]
+			if row.StripeMeterEventIdentifier != identifier {
+				continue
+			}
+			_, err = q.UpdateBillingUsageExportStatus(ctx, db.UpdateBillingUsageExportStatusParams{
+				ID:     row.ID,
+				Status: "failed",
+				Error:  stringPtr(errMsg),
+			})
+			if err != nil {
+				return err
+			}
+			_, err = q.MarkTeamBillingPeriodExporting(ctx, db.MarkTeamBillingPeriodExportingParams{
+				TeamID:      teamID,
+				PeriodStart: start,
+				PeriodEnd:   end,
+			})
+			if errors.Is(err, pgx.ErrNoRows) {
+				enabled, featureErr := q.IsFeatureEnabledForTeam(ctx, db.IsFeatureEnabledForTeamParams{
+					Key:    "billing_export_enabled",
+					TeamID: pgtype.UUID{Bytes: teamID, Valid: true},
+				})
+				if featureErr != nil {
+					return featureErr
+				}
+				if enabled {
+					return err
+				}
+				_, err = q.UpdateBillingUsageExportStatus(ctx, db.UpdateBillingUsageExportStatusParams{
+					ID:     row.ID,
+					Status: "skipped_disabled",
+					Error:  stringPtr(errMsg),
+				})
+				return err
+			}
+			return err
+		}
 		_, err = q.CreateBillingUsageExport(ctx, db.CreateBillingUsageExportParams{
 			TeamID:                     teamID,
 			PeriodStart:                start,
@@ -1788,7 +1912,7 @@ func billingPeriodResponseFromDB(period db.TeamBillingPeriod, account db.GetTeam
 	return resp
 }
 
-func billingPreviewItems(teamID uuid.UUID, periodStart, periodEnd time.Time, usage db.TeamBillingUsage, resources []billingResourceState) ([]billingExportPreviewItem, error) {
+func billingPreviewItems(teamID uuid.UUID, periodStart, periodEnd time.Time, usage db.TeamBillingUsage, resources []billingResourceState, customerID string) ([]billingExportPreviewItem, error) {
 	vcpuSeconds, err := numericFloat64(usage.VcpuSeconds)
 	if err != nil {
 		return nil, err
@@ -1817,6 +1941,10 @@ func billingPreviewItems(teamID uuid.UUID, periodStart, periodEnd time.Time, usa
 		default:
 			continue
 		}
+		if value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+			return nil, fmt.Errorf("billing export quantity must be finite and non-negative")
+		}
+		value = stripeMeterRoundedValue(value)
 		items = append(items, billingExportPreviewItem{
 			ResourceType: billingExportResourceType(resource.ResourceKey),
 			ResourceKey:  resource.ResourceKey,
@@ -1824,11 +1952,25 @@ func billingPreviewItems(teamID uuid.UUID, periodStart, periodEnd time.Time, usa
 			SortOrder:    resource.SortOrder,
 			DisplayUnit:  resource.DisplayUnit,
 			EventName:    resource.StripeEventName,
-			Identifier:   meterIdentifier(teamID, periodStart, periodEnd, billingExportResourceType(resource.ResourceKey)),
+			Identifier:   meterIdentifierForPayload(teamID, periodStart, periodEnd, billingExportResourceType(resource.ResourceKey), resource.StripeEventName, customerID, value),
 			Value:        value,
 		})
 	}
 	return items, nil
+}
+
+func validateBillingExportItems(items []billingExportPreviewItem) error {
+	for _, item := range items {
+		if item.Value < 0 || math.IsNaN(item.Value) || math.IsInf(item.Value, 0) {
+			return fmt.Errorf("billing export quantity must be finite and non-negative")
+		}
+	}
+	return nil
+}
+
+func hasResource(resources map[string]struct{}, resource string) bool {
+	_, ok := resources[resource]
+	return ok
 }
 
 func billingExportResourceType(resourceKey string) string {
@@ -1854,6 +1996,31 @@ func meterIdentifier(teamID uuid.UUID, periodStart, periodEnd time.Time, resourc
 	)
 }
 
+func meterIdentifierForPayload(teamID uuid.UUID, periodStart, periodEnd time.Time, resourceType, eventName, customerID string, value float64) string {
+	quantity := strconv.FormatFloat(stripeMeterRoundedValue(value), 'f', 12, 64)
+	digest := sha256.Sum256([]byte(strings.Join([]string{
+		eventName,
+		customerID,
+		strconv.FormatInt(periodEnd.UTC().Add(-time.Second).Unix(), 10),
+		quantity,
+	}, "\x00")))
+	return meterIdentifier(teamID, periodStart, periodEnd, resourceType) + ":" + hex.EncodeToString(digest[:])[:12]
+}
+
+func stripeMeterEventIdempotencyKey(identifier, eventName, customerID, value string, timestamp int64) string {
+	parts := []string{
+		identifier,
+		eventName,
+		customerID,
+		value,
+	}
+	if timestamp > 0 {
+		parts = append(parts, strconv.FormatInt(timestamp, 10))
+	}
+	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return "meter-event:" + hex.EncodeToString(digest[:])
+}
+
 func parseMeterIdentifier(raw string) (uuid.UUID, time.Time, time.Time, string, error) {
 	const periodMarker = ":period:"
 	const meterMarker = ":meter:"
@@ -1872,6 +2039,19 @@ func parseMeterIdentifier(raw string) (uuid.UUID, time.Time, time.Time, string, 
 	periodRaw, resourceType, ok := strings.Cut(remainder, meterMarker)
 	if !ok {
 		return uuid.Nil, time.Time{}, time.Time{}, "", fmt.Errorf("invalid meter identifier")
+	}
+	parts := strings.SplitN(resourceType, ":", 2)
+	resourceType = parts[0]
+	if resourceType != "cpu" && resourceType != "memory" && resourceType != "storage" {
+		return uuid.Nil, time.Time{}, time.Time{}, "", fmt.Errorf("invalid meter resource type")
+	}
+	if len(parts) == 2 {
+		if len(parts[1]) != 12 {
+			return uuid.Nil, time.Time{}, time.Time{}, "", fmt.Errorf("invalid meter identifier fingerprint")
+		}
+		if _, err := hex.DecodeString(parts[1]); err != nil {
+			return uuid.Nil, time.Time{}, time.Time{}, "", fmt.Errorf("invalid meter identifier fingerprint: %w", err)
+		}
 	}
 	bounds := strings.SplitN(periodRaw, ",", 2)
 	if len(bounds) != 2 {
@@ -1918,6 +2098,18 @@ func billingExportHasFailedRow(rows []db.BillingUsageExport) bool {
 		}
 	}
 	return false
+}
+
+func billingExportRowsFinalized(rows []db.BillingUsageExport) bool {
+	for _, row := range latestLiveExportByResource(rows) {
+		switch row.Status {
+		case "sent", "accepted", "skipped_zero", "skipped_shadow", "skipped_disabled":
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func billingExportAllFinalized(items []billingExportPreviewItem, rows map[string]db.BillingUsageExport) bool {
@@ -1999,15 +2191,29 @@ func numericFromFloat(v float64) pgtype.Numeric {
 }
 
 func formatDecimal(v float64) string {
-	return strconv.FormatFloat(v, 'f', 6, 64)
+	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
-func stripeMeterQuantity(hours float64) (string, bool) {
-	seconds := math.Round(hours * 3600.0)
-	if seconds <= 0 {
+// Stripe meter events should carry the same normalized billing quantity that
+// appears in the export preview, not the raw interval seconds.
+func stripeMeterQuantity(value float64) (string, bool) {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
 		return "", false
 	}
-	return strconv.FormatInt(int64(seconds), 10), true
+	formatted := strconv.FormatFloat(value, 'f', 12, 64)
+	rounded, err := strconv.ParseFloat(formatted, 64)
+	if err != nil || rounded <= 0 {
+		return "", false
+	}
+	return formatted, true
+}
+
+func stripeMeterRoundedValue(value float64) float64 {
+	rounded, err := strconv.ParseFloat(strconv.FormatFloat(value, 'f', 12, 64), 64)
+	if err != nil {
+		return value
+	}
+	return rounded
 }
 
 func stripeSubscriptionPeriodBounds(obj stripeSubscriptionObject) (int64, int64, bool) {

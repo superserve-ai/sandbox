@@ -957,7 +957,7 @@ FROM billing_usage_export
 WHERE team_id = $1
   AND period_start = $2
   AND period_end = $3
-ORDER BY created_at ASC
+ORDER BY created_at ASC, id ASC
 `
 
 type ListBillingUsageExportsForPeriodParams struct {
@@ -1335,6 +1335,43 @@ func (q *Queries) ListUnresolvedBillingPeriodAnomalies(ctx context.Context, arg 
 		return nil, err
 	}
 	return items, nil
+}
+
+const markBillingUsageExportSent = `-- name: MarkBillingUsageExportSent :one
+UPDATE billing_usage_export
+SET status = 'sent',
+    sent_at = $1,
+    updated_at = now()
+WHERE id = $2
+  AND status = 'pending'
+RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at
+`
+
+type MarkBillingUsageExportSentParams struct {
+	SentAt pgtype.Timestamptz `json:"sent_at"`
+	ID     uuid.UUID          `json:"id"`
+}
+
+func (q *Queries) MarkBillingUsageExportSent(ctx context.Context, arg MarkBillingUsageExportSentParams) (BillingUsageExport, error) {
+	row := q.db.QueryRow(ctx, markBillingUsageExportSent, arg.SentAt, arg.ID)
+	var i BillingUsageExport
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.ResourceType,
+		&i.StripeCustomerID,
+		&i.StripeMeterEventIdentifier,
+		&i.StripeEventName,
+		&i.Value,
+		&i.Status,
+		&i.Error,
+		&i.CreatedAt,
+		&i.SentAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const markStripeWebhookEventFailed = `-- name: MarkStripeWebhookEventFailed :one

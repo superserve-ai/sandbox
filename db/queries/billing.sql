@@ -511,13 +511,22 @@ SET status = sqlc.arg(status),
 WHERE id = sqlc.arg(id)
 RETURNING *;
 
+-- name: MarkBillingUsageExportSent :one
+UPDATE billing_usage_export
+SET status = 'sent',
+    sent_at = sqlc.arg(sent_at),
+    updated_at = now()
+WHERE id = sqlc.arg(id)
+  AND status = 'pending'
+RETURNING *;
+
 -- name: ListBillingUsageExportsForPeriod :many
 SELECT *
 FROM billing_usage_export
 WHERE team_id = sqlc.arg(team_id)
   AND period_start = sqlc.arg(period_start)
   AND period_end = sqlc.arg(period_end)
-ORDER BY created_at ASC;
+ORDER BY created_at ASC, id ASC;
 
 -- name: CreateStripeWebhookEvent :one
 INSERT INTO stripe_webhook_event (event_id, event_type, payload)
