@@ -231,6 +231,12 @@ module "observability" {
       instance_id   = module.sandbox_host.instance_id
     }
   }
+  host_maintenance_event_alerts = {
+    sandbox_host = {
+      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / host maintenance event"
+      instance_name = module.sandbox_host.instance_name
+    }
+  }
   labels = local.common_labels
 }
 

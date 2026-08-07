@@ -101,6 +101,9 @@ BUNDLE_FILES = [
     "deploy/sandboxes.slice",
     "deploy/needrestart-superserve.conf",
     "deploy/apt-no-auto-upgrades.conf",
+    "deploy/maintenance-watch.sh",
+    "deploy/superserve-maintenance-watch.service",
+    "deploy/superserve-maintenance-watch.timer",
     "scripts/fc-cleanup",
 ]
 
@@ -138,6 +141,9 @@ def main() -> int:
     q_dat_line = shlex.quote(f"DAEMON_AUTH_TOKEN={internal_api_token}")
     q_db = shlex.quote(database_url)
     q_db_line = shlex.quote(f"DATABASE_URL={database_url}")
+    maintenance_webhook = os.environ.get("MAINTENANCE_ALERT_WEBHOOK", "")
+    q_webhook = shlex.quote(maintenance_webhook)
+    q_webhook_line = shlex.quote(f"MAINTENANCE_ALERT_WEBHOOK={maintenance_webhook}")
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
@@ -226,8 +232,12 @@ def main() -> int:
             sudo install -m 0644 {extract_dir}/deploy/firecracker@.service /etc/systemd/system/firecracker@.service
             sudo install -m 0644 {extract_dir}/deploy/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
             sudo install -m 0644 {extract_dir}/deploy/sandboxes.slice /etc/systemd/system/sandboxes.slice
+            sudo install -m 0755 {extract_dir}/deploy/maintenance-watch.sh {install_dir}/maintenance-watch
+            sudo install -m 0644 {extract_dir}/deploy/superserve-maintenance-watch.service /etc/systemd/system/superserve-maintenance-watch.service
+            sudo install -m 0644 {extract_dir}/deploy/superserve-maintenance-watch.timer /etc/systemd/system/superserve-maintenance-watch.timer
             sudo systemctl daemon-reload
             sudo systemctl enable --quiet superserve-vmd.socket
+            sudo systemctl enable --now --quiet superserve-maintenance-watch.timer
 
             sudo install -m 0755 {extract_dir}/scripts/fc-cleanup {install_dir}/fc-cleanup
 
@@ -304,6 +314,17 @@ def main() -> int:
             if [ -n {q_sentry} ]; then
                 sudo sed -i '/^SENTRY_DSN=/d' /etc/sandbox/vmd.env
                 echo {q_sentry_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Upsert the maintenance-watch webhook into its own env file so the
+            # watcher never sources vmd's tokens. Empty = skip: the watcher
+            # still runs and logs notices to the journal, it just can't page.
+            if [ -n {q_webhook} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/maintenance-watch.env
+                sudo chmod 0600 /etc/sandbox/maintenance-watch.env
+                sudo sed -i '/^MAINTENANCE_ALERT_WEBHOOK=/d' /etc/sandbox/maintenance-watch.env
+                echo {q_webhook_line} | sudo tee -a /etc/sandbox/maintenance-watch.env > /dev/null
             fi
 
             # Upsert BACKUP_BUCKET (the cell's artifact backup bucket).
