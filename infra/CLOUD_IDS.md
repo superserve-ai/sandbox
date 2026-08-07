@@ -35,9 +35,18 @@ Cloud Monitoring notification channels.
   coverage here.
 - The shared Private Service Access prerequisite for Cloud IDS is managed
   outside this repository and must be confirmed before the first apply.
-- Threat findings are surfaced through a log-based Cloud Monitoring alert so
-  notifications can reuse the existing monitored destination without adding a
-  webhook secret to Terraform state.
+- Threat findings are surfaced through log-based Cloud Monitoring alert
+  policies so notifications can reuse the existing monitored destination
+  without adding a webhook secret to Terraform state.
+- INFORMATIONAL and LOW findings remain in Cloud Logging only and are not sent
+  to the incident channel.
+- MEDIUM findings map to an `ERROR` alert policy.
+- HIGH and CRITICAL findings map to a `CRITICAL` alert policy.
+- The log-based policies extract the IDS severity, threat name, threat ID,
+  URI or filename, source IP address, destination IP address, and destination
+  port so Slack notifications carry the useful threat context directly.
+- MEDIUM and HIGH/CRITICAL findings use the shared
+  `TF_VAR_notification_channel_ids` list.
 
 ## Cost estimate
 
@@ -70,6 +79,13 @@ outside this repo before the first Cloud IDS apply; do not create them here.
 After the endpoints are live, locate a real IDS threat log in Cloud Logging and
 confirm the alert policy matches the same `logName`, `resource.type`, and
 `resource.labels.id` values before relying on notification delivery.
+Confirm the notification severity in Slack matches the alert policy severity
+for the matching band:
+
+- `ERROR` for MEDIUM
+- `CRITICAL` for HIGH and CRITICAL
+Also confirm that INFORMATIONAL and LOW findings continue to appear in
+Cloud Logging without generating incident notifications.
 
 ## Rollback
 
