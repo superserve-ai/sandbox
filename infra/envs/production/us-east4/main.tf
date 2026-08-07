@@ -341,6 +341,7 @@ module "observability" {
     sandbox_host = {
       display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / host maintenance event"
       instance_name = module.sandbox_host.instance_name
+      instance_id   = module.sandbox_host.instance_id
     }
   }
   labels = local.common_labels

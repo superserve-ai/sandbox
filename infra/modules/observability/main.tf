@@ -111,7 +111,7 @@ resource "google_monitoring_alert_policy" "host_maintenance_events" {
       filter = <<-EOT
         logName="projects/${var.project_id}/logs/cloudaudit.googleapis.com%2Fsystem_event"
         resource.type="gce_instance"
-        protoPayload.resourceName=~"/instances/${each.value.instance_name}$"
+        resource.labels.instance_id="${each.value.instance_id}"
         protoPayload.methodName=~"(upcomingMaintenance|terminateOnHostMaintenance|hostError|automaticRestart)"
       EOT
     }

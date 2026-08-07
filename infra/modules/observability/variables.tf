@@ -38,6 +38,7 @@ variable "host_maintenance_event_alerts" {
   type = map(object({
     display_name  = string
     instance_name = string
+    instance_id   = string
     documentation = optional(string, null)
   }))
   default = {}
