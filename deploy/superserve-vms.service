@@ -8,15 +8,17 @@ Before=superserve-vmd.service
 [Service]
 # A minimal keeper process owns the delegated subtree: it holds the cgroup so
 # systemd does not GC it across zero-VM windows, and gives the subtree a stable
-# lifetime handle. vmd moves it into keeper/ at bootstrap, then enables
-# controllers on the freed root. Restart is disabled deliberately — a restart
-# would try to re-enter the controller-enabled inner root and fail (cgroup v2
-# no-internal-process rule); the keeper is not a VM-survival dependency, so
-# vmd handles its death (block new launches, existing VMs keep running).
+# lifetime handle. The keeper is not a VM-survival dependency: on its death,
+# existing VMs keep running and launches continue on the child-pinned tree.
 Type=exec
 ExecStart=/usr/bin/sleep infinity
 Slice=sandboxes.slice
 Delegate=yes
+# On systemd >= 254 the keeper starts directly inside keeper/, so a start over
+# live VM children works. Older systemd ignores this (warning) and keeps the
+# bootstrap-move flow, where such a start fails (cgroup v2 no-internal-process
+# rule) until the subtree drains; VMs are unaffected either way.
+DelegateSubgroup=keeper
 KillMode=process
 Restart=no
 # Every direct-spawn VM's processes and THREADS share this one service's task

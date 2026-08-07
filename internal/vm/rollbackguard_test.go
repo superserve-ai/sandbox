@@ -270,3 +270,27 @@ func TestDeployScriptPreservesGuardDropIns(t *testing.T) {
 		}
 	}
 }
+
+// The keeper unit's safety rests on two lines: KillMode=process (a keeper
+// stop must never signal the VM children) and Restart=no (an auto-restart
+// would flap against the no-internal-process rule on older systemd). The
+// needrestart fence keeps library upgrades from restarting platform units at
+// all. Pin all three so no edit weakens them silently.
+func TestKeeperUnitAndFenceInvariants(t *testing.T) {
+	unit, err := os.ReadFile(filepath.Join("..", "..", "deploy", "superserve-vms.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"KillMode=process", "Restart=no", "Delegate=yes", "DelegateSubgroup=keeper"} {
+		if !strings.Contains(string(unit), want) {
+			t.Fatalf("superserve-vms.service lost %q", want)
+		}
+	}
+	fence, err := os.ReadFile(filepath.Join("..", "..", "deploy", "needrestart-superserve.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(fence), "qr(^superserve-)") {
+		t.Fatal("needrestart fence no longer covers superserve- units")
+	}
+}
