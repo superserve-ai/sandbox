@@ -147,12 +147,18 @@ type VMRecord struct {
 	// success), a pause clears it (a snapshotted guest was provably live),
 	// and a resume relaunch verifies readiness synchronously before
 	// clearing it.
-	Unverified   bool   `json:"unverified,omitempty"`
-	RunDirID     string `json:"rundir_id"`
-	Namespace    string `json:"namespace"`
-	DiskPath     string `json:"disk_path"`
-	SnapshotPath string `json:"snapshot_path,omitempty"`
-	MemFilePath  string `json:"mem_file_path,omitempty"`
+	Unverified bool `json:"unverified,omitempty"`
+	// TeardownPending mirrors VMInstance.TeardownPending: a non-empty value
+	// is an explicit, durable claim that this record's resources were
+	// deliberately retained after a failed op and the reconciler owns the
+	// residual teardown. Omitted when empty so rollback binaries read
+	// records unchanged.
+	TeardownPending string `json:"teardown_pending,omitempty"`
+	RunDirID        string `json:"rundir_id"`
+	Namespace       string `json:"namespace"`
+	DiskPath        string `json:"disk_path"`
+	SnapshotPath    string `json:"snapshot_path,omitempty"`
+	MemFilePath     string `json:"mem_file_path,omitempty"`
 	// Persisted so a layered (diff-overlay) sandbox resumes correctly after a vmd
 	// restart: non-empty means MemFilePath is an overlay to be served over this
 	// base. Without it, resume would load the overlay standalone and read the
@@ -600,6 +606,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		MACAddress:                 inst.MACAddress,
 		Status:                     inst.Status,
 		Unverified:                 inst.Unverified,
+		TeardownPending:            inst.TeardownPending,
 		RunDirID:                   inst.RunDirID,
 		Namespace:                  inst.Namespace,
 		DiskPath:                   inst.DiskPath,
@@ -687,6 +694,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		MACAddress:                 rec.MACAddress,
 		Status:                     rec.Status,
 		Unverified:                 rec.Unverified,
+		TeardownPending:            rec.TeardownPending,
 		RunDirID:                   rec.RunDirID,
 		Namespace:                  rec.Namespace,
 		DiskPath:                   rec.DiskPath,

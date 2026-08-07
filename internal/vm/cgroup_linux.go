@@ -158,6 +158,16 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	if verr != nil {
 		return false, verr
 	}
+	// Arming is what first creates VMs an old binary cannot manage, so the
+	// downgrade protection must provably exist BEFORE the hazard does: refuse
+	// to arm unless the host-resident guard and its drop-in are installed.
+	// This makes rollback safety independent of any deploy revision or
+	// runbook — a host without the guard simply never enters the mode.
+	// Manage-only mode is deliberately not gated: existing cgroup VMs must
+	// stay manageable even on a host that somehow lost its guard.
+	if gerr := rollbackGuardInstalled(); gerr != nil {
+		return false, fmt.Errorf("host rollback guard not installed — refusing to arm: %w", gerr)
+	}
 	m.directSpawnArmed.Store(true)
 	return true, nil
 }
@@ -220,6 +230,38 @@ func (m *Manager) validateDirectLaunchPath(ctx context.Context, tree *cgroupTree
 	// that silently fails.
 	if !prlimitOnLaunchPath() {
 		return fmt.Errorf("prlimit not found on the direct-spawn launch PATH (%s) — every direct launch would exit before firecracker; refusing to arm", directSpawnPATH)
+	}
+	return nil
+}
+
+// rollbackGuardDropInPath is where the deploy installs the guard's
+// ExecStartPre drop-in. Kept in lockstep with deploy-vmd.py and
+// deploy/superserve-vmd-rollback-guard.conf.
+const rollbackGuardDropInPath = "/etc/systemd/system/superserve-vmd.service.d/10-rollback-guard.conf"
+
+// rollbackGuardInstalled verifies the host-resident downgrade guard exists:
+// the guard script beside this binary (the deploy installs both to the same
+// dir) and its ExecStartPre drop-in. A var for tests.
+var rollbackGuardInstalled = func() error {
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve own binary path: %w", err)
+	}
+	return checkRollbackGuard(filepath.Join(filepath.Dir(self), "vmd-rollback-guard"), rollbackGuardDropInPath)
+}
+
+// checkRollbackGuard is rollbackGuardInstalled's testable core: the script
+// must exist and be executable, the drop-in must exist.
+func checkRollbackGuard(script, dropIn string) error {
+	fi, err := os.Stat(script)
+	if err != nil {
+		return fmt.Errorf("guard script %s: %w", script, err)
+	}
+	if fi.Mode()&0o111 == 0 {
+		return fmt.Errorf("guard script %s is not executable", script)
+	}
+	if _, err := os.Stat(dropIn); err != nil {
+		return fmt.Errorf("guard drop-in %s: %w", dropIn, err)
 	}
 	return nil
 }

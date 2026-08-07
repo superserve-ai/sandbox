@@ -2382,3 +2382,56 @@ func TestReattachRecord_PausedAdoptsDemotedSupervision(t *testing.T) {
 		t.Fatalf("published instance must adopt the demoted durable mode, got %q", got)
 	}
 }
+
+// When a failed restore retains a possibly-live VM's resources, the parked
+// state must be explicit and durable: the record itself says what is held
+// and that the reconciler owns the teardown — and a successful relaunch
+// retires the claim.
+func TestReleaseFailedRestore_ParksExplicitDurableMarker(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	vms := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vms, "vm-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vms, "vm-1", "cgroup.events"), []byte("populated 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusError, Supervision: SupervisionCgroup}
+	if err := store.Put(toRecord(inst)); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+		cgroups: &cgroupTree{vms: vms}, vms: map[string]*VMInstance{"vm-1": inst}}
+
+	m.releaseFailedRestore("vm-1", false, false, func() { t.Fatal("must not clean the rundir of a possibly-live VM") })
+
+	inst.mu.RLock()
+	marker := inst.TeardownPending
+	inst.mu.RUnlock()
+	if marker == "" {
+		t.Fatal("a retained release must stamp the explicit teardown marker")
+	}
+	rec, gerr := store.Get("vm-1")
+	if gerr != nil || rec == nil || rec.TeardownPending == "" {
+		t.Fatalf("the marker must be durable, got rec=%+v err=%v", rec, gerr)
+	}
+
+	// A successful relaunch retires the claim durably.
+	inst.mu.Lock()
+	inst.Status = StatusRunning
+	inst.mu.Unlock()
+	if err := m.commitResumeState(inst); err != nil {
+		t.Fatalf("commitResumeState: %v", err)
+	}
+	rec, gerr = store.Get("vm-1")
+	if gerr != nil || rec == nil {
+		t.Fatal(gerr)
+	}
+	if rec.TeardownPending != "" {
+		t.Fatal("a successful relaunch must retire the parked-teardown claim")
+	}
+}

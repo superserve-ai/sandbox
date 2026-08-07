@@ -131,6 +131,14 @@ type VMInstance struct {
 	// live FC process, which a fresh resume re-establishes.
 	DirtyTracked bool
 
+	// TeardownPending, when non-empty, records that a failed lifecycle op
+	// deliberately RETAINED this VM's resources (rundir, network slot)
+	// because its process could not be proven dead — and names the owner of
+	// the residual teardown. Persisted, so the parked state explains itself
+	// after a restart; cleared by a successful relaunch, and retired with
+	// the record when the reconciler completes the release.
+	TeardownPending string
+
 	// Supervision records how the current Firecracker run is supervised —
 	// SupervisionUnit (systemd service, the empty string so legacy records
 	// stay canonical) or SupervisionCgroup (direct-spawned under vmd's
@@ -3800,6 +3808,19 @@ func (m *Manager) releaseFailedRestore(vmID string, inPlace, tapBusy bool, clean
 	if m.cgroupStillLive(vmID) {
 		m.log.Warn().Str("vm_id", vmID).
 			Msg("restore failed with a live cgroup — keeping rundir and network until the reconciler confirms death")
+		// Make the residual ownership explicit and durable, not implied: the
+		// parked record itself says what is retained and who finishes the
+		// teardown. Best-effort persist — the in-memory marker still guides
+		// this life, and a restart re-parks via reattach either way.
+		m.mu.RLock()
+		inst := m.vms[vmID]
+		m.mu.RUnlock()
+		if inst != nil {
+			inst.mu.Lock()
+			inst.TeardownPending = "restore failed; cgroup process not proven dead; rundir and network retained; reconciler owns stop and release"
+			inst.mu.Unlock()
+			_, _ = m.persistStateIfPresent(inst)
+		}
 		return
 	}
 	if !inPlace {
@@ -4412,6 +4433,11 @@ func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string) error {
 // destroy either erased the record itself or is caught here, and we erase our
 // own resurrecting write rather than hand back a destroyed VM.
 func (m *Manager) commitResumeState(inst *VMInstance) error {
+	// A successful relaunch retires any parked-teardown marker: the process
+	// below this record is now the live one it manages.
+	inst.mu.Lock()
+	inst.TeardownPending = ""
+	inst.mu.Unlock()
 	wrote := m.persistState(inst)
 	m.mu.RLock()
 	_, stillTracked := m.vms[inst.ID]

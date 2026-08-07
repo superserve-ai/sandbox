@@ -215,3 +215,58 @@ func TestRollbackGuard(t *testing.T) {
 		}
 	})
 }
+
+// Arming must refuse when the host-resident guard is missing: the guard is
+// what makes a later rollback safe, so the mode that creates the hazard may
+// not activate without it. checkRollbackGuard is the arm precondition's core.
+func TestCheckRollbackGuard(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "vmd-rollback-guard")
+	dropIn := filepath.Join(dir, "10-rollback-guard.conf")
+
+	if err := checkRollbackGuard(script, dropIn); err == nil {
+		t.Fatal("missing guard script must refuse")
+	}
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkRollbackGuard(script, dropIn); err == nil {
+		t.Fatal("non-executable guard script must refuse")
+	}
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkRollbackGuard(script, dropIn); err == nil {
+		t.Fatal("missing drop-in must refuse")
+	}
+	if err := os.WriteFile(dropIn, []byte("[Service]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkRollbackGuard(script, dropIn); err != nil {
+		t.Fatalf("complete guard must pass, got %v", err)
+	}
+}
+
+// The guard's rollback independence rests on one invariant: no deploy script
+// revision ever cleans the service.d drop-in directory (old revisions never
+// did; this pins that the current one installs the guard and never removes
+// drop-ins). A future "cleanup" would strip the protection during the exact
+// rollback it exists for.
+func TestDeployScriptPreservesGuardDropIns(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "scripts", "deploy-vmd.py"))
+	if err != nil {
+		t.Fatalf("read deploy script: %v", err)
+	}
+	s := string(src)
+	if !strings.Contains(s, "10-rollback-guard.conf") {
+		t.Fatal("deploy script no longer installs the rollback-guard drop-in")
+	}
+	if !strings.Contains(s, "vmd-rollback-guard") {
+		t.Fatal("deploy script no longer installs the rollback-guard script")
+	}
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, "service.d") && (strings.Contains(line, "rm ") || strings.Contains(line, "rm -")) {
+			t.Fatalf("deploy script removes files under service.d — this strips the rollback guard: %q", line)
+		}
+	}
+}
