@@ -232,6 +232,18 @@ def main() -> int:
             sudo install -m 0644 {extract_dir}/deploy/firecracker@.service /etc/systemd/system/firecracker@.service
             sudo install -m 0644 {extract_dir}/deploy/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
             sudo install -m 0644 {extract_dir}/deploy/sandboxes.slice /etc/systemd/system/sandboxes.slice
+            # Upsert the maintenance-watch webhook into its own env file so the
+            # watcher never sources vmd's tokens. Empty = skip: the watcher
+            # still runs and logs notices to the journal, it just can't page.
+            # Written BEFORE the timer is enabled below: an elapsed OnBootSec
+            # fires the watcher the moment `enable --now` runs.
+            if [ -n {q_webhook} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/maintenance-watch.env
+                sudo chmod 0600 /etc/sandbox/maintenance-watch.env
+                sudo sed -i '/^MAINTENANCE_ALERT_WEBHOOK=/d' /etc/sandbox/maintenance-watch.env
+                echo {q_webhook_line} | sudo tee -a /etc/sandbox/maintenance-watch.env > /dev/null
+            fi
             sudo install -m 0755 {extract_dir}/deploy/maintenance-watch.sh {install_dir}/maintenance-watch
             sudo install -m 0644 {extract_dir}/deploy/superserve-maintenance-watch.service /etc/systemd/system/superserve-maintenance-watch.service
             sudo install -m 0644 {extract_dir}/deploy/superserve-maintenance-watch.timer /etc/systemd/system/superserve-maintenance-watch.timer
@@ -314,17 +326,6 @@ def main() -> int:
             if [ -n {q_sentry} ]; then
                 sudo sed -i '/^SENTRY_DSN=/d' /etc/sandbox/vmd.env
                 echo {q_sentry_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
-            fi
-
-            # Upsert the maintenance-watch webhook into its own env file so the
-            # watcher never sources vmd's tokens. Empty = skip: the watcher
-            # still runs and logs notices to the journal, it just can't page.
-            if [ -n {q_webhook} ]; then
-                sudo install -d -m 0755 /etc/sandbox
-                sudo touch /etc/sandbox/maintenance-watch.env
-                sudo chmod 0600 /etc/sandbox/maintenance-watch.env
-                sudo sed -i '/^MAINTENANCE_ALERT_WEBHOOK=/d' /etc/sandbox/maintenance-watch.env
-                echo {q_webhook_line} | sudo tee -a /etc/sandbox/maintenance-watch.env > /dev/null
             fi
 
             # Upsert BACKUP_BUCKET (the cell's artifact backup bucket).
