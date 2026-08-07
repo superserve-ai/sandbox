@@ -161,8 +161,6 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	// Arming is what first creates VMs an old binary cannot manage, so the
 	// downgrade protection must provably exist BEFORE the hazard does: refuse
 	// to arm unless the host-resident guard and its drop-in are installed.
-	// This makes rollback safety independent of any deploy revision or
-	// runbook — a host without the guard simply never enters the mode.
 	// Manage-only mode is deliberately not gated: existing cgroup VMs must
 	// stay manageable even on a host that somehow lost its guard.
 	if gerr := rollbackGuardInstalled(); gerr != nil {

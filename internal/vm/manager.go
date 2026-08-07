@@ -3808,10 +3808,8 @@ func (m *Manager) releaseFailedRestore(vmID string, inPlace, tapBusy bool, clean
 	if m.cgroupStillLive(vmID) {
 		m.log.Warn().Str("vm_id", vmID).
 			Msg("restore failed with a live cgroup — keeping rundir and network until the reconciler confirms death")
-		// Make the residual ownership explicit and durable, not implied: the
-		// parked record itself says what is retained and who finishes the
-		// teardown. Best-effort persist — the in-memory marker still guides
-		// this life, and a restart re-parks via reattach either way.
+		// Best-effort persist — the in-memory marker still guides this
+		// life, and a restart re-parks via reattach either way.
 		m.mu.RLock()
 		inst := m.vms[vmID]
 		m.mu.RUnlock()
