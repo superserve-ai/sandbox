@@ -7,7 +7,7 @@
 set -u
 
 # Overridable for tests only; production runs use the defaults.
-ENDPOINT="${MAINTENANCE_WATCH_ENDPOINT:-http://metadata.google.internal/computeMetadata/v1/instance/upcoming-maintenance}"
+ENDPOINT="${MAINTENANCE_WATCH_ENDPOINT:-http://metadata.google.internal/computeMetadata/v1/instance/upcoming-maintenance?alt=json}"
 STATE_FILE="${MAINTENANCE_WATCH_STATE:-/var/lib/sandbox/maintenance-notice}"
 
 tmp=$(mktemp)
@@ -15,12 +15,14 @@ trap 'rm -f "$tmp"' EXIT
 code=$(curl -s -o "$tmp" -w '%{http_code}' -H "Metadata-Flavor: Google" \
     --connect-timeout 5 --max-time 30 "$ENDPOINT") || code=000
 
+# Only a 200 decides: its body is either the literal NONE (nothing scheduled)
+# or the pending notice. Any other code is a transient metadata-server problem
+# — skip the poll rather than misread it as "notice cleared".
 case "$code" in
-200) notice=$(cat "$tmp") ;;
-# The endpoint 503s when no maintenance is scheduled — that's the healthy case.
-404 | 503) notice="" ;;
-# Anything else is a transient metadata-server problem: skip the poll rather
-# than misread it as "notice cleared".
+200)
+    notice=$(cat "$tmp")
+    [ "$notice" = "NONE" ] && notice=""
+    ;;
 *)
     echo "metadata server unreachable (http $code), skipping poll" >&2
     exit 0

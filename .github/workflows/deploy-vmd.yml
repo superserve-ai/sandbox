@@ -40,6 +40,9 @@ on:
       - 'deploy/sandboxes.slice'
       - 'deploy/needrestart-superserve.conf'
       - 'deploy/apt-no-auto-upgrades.conf'
+      - 'deploy/maintenance-watch.sh'
+      - 'deploy/superserve-maintenance-watch.service'
+      - 'deploy/superserve-maintenance-watch.timer'
       - 'scripts/fc-cleanup'
       # The workflow + its deploy script must self-trigger (as deploy-otel does),
       # or a new cell/step lands without ever running until an unrelated vmd
