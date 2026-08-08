@@ -85,6 +85,10 @@ type Handler struct {
 	// served. Set via WithExec; default off.
 	execEnabled bool
 
+	// desktopEnabled controls whether the explicitly allowlisted DesktopService
+	// Connect RPCs are forwarded to boxd. Set via WithDesktop; default off.
+	desktopEnabled bool
+
 	// allowedOrigins is the set of browser origins allowed for CORS on
 	// data-plane endpoints (/files). Shared with the terminal origin check.
 	allowedOrigins []string

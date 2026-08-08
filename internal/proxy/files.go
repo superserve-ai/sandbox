@@ -79,6 +79,14 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 		h.serveExecStream(w, r, instanceID)
 	case execConnectPath:
 		h.serveExecWS(w, r, instanceID)
+	case desktopScreenshotPath,
+		desktopStreamPath,
+		desktopSendPointerPath,
+		desktopSendKeyPath,
+		desktopScrollPath,
+		desktopResizePath,
+		desktopSendActionsPath:
+		h.serveDesktop(w, r, instanceID)
 	default:
 		http.NotFound(w, r)
 	}
