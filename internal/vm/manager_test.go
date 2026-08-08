@@ -2435,3 +2435,83 @@ func TestReleaseFailedRestore_ParksExplicitDurableMarker(t *testing.T) {
 		t.Fatal("a successful relaunch must retire the parked-teardown claim")
 	}
 }
+
+// The scope-gone fallback's crash window leaves a cgroup RECORD over a live
+// firecracker@ UNIT. Every record-keyed release must require BOTH supervisors
+// down — the cgroup oracle alone reads that state as dead and would free the
+// tap under the running unit.
+func TestDestroyVM_CgroupRecordOverFallbackUnit_RefusesUntilUnitDown(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+		cgroups: &cgroupTree{vms: t.TempDir()}, // no group: the cgroup side reads dead
+		vms:     map[string]*VMInstance{},
+		cfg:     ManagerConfig{RunDir: t.TempDir()},
+	}
+
+	shimSystemctlActive(t) // the fallback unit is alive
+	err = m.DestroyVM(context.Background(), "vm-1", false)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("destroy over a live fallback unit must refuse Unavailable, got %v", err)
+	}
+	if rec, gerr := store.Get("vm-1"); gerr != nil || rec == nil {
+		t.Fatal("the record must survive the refusal")
+	}
+
+	shimSystemctlDown(t) // unit finally terminal
+	if err := m.DestroyVM(context.Background(), "vm-1", false); err != nil {
+		t.Fatalf("destroy must complete once both supervisors are down, got %v", err)
+	}
+	if rec, _ := store.Get("vm-1"); rec != nil {
+		t.Fatal("the record must be released after a confirmed destroy")
+	}
+}
+
+// The reattach stale-sweep's release proof must also see the fallback unit.
+func TestReattachRecord_CgroupRecordOverFallbackUnit_NotReleased(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // fallback unit alive
+	defer func() { vmUnitFullyDown = origDown }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "fc.sock")
+	if err := os.WriteFile(sock, []byte(""), 0o644); err != nil { // socket present
+		t.Fatal(err)
+	}
+	rec := VMRecord{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, SocketPath: sock}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+		cgroups: &cgroupTree{vms: t.TempDir()}, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok {
+		t.Fatalf("the record must be kept and published, got inst=%v ok=%v", inst, ok)
+	}
+	if kept, gerr := store.Get("vm-1"); gerr != nil || kept == nil {
+		t.Fatal("a cgroup record over a live fallback unit must never be released")
+	}
+
+	vmUnitFullyDown = func(string) bool { return true } // both down now
+	m2 := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+		cgroups: &cgroupTree{vms: t.TempDir()}, vms: map[string]*VMInstance{}}
+	if _, ok := m2.reattachRecord(context.Background(), rec, true); ok {
+		t.Fatal("with both supervisors down the stale record must be released")
+	}
+	if kept, _ := store.Get("vm-1"); kept != nil {
+		t.Fatal("release must delete the record")
+	}
+}

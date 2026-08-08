@@ -869,6 +869,17 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 			return status.Errorf(codes.Unavailable, "vm %s stop unconfirmed (cgroup process still live); retry after it exits", vmID)
 		}
 	}
+	// The mirror ambiguity: a scope-gone fallback can leave a cgroup record
+	// over a live firecracker@ unit (crash before the mode persisted), and
+	// the recorded-mode stop above never touched it. Stop the unit too and
+	// require it terminal before any cleanup — a no-op round trip when no
+	// unit exists.
+	if cgroupSupervised(destroySupervision) {
+		_ = stopUnit(ctx, systemdUnitName(vmID))
+		if !unitFullyDown(ctx, systemdUnitName(vmID)) {
+			return status.Errorf(codes.Unavailable, "vm %s stop unconfirmed (fallback unit still active); retry after it exits", vmID)
+		}
+	}
 	removeUnitDropIn(vmID)
 
 	// Recover the PID, socket, and namespace to tear down. A tracked VM has them
@@ -2770,9 +2781,10 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	if cleanupStale && !unmanageableMode && rec.Status != StatusPaused {
 		var fullyDown bool
 		if cgroupSupervised(rec.Supervision) {
-			// A conclusively empty group is already terminal — there is no
-			// deactivating analog to wait out.
-			fullyDown = m.cgroupDefinitelyDead(rec.ID)
+			// Both supervisors — the scope-gone fallback window (see
+			// DestroyVM's fallback-unit gate); an empty group is already
+			// terminal, the unit claim must be too.
+			fullyDown = m.cgroupDefinitelyDead(rec.ID) && vmUnitFullyDown(rec.ID)
 		} else {
 			fullyDown = vmUnitFullyDown(rec.ID)
 		}
@@ -2810,7 +2822,9 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 					if err := m.stopVM(ctx, rec.ID, rec.Supervision); err != nil {
 						log.Warn().Err(err).Msg("stop failed for socket-missing VM")
 					}
-					confirmed = m.cgroupDefinitelyDead(rec.ID)
+					// Both supervisors — the scope-gone fallback window.
+					_ = stopUnit(ctx, systemdUnitName(rec.ID))
+					confirmed = m.cgroupDefinitelyDead(rec.ID) && vmUnitFullyDown(rec.ID)
 					if !confirmed {
 						return nil, false
 					}
