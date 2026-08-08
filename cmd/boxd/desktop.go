@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"image"
 	"image/png"
 	"io"
 	"log"
@@ -25,15 +27,19 @@ import (
 // Desktop service (Connect RPC) — GUI screenshot capture and input injection
 // ---------------------------------------------------------------------------
 //
-// Capture shells out to ImageMagick's `import` (PNG to stdout, no temp
-// files); input injection shells out to xdotool. Every invocation is bound
-// to the request context via exec.CommandContext.
+// Pointer/scroll injection and frame capture use a persistent X11 connection
+// (desktop_x11.go) when one is available, falling back to shelling out
+// (xdotool / ImageMagick `import`). Keyboard input always shells out to
+// xdotool, which owns keysym resolution and text-entry keymap handling.
 type desktopService struct {
 	boxdpbconnect.UnimplementedDesktopServiceHandler
 	ctx          *sandboxContext
 	mutationMu   sync.Mutex
 	streamSlot   chan struct{}
 	captureSlots chan struct{}
+	// x11 holds the persistent display connection (desktop_x11.go). When it
+	// is unavailable, every operation falls back to the shell tools.
+	x11 x11Holder
 }
 
 // ---------------------------------------------------------------------------
@@ -43,12 +49,12 @@ type desktopService struct {
 // defaultDesktopFPS is used when FrameConfig.fps is 0.
 const defaultDesktopFPS = 4
 
-// maxDesktopFPS bounds the capture cadence; each frame forks `import` and
-// reads the whole framebuffer.
+// maxDesktopFPS bounds the capture cadence; each frame reads the whole
+// framebuffer (and forks `import` on the fallback path).
 const maxDesktopFPS = 15
 
-// screenshotTimeout bounds a single `import` invocation so a wedged X
-// server stalls one frame, not the whole stream.
+// screenshotTimeout bounds a single fallback `import` invocation so a
+// wedged X server stalls one frame, not the whole stream.
 const screenshotTimeout = 5 * time.Second
 
 // xdotoolTimeout bounds a single xdotool invocation (pointer/key/scroll/
@@ -167,6 +173,7 @@ func (s *desktopService) Stream(ctx context.Context, req *connect.Request[pb.Fra
 
 	var seq uint64
 	var consecutiveFailures int
+	var lastFrameHash uint64
 	for {
 		frameStart := time.Now()
 		img, err := s.captureScreenshot(ctx)
@@ -189,6 +196,16 @@ func (s *desktopService) Stream(ctx context.Context, req *connect.Request[pb.Fra
 			}
 		default:
 			consecutiveFailures = 0
+			// An unchanged frame (identical encoded bytes; encoding is
+			// deterministic) is sent as a keepalive, not a duplicate image.
+			hash := fnv64(img)
+			if seq > 0 && hash == lastFrameHash {
+				if err := stream.Send(&pb.Frame{Event: &pb.Frame_Keepalive{Keepalive: &pb.KeepAlive{}}}); err != nil {
+					return err
+				}
+				break
+			}
+			lastFrameHash = hash
 			seq++
 			if err := stream.Send(&pb.Frame{Event: &pb.Frame_Data{Data: &pb.FrameDataEvent{
 				Image:           img,
@@ -215,6 +232,37 @@ func (s *desktopService) Stream(ctx context.Context, req *connect.Request[pb.Fra
 		case <-time.After(wait):
 		}
 	}
+}
+
+// displayName resolves the X display for the persistent backend, preferring
+// the sandbox environment (boxd starts before template defaults apply, so
+// its own process env may lack DISPLAY).
+func (s *desktopService) displayName() string {
+	envVars, _, _ := s.ctx.snapshot()
+	if d := envVars["DISPLAY"]; d != "" {
+		return d
+	}
+	if d := os.Getenv("DISPLAY"); d != "" {
+		return d
+	}
+	return defaultDesktopDisplay
+}
+
+func fnv64(b []byte) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write(b)
+	return h.Sum64()
+}
+
+// encodeFramePNG encodes a captured frame. BestSpeed: encode latency
+// matters more than size for transient frames.
+func encodeFramePNG(frame *image.RGBA) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := enc.Encode(&buf, frame); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // Screenshot captures a single frame. It deliberately does not take the
@@ -247,16 +295,34 @@ func (s *desktopService) Screenshot(ctx context.Context, req *connect.Request[pb
 	}), nil
 }
 
-// captureScreenshot runs ImageMagick's `import` against the root window and
-// returns the PNG bytes written to stdout. Bound to a per-capture timeout
+// captureScreenshot returns the current frame as PNG bytes: the persistent
+// X11 backend (in-process capture + encode, cursor composited) when
+// available, else ImageMagick's `import`. Bound to a per-capture timeout
 // derived from ctx so one wedged capture can't stall the stream forever.
 func (s *desktopService) captureScreenshot(ctx context.Context) ([]byte, error) {
+	// One slot per capture on either backend: the X11 path also holds a
+	// full frame plus its PNG encoding in memory.
 	select {
 	case s.captureSlots <- struct{}{}:
 		defer func() { <-s.captureSlots }()
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	var encoded []byte
+	if s.withX11(ctx, func(b *x11Backend) error {
+		frame, err := b.Capture()
+		if err != nil {
+			return err
+		}
+		encoded, err = encodeFramePNG(frame)
+		return err
+	}) {
+		if len(encoded) > maxScreenshotBytes {
+			return nil, fmt.Errorf("screenshot is %d bytes, limit is %d", len(encoded), maxScreenshotBytes)
+		}
+		return encoded, nil
+	}
+
 	capCtx, cancel := context.WithTimeout(ctx, screenshotTimeout)
 	defer cancel()
 
@@ -293,9 +359,16 @@ func (s *desktopService) captureScreenshot(ctx context.Context) ([]byte, error) 
 	return out, nil
 }
 
-// displayGeometry queries the virtual display's current resolution via
-// xdotool, which boxd also uses for pointer/key injection.
+// displayGeometry queries the virtual display's current resolution — via the
+// persistent connection when available, else xdotool.
 func (s *desktopService) displayGeometry(ctx context.Context) (width, height uint32, err error) {
+	if s.withX11(ctx, func(b *x11Backend) error {
+		width, height, err = b.Geometry()
+		return err
+	}) {
+		return width, height, nil
+	}
+
 	geomCtx, cancel := context.WithTimeout(ctx, xdotoolTimeout)
 	defer cancel()
 
@@ -374,6 +447,32 @@ func pointerArgs(x, y int32, button pb.PointerButton, action pb.PointerAction) (
 	}
 }
 
+// execPointer delivers a validated pointer event: persistent backend first,
+// xdotool args as the fallback. Callers hold mutationMu.
+func (s *desktopService) execPointer(ctx context.Context, ev *pb.PointerEvent, fallbackArgs []string) error {
+	if s.withX11(ctx, func(b *x11Backend) error {
+		return b.Pointer(ev.GetX(), ev.GetY(), ev.GetButton(), ev.GetAction())
+	}) {
+		return nil
+	}
+	return s.runXdotool(ctx, fallbackArgs...)
+}
+
+// execScroll delivers a validated scroll event; same backend/fallback split.
+func (s *desktopService) execScroll(ctx context.Context, ev *pb.ScrollEvent, fallbackCmds [][]string) error {
+	if s.withX11(ctx, func(b *x11Backend) error {
+		return b.Scroll(ev.GetDx(), ev.GetDy())
+	}) {
+		return nil
+	}
+	for _, args := range fallbackCmds {
+		if err := s.runXdotool(ctx, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *desktopService) SendPointer(ctx context.Context, req *connect.Request[pb.PointerEvent]) (*connect.Response[pb.PointerResponse], error) {
 	args, err := pointerArgs(req.Msg.GetX(), req.Msg.GetY(), req.Msg.GetButton(), req.Msg.GetAction())
 	if err != nil {
@@ -381,7 +480,7 @@ func (s *desktopService) SendPointer(ctx context.Context, req *connect.Request[p
 	}
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
-	if err := s.runXdotool(ctx, args...); err != nil {
+	if err := s.execPointer(ctx, req.Msg, args); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return connect.NewResponse(&pb.PointerResponse{}), nil
@@ -488,10 +587,8 @@ func (s *desktopService) Scroll(ctx context.Context, req *connect.Request[pb.Scr
 	}
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
-	for _, args := range cmds {
-		if err := s.runXdotool(ctx, args...); err != nil {
-			return nil, connect.NewError(connect.CodeInternal, err)
-		}
+	if err := s.execScroll(ctx, req.Msg, cmds); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return connect.NewResponse(&pb.ScrollResponse{}), nil
 }
@@ -504,17 +601,21 @@ func (s *desktopService) Scroll(ctx context.Context, req *connect.Request[pb.Scr
 // worst-case input-lock hold time.
 const maxBatchActions = 64
 
-// batchCommands validates every action in the batch and lowers each to its
-// xdotool argument lists, reusing the exact validation of the unary RPCs.
-// Returned as one slice per action so execution can report the failing index.
-func batchCommands(actions []*pb.Action) ([][][]string, error) {
+// loweredAction is one fully validated batch step, ready to execute under
+// the input lock via whichever backend is available.
+type loweredAction func(ctx context.Context) error
+
+// lowerActions validates every action in the batch and lowers each to an
+// executor, reusing the exact validation of the unary RPCs. One entry per
+// action so execution can report the failing index.
+func (s *desktopService) lowerActions(actions []*pb.Action) ([]loweredAction, error) {
 	if len(actions) == 0 {
 		return nil, errors.New("actions is empty")
 	}
 	if len(actions) > maxBatchActions {
 		return nil, fmt.Errorf("too many actions: %d, max %d", len(actions), maxBatchActions)
 	}
-	cmds := make([][][]string, len(actions))
+	lowered := make([]loweredAction, len(actions))
 	for i, action := range actions {
 		switch a := action.GetAction().(type) {
 		case *pb.Action_Pointer:
@@ -522,42 +623,42 @@ func batchCommands(actions []*pb.Action) ([][][]string, error) {
 			if err != nil {
 				return nil, fmt.Errorf("action %d: %w", i, err)
 			}
-			cmds[i] = [][]string{args}
+			ev := a.Pointer
+			lowered[i] = func(ctx context.Context) error { return s.execPointer(ctx, ev, args) }
 		case *pb.Action_Key:
 			args, err := keyArgs(a.Key)
 			if err != nil {
 				return nil, fmt.Errorf("action %d: %w", i, err)
 			}
-			cmds[i] = [][]string{args}
+			lowered[i] = func(ctx context.Context) error { return s.runXdotool(ctx, args...) }
 		case *pb.Action_Scroll:
-			scroll, err := scrollCommands(a.Scroll.GetDx(), a.Scroll.GetDy())
+			cmds, err := scrollCommands(a.Scroll.GetDx(), a.Scroll.GetDy())
 			if err != nil {
 				return nil, fmt.Errorf("action %d: %w", i, err)
 			}
-			cmds[i] = scroll
+			ev := a.Scroll
+			lowered[i] = func(ctx context.Context) error { return s.execScroll(ctx, ev, cmds) }
 		default:
 			return nil, fmt.Errorf("action %d: one of pointer, key, or scroll is required", i)
 		}
 	}
-	return cmds, nil
+	return lowered, nil
 }
 
 func (s *desktopService) SendActions(ctx context.Context, req *connect.Request[pb.ActionBatch]) (*connect.Response[pb.ActionBatchResponse], error) {
-	cmds, err := batchCommands(req.Msg.GetActions())
+	lowered, err := s.lowerActions(req.Msg.GetActions())
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
-	for i, actionCmds := range cmds {
-		for _, args := range actionCmds {
-			if err := s.runXdotool(ctx, args...); err != nil {
-				return nil, connect.NewError(connect.CodeInternal,
-					fmt.Errorf("action %d failed after %d executed: %w", i, i, err))
-			}
+	for i, run := range lowered {
+		if err := run(ctx); err != nil {
+			return nil, connect.NewError(connect.CodeInternal,
+				fmt.Errorf("action %d failed after %d executed: %w", i, i, err))
 		}
 	}
-	return connect.NewResponse(&pb.ActionBatchResponse{Executed: uint32(len(cmds))}), nil
+	return connect.NewResponse(&pb.ActionBatchResponse{Executed: uint32(len(lowered))}), nil
 }
 
 func abs32(v int32) int64 {
@@ -725,15 +826,7 @@ var desktopHelperPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 // before template defaults are applied and does not have it in its own
 // environment.
 func (s *desktopService) commandContext(ctx context.Context, name string, args ...string) (*exec.Cmd, error) {
-	envVars, _, _ := s.ctx.snapshot()
-
-	display := envVars["DISPLAY"]
-	if display == "" {
-		display = os.Getenv("DISPLAY")
-	}
-	if display == "" {
-		display = defaultDesktopDisplay
-	}
+	display := s.displayName()
 
 	resolved, err := lookPathIn(name, desktopHelperPath)
 	if err != nil {
