@@ -89,6 +89,11 @@ type Handler struct {
 	// Connect RPCs are forwarded to boxd. Set via WithDesktop; default off.
 	desktopEnabled bool
 
+	// desktopUsageLast debounces desktop usage events (see
+	// captureDesktopUsage); keyed by instanceID+event.
+	desktopUsageMu   sync.Mutex
+	desktopUsageLast map[string]time.Time
+
 	// allowedOrigins is the set of browser origins allowed for CORS on
 	// data-plane endpoints (/files). Shared with the terminal origin check.
 	allowedOrigins []string

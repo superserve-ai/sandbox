@@ -1,10 +1,8 @@
 package proxy
 
 import (
-	"fmt"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
+	"time"
 
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
 )
@@ -18,10 +16,18 @@ const (
 	desktopResizePath      = boxdpbconnect.DesktopServiceResizeProcedure
 	desktopSendActionsPath = boxdpbconnect.DesktopServiceSendActionsProcedure
 
-	// Boxd accepts up to 64KiB of literal text per key event and a batch can
-	// carry several; 256KiB leaves envelope headroom so a request boxd would
-	// accept is never rejected here first.
-	maxDesktopRequestBytes = 256 * 1024
+	// Sized above the largest request boxd itself accepts — a SendActions
+	// batch of 64 actions × 64KiB text (~4MiB) plus envelope/JSON-encoding
+	// headroom — so the proxy never rejects a request boxd would take,
+	// while still bounding abuse.
+	maxDesktopRequestBytes = 8 << 20 // 8 MiB
+
+	// desktopUsageWindow debounces desktop usage events per (sandbox,
+	// event). Screenshots and input arrive per agent-loop iteration —
+	// orders of magnitude denser than any other usage event — and would
+	// otherwise crowd out the low-frequency events the usage pipeline
+	// reports on (the analytics buffer drops on overflow).
+	desktopUsageWindow = time.Minute
 )
 
 // WithDesktop exposes only the DesktopService RPC paths through the reserved
@@ -31,7 +37,35 @@ func (h *Handler) WithDesktop() *Handler {
 		panic("proxy: WithDesktop requires WithAuth to be called first")
 	}
 	h.desktopEnabled = true
+	h.desktopUsageLast = make(map[string]time.Time)
 	return h
+}
+
+// captureDesktopUsage emits a usage event at most once per
+// desktopUsageWindow per (sandbox, event).
+func (h *Handler) captureDesktopUsage(instanceID, event string, info InstanceInfo) {
+	now := time.Now()
+	key := instanceID + "\x00" + event
+
+	h.desktopUsageMu.Lock()
+	// ponytail: linear sweep keyed off map size; an LRU if fleets of
+	// concurrently-active desktop sandboxes ever exceed ~4k.
+	if len(h.desktopUsageLast) > 4096 {
+		for k, t := range h.desktopUsageLast {
+			if now.Sub(t) > desktopUsageWindow {
+				delete(h.desktopUsageLast, k)
+			}
+		}
+	}
+	last, seen := h.desktopUsageLast[key]
+	if seen && now.Sub(last) < desktopUsageWindow {
+		h.desktopUsageMu.Unlock()
+		return
+	}
+	h.desktopUsageLast[key] = now
+	h.desktopUsageMu.Unlock()
+
+	h.captureUsage(instanceID, event, info)
 }
 
 func (h *Handler) serveDesktop(w http.ResponseWriter, r *http.Request, instanceID string) {
@@ -40,11 +74,13 @@ func (h *Handler) serveDesktop(w http.ResponseWriter, r *http.Request, instanceI
 		return
 	}
 
+	// Browser clients are expected to use the Connect protocol; gRPC-web
+	// is not supported (its required headers are deliberately absent here).
 	if origin := r.Header.Get("Origin"); origin != "" {
 		if h.originAllowed(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "X-Access-Token, Content-Type, Connect-Protocol-Version, Connect-Timeout-Ms, Grpc-Timeout")
+			w.Header().Set("Access-Control-Allow-Headers", "X-Access-Token, Content-Type, Connect-Protocol-Version, Connect-Timeout-Ms")
 			w.Header().Set("Access-Control-Max-Age", "3600")
 		}
 		if r.Method == http.MethodOptions {
@@ -58,21 +94,18 @@ func (h *Handler) serveDesktop(w http.ResponseWriter, r *http.Request, instanceI
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxDesktopRequestBytes)
 
-	token := r.Header.Get(accessTokenHeader)
-	if token == "" {
-		http.Error(w, "missing X-Access-Token header", http.StatusUnauthorized)
+	// Reject declared-oversize bodies before proxying; MaxBytesReader
+	// backstops clients that lie or stream chunked, surfacing as 413 via
+	// the proxy's ErrorHandler.
+	if r.ContentLength > maxDesktopRequestBytes {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	r.Header.Del(accessTokenHeader)
-	r.Header.Del(headerSandboxID)
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	r.Body = http.MaxBytesReader(w, r.Body, maxDesktopRequestBytes)
 
-	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
-	if fail != nil {
-		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("desktop: auth failed")
-		fail.write(w)
+	info, ok := h.authorizeBoxdRequest(w, r, instanceID, "desktop")
+	if !ok {
 		return
 	}
 
@@ -83,40 +116,7 @@ func (h *Handler) serveDesktop(w http.ResponseWriter, r *http.Request, instanceI
 	case desktopScreenshotPath:
 		event = "desktop_screenshot"
 	}
-	h.captureUsage(instanceID, event, info)
+	h.captureDesktopUsage(instanceID, event, info)
 
-	transport := h.transports.get(instanceID, info)
-	target := &url.URL{
-		Scheme: "http",
-		Host:   fmt.Sprintf("%s:%d", info.VMIP, boxdPort),
-	}
-	rp := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			req.Host = r.Host
-			req.Header["X-Forwarded-For"] = nil
-			for _, header := range []string{
-				"X-Forwarded-Host",
-				"X-Forwarded-Proto",
-				"X-Real-Ip",
-				"Forwarded",
-			} {
-				req.Header.Del(header)
-			}
-		},
-		Transport:     transport,
-		FlushInterval: -1,
-		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
-			h.log.Error().Err(proxyErr).
-				Str("instance", instanceID).
-				Str("method", r.URL.Path).
-				Str("target", target.Host).
-				Msg("desktop: upstream error")
-			h.resolver.Invalidate(instanceID)
-			rw.Header().Set("Retry-After", "2")
-			http.Error(rw, "sandbox unreachable", http.StatusBadGateway)
-		},
-	}
-	rp.ServeHTTP(w, r)
+	h.newBoxdReverseProxy(r, instanceID, info, "desktop").ServeHTTP(w, r)
 }

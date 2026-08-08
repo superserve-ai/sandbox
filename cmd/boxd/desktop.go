@@ -146,33 +146,29 @@ func (s *desktopService) Stream(ctx context.Context, req *connect.Request[pb.Fra
 		return err
 	}
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
 	var seq uint64
 	var consecutiveFailures int
 	for {
-		select {
-		case <-ctx.Done():
+		frameStart := time.Now()
+		img, err := s.captureScreenshot(ctx)
+		switch {
+		case ctx.Err() != nil:
 			// Best-effort; the client may already be gone.
 			_ = stream.Send(&pb.Frame{Event: &pb.Frame_End{End: &pb.FrameEndEvent{Status: "cancelled"}}})
 			return nil
-		case <-ticker.C:
-			img, err := s.captureScreenshot(ctx)
-			if err != nil {
-				consecutiveFailures++
-				log.Printf("desktop: screenshot capture failed (%d/%d consecutive): %v",
-					consecutiveFailures, maxConsecutiveCaptureFailures, err)
-				if consecutiveFailures >= maxConsecutiveCaptureFailures {
-					_ = stream.Send(&pb.Frame{Event: &pb.Frame_End{End: &pb.FrameEndEvent{
-						Status: "error",
-						Error:  err.Error(),
-					}}})
-					return connect.NewError(connect.CodeInternal,
-						fmt.Errorf("screenshot capture failed %d times consecutively: %w", consecutiveFailures, err))
-				}
-				continue
+		case err != nil:
+			consecutiveFailures++
+			log.Printf("desktop: screenshot capture failed (%d/%d consecutive): %v",
+				consecutiveFailures, maxConsecutiveCaptureFailures, err)
+			if consecutiveFailures >= maxConsecutiveCaptureFailures {
+				_ = stream.Send(&pb.Frame{Event: &pb.Frame_End{End: &pb.FrameEndEvent{
+					Status: "error",
+					Error:  err.Error(),
+				}}})
+				return connect.NewError(connect.CodeInternal,
+					fmt.Errorf("screenshot capture failed %d times consecutively: %w", consecutiveFailures, err))
 			}
+		default:
 			consecutiveFailures = 0
 			seq++
 			if err := stream.Send(&pb.Frame{Event: &pb.Frame_Data{Data: &pb.FrameDataEvent{
@@ -182,6 +178,22 @@ func (s *desktopService) Stream(ctx context.Context, req *connect.Request[pb.Fra
 			}}}); err != nil {
 				return err
 			}
+		}
+
+		// Pace off capture completion, not a free-running ticker: a ticker
+		// always has a tick queued when capture overruns the interval,
+		// which degrades the loop into back-to-back forks at 100% duty.
+		// The floor guarantees idle time even when over budget, so a slow
+		// X server lowers FPS instead of monopolizing a core.
+		wait := interval - time.Since(frameStart)
+		if minGap := interval / 4; wait < minGap {
+			wait = minGap
+		}
+		select {
+		case <-ctx.Done():
+			_ = stream.Send(&pb.Frame{Event: &pb.Frame_End{End: &pb.FrameEndEvent{Status: "cancelled"}}})
+			return nil
+		case <-time.After(wait):
 		}
 	}
 }
@@ -407,20 +419,23 @@ func scrollCommands(dx, dy int32) ([][]string, error) {
 		return nil, fmt.Errorf("scroll delta out of range: (%d, %d), max magnitude %d", dx, dy, maxScrollRepeat)
 	}
 
+	// --delay 0 drops xdotool's default 100ms pause between repeated
+	// clicks; without it any repeat above ~50 outlives xdotoolTimeout and
+	// gets killed mid-scroll.
 	var cmds [][]string
 	if dy != 0 {
 		button := "5"
 		if dy < 0 {
 			button = "4"
 		}
-		cmds = append(cmds, []string{"click", "--repeat", strconv.Itoa(int(abs32(dy))), button})
+		cmds = append(cmds, []string{"click", "--repeat", strconv.Itoa(int(abs32(dy))), "--delay", "0", button})
 	}
 	if dx != 0 {
 		button := "7"
 		if dx < 0 {
 			button = "6"
 		}
-		cmds = append(cmds, []string{"click", "--repeat", strconv.Itoa(int(abs32(dx))), button})
+		cmds = append(cmds, []string{"click", "--repeat", strconv.Itoa(int(abs32(dx))), "--delay", "0", button})
 	}
 	return cmds, nil
 }

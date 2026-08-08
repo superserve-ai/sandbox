@@ -56,8 +56,17 @@ generate-sqlc:
 # Pin protoc to the version the committed *.pb.go files were generated with — see
 # the `// protoc vX.Y.Z` header in proto/boxdpb/*.pb.go. Regenerating with a
 # different protoc rewrites that header and the generated struct formatting for no
-# functional change, producing spurious diffs. Keep protoc (and protoc-gen-go /
-# protoc-gen-go-grpc) consistent here and in CI to avoid that drift.
+# functional change, producing spurious diffs. Keep protoc (and the plugin
+# versions below) consistent here and in CI to avoid that drift.
+PROTOC_GEN_GO_VERSION := v1.36.11
+PROTOC_GEN_GO_GRPC_VERSION := v1.6.2
+PROTOC_GEN_CONNECT_GO_VERSION := v1.19.1
+
+install-proto-tools:
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+	go install connectrpc.com/connect/cmd/protoc-gen-connect-go@$(PROTOC_GEN_CONNECT_GO_VERSION)
+
 generate-proto:
 	protoc --go_out=. --go_opt=module=github.com/superserve-ai/sandbox \
 		--go-grpc_out=. --go-grpc_opt=module=github.com/superserve-ai/sandbox \

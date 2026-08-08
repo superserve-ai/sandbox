@@ -300,7 +300,7 @@ func TestScrollCommands(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := [][]string{{"click", "--repeat", "3", "5"}}
+		want := [][]string{{"click", "--repeat", "3", "--delay", "0", "5"}}
 		if len(cmds) != 1 || !equalStrings(cmds[0], want[0]) {
 			t.Errorf("cmds = %v, want %v", cmds, want)
 		}
@@ -311,7 +311,7 @@ func TestScrollCommands(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := []string{"click", "--repeat", "4", "4"}
+		want := []string{"click", "--repeat", "4", "--delay", "0", "4"}
 		if len(cmds) != 1 || !equalStrings(cmds[0], want) {
 			t.Errorf("cmds = %v, want %v", cmds, want)
 		}
@@ -322,14 +322,14 @@ func TestScrollCommands(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(right) != 1 || !equalStrings(right[0], []string{"click", "--repeat", "2", "7"}) {
+		if len(right) != 1 || !equalStrings(right[0], []string{"click", "--repeat", "2", "--delay", "0", "7"}) {
 			t.Errorf("right = %v", right)
 		}
 		left, err := scrollCommands(-2, 0)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(left) != 1 || !equalStrings(left[0], []string{"click", "--repeat", "2", "6"}) {
+		if len(left) != 1 || !equalStrings(left[0], []string{"click", "--repeat", "2", "--delay", "0", "6"}) {
 			t.Errorf("left = %v", left)
 		}
 	})
@@ -657,7 +657,7 @@ exit 0
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
-	want := "click --repeat 3 5\n"
+	want := "click --repeat 3 --delay 0 5\n"
 	if string(got) != want {
 		t.Errorf("xdotool invoked with %q, want %q", got, want)
 	}
@@ -1085,7 +1085,7 @@ exit 0
 	}
 	want := "mousemove 10 20 click 1\n" +
 		"type --delay 0 -- hi\n" +
-		"click --repeat 3 5\n"
+		"click --repeat 3 --delay 0 5\n"
 	if string(got) != want {
 		t.Errorf("xdotool invocations:\n%s\nwant:\n%s", got, want)
 	}

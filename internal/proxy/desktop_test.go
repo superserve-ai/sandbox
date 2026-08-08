@@ -165,3 +165,63 @@ func TestDesktopProxy_DisabledAndConfigurationOrder(t *testing.T) {
 	}()
 	h.WithDesktop()
 }
+
+func TestDesktopProxy_OversizedBodyRejected413(t *testing.T) {
+	env := newDesktopProxyTestEnv(t)
+
+	// Declared Content-Length above the cap: rejected before proxying.
+	req := env.request(http.MethodPost, desktopSendActionsPath, env.validToken(),
+		strings.NewReader("tiny"))
+	req.ContentLength = maxDesktopRequestBytes + 1
+	w := httptest.NewRecorder()
+	env.handler.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("declared-oversize status = %d, want 413", w.Code)
+	}
+	if env.lastReq.received {
+		t.Fatal("oversized request must not reach the upstream")
+	}
+
+	// Undeclared (chunked) oversize: MaxBytesReader trips mid-copy and must
+	// surface as 413 through the ErrorHandler, not a 502 retry loop.
+	env2 := newDesktopProxyTestEnv(t)
+	big := strings.NewReader(strings.Repeat("x", maxDesktopRequestBytes+1))
+	req2 := env2.request(http.MethodPost, desktopSendActionsPath, env2.validToken(), big)
+	req2.ContentLength = -1 // force chunked
+	w2 := httptest.NewRecorder()
+	env2.handler.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("chunked-oversize status = %d, want 413; body: %s", w2.Code, w2.Body.String())
+	}
+}
+
+func TestDesktopProxy_UsageDebounce(t *testing.T) {
+	env := newDesktopProxyTestEnv(t)
+	info := InstanceInfo{VMIP: "10.0.0.1"}
+
+	var events int
+	// captureUsage is a no-op without analytics; count via the debounce map
+	// state instead: same (sandbox, event) within the window records once.
+	env.handler.captureDesktopUsage("sbx-a", "desktop_screenshot", info)
+	env.handler.captureDesktopUsage("sbx-a", "desktop_screenshot", info)
+	env.handler.captureDesktopUsage("sbx-a", "desktop_input", info)
+	env.handler.captureDesktopUsage("sbx-b", "desktop_screenshot", info)
+	events = len(env.handler.desktopUsageLast)
+	if events != 3 {
+		t.Fatalf("debounce map entries = %d, want 3 (sbx-a/screenshot, sbx-a/input, sbx-b/screenshot)", events)
+	}
+
+	// A stale entry re-emits: backdate and confirm the timestamp refreshes.
+	key := "sbx-a\x00desktop_screenshot"
+	stale := time.Now().Add(-2 * desktopUsageWindow)
+	env.handler.desktopUsageMu.Lock()
+	env.handler.desktopUsageLast[key] = stale
+	env.handler.desktopUsageMu.Unlock()
+	env.handler.captureDesktopUsage("sbx-a", "desktop_screenshot", info)
+	env.handler.desktopUsageMu.Lock()
+	refreshed := env.handler.desktopUsageLast[key].After(stale)
+	env.handler.desktopUsageMu.Unlock()
+	if !refreshed {
+		t.Fatal("expected a stale debounce entry to re-emit and refresh its timestamp")
+	}
+}

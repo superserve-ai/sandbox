@@ -1,10 +1,7 @@
 package proxy
 
 import (
-	"fmt"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"strings"
 )
 
@@ -12,9 +9,11 @@ import (
 // the terminal bridge talks to (boxdPort, defined in terminal.go), because
 // boxd serves both its connect-rpc services and the raw /files HTTP
 // endpoint on a single HTTP listener. The proxy treats all traffic to
-// boxdPort as sensitive regardless of path — only /files is allowlisted
-// through, everything else is 404'd so the in-VM connect-rpc services
-// stay strictly internal.
+// boxdPort as sensitive regardless of path — serveBoxdPort forwards only
+// the explicit per-path allowlist in its switch (/files, the exec
+// endpoints, and the DesktopService connect-rpc procedures); everything
+// else is 404'd. Any new boxd route or RPC stays unreachable from outside
+// until it is deliberately added to that allowlist.
 const (
 	// filesPath is the HTTP path the edge proxy forwards to boxd's
 	// raw /files handler after verifying the access token.
@@ -42,12 +41,16 @@ const (
 //
 // boxd is a special case: inside the VM a single HTTP listener serves
 // both the raw /files endpoint and the full connect-rpc service
-// surface (ProcessService, FilesystemService). We only ever expose the
-// narrow set of paths we explicitly handle below; any other path
-// returns an opaque 404 so a caller probing the in-VM surface cannot
-// enumerate what exists behind the proxy. That includes `/health`,
-// connect-rpc routes, and anything future boxd grows internally
-// without our knowledge.
+// surface (ProcessService, FilesystemService, DesktopService). We only
+// ever expose the narrow set of paths we explicitly handle below; any
+// other path returns an opaque 404 so a caller probing the in-VM
+// surface cannot enumerate what exists behind the proxy. That includes
+// `/health`, the ProcessService/FilesystemService connect-rpc routes,
+// and anything future boxd grows internally without our knowledge.
+// DesktopService procedures are the one connect-rpc surface deliberately
+// exposed (see desktop.go) — a new DesktopService RPC must also be added
+// to the switch below or it will 404 here while working in direct-to-boxd
+// testing.
 func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instanceID string) {
 	if !h.sandboxConns.acquire(instanceID) {
 		http.Error(w, "too many connections to sandbox", http.StatusTooManyRequests)
@@ -162,22 +165,8 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		}
 	}
 
-	token := r.Header.Get(accessTokenHeader)
-	if token == "" {
-		http.Error(w, "missing X-Access-Token header", http.StatusUnauthorized)
-		return
-	}
-
-	// Scrub the token before forwarding to boxd.
-	r.Header.Del(accessTokenHeader)
-	r.Header.Del(headerSandboxID)
-
-	w.Header().Set("Referrer-Policy", "no-referrer")
-
-	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
-	if fail != nil {
-		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("files: auth failed")
-		fail.write(w)
+	info, ok := h.authorizeBoxdRequest(w, r, instanceID, "files")
+	if !ok {
 		return
 	}
 	fileEvent := "file_read" // only GET/POST reach here; POST is a write
@@ -186,57 +175,8 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	}
 	h.captureUsage(instanceID, fileEvent, info)
 
-	// From here on it's just a transparent reverse proxy to boxd.
-	// Reuse the lifecycle-keyed transport cache for the same reasons
-	// as the generic forwarder: one pooled set of TCP connections per
-	// sandbox incarnation, reset on pause/resume.
-	transport := h.transports.get(instanceID, info)
-	target := &url.URL{
-		Scheme: "http",
-		Host:   fmt.Sprintf("%s:%d", info.VMIP, boxdPort),
-	}
-
-	rp := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			// Preserve the original Host so boxd logs the public name,
-			// not the VM private IP. Also avoids Host-header confusion
-			// on any downstream middleware that trusts it.
-			req.Host = r.Host
-			// Strip all forwarding / origin headers — a caller could
-			// otherwise inject these to spoof identity in any boxd
-			// log or future handler that trusts them. Note the
-			// explicit `= nil` for X-Forwarded-For: httputil.ReverseProxy
-			// re-appends that header after the Director runs unless
-			// its value is the nil slice. A plain Del leaves it
-			// missing, which httputil then "helpfully" refills.
-			req.Header["X-Forwarded-For"] = nil
-			for _, hdr := range []string{
-				"X-Forwarded-Host",
-				"X-Forwarded-Proto",
-				"X-Real-Ip",
-				"Forwarded",
-			} {
-				req.Header.Del(hdr)
-			}
-		},
-		Transport: transport,
-		// FlushInterval -1 streams the response as it arrives, which is
-		// what we want for large downloads: the client sees bytes as
-		// boxd produces them, not after the whole file is buffered.
-		FlushInterval: -1,
-		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
-			h.log.Error().Err(proxyErr).
-				Str("instance", instanceID).
-				Str("target", target.Host).
-				Msg("files: upstream error")
-			// Invalidate so the next request re-resolves from VMD,
-			// in case the VM was replaced mid-stream.
-			h.resolver.Invalidate(instanceID)
-			rw.Header().Set("Retry-After", "2")
-			http.Error(rw, "sandbox unreachable", http.StatusBadGateway)
-		},
-	}
-	rp.ServeHTTP(w, r)
+	// From here on it's a transparent reverse proxy to boxd, on the
+	// lifecycle-keyed transport cache: one pooled set of TCP connections
+	// per sandbox incarnation, reset on pause/resume.
+	h.newBoxdReverseProxy(r, instanceID, info, "files").ServeHTTP(w, r)
 }
