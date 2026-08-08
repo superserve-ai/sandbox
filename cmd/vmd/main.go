@@ -715,8 +715,10 @@ func main() {
 	// gate opens, so no in-flight create can be mistaken for a survivor
 	// (that racy post-gate case is the reconciler's job). No-op unless armed.
 	// The reap reserves the slots of survivors it couldn't confirm dead, so
-	// both the pool and the adoption pass below skip them; protectedNs carries
-	// their namespaces so the non-adoption sweep keeps them too.
+	// the pool and the adoption pass skip them; protectedNs carries their
+	// namespaces so the non-adoption sweep keeps them too. sweepSafe=false
+	// means a survivor could NOT be protected — every reclaim path below
+	// (sweep AND adoption) must stand down for this boot.
 	protectedNs, sweepSafe := mgr.ReapRecordlessCgroupVMs(ctx)
 	adoptNetPool := envOrDefault("VMD_NET_POOL_ADOPT", "false") == "true"
 	if !adoptNetPool {
@@ -761,7 +763,7 @@ func main() {
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 	switch {
-	case adoptNetPool && slotsReserved:
+	case adoptNetPool && slotsReserved && sweepSafe:
 		// Adopt the slots the previous run abandoned (or crashed out of) in
 		// the background: the pool starts warm within seconds instead of
 		// refilling from scratch, and boot never blocks on the pass.
@@ -770,10 +772,12 @@ func main() {
 			netPool.AdoptOrphanSlots(ctx)
 		}()
 	case adoptNetPool:
-		// Without a completed reservation pass, adoption cannot tell live VM
-		// namespaces from orphans — leave everything in place; the pool
-		// refills fresh and the next healthy boot adopts.
-		log.Error().Msg("skipping network pool adoption: startup slot reservation did not complete")
+		// Without a completed reservation pass — or with an unprotected
+		// recordless survivor — adoption cannot tell live VM namespaces from
+		// orphans; leave everything in place; the pool refills fresh and the
+		// next healthy boot adopts.
+		log.Error().Bool("slots_reserved", slotsReserved).Bool("survivors_protected", sweepSafe).
+			Msg("skipping network pool adoption: live namespaces not provably protected")
 	}
 
 	// Leak gauge for network namespaces — independent of the launcher path, and
