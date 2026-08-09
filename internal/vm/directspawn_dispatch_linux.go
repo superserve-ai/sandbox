@@ -287,13 +287,19 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 	}
 	tSocketReady := time.Now()
 
-	m.log.Info().
+	ev := m.log.Info().
 		Str("vm_id", vmID).
 		Int64("prestart_ms", tStart.Sub(tPrestart).Milliseconds()).
 		Int64("spawn_ms", tSpawnDone.Sub(tStart).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tSpawnDone).Milliseconds()).
-		Bool("direct", true).
-		Msg("fc startup phases")
+		Bool("direct", true)
+	// chain_ms = fork return → the script's pre-exec stamp (nsenter/unshare/
+	// mounts); fc_socket_ms = Firecracker init plus our detection latency.
+	if ts, ok := readFCExecStamp(socketPath, tSpawnDone, tSocketReady); ok {
+		ev = ev.Int64("chain_ms", ts.Sub(tSpawnDone).Milliseconds()).
+			Int64("fc_socket_ms", tSocketReady.Sub(ts).Milliseconds())
+	}
+	ev.Msg("fc startup phases")
 
 	return pid, nil
 }

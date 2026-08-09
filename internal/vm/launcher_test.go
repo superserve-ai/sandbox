@@ -4,10 +4,12 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/superserve-ai/sandbox/internal/shellquote"
 )
@@ -33,6 +35,60 @@ func TestBuildLauncherNamespace_Integration(t *testing.T) {
 	// A rebuild over an existing pin must also succeed (stale-pin path).
 	if err := buildLauncherNamespace(ctx, pin); err != nil {
 		t.Fatalf("rebuild over existing pin: %v", err)
+	}
+}
+
+func TestFCStartScript_ExecStamp(t *testing.T) {
+	got := fcStartScript("ns-7", "", "SETUP",
+		"/usr/bin/firecracker", "/run/x/fc.sock", "vm-abc")
+	// The stamp path rides inside the doubly-quoted inner script, so assert on
+	// the stable fragments rather than the escaped quoting.
+	if !strings.Contains(got, "date +%s%N >") || !strings.Contains(got, "/run/x/fcexec.ts") {
+		t.Fatalf("script missing pre-exec stamp; got:\n%s", got)
+	}
+	// The stamp must precede the firecracker exec and follow the setup: a
+	// failed setup must not stamp, and the stamp must not run after exec.
+	idx := strings.Index(got, "fcexec.ts")
+	if execIdx := strings.Index(got, "/usr/bin/firecracker"); execIdx < idx {
+		t.Errorf("stamp must come before the firecracker exec; got:\n%s", got)
+	}
+	if setupIdx := strings.Index(got, "SETUP"); setupIdx > idx {
+		t.Errorf("stamp must come after setup commands; got:\n%s", got)
+	}
+	// A best-effort stamp: date failure must not break the && chain to exec.
+	if !strings.Contains(got, "|| true") {
+		t.Errorf("stamp must be best-effort (|| true); got:\n%s", got)
+	}
+}
+
+func TestReadFCExecStamp(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "fc.sock")
+	write := func(s string) {
+		if err := os.WriteFile(fcExecStampPath(socketPath), []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := time.Now().Add(-time.Second)
+	after := time.Now().Add(time.Second)
+
+	if _, ok := readFCExecStamp(socketPath, before, after); ok {
+		t.Error("missing stamp file must read as absent")
+	}
+	write("garbage%N\n")
+	if _, ok := readFCExecStamp(socketPath, before, after); ok {
+		t.Error("unparsable stamp must read as absent")
+	}
+	// A stale stamp from a prior launch sits outside the window.
+	write(strconv.FormatInt(before.Add(-time.Hour).UnixNano(), 10))
+	if _, ok := readFCExecStamp(socketPath, before, after); ok {
+		t.Error("stale stamp outside the window must read as absent")
+	}
+	now := time.Now()
+	write(strconv.FormatInt(now.UnixNano(), 10) + "\n")
+	ts, ok := readFCExecStamp(socketPath, before, after)
+	if !ok || !ts.Equal(time.Unix(0, now.UnixNano())) {
+		t.Errorf("valid stamp: got (%v, %v), want (%v, true)", ts, ok, now)
 	}
 }
 

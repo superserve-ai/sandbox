@@ -4083,9 +4083,41 @@ func fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID str
 	// Each value is single-quoted, then the whole inner script is single-quoted as
 	// the `sh -c` arg — two shellquote.Single layers, so a caller-influenced path
 	// (base_path, perVMRootfs) can't close a quote and inject shell as root.
-	inner := fmt.Sprintf("%s%s && exec %s --api-sock %s --id %s",
-		setupCmds, sysfs, shellquote.Single(fcBin), shellquote.Single(socketPath), shellquote.Single(vmID))
+	//
+	// The date stamp right before the exec splits wait_socket into shell-chain
+	// time and Firecracker-side time (see readFCExecStamp). Best-effort: a date
+	// without %N or an unwritable dir must never block the launch.
+	inner := fmt.Sprintf("%s%s && { date +%%s%%N >%s 2>/dev/null || true; } && exec %s --api-sock %s --id %s",
+		setupCmds, sysfs, shellquote.Single(fcExecStampPath(socketPath)),
+		shellquote.Single(fcBin), shellquote.Single(socketPath), shellquote.Single(vmID))
 	return fmt.Sprintf("#!/bin/sh\nexec %s unshare -m -- sh -c %s\n", prefix, shellquote.Single(inner))
+}
+
+// fcExecStampPath is the per-VM file the launch script writes (wall-clock
+// nanoseconds) immediately before exec'ing Firecracker.
+func fcExecStampPath(socketPath string) string {
+	return filepath.Join(filepath.Dir(socketPath), "fcexec.ts")
+}
+
+// readFCExecStamp returns the launch script's pre-exec timestamp, or false
+// when it is missing, unparsable (a shell whose date lacks %N), or outside
+// (notBefore, notAfter) — a stale stamp from a prior launch of the same VM
+// must not be attributed to this one. Wall clock on both sides: the script's
+// date and the phase timestamps compared against it.
+func readFCExecStamp(socketPath string, notBefore, notAfter time.Time) (time.Time, bool) {
+	data, err := os.ReadFile(fcExecStampPath(socketPath))
+	if err != nil {
+		return time.Time{}, false
+	}
+	ns, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	ts := time.Unix(0, ns)
+	if ts.Before(notBefore) || ts.After(notAfter) {
+		return time.Time{}, false
+	}
+	return ts, true
 }
 
 // startFirecrackerViaSystemd writes the start script and launches Firecracker
@@ -4159,14 +4191,20 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	}
 	tSocketReady := time.Now()
 
-	m.log.Info().
+	ev := m.log.Info().
 		Str("vm_id", vmID).
 		Int64("prestart_ms", tStartUnit.Sub(tPrestart).Milliseconds()).
 		Int64("linger_check_ms", lingerCheckMs).
 		Bool("linger_skipped", freshUnit).
 		Int64("start_unit_ms", tStartUnitDone.Sub(tStartUnit).Milliseconds()).
-		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds()).
-		Msg("fc startup phases")
+		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds())
+	// On the unit path chain_ms also contains PID 1's dispatch of the unit;
+	// fc_socket_ms is Firecracker init plus our detection latency.
+	if ts, ok := readFCExecStamp(socketPath, tStartUnitDone, tSocketReady); ok {
+		ev = ev.Int64("chain_ms", ts.Sub(tStartUnitDone).Milliseconds()).
+			Int64("fc_socket_ms", tSocketReady.Sub(ts).Milliseconds())
+	}
+	ev.Msg("fc startup phases")
 
 	// Read the PID asynchronously so the create path isn't slowed down
 	// by the ~15ms dbus roundtrip. The PID is populated in the instance
