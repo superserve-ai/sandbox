@@ -1,8 +1,16 @@
 [Unit]
 Description=Superserve VM Daemon
-After=network-online.target superserve-vmd.socket
+After=network-online.target superserve-vmd.socket superserve-vms.service
 Wants=network-online.target
 Requires=superserve-vmd.socket
+# Pull in the delegated-subtree keeper on EVERY vmd start, including a
+# socket-activated one. Before= on the keeper only orders units already queued;
+# without this Wants= a socket connection under sockets.target can start vmd
+# before multi-user.target starts the keeper, and ArmDirectSpawn would find no
+# delegated scope (permanent unit-path fallback, or fatal if cgroup VMs exist).
+# Wants= not Requires=: a genuinely-failed keeper should let vmd degrade to the
+# unit path, not refuse to start.
+Wants=superserve-vms.service
 
 [Service]
 Type=simple
@@ -13,13 +21,20 @@ ExecStart=/usr/local/bin/vmd
 ExecReload=/bin/kill -HUP $MAINPID
 
 # DO NOT add ExecStartPre commands that kill Firecracker processes or
-# remove network namespaces. VMs are managed by systemd units
-# (firecracker@.service) and must survive VMD restarts.
+# remove network namespaces. VMs must survive VMD restarts — firecracker@
+# units (unit mode) run under sandboxes.slice, and direct-spawn VMs run in the
+# delegated superserve-vms.service, both outside this unit's cgroup.
 
-# mixed: send SIGTERM to the main process only. Do NOT kill the cgroup
-# (which would include firecracker@ units if they were children — they
-# aren't in systemd mode, but this is defense-in-depth).
+# process: signal the main process only, never the cgroup. Retained for
+# defense-in-depth and back-compat through the direct-spawn migration —
+# direct-spawn VMs no longer live in this unit's cgroup (they run under
+# superserve-vms.service), so VM survival no longer depends on it. vmd
+# verifies KillMode=process on superserve-vms.service, not this unit.
 KillMode=process
+# Delegate the cgroup subtree to vmd. Retained through the migration; the
+# direct-spawn VM subtree now lives under the delegated superserve-vms.service,
+# not here. No effect in unit mode (vmd creates no sub-cgroups).
+Delegate=yes
 Restart=always
 RestartSec=2
 
