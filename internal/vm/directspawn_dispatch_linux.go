@@ -303,20 +303,31 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 	}
 	tSocketReady := time.Now()
 
-	m.log.Info().
+	ev := m.log.Info().
 		Str("vm_id", vmID).
 		Int64("stop_prior_ms", stopPrior.Milliseconds()).
 		Int64("prestart_ms", tStart.Sub(tPrestart).Milliseconds()).
 		Int64("spawn_ms", tSpawnDone.Sub(tStart).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tSpawnDone).Milliseconds()).
-		Bool("direct", true).
-		Msg("fc startup phases")
-	m.recordPhases("launch", "direct", map[string]time.Duration{
+		Bool("direct", true)
+	// chain = fork return → the script's pre-exec stamp (nsenter/unshare/
+	// mounts); fc_socket = Firecracker init plus our detection latency.
+	// Emitted to both the log and the phase histogram when the stamp is
+	// usable; the coarse phases always emit.
+	launchPhases := map[string]time.Duration{
 		"stop_prior":  stopPrior,
 		"prestart":    tStart.Sub(tPrestart),
 		"spawn":       tSpawnDone.Sub(tStart),
 		"wait_socket": tSocketReady.Sub(tSpawnDone),
-	})
+	}
+	if ts, ok := readFCExecStamp(socketPath, tSpawnDone, tSocketReady); ok {
+		ev = ev.Int64("chain_ms", ts.Sub(tSpawnDone).Milliseconds()).
+			Int64("fc_socket_ms", tSocketReady.Sub(ts).Milliseconds())
+		launchPhases["chain"] = ts.Sub(tSpawnDone)
+		launchPhases["fc_socket"] = tSocketReady.Sub(ts)
+	}
+	ev.Msg("fc startup phases")
+	m.recordPhases("launch", "direct", launchPhases)
 
 	return pid, nil
 }
