@@ -40,7 +40,19 @@ const (
 	// root so controllers can be enabled there (cgroup v2 no-internal-process
 	// rule). Reserved — never a vmID.
 	keeperSubdir = "keeper"
+	// spareCgroupPrefix names pre-created, empty per-VM cgroups awaiting a
+	// launch (see spareCgroupPool). Reserved — never a vmID, and every scan
+	// that interprets a child dir as a VM must skip it (isReservedCgroupName).
+	spareCgroupPrefix = "spare-"
 )
+
+// isReservedCgroupName reports whether a child of the delegated scope is
+// vmd's own machinery rather than a VM: the keeper leaf or a spare from the
+// pre-created cgroup pool. The ONE predicate every scan uses, so a new
+// reserved name can never be half-recognized.
+func isReservedCgroupName(name string) bool {
+	return name == keeperSubdir || strings.HasPrefix(name, spareCgroupPrefix)
+}
 
 // cgroupTree holds the resolved paths of the delegated VM subtree — the
 // superserve-vms.service ControlGroup and its keeper leaf.
@@ -360,7 +372,7 @@ func delegatedTreeHasVMs(ctx context.Context) (bool, error) {
 		return false, err // scope exists but unreadable — caller fails closed
 	}
 	for _, e := range entries {
-		if e.IsDir() && e.Name() != keeperSubdir {
+		if e.IsDir() && !isReservedCgroupName(e.Name()) {
 			return true, nil
 		}
 	}
@@ -557,7 +569,7 @@ func (t *cgroupTree) firstPID(vmID string) int {
 // vms/ subtree onto vmd's own group, and a kill there would take the daemon
 // down with the VM. Defense-in-depth behind the launch-entry check.
 func (t *cgroupTree) safeVMCgroupDir(vmID string) (string, error) {
-	if !isLeafName(vmID) || vmID == keeperSubdir {
+	if !isLeafName(vmID) || isReservedCgroupName(vmID) {
 		return "", fmt.Errorf("invalid vm_id %q for cgroup path", vmID)
 	}
 	return t.vmCgroupDir(vmID), nil
@@ -732,7 +744,7 @@ func (t *cgroupTree) scanVMCgroups() ([]string, error) {
 	}
 	ids := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() && e.Name() != keeperSubdir {
+		if e.IsDir() && !isReservedCgroupName(e.Name()) {
 			ids = append(ids, e.Name())
 		}
 	}
@@ -798,7 +810,7 @@ func CheckDrained(ctx context.Context, statePath string) (DrainReport, error) {
 		return r, fmt.Errorf("scan scope %s: %w", r.ScopePath, err)
 	}
 	for _, e := range entries {
-		if !e.IsDir() || e.Name() == keeperSubdir {
+		if !e.IsDir() || isReservedCgroupName(e.Name()) {
 			continue
 		}
 		r.PerVMDirs++

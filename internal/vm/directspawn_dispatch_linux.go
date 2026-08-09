@@ -229,10 +229,18 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 		return 0, fmt.Errorf("write start script: %w", err)
 	}
 
-	cgDir, err := m.cgroups.createVMCgroup(vmID)
-	if err != nil {
-		return 0, err
+	// Claim a pre-created group when the pool has one (a cheap same-parent
+	// rename); otherwise pay the kernel's creation cost inline as before.
+	tCgroup := time.Now()
+	cgDir, spareUsed := m.claimSpareCgroup(vmID)
+	if cgDir == nil {
+		var cerr error
+		cgDir, cerr = m.cgroups.createVMCgroup(vmID)
+		if cerr != nil {
+			return 0, cerr
+		}
 	}
+	cgroupMs := time.Since(tCgroup).Milliseconds()
 	// spawnDirect takes ownership of cgDir and closes it; until the hand-off
 	// this path still owns it, so close it on the openVMConsole error return.
 	console, err := openVMConsole(m.cfg.RunDir, vmID)
@@ -290,6 +298,8 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 	m.log.Info().
 		Str("vm_id", vmID).
 		Int64("prestart_ms", tStart.Sub(tPrestart).Milliseconds()).
+		Int64("cgroup_ms", cgroupMs).
+		Bool("spare_cgroup", spareUsed).
 		Int64("spawn_ms", tSpawnDone.Sub(tStart).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tSpawnDone).Milliseconds()).
 		Bool("direct", true).

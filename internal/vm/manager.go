@@ -261,6 +261,12 @@ type ManagerConfig struct {
 	// without the preconditions degrades to the unit path with a loud
 	// error, never to a fleet that dies on the next vmd deploy.
 	DirectSpawn bool
+
+	// SpareCgroupTarget sizes the pre-created cgroup pool (see
+	// spareCgroupPool); 0 disables it. Only meaningful when DirectSpawn is
+	// armed — creating a memory cgroup is kernel-serialized and priced by
+	// host size, so wide create bursts otherwise queue on it.
+	SpareCgroupTarget int
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +342,10 @@ type Manager struct {
 	// slot and veth. In-memory only: a restart rebuilds reservations from
 	// scratch and the startup sweep reclaims unprotected namespaces.
 	survivorNS sync.Map
+	// spares is the pre-created cgroup pool; nil unless armed with a
+	// positive SpareCgroupTarget. Launches claim from it best-effort and
+	// fall back to inline creation — never a correctness dependency.
+	spares *spareCgroupPool
 	// orphanScanDone gates the fresh-unit linger skip: it is set only after
 	// startup reattach successfully listed active units and registered the
 	// BoltDB-missing ones as unconfirmed stops. Until then (or forever, if

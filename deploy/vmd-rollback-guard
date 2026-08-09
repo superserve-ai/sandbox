@@ -38,7 +38,9 @@ if ! VMS_CG=$(systemctl show -p ControlGroup --value superserve-vms.service 2>/d
     exit 1
 fi
 if [ -n "$VMS_CG" ] && [ -d "/sys/fs/cgroup${VMS_CG}" ]; then
-    if ! children=$(find "/sys/fs/cgroup${VMS_CG}" -mindepth 1 -maxdepth 1 -type d ! -name keeper 2>/dev/null); then
+    # keeper and spare-* are vmd's own machinery (the scope keeper's leaf and
+    # the pre-created cgroup pool) — never evidence of a live VM.
+    if ! children=$(find "/sys/fs/cgroup${VMS_CG}" -mindepth 1 -maxdepth 1 -type d ! -name keeper ! -name "spare-*" 2>/dev/null); then
         echo "vmd-rollback-guard: cannot read the delegated VM scope; refusing to start a vmd without cgroup supervision" >&2
         exit 1
     fi

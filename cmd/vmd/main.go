@@ -279,6 +279,20 @@ func runDrainCheck() int {
 	return 3
 }
 
+// spareCgroupTargetFromEnv resolves the spare cgroup pool size:
+// VMD_CGROUP_SPARE_POOL=true enables it at VMD_CGROUP_SPARE_TARGET
+// (default 256); anything else disables (0).
+func spareCgroupTargetFromEnv() int {
+	if envOrDefault("VMD_CGROUP_SPARE_POOL", "false") != "true" {
+		return 0
+	}
+	n, err := strconv.Atoi(envOrDefault("VMD_CGROUP_SPARE_TARGET", "256"))
+	if err != nil || n < 0 {
+		return 256
+	}
+	return n
+}
+
 func main() {
 	// Maintenance subcommands run before any daemon setup and exit. They must
 	// not open the state store in write mode or start services.
@@ -458,6 +472,7 @@ func main() {
 		LaunchViaLauncherNS:        launchViaLauncherNS,
 		LauncherNSPath:             os.Getenv("VMD_LAUNCHER_NS_PATH"),
 		DirectSpawn:                envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
+		SpareCgroupTarget:          spareCgroupTargetFromEnv(),
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
@@ -521,6 +536,14 @@ func main() {
 		log.Error().Err(err).Msg("direct spawn not armed — launches use the unit path")
 	} else if arms {
 		log.Info().Msg("direct spawn armed: new VMs launch into the delegated cgroup subtree")
+	}
+	// The spare cgroup pool exists only on an armed host; on any other
+	// outcome, reap spares a previously-armed life may have left so the
+	// scope holds nothing but VMs and the keeper.
+	if mgr.DirectSpawnArmed() {
+		mgr.StartSpareCgroupPool(ctx)
+	} else {
+		mgr.ReapStrayLeftoverSpares(ctx)
 	}
 
 	// ---- Backup uploader ----
