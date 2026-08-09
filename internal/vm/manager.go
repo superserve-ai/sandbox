@@ -87,15 +87,29 @@ func (s VMStatus) String() string {
 
 // VMInstance holds the runtime state of a single microVM.
 type VMInstance struct {
-	ID           string
-	PID          int
-	SocketPath   string
-	VsockPath    string
-	IP           string
-	TAPDevice    string
-	MACAddress   string
-	Status       VMStatus
-	Unverified   bool // Running persisted before boxd readiness (see VMRecord)
+	ID         string
+	PID        int
+	SocketPath string
+	VsockPath  string
+	IP         string
+	TAPDevice  string
+	MACAddress string
+	Status     VMStatus
+	Unverified bool // Running persisted before boxd readiness (see VMRecord)
+	// gen counts in-place lifecycle transitions (Status/Unverified writes on
+	// a tracked instance); the reconciler's deferredRelease is its consumer.
+	// Bump under inst.mu, at every in-place transition, and nowhere else:
+	// fresh instances need no bump, and inspection ops (env inject,
+	// verification) must NOT bump, or they void retries for VMs they never
+	// touched.
+	//
+	// incarnation is a process-unique, non-owning identity, lazily stamped by
+	// incarnationID at the reconciler's first contact — episodes store this
+	// integer instead of the pointer, so drift bookkeeping can never root a
+	// removed instance, and a fresh instance at a reused address can never
+	// masquerade as its predecessor.
+	gen          uint64
+	incarnation  uint64
 	Config       VMConfig
 	RunDirID     string // Directory name under RunDir for this VM's files.
 	Namespace    string // Network namespace name.
@@ -1052,6 +1066,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	stopCancel()
 
 	inst.mu.Lock()
+	inst.gen++
 	inst.Status = StatusPaused
 	inst.SnapshotPath = snapshotPath
 	inst.MemFilePath = memPath
@@ -1270,6 +1285,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			// VM that never came back. The marker stays set — readiness is
 			// still unproven, and the relaunch below reads it to verify.
 			existing.mu.Lock()
+			existing.gen++
 			existing.Status = StatusPaused
 			existing.mu.Unlock()
 			// The verdict has to be durable BEFORE relaunching: the relaunch
@@ -1426,6 +1442,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	}
 
 	inst.mu.Lock()
+	inst.gen++
 	inst.PID = pid
 	inst.SocketPath = socketPath
 	inst.Status = StatusRunning
@@ -1891,6 +1908,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				// guest-dead, and the relaunch replaces the unit anyway.
 				// If-present, so a racing destroy's deletion still wins.
 				existing.mu.Lock()
+				existing.gen++
 				existing.Status = StatusError
 				existing.mu.Unlock()
 				// Best-effort: the returned error is the useful one, and an
@@ -2310,6 +2328,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// persist synchronously, serializing the very fsync the goroutine
 	// overlaps with the boxd wait.
 	inst.mu.Lock()
+	inst.gen++
 	inst.Status = StatusRunning
 	inst.Unverified = true
 	inst.mu.Unlock()
@@ -2377,6 +2396,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("vm %s restored but its state could not be persisted", vmID)
 	}
 	inst.mu.Lock()
+	inst.gen++
 	inst.Unverified = false
 	inst.mu.Unlock()
 	// Persist-then-verify: checking AFTER the write leaves no window — a
@@ -2584,11 +2604,25 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				sigkillPID(rec.PID, 500*time.Millisecond)
 				log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
 			}
-			m.state.Delete(rec.ID)
-			// Free this record's namespace/slot directly instead of a broad
-			// re-sweep (which would also delete the warm pool's netns).
-			m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
-			return nil, false
+			// Delete-first, like markStale: freeing the slot while the record
+			// survives lets a later reattach of that record rebind a slot the
+			// pool has already handed to someone else.
+			if derr := m.state.Delete(rec.ID); derr == nil {
+				// Free this record's namespace/slot directly instead of a broad
+				// re-sweep (which would also delete the warm pool's netns).
+				m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
+				return nil, false
+			} else {
+				// Keep record AND slot — but returning unowned would strand
+				// them: with the DB row already failed, no drift rule matches
+				// a Running record behind a dead unit. Park as Error and fall
+				// through to the publish tail, so Drift 8's dead half owns the
+				// release through the deferred-retry machinery. In-memory
+				// only: the store just refused a delete, a Put would fare no
+				// better, and errorRecord reads the tracked instance first.
+				log.Error().Err(derr).Msg("failed to delete stale record; parking as error with its slot reserved")
+				rec.Status = StatusError
+			}
 		}
 		if rec.SocketPath != "" {
 			if _, statErr := os.Stat(rec.SocketPath); statErr != nil {
@@ -2925,6 +2959,7 @@ func (m *Manager) handleVMError(vmID string, origErr error) error {
 		return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
 	}
 	inst.mu.Lock()
+	inst.gen++
 	inst.Status = StatusStopped
 	inst.mu.Unlock()
 	delete(m.vms, vmID)
@@ -3204,6 +3239,25 @@ func (m *Manager) getInstance(vmID string) (*VMInstance, error) {
 	return nil, status.Errorf(codes.NotFound, "vm %s not found", vmID)
 }
 
+// incarnationCounter feeds VMInstance.incarnation; 0 is reserved for
+// "no instance".
+var incarnationCounter atomic.Uint64
+
+// incarnationID returns inst's process-unique identity, stamping it on first
+// use. Nil-safe: no instance is identity 0, which no stamped instance holds.
+func (inst *VMInstance) incarnationID() uint64 {
+	if inst == nil {
+		return 0
+	}
+	inst.mu.Lock()
+	if inst.incarnation == 0 {
+		inst.incarnation = incarnationCounter.Add(1)
+	}
+	v := inst.incarnation
+	inst.mu.Unlock()
+	return v
+}
+
 func (m *Manager) setStatus(vmID string, s VMStatus) {
 	m.mu.RLock()
 	inst, ok := m.vms[vmID]
@@ -3212,6 +3266,7 @@ func (m *Manager) setStatus(vmID string, s VMStatus) {
 		return
 	}
 	inst.mu.Lock()
+	inst.gen++
 	inst.Status = s
 	inst.mu.Unlock()
 	m.persistState(inst)
@@ -3418,6 +3473,7 @@ func (m *Manager) abortResumeLocked(vmID string) {
 	}
 	m.stopUnitDuringRestoreError(vmID)
 	inst.mu.Lock()
+	inst.gen++
 	inst.Status = StatusPaused
 	inst.DirtyTracked = false // FC process stopped; a fresh resume re-arms tracking.
 	inst.mu.Unlock()
@@ -4044,6 +4100,7 @@ func (m *Manager) commitResumeState(inst *VMInstance) error {
 			// unit this teardown is stopping.
 			m.stopUnitDuringRestoreError(inst.ID)
 			inst.mu.Lock()
+			inst.gen++
 			inst.Status = StatusError
 			inst.DirtyTracked = false // unit stopped; a relaunch re-arms tracking
 			inst.mu.Unlock()
@@ -4072,6 +4129,7 @@ func (m *Manager) commitVerifiedAdoption(existing *VMInstance) error {
 		return status.Errorf(codes.NotFound, "vm %s was destroyed during restore", existing.ID)
 	}
 	existing.mu.Lock()
+	existing.gen++
 	existing.Unverified = false
 	existing.mu.Unlock()
 	// Only a deletion aborts the adoption; an undurable clear is healed by

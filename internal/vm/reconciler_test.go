@@ -398,6 +398,7 @@ func TestUnverifiedOrphanGrace(t *testing.T) {
 // unit first retire the condition their rule matches on, so a swallowed
 // failure would be reported as a completed reap and never revisited.
 func TestMarkStaleReportsDeleteFailure(t *testing.T) {
+	stubUnitTerminal(t, true)
 	newRec := func(t *testing.T) (*Reconciler, *StateStore) {
 		t.Helper()
 		st, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
@@ -421,7 +422,7 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 		if err := st.Close(); err != nil { // the store is gone; the delete cannot land
 			t.Fatal(err)
 		}
-		if err := r.markStale("vm-1"); err == nil {
+		if err := r.markStale(context.Background(), "vm-1", ""); err == nil {
 			t.Fatal("an undeletable record must be reported, not reaped silently")
 		}
 		r.mgr.mu.RLock()
@@ -434,7 +435,7 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 
 	t.Run("success drops the instance", func(t *testing.T) {
 		r, _ := newRec(t)
-		if err := r.markStale("vm-1"); err != nil {
+		if err := r.markStale(context.Background(), "vm-1", ""); err != nil {
 			t.Fatalf("markStale: %v", err)
 		}
 		r.mgr.mu.RLock()
@@ -452,7 +453,7 @@ func TestMarkStaleReportsDeleteFailure(t *testing.T) {
 func TestFinalizeErrorReap_FailedDeleteKeepsMarker(t *testing.T) {
 	newRec := func() *Reconciler {
 		r := NewReconciler(&Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}, DefaultReconcilerConfig())
-		r.driftSeen["errdead:vm-1"] = time.Now()
+		r.driftSeen["errdead:vm-1"] = newDriftEpisode(time.Now(), nil, 0)
 		return r
 	}
 
@@ -484,6 +485,7 @@ func TestFinalizeErrorReap_FailedDeleteKeepsMarker(t *testing.T) {
 // The retry itself: a store that refuses the delete leaves the VM fully owned,
 // and a later pass — once the store recovers — completes the same cleanup.
 func TestMarkStale_FailedDeleteRetriedOnLaterPass(t *testing.T) {
+	stubUnitTerminal(t, true)
 	path := filepath.Join(t.TempDir(), "vmd.db")
 	store, err := OpenStateStore(path)
 	if err != nil {
@@ -503,7 +505,7 @@ func TestMarkStale_FailedDeleteRetriedOnLaterPass(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.markStale("vm-1"); err == nil {
+	if err := r.markStale(context.Background(), "vm-1", ""); err == nil {
 		t.Fatal("an undeletable record must report failure")
 	}
 	m.mu.RLock()
@@ -520,7 +522,7 @@ func TestMarkStale_FailedDeleteRetriedOnLaterPass(t *testing.T) {
 	}
 	defer reopened.Close()
 	m.state = reopened
-	if err := r.markStale("vm-1"); err != nil {
+	if err := r.markStale(context.Background(), "vm-1", ""); err != nil {
 		t.Fatalf("retry must succeed once the store recovers: %v", err)
 	}
 	m.mu.RLock()
@@ -562,6 +564,7 @@ func TestStatPauseArtifact(t *testing.T) {
 // updates that record when firecracker dies out from under vmd, so trusting
 // it vetoes every reap. The unit probe is the only valid oracle here.
 func TestReapDeadActiveVMs_StaleRunningRecordDoesNotVetoReap(t *testing.T) {
+	stubUnitTerminal(t, true) // markStale's own terminal guard must not veto the reap in tests
 	newFixture := func(t *testing.T, unitDown bool) (*Reconciler, *StateStore, string, *[]string) {
 		t.Helper()
 		sbID := uuid.New()
@@ -581,7 +584,10 @@ func TestReapDeadActiveVMs_StaleRunningRecordDoesNotVetoReap(t *testing.T) {
 			vms: map[string]*VMInstance{id: {ID: id, Status: StatusRunning}},
 		}
 		r := NewReconciler(m, DefaultReconcilerConfig())
-		r.driftSeen[id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+		// Bind the pre-seeded episode to the instance, as graceElapsedFor
+		// does: an unbound seed reads as a different generation and the
+		// currentness check would (correctly) restart the episode.
+		r.driftSeen[id] = newDriftEpisode(time.Now().Add(-2*r.cfg.GracePeriod), m.vms[id], 0)
 
 		origProbe := unitFullyDownProbe
 		unitFullyDownProbe = func(context.Context, string) bool { return unitDown }
@@ -645,7 +651,7 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 		id := sbID.String()
 		m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
 		r := NewReconciler(m, DefaultReconcilerConfig())
-		r.driftSeen["paused:"+id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+		r.driftSeen["paused:"+id] = newDriftEpisode(time.Now().Add(-2*r.cfg.GracePeriod), nil, 0)
 		flips := &[]string{}
 		r.markFailed = func(_ context.Context, vmID string, observed db.SandboxStatus) bool {
 			if observed != db.SandboxStatusPaused {
@@ -721,4 +727,890 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 			t.Fatalf("a locked VM must defer, got %v", *flips)
 		}
 	})
+}
+
+// stubUnitTerminal swaps the terminal-state probe so release tests do not
+// depend on a live systemd.
+func stubUnitTerminal(t *testing.T, terminal bool) {
+	t.Helper()
+	orig := unitFullyDownCtx
+	unitFullyDownCtx = func(context.Context, string) bool { return terminal }
+	t.Cleanup(func() { unitFullyDownCtx = orig })
+}
+
+// A release must not hand a VM's namespace, IP and tap device back to the pool
+// while its unit still has a process: the next VM would claim a device the old
+// Firecracker still owns. Deferring is safe because the retry comes back.
+func TestMarkStaleDefersWhileUnitNotTerminal(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusError}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	stubUnitTerminal(t, false) // unit still deactivating
+	if err := r.markStale(context.Background(), "vm-1", ""); !errors.Is(err, errUnitNotTerminal) {
+		t.Fatalf("a non-terminal unit must defer the release, got %v", err)
+	}
+	if rec, _ := store.Get("vm-1"); rec == nil {
+		t.Fatal("the record must survive a deferred release")
+	}
+	m.mu.RLock()
+	_, tracked := m.vms["vm-1"]
+	m.mu.RUnlock()
+	if !tracked {
+		t.Fatal("the instance and its slot must stay owned while the unit lives")
+	}
+	if got := r.pendingReleaseIDs(); len(got) != 1 || got[0] != "vm-1" {
+		t.Fatalf("a deferred release must be remembered for retry, got %v", got)
+	}
+
+	// The unit reaches a terminal state; the deferred release completes.
+	stubUnitTerminal(t, true)
+	r.retryPendingReleases(context.Background())
+	if rec, _ := store.Get("vm-1"); rec != nil {
+		t.Fatal("the retry must release once the unit is terminal")
+	}
+	if got := r.pendingReleaseIDs(); len(got) != 0 {
+		t.Fatalf("a completed release must be forgotten, got %v", got)
+	}
+}
+
+// A deferred release must not be audited as a completed reap, and must not
+// retire the drift marker: the record and its slot are still held. The guard
+// makes deferral the COMMON outcome, so a rule that reported success here
+// would mislabel routine cleanups, not just rare store failures.
+func TestFinalizeRelease_DeferralIsNotSuccess(t *testing.T) {
+	newRec := func() *Reconciler {
+		r := NewReconciler(&Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}, DefaultReconcilerConfig())
+		r.driftSeen["orphan:vm-1"] = newDriftEpisode(time.Now(), nil, 0)
+		return r
+	}
+
+	t.Run("deferral keeps the marker", func(t *testing.T) {
+		r := newRec()
+		r.finalizeRelease(context.Background(), "vm-1", "orphan:vm-1", "orphan_stop",
+			"systemd unit with no DB row", "systemd_active_db_missing", errUnitNotTerminal)
+		r.mu.Lock()
+		_, kept := r.driftSeen["orphan:vm-1"]
+		r.mu.Unlock()
+		if !kept {
+			t.Fatal("a deferred release must keep its marker — the slot is still held")
+		}
+	})
+
+	t.Run("completion retires the marker", func(t *testing.T) {
+		r := newRec()
+		r.finalizeRelease(context.Background(), "vm-1", "orphan:vm-1", "orphan_stop",
+			"systemd unit with no DB row", "systemd_active_db_missing", nil)
+		r.mu.Lock()
+		_, kept := r.driftSeen["orphan:vm-1"]
+		r.mu.Unlock()
+		if kept {
+			t.Fatal("a completed release must retire its marker")
+		}
+	})
+}
+
+// A reap whose release fails is remembered and finished on a later pass. No
+// drift rule can do this: they all match on a live unit, and the reap already
+// stopped it, so without this the record and its network slot are held until
+// the next vmd restart.
+func TestRetryPendingReleases(t *testing.T) {
+	stubUnitTerminal(t, true)
+	newRec := func(t *testing.T) (*Reconciler, string) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "vmd.db")
+		store, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Running is the shape most reap sources leave behind — nothing
+		// updates a record when firecracker dies — and the shape the old
+		// status-keyed void silently discarded.
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{
+			log:   zerolog.Nop(),
+			state: store,
+			vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning}},
+		}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		// Pass 1: the store refuses the delete, so the reap is left unfinished.
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.markStale(context.Background(), "vm-1", ""); err == nil {
+			t.Fatal("an undeletable record must report failure")
+		}
+		return r, path
+	}
+
+	t.Run("failed release is remembered", func(t *testing.T) {
+		r, _ := newRec(t)
+		if got := r.pendingReleaseIDs(); len(got) != 1 || got[0] != "vm-1" {
+			t.Fatalf("an abandoned release must be remembered, got %v", got)
+		}
+	})
+
+	t.Run("later pass completes it", func(t *testing.T) {
+		r, path := newRec(t)
+		reopened, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		r.mgr.state = reopened
+
+		r.retryPendingReleases(context.Background())
+
+		if got := r.pendingReleaseIDs(); len(got) != 0 {
+			t.Fatalf("a completed release must be forgotten, got %v", got)
+		}
+		r.mgr.mu.RLock()
+		_, tracked := r.mgr.vms["vm-1"]
+		r.mgr.mu.RUnlock()
+		if tracked {
+			t.Fatal("the completed retry must drop the instance")
+		}
+		if rec, gerr := reopened.Get("vm-1"); gerr != nil || rec != nil {
+			t.Fatalf("the completed retry must delete the record, got rec=%v err=%v", rec, gerr)
+		}
+	})
+
+	t.Run("a relaunched VM voids the reap", func(t *testing.T) {
+		r, path := newRec(t)
+		reopened, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		r.mgr.state = reopened
+		// A relaunch REPLACES the tracked instance — that pointer swap, not
+		// any status value, is what says a lifecycle op owns the VM now.
+		r.mgr.vms["vm-1"] = &VMInstance{ID: "vm-1", Status: StatusRunning}
+
+		r.retryPendingReleases(context.Background())
+
+		if got := r.pendingReleaseIDs(); len(got) != 0 {
+			t.Fatalf("a voided reap must be forgotten, got %v", got)
+		}
+		r.mgr.mu.RLock()
+		_, tracked := r.mgr.vms["vm-1"]
+		r.mgr.mu.RUnlock()
+		if !tracked {
+			t.Fatal("a relaunched VM must never be released by the retry")
+		}
+		if rec, _ := reopened.Get("vm-1"); rec == nil {
+			t.Fatal("a relaunched VM's record must survive")
+		}
+	})
+	t.Run("a relaunched then re-paused VM is never released", func(t *testing.T) {
+		// The trap a unit-state void would fall into: the new generation
+		// paused, so its unit is terminal — exactly like the stale entry —
+		// and only instance identity tells them apart. Releasing here would
+		// delete a legitimately paused record and free its slot.
+		r, path := newRec(t)
+		reopened, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		r.mgr.state = reopened
+		fresh := &VMInstance{ID: "vm-1", Status: StatusPaused}
+		r.mgr.vms["vm-1"] = fresh
+		if err := reopened.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Namespace: "ns-1"}); err != nil {
+			t.Fatal(err)
+		}
+
+		r.retryPendingReleases(context.Background())
+
+		if got := r.pendingReleaseIDs(); len(got) != 0 {
+			t.Fatalf("the voided entry must be forgotten, got %v", got)
+		}
+		if rec, _ := reopened.Get("vm-1"); rec == nil || rec.Status != StatusPaused {
+			t.Fatalf("the re-paused record must survive untouched, got %v", rec)
+		}
+		r.mgr.mu.RLock()
+		still := r.mgr.vms["vm-1"] == fresh
+		r.mgr.mu.RUnlock()
+		if !still {
+			t.Fatal("the new generation's instance must stay tracked")
+		}
+	})
+}
+
+// Retiring a deferred release must retire its originating drift marker too:
+// the deferring rule kept the marker alive on purpose, and a later episode of
+// the same rule for the same id would inherit its timestamp — an
+// unverified-orphan reap would then skip UnverifiedOrphanGrace entirely and
+// beat adoption to a brand-new crash window.
+func TestRetryPendingReleases_RetiresOriginMarker(t *testing.T) {
+	stubUnitTerminal(t, true)
+	newRec := func(t *testing.T) (*Reconciler, string, string) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "vmd.db")
+		store, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{
+			log:   zerolog.Nop(),
+			state: store,
+			vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning, Unverified: true}},
+		}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		marker := "unverifiedorphan:vm-1"
+		r.driftSeen[marker] = newDriftEpisode(time.Now().Add(-2*r.cfg.UnverifiedOrphanGrace), nil, 0)
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.markStale(context.Background(), "vm-1", marker); err == nil {
+			t.Fatal("an undeletable record must report failure")
+		}
+		return r, path, marker
+	}
+
+	t.Run("successful retry clears it", func(t *testing.T) {
+		r, path, marker := newRec(t)
+		reopened, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		r.mgr.state = reopened
+		r.retryPendingReleases(context.Background())
+		r.mu.Lock()
+		_, kept := r.driftSeen[marker]
+		r.mu.Unlock()
+		if kept {
+			t.Fatal("a completed release must retire the deferring rule's marker")
+		}
+	})
+
+	t.Run("identity void clears it", func(t *testing.T) {
+		r, _, marker := newRec(t)
+		r.mgr.vms["vm-1"] = &VMInstance{ID: "vm-1", Status: StatusRunning} // new generation
+		r.retryPendingReleases(context.Background())
+		r.mu.Lock()
+		_, kept := r.driftSeen[marker]
+		r.mu.Unlock()
+		if kept {
+			t.Fatal("a voided release must retire the old episode's marker")
+		}
+	})
+}
+
+// The in-place claim: adoption clears Unverified and pause flips Status on
+// the SAME tracked object, so pointer identity alone reads an adopted-then-
+// paused VM as the original reap target — and releases a healthy paused
+// record. Any observed mutation of the snapshot must void the entry.
+func TestRetryPendingReleases_InPlaceAdoptionVoids(t *testing.T) {
+	stubUnitTerminal(t, true)
+	path := ""
+	newRec := func(t *testing.T) *Reconciler {
+		t.Helper()
+		path = filepath.Join(t.TempDir(), "vmd.db")
+		store, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{
+			log:   zerolog.Nop(),
+			state: store,
+			vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning, Unverified: true}},
+		}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.markStale(context.Background(), "vm-1", ""); err == nil {
+			t.Fatal("an undeletable record must report failure")
+		}
+		return r
+	}
+
+	t.Run("adopted then paused, same pointer, is never released", func(t *testing.T) {
+		r := newRec(t)
+		reopened, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		r.mgr.state = reopened
+		// Adoption clears the marker in place; a later pause flips status in
+		// place. Same object throughout — only the snapshot tells the story.
+		inst := r.mgr.vms["vm-1"]
+		inst.mu.Lock()
+		inst.gen++ // adoption's funnel bumps
+		inst.Unverified = false
+		inst.gen++ // pause's funnel bumps
+		inst.Status = StatusPaused
+		inst.mu.Unlock()
+		if err := reopened.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Namespace: "ns-1"}); err != nil {
+			t.Fatal(err)
+		}
+
+		r.retryPendingReleases(context.Background())
+
+		if rec, _ := reopened.Get("vm-1"); rec == nil || rec.Status != StatusPaused {
+			t.Fatalf("the adopted VM's paused record must survive untouched, got %v", rec)
+		}
+		if got := r.pendingReleaseIDs(); len(got) != 0 {
+			t.Fatalf("the voided entry must be forgotten, got %v", got)
+		}
+	})
+
+	t.Run("an unmutated stale instance is still released", func(t *testing.T) {
+		r := newRec(t)
+		reopened, err := OpenStateStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		r.mgr.state = reopened
+
+		r.retryPendingReleases(context.Background())
+
+		if rec, _ := reopened.Get("vm-1"); rec != nil {
+			t.Fatal("a genuinely stale record must still be released")
+		}
+	})
+}
+
+// Drift 8's deferral must carry its marker into the pending release, like
+// every other deferring rule: a retry that completes without it retires the
+// record while the errdead: timestamp survives, robbing the id's next Error
+// episode of its grace period.
+func TestFinalizeErrorReap_TagsDeferredRelease(t *testing.T) {
+	stubUnitTerminal(t, true)
+	path := filepath.Join(t.TempDir(), "vmd.db")
+	store, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusError}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	marker := "errdead:vm-1"
+	r.driftSeen[marker] = newDriftEpisode(time.Now().Add(-2*r.cfg.GracePeriod), nil, 0)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	staleErr := r.markStale(context.Background(), "vm-1", marker)
+	if staleErr == nil {
+		t.Fatal("an undeletable record must report failure")
+	}
+	r.finalizeErrorReap(context.Background(), "vm-1", marker, "stale_cleanup",
+		"error record with no unit", "boltdb_error_unit_missing", staleErr)
+
+	reopened, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	m.state = reopened
+	r.retryPendingReleases(context.Background())
+
+	if rec, _ := reopened.Get("vm-1"); rec != nil {
+		t.Fatal("the retry must complete the release")
+	}
+	r.mu.Lock()
+	_, kept := r.driftSeen[marker]
+	r.mu.Unlock()
+	if kept {
+		t.Fatal("a completed retry must retire the Drift 8 marker it was deferred under")
+	}
+}
+
+// A deferred release keeps its rule's predicate true (Running record, dead
+// unit), so without standing aside the rule re-decides every pass and one
+// wedged record drains the host's five-per-hour budget in minutes,
+// suppressing unrelated destructive reconciliation.
+func TestHasPendingReleaseStandsAside(t *testing.T) {
+	stubUnitTerminal(t, false) // the unit never reaches terminal: every release defers
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	// The rule's first decision: charge once, defer the release.
+	if !r.consumeAutoFailBudget("vm-1") {
+		t.Fatal("first decision must have budget")
+	}
+	if err := r.markStale(context.Background(), "vm-1", ""); !errors.Is(err, errUnitNotTerminal) {
+		t.Fatalf("non-terminal unit must defer, got %v", err)
+	}
+	if !r.hasPendingRelease("vm-1") {
+		t.Fatal("a deferred release must be visible to the rules")
+	}
+
+	// Later passes: the retry re-drives the release without charging budget…
+	spent := len(r.autoFailLog)
+	for i := 0; i < 10; i++ {
+		r.retryPendingReleases(context.Background())
+	}
+	if len(r.autoFailLog) != spent {
+		t.Fatalf("the retry must never charge budget, spent %d more", len(r.autoFailLog)-spent)
+	}
+	if !r.hasPendingRelease("vm-1") {
+		t.Fatal("a still-deferred release must stay owned by the retry")
+	}
+	// …and the release completes once the unit lands, budget untouched.
+	stubUnitTerminal(t, true)
+	r.retryPendingReleases(context.Background())
+	if r.hasPendingRelease("vm-1") {
+		t.Fatal("the retry must complete once the unit is terminal")
+	}
+	if len(r.autoFailLog) != spent {
+		t.Fatal("completion must not charge budget either")
+	}
+}
+
+// Drift 1/2 grace under the BARE vm id and defer with marker "" — a
+// successful markStale clears that id itself, but a void never runs
+// markStale. Without clearing it here, the elapsed timestamp survives the
+// void, and the relaunched VM's next death reaps instantly without grace.
+func TestRetryPendingReleases_VoidClearsBareIDGrace(t *testing.T) {
+	stubUnitTerminal(t, false) // defer the release
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusRunning}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	// The Drift 1/2 shape: grace elapsed under the bare id, then a deferral.
+	r.driftSeen["vm-1"] = newDriftEpisode(time.Now().Add(-2*r.cfg.GracePeriod), nil, 0)
+	if err := r.markStale(context.Background(), "vm-1", ""); err == nil {
+		t.Fatal("non-terminal unit must defer")
+	}
+
+	// A relaunch replaces the instance; the retry voids the stale decision.
+	r.mgr.vms["vm-1"] = &VMInstance{ID: "vm-1", Status: StatusRunning}
+	r.retryPendingReleases(context.Background())
+
+	if r.hasPendingRelease("vm-1") {
+		t.Fatal("the void must retire the entry")
+	}
+	r.mu.Lock()
+	_, kept := r.driftSeen["vm-1"]
+	r.mu.Unlock()
+	if kept {
+		t.Fatal("the void must retire the bare-id grace, or the relaunched VM's next death skips its waiting period")
+	}
+}
+
+// A deferred release owns only the RELEASE half of Drift 1's reap: the row
+// flip re-drives uncharged (nobody else moves a stuck-active row off a dead
+// VM), and no second auto-fail slot is spent for the same decision.
+func TestReapDeadActiveVMs_PendingReleaseRedrivesFlipUncharged(t *testing.T) {
+	stubUnitTerminal(t, false) // the release stays deferred
+	sbID := uuid.New()
+	id := sbID.String()
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: id, Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:   zerolog.Nop(),
+		state: store,
+		vms:   map[string]*VMInstance{id: {ID: id, Status: StatusRunning}},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	if err := r.markStale(context.Background(), id, ""); err == nil {
+		t.Fatal("non-terminal unit must defer")
+	}
+	flips := 0
+	r.markFailed = func(_ context.Context, vmID string, observed db.SandboxStatus) bool {
+		flips++
+		return true // row moved active→failed
+	}
+	// The reap is still current and still a corpse — the one shape the
+	// uncharged flip re-drive exists for.
+	origProbe := unitFullyDownProbe
+	unitFullyDownProbe = func(context.Context, string) bool { return true }
+	t.Cleanup(func() { unitFullyDownProbe = origProbe })
+	rows := map[string]db.ListSandboxesByHostRow{
+		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+	}
+
+	spent := len(r.autoFailLog)
+	r.reapDeadActiveVMs(context.Background(), zerolog.Nop(), rows, map[string]bool{}, func(string) bool { return false }, time.Now())
+
+	if flips != 1 {
+		t.Fatalf("the stuck-active row must be flipped exactly once, got %d", flips)
+	}
+	if len(r.autoFailLog) != spent {
+		t.Fatalf("re-driving an already-budgeted decision must not charge again, spent %d more", len(r.autoFailLog)-spent)
+	}
+	if !r.hasPendingRelease(id) {
+		t.Fatal("the release must stay owned by the retry")
+	}
+}
+
+// The generation is what distinguishes a lifecycle claim from mere lock
+// traffic. Inspection ops (env inject, verification, PID persistence) take
+// the same vm-op lock but bump nothing — a delayed inject against a dead VM
+// must not erase the pending release and strand the record behind a Failed
+// row. And a full round-trip back to the deferred-time state — invisible to
+// any value snapshot — bumps twice, so the retry still voids.
+func TestGenerationSeparatesClaimsFromLockTraffic(t *testing.T) {
+	newRec := func(t *testing.T) (*Reconciler, *VMInstance, string) {
+		t.Helper()
+		stubUnitTerminal(t, false)
+		store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Namespace: "ns-1"}); err != nil {
+			t.Fatal(err)
+		}
+		inst := &VMInstance{ID: "vm-1", Status: StatusPaused}
+		m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		if err := r.markStale(context.Background(), "vm-1", "bolt-orphan:vm-1"); err == nil {
+			t.Fatal("non-terminal unit must defer")
+		}
+		return r, inst, "vm-1"
+	}
+
+	t.Run("an inspection op's lock does not void", func(t *testing.T) {
+		r, _, id := newRec(t)
+		unlock, err := r.mgr.lockVMOp(context.Background(), id) // inject-shaped: lock, no bump
+		if err != nil {
+			t.Fatal(err)
+		}
+		unlock()
+		stubUnitTerminal(t, true)
+		r.retryPendingReleases(context.Background())
+		if r.hasPendingRelease(id) {
+			t.Fatal("the retry must complete: no lifecycle op ever claimed the VM")
+		}
+		if rec, _ := r.mgr.state.Get(id); rec != nil {
+			t.Fatal("the stale record must be released despite intervening lock traffic")
+		}
+	})
+
+	t.Run("a round-trip back to the deferred state still voids", func(t *testing.T) {
+		r, inst, id := newRec(t)
+		inst.mu.Lock()
+		inst.gen++ // resume funnel
+		inst.Status = StatusRunning
+		inst.mu.Unlock()
+		inst.mu.Lock()
+		inst.gen++ // pause funnel: back to Paused, values identical to deferral time
+		inst.Status = StatusPaused
+		inst.mu.Unlock()
+		stubUnitTerminal(t, true)
+		r.retryPendingReleases(context.Background())
+		if rec, _ := r.mgr.state.Get(id); rec == nil {
+			t.Fatal("a claimed VM's record must survive the retry")
+		}
+		if r.hasPendingRelease(id) {
+			t.Fatal("the void must retire the entry")
+		}
+	})
+}
+
+// Drives Drift 3 itself — the earlier version of this test called markStale
+// directly and would have passed with the inverted guards still in runOnce.
+// Two directions: a genuinely stale orphan (Running in memory, as every
+// orphan is) must be stopped; a generation claimed since the pass snapshot
+// must not, even though the pass evidence still says orphan.
+func TestStopOrphanUnits_StaleVsClaimedGeneration(t *testing.T) {
+	newFixture := func(t *testing.T) (*Reconciler, string, *[]string) {
+		t.Helper()
+		stubUnitTerminal(t, true)
+		id := uuid.New().String()
+		inst := &VMInstance{ID: id, Status: StatusRunning} // orphans read Running
+		m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{id: inst}}
+		store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		m.state = store
+		if err := store.Put(VMRecord{ID: id, Status: StatusRunning}); err != nil {
+			t.Fatal(err)
+		}
+		r := NewReconciler(m, DefaultReconcilerConfig())
+		stopped := &[]string{}
+		orig := stopUnitFn
+		stopUnitFn = func(_ context.Context, unit string) error {
+			*stopped = append(*stopped, unit)
+			return nil
+		}
+		t.Cleanup(func() { stopUnitFn = orig })
+		return r, id, stopped
+	}
+	// The pass evidence: unit active, row absent (deleted/missing).
+	drive := func(r *Reconciler, id string) {
+		rows := map[string]db.ListSandboxesByHostRow{}
+		active := map[string]bool{id: true}
+		noErr := func(string) bool { return false }
+		now := time.Now()
+		r.stopOrphanUnits(context.Background(), zerolog.Nop(), rows, active, noErr, now)                          // opens the episode
+		r.stopOrphanUnits(context.Background(), zerolog.Nop(), rows, active, noErr, now.Add(2*r.cfg.GracePeriod)) // grace elapsed
+	}
+
+	t.Run("a stale orphan is stopped despite reading Running", func(t *testing.T) {
+		r, id, stopped := newFixture(t)
+		drive(r, id)
+		if len(*stopped) != 1 {
+			t.Fatalf("the stale orphan must be stopped, got %v", *stopped)
+		}
+	})
+
+	t.Run("a generation claimed since the snapshot is spared", func(t *testing.T) {
+		r, id, stopped := newFixture(t)
+		rows := map[string]db.ListSandboxesByHostRow{}
+		active := map[string]bool{id: true}
+		noErr := func(string) bool { return false }
+		now := time.Now()
+		r.stopOrphanUnits(context.Background(), zerolog.Nop(), rows, active, noErr, now) // episode opens
+		// A resume completes between the pass snapshot and the rule acting.
+		inst := r.mgr.vms[id]
+		inst.mu.Lock()
+		inst.gen++
+		inst.mu.Unlock()
+		r.stopOrphanUnits(context.Background(), zerolog.Nop(), rows, active, noErr, now.Add(2*r.cfg.GracePeriod))
+		if len(*stopped) != 0 {
+			t.Fatalf("a newly claimed generation must not be stopped, got %v", *stopped)
+		}
+	})
+}
+
+// A nil dbSandboxes is a FAILED DB query, not an empty host. Treating absence
+// of evidence as evidence of orphanhood would stop every active production VM
+// on the host, up to the auto-fail budget, on any DB blip.
+func TestStopOrphanUnits_NilDBStopsNothing(t *testing.T) {
+	stubUnitTerminal(t, true)
+	id := uuid.New().String()
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{id: {ID: id, Status: StatusRunning}}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	stopped := 0
+	orig := stopUnitFn
+	stopUnitFn = func(context.Context, string) error { stopped++; return nil }
+	t.Cleanup(func() { stopUnitFn = orig })
+
+	active := map[string]bool{id: true}
+	noErr := func(string) bool { return false }
+	now := time.Now()
+	r.stopOrphanUnits(context.Background(), zerolog.Nop(), nil, active, noErr, now)
+	r.stopOrphanUnits(context.Background(), zerolog.Nop(), nil, active, noErr, now.Add(2*r.cfg.GracePeriod))
+
+	if stopped != 0 {
+		t.Fatalf("a failed DB query must stop nothing, stopped %d units", stopped)
+	}
+}
+
+// Drift 1's terminal probe cannot distinguish a resume-and-repause from the
+// stale original — the new generation's unit is terminal again. Only the
+// episode's identity+generation binding spares the legitimate paused record.
+func TestReapDeadActiveVMs_RepauseABASpared(t *testing.T) {
+	stubUnitTerminal(t, true)
+	origProbe := unitFullyDownProbe
+	unitFullyDownProbe = func(context.Context, string) bool { return true }
+	t.Cleanup(func() { unitFullyDownProbe = origProbe })
+
+	sbID := uuid.New()
+	id := sbID.String()
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	inst := &VMInstance{ID: id, Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{id: inst}}
+	if err := store.Put(VMRecord{ID: id, Status: StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	r.markFailed = func(context.Context, string, db.SandboxStatus) bool { return true }
+	rows := map[string]db.ListSandboxesByHostRow{
+		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+	}
+	noErr := func(string) bool { return false }
+	now := time.Now()
+
+	// Pass 1 opens the episode against the stale generation.
+	r.reapDeadActiveVMs(context.Background(), zerolog.Nop(), rows, map[string]bool{}, noErr, now)
+	// A resume claims and a pause re-parks the SAME instance; its unit is
+	// terminal again and its record legitimately Paused.
+	inst.mu.Lock()
+	inst.gen += 2
+	inst.Status = StatusPaused
+	inst.mu.Unlock()
+	if err := store.Put(VMRecord{ID: id, Status: StatusPaused}); err != nil {
+		t.Fatal(err)
+	}
+	// Pass 2 acts on the stale evidence.
+	r.reapDeadActiveVMs(context.Background(), zerolog.Nop(), rows, map[string]bool{}, noErr, now.Add(2*r.cfg.GracePeriod))
+
+	if rec, _ := store.Get(id); rec == nil || rec.Status != StatusPaused {
+		t.Fatalf("the re-paused generation's record must survive, got %v", rec)
+	}
+}
+
+// A healthy row must heal the drift episode: without it, a later orphan
+// observation against the SAME generation (a row that flapped
+// deleted→active→deleted while the VM ran untouched) inherits the old
+// timestamp and stops the unit without serving its own grace.
+func TestStopOrphanUnits_HealThenRecurServesFreshGrace(t *testing.T) {
+	stubUnitTerminal(t, true)
+	sbID := uuid.New()
+	id := sbID.String()
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{id: {ID: id, Status: StatusRunning}}}
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	m.state = store
+	if err := store.Put(VMRecord{ID: id, Status: StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	stopped := 0
+	orig := stopUnitFn
+	stopUnitFn = func(context.Context, string) error { stopped++; return nil }
+	t.Cleanup(func() { stopUnitFn = orig })
+
+	orphan := map[string]db.ListSandboxesByHostRow{} // row absent
+	healthy := map[string]db.ListSandboxesByHostRow{
+		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+	}
+	active := map[string]bool{id: true}
+	noErr := func(string) bool { return false }
+	now := time.Now()
+
+	r.stopOrphanUnits(context.Background(), zerolog.Nop(), orphan, active, noErr, now)  // opens
+	r.stopOrphanUnits(context.Background(), zerolog.Nop(), healthy, active, noErr, now) // heals
+	// Recurs later, same generation, at a time the ORIGINAL episode would
+	// have long satisfied: only a fresh grace may gate the stop.
+	r.stopOrphanUnits(context.Background(), zerolog.Nop(), orphan, active, noErr, now.Add(3*r.cfg.GracePeriod))
+	if stopped != 0 {
+		t.Fatalf("a recurrence after a heal must serve a fresh grace, stopped %d", stopped)
+	}
+	r.stopOrphanUnits(context.Background(), zerolog.Nop(), orphan, active, noErr, now.Add(5*r.cfg.GracePeriod))
+	if stopped != 1 {
+		t.Fatalf("the recurred orphan must be stopped once its own grace elapses, got %d", stopped)
+	}
+}
+
+// Episodes store a non-owning incarnation id, never the pointer: drift
+// bookkeeping must not root removed instances (disappeared candidates are
+// exactly the ones no loop revisits to clear), and a fresh instance — even
+// one reusing the old address — must never inherit its predecessor's episode.
+func TestDriftEpisodesUseNonOwningIdentity(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	instA := &VMInstance{ID: "vm-1", Status: StatusRunning}
+	m.vms["vm-1"] = instA
+	now := time.Now()
+	r.graceElapsedFor("vm-1", "vm-1", now, r.cfg.GracePeriod) // opens, bound to A
+	if !r.episodeStillCurrent("vm-1", "vm-1") {
+		t.Fatal("the episode must be current for the instance it opened against")
+	}
+
+	// A replacement instance with identical field values (gen included).
+	m.vms["vm-1"] = &VMInstance{ID: "vm-1", Status: StatusRunning}
+	if r.episodeStillCurrent("vm-1", "vm-1") {
+		t.Fatal("a replacement instance must never inherit its predecessor's episode")
+	}
+}
+
+// The reviewer's race: a same-id relaunch completes between the systemd
+// snapshot (unit reads dead) and the DB snapshot (row reads Active) while an
+// old generation's pending release survives. The flip shortcut must verify
+// the pending reap is still current and still a corpse before touching the
+// row — the status-only CAS would otherwise fail the fresh generation, and
+// the orphan rule would then stop its live unit.
+func TestReapDeadActiveVMs_StalePendingDoesNotFailFreshGeneration(t *testing.T) {
+	stubUnitTerminal(t, false) // defer the old generation's release
+	sbID := uuid.New()
+	id := sbID.String()
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	old := &VMInstance{ID: id, Status: StatusRunning}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{id: old}}
+	if err := store.Put(VMRecord{ID: id, Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	if err := r.markStale(context.Background(), id, ""); err == nil {
+		t.Fatal("non-terminal unit must defer")
+	}
+	// The relaunch replaces the instance; its fresh unit is up, its row Active.
+	m.vms[id] = &VMInstance{ID: id, Status: StatusRunning}
+	origProbe := unitFullyDownProbe
+	unitFullyDownProbe = func(context.Context, string) bool { return false } // fresh unit alive
+	t.Cleanup(func() { unitFullyDownProbe = origProbe })
+	flips := 0
+	r.markFailed = func(context.Context, string, db.SandboxStatus) bool { flips++; return true }
+
+	rows := map[string]db.ListSandboxesByHostRow{
+		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+	}
+	// Stale systemd evidence: the pass snapshot predates the relaunch.
+	r.reapDeadActiveVMs(context.Background(), zerolog.Nop(), rows, map[string]bool{}, func(string) bool { return false }, time.Now())
+
+	if flips != 0 {
+		t.Fatalf("the fresh generation's row must not be failed, flipped %d times", flips)
+	}
+	if r.hasPendingRelease(id) {
+		t.Fatal("the stale entry must be voided, not left to ambush later passes")
+	}
+	if rec, _ := store.Get(id); rec == nil {
+		t.Fatal("the fresh generation's record must survive")
+	}
 }

@@ -120,7 +120,7 @@ type Reconciler struct {
 	// driftSeen tracks the first-seen timestamp for each drifted VM so
 	// we can enforce the grace period. Keyed by vmID.
 	mu          sync.Mutex
-	driftSeen   map[string]time.Time
+	driftSeen   map[string]driftEpisode
 	autoFailLog []time.Time // timestamps of recent auto-fail actions
 
 	// passCount counts completed reconcile passes, used to run the disk
@@ -133,18 +133,56 @@ type Reconciler struct {
 	// markFailed flips a sandbox row to failed; a field so rule tests can
 	// capture the flip without a control-plane DB. Defaults to markFailedInDB.
 	markFailed func(ctx context.Context, vmID string, observed db.SandboxStatus) bool
+
+	// pendingRelease holds VMs whose reap was decided and whose unit was
+	// stopped, but whose resource release did not complete. Every drift rule
+	// that reaps a live VM matches on an ACTIVE unit, which its own stop then
+	// retires — so without this set, an abandoned release is never revisited.
+	// The void semantics live on deferredRelease.
+	//
+	// marker is the originating rule's drift key, kept alive across the
+	// deferral: retiring the entry — by completed release OR void — must
+	// retire that marker too, or a LATER episode of the same rule for the
+	// same id inherits the old timestamp and skips its grace period.
+	//
+	// The slot is single-marker by choice. Two accepted, fail-safe edges: a
+	// void racing a fresh episode of the same rule clears that episode's new
+	// timestamp (its grace restarts — delays the reap, favors adoption), and
+	// a second rule deferring the same id overwrites the first rule's marker
+	// (that sliver keeps the stale-timestamp bug). Episode-scoped markers
+	// would close both; neither failure is destructive, so they don't pay
+	// for the machinery.
+	pendingRelease map[string]deferredRelease
 }
 
 // NewReconciler creates a reconciler bound to a Manager.
 func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
 	r := &Reconciler{
-		mgr:          mgr,
-		cfg:          cfg,
-		driftSeen:    make(map[string]time.Time),
-		prevKeptLive: -1,
+		mgr:            mgr,
+		cfg:            cfg,
+		driftSeen:      make(map[string]driftEpisode),
+		pendingRelease: make(map[string]deferredRelease),
+		prevKeptLive:   -1,
 	}
 	r.markFailed = r.markFailedInDB
 	return r
+}
+
+// voidPendingRelease retires a deferred release and all of its episode
+// bookkeeping — entry, prefixed marker, bare-id grace. Shared by the retry's
+// own void exit and the lifecycle-claim hook.
+func (r *Reconciler) voidPendingRelease(vmID string) {
+	r.mu.Lock()
+	e, ok := r.pendingRelease[vmID]
+	if ok {
+		delete(r.pendingRelease, vmID)
+	}
+	r.mu.Unlock()
+	if !ok {
+		return
+	}
+	r.clearDrift(vmID)
+	r.clearDrift(e.marker)
 }
 
 // runTimeout bounds each reconciliation pass so a slow DB or stuck
@@ -384,8 +422,8 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			log.Warn().Str("vm_id", id).Str("drift", "fc_empty_shell").
 				Msg("unit active but Firecracker holds no microVM — stopping the shell and marking failed")
 			err := stopUnit(ctx, systemdUnitName(id))
-			unlockOp()
 			if err != nil {
+				unlockOp()
 				// Leave the row untouched (a failed row behind a live
 				// unit would strand it). Refund the budget slot only when
 				// the stop provably never happened; an accepted-but-
@@ -406,7 +444,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// dead-VM rule). Detach from the pass context, bounded.
 			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			flipped := r.markFailedInDB(persistCtx, id, db.SandboxStatusActive)
-			r.markStale(id)
+			releaseErr := r.markStale(persistCtx, id, "") // under the lock, per its contract
+
+			unlockOp()
+			if releaseErr != nil {
+				r.finalizeRelease(persistCtx, id, "", "", "empty Firecracker shell while DB said active", "fc_empty_shell", releaseErr)
+			}
 			if flipped {
 				r.writeAudit(persistCtx, id, "mark_failed", "empty Firecracker shell while DB said active", "fc_empty_shell")
 			}
@@ -420,6 +463,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	if dbSandboxes == nil {
 		for id, rec := range bolted {
 			if rec.Status != StatusRunning {
+				r.clearDrift(id) // predicate stopped matching; see the Drift 3 heal
 				continue
 			}
 			if active[id] {
@@ -432,64 +476,43 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if errorRecord(id) {
 				continue
 			}
-			if !r.gracePeriodElapsed(id, now) {
+			// A deferred release keeps this rule's predicate true; the retry
+			// owns it now (see hasPendingRelease).
+			if r.hasPendingRelease(id) {
 				continue
 			}
+			if !r.graceElapsedFor(id, id, now, r.cfg.GracePeriod) {
+				continue
+			}
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue // an op owns the VM; the generation voids any pending entry
+			}
+			// A resume-and-repause since the pass snapshot leaves the unit
+			// terminal again; only the episode tells the generations apart.
+			if !r.episodeStillCurrent(id, id) {
+				unlockOp()
+				continue
+			}
+			// No status re-check: this rule's target is a Running record whose
+			// unit is dead, and nothing flips that record when firecracker
+			// exits — reading Running as liveness would veto every reap (the
+			// mistake Drift 1 made). The lock excludes an in-flight op, and
+			// markStale's own terminal probe runs under it.
 			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
 				continue
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "boltdb_running_unit_missing").
 				Msg("dead Firecracker detected (no DB context)")
-			r.markStale(id)
-			r.writeAudit(ctx, id, "stale_cleanup", "VM dead, DB unavailable", "boltdb_running_unit_missing")
+			releaseErr := r.markStale(ctx, id, "")
+			unlockOp()
+			r.finalizeRelease(ctx, id, "", "stale_cleanup", "VM dead, DB unavailable", "boltdb_running_unit_missing", releaseErr)
 		}
 	}
 
 	// Drift 3: systemd unit active, DB says deleted/failed/missing.
-	// `failed` catches restores whose forward-path cleanup didn't run
-	// (e.g., gRPC ctx fired mid-LoadSnapshot and our work continued
-	// after the caller gave up).
-	if dbSandboxes != nil {
-		for id := range active {
-			sb, known := dbSandboxes[id]
-			deleted := known && sb.Sandbox.Status == db.SandboxStatusDeleted
-			failed := known && sb.Sandbox.Status == db.SandboxStatusFailed
-			if known && !deleted && !failed {
-				continue
-			}
-			// Error records are Drift 8's (see Drift 1): its halves gate
-			// every record release on the terminal unit state, which this
-			// branch's stop does not.
-			if errorRecord(id) {
-				continue
-			}
-			if !r.gracePeriodElapsed("orphan:"+id, now) {
-				continue
-			}
-			if !r.consumeAutoFailBudget(id) {
-				r.writeAudit(ctx, id, "budget_exhausted", "orphan_stop suppressed by rate limit", "systemd_active_db_missing")
-				continue
-			}
-			reason := "systemd unit with no DB row"
-			kind := "systemd_active_db_missing"
-			if deleted {
-				reason = "systemd unit for soft-deleted sandbox"
-				kind = "systemd_active_db_deleted"
-			} else if failed {
-				reason = "systemd unit for failed sandbox"
-				kind = "systemd_active_db_failed"
-			}
-			log.Warn().Str("vm_id", id).Str("drift", kind).Msg("orphan systemd unit — stopping")
-			if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
-				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit")
-				continue
-			}
-			removeUnitDropIn(id)
-			r.markStale(id)
-			r.writeAudit(ctx, id, "orphan_stop", reason, kind)
-			r.clearDrift("orphan:" + id)
-		}
-	}
+	r.stopOrphanUnits(ctx, log, dbSandboxes, active, errorRecord, now)
 
 	// Drift 8: BoltDB record in Error but its systemd unit is still active.
 	// Reattach parks an unmanageable VM this way (unit alive, API socket
@@ -518,6 +541,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			r.clearDrift("errunit:" + id)
 			continue
 		}
+		// A prior pass already decided and charged this reap; its deferred
+		// release owns the id now (see hasPendingRelease).
+		if r.hasPendingRelease(id) {
+			unlockOp()
+			continue
+		}
 		if !r.consumeAutoFailBudget(id) {
 			unlockOp()
 			r.writeAudit(ctx, id, "budget_exhausted", "error_unit_stop suppressed by rate limit", "boltdb_error_unit_active")
@@ -539,7 +568,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			continue
 		}
 		removeUnitDropIn(id)
-		staleErr := r.markStale(id)
+		staleErr := r.markStale(ctx, id, "errunit:"+id)
 		unlockOp()
 		// Flip the DB row with the already-grace-qualified reap: Drift 1
 		// cleared its marker while the unit was active, so leaving the row
@@ -589,6 +618,14 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			r.clearDrift("errdead:" + id)
 			return
 		}
+		// A prior pass already decided and charged this reap (the deferral
+		// can arrive here when the active half's stop deferred, or when
+		// markStale's probe went inconclusive after this half's own probe
+		// passed); the retry owns it (see hasPendingRelease).
+		if r.hasPendingRelease(id) {
+			unlockOp()
+			return
+		}
 		// Absence from the active-only snapshot is not terminal — an
 		// activating or deactivating unit still has a process, and markStale
 		// releases the record and namespace. Probe before spending budget.
@@ -612,7 +649,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			unlockOp()
 			return
 		}
-		staleErr := r.markStale(id)
+		staleErr := r.markStale(ctx, id, "errdead:"+id)
 		unlockOp()
 		// Drift 1 skips Error records, so the row flip lands here (still
 		// compare-and-set: a relaunch may own the row by now).
@@ -737,7 +774,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				continue
 			}
 			removeUnitDropIn(id)
-			staleErr := r.markStale(id)
+			staleErr := r.markStale(ctx, id, "unverifiedorphan:"+id)
 			unlockOp()
 			if staleErr != nil {
 				// The unit is stopped but the record, its map entry and its slot
@@ -764,9 +801,18 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// not for every bolted entry.
 		for id := range boltedIDs {
 			if _, ok := dbSandboxes[id]; ok {
+				r.clearDrift("bolt-orphan:" + id) // healed; see Drift 3's twin
 				continue
 			}
-			if !r.gracePeriodElapsed("bolt-orphan:"+id, now) {
+			// A deferred release owns this id (see hasPendingRelease) —
+			// unconditionally: the top-of-pass active snapshot can still read
+			// true for the unit a same-pass Drift 3 just stopped and deferred,
+			// and re-deciding here double-charges the budget. A genuinely
+			// relaunched VM costs one pass: the retry voids its entry.
+			if r.hasPendingRelease(id) {
+				continue
+			}
+			if !r.graceElapsedFor("bolt-orphan:"+id, id, now, r.cfg.GracePeriod) {
 				continue
 			}
 			rec, getErr := r.mgr.state.Get(id)
@@ -781,27 +827,43 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if errorRecord(id) {
 				continue
 			}
+			// Same discipline as Drift 3, and the same reason for no status
+			// re-check.
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			if !r.episodeStillCurrent("bolt-orphan:"+id, id) {
+				unlockOp()
+				continue
+			}
 			// Only stopping a live unit is destructive; charge the budget there.
 			// Gate on the fail-closed `active` snapshot (the pass bailed if systemctl
 			// couldn't be listed) so an inconclusive check never frees a live VM's slot.
 			if active[id] {
 				if !r.consumeAutoFailBudget(id) {
+					unlockOp()
 					r.writeAudit(ctx, id, "budget_exhausted", "orphan_stop suppressed by rate limit", "boltdb_present_db_missing")
 					continue
 				}
 				log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
 					Msg("live orphan systemd unit with no DB row — stopping")
 				if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
+					unlockOp()
 					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit from BoltDB — leaving for retry")
 					continue
 				}
 				removeUnitDropIn(id)
 			}
-			r.markStale(id)
-			r.writeAudit(ctx, id, "stale_cleanup", "BoltDB entry with no DB row", "boltdb_present_db_missing")
-			r.clearDrift("bolt-orphan:" + id)
+			releaseErr := r.markStale(ctx, id, "bolt-orphan:"+id)
+			unlockOp()
+			r.finalizeRelease(ctx, id, "bolt-orphan:"+id, "stale_cleanup", "BoltDB entry with no DB row", "boltdb_present_db_missing", releaseErr)
 		}
 	}
+
+	// Runs last so a deferral recorded by this pass is retried on the next
+	// one, giving a stopped unit time to reach a terminal state in between.
+	r.retryPendingReleases(ctx)
 
 	// Drift 6 (detect-only): per-sandbox dirs on disk with no live row. Runs
 	// on a slower sub-cadence so the filesystem walk doesn't ride every tick.
@@ -1153,14 +1215,34 @@ func (r *Reconciler) gracePeriodElapsed(key string, now time.Time) bool {
 // graceElapsed is gracePeriodElapsed with an explicit window, for drifts whose
 // safe wait differs from the default (see UnverifiedOrphanGrace).
 func (r *Reconciler) graceElapsed(key string, now time.Time, window time.Duration) bool {
+	return r.graceElapsedFor(key, "", now, window)
+}
+
+// graceElapsedFor is graceElapsed binding the episode to vmID's instance
+// identity and generation, so episodeStillCurrent can later tell a continuing
+// drift from a newly claimed generation. An empty vmID opens an unbound
+// episode (rules whose key is not a VM).
+func (r *Reconciler) graceElapsedFor(key, vmID string, now time.Time, window time.Duration) bool {
+	var inst *VMInstance
+	var gen uint64
+	if vmID != "" {
+		r.mgr.mu.RLock()
+		inst = r.mgr.vms[vmID]
+		r.mgr.mu.RUnlock()
+		if inst != nil {
+			inst.mu.RLock()
+			gen = inst.gen
+			inst.mu.RUnlock()
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	firstSeen, ok := r.driftSeen[key]
+	e, ok := r.driftSeen[key]
 	if !ok {
-		r.driftSeen[key] = now
+		r.driftSeen[key] = newDriftEpisode(now, inst, gen)
 		return false
 	}
-	return now.Sub(firstSeen) >= window
+	return now.Sub(e.at) >= window
 }
 
 // statPauseArtifact classifies a pause artifact for the missing-snapshot rule:
@@ -1174,6 +1256,57 @@ var statPauseArtifact = func(path string) (present, confirmedMissing bool) {
 		return true, false
 	}
 	return false, errors.Is(err, os.ErrNotExist)
+}
+
+// driftEpisode is one continuous observation of a drift. It carries the
+// instance identity and lifecycle generation seen when the episode opened:
+// a rule that destroys (stop, release) must confirm under the vm-op lock that
+// its evidence still describes the VM it evaluated. A lifecycle op completing
+// between the pass snapshot and the lock replaces the instance or advances
+// its generation — acting on the stale snapshot would stop the NEW unit, and
+// that destruction lands in this pass, not a later one.
+type driftEpisode struct {
+	at time.Time
+	// inc is the instance's NON-OWNING incarnation identity (see
+	// VMInstance.incarnation): the episode must recognize its instance, not
+	// keep it alive — a pointer here would root the whole VMInstance graph in
+	// driftSeen for every episode whose predicate quietly stopped matching,
+	// since disappeared candidates are exactly the ones no loop revisits to
+	// clear.
+	inc uint64
+	gen uint64
+}
+
+// episodeStillCurrent reports whether key's episode still describes vmID's
+// tracked instance. A changed identity or generation RESTARTS the episode —
+// the drift may well still hold for the new generation, but it must serve its
+// own grace period before anything destructive acts on it. Call under the
+// vm-op lock, before spending budget or stopping.
+func (r *Reconciler) episodeStillCurrent(key, vmID string) bool {
+	r.mgr.mu.RLock()
+	inst := r.mgr.vms[vmID]
+	r.mgr.mu.RUnlock()
+	var gen uint64
+	if inst != nil {
+		inst.mu.RLock()
+		gen = inst.gen
+		inst.mu.RUnlock()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.driftSeen[key]
+	if !ok {
+		return false
+	}
+	if e.inc == inst.incarnationID() && e.gen == gen {
+		return true
+	}
+	r.driftSeen[key] = newDriftEpisode(time.Now(), inst, gen)
+	return false
+}
+
+func newDriftEpisode(at time.Time, inst *VMInstance, gen uint64) driftEpisode {
+	return driftEpisode{at: at, inc: inst.incarnationID(), gen: gen}
 }
 
 // clearDrift removes a drift marker once the VM returns to a healthy state.
@@ -1332,8 +1465,23 @@ func (r *Reconciler) finalizeErrorReap(ctx context.Context, vmID, marker, action
 // A non-nil error means nothing was cleaned up. Rules that stop the unit
 // before calling this must not report success on one: stopping the unit
 // retires the very condition their next pass matches on, so the record is
-// left for the startup reattach sweep rather than another pass.
-func (r *Reconciler) markStale(vmID string) error {
+// left for retryPendingReleases rather than another pass of the rule.
+//
+// Callers must hold vmID's vm-op lock across the call: a resume winning the
+// lock between the terminal probe and the cleanup would have its fresh
+// record deleted and its live namespace reclaimed.
+func (r *Reconciler) markStale(ctx context.Context, vmID, marker string) error {
+	// The release hands this VM's namespace, IP and tap device back to the
+	// pool, so it needs the terminal claim: a nil stopUnit only means the job
+	// finished, and absence from the active-unit snapshot is not terminal
+	// either — either way Firecracker may still hold the tap, and the next VM
+	// would claim a device the old process still owns. Fail-closed, so an
+	// inconclusive probe defers rather than releases.
+	if !unitFullyDownCtx(ctx, systemdUnitName(vmID)) {
+		r.notePendingRelease(vmID, marker)
+		return errUnitNotTerminal
+	}
+
 	// Capture the namespace before deleting the record: a VM whose teardown
 	// didn't run (e.g. a vmd timeout mid-DELETE) would otherwise leak its slot.
 	var namespace string
@@ -1345,6 +1493,8 @@ func (r *Reconciler) markStale(vmID string) error {
 	// cause ReattachAll to resurrect the stale record on next restart, so a
 	// failure here abandons the whole cleanup rather than half-applying it.
 	if err := r.mgr.state.Delete(vmID); err != nil {
+		// Recorded here, not per rule, so every caller inherits the retry.
+		r.notePendingRelease(vmID, marker)
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to delete stale state")
 		return err
 	}
@@ -1360,11 +1510,167 @@ func (r *Reconciler) markStale(vmID string) error {
 
 	r.mu.Lock()
 	delete(r.driftSeen, vmID)
+	delete(r.pendingRelease, vmID)
 	r.mu.Unlock()
 
 	r.mgr.log.Warn().Str("component", "reconciler").Str("vm_id", vmID).
 		Str("action", "mark_stale").Msg("reconciler: cleaned up stale VM record")
 	return nil
+}
+
+// stopUnitFn is the reap rules' destructive stop; a var for tests.
+var stopUnitFn = stopUnit
+
+// unitFullyDownCtx is markStale's terminal-unit oracle, bounded by the
+// caller's ctx so N wedged probes exhaust the pass deadline instead of
+// stacking 2s each past it; a var for tests. An expired ctx fails the probe,
+// which defers — the safe verdict.
+var unitFullyDownCtx = unitFullyDown
+
+// errUnitNotTerminal means the release was deferred, not that it failed: the
+// unit still has a process, so the record and its slot stay owned until a
+// later pass can release them safely.
+var errUnitNotTerminal = errors.New("unit not terminal; release deferred")
+
+// finalizeRelease records a reap's outcome. A deferred or failed release must
+// neither report success nor retire the drift marker: the record and its slot
+// are still held, and retryPendingReleases owns finishing the job. An empty
+// marker is for rules whose only marker markStale clears itself.
+func (r *Reconciler) finalizeRelease(ctx context.Context, vmID, marker, action, reason, driftKind string, releaseErr error) {
+	if releaseErr != nil {
+		r.writeAudit(ctx, vmID, "release_deferred", reason+"; slot still held", driftKind)
+		return
+	}
+	r.writeAudit(ctx, vmID, action, reason, driftKind)
+	if marker != "" {
+		r.clearDrift(marker)
+	}
+}
+
+// deferredRelease is a reap decision awaiting its release. The retry proceeds
+// only while m.vms still holds the EXACT instance observed at deferral AND its
+// lifecycle generation is unchanged: pointer identity detects REPLACEMENT ops
+// (a fresh relaunch swaps the map entry), the generation detects in-place
+// claims — including a round-trip that drives the VM away and back to its
+// deferred-time state, which a value snapshot cannot see. A stale instance is
+// by definition one no lifecycle op touches, so it advances neither.
+type deferredRelease struct {
+	inst   *VMInstance
+	marker string
+	gen    uint64
+}
+
+func (r *Reconciler) notePendingRelease(vmID, marker string) {
+	r.mgr.mu.RLock()
+	inst := r.mgr.vms[vmID]
+	r.mgr.mu.RUnlock()
+	var gen uint64
+	if inst != nil {
+		inst.mu.RLock()
+		gen = inst.gen
+		inst.mu.RUnlock()
+	}
+	r.mu.Lock()
+	e := r.pendingRelease[vmID]
+	e.inst, e.gen, e.marker = inst, gen, marker
+	r.pendingRelease[vmID] = e
+	r.mu.Unlock()
+}
+
+// hasPendingRelease reports a reap already decided for vmID whose release is
+// deferred. Rules whose predicate a deferral preserves (a Running record
+// behind a dead unit) must stand aside for it: re-deciding every pass would
+// re-charge the auto-fail budget — one wedged record drains the host's whole
+// budget in minutes — and re-audit a decision retryPendingReleases already owns.
+func (r *Reconciler) hasPendingRelease(vmID string) bool {
+	r.mu.Lock()
+	_, ok := r.pendingRelease[vmID]
+	r.mu.Unlock()
+	return ok
+}
+
+// pendingReleaseCurrent reports whether id's deferred entry still describes
+// the tracked instance — same identity+generation verdict the retry uses.
+// Callers hold the vm-op lock; a false verdict means a lifecycle op claimed
+// the VM since the reap was decided, and the entry must be voided, not acted.
+func (r *Reconciler) pendingReleaseCurrent(id string) bool {
+	r.mu.Lock()
+	noted, ok := r.pendingRelease[id]
+	r.mu.Unlock()
+	if !ok {
+		return false
+	}
+	r.mgr.mu.RLock()
+	cur := r.mgr.vms[id]
+	r.mgr.mu.RUnlock()
+	if cur != noted.inst {
+		return false
+	}
+	if cur == nil {
+		return true
+	}
+	cur.mu.RLock()
+	same := cur.gen == noted.gen
+	cur.mu.RUnlock()
+	return same
+}
+
+func (r *Reconciler) pendingReleaseIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := make([]string, 0, len(r.pendingRelease))
+	for id := range r.pendingRelease {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// retryPendingReleases finishes reaps whose resource release was abandoned.
+// It takes no destructive decision of its own — the rule that stopped the unit
+// already made and budgeted that call — so it charges no budget and waits out
+// no grace: charging again would let one broken store drain the host's budget
+// and suppress unrelated drift.
+func (r *Reconciler) retryPendingReleases(ctx context.Context) {
+	r.mu.Lock()
+	snapshot := make(map[string]deferredRelease, len(r.pendingRelease))
+	for id, e := range r.pendingRelease {
+		snapshot[id] = e
+	}
+	r.mu.Unlock()
+	for id, noted := range snapshot {
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue
+		}
+		// Identity AND an unchanged lifecycle generation decide the void —
+		// see deferredRelease for why either alone is insufficient.
+		r.mgr.mu.RLock()
+		cur := r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		claimed := false
+		if cur != nil && cur == noted.inst {
+			cur.mu.RLock()
+			claimed = cur.gen != noted.gen
+			cur.mu.RUnlock()
+		}
+		if cur != noted.inst || claimed {
+			// Voids retire the episode's timestamps (see pendingRelease): the
+			// prefixed marker, and the bare id — Drift 1/2 grace under the bare
+			// id and defer with marker "", relying on markStale to clear it,
+			// which a void never runs. Leaving either hands its elapsed grace
+			// to the id's next episode.
+			unlockOp()
+			r.voidPendingRelease(id)
+			continue
+		}
+		err := r.markStale(ctx, id, noted.marker)
+		unlockOp()
+		if err != nil {
+			continue // still unreleasable; the entry survives for the next pass
+		}
+		r.clearDrift(noted.marker)
+		r.writeAudit(ctx, id, "stale_cleanup", "deferred release completed on a later pass", "release_retry")
+	}
 }
 
 // reapDeadActiveVMs is Drift 1's body: DB says active, systemd says the unit
@@ -1374,6 +1680,9 @@ func (r *Reconciler) markStale(vmID string) error {
 func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool, errorRecord func(string) bool, now time.Time) {
 	for id, sb := range dbSandboxes {
 		if sb.Sandbox.Status != db.SandboxStatusActive {
+			// The predicate stopped matching; retire the episode so a later
+			// recurrence serves its own grace (see the Drift 3 heal).
+			r.clearDrift(id)
 			continue
 		}
 		if active[id] {
@@ -1387,7 +1696,35 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 		if errorRecord(id) {
 			continue
 		}
-		if !r.gracePeriodElapsed(id, now) {
+		// A deferred release owns the release half of this reap (see
+		// hasPendingRelease) — but only the release: nobody else moves a
+		// stuck-active row off a dead VM, so the flip re-drives here,
+		// uncharged (same decision, already budgeted) and CAS-guarded.
+		// Only for a reap that is still CURRENT and still a corpse, verified
+		// under the lock: a same-id relaunch can complete between the systemd
+		// snapshot (unit reads dead) and the DB snapshot (row reads Active),
+		// and the status-only CAS would happily fail the fresh generation.
+		if r.hasPendingRelease(id) {
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			if !r.pendingReleaseCurrent(id) {
+				unlockOp()
+				r.voidPendingRelease(id)
+				continue
+			}
+			if !unitFullyDownProbe(ctx, systemdUnitName(id)) {
+				unlockOp()
+				continue
+			}
+			if r.markFailed(ctx, id, db.SandboxStatusActive) {
+				r.writeAudit(ctx, id, "mark_failed", "VM dead while DB said active", "db_active_systemd_missing")
+			}
+			unlockOp()
+			continue
+		}
+		if !r.graceElapsedFor(id, id, now, r.cfg.GracePeriod) {
 			continue
 		}
 		// Lock before spending budget, then re-probe the UNIT under it —
@@ -1395,9 +1732,15 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 		// firecracker dies out from under vmd, so a stale Running instance
 		// is the very state this rule cleans up. A resume that relaunched
 		// mid-pass owns a live unit again, which this probe sees; an
-		// inconclusive probe defers to the next pass.
+		// inconclusive probe defers to the next pass. The probe alone cannot
+		// see a resume-and-repause — the new generation's unit is terminal
+		// again — so the episode check guards the release.
 		unlockOp, ok := r.mgr.tryLockVMOp(id)
 		if !ok {
+			continue
+		}
+		if !r.episodeStillCurrent(id, id) {
+			unlockOp()
 			continue
 		}
 		if !unitFullyDownProbe(ctx, systemdUnitName(id)) {
@@ -1415,7 +1758,7 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 		log.Warn().Str("vm_id", id).Str("drift", "db_active_systemd_missing").
 			Msg("DB says active but VM is dead — marking failed")
 		flipped := r.markFailed(ctx, id, db.SandboxStatusActive)
-		staleErr := r.markStale(id)
+		staleErr := r.markStale(ctx, id, "")
 		unlockOp()
 		if staleErr != nil {
 			// The row is failed but the record and slot are still held, and
@@ -1493,5 +1836,80 @@ func (r *Reconciler) failMissingSnapshots(ctx context.Context, log zerolog.Logge
 		}
 		r.writeAudit(ctx, id, "mark_failed", "snapshot file missing", "paused_snapshot_missing")
 		r.clearDrift("paused:" + id)
+	}
+}
+
+// stopOrphanUnits is Drift 3's body: a live unit whose control-plane row is
+// deleted, failed or missing. Extracted so the lock/episode race is testable
+// — the rule must stop a genuinely stale orphan and must NOT stop a unit
+// whose generation was claimed since the pass snapshot.
+func (r *Reconciler) stopOrphanUnits(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool, errorRecord func(string) bool, now time.Time) {
+	// This rule's ONLY evidence that a unit is an orphan is its DB row being
+	// deleted/failed/absent. A nil map is a FAILED QUERY, not an empty host —
+	// treating it as absence would classify every active unit as an orphan
+	// and stop production VMs up to the budget on any DB blip. Fail closed.
+	if dbSandboxes == nil {
+		return
+	}
+	for id := range active {
+		sb, known := dbSandboxes[id]
+		deleted := known && sb.Sandbox.Status == db.SandboxStatusDeleted
+		failed := known && sb.Sandbox.Status == db.SandboxStatusFailed
+		if known && !deleted && !failed {
+			// A healthy row heals the episode. Without this, a later orphan
+			// observation against the SAME generation (a row that flapped)
+			// inherits the old timestamp and acts without its grace.
+			r.clearDrift("orphan:" + id)
+			continue
+		}
+		// Error records are Drift 8's (see Drift 1): its halves gate
+		// every record release on the terminal unit state, which this
+		// branch's stop does not.
+		if errorRecord(id) {
+			continue
+		}
+		if !r.graceElapsedFor("orphan:"+id, id, now, r.cfg.GracePeriod) {
+			continue
+		}
+		// Lock before budget or the stop, so an in-flight create/resume
+		// (which holds it) is never killed mid-flight — and confirm under
+		// the lock that the episode still describes the instance it was
+		// opened against. No status re-check: an orphan that reached
+		// Running stays Running in memory until this rule stops it, so
+		// reading that as liveness would veto every reap (the Drift 1
+		// mistake); identity+generation is what distinguishes a stale
+		// orphan from a generation claimed since the pass snapshot.
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue
+		}
+		if !r.episodeStillCurrent("orphan:"+id, id) {
+			unlockOp()
+			continue
+		}
+		if !r.consumeAutoFailBudget(id) {
+			unlockOp()
+			r.writeAudit(ctx, id, "budget_exhausted", "orphan_stop suppressed by rate limit", "systemd_active_db_missing")
+			continue
+		}
+		reason := "systemd unit with no DB row"
+		kind := "systemd_active_db_missing"
+		if deleted {
+			reason = "systemd unit for soft-deleted sandbox"
+			kind = "systemd_active_db_deleted"
+		} else if failed {
+			reason = "systemd unit for failed sandbox"
+			kind = "systemd_active_db_failed"
+		}
+		log.Warn().Str("vm_id", id).Str("drift", kind).Msg("orphan systemd unit — stopping")
+		if err := stopUnitFn(ctx, systemdUnitName(id)); err != nil {
+			unlockOp()
+			log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit")
+			continue
+		}
+		removeUnitDropIn(id)
+		releaseErr := r.markStale(ctx, id, "orphan:"+id)
+		unlockOp()
+		r.finalizeRelease(ctx, id, "orphan:"+id, "orphan_stop", reason, kind, releaseErr)
 	}
 }
