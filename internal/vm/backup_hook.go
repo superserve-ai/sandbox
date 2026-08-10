@@ -590,9 +590,17 @@ func (m *Manager) RenewPendingStaging(log zerolog.Logger) {
 		return
 	}
 	for _, pb := range pending {
-		if pb.StagedDir != "" {
-			backup.RenewStaged(pb.StagedDir)
+		if pb.StagedDir == "" {
+			continue
 		}
+		// A marker persisted with its final generation path just before a
+		// crash prevented the rename that creates it (see
+		// resolveStagedLocation) names a directory that does not exist
+		// yet; renewing that path touches nothing, leaving the real
+		// pending-token directory that still holds the artifacts
+		// unrenewed and indistinguishable from an orphan to the sweep.
+		resolved := m.resolveStagedLocation(pb)
+		backup.RenewStaged(resolved.StagedDir)
 	}
 }
 

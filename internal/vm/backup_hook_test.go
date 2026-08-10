@@ -1221,6 +1221,70 @@ func TestRenewPendingStagingProtectsMarkerFromStartupSweep(t *testing.T) {
 	}
 }
 
+// enqueueStagedPending persists the marker's final generation path
+// BEFORE FinishPendingStage performs the rename that creates it: a
+// crash in that window leaves a durable marker naming a directory that
+// does not exist yet, while the staged bytes still live under the
+// original pending-token directory. Renewing the marker's (nonexistent)
+// final path touches nothing, so RenewPendingStaging must fall back to
+// the pending-token directory the same way resolveStagedLocation does,
+// or the sweep reaps the real artifacts as an untouched orphan.
+func TestRenewPendingStagingResolvesPersistBeforeRenameWindow(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	vmID := "vm-1"
+	pendingDir := filepath.Join(staging, vmID, "pending-tok1")
+	if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), []byte("bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pendingDir, "rootfs.ext4"), []byte("bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(pendingDir, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	finalDir := filepath.Join(staging, vmID, "generation-abc")
+	marker := PendingBackup{
+		VMID:         vmID,
+		Token:        "tok1",
+		StagedDir:    finalDir,
+		SnapshotPath: filepath.Join(finalDir, "vmstate.snap"),
+		DiskPath:     filepath.Join(finalDir, "rootfs.ext4"),
+	}
+	if err := st.PutPendingBackup(marker); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{state: st}
+	m.RenewPendingStaging(zerolog.Nop())
+
+	jdb, err := bolt.Open(filepath.Join(dir, "journal.db"), 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jdb.Close()
+	journal, err := backup.NewJournal(jdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup.SweepStaging(staging, journal, zerolog.Nop())
+
+	if _, err := os.Stat(pendingDir); err != nil {
+		t.Fatalf("pending-token dir removed by startup sweep despite a live durable marker resolvable through the persist-before-rename fallback: %v", err)
+	}
+}
+
 // The at-rest oracle must see the cgroup side: a cgroup VM has no systemd
 // unit, so the unit probe alone would read it vacuously dead and back up
 // bytes still in flight. A populated group is NOT at rest; a conclusively-
