@@ -118,7 +118,15 @@ func collectVMStateEntry(ctx context.Context, snapshotPath string, log zerolog.L
 // budget or fails to hash is likewise skipped with a warning rather than
 // failing the pause; the control plane never publishes a partial total as
 // the snapshot size.
-func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBasePath string, log zerolog.Logger) []ManifestEntry {
+//
+// diskBasePath is what actually gets read for the base digest: the
+// pause-time pin when the staged flow has one, the shared original
+// otherwise. diskBaseKeyPath is what the digest cache and coalescing
+// group key on, always the shared original regardless of which one
+// diskBasePath is — a batch of overlay pauses against the same template
+// each mint their own unique pin, and keying on that would make every
+// one of them pay its own full-base hash instead of sharing one.
+func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBasePath, diskBaseKeyPath string, log zerolog.Logger) []ManifestEntry {
 	budget, ok := hashBudget(ctx)
 	if !ok {
 		log.Warn().Msg("pause manifest: no hashing budget left before RPC deadline, skipping")
@@ -129,7 +137,7 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 
 	start := time.Now()
 	entries := make([]ManifestEntry, 0, 2)
-	add := func(name, path, basePath string) {
+	add := func(name, path, basePath, baseKeyPath string) {
 		if path == "" {
 			return
 		}
@@ -140,7 +148,7 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 		}
 		var baseSum string
 		if basePath != "" {
-			baseSum, err = baseDigest(hctx, basePath)
+			baseSum, err = baseDigest(hctx, basePath, baseKeyPath)
 			if err != nil {
 				log.Warn().Err(err).Str("path", basePath).
 					Msg("pause manifest: base digest failed, entry skipped")
@@ -158,8 +166,8 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 	}
 	// vmstate first: tiny and guaranteed inside any budget, so even a
 	// budget-exhausted pause records something verifiable.
-	add("vmstate.snap", snapshotPath, "")
-	add("rootfs.ext4", diskPath, diskBasePath)
+	add("vmstate.snap", snapshotPath, "", "")
+	add("rootfs.ext4", diskPath, diskBasePath, diskBaseKeyPath)
 	log.Info().
 		Int("files", len(entries)).
 		Int64("manifest_hash_ms", time.Since(start).Milliseconds()).
@@ -197,14 +205,38 @@ var baseDigestCache sync.Map
 // base must produce one hash, not one per pause.
 var baseDigestGroup singleflight.Group
 
-// baseDigest returns the content digest of a base image, cached. The
-// identity is re-checked after hashing: a base swapped mid-hash yields
-// an error (and an incomplete manifest, which the retry path owns)
-// rather than a digest describing bytes of two different files.
-func baseDigest(ctx context.Context, path string) (string, error) {
-	key, err := baseIdentity(path)
+// baseDigest returns the content digest of a base image, cached and
+// coalesced by keyPath while the bytes are actually read from readPath.
+// These differ for a staged pause: readPath is the pause-time pin (a
+// hard link, unique per pause and immutable), keyPath is the shared
+// template original every pause of that template has in common. Keying
+// the cache on readPath instead would make each pin its own cache entry
+// and defeat coalescing entirely — a batch of overlay pauses against one
+// cold base would each pay their own full hash instead of sharing one.
+//
+// The identity is re-checked against keyPath after hashing only when
+// readPath == keyPath (no pin): that guards against the shared original
+// mutating mid-hash, a race a hard-linked pin cannot have, since its
+// bytes cannot change out from under it. Skipping the recheck when
+// pinned also means a keyPath deleted after the read (template GC) is
+// not treated as an error — the bytes this call already has came from
+// the pin, not the now-gone original.
+func baseDigest(ctx context.Context, readPath, keyPath string) (string, error) {
+	key, err := baseIdentity(keyPath)
 	if err != nil {
-		return "", err
+		if readPath == keyPath {
+			return "", err
+		}
+		// The shared original can be gone (template GC after a destroy)
+		// even though the pause-time pin at readPath still holds valid,
+		// unchanged bytes: key on the pin instead. This hash then isn't
+		// shared with sibling pauses of the same template, but it must
+		// still succeed — surviving exactly this is the whole reason a
+		// pin exists.
+		key, err = baseIdentity(readPath)
+		if err != nil {
+			return "", err
+		}
 	}
 	if v, ok := baseDigestCache.Load(key); ok {
 		return v.(string), nil
@@ -221,16 +253,18 @@ func baseDigest(ctx context.Context, path string) (string, error) {
 		}
 		hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 		defer cancel()
-		sum, _, err := backup.HashFileApparent(hctx, path)
+		sum, _, err := backup.HashFileApparent(hctx, readPath)
 		if err != nil {
 			return "", err
 		}
-		after, err := baseIdentity(path)
-		if err != nil {
-			return "", err
-		}
-		if after != key {
-			return "", fmt.Errorf("base image %s changed while hashing", path)
+		if readPath == keyPath {
+			after, err := baseIdentity(keyPath)
+			if err != nil {
+				return "", err
+			}
+			if after != key {
+				return "", fmt.Errorf("base image %s changed while hashing", keyPath)
+			}
 		}
 		baseDigestCache.Store(key, sum)
 		return sum, nil

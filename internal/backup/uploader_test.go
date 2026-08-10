@@ -1777,6 +1777,32 @@ func TestCopyExtentContextHonorsCancellationBetweenChunks(t *testing.T) {
 	}
 }
 
+// fsync has no native cancellation; syncWithContext bounds it by ctx so
+// a slow or contended disk cannot block the RPC path's pause lock past
+// its deadline the way the size threshold and the copy's own bound
+// alone cannot.
+func TestSyncWithContextHonorsCancellation(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.CreateTemp(dir, "sync-ctx-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString("bytes"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	err = syncWithContext(ctx, f)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("syncWithContext blocked %v under a canceled context", elapsed)
+	}
+}
+
 func statIdentity(t *testing.T, path string) (dev, ino uint64, ctime syscall.Timespec) {
 	t.Helper()
 	fi, err := os.Stat(path)

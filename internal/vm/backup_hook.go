@@ -252,7 +252,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 			return
 		}
 	}
-	retried := collectPauseManifest(rctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, log)
+	retried := collectPauseManifest(rctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, pb.DiskBasePath, log)
 	if pb.DiskBasePath != "" {
 		// Re-check AFTER hashing too: the disk hash can run for minutes,
 		// and a base swapped inside that window would have been stat'ed
@@ -413,7 +413,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 			}
 		}
 	}
-	entries := collectPauseManifest(ctx, pb.SnapshotPath, pb.DiskPath, baseSrc, log)
+	entries := collectPauseManifest(ctx, pb.SnapshotPath, pb.DiskPath, baseSrc, pb.DiskBasePath, log)
 	if !pauseManifestComplete(entries) {
 		log.Warn().Str("vm_id", pb.VMID).
 			Msg("staged pause backup hash failed transiently; keeping pending record")

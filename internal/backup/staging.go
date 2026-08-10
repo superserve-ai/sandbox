@@ -445,7 +445,13 @@ func snapshotFile(ctx context.Context, dst, src string) error {
 	// FIRST, or a power loss can leave a journal pointing at a missing
 	// or torn staged file, which a restart would misread as an abandoned
 	// source.
-	if err := out.Sync(); err != nil {
+	//
+	// fsync has no native cancellation, so a slow or contended disk can
+	// block here regardless of the now-cancellable copy above; bound it
+	// by the caller's context the same way, giving up on blocking the
+	// RPC path's pause lock past its deadline even though the syscall
+	// itself keeps running in the background.
+	if err := syncWithContext(ctx, out); err != nil {
 		out.Close()
 		os.Remove(tmp)
 		return err
@@ -483,6 +489,22 @@ func copyExtentContext(ctx context.Context, dst io.Writer, src io.Reader) (int64
 			}
 			return total, err
 		}
+	}
+}
+
+// syncWithContext bounds an fsync by ctx. fsync has no native
+// cancellation: on timeout the underlying syscall keeps running against
+// f in the background (leaked, not aborted) while this returns ctx's
+// error, so a slow disk stops blocking the caller without pretending
+// the durability write was actually cut short.
+func syncWithContext(ctx context.Context, f *os.File) error {
+	done := make(chan error, 1)
+	go func() { done <- f.Sync() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
