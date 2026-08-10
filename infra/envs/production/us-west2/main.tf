@@ -50,9 +50,7 @@ locals {
 
   api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
 
-  # Promotion switch: the control plane dials whichever host this selects.
-  # Flipping active_sandbox_host to "standby" (tfvars) and applying is the
-  # whole cutover — the API redeploys pointed at the standby's IP.
+  # The control plane dials whichever host active_sandbox_host selects.
   active_vmd_ip = var.active_sandbox_host == "standby" ? module.sandbox_host_b.internal_ip : module.sandbox_host.internal_ip
 }
 module "network" {
@@ -212,7 +210,7 @@ module "sandbox_host" {
   })
 
   service_account_email = data.google_service_account.api_runner.email
-  # 24.04 images are only published under the -amd64 family (see sandbox_host_b).
+  # 24.04 images are only published under the -amd64 family.
   boot_disk_image     = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
   boot_disk_size_gb   = 250
   can_ip_forward      = false
@@ -224,11 +222,9 @@ module "sandbox_host" {
   }
 }
 
-# Second host for the cell: a cold standby, normally kept stopped.
-# While not in service it is labeled vmd-usw2-2 instead of vmd so auto-deploys
-# skip it. Promotion = set active_sandbox_host = "standby" and apply: the one
-# switch routes the control plane here AND relabels the host into the deploy
-# fleet, so neither half can be forgotten or reverted by a later apply.
+# Cold standby for the cell, normally kept stopped. Promotion = set
+# active_sandbox_host = "standby" and apply: routes the control plane here and
+# relabels the host into the component=vmd deploy fleet.
 module "sandbox_host_b" {
   source = "../../../modules/sandbox-host"
 
@@ -249,12 +245,9 @@ module "sandbox_host_b" {
   })
 
   service_account_email = data.google_service_account.api_runner.email
-  # The pre-24.04 family aliases without an arch suffix are gone; 24.04 images
-  # are only published under the -amd64 family.
-  boot_disk_image   = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
-  boot_disk_size_gb = 250
-  # Metal machine types reject the API-default pd-standard boot disk; Hyperdisk
-  # is required (see the boot_disk_type variable note).
+  boot_disk_image       = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  boot_disk_size_gb     = 250
+  # Metal machine types reject the API-default pd-standard boot disk.
   boot_disk_type      = "hyperdisk-balanced"
   can_ip_forward      = false
   on_host_maintenance = "TERMINATE"
@@ -277,8 +270,7 @@ module "observability" {
       instance_name = module.sandbox_host.instance_name
       instance_id   = module.sandbox_host.instance_id
     }
-    # Inert while the standby is stopped (no data, no fire); in place so a
-    # promoted host is covered without a separate observability change.
+    # Inert while the standby is stopped (no data, no fire).
     sandbox_host_b = {
       display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / CPU saturation"
       instance_name = module.sandbox_host_b.instance_name
