@@ -747,6 +747,12 @@ type PendingBackup struct {
 	// cannot mutate a snapshot, so an immediately-resumed pause still
 	// gets its backup.
 	StagedDir string `json:"staged_dir,omitempty"`
+	// SnapshotIdentity is SnapshotPath's stat identity captured when the
+	// marker was created. A VM's snapshot path is fixed across pauses, so
+	// a resume-then-pause reuses the exact same pathname; only identity
+	// distinguishes a genuine RPC retry (same bytes) from a distinct pause
+	// that overwrote them, and the marker-reuse check is load-bearing on it.
+	SnapshotIdentity string `json:"snapshot_identity,omitempty"`
 }
 
 // PutPendingBackup records (or refreshes) a pause's owed backup.

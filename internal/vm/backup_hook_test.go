@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/superserve-ai/sandbox/internal/backup"
 )
@@ -1109,6 +1110,114 @@ func TestRetryPauseReusesExistingStagedMarker(t *testing.T) {
 	}
 	if pendings != 1 {
 		t.Fatalf("pending dirs = %d, want the retry to reuse the first copy", pendings)
+	}
+}
+
+// A VM's snapshot path is fixed across pauses (always vmstate.snap under
+// its snapshot dir), so a resume followed by a second pause reuses the
+// exact same pathname as a still-pending marker from the first pause.
+// Matching reuse on path alone would mistake the second pause for a
+// retry of the first and skip staging its actual disk state, silently
+// losing the newer pause. Only the snapshot file's identity (which
+// changes when the second pause overwrites it) can tell them apart.
+//
+// Exercises reusablePendingBackup directly rather than through
+// backupPause's full async path: the staged flow's worker needs no
+// at-rest proof and can rename the pending directory away before a test
+// gets to inspect it, so asserting on directory names on disk races the
+// worker instead of testing the reuse decision itself.
+func TestReusablePendingBackupRejectsDistinctPauseAtSamePath(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	stagedDisk := filepath.Join(dir, "staged-rootfs.ext4")
+	if err := os.WriteFile(snap, []byte("first-pause-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stagedDisk, []byte("bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	firstIdentity, err := baseIdentity(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := PendingBackup{
+		VMID:             "vm-1",
+		StagedDir:        filepath.Join(dir, "pending-tok1"),
+		OrigSnapshotPath: snap,
+		DiskPath:         stagedDisk,
+		SnapshotIdentity: firstIdentity,
+	}
+	if err := st.PutPendingBackup(marker); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{state: st}
+
+	if _, ok := m.reusablePendingBackup("vm-1", snap); !ok {
+		t.Fatal("an RPC retry of the same unchanged pause must reuse the existing marker")
+	}
+
+	// A resume followed by a genuinely new pause overwrites the fixed
+	// vmstate.snap pathname with different bytes (different size, so
+	// identity differs regardless of filesystem mtime resolution).
+	if err := os.WriteFile(snap, []byte("second-pause-bytes-are-longer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.reusablePendingBackup("vm-1", snap); ok {
+		t.Fatal("a distinct second pause at the same path must not reuse the first pause's stale marker")
+	}
+}
+
+// The startup staging sweep runs synchronously, ahead of reattach and
+// therefore ahead of RecoverPendingBackups: a durable marker that
+// outlived a vmd outage longer than the sweep's orphan horizon has had
+// no worker to renew its staging directory's mtime, so without an
+// explicit renewal pass the sweep reads it as an abandoned directory
+// and deletes it out from under a still-live marker.
+func TestRenewPendingStagingProtectsMarkerFromStartupSweep(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	vmID := "vm-1"
+	pendingDir := filepath.Join(staging, vmID, "pending-tok1")
+	if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(pendingDir, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.PutPendingBackup(PendingBackup{VMID: vmID, StagedDir: pendingDir, Token: "tok1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{state: st}
+	m.RenewPendingStaging(zerolog.Nop())
+
+	jdb, err := bolt.Open(filepath.Join(dir, "journal.db"), 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jdb.Close()
+	journal, err := backup.NewJournal(jdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup.SweepStaging(staging, journal, zerolog.Nop())
+
+	if _, err := os.Stat(pendingDir); err != nil {
+		t.Fatalf("pending dir removed by startup sweep despite a live durable marker: %v", err)
 	}
 }
 

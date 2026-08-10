@@ -516,9 +516,13 @@ func baseSHAFromEntries(entries []ManifestEntry) string {
 }
 
 // reusablePendingBackup returns the live marker covering this exact
-// pause (same original snapshot path, staged copies still present), so
-// a control-plane retry of the pause reuses the first copy instead of
-// staging a second.
+// pause (same original snapshot path AND same snapshot file identity,
+// staged copies still present), so a control-plane retry of the pause
+// reuses the first copy instead of staging a second. The identity check
+// is load-bearing: a VM's snapshot path is fixed across pauses, so a
+// resume-then-pause-again reuses the exact same pathname as a still-live
+// marker from the earlier pause, and matching on path alone would treat
+// that distinct pause as a retry and skip staging its actual disk state.
 func (m *Manager) reusablePendingBackup(vmID, snapshotPath string) (PendingBackup, bool) {
 	if m.state == nil {
 		return PendingBackup{}, false
@@ -528,6 +532,10 @@ func (m *Manager) reusablePendingBackup(vmID, snapshotPath string) (PendingBacku
 		return PendingBackup{}, false
 	}
 	if prev.OrigSnapshotPath != snapshotPath || fileMissing(prev.DiskPath) {
+		return PendingBackup{}, false
+	}
+	id, err := baseIdentity(snapshotPath)
+	if err != nil || prev.SnapshotIdentity == "" || id != prev.SnapshotIdentity {
 		return PendingBackup{}, false
 	}
 	return prev, true
@@ -562,6 +570,30 @@ func (m *Manager) dropStagedPending(pb PendingBackup, log zerolog.Logger) {
 		_ = os.RemoveAll(pb.StagedDir)
 	}
 	m.deletePendingBackupIf(pb, log)
+}
+
+// RenewPendingStaging refreshes the staging mtime of every durable
+// pending-backup marker's staged directory. Call BEFORE the startup
+// staging sweep, which runs synchronously ahead of reattach and thus
+// ahead of RecoverPendingBackups: a marker that outlived the process by
+// more than the sweep's orphan horizon is otherwise indistinguishable
+// from an abandoned directory, and the sweep deletes it — discarding the
+// only durable copy of an otherwise-recoverable pause. Needs only the
+// BoltDB state (no instance map), so it's safe to call this early.
+func (m *Manager) RenewPendingStaging(log zerolog.Logger) {
+	if m.state == nil {
+		return
+	}
+	pending, err := m.state.ListPendingBackups()
+	if err != nil {
+		log.Warn().Err(err).Msg("renew pending staging: list failed")
+		return
+	}
+	for _, pb := range pending {
+		if pb.StagedDir != "" {
+			backup.RenewStaged(pb.StagedDir)
+		}
+	}
 }
 
 // RecoverPendingBackups re-runs every pause that still owed its backup
@@ -693,8 +725,10 @@ func (m *Manager) healPendingBackup(pb PendingBackup, log zerolog.Logger) {
 }
 
 // newPendingBackup builds a marker for a pause's owed backup, capturing
-// the overlay base's stat identity at creation so the rehash can prove
-// it is hashing the pause-time base and not a same-path replacement.
+// the overlay base's and the snapshot's stat identity at creation so the
+// rehash can prove it is hashing the pause-time base and not a
+// same-path replacement, and so a later pause of the same VM (fixed
+// snapshot pathname) can be told apart from a retry of this one.
 func newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath string) PendingBackup {
 	pb := PendingBackup{
 		VMID: vmID, SnapshotPath: snapshotPath, DiskPath: diskPath, DiskBasePath: diskBasePath,
@@ -704,6 +738,9 @@ func newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath string) Pending
 		if id, err := baseIdentity(diskBasePath); err == nil {
 			pb.BaseIdentity = id
 		}
+	}
+	if id, err := baseIdentity(snapshotPath); err == nil {
+		pb.SnapshotIdentity = id
 	}
 	return pb
 }

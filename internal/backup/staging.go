@@ -67,7 +67,7 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 		staged := filepath.Join(dir, f.Name)
 		if renewedExists(staged) {
 			task.Files[i].Path = staged
-		} else if err := snapshotFileMode(staged, f.Path, cloneOnly); err != nil {
+		} else if err := snapshotFileMode(context.Background(), staged, f.Path, cloneOnly); err != nil {
 			if cloneOnly {
 				all = false
 			} else {
@@ -172,7 +172,7 @@ func StagePending(ctx context.Context, root, vmID, token, basePath string, files
 			return "", nil, err
 		}
 		dst := filepath.Join(dir, name)
-		if err := snapshotFileMode(dst, src, false); err != nil {
+		if err := snapshotFileMode(ctx, dst, src, false); err != nil {
 			_ = os.RemoveAll(dir)
 			return "", nil, err
 		}
@@ -243,7 +243,7 @@ func StageSharedBase(root, basePath, baseSHA string, cloneOnly bool) (string, er
 	if renewedExists(stagedBase) {
 		return stagedBase, nil
 	}
-	if err := snapshotFileMode(stagedBase, basePath, cloneOnly); err != nil {
+	if err := snapshotFileMode(context.Background(), stagedBase, basePath, cloneOnly); err != nil {
 		return "", err
 	}
 	if err := syncDir(basesDir); err != nil {
@@ -277,7 +277,7 @@ var stagingFlights singleflight.Group
 
 // snapshotFileMode is snapshotFile with an optional clone-only mode
 // that fails fast instead of copying bytes.
-func snapshotFileMode(dst, src string, cloneOnly bool) error {
+func snapshotFileMode(ctx context.Context, dst, src string, cloneOnly bool) error {
 	_, err, _ := stagingFlights.Do(dst, func() (any, error) {
 		if _, err := os.Stat(dst); err == nil {
 			return nil, nil // a concurrent flight already published it
@@ -285,7 +285,7 @@ func snapshotFileMode(dst, src string, cloneOnly bool) error {
 		if cloneOnly {
 			return nil, snapshotClone(dst, src)
 		}
-		return nil, snapshotFile(dst, src)
+		return nil, snapshotFile(ctx, dst, src)
 	})
 	return err
 }
@@ -325,7 +325,7 @@ func snapshotClone(dst, src string) error {
 // snapshotFile copies src to dst preserving sparseness, via reflink
 // clone when available. Written to a temp name and renamed so a crash
 // mid-copy never leaves a plausible-looking partial staged file.
-func snapshotFile(dst, src string) error {
+func snapshotFile(ctx context.Context, dst, src string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -348,12 +348,23 @@ func snapshotFile(dst, src string) error {
 			return xerr
 		}
 		for _, e := range extents {
+			// Reflink is unavailable on this filesystem, so the fallback
+			// pays a real read+write per extent; a single extent can span
+			// the whole inline-staging budget, and only a context check
+			// between extents (not one before the whole file) keeps a
+			// slow disk from pinning the RPC path's pause lock past its
+			// deadline the way the size threshold alone cannot.
+			if err := ctx.Err(); err != nil {
+				out.Close()
+				os.Remove(tmp)
+				return err
+			}
 			if _, err := out.Seek(e.Offset, io.SeekStart); err != nil {
 				out.Close()
 				os.Remove(tmp)
 				return err
 			}
-			if _, err := io.Copy(out, io.NewSectionReader(in, e.Offset, e.Length)); err != nil {
+			if _, err := copyExtentContext(ctx, out, io.NewSectionReader(in, e.Offset, e.Length)); err != nil {
 				out.Close()
 				os.Remove(tmp)
 				return err
@@ -384,6 +395,31 @@ func snapshotFile(dst, src string) error {
 		return err
 	}
 	return syncDir(filepath.Dir(dst))
+}
+
+// copyExtentChunk bounds a single context check's worth of copying, so
+// a large dense extent yields to ctx cancellation instead of running
+// io.Copy to completion regardless of the caller's deadline.
+const copyExtentChunk = 4 << 20
+
+// copyExtentContext copies src to dst in bounded chunks, checking ctx
+// between each so a caller with a deadline (the pause RPC path) is not
+// blocked for the full extent on a slow or contended disk.
+func copyExtentContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		n, err := io.CopyN(dst, src, copyExtentChunk)
+		total += n
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return total, nil
+			}
+			return total, err
+		}
+	}
 }
 
 // syncDir fsyncs a directory so the entries inside it are durable.

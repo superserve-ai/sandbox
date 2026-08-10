@@ -1737,3 +1737,40 @@ func TestStagePendingRespectsDeadline(t *testing.T) {
 		t.Fatalf("err = %v, want deadline fallback", err)
 	}
 }
+
+// cancelAfterFirstRead cancels its context after its first Read call
+// returns, letting a test deterministically land cancellation between
+// chunks of a copy rather than racing on wall-clock timing.
+type cancelAfterFirstRead struct {
+	r      io.Reader
+	cancel context.CancelFunc
+	fired  bool
+}
+
+func (c *cancelAfterFirstRead) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if !c.fired {
+		c.fired = true
+		c.cancel()
+	}
+	return n, err
+}
+
+// A single dense extent (no reflink support) can span the whole
+// inline-staging budget; a slow or contended disk must not run the copy
+// to completion regardless of the caller's deadline. copyExtentContext
+// chunks the copy and rechecks ctx between chunks so a cancellation
+// lands well before the full extent is copied.
+func TestCopyExtentContextHonorsCancellationBetweenChunks(t *testing.T) {
+	src := bytes.Repeat([]byte("x"), 3*copyExtentChunk)
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := &cancelAfterFirstRead{r: bytes.NewReader(src), cancel: cancel}
+	var dst bytes.Buffer
+	n, err := copyExtentContext(ctx, &dst, reader)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if n >= int64(len(src)) {
+		t.Fatalf("copied %d of %d bytes despite cancellation after the first chunk", n, len(src))
+	}
+}
