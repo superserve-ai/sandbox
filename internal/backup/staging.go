@@ -159,12 +159,6 @@ func StagePending(ctx context.Context, root, vmID, token, basePath string, files
 	if err := syncDir(root); err != nil {
 		return "", nil, err
 	}
-	if basePath != "" {
-		// Best-effort: EXDEV or a filesystem without hard links loses
-		// only the pin, and the worker falls back to the original base
-		// path with its identity proofs.
-		_ = os.Link(basePath, filepath.Join(dir, BasePinName))
-	}
 	staged := make(map[string]string, len(files))
 	for name, src := range files {
 		if err := ctx.Err(); err != nil {
@@ -178,6 +172,19 @@ func StagePending(ctx context.Context, root, vmID, token, basePath string, files
 		}
 		staged[name] = dst
 	}
+	if basePath != "" {
+		// Linked only after every fallible copy has succeeded: a link
+		// (and the unlink a failed copy's RemoveAll cleanup would do to
+		// it) bumps the base inode's ctime, and the caller's fallback
+		// path trusts an identity captured from basePath BEFORE this
+		// call. Linking earlier and then unwinding on a later copy
+		// failure would silently invalidate that identity and make the
+		// unstaged fallback misread an untouched base as replaced.
+		// Best-effort: EXDEV or a filesystem without hard links loses
+		// only the pin, and the worker falls back to the original base
+		// path with its identity proofs.
+		_ = os.Link(basePath, filepath.Join(dir, BasePinName))
+	}
 	if err := syncDir(dir); err != nil {
 		_ = os.RemoveAll(dir)
 		return "", nil, err
@@ -188,36 +195,64 @@ func StagePending(ctx context.Context, root, vmID, token, basePath string, files
 // FinishPendingStage renames a hashed pending directory to its
 // generation name so ack cleanup and the sweep manage it under the
 // standard layout, returning the final path per file name.
+//
+// The rename and the renewal that follows it run inside one singleflight
+// call keyed on final: the rename preserves the pending directory's
+// (possibly stale) mtime, so the instant it becomes visible to a
+// concurrent SweepStaging pass — before this renewal runs — the sweep
+// could see an unjournaled, apparently-stale generation and delete it
+// under the same key RenewStaged uses. Wrapping both in one flight means
+// a sweep call for this exact path arriving anywhere in that window
+// joins this flight instead of running its own delete, closing the race
+// rather than only detecting it afterward.
 func FinishPendingStage(pendingDir, generation string, staged map[string]string) (map[string]string, error) {
 	final := filepath.Join(filepath.Dir(pendingDir), generation)
-	if pendingDir == final {
-		// Recovery re-running after a completed rename.
-	} else if err := os.Rename(pendingDir, final); err != nil {
-		if !os.IsExist(err) && !errors.Is(err, os.ErrExist) {
-			return nil, err
-		}
-		// The destination exists, but existence is not proof of
-		// completeness: the worker staging path also creates generation
-		// directories, and an interrupted one leaves residue under this
-		// exact name. Sizes alone are near-informationless for a fixed
-		// geometry image, so absorption additionally requires the
-		// vmstate BYTES to match (tiny, and its digest is effectively
-		// the generation identity); anything less is replaced by the
-		// complete pending copy rather than absorbing it.
-		if pendingAbsorbable(final, pendingDir, staged) {
-			_ = os.RemoveAll(pendingDir)
-		} else {
-			if err := os.RemoveAll(final); err != nil {
+	_, err, _ := stagingFlights.Do(final, func() (any, error) {
+		if pendingDir == final {
+			// Recovery re-running after a completed rename.
+		} else if err := os.Rename(pendingDir, final); err != nil {
+			if !os.IsExist(err) && !errors.Is(err, os.ErrExist) {
 				return nil, err
 			}
-			if err := os.Rename(pendingDir, final); err != nil {
-				return nil, err
+			// The destination exists, but existence is not proof of
+			// completeness: the worker staging path also creates generation
+			// directories, and an interrupted one leaves residue under this
+			// exact name. Sizes alone are near-informationless for a fixed
+			// geometry image, so absorption additionally requires the
+			// vmstate BYTES to match (tiny, and its digest is effectively
+			// the generation identity); anything less is replaced by the
+			// complete pending copy rather than absorbing it.
+			if pendingAbsorbable(final, pendingDir, staged) {
+				_ = os.RemoveAll(pendingDir)
+			} else {
+				if err := os.RemoveAll(final); err != nil {
+					return nil, err
+				}
+				if err := os.Rename(pendingDir, final); err != nil {
+					return nil, err
+				}
 			}
 		}
+		// Rename preserves the pause-time mtime; renew so the sweep's
+		// grace covers the gap to enqueue. Touch directly rather than
+		// through renewStaged: that helper takes the same flight key via
+		// stagingFlights.Do, and this closure is already running inside
+		// that exact flight — calling it here would deadlock waiting on
+		// itself.
+		now := time.Now()
+		_ = os.Chtimes(final, now, now)
+		return nil, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	// Rename preserves the pause-time mtime; renew so the sweep's grace
-	// covers the gap to enqueue.
-	RenewStaged(final)
+	// Defense in depth: confirm final actually survived the flight above
+	// (a sweep that started before this call registered its flight, and
+	// so never joined it, could still have reaped an already-stale
+	// directory in the instant before the rename).
+	if _, statErr := os.Stat(final); statErr != nil {
+		return nil, fmt.Errorf("staged generation vanished after rename: %w", statErr)
+	}
 	out := make(map[string]string, len(staged))
 	for name := range staged {
 		out[name] = filepath.Join(final, name)

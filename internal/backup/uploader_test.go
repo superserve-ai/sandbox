@@ -11,8 +11,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1772,5 +1774,124 @@ func TestCopyExtentContextHonorsCancellationBetweenChunks(t *testing.T) {
 	}
 	if n >= int64(len(src)) {
 		t.Fatalf("copied %d of %d bytes despite cancellation after the first chunk", n, len(src))
+	}
+}
+
+func statIdentity(t *testing.T, path string) (dev, ino uint64, ctime syscall.Timespec) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("no stat_t identity")
+	}
+	return uint64(st.Dev), uint64(st.Ino), st.Ctim
+}
+
+// A hard link (and the unlink a failed copy's cleanup performs on it)
+// bumps the target inode's ctime. If the base pin were created before
+// the fallible per-file copies, a later copy failure's RemoveAll
+// cleanup would unlink it and silently change the base's identity out
+// from under a caller that snapshotted that identity before calling
+// StagePending, making an unstaged fallback misread an untouched base
+// as replaced. The pin must only be created once every copy in this
+// call has already succeeded.
+func TestStagePendingLeavesBaseIdentityUnchangedOnCopyFailure(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, "base.img")
+	if err := os.WriteFile(base, []byte("base-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeDev, beforeIno, beforeCtime := statIdentity(t, base)
+
+	missing := filepath.Join(root, "does-not-exist.ext4")
+	if _, _, err := StagePending(context.Background(), root, "sb", "tok", base, map[string]string{"rootfs.ext4": missing}); err == nil {
+		t.Fatal("expected staging to fail for a missing source file")
+	}
+
+	afterDev, afterIno, afterCtime := statIdentity(t, base)
+	if beforeDev != afterDev || beforeIno != afterIno || beforeCtime != afterCtime {
+		t.Fatalf("base identity changed after a failed StagePending call: before=(%d,%d,%v) after=(%d,%d,%v)",
+			beforeDev, beforeIno, beforeCtime, afterDev, afterIno, afterCtime)
+	}
+	if _, err := os.Stat(filepath.Join(root, "sb", "pending-tok", BasePinName)); !os.IsNotExist(err) {
+		t.Fatalf("base.pin should not exist after a failed copy, got err=%v", err)
+	}
+}
+
+// FinishPendingStage's rename can preserve a stale mtime from the
+// pending directory, exposing an apparently-old, unjournaled generation
+// to a concurrent staging sweep before the renewal that follows the
+// rename gets to run. The rename and renewal now run inside one
+// singleflight call keyed on the final path, so a sweep's delete
+// attempt for that exact path arriving anywhere during the window joins
+// the flight instead of racing it independently — this must hold under
+// every goroutine interleaving, not just the common one, so the test
+// races real goroutines rather than asserting a fixed ordering.
+func TestFinishPendingStageSerializesWithConcurrentSweepDelete(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		root := t.TempDir()
+		sbDir := filepath.Join(root, "sb")
+		pendingDir := filepath.Join(sbDir, "pending-tok")
+		if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// A stale mtime, as if the pending directory sat untouched past
+		// the sweep's ordinary grace before this pause finally hashed.
+		old := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(pendingDir, old, old); err != nil {
+			t.Fatal(err)
+		}
+		generation := fmt.Sprintf("gen-%d", i)
+		final := filepath.Join(sbDir, generation)
+
+		var wg sync.WaitGroup
+		var finishErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, finishErr = FinishPendingStage(pendingDir, generation, map[string]string{"vmstate.snap": filepath.Join(pendingDir, "vmstate.snap")})
+		}()
+		go func() {
+			defer wg.Done()
+			// SweepStaging only ever learns about a generation directory
+			// via a real os.ReadDir listing, so in production it can never
+			// attempt this delete before the rename that creates the path
+			// has already happened on disk. Model that precondition (a
+			// version of this goroutine that raced the rename itself,
+			// rather than the file's existence, would win sometimes and
+			// isn't representative of how the sweep actually operates).
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				if _, err := os.Stat(final); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					return
+				}
+				runtime.Gosched()
+			}
+			// The sweep's exact delete logic for an unjournaled, stale
+			// generation directory.
+			_, _, _ = stagingFlights.Do(final, func() (any, error) {
+				if !fresherThan(final, stagingSweepGrace) {
+					_ = os.RemoveAll(final)
+				}
+				return nil, nil
+			})
+		}()
+		wg.Wait()
+
+		if finishErr != nil {
+			t.Fatalf("iteration %d: FinishPendingStage: %v", i, finishErr)
+		}
+		if _, err := os.Stat(filepath.Join(final, "vmstate.snap")); err != nil {
+			t.Fatalf("iteration %d: staged generation lost to a concurrent sweep delete: %v", i, err)
+		}
 	}
 }
