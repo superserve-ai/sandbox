@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -32,6 +33,7 @@ func touchNS(t *testing.T, dir, name string) {
 func newTestManager() *Manager {
 	return &Manager{
 		log:       zerolog.Nop(),
+		setupSem:  make(chan struct{}, setupSlotConcurrency),
 		devices:   make(map[string]*VMNetInfo),
 		slotOwner: make(map[int]string),
 		nextSlot:  1,
@@ -464,5 +466,19 @@ func TestCleanupVMOrNamespace_ReleasesOwnership(t *testing.T) {
 	}
 	if len(m.freeSlots) != 1 || m.freeSlots[0] != 5 {
 		t.Errorf("freeSlots = %v, want [5] (slot reclaimed)", m.freeSlots)
+	}
+}
+
+func TestSetupSlotQueueFailsFastOnExpiredContext(t *testing.T) {
+	m := newTestManager()
+	// Occupy every build permit so the new caller must queue.
+	for i := 0; i < setupSlotConcurrency; i++ {
+		m.setupSem <- struct{}{}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := m.setupSlot(ctx, 1)
+	if err == nil || !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "slot build queue") {
+		t.Fatalf("setupSlot = %v, want the build-queue refusal (no kernel work attempted)", err)
 	}
 }
