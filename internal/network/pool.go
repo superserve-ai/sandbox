@@ -163,7 +163,15 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 
 	p.log.Info().Int("target", newSize).Int("recycle_cap", recycleSize).
 		Bool("reset_tap_on_recycle", p.resetTapOnRecycle).Msg("network pool starting (filling in background)")
-	for i := 0; i < refillConcurrency; i++ {
+	// Each worker can park one pre-built slot in a blocked send when the pool
+	// is full, so inventory can exceed the target by up to the worker count.
+	// Clamping workers to the target keeps that overshoot proportionate for
+	// pools smaller than the default worker count.
+	workers := refillConcurrency
+	if newSize < workers {
+		workers = newSize
+	}
+	for i := 0; i < workers; i++ {
 		p.wg.Add(1)
 		go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
 	}
