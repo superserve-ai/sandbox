@@ -270,6 +270,13 @@ module "observability" {
       instance_name = module.sandbox_host.instance_name
       instance_id   = module.sandbox_host.instance_id
     }
+    # Inert while the standby is stopped (no data, no fire); in place so a
+    # promoted host is covered without a separate observability change.
+    sandbox_host_b = {
+      display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / CPU saturation"
+      instance_name = module.sandbox_host_b.instance_name
+      instance_id   = module.sandbox_host_b.instance_id
+    }
   }
   labels = local.common_labels
 }
