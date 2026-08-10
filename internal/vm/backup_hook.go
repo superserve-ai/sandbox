@@ -215,7 +215,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 	case pendingEligible:
 	}
 	before, err := os.Stat(pb.DiskPath)
-	if err != nil || !m.unitConfirmedDead(rctx, pb.VMID) {
+	if err != nil || !m.vmConfirmedAtRest(rctx, pb.VMID) {
 		log.Warn().Err(err).Str("vm_id", pb.VMID).
 			Msg("pause backup rehash inconclusive; keeping pending record")
 		m.healPendingBackup(pb, log)
@@ -278,7 +278,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 	after, err := os.Stat(pb.DiskPath)
 	if err != nil || !os.SameFile(before, after) ||
 		!before.ModTime().Equal(after.ModTime()) || before.Size() != after.Size() ||
-		!m.unitConfirmedDead(rctx, pb.VMID) {
+		!m.vmConfirmedAtRest(rctx, pb.VMID) {
 		log.Warn().Err(err).Str("vm_id", pb.VMID).
 			Msg("pause backup rehash not provably at-rest; keeping pending record")
 		m.healPendingBackup(pb, log)
@@ -768,17 +768,33 @@ func (m *Manager) pendingVerdict(vmID, snapshotPath string) pendingVerdictKind {
 // its stop attempts failed, and resume starts the unit before flipping
 // the status away from paused.
 func (m *Manager) atRest(ctx context.Context, vmID, snapshotPath string) bool {
-	return m.pausedAt(vmID, snapshotPath) && m.unitConfirmedDead(ctx, vmID)
+	return m.pausedAt(vmID, snapshotPath) && m.vmConfirmedAtRest(ctx, vmID)
 }
 
-// unitConfirmedDead consults systemd (overridable for tests via the
-// unitDead field) about whether the sandbox's unit is fully down. The
-// probe requires a terminal state: unitDefinitelyDead's weaker "not
-// active" answer calls a deactivating unit dead while its Firecracker
-// may still be flushing guest writes.
-func (m *Manager) unitConfirmedDead(ctx context.Context, vmID string) bool {
+// vmConfirmedAtRest reports whether the sandbox's Firecracker is fully
+// stopped so its artifacts are byte-stable — the at-rest proof every backup
+// gates on. It requires BOTH possible supervisors quiet, deliberately NOT
+// dispatching on the recorded mode: a crash between a launch and its persist
+// leaves the record's mode behind reality (a scope-gone fallback starts a
+// unit over a cgroup record; an armed resume starts a cgroup FC over a unit
+// record), and the recorded mode's oracle then answers vacuously while the
+// other supervisor's guest is still writing. The unit claim is TERMINAL
+// (unitFullyDown, not the weaker "not active" that calls a deactivating unit
+// dead while it may still flush guest writes); the cgroup claim is a
+// conclusively empty-or-absent group (populated or unreadable is not at
+// rest, and no delegated subtree means no cgroup FC can exist). Overridable
+// for tests via the unitDead seam, which stands in for the whole probe.
+func (m *Manager) vmConfirmedAtRest(ctx context.Context, vmID string) bool {
 	if m.unitDead != nil {
 		return m.unitDead(ctx, vmID)
+	}
+	if !knownSupervision(m.supervisionForVM(vmID)) {
+		// A mode this binary predates may supervise through a mechanism
+		// neither oracle below can see — never at rest.
+		return false
+	}
+	if m.cgroupStillLive(vmID) {
+		return false
 	}
 	return unitFullyDown(ctx, systemdUnitName(vmID))
 }
