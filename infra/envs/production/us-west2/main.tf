@@ -207,10 +207,50 @@ module "sandbox_host" {
   })
 
   service_account_email = data.google_service_account.api_runner.email
-  boot_disk_image       = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts"
-  boot_disk_size_gb     = 250
-  can_ip_forward        = false
-  on_host_maintenance   = "TERMINATE"
+  # 24.04 images are only published under the -amd64 family (see sandbox_host_b).
+  boot_disk_image     = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  boot_disk_size_gb   = 250
+  can_ip_forward      = false
+  on_host_maintenance = "TERMINATE"
+
+  metadata = {
+    enable-osconfig = "TRUE"
+    enable-oslogin  = "TRUE"
+  }
+}
+
+# Second host for the cell: a cold standby, normally kept stopped.
+# Labeled vmd-usw2-2 instead of vmd so auto-deploys skip this host while it is
+# not in service. Rename the label to component=vmd when it joins the fleet.
+module "sandbox_host_b" {
+  source = "../../../modules/sandbox-host"
+
+  project_id    = local.project_id
+  environment   = local.environment
+  region        = local.region
+  zone          = local.zone
+  instance_name = "superserve-vmd-usw2-2"
+  machine_type  = var.machine_type
+  subnet        = module.network.subnetwork_self_link
+  internal_ip   = "10.1.0.3"
+  tags          = ["vmd-usw2"]
+  labels = merge(local.sandbox_host_labels, {
+    component                  = "vmd-usw2-2"
+    sandbox_role               = "vmd"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
+  })
+
+  service_account_email = data.google_service_account.api_runner.email
+  # The pre-24.04 family aliases without an arch suffix are gone; 24.04 images
+  # are only published under the -amd64 family.
+  boot_disk_image   = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  boot_disk_size_gb = 250
+  # Metal machine types reject the API-default pd-standard boot disk; Hyperdisk
+  # is required (see the boot_disk_type variable note).
+  boot_disk_type      = "hyperdisk-balanced"
+  can_ip_forward      = false
+  on_host_maintenance = "TERMINATE"
 
   metadata = {
     enable-osconfig = "TRUE"
