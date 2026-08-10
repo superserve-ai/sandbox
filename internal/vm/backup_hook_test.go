@@ -982,6 +982,56 @@ func TestBasePinSurvivesBaseDeletion(t *testing.T) {
 	}
 }
 
+// baseIdentity embeds the path string it's given, and the fallback base
+// comparison in enqueueStagedPending always re-derives its "current"
+// identity from diskBasePath. An identity captured via the pin's path
+// (a different string, even though pin and diskBasePath share one
+// inode) could never match that later comparison, so a perfectly
+// unchanged base would read as replaced the moment the pin is lost
+// (e.g. absorbed away by FinishPendingStage). The pause-time identity
+// must be captured through diskBasePath itself.
+func TestBackupPauseCapturesBaseIdentityComparableToDiskBasePath(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "overlay.ext4")
+	base := filepath.Join(dir, "base.ext4")
+	for p, data := range map[string]string{snap: "vm state", disk: "overlay", base: "base bytes"} {
+		if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return false },
+	}
+	m.backupStaging = staging
+	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+
+	m.backupPause(context.Background(), "vm-1", snap, disk, base, zerolog.Nop())
+
+	pb, ok, err := st.GetPendingBackup("vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("no pending backup marker recorded")
+	}
+	want, err := baseIdentity(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pb.BaseIdentity != want {
+		t.Fatalf("BaseIdentity = %q, want %q (comparable to a later baseIdentity(diskBasePath) call, not the pin's path)", pb.BaseIdentity, want)
+	}
+}
+
 // An unpinned marker whose base is definitively gone must drop, not
 // spin: ENOENT is terminal, unlike a transient stat failure.
 func TestUnpinnedMissingBaseIsTerminal(t *testing.T) {

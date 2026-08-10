@@ -130,10 +130,20 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 			pb.StagedDir = dir
 			pb.SnapshotPath = staged["vmstate.snap"]
 			pb.DiskPath = staged["rootfs.ext4"]
-			if pin := filepath.Join(dir, backup.BasePinName); diskBasePath != "" {
-				if id, err := baseIdentity(pin); err == nil {
-					// The pin froze the pause-time base; identity now
-					// describes the pin's inode (linking bumps ctime).
+			if diskBasePath != "" {
+				// Stat through diskBasePath, not the pin: baseIdentity
+				// embeds the path string it's given, and the fallback
+				// comparison this identity feeds (when the pin is later
+				// lost, e.g. absorbed away by FinishPendingStage) always
+				// re-derives its "current" identity from diskBasePath. An
+				// identity captured via the pin's path could never match
+				// that, even with the base completely unchanged. The pin
+				// and diskBasePath share one inode (hard link), so
+				// stat-ing either returns identical dev/ino/size/ctime;
+				// only the path component differs, and diskBasePath is
+				// the one worth recording. Read after the link exists so
+				// the ctime bump linking causes is captured.
+				if id, err := baseIdentity(diskBasePath); err == nil {
 					pb.BaseIdentity = id
 				}
 			}
