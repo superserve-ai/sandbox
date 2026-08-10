@@ -102,6 +102,11 @@ const (
 	// rebuilds are short once uncontended, so a small window drains a backlog
 	// quickly.
 	resetTapConcurrency = 8
+	// refillConcurrency is the number of refill workers rebuilding the fresh
+	// pool. A single worker refills at one slot per build-time, which cannot
+	// catch a drained pool back up while claims keep arriving; builds stay
+	// individually cheap because Manager.setupSem bounds them globally.
+	refillConcurrency = 4
 	// resetTapTimeout bounds one batched rebuild — a healthy one takes well
 	// under a second, and a tight bound keeps a stalled backlog (and Stop)
 	// from dragging.
@@ -158,8 +163,10 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 
 	p.log.Info().Int("target", newSize).Int("recycle_cap", recycleSize).
 		Bool("reset_tap_on_recycle", p.resetTapOnRecycle).Msg("network pool starting (filling in background)")
-	p.wg.Add(1)
-	go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
+	for i := 0; i < refillConcurrency; i++ {
+		p.wg.Add(1)
+		go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
+	}
 
 	return p
 }
