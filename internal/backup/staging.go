@@ -196,55 +196,49 @@ func StagePending(ctx context.Context, root, vmID, token, basePath string, files
 // generation name so ack cleanup and the sweep manage it under the
 // standard layout, returning the final path per file name.
 //
-// The rename and the renewal that follows it run inside one singleflight
+// The rename and the renewal that follows it run inside a singleflight
 // call keyed on final: the rename preserves the pending directory's
 // (possibly stale) mtime, so the instant it becomes visible to a
 // concurrent SweepStaging pass — before this renewal runs — the sweep
 // could see an unjournaled, apparently-stale generation and delete it
 // under the same key RenewStaged uses. Wrapping both in one flight means
 // a sweep call for this exact path arriving anywhere in that window
-// joins this flight instead of running its own delete, closing the race
-// rather than only detecting it afterward.
+// joins this flight instead of running its own delete.
+//
+// But that same key can already be in flight for an unrelated reason —
+// a sweep evaluating pre-existing, incomplete residue some other worker
+// left at this exact generation path — and joining it would skip this
+// call's own rename/absorb logic entirely, silently reporting success
+// against whatever the sweep decided to do with someone else's
+// leftovers. pendingDir's existence after the flight is what
+// distinguishes the two: gone means a rename actually ran (ours or an
+// earlier attempt's); still there means this call was coalesced into an
+// unrelated result and must retry, which on the next attempt either runs
+// our own rename fresh or hits the EEXIST/absorb path against whatever
+// is now at final.
 func FinishPendingStage(pendingDir, generation string, staged map[string]string) (map[string]string, error) {
 	final := filepath.Join(filepath.Dir(pendingDir), generation)
-	_, err, _ := stagingFlights.Do(final, func() (any, error) {
-		if pendingDir == final {
-			// Recovery re-running after a completed rename.
-		} else if err := os.Rename(pendingDir, final); err != nil {
-			if !os.IsExist(err) && !errors.Is(err, os.ErrExist) {
-				return nil, err
-			}
-			// The destination exists, but existence is not proof of
-			// completeness: the worker staging path also creates generation
-			// directories, and an interrupted one leaves residue under this
-			// exact name. Sizes alone are near-informationless for a fixed
-			// geometry image, so absorption additionally requires the
-			// vmstate BYTES to match (tiny, and its digest is effectively
-			// the generation identity); anything less is replaced by the
-			// complete pending copy rather than absorbing it.
-			if pendingAbsorbable(final, pendingDir, staged) {
-				_ = os.RemoveAll(pendingDir)
-			} else {
-				if err := os.RemoveAll(final); err != nil {
-					return nil, err
-				}
-				if err := os.Rename(pendingDir, final); err != nil {
-					return nil, err
-				}
-			}
-		}
-		// Rename preserves the pause-time mtime; renew so the sweep's
-		// grace covers the gap to enqueue. Touch directly rather than
-		// through renewStaged: that helper takes the same flight key via
-		// stagingFlights.Do, and this closure is already running inside
-		// that exact flight — calling it here would deadlock waiting on
-		// itself.
+	if pendingDir == final {
+		// Recovery re-running after a completed rename; nothing to move.
 		now := time.Now()
 		_ = os.Chtimes(final, now, now)
-		return nil, nil
-	})
-	if err != nil {
-		return nil, err
+	} else {
+		const maxRenameAttempts = 5
+		moved := false
+		for attempt := 1; attempt <= maxRenameAttempts && !moved; attempt++ {
+			_, err, _ := stagingFlights.Do(final, func() (any, error) {
+				return nil, finishPendingRename(pendingDir, final, staged)
+			})
+			if err != nil {
+				return nil, err
+			}
+			if _, statErr := os.Stat(pendingDir); statErr != nil {
+				moved = true
+			}
+		}
+		if !moved {
+			return nil, fmt.Errorf("staged generation %s: rename did not land after %d attempts of a shared flight result", final, maxRenameAttempts)
+		}
 	}
 	// Defense in depth: confirm final actually survived the flight above
 	// (a sweep that started before this call registered its flight, and
@@ -261,6 +255,41 @@ func FinishPendingStage(pendingDir, generation string, staged map[string]string)
 		return nil, err
 	}
 	return out, nil
+}
+
+// finishPendingRename performs one rename-to-generation attempt plus the
+// renewal that must land in the same flight as the rename (see
+// FinishPendingStage). Touches final directly rather than through
+// renewStaged: that helper takes the same flight key via
+// stagingFlights.Do, and this function only ever runs from inside that
+// exact flight — calling it here would deadlock waiting on itself.
+func finishPendingRename(pendingDir, final string, staged map[string]string) error {
+	if err := os.Rename(pendingDir, final); err != nil {
+		if !os.IsExist(err) && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		// The destination exists, but existence is not proof of
+		// completeness: the worker staging path also creates generation
+		// directories, and an interrupted one leaves residue under this
+		// exact name. Sizes alone are near-informationless for a fixed
+		// geometry image, so absorption additionally requires the
+		// vmstate BYTES to match (tiny, and its digest is effectively
+		// the generation identity); anything less is replaced by the
+		// complete pending copy rather than absorbing it.
+		if pendingAbsorbable(final, pendingDir, staged) {
+			_ = os.RemoveAll(pendingDir)
+		} else {
+			if err := os.RemoveAll(final); err != nil {
+				return err
+			}
+			if err := os.Rename(pendingDir, final); err != nil {
+				return err
+			}
+		}
+	}
+	now := time.Now()
+	_ = os.Chtimes(final, now, now)
+	return nil
 }
 
 // StageSharedBase ensures a base image's content snapshot exists under

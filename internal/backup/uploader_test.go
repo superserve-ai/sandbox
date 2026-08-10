@@ -1895,3 +1895,71 @@ func TestFinishPendingStageSerializesWithConcurrentSweepDelete(t *testing.T) {
 		}
 	}
 }
+
+// FinishPendingStage's flight key can already be occupied by an
+// unrelated caller — a sweep evaluating pre-existing, incomplete
+// residue some other worker left at the exact same generation path.
+// Joining that flight must not let this call silently report success
+// against the sweep's decision about someone else's leftovers: it must
+// retry and end up performing its own rename/absorb logic against the
+// correct content.
+func TestFinishPendingStageRetriesWhenFlightKeyIsForeign(t *testing.T) {
+	root := t.TempDir()
+	sbDir := filepath.Join(root, "sb")
+	pendingDir := filepath.Join(sbDir, "pending-tok")
+	if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	correct := []byte("correct-vmstate-bytes")
+	if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), correct, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	generation := "gen-foreign"
+	final := filepath.Join(sbDir, generation)
+	// Pre-existing, incomplete residue at the destination, as if an
+	// interrupted worker-side stageTask left a partial generation
+	// directory here before this pause's rename ever runs.
+	if err := os.MkdirAll(final, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(final, "vmstate.snap"), []byte("stale-residue"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	occupying := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_, _, _ = stagingFlights.Do(final, func() (any, error) {
+			close(occupying)
+			<-release
+			return nil, nil
+		})
+	}()
+	<-occupying // the foreign flight is registered and holding the key
+
+	staged := map[string]string{"vmstate.snap": filepath.Join(pendingDir, "vmstate.snap")}
+	done := make(chan struct{})
+	var outPaths map[string]string
+	var finishErr error
+	go func() {
+		outPaths, finishErr = FinishPendingStage(pendingDir, generation, staged)
+		close(done)
+	}()
+
+	// Give FinishPendingStage's first Do call a chance to actually join
+	// the foreign flight before releasing it.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	<-done
+
+	if finishErr != nil {
+		t.Fatalf("FinishPendingStage: %v", finishErr)
+	}
+	got, err := os.ReadFile(outPaths["vmstate.snap"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, correct) {
+		t.Fatalf("final holds %q, want the correct staged bytes %q: coalescing into the foreign flight must not have been trusted blindly", got, correct)
+	}
+}
