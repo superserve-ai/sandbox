@@ -11,8 +11,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1359,30 +1361,6 @@ func TestEnqueueDedupeUpgradesPaths(t *testing.T) {
 	}
 }
 
-// Clone-only staging on a filesystem without reflink support degrades
-// cleanly: nothing staged, original paths untouched, no error.
-func TestStageTaskCloneFallsBackWithoutReflink(t *testing.T) {
-	dir := t.TempDir()
-	orig := filepath.Join(dir, "rootfs.ext4")
-	if err := os.WriteFile(orig, []byte("bytes"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	task := Task{SandboxID: "sb", Generation: "gen",
-		Files: []TaskFile{{Name: "rootfs.ext4", Path: orig, SHA256: "aa"}}}
-	all, err := StageTaskClone(filepath.Join(dir, "staging"), &task)
-	if err != nil {
-		t.Fatalf("clone-only staging errored: %v", err)
-	}
-	// This test tree may or may not sit on a reflink filesystem; either
-	// every file staged or none did, and unstaged files keep originals.
-	if !all && task.Files[0].Path != orig {
-		t.Fatalf("unstaged file path rewritten to %s", task.Files[0].Path)
-	}
-	if all && task.Files[0].Path == orig {
-		t.Fatal("allStaged reported but path not rewritten")
-	}
-}
-
 // A shared base this host already verified must not be streamed again:
 // prod bases are multi-GB and every generation re-references them, so a
 // redundant stream per generation pins the bandwidth cap and puts the
@@ -1646,5 +1624,475 @@ func TestLegacyUnscopedVerificationRecordsStillTrusted(t *testing.T) {
 	}
 	if ok, err := j.WasVerified(store.Identity()+"\x00"+object, time.Now()); err != nil || !ok {
 		t.Fatalf("migrated record lost: ok=%v err=%v", ok, err)
+	}
+}
+
+// The pending-to-generation absorb requires identical vmstate bytes;
+// residue and byte-divergent destinations are replaced by the complete
+// pending copy.
+func TestFinishPendingStageAbsorbAndReplace(t *testing.T) {
+	root := t.TempDir()
+	mk := func(dir string, vmstate string, withDisk bool) {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "vmstate.snap"), []byte(vmstate), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if withDisk {
+			if err := os.WriteFile(filepath.Join(dir, "rootfs.ext4"), []byte("diskdata"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	stagedOf := func(dir string) map[string]string {
+		return map[string]string{
+			"vmstate.snap": filepath.Join(dir, "vmstate.snap"),
+			"rootfs.ext4":  filepath.Join(dir, "rootfs.ext4"),
+		}
+	}
+
+	// Identical destination: absorbed, pending removed.
+	p1 := filepath.Join(root, "sb", "pending-a")
+	g1 := filepath.Join(root, "sb", "gen-1")
+	mk(p1, "same-state", true)
+	mk(g1, "same-state", true)
+	if _, err := FinishPendingStage(p1, "gen-1", stagedOf(p1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p1); !os.IsNotExist(err) {
+		t.Fatal("identical destination did not absorb the pending copy")
+	}
+
+	// Residue destination (missing disk): replaced by the pending copy.
+	p2 := filepath.Join(root, "sb", "pending-b")
+	g2 := filepath.Join(root, "sb", "gen-2")
+	mk(p2, "state-b", true)
+	mk(g2, "state-b", false)
+	final, err := FinishPendingStage(p2, "gen-2", stagedOf(p2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(final["rootfs.ext4"]); err != nil {
+		t.Fatalf("residue destination not replaced: %v", err)
+	}
+
+	// Byte-divergent vmstate: replaced, never absorbed.
+	p3 := filepath.Join(root, "sb", "pending-c")
+	g3 := filepath.Join(root, "sb", "gen-3")
+	mk(p3, "state-c-pending", true)
+	mk(g3, "state-c-DIFFER!", true)
+	final3, err := FinishPendingStage(p3, "gen-3", stagedOf(p3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(final3["vmstate.snap"])
+	if err != nil || string(got) != "state-c-pending" {
+		t.Fatalf("divergent destination absorbed: %q err=%v", got, err)
+	}
+	_ = g3
+}
+
+// Pending-token directories are protected by the long orphan horizon,
+// not the short residue grace: a renewed (live) one survives sweeps,
+// and only a long-dead orphan is reaped.
+func TestSweepStagingProtectsLivePendingDirs(t *testing.T) {
+	root := t.TempDir()
+	j, _ := testJournal(t)
+	live := filepath.Join(root, "sb", "pending-live")
+	orphan := filepath.Join(root, "sb", "pending-orphan")
+	for _, d := range []string{live, orphan} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Age both past the ordinary grace; the live one got renewed by a
+	// worker two hours ago is still fine, the orphan is ancient.
+	twoHours := time.Now().Add(-2 * time.Hour)
+	ancient := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(live, twoHours, twoHours); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(orphan, ancient, ancient); err != nil {
+		t.Fatal(err)
+	}
+	SweepStaging(root, j, zerolog.Nop())
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("live pending dir swept: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatal("ancient orphan pending dir survived")
+	}
+}
+
+// The RPC-path staging respects the caller's deadline: an exhausted
+// deadline falls back rather than copying.
+func TestStagePendingRespectsDeadline(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "rootfs.ext4")
+	if err := os.WriteFile(src, []byte("bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second))
+	defer cancel()
+	if _, _, err := StagePending(ctx, root, "sb", "tok", "", map[string]string{"rootfs.ext4": src}); !errors.Is(err, ErrStageTooLarge) {
+		t.Fatalf("err = %v, want deadline fallback", err)
+	}
+}
+
+// cancelAfterFirstRead cancels its context after its first Read call
+// returns, letting a test deterministically land cancellation between
+// chunks of a copy rather than racing on wall-clock timing.
+type cancelAfterFirstRead struct {
+	r      io.Reader
+	cancel context.CancelFunc
+	fired  bool
+}
+
+func (c *cancelAfterFirstRead) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if !c.fired {
+		c.fired = true
+		c.cancel()
+	}
+	return n, err
+}
+
+// A single dense extent (no reflink support) can span the whole
+// inline-staging budget; a slow or contended disk must not run the copy
+// to completion regardless of the caller's deadline. copyExtentContext
+// chunks the copy and rechecks ctx between chunks so a cancellation
+// lands well before the full extent is copied.
+func TestCopyExtentContextHonorsCancellationBetweenChunks(t *testing.T) {
+	src := bytes.Repeat([]byte("x"), 3*copyExtentChunk)
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := &cancelAfterFirstRead{r: bytes.NewReader(src), cancel: cancel}
+	var dst bytes.Buffer
+	n, err := copyExtentContext(ctx, &dst, reader)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if n >= int64(len(src)) {
+		t.Fatalf("copied %d of %d bytes despite cancellation after the first chunk", n, len(src))
+	}
+}
+
+// fsync has no native cancellation; syncWithContext bounds it by ctx so
+// a slow or contended disk cannot block the RPC path's pause lock past
+// its deadline the way the size threshold and the copy's own bound
+// alone cannot.
+func TestSyncWithContextHonorsCancellation(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.CreateTemp(dir, "sync-ctx-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString("bytes"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	err = syncWithContext(ctx, f)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("syncWithContext blocked %v under a canceled context", elapsed)
+	}
+}
+
+func statIdentity(t *testing.T, path string) (dev, ino uint64, ctime syscall.Timespec) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("no stat_t identity")
+	}
+	return uint64(st.Dev), uint64(st.Ino), st.Ctim
+}
+
+// A hard link (and the unlink a failed copy's cleanup performs on it)
+// bumps the target inode's ctime. If the base pin were created before
+// the fallible per-file copies, a later copy failure's RemoveAll
+// cleanup would unlink it and silently change the base's identity out
+// from under a caller that snapshotted that identity before calling
+// StagePending, making an unstaged fallback misread an untouched base
+// as replaced. The pin must only be created once every copy in this
+// call has already succeeded.
+func TestStagePendingLeavesBaseIdentityUnchangedOnCopyFailure(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, "base.img")
+	if err := os.WriteFile(base, []byte("base-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeDev, beforeIno, beforeCtime := statIdentity(t, base)
+
+	missing := filepath.Join(root, "does-not-exist.ext4")
+	if _, _, err := StagePending(context.Background(), root, "sb", "tok", base, map[string]string{"rootfs.ext4": missing}); err == nil {
+		t.Fatal("expected staging to fail for a missing source file")
+	}
+
+	afterDev, afterIno, afterCtime := statIdentity(t, base)
+	if beforeDev != afterDev || beforeIno != afterIno || beforeCtime != afterCtime {
+		t.Fatalf("base identity changed after a failed StagePending call: before=(%d,%d,%v) after=(%d,%d,%v)",
+			beforeDev, beforeIno, beforeCtime, afterDev, afterIno, afterCtime)
+	}
+	if _, err := os.Stat(filepath.Join(root, "sb", "pending-tok", BasePinName)); !os.IsNotExist(err) {
+		t.Fatalf("base.pin should not exist after a failed copy, got err=%v", err)
+	}
+}
+
+// FinishPendingStage's rename can preserve a stale mtime from the
+// pending directory, exposing an apparently-old, unjournaled generation
+// to a concurrent staging sweep before the renewal that follows the
+// rename gets to run. The rename and renewal now run inside one
+// singleflight call keyed on the final path, so a sweep's delete
+// attempt for that exact path arriving anywhere during the window joins
+// the flight instead of racing it independently — this must hold under
+// every goroutine interleaving, not just the common one, so the test
+// races real goroutines rather than asserting a fixed ordering.
+func TestFinishPendingStageSerializesWithConcurrentSweepDelete(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		root := t.TempDir()
+		sbDir := filepath.Join(root, "sb")
+		pendingDir := filepath.Join(sbDir, "pending-tok")
+		if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// A stale mtime, as if the pending directory sat untouched past
+		// the sweep's ordinary grace before this pause finally hashed.
+		old := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(pendingDir, old, old); err != nil {
+			t.Fatal(err)
+		}
+		generation := fmt.Sprintf("gen-%d", i)
+		final := filepath.Join(sbDir, generation)
+
+		var wg sync.WaitGroup
+		var finishErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, finishErr = FinishPendingStage(pendingDir, generation, map[string]string{"vmstate.snap": filepath.Join(pendingDir, "vmstate.snap")})
+		}()
+		go func() {
+			defer wg.Done()
+			// SweepStaging only ever learns about a generation directory
+			// via a real os.ReadDir listing, so in production it can never
+			// attempt this delete before the rename that creates the path
+			// has already happened on disk. Model that precondition (a
+			// version of this goroutine that raced the rename itself,
+			// rather than the file's existence, would win sometimes and
+			// isn't representative of how the sweep actually operates).
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				if _, err := os.Stat(final); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					return
+				}
+				runtime.Gosched()
+			}
+			// The sweep's exact delete logic for an unjournaled, stale
+			// generation directory.
+			_, _, _ = stagingFlights.Do(final, func() (any, error) {
+				if !fresherThan(final, stagingSweepGrace) {
+					_ = os.RemoveAll(final)
+				}
+				return nil, nil
+			})
+		}()
+		wg.Wait()
+
+		if finishErr != nil {
+			t.Fatalf("iteration %d: FinishPendingStage: %v", i, finishErr)
+		}
+		if _, err := os.Stat(filepath.Join(final, "vmstate.snap")); err != nil {
+			t.Fatalf("iteration %d: staged generation lost to a concurrent sweep delete: %v", i, err)
+		}
+	}
+}
+
+// FinishPendingStage's flight key can already be occupied by an
+// unrelated caller — a sweep evaluating pre-existing, incomplete
+// residue some other worker left at the exact same generation path.
+// Joining that flight must not let this call silently report success
+// against the sweep's decision about someone else's leftovers: it must
+// retry and end up performing its own rename/absorb logic against the
+// correct content.
+func TestFinishPendingStageRetriesWhenFlightKeyIsForeign(t *testing.T) {
+	root := t.TempDir()
+	sbDir := filepath.Join(root, "sb")
+	pendingDir := filepath.Join(sbDir, "pending-tok")
+	if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	correct := []byte("correct-vmstate-bytes")
+	if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), correct, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	generation := "gen-foreign"
+	final := filepath.Join(sbDir, generation)
+	// Pre-existing, incomplete residue at the destination, as if an
+	// interrupted worker-side stageTask left a partial generation
+	// directory here before this pause's rename ever runs.
+	if err := os.MkdirAll(final, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(final, "vmstate.snap"), []byte("stale-residue"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	occupying := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_, _, _ = stagingFlights.Do(final, func() (any, error) {
+			close(occupying)
+			<-release
+			return nil, nil
+		})
+	}()
+	<-occupying // the foreign flight is registered and holding the key
+
+	staged := map[string]string{"vmstate.snap": filepath.Join(pendingDir, "vmstate.snap")}
+	done := make(chan struct{})
+	var outPaths map[string]string
+	var finishErr error
+	go func() {
+		outPaths, finishErr = FinishPendingStage(pendingDir, generation, staged)
+		close(done)
+	}()
+
+	// Give FinishPendingStage's first Do call a chance to actually join
+	// the foreign flight before releasing it.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	<-done
+
+	if finishErr != nil {
+		t.Fatalf("FinishPendingStage: %v", finishErr)
+	}
+	got, err := os.ReadFile(outPaths["vmstate.snap"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, correct) {
+		t.Fatalf("final holds %q, want the correct staged bytes %q: coalescing into the foreign flight must not have been trusted blindly", got, correct)
+	}
+}
+
+// An interrupted worker-side stageTask can leave a same-size but
+// divergent rootfs.ext4 at the generation path (the mutable source
+// changed mid-copy). Absorbing on size alone would discard the correct
+// pending copy and enqueue the divergent one, which the uploader's own
+// verification then rejects, losing the pause. Content, not just size,
+// must match before absorbing.
+func TestFinishPendingStageReplacesDivergentSameSizeResidue(t *testing.T) {
+	root := t.TempDir()
+	sbDir := filepath.Join(root, "sb")
+	pendingDir := filepath.Join(sbDir, "pending-tok")
+	if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), []byte("vmstate-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	correctDisk := []byte("correct-disk-bytes-of-fixed-size")
+	if err := os.WriteFile(filepath.Join(pendingDir, "rootfs.ext4"), correctDisk, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	generation := "gen-divergent"
+	final := filepath.Join(sbDir, generation)
+	if err := os.MkdirAll(final, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// vmstate matches (same bytes) but rootfs.ext4 is the same size,
+	// different content: exactly what an interrupted stageTask residue
+	// looks like.
+	if err := os.WriteFile(filepath.Join(final, "vmstate.snap"), []byte("vmstate-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	divergentDisk := append([]byte(nil), correctDisk...)
+	divergentDisk[0] ^= 0xFF
+	if err := os.WriteFile(filepath.Join(final, "rootfs.ext4"), divergentDisk, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staged := map[string]string{
+		"vmstate.snap": filepath.Join(pendingDir, "vmstate.snap"),
+		"rootfs.ext4":  filepath.Join(pendingDir, "rootfs.ext4"),
+	}
+	outPaths, err := FinishPendingStage(pendingDir, generation, staged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(outPaths["rootfs.ext4"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, correctDisk) {
+		t.Fatalf("final rootfs.ext4 = %q, want the correct pending bytes %q: divergent same-size residue must not be absorbed", got, correctDisk)
+	}
+}
+
+// Absorbing a pre-existing generation directory with no base.pin
+// (worker-side stageTask never pins one) must not discard pendingDir's
+// pin along with the rest of pendingDir: the pin is the only thing
+// protecting the pause-time base from template GC, and final's content
+// being otherwise correct doesn't change that.
+func TestFinishPendingStageTransfersBasePinWhenAbsorbing(t *testing.T) {
+	root := t.TempDir()
+	sbDir := filepath.Join(root, "sb")
+	pendingDir := filepath.Join(sbDir, "pending-tok")
+	if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), []byte("vmstate-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pendingDir, "rootfs.ext4"), []byte("disk-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pinContent := []byte("pinned base bytes")
+	if err := os.WriteFile(filepath.Join(pendingDir, BasePinName), pinContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	generation := "gen-absorb-pin"
+	final := filepath.Join(sbDir, generation)
+	if err := os.MkdirAll(final, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(final, "vmstate.snap"), []byte("vmstate-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(final, "rootfs.ext4"), []byte("disk-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staged := map[string]string{
+		"vmstate.snap": filepath.Join(pendingDir, "vmstate.snap"),
+		"rootfs.ext4":  filepath.Join(pendingDir, "rootfs.ext4"),
+	}
+	if _, err := FinishPendingStage(pendingDir, generation, staged); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(final, BasePinName))
+	if err != nil {
+		t.Fatalf("base.pin missing from final after absorption: %v", err)
+	}
+	if !bytes.Equal(got, pinContent) {
+		t.Fatalf("transferred pin content = %q, want %q", got, pinContent)
 	}
 }

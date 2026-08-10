@@ -565,6 +565,13 @@ func main() {
 		if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
 			log.Fatal().Err(err).Str("path", stagingRoot).Msg("failed to create backup staging dir")
 		}
+		// Renew every durable marker's staged directory before the sweep
+		// runs: the sweep is synchronous and ordered ahead of reattach (and
+		// so ahead of RecoverPendingBackups), so a marker that survived an
+		// outage longer than the sweep's orphan horizon needs this renewal
+		// or it reads as an abandoned directory and gets deleted out from
+		// under a still-durable pause.
+		mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
 		backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
 		uploader.StagingRoot = stagingRoot
 		mgr.SetBackupStaging(stagingRoot)
