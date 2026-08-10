@@ -571,6 +571,29 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 	}, nil
 }
 
+// HashFileApparent digests a file's full apparent content the sparse
+// way: data extents are read from disk and holes are hashed as zeros
+// without touching disk, producing exactly the digest a sequential read
+// would while reading only the real bytes. A multi-GB overlay whose
+// real data is tens of MB hashes in the time of the tens of MB (plus
+// SHA over the zero runs), not the gigabytes.
+func HashFileApparent(ctx context.Context, path string) (string, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	extents, apparent, err := Extents(f)
+	if err != nil {
+		return "", 0, fmt.Errorf("extents %s: %w", path, err)
+	}
+	sum, err := hashApparent(ctx, f, extents, apparent)
+	if err != nil {
+		return "", 0, err
+	}
+	return sum, apparent, nil
+}
+
 // hashApparent digests the file's full apparent content from its extent
 // table: data extents from disk, holes as zeros without touching disk.
 // This must equal the pause manifest's digest, and restore recomputes the
