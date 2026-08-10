@@ -49,6 +49,11 @@ locals {
   })
 
   api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
+
+  # Promotion switch: the control plane dials whichever host this selects.
+  # Flipping active_sandbox_host to "standby" (tfvars) and applying is the
+  # whole cutover — the API redeploys pointed at the standby's IP.
+  active_vmd_ip = var.active_sandbox_host == "standby" ? module.sandbox_host_b.internal_ip : module.sandbox_host.internal_ip
 }
 module "network" {
   source = "../../../modules/network"
@@ -147,7 +152,7 @@ module "api" {
     SECRETS_SIGNING_KEY_ID = "v1"
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "12"
-    VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
+    VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
   }
 
@@ -221,7 +226,8 @@ module "sandbox_host" {
 
 # Second host for the cell: a cold standby, normally kept stopped.
 # Labeled vmd-usw2-2 instead of vmd so auto-deploys skip this host while it is
-# not in service. Rename the label to component=vmd when it joins the fleet.
+# not in service. Promotion = rename the label to component=vmd (deploys) AND
+# set active_sandbox_host = "standby" (routes the control plane here).
 module "sandbox_host_b" {
   source = "../../../modules/sandbox-host"
 
