@@ -225,9 +225,10 @@ module "sandbox_host" {
 }
 
 # Second host for the cell: a cold standby, normally kept stopped.
-# Labeled vmd-usw2-2 instead of vmd so auto-deploys skip this host while it is
-# not in service. Promotion = rename the label to component=vmd (deploys) AND
-# set active_sandbox_host = "standby" (routes the control plane here).
+# While not in service it is labeled vmd-usw2-2 instead of vmd so auto-deploys
+# skip it. Promotion = set active_sandbox_host = "standby" and apply: the one
+# switch routes the control plane here AND relabels the host into the deploy
+# fleet, so neither half can be forgotten or reverted by a later apply.
 module "sandbox_host_b" {
   source = "../../../modules/sandbox-host"
 
@@ -241,7 +242,7 @@ module "sandbox_host_b" {
   internal_ip   = "10.1.0.3"
   tags          = ["vmd-usw2"]
   labels = merge(local.sandbox_host_labels, {
-    component                  = "vmd-usw2-2"
+    component                  = var.active_sandbox_host == "standby" ? "vmd" : "vmd-usw2-2"
     sandbox_role               = "vmd"
     "vanta-contains-user-data" = "true"
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
