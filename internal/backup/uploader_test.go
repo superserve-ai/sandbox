@@ -1989,3 +1989,110 @@ func TestFinishPendingStageRetriesWhenFlightKeyIsForeign(t *testing.T) {
 		t.Fatalf("final holds %q, want the correct staged bytes %q: coalescing into the foreign flight must not have been trusted blindly", got, correct)
 	}
 }
+
+// An interrupted worker-side stageTask can leave a same-size but
+// divergent rootfs.ext4 at the generation path (the mutable source
+// changed mid-copy). Absorbing on size alone would discard the correct
+// pending copy and enqueue the divergent one, which the uploader's own
+// verification then rejects, losing the pause. Content, not just size,
+// must match before absorbing.
+func TestFinishPendingStageReplacesDivergentSameSizeResidue(t *testing.T) {
+	root := t.TempDir()
+	sbDir := filepath.Join(root, "sb")
+	pendingDir := filepath.Join(sbDir, "pending-tok")
+	if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), []byte("vmstate-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	correctDisk := []byte("correct-disk-bytes-of-fixed-size")
+	if err := os.WriteFile(filepath.Join(pendingDir, "rootfs.ext4"), correctDisk, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	generation := "gen-divergent"
+	final := filepath.Join(sbDir, generation)
+	if err := os.MkdirAll(final, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// vmstate matches (same bytes) but rootfs.ext4 is the same size,
+	// different content: exactly what an interrupted stageTask residue
+	// looks like.
+	if err := os.WriteFile(filepath.Join(final, "vmstate.snap"), []byte("vmstate-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	divergentDisk := append([]byte(nil), correctDisk...)
+	divergentDisk[0] ^= 0xFF
+	if err := os.WriteFile(filepath.Join(final, "rootfs.ext4"), divergentDisk, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staged := map[string]string{
+		"vmstate.snap": filepath.Join(pendingDir, "vmstate.snap"),
+		"rootfs.ext4":  filepath.Join(pendingDir, "rootfs.ext4"),
+	}
+	outPaths, err := FinishPendingStage(pendingDir, generation, staged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(outPaths["rootfs.ext4"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, correctDisk) {
+		t.Fatalf("final rootfs.ext4 = %q, want the correct pending bytes %q: divergent same-size residue must not be absorbed", got, correctDisk)
+	}
+}
+
+// Absorbing a pre-existing generation directory with no base.pin
+// (worker-side stageTask never pins one) must not discard pendingDir's
+// pin along with the rest of pendingDir: the pin is the only thing
+// protecting the pause-time base from template GC, and final's content
+// being otherwise correct doesn't change that.
+func TestFinishPendingStageTransfersBasePinWhenAbsorbing(t *testing.T) {
+	root := t.TempDir()
+	sbDir := filepath.Join(root, "sb")
+	pendingDir := filepath.Join(sbDir, "pending-tok")
+	if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), []byte("vmstate-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pendingDir, "rootfs.ext4"), []byte("disk-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pinContent := []byte("pinned base bytes")
+	if err := os.WriteFile(filepath.Join(pendingDir, BasePinName), pinContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	generation := "gen-absorb-pin"
+	final := filepath.Join(sbDir, generation)
+	if err := os.MkdirAll(final, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(final, "vmstate.snap"), []byte("vmstate-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(final, "rootfs.ext4"), []byte("disk-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staged := map[string]string{
+		"vmstate.snap": filepath.Join(pendingDir, "vmstate.snap"),
+		"rootfs.ext4":  filepath.Join(pendingDir, "rootfs.ext4"),
+	}
+	if _, err := FinishPendingStage(pendingDir, generation, staged); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(final, BasePinName))
+	if err != nil {
+		t.Fatalf("base.pin missing from final after absorption: %v", err)
+	}
+	if !bytes.Equal(got, pinContent) {
+		t.Fatalf("transferred pin content = %q, want %q", got, pinContent)
+	}
+}

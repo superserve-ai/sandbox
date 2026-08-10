@@ -247,16 +247,16 @@ func TestBaseDigestCoalescesAcrossDistinctReadPaths(t *testing.T) {
 	if err := os.WriteFile(base, []byte("shared base bytes"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Independent copies, not hard links to base: unlinking a hard link
-	// bumps the shared inode's ctime, which would change base's own
-	// identity as a side effect and defeat this test's premise that
-	// removing the read paths afterward has no bearing on the cache.
+	// Real hard links, matching what StagePending actually creates:
+	// baseDigest verifies readPath and keyPath are still the same file
+	// before trusting the shared cache key, so independent same-content
+	// copies would not exercise that path.
 	pin1 := filepath.Join(dir, "pin1")
 	pin2 := filepath.Join(dir, "pin2")
-	if err := os.WriteFile(pin1, []byte("shared base bytes"), 0o644); err != nil {
+	if err := os.Link(base, pin1); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(pin2, []byte("shared base bytes"), 0o644); err != nil {
+	if err := os.Link(base, pin2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -272,21 +272,20 @@ func TestBaseDigestCoalescesAcrossDistinctReadPaths(t *testing.T) {
 		t.Fatalf("digest via pin1 = %q, via pin2 = %q, want the same cached result for the shared keyPath", v1, v2)
 	}
 
-	// Deleting both pins' read paths must not matter for a subsequent
-	// call: the cache already holds the digest keyed on the still-live
-	// base path, so nothing needs to be read again.
-	if err := os.Remove(pin1); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(pin2); err != nil {
-		t.Fatal(err)
-	}
+	// A third call with a deliberately nonexistent readPath must still
+	// succeed by hitting the cache rather than trying to read it: proof
+	// the cached result is keyed on keyPath, not on either pin. base
+	// itself (and so its identity) is never touched here — unlinking
+	// pin1 or pin2 would bump base's own ctime as a side effect (they
+	// share one inode), which would change the very key this is trying
+	// to hit, so this test leaves them in place rather than removing
+	// them.
 	v3, err := baseDigest(context.Background(), "/nonexistent-must-not-be-read", base)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if v3 != v1 {
-		t.Fatal("cache miss after both pins were removed: caching is not keyed on keyPath")
+		t.Fatal("cache miss with a nonexistent readPath: caching is not keyed on keyPath")
 	}
 }
 
@@ -315,5 +314,51 @@ func TestBaseDigestSurvivesDeletedKeyPath(t *testing.T) {
 	want := sha256.Sum256([]byte("base bytes"))
 	if sum != hex.EncodeToString(want[:]) {
 		t.Fatalf("digest = %s, want %s", sum, hex.EncodeToString(want[:]))
+	}
+}
+
+// A pause pins the base's old inode via a hard link; if the shared base
+// path is then replaced with new content before the worker gets around
+// to hashing (readPath still the old pin, keyPath now describing the
+// new file), sharing keyPath's identity as the cache key would cache
+// the OLD bytes under the NEW base's key, corrupting every future
+// pause of the replacement base.
+func TestBaseDigestDoesNotPoisonCacheWhenKeyPathIsReplaced(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(base, []byte("original base bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pin := filepath.Join(dir, "pin")
+	if err := os.Link(base, pin); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replace the shared base with different content at the same path,
+	// as if this happened after the pause pinned the old inode but
+	// before the worker hashed it.
+	if err := os.Remove(base); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(base, []byte("replacement base bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pinnedSum, err := baseDigest(context.Background(), pin, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPinned := sha256.Sum256([]byte("original base bytes"))
+	if pinnedSum != hex.EncodeToString(wantPinned[:]) {
+		t.Fatalf("pinned digest = %s, want the old (pinned) bytes' digest", pinnedSum)
+	}
+
+	freshSum, err := baseDigest(context.Background(), base, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFresh := sha256.Sum256([]byte("replacement base bytes"))
+	if freshSum != hex.EncodeToString(wantFresh[:]) {
+		t.Fatalf("fresh digest = %s, want the replacement bytes' digest (cache was poisoned by the pinned call)", freshSum)
 	}
 }

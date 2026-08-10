@@ -241,6 +241,30 @@ func baseDigest(ctx context.Context, readPath, keyPath string) (string, error) {
 	if v, ok := baseDigestCache.Load(key); ok {
 		return v.(string), nil
 	}
+	if readPath != keyPath {
+		// Cache miss under keyPath's identity, about to hash readPath and
+		// store under key. keyPath may have been replaced (new content
+		// at the same shared path) after this pause pinned the old
+		// inode but before this worker got around to hashing it;
+		// baseIdentity's string always differs between readPath and
+		// keyPath (it embeds the path itself), so it can't be compared
+		// directly — stat both and check they're still the same
+		// underlying file instead. Trusting keyPath's identity as the
+		// cache key without this would cache readPath's (old) bytes
+		// under the replacement base's key, silently poisoning every
+		// future pause of the new base. Only worth doing on a miss: a
+		// cache hit under keyPath's current identity is trustworthy on
+		// its own and needs no comparison against readPath at all.
+		if same, serr := sameFile(readPath, keyPath); serr != nil || !same {
+			key, err = baseIdentity(readPath)
+			if err != nil {
+				return "", err
+			}
+			if v, ok := baseDigestCache.Load(key); ok {
+				return v.(string), nil
+			}
+		}
+	}
 	// DoChan rather than Do: a joiner must honor its own hash budget. A
 	// synchronous pause joining a hash started under the async rehash's
 	// ten-minute budget would otherwise block far past the pause RPC
@@ -295,6 +319,22 @@ func baseIdentity(path string) (string, error) {
 	// change is visible there.
 	return fmt.Sprintf("%s|%d|%d|%d|%d|%d",
 		path, st.Dev, st.Ino, fi.Size(), fi.ModTime().UnixNano(), st.Ctim.Nano()), nil
+}
+
+// sameFile reports whether a and b currently identify the same inode
+// (os.SameFile is dev+ino based, so it's a definitive answer, unlike
+// comparing two baseIdentity strings which always differ on the
+// embedded path even for hard links to one file).
+func sameFile(a, b string) (bool, error) {
+	fa, err := os.Stat(a)
+	if err != nil {
+		return false, err
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(fa, fb), nil
 }
 
 // collectBuildManifest hashes every artifact file in a completed build's

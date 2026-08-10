@@ -277,6 +277,17 @@ func finishPendingRename(pendingDir, final string, staged map[string]string) err
 		// the generation identity); anything less is replaced by the
 		// complete pending copy rather than absorbing it.
 		if pendingAbsorbable(final, pendingDir, staged) {
+			// final may be worker-side stageTask residue, which never
+			// pins a base: dropping pendingDir without first moving its
+			// pin over would discard the only thing protecting the
+			// pause-time base from template GC, even though the
+			// immutable pause artifacts and the shared staged base are
+			// both otherwise fine.
+			if transferBasePin(pendingDir, final) {
+				if err := syncDir(final); err != nil {
+					return err
+				}
+			}
 			_ = os.RemoveAll(pendingDir)
 		} else {
 			if err := os.RemoveAll(final); err != nil {
@@ -290,6 +301,34 @@ func finishPendingRename(pendingDir, final string, staged map[string]string) err
 	now := time.Now()
 	_ = os.Chtimes(final, now, now)
 	return nil
+}
+
+// transferBasePin moves a pause-time base pin from pendingDir into final
+// when absorbing final's pre-existing content in its place: final may
+// come from the worker-side stageTask path, which never pins a base,
+// and simply dropping pendingDir would otherwise discard the only thing
+// protecting the pause-time base from template GC. Reports whether a
+// transfer actually happened, so the caller knows whether final needs a
+// fresh directory sync.
+func transferBasePin(pendingDir, final string) bool {
+	src := filepath.Join(pendingDir, BasePinName)
+	if _, err := os.Stat(src); err != nil {
+		return false // nothing to transfer
+	}
+	dst := filepath.Join(final, BasePinName)
+	if _, err := os.Stat(dst); err == nil {
+		return false // final already has its own pin
+	}
+	if err := os.Rename(src, dst); err != nil {
+		// Best-effort: EXDEV shouldn't happen (both are under the same
+		// staging root) but a hard-link fallback covers it; failing to
+		// transfer at all just means the worker degrades to identity
+		// proofs over DiskBasePath, same as an unpinned pause.
+		if err := os.Link(src, dst); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // StageSharedBase ensures a base image's content snapshot exists under
@@ -326,10 +365,51 @@ func pendingAbsorbable(final, pendingDir string, staged map[string]string) bool 
 		if serr != nil || derr != nil || sfi.Size() != dfi.Size() {
 			return false
 		}
+		// Size matching is near-informationless for a fixed geometry
+		// image (rootfs.ext4 is always the same size regardless of what
+		// the guest wrote): an interrupted worker-side stageTask can
+		// leave a same-size but divergent disk at this generation path,
+		// and absorbing it would discard the correct pending copy for a
+		// destination the uploader's own verification then rejects,
+		// losing the pause. Every staged file's actual content must
+		// match, not just vmstate's.
+		if !filesEqual(src, filepath.Join(final, name)) {
+			return false
+		}
 	}
-	want, werr := os.ReadFile(filepath.Join(pendingDir, "vmstate.snap"))
-	got, gerr := os.ReadFile(filepath.Join(final, "vmstate.snap"))
-	return werr == nil && gerr == nil && bytes.Equal(want, got)
+	return true
+}
+
+// filesEqual compares two files' content by streaming rather than
+// reading either fully into memory: rootfs.ext4 can be many gigabytes.
+func filesEqual(a, b string) bool {
+	fa, err := os.Open(a)
+	if err != nil {
+		return false
+	}
+	defer fa.Close()
+	fb, err := os.Open(b)
+	if err != nil {
+		return false
+	}
+	defer fb.Close()
+	bufA := make([]byte, 1<<20)
+	bufB := make([]byte, 1<<20)
+	for {
+		na, erra := io.ReadFull(fa, bufA)
+		nb, errb := io.ReadFull(fb, bufB)
+		if na != nb || !bytes.Equal(bufA[:na], bufB[:nb]) {
+			return false
+		}
+		doneA := erra != nil
+		doneB := errb != nil
+		if doneA != doneB {
+			return false // one file has more data than the other
+		}
+		if doneA {
+			return errors.Is(erra, io.EOF) || errors.Is(erra, io.ErrUnexpectedEOF)
+		}
+	}
 }
 
 // stagingFlights serializes concurrent writers of one staged
