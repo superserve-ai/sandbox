@@ -49,6 +49,22 @@ func restartUnit(ctx context.Context, unit string) error {
 	return nil
 }
 
+// setUnitWeight sets a unit's CPU and IO scheduling weight at runtime.
+// --runtime applies to the live unit and persists until restart, so it
+// survives daemon-reloads without the never-restarted keeper dropping back to
+// the unit file's boot default. Both controllers share one weight — the two
+// populations contend for CPU and IO the same way. A var for the test seam.
+var setUnitWeight = func(ctx context.Context, unit string, weight int) error {
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "systemctl", "set-property", "--runtime", unit,
+		fmt.Sprintf("CPUWeight=%d", weight), fmt.Sprintf("IOWeight=%d", weight))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("set-property %s weight=%d: %s: %w", unit, weight, strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
 // stopJobWaitCap bounds the wait for a stop job's completion signal when the
 // caller's ctx allows more. A legitimate stop can take two full TimeoutStopSec
 // windows (SIGTERM phase, then a second window after SIGKILL) plus ExecStopPost,
@@ -332,7 +348,7 @@ func stopUnitWithBudget(ctx context.Context, unit string) error {
 // Detached and bounded. Confirmation requires the unit FULLY down, not
 // merely deactivating: the caller releases the record and namespace on
 // true, and a D-state process can survive the SIGKILL inside a
-// deactivating unit. A var for the same test seam vmUnitDead uses.
+// deactivating unit. A var for the same test seam vmDeadForRetry uses.
 var killUnitSIGKILL = func(ctx context.Context, unit string) bool {
 	kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()

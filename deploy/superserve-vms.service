@@ -1,0 +1,38 @@
+[Unit]
+Description=Delegated cgroup subtree for direct-spawn VMs
+# Ordered before vmd so the delegated subtree exists when vmd validates and
+# adopts it at startup. Placed under sandboxes.slice so direct-spawn VMs share
+# the one aggregate memory ceiling with the legacy firecracker@ units.
+Before=superserve-vmd.service
+
+[Service]
+# A minimal keeper process owns the delegated subtree: it holds the cgroup so
+# systemd does not GC it across zero-VM windows, and gives the subtree a stable
+# lifetime handle. The keeper is not a VM-survival dependency: on its death,
+# existing VMs keep running and launches continue on the child-pinned tree.
+Type=exec
+ExecStart=/usr/bin/sleep infinity
+Slice=sandboxes.slice
+Delegate=yes
+# On systemd >= 254 the keeper starts directly inside keeper/, so a start over
+# live VM children works. Older systemd ignores this (warning) and keeps the
+# bootstrap-move flow, where such a start fails (cgroup v2 no-internal-process
+# rule) until the subtree drains; VMs are unaffected either way.
+DelegateSubgroup=keeper
+KillMode=process
+Restart=no
+# Every direct-spawn VM's processes and THREADS share this one service's task
+# ceiling (per-unit VMs never did). Left unset, systemd's TasksMax default —
+# 15% of kernel.threads-max, host-size dependent — becomes an invisible fleet
+# cap that binds as clone3 EAGAIN at create. Fleet task containment is a
+# deliberate slice/host decision, not a service default.
+TasksMax=infinity
+# The reconciler owns the real weight — 100 per live direct VM, so each direct
+# VM weighs one legacy peer at any mix (see adjustDirectSpawnWeight). These
+# lines are only the boot default until its first pass; one peer, so a cold
+# host with few direct VMs never over-weights them and starves legacy.
+CPUWeight=100
+IOWeight=100
+
+[Install]
+WantedBy=multi-user.target
