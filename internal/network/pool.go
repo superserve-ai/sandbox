@@ -575,13 +575,22 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		}
 
 		if len(p.fresh) >= p.newSize {
-			// Pool full — block until a slot is consumed or shutdown.
+			// Pool full — pre-build one slot and block until it is consumed or
+			// shutdown. Built outside the select so a shutdown while blocked
+			// can dispose of the slot instead of dropping it.
+			slot := p.mustAllocate(ctx)
+			if slot == nil {
+				// mustAllocate only returns nil at shutdown.
+				return
+			}
 			select {
 			case <-p.stopCh:
+				p.stopSlot(slot)
 				return
 			case <-ctx.Done():
+				p.stopSlot(slot)
 				return
-			case p.fresh <- p.mustAllocate(ctx):
+			case p.fresh <- slot:
 			}
 			continue
 		}
