@@ -58,8 +58,11 @@ Use [collector-gmp.yaml](/home/lando/superserve-ai/sandbox/deploy/otel/collector
 - receives OTLP from the control plane on `4317` and `4318`
 - exports to GMP through `googlemanagedprometheus`
 - scrapes collector self-metrics from `127.0.0.1:8888`
+- scrapes root-filesystem utilization through `hostmetrics`, scoped to the root mountpoint only so the series means the OS disk rather than the sandbox data arrays, and stamps it with `host_id` from `HOST_ID` in `collector.env` (written by the deploy path, matches the instance name)
 - drops banned high-cardinality labels before export
 - keeps exporter queueing and memory limiting visible through self-metrics
+
+Alert policies over the root-filesystem series live next to the backup policies in `infra/modules/observability/backup-alerts.tf`.
 
 ### Bare-metal host deployment
 

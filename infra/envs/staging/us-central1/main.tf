@@ -306,6 +306,13 @@ module "observability" {
     display_prefix      = "Backup / ${module.sandbox_host.instance_name}"
     alert_disabled_host = false
   }
+  # Root-filesystem (OS disk) utilization, same policies as the production
+  # cells so staging validates the query shape first. Module defaults:
+  # warn at 85% sustained 30 minutes, page at 95%.
+  host_disk_alerts = {
+    host_id        = module.sandbox_host.instance_name
+    display_prefix = "Infrastructure / ${module.sandbox_host.instance_name}"
+  }
   dashboards = {
     sandbox_operations = {
       display_name = "Sandbox Telemetry / Staging Operations"

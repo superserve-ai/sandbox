@@ -132,3 +132,83 @@ resource "google_monitoring_alert_policy" "backup" {
     managed_by = "terraform"
   })
 }
+
+# Host root-filesystem alerting. The host-local collector's hostmetrics
+# receiver exports utilization for the root mountpoint only (the sandbox
+# data arrays are separate filesystems with their own reclaim logic), so
+# these policies watch the OS disk that the host's control services live
+# on. Series carry the same bounded host_id label as the backup metrics.
+
+locals {
+  host_disk_matcher = var.host_disk_alerts == null ? "" : "host_id=\"${var.host_disk_alerts.host_id}\""
+
+  host_disk_alert_conditions = var.host_disk_alerts == null ? {} : {
+    root_fs_warning = {
+      display_name = "${var.host_disk_alerts.display_prefix} / root filesystem filling"
+      severity     = "WARNING"
+      # 85% still leaves working headroom for logs, package state, and
+      # deploy artifacts, so cleanup can happen deliberately instead of
+      # under pressure. Sustaining it for 30 minutes filters spikes from
+      # transient files that free themselves.
+      query         = "max(system_filesystem_utilization{mountpoint=\"/\", ${local.host_disk_matcher}}) > ${var.host_disk_alerts.warning_utilization}"
+      duration      = var.host_disk_alerts.warning_duration
+      documentation = <<-EOT
+        Root filesystem utilization on ${var.host_disk_alerts.host_id} has stayed above ${format("%.0f", var.host_disk_alerts.warning_utilization * 100)}% for the alert window. This is the OS disk, not the sandbox data arrays; it holds logs, journals, package state, and deployed binaries, and it has no automatic reclaim.
+
+        Owner: Infrastructure Operations. Response: find the growth with `sudo du -x -d1 /` on the host (journal, /var/log, and /tmp are the usual suspects), clean up or rotate, and confirm utilization drops back below the threshold. If steady-state usage has genuinely grown, resize before it reaches the paging threshold.
+      EOT
+    }
+
+    root_fs_critical = {
+      display_name = "${var.host_disk_alerts.display_prefix} / root filesystem near capacity"
+      severity     = "CRITICAL"
+      # At 95% the OS disk is close to exhaustion: writes for logs,
+      # journals, and system state start failing shortly after, which
+      # takes down the host's control services and blocks deploys. That
+      # is worth a page while there is still room to act; the short
+      # window only debounces single-scrape blips.
+      query         = "max(system_filesystem_utilization{mountpoint=\"/\", ${local.host_disk_matcher}}) > ${var.host_disk_alerts.critical_utilization}"
+      duration      = var.host_disk_alerts.critical_duration
+      documentation = <<-EOT
+        Root filesystem utilization on ${var.host_disk_alerts.host_id} is above ${format("%.0f", var.host_disk_alerts.critical_utilization * 100)}%. The OS disk is close to exhaustion; once writes fail, the host's control services (vmd, the collector, systemd journal) degrade and deploys to the host stop working.
+
+        Owner: Infrastructure Operations. Response: free space immediately (`sudo journalctl --vacuum-size=500M`, clear /tmp and old artifacts under /var), then chase the source of growth. Treat sustained utilization at this level as a capacity problem, not a cleanup problem.
+      EOT
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "host_disk" {
+  for_each = local.host_disk_alert_conditions
+
+  project               = var.project_id
+  display_name          = each.value.display_name
+  combiner              = "OR"
+  enabled               = true
+  severity              = each.value.severity
+  notification_channels = var.notification_channel_ids
+
+  conditions {
+    display_name = each.value.display_name
+
+    condition_prometheus_query_language {
+      query               = each.value.query
+      duration            = each.value.duration
+      evaluation_interval = "30s"
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  documentation {
+    content   = each.value.documentation
+    mime_type = "text/markdown"
+  }
+
+  user_labels = merge(var.labels, {
+    alert_type = "host_disk_${each.key}"
+    managed_by = "terraform"
+  })
+}

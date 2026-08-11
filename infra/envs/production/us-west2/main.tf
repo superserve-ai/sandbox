@@ -301,6 +301,13 @@ module "observability" {
     host_id        = module.sandbox_host.instance_name
     display_prefix = "Backup / ${module.sandbox_host.instance_name}"
   }
+  # Root-filesystem (OS disk) utilization for the same host, scoped through
+  # the same host_id label the backup metrics use. Module defaults: warn at
+  # 85% sustained 30 minutes, page at 95%.
+  host_disk_alerts = {
+    host_id        = module.sandbox_host.instance_name
+    display_prefix = "Infrastructure / ${module.sandbox_host.instance_name}"
+  }
   labels = local.common_labels
 }
 

@@ -132,3 +132,33 @@ variable "backup_alerts" {
   })
   default = null
 }
+
+variable "host_disk_alerts" {
+  description = <<-EOT
+    Alert policies over root-filesystem utilization exported by the
+    host-local OTel collector's hostmetrics receiver, scoped to one
+    cell's vmd host via the host_id metric label (stamped from HOST_ID
+    in the collector env, which matches the instance name). The metric
+    covers the root mountpoint only, so utilization means the OS disk
+    rather than the sandbox data arrays. Null disables the set.
+  EOT
+  type = object({
+    host_id        = string
+    display_prefix = string
+    # Warning threshold as a fraction of capacity. 85% still leaves
+    # working headroom for logs, package state, and deploy artifacts,
+    # so cleanup can happen deliberately instead of under pressure.
+    warning_utilization = optional(number, 0.85)
+    # Sustained window for the warning. 30 minutes filters spikes from
+    # transient files that free themselves.
+    warning_duration = optional(string, "1800s")
+    # Paging threshold. At 95% the OS disk is close to exhaustion:
+    # writes for logs, journals, and system state start failing shortly
+    # after, which takes down the host's control services.
+    critical_utilization = optional(number, 0.95)
+    # Short window on the paging path; it only debounces single-scrape
+    # blips.
+    critical_duration = optional(string, "300s")
+  })
+  default = null
+}
