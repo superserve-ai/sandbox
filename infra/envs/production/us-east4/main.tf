@@ -151,11 +151,11 @@ module "api" {
 
   cpu_limit    = "2"
   memory_limit = "1Gi"
-  # 6 matches the live service (raised from 2 during burst tuning). scaling is
-  # in the module's ignore_changes, but that path is ineffective for the v2
-  # resource, so declaring the live value keeps the plan a no-op.
-  min_instances     = 6
-  max_instances     = 100
+  # max_instances * DB_MAX_CONNS must stay under the pooler's client-connection
+  # limit; raising either means re-checking that product. Declared rather than
+  # left to drift: the module's ignore_changes is ineffective for the v2 resource.
+  min_instances     = 10
+  max_instances     = 30
   startup_cpu_boost = true
   cpu_idle          = true
 
