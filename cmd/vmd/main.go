@@ -651,8 +651,9 @@ func main() {
 	// ---- Backup metrics sampler ----
 	// Periodic gauges every 30s: the enabled flag, journal depth and
 	// backlog age, pending-marker count, and outbox depth. All reads are
-	// read-only BoltDB views off the hot path; any error just skips that
-	// field for the sample and can never affect backup behavior.
+	// read-only BoltDB views off the hot path; a failed read drops that
+	// gauge from the sample instead of publishing a false zero, and can
+	// never affect backup behavior.
 	if backupMetrics != nil {
 		sample := func() {
 			s := telemetry.BackupSample{Enabled: backupBucket != ""}
@@ -661,16 +662,30 @@ func main() {
 					s.PendingPause = pending[backup.PriorityPause]
 					s.PendingCheckpoint = pending[backup.PriorityCheckpoint]
 					s.PendingBestEffort = pending[backup.PriorityBestEffort]
+					s.PendingOK = true
+				} else {
+					log.Warn().Err(err).Msg("backup metrics: journal pending read failed, dropping gauge from sample")
 				}
-				if oldest, ok, err := backupJournal.OldestEnqueuedAt(); err == nil && ok {
-					s.OldestPendingAge = time.Since(oldest)
+				if oldest, ok, err := backupJournal.OldestEnqueuedAt(); err == nil {
+					if ok {
+						s.OldestPendingAge = time.Since(oldest)
+					}
+					s.OldestPendingAgeOK = true
+				} else {
+					log.Warn().Err(err).Msg("backup metrics: oldest-pending read failed, dropping gauge from sample")
 				}
 				if depth, err := backupJournal.OutboxDepth(); err == nil {
 					s.OutboxPending = depth
+					s.OutboxPendingOK = true
+				} else {
+					log.Warn().Err(err).Msg("backup metrics: outbox depth read failed, dropping gauge from sample")
 				}
 			}
 			if markers, err := stateStore.ListPendingBackups(); err == nil {
 				s.PendingMarkers = len(markers)
+				s.PendingMarkersOK = true
+			} else {
+				log.Warn().Err(err).Msg("backup metrics: pending markers read failed, dropping gauge from sample")
 			}
 			backupMetrics.RecordSample(ctx, s)
 		}

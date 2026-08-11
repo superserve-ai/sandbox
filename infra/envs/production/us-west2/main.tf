@@ -56,6 +56,12 @@ locals {
   # started for an incident is never stopped again by a later apply.
   active_vmd_ip = var.active_sandbox_host == "standby" ? module.sandbox_host_b.internal_ip : module.sandbox_host.internal_ip
 
+  # The host currently serving vmd traffic, and so the host whose HOST_ID
+  # tags its metrics. Alert filters must key on this, not on sandbox_host,
+  # or a standby promotion leaves them watching a host_id that stopped
+  # emitting.
+  active_host_name = var.active_sandbox_host == "standby" ? module.sandbox_host_b.instance_name : module.sandbox_host.instance_name
+
   # Exactly one host carries component=vmd, the label the shared deploy
   # pipeline discovers; the other is parked under a cell-scoped label so
   # rollouts skip it instead of failing against a host that is out of service.
@@ -294,12 +300,14 @@ module "observability" {
     }
   }
   # Backup pipeline alerts scoped to this cell's host via the host_id
-  # metric label (HOST_ID on the host matches the instance name).
+  # metric label (HOST_ID on the host matches the instance name). Follows
+  # active_sandbox_host so a standby promotion keeps the filter on whichever
+  # host is actually emitting.
   # Thresholds are the module defaults; the rationale for each sits on
   # the module's variables.
   backup_alerts = {
-    host_id        = module.sandbox_host.instance_name
-    display_prefix = "Backup / ${module.sandbox_host.instance_name}"
+    host_id        = local.active_host_name
+    display_prefix = "Backup / ${local.active_host_name}"
   }
   # Root-filesystem (OS disk) utilization for the same host, scoped through
   # the same host_id label the backup metrics use. Module defaults: warn at

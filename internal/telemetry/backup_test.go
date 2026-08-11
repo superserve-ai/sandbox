@@ -137,13 +137,17 @@ func TestBackupRecorderRecordsSampleGauges(t *testing.T) {
 	r, reader := testBackupRecorder(t)
 
 	r.RecordSample(ctx, BackupSample{
-		Enabled:           false,
-		PendingPause:      3,
-		PendingCheckpoint: 2,
-		PendingBestEffort: 1,
-		OldestPendingAge:  90 * time.Second,
-		PendingMarkers:    4,
-		OutboxPending:     5,
+		Enabled:            false,
+		PendingPause:       3,
+		PendingCheckpoint:  2,
+		PendingBestEffort:  1,
+		PendingOK:          true,
+		OldestPendingAge:   90 * time.Second,
+		OldestPendingAgeOK: true,
+		PendingMarkers:     4,
+		PendingMarkersOK:   true,
+		OutboxPending:      5,
+		OutboxPendingOK:    true,
 	})
 
 	metrics := collectMetrics(t, reader)
@@ -195,11 +199,36 @@ func TestBackupRecorderClampsNegativeAge(t *testing.T) {
 	ctx := context.Background()
 	r, reader := testBackupRecorder(t)
 
-	r.RecordSample(ctx, BackupSample{Enabled: true, OldestPendingAge: -time.Minute})
+	r.RecordSample(ctx, BackupSample{Enabled: true, OldestPendingAge: -time.Minute, OldestPendingAgeOK: true})
 
 	metrics := collectMetrics(t, reader)
 	age := metrics["backup_oldest_pending_age_seconds"].Data.(metricdata.Gauge[float64])
 	if len(age.DataPoints) != 1 || age.DataPoints[0].Value != 0 {
 		t.Fatalf("backup_oldest_pending_age_seconds = %#v, want one point of 0", age.DataPoints)
+	}
+}
+
+// A failed read must drop its gauge from the sample rather than publish a
+// zero: a zero backlog age would reset the sustained-backlog alert, and a
+// zero outbox depth would suppress the stalled-outbox alert.
+func TestBackupRecorderOmitsGaugesOnUnreadFields(t *testing.T) {
+	ctx := context.Background()
+	r, reader := testBackupRecorder(t)
+
+	r.RecordSample(ctx, BackupSample{Enabled: true})
+
+	metrics := collectMetrics(t, reader)
+	for _, name := range []string{
+		"backup_journal_pending",
+		"backup_oldest_pending_age_seconds",
+		"backup_pending_markers",
+		"backup_outbox_pending",
+	} {
+		if _, ok := metrics[name]; ok {
+			t.Fatalf("%s was recorded despite its OK flag being false", name)
+		}
+	}
+	if _, ok := metrics["backup_enabled"]; !ok {
+		t.Fatal("backup_enabled must always be recorded, even when other reads fail")
 	}
 }

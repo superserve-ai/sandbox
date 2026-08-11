@@ -38,16 +38,26 @@ type BackupOTelConfig struct {
 // Enabled is emitted even when the pipeline is off: a production host
 // running with backup silently disabled must be visible as
 // backup_enabled=0, not as an absence of data.
+// Each read that backs a gauge below carries its own OK flag: a failed
+// BoltDB/state-store read must drop that gauge from the sample rather than
+// publish a zero, which would read as an empty queue and could reset the
+// backlog-age alert or suppress the stalled-outbox alert.
 type BackupSample struct {
-	Enabled           bool
-	PendingPause      int
-	PendingCheckpoint int
-	PendingBestEffort int
+	Enabled bool
+
+	PendingPause, PendingCheckpoint, PendingBestEffort int
+	PendingOK                                          bool
+
 	// OldestPendingAge is the age of the oldest queued task's enqueue
 	// time; zero when the queue is empty.
-	OldestPendingAge time.Duration
+	OldestPendingAge   time.Duration
+	OldestPendingAgeOK bool
+
 	PendingMarkers   int
-	OutboxPending    int
+	PendingMarkersOK bool
+
+	OutboxPending   int
+	OutboxPendingOK bool
 }
 
 // BackupRecorder emits the backup pipeline's bounded operational metrics
@@ -80,8 +90,8 @@ type BackupRecorder struct {
 // chosen for milliseconds, which would collapse every second-scale
 // observation into one bucket and make the p99 alerts meaningless.
 var (
-	// Hook and staging work is O(dirtied bytes): normally tens of ms,
-	// regressions (the hashing incident) land in whole seconds.
+	// Hook and staging work is O(dirtied bytes): normally tens of ms; a
+	// disk-size-scaled synchronous regression lands in whole seconds.
 	backupFastBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
 	// Hashing and uploads scale with artifact size under the bandwidth
 	// cap: seconds for typical overlays, minutes for multi-GB bases.
@@ -241,19 +251,27 @@ func (r *BackupRecorder) RecordSample(ctx context.Context, s BackupSample) {
 		enabled = 1
 	}
 	r.enabled.Record(ctx, enabled, opt)
-	r.journalPending.Record(ctx, int64(s.PendingPause),
-		metric.WithAttributes(r.attrs(attribute.String("priority", BackupPriorityPause))...))
-	r.journalPending.Record(ctx, int64(s.PendingCheckpoint),
-		metric.WithAttributes(r.attrs(attribute.String("priority", BackupPriorityCheckpoint))...))
-	r.journalPending.Record(ctx, int64(s.PendingBestEffort),
-		metric.WithAttributes(r.attrs(attribute.String("priority", BackupPriorityBestEffort))...))
-	age := s.OldestPendingAge.Seconds()
-	if age < 0 { // clock skew must not report a negative backlog
-		age = 0
+	if s.PendingOK {
+		r.journalPending.Record(ctx, int64(s.PendingPause),
+			metric.WithAttributes(r.attrs(attribute.String("priority", BackupPriorityPause))...))
+		r.journalPending.Record(ctx, int64(s.PendingCheckpoint),
+			metric.WithAttributes(r.attrs(attribute.String("priority", BackupPriorityCheckpoint))...))
+		r.journalPending.Record(ctx, int64(s.PendingBestEffort),
+			metric.WithAttributes(r.attrs(attribute.String("priority", BackupPriorityBestEffort))...))
 	}
-	r.oldestPendingAge.Record(ctx, age, opt)
-	r.pendingMarkers.Record(ctx, int64(s.PendingMarkers), opt)
-	r.outboxPending.Record(ctx, int64(s.OutboxPending), opt)
+	if s.OldestPendingAgeOK {
+		age := s.OldestPendingAge.Seconds()
+		if age < 0 { // clock skew must not report a negative backlog
+			age = 0
+		}
+		r.oldestPendingAge.Record(ctx, age, opt)
+	}
+	if s.PendingMarkersOK {
+		r.pendingMarkers.Record(ctx, int64(s.PendingMarkers), opt)
+	}
+	if s.OutboxPendingOK {
+		r.outboxPending.Record(ctx, int64(s.OutboxPending), opt)
+	}
 }
 
 func (r *BackupRecorder) attrs(extra ...attribute.KeyValue) []attribute.KeyValue {
