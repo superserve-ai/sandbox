@@ -254,9 +254,8 @@ parse_allocation_source_from_log() {
   ' <<<"$log_json" | tail -n 1
 }
 
-latest_vmd_vm_logs() {
+latest_vmd_logs() {
   local since="$1"
-  local sandbox_id="$2"
   local response status body
 
   response="$(ssh_request \
@@ -266,13 +265,23 @@ latest_vmd_vm_logs() {
   body="$(tail -n +2 <<<"$response")"
 
   if [[ "$status" != "0" ]]; then
-    fail "failed to read vmd logs for sandbox ${sandbox_id} from ${SSH_TARGET}"
+    fail "failed to read vmd logs from ${SSH_TARGET}: ${body}"
   fi
+
+  printf '%s\n' "$body"
+}
+
+latest_vmd_vm_logs() {
+  local since="$1"
+  local sandbox_id="$2"
+  local logs
+
+  logs="$(latest_vmd_logs "$since")"
 
   jq -Rc --arg sid "$sandbox_id" '
     fromjson?
     | select(.vm_id == $sid)
-  ' <<<"$body"
+  ' <<<"$logs"
 }
 
 collect_slot_state() {
@@ -280,7 +289,7 @@ collect_slot_state() {
   local sandbox_id="$2"
   local stage="$3"
   local logs slot host_ip ns source
-  logs="$(latest_vmd_logs "$since" | jq -c --arg sid "$sandbox_id" 'select(.MESSAGE? != null) | .MESSAGE | fromjson? | select(.vm_id == $sid)')"
+  logs="$(latest_vmd_vm_logs "$since" "$sandbox_id")"
   {
     printf '## %s %s\n' "$stage" "$since"
     printf '%s\n' "$logs"
