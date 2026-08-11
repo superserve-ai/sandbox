@@ -961,6 +961,16 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 				ceiling = m.maxSlot // WithExactSlot: allow only the pinned index
 			}
 			if m.nextSlot > ceiling {
+				if m.slotPinned {
+					// A reclaim scan only ever refills freeSlots, which a
+					// pinned claim never draws from (see the comment above)
+					// — so it cannot turn this failure into a success.
+					// Skip straight to failing instead of looping forever:
+					// freeSlots staying populated (nothing here ever drains
+					// it) would otherwise keep re-passing the check below.
+					m.mu.Unlock()
+					return 0, ErrNoSlots
+				}
 				// Out of fresh range, which is not the same as out of slots:
 				// indexes are discarded (never returned) whenever a namespace
 				// outlives them, so the gaps below are the only inventory left.
@@ -981,7 +991,10 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 				// loses it, in which case this call's own n is 0 even though
 				// the winner just refilled freeSlots. Trusting n here would
 				// fail this claim with ErrNoSlots despite slots being
-				// available right now.
+				// available right now. (Safe from the same loop risk as the
+				// pinned branch above: freeSlots is drained by the pop at
+				// the top of this loop on every non-pinned iteration, so
+				// this always terminates.)
 				if len(m.freeSlots) > 0 {
 					continue
 				}
