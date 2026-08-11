@@ -104,9 +104,10 @@ variable "backup_alerts" {
     oldest_pending_age_seconds = optional(number, 1800)
     # p99 of the synchronous pause-RPC backup hook. The hook is bounded
     # by design to a marker write, an O(dirtied-bytes) staging copy, and
-    # a tens-of-KB vmstate hash: tens to low hundreds of ms. The hashing
-    # regression this alert exists for added ~5s; 2s catches that class
-    # while tolerating occasional large staged overlays.
+    # a tens-of-KB vmstate hash: tens to low hundreds of ms. A
+    # synchronous term that scales with disk size instead of dirtied
+    # bytes lands far above that; 2s catches the class while tolerating
+    # occasional large staged overlays.
     pause_hook_p99_seconds = optional(number, 2)
     # How long the completion-notification outbox may stay nonzero. The
     # outbox drains on every ack and idle tick (seconds), so an hour of

@@ -211,9 +211,8 @@ func (r *BackupRecorder) RecordStageDuration(ctx context.Context, d time.Duratio
 }
 
 // RecordPauseHookDuration observes the synchronous time the pause RPC
-// path spends in the backup hook. This is the incident metric: manifest
-// hashing once silently added seconds here with only a log to show for
-// it.
+// path spends in the backup hook. It exists so any synchronous term
+// added to this path alerts instead of surfacing only in logs.
 func (r *BackupRecorder) RecordPauseHookDuration(ctx context.Context, d time.Duration) {
 	if r == nil {
 		return

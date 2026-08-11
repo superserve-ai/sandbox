@@ -105,9 +105,9 @@ func pauseManifestComplete(manifest []ManifestEntry) bool {
 func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath, diskBasePath string, log zerolog.Logger) []ManifestEntry {
 	// The pause-hook histogram measures exactly the synchronous time this
 	// hook holds the pause RPC path (detached workers are excluded by
-	// construction: they run past the return). Manifest hashing once
-	// added seconds here with only a log line to show for it; this metric
-	// exists so that class of regression alerts instead of hiding.
+	// construction: they run past the return). A size-dependent
+	// synchronous term added here would otherwise surface only in logs;
+	// the metric makes that class of regression alert instead of hide.
 	start := time.Now()
 	defer func() {
 		m.backupMetrics.RecordPauseHookDuration(ctx, time.Since(start))
