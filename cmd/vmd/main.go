@@ -458,6 +458,7 @@ func main() {
 		LaunchViaLauncherNS:        launchViaLauncherNS,
 		LauncherNSPath:             os.Getenv("VMD_LAUNCHER_NS_PATH"),
 		DirectSpawn:                envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
+		BareVMCgroups:              envOrDefault("VMD_BARE_VM_CGROUPS", "false") == "true",
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")

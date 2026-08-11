@@ -288,9 +288,16 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 func (m *Manager) StartNetnsLeakSampler(ctx context.Context, every time.Duration) {
 	m.startSampler(ctx, "netns-leak sampler", every, func() {
 		netnsTotal, ownedSlots, orphaned := m.netMgr.NetnsStats()
-		m.log.Info().Int("netns_total", netnsTotal).Int("owned_slots", ownedSlots).
-			Int("netns_orphaned", orphaned).
-			Msg("netns leak gauge")
+		ev := m.log.Info().Int("netns_total", netnsTotal).Int("owned_slots", ownedSlots).
+			Int("netns_orphaned", orphaned)
+		// Dying descendants of the VM scope: cgroups removed but not yet
+		// reclaimed by the kernel. A stable ambient count is normal churn;
+		// sustained growth is a reference leak (e.g. pages pinning dead
+		// groups) that per-VM controller changes must not mask.
+		if d, ok := m.scopeDyingDescendants(); ok {
+			ev = ev.Int("cgroup_dying", d)
+		}
+		ev.Msg("netns leak gauge")
 	})
 }
 

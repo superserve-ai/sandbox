@@ -406,3 +406,55 @@ func TestPidsCeilingAdequate(t *testing.T) {
 		}
 	}
 }
+
+// The oom.group write must be gated on the file existing (absent under bare
+// VM cgroups, where the parent enables no controllers) — a create in a bare
+// scope must succeed without it, and must not manufacture the file.
+func TestCreateVMCgroupSkipsAbsentOOMGroup(t *testing.T) {
+	tree := &cgroupTree{vms: t.TempDir()}
+	f, err := tree.createVMCgroup("vm-1")
+	if err != nil {
+		t.Fatalf("bare create: %v", err)
+	}
+	f.Close()
+	if _, err := os.Stat(filepath.Join(tree.vms, "vm-1", "memory.oom.group")); !os.IsNotExist(err) {
+		t.Fatal("oom.group must not be created when the controller file is absent")
+	}
+}
+
+func TestDisableSpecFor(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                     "",
+		"\n":                   "",
+		"memory pids":          "-memory -pids",
+		"cpu io memory pids\n": "-cpu -io -memory -pids",
+	} {
+		if got := disableSpecFor(in); got != want {
+			t.Errorf("disableSpecFor(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// disableChildControllers must verify the post-state and refuse to report
+// success while anything remains enabled — never silently continue.
+func TestDisableChildControllersVerifies(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "cgroup.subtree_control")
+
+	// Nothing enabled: no write needed, verify passes.
+	if err := os.WriteFile(p, []byte("\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := disableChildControllers(p); err != nil {
+		t.Fatalf("empty subtree must verify clean: %v", err)
+	}
+
+	// Plain files keep the written "-..." spec, standing in for a kernel that
+	// left controllers enabled: the verify must catch it and error.
+	if err := os.WriteFile(p, []byte("memory pids"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := disableChildControllers(p); err == nil {
+		t.Fatal("controllers still visible after disable must be an error")
+	}
+}
