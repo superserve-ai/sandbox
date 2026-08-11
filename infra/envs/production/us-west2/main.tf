@@ -50,8 +50,17 @@ locals {
 
   api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
 
-  # The control plane dials whichever host active_sandbox_host selects.
+  # The control plane dials whichever host active_sandbox_host selects. The
+  # selected host must already be running and serving before it is applied —
+  # instance run state is operational, not Terraform-managed, so that a host
+  # started for an incident is never stopped again by a later apply.
   active_vmd_ip = var.active_sandbox_host == "standby" ? module.sandbox_host_b.internal_ip : module.sandbox_host.internal_ip
+
+  # Exactly one host carries component=vmd, the label the shared deploy
+  # pipeline discovers; the other is parked under a cell-scoped label so
+  # rollouts skip it instead of failing against a host that is out of service.
+  primary_component = var.active_sandbox_host == "primary" ? "vmd" : "vmd-usw2-standby"
+  standby_component = var.active_sandbox_host == "standby" ? "vmd" : "vmd-usw2-standby"
 }
 module "network" {
   source = "../../../modules/network"
@@ -203,7 +212,7 @@ module "sandbox_host" {
   internal_ip   = "10.1.0.2"
   tags          = ["vmd-usw2"]
   labels = merge(local.sandbox_host_labels, {
-    component                  = "vmd"
+    component                  = local.primary_component
     sandbox_role               = "vmd"
     "vanta-contains-user-data" = "true"
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
@@ -222,9 +231,9 @@ module "sandbox_host" {
   }
 }
 
-# Cold standby for the cell, normally kept stopped. Promotion = set
-# active_sandbox_host = "standby" and apply: routes the control plane here and
-# relabels the host into the component=vmd deploy fleet.
+# Cold standby for the cell, normally kept stopped. Promotion = start this
+# host, then set active_sandbox_host = "standby" and apply: the switch routes
+# the control plane here and moves the deploy-fleet label off the primary.
 module "sandbox_host_b" {
   source = "../../../modules/sandbox-host"
 
@@ -238,7 +247,7 @@ module "sandbox_host_b" {
   internal_ip   = "10.1.0.3"
   tags          = ["vmd-usw2"]
   labels = merge(local.sandbox_host_labels, {
-    component                  = var.active_sandbox_host == "standby" ? "vmd" : "vmd-usw2-2"
+    component                  = local.standby_component
     sandbox_role               = "vmd"
     "vanta-contains-user-data" = "true"
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
