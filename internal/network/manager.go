@@ -939,7 +939,6 @@ func (m *Manager) claimTeardown(idx int, owner string) bool {
 // or the vmID for an on-demand SetupVM.
 func (m *Manager) claimSlotIndex(owner string) (int, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	for {
 		var idx int
@@ -958,9 +957,21 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 				// Out of fresh range, which is not the same as out of slots:
 				// indexes are discarded (never returned) whenever a namespace
 				// outlives them, so the gaps below are the only inventory left.
-				if n := m.reclaimUnusedSlotsLocked(); n > 0 {
+				//
+				// reclaimUnusedSlots manages its own locking and must be
+				// called without m.mu held: it reads the whole netns and
+				// host-veth directories, which at the ceiling means tens of
+				// thousands of entries. Holding the single allocator lock
+				// across that scan would stall every other claim on the
+				// host — including an on-demand RestoreSnapshot setup
+				// racing its gRPC deadline — for the scan's full duration.
+				m.mu.Unlock()
+				n := m.reclaimUnusedSlots()
+				m.mu.Lock()
+				if n > 0 {
 					continue
 				}
+				m.mu.Unlock()
 				return 0, ErrNoSlots
 			}
 			idx = m.nextSlot
@@ -975,6 +986,7 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 		}
 
 		m.assignSlotLocked(idx, owner)
+		m.mu.Unlock()
 		return idx, nil
 	}
 }
@@ -987,18 +999,20 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 // startup reservations are in place, when the only owners are records.
 func (m *Manager) ReclaimUnusedSlots() int {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.lastReclaim = time.Time{} // startup always scans
-	n := m.reclaimUnusedSlotsLocked()
+	m.mu.Unlock()
+	n := m.reclaimUnusedSlots()
 	// The startup orphan sweep runs after this and deletes namespaces, so
 	// indexes this pass counted as occupied can be free moments later. Leave
 	// the cooldown unarmed so the first claim at the ceiling rescans rather
 	// than failing for the cooldown's duration over stale evidence.
+	m.mu.Lock()
 	m.lastReclaim = time.Time{}
+	m.mu.Unlock()
 	return n
 }
 
-// reclaimUnusedSlotsLocked refills freeSlots from the range below nextSlot:
+// reclaimUnusedSlots refills freeSlots from the range below nextSlot:
 // every index that no owner holds and no kernel namespace occupies. Returns
 // how many it recovered.
 //
@@ -1011,9 +1025,16 @@ func (m *Manager) ReclaimUnusedSlots() int {
 //
 // One directory read rather than a stat per index: at the ceiling there are
 // tens of thousands of indexes to test, and namespace presence is the only
-// thing that makes one unusable. Caller must hold m.mu.
-func (m *Manager) reclaimUnusedSlotsLocked() int {
-	if time.Since(m.lastReclaim) < reclaimCooldown {
+// thing that makes one unusable. Caller must NOT hold m.mu: the directory
+// reads below are the expensive part of this call (tens of thousands of
+// entries at the ceiling), and every other slot claim on the host blocks on
+// m.mu for as long as it's held — this method takes the lock itself, only
+// for the cheap cooldown check and the final merge into freeSlots.
+func (m *Manager) reclaimUnusedSlots() int {
+	m.mu.Lock()
+	onCooldown := time.Since(m.lastReclaim) < reclaimCooldown
+	m.mu.Unlock()
+	if onCooldown {
 		return 0
 	}
 
@@ -1054,6 +1075,21 @@ func (m *Manager) reclaimUnusedSlotsLocked() int {
 			}
 		}
 	}
+
+	// Everything from here on is cheap in-memory bookkeeping against mutable
+	// allocator state, so it takes the lock — unlike the directory reads
+	// above, which ran unlocked.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Re-check: another goroutine may have scanned and armed the cooldown
+	// while this one was reading the filesystem unlocked. Its scan is at
+	// least as fresh as this one's, so defer to it rather than redoing the
+	// merge with a stale occupied set.
+	if time.Since(m.lastReclaim) < reclaimCooldown {
+		return 0
+	}
+
 	for _, idx := range m.freeSlots {
 		occupied[idx] = true
 	}

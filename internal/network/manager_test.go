@@ -308,13 +308,11 @@ func TestReclaimUnusedSlots_CooldownSkipsRescan(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()
 	m.nextSlot = MaxSlots + 1
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if n := m.reclaimUnusedSlotsLocked(); n == 0 {
+	if n := m.reclaimUnusedSlots(); n == 0 {
 		t.Fatal("first reclaim recovered nothing, want the empty range back")
 	}
 	m.freeSlots = nil
-	if n := m.reclaimUnusedSlotsLocked(); n != 0 {
+	if n := m.reclaimUnusedSlots(); n != 0 {
 		t.Errorf("second reclaim recovered %d within the cooldown, want 0", n)
 	}
 }
@@ -611,9 +609,7 @@ func TestReclaimUnusedSlots_LeavesCooldownUnarmed(t *testing.T) {
 		t.Fatalf("remove ns: %v", err)
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if n := m.reclaimUnusedSlotsLocked(); n != 3 {
+	if n := m.reclaimUnusedSlots(); n != 3 {
 		t.Fatalf("rescan = %d, want 3 — the cooldown blocked recovery of a just-swept index", n)
 	}
 }
@@ -632,14 +628,12 @@ func TestReclaimUnusedSlots_FailedScanDoesNotArmCooldown(t *testing.T) {
 
 	m := newTestManager()
 	m.nextSlot = 5
-	m.mu.Lock()
-	defer m.mu.Unlock()
 
-	if n := m.reclaimUnusedSlotsLocked(); n != 0 {
+	if n := m.reclaimUnusedSlots(); n != 0 {
 		t.Fatalf("reclaimed = %d on an unreadable host, want 0", n)
 	}
 	netnsDir = dir // condition clears
-	if n := m.reclaimUnusedSlotsLocked(); n != 4 {
+	if n := m.reclaimUnusedSlots(); n != 4 {
 		t.Fatalf("reclaimed = %d after recovery, want 4 — a failed scan armed the cooldown", n)
 	}
 }
