@@ -2147,3 +2147,52 @@ func TestFailedNotificationDeliveryRedelivers(t *testing.T) {
 		t.Fatalf("outbox after success = %+v (err %v), want empty", pending, err)
 	}
 }
+
+// A delivery failure stops the batch: with the control plane down, every
+// entry would fail and each attempt can hold the drain goroutine for the
+// full request timeout. The whole batch redelivers after the window.
+func TestFailedNotificationDeliveryStopsTheBatch(t *testing.T) {
+	j, _ := testJournal(t)
+	for i, gen := range []string{"gen-1", "gen-2"} {
+		task := Task{SandboxID: "sb-" + gen, Generation: gen, EnqueuedAt: time.Unix(int64(i+1), 0)}
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.Ack(task, "test-bucket", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	attempts := 0
+	u := &Uploader{Journal: j, OnVerified: func(Task) error {
+		attempts++
+		return errors.New("control plane unavailable")
+	}}
+	u.flushNotifications()
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want the batch stopped after the first failure", attempts)
+	}
+	if pending, err := j.PendingNotifications(); err != nil || len(pending) != 2 {
+		t.Fatalf("outbox = %d entries (err %v), want both retained", len(pending), err)
+	}
+}
+
+// The outbox copy pins the bucket the upload verified against, so a
+// restart that repoints BACKUP_BUCKET cannot mislabel old completions.
+func TestOutboxPinsVerifiedBucket(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(task, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := j.PendingNotifications()
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("outbox = %v (err %v), want one entry", pending, err)
+	}
+	if pending[0].VerifiedBucket != "bucket-a" {
+		t.Fatalf("VerifiedBucket = %q, want the ack-time scope", pending[0].VerifiedBucket)
+	}
+}

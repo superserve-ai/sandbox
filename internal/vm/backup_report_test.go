@@ -82,3 +82,25 @@ func TestBackupReporterErrorsKeepTheSignal(t *testing.T) {
 		t.Fatal("Deliver = nil against a closed server, want error")
 	}
 }
+
+// A notification pinned to the bucket it verified against reports that
+// bucket, not the reporter's current configuration.
+func TestBackupReporterUsesPinnedBucket(t *testing.T) {
+	var gotBody backupReportBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := &BackupReporter{ControlPlaneURL: srv.URL, HostID: "h", Token: "t", Bucket: "new-bucket", Log: zerolog.Nop()}
+	task := backup.Task{SandboxID: "sb", Generation: "g", VerifiedBucket: "old-bucket",
+		Files: []backup.TaskFile{{Name: "rootfs.ext4", SHA256: "aa", Size: 1}}}
+	if err := r.Deliver(task); err != nil {
+		t.Fatal(err)
+	}
+	if gotBody.Bucket != "old-bucket" {
+		t.Fatalf("bucket = %q, want the pinned verified bucket", gotBody.Bucket)
+	}
+}

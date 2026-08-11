@@ -67,12 +67,21 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	// the bucket manifest: task.Files alone would understate an overlay
 	// generation's restorable set.
 	files := task.ReportedFiles()
+	// The outbox pinned the bucket the upload verified against; trust it
+	// over the current configuration, which can differ after a restart
+	// that repointed BACKUP_BUCKET while notifications were outboxed.
+	// Empty means a pre-pinning outbox entry: the current bucket is the
+	// only available answer, as before.
+	bucket := task.VerifiedBucket
+	if bucket == "" {
+		bucket = r.Bucket
+	}
 	body := backupReportBody{
 		SandboxID:   task.SandboxID,
 		TemplateID:  task.TemplateID,
 		BuildID:     task.BuildID,
 		Generation:  task.Generation,
-		Bucket:      r.Bucket,
+		Bucket:      bucket,
 		CompletedAt: time.Now().UTC(),
 		Files:       make([]backupReportFile, 0, len(files)),
 	}

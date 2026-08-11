@@ -84,6 +84,14 @@ type Task struct {
 	// the uploader-owned staging tree; the dedupe upgrade in Enqueue is
 	// one-way toward staged.
 	Staged bool `json:"staged,omitempty"`
+	// VerifiedBucket names the store identity this completion was
+	// verified against. Set only on the outbox copy at ack time: a
+	// notification delivered after a restart with a different
+	// BACKUP_BUCKET must report the bucket that actually holds the
+	// bytes, not the newly configured one. Empty on queue rows and on
+	// outbox entries written before the field existed (consumers fall
+	// back to the current bucket, the pre-field behavior).
+	VerifiedBucket string `json:"verified_bucket,omitempty"`
 }
 
 // HasVerified reports whether this task already verified object.
@@ -486,7 +494,11 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 			}
 		}
 		if notify {
-			val, err := json.Marshal(task)
+			// The outbox copy pins the verified bucket: delivery may run
+			// under a future process configured against a different store.
+			nt := task
+			nt.VerifiedBucket = completedScope
+			val, err := json.Marshal(nt)
 			if err != nil {
 				return err
 			}
