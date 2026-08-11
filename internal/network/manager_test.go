@@ -17,7 +17,15 @@ func withTestNetnsDir(t *testing.T) string {
 	dir := t.TempDir()
 	old := netnsDir
 	netnsDir = dir
-	t.Cleanup(func() { netnsDir = old })
+	// Host interfaces are consulted alongside namespaces when deciding whether
+	// a slot index is free, so isolate them too — otherwise a runner carrying
+	// its own veth-N silently changes what these tests observe.
+	oldHostNet := hostNetDir
+	hostNetDir = t.TempDir()
+	t.Cleanup(func() {
+		netnsDir = old
+		hostNetDir = oldHostNet
+	})
 	return dir
 }
 
@@ -564,11 +572,7 @@ func TestReclaimUnusedSlots_RecoversRangeStrandedByReservations(t *testing.T) {
 // endless retry of the same index.
 func TestReclaimUnusedSlots_SkipsStrayHostVeths(t *testing.T) {
 	withTestNetnsDir(t)
-	netDir := t.TempDir()
-	oldNet := hostNetDir
-	hostNetDir = netDir
-	t.Cleanup(func() { hostNetDir = oldNet })
-	if err := os.Mkdir(filepath.Join(netDir, "veth-4"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(hostNetDir, "veth-4"), 0o755); err != nil {
 		t.Fatalf("create stray veth: %v", err)
 	}
 
