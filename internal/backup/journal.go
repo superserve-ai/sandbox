@@ -355,6 +355,18 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 	return task, found, nil
 }
 
+// currentKey resolves the task's live queue key through the dedupe
+// index: a concurrent enqueue can promote and re-key the row while an
+// attempt is in flight, so the caller's snapshot must never be trusted
+// to name the stored row. Falls back to the snapshot's own key when the
+// index has no entry.
+func currentKey(tx *bolt.Tx, task *Task) []byte {
+	if qk := tx.Bucket(indexBucket).Get(task.indexKey()); qk != nil {
+		return append([]byte(nil), qk...)
+	}
+	return task.key()
+}
+
 // RecordVerification persists BOTH verification records in one
 // transaction: the task's own progress (survives nacks) and the durable
 // history (survives acks). Atomicity is the point: a crash between two
@@ -364,12 +376,23 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 func (j *Journal) RecordVerification(task Task, object string, now time.Time) error {
 	return j.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(journalBucket)
-		mergeRow(b.Get(task.key()), &task)
+		old := currentKey(tx, &task)
+		mergeRow(b.Get(old), &task)
 		val, err := json.Marshal(task)
 		if err != nil {
 			return err
 		}
+		// mergeRow may have adopted a promoted priority, moving the
+		// row's key; write exactly one row and keep the index on it.
+		if nk := task.key(); !bytes.Equal(old, nk) {
+			if err := b.Delete(old); err != nil {
+				return err
+			}
+		}
 		if err := b.Put(task.key(), val); err != nil {
+			return err
+		}
+		if err := tx.Bucket(indexBucket).Put(task.indexKey(), task.key()); err != nil {
 			return err
 		}
 		return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
@@ -497,7 +520,10 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 	completed := completedScope != ""
 	now := time.Now()
 	return j.db.Update(func(tx *bolt.Tx) error {
-		if err := tx.Bucket(journalBucket).Delete(task.key()); err != nil {
+		// Resolve through the index: a promotion re-keyed row must be
+		// deleted where it lives, or the ack would drop only the index
+		// and leave the row orphaned for Next to run again.
+		if err := tx.Bucket(journalBucket).Delete(currentKey(tx, &task)); err != nil {
 			return err
 		}
 		if err := tx.Bucket(indexBucket).Delete(task.indexKey()); err != nil {
@@ -568,7 +594,6 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 // and persisting the caller's snapshot verbatim would silently undo the
 // upgrade after its marker was already cleared.
 func (j *Journal) Nack(task Task, now time.Time) error {
-	old := task.key()
 	task.Attempts++
 	backoff := time.Duration(1<<min(task.Attempts, 8)) * time.Second
 	const maxBackoff = 10 * time.Minute
@@ -578,6 +603,11 @@ func (j *Journal) Nack(task Task, now time.Time) error {
 	task.NotBefore = now.Add(backoff)
 	return j.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(journalBucket)
+		// Resolve through the index, not the caller's snapshot: a
+		// concurrent promotion re-keyed the row, and deleting the stale
+		// key while writing a snapshot-keyed retry would fork the task
+		// into two rows.
+		old := currentKey(tx, &task)
 		mergeRow(b.Get(old), &task)
 		val, err := json.Marshal(task)
 		if err != nil {
@@ -608,6 +638,12 @@ func mergeRow(existing []byte, task *Task) {
 	if cur.Staged && !task.Staged {
 		task.Files = cur.Files
 		task.Staged = true
+	}
+	// A promotion that landed while this attempt ran must survive the
+	// write-back, or the retry would demote the row to the snapshot's
+	// stale priority.
+	if cur.Priority < task.Priority {
+		task.Priority = cur.Priority
 	}
 	seen := make(map[string]bool, len(task.VerifiedObjects))
 	for _, o := range task.VerifiedObjects {

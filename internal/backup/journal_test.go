@@ -288,3 +288,111 @@ func TestEnqueueDedupePromotesPriority(t *testing.T) {
 		t.Fatalf("HasPending = %v err=%v, want true", pending, err)
 	}
 }
+
+// Promotion can re-key a row while the uploader holds the task from
+// Next. Every mutator must resolve the row through the index, or acks
+// orphan the promoted row, nacks fork the task into two rows, and
+// verification recreates the stale key.
+func TestPromotionWhileTaskInFlight(t *testing.T) {
+	newTask := func(gen string) Task {
+		return Task{SandboxID: "sb", Generation: gen,
+			Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
+			Priority: PriorityBestEffort, EnqueuedAt: time.Unix(1, 0)}
+	}
+	promote := func(j *Journal, gen string) {
+		p := newTask(gen)
+		p.Priority = PriorityPause
+		if err := j.Enqueue(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pendingTotal := func(j *Journal) int {
+		counts, err := j.Pending()
+		if err != nil {
+			t.Fatal(err)
+		}
+		total := 0
+		for _, n := range counts {
+			total += n
+		}
+		return total
+	}
+
+	t.Run("ack removes the promoted row", func(t *testing.T) {
+		j, _ := testJournal(t)
+		if err := j.Enqueue(newTask("gen-ack")); err != nil {
+			t.Fatal(err)
+		}
+		inflight, ok, err := j.Next(time.Unix(10, 0))
+		if err != nil || !ok {
+			t.Fatalf("Next: %v %v", ok, err)
+		}
+		promote(j, "gen-ack")
+		if err := j.Ack(inflight, "bucket", false); err != nil {
+			t.Fatal(err)
+		}
+		if n := pendingTotal(j); n != 0 {
+			t.Fatalf("pending after ack = %d, want 0 (promoted row orphaned)", n)
+		}
+		if _, ok, _ := j.Next(time.Unix(20, 0)); ok {
+			t.Fatal("Next returned a task after ack; promoted row survived")
+		}
+	})
+
+	t.Run("nack keeps one promoted row with backoff", func(t *testing.T) {
+		j, _ := testJournal(t)
+		if err := j.Enqueue(newTask("gen-nack")); err != nil {
+			t.Fatal(err)
+		}
+		inflight, ok, err := j.Next(time.Unix(10, 0))
+		if err != nil || !ok {
+			t.Fatalf("Next: %v %v", ok, err)
+		}
+		promote(j, "gen-nack")
+		if err := j.Nack(inflight, time.Unix(10, 0)); err != nil {
+			t.Fatal(err)
+		}
+		if n := pendingTotal(j); n != 1 {
+			t.Fatalf("pending after nack = %d, want exactly one row", n)
+		}
+		// Backoff holds: nothing runnable immediately after the nack.
+		if _, ok, _ := j.Next(time.Unix(11, 0)); ok {
+			t.Fatal("Next returned the task before its backoff elapsed")
+		}
+		later, ok, err := j.Next(time.Unix(600, 0))
+		if err != nil || !ok {
+			t.Fatalf("Next after backoff: %v %v", ok, err)
+		}
+		if later.Priority != PriorityPause {
+			t.Fatalf("retry priority = %d, want the promotion kept", later.Priority)
+		}
+	})
+
+	t.Run("verification does not fork the row", func(t *testing.T) {
+		j, _ := testJournal(t)
+		if err := j.Enqueue(newTask("gen-verify")); err != nil {
+			t.Fatal(err)
+		}
+		inflight, ok, err := j.Next(time.Unix(10, 0))
+		if err != nil || !ok {
+			t.Fatalf("Next: %v %v", ok, err)
+		}
+		promote(j, "gen-verify")
+		if err := j.RecordVerification(inflight, "obj-1", time.Unix(12, 0)); err != nil {
+			t.Fatal(err)
+		}
+		if n := pendingTotal(j); n != 1 {
+			t.Fatalf("pending after verification = %d, want exactly one row", n)
+		}
+		got, ok, err := j.Next(time.Unix(20, 0))
+		if err != nil || !ok {
+			t.Fatalf("Next: %v %v", ok, err)
+		}
+		if got.Priority != PriorityPause {
+			t.Fatalf("row priority = %d, want the promotion kept", got.Priority)
+		}
+		if verified, err := j.WasVerified("obj-1", time.Unix(20, 0)); err != nil || !verified {
+			t.Fatalf("WasVerified = %v (err %v), want the history recorded", verified, err)
+		}
+	})
+}
