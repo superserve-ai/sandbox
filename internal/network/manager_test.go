@@ -556,3 +556,32 @@ func TestReclaimUnusedSlots_RecoversRangeStrandedByReservations(t *testing.T) {
 		t.Errorf("idx = %d, want an index that no record reserved", idx)
 	}
 }
+
+// TestReclaimUnusedSlots_SkipsStrayHostVeths pins the exclusion: an index whose
+// host veth outlived its namespace cannot be built on (the move-to-host step
+// collides), and a failed build returns the index to the top of the LIFO free
+// list — so handing one out starves every other reclaimed slot behind an
+// endless retry of the same index.
+func TestReclaimUnusedSlots_SkipsStrayHostVeths(t *testing.T) {
+	withTestNetnsDir(t)
+	netDir := t.TempDir()
+	oldNet := hostNetDir
+	hostNetDir = netDir
+	t.Cleanup(func() { hostNetDir = oldNet })
+	if err := os.Mkdir(filepath.Join(netDir, "veth-4"), 0o755); err != nil {
+		t.Fatalf("create stray veth: %v", err)
+	}
+
+	m := newTestManager()
+	m.nextSlot = 6 // indexes 1..5 are below the high-water mark
+
+	reclaimed := m.ReclaimUnusedSlots()
+	if reclaimed != 4 {
+		t.Fatalf("reclaimed = %d, want 4 (1,2,3,5 — never the stray veth's index)", reclaimed)
+	}
+	for _, idx := range m.freeSlots {
+		if idx == 4 {
+			t.Fatal("index 4 reclaimed despite a stray host veth — builds there fail and relock the free list")
+		}
+	}
+}

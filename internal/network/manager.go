@@ -1007,6 +1007,30 @@ func (m *Manager) reclaimUnusedSlotsLocked() int {
 			occupied[idx] = true
 		}
 	}
+	// A host-side veth can outlive its namespace, and building over one fails
+	// at the move-to-host step. A failed build releases the index onto the top
+	// of the LIFO free list, so handing out such an index doesn't just waste a
+	// build — the next claim pops the same index and retries it forever,
+	// starving every other reclaimed slot. SweepStrayHostVeths is what clears
+	// them; until it does, they are not free.
+	// A host-side veth can outlive its namespace, and building over one fails
+	// at the move-to-host step. A failed build releases the index onto the top
+	// of the LIFO free list, so handing out such an index doesn't just waste a
+	// build — the next claim pops the same index and retries it forever,
+	// starving every other reclaimed slot. SweepStrayHostVeths is what clears
+	// them; until it does, they are not free.
+	veths, err := listHostVeths()
+	if err != nil {
+		m.log.Warn().Err(err).Msg("allocator: cannot list host veths — skipping slot reclaim")
+		return 0
+	}
+	for _, veth := range veths {
+		if idxStr, ok := strings.CutPrefix(veth, "veth-"); ok {
+			if idx, convErr := strconv.Atoi(idxStr); convErr == nil {
+				occupied[idx] = true
+			}
+		}
+	}
 	for _, idx := range m.freeSlots {
 		occupied[idx] = true
 	}
@@ -1400,7 +1424,7 @@ func pidsInNs(name string) (pids []int, ok bool) {
 
 // listHostVeths returns all veth-N interfaces visible in the host namespace.
 func listHostVeths() ([]string, error) {
-	entries, err := os.ReadDir("/sys/class/net")
+	entries, err := os.ReadDir(hostNetDir)
 	if err != nil {
 		return nil, err
 	}
@@ -1433,6 +1457,9 @@ func (m *Manager) UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []s
 
 // netnsDir is overridden by tests.
 var netnsDir = "/run/netns"
+
+// hostNetDir is where host-side interfaces appear; overridden by tests.
+var hostNetDir = "/sys/class/net"
 
 // NamespaceForPID returns the ns-N name of the network namespace that pid is
 // in, by matching /proc/<pid>/ns/net's inode against the named namespaces in
