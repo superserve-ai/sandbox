@@ -2096,3 +2096,41 @@ func TestFinishPendingStageTransfersBasePinWhenAbsorbing(t *testing.T) {
 		t.Fatalf("transferred pin content = %q, want %q", got, pinContent)
 	}
 }
+
+// A task that keeps failing must not retry forever: unbounded retry
+// turns one stuck task class into monotonic journal and staging growth.
+// At the ceiling the task abandons (no completion, staging removed) and
+// the owner's next pause covers.
+func TestUploadRetriesExhaustedAbandons(t *testing.T) {
+	j, _ := testJournal(t)
+	staging := t.TempDir()
+	task := Task{SandboxID: "sb", Generation: "gen-stuck",
+		Files:      []TaskFile{{Name: "rootfs.ext4", Path: "/nonexistent/never-readable", SHA256: "aa", Size: 1}},
+		Attempts:   maxUploadAttempts - 1,
+		EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	staged := filepath.Join(staging, "sb", "gen-stuck")
+	if err := os.MkdirAll(staged, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	u := &Uploader{Journal: j, StagingRoot: staging,
+		Store: &memStore{}, Log: zerolog.Nop()}
+	// uploadTask must error (unreadable source with a manifest digest
+	// forces the failure path rather than clean abandonment).
+	worked, err := u.drainOne(context.Background(), time.Unix(10, 0))
+	if err != nil || !worked {
+		t.Fatalf("drainOne = %v %v", worked, err)
+	}
+	if pending, err := j.HasPending("sb", "gen-stuck"); err != nil || pending {
+		t.Fatalf("HasPending = %v (err %v), want the exhausted task gone", pending, err)
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Fatalf("staged dir still present (err %v), want removed on exhaustion", err)
+	}
+	if verified, err := j.WasVerified("gen-stuck", time.Unix(10, 0)); err != nil || verified {
+		t.Fatalf("WasVerified = %v (err %v), want no completion recorded", verified, err)
+	}
+}

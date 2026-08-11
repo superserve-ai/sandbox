@@ -767,3 +767,21 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 		_ = os.Remove(sbDir)
 	}
 }
+
+// ResolveStagingRoot picks the staging tree location. The default lives
+// inside the snapshot directory so staging shares a filesystem with the
+// artifacts it clones: reflink works and capacity scales with the
+// artifact array rather than the OS disk, whose exhaustion takes the
+// journal down with it. The returned legacy path is the retired OS-disk
+// default the caller should remove, empty when it coincides with root.
+func ResolveStagingRoot(override, snapshotDir, runDir string) (root, legacy string) {
+	root = override
+	if root == "" {
+		root = filepath.Join(snapshotDir, ".backup-staging")
+	}
+	legacy = filepath.Join(filepath.Dir(runDir), "backup-staging")
+	if legacy == root {
+		legacy = ""
+	}
+	return root, legacy
+}

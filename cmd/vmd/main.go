@@ -558,12 +558,29 @@ func main() {
 			Log:        log.With().Str("component", "backup").Logger(),
 			VMDVersion: os.Getenv("SENTRY_RELEASE"),
 		}
-		// Staging pins enqueued artifacts via hard links so sandbox
-		// teardown cannot erase a queued generation; the sweep clears
-		// residue from crashes between staging and enqueue.
-		stagingRoot := filepath.Join(filepath.Dir(cfg.RunDir), "backup-staging")
+		// Staging pins enqueued artifacts so sandbox teardown cannot
+		// erase a queued generation; the sweep clears residue from
+		// crashes between staging and enqueue. The tree lives inside
+		// SNAPSHOT_DIR by default: that keeps it on the same filesystem
+		// as the artifacts it snapshots, so reflink cloning works and
+		// capacity scales with the artifact array instead of the OS
+		// disk. BACKUP_STAGING_DIR overrides for exotic layouts.
+		stagingRoot, legacyStaging := backup.ResolveStagingRoot(
+			os.Getenv("BACKUP_STAGING_DIR"), cfg.SnapshotDir, cfg.RunDir)
 		if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
 			log.Fatal().Err(err).Str("path", stagingRoot).Msg("failed to create backup staging dir")
+		}
+		// One-time relocation: remove the retired OS-disk tree.
+		// Uploader-owned by construction, and any task or marker still
+		// referencing legacy paths abandons safely or falls back to
+		// original paths and re-covers on the next pause.
+		if legacyStaging != "" {
+			if _, err := os.Stat(legacyStaging); err == nil {
+				log.Info().Str("path", legacyStaging).Msg("removing legacy backup staging tree")
+				if err := os.RemoveAll(legacyStaging); err != nil {
+					log.Warn().Err(err).Str("path", legacyStaging).Msg("legacy backup staging tree not fully removed")
+				}
+			}
 		}
 		// Renew every durable marker's staged directory before the sweep
 		// runs: the sweep is synchronous and ordered ahead of reattach (and

@@ -166,6 +166,24 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	}
 	completed, err := u.uploadTask(ctx, &task)
 	if err != nil {
+		// Retries are bounded: a task that has failed this many times is
+		// structurally stuck (its error is not transient at any horizon
+		// that matters), and unbounded retry converts one stuck task
+		// class into monotonic journal and staging growth. Abandoning is
+		// safe by the same contract every abandon path relies on: the
+		// generation's coverage is sacrificed, the owner's next pause
+		// covers, and the error log is the operator signal.
+		if task.Attempts+1 >= maxUploadAttempts {
+			task.logOwner(u.Log.Error().Err(err)).
+				Str("generation", task.Generation).
+				Int("attempts", task.Attempts+1).
+				Msg("backup upload retries exhausted; abandoning generation")
+			if aerr := u.Journal.Ack(task, "", false); aerr != nil {
+				return true, aerr
+			}
+			removeStagedTask(u.StagingRoot, task)
+			return true, nil
+		}
 		task.logOwner(u.Log.Warn().Err(err)).
 			Str("generation", task.Generation).
 			Int("attempts", task.Attempts+1).
@@ -345,6 +363,13 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 
 // stagingSweepInterval paces the running staged-base sweep.
 const stagingSweepInterval = 30 * time.Minute
+
+// maxUploadAttempts bounds a task's retries. At the capped backoff this
+// gives a stuck task on the order of ten hours to become uploadable,
+// which covers every transient class (bucket outage, disk pressure,
+// budget contention) while guaranteeing the journal and staging tree
+// cannot grow monotonically behind a task class that never succeeds.
+const maxUploadAttempts = 60
 
 // objectName routes an object into the task owner's prefix. Both owners
 // keep the content-addressed generation segment: build ids are reusable
