@@ -126,20 +126,32 @@ sandbox_exec() {
   printf '%s\n' "$stdout"
 }
 
-ssh_request() {
+ssh_request() { 
   local remote_cmd="$1"
-  local output status
+  local output err_output status
   output="$(mktemp)"
-  if ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
-    -o StrictHostKeyChecking=accept-new \
-    "$SSH_TARGET" "$remote_cmd" >"$output" 2>&1; then
+  err_output="$(mktemp)"
+
+  if gcloud compute ssh "$SSH_TARGET" \
+    --project="${GCP_PROJECT:-rayai-dev}" \
+    --zone="${GCP_ZONE:-us-central1-a}" \
+    --tunnel-through-iap \
+    --quiet \
+    --command="$remote_cmd" \
+    >"$output" 2>"$err_output"; then
     status=0
   else
     status=$?
   fi
+
   printf '%s\n' "$status"
   cat "$output"
-  rm -f "$output"
+
+  if [[ "$status" != "0" ]]; then
+    cat "$err_output" >&2
+  fi
+
+  rm -f "$output" "$err_output"
 }
 
 wait_for_sandbox_status() {
@@ -242,16 +254,25 @@ parse_allocation_source_from_log() {
   ' <<<"$log_json" | tail -n 1
 }
 
-latest_vmd_logs() {
+latest_vmd_vm_logs() {
   local since="$1"
+  local sandbox_id="$2"
   local response status body
-  response="$(ssh_request "sudo -n journalctl -u vmd --since $(shell_quote "$since") --no-pager -o json")"
+
+  response="$(ssh_request \
+    "sudo -n journalctl -u superserve-vmd --since $(shell_quote "$since") --no-pager -o cat")"
+
   status="$(head -n1 <<<"$response")"
   body="$(tail -n +2 <<<"$response")"
+
   if [[ "$status" != "0" ]]; then
-    fail "failed to read vmd logs from ${SSH_TARGET}: ${body}"
+    fail "failed to read vmd logs for sandbox ${sandbox_id} from ${SSH_TARGET}"
   fi
-  printf '%s\n' "$body"
+
+  jq -Rc --arg sid "$sandbox_id" '
+    fromjson?
+    | select(.vm_id == $sid)
+  ' <<<"$body"
 }
 
 collect_slot_state() {
