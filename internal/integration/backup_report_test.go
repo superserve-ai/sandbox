@@ -106,6 +106,31 @@ func TestIntegration_BackupReport_RecordsAndSyncsSize(t *testing.T) {
 		t.Fatalf("backup_generation rows = %d, want 1 after redelivery", rows)
 	}
 
+	// An unchanged re-pause re-verifies the same generation later: the
+	// newer verification refreshes completed_at in place, so freshness
+	// checks see the current pause as covered.
+	refreshed := strings.Replace(report, "2026-08-11T10:00:00Z", "2026-08-11T11:30:00Z", 1)
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/internal/hosts/host-1/backups", strings.NewReader(refreshed))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer itok-report")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("refresh: %d %s", w.Code, w.Body.String())
+	}
+	if res := mustJSON(t, w); res["recorded"] != true {
+		t.Fatalf("refresh = %v, want recorded=true for a newer verification", res)
+	}
+	var completed string
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*), max(completed_at)::text FROM backup_generation WHERE sandbox_id = $1`,
+		sandboxID).Scan(&rows, &completed); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 || !strings.HasPrefix(completed, "2026-08-11 11:30:00") {
+		t.Fatalf("after refresh rows=%d completed_at=%q, want one row at the newer instant", rows, completed)
+	}
+
 	// A report whose vmstate digest does not match the current pause
 	// records coverage but must not touch sizes: it describes an older
 	// generation.

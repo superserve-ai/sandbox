@@ -106,12 +106,7 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		return
 	}
 
-	params := db.RecordBackupGenerationParams{
-		Generation:  req.Generation,
-		Bucket:      req.Bucket,
-		CompletedAt: req.CompletedAt.UTC(),
-	}
-	var sandboxID uuid.UUID
+	var sandboxID, templateID uuid.UUID
 	if req.SandboxID != "" {
 		id, err := uuid.Parse(req.SandboxID)
 		if err != nil {
@@ -119,28 +114,44 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 			return
 		}
 		sandboxID = id
-		params.SandboxID = pgtype.UUID{Bytes: id, Valid: true}
 	} else {
 		id, err := uuid.Parse(req.TemplateID)
 		if err != nil {
 			respondErrorMsg(c, "bad_request", "template_id must be a uuid", http.StatusBadRequest)
 			return
 		}
-		params.TemplateID = pgtype.UUID{Bytes: id, Valid: true}
-		params.BuildID = &req.BuildID
+		templateID = id
 	}
 	files, err := json.Marshal(req.Files)
 	if err != nil {
 		respondErrorMsg(c, "bad_request", "files not serializable", http.StatusBadRequest)
 		return
 	}
-	params.Files = files
 
 	ctx := c.Request.Context()
 	recorded := false
 	sizeSynced := false
 	apply := func(q *db.Queries) error {
-		rows, err := q.RecordBackupGeneration(ctx, params)
+		var rows int64
+		var err error
+		if req.SandboxID != "" {
+			rows, err = q.RecordSandboxBackupGeneration(ctx, db.RecordSandboxBackupGenerationParams{
+				SandboxID:   pgtype.UUID{Bytes: sandboxID, Valid: true},
+				Generation:  req.Generation,
+				Bucket:      req.Bucket,
+				CompletedAt: req.CompletedAt.UTC(),
+				Files:       files,
+			})
+		} else {
+			rows, err = q.RecordTemplateBackupGeneration(ctx, db.RecordTemplateBackupGenerationParams{
+				TemplateID:  pgtype.UUID{Bytes: templateID, Valid: true},
+				BuildID:     &req.BuildID,
+				Generation:  req.Generation,
+				Bucket:      req.Bucket,
+				CompletedAt: req.CompletedAt.UTC(),
+				Files:       files,
+			})
+		}
 		if err != nil {
 			return err
 		}

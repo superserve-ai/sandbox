@@ -1,10 +1,24 @@
--- name: RecordBackupGeneration :execrows
+-- name: RecordSandboxBackupGeneration :execrows
 -- Idempotent by construction: reports are delivered at least once from
--- the host's outbox, and the partial unique indexes turn redeliveries
--- into no-ops. Returns the number of rows written (0 = already known).
-INSERT INTO backup_generation (sandbox_id, template_id, build_id, generation, bucket, completed_at, files)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT DO NOTHING;
+-- the host's outbox. A conflict refreshes completed_at only when the
+-- report carries a strictly newer verification (an unchanged re-pause
+-- re-verifies the same content-addressed generation later, and
+-- freshness checks must see the current pause as covered), so an exact
+-- redelivery affects zero rows.
+INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (sandbox_id, bucket, generation) WHERE sandbox_id IS NOT NULL
+DO UPDATE SET completed_at = excluded.completed_at, reported_at = now()
+WHERE excluded.completed_at > backup_generation.completed_at;
+
+-- name: RecordTemplateBackupGeneration :execrows
+-- Template variant of RecordSandboxBackupGeneration; the two exist
+-- because each conflict target must name its own partial unique index.
+INSERT INTO backup_generation (template_id, build_id, generation, bucket, completed_at, files)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (template_id, build_id, bucket, generation) WHERE template_id IS NOT NULL
+DO UPDATE SET completed_at = excluded.completed_at, reported_at = now()
+WHERE excluded.completed_at > backup_generation.completed_at;
 
 -- name: LatestSandboxBackup :one
 SELECT generation, bucket, completed_at

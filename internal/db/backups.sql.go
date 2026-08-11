@@ -74,14 +74,51 @@ func (q *Queries) LockSandboxRow(ctx context.Context, id uuid.UUID) (uuid.UUID, 
 	return id, err
 }
 
-const recordBackupGeneration = `-- name: RecordBackupGeneration :execrows
-INSERT INTO backup_generation (sandbox_id, template_id, build_id, generation, bucket, completed_at, files)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT DO NOTHING
+const recordSandboxBackupGeneration = `-- name: RecordSandboxBackupGeneration :execrows
+INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (sandbox_id, bucket, generation) WHERE sandbox_id IS NOT NULL
+DO UPDATE SET completed_at = excluded.completed_at, reported_at = now()
+WHERE excluded.completed_at > backup_generation.completed_at
 `
 
-type RecordBackupGenerationParams struct {
+type RecordSandboxBackupGenerationParams struct {
 	SandboxID   pgtype.UUID `json:"sandbox_id"`
+	Generation  string      `json:"generation"`
+	Bucket      string      `json:"bucket"`
+	CompletedAt time.Time   `json:"completed_at"`
+	Files       []byte      `json:"files"`
+}
+
+// Idempotent by construction: reports are delivered at least once from
+// the host's outbox. A conflict refreshes completed_at only when the
+// report carries a strictly newer verification (an unchanged re-pause
+// re-verifies the same content-addressed generation later, and
+// freshness checks must see the current pause as covered), so an exact
+// redelivery affects zero rows.
+func (q *Queries) RecordSandboxBackupGeneration(ctx context.Context, arg RecordSandboxBackupGenerationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordSandboxBackupGeneration,
+		arg.SandboxID,
+		arg.Generation,
+		arg.Bucket,
+		arg.CompletedAt,
+		arg.Files,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordTemplateBackupGeneration = `-- name: RecordTemplateBackupGeneration :execrows
+INSERT INTO backup_generation (template_id, build_id, generation, bucket, completed_at, files)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (template_id, build_id, bucket, generation) WHERE template_id IS NOT NULL
+DO UPDATE SET completed_at = excluded.completed_at, reported_at = now()
+WHERE excluded.completed_at > backup_generation.completed_at
+`
+
+type RecordTemplateBackupGenerationParams struct {
 	TemplateID  pgtype.UUID `json:"template_id"`
 	BuildID     *string     `json:"build_id"`
 	Generation  string      `json:"generation"`
@@ -90,12 +127,10 @@ type RecordBackupGenerationParams struct {
 	Files       []byte      `json:"files"`
 }
 
-// Idempotent by construction: reports are delivered at least once from
-// the host's outbox, and the partial unique indexes turn redeliveries
-// into no-ops. Returns the number of rows written (0 = already known).
-func (q *Queries) RecordBackupGeneration(ctx context.Context, arg RecordBackupGenerationParams) (int64, error) {
-	result, err := q.db.Exec(ctx, recordBackupGeneration,
-		arg.SandboxID,
+// Template variant of RecordSandboxBackupGeneration; the two exist
+// because each conflict target must name its own partial unique index.
+func (q *Queries) RecordTemplateBackupGeneration(ctx context.Context, arg RecordTemplateBackupGenerationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordTemplateBackupGeneration,
 		arg.TemplateID,
 		arg.BuildID,
 		arg.Generation,

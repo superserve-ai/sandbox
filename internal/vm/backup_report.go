@@ -136,7 +136,11 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	// otherwise silently drain the whole outbox.
 	switch resp.StatusCode {
 	case http.StatusUnauthorized, http.StatusForbidden,
-		http.StatusRequestTimeout, http.StatusTooManyRequests:
+		http.StatusRequestTimeout, http.StatusTooManyRequests,
+		// 404 means the control plane has not deployed the route yet
+		// (vmd can roll out first); the report becomes deliverable when
+		// the rollout completes, so it must survive in the outbox.
+		http.StatusNotFound:
 	default:
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 			r.Log.Error().Str("generation", task.Generation).
