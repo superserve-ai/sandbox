@@ -34,6 +34,9 @@ on:
       - 'internal/secretsproxy/**'
       - 'deploy/superserve-vmd.service'
       - 'deploy/superserve-vmd.socket'
+      - 'deploy/superserve-vms.service'
+      - 'deploy/vmd-rollback-guard'
+      - 'deploy/superserve-vmd-rollback-guard.conf'
       - 'deploy/superserve-secretsproxy.service'
       - 'deploy/firecracker@.service'
       - 'deploy/firecracker-netns@.service'
@@ -51,8 +54,48 @@ on:
       - '.github/workflows/scripts/deploy-vmd.py'
 
 jobs:
+  # Failing CI must not reach production control-plane hosts. CI is a
+  # separate workflow, so `needs:` can't reach it directly — poll the
+  # same-SHA run instead, same pattern as Deploy API's wait-for-migrations.
+  wait-for-ci:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for same-SHA CI to succeed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "Manual dispatch — operator owns this decision; skipping gate."
+            exit 0
+          fi
+
+          # CI runs on every push to main (no path filter), so a run for this
+          # SHA always exists — poll until it's visible and completed. ~20 min
+          # budget (60 × 20s), then fail closed: a deploy built from code that
+          # hasn't passed CI is worse than a late deploy.
+          for i in $(seq 1 60); do
+            run=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${{ github.sha }}&event=push" \
+              --jq '.workflow_runs[0] | if . == null then "absent absent" else "\(.status) \(.conclusion // "pending")" end')
+            status=${run% *}; conclusion=${run#* }
+            echo "attempt $i: status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CI succeeded; proceeding."
+                exit 0
+              fi
+              echo "CI concluded '$conclusion' — refusing to deploy unvalidated code."
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "Timed out waiting for CI; refusing to deploy."
+          exit 1
+
   deploy-staging:
     runs-on: ubuntu-latest
+    needs: [wait-for-ci]
     environment: staging
     permissions:
       contents: read

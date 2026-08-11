@@ -102,6 +102,16 @@ const (
 	// rebuilds are short once uncontended, so a small window drains a backlog
 	// quickly.
 	resetTapConcurrency = 8
+	// refillFailureBackoff paces retries after a failed slot build. Failures
+	// are host-wide conditions (an exhausted slot range, a sick netlink), not
+	// per-attempt luck, so retrying immediately burns a core and floods the
+	// log with thousands of identical lines a second without fixing anything.
+	refillFailureBackoff = 2 * time.Second
+	// refillConcurrency is the number of refill workers rebuilding the fresh
+	// pool. A single worker refills at one slot per build-time, which cannot
+	// catch a drained pool back up while claims keep arriving; builds stay
+	// individually cheap because Manager.setupSem bounds them globally.
+	refillConcurrency = 4
 	// resetTapTimeout bounds one batched rebuild — a healthy one takes well
 	// under a second, and a tight bound keeps a stalled backlog (and Stop)
 	// from dragging.
@@ -158,8 +168,18 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 
 	p.log.Info().Int("target", newSize).Int("recycle_cap", recycleSize).
 		Bool("reset_tap_on_recycle", p.resetTapOnRecycle).Msg("network pool starting (filling in background)")
-	p.wg.Add(1)
-	go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
+	// Each worker can park one pre-built slot in a blocked send when the pool
+	// is full, so inventory can exceed the target by up to the worker count.
+	// Clamping workers to the target keeps that overshoot proportionate for
+	// pools smaller than the default worker count.
+	workers := refillConcurrency
+	if newSize < workers {
+		workers = newSize
+	}
+	for i := 0; i < workers; i++ {
+		p.wg.Add(1)
+		go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
+	}
 
 	return p
 }
@@ -568,13 +588,22 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		}
 
 		if len(p.fresh) >= p.newSize {
-			// Pool full — block until a slot is consumed or shutdown.
+			// Pool full — pre-build one slot and block until it is consumed or
+			// shutdown. Built outside the select so a shutdown while blocked
+			// can dispose of the slot instead of dropping it.
+			slot := p.mustAllocate(ctx)
+			if slot == nil {
+				// mustAllocate only returns nil at shutdown.
+				return
+			}
 			select {
 			case <-p.stopCh:
+				p.stopSlot(slot)
 				return
 			case <-ctx.Done():
+				p.stopSlot(slot)
 				return
-			case p.fresh <- p.mustAllocate(ctx):
+			case p.fresh <- slot:
 			}
 			continue
 		}
@@ -582,6 +611,9 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		slot, err := p.allocate(ctx)
 		if err != nil {
 			p.log.Error().Err(err).Msg("pool refill failed")
+			if !p.pauseAfterFailure(ctx) {
+				return
+			}
 			continue
 		}
 		select {
@@ -603,13 +635,22 @@ func (p *Pool) mustAllocate(ctx context.Context) *preallocSlot {
 			return slot
 		}
 		p.log.Error().Err(err).Msg("pool allocate retry")
-		select {
-		case <-p.stopCh:
+		if !p.pauseAfterFailure(ctx) {
 			return nil
-		case <-ctx.Done():
-			return nil
-		default:
 		}
+	}
+}
+
+// pauseAfterFailure waits out the retry backoff, reporting false when the pool
+// is shutting down and the caller should give up instead of retrying.
+func (p *Pool) pauseAfterFailure(ctx context.Context) bool {
+	select {
+	case <-time.After(refillFailureBackoff):
+		return true
+	case <-p.stopCh:
+		return false
+	case <-ctx.Done():
+		return false
 	}
 }
 

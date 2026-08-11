@@ -3,10 +3,14 @@ package network
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -16,7 +20,15 @@ func withTestNetnsDir(t *testing.T) string {
 	dir := t.TempDir()
 	old := netnsDir
 	netnsDir = dir
-	t.Cleanup(func() { netnsDir = old })
+	// Host interfaces are consulted alongside namespaces when deciding whether
+	// a slot index is free, so isolate them too — otherwise a runner carrying
+	// its own veth-N silently changes what these tests observe.
+	oldHostNet := hostNetDir
+	hostNetDir = t.TempDir()
+	t.Cleanup(func() {
+		netnsDir = old
+		hostNetDir = oldHostNet
+	})
 	return dir
 }
 
@@ -32,6 +44,7 @@ func touchNS(t *testing.T, dir, name string) {
 func newTestManager() *Manager {
 	return &Manager{
 		log:       zerolog.Nop(),
+		setupSem:  make(chan struct{}, setupSlotConcurrency),
 		devices:   make(map[string]*VMNetInfo),
 		slotOwner: make(map[int]string),
 		nextSlot:  1,
@@ -255,10 +268,112 @@ func TestClaimSlotIndex_ErrNoSlotsWhenExhausted(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()
 	m.nextSlot = MaxSlots + 1
+	// Genuinely exhausted: spending the fresh range is not enough, since the
+	// ceiling path reclaims unused indexes below it — every index must be held.
+	for idx := 1; idx <= MaxSlots; idx++ {
+		m.slotOwner[idx] = "vm"
+	}
 
 	_, err := m.claimSlotIndex(poolOwner)
 	if !errors.Is(err, ErrNoSlots) {
 		t.Errorf("err = %v, want ErrNoSlots", err)
+	}
+}
+
+// TestClaimSlotIndex_ReclaimsUnusedIndexesAtCeiling pins the recovery path: a
+// spent fresh range must not fail while indexes below it hold neither an owner
+// nor a namespace — those discards are the only inventory a long-lived host
+// has left, and a restart cannot recover them.
+func TestClaimSlotIndex_ReclaimsUnusedIndexesAtCeiling(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	touchNS(t, dir, "ns-7")       // namespace outlived its index
+	m.assignSlotLocked(9, "vm-9") // still owned by a record
+	m.nextSlot = MaxSlots + 1     // fresh range spent
+
+	idx, err := m.claimSlotIndex("vm-new")
+	if err != nil {
+		t.Fatalf("claimSlotIndex = %v, want a reclaimed index", err)
+	}
+	if idx == 7 || idx == 9 {
+		t.Fatalf("idx = %d, want neither the namespace-backed (7) nor the owned (9) index", idx)
+	}
+	if owner := m.slotOwner[idx]; owner != "vm-new" {
+		t.Errorf("slotOwner[%d] = %q, want vm-new", idx, owner)
+	}
+}
+
+// TestClaimSlotIndex_ConcurrentCeilingLoserStillGetsReclaimedSlot pins the
+// concurrent path: two callers hitting the ceiling at once both scan, but
+// only one merges (the other loses the cooldown race in reclaimUnusedSlots
+// and gets n=0 back). The loser must still succeed off the freeSlots the
+// winner just populated, not fail with ErrNoSlots.
+func TestClaimSlotIndex_ConcurrentCeilingLoserStillGetsReclaimedSlot(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	m.nextSlot = MaxSlots + 1 // fresh range spent; every index below is reclaimable
+
+	const waitBound = 10 * time.Second
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	orig := reclaimScanBarrier
+	reclaimScanBarrier = func() {
+		first := false
+		once.Do(func() { first = true; close(entered) })
+		if first {
+			<-release
+		}
+	}
+	defer func() { reclaimScanBarrier = orig }()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := m.claimSlotIndex("vm-a")
+		errCh <- err
+	}()
+
+	// A is parked mid-scan, holding no lock. Bounded so an unexpected path
+	// that never reaches the barrier fails fast instead of hanging the suite.
+	select {
+	case <-entered:
+	case <-time.After(waitBound):
+		close(release) // free A's goroutine (a no-op if it's not there) before failing
+		t.Fatal("timed out waiting for A to reach the scan barrier — claimSlotIndex took a path that never scans")
+	}
+
+	// B runs a full claim — including its own reclaim, which is free to merge
+	// since A hasn't reached the merge step yet — while A is still parked.
+	if _, err := m.claimSlotIndex("vm-b"); err != nil {
+		close(release)
+		t.Fatalf("claimSlotIndex (B) = %v, want a reclaimed index", err)
+	}
+
+	close(release) // let A proceed: its merge loses the cooldown race to B's
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("claimSlotIndex (A) = %v, want a reclaimed index — A's own scan lost the cooldown race, but B had already refilled freeSlots", err)
+		}
+	case <-time.After(waitBound):
+		t.Fatal("timed out waiting for claimSlotIndex (A) to return after release")
+	}
+}
+
+// TestReclaimUnusedSlots_CooldownSkipsRescan pins the pacing: a host that is
+// truly out of slots must not rescan on every claim.
+func TestReclaimUnusedSlots_CooldownSkipsRescan(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	m.nextSlot = MaxSlots + 1
+	if n := m.reclaimUnusedSlots(); n == 0 {
+		t.Fatal("first reclaim recovered nothing, want the empty range back")
+	}
+	m.freeSlots = nil
+	if n := m.reclaimUnusedSlots(); n != 0 {
+		t.Errorf("second reclaim recovered %d within the cooldown, want 0", n)
 	}
 }
 
@@ -464,5 +579,205 @@ func TestCleanupVMOrNamespace_ReleasesOwnership(t *testing.T) {
 	}
 	if len(m.freeSlots) != 1 || m.freeSlots[0] != 5 {
 		t.Errorf("freeSlots = %v, want [5] (slot reclaimed)", m.freeSlots)
+	}
+}
+
+func TestSetupSlotQueueFailsFastOnExpiredContext(t *testing.T) {
+	m := newTestManager()
+	// Occupy every build permit so the new caller must queue.
+	for i := 0; i < setupSlotConcurrency; i++ {
+		m.setupSem <- struct{}{}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := m.setupSlot(ctx, 1)
+	if err == nil || !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "slot build queue") {
+		t.Fatalf("setupSlot = %v, want the build-queue refusal (no kernel work attempted)", err)
+	}
+}
+
+// TestReclaimUnusedSlots_RecoversRangeStrandedByReservations pins the startup
+// recovery: reservations pin the allocator above the highest record index, and
+// every unused index below it must come back as claimable inventory rather than
+// staying unreachable for the process lifetime.
+func TestReclaimUnusedSlots_RecoversRangeStrandedByReservations(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-3")
+	m := newTestManager()
+
+	// A record high in the range pins nextSlot above everything below it.
+	m.ReserveSlotsAbove(map[string]string{"vm-hi": "ns-500", "vm-3": "ns-3"})
+	if m.nextSlot != 501 {
+		t.Fatalf("nextSlot = %d, want 501 (past the highest reserved index)", m.nextSlot)
+	}
+
+	reclaimed := m.ReclaimUnusedSlots()
+	// Everything below the mark except the two reserved indexes.
+	if want := 498; reclaimed != want {
+		t.Fatalf("reclaimed = %d, want %d", reclaimed, want)
+	}
+	idx, err := m.claimSlotIndex("vm-new")
+	if err != nil {
+		t.Fatalf("claimSlotIndex after reclaim: %v", err)
+	}
+	if idx == 3 || idx == 500 {
+		t.Errorf("idx = %d, want an index that no record reserved", idx)
+	}
+}
+
+// TestReclaimUnusedSlots_SkipsStrayHostVeths pins the exclusion: an index whose
+// host veth outlived its namespace cannot be built on (the move-to-host step
+// collides), and a failed build returns the index to the top of the LIFO free
+// list — so handing one out starves every other reclaimed slot behind an
+// endless retry of the same index.
+func TestReclaimUnusedSlots_SkipsStrayHostVeths(t *testing.T) {
+	withTestNetnsDir(t)
+	if err := os.Mkdir(filepath.Join(hostNetDir, "veth-4"), 0o755); err != nil {
+		t.Fatalf("create stray veth: %v", err)
+	}
+
+	m := newTestManager()
+	m.nextSlot = 6 // indexes 1..5 are below the high-water mark
+
+	reclaimed := m.ReclaimUnusedSlots()
+	if reclaimed != 4 {
+		t.Fatalf("reclaimed = %d, want 4 (1,2,3,5 — never the stray veth's index)", reclaimed)
+	}
+	for _, idx := range m.freeSlots {
+		if idx == 4 {
+			t.Fatal("index 4 reclaimed despite a stray host veth — builds there fail and relock the free list")
+		}
+	}
+}
+
+// TestReclaimUnusedSlots_LeavesCooldownUnarmed pins the startup ordering: the
+// orphan sweep deletes namespaces after the startup reclaim runs, so a claim
+// that hits the ceiling moments later must rescan on the fresher evidence
+// instead of failing for the cooldown's duration.
+func TestReclaimUnusedSlots_LeavesCooldownUnarmed(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-2")
+	m := newTestManager()
+	m.nextSlot = 4
+
+	if n := m.ReclaimUnusedSlots(); n != 2 {
+		t.Fatalf("startup reclaim = %d, want 2 (ns-2 still occupied)", n)
+	}
+	// The sweep frees it, as it does on the non-adoption startup path.
+	m.freeSlots = nil
+	if err := os.Remove(filepath.Join(dir, "ns-2")); err != nil {
+		t.Fatalf("remove ns: %v", err)
+	}
+
+	if n := m.reclaimUnusedSlots(); n != 3 {
+		t.Fatalf("rescan = %d, want 3 — the cooldown blocked recovery of a just-swept index", n)
+	}
+}
+
+// TestReclaimUnusedSlots_FailedScanDoesNotArmCooldown pins the pacing to real
+// evidence: a scan that could not read the host's state has learned nothing,
+// so it must not suppress the next attempt — at the ceiling that would mean
+// refusing claims for the cooldown while capacity was actually available.
+func TestReclaimUnusedSlots_FailedScanDoesNotArmCooldown(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	notADir := filepath.Join(dir, "wedged")
+	if err := os.WriteFile(notADir, nil, 0o644); err != nil {
+		t.Fatalf("seed unreadable path: %v", err)
+	}
+	netnsDir = notADir // read fails with something other than "not exist"
+
+	m := newTestManager()
+	m.nextSlot = 5
+
+	if n := m.reclaimUnusedSlots(); n != 0 {
+		t.Fatalf("reclaimed = %d on an unreadable host, want 0", n)
+	}
+	netnsDir = dir // condition clears
+	if n := m.reclaimUnusedSlots(); n != 4 {
+		t.Fatalf("reclaimed = %d after recovery, want 4 — a failed scan armed the cooldown", n)
+	}
+}
+
+// TestSlotAddressing_LowRangeUnchanged pins backward compatibility: widening the
+// veth range must not move a single existing slot's addresses, or every live and
+// paused VM on a host would need its network rebuilt to match.
+func TestSlotAddressing_LowRangeUnchanged(t *testing.T) {
+	// The scheme before widening: 10.12.0.0/16, two addresses per slot.
+	oldVpeer := func(idx int) string { return fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256) }
+	oldVeth := func(idx int) string { return fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256) }
+	for idx := 0; idx < 32768; idx++ {
+		if got, want := vpeerIPForSlot(idx), oldVpeer(idx); got != want {
+			t.Fatalf("vpeerIPForSlot(%d) = %s, want %s (existing slot moved)", idx, got, want)
+		}
+		if got, want := vethIPForSlot(idx), oldVeth(idx); got != want {
+			t.Fatalf("vethIPForSlot(%d) = %s, want %s (existing slot moved)", idx, got, want)
+		}
+	}
+}
+
+// TestSlotAddressing_CrossesIntoSecondHalf pins the widened half and the /31
+// pairing that makes each veth link valid.
+func TestSlotAddressing_CrossesIntoSecondHalf(t *testing.T) {
+	cases := []struct {
+		idx         int
+		vpeer, veth string
+	}{
+		{32767, "10.12.255.254", "10.12.255.255"}, // last slot of the old range
+		{32768, "10.13.0.0", "10.13.0.1"},         // first slot of the new half
+		{MaxSlots - 1, "10.13.251.206", "10.13.251.207"},
+	}
+	for _, tc := range cases {
+		if got := vpeerIPForSlot(tc.idx); got != tc.vpeer {
+			t.Errorf("vpeerIPForSlot(%d) = %s, want %s", tc.idx, got, tc.vpeer)
+		}
+		if got := vethIPForSlot(tc.idx); got != tc.veth {
+			t.Errorf("vethIPForSlot(%d) = %s, want %s", tc.idx, got, tc.veth)
+		}
+	}
+}
+
+// TestSlotAddressing_WithinDeclaredRanges pins the arithmetic against the ranges
+// the scheme claims: host IPs inside vmIPRange (the firewall matches on it) and
+// veth pairs inside 10.12.0.0/15, at both ends of the slot space.
+func TestSlotAddressing_WithinDeclaredRanges(t *testing.T) {
+	_, hostNet, err := net.ParseCIDR(vmIPRange)
+	if err != nil {
+		t.Fatalf("parse vmIPRange: %v", err)
+	}
+	_, vethNet, err := net.ParseCIDR("10.12.0.0/15")
+	if err != nil {
+		t.Fatalf("parse veth range: %v", err)
+	}
+	for _, idx := range []int{0, 1, 32767, 32768, MaxSlots - 1} {
+		if ip := net.ParseIP(hostIPForSlot(idx)); ip == nil || !hostNet.Contains(ip) {
+			t.Errorf("hostIPForSlot(%d) = %s, outside %s", idx, hostIPForSlot(idx), vmIPRange)
+		}
+		for _, ipStr := range []string{vpeerIPForSlot(idx), vethIPForSlot(idx)} {
+			if ip := net.ParseIP(ipStr); ip == nil || !vethNet.Contains(ip) {
+				t.Errorf("slot %d address %s outside 10.12.0.0/15", idx, ipStr)
+			}
+		}
+		// The pair must sit in one /31: same address but for the low bit.
+		vpeer, veth := net.ParseIP(vpeerIPForSlot(idx)).To4(), net.ParseIP(vethIPForSlot(idx)).To4()
+		if vpeer[3]&0xfe != veth[3]&0xfe || vpeer[0] != veth[0] || vpeer[1] != veth[1] || vpeer[2] != veth[2] {
+			t.Errorf("slot %d pair %s/%s does not share a /31", idx, vpeer, veth)
+		}
+	}
+}
+
+// TestCleanupUsesSharedVpeerDerivation pins the route-deletion path to the same
+// derivation the build used. It carried its own hardcoded copy of the formula,
+// which silently deletes the wrong route for any slot in the widened half —
+// leaving a stale host route behind on every teardown up there.
+func TestCleanupUsesSharedVpeerDerivation(t *testing.T) {
+	for _, idx := range []int{5, 32768, MaxSlots - 1} {
+		legacy := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
+		got := vpeerIPForSlot(idx)
+		if idx < 32768 && got != legacy {
+			t.Fatalf("slot %d: shared derivation %s diverges from the old scheme %s", idx, got, legacy)
+		}
+		if idx >= 32768 && got == legacy {
+			t.Fatalf("slot %d: derivation still produces the wrapped legacy address %s", idx, legacy)
+		}
 	}
 }

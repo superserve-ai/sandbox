@@ -3,8 +3,11 @@ package vm
 import (
 	"context"
 	"errors"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -331,6 +334,65 @@ func keysOf(m map[string]sandboxDirInfo) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// The direct-spawn service weight must track the LIVE direct-VM count (100
+// per VM = one legacy peer each), clamp to cgroup v2's [100, 10000], skip the
+// set-property when unchanged, and only run when managing cgroup VMs.
+func TestAdjustDirectSpawnWeight(t *testing.T) {
+	orig := setUnitWeight
+	var got []int
+	setUnitWeight = func(_ context.Context, _ string, w int) error { got = append(got, w); return nil }
+	defer func() { setUnitWeight = orig }()
+
+	tree := &cgroupTree{vms: t.TempDir()} // non-nil => managing cgroup VMs
+	r := &Reconciler{mgr: &Manager{cgroups: tree, log: zerolog.Nop()}}
+
+	sup := func(ids ...string) (map[string]bool, map[string]Supervision) {
+		a := map[string]bool{}
+		s := map[string]Supervision{}
+		for _, id := range ids {
+			a[id] = true
+			s[id] = SupervisionCgroup
+		}
+		// A legacy unit in the set must NOT count toward the weight.
+		a["legacy-1"] = true
+		s["legacy-1"] = SupervisionUnit
+		return a, s
+	}
+
+	// 3 live direct VMs -> 300.
+	a, s := sup("d1", "d2", "d3")
+	r.adjustDirectSpawnWeight(context.Background(), a, s)
+	// Same count again -> no second call.
+	r.adjustDirectSpawnWeight(context.Background(), a, s)
+	// Zero direct VMs -> floor 100.
+	r.adjustDirectSpawnWeight(context.Background(), map[string]bool{"legacy-1": true}, map[string]Supervision{"legacy-1": SupervisionUnit})
+	// 200 direct VMs -> clamped to 10000.
+	many := []string{}
+	for i := 0; i < 200; i++ {
+		many = append(many, "d"+strconv.Itoa(i))
+	}
+	a2, s2 := sup(many...)
+	r.adjustDirectSpawnWeight(context.Background(), a2, s2)
+
+	want := []int{300, 100, 10000}
+	if len(got) != len(want) {
+		t.Fatalf("set-property calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("call %d weight = %d, want %d (all: %v)", i, got[i], want[i], got)
+		}
+	}
+
+	// Not managing cgroup VMs => never touches the weight.
+	got = nil
+	r2 := &Reconciler{mgr: &Manager{cgroups: nil, log: zerolog.Nop()}}
+	r2.adjustDirectSpawnWeight(context.Background(), a, s)
+	if len(got) != 0 {
+		t.Fatalf("unarmed reconciler set weight %v, want none", got)
+	}
 }
 
 // The crash-window orphan rule (Drift 7b) must lose the race with adoption: a
@@ -721,4 +783,343 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 			t.Fatalf("a locked VM must defer, got %v", *flips)
 		}
 	})
+}
+
+// --- Mode-aware release rules: a cgroup VM must never be released on the
+// unit oracle's vacuous answers (no firecracker@ unit exists for it). ---
+
+// shimSystemctlDown puts a systemctl on PATH that answers every unit query
+// with the conclusively-down answers a NONEXISTENT unit produces: exactly the
+// vacuous evidence these rules must refuse to release cgroup VMs on.
+func shimSystemctlDown(t *testing.T) {
+	t.Helper()
+	shim := t.TempDir()
+	script := "#!/bin/sh\ncase \"$1\" in\nlist-units) exit 0 ;;\nshow) echo inactive ;;\nis-active) exit 3 ;;\nesac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(shim, "systemctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// cgroupFixtureTree builds a delegated-subtree stand-in with one per-VM group
+// whose cgroup.events reads as given.
+func cgroupFixtureTree(t *testing.T, id, events string) *cgroupTree {
+	t.Helper()
+	vms := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vms, id), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vms, id, "cgroup.events"), []byte(events), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return &cgroupTree{vms: vms}
+}
+
+func setCgroupPopulated(t *testing.T, tree *cgroupTree, id string, populated bool) {
+	t.Helper()
+	v := "0"
+	if populated {
+		v = "1"
+	}
+	if err := os.WriteFile(filepath.Join(tree.vms, id, "cgroup.events"), []byte("populated "+v+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The prod-reachable shape releaseFailedRestore parks: an Error record in
+// cgroup mode whose FC is still alive. Driving the REAL pass (BoltDB-only
+// mode): the error rule must stop by the scanned mode and must not release
+// the record while the group stays populated; once the group is conclusively
+// empty, the next pass completes the release.
+func TestRunOnce_ErrorCgroupVM_ModeAwareStopAndRelease(t *testing.T) {
+	shimSystemctlDown(t)
+	id := uuid.New().String()
+	tree := cgroupFixtureTree(t, id, "populated 1\n")
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Put(VMRecord{ID: id, Status: StatusError, Supervision: SupervisionCgroup, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	runDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(runDir, id), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:     zerolog.Nop(),
+		state:   store,
+		netMgr:  nil,
+		cgroups: tree,
+		cfg:     ManagerConfig{RunDir: runDir},
+		vms:     map[string]*VMInstance{},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	var stops []Supervision
+	r.stopVM = func(_ context.Context, _ string, sup Supervision) error {
+		stops = append(stops, sup)
+		return nil // reported stopped — but the group stays populated (wedged FC)
+	}
+	past := time.Now().Add(-2 * r.cfg.GracePeriod)
+	r.driftSeen["errunit:"+id] = past
+
+	r.runOnce(context.Background())
+	if len(stops) != 1 || stops[0] != SupervisionCgroup {
+		t.Fatalf("the error rule must stop by the scanned mode (cgroup), got %v", stops)
+	}
+	if rec, gerr := store.Get(id); gerr != nil || rec == nil {
+		t.Fatal("a populated group must veto the release — record was freed under a live FC")
+	}
+
+	// The FC finally exits; the dead half completes the release.
+	setCgroupPopulated(t, tree, id, false)
+	r.driftSeen["errdead:"+id] = past
+	r.runOnce(context.Background())
+	if rec, gerr := store.Get(id); gerr == nil && rec != nil {
+		t.Fatalf("a conclusively-empty group must release the record, still present: %+v", rec)
+	}
+}
+
+// Drift 7b on a direct-spawn crash-window orphan: stop must dispatch by mode,
+// and the release needs the group conclusively empty — a stop that could not
+// kill the FC must leave record, instance and slot owned for the next pass.
+func TestReapUnverifiedOrphans_CgroupOrphan_ModeAwareStopAndProof(t *testing.T) {
+	id := uuid.New().String()
+	tree := cgroupFixtureTree(t, id, "populated 1\n")
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Put(VMRecord{ID: id, Status: StatusRunning, Unverified: true, Supervision: SupervisionCgroup}); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: id, Status: StatusRunning, Unverified: true, Supervision: SupervisionCgroup}
+	m := &Manager{log: zerolog.Nop(), state: store, cgroups: tree, vms: map[string]*VMInstance{id: inst}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	var stops []Supervision
+	r.stopVM = func(_ context.Context, _ string, sup Supervision) error {
+		stops = append(stops, sup)
+		return nil
+	}
+	r.driftSeen["unverifiedorphan:"+id] = time.Now().Add(-2 * r.cfg.UnverifiedOrphanGrace)
+
+	sbID := uuid.MustParse(id)
+	rows := map[string]db.ListSandboxesByHostRow{
+		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusPaused}},
+	}
+	active := map[string]bool{id: true}
+	sup := map[string]Supervision{id: SupervisionCgroup}
+
+	r.reapUnverifiedOrphans(context.Background(), zerolog.Nop(), rows, active, sup, time.Now())
+	if len(stops) != 1 || stops[0] != SupervisionCgroup {
+		t.Fatalf("orphan stop must dispatch by mode, got %v", stops)
+	}
+	if rec, gerr := store.Get(id); gerr != nil || rec == nil {
+		t.Fatal("a populated group must veto the release")
+	}
+
+	setCgroupPopulated(t, tree, id, false)
+	r.driftSeen["unverifiedorphan:"+id] = time.Now().Add(-2 * r.cfg.UnverifiedOrphanGrace)
+	r.reapUnverifiedOrphans(context.Background(), zerolog.Nop(), rows, active, sup, time.Now())
+	if rec, gerr := store.Get(id); gerr == nil && rec != nil {
+		t.Fatal("a conclusively-empty group must complete the release")
+	}
+}
+
+// Drift 1b on a direct-spawn empty shell: the probe finds no microVM behind
+// the socket, but the stop must dispatch by mode and the row flip + release
+// need the group conclusively empty.
+func TestFailEmptyShells_CgroupShell_ModeAwareStopAndProof(t *testing.T) {
+	id := uuid.New().String()
+	tree := cgroupFixtureTree(t, id, "populated 1\n")
+	// A short base dir: the rule dials RunDir/<id>/firecracker.sock, and
+	// t.TempDir's long test-name path would blow the 108-char sun_path cap.
+	runDir, err := os.MkdirTemp("", "fes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+	if err := os.MkdirAll(filepath.Join(runDir, id), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A fake FC API socket answering "Not started" — the empty-shell answer.
+	sock := filepath.Join(runDir, id, "firecracker.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"x","state":"Not started"}`))
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	store, serr := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Put(VMRecord{ID: id, Status: StatusRunning, Supervision: SupervisionCgroup}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, cgroups: tree, cfg: ManagerConfig{RunDir: runDir}, vms: map[string]*VMInstance{}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	var stops []Supervision
+	r.stopVM = func(_ context.Context, _ string, sup Supervision) error {
+		stops = append(stops, sup)
+		return nil
+	}
+	r.driftSeen["fcempty:"+id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+
+	sbID := uuid.MustParse(id)
+	rows := map[string]db.ListSandboxesByHostRow{
+		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+	}
+	active := map[string]bool{id: true}
+	sup := map[string]Supervision{id: SupervisionCgroup}
+
+	r.failEmptyShells(context.Background(), zerolog.Nop(), rows, active, sup, time.Now())
+	if len(stops) != 1 || stops[0] != SupervisionCgroup {
+		t.Fatalf("empty-shell stop must dispatch by mode, got %v", stops)
+	}
+	if rec, gerr := store.Get(id); gerr != nil || rec == nil {
+		t.Fatal("a populated group must veto the flip and release")
+	}
+
+	setCgroupPopulated(t, tree, id, false)
+	r.driftSeen["fcempty:"+id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+	r.failEmptyShells(context.Background(), zerolog.Nop(), rows, active, sup, time.Now())
+	if rec, gerr := store.Get(id); gerr == nil && rec != nil {
+		t.Fatal("a conclusively-empty group must complete the flip and release")
+	}
+}
+
+// The rollback drain: with direct spawn disarmed, a paused cgroup record must
+// demote to unit supervision — durably, and in the tracked instance when one
+// exists — but ONLY with the group conclusively empty and no lifecycle op in
+// flight. (Dir removal is not asserted: the fixture's cgroup.events is a real
+// file, so rmdir legitimately fails where a real cgroup's would succeed.)
+func TestDemotePausedCgroupRecords(t *testing.T) {
+	newFixture := func(t *testing.T, events string, inst *VMInstance) (*Reconciler, *StateStore, string) {
+		t.Helper()
+		id := uuid.New().String()
+		tree := cgroupFixtureTree(t, id, events)
+		store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		if err := store.Put(VMRecord{ID: id, Status: StatusPaused, Supervision: SupervisionCgroup}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{log: zerolog.Nop(), state: store, cgroups: tree, vms: map[string]*VMInstance{}}
+		if inst != nil {
+			inst.ID = id
+			m.vms[id] = inst
+		}
+		return NewReconciler(m, DefaultReconcilerConfig()), store, id
+	}
+	supOf := func(store *StateStore, id string) Supervision {
+		rec, err := store.Get(id)
+		if err != nil || rec == nil {
+			return Supervision("gone")
+		}
+		return rec.Supervision
+	}
+
+	t.Run("empty group demotes the tracked instance and the record", func(t *testing.T) {
+		inst := &VMInstance{Status: StatusPaused, Supervision: SupervisionCgroup}
+		r, store, id := newFixture(t, "populated 0\n", inst)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionUnit {
+			t.Fatalf("record must demote to unit, got %q", got)
+		}
+		inst.mu.RLock()
+		got := inst.Supervision
+		inst.mu.RUnlock()
+		if got != SupervisionUnit {
+			t.Fatalf("tracked instance must demote too, got %q", got)
+		}
+	})
+
+	t.Run("untracked record demotes via the store", func(t *testing.T) {
+		r, store, id := newFixture(t, "populated 0\n", nil)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionUnit {
+			t.Fatalf("record must demote to unit, got %q", got)
+		}
+	})
+
+	t.Run("populated group defers", func(t *testing.T) {
+		r, store, id := newFixture(t, "populated 1\n", nil)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionCgroup {
+			t.Fatalf("a populated group must defer the demotion, got %q", got)
+		}
+	})
+
+	t.Run("malformed events defers (unprovably empty)", func(t *testing.T) {
+		r, store, id := newFixture(t, "frozen 0\n", nil)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionCgroup {
+			t.Fatalf("an unprovably-empty group must defer the demotion, got %q", got)
+		}
+	})
+
+	t.Run("a resume that raced to Running defers", func(t *testing.T) {
+		inst := &VMInstance{Status: StatusRunning, Supervision: SupervisionCgroup}
+		r, store, id := newFixture(t, "populated 0\n", inst)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionCgroup {
+			t.Fatalf("a running instance must veto the demotion, got %q", got)
+		}
+		inst.mu.RLock()
+		got := inst.Supervision
+		inst.mu.RUnlock()
+		if got != SupervisionCgroup {
+			t.Fatal("the running instance's mode must be untouched")
+		}
+	})
+
+	t.Run("an in-flight lifecycle op defers", func(t *testing.T) {
+		r, store, id := newFixture(t, "populated 0\n", nil)
+		r.mgr.vmOpCh(id) <- struct{}{}
+		defer func() { <-r.mgr.vmOpCh(id) }()
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionCgroup {
+			t.Fatalf("a locked VM must defer, got %q", got)
+		}
+	})
+}
+
+// The release chokepoint must refuse unknown supervision modes: every rule
+// proves death via the unit and cgroup oracles, and a mode this binary
+// predates may supervise a live FC neither can see. The record, its instance
+// and its slot must all stay owned.
+func TestMarkStaleRefusesUnknownSupervision(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Supervision: Supervision("checkpointed"), Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{
+		"vm-1": {ID: "vm-1", Status: StatusError, Supervision: Supervision("checkpointed")},
+	}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	if err := r.markStale("vm-1"); err == nil {
+		t.Fatal("an unknown supervision mode must refuse release, not delete the record")
+	}
+	if rec, gerr := store.Get("vm-1"); gerr != nil || rec == nil {
+		t.Fatal("the record must survive the refusal")
+	}
+	if _, tracked := m.vms["vm-1"]; !tracked {
+		t.Fatal("the instance must stay tracked")
+	}
 }

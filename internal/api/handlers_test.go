@@ -3133,3 +3133,59 @@ func TestPauseWithRetry_NotFoundIsTerminal(t *testing.T) {
 		t.Fatalf("NotFound must not be retried, got %d calls", calls)
 	}
 }
+
+// TestCreateSandbox_InsertCarriesTemplateShape pins the row's initial shape: a
+// 'starting' (or failed-before-activation) sandbox must show the template's
+// vcpu/memory, not 1 vCPU / 1 MiB placeholders.
+func TestCreateSandbox_InsertCarriesTemplateShape(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	tpl := defaultReadyTemplate()
+	tpl.Vcpu = 4
+	tpl.MemoryMib = 8192
+
+	var sawVcpu, sawMem bool
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+				return previewCapableHostRow()
+			}
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				for _, a := range args {
+					if v, ok := a.(int32); ok {
+						if v == 4 {
+							sawVcpu = true
+						}
+						if v == 8192 {
+							sawMem = true
+						}
+					}
+				}
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "shaped",
+					Status: db.SandboxStatusStarting, VcpuCount: 4, MemoryMib: 8192,
+					CreatedAt: time.Now(),
+				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(tpl)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Scheduler: &stubScheduler{hostID: "public-host"}}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"shaped"}`))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+	if !sawVcpu || !sawMem {
+		t.Errorf("INSERT args missing template shape (vcpu4 seen=%v, mem8192 seen=%v) — placeholders written instead", sawVcpu, sawMem)
+	}
+}

@@ -966,9 +966,9 @@ func TestPauseVM_AlreadyPausedButArtifactsMissing_Fails(t *testing.T) {
 }
 
 func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	gated := false
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error { gated = true; return nil }
@@ -1015,9 +1015,9 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 // meant "no verdict" the record would never flip and every retry would repeat
 // the same wait — the sandbox stuck until the orphan reaper hours later.
 func TestRestoreVMSnapshot_AdoptionWaitCanceled_StillReachesVerdict(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	ctx, cancel := context.WithCancel(context.Background())
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(c context.Context, _ *Manager, _ string) error {
@@ -1069,9 +1069,9 @@ func TestRestoreVMSnapshot_AdoptionWaitCanceled_StillReachesVerdict(t *testing.T
 // A destroy landing inside the adoption readiness wait must not be reported
 // as a successful restore.
 func TestRestoreVMSnapshot_DestroyedDuringAdoptionWait_Fails(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(_ context.Context, m *Manager, _ string) error {
 		m.mu.Lock()
@@ -1107,9 +1107,9 @@ func TestRestoreVMSnapshot_DestroyedDuringAdoptionWait_Fails(t *testing.T) {
 // The crash-window guard: a reattached Running record whose restore was
 // interrupted before readiness must not be adopted as a successful create.
 func TestRestoreVMSnapshot_AdoptedButBoxdNeverReady_Fails(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error {
 		return errors.New("boxd never became ready")
@@ -1177,9 +1177,9 @@ func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
 }
 
 func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 
 	existing := &VMInstance{
 		ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5",
@@ -1201,9 +1201,9 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 // verdict comes back negative the record is a corpse, so it must not be
 // adopted — the resume falls through to a fresh launch instead.
 func TestResumeVM_UnverifiedRecord_NotAdopted(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error {
 		return errors.New("boxd never became ready") // a genuine corpse verdict
@@ -1277,9 +1277,9 @@ func TestRestoreVMSnapshot_RunningRecordButUnitDead_NotReturned(t *testing.T) {
 	// A record can read Running while the firecracker process is gone. The
 	// retry guard must not hand back that corpse — it must fall through to
 	// a fresh restore.
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return true } // unit definitively dead
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return true } // unit definitively dead
+	defer func() { vmDeadForRetry = orig }()
 
 	dir := t.TempDir()
 	snapPath := filepath.Join(dir, "vmstate.snap")
@@ -1324,9 +1324,9 @@ func TestInstanceRunning(t *testing.T) {
 // durable flag must also stay off the wire for verified records so rollback
 // binaries read them unchanged.
 func TestRetriedLaunchTargetFlagsUnverifiedRecord(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 
 	existing := &VMInstance{
 		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
@@ -1371,9 +1371,9 @@ func TestRetriedLaunchTargetFlagsUnverifiedRecord(t *testing.T) {
 // restart a duplicate delivery adopts the live VM instead of refusing the
 // record and relaunching it (which rolls the guest back to its snapshot).
 func TestRestoreVMSnapshot_VerifiedRecordAfterRestart_Adopted(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil } // boxd healthy
 	defer func() { adoptionBoxdReady = origReady }()
@@ -1436,9 +1436,9 @@ func TestRestoreVMSnapshot_VerifiedRecordAfterRestart_Adopted(t *testing.T) {
 // re-verify and adopt it — and heal the marker — rather than relaunching it
 // and rolling the guest back.
 func TestRestoreVMSnapshot_UnverifiedRecordAfterRestart_ReverifiedAndAdopted(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil } // boxd healthy
 	defer func() { adoptionBoxdReady = origReady }()
@@ -1546,9 +1546,9 @@ func TestVerifyBoxdReadyDetachedFromCaller(t *testing.T) {
 // marker (swallowed clear, crash before the verified persist) would make that
 // rollback happen to a healthy VM. Success must also heal the marker durably.
 func TestResumeVM_UnverifiedTarget_VerifiedAndAdopted(t *testing.T) {
-	origDead := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = origDead }()
+	origDead := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = origDead }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil }
 	defer func() { adoptionBoxdReady = origReady }()
@@ -1785,9 +1785,9 @@ func TestVerifyBoxdReadyReachesVerdictUnderShorterCallerDeadline(t *testing.T) {
 // touching status. The corpse verdict must therefore be recorded first, or the
 // crash-window record keeps advertising Running for a VM that never came back.
 func TestResumeVM_CorpseVerdict_ClearsRunningBeforeRelaunch(t *testing.T) {
-	origDead := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive → adoption considered
-	defer func() { vmUnitDead = origDead }()
+	origDead := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive → adoption considered
+	defer func() { vmDeadForRetry = origDead }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error {
 		return errors.New("boxd silent for the whole budget")
@@ -1880,9 +1880,9 @@ func TestCreateVMSnapshotDoesNotPersist(t *testing.T) {
 // on a precondition and return, so an unrecorded verdict would leave the record
 // still claiming Running. A failed write must refuse the relaunch outright.
 func TestResumeVM_CorpseVerdictUnrecordable_RefusesRelaunch(t *testing.T) {
-	origDead := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive → adoption considered
-	defer func() { vmUnitDead = origDead }()
+	origDead := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive → adoption considered
+	defer func() { vmDeadForRetry = origDead }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error {
 		return errors.New("boxd silent for the whole budget")
@@ -2119,6 +2119,79 @@ func TestReattachRecord_ErrorPersistFails_StillRefusedInMemory(t *testing.T) {
 // A socket-missing record whose unit stop cannot be confirmed must keep its
 // BoltDB record: deleting it would leave a live Firecracker no record points
 // to, invisible to the next reattach.
+// A record with an unknown supervision mode must be PARKED at reattach, not
+// released: the stale-cleanup's unit probe answers vacuously "down" for a
+// nonexistent unit, and acting on that evidence would delete the record and
+// free the network under whatever the unknown mode left running.
+func TestReattachRecord_UnknownSupervision_ParksUnmanageable(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return true } // the vacuous answer
+	defer func() { vmUnitFullyDown = origDown }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	rec := VMRecord{ID: "vm-1", Status: StatusRunning, Supervision: Supervision("checkpointed"), Namespace: "ns-1"}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{}, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok || inst.Status != StatusError {
+		t.Fatalf("an unknown mode must park as Error, got inst=%+v ok=%v", inst, ok)
+	}
+	kept, err := store.Get("vm-1")
+	if err != nil || kept == nil {
+		t.Fatalf("the record must be kept, got rec=%v err=%v", kept, err)
+	}
+	if kept.Supervision != Supervision("checkpointed") {
+		t.Fatalf("the unknown value must be preserved for the binary that understands it, got %q", kept.Supervision)
+	}
+	if kept.Status != StatusError {
+		t.Fatalf("the refusal must be durable, got %s", kept.Status)
+	}
+}
+
+// A failed restore whose direct-spawned FC survived (populated group, or a
+// kill whose completion cannot be proven) still holds its tap and disk: the
+// failure path must NOT free the network slot or rundir — ownership stays
+// with the record until the reconciler confirms death. Only a confirmed-dead
+// or unit-mode VM releases.
+func TestReleaseFailedRestore_LiveCgroupRetainsOwnership(t *testing.T) {
+	newMgr := func(events string) *Manager {
+		vms := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(vms, "vm-1"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(vms, "vm-1", "cgroup.events"), []byte(events), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}, cgroups: &cgroupTree{vms: vms}}
+	}
+	release := func(m *Manager) bool {
+		cleaned := false
+		m.releaseFailedRestore("vm-1", false, false, func() { cleaned = true })
+		return cleaned
+	}
+
+	if release(newMgr("populated 1\n")) {
+		t.Fatal("a live cgroup FC still holds its disk — the rundir must not be freed")
+	}
+	if release(newMgr("frozen 0\n")) { // malformed events: death unprovable
+		t.Fatal("an unprovable kill must retain ownership, not free the rundir")
+	}
+	if !release(newMgr("populated 0\n")) {
+		t.Fatal("a confirmed-dead VM must release its rundir")
+	}
+	unitMode := &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}}
+	if !release(unitMode) {
+		t.Fatal("a plain unit VM must not be blocked by the cgroup guard")
+	}
+}
+
 func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
 	origDown := vmUnitFullyDown
 	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
@@ -2258,5 +2331,187 @@ func TestCommitResumeState_UndurableRunning_FailsResume(t *testing.T) {
 	}
 	if dirty {
 		t.Fatal("DirtyTracked must clear with the unit stopped")
+	}
+}
+
+// A failed record lookup for a cgroup survivor skips the kill but leaves the
+// VM in no protected set, so it must also disable the startup orphan sweep —
+// otherwise the sweep could reclaim a live FC's namespace.
+func TestReapRecordlessCgroupVMsUnreadableRecordDisablesSweep(t *testing.T) {
+	vms := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vms, "vm-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close() // every read now errors — the unreadable-record case
+	m := &Manager{log: zerolog.Nop(), cgroups: &cgroupTree{vms: vms}, state: store}
+	if _, sweepSafe := m.ReapRecordlessCgroupVMs(t.Context()); sweepSafe {
+		t.Fatal("unreadable record for a cgroup survivor must disable the sweep")
+	}
+}
+
+// The reattach half of the demotion handshake: the rollback demotion can
+// rewrite the durable supervision while a lock-free reattach holds a stale
+// record; the paused publish must adopt the fresh durable mode, or the next
+// resume acts on the stale one and re-promotes a demoted record.
+func TestReattachRecord_PausedAdoptsDemotedSupervision(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// The store already holds the DEMOTED record (unit)...
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit}); err != nil {
+		t.Fatal(err)
+	}
+	// ...while this reattach still carries the pre-demotion snapshot (cgroup).
+	stale := VMRecord{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionCgroup}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{}, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), stale, true)
+	if inst == nil || !ok {
+		t.Fatalf("paused reattach must publish, got inst=%v ok=%v", inst, ok)
+	}
+	inst.mu.RLock()
+	got := inst.Supervision
+	inst.mu.RUnlock()
+	if got != SupervisionUnit {
+		t.Fatalf("published instance must adopt the demoted durable mode, got %q", got)
+	}
+}
+
+// When a failed restore retains a possibly-live VM's resources, the parked
+// state must be explicit and durable: the record itself says what is held
+// and that the reconciler owns the teardown — and a successful relaunch
+// retires the claim.
+func TestReleaseFailedRestore_ParksExplicitDurableMarker(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	vms := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vms, "vm-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vms, "vm-1", "cgroup.events"), []byte("populated 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusError, Supervision: SupervisionCgroup}
+	if err := store.Put(toRecord(inst)); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+		cgroups: &cgroupTree{vms: vms}, vms: map[string]*VMInstance{"vm-1": inst}}
+
+	m.releaseFailedRestore("vm-1", false, false, func() { t.Fatal("must not clean the rundir of a possibly-live VM") })
+
+	inst.mu.RLock()
+	marker := inst.TeardownPending
+	inst.mu.RUnlock()
+	if marker == "" {
+		t.Fatal("a retained release must stamp the explicit teardown marker")
+	}
+	rec, gerr := store.Get("vm-1")
+	if gerr != nil || rec == nil || rec.TeardownPending == "" {
+		t.Fatalf("the marker must be durable, got rec=%+v err=%v", rec, gerr)
+	}
+
+	// A successful relaunch retires the claim durably.
+	inst.mu.Lock()
+	inst.Status = StatusRunning
+	inst.mu.Unlock()
+	if err := m.commitResumeState(inst); err != nil {
+		t.Fatalf("commitResumeState: %v", err)
+	}
+	rec, gerr = store.Get("vm-1")
+	if gerr != nil || rec == nil {
+		t.Fatal(gerr)
+	}
+	if rec.TeardownPending != "" {
+		t.Fatal("a successful relaunch must retire the parked-teardown claim")
+	}
+}
+
+// The scope-gone fallback's crash window leaves a cgroup RECORD over a live
+// firecracker@ UNIT. Every record-keyed release must require BOTH supervisors
+// down — the cgroup oracle alone reads that state as dead and would free the
+// tap under the running unit.
+func TestDestroyVM_CgroupRecordOverFallbackUnit_RefusesUntilUnitDown(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+		cgroups: &cgroupTree{vms: t.TempDir()}, // no group: the cgroup side reads dead
+		vms:     map[string]*VMInstance{},
+		cfg:     ManagerConfig{RunDir: t.TempDir()},
+	}
+
+	shimSystemctlActive(t) // the fallback unit is alive
+	err = m.DestroyVM(context.Background(), "vm-1", false)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("destroy over a live fallback unit must refuse Unavailable, got %v", err)
+	}
+	if rec, gerr := store.Get("vm-1"); gerr != nil || rec == nil {
+		t.Fatal("the record must survive the refusal")
+	}
+
+	shimSystemctlDown(t) // unit finally terminal
+	if err := m.DestroyVM(context.Background(), "vm-1", false); err != nil {
+		t.Fatalf("destroy must complete once both supervisors are down, got %v", err)
+	}
+	if rec, _ := store.Get("vm-1"); rec != nil {
+		t.Fatal("the record must be released after a confirmed destroy")
+	}
+}
+
+// The reattach stale-sweep's release proof must also see the fallback unit.
+func TestReattachRecord_CgroupRecordOverFallbackUnit_NotReleased(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // fallback unit alive
+	defer func() { vmUnitFullyDown = origDown }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "fc.sock")
+	if err := os.WriteFile(sock, []byte(""), 0o644); err != nil { // socket present
+		t.Fatal(err)
+	}
+	rec := VMRecord{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, SocketPath: sock}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+		cgroups: &cgroupTree{vms: t.TempDir()}, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok {
+		t.Fatalf("the record must be kept and published, got inst=%v ok=%v", inst, ok)
+	}
+	if kept, gerr := store.Get("vm-1"); gerr != nil || kept == nil {
+		t.Fatal("a cgroup record over a live fallback unit must never be released")
+	}
+
+	vmUnitFullyDown = func(string) bool { return true } // both down now
+	m2 := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+		cgroups: &cgroupTree{vms: t.TempDir()}, vms: map[string]*VMInstance{}}
+	if _, ok := m2.reattachRecord(context.Background(), rec, true); ok {
+		t.Fatal("with both supervisors down the stale record must be released")
+	}
+	if kept, _ := store.Get("vm-1"); kept != nil {
+		t.Fatal("release must delete the record")
 	}
 }

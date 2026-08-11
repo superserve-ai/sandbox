@@ -3,6 +3,7 @@ package main
 import (
 	"cloud.google.com/go/storage"
 	"context"
+	"errors"
 	"fmt"
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/time/rate"
@@ -255,12 +256,47 @@ func (lc *lifecycle) shutdown(ctx context.Context) {
 // main
 // ---------------------------------------------------------------------------
 
+// runDrainCheck reports whether this host still holds direct-spawn state,
+// gating a rollback to a pre-direct-spawn binary. Exit 0 = drained (safe to
+// downgrade); 3 = residual state remains; 2 = the check itself failed. Callers
+// treat any non-zero as "do not downgrade". Run with vmd stopped — the store
+// read lock and the cgroup scan both need the daemon quiescent.
+func runDrainCheck() int {
+	statePath := envOrDefault("VMD_STATE_PATH",
+		filepath.Join(filepath.Dir(envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir")), "vmd.db"))
+	rep, err := vm.CheckDrained(context.Background(), statePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "drain-check: %v\n", err)
+		return 2
+	}
+	fmt.Printf("drain-check: cgroup_records=%d per_vm_dirs=%d populated_groups=%d scope=%q\n",
+		rep.CgroupRecords, rep.PerVMDirs, rep.PopulatedGroups, rep.ScopePath)
+	if rep.Drained() {
+		fmt.Println("drain-check: DRAINED — safe to install a pre-direct-spawn binary")
+		return 0
+	}
+	fmt.Fprintln(os.Stderr, "drain-check: NOT DRAINED — direct-spawn state remains; do not downgrade vmd")
+	return 3
+}
+
 func main() {
-	// Hidden re-exec entry: the launcher-namespace build re-execs vmd under
-	// unshare so the detach syscalls run inside the freshly cloned
-	// namespace. Must dispatch before any daemon setup.
-	if len(os.Args) > 1 && os.Args[1] == "launcher-prune" {
-		os.Exit(vm.LauncherPruneMain())
+	// Maintenance subcommands run before any daemon setup and exit. They must
+	// not open the state store in write mode or start services.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "capabilities":
+			// Advertised so rollback tooling can detect a downgrade to a binary
+			// that lacks cgroup supervision. Env-free by design.
+			fmt.Println("cgroup-supervision")
+			return
+		case "drain-check":
+			os.Exit(runDrainCheck())
+		case "launcher-prune":
+			// Hidden re-exec entry: the launcher-namespace build re-execs vmd
+			// under unshare so the detach syscalls run inside the freshly
+			// cloned namespace. Must dispatch before any daemon setup.
+			os.Exit(vm.LauncherPruneMain())
+		}
 	}
 
 	// Structured logging with zerolog — unix timestamp, caller info enabled.
@@ -421,6 +457,7 @@ func main() {
 		RequirePresenceSidecar:     requirePresenceSidecar,
 		LaunchViaLauncherNS:        launchViaLauncherNS,
 		LauncherNSPath:             os.Getenv("VMD_LAUNCHER_NS_PATH"),
+		DirectSpawn:                envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
@@ -467,6 +504,25 @@ func main() {
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
 
+	// Arm direct spawn AFTER the state store is attached (hasCgroupRecords
+	// reads it to decide rollback-management; the rollback-guard breadcrumb
+	// is written from its resolved path) and BEFORE ReattachAll (its
+	// cgroup-orphan scan needs the delegated subtree). Arms only when the
+	// unit's config proves the survival property (Delegate + KillMode=
+	// process); a refusal degrades new launches to the unit path but still
+	// initializes the subtree for managing any existing cgroup VMs.
+	if arms, err := mgr.ArmDirectSpawn(ctx); err != nil {
+		if errors.Is(err, vm.ErrCgroupVMsUnmanageable) {
+			// Existing cgroup VMs can't be adopted — refuse to come up "ready"
+			// while they run unmanaged. Crashloop surfaces the broken scope for
+			// an operator to repair; the VMs themselves keep running meanwhile.
+			log.Fatal().Err(err).Msg("existing cgroup-mode VMs cannot be managed — refusing to start")
+		}
+		log.Error().Err(err).Msg("direct spawn not armed — launches use the unit path")
+	} else if arms {
+		log.Info().Msg("direct spawn armed: new VMs launch into the delegated cgroup subtree")
+	}
+
 	// ---- Backup uploader ----
 	// Ships each pause's durable artifacts (disk overlay + vmstate) to the
 	// cell's backup bucket, content-addressed and create-only. Disabled
@@ -509,6 +565,13 @@ func main() {
 		if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
 			log.Fatal().Err(err).Str("path", stagingRoot).Msg("failed to create backup staging dir")
 		}
+		// Renew every durable marker's staged directory before the sweep
+		// runs: the sweep is synchronous and ordered ahead of reattach (and
+		// so ahead of RecoverPendingBackups), so a marker that survived an
+		// outage longer than the sweep's orphan horizon needs this renewal
+		// or it reads as an abandoned directory and gets deleted out from
+		// under a still-durable pause.
+		mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
 		backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
 		uploader.StagingRoot = stagingRoot
 		mgr.SetBackupStaging(stagingRoot)
@@ -652,11 +715,36 @@ func main() {
 	// one) and sweep leaked namespaces. The per-VM reattach runs in the background
 	// below; VMs it hasn't reached are loaded on-demand on first request.
 	slotsReserved := mgr.ReserveStartupSlots(ctx)
+	// Reap direct-spawn VMs whose record never persisted (crash between spawn
+	// and first write). They have no record to reserve their slot, so the
+	// sweep/adoption below would tear their netns down under a live FC or
+	// treat it as pool inventory. Safe here — synchronous, before the request
+	// gate opens, so no in-flight create can be mistaken for a survivor
+	// (that racy post-gate case is the reconciler's job). No-op unless armed.
+	// The reap reserves the slots of survivors it couldn't confirm dead, so
+	// the pool and the adoption pass skip them; protectedNs carries their
+	// namespaces so the non-adoption sweep keeps them too. sweepSafe=false
+	// means a survivor could NOT be protected — every reclaim path below
+	// (sweep AND adoption) must stand down for this boot.
+	protectedNs, sweepSafe := mgr.ReapRecordlessCgroupVMs(ctx)
 	adoptNetPool := envOrDefault("VMD_NET_POOL_ADOPT", "false") == "true"
 	if !adoptNetPool {
 		// Under adoption, orphan namespaces are warm-pool candidates instead
 		// of garbage; the adoption pass below validates or sweeps each one.
-		mgr.SweepStartupOrphanNamespaces()
+		// Skip the sweep when the reap couldn't guarantee a live survivor's
+		// ns is spared (see ReapRecordlessCgroupVMs).
+		if sweepSafe {
+			mgr.SweepStartupOrphanNamespaces(protectedNs...)
+			// The reservation-time reclaim ran before this sweep and counted
+			// these namespaces as occupied. Nothing revisits them below the
+			// ceiling — claims just take fresh indexes — so rescan now or the
+			// indexes the sweep freed stay stranded until the next restart.
+			if n := netMgr.ReclaimUnusedSlots(); n > 0 {
+				log.Info().Int("slots", n).Msg("reclaimed slot indexes freed by the startup orphan sweep")
+			}
+		} else {
+			log.Warn().Msg("skipping startup orphan namespace sweep: an unresolved live cgroup survivor could be reclaimed")
+		}
 	}
 
 	// Launcher launch path, enabled per host via VMD_LAUNCH_VIA_LAUNCHER_NS.
@@ -689,7 +777,7 @@ func main() {
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 	switch {
-	case adoptNetPool && slotsReserved:
+	case adoptNetPool && slotsReserved && sweepSafe:
 		// Adopt the slots the previous run abandoned (or crashed out of) in
 		// the background: the pool starts warm within seconds instead of
 		// refilling from scratch, and boot never blocks on the pass.
@@ -698,10 +786,12 @@ func main() {
 			netPool.AdoptOrphanSlots(ctx)
 		}()
 	case adoptNetPool:
-		// Without a completed reservation pass, adoption cannot tell live VM
-		// namespaces from orphans — leave everything in place; the pool
-		// refills fresh and the next healthy boot adopts.
-		log.Error().Msg("skipping network pool adoption: startup slot reservation did not complete")
+		// Without a completed reservation pass — or with an unprotected
+		// recordless survivor — adoption cannot tell live VM namespaces from
+		// orphans; leave everything in place; the pool refills fresh and the
+		// next healthy boot adopts.
+		log.Error().Bool("slots_reserved", slotsReserved).Bool("survivors_protected", sweepSafe).
+			Msg("skipping network pool adoption: live namespaces not provably protected")
 	}
 
 	// Leak gauge for network namespaces — independent of the launcher path, and

@@ -95,6 +95,9 @@ BUNDLE_FILES = [
     "bin/secretsproxy",
     "deploy/superserve-vmd.service",
     "deploy/superserve-vmd.socket",
+    "deploy/superserve-vms.service",
+    "deploy/vmd-rollback-guard",
+    "deploy/superserve-vmd-rollback-guard.conf",
     "deploy/superserve-secretsproxy.service",
     "deploy/firecracker@.service",
     "deploy/firecracker-netns@.service",
@@ -213,6 +216,38 @@ def main() -> int:
             mkdir -p {extract_dir}
             tar xzf {bundle_remote} -C {extract_dir}
 
+            # Rollback safety gate. If the incoming vmd lacks cgroup supervision
+            # (a downgrade past direct-spawn), an old binary would mishandle any
+            # live or PAUSED cgroup VMs on this host — deleting records/networking
+            # under them. Detect the downgrade by grepping the incoming binary for
+            # its capability marker (never execute an unknown old binary — it would
+            # start the daemon), then certify the host is drained USING THE CURRENT
+            # cgroup-aware binary before it is replaced. Gate on the CURRENT binary
+            # ALSO having the marker: on a retried downgrade the installed binary is
+            # already pre-direct-spawn, and running it as `vmd drain-check` would
+            # start the daemon (it doesn't know the subcommand) and hang the deploy
+            # — and there is nothing left to drain. Skipped for normal upgrades too.
+            if grep -qa cgroup-supervision {install_dir}/vmd 2>/dev/null && ! grep -qa cgroup-supervision {extract_dir}/bin/vmd; then
+                echo "incoming vmd lacks cgroup-supervision — verifying host is drained before downgrade"
+                sudo systemctl stop superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
+                # The capable vmd records its resolved state path in the
+                # breadcrumb (arming requires the write), so read that instead
+                # of re-parsing env files with systemd's grammar. Empty (a
+                # capable host that never armed) = drain-check's own defaults
+                # apply; the host-resident start guard backstops either way.
+                DC_STATE=$(sudo head -n 1 /var/lib/sandbox/vmd-state-path 2>/dev/null || true)
+                set +e
+                sudo env VMD_STATE_PATH="$DC_STATE" {install_dir}/vmd drain-check
+                DRAIN_RC=$?
+                set -e
+                if [ "$DRAIN_RC" -ne 0 ]; then
+                    echo "ERROR: host is NOT drained of direct-spawn state (drain-check rc=$DRAIN_RC); refusing to downgrade vmd. Drain cgroup VMs first, then retry." >&2
+                    sudo systemctl start superserve-vmd.socket || true
+                    exit 1
+                fi
+                echo "host drained — proceeding with downgrade"
+            fi
+
             # Install vmd + template-builder binaries.
             sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd
             sudo install -m 0755 {extract_dir}/bin/template-builder {install_dir}/template-builder
@@ -247,9 +282,48 @@ def main() -> int:
             sudo install -m 0755 {extract_dir}/deploy/maintenance-watch.sh {install_dir}/maintenance-watch
             sudo install -m 0644 {extract_dir}/deploy/superserve-maintenance-watch.service /etc/systemd/system/superserve-maintenance-watch.service
             sudo install -m 0644 {extract_dir}/deploy/superserve-maintenance-watch.timer /etc/systemd/system/superserve-maintenance-watch.timer
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vms.service /etc/systemd/system/superserve-vms.service
+            # Host-resident rollback guard: survives deploys of older revisions
+            # (their scripts predate the drain gate above and never remove
+            # drop-ins), so a guard-less script cannot install a pre-cgroup
+            # binary over live direct-spawn VMs unnoticed.
+            sudo install -m 0755 {extract_dir}/deploy/vmd-rollback-guard {install_dir}/vmd-rollback-guard
+            sudo install -d -m 0755 /etc/systemd/system/superserve-vmd.service.d
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-rollback-guard.conf /etc/systemd/system/superserve-vmd.service.d/10-rollback-guard.conf
             sudo systemctl daemon-reload
             sudo systemctl enable --quiet superserve-vmd.socket
             sudo systemctl enable --now --quiet superserve-maintenance-watch.timer
+            # Delegated cgroup subtree for direct-spawn VMs. Enable for boot, but
+            # START only when the delegated root has no child cgroups yet (fresh /
+            # first deploy). Once vmd has bootstrapped it, the root is an inner
+            # cgroup (keeper/ + VM children, controllers enabled), so systemd
+            # cannot place ExecStart back there (cgroup v2 no-internal-process) —
+            # a start would either be a redundant no-op (keeper alive) or FAIL and
+            # abort the deploy (keeper died with VMs still live). In both cases vmd
+            # re-adopts the existing scope; boot-time start is covered by WantedBy.
+            sudo systemctl enable --quiet superserve-vms.service
+            # A bootstrapped keeper is never restarted (below), so the unit
+            # file's TasksMax cannot reach a running service via daemon-reload
+            # alone. Apply it to the live unit; the unit file covers boot. The
+            # CPU/IO weight is deliberately NOT set here — the reconciler owns
+            # it dynamically (100 per live direct VM); a static value here
+            # would fight that and, at 10000 on a near-empty population, starve
+            # legacy VMs under contention.
+            sudo systemctl set-property --runtime superserve-vms.service TasksMax=infinity 2>/dev/null || true
+            VMS_CG=$(systemctl show -p ControlGroup --value superserve-vms.service 2>/dev/null || true)
+            # -print -quit (find exits itself after the first hit) instead of
+            # piping to grep -q: under set -o pipefail, grep closing the pipe
+            # early SIGPIPEs find and the pipeline reads non-zero even on a
+            # match, which would wrongly try to start a populated keeper.
+            VMS_CHILD=""
+            if [ -n "$VMS_CG" ]; then
+                VMS_CHILD=$(sudo find "/sys/fs/cgroup$VMS_CG" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null || true)
+            fi
+            if [ -n "$VMS_CHILD" ]; then
+                echo "delegated VM scope already established — not (re)starting the keeper; vmd will adopt it"
+            else
+                sudo systemctl start superserve-vms.service
+            fi
 
             sudo install -m 0755 {extract_dir}/scripts/fc-cleanup {install_dir}/fc-cleanup
 
