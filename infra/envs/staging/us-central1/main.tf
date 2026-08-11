@@ -298,6 +298,14 @@ module "observability" {
 
   project_id  = local.project_id
   environment = local.environment
+  # Backup pipeline alerts, same set as the production cells so staging
+  # validates the queries before they matter. The disabled-host alert
+  # stays off here: staging toggles BACKUP_BUCKET deliberately.
+  backup_alerts = {
+    host_id             = module.sandbox_host.instance_name
+    display_prefix      = "Backup / ${module.sandbox_host.instance_name}"
+    alert_disabled_host = false
+  }
   dashboards = {
     sandbox_operations = {
       display_name = "Sandbox Telemetry / Staging Operations"
