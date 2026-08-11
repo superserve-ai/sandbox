@@ -46,6 +46,11 @@ type Pool struct {
 	recycled chan *preallocSlot // returned from destroyed sandboxes
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
+	drainMu  sync.RWMutex
+	// refillPaused suspends the refill loop while the controller is tearing
+	// down warm inventory. That keeps the pool from immediately rebuilding the
+	// same slots that the pressure controller just shed.
+	refillPaused bool
 
 	// verifyPollInterval/verifyMaxWait tune Return's pre-recycle liveness
 	// check (see verifyAndRecycle). Zero means use the package defaults;
@@ -267,6 +272,48 @@ func (p *Pool) Return(slot *preallocSlot) {
 		defer sentrylog.Recover("netpool-verify-return")
 		p.verifyAndRecycle(slot)
 	}()
+}
+
+// drain tears down up to max warm slots from the pool so host-side namespace
+// and mount pressure can be reduced without reclaiming a live sandbox.
+func (p *Pool) drain(max int) int {
+	if max <= 0 {
+		return 0
+	}
+	p.setRefillPaused(true)
+	defer p.setRefillPaused(false)
+	drained := 0
+	for drained < max {
+		var slot *preallocSlot
+		select {
+		case slot = <-p.recycled:
+		default:
+			select {
+			case slot = <-p.fresh:
+			default:
+				return drained
+			}
+		}
+		if slot == nil {
+			return drained
+		}
+		p.cleanup(slot)
+		drained++
+	}
+	return drained
+}
+
+func (p *Pool) setRefillPaused(paused bool) {
+	p.drainMu.Lock()
+	p.refillPaused = paused
+	p.drainMu.Unlock()
+}
+
+func (p *Pool) refillIsPaused() bool {
+	p.drainMu.RLock()
+	paused := p.refillPaused
+	p.drainMu.RUnlock()
+	return paused
 }
 
 // verifyAndRecycle blocks (in its own goroutine, never the caller's) until
@@ -586,6 +633,16 @@ func (p *Pool) refillLoop(ctx context.Context) {
 			return
 		default:
 		}
+		if p.refillIsPaused() {
+			select {
+			case <-time.After(refillFailureBackoff):
+			case <-p.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
 
 		if len(p.fresh) >= p.newSize {
 			// Pool full — pre-build one slot and block until it is consumed or
@@ -595,6 +652,10 @@ func (p *Pool) refillLoop(ctx context.Context) {
 			if slot == nil {
 				// mustAllocate only returns nil at shutdown.
 				return
+			}
+			if p.refillIsPaused() {
+				p.cleanup(slot)
+				continue
 			}
 			select {
 			case <-p.stopCh:
@@ -614,6 +675,10 @@ func (p *Pool) refillLoop(ctx context.Context) {
 			if !p.pauseAfterFailure(ctx) {
 				return
 			}
+			continue
+		}
+		if p.refillIsPaused() {
+			p.cleanup(slot)
 			continue
 		}
 		select {

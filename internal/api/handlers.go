@@ -711,7 +711,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdTimeout)
 	defer bootCancel()
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
-		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath)
+		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig)
 	})
 	if err != nil {
 		if isVMDNotFound(err) {

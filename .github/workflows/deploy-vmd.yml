@@ -141,6 +141,20 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          # Fleet defaults for paused-network reclaim live in deployment
+          # config, not the binary. Operators can override them per host in
+          # /etc/sandbox/vmd.env after deployment.
+          VMD_PAUSED_NETWORK_RECLAIM: "true"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_NETNS_THRESHOLD: "23000"
+          VMD_PAUSED_NETWORK_NETNS_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "23000"
+          VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "2"
+          VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           # Staging validates the backup uploader first; the production
           # cells get their buckets after the staging soak.
           BACKUP_BUCKET: superserve-artifact-backup-staging-usc1
@@ -203,6 +217,20 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          # Fleet defaults for paused-network reclaim live in deployment
+          # config, not the binary. Operators can override them per host in
+          # /etc/sandbox/vmd.env after deployment.
+          VMD_PAUSED_NETWORK_RECLAIM: "true"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_NETNS_THRESHOLD: "23000"
+          VMD_PAUSED_NETWORK_NETNS_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "23000"
+          VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "2"
+          VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           BACKUP_BUCKET: superserve-artifact-backup-use4
           # Enables vmd's backup metrics exporter (host-local collector);
@@ -246,6 +274,20 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          # Fleet defaults for paused-network reclaim live in deployment
+          # config, not the binary. Operators can override them per host in
+          # /etc/sandbox/vmd.env after deployment.
+          VMD_PAUSED_NETWORK_RECLAIM: "true"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_NETNS_THRESHOLD: "23000"
+          VMD_PAUSED_NETWORK_NETNS_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "23000"
+          VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "2"
+          VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           # usw is its own cell — separate Supabase project + control plane
           # from the "use" cell above.

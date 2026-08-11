@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -193,6 +194,165 @@ func TestRecordVMDCallEmitsHostIDAndMethodAttributes(t *testing.T) {
 				wantValue,
 				attributes,
 			)
+		}
+	}
+}
+
+func TestRecordPausedNetworkPressureEmitsControllerMetrics(t *testing.T) {
+	ctx := context.Background()
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+	)
+	t.Cleanup(func() {
+		if err := provider.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown meter provider: %v", err)
+		}
+	})
+
+	meter := provider.Meter(instrumentationName)
+
+	mustGauge := func(name string) metric.Int64Gauge {
+		instrument, err := meter.Int64Gauge(name)
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		return instrument
+	}
+	mustCounter := func(name string) metric.Int64Counter {
+		instrument, err := meter.Int64Counter(name)
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		return instrument
+	}
+
+	recorder := &OTelRecorder{
+		provider:                provider,
+		serviceName:             "sandbox-vmd",
+		environment:             "staging",
+		pausedNetworkSlotsTotal: mustGauge("vmd_network_slots_total"),
+		pausedNetworkSlotsUsed:  mustGauge("vmd_network_slots_used"),
+		pausedNetworkSlotsAvail: mustGauge("vmd_network_slots_available"),
+		pausedNetworkPoolSlots:  mustGauge("vmd_network_pool_slots"),
+		pausedNetworkNetnsTotal: mustGauge("vmd_network_netns_total"),
+		pausedNetworkMountTotal: mustGauge("vmd_network_mounts_total"),
+		pausedNetworkPressure:   mustGauge("vmd_network_controller_pressure_state"),
+		pausedNetworkReclaimed:  mustCounter("vmd_network_slots_reclaimed_total"),
+		pausedNetworkPaused:     mustCounter("vmd_network_slots_reclaimed_paused_total"),
+	}
+
+	recorder.RecordPausedNetworkPressure(ctx, PausedNetworkPressure{
+		TotalSlots:        65000,
+		UsedSlots:         64950,
+		AvailableSlots:    50,
+		FreshPool:         12,
+		RecycledPool:      8,
+		NetnsTotal:        51,
+		MountTotal:        102,
+		PressureState:     "kernel",
+		ReclaimedRecycle:  2,
+		ReclaimedTeardown: 3,
+		ReclaimedPaused:   5,
+	})
+
+	var resourceMetrics metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &resourceMetrics); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+
+	seen := map[string]bool{}
+	for _, scopeMetrics := range resourceMetrics.ScopeMetrics {
+		for _, metric := range scopeMetrics.Metrics {
+			switch metric.Name {
+			case "vmd_network_slots_total":
+				gauge, ok := metric.Data.(metricdata.Gauge[int64])
+				if !ok {
+					t.Fatalf("slots total data type = %T, want metricdata.Gauge[int64]", metric.Data)
+				}
+				if len(gauge.DataPoints) != 1 || gauge.DataPoints[0].Value != 65000 {
+					t.Fatalf("slots total datapoints = %+v, want one value 65000", gauge.DataPoints)
+				}
+				seen[metric.Name] = true
+			case "vmd_network_pool_slots":
+				gauge, ok := metric.Data.(metricdata.Gauge[int64])
+				if !ok {
+					t.Fatalf("pool slots data type = %T, want metricdata.Gauge[int64]", metric.Data)
+				}
+				if len(gauge.DataPoints) != 2 {
+					t.Fatalf("pool slot datapoints = %d, want 2", len(gauge.DataPoints))
+				}
+				byType := map[string]int64{}
+				for _, dp := range gauge.DataPoints {
+					attrs := map[string]string{}
+					for _, attr := range dp.Attributes.ToSlice() {
+						attrs[string(attr.Key)] = attr.Value.AsString()
+					}
+					byType[attrs["type"]] = dp.Value
+				}
+				if byType["fresh"] != 12 || byType["recycled"] != 8 {
+					t.Fatalf("pool slot values = %#v, want fresh=12 recycled=8", byType)
+				}
+				seen[metric.Name] = true
+			case "vmd_network_slots_reclaimed_total":
+				sum, ok := metric.Data.(metricdata.Sum[int64])
+				if !ok {
+					t.Fatalf("reclaimed data type = %T, want metricdata.Sum[int64]", metric.Data)
+				}
+				if len(sum.DataPoints) != 2 {
+					t.Fatalf("reclaimed datapoints = %d, want 2", len(sum.DataPoints))
+				}
+				byMode := map[string]int64{}
+				for _, dp := range sum.DataPoints {
+					attrs := map[string]string{}
+					for _, attr := range dp.Attributes.ToSlice() {
+						attrs[string(attr.Key)] = attr.Value.AsString()
+					}
+					byMode[attrs["mode"]] = dp.Value
+				}
+				if byMode["recycle"] != 2 || byMode["teardown"] != 3 {
+					t.Fatalf("reclaimed values = %#v, want recycle=2 teardown=3", byMode)
+				}
+				seen[metric.Name] = true
+			case "vmd_network_slots_reclaimed_paused_total":
+				sum, ok := metric.Data.(metricdata.Sum[int64])
+				if !ok {
+					t.Fatalf("paused reclaimed data type = %T, want metricdata.Sum[int64]", metric.Data)
+				}
+				if len(sum.DataPoints) != 1 || sum.DataPoints[0].Value != 5 {
+					t.Fatalf("paused reclaimed datapoints = %+v, want one value 5", sum.DataPoints)
+				}
+				seen[metric.Name] = true
+			case "vmd_network_controller_pressure_state":
+				gauge, ok := metric.Data.(metricdata.Gauge[int64])
+				if !ok {
+					t.Fatalf("pressure state data type = %T, want metricdata.Gauge[int64]", metric.Data)
+				}
+				if len(gauge.DataPoints) != 1 || gauge.DataPoints[0].Value != 1 {
+					t.Fatalf("pressure state datapoints = %+v, want one value 1", gauge.DataPoints)
+				}
+				attrs := map[string]string{}
+				for _, attr := range gauge.DataPoints[0].Attributes.ToSlice() {
+					attrs[string(attr.Key)] = attr.Value.AsString()
+				}
+				if attrs["reason"] != "kernel" {
+					t.Fatalf("pressure state reason = %q, want kernel", attrs["reason"])
+				}
+				seen[metric.Name] = true
+			}
+		}
+	}
+
+	for _, name := range []string{
+		"vmd_network_slots_total",
+		"vmd_network_pool_slots",
+		"vmd_network_slots_reclaimed_total",
+		"vmd_network_slots_reclaimed_paused_total",
+		"vmd_network_controller_pressure_state",
+	} {
+		if !seen[name] {
+			t.Fatalf("metric %q not found", name)
 		}
 	}
 }

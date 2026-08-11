@@ -751,7 +751,7 @@ paused AS (
   SET status = 'pausing', updated_at = now()
   FROM expired
   WHERE sandbox.id = expired.id
-  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
+  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id, sandbox.network_config
 ),
 closed_intervals AS (
   -- Same atomicity story as BeginPause: bundle the active-interval close
@@ -772,7 +772,7 @@ closed_billing_compute AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
 

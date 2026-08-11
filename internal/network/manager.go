@@ -73,9 +73,10 @@ type VMNetInfo struct {
 // MaxSlots is the maximum number of concurrent VMs. Limited by the IP scheme:
 // hostIP uses 10.11.0.0/16 (one IP per VM), veth pairs use 10.12.0.0/15 (two
 // IPs per VM), so both sides top out at 65,536 and this sits just under it.
-// Every sandbox holds a slot for its whole life, paused included, so this is a
-// ceiling on sandboxes per host, not on running VMs — hardware and kernel
-// scale (namespace and mount table growth) bite well before the arithmetic.
+// Running sandboxes hold a slot; paused ones may release theirs after the
+// configured grace period. The ceiling is therefore on active networked VMs,
+// not on the total paused fleet — hardware and kernel scale (namespace and
+// mount table growth) bite well before the arithmetic.
 const MaxSlots = 65000
 
 // ErrNoSlots is returned when no network slots are available.
@@ -653,6 +654,35 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 		Msg("reclaimed network slot for untracked VM")
 }
 
+// TeardownVMOrNamespace forcefully tears down a VM's network slot without
+// recycling it into the warm pool.
+func (m *Manager) TeardownVMOrNamespace(vmID, fallbackNamespace string) {
+	m.mu.Lock()
+	_, tracked := m.devices[vmID]
+	m.mu.Unlock()
+	if tracked {
+		m.TeardownVM(vmID)
+		return
+	}
+
+	idx, ok := slotFromNamespace(fallbackNamespace)
+	if !ok {
+		return
+	}
+	if !m.claimTeardown(idx, vmID) {
+		return
+	}
+	defer m.releaseIfOwned(idx, teardownOwner)
+
+	if killed := killProcessesInNs(fallbackNamespace); killed > 0 {
+		m.log.Info().Str("namespace", fallbackNamespace).Int("killed", killed).
+			Msg("cleanup: killed lingering processes before namespace teardown")
+	}
+	m.cleanupFull(fallbackNamespace, fmt.Sprintf("veth-%d", idx))
+	m.log.Info().Str("vm_id", vmID).Str("namespace", fallbackNamespace).Int("slot", idx).
+		Msg("forcefully tore down network slot for untracked VM")
+}
+
 // Forget reverses an in-memory reattach that raced a concurrent DestroyVM/
 // markStale: it drops vmID from devices and releases only the index this vmID
 // still owns (releaseIfOwned), so if the racing destroy already freed or the pool
@@ -1037,6 +1067,23 @@ func (m *Manager) ReclaimUnusedSlots() int {
 	m.lastReclaim = time.Time{}
 	m.mu.Unlock()
 	return n
+}
+
+// PoolStats reports the current warm-pool depth and whether the pool exists.
+func (m *Manager) PoolStats() (fresh, recycled int, enabled bool) {
+	if m.pool == nil {
+		return 0, 0, false
+	}
+	return len(m.pool.fresh), len(m.pool.recycled), true
+}
+
+// DrainWarmPool tears down up to max warm pool slots so the host can shed
+// namespace, veth, tap, and mount pressure without waiting for a destroy path.
+func (m *Manager) DrainWarmPool(max int) int {
+	if m.pool == nil || max <= 0 {
+		return 0
+	}
+	return m.pool.drain(max)
 }
 
 // reclaimUnusedSlots refills freeSlots from the range below nextSlot:
