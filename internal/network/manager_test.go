@@ -3,6 +3,8 @@ package network
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -639,5 +641,89 @@ func TestReclaimUnusedSlots_FailedScanDoesNotArmCooldown(t *testing.T) {
 	netnsDir = dir // condition clears
 	if n := m.reclaimUnusedSlotsLocked(); n != 4 {
 		t.Fatalf("reclaimed = %d after recovery, want 4 — a failed scan armed the cooldown", n)
+	}
+}
+
+// TestSlotAddressing_LowRangeUnchanged pins backward compatibility: widening the
+// veth range must not move a single existing slot's addresses, or every live and
+// paused VM on a host would need its network rebuilt to match.
+func TestSlotAddressing_LowRangeUnchanged(t *testing.T) {
+	// The scheme before widening: 10.12.0.0/16, two addresses per slot.
+	oldVpeer := func(idx int) string { return fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256) }
+	oldVeth := func(idx int) string { return fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256) }
+	for idx := 0; idx < 32768; idx++ {
+		if got, want := vpeerIPForSlot(idx), oldVpeer(idx); got != want {
+			t.Fatalf("vpeerIPForSlot(%d) = %s, want %s (existing slot moved)", idx, got, want)
+		}
+		if got, want := vethIPForSlot(idx), oldVeth(idx); got != want {
+			t.Fatalf("vethIPForSlot(%d) = %s, want %s (existing slot moved)", idx, got, want)
+		}
+	}
+}
+
+// TestSlotAddressing_CrossesIntoSecondHalf pins the widened half and the /31
+// pairing that makes each veth link valid.
+func TestSlotAddressing_CrossesIntoSecondHalf(t *testing.T) {
+	cases := []struct {
+		idx         int
+		vpeer, veth string
+	}{
+		{32767, "10.12.255.254", "10.12.255.255"}, // last slot of the old range
+		{32768, "10.13.0.0", "10.13.0.1"},         // first slot of the new half
+		{MaxSlots - 1, "10.13.251.206", "10.13.251.207"},
+	}
+	for _, tc := range cases {
+		if got := vpeerIPForSlot(tc.idx); got != tc.vpeer {
+			t.Errorf("vpeerIPForSlot(%d) = %s, want %s", tc.idx, got, tc.vpeer)
+		}
+		if got := vethIPForSlot(tc.idx); got != tc.veth {
+			t.Errorf("vethIPForSlot(%d) = %s, want %s", tc.idx, got, tc.veth)
+		}
+	}
+}
+
+// TestSlotAddressing_WithinDeclaredRanges pins the arithmetic against the ranges
+// the scheme claims: host IPs inside vmIPRange (the firewall matches on it) and
+// veth pairs inside 10.12.0.0/15, at both ends of the slot space.
+func TestSlotAddressing_WithinDeclaredRanges(t *testing.T) {
+	_, hostNet, err := net.ParseCIDR(vmIPRange)
+	if err != nil {
+		t.Fatalf("parse vmIPRange: %v", err)
+	}
+	_, vethNet, err := net.ParseCIDR("10.12.0.0/15")
+	if err != nil {
+		t.Fatalf("parse veth range: %v", err)
+	}
+	for _, idx := range []int{0, 1, 32767, 32768, MaxSlots - 1} {
+		if ip := net.ParseIP(hostIPForSlot(idx)); ip == nil || !hostNet.Contains(ip) {
+			t.Errorf("hostIPForSlot(%d) = %s, outside %s", idx, hostIPForSlot(idx), vmIPRange)
+		}
+		for _, ipStr := range []string{vpeerIPForSlot(idx), vethIPForSlot(idx)} {
+			if ip := net.ParseIP(ipStr); ip == nil || !vethNet.Contains(ip) {
+				t.Errorf("slot %d address %s outside 10.12.0.0/15", idx, ipStr)
+			}
+		}
+		// The pair must sit in one /31: same address but for the low bit.
+		vpeer, veth := net.ParseIP(vpeerIPForSlot(idx)).To4(), net.ParseIP(vethIPForSlot(idx)).To4()
+		if vpeer[3]&0xfe != veth[3]&0xfe || vpeer[0] != veth[0] || vpeer[1] != veth[1] || vpeer[2] != veth[2] {
+			t.Errorf("slot %d pair %s/%s does not share a /31", idx, vpeer, veth)
+		}
+	}
+}
+
+// TestCleanupUsesSharedVpeerDerivation pins the route-deletion path to the same
+// derivation the build used. It carried its own hardcoded copy of the formula,
+// which silently deletes the wrong route for any slot in the widened half —
+// leaving a stale host route behind on every teardown up there.
+func TestCleanupUsesSharedVpeerDerivation(t *testing.T) {
+	for _, idx := range []int{5, 32768, MaxSlots - 1} {
+		legacy := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
+		got := vpeerIPForSlot(idx)
+		if idx < 32768 && got != legacy {
+			t.Fatalf("slot %d: shared derivation %s diverges from the old scheme %s", idx, got, legacy)
+		}
+		if idx >= 32768 && got == legacy {
+			t.Fatalf("slot %d: derivation still produces the wrapped legacy address %s", idx, legacy)
+		}
 	}
 }
