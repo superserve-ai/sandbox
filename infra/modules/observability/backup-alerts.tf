@@ -17,7 +17,7 @@ locals {
       # Failed attempts per hour over a 30m window. Retry backoff caps at
       # 10m, so one permanently failing generation alone produces ~6
       # attempts/hour; the threshold catches a single stuck task on any
-      # cell (west ~1000 pauses/day, east ~10/day) without firing on
+      # cell regardless of its pause volume, without firing on
       # transient bucket errors that clear on retry.
       query         = "sum(rate(backup_upload_total{result=\"failed\", ${local.backup_host_matcher}}[30m])) * 3600 > ${var.backup_alerts.upload_failures_per_hour}"
       duration      = "1800s"
@@ -30,9 +30,9 @@ locals {
 
     backlog_age = {
       display_name = "${var.backup_alerts.display_prefix} / oldest pending generation too old"
-      # Overlays are tens of MB packed and ship in seconds under the
-      # default 100 Mbit/s cap; west's ~1000 pauses/day is one pause per
-      # ~90s, so queue residence is normally under a minute. A 30 minute
+      # Sparse-packed overlays ship in seconds under the default
+      # bandwidth cap, so queue residence is normally well under a
+      # minute even on a busy cell. A 30 minute
       # old queue head means the drain loop is stalled or falling behind,
       # and every queued pause is unmet durability (RPO) exposure.
       query         = "max(backup_oldest_pending_age_seconds{${local.backup_host_matcher}}) > ${var.backup_alerts.oldest_pending_age_seconds}"
@@ -48,11 +48,11 @@ locals {
       display_name = "${var.backup_alerts.display_prefix} / pause hook p99 regression"
       # The synchronous hook is bounded by design to a marker write, an
       # O(dirtied-bytes) staging copy, and a tens-of-KB vmstate hash:
-      # tens to low hundreds of ms. The manifest-hashing regression this
-      # alert exists for added ~5s to every pause with only a log line to
-      # show for it; 2s p99 catches that class while tolerating the
-      # occasional large staged overlay. The 1h rate window keeps the
-      # quantile meaningful on the east cell's ~10 pauses/day.
+      # tens to low hundreds of ms. The class this alert exists for is a
+      # synchronous term that scales with disk size instead of dirtied
+      # bytes; 2s p99 catches that while tolerating the occasional large
+      # staged overlay. The 1h rate window keeps the quantile meaningful
+      # on a low-traffic cell.
       query         = "histogram_quantile(0.99, sum by (le) (rate(backup_pause_hook_duration_seconds_bucket{${local.backup_host_matcher}}[1h]))) > ${var.backup_alerts.pause_hook_p99_seconds}"
       duration      = "1800s"
       documentation = <<-EOT
@@ -82,8 +82,8 @@ locals {
         display_name = "${var.backup_alerts.display_prefix} / backup disabled on host"
         # vmd emits backup_enabled from outside the BACKUP_BUCKET gate
         # precisely so a host with backup misconfigured reports 0 instead
-        # of nothing: a production cell once ran a full day with backup
-        # silently disabled. 30 minutes tolerates deploy churn.
+        # of nothing; without it, a misconfigured host is indistinguishable
+        # from one emitting no metrics. 30 minutes tolerates deploy churn.
         query         = "max(backup_enabled{${local.backup_host_matcher}}) < 1"
         duration      = "1800s"
         documentation = <<-EOT

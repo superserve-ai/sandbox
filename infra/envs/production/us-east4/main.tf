@@ -339,9 +339,9 @@ module "observability" {
   }
   # Backup pipeline alerts scoped to this cell's host via the host_id
   # metric label (HOST_ID on the host matches the instance name). Module
-  # defaults hold for this cell's ~10 pauses/day too: the failure-rate
+  # defaults hold regardless of the cell's traffic: the failure-rate
   # threshold keys on retry pressure (one stuck generation retries ~6
-  # times/hour), not on traffic volume.
+  # times/hour under the capped backoff), not on pause volume.
   backup_alerts = {
     host_id        = module.sandbox_host.instance_name
     display_prefix = "Backup / ${module.sandbox_host.instance_name}"

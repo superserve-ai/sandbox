@@ -97,11 +97,10 @@ variable "backup_alerts" {
     # attempts/hour; the default catches one stuck task on any cell while
     # ignoring transient bucket blips that succeed on retry.
     upload_failures_per_hour = optional(number, 4)
-    # Age of the oldest queued generation. Overlays are tens of MB packed
-    # and upload in seconds under the default 100 Mbit/s cap; even the
-    # west cell's ~1000 pauses/day is one pause per ~90s, so queue
-    # residence is normally under a minute and a 30 minute old head means
-    # the drain is stalled or the backlog is growing.
+    # Age of the oldest queued generation. Sparse-packed overlays upload
+    # in seconds under the default bandwidth cap, so queue residence is
+    # normally well under a minute even on a busy cell, and a 30 minute
+    # old head means the drain is stalled or the backlog is growing.
     oldest_pending_age_seconds = optional(number, 1800)
     # p99 of the synchronous pause-RPC backup hook. The hook is bounded
     # by design to a marker write, an O(dirtied-bytes) staging copy, and

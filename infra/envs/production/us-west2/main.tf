@@ -233,8 +233,8 @@ module "observability" {
   }
   # Backup pipeline alerts scoped to this cell's host via the host_id
   # metric label (HOST_ID on the host matches the instance name).
-  # Thresholds are the module defaults, sized in the module against this
-  # cell's ~1000 pauses/day and tens-of-MB packed overlays.
+  # Thresholds are the module defaults; the rationale for each sits on
+  # the module's variables.
   backup_alerts = {
     host_id        = module.sandbox_host.instance_name
     display_prefix = "Backup / ${module.sandbox_host.instance_name}"
