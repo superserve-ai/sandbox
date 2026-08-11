@@ -585,3 +585,29 @@ func TestReclaimUnusedSlots_SkipsStrayHostVeths(t *testing.T) {
 		}
 	}
 }
+
+// TestReclaimUnusedSlots_LeavesCooldownUnarmed pins the startup ordering: the
+// orphan sweep deletes namespaces after the startup reclaim runs, so a claim
+// that hits the ceiling moments later must rescan on the fresher evidence
+// instead of failing for the cooldown's duration.
+func TestReclaimUnusedSlots_LeavesCooldownUnarmed(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-2")
+	m := newTestManager()
+	m.nextSlot = 4
+
+	if n := m.ReclaimUnusedSlots(); n != 2 {
+		t.Fatalf("startup reclaim = %d, want 2 (ns-2 still occupied)", n)
+	}
+	// The sweep frees it, as it does on the non-adoption startup path.
+	m.freeSlots = nil
+	if err := os.Remove(filepath.Join(dir, "ns-2")); err != nil {
+		t.Fatalf("remove ns: %v", err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if n := m.reclaimUnusedSlotsLocked(); n != 3 {
+		t.Fatalf("rescan = %d, want 3 — the cooldown blocked recovery of a just-swept index", n)
+	}
+}

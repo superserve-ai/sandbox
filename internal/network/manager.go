@@ -970,8 +970,14 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 func (m *Manager) ReclaimUnusedSlots() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.lastReclaim = time.Time{} // startup always scans; the cooldown paces the ceiling path
-	return m.reclaimUnusedSlotsLocked()
+	m.lastReclaim = time.Time{} // startup always scans
+	n := m.reclaimUnusedSlotsLocked()
+	// The startup orphan sweep runs after this and deletes namespaces, so
+	// indexes this pass counted as occupied can be free moments later. Leave
+	// the cooldown unarmed so the first claim at the ceiling rescans rather
+	// than failing for the cooldown's duration over stale evidence.
+	m.lastReclaim = time.Time{}
+	return n
 }
 
 // reclaimUnusedSlotsLocked refills freeSlots from the range below nextSlot:
