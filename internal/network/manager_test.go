@@ -302,6 +302,50 @@ func TestClaimSlotIndex_ReclaimsUnusedIndexesAtCeiling(t *testing.T) {
 	}
 }
 
+// TestClaimSlotIndex_ConcurrentCeilingLoserStillGetsReclaimedSlot pins the
+// concurrent path: two callers hitting the ceiling at once both scan, but
+// only one merges (the other loses the cooldown race in reclaimUnusedSlots
+// and gets n=0 back). The loser must still succeed off the freeSlots the
+// winner just populated, not fail with ErrNoSlots.
+func TestClaimSlotIndex_ConcurrentCeilingLoserStillGetsReclaimedSlot(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	m.nextSlot = MaxSlots + 1 // fresh range spent; every index below is reclaimable
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	orig := reclaimScanBarrier
+	reclaimScanBarrier = func() {
+		first := false
+		once.Do(func() { first = true; close(entered) })
+		if first {
+			<-release
+		}
+	}
+	defer func() { reclaimScanBarrier = orig }()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := m.claimSlotIndex("vm-a")
+		errCh <- err
+	}()
+
+	<-entered // A is parked mid-scan, holding no lock
+
+	// B runs a full claim — including its own reclaim, which is free to merge
+	// since A hasn't reached the merge step yet — while A is still parked.
+	if _, err := m.claimSlotIndex("vm-b"); err != nil {
+		t.Fatalf("claimSlotIndex (B) = %v, want a reclaimed index", err)
+	}
+
+	close(release) // let A proceed: its merge loses the cooldown race to B's
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("claimSlotIndex (A) = %v, want a reclaimed index — A's own scan lost the cooldown race, but B had already refilled freeSlots", err)
+	}
+}
+
 // TestReclaimUnusedSlots_CooldownSkipsRescan pins the pacing: a host that is
 // truly out of slots must not rescan on every claim.
 func TestReclaimUnusedSlots_CooldownSkipsRescan(t *testing.T) {

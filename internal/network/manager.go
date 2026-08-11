@@ -86,6 +86,13 @@ var ErrNoSlots = fmt.Errorf("no available network slots (max %d concurrent VMs)"
 // released, and a host at the ceiling is exactly when claims arrive fastest.
 const reclaimCooldown = 30 * time.Second
 
+// reclaimScanBarrier runs inside reclaimUnusedSlots after the unlocked
+// directory reads finish and before it re-locks to merge. No-op in
+// production; tests override it to pause one scan there so a second,
+// concurrent scan can complete its own merge first — deterministically
+// reproducing the "this call's own reclaim lost the cooldown race" path.
+var reclaimScanBarrier = func() {}
+
 // setupSlotConcurrency caps concurrent slot builds across every caller
 // (on-demand fallback and pool refill). Each build forks a dozen ip/nsenter
 // commands that serialize on the kernel's netlink lock, so unbounded
@@ -966,9 +973,16 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 				// host — including an on-demand RestoreSnapshot setup
 				// racing its gRPC deadline — for the scan's full duration.
 				m.mu.Unlock()
-				n := m.reclaimUnusedSlots()
+				m.reclaimUnusedSlots()
 				m.mu.Lock()
-				if n > 0 {
+				// Check current state, not this call's own return value: a
+				// concurrent caller's scan can win the merge (see the
+				// cooldown re-check in reclaimUnusedSlots) while this one
+				// loses it, in which case this call's own n is 0 even though
+				// the winner just refilled freeSlots. Trusting n here would
+				// fail this claim with ErrNoSlots despite slots being
+				// available right now.
+				if len(m.freeSlots) > 0 {
 					continue
 				}
 				m.mu.Unlock()
@@ -1075,6 +1089,11 @@ func (m *Manager) reclaimUnusedSlots() int {
 			}
 		}
 	}
+
+	// Test seam: no-op in production. Tests override this to pause a scan
+	// here, after the unlocked directory reads and before the merge lock, to
+	// deterministically interleave a concurrent scan that merges first.
+	reclaimScanBarrier()
 
 	// Everything from here on is cheap in-memory bookkeeping against mutable
 	// allocator state, so it takes the lock — unlike the directory reads
