@@ -102,6 +102,30 @@ sandbox_request() {
   rm -f "$output"
 }
 
+sandbox_exec_json() {
+  local command="$1"
+  local payload response status body
+  payload="$(jq -cn --arg command "$command" --argjson timeout_s "$EXEC_TIMEOUT_S" '{command: $command, timeout_s: $timeout_s}')"
+  response="$(sandbox_request POST "/exec" "$payload")"
+  status="$(head -n1 <<<"$response")"
+  body="$(tail -n +2 <<<"$response")"
+  if [[ "$status" != "200" ]]; then
+    fail "sandbox exec failed with HTTP ${status}: ${body}"
+  fi
+  printf '%s\n' "$body"
+}
+
+sandbox_exec() {
+  local body exit_code stdout
+  body="$(sandbox_exec_json "$1")"
+  exit_code="$(jq -r '.exit_code // empty' <<<"$body")"
+  if [[ "$exit_code" != "0" ]]; then
+    fail "sandbox exec returned exit_code ${exit_code}: ${body}"
+  fi
+  stdout="$(jq -r '.stdout // empty' <<<"$body")"
+  printf '%s\n' "$stdout"
+}
+
 ssh_request() {
   local remote_cmd="$1"
   local output status
@@ -139,19 +163,6 @@ wait_for_sandbox_status() {
   done
 
   fail "sandbox ${SANDBOX_ID} did not reach status ${wanted} within ${POLL_TIMEOUT_S}s"
-}
-
-sandbox_exec() {
-  local command="$1"
-  local payload response status body
-  payload="$(jq -cn --arg command "$command" --argjson timeout_s "$EXEC_TIMEOUT_S" '{command: $command, timeout_s: $timeout_s}')"
-  response="$(sandbox_request POST "/exec" "$payload")"
-  status="$(head -n1 <<<"$response")"
-  body="$(tail -n +2 <<<"$response")"
-  if [[ "$status" != "200" ]]; then
-    fail "sandbox exec failed with HTTP ${status}: ${body}"
-  fi
-  printf '%s\n' "$body"
 }
 
 publish_preview_port() {
@@ -243,25 +254,12 @@ latest_vmd_logs() {
   printf '%s\n' "$body"
 }
 
-latest_vmd_vm_logs() {
-  local since="$1"
-  local sandbox_id="$2"
-  local response status body
-  response="$(ssh_request "sudo -n journalctl -u vmd --since $(shell_quote "$since") --no-pager -o json | jq -c --arg sid $(shell_quote "$sandbox_id") 'select(.MESSAGE? != null) | .MESSAGE | fromjson? | select(.vm_id == \$sid)'")"
-  status="$(head -n1 <<<"$response")"
-  body="$(tail -n +2 <<<"$response")"
-  if [[ "$status" != "0" ]]; then
-    fail "failed to read vmd logs for sandbox ${sandbox_id} from ${SSH_TARGET}: ${body}"
-  fi
-  printf '%s\n' "$body"
-}
-
 collect_slot_state() {
   local since="$1"
   local sandbox_id="$2"
   local stage="$3"
   local logs slot host_ip ns source
-  logs="$(latest_vmd_vm_logs "$since" "$sandbox_id")"
+  logs="$(latest_vmd_logs "$since" | jq -c --arg sid "$sandbox_id" 'select(.MESSAGE? != null) | .MESSAGE | fromjson? | select(.vm_id == $sid)')"
   {
     printf '## %s %s\n' "$stage" "$since"
     printf '%s\n' "$logs"
@@ -497,6 +495,7 @@ create_body="$(jq -cn \
   --arg run_id "$RUN_ID" \
   '{name: $name, from_template: $template, timeout_seconds: 1800, metadata: {validation: "paused-network-slot", region: $region, run_id: $run_id}}')"
 
+create_log_since="$(date -u +%Y-%m-%d' '%H:%M:%S)"
 create_response="$(api_request POST /sandboxes "$create_body")"
 create_status="$(head -n1 <<<"$create_response")"
 create_body_json="$(tail -n +2 <<<"$create_response")"
@@ -515,8 +514,12 @@ wait_for_sandbox_status active
 pre_exec_link="$(sandbox_exec 'ip -j link')"
 pre_exec_addr="$(sandbox_exec 'ip -j addr')"
 pre_exec_route="$(sandbox_exec 'ip -j route')"
-pre_dns="$(sandbox_exec 'getent hosts example.com || true')"
-pre_https="$(sandbox_exec "curl -fsS -o /dev/null -w '%{http_code}\n' https://example.com || true")"
+pre_dns_response="$(sandbox_exec_json 'getent hosts example.com')"
+pre_dns_exit="$(jq -r '.exit_code // empty' <<<"$pre_dns_response")"
+pre_dns="$(jq -r '.stdout // empty' <<<"$pre_dns_response")"
+pre_https_response="$(sandbox_exec_json "curl -fsS -o /dev/null -w '%{http_code}\n' https://example.com")"
+pre_https_exit="$(jq -r '.exit_code // empty' <<<"$pre_https_response")"
+pre_https="$(jq -r '.stdout // empty' <<<"$pre_https_response")"
 
 printf '%s\n' "$pre_exec_link" >"$RESULTS_DIR/before-guest-link.json"
 printf '%s\n' "$pre_exec_addr" >"$RESULTS_DIR/before-guest-addr.json"
@@ -534,10 +537,13 @@ GUEST_GW="$(jq -r '.[] | select(.dst == "default") | .gateway // empty' <<<"$pre
 [[ -n "$GUEST_GW" ]] || fail "could not determine guest gateway before pause"
 GUEST_IP_STATUS="PASS"
 GUEST_ROUTES_STATUS="PASS"
-DNS_STATUS="PASS"
-OUTBOUND_NETWORK="PASS"
+if [[ "$pre_dns_exit" == "0" && -n "$pre_dns" ]]; then
+  DNS_STATUS="PASS"
+fi
+if [[ "$pre_https_exit" == "0" && "$(tr -d '\r\n' <<<"$pre_https")" == "200" ]]; then
+  OUTBOUND_NETWORK="PASS"
+fi
 
-create_log_since="$(date -u +%Y-%m-%d' '%H:%M:%S)"
 slot_context="$(collect_slot_state "$create_log_since" "$SANDBOX_ID" "create")"
 OLD_SLOT="$(sed -n '1p' <<<"$slot_context")"
 OLD_HOST_IP="$(sed -n '2p' <<<"$slot_context")"
@@ -557,19 +563,23 @@ check_host_slot_resources "$OLD_SLOT" "before"
   printf '%s\n' "$pre_exec_route"
 } >"$RESULTS_DIR/before-guest.txt"
 
+preview_start_response="$(sandbox_exec_json 'nohup python3 -m http.server 8080 >/tmp/preview-server.log 2>&1 </dev/null &')"
+preview_start_exit="$(jq -r '.exit_code // empty' <<<"$preview_start_response")"
+[[ "$preview_start_exit" == "0" ]] || fail "preview server start failed: ${preview_start_response}"
+
 preview_port=8080
 publish_preview_port "$preview_port" >/dev/null
 preview_url="https://${preview_port}-${SANDBOX_ID}.${PREVIEW_DOMAIN}"
 wait_for_preview_http_200 "$preview_url"
 PREVIEW_PORT_STATUS="PASS"
 
+pause_log_since="$(date -u +%Y-%m-%d' '%H:%M:%S)"
 pause_response="$(api_request POST "/sandboxes/${SANDBOX_ID}/pause")"
 pause_status="$(head -n1 <<<"$pause_response")"
 pause_body="$(tail -n +2 <<<"$pause_response")"
 [[ "$pause_status" == "204" ]] || fail "pause failed with HTTP ${pause_status}: ${pause_body}"
 wait_for_sandbox_status paused
 
-pause_log_since="$(date -u +%Y-%m-%d' '%H:%M:%S)"
 check_host_slot_released "$OLD_SLOT" "paused"
 SLOT_RELEASED="PASS"
 OLD_NETNS_REMOVED="PASS"
@@ -578,9 +588,6 @@ OLD_MOUNT_REMOVED="PASS"
 
 paused_log="$(latest_vmd_logs "$pause_log_since")"
 printf '%s\n' "$paused_log" >"$RESULTS_DIR/paused-host.txt"
-if jq -e --arg old_ip "$OLD_HOST_IP" 'select(.host_ip == $old_ip)' <<<"$paused_log" >/dev/null 2>&1; then
-  STALE_STATE_FOUND="yes: old host IP still present in post-pause logs"
-fi
 
 found_temp_owner=""
 for attempt in $(seq 1 "$REUSE_ATTEMPTS"); do
@@ -599,8 +606,8 @@ for attempt in $(seq 1 "$REUSE_ATTEMPTS"); do
   TEMP_ACCESS_TOKEN="$(jq -r '.access_token // empty' <<<"$temp_body")"
   [[ -n "$TEMP_SANDBOX_ID" ]] || fail "temp sandbox create response did not include id"
   [[ -n "$TEMP_ACCESS_TOKEN" ]] || fail "temp sandbox create response did not include access token"
-  wait_for_sandbox_status active
   temp_log_since="$(date -u +%Y-%m-%d' '%H:%M:%S)"
+  wait_for_sandbox_status active
   temp_slot_context="$(collect_slot_state "$temp_log_since" "$TEMP_SANDBOX_ID" "temp-${attempt}")"
   temp_slot="$(sed -n '1p' <<<"$temp_slot_context")"
   if [[ "$temp_slot" == "$OLD_SLOT" ]]; then
@@ -615,6 +622,7 @@ done
 
 [[ -n "$found_temp_owner" ]] || fail "could not observe OLD_SLOT ${OLD_SLOT} being reused within ${REUSE_ATTEMPTS} attempts"
 
+resume_log_since="$(date -u +%Y-%m-%d' '%H:%M:%S)"
 resume_start_epoch="$(date +%s)"
 resume_response="$(api_request POST "/sandboxes/${SANDBOX_ID}/resume")"
 resume_status="$(head -n1 <<<"$resume_response")"
@@ -625,7 +633,6 @@ ACCESS_TOKEN="$(jq -r '.access_token // empty' <<<"$resume_body")"
 wait_for_sandbox_status active
 RESUME_LATENCY="$(( $(date +%s) - resume_start_epoch ))s"
 
-resume_log_since="$(date -u +%Y-%m-%d' '%H:%M:%S)"
 resume_slot_context="$(collect_slot_state "$resume_log_since" "$SANDBOX_ID" "resume")"
 NEW_SLOT="$(sed -n '1p' <<<"$resume_slot_context")"
 NEW_HOST_IP="$(sed -n '2p' <<<"$resume_slot_context")"
@@ -641,8 +648,12 @@ check_host_slot_resources "$NEW_SLOT" "after"
 post_exec_link="$(sandbox_exec 'ip -j link')"
 post_exec_addr="$(sandbox_exec 'ip -j addr')"
 post_exec_route="$(sandbox_exec 'ip -j route')"
-post_dns="$(sandbox_exec 'getent hosts example.com || true')"
-post_https="$(sandbox_exec "curl -fsS -o /dev/null -w '%{http_code}\n' https://example.com || true")"
+post_dns_response="$(sandbox_exec_json 'getent hosts example.com')"
+post_dns_exit="$(jq -r '.exit_code // empty' <<<"$post_dns_response")"
+post_dns="$(jq -r '.stdout // empty' <<<"$post_dns_response")"
+post_https_response="$(sandbox_exec_json "curl -fsS -o /dev/null -w '%{http_code}\n' https://example.com")"
+post_https_exit="$(jq -r '.exit_code // empty' <<<"$post_https_response")"
+post_https="$(jq -r '.stdout // empty' <<<"$post_https_response")"
 printf '%s\n' "$post_exec_link" >"$RESULTS_DIR/after-guest-link.json"
 printf '%s\n' "$post_exec_addr" >"$RESULTS_DIR/after-guest-addr.json"
 printf '%s\n' "$post_exec_route" >"$RESULTS_DIR/after-guest-route.json"
@@ -675,8 +686,12 @@ fi
 
 [[ -n "$POST_GUEST_IP" && "$POST_GUEST_IP" == "$GUEST_IP" ]] && GUEST_IP_STATUS="PASS"
 [[ -n "$POST_GUEST_GW" && "$POST_GUEST_GW" == "$GUEST_GW" ]] && GUEST_ROUTES_STATUS="PASS"
-[[ -n "$post_dns" ]] && DNS_STATUS="PASS"
-[[ "$post_https" == "200" ]] && OUTBOUND_NETWORK="PASS"
+if [[ "$post_dns_exit" == "0" && -n "$post_dns" ]]; then
+  DNS_STATUS="PASS"
+fi
+if [[ "$post_https_exit" == "0" && "$(tr -d '\r\n' <<<"$post_https")" == "200" ]]; then
+  OUTBOUND_NETWORK="PASS"
+fi
 wait_for_preview_http_200 "$preview_url"
 
 post_log="$(latest_vmd_logs "$resume_log_since")"
@@ -686,8 +701,10 @@ post_log="$(latest_vmd_logs "$resume_log_since")"
   printf '\n'
 } >>"$RESULTS_DIR/vmd.log"
 printf '%s\n' "$post_log" >"$RESULTS_DIR/after-host.txt"
-if jq -e --arg old_ip "$OLD_HOST_IP" 'select(.host_ip == $old_ip)' <<<"$post_log" >/dev/null 2>&1; then
-  STALE_STATE_FOUND="yes: old host IP still present in post-resume logs"
+if jq -e --arg old_ip "$OLD_HOST_IP" '
+  select((.message // .msg // "") == "reattached VM network state" and .host_ip == $old_ip)
+' <<<"$post_log" >/dev/null 2>&1; then
+  STALE_STATE_FOUND="yes: stale host IP reappeared in post-resume live-state logs"
 fi
 
 if [[ -n "${TEMP_SANDBOX_ID:-}" ]]; then
@@ -699,6 +716,26 @@ control_line="MANUAL"
 firewall_line="MANUAL"
 
 summary="$RESULTS_DIR/summary.txt"
+if [[ \
+  "$SLOT_RELEASED" == "PASS" && \
+  "$OLD_SLOT_REUSED" == "PASS" && \
+  "$SLOT_CHANGED_ON_RESUME" == "PASS" && \
+  "$OLD_NETNS_REMOVED" == "PASS" && \
+  "$OLD_VETH_REMOVED" == "PASS" && \
+  "$OLD_MOUNT_REMOVED" == "PASS" && \
+  "$NEW_NETNS_CREATED" == "PASS" && \
+  "$NEW_VETH_CREATED" == "PASS" && \
+  "$GUEST_IP_STATUS" == "PASS" && \
+  "$GUEST_ROUTES_STATUS" == "PASS" && \
+  "$GUEST_MAC_COMPARISON" == "changed" && \
+  "$DNS_STATUS" == "PASS" && \
+  "$OUTBOUND_NETWORK" == "PASS" && \
+  "$PREVIEW_PORT_STATUS" == "PASS" && \
+  "$STALE_STATE_FOUND" == "no" \
+]]; then
+  OVERALL="PASS"
+fi
+
 {
   echo "SANDBOX_ID=${SANDBOX_ID}"
   echo "HOST=${SSH_TARGET}"
@@ -731,10 +768,10 @@ summary="$RESULTS_DIR/summary.txt"
   echo "FIREWALL_STATE=${firewall_line}"
   echo "CONTROL_PLANE_IP_STATE=${control_line}"
   echo "STALE_STATE_FOUND=${STALE_STATE_FOUND}"
-  echo "OVERALL=PASS"
+  echo "OVERALL=${OVERALL}"
 } >"$summary"
 
 echo "validation complete"
 echo "results: ${RESULTS_DIR}"
 echo "summary: ${summary}"
-echo "overall: PASS"
+echo "overall: ${OVERALL}"
