@@ -242,6 +242,18 @@ type AuditLog struct {
 	CreatedAt    time.Time   `json:"created_at"`
 }
 
+type BackupGeneration struct {
+	ID          uuid.UUID   `json:"id"`
+	SandboxID   pgtype.UUID `json:"sandbox_id"`
+	TemplateID  pgtype.UUID `json:"template_id"`
+	BuildID     *string     `json:"build_id"`
+	Generation  string      `json:"generation"`
+	Bucket      string      `json:"bucket"`
+	CompletedAt time.Time   `json:"completed_at"`
+	ReportedAt  time.Time   `json:"reported_at"`
+	Files       []byte      `json:"files"`
+}
+
 type BillingPeriodAnomaly struct {
 	ID          uuid.UUID          `json:"id"`
 	TeamID      uuid.UUID          `json:"team_id"`

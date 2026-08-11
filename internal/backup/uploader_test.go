@@ -107,7 +107,7 @@ func TestUploaderShipsGenerationAndAcks(t *testing.T) {
 	j, _ := testJournal(t)
 	store := newMemStore()
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 
 	task := writeTask(t, t.TempDir())
 	if err := j.Enqueue(task); err != nil {
@@ -191,7 +191,7 @@ func TestUploaderAbandonsVanishedSource(t *testing.T) {
 	j, _ := testJournal(t)
 	store := newMemStore()
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 
 	task := writeTask(t, t.TempDir())
 	if err := os.Remove(task.Files[0].Path); err != nil {
@@ -219,7 +219,7 @@ func TestUploaderAbandonsMutatedSource(t *testing.T) {
 	j, _ := testJournal(t)
 	store := newMemStore()
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 
 	task := writeTask(t, t.TempDir())
 	if err := j.Enqueue(task); err != nil {
@@ -318,7 +318,7 @@ func TestUploaderRoutesTemplateTasks(t *testing.T) {
 	j, _ := testJournal(t)
 	store := newMemStore()
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 
 	// Mixed queue: a sandbox pause and a template build, both pause priority.
 	sandbox := writeTask(t, t.TempDir())
@@ -442,7 +442,7 @@ func TestTemplateTaskAbandonsCleanlyOnVanishedSource(t *testing.T) {
 	store := newMemStore()
 	staging := t.TempDir()
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, StagingRoot: staging, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, StagingRoot: staging, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 
 	task := Task{
 		TemplateID: "tpl-1",
@@ -549,7 +549,7 @@ func TestUploaderWithholdsManifestOnMidStreamMutation(t *testing.T) {
 		},
 	}
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +629,7 @@ func TestUploaderAbandonsUnverifiedDedupedObject(t *testing.T) {
 	overlayObj := "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[0].Path, "overlay.ext4")
 	store.objects[overlayObj] = []byte("CORRUPT!")
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
@@ -651,7 +651,7 @@ func TestUploaderTrustsHistoryForUnchangedRepause(t *testing.T) {
 	j, _ := testJournal(t)
 	store := newMemStore()
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 
 	// First pause: full upload, verified, acked.
 	task := writeTask(t, t.TempDir())
@@ -758,7 +758,7 @@ func TestVerifiedNotificationSurvivesCrashBeforeDelivery(t *testing.T) {
 	}
 
 	var delivered []Task
-	u := &Uploader{Journal: j, OnVerified: func(t Task) { delivered = append(delivered, t) }}
+	u := &Uploader{Journal: j, OnVerified: func(t Task) error { delivered = append(delivered, t); return nil }}
 	u.flushNotifications()
 	if len(delivered) != 1 || delivered[0].SandboxID != "sb" || delivered[0].Generation != "gen" {
 		t.Fatalf("delivered = %+v, want the acked task once", delivered)
@@ -2094,5 +2094,56 @@ func TestFinishPendingStageTransfersBasePinWhenAbsorbing(t *testing.T) {
 	}
 	if !bytes.Equal(got, pinContent) {
 		t.Fatalf("transferred pin content = %q, want %q", got, pinContent)
+	}
+}
+
+// A delivery the consumer cannot land (control plane down, request
+// rejected) keeps the signal outboxed: only a nil return clears it, and
+// the next flush redelivers.
+func TestFailedNotificationDeliveryRedelivers(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(task, "test-bucket", true); err != nil {
+		t.Fatal(err)
+	}
+
+	var delivered []Task
+	fail := true
+	u := &Uploader{Journal: j, OnVerified: func(t Task) error {
+		if fail {
+			return errors.New("control plane unavailable")
+		}
+		delivered = append(delivered, t)
+		return nil
+	}}
+	u.flushNotifications()
+	if len(delivered) != 0 {
+		t.Fatalf("delivered = %+v, want none while delivery fails", delivered)
+	}
+	pending, err := j.PendingNotifications()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("outbox = %+v, want the undelivered signal retained", pending)
+	}
+
+	// The failure armed the retry spacing; a flush inside the window is
+	// a no-op even with the consumer healthy again.
+	fail = false
+	u.flushNotifications()
+	if len(delivered) != 0 {
+		t.Fatalf("delivered = %+v inside the retry window, want none", delivered)
+	}
+	u.notifyRetryAt = time.Time{}
+	u.flushNotifications()
+	if len(delivered) != 1 || delivered[0].Generation != "gen" {
+		t.Fatalf("delivered = %+v, want the retained signal once", delivered)
+	}
+	if pending, err = j.PendingNotifications(); err != nil || len(pending) != 0 {
+		t.Fatalf("outbox after success = %+v (err %v), want empty", pending, err)
 	}
 }

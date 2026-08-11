@@ -65,11 +65,16 @@ type Uploader struct {
 	// (manifest object written) and acked. This is the signal downstream
 	// bookkeeping and local-staging GC key on. Delivery is at-least-once:
 	// the signal is held durably in the journal's outbox until the
-	// callback returns, and a restart redelivers undelivered signals, so
-	// the callback must tolerate duplicates.
-	OnVerified func(Task)
+	// callback returns nil, and a restart redelivers undelivered signals,
+	// so the callback must tolerate duplicates. A non-nil return keeps
+	// the signal outboxed for the next flush (ack-time and idle ticks):
+	// a delivery the consumer could not land must not be cleared.
+	OnVerified func(Task) error
 	// Tick is the idle poll interval. 0 → 1s.
 	Tick time.Duration
+	// notifyRetryAt gates the next delivery attempt after a failed one.
+	// Touched only from Run's goroutine (ack and idle flushes).
+	notifyRetryAt time.Time
 	// StagingRoot is the hard-link staging tree; finished tasks get
 	// their staged generation removed. Empty disables staging cleanup.
 	StagingRoot string
@@ -207,11 +212,20 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	return true, nil
 }
 
+// notifyRetryDelay spaces delivery attempts after a failure: the idle
+// flush runs every tick, and a control plane that is down must not be
+// hammered (or the log flooded) once per second per pending signal.
+const notifyRetryDelay = 30 * time.Second
+
 // flushNotifications delivers every outboxed completion signal and
-// confirms each only after the callback returns. Failures to load or
-// clear are logged and retried on the next flush, never dropped.
+// confirms each only after the callback returns nil. Failures to
+// deliver, load, or clear are logged and retried on a later flush
+// (spaced by notifyRetryDelay), never dropped.
 func (u *Uploader) flushNotifications() {
 	if u.OnVerified == nil {
+		return
+	}
+	if !u.notifyRetryAt.IsZero() && time.Now().Before(u.notifyRetryAt) {
 		return
 	}
 	pending, err := u.Journal.PendingNotifications()
@@ -220,7 +234,14 @@ func (u *Uploader) flushNotifications() {
 		return
 	}
 	for _, t := range pending {
-		u.OnVerified(t)
+		if err := u.OnVerified(t); err != nil {
+			t.logOwner(u.Log.Warn().Err(err)).
+				Str("generation", t.Generation).
+				Msg("backup notification delivery failed; will redeliver")
+			u.notifyRetryAt = time.Now().Add(notifyRetryDelay)
+			continue
+		}
+		u.notifyRetryAt = time.Time{}
 		if err := u.Journal.ClearNotification(t); err != nil {
 			t.logOwner(u.Log.Warn().Err(err)).
 				Str("generation", t.Generation).
