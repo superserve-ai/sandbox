@@ -49,6 +49,18 @@ locals {
   })
 
   api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
+
+  # The control plane dials whichever host active_sandbox_host selects. The
+  # selected host must already be running and serving before it is applied —
+  # instance run state is operational, not Terraform-managed, so that a host
+  # started for an incident is never stopped again by a later apply.
+  active_vmd_ip = var.active_sandbox_host == "standby" ? module.sandbox_host_b.internal_ip : module.sandbox_host.internal_ip
+
+  # Exactly one host carries component=vmd, the label the shared deploy
+  # pipeline discovers; the other is parked under a cell-scoped label so
+  # rollouts skip it instead of failing against a host that is out of service.
+  primary_component = var.active_sandbox_host == "primary" ? "vmd" : "vmd-usw2-standby"
+  standby_component = var.active_sandbox_host == "standby" ? "vmd" : "vmd-usw2-standby"
 }
 module "network" {
   source = "../../../modules/network"
@@ -147,7 +159,7 @@ module "api" {
     SECRETS_SIGNING_KEY_ID = "v1"
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "12"
-    VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
+    VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
   }
 
@@ -200,17 +212,54 @@ module "sandbox_host" {
   internal_ip   = "10.1.0.2"
   tags          = ["vmd-usw2"]
   labels = merge(local.sandbox_host_labels, {
-    component                  = "vmd"
+    component                  = local.primary_component
     sandbox_role               = "vmd"
     "vanta-contains-user-data" = "true"
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
 
   service_account_email = data.google_service_account.api_runner.email
-  boot_disk_image       = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts"
+  # 24.04 images are only published under the -amd64 family.
+  boot_disk_image     = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  boot_disk_size_gb   = 250
+  can_ip_forward      = false
+  on_host_maintenance = "TERMINATE"
+
+  metadata = {
+    enable-osconfig = "TRUE"
+    enable-oslogin  = "TRUE"
+  }
+}
+
+# Cold standby for the cell, normally kept stopped. Promotion = start this
+# host, then set active_sandbox_host = "standby" and apply: the switch routes
+# the control plane here and moves the deploy-fleet label off the primary.
+module "sandbox_host_b" {
+  source = "../../../modules/sandbox-host"
+
+  project_id    = local.project_id
+  environment   = local.environment
+  region        = local.region
+  zone          = local.zone
+  instance_name = "superserve-vmd-usw2-2"
+  machine_type  = var.machine_type
+  subnet        = module.network.subnetwork_self_link
+  internal_ip   = "10.1.0.3"
+  tags          = ["vmd-usw2"]
+  labels = merge(local.sandbox_host_labels, {
+    component                  = local.standby_component
+    sandbox_role               = "vmd"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
+  })
+
+  service_account_email = data.google_service_account.api_runner.email
+  boot_disk_image       = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
   boot_disk_size_gb     = 250
-  can_ip_forward        = false
-  on_host_maintenance   = "TERMINATE"
+  # Metal machine types reject the API-default pd-standard boot disk.
+  boot_disk_type      = "hyperdisk-balanced"
+  can_ip_forward      = false
+  on_host_maintenance = "TERMINATE"
 
   metadata = {
     enable-osconfig = "TRUE"
@@ -229,6 +278,12 @@ module "observability" {
       display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
       instance_name = module.sandbox_host.instance_name
       instance_id   = module.sandbox_host.instance_id
+    }
+    # Inert while the standby is stopped (no data, no fire).
+    sandbox_host_b = {
+      display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / CPU saturation"
+      instance_name = module.sandbox_host_b.instance_name
+      instance_id   = module.sandbox_host_b.instance_id
     }
   }
   host_maintenance_event_alerts = {
