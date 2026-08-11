@@ -234,3 +234,57 @@ func TestJournalEnqueueRequiresExactlyOneOwner(t *testing.T) {
 		t.Fatalf("pending after dedupe = %v", counts)
 	}
 }
+
+// A live pause re-enqueueing a generation the backfill already queued at
+// best-effort promotes the row: the queue key re-sorts under the pause
+// tier while attempts and backoff stay with the task, and promotion is
+// one-way (a later best-effort enqueue never demotes).
+func TestEnqueueDedupePromotesPriority(t *testing.T) {
+	j, _ := testJournal(t)
+	gen := "promote-gen"
+	if err := j.Enqueue(Task{SandboxID: "sb", Generation: gen,
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
+		Priority: PriorityBestEffort, EnqueuedAt: time.Unix(1, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	// A checkpoint task would outrank the best-effort row.
+	if err := j.Enqueue(Task{SandboxID: "other", Generation: "ck",
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/q", SHA256: "bb", Size: 1}},
+		Priority: PriorityCheckpoint, EnqueuedAt: time.Unix(2, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	next, ok, err := j.Next(time.Unix(10, 0))
+	if err != nil || !ok || next.Generation != "ck" {
+		t.Fatalf("pre-promotion Next = %+v ok=%v err=%v, want the checkpoint task", next, ok, err)
+	}
+
+	// The live pause claims the same generation.
+	if err := j.Enqueue(Task{SandboxID: "sb", Generation: gen,
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
+		Priority: PriorityPause, EnqueuedAt: time.Unix(3, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	next, ok, err = j.Next(time.Unix(10, 0))
+	if err != nil || !ok || next.Generation != gen {
+		t.Fatalf("post-promotion Next = %+v ok=%v err=%v, want the promoted pause generation", next, ok, err)
+	}
+	if next.Priority != PriorityPause {
+		t.Fatalf("promoted priority = %d, want pause", next.Priority)
+	}
+
+	// One-way: re-enqueueing at best-effort does not demote.
+	if err := j.Enqueue(Task{SandboxID: "sb", Generation: gen,
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
+		Priority: PriorityBestEffort, EnqueuedAt: time.Unix(4, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	next, _, err = j.Next(time.Unix(10, 0))
+	if err != nil || next.Priority != PriorityPause {
+		t.Fatalf("after best-effort re-enqueue priority = %d (err %v), want pause kept", next.Priority, err)
+	}
+	// The index still points at a live row: exactly one pending entry for
+	// the owner+generation.
+	if pending, err := j.HasPending("sb", gen); err != nil || !pending {
+		t.Fatalf("HasPending = %v err=%v, want true", pending, err)
+	}
+}

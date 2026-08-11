@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -252,16 +253,38 @@ func (j *Journal) Enqueue(task Task) error {
 					}
 					return idx.Put(task.indexKey(), qk)
 				}
+				changed := false
 				if task.Staged && !cur.Staged {
 					cur.Files = task.Files
 					cur.Staged = true
-					upgraded, err := json.Marshal(cur)
-					if err != nil {
+					changed = true
+				}
+				// Priority promotion, one-way toward more urgent: a live
+				// pause re-enqueueing a generation the backfill queued at
+				// best-effort must not leave it waiting behind checkpoint
+				// traffic. The queue key embeds the priority, so promotion
+				// re-keys the row; attempts and NotBefore stay with it.
+				if task.Priority < cur.Priority {
+					cur.Priority = task.Priority
+					changed = true
+				}
+				if !changed {
+					return nil
+				}
+				upgraded, err := json.Marshal(cur)
+				if err != nil {
+					return err
+				}
+				nk := cur.key()
+				if !bytes.Equal(nk, qk) {
+					if err := queue.Delete(qk); err != nil {
 						return err
 					}
-					return queue.Put(qk, upgraded)
 				}
-				return nil
+				if err := queue.Put(nk, upgraded); err != nil {
+					return err
+				}
+				return idx.Put(cur.indexKey(), nk)
 			}
 		}
 		if err := queue.Put(task.key(), val); err != nil {
