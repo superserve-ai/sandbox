@@ -257,10 +257,55 @@ func TestClaimSlotIndex_ErrNoSlotsWhenExhausted(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()
 	m.nextSlot = MaxSlots + 1
+	// Genuinely exhausted: spending the fresh range is not enough, since the
+	// ceiling path reclaims unused indexes below it — every index must be held.
+	for idx := 1; idx <= MaxSlots; idx++ {
+		m.slotOwner[idx] = "vm"
+	}
 
 	_, err := m.claimSlotIndex(poolOwner)
 	if !errors.Is(err, ErrNoSlots) {
 		t.Errorf("err = %v, want ErrNoSlots", err)
+	}
+}
+
+// TestClaimSlotIndex_ReclaimsUnusedIndexesAtCeiling pins the recovery path: a
+// spent fresh range must not fail while indexes below it hold neither an owner
+// nor a namespace — those discards are the only inventory a long-lived host
+// has left, and a restart cannot recover them.
+func TestClaimSlotIndex_ReclaimsUnusedIndexesAtCeiling(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	touchNS(t, dir, "ns-7")       // namespace outlived its index
+	m.assignSlotLocked(9, "vm-9") // still owned by a record
+	m.nextSlot = MaxSlots + 1     // fresh range spent
+
+	idx, err := m.claimSlotIndex("vm-new")
+	if err != nil {
+		t.Fatalf("claimSlotIndex = %v, want a reclaimed index", err)
+	}
+	if idx == 7 || idx == 9 {
+		t.Fatalf("idx = %d, want neither the namespace-backed (7) nor the owned (9) index", idx)
+	}
+	if owner := m.slotOwner[idx]; owner != "vm-new" {
+		t.Errorf("slotOwner[%d] = %q, want vm-new", idx, owner)
+	}
+}
+
+// TestReclaimUnusedSlots_CooldownSkipsRescan pins the pacing: a host that is
+// truly out of slots must not rescan on every claim.
+func TestReclaimUnusedSlots_CooldownSkipsRescan(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	m.nextSlot = MaxSlots + 1
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if n := m.reclaimUnusedSlotsLocked(); n == 0 {
+		t.Fatal("first reclaim recovered nothing, want the empty range back")
+	}
+	m.freeSlots = nil
+	if n := m.reclaimUnusedSlotsLocked(); n != 0 {
+		t.Errorf("second reclaim recovered %d within the cooldown, want 0", n)
 	}
 }
 

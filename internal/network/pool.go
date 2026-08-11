@@ -102,6 +102,11 @@ const (
 	// rebuilds are short once uncontended, so a small window drains a backlog
 	// quickly.
 	resetTapConcurrency = 8
+	// refillFailureBackoff paces retries after a failed slot build. Failures
+	// are host-wide conditions (an exhausted slot range, a sick netlink), not
+	// per-attempt luck, so retrying immediately burns a core and floods the
+	// log with thousands of identical lines a second without fixing anything.
+	refillFailureBackoff = 2 * time.Second
 	// refillConcurrency is the number of refill workers rebuilding the fresh
 	// pool. A single worker refills at one slot per build-time, which cannot
 	// catch a drained pool back up while claims keep arriving; builds stay
@@ -606,6 +611,9 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		slot, err := p.allocate(ctx)
 		if err != nil {
 			p.log.Error().Err(err).Msg("pool refill failed")
+			if !p.pauseAfterFailure(ctx) {
+				return
+			}
 			continue
 		}
 		select {
@@ -627,13 +635,22 @@ func (p *Pool) mustAllocate(ctx context.Context) *preallocSlot {
 			return slot
 		}
 		p.log.Error().Err(err).Msg("pool allocate retry")
-		select {
-		case <-p.stopCh:
+		if !p.pauseAfterFailure(ctx) {
 			return nil
-		case <-ctx.Done():
-			return nil
-		default:
 		}
+	}
+}
+
+// pauseAfterFailure waits out the retry backoff, reporting false when the pool
+// is shutting down and the caller should give up instead of retrying.
+func (p *Pool) pauseAfterFailure(ctx context.Context) bool {
+	select {
+	case <-time.After(refillFailureBackoff):
+		return true
+	case <-p.stopCh:
+		return false
+	case <-ctx.Done():
+		return false
 	}
 }
 

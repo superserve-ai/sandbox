@@ -78,6 +78,11 @@ const MaxSlots = 32000
 // ErrNoSlots is returned when no network slots are available.
 var ErrNoSlots = fmt.Errorf("no available network slots (max %d concurrent VMs)", MaxSlots)
 
+// reclaimCooldown bounds how often a claim at the ceiling rescans for unused
+// indexes. The scan is cheap but pointless to repeat while nothing has been
+// released, and a host at the ceiling is exactly when claims arrive fastest.
+const reclaimCooldown = 30 * time.Second
+
 // setupSlotConcurrency caps concurrent slot builds across every caller
 // (on-demand fallback and pool refill). Each build forks a dozen ip/nsenter
 // commands that serialize on the kernel's netlink lock, so unbounded
@@ -119,6 +124,9 @@ type Manager struct {
 	// every slot path must route through them so ownership can never be dropped
 	// (leak) or duplicated (double hand-out).
 	slotOwner map[int]string
+
+	// lastReclaim is when the ceiling path last rescanned for unused indexes.
+	lastReclaim time.Time
 
 	// TCP egress proxy — receives per-sandbox rule updates and cleanup.
 	egressProxy *EgressProxy
@@ -929,6 +937,12 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 				ceiling = m.maxSlot // WithExactSlot: allow only the pinned index
 			}
 			if m.nextSlot > ceiling {
+				// Out of fresh range, which is not the same as out of slots:
+				// indexes are discarded (never returned) whenever a namespace
+				// outlives them, so the gaps below are the only inventory left.
+				if n := m.reclaimUnusedSlotsLocked(); n > 0 {
+					continue
+				}
 				return 0, ErrNoSlots
 			}
 			idx = m.nextSlot
@@ -945,6 +959,65 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 		m.assignSlotLocked(idx, owner)
 		return idx, nil
 	}
+}
+
+// reclaimUnusedSlotsLocked refills freeSlots from the range below nextSlot:
+// every index that no owner holds and no kernel namespace occupies. Returns
+// how many it recovered.
+//
+// The allocator only ever advances nextSlot, and discards any index whose
+// namespace outlived it (returning it to freeSlots would loop). On a
+// long-lived host those discards accumulate until the fresh range is spent
+// while most of the space below it is idle — and a restart does not clear it,
+// because boot re-reserves each record's index and resumes above the highest.
+// So the ceiling has to be recoverable in place.
+//
+// One directory read rather than a stat per index: at the ceiling there are
+// tens of thousands of indexes to test, and namespace presence is the only
+// thing that makes one unusable. Caller must hold m.mu.
+func (m *Manager) reclaimUnusedSlotsLocked() int {
+	if time.Since(m.lastReclaim) < reclaimCooldown {
+		return 0
+	}
+	m.lastReclaim = time.Now()
+
+	entries, err := os.ReadDir(netnsDir)
+	if err != nil && !os.IsNotExist(err) {
+		// Fail closed: an unreadable namespace directory means every index
+		// might still be occupied, and handing one out would collide.
+		m.log.Warn().Err(err).Msg("allocator: cannot list namespaces — skipping slot reclaim")
+		return 0
+	}
+	occupied := make(map[int]bool, len(entries))
+	for _, entry := range entries {
+		if idx, ok := slotFromNamespace(entry.Name()); ok {
+			occupied[idx] = true
+		}
+	}
+	for _, idx := range m.freeSlots {
+		occupied[idx] = true
+	}
+
+	limit := m.nextSlot - 1
+	if limit > MaxSlots {
+		limit = MaxSlots
+	}
+	reclaimed := 0
+	for idx := 1; idx <= limit; idx++ {
+		if occupied[idx] {
+			continue
+		}
+		if _, owned := m.slotOwner[idx]; owned {
+			continue
+		}
+		m.freeSlots = append(m.freeSlots, idx)
+		reclaimed++
+	}
+	if reclaimed > 0 {
+		m.log.Warn().Int("reclaimed", reclaimed).Int("namespaces", len(entries)).
+			Msg("allocator: slot range spent — reclaimed unused indexes")
+	}
+	return reclaimed
 }
 
 // SweepOrphanNamespaces removes host namespaces and veth interfaces
