@@ -93,3 +93,56 @@ locals {
     labels                      = var.labels
   }
 }
+
+resource "google_monitoring_alert_policy" "sandbox_failures" {
+  for_each = var.sandbox_failure_alerts
+
+  project               = var.project_id
+  display_name          = each.value.display_name
+  combiner              = "OR"
+  enabled               = true
+  notification_channels = var.notification_channel_ids
+
+  lifecycle {
+    precondition {
+      condition     = length(var.notification_channel_ids) > 0
+      error_message = "notification_channel_ids must contain an existing monitored channel when sandbox failure alerts are configured"
+    }
+    precondition {
+      condition     = each.value.threshold > 0
+      error_message = "Sandbox failure alert thresholds must be greater than 0"
+    }
+  }
+
+  conditions {
+    display_name = "Failed sandbox transitions"
+
+    condition_prometheus_query_language {
+      query = <<-EOT
+        sum(increase(sandbox_transition_total{environment="${var.environment}",operation="fail",result="success"}[${each.value.lookback}])) > ${each.value.threshold}
+      EOT
+
+      duration            = each.value.evaluation_duration
+      evaluation_interval = "60s"
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  documentation {
+    content = coalesce(each.value.documentation, <<-EOT
+      More than ${each.value.threshold} sandboxes were successfully transitioned into the terminal failed state during the preceding ${each.value.lookback} in ${var.environment}.
+
+      This is distinct from lifecycle API errors: the failure transition itself is recorded with operation="fail", result="success". Inspect the Sandbox Telemetry Operations dashboard, then correlate the affected host and VMD logs.
+    EOT
+    )
+    mime_type = "text/markdown"
+  }
+
+  user_labels = merge(var.labels, {
+    alert_type = "sandbox_failed_transitions"
+    managed_by = "terraform"
+  })
+}
