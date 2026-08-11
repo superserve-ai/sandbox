@@ -78,9 +78,19 @@ const MaxSlots = 32000
 // ErrNoSlots is returned when no network slots are available.
 var ErrNoSlots = fmt.Errorf("no available network slots (max %d concurrent VMs)", MaxSlots)
 
+// setupSlotConcurrency caps concurrent slot builds across every caller
+// (on-demand fallback and pool refill). Each build forks a dozen ip/nsenter
+// commands that serialize on the kernel's netlink lock, so unbounded
+// concurrent builds convoy each other into multi-second latencies; a small
+// window keeps every build near its uncontended cost.
+const setupSlotConcurrency = 8
+
 type Manager struct {
 	hostInterface string
 	log           zerolog.Logger
+
+	// setupSem bounds concurrent setupSlot builds (see setupSlotConcurrency).
+	setupSem chan struct{}
 
 	mu         sync.Mutex
 	devices    map[string]*VMNetInfo
@@ -216,6 +226,7 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 	mgr := &Manager{
 		hostInterface:  hostInterface,
 		log:            log.With().Str("component", "network").Logger(),
+		setupSem:       make(chan struct{}, setupSlotConcurrency),
 		devices:        make(map[string]*VMNetInfo),
 		slotOwner:      make(map[int]string),
 		nextSlot:       1,
@@ -279,6 +290,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		return nil, err
 	}
 
+	tBuild := time.Now()
 	info, _, err := m.setupSlot(ctx, idx)
 	if err != nil {
 		// Build failed — release the index (we are its sole owner) so it isn't
@@ -296,6 +308,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		Str("vm_id", vmID).
 		Str("namespace", info.Namespace).
 		Str("host_ip", info.HostIP).
+		Int64("on_demand_setup_ms", time.Since(tBuild).Milliseconds()).
 		Msg("network namespace created")
 
 	return info, nil
@@ -320,6 +333,15 @@ func macForSlot(idx int) string      { return fmt.Sprintf("AA:FC:00:%02X:%02X:%0
 // nftables, routing) for a single slot index. Used by both SetupVM
 // (on-demand) and Pool (pre-allocation).
 func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, error) {
+	// Bounded build window: a caller whose deadline expires while queued fails
+	// fast instead of building a slot its request can no longer use.
+	select {
+	case m.setupSem <- struct{}{}:
+		defer func() { <-m.setupSem }()
+	case <-ctx.Done():
+		return nil, "", fmt.Errorf("slot build queue: %w", ctx.Err())
+	}
+
 	// Ownership of idx is NOT touched here: claimSlotIndex owns it before this
 	// runs (pool/on-demand), and record paths reserve it. On success the slot is
 	// live and stays owned; on failure the caller releases idx (freeSlot).

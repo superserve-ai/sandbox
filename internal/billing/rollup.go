@@ -238,8 +238,12 @@ RETURNING true`
 }
 
 func enqueueHour(ctx context.Context, pool *pgxpool.Pool, hourStart, hourEnd time.Time, refreshCompleted bool) (int64, error) {
+	// interval_team_set is MATERIALIZED so the flag check runs against the
+	// deduplicated team set (~tens of rows). Without the fence the planner
+	// pushes feature_enabled() into the interval scans and evaluates it once
+	// per interval row — tens of thousands of flag lookups per call.
 	const query = `
-WITH candidate_teams AS (
+WITH interval_team_set AS MATERIALIZED (
     SELECT DISTINCT team_id
     FROM (
         SELECT i.team_id
@@ -256,7 +260,10 @@ WITH candidate_teams AS (
           AND $1 < LEAST(now(), $2)
           AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
     ) billing_teams
-    WHERE feature_enabled('billing_hourly_rollups', billing_teams.team_id)
+),
+candidate_teams AS (
+    SELECT team_id FROM interval_team_set
+    WHERE feature_enabled('billing_hourly_rollups', team_id)
 )
 INSERT INTO billing_rollup_job (team_id, hour_start, hour_end, status, next_attempt_at)
 SELECT team_id, $1, $2, 'pending', now()
@@ -420,8 +427,10 @@ func nextTeamBackfillBatches(ctx context.Context, pool *pgxpool.Pool, startHour,
 		teamLimit = defaultHourlyRollupBatchSize
 	}
 
+	// Same MATERIALIZED fence as enqueueHour: dedup the interval scan first,
+	// flag-check the resulting team set — not every interval row.
 	const query = `
-WITH interval_teams AS (
+WITH interval_team_set AS MATERIALIZED (
     SELECT DISTINCT team_id
     FROM (
         SELECT i.team_id
@@ -438,7 +447,10 @@ WITH interval_teams AS (
           AND $1 < LEAST(now(), $2)
           AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
     ) billing_teams
-    WHERE feature_enabled('billing_hourly_rollups', billing_teams.team_id)
+),
+interval_teams AS (
+    SELECT team_id FROM interval_team_set
+    WHERE feature_enabled('billing_hourly_rollups', team_id)
 ),
 eligible_team_cursors AS (
     SELECT
