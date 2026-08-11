@@ -287,6 +287,30 @@ func SharedBaseName(sha string) string {
 	return "base-" + sha + ".ext4"
 }
 
+// ReportedFiles returns the manifest entries a verified generation's
+// coverage report should carry: the task's own files plus the shared
+// base entries uploadTask synthesizes into the bucket manifest, which
+// task.Files alone omits. Shared sizes come from the staged or original
+// source when it still exists and are zero otherwise: delivery can
+// outlive ack-time staging cleanup, and the base object's authoritative
+// size lives in the bucket manifest either way.
+func (t *Task) ReportedFiles() []TaskFile {
+	out := append([]TaskFile(nil), t.Files...)
+	seen := map[string]bool{}
+	for _, f := range t.Files {
+		if f.BaseSHA256 == "" || seen[f.BaseSHA256] {
+			continue
+		}
+		seen[f.BaseSHA256] = true
+		bf, err := baseTaskFile(f)
+		if err != nil {
+			bf = TaskFile{Name: SharedBaseName(f.BaseSHA256), SHA256: f.BaseSHA256, Shared: true}
+		}
+		out = append(out, bf)
+	}
+	return out
+}
+
 // uploadTask ships every artifact of a generation, then its manifest
 // object. Objects are content-addressed and create-only, so retries after
 // partial progress re-cover already-written objects as no-ops. completed

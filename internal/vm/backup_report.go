@@ -63,6 +63,10 @@ type backupReportBody struct {
 // which coverage queries tolerate (a backup can only be reported after
 // it completed).
 func (r *BackupReporter) Deliver(task backup.Task) error {
+	// ReportedFiles adds the shared base entries the uploader ships into
+	// the bucket manifest: task.Files alone would understate an overlay
+	// generation's restorable set.
+	files := task.ReportedFiles()
 	body := backupReportBody{
 		SandboxID:   task.SandboxID,
 		TemplateID:  task.TemplateID,
@@ -70,9 +74,9 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 		Generation:  task.Generation,
 		Bucket:      r.Bucket,
 		CompletedAt: time.Now().UTC(),
-		Files:       make([]backupReportFile, 0, len(task.Files)),
+		Files:       make([]backupReportFile, 0, len(files)),
 	}
-	for _, f := range task.Files {
+	for _, f := range files {
 		body.Files = append(body.Files, backupReportFile{
 			Name:       f.Name,
 			SizeBytes:  f.Size,

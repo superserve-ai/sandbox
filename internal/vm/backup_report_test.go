@@ -54,8 +54,13 @@ func TestBackupReporterDelivers(t *testing.T) {
 	if gotBody.Bucket != "cell-bucket" || gotBody.Generation != "gen-key" || gotBody.SandboxID != task.SandboxID {
 		t.Fatalf("body = %+v", gotBody)
 	}
-	if len(gotBody.Files) != 2 || gotBody.Files[0].BaseSHA256 != "bb" || gotBody.Files[1].SizeBytes != 128 {
+	if len(gotBody.Files) != 3 || gotBody.Files[0].BaseSHA256 != "bb" || gotBody.Files[1].SizeBytes != 128 {
 		t.Fatalf("files = %+v", gotBody.Files)
+	}
+	// The synthesized shared base travels too: task.Files alone would
+	// understate the generation's restorable set.
+	if base := gotBody.Files[2]; !base.Shared || base.SHA256 != "bb" || base.Name != "base-bb.ext4" {
+		t.Fatalf("shared base entry = %+v", base)
 	}
 	if gotBody.CompletedAt.IsZero() {
 		t.Fatal("completed_at not stamped")
