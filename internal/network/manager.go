@@ -396,15 +396,21 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	}
 
 	if err := run(ctx, "ip", "link", "set", vethName, "up"); err != nil {
-		m.removeNS(nsName)
+		// The veth now lives on the host, so it outlives the namespace:
+		// tear both down or the next build at this index collides with it.
+		m.cleanupFull(nsName, vethName)
 		return nil, "", fmt.Errorf("bring up veth: %w", err)
 	}
 	if err := run(ctx, "ip", "link", "set", vethName, "mtu", ifaceMTU); err != nil {
-		m.removeNS(nsName)
+		// The veth now lives on the host, so it outlives the namespace:
+		// tear both down or the next build at this index collides with it.
+		m.cleanupFull(nsName, vethName)
 		return nil, "", fmt.Errorf("set veth MTU: %w", err)
 	}
 	if err := run(ctx, "ip", "addr", "add", vethIP+"/31", "dev", vethName); err != nil {
-		m.removeNS(nsName)
+		// The veth now lives on the host, so it outlives the namespace:
+		// tear both down or the next build at this index collides with it.
+		m.cleanupFull(nsName, vethName)
 		return nil, "", fmt.Errorf("assign veth IP: %w", err)
 	}
 
