@@ -458,3 +458,44 @@ func TestDisableChildControllersVerifies(t *testing.T) {
 		t.Fatal("controllers still visible after disable must be an error")
 	}
 }
+
+// Leaving bare mode re-exposes memory.oom.group on already-running children at
+// the kernel default 0; nothing else rewrites it (createVMCgroup runs only at
+// create), so convergence must stamp them or those VMs keep per-process OOM
+// semantics until relaunch.
+func TestRestoreChildOOMGroup(t *testing.T) {
+	tree := &cgroupTree{vms: t.TempDir()}
+	mk := func(name string, oom *string) {
+		dir := filepath.Join(tree.vms, name)
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if oom != nil {
+			if err := os.WriteFile(filepath.Join(dir, "memory.oom.group"), []byte(*oom), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	zero, one := "0\n", "1\n"
+	mk("vm-bare-era", &zero)  // created while bare: file back at the default
+	mk("vm-already-set", &one) // created with controllers: already correct
+	mk("vm-no-controller", nil) // no memory controller: nothing to restore
+	mk(keeperSubdir, &zero)     // reserved: never touched
+
+	n, err := restoreChildOOMGroup(tree)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("restored %d, want 1 (only the bare-era child)", n)
+	}
+	if b, _ := os.ReadFile(filepath.Join(tree.vms, "vm-bare-era", "memory.oom.group")); strings.TrimSpace(string(b)) != "1" {
+		t.Errorf("bare-era child not stamped: %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(tree.vms, keeperSubdir, "memory.oom.group")); strings.TrimSpace(string(b)) != "0" {
+		t.Errorf("keeper must never be stamped, got %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(tree.vms, "vm-no-controller", "memory.oom.group")); !os.IsNotExist(err) {
+		t.Error("a child without the memory controller must not gain the file")
+	}
+}

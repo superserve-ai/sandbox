@@ -142,14 +142,29 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 		}
 	}
 	m.cgroups = tree // existing cgroup VMs are now manageable
-	if m.cfg.BareVMCgroups {
-		// Converge a previously controller-enabled host. Legal with live
-		// children (their controller state tears down in place; charges
-		// reparent to the service). Loud, never silent, but not fatal: with
-		// controllers still enabled the host is merely on the slower
-		// pre-bare behavior, which is correct.
-		if derr := disableChildControllers(filepath.Join(tree.vms, "cgroup.subtree_control")); derr != nil {
-			m.log.Error().Err(derr).Msg("bare vm cgroups requested but child controllers remain enabled — launches pay full cgroup-creation cost")
+	// Converge the host to the configured child-controller mode. Gated on
+	// wantArm: with direct spawn off this host is draining pre-existing
+	// cgroup VMs, and stripping controllers from VMs that were created with
+	// them (losing memory.oom.group) is not a change a manage-only pass may
+	// make. Fresh launches are what the mode is for, and there are none here.
+	if wantArm {
+		if m.cfg.BareVMCgroups {
+			// Legal with live children (their controller state tears down in
+			// place; charges reparent to the service). Loud, never silent, but
+			// not fatal: with controllers still enabled the host is merely on
+			// the slower pre-bare behavior, which is correct.
+			if derr := disableChildControllers(filepath.Join(tree.vms, "cgroup.subtree_control")); derr != nil {
+				m.log.Error().Err(derr).Msg("bare vm cgroups requested but child controllers remain enabled — launches pay full cgroup-creation cost")
+			}
+		} else if n, cerr := restoreChildOOMGroup(tree); cerr != nil {
+			// The reverse convergence: re-enabling the memory controller
+			// re-exposes memory.oom.group on already-running children, but at
+			// the kernel default 0 — nothing rewrites it, since that happens
+			// only at create. VMs launched while bare would keep per-process
+			// OOM semantics until their next relaunch, so stamp them here.
+			m.log.Error().Err(cerr).Msg("could not restore oom.group on existing VM cgroups — they retain per-process OOM semantics until relaunch")
+		} else if n > 0 {
+			m.log.Info().Int("cgroups", n).Msg("restored whole-VM OOM semantics on existing cgroups after leaving bare mode")
 		}
 	}
 
@@ -504,6 +519,39 @@ func (m *Manager) scopeDyingDescendants() (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// restoreChildOOMGroup writes memory.oom.group=1 on every per-VM cgroup that
+// has the file but does not already claim it — the children created while the
+// host ran bare, whose file reappeared at the kernel default 0 when the memory
+// controller came back. Returns how many were stamped. Reserved names and
+// children without the file (memory controller not enabled) are skipped.
+func restoreChildOOMGroup(t *cgroupTree) (int, error) {
+	entries, err := os.ReadDir(t.vms)
+	if err != nil {
+		return 0, fmt.Errorf("scan scope for oom.group restore: %w", err)
+	}
+	restored := 0
+	var firstErr error
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == keeperSubdir {
+			continue
+		}
+		path := filepath.Join(t.vms, e.Name(), "memory.oom.group")
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			continue // no memory controller on this child: nothing to restore
+		}
+		if strings.TrimSpace(string(data)) == "1" {
+			continue
+		}
+		if werr := os.WriteFile(path, []byte("1"), 0o644); werr != nil && firstErr == nil {
+			firstErr = fmt.Errorf("set oom.group on %s: %w", e.Name(), werr)
+		} else if werr == nil {
+			restored++
+		}
+	}
+	return restored, firstErr
 }
 
 // disableSpecFor builds the "-a -b" write that disables every controller
