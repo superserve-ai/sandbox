@@ -1438,3 +1438,187 @@ func TestVMConfirmedAtRest_RequiresBothSupervisorsQuiet(t *testing.T) {
 		}
 	})
 }
+
+// The backfill mints coverage for a paused sandbox the uploader has
+// never seen: a best-effort task with both durable artifacts reaches the
+// journal, the marker clears on the successful handoff, and the ledger
+// records the covered snapshot so the next pass skips it.
+func TestBackfillCoversPausedSandboxAtBestEffort(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Put(VMRecord{ID: "vm-1", Status: StatusPaused, SnapshotPath: snap, DiskPath: disk}); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := make(chan backup.Task, 2)
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
+
+	select {
+	case task := <-tasks:
+		if task.SandboxID != "vm-1" || task.Generation == "" {
+			t.Fatalf("task = %+v, want owner vm-1 with a generation key", task)
+		}
+		if task.Priority != backup.PriorityBestEffort {
+			t.Fatalf("task priority = %d, want best-effort", task.Priority)
+		}
+		names := make(map[string]bool, len(task.Files))
+		for _, f := range task.Files {
+			names[f.Name] = true
+		}
+		if !names["vmstate.snap"] || !names["rootfs.ext4"] {
+			t.Fatalf("task files = %v, want vmstate.snap and rootfs.ext4", names)
+		}
+	default:
+		t.Fatal("backfill never enqueued the uncovered paused sandbox")
+	}
+	if pending, err := st.ListPendingBackups(); err != nil || len(pending) != 0 {
+		t.Fatalf("pending markers after backfill = %v (err %v), want none", pending, err)
+	}
+	if _, ok, err := st.GetBackfillMark("vm-1"); err != nil || !ok {
+		t.Fatalf("ledger mark missing after backfill (err %v)", err)
+	}
+
+	// A second pass over the unchanged snapshot mints nothing.
+	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
+	select {
+	case task := <-tasks:
+		t.Fatalf("second pass re-enqueued %+v for an unchanged snapshot", task)
+	default:
+	}
+}
+
+// A snapshot whose identity changed since the ledger entry (the sandbox
+// paused again with new bytes) is picked up again, converging on the
+// pause's own generation via journal dedupe rather than being skipped.
+func TestBackfillReenqueuesChangedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Put(VMRecord{ID: "vm-1", Status: StatusPaused, SnapshotPath: snap, DiskPath: disk}); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := make(chan backup.Task, 2)
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
+	first := <-tasks
+
+	if err := os.WriteFile(snap, []byte("newer vm state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
+	select {
+	case task := <-tasks:
+		if task.Generation == first.Generation {
+			t.Fatal("changed snapshot produced the first generation key")
+		}
+	default:
+		t.Fatal("backfill skipped a snapshot whose identity changed")
+	}
+}
+
+// An existing pending marker owns its VM's coverage: the backfill must
+// neither replace it nor drain it (the sweep owns retained markers), and
+// non-paused or incomplete records contribute nothing.
+func TestBackfillLeavesExistingMarkersAndSkipsIneligible(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	marked := PendingBackup{VMID: "vm-marked", SnapshotPath: "/snap", DiskPath: "/disk", Token: "t-1"}
+	if err := st.PutPendingBackup(marked); err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range []VMRecord{
+		{ID: "vm-marked", Status: StatusPaused, SnapshotPath: "/snap", DiskPath: "/disk"},
+		{ID: "vm-running", Status: StatusRunning, SnapshotPath: "/snap", DiskPath: "/disk"},
+		{ID: "vm-no-snapshot", Status: StatusPaused, DiskPath: "/disk"},
+	} {
+		if err := st.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+
+	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
+
+	select {
+	case task := <-tasks:
+		t.Fatalf("backfill enqueued %+v, want nothing", task)
+	default:
+	}
+	got, ok, err := st.GetPendingBackup("vm-marked")
+	if err != nil || !ok || got.Token != "t-1" {
+		t.Fatalf("existing marker = %+v ok=%v (err %v), want the original untouched", got, ok, err)
+	}
+}
+
+// Ledger entries for VMs whose records are gone are pruned, so the
+// ledger tracks the live fleet instead of growing forever.
+func TestBackfillPrunesLedgerForDeletedVMs(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.PutBackfillMark("vm-gone", "stale-identity"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+
+	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
+
+	if _, ok, err := st.GetBackfillMark("vm-gone"); err != nil || ok {
+		t.Fatalf("stale ledger entry survived the prune (ok=%v err=%v)", ok, err)
+	}
+}
