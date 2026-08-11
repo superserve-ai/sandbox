@@ -204,6 +204,7 @@ def main() -> int:
     def deploy(inst):
         name, zone = inst["name"], inst["zone"]
         tag = f"{name}/{zone}"
+        q_host_id_line = shlex.quote(f"HOST_ID={name}")
 
         # Single SCP — one IAP tunnel for the whole bundle.
         run_or_die(
@@ -413,6 +414,15 @@ def main() -> int:
                 echo {q_otel_enabled_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
                 echo {q_otel_env_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
+
+            # Upsert HOST_ID with the instance name. vmd falls back to
+            # "default" without it, which breaks reconciler DB scoping,
+            # heartbeat identity, and the host_id metric label the backup
+            # alert policies filter on. The instance name is the host's
+            # identity in the host table and in those filters; on hosts
+            # where it was seeded by hand this rewrites the same value.
+            sudo sed -i '/^HOST_ID=/d' /etc/sandbox/vmd.env
+            echo {q_host_id_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
 
             # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes
             # its control socket into RuntimeDirectory=/run/secretsproxy under

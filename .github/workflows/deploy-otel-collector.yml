@@ -72,14 +72,27 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       # The use4 cell host is the primary production host (api.superserve.ai).
-      # Skipped until CLOUD_RUN_SERVICE_USE4 is set. (usw remains uncovered here
-      # — pre-existing gap, tracked separately.)
+      # Skipped until CLOUD_RUN_SERVICE_USE4 is set.
       - name: Deploy OTEL Collector to use4 cell VMD instances
         if: vars.CLOUD_RUN_SERVICE_USE4 != ''
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: us-east4
           VMD_FILTER: labels.component=vmd AND labels.environment=production AND labels.region=us-east4
+          OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
+        run: |
+          python3 .github/workflows/scripts/deploy-otel-collector.py
+
+      # Both production cells need a host-local collector: without one,
+      # vmd's OTLP export lands on a closed localhost port and every
+      # backup alert policy for the cell (including backup-disabled)
+      # watches series that never arrive.
+      - name: Deploy OTEL Collector to usw2 cell VMD instances
+        if: vars.CLOUD_RUN_SERVICE_USE4 != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: us-west2
+          VMD_FILTER: labels.component=vmd AND labels.environment=production AND labels.region=us-west2
           OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
         run: |
           python3 .github/workflows/scripts/deploy-otel-collector.py
