@@ -819,6 +819,13 @@ func main() {
 		// ns is spared (see ReapRecordlessCgroupVMs).
 		if sweepSafe {
 			mgr.SweepStartupOrphanNamespaces(protectedNs...)
+			// The reservation-time reclaim ran before this sweep and counted
+			// these namespaces as occupied. Nothing revisits them below the
+			// ceiling — claims just take fresh indexes — so rescan now or the
+			// indexes the sweep freed stay stranded until the next restart.
+			if n := netMgr.ReclaimUnusedSlots(); n > 0 {
+				log.Info().Int("slots", n).Msg("reclaimed slot indexes freed by the startup orphan sweep")
+			}
 		} else {
 			log.Warn().Msg("skipping startup orphan namespace sweep: an unresolved live cgroup survivor could be reclaimed")
 		}

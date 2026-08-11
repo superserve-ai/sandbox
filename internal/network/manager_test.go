@@ -17,7 +17,15 @@ func withTestNetnsDir(t *testing.T) string {
 	dir := t.TempDir()
 	old := netnsDir
 	netnsDir = dir
-	t.Cleanup(func() { netnsDir = old })
+	// Host interfaces are consulted alongside namespaces when deciding whether
+	// a slot index is free, so isolate them too — otherwise a runner carrying
+	// its own veth-N silently changes what these tests observe.
+	oldHostNet := hostNetDir
+	hostNetDir = t.TempDir()
+	t.Cleanup(func() {
+		netnsDir = old
+		hostNetDir = oldHostNet
+	})
 	return dir
 }
 
@@ -257,10 +265,55 @@ func TestClaimSlotIndex_ErrNoSlotsWhenExhausted(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()
 	m.nextSlot = MaxSlots + 1
+	// Genuinely exhausted: spending the fresh range is not enough, since the
+	// ceiling path reclaims unused indexes below it — every index must be held.
+	for idx := 1; idx <= MaxSlots; idx++ {
+		m.slotOwner[idx] = "vm"
+	}
 
 	_, err := m.claimSlotIndex(poolOwner)
 	if !errors.Is(err, ErrNoSlots) {
 		t.Errorf("err = %v, want ErrNoSlots", err)
+	}
+}
+
+// TestClaimSlotIndex_ReclaimsUnusedIndexesAtCeiling pins the recovery path: a
+// spent fresh range must not fail while indexes below it hold neither an owner
+// nor a namespace — those discards are the only inventory a long-lived host
+// has left, and a restart cannot recover them.
+func TestClaimSlotIndex_ReclaimsUnusedIndexesAtCeiling(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	touchNS(t, dir, "ns-7")       // namespace outlived its index
+	m.assignSlotLocked(9, "vm-9") // still owned by a record
+	m.nextSlot = MaxSlots + 1     // fresh range spent
+
+	idx, err := m.claimSlotIndex("vm-new")
+	if err != nil {
+		t.Fatalf("claimSlotIndex = %v, want a reclaimed index", err)
+	}
+	if idx == 7 || idx == 9 {
+		t.Fatalf("idx = %d, want neither the namespace-backed (7) nor the owned (9) index", idx)
+	}
+	if owner := m.slotOwner[idx]; owner != "vm-new" {
+		t.Errorf("slotOwner[%d] = %q, want vm-new", idx, owner)
+	}
+}
+
+// TestReclaimUnusedSlots_CooldownSkipsRescan pins the pacing: a host that is
+// truly out of slots must not rescan on every claim.
+func TestReclaimUnusedSlots_CooldownSkipsRescan(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	m.nextSlot = MaxSlots + 1
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if n := m.reclaimUnusedSlotsLocked(); n == 0 {
+		t.Fatal("first reclaim recovered nothing, want the empty range back")
+	}
+	m.freeSlots = nil
+	if n := m.reclaimUnusedSlotsLocked(); n != 0 {
+		t.Errorf("second reclaim recovered %d within the cooldown, want 0", n)
 	}
 }
 
@@ -480,5 +533,111 @@ func TestSetupSlotQueueFailsFastOnExpiredContext(t *testing.T) {
 	_, _, err := m.setupSlot(ctx, 1)
 	if err == nil || !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "slot build queue") {
 		t.Fatalf("setupSlot = %v, want the build-queue refusal (no kernel work attempted)", err)
+	}
+}
+
+// TestReclaimUnusedSlots_RecoversRangeStrandedByReservations pins the startup
+// recovery: reservations pin the allocator above the highest record index, and
+// every unused index below it must come back as claimable inventory rather than
+// staying unreachable for the process lifetime.
+func TestReclaimUnusedSlots_RecoversRangeStrandedByReservations(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-3")
+	m := newTestManager()
+
+	// A record high in the range pins nextSlot above everything below it.
+	m.ReserveSlotsAbove(map[string]string{"vm-hi": "ns-500", "vm-3": "ns-3"})
+	if m.nextSlot != 501 {
+		t.Fatalf("nextSlot = %d, want 501 (past the highest reserved index)", m.nextSlot)
+	}
+
+	reclaimed := m.ReclaimUnusedSlots()
+	// Everything below the mark except the two reserved indexes.
+	if want := 498; reclaimed != want {
+		t.Fatalf("reclaimed = %d, want %d", reclaimed, want)
+	}
+	idx, err := m.claimSlotIndex("vm-new")
+	if err != nil {
+		t.Fatalf("claimSlotIndex after reclaim: %v", err)
+	}
+	if idx == 3 || idx == 500 {
+		t.Errorf("idx = %d, want an index that no record reserved", idx)
+	}
+}
+
+// TestReclaimUnusedSlots_SkipsStrayHostVeths pins the exclusion: an index whose
+// host veth outlived its namespace cannot be built on (the move-to-host step
+// collides), and a failed build returns the index to the top of the LIFO free
+// list — so handing one out starves every other reclaimed slot behind an
+// endless retry of the same index.
+func TestReclaimUnusedSlots_SkipsStrayHostVeths(t *testing.T) {
+	withTestNetnsDir(t)
+	if err := os.Mkdir(filepath.Join(hostNetDir, "veth-4"), 0o755); err != nil {
+		t.Fatalf("create stray veth: %v", err)
+	}
+
+	m := newTestManager()
+	m.nextSlot = 6 // indexes 1..5 are below the high-water mark
+
+	reclaimed := m.ReclaimUnusedSlots()
+	if reclaimed != 4 {
+		t.Fatalf("reclaimed = %d, want 4 (1,2,3,5 — never the stray veth's index)", reclaimed)
+	}
+	for _, idx := range m.freeSlots {
+		if idx == 4 {
+			t.Fatal("index 4 reclaimed despite a stray host veth — builds there fail and relock the free list")
+		}
+	}
+}
+
+// TestReclaimUnusedSlots_LeavesCooldownUnarmed pins the startup ordering: the
+// orphan sweep deletes namespaces after the startup reclaim runs, so a claim
+// that hits the ceiling moments later must rescan on the fresher evidence
+// instead of failing for the cooldown's duration.
+func TestReclaimUnusedSlots_LeavesCooldownUnarmed(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-2")
+	m := newTestManager()
+	m.nextSlot = 4
+
+	if n := m.ReclaimUnusedSlots(); n != 2 {
+		t.Fatalf("startup reclaim = %d, want 2 (ns-2 still occupied)", n)
+	}
+	// The sweep frees it, as it does on the non-adoption startup path.
+	m.freeSlots = nil
+	if err := os.Remove(filepath.Join(dir, "ns-2")); err != nil {
+		t.Fatalf("remove ns: %v", err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if n := m.reclaimUnusedSlotsLocked(); n != 3 {
+		t.Fatalf("rescan = %d, want 3 — the cooldown blocked recovery of a just-swept index", n)
+	}
+}
+
+// TestReclaimUnusedSlots_FailedScanDoesNotArmCooldown pins the pacing to real
+// evidence: a scan that could not read the host's state has learned nothing,
+// so it must not suppress the next attempt — at the ceiling that would mean
+// refusing claims for the cooldown while capacity was actually available.
+func TestReclaimUnusedSlots_FailedScanDoesNotArmCooldown(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	notADir := filepath.Join(dir, "wedged")
+	if err := os.WriteFile(notADir, nil, 0o644); err != nil {
+		t.Fatalf("seed unreadable path: %v", err)
+	}
+	netnsDir = notADir // read fails with something other than "not exist"
+
+	m := newTestManager()
+	m.nextSlot = 5
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if n := m.reclaimUnusedSlotsLocked(); n != 0 {
+		t.Fatalf("reclaimed = %d on an unreadable host, want 0", n)
+	}
+	netnsDir = dir // condition clears
+	if n := m.reclaimUnusedSlotsLocked(); n != 4 {
+		t.Fatalf("reclaimed = %d after recovery, want 4 — a failed scan armed the cooldown", n)
 	}
 }
