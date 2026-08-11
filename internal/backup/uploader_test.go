@@ -2195,4 +2195,7 @@ func TestOutboxPinsVerifiedBucket(t *testing.T) {
 	if pending[0].VerifiedBucket != "bucket-a" {
 		t.Fatalf("VerifiedBucket = %q, want the ack-time scope", pending[0].VerifiedBucket)
 	}
+	if pending[0].VerifiedAt.IsZero() {
+		t.Fatal("VerifiedAt not pinned at ack time")
+	}
 }

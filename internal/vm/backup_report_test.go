@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -95,12 +96,16 @@ func TestBackupReporterUsesPinnedBucket(t *testing.T) {
 	defer srv.Close()
 
 	r := &BackupReporter{ControlPlaneURL: srv.URL, HostID: "h", Token: "t", Bucket: "new-bucket", Log: zerolog.Nop()}
-	task := backup.Task{SandboxID: "sb", Generation: "g", VerifiedBucket: "old-bucket",
+	pinned := time.Date(2026, 8, 10, 3, 0, 0, 0, time.UTC)
+	task := backup.Task{SandboxID: "sb", Generation: "g", VerifiedBucket: "old-bucket", VerifiedAt: pinned,
 		Files: []backup.TaskFile{{Name: "rootfs.ext4", SHA256: "aa", Size: 1}}}
 	if err := r.Deliver(task); err != nil {
 		t.Fatal(err)
 	}
 	if gotBody.Bucket != "old-bucket" {
 		t.Fatalf("bucket = %q, want the pinned verified bucket", gotBody.Bucket)
+	}
+	if !gotBody.CompletedAt.Equal(pinned) {
+		t.Fatalf("completed_at = %v, want the pinned verification instant", gotBody.CompletedAt)
 	}
 }

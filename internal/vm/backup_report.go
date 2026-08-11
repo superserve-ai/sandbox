@@ -57,11 +57,11 @@ type backupReportBody struct {
 	Files       []backupReportFile `json:"files"`
 }
 
-// Deliver reports one verified generation. CompletedAt is stamped at
-// delivery time: the outbox entry does not carry the verification
-// instant, so a crash-redelivered report skews later by the outage,
-// which coverage queries tolerate (a backup can only be reported after
-// it completed).
+// Deliver reports one verified generation. CompletedAt is the ack-time
+// verification instant pinned on the outbox entry; only entries written
+// before that field existed fall back to delivery time, whose skew
+// coverage queries tolerate in one direction (a backup can only be
+// reported after it completed).
 func (r *BackupReporter) Deliver(task backup.Task) error {
 	// ReportedFiles adds the shared base entries the uploader ships into
 	// the bucket manifest: task.Files alone would understate an overlay
@@ -76,13 +76,17 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	if bucket == "" {
 		bucket = r.Bucket
 	}
+	completedAt := task.VerifiedAt
+	if completedAt.IsZero() {
+		completedAt = time.Now()
+	}
 	body := backupReportBody{
 		SandboxID:   task.SandboxID,
 		TemplateID:  task.TemplateID,
 		BuildID:     task.BuildID,
 		Generation:  task.Generation,
 		Bucket:      bucket,
-		CompletedAt: time.Now().UTC(),
+		CompletedAt: completedAt.UTC(),
 		Files:       make([]backupReportFile, 0, len(files)),
 	}
 	for _, f := range files {

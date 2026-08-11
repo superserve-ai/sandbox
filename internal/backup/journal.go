@@ -92,6 +92,11 @@ type Task struct {
 	// outbox entries written before the field existed (consumers fall
 	// back to the current bucket, the pre-field behavior).
 	VerifiedBucket string `json:"verified_bucket,omitempty"`
+	// VerifiedAt is when the upload verified, pinned on the outbox copy
+	// alongside VerifiedBucket: deliveries run in outbox key order (owner
+	// and content hash, not chronology), so stamping delivery time would
+	// let an older generation delivered later rank as the newest backup.
+	VerifiedAt time.Time `json:"verified_at,omitempty"`
 }
 
 // HasVerified reports whether this task already verified object.
@@ -494,10 +499,13 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 			}
 		}
 		if notify {
-			// The outbox copy pins the verified bucket: delivery may run
-			// under a future process configured against a different store.
+			// The outbox copy pins the verified bucket and instant:
+			// delivery may run under a future process configured against a
+			// different store, and in an order that has nothing to do with
+			// when each generation verified.
 			nt := task
 			nt.VerifiedBucket = completedScope
+			nt.VerifiedAt = now.UTC()
 			val, err := json.Marshal(nt)
 			if err != nil {
 				return err
