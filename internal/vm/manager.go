@@ -283,6 +283,11 @@ type Manager struct {
 	// unitDead overrides the systemd unit-dead probe in tests; nil means
 	// the real probe. See vmConfirmedAtRest.
 	unitDead func(ctx context.Context, vmID string) bool
+	// rehashDone, when set, is called as the detached pending-backup worker
+	// returns. The worker deliberately outlives backupPause, so a test whose
+	// staging tree is a t.TempDir() otherwise races its own cleanup against
+	// the worker's writes. Nil in production.
+	rehashDone func()
 	// pendingInFlight guards one pending-backup worker per VM across the
 	// startup recovery and the periodic sweep.
 	pendingInFlight sync.Map
@@ -3064,6 +3069,12 @@ func (m *Manager) ReserveStartupSlots(context.Context) bool {
 		return false
 	}
 	m.netMgr.ReserveSlotsAbove(collectStartupSlots(recs))
+	// Reservations pin the allocator above the highest record index, stranding
+	// every unused index below it. Hand those back now, while records are the
+	// only owners and "unowned with no namespace" provably means free.
+	if n := m.netMgr.ReclaimUnusedSlots(); n > 0 {
+		m.log.Info().Int("slots", n).Msg("reclaimed unused network slot indexes")
+	}
 	return true
 }
 
