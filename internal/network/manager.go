@@ -71,9 +71,12 @@ type VMNetInfo struct {
 // ---------------------------------------------------------------------------
 
 // MaxSlots is the maximum number of concurrent VMs. Limited by the IP scheme:
-// hostIP uses 10.11.0.0/16 (one IP per VM), veth pairs use 10.12.0.0/16 (two IPs per VM).
-// This supports up to ~32K concurrent VMs per node — hardware (RAM/CPU) is the real limit.
-const MaxSlots = 32000
+// hostIP uses 10.11.0.0/16 (one IP per VM), veth pairs use 10.12.0.0/15 (two
+// IPs per VM), so both sides top out at 65,536 and this sits just under it.
+// Every sandbox holds a slot for its whole life, paused included, so this is a
+// ceiling on sandboxes per host, not on running VMs — hardware and kernel
+// scale (namespace and mount table growth) bite well before the arithmetic.
+const MaxSlots = 65000
 
 // ErrNoSlots is returned when no network slots are available.
 var ErrNoSlots = fmt.Errorf("no available network slots (max %d concurrent VMs)", MaxSlots)
@@ -270,7 +273,7 @@ func (m *Manager) SetProxyPorts(http, tls, other uint16) {
 //
 // Network topology:
 //
-//	Host:      veth-<idx> (10.12.x.y/31)  ←→  eth0 (10.12.x.y/31) :Namespace
+//	Host:      veth-<idx> (10.12+.x.y/31)  ←→  eth0 (10.12+.x.y/31) :Namespace
 //	Host:      route hostIP/32 via vpeerIP
 //	Namespace: tap0 (169.254.0.22/30)  ←→  VM eth0 (169.254.0.21)
 //	Namespace: nftables SNAT 169.254.0.21 → hostIP (outbound)
@@ -278,8 +281,8 @@ func (m *Manager) SetProxyPorts(http, tls, other uint16) {
 //
 // IP addressing uses /16 subnets to support thousands of concurrent VMs:
 //   - hostIP:  10.11.<idx/256>.<idx%256>  (one per VM)
-//   - vpeerIP: 10.12.<(idx*2)/256>.<(idx*2)%256>  (namespace side of veth)
-//   - vethIP:  10.12.<(idx*2+1)/256>.<(idx*2+1)%256>  (host side of veth)
+//   - vpeerIP: offset idx*2 into 10.12.0.0/15    (namespace side of veth)
+//   - vethIP:  offset idx*2+1 into 10.12.0.0/15  (host side of veth)
 //
 // The host reaches the VM at hostIP:<port>. NAT inside the namespace
 // translates to 169.254.0.21:<port>. No guest IP reconfig needed.
@@ -333,9 +336,18 @@ func hostIPForSlot(idx int) string {
 // the kernel objects carry all the state, nothing needs to be persisted.
 func nsNameForSlot(idx int) string   { return fmt.Sprintf("ns-%d", idx) }
 func vethNameForSlot(idx int) string { return fmt.Sprintf("veth-%d", idx) }
-func vpeerIPForSlot(idx int) string  { return fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256) }
-func vethIPForSlot(idx int) string   { return fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256) }
-func macForSlot(idx int) string      { return fmt.Sprintf("AA:FC:00:%02X:%02X:%02X", 0, idx/256, idx%256) }
+func vpeerIPForSlot(idx int) string  { return vethPairIP(idx * 2) }
+func vethIPForSlot(idx int) string   { return vethPairIP(idx*2 + 1) }
+
+// vethPairIP addresses one end of a slot's veth /31 by its flat offset into
+// 10.12.0.0/15. Slots below 32,768 keep the exact addresses the old /16 scheme
+// gave them, so widening the range leaves every existing namespace untouched.
+// Offsets are even/odd pairs and the /15 boundary is even, so a pair can never
+// straddle it.
+func vethPairIP(offset int) string {
+	return fmt.Sprintf("10.%d.%d.%d", 12+offset/65536, (offset%65536)/256, offset%256)
+}
+func macForSlot(idx int) string { return fmt.Sprintf("AA:FC:00:%02X:%02X:%02X", 0, idx/256, idx%256) }
 
 // setupSlot runs the expensive network setup (namespace, veth, TAP,
 // nftables, routing) for a single slot index. Used by both SetupVM
@@ -579,7 +591,7 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 			Msg("cleanup: killed lingering processes before namespace teardown")
 	}
 
-	vpeerIP := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
+	vpeerIP := vpeerIPForSlot(idx)
 	hostCIDR := fmt.Sprintf("%s/32", info.HostIP)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
