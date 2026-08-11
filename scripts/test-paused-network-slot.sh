@@ -611,8 +611,21 @@ wait_for_sandbox_status "$SANDBOX_ID" paused
 
 check_host_slot_released "$OLD_SLOT" "paused"
 
-paused_log="$(latest_vmd_logs "$pause_log_since")"
-printf '%s\n' "$paused_log" >"$RESULTS_DIR/paused-host.txt"
+paused_vm_log="$(latest_vmd_vm_logs "$pause_log_since" "$SANDBOX_ID")"
+printf '%s\n' "$paused_vm_log" >"$RESULTS_DIR/paused-host.txt"
+
+if jq -e --arg sid "$SANDBOX_ID" --arg slot "$OLD_SLOT" --arg ns "$OLD_NETNS" '
+  select(
+    .vm_id == $sid and
+    (.slot | tostring) == $slot and
+    .namespace == $ns and
+    ((.message // .msg // "") == "network slot returned to pool")
+  )
+' <<<"$paused_vm_log" >/dev/null 2>&1; then
+  SLOT_RELEASED="PASS"
+else
+  fail "did not observe network slot returned to pool for sandbox ${SANDBOX_ID} slot ${OLD_SLOT} namespace ${OLD_NETNS}; inspect ${RESULTS_DIR}/paused-host.txt"
+fi
 
 # Try a few fresh sandboxes; if one reclaims OLD_SLOT, the release is proven
 # even when the host keeps the namespace/veth/mount around in the pool.
@@ -639,7 +652,6 @@ for attempt in $(seq 1 "$REUSE_ATTEMPTS"); do
   temp_slot="$(sed -n '1p' <<<"$temp_slot_context")"
   if [[ "$temp_slot" == "$OLD_SLOT" ]]; then
     found_temp_owner="$TEMP_SANDBOX_ID"
-    SLOT_RELEASED="PASS"
     OLD_SLOT_REUSED="PASS"
     break
   fi
