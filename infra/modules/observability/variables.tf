@@ -33,6 +33,17 @@ variable "compute_instance_cpu_alerts" {
   default = {}
 }
 
+variable "host_maintenance_event_alerts" {
+  description = "Log-based alerts on GCE host maintenance / restart system events, keyed by logical name."
+  type = map(object({
+    display_name  = string
+    instance_name = string
+    instance_id   = string
+    documentation = optional(string, null)
+  }))
+  default = {}
+}
+
 variable "log_buckets" {
   description = "Logging bucket definitions keyed by logical name."
   type = map(object({

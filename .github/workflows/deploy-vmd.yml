@@ -43,6 +43,9 @@ on:
       - 'deploy/sandboxes.slice'
       - 'deploy/needrestart-superserve.conf'
       - 'deploy/apt-no-auto-upgrades.conf'
+      - 'deploy/maintenance-watch.sh'
+      - 'deploy/superserve-maintenance-watch.service'
+      - 'deploy/superserve-maintenance-watch.timer'
       - 'scripts/fc-cleanup'
       # The workflow + its deploy script must self-trigger (as deploy-otel does),
       # or a new cell/step lands without ever running until an unrelated vmd
@@ -140,6 +143,7 @@ jobs:
           # Staging validates the backup uploader first; the production
           # cells get their buckets after the staging soak.
           BACKUP_BUCKET: superserve-artifact-backup-staging-usc1
+          MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
           python3 .github/workflows/scripts/deploy-vmd.py
 
@@ -201,6 +205,7 @@ jobs:
           CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_PROD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
           INTERNAL_API_TOKEN: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
+          MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
           # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
           # filter and fan out to every VMD_LABEL match. use4 is the permanent
@@ -242,6 +247,7 @@ jobs:
           # Enables the pause-backup uploader for the cell (validated on
           # staging first; the bucket is create-only for hosts).
           BACKUP_BUCKET: superserve-artifact-backup-usw2
+          MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
           # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
           # filter and fan out to every VMD_LABEL match — which would push
