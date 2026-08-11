@@ -155,12 +155,13 @@ ssh_request() {
 }
 
 wait_for_sandbox_status() {
-  local wanted="$1"
+  local sandbox_id="$1"
+  local wanted="$2"
   local deadline=$((SECONDS + POLL_TIMEOUT_S))
 
   while (( SECONDS < deadline )); do
     local response status body current
-    response="$(api_request GET "/sandboxes/${SANDBOX_ID}")"
+    response="$(api_request GET "/sandboxes/${sandbox_id}")"
     status="$(head -n1 <<<"$response")"
     body="$(tail -n +2 <<<"$response")"
     if [[ "$status" != "200" ]]; then
@@ -174,7 +175,7 @@ wait_for_sandbox_status() {
     sleep 2
   done
 
-  fail "sandbox ${SANDBOX_ID} did not reach status ${wanted} within ${POLL_TIMEOUT_S}s"
+  fail "sandbox ${sandbox_id} did not reach status ${wanted} within ${POLL_TIMEOUT_S}s"
 }
 
 publish_preview_port() {
@@ -537,7 +538,7 @@ ACCESS_TOKEN="$(jq -r '.access_token // empty' <<<"$create_body_json")"
 RESULTS_DIR="${RESULTS_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)-${SANDBOX_ID}"
 mkdir -p "$RESULTS_DIR"
 
-wait_for_sandbox_status active
+wait_for_sandbox_status "$SANDBOX_ID" active
 
 pre_exec_link="$(sandbox_exec 'ip -j link')"
 pre_exec_addr="$(sandbox_exec 'ip -j addr')"
@@ -606,7 +607,7 @@ pause_response="$(api_request POST "/sandboxes/${SANDBOX_ID}/pause")"
 pause_status="$(head -n1 <<<"$pause_response")"
 pause_body="$(tail -n +2 <<<"$pause_response")"
 [[ "$pause_status" == "204" ]] || fail "pause failed with HTTP ${pause_status}: ${pause_body}"
-wait_for_sandbox_status paused
+wait_for_sandbox_status "$SANDBOX_ID" paused
 
 check_host_slot_released "$OLD_SLOT" "paused"
 
@@ -633,7 +634,7 @@ for attempt in $(seq 1 "$REUSE_ATTEMPTS"); do
   [[ -n "$TEMP_SANDBOX_ID" ]] || fail "temp sandbox create response did not include id"
   [[ -n "$TEMP_ACCESS_TOKEN" ]] || fail "temp sandbox create response did not include access token"
   temp_log_since="$(date -u +%Y-%m-%d' '%H:%M:%S)"
-  wait_for_sandbox_status active
+  wait_for_sandbox_status "$TEMP_SANDBOX_ID" active
   temp_slot_context="$(collect_slot_state "$temp_log_since" "$TEMP_SANDBOX_ID" "temp-${attempt}")"
   temp_slot="$(sed -n '1p' <<<"$temp_slot_context")"
   if [[ "$temp_slot" == "$OLD_SLOT" ]]; then
@@ -657,7 +658,7 @@ resume_body="$(tail -n +2 <<<"$resume_response")"
 [[ "$resume_status" == "200" ]] || fail "resume failed with HTTP ${resume_status}: ${resume_body}"
 ACCESS_TOKEN="$(jq -r '.access_token // empty' <<<"$resume_body")"
 [[ -n "$ACCESS_TOKEN" ]] || fail "resume response did not include a fresh access token"
-wait_for_sandbox_status active
+wait_for_sandbox_status "$SANDBOX_ID" active
 RESUME_LATENCY="$(( $(date +%s) - resume_start_epoch ))s"
 
 resume_slot_context="$(collect_slot_state "$resume_log_since" "$SANDBOX_ID" "resume")"
