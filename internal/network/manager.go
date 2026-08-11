@@ -961,6 +961,19 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 	}
 }
 
+// ReclaimUnusedSlots seeds the free list with every index below the
+// allocator's high-water mark that no owner holds and no namespace occupies.
+// Startup pins the mark above the highest record index, so on a host whose
+// records reach into the upper range, everything below it is unreachable for
+// the whole process lifetime unless it is reclaimed deliberately. Call it once
+// startup reservations are in place, when the only owners are records.
+func (m *Manager) ReclaimUnusedSlots() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastReclaim = time.Time{} // startup always scans; the cooldown paces the ceiling path
+	return m.reclaimUnusedSlotsLocked()
+}
+
 // reclaimUnusedSlotsLocked refills freeSlots from the range below nextSlot:
 // every index that no owner holds and no kernel namespace occupies. Returns
 // how many it recovered.

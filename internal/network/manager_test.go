@@ -527,3 +527,32 @@ func TestSetupSlotQueueFailsFastOnExpiredContext(t *testing.T) {
 		t.Fatalf("setupSlot = %v, want the build-queue refusal (no kernel work attempted)", err)
 	}
 }
+
+// TestReclaimUnusedSlots_RecoversRangeStrandedByReservations pins the startup
+// recovery: reservations pin the allocator above the highest record index, and
+// every unused index below it must come back as claimable inventory rather than
+// staying unreachable for the process lifetime.
+func TestReclaimUnusedSlots_RecoversRangeStrandedByReservations(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-3")
+	m := newTestManager()
+
+	// A record high in the range pins nextSlot above everything below it.
+	m.ReserveSlotsAbove(map[string]string{"vm-hi": "ns-500", "vm-3": "ns-3"})
+	if m.nextSlot != 501 {
+		t.Fatalf("nextSlot = %d, want 501 (past the highest reserved index)", m.nextSlot)
+	}
+
+	reclaimed := m.ReclaimUnusedSlots()
+	// Everything below the mark except the two reserved indexes.
+	if want := 498; reclaimed != want {
+		t.Fatalf("reclaimed = %d, want %d", reclaimed, want)
+	}
+	idx, err := m.claimSlotIndex("vm-new")
+	if err != nil {
+		t.Fatalf("claimSlotIndex after reclaim: %v", err)
+	}
+	if idx == 3 || idx == 500 {
+		t.Errorf("idx = %d, want an index that no record reserved", idx)
+	}
+}
