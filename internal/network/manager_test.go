@@ -615,3 +615,29 @@ func TestReclaimUnusedSlots_LeavesCooldownUnarmed(t *testing.T) {
 		t.Fatalf("rescan = %d, want 3 — the cooldown blocked recovery of a just-swept index", n)
 	}
 }
+
+// TestReclaimUnusedSlots_FailedScanDoesNotArmCooldown pins the pacing to real
+// evidence: a scan that could not read the host's state has learned nothing,
+// so it must not suppress the next attempt — at the ceiling that would mean
+// refusing claims for the cooldown while capacity was actually available.
+func TestReclaimUnusedSlots_FailedScanDoesNotArmCooldown(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	notADir := filepath.Join(dir, "wedged")
+	if err := os.WriteFile(notADir, nil, 0o644); err != nil {
+		t.Fatalf("seed unreadable path: %v", err)
+	}
+	netnsDir = notADir // read fails with something other than "not exist"
+
+	m := newTestManager()
+	m.nextSlot = 5
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if n := m.reclaimUnusedSlotsLocked(); n != 0 {
+		t.Fatalf("reclaimed = %d on an unreadable host, want 0", n)
+	}
+	netnsDir = dir // condition clears
+	if n := m.reclaimUnusedSlotsLocked(); n != 4 {
+		t.Fatalf("reclaimed = %d after recovery, want 4 — a failed scan armed the cooldown", n)
+	}
+}

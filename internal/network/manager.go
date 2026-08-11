@@ -1004,7 +1004,6 @@ func (m *Manager) reclaimUnusedSlotsLocked() int {
 	if time.Since(m.lastReclaim) < reclaimCooldown {
 		return 0
 	}
-	m.lastReclaim = time.Now()
 
 	entries, err := os.ReadDir(netnsDir)
 	if err != nil && !os.IsNotExist(err) {
@@ -1046,6 +1045,10 @@ func (m *Manager) reclaimUnusedSlotsLocked() int {
 	for _, idx := range m.freeSlots {
 		occupied[idx] = true
 	}
+	// Armed only now that both reads succeeded: a scan that bailed on a
+	// transient read has learned nothing, and must not silence the next one
+	// for the cooldown while the host may have capacity to hand out.
+	m.lastReclaim = time.Now()
 
 	limit := m.nextSlot - 1
 	if limit > MaxSlots {
