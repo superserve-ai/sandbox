@@ -55,8 +55,18 @@ jobs:
     # Runs on ordinary main pushes like deploy-vmd.yml and terraform-cd:
     # the collector must roll out on the same automatic path as the vmd
     # metrics exporter and the alert policies that watch its series, or a
-    # merge leaves alerts staring at ports nothing listens on.
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    # merge leaves alerts staring at ports nothing listens on. A push only
+    # proceeds once deploy-staging (which always runs on push) has
+    # actually succeeded, so a broken collector build or config never
+    # reaches production. deploy-staging is conditional on the dispatch
+    # input and never runs on a production-only workflow_dispatch, so that
+    # path is evaluated on its own, preserving the manual behavior.
+    if: |
+      always() && (
+        (github.event_name == 'push' && needs.deploy-staging.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+      )
+    needs: [deploy-staging]
     runs-on: ubuntu-latest
     environment: production
     permissions:
