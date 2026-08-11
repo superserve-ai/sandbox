@@ -262,12 +262,12 @@
         "width": 6,
         "height": 4,
         "widget": {
-          "title": "Sandbox Error Rate",
+          "title": "Sandbox Errors and Failed-State Transitions",
           "xyChart": {
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "sum by (result) (rate(sandbox_transition_total{environment=\"${environment}\",result=~\"conflict|error|timeout\"}[5m]))"
+                  "prometheusQuery": "sum by (operation, result) (rate(sandbox_transition_total{environment=\"${environment}\",result=~\"conflict|error|timeout\"}[5m])) or sum by (operation, result) (rate(sandbox_transition_total{environment=\"${environment}\",operation=\"fail\",result=\"success\"}[5m]))"
                 },
                 "plotType": "LINE",
                 "targetAxis": "Y1"
