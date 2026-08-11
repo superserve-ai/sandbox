@@ -11,6 +11,7 @@ import (
 	"hash"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -70,6 +71,12 @@ type Uploader struct {
 	OnVerified func(Task)
 	// Tick is the idle poll interval. 0 → 1s.
 	Tick time.Duration
+	// LegacyStagingRoot is a retired staging location still referenced
+	// by journal rows enqueued before a relocation. It is swept with the
+	// same journal authority as StagingRoot until it empties, then the
+	// directory itself is removed; deleting it eagerly would destroy
+	// staged copies that queued tasks still need.
+	LegacyStagingRoot string
 	// StagingRoot is the hard-link staging tree; finished tasks get
 	// their staged generation removed. Empty disables staging cleanup.
 	StagingRoot string
@@ -153,6 +160,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 		if u.StagingRoot != "" && u.clock().Sub(lastSweep) > stagingSweepInterval {
 			lastSweep = u.clock()
 			SweepStaging(u.StagingRoot, u.Journal, u.Log)
+			u.sweepLegacyStaging()
 		}
 	}
 }
@@ -173,7 +181,7 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 		// safe by the same contract every abandon path relies on: the
 		// generation's coverage is sacrificed, the owner's next pause
 		// covers, and the error log is the operator signal.
-		if task.Attempts+1 >= maxUploadAttempts {
+		if task.Attempts+1 >= maxUploadAttempts && !isStoreError(err) && !errors.Is(err, context.Canceled) {
 			task.logOwner(u.Log.Error().Err(err)).
 				Str("generation", task.Generation).
 				Int("attempts", task.Attempts+1).
@@ -356,6 +364,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 		return false, err
 	}
 	if _, err := u.Store.Create(ctx, manifestObject, &limitedReader{r: bytes.NewReader(payload), limiter: u.Limiter, ctx: ctx}); err != nil {
+		err = storeError{err}
 		return false, fmt.Errorf("manifest object: %w", err)
 	}
 	return true, nil
@@ -364,12 +373,46 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 // stagingSweepInterval paces the running staged-base sweep.
 const stagingSweepInterval = 30 * time.Minute
 
-// maxUploadAttempts bounds a task's retries. At the capped backoff this
-// gives a stuck task on the order of ten hours to become uploadable,
-// which covers every transient class (bucket outage, disk pressure,
-// budget contention) while guaranteeing the journal and staging tree
-// cannot grow monotonically behind a task class that never succeeds.
+// maxUploadAttempts bounds a task's retries for LOCAL failures, which
+// are deterministic: the same bytes and environment fail the same way,
+// so this many identical failures is structural, and unbounded retry
+// converts one stuck task class into monotonic journal and staging
+// growth. Store errors are exempt: an outage or credential problem is
+// environmental, however long it lasts, and exhausting durable work
+// against it would discard generations (a destroyed sandbox has no next
+// pause) that become uploadable the moment the store recovers. Outage
+// depth stays visible through the queue-age telemetry instead.
 const maxUploadAttempts = 60
+
+// storeError marks a failure that came from the blob store rather than
+// local preparation, exempting it from the retry ceiling.
+type storeError struct{ err error }
+
+func (e storeError) Error() string { return e.err.Error() }
+func (e storeError) Unwrap() error { return e.err }
+
+func isStoreError(err error) bool {
+	var se storeError
+	return errors.As(err, &se)
+}
+
+// sweepLegacyStaging drains a retired staging location under journal
+// authority and removes the directory once nothing references it. The
+// non-recursive Remove is the emptiness check: it fails harmlessly
+// while any sandbox or base entry survives.
+func (u *Uploader) sweepLegacyStaging() {
+	if u.LegacyStagingRoot == "" {
+		return
+	}
+	SweepStaging(u.LegacyStagingRoot, u.Journal, u.Log)
+	// The bases subdirectory outlives its last entry; both removes are
+	// non-recursive, so each succeeds only against emptiness.
+	_ = os.Remove(filepath.Join(u.LegacyStagingRoot, "bases"))
+	if err := os.Remove(u.LegacyStagingRoot); err == nil {
+		u.Log.Info().Str("path", u.LegacyStagingRoot).Msg("legacy backup staging tree drained and removed")
+		u.LegacyStagingRoot = ""
+	}
+}
 
 // objectName routes an object into the task owner's prefix. Both owners
 // keep the content-addressed generation segment: build ids are reusable
@@ -500,7 +543,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 	reader := &limitedReader{r: hasher, limiter: u.Limiter, ctx: ctx}
 	created, err := u.Store.Create(ctx, object, reader)
 	if err != nil {
-		return ManifestFile{}, err
+		return ManifestFile{}, storeError{err}
 	}
 	if created {
 		// The store wrote exactly the bytes that flowed through the

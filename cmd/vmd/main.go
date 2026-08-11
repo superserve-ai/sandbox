@@ -570,18 +570,13 @@ func main() {
 		if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
 			log.Fatal().Err(err).Str("path", stagingRoot).Msg("failed to create backup staging dir")
 		}
-		// One-time relocation: remove the retired OS-disk tree.
-		// Uploader-owned by construction, and any task or marker still
-		// referencing legacy paths abandons safely or falls back to
-		// original paths and re-covers on the next pause.
-		if legacyStaging != "" {
-			if _, err := os.Stat(legacyStaging); err == nil {
-				log.Info().Str("path", legacyStaging).Msg("removing legacy backup staging tree")
-				if err := os.RemoveAll(legacyStaging); err != nil {
-					log.Warn().Err(err).Str("path", legacyStaging).Msg("legacy backup staging tree not fully removed")
-				}
-			}
-		}
+		// Relocation drains, never deletes: journal rows enqueued before
+		// the move still reference staged copies in the retired tree, so
+		// it is swept under the same journal authority as the live root
+		// until it empties, and only then removed (in the uploader's
+		// periodic sweep). Markers renewed above keep their directories
+		// alive wherever they point.
+		uploader.LegacyStagingRoot = legacyStaging
 		// Renew every durable marker's staged directory before the sweep
 		// runs: the sweep is synchronous and ordered ahead of reattach (and
 		// so ahead of RecoverPendingBackups), so a marker that survived an
@@ -590,6 +585,9 @@ func main() {
 		// under a still-durable pause.
 		mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
 		backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
+		if legacyStaging != "" {
+			backup.SweepStaging(legacyStaging, journal, log.With().Str("component", "backup").Logger())
+		}
 		uploader.StagingRoot = stagingRoot
 		mgr.SetBackupStaging(stagingRoot)
 		mgr.SetBackupEnqueue(journal.Enqueue)

@@ -773,14 +773,21 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 // artifacts it clones: reflink works and capacity scales with the
 // artifact array rather than the OS disk, whose exhaustion takes the
 // journal down with it. The returned legacy path is the retired OS-disk
-// default the caller should remove, empty when it coincides with root.
+// default, drained by the uploader's sweep and removed once empty; it
+// is empty when the configured root aliases or overlaps it.
 func ResolveStagingRoot(override, snapshotDir, runDir string) (root, legacy string) {
-	root = override
-	if root == "" {
+	root = filepath.Clean(override)
+	if override == "" {
 		root = filepath.Join(snapshotDir, ".backup-staging")
 	}
 	legacy = filepath.Join(filepath.Dir(runDir), "backup-staging")
-	if legacy == root {
+	// The legacy tree is only legacy when the configured root lives
+	// entirely outside it: equality or containment (either direction,
+	// aliased spellings included) means the operator pointed staging at
+	// the old location and nothing may treat it as retired.
+	if root == legacy ||
+		strings.HasPrefix(root, legacy+string(os.PathSeparator)) ||
+		strings.HasPrefix(legacy, root+string(os.PathSeparator)) {
 		legacy = ""
 	}
 	return root, legacy

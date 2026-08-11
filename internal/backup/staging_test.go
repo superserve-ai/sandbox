@@ -18,4 +18,15 @@ func TestResolveStagingRoot(t *testing.T) {
 	if legacy != "" {
 		t.Fatalf("legacy = %q, want suppressed when it is the configured root", legacy)
 	}
+	// Aliased and contained spellings must suppress too: treating the
+	// configured root's own tree as retired would drain live staging.
+	for _, override := range []string{
+		"/var/lib/sandbox/backup-staging/",
+		"/var/lib/sandbox/backup-staging/sub",
+		"/var/lib/sandbox",
+	} {
+		if _, legacy := ResolveStagingRoot(override, "/data/snapshots", "/var/lib/sandbox/rundir"); legacy != "" {
+			t.Fatalf("override %q: legacy = %q, want suppressed", override, legacy)
+		}
+	}
 }
