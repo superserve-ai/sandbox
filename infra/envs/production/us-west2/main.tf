@@ -231,6 +231,13 @@ module "observability" {
       instance_id   = module.sandbox_host.instance_id
     }
   }
+  sandbox_failure_alerts = {
+    fleet = {
+      display_name = "Sandbox / us-west2 / High failed sandbox count"
+      threshold    = 5
+      lookback     = "10m"
+    }
+  }
   labels = local.common_labels
 }
 
