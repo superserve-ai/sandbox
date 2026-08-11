@@ -4,7 +4,7 @@
 # customer identifiers). PromQL conditions fire while the query returns a
 # series, so each query folds its threshold into the expression.
 #
-# The set exists for two incident classes: pause-path latency regressions
+# The set exists for two failure classes: pause-path latency regressions
 # that only a pause-hook duration metric can catch, and a production host
 # running with backup silently disabled (backup_enabled=0).
 
