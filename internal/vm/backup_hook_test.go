@@ -1144,6 +1144,13 @@ func TestRetryPauseReusesExistingStagedMarker(t *testing.T) {
 	}
 	m.backupStaging = staging
 	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+	// Pin the per-VM worker slot: staging happens synchronously inside
+	// backupPause, but the detached staged worker needs no at-rest proof
+	// and would rename the pending directory to its generation name,
+	// racing the directory inspection below (the unitDead=false stall
+	// only holds the UNSTAGED flow). With the slot occupied, workers heal
+	// the marker and exit, so the pending directory provably survives.
+	m.pendingInFlight.Store("vm-1", struct{}{})
 
 	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
 	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
