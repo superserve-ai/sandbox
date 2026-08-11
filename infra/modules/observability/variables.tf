@@ -80,3 +80,15 @@ variable "labels" {
   type        = map(string)
   default     = {}
 }
+
+variable "sandbox_failure_alerts" {
+  description = "Alerts on successful transitions of sandbox rows into the terminal failed state."
+  type = map(object({
+    display_name        = string
+    threshold           = optional(number, 5)
+    lookback            = optional(string, "10m")
+    evaluation_duration = optional(string, "0s")
+    documentation       = optional(string, null)
+  }))
+  default = {}
+}
