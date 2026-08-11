@@ -78,6 +78,11 @@ const MaxSlots = 32000
 // ErrNoSlots is returned when no network slots are available.
 var ErrNoSlots = fmt.Errorf("no available network slots (max %d concurrent VMs)", MaxSlots)
 
+// reclaimCooldown bounds how often a claim at the ceiling rescans for unused
+// indexes. The scan is cheap but pointless to repeat while nothing has been
+// released, and a host at the ceiling is exactly when claims arrive fastest.
+const reclaimCooldown = 30 * time.Second
+
 // setupSlotConcurrency caps concurrent slot builds across every caller
 // (on-demand fallback and pool refill). Each build forks a dozen ip/nsenter
 // commands that serialize on the kernel's netlink lock, so unbounded
@@ -119,6 +124,9 @@ type Manager struct {
 	// every slot path must route through them so ownership can never be dropped
 	// (leak) or duplicated (double hand-out).
 	slotOwner map[int]string
+
+	// lastReclaim is when the ceiling path last rescanned for unused indexes.
+	lastReclaim time.Time
 
 	// TCP egress proxy — receives per-sandbox rule updates and cleanup.
 	egressProxy *EgressProxy
@@ -388,15 +396,21 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	}
 
 	if err := run(ctx, "ip", "link", "set", vethName, "up"); err != nil {
-		m.removeNS(nsName)
+		// The veth now lives on the host, so it outlives the namespace:
+		// tear both down or the next build at this index collides with it.
+		m.cleanupFull(nsName, vethName)
 		return nil, "", fmt.Errorf("bring up veth: %w", err)
 	}
 	if err := run(ctx, "ip", "link", "set", vethName, "mtu", ifaceMTU); err != nil {
-		m.removeNS(nsName)
+		// The veth now lives on the host, so it outlives the namespace:
+		// tear both down or the next build at this index collides with it.
+		m.cleanupFull(nsName, vethName)
 		return nil, "", fmt.Errorf("set veth MTU: %w", err)
 	}
 	if err := run(ctx, "ip", "addr", "add", vethIP+"/31", "dev", vethName); err != nil {
-		m.removeNS(nsName)
+		// The veth now lives on the host, so it outlives the namespace:
+		// tear both down or the next build at this index collides with it.
+		m.cleanupFull(nsName, vethName)
 		return nil, "", fmt.Errorf("assign veth IP: %w", err)
 	}
 
@@ -929,6 +943,12 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 				ceiling = m.maxSlot // WithExactSlot: allow only the pinned index
 			}
 			if m.nextSlot > ceiling {
+				// Out of fresh range, which is not the same as out of slots:
+				// indexes are discarded (never returned) whenever a namespace
+				// outlives them, so the gaps below are the only inventory left.
+				if n := m.reclaimUnusedSlotsLocked(); n > 0 {
+					continue
+				}
 				return 0, ErrNoSlots
 			}
 			idx = m.nextSlot
@@ -945,6 +965,111 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 		m.assignSlotLocked(idx, owner)
 		return idx, nil
 	}
+}
+
+// ReclaimUnusedSlots seeds the free list with every index below the
+// allocator's high-water mark that no owner holds and no namespace occupies.
+// Startup pins the mark above the highest record index, so on a host whose
+// records reach into the upper range, everything below it is unreachable for
+// the whole process lifetime unless it is reclaimed deliberately. Call it once
+// startup reservations are in place, when the only owners are records.
+func (m *Manager) ReclaimUnusedSlots() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastReclaim = time.Time{} // startup always scans
+	n := m.reclaimUnusedSlotsLocked()
+	// The startup orphan sweep runs after this and deletes namespaces, so
+	// indexes this pass counted as occupied can be free moments later. Leave
+	// the cooldown unarmed so the first claim at the ceiling rescans rather
+	// than failing for the cooldown's duration over stale evidence.
+	m.lastReclaim = time.Time{}
+	return n
+}
+
+// reclaimUnusedSlotsLocked refills freeSlots from the range below nextSlot:
+// every index that no owner holds and no kernel namespace occupies. Returns
+// how many it recovered.
+//
+// The allocator only ever advances nextSlot, and discards any index whose
+// namespace outlived it (returning it to freeSlots would loop). On a
+// long-lived host those discards accumulate until the fresh range is spent
+// while most of the space below it is idle — and a restart does not clear it,
+// because boot re-reserves each record's index and resumes above the highest.
+// So the ceiling has to be recoverable in place.
+//
+// One directory read rather than a stat per index: at the ceiling there are
+// tens of thousands of indexes to test, and namespace presence is the only
+// thing that makes one unusable. Caller must hold m.mu.
+func (m *Manager) reclaimUnusedSlotsLocked() int {
+	if time.Since(m.lastReclaim) < reclaimCooldown {
+		return 0
+	}
+
+	entries, err := os.ReadDir(netnsDir)
+	if err != nil && !os.IsNotExist(err) {
+		// Fail closed: an unreadable namespace directory means every index
+		// might still be occupied, and handing one out would collide.
+		m.log.Warn().Err(err).Msg("allocator: cannot list namespaces — skipping slot reclaim")
+		return 0
+	}
+	occupied := make(map[int]bool, len(entries))
+	for _, entry := range entries {
+		if idx, ok := slotFromNamespace(entry.Name()); ok {
+			occupied[idx] = true
+		}
+	}
+	// A host-side veth can outlive its namespace, and building over one fails
+	// at the move-to-host step. A failed build releases the index onto the top
+	// of the LIFO free list, so handing out such an index doesn't just waste a
+	// build — the next claim pops the same index and retries it forever,
+	// starving every other reclaimed slot. SweepStrayHostVeths is what clears
+	// them; until it does, they are not free.
+	// A host-side veth can outlive its namespace, and building over one fails
+	// at the move-to-host step. A failed build releases the index onto the top
+	// of the LIFO free list, so handing out such an index doesn't just waste a
+	// build — the next claim pops the same index and retries it forever,
+	// starving every other reclaimed slot. SweepStrayHostVeths is what clears
+	// them; until it does, they are not free.
+	veths, err := listHostVeths()
+	if err != nil {
+		m.log.Warn().Err(err).Msg("allocator: cannot list host veths — skipping slot reclaim")
+		return 0
+	}
+	for _, veth := range veths {
+		if idxStr, ok := strings.CutPrefix(veth, "veth-"); ok {
+			if idx, convErr := strconv.Atoi(idxStr); convErr == nil {
+				occupied[idx] = true
+			}
+		}
+	}
+	for _, idx := range m.freeSlots {
+		occupied[idx] = true
+	}
+	// Armed only now that both reads succeeded: a scan that bailed on a
+	// transient read has learned nothing, and must not silence the next one
+	// for the cooldown while the host may have capacity to hand out.
+	m.lastReclaim = time.Now()
+
+	limit := m.nextSlot - 1
+	if limit > MaxSlots {
+		limit = MaxSlots
+	}
+	reclaimed := 0
+	for idx := 1; idx <= limit; idx++ {
+		if occupied[idx] {
+			continue
+		}
+		if _, owned := m.slotOwner[idx]; owned {
+			continue
+		}
+		m.freeSlots = append(m.freeSlots, idx)
+		reclaimed++
+	}
+	if reclaimed > 0 {
+		m.log.Warn().Int("reclaimed", reclaimed).Int("namespaces", len(entries)).
+			Msg("allocator: slot range spent — reclaimed unused indexes")
+	}
+	return reclaimed
 }
 
 // SweepOrphanNamespaces removes host namespaces and veth interfaces
@@ -1314,7 +1439,7 @@ func pidsInNs(name string) (pids []int, ok bool) {
 
 // listHostVeths returns all veth-N interfaces visible in the host namespace.
 func listHostVeths() ([]string, error) {
-	entries, err := os.ReadDir("/sys/class/net")
+	entries, err := os.ReadDir(hostNetDir)
 	if err != nil {
 		return nil, err
 	}
@@ -1347,6 +1472,9 @@ func (m *Manager) UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []s
 
 // netnsDir is overridden by tests.
 var netnsDir = "/run/netns"
+
+// hostNetDir is where host-side interfaces appear; overridden by tests.
+var hostNetDir = "/sys/class/net"
 
 // NamespaceForPID returns the ns-N name of the network namespace that pid is
 // in, by matching /proc/<pid>/ns/net's inode against the named namespaces in
