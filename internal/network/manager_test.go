@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -312,6 +313,8 @@ func TestClaimSlotIndex_ConcurrentCeilingLoserStillGetsReclaimedSlot(t *testing.
 	m := newTestManager()
 	m.nextSlot = MaxSlots + 1 // fresh range spent; every index below is reclaimable
 
+	const waitBound = 10 * time.Second
+
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
@@ -331,18 +334,31 @@ func TestClaimSlotIndex_ConcurrentCeilingLoserStillGetsReclaimedSlot(t *testing.
 		errCh <- err
 	}()
 
-	<-entered // A is parked mid-scan, holding no lock
+	// A is parked mid-scan, holding no lock. Bounded so an unexpected path
+	// that never reaches the barrier fails fast instead of hanging the suite.
+	select {
+	case <-entered:
+	case <-time.After(waitBound):
+		close(release) // free A's goroutine (a no-op if it's not there) before failing
+		t.Fatal("timed out waiting for A to reach the scan barrier — claimSlotIndex took a path that never scans")
+	}
 
 	// B runs a full claim — including its own reclaim, which is free to merge
 	// since A hasn't reached the merge step yet — while A is still parked.
 	if _, err := m.claimSlotIndex("vm-b"); err != nil {
+		close(release)
 		t.Fatalf("claimSlotIndex (B) = %v, want a reclaimed index", err)
 	}
 
 	close(release) // let A proceed: its merge loses the cooldown race to B's
 
-	if err := <-errCh; err != nil {
-		t.Fatalf("claimSlotIndex (A) = %v, want a reclaimed index — A's own scan lost the cooldown race, but B had already refilled freeSlots", err)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("claimSlotIndex (A) = %v, want a reclaimed index — A's own scan lost the cooldown race, but B had already refilled freeSlots", err)
+		}
+	case <-time.After(waitBound):
+		t.Fatal("timed out waiting for claimSlotIndex (A) to return after release")
 	}
 }
 
