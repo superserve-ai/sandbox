@@ -1013,8 +1013,23 @@ func TestBackupPauseCapturesBaseIdentityComparableToDiskBasePath(t *testing.T) {
 	}
 	m.backupStaging = staging
 	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+	// backupPause hands the marker to a detached worker. Two races follow from
+	// that, and this test needs both closed: the worker keeps writing under
+	// staging (t.TempDir()'s cleanup then fails with "directory not empty"),
+	// and on completion it consumes the very marker asserted on below.
+	// Claiming the per-VM in-flight slot first parks the worker at its own
+	// busy guard — it heals the marker durably, then returns without
+	// consuming it — and rehashDone makes that return observable.
+	m.pendingInFlight.Store("vm-1", struct{}{})
+	rehashed := make(chan struct{})
+	m.rehashDone = func() { close(rehashed) }
 
 	m.backupPause(context.Background(), "vm-1", snap, disk, base, zerolog.Nop())
+	select {
+	case <-rehashed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("pending-backup worker did not finish")
+	}
 
 	pb, ok, err := st.GetPendingBackup("vm-1")
 	if err != nil {

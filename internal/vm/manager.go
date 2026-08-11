@@ -283,6 +283,11 @@ type Manager struct {
 	// unitDead overrides the systemd unit-dead probe in tests; nil means
 	// the real probe. See vmConfirmedAtRest.
 	unitDead func(ctx context.Context, vmID string) bool
+	// rehashDone, when set, is called as the detached pending-backup worker
+	// returns. The worker deliberately outlives backupPause, so a test whose
+	// staging tree is a t.TempDir() otherwise races its own cleanup against
+	// the worker's writes. Nil in production.
+	rehashDone func()
 	// pendingInFlight guards one pending-backup worker per VM across the
 	// startup recovery and the periodic sweep.
 	pendingInFlight sync.Map
