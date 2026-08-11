@@ -123,9 +123,28 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	// Any 2xx clears the outbox entry, including accepted-but-orphaned
 	// reports: only the control plane knows whether an owner row exists,
 	// and redelivering an unacceptable report forever helps nobody.
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("backup report rejected: %s: %s", resp.Status, string(msg))
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
 	}
-	return nil
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	// A permanent rejection can never succeed on retry, and the flush
+	// stops at the first failure, so returning an error here would wedge
+	// every later report on this host behind one poisoned entry forever.
+	// Drop it loudly instead: the generation stays durable in the bucket,
+	// only its coverage row is lost. Auth and pressure statuses stay
+	// retryable, since a rotated token or a throttled control plane would
+	// otherwise silently drain the whole outbox.
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden,
+		http.StatusRequestTimeout, http.StatusTooManyRequests:
+	default:
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			r.Log.Error().Str("generation", task.Generation).
+				Str("sandbox_id", task.SandboxID).Str("template_id", task.TemplateID).
+				Str("status", resp.Status).Str("response", string(msg)).
+				Msg("backup report permanently rejected; dropping its coverage row")
+			return nil
+		}
+	}
+	return fmt.Errorf("backup report rejected: %s: %s", resp.Status, string(msg))
 }

@@ -109,3 +109,25 @@ func TestBackupReporterUsesPinnedBucket(t *testing.T) {
 		t.Fatalf("completed_at = %v, want the pinned verification instant", gotBody.CompletedAt)
 	}
 }
+
+// A permanent rejection clears instead of erroring: the flush stops at
+// the first failure, so one report the control plane will never accept
+// must not wedge every later report behind it. Auth failures stay
+// retryable, since a rotated token would otherwise drain the outbox.
+func TestBackupReporterDropsPermanentRejections(t *testing.T) {
+	status := http.StatusBadRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+	}))
+	defer srv.Close()
+	r := &BackupReporter{ControlPlaneURL: srv.URL, HostID: "h", Token: "t", Bucket: "b", Log: zerolog.Nop()}
+	task := backup.Task{SandboxID: "sb", Generation: "g",
+		Files: []backup.TaskFile{{Name: "rootfs.ext4", SHA256: "aa", Size: 1}}}
+	if err := r.Deliver(task); err != nil {
+		t.Fatalf("Deliver on 400 = %v, want nil so the outbox clears", err)
+	}
+	status = http.StatusUnauthorized
+	if err := r.Deliver(task); err == nil {
+		t.Fatal("Deliver on 401 = nil, want error so a rotated token retries")
+	}
+}

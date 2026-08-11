@@ -17,10 +17,13 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-// maxBackupReportFiles bounds a report's manifest: a real generation
-// carries a handful of artifacts, and the endpoint must not accept an
-// unbounded jsonb payload.
-const maxBackupReportFiles = 32
+// maxBackupReportFiles bounds a report's manifest jsonb. Sandbox
+// generations carry a handful of files, but template builds ship every
+// regular artifact in the build's snapshot directory with no bound of
+// their own, so this must sit far above anything a real build produces;
+// a report rejected here is rejected forever and the reporter drops it
+// as poisoned, losing that generation's coverage row.
+const maxBackupReportFiles = 512
 
 var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
