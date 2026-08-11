@@ -100,6 +100,9 @@ jobs:
           # Staging validates the backup uploader first; the production
           # cells get their buckets after the staging soak.
           BACKUP_BUCKET: superserve-artifact-backup-staging-usc1
+          # Enables vmd's backup metrics exporter (host-local collector);
+          # the backup alert policies read these series.
+          OTEL_ENVIRONMENT: staging
         run: |
           python3 .github/workflows/scripts/deploy-vmd.py
 
@@ -157,6 +160,10 @@ jobs:
           SHA: ${{ github.sha }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           BACKUP_BUCKET: superserve-artifact-backup-use4
+          # Enables vmd's backup metrics exporter (host-local collector);
+          # the cell's backup alert policies, including backup-disabled,
+          # cannot fire without these series.
+          OTEL_ENVIRONMENT: production
           # use4 is the "use" cell's Supabase + control plane.
           CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_PROD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
@@ -202,6 +209,10 @@ jobs:
           # Enables the pause-backup uploader for the cell (validated on
           # staging first; the bucket is create-only for hosts).
           BACKUP_BUCKET: superserve-artifact-backup-usw2
+          # Enables vmd's backup metrics exporter (host-local collector);
+          # the cell's backup alert policies, including backup-disabled,
+          # cannot fire without these series.
+          OTEL_ENVIRONMENT: production
         run: |
           # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
           # filter and fan out to every VMD_LABEL match — which would push
