@@ -39,6 +39,18 @@ rate(db_pool_acquire_duration_seconds_total[5m]) / rate(db_pool_acquire_total[5m
 
 Do not add customer, user, sandbox, request, raw URL, or raw error-message labels to Phase 1 metrics. The collector config also defensively drops known high-cardinality internal labels, but application code should avoid emitting them in the first place.
 
+## VMD backup metrics
+
+`vmd` emits its own OTLP metric set for the backup pipeline under service name `sandbox-vmd`, using the same env contract (`OTEL_METRICS_ENABLED`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_ENVIRONMENT`, `OTEL_EXPORT_INTERVAL`) against the host-local collector:
+
+- `backup_enabled` gauge (1/0). Emitted whether or not `BACKUP_BUCKET` is set, so a host with backup silently disabled is visible as `0` rather than as missing data.
+- `backup_journal_pending` gauge labeled `priority` (`pause`, `checkpoint`, `best_effort`), `backup_oldest_pending_age_seconds` gauge.
+- `backup_upload_total` counter labeled `result` (`verified`, `deduped`, `abandoned`, `failed`), `backup_upload_bytes_total` counter.
+- `backup_hash_duration_seconds`, `backup_stage_duration_seconds`, `backup_upload_duration_seconds`, `backup_pause_hook_duration_seconds` histograms. The pause-hook histogram measures the synchronous backup time on the pause RPC path.
+- `backup_pending_markers`, `backup_outbox_pending` gauges, `backup_notify_failures_total` counter.
+
+Labels stay within the bounded vocabulary above plus `priority`; `host_id` comes from `HOST_ID` and identifies the cell. Alert policies over these metrics live in `infra/modules/observability/backup-alerts.tf`.
+
 ## Phase 2 collector
 
 Use [collector-gmp.yaml](/home/lando/superserve-ai/sandbox/deploy/otel/collector-gmp.yaml) for staging and later production rollout. It:

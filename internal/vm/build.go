@@ -251,7 +251,9 @@ func (m *Manager) backupBuildArtifacts(ctx context.Context, templateID, buildVMI
 	if m.backupEnqueue == nil {
 		return
 	}
+	hashStart := time.Now()
 	entries, complete := collectBuildManifest(ctx, snapshotDir, []string{basePath}, log)
+	m.backupMetrics.RecordHashDuration(ctx, time.Since(hashStart))
 	if len(entries) == 0 {
 		log.Warn().Str("dir", snapshotDir).
 			Msg("build manifest hashed no artifacts; build not enqueued for backup")
