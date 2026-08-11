@@ -115,6 +115,9 @@ BUNDLE_FILES = [
     "deploy/sandboxes.slice",
     "deploy/needrestart-superserve.conf",
     "deploy/apt-no-auto-upgrades.conf",
+    "deploy/maintenance-watch.sh",
+    "deploy/superserve-maintenance-watch.service",
+    "deploy/superserve-maintenance-watch.timer",
     "scripts/fc-cleanup",
 ]
 
@@ -156,6 +159,9 @@ def main() -> int:
     q_dat_line = shlex.quote(f"DAEMON_AUTH_TOKEN={internal_api_token}")
     q_db = shlex.quote(database_url)
     q_db_line = shlex.quote(f"DATABASE_URL={database_url}")
+    maintenance_webhook = os.environ.get("MAINTENANCE_ALERT_WEBHOOK", "")
+    q_webhook = shlex.quote(maintenance_webhook)
+    q_webhook_line = shlex.quote(f"MAINTENANCE_ALERT_WEBHOOK={maintenance_webhook}")
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
@@ -277,6 +283,21 @@ def main() -> int:
             sudo install -m 0644 {extract_dir}/deploy/firecracker@.service /etc/systemd/system/firecracker@.service
             sudo install -m 0644 {extract_dir}/deploy/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
             sudo install -m 0644 {extract_dir}/deploy/sandboxes.slice /etc/systemd/system/sandboxes.slice
+            # Upsert the maintenance-watch webhook into its own env file so the
+            # watcher never sources vmd's tokens. Empty = skip: the watcher
+            # still runs and logs notices to the journal, it just can't page.
+            # Written BEFORE the timer is enabled below: an elapsed OnBootSec
+            # fires the watcher the moment `enable --now` runs.
+            if [ -n {q_webhook} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/maintenance-watch.env
+                sudo chmod 0600 /etc/sandbox/maintenance-watch.env
+                sudo sed -i '/^MAINTENANCE_ALERT_WEBHOOK=/d' /etc/sandbox/maintenance-watch.env
+                echo {q_webhook_line} | sudo tee -a /etc/sandbox/maintenance-watch.env > /dev/null
+            fi
+            sudo install -m 0755 {extract_dir}/deploy/maintenance-watch.sh {install_dir}/maintenance-watch
+            sudo install -m 0644 {extract_dir}/deploy/superserve-maintenance-watch.service /etc/systemd/system/superserve-maintenance-watch.service
+            sudo install -m 0644 {extract_dir}/deploy/superserve-maintenance-watch.timer /etc/systemd/system/superserve-maintenance-watch.timer
             sudo install -m 0644 {extract_dir}/deploy/superserve-vms.service /etc/systemd/system/superserve-vms.service
             # Host-resident rollback guard: survives deploys of older revisions
             # (their scripts predate the drain gate above and never remove
@@ -287,6 +308,7 @@ def main() -> int:
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-rollback-guard.conf /etc/systemd/system/superserve-vmd.service.d/10-rollback-guard.conf
             sudo systemctl daemon-reload
             sudo systemctl enable --quiet superserve-vmd.socket
+            sudo systemctl enable --now --quiet superserve-maintenance-watch.timer
             # Delegated cgroup subtree for direct-spawn VMs. Enable for boot, but
             # START only when the delegated root has no child cgroups yet (fresh /
             # first deploy). Once vmd has bootstrapped it, the root is an inner

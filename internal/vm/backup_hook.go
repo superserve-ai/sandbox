@@ -190,6 +190,9 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 // Terminal outcomes clear the pending record; only transient failures
 // keep it for the sweep.
 func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) {
+	if m.rehashDone != nil {
+		defer m.rehashDone()
+	}
 	// One worker per VM: the periodic sweep and startup recovery may both
 	// find the same record while a worker is mid-hash, and a second
 	// concurrent hash of the same multi-GB artifacts buys nothing (the
