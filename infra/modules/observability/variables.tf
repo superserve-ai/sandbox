@@ -113,8 +113,9 @@ variable "backup_alerts" {
     # standing entries means completion write-back is stalled.
     outbox_stalled_duration = optional(string, "3600s")
     # Fire when the host reports backup_enabled=0 (BACKUP_BUCKET unset).
-    # On in production, where a silently disabled host once ran for a
-    # day; staging may disable backup deliberately.
+    # On in production, where a host without backup accrues unmet
+    # durability with no other signal; staging may disable backup
+    # deliberately.
     alert_disabled_host = optional(bool, true)
   })
   default = null

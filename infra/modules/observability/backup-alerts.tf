@@ -67,7 +67,10 @@ locals {
       # The notification outbox drains on every ack and on idle ticks
       # (seconds end to end), so entries standing for an hour mean
       # completion signals are not reaching downstream bookkeeping and
-      # staging GC is pinned.
+      # staging GC is pinned. Until a notification consumer is wired
+      # onto the uploader (its own change), the gauge sits at zero and
+      # this policy is armed but structurally quiet; it cannot false
+      # positive, only wake once a consumer exists.
       query         = "min(backup_outbox_pending{${local.backup_host_matcher}}) > 0"
       duration      = var.backup_alerts.outbox_stalled_duration
       documentation = <<-EOT
