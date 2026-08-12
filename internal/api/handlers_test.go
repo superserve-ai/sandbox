@@ -2450,13 +2450,17 @@ func TestCreateSandbox_TransientVMDErrorCancelsPendingInsert(t *testing.T) {
 			if code := errorCode(parseJSON(t, w)); code != "service_unavailable" {
 				t.Fatalf("error code = %q, want service_unavailable", code)
 			}
-			if !destroyed.Load() {
-				t.Fatal("VM was not torn down after transient VMD failure")
-			}
 			select {
 			case <-insertCanceled:
 			default:
 				t.Fatal("detached insert was not canceled after VMD failure")
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && !destroyed.Load() {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if !destroyed.Load() {
+				t.Fatal("VM was not torn down after transient VMD failure")
 			}
 		})
 	}
@@ -2582,6 +2586,10 @@ func TestCreateSandbox_PermanentVMDFailureReturnsInternalWithoutWaitingForCleanu
 	case <-insertCanceled:
 	default:
 		t.Fatal("detached insert was not canceled after permanent VMD failure")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !destroyed.Load() {
+		time.Sleep(10 * time.Millisecond)
 	}
 	if !destroyed.Load() {
 		t.Fatal("VM was not torn down after permanent VMD failure")
@@ -2863,6 +2871,10 @@ func TestCreateSandbox_VMDTransientFailureWithoutReconciliationReturnsInternal(t
 	}
 	if code := errorCode(parseJSON(t, w)); code != "internal_error" {
 		t.Fatalf("error code = %q, want internal_error", code)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !destroyed.Load() {
+		time.Sleep(10 * time.Millisecond)
 	}
 	if !destroyed.Load() {
 		t.Fatal("VM was not torn down after VMD failure")
