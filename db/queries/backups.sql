@@ -50,7 +50,7 @@ LIMIT 1;
 -- along because 'pausing' marks a finalize that has not committed yet:
 -- a fast upload's report arriving in that window must retry rather than
 -- silently miss its size sync.
-SELECT id, status FROM sandbox WHERE id = $1 FOR UPDATE;
+SELECT id, status, updated_at FROM sandbox WHERE id = $1 FOR UPDATE;
 
 -- name: LatestSnapshotVMState :one
 -- The sandbox's newest snapshot row and the vmstate digest its pause-time

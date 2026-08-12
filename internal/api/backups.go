@@ -188,7 +188,13 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		// the whole transaction back as retryable instead; redelivery
 		// re-records coverage idempotently and the sync lands once the
 		// finalize has committed.
-		if row.Status == "pausing" {
+		// Time-bounded: a finalize that failed permanently leaves the
+		// sandbox stranded in 'pausing' with no retry scheduled, and an
+		// unconditional 503 would head-of-line-block the host's outbox
+		// forever. A fresh 'pausing' retries; a stale one proceeds, and
+		// the vmstate match below skips the sync exactly as for any
+		// other settled mismatch.
+		if row.Status == "pausing" && time.Since(row.UpdatedAt) < 10*time.Minute {
 			return errFinalizeInFlight
 		}
 		snap, err := q.LatestSnapshotVMState(ctx, sandboxID)

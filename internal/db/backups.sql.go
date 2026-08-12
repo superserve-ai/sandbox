@@ -73,12 +73,13 @@ func (q *Queries) LatestSnapshotVMState(ctx context.Context, sandboxID uuid.UUID
 }
 
 const lockSandboxRow = `-- name: LockSandboxRow :one
-SELECT id, status FROM sandbox WHERE id = $1 FOR UPDATE
+SELECT id, status, updated_at FROM sandbox WHERE id = $1 FOR UPDATE
 `
 
 type LockSandboxRowRow struct {
-	ID     uuid.UUID     `json:"id"`
-	Status SandboxStatus `json:"status"`
+	ID        uuid.UUID     `json:"id"`
+	Status    SandboxStatus `json:"status"`
+	UpdatedAt time.Time     `json:"updated_at"`
 }
 
 // Serializes the backup report's snapshot-size sync against FinalizePause,
@@ -90,7 +91,7 @@ type LockSandboxRowRow struct {
 func (q *Queries) LockSandboxRow(ctx context.Context, id uuid.UUID) (LockSandboxRowRow, error) {
 	row := q.db.QueryRow(ctx, lockSandboxRow, id)
 	var i LockSandboxRowRow
-	err := row.Scan(&i.ID, &i.Status)
+	err := row.Scan(&i.ID, &i.Status, &i.UpdatedAt)
 	return i, err
 }
 

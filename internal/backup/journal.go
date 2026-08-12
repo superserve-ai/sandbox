@@ -769,40 +769,53 @@ func (j *Journal) PendingNotifications(limit int) ([]Task, error) {
 }
 
 // SeedOutboxFromCompletions backfills the notification outbox from the
-// durable completions record, once per scope. Completions acked before
-// reporter wiring existed have no outbox entry, Covered suppresses their
-// re-enqueue, and their sandboxes may never pause again, so without this
-// seed every pre-rollout generation would stay permanently absent from
-// control-plane coverage. Seeded tasks carry owner, generation, pinned
-// bucket, and the recorded ack instant but no file manifest (the task
-// row is long gone); consumers deliver them as coverage-only reports,
-// and the bucket's manifest object remains the file-set authority.
-// Marker-guarded: runs to completion exactly once per scope.
+// durable completions record. Completions acked without outbox entries
+// (pre-wiring history, or a rollback window running an older uploader)
+// have no other path to control-plane coverage: Covered suppresses
+// their re-enqueue and their sandboxes may never pause again. The
+// marker is a high-water mark of the newest completion ack instant
+// processed, not a once-ever flag: each boot seeds only completions
+// acked after it, so a rollback window's acks are caught by the next
+// upgrade, while already-delivered older completions are never
+// re-seeded. Completions acked normally since the previous boot re-seed
+// once and deliver as idempotent no-ops, a bounded redundancy. Seeded
+// tasks carry owner, generation, pinned bucket, and the recorded ack
+// instant but no file manifest (the task row is long gone); the
+// bucket's manifest object remains the file-set authority. Existing
+// outbox entries are never overwritten.
 func (j *Journal) SeedOutboxFromCompletions(scope string) error {
 	marker := []byte("\x00completions_seeded\x00" + scope)
 	return j.db.Update(func(tx *bolt.Tx) error {
 		ob := tx.Bucket(outboxBucket)
-		if ob.Get(marker) != nil {
-			return nil
+		var seededThrough int64
+		if v := ob.Get(marker); v != nil {
+			_, _ = fmt.Sscanf(string(v), "%d", &seededThrough)
 		}
+		maxSeen := seededThrough
 		prefix := []byte(scope + "\x00")
 		c := tx.Bucket(completionsBucket).Cursor()
 		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			var ns int64
+			if _, err := fmt.Sscanf(string(v), "%d", &ns); err != nil {
+				continue
+			}
+			if ns <= seededThrough {
+				continue
+			}
+			if ns > maxSeen {
+				maxSeen = ns
+			}
 			rest := string(k[len(prefix):])
 			i := strings.LastIndexByte(rest, 0)
 			if i < 0 {
 				continue
 			}
 			owner, gen := rest[:i], rest[i+1:]
-			t := Task{Generation: gen, VerifiedBucket: scope}
+			t := Task{Generation: gen, VerifiedBucket: scope, VerifiedAt: time.Unix(0, ns).UTC()}
 			if sep := strings.IndexByte(owner, 0); sep >= 0 {
 				t.TemplateID, t.BuildID = owner[:sep], owner[sep+1:]
 			} else {
 				t.SandboxID = owner
-			}
-			var ns int64
-			if _, err := fmt.Sscanf(string(v), "%d", &ns); err == nil {
-				t.VerifiedAt = time.Unix(0, ns).UTC()
 			}
 			key := completionKey(scope, t)
 			if ob.Get(key) != nil {
@@ -818,7 +831,7 @@ func (j *Journal) SeedOutboxFromCompletions(scope string) error {
 				return err
 			}
 		}
-		return ob.Put(marker, []byte("1"))
+		return ob.Put(marker, []byte(fmt.Sprintf("%d", maxSeen)))
 	})
 }
 

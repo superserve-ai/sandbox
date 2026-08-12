@@ -2466,7 +2466,8 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 		}
 	}
 
-	// Idempotent: delivery clears, and a second seed resurrects nothing.
+	// Delivery clears, and a second seed resurrects nothing already
+	// processed (the high-water mark advanced past those acks).
 	for _, p := range pending {
 		if err := j.ClearNotification(p); err != nil {
 			t.Fatal(err)
@@ -2477,6 +2478,24 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 	}
 	if rest, _ := j.PendingNotifications(0); len(rest) != 0 {
 		t.Fatalf("second seed resurrected %d entries, want 0", len(rest))
+	}
+
+	// A completion acked AFTER the last seed (a rollback window running
+	// an older uploader, whose acks bank nothing) is caught by the next
+	// seed instead of being suppressed forever.
+	late := Task{SandboxID: "sb-late", Generation: "gen-late", EnqueuedAt: time.Unix(9, 0)}
+	if err := j.Enqueue(late); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(late, "bucket-a", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
+		t.Fatal(err)
+	}
+	caught, err := j.PendingNotifications(0)
+	if err != nil || len(caught) != 1 || caught[0].SandboxID != "sb-late" {
+		t.Fatalf("post-rollback seed = %+v (err %v), want the late completion", caught, err)
 	}
 }
 
