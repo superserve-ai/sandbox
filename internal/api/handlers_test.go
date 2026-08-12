@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -249,9 +250,10 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[21].(*int32) = s.DiskMib
 		*dest[22].(**int32) = s.AutoDeleteSeconds
 		*dest[23].(*pgtype.Timestamptz) = s.AutoDeleteAt
-		if len(dest) == 25 {
+		*dest[24].(*pgtype.Timestamptz) = s.FailedAt
+		if len(dest) == 26 {
 			// GetSandboxWithPreviewPolicy: trailing COALESCE'd effective access.
-			*dest[24].(*string) = "legacy_public"
+			*dest[25].(*string) = "legacy_public"
 		}
 		return nil
 	}}
@@ -2390,6 +2392,493 @@ func TestCreateSandbox_QuotaExceeded(t *testing.T) {
 	}
 	if !destroyCalled {
 		t.Error("orphan VM was not destroyed after quota rejection")
+	}
+}
+
+func TestCreateSandbox_TransientVMDErrorCancelsPendingInsert(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "deadline exceeded", err: status.Error(codes.DeadlineExceeded, "context deadline exceeded")},
+		{name: "unavailable", err: status.Error(codes.Unavailable, "connection refused")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			teamID := uuid.New()
+			insertCanceled := make(chan struct{})
+			var destroyed atomic.Bool
+			vmd := &stubVMD{
+				restoreFn: func(context.Context, string, string, string) (string, error) {
+					return "", tt.err
+				},
+				destroyFn: func(context.Context, string, bool) error {
+					destroyed.Store(true)
+					return nil
+				},
+			}
+
+			mock := &mockDBTX{
+				queryRowFn: func(ctx context.Context, sql string, _ ...any) pgx.Row {
+					if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+						return previewCapableHostRow()
+					}
+					if strings.Contains(sql, "-- name: GetSandbox :one") {
+						return errorRow(pgx.ErrNoRows)
+					}
+					if strings.Contains(sql, "INSERT INTO sandbox") {
+						return &mockRow{scanFn: func(dest ...any) error {
+							<-ctx.Done()
+							close(insertCanceled)
+							return ctx.Err()
+						}}
+					}
+					if strings.Contains(sql, "FROM template") {
+						return templateRow(defaultReadyTemplate())
+					}
+					return activityRow()
+				},
+			}
+
+			h := &Handlers{VMD: vmd, DB: db.New(mock)}
+			w := httptest.NewRecorder()
+			setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503; body: %s", w.Code, w.Body.String())
+			}
+			if code := errorCode(parseJSON(t, w)); code != "service_unavailable" {
+				t.Fatalf("error code = %q, want service_unavailable", code)
+			}
+			select {
+			case <-insertCanceled:
+			default:
+				t.Fatal("detached insert was not canceled after VMD failure")
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && !destroyed.Load() {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if !destroyed.Load() {
+				t.Fatal("VM was not torn down after transient VMD failure")
+			}
+		})
+	}
+}
+
+func TestCreateSandbox_VMDFileMissingReturnsHostStateMissingEvenIfInsertCancels(t *testing.T) {
+	teamID := uuid.New()
+	insertCanceled := make(chan struct{})
+	vmd := &stubVMD{
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			return "", status.Error(codes.FailedPrecondition, "snapshot missing")
+		},
+		destroyFn: func(context.Context, string, bool) error { return nil },
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(ctx context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+				return previewCapableHostRow()
+			}
+			if strings.Contains(sql, "-- name: GetSandbox :one") {
+				return errorRow(pgx.ErrNoRows)
+			}
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return &mockRow{scanFn: func(dest ...any) error {
+					<-ctx.Done()
+					close(insertCanceled)
+					return ctx.Err()
+				}}
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body: %s", w.Code, w.Body.String())
+	}
+	if code := errorCode(parseJSON(t, w)); code != "host_state_missing" {
+		t.Fatalf("error code = %q, want host_state_missing", code)
+	}
+	select {
+	case <-insertCanceled:
+	default:
+		t.Fatal("detached insert was not canceled after file-missing VMD failure")
+	}
+}
+
+func TestCreateSandbox_PermanentVMDFailureReturnsInternalWithoutWaitingForCleanup(t *testing.T) {
+	teamID := uuid.New()
+	insertCanceled := make(chan struct{})
+	destroyStarted := make(chan struct{})
+	destroyRelease := make(chan struct{})
+	var destroyed atomic.Bool
+	vmd := &stubVMD{
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			return "", status.Error(codes.InvalidArgument, "bad restore request")
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			destroyed.Store(true)
+			close(destroyStarted)
+			<-destroyRelease
+			return nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(ctx context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+				return previewCapableHostRow()
+			}
+			if strings.Contains(sql, "-- name: GetSandbox :one") {
+				return errorRow(pgx.ErrNoRows)
+			}
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return &mockRow{scanFn: func(dest ...any) error {
+					<-ctx.Done()
+					close(insertCanceled)
+					return ctx.Err()
+				}}
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("request waited on cleanup after permanent VMD failure")
+	}
+
+	select {
+	case <-destroyStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup did not start after permanent VMD failure")
+	}
+	close(destroyRelease)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body: %s", w.Code, w.Body.String())
+	}
+	if code := errorCode(parseJSON(t, w)); code != "internal_error" {
+		t.Fatalf("error code = %q, want internal_error", code)
+	}
+	select {
+	case <-insertCanceled:
+	default:
+		t.Fatal("detached insert was not canceled after permanent VMD failure")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !destroyed.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !destroyed.Load() {
+		t.Fatal("VM was not torn down after permanent VMD failure")
+	}
+}
+
+func TestCreateSandbox_TransientDBErrorReturnsRetryableFailure(t *testing.T) {
+	teamID := uuid.New()
+	insertFailed := make(chan struct{})
+	lookupStarted := make(chan struct{})
+	markStarted := make(chan struct{})
+	markRelease := make(chan struct{})
+	done := make(chan struct{})
+	sandboxID := uuid.New()
+	var destroyed atomic.Bool
+	vmd := &stubVMD{
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			<-insertFailed
+			return "10.0.0.9", nil
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			destroyed.Store(true)
+			return nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+				return previewCapableHostRow()
+			}
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				close(insertFailed)
+				return errorRow(&pgconn.PgError{Code: "57P03", Message: "the database system is starting up"})
+			}
+			if strings.Contains(sql, "-- name: GetSandbox :one") {
+				close(lookupStarted)
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "sb",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
+					CreatedAt: time.Now(),
+				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "UPDATE sandbox\n  SET status = 'failed'") || strings.Contains(sql, "UPDATE sandbox\nSET status = 'failed'") {
+				<-lookupStarted
+				close(markStarted)
+				<-markRelease
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	go func() {
+		setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+		close(done)
+	}()
+
+	select {
+	case <-lookupStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("transient insert failure did not verify sandbox existence before marking failed")
+	}
+
+	select {
+	case <-markStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("failed-state write was not scheduled after transient DB failure")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("request waited on the failed-state write instead of returning 503")
+	}
+
+	close(markRelease)
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("request did not finish after releasing the failed-state write")
+	}
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body: %s", w.Code, w.Body.String())
+	}
+	if code := errorCode(parseJSON(t, w)); code != "service_unavailable" {
+		t.Fatalf("error code = %q, want service_unavailable", code)
+	}
+	if !destroyed.Load() {
+		t.Fatal("orphan VM was not destroyed after transient DB failure")
+	}
+}
+
+func TestCreateSandbox_TransientDBErrorSkipsMissingRowReconcile(t *testing.T) {
+	teamID := uuid.New()
+	insertFailed := make(chan struct{})
+	var lookupCalls atomic.Int32
+	var destroyed atomic.Bool
+	var markCalls atomic.Int32
+	vmd := &stubVMD{
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			<-insertFailed
+			return "10.0.0.9", nil
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			destroyed.Store(true)
+			return nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+				return previewCapableHostRow()
+			}
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				close(insertFailed)
+				return errorRow(&pgconn.PgError{Code: "57P03", Message: "the database system is starting up"})
+			}
+			if strings.Contains(sql, "-- name: GetSandbox :one") {
+				lookupCalls.Add(1)
+				return errorRow(pgx.ErrNoRows)
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "UPDATE sandbox\n  SET status = 'failed'") || strings.Contains(sql, "UPDATE sandbox\nSET status = 'failed'") {
+				markCalls.Add(1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body: %s", w.Code, w.Body.String())
+	}
+	if code := errorCode(parseJSON(t, w)); code != "service_unavailable" {
+		t.Fatalf("error code = %q, want service_unavailable", code)
+	}
+	if !destroyed.Load() {
+		t.Fatal("orphan VM was not destroyed after transient DB failure")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && lookupCalls.Load() < 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := lookupCalls.Load(); got < 2 {
+		t.Fatalf("GetSandbox calls = %d, want repeated absent-row verification", got)
+	}
+	if got := markCalls.Load(); got != 0 {
+		t.Fatalf("failed-state write calls = %d, want no-op when sandbox row is absent", got)
+	}
+}
+
+func TestCreateSandbox_VMDTransientFailureRetriesFailedStateWrite(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+	var destroyed atomic.Bool
+	var markCalls atomic.Int32
+	vmd := &stubVMD{
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			return "", status.Error(codes.Unavailable, "connection refused")
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			destroyed.Store(true)
+			return nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return previewCapableHostRow()
+			case strings.Contains(sql, "INSERT INTO sandbox"):
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "sb",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
+					CreatedAt: time.Now(),
+				})
+			case strings.Contains(sql, "FROM template"):
+				return templateRow(defaultReadyTemplate())
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "UPDATE sandbox\n  SET status = 'failed'") || strings.Contains(sql, "UPDATE sandbox\nSET status = 'failed'") {
+				if markCalls.Add(1) == 1 {
+					return pgconn.CommandTag{}, &pgconn.PgError{Code: "57P01", Message: "the database system is shutting down"}
+				}
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body: %s", w.Code, w.Body.String())
+	}
+	if code := errorCode(parseJSON(t, w)); code != "service_unavailable" {
+		t.Fatalf("error code = %q, want service_unavailable", code)
+	}
+	if !destroyed.Load() {
+		t.Fatal("VM was not torn down after VMD failure")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && markCalls.Load() < 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := markCalls.Load(); got < 2 {
+		t.Fatalf("failed-state write calls = %d, want retry after transient DB error", got)
+	}
+}
+
+func TestCreateSandbox_VMDTransientFailureWithoutReconciliationReturnsInternal(t *testing.T) {
+	teamID := uuid.New()
+	var destroyed atomic.Bool
+	vmd := &stubVMD{
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			return "", status.Error(codes.Unavailable, "connection refused")
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			destroyed.Store(true)
+			return nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return previewCapableHostRow()
+			case strings.Contains(sql, "INSERT INTO sandbox"):
+				return sandboxRow(db.Sandbox{
+					ID: uuid.New(), TeamID: teamID, Name: "sb",
+					Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 256,
+					CreatedAt: time.Now(),
+				})
+			case strings.Contains(sql, "FROM template"):
+				return templateRow(defaultReadyTemplate())
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "UPDATE sandbox\n  SET status = 'failed'") || strings.Contains(sql, "UPDATE sandbox\nSET status = 'failed'") {
+				return pgconn.CommandTag{}, errors.New("mark failed unavailable")
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body: %s", w.Code, w.Body.String())
+	}
+	if code := errorCode(parseJSON(t, w)); code != "internal_error" {
+		t.Fatalf("error code = %q, want internal_error", code)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !destroyed.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !destroyed.Load() {
+		t.Fatal("VM was not torn down after VMD failure")
 	}
 }
 

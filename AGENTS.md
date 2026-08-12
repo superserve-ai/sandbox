@@ -28,3 +28,16 @@ repository, upstream project issues, and public documentation.
   does, and not review-time justifications.
 - Test fixtures use invented data only: generated UUIDs, neutral names,
   RFC-reserved IPs and example domains.
+
+## Sandbox lifecycle performance
+
+Sandbox startup and resume latency are critical product paths.
+
+When changing code involved in sandbox creation, startup, restore, resume, reattach, pause/unpause, or related lifecycle transitions:
+
+- Keep new I/O, network calls, database access, hashing, compression, serialization, logging, metrics emission, retries, and other potentially blocking work out of the synchronous startup/resume hot path whenever possible.
+- Prefer asynchronous, deferred, precomputed, cached, or background work when correctness allows.
+- Do not add loops over fleet-, artifact-, filesystem-, or user-sized collections to the hot path without demonstrating that the bound is small and stable.
+- Do not add telemetry whose cost or volume scales per item on the hot path.
+- If synchronous work is unavoidable, explicitly explain why it must be synchronous and assess its latency impact.
+- Preserve existing startup/resume latency instrumentation and add measurement when introducing a new meaningful latency component.
