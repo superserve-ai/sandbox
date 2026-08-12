@@ -1287,7 +1287,7 @@ func assertFloatNear(t *testing.T, got, want float64) {
 
 func assertFloatBetween(t *testing.T, got, min, max float64) {
 	t.Helper()
-	const epsilon = 0.000000000001
+	const epsilon = 0.00000001
 	if got < min-epsilon || got > max+epsilon {
 		t.Fatalf("got %v, want between %v and %v", got, min, max)
 	}

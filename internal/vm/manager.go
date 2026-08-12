@@ -1709,11 +1709,12 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// exec-503 incidents.
 	probeStart := time.Now()
 	vmIP := inst.IP
+	probe := boxdHealthProbe
 	go func() {
 		defer sentrylog.Recover("resume-boxd-probe")
 		probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := m.waitForBoxd(probeCtx, vmIP, 30*time.Second); err != nil {
+		if err := probe(probeCtx, vmIP, 30*time.Second); err != nil {
 			log.Warn().Err(err).
 				Int64("wait_boxd_ms", time.Since(probeStart).Milliseconds()).
 				Msg("boxd not reachable after resume")
