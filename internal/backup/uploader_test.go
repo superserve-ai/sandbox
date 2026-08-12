@@ -2373,3 +2373,54 @@ func TestOutboxKeepsPerBucketNotifications(t *testing.T) {
 		t.Fatal("clear removed the wrong bucket's entry")
 	}
 }
+
+// Across the key-format upgrade, a legacy unscoped entry and a scoped
+// entry for the same owner/generation can coexist. Clearing one shape
+// must not discard the other's undelivered signal.
+func TestClearNotificationLeavesOtherKeyShape(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	// Legacy entry: written under the unscoped key with no pinned bucket,
+	// as the pre-upgrade code did.
+	legacy := task
+	legacyVal, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(outboxBucket).Put(task.indexKey(), legacyVal)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Scoped entry from the current code.
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(task, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := j.PendingNotifications()
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("outbox = %d entries (err %v), want both shapes", len(pending), err)
+	}
+	var scoped Task
+	for _, p := range pending {
+		if p.VerifiedBucket != "" {
+			scoped = p
+		}
+	}
+	if err := j.ClearNotification(scoped); err != nil {
+		t.Fatal(err)
+	}
+	rest, err := j.PendingNotifications()
+	if err != nil || len(rest) != 1 || rest[0].VerifiedBucket != "" {
+		t.Fatalf("after scoped clear = %+v (err %v), want the legacy entry retained", rest, err)
+	}
+	if err := j.ClearNotification(rest[0]); err != nil {
+		t.Fatal(err)
+	}
+	if final, _ := j.PendingNotifications(); len(final) != 0 {
+		t.Fatalf("after legacy clear = %d entries, want empty", len(final))
+	}
+}

@@ -755,15 +755,16 @@ func (j *Journal) PendingNotifications() ([]Task, error) {
 // ClearNotification confirms delivery of a task's completion signal.
 func (j *Journal) ClearNotification(task Task) error {
 	return j.db.Update(func(tx *bolt.Tx) error {
-		// Scoped by the entry's own pinned bucket, mirroring the ack-time
-		// key. The unscoped delete clears entries written before the key
-		// carried the bucket; for those, VerifiedBucket is empty and the
-		// scoped delete is a no-op, so exactly one shape matches either
-		// way.
+		// Each entry is deleted under exactly the key shape it was
+		// written with: entries from before the key carried the bucket
+		// have no pinned VerifiedBucket and live under the unscoped key,
+		// everything since lives under the scoped one. Deleting only the
+		// cleared entry's own shape means a still-undelivered legacy
+		// entry survives a scoped clear for the same owner/generation.
 		b := tx.Bucket(outboxBucket)
-		if err := b.Delete(completionKey(task.VerifiedBucket, task)); err != nil {
-			return err
+		if task.VerifiedBucket == "" {
+			return b.Delete(task.indexKey())
 		}
-		return b.Delete(task.indexKey())
+		return b.Delete(completionKey(task.VerifiedBucket, task))
 	})
 }
