@@ -65,31 +65,10 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		cfg.ExportInterval = 15 * time.Second
 	}
 
-	exporterOpts := []otlpmetrichttp.Option{otlpmetrichttp.WithEndpointURL(cfg.Endpoint)}
-	if cfg.Insecure || strings.HasPrefix(cfg.Endpoint, "http://") {
-		exporterOpts = append(exporterOpts, otlpmetrichttp.WithInsecure())
-	}
-	exporter, err := otlpmetrichttp.New(ctx, exporterOpts...)
+	provider, err := newOTLPMeterProvider(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("create otlp metric exporter: %w", err)
+		return nil, err
 	}
-
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes("",
-			attribute.String("service.name", cfg.ServiceName),
-			attribute.String("service.version", cfg.ServiceVersion),
-			attribute.String("environment", cfg.Environment),
-		),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create otel resource: %w", err)
-	}
-
-	provider := sdkmetric.NewMeterProvider(
-		sdkmetric.WithResource(res),
-		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(cfg.ExportInterval))),
-	)
 	meter := provider.Meter(instrumentationName)
 
 	r := &OTelRecorder{
@@ -266,4 +245,35 @@ func safeHostID(v string) string {
 		return "unknown"
 	}
 	return v
+}
+
+// newOTLPMeterProvider builds the OTLP/HTTP exporter, resource, and
+// periodic-reader meter provider shared by every recorder in this
+// package. cfg must already have its defaults applied.
+func newOTLPMeterProvider(ctx context.Context, cfg OTelConfig) (*sdkmetric.MeterProvider, error) {
+	exporterOpts := []otlpmetrichttp.Option{otlpmetrichttp.WithEndpointURL(cfg.Endpoint)}
+	if cfg.Insecure || strings.HasPrefix(cfg.Endpoint, "http://") {
+		exporterOpts = append(exporterOpts, otlpmetrichttp.WithInsecure())
+	}
+	exporter, err := otlpmetrichttp.New(ctx, exporterOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("create otlp metric exporter: %w", err)
+	}
+
+	res, err := resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes("",
+			attribute.String("service.name", cfg.ServiceName),
+			attribute.String("service.version", cfg.ServiceVersion),
+			attribute.String("environment", cfg.Environment),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create otel resource: %w", err)
+	}
+
+	return sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(res),
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(cfg.ExportInterval))),
+	), nil
 }

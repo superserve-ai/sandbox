@@ -30,6 +30,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/shellquote"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
@@ -303,6 +304,9 @@ type Manager struct {
 	// already pending or completed; nil means never covered. See
 	// SetBackupCovered.
 	backupCovered func(backup.Task) (bool, error)
+	// backupMetrics optionally observes backup hook timings; nil (metrics
+	// disabled) is safe at every call site. See SetBackupMetrics.
+	backupMetrics *telemetry.BackupRecorder
 	// adoptedBuildBackups guards backup reconciliation of completed
 	// builds adopted from disk: one IN-FLIGHT reconcile per build id.
 	// Cross-process and cross-attempt dedupe is the journal's job (owner

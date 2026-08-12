@@ -153,6 +153,8 @@ locals {
     notification_channel_ids      = var.notification_channel_ids
     compute_instance_cpu_alerts   = var.compute_instance_cpu_alerts
     host_maintenance_event_alerts = var.host_maintenance_event_alerts
+    backup_alerts                 = var.backup_alerts
+    host_disk_alerts              = var.host_disk_alerts
     log_buckets                   = var.log_buckets
     uptime_checks                 = var.uptime_checks
     alert_policies                = var.alert_policies

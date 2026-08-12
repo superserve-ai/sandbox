@@ -20,6 +20,17 @@ Env vars:
                        into vmd.env when set; empty = skip, leaving the
                        host's backup uploader disabled. Staged rollout:
                        staging first, production after the staging soak.
+  OTEL_ENVIRONMENT     optional — enables vmd's OTLP backup-metrics exporter
+                       by upserting OTEL_METRICS_ENABLED=true and this value
+                       as OTEL_ENVIRONMENT into vmd.env. Empty = skip,
+                       leaving the host's existing setting alone. The
+                       endpoint stays vmd's compiled default
+                       (http://localhost:4318, the host-local collector), so
+                       only the enable flag and environment ship. The backup
+                       alert policies key on these series, including the
+                       backup-disabled alert, which cannot fire on absent
+                       data — so metrics must be on wherever those alerts
+                       are instantiated.
   CONTROL_PLANE_URL    optional — control-plane base URL (e.g.
                        https://api.superserve.ai). Upserted into vmd.env when
                        set. vmd reads it via os.Getenv("CONTROL_PLANE_URL").
@@ -120,6 +131,7 @@ def main() -> int:
     sha = os.environ["SHA"][:8]
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     backup_bucket = os.environ.get("BACKUP_BUCKET", "")
+    otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
     control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
     internal_api_token = os.environ.get("INTERNAL_API_TOKEN", "")
     database_url = os.environ.get("DATABASE_URL", "")
@@ -135,6 +147,9 @@ def main() -> int:
     q_sentry_line = shlex.quote(f"SENTRY_DSN={sentry_dsn}")
     q_backup = shlex.quote(backup_bucket)
     q_backup_line = shlex.quote(f"BACKUP_BUCKET={backup_bucket}")
+    q_otel = shlex.quote(otel_environment)
+    q_otel_enabled_line = shlex.quote("OTEL_METRICS_ENABLED=true")
+    q_otel_env_line = shlex.quote(f"OTEL_ENVIRONMENT={otel_environment}")
     q_cpu = shlex.quote(control_plane_url)
     q_cpu_line = shlex.quote(f"CONTROL_PLANE_URL={control_plane_url}")
     q_dns = shlex.quote(dns_redirect_port)
@@ -195,6 +210,7 @@ def main() -> int:
     def deploy(inst):
         name, zone = inst["name"], inst["zone"]
         tag = f"{name}/{zone}"
+        q_host_id_line = shlex.quote(f"HOST_ID={name}")
 
         # Single SCP — one IAP tunnel for the whole bundle.
         run_or_die(
@@ -408,6 +424,27 @@ def main() -> int:
                 sudo sed -i '/^BACKUP_BUCKET=/d' /etc/sandbox/vmd.env
                 echo {q_backup_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
+
+            # Upsert the OTLP backup-metrics contract: enable flag plus
+            # environment label. Empty = skip. The exporter endpoint stays
+            # vmd's compiled default (the host-local collector on
+            # localhost:4318). The backup alert policies read these series,
+            # so hosts they watch must have this set.
+            if [ -n {q_otel} ]; then
+                sudo sed -i '/^OTEL_METRICS_ENABLED=/d' /etc/sandbox/vmd.env
+                sudo sed -i '/^OTEL_ENVIRONMENT=/d' /etc/sandbox/vmd.env
+                echo {q_otel_enabled_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+                echo {q_otel_env_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Upsert HOST_ID with the instance name. vmd falls back to
+            # "default" without it, which breaks reconciler DB scoping,
+            # heartbeat identity, and the host_id metric label the backup
+            # alert policies filter on. The instance name is the host's
+            # identity in the host table and in those filters; on hosts
+            # where it was seeded by hand this rewrites the same value.
+            sudo sed -i '/^HOST_ID=/d' /etc/sandbox/vmd.env
+            echo {q_host_id_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
 
             # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes
             # its control socket into RuntimeDirectory=/run/secretsproxy under
