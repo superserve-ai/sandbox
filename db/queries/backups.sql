@@ -23,15 +23,19 @@ WHERE excluded.completed_at > backup_generation.completed_at;
 -- name: LatestSandboxBackup :one
 -- Freshness bounds future timestamps at read instead of rewriting them
 -- at insert: completed_at is stored exactly as the host verified it, so
--- redeliveries stay idempotent under the strictly-newer upsert guard and
--- the host's own ordering survives. A skewed-ahead clock's rows cap at
--- now() for ranking (they cannot outrank indefinitely), the raw
--- timestamp breaks ties preserving the host's relative order, and the
--- true order re-emerges as wall time passes the stamps.
-SELECT generation, bucket, completed_at
+-- redeliveries stay idempotent under the strictly-newer upsert guard.
+-- The cap is reported_at, the server-side receive instant fixed at
+-- insert: a skewed-ahead row ranks no later than when the control plane
+-- actually learned of it, so any subsequently completed legitimate
+-- generation outranks it (a now() cap would keep tying the skewed row
+-- to the query clock and it would win every read until wall time passed
+-- the stamp). The returned completed_at is bounded the same way so
+-- freshness consumers never see an unbounded future value; the raw
+-- column breaks ranking ties, preserving the host's own order.
+SELECT generation, bucket, LEAST(completed_at, reported_at)::timestamptz AS completed_at
 FROM backup_generation
 WHERE sandbox_id = $1
-ORDER BY LEAST(completed_at, now()) DESC, completed_at DESC
+ORDER BY LEAST(completed_at, reported_at) DESC, completed_at DESC
 LIMIT 1;
 
 -- name: LockSandboxRow :one
