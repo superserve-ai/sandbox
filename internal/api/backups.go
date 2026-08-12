@@ -83,7 +83,12 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "bucket and completed_at are required", http.StatusBadRequest)
 		return
 	}
-	if len(req.Files) == 0 || len(req.Files) > maxBackupReportFiles {
+	// Zero files is a coverage-only report: hosts seed historical
+	// completions whose task rows (and manifests) are long gone, and the
+	// bucket's manifest object remains the file-set authority for them.
+	// Rejecting those would poison the seed, since the reporter treats a
+	// 400 as permanent.
+	if len(req.Files) > maxBackupReportFiles {
 		respondErrorMsg(c, "bad_request", "files must carry the generation manifest", http.StatusBadRequest)
 		return
 	}

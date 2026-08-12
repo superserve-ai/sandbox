@@ -186,3 +186,47 @@ func TestIntegration_BackupReport_UnknownOwnerAccepted(t *testing.T) {
 		t.Fatalf("orphan report wrote %d rows", rows)
 	}
 }
+
+// A coverage-only report (zero files) records coverage without touching
+// snapshot sizes: hosts seed historical completions whose task rows and
+// manifests are long gone, and rejecting them would poison the seed
+// since the reporter treats a 400 as permanent.
+func TestIntegration_BackupReport_CoverageOnlySeed(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	t.Setenv("INTERNAL_API_TOKEN", "itok-seed")
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"backup-seed"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	body := `{"sandbox_id":"` + sid + `","generation":"` + genKey + `","bucket":"seed-bucket","completed_at":"2026-08-01T00:00:00Z","files":[]}`
+	req := httptest.NewRequest("POST", "/internal/hosts/test-host/backups", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer itok-seed")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("seed report: %d %s", w.Code, w.Body.String())
+	}
+
+	var gen, bucket string
+	if err := testPool.QueryRow(ctx,
+		`SELECT generation, bucket FROM backup_generation WHERE sandbox_id = $1`, sandboxID).Scan(&gen, &bucket); err != nil {
+		t.Fatalf("coverage row missing after seed: %v", err)
+	}
+	if gen != genKey || bucket != "seed-bucket" {
+		t.Fatalf("coverage = %s %s, want the seeded generation and bucket", gen, bucket)
+	}
+	var size any
+	if err := testPool.QueryRow(ctx,
+		`SELECT size_bytes FROM snapshot WHERE sandbox_id = $1`, sandboxID).Scan(&size); err == nil {
+		if n, ok := size.(int64); ok && n != 0 {
+			t.Fatalf("size_bytes = %d after a file-less seed, want untouched", n)
+		}
+	}
+}

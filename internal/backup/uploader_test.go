@@ -2479,3 +2479,26 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 		t.Fatalf("second seed resurrected %d entries, want 0", len(rest))
 	}
 }
+
+// Completions bank their notification even without a consumer: a vmd
+// running with reporting unwired must not lose the window's signals,
+// since the seed marker is once per scope and cannot rescan.
+func TestCompletionsOutboxWithoutConsumer(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	u := &Uploader{Journal: j, Store: newMemStore()}
+	worked, err := u.drainOne(context.Background(), time.Now())
+	if err != nil || !worked {
+		t.Fatalf("drainOne: worked=%v err=%v", worked, err)
+	}
+	pending, err := j.PendingNotifications()
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("outbox = %d entries (err %v), want the completion banked", len(pending), err)
+	}
+	if pending[0].VerifiedBucket == "" {
+		t.Fatal("banked entry missing its pinned bucket")
+	}
+}

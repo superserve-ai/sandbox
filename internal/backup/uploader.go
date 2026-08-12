@@ -273,7 +273,13 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	if completed {
 		completedScope = u.Store.Identity()
 	}
-	if err := u.Journal.Ack(task, completedScope, completed && u.OnVerified != nil); err != nil {
+	// Notify on every completion, consumer or not: a vmd running without
+	// reporter wiring must still bank the signal, or completions from
+	// that window would be permanently invisible to coverage once
+	// reporting returns (the seed marker is once per scope and cannot
+	// rescan). The outbox simply accumulates until a consumer flushes
+	// it, and the outbox-depth metric surfaces unbounded growth.
+	if err := u.Journal.Ack(task, completedScope, completed); err != nil {
 		return true, err
 	}
 	removeStagedTask(u.StagingRoot, task)
