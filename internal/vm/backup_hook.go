@@ -213,6 +213,11 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		return "", false
 	}
 	defer m.pendingInFlight.Delete(pb.VMID)
+	// Clear any stale capture at guard acquisition: a previous worker's
+	// enqueue may have left its generation in the slot after releasing
+	// the guard. From here, only this run's flow can write it, so
+	// whatever the guarded read finds below is this call's enqueue.
+	m.lastSandboxEnqueue.Delete(pb.VMID)
 	capturedGen := func() string {
 		if v, ok := m.lastSandboxEnqueue.LoadAndDelete(pb.VMID); ok {
 			if gen, _ := v.(string); gen != "" {
