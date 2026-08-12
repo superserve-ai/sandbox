@@ -744,13 +744,33 @@ def main() -> int:
                 # Mount already verified in the precondition block at the
                 # top of this script, before {service} was touched.
                 NEW_BACKUP_JOURNAL_PATH={q_backup_journal}
+                # EnvironmentFile= (systemd.exec(5), which is what loads
+                # vmd.env) accepts quoted values, and vmd itself receives
+                # them unquoted either way. This script never writes
+                # BACKUP_JOURNAL_PATH or RUN_DIR quoted, but an existing
+                # host could have either set that way by hand — grep|cut
+                # below would then keep the quote characters as part of the
+                # value, so it would never match the real file on disk and
+                # the migration would silently skip a journal that does
+                # exist. Strip one matching pair of leading/trailing quotes
+                # from each before using it as a path.
+                BJ_Q1="'"
+                BJ_Q2='"'
                 OLD_BACKUP_JOURNAL_PATH=$(sudo grep '^BACKUP_JOURNAL_PATH=' /etc/sandbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2-) || true
+                case "$OLD_BACKUP_JOURNAL_PATH" in
+                    "$BJ_Q2"*"$BJ_Q2") OLD_BACKUP_JOURNAL_PATH="${{OLD_BACKUP_JOURNAL_PATH#$BJ_Q2}}"; OLD_BACKUP_JOURNAL_PATH="${{OLD_BACKUP_JOURNAL_PATH%$BJ_Q2}}" ;;
+                    "$BJ_Q1"*"$BJ_Q1") OLD_BACKUP_JOURNAL_PATH="${{OLD_BACKUP_JOURNAL_PATH#$BJ_Q1}}"; OLD_BACKUP_JOURNAL_PATH="${{OLD_BACKUP_JOURNAL_PATH%$BJ_Q1}}" ;;
+                esac
                 if [ -z "$OLD_BACKUP_JOURNAL_PATH" ]; then
                     # No override recorded yet: mirror vmd's own default
                     # derivation (filepath.Join(filepath.Dir(cfg.RunDir),
                     # "backup.db") in cmd/vmd/main.go) instead of assuming a
                     # fixed path, since RUN_DIR itself is configurable.
                     RUN_DIR_VALUE=$(sudo grep '^RUN_DIR=' /etc/sandbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2-) || true
+                    case "$RUN_DIR_VALUE" in
+                        "$BJ_Q2"*"$BJ_Q2") RUN_DIR_VALUE="${{RUN_DIR_VALUE#$BJ_Q2}}"; RUN_DIR_VALUE="${{RUN_DIR_VALUE%$BJ_Q2}}" ;;
+                        "$BJ_Q1"*"$BJ_Q1") RUN_DIR_VALUE="${{RUN_DIR_VALUE#$BJ_Q1}}"; RUN_DIR_VALUE="${{RUN_DIR_VALUE%$BJ_Q1}}" ;;
+                    esac
                     RUN_DIR_VALUE="${{RUN_DIR_VALUE:-/var/lib/sandbox/rundir}}"
                     # filepath.Dir does not walk up a level when the path
                     # already ends in a separator, it only collapses the
