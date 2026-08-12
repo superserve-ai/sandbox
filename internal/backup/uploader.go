@@ -198,10 +198,13 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 				Str("generation", task.Generation).
 				Int("attempts", task.Attempts+1).
 				Msg("backup upload retries exhausted; abandoning generation")
-			if aerr := u.Journal.Ack(task, "", false); aerr != nil {
+			cleared, aerr := u.Journal.Ack(task, "", false)
+			if aerr != nil {
 				return true, aerr
 			}
-			removeStagedTask(u.StagingRoot, task)
+			if cleared {
+				removeStagedTask(u.StagingRoot, task)
+			}
 			u.Metrics.RecordUpload(ctx, telemetry.BackupUploadAbandoned, u.clock().Sub(start))
 			return true, nil
 		}
@@ -251,10 +254,15 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	if completed {
 		completedScope = u.Store.Identity()
 	}
-	if err := u.Journal.Ack(task, completedScope, completed && u.OnVerified != nil); err != nil {
+	cleared, err := u.Journal.Ack(task, completedScope, completed && u.OnVerified != nil)
+	if err != nil {
 		return true, err
 	}
-	removeStagedTask(u.StagingRoot, task)
+	// A superseded abandonment cleared nothing: the upgraded row still
+	// references its staged files, which must survive for its own upload.
+	if cleared {
+		removeStagedTask(u.StagingRoot, task)
+	}
 	u.flushNotifications()
 	return true, nil
 }

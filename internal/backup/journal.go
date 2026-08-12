@@ -544,24 +544,45 @@ func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
 	return ok, err
 }
 
-// Ack removes a finished task. Called only after every object of the
-// generation is verified in the bucket (or the task was abandoned).
-// completed records the owner+generation in the durable completions
-// bucket within the SAME transaction: the ack deletes the queue row, so
-// this record is the only survivor telling recovery sweeps the
-// generation is already in the bucket. notify additionally records the
-// task in the notification outbox, likewise transactionally: the ack
-// that makes the task's completion otherwise unrecoverable is the last
-// durable moment to remember that a completion signal is still owed.
+// Ack removes a finished task, reporting whether the row was actually
+// cleared. Called only after every object of the generation is verified
+// in the bucket (or the task was abandoned). completed records the
+// owner+generation in the durable completions bucket within the SAME
+// transaction: the ack deletes the queue row, so this record is the only
+// survivor telling recovery sweeps the generation is already in the
+// bucket. notify additionally records the task in the notification
+// outbox, likewise transactionally: the ack that makes the task's
+// completion otherwise unrecoverable is the last durable moment to
+// remember that a completion signal is still owed.
+//
+// An ABANDONMENT (empty scope) whose stored row was upgraded since the
+// attempt began (staged, or promoted to a more urgent tier by a live
+// pause) clears nothing and returns false: the failure verdict belongs
+// to the stale snapshot, and deleting the upgraded row would destroy a
+// live pause's coverage and let removeStagedTask reap its staged files.
+// The upgraded row retries on its own schedule. A completion ack always
+// clears: the generation is durable regardless of what upgraded.
 // Piggybacks a bounded lazy prune of expired verification history.
-func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
+func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, error) {
 	completed := completedScope != ""
 	now := time.Now()
-	return j.db.Update(func(tx *bolt.Tx) error {
+	cleared := true
+	err := j.db.Update(func(tx *bolt.Tx) error {
 		// Resolve through the index: a promotion re-keyed row must be
 		// deleted where it lives, or the ack would drop only the index
 		// and leave the row orphaned for Next to run again.
-		if err := tx.Bucket(journalBucket).Delete(currentKey(tx, &task)); err != nil {
+		qk := currentKey(tx, &task)
+		if !completed {
+			if existing := tx.Bucket(journalBucket).Get(qk); existing != nil {
+				var cur Task
+				if json.Unmarshal(existing, &cur) == nil &&
+					((cur.Staged && !task.Staged) || cur.Priority < task.Priority) {
+					cleared = false
+					return nil
+				}
+			}
+		}
+		if err := tx.Bucket(journalBucket).Delete(qk); err != nil {
 			return err
 		}
 		if err := tx.Bucket(indexBucket).Delete(task.indexKey()); err != nil {
@@ -622,6 +643,7 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 		}
 		return vb.Put(pruneCursorKey, next)
 	})
+	return cleared, err
 }
 
 // Nack records a failed attempt and reschedules with exponential backoff

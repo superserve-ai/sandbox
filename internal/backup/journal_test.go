@@ -49,7 +49,7 @@ func TestJournalPriorityAndFIFO(t *testing.T) {
 			break
 		}
 		got = append(got, task.Generation)
-		if err := j.Ack(task, "", false); err != nil {
+		if _, err := j.Ack(task, "", false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -130,7 +130,7 @@ func TestJournalRecordsCompletions(t *testing.T) {
 	if done, err := j.WasCompleted("test-bucket", task); err != nil || done {
 		t.Fatalf("WasCompleted before ack = %v err=%v", done, err)
 	}
-	if err := j.Ack(task, "test-bucket", false); err != nil {
+	if _, err := j.Ack(task, "test-bucket", false); err != nil {
 		t.Fatal(err)
 	}
 	if done, err := j.WasCompleted("test-bucket", task); err != nil || !done {
@@ -146,7 +146,7 @@ func TestJournalRecordsCompletions(t *testing.T) {
 	if err := j.Enqueue(abandoned); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(abandoned, "", false); err != nil {
+	if _, err := j.Ack(abandoned, "", false); err != nil {
 		t.Fatal(err)
 	}
 	if done, _ := j.WasCompleted("test-bucket", abandoned); done {
@@ -197,7 +197,7 @@ func TestJournalQueueKeysScopedByOwner(t *testing.T) {
 			break
 		}
 		owners[task.owner()] = true
-		if err := j.Ack(task, "", false); err != nil {
+		if _, err := j.Ack(task, "", false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -328,7 +328,7 @@ func TestPromotionWhileTaskInFlight(t *testing.T) {
 			t.Fatalf("Next: %v %v", ok, err)
 		}
 		promote(j, "gen-ack")
-		if err := j.Ack(inflight, "bucket", false); err != nil {
+		if _, err := j.Ack(inflight, "bucket", false); err != nil {
 			t.Fatal(err)
 		}
 		if n := pendingTotal(j); n != 0 {
@@ -443,7 +443,7 @@ func TestJournalOutboxDepth(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "bucket", true); err != nil {
+	if _, err := j.Ack(task, "bucket", true); err != nil {
 		t.Fatal(err)
 	}
 	if depth, err := j.OutboxDepth(); err != nil || depth != 1 {
@@ -470,7 +470,7 @@ func TestOwnerCoveredHonorsSinceBound(t *testing.T) {
 	if err := j.Enqueue(old); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(old, "bucket", false); err != nil {
+	if _, err := j.Ack(old, "bucket", false); err != nil {
 		t.Fatal(err)
 	}
 	if cov, err := j.OwnerCovered("bucket", "sb", markTime.Add(time.Minute)); err != nil || cov {
@@ -487,7 +487,7 @@ func TestOwnerCoveredHonorsSinceBound(t *testing.T) {
 	}
 
 	// A completion at/after the mark covers.
-	if err := j.Ack(pendingTask, "bucket", false); err != nil {
+	if _, err := j.Ack(pendingTask, "bucket", false); err != nil {
 		t.Fatal(err)
 	}
 	if cov, err := j.OwnerCovered("bucket", "sb", markTime); err != nil || !cov {
@@ -497,5 +497,56 @@ func TestOwnerCoveredHonorsSinceBound(t *testing.T) {
 	// Scope isolation: another bucket's completions say nothing here.
 	if cov, err := j.OwnerCovered("other-bucket", "sb", markTime); err != nil || cov {
 		t.Fatalf("cross-bucket covered = %v err=%v, want false", cov, err)
+	}
+}
+
+// An abandonment carrying a stale snapshot must not clear a row that was
+// upgraded since the attempt began: a live pause's staging or promotion
+// supersedes the failure verdict, and the upgraded row keeps its staged
+// files and retries on its own schedule. Completion acks always clear.
+func TestAbandonmentDoesNotClearUpgradedRow(t *testing.T) {
+	j, _ := testJournal(t)
+	snapshot := Task{SandboxID: "sb", Generation: "gen",
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/orig", SHA256: "aa", Size: 1}},
+		Priority: PriorityBestEffort, EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	inflight, ok, err := j.Next(time.Unix(10, 0))
+	if err != nil || !ok {
+		t.Fatalf("Next: %v %v", ok, err)
+	}
+
+	// A live pause stages and promotes the same generation mid-attempt.
+	upgraded := snapshot
+	upgraded.Priority = PriorityPause
+	upgraded.Staged = true
+	upgraded.Files = []TaskFile{{Name: "rootfs.ext4", Path: "/staged", SHA256: "aa", Size: 1}}
+	if err := j.Enqueue(upgraded); err != nil {
+		t.Fatal(err)
+	}
+
+	cleared, err := j.Ack(inflight, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared {
+		t.Fatal("stale abandonment cleared the upgraded row")
+	}
+	got, ok, err := j.Next(time.Unix(20, 0))
+	if err != nil || !ok {
+		t.Fatalf("Next after abandonment: %v %v", ok, err)
+	}
+	if !got.Staged || got.Priority != PriorityPause || got.Files[0].Path != "/staged" {
+		t.Fatalf("surviving row = %+v, want the staged promoted upgrade", got)
+	}
+
+	// A completion ack clears even an upgraded row: the generation is
+	// durable regardless of what upgraded meanwhile.
+	if cleared, err := j.Ack(got, "bucket", false); err != nil || !cleared {
+		t.Fatalf("completion ack cleared=%v err=%v, want true", cleared, err)
+	}
+	if _, ok, _ := j.Next(time.Unix(30, 0)); ok {
+		t.Fatal("row survived a completion ack")
 	}
 }

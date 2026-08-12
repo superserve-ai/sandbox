@@ -1060,7 +1060,23 @@ func main() {
 		if os.Getenv("BACKUP_BACKFILL") == "1" {
 			go func() {
 				defer sentrylog.Recover("backup backfill")
-				mgr.BackfillPausedBackups(ctx, log.With().Str("component", "backup").Logger())
+				blog := log.With().Str("component", "backup").Logger()
+				// Re-sweep periodically while the flag is on, not once per
+				// boot: the uploader's retry ceiling can abandon a minted
+				// upload long after the startup pass returned, and these
+				// sandboxes may never pause again to self-heal. Converged
+				// passes are cheap (ledger marks plus coverage probes skip
+				// everything covered), so the cadence buys convergence
+				// without re-hashing. Turn the flag off only once coverage
+				// is verified, not merely once a pass has run.
+				for {
+					mgr.BackfillPausedBackups(ctx, blog)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(6 * time.Hour):
+					}
+				}
 			}()
 		}
 	}()
