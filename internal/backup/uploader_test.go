@@ -2450,7 +2450,7 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
+	if _, err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := j.PendingNotifications(0)
@@ -2473,7 +2473,7 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
+	if _, err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
 		t.Fatal(err)
 	}
 	if rest, _ := j.PendingNotifications(0); len(rest) != 0 {
@@ -2490,7 +2490,7 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 	if err := j.Ack(late, "bucket-a", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
+	if _, err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
 		t.Fatal(err)
 	}
 	caught, err := j.PendingNotifications(0)
@@ -2544,5 +2544,47 @@ func TestFlushNotificationsBoundsTheBatch(t *testing.T) {
 	u.flushNotifications()
 	if delivered != notifyFlushBatch+5 {
 		t.Fatalf("second flush delivered %d total, want all %d", delivered, notifyFlushBatch+5)
+	}
+}
+
+// A history larger than one chunk seeds across multiple bounded
+// transactions, resuming at the persisted cursor, and the high-water
+// mark advances only when a full scan completes.
+func TestSeedChunksAndResumes(t *testing.T) {
+	j, _ := testJournal(t)
+	total := seedChunkLimit + 40
+	for i := 0; i < total; i++ {
+		task := Task{SandboxID: fmt.Sprintf("sb-%04d", i), Generation: fmt.Sprintf("gen-%04d", i), EnqueuedAt: time.Unix(int64(i+1), 0)}
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.Ack(task, "bucket-a", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done, err := j.SeedOutboxFromCompletions("bucket-a")
+	if err != nil || done {
+		t.Fatalf("first chunk done=%v err=%v, want an incomplete scan", done, err)
+	}
+	rounds := 1
+	for !done {
+		if rounds > 10 {
+			t.Fatal("seed never completed")
+		}
+		done, err = j.SeedOutboxFromCompletions("bucket-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rounds++
+	}
+	if pending, err := j.PendingNotifications(0); err != nil || len(pending) != total {
+		t.Fatalf("outbox after chunked seed = %d (err %v), want %d", len(pending), err, total)
+	}
+	// Completed scan advanced the mark: a fresh seed adds nothing.
+	if done, err := j.SeedOutboxFromCompletions("bucket-a"); err != nil || !done {
+		t.Fatalf("post-completion seed done=%v err=%v", done, err)
+	}
+	if pending, _ := j.PendingNotifications(0); len(pending) != total {
+		t.Fatalf("post-completion seed changed outbox to %d, want %d", len(pending), total)
 	}
 }

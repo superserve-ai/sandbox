@@ -37,10 +37,21 @@ WHERE excluded.completed_at > backup_generation.completed_at
 -- the stamp). The returned completed_at is bounded the same way so
 -- freshness consumers never see an unbounded future value; the raw
 -- column breaks ranking ties, preserving the host's own order.
+-- Future-stamped rows (completed_at > reported_at) all rank at the
+-- sandbox's EARLIEST future receive instant rather than each at its
+-- own, so their order among themselves comes from the raw tie-break
+-- (the host's own clock) instead of delivery order, while the class
+-- still cannot outrank any legitimately later completion.
 SELECT generation, bucket, LEAST(completed_at, reported_at)::timestamptz AS completed_at
-FROM backup_generation
-WHERE sandbox_id = $1
-ORDER BY LEAST(completed_at, reported_at) DESC, completed_at DESC
+FROM (
+  SELECT generation, bucket, completed_at, reported_at,
+    CASE WHEN completed_at > reported_at
+      THEN MIN(reported_at) FILTER (WHERE completed_at > reported_at) OVER ()
+      ELSE completed_at END AS effective_at
+  FROM backup_generation
+  WHERE sandbox_id = $1
+) ranked
+ORDER BY effective_at DESC, completed_at DESC
 LIMIT 1;
 
 -- name: LockSandboxRow :one

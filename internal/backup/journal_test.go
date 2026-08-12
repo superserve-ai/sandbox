@@ -306,7 +306,7 @@ func TestJournalOutboxDepth(t *testing.T) {
 // and hold the outbox-stalled alert firing on every seeded host.
 func TestOutboxDepthExcludesSeedMarker(t *testing.T) {
 	j, _ := testJournal(t)
-	if err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
+	if _, err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
 		t.Fatal(err)
 	}
 	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {

@@ -134,25 +134,22 @@ func (u *Uploader) Run(ctx context.Context) error {
 	// Seed the outbox from completions that predate reporter wiring, so
 	// pre-rollout generations reach control-plane coverage; once per
 	// scope, and only when a consumer exists to deliver them.
-	if u.OnVerified != nil {
-		for {
-			if err := u.Journal.SeedOutboxFromCompletions(u.Store.Identity()); err == nil {
-				break
-			} else {
-				u.Log.Error().Err(err).Msg("outbox completion seed failed; retrying before draining")
-			}
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(tick):
-			}
-		}
-	}
+	// Seeding runs INSIDE the loop, one bounded chunk per iteration, so
+	// a large completion history neither holds the shared DB's write
+	// lock in one transaction nor delays the first queued backups.
+	seeding := u.OnVerified != nil
 	// Deliver completion signals a previous process acked but never
 	// notified: the outbox is the only record of those.
 	u.flushNotifications()
 	lastSweep := u.clock()
 	for {
+		if seeding {
+			if done, err := u.Journal.SeedOutboxFromCompletions(u.Store.Identity()); err != nil {
+				u.Log.Error().Err(err).Msg("outbox completion seed failed; will retry")
+			} else if done {
+				seeding = false
+			}
+		}
 		// Checked every iteration: a successful Nack after a canceled
 		// upload returns (worked, nil), and without this check a queued
 		// backlog would be drained (and pointlessly nacked) task by task

@@ -768,40 +768,76 @@ func (j *Journal) PendingNotifications(limit int) ([]Task, error) {
 	return tasks, err
 }
 
-// SeedOutboxFromCompletions backfills the notification outbox from the
-// durable completions record. Completions acked without outbox entries
-// (pre-wiring history, or a rollback window running an older uploader)
-// have no other path to control-plane coverage: Covered suppresses
-// their re-enqueue and their sandboxes may never pause again. The
-// marker is a high-water mark of the newest completion ack instant
-// processed, not a once-ever flag: each boot seeds only completions
-// acked after it, so a rollback window's acks are caught by the next
-// upgrade, while already-delivered older completions are never
-// re-seeded. Completions acked normally since the previous boot re-seed
-// once and deliver as idempotent no-ops, a bounded redundancy. Seeded
-// tasks carry owner, generation, pinned bucket, and the recorded ack
-// instant but no file manifest (the task row is long gone); the
-// bucket's manifest object remains the file-set authority. Existing
-// outbox entries are never overwritten.
-func (j *Journal) SeedOutboxFromCompletions(scope string) error {
+// seedChunkLimit bounds completions examined per seed transaction, so
+// the scan of a large history neither holds the shared DB's write lock
+// in one giant transaction nor delays the drain loop it interleaves
+// with.
+const seedChunkLimit = 256
+
+// SeedOutboxFromCompletions backfills one bounded chunk of the
+// notification outbox from the durable completions record, returning
+// done=false while more remain. Completions acked without outbox
+// entries (pre-wiring history, or a rollback window running an older
+// uploader) have no other path to control-plane coverage: Covered
+// suppresses their re-enqueue and their sandboxes may never pause
+// again. The marker persists a high-water mark of the newest completion
+// ack processed plus a resume cursor: an in-progress scan resumes at
+// the cursor, and the high-water mark only advances once a full scan
+// completes, so an interruption never skips unprocessed older acks.
+// Each boot therefore seeds exactly the completions acked after the
+// last completed scan: rollback windows are caught by the next upgrade,
+// delivered history never re-seeds, and normal completions since the
+// previous boot re-seed once as idempotent no-ops. Seeded tasks carry
+// owner, generation, pinned bucket, and the recorded ack instant but no
+// file manifest (the task row is long gone); the bucket's manifest
+// object remains the file-set authority. Existing outbox entries are
+// never overwritten.
+func (j *Journal) SeedOutboxFromCompletions(scope string) (bool, error) {
 	marker := []byte("\x00completions_seeded\x00" + scope)
-	return j.db.Update(func(tx *bolt.Tx) error {
+	done := true
+	err := j.db.Update(func(tx *bolt.Tx) error {
 		ob := tx.Bucket(outboxBucket)
-		var seededThrough int64
+		var seededThrough, maxSeen int64
+		var cursor []byte
 		if v := ob.Get(marker); v != nil {
-			_, _ = fmt.Sscanf(string(v), "%d", &seededThrough)
+			parts := strings.SplitN(string(v), "\x00", 3)
+			_, _ = fmt.Sscanf(parts[0], "%d", &seededThrough)
+			maxSeen = seededThrough
+			if len(parts) == 3 {
+				_, _ = fmt.Sscanf(parts[1], "%d", &maxSeen)
+				cursor = []byte(parts[2])
+			}
 		}
-		maxSeen := seededThrough
 		prefix := []byte(scope + "\x00")
 		c := tx.Bucket(completionsBucket).Cursor()
-		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+		var k, v []byte
+		if len(cursor) > 0 {
+			// The cursor names the first UNPROCESSED key: resume at it,
+			// not after it.
+			k, v = c.Seek(cursor)
+		} else {
+			k, v = c.Seek(prefix)
+		}
+		examined := 0
+		for ; k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			if examined >= seedChunkLimit {
+				// Persist progress and yield the write lock: high-water
+				// stays at the last COMPLETED scan, the interim max and
+				// cursor carry this scan's progress.
+				done = false
+				return ob.Put(marker, []byte(fmt.Sprintf("%d\x00%d\x00%s", seededThrough, maxSeen, k)))
+			}
 			var ns int64
 			if _, err := fmt.Sscanf(string(v), "%d", &ns); err != nil {
 				continue
 			}
+			// Already-seeded history does not count against the chunk:
+			// skipping is a cheap read, and charging it would make every
+			// converged boot re-paginate the whole scan.
 			if ns <= seededThrough {
 				continue
 			}
+			examined++
 			if ns > maxSeen {
 				maxSeen = ns
 			}
@@ -833,6 +869,10 @@ func (j *Journal) SeedOutboxFromCompletions(scope string) error {
 		}
 		return ob.Put(marker, []byte(fmt.Sprintf("%d", maxSeen)))
 	})
+	if err != nil {
+		return false, err
+	}
+	return done, nil
 }
 
 // ClearNotification confirms delivery of a task's completion signal.
