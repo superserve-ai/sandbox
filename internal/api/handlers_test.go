@@ -2407,13 +2407,13 @@ func TestCreateSandbox_TransientVMDErrorCancelsPendingInsert(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			teamID := uuid.New()
 			insertCanceled := make(chan struct{})
-			var destroyed bool
+			var destroyed atomic.Bool
 			vmd := &stubVMD{
 				restoreFn: func(context.Context, string, string, string) (string, error) {
 					return "", tt.err
 				},
 				destroyFn: func(context.Context, string, bool) error {
-					destroyed = true
+					destroyed.Store(true)
 					return nil
 				},
 			}
@@ -2450,7 +2450,7 @@ func TestCreateSandbox_TransientVMDErrorCancelsPendingInsert(t *testing.T) {
 			if code := errorCode(parseJSON(t, w)); code != "service_unavailable" {
 				t.Fatalf("error code = %q, want service_unavailable", code)
 			}
-			if !destroyed {
+			if !destroyed.Load() {
 				t.Fatal("VM was not torn down after transient VMD failure")
 			}
 			select {
@@ -2516,11 +2516,13 @@ func TestCreateSandbox_PermanentVMDFailureReturnsInternalWithoutWaitingForCleanu
 	insertCanceled := make(chan struct{})
 	destroyStarted := make(chan struct{})
 	destroyRelease := make(chan struct{})
+	var destroyed atomic.Bool
 	vmd := &stubVMD{
 		restoreFn: func(context.Context, string, string, string) (string, error) {
 			return "", status.Error(codes.InvalidArgument, "bad restore request")
 		},
 		destroyFn: func(context.Context, string, bool) error {
+			destroyed.Store(true)
 			close(destroyStarted)
 			<-destroyRelease
 			return nil
@@ -2581,6 +2583,9 @@ func TestCreateSandbox_PermanentVMDFailureReturnsInternalWithoutWaitingForCleanu
 	default:
 		t.Fatal("detached insert was not canceled after permanent VMD failure")
 	}
+	if !destroyed.Load() {
+		t.Fatal("VM was not torn down after permanent VMD failure")
+	}
 }
 
 func TestCreateSandbox_TransientDBErrorReturnsRetryableFailure(t *testing.T) {
@@ -2591,14 +2596,14 @@ func TestCreateSandbox_TransientDBErrorReturnsRetryableFailure(t *testing.T) {
 	markRelease := make(chan struct{})
 	done := make(chan struct{})
 	sandboxID := uuid.New()
-	var destroyed bool
+	var destroyed atomic.Bool
 	vmd := &stubVMD{
 		restoreFn: func(context.Context, string, string, string) (string, error) {
 			<-insertFailed
 			return "10.0.0.9", nil
 		},
 		destroyFn: func(context.Context, string, bool) error {
-			destroyed = true
+			destroyed.Store(true)
 			return nil
 		},
 	}
@@ -2673,7 +2678,7 @@ func TestCreateSandbox_TransientDBErrorReturnsRetryableFailure(t *testing.T) {
 	if code := errorCode(parseJSON(t, w)); code != "service_unavailable" {
 		t.Fatalf("error code = %q, want service_unavailable", code)
 	}
-	if !destroyed {
+	if !destroyed.Load() {
 		t.Fatal("orphan VM was not destroyed after transient DB failure")
 	}
 }
@@ -2682,7 +2687,7 @@ func TestCreateSandbox_TransientDBErrorSkipsMissingRowReconcile(t *testing.T) {
 	teamID := uuid.New()
 	insertFailed := make(chan struct{})
 	var lookupCalls atomic.Int32
-	var destroyed bool
+	var destroyed atomic.Bool
 	var markCalls atomic.Int32
 	vmd := &stubVMD{
 		restoreFn: func(context.Context, string, string, string) (string, error) {
@@ -2690,7 +2695,7 @@ func TestCreateSandbox_TransientDBErrorSkipsMissingRowReconcile(t *testing.T) {
 			return "10.0.0.9", nil
 		},
 		destroyFn: func(context.Context, string, bool) error {
-			destroyed = true
+			destroyed.Store(true)
 			return nil
 		},
 	}
@@ -2731,7 +2736,7 @@ func TestCreateSandbox_TransientDBErrorSkipsMissingRowReconcile(t *testing.T) {
 	if code := errorCode(parseJSON(t, w)); code != "service_unavailable" {
 		t.Fatalf("error code = %q, want service_unavailable", code)
 	}
-	if !destroyed {
+	if !destroyed.Load() {
 		t.Fatal("orphan VM was not destroyed after transient DB failure")
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -2749,14 +2754,14 @@ func TestCreateSandbox_TransientDBErrorSkipsMissingRowReconcile(t *testing.T) {
 func TestCreateSandbox_VMDTransientFailureRetriesFailedStateWrite(t *testing.T) {
 	teamID := uuid.New()
 	sandboxID := uuid.New()
-	var destroyed bool
+	var destroyed atomic.Bool
 	var markCalls atomic.Int32
 	vmd := &stubVMD{
 		restoreFn: func(context.Context, string, string, string) (string, error) {
 			return "", status.Error(codes.Unavailable, "connection refused")
 		},
 		destroyFn: func(context.Context, string, bool) error {
-			destroyed = true
+			destroyed.Store(true)
 			return nil
 		},
 	}
@@ -2799,7 +2804,7 @@ func TestCreateSandbox_VMDTransientFailureRetriesFailedStateWrite(t *testing.T) 
 	if code := errorCode(parseJSON(t, w)); code != "service_unavailable" {
 		t.Fatalf("error code = %q, want service_unavailable", code)
 	}
-	if !destroyed {
+	if !destroyed.Load() {
 		t.Fatal("VM was not torn down after VMD failure")
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -2813,13 +2818,13 @@ func TestCreateSandbox_VMDTransientFailureRetriesFailedStateWrite(t *testing.T) 
 
 func TestCreateSandbox_VMDTransientFailureWithoutReconciliationReturnsInternal(t *testing.T) {
 	teamID := uuid.New()
-	var destroyed bool
+	var destroyed atomic.Bool
 	vmd := &stubVMD{
 		restoreFn: func(context.Context, string, string, string) (string, error) {
 			return "", status.Error(codes.Unavailable, "connection refused")
 		},
 		destroyFn: func(context.Context, string, bool) error {
-			destroyed = true
+			destroyed.Store(true)
 			return nil
 		},
 	}
@@ -2859,7 +2864,7 @@ func TestCreateSandbox_VMDTransientFailureWithoutReconciliationReturnsInternal(t
 	if code := errorCode(parseJSON(t, w)); code != "internal_error" {
 		t.Fatalf("error code = %q, want internal_error", code)
 	}
-	if !destroyed {
+	if !destroyed.Load() {
 		t.Fatal("VM was not torn down after VMD failure")
 	}
 }
