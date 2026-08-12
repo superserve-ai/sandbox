@@ -856,3 +856,83 @@ func TestAdoptOrphanSlots_SystemicTimeoutsAbortPass(t *testing.T) {
 		t.Fatalf("aborted pass must release every claimed index, %d stranded", stranded)
 	}
 }
+
+// TestClaimWait_ConsumesProducedSlot pins the deploy-window contract: a
+// claimant that finds the pool momentarily empty while producers are running
+// waits and consumes their next slot instead of falling back to an inline
+// build — the fallback commitment is what turned restart windows into
+// tens-of-seconds creates.
+func TestClaimWait_ConsumesProducedSlot(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+
+	p.adopting.Store(true) // producers active, nothing delivered yet
+	touchNS(t, dir, "ns-1")
+	m.assignSlotLocked(1, poolOwner)
+	go func() {
+		time.Sleep(60 * time.Millisecond) // slot lands mid-wait
+		p.fresh <- &preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1", HostIP: "10.11.0.1"}, vethName: "veth-1"}
+	}()
+
+	tStart := time.Now()
+	got := p.ClaimWait(context.Background(), "vm-x", 2*time.Second)
+	if got == nil {
+		t.Fatal("ClaimWait returned nil while a producer was delivering")
+	}
+	if got.Namespace != "ns-1" {
+		t.Fatalf("claimed %q, want ns-1", got.Namespace)
+	}
+	if waited := time.Since(tStart); waited > time.Second {
+		t.Fatalf("took %v, want roughly the producer's 60ms delivery", waited)
+	}
+}
+
+// TestClaimWait_IdlePoolReturnsImmediately pins the no-regression contract:
+// when nothing is producing (no adoption, refill paused), ClaimWait must not
+// burn its budget — the caller should fall through to an inline build exactly
+// as fast as before this path existed.
+func TestClaimWait_IdlePoolReturnsImmediately(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.setRefillPaused(true) // empty AND provably idle
+
+	tStart := time.Now()
+	if got := p.ClaimWait(context.Background(), "vm-x", 2*time.Second); got != nil {
+		t.Fatalf("expected nil from an idle empty pool, got %+v", got)
+	}
+	if waited := time.Since(tStart); waited > 500*time.Millisecond {
+		t.Fatalf("idle pool held the claimant %v; must return without waiting", waited)
+	}
+}
+
+// TestWaitWarm_OpensOnFirstInventoryAndCapsOut pins the boot gate contract:
+// the gate waits for first inventory when it is coming, and never holds boot
+// past its cap when it is not.
+func TestWaitWarm_OpensOnFirstInventoryAndCapsOut(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		p.fresh <- &preallocSlot{idx: 2, info: &VMNetInfo{Namespace: "ns-2"}, vethName: "veth-2"}
+	}()
+	tStart := time.Now()
+	if n := p.WaitWarm(context.Background(), 1, 2*time.Second); n < 1 {
+		t.Fatalf("WaitWarm = %d, want >=1 once inventory landed", n)
+	}
+	if waited := time.Since(tStart); waited > time.Second {
+		t.Fatalf("took %v waiting for inventory that landed at 60ms", waited)
+	}
+
+	// Nothing else arriving: the cap, not the target, ends the wait.
+	tStart = time.Now()
+	if n := p.WaitWarm(context.Background(), 8, 150*time.Millisecond); n >= 8 {
+		t.Fatalf("WaitWarm = %d, expected cap-out below the 8-slot target", n)
+	}
+	if waited := time.Since(tStart); waited > time.Second {
+		t.Fatalf("cap of 150ms held boot for %v", waited)
+	}
+}

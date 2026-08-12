@@ -280,6 +280,17 @@ func runDrainCheck() int {
 	return 3
 }
 
+// warmGateMinSlots / warmGateMaxWait shape the boot-time pool warm-up gate:
+// open the request gate as soon as the pool holds a small first batch of
+// claimable slots, but never hold boot longer than the cap. The batch only
+// needs to cover the first seconds of arrivals — SetupVM's bounded pool wait
+// carries anything beyond it — and the cap exists for hosts with nothing to
+// adopt, where inventory comes from fresh builds the gate must not wait on.
+const (
+	warmGateMinSlots = 16
+	warmGateMaxWait  = 5 * time.Second
+)
+
 func main() {
 	// Maintenance subcommands run before any daemon setup and exit. They must
 	// not open the state store in write mode or start services.
@@ -1154,8 +1165,22 @@ func main() {
 	})
 
 	// Fast pre-serve init is done (slots reserved, namespaces swept, pool fill
-	// backgrounded). Open the gate; pool warm-up and full reattach continue in
-	// the background, and requests load any not-yet-reattached VM on demand.
+	// backgrounded). Before opening the gate, give the pool a moment to hold
+	// first inventory: the previous run's slots are already in the kernel and
+	// adoption turns them back into claimable inventory within about a second
+	// of the scan finishing — a gate that opens at zero sends the first
+	// arrivals into inline slot builds that contend with that same adoption
+	// for netlink and the mount table, which is what turned deploy restarts
+	// into tens-of-seconds create latency. The wait is capped so a host with
+	// nothing to adopt (first boot, adoption skipped) still serves promptly;
+	// stragglers past the cap are covered by SetupVM's bounded pool wait.
+	// Requests arriving during the wait queue in the socket unit's accept
+	// backlog or get a retryable Unavailable — never a slow failure.
+	if inventory := netPool.WaitWarm(ctx, warmGateMinSlots, warmGateMaxWait); inventory > 0 {
+		log.Info().Int("pool_inventory", inventory).Msg("request gate opening with warm pool")
+	} else {
+		log.Warn().Msg("request gate opening with an empty pool — nothing adopted within the warm-up cap")
+	}
 	startupReady.Store(true)
 	log.Info().Msg("startup complete — gRPC serving requests")
 

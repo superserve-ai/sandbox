@@ -101,6 +101,13 @@ var reclaimScanBarrier = func() {}
 // window keeps every build near its uncontended cost.
 const setupSlotConcurrency = 8
 
+// poolClaimWaitBudget bounds how long a claimant waits on a producing pool
+// before falling back to an inline build. Producers deliver within tens of
+// milliseconds normally and a few seconds during a boot-time adoption pass;
+// past that they are wedged and waiting longer buys nothing. ClaimWait also
+// honors the caller's ctx, so a nearly-spent deadline shortens this further.
+const poolClaimWaitBudget = 2 * time.Second
+
 type Manager struct {
 	hostInterface string
 	log           zerolog.Logger
@@ -301,7 +308,22 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 			m.registerEgress(vmID, info)
 			return info, nil
 		}
-		m.log.Info().Str("vm_id", vmID).Msg("network pool empty, falling back to on-demand setup")
+		// Empty is usually momentary — a restart adopting the previous run's
+		// slots, or a burst outrunning refill — and the producers are already
+		// holding the kernel locks an inline build would need. Wait briefly
+		// for their output rather than building alongside them; the wait is
+		// bounded and ClaimWait exits early if nothing is producing.
+		tWait := time.Now()
+		if info := m.pool.ClaimWait(ctx, vmID, poolClaimWaitBudget); info != nil {
+			m.registerEgress(vmID, info)
+			m.log.Info().Str("vm_id", vmID).
+				Int64("pool_wait_ms", time.Since(tWait).Milliseconds()).
+				Msg("pool: claim satisfied after waiting on refill")
+			return info, nil
+		}
+		m.log.Info().Str("vm_id", vmID).
+			Int64("pool_wait_ms", time.Since(tWait).Milliseconds()).
+			Msg("network pool empty, falling back to on-demand setup")
 	}
 
 	idx, err := m.claimSlotIndex(vmID)

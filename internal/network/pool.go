@@ -63,6 +63,11 @@ type Pool struct {
 	verifyPollInterval time.Duration
 	verifyMaxWait      time.Duration
 
+	// adopting is true while an adoption pass is turning the previous run's
+	// abandoned slots back into inventory. Claimants use it (via producing)
+	// to prefer waiting on that output over building inline.
+	adopting atomic.Bool
+
 	// resetTapOnRecycle recreates tap0 before a returned slot is recycled.
 	resetTapOnRecycle bool
 	// abandonOnStop: Stop leaves slots in the kernel for the next process
@@ -250,6 +255,90 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 			Int64("claim_total_ms", tDone.Sub(tEntry).Milliseconds()).
 			Msg("pool: claim complete")
 		return slot.info
+	}
+}
+
+// producing reports whether the pool is actively acquiring inventory: an
+// adoption pass is running, or the fresh buffer is below target while the
+// refill loop is unblocked. While true, a claimant is better off waiting for
+// the next produced slot than building one inline alongside the producers —
+// both paths cross the same kernel locks, and the producers already hold them.
+func (p *Pool) producing() bool {
+	if p.adopting.Load() {
+		return true
+	}
+	return len(p.fresh) < p.newSize && !p.refillIsPaused()
+}
+
+// claimWaitPoll is ClaimWait's retry interval. Coarse on purpose: the wait
+// substitutes for inline builds that cost whole seconds, so tens of
+// milliseconds of granularity is noise, and polling Claim keeps its phantom
+// validation and devmap handoff in one place instead of re-plumbing them
+// around a blocking channel receive.
+const claimWaitPoll = 25 * time.Millisecond
+
+// ClaimWait is Claim with bounded patience: while the pool is producing, keep
+// retrying up to budget so the claimant consumes producer output instead of
+// racing the producers. The failure this exists for: a restart (or a burst)
+// momentarily empties the pool, N claimants each commit to an inline build,
+// and those builds queue behind a bounded semaphore while contending with the
+// pool's own refill for netlink and the mount table — each claimant pays tens
+// of seconds for a slot the pool would have handed it moments later.
+//
+// Returns nil when the pool is provably idle-and-empty, the budget lapses
+// (producers wedged — their locks are stalled too, so an inline build would
+// fare no better, but it remains the caller's last resort), or ctx/shutdown
+// ends the wait.
+func (p *Pool) ClaimWait(ctx context.Context, vmID string, budget time.Duration) *VMNetInfo {
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+	tick := time.NewTicker(claimWaitPoll)
+	defer tick.Stop()
+	for {
+		if info := p.Claim(vmID); info != nil {
+			return info
+		}
+		if !p.producing() {
+			return nil
+		}
+		select {
+		case <-p.stopCh:
+			return nil
+		case <-ctx.Done():
+			return nil
+		case <-deadline.C:
+			return nil
+		case <-tick.C:
+		}
+	}
+}
+
+// WaitWarm blocks until the pool holds at least minSlots claimable slots or
+// maxWait lapses, returning the inventory last seen. Called once at boot,
+// after adoption starts and before the request gate opens: the previous run's
+// slots are already in the kernel, so first inventory is moments away, and a
+// gate that opens at zero sends the first arrivals into inline builds against
+// the adoption churn. The cap bounds boot delay for the cases with nothing to
+// adopt (first boot, adoption skipped, empty host) — the pool then warms by
+// building and the gate must not wait on that.
+func (p *Pool) WaitWarm(ctx context.Context, minSlots int, maxWait time.Duration) int {
+	deadline := time.NewTimer(maxWait)
+	defer deadline.Stop()
+	tick := time.NewTicker(claimWaitPoll)
+	defer tick.Stop()
+	for {
+		if n := len(p.fresh) + len(p.recycled); n >= minSlots {
+			return n
+		}
+		select {
+		case <-p.stopCh:
+			return len(p.fresh) + len(p.recycled)
+		case <-ctx.Done():
+			return len(p.fresh) + len(p.recycled)
+		case <-deadline.C:
+			return len(p.fresh) + len(p.recycled)
+		case <-tick.C:
+		}
 	}
 }
 
@@ -489,6 +578,8 @@ func (p *Pool) stopSlot(slot *preallocSlot) {
 func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped int64) {
 	indexes := p.mgr.claimOrphanSlots()
 	if len(indexes) > 0 {
+		p.adopting.Store(true)
+		defer p.adopting.Store(false)
 		p.log.Info().Int("candidates", len(indexes)).Msg("pool: adopting slots left by previous run")
 
 		var nAdopted, nInvalid, nSkipped, nTimeouts atomic.Int64
