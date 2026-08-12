@@ -162,3 +162,30 @@ variable "host_disk_alerts" {
   })
   default = null
 }
+
+variable "launch_path_alerts" {
+  description = <<-EOT
+    Alert policies over the vmd launch path's Managed Prometheus metrics
+    (exported by the host-local OTel collector), scoped to one cell's vmd
+    host via the host_id metric label. Covers the pruned launcher mount
+    namespace being unavailable and live network namespaces accumulating,
+    both of which degrade latency silently. Null disables the set.
+  EOT
+  type = object({
+    host_id        = string
+    display_prefix = string
+    # How long launches may run on the legacy path before paging. Pin
+    # rebuilds retry every 5 minutes, so this must exceed one retry cycle
+    # or a transient failure that self-heals would page; 15 minutes gives
+    # two attempts and still catches a stuck host long before the mount
+    # table makes it un-deployable.
+    launcher_not_ready_duration = optional(string, "900s")
+    # Live network namespaces on the host. Steady state should be running
+    # VMs plus the warm pool (low thousands). Deploy duration and ssh
+    # session setup both scale with the mount table these produce, so the
+    # default sits well above normal operation and well below the range
+    # where those operations begin to time out.
+    netns_total_threshold = optional(number, 8000)
+  })
+  default = null
+}

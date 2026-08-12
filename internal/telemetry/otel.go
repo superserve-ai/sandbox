@@ -56,6 +56,7 @@ type OTelRecorder struct {
 	pausedNetworkPressure    metric.Int64Gauge
 	pausedNetworkReclaimed   metric.Int64Counter
 	pausedNetworkPaused      metric.Int64Counter
+	launcherReady            metric.Int64Gauge
 }
 
 // NewOTelRecorder constructs an OTLP/HTTP metrics recorder. Call Shutdown on
@@ -154,6 +155,9 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	if r.pausedNetworkPaused, err = meter.Int64Counter("vmd_network_slots_reclaimed_paused_total"); err != nil {
 		return nil, err
 	}
+	if r.launcherReady, err = meter.Int64Gauge("vmd_launcher_ready"); err != nil {
+		return nil, err
+	}
 	return r, nil
 }
 
@@ -230,6 +234,20 @@ func (r *OTelRecorder) RecordDBPoolStats(ctx context.Context, s DBPoolStats) {
 	if s.AcquireDurationSecondsDelta > 0 {
 		r.dbAcquireDurationSeconds.Add(ctx, s.AcquireDurationSecondsDelta, opt)
 	}
+}
+
+// RecordLauncherState emits vmd_launcher_ready as 1/0. Alert on it: a sustained
+// 0 means every Firecracker start on that host is walking the full mount table,
+// which is customer-visible latency long before anything errors.
+func (r *OTelRecorder) RecordLauncherState(ctx context.Context, s LauncherState) {
+	if r == nil {
+		return
+	}
+	ready := int64(0)
+	if s.Ready {
+		ready = 1
+	}
+	r.launcherReady.Record(ctx, ready, metric.WithAttributes(r.attrs()...))
 }
 
 func (r *OTelRecorder) RecordPausedNetworkPressure(ctx context.Context, p PausedNetworkPressure) {

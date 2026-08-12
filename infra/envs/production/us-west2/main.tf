@@ -311,6 +311,16 @@ module "observability" {
     host_id        = local.active_host_name
     display_prefix = "Backup / ${local.active_host_name}"
   }
+  # Launch-path health for the same host: the pruned launcher mount namespace
+  # being unavailable (VM starts fall back to walking the full host mount
+  # table) and live network namespaces accumulating. Both degrade latency
+  # while the service still reports healthy, so neither has another signal.
+  # Module defaults: page after 15 minutes on the legacy path, and at 8,000
+  # live namespaces sustained 30 minutes.
+  launch_path_alerts = {
+    host_id        = local.active_host_name
+    display_prefix = "Launch path / ${local.active_host_name}"
+  }
   # Root-filesystem (OS disk) utilization for the same host, scoped through
   # the same host_id label the backup metrics use, and following
   # active_sandbox_host for the same reason. Module defaults: warn at 85%

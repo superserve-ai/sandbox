@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // launcherPruneArg is the hidden argv[1] under which vmd re-execs itself to
@@ -287,6 +288,12 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 			Bool("launcher_ready", m.launcherReady.Load()).
 			Msg("host mount table")
 		m.revalidateLauncher(ctx)
+		// After revalidation, so the sample reflects the tick's verdict rather
+		// than the previous one. Emitted here rather than from the reclaim
+		// controller: the launch path degrades whether or not that is enabled.
+		if m.recorder != nil {
+			m.recorder.RecordLauncherState(ctx, telemetry.LauncherState{Ready: m.launcherReady.Load()})
+		}
 	})
 }
 
