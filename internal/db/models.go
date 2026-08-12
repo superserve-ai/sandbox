@@ -487,6 +487,7 @@ type Sandbox struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	FailedAt          pgtype.Timestamptz `json:"failed_at"`
 }
 
 type SandboxActiveInterval struct {

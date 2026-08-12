@@ -300,7 +300,8 @@ WITH failed AS (
   -- auto_delete_at is cleared: the deadline is only meaningful in 'paused',
   -- and a stale one would resurface (or instantly fire) if the sandbox is
   -- ever returned to 'paused' by a recovery path.
-  SET status = 'failed', auto_delete_at = NULL, updated_at = now()
+  SET status = 'failed', auto_delete_at = NULL, updated_at = now(),
+      failed_at = COALESCE(failed_at, now())
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
     AND sandbox.status = sqlc.arg(observed_status)
   RETURNING id
@@ -327,7 +328,8 @@ SELECT count(*) FROM failed;
 -- bundling of the active-interval close.
 WITH failed AS (
   UPDATE sandbox
-  SET status = 'failed', auto_delete_at = NULL, updated_at = now()
+  SET status = 'failed', auto_delete_at = NULL, updated_at = now(),
+      failed_at = COALESCE(failed_at, now())
   WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
   RETURNING id
 ),
