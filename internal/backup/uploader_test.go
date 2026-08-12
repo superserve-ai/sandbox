@@ -2424,3 +2424,58 @@ func TestClearNotificationLeavesOtherKeyShape(t *testing.T) {
 		t.Fatalf("after legacy clear = %d entries, want empty", len(final))
 	}
 }
+
+// Completions acked before reporter wiring existed have no outbox entry
+// and their sandboxes may never pause again; the seed backfills them
+// into the outbox once per scope, without touching other scopes or
+// overwriting live entries.
+func TestSeedOutboxFromCompletions(t *testing.T) {
+	j, _ := testJournal(t)
+	// Pre-rollout acks: completed, but notify=false (no consumer existed).
+	sb := Task{SandboxID: "sb-old", Generation: "gen-1", EnqueuedAt: time.Unix(1, 0)}
+	tpl := Task{TemplateID: "tpl", BuildID: "b1", Generation: "gen-2", EnqueuedAt: time.Unix(2, 0)}
+	other := Task{SandboxID: "sb-other", Generation: "gen-3", EnqueuedAt: time.Unix(3, 0)}
+	for _, task := range []Task{sb, tpl} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.Ack(task, "bucket-a", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.Enqueue(other); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(other, "bucket-b", false); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := j.PendingNotifications()
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("outbox after seed = %d entries (err %v), want the two bucket-a completions", len(pending), err)
+	}
+	for _, p := range pending {
+		if p.VerifiedBucket != "bucket-a" || p.VerifiedAt.IsZero() {
+			t.Fatalf("seeded entry = %+v, want pinned bucket-a and ack instant", p)
+		}
+		if p.TemplateID == "tpl" && p.BuildID != "b1" {
+			t.Fatalf("template seed lost its build id: %+v", p)
+		}
+	}
+
+	// Idempotent: delivery clears, and a second seed resurrects nothing.
+	for _, p := range pending {
+		if err := j.ClearNotification(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
+		t.Fatal(err)
+	}
+	if rest, _ := j.PendingNotifications(); len(rest) != 0 {
+		t.Fatalf("second seed resurrected %d entries, want 0", len(rest))
+	}
+}

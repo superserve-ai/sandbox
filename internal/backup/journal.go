@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -750,6 +751,60 @@ func (j *Journal) PendingNotifications() ([]Task, error) {
 		})
 	})
 	return tasks, err
+}
+
+// SeedOutboxFromCompletions backfills the notification outbox from the
+// durable completions record, once per scope. Completions acked before
+// reporter wiring existed have no outbox entry, Covered suppresses their
+// re-enqueue, and their sandboxes may never pause again, so without this
+// seed every pre-rollout generation would stay permanently absent from
+// control-plane coverage. Seeded tasks carry owner, generation, pinned
+// bucket, and the recorded ack instant but no file manifest (the task
+// row is long gone); consumers deliver them as coverage-only reports,
+// and the bucket's manifest object remains the file-set authority.
+// Marker-guarded: runs to completion exactly once per scope.
+func (j *Journal) SeedOutboxFromCompletions(scope string) error {
+	marker := []byte("\x00completions_seeded\x00" + scope)
+	return j.db.Update(func(tx *bolt.Tx) error {
+		ob := tx.Bucket(outboxBucket)
+		if ob.Get(marker) != nil {
+			return nil
+		}
+		prefix := []byte(scope + "\x00")
+		c := tx.Bucket(completionsBucket).Cursor()
+		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			rest := string(k[len(prefix):])
+			i := strings.LastIndexByte(rest, 0)
+			if i < 0 {
+				continue
+			}
+			owner, gen := rest[:i], rest[i+1:]
+			t := Task{Generation: gen, VerifiedBucket: scope}
+			if sep := strings.IndexByte(owner, 0); sep >= 0 {
+				t.TemplateID, t.BuildID = owner[:sep], owner[sep+1:]
+			} else {
+				t.SandboxID = owner
+			}
+			var ns int64
+			if _, err := fmt.Sscanf(string(v), "%d", &ns); err == nil {
+				t.VerifiedAt = time.Unix(0, ns).UTC()
+			}
+			key := completionKey(scope, t)
+			if ob.Get(key) != nil {
+				// A live outbox entry (possibly with its file manifest)
+				// already covers this generation; never overwrite it.
+				continue
+			}
+			val, err := json.Marshal(t)
+			if err != nil {
+				return err
+			}
+			if err := ob.Put(key, val); err != nil {
+				return err
+			}
+		}
+		return ob.Put(marker, []byte("1"))
+	})
 }
 
 // ClearNotification confirms delivery of a task's completion signal.

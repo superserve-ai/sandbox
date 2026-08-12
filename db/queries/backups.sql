@@ -8,7 +8,7 @@
 INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (sandbox_id, bucket, generation) WHERE sandbox_id IS NOT NULL
-DO UPDATE SET completed_at = excluded.completed_at, reported_at = now()
+DO UPDATE SET completed_at = excluded.completed_at, reported_at = now(), files = excluded.files
 WHERE excluded.completed_at > backup_generation.completed_at;
 
 -- name: RecordTemplateBackupGeneration :execrows
@@ -17,7 +17,7 @@ WHERE excluded.completed_at > backup_generation.completed_at;
 INSERT INTO backup_generation (template_id, build_id, generation, bucket, completed_at, files)
 VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (template_id, build_id, bucket, generation) WHERE template_id IS NOT NULL
-DO UPDATE SET completed_at = excluded.completed_at, reported_at = now()
+DO UPDATE SET completed_at = excluded.completed_at, reported_at = now(), files = excluded.files
 WHERE excluded.completed_at > backup_generation.completed_at;
 
 -- name: LatestSandboxBackup :one

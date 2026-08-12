@@ -131,6 +131,23 @@ func (u *Uploader) Run(ctx context.Context) error {
 		case <-time.After(tick):
 		}
 	}
+	// Seed the outbox from completions that predate reporter wiring, so
+	// pre-rollout generations reach control-plane coverage; once per
+	// scope, and only when a consumer exists to deliver them.
+	if u.OnVerified != nil {
+		for {
+			if err := u.Journal.SeedOutboxFromCompletions(u.Store.Identity()); err == nil {
+				break
+			} else {
+				u.Log.Error().Err(err).Msg("outbox completion seed failed; retrying before draining")
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(tick):
+			}
+		}
+	}
 	// Deliver completion signals a previous process acked but never
 	// notified: the outbox is the only record of those.
 	u.flushNotifications()
