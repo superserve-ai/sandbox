@@ -720,7 +720,19 @@ def main() -> int:
                 if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ] \\
                     && [ -f "$OLD_BACKUP_JOURNAL_PATH" ] \\
                     && [ ! -e "$NEW_BACKUP_JOURNAL_PATH" ]; then
-                    sudo install -d -m 0755 "$(dirname "$NEW_BACKUP_JOURNAL_PATH")"
+                    NEW_JOURNAL_DIR="$(dirname "$NEW_BACKUP_JOURNAL_PATH")"
+                    # install -d creates missing path components
+                    # unconditionally, so if the local-SSD array isn't
+                    # actually mounted here (a transient mount race, a
+                    # detach) it would silently create an ordinary
+                    # root-disk directory instead of failing — defeating
+                    # the entire point of this migration, and later
+                    # hiding that data once the real mount reappears.
+                    # Require it be a mountpoint before writing anything.
+                    if ! mountpoint -q "$NEW_JOURNAL_DIR" 2>/dev/null; then
+                        echo "ERROR: $NEW_JOURNAL_DIR is not a mounted filesystem; refusing to migrate the backup journal there" >&2
+                        exit 1
+                    fi
                     # Old and new live on different filesystems (root disk
                     # vs. the local-SSD array), so a plain `mv` is a
                     # copy-then-delete, not an atomic rename: a kill mid-copy
@@ -729,13 +741,22 @@ def main() -> int:
                     # an already-completed migration on retry, publishing a
                     # BoltDB vmd can't open. Copy to a same-filesystem temp
                     # path next to the destination, then rename — same
-                    # filesystem makes that rename atomic — and only then
-                    # remove the source.
+                    # filesystem makes that rename atomic.
                     TMP_BACKUP_JOURNAL_PATH="${{NEW_BACKUP_JOURNAL_PATH}}.migrating.$$"
                     sudo rm -f "${{NEW_BACKUP_JOURNAL_PATH}}".migrating.*
                     sudo cp --preserve=mode,ownership "$OLD_BACKUP_JOURNAL_PATH" "$TMP_BACKUP_JOURNAL_PATH"
                     sudo mv "$TMP_BACKUP_JOURNAL_PATH" "$NEW_BACKUP_JOURNAL_PATH"
-                    sudo rm -f "$OLD_BACKUP_JOURNAL_PATH"
+                    # Rename rather than remove the source: the socket unit
+                    # (superserve-vmd.socket) stays active through this
+                    # whole block by design, so a connection arriving right
+                    # now can make systemd reactivate vmd against whatever
+                    # vmd.env still says (the old path, since it's rewritten
+                    # below only after this succeeds). Deleting the source
+                    # out from under a reactivated vmd would unlink it while
+                    # still open, silently discarding every write from that
+                    # point on; leaving it in place under a different name
+                    # means those writes land somewhere recoverable instead.
+                    sudo mv "$OLD_BACKUP_JOURNAL_PATH" "${{OLD_BACKUP_JOURNAL_PATH}}.migrated"
                     echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
                 fi
 
