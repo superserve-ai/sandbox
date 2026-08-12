@@ -741,8 +741,18 @@ def main() -> int:
             # migrated by an earlier deploy) so this is a no-op in steady
             # state.
             if [ -n {q_backup_journal} ]; then
-                # Mount already verified in the precondition block at the
-                # top of this script, before {service} was touched.
+                # {service} was already stopped above (unconditionally, for
+                # every deploy) before this block is even reached, so any
+                # failure exit between here and the restart/health-check
+                # block further down would otherwise leave it down with
+                # nothing to bring it back — including from the mount
+                # recheck just below, and from the fallible env write later
+                # in this block. Arm recovery up front, for the whole
+                # section, rather than only around the parts that also stop
+                # the socket. A no-op start on units that were never
+                # stopped. Disarmed only once {service} is confirmed active
+                # again, near the end of this script.
+                trap '\''sudo systemctl start superserve-vmd.socket {service} 2>/dev/null || true'\'' EXIT
                 NEW_BACKUP_JOURNAL_PATH={q_backup_journal}
                 # EnvironmentFile= (systemd.exec(5), which is what loads
                 # vmd.env) accepts quoted values, and vmd itself receives
@@ -786,25 +796,27 @@ def main() -> int:
                     OLD_BACKUP_JOURNAL_PATH="$RUN_DIR_PARENT/backup.db"
                 fi
 
+                # The precondition block at the top of this script already
+                # confirmed the mount, but that was before extracting the
+                # bundle and installing binaries/units — a long enough
+                # window that the array could be transiently unmounted by
+                # the time we get here. Check again immediately before
+                # mutating anything below, and unconditionally (not just
+                # when the path is changing): a steady-state host restarts
+                # {service} unconditionally further down too, and if the
+                # mount vanished in between, vmd would silently open a
+                # root-backed journal at the same configured path, hiding
+                # the real one until the SSD is remounted.
+                BJ_ANCESTOR="$(dirname "$NEW_BACKUP_JOURNAL_PATH")"
+                while [ ! -d "$BJ_ANCESTOR" ] && [ "$BJ_ANCESTOR" != "/" ]; do
+                    BJ_ANCESTOR="$(dirname "$BJ_ANCESTOR")"
+                done
+                if [ "$(sudo stat -c %d "$BJ_ANCESTOR")" = "$(sudo stat -c %d /)" ]; then
+                    echo "ERROR: $BJ_ANCESTOR is on the root filesystem, not a separate mount; refusing to deploy" >&2
+                    exit 1
+                fi
+
                 if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ]; then
-                    # The precondition block at the top of this script
-                    # already confirmed the mount, but that was before
-                    # extracting the bundle and installing binaries/units —
-                    # a long enough window that the array could be
-                    # transiently unmounted by the time we get here. Check
-                    # again immediately before mutating anything below: a
-                    # cp into a now-root-backed directory would publish and
-                    # retire the source against a destination that isn't
-                    # really on the SSD, exactly what the earlier check
-                    # exists to prevent.
-                    BJ_ANCESTOR="$(dirname "$NEW_BACKUP_JOURNAL_PATH")"
-                    while [ ! -d "$BJ_ANCESTOR" ] && [ "$BJ_ANCESTOR" != "/" ]; do
-                        BJ_ANCESTOR="$(dirname "$BJ_ANCESTOR")"
-                    done
-                    if [ "$(sudo stat -c %d "$BJ_ANCESTOR")" = "$(sudo stat -c %d /)" ]; then
-                        echo "ERROR: $BJ_ANCESTOR is on the root filesystem, not a separate mount; refusing to deploy" >&2
-                        exit 1
-                    fi
                     # {service} was stopped above, but superserve-vmd.socket
                     # stays active the rest of this script by design
                     # (zero-downtime deploys), so a connection landing in the
@@ -819,20 +831,10 @@ def main() -> int:
                     # just when there's a file to migrate. Re-enabled by the
                     # socket restart/start block and the {service} restart
                     # later in this script, once vmd.env names the new path.
-                    # Unlike the earlier {service}-only stop, this also takes
-                    # down socket activation, so a failure below (cp hitting
-                    # a full or errored destination, sync failing, etc.)
-                    # would exit via set -e and leave the host with no
-                    # listener at all instead of still serving on the old
-                    # journal — the old vmd.env is still correct at that
-                    # point, since it's only rewritten after this block
-                    # succeeds. Arm a trap to restore both units on any such
-                    # exit. The env write below is fallible too (full disk,
-                    # I/O error), and still needs the old units back if it
-                    # fails, so this stays armed through that write and the
-                    # restart/health-check block further down; disarmed only
-                    # once {service} is confirmed active again, there.
-                    trap '\''sudo systemctl start superserve-vmd.socket {service} 2>/dev/null || true'\'' EXIT
+                    # The recovery trap armed at the top of this block
+                    # already covers a failure here too — it stops the
+                    # socket now as well, not just {service}, but the trap's
+                    # start of both units on any exit applies regardless.
                     sudo systemctl stop superserve-vmd.socket {service}
                     if [ -f "$OLD_BACKUP_JOURNAL_PATH" ]; then
                         # $OLD_BACKUP_JOURNAL_PATH still present under its
