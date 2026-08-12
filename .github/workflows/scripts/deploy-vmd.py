@@ -701,6 +701,19 @@ def main() -> int:
             # state.
             if [ -n {q_backup_journal} ]; then
                 NEW_BACKUP_JOURNAL_PATH={q_backup_journal}
+                NEW_JOURNAL_DIR="$(dirname "$NEW_BACKUP_JOURNAL_PATH")"
+                # Checked on EVERY deploy that configures this path, not just
+                # a first-time migration: without this, a transiently
+                # unmounted local-SSD array would leave NEW_JOURNAL_DIR
+                # resolvable as an ordinary root-disk directory, and a plain
+                # restart — no migration involved — would silently open a
+                # root-disk BoltDB there instead of failing, defeating the
+                # whole point of this override and later hiding that data
+                # once the real mount reappears.
+                if ! mountpoint -q "$NEW_JOURNAL_DIR" 2>/dev/null; then
+                    echo "ERROR: $NEW_JOURNAL_DIR is not a mounted filesystem; refusing to configure the backup journal there" >&2
+                    exit 1
+                fi
                 OLD_BACKUP_JOURNAL_PATH=$(sudo grep '^BACKUP_JOURNAL_PATH=' /etc/sandbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2-) || true
                 if [ -z "$OLD_BACKUP_JOURNAL_PATH" ]; then
                     # No override recorded yet: mirror vmd's own default
@@ -720,19 +733,7 @@ def main() -> int:
                 if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ] \\
                     && [ -f "$OLD_BACKUP_JOURNAL_PATH" ] \\
                     && [ ! -e "$NEW_BACKUP_JOURNAL_PATH" ]; then
-                    NEW_JOURNAL_DIR="$(dirname "$NEW_BACKUP_JOURNAL_PATH")"
-                    # install -d creates missing path components
-                    # unconditionally, so if the local-SSD array isn't
-                    # actually mounted here (a transient mount race, a
-                    # detach) it would silently create an ordinary
-                    # root-disk directory instead of failing — defeating
-                    # the entire point of this migration, and later
-                    # hiding that data once the real mount reappears.
-                    # Require it be a mountpoint before writing anything.
-                    if ! mountpoint -q "$NEW_JOURNAL_DIR" 2>/dev/null; then
-                        echo "ERROR: $NEW_JOURNAL_DIR is not a mounted filesystem; refusing to migrate the backup journal there" >&2
-                        exit 1
-                    fi
+                    # NEW_JOURNAL_DIR is already confirmed a mountpoint above.
                     # Old and new live on different filesystems (root disk
                     # vs. the local-SSD array), so a plain `mv` is a
                     # copy-then-delete, not an atomic rename: a kill mid-copy
@@ -772,7 +773,17 @@ def main() -> int:
             else
                 sudo systemctl start superserve-vmd.socket
             fi
-            sudo systemctl start {service}
+            # `restart`, not `start`: the socket unit stays active through
+            # the whole block above by design (zero-downtime — connections
+            # backlog instead of refusing), so a connection arriving during
+            # the stop window can already have made systemd reactivate
+            # {service} against the pre-migration vmd.env. `start` is a
+            # no-op against an already-active unit and would leave that
+            # reactivated process running on the old path indefinitely;
+            # `restart` guarantees the process running once this script
+            # exits is always the one reading the final, fully-migrated
+            # config, whether or not a reactivation race occurred.
+            sudo systemctl restart {service}
             sleep 3
             sudo systemctl is-active --quiet {service} || (
                 echo "ERROR: {service} failed to become active after restart" >&2
