@@ -39,7 +39,7 @@ locals {
       # sustained growth degrades deploys and host access before it degrades
       # anything customers see.
       query         = "max(vmd_network_netns_total{${local.launch_path_host_matcher}}) > ${var.launch_path_alerts.netns_total_threshold}"
-      duration      = "1800s"
+      duration      = var.launch_path_alerts.netns_total_duration
       documentation = <<-EOT
         ${var.launch_path_alerts.host_id} is carrying more than ${var.launch_path_alerts.netns_total_threshold} live network namespaces. Each contributes roughly two host mount-table entries, and that table is walked on every process start, every systemctl daemon-reload, and every ssh login — so deploys slow down, the host gets harder to reach, and the launcher pin build (which protects VM start latency) becomes more likely to fail.
 

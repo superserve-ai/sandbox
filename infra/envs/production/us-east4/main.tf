@@ -350,8 +350,12 @@ module "observability" {
   # being unavailable (VM starts fall back to walking the full host mount
   # table) and live network namespaces accumulating. Both degrade latency
   # while the service still reports healthy, so neither has another signal.
+  #
   # Module defaults: page after 15 minutes on the legacy path, and at 8,000
-  # live namespaces sustained 30 minutes.
+  # live namespaces sustained 30 minutes. That 8,000 is deliberately above
+  # vmd's reclaim ceiling (VMD_PAUSED_NETWORK_NETNS_THRESHOLD, currently
+  # 6,000) so it means "the controller engaged and still lost", not "the
+  # controller is doing its job" — raise both together or neither.
   launch_path_alerts = {
     host_id        = module.sandbox_host.instance_name
     display_prefix = "Launch path / ${module.sandbox_host.instance_name}"

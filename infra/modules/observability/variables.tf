@@ -192,7 +192,19 @@ variable "launch_path_alerts" {
     # session setup both scale with the mount table these produce, so the
     # default sits well above normal operation and well below the range
     # where those operations begin to time out.
+    #
+    # COUPLED to vmd's reclaim band (VMD_PAUSED_NETWORK_NETNS_THRESHOLD /
+    # _HYSTERESIS): this must sit ABOVE the reclaim ceiling, so it fires only
+    # when the controller engaged and still could not hold the line — the
+    # controller losing to inflow, not the normal sawtooth between the band's
+    # floor and ceiling. Move this whenever the reclaim ceiling moves, or it
+    # silently degrades into either a duplicate of the controller's own
+    # trigger or an alert that can never fire.
     netns_total_threshold = optional(number, 8000)
+    # Sustained window for the namespace threshold. The controller drains a
+    # backlog over tens of minutes, so a window shorter than that would page
+    # during a recovery that is working.
+    netns_total_duration = optional(string, "1800s")
   })
   default = null
 }
