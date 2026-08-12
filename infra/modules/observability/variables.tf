@@ -201,6 +201,15 @@ variable "launch_path_alerts" {
     # silently degrades into either a duplicate of the controller's own
     # trigger or an alert that can never fire.
     netns_total_threshold = optional(number, 8000)
+    # Fast path for runaway growth. The 30 minute window above is right for a
+    # count drifting just over the ceiling, but too slow when inflow is
+    # outrunning the drain: at the growth rates a busy host reaches, half an
+    # hour spent confirming 8,000 can end well past 12,000, and the cost of
+    # every operation that walks the mount table rises the whole way. This
+    # tier trades the long window for a higher bar, so a host climbing fast
+    # is caught in minutes while a slow drift still waits out the 30.
+    netns_critical_threshold = optional(number, 9000)
+    netns_critical_duration  = optional(string, "300s")
     # Sustained window for the namespace threshold. The controller drains a
     # backlog over tens of minutes, so a window shorter than that would page
     # during a recovery that is working.

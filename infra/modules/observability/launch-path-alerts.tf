@@ -46,6 +46,23 @@ locals {
         Owner: Infrastructure Operations. Response: confirm the paused-network reclaim controller is enabled and draining (vmd_network_slots_reclaimed_paused_total should be rising, vmd_network_netns_total falling). If the count is flat or rising while the controller is engaged, the per-pass reclaim cap is at or below the rate at which new namespaces are being created.
       EOT
     }
+
+    netns_runaway = {
+      display_name = "${var.launch_path_alerts.display_prefix} / live network namespaces climbing fast"
+      # Same signal as the policy above, higher bar and a short window. The
+      # 30 minute confirmation is appropriate for a count sitting just over
+      # the reclaim ceiling, but a host whose inflow has outrun the drain
+      # covers thousands of namespaces in that time, and every mount-table
+      # operation gets more expensive the whole way. Reaching this level at
+      # all means the controller is not merely lagging but losing.
+      query         = "max(vmd_network_netns_total{${local.launch_path_host_matcher}}) > ${var.launch_path_alerts.netns_critical_threshold}"
+      duration      = var.launch_path_alerts.netns_critical_duration
+      documentation = <<-EOT
+        ${var.launch_path_alerts.host_id} has passed ${var.launch_path_alerts.netns_critical_threshold} live network namespaces. Unlike the sustained-growth policy, this fires quickly: at this level the reclaim controller has engaged and is losing to inflow, and the count typically keeps climbing rather than levelling off. Deploys, ssh logins, and the launcher pin build all degrade as the mount table grows, and a vmd restart in this state is likely to fail its pin build and leave every VM start on the slow path.
+
+        Owner: Infrastructure Operations. Response: check whether the reclaim controller is draining at all (vmd_network_slots_reclaimed_paused_total rate) and compare it against the rate new namespaces are appearing. If the drain is running at its per-pass cap and still not winning, the cap (VMD_PAUSED_NETWORK_MAX_RECLAIMS) is the constraint. Confirm vmd_launcher_ready is still 1 before considering a restart.
+      EOT
+    }
   }
 }
 
