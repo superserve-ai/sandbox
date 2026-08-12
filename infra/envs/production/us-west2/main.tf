@@ -150,10 +150,12 @@ module "api" {
   service_account_email = data.google_service_account.api_runner.email
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
 
-  cpu_limit         = "2"
-  memory_limit      = "1Gi"
-  min_instances     = 2
-  max_instances     = 100
+  cpu_limit    = "2"
+  memory_limit = "1Gi"
+  # max_instances * DB_MAX_CONNS must stay under this cell's pooler
+  # client-connection limit; raising either means re-checking that product.
+  min_instances     = 10
+  max_instances     = 30
   startup_cpu_boost = true
   cpu_idle          = true
 
@@ -164,7 +166,7 @@ module "api" {
     SUPABASE_URL           = var.supabase_url
     SECRETS_SIGNING_KEY_ID = "v1"
     ALLOW_EPHEMERAL_SEED   = "0"
-    DB_MAX_CONNS           = "12"
+    DB_MAX_CONNS           = "15"
     VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
   }
