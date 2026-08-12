@@ -17,6 +17,11 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
+// errFinalizeInFlight rolls a report's transaction back when the
+// sandbox is mid-finalize: coverage re-records idempotently on
+// redelivery, and the size sync lands once the snapshot row exists.
+var errFinalizeInFlight = errors.New("pause finalization in flight")
+
 // maxBackupReportFiles bounds a report's manifest jsonb. Sandbox
 // generations carry a handful of files, but template builds ship every
 // regular artifact in the build's snapshot directory with no bound of
@@ -168,11 +173,23 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		// so the vmstate match below cannot go stale mid-transaction: a
 		// concurrent pause either commits first (the match fails, its own
 		// finalize owns sizes) or waits for this commit.
-		if _, err := q.LockSandboxRow(ctx, sandboxID); err != nil {
+		row, err := q.LockSandboxRow(ctx, sandboxID)
+		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil
 			}
 			return err
+		}
+		// 'pausing' means FinalizePause has not committed this pause's
+		// snapshot row yet (it takes the same row lock we now hold): a
+		// fast upload's report arriving in that window would match the
+		// PREVIOUS snapshot's vmstate and silently skip the new one's
+		// size sync forever, since a 200 clears the host's outbox. Roll
+		// the whole transaction back as retryable instead; redelivery
+		// re-records coverage idempotently and the sync lands once the
+		// finalize has committed.
+		if row.Status == "pausing" {
+			return errFinalizeInFlight
 		}
 		snap, err := q.LatestSnapshotVMState(ctx, sandboxID)
 		if err != nil {
@@ -218,6 +235,12 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		}
 	}
 	if err != nil {
+		if errors.Is(err, errFinalizeInFlight) {
+			// Retryable by contract: 503 keeps the entry outboxed and the
+			// host redelivers after the finalize commits.
+			respondErrorMsg(c, "finalize_in_flight", "pause finalization in progress; retry", http.StatusServiceUnavailable)
+			return
+		}
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
 			// The owner row does not exist here (a sandbox this control

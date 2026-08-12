@@ -73,16 +73,25 @@ func (q *Queries) LatestSnapshotVMState(ctx context.Context, sandboxID uuid.UUID
 }
 
 const lockSandboxRow = `-- name: LockSandboxRow :one
-SELECT id FROM sandbox WHERE id = $1 FOR UPDATE
+SELECT id, status FROM sandbox WHERE id = $1 FOR UPDATE
 `
+
+type LockSandboxRowRow struct {
+	ID     uuid.UUID     `json:"id"`
+	Status SandboxStatus `json:"status"`
+}
 
 // Serializes the backup report's snapshot-size sync against FinalizePause,
 // which takes the same row lock: the vmstate match below stays true for
-// the duration of the transaction or the sync is skipped.
-func (q *Queries) LockSandboxRow(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+// the duration of the transaction or the sync is skipped. Status rides
+// along because 'pausing' marks a finalize that has not committed yet:
+// a fast upload's report arriving in that window must retry rather than
+// silently miss its size sync.
+func (q *Queries) LockSandboxRow(ctx context.Context, id uuid.UUID) (LockSandboxRowRow, error) {
 	row := q.db.QueryRow(ctx, lockSandboxRow, id)
-	err := row.Scan(&id)
-	return id, err
+	var i LockSandboxRowRow
+	err := row.Scan(&i.ID, &i.Status)
+	return i, err
 }
 
 const recordSandboxBackupGeneration = `-- name: RecordSandboxBackupGeneration :execrows

@@ -46,8 +46,11 @@ LIMIT 1;
 -- name: LockSandboxRow :one
 -- Serializes the backup report's snapshot-size sync against FinalizePause,
 -- which takes the same row lock: the vmstate match below stays true for
--- the duration of the transaction or the sync is skipped.
-SELECT id FROM sandbox WHERE id = $1 FOR UPDATE;
+-- the duration of the transaction or the sync is skipped. Status rides
+-- along because 'pausing' marks a finalize that has not committed yet:
+-- a fast upload's report arriving in that window must retry rather than
+-- silently miss its size sync.
+SELECT id, status FROM sandbox WHERE id = $1 FOR UPDATE;
 
 -- name: LatestSnapshotVMState :one
 -- The sandbox's newest snapshot row and the vmstate digest its pause-time
