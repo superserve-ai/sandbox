@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/shellquote"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
@@ -106,6 +108,11 @@ type VMInstance struct {
 	Metadata     map[string]string
 	TeamID       string // owning team; carried for data-plane usage attribution
 	OwnerID      string // creating user; empty when unknown
+	// PausedAt records when this VM last entered the paused state. It drives
+	// oldest-first pressure reclamation. Zero means the field is unset on a
+	// legacy record; callers fall back to CreatedAt and then place any fully
+	// timestampless records last.
+	PausedAt time.Time
 
 	// PreviewAccess and PreviewPorts are the data-plane publication policy.
 	// Empty/legacy_public preserves historical all-port routing; strict modes
@@ -151,6 +158,37 @@ type VMInstance struct {
 	mu sync.RWMutex
 }
 
+// vmNetworkManager captures the network operations the VM manager uses.
+// Keeping this narrow lets tests stub teardown/rebuild behavior without
+// running real namespace commands.
+type vmNetworkManager interface {
+	CleanupVM(vmID string)
+	CleanupVMOrNamespace(vmID, fallbackNamespace string)
+	ClaimFreshSlot(owner string) (int, error)
+	EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, macAddress string) (*network.VMNetInfo, error)
+	Forget(vmID string)
+	GetVMNetInfo(vmID string) *network.VMNetInfo
+	NetnsStats() (netnsTotal, ownedSlots, orphaned int)
+	NamespaceForPID(pid int) string
+	ReattachVM(vmID, namespace, hostIP, macAddress string) error
+	ReclaimUnusedSlots() int
+	ReleaseSlot(owner string, idx int)
+	ReserveSlotsAbove(reservations map[string]string)
+	SetupVM(ctx context.Context, vmID string, cfg *network.Config) (*network.VMNetInfo, error)
+	PoolStats() (fresh, recycled int, enabled bool)
+	DrainWarmPool(max int) int
+	SweepOrphanNamespaces(keep map[string]bool) int
+	UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []string) error
+	TeardownVMOrNamespace(vmID, fallbackNamespace string)
+	TeardownVM(vmID string)
+}
+
+type sandboxNetworkRules struct {
+	allowedCIDRs   []string
+	deniedCIDRs    []string
+	allowedDomains []string
+}
+
 // PreviewPortPolicy is the VMD representation of one published port. Access
 // is empty for a Phase 1 sender and then inherits PreviewAccess. TokenVersion
 // is meaningful only for a tokenized wire sentinel.
@@ -190,6 +228,45 @@ type ManagerConfig struct {
 	// prevent a spike of concurrent sandbox creates from saturating host
 	// file I/O, netns setup, and Firecracker boots. 0 → default 500.
 	MaxConcurrentRestores int
+
+	// PausedNetworkSlotHeadroomPercent is the percentage-based free-slot
+	// cushion the controller tries to maintain. Zero disables the percentage
+	// component and relies on the absolute reserve.
+	PausedNetworkSlotHeadroomPercent int
+	// PausedNetworkSlotHeadroomReserve is the absolute free-slot cushion the
+	// controller tries to maintain. The controller uses the larger of the
+	// reserve and the percentage-derived target.
+	PausedNetworkSlotHeadroomReserve int
+	// PausedNetworkSlotHeadroomHysteresis is the extra free-slot margin used
+	// to stop reclaiming only after healthy headroom is restored.
+	PausedNetworkSlotHeadroomHysteresis int
+	// PausedNetworkNetnsThreshold is the maximum number of netns entries the
+	// host should tolerate before the controller switches into inventory-shrink
+	// mode.
+	PausedNetworkNetnsThreshold int
+	// PausedNetworkNetnsHysteresis is the stop margin below the netns pressure
+	// threshold.
+	PausedNetworkNetnsHysteresis int
+	// PausedNetworkMountThreshold is the maximum number of host mount entries
+	// the controller should tolerate before it switches into inventory-shrink
+	// mode.
+	PausedNetworkMountThreshold int
+	// PausedNetworkMountHysteresis is the stop margin below the mount pressure
+	// threshold.
+	PausedNetworkMountHysteresis int
+	// PausedNetworkMinWarmAge keeps freshly paused VMs out of pressure-driven
+	// reclamation so they can remain warm briefly.
+	PausedNetworkMinWarmAge time.Duration
+	// PausedNetworkReclaimEnabled gates the pressure controller.
+	PausedNetworkReclaimEnabled bool
+	// PausedNetworkMaxReclaims bounds how many paused sandboxes one controller
+	// pass may reclaim.
+	PausedNetworkMaxReclaims int
+	// PausedNetworkReclaimCooldown adds hysteresis between reclamation passes.
+	PausedNetworkReclaimCooldown time.Duration
+	// TelemetryRecorder receives bounded host metrics for paused-network
+	// pressure and reclaim activity. Nil disables export.
+	TelemetryRecorder telemetry.Recorder
 
 	// UffdEnabled gates the UFFD lazy-restore path. false → fresh
 	// restores fall back to the File memory backend (synchronous CRC64),
@@ -270,10 +347,11 @@ type ManagerConfig struct {
 // Manager orchestrates the lifecycle of Firecracker microVMs.
 type Manager struct {
 	cfg         ManagerConfig
-	netMgr      *network.Manager
+	netMgr      vmNetworkManager
 	egressProxy *network.EgressProxy
 	log         zerolog.Logger
 	state       *StateStore // persistent local state (BoltDB); nil = no persistence
+	recorder    telemetry.Recorder
 	// backupEnqueue hands finalized pause manifests to the durability
 	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
 	backupEnqueue func(backup.Task) error
@@ -283,6 +361,11 @@ type Manager struct {
 	// unitDead overrides the systemd unit-dead probe in tests; nil means
 	// the real probe. See vmConfirmedAtRest.
 	unitDead func(ctx context.Context, vmID string) bool
+	// rehashDone, when set, is called as the detached pending-backup worker
+	// returns. The worker deliberately outlives backupPause, so a test whose
+	// staging tree is a t.TempDir() otherwise races its own cleanup against
+	// the worker's writes. Nil in production.
+	rehashDone func()
 	// pendingInFlight guards one pending-backup worker per VM across the
 	// startup recovery and the periodic sweep.
 	pendingInFlight sync.Map
@@ -298,6 +381,18 @@ type Manager struct {
 	// already pending or completed; nil means never covered. See
 	// SetBackupCovered.
 	backupCovered func(backup.Task) (bool, error)
+	// backupMetrics optionally observes backup hook timings; nil (metrics
+	// disabled) is safe at every call site. See SetBackupMetrics.
+	backupMetrics *telemetry.BackupRecorder
+	// launchFirecrackerHook is a test seam. When set, launchFirecracker
+	// delegates to it instead of the platform-specific implementation.
+	launchFirecrackerHook func(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error)
+	// restoreForResumeHook is a test seam for the snapshot restore step.
+	restoreForResumeHook func(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo) (dirtyTracked bool, err error)
+	// pausedNetworkControllerState bounds pause-network reclamation cadence.
+	pausedNetworkControllerMu      sync.Mutex
+	pausedNetworkControllerLastRun time.Time
+	pausedNetworkControllerActive  bool
 	// adoptedBuildBackups guards backup reconciliation of completed
 	// builds adopted from disk: one IN-FLIGHT reconcile per build id.
 	// Cross-process and cross-attempt dedupe is the journal's job (owner
@@ -513,6 +608,7 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 	m := &Manager{
 		cfg:            cfg,
 		netMgr:         netMgr,
+		recorder:       cfg.TelemetryRecorder,
 		log:            log.With().Str("component", "vm_manager").Logger(),
 		vms:            make(map[string]*VMInstance),
 		restoreSem:     make(chan struct{}, maxRestores),
@@ -532,6 +628,24 @@ func (m *Manager) SetStateStore(s *StateStore) {
 // Must be called before any VMs are created.
 func (m *Manager) SetEgressProxy(proxy *network.EgressProxy) {
 	m.egressProxy = proxy
+}
+
+func (m *Manager) applySandboxNetworkRules(vmID string, netInfo *network.VMNetInfo, rules *sandboxNetworkRules) error {
+	if rules == nil {
+		return nil
+	}
+	if err := m.netMgr.UpdateFirewallRules(vmID, rules.allowedCIDRs, rules.deniedCIDRs); err != nil {
+		return fmt.Errorf("update firewall rules: %w", err)
+	}
+	if m.egressProxy != nil && netInfo != nil {
+		m.egressProxy.SetRules(netInfo.HostIP, &network.EgressRules{
+			AllowedCIDRs:   rules.allowedCIDRs,
+			DeniedCIDRs:    rules.deniedCIDRs,
+			AllowedDomains: rules.allowedDomains,
+			SandboxID:      vmID,
+		})
+	}
+	return nil
 }
 
 // templateRunDir returns the fixed path where every template's rootfs lives
@@ -1148,6 +1262,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	inst.MemFilePath = memPath
 	inst.BaseMemPath = baseMemPath // template base for a layered overlay; "" when standalone
 	inst.DirtyTracked = false      // FC process is stopping; a fresh resume re-arms tracking.
+	inst.PausedAt = time.Now()
 	// The crash-window marker describes a RUNNING record persisted before
 	// readiness was proven; a successful pause proves the guest was live and
 	// snapshots fresh artifacts, and its resume relaunches from them anyway.
@@ -1318,9 +1433,15 @@ func fileExists(path string) bool {
 // this returning and those steps acting on it. The gRPC adapter is the sole
 // caller and owns that lock scope; there is deliberately no self-locking
 // wrapper, which would release the lock before those steps and reopen the race.
-func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
+func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string, networkRules *sandboxNetworkRules) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
+	needsNetworkCleanup := false
+	defer func() {
+		if needsNetworkCleanup {
+			m.netMgr.TeardownVM(vmID)
+		}
+	}()
 
 	inst, err := m.getInstance(vmID)
 	if err != nil {
@@ -1438,12 +1559,24 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 
 	tSlot := time.Now()
 	var netInfo *network.VMNetInfo
-	if inst.Namespace != "" {
+	nsName := inst.Namespace
+	if nsName != "" {
 		var nsErr error
-		netInfo, nsErr = m.netMgr.EnsureVMSlot(ctx, vmID, inst.Namespace, inst.IP, inst.MACAddress)
+		netInfo, nsErr = m.netMgr.EnsureVMSlot(ctx, vmID, nsName, inst.IP, inst.MACAddress)
 		if nsErr != nil {
 			return nil, fmt.Errorf("ensure network slot for resume: %w", nsErr)
 		}
+	} else {
+		var netErr error
+		netInfo, netErr = m.netMgr.SetupVM(ctx, vmID, nil)
+		if netErr != nil {
+			return nil, fmt.Errorf("setup network for resume: %w", netErr)
+		}
+		nsName = netInfo.Namespace
+		needsNetworkCleanup = true
+	}
+	if err := m.applySandboxNetworkRules(vmID, netInfo, networkRules); err != nil {
+		return nil, err
 	}
 
 	tFcStart := time.Now()
@@ -1452,7 +1585,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.mu.RUnlock()
 	// freshUnit=false: a resume replaces a paused VM's slot, never a brand-new
 	// unit, so it must always run the linger query.
-	pid, resumeSupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, resumeExisting, true, false)
+	pid, resumeSupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, nsName, resumeExisting, true, false)
 	// Stamp before the error branch too: a cgroup launch that forked FC but
 	// failed socket-readiness (kill unconfirmed) leaves a live process, so the
 	// instance must say cgroup for a later destroy to kill it, not no-op a unit.
@@ -1487,25 +1620,31 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		}
 	}
 	tRestore := time.Now()
-	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
+	var dirtyTracked bool
+	var restoreErr error
+	if m.restoreForResumeHook != nil {
+		dirtyTracked, restoreErr = m.restoreForResumeHook(socketPath, snapshotPath, memPath, basePath, netInfo)
+	} else {
+		dirtyTracked, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
+	}
 	tRestoreDone := time.Now()
-	if err != nil {
+	if restoreErr != nil {
 		// Firecracker is already running; stop the unit before returning or it leaks.
 		m.stopUnitDuringRestoreError(vmID)
-		if errors.Is(err, ErrTornSnapshot) {
+		if errors.Is(restoreErr, ErrTornSnapshot) {
 			return nil, status.Errorf(codes.DataLoss,
 				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
-				snapshotPath, err)
+				snapshotPath, restoreErr)
 		}
-		if errors.Is(err, ErrLayeredInvalidSnapshot) {
+		if errors.Is(restoreErr, ErrLayeredInvalidSnapshot) {
 			// Permanent: the overlay/base pairing is structurally invalid, so retrying
 			// the layered restore can't succeed. FailedPrecondition tells the caller not
 			// to retry (vs the generic Internal below, which it may).
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"snapshot %q has an invalid layered overlay/base pairing; do not retry: %v",
-				snapshotPath, err)
+				snapshotPath, restoreErr)
 		}
-		return nil, fmt.Errorf("restore snapshot: %w", err)
+		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
 	inst.mu.RLock()
@@ -1520,7 +1659,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// (detached probe below). The guest was just relaunched from its
 		// snapshot, so this teardown discards nothing of value — but only a
 		// GENUINE verdict may reach it; see verifyBoxdReady.
-		if verr := m.verifyBoxdReady(ctx, inst.IP); verr != nil {
+		if verr := m.verifyBoxdReady(ctx, netInfo.HostIP); verr != nil {
 			m.stopUnitDuringRestoreError(vmID)
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("boxd not ready after relaunch of unverified vm %s: %w", vmID, verr)
@@ -1530,9 +1669,14 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.mu.Lock()
 	inst.PID = pid
 	inst.SocketPath = socketPath
+	inst.IP = netInfo.HostIP
+	inst.TAPDevice = netInfo.TAPDevice
+	inst.MACAddress = netInfo.MACAddress
+	inst.Namespace = nsName
 	inst.Status = StatusRunning
 	inst.Unverified = false
 	inst.DirtyTracked = dirtyTracked
+	inst.PausedAt = time.Time{}
 	// Record the file actually resumed from (callers may pass an explicit path
 	// that differs from the cached one) so the next pause's diff baseline matches
 	// what Firecracker's dirty bitmap is relative to.
@@ -1544,6 +1688,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	if cerr := m.commitResumeState(inst); cerr != nil {
 		return nil, cerr
 	}
+	needsNetworkCleanup = false
 	// Resume-side phase parity with the create path's "restoring snapshot"
 	// line; wait_boxd_ms arrives async on the probe log below. prep spans
 	// the op-lock wait plus the precondition gates, so a duplicate-resume
@@ -1564,11 +1709,12 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// exec-503 incidents.
 	probeStart := time.Now()
 	vmIP := inst.IP
+	probe := boxdHealthProbe
 	go func() {
 		defer sentrylog.Recover("resume-boxd-probe")
 		probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := m.waitForBoxd(probeCtx, vmIP, 30*time.Second); err != nil {
+		if err := probe(probeCtx, vmIP, 30*time.Second); err != nil {
 			log.Warn().Err(err).
 				Int64("wait_boxd_ms", time.Since(probeStart).Milliseconds()).
 				Msg("boxd not reachable after resume")
@@ -1662,13 +1808,25 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	}
 	socketPath := filepath.Join(m.cfg.RunDir, rundirKey, "firecracker.sock")
 
-	var tapDevice string
+	var (
+		tapDevice string
+		nsName    string
+	)
 	if inst.Namespace != "" {
 		netInfo, nsErr := m.netMgr.EnsureVMSlot(ctx, vmID, inst.Namespace, inst.IP, inst.MACAddress)
 		if nsErr != nil {
 			return "", fmt.Errorf("ensure network slot for verify: %w", nsErr)
 		}
 		tapDevice = netInfo.TAPDevice
+		nsName = netInfo.Namespace
+	} else {
+		netInfo, netErr := m.netMgr.SetupVM(ctx, vmID, nil)
+		if netErr != nil {
+			return "", fmt.Errorf("setup network for verify: %w", netErr)
+		}
+		tapDevice = netInfo.TAPDevice
+		nsName = netInfo.Namespace
+		defer m.netMgr.TeardownVM(vmID)
 	}
 
 	// Throwaway Firecracker in the sandbox's existing rundir, stopped on the
@@ -1682,7 +1840,7 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	inst.mu.RLock()
 	verifyExisting := inst.Supervision
 	inst.mu.RUnlock()
-	_, verifySupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, verifyExisting, true, false)
+	_, verifySupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, nsName, verifyExisting, true, false)
 	// Register the mode-aware stop BEFORE the error branch: a cgroup launch that
 	// forked FC but failed socket-readiness (kill unconfirmed) returns cgroup
 	// mode with an error and leaves a live throwaway, so the deferred stop must
@@ -2460,6 +2618,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.mu.Lock()
 	inst.Status = StatusRunning
 	inst.Unverified = true
+	inst.PausedAt = time.Time{}
 	inst.mu.Unlock()
 	persistDone := make(chan struct{})
 	optimisticOK := false
@@ -3605,6 +3764,323 @@ func (m *Manager) setStatus(vmID string, s VMStatus) {
 	m.persistState(inst)
 }
 
+type pausedNetworkPressureSnapshot struct {
+	totalSlots    int
+	freeSlots     int
+	netnsTotal    int
+	ownedSlots    int
+	orphaned      int
+	mountTotal    int
+	mountNsfs     int
+	freshPool     int
+	recycledPool  int
+	poolAvailable bool
+}
+
+func (m *Manager) pausedNetworkPressureSnapshot() pausedNetworkPressureSnapshot {
+	snapshot := pausedNetworkPressureSnapshot{totalSlots: network.MaxSlots}
+	if m.netMgr != nil {
+		snapshot.netnsTotal, snapshot.ownedSlots, snapshot.orphaned = m.netMgr.NetnsStats()
+		snapshot.freshPool, snapshot.recycledPool, snapshot.poolAvailable = m.netMgr.PoolStats()
+	}
+	snapshot.mountTotal, snapshot.mountNsfs = hostMountCounts()
+	snapshot.freeSlots = snapshot.totalSlots - snapshot.ownedSlots
+	if snapshot.poolAvailable {
+		snapshot.freeSlots += snapshot.freshPool + snapshot.recycledPool
+	}
+	if snapshot.freeSlots > snapshot.totalSlots {
+		snapshot.freeSlots = snapshot.totalSlots
+	}
+	if snapshot.freeSlots < 0 {
+		snapshot.freeSlots = 0
+	}
+	return snapshot
+}
+
+func (m *Manager) pausedNetworkSlotWatermarks(totalSlots int) (low, high int) {
+	low = m.cfg.PausedNetworkSlotHeadroomReserve
+	if pct := (totalSlots * m.cfg.PausedNetworkSlotHeadroomPercent) / 100; pct > low {
+		low = pct
+	}
+	if low < 0 {
+		low = 0
+	}
+	if low > totalSlots {
+		low = totalSlots
+	}
+	high = low + m.cfg.PausedNetworkSlotHeadroomHysteresis
+	if high <= low {
+		high = low + 1
+	}
+	if high > totalSlots {
+		high = totalSlots
+	}
+	if high < low {
+		high = low
+	}
+	return low, high
+}
+
+func (m *Manager) pausedNetworkCountWatermarks(threshold, hysteresis int) (low, high int, enabled bool) {
+	if threshold <= 0 {
+		return 0, 0, false
+	}
+	high = threshold
+	low = high - hysteresis
+	if hysteresis <= 0 {
+		low = high - 1
+	}
+	if low < 0 {
+		low = 0
+	}
+	if high <= low {
+		high = low + 1
+	}
+	return low, high, true
+}
+
+func (m *Manager) pausedAtForOrder(rec VMRecord) time.Time {
+	if !rec.PausedAt.IsZero() {
+		return rec.PausedAt
+	}
+	if !rec.CreatedAt.IsZero() {
+		return rec.CreatedAt
+	}
+	return time.Time{}
+}
+
+func (m *Manager) reclaimPausedNetworkInventory(now time.Time) int {
+	if m.state == nil || m.netMgr == nil || !m.cfg.PausedNetworkReclaimEnabled {
+		return 0
+	}
+	m.pausedNetworkControllerMu.Lock()
+	active := m.pausedNetworkControllerActive
+	last := m.pausedNetworkControllerLastRun
+	m.pausedNetworkControllerMu.Unlock()
+	if cooldown := m.cfg.PausedNetworkReclaimCooldown; cooldown > 0 {
+		if !last.IsZero() && now.Sub(last) < cooldown {
+			return 0
+		}
+	}
+
+	snapshot := m.pausedNetworkPressureSnapshot()
+	slotLow, slotHigh := m.pausedNetworkSlotWatermarks(snapshot.totalSlots)
+	netnsLow, netnsHigh, netnsEnabled := m.pausedNetworkCountWatermarks(m.cfg.PausedNetworkNetnsThreshold, m.cfg.PausedNetworkNetnsHysteresis)
+	mountLow, mountHigh, mountEnabled := m.pausedNetworkCountWatermarks(m.cfg.PausedNetworkMountThreshold, m.cfg.PausedNetworkMountHysteresis)
+
+	slotPressure := snapshot.freeSlots < slotLow
+	netnsPressure := netnsEnabled && snapshot.netnsTotal > netnsHigh
+	mountPressure := mountEnabled && snapshot.mountTotal > mountHigh
+	kernelPressure := netnsPressure || mountPressure
+	pressureState := "idle"
+	switch {
+	case slotPressure && kernelPressure:
+		pressureState = "both"
+	case slotPressure:
+		pressureState = "slot"
+	case kernelPressure:
+		pressureState = "kernel"
+	}
+	healthyNetns := !netnsEnabled || snapshot.netnsTotal <= netnsLow
+	healthyMount := !mountEnabled || snapshot.mountTotal <= mountLow
+	healthy := snapshot.freeSlots >= slotHigh && healthyNetns && healthyMount
+	telemetrySnapshot := telemetry.PausedNetworkPressure{
+		TotalSlots:     int64(snapshot.totalSlots),
+		UsedSlots:      int64(snapshot.totalSlots - snapshot.freeSlots),
+		AvailableSlots: int64(snapshot.freeSlots),
+		FreshPool:      int64(snapshot.freshPool),
+		RecycledPool:   int64(snapshot.recycledPool),
+		NetnsTotal:     int64(snapshot.netnsTotal),
+		MountTotal:     int64(snapshot.mountTotal),
+		PressureState:  pressureState,
+	}
+	defer func() {
+		if m.recorder != nil {
+			m.recorder.RecordPausedNetworkPressure(context.Background(), telemetrySnapshot)
+		}
+	}()
+	if active && healthy {
+		m.pausedNetworkControllerMu.Lock()
+		m.pausedNetworkControllerActive = false
+		m.pausedNetworkControllerMu.Unlock()
+		return 0
+	}
+	if !active && !slotPressure && !kernelPressure {
+		return 0
+	}
+	m.pausedNetworkControllerMu.Lock()
+	m.pausedNetworkControllerActive = true
+	m.pausedNetworkControllerMu.Unlock()
+
+	recs, err := m.state.All()
+	if err != nil {
+		m.log.Error().Err(err).Msg("failed to read VM state for paused network controller")
+		return 0
+	}
+	type candidate struct {
+		rec  VMRecord
+		when time.Time
+	}
+	candidates := make([]candidate, 0, len(recs))
+	for _, rec := range recs {
+		if rec.Status != StatusPaused || rec.Namespace == "" {
+			continue
+		}
+		candidates = append(candidates, candidate{rec: rec, when: m.pausedAtForOrder(rec)})
+	}
+	if len(candidates) == 0 {
+		return 0
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].when.Equal(candidates[j].when) {
+			return candidates[i].rec.ID < candidates[j].rec.ID
+		}
+		if candidates[i].when.IsZero() {
+			return false
+		}
+		if candidates[j].when.IsZero() {
+			return true
+		}
+		return candidates[i].when.Before(candidates[j].when)
+	})
+
+	maxReclaims := m.cfg.PausedNetworkMaxReclaims
+	if maxReclaims <= 0 {
+		maxReclaims = 1
+	}
+	reclaimed := 0
+	for _, cand := range candidates {
+		if reclaimed >= maxReclaims {
+			break
+		}
+		if slotPressure && !kernelPressure && m.cfg.PausedNetworkMinWarmAge > 0 {
+			age := now.Sub(m.pausedAtForOrder(cand.rec))
+			if age < m.cfg.PausedNetworkMinWarmAge {
+				continue
+			}
+		}
+		if unlock, ok := m.tryLockVMOp(cand.rec.ID); ok {
+			cur := cand.rec
+			if inst := m.trackedInstance(cand.rec.ID); inst != nil {
+				inst.mu.RLock()
+				cur.Status = inst.Status
+				cur.Namespace = inst.Namespace
+				cur.IP = inst.IP
+				cur.TAPDevice = inst.TAPDevice
+				cur.MACAddress = inst.MACAddress
+				cur.PausedAt = inst.PausedAt
+				inst.mu.RUnlock()
+			} else if m.state != nil {
+				stored, gerr := m.state.Get(cand.rec.ID)
+				if gerr != nil || stored == nil || stored.ID == "" {
+					unlock()
+					continue
+				}
+				cur = *stored
+			}
+			if cur.Status != StatusPaused || cur.Namespace == "" {
+				unlock()
+				continue
+			}
+			shrink := kernelPressure || !snapshot.poolAvailable
+			released, relErr := m.releasePausedNetworkSlot(cur, shrink)
+			if relErr != nil {
+				m.log.Error().Err(relErr).Str("vm_id", cand.rec.ID).Bool("shrink", shrink).Msg("failed to release paused network slot")
+				unlock()
+				continue
+			}
+			if released {
+				reclaimed++
+				telemetrySnapshot.ReclaimedPaused++
+				if shrink {
+					telemetrySnapshot.ReclaimedTeardown++
+				} else {
+					telemetrySnapshot.ReclaimedRecycle++
+				}
+			}
+			unlock()
+			continue
+		}
+	}
+	if kernelPressure && reclaimed < maxReclaims {
+		drained := m.netMgr.DrainWarmPool(maxReclaims - reclaimed)
+		reclaimed += drained
+		telemetrySnapshot.ReclaimedTeardown += int64(drained)
+	}
+	if reclaimed > 0 {
+		m.pausedNetworkControllerMu.Lock()
+		m.pausedNetworkControllerLastRun = now
+		m.pausedNetworkControllerMu.Unlock()
+	}
+	return reclaimed
+}
+
+// releasePausedNetworkSlot tears down or recycles a paused sandbox's network
+// namespace and clears the persisted network identity so the slot can be
+// reclaimed.
+func (m *Manager) releasePausedNetworkSlot(rec VMRecord, shrink bool) (bool, error) {
+	if rec.Namespace == "" || m.netMgr == nil {
+		return false, nil
+	}
+
+	if inst := m.trackedInstance(rec.ID); inst != nil {
+		inst.mu.Lock()
+		if inst.Status != StatusPaused {
+			inst.mu.Unlock()
+			return false, nil
+		}
+		ns := inst.Namespace
+		if ns == "" {
+			inst.mu.Unlock()
+			return false, nil
+		}
+		inst.mu.Unlock()
+		cleared := toRecord(inst)
+		cleared.Namespace = ""
+		cleared.IP = ""
+		cleared.TAPDevice = ""
+		cleared.MACAddress = ""
+		if m.state != nil && !isBuildVM(inst.ID) {
+			if wrote, err := m.state.PutIfPresent(cleared); err != nil {
+				return false, fmt.Errorf("persist paused slot release for vm %s: %w", rec.ID, err)
+			} else if !wrote {
+				return false, nil
+			}
+		}
+		inst.mu.Lock()
+		inst.Namespace = ""
+		inst.IP = ""
+		inst.TAPDevice = ""
+		inst.MACAddress = ""
+		inst.mu.Unlock()
+		if shrink {
+			m.netMgr.TeardownVM(rec.ID)
+		} else {
+			m.netMgr.CleanupVM(rec.ID)
+		}
+		return true, nil
+	}
+
+	cleared := rec
+	cleared.Namespace = ""
+	cleared.IP = ""
+	cleared.TAPDevice = ""
+	cleared.MACAddress = ""
+	if m.state != nil {
+		if wrote, err := m.state.PutIfPresent(cleared); err != nil {
+			return false, fmt.Errorf("persist paused slot release for vm %s: %w", rec.ID, err)
+		} else if !wrote {
+			return false, nil
+		}
+	}
+	if shrink {
+		m.netMgr.TeardownVMOrNamespace(rec.ID, rec.Namespace)
+	} else {
+		m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
+	}
+	return true, nil
+}
+
 // persistState writes the current VM state to BoltDB. No-op if no state
 // store is configured. Errors are logged but not returned — BoltDB is a
 // cache, not a source of truth.
@@ -3808,6 +4284,7 @@ func (m *Manager) abortResumeLocked(vmID string) {
 	inst.mu.Lock()
 	inst.Status = StatusPaused
 	inst.DirtyTracked = false // FC process stopped; a fresh resume re-arms tracking.
+	inst.PausedAt = time.Now()
 	inst.mu.Unlock()
 	// Conditional: a concurrent destroy may have deleted the record; it owns
 	// the teardown then, and an unconditional write would resurrect a

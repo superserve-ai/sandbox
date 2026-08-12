@@ -873,6 +873,7 @@ func TestBackupPausePathIsDiskSizeIndependent(t *testing.T) {
 	}
 	m.backupStaging = filepath.Join(dir, "staging")
 	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+	awaitRehashWorkers(t, m, 1)
 
 	start := time.Now()
 	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
@@ -906,6 +907,7 @@ func TestFastResumeKeepsBackupViaInlineStaging(t *testing.T) {
 	}
 	m.backupStaging = staging
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+	awaitRehashWorkers(t, m, 1)
 
 	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
 	// Mutate the originals immediately, as a resumed guest would.
@@ -950,6 +952,7 @@ func TestBasePinSurvivesBaseDeletion(t *testing.T) {
 		unitDead: func(context.Context, string) bool { return false },
 	}
 	m.backupStaging = staging
+	awaitRehashWorkers(t, m, 1)
 	// Hold the worker: enqueue blocks until the base is deleted.
 	proceed := make(chan struct{})
 	m.SetBackupEnqueue(func(task backup.Task) error {
@@ -990,6 +993,27 @@ func TestBasePinSurvivesBaseDeletion(t *testing.T) {
 // unchanged base would read as replaced the moment the pin is lost
 // (e.g. absorbed away by FinishPendingStage). The pause-time identity
 // must be captured through diskBasePath itself.
+// awaitRehashWorkers makes a test wait for the detached pending-backup workers
+// backupPause spawns. Those workers outlive the call and keep writing under the
+// staging tree, so a test whose staging lives in t.TempDir() otherwise races its
+// own cleanup and fails with "directory not empty" on a loaded runner. Registered
+// as a cleanup after t.TempDir(), so it runs before the directory is removed.
+func awaitRehashWorkers(t *testing.T, m *Manager, n int) {
+	t.Helper()
+	done := make(chan struct{}, n)
+	m.rehashDone = func() { done <- struct{}{} }
+	t.Cleanup(func() {
+		for i := 0; i < n; i++ {
+			select {
+			case <-done:
+			case <-time.After(30 * time.Second):
+				t.Error("pending-backup worker did not finish")
+				return
+			}
+		}
+	})
+}
+
 func TestBackupPauseCapturesBaseIdentityComparableToDiskBasePath(t *testing.T) {
 	dir := t.TempDir()
 	staging := filepath.Join(dir, "staging")
@@ -1013,6 +1037,11 @@ func TestBackupPauseCapturesBaseIdentityComparableToDiskBasePath(t *testing.T) {
 	}
 	m.backupStaging = staging
 	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+	// The detached worker consumes the marker asserted on below, so park it at
+	// its own per-VM busy guard: it heals the marker durably, then returns
+	// without consuming it.
+	m.pendingInFlight.Store("vm-1", struct{}{})
+	awaitRehashWorkers(t, m, 1)
 
 	m.backupPause(context.Background(), "vm-1", snap, disk, base, zerolog.Nop())
 
@@ -1144,6 +1173,11 @@ func TestRetryPauseReusesExistingStagedMarker(t *testing.T) {
 	}
 	m.backupStaging = staging
 	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+	// Both pauses spawn a detached worker, and a worker that ran to completion
+	// would clean up the very staged dirs counted below. Park them at the
+	// per-VM busy guard and wait for both to return before cleanup.
+	m.pendingInFlight.Store("vm-1", struct{}{})
+	awaitRehashWorkers(t, m, 2)
 
 	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
 	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())

@@ -40,3 +40,31 @@ func TestParseSecretsProxyAddr(t *testing.T) {
 		})
 	}
 }
+
+func TestPausedNetworkReclaimTriggersConfigured(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name           string
+		slotPercent    int
+		slotReserve    int
+		netnsThreshold int
+		mountThreshold int
+		wantConfigured bool
+	}{
+		{name: "all disabled", wantConfigured: false},
+		{name: "slot percent", slotPercent: 5, wantConfigured: true},
+		{name: "slot reserve", slotReserve: 1, wantConfigured: true},
+		{name: "netns threshold", netnsThreshold: 1, wantConfigured: true},
+		{name: "mount threshold", mountThreshold: 1, wantConfigured: true},
+		{name: "mixed disabled", slotPercent: 0, slotReserve: 0, netnsThreshold: 0, mountThreshold: 0, wantConfigured: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pausedNetworkReclaimTriggersConfigured(tc.slotPercent, tc.slotReserve, tc.netnsThreshold, tc.mountThreshold); got != tc.wantConfigured {
+				t.Fatalf("pausedNetworkReclaimTriggersConfigured() = %v, want %v", got, tc.wantConfigured)
+			}
+		})
+	}
+}
