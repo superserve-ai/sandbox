@@ -138,13 +138,21 @@ func (u *Uploader) Run(ctx context.Context) error {
 	// a large completion history neither holds the shared DB's write
 	// lock in one transaction nor delays the first queued backups.
 	seeding := u.OnVerified != nil
+	if seeding {
+		// A cursor surviving a restart could resume past completions an
+		// older binary wrote during a rollback interval; fresh processes
+		// start their first pass at the top.
+		if err := u.Journal.ResetSeedCursor(); err != nil {
+			u.Log.Error().Err(err).Msg("seed cursor reset failed; seeding proceeds from persisted position")
+		}
+	}
 	// Deliver completion signals a previous process acked but never
 	// notified: the outbox is the only record of those.
 	u.flushNotifications()
 	lastSweep := u.clock()
 	for {
 		if seeding {
-			if done, err := u.Journal.SeedOutboxFromCompletions(u.Store.Identity()); err != nil {
+			if done, err := u.Journal.SeedOutboxFromCompletions(); err != nil {
 				u.Log.Error().Err(err).Msg("outbox completion seed failed; will retry")
 			} else if done {
 				seeding = false

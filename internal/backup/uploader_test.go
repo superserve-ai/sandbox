@@ -2450,16 +2450,23 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
+	if _, err := j.SeedOutboxFromCompletions(); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := j.PendingNotifications(0)
-	if err != nil || len(pending) != 2 {
-		t.Fatalf("outbox after seed = %d entries (err %v), want the two bucket-a completions", len(pending), err)
+	if err != nil || len(pending) != 3 {
+		t.Fatalf("outbox after seed = %d entries (err %v), want all three scopes' completions", len(pending), err)
 	}
 	for _, p := range pending {
-		if p.VerifiedBucket != "bucket-a" || p.VerifiedAt.IsZero() {
-			t.Fatalf("seeded entry = %+v, want pinned bucket-a and ack instant", p)
+		want := "bucket-a"
+		if p.SandboxID == "sb-other" {
+			// Every recorded scope seeds, each entry pinning its own
+			// bucket: pre-reporter completions under an earlier
+			// BACKUP_BUCKET still name real objects there.
+			want = "bucket-b"
+		}
+		if p.VerifiedBucket != want || p.VerifiedAt.IsZero() {
+			t.Fatalf("seeded entry = %+v, want pinned %s and ack instant", p, want)
 		}
 		if p.TemplateID == "tpl" && p.BuildID != "b1" {
 			t.Fatalf("template seed lost its build id: %+v", p)
@@ -2473,7 +2480,7 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
+	if _, err := j.SeedOutboxFromCompletions(); err != nil {
 		t.Fatal(err)
 	}
 	if rest, _ := j.PendingNotifications(0); len(rest) != 0 {
@@ -2490,7 +2497,7 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 	if err := j.Ack(late, "bucket-a", false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
+	if _, err := j.SeedOutboxFromCompletions(); err != nil {
 		t.Fatal(err)
 	}
 	caught, err := j.PendingNotifications(0)
@@ -2562,7 +2569,7 @@ func TestSeedChunksAndResumes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	done, err := j.SeedOutboxFromCompletions("bucket-a")
+	done, err := j.SeedOutboxFromCompletions()
 	if err != nil || done {
 		t.Fatalf("first chunk done=%v err=%v, want an incomplete scan", done, err)
 	}
@@ -2571,7 +2578,7 @@ func TestSeedChunksAndResumes(t *testing.T) {
 		if rounds > 10 {
 			t.Fatal("seed never completed")
 		}
-		done, err = j.SeedOutboxFromCompletions("bucket-a")
+		done, err = j.SeedOutboxFromCompletions()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2588,7 +2595,7 @@ func TestSeedChunksAndResumes(t *testing.T) {
 		if rounds > 10 {
 			t.Fatal("converged seed never reached its fixed point")
 		}
-		done, err = j.SeedOutboxFromCompletions("bucket-a")
+		done, err = j.SeedOutboxFromCompletions()
 		if err != nil {
 			t.Fatal(err)
 		}

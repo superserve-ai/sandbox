@@ -1,7 +1,6 @@
 package backup
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -806,13 +805,27 @@ const seedChunkLimit = 256
 // the restarted pass is cheap skips and reaches the fixed point on the
 // first pass that finds nothing new. The cursor persists pagination
 // position and whether the current pass has found work.
-func (j *Journal) SeedOutboxFromCompletions(scope string) (bool, error) {
-	cursorKey := []byte("\x00completions_seed_cursor\x00" + scope)
+// ResetSeedCursor drops any persisted pagination cursor. Called once at
+// uploader startup: a cursor surviving a process restart could resume a
+// pass whose already-scanned region predates completions an older
+// binary wrote during a rollback interval, declaring a clean pass over
+// keys it never examined. A fresh process always starts its first pass
+// at the top; within a process, in-process acks bank and mark
+// themselves, so resumed passes are sound.
+func (j *Journal) ResetSeedCursor() error {
+	return j.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(outboxBucket).Delete(seedCursorKey)
+	})
+}
+
+var seedCursorKey = []byte("\x00completions_seed_cursor")
+
+func (j *Journal) SeedOutboxFromCompletions() (bool, error) {
+	cursorKey := seedCursorKey
 	done := false
 	err := j.db.Update(func(tx *bolt.Tx) error {
 		ob := tx.Bucket(outboxBucket)
 		seeded := tx.Bucket(seededBucket)
-		prefix := []byte(scope + "\x00")
 		c := tx.Bucket(completionsBucket).Cursor()
 		var k, v []byte
 		// Both pass properties persist across pagination: whether the
@@ -829,10 +842,14 @@ func (j *Journal) SeedOutboxFromCompletions(scope string) (bool, error) {
 			// The cursor names the first unprocessed key: resume at it.
 			k, v = c.Seek(cur[3:])
 		} else {
-			k, v = c.Seek(prefix)
+			k, v = c.First()
 		}
+		// The scan covers EVERY recorded bucket identity, not just the
+		// configured one: pre-reporter completions scoped to an earlier
+		// BACKUP_BUCKET still name real objects in that bucket, and each
+		// seeded task pins the scope parsed from its own key.
 		examined := 0
-		for ; k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+		for ; k != nil; k, v = c.Next() {
 			key := append([]byte(nil), k...)
 			if examined >= seedChunkLimit {
 				top, work := byte('0'), byte('0')
@@ -849,7 +866,12 @@ func (j *Journal) SeedOutboxFromCompletions(scope string) (bool, error) {
 				continue
 			}
 			hadWork = true
-			rest := string(k[len(prefix):])
+			parts := string(key)
+			si := strings.IndexByte(parts, 0)
+			if si < 0 {
+				continue
+			}
+			scope, rest := parts[:si], parts[si+1:]
 			i := strings.LastIndexByte(rest, 0)
 			if i < 0 {
 				continue
