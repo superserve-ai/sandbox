@@ -457,48 +457,6 @@ func TestJournalOutboxDepth(t *testing.T) {
 	}
 }
 
-// OwnerCovered ties backfill-ledger trust to coverage NEWER than the
-// mark: an older generation's completion must not mask an abandoned
-// backfill upload, while any pending row or a completion after the mint
-// keeps the skip.
-func TestOwnerCoveredHonorsSinceBound(t *testing.T) {
-	j, _ := testJournal(t)
-	markTime := time.Now()
-
-	// A generation completed BEFORE the mark does not cover.
-	old := Task{SandboxID: "sb", Generation: "gen-old", EnqueuedAt: time.Unix(1, 0)}
-	if err := j.Enqueue(old); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := j.Ack(old, "bucket", false); err != nil {
-		t.Fatal(err)
-	}
-	if cov, err := j.OwnerCovered("bucket", "sb", markTime.Add(time.Minute)); err != nil || cov {
-		t.Fatalf("covered by pre-mark completion = %v err=%v, want false", cov, err)
-	}
-
-	// A pending row covers regardless of age.
-	pendingTask := Task{SandboxID: "sb", Generation: "gen-pending", EnqueuedAt: time.Unix(2, 0)}
-	if err := j.Enqueue(pendingTask); err != nil {
-		t.Fatal(err)
-	}
-	if cov, err := j.OwnerCovered("bucket", "sb", markTime.Add(time.Minute)); err != nil || !cov {
-		t.Fatalf("covered with pending row = %v err=%v, want true", cov, err)
-	}
-
-	// A completion at/after the mark covers.
-	if _, err := j.Ack(pendingTask, "bucket", false); err != nil {
-		t.Fatal(err)
-	}
-	if cov, err := j.OwnerCovered("bucket", "sb", markTime); err != nil || !cov {
-		t.Fatalf("covered by post-mark completion = %v err=%v, want true", cov, err)
-	}
-
-	// Scope isolation: another bucket's completions say nothing here.
-	if cov, err := j.OwnerCovered("other-bucket", "sb", markTime); err != nil || cov {
-		t.Fatalf("cross-bucket covered = %v err=%v, want false", cov, err)
-	}
-}
 
 // An abandonment carrying a stale snapshot must not clear a row that was
 // upgraded since the attempt began: a live pause's staging or promotion

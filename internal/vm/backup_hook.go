@@ -49,17 +49,6 @@ func (m *Manager) SetBackupCovered(fn func(backup.Task) (bool, error)) {
 	m.backupCovered = fn
 }
 
-// SetBackupOwnerCovered installs the generation-free coverage probe: does
-// the sandbox have any pending task, or a generation completed at or
-// after `since`? The backfill ledger's skip path passes its mark's mint
-// time, because a ledger mark only proves an enqueue happened, the
-// uploader's retry ceiling can abandon that task afterward, and an OLDER
-// generation's completion must not mask the abandoned one. nil degrades
-// to trusting the ledger alone.
-func (m *Manager) SetBackupOwnerCovered(fn func(sandboxID string, since time.Time) (bool, error)) {
-	m.backupOwnerCovered = fn
-}
-
 // retryWithBackoff runs attempt with doubling delays until it succeeds
 // or enqueueRetryAttempts are exhausted, reporting whether it succeeded.
 // The first attempt is already behind the caller; this helper owns only
@@ -765,18 +754,19 @@ func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger)
 			unreadable++
 			continue
 		}
-		if prev, minted, ok, err := m.state.GetBackfillMark(rec.ID); err == nil && ok && prev == id {
-			// The mark proves an enqueue happened, not that the upload
-			// survived: the retry ceiling can abandon a stuck task after
-			// the mark was written, and a backfilled sandbox may never
-			// pause again to replace the loss. Skip only while the journal
-			// still shows the sandbox pending or completed; otherwise the
-			// mark is stale and the snapshot re-mints below. Probe errors
-			// keep the skip (transient journal trouble must not stampede
+		if prev, gen, ok, err := m.state.GetBackfillMark(rec.ID); err == nil && ok && prev == id && gen != "" {
+			// The mark binds the snapshot to the exact generation its
+			// mint enqueued, so the probe is a point lookup: pending or
+			// completed for THAT generation. An older generation's
+			// completion (even one still in flight when the mark was
+			// written) can never satisfy it, and an abandoned upload
+			// makes the mark stale and re-mints below. Probe errors keep
+			// the skip (transient journal trouble must not stampede
 			// re-hashing), and a nil probe trusts the ledger as before.
 			stale := false
-			if m.backupOwnerCovered != nil {
-				if cov, err := m.backupOwnerCovered(rec.ID, minted); err == nil && !cov {
+			if m.backupCovered != nil {
+				probe := backup.Task{SandboxID: rec.ID, Generation: gen}
+				if cov, err := m.backupCovered(probe); err == nil && !cov {
 					stale = true
 				}
 			}
@@ -800,14 +790,8 @@ func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger)
 			covered++
 			continue
 		}
-		// Ledger AFTER the marker is durable, BEFORE the drain: from here
-		// the pending machinery owns the outcome (retained on transient
-		// failures, dropped only on supersession), and re-minting a second
-		// marker for the same snapshot could only duplicate hashing.
-		if err := m.state.PutBackfillMark(rec.ID, id, time.Now()); err != nil {
-			log.Warn().Err(err).Str("vm_id", rec.ID).Msg("backup backfill: ledger write failed")
-		}
 		minted++
+		m.lastSandboxEnqueue.Delete(rec.ID)
 		select {
 		case m.rehashSlots <- struct{}{}:
 		case <-ctx.Done():
@@ -815,6 +799,20 @@ func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger)
 		}
 		m.rehashPendingBackup(ctx, pb, log)
 		<-m.rehashSlots
+		// Ledger AFTER the mint's synchronous rehash, bound to the
+		// generation it actually enqueued: a mint that produced no
+		// enqueue (abandoned, failed) writes no mark and the next pass
+		// retries. A live pause racing this window overwrites the map
+		// entry with its own generation, which is an equally honest
+		// coverage anchor, and its resume changed the snapshot identity
+		// so the mark stops matching anyway.
+		if v, ok := m.lastSandboxEnqueue.Load(rec.ID); ok {
+			if gen, _ := v.(string); gen != "" {
+				if err := m.state.PutBackfillMark(rec.ID, id, gen); err != nil {
+					log.Warn().Err(err).Str("vm_id", rec.ID).Msg("backup backfill: ledger write failed")
+				}
+			}
+		}
 		if minted%backfillProgressEvery == 0 {
 			log.Info().Int("minted", minted).Int("already_covered", covered).
 				Msg("backup backfill progress")
@@ -1128,6 +1126,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio back
 			Msg("backup enqueue failed; pause not journaled")
 		return false, false
 	}
+	m.lastSandboxEnqueue.Store(vmID, task.Generation)
 	return true, staged
 }
 

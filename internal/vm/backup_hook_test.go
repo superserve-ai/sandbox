@@ -1639,7 +1639,7 @@ func TestBackfillPrunesLedgerForDeletedVMs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if err := st.PutBackfillMark("vm-gone", "stale-identity", time.Now()); err != nil {
+	if err := st.PutBackfillMark("vm-gone", "stale-identity", "gen-stale"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1684,13 +1684,15 @@ func TestBackfillRemintsAfterAbandonedTask(t *testing.T) {
 	tasks := make(chan backup.Task, 4)
 	covered := true
 	var probeErr error
+	var probedGen string
+	var mintedGen string
 	m := &Manager{
 		state:    st,
 		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
 		unitDead: func(context.Context, string) bool { return true },
 	}
-	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
-	m.SetBackupOwnerCovered(func(string, time.Time) (bool, error) { return covered, probeErr })
+	m.SetBackupEnqueue(func(task backup.Task) error { mintedGen = task.Generation; tasks <- task; return nil })
+	m.SetBackupCovered(func(task backup.Task) (bool, error) { probedGen = task.Generation; return covered, probeErr })
 
 	drain := func() int {
 		n := 0
@@ -1709,10 +1711,14 @@ func TestBackfillRemintsAfterAbandonedTask(t *testing.T) {
 		t.Fatalf("first pass enqueued %d tasks, want 1", n)
 	}
 
-	// Owner still covered: the mark skips.
+	// Still covered: the mark skips, probing exactly the generation the
+	// mint enqueued.
 	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
 	if n := drain(); n != 0 {
 		t.Fatalf("covered pass enqueued %d tasks, want 0", n)
+	}
+	if probedGen == "" || probedGen != mintedGen {
+		t.Fatalf("probe generation = %q, want the minted generation %q", probedGen, mintedGen)
 	}
 
 	// The task was abandoned (no pending row, no completion): the mark is

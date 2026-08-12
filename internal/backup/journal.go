@@ -464,44 +464,6 @@ func completionKey(scope string, task Task) []byte {
 	return append([]byte(scope+"\x00"), task.indexKey()...)
 }
 
-// OwnerCovered reports whether a sandbox has ANY pending task, or a
-// generation completed at or after `since`, in the given bucket. The
-// backfill ledger consults it on the skip path with the mark's mint
-// time: a ledger mark proves an enqueue happened, not that the upload
-// survived, and the retry ceiling can abandon a structurally stuck task
-// after the mark was written. The time bound is what ties the answer to
-// the MARKED generation without needing its key: an older generation's
-// completion predates the mint and must not mask the abandoned one,
-// while the marked upload's completion can only land after it.
-// Backfilled sandboxes may never pause again, so a stale mark must not
-// keep skipping. The pending seek is bounded; the completion scan walks
-// only the owner's own generations.
-func (j *Journal) OwnerCovered(scope, sandboxID string, since time.Time) (bool, error) {
-	prefix := []byte(sandboxID + "\x00")
-	completedPrefix := []byte(scope + "\x00" + sandboxID + "\x00")
-	var covered bool
-	err := j.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(indexBucket).Cursor()
-		if k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix) {
-			covered = true
-			return nil
-		}
-		cc := tx.Bucket(completionsBucket).Cursor()
-		for k, v := cc.Seek(completedPrefix); k != nil && bytes.HasPrefix(k, completedPrefix); k, v = cc.Next() {
-			var ns int64
-			if _, err := fmt.Sscanf(string(v), "%d", &ns); err != nil {
-				continue
-			}
-			if !time.Unix(0, ns).Before(since) {
-				covered = true
-				return nil
-			}
-		}
-		return nil
-	})
-	return covered, err
-}
-
 func (j *Journal) WasCompleted(scope string, task Task) (bool, error) {
 	var ok bool
 	err := j.db.View(func(tx *bolt.Tx) error {
