@@ -150,8 +150,13 @@ WHERE team_id = @team_id
        OR name ILIKE '%' || sqlc.narg('name_search')::text || '%');
 
 -- name: UpdateSandboxStatus :exec
+-- Generic status setter (reverts to 'active', boot-failure to 'failed',
+-- etc.). failed_at is guarded so any caller landing on 'failed' — present
+-- or future — gets a durable failure timestamp without having to know
+-- about it, same set-once semantics as MarkSandboxFailed.
 UPDATE sandbox
-SET status = $2, updated_at = now()
+SET status = $2, updated_at = now(),
+    failed_at = CASE WHEN $2 = 'failed' THEN COALESCE(failed_at, now()) ELSE failed_at END
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 
 -- name: UpdateSandboxHost :exec

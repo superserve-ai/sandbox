@@ -5,12 +5,13 @@
 -- PRIVILEGES in 20260730000002), so panels querying public tables directly
 -- fail with "permission denied".
 
--- Durable failure timestamp: set once, when a sandbox is actually marked
--- failed (see MarkSandboxFailed / MarkSandboxFailedInTeam below), and never
--- overwritten afterward — including by DestroySandbox, which only touches
--- status/destroyed_at/updated_at on cleanup. Nullable and never backfilled:
--- sandboxes that failed before this column existed simply have no
--- failed_at, which is correct since their real failure time isn't known.
+-- Durable failure timestamp: set once, by every write path that can land a
+-- sandbox on 'failed' (MarkSandboxFailed, MarkSandboxFailedInTeam, and the
+-- generic UpdateSandboxStatus used by e.g. the post-boot failure path), and
+-- never overwritten afterward — including by DestroySandbox, which only
+-- touches status/destroyed_at/updated_at on cleanup. Nullable and never
+-- backfilled: sandboxes that failed before this column existed simply have
+-- no failed_at, which is correct since their real failure time isn't known.
 ALTER TABLE sandbox ADD COLUMN IF NOT EXISTS failed_at timestamptz;
 
 -- Minimal projection of sandbox_active_interval (just the two columns the
@@ -25,8 +26,8 @@ FROM sandbox_active_interval;
 -- rewrites 'failed' to 'deleted' on cleanup (and bumps updated_at), so a
 -- day's count would silently shrink as failed sandboxes get reaped later.
 -- failed_at is set once, at the moment a sandbox is actually marked failed
--- (see MarkSandboxFailed / MarkSandboxFailedInTeam), and is never touched by
--- the delete path, so it stays a durable per-sandbox failure event even
+-- by any of the write paths that can do so, and is never touched by the
+-- delete path, so it stays a durable per-sandbox failure event even
 -- after the row moves on to 'deleted'. Rows failed before this column
 -- existed have failed_at NULL and are excluded rather than misdated.
 CREATE OR REPLACE VIEW analytics.daily_sandbox_failures AS

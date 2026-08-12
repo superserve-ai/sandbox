@@ -2228,7 +2228,8 @@ func (q *Queries) UpdateSandboxPreviewAccess(ctx context.Context, arg UpdateSand
 
 const updateSandboxStatus = `-- name: UpdateSandboxStatus :exec
 UPDATE sandbox
-SET status = $2, updated_at = now()
+SET status = $2, updated_at = now(),
+    failed_at = CASE WHEN $2 = 'failed' THEN COALESCE(failed_at, now()) ELSE failed_at END
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL
 `
 
@@ -2238,6 +2239,10 @@ type UpdateSandboxStatusParams struct {
 	TeamID uuid.UUID     `json:"team_id"`
 }
 
+// Generic status setter (reverts to 'active', boot-failure to 'failed',
+// etc.). failed_at is guarded so any caller landing on 'failed' — present
+// or future — gets a durable failure timestamp without having to know
+// about it, same set-once semantics as MarkSandboxFailed.
 func (q *Queries) UpdateSandboxStatus(ctx context.Context, arg UpdateSandboxStatusParams) error {
 	_, err := q.db.Exec(ctx, updateSandboxStatus, arg.ID, arg.Status, arg.TeamID)
 	return err
