@@ -188,8 +188,11 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 // staging) it runs the at-rest flow over the mutable originals, proving
 // the bytes are not being written before trusting a hash of them.
 // Terminal outcomes clear the pending record; only transient failures
-// keep it for the sweep.
-func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) {
+// keep it for the sweep. Reports whether this call actually ran the
+// flow: false means the per-VM busy guard yielded to an older worker,
+// so nothing this call observes (in particular the backfill's enqueue
+// capture) can be attributed to it.
+func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) bool {
 	if m.rehashDone != nil {
 		defer m.rehashDone()
 	}
@@ -205,7 +208,7 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	// worker's exact-token cleanup no-ops against it.
 	m.healPendingBackup(pb, log)
 	if _, busy := m.pendingInFlight.LoadOrStore(pb.VMID, struct{}{}); busy {
-		return
+		return false
 	}
 	defer m.pendingInFlight.Delete(pb.VMID)
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
@@ -218,9 +221,10 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		// retention promise wants a destroyed sandbox's last pause in
 		// the bucket.
 		m.enqueueStagedPending(rctx, pb, log)
-		return
+		return true
 	}
 	m.rehashUnstagedLocked(rctx, pb, log)
+	return true
 }
 
 // rehashUnstagedLocked is the at-rest flow over mutable original paths,
@@ -805,16 +809,17 @@ func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger)
 		case <-ctx.Done():
 			return
 		}
-		m.rehashPendingBackup(ctx, pb, log)
+		ran := m.rehashPendingBackup(ctx, pb, log)
 		<-m.rehashSlots
 		// Ledger AFTER the mint's synchronous rehash, bound to the
-		// generation it actually enqueued: a mint that produced no
-		// enqueue (abandoned, failed) writes no mark and the next pass
-		// retries. A live pause racing this window overwrites the map
-		// entry with its own generation, which is an equally honest
-		// coverage anchor, and its resume changed the snapshot identity
-		// so the mark stops matching anyway.
-		if v, ok := m.lastSandboxEnqueue.Load(rec.ID); ok {
+		// generation it actually enqueued, and ONLY when this call ran
+		// the flow: the per-VM busy guard serializes all sandbox enqueue
+		// workers, so a run that executed proves the captured generation
+		// is this mint's, while a yielded run could be reading an older
+		// worker's enqueue and must write no mark (the marker machinery
+		// owns the outcome and the next pass re-evaluates). A mint that
+		// produced no enqueue (abandoned, failed) also writes no mark.
+		if v, ok := m.lastSandboxEnqueue.Load(rec.ID); ok && ran {
 			if gen, _ := v.(string); gen != "" {
 				if err := m.state.PutBackfillMark(rec.ID, id, gen); err != nil {
 					log.Warn().Err(err).Str("vm_id", rec.ID).Msg("backup backfill: ledger write failed")
