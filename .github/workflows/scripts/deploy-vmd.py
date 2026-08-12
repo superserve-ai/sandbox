@@ -340,12 +340,19 @@ def main() -> int:
                 # (cmd/vmd/main.go), so a nested path like
                 # /mnt/localssd/journals/backup.db needs this directory to
                 # exist before vmd (or the migration copy below) can open a
-                # file in it. A no-op when the parent already exists. 0700,
-                # not the more common 0755: only vmd (root) ever needs to
-                # reach this directory, matching the 0600 the journal file
-                # itself already gets, rather than leaving its existence,
-                # name, and size readable to every local user.
-                sudo install -d -m 0700 "$(dirname {q_backup_journal})"
+                # file in it. Only set the 0700 mode (vs. the more common
+                # 0755 -- only vmd, as root, ever needs to reach this
+                # directory) when actually CREATING it: for the common
+                # configured value, /mnt/localssd/backup.db, dirname is
+                # /mnt/localssd itself -- the shared mount root RUN_DIR and
+                # SNAPSHOT_DIR also live under -- and install -d re-chmods
+                # existing directories too, so applying it unconditionally
+                # would narrow that shared mountpoint's permissions on
+                # every single deploy.
+                BJ_JOURNAL_DIR="$(dirname {q_backup_journal})"
+                if [ ! -d "$BJ_JOURNAL_DIR" ]; then
+                    sudo install -d -m 0700 "$BJ_JOURNAL_DIR"
+                fi
             fi
 
             # Extract the deploy bundle into a sha-scoped staging dir so
@@ -756,7 +763,20 @@ def main() -> int:
                 # the socket. A no-op start on units that were never
                 # stopped. Disarmed only once {service} is confirmed active
                 # again, near the end of this script.
-                trap '\''sudo systemctl start superserve-vmd.socket {service} 2>/dev/null || true'\'' EXIT
+                #
+                # Re-verifies the mount at fire time rather than blindly
+                # restarting: $BJ_ANCESTOR is set below and stays valid for
+                # the rest of this block, so a failure well after the mount
+                # check (the env write, say) could still be firing this
+                # handler while the mount is fine and a restart is exactly
+                # right — but if it's the mount check itself that's failing,
+                # or the mount vanished in the meantime, restarting would
+                # recreate the very root-backed journal this section exists
+                # to prevent. Stop both units instead and leave them down in
+                # that case: down but honest beats up and silently wrong.
+                # Empty $BJ_ANCESTOR (nothing checked yet) falls through to
+                # the normal restart, same as before.
+                trap '\''if [ -n "$BJ_ANCESTOR" ] && [ "$(sudo stat -c %d "$BJ_ANCESTOR" 2>/dev/null)" = "$(sudo stat -c %d / 2>/dev/null)" ]; then echo "WARNING: $BJ_ANCESTOR is on the root filesystem; leaving superserve-vmd.socket and {service} stopped rather than restarting onto it" >&2; sudo systemctl stop superserve-vmd.socket {service} 2>/dev/null || true; else sudo systemctl start superserve-vmd.socket {service} 2>/dev/null || true; fi'\'' EXIT
                 NEW_BACKUP_JOURNAL_PATH={q_backup_journal}
                 # EnvironmentFile= (systemd.exec(5), which is what loads
                 # vmd.env) accepts quoted values, and vmd itself receives
@@ -817,18 +837,11 @@ def main() -> int:
                 done
                 if [ "$(sudo stat -c %d "$BJ_ANCESTOR")" = "$(sudo stat -c %d /)" ]; then
                     echo "ERROR: $BJ_ANCESTOR is on the root filesystem, not a separate mount; refusing to deploy" >&2
-                    # Do NOT let the recovery trap restart vmd here: {service}
-                    # is already stopped, but the trap's own restart (and,
-                    # if left active, the socket auto-activating it) would
-                    # bring vmd back up against vmd.env's still-current,
-                    # normally-correct path -- which, since this check just
-                    # proved the real mount is gone, now silently resolves
-                    # to the root disk instead. That's exactly the failure
-                    # this check exists to catch, so disarm the trap and
-                    # stop the socket too: down but honest beats up and
-                    # silently writing the journal to the wrong disk.
-                    trap - EXIT
-                    sudo systemctl stop superserve-vmd.socket {service} 2>/dev/null || true
+                    # The recovery trap armed above re-checks $BJ_ANCESTOR
+                    # itself before deciding whether to restart, so a plain
+                    # exit here correctly leaves both units stopped instead
+                    # of restarting vmd onto the root-backed path this check
+                    # just caught.
                     exit 1
                 fi
 
