@@ -787,8 +787,24 @@ def main() -> int:
                 fi
 
                 if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ]; then
-                    # The destination's mount is already confirmed by the
-                    # precondition block at the top of this script.
+                    # The precondition block at the top of this script
+                    # already confirmed the mount, but that was before
+                    # extracting the bundle and installing binaries/units —
+                    # a long enough window that the array could be
+                    # transiently unmounted by the time we get here. Check
+                    # again immediately before mutating anything below: a
+                    # cp into a now-root-backed directory would publish and
+                    # retire the source against a destination that isn't
+                    # really on the SSD, exactly what the earlier check
+                    # exists to prevent.
+                    BJ_ANCESTOR="$(dirname "$NEW_BACKUP_JOURNAL_PATH")"
+                    while [ ! -d "$BJ_ANCESTOR" ] && [ "$BJ_ANCESTOR" != "/" ]; do
+                        BJ_ANCESTOR="$(dirname "$BJ_ANCESTOR")"
+                    done
+                    if [ "$(sudo stat -c %d "$BJ_ANCESTOR")" = "$(sudo stat -c %d /)" ]; then
+                        echo "ERROR: $BJ_ANCESTOR is on the root filesystem, not a separate mount; refusing to deploy" >&2
+                        exit 1
+                    fi
                     # {service} was stopped above, but superserve-vmd.socket
                     # stays active the rest of this script by design
                     # (zero-downtime deploys), so a connection landing in the
