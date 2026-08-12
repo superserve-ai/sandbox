@@ -504,14 +504,16 @@ def main() -> int:
                 echo {q_otel_env_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
-            # Upsert HOST_ID with the instance name. vmd falls back to
-            # "default" without it, which breaks reconciler DB scoping,
-            # heartbeat identity, and the host_id metric label the backup
-            # alert policies filter on. The instance name is the host's
-            # identity in the host table and in those filters; on hosts
-            # where it was seeded by hand this rewrites the same value.
-            sudo sed -i '/^HOST_ID=/d' /etc/sandbox/vmd.env
-            echo {q_host_id_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            # Set HOST_ID to the instance name only when the env has no
+            # value yet. HOST_ID is the host's identity in the host table,
+            # so it must never change across deploys: heartbeats and
+            # reconciler scoping key on the existing row, and rewriting it
+            # to the instance name orphans any host whose row predates the
+            # name-matching convention. New hosts get the instance name,
+            # which is the convention for every row created since.
+            if ! sudo grep -q '^HOST_ID=' /etc/sandbox/vmd.env; then
+                echo {q_host_id_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
 
             # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes
             # its control socket into RuntimeDirectory=/run/secretsproxy under
