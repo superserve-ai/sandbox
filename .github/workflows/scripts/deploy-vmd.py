@@ -826,30 +826,57 @@ def main() -> int:
                         # are only cached writes until this point: root disk
                         # and the local-SSD array are separate devices with
                         # independent write-back queues, so a crash here
-                        # could retire the source (next step) while the
-                        # destination's data, or even the rename's own
-                        # directory entry, hasn't reached stable storage yet
-                        # — on reboot vmd would find a missing or truncated
-                        # destination with no source left to fall back to.
-                        # Flush everything to disk before going any further
-                        # so the destination is durable before the source is
-                        # touched.
+                        # could leave the destination's data, or even the
+                        # rename's own directory entry, unwritten — on reboot
+                        # vmd would find a missing or truncated destination.
+                        # Flush everything to disk before going any further,
+                        # and before the config below can start pointing at
+                        # this destination.
                         sudo sync
-                        # Rename rather than remove the source: if this
-                        # script is killed between the two mv calls above, a
-                        # recoverable file survives instead of an unlinked
-                        # inode. Not cleaned up afterward — reclaiming it
-                        # safely needs the same "nothing still references it"
-                        # guarantee that motivates renaming over deleting it
-                        # here, for a single-digit-MB file, not the multi-GB
-                        # artifacts that actually filled the root disk.
-                        sudo mv "$OLD_BACKUP_JOURNAL_PATH" "${{OLD_BACKUP_JOURNAL_PATH}}.migrated"
-                        echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
+                        # The source is intentionally NOT retired here. It's
+                        # retired below, only once vmd.env durably names
+                        # NEW_BACKUP_JOURNAL_PATH — see that block for why.
                     fi
                 fi
 
-                sudo sed -i '/^BACKUP_JOURNAL_PATH=/d' /etc/sandbox/vmd.env
-                echo {q_backup_journal_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+                # Publish the override as one atomic swap instead of
+                # sed -i (delete) + tee -a (append): those are two separate
+                # writes, so a failure or interruption between them (full
+                # disk, dropped session) can leave vmd.env with no
+                # BACKUP_JOURNAL_PATH line at all. vmd would then fall back
+                # to its own default — $OLD_BACKUP_JOURNAL_PATH — and if a
+                # migration above already ran, that path is empty or gone,
+                # so vmd creates a fresh database there. A later deploy
+                # would then read that fresh empty file as "the old journal"
+                # and copy it over the real one, destroying it. Build the
+                # new content in a temp file on the same filesystem as
+                # vmd.env and rename it into place: vmd.env is always either
+                # fully the old content or fully the new content, never
+                # in between, regardless of when a failure happens.
+                sudo touch /etc/sandbox/vmd.env
+                BJ_ENV_TMP="/etc/sandbox/vmd.env.tmp.$$"
+                sudo rm -f /etc/sandbox/vmd.env.tmp.*
+                sudo cp --preserve=mode,ownership /etc/sandbox/vmd.env "$BJ_ENV_TMP"
+                sudo sed -i '/^BACKUP_JOURNAL_PATH=/d' "$BJ_ENV_TMP"
+                echo {q_backup_journal_line} | sudo tee -a "$BJ_ENV_TMP" > /dev/null
+                sudo sync
+                sudo mv "$BJ_ENV_TMP" /etc/sandbox/vmd.env
+
+                if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ] \\
+                    && [ -f "$OLD_BACKUP_JOURNAL_PATH" ]; then
+                    # vmd.env now durably names NEW_BACKUP_JOURNAL_PATH, so
+                    # it's safe to retire the source: nothing will fall back
+                    # to looking for it at its original name anymore.
+                    # Rename rather than remove: if this script is killed
+                    # here, a recoverable file survives instead of an
+                    # unlinked inode. Not cleaned up afterward — reclaiming
+                    # it safely needs the same "nothing still references it"
+                    # guarantee that motivates renaming over deleting it
+                    # here, for a single-digit-MB file, not the multi-GB
+                    # artifacts that actually filled the root disk.
+                    sudo mv "$OLD_BACKUP_JOURNAL_PATH" "${{OLD_BACKUP_JOURNAL_PATH}}.migrated"
+                    echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
+                fi
             fi
             if [ "$SOCKET_CHANGED" = 1 ]; then
                 # Socket unit changed: rebind so the new ListenStream/options
