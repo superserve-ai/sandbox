@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/backup"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // SetBackupStaging points the enqueue path at the uploader's hard-link
@@ -29,6 +30,14 @@ func (m *Manager) SetBackupStaging(dir string) {
 // as covered while nothing reached BoltDB.
 func (m *Manager) SetBackupEnqueue(fn func(backup.Task) error) {
 	m.backupEnqueue = fn
+}
+
+// SetBackupMetrics installs the optional backup metrics recorder. Same
+// startup-only pattern as SetBackupEnqueue; a nil recorder (metrics
+// disabled) is safe at every call site, and recording never affects
+// backup behavior.
+func (m *Manager) SetBackupMetrics(rec *telemetry.BackupRecorder) {
+	m.backupMetrics = rec
 }
 
 // SetBackupCovered installs the journal's coverage probe: whether a
@@ -94,6 +103,15 @@ func pauseManifestComplete(manifest []ManifestEntry) bool {
 // and the uploader's pre-verification abandons that generation, which is
 // the same safe outcome as any mutated source.
 func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath, diskBasePath string, log zerolog.Logger) []ManifestEntry {
+	// The pause-hook histogram measures exactly the synchronous time this
+	// hook holds the pause RPC path (detached workers are excluded by
+	// construction: they run past the return). A size-dependent
+	// synchronous term added here would otherwise surface only in logs;
+	// the metric makes that class of regression alert instead of hide.
+	start := time.Now()
+	defer func() {
+		m.backupMetrics.RecordPauseHookDuration(ctx, time.Since(start))
+	}()
 	// NOTHING here may scale with apparent disk size: pause latency must
 	// track what the guest dirtied, and hashing a sparse overlay's full
 	// apparent content costs seconds regardless of hasher. All
@@ -121,10 +139,13 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 			go m.rehashPendingBackup(ctx, prev, log)
 			return manifest
 		}
-		if dir, staged, err := backup.StagePending(ctx, m.backupStaging, vmID, pb.Token, diskBasePath, map[string]string{
+		stageStart := time.Now()
+		dir, staged, err := backup.StagePending(ctx, m.backupStaging, vmID, pb.Token, diskBasePath, map[string]string{
 			"vmstate.snap": snapshotPath,
 			"rootfs.ext4":  diskPath,
-		}); err == nil {
+		})
+		m.backupMetrics.RecordStageDuration(ctx, time.Since(stageStart))
+		if err == nil {
 			pb.OrigSnapshotPath = snapshotPath
 			pb.OrigDiskPath = diskPath
 			pb.StagedDir = dir
@@ -169,6 +190,9 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 // Terminal outcomes clear the pending record; only transient failures
 // keep it for the sweep.
 func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) {
+	if m.rehashDone != nil {
+		defer m.rehashDone()
+	}
 	// One worker per VM: the periodic sweep and startup recovery may both
 	// find the same record while a worker is mid-hash, and a second
 	// concurrent hash of the same multi-GB artifacts buys nothing (the
@@ -252,7 +276,9 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 			return
 		}
 	}
+	hashStart := time.Now()
 	retried := collectPauseManifest(rctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, pb.DiskBasePath, log)
+	m.backupMetrics.RecordHashDuration(rctx, time.Since(hashStart))
 	if pb.DiskBasePath != "" {
 		// Re-check AFTER hashing too: the disk hash can run for minutes,
 		// and a base swapped inside that window would have been stat'ed
@@ -413,7 +439,9 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 			}
 		}
 	}
+	hashStart := time.Now()
 	entries := collectPauseManifest(ctx, pb.SnapshotPath, pb.DiskPath, baseSrc, pb.DiskBasePath, log)
+	m.backupMetrics.RecordHashDuration(ctx, time.Since(hashStart))
 	if !pauseManifestComplete(entries) {
 		log.Warn().Str("vm_id", pb.VMID).
 			Msg("staged pause backup hash failed transiently; keeping pending record")
@@ -440,7 +468,9 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 	// above), so the enqueued task is FULLY staged and needs no at-rest
 	// fallback, which could not succeed for a resumed sandbox anyway.
 	if pb.DiskBasePath != "" {
+		baseStageStart := time.Now()
 		stagedBase, err := backup.StageSharedBase(m.backupStaging, baseSrc, baseSHAFromEntries(entries), false)
+		m.backupMetrics.RecordStageDuration(ctx, time.Since(baseStageStart))
 		if err != nil {
 			log.Warn().Err(err).Str("vm_id", pb.VMID).
 				Msg("staged pause backup: base staging failed; keeping pending record")
@@ -1047,8 +1077,11 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio back
 		}
 		before, statErr := os.Stat(diskPath)
 		if statErr == nil && m.atRest(probeCtx(), vmID, snapPath) {
-			if err := backup.StageTask(m.backupStaging, &task); err != nil {
-				m.log.Warn().Err(err).Str("vm_id", vmID).
+			stageStart := time.Now()
+			stageErr := backup.StageTask(m.backupStaging, &task)
+			m.backupMetrics.RecordStageDuration(context.Background(), time.Since(stageStart))
+			if stageErr != nil {
+				m.log.Warn().Err(stageErr).Str("vm_id", vmID).
 					Msg("backup staging failed; uploading from original paths")
 			} else if after, err := os.Stat(diskPath); err == nil &&
 				os.SameFile(before, after) &&

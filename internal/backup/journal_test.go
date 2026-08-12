@@ -243,13 +243,13 @@ func TestEnqueueDedupePromotesPriority(t *testing.T) {
 	j, _ := testJournal(t)
 	gen := "promote-gen"
 	if err := j.Enqueue(Task{SandboxID: "sb", Generation: gen,
-		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
 		Priority: PriorityBestEffort, EnqueuedAt: time.Unix(1, 0)}); err != nil {
 		t.Fatal(err)
 	}
 	// A checkpoint task would outrank the best-effort row.
 	if err := j.Enqueue(Task{SandboxID: "other", Generation: "ck",
-		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/q", SHA256: "bb", Size: 1}},
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/q", SHA256: "bb", Size: 1}},
 		Priority: PriorityCheckpoint, EnqueuedAt: time.Unix(2, 0)}); err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestEnqueueDedupePromotesPriority(t *testing.T) {
 
 	// The live pause claims the same generation.
 	if err := j.Enqueue(Task{SandboxID: "sb", Generation: gen,
-		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
 		Priority: PriorityPause, EnqueuedAt: time.Unix(3, 0)}); err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestEnqueueDedupePromotesPriority(t *testing.T) {
 
 	// One-way: re-enqueueing at best-effort does not demote.
 	if err := j.Enqueue(Task{SandboxID: "sb", Generation: gen,
-		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
 		Priority: PriorityBestEffort, EnqueuedAt: time.Unix(4, 0)}); err != nil {
 		t.Fatal(err)
 	}
@@ -395,4 +395,64 @@ func TestPromotionWhileTaskInFlight(t *testing.T) {
 			t.Fatalf("WasVerified = %v (err %v), want the history recorded", verified, err)
 		}
 	})
+}
+
+func TestJournalOldestEnqueuedAt(t *testing.T) {
+	j, _ := testJournal(t)
+
+	if _, ok, err := j.OldestEnqueuedAt(); err != nil || ok {
+		t.Fatalf("empty queue: ok=%v err=%v, want no oldest", ok, err)
+	}
+
+	base := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
+	newer := Task{SandboxID: "sb-new", Generation: "gen-1", Priority: PriorityPause, EnqueuedAt: base.Add(time.Hour)}
+	older := Task{SandboxID: "sb-old", Generation: "gen-2", Priority: PriorityBestEffort, EnqueuedAt: base}
+	for _, task := range []Task{newer, older} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	oldest, ok, err := j.OldestEnqueuedAt()
+	if err != nil || !ok {
+		t.Fatalf("oldest: ok=%v err=%v", ok, err)
+	}
+	if !oldest.Equal(base) {
+		t.Fatalf("oldest = %s, want %s (priority must not mask an older low-priority task)", oldest, base)
+	}
+
+	// A Nack defers readiness but the task is still backlog: age keeps
+	// counting from the original enqueue.
+	if err := j.Nack(older, base.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	oldest, ok, err = j.OldestEnqueuedAt()
+	if err != nil || !ok || !oldest.Equal(base) {
+		t.Fatalf("post-nack oldest = %s ok=%v err=%v, want %s", oldest, ok, err, base)
+	}
+}
+
+func TestJournalOutboxDepth(t *testing.T) {
+	j, _ := testJournal(t)
+
+	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {
+		t.Fatalf("empty outbox depth = %d err=%v, want 0", depth, err)
+	}
+
+	task := Task{SandboxID: "sb-1", Generation: "gen-1", Priority: PriorityPause, EnqueuedAt: time.Now().UTC()}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(task, "bucket", true); err != nil {
+		t.Fatal(err)
+	}
+	if depth, err := j.OutboxDepth(); err != nil || depth != 1 {
+		t.Fatalf("outbox depth after notify ack = %d err=%v, want 1", depth, err)
+	}
+	if err := j.ClearNotification(task); err != nil {
+		t.Fatal(err)
+	}
+	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {
+		t.Fatalf("outbox depth after clear = %d err=%v, want 0", depth, err)
+	}
 }

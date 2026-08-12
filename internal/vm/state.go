@@ -182,6 +182,13 @@ type VMRecord struct {
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
+	// PausedAt marks when a sandbox last entered the paused state. New
+	// records persist this field; paused_network_release_at remains as a
+	// legacy compatibility field for older on-disk rows.
+	PausedAt time.Time `json:"paused_at,omitempty"`
+	// PausedNetworkReleaseAt is legacy compatibility for rows written by the
+	// older timestamp-based release policy. New writes leave it empty.
+	PausedNetworkReleaseAt time.Time `json:"paused_network_release_at,omitempty"`
 	// Supervision dispatches liveness/stop/reattach for this VM's current
 	// run. Empty (SupervisionUnit) is canonical for systemd-unit VMs so
 	// records written by this binary stay readable-and-correct under a
@@ -628,6 +635,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		BasePath:                   inst.Config.BasePath,
 		TeamID:                     inst.TeamID,
 		OwnerID:                    inst.OwnerID,
+		PausedAt:                   inst.PausedAt,
 		Supervision:                inst.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(inst.PreviewAccess, inst.PreviewPorts),
 		PreviewPorts:               previewPortsToRecord(inst.PreviewPorts),
@@ -693,26 +701,32 @@ func toInstance(rec VMRecord) *VMInstance {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
 	return &VMInstance{
-		ID:                         rec.ID,
-		PID:                        rec.PID,
-		SocketPath:                 rec.SocketPath,
-		VsockPath:                  rec.VsockPath,
-		IP:                         rec.IP,
-		TAPDevice:                  rec.TAPDevice,
-		MACAddress:                 rec.MACAddress,
-		Status:                     rec.Status,
-		Unverified:                 rec.Unverified,
-		TeardownPending:            rec.TeardownPending,
-		RunDirID:                   rec.RunDirID,
-		Namespace:                  rec.Namespace,
-		DiskPath:                   rec.DiskPath,
-		SnapshotPath:               rec.SnapshotPath,
-		MemFilePath:                rec.MemFilePath,
-		BaseMemPath:                rec.BaseMemPath,
-		CreatedAt:                  rec.CreatedAt,
-		Metadata:                   rec.Metadata,
-		TeamID:                     rec.TeamID,
-		OwnerID:                    rec.OwnerID,
+		ID:              rec.ID,
+		PID:             rec.PID,
+		SocketPath:      rec.SocketPath,
+		VsockPath:       rec.VsockPath,
+		IP:              rec.IP,
+		TAPDevice:       rec.TAPDevice,
+		MACAddress:      rec.MACAddress,
+		Status:          rec.Status,
+		Unverified:      rec.Unverified,
+		TeardownPending: rec.TeardownPending,
+		RunDirID:        rec.RunDirID,
+		Namespace:       rec.Namespace,
+		DiskPath:        rec.DiskPath,
+		SnapshotPath:    rec.SnapshotPath,
+		MemFilePath:     rec.MemFilePath,
+		BaseMemPath:     rec.BaseMemPath,
+		CreatedAt:       rec.CreatedAt,
+		Metadata:        rec.Metadata,
+		TeamID:          rec.TeamID,
+		OwnerID:         rec.OwnerID,
+		PausedAt: func() time.Time {
+			if !rec.PausedAt.IsZero() {
+				return rec.PausedAt
+			}
+			return rec.PausedNetworkReleaseAt
+		}(),
 		Supervision:                rec.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(rec.PreviewAccess, ports),
 		PreviewPorts:               ports,
