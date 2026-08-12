@@ -2580,11 +2580,21 @@ func TestSeedChunksAndResumes(t *testing.T) {
 	if pending, err := j.PendingNotifications(0); err != nil || len(pending) != total {
 		t.Fatalf("outbox after chunked seed = %d (err %v), want %d", len(pending), err, total)
 	}
-	// Completed scan advanced the mark: a fresh seed adds nothing.
-	if done, err := j.SeedOutboxFromCompletions("bucket-a"); err != nil || !done {
-		t.Fatalf("post-completion seed done=%v err=%v", done, err)
+	// Converged history: passes paginate cheaply and reach the fixed
+	// point (a clean top-to-end pass finding nothing new) without
+	// changing the outbox.
+	done, rounds = false, 0
+	for !done {
+		if rounds > 10 {
+			t.Fatal("converged seed never reached its fixed point")
+		}
+		done, err = j.SeedOutboxFromCompletions("bucket-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rounds++
 	}
 	if pending, _ := j.PendingNotifications(0); len(pending) != total {
-		t.Fatalf("post-completion seed changed outbox to %d, want %d", len(pending), total)
+		t.Fatalf("converged passes changed outbox to %d, want %d", len(pending), total)
 	}
 }

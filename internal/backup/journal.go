@@ -780,55 +780,75 @@ func (j *Journal) PendingNotifications(limit int) ([]Task, error) {
 	return tasks, err
 }
 
-// seedChunkLimit bounds unseeded completions processed per seed
-// transaction, so the scan of a large history neither holds the shared
-// DB's write lock in one giant transaction nor delays the drain loop it
-// interleaves with.
+// seedChunkLimit bounds completions examined per seed transaction
+// (seeded skips included), so no single write transaction on the shared
+// DB scales with history size; a full pass paginates across drain
+// iterations.
 const seedChunkLimit = 256
 
 // SeedOutboxFromCompletions backfills one bounded chunk of the
 // notification outbox from the durable completions record, returning
-// done=false while more remain. Completions acked without outbox
-// entries (pre-wiring history, or a rollback window running an older
-// uploader) have no other path to control-plane coverage: Covered
+// done=false while more work may remain. Completions acked without
+// outbox entries (pre-wiring history, or a rollback window running an
+// older uploader) have no other path to control-plane coverage: Covered
 // suppresses their re-enqueue and their sandboxes may never pause
 // again. Seeded-ness is structural, not clock-based: every banked
 // signal (ack-time or seed-time) records the completion key in the
 // seeded set within the same transaction, and the seed processes
 // exactly the completions absent from that set, so a rollback window's
-// acks are caught by the next upgrade regardless of clock direction and
-// nothing ever re-seeds. A persisted cursor resumes an interrupted
-// scan; converged boots pay one cheap skip-pass. Seeded tasks carry
-// owner, generation, pinned bucket, and the recorded ack instant but no
-// file manifest (the task row is long gone); the bucket's manifest
-// object remains the file-set authority. Existing outbox entries are
-// never overwritten.
+// acks are caught regardless of clock direction and nothing ever
+// re-seeds.
+//
+// Convergence: done only when a COMPLETE pass from the bucket top finds
+// zero unseeded entries. A paginated or resumed pass always restarts
+// from the top after finishing, because completions written during an
+// interruption (a rollback interval) can sort before the resume cursor;
+// the restarted pass is cheap skips and reaches the fixed point on the
+// first pass that finds nothing new. The cursor persists pagination
+// position and whether the current pass has found work.
 func (j *Journal) SeedOutboxFromCompletions(scope string) (bool, error) {
 	cursorKey := []byte("\x00completions_seed_cursor\x00" + scope)
-	done := true
+	done := false
 	err := j.db.Update(func(tx *bolt.Tx) error {
 		ob := tx.Bucket(outboxBucket)
 		seeded := tx.Bucket(seededBucket)
 		prefix := []byte(scope + "\x00")
 		c := tx.Bucket(completionsBucket).Cursor()
 		var k, v []byte
-		if cur := ob.Get(cursorKey); cur != nil {
+		// Both pass properties persist across pagination: whether the
+		// pass began at the bucket top (a resumed chunk continues its
+		// pass, it does not start a new one) and whether the pass has
+		// found unseeded work. In-process acks bank and mark themselves,
+		// so entries appearing mid-pass are impossible within a process,
+		// and cross-boot additions always get a fresh top pass.
+		passFromTop := true
+		hadWork := false
+		if cur := ob.Get(cursorKey); cur != nil && len(cur) >= 3 {
+			passFromTop = cur[0] == '1'
+			hadWork = cur[1] == '1'
 			// The cursor names the first unprocessed key: resume at it.
-			k, v = c.Seek(cur)
+			k, v = c.Seek(cur[3:])
 		} else {
 			k, v = c.Seek(prefix)
 		}
-		processed := 0
+		examined := 0
 		for ; k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
 			key := append([]byte(nil), k...)
+			if examined >= seedChunkLimit {
+				top, work := byte('0'), byte('0')
+				if passFromTop {
+					top = '1'
+				}
+				if hadWork {
+					work = '1'
+				}
+				return ob.Put(cursorKey, append([]byte{top, work, 0}, key...))
+			}
+			examined++
 			if seeded.Get(key) != nil {
 				continue
 			}
-			if processed >= seedChunkLimit {
-				done = false
-				return ob.Put(cursorKey, key)
-			}
-			processed++
+			hadWork = true
 			rest := string(k[len(prefix):])
 			i := strings.LastIndexByte(rest, 0)
 			if i < 0 {
@@ -858,6 +878,11 @@ func (j *Journal) SeedOutboxFromCompletions(scope string) (bool, error) {
 				return err
 			}
 		}
+		// End of bucket: the fixed point is a complete pass from the top
+		// that found nothing unseeded. A pass that found work restarts
+		// from the top on the next call (cursor deleted), which is cheap
+		// skips, and reaches the fixed point one pass later.
+		done = passFromTop && !hadWork
 		return ob.Delete(cursorKey)
 	})
 	if err != nil {

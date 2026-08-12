@@ -112,7 +112,7 @@ VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (sandbox_id, bucket, generation) WHERE sandbox_id IS NOT NULL
 DO UPDATE SET completed_at = excluded.completed_at, reported_at = now(), files = excluded.files
 WHERE excluded.completed_at > backup_generation.completed_at
-   OR (backup_generation.completed_at > now() AND excluded.completed_at <= now())
+   OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
 `
 
 type RecordSandboxBackupGenerationParams struct {
@@ -152,7 +152,7 @@ VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (template_id, build_id, bucket, generation) WHERE template_id IS NOT NULL
 DO UPDATE SET completed_at = excluded.completed_at, reported_at = now(), files = excluded.files
 WHERE excluded.completed_at > backup_generation.completed_at
-   OR (backup_generation.completed_at > now() AND excluded.completed_at <= now())
+   OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
 `
 
 type RecordTemplateBackupGenerationParams struct {

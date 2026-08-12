@@ -6,14 +6,16 @@
 -- freshness checks must see the current pause as covered), so an exact
 -- redelivery affects zero rows. The second refresh arm lets a corrected
 -- clock repair its own damage: a stored future value (provably bogus,
--- it exceeds now()) yields to a sane incoming one, while redelivery of
--- either report matches neither arm and stays a no-op.
+-- it exceeds now()) yields to ANY smaller incoming one, sane or merely
+-- less skewed, so repair is monotone even when the correction lands
+-- while some skew remains; redelivery of either report matches neither
+-- arm and stays a no-op.
 INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (sandbox_id, bucket, generation) WHERE sandbox_id IS NOT NULL
 DO UPDATE SET completed_at = excluded.completed_at, reported_at = now(), files = excluded.files
 WHERE excluded.completed_at > backup_generation.completed_at
-   OR (backup_generation.completed_at > now() AND excluded.completed_at <= now());
+   OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at);
 
 -- name: RecordTemplateBackupGeneration :execrows
 -- Template variant of RecordSandboxBackupGeneration; the two exist
@@ -23,7 +25,7 @@ VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (template_id, build_id, bucket, generation) WHERE template_id IS NOT NULL
 DO UPDATE SET completed_at = excluded.completed_at, reported_at = now(), files = excluded.files
 WHERE excluded.completed_at > backup_generation.completed_at
-   OR (backup_generation.completed_at > now() AND excluded.completed_at <= now());
+   OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at);
 
 -- name: LatestSandboxBackup :one
 -- Freshness bounds future timestamps at read instead of rewriting them
