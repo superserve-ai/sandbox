@@ -366,3 +366,56 @@ func TestReaper_LoopRunsImmediately(t *testing.T) {
 	}
 	t.Fatal("reaper did not run immediately on startup")
 }
+
+// TestCleanupExpiredRevocations_IndependentTimeouts verifies that the two DB
+// calls in cleanupExpiredRevocations each receive their own deadline rather
+// than sharing a single context. If they shared one context and the first
+// call ran for nearly the full budget, the second would get a near-zero
+// deadline and fail with DeadlineExceeded. With independent contexts the
+// second call always has a fresh 5-second budget.
+func TestCleanupExpiredRevocations_IndependentTimeouts(t *testing.T) {
+	const budget = 5 * time.Second
+
+	var firstDeadline, secondDeadline time.Time
+	var callCount int32
+
+	mock := &reaperMockDBTX{
+		execFn: func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+			n := atomic.AddInt32(&callCount, 1)
+			dl, ok := ctx.Deadline()
+			if !ok {
+				t.Errorf("call %d: context has no deadline", n)
+				return pgconn.CommandTag{}, nil
+			}
+			switch n {
+			case 1:
+				firstDeadline = dl
+			case 2:
+				secondDeadline = dl
+			}
+			return pgconn.CommandTag{}, nil
+		},
+	}
+	h := &Handlers{DB: db.New(mock)}
+	h.cleanupExpiredRevocations(context.Background())
+
+	if atomic.LoadInt32(&callCount) != 2 {
+		t.Fatalf("expected 2 DB exec calls, got %d", callCount)
+	}
+
+	// Each deadline must be approximately `budget` from now, not from the
+	// start of the function. A shared context would give the second call a
+	// deadline close to the first's, meaning it started from the same origin.
+	// With independent contexts both deadlines are >= budget - small delta.
+	const slack = time.Second
+	now := time.Now()
+	if d := firstDeadline.Sub(now); d < budget-slack {
+		t.Errorf("first call deadline too soon: %v remaining (want >= %v)", d, budget-slack)
+	}
+	if d := secondDeadline.Sub(now); d < budget-slack {
+		t.Errorf("second call deadline too soon: %v remaining (want >= %v)", d, budget-slack)
+	}
+	if !secondDeadline.After(firstDeadline) {
+		t.Errorf("second deadline (%v) must be strictly after first deadline (%v)", secondDeadline, firstDeadline)
+	}
+}
