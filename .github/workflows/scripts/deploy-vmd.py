@@ -334,6 +334,14 @@ def main() -> int:
                     echo "ERROR: $BJ_ANCESTOR is on the root filesystem, not a separate mount; refusing to deploy" >&2
                     exit 1
                 fi
+                # $BJ_ANCESTOR is confirmed on a real mount, so it's now safe
+                # to create the rest of the path down to the parent — vmd
+                # opens the journal directly with no mkdir of its own
+                # (cmd/vmd/main.go), so a nested path like
+                # /mnt/localssd/journals/backup.db needs this directory to
+                # exist before vmd (or the migration copy below) can open a
+                # file in it. A no-op when the parent already exists.
+                sudo install -d -m 0755 "$(dirname {q_backup_journal})"
             fi
 
             # Extract the deploy bundle into a sha-scoped staging dir so
@@ -783,7 +791,11 @@ def main() -> int:
                     # journal — the old vmd.env is still correct at that
                     # point, since it's only rewritten after this block
                     # succeeds. Arm a trap to restore both units on any such
-                    # exit; disarmed once the migration actually succeeds, below.
+                    # exit. The env write below is fallible too (full disk,
+                    # I/O error), and still needs the old units back if it
+                    # fails, so this stays armed through that write and the
+                    # restart/health-check block further down; disarmed only
+                    # once {service} is confirmed active again, there.
                     trap '\''sudo systemctl start superserve-vmd.socket {service} 2>/dev/null || true'\'' EXIT
                     sudo systemctl stop superserve-vmd.socket {service}
                     # $OLD_BACKUP_JOURNAL_PATH still present under its
@@ -829,7 +841,6 @@ def main() -> int:
                     # file, not the multi-GB artifacts that actually filled
                     # the root disk.
                     sudo mv "$OLD_BACKUP_JOURNAL_PATH" "${{OLD_BACKUP_JOURNAL_PATH}}.migrated"
-                    trap - EXIT
                     echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
                 fi
 
@@ -863,6 +874,11 @@ def main() -> int:
                 sudo journalctl -u {service} --no-pager -n 40 >&2 || true
                 exit 1
             )
+            # {service} is confirmed active on the final config: disarm the
+            # journal-migration recovery trap (a no-op if it was never
+            # armed this run). Anything past this point is unrelated to the
+            # backup journal and shouldn't restart vmd on failure.
+            trap - EXIT
 
             # Restart secretsproxy; tolerate missing env file on hosts not
             # yet provisioned (is-active check below is gated on the file).
