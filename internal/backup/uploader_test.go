@@ -2096,3 +2096,131 @@ func TestFinishPendingStageTransfersBasePinWhenAbsorbing(t *testing.T) {
 		t.Fatalf("transferred pin content = %q, want %q", got, pinContent)
 	}
 }
+
+// A task that keeps failing must not retry forever: unbounded retry
+// turns one stuck task class into monotonic journal and staging growth.
+// At the ceiling the task abandons (no completion, staging removed) and
+// the owner's next pause covers.
+func TestUploadRetriesExhaustedAbandons(t *testing.T) {
+	j, _ := testJournal(t)
+	staging := t.TempDir()
+	task := Task{SandboxID: "sb", Generation: "gen-stuck",
+		Files:      []TaskFile{{Name: "rootfs.ext4", Path: "/nonexistent/never-readable", SHA256: "aa", Size: 1}},
+		Attempts:   maxUploadAttempts - 1,
+		EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	staged := filepath.Join(staging, "sb", "gen-stuck")
+	if err := os.MkdirAll(staged, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	u := &Uploader{Journal: j, StagingRoot: staging,
+		Store: &memStore{}, Log: zerolog.Nop()}
+	// uploadTask must error (unreadable source with a manifest digest
+	// forces the failure path rather than clean abandonment).
+	worked, err := u.drainOne(context.Background(), time.Unix(10, 0))
+	if err != nil || !worked {
+		t.Fatalf("drainOne = %v %v", worked, err)
+	}
+	if pending, err := j.HasPending("sb", "gen-stuck"); err != nil || pending {
+		t.Fatalf("HasPending = %v (err %v), want the exhausted task gone", pending, err)
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Fatalf("staged dir still present (err %v), want removed on exhaustion", err)
+	}
+	if verified, err := j.WasVerified("gen-stuck", time.Unix(10, 0)); err != nil || verified {
+		t.Fatalf("WasVerified = %v (err %v), want no completion recorded", verified, err)
+	}
+}
+
+// outageStore fails every Create, the shape of a store outage.
+type outageStore struct{ BlobStore }
+
+func (outageStore) Create(context.Context, string, io.Reader) (bool, error) {
+	return false, errors.New("store unavailable")
+}
+
+// Store failures are environmental and exempt from the retry ceiling: an
+// outage must never exhaust durable work whose bytes become uploadable
+// the moment the store recovers.
+func TestStoreErrorsExemptFromRetryCeiling(t *testing.T) {
+	j, _ := testJournal(t)
+	src := filepath.Join(t.TempDir(), "rootfs.ext4")
+	if err := os.WriteFile(src, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("x"))
+	task := Task{SandboxID: "sb", Generation: "gen-outage",
+		Files:      []TaskFile{{Name: "rootfs.ext4", Path: src, SHA256: hex.EncodeToString(sum[:]), Size: 1}},
+		Attempts:   maxUploadAttempts + 5,
+		EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	u := &Uploader{Journal: j, Store: outageStore{newMemStore()}, Log: zerolog.Nop()}
+	worked, err := u.drainOne(context.Background(), time.Unix(10, 0))
+	if err != nil || !worked {
+		t.Fatalf("drainOne = %v %v", worked, err)
+	}
+	if pending, err := j.HasPending("sb", "gen-outage"); err != nil || !pending {
+		t.Fatalf("HasPending = %v (err %v), want the task retained through the outage", pending, err)
+	}
+}
+
+// A retired staging tree drains under journal authority and the root
+// itself is removed only once nothing survives inside it.
+func TestLegacyStagingDrainsThenRemoves(t *testing.T) {
+	j, _ := testJournal(t)
+	legacy := filepath.Join(t.TempDir(), "backup-staging")
+	old := time.Now().Add(-2 * time.Hour)
+
+	// One dir a queued task still references, one orphan past grace.
+	kept := filepath.Join(legacy, "sb-live", "gen-live")
+	orphan := filepath.Join(legacy, "sb-dead", "gen-dead")
+	for _, d := range []string{kept, orphan} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(d, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.Enqueue(Task{SandboxID: "sb-live", Generation: "gen-live",
+		Files:      []TaskFile{{Name: "rootfs.ext4", Path: filepath.Join(kept, "rootfs.ext4"), SHA256: "aa", Size: 1}},
+		EnqueuedAt: time.Unix(1, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(legacy, "bases"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	u := &Uploader{Journal: j, LegacyStagingRoot: legacy, Log: zerolog.Nop()}
+	u.sweepLegacyStaging()
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan survived the legacy sweep (err %v)", err)
+	}
+	if _, err := os.Stat(kept); err != nil {
+		t.Fatalf("referenced staging deleted by the legacy sweep: %v", err)
+	}
+	if u.LegacyStagingRoot == "" {
+		t.Fatal("legacy root cleared while a referenced entry survives")
+	}
+
+	// Drain the reference; the next sweep empties and removes the root.
+	if err := j.Ack(Task{SandboxID: "sb-live", Generation: "gen-live"}, "", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(kept, old, old); err != nil {
+		t.Fatal(err)
+	}
+	u.sweepLegacyStaging()
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy root survived after draining (err %v)", err)
+	}
+	if u.LegacyStagingRoot != "" {
+		t.Fatal("legacy root not cleared after removal")
+	}
+}

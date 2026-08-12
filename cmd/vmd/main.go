@@ -600,13 +600,25 @@ func main() {
 			VMDVersion: os.Getenv("SENTRY_RELEASE"),
 			Metrics:    backupMetrics,
 		}
-		// Staging pins enqueued artifacts via hard links so sandbox
-		// teardown cannot erase a queued generation; the sweep clears
-		// residue from crashes between staging and enqueue.
-		stagingRoot := filepath.Join(filepath.Dir(cfg.RunDir), "backup-staging")
+		// Staging pins enqueued artifacts so sandbox teardown cannot
+		// erase a queued generation; the sweep clears residue from
+		// crashes between staging and enqueue. The tree lives inside
+		// SNAPSHOT_DIR by default: that keeps it on the same filesystem
+		// as the artifacts it snapshots, so reflink cloning works and
+		// capacity scales with the artifact array instead of the OS
+		// disk. BACKUP_STAGING_DIR overrides for exotic layouts.
+		stagingRoot, legacyStaging := backup.ResolveStagingRoot(
+			os.Getenv("BACKUP_STAGING_DIR"), cfg.SnapshotDir, cfg.RunDir)
 		if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
 			log.Fatal().Err(err).Str("path", stagingRoot).Msg("failed to create backup staging dir")
 		}
+		// Relocation drains, never deletes: journal rows enqueued before
+		// the move still reference staged copies in the retired tree, so
+		// it is swept under the same journal authority as the live root
+		// until it empties, and only then removed (in the uploader's
+		// periodic sweep). Markers renewed above keep their directories
+		// alive wherever they point.
+		uploader.LegacyStagingRoot = legacyStaging
 		// Renew every durable marker's staged directory before the sweep
 		// runs: the sweep is synchronous and ordered ahead of reattach (and
 		// so ahead of RecoverPendingBackups), so a marker that survived an
@@ -615,6 +627,9 @@ func main() {
 		// under a still-durable pause.
 		mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
 		backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
+		if legacyStaging != "" {
+			backup.SweepStaging(legacyStaging, journal, log.With().Str("component", "backup").Logger())
+		}
 		uploader.StagingRoot = stagingRoot
 		mgr.SetBackupStaging(stagingRoot)
 		mgr.SetBackupEnqueue(journal.Enqueue)
