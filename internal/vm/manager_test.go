@@ -367,8 +367,11 @@ func TestReclaimPausedNetworkInventory_RecyclesOldestPausedInstance(t *testing.T
 		netnsTotal:   1,
 		ownedSlots:   network.MaxSlots - 1,
 	}
+	// A tracked instance still releases by namespace name: the by-vmID call
+	// no-ops for a VM missing from the net manager's device table, which would
+	// strand the kernel state after the record has already been cleared.
 	fake.beforeRelease = func(op, vmID, ns string) {
-		if op != "cleanup" || vmID != rec.ID {
+		if op != "cleanup_ns" || vmID != rec.ID || ns != rec.Namespace {
 			t.Fatalf("unexpected release hook call: op=%q vmID=%q ns=%q", op, vmID, ns)
 		}
 		got, err := store.Get(rec.ID)
@@ -400,11 +403,11 @@ func TestReclaimPausedNetworkInventory_RecyclesOldestPausedInstance(t *testing.T
 	if reclaimed != 1 {
 		t.Fatalf("reclaimed = %d, want 1", reclaimed)
 	}
-	if got := fake.cleanupVMCalls; len(got) != 1 || got[0] != rec.ID {
-		t.Fatalf("cleanup calls = %+v, want one recycle for %q", got, rec.ID)
+	if got := fake.cleanupCalls; len(got) != 1 || got[0].vmID != rec.ID || got[0].ns != rec.Namespace {
+		t.Fatalf("cleanup calls = %+v, want one recycle for %q/%q", got, rec.ID, rec.Namespace)
 	}
-	if len(fake.teardownCalls) != 0 {
-		t.Fatalf("teardown calls = %v, want none", fake.teardownCalls)
+	if len(fake.teardownCalls) != 0 || len(fake.teardownNSCalls) != 0 {
+		t.Fatalf("teardown calls = %v/%v, want none", fake.teardownCalls, fake.teardownNSCalls)
 	}
 	if inst.Namespace != "" || inst.IP != "" || inst.TAPDevice != "" || inst.MACAddress != "" {
 		t.Fatalf("tracked instance still held network identity: %+v", inst)

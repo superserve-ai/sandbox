@@ -174,9 +174,19 @@ type AnalyticsActiveSandboxCount struct {
 	ActiveSandboxes int64 `json:"active_sandboxes"`
 }
 
+type AnalyticsDailySandboxFailure struct {
+	Day      pgtype.Date `json:"day"`
+	Failures int64       `json:"failures"`
+}
+
 type AnalyticsDailySandboxStart struct {
 	Day    pgtype.Date `json:"day"`
 	Starts int64       `json:"starts"`
+}
+
+type AnalyticsSandboxActiveInterval struct {
+	StartedAt time.Time          `json:"started_at"`
+	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 }
 
 type AnalyticsTeamHourlySpend struct {
@@ -489,6 +499,7 @@ type Sandbox struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	FailedAt          pgtype.Timestamptz `json:"failed_at"`
 }
 
 type SandboxActiveInterval struct {
