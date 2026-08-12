@@ -287,7 +287,13 @@ func TestJournalOutboxDepth(t *testing.T) {
 	if depth, err := j.OutboxDepth(); err != nil || depth != 1 {
 		t.Fatalf("outbox depth after notify ack = %d err=%v, want 1", depth, err)
 	}
-	if err := j.ClearNotification(task); err != nil {
+	// Clear takes the entry as PendingNotifications returns it: the
+	// outbox key is scoped by the entry's pinned bucket.
+	pending, err := j.PendingNotifications()
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending = %d err=%v, want 1", len(pending), err)
+	}
+	if err := j.ClearNotification(pending[0]); err != nil {
 		t.Fatal(err)
 	}
 	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {

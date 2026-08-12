@@ -2327,3 +2327,49 @@ type outageStore struct{ BlobStore }
 func (outageStore) Create(context.Context, string, io.Reader) (bool, error) {
 	return false, errors.New("store unavailable")
 }
+
+// After a bucket repoint, the same generation legitimately completes once
+// per bucket. Outbox entries are keyed by verified bucket, so the second
+// ack must not overwrite the first bucket's undelivered signal, and
+// clearing one delivery leaves the other outboxed.
+func TestOutboxKeepsPerBucketNotifications(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(task, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(task, "bucket-b", true); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := j.PendingNotifications()
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("outbox = %d entries (err %v), want one per bucket", len(pending), err)
+	}
+	buckets := map[string]bool{}
+	for _, p := range pending {
+		buckets[p.VerifiedBucket] = true
+	}
+	if !buckets["bucket-a"] || !buckets["bucket-b"] {
+		t.Fatalf("outbox buckets = %v, want both pinned buckets", buckets)
+	}
+
+	// Clearing one bucket's delivery leaves the other signal outboxed.
+	cleared := pending[0]
+	if err := j.ClearNotification(cleared); err != nil {
+		t.Fatal(err)
+	}
+	rest, err := j.PendingNotifications()
+	if err != nil || len(rest) != 1 {
+		t.Fatalf("outbox after clear = %d entries (err %v), want 1", len(rest), err)
+	}
+	if rest[0].VerifiedBucket == cleared.VerifiedBucket {
+		t.Fatal("clear removed the wrong bucket's entry")
+	}
+}

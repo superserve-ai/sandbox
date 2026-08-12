@@ -510,7 +510,12 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 			if err != nil {
 				return err
 			}
-			if err := tx.Bucket(outboxBucket).Put(task.indexKey(), val); err != nil {
+			// Keyed by bucket + owner + generation: coverage is
+			// bucket-scoped, so the same generation can legitimately
+			// complete once per bucket after a repoint, and an unscoped
+			// key would let the second ack overwrite the first bucket's
+			// undelivered signal.
+			if err := tx.Bucket(outboxBucket).Put(completionKey(completedScope, task), val); err != nil {
 				return err
 			}
 		}
@@ -750,6 +755,15 @@ func (j *Journal) PendingNotifications() ([]Task, error) {
 // ClearNotification confirms delivery of a task's completion signal.
 func (j *Journal) ClearNotification(task Task) error {
 	return j.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(outboxBucket).Delete(task.indexKey())
+		// Scoped by the entry's own pinned bucket, mirroring the ack-time
+		// key. The unscoped delete clears entries written before the key
+		// carried the bucket; for those, VerifiedBucket is empty and the
+		// scoped delete is a no-op, so exactly one shape matches either
+		// way.
+		b := tx.Bucket(outboxBucket)
+		if err := b.Delete(completionKey(task.VerifiedBucket, task)); err != nil {
+			return err
+		}
+		return b.Delete(task.indexKey())
 	})
 }
