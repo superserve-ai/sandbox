@@ -20,6 +20,13 @@ Env vars:
                        into vmd.env when set; empty = skip, leaving the
                        host's backup uploader disabled. Staged rollout:
                        staging first, production after the staging soak.
+  BACKUP_JOURNAL_PATH  optional — path for the backup uploader's BoltDB
+                       journal. Upserted into vmd.env when set; empty = skip,
+                       leaving vmd's default (next to RUN_DIR, i.e. on the
+                       host's root disk) in place. Set this to a path on
+                       /mnt/localssd: the journal is written to continuously
+                       while backups drain, and the root disk is small
+                       enough that it can fill and stall the uploader.
   OTEL_ENVIRONMENT     optional — enables vmd's OTLP backup-metrics exporter
                        by upserting OTEL_METRICS_ENABLED=true and this value
                        as OTEL_ENVIRONMENT into vmd.env. Empty = skip,
@@ -154,6 +161,7 @@ def main() -> int:
     sha = os.environ["SHA"][:8]
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     backup_bucket = os.environ.get("BACKUP_BUCKET", "")
+    backup_journal_path = os.environ.get("BACKUP_JOURNAL_PATH", "")
     otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
     control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
     internal_api_token = os.environ.get("INTERNAL_API_TOKEN", "")
@@ -170,6 +178,8 @@ def main() -> int:
     q_sentry_line = shlex.quote(f"SENTRY_DSN={sentry_dsn}")
     q_backup = shlex.quote(backup_bucket)
     q_backup_line = shlex.quote(f"BACKUP_BUCKET={backup_bucket}")
+    q_backup_journal = shlex.quote(backup_journal_path)
+    q_backup_journal_line = shlex.quote(f"BACKUP_JOURNAL_PATH={backup_journal_path}")
     q_otel = shlex.quote(otel_environment)
     q_otel_enabled_line = shlex.quote("OTEL_METRICS_ENABLED=true")
     q_otel_env_line = shlex.quote(f"OTEL_ENVIRONMENT={otel_environment}")
@@ -490,6 +500,14 @@ def main() -> int:
             if [ -n {q_backup} ]; then
                 sudo sed -i '/^BACKUP_BUCKET=/d' /etc/sandbox/vmd.env
                 echo {q_backup_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Upsert BACKUP_JOURNAL_PATH (moves the backup uploader's BoltDB
+            # journal off the root disk onto the local-SSD array). Empty =
+            # skip, leaving vmd's default in place.
+            if [ -n {q_backup_journal} ]; then
+                sudo sed -i '/^BACKUP_JOURNAL_PATH=/d' /etc/sandbox/vmd.env
+                echo {q_backup_journal_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
             # Upsert the OTLP backup-metrics contract: enable flag plus
