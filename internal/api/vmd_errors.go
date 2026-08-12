@@ -149,6 +149,7 @@ func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, tea
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async mark-failed write failed")
 			return
 		}
+		RecordSandboxFailed(ctx)
 		RecordSandboxTransition(ctx, "fail", telemetry.ResultSuccess, hostID, time.Since(started))
 	}()
 }

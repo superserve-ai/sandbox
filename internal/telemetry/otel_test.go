@@ -198,6 +198,68 @@ func TestRecordVMDCallEmitsHostIDAndMethodAttributes(t *testing.T) {
 	}
 }
 
+func TestRecordSandboxFailedEmitsDedicatedCounter(t *testing.T) {
+	ctx := context.Background()
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+	)
+	t.Cleanup(func() {
+		if err := provider.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown meter provider: %v", err)
+		}
+	})
+
+	meter := provider.Meter(instrumentationName)
+
+	failedCounter, err := meter.Int64Counter("sandbox_failed_total")
+	if err != nil {
+		t.Fatalf("create sandbox failed counter: %v", err)
+	}
+
+	recorder := &OTelRecorder{
+		provider:      provider,
+		serviceName:   "sandbox-controlplane",
+		environment:   "staging",
+		sandboxFailed: failedCounter,
+	}
+
+	recorder.RecordSandboxFailed(ctx)
+
+	var resourceMetrics metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &resourceMetrics); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+
+	var gotValue int64
+	var found bool
+	for _, scopeMetrics := range resourceMetrics.ScopeMetrics {
+		for _, metric := range scopeMetrics.Metrics {
+			if metric.Name != "sandbox_failed_total" {
+				continue
+			}
+
+			sum, ok := metric.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("metric data type = %T, want metricdata.Sum[int64]", metric.Data)
+			}
+			if len(sum.DataPoints) != 1 {
+				t.Fatalf("data points = %d, want 1", len(sum.DataPoints))
+			}
+			gotValue = sum.DataPoints[0].Value
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatal("sandbox_failed_total metric not found")
+	}
+	if gotValue != 1 {
+		t.Fatalf("sandbox_failed_total value = %d, want 1", gotValue)
+	}
+}
+
 func TestRecordPausedNetworkPressureEmitsControllerMetrics(t *testing.T) {
 	ctx := context.Background()
 

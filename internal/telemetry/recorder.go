@@ -78,6 +78,7 @@ type PausedNetworkPressure struct {
 // operational metrics into Postgres.
 type Recorder interface {
 	RecordSandboxTransition(context.Context, SandboxTransition)
+	RecordSandboxFailed(context.Context)
 	RecordVMDCall(context.Context, VMDCall)
 	RecordHostCapacity(context.Context, HostCapacity)
 	RecordDBPoolStats(context.Context, DBPoolStats)
@@ -88,6 +89,7 @@ type noopRecorder struct{}
 
 func NewNoopRecorder() Recorder                                                         { return noopRecorder{} }
 func (noopRecorder) RecordSandboxTransition(context.Context, SandboxTransition)         {}
+func (noopRecorder) RecordSandboxFailed(context.Context)                                {}
 func (noopRecorder) RecordVMDCall(context.Context, VMDCall)                             {}
 func (noopRecorder) RecordHostCapacity(context.Context, HostCapacity)                   {}
 func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)                     {}

@@ -76,6 +76,10 @@ func RecordSandboxTransition(ctx context.Context, operation, result, hostID stri
 	})
 }
 
+func RecordSandboxFailed(ctx context.Context) {
+	currentTelemetryRecorder().RecordSandboxFailed(ctx)
+}
+
 // SandboxLifecycleTelemetry records coarse user-visible sandbox lifecycle
 // transitions from the routed API surface. It intentionally emits only bounded
 // labels; sandbox IDs, team IDs, user IDs, request IDs, URLs, and raw errors are

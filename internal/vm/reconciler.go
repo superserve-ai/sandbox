@@ -152,7 +152,13 @@ func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
 		driftSeen:    make(map[string]time.Time),
 		prevKeptLive: -1,
 	}
-	r.markFailed = r.markFailedInDB
+	r.markFailed = func(ctx context.Context, vmID string, observed db.SandboxStatus) bool {
+		flipped := r.markFailedInDB(ctx, vmID, observed)
+		if flipped && r.mgr != nil && r.mgr.recorder != nil {
+			r.mgr.recorder.RecordSandboxFailed(ctx)
+		}
+		return flipped
+	}
 	r.stopVM = mgr.stopVM
 	return r
 }
@@ -689,7 +695,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// branch below).
 		if dbSandboxes != nil {
 			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
-				r.markFailedInDB(ctx, id, db.SandboxStatusActive)
+				r.markFailed(ctx, id, db.SandboxStatusActive)
 			}
 		}
 		r.finalizeErrorReap(ctx, id, "errunit:"+id, "error_unit_stop",
@@ -742,7 +748,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// wedge: the next pass's snapshot reads 'failed'.
 			if dbSandboxes != nil {
 				if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive && r.consumeAutoFailBudget(id) {
-					if r.markFailedInDB(ctx, id, db.SandboxStatusActive) {
+					if r.markFailed(ctx, id, db.SandboxStatusActive) {
 						r.writeAudit(ctx, id, "mark_failed", "wedged error VM: row flipped while awaiting terminal unit", "boltdb_error_unit_wedged")
 					}
 				}
@@ -760,7 +766,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// compare-and-set: a relaunch may own the row by now).
 		if dbSandboxes != nil {
 			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
-				r.markFailedInDB(ctx, id, db.SandboxStatusActive)
+				r.markFailed(ctx, id, db.SandboxStatusActive)
 			}
 		}
 		r.finalizeErrorReap(ctx, id, "errdead:"+id, "stale_cleanup",
@@ -1637,7 +1643,7 @@ func (r *Reconciler) failEmptyShells(ctx context.Context, log zerolog.Logger, db
 			// behind a dead unit costs another grace+budget cycle via the
 			// dead-VM rule). Detach from the pass context, bounded.
 			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-			flipped := r.markFailedInDB(persistCtx, id, db.SandboxStatusActive)
+			flipped := r.markFailed(persistCtx, id, db.SandboxStatusActive)
 			r.markStale(id)
 			if flipped {
 				r.writeAudit(persistCtx, id, "mark_failed", "empty Firecracker shell while DB said active", "fc_empty_shell")

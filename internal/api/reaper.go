@@ -456,6 +456,7 @@ func (h *Handlers) markSandboxFailed(ctx context.Context, sbx db.ClaimExpiredSan
 		l.Error().Err(err).Str("reason", reason).Msg("reaper: TERMINAL — sandbox stuck in 'pausing', mark-failed also failed, manual recovery required")
 		return
 	}
+	RecordSandboxFailed(ctx)
 	RecordSandboxTransition(ctx, "fail", telemetry.ResultSuccess, sbx.HostID, time.Since(started))
 	l.Error().Str("reason", reason).Msg("reaper: TERMINAL — sandbox marked 'failed', manual recovery required")
 }

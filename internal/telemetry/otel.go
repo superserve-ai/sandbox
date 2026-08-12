@@ -34,6 +34,7 @@ type OTelRecorder struct {
 	environment string
 
 	sandboxTransitions       metric.Int64Counter
+	sandboxFailed            metric.Int64Counter
 	sandboxDuration          metric.Float64Histogram
 	vmdCalls                 metric.Int64Counter
 	vmdDuration              metric.Float64Histogram
@@ -86,6 +87,9 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		environment: cfg.Environment,
 	}
 	if r.sandboxTransitions, err = meter.Int64Counter("sandbox_transition_total"); err != nil {
+		return nil, err
+	}
+	if r.sandboxFailed, err = meter.Int64Counter("sandbox_failed_total"); err != nil {
 		return nil, err
 	}
 	if r.sandboxDuration, err = meter.Float64Histogram("sandbox_transition_duration_seconds"); err != nil {
@@ -179,6 +183,13 @@ func (r *OTelRecorder) RecordSandboxTransition(ctx context.Context, t SandboxTra
 	if t.Duration > 0 {
 		r.sandboxDuration.Record(ctx, t.Duration.Seconds(), opt)
 	}
+}
+
+func (r *OTelRecorder) RecordSandboxFailed(ctx context.Context) {
+	if r == nil {
+		return
+	}
+	r.sandboxFailed.Add(ctx, 1, metric.WithAttributes(r.attrs()...))
 }
 
 func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
