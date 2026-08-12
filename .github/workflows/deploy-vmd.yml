@@ -171,8 +171,10 @@ jobs:
           BACKUP_BUCKET: superserve-artifact-backup-staging-usc1
           # Keeps the backup journal off the root disk — it's written
           # continuously while backups drain and can stall the uploader
-          # if the (small) root disk fills.
-          BACKUP_JOURNAL_PATH: /mnt/localssd/backup.db
+          # if the (small) root disk fills. Staging is a smaller instance
+          # with no NVMe-backed local SSD (unlike use4/usw2), so this
+          # points at its attached persistent disk instead of /mnt/localssd.
+          BACKUP_JOURNAL_PATH: /mnt/sandbox-data/backup.db
           # Enables vmd's backup metrics exporter (host-local collector);
           # the backup alert policies read these series.
           OTEL_ENVIRONMENT: staging
