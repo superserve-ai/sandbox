@@ -291,6 +291,18 @@ const (
 	warmGateMaxWait  = 5 * time.Second
 )
 
+// warmGateTarget clamps the gate's slot target to what the configured pool
+// can actually hold: the fresh channel's capacity IS the pool target, so a
+// pool configured smaller than warmGateMinSlots is fully warm below it, and
+// an unclamped gate would burn its whole cap waiting for inventory that
+// cannot exist. freshSize <= 0 mirrors StartPool's own default.
+func warmGateTarget(freshSize int) int {
+	if freshSize <= 0 {
+		freshSize = 32 // keep in step with StartPool's NewSize default
+	}
+	return min(warmGateMinSlots, freshSize)
+}
+
 func main() {
 	// Maintenance subcommands run before any daemon setup and exit. They must
 	// not open the state store in write mode or start services.
@@ -1176,10 +1188,17 @@ func main() {
 	// stragglers past the cap are covered by SetupVM's bounded pool wait.
 	// Requests arriving during the wait queue in the socket unit's accept
 	// backlog or get a retryable Unavailable — never a slow failure.
-	if inventory := netPool.WaitWarm(ctx, warmGateMinSlots, warmGateMaxWait); inventory > 0 {
-		log.Info().Int("pool_inventory", inventory).Msg("request gate opening with warm pool")
+	warmTarget := warmGateTarget(netPoolFresh)
+	tWarm := time.Now()
+	inventory := netPool.WaitWarm(ctx, warmTarget, warmGateMaxWait)
+	warmWaitMS := time.Since(tWarm).Milliseconds()
+	if inventory >= warmTarget {
+		log.Info().Int("pool_inventory", inventory).Int("warm_target", warmTarget).
+			Int64("warm_wait_ms", warmWaitMS).Msg("request gate opening with warm pool")
 	} else {
-		log.Warn().Msg("request gate opening with an empty pool — nothing adopted within the warm-up cap")
+		log.Warn().Int("pool_inventory", inventory).Int("warm_target", warmTarget).
+			Int64("warm_wait_ms", warmWaitMS).
+			Msg("request gate opening below the warm target — pool still filling")
 	}
 	startupReady.Store(true)
 	log.Info().Msg("startup complete — gRPC serving requests")
