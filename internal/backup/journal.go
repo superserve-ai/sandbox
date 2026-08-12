@@ -146,12 +146,13 @@ var (
 	// "never made it, reconcile", without which a swept owner would be
 	// re-uploaded on every pass after its task was acked away.
 	completionsBucket = []byte("backup_completed_generations")
-	// seededBucket records completion keys whose notification signal was
-	// banked in the outbox at least once (by the ack itself, or by a
-	// seed). The completion seed skips exactly this set, which makes it
-	// structural rather than clock-based: an older uploader's acks from
-	// a rollback window never write it and are caught by the next
-	// upgrade's seed regardless of clock direction.
+	// seededBucket records, per completion key, the completion VALUE (the
+	// ack instant) whose notification signal was banked in the outbox (by
+	// the ack itself, or by a seed). The seed skips an entry only when
+	// the banked value matches the current one, which makes seeding track
+	// acknowledgments rather than keys: an older uploader's rollback-window
+	// ack of the SAME generation overwrites the completion value without
+	// touching this record, and the mismatch re-seeds the newer instant.
 	seededBucket = []byte("backup_outbox_seeded")
 )
 
@@ -525,9 +526,10 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 			if err := tx.Bucket(outboxBucket).Put(completionKey(completedScope, task), val); err != nil {
 				return err
 			}
-			// Banked: the completion seed must never re-seed this
-			// completion, no matter what any clock does.
-			if err := tx.Bucket(seededBucket).Put(completionKey(completedScope, task), []byte("1")); err != nil {
+			// Banked, recorded as THIS acknowledgment's value: the seed
+			// re-seeds only if a later ack (a rollback interval's
+			// re-pause) overwrites the completion instant.
+			if err := tx.Bucket(seededBucket).Put(completionKey(completedScope, task), []byte(fmt.Sprintf("%d", now.UnixNano()))); err != nil {
 				return err
 			}
 		}
@@ -862,7 +864,7 @@ func (j *Journal) SeedOutboxFromCompletions() (bool, error) {
 				return ob.Put(cursorKey, append([]byte{top, work, 0}, key...))
 			}
 			examined++
-			if seeded.Get(key) != nil {
+			if sv := seeded.Get(key); sv != nil && string(sv) == string(v) {
 				continue
 			}
 			hadWork = true
@@ -896,7 +898,7 @@ func (j *Journal) SeedOutboxFromCompletions() (bool, error) {
 					return err
 				}
 			}
-			if err := seeded.Put(key, []byte("1")); err != nil {
+			if err := seeded.Put(key, append([]byte(nil), v...)); err != nil {
 				return err
 			}
 		}

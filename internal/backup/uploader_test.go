@@ -2605,3 +2605,53 @@ func TestSeedChunksAndResumes(t *testing.T) {
 		t.Fatalf("converged passes changed outbox to %d, want %d", len(pending), total)
 	}
 }
+
+// A rollback-interval re-ack of the SAME generation overwrites the
+// completion instant without touching the seeded record; the seed must
+// treat the mismatch as unseeded and deliver the newer instant.
+func TestSeedReseedsReacknowledgedCompletion(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(task, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+	banked, err := j.PendingNotifications(0)
+	if err != nil || len(banked) != 1 {
+		t.Fatalf("banked = %v err=%v", banked, err)
+	}
+	first := banked[0].VerifiedAt
+	if err := j.ClearNotification(banked[0]); err != nil {
+		t.Fatal(err)
+	}
+	for done := false; !done; {
+		if done, err = j.SeedOutboxFromCompletions(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rest, _ := j.PendingNotifications(0); len(rest) != 0 {
+		t.Fatalf("seed resurrected a delivered completion: %v", rest)
+	}
+
+	// The old binary re-acks the same generation (no outbox banking).
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(task, "bucket-a", false); err != nil {
+		t.Fatal(err)
+	}
+	for done := false; !done; {
+		if done, err = j.SeedOutboxFromCompletions(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reseeded, err := j.PendingNotifications(0)
+	if err != nil || len(reseeded) != 1 {
+		t.Fatalf("re-ack not reseeded: %v err=%v", reseeded, err)
+	}
+	if !reseeded[0].VerifiedAt.After(first) {
+		t.Fatalf("reseeded instant %v not after first %v", reseeded[0].VerifiedAt, first)
+	}
+}
