@@ -369,6 +369,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// lock, re-checking that it's still recordless so an in-flight launch
 	// that just made the cgroup is never killed.
 	for id := range active {
+		if ctx.Err() != nil {
+			return
+		}
 		if supervisionOf[id] != SupervisionCgroup {
 			continue
 		}
@@ -483,6 +486,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	if r.mgr.cgroups != nil {
 		if cgDirs, cgErr := r.mgr.cgroups.scanVMCgroups(); cgErr == nil {
 			for _, id := range cgDirs {
+				if ctx.Err() != nil {
+					return
+				}
 				if active[id] {
 					continue // populated (Drift 0 handles it)
 				}
@@ -548,6 +554,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// the old behavior: just clean up the stale BoltDB entry.
 	if dbSandboxes == nil {
 		for id, rec := range bolted {
+			if ctx.Err() != nil {
+				return
+			}
 			if rec.Status != StatusRunning {
 				continue
 			}
@@ -580,6 +589,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// after the caller gave up).
 	if dbSandboxes != nil {
 		for id := range active {
+			if ctx.Err() != nil {
+				return
+			}
 			sb, known := dbSandboxes[id]
 			deleted := known && sb.Sandbox.Status == db.SandboxStatusDeleted
 			failed := known && sb.Sandbox.Status == db.SandboxStatusFailed
@@ -636,6 +648,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// relaunch or destroy. Keyed on BoltDB + systemd only, so it runs in
 	// both DB modes.
 	for id := range active {
+		if ctx.Err() != nil {
+			return
+		}
 		if !errorRecord(id) {
 			r.clearDrift("errunit:" + id)
 			continue
@@ -703,6 +718,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// Drift 5 on missing DB rows). Grace gives the control plane's own
 	// destroy first claim on the record.
 	reapDeadError := func(id string) {
+		if ctx.Err() != nil {
+			return
+		}
 		if active[id] {
 			r.clearDrift("errdead:" + id)
 			return
@@ -783,6 +801,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// persists — keying off records could kill a just-launched resume.
 	if dbSandboxes != nil {
 		for id := range active {
+			if ctx.Err() != nil {
+				return
+			}
 			sb, known := dbSandboxes[id]
 			if !known || sb.Sandbox.Status != db.SandboxStatusPaused {
 				r.clearDrift("pausedunit:" + id)
@@ -853,6 +874,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// Fetch the full record only for the few IDs that look orphaned,
 		// not for every bolted entry.
 		for id := range boltedIDs {
+			if ctx.Err() != nil {
+				return
+			}
 			if _, ok := dbSandboxes[id]; ok {
 				continue
 			}
@@ -1575,6 +1599,9 @@ func (r *Reconciler) failEmptyShells(ctx context.Context, log zerolog.Logger, db
 		probeCancel()
 
 		for _, id := range candidates {
+			if ctx.Err() != nil {
+				return
+			}
 			res := probes[id]
 			if res.err != nil {
 				continue // no evidence either way; drift state untouched
@@ -1662,6 +1689,9 @@ func (r *Reconciler) reapUnverifiedOrphans(ctx context.Context, log zerolog.Logg
 	// later resume still restores cleanly.
 	if dbSandboxes != nil {
 		for id := range active {
+			if ctx.Err() != nil {
+				return
+			}
 			sb, known := dbSandboxes[id]
 			if !known || sb.Sandbox.Status != db.SandboxStatusPaused || !r.mgr.instanceUnverifiedRunning(id) {
 				r.clearDrift("unverifiedorphan:" + id)
@@ -1803,6 +1833,9 @@ func (r *Reconciler) demotePausedCgroupRecords(ctx context.Context, log zerolog.
 
 func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool, errorRecord func(string) bool, now time.Time) {
 	for id, sb := range dbSandboxes {
+		if ctx.Err() != nil {
+			return
+		}
 		if sb.Sandbox.Status != db.SandboxStatusActive {
 			continue
 		}
@@ -1868,6 +1901,9 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 // the lifecycle lock) is only testable with the pass data injectable.
 func (r *Reconciler) failMissingSnapshots(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, now time.Time) {
 	for id, sb := range dbSandboxes {
+		if ctx.Err() != nil {
+			return
+		}
 		if sb.Sandbox.Status != db.SandboxStatusPaused || !sb.Sandbox.SnapshotID.Valid {
 			continue
 		}
