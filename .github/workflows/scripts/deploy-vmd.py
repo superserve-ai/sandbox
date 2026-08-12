@@ -319,8 +319,19 @@ def main() -> int:
             # the host exactly as it was (old binary, old config, still
             # serving) instead of stopped and exposed.
             if [ -n {q_backup_journal} ]; then
-                if ! mountpoint -q "$(dirname {q_backup_journal})" 2>/dev/null; then
-                    echo "ERROR: $(dirname {q_backup_journal}) is not a mounted filesystem; refusing to deploy" >&2
+                # A path below the mount (e.g. /mnt/localssd/journals/backup.db)
+                # is valid but its immediate parent may not exist yet on a
+                # fresh host and, even once created, is never itself the
+                # mountpoint — mountpoint(1) would reject it regardless of
+                # whether the array is actually mounted. Walk up to the
+                # nearest existing ancestor and compare devices with / instead:
+                # same device means nothing real is mounted there yet.
+                BJ_ANCESTOR="$(dirname {q_backup_journal})"
+                while [ ! -d "$BJ_ANCESTOR" ] && [ "$BJ_ANCESTOR" != "/" ]; do
+                    BJ_ANCESTOR="$(dirname "$BJ_ANCESTOR")"
+                done
+                if [ "$(sudo stat -c %d "$BJ_ANCESTOR")" = "$(sudo stat -c %d /)" ]; then
+                    echo "ERROR: $BJ_ANCESTOR is on the root filesystem, not a separate mount; refusing to deploy" >&2
                     exit 1
                 fi
             fi
@@ -764,6 +775,16 @@ def main() -> int:
                     # {service} restarts onto the new path. Re-enabled by the
                     # socket restart/start block and the {service} restart
                     # later in this script, once vmd.env names the new path.
+                    # Unlike the earlier {service}-only stop, this also takes
+                    # down socket activation, so a failure below (cp hitting
+                    # a full or errored destination, sync failing, etc.)
+                    # would exit via set -e and leave the host with no
+                    # listener at all instead of still serving on the old
+                    # journal — the old vmd.env is still correct at that
+                    # point, since it's only rewritten after this block
+                    # succeeds. Arm a trap to restore both units on any such
+                    # exit; disarmed once the migration actually succeeds, below.
+                    trap '\''sudo systemctl start superserve-vmd.socket {service} 2>/dev/null || true'\'' EXIT
                     sudo systemctl stop superserve-vmd.socket {service}
                     # $OLD_BACKUP_JOURNAL_PATH still present under its
                     # original name is the only signal migration hasn't
@@ -808,6 +829,7 @@ def main() -> int:
                     # file, not the multi-GB artifacts that actually filled
                     # the root disk.
                     sudo mv "$OLD_BACKUP_JOURNAL_PATH" "${{OLD_BACKUP_JOURNAL_PATH}}.migrated"
+                    trap - EXIT
                     echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
                 fi
 
