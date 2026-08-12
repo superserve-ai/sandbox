@@ -504,8 +504,18 @@ def main() -> int:
 
             # Upsert BACKUP_JOURNAL_PATH (moves the backup uploader's BoltDB
             # journal off the root disk onto the local-SSD array). Empty =
-            # skip, leaving vmd's default in place.
+            # skip, leaving vmd's default in place. Captures the host's
+            # current effective path first (its own override if already
+            # set, else vmd's compiled default) so the stop/restart block
+            # below can migrate the journal file itself: the env upsert
+            # alone would otherwise point a freshly-restarted vmd at an
+            # empty BoltDB, orphaning every already-staged, not-yet-uploaded
+            # generation the old journal was tracking — the startup sweep
+            # then reaps those staged artifacts as unreferenced orphans
+            # instead of uploading them.
             if [ -n {q_backup_journal} ]; then
+                OLD_BACKUP_JOURNAL_PATH=$(sudo grep '^BACKUP_JOURNAL_PATH=' /etc/sandbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2-) || true
+                OLD_BACKUP_JOURNAL_PATH="${{OLD_BACKUP_JOURNAL_PATH:-/var/lib/sandbox/backup.db}}"
                 sudo sed -i '/^BACKUP_JOURNAL_PATH=/d' /etc/sandbox/vmd.env
                 echo {q_backup_journal_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
@@ -688,6 +698,22 @@ def main() -> int:
             # ports, and a plain restart can bind the socket unit before the
             # old process has released them. Idempotent in steady state.
             sudo systemctl stop {service}
+
+            # Migrate the backup journal to its new path now that vmd is
+            # stopped (the file is closed, safe to move). Skip when there's
+            # nothing to migrate (old path unchanged, no old file, or a
+            # destination already migrated by an earlier deploy) so this is
+            # a no-op in steady state.
+            if [ -n {q_backup_journal} ]; then
+                NEW_BACKUP_JOURNAL_PATH={q_backup_journal}
+                if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ] \\
+                    && [ -f "$OLD_BACKUP_JOURNAL_PATH" ] \\
+                    && [ ! -e "$NEW_BACKUP_JOURNAL_PATH" ]; then
+                    sudo install -d -m 0755 "$(dirname "$NEW_BACKUP_JOURNAL_PATH")"
+                    sudo mv "$OLD_BACKUP_JOURNAL_PATH" "$NEW_BACKUP_JOURNAL_PATH"
+                    echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
+                fi
+            fi
             if [ "$SOCKET_CHANGED" = 1 ]; then
                 # Socket unit changed: rebind so the new ListenStream/options
                 # apply. Brief refused window, but only on the rare deploy that
