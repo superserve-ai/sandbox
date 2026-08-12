@@ -20,6 +20,13 @@ Env vars:
                        into vmd.env when set; empty = skip, leaving the
                        host's backup uploader disabled. Staged rollout:
                        staging first, production after the staging soak.
+  BACKUP_JOURNAL_PATH  optional — path for the backup uploader's BoltDB
+                       journal. Upserted into vmd.env when set; empty = skip,
+                       leaving vmd's default (next to RUN_DIR, i.e. on the
+                       host's root disk) in place. Set this to a path on
+                       /mnt/localssd: the journal is written to continuously
+                       while backups drain, and the root disk is small
+                       enough that it can fill and stall the uploader.
   OTEL_ENVIRONMENT     optional — enables vmd's OTLP backup-metrics exporter
                        by upserting OTEL_METRICS_ENABLED=true and this value
                        as OTEL_ENVIRONMENT into vmd.env. Empty = skip,
@@ -154,6 +161,7 @@ def main() -> int:
     sha = os.environ["SHA"][:8]
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     backup_bucket = os.environ.get("BACKUP_BUCKET", "")
+    backup_journal_path = os.environ.get("BACKUP_JOURNAL_PATH", "")
     otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
     control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
     internal_api_token = os.environ.get("INTERNAL_API_TOKEN", "")
@@ -170,6 +178,8 @@ def main() -> int:
     q_sentry_line = shlex.quote(f"SENTRY_DSN={sentry_dsn}")
     q_backup = shlex.quote(backup_bucket)
     q_backup_line = shlex.quote(f"BACKUP_BUCKET={backup_bucket}")
+    q_backup_journal = shlex.quote(backup_journal_path)
+    q_backup_journal_line = shlex.quote(f"BACKUP_JOURNAL_PATH={backup_journal_path}")
     q_otel = shlex.quote(otel_environment)
     q_otel_enabled_line = shlex.quote("OTEL_METRICS_ENABLED=true")
     q_otel_env_line = shlex.quote(f"OTEL_ENVIRONMENT={otel_environment}")
@@ -292,6 +302,58 @@ def main() -> int:
 
         inject_script = textwrap.dedent(f"""
             set -euo pipefail
+
+            # Precondition, checked before any host mutation: if
+            # BACKUP_JOURNAL_PATH names a path outside a real mount (the
+            # local-SSD array being transiently unmounted, most likely),
+            # fail here instead of partway through the stop/restart
+            # sequence below. superserve-vmd.socket stays active across the
+            # whole deploy by design (zero-downtime — see
+            # deploy/superserve-vmd.socket), so aborting mid-sequence would
+            # leave {service} stopped with the socket still live: the next
+            # connection would socket-activate it against the *persisted*
+            # (already-correct) path while the mount is absent, silently
+            # opening a root-disk BoltDB there — exactly what this check
+            # exists to prevent, just via a path this script doesn't
+            # control. Failing before touching the service at all leaves
+            # the host exactly as it was (old binary, old config, still
+            # serving) instead of stopped and exposed.
+            if [ -n {q_backup_journal} ]; then
+                # A path below the mount (e.g. /mnt/localssd/journals/backup.db)
+                # is valid but its immediate parent may not exist yet on a
+                # fresh host and, even once created, is never itself the
+                # mountpoint — mountpoint(1) would reject it regardless of
+                # whether the array is actually mounted. Walk up to the
+                # nearest existing ancestor and compare devices with / instead:
+                # same device means nothing real is mounted there yet.
+                BJ_ANCESTOR="$(dirname {q_backup_journal})"
+                while [ ! -d "$BJ_ANCESTOR" ] && [ "$BJ_ANCESTOR" != "/" ]; do
+                    BJ_ANCESTOR="$(dirname "$BJ_ANCESTOR")"
+                done
+                if [ "$(sudo stat -c %d "$BJ_ANCESTOR")" = "$(sudo stat -c %d /)" ]; then
+                    echo "ERROR: $BJ_ANCESTOR is on the root filesystem, not a separate mount; refusing to deploy" >&2
+                    exit 1
+                fi
+                # $BJ_ANCESTOR is confirmed on a real mount, so it's now safe
+                # to create the rest of the path down to the parent — vmd
+                # opens the journal directly with no mkdir of its own
+                # (cmd/vmd/main.go), so a nested path like
+                # /mnt/localssd/journals/backup.db needs this directory to
+                # exist before vmd (or the migration copy below) can open a
+                # file in it. Only set the 0700 mode (vs. the more common
+                # 0755 -- only vmd, as root, ever needs to reach this
+                # directory) when actually CREATING it: for the common
+                # configured value, /mnt/localssd/backup.db, dirname is
+                # /mnt/localssd itself -- the shared mount root RUN_DIR and
+                # SNAPSHOT_DIR also live under -- and install -d re-chmods
+                # existing directories too, so applying it unconditionally
+                # would narrow that shared mountpoint's permissions on
+                # every single deploy.
+                BJ_JOURNAL_DIR="$(dirname {q_backup_journal})"
+                if [ ! -d "$BJ_JOURNAL_DIR" ]; then
+                    sudo install -d -m 0700 "$BJ_JOURNAL_DIR"
+                fi
+            fi
 
             # Extract the deploy bundle into a sha-scoped staging dir so
             # parallel deploys (or aborted retries) don't collide.
@@ -492,6 +554,12 @@ def main() -> int:
                 echo {q_backup_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
+            # BACKUP_JOURNAL_PATH (moves the backup uploader's BoltDB journal
+            # off the root disk onto the local-SSD array) is upserted below,
+            # after vmd is stopped, together with migrating any existing
+            # journal file to the new location. See that block for why the
+            # env write must not happen until the migration is done.
+
             # Upsert the OTLP backup-metrics contract: enable flag plus
             # environment label. Empty = skip. The exporter endpoint stays
             # vmd's compiled default (the host-local collector on
@@ -670,6 +738,218 @@ def main() -> int:
             # ports, and a plain restart can bind the socket unit before the
             # old process has released them. Idempotent in steady state.
             sudo systemctl stop {service}
+
+            # Migrate the backup journal to its new path now that vmd is
+            # stopped (the file is closed, safe to move), then upsert
+            # BACKUP_JOURNAL_PATH. The env write happens LAST, only after a
+            # successful migration: if it happened earlier and the deploy
+            # were interrupted before this point, vmd.env would already
+            # name the new path while the real journal was still at the
+            # old one, so a retry would read old==new, skip the migration
+            # as "already done", and the eventual restart would open an
+            # empty database. Skip entirely when there's nothing to migrate
+            # (old path unchanged, no old file, or a destination already
+            # migrated by an earlier deploy) so this is a no-op in steady
+            # state.
+            if [ -n {q_backup_journal} ]; then
+                # {service} was already stopped above (unconditionally, for
+                # every deploy) before this block is even reached, so any
+                # failure exit between here and the restart/health-check
+                # block further down would otherwise leave it down with
+                # nothing to bring it back — including from the mount
+                # recheck just below, and from the fallible env write later
+                # in this block. Arm recovery up front, for the whole
+                # section, rather than only around the parts that also stop
+                # the socket. A no-op start on units that were never
+                # stopped. Disarmed only once {service} is confirmed active
+                # again, near the end of this script.
+                #
+                # Re-verifies the mount at fire time rather than blindly
+                # restarting: $BJ_ANCESTOR is set below and stays valid for
+                # the rest of this block, so a failure well after the mount
+                # check (the env write, say) could still be firing this
+                # handler while the mount is fine and a restart is exactly
+                # right — but if it's the mount check itself that's failing,
+                # or the mount vanished in the meantime, restarting would
+                # recreate the very root-backed journal this section exists
+                # to prevent. Stop both units instead and leave them down in
+                # that case: down but honest beats up and silently wrong.
+                # Empty $BJ_ANCESTOR (nothing checked yet) falls through to
+                # the normal restart, same as before.
+                trap '\''if [ -n "$BJ_ANCESTOR" ] && [ "$(sudo stat -c %d "$BJ_ANCESTOR" 2>/dev/null)" = "$(sudo stat -c %d / 2>/dev/null)" ]; then echo "WARNING: $BJ_ANCESTOR is on the root filesystem; leaving superserve-vmd.socket and {service} stopped rather than restarting onto it" >&2; sudo systemctl stop superserve-vmd.socket {service} 2>/dev/null || true; else sudo systemctl start superserve-vmd.socket {service} 2>/dev/null || true; fi'\'' EXIT
+                NEW_BACKUP_JOURNAL_PATH={q_backup_journal}
+                # EnvironmentFile= (systemd.exec(5), which is what loads
+                # vmd.env) accepts quoted values, and vmd itself receives
+                # them unquoted either way. This script never writes
+                # BACKUP_JOURNAL_PATH or RUN_DIR quoted, but an existing
+                # host could have either set that way by hand — grep|cut
+                # below would then keep the quote characters as part of the
+                # value, so it would never match the real file on disk and
+                # the migration would silently skip a journal that does
+                # exist. Strip one matching pair of leading/trailing quotes
+                # from each before using it as a path.
+                BJ_Q1="'"
+                BJ_Q2='"'
+                OLD_BACKUP_JOURNAL_PATH=$(sudo grep '^BACKUP_JOURNAL_PATH=' /etc/sandbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2-) || true
+                case "$OLD_BACKUP_JOURNAL_PATH" in
+                    "$BJ_Q2"*"$BJ_Q2") OLD_BACKUP_JOURNAL_PATH="${{OLD_BACKUP_JOURNAL_PATH#$BJ_Q2}}"; OLD_BACKUP_JOURNAL_PATH="${{OLD_BACKUP_JOURNAL_PATH%$BJ_Q2}}" ;;
+                    "$BJ_Q1"*"$BJ_Q1") OLD_BACKUP_JOURNAL_PATH="${{OLD_BACKUP_JOURNAL_PATH#$BJ_Q1}}"; OLD_BACKUP_JOURNAL_PATH="${{OLD_BACKUP_JOURNAL_PATH%$BJ_Q1}}" ;;
+                esac
+                if [ -z "$OLD_BACKUP_JOURNAL_PATH" ]; then
+                    # No override recorded yet: mirror vmd's own default
+                    # derivation (filepath.Join(filepath.Dir(cfg.RunDir),
+                    # "backup.db") in cmd/vmd/main.go) instead of assuming a
+                    # fixed path, since RUN_DIR itself is configurable.
+                    RUN_DIR_VALUE=$(sudo grep '^RUN_DIR=' /etc/sandbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2-) || true
+                    case "$RUN_DIR_VALUE" in
+                        "$BJ_Q2"*"$BJ_Q2") RUN_DIR_VALUE="${{RUN_DIR_VALUE#$BJ_Q2}}"; RUN_DIR_VALUE="${{RUN_DIR_VALUE%$BJ_Q2}}" ;;
+                        "$BJ_Q1"*"$BJ_Q1") RUN_DIR_VALUE="${{RUN_DIR_VALUE#$BJ_Q1}}"; RUN_DIR_VALUE="${{RUN_DIR_VALUE%$BJ_Q1}}" ;;
+                    esac
+                    RUN_DIR_VALUE="${{RUN_DIR_VALUE:-/var/lib/sandbox/rundir}}"
+                    # filepath.Dir does not walk up a level when the path
+                    # already ends in a separator, it only collapses the
+                    # trailing slash(es): filepath.Dir("/a/b/") is "/a/b",
+                    # not "/a". Shell dirname always walks up regardless, so
+                    # stripping the slash and calling dirname unconditionally
+                    # derives the wrong ancestor whenever RUN_DIR itself ends
+                    # in a separator. Branch on that case instead.
+                    case "$RUN_DIR_VALUE" in
+                        */) RUN_DIR_PARENT="$(printf '%s' "$RUN_DIR_VALUE" | sed 's:/*$::')" ;;
+                        *)  RUN_DIR_PARENT="$(dirname "$RUN_DIR_VALUE")" ;;
+                    esac
+                    OLD_BACKUP_JOURNAL_PATH="$RUN_DIR_PARENT/backup.db"
+                fi
+
+                # The precondition block at the top of this script already
+                # confirmed the mount, but that was before extracting the
+                # bundle and installing binaries/units — a long enough
+                # window that the array could be transiently unmounted by
+                # the time we get here. Check again immediately before
+                # mutating anything below, and unconditionally (not just
+                # when the path is changing): a steady-state host restarts
+                # {service} unconditionally further down too, and if the
+                # mount vanished in between, vmd would silently open a
+                # root-backed journal at the same configured path, hiding
+                # the real one until the SSD is remounted.
+                BJ_ANCESTOR="$(dirname "$NEW_BACKUP_JOURNAL_PATH")"
+                while [ ! -d "$BJ_ANCESTOR" ] && [ "$BJ_ANCESTOR" != "/" ]; do
+                    BJ_ANCESTOR="$(dirname "$BJ_ANCESTOR")"
+                done
+                if [ "$(sudo stat -c %d "$BJ_ANCESTOR")" = "$(sudo stat -c %d /)" ]; then
+                    echo "ERROR: $BJ_ANCESTOR is on the root filesystem, not a separate mount; refusing to deploy" >&2
+                    # The recovery trap armed above re-checks $BJ_ANCESTOR
+                    # itself before deciding whether to restart, so a plain
+                    # exit here correctly leaves both units stopped instead
+                    # of restarting vmd onto the root-backed path this check
+                    # just caught.
+                    exit 1
+                fi
+
+                if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ]; then
+                    # {service} was stopped above, but superserve-vmd.socket
+                    # stays active the rest of this script by design
+                    # (zero-downtime deploys), so a connection landing in the
+                    # gap between that stop and here can already have
+                    # socket-activated vmd against the still-current old
+                    # path — even when $OLD_BACKUP_JOURNAL_PATH has no file
+                    # yet (a host's first deploy of this setting): vmd would
+                    # then create one there on activation, and it becomes an
+                    # orphan the moment vmd.env is rewritten below to name
+                    # the new path, with nothing left to migrate it. Stop the
+                    # socket too, whenever the path is changing at all, not
+                    # just when there's a file to migrate. Re-enabled by the
+                    # socket restart/start block and the {service} restart
+                    # later in this script, once vmd.env names the new path.
+                    # The recovery trap armed at the top of this block
+                    # already covers a failure here too — it stops the
+                    # socket now as well, not just {service}, but the trap's
+                    # start of both units on any exit applies regardless.
+                    sudo systemctl stop superserve-vmd.socket {service}
+                    if [ -f "$OLD_BACKUP_JOURNAL_PATH" ]; then
+                        # $OLD_BACKUP_JOURNAL_PATH still present under its
+                        # original name is the only signal migration hasn't
+                        # completed: completion always ends by renaming it
+                        # aside, below. So this always redoes the copy while
+                        # the source is present, rather than trusting
+                        # NEW_BACKUP_JOURNAL_PATH's mere existence — an
+                        # earlier attempt may have been interrupted after
+                        # making it visible but before it was synced (see
+                        # below), leaving a torn file that a plain existence
+                        # check would mistake for a completed migration.
+                        #
+                        # Old and new live on different filesystems (root
+                        # disk vs. the local-SSD array), so a plain `mv` is a
+                        # copy-then-delete, not an atomic rename: a kill
+                        # mid-copy would otherwise leave a torn file directly
+                        # at NEW_BACKUP_JOURNAL_PATH. Copy to a
+                        # same-filesystem temp path next to the destination,
+                        # then rename — same filesystem makes that rename
+                        # atomic.
+                        TMP_BACKUP_JOURNAL_PATH="${{NEW_BACKUP_JOURNAL_PATH}}.migrating.$$"
+                        sudo rm -f "${{NEW_BACKUP_JOURNAL_PATH}}".migrating.*
+                        sudo cp --preserve=mode,ownership "$OLD_BACKUP_JOURNAL_PATH" "$TMP_BACKUP_JOURNAL_PATH"
+                        sudo mv "$TMP_BACKUP_JOURNAL_PATH" "$NEW_BACKUP_JOURNAL_PATH"
+                        # The copy and the rename onto NEW_BACKUP_JOURNAL_PATH
+                        # are only cached writes until this point: root disk
+                        # and the local-SSD array are separate devices with
+                        # independent write-back queues, so a crash here
+                        # could leave the destination's data, or even the
+                        # rename's own directory entry, unwritten — on reboot
+                        # vmd would find a missing or truncated destination.
+                        # Flush everything to disk before going any further,
+                        # and before the config below can start pointing at
+                        # this destination.
+                        sudo sync
+                        # The source is intentionally NOT retired here. It's
+                        # retired below, only once vmd.env durably names
+                        # NEW_BACKUP_JOURNAL_PATH — see that block for why.
+                    fi
+                fi
+
+                # Publish the override as one atomic swap instead of
+                # sed -i (delete) + tee -a (append): those are two separate
+                # writes, so a failure or interruption between them (full
+                # disk, dropped session) can leave vmd.env with no
+                # BACKUP_JOURNAL_PATH line at all. vmd would then fall back
+                # to its own default — $OLD_BACKUP_JOURNAL_PATH — and if a
+                # migration above already ran, that path is empty or gone,
+                # so vmd creates a fresh database there. A later deploy
+                # would then read that fresh empty file as "the old journal"
+                # and copy it over the real one, destroying it. Build the
+                # new content in a temp file on the same filesystem as
+                # vmd.env and rename it into place: vmd.env is always either
+                # fully the old content or fully the new content, never
+                # in between, regardless of when a failure happens.
+                sudo touch /etc/sandbox/vmd.env
+                BJ_ENV_TMP="/etc/sandbox/vmd.env.tmp.$$"
+                sudo rm -f /etc/sandbox/vmd.env.tmp.*
+                sudo cp --preserve=mode,ownership /etc/sandbox/vmd.env "$BJ_ENV_TMP"
+                sudo sed -i '/^BACKUP_JOURNAL_PATH=/d' "$BJ_ENV_TMP"
+                echo {q_backup_journal_line} | sudo tee -a "$BJ_ENV_TMP" > /dev/null
+                sudo mv "$BJ_ENV_TMP" /etc/sandbox/vmd.env
+                # Sync AFTER the rename, not before: a sync before only
+                # covers the temp file's content, not the rename's own
+                # directory-entry update, which is a separate write that
+                # can still be lost on power loss right after `mv` returns
+                # — same reasoning as the journal file's own sync above.
+                sudo sync
+
+                if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ] \\
+                    && [ -f "$OLD_BACKUP_JOURNAL_PATH" ]; then
+                    # vmd.env now durably names NEW_BACKUP_JOURNAL_PATH, so
+                    # it's safe to retire the source: nothing will fall back
+                    # to looking for it at its original name anymore.
+                    # Rename rather than remove: if this script is killed
+                    # here, a recoverable file survives instead of an
+                    # unlinked inode. Not cleaned up afterward — reclaiming
+                    # it safely needs the same "nothing still references it"
+                    # guarantee that motivates renaming over deleting it
+                    # here, for a single-digit-MB file, not the multi-GB
+                    # artifacts that actually filled the root disk.
+                    sudo mv "$OLD_BACKUP_JOURNAL_PATH" "${{OLD_BACKUP_JOURNAL_PATH}}.migrated"
+                    echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
+                fi
+            fi
             if [ "$SOCKET_CHANGED" = 1 ]; then
                 # Socket unit changed: rebind so the new ListenStream/options
                 # apply. Brief refused window, but only on the rare deploy that
@@ -679,7 +959,17 @@ def main() -> int:
             else
                 sudo systemctl start superserve-vmd.socket
             fi
-            sudo systemctl start {service}
+            # `restart`, not `start`: the socket unit stays active through
+            # the whole block above by design (zero-downtime — connections
+            # backlog instead of refusing), so a connection arriving during
+            # the stop window can already have made systemd reactivate
+            # {service} against the pre-migration vmd.env. `start` is a
+            # no-op against an already-active unit and would leave that
+            # reactivated process running on the old path indefinitely;
+            # `restart` guarantees the process running once this script
+            # exits is always the one reading the final, fully-migrated
+            # config, whether or not a reactivation race occurred.
+            sudo systemctl restart {service}
             sleep 3
             sudo systemctl is-active --quiet {service} || (
                 echo "ERROR: {service} failed to become active after restart" >&2
@@ -687,6 +977,11 @@ def main() -> int:
                 sudo journalctl -u {service} --no-pager -n 40 >&2 || true
                 exit 1
             )
+            # {service} is confirmed active on the final config: disarm the
+            # journal-migration recovery trap (a no-op if it was never
+            # armed this run). Anything past this point is unrelated to the
+            # backup journal and shouldn't restart vmd on failure.
+            trap - EXIT
 
             # Restart secretsproxy; tolerate missing env file on hosts not
             # yet provisioned (is-active check below is gated on the file).
