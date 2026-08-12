@@ -45,6 +45,24 @@ locals {
     dataclassification = "confidential"
     application        = "sandbox-host"
   })
+
+  # The host_id that actually tags vmd's own metrics: its HOST_ID runtime env,
+  # which is ALSO its identity in the host table. Not derivable from the
+  # instance name — this cell's row predates the convention of naming rows
+  # after the instance, and HOST_ID must never be changed to match, because
+  # heartbeats and reconciler scoping key on the existing row. An alert filter
+  # that guesses the instance name selects no series and never fires, which
+  # looks identical to a healthy host.
+  #
+  # Verify against the host before changing: grep '^HOST_ID=' /etc/sandbox/vmd.env
+  #
+  # Deliberately NOT the instance name, and the two must not be merged: the
+  # host-local collector stamps its own HOST_ID (the instance name, rewritten
+  # on every collector deploy) onto the hostmetrics pipeline, so host-level
+  # series like filesystem utilization carry the instance name while vmd's own
+  # OTLP series carry this. One machine, two host_id values, depending on which
+  # process emitted the metric.
+  metrics_host_id = "default"
 }
 
 module "network" {
@@ -338,12 +356,13 @@ module "observability" {
     }
   }
   # Backup pipeline alerts scoped to this cell's host via the host_id
-  # metric label (HOST_ID on the host matches the instance name). Module
+  # metric label (vmd's HOST_ID — see metrics_host_id, which is not the
+  # instance name on this cell). Module
   # defaults hold regardless of the cell's traffic: the failure-rate
   # threshold keys on retry pressure (one stuck generation retries ~6
   # times/hour under the capped backoff), not on pause volume.
   backup_alerts = {
-    host_id        = module.sandbox_host.instance_name
+    host_id        = local.metrics_host_id
     display_prefix = "Backup / ${module.sandbox_host.instance_name}"
   }
   # Launch-path health for the same host: the pruned launcher mount namespace
@@ -359,7 +378,7 @@ module "observability" {
   # they mean "the controller engaged and still lost", not "the controller is
   # doing its job" — move them together with the ceiling or not at all.
   launch_path_alerts = {
-    host_id        = module.sandbox_host.instance_name
+    host_id        = local.metrics_host_id
     display_prefix = "Launch path / ${module.sandbox_host.instance_name}"
   }
   # Root-filesystem (OS disk) utilization for the same host, scoped through
