@@ -54,6 +54,17 @@ on:
       - '.github/workflows/deploy-vmd.yml'
       - '.github/workflows/scripts/deploy-vmd.py'
 
+# Serialize runs rather than canceling: deploy-vmd.py stops vmd, rewrites
+# /etc/sandbox/vmd.env, and restarts it non-atomically across several steps
+# per host. Two overlapping runs racing that sequence on the same host can
+# interleave (e.g. both pass the backup-journal migration's source-present
+# check before either finishes), and canceling a run mid-sequence would
+# leave a host stopped or on a half-written env file. A queued run always
+# starts from the finished state of the one before it.
+concurrency:
+  group: deploy-vmd
+  cancel-in-progress: false
+
 jobs:
   # Failing CI must not reach production control-plane hosts. CI is a
   # separate workflow, so `needs:` can't reach it directly — poll the

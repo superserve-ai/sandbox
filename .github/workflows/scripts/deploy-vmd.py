@@ -709,6 +709,11 @@ def main() -> int:
                     # fixed path, since RUN_DIR itself is configurable.
                     RUN_DIR_VALUE=$(sudo grep '^RUN_DIR=' /etc/sandbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2-) || true
                     RUN_DIR_VALUE="${{RUN_DIR_VALUE:-/var/lib/sandbox/rundir}}"
+                    # Go's filepath.Dir cleans a trailing slash rather than
+                    # walking up to the parent (filepath.Dir("/a/b/") is
+                    # "/a/b", not "/a"), but shell dirname does walk up —
+                    # strip trailing slashes first so both agree.
+                    RUN_DIR_VALUE="$(printf '%s' "$RUN_DIR_VALUE" | sed 's:/*$::')"
                     OLD_BACKUP_JOURNAL_PATH="$(dirname "$RUN_DIR_VALUE")/backup.db"
                 fi
 
