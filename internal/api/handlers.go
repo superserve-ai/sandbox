@@ -2149,6 +2149,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Per-team sandbox count cap; raised by sandbox_quota_on_insert trigger.
 	quotaExceeded := isSandboxQuotaErr(dbErr)
+	vmdTransientFailure := isVMDDeadline(vmdErr) || isVMDUnavailable(vmdErr)
 	transientCreateFailure := isTransientCreateDBErr(dbErr) || isVMDDeadline(vmdErr) || isVMDUnavailable(vmdErr)
 	transientReason := createSandboxTransientFailureReason(dbErr, vmdErr)
 
@@ -2156,8 +2157,15 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// Any non-empty error can leave a VM behind, so clean it up best-effort
 		// before deciding which failure mode to report.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
-		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
-		cleanupCancel()
+		if vmdErr != nil {
+			go func() {
+				defer cleanupCancel()
+				_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+			}()
+		} else {
+			_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+			cleanupCancel()
+		}
 	}
 
 	// If the create failed after the row may have been written, converge the
@@ -2183,6 +2191,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		if isVMDFileMissing(vmdErr) {
 			respondError(c, ErrHostStateMissing)
+			return
+		}
+		if vmdErr != nil && !vmdTransientFailure {
+			respondError(c, ErrInternal)
 			return
 		}
 		if transientCreateFailure {

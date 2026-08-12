@@ -2511,6 +2511,78 @@ func TestCreateSandbox_VMDFileMissingReturnsHostStateMissingEvenIfInsertCancels(
 	}
 }
 
+func TestCreateSandbox_PermanentVMDFailureReturnsInternalWithoutWaitingForCleanup(t *testing.T) {
+	teamID := uuid.New()
+	insertCanceled := make(chan struct{})
+	destroyStarted := make(chan struct{})
+	destroyRelease := make(chan struct{})
+	vmd := &stubVMD{
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			return "", status.Error(codes.InvalidArgument, "bad restore request")
+		},
+		destroyFn: func(context.Context, string, bool) error {
+			close(destroyStarted)
+			<-destroyRelease
+			return nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(ctx context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+				return previewCapableHostRow()
+			}
+			if strings.Contains(sql, "-- name: GetSandbox :one") {
+				return errorRow(pgx.ErrNoRows)
+			}
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return &mockRow{scanFn: func(dest ...any) error {
+					<-ctx.Done()
+					close(insertCanceled)
+					return ctx.Err()
+				}}
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sb"}`))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("request waited on cleanup after permanent VMD failure")
+	}
+
+	select {
+	case <-destroyStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup did not start after permanent VMD failure")
+	}
+	close(destroyRelease)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body: %s", w.Code, w.Body.String())
+	}
+	if code := errorCode(parseJSON(t, w)); code != "internal_error" {
+		t.Fatalf("error code = %q, want internal_error", code)
+	}
+	select {
+	case <-insertCanceled:
+	default:
+		t.Fatal("detached insert was not canceled after permanent VMD failure")
+	}
+}
+
 func TestCreateSandbox_TransientDBErrorReturnsRetryableFailure(t *testing.T) {
 	teamID := uuid.New()
 	insertFailed := make(chan struct{})
