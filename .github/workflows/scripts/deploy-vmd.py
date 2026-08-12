@@ -303,6 +303,28 @@ def main() -> int:
         inject_script = textwrap.dedent(f"""
             set -euo pipefail
 
+            # Precondition, checked before any host mutation: if
+            # BACKUP_JOURNAL_PATH names a path outside a real mount (the
+            # local-SSD array being transiently unmounted, most likely),
+            # fail here instead of partway through the stop/restart
+            # sequence below. superserve-vmd.socket stays active across the
+            # whole deploy by design (zero-downtime — see
+            # deploy/superserve-vmd.socket), so aborting mid-sequence would
+            # leave {service} stopped with the socket still live: the next
+            # connection would socket-activate it against the *persisted*
+            # (already-correct) path while the mount is absent, silently
+            # opening a root-disk BoltDB there — exactly what this check
+            # exists to prevent, just via a path this script doesn't
+            # control. Failing before touching the service at all leaves
+            # the host exactly as it was (old binary, old config, still
+            # serving) instead of stopped and exposed.
+            if [ -n {q_backup_journal} ]; then
+                if ! mountpoint -q "$(dirname {q_backup_journal})" 2>/dev/null; then
+                    echo "ERROR: $(dirname {q_backup_journal}) is not a mounted filesystem; refusing to deploy" >&2
+                    exit 1
+                fi
+            fi
+
             # Extract the deploy bundle into a sha-scoped staging dir so
             # parallel deploys (or aborted retries) don't collide.
             sudo rm -rf {extract_dir}
@@ -700,20 +722,9 @@ def main() -> int:
             # migrated by an earlier deploy) so this is a no-op in steady
             # state.
             if [ -n {q_backup_journal} ]; then
+                # Mount already verified in the precondition block at the
+                # top of this script, before {service} was touched.
                 NEW_BACKUP_JOURNAL_PATH={q_backup_journal}
-                NEW_JOURNAL_DIR="$(dirname "$NEW_BACKUP_JOURNAL_PATH")"
-                # Checked on EVERY deploy that configures this path, not just
-                # a first-time migration: without this, a transiently
-                # unmounted local-SSD array would leave NEW_JOURNAL_DIR
-                # resolvable as an ordinary root-disk directory, and a plain
-                # restart — no migration involved — would silently open a
-                # root-disk BoltDB there instead of failing, defeating the
-                # whole point of this override and later hiding that data
-                # once the real mount reappears.
-                if ! mountpoint -q "$NEW_JOURNAL_DIR" 2>/dev/null; then
-                    echo "ERROR: $NEW_JOURNAL_DIR is not a mounted filesystem; refusing to configure the backup journal there" >&2
-                    exit 1
-                fi
                 OLD_BACKUP_JOURNAL_PATH=$(sudo grep '^BACKUP_JOURNAL_PATH=' /etc/sandbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2-) || true
                 if [ -z "$OLD_BACKUP_JOURNAL_PATH" ]; then
                     # No override recorded yet: mirror vmd's own default
@@ -733,7 +744,8 @@ def main() -> int:
                 if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ] \\
                     && [ -f "$OLD_BACKUP_JOURNAL_PATH" ] \\
                     && [ ! -e "$NEW_BACKUP_JOURNAL_PATH" ]; then
-                    # NEW_JOURNAL_DIR is already confirmed a mountpoint above.
+                    # The destination's mount is already confirmed by the
+                    # precondition block at the top of this script.
                     # Old and new live on different filesystems (root disk
                     # vs. the local-SSD array), so a plain `mv` is a
                     # copy-then-delete, not an atomic rename: a kill mid-copy
@@ -757,6 +769,12 @@ def main() -> int:
                     # still open, silently discarding every write from that
                     # point on; leaving it in place under a different name
                     # means those writes land somewhere recoverable instead.
+                    # Left uncleaned deliberately, not an oversight: it's a
+                    # single-digit-MB journal file, not the multi-GB backup
+                    # artifacts that actually filled the root disk, and
+                    # reclaiming it would require the same "is anything
+                    # still writing to it" guarantee that ruled out deleting
+                    # it above — not worth reopening for a few MB.
                     sudo mv "$OLD_BACKUP_JOURNAL_PATH" "${{OLD_BACKUP_JOURNAL_PATH}}.migrated"
                     echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
                 fi
