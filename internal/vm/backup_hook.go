@@ -188,11 +188,13 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 // staging) it runs the at-rest flow over the mutable originals, proving
 // the bytes are not being written before trusting a hash of them.
 // Terminal outcomes clear the pending record; only transient failures
-// keep it for the sweep. Reports whether this call actually ran the
-// flow: false means the per-VM busy guard yielded to an older worker,
-// so nothing this call observes (in particular the backfill's enqueue
-// capture) can be attributed to it.
-func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) bool {
+// keep it for the sweep. Returns the generation this call enqueued (""
+// when it enqueued nothing) and whether it ran the flow at all: false
+// means the per-VM busy guard yielded to an older worker. The
+// generation is read from the capture slot while the guard is still
+// held, so it is attributable to this call by construction: no other
+// worker for this VM can interleave an enqueue before the read.
+func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) (string, bool) {
 	if m.rehashDone != nil {
 		defer m.rehashDone()
 	}
@@ -208,9 +210,17 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	// worker's exact-token cleanup no-ops against it.
 	m.healPendingBackup(pb, log)
 	if _, busy := m.pendingInFlight.LoadOrStore(pb.VMID, struct{}{}); busy {
-		return false
+		return "", false
 	}
 	defer m.pendingInFlight.Delete(pb.VMID)
+	capturedGen := func() string {
+		if v, ok := m.lastSandboxEnqueue.LoadAndDelete(pb.VMID); ok {
+			if gen, _ := v.(string); gen != "" {
+				return gen
+			}
+		}
+		return ""
+	}
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 	defer cancel()
 	if pb.StagedDir != "" {
@@ -221,10 +231,10 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		// retention promise wants a destroyed sandbox's last pause in
 		// the bucket.
 		m.enqueueStagedPending(rctx, pb, log)
-		return true
+		return capturedGen(), true
 	}
 	m.rehashUnstagedLocked(rctx, pb, log)
-	return true
+	return capturedGen(), true
 }
 
 // rehashUnstagedLocked is the at-rest flow over mutable original paths,
@@ -324,7 +334,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 		m.healPendingBackup(pb, log)
 		return
 	}
-	if ok, staged := m.enqueueBackup(pb.VMID, retried, pb.backupPriority()); ok {
+	if ok, staged, _ := m.enqueueBackup(pb.VMID, retried, pb.backupPriority()); ok {
 		if staged {
 			m.deletePendingBackupIf(pb, log)
 			return
@@ -518,7 +528,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 			entries[i].Path = p
 		}
 	}
-	if ok, _ := m.enqueueBackup(pb.VMID, entries, pb.backupPriority()); ok {
+	if ok, _, _ := m.enqueueBackup(pb.VMID, entries, pb.backupPriority()); ok {
 		m.deletePendingBackupIf(pb, log)
 		return
 	}
@@ -803,27 +813,22 @@ func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger)
 			continue
 		}
 		minted++
-		m.lastSandboxEnqueue.Delete(rec.ID)
 		select {
 		case m.rehashSlots <- struct{}{}:
 		case <-ctx.Done():
 			return
 		}
-		ran := m.rehashPendingBackup(ctx, pb, log)
+		gen, ran := m.rehashPendingBackup(ctx, pb, log)
 		<-m.rehashSlots
 		// Ledger AFTER the mint's synchronous rehash, bound to the
-		// generation it actually enqueued, and ONLY when this call ran
-		// the flow: the per-VM busy guard serializes all sandbox enqueue
-		// workers, so a run that executed proves the captured generation
-		// is this mint's, while a yielded run could be reading an older
-		// worker's enqueue and must write no mark (the marker machinery
-		// owns the outcome and the next pass re-evaluates). A mint that
-		// produced no enqueue (abandoned, failed) also writes no mark.
-		if v, ok := m.lastSandboxEnqueue.Load(rec.ID); ok && ran {
-			if gen, _ := v.(string); gen != "" {
-				if err := m.state.PutBackfillMark(rec.ID, id, gen); err != nil {
-					log.Warn().Err(err).Str("vm_id", rec.ID).Msg("backup backfill: ledger write failed")
-				}
+		// generation the guarded flow itself returned: the capture is
+		// read while the per-VM guard is still held, so it cannot belong
+		// to any other worker. A yielded run (ran=false) or a mint that
+		// enqueued nothing writes no mark; the marker machinery owns the
+		// outcome and the next pass re-evaluates.
+		if ran && gen != "" {
+			if err := m.state.PutBackfillMark(rec.ID, id, gen); err != nil {
+				log.Warn().Err(err).Str("vm_id", rec.ID).Msg("backup backfill: ledger write failed")
 			}
 		}
 		if minted%backfillProgressEvery == 0 {
@@ -848,7 +853,7 @@ func (m *Manager) retryEnqueue(pb PendingBackup, manifest []ManifestEntry, log z
 	m.healPendingBackup(pb, log)
 	var staged bool
 	enqueued := retryWithBackoff(func() bool {
-		ok, s := m.enqueueBackup(pb.VMID, manifest, pb.backupPriority())
+		ok, s, _ := m.enqueueBackup(pb.VMID, manifest, pb.backupPriority())
 		staged = s
 		return ok
 	})
@@ -1054,9 +1059,9 @@ func (pb PendingBackup) backupPriority() backup.Priority {
 // Enqueue is a local BoltDB write (milliseconds) and must never fail the
 // pause: the artifacts on disk are valid regardless, and the journal is
 // the retry mechanism, not the caller.
-func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio backup.Priority) (bool, bool) {
+func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio backup.Priority) (bool, bool, string) {
 	if m.backupEnqueue == nil || len(manifest) == 0 {
-		return false, false
+		return false, false, ""
 	}
 	files := make([]backup.TaskFile, 0, len(manifest))
 	for _, e := range manifest {
@@ -1073,7 +1078,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio back
 	if !pauseManifestComplete(manifest) {
 		m.log.Warn().Str("vm_id", vmID).
 			Msg("pause manifest missing a durable artifact digest; generation not enqueued for backup")
-		return false, false
+		return false, false, ""
 	}
 	task := backup.Task{
 		SandboxID: vmID,
@@ -1137,12 +1142,12 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio back
 	if err := m.backupEnqueue(task); err != nil {
 		m.log.Error().Err(err).Str("vm_id", vmID).
 			Msg("backup enqueue failed; pause not journaled")
-		return false, false
+		return false, false, ""
 	}
 	if m.backfillCapturing.Load() {
 		m.lastSandboxEnqueue.Store(vmID, task.Generation)
 	}
-	return true, staged
+	return true, staged, task.Generation
 }
 
 // probeCtx bounds a systemd liveness probe: these run on detached
