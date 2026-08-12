@@ -177,13 +177,10 @@ type VMRecord struct {
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
-	// PausedAt marks when a sandbox last entered the paused state. New
-	// records persist this field; paused_network_release_at remains as a
-	// legacy compatibility field for older on-disk rows.
+	// PausedAt marks when a sandbox last entered the paused state. Zero on
+	// records written before the field existed; callers needing an ordering
+	// key fall back to CreatedAt.
 	PausedAt time.Time `json:"paused_at,omitempty"`
-	// PausedNetworkReleaseAt is legacy compatibility for rows written by the
-	// older timestamp-based release policy. New writes leave it empty.
-	PausedNetworkReleaseAt time.Time `json:"paused_network_release_at,omitempty"`
 	// Supervision dispatches liveness/stop/reattach for this VM's current
 	// run. Empty (SupervisionUnit) is canonical for systemd-unit VMs so
 	// records written by this binary stay readable-and-correct under a
@@ -713,12 +710,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		Metadata:        rec.Metadata,
 		TeamID:          rec.TeamID,
 		OwnerID:         rec.OwnerID,
-		PausedAt: func() time.Time {
-			if !rec.PausedAt.IsZero() {
-				return rec.PausedAt
-			}
-			return rec.PausedNetworkReleaseAt
-		}(),
+		PausedAt:        rec.PausedAt,
 		Supervision:                rec.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(rec.PreviewAccess, ports),
 		PreviewPorts:               ports,
