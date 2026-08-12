@@ -50,11 +50,13 @@ func (m *Manager) SetBackupCovered(fn func(backup.Task) (bool, error)) {
 }
 
 // SetBackupOwnerCovered installs the generation-free coverage probe: does
-// the sandbox have ANY pending task or completed generation? The backfill
-// ledger's skip path needs it because a ledger mark only proves an
-// enqueue happened, and the uploader's retry ceiling can abandon that
-// task afterward. nil degrades to trusting the ledger alone.
-func (m *Manager) SetBackupOwnerCovered(fn func(sandboxID string) (bool, error)) {
+// the sandbox have any pending task, or a generation completed at or
+// after `since`? The backfill ledger's skip path passes its mark's mint
+// time, because a ledger mark only proves an enqueue happened, the
+// uploader's retry ceiling can abandon that task afterward, and an OLDER
+// generation's completion must not mask the abandoned one. nil degrades
+// to trusting the ledger alone.
+func (m *Manager) SetBackupOwnerCovered(fn func(sandboxID string, since time.Time) (bool, error)) {
 	m.backupOwnerCovered = fn
 }
 
@@ -763,7 +765,7 @@ func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger)
 			unreadable++
 			continue
 		}
-		if prev, ok, err := m.state.GetBackfillMark(rec.ID); err == nil && ok && prev == id {
+		if prev, minted, ok, err := m.state.GetBackfillMark(rec.ID); err == nil && ok && prev == id {
 			// The mark proves an enqueue happened, not that the upload
 			// survived: the retry ceiling can abandon a stuck task after
 			// the mark was written, and a backfilled sandbox may never
@@ -774,7 +776,7 @@ func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger)
 			// re-hashing), and a nil probe trusts the ledger as before.
 			stale := false
 			if m.backupOwnerCovered != nil {
-				if cov, err := m.backupOwnerCovered(rec.ID); err == nil && !cov {
+				if cov, err := m.backupOwnerCovered(rec.ID, minted); err == nil && !cov {
 					stale = true
 				}
 			}
@@ -802,7 +804,7 @@ func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger)
 		// the pending machinery owns the outcome (retained on transient
 		// failures, dropped only on supersession), and re-minting a second
 		// marker for the same snapshot could only duplicate hashing.
-		if err := m.state.PutBackfillMark(rec.ID, id); err != nil {
+		if err := m.state.PutBackfillMark(rec.ID, id, time.Now()); err != nil {
 			log.Warn().Err(err).Str("vm_id", rec.ID).Msg("backup backfill: ledger write failed")
 		}
 		minted++

@@ -464,15 +464,19 @@ func completionKey(scope string, task Task) []byte {
 	return append([]byte(scope+"\x00"), task.indexKey()...)
 }
 
-// OwnerCovered reports whether a sandbox has ANY pending task or
-// completed generation in the given bucket, without needing a
-// generation key. The backfill ledger consults it on the skip path: a
-// ledger mark proves an enqueue happened, not that the upload survived,
-// and the retry ceiling can abandon a structurally stuck task after the
-// mark was written. Backfilled sandboxes may never pause again, so a
-// mark whose task vanished without completing must not keep skipping.
-// Both checks are bounded prefix seeks, not scans.
-func (j *Journal) OwnerCovered(scope, sandboxID string) (bool, error) {
+// OwnerCovered reports whether a sandbox has ANY pending task, or a
+// generation completed at or after `since`, in the given bucket. The
+// backfill ledger consults it on the skip path with the mark's mint
+// time: a ledger mark proves an enqueue happened, not that the upload
+// survived, and the retry ceiling can abandon a structurally stuck task
+// after the mark was written. The time bound is what ties the answer to
+// the MARKED generation without needing its key: an older generation's
+// completion predates the mint and must not mask the abandoned one,
+// while the marked upload's completion can only land after it.
+// Backfilled sandboxes may never pause again, so a stale mark must not
+// keep skipping. The pending seek is bounded; the completion scan walks
+// only the owner's own generations.
+func (j *Journal) OwnerCovered(scope, sandboxID string, since time.Time) (bool, error) {
 	prefix := []byte(sandboxID + "\x00")
 	completedPrefix := []byte(scope + "\x00" + sandboxID + "\x00")
 	var covered bool
@@ -483,8 +487,15 @@ func (j *Journal) OwnerCovered(scope, sandboxID string) (bool, error) {
 			return nil
 		}
 		cc := tx.Bucket(completionsBucket).Cursor()
-		if k, _ := cc.Seek(completedPrefix); k != nil && bytes.HasPrefix(k, completedPrefix) {
-			covered = true
+		for k, v := cc.Seek(completedPrefix); k != nil && bytes.HasPrefix(k, completedPrefix); k, v = cc.Next() {
+			var ns int64
+			if _, err := fmt.Sscanf(string(v), "%d", &ns); err != nil {
+				continue
+			}
+			if !time.Unix(0, ns).Before(since) {
+				covered = true
+				return nil
+			}
 		}
 		return nil
 	})

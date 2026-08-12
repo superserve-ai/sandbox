@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"path/filepath"
 	"time"
 
@@ -875,32 +876,46 @@ func (s *StateStore) GetPendingBackup(vmID string) (PendingBackup, bool, error) 
 // exact snapshot identity, so reruns and later boots skip it without
 // re-hashing. Marks say "a marker was minted", never "the upload
 // verified": once minted, the pending-backup machinery owns the outcome.
-func (s *StateStore) PutBackfillMark(vmID, snapshotIdentity string) error {
+func (s *StateStore) PutBackfillMark(vmID, snapshotIdentity string, mintedAt time.Time) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(backfillMarkBucketName)
 		if b == nil {
 			return fmt.Errorf("backfill ledger bucket missing")
 		}
-		return b.Put([]byte(vmID), []byte(snapshotIdentity))
+		// Identity NUL mint-time: the mint instant lets the skip path
+		// demand coverage NEWER than the mark, so an older generation's
+		// completion cannot mask an abandoned backfill upload.
+		val := fmt.Sprintf("%s\x00%d", snapshotIdentity, mintedAt.UnixNano())
+		return b.Put([]byte(vmID), []byte(val))
 	})
 }
 
 // GetBackfillMark returns the snapshot identity a backfill pass last
-// covered for this VM, if any.
-func (s *StateStore) GetBackfillMark(vmID string) (string, bool, error) {
+// covered for this VM and when it minted, if any.
+func (s *StateStore) GetBackfillMark(vmID string) (string, time.Time, bool, error) {
 	var id string
+	var minted time.Time
 	found := false
 	err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(backfillMarkBucketName)
 		if b == nil {
 			return nil
 		}
-		if v := b.Get([]byte(vmID)); v != nil {
-			id, found = string(v), true
+		v := b.Get([]byte(vmID))
+		if v == nil {
+			return nil
+		}
+		id, found = string(v), true
+		if i := strings.IndexByte(id, 0); i >= 0 {
+			var ns int64
+			if _, err := fmt.Sscanf(id[i+1:], "%d", &ns); err == nil {
+				minted = time.Unix(0, ns)
+			}
+			id = id[:i]
 		}
 		return nil
 	})
-	return id, found, err
+	return id, minted, found, err
 }
 
 // PruneBackfillMarks drops ledger entries for VMs no longer in the

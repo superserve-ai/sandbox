@@ -1526,7 +1526,7 @@ func TestBackfillCoversPausedSandboxAtBestEffort(t *testing.T) {
 	if pending, err := st.ListPendingBackups(); err != nil || len(pending) != 0 {
 		t.Fatalf("pending markers after backfill = %v (err %v), want none", pending, err)
 	}
-	if _, ok, err := st.GetBackfillMark("vm-1"); err != nil || !ok {
+	if _, _, ok, err := st.GetBackfillMark("vm-1"); err != nil || !ok {
 		t.Fatalf("ledger mark missing after backfill (err %v)", err)
 	}
 
@@ -1639,7 +1639,7 @@ func TestBackfillPrunesLedgerForDeletedVMs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if err := st.PutBackfillMark("vm-gone", "stale-identity"); err != nil {
+	if err := st.PutBackfillMark("vm-gone", "stale-identity", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1652,7 +1652,7 @@ func TestBackfillPrunesLedgerForDeletedVMs(t *testing.T) {
 
 	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
 
-	if _, ok, err := st.GetBackfillMark("vm-gone"); err != nil || ok {
+	if _, _, ok, err := st.GetBackfillMark("vm-gone"); err != nil || ok {
 		t.Fatalf("stale ledger entry survived the prune (ok=%v err=%v)", ok, err)
 	}
 }
@@ -1690,7 +1690,7 @@ func TestBackfillRemintsAfterAbandonedTask(t *testing.T) {
 		unitDead: func(context.Context, string) bool { return true },
 	}
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
-	m.SetBackupOwnerCovered(func(string) (bool, error) { return covered, probeErr })
+	m.SetBackupOwnerCovered(func(string, time.Time) (bool, error) { return covered, probeErr })
 
 	drain := func() int {
 		n := 0

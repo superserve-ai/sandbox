@@ -384,7 +384,7 @@ type Manager struct {
 	// backupOwnerCovered probes whether a sandbox has any pending or
 	// completed generation at all, generation-free; nil trusts the
 	// backfill ledger alone. See SetBackupOwnerCovered.
-	backupOwnerCovered func(sandboxID string) (bool, error)
+	backupOwnerCovered func(sandboxID string, since time.Time) (bool, error)
 	// backupMetrics optionally observes backup hook timings; nil (metrics
 	// disabled) is safe at every call site. See SetBackupMetrics.
 	backupMetrics *telemetry.BackupRecorder
