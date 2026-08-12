@@ -147,6 +147,13 @@ var (
 	// "never made it, reconcile", without which a swept owner would be
 	// re-uploaded on every pass after its task was acked away.
 	completionsBucket = []byte("backup_completed_generations")
+	// seededBucket records completion keys whose notification signal was
+	// banked in the outbox at least once (by the ack itself, or by a
+	// seed). The completion seed skips exactly this set, which makes it
+	// structural rather than clock-based: an older uploader's acks from
+	// a rollback window never write it and are caught by the next
+	// upgrade's seed regardless of clock direction.
+	seededBucket = []byte("backup_outbox_seeded")
 )
 
 // verifiedRetention bounds how long verification history is kept. Long
@@ -166,7 +173,7 @@ var pruneCursorKey = []byte("\x00prune_cursor")
 // caller owns the bolt DB; sharing vmd's state DB keeps one fsync domain.
 func NewJournal(db *bolt.DB) (*Journal, error) {
 	err := db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket, outboxBucket, completionsBucket} {
+		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket, outboxBucket, completionsBucket, seededBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -519,6 +526,11 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 			if err := tx.Bucket(outboxBucket).Put(completionKey(completedScope, task), val); err != nil {
 				return err
 			}
+			// Banked: the completion seed must never re-seed this
+			// completion, no matter what any clock does.
+			if err := tx.Bucket(seededBucket).Put(completionKey(completedScope, task), []byte("1")); err != nil {
+				return err
+			}
 		}
 		// Bounded incremental prune: examine at most pruneExamineLimit
 		// entries per ack, resuming from a persisted cursor position and
@@ -768,10 +780,10 @@ func (j *Journal) PendingNotifications(limit int) ([]Task, error) {
 	return tasks, err
 }
 
-// seedChunkLimit bounds completions examined per seed transaction, so
-// the scan of a large history neither holds the shared DB's write lock
-// in one giant transaction nor delays the drain loop it interleaves
-// with.
+// seedChunkLimit bounds unseeded completions processed per seed
+// transaction, so the scan of a large history neither holds the shared
+// DB's write lock in one giant transaction nor delays the drain loop it
+// interleaves with.
 const seedChunkLimit = 256
 
 // SeedOutboxFromCompletions backfills one bounded chunk of the
@@ -780,94 +792,73 @@ const seedChunkLimit = 256
 // entries (pre-wiring history, or a rollback window running an older
 // uploader) have no other path to control-plane coverage: Covered
 // suppresses their re-enqueue and their sandboxes may never pause
-// again. The marker persists a high-water mark of the newest completion
-// ack processed plus a resume cursor: an in-progress scan resumes at
-// the cursor, and the high-water mark only advances once a full scan
-// completes, so an interruption never skips unprocessed older acks.
-// Each boot therefore seeds exactly the completions acked after the
-// last completed scan: rollback windows are caught by the next upgrade,
-// delivered history never re-seeds, and normal completions since the
-// previous boot re-seed once as idempotent no-ops. Seeded tasks carry
+// again. Seeded-ness is structural, not clock-based: every banked
+// signal (ack-time or seed-time) records the completion key in the
+// seeded set within the same transaction, and the seed processes
+// exactly the completions absent from that set, so a rollback window's
+// acks are caught by the next upgrade regardless of clock direction and
+// nothing ever re-seeds. A persisted cursor resumes an interrupted
+// scan; converged boots pay one cheap skip-pass. Seeded tasks carry
 // owner, generation, pinned bucket, and the recorded ack instant but no
 // file manifest (the task row is long gone); the bucket's manifest
 // object remains the file-set authority. Existing outbox entries are
 // never overwritten.
 func (j *Journal) SeedOutboxFromCompletions(scope string) (bool, error) {
-	marker := []byte("\x00completions_seeded\x00" + scope)
+	cursorKey := []byte("\x00completions_seed_cursor\x00" + scope)
 	done := true
 	err := j.db.Update(func(tx *bolt.Tx) error {
 		ob := tx.Bucket(outboxBucket)
-		var seededThrough, maxSeen int64
-		var cursor []byte
-		if v := ob.Get(marker); v != nil {
-			parts := strings.SplitN(string(v), "\x00", 3)
-			_, _ = fmt.Sscanf(parts[0], "%d", &seededThrough)
-			maxSeen = seededThrough
-			if len(parts) == 3 {
-				_, _ = fmt.Sscanf(parts[1], "%d", &maxSeen)
-				cursor = []byte(parts[2])
-			}
-		}
+		seeded := tx.Bucket(seededBucket)
 		prefix := []byte(scope + "\x00")
 		c := tx.Bucket(completionsBucket).Cursor()
 		var k, v []byte
-		if len(cursor) > 0 {
-			// The cursor names the first UNPROCESSED key: resume at it,
-			// not after it.
-			k, v = c.Seek(cursor)
+		if cur := ob.Get(cursorKey); cur != nil {
+			// The cursor names the first unprocessed key: resume at it.
+			k, v = c.Seek(cur)
 		} else {
 			k, v = c.Seek(prefix)
 		}
-		examined := 0
+		processed := 0
 		for ; k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-			if examined >= seedChunkLimit {
-				// Persist progress and yield the write lock: high-water
-				// stays at the last COMPLETED scan, the interim max and
-				// cursor carry this scan's progress.
+			key := append([]byte(nil), k...)
+			if seeded.Get(key) != nil {
+				continue
+			}
+			if processed >= seedChunkLimit {
 				done = false
-				return ob.Put(marker, []byte(fmt.Sprintf("%d\x00%d\x00%s", seededThrough, maxSeen, k)))
+				return ob.Put(cursorKey, key)
 			}
-			var ns int64
-			if _, err := fmt.Sscanf(string(v), "%d", &ns); err != nil {
-				continue
-			}
-			// Already-seeded history does not count against the chunk:
-			// skipping is a cheap read, and charging it would make every
-			// converged boot re-paginate the whole scan.
-			if ns <= seededThrough {
-				continue
-			}
-			examined++
-			if ns > maxSeen {
-				maxSeen = ns
-			}
+			processed++
 			rest := string(k[len(prefix):])
 			i := strings.LastIndexByte(rest, 0)
 			if i < 0 {
 				continue
 			}
 			owner, gen := rest[:i], rest[i+1:]
-			t := Task{Generation: gen, VerifiedBucket: scope, VerifiedAt: time.Unix(0, ns).UTC()}
+			t := Task{Generation: gen, VerifiedBucket: scope}
+			var ns int64
+			if _, err := fmt.Sscanf(string(v), "%d", &ns); err == nil {
+				t.VerifiedAt = time.Unix(0, ns).UTC()
+			}
 			if sep := strings.IndexByte(owner, 0); sep >= 0 {
 				t.TemplateID, t.BuildID = owner[:sep], owner[sep+1:]
 			} else {
 				t.SandboxID = owner
 			}
-			key := completionKey(scope, t)
-			if ob.Get(key) != nil {
-				// A live outbox entry (possibly with its file manifest)
-				// already covers this generation; never overwrite it.
-				continue
+			if ob.Get(key) == nil {
+				val, err := json.Marshal(t)
+				if err != nil {
+					return err
+				}
+				if err := ob.Put(key, val); err != nil {
+					return err
+				}
 			}
-			val, err := json.Marshal(t)
-			if err != nil {
-				return err
-			}
-			if err := ob.Put(key, val); err != nil {
+			if err := seeded.Put(key, []byte("1")); err != nil {
 				return err
 			}
 		}
-		return ob.Put(marker, []byte(fmt.Sprintf("%d", maxSeen)))
+		return ob.Delete(cursorKey)
 	})
 	if err != nil {
 		return false, err
