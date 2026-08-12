@@ -130,8 +130,10 @@ type RecordSandboxBackupGenerationParams struct {
 // freshness checks must see the current pause as covered), so an exact
 // redelivery affects zero rows. The second refresh arm lets a corrected
 // clock repair its own damage: a stored future value (provably bogus,
-// it exceeds now()) yields to a sane incoming one, while redelivery of
-// either report matches neither arm and stays a no-op.
+// it exceeds now()) yields to ANY smaller incoming one, sane or merely
+// less skewed, so repair is monotone even when the correction lands
+// while some skew remains; redelivery of either report matches neither
+// arm and stays a no-op.
 func (q *Queries) RecordSandboxBackupGeneration(ctx context.Context, arg RecordSandboxBackupGenerationParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordSandboxBackupGeneration,
 		arg.SandboxID,
