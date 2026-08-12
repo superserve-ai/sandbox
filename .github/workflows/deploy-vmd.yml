@@ -54,6 +54,17 @@ on:
       - '.github/workflows/deploy-vmd.yml'
       - '.github/workflows/scripts/deploy-vmd.py'
 
+# Serialize runs rather than canceling: deploy-vmd.py stops vmd, rewrites
+# /etc/sandbox/vmd.env, and restarts it non-atomically across several steps
+# per host. Two overlapping runs racing that sequence on the same host can
+# interleave (e.g. both pass the backup-journal migration's source-present
+# check before either finishes), and canceling a run mid-sequence would
+# leave a host stopped or on a half-written env file. A queued run always
+# starts from the finished state of the one before it.
+concurrency:
+  group: deploy-vmd
+  cancel-in-progress: false
+
 jobs:
   # Failing CI must not reach production control-plane hosts. CI is a
   # separate workflow, so `needs:` can't reach it directly — poll the
@@ -153,11 +164,17 @@ jobs:
           VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "0"
           VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
           VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
-          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "20"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "60"
           VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           # Staging validates the backup uploader first; the production
           # cells get their buckets after the staging soak.
           BACKUP_BUCKET: superserve-artifact-backup-staging-usc1
+          # Keeps the backup journal off the root disk — it's written
+          # continuously while backups drain and can stall the uploader
+          # if the (small) root disk fills. Staging is a smaller instance
+          # with no NVMe-backed local SSD (unlike use4/usw2), so this
+          # points at its attached persistent disk instead of /mnt/localssd.
+          BACKUP_JOURNAL_PATH: /mnt/sandbox-data/backup.db
           # Enables vmd's backup metrics exporter (host-local collector);
           # the backup alert policies read these series.
           OTEL_ENVIRONMENT: staging
@@ -229,10 +246,14 @@ jobs:
           VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "0"
           VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
           VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
-          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "20"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "60"
           VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           BACKUP_BUCKET: superserve-artifact-backup-use4
+          # Keeps the backup journal off the root disk — it's written
+          # continuously while backups drain and can stall the uploader
+          # if the (small) root disk fills.
+          BACKUP_JOURNAL_PATH: /mnt/localssd/backup.db
           # Enables vmd's backup metrics exporter (host-local collector);
           # the cell's backup alert policies, including backup-disabled,
           # cannot fire without these series.
@@ -286,7 +307,7 @@ jobs:
           VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "0"
           VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
           VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
-          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "20"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "60"
           VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           # usw is its own cell — separate Supabase project + control plane
@@ -297,6 +318,10 @@ jobs:
           # Enables the pause-backup uploader for the cell (validated on
           # staging first; the bucket is create-only for hosts).
           BACKUP_BUCKET: superserve-artifact-backup-usw2
+          # Keeps the backup journal off the root disk — it's written
+          # continuously while backups drain and can stall the uploader
+          # if the (small) root disk fills.
+          BACKUP_JOURNAL_PATH: /mnt/localssd/backup.db
           # Enables vmd's backup metrics exporter (host-local collector);
           # the cell's backup alert policies, including backup-disabled,
           # cannot fire without these series.
