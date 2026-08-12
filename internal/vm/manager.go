@@ -409,6 +409,12 @@ type Manager struct {
 	// revalidateLauncher's re-enable so a stale previous-boot pin can't resurrect
 	// the launcher path.
 	launcherBuilt atomic.Bool
+	// launcherBuilding admits one pin build at a time, so the boot build and a
+	// sampler-driven retry can't run concurrently and prune the same paths.
+	launcherBuilding atomic.Bool
+	// launcherNextRetry is the earliest wall-clock (unix nanos) at which a failed
+	// pin build may be retried. Zero means retry immediately.
+	launcherNextRetry atomic.Int64
 
 	// cgroups is the delegated subtree for direct-spawned VMs; nil until
 	// ArmDirectSpawn succeeds. directSpawnArmed gates NEW launches onto the

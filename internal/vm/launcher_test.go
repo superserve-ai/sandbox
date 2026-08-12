@@ -4,10 +4,14 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/shellquote"
 )
@@ -220,5 +224,55 @@ malformed
 		if got[i] != want[i] {
 			t.Errorf("prunePaths[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+// TestEnsureLauncherNamespace_SingleFlight pins the guard that keeps the boot
+// build and a sampler-driven retry from pruning the same pin concurrently. The
+// boot build runs async, so a retry scheduled by the first sampler tick can
+// land while it is still running.
+func TestEnsureLauncherNamespace_SingleFlight(t *testing.T) {
+	m := &Manager{cfg: ManagerConfig{
+		LaunchViaLauncherNS: true,
+		LauncherNSPath:      filepath.Join(t.TempDir(), "launcher.mntns"),
+	}}
+	// Stand in for a build already in flight.
+	m.launcherBuilding.Store(true)
+
+	if err := m.EnsureLauncherNamespace(context.Background()); err != nil {
+		t.Fatalf("EnsureLauncherNamespace with a build in flight = %v, want nil", err)
+	}
+	if m.launcherBuilt.Load() || m.launcherReady.Load() {
+		t.Fatal("a skipped build must not claim the pin is built or ready")
+	}
+	if !m.launcherBuilding.Load() {
+		t.Fatal("a skipped build must leave the in-flight guard held by its owner")
+	}
+}
+
+// TestRetryLauncherBuild_RateLimited pins the spacing between failed rebuild
+// attempts: without it a host whose build keeps failing pays a full prune on
+// every sampler tick.
+func TestRetryLauncherBuild_RateLimited(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{
+		LaunchViaLauncherNS: true,
+		LauncherNSPath:      filepath.Join(t.TempDir(), "launcher.mntns"),
+	}}
+	// Held so the spawned attempt returns at the single-flight guard instead of
+	// running a real unshare/prune from a unit test.
+	m.launcherBuilding.Store(true)
+
+	m.retryLauncherBuild(context.Background())
+	first := m.launcherNextRetry.Load()
+	if first == 0 {
+		t.Fatal("first retry did not arm the interval")
+	}
+	if got := time.Until(time.Unix(0, first)); got > launcherRetryInterval {
+		t.Fatalf("next retry armed %v out, want <= %v", got, launcherRetryInterval)
+	}
+
+	m.retryLauncherBuild(context.Background())
+	if m.launcherNextRetry.Load() != first {
+		t.Fatal("a retry inside the interval must not re-arm the timer")
 	}
 }

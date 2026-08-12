@@ -63,6 +63,14 @@ func (m *Manager) EnsureLauncherNamespace(ctx context.Context) error {
 	if pinPath == "" {
 		return nil // launcher mode disabled
 	}
+	// One build at a time. The boot build runs async and can still be in flight
+	// when the first sampler tick schedules a retry; two concurrent prunes would
+	// race over the same pin path. Reporting nil is right — the in-flight build
+	// owns the outcome and logs it.
+	if !m.launcherBuilding.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer m.launcherBuilding.Store(false)
 	ctx, cancel := context.WithTimeout(ctx, launcherBuildTimeout)
 	defer cancel()
 	// The launch path needs nsenter; without it, fail here (launcherReady stays
@@ -313,6 +321,39 @@ func (m *Manager) revalidateLauncher(ctx context.Context) {
 		m.launcherReady.Store(true)
 		m.log.Info().Str("path", pin).Msg("launcher pin valid again — resuming launcher launch path")
 	}
+
+	// A build that failed at boot leaves launcherBuilt false for the life of the
+	// process, so the re-enable arm above can never fire and EVERY launch pays
+	// the full host mount table until someone restarts vmd. Retry instead.
+	//
+	// Rebuilding is safe where resurrecting an old pin is not: a fresh build
+	// snapshots the CURRENT mount table, which is exactly what the boot-time
+	// build does, so it cannot be missing a launch-critical mount added since.
+	if !m.launcherBuilt.Load() {
+		m.retryLauncherBuild(ctx)
+	}
+}
+
+// launcherRetryInterval spaces failed pin rebuilds. A working build takes
+// seconds, so this only paces hosts where it keeps failing — there is no point
+// paying a full prune attempt on every sampler tick.
+const launcherRetryInterval = 5 * time.Minute
+
+// retryLauncherBuild re-attempts the pruned-namespace build after a failure.
+// Async by design: a wedged mount syscall can hold a build for
+// launcherBuildTimeout, and the sampler tick must not block on it.
+func (m *Manager) retryLauncherBuild(ctx context.Context) {
+	now := time.Now()
+	if next := m.launcherNextRetry.Load(); next != 0 && now.UnixNano() < next {
+		return
+	}
+	m.launcherNextRetry.Store(now.Add(launcherRetryInterval).UnixNano())
+	go func() {
+		defer sentrylog.Recover("launcher namespace rebuild")
+		if err := m.EnsureLauncherNamespace(ctx); err != nil {
+			m.log.Warn().Err(err).Msg("launcher pin rebuild failed — still on the legacy launch path")
+		}
+	}()
 }
 
 // hostMountCounts returns the total mount count and the nsfs subset (the
