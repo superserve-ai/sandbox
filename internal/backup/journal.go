@@ -889,14 +889,23 @@ func (j *Journal) SeedOutboxFromCompletions() (bool, error) {
 			} else {
 				t.SandboxID = owner
 			}
-			if ob.Get(key) == nil {
-				val, err := json.Marshal(t)
-				if err != nil {
-					return err
+			if existing := ob.Get(key); existing != nil {
+				// An undelivered entry survives a rollback re-ack with
+				// its stale instant; refresh the instant in place while
+				// preserving any file manifest the entry carries, which
+				// a coverage-only seed could not reconstruct.
+				var cur Task
+				if json.Unmarshal(existing, &cur) == nil {
+					cur.VerifiedAt = t.VerifiedAt
+					t = cur
 				}
-				if err := ob.Put(key, val); err != nil {
-					return err
-				}
+			}
+			val, err := json.Marshal(t)
+			if err != nil {
+				return err
+			}
+			if err := ob.Put(key, val); err != nil {
+				return err
 			}
 			if err := seeded.Put(key, append([]byte(nil), v...)); err != nil {
 				return err

@@ -2655,3 +2655,43 @@ func TestSeedReseedsReacknowledgedCompletion(t *testing.T) {
 		t.Fatalf("reseeded instant %v not after first %v", reseeded[0].VerifiedAt, first)
 	}
 }
+
+// A rollback re-ack while the previous notification is still outboxed
+// must refresh the entry's instant in place, preserving its payload.
+func TestSeedRefreshesUndeliveredEntryOnReack(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0),
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}}}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(task, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+	banked, _ := j.PendingNotifications(0)
+	first := banked[0].VerifiedAt
+
+	// Rollback re-ack before delivery: completion instant moves on.
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(task, "bucket-a", false); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	for done := false; !done; {
+		if done, err = j.SeedOutboxFromCompletions(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refreshed, err := j.PendingNotifications(0)
+	if err != nil || len(refreshed) != 1 {
+		t.Fatalf("outbox = %v err=%v, want one refreshed entry", refreshed, err)
+	}
+	if !refreshed[0].VerifiedAt.After(first) {
+		t.Fatalf("instant %v not refreshed past %v", refreshed[0].VerifiedAt, first)
+	}
+	if len(refreshed[0].Files) != 1 {
+		t.Fatalf("refresh lost the entry's file manifest: %+v", refreshed[0])
+	}
+}
