@@ -276,3 +276,26 @@ func TestRetryLauncherBuild_RateLimited(t *testing.T) {
 		t.Fatal("a retry inside the interval must not re-arm the timer")
 	}
 }
+
+// TestRetryLauncherBuild_CoversPostBuildInvalidation pins the second way a
+// process ends up stuck on the legacy path: a pin that built successfully and
+// later went invalid clears launcherReady but leaves launcherBuilt set, so a
+// rebuild gated on launcherBuilt alone would never fire.
+func TestRetryLauncherBuild_CoversPostBuildInvalidation(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{
+		LaunchViaLauncherNS: true,
+		LauncherNSPath:      filepath.Join(t.TempDir(), "launcher.mntns"),
+	}}
+	// Built this boot, then invalidated: exactly the state revalidateLauncher
+	// leaves behind when a live pin stops being valid.
+	m.launcherBuilt.Store(true)
+	m.launcherReady.Store(false)
+	// Held so the scheduled attempt stops at the single-flight guard rather
+	// than running a real unshare/prune from a unit test.
+	m.launcherBuilding.Store(true)
+
+	m.retryLauncherBuild(context.Background())
+	if m.launcherNextRetry.Load() == 0 {
+		t.Fatal("an invalidated pin must schedule a rebuild, not wait for a restart")
+	}
+}

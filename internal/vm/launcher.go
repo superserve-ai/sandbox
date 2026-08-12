@@ -329,14 +329,24 @@ func (m *Manager) revalidateLauncher(ctx context.Context) {
 		m.log.Info().Str("path", pin).Msg("launcher pin valid again — resuming launcher launch path")
 	}
 
-	// A build that failed at boot leaves launcherBuilt false for the life of the
-	// process, so the re-enable arm above can never fire and EVERY launch pays
-	// the full host mount table until someone restarts vmd. Retry instead.
+	// Rebuild whenever we are not on the launcher path, whatever put us there.
+	// launcherReady is the right predicate because it is true only for a pin
+	// that is both valid AND built this boot, so this covers both ways of
+	// ending up on the legacy path for the life of the process:
 	//
-	// Rebuilding is safe where resurrecting an old pin is not: a fresh build
-	// snapshots the CURRENT mount table, which is exactly what the boot-time
-	// build does, so it cannot be missing a launch-critical mount added since.
-	if !m.launcherBuilt.Load() {
+	//   - the boot build failed, so launcherBuilt never became true and the
+	//     re-enable arm above can never fire;
+	//   - the pin built fine and later went invalid (unmounted, or otherwise
+	//     no longer pruned), which clears launcherReady but leaves
+	//     launcherBuilt set, so a check on launcherBuilt alone would skip it.
+	//
+	// Either way every launch pays the full host mount table until something
+	// rebuilds. Rebuilding is safe where resurrecting an old pin is not: a
+	// fresh build snapshots the CURRENT mount table, which is exactly what the
+	// boot-time build does, so it cannot be missing a launch-critical mount
+	// added since. The single-flight guard inside EnsureLauncherNamespace makes
+	// this a no-op while the boot build is still running.
+	if !m.launcherReady.Load() {
 		m.retryLauncherBuild(ctx)
 	}
 }
