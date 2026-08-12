@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -353,7 +354,7 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 	// retry as the user-facing boots — the background ctx never reads dead,
 	// which is right: a rollback landing late still beats marking the
 	// sandbox failed.
-	_, _, _, _, err := retryTransientBoot(ctx, sbx.ID.String(), func(rctx context.Context) (string, uint32, uint32, error) {
+	ipAddr, _, _, _, err := retryTransientBoot(ctx, sbx.ID.String(), func(rctx context.Context) (string, uint32, uint32, error) {
 		return vmd.ResumeInstance(rctx, sbx.ID.String(), snapshotPath, memPath, sbx.NetworkConfig)
 	})
 	if err != nil {
@@ -370,9 +371,27 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 		return
 	}
 
+	parsedIP, parseErr := netip.ParseAddr(ipAddr)
+	if parseErr != nil {
+		rl.Error().Err(parseErr).Str("ip", ipAddr).Msg("reaper: rollback resume returned invalid IP")
+		h.markSandboxFailed(ctx, sbx, "rollback resume returned invalid IP after pause DB error", rl)
+		return
+	}
+
 	// VM is running again — revert DB to active so reaper retries cleanly.
 	revertCtx, revertCancel := context.WithTimeout(ctx, asyncTimeout)
 	defer revertCancel()
+	if err := h.DB.UpdateSandboxHost(revertCtx, db.UpdateSandboxHostParams{
+		ID:        sbx.ID,
+		HostID:    sbx.HostID,
+		IpAddress: &parsedIP,
+		Pid:       nil,
+		TeamID:    sbx.TeamID,
+	}); err != nil {
+		rl.Error().Err(err).Msg("reaper: rollback host/IP update failed (VM resumed but row not updated)")
+		h.markSandboxFailed(ctx, sbx, "rollback host/IP update failed after pause DB error", rl)
+		return
+	}
 	if err := h.DB.UpdateSandboxStatus(revertCtx, db.UpdateSandboxStatusParams{
 		ID:     sbx.ID,
 		Status: db.SandboxStatusActive,

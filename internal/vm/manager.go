@@ -387,6 +387,8 @@ type Manager struct {
 	// launchFirecrackerHook is a test seam. When set, launchFirecracker
 	// delegates to it instead of the platform-specific implementation.
 	launchFirecrackerHook func(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error)
+	// restoreForResumeHook is a test seam for the snapshot restore step.
+	restoreForResumeHook func(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo) (dirtyTracked bool, err error)
 	// pausedNetworkControllerState bounds pause-network reclamation cadence.
 	pausedNetworkControllerMu      sync.Mutex
 	pausedNetworkControllerLastRun time.Time
@@ -1618,25 +1620,31 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		}
 	}
 	tRestore := time.Now()
-	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
+	var dirtyTracked bool
+	var restoreErr error
+	if m.restoreForResumeHook != nil {
+		dirtyTracked, restoreErr = m.restoreForResumeHook(socketPath, snapshotPath, memPath, basePath, netInfo)
+	} else {
+		dirtyTracked, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
+	}
 	tRestoreDone := time.Now()
-	if err != nil {
+	if restoreErr != nil {
 		// Firecracker is already running; stop the unit before returning or it leaks.
 		m.stopUnitDuringRestoreError(vmID)
-		if errors.Is(err, ErrTornSnapshot) {
+		if errors.Is(restoreErr, ErrTornSnapshot) {
 			return nil, status.Errorf(codes.DataLoss,
 				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
-				snapshotPath, err)
+				snapshotPath, restoreErr)
 		}
-		if errors.Is(err, ErrLayeredInvalidSnapshot) {
+		if errors.Is(restoreErr, ErrLayeredInvalidSnapshot) {
 			// Permanent: the overlay/base pairing is structurally invalid, so retrying
 			// the layered restore can't succeed. FailedPrecondition tells the caller not
 			// to retry (vs the generic Internal below, which it may).
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"snapshot %q has an invalid layered overlay/base pairing; do not retry: %v",
-				snapshotPath, err)
+				snapshotPath, restoreErr)
 		}
-		return nil, fmt.Errorf("restore snapshot: %w", err)
+		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
 	inst.mu.RLock()
@@ -1651,7 +1659,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// (detached probe below). The guest was just relaunched from its
 		// snapshot, so this teardown discards nothing of value — but only a
 		// GENUINE verdict may reach it; see verifyBoxdReady.
-		if verr := m.verifyBoxdReady(ctx, inst.IP); verr != nil {
+		if verr := m.verifyBoxdReady(ctx, netInfo.HostIP); verr != nil {
 			m.stopUnitDuringRestoreError(vmID)
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("boxd not ready after relaunch of unverified vm %s: %w", vmID, verr)

@@ -2099,6 +2099,88 @@ func TestResumeVM_UnverifiedTarget_VerifiedAndAdopted(t *testing.T) {
 	}
 }
 
+// When a paused record has had its network identity cleared, the unverified
+// resume path must verify the replacement slot's IP, not the empty pre-release
+// address. Otherwise a healthy relaunch gets stopped as "unready" and marked
+// failed.
+func TestResumeVM_UnverifiedRelaunchVerifiesReplacementIP(t *testing.T) {
+	var verifiedIP string
+	origReady := adoptionBoxdReady
+	defer func() { adoptionBoxdReady = origReady }()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	rootfsPath := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snapPath, memPath, rootfsPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fake := &fakeNetMgr{
+		setupInfo: map[string]*network.VMNetInfo{
+			"vm-1": {
+				Namespace:  "ns-99",
+				TAPDevice:  network.TAPName,
+				VMIP:       network.VMInternalIP,
+				GatewayIP:  network.VMGatewayIP,
+				HostIP:     "10.11.0.99",
+				MACAddress: "02:FC:00:00:00:63",
+			},
+		},
+	}
+	inst := &VMInstance{
+		ID:           "vm-1",
+		Status:       StatusPaused,
+		Unverified:   true,
+		SnapshotPath: snapPath,
+		MemFilePath:  memPath,
+		DiskPath:     rootfsPath,
+	}
+	mgr := &Manager{
+		log:    zerolog.Nop(),
+		cfg:    ManagerConfig{RunDir: dir},
+		netMgr: fake,
+		vms:    map[string]*VMInstance{"vm-1": inst},
+	}
+	mgr.launchFirecrackerHook = func(_ context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (int, Supervision, error) {
+		if vmID != "vm-1" {
+			t.Fatalf("vmID = %q, want vm-1", vmID)
+		}
+		if netNS != "ns-99" {
+			t.Fatalf("netNS = %q, want ns-99", netNS)
+		}
+		if perVMRootfs != rootfsPath || basePath != "" || socketPath == "" {
+			t.Fatalf("unexpected launch paths: socket=%q rootfs=%q base=%q", socketPath, perVMRootfs, basePath)
+		}
+		if existing != SupervisionUnit || !hadPriorLife || freshUnit {
+			t.Fatalf("unexpected launch args: existing=%q hadPriorLife=%v freshUnit=%v", existing, hadPriorLife, freshUnit)
+		}
+		return 4321, SupervisionUnit, nil
+	}
+	mgr.restoreForResumeHook = func(_ string, _ string, _ string, _ string, _ *network.VMNetInfo) (bool, error) {
+		return true, nil
+	}
+	adoptionBoxdReady = func(_ context.Context, _ *Manager, ip string) error {
+		verifiedIP = ip
+		return nil
+	}
+
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatalf("lock op: %v", err)
+	}
+	defer unlock()
+
+	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil {
+		t.Fatalf("resumeVMLocked: %v", err)
+	}
+	if verifiedIP != "10.11.0.99" {
+		t.Fatalf("verified IP = %q, want replacement host IP", verifiedIP)
+	}
+}
+
 // commitVerifiedAdoption must treat the store refusing the marker-clear write
 // (record deleted by a concurrent destroy) as NotFound, never success.
 func TestCommitVerifiedAdoption_DestroyedRecordIsNotFound(t *testing.T) {

@@ -237,9 +237,7 @@ func (r *OTelRecorder) RecordPausedNetworkPressure(ctx context.Context, p Paused
 		return
 	}
 	attrs := r.attrs()
-	pressureAttrs := append(attrs, attribute.String("reason", safePressureReason(p.PressureState)))
 	opt := metric.WithAttributes(attrs...)
-	pressureOpt := metric.WithAttributes(pressureAttrs...)
 	r.pausedNetworkSlotsTotal.Record(ctx, p.TotalSlots, opt)
 	r.pausedNetworkSlotsUsed.Record(ctx, p.UsedSlots, opt)
 	r.pausedNetworkSlotsAvail.Record(ctx, p.AvailableSlots, opt)
@@ -247,7 +245,14 @@ func (r *OTelRecorder) RecordPausedNetworkPressure(ctx context.Context, p Paused
 	r.pausedNetworkPoolSlots.Record(ctx, p.RecycledPool, metric.WithAttributes(append(attrs, attribute.String("type", "recycled"))...))
 	r.pausedNetworkNetnsTotal.Record(ctx, p.NetnsTotal, opt)
 	r.pausedNetworkMountTotal.Record(ctx, p.MountTotal, opt)
-	r.pausedNetworkPressure.Record(ctx, 1, pressureOpt)
+	currentReason := safePressureReason(p.PressureState)
+	for _, reason := range []string{"idle", "slot", "kernel", "both"} {
+		value := int64(0)
+		if reason == currentReason {
+			value = 1
+		}
+		r.pausedNetworkPressure.Record(ctx, value, metric.WithAttributes(append(attrs, attribute.String("reason", reason))...))
+	}
 	if p.ReclaimedRecycle > 0 {
 		r.pausedNetworkReclaimed.Add(ctx, p.ReclaimedRecycle, metric.WithAttributes(append(attrs, attribute.String("mode", "recycle"))...))
 	}

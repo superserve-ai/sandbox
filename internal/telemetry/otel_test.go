@@ -329,15 +329,19 @@ func TestRecordPausedNetworkPressureEmitsControllerMetrics(t *testing.T) {
 				if !ok {
 					t.Fatalf("pressure state data type = %T, want metricdata.Gauge[int64]", metric.Data)
 				}
-				if len(gauge.DataPoints) != 1 || gauge.DataPoints[0].Value != 1 {
-					t.Fatalf("pressure state datapoints = %+v, want one value 1", gauge.DataPoints)
+				if len(gauge.DataPoints) != 4 {
+					t.Fatalf("pressure state datapoints = %+v, want four reason series", gauge.DataPoints)
 				}
-				attrs := map[string]string{}
-				for _, attr := range gauge.DataPoints[0].Attributes.ToSlice() {
-					attrs[string(attr.Key)] = attr.Value.AsString()
+				byReason := map[string]int64{}
+				for _, dp := range gauge.DataPoints {
+					attrs := map[string]string{}
+					for _, attr := range dp.Attributes.ToSlice() {
+						attrs[string(attr.Key)] = attr.Value.AsString()
+					}
+					byReason[attrs["reason"]] = dp.Value
 				}
-				if attrs["reason"] != "kernel" {
-					t.Fatalf("pressure state reason = %q, want kernel", attrs["reason"])
+				if byReason["idle"] != 0 || byReason["slot"] != 0 || byReason["kernel"] != 1 || byReason["both"] != 0 {
+					t.Fatalf("pressure state values = %#v, want idle=0 slot=0 kernel=1 both=0", byReason)
 				}
 				seen[metric.Name] = true
 			}

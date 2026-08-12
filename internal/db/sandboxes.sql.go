@@ -2128,7 +2128,7 @@ func (q *Queries) UpdateSandboxAutoDelete(ctx context.Context, arg UpdateSandbox
 
 const updateSandboxHost = `-- name: UpdateSandboxHost :exec
 UPDATE sandbox
-SET host_id = $2, ip_address = $3, pid = $4, updated_at = now()
+SET host_id = $2, ip_address = $3, pid = COALESCE($4, pid), updated_at = now()
 WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL
 `
 
