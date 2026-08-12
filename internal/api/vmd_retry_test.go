@@ -6,9 +6,15 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+type retryableCreateErr struct{}
+
+func (retryableCreateErr) Error() string     { return "retryable create error" }
+func (retryableCreateErr) SafeToRetry() bool { return true }
 
 func TestRetryBootOnDeadline(t *testing.T) {
 	grpcDeadline := status.Error(codes.DeadlineExceeded, "context deadline exceeded")
@@ -97,5 +103,17 @@ func TestIsVMDDeadline(t *testing.T) {
 	if isVMDDeadline(nil) || isVMDDeadline(errors.New("boom")) ||
 		isVMDDeadline(status.Error(codes.Unavailable, "x")) || isVMDDeadline(context.Canceled) {
 		t.Error("nil, plain, Unavailable, and Canceled must not classify")
+	}
+}
+
+func TestIsTransientCreateDBErr(t *testing.T) {
+	if !isTransientCreateDBErr(retryableCreateErr{}) {
+		t.Error("SafeToRetry errors should classify as transient create DB failures")
+	}
+	if !isTransientCreateDBErr(&pgconn.PgError{Code: "57P01", Message: "shutdown"}) {
+		t.Error("postgres restart SQLSTATE should classify as transient")
+	}
+	if isTransientCreateDBErr(errors.New("boom")) {
+		t.Error("plain errors must not classify as transient create DB failures")
 	}
 }
