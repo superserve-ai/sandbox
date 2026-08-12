@@ -340,8 +340,12 @@ def main() -> int:
                 # (cmd/vmd/main.go), so a nested path like
                 # /mnt/localssd/journals/backup.db needs this directory to
                 # exist before vmd (or the migration copy below) can open a
-                # file in it. A no-op when the parent already exists.
-                sudo install -d -m 0755 "$(dirname {q_backup_journal})"
+                # file in it. A no-op when the parent already exists. 0700,
+                # not the more common 0755: only vmd (root) ever needs to
+                # reach this directory, matching the 0600 the journal file
+                # itself already gets, rather than leaving its existence,
+                # name, and size readable to every local user.
+                sudo install -d -m 0700 "$(dirname {q_backup_journal})"
             fi
 
             # Extract the deploy bundle into a sha-scoped staging dir so
@@ -813,6 +817,18 @@ def main() -> int:
                 done
                 if [ "$(sudo stat -c %d "$BJ_ANCESTOR")" = "$(sudo stat -c %d /)" ]; then
                     echo "ERROR: $BJ_ANCESTOR is on the root filesystem, not a separate mount; refusing to deploy" >&2
+                    # Do NOT let the recovery trap restart vmd here: {service}
+                    # is already stopped, but the trap's own restart (and,
+                    # if left active, the socket auto-activating it) would
+                    # bring vmd back up against vmd.env's still-current,
+                    # normally-correct path -- which, since this check just
+                    # proved the real mount is gone, now silently resolves
+                    # to the root disk instead. That's exactly the failure
+                    # this check exists to catch, so disarm the trap and
+                    # stop the socket too: down but honest beats up and
+                    # silently writing the journal to the wrong disk.
+                    trap - EXIT
+                    sudo systemctl stop superserve-vmd.socket {service} 2>/dev/null || true
                     exit 1
                 fi
 
