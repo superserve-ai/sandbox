@@ -95,10 +95,12 @@ variable "labels" {
 variable "backup_alerts" {
   description = <<-EOT
     Alert policies over the vmd backup pipeline's Managed Prometheus
-    metrics (exported by the host-local OTel collector), scoped to one
-    cell's vmd host via the host_id metric label. host_id follows the
-    sandbox host's HOST_ID runtime env, which matches the instance name.
-    Null disables the whole set.
+    metrics, scoped to one cell's vmd host via the host_id metric label.
+    host_id is vmd's HOST_ID runtime env, which is its identity in the host
+    table — NOT necessarily the instance name, and not the host_id the
+    collector stamps on its own host-level series. Pass the value read from
+    the host's /etc/sandbox/vmd.env; a guess selects no series and the
+    policies stay silent. Null disables the whole set.
   EOT
   type = object({
     host_id        = string
@@ -165,11 +167,16 @@ variable "host_disk_alerts" {
 
 variable "launch_path_alerts" {
   description = <<-EOT
-    Alert policies over the vmd launch path's Managed Prometheus metrics
-    (exported by the host-local OTel collector), scoped to one cell's vmd
-    host via the host_id metric label. Covers the pruned launcher mount
-    namespace being unavailable and live network namespaces accumulating,
-    both of which degrade latency silently. Null disables the set.
+    Alert policies over the vmd launch path's Managed Prometheus metrics,
+    scoped to one cell's vmd host via the host_id metric label. Covers the
+    pruned launcher mount namespace being unavailable and live network
+    namespaces accumulating, both of which degrade latency silently.
+
+    host_id is vmd's HOST_ID runtime env (the same label the backup metrics
+    carry), NOT the instance name and NOT the collector's own host_id — read
+    it from the host's /etc/sandbox/vmd.env. A guess selects no series, and
+    a policy watching nothing is indistinguishable from a healthy host.
+    Null disables the set.
   EOT
   type = object({
     host_id        = string

@@ -23,6 +23,13 @@ type OTelConfig struct {
 	Endpoint       string
 	Insecure       bool
 	ExportInterval time.Duration
+	// HostID scopes per-host series to the host that produced them. The
+	// collector stamps host_id only onto its own hostmetrics pipeline,
+	// assuming OTLP senders label their own series — so without this, a
+	// per-host gauge is indistinguishable between cells and cannot be
+	// alerted on per host. Empty (the control plane, which is not per-host)
+	// records as "unknown".
+	HostID string
 }
 
 // OTelRecorder emits the sandbox control plane's bounded operational metrics
@@ -32,6 +39,7 @@ type OTelRecorder struct {
 
 	serviceName string
 	environment string
+	hostID      string
 
 	sandboxTransitions       metric.Int64Counter
 	sandboxDuration          metric.Float64Histogram
@@ -85,6 +93,7 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		provider:    provider,
 		serviceName: cfg.ServiceName,
 		environment: cfg.Environment,
+		hostID:      safeHostID(cfg.HostID),
 	}
 	if r.sandboxTransitions, err = meter.Int64Counter("sandbox_transition_total"); err != nil {
 		return nil, err
@@ -247,14 +256,17 @@ func (r *OTelRecorder) RecordLauncherState(ctx context.Context, s LauncherState)
 	if s.Ready {
 		ready = 1
 	}
-	r.launcherReady.Record(ctx, ready, metric.WithAttributes(r.attrs()...))
+	r.launcherReady.Record(ctx, ready, metric.WithAttributes(r.selfAttrs()...))
 }
 
 func (r *OTelRecorder) RecordPausedNetworkPressure(ctx context.Context, p PausedNetworkPressure) {
 	if r == nil {
 		return
 	}
-	attrs := r.attrs()
+	// These describe the emitting host's own network state, so they carry
+	// host_id — without it every cell's series collapse into one and cannot be
+	// alerted on or attributed per host.
+	attrs := r.selfAttrs()
 	opt := metric.WithAttributes(attrs...)
 	r.pausedNetworkSlotsTotal.Record(ctx, p.TotalSlots, opt)
 	r.pausedNetworkSlotsUsed.Record(ctx, p.UsedSlots, opt)
@@ -280,6 +292,18 @@ func (r *OTelRecorder) RecordPausedNetworkPressure(ctx context.Context, p Paused
 	if p.ReclaimedPaused > 0 {
 		r.pausedNetworkPaused.Add(ctx, p.ReclaimedPaused, opt)
 	}
+}
+
+// selfAttrs labels a series with the host that EMITTED it, for gauges that
+// describe this process's own host rather than a call's target. Kept separate
+// from attrs: the call-flavoured recorders already carry a host_id meaning
+// "the host this operation addressed", and a second key would collide.
+func (r *OTelRecorder) selfAttrs(extra ...attribute.KeyValue) []attribute.KeyValue {
+	return append([]attribute.KeyValue{
+		attribute.String("service.name", r.serviceName),
+		attribute.String("environment", r.environment),
+		attribute.String("host_id", r.hostID),
+	}, extra...)
 }
 
 func (r *OTelRecorder) attrs(extra ...attribute.KeyValue) []attribute.KeyValue {
