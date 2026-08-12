@@ -70,13 +70,22 @@ func (m *Manager) launchFirecrackerImpl(ctx context.Context, vmID, socketPath, p
 		// which both report as stopped while the old FC is still exiting.
 		// A no-op unit stop costs one D-Bus round trip; fresh creates never
 		// had a unit and skip it.
+		//
+		// Timed, and carried into the phase log below: this block runs before
+		// the phase clock starts, so without the field it is the invisible
+		// difference between fc_start_ms and prestart+spawn+wait_socket —
+		// a gap that has to be reconstructed by subtraction across log lines,
+		// which mispairs whenever the same VM launched more than once.
+		var stopPrior time.Duration
 		if hadPriorLife {
+			tStopPrior := time.Now()
 			_ = stopUnit(ctx, systemdUnitName(vmID))
 			if !unitFullyDown(ctx, systemdUnitName(vmID)) {
 				return 0, existing, fmt.Errorf("legacy unit for %s not fully down; refusing cgroup launch", vmID)
 			}
+			stopPrior = time.Since(tStopPrior)
 		}
-		pid, err = m.startFirecrackerDirect(ctx, vmID, socketPath, perVMRootfs, basePath, netNS)
+		pid, err = m.startFirecrackerDirect(ctx, vmID, socketPath, perVMRootfs, basePath, netNS, stopPrior)
 		if err != nil && errors.Is(err, errScopeGone) {
 			// The delegated scope is gone (keeper died, drained scope GC'd).
 			// Scope-gone proves no cgroup FC survives for this ID (a populated
@@ -202,7 +211,7 @@ func (m *Manager) cgroupStillLive(vmID string) bool {
 // the async unit-MainPID resolution is unnecessary here. A leftover populated
 // cgroup at launch is the winding-down case: kill it empty first, mirroring
 // the unit path's replace semantics.
-func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string) (int, error) {
+func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, stopPrior time.Duration) (int, error) {
 	tPrestart := time.Now()
 	if m.cgroups == nil {
 		return 0, fmt.Errorf("direct launch %s: not armed", vmID)
@@ -296,6 +305,7 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 
 	m.log.Info().
 		Str("vm_id", vmID).
+		Int64("stop_prior_ms", stopPrior.Milliseconds()).
 		Int64("prestart_ms", tStart.Sub(tPrestart).Milliseconds()).
 		Int64("spawn_ms", tSpawnDone.Sub(tStart).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tSpawnDone).Milliseconds()).
