@@ -773,6 +773,18 @@ def main() -> int:
                     sudo rm -f "${{NEW_BACKUP_JOURNAL_PATH}}".migrating.*
                     sudo cp --preserve=mode,ownership "$OLD_BACKUP_JOURNAL_PATH" "$TMP_BACKUP_JOURNAL_PATH"
                     sudo mv "$TMP_BACKUP_JOURNAL_PATH" "$NEW_BACKUP_JOURNAL_PATH"
+                    # The copy and the rename onto NEW_BACKUP_JOURNAL_PATH are
+                    # only cached writes until this point: root disk and the
+                    # local-SSD array are separate devices with independent
+                    # write-back queues, so a crash here could retire the
+                    # source (next step) while the destination's data, or
+                    # even the rename's own directory entry, hasn't reached
+                    # stable storage yet — on reboot vmd would find a missing
+                    # or truncated destination with no source left to fall
+                    # back to. Flush everything to disk before going any
+                    # further so the destination is durable before the
+                    # source is touched.
+                    sudo sync
                     # Rename rather than remove the source: belt-and-suspenders
                     # against anything unexpected in this critical section
                     # (e.g. this script itself being killed between the two
