@@ -21,10 +21,17 @@ DO UPDATE SET completed_at = excluded.completed_at, reported_at = now(), files =
 WHERE excluded.completed_at > backup_generation.completed_at;
 
 -- name: LatestSandboxBackup :one
+-- Freshness bounds future timestamps at read instead of rewriting them
+-- at insert: completed_at is stored exactly as the host verified it, so
+-- redeliveries stay idempotent under the strictly-newer upsert guard and
+-- the host's own ordering survives. A skewed-ahead clock's rows cap at
+-- now() for ranking (they cannot outrank indefinitely), the raw
+-- timestamp breaks ties preserving the host's relative order, and the
+-- true order re-emerges as wall time passes the stamps.
 SELECT generation, bucket, completed_at
 FROM backup_generation
 WHERE sandbox_id = $1
-ORDER BY completed_at DESC
+ORDER BY LEAST(completed_at, now()) DESC, completed_at DESC
 LIMIT 1;
 
 -- name: LockSandboxRow :one

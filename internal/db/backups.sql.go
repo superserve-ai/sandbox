@@ -17,7 +17,7 @@ const latestSandboxBackup = `-- name: LatestSandboxBackup :one
 SELECT generation, bucket, completed_at
 FROM backup_generation
 WHERE sandbox_id = $1
-ORDER BY completed_at DESC
+ORDER BY LEAST(completed_at, now()) DESC, completed_at DESC
 LIMIT 1
 `
 
@@ -27,6 +27,13 @@ type LatestSandboxBackupRow struct {
 	CompletedAt time.Time `json:"completed_at"`
 }
 
+// Freshness bounds future timestamps at read instead of rewriting them
+// at insert: completed_at is stored exactly as the host verified it, so
+// redeliveries stay idempotent under the strictly-newer upsert guard and
+// the host's own ordering survives. A skewed-ahead clock's rows cap at
+// now() for ranking (they cannot outrank indefinitely), the raw
+// timestamp breaks ties preserving the host's relative order, and the
+// true order re-emerges as wall time passes the stamps.
 func (q *Queries) LatestSandboxBackup(ctx context.Context, sandboxID pgtype.UUID) (LatestSandboxBackupRow, error) {
 	row := q.db.QueryRow(ctx, latestSandboxBackup, sandboxID)
 	var i LatestSandboxBackupRow
