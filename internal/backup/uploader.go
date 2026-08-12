@@ -292,6 +292,7 @@ func (u *Uploader) flushNotifications() {
 			// will fail the rest too, and each attempt can hold the
 			// drain goroutine for the full request timeout. The retained
 			// entries redeliver together after the retry window.
+			u.Metrics.AddNotifyFailure(context.Background())
 			t.logOwner(u.Log.Warn().Err(err)).
 				Str("generation", t.Generation).
 				Msg("backup notification delivery failed; will redeliver")
