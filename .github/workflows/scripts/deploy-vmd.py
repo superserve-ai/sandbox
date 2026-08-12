@@ -58,6 +58,29 @@ Env vars:
                        unbound local_dns_port; upserted into vmd.env so a rebuilt
                        host wires the redirect (unbound answers there but vmd
                        owns the redirect rules).
+  VMD_PAUSED_NETWORK_RECLAIM optional — enables pressure-driven release of
+                       paused-network inventory. When set, upserted into
+                       vmd.env.
+  VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT optional — free-slot pressure
+                       percentage. When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE optional — free-slot absolute
+                       reserve. When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS optional — free-slot release
+                       band. When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_NETNS_THRESHOLD optional — kernel netns pressure
+                       threshold. When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_NETNS_HYSTERESIS optional — kernel netns recovery band.
+                       When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_MOUNT_THRESHOLD optional — kernel mount pressure
+                       threshold. When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS optional — kernel mount recovery band.
+                       When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_MIN_WARM_AGE optional — minimum paused age before
+                       slot-pressure recycle. When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_MAX_RECLAIMS optional — controller work budget per pass.
+                       When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN optional — minimum time between
+                       reclamation passes. When set, upserted into vmd.env.
 
 All deploy artifacts (binaries + systemd units + scripts) are packed
 into a single tarball and SCP'd once per host. Each gcloud SCP/SSH
@@ -154,6 +177,50 @@ def main() -> int:
     q_cpu_line = shlex.quote(f"CONTROL_PLANE_URL={control_plane_url}")
     q_dns = shlex.quote(dns_redirect_port)
     q_dns_line = shlex.quote(f"VMD_DNS_REDIRECT_PORT={dns_redirect_port}")
+    q_paused_reclaim = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_RECLAIM", ""))
+    q_paused_reclaim_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_RECLAIM={os.environ.get('VMD_PAUSED_NETWORK_RECLAIM', '')}"
+    )
+    q_paused_slot_percent = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT", ""))
+    q_paused_slot_percent_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT={os.environ.get('VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT', '')}"
+    )
+    q_paused_slot_reserve = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE", ""))
+    q_paused_slot_reserve_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE={os.environ.get('VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE', '')}"
+    )
+    q_paused_slot_hysteresis = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS", ""))
+    q_paused_slot_hysteresis_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS={os.environ.get('VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS', '')}"
+    )
+    q_paused_netns_threshold = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_NETNS_THRESHOLD", ""))
+    q_paused_netns_threshold_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_NETNS_THRESHOLD={os.environ.get('VMD_PAUSED_NETWORK_NETNS_THRESHOLD', '')}"
+    )
+    q_paused_netns_hysteresis = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_NETNS_HYSTERESIS", ""))
+    q_paused_netns_hysteresis_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_NETNS_HYSTERESIS={os.environ.get('VMD_PAUSED_NETWORK_NETNS_HYSTERESIS', '')}"
+    )
+    q_paused_mount_threshold = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_MOUNT_THRESHOLD", ""))
+    q_paused_mount_threshold_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_MOUNT_THRESHOLD={os.environ.get('VMD_PAUSED_NETWORK_MOUNT_THRESHOLD', '')}"
+    )
+    q_paused_mount_hysteresis = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS", ""))
+    q_paused_mount_hysteresis_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS={os.environ.get('VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS', '')}"
+    )
+    q_paused_min_warm_age = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_MIN_WARM_AGE", ""))
+    q_paused_min_warm_age_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_MIN_WARM_AGE={os.environ.get('VMD_PAUSED_NETWORK_MIN_WARM_AGE', '')}"
+    )
+    q_paused_max_reclaims = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_MAX_RECLAIMS", ""))
+    q_paused_max_reclaims_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_MAX_RECLAIMS={os.environ.get('VMD_PAUSED_NETWORK_MAX_RECLAIMS', '')}"
+    )
+    q_paused_cooldown = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN", ""))
+    q_paused_cooldown_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN={os.environ.get('VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN', '')}"
+    )
     q_token = shlex.quote(internal_api_token)
     q_iat_line = shlex.quote(f"INTERNAL_API_TOKEN={internal_api_token}")
     q_dat_line = shlex.quote(f"DAEMON_AUTH_TOKEN={internal_api_token}")
@@ -481,6 +548,76 @@ def main() -> int:
                 sudo touch /etc/sandbox/vmd.env
                 sudo sed -i '/^VMD_DNS_REDIRECT_PORT=/d' /etc/sandbox/vmd.env
                 echo {q_dns_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Upsert the paused-network reclaim policy. These values are
+            # supplied by deployment config so the daemon never bakes in host
+            # defaults.
+            if [ -n {q_paused_reclaim} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_RECLAIM=/d' /etc/sandbox/vmd.env
+                echo {q_paused_reclaim_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_slot_percent} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT=/d' /etc/sandbox/vmd.env
+                echo {q_paused_slot_percent_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_slot_reserve} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE=/d' /etc/sandbox/vmd.env
+                echo {q_paused_slot_reserve_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_slot_hysteresis} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS=/d' /etc/sandbox/vmd.env
+                echo {q_paused_slot_hysteresis_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_netns_threshold} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_NETNS_THRESHOLD=/d' /etc/sandbox/vmd.env
+                echo {q_paused_netns_threshold_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_netns_hysteresis} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_NETNS_HYSTERESIS=/d' /etc/sandbox/vmd.env
+                echo {q_paused_netns_hysteresis_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_mount_threshold} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_MOUNT_THRESHOLD=/d' /etc/sandbox/vmd.env
+                echo {q_paused_mount_threshold_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_mount_hysteresis} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS=/d' /etc/sandbox/vmd.env
+                echo {q_paused_mount_hysteresis_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_min_warm_age} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_MIN_WARM_AGE=/d' /etc/sandbox/vmd.env
+                echo {q_paused_min_warm_age_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_max_reclaims} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_MAX_RECLAIMS=/d' /etc/sandbox/vmd.env
+                echo {q_paused_max_reclaims_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_cooldown} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN=/d' /etc/sandbox/vmd.env
+                echo {q_paused_cooldown_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
             # Upsert the shared control-plane auth token. vmd reads it as

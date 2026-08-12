@@ -41,6 +41,7 @@ func newTestPool(t *testing.T, m *Manager) *Pool {
 		fresh:              make(chan *preallocSlot, 4),
 		recycled:           make(chan *preallocSlot, 4),
 		stopCh:             make(chan struct{}),
+		refillDrainGate:    make(chan struct{}),
 		verifyPollInterval: time.Millisecond,
 		verifyMaxWait:      50 * time.Millisecond,
 		resetSem:           make(chan struct{}, resetTapConcurrency),
@@ -554,6 +555,54 @@ func TestPoolStop_LegacyTearsDownParkedVerify(t *testing.T) {
 	}
 }
 
+// A refill worker that was already blocked on a full pool must observe a
+// drain and drop the built slot instead of replacing the one the controller
+// just removed.
+func TestPoolDrainRejectsBlockedRefillSend(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+
+	for i := 0; i < cap(p.fresh); i++ {
+		p.fresh <- &preallocSlot{}
+	}
+
+	dropped := make(chan struct{})
+	errCh := make(chan string, 1)
+	started := make(chan struct{})
+	go func() {
+		slot := &preallocSlot{}
+		close(started)
+		select {
+		case p.fresh <- slot:
+			errCh <- "blocked refill send should not succeed once drain starts"
+		case <-p.refillDrainCh():
+			close(dropped)
+		case <-p.stopCh:
+		}
+	}()
+	<-started
+	time.Sleep(25 * time.Millisecond)
+
+	if drained := p.drain(1); drained != 1 {
+		t.Fatalf("drain = %d, want 1", drained)
+	}
+
+	select {
+	case <-dropped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked refill send did not observe drain")
+	}
+	select {
+	case msg := <-errCh:
+		t.Fatal(msg)
+	default:
+	}
+	if got := len(p.fresh); got != 3 {
+		t.Fatalf("fresh pool depth = %d, want 3 after draining one slot", got)
+	}
+}
+
 func TestAdoptOrphanSlots_ValidSlotBecomesClaimable(t *testing.T) {
 	dir := withTestNetnsDir(t)
 	touchNS(t, dir, "ns-7")
@@ -638,8 +687,8 @@ func TestClaimOrphanSlots_SkipsOwnedAndBumpsHighWater(t *testing.T) {
 
 func TestClaimOrphanSlots_RejectsOutOfRangeIndex(t *testing.T) {
 	dir := withTestNetnsDir(t)
-	touchNS(t, dir, "ns-99999999") // beyond MaxSlots: must never enter the allocator
-	touchNS(t, dir, "ns-0")        // below it: the allocator starts at 1
+	touchNS(t, dir, "ns-99999999")               // beyond MaxSlots: must never enter the allocator
+	touchNS(t, dir, "ns-0")                      // below it: the allocator starts at 1
 	touchNS(t, dir, "ns-9999999999999999999999") // overflows the parse negative
 	touchNS(t, dir, "ns-2")
 	m := newTestManager()

@@ -430,6 +430,113 @@ func main() {
 		requirePresenceSidecar = "auto"
 	}
 	launchViaLauncherNS := envOrDefault("VMD_LAUNCH_VIA_LAUNCHER_NS", "false") == "true"
+	pausedNetworkReclaimEnabled := envOrDefault("VMD_PAUSED_NETWORK_RECLAIM", "false") == "true"
+	requirePausedNetworkEnv := func(key, fallback string) string {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+		if pausedNetworkReclaimEnabled {
+			log.Fatal().Str("key", key).Msg("paused network reclaim is enabled but required configuration is missing")
+		}
+		return fallback
+	}
+	pausedNetworkSlotHeadroomPercent, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT", "0"))
+	if err != nil || pausedNetworkSlotHeadroomPercent < 0 || pausedNetworkSlotHeadroomPercent > 100 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT")).Msg("VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT must be an integer between 0 and 100")
+	}
+	pausedNetworkSlotHeadroomReserve, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE", "0"))
+	if err != nil || pausedNetworkSlotHeadroomReserve < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE")).Msg("VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE must be a non-negative integer")
+	}
+	pausedNetworkSlotHeadroomHysteresis, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS", "1"))
+	if err != nil || pausedNetworkSlotHeadroomHysteresis < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS")).Msg("VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS must be a non-negative integer")
+	}
+	pausedNetworkNetnsThreshold, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_NETNS_THRESHOLD", "0"))
+	if err != nil || pausedNetworkNetnsThreshold < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_NETNS_THRESHOLD")).Msg("VMD_PAUSED_NETWORK_NETNS_THRESHOLD must be a non-negative integer")
+	}
+	pausedNetworkNetnsHysteresis, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_NETNS_HYSTERESIS", "1"))
+	if err != nil || pausedNetworkNetnsHysteresis < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_NETNS_HYSTERESIS")).Msg("VMD_PAUSED_NETWORK_NETNS_HYSTERESIS must be a non-negative integer")
+	}
+	pausedNetworkMountThreshold, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_MOUNT_THRESHOLD", "0"))
+	if err != nil || pausedNetworkMountThreshold < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_MOUNT_THRESHOLD")).Msg("VMD_PAUSED_NETWORK_MOUNT_THRESHOLD must be a non-negative integer")
+	}
+	pausedNetworkMountHysteresis, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS", "1"))
+	if err != nil || pausedNetworkMountHysteresis < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS")).Msg("VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS must be a non-negative integer")
+	}
+	pausedNetworkMinWarmAge, err := time.ParseDuration(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_MIN_WARM_AGE", "0s"))
+	if err != nil || pausedNetworkMinWarmAge < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_MIN_WARM_AGE")).Msg("VMD_PAUSED_NETWORK_MIN_WARM_AGE must be a non-negative duration")
+	}
+	pausedNetworkMaxReclaims, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_MAX_RECLAIMS", "2"))
+	if err != nil || pausedNetworkMaxReclaims < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_MAX_RECLAIMS")).Msg("VMD_PAUSED_NETWORK_MAX_RECLAIMS must be a non-negative integer")
+	}
+	pausedNetworkReclaimCooldown, err := time.ParseDuration(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN", "30s"))
+	if err != nil || pausedNetworkReclaimCooldown < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN")).Msg("VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN must be a non-negative duration")
+	}
+	if pausedNetworkReclaimEnabled {
+		log.Info().
+			Int("paused_network_max_reclaims", pausedNetworkMaxReclaims).
+			Dur("paused_network_reclaim_cooldown", pausedNetworkReclaimCooldown).
+			Int("paused_network_slot_headroom_percent", pausedNetworkSlotHeadroomPercent).
+			Int("paused_network_slot_headroom_reserve", pausedNetworkSlotHeadroomReserve).
+			Int("paused_network_netns_threshold", pausedNetworkNetnsThreshold).
+			Int("paused_network_mount_threshold", pausedNetworkMountThreshold).
+			Msg("paused network reclaim enabled")
+		if !pausedNetworkReclaimTriggersConfigured(
+			pausedNetworkSlotHeadroomPercent,
+			pausedNetworkSlotHeadroomReserve,
+			pausedNetworkNetnsThreshold,
+			pausedNetworkMountThreshold,
+		) {
+			log.Warn().
+				Msg("paused network reclaim is enabled but no pressure trigger is configured; reclamation will remain inert until at least one threshold is raised")
+		}
+	}
+	recorder := telemetry.NewNoopRecorder()
+	if envOrDefault("OTEL_METRICS_ENABLED", "false") == "true" {
+		otelExportInterval, err := time.ParseDuration(envOrDefault("OTEL_EXPORT_INTERVAL", "15s"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("invalid OTEL_EXPORT_INTERVAL")
+		}
+		otelRecorder, err := telemetry.NewOTelRecorder(ctx, telemetry.OTelConfig{
+			ServiceName:    envOrDefault("OTEL_SERVICE_NAME", "sandbox-vmd"),
+			ServiceVersion: os.Getenv("OTEL_SERVICE_VERSION"),
+			Environment:    envOrDefault("OTEL_ENVIRONMENT", "dev"),
+			Endpoint:       envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+			Insecure: func() bool {
+				v, err := strconv.ParseBool(envOrDefault("OTEL_EXPORTER_OTLP_INSECURE", "false"))
+				if err != nil {
+					log.Warn().Err(err).Msg("invalid OTEL_EXPORTER_OTLP_INSECURE; using false")
+					return false
+				}
+				return v
+			}(),
+			ExportInterval: otelExportInterval,
+		})
+		if err != nil {
+			log.Warn().Err(err).Msg("otel metrics init failed; continuing without network-pressure export")
+		} else {
+			recorder = otelRecorder
+			defer func() {
+				flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer flushCancel()
+				if err := otelRecorder.Shutdown(flushCtx); err != nil {
+					log.Warn().Err(err).Msg("otel metrics shutdown failed")
+				}
+			}()
+			log.Info().
+				Str("endpoint", envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")).
+				Dur("interval", otelExportInterval).
+				Msg("otel metrics initialized")
+		}
+	}
 
 	// Persistent systemd D-Bus connection for unit operations (vs forking
 	// systemctl per call). Falls back to systemctl per call when unavailable.
@@ -438,27 +545,39 @@ func main() {
 	log.Info().Bool("systemd_dbus", systemdDBus).Msg("systemd unit-operations transport")
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
-		FirecrackerBin:             cfg.FirecrackerBin,
-		JailerBin:                  cfg.JailerBin,
-		KernelPath:                 cfg.KernelPath,
-		BaseRootfsPath:             cfg.BaseRootfsPath,
-		SnapshotDir:                cfg.SnapshotDir,
-		RunDir:                     cfg.RunDir,
-		TemplateBuilderBin:         cfg.TemplateBuilderBin,
-		BoxdBinaryPath:             cfg.BoxdBinaryPath,
-		HostInterface:              cfg.HostInterface,
-		MaxConcurrentRestores:      maxRestores,
-		UffdEnabled:                uffdEnabled,
-		UffdPrefetchEnabled:        uffdPrefetchEnabled,
-		UffdRecordMaxSeconds:       uffdRecordMaxSeconds,
-		ResumeUffdEnabled:          resumeUffdEnabled,
-		VerifySnapshotEnabled:      verifySnapshotEnabled,
-		IncrementalSnapshotEnabled: incrementalSnapshotEnabled,
-		HandlerDeathAbortEnabled:   handlerDeathAbortEnabled,
-		RequirePresenceSidecar:     requirePresenceSidecar,
-		LaunchViaLauncherNS:        launchViaLauncherNS,
-		LauncherNSPath:             os.Getenv("VMD_LAUNCHER_NS_PATH"),
-		DirectSpawn:                envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
+		FirecrackerBin:                      cfg.FirecrackerBin,
+		JailerBin:                           cfg.JailerBin,
+		KernelPath:                          cfg.KernelPath,
+		BaseRootfsPath:                      cfg.BaseRootfsPath,
+		SnapshotDir:                         cfg.SnapshotDir,
+		RunDir:                              cfg.RunDir,
+		TemplateBuilderBin:                  cfg.TemplateBuilderBin,
+		BoxdBinaryPath:                      cfg.BoxdBinaryPath,
+		HostInterface:                       cfg.HostInterface,
+		MaxConcurrentRestores:               maxRestores,
+		UffdEnabled:                         uffdEnabled,
+		UffdPrefetchEnabled:                 uffdPrefetchEnabled,
+		UffdRecordMaxSeconds:                uffdRecordMaxSeconds,
+		ResumeUffdEnabled:                   resumeUffdEnabled,
+		VerifySnapshotEnabled:               verifySnapshotEnabled,
+		IncrementalSnapshotEnabled:          incrementalSnapshotEnabled,
+		HandlerDeathAbortEnabled:            handlerDeathAbortEnabled,
+		RequirePresenceSidecar:              requirePresenceSidecar,
+		PausedNetworkReclaimEnabled:         pausedNetworkReclaimEnabled,
+		PausedNetworkSlotHeadroomPercent:    pausedNetworkSlotHeadroomPercent,
+		PausedNetworkSlotHeadroomReserve:    pausedNetworkSlotHeadroomReserve,
+		PausedNetworkSlotHeadroomHysteresis: pausedNetworkSlotHeadroomHysteresis,
+		PausedNetworkNetnsThreshold:         pausedNetworkNetnsThreshold,
+		PausedNetworkNetnsHysteresis:        pausedNetworkNetnsHysteresis,
+		PausedNetworkMountThreshold:         pausedNetworkMountThreshold,
+		PausedNetworkMountHysteresis:        pausedNetworkMountHysteresis,
+		PausedNetworkMinWarmAge:             pausedNetworkMinWarmAge,
+		PausedNetworkMaxReclaims:            pausedNetworkMaxReclaims,
+		PausedNetworkReclaimCooldown:        pausedNetworkReclaimCooldown,
+		TelemetryRecorder:                   recorder,
+		LaunchViaLauncherNS:                 launchViaLauncherNS,
+		LauncherNSPath:                      os.Getenv("VMD_LAUNCHER_NS_PATH"),
+		DirectSpawn:                         envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
@@ -1084,4 +1203,8 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info().Msg("VM daemon shutdown complete")
+}
+
+func pausedNetworkReclaimTriggersConfigured(slotHeadroomPercent, slotHeadroomReserve, netnsThreshold, mountThreshold int) bool {
+	return slotHeadroomPercent > 0 || slotHeadroomReserve > 0 || netnsThreshold > 0 || mountThreshold > 0
 }

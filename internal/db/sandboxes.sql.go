@@ -381,7 +381,7 @@ paused AS (
   SET status = 'pausing', updated_at = now()
   FROM expired
   WHERE sandbox.id = expired.id
-  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
+  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id, sandbox.network_config
 ),
 closed_intervals AS (
   -- Same atomicity story as BeginPause: bundle the active-interval close
@@ -402,17 +402,18 @@ closed_billing_compute AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id
 `
 
 type ClaimExpiredSandboxesRow struct {
-	ID         uuid.UUID   `json:"id"`
-	TeamID     uuid.UUID   `json:"team_id"`
-	Name       string      `json:"name"`
-	SnapshotID pgtype.UUID `json:"snapshot_id"`
-	HostID     string      `json:"host_id"`
+	ID            uuid.UUID   `json:"id"`
+	TeamID        uuid.UUID   `json:"team_id"`
+	Name          string      `json:"name"`
+	SnapshotID    pgtype.UUID `json:"snapshot_id"`
+	HostID        string      `json:"host_id"`
+	NetworkConfig []byte      `json:"network_config"`
 }
 
 // Atomically claims active sandboxes past their timeout and marks them 'pausing'.
@@ -444,6 +445,7 @@ func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]Cla
 			&i.Name,
 			&i.SnapshotID,
 			&i.HostID,
+			&i.NetworkConfig,
 		); err != nil {
 			return nil, err
 		}
@@ -2126,7 +2128,7 @@ func (q *Queries) UpdateSandboxAutoDelete(ctx context.Context, arg UpdateSandbox
 
 const updateSandboxHost = `-- name: UpdateSandboxHost :exec
 UPDATE sandbox
-SET host_id = $2, ip_address = $3, pid = $4, updated_at = now()
+SET host_id = $2, ip_address = $3, pid = COALESCE($4, pid), updated_at = now()
 WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL
 `
 
