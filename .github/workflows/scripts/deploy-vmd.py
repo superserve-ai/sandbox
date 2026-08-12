@@ -746,6 +746,20 @@ def main() -> int:
                     && [ ! -e "$NEW_BACKUP_JOURNAL_PATH" ]; then
                     # The destination's mount is already confirmed by the
                     # precondition block at the top of this script.
+                    # {service} was stopped above, but superserve-vmd.socket
+                    # stays active the rest of this script by design
+                    # (zero-downtime deploys), so a connection landing in the
+                    # gap between that stop and here can already have
+                    # socket-activated vmd against the still-current old
+                    # path. Stop the socket too, right before touching the
+                    # journal, so nothing can hold $OLD_BACKUP_JOURNAL_PATH
+                    # open or reopen it while it's being copied and retired;
+                    # a write that lands there after this point is invisible
+                    # to $NEW_BACKUP_JOURNAL_PATH and silently lost once
+                    # {service} restarts onto the new path. Re-enabled by the
+                    # socket restart/start block and the {service} restart
+                    # later in this script, once vmd.env names the new path.
+                    sudo systemctl stop superserve-vmd.socket {service}
                     # Old and new live on different filesystems (root disk
                     # vs. the local-SSD array), so a plain `mv` is a
                     # copy-then-delete, not an atomic rename: a kill mid-copy
@@ -759,22 +773,17 @@ def main() -> int:
                     sudo rm -f "${{NEW_BACKUP_JOURNAL_PATH}}".migrating.*
                     sudo cp --preserve=mode,ownership "$OLD_BACKUP_JOURNAL_PATH" "$TMP_BACKUP_JOURNAL_PATH"
                     sudo mv "$TMP_BACKUP_JOURNAL_PATH" "$NEW_BACKUP_JOURNAL_PATH"
-                    # Rename rather than remove the source: the socket unit
-                    # (superserve-vmd.socket) stays active through this
-                    # whole block by design, so a connection arriving right
-                    # now can make systemd reactivate vmd against whatever
-                    # vmd.env still says (the old path, since it's rewritten
-                    # below only after this succeeds). Deleting the source
-                    # out from under a reactivated vmd would unlink it while
-                    # still open, silently discarding every write from that
-                    # point on; leaving it in place under a different name
-                    # means those writes land somewhere recoverable instead.
-                    # Left uncleaned deliberately, not an oversight: it's a
-                    # single-digit-MB journal file, not the multi-GB backup
-                    # artifacts that actually filled the root disk, and
-                    # reclaiming it would require the same "is anything
-                    # still writing to it" guarantee that ruled out deleting
-                    # it above — not worth reopening for a few MB.
+                    # Rename rather than remove the source: belt-and-suspenders
+                    # against anything unexpected in this critical section
+                    # (e.g. this script itself being killed between the two
+                    # mv calls above) leaving a recoverable file behind
+                    # instead of an unlinked inode. Left uncleaned
+                    # deliberately, not an oversight: it's a single-digit-MB
+                    # journal file, not the multi-GB backup artifacts that
+                    # actually filled the root disk, and reclaiming it would
+                    # need the same "nothing still references it" guarantee
+                    # that motivates renaming over deleting it here — not
+                    # worth reopening for a few MB.
                     sudo mv "$OLD_BACKUP_JOURNAL_PATH" "${{OLD_BACKUP_JOURNAL_PATH}}.migrated"
                     echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
                 fi
