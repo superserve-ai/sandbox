@@ -289,7 +289,7 @@ func TestJournalOutboxDepth(t *testing.T) {
 	}
 	// Clear takes the entry as PendingNotifications returns it: the
 	// outbox key is scoped by the entry's pinned bucket.
-	pending, err := j.PendingNotifications()
+	pending, err := j.PendingNotifications(0)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending = %d err=%v, want 1", len(pending), err)
 	}
@@ -312,7 +312,7 @@ func TestOutboxDepthExcludesSeedMarker(t *testing.T) {
 	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {
 		t.Fatalf("depth after seed marker = %d err=%v, want 0", depth, err)
 	}
-	if pending, err := j.PendingNotifications(); err != nil || len(pending) != 0 {
+	if pending, err := j.PendingNotifications(0); err != nil || len(pending) != 0 {
 		t.Fatalf("pending after seed marker = %d err=%v, want 0", len(pending), err)
 	}
 }

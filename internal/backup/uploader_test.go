@@ -782,7 +782,7 @@ func TestAbandonedAckLeavesNoNotification(t *testing.T) {
 	if err := j.Ack(task, "", false); err != nil {
 		t.Fatal(err)
 	}
-	pending, err := j.PendingNotifications()
+	pending, err := j.PendingNotifications(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2123,7 +2123,7 @@ func TestFailedNotificationDeliveryRedelivers(t *testing.T) {
 	if len(delivered) != 0 {
 		t.Fatalf("delivered = %+v, want none while delivery fails", delivered)
 	}
-	pending, err := j.PendingNotifications()
+	pending, err := j.PendingNotifications(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2143,7 +2143,7 @@ func TestFailedNotificationDeliveryRedelivers(t *testing.T) {
 	if len(delivered) != 1 || delivered[0].Generation != "gen" {
 		t.Fatalf("delivered = %+v, want the retained signal once", delivered)
 	}
-	if pending, err = j.PendingNotifications(); err != nil || len(pending) != 0 {
+	if pending, err = j.PendingNotifications(0); err != nil || len(pending) != 0 {
 		t.Fatalf("outbox after success = %+v (err %v), want empty", pending, err)
 	}
 }
@@ -2172,7 +2172,7 @@ func TestFailedNotificationDeliveryStopsTheBatch(t *testing.T) {
 	if attempts != 1 {
 		t.Fatalf("attempts = %d, want the batch stopped after the first failure", attempts)
 	}
-	if pending, err := j.PendingNotifications(); err != nil || len(pending) != 2 {
+	if pending, err := j.PendingNotifications(0); err != nil || len(pending) != 2 {
 		t.Fatalf("outbox = %d entries (err %v), want both retained", len(pending), err)
 	}
 }
@@ -2188,7 +2188,7 @@ func TestOutboxPinsVerifiedBucket(t *testing.T) {
 	if err := j.Ack(task, "bucket-a", true); err != nil {
 		t.Fatal(err)
 	}
-	pending, err := j.PendingNotifications()
+	pending, err := j.PendingNotifications(0)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("outbox = %v (err %v), want one entry", pending, err)
 	}
@@ -2348,7 +2348,7 @@ func TestOutboxKeepsPerBucketNotifications(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pending, err := j.PendingNotifications()
+	pending, err := j.PendingNotifications(0)
 	if err != nil || len(pending) != 2 {
 		t.Fatalf("outbox = %d entries (err %v), want one per bucket", len(pending), err)
 	}
@@ -2365,7 +2365,7 @@ func TestOutboxKeepsPerBucketNotifications(t *testing.T) {
 	if err := j.ClearNotification(cleared); err != nil {
 		t.Fatal(err)
 	}
-	rest, err := j.PendingNotifications()
+	rest, err := j.PendingNotifications(0)
 	if err != nil || len(rest) != 1 {
 		t.Fatalf("outbox after clear = %d entries (err %v), want 1", len(rest), err)
 	}
@@ -2400,7 +2400,7 @@ func TestClearNotificationLeavesOtherKeyShape(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pending, err := j.PendingNotifications()
+	pending, err := j.PendingNotifications(0)
 	if err != nil || len(pending) != 2 {
 		t.Fatalf("outbox = %d entries (err %v), want both shapes", len(pending), err)
 	}
@@ -2413,14 +2413,14 @@ func TestClearNotificationLeavesOtherKeyShape(t *testing.T) {
 	if err := j.ClearNotification(scoped); err != nil {
 		t.Fatal(err)
 	}
-	rest, err := j.PendingNotifications()
+	rest, err := j.PendingNotifications(0)
 	if err != nil || len(rest) != 1 || rest[0].VerifiedBucket != "" {
 		t.Fatalf("after scoped clear = %+v (err %v), want the legacy entry retained", rest, err)
 	}
 	if err := j.ClearNotification(rest[0]); err != nil {
 		t.Fatal(err)
 	}
-	if final, _ := j.PendingNotifications(); len(final) != 0 {
+	if final, _ := j.PendingNotifications(0); len(final) != 0 {
 		t.Fatalf("after legacy clear = %d entries, want empty", len(final))
 	}
 }
@@ -2453,7 +2453,7 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 	if err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
 		t.Fatal(err)
 	}
-	pending, err := j.PendingNotifications()
+	pending, err := j.PendingNotifications(0)
 	if err != nil || len(pending) != 2 {
 		t.Fatalf("outbox after seed = %d entries (err %v), want the two bucket-a completions", len(pending), err)
 	}
@@ -2475,7 +2475,7 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 	if err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
 		t.Fatal(err)
 	}
-	if rest, _ := j.PendingNotifications(); len(rest) != 0 {
+	if rest, _ := j.PendingNotifications(0); len(rest) != 0 {
 		t.Fatalf("second seed resurrected %d entries, want 0", len(rest))
 	}
 }
@@ -2494,11 +2494,36 @@ func TestCompletionsOutboxWithoutConsumer(t *testing.T) {
 	if err != nil || !worked {
 		t.Fatalf("drainOne: worked=%v err=%v", worked, err)
 	}
-	pending, err := j.PendingNotifications()
+	pending, err := j.PendingNotifications(0)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("outbox = %d entries (err %v), want the completion banked", len(pending), err)
 	}
 	if pending[0].VerifiedBucket == "" {
 		t.Fatal("banked entry missing its pinned bucket")
+	}
+}
+
+// A deep outbox converges across bounded flushes instead of holding the
+// drain loop through every entry at once.
+func TestFlushNotificationsBoundsTheBatch(t *testing.T) {
+	j, _ := testJournal(t)
+	for i := 0; i < notifyFlushBatch+5; i++ {
+		task := Task{SandboxID: fmt.Sprintf("sb-%03d", i), Generation: fmt.Sprintf("gen-%03d", i), EnqueuedAt: time.Unix(int64(i+1), 0)}
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.Ack(task, "bucket", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	delivered := 0
+	u := &Uploader{Journal: j, OnVerified: func(Task) error { delivered++; return nil }}
+	u.flushNotifications()
+	if delivered != notifyFlushBatch {
+		t.Fatalf("first flush delivered %d, want the batch bound %d", delivered, notifyFlushBatch)
+	}
+	u.flushNotifications()
+	if delivered != notifyFlushBatch+5 {
+		t.Fatalf("second flush delivered %d total, want all %d", delivered, notifyFlushBatch+5)
 	}
 }

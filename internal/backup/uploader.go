@@ -292,10 +292,17 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 // hammered (or the log flooded) once per second per pending signal.
 const notifyRetryDelay = 30 * time.Second
 
-// flushNotifications delivers every outboxed completion signal and
-// confirms each only after the callback returns nil. Failures to
-// deliver, load, or clear are logged and retried on a later flush
-// (spaced by notifyRetryDelay), never dropped.
+// notifyFlushBatch bounds deliveries per flush. Flushes run at startup,
+// after every ack, and on idle ticks, so a deep outbox (a seeded
+// upgrade, or a long consumer-less window) converges across flushes
+// instead of holding the drain loop through thousands of sequential
+// requests while queued pause backups wait.
+const notifyFlushBatch = 32
+
+// flushNotifications delivers up to notifyFlushBatch outboxed completion
+// signals and confirms each only after the callback returns nil.
+// Failures to deliver, load, or clear are logged and retried on a later
+// flush (spaced by notifyRetryDelay), never dropped.
 func (u *Uploader) flushNotifications() {
 	if u.OnVerified == nil {
 		return
@@ -303,7 +310,7 @@ func (u *Uploader) flushNotifications() {
 	if !u.notifyRetryAt.IsZero() && time.Now().Before(u.notifyRetryAt) {
 		return
 	}
-	pending, err := u.Journal.PendingNotifications()
+	pending, err := u.Journal.PendingNotifications(notifyFlushBatch)
 	if err != nil {
 		u.Metrics.AddNotifyFailure(context.Background())
 		u.Log.Warn().Err(err).Msg("backup notification outbox read failed")

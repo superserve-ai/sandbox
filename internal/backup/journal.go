@@ -742,19 +742,28 @@ func (j *Journal) MigrateVerificationScope(scope string) error {
 	})
 }
 
-// PendingNotifications returns completed tasks whose OnVerified signal
-// has not been confirmed delivered. Corrupt entries are skipped (and
-// swept by ClearNotification when their key is next written).
-func (j *Journal) PendingNotifications() ([]Task, error) {
+// PendingNotifications returns up to limit completed tasks whose
+// OnVerified signal has not been confirmed delivered (limit <= 0 means
+// all). Corrupt entries are skipped (and swept by ClearNotification when
+// their key is next written); NUL-prefixed keys are internal markers,
+// not notifications.
+func (j *Journal) PendingNotifications(limit int) ([]Task, error) {
 	var tasks []Task
 	err := j.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(outboxBucket).ForEach(func(k, v []byte) error {
+		c := tx.Bucket(outboxBucket).Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if len(k) > 0 && k[0] == 0 {
+				continue
+			}
 			var t Task
 			if json.Unmarshal(v, &t) == nil {
 				tasks = append(tasks, t)
+				if limit > 0 && len(tasks) >= limit {
+					return nil
+				}
 			}
-			return nil
-		})
+		}
+		return nil
 	})
 	return tasks, err
 }
