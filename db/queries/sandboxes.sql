@@ -156,7 +156,7 @@ WHERE team_id = @team_id
 -- about it, same set-once semantics as MarkSandboxFailed.
 UPDATE sandbox
 SET status = $2, updated_at = now(),
-    failed_at = CASE WHEN $2 = 'failed' THEN COALESCE(failed_at, now()) ELSE failed_at END
+    failed_at = CASE WHEN $2::sandbox_status = 'failed' THEN COALESCE(failed_at, now()) ELSE failed_at END
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 
 -- name: UpdateSandboxHost :exec
