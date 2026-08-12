@@ -647,11 +647,17 @@ func (j *Journal) OldestEnqueuedAt() (time.Time, bool, error) {
 }
 
 // OutboxDepth reports how many completed tasks still owe their
-// completion notification.
+// completion notification. NUL-prefixed keys are internal markers (the
+// per-scope completion-seed guard), not notifications: counting them
+// would pin the depth gauge above zero forever and hold the
+// outbox-stalled alert permanently firing on every seeded host.
 func (j *Journal) OutboxDepth() (int, error) {
 	n := 0
 	err := j.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(outboxBucket).ForEach(func(_, _ []byte) error {
+		return tx.Bucket(outboxBucket).ForEach(func(k, _ []byte) error {
+			if len(k) > 0 && k[0] == 0 {
+				return nil
+			}
 			n++
 			return nil
 		})

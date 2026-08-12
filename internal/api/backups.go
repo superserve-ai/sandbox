@@ -83,6 +83,13 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "bucket and completed_at are required", http.StatusBadRequest)
 		return
 	}
+	// Clamp future timestamps to server time: coverage freshness orders
+	// solely by completed_at and the upsert refreshes only on strictly
+	// newer values, so one skewed host clock would let a stale generation
+	// outrank every real one until wall time caught up.
+	if now := time.Now().UTC(); req.CompletedAt.After(now) {
+		req.CompletedAt = now
+	}
 	// Zero files is a coverage-only report: hosts seed historical
 	// completions whose task rows (and manifests) are long gone, and the
 	// bucket's manifest object remains the file-set authority for them.

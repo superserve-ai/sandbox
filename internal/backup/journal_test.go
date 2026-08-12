@@ -300,3 +300,19 @@ func TestJournalOutboxDepth(t *testing.T) {
 		t.Fatalf("outbox depth after clear = %d err=%v, want 0", depth, err)
 	}
 }
+
+// The per-scope seed marker lives inside the outbox bucket but is not a
+// notification: counting it would pin the depth gauge above zero forever
+// and hold the outbox-stalled alert firing on every seeded host.
+func TestOutboxDepthExcludesSeedMarker(t *testing.T) {
+	j, _ := testJournal(t)
+	if err := j.SeedOutboxFromCompletions("bucket-a"); err != nil {
+		t.Fatal(err)
+	}
+	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {
+		t.Fatalf("depth after seed marker = %d err=%v, want 0", depth, err)
+	}
+	if pending, err := j.PendingNotifications(); err != nil || len(pending) != 0 {
+		t.Fatalf("pending after seed marker = %d err=%v, want 0", len(pending), err)
+	}
+}
