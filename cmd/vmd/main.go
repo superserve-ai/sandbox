@@ -757,6 +757,9 @@ func main() {
 			// must not suppress uploading into this one.
 			return journal.Covered(bucket, t)
 		})
+		mgr.SetBackupOwnerCovered(func(sandboxID string) (bool, error) {
+			return journal.OwnerCovered(bucket, sandboxID)
+		})
 		// The uploader must fully stop before the journal and GCS client
 		// close under it: a verification or Nack cut off mid-write leaves
 		// a finalized object the journal never recorded, which the

@@ -49,6 +49,15 @@ func (m *Manager) SetBackupCovered(fn func(backup.Task) (bool, error)) {
 	m.backupCovered = fn
 }
 
+// SetBackupOwnerCovered installs the generation-free coverage probe: does
+// the sandbox have ANY pending task or completed generation? The backfill
+// ledger's skip path needs it because a ledger mark only proves an
+// enqueue happened, and the uploader's retry ceiling can abandon that
+// task afterward. nil degrades to trusting the ledger alone.
+func (m *Manager) SetBackupOwnerCovered(fn func(sandboxID string) (bool, error)) {
+	m.backupOwnerCovered = fn
+}
+
 // retryWithBackoff runs attempt with doubling delays until it succeeds
 // or enqueueRetryAttempts are exhausted, reporting whether it succeeded.
 // The first attempt is already behind the caller; this helper owns only
@@ -755,8 +764,24 @@ func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger)
 			continue
 		}
 		if prev, ok, err := m.state.GetBackfillMark(rec.ID); err == nil && ok && prev == id {
-			covered++
-			continue
+			// The mark proves an enqueue happened, not that the upload
+			// survived: the retry ceiling can abandon a stuck task after
+			// the mark was written, and a backfilled sandbox may never
+			// pause again to replace the loss. Skip only while the journal
+			// still shows the sandbox pending or completed; otherwise the
+			// mark is stale and the snapshot re-mints below. Probe errors
+			// keep the skip (transient journal trouble must not stampede
+			// re-hashing), and a nil probe trusts the ledger as before.
+			stale := false
+			if m.backupOwnerCovered != nil {
+				if cov, err := m.backupOwnerCovered(rec.ID); err == nil && !cov {
+					stale = true
+				}
+			}
+			if !stale {
+				covered++
+				continue
+			}
 		}
 		pb := newPendingBackup(rec.ID, rec.SnapshotPath, rec.DiskPath, rec.BasePath)
 		pb.BestEffort = true

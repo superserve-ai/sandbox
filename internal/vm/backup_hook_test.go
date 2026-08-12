@@ -1656,3 +1656,79 @@ func TestBackfillPrunesLedgerForDeletedVMs(t *testing.T) {
 		t.Fatalf("stale ledger entry survived the prune (ok=%v err=%v)", ok, err)
 	}
 }
+
+// A ledger mark proves an enqueue happened, not that the upload survived:
+// the retry ceiling can abandon the task after the mark was written, and
+// a backfilled sandbox may never pause again to replace the loss. The
+// skip path therefore holds only while the journal still shows the owner
+// pending or completed; a stale mark re-mints, and probe errors keep the
+// skip.
+func TestBackfillRemintsAfterAbandonedTask(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Put(VMRecord{ID: "vm-1", Status: StatusPaused, SnapshotPath: snap, DiskPath: disk}); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := make(chan backup.Task, 4)
+	covered := true
+	var probeErr error
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+	m.SetBackupOwnerCovered(func(string) (bool, error) { return covered, probeErr })
+
+	drain := func() int {
+		n := 0
+		for {
+			select {
+			case <-tasks:
+				n++
+			default:
+				return n
+			}
+		}
+	}
+
+	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
+	if n := drain(); n != 1 {
+		t.Fatalf("first pass enqueued %d tasks, want 1", n)
+	}
+
+	// Owner still covered: the mark skips.
+	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
+	if n := drain(); n != 0 {
+		t.Fatalf("covered pass enqueued %d tasks, want 0", n)
+	}
+
+	// The task was abandoned (no pending row, no completion): the mark is
+	// stale and the snapshot re-mints.
+	covered = false
+	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
+	if n := drain(); n != 1 {
+		t.Fatalf("post-abandon pass enqueued %d tasks, want a re-mint", n)
+	}
+
+	// A probe error keeps the skip: transient journal trouble must not
+	// stampede the fleet into re-hashing.
+	covered = false
+	probeErr = errors.New("journal unavailable")
+	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
+	if n := drain(); n != 0 {
+		t.Fatalf("probe-error pass enqueued %d tasks, want 0", n)
+	}
+}

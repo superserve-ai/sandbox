@@ -464,6 +464,33 @@ func completionKey(scope string, task Task) []byte {
 	return append([]byte(scope+"\x00"), task.indexKey()...)
 }
 
+// OwnerCovered reports whether a sandbox has ANY pending task or
+// completed generation in the given bucket, without needing a
+// generation key. The backfill ledger consults it on the skip path: a
+// ledger mark proves an enqueue happened, not that the upload survived,
+// and the retry ceiling can abandon a structurally stuck task after the
+// mark was written. Backfilled sandboxes may never pause again, so a
+// mark whose task vanished without completing must not keep skipping.
+// Both checks are bounded prefix seeks, not scans.
+func (j *Journal) OwnerCovered(scope, sandboxID string) (bool, error) {
+	prefix := []byte(sandboxID + "\x00")
+	completedPrefix := []byte(scope + "\x00" + sandboxID + "\x00")
+	var covered bool
+	err := j.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(indexBucket).Cursor()
+		if k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix) {
+			covered = true
+			return nil
+		}
+		cc := tx.Bucket(completionsBucket).Cursor()
+		if k, _ := cc.Seek(completedPrefix); k != nil && bytes.HasPrefix(k, completedPrefix) {
+			covered = true
+		}
+		return nil
+	})
+	return covered, err
+}
+
 func (j *Journal) WasCompleted(scope string, task Task) (bool, error) {
 	var ok bool
 	err := j.db.View(func(tx *bolt.Tx) error {

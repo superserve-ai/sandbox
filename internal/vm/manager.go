@@ -381,6 +381,10 @@ type Manager struct {
 	// already pending or completed; nil means never covered. See
 	// SetBackupCovered.
 	backupCovered func(backup.Task) (bool, error)
+	// backupOwnerCovered probes whether a sandbox has any pending or
+	// completed generation at all, generation-free; nil trusts the
+	// backfill ledger alone. See SetBackupOwnerCovered.
+	backupOwnerCovered func(sandboxID string) (bool, error)
 	// backupMetrics optionally observes backup hook timings; nil (metrics
 	// disabled) is safe at every call site. See SetBackupMetrics.
 	backupMetrics *telemetry.BackupRecorder
