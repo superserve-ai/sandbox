@@ -502,23 +502,11 @@ def main() -> int:
                 echo {q_backup_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
-            # Upsert BACKUP_JOURNAL_PATH (moves the backup uploader's BoltDB
-            # journal off the root disk onto the local-SSD array). Empty =
-            # skip, leaving vmd's default in place. Captures the host's
-            # current effective path first (its own override if already
-            # set, else vmd's compiled default) so the stop/restart block
-            # below can migrate the journal file itself: the env upsert
-            # alone would otherwise point a freshly-restarted vmd at an
-            # empty BoltDB, orphaning every already-staged, not-yet-uploaded
-            # generation the old journal was tracking — the startup sweep
-            # then reaps those staged artifacts as unreferenced orphans
-            # instead of uploading them.
-            if [ -n {q_backup_journal} ]; then
-                OLD_BACKUP_JOURNAL_PATH=$(sudo grep '^BACKUP_JOURNAL_PATH=' /etc/sandbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2-) || true
-                OLD_BACKUP_JOURNAL_PATH="${{OLD_BACKUP_JOURNAL_PATH:-/var/lib/sandbox/backup.db}}"
-                sudo sed -i '/^BACKUP_JOURNAL_PATH=/d' /etc/sandbox/vmd.env
-                echo {q_backup_journal_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
-            fi
+            # BACKUP_JOURNAL_PATH (moves the backup uploader's BoltDB journal
+            # off the root disk onto the local-SSD array) is upserted below,
+            # after vmd is stopped, together with migrating any existing
+            # journal file to the new location. See that block for why the
+            # env write must not happen until the migration is done.
 
             # Upsert the OTLP backup-metrics contract: enable flag plus
             # environment label. Empty = skip. The exporter endpoint stays
@@ -700,12 +688,30 @@ def main() -> int:
             sudo systemctl stop {service}
 
             # Migrate the backup journal to its new path now that vmd is
-            # stopped (the file is closed, safe to move). Skip when there's
-            # nothing to migrate (old path unchanged, no old file, or a
-            # destination already migrated by an earlier deploy) so this is
-            # a no-op in steady state.
+            # stopped (the file is closed, safe to move), then upsert
+            # BACKUP_JOURNAL_PATH. The env write happens LAST, only after a
+            # successful migration: if it happened earlier and the deploy
+            # were interrupted before this point, vmd.env would already
+            # name the new path while the real journal was still at the
+            # old one, so a retry would read old==new, skip the migration
+            # as "already done", and the eventual restart would open an
+            # empty database. Skip entirely when there's nothing to migrate
+            # (old path unchanged, no old file, or a destination already
+            # migrated by an earlier deploy) so this is a no-op in steady
+            # state.
             if [ -n {q_backup_journal} ]; then
                 NEW_BACKUP_JOURNAL_PATH={q_backup_journal}
+                OLD_BACKUP_JOURNAL_PATH=$(sudo grep '^BACKUP_JOURNAL_PATH=' /etc/sandbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2-) || true
+                if [ -z "$OLD_BACKUP_JOURNAL_PATH" ]; then
+                    # No override recorded yet: mirror vmd's own default
+                    # derivation (filepath.Join(filepath.Dir(cfg.RunDir),
+                    # "backup.db") in cmd/vmd/main.go) instead of assuming a
+                    # fixed path, since RUN_DIR itself is configurable.
+                    RUN_DIR_VALUE=$(sudo grep '^RUN_DIR=' /etc/sandbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2-) || true
+                    RUN_DIR_VALUE="${{RUN_DIR_VALUE:-/var/lib/sandbox/rundir}}"
+                    OLD_BACKUP_JOURNAL_PATH="$(dirname "$RUN_DIR_VALUE")/backup.db"
+                fi
+
                 if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ] \\
                     && [ -f "$OLD_BACKUP_JOURNAL_PATH" ] \\
                     && [ ! -e "$NEW_BACKUP_JOURNAL_PATH" ]; then
@@ -713,6 +719,9 @@ def main() -> int:
                     sudo mv "$OLD_BACKUP_JOURNAL_PATH" "$NEW_BACKUP_JOURNAL_PATH"
                     echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
                 fi
+
+                sudo sed -i '/^BACKUP_JOURNAL_PATH=/d' /etc/sandbox/vmd.env
+                echo {q_backup_journal_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
             if [ "$SOCKET_CHANGED" = 1 ]; then
                 # Socket unit changed: rebind so the new ListenStream/options
