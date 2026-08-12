@@ -728,6 +728,14 @@ const backfillProgressEvery = 250
 // reason as RecoverPendingBackups: the at-rest verdict reads the
 // instance map.
 func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger) {
+	m.backfillCapturing.Store(true)
+	defer func() {
+		m.backfillCapturing.Store(false)
+		m.lastSandboxEnqueue.Range(func(k, _ any) bool {
+			m.lastSandboxEnqueue.Delete(k)
+			return true
+		})
+	}()
 	if m.backupEnqueue == nil || m.state == nil {
 		return
 	}
@@ -1126,7 +1134,9 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio back
 			Msg("backup enqueue failed; pause not journaled")
 		return false, false
 	}
-	m.lastSandboxEnqueue.Store(vmID, task.Generation)
+	if m.backfillCapturing.Load() {
+		m.lastSandboxEnqueue.Store(vmID, task.Generation)
+	}
 	return true, staged
 }
 
