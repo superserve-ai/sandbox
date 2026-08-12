@@ -859,8 +859,13 @@ def main() -> int:
                 sudo cp --preserve=mode,ownership /etc/sandbox/vmd.env "$BJ_ENV_TMP"
                 sudo sed -i '/^BACKUP_JOURNAL_PATH=/d' "$BJ_ENV_TMP"
                 echo {q_backup_journal_line} | sudo tee -a "$BJ_ENV_TMP" > /dev/null
-                sudo sync
                 sudo mv "$BJ_ENV_TMP" /etc/sandbox/vmd.env
+                # Sync AFTER the rename, not before: a sync before only
+                # covers the temp file's content, not the rename's own
+                # directory-entry update, which is a separate write that
+                # can still be lost on power loss right after `mv` returns
+                # — same reasoning as the journal file's own sync above.
+                sudo sync
 
                 if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ] \\
                     && [ -f "$OLD_BACKUP_JOURNAL_PATH" ]; then
