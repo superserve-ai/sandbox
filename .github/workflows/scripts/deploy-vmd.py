@@ -733,17 +733,22 @@ def main() -> int:
                     # fixed path, since RUN_DIR itself is configurable.
                     RUN_DIR_VALUE=$(sudo grep '^RUN_DIR=' /etc/sandbox/vmd.env 2>/dev/null | head -1 | cut -d= -f2-) || true
                     RUN_DIR_VALUE="${{RUN_DIR_VALUE:-/var/lib/sandbox/rundir}}"
-                    # Go's filepath.Dir cleans a trailing slash rather than
-                    # walking up to the parent (filepath.Dir("/a/b/") is
-                    # "/a/b", not "/a"), but shell dirname does walk up —
-                    # strip trailing slashes first so both agree.
-                    RUN_DIR_VALUE="$(printf '%s' "$RUN_DIR_VALUE" | sed 's:/*$::')"
-                    OLD_BACKUP_JOURNAL_PATH="$(dirname "$RUN_DIR_VALUE")/backup.db"
+                    # filepath.Dir does not walk up a level when the path
+                    # already ends in a separator, it only collapses the
+                    # trailing slash(es): filepath.Dir("/a/b/") is "/a/b",
+                    # not "/a". Shell dirname always walks up regardless, so
+                    # stripping the slash and calling dirname unconditionally
+                    # derives the wrong ancestor whenever RUN_DIR itself ends
+                    # in a separator. Branch on that case instead.
+                    case "$RUN_DIR_VALUE" in
+                        */) RUN_DIR_PARENT="$(printf '%s' "$RUN_DIR_VALUE" | sed 's:/*$::')" ;;
+                        *)  RUN_DIR_PARENT="$(dirname "$RUN_DIR_VALUE")" ;;
+                    esac
+                    OLD_BACKUP_JOURNAL_PATH="$RUN_DIR_PARENT/backup.db"
                 fi
 
                 if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ] \\
-                    && [ -f "$OLD_BACKUP_JOURNAL_PATH" ] \\
-                    && [ ! -e "$NEW_BACKUP_JOURNAL_PATH" ]; then
+                    && [ -f "$OLD_BACKUP_JOURNAL_PATH" ]; then
                     # The destination's mount is already confirmed by the
                     # precondition block at the top of this script.
                     # {service} was stopped above, but superserve-vmd.socket
@@ -760,13 +765,22 @@ def main() -> int:
                     # socket restart/start block and the {service} restart
                     # later in this script, once vmd.env names the new path.
                     sudo systemctl stop superserve-vmd.socket {service}
+                    # $OLD_BACKUP_JOURNAL_PATH still present under its
+                    # original name is the only signal migration hasn't
+                    # completed: completion always ends by renaming it
+                    # aside, below. So this block always redoes the copy
+                    # while the source is present, rather than trusting
+                    # NEW_BACKUP_JOURNAL_PATH's mere existence — an earlier
+                    # attempt may have been interrupted after making it
+                    # visible but before it was synced (see below), leaving
+                    # a torn file that a plain existence check would mistake
+                    # for a completed migration.
+                    #
                     # Old and new live on different filesystems (root disk
                     # vs. the local-SSD array), so a plain `mv` is a
                     # copy-then-delete, not an atomic rename: a kill mid-copy
-                    # leaves a truncated file at NEW_BACKUP_JOURNAL_PATH,
-                    # which the existence check above would then mistake for
-                    # an already-completed migration on retry, publishing a
-                    # BoltDB vmd can't open. Copy to a same-filesystem temp
+                    # would otherwise leave a torn file directly at
+                    # NEW_BACKUP_JOURNAL_PATH. Copy to a same-filesystem temp
                     # path next to the destination, then rename — same
                     # filesystem makes that rename atomic.
                     TMP_BACKUP_JOURNAL_PATH="${{NEW_BACKUP_JOURNAL_PATH}}.migrating.$$"
@@ -785,17 +799,14 @@ def main() -> int:
                     # further so the destination is durable before the
                     # source is touched.
                     sudo sync
-                    # Rename rather than remove the source: belt-and-suspenders
-                    # against anything unexpected in this critical section
-                    # (e.g. this script itself being killed between the two
-                    # mv calls above) leaving a recoverable file behind
-                    # instead of an unlinked inode. Left uncleaned
-                    # deliberately, not an oversight: it's a single-digit-MB
-                    # journal file, not the multi-GB backup artifacts that
-                    # actually filled the root disk, and reclaiming it would
-                    # need the same "nothing still references it" guarantee
-                    # that motivates renaming over deleting it here — not
-                    # worth reopening for a few MB.
+                    # Rename rather than remove the source: if this script
+                    # is killed between the two mv calls above, a recoverable
+                    # file survives instead of an unlinked inode. Not cleaned
+                    # up afterward — reclaiming it safely needs the same
+                    # "nothing still references it" guarantee that motivates
+                    # renaming over deleting it here, for a single-digit-MB
+                    # file, not the multi-GB artifacts that actually filled
+                    # the root disk.
                     sudo mv "$OLD_BACKUP_JOURNAL_PATH" "${{OLD_BACKUP_JOURNAL_PATH}}.migrated"
                     echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
                 fi
