@@ -46,6 +46,16 @@ type Pool struct {
 	recycled chan *preallocSlot // returned from destroyed sandboxes
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
+	drainMu  sync.RWMutex
+	// refillDrainGate is closed while the controller is draining warm inventory.
+	// Refill workers select on it before handing a built slot to the pool so a
+	// send that was already blocked when drain started can still abort instead
+	// of immediately replacing the drained slot.
+	refillDrainGate chan struct{}
+	// refillPaused suspends the refill loop while the controller is tearing
+	// down warm inventory. That keeps the pool from immediately rebuilding the
+	// same slots that the pressure controller just shed.
+	refillPaused bool
 
 	// verifyPollInterval/verifyMaxWait tune Return's pre-recycle liveness
 	// check (see verifyAndRecycle). Zero means use the package defaults;
@@ -102,6 +112,16 @@ const (
 	// rebuilds are short once uncontended, so a small window drains a backlog
 	// quickly.
 	resetTapConcurrency = 8
+	// refillFailureBackoff paces retries after a failed slot build. Failures
+	// are host-wide conditions (an exhausted slot range, a sick netlink), not
+	// per-attempt luck, so retrying immediately burns a core and floods the
+	// log with thousands of identical lines a second without fixing anything.
+	refillFailureBackoff = 2 * time.Second
+	// refillConcurrency is the number of refill workers rebuilding the fresh
+	// pool. A single worker refills at one slot per build-time, which cannot
+	// catch a drained pool back up while claims keep arriving; builds stay
+	// individually cheap because Manager.setupSem bounds them globally.
+	refillConcurrency = 4
 	// resetTapTimeout bounds one batched rebuild — a healthy one takes well
 	// under a second, and a tight bound keeps a stalled backlog (and Stop)
 	// from dragging.
@@ -150,6 +170,7 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		fresh:             make(chan *preallocSlot, newSize),
 		recycled:          make(chan *preallocSlot, recycleSize),
 		stopCh:            make(chan struct{}),
+		refillDrainGate:   make(chan struct{}),
 		resetTapOnRecycle: cfg.ResetTapOnRecycle,
 		abandonOnStop:     cfg.AbandonOnStop,
 		resetSem:          make(chan struct{}, resetTapConcurrency),
@@ -158,8 +179,18 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 
 	p.log.Info().Int("target", newSize).Int("recycle_cap", recycleSize).
 		Bool("reset_tap_on_recycle", p.resetTapOnRecycle).Msg("network pool starting (filling in background)")
-	p.wg.Add(1)
-	go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
+	// Each worker can park one pre-built slot in a blocked send when the pool
+	// is full, so inventory can exceed the target by up to the worker count.
+	// Clamping workers to the target keeps that overshoot proportionate for
+	// pools smaller than the default worker count.
+	workers := refillConcurrency
+	if newSize < workers {
+		workers = newSize
+	}
+	for i := 0; i < workers; i++ {
+		p.wg.Add(1)
+		go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
+	}
 
 	return p
 }
@@ -247,6 +278,73 @@ func (p *Pool) Return(slot *preallocSlot) {
 		defer sentrylog.Recover("netpool-verify-return")
 		p.verifyAndRecycle(slot)
 	}()
+}
+
+// drain tears down up to max warm slots from the pool so host-side namespace
+// and mount pressure can be reduced without reclaiming a live sandbox.
+func (p *Pool) drain(max int) int {
+	if max <= 0 {
+		return 0
+	}
+	p.setRefillPaused(true)
+	p.closeRefillDrainGate()
+	defer func() {
+		p.resetRefillDrainGate()
+		p.setRefillPaused(false)
+	}()
+	drained := 0
+	for drained < max {
+		var slot *preallocSlot
+		select {
+		case slot = <-p.recycled:
+		default:
+			select {
+			case slot = <-p.fresh:
+			default:
+				return drained
+			}
+		}
+		if slot == nil {
+			return drained
+		}
+		p.cleanup(slot)
+		drained++
+	}
+	return drained
+}
+
+func (p *Pool) closeRefillDrainGate() {
+	p.drainMu.Lock()
+	if p.refillDrainGate != nil {
+		close(p.refillDrainGate)
+	}
+	p.drainMu.Unlock()
+}
+
+func (p *Pool) resetRefillDrainGate() {
+	p.drainMu.Lock()
+	p.refillDrainGate = make(chan struct{})
+	p.drainMu.Unlock()
+}
+
+func (p *Pool) setRefillPaused(paused bool) {
+	p.drainMu.Lock()
+	p.refillPaused = paused
+	p.drainMu.Unlock()
+}
+
+func (p *Pool) refillIsPaused() bool {
+	p.drainMu.RLock()
+	paused := p.refillPaused
+	p.drainMu.RUnlock()
+	return paused
+}
+
+func (p *Pool) refillDrainCh() <-chan struct{} {
+	p.drainMu.RLock()
+	gate := p.refillDrainGate
+	p.drainMu.RUnlock()
+	return gate
 }
 
 // verifyAndRecycle blocks (in its own goroutine, never the caller's) until
@@ -566,15 +664,41 @@ func (p *Pool) refillLoop(ctx context.Context) {
 			return
 		default:
 		}
-
-		if len(p.fresh) >= p.newSize {
-			// Pool full — block until a slot is consumed or shutdown.
+		if p.refillIsPaused() {
 			select {
+			case <-time.After(refillFailureBackoff):
 			case <-p.stopCh:
 				return
 			case <-ctx.Done():
 				return
-			case p.fresh <- p.mustAllocate(ctx):
+			}
+			continue
+		}
+
+		if len(p.fresh) >= p.newSize {
+			// Pool full — pre-build one slot and block until it is consumed or
+			// shutdown. Built outside the select so a shutdown while blocked
+			// can dispose of the slot instead of dropping it.
+			slot := p.mustAllocate(ctx)
+			if slot == nil {
+				// mustAllocate only returns nil at shutdown.
+				return
+			}
+			if p.refillIsPaused() {
+				p.cleanup(slot)
+				continue
+			}
+			select {
+			case <-p.refillDrainCh():
+				p.cleanup(slot)
+				continue
+			case <-p.stopCh:
+				p.stopSlot(slot)
+				return
+			case <-ctx.Done():
+				p.stopSlot(slot)
+				return
+			case p.fresh <- slot:
 			}
 			continue
 		}
@@ -582,9 +706,19 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		slot, err := p.allocate(ctx)
 		if err != nil {
 			p.log.Error().Err(err).Msg("pool refill failed")
+			if !p.pauseAfterFailure(ctx) {
+				return
+			}
+			continue
+		}
+		if p.refillIsPaused() {
+			p.cleanup(slot)
 			continue
 		}
 		select {
+		case <-p.refillDrainCh():
+			p.cleanup(slot)
+			continue
 		case p.fresh <- slot:
 		case <-p.stopCh:
 			p.stopSlot(slot)
@@ -603,13 +737,22 @@ func (p *Pool) mustAllocate(ctx context.Context) *preallocSlot {
 			return slot
 		}
 		p.log.Error().Err(err).Msg("pool allocate retry")
-		select {
-		case <-p.stopCh:
+		if !p.pauseAfterFailure(ctx) {
 			return nil
-		case <-ctx.Done():
-			return nil
-		default:
 		}
+	}
+}
+
+// pauseAfterFailure waits out the retry backoff, reporting false when the pool
+// is shutting down and the caller should give up instead of retrying.
+func (p *Pool) pauseAfterFailure(ctx context.Context) bool {
+	select {
+	case <-time.After(refillFailureBackoff):
+		return true
+	case <-p.stopCh:
+		return false
+	case <-ctx.Done():
+		return false
 	}
 }
 

@@ -47,6 +47,15 @@ type OTelRecorder struct {
 	dbEmptyAcquire           metric.Int64Counter
 	dbCanceledAcquire        metric.Int64Counter
 	dbAcquireDurationSeconds metric.Float64Counter
+	pausedNetworkSlotsTotal  metric.Int64Gauge
+	pausedNetworkSlotsUsed   metric.Int64Gauge
+	pausedNetworkSlotsAvail  metric.Int64Gauge
+	pausedNetworkPoolSlots   metric.Int64Gauge
+	pausedNetworkNetnsTotal  metric.Int64Gauge
+	pausedNetworkMountTotal  metric.Int64Gauge
+	pausedNetworkPressure    metric.Int64Gauge
+	pausedNetworkReclaimed   metric.Int64Counter
+	pausedNetworkPaused      metric.Int64Counter
 }
 
 // NewOTelRecorder constructs an OTLP/HTTP metrics recorder. Call Shutdown on
@@ -65,31 +74,10 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		cfg.ExportInterval = 15 * time.Second
 	}
 
-	exporterOpts := []otlpmetrichttp.Option{otlpmetrichttp.WithEndpointURL(cfg.Endpoint)}
-	if cfg.Insecure || strings.HasPrefix(cfg.Endpoint, "http://") {
-		exporterOpts = append(exporterOpts, otlpmetrichttp.WithInsecure())
-	}
-	exporter, err := otlpmetrichttp.New(ctx, exporterOpts...)
+	provider, err := newOTLPMeterProvider(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("create otlp metric exporter: %w", err)
+		return nil, err
 	}
-
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes("",
-			attribute.String("service.name", cfg.ServiceName),
-			attribute.String("service.version", cfg.ServiceVersion),
-			attribute.String("environment", cfg.Environment),
-		),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create otel resource: %w", err)
-	}
-
-	provider := sdkmetric.NewMeterProvider(
-		sdkmetric.WithResource(res),
-		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(cfg.ExportInterval))),
-	)
 	meter := provider.Meter(instrumentationName)
 
 	r := &OTelRecorder{
@@ -137,6 +125,33 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.dbAcquireDurationSeconds, err = meter.Float64Counter("db_pool_acquire_duration_seconds_total"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkSlotsTotal, err = meter.Int64Gauge("vmd_network_slots_total"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkSlotsUsed, err = meter.Int64Gauge("vmd_network_slots_used"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkSlotsAvail, err = meter.Int64Gauge("vmd_network_slots_available"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkPoolSlots, err = meter.Int64Gauge("vmd_network_pool_slots"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkNetnsTotal, err = meter.Int64Gauge("vmd_network_netns_total"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkMountTotal, err = meter.Int64Gauge("vmd_network_mounts_total"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkPressure, err = meter.Int64Gauge("vmd_network_controller_pressure_state"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkReclaimed, err = meter.Int64Counter("vmd_network_slots_reclaimed_total"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkPaused, err = meter.Int64Counter("vmd_network_slots_reclaimed_paused_total"); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -217,6 +232,38 @@ func (r *OTelRecorder) RecordDBPoolStats(ctx context.Context, s DBPoolStats) {
 	}
 }
 
+func (r *OTelRecorder) RecordPausedNetworkPressure(ctx context.Context, p PausedNetworkPressure) {
+	if r == nil {
+		return
+	}
+	attrs := r.attrs()
+	opt := metric.WithAttributes(attrs...)
+	r.pausedNetworkSlotsTotal.Record(ctx, p.TotalSlots, opt)
+	r.pausedNetworkSlotsUsed.Record(ctx, p.UsedSlots, opt)
+	r.pausedNetworkSlotsAvail.Record(ctx, p.AvailableSlots, opt)
+	r.pausedNetworkPoolSlots.Record(ctx, p.FreshPool, metric.WithAttributes(append(attrs, attribute.String("type", "fresh"))...))
+	r.pausedNetworkPoolSlots.Record(ctx, p.RecycledPool, metric.WithAttributes(append(attrs, attribute.String("type", "recycled"))...))
+	r.pausedNetworkNetnsTotal.Record(ctx, p.NetnsTotal, opt)
+	r.pausedNetworkMountTotal.Record(ctx, p.MountTotal, opt)
+	currentReason := safePressureReason(p.PressureState)
+	for _, reason := range []string{"idle", "slot", "kernel", "both"} {
+		value := int64(0)
+		if reason == currentReason {
+			value = 1
+		}
+		r.pausedNetworkPressure.Record(ctx, value, metric.WithAttributes(append(attrs, attribute.String("reason", reason))...))
+	}
+	if p.ReclaimedRecycle > 0 {
+		r.pausedNetworkReclaimed.Add(ctx, p.ReclaimedRecycle, metric.WithAttributes(append(attrs, attribute.String("mode", "recycle"))...))
+	}
+	if p.ReclaimedTeardown > 0 {
+		r.pausedNetworkReclaimed.Add(ctx, p.ReclaimedTeardown, metric.WithAttributes(append(attrs, attribute.String("mode", "teardown"))...))
+	}
+	if p.ReclaimedPaused > 0 {
+		r.pausedNetworkPaused.Add(ctx, p.ReclaimedPaused, opt)
+	}
+}
+
 func (r *OTelRecorder) attrs(extra ...attribute.KeyValue) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		attribute.String("service.name", r.serviceName),
@@ -254,6 +301,15 @@ func safeMethod(v string) string {
 	}
 }
 
+func safePressureReason(v string) string {
+	switch v {
+	case "idle", "slot", "kernel", "both":
+		return v
+	default:
+		return "idle"
+	}
+}
+
 func safeRegion(v string) string {
 	if v == "" {
 		return "unknown"
@@ -266,4 +322,35 @@ func safeHostID(v string) string {
 		return "unknown"
 	}
 	return v
+}
+
+// newOTLPMeterProvider builds the OTLP/HTTP exporter, resource, and
+// periodic-reader meter provider shared by every recorder in this
+// package. cfg must already have its defaults applied.
+func newOTLPMeterProvider(ctx context.Context, cfg OTelConfig) (*sdkmetric.MeterProvider, error) {
+	exporterOpts := []otlpmetrichttp.Option{otlpmetrichttp.WithEndpointURL(cfg.Endpoint)}
+	if cfg.Insecure || strings.HasPrefix(cfg.Endpoint, "http://") {
+		exporterOpts = append(exporterOpts, otlpmetrichttp.WithInsecure())
+	}
+	exporter, err := otlpmetrichttp.New(ctx, exporterOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("create otlp metric exporter: %w", err)
+	}
+
+	res, err := resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes("",
+			attribute.String("service.name", cfg.ServiceName),
+			attribute.String("service.version", cfg.ServiceVersion),
+			attribute.String("environment", cfg.Environment),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create otel resource: %w", err)
+	}
+
+	return sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(res),
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(cfg.ExportInterval))),
+	), nil
 }

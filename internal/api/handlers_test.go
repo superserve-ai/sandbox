@@ -32,7 +32,7 @@ import (
 type stubVMD struct {
 	destroyFn        func(ctx context.Context, id string, force bool) error
 	pauseFn          func(ctx context.Context, id, snapshotDir string) (string, string, error)
-	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte) (string, error)
 	restoreFn        func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
 	restorePolicyFn  func(access string, ports map[int32]vmdclient.PortPolicy, revision int64)
 	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
@@ -73,9 +73,9 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir string) (st
 	}
 	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil, nil
 }
-func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string) (string, uint32, uint32, error) {
+func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte) (string, uint32, uint32, error) {
 	if s.resumeFn != nil {
-		ip, err := s.resumeFn(ctx, id, snapshotPath, memPath)
+		ip, err := s.resumeFn(ctx, id, snapshotPath, memPath, networkConfig)
 		return ip, 1, 1024, err
 	}
 	return "10.0.0.1", 1, 1024, nil
@@ -938,7 +938,7 @@ func TestResumeSandbox_LegacyPolicyToleratesOldVMD(t *testing.T) {
 	var resumeCalled, updateCalled bool
 	vmd := &stubVMD{
 		destroyFn: func(context.Context, string, bool) error { return nil },
-		resumeFn: func(_ context.Context, id, snapPath, memPath string) (string, error) {
+		resumeFn: func(_ context.Context, id, snapPath, memPath string, _ []byte) (string, error) {
 			resumeCalled = true
 			if id != sandboxID.String() {
 				t.Errorf("ResumeInstance id = %q, want %q", id, sandboxID)
@@ -1017,7 +1017,7 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 	var policyReads int
 	var restored, reconciled previewPolicySnapshot
 	vmd := &stubVMD{
-		resumeFn: func(context.Context, string, string, string) (string, error) {
+		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
 			return "", status.Error(codes.NotFound, "vm absent after vmd restart")
 		},
 		restorePolicyFn: func(access string, ports map[int32]vmdclient.PortPolicy, revision int64) {
@@ -1101,7 +1101,7 @@ func TestResumeSandbox_PrivatePolicyRequiresBrowserChainAndRestoresBrowserPorts(
 
 	var restored, reconciled previewPolicySnapshot
 	vmd := &stubVMD{
-		resumeFn: func(context.Context, string, string, string) (string, error) {
+		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
 			return "", status.Error(codes.NotFound, "vm absent after restart")
 		},
 		restorePolicyFn: func(access string, ports map[int32]vmdclient.PortPolicy, revision int64) {
@@ -1192,7 +1192,7 @@ func TestResumeSandbox_ReappliesSecretBindings(t *testing.T) {
 	var injectedJWT string
 	var injectCalled bool
 	vmd := &stubVMD{
-		resumeFn: func(_ context.Context, _, _, _ string) (string, error) { return "10.0.0.5", nil },
+		resumeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) { return "10.0.0.5", nil },
 		injectEnvFn: func(_ context.Context, _ string, _ map[string]string, jwt string) error {
 			injectCalled, injectedJWT = true, jwt
 			return nil
@@ -1348,7 +1348,7 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 
 	vmd := &stubVMD{
 		destroyFn: func(context.Context, string, bool) error { return nil },
-		resumeFn: func(context.Context, string, string, string) (string, error) {
+		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
 			return "", fmt.Errorf("vmd unreachable")
 		},
 	}
@@ -1395,7 +1395,7 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 
 	var destroyCalled, pauseCalled, updateNetworkCalled, finalizeCalled, activateCalled int32
 	vmd := &stubVMD{
-		resumeFn: func(context.Context, string, string, string) (string, error) {
+		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
 			return "10.0.0.5", nil
 		},
 		destroyFn: func(context.Context, string, bool) error {
@@ -1476,7 +1476,7 @@ func TestResumeSandbox_ActivateFailure_PausesNotDestroys(t *testing.T) {
 
 	var destroyCalled, pauseCalled, finalizeCalled int32
 	vmd := &stubVMD{
-		resumeFn: func(context.Context, string, string, string) (string, error) {
+		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
 			return "10.0.0.5", nil
 		},
 		destroyFn: func(context.Context, string, bool) error {
@@ -1591,7 +1591,7 @@ func TestActivateSandbox_PausedResumesAndReturns200(t *testing.T) {
 	var resumeCalled bool
 	vmd := &stubVMD{
 		destroyFn: func(context.Context, string, bool) error { return nil },
-		resumeFn: func(_ context.Context, id, _, _ string) (string, error) {
+		resumeFn: func(_ context.Context, id, _, _ string, _ []byte) (string, error) {
 			resumeCalled = true
 			return "10.0.0.5", nil
 		},
@@ -1738,7 +1738,7 @@ func TestResumeSandbox_ActivityLogFailure_StillReturns200(t *testing.T) {
 
 	vmd := &stubVMD{
 		destroyFn: func(context.Context, string, bool) error { return nil },
-		resumeFn: func(context.Context, string, string, string) (string, error) {
+		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
 			return "10.0.0.5", nil
 		},
 	}
@@ -3131,5 +3131,61 @@ func TestPauseWithRetry_NotFoundIsTerminal(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("NotFound must not be retried, got %d calls", calls)
+	}
+}
+
+// TestCreateSandbox_InsertCarriesTemplateShape pins the row's initial shape: a
+// 'starting' (or failed-before-activation) sandbox must show the template's
+// vcpu/memory, not 1 vCPU / 1 MiB placeholders.
+func TestCreateSandbox_InsertCarriesTemplateShape(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+
+	tpl := defaultReadyTemplate()
+	tpl.Vcpu = 4
+	tpl.MemoryMib = 8192
+
+	var sawVcpu, sawMem bool
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+				return previewCapableHostRow()
+			}
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				for _, a := range args {
+					if v, ok := a.(int32); ok {
+						if v == 4 {
+							sawVcpu = true
+						}
+						if v == 8192 {
+							sawMem = true
+						}
+					}
+				}
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "shaped",
+					Status: db.SandboxStatusStarting, VcpuCount: 4, MemoryMib: 8192,
+					CreatedAt: time.Now(),
+				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(tpl)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Scheduler: &stubScheduler{hostID: "public-host"}}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"shaped"}`))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+	if !sawVcpu || !sawMem {
+		t.Errorf("INSERT args missing template shape (vcpu4 seen=%v, mem8192 seen=%v) — placeholders written instead", sawVcpu, sawMem)
 	}
 }

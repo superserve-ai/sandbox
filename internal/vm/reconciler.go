@@ -224,6 +224,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// Pass timestamp; the disk scan derives its grace cutoff from it (rows
 	// destroyed within, and dirs touched within, DiskGracePeriod are kept).
 	snapshotTime := time.Now()
+	if reclaimed := r.mgr.reclaimPausedNetworkInventory(snapshotTime); reclaimed > 0 {
+		log.Info().Int("reclaimed", reclaimed).Msg("reclaimed paused network inventory")
+	}
 
 	// Source B: running VMs, as a fail-closed UNION of both supervision
 	// modes — active systemd units and populated per-VM cgroups. This set

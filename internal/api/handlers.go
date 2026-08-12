@@ -711,7 +711,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdTimeout)
 	defer bootCancel()
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
-		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath)
+		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig)
 	})
 	if err != nil {
 		if isVMDNotFound(err) {
@@ -1906,6 +1906,15 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	sandboxID := uuid.New()
 
 	insertCtx := context.WithoutCancel(c.Request.Context())
+
+	// The shape shown while the sandbox is 'starting' — and kept if the create
+	// fails before activation. ActivateSandbox overwrites it with the actuals
+	// vmd reports once the VM is up.
+	insertVcpu, insertMemMiB := int32(defaultVcpu), int32(defaultMemoryMi)
+	if templateID.Valid && templateVcpu > 0 && templateMemMiB > 0 {
+		insertVcpu, insertMemMiB = int32(templateVcpu), int32(templateMemMiB)
+	}
+
 	type insertResult struct {
 		sandbox db.Sandbox
 		err     error
@@ -1925,8 +1934,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				TeamID:            teamID,
 				Name:              req.Name,
 				Status:            db.SandboxStatusStarting,
-				VcpuCount:         1, // placeholders; real values land via ActivateSandbox
-				MemoryMib:         1,
+				VcpuCount:         insertVcpu,
+				MemoryMib:         insertMemMiB,
 				HostID:            hostID,
 				TimeoutSeconds:    req.TimeoutSeconds,
 				AutoDeleteSeconds: req.AutoDeleteSeconds,
@@ -1947,8 +1956,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			TeamID:            teamID,
 			Name:              req.Name,
 			Status:            db.SandboxStatusStarting,
-			VcpuCount:         1,
-			MemoryMib:         1,
+			VcpuCount:         insertVcpu,
+			MemoryMib:         insertMemMiB,
 			HostID:            hostID,
 			TimeoutSeconds:    req.TimeoutSeconds,
 			AutoDeleteSeconds: req.AutoDeleteSeconds,
@@ -1987,8 +1996,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				ID:                sandboxID,
 				Name:              req.Name,
 				Status:            db.SandboxStatusStarting,
-				VcpuCount:         1, // placeholders; real values land via ActivateSandbox
-				MemoryMib:         1,
+				VcpuCount:         insertVcpu,
+				MemoryMib:         insertMemMiB,
 				HostID:            hostID,
 				TimeoutSeconds:    req.TimeoutSeconds,
 				AutoDeleteSeconds: req.AutoDeleteSeconds,
@@ -2009,8 +2018,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			TeamID:            teamID,
 			Name:              req.Name,
 			Status:            db.SandboxStatusStarting,
-			VcpuCount:         1,
-			MemoryMib:         1,
+			VcpuCount:         insertVcpu,
+			MemoryMib:         insertMemMiB,
 			HostID:            hostID,
 			TimeoutSeconds:    req.TimeoutSeconds,
 			AutoDeleteSeconds: req.AutoDeleteSeconds,

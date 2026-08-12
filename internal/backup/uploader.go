@@ -11,10 +11,13 @@ import (
 	"hash"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/rs/zerolog"
 	"golang.org/x/time/rate"
+
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // GenerationManifest is the completion marker object, written after every
@@ -70,6 +73,12 @@ type Uploader struct {
 	OnVerified func(Task)
 	// Tick is the idle poll interval. 0 → 1s.
 	Tick time.Duration
+	// LegacyStagingRoot is a retired staging location still referenced
+	// by journal rows enqueued before a relocation. It is swept with the
+	// same journal authority as StagingRoot until it empties, then the
+	// directory itself is removed; deleting it eagerly would destroy
+	// staged copies that queued tasks still need.
+	LegacyStagingRoot string
 	// StagingRoot is the hard-link staging tree; finished tasks get
 	// their staged generation removed. Empty disables staging cleanup.
 	StagingRoot string
@@ -77,6 +86,11 @@ type Uploader struct {
 	// for failure-time backoff, where the drain-start time would let a
 	// late failure retry immediately.
 	Now func() time.Time
+	// Metrics optionally records upload outcomes and notify failures.
+	// Nil disables recording (every recorder method is nil-safe), and a
+	// metrics error can never affect backup behavior: the recorder only
+	// observes, it is never consulted.
+	Metrics *telemetry.BackupRecorder
 }
 
 func (u *Uploader) clock() time.Time {
@@ -153,6 +167,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 		if u.StagingRoot != "" && u.clock().Sub(lastSweep) > stagingSweepInterval {
 			lastSweep = u.clock()
 			SweepStaging(u.StagingRoot, u.Journal, u.Log)
+			u.sweepLegacyStaging()
 		}
 	}
 }
@@ -164,8 +179,37 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	if err != nil || !ok {
 		return false, err
 	}
-	completed, err := u.uploadTask(ctx, &task)
+	start := u.clock()
+	completed, streamed, err := u.uploadTask(ctx, &task)
+	// Bytes count what actually reached new bucket objects, failures
+	// included: partial progress is real upload traffic.
+	u.Metrics.AddUploadBytes(ctx, streamed)
 	if err != nil {
+		// Retries are bounded: a task that has failed this many times is
+		// structurally stuck (its error is not transient at any horizon
+		// that matters), and unbounded retry converts one stuck task
+		// class into monotonic journal and staging growth. Abandoning is
+		// safe by the same contract every abandon path relies on: the
+		// generation's coverage is sacrificed, the owner's next pause
+		// covers, and the error log is the operator signal (with the
+		// abandoned outcome in the upload metric).
+		if task.Attempts+1 >= maxUploadAttempts && !isStoreError(err) && !errors.Is(err, context.Canceled) {
+			task.logOwner(u.Log.Error().Err(err)).
+				Str("generation", task.Generation).
+				Int("attempts", task.Attempts+1).
+				Msg("backup upload retries exhausted; abandoning generation")
+			if aerr := u.Journal.Ack(task, "", false); aerr != nil {
+				return true, aerr
+			}
+			removeStagedTask(u.StagingRoot, task)
+			u.Metrics.RecordUpload(ctx, telemetry.BackupUploadAbandoned, u.clock().Sub(start))
+			return true, nil
+		}
+		// A shutdown-canceled attempt is not a failure signal; the task
+		// retries on the next boot.
+		if ctx.Err() == nil {
+			u.Metrics.RecordUpload(ctx, telemetry.BackupUploadFailed, u.clock().Sub(start))
+		}
 		task.logOwner(u.Log.Warn().Err(err)).
 			Str("generation", task.Generation).
 			Int("attempts", task.Attempts+1).
@@ -175,6 +219,14 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 		// NotBefore and retry immediately.
 		return true, u.Journal.Nack(task, u.clock())
 	}
+	result := telemetry.BackupUploadAbandoned
+	if completed {
+		result = telemetry.BackupUploadDeduped
+		if streamed > 0 {
+			result = telemetry.BackupUploadVerified
+		}
+	}
+	u.Metrics.RecordUpload(ctx, result, u.clock().Sub(start))
 	if !completed && !task.Staged {
 		// Abandonment of a mutable-path task: a concurrent dedupe may
 		// have upgraded the row to staged snapshots that would survive
@@ -216,12 +268,14 @@ func (u *Uploader) flushNotifications() {
 	}
 	pending, err := u.Journal.PendingNotifications()
 	if err != nil {
+		u.Metrics.AddNotifyFailure(context.Background())
 		u.Log.Warn().Err(err).Msg("backup notification outbox read failed")
 		return
 	}
 	for _, t := range pending {
 		u.OnVerified(t)
 		if err := u.Journal.ClearNotification(t); err != nil {
+			u.Metrics.AddNotifyFailure(context.Background())
 			t.logOwner(u.Log.Warn().Err(err)).
 				Str("generation", t.Generation).
 				Msg("backup notification clear failed; will redeliver")
@@ -273,8 +327,10 @@ func SharedBaseName(sha string) string {
 // task is done, but nothing was made durable, so verification hooks must
 // not fire.
 // task is a pointer so verification progress recorded during the attempt
-// survives into the Nack that re-persists the task on failure.
-func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, _ error) {
+// survives into the Nack that re-persists the task on failure. streamed
+// counts bytes written into newly created objects across the attempt,
+// error paths included (dedupes and skips add nothing).
+func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, streamed int64, _ error) {
 	gen := GenerationManifest{
 		SandboxID:  task.SandboxID,
 		TemplateID: task.TemplateID,
@@ -284,7 +340,8 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 	}
 	uploadedBases := map[string]bool{}
 	for _, file := range task.Files {
-		mf, err := u.uploadFile(ctx, task, file)
+		mf, n, err := u.uploadFile(ctx, task, file)
+		streamed += n
 		if err != nil {
 			if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
 				// The artifact vanished or mutated between enqueue and
@@ -293,9 +350,9 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				// address; the generation is abandoned, not retried.
 				task.logOwner(u.lossEvent(task).Str("path", file.Path)).
 					Msg("backup source file gone; abandoning generation")
-				return false, nil
+				return false, streamed, nil
 			}
-			return false, err
+			return false, streamed, err
 		}
 		gen.Files = append(gen.Files, mf)
 		// An overlay's holes are backed by its base image, and the bucket
@@ -312,18 +369,19 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				if os.IsNotExist(err) {
 					task.logOwner(u.lossEvent(task).Str("path", file.BasePath)).
 						Msg("backup base image gone; abandoning generation")
-					return false, nil
+					return false, streamed, nil
 				}
-				return false, err
+				return false, streamed, err
 			}
-			bmf, err := u.uploadFile(ctx, task, bf)
+			bmf, n, err := u.uploadFile(ctx, task, bf)
+			streamed += n
 			if err != nil {
 				if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
 					task.logOwner(u.lossEvent(task).Str("path", bf.Path)).
 						Msg("backup base image gone or rebuilt; abandoning generation")
-					return false, nil
+					return false, streamed, nil
 				}
-				return false, err
+				return false, streamed, err
 			}
 			uploadedBases[file.BaseSHA256] = true
 			gen.Files = append(gen.Files, bmf)
@@ -331,20 +389,65 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 	}
 	manifestObject, err := task.objectName(ManifestObject)
 	if err != nil {
-		return false, err
+		return false, streamed, err
 	}
 	payload, err := json.Marshal(gen)
 	if err != nil {
-		return false, err
+		return false, streamed, err
 	}
-	if _, err := u.Store.Create(ctx, manifestObject, &limitedReader{r: bytes.NewReader(payload), limiter: u.Limiter, ctx: ctx}); err != nil {
-		return false, fmt.Errorf("manifest object: %w", err)
+	created, err := u.Store.Create(ctx, manifestObject, &limitedReader{r: bytes.NewReader(payload), limiter: u.Limiter, ctx: ctx})
+	if err != nil {
+		return false, streamed, fmt.Errorf("manifest object: %w", storeError{err})
 	}
-	return true, nil
+	if created {
+		streamed += int64(len(payload))
+	}
+	return true, streamed, nil
 }
 
 // stagingSweepInterval paces the running staged-base sweep.
 const stagingSweepInterval = 30 * time.Minute
+
+// maxUploadAttempts bounds a task's retries for LOCAL failures, which
+// are deterministic: the same bytes and environment fail the same way,
+// so this many identical failures is structural, and unbounded retry
+// converts one stuck task class into monotonic journal and staging
+// growth. Store errors are exempt: an outage or credential problem is
+// environmental, however long it lasts, and exhausting durable work
+// against it would discard generations (a destroyed sandbox has no next
+// pause) that become uploadable the moment the store recovers. Outage
+// depth stays visible through the queue-age telemetry instead.
+const maxUploadAttempts = 60
+
+// storeError marks a failure that came from the blob store rather than
+// local preparation, exempting it from the retry ceiling.
+type storeError struct{ err error }
+
+func (e storeError) Error() string { return e.err.Error() }
+func (e storeError) Unwrap() error { return e.err }
+
+func isStoreError(err error) bool {
+	var se storeError
+	return errors.As(err, &se)
+}
+
+// sweepLegacyStaging drains a retired staging location under journal
+// authority and removes the directory once nothing references it. The
+// non-recursive Remove is the emptiness check: it fails harmlessly
+// while any sandbox or base entry survives.
+func (u *Uploader) sweepLegacyStaging() {
+	if u.LegacyStagingRoot == "" {
+		return
+	}
+	SweepStaging(u.LegacyStagingRoot, u.Journal, u.Log)
+	// The bases subdirectory outlives its last entry; both removes are
+	// non-recursive, so each succeeds only against emptiness.
+	_ = os.Remove(filepath.Join(u.LegacyStagingRoot, "bases"))
+	if err := os.Remove(u.LegacyStagingRoot); err == nil {
+		u.Log.Info().Str("path", u.LegacyStagingRoot).Msg("legacy backup staging tree drained and removed")
+		u.LegacyStagingRoot = ""
+	}
+}
 
 // objectName routes an object into the task owner's prefix. Both owners
 // keep the content-addressed generation segment: build ids are reusable
@@ -409,30 +512,33 @@ func (u *Uploader) verifiedHere(task *Task, object string) (bool, error) {
 	return u.Journal.WasVerified(u.verificationKey(object), u.clock())
 }
 
-func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (ManifestFile, error) {
+// uploadFile ships one artifact object. shipped counts bytes written
+// into a newly created object (zero on dedupes, skips, and failures that
+// abort the create), so byte accounting reflects storage actually done.
+func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_ ManifestFile, shipped int64, _ error) {
 	if file.Name == ManifestObject {
-		return ManifestFile{}, fmt.Errorf("artifact name %q collides with the manifest object", file.Name)
+		return ManifestFile{}, 0, fmt.Errorf("artifact name %q collides with the manifest object", file.Name)
 	}
 	f, err := os.Open(file.Path)
 	if err != nil {
-		return ManifestFile{}, err
+		return ManifestFile{}, 0, err
 	}
 	defer f.Close()
 	extents, apparent, err := Extents(f)
 	if err != nil {
-		return ManifestFile{}, fmt.Errorf("extents %s: %w", file.Path, err)
+		return ManifestFile{}, 0, fmt.Errorf("extents %s: %w", file.Path, err)
 	}
 	// Verify the source still matches the digest recorded at pause time
 	// before any bytes ship: a cheap early abort for the common mutation
 	// case (the sandbox resumed before the drain).
 	sum, err := hashApparent(ctx, f, extents, apparent)
 	if err != nil {
-		return ManifestFile{}, fmt.Errorf("verify %s: %w", file.Path, err)
+		return ManifestFile{}, 0, fmt.Errorf("verify %s: %w", file.Path, err)
 	}
 	if sum != file.SHA256 {
 		task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
 			Msg("backup source changed since pause; abandoning generation")
-		return ManifestFile{}, errSourceChanged
+		return ManifestFile{}, 0, errSourceChanged
 	}
 	// The object name embeds the packing fingerprint: a retry over a
 	// physically relaid file (same apparent content, different extents)
@@ -450,7 +556,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		objectName = file.Name + ".p" + PackFingerprint(extents, apparent)
 		object, err = task.objectName(objectName)
 		if err != nil {
-			return ManifestFile{}, err
+			return ManifestFile{}, 0, err
 		}
 	}
 	if file.Shared {
@@ -474,7 +580,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 				Size:       apparent,
 				PackedSize: PackedSize(extents),
 				Extents:    extents,
-			}, nil
+			}, 0, nil
 		}
 	}
 	// The stream hasher digests the apparent content of what is ACTUALLY
@@ -488,19 +594,23 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 	reader := &limitedReader{r: hasher, limiter: u.Limiter, ctx: ctx}
 	created, err := u.Store.Create(ctx, object, reader)
 	if err != nil {
-		return ManifestFile{}, err
+		return ManifestFile{}, 0, storeError{err}
 	}
 	if created {
+		// The store finalized a new object from this stream; these bytes
+		// are real upload traffic even when verification below rejects
+		// the generation.
+		shipped = hasher.consumed
 		// The store wrote exactly the bytes that flowed through the
 		// hasher; anything short of full consumption with a matching
 		// digest means the stored object is not what the manifest would
 		// claim.
-		shipped, complete := hasher.finish()
-		if !complete || shipped != file.SHA256 {
-			task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", shipped)).
+		sum, complete := hasher.finish()
+		if !complete || sum != file.SHA256 {
+			task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
 				Bool("fully_streamed", complete).
 				Msg("backup source changed during upload; abandoning generation")
-			return ManifestFile{}, errSourceChanged
+			return ManifestFile{}, shipped, errSourceChanged
 		}
 		// Persist that these exact object bytes were verified BEFORE any
 		// further progress, both in the task (survives nacks) and in the
@@ -529,7 +639,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 			time.Sleep(delay)
 		}
 		if recErr != nil {
-			return ManifestFile{}, fmt.Errorf("record verification of %s: %w", object, recErr)
+			return ManifestFile{}, shipped, fmt.Errorf("record verification of %s: %w", object, recErr)
 		}
 		task.VerifiedObjects = verified
 	} else if file.Shared {
@@ -553,11 +663,11 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 			next.VerifiedObjects = append(append([]string(nil), task.VerifiedObjects...), u.verificationKey(object))
 		}
 		if err := u.Journal.RecordVerification(next, u.verificationKey(object), u.clock()); err != nil {
-			return ManifestFile{}, fmt.Errorf("record shared dedupe of %s: %w", object, err)
+			return ManifestFile{}, 0, fmt.Errorf("record shared dedupe of %s: %w", object, err)
 		}
 		task.VerifiedObjects = next.VerifiedObjects
 	} else if ok, err := u.verifiedHere(task, object); err != nil {
-		return ManifestFile{}, err
+		return ManifestFile{}, 0, err
 	} else if !ok {
 		// The object already existed (dedupe). Stream consumption proves
 		// nothing here: small objects buffer fully before the
@@ -570,7 +680,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		// identity cannot read them back).
 		task.logOwner(u.Log.Warn().Str("object", object)).
 			Msg("deduped object has no verification history; abandoning generation")
-		return ManifestFile{}, errSourceChanged
+		return ManifestFile{}, 0, errSourceChanged
 	}
 	return ManifestFile{
 		Name:       file.Name,
@@ -581,7 +691,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (M
 		Size:       apparent,
 		PackedSize: PackedSize(extents),
 		Extents:    extents,
-	}, nil
+	}, shipped, nil
 }
 
 // HashFileApparent digests a file's full apparent content the sparse

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/superserve-ai/sandbox/internal/preview"
 	bolt "go.etcd.io/bbolt"
@@ -67,6 +68,72 @@ func TestLegacyVMRecordRetainsAllPortCompatibility(t *testing.T) {
 	}
 	if inst.PreviewPorts != nil || inst.PreviewPolicyRevision != 0 {
 		t.Fatalf("legacy policy = (%#v, %d), want (nil, 0)", inst.PreviewPorts, inst.PreviewPolicyRevision)
+	}
+}
+
+func TestPausedAtRoundTrip(t *testing.T) {
+	pausedAt := time.Unix(1_725_000_000, 0).UTC()
+	inst := &VMInstance{
+		ID:       "vm-paused",
+		PausedAt: pausedAt,
+	}
+
+	rec := toRecord(inst)
+	if !rec.PausedAt.Equal(pausedAt) {
+		t.Fatalf("record paused_at = %v, want %v", rec.PausedAt, pausedAt)
+	}
+
+	restored := toInstance(rec)
+	if !restored.PausedAt.Equal(pausedAt) {
+		t.Fatalf("restored paused_at = %v, want %v", restored.PausedAt, pausedAt)
+	}
+}
+
+func TestStateStorePausedAtRoundTrip(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "state.db")
+	pausedAt := time.Unix(1_725_000_000, 0).UTC()
+
+	store, err := OpenStateStore(storePath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.Put(VMRecord{
+		ID:       "vm-paused",
+		Status:   StatusPaused,
+		PausedAt: pausedAt,
+	}); err != nil {
+		t.Fatalf("put paused record: %v", err)
+	}
+	if err := store.Put(VMRecord{
+		ID:     "vm-legacy",
+		Status: StatusPaused,
+	}); err != nil {
+		t.Fatalf("put legacy record: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = OpenStateStore(storePath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store.Close()
+
+	got, err := store.Get("vm-paused")
+	if err != nil {
+		t.Fatalf("get paused record: %v", err)
+	}
+	if !got.PausedAt.Equal(pausedAt) {
+		t.Fatalf("stored paused_at = %v, want %v", got.PausedAt, pausedAt)
+	}
+
+	legacy, err := store.Get("vm-legacy")
+	if err != nil {
+		t.Fatalf("get legacy record: %v", err)
+	}
+	if !legacy.PausedAt.IsZero() {
+		t.Fatalf("legacy paused_at = %v, want zero", legacy.PausedAt)
 	}
 }
 
