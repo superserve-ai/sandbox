@@ -153,7 +153,7 @@ jobs:
           VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "0"
           VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
           VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
-          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "20"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "60"
           VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           # Staging validates the backup uploader first; the production
           # cells get their buckets after the staging soak.
@@ -229,7 +229,7 @@ jobs:
           VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "0"
           VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
           VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
-          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "20"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "60"
           VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           BACKUP_BUCKET: superserve-artifact-backup-use4
@@ -286,7 +286,7 @@ jobs:
           VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "0"
           VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
           VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
-          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "20"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "60"
           VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           # usw is its own cell — separate Supabase project + control plane
