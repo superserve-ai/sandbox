@@ -716,7 +716,21 @@ def main() -> int:
                     && [ -f "$OLD_BACKUP_JOURNAL_PATH" ] \\
                     && [ ! -e "$NEW_BACKUP_JOURNAL_PATH" ]; then
                     sudo install -d -m 0755 "$(dirname "$NEW_BACKUP_JOURNAL_PATH")"
-                    sudo mv "$OLD_BACKUP_JOURNAL_PATH" "$NEW_BACKUP_JOURNAL_PATH"
+                    # Old and new live on different filesystems (root disk
+                    # vs. the local-SSD array), so a plain `mv` is a
+                    # copy-then-delete, not an atomic rename: a kill mid-copy
+                    # leaves a truncated file at NEW_BACKUP_JOURNAL_PATH,
+                    # which the existence check above would then mistake for
+                    # an already-completed migration on retry, publishing a
+                    # BoltDB vmd can't open. Copy to a same-filesystem temp
+                    # path next to the destination, then rename — same
+                    # filesystem makes that rename atomic — and only then
+                    # remove the source.
+                    TMP_BACKUP_JOURNAL_PATH="${{NEW_BACKUP_JOURNAL_PATH}}.migrating.$$"
+                    sudo rm -f "${{NEW_BACKUP_JOURNAL_PATH}}".migrating.*
+                    sudo cp --preserve=mode,ownership "$OLD_BACKUP_JOURNAL_PATH" "$TMP_BACKUP_JOURNAL_PATH"
+                    sudo mv "$TMP_BACKUP_JOURNAL_PATH" "$NEW_BACKUP_JOURNAL_PATH"
+                    sudo rm -f "$OLD_BACKUP_JOURNAL_PATH"
                     echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
                 fi
 
