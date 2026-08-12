@@ -20,6 +20,17 @@ Env vars:
                        into vmd.env when set; empty = skip, leaving the
                        host's backup uploader disabled. Staged rollout:
                        staging first, production after the staging soak.
+  OTEL_ENVIRONMENT     optional — enables vmd's OTLP backup-metrics exporter
+                       by upserting OTEL_METRICS_ENABLED=true and this value
+                       as OTEL_ENVIRONMENT into vmd.env. Empty = skip,
+                       leaving the host's existing setting alone. The
+                       endpoint stays vmd's compiled default
+                       (http://localhost:4318, the host-local collector), so
+                       only the enable flag and environment ship. The backup
+                       alert policies key on these series, including the
+                       backup-disabled alert, which cannot fire on absent
+                       data — so metrics must be on wherever those alerts
+                       are instantiated.
   CONTROL_PLANE_URL    optional — control-plane base URL (e.g.
                        https://api.superserve.ai). Upserted into vmd.env when
                        set. vmd reads it via os.Getenv("CONTROL_PLANE_URL").
@@ -47,6 +58,29 @@ Env vars:
                        unbound local_dns_port; upserted into vmd.env so a rebuilt
                        host wires the redirect (unbound answers there but vmd
                        owns the redirect rules).
+  VMD_PAUSED_NETWORK_RECLAIM optional — enables pressure-driven release of
+                       paused-network inventory. When set, upserted into
+                       vmd.env.
+  VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT optional — free-slot pressure
+                       percentage. When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE optional — free-slot absolute
+                       reserve. When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS optional — free-slot release
+                       band. When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_NETNS_THRESHOLD optional — kernel netns pressure
+                       threshold. When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_NETNS_HYSTERESIS optional — kernel netns recovery band.
+                       When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_MOUNT_THRESHOLD optional — kernel mount pressure
+                       threshold. When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS optional — kernel mount recovery band.
+                       When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_MIN_WARM_AGE optional — minimum paused age before
+                       slot-pressure recycle. When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_MAX_RECLAIMS optional — controller work budget per pass.
+                       When set, upserted into vmd.env.
+  VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN optional — minimum time between
+                       reclamation passes. When set, upserted into vmd.env.
 
 All deploy artifacts (binaries + systemd units + scripts) are packed
 into a single tarball and SCP'd once per host. Each gcloud SCP/SSH
@@ -104,6 +138,9 @@ BUNDLE_FILES = [
     "deploy/sandboxes.slice",
     "deploy/needrestart-superserve.conf",
     "deploy/apt-no-auto-upgrades.conf",
+    "deploy/maintenance-watch.sh",
+    "deploy/superserve-maintenance-watch.service",
+    "deploy/superserve-maintenance-watch.timer",
     "scripts/fc-cleanup",
 ]
 
@@ -117,6 +154,7 @@ def main() -> int:
     sha = os.environ["SHA"][:8]
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     backup_bucket = os.environ.get("BACKUP_BUCKET", "")
+    otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
     control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
     internal_api_token = os.environ.get("INTERNAL_API_TOKEN", "")
     database_url = os.environ.get("DATABASE_URL", "")
@@ -132,15 +170,65 @@ def main() -> int:
     q_sentry_line = shlex.quote(f"SENTRY_DSN={sentry_dsn}")
     q_backup = shlex.quote(backup_bucket)
     q_backup_line = shlex.quote(f"BACKUP_BUCKET={backup_bucket}")
+    q_otel = shlex.quote(otel_environment)
+    q_otel_enabled_line = shlex.quote("OTEL_METRICS_ENABLED=true")
+    q_otel_env_line = shlex.quote(f"OTEL_ENVIRONMENT={otel_environment}")
     q_cpu = shlex.quote(control_plane_url)
     q_cpu_line = shlex.quote(f"CONTROL_PLANE_URL={control_plane_url}")
     q_dns = shlex.quote(dns_redirect_port)
     q_dns_line = shlex.quote(f"VMD_DNS_REDIRECT_PORT={dns_redirect_port}")
+    q_paused_reclaim = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_RECLAIM", ""))
+    q_paused_reclaim_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_RECLAIM={os.environ.get('VMD_PAUSED_NETWORK_RECLAIM', '')}"
+    )
+    q_paused_slot_percent = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT", ""))
+    q_paused_slot_percent_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT={os.environ.get('VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT', '')}"
+    )
+    q_paused_slot_reserve = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE", ""))
+    q_paused_slot_reserve_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE={os.environ.get('VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE', '')}"
+    )
+    q_paused_slot_hysteresis = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS", ""))
+    q_paused_slot_hysteresis_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS={os.environ.get('VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS', '')}"
+    )
+    q_paused_netns_threshold = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_NETNS_THRESHOLD", ""))
+    q_paused_netns_threshold_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_NETNS_THRESHOLD={os.environ.get('VMD_PAUSED_NETWORK_NETNS_THRESHOLD', '')}"
+    )
+    q_paused_netns_hysteresis = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_NETNS_HYSTERESIS", ""))
+    q_paused_netns_hysteresis_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_NETNS_HYSTERESIS={os.environ.get('VMD_PAUSED_NETWORK_NETNS_HYSTERESIS', '')}"
+    )
+    q_paused_mount_threshold = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_MOUNT_THRESHOLD", ""))
+    q_paused_mount_threshold_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_MOUNT_THRESHOLD={os.environ.get('VMD_PAUSED_NETWORK_MOUNT_THRESHOLD', '')}"
+    )
+    q_paused_mount_hysteresis = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS", ""))
+    q_paused_mount_hysteresis_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS={os.environ.get('VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS', '')}"
+    )
+    q_paused_min_warm_age = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_MIN_WARM_AGE", ""))
+    q_paused_min_warm_age_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_MIN_WARM_AGE={os.environ.get('VMD_PAUSED_NETWORK_MIN_WARM_AGE', '')}"
+    )
+    q_paused_max_reclaims = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_MAX_RECLAIMS", ""))
+    q_paused_max_reclaims_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_MAX_RECLAIMS={os.environ.get('VMD_PAUSED_NETWORK_MAX_RECLAIMS', '')}"
+    )
+    q_paused_cooldown = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN", ""))
+    q_paused_cooldown_line = shlex.quote(
+        f"VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN={os.environ.get('VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN', '')}"
+    )
     q_token = shlex.quote(internal_api_token)
     q_iat_line = shlex.quote(f"INTERNAL_API_TOKEN={internal_api_token}")
     q_dat_line = shlex.quote(f"DAEMON_AUTH_TOKEN={internal_api_token}")
     q_db = shlex.quote(database_url)
     q_db_line = shlex.quote(f"DATABASE_URL={database_url}")
+    maintenance_webhook = os.environ.get("MAINTENANCE_ALERT_WEBHOOK", "")
+    q_webhook = shlex.quote(maintenance_webhook)
+    q_webhook_line = shlex.quote(f"MAINTENANCE_ALERT_WEBHOOK={maintenance_webhook}")
 
     # Build the deploy bundle once. Same artifact ships to every host;
     # building per-host would waste CI runner CPU.
@@ -189,6 +277,7 @@ def main() -> int:
     def deploy(inst):
         name, zone = inst["name"], inst["zone"]
         tag = f"{name}/{zone}"
+        q_host_id_line = shlex.quote(f"HOST_ID={name}")
 
         # Single SCP — one IAP tunnel for the whole bundle.
         run_or_die(
@@ -261,6 +350,21 @@ def main() -> int:
             sudo install -m 0644 {extract_dir}/deploy/firecracker@.service /etc/systemd/system/firecracker@.service
             sudo install -m 0644 {extract_dir}/deploy/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
             sudo install -m 0644 {extract_dir}/deploy/sandboxes.slice /etc/systemd/system/sandboxes.slice
+            # Upsert the maintenance-watch webhook into its own env file so the
+            # watcher never sources vmd's tokens. Empty = skip: the watcher
+            # still runs and logs notices to the journal, it just can't page.
+            # Written BEFORE the timer is enabled below: an elapsed OnBootSec
+            # fires the watcher the moment `enable --now` runs.
+            if [ -n {q_webhook} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/maintenance-watch.env
+                sudo chmod 0600 /etc/sandbox/maintenance-watch.env
+                sudo sed -i '/^MAINTENANCE_ALERT_WEBHOOK=/d' /etc/sandbox/maintenance-watch.env
+                echo {q_webhook_line} | sudo tee -a /etc/sandbox/maintenance-watch.env > /dev/null
+            fi
+            sudo install -m 0755 {extract_dir}/deploy/maintenance-watch.sh {install_dir}/maintenance-watch
+            sudo install -m 0644 {extract_dir}/deploy/superserve-maintenance-watch.service /etc/systemd/system/superserve-maintenance-watch.service
+            sudo install -m 0644 {extract_dir}/deploy/superserve-maintenance-watch.timer /etc/systemd/system/superserve-maintenance-watch.timer
             sudo install -m 0644 {extract_dir}/deploy/superserve-vms.service /etc/systemd/system/superserve-vms.service
             # Host-resident rollback guard: survives deploys of older revisions
             # (their scripts predate the drain gate above and never remove
@@ -271,6 +375,7 @@ def main() -> int:
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-rollback-guard.conf /etc/systemd/system/superserve-vmd.service.d/10-rollback-guard.conf
             sudo systemctl daemon-reload
             sudo systemctl enable --quiet superserve-vmd.socket
+            sudo systemctl enable --now --quiet superserve-maintenance-watch.timer
             # Delegated cgroup subtree for direct-spawn VMs. Enable for boot, but
             # START only when the delegated root has no child cgroups yet (fresh /
             # first deploy). Once vmd has bootstrapped it, the root is an inner
@@ -387,6 +492,29 @@ def main() -> int:
                 echo {q_backup_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
+            # Upsert the OTLP backup-metrics contract: enable flag plus
+            # environment label. Empty = skip. The exporter endpoint stays
+            # vmd's compiled default (the host-local collector on
+            # localhost:4318). The backup alert policies read these series,
+            # so hosts they watch must have this set.
+            if [ -n {q_otel} ]; then
+                sudo sed -i '/^OTEL_METRICS_ENABLED=/d' /etc/sandbox/vmd.env
+                sudo sed -i '/^OTEL_ENVIRONMENT=/d' /etc/sandbox/vmd.env
+                echo {q_otel_enabled_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+                echo {q_otel_env_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Set HOST_ID to the instance name only when the env has no
+            # value yet. HOST_ID is the host's identity in the host table,
+            # so it must never change across deploys: heartbeats and
+            # reconciler scoping key on the existing row, and rewriting it
+            # to the instance name orphans any host whose row predates the
+            # name-matching convention. New hosts get the instance name,
+            # which is the convention for every row created since.
+            if ! sudo grep -q '^HOST_ID=' /etc/sandbox/vmd.env; then
+                echo {q_host_id_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
             # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes
             # its control socket into RuntimeDirectory=/run/secretsproxy under
             # DynamicUser; vmd connects to the same path.
@@ -422,6 +550,76 @@ def main() -> int:
                 sudo touch /etc/sandbox/vmd.env
                 sudo sed -i '/^VMD_DNS_REDIRECT_PORT=/d' /etc/sandbox/vmd.env
                 echo {q_dns_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Upsert the paused-network reclaim policy. These values are
+            # supplied by deployment config so the daemon never bakes in host
+            # defaults.
+            if [ -n {q_paused_reclaim} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_RECLAIM=/d' /etc/sandbox/vmd.env
+                echo {q_paused_reclaim_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_slot_percent} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT=/d' /etc/sandbox/vmd.env
+                echo {q_paused_slot_percent_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_slot_reserve} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE=/d' /etc/sandbox/vmd.env
+                echo {q_paused_slot_reserve_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_slot_hysteresis} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS=/d' /etc/sandbox/vmd.env
+                echo {q_paused_slot_hysteresis_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_netns_threshold} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_NETNS_THRESHOLD=/d' /etc/sandbox/vmd.env
+                echo {q_paused_netns_threshold_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_netns_hysteresis} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_NETNS_HYSTERESIS=/d' /etc/sandbox/vmd.env
+                echo {q_paused_netns_hysteresis_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_mount_threshold} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_MOUNT_THRESHOLD=/d' /etc/sandbox/vmd.env
+                echo {q_paused_mount_threshold_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_mount_hysteresis} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS=/d' /etc/sandbox/vmd.env
+                echo {q_paused_mount_hysteresis_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_min_warm_age} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_MIN_WARM_AGE=/d' /etc/sandbox/vmd.env
+                echo {q_paused_min_warm_age_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_max_reclaims} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_MAX_RECLAIMS=/d' /etc/sandbox/vmd.env
+                echo {q_paused_max_reclaims_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+            if [ -n {q_paused_cooldown} ]; then
+                sudo install -d -m 0755 /etc/sandbox
+                sudo touch /etc/sandbox/vmd.env
+                sudo sed -i '/^VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN=/d' /etc/sandbox/vmd.env
+                echo {q_paused_cooldown_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
             # Upsert the shared control-plane auth token. vmd reads it as

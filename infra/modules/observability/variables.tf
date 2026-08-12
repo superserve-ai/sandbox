@@ -33,6 +33,17 @@ variable "compute_instance_cpu_alerts" {
   default = {}
 }
 
+variable "host_maintenance_event_alerts" {
+  description = "Log-based alerts on GCE host maintenance / restart system events, keyed by logical name."
+  type = map(object({
+    display_name  = string
+    instance_name = string
+    instance_id   = string
+    documentation = optional(string, null)
+  }))
+  default = {}
+}
+
 variable "log_buckets" {
   description = "Logging bucket definitions keyed by logical name."
   type = map(object({
@@ -79,4 +90,75 @@ variable "labels" {
   description = "Labels to apply to supported resources."
   type        = map(string)
   default     = {}
+}
+
+variable "backup_alerts" {
+  description = <<-EOT
+    Alert policies over the vmd backup pipeline's Managed Prometheus
+    metrics (exported by the host-local OTel collector), scoped to one
+    cell's vmd host via the host_id metric label. host_id follows the
+    sandbox host's HOST_ID runtime env, which matches the instance name.
+    Null disables the whole set.
+  EOT
+  type = object({
+    host_id        = string
+    display_prefix = string
+    # Sustained failed upload attempts per hour. The retry backoff caps at
+    # 10 minutes, so a single permanently failing generation produces ~6
+    # attempts/hour; the default catches one stuck task on any cell while
+    # ignoring transient bucket blips that succeed on retry.
+    upload_failures_per_hour = optional(number, 4)
+    # Age of the oldest queued generation. Sparse-packed overlays upload
+    # in seconds under the default bandwidth cap, so queue residence is
+    # normally well under a minute even on a busy cell, and a 30 minute
+    # old head means the drain is stalled or the backlog is growing.
+    oldest_pending_age_seconds = optional(number, 1800)
+    # p99 of the synchronous pause-RPC backup hook. The hook is bounded
+    # by design to a marker write, an O(dirtied-bytes) staging copy, and
+    # a tens-of-KB vmstate hash: tens to low hundreds of ms. A
+    # synchronous term that scales with disk size instead of dirtied
+    # bytes lands far above that; 2s catches the class while tolerating
+    # occasional large staged overlays.
+    pause_hook_p99_seconds = optional(number, 2)
+    # How long the completion-notification outbox may stay nonzero. The
+    # outbox drains on every ack and idle tick (seconds), so an hour of
+    # standing entries means completion write-back is stalled.
+    outbox_stalled_duration = optional(string, "3600s")
+    # Fire when the host reports backup_enabled=0 (BACKUP_BUCKET unset).
+    # On in production, where a host without backup accrues unmet
+    # durability with no other signal; staging may disable backup
+    # deliberately.
+    alert_disabled_host = optional(bool, true)
+  })
+  default = null
+}
+
+variable "host_disk_alerts" {
+  description = <<-EOT
+    Alert policies over root-filesystem utilization exported by the
+    host-local OTel collector's hostmetrics receiver, scoped to one
+    cell's vmd host via the host_id metric label (stamped from HOST_ID
+    in the collector env, which matches the instance name). The metric
+    covers the root mountpoint only, so utilization means the OS disk
+    rather than the sandbox data arrays. Null disables the set.
+  EOT
+  type = object({
+    host_id        = string
+    display_prefix = string
+    # Warning threshold as a fraction of capacity. 85% still leaves
+    # working headroom for logs, package state, and deploy artifacts,
+    # so cleanup can happen deliberately instead of under pressure.
+    warning_utilization = optional(number, 0.85)
+    # Sustained window for the warning. 30 minutes filters spikes from
+    # transient files that free themselves.
+    warning_duration = optional(string, "1800s")
+    # Paging threshold. At 95% the OS disk is close to exhaustion:
+    # writes for logs, journals, and system state start failing shortly
+    # after, which takes down the host's control services.
+    critical_utilization = optional(number, 0.95)
+    # Short window on the paging path; it only debounces single-scrape
+    # blips.
+    critical_duration = optional(string, "300s")
+  })
+  default = null
 }

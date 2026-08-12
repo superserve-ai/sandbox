@@ -597,6 +597,42 @@ func mergeRow(existing []byte, task *Task) {
 	}
 }
 
+// OldestEnqueuedAt returns the earliest EnqueuedAt among queued tasks,
+// ok=false when the queue holds none. Enqueue time rather than readiness
+// deliberately: a task deferred by retry backoff is still backlog, and
+// the age gauge this feeds is about how stale the oldest owed upload is.
+func (j *Journal) OldestEnqueuedAt() (time.Time, bool, error) {
+	var oldest time.Time
+	found := false
+	err := j.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(journalBucket).ForEach(func(_, v []byte) error {
+			var t Task
+			if err := json.Unmarshal(v, &t); err != nil {
+				return nil // corrupt entries are dropped by Next, not counted
+			}
+			if !found || t.EnqueuedAt.Before(oldest) {
+				oldest = t.EnqueuedAt
+				found = true
+			}
+			return nil
+		})
+	})
+	return oldest, found, err
+}
+
+// OutboxDepth reports how many completed tasks still owe their
+// completion notification.
+func (j *Journal) OutboxDepth() (int, error) {
+	n := 0
+	err := j.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(outboxBucket).ForEach(func(_, _ []byte) error {
+			n++
+			return nil
+		})
+	})
+	return n, err
+}
+
 // Pending reports queue depth per priority, the uploader's lag gauge.
 func (j *Journal) Pending() (map[Priority]int, error) {
 	counts := map[Priority]int{}

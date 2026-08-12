@@ -79,7 +79,18 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 	}
 	defer unlockOp()
 
-	inst, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath())
+	var resumeNetworkRules *sandboxNetworkRules
+	if netCfg := req.GetSandboxNetwork(); netCfg != nil {
+		egress := netCfg.GetEgress()
+		if egress != nil {
+			resumeNetworkRules = &sandboxNetworkRules{
+				allowedCIDRs:   egress.GetAllowedCidrs(),
+				deniedCIDRs:    egress.GetDeniedCidrs(),
+				allowedDomains: egress.GetAllowedDomains(),
+			}
+		}
+	}
+	inst, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
 	if err != nil {
 		return nil, err
 	}
@@ -394,22 +405,13 @@ func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.Updat
 		return nil, err
 	}
 
-	// Update nftables rules (non-TCP traffic).
-	if err := a.mgr.netMgr.UpdateFirewallRules(vmID, egress.GetAllowedCidrs(), egress.GetDeniedCidrs()); err != nil {
-		return nil, status.Errorf(codes.Internal, "update firewall rules: %v", err)
-	}
-
-	// Update egress proxy rules (TCP traffic — domain + CIDR filtering).
-	if a.mgr.egressProxy != nil {
-		netInfo := a.mgr.netMgr.GetVMNetInfo(vmID)
-		if netInfo != nil {
-			a.mgr.egressProxy.SetRules(netInfo.HostIP, &network.EgressRules{
-				AllowedCIDRs:   egress.GetAllowedCidrs(),
-				DeniedCIDRs:    egress.GetDeniedCidrs(),
-				AllowedDomains: egress.GetAllowedDomains(),
-				SandboxID:      vmID,
-			})
-		}
+	netInfo := a.mgr.netMgr.GetVMNetInfo(vmID)
+	if err := a.mgr.applySandboxNetworkRules(vmID, netInfo, &sandboxNetworkRules{
+		allowedCIDRs:   egress.GetAllowedCidrs(),
+		deniedCIDRs:    egress.GetDeniedCidrs(),
+		allowedDomains: egress.GetAllowedDomains(),
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 
 	return &vmdpb.UpdateSandboxNetworkResponse{VmId: vmID}, nil

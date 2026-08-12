@@ -209,6 +209,7 @@ def main() -> int:
             sudo tee /etc/sandbox/otel/collector.env >/dev/null <<'OTELENV'
             GCP_PROJECT={collector_project}
             GCP_ZONE={zone_name}
+            HOST_ID={name}
             OTELENV
             sudo chmod 0644 /etc/sandbox/otel/collector.env
 

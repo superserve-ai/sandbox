@@ -337,6 +337,29 @@ module "observability" {
       instance_id   = module.sandbox_host.instance_id
     }
   }
+  # Backup pipeline alerts scoped to this cell's host via the host_id
+  # metric label (HOST_ID on the host matches the instance name). Module
+  # defaults hold regardless of the cell's traffic: the failure-rate
+  # threshold keys on retry pressure (one stuck generation retries ~6
+  # times/hour under the capped backoff), not on pause volume.
+  backup_alerts = {
+    host_id        = module.sandbox_host.instance_name
+    display_prefix = "Backup / ${module.sandbox_host.instance_name}"
+  }
+  # Root-filesystem (OS disk) utilization for the same host, scoped through
+  # the same host_id label the backup metrics use. Module defaults: warn at
+  # 85% sustained 30 minutes, page at 95%.
+  host_disk_alerts = {
+    host_id        = module.sandbox_host.instance_name
+    display_prefix = "Infrastructure / ${module.sandbox_host.instance_name}"
+  }
+  host_maintenance_event_alerts = {
+    sandbox_host = {
+      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / host maintenance event"
+      instance_name = module.sandbox_host.instance_name
+      instance_id   = module.sandbox_host.instance_id
+    }
+  }
   labels = local.common_labels
 }
 

@@ -39,6 +39,13 @@ func (m *Manager) cgroupLaunch(existing Supervision) bool {
 // stop before a cgroup launch; freshUnit is the systemd linger-skip hint,
 // ignored on the cgroup path.
 func (m *Manager) launchFirecracker(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error) {
+	if m.launchFirecrackerHook != nil {
+		return m.launchFirecrackerHook(ctx, vmID, socketPath, perVMRootfs, basePath, netNS, existing, hadPriorLife, freshUnit)
+	}
+	return m.launchFirecrackerImpl(ctx, vmID, socketPath, perVMRootfs, basePath, netNS, existing, hadPriorLife, freshUnit)
+}
+
+func (m *Manager) launchFirecrackerImpl(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error) {
 	if !knownSupervision(existing) {
 		// A launch over an unknown mode could double-spawn: the prior-life
 		// stop below only clears units, and no oracle can prove what an

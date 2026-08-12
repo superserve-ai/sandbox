@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -365,4 +367,54 @@ func TestReaper_LoopRunsImmediately(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("reaper did not run immediately on startup")
+}
+
+// rollbackPausedVM must persist the resumed host/IP before it flips the row
+// back to active, otherwise the DB can keep advertising a recycled slot.
+func TestRollbackPausedVM_PersistsReplacementHostAndIP(t *testing.T) {
+	resumeIP := "10.11.0.99"
+	var callOrder []string
+	var gotHost string
+	var gotIP string
+	var gotPID *int32
+
+	h := &Handlers{
+		VMD: &stubVMD{resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
+			return resumeIP, nil
+		}},
+		DB: db.New(&reaperMockDBTX{
+			execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+				switch {
+				case strings.Contains(sql, "SET host_id = $2, ip_address = $3, pid = COALESCE($4, pid)"):
+					callOrder = append(callOrder, "host")
+					gotHost = args[1].(string)
+					gotIP = args[2].(*netip.Addr).String()
+					gotPID = args[3].(*int32)
+				case strings.Contains(sql, "SET status = $2"):
+					callOrder = append(callOrder, "status")
+				}
+				return pgconn.CommandTag{}, nil
+			},
+		}),
+	}
+
+	sbx := db.ClaimExpiredSandboxesRow{
+		ID:            uuid.New(),
+		TeamID:        uuid.New(),
+		HostID:        "host-1",
+		Name:          "sbx",
+		NetworkConfig: []byte(`{"allowed_cidrs":["10.0.0.0/8"]}`),
+	}
+
+	h.rollbackPausedVM(context.Background(), sbx, "/snapshots/vmstate.snap", "/snapshots/mem.snap", errors.New("pause write failed"), zerolog.Nop())
+
+	if gotHost != "host-1" || gotIP != resumeIP {
+		t.Fatalf("replacement host/IP = %q/%q, want host-1/%s", gotHost, gotIP, resumeIP)
+	}
+	if gotPID != nil {
+		t.Fatalf("replacement pid arg = %#v, want nil to preserve the existing PID", gotPID)
+	}
+	if strings.Join(callOrder, ",") != "host,status" {
+		t.Fatalf("rollback write order = %v, want host then status", callOrder)
+	}
 }
