@@ -33,6 +33,11 @@ const sandboxScope = `sandbox_id IN (SELECT id FROM sandbox WHERE team_id = $1)`
 const manifestScope = `(snapshot_id IN (SELECT id FROM snapshot WHERE team_id = $1)
 	OR template_id IN (SELECT id FROM template WHERE team_id = $1))`
 
+// backupGenerationScope covers backup_generation, whose rows hang off
+// exactly one of sandbox or template (no team_id column of their own).
+const backupGenerationScope = `(sandbox_id IN (SELECT id FROM sandbox WHERE team_id = $1)
+	OR template_id IN (SELECT id FROM template WHERE team_id = $1))`
+
 type tableSpec struct {
 	name  string
 	scope string
@@ -94,6 +99,10 @@ var migratedTables = []tableSpec{
 	// Integrity manifests hang off snapshots and templates; both parents
 	// are in scope by this point in the FK order.
 	{"artifact_manifest", manifestScope},
+	// Backup coverage rows hang off sandboxes and templates; the source
+	// cell's bucket names stay meaningful because buckets are recorded
+	// per row, so the destination knows which cell bucket holds the bytes.
+	{"backup_generation", backupGenerationScope},
 	{"sandbox_secret", sandboxScope},
 	{"sandbox_active_interval", "team_id = $1"},
 	{"sandbox_compute_billing_interval", "team_id = $1"},
