@@ -233,6 +233,12 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 	}
 	for i := 0; i < workers; i++ {
 		p.wg.Add(1)
+		// Declared active before the goroutine is even scheduled — a create
+		// racing boot must see the pool as producing, or it commits to an
+		// inline build against the imminent refill (the same synchronous
+		// publication StartAdoption makes for its phase). The worker inherits
+		// the declaration and relinquishes it on backoff, pause, or exit.
+		p.refillActive.Add(1)
 		go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
 	}
 
@@ -906,8 +912,10 @@ func (p *Pool) refillLoop(ctx context.Context) {
 	// broadcast wake claimants into the instant where the count reads zero,
 	// and they would bail to inline builds against a producer that is
 	// committed to its next slot. Zero is exposed only at backoff, pause,
-	// and shutdown, when the pool genuinely promises nothing.
-	active := false
+	// and shutdown, when the pool genuinely promises nothing. The initial
+	// declaration was published synchronously by StartPool; this loop only
+	// ever relinquishes and re-acquires it.
+	active := true
 	deactivate := func() {
 		if active {
 			active = false
