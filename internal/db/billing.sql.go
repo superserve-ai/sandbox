@@ -454,22 +454,23 @@ func (q *Queries) GetTeamActivePricingPlan(ctx context.Context, teamID uuid.UUID
 }
 
 const getTeamBillingAccount = `-- name: GetTeamBillingAccount :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
 FROM team_billing_account
 WHERE team_id = $1
 `
 
 type GetTeamBillingAccountRow struct {
-	TeamID                   uuid.UUID          `json:"team_id"`
-	StripeCustomerID         *string            `json:"stripe_customer_id"`
-	StripeSubscriptionID     *string            `json:"stripe_subscription_id"`
-	StripeSubscriptionStatus *string            `json:"stripe_subscription_status"`
-	StripeInvoiceStatus      *string            `json:"stripe_invoice_status"`
-	CurrentPeriodStart       pgtype.Timestamptz `json:"current_period_start"`
-	CurrentPeriodEnd         pgtype.Timestamptz `json:"current_period_end"`
-	CancelAtPeriodEnd        bool               `json:"cancel_at_period_end"`
-	CreatedAt                time.Time          `json:"created_at"`
-	UpdatedAt                time.Time          `json:"updated_at"`
+	TeamID                    uuid.UUID          `json:"team_id"`
+	StripeCustomerID          *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID      *string            `json:"stripe_subscription_id"`
+	StripeSubscriptionStatus  *string            `json:"stripe_subscription_status"`
+	StripeInvoiceStatus       *string            `json:"stripe_invoice_status"`
+	StripeSubscriptionEventAt pgtype.Timestamptz `json:"stripe_subscription_event_at"`
+	CurrentPeriodStart        pgtype.Timestamptz `json:"current_period_start"`
+	CurrentPeriodEnd          pgtype.Timestamptz `json:"current_period_end"`
+	CancelAtPeriodEnd         bool               `json:"cancel_at_period_end"`
+	CreatedAt                 time.Time          `json:"created_at"`
+	UpdatedAt                 time.Time          `json:"updated_at"`
 }
 
 func (q *Queries) GetTeamBillingAccount(ctx context.Context, teamID uuid.UUID) (GetTeamBillingAccountRow, error) {
@@ -481,6 +482,7 @@ func (q *Queries) GetTeamBillingAccount(ctx context.Context, teamID uuid.UUID) (
 		&i.StripeSubscriptionID,
 		&i.StripeSubscriptionStatus,
 		&i.StripeInvoiceStatus,
+		&i.StripeSubscriptionEventAt,
 		&i.CurrentPeriodStart,
 		&i.CurrentPeriodEnd,
 		&i.CancelAtPeriodEnd,
@@ -491,22 +493,23 @@ func (q *Queries) GetTeamBillingAccount(ctx context.Context, teamID uuid.UUID) (
 }
 
 const getTeamBillingAccountByStripeCustomerID = `-- name: GetTeamBillingAccountByStripeCustomerID :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
 FROM team_billing_account
 WHERE stripe_customer_id = $1
 `
 
 type GetTeamBillingAccountByStripeCustomerIDRow struct {
-	TeamID                   uuid.UUID          `json:"team_id"`
-	StripeCustomerID         *string            `json:"stripe_customer_id"`
-	StripeSubscriptionID     *string            `json:"stripe_subscription_id"`
-	StripeSubscriptionStatus *string            `json:"stripe_subscription_status"`
-	StripeInvoiceStatus      *string            `json:"stripe_invoice_status"`
-	CurrentPeriodStart       pgtype.Timestamptz `json:"current_period_start"`
-	CurrentPeriodEnd         pgtype.Timestamptz `json:"current_period_end"`
-	CancelAtPeriodEnd        bool               `json:"cancel_at_period_end"`
-	CreatedAt                time.Time          `json:"created_at"`
-	UpdatedAt                time.Time          `json:"updated_at"`
+	TeamID                    uuid.UUID          `json:"team_id"`
+	StripeCustomerID          *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID      *string            `json:"stripe_subscription_id"`
+	StripeSubscriptionStatus  *string            `json:"stripe_subscription_status"`
+	StripeInvoiceStatus       *string            `json:"stripe_invoice_status"`
+	StripeSubscriptionEventAt pgtype.Timestamptz `json:"stripe_subscription_event_at"`
+	CurrentPeriodStart        pgtype.Timestamptz `json:"current_period_start"`
+	CurrentPeriodEnd          pgtype.Timestamptz `json:"current_period_end"`
+	CancelAtPeriodEnd         bool               `json:"cancel_at_period_end"`
+	CreatedAt                 time.Time          `json:"created_at"`
+	UpdatedAt                 time.Time          `json:"updated_at"`
 }
 
 func (q *Queries) GetTeamBillingAccountByStripeCustomerID(ctx context.Context, stripeCustomerID *string) (GetTeamBillingAccountByStripeCustomerIDRow, error) {
@@ -518,6 +521,7 @@ func (q *Queries) GetTeamBillingAccountByStripeCustomerID(ctx context.Context, s
 		&i.StripeSubscriptionID,
 		&i.StripeSubscriptionStatus,
 		&i.StripeInvoiceStatus,
+		&i.StripeSubscriptionEventAt,
 		&i.CurrentPeriodStart,
 		&i.CurrentPeriodEnd,
 		&i.CancelAtPeriodEnd,
@@ -1742,7 +1746,7 @@ VALUES ($1, $2)
 ON CONFLICT (team_id) DO UPDATE
 SET stripe_customer_id = EXCLUDED.stripe_customer_id,
     updated_at = now()
-RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
 `
 
 type UpsertTeamBillingAccountCustomerParams struct {
@@ -1758,12 +1762,13 @@ func (q *Queries) UpsertTeamBillingAccountCustomer(ctx context.Context, arg Upse
 		&i.StripeCustomerID,
 		&i.StripeSubscriptionID,
 		&i.StripeSubscriptionStatus,
+		&i.StripeInvoiceStatus,
+		&i.StripeSubscriptionEventAt,
 		&i.CurrentPeriodStart,
 		&i.CurrentPeriodEnd,
 		&i.CancelAtPeriodEnd,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.StripeInvoiceStatus,
 	)
 	return i, err
 }
@@ -1775,6 +1780,7 @@ INSERT INTO team_billing_account (
     stripe_subscription_id,
     stripe_subscription_status,
     stripe_invoice_status,
+    stripe_subscription_event_at,
     current_period_start,
     current_period_end,
     cancel_at_period_end
@@ -1787,29 +1793,32 @@ VALUES (
     $5,
     $6,
     $7,
-    COALESCE($8, false)
+    $8,
+    COALESCE($9, false)
 )
 ON CONFLICT (team_id) DO UPDATE
 SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_account.stripe_customer_id),
     stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, team_billing_account.stripe_subscription_id),
     stripe_subscription_status = COALESCE(EXCLUDED.stripe_subscription_status, team_billing_account.stripe_subscription_status),
     stripe_invoice_status = COALESCE(EXCLUDED.stripe_invoice_status, team_billing_account.stripe_invoice_status),
+    stripe_subscription_event_at = COALESCE(EXCLUDED.stripe_subscription_event_at, team_billing_account.stripe_subscription_event_at),
     current_period_start = COALESCE(EXCLUDED.current_period_start, team_billing_account.current_period_start),
     current_period_end = COALESCE(EXCLUDED.current_period_end, team_billing_account.current_period_end),
-    cancel_at_period_end = COALESCE($8, team_billing_account.cancel_at_period_end),
+    cancel_at_period_end = COALESCE($9, team_billing_account.cancel_at_period_end),
     updated_at = now()
-RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
 `
 
 type UpsertTeamBillingAccountSubscriptionParams struct {
-	TeamID                   uuid.UUID          `json:"team_id"`
-	StripeCustomerID         *string            `json:"stripe_customer_id"`
-	StripeSubscriptionID     *string            `json:"stripe_subscription_id"`
-	StripeSubscriptionStatus *string            `json:"stripe_subscription_status"`
-	StripeInvoiceStatus      *string            `json:"stripe_invoice_status"`
-	CurrentPeriodStart       pgtype.Timestamptz `json:"current_period_start"`
-	CurrentPeriodEnd         pgtype.Timestamptz `json:"current_period_end"`
-	CancelAtPeriodEnd        interface{}        `json:"cancel_at_period_end"`
+	TeamID                    uuid.UUID          `json:"team_id"`
+	StripeCustomerID          *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID      *string            `json:"stripe_subscription_id"`
+	StripeSubscriptionStatus  *string            `json:"stripe_subscription_status"`
+	StripeInvoiceStatus       *string            `json:"stripe_invoice_status"`
+	StripeSubscriptionEventAt pgtype.Timestamptz `json:"stripe_subscription_event_at"`
+	CurrentPeriodStart        pgtype.Timestamptz `json:"current_period_start"`
+	CurrentPeriodEnd          pgtype.Timestamptz `json:"current_period_end"`
+	CancelAtPeriodEnd         interface{}        `json:"cancel_at_period_end"`
 }
 
 func (q *Queries) UpsertTeamBillingAccountSubscription(ctx context.Context, arg UpsertTeamBillingAccountSubscriptionParams) (TeamBillingAccount, error) {
@@ -1819,6 +1828,7 @@ func (q *Queries) UpsertTeamBillingAccountSubscription(ctx context.Context, arg 
 		arg.StripeSubscriptionID,
 		arg.StripeSubscriptionStatus,
 		arg.StripeInvoiceStatus,
+		arg.StripeSubscriptionEventAt,
 		arg.CurrentPeriodStart,
 		arg.CurrentPeriodEnd,
 		arg.CancelAtPeriodEnd,
@@ -1829,12 +1839,13 @@ func (q *Queries) UpsertTeamBillingAccountSubscription(ctx context.Context, arg 
 		&i.StripeCustomerID,
 		&i.StripeSubscriptionID,
 		&i.StripeSubscriptionStatus,
+		&i.StripeInvoiceStatus,
+		&i.StripeSubscriptionEventAt,
 		&i.CurrentPeriodStart,
 		&i.CurrentPeriodEnd,
 		&i.CancelAtPeriodEnd,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.StripeInvoiceStatus,
 	)
 	return i, err
 }

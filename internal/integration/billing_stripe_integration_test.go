@@ -191,6 +191,41 @@ func stripeSignature(t *testing.T, payload []byte, ts time.Time) string {
 	return fmt.Sprintf("t=%d,v1=%s", ts.Unix(), hex.EncodeToString(mac.Sum(nil)))
 }
 
+func derefString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+func stripeSubscriptionWebhookPayload(t *testing.T, eventID, eventType, subscriptionID, customerID, status string, created, periodStart, periodEnd time.Time) []byte {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"id":      eventID,
+		"type":    eventType,
+		"created": created.Unix(),
+		"data": map[string]any{
+			"object": map[string]any{
+				"id":       subscriptionID,
+				"customer": customerID,
+				"status":   status,
+				"items": map[string]any{
+					"data": []map[string]any{
+						{
+							"current_period_start": periodStart.Unix(),
+							"current_period_end":   periodEnd.Unix(),
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal subscription webhook payload: %v", err)
+	}
+	return payload
+}
+
 func doRequest(r *gin.Engine, req *http.Request) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -675,22 +710,8 @@ func TestIntegration_StripeWebhookDuplicateDeliveryIsSafe(t *testing.T) {
 	_ = periodID
 	r := newBillingRouter(t, &fakeStripeClient{})
 
-	payload, err := json.Marshal(map[string]any{
-		"id":   "evt_test_duplicate",
-		"type": "customer.subscription.updated",
-		"data": map[string]any{
-			"object": map[string]any{
-				"id":                   "sub_duplicate",
-				"customer":             "cus_test_period",
-				"status":               "active",
-				"current_period_start": time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC).Unix(),
-				"current_period_end":   time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC).Unix(),
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("marshal webhook payload: %v", err)
-	}
+	createdAt := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	payload := stripeSubscriptionWebhookPayload(t, "evt_test_duplicate", "customer.subscription.created", "sub_duplicate", "cus_"+teamID.String(), "active", createdAt, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
 	sig := stripeSignature(t, payload, time.Now().UTC())
 
 	for i := 0; i < 2; i++ {
@@ -712,6 +733,73 @@ func TestIntegration_StripeWebhookDuplicateDeliveryIsSafe(t *testing.T) {
 	}
 	if got := billingPeriodStatus(t, teamID, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)); got != "approved" {
 		t.Fatalf("duplicate webhook changed unrelated billing period status to %q", got)
+	}
+	account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load billing account: %v", err)
+	}
+	if !account.CurrentPeriodStart.Valid || !account.CurrentPeriodStart.Time.Equal(time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("subscription current period start = %v, want 2026-07-01", account.CurrentPeriodStart)
+	}
+	if !account.CurrentPeriodEnd.Valid || !account.CurrentPeriodEnd.Time.Equal(time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("subscription current period end = %v, want 2026-08-01", account.CurrentPeriodEnd)
+	}
+	if !account.StripeSubscriptionEventAt.Valid || !account.StripeSubscriptionEventAt.Time.Equal(createdAt) {
+		t.Fatalf("subscription event at = %v, want %v", account.StripeSubscriptionEventAt, createdAt)
+	}
+}
+
+func TestIntegration_StripeWebhookIgnoresForeignOrStaleSubscriptionEvents(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
+	r := newBillingRouter(t, &fakeStripeClient{})
+
+	currentCreated := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	currentPayload := stripeSubscriptionWebhookPayload(t, "evt_subscription_current", "customer.subscription.created", "sub_current", "cus_"+teamID.String(), "active", currentCreated, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+	currentSig := stripeSignature(t, currentPayload, time.Now().UTC())
+	req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(currentPayload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", currentSig)
+	if w := doRequest(r, req); w.Code != http.StatusOK {
+		t.Fatalf("current subscription webhook: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	foreignPayload := stripeSubscriptionWebhookPayload(t, "evt_subscription_foreign", "customer.subscription.deleted", "sub_foreign", "cus_"+teamID.String(), "canceled", currentCreated.Add(2*time.Hour), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	foreignSig := stripeSignature(t, foreignPayload, time.Now().UTC())
+	req = httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(foreignPayload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", foreignSig)
+	if w := doRequest(r, req); w.Code != http.StatusOK {
+		t.Fatalf("foreign subscription webhook: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	stalePayload := stripeSubscriptionWebhookPayload(t, "evt_subscription_stale", "customer.subscription.updated", "sub_current", "cus_"+teamID.String(), "past_due", currentCreated.Add(-2*time.Hour), time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC))
+	staleSig := stripeSignature(t, stalePayload, time.Now().UTC())
+	req = httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(stalePayload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", staleSig)
+	if w := doRequest(r, req); w.Code != http.StatusOK {
+		t.Fatalf("stale subscription webhook: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load billing account: %v", err)
+	}
+	if account.StripeSubscriptionID == nil || *account.StripeSubscriptionID != "sub_current" {
+		t.Fatalf("subscription id = %q, want sub_current", derefString(account.StripeSubscriptionID))
+	}
+	if account.StripeSubscriptionStatus == nil || *account.StripeSubscriptionStatus != "active" {
+		t.Fatalf("subscription status = %q, want active", derefString(account.StripeSubscriptionStatus))
+	}
+	if !account.CurrentPeriodStart.Valid || !account.CurrentPeriodStart.Time.Equal(time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("current period start = %v, want 2026-07-01", account.CurrentPeriodStart)
+	}
+	if !account.CurrentPeriodEnd.Valid || !account.CurrentPeriodEnd.Time.Equal(time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("current period end = %v, want 2026-08-01", account.CurrentPeriodEnd)
+	}
+	if !account.StripeSubscriptionEventAt.Valid || !account.StripeSubscriptionEventAt.Time.Equal(currentCreated) {
+		t.Fatalf("subscription event at = %v, want %v", account.StripeSubscriptionEventAt, currentCreated)
 	}
 }
 

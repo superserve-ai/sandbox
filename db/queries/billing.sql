@@ -421,12 +421,12 @@ WHERE billing_period_anomaly.id = sqlc.arg(id)
 RETURNING *;
 
 -- name: GetTeamBillingAccount :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
 FROM team_billing_account
 WHERE team_id = sqlc.arg(team_id);
 
 -- name: GetTeamBillingAccountByStripeCustomerID :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
 FROM team_billing_account
 WHERE stripe_customer_id = sqlc.arg(stripe_customer_id);
 
@@ -445,6 +445,7 @@ INSERT INTO team_billing_account (
     stripe_subscription_id,
     stripe_subscription_status,
     stripe_invoice_status,
+    stripe_subscription_event_at,
     current_period_start,
     current_period_end,
     cancel_at_period_end
@@ -455,6 +456,7 @@ VALUES (
     sqlc.narg(stripe_subscription_id),
     sqlc.narg(stripe_subscription_status),
     sqlc.narg(stripe_invoice_status),
+    sqlc.narg(stripe_subscription_event_at),
     sqlc.narg(current_period_start),
     sqlc.narg(current_period_end),
     COALESCE(sqlc.narg(cancel_at_period_end), false)
@@ -464,6 +466,7 @@ SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_acco
     stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, team_billing_account.stripe_subscription_id),
     stripe_subscription_status = COALESCE(EXCLUDED.stripe_subscription_status, team_billing_account.stripe_subscription_status),
     stripe_invoice_status = COALESCE(EXCLUDED.stripe_invoice_status, team_billing_account.stripe_invoice_status),
+    stripe_subscription_event_at = COALESCE(EXCLUDED.stripe_subscription_event_at, team_billing_account.stripe_subscription_event_at),
     current_period_start = COALESCE(EXCLUDED.current_period_start, team_billing_account.current_period_start),
     current_period_end = COALESCE(EXCLUDED.current_period_end, team_billing_account.current_period_end),
     cancel_at_period_end = COALESCE(sqlc.narg(cancel_at_period_end), team_billing_account.cancel_at_period_end),

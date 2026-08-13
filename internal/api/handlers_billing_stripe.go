@@ -178,9 +178,10 @@ type billingSessionResponse struct {
 }
 
 type stripeEventEnvelope struct {
-	ID   string                  `json:"id"`
-	Type string                  `json:"type"`
-	Data stripeEventEnvelopeData `json:"data"`
+	ID      string                  `json:"id"`
+	Type    string                  `json:"type"`
+	Created int64                   `json:"created"`
+	Data    stripeEventEnvelopeData `json:"data"`
 }
 
 type stripeEventEnvelopeData struct {
@@ -188,12 +189,22 @@ type stripeEventEnvelopeData struct {
 }
 
 type stripeSubscriptionObject struct {
-	ID                 string `json:"id"`
-	Customer           string `json:"customer"`
-	Status             string `json:"status"`
-	CurrentPeriodStart int64  `json:"current_period_start"`
-	CurrentPeriodEnd   int64  `json:"current_period_end"`
-	CancelAtPeriodEnd  bool   `json:"cancel_at_period_end"`
+	ID                 string                        `json:"id"`
+	Customer           string                        `json:"customer"`
+	Status             string                        `json:"status"`
+	CurrentPeriodStart int64                         `json:"current_period_start"`
+	CurrentPeriodEnd   int64                         `json:"current_period_end"`
+	CancelAtPeriodEnd  bool                          `json:"cancel_at_period_end"`
+	Items              stripeSubscriptionObjectItems `json:"items"`
+}
+
+type stripeSubscriptionObjectItems struct {
+	Data []stripeSubscriptionItem `json:"data"`
+}
+
+type stripeSubscriptionItem struct {
+	CurrentPeriodStart int64 `json:"current_period_start"`
+	CurrentPeriodEnd   int64 `json:"current_period_end"`
 }
 
 type stripeCheckoutCompletedObject struct {
@@ -1354,6 +1365,7 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 }
 
 func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries, event stripeEventEnvelope) error {
+	eventAt := stripeEventTime(event.Created)
 	switch event.Type {
 	case "checkout.session.completed":
 		var obj stripeCheckoutCompletedObject
@@ -1382,14 +1394,33 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 			}
 			return err
 		}
+		if obj.ID == "" {
+			return nil
+		}
+		if eventAt.IsZero() {
+			return nil
+		}
+		if account.StripeSubscriptionEventAt.Valid && !eventAt.After(account.StripeSubscriptionEventAt.Time.UTC()) {
+			return nil
+		}
+		if event.Type != "customer.subscription.created" {
+			if account.StripeSubscriptionID == nil || *account.StripeSubscriptionID != obj.ID {
+				return nil
+			}
+		}
+		start, end, ok := stripeSubscriptionPeriodBounds(obj)
+		if !ok {
+			return nil
+		}
 		_, err = q.UpsertTeamBillingAccountSubscription(ctx, db.UpsertTeamBillingAccountSubscriptionParams{
-			TeamID:                   account.TeamID,
-			StripeCustomerID:         stringPtr(obj.Customer),
-			StripeSubscriptionID:     stringPtr(obj.ID),
-			StripeSubscriptionStatus: stringPtr(obj.Status),
-			CurrentPeriodStart:       timestamptzFromUnix(obj.CurrentPeriodStart),
-			CurrentPeriodEnd:         timestamptzFromUnix(obj.CurrentPeriodEnd),
-			CancelAtPeriodEnd:        boolPtr(obj.CancelAtPeriodEnd),
+			TeamID:                    account.TeamID,
+			StripeCustomerID:          stringPtr(obj.Customer),
+			StripeSubscriptionID:      stringPtr(obj.ID),
+			StripeSubscriptionStatus:  stringPtr(obj.Status),
+			CurrentPeriodStart:        timestamptzFromUnix(start),
+			CurrentPeriodEnd:          timestamptzFromUnix(end),
+			CancelAtPeriodEnd:         boolPtr(obj.CancelAtPeriodEnd),
+			StripeSubscriptionEventAt: timestamptzFromUnix(event.Created),
 		})
 		return err
 	case "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
@@ -1977,6 +2008,25 @@ func stripeMeterQuantity(hours float64) (string, bool) {
 		return "", false
 	}
 	return strconv.FormatInt(int64(seconds), 10), true
+}
+
+func stripeSubscriptionPeriodBounds(obj stripeSubscriptionObject) (int64, int64, bool) {
+	if obj.CurrentPeriodStart > 0 && obj.CurrentPeriodEnd > 0 {
+		return obj.CurrentPeriodStart, obj.CurrentPeriodEnd, true
+	}
+	for _, item := range obj.Items.Data {
+		if item.CurrentPeriodStart > 0 && item.CurrentPeriodEnd > 0 {
+			return item.CurrentPeriodStart, item.CurrentPeriodEnd, true
+		}
+	}
+	return 0, 0, false
+}
+
+func stripeEventTime(v int64) time.Time {
+	if v <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(v, 0).UTC()
 }
 
 func checkoutSessionIdempotencyKey(teamID uuid.UUID, customerID, successURL, cancelURL string, priceIDs []string) string {
