@@ -130,7 +130,7 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	if _, err := os.Stat(filepath.Join(cgroupMount, "cgroup.controllers")); err != nil {
 		return false, fatalIfManaging(fmt.Errorf("cgroup v2 unified hierarchy required: %w", err))
 	}
-	tree, err := adoptVmsScope(ctx, m.cfg.BareVMCgroups)
+	tree, wasBare, err := adoptVmsScope(ctx, m.cfg.BareVMCgroups)
 	if err != nil {
 		return false, fatalIfManaging(fmt.Errorf("adopt delegated VM scope (%s): %w", vmsUnitName, err))
 	}
@@ -156,6 +156,9 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 			if derr := disableChildControllers(filepath.Join(tree.vms, "cgroup.subtree_control")); derr != nil {
 				m.log.Error().Err(derr).Msg("bare vm cgroups requested but child controllers remain enabled — launches pay full cgroup-creation cost")
 			}
+		} else if !wasBare {
+			// No bare→controllers transition happened; the restore would be
+			// a per-live-VM scan for nothing on every ordinary startup.
 		} else if n, cerr := restoreChildOOMGroup(tree); cerr != nil {
 			// The reverse convergence: re-enabling the memory controller
 			// re-exposes memory.oom.group on already-running children, but at
@@ -420,35 +423,39 @@ func (m *Manager) hasCgroupRecords() (bool, error) {
 // their files (bare children get none; the caller converges the host).
 // No memory.max here: the subtree lives under sandboxes.slice and inherits its
 // 95% ceiling hierarchically. Idempotent across vmd restarts.
-func adoptVmsScope(ctx context.Context, bare bool) (*cgroupTree, error) {
+// The second return reports whether the children lacked the memory
+// controller before this call enabled it — i.e. the host was previously
+// bare — so the caller runs the oom.group restore only when a transition
+// actually happened, never as unconditional per-VM startup work.
+func adoptVmsScope(ctx context.Context, bare bool) (*cgroupTree, bool, error) {
 	rel, err := unitControlGroup(ctx, vmsUnitName)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if rel == "" {
-		return nil, fmt.Errorf("%s has no ControlGroup (not loaded/active?)", vmsUnitName)
+		return nil, false, fmt.Errorf("%s has no ControlGroup (not loaded/active?)", vmsUnitName)
 	}
 	if !strings.Contains(rel, "/sandboxes.slice/") {
-		return nil, fmt.Errorf("%s ControlGroup %q is not under sandboxes.slice", vmsUnitName, rel)
+		return nil, false, fmt.Errorf("%s ControlGroup %q is not under sandboxes.slice", vmsUnitName, rel)
 	}
 	t := &cgroupTree{
 		vms:    filepath.Join(cgroupMount, rel),
 		keeper: filepath.Join(cgroupMount, rel, keeperSubdir),
 	}
 	if err := os.Mkdir(t.keeper, 0o755); err != nil && !os.IsExist(err) {
-		return nil, fmt.Errorf("mkdir keeper: %w", err)
+		return nil, false, fmt.Errorf("mkdir keeper: %w", err)
 	}
 	// Move any process still in the delegated root (the keeper on first
 	// bootstrap; none on a restart) into keeper/, so controllers can be enabled
 	// on the now-empty root. Per-VM groups live in vms/<id>, not here.
 	pids, err := readCgroupProcs(t.vms)
 	if err != nil {
-		return nil, fmt.Errorf("read scope root procs: %w", err)
+		return nil, false, fmt.Errorf("read scope root procs: %w", err)
 	}
 	for _, pid := range pids {
 		if err := os.WriteFile(filepath.Join(t.keeper, "cgroup.procs"),
 			[]byte(strconv.Itoa(pid)), 0o644); err != nil {
-			return nil, fmt.Errorf("move keeper pid %d: %w", pid, err)
+			return nil, false, fmt.Errorf("move keeper pid %d: %w", pid, err)
 		}
 	}
 	subtree := filepath.Join(t.vms, "cgroup.subtree_control")
@@ -456,13 +463,21 @@ func adoptVmsScope(ctx context.Context, bare bool) (*cgroupTree, error) {
 		// No controllers on the children (see ManagerConfig.BareVMCgroups
 		// for the why and the trade). The caller runs
 		// disableChildControllers to converge a previously-enabled host.
-		return t, nil
+		return t, false, nil
+	}
+	// Captured BEFORE the enable below overwrites the evidence: memory
+	// already present means the host was never bare and nothing needs the
+	// oom.group restore. An unreadable value reads as "was bare" — the
+	// restore is cheap and idempotent, skipping a needed repair is not.
+	wasBare := true
+	if cur, rerr := os.ReadFile(subtree); rerr == nil {
+		wasBare = !subtreeHasController(string(cur), "memory")
 	}
 	// root's subtree_control gives its children (vms/<id>/) their controller
 	// files. memory+pids are REQUIRED — per-VM memory.oom.group must exist or
 	// createVMCgroup fails — so a failure here is a fail-closed arm refusal.
 	if err := os.WriteFile(subtree, []byte("+memory +pids"), 0o644); err != nil {
-		return nil, fmt.Errorf("enable memory/pids on scope root: %w", err)
+		return nil, false, fmt.Errorf("enable memory/pids on scope root: %w", err)
 	}
 	// cpu+io make each per-VM cgroup its OWN scheduling domain at the default
 	// weight 100 — one peer of every other direct VM and of each legacy
@@ -471,7 +486,18 @@ func adoptVmsScope(ctx context.Context, bare bool) (*cgroupTree, error) {
 	// CFS (per-thread) as before, which is a fairness downgrade, not a
 	// safety one — never worth refusing to arm over.
 	_ = os.WriteFile(subtree, []byte("+cpu +io"), 0o644)
-	return t, nil
+	return t, wasBare, nil
+}
+
+// subtreeHasController reports whether a cgroup.subtree_control value lists
+// the named controller.
+func subtreeHasController(val, name string) bool {
+	for _, f := range strings.Fields(val) {
+		if f == name {
+			return true
+		}
+	}
+	return false
 }
 
 // disableChildControllers turns off every controller currently enabled in the

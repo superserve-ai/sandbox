@@ -499,3 +499,22 @@ func TestRestoreChildOOMGroup(t *testing.T) {
 		t.Error("a child without the memory controller must not gain the file")
 	}
 }
+
+// The oom.group restore is gated on an actual bare→controllers transition:
+// memory already enabled before adoption means the host was never bare, and
+// no per-VM startup scan may run. Unreadable state fails toward restoring
+// (cheap, idempotent) rather than toward skipping a needed repair.
+func TestSubtreeHasController(t *testing.T) {
+	for val, has := range map[string]bool{
+		"":                     false,
+		"\n":                   false,
+		"cpu io memory pids":   true,
+		"cpu io pids\n":        false,
+		"memory":               true,
+		"memoryx pids":         false, // prefix must not match
+	} {
+		if got := subtreeHasController(val, "memory"); got != has {
+			t.Errorf("subtreeHasController(%q, memory) = %v, want %v", val, got, has)
+		}
+	}
+}
