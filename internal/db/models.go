@@ -655,13 +655,13 @@ type TeamBillingAccount struct {
 	StripeCustomerID          *string            `json:"stripe_customer_id"`
 	StripeSubscriptionID      *string            `json:"stripe_subscription_id"`
 	StripeSubscriptionStatus  *string            `json:"stripe_subscription_status"`
-	StripeInvoiceStatus       *string            `json:"stripe_invoice_status"`
-	StripeSubscriptionEventAt pgtype.Timestamptz `json:"stripe_subscription_event_at"`
 	CurrentPeriodStart        pgtype.Timestamptz `json:"current_period_start"`
 	CurrentPeriodEnd          pgtype.Timestamptz `json:"current_period_end"`
 	CancelAtPeriodEnd         bool               `json:"cancel_at_period_end"`
 	CreatedAt                 time.Time          `json:"created_at"`
 	UpdatedAt                 time.Time          `json:"updated_at"`
+	StripeInvoiceStatus       *string            `json:"stripe_invoice_status"`
+	StripeSubscriptionEventAt pgtype.Timestamptz `json:"stripe_subscription_event_at"`
 }
 
 type TeamBillingPeriod struct {

@@ -1746,7 +1746,7 @@ VALUES ($1, $2)
 ON CONFLICT (team_id) DO UPDATE
 SET stripe_customer_id = EXCLUDED.stripe_customer_id,
     updated_at = now()
-RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at
 `
 
 type UpsertTeamBillingAccountCustomerParams struct {
@@ -1762,13 +1762,13 @@ func (q *Queries) UpsertTeamBillingAccountCustomer(ctx context.Context, arg Upse
 		&i.StripeCustomerID,
 		&i.StripeSubscriptionID,
 		&i.StripeSubscriptionStatus,
-		&i.StripeInvoiceStatus,
-		&i.StripeSubscriptionEventAt,
 		&i.CurrentPeriodStart,
 		&i.CurrentPeriodEnd,
 		&i.CancelAtPeriodEnd,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.StripeInvoiceStatus,
+		&i.StripeSubscriptionEventAt,
 	)
 	return i, err
 }
@@ -1806,7 +1806,7 @@ SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_acco
     current_period_end = COALESCE(EXCLUDED.current_period_end, team_billing_account.current_period_end),
     cancel_at_period_end = COALESCE($9, team_billing_account.cancel_at_period_end),
     updated_at = now()
-RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at
 `
 
 type UpsertTeamBillingAccountSubscriptionParams struct {
@@ -1839,13 +1839,13 @@ func (q *Queries) UpsertTeamBillingAccountSubscription(ctx context.Context, arg 
 		&i.StripeCustomerID,
 		&i.StripeSubscriptionID,
 		&i.StripeSubscriptionStatus,
-		&i.StripeInvoiceStatus,
-		&i.StripeSubscriptionEventAt,
 		&i.CurrentPeriodStart,
 		&i.CurrentPeriodEnd,
 		&i.CancelAtPeriodEnd,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.StripeInvoiceStatus,
+		&i.StripeSubscriptionEventAt,
 	)
 	return i, err
 }
