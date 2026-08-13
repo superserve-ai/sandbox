@@ -35,7 +35,12 @@ locals {
       # minute even on a busy cell. A 30 minute
       # old queue head means the drain loop is stalled or falling behind,
       # and every queued pause is unmet durability (RPO) exposure.
-      query         = "max(backup_oldest_pending_age_seconds{${local.backup_host_matcher}}) > ${var.backup_alerts.oldest_pending_age_seconds}"
+      # Scoped to the pause tier: pause generations should ship in
+      # seconds, while checkpoint and best-effort backlogs (the backfill
+      # sweep in particular) are deliberately patient, drain only in
+      # idle pipe time, and would otherwise hold this alert firing for
+      # the whole enablement window.
+      query         = "max(backup_oldest_pending_age_seconds{priority=\"pause\", ${local.backup_host_matcher}}) > ${var.backup_alerts.oldest_pending_age_seconds}"
       duration      = "900s"
       documentation = <<-EOT
         The oldest queued backup generation on ${var.backup_alerts.host_id} has been waiting more than ${var.backup_alerts.oldest_pending_age_seconds}s. Queued pauses are not yet durable in the bucket, so this is direct restore-point exposure.
