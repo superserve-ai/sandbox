@@ -939,7 +939,7 @@ func (p *Pool) refillLoop(ctx context.Context) {
 			active = true
 			p.refillActive.Add(1)
 		}
-		switch p.refillStep(ctx) {
+		switch p.refillStep(ctx, deactivate) {
 		case refillStopped:
 			return
 		case refillOK:
@@ -963,7 +963,11 @@ func (p *Pool) refillLoop(ctx context.Context) {
 // of one slot per worker); parked-active is truthful, and claimants never
 // wait on a full pool anyway. Built outside the select so a shutdown while
 // parked can dispose of the slot instead of dropping it.
-func (p *Pool) refillStep(ctx context.Context) refillOutcome {
+//
+// deactivate is the caller's declaration-release: the paused/drain arms call
+// it before tearing the doomed slot down, because cleanup can block for
+// seconds and a discarding worker is not a producer anyone should wait on.
+func (p *Pool) refillStep(ctx context.Context, deactivate func()) refillOutcome {
 	slot, err := p.allocate(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -973,11 +977,13 @@ func (p *Pool) refillStep(ctx context.Context) refillOutcome {
 		return refillFailed
 	}
 	if p.refillIsPaused() {
+		deactivate()
 		p.cleanup(slot)
 		return refillOK
 	}
 	select {
 	case <-p.refillDrainCh():
+		deactivate()
 		p.cleanup(slot)
 		return refillOK
 	case p.fresh <- slot:
