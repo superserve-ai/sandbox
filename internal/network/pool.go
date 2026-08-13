@@ -363,6 +363,13 @@ const claimWaitFallbackPoll = 100 * time.Millisecond
 func (p *Pool) ClaimWait(ctx context.Context, vmID string) *VMNetInfo {
 	start := time.Now()
 	for {
+		// Checked before every claim attempt, not only in the select: a
+		// wakeup can race cancellation, and a dead request must never
+		// consume inventory a live claimant is waiting on — the slot would
+		// be assigned to a vmID whose caller has already gone away.
+		if ctx.Err() != nil {
+			return nil
+		}
 		ch := p.progressCh()
 		if info := p.Claim(vmID); info != nil {
 			return info
