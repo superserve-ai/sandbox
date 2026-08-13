@@ -381,6 +381,12 @@ func (p *Pool) ClaimWait(ctx context.Context, vmID string) *VMNetInfo {
 			return info
 		}
 		if !p.producing() {
+			// Same cancellation guard as the loop top: this final claim must
+			// not hand a just-delivered slot to a request whose caller is
+			// already gone.
+			if ctx.Err() != nil {
+				return nil
+			}
 			return p.Claim(vmID)
 		}
 		budget := poolClaimWaitBudget
