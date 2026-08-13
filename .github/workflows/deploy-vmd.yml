@@ -169,6 +169,11 @@ jobs:
           # Staging validates the backup uploader first; the production
           # cells get their buckets after the staging soak.
           BACKUP_BUCKET: superserve-artifact-backup-staging-usc1
+          # Stage one of the backfill rollout: staging first, then use4,
+          # then usw2, each gated on coverage convergence verified via
+          # the backup_generation table. Removing this line disables the
+          # sweep on the next deploy.
+          BACKUP_BACKFILL: "1"
           # Keeps the backup journal off the root disk — it's written
           # continuously while backups drain and can stall the uploader
           # if the (small) root disk fills. Staging is a smaller instance
