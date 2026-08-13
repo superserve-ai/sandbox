@@ -22,6 +22,8 @@ func (r *captureRecorder) RecordDBPoolStats(context.Context, DBPoolStats) {}
 
 func (r *captureRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure) {}
 
+func (r *captureRecorder) RecordLauncherState(context.Context, LauncherState) {}
+
 func TestInstrumentedVMDClientRecordsHostID(t *testing.T) {
 	recorder := &captureRecorder{}
 

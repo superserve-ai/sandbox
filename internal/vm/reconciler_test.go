@@ -696,6 +696,62 @@ func TestReapDeadActiveVMs_StaleRunningRecordDoesNotVetoReap(t *testing.T) {
 	})
 }
 
+// A large stale-record backlog must not blow through the pass's own
+// deadline: markStale's netns teardown and BoltDB delete run on their own
+// unrelated context, so nothing but an explicit ctx.Err() check between
+// candidates stops the loop once the pass budget is spent. An already-
+// expired context must make the rule a no-op rather than grinding through
+// every candidate anyway.
+func TestReapDeadActiveVMs_ExpiredContextStopsBeforeAnyWork(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ids := make([]string, 5)
+	rows := make(map[string]db.ListSandboxesByHostRow, len(ids))
+	for i := range ids {
+		sbID := uuid.New()
+		id := sbID.String()
+		ids[i] = id
+		if err := store.Put(VMRecord{ID: id, Status: StatusRunning}); err != nil {
+			t.Fatal(err)
+		}
+		rows[id] = db.ListSandboxesByHostRow{Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}}
+	}
+
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	for _, id := range ids {
+		r.driftSeen[id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+	}
+
+	origProbe := unitFullyDownProbe
+	unitFullyDownProbe = func(context.Context, string) bool { return true } // every unit conclusively dead
+	t.Cleanup(func() { unitFullyDownProbe = origProbe })
+
+	flips := &[]string{}
+	r.markFailed = func(_ context.Context, vmID string, _ db.SandboxStatus) bool {
+		*flips = append(*flips, vmID)
+		return true
+	}
+
+	expiredCtx, cancel := context.WithCancel(context.Background())
+	cancel() // already expired before the rule ever runs
+
+	r.reapDeadActiveVMs(expiredCtx, zerolog.Nop(), rows, map[string]bool{}, func(string) bool { return false }, time.Now())
+
+	if len(*flips) != 0 {
+		t.Fatalf("an expired pass context must stop the loop before touching any candidate, got %d flips: %v", len(*flips), *flips)
+	}
+	for _, id := range ids {
+		if rec, _ := store.Get(id); rec == nil {
+			t.Fatalf("record %s must survive an aborted pass — it was never processed, not cleaned up", id)
+		}
+	}
+}
+
 // The lock-window race: a resume + re-pause can write a NEW artifact at the
 // same path while this rule waits on the lifecycle lock. The re-stat under
 // the lock must see it and heal rather than fail the fresh generation; an
