@@ -1421,6 +1421,38 @@ const staleHandleRetryDelay = 150 * time.Millisecond
 // existed.
 const staleHandleRetryBodyLimit = 32 << 20 // 32 MiB
 
+// staleHandleRetryTotalBudget bounds the AGGREGATE bytes buffered for
+// ESTALE retry across all concurrent uploads, not just one request. The
+// per-request cap alone isn't enough: the proxy allows up to 200
+// concurrent connections to a single sandbox (internal/proxy/proxy.go),
+// and the smallest supported sandbox has only 256 MiB of RAM total
+// (internal/api/handlers_template.go) -- eight simultaneous near-cap
+// uploads could otherwise buffer the guest's entire memory allocation
+// between them, before boxd's own overhead or the guest OS. A request
+// that can't get a reservation falls back to the streamed, non-retrying
+// path, the same degradation an oversized single body already gets.
+const staleHandleRetryTotalBudget = 32 << 20 // 32 MiB
+
+var staleHandleRetryBytesInFlight atomic.Int64
+
+// reserveRetryBudget attempts to claim n bytes from the shared retry
+// buffering budget, returning false if that would exceed it.
+func reserveRetryBudget(n int64) bool {
+	for {
+		cur := staleHandleRetryBytesInFlight.Load()
+		if cur+n > staleHandleRetryTotalBudget {
+			return false
+		}
+		if staleHandleRetryBytesInFlight.CompareAndSwap(cur, cur+n) {
+			return true
+		}
+	}
+}
+
+func releaseRetryBudget(n int64) {
+	staleHandleRetryBytesInFlight.Add(-n)
+}
+
 func isStaleHandle(err error) bool {
 	return errors.Is(err, syscall.ESTALE)
 }
@@ -1468,9 +1500,14 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
 	}
 
 	var written int64
-	if int64(len(peeked)) > staleHandleRetryBodyLimit {
+	peekedLen := int64(len(peeked))
+	if peekedLen > staleHandleRetryBodyLimit || !reserveRetryBudget(peekedLen) {
+		// Too large to buffer at all, or the aggregate budget is
+		// currently claimed by other concurrent uploads -- stream
+		// through once with no retry rather than risk an OOM.
 		written, err = writeFileAttempt(path, io.MultiReader(bytes.NewReader(peeked), r.Body))
 	} else {
+		defer releaseRetryBudget(peekedLen)
 		deadline := time.Now().Add(staleHandleRetryBudget)
 		for {
 			written, err = writeFileAttempt(path, bytes.NewReader(peeked))
