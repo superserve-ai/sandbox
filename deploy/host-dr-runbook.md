@@ -1,0 +1,112 @@
+# Host disaster recovery: rebuild a lost host from GCS + DB
+
+Scope: a vmd host (or its local-SSD array) is unrecoverable. Every
+sandbox it held comes back on a replacement host, cold-booted from its
+newest completed backup generation. The recovery contract is
+filesystem-only: files survive to the last pause or checkpoint, process
+state does not. Sandbox restores are kernel-independent; only template
+memory snapshots are kernel-sensitive, and those are rebuildable.
+
+## 0. Decide and declare
+
+- Confirm the host is actually gone (not a reboot: local SSD survives a
+  reboot, and vmd's boot-time recovery handles that case itself).
+- Freeze scheduling to the dead host: mark its `host` row unhealthy so
+  the control plane stops placing new sandboxes.
+- Note the incident start time; the RTO clock runs from here.
+
+## 1. Provision the replacement
+
+Per-cell specifics live in the infra envs (`infra/envs/production/*`):
+machine type, zone, reservation, subnet. The known sharp edges from
+prior bring-ups:
+
+- Metal + local-SSD shapes need a matching reservation; check capacity
+  before assuming the type is available in-zone.
+- Verify egress works from the new host before anything else (a prior
+  bring-up shipped without external egress and everything downstream
+  failed confusingly).
+- Build the RAID array and mount it at the same path
+  (`/mnt/localssd`), with the same `/var/lib/sandbox` layout.
+- Deploy vmd via the normal workflow. Set `HOST_ID` to the DB row id of
+  the DEAD host only at the remap step below, never while the old row
+  still points at live state elsewhere.
+
+## 2. Enumerate and dry-run
+
+Run the bulk tool under the cell's restore identity
+(`superserve-backup-ro-<cell>`, granted by an admin for the incident):
+
+```
+backup-restore -bucket <cell-backup-bucket> \
+  -host-restore <dead-host-id> \
+  -db-url "$DATABASE_URL" \
+  -dest-root /var/lib/sandbox/snapshots \
+  -concurrency 8
+```
+
+The default is a dry run. It produces the coverage ledger: every live
+sandbox the DB pins to the dead host, classified as coverable (newest
+completed generation present in the bucket) or uncovered. If the DB is
+itself unreachable, pass `-sandboxes-file` with one sandbox id per line.
+
+Review the ledger before executing. The uncovered list is the
+partial-failure playbook input, not a tool error.
+
+## 3. Execute
+
+```
+backup-restore ... -execute
+```
+
+Each sandbox's newest generation materializes into
+`<dest-root>/<sandbox-id>` through the single-restore path: sparse
+rebuild, digest verification of every file, and a fsynced completion
+marker. A destination without the marker was interrupted and must not
+be consumed; re-running is idempotent. The JSON ledger lands in the
+dest root.
+
+Restore is bandwidth-bound; at survey-measured sizes (tens of MB packed
+per sandbox) a full cell restores in well under an hour. Bases shared
+across sandboxes fetch once per generation set.
+
+## 4. Validate a sample
+
+Cold-boot a handful of restored sandboxes before the remap: create the
+overlay from base plus restored artifacts and boot, confirm the guest
+filesystem is the customer's last pause. This is the step that turns
+"objects verified" into "sandboxes recover".
+
+## 5. Remap and reopen
+
+- Point the DB at the replacement: update the `host` row (or its
+  `vmd_addr`) and set the replacement's `HOST_ID` to the dead host's row
+  id. Host identity must match the row id exactly; a mismatch silently
+  splits the fleet's view (this has caused a multi-cell incident).
+- Sandboxes that were RUNNING at host death come back paused with their
+  last generation's files; their timeline should show the recovery
+  honestly rather than pretending continuity.
+- Unfreeze scheduling. Watch the first resumes: they cold-boot (the
+  memory tier died with the host) and are slower than warm resumes once.
+
+## 6. Partial-failure playbook
+
+From the ledger:
+
+- `uncovered`: the bucket holds no completed generation. These sandboxes'
+  data did not survive. Identify the teams affected and notify with the
+  last-known-good timestamp (none, for never-backed-up sandboxes).
+- `failed`: the restore itself errored; retry these individually with
+  the single-sandbox mode and escalate persistent integrity failures
+  (they indicate bucket-side corruption, which versioning and soft
+  delete can recover; that path is an admin operation).
+- In-flight-at-death uploads appear as uncovered for their newest pause
+  but usually have an older completed generation; `backup-restore
+  -sandbox <id>` lists every restorable generation, newest first.
+
+## 7. Close out
+
+Record measured RTO (incident start to scheduling reopened), attach the
+ledger, and file follow-ups for every uncovered sandbox class the
+backlog explains (for example, generations queued behind an uploader
+backlog at the moment of death).
