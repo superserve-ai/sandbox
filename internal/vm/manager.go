@@ -389,6 +389,14 @@ type Manager struct {
 	// already pending or completed; nil means never covered. See
 	// SetBackupCovered.
 	backupCovered func(backup.Task) (bool, error)
+	// lastSandboxEnqueue records the generation of each sandbox's most
+	// recent successful backup enqueue, captured ONLY while a backfill
+	// pass runs (backfillCapturing): the pass is the map's only reader,
+	// it clears the map when it ends, and gating the writes keeps a
+	// long-lived host's churn from growing the map with sandboxes no
+	// pass will ever read.
+	lastSandboxEnqueue sync.Map
+	backfillCapturing  atomic.Bool
 	// backupMetrics optionally observes backup hook timings; nil (metrics
 	// disabled) is safe at every call site. See SetBackupMetrics.
 	backupMetrics *telemetry.BackupRecorder
