@@ -2796,7 +2796,7 @@ components:
           format: double
         status:
           type: string
-          enum: [pending, sent, accepted, failed, skipped_shadow]
+          enum: [pending, sent, accepted, failed, skipped_shadow,skipped_zero]
           description: >
             Export attempt lifecycle. `sent` means Stripe returned a
             2xx response. `accepted` is kept for legacy rows and is
