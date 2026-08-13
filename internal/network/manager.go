@@ -111,12 +111,18 @@ const poolClaimWaitBudget = 2 * time.Second
 
 // adoptionClaimWaitBudget replaces poolClaimWaitBudget while a boot-time
 // adoption pass is running: the previous run's slots are moments from being
-// inventory, but the ramp to the FIRST delivery spans a few seconds (the
-// orphan scan runs before any output), and a claimant that gives up inside
-// that ramp builds inline against the adoption churn — the exact stampede
-// this wait exists to prevent. Only slot-allocating requests ever pay this;
-// pause/resume/destroy never touch the pool and are not gated on it.
-const adoptionClaimWaitBudget = 6 * time.Second
+// inventory, but the ramp to the FIRST delivery — the orphan scan runs
+// before any output — has been observed anywhere from a few seconds to
+// over ten on a large host, scaling with the candidate count. The budget
+// must cover the whole observed range: a claimant that gives up inside the
+// ramp builds inline against the adoption churn (the exact stampede this
+// wait exists to prevent) after having paid the wait as well. The cost of
+// generosity is nil in the common case — waiters exit the moment the first
+// slot lands — and bounded in the worst: an adoption pass that delivers
+// nothing self-aborts and clears the flag. Only slot-allocating requests
+// ever pay this; pause/resume/destroy never touch the pool and are not
+// gated on it.
+const adoptionClaimWaitBudget = 12 * time.Second
 
 type Manager struct {
 	hostInterface string
