@@ -103,10 +103,20 @@ const setupSlotConcurrency = 8
 
 // poolClaimWaitBudget bounds how long a claimant waits on a producing pool
 // before falling back to an inline build. Producers deliver within tens of
-// milliseconds normally and a few seconds during a boot-time adoption pass;
-// past that they are wedged and waiting longer buys nothing. ClaimWait also
-// honors the caller's ctx, so a nearly-spent deadline shortens this further.
+// milliseconds normally; past this they are backing off or wedged, and
+// ClaimWait's progress check usually bails well before the budget anyway.
+// ClaimWait also honors the caller's ctx, so a nearly-spent deadline
+// shortens this further.
 const poolClaimWaitBudget = 2 * time.Second
+
+// adoptionClaimWaitBudget replaces poolClaimWaitBudget while a boot-time
+// adoption pass is running: the previous run's slots are moments from being
+// inventory, but the ramp to the FIRST delivery spans a few seconds (the
+// orphan scan runs before any output), and a claimant that gives up inside
+// that ramp builds inline against the adoption churn — the exact stampede
+// this wait exists to prevent. Only slot-allocating requests ever pay this;
+// pause/resume/destroy never touch the pool and are not gated on it.
+const adoptionClaimWaitBudget = 6 * time.Second
 
 type Manager struct {
 	hostInterface string
@@ -314,7 +324,11 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		// for their output rather than building alongside them; the wait is
 		// bounded and ClaimWait exits early if nothing is producing.
 		tWait := time.Now()
-		if info := m.pool.ClaimWait(ctx, vmID, poolClaimWaitBudget); info != nil {
+		budget := poolClaimWaitBudget
+		if m.pool.adopting.Load() {
+			budget = adoptionClaimWaitBudget
+		}
+		if info := m.pool.ClaimWait(ctx, vmID, budget); info != nil {
 			m.registerEgress(vmID, info)
 			m.log.Info().Str("vm_id", vmID).
 				Int64("pool_wait_ms", time.Since(tWait).Milliseconds()).

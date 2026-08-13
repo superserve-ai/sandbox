@@ -907,32 +907,73 @@ func TestClaimWait_IdlePoolReturnsImmediately(t *testing.T) {
 	}
 }
 
-// TestWaitWarm_OpensOnFirstInventoryAndCapsOut pins the boot gate contract:
-// the gate waits for first inventory when it is coming, and never holds boot
-// past its cap when it is not.
-func TestWaitWarm_OpensOnFirstInventoryAndCapsOut(t *testing.T) {
-	withTestNetnsDir(t)
+// TestClaimWait_BurstConsumesExactlyWhatProducersDeliver pins the storm
+// contract this path exists for: a burst of claimants against a producing
+// pool must drain the producers' output exactly — every delivered slot
+// claimed by exactly one claimant, every unlucky claimant falling back only
+// after its budget — with no slot lost and no double-claim.
+func TestClaimWait_BurstConsumesExactlyWhatProducersDeliver(t *testing.T) {
+	dir := withTestNetnsDir(t)
 	m := newTestManager()
 	p := newTestPool(t, m)
+	p.fresh = make(chan *preallocSlot, 32) // room for the whole delivery
+	p.adopting.Store(true)                 // boot-shaped: adoption producing
 
+	const claimants, delivered = 20, 10
+	for i := 1; i <= delivered; i++ {
+		touchNS(t, dir, fmt.Sprintf("ns-%d", i))
+		m.assignSlotLocked(i, poolOwner)
+	}
 	go func() {
-		time.Sleep(60 * time.Millisecond)
-		p.fresh <- &preallocSlot{idx: 2, info: &VMNetInfo{Namespace: "ns-2"}, vethName: "veth-2"}
+		for i := 1; i <= delivered; i++ {
+			time.Sleep(15 * time.Millisecond) // trickle in mid-wait
+			p.fresh <- &preallocSlot{idx: i, info: &VMNetInfo{Namespace: fmt.Sprintf("ns-%d", i)}, vethName: fmt.Sprintf("veth-%d", i)}
+		}
 	}()
-	tStart := time.Now()
-	if n := p.WaitWarm(context.Background(), 1, 2*time.Second); n < 1 {
-		t.Fatalf("WaitWarm = %d, want >=1 once inventory landed", n)
-	}
-	if waited := time.Since(tStart); waited > time.Second {
-		t.Fatalf("took %v waiting for inventory that landed at 60ms", waited)
+
+	results := make(chan *VMNetInfo, claimants)
+	for i := 0; i < claimants; i++ {
+		go func(n int) {
+			results <- p.ClaimWait(context.Background(), fmt.Sprintf("vm-%d", n), 900*time.Millisecond)
+		}(i)
 	}
 
-	// Nothing else arriving: the cap, not the target, ends the wait.
-	tStart = time.Now()
-	if n := p.WaitWarm(context.Background(), 8, 150*time.Millisecond); n >= 8 {
-		t.Fatalf("WaitWarm = %d, expected cap-out below the 8-slot target", n)
+	won := map[string]bool{}
+	var lost int
+	for i := 0; i < claimants; i++ {
+		if info := <-results; info == nil {
+			lost++
+		} else if won[info.Namespace] {
+			t.Fatalf("namespace %s claimed twice", info.Namespace)
+		} else {
+			won[info.Namespace] = true
+		}
 	}
-	if waited := time.Since(tStart); waited > time.Second {
-		t.Fatalf("cap of 150ms held boot for %v", waited)
+	if len(won) != delivered || lost != claimants-delivered {
+		t.Fatalf("won=%d lost=%d, want %d/%d", len(won), lost, delivered, claimants-delivered)
+	}
+}
+
+// TestClaimWait_BailsWhenProducersStall pins the progress check: a pool that
+// CLAIMS to be producing (below target, refill unpaused) but delivers nothing
+// — refill in its failure backoff, or its workers gone — must release the
+// claimant to the inline build after the stall interval, not hold it for the
+// full budget on a promise.
+func TestClaimWait_BailsWhenProducersStall(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m) // fresh empty and below target: producing()==true, nothing delivering
+
+	tStart := time.Now()
+	got := p.ClaimWait(context.Background(), "vm-x", 5*time.Second)
+	waited := time.Since(tStart)
+	if got != nil {
+		t.Fatalf("expected nil from a stalled pool, got %+v", got)
+	}
+	if waited < produceStallBail {
+		t.Fatalf("bailed after %v, before the %v stall interval", waited, produceStallBail)
+	}
+	if waited > 2500*time.Millisecond {
+		t.Fatalf("stalled pool held the claimant %v; the stall check must beat the 5s budget", waited)
 	}
 }

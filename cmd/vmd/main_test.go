@@ -68,21 +68,3 @@ func TestPausedNetworkReclaimTriggersConfigured(t *testing.T) {
 		})
 	}
 }
-
-// TestWarmGateTarget pins the clamp: a pool configured smaller than the gate's
-// default target is fully warm below it, and the gate must wait for what can
-// exist, not for the constant.
-func TestWarmGateTarget(t *testing.T) {
-	cases := []struct{ fresh, want int }{
-		{fresh: 1024, want: warmGateMinSlots}, // production-sized pool: default target
-		{fresh: 16, want: 16},                 // exactly at the target
-		{fresh: 8, want: 8},                   // small pool: clamp to its capacity
-		{fresh: 0, want: warmGateMinSlots},    // unset mirrors StartPool's 32 default
-		{fresh: -3, want: warmGateMinSlots},   // garbage env parses to <= 0
-	}
-	for _, tc := range cases {
-		if got := warmGateTarget(tc.fresh); got != tc.want {
-			t.Errorf("warmGateTarget(%d) = %d, want %d", tc.fresh, got, tc.want)
-		}
-	}
-}

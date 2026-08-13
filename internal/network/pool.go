@@ -68,6 +68,12 @@ type Pool struct {
 	// to prefer waiting on that output over building inline.
 	adopting atomic.Bool
 
+	// produced counts every slot delivered into fresh or recycled. Where
+	// producing() states intent, this is the evidence: ClaimWait watches it
+	// to distinguish producers that are delivering from producers that are
+	// backing off or wedged, and stops waiting on the latter.
+	produced atomic.Uint64
+
 	// resetTapOnRecycle recreates tap0 before a returned slot is recycled.
 	resetTapOnRecycle bool
 	// abandonOnStop: Stop leaves slots in the kernel for the next process
@@ -289,11 +295,23 @@ const claimWaitPoll = 25 * time.Millisecond
 // (producers wedged — their locks are stalled too, so an inline build would
 // fare no better, but it remains the caller's last resort), or ctx/shutdown
 // ends the wait.
+// produceStallBail is how long ClaimWait tolerates a producing-but-silent
+// pool outside an adoption pass. Refill's own failure backoff alone exceeds
+// any claimant's patience, so a counter that hasn't moved for this long means
+// the producers are backing off or wedged — waiting further spends budget on
+// a promise. Adoption is exempt: its ramp to first delivery legitimately
+// spans seconds (the orphan scan precedes any output), and a genuinely
+// wedged pass aborts itself and clears the adopting flag, so the caller's
+// budget alone bounds that phase.
+const produceStallBail = 750 * time.Millisecond
+
 func (p *Pool) ClaimWait(ctx context.Context, vmID string, budget time.Duration) *VMNetInfo {
 	deadline := time.NewTimer(budget)
 	defer deadline.Stop()
 	tick := time.NewTicker(claimWaitPoll)
 	defer tick.Stop()
+	lastSeen := p.produced.Load()
+	lastProgress := time.Now()
 	for {
 		if info := p.Claim(vmID); info != nil {
 			return info
@@ -301,6 +319,11 @@ func (p *Pool) ClaimWait(ctx context.Context, vmID string, budget time.Duration)
 		if !p.producing() {
 			return nil
 		}
+		if cur := p.produced.Load(); cur != lastSeen {
+			lastSeen, lastProgress = cur, time.Now()
+		} else if !p.adopting.Load() && time.Since(lastProgress) > produceStallBail {
+			return nil
+		}
 		select {
 		case <-p.stopCh:
 			return nil
@@ -308,35 +331,6 @@ func (p *Pool) ClaimWait(ctx context.Context, vmID string, budget time.Duration)
 			return nil
 		case <-deadline.C:
 			return nil
-		case <-tick.C:
-		}
-	}
-}
-
-// WaitWarm blocks until the pool holds at least minSlots claimable slots or
-// maxWait lapses, returning the inventory last seen. Called once at boot,
-// after adoption starts and before the request gate opens: the previous run's
-// slots are already in the kernel, so first inventory is moments away, and a
-// gate that opens at zero sends the first arrivals into inline builds against
-// the adoption churn. The cap bounds boot delay for the cases with nothing to
-// adopt (first boot, adoption skipped, empty host) — the pool then warms by
-// building and the gate must not wait on that.
-func (p *Pool) WaitWarm(ctx context.Context, minSlots int, maxWait time.Duration) int {
-	deadline := time.NewTimer(maxWait)
-	defer deadline.Stop()
-	tick := time.NewTicker(claimWaitPoll)
-	defer tick.Stop()
-	for {
-		if n := len(p.fresh) + len(p.recycled); n >= minSlots {
-			return n
-		}
-		select {
-		case <-p.stopCh:
-			return len(p.fresh) + len(p.recycled)
-		case <-ctx.Done():
-			return len(p.fresh) + len(p.recycled)
-		case <-deadline.C:
-			return len(p.fresh) + len(p.recycled)
 		case <-tick.C:
 		}
 	}
@@ -526,6 +520,7 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 
 	select {
 	case p.recycled <- slot:
+		p.produced.Add(1)
 	case <-p.stopCh:
 		// Stop() closes p.recycled only after p.wg.Wait() returns, and this
 		// goroutine holds a wg slot until it returns — so stopCh firing here
@@ -539,6 +534,7 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 		if slot.adopted {
 			select {
 			case p.fresh <- slot:
+				p.produced.Add(1)
 				return
 			default:
 			}
@@ -790,6 +786,7 @@ func (p *Pool) refillLoop(ctx context.Context) {
 				p.stopSlot(slot)
 				return
 			case p.fresh <- slot:
+				p.produced.Add(1)
 			}
 			continue
 		}
@@ -811,6 +808,7 @@ func (p *Pool) refillLoop(ctx context.Context) {
 			p.cleanup(slot)
 			continue
 		case p.fresh <- slot:
+			p.produced.Add(1)
 		case <-p.stopCh:
 			p.stopSlot(slot)
 			return
