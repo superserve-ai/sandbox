@@ -314,7 +314,10 @@ func (p *Pool) producing() bool {
 	if p.adoptionTrusted() || p.adoptPhase.Load() == adoptPhaseScanning {
 		return true
 	}
-	return p.refillActive.Load() > 0
+	// While the pressure controller has refill paused, in-flight workers'
+	// output is predestined for the discard arms — active or not, they can
+	// deliver nothing, so claimants must not wait on them.
+	return p.refillActive.Load() > 0 && !p.refillIsPaused()
 }
 
 // adoptionTrusted reports whether claimants should treat the adoption pass as
