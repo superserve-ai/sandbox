@@ -1108,11 +1108,13 @@ func TestStartAdoption_PhaseVisibleBeforeReturn(t *testing.T) {
 	}
 }
 
-// BenchmarkClaimWaitBurst measures the broadcast-wakeup cost the design
+// BenchmarkClaimWaitBurst measures the broadcast-wakeup storm the design
 // accepts: every delivered slot wakes every waiter. One iteration is a full
-// burst — many claimants against a trickle of deliveries — so ns/op and
-// allocs/op quantify the scheduler and timer churn of the losing waiters,
-// the cost a wake-one design would remove.
+// burst — all claimants are parked in the wait loop BEFORE the timer starts
+// (untimed settle sleep), and the fresh channel has capacity one so each
+// delivery must be consumed before the next lands. Losers therefore really
+// sleep and really wake per delivery; ns/op and allocs/op quantify exactly
+// the churn a wake-one design would remove.
 func BenchmarkClaimWaitBurst(b *testing.B) {
 	const claimants, delivered = 200, 100
 
@@ -1127,8 +1129,8 @@ func BenchmarkClaimWaitBurst(b *testing.B) {
 			mgr:               m,
 			log:               zerolog.Nop(),
 			newSize:           delivered,
-			fresh:             make(chan *preallocSlot, delivered),
-			recycled:          make(chan *preallocSlot, 4),
+			fresh:             make(chan *preallocSlot, 1), // forces paced, per-delivery consumption
+			recycled:          make(chan *preallocSlot, 1),
 			stopCh:            make(chan struct{}),
 			refillDrainGate:   make(chan struct{}),
 			resetSem:          make(chan struct{}, resetTapConcurrency),
@@ -1143,16 +1145,6 @@ func BenchmarkClaimWaitBurst(b *testing.B) {
 			_ = f.Close()
 			m.assignSlotLocked(j, poolOwner)
 		}
-		b.StartTimer()
-
-		go func() {
-			for j := 1; j <= delivered; j++ {
-				p.fresh <- &preallocSlot{idx: j, info: &VMNetInfo{Namespace: fmt.Sprintf("ns-%d", j)}, vethName: fmt.Sprintf("veth-%d", j)}
-				p.signalProgress()
-			}
-			p.adoptPhase.Store(adoptPhaseIdle)
-			p.signalProgress()
-		}()
 
 		var wg sync.WaitGroup
 		for c := 0; c < claimants; c++ {
@@ -1162,7 +1154,19 @@ func BenchmarkClaimWaitBurst(b *testing.B) {
 				p.ClaimWait(context.Background(), fmt.Sprintf("vm-%d", n))
 			}(c)
 		}
+		// Untimed settle: every claimant finds the pool empty and parks in
+		// the wait select before the first delivery is timed.
+		time.Sleep(50 * time.Millisecond)
+		b.StartTimer()
+
+		for j := 1; j <= delivered; j++ {
+			p.fresh <- &preallocSlot{idx: j, info: &VMNetInfo{Namespace: fmt.Sprintf("ns-%d", j)}, vethName: fmt.Sprintf("veth-%d", j)}
+			p.signalProgress()
+		}
+		p.adoptPhase.Store(adoptPhaseIdle)
+		p.signalProgress()
 		wg.Wait()
+		b.StopTimer()
 		close(p.stopCh)
 	}
 }

@@ -335,6 +335,12 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 			}
 			return info, nil
 		}
+		// A nil wait result can mean cancellation, not exhaustion — a dead
+		// request must not enter the inline path, whose slot-index claim can
+		// trigger reclaim scans over the full namespace table.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		m.log.Info().Str("vm_id", vmID).
 			Int64("pool_wait_ms", time.Since(tWait).Milliseconds()).
 			Msg("network pool empty, falling back to on-demand setup")
