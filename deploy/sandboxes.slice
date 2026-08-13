@@ -22,6 +22,19 @@ IOAccounting=yes
 # available to whoever wants it (background backup drain included).
 # IOWeight additionally requires an io-cost model on the device to bite
 # (kernel-dependent); CPUWeight is the load-bearing half.
+#
+# Known tradeoff: vmd's synchronous lifecycle orchestration (launch,
+# pause, resume RPC handling) shares system.slice's reduced footing —
+# the slice split cannot distinguish it from vmd's background work.
+# Narrower than it sounds: the heavy half of those paths (snapshot and
+# guest-memory writes) runs inside the Firecracker processes, which sit
+# in THIS slice on the favored side; vmd's own synchronous share is the
+# O(dirtied-bytes) staging copy and small hashes. The pause-hook
+# duration histogram is the guard metric for the remainder — a
+# regression there under load argues for isolating the uploader's
+# workers instead (thread-scoped cgroups cover CPU; full IO isolation
+# needs the uploader out-of-process, since io is a domain controller),
+# not for weakening this split.
 CPUWeight=400
 IOWeight=400
 
