@@ -3,8 +3,11 @@ package backup
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -75,4 +78,49 @@ func TestHostRestoreCancelKeepsLedgerComplete(t *testing.T) {
 	if len(report.Results) != 2 {
 		t.Fatalf("ledger has %d rows, want every item accounted", len(report.Results))
 	}
+}
+
+// Reruns after interruption skip destinations whose completion marker
+// records the target generation, and the base cache streams a shared
+// base from the store exactly once however many sandboxes depend on it.
+func TestHostRestoreRerunAndBaseCache(t *testing.T) {
+	store := newMemBlobs()
+	src := t.TempDir()
+	task := writeRestoreFixture(t, src)
+	uploadFixture(t, store, task)
+	root := t.TempDir()
+	items := []HostRestoreItem{{SandboxID: task.SandboxID, Dest: filepath.Join(root, task.SandboxID)}}
+
+	counter := &countingReader{inner: store}
+	cache := &CachingBaseReader{Inner: counter, Dir: filepath.Join(root, ".base-cache")}
+	r := &HostRestorer{Reader: cache, Lister: store, Concurrency: 1}
+	report := r.Run(context.Background(), items)
+	if report.Restored != 1 {
+		t.Fatalf("first run = %+v", report)
+	}
+	report = r.Run(context.Background(), items)
+	if report.Restored != 1 || report.Results[0].Reason != "already restored by a prior run" {
+		t.Fatalf("rerun = %+v, want marker-based skip", report.Results[0])
+	}
+	for object, n := range counter.reads {
+		if strings.HasPrefix(object, "bases/") && n != 1 {
+			t.Fatalf("shared base %s streamed %d times, want once", object, n)
+		}
+	}
+}
+
+type countingReader struct {
+	inner BlobReader
+	mu    sync.Mutex
+	reads map[string]int
+}
+
+func (c *countingReader) NewReader(ctx context.Context, object string) (io.ReadCloser, error) {
+	c.mu.Lock()
+	if c.reads == nil {
+		c.reads = map[string]int{}
+	}
+	c.reads[object]++
+	c.mu.Unlock()
+	return c.inner.NewReader(ctx, object)
 }

@@ -2,11 +2,17 @@ package backup
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // HostRestoreItem is one artifact owner the DB says lived on the dead
@@ -72,11 +78,8 @@ type HostRestorer struct {
 	Lister BlobLister
 	// Concurrency bounds parallel restores. The replacement host is cold
 	// (no customer traffic yet), so the bound exists to keep the fetch
-	// path below the NIC and disk ceilings, not to protect tenants; the
-	// mass-restore wedging seen during the us-east4 cutover was
-	// boot-storm churn, which cold-boot-on-demand avoids entirely, but
-	// the bound still keeps the failure mode of one slow item from
-	// serializing the fleet. 0 means 4.
+	// path below the NIC and disk ceilings, not to protect tenants, and
+	// it keeps one slow item from serializing the fleet. 0 means 4.
 	Concurrency int
 	// DryRun stops after coverage probing: every item resolves to
 	// coverable or uncovered and nothing touches disk.
@@ -111,26 +114,31 @@ func (h *HostRestorer) Run(ctx context.Context, items []HostRestoreItem) *HostRe
 		}()
 	}
 	for i := range items {
+		stop := false
 		select {
 		case work <- i:
 		case <-ctx.Done():
+			stop = true
 		}
-		if ctx.Err() != nil {
-			// Remaining items report as failed-by-cancel rather than
-			// silently absent from the ledger.
-			for j := i; j < len(items); j++ {
-				if results[j].Outcome == "" {
-					results[j] = HostRestoreResult{
-						SandboxID: items[j].SandboxID, Dest: items[j].Dest,
-						Outcome: HostRestoreFailed, Reason: "canceled before restore",
-					}
-				}
-			}
+		if stop {
 			break
 		}
 	}
 	close(work)
 	wg.Wait()
+	// Undispatched items report as failed-by-cancel rather than
+	// silently absent from the ledger. Filled only after the workers
+	// finish: an item dispatched in the same instant cancellation
+	// arrived is owned by its worker, and its real result must not be
+	// overwritten here.
+	for j := range results {
+		if results[j].Outcome == "" {
+			results[j] = HostRestoreResult{
+				SandboxID: items[j].SandboxID, Dest: items[j].Dest,
+				Outcome: HostRestoreFailed, Reason: "canceled before restore",
+			}
+		}
+	}
 
 	report := &HostRestoreReport{Results: results, Elapsed: time.Since(start)}
 	for _, r := range results {
@@ -174,6 +182,16 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 		return res
 	}
 	dest := filepath.Clean(item.Dest)
+	// Rerun idempotence: a destination already holding this generation's
+	// completion marker finished a prior run past its fsynced
+	// verification; report it restored instead of failing on the
+	// non-empty directory.
+	if gen, ok := completedGenerationAt(dest); ok && gen == res.Generation {
+		res.Outcome = HostRestoreRestored
+		res.Reason = "already restored by a prior run"
+		res.Duration = time.Since(start)
+		return res
+	}
 	if _, err := RestoreGeneration(ctx, h.Reader, item.SandboxID, res.Generation, dest, nil); err != nil {
 		res.Outcome, res.Reason = HostRestoreFailed, err.Error()
 		res.Duration = time.Since(start)
@@ -182,4 +200,70 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 	res.Outcome = HostRestoreRestored
 	res.Duration = time.Since(start)
 	return res
+}
+
+// completedGenerationAt reports the generation a destination's fsynced
+// completion marker records, if one exists and parses.
+func completedGenerationAt(dest string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(dest, ManifestObject))
+	if err != nil {
+		return "", false
+	}
+	var m GenerationManifest
+	if json.Unmarshal(data, &m) != nil {
+		return "", false
+	}
+	return m.Generation, m.Generation != ""
+}
+
+// CachingBaseReader wraps a BlobReader, spooling shared base objects
+// (the bases/ prefix) into a local directory once and serving repeat
+// fetches from disk. A fleet restored from a handful of templates would
+// otherwise stream the same multi-gigabyte base object once per
+// sandbox; generation-scoped objects pass straight through. Concurrent
+// first fetches of one base coalesce.
+type CachingBaseReader struct {
+	Inner BlobReader
+	Dir   string
+	group singleflight.Group
+}
+
+func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.ReadCloser, error) {
+	if !strings.HasPrefix(object, "bases/") {
+		return c.Inner.NewReader(ctx, object)
+	}
+	cached := filepath.Join(c.Dir, strings.ReplaceAll(object, "/", "_"))
+	_, err, _ := c.group.Do(cached, func() (any, error) {
+		if _, err := os.Stat(cached); err == nil {
+			return nil, nil
+		}
+		src, err := c.Inner.NewReader(ctx, object)
+		if err != nil {
+			return nil, err
+		}
+		defer src.Close()
+		if err := os.MkdirAll(c.Dir, 0o700); err != nil {
+			return nil, err
+		}
+		tmp, err := os.CreateTemp(c.Dir, ".spool-*")
+		if err != nil {
+			return nil, err
+		}
+		defer os.Remove(tmp.Name())
+		if _, err := io.Copy(tmp, src); err != nil {
+			tmp.Close()
+			return nil, err
+		}
+		if err := tmp.Close(); err != nil {
+			return nil, err
+		}
+		// Rename-after-full-write: a crashed spool never masquerades as
+		// a cached base, and every restore's own digest verification
+		// still covers the served bytes end to end.
+		return nil, os.Rename(tmp.Name(), cached)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(cached)
 }

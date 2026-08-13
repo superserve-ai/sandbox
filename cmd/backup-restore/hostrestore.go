@@ -59,8 +59,11 @@ func runHostRestore(ctx context.Context, reader backup.BlobReader, lister backup
 	}
 	fmt.Printf("host restore (%s): %d sandboxes from host %s, concurrency %d\n", mode, len(items), hostID, concurrency)
 
+	// Shared template bases spool to a local cache once instead of
+	// streaming per sandbox.
+	cache := &backup.CachingBaseReader{Inner: reader, Dir: filepath.Join(destRoot, ".base-cache")}
 	restorer := &backup.HostRestorer{
-		Reader:      reader,
+		Reader:      cache,
 		Lister:      lister,
 		Concurrency: concurrency,
 		DryRun:      !execute,

@@ -23,9 +23,8 @@ prior bring-ups:
 
 - Metal + local-SSD shapes need a matching reservation; check capacity
   before assuming the type is available in-zone.
-- Verify egress works from the new host before anything else (a prior
-  bring-up shipped without external egress and everything downstream
-  failed confusingly).
+- Verify egress works from the new host before anything else; downstream
+  failures from missing egress are confusing to diagnose.
 - Build the RAID array and mount it at the same path
   (`/mnt/localssd`), with the same `/var/lib/sandbox` layout.
 - Deploy vmd via the normal workflow. Set `HOST_ID` to the DB row id of
@@ -63,12 +62,15 @@ Each sandbox's newest generation materializes into
 `<dest-root>/<sandbox-id>` through the single-restore path: sparse
 rebuild, digest verification of every file, and a fsynced completion
 marker. A destination without the marker was interrupted and must not
-be consumed; re-running is idempotent. The JSON ledger lands in the
-dest root.
+be consumed. Re-running is idempotent: destinations whose completion
+marker already records the target generation are reported restored and
+skipped. The JSON ledger lands in the dest root.
 
-Restore is bandwidth-bound; at survey-measured sizes (tens of MB packed
-per sandbox) a full cell restores in well under an hour. Bases shared
-across sandboxes fetch once per generation set.
+Restore is bandwidth-bound; at measured fleet sizes (tens of MB packed
+per sandbox) a full cell restores in well under an hour. Shared template
+bases spool once into `<dest-root>/.base-cache` and serve every
+dependent sandbox from disk; remove the cache directory after the
+exercise.
 
 ## 4. Validate a sample
 
@@ -82,12 +84,18 @@ filesystem is the customer's last pause. This is the step that turns
 - Point the DB at the replacement: update the `host` row (or its
   `vmd_addr`) and set the replacement's `HOST_ID` to the dead host's row
   id. Host identity must match the row id exactly; a mismatch silently
-  splits the fleet's view (this has caused a multi-cell incident).
-- Sandboxes that were RUNNING at host death come back paused with their
-  last generation's files; their timeline should show the recovery
-  honestly rather than pretending continuity.
-- Unfreeze scheduling. Watch the first resumes: they cold-boot (the
-  memory tier died with the host) and are slower than warm resumes once.
+  splits the fleet's view of which sandboxes exist.
+- Restored generations carry no memory image by design, but snapshot
+  rows still reference the dead host's mem paths, and the standard
+  resume path expects one. Until the memoryless cold-boot resume is
+  wired into vmd (tracked as the restore tooling's remaining
+  acceptance), recovered sandboxes must be brought back through the
+  validated manual cold-boot procedure from step 4, not by letting
+  clients resume them; keep scheduling frozen for recovered sandboxes
+  until that wiring exists or the manual boot has run.
+- Sandboxes that were RUNNING at host death come back with their last
+  generation's files; their timeline should show the recovery honestly
+  rather than pretending continuity.
 
 ## 6. Partial-failure playbook
 
