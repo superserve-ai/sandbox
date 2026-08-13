@@ -23,17 +23,18 @@ import (
 type HostRestoreItem struct {
 	SandboxID string
 	Dest      string
-	// WantVMStateSHAs lists vmstate digests of the sandbox's pauses in
-	// the control plane's capture order, newest first. Bucket object
-	// times are upload-completion times, so a retry-delayed old upload
-	// can finish after a newer pause's and rank first by age; selection
-	// walks this list and takes the first digest with a matching
-	// manifest, so recovery lands on the newest CAPTURED pause that
-	// actually reached the bucket, however deep the control plane's
-	// history goes. Newest-completed is the recorded fallback only when
-	// no listed digest matches (or the list is empty), where capture
+	// Anchors lists the digest sets of the sandbox's pauses in the
+	// control plane's capture order, newest first; each anchor maps file
+	// name to sha256 and matches a manifest only when EVERY recorded
+	// digest appears (vmstate alone can collide across pauses whose
+	// rootfs differs). Bucket object times are upload-completion times,
+	// so selection walks this list and takes the first anchor with a
+	// matching manifest: recovery lands on the newest CAPTURED pause
+	// that actually reached the bucket, however deep the control
+	// plane's history goes. Newest-completed is the recorded fallback
+	// only when no anchor matches (or the list is empty), where capture
 	// order is unrecoverable by construction: manifests are timeless.
-	WantVMStateSHAs []string
+	Anchors []CaptureAnchor
 }
 
 // HostRestoreResult is the per-item outcome of a bulk restore. Exactly
@@ -46,6 +47,29 @@ type HostRestoreResult struct {
 	Outcome    HostRestoreOutcome
 	Reason     string
 	Duration   time.Duration
+}
+
+// CaptureAnchor is one pause's recorded digest set: file name to
+// sha256, as the control plane's artifact manifest holds it.
+type CaptureAnchor map[string]string
+
+// matches reports whether every digest the anchor records appears in
+// the manifest. A vmstate-only anchor (the pause-time manifest shape)
+// matches on that single digest; richer anchors bind the full set.
+func (a CaptureAnchor) matches(m *GenerationManifest) bool {
+	if len(a) == 0 {
+		return false
+	}
+	byName := map[string]string{}
+	for _, f := range m.Files {
+		byName[f.Name] = f.SHA256
+	}
+	for name, sha := range a {
+		if byName[name] != sha {
+			return false
+		}
+	}
+	return true
 }
 
 type HostRestoreOutcome string
@@ -193,8 +217,8 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 	// is newest-first with early exit so the common case pays one fetch,
 	// candidates probe in small parallel batches, and history depth is
 	// capped by retention once GC lands.
-	if len(item.WantVMStateSHAs) > 0 {
-		var vmstateByGen sync.Map
+	if len(item.Anchors) > 0 {
+		var manifestByGen sync.Map
 		unreadable := 0
 		for lo := 0; lo < len(gens); lo += anchorProbeBatch {
 			hi := lo + anchorProbeBatch
@@ -212,11 +236,7 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 						failed[i-lo] = true
 						return
 					}
-					for _, f := range m.Files {
-						if f.Name == "vmstate.snap" {
-							vmstateByGen.Store(gens[i].Generation, f.SHA256)
-						}
-					}
+					manifestByGen.Store(gens[i].Generation, m)
 				}(i)
 			}
 			pwg.Wait()
@@ -227,13 +247,15 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 			}
 		}
 		// Walk the control plane's capture order, newest first: the
-		// first listed digest with a manifest in the bucket is the
-		// newest captured pause that survived.
+		// first anchor with a matching manifest is the newest captured
+		// pause that survived.
 		match := ""
-		for _, sha := range item.WantVMStateSHAs {
+		matchAnchor := -1
+		for ai, anchor := range item.Anchors {
 			for _, g := range gens {
-				if got, ok := vmstateByGen.Load(g.Generation); ok && got == sha {
+				if v, ok := manifestByGen.Load(g.Generation); ok && anchor.matches(v.(*GenerationManifest)) {
 					match = g.Generation
+					matchAnchor = ai
 					break
 				}
 			}
@@ -242,7 +264,12 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 			}
 		}
 		switch {
-		case match != "":
+		case match != "" && (unreadable == 0 || matchAnchor == 0):
+			// With unreadable candidates in play, only a newest-anchor
+			// match is trustworthy: an unreadable manifest could match a
+			// NEWER anchor than the one found, and accepting the older
+			// match would silently roll the sandbox back on a transient
+			// read error.
 			res.Generation = match
 		case unreadable > 0:
 			// Fail closed: an unreadable candidate may BE the anchor, and
