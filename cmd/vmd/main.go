@@ -1158,9 +1158,12 @@ func main() {
 	// the background, and requests load any not-yet-reattached VM on demand.
 	// Boot-time pool patience lives in SetupVM's bounded ClaimWait (with a
 	// longer budget while adoption runs), deliberately NOT here: only
-	// slot-allocating requests should ever wait on the pool, and a gate at
-	// this level would hold pause, resume, and destroy behind inventory they
-	// never use.
+	// slot-allocating requests should ever wait on the pool. Pause and
+	// destroy never allocate; resume usually reuses its saved namespace and
+	// pays nothing, but a resume whose namespace is gone (or a stateless
+	// restore) allocates like a create and shares its bounded wait. A gate
+	// at this level would hold even the non-allocating paths behind
+	// inventory they never use.
 	startupReady.Store(true)
 	log.Info().Msg("startup complete — gRPC serving requests")
 

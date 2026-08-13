@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1102,5 +1105,64 @@ func TestStartAdoption_PhaseVisibleBeforeReturn(t *testing.T) {
 	}
 	if got := passes.Load(); got != 1 {
 		t.Fatalf("adopted %d times, want exactly 1 candidate processed by exactly 1 pass", got)
+	}
+}
+
+// BenchmarkClaimWaitBurst measures the broadcast-wakeup cost the design
+// accepts: every delivered slot wakes every waiter. One iteration is a full
+// burst — many claimants against a trickle of deliveries — so ns/op and
+// allocs/op quantify the scheduler and timer churn of the losing waiters,
+// the cost a wake-one design would remove.
+func BenchmarkClaimWaitBurst(b *testing.B) {
+	const claimants, delivered = 200, 100
+
+	oldNs, oldHost := netnsDir, hostNetDir
+	defer func() { netnsDir, hostNetDir = oldNs, oldHost }()
+
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		netnsDir, hostNetDir = b.TempDir(), b.TempDir()
+		m := newTestManager()
+		p := &Pool{
+			mgr:               m,
+			log:               zerolog.Nop(),
+			newSize:           delivered,
+			fresh:             make(chan *preallocSlot, delivered),
+			recycled:          make(chan *preallocSlot, 4),
+			stopCh:            make(chan struct{}),
+			refillDrainGate:   make(chan struct{}),
+			resetSem:          make(chan struct{}, resetTapConcurrency),
+			adoptEscapeStreak: defaultAdoptEscapeStreak,
+		}
+		p.adoptPhase.Store(adoptPhaseVerifying)
+		for j := 1; j <= delivered; j++ {
+			f, err := os.Create(filepath.Join(netnsDir, fmt.Sprintf("ns-%d", j)))
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = f.Close()
+			m.assignSlotLocked(j, poolOwner)
+		}
+		b.StartTimer()
+
+		go func() {
+			for j := 1; j <= delivered; j++ {
+				p.fresh <- &preallocSlot{idx: j, info: &VMNetInfo{Namespace: fmt.Sprintf("ns-%d", j)}, vethName: fmt.Sprintf("veth-%d", j)}
+				p.signalProgress()
+			}
+			p.adoptPhase.Store(adoptPhaseIdle)
+			p.signalProgress()
+		}()
+
+		var wg sync.WaitGroup
+		for c := 0; c < claimants; c++ {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				p.ClaimWait(context.Background(), fmt.Sprintf("vm-%d", n))
+			}(c)
+		}
+		wg.Wait()
+		close(p.stopCh)
 	}
 }
