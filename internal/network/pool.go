@@ -580,6 +580,12 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) bool {
 
 	select {
 	case p.recycled <- slot:
+		// Trust is restored before the delivery broadcast: a claimant woken
+		// by this slot's arrival must never observe the pass as still
+		// untrusted and bail to an inline build.
+		if slot.adopted {
+			p.adoptDelivered()
+		}
 		p.signalProgress()
 		return true
 	case <-p.stopCh:
@@ -596,6 +602,7 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) bool {
 		if slot.adopted {
 			select {
 			case p.fresh <- slot:
+				p.adoptDelivered()
 				p.signalProgress()
 				return true
 			default:
@@ -819,14 +826,15 @@ func (p *Pool) adoptOne(ctx context.Context, idx int, adopted, invalid, skipped,
 		}
 		return
 	}
-	if p.verifyAndRecycle(&preallocSlot{
+	// verifyAndRecycle resets the trust streak itself, ordered before its
+	// delivery broadcast (see the recycle send), so waiters never observe a
+	// delivered slot alongside stale distrust.
+	if !p.verifyAndRecycle(&preallocSlot{
 		idx:      idx,
 		info:     info,
 		vethName: vethName,
 		adopted:  true,
 	}) {
-		p.adoptDelivered()
-	} else {
 		// Validated but not placed (occupied namespace, failed tap rebuild,
 		// full pool): still a candidate that yielded no inventory.
 		p.adoptYieldedNothing()
