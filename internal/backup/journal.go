@@ -641,27 +641,28 @@ func mergeRow(existing []byte, task *Task) {
 	}
 }
 
-// OldestEnqueuedAt returns the earliest EnqueuedAt among queued tasks,
-// ok=false when the queue holds none. Enqueue time rather than readiness
-// deliberately: a task deferred by retry backoff is still backlog, and
-// the age gauge this feeds is about how stale the oldest owed upload is.
-func (j *Journal) OldestEnqueuedAt() (time.Time, bool, error) {
-	var oldest time.Time
-	found := false
+// OldestEnqueuedAtByPriority returns the earliest EnqueuedAt among
+// queued tasks per priority tier. Age is measured from enqueue, not
+// readiness: a nacked task in backoff is still unmet backlog. Per-tier
+// resolution exists because the tiers have opposite service
+// expectations: a pause generation should ship in seconds, while a
+// best-effort backfill backlog is deliberately patient and must not
+// trip the pause tier's freshness alerting.
+func (j *Journal) OldestEnqueuedAtByPriority() (map[Priority]time.Time, error) {
+	oldest := map[Priority]time.Time{}
 	err := j.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(journalBucket).ForEach(func(_, v []byte) error {
 			var t Task
-			if err := json.Unmarshal(v, &t); err != nil {
-				return nil // corrupt entries are dropped by Next, not counted
+			if json.Unmarshal(v, &t) != nil {
+				return nil
 			}
-			if !found || t.EnqueuedAt.Before(oldest) {
-				oldest = t.EnqueuedAt
-				found = true
+			if cur, ok := oldest[t.Priority]; !ok || t.EnqueuedAt.Before(cur) {
+				oldest[t.Priority] = t.EnqueuedAt
 			}
 			return nil
 		})
 	})
-	return oldest, found, err
+	return oldest, err
 }
 
 // OutboxDepth reports how many completed tasks still owe their

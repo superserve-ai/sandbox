@@ -819,9 +819,15 @@ func main() {
 				} else {
 					log.Warn().Err(err).Msg("backup metrics: journal pending read failed, dropping gauge from sample")
 				}
-				if oldest, ok, err := backupJournal.OldestEnqueuedAt(); err == nil {
-					if ok {
-						s.OldestPendingAge = time.Since(oldest)
+				if oldest, err := backupJournal.OldestEnqueuedAtByPriority(); err == nil {
+					if t, ok := oldest[backup.PriorityPause]; ok {
+						s.OldestPauseAge = time.Since(t)
+					}
+					if t, ok := oldest[backup.PriorityCheckpoint]; ok {
+						s.OldestCheckpointAge = time.Since(t)
+					}
+					if t, ok := oldest[backup.PriorityBestEffort]; ok {
+						s.OldestBestEffortAge = time.Since(t)
 					}
 					s.OldestPendingAgeOK = true
 				} else {
