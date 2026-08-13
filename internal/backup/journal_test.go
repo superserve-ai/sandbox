@@ -541,3 +541,52 @@ func TestStaleResolutionFencedAfterThiefResolves(t *testing.T) {
 		t.Fatalf("pending after refused zombie Nack = %v, want empty", counts)
 	}
 }
+
+// RecordVerification is a row write too: a stale worker recording
+// mid-flight progress after its lease was stolen and resolved must not
+// recreate the row — that would forge the durable row-presence evidence
+// Ack and Nack fence on, reopening the exact stale-Ack index deletion
+// the fence exists to prevent.
+func TestStaleRecordVerificationCannotResurrectRow(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	task := Task{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	now := base.Add(time.Minute)
+	stale, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	thief, ok, err := j.Next(now.Add(claimTTL))
+	if err != nil || !ok {
+		t.Fatalf("steal Next = %v/%v", ok, err)
+	}
+	if err := j.Nack(thief, now.Add(claimTTL)); err != nil {
+		t.Fatal(err)
+	}
+	// The stale worker's progress write is refused and recreates nothing.
+	if err := j.RecordVerification(stale, "bucket\x00obj", now.Add(claimTTL)); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("stale RecordVerification = %v, want errClaimStolen", err)
+	}
+	// The full attack chain stays closed: the follow-up stale Ack is
+	// still refused and the re-keyed row's index survives.
+	if err := j.Ack(stale, "bucket", false); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("stale Ack = %v, want errClaimStolen", err)
+	}
+	if pending, err := j.HasPending("sb-a", "aaa"); err != nil || !pending {
+		t.Fatalf("HasPending = %v/%v, want the re-keyed row still indexed", pending, err)
+	}
+	// A live-claim holder's progress writes still land.
+	redo, ok, err := j.Next(now.Add(claimTTL + time.Hour))
+	if err != nil || !ok {
+		t.Fatalf("reclaim Next = %v/%v", ok, err)
+	}
+	if err := j.RecordVerification(redo, "bucket\x00obj", now.Add(claimTTL+time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if verified, err := j.WasVerified("bucket\x00obj", now.Add(claimTTL+time.Hour)); err != nil || !verified {
+		t.Fatalf("WasVerified = %v/%v after live-claim record", verified, err)
+	}
+}

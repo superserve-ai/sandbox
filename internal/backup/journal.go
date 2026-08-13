@@ -436,6 +436,17 @@ func (j *Journal) fenced(task Task, resolve func() error) error {
 	return resolve()
 }
 
+// guarded is fenced without the claim drop, for mid-flight progress
+// writes that must keep the caller's claim live.
+func (j *Journal) guarded(task Task, fn func() error) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if c, held := j.claims[string(task.key())]; held && c.token != task.ClaimToken {
+		return errClaimStolen
+	}
+	return fn()
+}
+
 // Release frees task's claim without resolving it, for the one drain
 // outcome that is neither an Ack nor a Nack: an abandoned mutable-path
 // attempt whose row a concurrent dedupe upgraded to staged snapshots.
@@ -458,18 +469,31 @@ func (j *Journal) Release(task Task) {
 // separate writes would leave a task that trusts its dedupe while the
 // history never learns of the object, silently degrading later unchanged
 // re-pauses to abandonment.
+// Fenced like every row write, but WITHOUT dropping the claim — this is
+// mid-flight progress, not resolution. An unfenced write here would
+// recreate the row a replacement worker already resolved, forging
+// exactly the durable row-presence evidence Ack and Nack fence on; a
+// refused stale record is safe to lose (the bytes are create-only in
+// the bucket, and the replacement's own attempt records or re-proves
+// them under the existing rules).
 func (j *Journal) RecordVerification(task Task, object string, now time.Time) error {
-	return j.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(journalBucket)
-		mergeRow(b.Get(task.key()), &task)
-		val, err := json.Marshal(task)
-		if err != nil {
-			return err
-		}
-		if err := b.Put(task.key(), val); err != nil {
-			return err
-		}
-		return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
+	return j.guarded(task, func() error {
+		return j.db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket(journalBucket)
+			existing := b.Get(task.key())
+			if existing == nil {
+				return errClaimStolen
+			}
+			mergeRow(existing, &task)
+			val, err := json.Marshal(task)
+			if err != nil {
+				return err
+			}
+			if err := b.Put(task.key(), val); err != nil {
+				return err
+			}
+			return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
+		})
 	})
 }
 

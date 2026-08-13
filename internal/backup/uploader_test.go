@@ -1407,6 +1407,9 @@ func TestSharedBaseUploadsOnceThenSkipsTheStream(t *testing.T) {
 	}
 
 	t1 := makeTask("sb-one", "overlay one")
+	if err := j.Enqueue(t1); err != nil {
+		t.Fatal(err)
+	}
 	if completed, _, err := u.uploadTask(context.Background(), &t1); err != nil || !completed {
 		t.Fatalf("first upload: completed=%v err=%v", completed, err)
 	}
@@ -1424,6 +1427,9 @@ func TestSharedBaseUploadsOnceThenSkipsTheStream(t *testing.T) {
 	}
 
 	t2 := makeTask("sb-two", "overlay two")
+	if err := j.Enqueue(t2); err != nil {
+		t.Fatal(err)
+	}
 	if completed, _, err := u.uploadTask(context.Background(), &t2); err != nil || !completed {
 		t.Fatalf("second upload: completed=%v err=%v", completed, err)
 	}
@@ -1497,6 +1503,9 @@ func TestSharedDedupeRecordsHistoryForFutureSkips(t *testing.T) {
 	baseObject := SharedBaseObject(baseSHA, PackFingerprint(extents, apparent))
 	store.objects[baseObject] = []byte("already there")
 
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
 	if completed, _, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
 		t.Fatalf("upload: completed=%v err=%v", completed, err)
 	}
