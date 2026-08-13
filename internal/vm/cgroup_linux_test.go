@@ -518,3 +518,55 @@ func TestSubtreeHasController(t *testing.T) {
 		}
 	}
 }
+
+// Controller mode is an arming-only concern; the configure step must report
+// the pre-enable bare state so the oom.group restore runs exactly on the
+// bare→controllers transition, and enable failures must refuse arming.
+func TestConfigureChildControllers(t *testing.T) {
+	write := func(content string) string {
+		p := filepath.Join(t.TempDir(), "cgroup.subtree_control")
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// Non-bare over a bare host: memory absent → wasBare.
+	if wasBare, err := configureChildControllers(write("cpu io\n"), false); err != nil || !wasBare {
+		t.Errorf("bare host enable: wasBare=%v err=%v, want true, nil", wasBare, err)
+	}
+	// Non-bare over an already-enabled host: no transition.
+	if wasBare, err := configureChildControllers(write("cpu io memory pids\n"), false); err != nil || wasBare {
+		t.Errorf("enabled host enable: wasBare=%v err=%v, want false, nil", wasBare, err)
+	}
+	// Bare over an empty subtree verifies clean.
+	if _, err := configureChildControllers(write("\n"), true); err != nil {
+		t.Errorf("bare over empty: %v", err)
+	}
+	// Bare with controllers that refuse to disable (plain files keep the
+	// written spec) must error — never silently continue enabled.
+	if _, err := configureChildControllers(write("memory pids"), true); err == nil {
+		t.Error("bare over stuck controllers must error")
+	}
+	// Enable failure (subtree path is a directory) must refuse arming.
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := configureChildControllers(filepath.Join(dir, "sub"), false); err == nil {
+		t.Error("unwritable subtree must refuse the enable")
+	}
+}
+
+// A read failure that is not plain absence must surface: silently skipping
+// would report a clean transition over a VM whose OOM setting was never
+// restored. (A directory at the file's path yields such a non-ENOENT error.)
+func TestRestoreChildOOMGroupPropagatesReadFailure(t *testing.T) {
+	tree := &cgroupTree{vms: t.TempDir()}
+	if err := os.MkdirAll(filepath.Join(tree.vms, "vm-broken", "memory.oom.group"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoreChildOOMGroup(tree); err == nil {
+		t.Fatal("a non-ENOENT read failure must be reported, not skipped")
+	}
+}
