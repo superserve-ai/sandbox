@@ -12,13 +12,16 @@ IOAccounting=yes
 # root are system.slice and user.slice (default weight 100 each): weights
 # set on individual services inside system.slice (vmd included) can never
 # bias those services against the VMs here, because the root-level split
-# happens first. 400 gives the VM tree an 80% share of CPU and IO when
-# everything is hungry — vmd's backup hashing and upload streaming, the
-# proxy, and every other daemon divide what remains — while weights,
-# being proportional shares rather than caps, leave an idle host's full
-# throughput available to whoever wants it (background backup drain
-# included). IOWeight additionally requires an io-cost model on the
-# device to bite (kernel-dependent); CPUWeight is the load-bearing half.
+# happens first. 400 is a 4:1 advantage over EACH default-weight sibling,
+# not a fixed share: 80% of CPU and IO when only system.slice competes
+# (vmd's backup hashing and upload streaming, the proxy, every other
+# daemon divide its 100), ~67% when user.slice is also busy (SSH
+# sessions, including the deploy itself, run there). Weights are
+# proportional shares rather than caps, so an idle host's full
+# throughput stays available to whoever wants it (background backup
+# drain included). IOWeight additionally requires an io-cost model on
+# the device to bite (kernel-dependent); CPUWeight is the load-bearing
+# half.
 CPUWeight=400
 IOWeight=400
 
