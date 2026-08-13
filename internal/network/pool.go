@@ -30,10 +30,6 @@ type PoolConfig struct {
 	// and the next process adopts the slots via AdoptOrphanSlots. Off by
 	// default (legacy teardown).
 	AbandonOnStop bool
-	// AdoptEscapeStreak is how many consecutive adoption candidates may yield
-	// no inventory before claimants stop waiting on the pass (see
-	// adoptYieldedNothing). Default: 32.
-	AdoptEscapeStreak int
 }
 
 // Pool pre-allocates network namespaces, veth pairs, TAP devices, and
@@ -176,7 +172,11 @@ const (
 	// candidate) — better to stop early and leave the rest for a healthier
 	// boot than to accumulate a thread per slot.
 	adoptTimeoutAbort = 3
-	// defaultAdoptEscapeStreak: see PoolConfig.AdoptEscapeStreak.
+	// defaultAdoptEscapeStreak is how many consecutive adoption candidates may
+	// yield no inventory before claimants stop waiting on the pass (see
+	// adoptYieldedNothing). The single tuning point, deliberately in code:
+	// changing it is a reviewed one-line diff, not a host edit that a rebuild
+	// forgets. The escape is bounded by the claim budget regardless.
 	defaultAdoptEscapeStreak = 32
 )
 
@@ -217,10 +217,7 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		abandonOnStop:     cfg.AbandonOnStop,
 		resetSem:          make(chan struct{}, resetTapConcurrency),
 	}
-	p.adoptEscapeStreak = int64(cfg.AdoptEscapeStreak)
-	if p.adoptEscapeStreak <= 0 {
-		p.adoptEscapeStreak = defaultAdoptEscapeStreak
-	}
+	p.adoptEscapeStreak = defaultAdoptEscapeStreak
 	m.pool = p
 
 	p.log.Info().Int("target", newSize).Int("recycle_cap", recycleSize).

@@ -1003,13 +1003,11 @@ func main() {
 	// below isn't held for the fill; creates fall back to on-demand until warm.
 	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "256"))
 	netPoolRecycle, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_RECYCLE_SIZE", "256"))
-	adoptEscapeStreak, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_ADOPT_ESCAPE_STREAK", "32"))
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
 		NewSize:           netPoolFresh,
 		RecycleSize:       netPoolRecycle,
 		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
 		AbandonOnStop:     adoptNetPool,
-		AdoptEscapeStreak: adoptEscapeStreak,
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 	switch {
