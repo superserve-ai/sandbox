@@ -1606,6 +1606,47 @@ func pidsInNs(name string) (pids []int, ok bool) {
 	return pids, true
 }
 
+// occupiedNamespaces reports which named network namespaces have at least
+// one live process, from a SINGLE /proc pass — the per-slot pidsInNs scan
+// costs a full /proc readdir each, which is exactly the multiplier the
+// receipt fast path exists to remove. ok=false means /proc itself was
+// unreadable: "don't know", never "all clear".
+func occupiedNamespaces() (occupied map[string]bool, ok bool) {
+	entries, err := os.ReadDir(netnsDir)
+	if err != nil {
+		return nil, false
+	}
+	inoToName := make(map[uint64]string, len(entries))
+	for _, e := range entries {
+		st, err := os.Stat(netnsDir + "/" + e.Name())
+		if err != nil {
+			continue
+		}
+		inoToName[st.Sys().(*syscall.Stat_t).Ino] = e.Name()
+	}
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, false
+	}
+	occupied = make(map[string]bool)
+	for _, e := range procs {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		st, err := os.Stat("/proc/" + e.Name() + "/ns/net")
+		if err != nil {
+			continue
+		}
+		if name, hit := inoToName[st.Sys().(*syscall.Stat_t).Ino]; hit {
+			occupied[name] = true
+		}
+	}
+	return occupied, true
+}
+
 // listHostVeths returns all veth-N interfaces visible in the host namespace.
 func listHostVeths() ([]string, error) {
 	entries, err := os.ReadDir(hostNetDir)

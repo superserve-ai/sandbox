@@ -1262,6 +1262,12 @@ func main() {
 		log.Error().Err(lc.firstErr).Str("service", lc.errName).Msg("VM daemon shutdown after service error")
 		os.Exit(1)
 	}
+	// The final act of a fully successful, signal-initiated shutdown: vouch
+	// for the pool inventory the stopped-and-quiesced pool snapshotted, so
+	// the next boot can adopt it without the paranoid per-slot rebuild. A
+	// failure-triggered shutdown exits above and vouches for nothing, and
+	// CommitReceipt itself refuses unless the pool fully quiesced.
+	netPool.CommitReceipt()
 	log.Info().Msg("VM daemon shutdown complete")
 }
 

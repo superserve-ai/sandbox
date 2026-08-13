@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,6 +86,15 @@ type Pool struct {
 	// valid is unknowable without receipt/version evidence.
 	adoptStreak       atomic.Int64
 	adoptEscapeStreak int64
+
+	// quiesced is set by Stop (abandon mode) only when every pool worker
+	// joined within the bound; receiptFresh/receiptRecycled are the settled
+	// channel membership drained at that moment. CommitReceipt refuses to
+	// write unless quiesced — a receipt may vouch only for slots no worker
+	// could still have been touching.
+	quiesced        bool
+	receiptFresh    []int
+	receiptRecycled []int
 
 	// notifyCh broadcasts producer progress (a delivery or a state change) to
 	// ClaimWait waiters by close-and-replace, so a burst of claimants wakes on
@@ -664,6 +674,144 @@ func (p *Pool) stopSlot(slot *preallocSlot) {
 	p.cleanup(slot)
 }
 
+// adoptFromReceipt consumes the previous process's receipt and, for every
+// candidate it vouches for, runs cheap batched validation and places the
+// slot straight into inventory — no kill/poll, no firewall reinstall, no
+// route rewrite, no tap rebuild: those exist to re-derive or repair state
+// the receipt proves is already settled and current. Returns the remaining
+// candidates (unvouched plus demoted) for the full path, and the count
+// placed. All scans are batched: one netns readdir, one host-interface
+// readdir, one /proc pass — the per-slot multiplier is the cost being
+// removed.
+func (p *Pool) adoptFromReceipt(ctx context.Context, candidates []int) (remaining []int, placed int64) {
+	r, reason := consumePoolReceipt()
+	if r == nil {
+		if reason != "absent" {
+			p.log.Warn().Str("reason", reason).Msg("pool: receipt rejected — full adoption for all candidates")
+		}
+		return candidates, 0
+	}
+
+	tStart := time.Now()
+	vouched := make(map[int]bool, len(r.Fresh)+len(r.Recycled))
+	preferRecycled := make(map[int]bool, len(r.Recycled))
+	for _, idx := range r.Fresh {
+		vouched[idx] = true
+	}
+	for _, idx := range r.Recycled {
+		vouched[idx] = true
+		preferRecycled[idx] = true
+	}
+
+	occupied, ok := occupiedNamespaces()
+	if !ok {
+		p.log.Warn().Msg("pool: /proc scan failed — receipt discarded, full adoption for all candidates")
+		return candidates, 0
+	}
+	nsSet := make(map[string]bool)
+	if entries, err := os.ReadDir(netnsDir); err == nil {
+		for _, e := range entries {
+			nsSet[e.Name()] = true
+		}
+	}
+	vethSet := make(map[string]bool)
+	if veths, err := listHostVeths(); err == nil {
+		for _, v := range veths {
+			vethSet[v] = true
+		}
+	}
+
+	var toValidate []int
+	for _, idx := range candidates {
+		if vouched[idx] {
+			toValidate = append(toValidate, idx)
+		} else {
+			remaining = append(remaining, idx)
+		}
+	}
+
+	var demoted int64
+	var mu sync.Mutex
+	work := make(chan int)
+	var workers sync.WaitGroup
+	for i := 0; i < adoptConcurrency; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			defer sentrylog.Recover("netpool-receipt-adopt")
+			for idx := range work {
+				slot := p.fastAdoptVouched(idx, nsSet, vethSet, occupied)
+				if slot == nil {
+					mu.Lock()
+					remaining = append(remaining, idx)
+					demoted++
+					mu.Unlock()
+					continue
+				}
+				if !p.placeVouched(slot, preferRecycled[idx]) {
+					// No channel space: not a defect, just surplus. Route
+					// through the full path, which owns overflow teardown.
+					mu.Lock()
+					remaining = append(remaining, idx)
+					demoted++
+					mu.Unlock()
+					continue
+				}
+				p.adoptDelivered()
+				p.signalProgress()
+				mu.Lock()
+				placed++
+				mu.Unlock()
+			}
+		}()
+	}
+feed:
+	for i, idx := range toValidate {
+		select {
+		case work <- idx:
+		case <-p.stopCh:
+			mu.Lock()
+			remaining = append(remaining, toValidate[i:]...)
+			mu.Unlock()
+			break feed
+		case <-ctx.Done():
+			mu.Lock()
+			remaining = append(remaining, toValidate[i:]...)
+			mu.Unlock()
+			break feed
+		}
+	}
+	close(work)
+	workers.Wait()
+
+	p.log.Info().Int("vouched", len(toValidate)).Int64("placed", placed).
+		Int64("demoted", demoted).Int("unvouched", len(candidates)-len(toValidate)).
+		Int64("fast_path_ms", time.Since(tStart).Milliseconds()).
+		Msg("pool: receipt fast adoption complete")
+	return remaining, placed
+}
+
+// placeVouched returns a vouched slot to inventory, preferring the channel
+// it occupied in its previous life; a full preferred channel falls over to
+// the other (both directions are safe — the slot is fully built).
+func (p *Pool) placeVouched(slot *preallocSlot, preferRecycled bool) bool {
+	first, second := p.fresh, p.recycled
+	if preferRecycled {
+		first, second = p.recycled, p.fresh
+	}
+	select {
+	case first <- slot:
+		return true
+	default:
+	}
+	select {
+	case second <- slot:
+		return true
+	default:
+	}
+	return false
+}
+
 // AdoptOrphanSlots claims every namespace a previous vmd lifetime left behind
 // and feeds the valid ones through the recycle verification path, so a restart
 // starts with a warm pool instead of rebuilding it from scratch. Slots that
@@ -690,6 +838,16 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 	indexes := p.mgr.claimOrphanSlots()
 	p.adoptPhase.Store(adoptPhaseVerifying)
 	p.signalProgress()
+
+	// Receipt fast path. Consumed (one-shot) and validated BEFORE the worker
+	// pass; whatever it vouches for — intersected with the candidates the
+	// scan actually claimed, so ownership decided above always outranks the
+	// receipt — skips the paranoid rebuild and rejoins inventory after cheap
+	// batched validation. Everything else, including vouched slots that fail
+	// a check, takes the full path below unchanged.
+	indexes, fastAdopted := p.adoptFromReceipt(ctx, indexes)
+	adopted += fastAdopted
+
 	if len(indexes) > 0 {
 		p.log.Info().Int("candidates", len(indexes)).Msg("pool: adopting slots left by previous run")
 
@@ -750,7 +908,9 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 		}
 		p.log.Info().Int64("adopted", nAdopted.Load()).Int64("torn_down", nInvalid.Load()).
 			Int64("skipped", nSkipped.Load()).Msg("pool: adoption pass complete")
-		adopted, invalid, skipped = nAdopted.Load(), nInvalid.Load(), nSkipped.Load()
+		// Accumulate — adopted already carries the receipt fast path's count.
+		adopted += nAdopted.Load()
+		invalid, skipped = nInvalid.Load(), nSkipped.Load()
 	}
 
 	p.adoptPhase.Store(adoptPhaseIdle)
@@ -881,18 +1041,44 @@ func (p *Pool) Stop() {
 	close(p.stopCh)
 
 	if p.abandonOnStop {
-		// Bounded wait purely to let in-flight goroutines observe stopCh and
-		// quiesce; slots stay in the kernel either way, so an expired wait
-		// abandons nothing that boot-time adoption doesn't already cover.
+		// Bounded wait for every mutation source (refill, verify, adoption)
+		// to observe stopCh and join. Slots stay in the kernel either way —
+		// an expired wait abandons nothing that boot-time adoption doesn't
+		// already cover — but only a COMPLETE join permits the receipt
+		// snapshot below: a worker still running could deliver or tear down
+		// a slot after we recorded it, and a receipt must vouch only for
+		// settled state.
 		done := make(chan struct{})
 		go func() { p.wg.Wait(); close(done) }()
 		select {
 		case <-done:
+			// Fully quiesced: nothing else touches the channels, so their
+			// membership is a fact, not a race. Drain them into the snapshot
+			// (the structs are abandoned regardless; only indexes matter).
+			for {
+				select {
+				case slot := <-p.fresh:
+					p.receiptFresh = append(p.receiptFresh, slot.idx)
+					continue
+				default:
+				}
+				break
+			}
+			for {
+				select {
+				case slot := <-p.recycled:
+					p.receiptRecycled = append(p.receiptRecycled, slot.idx)
+					continue
+				default:
+				}
+				break
+			}
+			p.quiesced = true
 		case <-time.After(abandonStopWait):
-			p.log.Warn().Msg("pool: in-flight workers still settling at exit — slots remain adoptable")
+			p.log.Warn().Msg("pool: in-flight workers still settling at exit — slots remain adoptable, no receipt will be written")
 		}
-		p.log.Info().Int("fresh", len(p.fresh)).Int("recycled", len(p.recycled)).
-			Msg("network pool stopped (slots abandoned for adoption)")
+		p.log.Info().Int("fresh", len(p.receiptFresh)).Int("recycled", len(p.receiptRecycled)).
+			Bool("quiesced", p.quiesced).Msg("network pool stopped (slots abandoned for adoption)")
 		return
 	}
 
@@ -907,6 +1093,40 @@ func (p *Pool) Stop() {
 		p.cleanup(slot)
 	}
 	p.log.Info().Msg("network pool stopped")
+}
+
+// CommitReceipt writes the pool receipt as the caller's final shutdown act.
+// It refuses — silently falling back to full adoption on next boot — unless
+// this was an abandon-mode stop that fully quiesced, and the start-generation
+// mechanism is installed. Call only after every other shutdown step has
+// completed successfully; an aborted or failing shutdown must not vouch.
+func (p *Pool) CommitReceipt() {
+	if !p.abandonOnStop || !p.quiesced {
+		return
+	}
+	gen, ok := readGeneration()
+	if !ok {
+		p.log.Info().Msg("pool: start-generation mechanism not installed — no receipt written")
+		return
+	}
+	bootID, err := readBootID()
+	if err != nil {
+		p.log.Warn().Err(err).Msg("pool: boot id unreadable — no receipt written")
+		return
+	}
+	r := &poolReceipt{
+		BootID:      bootID,
+		Generation:  gen,
+		Fingerprint: slotPolicyFingerprint(),
+		Fresh:       p.receiptFresh,
+		Recycled:    p.receiptRecycled,
+	}
+	if err := writePoolReceipt(r); err != nil {
+		p.log.Warn().Err(err).Msg("pool: receipt write failed — next boot takes the full adoption path")
+		return
+	}
+	p.log.Info().Int("fresh", len(r.Fresh)).Int("recycled", len(r.Recycled)).
+		Uint64("generation", gen).Msg("pool: receipt committed for next boot")
 }
 
 // refillStep outcomes: the worker delivered/discarded a slot and should loop,
