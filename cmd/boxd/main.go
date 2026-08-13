@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1409,15 +1410,28 @@ const staleHandleRetryBudget = 5 * time.Second
 // would just eat into the retry budget without a compensating benefit.
 const staleHandleRetryDelay = 150 * time.Millisecond
 
+// staleHandleRetryBodyLimit caps how large a request body we'll buffer
+// in memory to make it replayable across ESTALE retries. Retrying means
+// replaying the same bytes into a fresh open(), which needs the body
+// in memory, but buffering an arbitrarily large upload risks OOMing the
+// guest -- the proxy allows uploads up to 4 GiB (internal/proxy/files.go),
+// far larger than typical guest memory. Bodies at or under the limit get
+// buffered and retried; anything larger streams straight through with a
+// single attempt and no retry, the same behavior as before this logic
+// existed.
+const staleHandleRetryBodyLimit = 32 << 20 // 32 MiB
+
 func isStaleHandle(err error) bool {
 	return errors.Is(err, syscall.ESTALE)
 }
 
-// writeFileAttempt performs one mkdir+open+write+close cycle. It's split
-// out so handleFileUpload can retry the whole sequence on ESTALE — the
-// mkdir and the open can each independently observe a stale handle on the
-// same mount.
-func writeFileAttempt(path string, body []byte) (int64, error) {
+// writeFileAttempt performs one mkdir+open+write+close cycle, copying
+// body into the file. It's split out so handleFileUpload can retry the
+// whole sequence on ESTALE — the mkdir and the open can each
+// independently observe a stale handle on the same mount. body is an
+// io.Reader rather than a []byte so the same function serves both the
+// buffered (retryable) and streamed (large-upload) paths.
+func writeFileAttempt(path string, body io.Reader) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return 0, fmt.Errorf("mkdir: %w", err)
 	}
@@ -1427,7 +1441,7 @@ func writeFileAttempt(path string, body []byte) (int64, error) {
 		return 0, fmt.Errorf("create file: %w", err)
 	}
 
-	written, werr := f.Write(body)
+	written, werr := io.Copy(f, body)
 	cerr := f.Close()
 	if werr != nil {
 		_ = os.Remove(path)
@@ -1437,28 +1451,37 @@ func writeFileAttempt(path string, body []byte) (int64, error) {
 		_ = os.Remove(path)
 		return 0, fmt.Errorf("write: %w", cerr)
 	}
-	return int64(written), nil
+	return written, nil
 }
 
 func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
-	// Buffer the body up front. Retrying a stale-handle failure means
-	// replaying the same bytes into a fresh open(), and an http.Request
-	// body can't be re-read once io.Copy has partially drained it.
-	body, err := io.ReadAll(r.Body)
+	// Peek up to the retry-buffer limit rather than reading the whole
+	// body blindly. If the body is larger than the limit, len(peeked)
+	// comes back as limit+1 without hitting EOF, and we fall through to
+	// the streamed, non-retrying path with those bytes stitched back
+	// onto the front of the body.
+	peeked, err := io.ReadAll(io.LimitReader(r.Body, staleHandleRetryBodyLimit+1))
 	if err != nil {
 		errJSON, _ := json.Marshal(map[string]string{"error": "read body: " + err.Error()})
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
 		return
 	}
 
-	deadline := time.Now().Add(staleHandleRetryBudget)
 	var written int64
-	for {
-		written, err = writeFileAttempt(path, body)
-		if err == nil || !isStaleHandle(err) || time.Now().After(deadline) {
-			break
+	if int64(len(peeked)) > staleHandleRetryBodyLimit {
+		written, err = writeFileAttempt(path, io.MultiReader(bytes.NewReader(peeked), r.Body))
+	} else {
+		deadline := time.Now().Add(staleHandleRetryBudget)
+		for {
+			written, err = writeFileAttempt(path, bytes.NewReader(peeked))
+			if err == nil || !isStaleHandle(err) || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(staleHandleRetryDelay)
+			if time.Now().After(deadline) {
+				break
+			}
 		}
-		time.Sleep(staleHandleRetryDelay)
 	}
 	if err != nil {
 		if errors.Is(err, syscall.ENOSPC) {
