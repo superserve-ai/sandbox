@@ -566,9 +566,16 @@ func TestStaleRecordVerificationCannotResurrectRow(t *testing.T) {
 	if err := j.Nack(thief, now.Add(claimTTL)); err != nil {
 		t.Fatal(err)
 	}
-	// The stale worker's progress write is refused and recreates nothing.
+	// The stale worker's progress write is refused and recreates nothing
+	// — but the verification history survives: those object bytes are
+	// digest-verified in the bucket regardless of who owns the row, and
+	// dropping the record would make the replacement's create-only
+	// dedupe abandon a provably good generation.
 	if err := j.RecordVerification(stale, "bucket\x00obj", now.Add(claimTTL)); !errors.Is(err, errClaimStolen) {
 		t.Fatalf("stale RecordVerification = %v, want errClaimStolen", err)
+	}
+	if verified, err := j.WasVerified("bucket\x00obj", now.Add(claimTTL)); err != nil || !verified {
+		t.Fatalf("WasVerified after refused stale record = %v/%v, want history preserved", verified, err)
 	}
 	// The full attack chain stays closed: the follow-up stale Ack is
 	// still refused and the re-keyed row's index survives.

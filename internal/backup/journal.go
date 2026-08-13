@@ -2,6 +2,7 @@ package backup
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -472,12 +473,19 @@ func (j *Journal) Release(task Task) {
 // Fenced like every row write, but WITHOUT dropping the claim — this is
 // mid-flight progress, not resolution. An unfenced write here would
 // recreate the row a replacement worker already resolved, forging
-// exactly the durable row-presence evidence Ack and Nack fence on; a
-// refused stale record is safe to lose (the bytes are create-only in
-// the bucket, and the replacement's own attempt records or re-proves
-// them under the existing rules).
+// exactly the durable row-presence evidence Ack and Nack fence on.
+// The fence rejects only the ROW half: the history entry records that
+// these exact object bytes were stream-verified, which is object-level
+// truth independent of who owns the row now — and it must survive the
+// steal, because the replacement's own upload of a non-shared object
+// this caller already finalized dedupes against it and, per the strict
+// no-history rule, would otherwise abandon a generation whose bytes are
+// provably good. History-without-row-progress is the safe direction of
+// the usual atomicity concern (the caller adopts in-memory trust only
+// on full success), so the stolen path still returns errClaimStolen
+// after recording it.
 func (j *Journal) RecordVerification(task Task, object string, now time.Time) error {
-	return j.guarded(task, func() error {
+	err := j.guarded(task, func() error {
 		return j.db.Update(func(tx *bolt.Tx) error {
 			b := tx.Bucket(journalBucket)
 			existing := b.Get(task.key())
@@ -495,6 +503,14 @@ func (j *Journal) RecordVerification(task Task, object string, now time.Time) er
 			return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
 		})
 	})
+	if errors.Is(err, errClaimStolen) {
+		if herr := j.db.Update(func(tx *bolt.Tx) error {
+			return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
+		}); herr != nil {
+			return herr
+		}
+	}
+	return err
 }
 
 // PendingBaseSHAs returns the content hashes of every base image some
