@@ -1,10 +1,8 @@
 package proxy
 
 import (
-	"fmt"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"strconv"
 	"time"
 )
@@ -48,29 +46,15 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 	}
 	tStart := time.Now()
 
-	token := r.Header.Get(accessTokenHeader)
-	if token == "" {
-		http.Error(w, "missing X-Access-Token header", http.StatusUnauthorized)
-		return
-	}
-	r.Header.Del(accessTokenHeader)
-	r.Header.Del(headerSandboxID)
-	w.Header().Set("Referrer-Policy", "no-referrer")
-
-	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
-	if fail != nil {
-		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("exec: auth failed")
-		fail.write(w)
+	info, ok := h.authorizeBoxdRequest(w, r, instanceID, "exec")
+	if !ok {
 		return
 	}
 	tAuthDone := time.Now()
 	h.captureUsage(instanceID, "command_run", info)
 
 	transport := h.transports.get(instanceID, info)
-	target := &url.URL{
-		Scheme: "http",
-		Host:   fmt.Sprintf("%s:%d", info.VMIP, boxdPort),
-	}
+	target := boxdTarget(info)
 
 	// Per-request phase fields, mirroring the create path's phase log:
 	// aggregate across requests or read one line for a single create→exec
@@ -86,20 +70,7 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 	)
 
 	rp := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			req.Host = r.Host
-			req.Header["X-Forwarded-For"] = nil
-			for _, hdr := range []string{
-				"X-Forwarded-Host",
-				"X-Forwarded-Proto",
-				"X-Real-Ip",
-				"Forwarded",
-			} {
-				req.Header.Del(hdr)
-			}
-		},
+		Director:  boxdDirector(r.Host, target),
 		Transport: transport,
 		// -1: stream each chunk as it arrives — required for SSE.
 		FlushInterval: -1,
