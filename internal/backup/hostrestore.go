@@ -23,15 +23,17 @@ import (
 type HostRestoreItem struct {
 	SandboxID string
 	Dest      string
-	// WantVMStateSHA, when set, names the vmstate digest of the
-	// sandbox's latest pause as the control plane recorded it. Bucket
-	// object times are upload-completion times, so a retry-delayed old
-	// upload can finish after a newer pause's and rank first by age; the
-	// digest match selects the generation of the ACTUAL latest pause,
-	// with newest-completed as the recorded fallback when no candidate
-	// matches (the latest pause's upload may not have finished before
-	// the host died).
-	WantVMStateSHA string
+	// WantVMStateSHAs lists vmstate digests of the sandbox's pauses in
+	// the control plane's capture order, newest first. Bucket object
+	// times are upload-completion times, so a retry-delayed old upload
+	// can finish after a newer pause's and rank first by age; selection
+	// walks this list and takes the first digest with a matching
+	// manifest, so recovery lands on the newest CAPTURED pause that
+	// actually reached the bucket, however deep the control plane's
+	// history goes. Newest-completed is the recorded fallback only when
+	// no listed digest matches (or the list is empty), where capture
+	// order is unrecoverable by construction: manifests are timeless.
+	WantVMStateSHAs []string
 }
 
 // HostRestoreResult is the per-item outcome of a bulk restore. Exactly
@@ -191,15 +193,14 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 	// is newest-first with early exit so the common case pays one fetch,
 	// candidates probe in small parallel batches, and history depth is
 	// capped by retention once GC lands.
-	if item.WantVMStateSHA != "" {
-		matchIdx := -1
+	if len(item.WantVMStateSHAs) > 0 {
+		var vmstateByGen sync.Map
 		unreadable := 0
-		for lo := 0; lo < len(gens) && matchIdx < 0; lo += anchorProbeBatch {
+		for lo := 0; lo < len(gens); lo += anchorProbeBatch {
 			hi := lo + anchorProbeBatch
 			if hi > len(gens) {
 				hi = len(gens)
 			}
-			found := make([]bool, hi-lo)
 			failed := make([]bool, hi-lo)
 			var pwg sync.WaitGroup
 			for i := lo; i < hi; i++ {
@@ -212,31 +213,37 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 						return
 					}
 					for _, f := range m.Files {
-						if f.Name == "vmstate.snap" && f.SHA256 == item.WantVMStateSHA {
-							found[i-lo] = true
-							return
+						if f.Name == "vmstate.snap" {
+							vmstateByGen.Store(gens[i].Generation, f.SHA256)
 						}
 					}
 				}(i)
 			}
 			pwg.Wait()
-			for i, ok := range found {
-				if ok {
-					matchIdx = lo + i
-					break
-				}
-			}
 			for _, bad := range failed {
 				if bad {
 					unreadable++
 				}
 			}
 		}
+		// Walk the control plane's capture order, newest first: the
+		// first listed digest with a manifest in the bucket is the
+		// newest captured pause that survived.
+		match := ""
+		for _, sha := range item.WantVMStateSHAs {
+			for _, g := range gens {
+				if got, ok := vmstateByGen.Load(g.Generation); ok && got == sha {
+					match = g.Generation
+					break
+				}
+			}
+			if match != "" {
+				break
+			}
+		}
 		switch {
-		case matchIdx >= 0:
-			// A found anchor wins outright: only one generation carries
-			// this digest, so errors on other candidates are moot.
-			res.Generation = gens[matchIdx].Generation
+		case match != "":
+			res.Generation = match
 		case unreadable > 0:
 			// Fail closed: an unreadable candidate may BE the anchor, and
 			// falling back would silently roll the sandbox to an older

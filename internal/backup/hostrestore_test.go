@@ -157,7 +157,7 @@ func TestHostRestoreSelectsByVMStateDigest(t *testing.T) {
 	root := t.TempDir()
 	r := &HostRestorer{Reader: store, Lister: store, Concurrency: 1}
 	report := r.Run(context.Background(), []HostRestoreItem{{
-		SandboxID: newTask.SandboxID, Dest: filepath.Join(root, "a"), WantVMStateSHA: newSHA,
+		SandboxID: newTask.SandboxID, Dest: filepath.Join(root, "a"), WantVMStateSHAs: []string{newSHA},
 	}})
 	if report.Restored != 1 || report.Results[0].Generation != newTask.Generation {
 		t.Fatalf("digest anchor picked %+v, want the newer pause %s", report.Results[0], newTask.Generation)
@@ -167,7 +167,7 @@ func TestHostRestoreSelectsByVMStateDigest(t *testing.T) {
 	// completed wins with the fallback recorded.
 	report = r.Run(context.Background(), []HostRestoreItem{{
 		SandboxID: newTask.SandboxID, Dest: filepath.Join(root, "b"),
-		WantVMStateSHA: "0000000000000000000000000000000000000000000000000000000000000000",
+		WantVMStateSHAs: []string{"0000000000000000000000000000000000000000000000000000000000000000"},
 	}})
 	if report.Restored != 1 || report.Results[0].Reason == "" {
 		t.Fatalf("fallback = %+v, want newest-completed with recorded reason", report.Results[0])

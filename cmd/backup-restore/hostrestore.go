@@ -27,7 +27,7 @@ import (
 func runHostRestore(ctx context.Context, reader backup.BlobReader, lister backup.BlobLister,
 	hostID, dbURL, itemsFile, destRoot string, concurrency int, execute bool) int {
 	var ids []string
-	wantSHAs := map[string]string{}
+	wantSHAs := map[string][]string{}
 	var err error
 	switch {
 	case itemsFile != "":
@@ -54,9 +54,9 @@ func runHostRestore(ctx context.Context, reader backup.BlobReader, lister backup
 	items := make([]backup.HostRestoreItem, 0, len(ids))
 	for _, id := range ids {
 		items = append(items, backup.HostRestoreItem{
-			SandboxID:      id,
-			Dest:           filepath.Join(destRoot, id),
-			WantVMStateSHA: wantSHAs[id],
+			SandboxID:       id,
+			Dest:            filepath.Join(destRoot, id),
+			WantVMStateSHAs: wantSHAs[id],
 		})
 	}
 	mode := "dry-run"
@@ -111,35 +111,38 @@ func runHostRestore(ctx context.Context, reader backup.BlobReader, lister backup
 // sandboxIDsFromDB enumerates live sandboxes the control plane pins to
 // the host. Destroyed sandboxes are excluded (their backups follow the
 // retention policy, not DR), as is anything never assigned here.
-func sandboxIDsFromDB(ctx context.Context, dbURL, hostID string) ([]string, map[string]string, error) {
+func sandboxIDsFromDB(ctx context.Context, dbURL, hostID string) ([]string, map[string][]string, error) {
 	conn, err := pgx.Connect(ctx, dbURL)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect: %w", err)
 	}
 	defer conn.Close(ctx)
-	// The latest pause's vmstate digest anchors generation selection to
-	// capture order rather than upload-completion order.
+	// Pause vmstate digests in capture order (newest first) anchor
+	// generation selection to capture order rather than
+	// upload-completion order, as deep as the control plane's snapshot
+	// history goes.
 	rows, err := conn.Query(ctx, `
 		SELECT sb.id,
-		       COALESCE((SELECT am.sha256 FROM artifact_manifest am
+		       COALESCE(ARRAY(SELECT am.sha256 FROM artifact_manifest am
 		         JOIN snapshot s ON s.id = am.snapshot_id
 		         WHERE s.sandbox_id = sb.id AND am.file_name = 'vmstate.snap'
-		         ORDER BY s.generation DESC LIMIT 1), '')
+		         ORDER BY s.generation DESC), '{}')
 		FROM sandbox sb WHERE sb.host_id = $1 AND sb.destroyed_at IS NULL ORDER BY sb.id`, hostID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("query: %w", err)
 	}
 	defer rows.Close()
 	var ids []string
-	shas := map[string]string{}
+	shas := map[string][]string{}
 	for rows.Next() {
-		var id, sha string
-		if err := rows.Scan(&id, &sha); err != nil {
+		var id string
+		var list []string
+		if err := rows.Scan(&id, &list); err != nil {
 			return nil, nil, err
 		}
 		ids = append(ids, id)
-		if sha != "" {
-			shas[id] = sha
+		if len(list) > 0 {
+			shas[id] = list
 		}
 	}
 	return ids, shas, rows.Err()
@@ -151,14 +154,14 @@ func sandboxIDsFromDB(ctx context.Context, dbURL, hostID string) ([]string, map[
 // columns from a DB replica when the primary is down). Without the
 // digest, selection degrades to newest-completed, exactly as recorded
 // in the ledger.
-func sandboxIDsFromFile(path string) ([]string, map[string]string, error) {
+func sandboxIDsFromFile(path string) ([]string, map[string][]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer f.Close()
 	var ids []string
-	shas := map[string]string{}
+	shas := map[string][]string{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -168,7 +171,7 @@ func sandboxIDsFromFile(path string) ([]string, map[string]string, error) {
 		fields := strings.Fields(line)
 		ids = append(ids, fields[0])
 		if len(fields) > 1 {
-			shas[fields[0]] = fields[1]
+			shas[fields[0]] = fields[1:]
 		}
 	}
 	return ids, shas, sc.Err()
