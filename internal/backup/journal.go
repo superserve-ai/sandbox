@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -103,6 +104,21 @@ func (t *Task) HasVerified(object string) bool {
 // staging deletable, so it must never fire early.
 type Journal struct {
 	db *bolt.DB
+
+	// mu guards claims and spans Next's whole scan-and-claim, so two
+	// concurrent drain workers can never select the same entry.
+	mu sync.Mutex
+	// claims marks queue keys handed out by Next and not yet resolved by
+	// Ack or Nack, so concurrent workers each receive a distinct task.
+	// Deliberately in-memory: bolt's exclusive file lock makes the journal
+	// single-process, so a claim can only ever be held by this process,
+	// and a crash releases every claim by construction — persisting them
+	// would instead make a restarted vmd wait out stale leases before
+	// resuming in-flight work. The expiry is a backstop for a worker
+	// goroutine wedged past any plausible upload; a steal after expiry
+	// duplicates work but never corrupts it (objects are content-addressed
+	// and create-only).
+	claims map[string]time.Time
 }
 
 var (
@@ -148,6 +164,13 @@ const pruneExamineLimit = 64
 // (prefixed so it sorts apart from object names, which never start NUL).
 var pruneCursorKey = []byte("\x00prune_cursor")
 
+// claimTTL bounds how long an unresolved claim excludes its task from
+// Next. Sized above the slowest plausible upload at the bandwidth cap (a
+// multi-GB shared base at 100 Mbit/s runs tens of minutes), so expiry
+// only ever fires on a genuinely wedged worker; the steal it then permits
+// is safe, just redundant.
+const claimTTL = time.Hour
+
 // NewJournal opens (creating if needed) the journal bucket in db. The
 // caller owns the bolt DB; sharing vmd's state DB keeps one fsync domain.
 func NewJournal(db *bolt.DB) (*Journal, error) {
@@ -162,7 +185,7 @@ func NewJournal(db *bolt.DB) (*Journal, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create journal bucket: %w", err)
 	}
-	return &Journal{db: db}, nil
+	return &Journal{db: db, claims: make(map[string]time.Time)}, nil
 }
 
 // readyAt is when the task becomes runnable: its enqueue time until a
@@ -271,16 +294,30 @@ func (j *Journal) Enqueue(task Task) error {
 	})
 }
 
-// Next returns the highest-priority runnable task (NotBefore in the past),
-// or ok=false when the queue has nothing runnable. Keys sort by
-// readiness within each priority, so the first decodable entry of a
-// priority answers for the whole priority: not ready means nothing
-// behind it is ready either, and the cursor seeks straight to the next
-// priority. A corrupt entry must never wedge the queue: it is deleted
-// (self-healing) rather than surfaced as a permanent error, and the scan
-// continues past it.
+// Next returns the highest-priority runnable task (NotBefore in the past)
+// and claims it until Ack or Nack resolves it, or ok=false when the queue
+// has nothing runnable and unclaimed. Keys sort by readiness within each
+// priority, so the first decodable UNCLAIMED entry of a priority answers
+// for the whole priority: claimed entries were ready when claimed and so
+// sort with the ready entries at the front of their tier, meaning they
+// are skipped individually (ownership is not readiness — the entry behind
+// a claimed one may be free), while a deferred entry still proves nothing
+// behind it in the tier is ready and the cursor seeks straight to the
+// next priority. A corrupt entry must never wedge the queue: it is
+// deleted (self-healing) rather than surfaced as a permanent error, and
+// the scan continues past it.
 func (j *Journal) Next(now time.Time) (Task, bool, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	// Expired claims (a worker wedged past claimTTL) become claimable
+	// again here; no separate reaper.
+	for k, until := range j.claims {
+		if !until.After(now) {
+			delete(j.claims, k)
+		}
+	}
 	var task Task
+	var claimKey string
 	var corrupt [][]byte
 	found := false
 	err := j.db.View(func(tx *bolt.Tx) error {
@@ -292,13 +329,22 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 				k, v = c.Next()
 				continue
 			}
+			if _, claimed := j.claims[string(k)]; claimed {
+				k, v = c.Next()
+				continue
+			}
 			if !t.NotBefore.After(now) {
 				task = t
+				// Claim under the stored key, not a recomputed one: the
+				// two agree everywhere except the corrupt-row replacement
+				// path in Enqueue, and a claim registered under a key the
+				// scan will never see would silently dedupe nothing.
+				claimKey = string(k)
 				found = true
 				break
 			}
-			// Earliest entry of this priority is deferred: skip the
-			// whole priority.
+			// Earliest unclaimed entry of this priority is deferred: skip
+			// the whole priority.
 			k, v = c.Seek(append([]byte(fmt.Sprintf("%d", t.Priority+1)), '/'))
 		}
 		return nil
@@ -329,7 +375,25 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 			return Task{}, false, fmt.Errorf("drop corrupt journal entries: %w", err)
 		}
 	}
+	if found {
+		j.claims[claimKey] = now.Add(claimTTL)
+	}
 	return task, found, nil
+}
+
+// release drops the claim Next registered under key, if any. Called from
+// Ack and Nack regardless of their transaction's outcome, but only AFTER
+// it: a resolution that failed leaves the row in place and freeing the
+// claim lets any worker retry it promptly instead of waiting out the TTL,
+// while releasing before the transaction commits would let another worker
+// claim the row mid-resolution and resolve it against a key the
+// transaction is about to invalidate. The key matches the stored key on
+// every path except Enqueue's corrupt-row replacement; a claim orphaned
+// there expires via the TTL backstop.
+func (j *Journal) release(key []byte) {
+	j.mu.Lock()
+	delete(j.claims, string(key))
+	j.mu.Unlock()
 }
 
 // RecordVerification persists BOTH verification records in one
@@ -471,6 +535,7 @@ func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
 // durable moment to remember that a completion signal is still owed.
 // Piggybacks a bounded lazy prune of expired verification history.
 func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
+	defer j.release(task.key())
 	completed := completedScope != ""
 	now := time.Now()
 	return j.db.Update(func(tx *bolt.Tx) error {
@@ -546,6 +611,10 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 // upgrade after its marker was already cleared.
 func (j *Journal) Nack(task Task, now time.Time) error {
 	old := task.key()
+	// The claim was registered under the pre-reschedule key; the deferral
+	// below re-keys the row, so release that original key, not a
+	// recomputation over the mutated task.
+	defer j.release(old)
 	task.Attempts++
 	backoff := time.Duration(1<<min(task.Attempts, 8)) * time.Second
 	const maxBackoff = 10 * time.Minute

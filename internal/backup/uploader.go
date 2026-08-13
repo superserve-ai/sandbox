@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -52,15 +53,25 @@ type ManifestFile struct {
 	Extents    []Extent `json:"extents"`
 }
 
-// Uploader drains the journal into the blob store. Single drain loop:
-// fleet-wide churn is tens of GB/day, so one bandwidth-capped stream is
-// deliberate simplicity, not a bottleneck.
+// Uploader drains the journal into the blob store with Concurrency
+// workers sharing one bandwidth cap. The journal's claim mechanism hands
+// each worker a distinct task; per-task overhead (digest pre-check, GCS
+// round trips) rather than bandwidth is what bounds drain throughput at
+// the fleet's pause rates, so workers raise task throughput while the
+// shared limiter keeps total egress exactly where one stream held it.
 type Uploader struct {
 	Journal *Journal
 	Store   BlobStore
 	// Limiter caps upload bandwidth in bytes/sec so backups never starve
-	// guest traffic or the UFFD resume path.
+	// guest traffic or the UFFD resume path. One instance shared by every
+	// worker BY DESIGN: a per-worker limiter would multiply the cap by
+	// the worker count.
 	Limiter *rate.Limiter
+	// Concurrency is the number of drain workers; 0 or less means 1.
+	// Deliberately a fixed count rather than derived from host cores: the
+	// budget being spent is what backup work takes from tenant VMs, not
+	// what the host has.
+	Concurrency int
 	Log     zerolog.Logger
 	// VMDVersion is stamped into generation manifests.
 	VMDVersion string
@@ -91,6 +102,13 @@ type Uploader struct {
 	// metrics error can never affect backup behavior: the recorder only
 	// observes, it is never consulted.
 	Metrics *telemetry.BackupRecorder
+
+	// notifyMu lets concurrent workers skip a flush another worker is
+	// already running rather than delivering the same outbox entries
+	// twice back-to-back. Correctness never depends on it: delivery is
+	// at-least-once and the outbox persists anything a skipped flush
+	// would have sent.
+	notifyMu sync.Mutex
 }
 
 func (u *Uploader) clock() time.Time {
@@ -129,6 +147,29 @@ func (u *Uploader) Run(ctx context.Context) error {
 	// Deliver completion signals a previous process acked but never
 	// notified: the outbox is the only record of those.
 	u.flushNotifications()
+	n := u.Concurrency
+	if n < 1 {
+		n = 1
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		// Exactly one worker owns the staging sweep: it is journal-global
+		// work, and N workers each running it would multiply directory
+		// walks without clearing residue any faster.
+		go func(sweeper bool) {
+			defer wg.Done()
+			u.drainLoop(ctx, tick, sweeper)
+		}(i == 0)
+	}
+	wg.Wait()
+	return nil
+}
+
+// drainLoop is one worker: it drains claimed tasks until ctx ends,
+// backing off on idle and errors. The sweeper additionally runs the
+// periodic staged-base sweep.
+func (u *Uploader) drainLoop(ctx context.Context, tick time.Duration, sweeper bool) {
 	lastSweep := u.clock()
 	for {
 		// Checked every iteration: a successful Nack after a canceled
@@ -136,12 +177,12 @@ func (u *Uploader) Run(ctx context.Context) error {
 		// backlog would be drained (and pointlessly nacked) task by task
 		// before the idle select ever observed cancellation.
 		if ctx.Err() != nil {
-			return nil
+			return
 		}
 		worked, err := u.drainOne(ctx, u.clock())
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return
 			}
 			u.Log.Error().Err(err).Msg("backup drain error")
 		}
@@ -150,7 +191,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 		if !worked || err != nil {
 			select {
 			case <-ctx.Done():
-				return nil
+				return
 			case <-time.After(tick):
 			}
 			// Retry any undelivered completion signal on the idle tick:
@@ -164,7 +205,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 		// periodically. Deliberately OUTSIDE the idle branch: a host
 		// with a standing backlog never idles, and the sweep must not
 		// starve exactly when staged residue accumulates fastest.
-		if u.StagingRoot != "" && u.clock().Sub(lastSweep) > stagingSweepInterval {
+		if sweeper && u.StagingRoot != "" && u.clock().Sub(lastSweep) > stagingSweepInterval {
 			lastSweep = u.clock()
 			SweepStaging(u.StagingRoot, u.Journal, u.Log)
 			u.sweepLegacyStaging()
@@ -266,6 +307,14 @@ func (u *Uploader) flushNotifications() {
 	if u.OnVerified == nil {
 		return
 	}
+	// One flush at a time: a second worker arriving mid-flush would read
+	// the same not-yet-cleared entries and double-deliver immediately.
+	// Skipping is safe — anything it would have sent is still outboxed
+	// and goes with the next ack or idle flush.
+	if !u.notifyMu.TryLock() {
+		return
+	}
+	defer u.notifyMu.Unlock()
 	pending, err := u.Journal.PendingNotifications()
 	if err != nil {
 		u.Metrics.AddNotifyFailure(context.Background())

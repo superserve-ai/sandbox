@@ -294,3 +294,121 @@ func TestJournalOutboxDepth(t *testing.T) {
 		t.Fatalf("outbox depth after clear = %d err=%v, want 0", depth, err)
 	}
 }
+
+// Concurrent drain workers must each receive a distinct task: Next
+// claims what it returns until Ack or Nack resolves it.
+func TestNextClaimsTasksForConcurrentWorkers(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	for _, task := range []Task{
+		{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base},
+		{SandboxID: "sb-b", Generation: "bbb", Priority: PriorityPause, EnqueuedAt: base.Add(time.Second)},
+	} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := base.Add(time.Minute)
+	first, ok, err := j.Next(now)
+	if err != nil || !ok || first.SandboxID != "sb-a" {
+		t.Fatalf("first Next = %+v/%v/%v, want sb-a", first, ok, err)
+	}
+	// A second worker draining while the first is mid-upload gets the
+	// NEXT task, not the same one.
+	second, ok, err := j.Next(now)
+	if err != nil || !ok || second.SandboxID != "sb-b" {
+		t.Fatalf("second Next = %+v/%v/%v, want sb-b", second, ok, err)
+	}
+	// Both claimed: a third worker finds nothing runnable.
+	if _, ok, err := j.Next(now); err != nil || ok {
+		t.Fatalf("third Next = %v/%v, want nothing runnable", ok, err)
+	}
+}
+
+// Ack and Nack release the claim: an acked task's slot frees for the
+// tier behind it, a nacked task returns (deferred) rather than staying
+// claim-locked forever.
+func TestAckAndNackReleaseClaims(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	task := Task{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	now := base.Add(time.Minute)
+	got, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	if err := j.Nack(got, now); err != nil {
+		t.Fatal(err)
+	}
+	// The nacked task is deferred by backoff, not claim-locked: past its
+	// NotBefore it drains again.
+	redo, ok, err := j.Next(now.Add(time.Hour))
+	if err != nil || !ok || redo.Attempts != 1 {
+		t.Fatalf("Next after Nack = %+v/%v/%v, want attempts=1", redo, ok, err)
+	}
+	if err := j.Ack(redo, "bucket", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := j.Next(now.Add(2 * time.Hour)); err != nil || ok {
+		t.Fatalf("Next after Ack = %v/%v, want empty queue", ok, err)
+	}
+	// The claim table must not leak resolved entries.
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.claims) != 0 {
+		t.Fatalf("claims after resolution = %v, want empty", j.claims)
+	}
+}
+
+// A claimed pause task must not wall off the rest of the queue: the scan
+// skips it individually (unlike a deferred head, which proves its whole
+// tier unready) and continues into lower tiers when the claimant's tier
+// is exhausted.
+func TestClaimedHeadDoesNotBlockTierOrQueue(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	for _, task := range []Task{
+		{SandboxID: "sb-pause", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base},
+		{TemplateID: "tpl", BuildID: "b1", Generation: "ccc", Priority: PriorityCheckpoint, EnqueuedAt: base},
+	} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := base.Add(time.Minute)
+	first, ok, err := j.Next(now)
+	if err != nil || !ok || first.SandboxID != "sb-pause" {
+		t.Fatalf("first Next = %+v/%v/%v, want the pause task", first, ok, err)
+	}
+	// With the only pause task claimed, a second worker reaches the
+	// checkpoint tier instead of idling behind the claim.
+	second, ok, err := j.Next(now)
+	if err != nil || !ok || second.TemplateID != "tpl" {
+		t.Fatalf("second Next = %+v/%v/%v, want the checkpoint task", second, ok, err)
+	}
+}
+
+// A claim left unresolved past its lease (wedged worker) expires and the
+// task becomes drainable again.
+func TestClaimExpiryReclaims(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	task := Task{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	now := base.Add(time.Minute)
+	if _, ok, err := j.Next(now); err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	if _, ok, err := j.Next(now.Add(claimTTL - time.Second)); err != nil || ok {
+		t.Fatalf("Next within lease = %v/%v, want claim held", ok, err)
+	}
+	redo, ok, err := j.Next(now.Add(claimTTL))
+	if err != nil || !ok || redo.SandboxID != "sb-a" {
+		t.Fatalf("Next past lease = %+v/%v/%v, want the task reclaimed", redo, ok, err)
+	}
+}
