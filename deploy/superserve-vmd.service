@@ -43,6 +43,22 @@ EnvironmentFile=/etc/sandbox/vmd.env
 
 LimitNOFILE=65536
 
+# Weight vmd below the default (100) for CPU and IO so its background
+# work — backup hashing and upload streaming, staging copies, sweeps —
+# yields to live VMs under contention. Weights are proportional-share,
+# not caps: an idle host gives vmd full throughput, which is exactly the
+# shape backup drain wants (full speed when quiet, back off when tenant
+# VMs need the cores or the disk). Direct-spawn VMs run under the
+# delegated superserve-vms.service and firecracker@ units under
+# sandboxes.slice, both siblings of this unit at default weight, so
+# these values bias every peer contention in the VMs' favor. The
+# tradeoff is that vmd's own RPC paths (pause, resume) are deprioritized
+# too; the pause-hook duration histogram is the guard metric, and the
+# escape hatch if it regresses is moving upload work into a sub-cgroup,
+# not removing the weights.
+CPUWeight=25
+IOWeight=25
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=vmd
