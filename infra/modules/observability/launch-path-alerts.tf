@@ -10,6 +10,12 @@
 # watch the same bounded host_id label as the backup metrics.
 
 locals {
+  # Queries below use fully-qualified typed metric names
+  # (prometheus.googleapis.com/<name>/gauge) rather than bare PromQL names:
+  # Managed Prometheus resolves a bare name ending in _total as a counter —
+  # which does not exist for our gauge — and rejects policies referencing
+  # metrics that have not emitted yet (vmd_launcher_ready ships in the same
+  # change as its policy). The typed form resolves both and is stable.
   launch_path_host_matcher = var.launch_path_alerts == null ? "" : "host_id=\"${var.launch_path_alerts.host_id}\""
 
   launch_path_alert_conditions = var.launch_path_alerts == null ? {} : {
@@ -21,7 +27,7 @@ locals {
       # here is long enough to let a retry succeed and short enough that a
       # host stuck on the legacy path is caught well before it becomes a
       # multi-hour latency incident.
-      query         = "min(vmd_launcher_ready{${local.launch_path_host_matcher}}) < 1"
+      query         = "min({__name__=\"prometheus.googleapis.com/vmd_launcher_ready/gauge\", ${local.launch_path_host_matcher}}) < 1"
       duration      = var.launch_path_alerts.launcher_not_ready_duration
       documentation = <<-EOT
         Firecracker launches on ${var.launch_path_alerts.host_id} are running on the legacy path (vmd_launcher_ready=0), so every VM start walks the host's full mount table instead of the pruned launcher namespace. Expect VM start latency in the hundreds of milliseconds to seconds, growing with the host's mount table, while creates still succeed and nothing errors.
@@ -38,7 +44,7 @@ locals {
       # (deploy duration), ssh session setup, and the launcher pin build — so
       # sustained growth degrades deploys and host access before it degrades
       # anything customers see.
-      query         = "max(vmd_network_netns_total{${local.launch_path_host_matcher}}) > ${var.launch_path_alerts.netns_total_threshold}"
+      query         = "max({__name__=\"prometheus.googleapis.com/vmd_network_netns_total/gauge\", ${local.launch_path_host_matcher}}) > ${var.launch_path_alerts.netns_total_threshold}"
       duration      = var.launch_path_alerts.netns_total_duration
       documentation = <<-EOT
         ${var.launch_path_alerts.host_id} is carrying more than ${var.launch_path_alerts.netns_total_threshold} live network namespaces. Each contributes roughly two host mount-table entries, and that table is walked on every process start, every systemctl daemon-reload, and every ssh login — so deploys slow down, the host gets harder to reach, and the launcher pin build (which protects VM start latency) becomes more likely to fail.
@@ -55,7 +61,7 @@ locals {
       # covers thousands of namespaces in that time, and every mount-table
       # operation gets more expensive the whole way. Reaching this level at
       # all means the controller is not merely lagging but losing.
-      query         = "max(vmd_network_netns_total{${local.launch_path_host_matcher}}) > ${var.launch_path_alerts.netns_critical_threshold}"
+      query         = "max({__name__=\"prometheus.googleapis.com/vmd_network_netns_total/gauge\", ${local.launch_path_host_matcher}}) > ${var.launch_path_alerts.netns_critical_threshold}"
       duration      = var.launch_path_alerts.netns_critical_duration
       documentation = <<-EOT
         ${var.launch_path_alerts.host_id} has passed ${var.launch_path_alerts.netns_critical_threshold} live network namespaces. Unlike the sustained-growth policy, this fires quickly: at this level the reclaim controller has engaged and is losing to inflow, and the count typically keeps climbing rather than levelling off. Deploys, ssh logins, and the launcher pin build all degrade as the mount table grows, and a vmd restart in this state is likely to fail its pin build and leave every VM start on the slow path.
