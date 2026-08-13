@@ -63,10 +63,13 @@ type backupReportBody struct {
 // coverage queries tolerate in one direction (a backup can only be
 // reported after it completed).
 func (r *BackupReporter) Deliver(task backup.Task) error {
-	// ReportedFiles adds the shared base entries the uploader ships into
-	// the bucket manifest: task.Files alone would understate an overlay
-	// generation's restorable set.
-	files := task.ReportedFiles()
+	// Finalized manifests travel verbatim; only legacy outbox entries
+	// (pre-finalization) re-synthesize shared entries, accepting the
+	// zero-size fallback when staging cleanup won the race.
+	files := task.Files
+	if !task.FilesFinal {
+		files = task.ReportedFiles()
+	}
 	// The outbox pinned the bucket the upload verified against; trust it
 	// over the current configuration, which can differ after a restart
 	// that repointed BACKUP_BUCKET while notifications were outboxed.

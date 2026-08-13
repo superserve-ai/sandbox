@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -207,7 +208,7 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 		return false, err
 	}
 	start := u.clock()
-	completed, streamed, err := u.uploadTask(ctx, &task)
+	completed, finalized, streamed, err := u.uploadTask(ctx, &task)
 	// Bytes count what actually reached new bucket objects, failures
 	// included: partial progress is real upload traffic.
 	u.Metrics.AddUploadBytes(ctx, streamed)
@@ -284,7 +285,15 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	// reporting returns (the seed marker is once per scope and cannot
 	// rescan). The outbox simply accumulates until a consumer flushes
 	// it, and the outbox-depth metric surfaces unbounded growth.
-	if err := u.Journal.Ack(task, completedScope, completed); err != nil {
+	ackTask := task
+	if completed && len(finalized) > 0 {
+		// The outbox copy carries the finalized manifest verbatim;
+		// staging cleanup below still uses the original task's local
+		// paths.
+		ackTask.Files = finalized
+		ackTask.FilesFinal = true
+	}
+	if err := u.Journal.Ack(ackTask, completedScope, completed); err != nil {
 		return true, err
 	}
 	removeStagedTask(u.StagingRoot, task)
@@ -415,7 +424,7 @@ func (t *Task) ReportedFiles() []TaskFile {
 // survives into the Nack that re-persists the task on failure. streamed
 // counts bytes written into newly created objects across the attempt,
 // error paths included (dedupes and skips add nothing).
-func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, streamed int64, _ error) {
+func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, finalized []TaskFile, streamed int64, _ error) {
 	gen := GenerationManifest{
 		SandboxID:  task.SandboxID,
 		TemplateID: task.TemplateID,
@@ -435,9 +444,9 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				// address; the generation is abandoned, not retried.
 				task.logOwner(u.lossEvent(task).Str("path", file.Path)).
 					Msg("backup source file gone; abandoning generation")
-				return false, streamed, nil
+				return false, nil, streamed, nil
 			}
-			return false, streamed, err
+			return false, nil, streamed, err
 		}
 		gen.Files = append(gen.Files, mf)
 		// An overlay's holes are backed by its base image, and the bucket
@@ -454,9 +463,9 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				if os.IsNotExist(err) {
 					task.logOwner(u.lossEvent(task).Str("path", file.BasePath)).
 						Msg("backup base image gone; abandoning generation")
-					return false, streamed, nil
+					return false, nil, streamed, nil
 				}
-				return false, streamed, err
+				return false, nil, streamed, err
 			}
 			bmf, n, err := u.uploadFile(ctx, task, bf)
 			streamed += n
@@ -464,9 +473,9 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
 					task.logOwner(u.lossEvent(task).Str("path", bf.Path)).
 						Msg("backup base image gone or rebuilt; abandoning generation")
-					return false, streamed, nil
+					return false, nil, streamed, nil
 				}
-				return false, streamed, err
+				return false, nil, streamed, err
 			}
 			uploadedBases[file.BaseSHA256] = true
 			gen.Files = append(gen.Files, bmf)
@@ -474,20 +483,32 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 	}
 	manifestObject, err := task.objectName(ManifestObject)
 	if err != nil {
-		return false, streamed, err
+		return false, nil, streamed, err
 	}
 	payload, err := json.Marshal(gen)
 	if err != nil {
-		return false, streamed, err
+		return false, nil, streamed, err
 	}
 	created, err := u.Store.Create(ctx, manifestObject, &limitedReader{r: bytes.NewReader(payload), limiter: u.Limiter, ctx: ctx})
 	if err != nil {
-		return false, streamed, fmt.Errorf("manifest object: %w", storeError{err})
+		return false, nil, streamed, fmt.Errorf("manifest object: %w", storeError{err})
 	}
 	if created {
 		streamed += int64(len(payload))
 	}
-	return true, streamed, nil
+	// The finalized reportable set, captured while every size and digest
+	// is authoritative: reconstructing it at delivery time would stat
+	// staged copies that ack-time cleanup may have already removed,
+	// recording zero-size entries in coverage.
+	finalized = make([]TaskFile, 0, len(gen.Files))
+	for _, mf := range gen.Files {
+		finalized = append(finalized, TaskFile{
+			Name: mf.Name, SHA256: mf.SHA256, Size: mf.Size,
+			BasePath: mf.BasePath, BaseSHA256: mf.BaseSHA256,
+			Shared: strings.HasPrefix(mf.Object, "bases/"),
+		})
+	}
+	return true, finalized, streamed, nil
 }
 
 // stagingSweepInterval paces the running staged-base sweep.

@@ -92,6 +92,11 @@ type Task struct {
 	// outbox entries written before the field existed (consumers fall
 	// back to the current bucket, the pre-field behavior).
 	VerifiedBucket string `json:"verified_bucket,omitempty"`
+	// FilesFinal marks Files as the finalized reportable manifest,
+	// captured at upload completion with authoritative sizes; consumers
+	// use it verbatim instead of re-synthesizing shared entries from
+	// local paths that ack-time cleanup may have removed.
+	FilesFinal bool `json:"files_final,omitempty"`
 	// VerifiedAt is when the upload verified, pinned on the outbox copy
 	// alongside VerifiedBucket: deliveries run in outbox key order (owner
 	// and content hash, not chronology), so stamping delivery time would

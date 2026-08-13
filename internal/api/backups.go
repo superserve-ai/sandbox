@@ -144,6 +144,23 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 	apply := func(q *db.Queries) error {
 		var rows int64
 		var err error
+		var sbRow db.LockSandboxRowRow
+		haveSandbox := false
+		if req.SandboxID != "" {
+			// Lock order matches FinalizePause: sandbox row first, then
+			// dependent writes. Inserting the FK-backed coverage row
+			// before the lock took a share lock on the sandbox row and
+			// upgraded it under FOR UPDATE, inviting deadlock against
+			// the lifecycle path.
+			sbRow, err = q.LockSandboxRow(ctx, sandboxID)
+			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+			haveSandbox = err == nil
+			if haveSandbox && sbRow.Status == "pausing" && time.Since(sbRow.UpdatedAt) < 10*time.Minute {
+				return errFinalizeInFlight
+			}
+		}
 		if req.SandboxID != "" {
 			rows, err = q.RecordSandboxBackupGeneration(ctx, db.RecordSandboxBackupGenerationParams{
 				SandboxID:   pgtype.UUID{Bytes: sandboxID, Valid: true},
@@ -197,39 +214,47 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		if row.Status == "pausing" && time.Since(row.UpdatedAt) < 10*time.Minute {
 			return errFinalizeInFlight
 		}
-		snap, err := q.LatestSnapshotVMState(ctx, sandboxID)
+		manifest, err := q.LatestSnapshotManifest(ctx, sandboxID)
 		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil
-			}
 			return err
 		}
-		var vmstate string
-		var total int64
-		var hasDisk bool
+		if len(manifest) == 0 {
+			return nil
+		}
+		byName := map[string]string{}
 		for _, f := range req.Files {
-			if f.Name == "vmstate.snap" {
-				vmstate = f.SHA256
-			}
+			byName[f.Name] = f.SHA256
+		}
+		var total int64
+		var hasDisk, hasVMState bool
+		for _, f := range req.Files {
 			if f.Name == "rootfs.ext4" {
 				hasDisk = true
+			}
+			if f.Name == "vmstate.snap" {
+				hasVMState = true
 			}
 			if !f.Shared {
 				total += f.SizeBytes
 			}
 		}
-		// Size sync requires the complete restorable pair: a report
-		// without the disk entry (coverage-only seeds, or any partial
-		// manifest) must not overwrite the snapshot's recorded size with
-		// a sum that omits its dominant term.
-		if !hasDisk || vmstate == "" || snap.VmstateSha256 != vmstate {
-			// The report describes an older pause (or one whose manifest
-			// hash was skipped): coverage is recorded above, but this
-			// snapshot row's sizes belong to its own pause's report.
+		// The report must carry the complete restorable pair AND match
+		// every digest the pause-time manifest recorded: vmstate alone
+		// is not a unique pause identity, and any recorded row the
+		// report contradicts (or lacks) means it describes a different
+		// pause. Rows are vmstate-only today and tighten the match
+		// automatically as richer manifests appear.
+		if !hasDisk || !hasVMState {
 			return nil
 		}
+		for _, row := range manifest {
+			if byName[row.FileName] != row.Sha256 {
+				return nil
+			}
+		}
+		snapshotID := manifest[0].SnapshotID
 		if err := q.SetSnapshotSizeBytes(ctx, db.SetSnapshotSizeBytesParams{
-			ID: snap.SnapshotID, SizeBytes: total,
+			ID: snapshotID, SizeBytes: total,
 		}); err != nil {
 			return err
 		}

@@ -56,31 +56,46 @@ func (q *Queries) LatestSandboxBackup(ctx context.Context, sandboxID pgtype.UUID
 	return i, err
 }
 
-const latestSnapshotVMState = `-- name: LatestSnapshotVMState :one
-SELECT s.id AS snapshot_id,
-       COALESCE((SELECT am.sha256 FROM artifact_manifest am
-         WHERE am.snapshot_id = s.id AND am.file_name = 'vmstate.snap'), '') AS vmstate_sha256
+const latestSnapshotManifest = `-- name: LatestSnapshotManifest :many
+SELECT s.id AS snapshot_id, am.file_name, am.sha256
 FROM snapshot s
+JOIN artifact_manifest am ON am.snapshot_id = s.id
 WHERE s.sandbox_id = $1
-ORDER BY s.generation DESC
-LIMIT 1
+  AND s.generation = (SELECT MAX(generation) FROM snapshot WHERE sandbox_id = $1)
+ORDER BY am.file_name
 `
 
-type LatestSnapshotVMStateRow struct {
-	SnapshotID    uuid.UUID   `json:"snapshot_id"`
-	VmstateSha256 interface{} `json:"vmstate_sha256"`
+type LatestSnapshotManifestRow struct {
+	SnapshotID uuid.UUID `json:"snapshot_id"`
+	FileName   string    `json:"file_name"`
+	Sha256     string    `json:"sha256"`
 }
 
-// The sandbox's newest snapshot row and the vmstate digest its pause-time
-// manifest recorded. The digest is the join point between a backup report
-// and the snapshot row it describes: pause-time manifests are
-// vmstate-only, so a matching vmstate sha proves the report covers
-// exactly this pause.
-func (q *Queries) LatestSnapshotVMState(ctx context.Context, sandboxID uuid.UUID) (LatestSnapshotVMStateRow, error) {
-	row := q.db.QueryRow(ctx, latestSnapshotVMState, sandboxID)
-	var i LatestSnapshotVMStateRow
-	err := row.Scan(&i.SnapshotID, &i.VmstateSha256)
-	return i, err
+// The sandbox's newest snapshot row with every digest its pause-time
+// manifest recorded. The full recorded set is the join point between a
+// backup report and the snapshot row it describes: vmstate alone is not
+// a unique pause identity (identical vmstate bytes with different disk
+// contents are possible), so the report must match EVERY recorded row.
+// Pause-time manifests are vmstate-only today; rows tighten the match
+// automatically as richer manifests appear.
+func (q *Queries) LatestSnapshotManifest(ctx context.Context, sandboxID uuid.UUID) ([]LatestSnapshotManifestRow, error) {
+	rows, err := q.db.Query(ctx, latestSnapshotManifest, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LatestSnapshotManifestRow{}
+	for rows.Next() {
+		var i LatestSnapshotManifestRow
+		if err := rows.Scan(&i.SnapshotID, &i.FileName, &i.Sha256); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const lockSandboxRow = `-- name: LockSandboxRow :one

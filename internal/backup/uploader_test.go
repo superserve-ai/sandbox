@@ -1399,7 +1399,7 @@ func TestSharedBaseUploadsOnceThenSkipsTheStream(t *testing.T) {
 	}
 
 	t1 := makeTask("sb-one", "overlay one")
-	if completed, _, err := u.uploadTask(context.Background(), &t1); err != nil || !completed {
+	if completed, _, _, err := u.uploadTask(context.Background(), &t1); err != nil || !completed {
 		t.Fatalf("first upload: completed=%v err=%v", completed, err)
 	}
 	var baseObject string
@@ -1416,7 +1416,7 @@ func TestSharedBaseUploadsOnceThenSkipsTheStream(t *testing.T) {
 	}
 
 	t2 := makeTask("sb-two", "overlay two")
-	if completed, _, err := u.uploadTask(context.Background(), &t2); err != nil || !completed {
+	if completed, _, _, err := u.uploadTask(context.Background(), &t2); err != nil || !completed {
 		t.Fatalf("second upload: completed=%v err=%v", completed, err)
 	}
 	if store.creates[baseObject] != 1 {
@@ -1489,7 +1489,7 @@ func TestSharedDedupeRecordsHistoryForFutureSkips(t *testing.T) {
 	baseObject := SharedBaseObject(baseSHA, PackFingerprint(extents, apparent))
 	store.objects[baseObject] = []byte("already there")
 
-	if completed, _, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
+	if completed, _, _, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
 		t.Fatalf("upload: completed=%v err=%v", completed, err)
 	}
 	if store.creates[baseObject] != 1 {
@@ -1609,7 +1609,7 @@ func TestLegacyUnscopedVerificationRecordsStillTrusted(t *testing.T) {
 	if err := j.MigrateVerificationScope(store.Identity()); err != nil {
 		t.Fatal(err)
 	}
-	completed, _, err := u.uploadTask(context.Background(), &task)
+	completed, _, _, err := u.uploadTask(context.Background(), &task)
 	if err != nil || !completed {
 		t.Fatalf("upload with migrated record: completed=%v err=%v (want dedupe trusted)", completed, err)
 	}

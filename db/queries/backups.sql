@@ -75,19 +75,20 @@ LIMIT 1;
 -- silently miss its size sync.
 SELECT id, status, updated_at FROM sandbox WHERE id = $1 FOR UPDATE;
 
--- name: LatestSnapshotVMState :one
--- The sandbox's newest snapshot row and the vmstate digest its pause-time
--- manifest recorded. The digest is the join point between a backup report
--- and the snapshot row it describes: pause-time manifests are
--- vmstate-only, so a matching vmstate sha proves the report covers
--- exactly this pause.
-SELECT s.id AS snapshot_id,
-       COALESCE((SELECT am.sha256 FROM artifact_manifest am
-         WHERE am.snapshot_id = s.id AND am.file_name = 'vmstate.snap'), '') AS vmstate_sha256
+-- name: LatestSnapshotManifest :many
+-- The sandbox's newest snapshot row with every digest its pause-time
+-- manifest recorded. The full recorded set is the join point between a
+-- backup report and the snapshot row it describes: vmstate alone is not
+-- a unique pause identity (identical vmstate bytes with different disk
+-- contents are possible), so the report must match EVERY recorded row.
+-- Pause-time manifests are vmstate-only today; rows tighten the match
+-- automatically as richer manifests appear.
+SELECT s.id AS snapshot_id, am.file_name, am.sha256
 FROM snapshot s
+JOIN artifact_manifest am ON am.snapshot_id = s.id
 WHERE s.sandbox_id = $1
-ORDER BY s.generation DESC
-LIMIT 1;
+  AND s.generation = (SELECT MAX(generation) FROM snapshot WHERE sandbox_id = $1)
+ORDER BY am.file_name;
 
 -- name: SetSnapshotSizeBytes :exec
 UPDATE snapshot SET size_bytes = $2 WHERE id = $1;
