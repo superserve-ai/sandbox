@@ -289,11 +289,19 @@ func (j *Journal) Enqueue(task Task) error {
 				var cur Task
 				if err := json.Unmarshal(existing, &cur); err != nil {
 					// An undecodable row must not swallow the incoming
-					// task as a silent dedupe: replace it.
-					if err := queue.Put(qk, val); err != nil {
+					// task as a silent dedupe: replace it — under the
+					// incoming task's OWN key, never the corrupt row's.
+					// Every row living at exactly its task's key is what
+					// resolution fencing leans on for durable ownership
+					// evidence; a row parked under a foreign key could be
+					// claimed but never acked.
+					if err := queue.Delete(qk); err != nil {
 						return err
 					}
-					return idx.Put(task.indexKey(), qk)
+					if err := queue.Put(task.key(), val); err != nil {
+						return err
+					}
+					return idx.Put(task.indexKey(), task.key())
 				}
 				if task.Staged && !cur.Staged {
 					cur.Files = task.Files
@@ -356,10 +364,10 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 			}
 			if !t.NotBefore.After(now) {
 				task = t
-				// Claim under the stored key, not a recomputed one: the
-				// two agree everywhere except the corrupt-row replacement
-				// path in Enqueue, and a claim registered under a key the
-				// scan will never see would silently dedupe nothing.
+				// The stored key and task.key() agree by invariant (every
+				// write path stores a row under exactly its task's key);
+				// claim under the stored key so the scan's own view is
+				// what the claim indexes.
 				claimKey = string(k)
 				found = true
 				break
@@ -592,6 +600,17 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 
 func (j *Journal) ackLocked(task Task, completedScope string, completed, notify bool, now time.Time) error {
 	return j.db.Update(func(tx *bolt.Tx) error {
+		// The claim token only fences while the claim is LIVE; once a
+		// replacement worker resolved the row (its Nack re-keyed it, or
+		// its Ack deleted it), no claim remains and the token check above
+		// passes vacuously. The row's presence under this exact key is
+		// the durable ownership evidence that outlives claims: a resolved
+		// steal always deleted or re-keyed it, so its absence means this
+		// caller is stale and must not touch the index that now belongs
+		// to the replacement's row.
+		if tx.Bucket(journalBucket).Get(task.key()) == nil {
+			return errClaimStolen
+		}
 		if err := tx.Bucket(journalBucket).Delete(task.key()); err != nil {
 			return err
 		}
@@ -682,7 +701,16 @@ func (j *Journal) Nack(task Task, now time.Time) error {
 func (j *Journal) nackLocked(old []byte, task Task) error {
 	return j.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(journalBucket)
-		mergeRow(b.Get(old), &task)
+		existing := b.Get(old)
+		// Same durable ownership evidence as the ack path: a missing row
+		// under the pre-reschedule key means a replacement worker already
+		// resolved this task after the caller's lease lapsed. Proceeding
+		// would resurrect an acked row (or fork a re-keyed one) and point
+		// the index at the zombie.
+		if existing == nil {
+			return errClaimStolen
+		}
+		mergeRow(existing, &task)
 		val, err := json.Marshal(task)
 		if err != nil {
 			return err

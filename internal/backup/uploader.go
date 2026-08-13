@@ -109,6 +109,37 @@ type Uploader struct {
 	// at-least-once and the outbox persists anything a skipped flush
 	// would have sent.
 	notifyMu sync.Mutex
+
+	// sharedMu guards sharedLocks, the per-object serialization for
+	// shared-base uploads. Two generations referencing the same
+	// not-yet-verified base would otherwise both stream the multi-GB
+	// object concurrently — create-only means one loses the finalize
+	// precondition after the shared limiter already spent double the
+	// bandwidth on identical bytes. The second worker instead waits for
+	// the first and reuses its recorded verification. Entries are one
+	// mutex per distinct base object seen this process and are never
+	// removed: the population is bounded by template versions, not
+	// generations.
+	sharedMu    sync.Mutex
+	sharedLocks map[string]*sync.Mutex
+}
+
+// lockShared serializes shared-object uploads per object name, returning
+// the unlock. Generation-scoped objects never need this: the journal's
+// claims already make each generation exclusive to one worker.
+func (u *Uploader) lockShared(object string) func() {
+	u.sharedMu.Lock()
+	if u.sharedLocks == nil {
+		u.sharedLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := u.sharedLocks[object]
+	if !ok {
+		mu = &sync.Mutex{}
+		u.sharedLocks[object] = mu
+	}
+	u.sharedMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (u *Uploader) clock() time.Time {
@@ -612,6 +643,17 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		}
 	}
 	if file.Shared {
+		// Serialize per shared object, and only then consult the
+		// verification history: two workers whose generations reference
+		// the same not-yet-verified base would otherwise both stream the
+		// multi-GB object (create-only makes the loser's full stream pure
+		// waste under the shared bandwidth cap). The waiter blocks here
+		// while the winner streams, then re-runs the check below against
+		// the verification the winner just recorded and skips the stream.
+		// Held for the rest of the upload by design — that IS the
+		// serialization. Lock scope is a single uploadFile call, so no
+		// worker ever holds two shared locks (no ordering deadlock).
+		defer u.lockShared(object)()
 		// Skip the stream when this host already verified these exact
 		// object bytes: shared bases are multi-GB, and every generation
 		// on the template re-references the same object, so streaming

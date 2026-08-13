@@ -482,3 +482,62 @@ func TestStaleWorkerIsFencedAfterLeaseSteal(t *testing.T) {
 		t.Fatalf("pending after thief Ack = %v, want empty", counts)
 	}
 }
+
+// The claim token only fences while the claim is live; once the
+// replacement worker resolves the row, the durable row state must keep
+// fencing the stale worker. A stale Ack after the thief's Nack must not
+// delete the index now pointing at the re-keyed row, and a stale Nack
+// after the thief's Ack must not resurrect the acked row.
+func TestStaleResolutionFencedAfterThiefResolves(t *testing.T) {
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	now := base.Add(time.Minute)
+
+	// Thief nacks (row re-keyed), then the stale worker's Ack is refused
+	// and the index still resolves the pending generation.
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	stale, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	thief, ok, err := j.Next(now.Add(claimTTL))
+	if err != nil || !ok {
+		t.Fatalf("steal Next = %v/%v", ok, err)
+	}
+	if err := j.Nack(thief, now.Add(claimTTL)); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(stale, "bucket", false); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("stale Ack after thief Nack = %v, want errClaimStolen", err)
+	}
+	if pending, err := j.HasPending("sb-a", "aaa"); err != nil || !pending {
+		t.Fatalf("HasPending = %v/%v, want the re-keyed row still indexed", pending, err)
+	}
+
+	// Thief acks (row gone), then the stale worker's Nack is refused
+	// rather than resurrecting a zombie row.
+	j2, _ := testJournal(t)
+	if err := j2.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	stale2, ok, err := j2.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	thief2, ok, err := j2.Next(now.Add(claimTTL))
+	if err != nil || !ok {
+		t.Fatalf("steal Next = %v/%v", ok, err)
+	}
+	if err := j2.Ack(thief2, "bucket", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := j2.Nack(stale2, now.Add(claimTTL)); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("stale Nack after thief Ack = %v, want errClaimStolen", err)
+	}
+	if counts, _ := j2.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("pending after refused zombie Nack = %v, want empty", counts)
+	}
+}
