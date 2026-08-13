@@ -49,7 +49,7 @@ func TestJournalPriorityAndFIFO(t *testing.T) {
 			break
 		}
 		got = append(got, task.Generation)
-		if err := j.Ack(task, "", false); err != nil {
+		if _, err := j.Ack(task, "", false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -130,7 +130,7 @@ func TestJournalRecordsCompletions(t *testing.T) {
 	if done, err := j.WasCompleted("test-bucket", task); err != nil || done {
 		t.Fatalf("WasCompleted before ack = %v err=%v", done, err)
 	}
-	if err := j.Ack(task, "test-bucket", false); err != nil {
+	if _, err := j.Ack(task, "test-bucket", false); err != nil {
 		t.Fatal(err)
 	}
 	if done, err := j.WasCompleted("test-bucket", task); err != nil || !done {
@@ -146,7 +146,7 @@ func TestJournalRecordsCompletions(t *testing.T) {
 	if err := j.Enqueue(abandoned); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(abandoned, "", false); err != nil {
+	if _, err := j.Ack(abandoned, "", false); err != nil {
 		t.Fatal(err)
 	}
 	if done, _ := j.WasCompleted("test-bucket", abandoned); done {
@@ -197,7 +197,7 @@ func TestJournalQueueKeysScopedByOwner(t *testing.T) {
 			break
 		}
 		owners[task.owner()] = true
-		if err := j.Ack(task, "", false); err != nil {
+		if _, err := j.Ack(task, "", false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -233,6 +233,168 @@ func TestJournalEnqueueRequiresExactlyOneOwner(t *testing.T) {
 	if counts, _ := j.Pending(); counts[PriorityBestEffort]+counts[PriorityCheckpoint]+counts[PriorityPause] != 2 {
 		t.Fatalf("pending after dedupe = %v", counts)
 	}
+}
+
+// A live pause re-enqueueing a generation the backfill already queued at
+// best-effort promotes the row: the queue key re-sorts under the pause
+// tier while attempts and backoff stay with the task, and promotion is
+// one-way (a later best-effort enqueue never demotes).
+func TestEnqueueDedupePromotesPriority(t *testing.T) {
+	j, _ := testJournal(t)
+	gen := "promote-gen"
+	if err := j.Enqueue(Task{SandboxID: "sb", Generation: gen,
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
+		Priority: PriorityBestEffort, EnqueuedAt: time.Unix(1, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	// A checkpoint task would outrank the best-effort row.
+	if err := j.Enqueue(Task{SandboxID: "other", Generation: "ck",
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/q", SHA256: "bb", Size: 1}},
+		Priority: PriorityCheckpoint, EnqueuedAt: time.Unix(2, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	next, ok, err := j.Next(time.Unix(10, 0))
+	if err != nil || !ok || next.Generation != "ck" {
+		t.Fatalf("pre-promotion Next = %+v ok=%v err=%v, want the checkpoint task", next, ok, err)
+	}
+
+	// The live pause claims the same generation.
+	if err := j.Enqueue(Task{SandboxID: "sb", Generation: gen,
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
+		Priority: PriorityPause, EnqueuedAt: time.Unix(3, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	next, ok, err = j.Next(time.Unix(10, 0))
+	if err != nil || !ok || next.Generation != gen {
+		t.Fatalf("post-promotion Next = %+v ok=%v err=%v, want the promoted pause generation", next, ok, err)
+	}
+	if next.Priority != PriorityPause {
+		t.Fatalf("promoted priority = %d, want pause", next.Priority)
+	}
+
+	// One-way: re-enqueueing at best-effort does not demote.
+	if err := j.Enqueue(Task{SandboxID: "sb", Generation: gen,
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
+		Priority: PriorityBestEffort, EnqueuedAt: time.Unix(4, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	next, _, err = j.Next(time.Unix(10, 0))
+	if err != nil || next.Priority != PriorityPause {
+		t.Fatalf("after best-effort re-enqueue priority = %d (err %v), want pause kept", next.Priority, err)
+	}
+	// The index still points at a live row: exactly one pending entry for
+	// the owner+generation.
+	if pending, err := j.HasPending("sb", gen); err != nil || !pending {
+		t.Fatalf("HasPending = %v err=%v, want true", pending, err)
+	}
+}
+
+// Promotion can re-key a row while the uploader holds the task from
+// Next. Every mutator must resolve the row through the index, or acks
+// orphan the promoted row, nacks fork the task into two rows, and
+// verification recreates the stale key.
+func TestPromotionWhileTaskInFlight(t *testing.T) {
+	newTask := func(gen string) Task {
+		return Task{SandboxID: "sb", Generation: gen,
+			Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}},
+			Priority: PriorityBestEffort, EnqueuedAt: time.Unix(1, 0)}
+	}
+	promote := func(j *Journal, gen string) {
+		p := newTask(gen)
+		p.Priority = PriorityPause
+		if err := j.Enqueue(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pendingTotal := func(j *Journal) int {
+		counts, err := j.Pending()
+		if err != nil {
+			t.Fatal(err)
+		}
+		total := 0
+		for _, n := range counts {
+			total += n
+		}
+		return total
+	}
+
+	t.Run("ack removes the promoted row", func(t *testing.T) {
+		j, _ := testJournal(t)
+		if err := j.Enqueue(newTask("gen-ack")); err != nil {
+			t.Fatal(err)
+		}
+		inflight, ok, err := j.Next(time.Unix(10, 0))
+		if err != nil || !ok {
+			t.Fatalf("Next: %v %v", ok, err)
+		}
+		promote(j, "gen-ack")
+		if _, err := j.Ack(inflight, "bucket", false); err != nil {
+			t.Fatal(err)
+		}
+		if n := pendingTotal(j); n != 0 {
+			t.Fatalf("pending after ack = %d, want 0 (promoted row orphaned)", n)
+		}
+		if _, ok, _ := j.Next(time.Unix(20, 0)); ok {
+			t.Fatal("Next returned a task after ack; promoted row survived")
+		}
+	})
+
+	t.Run("nack keeps one promoted row with backoff", func(t *testing.T) {
+		j, _ := testJournal(t)
+		if err := j.Enqueue(newTask("gen-nack")); err != nil {
+			t.Fatal(err)
+		}
+		inflight, ok, err := j.Next(time.Unix(10, 0))
+		if err != nil || !ok {
+			t.Fatalf("Next: %v %v", ok, err)
+		}
+		promote(j, "gen-nack")
+		if err := j.Nack(inflight, time.Unix(10, 0)); err != nil {
+			t.Fatal(err)
+		}
+		if n := pendingTotal(j); n != 1 {
+			t.Fatalf("pending after nack = %d, want exactly one row", n)
+		}
+		// Backoff holds: nothing runnable immediately after the nack.
+		if _, ok, _ := j.Next(time.Unix(11, 0)); ok {
+			t.Fatal("Next returned the task before its backoff elapsed")
+		}
+		later, ok, err := j.Next(time.Unix(600, 0))
+		if err != nil || !ok {
+			t.Fatalf("Next after backoff: %v %v", ok, err)
+		}
+		if later.Priority != PriorityPause {
+			t.Fatalf("retry priority = %d, want the promotion kept", later.Priority)
+		}
+	})
+
+	t.Run("verification does not fork the row", func(t *testing.T) {
+		j, _ := testJournal(t)
+		if err := j.Enqueue(newTask("gen-verify")); err != nil {
+			t.Fatal(err)
+		}
+		inflight, ok, err := j.Next(time.Unix(10, 0))
+		if err != nil || !ok {
+			t.Fatalf("Next: %v %v", ok, err)
+		}
+		promote(j, "gen-verify")
+		if err := j.RecordVerification(inflight, "obj-1", time.Unix(12, 0)); err != nil {
+			t.Fatal(err)
+		}
+		if n := pendingTotal(j); n != 1 {
+			t.Fatalf("pending after verification = %d, want exactly one row", n)
+		}
+		got, ok, err := j.Next(time.Unix(20, 0))
+		if err != nil || !ok {
+			t.Fatalf("Next: %v %v", ok, err)
+		}
+		if got.Priority != PriorityPause {
+			t.Fatalf("row priority = %d, want the promotion kept", got.Priority)
+		}
+		if verified, err := j.WasVerified("obj-1", time.Unix(20, 0)); err != nil || !verified {
+			t.Fatalf("WasVerified = %v (err %v), want the history recorded", verified, err)
+		}
+	})
 }
 
 func TestJournalOldestEnqueuedAtByPriority(t *testing.T) {
@@ -290,7 +452,7 @@ func TestJournalOutboxDepth(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "bucket", true); err != nil {
+	if _, err := j.Ack(task, "bucket", true); err != nil {
 		t.Fatal(err)
 	}
 	if depth, err := j.OutboxDepth(); err != nil || depth != 1 {
@@ -307,6 +469,57 @@ func TestJournalOutboxDepth(t *testing.T) {
 	}
 	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {
 		t.Fatalf("outbox depth after clear = %d err=%v, want 0", depth, err)
+	}
+}
+
+// An abandonment carrying a stale snapshot must not clear a row that was
+// upgraded since the attempt began: a live pause's staging or promotion
+// supersedes the failure verdict, and the upgraded row keeps its staged
+// files and retries on its own schedule. Completion acks always clear.
+func TestAbandonmentDoesNotClearUpgradedRow(t *testing.T) {
+	j, _ := testJournal(t)
+	snapshot := Task{SandboxID: "sb", Generation: "gen",
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/orig", SHA256: "aa", Size: 1}},
+		Priority: PriorityBestEffort, EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	inflight, ok, err := j.Next(time.Unix(10, 0))
+	if err != nil || !ok {
+		t.Fatalf("Next: %v %v", ok, err)
+	}
+
+	// A live pause stages and promotes the same generation mid-attempt.
+	upgraded := snapshot
+	upgraded.Priority = PriorityPause
+	upgraded.Staged = true
+	upgraded.Files = []TaskFile{{Name: "rootfs.ext4", Path: "/staged", SHA256: "aa", Size: 1}}
+	if err := j.Enqueue(upgraded); err != nil {
+		t.Fatal(err)
+	}
+
+	cleared, err := j.Ack(inflight, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared {
+		t.Fatal("stale abandonment cleared the upgraded row")
+	}
+	got, ok, err := j.Next(time.Unix(20, 0))
+	if err != nil || !ok {
+		t.Fatalf("Next after abandonment: %v %v", ok, err)
+	}
+	if !got.Staged || got.Priority != PriorityPause || got.Files[0].Path != "/staged" {
+		t.Fatalf("surviving row = %+v, want the staged promoted upgrade", got)
+	}
+
+	// A completion ack clears even an upgraded row: the generation is
+	// durable regardless of what upgraded meanwhile.
+	if cleared, err := j.Ack(got, "bucket", false); err != nil || !cleared {
+		t.Fatalf("completion ack cleared=%v err=%v, want true", cleared, err)
+	}
+	if _, ok, _ := j.Next(time.Unix(30, 0)); ok {
+		t.Fatal("row survived a completion ack")
 	}
 }
 

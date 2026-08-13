@@ -1073,6 +1073,34 @@ func main() {
 		// meta (both no-ops when backup is disabled).
 		mgr.RecoverPendingBackups(ctx, log)
 		mgr.RecoverTemplateBackups(ctx, log)
+		// One-time coverage for sandboxes that paused before the uploader
+		// existed and will never pause again on their own. Off by default:
+		// the pass reads every paused snapshot once, so it's enabled per
+		// host, run to completion, and turned back off. The ledger makes
+		// reruns cheap (only changed or previously unreadable snapshots
+		// are revisited).
+		if os.Getenv("BACKUP_BACKFILL") == "1" {
+			go func() {
+				defer sentrylog.Recover("backup backfill")
+				blog := log.With().Str("component", "backup").Logger()
+				// Re-sweep periodically while the flag is on, not once per
+				// boot: the uploader's retry ceiling can abandon a minted
+				// upload long after the startup pass returned, and these
+				// sandboxes may never pause again to self-heal. Converged
+				// passes are cheap (ledger marks plus coverage probes skip
+				// everything covered), so the cadence buys convergence
+				// without re-hashing. Turn the flag off only once coverage
+				// is verified, not merely once a pass has run.
+				for {
+					mgr.BackfillPausedBackups(ctx, blog)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(6 * time.Hour):
+					}
+				}
+			}()
+		}
 	}()
 
 	// ---- Optional DB connection for the reconciler ----
