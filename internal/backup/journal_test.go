@@ -234,3 +234,85 @@ func TestJournalEnqueueRequiresExactlyOneOwner(t *testing.T) {
 		t.Fatalf("pending after dedupe = %v", counts)
 	}
 }
+
+func TestJournalOldestEnqueuedAt(t *testing.T) {
+	j, _ := testJournal(t)
+
+	if _, ok, err := j.OldestEnqueuedAt(); err != nil || ok {
+		t.Fatalf("empty queue: ok=%v err=%v, want no oldest", ok, err)
+	}
+
+	base := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
+	newer := Task{SandboxID: "sb-new", Generation: "gen-1", Priority: PriorityPause, EnqueuedAt: base.Add(time.Hour)}
+	older := Task{SandboxID: "sb-old", Generation: "gen-2", Priority: PriorityBestEffort, EnqueuedAt: base}
+	for _, task := range []Task{newer, older} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	oldest, ok, err := j.OldestEnqueuedAt()
+	if err != nil || !ok {
+		t.Fatalf("oldest: ok=%v err=%v", ok, err)
+	}
+	if !oldest.Equal(base) {
+		t.Fatalf("oldest = %s, want %s (priority must not mask an older low-priority task)", oldest, base)
+	}
+
+	// A Nack defers readiness but the task is still backlog: age keeps
+	// counting from the original enqueue.
+	if err := j.Nack(older, base.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	oldest, ok, err = j.OldestEnqueuedAt()
+	if err != nil || !ok || !oldest.Equal(base) {
+		t.Fatalf("post-nack oldest = %s ok=%v err=%v, want %s", oldest, ok, err, base)
+	}
+}
+
+func TestJournalOutboxDepth(t *testing.T) {
+	j, _ := testJournal(t)
+
+	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {
+		t.Fatalf("empty outbox depth = %d err=%v, want 0", depth, err)
+	}
+
+	task := Task{SandboxID: "sb-1", Generation: "gen-1", Priority: PriorityPause, EnqueuedAt: time.Now().UTC()}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Ack(task, "bucket", true); err != nil {
+		t.Fatal(err)
+	}
+	if depth, err := j.OutboxDepth(); err != nil || depth != 1 {
+		t.Fatalf("outbox depth after notify ack = %d err=%v, want 1", depth, err)
+	}
+	// Clear takes the entry as PendingNotifications returns it: the
+	// outbox key is scoped by the entry's pinned bucket.
+	pending, err := j.PendingNotifications(0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending = %d err=%v, want 1", len(pending), err)
+	}
+	if err := j.ClearNotification(pending[0]); err != nil {
+		t.Fatal(err)
+	}
+	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {
+		t.Fatalf("outbox depth after clear = %d err=%v, want 0", depth, err)
+	}
+}
+
+// The per-scope seed marker lives inside the outbox bucket but is not a
+// notification: counting it would pin the depth gauge above zero forever
+// and hold the outbox-stalled alert firing on every seeded host.
+func TestOutboxDepthExcludesSeedMarker(t *testing.T) {
+	j, _ := testJournal(t)
+	if _, err := j.SeedOutboxFromCompletions(); err != nil {
+		t.Fatal(err)
+	}
+	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {
+		t.Fatalf("depth after seed marker = %d err=%v, want 0", depth, err)
+	}
+	if pending, err := j.PendingNotifications(0); err != nil || len(pending) != 0 {
+		t.Fatalf("pending after seed marker = %d err=%v, want 0", len(pending), err)
+	}
+}

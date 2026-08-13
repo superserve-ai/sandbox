@@ -1,0 +1,157 @@
+package vm
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/backup"
+)
+
+// BackupReporter delivers verified-generation reports to the control
+// plane, closing the loop between the uploader's durable outbox and the
+// backup_generation coverage table. Deliver is the uploader's OnVerified
+// callback: a non-nil return keeps the signal outboxed, so this only
+// returns nil once the control plane accepted the report (any 2xx).
+// Redelivery after a crash means duplicates; the endpoint is idempotent
+// on (owner, bucket, generation).
+type BackupReporter struct {
+	// ControlPlaneURL is the base URL of the control plane API; reports
+	// POST to {ControlPlaneURL}/internal/hosts/{HostID}/backups with the
+	// same bearer token as the heartbeat.
+	ControlPlaneURL string
+	HostID          string
+	Token           string
+	// Bucket names the store the generation was verified in: coverage is
+	// per bucket, and the control plane records which cell bucket holds
+	// the bytes.
+	Bucket string
+	Client *http.Client
+	Log    zerolog.Logger
+}
+
+// backupReportFile mirrors the control plane's manifest entry shape.
+// Host paths deliberately do not travel: they name staging locations
+// that stop existing once the upload acks.
+type backupReportFile struct {
+	Name       string `json:"name"`
+	SizeBytes  int64  `json:"size_bytes"`
+	SHA256     string `json:"sha256"`
+	BaseSHA256 string `json:"base_sha256,omitempty"`
+	Shared     bool   `json:"shared,omitempty"`
+}
+
+type backupReportBody struct {
+	SandboxID   string             `json:"sandbox_id,omitempty"`
+	TemplateID  string             `json:"template_id,omitempty"`
+	BuildID     string             `json:"build_id,omitempty"`
+	Generation  string             `json:"generation"`
+	Bucket      string             `json:"bucket"`
+	CompletedAt time.Time          `json:"completed_at"`
+	Files       []backupReportFile `json:"files"`
+}
+
+// Deliver reports one verified generation. CompletedAt is the ack-time
+// verification instant pinned on the outbox entry; only entries written
+// before that field existed fall back to delivery time, whose skew
+// coverage queries tolerate in one direction (a backup can only be
+// reported after it completed).
+func (r *BackupReporter) Deliver(task backup.Task) error {
+	// Finalized manifests travel verbatim; only legacy outbox entries
+	// (pre-finalization) re-synthesize shared entries, accepting the
+	// zero-size fallback when staging cleanup won the race.
+	files := task.Files
+	if !task.FilesFinal {
+		files = task.ReportedFiles()
+	}
+	// The outbox pinned the bucket the upload verified against; trust it
+	// over the current configuration, which can differ after a restart
+	// that repointed BACKUP_BUCKET while notifications were outboxed.
+	// Empty means a pre-pinning outbox entry: the current bucket is the
+	// only available answer, as before.
+	bucket := task.VerifiedBucket
+	if bucket == "" {
+		bucket = r.Bucket
+	}
+	completedAt := task.VerifiedAt
+	if completedAt.IsZero() {
+		completedAt = time.Now()
+	}
+	body := backupReportBody{
+		SandboxID:   task.SandboxID,
+		TemplateID:  task.TemplateID,
+		BuildID:     task.BuildID,
+		Generation:  task.Generation,
+		Bucket:      bucket,
+		CompletedAt: completedAt.UTC(),
+		Files:       make([]backupReportFile, 0, len(files)),
+	}
+	for _, f := range files {
+		body.Files = append(body.Files, backupReportFile{
+			Name:       f.Name,
+			SizeBytes:  f.Size,
+			SHA256:     f.SHA256,
+			BaseSHA256: f.BaseSHA256,
+			Shared:     f.Shared,
+		})
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal backup report: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	url := fmt.Sprintf("%s/internal/hosts/%s/backups", r.ControlPlaneURL, r.HostID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build backup report request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+r.Token)
+	client := r.Client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("deliver backup report: %w", err)
+	}
+	defer resp.Body.Close()
+	// Any 2xx clears the outbox entry, including accepted-but-orphaned
+	// reports: only the control plane knows whether an owner row exists,
+	// and redelivering an unacceptable report forever helps nobody.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	// A permanent rejection can never succeed on retry, and the flush
+	// stops at the first failure, so returning an error here would wedge
+	// every later report on this host behind one poisoned entry forever.
+	// Drop it loudly instead: the generation stays durable in the bucket,
+	// only its coverage row is lost. Auth and pressure statuses stay
+	// retryable, since a rotated token or a throttled control plane would
+	// otherwise silently drain the whole outbox.
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden,
+		http.StatusRequestTimeout, http.StatusTooManyRequests,
+		// 404 means the control plane has not deployed the route yet
+		// (vmd can roll out first); the report becomes deliverable when
+		// the rollout completes, so it must survive in the outbox.
+		http.StatusNotFound:
+	default:
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			r.Log.Error().Str("generation", task.Generation).
+				Str("sandbox_id", task.SandboxID).Str("template_id", task.TemplateID).
+				Str("status", resp.Status).Str("response", string(msg)).
+				Msg("backup report permanently rejected; dropping its coverage row")
+			return nil
+		}
+	}
+	return fmt.Errorf("backup report rejected: %s: %s", resp.Status, string(msg))
+}

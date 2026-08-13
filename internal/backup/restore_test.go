@@ -140,7 +140,7 @@ func uploadFixture(t *testing.T, store *memBlobs, task Task) {
 	t.Helper()
 	j, _ := testJournal(t)
 	u := &Uploader{Journal: j, Store: store}
-	completed, err := u.uploadTask(context.Background(), &task)
+	completed, _, _, err := u.uploadTask(context.Background(), &task)
 	if err != nil || !completed {
 		t.Fatalf("upload fixture: completed=%v err=%v", completed, err)
 	}
@@ -1106,7 +1106,7 @@ func TestRestoreValidatesStagedCopyFallbackGeneration(t *testing.T) {
 	j, _ := testJournal(t)
 	store := newMemStore()
 	u := &Uploader{Journal: j, Store: store}
-	if completed, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
+	if completed, _, _, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
 		t.Fatalf("upload: completed=%v err=%v", completed, err)
 	}
 

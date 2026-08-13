@@ -174,9 +174,19 @@ type AnalyticsActiveSandboxCount struct {
 	ActiveSandboxes int64 `json:"active_sandboxes"`
 }
 
+type AnalyticsDailySandboxFailure struct {
+	Day      pgtype.Date `json:"day"`
+	Failures int64       `json:"failures"`
+}
+
 type AnalyticsDailySandboxStart struct {
 	Day    pgtype.Date `json:"day"`
 	Starts int64       `json:"starts"`
+}
+
+type AnalyticsSandboxActiveInterval struct {
+	StartedAt time.Time          `json:"started_at"`
+	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 }
 
 type AnalyticsTeamHourlySpend struct {
@@ -240,6 +250,18 @@ type AuditLog struct {
 	NewValue     []byte      `json:"new_value"`
 	Metadata     []byte      `json:"metadata"`
 	CreatedAt    time.Time   `json:"created_at"`
+}
+
+type BackupGeneration struct {
+	ID          uuid.UUID   `json:"id"`
+	SandboxID   pgtype.UUID `json:"sandbox_id"`
+	TemplateID  pgtype.UUID `json:"template_id"`
+	BuildID     *string     `json:"build_id"`
+	Generation  string      `json:"generation"`
+	Bucket      string      `json:"bucket"`
+	CompletedAt time.Time   `json:"completed_at"`
+	ReportedAt  time.Time   `json:"reported_at"`
+	Files       []byte      `json:"files"`
 }
 
 type BillingPeriodAnomaly struct {
@@ -477,6 +499,7 @@ type Sandbox struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	FailedAt          pgtype.Timestamptz `json:"failed_at"`
 }
 
 type SandboxActiveInterval struct {

@@ -11,6 +11,7 @@ The current Terraform-managed Compute Engine inventory for Vanta is:
 | --- | --- | --- | --- |
 | staging | us-central1 | `superserve-vmd-staging` | Managed by Terraform |
 | production | us-west2 | `superserve-vmd-usw2` | Managed by Terraform |
+| production | us-west2 | `superserve-vmd-usw2-2` | Managed by Terraform (cold standby, normally stopped) |
 | production | us-east4 | `superserve-vmd-use4` | Managed by Terraform |
 | production | us-central1 | none | Decommissioned, no Terraform-managed instance remains |
 
@@ -50,8 +51,10 @@ because the instance-ID filter keeps each host's evidence and response path
 unambiguous.
 
 For an existing matching policy, use its full Monitoring policy name with
-`terraform import module.observability.google_monitoring_alert_policy.compute_instance_cpu[\"sandbox_host\"] POLICY_NAME`
-before planning. If the policy is not a match, update it in place or remove it
+`terraform import module.observability.google_monitoring_alert_policy.compute_instance_cpu[\"HOST_KEY\"] POLICY_NAME`
+before planning, where `HOST_KEY` is that host's key in the environment's
+`compute_instance_cpu_alerts` map (`sandbox_host` for a cell's primary host,
+`sandbox_host_b` for the us-west2 standby). If the policy is not a match, update it in place or remove it
 from the state/configuration deliberately before creating the managed policy.
 
 For a review-only plan, supply the same variable as a Terraform list literal,

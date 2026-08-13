@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // launcherPruneArg is the hidden argv[1] under which vmd re-execs itself to
@@ -63,6 +64,14 @@ func (m *Manager) EnsureLauncherNamespace(ctx context.Context) error {
 	if pinPath == "" {
 		return nil // launcher mode disabled
 	}
+	// One build at a time. The boot build runs async and can still be in flight
+	// when the first sampler tick schedules a retry; two concurrent prunes would
+	// race over the same pin path. Reporting nil is right — the in-flight build
+	// owns the outcome and logs it.
+	if !m.launcherBuilding.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer m.launcherBuilding.Store(false)
 	ctx, cancel := context.WithTimeout(ctx, launcherBuildTimeout)
 	defer cancel()
 	// The launch path needs nsenter; without it, fail here (launcherReady stays
@@ -279,6 +288,12 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 			Bool("launcher_ready", m.launcherReady.Load()).
 			Msg("host mount table")
 		m.revalidateLauncher(ctx)
+		// After revalidation, so the sample reflects the tick's verdict rather
+		// than the previous one. Emitted here rather than from the reclaim
+		// controller: the launch path degrades whether or not that is enabled.
+		if m.recorder != nil {
+			m.recorder.RecordLauncherState(ctx, telemetry.LauncherState{Ready: m.launcherReady.Load()})
+		}
 	})
 }
 
@@ -320,6 +335,49 @@ func (m *Manager) revalidateLauncher(ctx context.Context) {
 		m.launcherReady.Store(true)
 		m.log.Info().Str("path", pin).Msg("launcher pin valid again — resuming launcher launch path")
 	}
+
+	// Rebuild whenever we are not on the launcher path, whatever put us there.
+	// launcherReady is the right predicate because it is true only for a pin
+	// that is both valid AND built this boot, so this covers both ways of
+	// ending up on the legacy path for the life of the process:
+	//
+	//   - the boot build failed, so launcherBuilt never became true and the
+	//     re-enable arm above can never fire;
+	//   - the pin built fine and later went invalid (unmounted, or otherwise
+	//     no longer pruned), which clears launcherReady but leaves
+	//     launcherBuilt set, so a check on launcherBuilt alone would skip it.
+	//
+	// Either way every launch pays the full host mount table until something
+	// rebuilds. Rebuilding is safe where resurrecting an old pin is not: a
+	// fresh build snapshots the CURRENT mount table, which is exactly what the
+	// boot-time build does, so it cannot be missing a launch-critical mount
+	// added since. The single-flight guard inside EnsureLauncherNamespace makes
+	// this a no-op while the boot build is still running.
+	if !m.launcherReady.Load() {
+		m.retryLauncherBuild(ctx)
+	}
+}
+
+// launcherRetryInterval spaces failed pin rebuilds. A working build takes
+// seconds, so this only paces hosts where it keeps failing — there is no point
+// paying a full prune attempt on every sampler tick.
+const launcherRetryInterval = 5 * time.Minute
+
+// retryLauncherBuild re-attempts the pruned-namespace build after a failure.
+// Async by design: a wedged mount syscall can hold a build for
+// launcherBuildTimeout, and the sampler tick must not block on it.
+func (m *Manager) retryLauncherBuild(ctx context.Context) {
+	now := time.Now()
+	if next := m.launcherNextRetry.Load(); next != 0 && now.UnixNano() < next {
+		return
+	}
+	m.launcherNextRetry.Store(now.Add(launcherRetryInterval).UnixNano())
+	go func() {
+		defer sentrylog.Recover("launcher namespace rebuild")
+		if err := m.EnsureLauncherNamespace(ctx); err != nil {
+			m.log.Warn().Err(err).Msg("launcher pin rebuild failed — still on the legacy launch path")
+		}
+	}()
 }
 
 // hostMountCounts returns the total mount count and the nsfs subset (the
