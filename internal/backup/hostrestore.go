@@ -183,10 +183,18 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 	sort.SliceStable(gens, func(i, j int) bool { return gens[i].Created.After(gens[j].Created) })
 	res.Generation = gens[0].Generation
 	// Prefer the generation whose vmstate digest matches the control
-	// plane's latest pause: completion order is not capture order.
+	// plane's latest pause: completion order is not capture order. The
+	// probe is bounded: the anchored generation, if it uploaded at all,
+	// completed near the head of the history, and an unbounded walk
+	// would turn full-host recovery into fleet-size times history-depth
+	// synchronous fetches exactly when the anchor is absent (the
+	// expected host-death case).
 	if item.WantVMStateSHA != "" {
 		matched := false
-		for _, g := range gens {
+		for i, g := range gens {
+			if i >= anchorProbeLimit {
+				break
+			}
 			m, err := fetchManifest(ctx, h.Reader, item.SandboxID, g.Generation, func(string, ...any) {})
 			if err != nil {
 				continue
@@ -203,10 +211,19 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 			}
 		}
 		if !matched {
-			res.Reason = "latest pause not in bucket; using newest completed generation"
+			res.Reason = "latest pause not among newest completed generations; using newest completed"
 		}
 	}
 	if h.DryRun {
+		// Coverable must mean restorable: fetch and authenticate the
+		// selected manifest (identity, self-derived generation key,
+		// consistency pairs) so a corrupt or misplaced manifest shows up
+		// in the dry-run ledger, not mid-recovery.
+		if _, err := fetchManifest(ctx, h.Reader, item.SandboxID, res.Generation, func(string, ...any) {}); err != nil {
+			res.Outcome, res.Reason = HostRestoreFailed, fmt.Sprintf("manifest validation: %v", err)
+			res.Duration = time.Since(start)
+			return res
+		}
 		res.Outcome = HostRestoreCoverable
 		res.Duration = time.Since(start)
 		return res
@@ -231,6 +248,10 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 	res.Duration = time.Since(start)
 	return res
 }
+
+// anchorProbeLimit bounds how many newest generations the capture
+// anchor probe fetches manifests for before falling back.
+const anchorProbeLimit = 5
 
 // completedGenerationAt reports the generation a destination's fsynced
 // completion marker records, if one exists and parses.

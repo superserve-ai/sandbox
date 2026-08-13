@@ -31,7 +31,7 @@ func runHostRestore(ctx context.Context, reader backup.BlobReader, lister backup
 	var err error
 	switch {
 	case itemsFile != "":
-		ids, err = sandboxIDsFromFile(itemsFile)
+		ids, wantSHAs, err = sandboxIDsFromFile(itemsFile)
 	case dbURL != "":
 		ids, wantSHAs, err = sandboxIDsFromDB(ctx, dbURL, hostID)
 	default:
@@ -145,18 +145,31 @@ func sandboxIDsFromDB(ctx context.Context, dbURL, hostID string) ([]string, map[
 	return ids, shas, rows.Err()
 }
 
-func sandboxIDsFromFile(path string) ([]string, error) {
+// sandboxIDsFromFile reads one sandbox per line: the id, optionally
+// followed by whitespace and the latest pause's vmstate sha256 so
+// file-based recovery keeps the capture-order anchor (export both
+// columns from a DB replica when the primary is down). Without the
+// digest, selection degrades to newest-completed, exactly as recorded
+// in the ledger.
+func sandboxIDsFromFile(path string) ([]string, map[string]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer f.Close()
 	var ids []string
+	shas := map[string]string{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		if id := strings.TrimSpace(sc.Text()); id != "" && !strings.HasPrefix(id, "#") {
-			ids = append(ids, id)
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		ids = append(ids, fields[0])
+		if len(fields) > 1 {
+			shas[fields[0]] = fields[1]
 		}
 	}
-	return ids, sc.Err()
+	return ids, shas, sc.Err()
 }

@@ -47,7 +47,10 @@ backup-restore -bucket <cell-backup-bucket> \
 The default is a dry run. It produces the coverage ledger: every live
 sandbox the DB pins to the dead host, classified as coverable (newest
 completed generation present in the bucket) or uncovered. If the DB is
-itself unreachable, pass `-sandboxes-file` with one sandbox id per line.
+itself unreachable, pass `-sandboxes-file`: one sandbox id per line,
+optionally followed by the latest pause's vmstate sha256 (export both
+columns from a DB replica) so selection stays anchored to capture order
+rather than upload-completion order.
 
 Review the ledger before executing. The uncovered list is the
 partial-failure playbook input, not a tool error.
