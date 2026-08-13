@@ -276,6 +276,9 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 		if cur, ok, lerr := u.Journal.Load(task); lerr == nil && ok && cur.Staged {
 			task.logOwner(u.Log.Info()).
 				Msg("abandoned mutable-path attempt; staged row retained for retry")
+			// Neither acked nor nacked: free the claim explicitly so the
+			// retained row is drainable now, not after the lease expires.
+			u.Journal.Release(task)
 			return true, nil
 		}
 	}

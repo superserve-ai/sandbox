@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -410,5 +411,74 @@ func TestClaimExpiryReclaims(t *testing.T) {
 	redo, ok, err := j.Next(now.Add(claimTTL))
 	if err != nil || !ok || redo.SandboxID != "sb-a" {
 		t.Fatalf("Next past lease = %+v/%v/%v, want the task reclaimed", redo, ok, err)
+	}
+}
+
+// Release frees a claim without resolving the task: the retained-row
+// drain outcome leaves the row queued, and it must be drainable
+// immediately rather than after the lease expires.
+func TestReleaseFreesUnresolvedClaim(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	task := Task{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	now := base.Add(time.Minute)
+	got, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	if _, ok, err := j.Next(now); err != nil || ok {
+		t.Fatalf("Next while claimed = %v/%v, want nothing", ok, err)
+	}
+	j.Release(got)
+	redo, ok, err := j.Next(now)
+	if err != nil || !ok || redo.Attempts != 0 {
+		t.Fatalf("Next after Release = %+v/%v/%v, want the task back untouched", redo, ok, err)
+	}
+}
+
+// A worker that outlives its lease is fenced: once another worker claims
+// the row, the stale worker's Ack, Nack, and Release are all refused,
+// and the thief's resolution is the one that lands.
+func TestStaleWorkerIsFencedAfterLeaseSteal(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	task := Task{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	now := base.Add(time.Minute)
+	stale, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	// The lease lapses and a second worker claims the same row.
+	thief, ok, err := j.Next(now.Add(claimTTL))
+	if err != nil || !ok || thief.ClaimToken == stale.ClaimToken {
+		t.Fatalf("steal Next = %+v/%v/%v, want a fresh claim", thief, ok, err)
+	}
+	// Every stale resolution is refused and leaves the row alone.
+	if err := j.Ack(stale, "bucket", false); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("stale Ack err = %v, want errClaimStolen", err)
+	}
+	if err := j.Nack(stale, now.Add(claimTTL)); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("stale Nack err = %v, want errClaimStolen", err)
+	}
+	j.Release(stale)
+	if counts, err := j.Pending(); err != nil || counts[PriorityPause] != 1 {
+		t.Fatalf("pending after stale resolutions = %v/%v, want the row intact", counts, err)
+	}
+	// The row stays claimed by the thief despite the stale Release.
+	if _, ok, err := j.Next(now.Add(claimTTL + time.Minute)); err != nil || ok {
+		t.Fatalf("Next while thief holds claim = %v/%v, want nothing", ok, err)
+	}
+	// The thief's resolution is authoritative.
+	if err := j.Ack(thief, "bucket", false); err != nil {
+		t.Fatal(err)
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("pending after thief Ack = %v, want empty", counts)
 	}
 }

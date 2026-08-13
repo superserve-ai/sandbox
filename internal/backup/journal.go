@@ -85,6 +85,13 @@ type Task struct {
 	// the uploader-owned staging tree; the dedupe upgrade in Enqueue is
 	// one-way toward staged.
 	Staged bool `json:"staged,omitempty"`
+	// ClaimToken fences resolution against lease steals: Next stamps the
+	// claim's token here, and Ack/Nack refuse to touch a row whose live
+	// claim carries a different token (the lease expired and another
+	// worker took over; its resolution supersedes this one). Never
+	// persisted — claims are process-local, and a serialized token would
+	// outlive the claim table it indexes into.
+	ClaimToken uint64 `json:"-"`
 }
 
 // HasVerified reports whether this task already verified object.
@@ -105,8 +112,12 @@ func (t *Task) HasVerified(object string) bool {
 type Journal struct {
 	db *bolt.DB
 
-	// mu guards claims and spans Next's whole scan-and-claim, so two
-	// concurrent drain workers can never select the same entry.
+	// mu guards claims AND spans every claim-coupled row mutation: Next's
+	// whole scan-and-claim, and the ownership check plus bolt write in
+	// Ack/Nack. Holding it across the writes is what makes the fencing
+	// airtight — a stale worker's resolution and a thief's cannot
+	// interleave against the same row, because whichever acquires mu
+	// second sees the full effect of the first.
 	mu sync.Mutex
 	// claims marks queue keys handed out by Next and not yet resolved by
 	// Ack or Nack, so concurrent workers each receive a distinct task.
@@ -115,10 +126,19 @@ type Journal struct {
 	// and a crash releases every claim by construction — persisting them
 	// would instead make a restarted vmd wait out stale leases before
 	// resuming in-flight work. The expiry is a backstop for a worker
-	// goroutine wedged past any plausible upload; a steal after expiry
-	// duplicates work but never corrupts it (objects are content-addressed
-	// and create-only).
-	claims map[string]time.Time
+	// goroutine wedged past any plausible upload; the token fences the
+	// wedged worker's late resolution if it ever resumes after a steal.
+	claims map[string]claim
+	// claimSeq issues claim tokens, under mu. Starts from 1 so a zero
+	// ClaimToken (a task never handed out by Next, e.g. direct test
+	// calls) can never match a live claim.
+	claimSeq uint64
+}
+
+// claim is one outstanding lease: when it lapses and who holds it.
+type claim struct {
+	until time.Time
+	token uint64
 }
 
 var (
@@ -185,7 +205,7 @@ func NewJournal(db *bolt.DB) (*Journal, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create journal bucket: %w", err)
 	}
-	return &Journal{db: db, claims: make(map[string]time.Time)}, nil
+	return &Journal{db: db, claims: make(map[string]claim)}, nil
 }
 
 // readyAt is when the task becomes runnable: its enqueue time until a
@@ -310,9 +330,10 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	// Expired claims (a worker wedged past claimTTL) become claimable
-	// again here; no separate reaper.
-	for k, until := range j.claims {
-		if !until.After(now) {
+	// again here; no separate reaper. The token check in Ack/Nack fences
+	// the original holder if it ever resumes after the steal.
+	for k, c := range j.claims {
+		if !c.until.After(now) {
 			delete(j.claims, k)
 		}
 	}
@@ -376,24 +397,51 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 		}
 	}
 	if found {
-		j.claims[claimKey] = now.Add(claimTTL)
+		j.claimSeq++
+		j.claims[claimKey] = claim{until: now.Add(claimTTL), token: j.claimSeq}
+		task.ClaimToken = j.claimSeq
 	}
 	return task, found, nil
 }
 
-// release drops the claim Next registered under key, if any. Called from
-// Ack and Nack regardless of their transaction's outcome, but only AFTER
-// it: a resolution that failed leaves the row in place and freeing the
-// claim lets any worker retry it promptly instead of waiting out the TTL,
-// while releasing before the transaction commits would let another worker
-// claim the row mid-resolution and resolve it against a key the
-// transaction is about to invalidate. The key matches the stored key on
-// every path except Enqueue's corrupt-row replacement; a claim orphaned
-// there expires via the TTL backstop.
-func (j *Journal) release(key []byte) {
+// errClaimStolen reports a resolution refused because the caller's lease
+// expired and another worker claimed the task; the thief's eventual Ack
+// or Nack is authoritative, and the stale caller's completed work is
+// safe to discard unresolved (objects are content-addressed and
+// create-only, and any verification it recorded is already durable).
+var errClaimStolen = fmt.Errorf("backup task claim expired and was reclaimed by another worker")
+
+// fenced runs resolve under mu if task still owns (or nobody holds) its
+// row's claim, dropping the claim afterward; a live claim under a
+// different token means the lease was stolen and the resolution is
+// refused whole.
+func (j *Journal) fenced(task Task, resolve func() error) error {
 	j.mu.Lock()
-	delete(j.claims, string(key))
-	j.mu.Unlock()
+	defer j.mu.Unlock()
+	key := string(task.key())
+	if c, held := j.claims[key]; held && c.token != task.ClaimToken {
+		return errClaimStolen
+	}
+	// Dropped even when resolve fails: the row is intact and unclaiming
+	// it lets any worker retry promptly instead of waiting out the TTL.
+	defer delete(j.claims, key)
+	return resolve()
+}
+
+// Release frees task's claim without resolving it, for the one drain
+// outcome that is neither an Ack nor a Nack: an abandoned mutable-path
+// attempt whose row a concurrent dedupe upgraded to staged snapshots.
+// The row is deliberately left queued for the next drain, and without
+// this release it would sit invisibly claimed until the TTL expired.
+// Token-checked like every resolution: a stale caller must not free a
+// claim a thief now holds.
+func (j *Journal) Release(task Task) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	key := string(task.key())
+	if c, held := j.claims[key]; held && c.token == task.ClaimToken {
+		delete(j.claims, key)
+	}
 }
 
 // RecordVerification persists BOTH verification records in one
@@ -535,9 +583,14 @@ func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
 // durable moment to remember that a completion signal is still owed.
 // Piggybacks a bounded lazy prune of expired verification history.
 func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
-	defer j.release(task.key())
 	completed := completedScope != ""
 	now := time.Now()
+	return j.fenced(task, func() error {
+		return j.ackLocked(task, completedScope, completed, notify, now)
+	})
+}
+
+func (j *Journal) ackLocked(task Task, completedScope string, completed, notify bool, now time.Time) error {
 	return j.db.Update(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(journalBucket).Delete(task.key()); err != nil {
 			return err
@@ -610,11 +663,10 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 // and persisting the caller's snapshot verbatim would silently undo the
 // upgrade after its marker was already cleared.
 func (j *Journal) Nack(task Task, now time.Time) error {
+	// The claim lives under the pre-reschedule identity; the deferral
+	// below re-keys the row, so fence on a pre-mutation copy.
+	orig := task
 	old := task.key()
-	// The claim was registered under the pre-reschedule key; the deferral
-	// below re-keys the row, so release that original key, not a
-	// recomputation over the mutated task.
-	defer j.release(old)
 	task.Attempts++
 	backoff := time.Duration(1<<min(task.Attempts, 8)) * time.Second
 	const maxBackoff = 10 * time.Minute
@@ -622,6 +674,12 @@ func (j *Journal) Nack(task Task, now time.Time) error {
 		backoff = maxBackoff
 	}
 	task.NotBefore = now.Add(backoff)
+	return j.fenced(orig, func() error {
+		return j.nackLocked(old, task)
+	})
+}
+
+func (j *Journal) nackLocked(old []byte, task Task) error {
 	return j.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(journalBucket)
 		mergeRow(b.Get(old), &task)
