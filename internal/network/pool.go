@@ -578,14 +578,18 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) bool {
 		}
 	}
 
+	// Trust is restored before the slot becomes visible: a claimant can
+	// consume it via the broadcast or its own fallback poll the instant the
+	// send lands, and the remaining waiters must never observe an empty pool
+	// alongside stale distrust. The reset keys on proven validity, not
+	// placement — a validated slot that finds every channel full is not
+	// evidence of a yieldless pass, and a full pool has no waiters to
+	// mislead.
+	if slot.adopted {
+		p.adoptDelivered()
+	}
 	select {
 	case p.recycled <- slot:
-		// Trust is restored before the delivery broadcast: a claimant woken
-		// by this slot's arrival must never observe the pass as still
-		// untrusted and bail to an inline build.
-		if slot.adopted {
-			p.adoptDelivered()
-		}
 		p.signalProgress()
 		return true
 	case <-p.stopCh:
@@ -602,7 +606,6 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) bool {
 		if slot.adopted {
 			select {
 			case p.fresh <- slot:
-				p.adoptDelivered()
 				p.signalProgress()
 				return true
 			default:
