@@ -891,6 +891,21 @@ const (
 
 func (p *Pool) refillLoop(ctx context.Context) {
 	defer p.wg.Done()
+	// The worker's active declaration is continuous across successful
+	// iterations — decrementing between two builds would let a delivery
+	// broadcast wake claimants into the instant where the count reads zero,
+	// and they would bail to inline builds against a producer that is
+	// committed to its next slot. Zero is exposed only at backoff, pause,
+	// and shutdown, when the pool genuinely promises nothing.
+	active := false
+	deactivate := func() {
+		if active {
+			active = false
+			p.refillActive.Add(-1)
+			p.signalProgress()
+		}
+	}
+	defer deactivate()
 	for {
 		select {
 		case <-p.stopCh:
@@ -900,6 +915,7 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		default:
 		}
 		if p.refillIsPaused() {
+			deactivate()
 			select {
 			case <-time.After(refillFailureBackoff):
 			case <-p.stopCh:
@@ -909,10 +925,17 @@ func (p *Pool) refillLoop(ctx context.Context) {
 			}
 			continue
 		}
+		if !active {
+			active = true
+			p.refillActive.Add(1)
+		}
 		switch p.refillStep(ctx) {
 		case refillStopped:
 			return
+		case refillOK:
+			p.signalProgress()
 		case refillFailed:
+			deactivate()
 			if !p.pauseAfterFailure(ctx) {
 				return
 			}
@@ -920,23 +943,17 @@ func (p *Pool) refillLoop(ctx context.Context) {
 	}
 }
 
-// refillStep builds and delivers (or discards) one slot while the worker is
-// declared active. The active span covers construction through delivery so a
-// claimant reading refillActive sees real producer state; every retry backoff
-// happens in the caller, outside the span, so a pool whose workers are all
-// backing off — or spinning on an unsatisfiable allocation, like an exhausted
-// slot range — reads as inactive and releases claimants immediately. A full
-// pool parks the worker on the send with finished inventory in hand (bounded
-// overshoot of one slot per worker); parked-active is truthful, and claimants
-// never wait on a full pool anyway. Built outside the select so a shutdown
-// while parked can dispose of the slot instead of dropping it.
+// refillStep builds and delivers (or discards) one slot. The caller owns the
+// worker's active declaration (continuous across successful iterations) and
+// the post-delivery wakeup; every retry backoff also happens in the caller,
+// outside the active span, so a pool whose workers are all backing off — or
+// spinning on an unsatisfiable allocation, like an exhausted slot range —
+// reads as inactive and releases claimants immediately. A full pool parks
+// the worker on the send with finished inventory in hand (bounded overshoot
+// of one slot per worker); parked-active is truthful, and claimants never
+// wait on a full pool anyway. Built outside the select so a shutdown while
+// parked can dispose of the slot instead of dropping it.
 func (p *Pool) refillStep(ctx context.Context) refillOutcome {
-	p.refillActive.Add(1)
-	defer func() {
-		p.refillActive.Add(-1)
-		p.signalProgress()
-	}()
-
 	slot, err := p.allocate(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
