@@ -76,13 +76,14 @@ type Pool struct {
 	adoptPhase atomic.Int32
 
 	// adoptStreak counts consecutive verified candidates that yielded no
-	// inventory; any delivery resets it. adoptEscaped trips when the streak
-	// reaches adoptEscapeStreak: claimants stop treating the pass as a
-	// producer (it may be chewing through invalid slots forever) until it
-	// delivers again. An explicit, logged heuristic — whether the REMAINING
-	// candidates are valid is unknowable without receipt/version evidence.
+	// inventory; any delivery resets it. At adoptEscapeStreak, claimants stop
+	// treating the pass as a producer (it may be chewing through invalid
+	// slots forever) until it delivers again. The escape is DERIVED from the
+	// streak (adoptionTrusted), never stored separately — one atomic means a
+	// stale failure can't race a fresh delivery out of its trust restore. An
+	// explicit, logged heuristic — whether the REMAINING candidates are
+	// valid is unknowable without receipt/version evidence.
 	adoptStreak       atomic.Int64
-	adoptEscaped      atomic.Bool
 	adoptEscapeStreak int64
 
 	// notifyCh broadcasts producer progress (a delivery or a state change) to
@@ -314,7 +315,7 @@ func (p *Pool) producing() bool {
 // a producer worth waiting on: a pass is running and hasn't tripped the
 // no-yield escape. Trust is reversible — a later delivery restores it.
 func (p *Pool) adoptionTrusted() bool {
-	return p.adoptPhase.Load() != adoptPhaseIdle && !p.adoptEscaped.Load()
+	return p.adoptPhase.Load() != adoptPhaseIdle && p.adoptStreak.Load() < p.adoptEscapeStreak
 }
 
 // progressCh returns the channel the next progress broadcast will close.
@@ -646,7 +647,6 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 	p.adoptPhase.CompareAndSwap(adoptPhaseIdle, adoptPhaseScanning)
 	defer func() {
 		p.adoptPhase.Store(adoptPhaseIdle)
-		p.adoptEscaped.Store(false)
 		p.adoptStreak.Store(0)
 		p.signalProgress()
 	}()
@@ -744,19 +744,20 @@ func (p *Pool) StartAdoption(ctx context.Context) bool {
 }
 
 // adoptDelivered and adoptYieldedNothing maintain the pass's trust streak
-// (see the adoptStreak field). Trust transitions are logged once per edge,
-// not per claimant, so a burst can't turn them into a log storm.
+// (see the adoptStreak field). Trust transitions are logged once per edge —
+// detected from the atomic op's own return value, so concurrent workers
+// cannot double-log or lose an edge — never per claimant, so a burst can't
+// turn them into a log storm.
 func (p *Pool) adoptDelivered() {
-	p.adoptStreak.Store(0)
-	if p.adoptEscaped.CompareAndSwap(true, false) {
+	if p.adoptStreak.Swap(0) >= p.adoptEscapeStreak {
 		p.log.Info().Msg("pool: adoption delivering again — claimants waiting on it restored")
 		p.signalProgress()
 	}
 }
 
 func (p *Pool) adoptYieldedNothing() {
-	if p.adoptStreak.Add(1) >= p.adoptEscapeStreak && p.adoptEscaped.CompareAndSwap(false, true) {
-		p.log.Warn().Int64("consecutive_without_delivery", p.adoptStreak.Load()).
+	if p.adoptStreak.Add(1) == p.adoptEscapeStreak {
+		p.log.Warn().Int64("consecutive_without_delivery", p.adoptEscapeStreak).
 			Msg("pool: adoption yielding no inventory — claimants no longer waiting on the pass")
 		p.signalProgress()
 	}
