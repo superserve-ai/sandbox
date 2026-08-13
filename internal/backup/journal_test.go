@@ -397,38 +397,47 @@ func TestPromotionWhileTaskInFlight(t *testing.T) {
 	})
 }
 
-func TestJournalOldestEnqueuedAt(t *testing.T) {
+func TestJournalOldestEnqueuedAtByPriority(t *testing.T) {
 	j, _ := testJournal(t)
 
-	if _, ok, err := j.OldestEnqueuedAt(); err != nil || ok {
-		t.Fatalf("empty queue: ok=%v err=%v, want no oldest", ok, err)
+	if oldest, err := j.OldestEnqueuedAtByPriority(); err != nil || len(oldest) != 0 {
+		t.Fatalf("empty queue: %v err=%v, want no entries", oldest, err)
 	}
 
 	base := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
-	newer := Task{SandboxID: "sb-new", Generation: "gen-1", Priority: PriorityPause, EnqueuedAt: base.Add(time.Hour)}
-	older := Task{SandboxID: "sb-old", Generation: "gen-2", Priority: PriorityBestEffort, EnqueuedAt: base}
-	for _, task := range []Task{newer, older} {
+	pauseNew := Task{SandboxID: "sb-new", Generation: "gen-1", Priority: PriorityPause, EnqueuedAt: base.Add(time.Hour)}
+	pauseOld := Task{SandboxID: "sb-old", Generation: "gen-2", Priority: PriorityPause, EnqueuedAt: base.Add(30 * time.Minute)}
+	backfill := Task{SandboxID: "sb-bf", Generation: "gen-3", Priority: PriorityBestEffort, EnqueuedAt: base}
+	for _, task := range []Task{pauseNew, pauseOld, backfill} {
 		if err := j.Enqueue(task); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	oldest, ok, err := j.OldestEnqueuedAt()
-	if err != nil || !ok {
-		t.Fatalf("oldest: ok=%v err=%v", ok, err)
+	oldest, err := j.OldestEnqueuedAtByPriority()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !oldest.Equal(base) {
-		t.Fatalf("oldest = %s, want %s (priority must not mask an older low-priority task)", oldest, base)
+	// Tiers resolve independently: the hours-old best-effort backfill
+	// backlog must not surface as the pause tier's age.
+	if !oldest[PriorityPause].Equal(base.Add(30 * time.Minute)) {
+		t.Fatalf("pause oldest = %s, want the older pause", oldest[PriorityPause])
+	}
+	if !oldest[PriorityBestEffort].Equal(base) {
+		t.Fatalf("best-effort oldest = %s, want the backfill task", oldest[PriorityBestEffort])
+	}
+	if _, ok := oldest[PriorityCheckpoint]; ok {
+		t.Fatal("empty checkpoint tier reported an age")
 	}
 
 	// A Nack defers readiness but the task is still backlog: age keeps
 	// counting from the original enqueue.
-	if err := j.Nack(older, base.Add(2*time.Hour)); err != nil {
+	if err := j.Nack(backfill, base.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	oldest, ok, err = j.OldestEnqueuedAt()
-	if err != nil || !ok || !oldest.Equal(base) {
-		t.Fatalf("post-nack oldest = %s ok=%v err=%v, want %s", oldest, ok, err, base)
+	oldest, err = j.OldestEnqueuedAtByPriority()
+	if err != nil || !oldest[PriorityBestEffort].Equal(base) {
+		t.Fatalf("post-nack best-effort oldest = %s err=%v, want %s", oldest[PriorityBestEffort], err, base)
 	}
 }
 
