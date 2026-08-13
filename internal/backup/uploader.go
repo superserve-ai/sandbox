@@ -722,18 +722,6 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 	if err != nil {
 		return ManifestFile{}, 0, fmt.Errorf("extents %s: %w", file.Path, err)
 	}
-	// Verify the source still matches the digest recorded at pause time
-	// before any bytes ship: a cheap early abort for the common mutation
-	// case (the sandbox resumed before the drain).
-	sum, err := hashApparent(ctx, f, extents, apparent)
-	if err != nil {
-		return ManifestFile{}, 0, fmt.Errorf("verify %s: %w", file.Path, err)
-	}
-	if sum != file.SHA256 {
-		task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
-			Msg("backup source changed since pause; abandoning generation")
-		return ManifestFile{}, 0, errSourceChanged
-	}
 	// The object name embeds the packing fingerprint: a retry over a
 	// physically relaid file (same apparent content, different extents)
 	// maps to a fresh object instead of deduping against bytes packed with
@@ -754,26 +742,31 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		}
 	}
 	if file.Shared {
-		// Serialize per shared object, and only then consult the
-		// verification history: two workers whose generations reference
-		// the same not-yet-verified base would otherwise both stream the
-		// multi-GB object (create-only makes the loser's full stream pure
-		// waste under the shared bandwidth cap). The waiter blocks here
-		// while the winner streams, then re-runs the check below against
-		// the verification the winner just recorded and skips the stream.
-		// Held for the rest of the upload by design — that IS the
-		// serialization. Lock scope is a single uploadFile call, so no
-		// worker ever holds two shared locks (no ordering deadlock).
+		// Serialize per shared object BEFORE any expensive work — the
+		// name needs only the extent scan, not the hash. Two workers
+		// whose generations reference the same not-yet-verified base
+		// would otherwise each hash and then both stream the multi-GB
+		// object (create-only makes the loser's full stream pure waste
+		// under the shared bandwidth cap, and the duplicate hashes are
+		// full-file reads on the same loaded host). The waiter blocks
+		// here while the winner hashes and streams, then finds the
+		// winner's verification below and skips both. Held for the rest
+		// of the upload by design — that IS the serialization. Lock scope
+		// is a single uploadFile call, so no worker ever holds two shared
+		// locks (no ordering deadlock).
 		defer u.lockShared(object)()
-		// Skip the stream when this host already verified these exact
-		// object bytes: shared bases are multi-GB, and every generation
-		// on the template re-references the same object, so streaming
-		// just to discover the create-only 412 at finalize would pin the
-		// bandwidth cap on redundant bytes and put the drain loop
-		// permanently behind the pause arrival rate. The local source
-		// was pre-verified above, the name embeds digest and packing
-		// fingerprint, and the extent table here describes this host's
-		// packing of content the history already vouches for.
+		// Skip hash and stream when this host already verified these
+		// exact object bytes: shared bases are multi-GB, and every
+		// generation on the template re-references the same object, so
+		// re-proving the local source buys nothing for an object whose
+		// stored bytes the history already vouches for — no bytes ship on
+		// this path, and the manifest's digest describes the bucket
+		// object, not the local file. A locally mutated base cannot ride
+		// this skip: same-layout mutation changes nothing (the object
+		// still holds the verified original matching the recorded
+		// digest), and layout-changing mutation changes the packing
+		// fingerprint, missing the history and falling through to the
+		// hash below.
 		verified, _ := u.verifiedHere(task, object)
 		if verified {
 			u.Log.Info().Str("object", object).
@@ -787,6 +780,19 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 				Extents:    extents,
 			}, 0, nil
 		}
+	}
+	// Verify the source still matches the digest recorded at pause time
+	// before any bytes ship: a cheap early abort for the common mutation
+	// case (the sandbox resumed before the drain). After the shared skip
+	// above, so an already-verified base is never re-read at all.
+	sum, err := hashApparent(ctx, f, extents, apparent)
+	if err != nil {
+		return ManifestFile{}, 0, fmt.Errorf("verify %s: %w", file.Path, err)
+	}
+	if sum != file.SHA256 {
+		task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
+			Msg("backup source changed since pause; abandoning generation")
+		return ManifestFile{}, 0, errSourceChanged
 	}
 	// The stream hasher digests the apparent content of what is ACTUALLY
 	// shipped (packed bytes as streamed, zeros for the holes), closing the
