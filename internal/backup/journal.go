@@ -85,6 +85,24 @@ type Task struct {
 	// the uploader-owned staging tree; the dedupe upgrade in Enqueue is
 	// one-way toward staged.
 	Staged bool `json:"staged,omitempty"`
+	// VerifiedBucket names the store identity this completion was
+	// verified against. Set only on the outbox copy at ack time: a
+	// notification delivered after a restart with a different
+	// BACKUP_BUCKET must report the bucket that actually holds the
+	// bytes, not the newly configured one. Empty on queue rows and on
+	// outbox entries written before the field existed (consumers fall
+	// back to the current bucket, the pre-field behavior).
+	VerifiedBucket string `json:"verified_bucket,omitempty"`
+	// FilesFinal marks Files as the finalized reportable manifest,
+	// captured at upload completion with authoritative sizes; consumers
+	// use it verbatim instead of re-synthesizing shared entries from
+	// local paths that ack-time cleanup may have removed.
+	FilesFinal bool `json:"files_final,omitempty"`
+	// VerifiedAt is when the upload verified, pinned on the outbox copy
+	// alongside VerifiedBucket: deliveries run in outbox key order (owner
+	// and content hash, not chronology), so stamping delivery time would
+	// let an older generation delivered later rank as the newest backup.
+	VerifiedAt time.Time `json:"verified_at,omitempty"`
 }
 
 // HasVerified reports whether this task already verified object.
@@ -134,6 +152,14 @@ var (
 	// "never made it, reconcile", without which a swept owner would be
 	// re-uploaded on every pass after its task was acked away.
 	completionsBucket = []byte("backup_completed_generations")
+	// seededBucket records, per completion key, the completion VALUE (the
+	// ack instant) whose notification signal was banked in the outbox (by
+	// the ack itself, or by a seed). The seed skips an entry only when
+	// the banked value matches the current one, which makes seeding track
+	// acknowledgments rather than keys: an older uploader's rollback-window
+	// ack of the SAME generation overwrites the completion value without
+	// touching this record, and the mismatch re-seeds the newer instant.
+	seededBucket = []byte("backup_outbox_seeded")
 )
 
 // verifiedRetention bounds how long verification history is kept. Long
@@ -153,7 +179,7 @@ var pruneCursorKey = []byte("\x00prune_cursor")
 // caller owns the bolt DB; sharing vmd's state DB keeps one fsync domain.
 func NewJournal(db *bolt.DB) (*Journal, error) {
 	err := db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket, outboxBucket, completionsBucket} {
+		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket, outboxBucket, completionsBucket, seededBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -556,11 +582,29 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, erro
 			}
 		}
 		if notify {
-			val, err := json.Marshal(task)
+			// The outbox copy pins the verified bucket and instant:
+			// delivery may run under a future process configured against a
+			// different store, and in an order that has nothing to do with
+			// when each generation verified.
+			nt := task
+			nt.VerifiedBucket = completedScope
+			nt.VerifiedAt = now.UTC()
+			val, err := json.Marshal(nt)
 			if err != nil {
 				return err
 			}
-			if err := tx.Bucket(outboxBucket).Put(task.indexKey(), val); err != nil {
+			// Keyed by bucket + owner + generation: coverage is
+			// bucket-scoped, so the same generation can legitimately
+			// complete once per bucket after a repoint, and an unscoped
+			// key would let the second ack overwrite the first bucket's
+			// undelivered signal.
+			if err := tx.Bucket(outboxBucket).Put(completionKey(completedScope, task), val); err != nil {
+				return err
+			}
+			// Banked, recorded as THIS acknowledgment's value: the seed
+			// re-seeds only if a later ack (a rollback interval's
+			// re-pause) overwrites the completion instant.
+			if err := tx.Bucket(seededBucket).Put(completionKey(completedScope, task), []byte(fmt.Sprintf("%d", now.UnixNano()))); err != nil {
 				return err
 			}
 		}
@@ -702,11 +746,17 @@ func (j *Journal) OldestEnqueuedAt() (time.Time, bool, error) {
 }
 
 // OutboxDepth reports how many completed tasks still owe their
-// completion notification.
+// completion notification. NUL-prefixed keys are internal markers (the
+// per-scope completion-seed guard), not notifications: counting them
+// would pin the depth gauge above zero forever and hold the
+// outbox-stalled alert permanently firing on every seeded host.
 func (j *Journal) OutboxDepth() (int, error) {
 	n := 0
 	err := j.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(outboxBucket).ForEach(func(_, _ []byte) error {
+		return tx.Bucket(outboxBucket).ForEach(func(k, _ []byte) error {
+			if len(k) > 0 && k[0] == 0 {
+				return nil
+			}
 			n++
 			return nil
 		})
@@ -791,26 +841,188 @@ func (j *Journal) MigrateVerificationScope(scope string) error {
 	})
 }
 
-// PendingNotifications returns completed tasks whose OnVerified signal
-// has not been confirmed delivered. Corrupt entries are skipped (and
-// swept by ClearNotification when their key is next written).
-func (j *Journal) PendingNotifications() ([]Task, error) {
+// PendingNotifications returns up to limit completed tasks whose
+// OnVerified signal has not been confirmed delivered (limit <= 0 means
+// all). Corrupt entries are skipped (and swept by ClearNotification when
+// their key is next written); NUL-prefixed keys are internal markers,
+// not notifications.
+func (j *Journal) PendingNotifications(limit int) ([]Task, error) {
 	var tasks []Task
 	err := j.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(outboxBucket).ForEach(func(k, v []byte) error {
+		c := tx.Bucket(outboxBucket).Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if len(k) > 0 && k[0] == 0 {
+				continue
+			}
 			var t Task
 			if json.Unmarshal(v, &t) == nil {
 				tasks = append(tasks, t)
+				if limit > 0 && len(tasks) >= limit {
+					return nil
+				}
 			}
-			return nil
-		})
+		}
+		return nil
 	})
 	return tasks, err
+}
+
+// seedChunkLimit bounds completions examined per seed transaction
+// (seeded skips included), so no single write transaction on the shared
+// DB scales with history size; a full pass paginates across drain
+// iterations.
+const seedChunkLimit = 256
+
+// SeedOutboxFromCompletions backfills one bounded chunk of the
+// notification outbox from the durable completions record, returning
+// done=false while more work may remain. Completions acked without
+// outbox entries (pre-wiring history, or a rollback window running an
+// older uploader) have no other path to control-plane coverage: Covered
+// suppresses their re-enqueue and their sandboxes may never pause
+// again. Seeded-ness is structural, not clock-based: every banked
+// signal (ack-time or seed-time) records the completion key in the
+// seeded set within the same transaction, and the seed processes
+// exactly the completions absent from that set, so a rollback window's
+// acks are caught regardless of clock direction and nothing ever
+// re-seeds.
+//
+// Convergence: done only when a COMPLETE pass from the bucket top finds
+// zero unseeded entries. A paginated or resumed pass always restarts
+// from the top after finishing, because completions written during an
+// interruption (a rollback interval) can sort before the resume cursor;
+// the restarted pass is cheap skips and reaches the fixed point on the
+// first pass that finds nothing new. The cursor persists pagination
+// position and whether the current pass has found work.
+// ResetSeedCursor drops any persisted pagination cursor. Called once at
+// uploader startup: a cursor surviving a process restart could resume a
+// pass whose already-scanned region predates completions an older
+// binary wrote during a rollback interval, declaring a clean pass over
+// keys it never examined. A fresh process always starts its first pass
+// at the top; within a process, in-process acks bank and mark
+// themselves, so resumed passes are sound.
+func (j *Journal) ResetSeedCursor() error {
+	return j.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(outboxBucket).Delete(seedCursorKey)
+	})
+}
+
+var seedCursorKey = []byte("\x00completions_seed_cursor")
+
+func (j *Journal) SeedOutboxFromCompletions() (bool, error) {
+	cursorKey := seedCursorKey
+	done := false
+	err := j.db.Update(func(tx *bolt.Tx) error {
+		ob := tx.Bucket(outboxBucket)
+		seeded := tx.Bucket(seededBucket)
+		c := tx.Bucket(completionsBucket).Cursor()
+		var k, v []byte
+		// Both pass properties persist across pagination: whether the
+		// pass began at the bucket top (a resumed chunk continues its
+		// pass, it does not start a new one) and whether the pass has
+		// found unseeded work. In-process acks bank and mark themselves,
+		// so entries appearing mid-pass are impossible within a process,
+		// and cross-boot additions always get a fresh top pass.
+		passFromTop := true
+		hadWork := false
+		if cur := ob.Get(cursorKey); cur != nil && len(cur) >= 3 {
+			passFromTop = cur[0] == '1'
+			hadWork = cur[1] == '1'
+			// The cursor names the first unprocessed key: resume at it.
+			k, v = c.Seek(cur[3:])
+		} else {
+			k, v = c.First()
+		}
+		// The scan covers EVERY recorded bucket identity, not just the
+		// configured one: pre-reporter completions scoped to an earlier
+		// BACKUP_BUCKET still name real objects in that bucket, and each
+		// seeded task pins the scope parsed from its own key.
+		examined := 0
+		for ; k != nil; k, v = c.Next() {
+			key := append([]byte(nil), k...)
+			if examined >= seedChunkLimit {
+				top, work := byte('0'), byte('0')
+				if passFromTop {
+					top = '1'
+				}
+				if hadWork {
+					work = '1'
+				}
+				return ob.Put(cursorKey, append([]byte{top, work, 0}, key...))
+			}
+			examined++
+			if sv := seeded.Get(key); sv != nil && string(sv) == string(v) {
+				continue
+			}
+			hadWork = true
+			parts := string(key)
+			si := strings.IndexByte(parts, 0)
+			if si < 0 {
+				continue
+			}
+			scope, rest := parts[:si], parts[si+1:]
+			i := strings.LastIndexByte(rest, 0)
+			if i < 0 {
+				continue
+			}
+			owner, gen := rest[:i], rest[i+1:]
+			t := Task{Generation: gen, VerifiedBucket: scope}
+			var ns int64
+			if _, err := fmt.Sscanf(string(v), "%d", &ns); err == nil {
+				t.VerifiedAt = time.Unix(0, ns).UTC()
+			}
+			if sep := strings.IndexByte(owner, 0); sep >= 0 {
+				t.TemplateID, t.BuildID = owner[:sep], owner[sep+1:]
+			} else {
+				t.SandboxID = owner
+			}
+			if existing := ob.Get(key); existing != nil {
+				// An undelivered entry survives a rollback re-ack with
+				// its stale instant; refresh the instant in place while
+				// preserving any file manifest the entry carries, which
+				// a coverage-only seed could not reconstruct.
+				var cur Task
+				if json.Unmarshal(existing, &cur) == nil {
+					cur.VerifiedAt = t.VerifiedAt
+					t = cur
+				}
+			}
+			val, err := json.Marshal(t)
+			if err != nil {
+				return err
+			}
+			if err := ob.Put(key, val); err != nil {
+				return err
+			}
+			if err := seeded.Put(key, append([]byte(nil), v...)); err != nil {
+				return err
+			}
+		}
+		// End of bucket: the fixed point is a complete pass from the top
+		// that found nothing unseeded. A pass that found work restarts
+		// from the top on the next call (cursor deleted), which is cheap
+		// skips, and reaches the fixed point one pass later.
+		done = passFromTop && !hadWork
+		return ob.Delete(cursorKey)
+	})
+	if err != nil {
+		return false, err
+	}
+	return done, nil
 }
 
 // ClearNotification confirms delivery of a task's completion signal.
 func (j *Journal) ClearNotification(task Task) error {
 	return j.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(outboxBucket).Delete(task.indexKey())
+		// Each entry is deleted under exactly the key shape it was
+		// written with: entries from before the key carried the bucket
+		// have no pinned VerifiedBucket and live under the unscoped key,
+		// everything since lives under the scoped one. Deleting only the
+		// cleared entry's own shape means a still-undelivered legacy
+		// entry survives a scoped clear for the same owner/generation.
+		b := tx.Bucket(outboxBucket)
+		if task.VerifiedBucket == "" {
+			return b.Delete(task.indexKey())
+		}
+		return b.Delete(completionKey(task.VerifiedBucket, task))
 	})
 }
