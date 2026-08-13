@@ -23,6 +23,15 @@ import (
 type HostRestoreItem struct {
 	SandboxID string
 	Dest      string
+	// WantVMStateSHA, when set, names the vmstate digest of the
+	// sandbox's latest pause as the control plane recorded it. Bucket
+	// object times are upload-completion times, so a retry-delayed old
+	// upload can finish after a newer pause's and rank first by age; the
+	// digest match selects the generation of the ACTUAL latest pause,
+	// with newest-completed as the recorded fallback when no candidate
+	// matches (the latest pause's upload may not have finished before
+	// the host died).
+	WantVMStateSHA string
 }
 
 // HostRestoreResult is the per-item outcome of a bulk restore. Exactly
@@ -171,11 +180,32 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 		res.Duration = time.Since(start)
 		return res
 	}
-	// ListGenerations returns newest first; the newest completed
-	// generation is the recovery point (at most one pause interval of
-	// file changes lost, per the recovery contract).
 	sort.SliceStable(gens, func(i, j int) bool { return gens[i].Created.After(gens[j].Created) })
 	res.Generation = gens[0].Generation
+	// Prefer the generation whose vmstate digest matches the control
+	// plane's latest pause: completion order is not capture order.
+	if item.WantVMStateSHA != "" {
+		matched := false
+		for _, g := range gens {
+			m, err := fetchManifest(ctx, h.Reader, item.SandboxID, g.Generation, func(string, ...any) {})
+			if err != nil {
+				continue
+			}
+			for _, f := range m.Files {
+				if f.Name == "vmstate.snap" && f.SHA256 == item.WantVMStateSHA {
+					res.Generation = g.Generation
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if !matched {
+			res.Reason = "latest pause not in bucket; using newest completed generation"
+		}
+	}
 	if h.DryRun {
 		res.Outcome = HostRestoreCoverable
 		res.Duration = time.Since(start)

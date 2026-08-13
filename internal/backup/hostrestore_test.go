@@ -3,6 +3,8 @@ package backup
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
@@ -123,4 +125,68 @@ func (c *countingReader) NewReader(ctx context.Context, object string) (io.ReadC
 	c.reads[object]++
 	c.mu.Unlock()
 	return c.inner.NewReader(ctx, object)
+}
+
+// Bucket object times are upload-completion times: a retry-delayed old
+// upload finishing after a newer pause must not outrank it. The digest
+// anchor selects the control plane's latest pause; an absent match
+// falls back to newest-completed with the reason recorded.
+func TestHostRestoreSelectsByVMStateDigest(t *testing.T) {
+	store := newMemBlobs()
+	srcOld := t.TempDir()
+	oldTask := writeRestoreFixture(t, srcOld)
+	// A second, content-distinct generation for the same sandbox: mutate
+	// the vmstate before fixturing.
+	srcNew := t.TempDir()
+	newTask := writeRestoreFixture(t, srcNew)
+	if err := os.WriteFile(filepath.Join(srcNew, "vmstate.snap"), []byte("newer pause vmstate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newTask = refreshFixtureDigests(t, newTask)
+	// Upload the NEWER pause first, the OLDER one second: completion
+	// order now inverts capture order.
+	uploadFixture(t, store, newTask)
+	uploadFixture(t, store, oldTask)
+
+	var newSHA string
+	for _, f := range newTask.Files {
+		if f.Name == "vmstate.snap" {
+			newSHA = f.SHA256
+		}
+	}
+	root := t.TempDir()
+	r := &HostRestorer{Reader: store, Lister: store, Concurrency: 1}
+	report := r.Run(context.Background(), []HostRestoreItem{{
+		SandboxID: newTask.SandboxID, Dest: filepath.Join(root, "a"), WantVMStateSHA: newSHA,
+	}})
+	if report.Restored != 1 || report.Results[0].Generation != newTask.Generation {
+		t.Fatalf("digest anchor picked %+v, want the newer pause %s", report.Results[0], newTask.Generation)
+	}
+
+	// No matching digest (the latest pause never uploaded): newest
+	// completed wins with the fallback recorded.
+	report = r.Run(context.Background(), []HostRestoreItem{{
+		SandboxID: newTask.SandboxID, Dest: filepath.Join(root, "b"),
+		WantVMStateSHA: "0000000000000000000000000000000000000000000000000000000000000000",
+	}})
+	if report.Restored != 1 || report.Results[0].Reason == "" {
+		t.Fatalf("fallback = %+v, want newest-completed with recorded reason", report.Results[0])
+	}
+}
+
+// refreshFixtureDigests re-derives digests, sizes, and the generation
+// key after a fixture file was mutated on disk.
+func refreshFixtureDigests(t *testing.T, task Task) Task {
+	t.Helper()
+	for i := range task.Files {
+		data, err := os.ReadFile(task.Files[i].Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(data)
+		task.Files[i].SHA256 = hex.EncodeToString(sum[:])
+		task.Files[i].Size = int64(len(data))
+	}
+	task.Generation = GenerationKey(task.Files)
+	return task
 }

@@ -27,12 +27,13 @@ import (
 func runHostRestore(ctx context.Context, reader backup.BlobReader, lister backup.BlobLister,
 	hostID, dbURL, itemsFile, destRoot string, concurrency int, execute bool) int {
 	var ids []string
+	wantSHAs := map[string]string{}
 	var err error
 	switch {
 	case itemsFile != "":
 		ids, err = sandboxIDsFromFile(itemsFile)
 	case dbURL != "":
-		ids, err = sandboxIDsFromDB(ctx, dbURL, hostID)
+		ids, wantSHAs, err = sandboxIDsFromDB(ctx, dbURL, hostID)
 	default:
 		fmt.Fprintln(os.Stderr, "host restore needs -db-url (or DATABASE_URL) or -sandboxes-file")
 		return 2
@@ -46,11 +47,16 @@ func runHostRestore(ctx context.Context, reader backup.BlobReader, lister backup
 		return 0
 	}
 
+	if err := os.MkdirAll(destRoot, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "create dest root: %v\n", err)
+		return 1
+	}
 	items := make([]backup.HostRestoreItem, 0, len(ids))
 	for _, id := range ids {
 		items = append(items, backup.HostRestoreItem{
-			SandboxID: id,
-			Dest:      filepath.Join(destRoot, id),
+			SandboxID:      id,
+			Dest:           filepath.Join(destRoot, id),
+			WantVMStateSHA: wantSHAs[id],
 		})
 	}
 	mode := "dry-run"
@@ -105,27 +111,38 @@ func runHostRestore(ctx context.Context, reader backup.BlobReader, lister backup
 // sandboxIDsFromDB enumerates live sandboxes the control plane pins to
 // the host. Destroyed sandboxes are excluded (their backups follow the
 // retention policy, not DR), as is anything never assigned here.
-func sandboxIDsFromDB(ctx context.Context, dbURL, hostID string) ([]string, error) {
+func sandboxIDsFromDB(ctx context.Context, dbURL, hostID string) ([]string, map[string]string, error) {
 	conn, err := pgx.Connect(ctx, dbURL)
 	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
+		return nil, nil, fmt.Errorf("connect: %w", err)
 	}
 	defer conn.Close(ctx)
-	rows, err := conn.Query(ctx,
-		`SELECT id FROM sandbox WHERE host_id = $1 AND destroyed_at IS NULL ORDER BY id`, hostID)
+	// The latest pause's vmstate digest anchors generation selection to
+	// capture order rather than upload-completion order.
+	rows, err := conn.Query(ctx, `
+		SELECT sb.id,
+		       COALESCE((SELECT am.sha256 FROM artifact_manifest am
+		         JOIN snapshot s ON s.id = am.snapshot_id
+		         WHERE s.sandbox_id = sb.id AND am.file_name = 'vmstate.snap'
+		         ORDER BY s.generation DESC LIMIT 1), '')
+		FROM sandbox sb WHERE sb.host_id = $1 AND sb.destroyed_at IS NULL ORDER BY sb.id`, hostID)
 	if err != nil {
-		return nil, fmt.Errorf("query: %w", err)
+		return nil, nil, fmt.Errorf("query: %w", err)
 	}
 	defer rows.Close()
 	var ids []string
+	shas := map[string]string{}
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
+		var id, sha string
+		if err := rows.Scan(&id, &sha); err != nil {
+			return nil, nil, err
 		}
 		ids = append(ids, id)
+		if sha != "" {
+			shas[id] = sha
+		}
 	}
-	return ids, rows.Err()
+	return ids, shas, rows.Err()
 }
 
 func sandboxIDsFromFile(path string) ([]string, error) {
