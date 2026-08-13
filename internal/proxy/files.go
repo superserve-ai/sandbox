@@ -43,6 +43,13 @@ const (
 	// this comfortably covers the whole thing without risking a large
 	// or malformed body bloating the log line.
 	maxErrorBodySnippet = 200
+
+	// maxLoggedPathLen bounds how much of the caller-controlled ?path=
+	// we log on an error response. The proxy's HTTP parser allows
+	// request targets up to ~1 MiB, so an unbounded log field here lets
+	// cheap repeated 4xx/5xx requests with a huge path balloon log size
+	// despite the response-body snippet already being capped.
+	maxLoggedPathLen = 200
 )
 
 // serveBoxdPort is the entry point for any request addressed at the
@@ -249,9 +256,13 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 				Reader: io.MultiReader(bytes.NewReader(snippet), resp.Body),
 				Closer: resp.Body,
 			}
+			loggedPath := requestedPath
+			if len(loggedPath) > maxLoggedPathLen {
+				loggedPath = loggedPath[:maxLoggedPathLen]
+			}
 			h.log.Warn().
 				Str("sandbox_id", instanceID).
-				Str("path", requestedPath).
+				Str("path", loggedPath).
 				Int("status", resp.StatusCode).
 				Dur("duration", time.Since(start)).
 				Str("body_snippet", strings.ToValidUTF8(string(snippet), "�")).
