@@ -1,11 +1,14 @@
 package proxy
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // File bridge constants. The /files path lives on the same boxd port that
@@ -34,6 +37,12 @@ const (
 	// this prevents a caller from streaming an absurdly large payload
 	// that ties up proxy resources before the VM disk fills.
 	maxUploadBytes = 4 << 30 // 4 GB
+
+	// maxErrorBodySnippet bounds how much of a boxd error response body
+	// we log. boxd's own errors are short JSON (`{"error":"..."}`), so
+	// this comfortably covers the whole thing without risking a large
+	// or malformed body bloating the log line.
+	maxErrorBodySnippet = 200
 )
 
 // serveBoxdPort is the entry point for any request addressed at the
@@ -188,6 +197,7 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		Host:   fmt.Sprintf("%s:%d", info.VMIP, boxdPort),
 	}
 
+	start := time.Now()
 	rp := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
@@ -218,6 +228,36 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		// what we want for large downloads: the client sees bytes as
 		// boxd produces them, not after the whole file is buffered.
 		FlushInterval: -1,
+		// boxd's own error responses (ENOSPC, ESTALE, etc.) are
+		// well-formed HTTP from vmd's point of view — ErrorHandler below
+		// only fires on connection-level failures, so without this a
+		// well-formed 4xx/5xx from inside the guest is invisible to any
+		// central log. Peel off a bounded snippet of the body for the
+		// log line, then put it back so the client still gets the full
+		// response unchanged.
+		ModifyResponse: func(resp *http.Response) error {
+			if resp.StatusCode < 400 {
+				return nil
+			}
+			buf := make([]byte, maxErrorBodySnippet)
+			n, _ := io.ReadFull(resp.Body, buf)
+			snippet := buf[:n]
+			resp.Body = struct {
+				io.Reader
+				io.Closer
+			}{
+				Reader: io.MultiReader(bytes.NewReader(snippet), resp.Body),
+				Closer: resp.Body,
+			}
+			h.log.Warn().
+				Str("sandbox_id", instanceID).
+				Str("path", requestedPath).
+				Int("status", resp.StatusCode).
+				Dur("duration", time.Since(start)).
+				Str("body_snippet", strings.ToValidUTF8(string(snippet), "�")).
+				Msg("files: boxd error response")
+			return nil
+		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
 			h.log.Error().Err(proxyErr).
 				Str("instance", instanceID).

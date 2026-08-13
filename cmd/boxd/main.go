@@ -1391,47 +1391,70 @@ func writeStorageFull(w http.ResponseWriter, partialPath string) {
 	_, _ = w.Write([]byte(storageFullResponse))
 }
 
-func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
+// staleHandleMaxAttempts bounds how many times we'll retry a write that
+// fails with ESTALE. The backing mount handing us a stale handle is
+// transient by nature (the guest's rootfs briefly loses and regains its
+// backing block device) — a fresh open() a few hundred milliseconds later
+// almost always gets a valid handle again, so we retry a handful of times
+// before giving up and surfacing a 500.
+const staleHandleMaxAttempts = 4
+
+func isStaleHandle(err error) bool {
+	return errors.Is(err, syscall.ESTALE)
+}
+
+// writeFileAttempt performs one mkdir+open+write+close cycle. It's split
+// out so handleFileUpload can retry the whole sequence on ESTALE — the
+// mkdir and the open can each independently observe a stale handle on the
+// same mount.
+func writeFileAttempt(path string, body []byte) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		// mkdir itself can hit ENOSPC if the sandbox is already
-		// brimming — inodes exhausted, no room for a new directory
-		// entry. Surface it as the same storage-full error so users
-		// get one consistent code for "you're out of disk" regardless
-		// of which syscall tripped it.
-		if errors.Is(err, syscall.ENOSPC) {
-			writeStorageFull(w, "")
-			return
-		}
-		errJSON, _ := json.Marshal(map[string]string{"error": "mkdir: " + err.Error()})
-		http.Error(w, string(errJSON), http.StatusInternalServerError)
-		return
+		return 0, fmt.Errorf("mkdir: %w", err)
 	}
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		if errors.Is(err, syscall.ENOSPC) {
-			writeStorageFull(w, "")
-			return
-		}
-		errJSON, _ := json.Marshal(map[string]string{"error": "create file: " + err.Error()})
+		return 0, fmt.Errorf("create file: %w", err)
+	}
+
+	written, werr := f.Write(body)
+	cerr := f.Close()
+	if werr != nil {
+		_ = os.Remove(path)
+		return 0, fmt.Errorf("write: %w", werr)
+	}
+	if cerr != nil {
+		_ = os.Remove(path)
+		return 0, fmt.Errorf("write: %w", cerr)
+	}
+	return int64(written), nil
+}
+
+func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
+	// Buffer the body up front. Retrying a stale-handle failure means
+	// replaying the same bytes into a fresh open(), and an http.Request
+	// body can't be re-read once io.Copy has partially drained it.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		errJSON, _ := json.Marshal(map[string]string{"error": "read body: " + err.Error()})
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
 		return
 	}
 
-	written, err := io.Copy(f, r.Body)
-	f.Close()
+	var written int64
+	for attempt := 0; ; attempt++ {
+		written, err = writeFileAttempt(path, body)
+		if err == nil || !isStaleHandle(err) || attempt >= staleHandleMaxAttempts-1 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond << attempt)
+	}
 	if err != nil {
-		// Remove the partial file — a truncated upload is never useful
-		// to the caller. This handles both ENOSPC (disk full) and
-		// client disconnect (network drop, cancel) so interrupted
-		// uploads don't leave orphaned files eating disk space.
-		_ = os.Remove(path)
-
 		if errors.Is(err, syscall.ENOSPC) {
 			writeStorageFull(w, "")
 			return
 		}
-		errJSON, _ := json.Marshal(map[string]string{"error": "write: " + err.Error()})
+		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
 		return
 	}
