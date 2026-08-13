@@ -1094,13 +1094,11 @@ func TestStartAdoption_PhaseVisibleBeforeReturn(t *testing.T) {
 		t.Fatal("duplicate StartAdoption must no-op")
 	}
 
-	deadline := time.After(2 * time.Second)
-	for p.adoptPhase.Load() != adoptPhaseIdle {
-		select {
-		case <-deadline:
-			t.Fatal("pass never returned to idle")
-		case <-time.After(10 * time.Millisecond):
-		}
+	// Wait on the goroutine, not the phase: idle is set before the final veth
+	// sweep, so a phase poll can release the test while the pass still runs.
+	p.wg.Wait()
+	if p.adoptPhase.Load() != adoptPhaseIdle {
+		t.Fatal("pass never returned to idle")
 	}
 	if got := passes.Load(); got != 1 {
 		t.Fatalf("adopted %d times, want exactly 1 candidate processed by exactly 1 pass", got)
