@@ -572,10 +572,16 @@ func (p *Pool) stopSlot(slot *preallocSlot) {
 // reservation completed successfully — record-owned indexes must never be
 // candidates. Returns the pass's counts.
 func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped int64) {
+	// The adopting window must cover the orphan scan itself — it can run long
+	// on a big namespace table, and claimants arriving during it deserve
+	// adoption-grade patience — but not the stray-veth sweep at the end, which
+	// delivers nothing a claimant could wait for. Opened here, closed
+	// explicitly before the sweep; the defer is only a backstop so a panic
+	// can't leave the flag stuck true.
+	p.adopting.Store(true)
+	defer p.adopting.Store(false)
 	indexes := p.mgr.claimOrphanSlots()
 	if len(indexes) > 0 {
-		p.adopting.Store(true)
-		defer p.adopting.Store(false)
 		p.log.Info().Int("candidates", len(indexes)).Msg("pool: adopting slots left by previous run")
 
 		var nAdopted, nInvalid, nSkipped, nTimeouts atomic.Int64
@@ -638,6 +644,7 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 		adopted, invalid, skipped = nAdopted.Load(), nInvalid.Load(), nSkipped.Load()
 	}
 
+	p.adopting.Store(false)
 	p.mgr.SweepStrayHostVeths()
 	return adopted, invalid, skipped
 }
