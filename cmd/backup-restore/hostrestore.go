@@ -117,11 +117,16 @@ func sandboxIDsFromDB(ctx context.Context, dbURL, hostID string) ([]string, map[
 		return nil, nil, fmt.Errorf("connect: %w", err)
 	}
 	defer conn.Close(ctx)
-	// Each pause's complete recorded digest set, in capture order
-	// (newest first), anchors generation selection to capture order
-	// rather than upload-completion order, as deep as the control
-	// plane's snapshot history goes. The full set matters: vmstate alone
-	// can collide across pauses whose rootfs differs.
+	// Each pause's recorded digest set, in capture order (newest
+	// first), anchors generation selection to capture order rather than
+	// upload-completion order, as deep as the control plane's snapshot
+	// history goes. Today pause-time manifests record vmstate only
+	// (hashing left the pause path), so these anchors are single-digest
+	// until the async worker's manifest write-back populates the full
+	// set; the grouping is per snapshot generation so richer rows bind
+	// automatically as they appear, and the residual vmstate-collision
+	// ambiguity until then is a recovery-point nuance the ledger's
+	// generation column makes auditable.
 	rows, err := conn.Query(ctx, `
 		SELECT sb.id, COALESCE((
 		  SELECT json_agg(sd.digests ORDER BY sd.gen DESC)
@@ -177,16 +182,24 @@ func sandboxIDsFromFile(path string) ([]string, map[string][]backup.CaptureAncho
 		}
 		fields := strings.Fields(line)
 		ids = append(ids, fields[0])
-		// Digest columns anchor by vmstate only (the exportable shape);
-		// name=sha tokens carry richer sets when available.
+		// Anchors separate by commas, one per pause (newest first);
+		// within an anchor, name=sha tokens bind multiple files of the
+		// SAME pause into one digest set, and a bare digest means
+		// vmstate (the exportable shape). Splitting same-pause tokens
+		// into separate anchors would misrank a vmstate-only match of a
+		// newer pause above the richer set it belongs to.
 		for _, tok := range fields[1:] {
 			a := backup.CaptureAnchor{}
-			if name, sha, ok := strings.Cut(tok, "="); ok {
-				a[name] = sha
-			} else {
-				a["vmstate.snap"] = tok
+			for _, part := range strings.Split(tok, ",") {
+				if name, sha, ok := strings.Cut(part, "="); ok {
+					a[name] = sha
+				} else if part != "" {
+					a["vmstate.snap"] = part
+				}
 			}
-			anchors[fields[0]] = append(anchors[fields[0]], a)
+			if len(a) > 0 {
+				anchors[fields[0]] = append(anchors[fields[0]], a)
+			}
 		}
 	}
 	return ids, anchors, sc.Err()
