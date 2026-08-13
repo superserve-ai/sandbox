@@ -442,6 +442,16 @@ def main() -> int:
             # any host with VMs. Apply the weights to the live slice;
             # --runtime keeps the unit file the durable source for boot.
             # Keep the values in lockstep with deploy/sandboxes.slice.
+            #
+            # Rollback caveat, accepted deliberately: a deploy of a script
+            # revision predating this line removes the weights from the
+            # unit file but cannot clear this runtime property, so the
+            # live slice stays weighted until reboot. The residue errs in
+            # the safe direction (VMs keep priority over background work),
+            # and an operator can clear it immediately with
+            #   systemctl set-property --runtime sandboxes.slice CPUWeight=100 IOWeight=100
+            # A self-clearing mechanism can only live in NEWER scripts,
+            # which by definition are not the ones rolled back to.
             sudo systemctl set-property --runtime sandboxes.slice CPUWeight=400 IOWeight=400 2>/dev/null || true
             sudo systemctl enable --quiet superserve-vmd.socket
             sudo systemctl enable --now --quiet superserve-maintenance-watch.timer
