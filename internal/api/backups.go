@@ -206,15 +206,23 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		}
 		var vmstate string
 		var total int64
+		var hasDisk bool
 		for _, f := range req.Files {
 			if f.Name == "vmstate.snap" {
 				vmstate = f.SHA256
+			}
+			if f.Name == "rootfs.ext4" {
+				hasDisk = true
 			}
 			if !f.Shared {
 				total += f.SizeBytes
 			}
 		}
-		if vmstate == "" || snap.VmstateSha256 != vmstate {
+		// Size sync requires the complete restorable pair: a report
+		// without the disk entry (coverage-only seeds, or any partial
+		// manifest) must not overwrite the snapshot's recorded size with
+		// a sum that omits its dominant term.
+		if !hasDisk || vmstate == "" || snap.VmstateSha256 != vmstate {
 			// The report describes an older pause (or one whose manifest
 			// hash was skipped): coverage is recorded above, but this
 			// snapshot row's sizes belong to its own pause's report.

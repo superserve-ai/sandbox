@@ -230,3 +230,59 @@ func TestIntegration_BackupReport_CoverageOnlySeed(t *testing.T) {
 		}
 	}
 }
+
+// A coverage-only report (empty files, the outbox seed's shape) with a
+// newer completion instant refreshes freshness but must never erase the
+// recorded manifest, and must never touch snapshot sizes.
+func TestIntegration_BackupReport_CoverageOnlyPreservesManifest(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	t.Setenv("INTERNAL_API_TOKEN", "itok-seed")
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"seed-guard"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	_ = teamID
+
+	rich := `{"sandbox_id":"` + sid + `","generation":"` + genKey + `",` +
+		`"bucket":"cell-bucket","completed_at":"2026-08-11T10:00:00Z","files":[` +
+		`{"name":"rootfs.ext4","size_bytes":4096,"sha256":"` + diskSHA + `"},` +
+		`{"name":"vmstate.snap","size_bytes":128,"sha256":"` + vmstateSHA + `"}]}`
+	req := httptest.NewRequest("POST", "/internal/hosts/host-1/backups", strings.NewReader(rich))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer itok-seed")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("rich report: %d %s", w.Code, w.Body.String())
+	}
+
+	// The seed's shape: same generation, newer instant, no files.
+	seeded := `{"sandbox_id":"` + sid + `","generation":"` + genKey + `",` +
+		`"bucket":"cell-bucket","completed_at":"2026-08-11T11:00:00Z","files":[]}`
+	req = httptest.NewRequest("POST", "/internal/hosts/host-1/backups", strings.NewReader(seeded))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer itok-seed")
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("coverage-only report: %d %s", w.Code, w.Body.String())
+	}
+
+	var files string
+	var completedAt string
+	if err := testPool.QueryRow(ctx,
+		`SELECT files::text, completed_at::text FROM backup_generation WHERE sandbox_id = $1`, sid).
+		Scan(&files, &completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(files, "rootfs.ext4") {
+		t.Fatalf("coverage-only refresh erased the manifest: files = %s", files)
+	}
+	if !strings.Contains(completedAt, "11:00:00") {
+		t.Fatalf("completed_at = %s, want the newer instant kept", completedAt)
+	}
+}
