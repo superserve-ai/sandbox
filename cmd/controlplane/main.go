@@ -171,6 +171,7 @@ func run() error {
 
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
 	handlers.Pool = dbPool
+	handlers.Stripe = api.NewStripeBillingClient(cfg)
 
 	// Product-usage analytics — no-op when POSTHOG_KEY is unset.
 	analyticsClient, err := analytics.New(os.Getenv("POSTHOG_KEY"), os.Getenv("POSTHOG_HOST"), log.Logger)
