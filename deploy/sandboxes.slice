@@ -7,6 +7,21 @@ CPUAccounting=yes
 MemoryAccounting=yes
 IOAccounting=yes
 
+# Weight sandbox VMs above everything in system.slice under contention.
+# cgroup weights only compare SIBLINGS, and this slice's siblings at the
+# root are system.slice and user.slice (default weight 100 each): weights
+# set on individual services inside system.slice (vmd included) can never
+# bias those services against the VMs here, because the root-level split
+# happens first. 400 gives the VM tree an 80% share of CPU and IO when
+# everything is hungry — vmd's backup hashing and upload streaming, the
+# proxy, and every other daemon divide what remains — while weights,
+# being proportional shares rather than caps, leave an idle host's full
+# throughput available to whoever wants it (background backup drain
+# included). IOWeight additionally requires an io-cost model on the
+# device to bite (kernel-dependent); CPUWeight is the load-bearing half.
+CPUWeight=400
+IOWeight=400
+
 # Memory ceiling: percentage is of total host RAM (correct semantics).
 MemoryMax=95%
 
