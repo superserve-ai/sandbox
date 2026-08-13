@@ -370,7 +370,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				// upload (sandbox deleted or resumed, local GC won the
 				// race). Nothing valid to back up under this content
 				// address; the generation is abandoned, not retried.
-				task.logOwner(u.Log.Warn().Str("path", file.Path)).
+				task.logOwner(u.lossEvent(task).Str("path", file.Path)).
 					Msg("backup source file gone; abandoning generation")
 				return false, streamed, nil
 			}
@@ -389,7 +389,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 			bf, err := baseTaskFile(file)
 			if err != nil {
 				if os.IsNotExist(err) {
-					task.logOwner(u.Log.Warn().Str("path", file.BasePath)).
+					task.logOwner(u.lossEvent(task).Str("path", file.BasePath)).
 						Msg("backup base image gone; abandoning generation")
 					return false, streamed, nil
 				}
@@ -399,7 +399,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 			streamed += n
 			if err != nil {
 				if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
-					task.logOwner(u.Log.Warn().Str("path", bf.Path)).
+					task.logOwner(u.lossEvent(task).Str("path", bf.Path)).
 						Msg("backup base image gone or rebuilt; abandoning generation")
 					return false, streamed, nil
 				}
@@ -490,6 +490,19 @@ func (t *Task) logOwner(e *zerolog.Event) *zerolog.Event {
 	return e.Str("sandbox_id", t.SandboxID)
 }
 
+// lossEvent picks the log level for an abandoned generation: staged
+// tasks upload from immutable snapshots, so a vanished or mutated
+// source there means corruption or an invariant break and must reach
+// the error channel (Sentry forwards errors only); unstaged tasks
+// upload from mutable paths where abandonment is the designed outcome
+// of a resume or teardown winning the race, and stays a warning.
+func (u *Uploader) lossEvent(task *Task) *zerolog.Event {
+	if task.Staged {
+		return u.Log.Error()
+	}
+	return u.Log.Warn()
+}
+
 // errSourceChanged marks a source file whose current content no longer
 // matches the digest recorded at pause time: the sandbox resumed and
 // mutated the disk before the upload drained. Shipping those bytes under
@@ -545,7 +558,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		return ManifestFile{}, 0, fmt.Errorf("verify %s: %w", file.Path, err)
 	}
 	if sum != file.SHA256 {
-		u.Log.Warn().Str("path", file.Path).Str("want", file.SHA256).Str("got", sum).
+		task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
 			Msg("backup source changed since pause; abandoning generation")
 		return ManifestFile{}, 0, errSourceChanged
 	}
@@ -616,7 +629,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		// claim.
 		sum, complete := hasher.finish()
 		if !complete || sum != file.SHA256 {
-			u.Log.Warn().Str("path", file.Path).Str("want", file.SHA256).Str("got", sum).
+			task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
 				Bool("fully_streamed", complete).
 				Msg("backup source changed during upload; abandoning generation")
 			return ManifestFile{}, shipped, errSourceChanged

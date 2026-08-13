@@ -417,6 +417,12 @@ type Manager struct {
 	// revalidateLauncher's re-enable so a stale previous-boot pin can't resurrect
 	// the launcher path.
 	launcherBuilt atomic.Bool
+	// launcherBuilding admits one pin build at a time, so the boot build and a
+	// sampler-driven retry can't run concurrently and prune the same paths.
+	launcherBuilding atomic.Bool
+	// launcherNextRetry is the earliest wall-clock (unix nanos) at which a failed
+	// pin build may be retried. Zero means retry immediately.
+	launcherNextRetry atomic.Int64
 
 	// cgroups is the delegated subtree for direct-spawned VMs; nil until
 	// ArmDirectSpawn succeeds. directSpawnArmed gates NEW launches onto the
@@ -3961,7 +3967,13 @@ func (m *Manager) reclaimPausedNetworkInventory(now time.Time) int {
 		if reclaimed >= maxReclaims {
 			break
 		}
-		if slotPressure && !kernelPressure && m.cfg.PausedNetworkMinWarmAge > 0 {
+		// Warmth is protected under every pressure type. Gating this on slot
+		// pressure alone made it dead in practice: slot headroom is measured
+		// against the whole index range, so kernel pressure is what actually
+		// fires, and a sandbox paused seconds ago was eligible immediately.
+		// Skipping a too-fresh candidate costs nothing — the backlog supplies
+		// older ones, and the next pass re-evaluates.
+		if m.cfg.PausedNetworkMinWarmAge > 0 {
 			age := now.Sub(m.pausedAtForOrder(cand.rec))
 			if age < m.cfg.PausedNetworkMinWarmAge {
 				continue
@@ -4015,11 +4027,13 @@ func (m *Manager) reclaimPausedNetworkInventory(now time.Time) int {
 		reclaimed += drained
 		telemetrySnapshot.ReclaimedTeardown += int64(drained)
 	}
-	if reclaimed > 0 {
-		m.pausedNetworkControllerMu.Lock()
-		m.pausedNetworkControllerLastRun = now
-		m.pausedNetworkControllerMu.Unlock()
-	}
+	// Stamp on any pass that got this far, not only ones that reclaimed. A
+	// pressured host whose candidates are all lock-contended (or already
+	// released) otherwise never arms the cooldown, and repeats the full record
+	// scan, /proc/mounts read and netns readdir on every single tick.
+	m.pausedNetworkControllerMu.Lock()
+	m.pausedNetworkControllerLastRun = now
+	m.pausedNetworkControllerMu.Unlock()
 	return reclaimed
 }
 
@@ -4061,10 +4075,17 @@ func (m *Manager) releasePausedNetworkSlot(rec VMRecord, shrink bool) (bool, err
 		inst.TAPDevice = ""
 		inst.MACAddress = ""
 		inst.mu.Unlock()
+		// Name the namespace explicitly rather than relying on the net
+		// manager's device table: a VM whose startup reattach failed is absent
+		// from it, and the by-vmID calls silently no-op for those. The record's
+		// namespace has already been cleared above, so a no-op here would strand
+		// the netns, veth, tap and mount entries with nothing left naming them —
+		// invisible to every sweep and reclaim until the next restart. These
+		// variants take the same by-vmID path when the VM is tracked.
 		if shrink {
-			m.netMgr.TeardownVM(rec.ID)
+			m.netMgr.TeardownVMOrNamespace(rec.ID, ns)
 		} else {
-			m.netMgr.CleanupVM(rec.ID)
+			m.netMgr.CleanupVMOrNamespace(rec.ID, ns)
 		}
 		return true, nil
 	}
