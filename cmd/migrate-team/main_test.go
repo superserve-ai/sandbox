@@ -274,6 +274,18 @@ func seedFixture(t *testing.T) *fixture {
 		INSERT INTO artifact_manifest (template_id, file_name, path, size_bytes, sha256)
 		VALUES ($1, 'base.ext4', '/srv/templates/'||$2::text||'/base.ext4', 8192,
 		        repeat('cd', 32))`, f.tpl, f.tpl)
+	// Backup coverage rows: one through each parent kind, so the copy
+	// scope's sandbox and template branches are both exercised.
+	mustExec(t, srcPool, `
+		INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
+		VALUES ($1, repeat('ef', 32), 'superserve-artifact-backup-test', now(),
+		        jsonb_build_array(jsonb_build_object(
+		            'name', 'rootfs.ext4', 'size_bytes', 4096, 'sha256', repeat('ab', 32))))`, f.sb1)
+	mustExec(t, srcPool, `
+		INSERT INTO backup_generation (template_id, build_id, generation, bucket, completed_at, files)
+		VALUES ($1, 'build-1', repeat('01', 32), 'superserve-artifact-backup-test', now(),
+		        jsonb_build_array(jsonb_build_object(
+		            'name', 'base.ext4', 'size_bytes', 8192, 'sha256', repeat('cd', 32))))`, f.tpl)
 	// Destroyed sandbox: copied for history, excluded from artifact dirs.
 	mustExec(t, srcPool, `
 		INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id,
@@ -422,6 +434,7 @@ func seedFixture(t *testing.T) *fixture {
 		"sandbox":                            4,
 		"snapshot":                           2,
 		"artifact_manifest":                  2,
+		"backup_generation":                  2,
 		"sandbox_secret":                     1,
 		"sandbox_active_interval":            2,
 		"sandbox_compute_billing_interval":   2,

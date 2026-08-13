@@ -288,7 +288,13 @@ func TestJournalOutboxDepth(t *testing.T) {
 	if depth, err := j.OutboxDepth(); err != nil || depth != 1 {
 		t.Fatalf("outbox depth after notify ack = %d err=%v, want 1", depth, err)
 	}
-	if err := j.ClearNotification(task); err != nil {
+	// Clear takes the entry as PendingNotifications returns it: the
+	// outbox key is scoped by the entry's pinned bucket.
+	pending, err := j.PendingNotifications(0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending = %d err=%v, want 1", len(pending), err)
+	}
+	if err := j.ClearNotification(pending[0]); err != nil {
 		t.Fatal(err)
 	}
 	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {
@@ -595,5 +601,21 @@ func TestStaleRecordVerificationCannotResurrectRow(t *testing.T) {
 	}
 	if verified, err := j.WasVerified("bucket\x00obj", now.Add(claimTTL+time.Hour)); err != nil || !verified {
 		t.Fatalf("WasVerified = %v/%v after live-claim record", verified, err)
+	}
+}
+
+// The per-scope seed marker lives inside the outbox bucket but is not a
+// notification: counting it would pin the depth gauge above zero forever
+// and hold the outbox-stalled alert firing on every seeded host.
+func TestOutboxDepthExcludesSeedMarker(t *testing.T) {
+	j, _ := testJournal(t)
+	if _, err := j.SeedOutboxFromCompletions(); err != nil {
+		t.Fatal(err)
+	}
+	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {
+		t.Fatalf("depth after seed marker = %d err=%v, want 0", depth, err)
+	}
+	if pending, err := j.PendingNotifications(0); err != nil || len(pending) != 0 {
+		t.Fatalf("pending after seed marker = %d err=%v, want 0", len(pending), err)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,18 +73,24 @@ type Uploader struct {
 	// budget being spent is what backup work takes from tenant VMs, not
 	// what the host has.
 	Concurrency int
-	Log     zerolog.Logger
+	Log         zerolog.Logger
 	// VMDVersion is stamped into generation manifests.
 	VMDVersion string
 	// OnVerified fires after a task's generation is fully in the bucket
 	// (manifest object written) and acked. This is the signal downstream
 	// bookkeeping and local-staging GC key on. Delivery is at-least-once:
 	// the signal is held durably in the journal's outbox until the
-	// callback returns, and a restart redelivers undelivered signals, so
-	// the callback must tolerate duplicates.
-	OnVerified func(Task)
+	// callback returns nil, and a restart redelivers undelivered signals,
+	// so the callback must tolerate duplicates. A non-nil return keeps
+	// the signal outboxed for the next flush (ack-time and idle ticks):
+	// a delivery the consumer could not land must not be cleared.
+	OnVerified func(Task) error
 	// Tick is the idle poll interval. 0 → 1s.
 	Tick time.Duration
+	// notifyRetryAt gates the next delivery attempt after a failed one.
+	// Read and written only under notifyMu (flushNotifications holds it
+	// for the whole flush), which keeps it race-free across workers.
+	notifyRetryAt time.Time
 	// LegacyStagingRoot is a retired staging location still referenced
 	// by journal rows enqueued before a relocation. It is swept with the
 	// same journal authority as StagingRoot until it empties, then the
@@ -175,6 +182,21 @@ func (u *Uploader) Run(ctx context.Context) error {
 		case <-time.After(tick):
 		}
 	}
+	// Seed the outbox from completions that predate reporter wiring, so
+	// pre-rollout generations reach control-plane coverage; once per
+	// scope, and only when a consumer exists to deliver them.
+	// Seeding runs INSIDE the loop, one bounded chunk per iteration, so
+	// a large completion history neither holds the shared DB's write
+	// lock in one transaction nor delays the first queued backups.
+	seeding := u.OnVerified != nil
+	if seeding {
+		// A cursor surviving a restart could resume past completions an
+		// older binary wrote during a rollback interval; fresh processes
+		// start their first pass at the top.
+		if err := u.Journal.ResetSeedCursor(); err != nil {
+			u.Log.Error().Err(err).Msg("seed cursor reset failed; seeding proceeds from persisted position")
+		}
+	}
 	// Deliver completion signals a previous process acked but never
 	// notified: the outbox is the only record of those.
 	u.flushNotifications()
@@ -185,12 +207,13 @@ func (u *Uploader) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
-		// Exactly one worker owns the staging sweep: it is journal-global
-		// work, and N workers each running it would multiply directory
-		// walks without clearing residue any faster.
+		// Exactly one worker owns the staging sweep and the completion
+		// seeding: both are journal-global work, and N workers each
+		// running them would multiply directory walks and seed-cursor
+		// contention without finishing either any faster.
 		go func(sweeper bool) {
 			defer wg.Done()
-			u.drainLoop(ctx, tick, sweeper)
+			u.drainLoop(ctx, tick, sweeper, sweeper && seeding)
 		}(i == 0)
 	}
 	wg.Wait()
@@ -199,10 +222,18 @@ func (u *Uploader) Run(ctx context.Context) error {
 
 // drainLoop is one worker: it drains claimed tasks until ctx ends,
 // backing off on idle and errors. The sweeper additionally runs the
-// periodic staged-base sweep.
-func (u *Uploader) drainLoop(ctx context.Context, tick time.Duration, sweeper bool) {
+// periodic staged-base sweep and, when seeding, the bounded
+// per-iteration outbox seed chunks.
+func (u *Uploader) drainLoop(ctx context.Context, tick time.Duration, sweeper, seeding bool) {
 	lastSweep := u.clock()
 	for {
+		if seeding {
+			if done, err := u.Journal.SeedOutboxFromCompletions(); err != nil {
+				u.Log.Error().Err(err).Msg("outbox completion seed failed; will retry")
+			} else if done {
+				seeding = false
+			}
+		}
 		// Checked every iteration: a successful Nack after a canceled
 		// upload returns (worked, nil), and without this check a queued
 		// backlog would be drained (and pointlessly nacked) task by task
@@ -252,7 +283,7 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 		return false, err
 	}
 	start := u.clock()
-	completed, streamed, err := u.uploadTask(ctx, &task)
+	completed, finalized, streamed, err := u.uploadTask(ctx, &task)
 	// Bytes count what actually reached new bucket objects, failures
 	// included: partial progress is real upload traffic.
 	u.Metrics.AddUploadBytes(ctx, streamed)
@@ -326,7 +357,21 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	if completed {
 		completedScope = u.Store.Identity()
 	}
-	if err := u.Journal.Ack(task, completedScope, completed && u.OnVerified != nil); err != nil {
+	// Notify on every completion, consumer or not: a vmd running without
+	// reporter wiring must still bank the signal, or completions from
+	// that window would be permanently invisible to coverage once
+	// reporting returns (the seed marker is once per scope and cannot
+	// rescan). The outbox simply accumulates until a consumer flushes
+	// it, and the outbox-depth metric surfaces unbounded growth.
+	ackTask := task
+	if completed && len(finalized) > 0 {
+		// The outbox copy carries the finalized manifest verbatim;
+		// staging cleanup below still uses the original task's local
+		// paths.
+		ackTask.Files = finalized
+		ackTask.FilesFinal = true
+	}
+	if err := u.Journal.Ack(ackTask, completedScope, completed); err != nil {
 		return true, err
 	}
 	removeStagedTask(u.StagingRoot, task)
@@ -334,9 +379,22 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	return true, nil
 }
 
-// flushNotifications delivers every outboxed completion signal and
-// confirms each only after the callback returns. Failures to load or
-// clear are logged and retried on the next flush, never dropped.
+// notifyRetryDelay spaces delivery attempts after a failure: the idle
+// flush runs every tick, and a control plane that is down must not be
+// hammered (or the log flooded) once per second per pending signal.
+const notifyRetryDelay = 30 * time.Second
+
+// notifyFlushBatch bounds deliveries per flush. Flushes run at startup,
+// after every ack, and on idle ticks, so a deep outbox (a seeded
+// upgrade, or a long consumer-less window) converges across flushes
+// instead of holding the drain loop through thousands of sequential
+// requests while queued pause backups wait.
+const notifyFlushBatch = 32
+
+// flushNotifications delivers up to notifyFlushBatch outboxed completion
+// signals and confirms each only after the callback returns nil.
+// Failures to deliver, load, or clear are logged and retried on a later
+// flush (spaced by notifyRetryDelay), never dropped.
 func (u *Uploader) flushNotifications() {
 	if u.OnVerified == nil {
 		return
@@ -344,19 +402,36 @@ func (u *Uploader) flushNotifications() {
 	// One flush at a time: a second worker arriving mid-flush would read
 	// the same not-yet-cleared entries and double-deliver immediately.
 	// Skipping is safe — anything it would have sent is still outboxed
-	// and goes with the next ack or idle flush.
+	// and goes with the next ack or idle flush. The mutex also makes it
+	// the only guard notifyRetryAt needs: every read and write of that
+	// field happens while holding it.
 	if !u.notifyMu.TryLock() {
 		return
 	}
 	defer u.notifyMu.Unlock()
-	pending, err := u.Journal.PendingNotifications()
+	if !u.notifyRetryAt.IsZero() && time.Now().Before(u.notifyRetryAt) {
+		return
+	}
+	pending, err := u.Journal.PendingNotifications(notifyFlushBatch)
 	if err != nil {
 		u.Metrics.AddNotifyFailure(context.Background())
 		u.Log.Warn().Err(err).Msg("backup notification outbox read failed")
 		return
 	}
 	for _, t := range pending {
-		u.OnVerified(t)
+		if err := u.OnVerified(t); err != nil {
+			// Stop the batch: a control plane that failed this delivery
+			// will fail the rest too, and each attempt can hold the
+			// drain goroutine for the full request timeout. The retained
+			// entries redeliver together after the retry window.
+			u.Metrics.AddNotifyFailure(context.Background())
+			t.logOwner(u.Log.Warn().Err(err)).
+				Str("generation", t.Generation).
+				Msg("backup notification delivery failed; will redeliver")
+			u.notifyRetryAt = time.Now().Add(notifyRetryDelay)
+			return
+		}
+		u.notifyRetryAt = time.Time{}
 		if err := u.Journal.ClearNotification(t); err != nil {
 			u.Metrics.AddNotifyFailure(context.Background())
 			t.logOwner(u.Log.Warn().Err(err)).
@@ -403,6 +478,30 @@ func SharedBaseName(sha string) string {
 	return "base-" + sha + ".ext4"
 }
 
+// ReportedFiles returns the manifest entries a verified generation's
+// coverage report should carry: the task's own files plus the shared
+// base entries uploadTask synthesizes into the bucket manifest, which
+// task.Files alone omits. Shared sizes come from the staged or original
+// source when it still exists and are zero otherwise: delivery can
+// outlive ack-time staging cleanup, and the base object's authoritative
+// size lives in the bucket manifest either way.
+func (t *Task) ReportedFiles() []TaskFile {
+	out := append([]TaskFile(nil), t.Files...)
+	seen := map[string]bool{}
+	for _, f := range t.Files {
+		if f.BaseSHA256 == "" || seen[f.BaseSHA256] {
+			continue
+		}
+		seen[f.BaseSHA256] = true
+		bf, err := baseTaskFile(f)
+		if err != nil {
+			bf = TaskFile{Name: SharedBaseName(f.BaseSHA256), SHA256: f.BaseSHA256, Shared: true}
+		}
+		out = append(out, bf)
+	}
+	return out
+}
+
 // uploadTask ships every artifact of a generation, then its manifest
 // object. Objects are content-addressed and create-only, so retries after
 // partial progress re-cover already-written objects as no-ops. completed
@@ -413,7 +512,7 @@ func SharedBaseName(sha string) string {
 // survives into the Nack that re-persists the task on failure. streamed
 // counts bytes written into newly created objects across the attempt,
 // error paths included (dedupes and skips add nothing).
-func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, streamed int64, _ error) {
+func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, finalized []TaskFile, streamed int64, _ error) {
 	gen := GenerationManifest{
 		SandboxID:  task.SandboxID,
 		TemplateID: task.TemplateID,
@@ -433,9 +532,9 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				// address; the generation is abandoned, not retried.
 				task.logOwner(u.lossEvent(task).Str("path", file.Path)).
 					Msg("backup source file gone; abandoning generation")
-				return false, streamed, nil
+				return false, nil, streamed, nil
 			}
-			return false, streamed, err
+			return false, nil, streamed, err
 		}
 		gen.Files = append(gen.Files, mf)
 		// An overlay's holes are backed by its base image, and the bucket
@@ -452,9 +551,9 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				if os.IsNotExist(err) {
 					task.logOwner(u.lossEvent(task).Str("path", file.BasePath)).
 						Msg("backup base image gone; abandoning generation")
-					return false, streamed, nil
+					return false, nil, streamed, nil
 				}
-				return false, streamed, err
+				return false, nil, streamed, err
 			}
 			bmf, n, err := u.uploadFile(ctx, task, bf)
 			streamed += n
@@ -462,9 +561,9 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
 					task.logOwner(u.lossEvent(task).Str("path", bf.Path)).
 						Msg("backup base image gone or rebuilt; abandoning generation")
-					return false, streamed, nil
+					return false, nil, streamed, nil
 				}
-				return false, streamed, err
+				return false, nil, streamed, err
 			}
 			uploadedBases[file.BaseSHA256] = true
 			gen.Files = append(gen.Files, bmf)
@@ -472,20 +571,32 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 	}
 	manifestObject, err := task.objectName(ManifestObject)
 	if err != nil {
-		return false, streamed, err
+		return false, nil, streamed, err
 	}
 	payload, err := json.Marshal(gen)
 	if err != nil {
-		return false, streamed, err
+		return false, nil, streamed, err
 	}
 	created, err := u.Store.Create(ctx, manifestObject, &limitedReader{r: bytes.NewReader(payload), limiter: u.Limiter, ctx: ctx})
 	if err != nil {
-		return false, streamed, fmt.Errorf("manifest object: %w", storeError{err})
+		return false, nil, streamed, fmt.Errorf("manifest object: %w", storeError{err})
 	}
 	if created {
 		streamed += int64(len(payload))
 	}
-	return true, streamed, nil
+	// The finalized reportable set, captured while every size and digest
+	// is authoritative: reconstructing it at delivery time would stat
+	// staged copies that ack-time cleanup may have already removed,
+	// recording zero-size entries in coverage.
+	finalized = make([]TaskFile, 0, len(gen.Files))
+	for _, mf := range gen.Files {
+		finalized = append(finalized, TaskFile{
+			Name: mf.Name, SHA256: mf.SHA256, Size: mf.Size,
+			BasePath: mf.BasePath, BaseSHA256: mf.BaseSHA256,
+			Shared: strings.HasPrefix(mf.Object, "bases/"),
+		})
+	}
+	return true, finalized, streamed, nil
 }
 
 // stagingSweepInterval paces the running staged-base sweep.

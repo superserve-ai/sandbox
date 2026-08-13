@@ -767,6 +767,24 @@ func main() {
 			// must not suppress uploading into this one.
 			return journal.Covered(bucket, t)
 		})
+		// Verified generations report back to the control plane so backup
+		// coverage is a DB query. Rides the uploader's durable outbox:
+		// failed deliveries stay outboxed and retry on ack-time and idle
+		// flushes. Requires the same wiring the heartbeat uses; without
+		// it, uploads still run and only the write-back is off.
+		if cfg.ControlPlaneURL != "" && os.Getenv("INTERNAL_API_TOKEN") != "" {
+			reporter := &vm.BackupReporter{
+				ControlPlaneURL: cfg.ControlPlaneURL,
+				HostID:          cfg.HostID,
+				Token:           os.Getenv("INTERNAL_API_TOKEN"),
+				Bucket:          bucket,
+				Log:             log.With().Str("component", "backup").Logger(),
+			}
+			uploader.OnVerified = reporter.Deliver
+			log.Info().Msg("backup coverage write-back enabled")
+		} else {
+			log.Warn().Msg("backup coverage write-back disabled: control plane URL or internal token unset")
+		}
 		// The uploader must fully stop before the journal and GCS client
 		// close under it: a verification or Nack cut off mid-write leaves
 		// a finalized object the journal never recorded, which the
