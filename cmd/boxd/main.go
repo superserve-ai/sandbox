@@ -1391,13 +1391,23 @@ func writeStorageFull(w http.ResponseWriter, partialPath string) {
 	_, _ = w.Write([]byte(storageFullResponse))
 }
 
-// staleHandleMaxAttempts bounds how many times we'll retry a write that
-// fails with ESTALE. The backing mount handing us a stale handle is
-// transient by nature (the guest's rootfs briefly loses and regains its
-// backing block device) — a fresh open() a few hundred milliseconds later
-// almost always gets a valid handle again, so we retry a handful of times
-// before giving up and surfacing a 500.
-const staleHandleMaxAttempts = 4
+// staleHandleRetryBudget bounds total wall-clock time spent retrying a
+// write that fails with ESTALE, not attempt count. Observed ESTALE
+// failures aren't a cheap instant syscall error — the write() call
+// itself has been seen blocking for several seconds (up to ~18s) before
+// returning ESTALE, so a fixed attempt count could multiply an already
+// slow failure by 4x and blow well past any caller's timeout. Bounding
+// by elapsed time means a single slow attempt already exhausts the
+// budget and we fail fast with roughly the same latency as before,
+// while a fast-resolving stale handle still gets a few quick retries
+// within the window.
+const staleHandleRetryBudget = 5 * time.Second
+
+// staleHandleRetryDelay is the pause between retry attempts. It's small
+// and fixed rather than exponential: staleHandleRetryBudget is what
+// actually bounds total latency, so growing the backoff on top of that
+// would just eat into the retry budget without a compensating benefit.
+const staleHandleRetryDelay = 150 * time.Millisecond
 
 func isStaleHandle(err error) bool {
 	return errors.Is(err, syscall.ESTALE)
@@ -1441,13 +1451,14 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
 		return
 	}
 
+	deadline := time.Now().Add(staleHandleRetryBudget)
 	var written int64
-	for attempt := 0; ; attempt++ {
+	for {
 		written, err = writeFileAttempt(path, body)
-		if err == nil || !isStaleHandle(err) || attempt >= staleHandleMaxAttempts-1 {
+		if err == nil || !isStaleHandle(err) || time.Now().After(deadline) {
 			break
 		}
-		time.Sleep(100 * time.Millisecond << attempt)
+		time.Sleep(staleHandleRetryDelay)
 	}
 	if err != nil {
 		if errors.Is(err, syscall.ENOSPC) {
