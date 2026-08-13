@@ -260,8 +260,8 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 			}
 		}
 		if slot == nil {
-			// mustAllocate returns nil at shutdown and the refill select can
-			// still win the send arm — fall back to on-demand setup.
+			// Defensive: no producer sends nil today, but a nil here would
+			// otherwise panic the claim path — fall back to on-demand setup.
 			return nil
 		}
 		tPopped := time.Now()
@@ -913,9 +913,14 @@ func (p *Pool) refillLoop(ctx context.Context) {
 
 // refillStep builds and delivers (or discards) one slot while the worker is
 // declared active. The active span covers construction through delivery so a
-// claimant reading refillActive sees real producer state; every backoff sleep
+// claimant reading refillActive sees real producer state; every retry backoff
 // happens in the caller, outside the span, so a pool whose workers are all
-// backing off reads as inactive and releases claimants immediately.
+// backing off — or spinning on an unsatisfiable allocation, like an exhausted
+// slot range — reads as inactive and releases claimants immediately. A full
+// pool parks the worker on the send with finished inventory in hand (bounded
+// overshoot of one slot per worker); parked-active is truthful, and claimants
+// never wait on a full pool anyway. Built outside the select so a shutdown
+// while parked can dispose of the slot instead of dropping it.
 func (p *Pool) refillStep(ctx context.Context) refillOutcome {
 	p.refillActive.Add(1)
 	defer func() {
@@ -923,38 +928,11 @@ func (p *Pool) refillStep(ctx context.Context) refillOutcome {
 		p.signalProgress()
 	}()
 
-	if len(p.fresh) >= p.newSize {
-		// Pool full — pre-build one slot and block until it is consumed or
-		// shutdown. Built outside the select so a shutdown while blocked
-		// can dispose of the slot instead of dropping it. The worker stays
-		// active while parked: it holds finished inventory, and claimants
-		// never wait on a full pool anyway.
-		slot := p.mustAllocate(ctx)
-		if slot == nil {
-			// mustAllocate only returns nil at shutdown.
-			return refillStopped
-		}
-		if p.refillIsPaused() {
-			p.cleanup(slot)
-			return refillOK
-		}
-		select {
-		case <-p.refillDrainCh():
-			p.cleanup(slot)
-			return refillOK
-		case <-p.stopCh:
-			p.stopSlot(slot)
-			return refillStopped
-		case <-ctx.Done():
-			p.stopSlot(slot)
-			return refillStopped
-		case p.fresh <- slot:
-			return refillOK
-		}
-	}
-
 	slot, err := p.allocate(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return refillStopped
+		}
 		p.log.Error().Err(err).Msg("pool refill failed")
 		return refillFailed
 	}
@@ -974,19 +952,6 @@ func (p *Pool) refillStep(ctx context.Context) refillOutcome {
 	case <-ctx.Done():
 		p.stopSlot(slot)
 		return refillStopped
-	}
-}
-
-func (p *Pool) mustAllocate(ctx context.Context) *preallocSlot {
-	for {
-		slot, err := p.allocate(ctx)
-		if err == nil {
-			return slot
-		}
-		p.log.Error().Err(err).Msg("pool allocate retry")
-		if !p.pauseAfterFailure(ctx) {
-			return nil
-		}
 	}
 }
 
