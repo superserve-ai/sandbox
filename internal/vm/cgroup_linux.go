@@ -142,43 +142,6 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 		}
 	}
 	m.cgroups = tree // existing cgroup VMs are now manageable
-	// Controller mode is configured ONLY when arming. A manage-only pass
-	// (rollback/drain) must not mutate the mode existing VMs were created
-	// under: re-enabling controllers there would pay per-child kernel
-	// allocations during an incident-time startup, turn an enable failure
-	// into a crash loop of an otherwise manageable fleet, and leave
-	// bare-era children with oom.group at the kernel default.
-	if wantArm {
-		if m.cfg.BareVMCgroups {
-			// Disable failure is loud, never silent, but not fatal: with
-			// controllers still enabled the host is merely on the slower
-			// pre-bare behavior, which is correct. (Disabling is legal with
-			// live children — their controller state tears down in place.)
-			if _, derr := configureChildControllers(filepath.Join(tree.vms, "cgroup.subtree_control"), true); derr != nil {
-				m.log.Error().Err(derr).Msg("bare vm cgroups requested but child controllers remain enabled — launches pay full cgroup-creation cost")
-			}
-		} else {
-			wasBare, cfgErr := configureChildControllers(filepath.Join(tree.vms, "cgroup.subtree_control"), false)
-			if cfgErr != nil {
-				// Arming needs the controllers it was asked for; the fleet
-				// stays manageable (kill/liveness are controller-independent),
-				// so refuse the arm rather than crash or arm half-configured.
-				return false, cfgErr
-			}
-			if wasBare {
-				// Leaving bare mode re-exposes memory.oom.group on already-
-				// running children at the kernel default 0, and nothing else
-				// rewrites it (that happens only at create) — stamp them, or
-				// they keep per-process OOM semantics until relaunch.
-				if n, cerr := restoreChildOOMGroup(tree); cerr != nil {
-					m.log.Error().Err(cerr).Msg("could not restore oom.group on existing VM cgroups — they retain per-process OOM semantics until relaunch")
-				} else if n > 0 {
-					m.log.Info().Int("cgroups", n).Msg("restored whole-VM OOM semantics on existing cgroups after leaving bare mode")
-				}
-			}
-		}
-	}
-
 	// Run the launch validations in manage-only mode too (flag off here
 	// implies cgroup VMs exist): a record's relaunch forks a new FC just
 	// like a fresh create, and a failure must refuse it, never spawn
@@ -202,6 +165,40 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	// stay manageable even on a host that somehow lost its guard.
 	if gerr := rollbackGuardInstalled(); gerr != nil {
 		return false, fmt.Errorf("host rollback guard not installed — refusing to arm: %w", gerr)
+	}
+	// Controller mode is configured LAST, only after every arm precondition
+	// has passed: it mutates live children (disabling strips their domains,
+	// enabling allocates per-child kernel state), and a failed arm must not
+	// leave the fleet converged to a mode no launch will use. Manage-only
+	// passes never reach here, so they never mutate the mode existing VMs
+	// were created under.
+	if m.cfg.BareVMCgroups {
+		// Disable failure is loud, never silent, but not fatal: with
+		// controllers still enabled the host is merely on the slower
+		// pre-bare behavior, which is correct. (Disabling is legal with
+		// live children — their controller state tears down in place.)
+		if _, derr := configureChildControllers(filepath.Join(tree.vms, "cgroup.subtree_control"), true); derr != nil {
+			m.log.Error().Err(derr).Msg("bare vm cgroups requested but child controllers remain enabled — launches pay full cgroup-creation cost")
+		}
+	} else {
+		wasBare, cfgErr := configureChildControllers(filepath.Join(tree.vms, "cgroup.subtree_control"), false)
+		if cfgErr != nil {
+			// Arming needs the controllers it was asked for; the fleet
+			// stays manageable (kill/liveness are controller-independent),
+			// so refuse the arm rather than crash or arm half-configured.
+			return false, cfgErr
+		}
+		if wasBare {
+			// Leaving bare mode re-exposes memory.oom.group on already-
+			// running children at the kernel default 0, and nothing else
+			// rewrites it (that happens only at create) — stamp them, or
+			// they keep per-process OOM semantics until relaunch.
+			if n, cerr := restoreChildOOMGroup(tree); cerr != nil {
+				m.log.Error().Err(cerr).Msg("could not restore oom.group on existing VM cgroups — they retain per-process OOM semantics until relaunch")
+			} else if n > 0 {
+				m.log.Info().Int("cgroups", n).Msg("restored whole-VM OOM semantics on existing cgroups after leaving bare mode")
+			}
+		}
 	}
 	m.directSpawnArmed.Store(true)
 	return true, nil
