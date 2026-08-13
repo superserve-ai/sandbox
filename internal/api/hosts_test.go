@@ -123,3 +123,19 @@ func TestHostHeartbeatRejectsMalformedCapabilityBeforeDB(t *testing.T) {
 		t.Fatal("invalid heartbeat reached the database")
 	}
 }
+
+func TestHostHeartbeatWrappedErrNoRowsReturns404(t *testing.T) {
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, _ string, _ ...any) pgx.Row {
+			return errorRow(fmt.Errorf("query update host heartbeat: %w", pgx.ErrNoRows))
+		},
+	}
+	h := &Handlers{DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/internal/hosts/nonexistent-host/heartbeat", nil)
+	setupHostHeartbeatRouter(h).ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body: %s", w.Code, w.Body.String())
+	}
+}

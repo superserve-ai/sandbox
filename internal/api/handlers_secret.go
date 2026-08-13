@@ -934,7 +934,7 @@ func (h *Handlers) GetSandboxEgressRules(c *gin.Context) {
 	}
 	row, err := h.DB.GetSandboxEgressContext(c.Request.Context(), sandboxID)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			c.Status(http.StatusNotFound)
 			return
 		}

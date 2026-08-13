@@ -550,7 +550,7 @@ func (h *Handlers) loadActiveSandbox(c *gin.Context) *db.Sandbox {
 		TeamID: teamID,
 	})
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			respondError(c, ErrSandboxNotFound)
 		} else {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
@@ -586,7 +586,7 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			TeamID: teamID,
 		})
 		if err != nil {
-			if err == pgx.ErrNoRows {
+			if errors.Is(err, pgx.ErrNoRows) {
 				respondError(c, ErrSandboxNotFound)
 			} else {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxWithPreviewPolicy failed")
@@ -698,7 +698,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			// Someone else is already resuming, or the sandbox is no longer
 			// in paused state. Surface as conflict; client retries.
 			respondError(c, ErrInvalidState)
@@ -1145,7 +1145,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		TeamID: teamID,
 	})
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			respondError(c, ErrSandboxNotFound)
 			return
 		}
@@ -1202,7 +1202,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		TeamID: teamID,
 	})
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			respondError(c, ErrSandboxNotFound)
 			return
 		}
@@ -1224,13 +1224,13 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		RevocationExpiresAt:     time.Now().Add(SecretsJWTLifetime),
 		StaleTransitionalBefore: time.Now().Add(-staleTransitionGrace),
 	}); err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			// Not claimable from its current state. Re-read to tell a
 			// just-completed delete (idempotent) from a transitional state
 			// (resuming/pausing/starting) the caller should retry.
 			cur, gerr := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
 			switch {
-			case gerr == pgx.ErrNoRows:
+			case errors.Is(gerr, pgx.ErrNoRows):
 				c.Status(http.StatusNoContent)
 			case gerr != nil:
 				log.Error().Err(gerr).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox re-read failed")
@@ -1725,7 +1725,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		TeamID: teamID,
 	})
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			respondError(c, ErrSandboxNotFound)
 			return
 		}
@@ -2530,7 +2530,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		TeamID: teamID,
 	})
 	if err != nil {
-		if err != pgx.ErrNoRows {
+		if !errors.Is(err, pgx.ErrNoRows) {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginPause failed")
 			respondError(c, ErrInternal)
 			return
@@ -2642,7 +2642,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 			// and FinalizePause (a rare race with DeleteSandbox). The VM is
 			// already stopped and its snapshot files are on disk — nothing to
 			// finalize for a sandbox that no longer exists.
-			if err == pgx.ErrNoRows {
+			if errors.Is(err, pgx.ErrNoRows) {
 				log.Warn().Str("sandbox_id", sandboxID.String()).Msg("FinalizePause: sandbox deleted mid-pause")
 				return
 			}
@@ -2857,7 +2857,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		TeamID: teamID,
 	})
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			respondError(c, ErrSandboxNotFound)
 			return
 		}

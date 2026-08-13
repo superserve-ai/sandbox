@@ -191,7 +191,7 @@ type previewMutationFinalize func(*db.Queries, previewPolicySnapshot) (outcomeEr
 func (h *Handlers) applyPreviewMutationFinalized(ctx context.Context, sandboxID, teamID uuid.UUID, mutate func(*db.Queries) error, finalize previewMutationFinalize) (previewPolicySnapshot, error, error) {
 	run := func(q *db.Queries) (previewPolicySnapshot, error, error) {
 		if _, err := q.LockSandboxForPreviewMutation(ctx, db.LockSandboxForPreviewMutationParams{ID: sandboxID, TeamID: teamID}); err != nil {
-			if err == pgx.ErrNoRows {
+			if errors.Is(err, pgx.ErrNoRows) {
 				return previewPolicySnapshot{}, nil, ErrSandboxNotFound
 			}
 			return previewPolicySnapshot{}, nil, err
@@ -915,7 +915,7 @@ func (h *Handlers) pushAfterPreviewMutation(c *gin.Context, sandbox db.Sandbox, 
 
 func (h *Handlers) getTeamSandbox(c *gin.Context, sandboxID, teamID uuid.UUID) (db.Sandbox, bool) {
 	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		respondError(c, ErrSandboxNotFound)
 		return db.Sandbox{}, false
 	}

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -86,7 +87,7 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		}
 	}
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			respondErrorMsg(c, "not_found", "host not found", http.StatusNotFound)
 			return
 		}
