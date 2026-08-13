@@ -184,34 +184,50 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 	res.Generation = gens[0].Generation
 	// Prefer the generation whose vmstate digest matches the control
 	// plane's latest pause: completion order is not capture order. The
-	// probe is bounded: the anchored generation, if it uploaded at all,
-	// completed near the head of the history, and an unbounded walk
-	// would turn full-host recovery into fleet-size times history-depth
-	// synchronous fetches exactly when the anchor is absent (the
-	// expected host-death case).
+	// scan is complete, not truncated: any bound invites a silent
+	// rollback the moment enough retry-delayed older uploads complete
+	// after the latest pause's (correctness outranks DR speed here).
+	// Cost stays bounded in practice: manifests are kilobytes, the walk
+	// is newest-first with early exit so the common case pays one fetch,
+	// candidates probe in small parallel batches, and history depth is
+	// capped by retention once GC lands.
 	if item.WantVMStateSHA != "" {
-		matched := false
-		for i, g := range gens {
-			if i >= anchorProbeLimit {
-				break
+		matchIdx := -1
+		for lo := 0; lo < len(gens) && matchIdx < 0; lo += anchorProbeBatch {
+			hi := lo + anchorProbeBatch
+			if hi > len(gens) {
+				hi = len(gens)
 			}
-			m, err := fetchManifest(ctx, h.Reader, item.SandboxID, g.Generation, func(string, ...any) {})
-			if err != nil {
-				continue
+			found := make([]bool, hi-lo)
+			var pwg sync.WaitGroup
+			for i := lo; i < hi; i++ {
+				pwg.Add(1)
+				go func(i int) {
+					defer pwg.Done()
+					m, err := fetchManifest(ctx, h.Reader, item.SandboxID, gens[i].Generation, func(string, ...any) {})
+					if err != nil {
+						return
+					}
+					for _, f := range m.Files {
+						if f.Name == "vmstate.snap" && f.SHA256 == item.WantVMStateSHA {
+							found[i-lo] = true
+							return
+						}
+					}
+				}(i)
 			}
-			for _, f := range m.Files {
-				if f.Name == "vmstate.snap" && f.SHA256 == item.WantVMStateSHA {
-					res.Generation = g.Generation
-					matched = true
+			pwg.Wait()
+			for i, ok := range found {
+				if ok {
+					matchIdx = lo + i
 					break
 				}
 			}
-			if matched {
-				break
-			}
 		}
-		if !matched {
-			res.Reason = "latest pause not among newest completed generations; using newest completed"
+		if matchIdx >= 0 {
+			res.Generation = gens[matchIdx].Generation
+		} else {
+			res.Reason = "latest pause not in bucket; using newest completed generation"
 		}
 	}
 	if h.DryRun {
@@ -249,9 +265,9 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 	return res
 }
 
-// anchorProbeLimit bounds how many newest generations the capture
-// anchor probe fetches manifests for before falling back.
-const anchorProbeLimit = 5
+// anchorProbeBatch bounds concurrent manifest fetches within one
+// sandbox's capture-anchor scan.
+const anchorProbeBatch = 4
 
 // completedGenerationAt reports the generation a destination's fsynced
 // completion marker records, if one exists and parses.
