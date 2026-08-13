@@ -506,6 +506,7 @@ func main() {
 			log.Fatal().Err(err).Msg("invalid OTEL_EXPORT_INTERVAL")
 		}
 		otelRecorder, err := telemetry.NewOTelRecorder(ctx, telemetry.OTelConfig{
+			HostID:         cfg.HostID,
 			ServiceName:    envOrDefault("OTEL_SERVICE_NAME", "sandbox-vmd"),
 			ServiceVersion: os.Getenv("OTEL_SERVICE_VERSION"),
 			Environment:    envOrDefault("OTEL_ENVIRONMENT", "dev"),
