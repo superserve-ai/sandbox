@@ -193,12 +193,14 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 	// capped by retention once GC lands.
 	if item.WantVMStateSHA != "" {
 		matchIdx := -1
+		unreadable := 0
 		for lo := 0; lo < len(gens) && matchIdx < 0; lo += anchorProbeBatch {
 			hi := lo + anchorProbeBatch
 			if hi > len(gens) {
 				hi = len(gens)
 			}
 			found := make([]bool, hi-lo)
+			failed := make([]bool, hi-lo)
 			var pwg sync.WaitGroup
 			for i := lo; i < hi; i++ {
 				pwg.Add(1)
@@ -206,6 +208,7 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 					defer pwg.Done()
 					m, err := fetchManifest(ctx, h.Reader, item.SandboxID, gens[i].Generation, func(string, ...any) {})
 					if err != nil {
+						failed[i-lo] = true
 						return
 					}
 					for _, f := range m.Files {
@@ -223,10 +226,27 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 					break
 				}
 			}
+			for _, bad := range failed {
+				if bad {
+					unreadable++
+				}
+			}
 		}
-		if matchIdx >= 0 {
+		switch {
+		case matchIdx >= 0:
+			// A found anchor wins outright: only one generation carries
+			// this digest, so errors on other candidates are moot.
 			res.Generation = gens[matchIdx].Generation
-		} else {
+		case unreadable > 0:
+			// Fail closed: an unreadable candidate may BE the anchor, and
+			// falling back would silently roll the sandbox to an older
+			// pause on a transient read error. Reruns are idempotent, so
+			// the operator retries this item cheaply.
+			res.Outcome = HostRestoreFailed
+			res.Reason = fmt.Sprintf("anchor scan incomplete: %d candidate manifests unreadable; rerun", unreadable)
+			res.Duration = time.Since(start)
+			return res
+		default:
 			res.Reason = "latest pause not in bucket; using newest completed generation"
 		}
 	}
