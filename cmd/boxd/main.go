@@ -1419,7 +1419,10 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
 	}
 
 	written, err := io.Copy(f, r.Body)
-	f.Close()
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		// Remove the partial file — a truncated upload is never useful
 		// to the caller. This handles both ENOSPC (disk full) and
