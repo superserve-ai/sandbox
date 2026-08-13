@@ -3,9 +3,11 @@ package config
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -18,6 +20,14 @@ type Config struct {
 	Port        string // API_PORT, default "8080"
 	VMDAddress  string // VMD_GRPC_ADDRESS, default "localhost:50051"
 	DatabaseURL string // DATABASE_URL, required
+
+	StripeSecretKey        string   // STRIPE_SECRET_KEY
+	StripeWebhookSecret    string   // STRIPE_WEBHOOK_SECRET
+	StripeAPIBaseURL       string   // STRIPE_API_BASE_URL, default "https://api.stripe.com"
+	StripeAPIVersion       string   // STRIPE_API_VERSION, required for Stripe requests
+	StripeCheckoutPriceIDs []string // STRIPE_CHECKOUT_PRICE_IDS, required for checkout sessions
+	BillingResources       []BillingResourceConfig
+	AppAllowedOrigins      []string // APP_ALLOWED_ORIGINS, comma-separated browser origins allowed in billing redirects
 
 	// SandboxAccessTokenSeed is the HMAC seed shared with the edge
 	// proxy. Both sides derive per-sandbox access tokens as
@@ -85,11 +95,19 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	checkoutPriceIDs := checkoutPriceIDs()
 
 	cfg := &Config{
 		Port:                   envOrDefault("API_PORT", "8080"),
 		VMDAddress:             envOrDefault("VMD_GRPC_ADDRESS", "localhost:50051"),
 		DatabaseURL:            dbURL,
+		StripeSecretKey:        os.Getenv("STRIPE_SECRET_KEY"),
+		StripeWebhookSecret:    os.Getenv("STRIPE_WEBHOOK_SECRET"),
+		StripeAPIBaseURL:       envOrDefault("STRIPE_API_BASE_URL", "https://api.stripe.com"),
+		StripeAPIVersion:       strings.TrimSpace(os.Getenv("STRIPE_API_VERSION")),
+		StripeCheckoutPriceIDs: checkoutPriceIDs,
+		BillingResources:       billingResources(checkoutPriceIDs),
+		AppAllowedOrigins:      splitCSV(os.Getenv("APP_ALLOWED_ORIGINS")),
 		SandboxAccessTokenSeed: seed,
 		EdgeProxyDomain:        envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
 		DefaultHostID:          envOrDefault("DEFAULT_HOST_ID", "default"),
@@ -107,6 +125,128 @@ func Load() (*Config, error) {
 		OTelExportInterval:     exportInterval,
 	}
 	return cfg, nil
+}
+
+func checkoutPriceIDs() []string {
+	ids := splitCSV(os.Getenv("STRIPE_CHECKOUT_PRICE_IDS"))
+	if len(ids) == 0 {
+		ids = splitCSV(os.Getenv("STRIPE_CHECKOUT_PRICE_ID"))
+	}
+	return ids
+}
+
+// BillingResourceConfig describes one metered resource in the billing model.
+// The default configuration is loaded from the existing Stripe checkout price
+// environment variables, but a JSON resource list can override it when needed.
+type BillingResourceConfig struct {
+	ResourceKey     string `json:"resource_key"`
+	DisplayName     string `json:"display_name"`
+	SortOrder       int    `json:"sort_order"`
+	UsageUnit       string `json:"usage_unit"`
+	DisplayUnit     string `json:"display_unit"`
+	StripeEventName string `json:"stripe_event_name"`
+	StripePriceID   string `json:"stripe_price_id"`
+	Tracked         bool   `json:"tracked"`
+	Billable        bool   `json:"billable"`
+	CheckoutEnabled bool   `json:"checkout_enabled"`
+}
+
+func billingResources(checkoutPriceIDs []string) []BillingResourceConfig {
+	if raw := strings.TrimSpace(os.Getenv("BILLING_RESOURCE_CONFIG")); raw != "" {
+		var resources []BillingResourceConfig
+		if err := json.Unmarshal([]byte(raw), &resources); err == nil && len(resources) > 0 {
+			normalizeBillingResources(resources)
+			return resources
+		}
+	}
+
+	resources := []BillingResourceConfig{
+		{
+			ResourceKey:     "vcpu",
+			UsageUnit:       "second",
+			StripeEventName: "cpu_vcpu_hours",
+			Tracked:         true,
+			Billable:        true,
+			CheckoutEnabled: true,
+		},
+		{
+			ResourceKey:     "memory_gib",
+			UsageUnit:       "second",
+			StripeEventName: "memory_gib_hours",
+			Tracked:         true,
+			Billable:        true,
+			CheckoutEnabled: true,
+		},
+		{
+			ResourceKey:     "storage_gib",
+			UsageUnit:       "second",
+			StripeEventName: "storage_gib_hours",
+			Tracked:         true,
+			Billable:        false,
+			CheckoutEnabled: true,
+		},
+	}
+	for i := range resources {
+		if i < len(checkoutPriceIDs) {
+			resources[i].StripePriceID = checkoutPriceIDs[i]
+		}
+	}
+	normalizeBillingResources(resources)
+	return resources
+}
+
+func normalizeBillingResources(resources []BillingResourceConfig) {
+	for i := range resources {
+		if resources[i].UsageUnit == "" {
+			resources[i].UsageUnit = "second"
+		}
+		if resources[i].DisplayUnit == "" {
+			resources[i].DisplayUnit = defaultBillingResourceDisplayUnit(resources[i].ResourceKey)
+		}
+		if resources[i].DisplayName == "" {
+			resources[i].DisplayName = defaultBillingResourceDisplayName(resources[i].ResourceKey)
+		}
+		if resources[i].SortOrder == 0 {
+			resources[i].SortOrder = (i + 1) * 10
+		}
+	}
+}
+
+func defaultBillingResourceDisplayName(resourceKey string) string {
+	switch resourceKey {
+	case "vcpu":
+		return "CPU"
+	case "memory_gib":
+		return "Memory"
+	case "storage_gib":
+		return "Storage"
+	default:
+		return resourceKey
+	}
+}
+
+func defaultBillingResourceDisplayUnit(resourceKey string) string {
+	switch resourceKey {
+	case "vcpu":
+		return "vCPU-hours"
+	case "memory_gib":
+		return "GiB-hours"
+	case "storage_gib":
+		return "GiB-hours"
+	default:
+		return resourceKey
+	}
+}
+
+func splitCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if v := strings.TrimSpace(part); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func loadSeed(envValue string, allowEphemeral bool) ([]byte, error) {
