@@ -366,6 +366,17 @@ const claimWaitFallbackPoll = 100 * time.Millisecond
 // (after one final Claim — a producer may deliver immediately before
 // declaring itself inactive), when the budget lapses, or when ctx/shutdown
 // ends the wait.
+// finalClaim is ClaimWait's last look at the pool before giving up (producers
+// gone, or budget spent): a slot published in the race window since the last
+// miss is consumed rather than orphaned to an inline build — unless the
+// caller is already gone, in which case inventory is left for live claimants.
+func (p *Pool) finalClaim(ctx context.Context, vmID string) *VMNetInfo {
+	if ctx.Err() != nil {
+		return nil
+	}
+	return p.Claim(vmID)
+}
+
 func (p *Pool) ClaimWait(ctx context.Context, vmID string) *VMNetInfo {
 	start := time.Now()
 	for {
@@ -381,13 +392,7 @@ func (p *Pool) ClaimWait(ctx context.Context, vmID string) *VMNetInfo {
 			return info
 		}
 		if !p.producing() {
-			// Same cancellation guard as the loop top: this final claim must
-			// not hand a just-delivered slot to a request whose caller is
-			// already gone.
-			if ctx.Err() != nil {
-				return nil
-			}
-			return p.Claim(vmID)
+			return p.finalClaim(ctx, vmID)
 		}
 		budget := poolClaimWaitBudget
 		if p.adoptionTrusted() {
@@ -395,7 +400,7 @@ func (p *Pool) ClaimWait(ctx context.Context, vmID string) *VMNetInfo {
 		}
 		remaining := budget - time.Since(start)
 		if remaining <= 0 {
-			return nil
+			return p.finalClaim(ctx, vmID)
 		}
 		wait := claimWaitFallbackPoll
 		if remaining < wait {
