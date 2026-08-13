@@ -45,6 +45,7 @@ func newTestPool(t *testing.T, m *Manager) *Pool {
 		verifyPollInterval: time.Millisecond,
 		verifyMaxWait:      50 * time.Millisecond,
 		resetSem:           make(chan struct{}, resetTapConcurrency),
+		adoptEscapeStreak:  defaultAdoptEscapeStreak,
 	}
 	t.Cleanup(func() {
 		select {
@@ -867,16 +868,17 @@ func TestClaimWait_ConsumesProducedSlot(t *testing.T) {
 	m := newTestManager()
 	p := newTestPool(t, m)
 
-	p.adopting.Store(true) // producers active, nothing delivered yet
+	p.adoptPhase.Store(adoptPhaseScanning) // producers active, nothing delivered yet
 	touchNS(t, dir, "ns-1")
 	m.assignSlotLocked(1, poolOwner)
 	go func() {
 		time.Sleep(60 * time.Millisecond) // slot lands mid-wait
 		p.fresh <- &preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1", HostIP: "10.11.0.1"}, vethName: "veth-1"}
+		p.signalProgress()
 	}()
 
 	tStart := time.Now()
-	got := p.ClaimWait(context.Background(), "vm-x", 2*time.Second)
+	got := p.ClaimWait(context.Background(), "vm-x")
 	if got == nil {
 		t.Fatal("ClaimWait returned nil while a producer was delivering")
 	}
@@ -888,36 +890,84 @@ func TestClaimWait_ConsumesProducedSlot(t *testing.T) {
 	}
 }
 
-// TestClaimWait_IdlePoolReturnsImmediately pins the no-regression contract:
-// when nothing is producing (no adoption, refill paused), ClaimWait must not
-// burn its budget — the caller should fall through to an inline build exactly
-// as fast as before this path existed.
-func TestClaimWait_IdlePoolReturnsImmediately(t *testing.T) {
+// TestClaimWait_NoDeclaredProducersReturnsImmediately pins the no-regression
+// contract: when no producer has declared itself active — refill workers all
+// idle or backing off, no adoption pass — ClaimWait must not burn its budget.
+// The pool being below target is NOT evidence of production; only a declared
+// worker is.
+func TestClaimWait_NoDeclaredProducersReturnsImmediately(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()
-	p := newTestPool(t, m)
-	p.setRefillPaused(true) // empty AND provably idle
+	p := newTestPool(t, m) // empty, below target, but zero declared producers
 
 	tStart := time.Now()
-	if got := p.ClaimWait(context.Background(), "vm-x", 2*time.Second); got != nil {
-		t.Fatalf("expected nil from an idle empty pool, got %+v", got)
+	if got := p.ClaimWait(context.Background(), "vm-x"); got != nil {
+		t.Fatalf("expected nil from a pool with no active producers, got %+v", got)
 	}
 	if waited := time.Since(tStart); waited > 500*time.Millisecond {
-		t.Fatalf("idle pool held the claimant %v; must return without waiting", waited)
+		t.Fatalf("producerless pool held the claimant %v; must return without waiting", waited)
+	}
+}
+
+// TestClaimWait_SlowProducerStillWins pins the fix for the false-stall
+// regression: a single healthy build that takes longer than any polling
+// heuristic (here 900ms) must still be consumed by the waiting claimant,
+// because the worker's declared active state — not elapsed silence — is what
+// claimants trust.
+func TestClaimWait_SlowProducerStillWins(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+
+	p.refillActive.Add(1) // one worker declared mid-build
+	touchNS(t, dir, "ns-2")
+	m.assignSlotLocked(2, poolOwner)
+	go func() {
+		time.Sleep(900 * time.Millisecond) // slow but healthy build
+		p.fresh <- &preallocSlot{idx: 2, info: &VMNetInfo{Namespace: "ns-2", HostIP: "10.11.0.2"}, vethName: "veth-2"}
+		p.refillActive.Add(-1)
+		p.signalProgress()
+	}()
+
+	got := p.ClaimWait(context.Background(), "vm-x")
+	if got == nil {
+		t.Fatal("ClaimWait gave up on a declared, delivering producer")
+	}
+	if got.Namespace != "ns-2" {
+		t.Fatalf("claimed %q, want ns-2", got.Namespace)
+	}
+}
+
+// TestClaimWait_FinalClaimBeatsDeactivationRace pins the handoff edge: a slot
+// present in the pool must be won even when every producer reads inactive —
+// a producer can publish immediately before clearing its active state, and
+// the final Claim is what keeps that slot from being orphaned to an inline
+// build.
+func TestClaimWait_FinalClaimBeatsDeactivationRace(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+
+	touchNS(t, dir, "ns-3")
+	m.assignSlotLocked(3, poolOwner)
+	p.fresh <- &preallocSlot{idx: 3, info: &VMNetInfo{Namespace: "ns-3", HostIP: "10.11.0.3"}, vethName: "veth-3"}
+
+	if got := p.ClaimWait(context.Background(), "vm-x"); got == nil || got.Namespace != "ns-3" {
+		t.Fatalf("delivered slot must be claimed even with all producers inactive, got %+v", got)
 	}
 }
 
 // TestClaimWait_BurstConsumesExactlyWhatProducersDeliver pins the storm
 // contract this path exists for: a burst of claimants against a producing
 // pool must drain the producers' output exactly — every delivered slot
-// claimed by exactly one claimant, every unlucky claimant falling back only
-// after its budget — with no slot lost and no double-claim.
+// claimed by exactly one claimant, every unlucky claimant falling back once
+// production ends — with no slot lost and no double-claim.
 func TestClaimWait_BurstConsumesExactlyWhatProducersDeliver(t *testing.T) {
 	dir := withTestNetnsDir(t)
 	m := newTestManager()
 	p := newTestPool(t, m)
-	p.fresh = make(chan *preallocSlot, 32) // room for the whole delivery
-	p.adopting.Store(true)                 // boot-shaped: adoption producing
+	p.fresh = make(chan *preallocSlot, 32)  // room for the whole delivery
+	p.adoptPhase.Store(adoptPhaseVerifying) // boot-shaped: adoption producing
 
 	const claimants, delivered = 20, 10
 	for i := 1; i <= delivered; i++ {
@@ -928,13 +978,16 @@ func TestClaimWait_BurstConsumesExactlyWhatProducersDeliver(t *testing.T) {
 		for i := 1; i <= delivered; i++ {
 			time.Sleep(15 * time.Millisecond) // trickle in mid-wait
 			p.fresh <- &preallocSlot{idx: i, info: &VMNetInfo{Namespace: fmt.Sprintf("ns-%d", i)}, vethName: fmt.Sprintf("veth-%d", i)}
+			p.signalProgress()
 		}
+		p.adoptPhase.Store(adoptPhaseIdle) // pass over — losers must stop waiting
+		p.signalProgress()
 	}()
 
 	results := make(chan *VMNetInfo, claimants)
 	for i := 0; i < claimants; i++ {
 		go func(n int) {
-			results <- p.ClaimWait(context.Background(), fmt.Sprintf("vm-%d", n), 900*time.Millisecond)
+			results <- p.ClaimWait(context.Background(), fmt.Sprintf("vm-%d", n))
 		}(i)
 	}
 
@@ -954,26 +1007,102 @@ func TestClaimWait_BurstConsumesExactlyWhatProducersDeliver(t *testing.T) {
 	}
 }
 
-// TestClaimWait_BailsWhenProducersStall pins the progress check: a pool that
-// CLAIMS to be producing (below target, refill unpaused) but delivers nothing
-// — refill in its failure backoff, or its workers gone — must release the
-// claimant to the inline build after the stall interval, not hold it for the
-// full budget on a promise.
-func TestClaimWait_BailsWhenProducersStall(t *testing.T) {
+// TestClaimWait_BudgetFollowsTrust pins the escape contract: a claimant that
+// began waiting on a trusted adoption pass must be released promptly — not
+// after the full adoption budget — when the pass trips its no-yield escape
+// mid-wait.
+func TestClaimWait_BudgetFollowsTrust(t *testing.T) {
 	withTestNetnsDir(t)
 	m := newTestManager()
-	p := newTestPool(t, m) // fresh empty and below target: producing()==true, nothing delivering
+	p := newTestPool(t, m)
+	p.adoptEscapeStreak = 1
+	p.adoptPhase.Store(adoptPhaseVerifying) // trusted at wait start
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		p.adoptYieldedNothing() // trips the escape at streak 1
+	}()
 
 	tStart := time.Now()
-	got := p.ClaimWait(context.Background(), "vm-x", 5*time.Second)
+	got := p.ClaimWait(context.Background(), "vm-x")
 	waited := time.Since(tStart)
 	if got != nil {
-		t.Fatalf("expected nil from a stalled pool, got %+v", got)
+		t.Fatalf("expected nil from an escaping pass, got %+v", got)
 	}
-	if waited < produceStallBail {
-		t.Fatalf("bailed after %v, before the %v stall interval", waited, produceStallBail)
+	if waited >= poolClaimWaitBudget {
+		t.Fatalf("claimant held %v after trust was lost; must release well before the %v normal budget",
+			waited, poolClaimWaitBudget)
 	}
-	if waited > 2500*time.Millisecond {
-		t.Fatalf("stalled pool held the claimant %v; the stall check must beat the 5s budget", waited)
+}
+
+// TestAdoptTrust_EscapeIsReversible pins the trust state machine: the streak
+// trips the escape at the configured limit, any delivery resets both streak
+// and escape, and a fresh streak can trip it again.
+func TestAdoptTrust_EscapeIsReversible(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.adoptEscapeStreak = 3
+	p.adoptPhase.Store(adoptPhaseVerifying)
+
+	for i := 0; i < 2; i++ {
+		p.adoptYieldedNothing()
+	}
+	if !p.adoptionTrusted() {
+		t.Fatal("trust lost before the streak limit")
+	}
+	p.adoptYieldedNothing()
+	if p.adoptionTrusted() {
+		t.Fatal("streak limit reached but trust not suspended")
+	}
+	p.adoptDelivered()
+	if !p.adoptionTrusted() {
+		t.Fatal("delivery must restore trust")
+	}
+	if p.adoptStreak.Load() != 0 {
+		t.Fatalf("delivery must reset the streak, got %d", p.adoptStreak.Load())
+	}
+}
+
+// TestStartAdoption_PhaseVisibleBeforeReturn pins the startup-race fix: the
+// pass must be observable as underway the moment StartAdoption returns —
+// before its goroutine is ever scheduled — and a duplicate start must not
+// spawn a second pass.
+func TestStartAdoption_PhaseVisibleBeforeReturn(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-5")
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.abandonOnStop = true
+
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(*Manager, context.Context, string) error { return nil })
+	var passes atomic.Int64
+	stubAdoptSlot(t, func(_ *Manager, _ context.Context, idx int) (*VMNetInfo, string, error) {
+		passes.Add(1)
+		time.Sleep(100 * time.Millisecond) // hold the pass open for the assertions
+		return &VMNetInfo{Namespace: nsNameForSlot(idx), HostIP: hostIPForSlot(idx)}, vethNameForSlot(idx), nil
+	})
+
+	if !p.StartAdoption(context.Background()) {
+		t.Fatal("first StartAdoption must begin a pass")
+	}
+	if p.adoptPhase.Load() == adoptPhaseIdle {
+		t.Fatal("pass must be visible before StartAdoption returns")
+	}
+	if p.StartAdoption(context.Background()) {
+		t.Fatal("duplicate StartAdoption must no-op")
+	}
+
+	deadline := time.After(2 * time.Second)
+	for p.adoptPhase.Load() != adoptPhaseIdle {
+		select {
+		case <-deadline:
+			t.Fatal("pass never returned to idle")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if got := passes.Load(); got != 1 {
+		t.Fatalf("adopted %d times, want exactly 1 candidate processed by exactly 1 pass", got)
 	}
 }

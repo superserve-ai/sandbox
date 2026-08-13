@@ -101,28 +101,24 @@ var reclaimScanBarrier = func() {}
 // window keeps every build near its uncontended cost.
 const setupSlotConcurrency = 8
 
-// poolClaimWaitBudget bounds how long a claimant waits on a producing pool
-// before falling back to an inline build. Producers deliver within tens of
-// milliseconds normally; past this they are backing off or wedged, and
-// ClaimWait's progress check usually bails well before the budget anyway.
-// ClaimWait also honors the caller's ctx, so a nearly-spent deadline
-// shortens this further.
+// poolClaimWaitBudget bounds how long a claimant waits on active producers
+// before falling back to an inline build. ClaimWait exits well before this
+// when no producer is active, and honors the caller's ctx throughout.
 const poolClaimWaitBudget = 2 * time.Second
 
-// adoptionClaimWaitBudget replaces poolClaimWaitBudget while a boot-time
-// adoption pass is running: the previous run's slots are moments from being
-// inventory, but the ramp to the FIRST delivery — the orphan scan runs
-// before any output — has been observed anywhere from a few seconds to
-// over ten on a large host, scaling with the candidate count. The budget
-// must cover the whole observed range: a claimant that gives up inside the
-// ramp builds inline against the adoption churn (the exact stampede this
-// wait exists to prevent) after having paid the wait as well. The cost of
-// generosity is nil in the common case — waiters exit the moment the first
-// slot lands — and bounded in the worst: an adoption pass that delivers
-// nothing self-aborts and clears the flag. Only slot-allocating requests
-// ever pay this; pause/resume/destroy never touch the pool and are not
-// gated on it.
+// adoptionClaimWaitBudget applies while an adoption pass is trusted (see
+// Pool.adoptionTrusted): the ramp to the pass's first delivery scales with
+// the candidate count and can span many seconds, and a claimant that gives up
+// inside it builds inline against the adoption churn — the exact stampede
+// this wait prevents. Waiters exit the moment a slot lands, and the budget
+// re-clamps to poolClaimWaitBudget if the pass loses trust mid-wait. Only
+// slot-allocating requests ever pay this.
 const adoptionClaimWaitBudget = 12 * time.Second
+
+// poolWaitLogThreshold samples the satisfied-after-wait log line: waits below
+// it are routine producer handoffs, and logging each would turn a burst into
+// its own log storm. Fallbacks are always logged — they are the alarm signal.
+const poolWaitLogThreshold = 250 * time.Millisecond
 
 type Manager struct {
 	hostInterface string
@@ -328,17 +324,15 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		// slots, or a burst outrunning refill — and the producers are already
 		// holding the kernel locks an inline build would need. Wait briefly
 		// for their output rather than building alongside them; the wait is
-		// bounded and ClaimWait exits early if nothing is producing.
+		// bounded and ClaimWait exits early once no producer is active.
 		tWait := time.Now()
-		budget := poolClaimWaitBudget
-		if m.pool.adopting.Load() {
-			budget = adoptionClaimWaitBudget
-		}
-		if info := m.pool.ClaimWait(ctx, vmID, budget); info != nil {
+		if info := m.pool.ClaimWait(ctx, vmID); info != nil {
 			m.registerEgress(vmID, info)
-			m.log.Info().Str("vm_id", vmID).
-				Int64("pool_wait_ms", time.Since(tWait).Milliseconds()).
-				Msg("pool: claim satisfied after waiting on refill")
+			if waited := time.Since(tWait); waited >= poolWaitLogThreshold {
+				m.log.Info().Str("vm_id", vmID).
+					Int64("pool_wait_ms", waited.Milliseconds()).
+					Msg("pool: claim satisfied after waiting on refill")
+			}
 			return info, nil
 		}
 		m.log.Info().Str("vm_id", vmID).

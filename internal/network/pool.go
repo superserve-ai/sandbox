@@ -30,6 +30,10 @@ type PoolConfig struct {
 	// and the next process adopts the slots via AdoptOrphanSlots. Off by
 	// default (legacy teardown).
 	AbandonOnStop bool
+	// AdoptEscapeStreak is how many consecutive adoption candidates may yield
+	// no inventory before claimants stop waiting on the pass (see
+	// adoptYieldedNothing). Default: 32.
+	AdoptEscapeStreak int
 }
 
 // Pool pre-allocates network namespaces, veth pairs, TAP devices, and
@@ -63,16 +67,34 @@ type Pool struct {
 	verifyPollInterval time.Duration
 	verifyMaxWait      time.Duration
 
-	// adopting is true while an adoption pass is turning the previous run's
-	// abandoned slots back into inventory. Claimants use it (via producing)
-	// to prefer waiting on that output over building inline.
-	adopting atomic.Bool
+	// refillActive counts refill workers currently building or delivering a
+	// slot. Workers declare themselves active for the whole construction-
+	// through-delivery span and inactive during backoff sleeps, so claimants
+	// read actual producer state instead of inferring liveness from timing.
+	refillActive atomic.Int64
 
-	// produced counts every slot delivered into fresh or recycled. Where
-	// producing() states intent, this is the evidence: ClaimWait watches it
-	// to distinguish producers that are delivering from producers that are
-	// backing off or wedged, and stops waiting on the latter.
-	produced atomic.Uint64
+	// adoptPhase is the adoption pass's lifecycle: idle → scanning (orphan
+	// scan, zero output possible) → verifying (workers judging candidates) →
+	// idle. A single atomic so claimants can never observe contradictory
+	// intermediate states.
+	adoptPhase atomic.Int32
+
+	// adoptStreak counts consecutive verified candidates that yielded no
+	// inventory; any delivery resets it. adoptEscaped trips when the streak
+	// reaches adoptEscapeStreak: claimants stop treating the pass as a
+	// producer (it may be chewing through invalid slots forever) until it
+	// delivers again. An explicit, logged heuristic — whether the REMAINING
+	// candidates are valid is unknowable without receipt/version evidence.
+	adoptStreak       atomic.Int64
+	adoptEscaped      atomic.Bool
+	adoptEscapeStreak int64
+
+	// notifyCh broadcasts producer progress (a delivery or a state change) to
+	// ClaimWait waiters by close-and-replace, so a burst of claimants wakes on
+	// events instead of hammering a fine-grained poll. Lazily created; nil
+	// while nobody has asked to wait.
+	notifyMu sync.Mutex
+	notifyCh chan struct{}
 
 	// resetTapOnRecycle recreates tap0 before a returned slot is recycled.
 	resetTapOnRecycle bool
@@ -154,6 +176,15 @@ const (
 	// candidate) — better to stop early and leave the rest for a healthier
 	// boot than to accumulate a thread per slot.
 	adoptTimeoutAbort = 3
+	// defaultAdoptEscapeStreak: see PoolConfig.AdoptEscapeStreak.
+	defaultAdoptEscapeStreak = 32
+)
+
+// Adoption pass phases (Pool.adoptPhase).
+const (
+	adoptPhaseIdle int32 = iota
+	adoptPhaseScanning
+	adoptPhaseVerifying
 )
 
 // adoptSlotFunc is a seam over Manager.adoptSlot so tests can drive adoption
@@ -185,6 +216,10 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		resetTapOnRecycle: cfg.ResetTapOnRecycle,
 		abandonOnStop:     cfg.AbandonOnStop,
 		resetSem:          make(chan struct{}, resetTapConcurrency),
+	}
+	p.adoptEscapeStreak = int64(cfg.AdoptEscapeStreak)
+	if p.adoptEscapeStreak <= 0 {
+		p.adoptEscapeStreak = defaultAdoptEscapeStreak
 	}
 	m.pool = p
 
@@ -264,74 +299,98 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 	}
 }
 
-// producing reports whether the pool is actively acquiring inventory: an
-// adoption pass is running, or the fresh buffer is below target while the
-// refill loop is unblocked. While true, a claimant is better off waiting for
-// the next produced slot than building one inline alongside the producers —
-// both paths cross the same kernel locks, and the producers already hold them.
+// producing reports whether some producer has declared itself active: a
+// refill worker mid-build/mid-delivery, or an adoption pass that is scanning
+// or still trusted to yield inventory. While true, a claimant is better off
+// waiting for the next slot than building one inline alongside the producers
+// — both paths cross the same kernel locks, and the producers already hold
+// them. Declared state, not inference: a worker sleeping in failure backoff
+// counts as inactive, so a dead pool releases claimants immediately.
 func (p *Pool) producing() bool {
-	if p.adopting.Load() {
+	if p.adoptionTrusted() || p.adoptPhase.Load() == adoptPhaseScanning {
 		return true
 	}
-	return len(p.fresh) < p.newSize && !p.refillIsPaused()
+	return p.refillActive.Load() > 0
 }
 
-// claimWaitPoll is ClaimWait's retry interval. Coarse on purpose: the wait
-// substitutes for inline builds that cost whole seconds, so tens of
-// milliseconds of granularity is noise, and polling Claim keeps its phantom
-// validation and devmap handoff in one place instead of re-plumbing them
-// around a blocking channel receive.
-const claimWaitPoll = 25 * time.Millisecond
+// adoptionTrusted reports whether claimants should treat the adoption pass as
+// a producer worth waiting on: a pass is running and hasn't tripped the
+// no-yield escape. Trust is reversible — a later delivery restores it.
+func (p *Pool) adoptionTrusted() bool {
+	return p.adoptPhase.Load() != adoptPhaseIdle && !p.adoptEscaped.Load()
+}
 
-// ClaimWait is Claim with bounded patience: while the pool is producing, keep
-// retrying up to budget so the claimant consumes producer output instead of
+// progressCh returns the channel the next progress broadcast will close.
+// Callers must capture it BEFORE their Claim attempt so a delivery landing
+// between the miss and the wait still wakes them.
+func (p *Pool) progressCh() <-chan struct{} {
+	p.notifyMu.Lock()
+	defer p.notifyMu.Unlock()
+	if p.notifyCh == nil {
+		p.notifyCh = make(chan struct{})
+	}
+	return p.notifyCh
+}
+
+// signalProgress wakes every ClaimWait waiter: a slot was delivered or a
+// producer changed state, so waiters must re-evaluate what they're waiting
+// for (and whether they still should be).
+func (p *Pool) signalProgress() {
+	p.notifyMu.Lock()
+	defer p.notifyMu.Unlock()
+	if p.notifyCh != nil {
+		close(p.notifyCh)
+		p.notifyCh = nil
+	}
+}
+
+// claimWaitFallbackPoll bounds how stale a waiter's view can get if a
+// progress signal is missed; the notify broadcast is the primary wakeup.
+const claimWaitFallbackPoll = 100 * time.Millisecond
+
+// ClaimWait is Claim with bounded patience: while a producer declares itself
+// active, keep retrying so the claimant consumes producer output instead of
 // racing the producers. The failure this exists for: a restart (or a burst)
 // momentarily empties the pool, N claimants each commit to an inline build,
 // and those builds queue behind a bounded semaphore while contending with the
 // pool's own refill for netlink and the mount table — each claimant pays tens
 // of seconds for a slot the pool would have handed it moments later.
 //
-// Returns nil when the pool is provably idle-and-empty, the budget lapses
-// (producers wedged — their locks are stalled too, so an inline build would
-// fare no better, but it remains the caller's last resort), or ctx/shutdown
+// The budget follows adoption trust dynamically: a claimant that started on
+// the generous adoption budget is re-clamped to the normal one the moment the
+// pass trips its no-yield escape. Returns nil when no producer is active
+// (after one final Claim — a producer may deliver immediately before
+// declaring itself inactive), when the budget lapses, or when ctx/shutdown
 // ends the wait.
-// produceStallBail is how long ClaimWait tolerates a producing-but-silent
-// pool outside an adoption pass. Refill's own failure backoff alone exceeds
-// any claimant's patience, so a counter that hasn't moved for this long means
-// the producers are backing off or wedged — waiting further spends budget on
-// a promise. Adoption is exempt: its ramp to first delivery legitimately
-// spans seconds (the orphan scan precedes any output), and a genuinely
-// wedged pass aborts itself and clears the adopting flag, so the caller's
-// budget alone bounds that phase.
-const produceStallBail = 750 * time.Millisecond
-
-func (p *Pool) ClaimWait(ctx context.Context, vmID string, budget time.Duration) *VMNetInfo {
-	deadline := time.NewTimer(budget)
-	defer deadline.Stop()
-	tick := time.NewTicker(claimWaitPoll)
-	defer tick.Stop()
-	lastSeen := p.produced.Load()
-	lastProgress := time.Now()
+func (p *Pool) ClaimWait(ctx context.Context, vmID string) *VMNetInfo {
+	start := time.Now()
 	for {
+		ch := p.progressCh()
 		if info := p.Claim(vmID); info != nil {
 			return info
 		}
 		if !p.producing() {
+			return p.Claim(vmID)
+		}
+		budget := poolClaimWaitBudget
+		if p.adoptionTrusted() {
+			budget = adoptionClaimWaitBudget
+		}
+		remaining := budget - time.Since(start)
+		if remaining <= 0 {
 			return nil
 		}
-		if cur := p.produced.Load(); cur != lastSeen {
-			lastSeen, lastProgress = cur, time.Now()
-		} else if !p.adopting.Load() && time.Since(lastProgress) > produceStallBail {
-			return nil
+		wait := claimWaitFallbackPoll
+		if remaining < wait {
+			wait = remaining
 		}
 		select {
+		case <-ch:
+		case <-time.After(wait):
 		case <-p.stopCh:
 			return nil
 		case <-ctx.Done():
 			return nil
-		case <-deadline.C:
-			return nil
-		case <-tick.C:
 		}
 	}
 }
@@ -439,7 +498,10 @@ func (p *Pool) refillDrainCh() <-chan struct{} {
 // A namespace still occupied after verifyMaxWait isn't a slow teardown, it's
 // stuck — recycling it would poison the pool, so it's torn down for real
 // instead of being handed to the next VM.
-func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
+// The boolean result reports whether the slot was actually delivered into
+// pool inventory (as opposed to torn down or abandoned) — adoption uses it to
+// maintain its no-yield trust streak.
+func (p *Pool) verifyAndRecycle(slot *preallocSlot) bool {
 	pollInterval := p.verifyPollInterval
 	if pollInterval <= 0 {
 		pollInterval = defaultVerifyPollInterval
@@ -464,13 +526,13 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 			p.log.Error().Str("namespace", ns).Int("slot", slot.idx).
 				Msg("pool: namespace still occupied after max wait — tearing down instead of recycling")
 			p.cleanup(slot)
-			return
+			return false
 		}
 		select {
 		case <-time.After(pollInterval):
 		case <-p.stopCh:
 			p.stopSlot(slot)
-			return
+			return false
 		}
 	}
 
@@ -483,7 +545,7 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 		// below still has a default arm.
 		if p.placementFull(slot) {
 			p.cleanup(slot)
-			return
+			return false
 		}
 		// The semaphore is acquired before the deadline starts, so queueing
 		// behind a backlog doesn't eat into a rebuild's own budget.
@@ -491,7 +553,7 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 		case p.resetSem <- struct{}{}:
 		case <-p.stopCh:
 			p.stopSlot(slot)
-			return
+			return false
 		}
 		poolFull, err := func() (bool, error) {
 			// Deferred so a panicking rebuild can't leak the token — Return's
@@ -508,24 +570,26 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 		}()
 		if poolFull {
 			p.cleanup(slot)
-			return
+			return false
 		}
 		if err != nil {
 			p.log.Error().Err(err).Str("namespace", ns).Int("slot", slot.idx).
 				Msg("pool: tap reset failed on recycle — tearing down instead of recycling")
 			p.cleanup(slot)
-			return
+			return false
 		}
 	}
 
 	select {
 	case p.recycled <- slot:
-		p.produced.Add(1)
+		p.signalProgress()
+		return true
 	case <-p.stopCh:
 		// Stop() closes p.recycled only after p.wg.Wait() returns, and this
 		// goroutine holds a wg slot until it returns — so stopCh firing here
 		// (pool shutting down mid-verify) can't race a send on a closed channel.
 		p.stopSlot(slot)
+		return false
 	default:
 		// Recycle pool full. An adopted slot is fully built, so it counts as
 		// fresh inventory instead of being destroyed while the refill loop
@@ -534,12 +598,13 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 		if slot.adopted {
 			select {
 			case p.fresh <- slot:
-				p.produced.Add(1)
-				return
+				p.signalProgress()
+				return true
 			default:
 			}
 		}
 		p.cleanup(slot)
+		return false
 	}
 }
 
@@ -571,16 +636,26 @@ func (p *Pool) stopSlot(slot *preallocSlot) {
 // slow host) are left for a later pass. Must run after startup slot
 // reservation completed successfully — record-owned indexes must never be
 // candidates. Returns the pass's counts.
+//
+// Prefer StartAdoption over calling this directly at boot: it enters the
+// scanning phase before its goroutine is spawned, so no request can observe
+// the gap between launch and the pass actually starting.
 func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped int64) {
-	// The adopting window must cover the orphan scan itself — it can run long
-	// on a big namespace table, and claimants arriving during it deserve
-	// adoption-grade patience — but not the stray-veth sweep at the end, which
-	// delivers nothing a claimant could wait for. Opened here, closed
-	// explicitly before the sweep; the defer is only a backstop so a panic
-	// can't leave the flag stuck true.
-	p.adopting.Store(true)
-	defer p.adopting.Store(false)
+	// Direct callers (tests, legacy paths) enter the phase here; via
+	// StartAdoption it is already scanning and the CAS no-ops. The deferred
+	// reset is the panic backstop AND clears the trust state for the next
+	// pass; the explicit idle transition before the sweep is the normal path
+	// — the stray-veth sweep delivers nothing a claimant could wait for.
+	p.adoptPhase.CompareAndSwap(adoptPhaseIdle, adoptPhaseScanning)
+	defer func() {
+		p.adoptPhase.Store(adoptPhaseIdle)
+		p.adoptEscaped.Store(false)
+		p.adoptStreak.Store(0)
+		p.signalProgress()
+	}()
 	indexes := p.mgr.claimOrphanSlots()
+	p.adoptPhase.Store(adoptPhaseVerifying)
+	p.signalProgress()
 	if len(indexes) > 0 {
 		p.log.Info().Int("candidates", len(indexes)).Msg("pool: adopting slots left by previous run")
 
@@ -644,9 +719,50 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 		adopted, invalid, skipped = nAdopted.Load(), nInvalid.Load(), nSkipped.Load()
 	}
 
-	p.adopting.Store(false)
+	p.adoptPhase.Store(adoptPhaseIdle)
+	p.signalProgress()
 	p.mgr.SweepStrayHostVeths()
 	return adopted, invalid, skipped
+}
+
+// StartAdoption runs AdoptOrphanSlots in the background. The scanning phase
+// is entered synchronously, before the goroutine is spawned, so a request
+// arriving before the scheduler runs the pass already sees adoption underway
+// and waits with adoption-grade patience — launching the goroutine at the
+// call site would leave a window where claimants bail early into inline
+// builds against the imminent churn. The pass is tracked in the pool wait
+// group so Stop cannot outlive its state. A duplicate start is a no-op.
+func (p *Pool) StartAdoption(ctx context.Context) bool {
+	if !p.adoptPhase.CompareAndSwap(adoptPhaseIdle, adoptPhaseScanning) {
+		p.log.Warn().Msg("pool: adoption already running — duplicate start ignored")
+		return false
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer sentrylog.Recover("netpool-adopt")
+		p.AdoptOrphanSlots(ctx)
+	}()
+	return true
+}
+
+// adoptDelivered and adoptYieldedNothing maintain the pass's trust streak
+// (see the adoptStreak field). Trust transitions are logged once per edge,
+// not per claimant, so a burst can't turn them into a log storm.
+func (p *Pool) adoptDelivered() {
+	p.adoptStreak.Store(0)
+	if p.adoptEscaped.CompareAndSwap(true, false) {
+		p.log.Info().Msg("pool: adoption delivering again — claimants waiting on it restored")
+		p.signalProgress()
+	}
+}
+
+func (p *Pool) adoptYieldedNothing() {
+	if p.adoptStreak.Add(1) >= p.adoptEscapeStreak && p.adoptEscaped.CompareAndSwap(false, true) {
+		p.log.Warn().Int64("consecutive_without_delivery", p.adoptStreak.Load()).
+			Msg("pool: adoption yielding no inventory — claimants no longer waiting on the pass")
+		p.signalProgress()
+	}
 }
 
 // adoptOne validates and places a single claimed orphan. Outcomes: adopted
@@ -663,6 +779,7 @@ func (p *Pool) adoptOne(ctx context.Context, idx int, adopted, invalid, skipped,
 				Msg("pool: adoption panicked — releasing slot")
 			p.mgr.releaseIfOwned(idx, poolOwner)
 			skipped.Add(1)
+			p.adoptYieldedNothing()
 		}
 	}()
 
@@ -685,6 +802,7 @@ func (p *Pool) adoptOne(ctx context.Context, idx int, adopted, invalid, skipped,
 			p.mgr.releaseIfOwned(idx, poolOwner)
 			skipped.Add(1)
 			timeouts.Add(1)
+			p.adoptYieldedNothing()
 		default:
 			p.log.Warn().Err(err).Int("slot", idx).
 				Msg("pool: orphan slot failed validation — tearing down")
@@ -699,15 +817,22 @@ func (p *Pool) adoptOne(ctx context.Context, idx int, adopted, invalid, skipped,
 				vethName: vethNameForSlot(idx),
 			})
 			invalid.Add(1)
+			p.adoptYieldedNothing()
 		}
 		return
 	}
-	p.verifyAndRecycle(&preallocSlot{
+	if p.verifyAndRecycle(&preallocSlot{
 		idx:      idx,
 		info:     info,
 		vethName: vethName,
 		adopted:  true,
-	})
+	}) {
+		p.adoptDelivered()
+	} else {
+		// Validated but not placed (occupied namespace, failed tap rebuild,
+		// full pool): still a candidate that yielded no inventory.
+		p.adoptYieldedNothing()
+	}
 	adopted.Add(1)
 }
 
@@ -748,6 +873,16 @@ func (p *Pool) Stop() {
 	p.log.Info().Msg("network pool stopped")
 }
 
+// refillStep outcomes: the worker delivered/discarded a slot and should loop,
+// failed a build and should back off, or observed shutdown and should exit.
+type refillOutcome int
+
+const (
+	refillOK refillOutcome = iota
+	refillFailed
+	refillStopped
+)
+
 func (p *Pool) refillLoop(ctx context.Context) {
 	defer p.wg.Done()
 	for {
@@ -768,61 +903,80 @@ func (p *Pool) refillLoop(ctx context.Context) {
 			}
 			continue
 		}
-
-		if len(p.fresh) >= p.newSize {
-			// Pool full — pre-build one slot and block until it is consumed or
-			// shutdown. Built outside the select so a shutdown while blocked
-			// can dispose of the slot instead of dropping it.
-			slot := p.mustAllocate(ctx)
-			if slot == nil {
-				// mustAllocate only returns nil at shutdown.
-				return
-			}
-			if p.refillIsPaused() {
-				p.cleanup(slot)
-				continue
-			}
-			select {
-			case <-p.refillDrainCh():
-				p.cleanup(slot)
-				continue
-			case <-p.stopCh:
-				p.stopSlot(slot)
-				return
-			case <-ctx.Done():
-				p.stopSlot(slot)
-				return
-			case p.fresh <- slot:
-				p.produced.Add(1)
-			}
-			continue
-		}
-
-		slot, err := p.allocate(ctx)
-		if err != nil {
-			p.log.Error().Err(err).Msg("pool refill failed")
+		switch p.refillStep(ctx) {
+		case refillStopped:
+			return
+		case refillFailed:
 			if !p.pauseAfterFailure(ctx) {
 				return
 			}
-			continue
+		}
+	}
+}
+
+// refillStep builds and delivers (or discards) one slot while the worker is
+// declared active. The active span covers construction through delivery so a
+// claimant reading refillActive sees real producer state; every backoff sleep
+// happens in the caller, outside the span, so a pool whose workers are all
+// backing off reads as inactive and releases claimants immediately.
+func (p *Pool) refillStep(ctx context.Context) refillOutcome {
+	p.refillActive.Add(1)
+	defer func() {
+		p.refillActive.Add(-1)
+		p.signalProgress()
+	}()
+
+	if len(p.fresh) >= p.newSize {
+		// Pool full — pre-build one slot and block until it is consumed or
+		// shutdown. Built outside the select so a shutdown while blocked
+		// can dispose of the slot instead of dropping it. The worker stays
+		// active while parked: it holds finished inventory, and claimants
+		// never wait on a full pool anyway.
+		slot := p.mustAllocate(ctx)
+		if slot == nil {
+			// mustAllocate only returns nil at shutdown.
+			return refillStopped
 		}
 		if p.refillIsPaused() {
 			p.cleanup(slot)
-			continue
+			return refillOK
 		}
 		select {
 		case <-p.refillDrainCh():
 			p.cleanup(slot)
-			continue
-		case p.fresh <- slot:
-			p.produced.Add(1)
+			return refillOK
 		case <-p.stopCh:
 			p.stopSlot(slot)
-			return
+			return refillStopped
 		case <-ctx.Done():
 			p.stopSlot(slot)
-			return
+			return refillStopped
+		case p.fresh <- slot:
+			return refillOK
 		}
+	}
+
+	slot, err := p.allocate(ctx)
+	if err != nil {
+		p.log.Error().Err(err).Msg("pool refill failed")
+		return refillFailed
+	}
+	if p.refillIsPaused() {
+		p.cleanup(slot)
+		return refillOK
+	}
+	select {
+	case <-p.refillDrainCh():
+		p.cleanup(slot)
+		return refillOK
+	case p.fresh <- slot:
+		return refillOK
+	case <-p.stopCh:
+		p.stopSlot(slot)
+		return refillStopped
+	case <-ctx.Done():
+		p.stopSlot(slot)
+		return refillStopped
 	}
 }
 

@@ -1003,22 +1003,23 @@ func main() {
 	// below isn't held for the fill; creates fall back to on-demand until warm.
 	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "256"))
 	netPoolRecycle, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_RECYCLE_SIZE", "256"))
+	adoptEscapeStreak, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_ADOPT_ESCAPE_STREAK", "32"))
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
 		NewSize:           netPoolFresh,
 		RecycleSize:       netPoolRecycle,
 		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
 		AbandonOnStop:     adoptNetPool,
+		AdoptEscapeStreak: adoptEscapeStreak,
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 	switch {
 	case adoptNetPool && slotsReserved && sweepSafe:
-		// Adopt the slots the previous run abandoned (or crashed out of) in
-		// the background: the pool starts warm within seconds instead of
-		// refilling from scratch, and boot never blocks on the pass.
-		go func() {
-			defer sentrylog.Recover("netpool adoption")
-			netPool.AdoptOrphanSlots(ctx)
-		}()
+		// Adopt the slots the previous run abandoned (or crashed out of):
+		// the pool starts warm within seconds instead of refilling from
+		// scratch. StartAdoption marks the pass underway before returning,
+		// so requests racing boot wait on it instead of building inline;
+		// the pass itself runs in the background and never blocks boot.
+		netPool.StartAdoption(ctx)
 	case adoptNetPool:
 		// Without a completed reservation pass — or with an unprotected
 		// recordless survivor — adoption cannot tell live VM namespaces from
