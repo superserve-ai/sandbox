@@ -62,6 +62,24 @@ locals {
   # emitting.
   active_host_name = var.active_sandbox_host == "standby" ? module.sandbox_host_b.instance_name : module.sandbox_host.instance_name
 
+  # The host_id that actually tags this cell's metrics: vmd's HOST_ID runtime
+  # env, which is ALSO its identity in the host table. It is not derivable from
+  # the instance name — this cell's row predates the convention of naming rows
+  # after the instance, and HOST_ID must never be changed to match, because
+  # heartbeats and reconciler scoping key on the existing row. Alert filters
+  # that guess the instance name here select no series and never fire, which
+  # looks identical to a healthy host.
+  #
+  # Verify against the host before changing: grep '^HOST_ID=' /etc/sandbox/vmd.env
+  #
+  # Deliberately NOT the same as active_host_name, and the two must not be
+  # merged: the host-local collector stamps its own HOST_ID (the instance name,
+  # rewritten on every collector deploy) onto the hostmetrics pipeline, so
+  # host-level series like filesystem utilization carry the instance name while
+  # vmd's own OTLP series carry vmd's HOST_ID. One machine, two host_id values,
+  # depending on which process emitted the metric.
+  metrics_host_id = var.active_sandbox_host == "standby" ? "usw2-2" : "usw2"
+
   # Exactly one host carries component=vmd, the label the shared deploy
   # pipeline discovers; the other is parked under a cell-scoped label so
   # rollouts skip it instead of failing against a host that is out of service.
@@ -308,8 +326,24 @@ module "observability" {
   # Thresholds are the module defaults; the rationale for each sits on
   # the module's variables.
   backup_alerts = {
-    host_id        = local.active_host_name
+    host_id        = local.metrics_host_id
     display_prefix = "Backup / ${local.active_host_name}"
+  }
+  # Launch-path health for the same host: the pruned launcher mount namespace
+  # being unavailable (VM starts fall back to walking the full host mount
+  # table) and live network namespaces accumulating. Both degrade latency
+  # while the service still reports healthy, so neither has another signal.
+  #
+  # Module defaults: page after 15 minutes on the legacy path; at 8,000 live
+  # namespaces sustained 30 minutes; and at 9,000 after only 5 minutes, since
+  # a host whose inflow has outrun the drain covers thousands of namespaces
+  # in half an hour. Both namespace levels are deliberately above vmd's
+  # reclaim ceiling (VMD_PAUSED_NETWORK_NETNS_THRESHOLD, currently 6,000) so
+  # they mean "the controller engaged and still lost", not "the controller is
+  # doing its job" — move them together with the ceiling or not at all.
+  launch_path_alerts = {
+    host_id        = local.metrics_host_id
+    display_prefix = "Launch path / ${local.active_host_name}"
   }
   # Root-filesystem (OS disk) utilization for the same host, scoped through
   # the same host_id label the backup metrics use, and following
