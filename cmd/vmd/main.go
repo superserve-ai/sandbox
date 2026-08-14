@@ -178,6 +178,13 @@ type lifecycle struct {
 	closers  []serviceCloser
 	firstErr error
 	errName  string
+	// signalInitiated records that shutdown was requested by an operator
+	// signal (deploy, systemctl stop) rather than a service exiting on its
+	// own — even a nil-error service return is NOT an intentional shutdown.
+	// closerErr records the first closer failure. Both gate the pool
+	// receipt: only a deliberate, fully clean shutdown may vouch.
+	signalInitiated bool
+	closerErr       error
 
 	done   chan struct{}
 	doneCh sync.Once
@@ -226,6 +233,23 @@ func (lc *lifecycle) signalShutdown() {
 	lc.doneCh.Do(func() { close(lc.done) })
 }
 
+// noteSignalInitiated marks this shutdown as operator-requested. Call before
+// signalShutdown from the signal handler only.
+func (lc *lifecycle) noteSignalInitiated() {
+	lc.mu.Lock()
+	lc.signalInitiated = true
+	lc.mu.Unlock()
+}
+
+// cleanIntentionalShutdown reports whether this was a signal-initiated
+// shutdown in which no service errored and every closer succeeded — the
+// only condition under which state may be vouched for.
+func (lc *lifecycle) cleanIntentionalShutdown() bool {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return lc.signalInitiated && lc.firstErr == nil && lc.closerErr == nil
+}
+
 // wait blocks until shutdown is signaled (by a service exit, context
 // cancellation, or an external caller).
 func (lc *lifecycle) wait(ctx context.Context) {
@@ -249,6 +273,11 @@ func (lc *lifecycle) shutdown(ctx context.Context) {
 		lc.log.Info().Str("service", c.name).Msg("closing")
 		if err := c.close(ctx); err != nil {
 			lc.log.Error().Err(err).Str("service", c.name).Msg("close returned error")
+			lc.mu.Lock()
+			if lc.closerErr == nil {
+				lc.closerErr = fmt.Errorf("%s: %w", c.name, err)
+			}
+			lc.mu.Unlock()
 		}
 	}
 }
@@ -1236,6 +1265,7 @@ func main() {
 		select {
 		case sig := <-sigCh:
 			log.Info().Str("signal", sig.String()).Msg("received shutdown signal")
+			lc.noteSignalInitiated()
 			lc.signalShutdown()
 		case <-ctx.Done():
 		}
@@ -1270,6 +1300,18 @@ func main() {
 	if lc.firstErr != nil {
 		log.Error().Err(lc.firstErr).Str("service", lc.errName).Msg("VM daemon shutdown after service error")
 		os.Exit(1)
+	}
+	// The final act of a fully clean, operator-initiated shutdown: vouch for
+	// the pool inventory the stopped-and-quiesced pool snapshotted, so the
+	// next boot can adopt it without the paranoid per-slot rebuild. Every
+	// other ending vouches for nothing: a service error exits above, an
+	// unexpected service return (even error-free) is not intentional, a
+	// failed closer means teardown is suspect, and CommitReceipt itself
+	// refuses unless the pool fully quiesced.
+	if lc.cleanIntentionalShutdown() {
+		netPool.CommitReceipt()
+	} else {
+		log.Info().Msg("shutdown not clean-and-intentional — no pool receipt written")
 	}
 	log.Info().Msg("VM daemon shutdown complete")
 }

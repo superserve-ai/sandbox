@@ -20,6 +20,11 @@ Env vars:
                        into vmd.env when set; empty = skip, leaving the
                        host's backup uploader disabled. Staged rollout:
                        staging first, production after the staging soak.
+  BACKUP_BACKFILL      optional — "1" enables the paused-sandbox backup
+                       backfill sweep (startup + six-hourly re-sweeps).
+                       Reconciled, not merely upserted: unset in the
+                       workflow removes the line on the next deploy, which
+                       is the rollout's documented off switch.
   BACKUP_JOURNAL_PATH  optional — path for the backup uploader's BoltDB
                        journal. Upserted into vmd.env when set; empty = skip,
                        leaving vmd's default (next to RUN_DIR, i.e. on the
@@ -148,6 +153,7 @@ BUNDLE_FILES = [
     "deploy/superserve-vms.service",
     "deploy/vmd-rollback-guard",
     "deploy/superserve-vmd-rollback-guard.conf",
+    "deploy/superserve-vmd-start-generation.conf",
     "deploy/superserve-secretsproxy.service",
     "deploy/firecracker@.service",
     "deploy/firecracker-netns@.service",
@@ -172,6 +178,7 @@ def main() -> int:
     backup_bucket = os.environ.get("BACKUP_BUCKET", "")
     backup_upload_concurrency = os.environ.get("BACKUP_UPLOAD_CONCURRENCY", "")
     backup_journal_path = os.environ.get("BACKUP_JOURNAL_PATH", "")
+    backup_backfill = os.environ.get("BACKUP_BACKFILL", "")
     otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
     control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
     internal_api_token = os.environ.get("INTERNAL_API_TOKEN", "")
@@ -188,6 +195,8 @@ def main() -> int:
     q_sentry_line = shlex.quote(f"SENTRY_DSN={sentry_dsn}")
     q_backup = shlex.quote(backup_bucket)
     q_backup_line = shlex.quote(f"BACKUP_BUCKET={backup_bucket}")
+    q_backup_backfill = shlex.quote(backup_backfill)
+    q_backup_backfill_line = shlex.quote(f"BACKUP_BACKFILL={backup_backfill}")
     q_backup_workers = shlex.quote(backup_upload_concurrency)
     q_backup_workers_line = shlex.quote(f"BACKUP_UPLOAD_CONCURRENCY={backup_upload_concurrency}")
     q_backup_journal = shlex.quote(backup_journal_path)
@@ -447,7 +456,23 @@ def main() -> int:
             sudo install -m 0755 {extract_dir}/deploy/vmd-rollback-guard {install_dir}/vmd-rollback-guard
             sudo install -d -m 0755 /etc/systemd/system/superserve-vmd.service.d
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-rollback-guard.conf /etc/systemd/system/superserve-vmd.service.d/10-rollback-guard.conf
+            # Start-generation stamp: proves receipt succession (see the
+            # drop-in's header). A drop-in for the same reason as the guard
+            # above — it must survive deploys of revisions that predate it.
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-start-generation.conf /etc/systemd/system/superserve-vmd.service.d/20-start-generation.conf
             sudo systemctl daemon-reload
+            # daemon-reload alone does not apply [Slice] resource values to
+            # an already-active cgroup (same systemd behavior the TasksMax
+            # block below works around), and sandboxes.slice is active on
+            # any host with VMs. Apply the weights to the live slice;
+            # --runtime keeps the unit file the durable source for boot.
+            # Keep the values in lockstep with deploy/sandboxes.slice.
+            #
+            # WARNING: this runtime override survives a rollback to an
+            # older script revision (which cannot know to clear it) and
+            # lasts until reboot. To clear it by hand:
+            #   systemctl set-property --runtime sandboxes.slice CPUWeight=100 IOWeight=100
+            sudo systemctl set-property --runtime sandboxes.slice CPUWeight=400 IOWeight=400 2>/dev/null || true
             sudo systemctl enable --quiet superserve-vmd.socket
             sudo systemctl enable --now --quiet superserve-maintenance-watch.timer
             # Delegated cgroup subtree for direct-spawn VMs. Enable for boot, but
@@ -612,6 +637,18 @@ def main() -> int:
                     echo 'SECRETSPROXY_SOCKET=/run/secretsproxy/control.sock' | sudo tee -a "$env_file" > /dev/null
                 fi
             done
+
+            # Reconcile the backfill flag: unlike the skip-when-empty vars,
+            # the stale line is ALWAYS removed and re-added only when the
+            # workflow sets it. This is a rollout flag with an explicit off
+            # step (coverage verified, flag removed), and unsetting it in the
+            # workflow must actually disable the sweep on the next deploy
+            # rather than requiring a manual host edit.
+            sudo touch /etc/sandbox/vmd.env
+            sudo sed -i '/^BACKUP_BACKFILL=/d' /etc/sandbox/vmd.env
+            if [ -n {q_backup_backfill} ]; then
+                echo {q_backup_backfill_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
 
             # Upsert the control-plane URL. Empty = skip. vmd.env is safe to
             # create; secretsproxy.env is only UPSERTED when it ALREADY exists —
