@@ -227,6 +227,12 @@ func sandboxIDsFromFile(path string) ([]string, map[string][]backup.CaptureAncho
 				if !isHexDigest(sha) {
 					return nil, nil, fmt.Errorf("sandbox %s: %q is not a 64-hex sha256 digest", fields[0], sha)
 				}
+				// Manifest entries are leaf filenames; an empty or
+				// path-shaped name can never match one and would silently
+				// unanchor the sandbox.
+				if name == "" || strings.ContainsAny(name, "/\\") {
+					return nil, nil, fmt.Errorf("sandbox %s: %q is not a valid artifact name in anchor token %q", fields[0], name, tok)
+				}
 				a[name] = sha
 			}
 			if len(a) > 0 {
