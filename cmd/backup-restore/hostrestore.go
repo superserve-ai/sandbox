@@ -233,6 +233,18 @@ func sandboxIDsFromFile(path string) ([]string, map[string][]backup.CaptureAncho
 				if name == "" || strings.ContainsAny(name, "/\\") {
 					return nil, nil, fmt.Errorf("sandbox %s: %q is not a valid artifact name in anchor token %q", fields[0], name, tok)
 				}
+				// The completion marker is reserved: no valid manifest
+				// lists it, so an anchor naming it can never match and
+				// would silently unanchor the sandbox.
+				if name == backup.ManifestObject {
+					return nil, nil, fmt.Errorf("sandbox %s: %q is a reserved name, not an artifact, in anchor token %q", fields[0], name, tok)
+				}
+				// A repeated name silently keeps only the last digest,
+				// and a malformed export that pastes two pauses into one
+				// anchor could then match the wrong generation.
+				if _, dup := a[name]; dup {
+					return nil, nil, fmt.Errorf("sandbox %s: duplicate artifact %q within one anchor", fields[0], name)
+				}
 				a[name] = sha
 			}
 			if len(a) > 0 {
