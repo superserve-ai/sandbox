@@ -833,7 +833,14 @@ func pidIsVMFirecracker(pid int, vmID string) bool {
 // per-VM copy must then be hole-exact, so it reflinks strictly rather
 // than falling back to a heuristic sparse copy that could turn
 // guest-written zeros into holes exposing base content.
-func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath string, vcpu, memMiB uint32) (*VMInstance, error) {
+// supervised spawns the VM under the fleet's real lifecycle supervision
+// (systemd unit or validated cgroup, seeded by `supervision`) through
+// the same dispatcher resume uses, so auto-pause's mode-directed stop
+// and every at-rest oracle see the VM the way they see any sandbox.
+// The flag is explicit because SupervisionUnit is the zero value: a
+// sentinel on the mode alone cannot distinguish "unit mode" from the
+// legacy unsupervised spawn kept for throwaway template-build VMs.
+func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath string, supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
@@ -929,12 +936,40 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 	}
 
 	// 4. Start Firecracker inside the network namespace, configure, and boot.
-	pid, err := m.startFirecrackerColdBoot(ctx, vmID, socketPath, fcCfg, netInfo.Namespace)
-	if err != nil {
-		m.netMgr.CleanupVM(vmID)
-		m.cleanupRunDir(vmID)
-		m.setStatus(vmID, StatusError)
-		return nil, fmt.Errorf("start firecracker: %w", err)
+	var pid int
+	if supervised {
+		spawnedPID, actual, lerr := m.launchFirecracker(ctx, vmID, socketPath, diskPath, basePath, netInfo.Namespace, supervision, true, false)
+		if lerr == nil {
+			stopSpawned := func() { _ = m.stopVM(ctx, vmID, actual) }
+			if lerr = waitForSocket(socketPath, 10*time.Second); lerr != nil {
+				stopSpawned()
+			} else if lerr = ConfigureMachine(socketPath, fcCfg); lerr != nil {
+				stopSpawned()
+			} else if lerr = StartInstance(socketPath); lerr != nil {
+				stopSpawned()
+			}
+			if lerr == nil {
+				pid = spawnedPID
+				inst.mu.Lock()
+				inst.Supervision = actual
+				inst.mu.Unlock()
+			}
+		}
+		if lerr != nil {
+			m.netMgr.CleanupVM(vmID)
+			m.cleanupRunDir(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("start firecracker (supervised): %w", lerr)
+		}
+	} else {
+		var serr error
+		pid, serr = m.startFirecrackerColdBoot(ctx, vmID, socketPath, fcCfg, netInfo.Namespace)
+		if serr != nil {
+			m.netMgr.CleanupVM(vmID)
+			m.cleanupRunDir(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("start firecracker: %w", serr)
+		}
 	}
 
 	inst.mu.Lock()

@@ -129,8 +129,17 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		return nil, fmt.Errorf("clear residue: %w", err)
 	}
 	teardownDur := time.Since(reviveStart)
+	// The revived VM lives under the fleet's real supervision, seeded
+	// from the zombie's recorded mode (default unit for records that
+	// predate the mode field): auto-pause's mode-directed stop and every
+	// at-rest oracle must see this VM the way they see any sandbox, and
+	// an unsupervised spawn would read as at-rest while running.
+	supervision := prevRec.Supervision
+	if !knownSupervision(supervision) {
+		supervision = SupervisionUnit
+	}
 	phaseStart := time.Now()
-	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, vcpu, memMiB)
+	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, true, supervision, vcpu, memMiB)
 	if err != nil {
 		return nil, err
 	}
