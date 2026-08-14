@@ -790,6 +790,13 @@ WITH draining AS (
   WHERE s.destroyed_at IS NULL
     AND s.status = 'active'
     AND s.host_id = sqlc.arg('host_id')
+    -- Re-checked inside the claim: an operator un-drain between the tick's
+    -- host listing and this statement must not let a stale tick pause
+    -- sandboxes (including fresh placements) on a now-active host.
+    AND EXISTS (
+      SELECT 1 FROM host h
+      WHERE h.id = s.host_id AND h.status = 'draining'
+    )
   ORDER BY s.created_at ASC
   LIMIT sqlc.arg('batch_size')
   FOR UPDATE OF s SKIP LOCKED

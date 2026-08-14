@@ -28,14 +28,6 @@ type hostHeartbeatRequest struct {
 	MaintenanceWindowStart *string `json:"maintenance_window_start,omitempty"`
 }
 
-// drainLeadTime is how far ahead of an announced maintenance window the host
-// begins draining (pausing its active sandboxes). Late on purpose: pausing
-// disrupts live workloads, so the platform waits until the restart is close;
-// a full fleet drain measures in low minutes, so an hour holds generous
-// margin for retries. One reviewed constant, derived from measured drain
-// time × safety factor — not host config.
-const drainLeadTime = time.Hour
-
 // HostHeartbeat handles POST /internal/hosts/:host_id/heartbeat.
 // VMD calls this every 30s to prove liveness. The control plane updates
 // last_heartbeat_at; a background detector marks hosts unhealthy after
@@ -121,65 +113,34 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		}
 	}
 
-	status := host.Status
 	if req.MaintenanceWindowStart != nil {
-		status = h.recordMaintenanceWindow(ctx, hostID, *req.MaintenanceWindowStart, status)
+		h.recordMaintenanceWindow(ctx, hostID, *req.MaintenanceWindowStart)
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": status})
+	c.JSON(http.StatusOK, gin.H{"status": host.Status})
 }
 
 // recordMaintenanceWindow persists the heartbeat's announced-maintenance
-// answer and makes the drain decision: a host with a window inside
-// drainLeadTime flips active → draining, which removes it from placement and
-// puts the drain reaper to work pausing its active sandboxes. Un-draining is
-// deliberately NOT done here — see UndrainHost. Returns the (possibly
-// updated) host status for the heartbeat response.
-func (h *Handlers) recordMaintenanceWindow(ctx context.Context, hostID, raw, status string) string {
-	var window *time.Time
+// answer — recording ONLY. The drain decision deliberately does not live
+// here: it is driven from the persisted deadline by the reaper's drain loop
+// (see drainDueHosts), so a window recorded hours ago still drains on time
+// even if every later metadata probe fails or the reporting host rolls back
+// to a version that stops sending the field.
+func (h *Handlers) recordMaintenanceWindow(ctx context.Context, hostID, raw string) {
+	var ts pgtype.Timestamptz
 	if raw != "" {
 		t, err := time.Parse(time.RFC3339, raw)
 		if err != nil {
 			log.Warn().Str("host_id", hostID).Str("value", raw).Msg("heartbeat carried unparseable maintenance window; ignoring")
-			return status
+			return
 		}
-		window = &t
-	}
-	var ts pgtype.Timestamptz
-	if window != nil {
-		ts = pgtype.Timestamptz{Time: *window, Valid: true}
+		ts = pgtype.Timestamptz{Time: t, Valid: true}
 	}
 	if err := h.DB.UpdateHostMaintenanceWindow(ctx, db.UpdateHostMaintenanceWindowParams{
 		ID: hostID, MaintenanceWindowStart: ts,
 	}); err != nil {
 		log.Error().Err(err).Str("host_id", hostID).Msg("failed to record maintenance window")
-		return status
 	}
-	until := time.Duration(0)
-	if window != nil {
-		until = time.Until(*window)
-	}
-	// Drain only inside the lead window. The lower bound matters as much as
-	// the upper: a recorded window well in the past (metadata that never
-	// cleared after the restart happened) must not re-drain a host an
-	// operator just un-drained.
-	if window == nil || status != "active" || until > drainLeadTime || until < -drainLeadTime {
-		return status
-	}
-	n, err := h.DB.DrainHost(ctx, hostID)
-	if err != nil {
-		log.Error().Err(err).Str("host_id", hostID).Msg("failed to drain host for maintenance")
-		return status
-	}
-	if n > 0 {
-		log.Warn().Str("host_id", hostID).Time("window_start", *window).
-			Msg("host maintenance window imminent — draining: placement stopped, active sandboxes will be paused")
-		if h.Scheduler != nil {
-			h.Scheduler.Invalidate()
-		}
-		return "draining"
-	}
-	return status
 }
 
 // DrainHost handles POST /internal/hosts/:host_id/drain — the operator

@@ -52,6 +52,7 @@ func DefaultReaperConfig() ReaperConfig {
 //     cannot starve the control plane for extended periods.
 func (h *Handlers) StartTimeoutReaper(ctx context.Context, cfg ReaperConfig) {
 	go h.reaperLoop(ctx, cfg)
+	go h.drainLoop(ctx, cfg)
 }
 
 func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
@@ -74,7 +75,6 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 
 	runTick := func() {
 		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
-		sentrylog.RunSafe("host-drain", func() { h.drainOnce(ctx, cfg.BatchSize, parallelism) })
 		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
 		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx) })
 		sentrylog.RunSafe("snapshot-row-sweep", func() { h.sweepOrphanedSnapshotRows(ctx) })
@@ -486,6 +486,64 @@ func (h *Handlers) markSandboxFailed(ctx context.Context, sbx db.ClaimExpiredSan
 	}
 	RecordSandboxTransition(ctx, "fail", telemetry.ResultSuccess, sbx.HostID, time.Since(started))
 	l.Error().Str("reason", reason).Msg("reaper: TERMINAL — sandbox marked 'failed', manual recovery required")
+}
+
+// drainLeadTime is how far ahead of an announced maintenance window the host
+// begins draining (pausing its active sandboxes). Late on purpose: pausing
+// disrupts live workloads, so the platform waits until the restart is close;
+// a full fleet drain measures in low minutes, so an hour holds generous
+// margin for retries. One reviewed constant, derived from measured drain
+// time × safety factor — not host config.
+const drainLeadTime = time.Hour
+
+// drainLoop runs host draining on its own cadence, independent of the
+// cleanup loop: a drain batch can legitimately block for minutes on slow
+// pauses, and the DB-only sweeps (intervals, revocations, snapshots) must
+// not queue behind it — nor drain behind them. Missed ticks coalesce.
+func (h *Handlers) drainLoop(ctx context.Context, cfg ReaperConfig) {
+	parallelism := cfg.Parallelism
+	if parallelism <= 0 {
+		parallelism = 10
+	}
+	if int32(parallelism) > cfg.BatchSize {
+		parallelism = int(cfg.BatchSize)
+	}
+	ticker := time.NewTicker(cfg.Interval)
+	defer ticker.Stop()
+	for {
+		sentrylog.RunSafe("host-drain", func() {
+			h.drainDueHosts(ctx)
+			h.drainOnce(ctx, cfg.BatchSize, parallelism)
+		})
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// drainDueHosts is the drain decision's single home: it flips active hosts
+// whose PERSISTED maintenance window has entered the lead period. Driving
+// this from recorded state rather than freshly reported heartbeat values
+// means a window recorded hours ago drains on time even if every later
+// metadata probe fails.
+func (h *Handlers) drainDueHosts(ctx context.Context) {
+	due, err := h.DB.DrainHostsDueForMaintenance(ctx, int32(drainLeadTime/time.Second))
+	if err != nil {
+		log.Error().Err(err).Msg("drain: flipping due hosts failed")
+		return
+	}
+	if len(due) == 0 {
+		return
+	}
+	for _, host := range due {
+		log.Warn().Str("host_id", host.ID).Time("window_start", host.MaintenanceWindowStart.Time).
+			Msg("host maintenance window imminent — draining: placement stopped, active sandboxes will be paused")
+	}
+	if h.Scheduler != nil {
+		h.Scheduler.Invalidate()
+	}
 }
 
 // drainIncompleteLead is how close to a host's maintenance window unpaused

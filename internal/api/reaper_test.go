@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -669,5 +671,60 @@ func TestDrain_TickBudgetBoundsFleetWideWork(t *testing.T) {
 	}
 	if atomic.LoadInt32(&claimCalls) >= 4 {
 		t.Fatal("hosts beyond the budget must defer, not claim")
+	}
+}
+
+// TestDrainDueHosts pins the persisted-deadline decision: the flip query is
+// the single place hosts become draining on schedule, so a window recorded
+// long ago drains on time even when later heartbeats fail to report.
+// (The lead-time bounds themselves live in the SQL and are asserted by the
+// guard test on the query text below.)
+func TestDrainDueHosts_FlipsAndLogs(t *testing.T) {
+	var flips int32
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+				if strings.Contains(sql, "-- name: DrainHostsDueForMaintenance :many") {
+					atomic.AddInt32(&flips, 1)
+					if got := args[0].(int32); got != int32(drainLeadTime/time.Second) {
+						t.Errorf("lead seconds = %d, want %d", got, int32(drainLeadTime/time.Second))
+					}
+					return &drainingHostRows{hosts: []db.ListDrainingHostsRow{{
+						ID:                     "host-a",
+						MaintenanceWindowStart: pgtype.Timestamptz{Time: time.Now().Add(30 * time.Minute), Valid: true},
+					}}}, nil
+				}
+				return newStubRows(nil), nil
+			},
+		},
+		&stubVMD{},
+	)
+	h.drainDueHosts(context.Background())
+	if atomic.LoadInt32(&flips) != 1 {
+		t.Fatal("drainDueHosts must run the flip query")
+	}
+}
+
+// TestDrainDueForMaintenanceQueryBounds pins the SQL-side lead window: both
+// bounds present, so long-stale windows cannot re-drain an un-drained host.
+func TestDrainDueForMaintenanceQueryBounds(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "db", "queries", "hosts.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := string(raw)
+	start := strings.Index(q, "-- name: DrainHostsDueForMaintenance :many")
+	if start < 0 {
+		t.Fatal("DrainHostsDueForMaintenance query missing")
+	}
+	block := q[start : start+strings.Index(q[start:], "RETURNING")]
+	for _, required := range []string{
+		"status = 'active'",
+		"maintenance_window_start <= now() + make_interval",
+		"maintenance_window_start >= now() - make_interval",
+	} {
+		if !strings.Contains(block, required) {
+			t.Errorf("flip query missing %q", required)
+		}
 	}
 }

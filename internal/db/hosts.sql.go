@@ -78,6 +78,48 @@ func (q *Queries) DrainHost(ctx context.Context, id string) (int64, error) {
 	return result.RowsAffected(), nil
 }
 
+const drainHostsDueForMaintenance = `-- name: DrainHostsDueForMaintenance :many
+UPDATE host
+SET status = 'draining', updated_at = now()
+WHERE status = 'active'
+  AND maintenance_window_start IS NOT NULL
+  AND maintenance_window_start <= now() + make_interval(secs => $1::int)
+  AND maintenance_window_start >= now() - make_interval(secs => $1::int)
+RETURNING id, maintenance_window_start
+`
+
+type DrainHostsDueForMaintenanceRow struct {
+	ID                     string             `json:"id"`
+	MaintenanceWindowStart pgtype.Timestamptz `json:"maintenance_window_start"`
+}
+
+// Flips active hosts whose RECORDED maintenance window has entered the lead
+// period. This is the drain decision's single home: driving it from the
+// persisted deadline (not from freshly reported values) means a window
+// recorded hours ago still drains on time even if every later metadata
+// probe fails. The lower bound keeps long-stale windows (metadata that
+// never cleared after a completed restart) from re-draining an un-drained
+// host.
+func (q *Queries) DrainHostsDueForMaintenance(ctx context.Context, leadSeconds int32) ([]DrainHostsDueForMaintenanceRow, error) {
+	rows, err := q.db.Query(ctx, drainHostsDueForMaintenance, leadSeconds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []DrainHostsDueForMaintenanceRow{}
+	for rows.Next() {
+		var i DrainHostsDueForMaintenanceRow
+		if err := rows.Scan(&i.ID, &i.MaintenanceWindowStart); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getHost = `-- name: GetHost :one
 SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, maintenance_window_start FROM host WHERE id = $1
 `

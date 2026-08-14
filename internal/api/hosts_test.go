@@ -165,11 +165,12 @@ func postHeartbeat(t *testing.T, h *Handlers, body string) *httptest.ResponseRec
 	return w
 }
 
-// TestHostHeartbeatDrainsOnImminentMaintenance pins the auto-drain decision:
-// an active host reporting a maintenance window inside the lead time flips
-// to draining in the same heartbeat.
-func TestHostHeartbeatDrainsOnImminentMaintenance(t *testing.T) {
-	mock, windowWrites, drains := drainTestMock(t, "active", true)
+// TestHostHeartbeatRecordsWithoutDeciding pins the recorder-only contract:
+// even an imminent window is only persisted — the drain decision lives in
+// the reaper's drain loop, driven from the persisted deadline, so it fires
+// on time regardless of what later heartbeats manage to report.
+func TestHostHeartbeatRecordsWithoutDeciding(t *testing.T) {
+	mock, windowWrites, drains := drainTestMock(t, "active", false)
 	h := &Handlers{DB: db.New(mock)}
 	soon := time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339)
 
@@ -178,32 +179,8 @@ func TestHostHeartbeatDrainsOnImminentMaintenance(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", w.Code, w.Body.String())
 	}
-	if *windowWrites != 1 || *drains != 1 {
-		t.Fatalf("windowWrites=%d drains=%d, want 1/1", *windowWrites, *drains)
-	}
-	if !strings.Contains(w.Body.String(), `"draining"`) {
-		t.Fatalf("response must report draining, got %s", w.Body.String())
-	}
-}
-
-// TestHostHeartbeatFarWindowRecordsWithoutDraining pins the late-drain
-// policy: a window beyond the lead time is recorded but the host keeps
-// serving and taking placement.
-func TestHostHeartbeatFarWindowRecordsWithoutDraining(t *testing.T) {
-	mock, windowWrites, _ := drainTestMock(t, "active", false)
-	h := &Handlers{DB: db.New(mock)}
-	far := time.Now().Add(6 * time.Hour).UTC().Format(time.RFC3339)
-
-	w := postHeartbeat(t, h, `{"maintenance_window_start":"`+far+`"}`)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status %d: %s", w.Code, w.Body.String())
-	}
-	if *windowWrites != 1 {
-		t.Fatalf("windowWrites=%d, want 1", *windowWrites)
-	}
-	if !strings.Contains(w.Body.String(), `"active"`) {
-		t.Fatalf("response must stay active, got %s", w.Body.String())
+	if *windowWrites != 1 || *drains != 0 {
+		t.Fatalf("windowWrites=%d drains=%d, want 1/0 — heartbeat records, reaper decides", *windowWrites, *drains)
 	}
 }
 
@@ -280,27 +257,5 @@ func TestDrainEndpoints(t *testing.T) {
 				t.Fatalf("code %d, want %d: %s", w.Code, tc.wantCode, w.Body.String())
 			}
 		})
-	}
-}
-
-// TestHostHeartbeatStalePastWindowDoesNotDrain pins the lower bound of the
-// drain window: a recorded window well in the past (metadata that never
-// cleared after the restart already happened) must not re-drain a host an
-// operator just un-drained.
-func TestHostHeartbeatStalePastWindowDoesNotDrain(t *testing.T) {
-	mock, windowWrites, _ := drainTestMock(t, "active", false)
-	h := &Handlers{DB: db.New(mock)}
-	stale := time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339)
-
-	w := postHeartbeat(t, h, `{"maintenance_window_start":"`+stale+`"}`)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status %d: %s", w.Code, w.Body.String())
-	}
-	if *windowWrites != 1 {
-		t.Fatalf("windowWrites=%d, want 1 — stale window is still recorded, just not acted on", *windowWrites)
-	}
-	if !strings.Contains(w.Body.String(), `"active"`) {
-		t.Fatalf("host must stay active on a stale window, got %s", w.Body.String())
 	}
 }

@@ -43,6 +43,22 @@ UPDATE host
 SET status = 'active', updated_at = now()
 WHERE id = $1 AND status = 'draining';
 
+-- name: DrainHostsDueForMaintenance :many
+-- Flips active hosts whose RECORDED maintenance window has entered the lead
+-- period. This is the drain decision's single home: driving it from the
+-- persisted deadline (not from freshly reported values) means a window
+-- recorded hours ago still drains on time even if every later metadata
+-- probe fails. The lower bound keeps long-stale windows (metadata that
+-- never cleared after a completed restart) from re-draining an un-drained
+-- host.
+UPDATE host
+SET status = 'draining', updated_at = now()
+WHERE status = 'active'
+  AND maintenance_window_start IS NOT NULL
+  AND maintenance_window_start <= now() + make_interval(secs => sqlc.arg('lead_seconds')::int)
+  AND maintenance_window_start >= now() - make_interval(secs => sqlc.arg('lead_seconds')::int)
+RETURNING id, maintenance_window_start;
+
 -- name: ListDrainingHosts :many
 -- Hosts being drained ahead of an announced restart. The reaper pauses their
 -- remaining active sandboxes; maintenance_window_start drives the
