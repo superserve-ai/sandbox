@@ -268,14 +268,12 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 		// first anchor with a matching manifest is the newest captured
 		// pause that survived.
 		match := ""
-		matchAnchor := -1
 		var matchedGens []string
-		for ai, anchor := range item.Anchors {
+		for _, anchor := range item.Anchors {
 			for _, g := range gens {
 				if v, ok := manifestByGen.Load(g.Generation); ok && anchor.matches(v.(*GenerationManifest)) {
 					if match == "" {
 						match = g.Generation
-						matchAnchor = ai
 					}
 					matchedGens = append(matchedGens, g.Generation)
 				}
@@ -305,12 +303,13 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 			}
 		}
 		switch {
-		case match != "" && (unreadable == 0 || matchAnchor == 0):
-			// With unreadable candidates in play, only a newest-anchor
-			// match is trustworthy: an unreadable manifest could match a
-			// NEWER anchor than the one found, and accepting the older
-			// match would silently roll the sandbox back on a transient
-			// read error.
+		case match != "" && unreadable == 0:
+			// Acceptance requires the scan to be complete: an unreadable
+			// manifest could match a newer anchor than the one found, or
+			// be a content-differing duplicate of the winning anchor's
+			// match, and either way accepting would silently restore the
+			// wrong generation on a transient read error. Reruns are
+			// idempotent, so failing closed below costs one retry.
 			res.Generation = match
 		case unreadable > 0:
 			// Fail closed: an unreadable candidate may BE the anchor, and
