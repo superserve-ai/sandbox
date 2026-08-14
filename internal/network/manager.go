@@ -15,6 +15,8 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/shellquote"
+
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // ---------------------------------------------------------------------------
@@ -123,6 +125,8 @@ const poolWaitLogThreshold = 250 * time.Millisecond
 type Manager struct {
 	hostInterface string
 	log           zerolog.Logger
+	// recorder receives slot claim/build latency phases; nil records nothing.
+	recorder telemetry.Recorder
 
 	// setupSem bounds concurrent setupSlot builds (see setupSlotConcurrency).
 	setupSem chan struct{}
@@ -256,6 +260,20 @@ func WithEgressPortChainOwner() ManagerOption {
 	return func(m *Manager) { m.ownsEgressPortChain = true }
 }
 
+// SetTelemetry attaches the operational metrics recorder; slot claim and
+// build phases are emitted through it (plane "vmd", op "net").
+func (m *Manager) SetTelemetry(r telemetry.Recorder) { m.recorder = r }
+
+// recordNetPhase emits one network-phase latency sample; nil-safe.
+func (m *Manager) recordNetPhase(phase string, d time.Duration) {
+	if m.recorder == nil || d < 0 {
+		return
+	}
+	m.recorder.RecordLatencyPhase(context.Background(), telemetry.LatencyPhase{
+		Plane: "vmd", Op: "net", Phase: phase, Duration: d,
+	})
+}
+
 func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, opts ...ManagerOption) (*Manager, error) {
 	if err := enableIPForward(ctx); err != nil {
 		return nil, err
@@ -328,6 +346,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		tWait := time.Now()
 		if info := m.pool.ClaimWait(ctx, vmID); info != nil {
 			m.registerEgress(vmID, info)
+			m.recordNetPhase("pool_wait", time.Since(tWait))
 			if waited := time.Since(tWait); waited >= poolWaitLogThreshold {
 				m.log.Info().Str("vm_id", vmID).
 					Int64("pool_wait_ms", waited.Milliseconds()).
@@ -344,6 +363,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		m.log.Info().Str("vm_id", vmID).
 			Int64("pool_wait_ms", time.Since(tWait).Milliseconds()).
 			Msg("network pool empty, falling back to on-demand setup")
+		m.recordNetPhase("pool_wait", time.Since(tWait))
 	}
 
 	idx, err := m.claimSlotIndex(vmID)
@@ -371,6 +391,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		Str("host_ip", info.HostIP).
 		Int64("on_demand_setup_ms", time.Since(tBuild).Milliseconds()).
 		Msg("network namespace created")
+	m.recordNetPhase("on_demand_setup", time.Since(tBuild))
 
 	return info, nil
 }

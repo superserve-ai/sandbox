@@ -316,6 +316,7 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 			Int64("claim_devmap_ms", tDone.Sub(tNsChecked).Milliseconds()).
 			Int64("claim_total_ms", tDone.Sub(tEntry).Milliseconds()).
 			Msg("pool: claim complete")
+		p.mgr.recordNetPhase("claim_total", tDone.Sub(tEntry))
 		return slot.info
 	}
 }

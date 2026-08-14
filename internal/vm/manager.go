@@ -1732,6 +1732,13 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		Int64("restore_ms", tRestoreDone.Sub(tRestore).Milliseconds()).
 		Int64("total_ms", time.Since(tEntry).Milliseconds()).
 		Msg("VM resumed from snapshot")
+	m.recordPhases("resume", "", map[string]time.Duration{
+		"prep":        tSlot.Sub(tEntry),
+		"ensure_slot": tFcStart.Sub(tSlot),
+		"fc_start":    tFcDone.Sub(tFcStart),
+		"restore":     tRestoreDone.Sub(tRestore),
+		"total":       time.Since(tEntry),
+	})
 
 	// Telemetry only: measure how long boxd takes to become reachable after
 	// the vCPUs resume. Detached — status is already running and the probe
@@ -1755,6 +1762,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		log.Info().
 			Int64("wait_boxd_ms", time.Since(probeStart).Milliseconds()).
 			Msg("boxd reachable after resume")
+		m.recordPhases("resume", "", map[string]time.Duration{"wait_boxd": time.Since(probeStart)})
 	}()
 	return inst, nil
 }
@@ -2490,6 +2498,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Float64("mem_psi_avg10", memPSI).
 			Int("attempt", attempt).
 			Msg("restoring snapshot")
+		if attempt == 1 {
+			m.recordPhases("restore", "", map[string]time.Duration{
+				"entry_to_sem": tSemAcquired.Sub(tEntry),
+				"sem_to_disk":  tDiskReady.Sub(tSemAcquired),
+				"disk_to_net":  tNetReady.Sub(netBase),
+				"net_to_fc":    tFcReady.Sub(tNetReady),
+			})
+		}
 
 		// attemptErr is this attempt's result alone; it lands in restoreErr after
 		// the load log so a stale prior-attempt error can never leak into the

@@ -574,7 +574,11 @@ func main() {
 				Dur("interval", otelExportInterval).
 				Msg("otel metrics initialized")
 		}
-	}
+	
+	// Network slot claim/build phases ride the same recorder (no-op when
+	// metrics are disabled).
+	netMgr.SetTelemetry(recorder)
+}
 
 	// Persistent systemd D-Bus connection for unit operations (vs forking
 	// systemctl per call). Falls back to systemctl per call when unavailable.
