@@ -2591,14 +2591,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		Int64("total_ms", tPostDone.Sub(tStart).Milliseconds()).
 		Msg("CreateSandbox phases")
 	RecordLatencyPhases(c.Request.Context(), "create", hostID, map[string]time.Duration{
-		"auth":              time.Duration(c.GetInt64("auth_ms")) * time.Millisecond,
-		"lookup":            tLookupDone.Sub(tStart),
-		"sched":             tVmdStart.Sub(tLookupDone),
-		"vmd":               tVmdEnd.Sub(tVmdStart),
-		"insert":            tInsertEnd.Sub(tInsertStart),
-		"insert_wait":       tInsertReceive.Sub(tVmdEnd),
-		"post":              tPostDone.Sub(tInsertReceive),
-		"total":             tPostDone.Sub(tStart),
+		"auth":        time.Duration(c.GetInt64("auth_ms")) * time.Millisecond,
+		"lookup":      tLookupDone.Sub(tStart),
+		"sched":       tVmdStart.Sub(tLookupDone),
+		"vmd":         tVmdEnd.Sub(tVmdStart),
+		"insert":      tInsertEnd.Sub(tInsertStart),
+		"insert_wait": tInsertReceive.Sub(tVmdEnd),
+		"post":        tPostDone.Sub(tInsertReceive),
+		"total":       tPostDone.Sub(tStart),
 	})
 	RecordSandboxTransition(c.Request.Context(), "create", telemetry.ResultSuccess, hostID, tPostDone.Sub(tStart))
 	c.JSON(http.StatusCreated, resp)
