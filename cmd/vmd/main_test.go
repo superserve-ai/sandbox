@@ -2,6 +2,40 @@ package main
 
 import "testing"
 
+func TestLoadConfigRequiresExplicitHostID(t *testing.T) {
+	cases := []struct {
+		name    string
+		hostID  string
+		wantErr bool
+	}{
+		{"unset", "", true},
+		{"legacy default identity", "default", false},
+		{"real identity", "host-a", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("KERNEL_PATH", "/tmp/kernel")
+			t.Setenv("BASE_ROOTFS_PATH", "/tmp/rootfs")
+			t.Setenv("HOST_ID", tc.hostID)
+
+			cfg, err := loadConfig()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("loadConfig() = %+v, want error for HOST_ID=%q", cfg, tc.hostID)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig() error: %v", err)
+			}
+			if cfg.HostID != tc.hostID {
+				t.Fatalf("cfg.HostID = %q, want %q", cfg.HostID, tc.hostID)
+			}
+		})
+	}
+}
+
 func TestParseSecretsProxyAddr(t *testing.T) {
 	t.Parallel()
 
