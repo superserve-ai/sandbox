@@ -27,6 +27,15 @@ Env vars:
                        /mnt/localssd: the journal is written to continuously
                        while backups drain, and the root disk is small
                        enough that it can fill and stall the uploader.
+  BACKUP_UPLOAD_CONCURRENCY
+                       optional — number of parallel drain workers in the
+                       backup uploader. Upserted into vmd.env when set;
+                       empty = skip, leaving vmd's default of one worker.
+                       Workers share a single bandwidth limiter, so this
+                       raises task throughput (per-task overhead is the
+                       bottleneck at high pause rates), never total egress.
+                       Staged rollout: staging first, production after the
+                       staging soak.
   OTEL_ENVIRONMENT     optional — enables vmd's OTLP backup-metrics exporter
                        by upserting OTEL_METRICS_ENABLED=true and this value
                        as OTEL_ENVIRONMENT into vmd.env. Empty = skip,
@@ -161,6 +170,7 @@ def main() -> int:
     sha = os.environ["SHA"][:8]
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     backup_bucket = os.environ.get("BACKUP_BUCKET", "")
+    backup_upload_concurrency = os.environ.get("BACKUP_UPLOAD_CONCURRENCY", "")
     backup_journal_path = os.environ.get("BACKUP_JOURNAL_PATH", "")
     otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
     control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
@@ -178,6 +188,8 @@ def main() -> int:
     q_sentry_line = shlex.quote(f"SENTRY_DSN={sentry_dsn}")
     q_backup = shlex.quote(backup_bucket)
     q_backup_line = shlex.quote(f"BACKUP_BUCKET={backup_bucket}")
+    q_backup_workers = shlex.quote(backup_upload_concurrency)
+    q_backup_workers_line = shlex.quote(f"BACKUP_UPLOAD_CONCURRENCY={backup_upload_concurrency}")
     q_backup_journal = shlex.quote(backup_journal_path)
     q_backup_journal_line = shlex.quote(f"BACKUP_JOURNAL_PATH={backup_journal_path}")
     q_otel = shlex.quote(otel_environment)
@@ -564,6 +576,14 @@ def main() -> int:
             if [ -n {q_backup} ]; then
                 sudo sed -i '/^BACKUP_BUCKET=/d' /etc/sandbox/vmd.env
                 echo {q_backup_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Upsert BACKUP_UPLOAD_CONCURRENCY (parallel drain workers over
+            # one shared bandwidth cap). Empty = skip, leaving vmd's default
+            # of a single worker.
+            if [ -n {q_backup_workers} ]; then
+                sudo sed -i '/^BACKUP_UPLOAD_CONCURRENCY=/d' /etc/sandbox/vmd.env
+                echo {q_backup_workers_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
             # BACKUP_JOURNAL_PATH (moves the backup uploader's BoltDB journal

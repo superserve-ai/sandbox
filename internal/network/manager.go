@@ -101,6 +101,25 @@ var reclaimScanBarrier = func() {}
 // window keeps every build near its uncontended cost.
 const setupSlotConcurrency = 8
 
+// poolClaimWaitBudget bounds how long a claimant waits on active producers
+// before falling back to an inline build. ClaimWait exits well before this
+// when no producer is active, and honors the caller's ctx throughout.
+const poolClaimWaitBudget = 2 * time.Second
+
+// adoptionClaimWaitBudget applies while an adoption pass is trusted (see
+// Pool.adoptionTrusted): the ramp to the pass's first delivery scales with
+// the candidate count and can span many seconds, and a claimant that gives up
+// inside it builds inline against the adoption churn — the exact stampede
+// this wait prevents. Waiters exit the moment a slot lands, and the budget
+// re-clamps to poolClaimWaitBudget if the pass loses trust mid-wait. Only
+// slot-allocating requests ever pay this.
+const adoptionClaimWaitBudget = 12 * time.Second
+
+// poolWaitLogThreshold samples the satisfied-after-wait log line: waits below
+// it are routine producer handoffs, and logging each would turn a burst into
+// its own log storm. Fallbacks are always logged — they are the alarm signal.
+const poolWaitLogThreshold = 250 * time.Millisecond
+
 type Manager struct {
 	hostInterface string
 	log           zerolog.Logger
@@ -301,7 +320,30 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 			m.registerEgress(vmID, info)
 			return info, nil
 		}
-		m.log.Info().Str("vm_id", vmID).Msg("network pool empty, falling back to on-demand setup")
+		// Empty is usually momentary — a restart adopting the previous run's
+		// slots, or a burst outrunning refill — and the producers are already
+		// holding the kernel locks an inline build would need. Wait briefly
+		// for their output rather than building alongside them; the wait is
+		// bounded and ClaimWait exits early once no producer is active.
+		tWait := time.Now()
+		if info := m.pool.ClaimWait(ctx, vmID); info != nil {
+			m.registerEgress(vmID, info)
+			if waited := time.Since(tWait); waited >= poolWaitLogThreshold {
+				m.log.Info().Str("vm_id", vmID).
+					Int64("pool_wait_ms", waited.Milliseconds()).
+					Msg("pool: claim satisfied after waiting on refill")
+			}
+			return info, nil
+		}
+		// A nil wait result can mean cancellation, not exhaustion — a dead
+		// request must not enter the inline path, whose slot-index claim can
+		// trigger reclaim scans over the full namespace table.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		m.log.Info().Str("vm_id", vmID).
+			Int64("pool_wait_ms", time.Since(tWait).Milliseconds()).
+			Msg("network pool empty, falling back to on-demand setup")
 	}
 
 	idx, err := m.claimSlotIndex(vmID)

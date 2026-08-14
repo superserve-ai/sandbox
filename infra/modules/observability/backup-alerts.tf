@@ -72,11 +72,15 @@ locals {
       # bytes; 2s p99 catches that while tolerating the occasional large
       # staged overlay. The 1h rate window keeps the quantile meaningful
       # on a low-traffic cell.
-      metric_type   = "prometheus.googleapis.com/backup_pause_hook_duration_seconds/histogram"
-      extra_filter  = ""
-      comparison    = "COMPARISON_GT"
-      threshold     = var.backup_alerts.pause_hook_p99_seconds
-      aligner       = "ALIGN_PERCENTILE_99"
+      metric_type  = "prometheus.googleapis.com/backup_pause_hook_duration_seconds/histogram"
+      extra_filter = ""
+      comparison   = "COMPARISON_GT"
+      threshold    = var.backup_alerts.pause_hook_p99_seconds
+      # Prometheus histograms ingest as CUMULATIVE distributions, which
+      # percentile ALIGNERS reject: the recipe is delta-align the
+      # cumulative series, then percentile-REDUCE across them.
+      aligner       = "ALIGN_DELTA"
+      reducer       = "REDUCE_PERCENTILE_99"
       duration      = "1800s"
       documentation = <<-EOT
         The p99 of the synchronous backup hook on the pause RPC path on ${var.backup_alerts.host_id} exceeded ${var.backup_alerts.pause_hook_p99_seconds}s for 30 minutes. This latency is paid by every pause the control plane issues.
@@ -148,8 +152,9 @@ resource "google_monitoring_alert_policy" "backup" {
       threshold_value = each.value.threshold
       duration        = each.value.duration
       aggregations {
-        alignment_period   = "60s"
-        per_series_aligner = each.value.aligner
+        alignment_period     = "60s"
+        per_series_aligner   = each.value.aligner
+        cross_series_reducer = try(each.value.reducer, null)
       }
       trigger {
         count = 1
@@ -244,8 +249,9 @@ resource "google_monitoring_alert_policy" "host_disk" {
       threshold_value = each.value.threshold
       duration        = each.value.duration
       aggregations {
-        alignment_period   = "60s"
-        per_series_aligner = each.value.aligner
+        alignment_period     = "60s"
+        per_series_aligner   = each.value.aligner
+        cross_series_reducer = try(each.value.reducer, null)
       }
       trigger {
         count = 1
