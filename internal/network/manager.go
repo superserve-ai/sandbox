@@ -1606,18 +1606,21 @@ func pidsInNs(name string) (pids []int, ok bool) {
 	return pids, true
 }
 
-// occupiedNamespaces reports which named network namespaces have at least
-// one live process, from a SINGLE /proc pass — the per-slot pidsInNs scan
-// costs a full /proc readdir each, which is exactly the multiplier the
-// receipt fast path exists to remove. ok=false means /proc itself was
-// unreadable: "don't know", never "all clear".
-func occupiedNamespaces() (occupied map[string]bool, ok bool) {
+// occupiedNamespaces reports every named network namespace (names) and which
+// of them have at least one live process (occupied), from ONE netns readdir
+// and ONE /proc pass — the per-slot pidsInNs scan costs a full /proc readdir
+// each, which is exactly the multiplier the receipt fast path exists to
+// remove. ok=false means a directory was unreadable: "don't know", never
+// "all clear".
+func occupiedNamespaces() (names, occupied map[string]bool, ok bool) {
 	entries, err := os.ReadDir(netnsDir)
 	if err != nil {
-		return nil, false
+		return nil, nil, false
 	}
+	names = make(map[string]bool, len(entries))
 	inoToName := make(map[uint64]string, len(entries))
 	for _, e := range entries {
+		names[e.Name()] = true
 		st, err := os.Stat(netnsDir + "/" + e.Name())
 		if err != nil {
 			continue
@@ -1626,7 +1629,7 @@ func occupiedNamespaces() (occupied map[string]bool, ok bool) {
 	}
 	procs, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil, false
+		return nil, nil, false
 	}
 	occupied = make(map[string]bool)
 	for _, e := range procs {
@@ -1644,7 +1647,7 @@ func occupiedNamespaces() (occupied map[string]bool, ok bool) {
 			occupied[name] = true
 		}
 	}
-	return occupied, true
+	return names, occupied, true
 }
 
 // listHostVeths returns all veth-N interfaces visible in the host namespace.

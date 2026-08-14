@@ -3,7 +3,6 @@ package network
 import (
 	"context"
 	"errors"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -712,16 +711,10 @@ func (p *Pool) adoptFromReceipt(ctx context.Context, candidates []int) (remainin
 		preferRecycled[idx] = true
 	}
 
-	occupied, ok := occupiedNamespaces()
+	nsSet, occupied, ok := occupiedNamespaces()
 	if !ok {
-		p.log.Warn().Msg("pool: /proc scan failed — receipt discarded, full adoption for all candidates")
+		p.log.Warn().Msg("pool: namespace/proc scan failed — receipt discarded, full adoption for all candidates")
 		return candidates, 0
-	}
-	nsSet := make(map[string]bool)
-	if entries, err := os.ReadDir(netnsDir); err == nil {
-		for _, e := range entries {
-			nsSet[e.Name()] = true
-		}
 	}
 	vethSet := make(map[string]bool)
 	if veths, err := listHostVeths(); err == nil {

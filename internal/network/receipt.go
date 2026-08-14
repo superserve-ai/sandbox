@@ -199,7 +199,13 @@ var fastAdoptSlotTimeout = 3 * time.Second
 
 // fastAdoptVouched runs the cheap validation a vouched slot must still pass
 // before rejoining inventory: namespace present, host veth present, zero
-// occupants (from the caller's single batched /proc scan), and — inside the
+// occupants (from the caller's single batched /proc scan — advisory triage,
+// not the safety boundary: every candidate is pool-OWNED from the moment
+// claimOrphanSlots claimed it, launches only ever enter namespaces via a
+// claimed pool slot or a freshly claimed free index, and running VMs' slots
+// are record-owned and never candidates, so nothing can enter a candidate's
+// namespace between this scan and the rebuild; the full path's kill/poll
+// relies on the same ownership exclusion across its own gap), and — inside the
 // namespace — the tap device present and the firewall ruleset rebuilt from
 // current policy (in-process netlink; requires the zero-occupant guarantee,
 // as the rebuild briefly drops enforcement). No kill/poll, no route
