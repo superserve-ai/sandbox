@@ -90,6 +90,7 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	registered := false
+	reclaimed := false
 	beat := func(q *db.Queries) (status, prevStatus string, _ error) {
 		host, err := q.GetHostForUpdate(ctx, hostID)
 		if err == pgx.ErrNoRows {
@@ -133,6 +134,7 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 			}); err != nil {
 				return "", "", err
 			}
+			reclaimed = true
 			log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
 				Msg("host identity reclaimed from a silent holder")
 		}
@@ -183,6 +185,12 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 	if registered {
 		log.Info().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
 			Str("region", req.Region).Msg("host self-registered as provisioning")
+	}
+	if reclaimed && h.Hosts != nil {
+		// The row's vmd_addr changed; a cached client still dials the old
+		// machine (the registry only self-evicts on dead transports, and a
+		// live old daemon would silently take the wrong host's RPCs).
+		h.Hosts.Invalidate(hostID)
 	}
 	if prevStatus == "unhealthy" && status == "active" {
 		// The heartbeat just recovered this host; drop the scheduler's cached
