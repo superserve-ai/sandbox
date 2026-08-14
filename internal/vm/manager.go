@@ -984,7 +984,9 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 		// underneath it is the wedge the stop exists to prevent.
 		stopFailed := false
 		stopSpawned := func() {
-			if serr := m.stopVM(context.WithoutCancel(ctx), vmID, actual); serr != nil {
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coldBootStopBudget)
+			defer cancel()
+			if serr := m.stopVM(sctx, vmID, actual); serr != nil {
 				stopFailed = true
 				log.Error().Err(serr).Msg("stop spawned VM after failed cold boot; residue left for forced teardown")
 			}
@@ -3883,6 +3885,13 @@ func (m *Manager) instanceClaimsCgroup(vmID string) bool {
 // could not be confirmed stopped; its resources and error record were
 // deliberately retained for a forced teardown.
 var errSpawnedStopUnconfirmed = errors.New("spawned VM stop unconfirmed")
+
+// coldBootStopBudget bounds the detached stop of a spawned VM after a
+// failed cold boot: detachment protects the stop from the caller's spent
+// deadline, but an unbounded stop would let a hung systemctl wedge the
+// lifecycle path indefinitely (see stopUnitBudget for the same
+// discipline).
+const coldBootStopBudget = 30 * time.Second
 
 // lockRecordOwner acquires vmID's record-ownership mutex (see
 // recordOwnerMus) and returns its unlock.

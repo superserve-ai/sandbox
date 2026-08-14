@@ -201,7 +201,11 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	teardownFailed := false
 	teardownSelf := func(c context.Context) {
 		selfDestroys++
-		if derr := m.DestroyVM(c, vmID, true); derr != nil {
+		// Detached from the RPC's deadline but bounded: a hung stop must
+		// not wedge the RPC and the per-VM lifecycle lock indefinitely.
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(c), reviveTeardownBudget)
+		defer cancel()
+		if derr := m.DestroyVM(dctx, vmID, true); derr != nil {
 			teardownFailed = true
 			m.log.Error().Err(derr).Str("vm_id", vmID).Msg("teardown after failed revival did not confirm; record left as-is")
 		}
@@ -233,6 +237,17 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// authoritative and revival must not recreate the sandbox.
 	if m.destroyEpoch(vmID) != epochAtRead+1 {
 		return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while revival was preparing; the destroy is authoritative", vmID)
+	}
+	// The salvage copy can take minutes on a full disk, and a vmd crash
+	// there must not leave the sandbox recordless: revival refuses
+	// unknown sandboxes, so a missing record bricks every retry. The
+	// zombie record returns to the store for the copy's duration; the
+	// boot's seeded persists overwrite it truthfully, and the failure
+	// and destroy paths handle it from there.
+	if m.state != nil {
+		if perr := m.state.Put(*prevRec); perr != nil {
+			return nil, status.Errorf(codes.Internal, "keep record across boot: %v", perr)
+		}
 	}
 	teardownDur := time.Since(reviveStart)
 	// The revived VM lives under the fleet's real supervision, seeded
@@ -330,11 +345,12 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// replacement goes too.
 	externallyDestroyed := m.destroyEpoch(vmID) != epochBase+selfDestroys
 	if !stillTracked || beingDestroyed || externallyDestroyed {
-		if externallyDestroyed && stillTracked && !beingDestroyed {
-			teardownSelf(context.WithoutCancel(ctx))
-		} else if wrote {
-			m.deleteState(vmID)
-		}
+		// Whatever the interleaving, the replacement or its residue must
+		// go: a destroy that raced the boot may have missed the spawned
+		// process or the just-written record (it can complete before
+		// either exists), and DestroyVM force-cleans residue even for
+		// untracked VMs, serializing behind any destroy still in flight.
+		teardownSelf(context.WithoutCancel(ctx))
 		committed = true
 		return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while revival was completing", vmID)
 	}
@@ -370,3 +386,9 @@ func statRegularFile(path string) bool {
 // boots run full guest init (no warm memory image), so this is more
 // generous than the resume budget.
 const reviveBoxdReadyBudget = 90 * time.Second
+
+// reviveTeardownBudget bounds a failed revival's teardown: DestroyVM
+// stops the unit or cgroup, releases the slot, and clears the run
+// directory, so it gets more room than a bare unit stop, but never an
+// unbounded hold on the RPC and lifecycle lock.
+const reviveTeardownBudget = 60 * time.Second
