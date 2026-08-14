@@ -739,7 +739,7 @@ func (p *Pool) adoptFromReceipt(ctx context.Context, candidates []int) (remainin
 		}
 	}
 
-	var demoted int64
+	var demoted, quarantined int64
 	var timeouts atomic.Int64
 	var mu sync.Mutex
 	work := make(chan int)
@@ -752,7 +752,17 @@ func (p *Pool) adoptFromReceipt(ctx context.Context, candidates []int) (remainin
 			for idx := range work {
 				slot, timedOut := p.fastAdoptVouched(idx, nsSet, vethSet, occupied)
 				if timedOut {
+					// The abandoned validator may still be mutating this
+					// namespace; the index must not re-enter ANY path this
+					// boot. Release it — the nsExists guard keeps the index
+					// from being rebuilt while the namespace lives, the leak
+					// gauge surfaces it, and the next boot re-adopts it.
 					timeouts.Add(1)
+					p.mgr.releaseIfOwned(idx, poolOwner)
+					mu.Lock()
+					quarantined++
+					mu.Unlock()
+					continue
 				}
 				if slot == nil {
 					mu.Lock()
@@ -815,7 +825,8 @@ feed:
 	workers.Wait()
 
 	p.log.Info().Int("vouched", len(toValidate)).Int64("placed", placed).
-		Int64("demoted", demoted).Int("unvouched", len(candidates)-len(toValidate)).
+		Int64("demoted", demoted).Int64("quarantined", quarantined).
+		Int("unvouched", len(candidates)-len(toValidate)).
 		Int64("fast_path_ms", time.Since(tStart).Milliseconds()).
 		Msg("pool: receipt fast adoption complete")
 	return remaining, placed

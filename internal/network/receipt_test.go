@@ -535,7 +535,27 @@ func TestFastAdopt_TimeoutDemotesAndAborts(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("adoption hung on wedged fast-path validation")
 	}
-	if adopted != slots || fullPath.Load() != slots {
-		t.Fatalf("every wedged slot must reach the full path: adopted=%d fullPath=%d", adopted, fullPath.Load())
+	// Timed-out slots must be RELEASED for a later boot — their abandoned
+	// validators may still be mutating the namespace, so republishing them
+	// this boot (fast or full path) would risk a claimed sandbox's rules.
+	// Only the never-dispatched remainder (after the systemic abort) may
+	// take the full path. Every index must land in exactly one bucket.
+	if adopted != fullPath.Load() {
+		t.Fatalf("full path adopted %d but pass counted %d", fullPath.Load(), adopted)
+	}
+	m.mu.Lock()
+	var released int64
+	for i := 1; i <= slots; i++ {
+		if _, owned := m.slotOwner[i]; !owned {
+			released++
+		}
+	}
+	m.mu.Unlock()
+	if released == 0 {
+		t.Fatal("wedged validation must release at least the timed-out slots")
+	}
+	if released+adopted != slots {
+		t.Fatalf("slots must split between released and adopted: released=%d adopted=%d of %d",
+			released, adopted, slots)
 	}
 }

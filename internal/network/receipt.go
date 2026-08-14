@@ -285,13 +285,19 @@ func (p *Pool) fastAdoptVouched(idx int, nsSet, vethSet map[string]bool, occupie
 		}, false
 	case <-time.After(fastAdoptSlotTimeout):
 		// Abandon the pinned worker; when it eventually finishes, its handle
-		// must not leak.
+		// must not leak. CRITICALLY, the caller must NOT route this index
+		// anywhere this boot: the abandoned worker may still be mid-rebuild
+		// inside the namespace, and republishing the slot would let it wipe
+		// a claimed sandbox's rules when it wakes. Timed-out slots are
+		// released and left for the next boot, mirroring the full path's
+		// timeout semantics — only failures whose validator provably
+		// finished (an error or panic result) may demote to the full path.
 		go func() {
 			if r := <-resCh; r.fw != nil {
 				_ = r.fw.Close()
 			}
 		}()
-		p.log.Warn().Int("slot", idx).Msg("pool: vouched slot validation timed out — demoting to full adoption")
+		p.log.Warn().Int("slot", idx).Msg("pool: vouched slot validation timed out — releasing for a later boot")
 		return nil, true
 	}
 }
