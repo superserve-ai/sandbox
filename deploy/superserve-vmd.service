@@ -43,6 +43,13 @@ EnvironmentFile=/etc/sandbox/vmd.env
 
 LimitNOFILE=65536
 
+# No CPUWeight/IOWeight here: this unit lives under system.slice while
+# every VM lives under sandboxes.slice, and cgroup weights only compare
+# siblings — a weight set here biases vmd against journald and the
+# proxy, not against the VMs. The VM-vs-everything split is set where
+# that contention actually resolves: sandboxes.slice (see
+# deploy/sandboxes.slice).
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=vmd
