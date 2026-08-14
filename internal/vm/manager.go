@@ -3917,6 +3917,16 @@ func (m *Manager) lockRecordOwner(vmID string) func() {
 	return mu.Unlock
 }
 
+// recordRevivalPending reports whether vmID's durable record is marked
+// as an in-flight revival's retry anchor (see VMRecord.RevivalPending).
+func (m *Manager) recordRevivalPending(vmID string) bool {
+	if m.state == nil {
+		return false
+	}
+	rec, err := m.state.Get(vmID)
+	return err == nil && rec != nil && rec.RevivalPending
+}
+
 // destroyEpoch reads vmID's completed-destroy counter.
 func (m *Manager) destroyEpoch(vmID string) uint64 {
 	v, _ := m.destroyEpochs.LoadOrStore(vmID, new(uint64))

@@ -733,6 +733,14 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			r.clearDrift("errdead:" + id)
 			return
 		}
+		// A parked revival anchor is not an ordinary dead Error record:
+		// the operator's retry needs it to pass the known-sandbox guard,
+		// so reaping it would recreate exactly the unrecoverable state
+		// the marker exists to prevent. The operator's revive or an
+		// explicit destroy retires it.
+		if r.mgr.recordRevivalPending(id) {
+			return
+		}
 		if !r.gracePeriodElapsed("errdead:"+id, now) {
 			return
 		}

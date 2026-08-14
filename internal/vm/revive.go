@@ -294,6 +294,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		inst.PreviewPorts = previewPortsFromRecord(prevRec.PreviewPorts, prevRec.PreviewPortAccess, prevRec.PreviewPortTokenVersions)
 		inst.PreviewPolicyRevision = prevRec.PreviewPolicyRevision
 		inst.PreviewTokenPolicyRevision = prevRec.PreviewTokenPolicyRevision
+		inst.Metadata = prevRec.Metadata
 	}
 	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, rules, seed, true, supervision, vcpu, memMiB)
 	if err != nil {
