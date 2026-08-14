@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -53,16 +54,26 @@ type ManifestFile struct {
 	Extents    []Extent `json:"extents"`
 }
 
-// Uploader drains the journal into the blob store. Single drain loop:
-// fleet-wide churn is tens of GB/day, so one bandwidth-capped stream is
-// deliberate simplicity, not a bottleneck.
+// Uploader drains the journal into the blob store with Concurrency
+// workers sharing one bandwidth cap. The journal's claim mechanism hands
+// each worker a distinct task; per-task overhead (digest pre-check, GCS
+// round trips) rather than bandwidth is what bounds drain throughput at
+// the fleet's pause rates, so workers raise task throughput while the
+// shared limiter keeps total egress exactly where one stream held it.
 type Uploader struct {
 	Journal *Journal
 	Store   BlobStore
 	// Limiter caps upload bandwidth in bytes/sec so backups never starve
-	// guest traffic or the UFFD resume path.
+	// guest traffic or the UFFD resume path. One instance shared by every
+	// worker BY DESIGN: a per-worker limiter would multiply the cap by
+	// the worker count.
 	Limiter *rate.Limiter
-	Log     zerolog.Logger
+	// Concurrency is the number of drain workers; 0 or less means 1.
+	// Deliberately a fixed count rather than derived from host cores: the
+	// budget being spent is what backup work takes from tenant VMs, not
+	// what the host has.
+	Concurrency int
+	Log         zerolog.Logger
 	// VMDVersion is stamped into generation manifests.
 	VMDVersion string
 	// OnVerified fires after a task's generation is fully in the bucket
@@ -77,7 +88,8 @@ type Uploader struct {
 	// Tick is the idle poll interval. 0 → 1s.
 	Tick time.Duration
 	// notifyRetryAt gates the next delivery attempt after a failed one.
-	// Touched only from Run's goroutine (ack and idle flushes).
+	// Read and written only under notifyMu (flushNotifications holds it
+	// for the whole flush), which keeps it race-free across workers.
 	notifyRetryAt time.Time
 	// LegacyStagingRoot is a retired staging location still referenced
 	// by journal rows enqueued before a relocation. It is swept with the
@@ -97,6 +109,44 @@ type Uploader struct {
 	// metrics error can never affect backup behavior: the recorder only
 	// observes, it is never consulted.
 	Metrics *telemetry.BackupRecorder
+
+	// notifyMu lets concurrent workers skip a flush another worker is
+	// already running rather than delivering the same outbox entries
+	// twice back-to-back. Correctness never depends on it: delivery is
+	// at-least-once and the outbox persists anything a skipped flush
+	// would have sent.
+	notifyMu sync.Mutex
+
+	// sharedMu guards sharedLocks, the per-object serialization for
+	// shared-base uploads. Two generations referencing the same
+	// not-yet-verified base would otherwise both stream the multi-GB
+	// object concurrently — create-only means one loses the finalize
+	// precondition after the shared limiter already spent double the
+	// bandwidth on identical bytes. The second worker instead waits for
+	// the first and reuses its recorded verification. Entries are one
+	// mutex per distinct base object seen this process and are never
+	// removed: the population is bounded by template versions, not
+	// generations.
+	sharedMu    sync.Mutex
+	sharedLocks map[string]*sync.Mutex
+}
+
+// lockShared serializes shared-object uploads per object name, returning
+// the unlock. Generation-scoped objects never need this: the journal's
+// claims already make each generation exclusive to one worker.
+func (u *Uploader) lockShared(object string) func() {
+	u.sharedMu.Lock()
+	if u.sharedLocks == nil {
+		u.sharedLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := u.sharedLocks[object]
+	if !ok {
+		mu = &sync.Mutex{}
+		u.sharedLocks[object] = mu
+	}
+	u.sharedMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (u *Uploader) clock() time.Time {
@@ -150,6 +200,31 @@ func (u *Uploader) Run(ctx context.Context) error {
 	// Deliver completion signals a previous process acked but never
 	// notified: the outbox is the only record of those.
 	u.flushNotifications()
+	n := u.Concurrency
+	if n < 1 {
+		n = 1
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		// Exactly one worker owns the staging sweep and the completion
+		// seeding: both are journal-global work, and N workers each
+		// running them would multiply directory walks and seed-cursor
+		// contention without finishing either any faster.
+		go func(sweeper bool) {
+			defer wg.Done()
+			u.drainLoop(ctx, tick, sweeper, sweeper && seeding)
+		}(i == 0)
+	}
+	wg.Wait()
+	return nil
+}
+
+// drainLoop is one worker: it drains claimed tasks until ctx ends,
+// backing off on idle and errors. The sweeper additionally runs the
+// periodic staged-base sweep and, when seeding, the bounded
+// per-iteration outbox seed chunks.
+func (u *Uploader) drainLoop(ctx context.Context, tick time.Duration, sweeper, seeding bool) {
 	lastSweep := u.clock()
 	for {
 		if seeding {
@@ -164,12 +239,12 @@ func (u *Uploader) Run(ctx context.Context) error {
 		// backlog would be drained (and pointlessly nacked) task by task
 		// before the idle select ever observed cancellation.
 		if ctx.Err() != nil {
-			return nil
+			return
 		}
 		worked, err := u.drainOne(ctx, u.clock())
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return
 			}
 			u.Log.Error().Err(err).Msg("backup drain error")
 		}
@@ -178,7 +253,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 		if !worked || err != nil {
 			select {
 			case <-ctx.Done():
-				return nil
+				return
 			case <-time.After(tick):
 			}
 			// Retry any undelivered completion signal on the idle tick:
@@ -192,7 +267,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 		// periodically. Deliberately OUTSIDE the idle branch: a host
 		// with a standing backlog never idles, and the sweep must not
 		// starve exactly when staged residue accumulates fastest.
-		if u.StagingRoot != "" && u.clock().Sub(lastSweep) > stagingSweepInterval {
+		if sweeper && u.StagingRoot != "" && u.clock().Sub(lastSweep) > stagingSweepInterval {
 			lastSweep = u.clock()
 			SweepStaging(u.StagingRoot, u.Journal, u.Log)
 			u.sweepLegacyStaging()
@@ -268,6 +343,9 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 		if cur, ok, lerr := u.Journal.Load(task); lerr == nil && ok && cur.Staged {
 			task.logOwner(u.Log.Info()).
 				Msg("abandoned mutable-path attempt; staged row retained for retry")
+			// Neither acked nor nacked: free the claim explicitly so the
+			// retained row is drainable now, not after the lease expires.
+			u.Journal.Release(task)
 			u.Metrics.RecordUpload(ctx, telemetry.BackupUploadFailed, u.clock().Sub(start))
 			return true, nil
 		}
@@ -343,6 +421,16 @@ func (u *Uploader) flushNotifications() {
 	if u.OnVerified == nil {
 		return
 	}
+	// One flush at a time: a second worker arriving mid-flush would read
+	// the same not-yet-cleared entries and double-deliver immediately.
+	// Skipping is safe — anything it would have sent is still outboxed
+	// and goes with the next ack or idle flush. The mutex also makes it
+	// the only guard notifyRetryAt needs: every read and write of that
+	// field happens while holding it.
+	if !u.notifyMu.TryLock() {
+		return
+	}
+	defer u.notifyMu.Unlock()
 	if !u.notifyRetryAt.IsZero() && time.Now().Before(u.notifyRetryAt) {
 		return
 	}
@@ -656,18 +744,6 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 	if err != nil {
 		return ManifestFile{}, 0, fmt.Errorf("extents %s: %w", file.Path, err)
 	}
-	// Verify the source still matches the digest recorded at pause time
-	// before any bytes ship: a cheap early abort for the common mutation
-	// case (the sandbox resumed before the drain).
-	sum, err := hashApparent(ctx, f, extents, apparent)
-	if err != nil {
-		return ManifestFile{}, 0, fmt.Errorf("verify %s: %w", file.Path, err)
-	}
-	if sum != file.SHA256 {
-		task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
-			Msg("backup source changed since pause; abandoning generation")
-		return ManifestFile{}, 0, errSourceChanged
-	}
 	// The object name embeds the packing fingerprint: a retry over a
 	// physically relaid file (same apparent content, different extents)
 	// maps to a fresh object instead of deduping against bytes packed with
@@ -688,15 +764,31 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		}
 	}
 	if file.Shared {
-		// Skip the stream when this host already verified these exact
-		// object bytes: shared bases are multi-GB, and every generation
-		// on the template re-references the same object, so streaming
-		// just to discover the create-only 412 at finalize would pin the
-		// bandwidth cap on redundant bytes and put the drain loop
-		// permanently behind the pause arrival rate. The local source
-		// was pre-verified above, the name embeds digest and packing
-		// fingerprint, and the extent table here describes this host's
-		// packing of content the history already vouches for.
+		// Serialize per shared object BEFORE any expensive work — the
+		// name needs only the extent scan, not the hash. Two workers
+		// whose generations reference the same not-yet-verified base
+		// would otherwise each hash and then both stream the multi-GB
+		// object (create-only makes the loser's full stream pure waste
+		// under the shared bandwidth cap, and the duplicate hashes are
+		// full-file reads on the same loaded host). The waiter blocks
+		// here while the winner hashes and streams, then finds the
+		// winner's verification below and skips both. Held for the rest
+		// of the upload by design — that IS the serialization. Lock scope
+		// is a single uploadFile call, so no worker ever holds two shared
+		// locks (no ordering deadlock).
+		defer u.lockShared(object)()
+		// Skip hash and stream when this host already verified these
+		// exact object bytes: shared bases are multi-GB, and every
+		// generation on the template re-references the same object, so
+		// re-proving the local source buys nothing for an object whose
+		// stored bytes the history already vouches for — no bytes ship on
+		// this path, and the manifest's digest describes the bucket
+		// object, not the local file. A locally mutated base cannot ride
+		// this skip: same-layout mutation changes nothing (the object
+		// still holds the verified original matching the recorded
+		// digest), and layout-changing mutation changes the packing
+		// fingerprint, missing the history and falling through to the
+		// hash below.
 		verified, _ := u.verifiedHere(task, object)
 		if verified {
 			u.Log.Info().Str("object", object).
@@ -710,6 +802,19 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 				Extents:    extents,
 			}, 0, nil
 		}
+	}
+	// Verify the source still matches the digest recorded at pause time
+	// before any bytes ship: a cheap early abort for the common mutation
+	// case (the sandbox resumed before the drain). After the shared skip
+	// above, so an already-verified base is never re-read at all.
+	sum, err := hashApparent(ctx, f, extents, apparent)
+	if err != nil {
+		return ManifestFile{}, 0, fmt.Errorf("verify %s: %w", file.Path, err)
+	}
+	if sum != file.SHA256 {
+		task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
+			Msg("backup source changed since pause; abandoning generation")
+		return ManifestFile{}, 0, errSourceChanged
 	}
 	// The stream hasher digests the apparent content of what is ACTUALLY
 	// shipped (packed bytes as streamed, zeros for the holes), closing the

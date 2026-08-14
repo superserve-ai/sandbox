@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -384,14 +385,19 @@ func TestPromotionWhileTaskInFlight(t *testing.T) {
 		if n := pendingTotal(j); n != 1 {
 			t.Fatalf("pending after verification = %d, want exactly one row", n)
 		}
-		got, ok, err := j.Next(time.Unix(20, 0))
+		// Mid-flight verification keeps the caller's claim (the worker is
+		// still uploading), so the row stays invisible to other workers
+		// until resolution or lease expiry; scan past the TTL to observe
+		// the single surviving row.
+		reclaimAt := time.Unix(20, 0).Add(claimTTL)
+		got, ok, err := j.Next(reclaimAt)
 		if err != nil || !ok {
 			t.Fatalf("Next: %v %v", ok, err)
 		}
 		if got.Priority != PriorityPause {
 			t.Fatalf("row priority = %d, want the promotion kept", got.Priority)
 		}
-		if verified, err := j.WasVerified("obj-1", time.Unix(20, 0)); err != nil || !verified {
+		if verified, err := j.WasVerified("obj-1", reclaimAt); err != nil || !verified {
 			t.Fatalf("WasVerified = %v (err %v), want the history recorded", verified, err)
 		}
 	})
@@ -469,6 +475,308 @@ func TestJournalOutboxDepth(t *testing.T) {
 	}
 	if depth, err := j.OutboxDepth(); err != nil || depth != 0 {
 		t.Fatalf("outbox depth after clear = %d err=%v, want 0", depth, err)
+	}
+}
+
+// Concurrent drain workers must each receive a distinct task: Next
+// claims what it returns until Ack or Nack resolves it.
+func TestNextClaimsTasksForConcurrentWorkers(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	for _, task := range []Task{
+		{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base},
+		{SandboxID: "sb-b", Generation: "bbb", Priority: PriorityPause, EnqueuedAt: base.Add(time.Second)},
+	} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := base.Add(time.Minute)
+	first, ok, err := j.Next(now)
+	if err != nil || !ok || first.SandboxID != "sb-a" {
+		t.Fatalf("first Next = %+v/%v/%v, want sb-a", first, ok, err)
+	}
+	// A second worker draining while the first is mid-upload gets the
+	// NEXT task, not the same one.
+	second, ok, err := j.Next(now)
+	if err != nil || !ok || second.SandboxID != "sb-b" {
+		t.Fatalf("second Next = %+v/%v/%v, want sb-b", second, ok, err)
+	}
+	// Both claimed: a third worker finds nothing runnable.
+	if _, ok, err := j.Next(now); err != nil || ok {
+		t.Fatalf("third Next = %v/%v, want nothing runnable", ok, err)
+	}
+}
+
+// Ack and Nack release the claim: an acked task's slot frees for the
+// tier behind it, a nacked task returns (deferred) rather than staying
+// claim-locked forever.
+func TestAckAndNackReleaseClaims(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	task := Task{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	now := base.Add(time.Minute)
+	got, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	if err := j.Nack(got, now); err != nil {
+		t.Fatal(err)
+	}
+	// The nacked task is deferred by backoff, not claim-locked: past its
+	// NotBefore it drains again.
+	redo, ok, err := j.Next(now.Add(time.Hour))
+	if err != nil || !ok || redo.Attempts != 1 {
+		t.Fatalf("Next after Nack = %+v/%v/%v, want attempts=1", redo, ok, err)
+	}
+	if _, err := j.Ack(redo, "bucket", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := j.Next(now.Add(2 * time.Hour)); err != nil || ok {
+		t.Fatalf("Next after Ack = %v/%v, want empty queue", ok, err)
+	}
+	// The claim table must not leak resolved entries.
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.claims) != 0 {
+		t.Fatalf("claims after resolution = %v, want empty", j.claims)
+	}
+}
+
+// A claimed pause task must not wall off the rest of the queue: the scan
+// skips it individually (unlike a deferred head, which proves its whole
+// tier unready) and continues into lower tiers when the claimant's tier
+// is exhausted.
+func TestClaimedHeadDoesNotBlockTierOrQueue(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	for _, task := range []Task{
+		{SandboxID: "sb-pause", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base},
+		{TemplateID: "tpl", BuildID: "b1", Generation: "ccc", Priority: PriorityCheckpoint, EnqueuedAt: base},
+	} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := base.Add(time.Minute)
+	first, ok, err := j.Next(now)
+	if err != nil || !ok || first.SandboxID != "sb-pause" {
+		t.Fatalf("first Next = %+v/%v/%v, want the pause task", first, ok, err)
+	}
+	// With the only pause task claimed, a second worker reaches the
+	// checkpoint tier instead of idling behind the claim.
+	second, ok, err := j.Next(now)
+	if err != nil || !ok || second.TemplateID != "tpl" {
+		t.Fatalf("second Next = %+v/%v/%v, want the checkpoint task", second, ok, err)
+	}
+}
+
+// A claim left unresolved past its lease (wedged worker) expires and the
+// task becomes drainable again.
+func TestClaimExpiryReclaims(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	task := Task{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	now := base.Add(time.Minute)
+	if _, ok, err := j.Next(now); err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	if _, ok, err := j.Next(now.Add(claimTTL - time.Second)); err != nil || ok {
+		t.Fatalf("Next within lease = %v/%v, want claim held", ok, err)
+	}
+	redo, ok, err := j.Next(now.Add(claimTTL))
+	if err != nil || !ok || redo.SandboxID != "sb-a" {
+		t.Fatalf("Next past lease = %+v/%v/%v, want the task reclaimed", redo, ok, err)
+	}
+}
+
+// Release frees a claim without resolving the task: the retained-row
+// drain outcome leaves the row queued, and it must be drainable
+// immediately rather than after the lease expires.
+func TestReleaseFreesUnresolvedClaim(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	task := Task{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	now := base.Add(time.Minute)
+	got, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	if _, ok, err := j.Next(now); err != nil || ok {
+		t.Fatalf("Next while claimed = %v/%v, want nothing", ok, err)
+	}
+	j.Release(got)
+	redo, ok, err := j.Next(now)
+	if err != nil || !ok || redo.Attempts != 0 {
+		t.Fatalf("Next after Release = %+v/%v/%v, want the task back untouched", redo, ok, err)
+	}
+}
+
+// A worker that outlives its lease is fenced: once another worker claims
+// the row, the stale worker's Ack, Nack, and Release are all refused,
+// and the thief's resolution is the one that lands.
+func TestStaleWorkerIsFencedAfterLeaseSteal(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	task := Task{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	now := base.Add(time.Minute)
+	stale, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	// The lease lapses and a second worker claims the same row.
+	thief, ok, err := j.Next(now.Add(claimTTL))
+	if err != nil || !ok || thief.ClaimToken == stale.ClaimToken {
+		t.Fatalf("steal Next = %+v/%v/%v, want a fresh claim", thief, ok, err)
+	}
+	// Every stale resolution is refused and leaves the row alone.
+	if _, err := j.Ack(stale, "bucket", false); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("stale Ack err = %v, want errClaimStolen", err)
+	}
+	if err := j.Nack(stale, now.Add(claimTTL)); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("stale Nack err = %v, want errClaimStolen", err)
+	}
+	j.Release(stale)
+	if counts, err := j.Pending(); err != nil || counts[PriorityPause] != 1 {
+		t.Fatalf("pending after stale resolutions = %v/%v, want the row intact", counts, err)
+	}
+	// The row stays claimed by the thief despite the stale Release.
+	if _, ok, err := j.Next(now.Add(claimTTL + time.Minute)); err != nil || ok {
+		t.Fatalf("Next while thief holds claim = %v/%v, want nothing", ok, err)
+	}
+	// The thief's resolution is authoritative.
+	if _, err := j.Ack(thief, "bucket", false); err != nil {
+		t.Fatal(err)
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("pending after thief Ack = %v, want empty", counts)
+	}
+}
+
+// The claim token only fences while the claim is live; once the
+// replacement worker resolves the row, the durable row state must keep
+// fencing the stale worker. A stale Ack after the thief's Nack must not
+// delete the index now pointing at the re-keyed row, and a stale Nack
+// after the thief's Ack must not resurrect the acked row.
+func TestStaleResolutionFencedAfterThiefResolves(t *testing.T) {
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	now := base.Add(time.Minute)
+
+	// Thief nacks (row re-keyed), then the stale worker's Ack is refused
+	// and the index still resolves the pending generation.
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	stale, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	thief, ok, err := j.Next(now.Add(claimTTL))
+	if err != nil || !ok {
+		t.Fatalf("steal Next = %v/%v", ok, err)
+	}
+	if err := j.Nack(thief, now.Add(claimTTL)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(stale, "bucket", false); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("stale Ack after thief Nack = %v, want errClaimStolen", err)
+	}
+	if pending, err := j.HasPending("sb-a", "aaa"); err != nil || !pending {
+		t.Fatalf("HasPending = %v/%v, want the re-keyed row still indexed", pending, err)
+	}
+
+	// Thief acks (row gone), then the stale worker's Nack is refused
+	// rather than resurrecting a zombie row.
+	j2, _ := testJournal(t)
+	if err := j2.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	stale2, ok, err := j2.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	thief2, ok, err := j2.Next(now.Add(claimTTL))
+	if err != nil || !ok {
+		t.Fatalf("steal Next = %v/%v", ok, err)
+	}
+	if _, err := j2.Ack(thief2, "bucket", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := j2.Nack(stale2, now.Add(claimTTL)); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("stale Nack after thief Ack = %v, want errClaimStolen", err)
+	}
+	if counts, _ := j2.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("pending after refused zombie Nack = %v, want empty", counts)
+	}
+}
+
+// RecordVerification is a row write too: a stale worker recording
+// mid-flight progress after its lease was stolen and resolved must not
+// recreate the row — that would forge the durable row-presence evidence
+// Ack and Nack fence on, reopening the exact stale-Ack index deletion
+// the fence exists to prevent.
+func TestStaleRecordVerificationCannotResurrectRow(t *testing.T) {
+	j, _ := testJournal(t)
+	base := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	task := Task{SandboxID: "sb-a", Generation: "aaa", Priority: PriorityPause, EnqueuedAt: base}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	now := base.Add(time.Minute)
+	stale, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("Next = %v/%v", ok, err)
+	}
+	thief, ok, err := j.Next(now.Add(claimTTL))
+	if err != nil || !ok {
+		t.Fatalf("steal Next = %v/%v", ok, err)
+	}
+	if err := j.Nack(thief, now.Add(claimTTL)); err != nil {
+		t.Fatal(err)
+	}
+	// The stale worker's progress write is refused and recreates nothing
+	// — but the verification history survives: those object bytes are
+	// digest-verified in the bucket regardless of who owns the row, and
+	// dropping the record would make the replacement's create-only
+	// dedupe abandon a provably good generation.
+	if err := j.RecordVerification(stale, "bucket\x00obj", now.Add(claimTTL)); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("stale RecordVerification = %v, want errClaimStolen", err)
+	}
+	if verified, err := j.WasVerified("bucket\x00obj", now.Add(claimTTL)); err != nil || !verified {
+		t.Fatalf("WasVerified after refused stale record = %v/%v, want history preserved", verified, err)
+	}
+	// The full attack chain stays closed: the follow-up stale Ack is
+	// still refused and the re-keyed row's index survives.
+	if _, err := j.Ack(stale, "bucket", false); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("stale Ack = %v, want errClaimStolen", err)
+	}
+	if pending, err := j.HasPending("sb-a", "aaa"); err != nil || !pending {
+		t.Fatalf("HasPending = %v/%v, want the re-keyed row still indexed", pending, err)
+	}
+	// A live-claim holder's progress writes still land.
+	redo, ok, err := j.Next(now.Add(claimTTL + time.Hour))
+	if err != nil || !ok {
+		t.Fatalf("reclaim Next = %v/%v", ok, err)
+	}
+	if err := j.RecordVerification(redo, "bucket\x00obj", now.Add(claimTTL+time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if verified, err := j.WasVerified("bucket\x00obj", now.Add(claimTTL+time.Hour)); err != nil || !verified {
+		t.Fatalf("WasVerified = %v/%v after live-claim record", verified, err)
 	}
 }
 
