@@ -297,13 +297,25 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 		// covers, and the error log is the operator signal (with the
 		// abandoned outcome in the upload metric).
 		if task.Attempts+1 >= maxUploadAttempts && !isStoreError(err) && !errors.Is(err, context.Canceled) {
+			cleared, aerr := u.Journal.Ack(task, "", false)
+			if aerr != nil {
+				return true, aerr
+			}
+			if !cleared {
+				// A live pause upgraded the row mid-attempt: the failure
+				// verdict belongs to the stale snapshot, so no data-loss
+				// signal fires and the upgraded row retries on its own
+				// schedule.
+				task.logOwner(u.Log.Info().Err(err)).
+					Str("generation", task.Generation).
+					Msg("retry ceiling reached but a live pause upgraded the row; leaving it queued")
+				u.Metrics.RecordUpload(ctx, telemetry.BackupUploadFailed, u.clock().Sub(start))
+				return true, nil
+			}
 			task.logOwner(u.Log.Error().Err(err)).
 				Str("generation", task.Generation).
 				Int("attempts", task.Attempts+1).
 				Msg("backup upload retries exhausted; abandoning generation")
-			if aerr := u.Journal.Ack(task, "", false); aerr != nil {
-				return true, aerr
-			}
 			removeStagedTask(u.StagingRoot, task)
 			u.Metrics.RecordUpload(ctx, telemetry.BackupUploadAbandoned, u.clock().Sub(start))
 			return true, nil
@@ -322,25 +334,19 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 		// NotBefore and retry immediately.
 		return true, u.Journal.Nack(task, u.clock())
 	}
-	result := telemetry.BackupUploadAbandoned
-	if completed {
-		result = telemetry.BackupUploadDeduped
-		if streamed > 0 {
-			result = telemetry.BackupUploadVerified
-		}
-	}
-	u.Metrics.RecordUpload(ctx, result, u.clock().Sub(start))
 	if !completed && !task.Staged {
 		// Abandonment of a mutable-path task: a concurrent dedupe may
 		// have upgraded the row to staged snapshots that would survive
 		// whatever deleted our sources. Leave the upgraded row for the
-		// next drain instead of acking it away.
+		// next drain instead of acking it away, and report a retryable
+		// failure rather than a data-loss abandonment.
 		if cur, ok, lerr := u.Journal.Load(task); lerr == nil && ok && cur.Staged {
 			task.logOwner(u.Log.Info()).
 				Msg("abandoned mutable-path attempt; staged row retained for retry")
 			// Neither acked nor nacked: free the claim explicitly so the
 			// retained row is drainable now, not after the lease expires.
 			u.Journal.Release(task)
+			u.Metrics.RecordUpload(ctx, telemetry.BackupUploadFailed, u.clock().Sub(start))
 			return true, nil
 		}
 	}
@@ -371,10 +377,26 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 		ackTask.Files = finalized
 		ackTask.FilesFinal = true
 	}
-	if err := u.Journal.Ack(ackTask, completedScope, completed); err != nil {
+	cleared, err := u.Journal.Ack(ackTask, completedScope, completed)
+	if err != nil {
 		return true, err
 	}
-	removeStagedTask(u.StagingRoot, task)
+	// A superseded abandonment cleared nothing: the upgraded row still
+	// references its staged files, which must survive for its own upload,
+	// and no data-loss signal fires for a verdict that no longer applies.
+	if cleared {
+		removeStagedTask(u.StagingRoot, task)
+	}
+	result := telemetry.BackupUploadAbandoned
+	if completed {
+		result = telemetry.BackupUploadDeduped
+		if streamed > 0 {
+			result = telemetry.BackupUploadVerified
+		}
+	} else if !cleared {
+		result = telemetry.BackupUploadFailed
+	}
+	u.Metrics.RecordUpload(ctx, result, u.clock().Sub(start))
 	u.flushNotifications()
 	return true, nil
 }

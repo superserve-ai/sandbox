@@ -728,7 +728,7 @@ func TestJournalPruneSweepsHistoryAcrossAcks(t *testing.T) {
 		if err := j.Enqueue(task); err != nil {
 			t.Fatal(err)
 		}
-		if err := j.Ack(task, "", false); err != nil {
+		if _, err := j.Ack(task, "", false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -759,7 +759,7 @@ func TestVerifiedNotificationSurvivesCrashBeforeDelivery(t *testing.T) {
 	}
 	// Simulate the first process: ack with notification owed, then crash
 	// before any delivery (no flush runs).
-	if err := j.Ack(task, "test-bucket", true); err != nil {
+	if _, err := j.Ack(task, "test-bucket", true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -785,7 +785,7 @@ func TestAbandonedAckLeavesNoNotification(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "", false); err != nil {
+	if _, err := j.Ack(task, "", false); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := j.PendingNotifications(0)
@@ -1032,7 +1032,7 @@ func TestNextSkipsDeferredPriorityWithoutScanning(t *testing.T) {
 	// The nack re-keyed the row; ack through the same task state must
 	// clear it (index and queue agree on the new key).
 	nacked := got
-	if err := j.Ack(nacked, "", false); err != nil {
+	if _, err := j.Ack(nacked, "", false); err != nil {
 		t.Fatal(err)
 	}
 	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
@@ -1323,7 +1323,7 @@ func TestStagedBaseSurvivesTemplateGC(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(staging, "bases", hex.EncodeToString(baseSum[:]))); err != nil {
 		t.Fatalf("referenced staged base swept: %v", err)
 	}
-	if err := j.Ack(Task{SandboxID: "sb2", Generation: "g2", EnqueuedAt: time.Unix(3, 0)}, "", false); err != nil {
+	if _, err := j.Ack(Task{SandboxID: "sb2", Generation: "g2", EnqueuedAt: time.Unix(3, 0)}, "", false); err != nil {
 		t.Fatal(err)
 	}
 	ageStagingTree(t, staging)
@@ -2123,7 +2123,7 @@ func TestFailedNotificationDeliveryRedelivers(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "test-bucket", true); err != nil {
+	if _, err := j.Ack(task, "test-bucket", true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2175,7 +2175,7 @@ func TestFailedNotificationDeliveryStopsTheBatch(t *testing.T) {
 		if err := j.Enqueue(task); err != nil {
 			t.Fatal(err)
 		}
-		if err := j.Ack(task, "test-bucket", true); err != nil {
+		if _, err := j.Ack(task, "test-bucket", true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2202,7 +2202,7 @@ func TestOutboxPinsVerifiedBucket(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "bucket-a", true); err != nil {
+	if _, err := j.Ack(task, "bucket-a", true); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := j.PendingNotifications(0)
@@ -2325,7 +2325,7 @@ func TestLegacyStagingDrainsThenRemoves(t *testing.T) {
 	// Drain the reference; the next sweep empties and removes the root.
 	// The ack must name the row's exact identity (EnqueuedAt included):
 	// resolution is fenced on the row existing at the task's own key.
-	if err := j.Ack(Task{SandboxID: "sb-live", Generation: "gen-live", EnqueuedAt: time.Unix(1, 0)}, "", false); err != nil {
+	if _, err := j.Ack(Task{SandboxID: "sb-live", Generation: "gen-live", EnqueuedAt: time.Unix(1, 0)}, "", false); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chtimes(kept, old, old); err != nil {
@@ -2539,13 +2539,13 @@ func TestOutboxKeepsPerBucketNotifications(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "bucket-a", true); err != nil {
+	if _, err := j.Ack(task, "bucket-a", true); err != nil {
 		t.Fatal(err)
 	}
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "bucket-b", true); err != nil {
+	if _, err := j.Ack(task, "bucket-b", true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2597,7 +2597,7 @@ func TestClearNotificationLeavesOtherKeyShape(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "bucket-a", true); err != nil {
+	if _, err := j.Ack(task, "bucket-a", true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2640,14 +2640,14 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 		if err := j.Enqueue(task); err != nil {
 			t.Fatal(err)
 		}
-		if err := j.Ack(task, "bucket-a", false); err != nil {
+		if _, err := j.Ack(task, "bucket-a", false); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if err := j.Enqueue(other); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(other, "bucket-b", false); err != nil {
+	if _, err := j.Ack(other, "bucket-b", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2695,7 +2695,7 @@ func TestSeedOutboxFromCompletions(t *testing.T) {
 	if err := j.Enqueue(late); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(late, "bucket-a", false); err != nil {
+	if _, err := j.Ack(late, "bucket-a", false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := j.SeedOutboxFromCompletions(); err != nil {
@@ -2739,7 +2739,7 @@ func TestFlushNotificationsBoundsTheBatch(t *testing.T) {
 		if err := j.Enqueue(task); err != nil {
 			t.Fatal(err)
 		}
-		if err := j.Ack(task, "bucket", true); err != nil {
+		if _, err := j.Ack(task, "bucket", true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2766,7 +2766,7 @@ func TestSeedChunksAndResumes(t *testing.T) {
 		if err := j.Enqueue(task); err != nil {
 			t.Fatal(err)
 		}
-		if err := j.Ack(task, "bucket-a", false); err != nil {
+		if _, err := j.Ack(task, "bucket-a", false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2816,7 +2816,7 @@ func TestSeedReseedsReacknowledgedCompletion(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "bucket-a", true); err != nil {
+	if _, err := j.Ack(task, "bucket-a", true); err != nil {
 		t.Fatal(err)
 	}
 	banked, err := j.PendingNotifications(0)
@@ -2840,7 +2840,7 @@ func TestSeedReseedsReacknowledgedCompletion(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "bucket-a", false); err != nil {
+	if _, err := j.Ack(task, "bucket-a", false); err != nil {
 		t.Fatal(err)
 	}
 	for done := false; !done; {
@@ -2866,7 +2866,7 @@ func TestSeedRefreshesUndeliveredEntryOnReack(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "bucket-a", true); err != nil {
+	if _, err := j.Ack(task, "bucket-a", true); err != nil {
 		t.Fatal(err)
 	}
 	banked, _ := j.PendingNotifications(0)
@@ -2876,7 +2876,7 @@ func TestSeedRefreshesUndeliveredEntryOnReack(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "bucket-a", false); err != nil {
+	if _, err := j.Ack(task, "bucket-a", false); err != nil {
 		t.Fatal(err)
 	}
 	var err error
