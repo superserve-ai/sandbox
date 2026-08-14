@@ -85,7 +85,13 @@ func runRevive(args []string) int {
 		badField := false
 		for _, tok := range rest {
 			if p, ok := strings.CutPrefix(tok, "base="); ok {
-				req.BasePath = p
+				if p == "none" {
+					// The salvage is flattened or standalone; boot it
+					// without the recorded base.
+					req.StandaloneDisk = true
+				} else {
+					req.BasePath = p
+				}
 			} else if p, ok := strings.CutPrefix(tok, "allow="); ok {
 				req.AllowedCidrs = splitCommaList(p)
 			} else if p, ok := strings.CutPrefix(tok, "deny="); ok {
@@ -104,6 +110,10 @@ func runRevive(args []string) int {
 		// Malformed resource fields reject the line rather than silently
 		// booting at defaults: a typo must not revive a 32 GiB workload
 		// into a 1 GiB VM.
+		if req.StandaloneDisk && req.BasePath != "" {
+			fmt.Printf("FAILED %s: base=none conflicts with base=%s\n", req.VmId, req.BasePath)
+			badField = true
+		}
 		if len(fields) > 4 {
 			fmt.Printf("FAILED %s: surplus positional fields %v\n", req.VmId, fields[4:])
 			badField = true

@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"path/filepath"
+	"strings"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -699,27 +699,27 @@ func toInstance(rec VMRecord) *VMInstance {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
 	return &VMInstance{
-		ID:              rec.ID,
-		PID:             rec.PID,
-		SocketPath:      rec.SocketPath,
-		VsockPath:       rec.VsockPath,
-		IP:              rec.IP,
-		TAPDevice:       rec.TAPDevice,
-		MACAddress:      rec.MACAddress,
-		Status:          rec.Status,
-		Unverified:      rec.Unverified,
-		TeardownPending: rec.TeardownPending,
-		RunDirID:        rec.RunDirID,
-		Namespace:       rec.Namespace,
-		DiskPath:        rec.DiskPath,
-		SnapshotPath:    rec.SnapshotPath,
-		MemFilePath:     rec.MemFilePath,
-		BaseMemPath:     rec.BaseMemPath,
-		CreatedAt:       rec.CreatedAt,
-		Metadata:        rec.Metadata,
-		TeamID:          rec.TeamID,
-		OwnerID:         rec.OwnerID,
-		PausedAt:        rec.PausedAt,
+		ID:                         rec.ID,
+		PID:                        rec.PID,
+		SocketPath:                 rec.SocketPath,
+		VsockPath:                  rec.VsockPath,
+		IP:                         rec.IP,
+		TAPDevice:                  rec.TAPDevice,
+		MACAddress:                 rec.MACAddress,
+		Status:                     rec.Status,
+		Unverified:                 rec.Unverified,
+		TeardownPending:            rec.TeardownPending,
+		RunDirID:                   rec.RunDirID,
+		Namespace:                  rec.Namespace,
+		DiskPath:                   rec.DiskPath,
+		SnapshotPath:               rec.SnapshotPath,
+		MemFilePath:                rec.MemFilePath,
+		BaseMemPath:                rec.BaseMemPath,
+		CreatedAt:                  rec.CreatedAt,
+		Metadata:                   rec.Metadata,
+		TeamID:                     rec.TeamID,
+		OwnerID:                    rec.OwnerID,
+		PausedAt:                   rec.PausedAt,
 		Supervision:                rec.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(rec.PreviewAccess, ports),
 		PreviewPorts:               ports,

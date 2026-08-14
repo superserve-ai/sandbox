@@ -297,6 +297,11 @@ message ReviveVMRequest {
   // (the operator CLI prints that obligation per revived sandbox).
   map<string, string> env_vars = 9;
   string secrets_jwt = 10;
+  // The salvage is a standalone or flattened image: boot it without any
+  // base, ignoring the base recorded on the sandbox. Needed because an
+  // empty base_path means "use the recorded base", and a flattened
+  // image's sparse zero regions must not read through to the old base.
+  bool standalone_disk = 11;
 }
 
 message ReviveVMResponse {

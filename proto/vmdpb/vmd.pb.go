@@ -1224,10 +1224,15 @@ type ReviveVMRequest struct {
 	// be delivered again. Same semantics as InjectSandboxEnv; when both
 	// are empty the caller owns re-injection before activating the row
 	// (the operator CLI prints that obligation per revived sandbox).
-	EnvVars       map[string]string `protobuf:"bytes,9,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	SecretsJwt    string            `protobuf:"bytes,10,opt,name=secrets_jwt,json=secretsJwt,proto3" json:"secrets_jwt,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	EnvVars    map[string]string `protobuf:"bytes,9,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	SecretsJwt string            `protobuf:"bytes,10,opt,name=secrets_jwt,json=secretsJwt,proto3" json:"secrets_jwt,omitempty"`
+	// The salvage is a standalone or flattened image: boot it without any
+	// base, ignoring the base recorded on the sandbox. Needed because an
+	// empty base_path means "use the recorded base", and a flattened
+	// image's sparse zero regions must not read through to the old base.
+	StandaloneDisk bool `protobuf:"varint,11,opt,name=standalone_disk,json=standaloneDisk,proto3" json:"standalone_disk,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ReviveVMRequest) Reset() {
@@ -1328,6 +1333,13 @@ func (x *ReviveVMRequest) GetSecretsJwt() string {
 		return x.SecretsJwt
 	}
 	return ""
+}
+
+func (x *ReviveVMRequest) GetStandaloneDisk() bool {
+	if x != nil {
+		return x.StandaloneDisk
+	}
+	return false
 }
 
 type ReviveVMResponse struct {
@@ -3785,7 +3797,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x11DestroyVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1d\n" +
 	"\n" +
-	"cleaned_up\x18\x02 \x01(\bR\tcleanedUp\"\xa7\x03\n" +
+	"cleaned_up\x18\x02 \x01(\bR\tcleanedUp\"\xd0\x03\n" +
 	"\x0fReviveVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1b\n" +
 	"\tdisk_path\x18\x02 \x01(\tR\bdiskPath\x12\x12\n" +
@@ -3798,7 +3810,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\benv_vars\x18\t \x03(\v2/.superserve.vmd.v1.ReviveVMRequest.EnvVarsEntryR\aenvVars\x12\x1f\n" +
 	"\vsecrets_jwt\x18\n" +
 	" \x01(\tR\n" +
-	"secretsJwt\x1a:\n" +
+	"secretsJwt\x12'\n" +
+	"\x0fstandalone_disk\x18\v \x01(\bR\x0estandaloneDisk\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"H\n" +

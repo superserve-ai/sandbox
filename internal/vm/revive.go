@@ -27,7 +27,7 @@ import (
 // only after this returns, and the ordinary auto-pause machinery then
 // takes the revived sandbox through the standard pause path, which is
 // what lands it paused with a fresh, uploaded generation.
-func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
+func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string, standaloneDisk bool, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
 	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
 		return nil, status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
 	}
@@ -126,7 +126,14 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// comes from the request or, absent there, the zombie's own durable
 	// record, and when neither names one the disk boots standalone
 	// (legacy full-image sandboxes). A named base must exist.
-	if basePath == "" && prevRec != nil {
+	if standaloneDisk {
+		// A flattened salvage must not inherit the recorded base: its
+		// sparse zero regions are real zeros, and overlay mode would
+		// read them from the old base as stale filesystem contents.
+		if basePath != "" {
+			return nil, status.Error(codes.InvalidArgument, "standalone_disk excludes base_path")
+		}
+	} else if basePath == "" && prevRec != nil {
 		basePath = prevRec.BasePath
 	}
 	if basePath != "" {
