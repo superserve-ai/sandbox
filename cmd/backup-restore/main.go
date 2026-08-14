@@ -29,6 +29,11 @@ import (
 )
 
 func main() {
+	// Subcommand dispatch ahead of flag parsing: `revive` drives vmd
+	// directly and has its own flag set.
+	if len(os.Args) > 1 && os.Args[1] == "revive" {
+		os.Exit(runRevive(os.Args[2:]))
+	}
 	bucket := flag.String("bucket", "", "backup bucket name")
 	sandbox := flag.String("sandbox", "", "sandbox id")
 	generation := flag.String("generation", "", "generation to restore; omit to list the sandbox's restorable generations")
@@ -36,6 +41,7 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: backup-restore -bucket <bucket> -sandbox <id> -generation <gen> -dest <dir>")
 		fmt.Fprintln(os.Stderr, "       backup-restore -bucket <bucket> -sandbox <id>   (list restorable generations, newest first)")
+		fmt.Fprintln(os.Stderr, "       backup-restore revive -manifest <file>          (cold-boot dead sandboxes from salvaged disks, on-host)")
 		flag.PrintDefaults()
 	}
 	flag.Parse()

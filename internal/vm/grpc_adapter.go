@@ -676,3 +676,15 @@ func vmStatusToProto(s VMStatus) vmdpb.VMStatus {
 		return vmdpb.VMStatus_VM_STATUS_UNSPECIFIED
 	}
 }
+
+// ReviveVM cold-boots a dead sandbox from a salvaged copy of its own
+// disk; see Manager.ReviveVM for the liveness and residue semantics.
+func (a *GRPCAdapter) ReviveVM(ctx context.Context, req *vmdpb.ReviveVMRequest) (*vmdpb.ReviveVMResponse, error) {
+	inst, err := a.mgr.ReviveVM(ctx, req.GetVmId(), req.GetDiskPath(), req.GetVcpu(), req.GetMemMib())
+	if err != nil {
+		return nil, err
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return &vmdpb.ReviveVMResponse{DiskPath: inst.DiskPath, HostIp: inst.IP}, nil
+}
