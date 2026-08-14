@@ -20,6 +20,11 @@ Env vars:
                        into vmd.env when set; empty = skip, leaving the
                        host's backup uploader disabled. Staged rollout:
                        staging first, production after the staging soak.
+  BACKUP_BACKFILL      optional — "1" enables the paused-sandbox backup
+                       backfill sweep (startup + six-hourly re-sweeps).
+                       Reconciled, not merely upserted: unset in the
+                       workflow removes the line on the next deploy, which
+                       is the rollout's documented off switch.
   BACKUP_JOURNAL_PATH  optional — path for the backup uploader's BoltDB
                        journal. Upserted into vmd.env when set; empty = skip,
                        leaving vmd's default (next to RUN_DIR, i.e. on the
@@ -173,6 +178,7 @@ def main() -> int:
     backup_bucket = os.environ.get("BACKUP_BUCKET", "")
     backup_upload_concurrency = os.environ.get("BACKUP_UPLOAD_CONCURRENCY", "")
     backup_journal_path = os.environ.get("BACKUP_JOURNAL_PATH", "")
+    backup_backfill = os.environ.get("BACKUP_BACKFILL", "")
     otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
     control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
     internal_api_token = os.environ.get("INTERNAL_API_TOKEN", "")
@@ -189,6 +195,8 @@ def main() -> int:
     q_sentry_line = shlex.quote(f"SENTRY_DSN={sentry_dsn}")
     q_backup = shlex.quote(backup_bucket)
     q_backup_line = shlex.quote(f"BACKUP_BUCKET={backup_bucket}")
+    q_backup_backfill = shlex.quote(backup_backfill)
+    q_backup_backfill_line = shlex.quote(f"BACKUP_BACKFILL={backup_backfill}")
     q_backup_workers = shlex.quote(backup_upload_concurrency)
     q_backup_workers_line = shlex.quote(f"BACKUP_UPLOAD_CONCURRENCY={backup_upload_concurrency}")
     q_backup_journal = shlex.quote(backup_journal_path)
@@ -629,6 +637,18 @@ def main() -> int:
                     echo 'SECRETSPROXY_SOCKET=/run/secretsproxy/control.sock' | sudo tee -a "$env_file" > /dev/null
                 fi
             done
+
+            # Reconcile the backfill flag: unlike the skip-when-empty vars,
+            # the stale line is ALWAYS removed and re-added only when the
+            # workflow sets it. This is a rollout flag with an explicit off
+            # step (coverage verified, flag removed), and unsetting it in the
+            # workflow must actually disable the sweep on the next deploy
+            # rather than requiring a manual host edit.
+            sudo touch /etc/sandbox/vmd.env
+            sudo sed -i '/^BACKUP_BACKFILL=/d' /etc/sandbox/vmd.env
+            if [ -n {q_backup_backfill} ]; then
+                echo {q_backup_backfill_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
 
             # Upsert the control-plane URL. Empty = skip. vmd.env is safe to
             # create; secretsproxy.env is only UPSERTED when it ALREADY exists —
