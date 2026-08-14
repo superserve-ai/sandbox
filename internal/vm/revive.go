@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -34,6 +35,16 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath string, vcpu, mem
 	if !fi.Mode().IsRegular() {
 		return nil, status.Errorf(codes.InvalidArgument, "disk_path %q is not a regular file", diskPath)
 	}
+	// The whole revival transaction holds the VM's lifecycle lock:
+	// without it, two concurrent revives for one id can interleave so
+	// that the loser's teardown destroys the winner's freshly booted VM.
+	// DestroyVM deliberately does not take this lock, so calling it
+	// below cannot deadlock.
+	unlock, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	// Never revive over a live or healthy VM. The recorded status is
 	// exactly what a zombie lies about (a dead VM's record still says
 	// running), so liveness is probed from the process: a recorded
@@ -62,8 +73,32 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath string, vcpu, mem
 	if err != nil {
 		return nil, err
 	}
+	inst.mu.RLock()
+	ip := inst.IP
+	inst.mu.RUnlock()
+	// Revival is only real when the guest is: Firecracker accepting the
+	// boot proves nothing about a corrupt or incompatible salvaged disk,
+	// and reporting success on a wedged guest would flip the DB row to
+	// active for a sandbox nobody can reach. On failure, tear the VM
+	// back down so the retry starts clean and the salvage stays
+	// pristine.
+	if err := m.waitForBoxd(ctx, ip, reviveBoxdReadyBudget); err != nil {
+		_ = m.DestroyVM(ctx, vmID, true)
+		return nil, status.Errorf(codes.Unavailable, "guest did not become ready: %v", err)
+	}
 	// Durable record: reattach and the reconciler must know this VM
-	// after a vmd restart, exactly like any created VM.
-	m.persistState(inst)
+	// after a vmd restart, exactly like any created VM. A revival the
+	// state store cannot record is not a revival: an unrecorded running
+	// VM would be invisible to reconciliation and refused by the next
+	// revive's liveness probe, so fail closed and tear down.
+	if !m.persistState(inst) {
+		_ = m.DestroyVM(ctx, vmID, true)
+		return nil, status.Error(codes.Internal, "revived VM could not be durably recorded; torn down for clean retry")
+	}
 	return inst, nil
 }
+
+// reviveBoxdReadyBudget bounds the wait for a revived guest's boxd. Cold
+// boots run full guest init (no warm memory image), so this is more
+// generous than the resume budget.
+const reviveBoxdReadyBudget = 90 * time.Second

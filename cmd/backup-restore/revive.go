@@ -62,15 +62,31 @@ func runRevive(args []string) int {
 			continue
 		}
 		req := &vmdpb.ReviveVMRequest{VmId: fields[0], DiskPath: fields[1]}
+		// Malformed resource fields reject the line rather than silently
+		// booting at defaults: a typo must not revive a 32 GiB workload
+		// into a 1 GiB VM.
+		badField := false
 		if len(fields) > 2 {
-			if v, err := strconv.ParseUint(fields[2], 10, 32); err == nil {
+			v, err := strconv.ParseUint(fields[2], 10, 32)
+			if err != nil {
+				fmt.Printf("FAILED %s: malformed vcpu %q\n", req.VmId, fields[2])
+				badField = true
+			} else {
 				req.Vcpu = uint32(v)
 			}
 		}
-		if len(fields) > 3 {
-			if v, err := strconv.ParseUint(fields[3], 10, 32); err == nil {
+		if !badField && len(fields) > 3 {
+			v, err := strconv.ParseUint(fields[3], 10, 32)
+			if err != nil {
+				fmt.Printf("FAILED %s: malformed mem-mib %q\n", req.VmId, fields[3])
+				badField = true
+			} else {
 				req.MemMib = uint32(v)
 			}
+		}
+		if badField {
+			failed++
+			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 		resp, err := client.ReviveVM(ctx, req)
@@ -82,6 +98,12 @@ func runRevive(args []string) int {
 		}
 		fmt.Printf("REVIVED %s ip=%s disk=%s\n", req.VmId, resp.GetHostIp(), resp.GetDiskPath())
 		revived++
+	}
+	if err := sc.Err(); err != nil {
+		// A truncated manifest read must not masquerade as a clean run:
+		// every unread line is a sandbox nobody attempted.
+		fmt.Fprintf(os.Stderr, "revive: manifest read failed mid-scan: %v\n", err)
+		failed++
 	}
 	fmt.Printf("revive complete: revived=%d failed=%d\n", revived, failed)
 	if failed > 0 {
