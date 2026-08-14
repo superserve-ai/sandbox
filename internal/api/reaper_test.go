@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"strings"
 	"sync/atomic"
@@ -604,7 +605,69 @@ func TestDrain_BatchSharedAcrossHosts(t *testing.T) {
 
 	h.drainOnce(context.Background(), 10, 2)
 
-	if len(claimSizes) != 2 || claimSizes[0] != 5 || claimSizes[1] != 5 {
-		t.Fatalf("claim sizes %v, want [5 5] — batch split across hosts", claimSizes)
+	// First host gets an even split of the budget; having claimed nothing,
+	// its share flows onward, so the second host may use the full remainder.
+	if len(claimSizes) != 2 || claimSizes[0] != 5 || claimSizes[1] != 10 {
+		t.Fatalf("claim sizes %v, want [5 10] — even split, unspent budget flows on", claimSizes)
+	}
+}
+
+// TestDrain_TickBudgetBoundsFleetWideWork pins the whole-tick bound when
+// hosts outnumber the batch: actual claims spend a shared budget, and once
+// it is gone the remaining hosts defer to the next tick — total pauses per
+// tick never exceed BatchSize no matter how many hosts drain at once.
+func TestDrain_TickBudgetBoundsFleetWideWork(t *testing.T) {
+	var totalClaimed int32
+	var claimCalls int32
+	sandboxRows := func(n int32) []db.ClaimExpiredSandboxesRow {
+		rows := make([]db.ClaimExpiredSandboxesRow, n)
+		for i := range rows {
+			rows[i] = expiredRow(fmt.Sprintf("sbx-%d", i))
+		}
+		return rows
+	}
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+				switch {
+				case strings.Contains(sql, "-- name: ListDrainingHosts :many"):
+					return &drainingHostRows{hosts: []db.ListDrainingHostsRow{
+						{ID: "host-a"}, {ID: "host-b"}, {ID: "host-c"}, {ID: "host-d"},
+					}}, nil
+				case strings.Contains(sql, "-- name: ClaimDrainingSandboxes :many"):
+					atomic.AddInt32(&claimCalls, 1)
+					n := args[1].(int32) // every host has more actives than its share
+					atomic.AddInt32(&totalClaimed, n)
+					return newStubRows(sandboxRows(n)), nil
+				}
+				return newStubRows(nil), nil
+			},
+			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+				switch {
+				case strings.Contains(sql, "-- name: CountUnpausedOnHost :one"):
+					return &mockRow{scanFn: func(dest ...any) error {
+						*dest[0].(*int64) = 0
+						return nil
+					}}
+				case strings.Contains(sql, "upserted AS"):
+					return finalizePauseRow(uuid.New())
+				case strings.Contains(sql, "FROM sandbox_active_interval"):
+					return notFoundRow()
+				}
+				return activityRow()
+			},
+		},
+		&stubVMD{pauseFn: func(_ context.Context, _ string, _ string) (string, string, error) {
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		}},
+	)
+
+	h.drainOnce(context.Background(), 2, 1)
+
+	if got := atomic.LoadInt32(&totalClaimed); got > 2 {
+		t.Fatalf("tick claimed %d sandboxes with batch 2 — the whole-tick bound is broken", got)
+	}
+	if atomic.LoadInt32(&claimCalls) >= 4 {
+		t.Fatal("hosts beyond the budget must defer, not claim")
 	}
 }

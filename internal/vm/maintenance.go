@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -54,8 +55,12 @@ func probeMaintenanceWindow(ctx context.Context, client *http.Client) (*time.Tim
 		// erase a recorded window — the explicit clear is a 200 saying NONE).
 		return nil, fmt.Errorf("metadata returned %d", resp.StatusCode)
 	}
-	trimmed := string(body)
-	if trimmed == "" || trimmed == "NONE" || trimmed == "NONE\n" {
+	// With ?alt=json the no-maintenance sentinel arrives as the JSON string
+	// "NONE" (quoted); accept the bare spelling too for robustness. This is
+	// the authoritative clear — misreading it as malformed would leave a
+	// recorded window stale forever.
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" || trimmed == "NONE" || trimmed == `"NONE"` {
 		return nil, nil
 	}
 	var m upcomingMaintenance

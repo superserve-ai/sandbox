@@ -512,24 +512,34 @@ func (h *Handlers) drainOnce(ctx context.Context, batchSize int32, parallelism i
 	}
 
 	// BatchSize bounds the whole tick, not each host: it is ReaperConfig's
-	// documented per-cycle work bound, and a slow host must not starve the
-	// others of their share of it. Claims are split across hosts and all
+	// documented per-cycle work bound, and neither a slow host nor a large
+	// draining fleet may exceed it. A running budget is split evenly over
+	// the hosts still to claim and spent by ACTUAL claims, so hosts with
+	// nothing active donate their share onward; when the budget runs out,
+	// later hosts wait for the next tick — logged, never silent. All
 	// claimed sandboxes dispatch through ONE bounded fan-out, so pauses
 	// interleave across hosts instead of serializing host by host.
-	perHost := batchSize / int32(len(hosts))
-	if perHost < 1 {
-		perHost = 1
-	}
+	remaining := batchSize
 	var all []db.ClaimDrainingSandboxesRow
-	for _, host := range hosts {
+	for i, host := range hosts {
+		if remaining <= 0 {
+			log.Info().Int("hosts_deferred", len(hosts)-i).
+				Msg("drain: tick budget spent — remaining hosts drain next tick")
+			break
+		}
+		per := remaining / int32(len(hosts)-i)
+		if per < 1 {
+			per = 1
+		}
 		claimed, err := h.DB.ClaimDrainingSandboxes(ctx, db.ClaimDrainingSandboxesParams{
-			HostID: host.ID, BatchSize: perHost,
+			HostID: host.ID, BatchSize: per,
 		})
 		if err != nil {
 			log.Error().Err(err).Str("host_id", host.ID).Msg("drain: claim failed")
 			continue
 		}
 		if len(claimed) > 0 {
+			remaining -= int32(len(claimed))
 			log.Info().Str("host_id", host.ID).Int("claimed", len(claimed)).
 				Msg("drain: pausing active sandboxes on draining host")
 			all = append(all, claimed...)
