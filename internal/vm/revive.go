@@ -53,10 +53,18 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// snapshot is healthy at rest and refused: resume owns that path.
 	if inst, err := m.getInstance(vmID); err == nil {
 		inst.mu.RLock()
-		st, snap := inst.Status, inst.SnapshotPath
+		st, snap, mem, baseMem := inst.Status, inst.SnapshotPath, inst.MemFilePath, inst.BaseMemPath
 		inst.mu.RUnlock()
 		if st == StatusPaused && snap != "" {
-			return nil, status.Errorf(codes.FailedPrecondition, "vm %s is paused with a snapshot; resume owns healthy paused VMs", vmID)
+			// The refusal delegates to resume, so it only holds when
+			// resume is actually possible: every recorded pause artifact
+			// must still exist. A paused record whose snapshot or memory
+			// file is gone is unresumable, and refusing revival too
+			// would strand a sandbox that has a usable salvaged disk.
+			if statRegularFile(snap) && (mem == "" || statRegularFile(mem)) && (baseMem == "" || statRegularFile(baseMem)) {
+				return nil, status.Errorf(codes.FailedPrecondition, "vm %s is paused with a snapshot; resume owns healthy paused VMs", vmID)
+			}
+			m.log.Warn().Str("vm_id", vmID).Msg("paused record has missing snapshot artifacts; treating as unresumable and allowing revival")
 		}
 	}
 	// Liveness comes from the supervisors, not the record or a PID: the
@@ -128,6 +136,21 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	if err := m.DestroyVM(ctx, vmID, true); err != nil {
 		return nil, fmt.Errorf("clear residue: %w", err)
 	}
+	// The teardown above deleted the zombie's durable record, and a
+	// failed boot may persist a fresh partial one. Until the revived VM
+	// is durably recorded, any exit restores the original record: a
+	// failed attempt must stay retryable (revival requires a known
+	// record) and must not lose ownership, preview policy, shape, or
+	// base metadata.
+	committed := false
+	defer func() {
+		if committed || m.state == nil {
+			return
+		}
+		if perr := m.state.Put(*prevRec); perr != nil {
+			m.log.Error().Err(perr).Str("vm_id", vmID).Msg("restore zombie record after failed revival")
+		}
+	}()
 	teardownDur := time.Since(reviveStart)
 	// The revived VM lives under the fleet's real supervision, seeded
 	// from the zombie's recorded mode (default unit for records that
@@ -208,6 +231,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
 		return nil, status.Error(codes.Internal, "revived VM could not be durably recorded; torn down for clean retry")
 	}
+	committed = true
 	// Rare operator path, so phase durations go to the structured log
 	// rather than a new metric surface: enough to see where a slow
 	// revival spent its time (teardown and copy fold into boot).
@@ -218,6 +242,12 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		Dur("total", time.Since(reviveStart)).
 		Msg("sandbox revived")
 	return inst, nil
+}
+
+// statRegularFile reports whether path exists and is a regular file.
+func statRegularFile(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.Mode().IsRegular()
 }
 
 // reviveBoxdReadyBudget bounds the wait for a revived guest's boxd. Cold
