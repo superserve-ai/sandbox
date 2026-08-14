@@ -1742,9 +1742,21 @@ func TestSweepStagingProtectsLivePendingDirs(t *testing.T) {
 	}
 }
 
-// The RPC-path staging respects the caller's deadline: an exhausted
-// deadline falls back rather than copying.
+// overrideClone pins the reflink implementation for one test: whether
+// FICLONE works depends on the filesystem the test tree lives on, and
+// both the clone-first and copy-fallback behaviors must be testable
+// anywhere.
+func overrideClone(t *testing.T, fn func(dst, src *os.File) error) {
+	t.Helper()
+	prev := cloneFn
+	cloneFn = fn
+	t.Cleanup(func() { cloneFn = prev })
+}
+
+// The RPC-path staging respects the caller's deadline when it has to
+// COPY: an exhausted deadline falls back rather than copying.
 func TestStagePendingRespectsDeadline(t *testing.T) {
+	overrideClone(t, func(dst, src *os.File) error { return errors.ErrUnsupported })
 	root := t.TempDir()
 	src := filepath.Join(root, "rootfs.ext4")
 	if err := os.WriteFile(src, []byte("bytes"), 0o600); err != nil {
@@ -1754,6 +1766,33 @@ func TestStagePendingRespectsDeadline(t *testing.T) {
 	defer cancel()
 	if _, _, err := StagePending(ctx, root, "sb", "tok", "", map[string]string{"rootfs.ext4": src}); !errors.Is(err, ErrStageTooLarge) {
 		t.Fatalf("err = %v, want deadline fallback", err)
+	}
+}
+
+// A reflink clone is O(metadata) regardless of packed size, so neither
+// the exhausted-deadline guard nor the packed-size cap may demote a
+// clonable pause to the marker-only path — that would concede the
+// fast-resume window on exactly the filesystems where staging is free.
+func TestStagePendingCloneBypassesCopyGuards(t *testing.T) {
+	overrideClone(t, func(dst, src *os.File) error {
+		_, err := io.Copy(dst, src)
+		return err
+	})
+	root := t.TempDir()
+	src := filepath.Join(root, "rootfs.ext4")
+	if err := os.WriteFile(src, []byte("pause-time bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The same nearly-spent deadline that forces the copy path to give up.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second))
+	defer cancel()
+	_, staged, err := StagePending(ctx, root, "sb", "tok", "", map[string]string{"rootfs.ext4": src})
+	if err != nil {
+		t.Fatalf("clonable staging failed under a short deadline: %v", err)
+	}
+	got, err := os.ReadFile(staged["rootfs.ext4"])
+	if err != nil || string(got) != "pause-time bytes" {
+		t.Fatalf("staged clone content = %q, err = %v", got, err)
 	}
 }
 
