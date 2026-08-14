@@ -757,6 +757,23 @@ def main() -> int:
             # socket activation the old direct-bound vmd still holds the
             # ports, and a plain restart can bind the socket unit before the
             # old process has released them. Idempotent in steady state.
+            # Masked BEFORE the stop below — in that order there is no
+            # instant in which the service is both stopped and startable
+            # (masking a running unit is legal: it blocks starts, not the
+            # current process). The socket deliberately stays listening
+            # (connections backlog instead of refusing), and without the
+            # mask a single arriving connection socket-activates vmd against
+            # half-written config — that instance then serves real traffic
+            # until the final restart below executes it mid-flight, failing
+            # whatever it was serving and doubling the restart churn. Masked,
+            # the backlog simply waits for the one real restart at the end.
+            # --runtime so a host reboot clears the mask even if every
+            # recovery path here is skipped. The trap keeps a failure exit
+            # anywhere in the window from leaving the host masked-and-down;
+            # the journal block below re-arms a more specific trap over it,
+            # and both are disarmed after the final health check.
+            sudo systemctl mask --runtime {service}
+            trap '\''sudo systemctl unmask --runtime {service} 2>/dev/null || true; sudo systemctl start superserve-vmd.socket {service} 2>/dev/null || true'\'' EXIT
             sudo systemctl stop {service}
 
             # Migrate the backup journal to its new path now that vmd is
@@ -796,7 +813,7 @@ def main() -> int:
                 # that case: down but honest beats up and silently wrong.
                 # Empty $BJ_ANCESTOR (nothing checked yet) falls through to
                 # the normal restart, same as before.
-                trap '\''if [ -n "$BJ_ANCESTOR" ] && [ "$(sudo stat -c %d "$BJ_ANCESTOR" 2>/dev/null)" = "$(sudo stat -c %d / 2>/dev/null)" ]; then echo "WARNING: $BJ_ANCESTOR is on the root filesystem; leaving superserve-vmd.socket and {service} stopped rather than restarting onto it" >&2; sudo systemctl stop superserve-vmd.socket {service} 2>/dev/null || true; else sudo systemctl start superserve-vmd.socket {service} 2>/dev/null || true; fi'\'' EXIT
+                trap '\''sudo systemctl unmask --runtime {service} 2>/dev/null || true; if [ -n "$BJ_ANCESTOR" ] && [ "$(sudo stat -c %d "$BJ_ANCESTOR" 2>/dev/null)" = "$(sudo stat -c %d / 2>/dev/null)" ]; then echo "WARNING: $BJ_ANCESTOR is on the root filesystem; leaving superserve-vmd.socket and {service} stopped rather than restarting onto it" >&2; sudo systemctl stop superserve-vmd.socket {service} 2>/dev/null || true; else sudo systemctl start superserve-vmd.socket {service} 2>/dev/null || true; fi'\'' EXIT
                 NEW_BACKUP_JOURNAL_PATH={q_backup_journal}
                 # EnvironmentFile= (systemd.exec(5), which is what loads
                 # vmd.env) accepts quoted values, and vmd itself receives
@@ -979,16 +996,13 @@ def main() -> int:
             else
                 sudo systemctl start superserve-vmd.socket
             fi
-            # `restart`, not `start`: the socket unit stays active through
-            # the whole block above by design (zero-downtime — connections
-            # backlog instead of refusing), so a connection arriving during
-            # the stop window can already have made systemd reactivate
-            # {service} against the pre-migration vmd.env. `start` is a
-            # no-op against an already-active unit and would leave that
-            # reactivated process running on the old path indefinitely;
-            # `restart` guarantees the process running once this script
-            # exits is always the one reading the final, fully-migrated
-            # config, whether or not a reactivation race occurred.
+            # The config window is over: lift the mask and perform the one
+            # and only boot of this deploy. The mask above makes mid-window
+            # reactivation impossible, so this restart serves the socket'''s
+            # backlogged connections with the final, fully-migrated config —
+            # `restart` (not `start`) kept for robustness if the unit were
+            # ever active here through some path this script didn'''t take.
+            sudo systemctl unmask --runtime {service}
             sudo systemctl restart {service}
             sleep 3
             sudo systemctl is-active --quiet {service} || (
@@ -998,9 +1012,9 @@ def main() -> int:
                 exit 1
             )
             # {service} is confirmed active on the final config: disarm the
-            # journal-migration recovery trap (a no-op if it was never
-            # armed this run). Anything past this point is unrelated to the
-            # backup journal and shouldn't restart vmd on failure.
+            # recovery trap (mask-window baseline or journal-migration,
+            # whichever is armed). Anything past this point is unrelated to
+            # the backup journal and shouldn't restart vmd on failure.
             trap - EXIT
 
             # Restart secretsproxy; tolerate missing env file on hosts not
