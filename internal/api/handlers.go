@@ -2619,39 +2619,46 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		Msg("VMD pause complete")
 
 	// Past this point the snapshot already exists on disk — the pause has
-	// physically happened, so the bookkeeping (snapshot row upsert + status
-	// flip pausing → paused in a single CTE) is fire-and-forget. BeginPause's
-	// gate write owns the row and every other transition is status-gated, so
-	// a racing resume sees 'pausing' and 409s until this lands. Detached from
-	// cancellation so a client disconnect cannot orphan the bookkeeping;
-	// trace/span context preserved. The upsert replaces the old "insert a new
-	// row + delete the previous" flow, so there's no explicit prev-snapshot
-	// cleanup to schedule here.
-	finalizeCtx := context.WithoutCancel(c.Request.Context())
-	h.asyncBookkeeping("finalize-pause", func() {
-		fctx, fcancel := context.WithTimeout(finalizeCtx, asyncTimeout)
-		defer fcancel()
-		params := db.FinalizePauseParams{
-			ID:      sandboxID,
-			TeamID:  teamID,
-			Path:    snapshotPath,
-			MemPath: &memPath,
-			Trigger: "pause",
-		}
-		applyManifest(&params, manifest)
-		if _, err := h.finalizePause(fctx, params); err != nil {
-			// ErrNoRows means the sandbox was soft-deleted between BeginPause
-			// and FinalizePause (a rare race with DeleteSandbox). The VM is
-			// already stopped and its snapshot files are on disk — nothing to
-			// finalize for a sandbox that no longer exists.
-			if err == pgx.ErrNoRows {
-				log.Warn().Str("sandbox_id", sandboxID.String()).Msg("FinalizePause: sandbox deleted mid-pause")
-				return
-			}
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async DB FinalizePause failed — sandbox may be stuck in 'pausing'")
+	// physically happened, so all that's left is bookkeeping (snapshot row
+	// upsert + status flip pausing → paused in a single CTE). This now runs
+	// synchronously and gates the response: BeginPause's gate write owns the
+	// row and every other transition is status-gated, so responding success
+	// before this lands would tell the client "paused" while a racing resume
+	// still sees 'pausing' and 409s against an operation it was just told
+	// succeeded. Detached from cancellation so a client disconnect cannot
+	// orphan the write mid-flight and strand the sandbox in 'pausing' with
+	// nothing left to retry it; trace/span context preserved. The upsert
+	// replaces the old "insert a new row + delete the previous" flow, so
+	// there's no explicit prev-snapshot cleanup to schedule here.
+	finalizeCtx, finalizeCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), asyncTimeout)
+	defer finalizeCancel()
+	params := db.FinalizePauseParams{
+		ID:      sandboxID,
+		TeamID:  teamID,
+		Path:    snapshotPath,
+		MemPath: &memPath,
+		Trigger: "pause",
+	}
+	applyManifest(&params, manifest)
+	if _, err := h.finalizePause(finalizeCtx, params); err != nil {
+		// ErrNoRows means the sandbox was soft-deleted between BeginPause
+		// and FinalizePause (a rare race with DeleteSandbox). The VM is
+		// already stopped and its snapshot files are on disk — nothing to
+		// finalize for a sandbox that no longer exists, so this still
+		// reports success; the delete already owns the outcome.
+		if err == pgx.ErrNoRows {
+			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("FinalizePause: sandbox deleted mid-pause")
+			c.Status(http.StatusNoContent)
 			return
 		}
-	})
+		// Unlike the old fire-and-forget path, this must not report success:
+		// the sandbox is stuck in 'pausing' (VM already paused, row not
+		// flipped), and telling the client otherwise would just relocate the
+		// race instead of closing it.
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB FinalizePause failed — sandbox stuck in 'pausing', VM already paused")
+		respondError(c, ErrInternal)
+		return
+	}
 
 	// Interval was already closed at BeginPause; FinalizePause is the
 	// end of the VMD pause work, not the moment the sandbox left active.

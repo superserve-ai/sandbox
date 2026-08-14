@@ -2949,17 +2949,20 @@ func TestPauseSandbox_Success(t *testing.T) {
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "'pausing'"):
-				// BeginPause: atomic transition active → pausing, returns *
-				return sandboxRow(sb)
 			case strings.Contains(sql, "upserted AS"):
-				// FinalizePause: CTE upsert + update, returns snapshot_id
+				// FinalizePause: CTE upsert + update, returns snapshot_id.
+				// Checked before the "'pausing'" case below: FinalizePause's
+				// own WHERE clause also matches status IN ('pausing', ...),
+				// so the more specific CTE marker must win first.
 				return finalizePauseRow(snapshotID)
 			case strings.Contains(sql, "INSERT INTO snapshot"):
 				// Belt-and-braces: FinalizePause contains an INSERT inside
 				// the upserted CTE; match that too in case the SQL text
 				// routing misses the CTE alias.
 				return finalizePauseRow(snapshotID)
+			case strings.Contains(sql, "'pausing'"):
+				// BeginPause: atomic transition active → pausing, returns *
+				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM sandbox"):
 				// Generic GetSandbox (fallback from BeginPause)
 				return sandboxRow(sb)
