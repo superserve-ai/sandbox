@@ -36,7 +36,7 @@ type Client interface {
 	// host-local only and not manifested).
 	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, manifest []ManifestEntry, err error)
 	// ResumeInstance restores a paused VM.
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
 	// in-memory map but the snapshot files are still on disk). basePath +

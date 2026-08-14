@@ -32,6 +32,7 @@ import (
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vm"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
@@ -429,6 +430,114 @@ func main() {
 		requirePresenceSidecar = "auto"
 	}
 	launchViaLauncherNS := envOrDefault("VMD_LAUNCH_VIA_LAUNCHER_NS", "false") == "true"
+	pausedNetworkReclaimEnabled := envOrDefault("VMD_PAUSED_NETWORK_RECLAIM", "false") == "true"
+	requirePausedNetworkEnv := func(key, fallback string) string {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+		if pausedNetworkReclaimEnabled {
+			log.Fatal().Str("key", key).Msg("paused network reclaim is enabled but required configuration is missing")
+		}
+		return fallback
+	}
+	pausedNetworkSlotHeadroomPercent, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT", "0"))
+	if err != nil || pausedNetworkSlotHeadroomPercent < 0 || pausedNetworkSlotHeadroomPercent > 100 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT")).Msg("VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT must be an integer between 0 and 100")
+	}
+	pausedNetworkSlotHeadroomReserve, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE", "0"))
+	if err != nil || pausedNetworkSlotHeadroomReserve < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE")).Msg("VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE must be a non-negative integer")
+	}
+	pausedNetworkSlotHeadroomHysteresis, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS", "1"))
+	if err != nil || pausedNetworkSlotHeadroomHysteresis < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS")).Msg("VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS must be a non-negative integer")
+	}
+	pausedNetworkNetnsThreshold, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_NETNS_THRESHOLD", "0"))
+	if err != nil || pausedNetworkNetnsThreshold < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_NETNS_THRESHOLD")).Msg("VMD_PAUSED_NETWORK_NETNS_THRESHOLD must be a non-negative integer")
+	}
+	pausedNetworkNetnsHysteresis, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_NETNS_HYSTERESIS", "1"))
+	if err != nil || pausedNetworkNetnsHysteresis < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_NETNS_HYSTERESIS")).Msg("VMD_PAUSED_NETWORK_NETNS_HYSTERESIS must be a non-negative integer")
+	}
+	pausedNetworkMountThreshold, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_MOUNT_THRESHOLD", "0"))
+	if err != nil || pausedNetworkMountThreshold < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_MOUNT_THRESHOLD")).Msg("VMD_PAUSED_NETWORK_MOUNT_THRESHOLD must be a non-negative integer")
+	}
+	pausedNetworkMountHysteresis, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS", "1"))
+	if err != nil || pausedNetworkMountHysteresis < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS")).Msg("VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS must be a non-negative integer")
+	}
+	pausedNetworkMinWarmAge, err := time.ParseDuration(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_MIN_WARM_AGE", "0s"))
+	if err != nil || pausedNetworkMinWarmAge < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_MIN_WARM_AGE")).Msg("VMD_PAUSED_NETWORK_MIN_WARM_AGE must be a non-negative duration")
+	}
+	pausedNetworkMaxReclaims, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_MAX_RECLAIMS", "2"))
+	if err != nil || pausedNetworkMaxReclaims < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_MAX_RECLAIMS")).Msg("VMD_PAUSED_NETWORK_MAX_RECLAIMS must be a non-negative integer")
+	}
+	pausedNetworkReclaimCooldown, err := time.ParseDuration(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN", "30s"))
+	if err != nil || pausedNetworkReclaimCooldown < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN")).Msg("VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN must be a non-negative duration")
+	}
+	if pausedNetworkReclaimEnabled {
+		log.Info().
+			Int("paused_network_max_reclaims", pausedNetworkMaxReclaims).
+			Dur("paused_network_reclaim_cooldown", pausedNetworkReclaimCooldown).
+			Int("paused_network_slot_headroom_percent", pausedNetworkSlotHeadroomPercent).
+			Int("paused_network_slot_headroom_reserve", pausedNetworkSlotHeadroomReserve).
+			Int("paused_network_netns_threshold", pausedNetworkNetnsThreshold).
+			Int("paused_network_mount_threshold", pausedNetworkMountThreshold).
+			Msg("paused network reclaim enabled")
+		if !pausedNetworkReclaimTriggersConfigured(
+			pausedNetworkSlotHeadroomPercent,
+			pausedNetworkSlotHeadroomReserve,
+			pausedNetworkNetnsThreshold,
+			pausedNetworkMountThreshold,
+		) {
+			log.Warn().
+				Msg("paused network reclaim is enabled but no pressure trigger is configured; reclamation will remain inert until at least one threshold is raised")
+		}
+	}
+	recorder := telemetry.NewNoopRecorder()
+	if envOrDefault("OTEL_METRICS_ENABLED", "false") == "true" {
+		otelExportInterval, err := time.ParseDuration(envOrDefault("OTEL_EXPORT_INTERVAL", "15s"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("invalid OTEL_EXPORT_INTERVAL")
+		}
+		otelRecorder, err := telemetry.NewOTelRecorder(ctx, telemetry.OTelConfig{
+			HostID:         cfg.HostID,
+			ServiceName:    envOrDefault("OTEL_SERVICE_NAME", "sandbox-vmd"),
+			ServiceVersion: os.Getenv("OTEL_SERVICE_VERSION"),
+			Environment:    envOrDefault("OTEL_ENVIRONMENT", "dev"),
+			Endpoint:       envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+			Insecure: func() bool {
+				v, err := strconv.ParseBool(envOrDefault("OTEL_EXPORTER_OTLP_INSECURE", "false"))
+				if err != nil {
+					log.Warn().Err(err).Msg("invalid OTEL_EXPORTER_OTLP_INSECURE; using false")
+					return false
+				}
+				return v
+			}(),
+			ExportInterval: otelExportInterval,
+		})
+		if err != nil {
+			log.Warn().Err(err).Msg("otel metrics init failed; continuing without network-pressure export")
+		} else {
+			recorder = otelRecorder
+			defer func() {
+				flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer flushCancel()
+				if err := otelRecorder.Shutdown(flushCtx); err != nil {
+					log.Warn().Err(err).Msg("otel metrics shutdown failed")
+				}
+			}()
+			log.Info().
+				Str("endpoint", envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")).
+				Dur("interval", otelExportInterval).
+				Msg("otel metrics initialized")
+		}
+	}
 
 	// Persistent systemd D-Bus connection for unit operations (vs forking
 	// systemctl per call). Falls back to systemctl per call when unavailable.
@@ -437,27 +546,39 @@ func main() {
 	log.Info().Bool("systemd_dbus", systemdDBus).Msg("systemd unit-operations transport")
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
-		FirecrackerBin:             cfg.FirecrackerBin,
-		JailerBin:                  cfg.JailerBin,
-		KernelPath:                 cfg.KernelPath,
-		BaseRootfsPath:             cfg.BaseRootfsPath,
-		SnapshotDir:                cfg.SnapshotDir,
-		RunDir:                     cfg.RunDir,
-		TemplateBuilderBin:         cfg.TemplateBuilderBin,
-		BoxdBinaryPath:             cfg.BoxdBinaryPath,
-		HostInterface:              cfg.HostInterface,
-		MaxConcurrentRestores:      maxRestores,
-		UffdEnabled:                uffdEnabled,
-		UffdPrefetchEnabled:        uffdPrefetchEnabled,
-		UffdRecordMaxSeconds:       uffdRecordMaxSeconds,
-		ResumeUffdEnabled:          resumeUffdEnabled,
-		VerifySnapshotEnabled:      verifySnapshotEnabled,
-		IncrementalSnapshotEnabled: incrementalSnapshotEnabled,
-		HandlerDeathAbortEnabled:   handlerDeathAbortEnabled,
-		RequirePresenceSidecar:     requirePresenceSidecar,
-		LaunchViaLauncherNS:        launchViaLauncherNS,
-		LauncherNSPath:             os.Getenv("VMD_LAUNCHER_NS_PATH"),
-		DirectSpawn:                envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
+		FirecrackerBin:                      cfg.FirecrackerBin,
+		JailerBin:                           cfg.JailerBin,
+		KernelPath:                          cfg.KernelPath,
+		BaseRootfsPath:                      cfg.BaseRootfsPath,
+		SnapshotDir:                         cfg.SnapshotDir,
+		RunDir:                              cfg.RunDir,
+		TemplateBuilderBin:                  cfg.TemplateBuilderBin,
+		BoxdBinaryPath:                      cfg.BoxdBinaryPath,
+		HostInterface:                       cfg.HostInterface,
+		MaxConcurrentRestores:               maxRestores,
+		UffdEnabled:                         uffdEnabled,
+		UffdPrefetchEnabled:                 uffdPrefetchEnabled,
+		UffdRecordMaxSeconds:                uffdRecordMaxSeconds,
+		ResumeUffdEnabled:                   resumeUffdEnabled,
+		VerifySnapshotEnabled:               verifySnapshotEnabled,
+		IncrementalSnapshotEnabled:          incrementalSnapshotEnabled,
+		HandlerDeathAbortEnabled:            handlerDeathAbortEnabled,
+		RequirePresenceSidecar:              requirePresenceSidecar,
+		PausedNetworkReclaimEnabled:         pausedNetworkReclaimEnabled,
+		PausedNetworkSlotHeadroomPercent:    pausedNetworkSlotHeadroomPercent,
+		PausedNetworkSlotHeadroomReserve:    pausedNetworkSlotHeadroomReserve,
+		PausedNetworkSlotHeadroomHysteresis: pausedNetworkSlotHeadroomHysteresis,
+		PausedNetworkNetnsThreshold:         pausedNetworkNetnsThreshold,
+		PausedNetworkNetnsHysteresis:        pausedNetworkNetnsHysteresis,
+		PausedNetworkMountThreshold:         pausedNetworkMountThreshold,
+		PausedNetworkMountHysteresis:        pausedNetworkMountHysteresis,
+		PausedNetworkMinWarmAge:             pausedNetworkMinWarmAge,
+		PausedNetworkMaxReclaims:            pausedNetworkMaxReclaims,
+		PausedNetworkReclaimCooldown:        pausedNetworkReclaimCooldown,
+		TelemetryRecorder:                   recorder,
+		LaunchViaLauncherNS:                 launchViaLauncherNS,
+		LauncherNSPath:                      os.Getenv("VMD_LAUNCHER_NS_PATH"),
+		DirectSpawn:                         envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
@@ -523,13 +644,52 @@ func main() {
 		log.Info().Msg("direct spawn armed: new VMs launch into the delegated cgroup subtree")
 	}
 
+	// ---- Backup metrics recorder ----
+	// Optional OTLP recorder for the backup pipeline, exporting to the
+	// host-local collector under the same env contract as the control
+	// plane's recorder but with the vmd service name. Constructed OUTSIDE
+	// the BACKUP_BUCKET gate on purpose: a production host running with
+	// backup silently disabled must still emit backup_enabled=0 rather
+	// than nothing. Nil when metrics are off; every call site is nil-safe.
+	var backupMetrics *telemetry.BackupRecorder
+	if envOrDefault("OTEL_METRICS_ENABLED", "false") == "true" {
+		exportInterval, perr := time.ParseDuration(envOrDefault("OTEL_EXPORT_INTERVAL", "15s"))
+		if perr != nil {
+			log.Warn().Err(perr).Msg("invalid OTEL_EXPORT_INTERVAL; using 15s")
+			exportInterval = 15 * time.Second
+		}
+		rec, err := telemetry.NewBackupRecorder(ctx, telemetry.BackupOTelConfig{
+			OTelConfig: telemetry.OTelConfig{
+				ServiceName:    envOrDefault("OTEL_SERVICE_NAME", "sandbox-vmd"),
+				ServiceVersion: os.Getenv("OTEL_SERVICE_VERSION"),
+				Environment:    envOrDefault("OTEL_ENVIRONMENT", "dev"),
+				Endpoint:       envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+				Insecure:       os.Getenv("OTEL_EXPORTER_OTLP_INSECURE") == "true",
+				ExportInterval: exportInterval,
+			},
+			HostID: cfg.HostID,
+		})
+		if err != nil {
+			log.Warn().Err(err).Msg("backup metrics init failed; continuing without metrics")
+		} else {
+			backupMetrics = rec
+			lc.addCloser("backup metrics", func(sctx context.Context) error {
+				return rec.Shutdown(sctx)
+			})
+			log.Info().Msg("backup metrics recorder enabled")
+		}
+	}
+	mgr.SetBackupMetrics(backupMetrics)
+
 	// ---- Backup uploader ----
 	// Ships each pause's durable artifacts (disk overlay + vmstate) to the
 	// cell's backup bucket, content-addressed and create-only. Disabled
 	// unless BACKUP_BUCKET is set; the journal makes uploads crash-safe
 	// across vmd restarts, and the bandwidth cap keeps backups from
 	// competing with guest traffic.
-	if bucket := os.Getenv("BACKUP_BUCKET"); bucket != "" {
+	backupBucket := os.Getenv("BACKUP_BUCKET")
+	var backupJournal *backup.Journal
+	if bucket := backupBucket; bucket != "" {
 		journalPath := envOrDefault("BACKUP_JOURNAL_PATH", filepath.Join(filepath.Dir(cfg.RunDir), "backup.db"))
 		bdb, err := bolt.Open(journalPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 		if err != nil {
@@ -540,6 +700,7 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("failed to init backup journal")
 		}
+		backupJournal = journal
 		gcsClient, err := storage.NewClient(ctx)
 		if err != nil {
 			log.Fatal().Err(err).Msg("failed to create GCS client for backup")
@@ -551,20 +712,42 @@ func main() {
 		}
 		// Megabits per second, as the name says: 1 Mbit/s = 125000 B/s.
 		bytesPerSec := rate.Limit(mbps) * 125000
-		uploader := &backup.Uploader{
-			Journal:    journal,
-			Store:      backup.NewGCSStore(gcsClient, bucket),
-			Limiter:    rate.NewLimiter(bytesPerSec, 32<<20),
-			Log:        log.With().Str("component", "backup").Logger(),
-			VMDVersion: os.Getenv("SENTRY_RELEASE"),
+		// Drain workers, not a bandwidth knob: per-task overhead is what
+		// bounds throughput once the pause rate outruns one serial loop.
+		// All workers share the single limiter above, so raising this
+		// never raises total egress past the bandwidth cap.
+		workers, _ := strconv.Atoi(envOrDefault("BACKUP_UPLOAD_CONCURRENCY", "1"))
+		if workers < 1 {
+			workers = 1
 		}
-		// Staging pins enqueued artifacts via hard links so sandbox
-		// teardown cannot erase a queued generation; the sweep clears
-		// residue from crashes between staging and enqueue.
-		stagingRoot := filepath.Join(filepath.Dir(cfg.RunDir), "backup-staging")
+		uploader := &backup.Uploader{
+			Journal:     journal,
+			Store:       backup.NewGCSStore(gcsClient, bucket),
+			Limiter:     rate.NewLimiter(bytesPerSec, 32<<20),
+			Concurrency: workers,
+			Log:         log.With().Str("component", "backup").Logger(),
+			VMDVersion:  os.Getenv("SENTRY_RELEASE"),
+			Metrics:     backupMetrics,
+		}
+		// Staging pins enqueued artifacts so sandbox teardown cannot
+		// erase a queued generation; the sweep clears residue from
+		// crashes between staging and enqueue. The tree lives inside
+		// SNAPSHOT_DIR by default: that keeps it on the same filesystem
+		// as the artifacts it snapshots, so reflink cloning works and
+		// capacity scales with the artifact array instead of the OS
+		// disk. BACKUP_STAGING_DIR overrides for exotic layouts.
+		stagingRoot, legacyStaging := backup.ResolveStagingRoot(
+			os.Getenv("BACKUP_STAGING_DIR"), cfg.SnapshotDir, cfg.RunDir)
 		if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
 			log.Fatal().Err(err).Str("path", stagingRoot).Msg("failed to create backup staging dir")
 		}
+		// Relocation drains, never deletes: journal rows enqueued before
+		// the move still reference staged copies in the retired tree, so
+		// it is swept under the same journal authority as the live root
+		// until it empties, and only then removed (in the uploader's
+		// periodic sweep). Markers renewed above keep their directories
+		// alive wherever they point.
+		uploader.LegacyStagingRoot = legacyStaging
 		// Renew every durable marker's staged directory before the sweep
 		// runs: the sweep is synchronous and ordered ahead of reattach (and
 		// so ahead of RecoverPendingBackups), so a marker that survived an
@@ -573,6 +756,9 @@ func main() {
 		// under a still-durable pause.
 		mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
 		backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
+		if legacyStaging != "" {
+			backup.SweepStaging(legacyStaging, journal, log.With().Str("component", "backup").Logger())
+		}
 		uploader.StagingRoot = stagingRoot
 		mgr.SetBackupStaging(stagingRoot)
 		mgr.SetBackupEnqueue(journal.Enqueue)
@@ -581,6 +767,24 @@ func main() {
 			// must not suppress uploading into this one.
 			return journal.Covered(bucket, t)
 		})
+		// Verified generations report back to the control plane so backup
+		// coverage is a DB query. Rides the uploader's durable outbox:
+		// failed deliveries stay outboxed and retry on ack-time and idle
+		// flushes. Requires the same wiring the heartbeat uses; without
+		// it, uploads still run and only the write-back is off.
+		if cfg.ControlPlaneURL != "" && os.Getenv("INTERNAL_API_TOKEN") != "" {
+			reporter := &vm.BackupReporter{
+				ControlPlaneURL: cfg.ControlPlaneURL,
+				HostID:          cfg.HostID,
+				Token:           os.Getenv("INTERNAL_API_TOKEN"),
+				Bucket:          bucket,
+				Log:             log.With().Str("component", "backup").Logger(),
+			}
+			uploader.OnVerified = reporter.Deliver
+			log.Info().Msg("backup coverage write-back enabled")
+		} else {
+			log.Warn().Msg("backup coverage write-back disabled: control plane URL or internal token unset")
+		}
 		// The uploader must fully stop before the journal and GCS client
 		// close under it: a verification or Nack cut off mid-write leaves
 		// a finalized object the journal never recorded, which the
@@ -603,7 +807,70 @@ func main() {
 			defer close(upDone)
 			return uploader.Run(upCtx)
 		})
-		log.Info().Str("bucket", bucket).Int("bandwidth_mbps", mbps).Msg("backup uploader enabled")
+		log.Info().Str("bucket", bucket).Int("bandwidth_mbps", mbps).Int("workers", workers).Msg("backup uploader enabled")
+	}
+
+	// ---- Backup metrics sampler ----
+	// Periodic gauges every 30s: the enabled flag, journal depth and
+	// backlog age, pending-marker count, and outbox depth. All reads are
+	// read-only BoltDB views off the hot path; a failed read drops that
+	// gauge from the sample instead of publishing a false zero, and can
+	// never affect backup behavior.
+	if backupMetrics != nil {
+		sample := func() {
+			s := telemetry.BackupSample{Enabled: backupBucket != ""}
+			if backupJournal != nil {
+				if pending, err := backupJournal.Pending(); err == nil {
+					s.PendingPause = pending[backup.PriorityPause]
+					s.PendingCheckpoint = pending[backup.PriorityCheckpoint]
+					s.PendingBestEffort = pending[backup.PriorityBestEffort]
+					s.PendingOK = true
+				} else {
+					log.Warn().Err(err).Msg("backup metrics: journal pending read failed, dropping gauge from sample")
+				}
+				if oldest, err := backupJournal.OldestEnqueuedAtByPriority(); err == nil {
+					if t, ok := oldest[backup.PriorityPause]; ok {
+						s.OldestPauseAge = time.Since(t)
+					}
+					if t, ok := oldest[backup.PriorityCheckpoint]; ok {
+						s.OldestCheckpointAge = time.Since(t)
+					}
+					if t, ok := oldest[backup.PriorityBestEffort]; ok {
+						s.OldestBestEffortAge = time.Since(t)
+					}
+					s.OldestPendingAgeOK = true
+				} else {
+					log.Warn().Err(err).Msg("backup metrics: oldest-pending read failed, dropping gauge from sample")
+				}
+				if depth, err := backupJournal.OutboxDepth(); err == nil {
+					s.OutboxPending = depth
+					s.OutboxPendingOK = true
+				} else {
+					log.Warn().Err(err).Msg("backup metrics: outbox depth read failed, dropping gauge from sample")
+				}
+			}
+			if markers, err := stateStore.ListPendingBackups(); err == nil {
+				s.PendingMarkers = len(markers)
+				s.PendingMarkersOK = true
+			} else {
+				log.Warn().Err(err).Msg("backup metrics: pending markers read failed, dropping gauge from sample")
+			}
+			backupMetrics.RecordSample(ctx, s)
+		}
+		go func() {
+			defer sentrylog.Recover("backup metrics sampler")
+			t := time.NewTicker(30 * time.Second)
+			defer t.Stop()
+			sample()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					sample()
+				}
+			}
+		}()
 	}
 
 	// ---- gRPC server ----
@@ -778,13 +1045,12 @@ func main() {
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 	switch {
 	case adoptNetPool && slotsReserved && sweepSafe:
-		// Adopt the slots the previous run abandoned (or crashed out of) in
-		// the background: the pool starts warm within seconds instead of
-		// refilling from scratch, and boot never blocks on the pass.
-		go func() {
-			defer sentrylog.Recover("netpool adoption")
-			netPool.AdoptOrphanSlots(ctx)
-		}()
+		// Adopt the slots the previous run abandoned (or crashed out of):
+		// the pool starts warm within seconds instead of refilling from
+		// scratch. StartAdoption marks the pass underway before returning,
+		// so requests racing boot wait on it instead of building inline;
+		// the pass itself runs in the background and never blocks boot.
+		netPool.StartAdoption(ctx)
 	case adoptNetPool:
 		// Without a completed reservation pass — or with an unprotected
 		// recordless survivor — adoption cannot tell live VM namespaces from
@@ -815,6 +1081,34 @@ func main() {
 		// meta (both no-ops when backup is disabled).
 		mgr.RecoverPendingBackups(ctx, log)
 		mgr.RecoverTemplateBackups(ctx, log)
+		// One-time coverage for sandboxes that paused before the uploader
+		// existed and will never pause again on their own. Off by default:
+		// the pass reads every paused snapshot once, so it's enabled per
+		// host, run to completion, and turned back off. The ledger makes
+		// reruns cheap (only changed or previously unreadable snapshots
+		// are revisited).
+		if os.Getenv("BACKUP_BACKFILL") == "1" {
+			go func() {
+				defer sentrylog.Recover("backup backfill")
+				blog := log.With().Str("component", "backup").Logger()
+				// Re-sweep periodically while the flag is on, not once per
+				// boot: the uploader's retry ceiling can abandon a minted
+				// upload long after the startup pass returned, and these
+				// sandboxes may never pause again to self-heal. Converged
+				// passes are cheap (ledger marks plus coverage probes skip
+				// everything covered), so the cadence buys convergence
+				// without re-hashing. Turn the flag off only once coverage
+				// is verified, not merely once a pass has run.
+				for {
+					mgr.BackfillPausedBackups(ctx, blog)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(6 * time.Hour):
+					}
+				}
+			}()
+		}
 	}()
 
 	// ---- Optional DB connection for the reconciler ----
@@ -923,6 +1217,14 @@ func main() {
 	// Fast pre-serve init is done (slots reserved, namespaces swept, pool fill
 	// backgrounded). Open the gate; pool warm-up and full reattach continue in
 	// the background, and requests load any not-yet-reattached VM on demand.
+	// Boot-time pool patience lives in SetupVM's bounded ClaimWait (with a
+	// longer budget while adoption runs), deliberately NOT here: only
+	// slot-allocating requests should ever wait on the pool. Pause and
+	// destroy never allocate; resume usually reuses its saved namespace and
+	// pays nothing, but a resume whose namespace is gone (or a stateless
+	// restore) allocates like a create and shares its bounded wait. A gate
+	// at this level would hold even the non-allocating paths behind
+	// inventory they never use.
 	startupReady.Store(true)
 	log.Info().Msg("startup complete — gRPC serving requests")
 
@@ -970,4 +1272,8 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info().Msg("VM daemon shutdown complete")
+}
+
+func pausedNetworkReclaimTriggersConfigured(slotHeadroomPercent, slotHeadroomReserve, netnsThreshold, mountThreshold int) bool {
+	return slotHeadroomPercent > 0 || slotHeadroomReserve > 0 || netnsThreshold > 0 || mountThreshold > 0
 }

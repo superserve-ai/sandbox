@@ -177,6 +177,10 @@ module "api" {
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
     SUPABASE_URL                = var.supabase_url
     VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host.internal_ip)
+    STRIPE_API_BASE_URL         = "https://api.stripe.com"
+    STRIPE_CHECKOUT_PRICE_IDS   = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
+    STRIPE_API_VERSION          = "2026-05-27.dahlia"
+    APP_ALLOWED_ORIGINS         = "https://console-staging.superserve.ai"
   }
   secrets = {
     SANDBOX_ACCESS_TOKEN_SEED = {
@@ -194,11 +198,22 @@ module "api" {
     SYSTEM_TEAM_ID = {
       secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
     }
+    STRIPE_SECRET_KEY = {
+      secret = google_secret_manager_secret.stripe_secret_key.secret_id
+    }
+
+    STRIPE_WEBHOOK_SECRET = {
+      secret = google_secret_manager_secret.stripe_webhook_secret.secret_id
+    }
   }
   vpc_connector = module.network.vpc_connector_id
   labels        = local.common_labels
 
-  depends_on = [google_secret_manager_secret_iam_member.api_runtime_system_team_id]
+  depends_on = [
+    google_secret_manager_secret_iam_member.api_runtime_system_team_id,
+    google_secret_manager_secret_iam_member.api_runtime_stripe_secret_key,
+    google_secret_manager_secret_iam_member.api_runtime_stripe_webhook_secret,
+  ]
 }
 resource "google_compute_disk" "sandbox_data" {
   project = local.project_id
@@ -232,6 +247,40 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_system_team_id" 
   secret_id = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
+}
+resource "google_secret_manager_secret_iam_member" "api_runtime_stripe_secret_key" {
+  project   = local.project_id
+  secret_id = google_secret_manager_secret.stripe_secret_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_runtime_stripe_webhook_secret" {
+  project   = local.project_id
+  secret_id = google_secret_manager_secret.stripe_webhook_secret.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
+}
+resource "google_secret_manager_secret" "stripe_secret_key" {
+  project   = local.project_id
+  secret_id = "stripe-secret-key-${local.resource_suffix}"
+
+  replication {
+    auto {}
+  }
+
+  labels = local.common_labels
+}
+
+resource "google_secret_manager_secret" "stripe_webhook_secret" {
+  project   = local.project_id
+  secret_id = "stripe-webhook-secret-${local.resource_suffix}"
+
+  replication {
+    auto {}
+  }
+
+  labels = local.common_labels
 }
 
 module "sandbox_host" {
@@ -298,6 +347,21 @@ module "observability" {
 
   project_id  = local.project_id
   environment = local.environment
+  # Backup pipeline alerts, same set as the production cells so staging
+  # validates the queries before they matter. The disabled-host alert
+  # stays off here: staging toggles BACKUP_BUCKET deliberately.
+  backup_alerts = {
+    host_id             = module.sandbox_host.instance_name
+    display_prefix      = "Backup / ${module.sandbox_host.instance_name}"
+    alert_disabled_host = false
+  }
+  # Root-filesystem (OS disk) utilization, same policies as the production
+  # cells so staging validates the query shape first. Module defaults:
+  # warn at 85% sustained 30 minutes, page at 95%.
+  host_disk_alerts = {
+    host_id        = module.sandbox_host.instance_name
+    display_prefix = "Infrastructure / ${module.sandbox_host.instance_name}"
+  }
   dashboards = {
     sandbox_operations = {
       display_name = "Sandbox Telemetry / Staging Operations"

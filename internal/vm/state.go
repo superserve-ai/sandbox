@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"path/filepath"
 	"time"
 
@@ -23,6 +24,11 @@ var (
 	// completed: the async retry goroutine is not a durable record, and a
 	// crash or deploy during its window must not lose the pause's coverage.
 	pendingBackupBucketName = []byte("pending_backups")
+	// backfillMarkBucketName is the backup backfill ledger: vm ID → the
+	// snapshot stat identity whose coverage a backfill pass already minted.
+	// Without it every pass would re-hash the whole paused fleet to learn
+	// that nothing changed, since generation keys only exist after hashing.
+	backfillMarkBucketName = []byte("backup_backfill_marks")
 )
 
 // persistedPreviewPolicy is stored separately from VMRecord so a rollback to
@@ -177,6 +183,10 @@ type VMRecord struct {
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
+	// PausedAt marks when a sandbox last entered the paused state. Zero on
+	// records written before the field existed; callers needing an ordering
+	// key fall back to CreatedAt.
+	PausedAt time.Time `json:"paused_at,omitempty"`
 	// Supervision dispatches liveness/stop/reattach for this VM's current
 	// run. Empty (SupervisionUnit) is canonical for systemd-unit VMs so
 	// records written by this binary stay readable-and-correct under a
@@ -280,6 +290,9 @@ func OpenStateStore(path string) (*StateStore, error) {
 			return err
 		}
 		if _, err := tx.CreateBucketIfNotExists(pendingBackupBucketName); err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(backfillMarkBucketName); err != nil {
 			return err
 		}
 		policies, err := tx.CreateBucketIfNotExists(previewPolicyBucketName)
@@ -620,6 +633,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		BasePath:                   inst.Config.BasePath,
 		TeamID:                     inst.TeamID,
 		OwnerID:                    inst.OwnerID,
+		PausedAt:                   inst.PausedAt,
 		Supervision:                inst.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(inst.PreviewAccess, inst.PreviewPorts),
 		PreviewPorts:               previewPortsToRecord(inst.PreviewPorts),
@@ -685,26 +699,27 @@ func toInstance(rec VMRecord) *VMInstance {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
 	return &VMInstance{
-		ID:                         rec.ID,
-		PID:                        rec.PID,
-		SocketPath:                 rec.SocketPath,
-		VsockPath:                  rec.VsockPath,
-		IP:                         rec.IP,
-		TAPDevice:                  rec.TAPDevice,
-		MACAddress:                 rec.MACAddress,
-		Status:                     rec.Status,
-		Unverified:                 rec.Unverified,
-		TeardownPending:            rec.TeardownPending,
-		RunDirID:                   rec.RunDirID,
-		Namespace:                  rec.Namespace,
-		DiskPath:                   rec.DiskPath,
-		SnapshotPath:               rec.SnapshotPath,
-		MemFilePath:                rec.MemFilePath,
-		BaseMemPath:                rec.BaseMemPath,
-		CreatedAt:                  rec.CreatedAt,
-		Metadata:                   rec.Metadata,
-		TeamID:                     rec.TeamID,
-		OwnerID:                    rec.OwnerID,
+		ID:              rec.ID,
+		PID:             rec.PID,
+		SocketPath:      rec.SocketPath,
+		VsockPath:       rec.VsockPath,
+		IP:              rec.IP,
+		TAPDevice:       rec.TAPDevice,
+		MACAddress:      rec.MACAddress,
+		Status:          rec.Status,
+		Unverified:      rec.Unverified,
+		TeardownPending: rec.TeardownPending,
+		RunDirID:        rec.RunDirID,
+		Namespace:       rec.Namespace,
+		DiskPath:        rec.DiskPath,
+		SnapshotPath:    rec.SnapshotPath,
+		MemFilePath:     rec.MemFilePath,
+		BaseMemPath:     rec.BaseMemPath,
+		CreatedAt:       rec.CreatedAt,
+		Metadata:        rec.Metadata,
+		TeamID:          rec.TeamID,
+		OwnerID:         rec.OwnerID,
+		PausedAt:        rec.PausedAt,
 		Supervision:                rec.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(rec.PreviewAccess, ports),
 		PreviewPorts:               ports,
@@ -753,6 +768,11 @@ type PendingBackup struct {
 	// distinguishes a genuine RPC retry (same bytes) from a distinct pause
 	// that overwrote them, and the marker-reuse check is load-bearing on it.
 	SnapshotIdentity string `json:"snapshot_identity,omitempty"`
+	// BestEffort routes the eventual journal write to the lowest upload
+	// priority. Set by the backfill sweep, whose thousands of historical
+	// pauses must never delay a live pause's generation; absent (every
+	// marker minted by a real pause) means pause priority.
+	BestEffort bool `json:"best_effort,omitempty"`
 }
 
 // PutPendingBackup records (or refreshes) a pause's owed backup.
@@ -788,6 +808,27 @@ func (s *StateStore) PutPendingBackupIfOwner(p PendingBackup) error {
 	})
 }
 
+// PutPendingBackupIfAbsent writes the marker only when no marker exists
+// for the VM, reporting whether it wrote. The backfill mints through
+// this: a marker minted concurrently by a real pause owns the slot and
+// must never be replaced by backfill's view of the same sandbox.
+func (s *StateStore) PutPendingBackupIfAbsent(p PendingBackup) (bool, error) {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return false, err
+	}
+	wrote := false
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(pendingBackupBucketName)
+		if b.Get([]byte(p.VMID)) != nil {
+			return nil
+		}
+		wrote = true
+		return b.Put([]byte(p.VMID), data)
+	})
+	return wrote, err
+}
+
 // DeletePendingBackupIf clears the marker only while the given token
 // still owns it: an older pause's async worker finishing late must not
 // erase the record a newer pause has since written over the same key.
@@ -821,6 +862,73 @@ func (s *StateStore) GetPendingBackup(vmID string) (PendingBackup, bool, error) 
 		return nil
 	})
 	return p, found, err
+}
+
+// PutBackfillMark records that a backfill pass minted coverage for this
+// exact snapshot identity, so reruns and later boots skip it without
+// re-hashing. Marks say "a marker was minted", never "the upload
+// verified": once minted, the pending-backup machinery owns the outcome.
+func (s *StateStore) PutBackfillMark(vmID, snapshotIdentity, generation string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(backfillMarkBucketName)
+		if b == nil {
+			return fmt.Errorf("backfill ledger bucket missing")
+		}
+		// Identity NUL generation: binding the mark to the exact
+		// generation its mint enqueued lets the skip path probe the
+		// journal with a point lookup, so no other generation's fate can
+		// masquerade as this snapshot's coverage.
+		return b.Put([]byte(vmID), []byte(snapshotIdentity+"\x00"+generation))
+	})
+}
+
+// GetBackfillMark returns the snapshot identity a backfill pass last
+// covered for this VM and the generation its mint enqueued, if any.
+func (s *StateStore) GetBackfillMark(vmID string) (string, string, bool, error) {
+	var id, gen string
+	found := false
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(backfillMarkBucketName)
+		if b == nil {
+			return nil
+		}
+		v := b.Get([]byte(vmID))
+		if v == nil {
+			return nil
+		}
+		id, found = string(v), true
+		if i := strings.IndexByte(id, 0); i >= 0 {
+			id, gen = id[:i], id[i+1:]
+		}
+		return nil
+	})
+	return id, gen, found, err
+}
+
+// PruneBackfillMarks drops ledger entries for VMs no longer in the
+// record set, so the ledger tracks the fleet instead of growing forever.
+func (s *StateStore) PruneBackfillMarks(keep map[string]struct{}) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(backfillMarkBucketName)
+		if b == nil {
+			return nil
+		}
+		var stale [][]byte
+		if err := b.ForEach(func(k, _ []byte) error {
+			if _, ok := keep[string(k)]; !ok {
+				stale = append(stale, append([]byte(nil), k...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, k := range stale {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // ListPendingBackups returns every pause still owing its backup enqueue.

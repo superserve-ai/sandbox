@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -170,6 +171,7 @@ func run() error {
 
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
 	handlers.Pool = dbPool
+	handlers.Stripe = api.NewStripeBillingClient(cfg)
 
 	// Product-usage analytics — no-op when POSTHOG_KEY is unset.
 	analyticsClient, err := analytics.New(os.Getenv("POSTHOG_KEY"), os.Getenv("POSTHOG_HOST"), log.Logger)
@@ -406,12 +408,34 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir str
 	return resp.SnapshotPath, resp.MemFilePath, manifest, nil
 }
 
-func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string) (string, uint32, uint32, error) {
-	resp, err := c.client.ResumeVM(ctx, &vmdpb.ResumeVMRequest{
+func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, networkConfig []byte) (string, uint32, uint32, error) {
+	req := &vmdpb.ResumeVMRequest{
 		VmId:         vmID,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
-	})
+	}
+	if len(networkConfig) > 0 {
+		var persisted struct {
+			Egress struct {
+				AllowedCIDRs   []string `json:"allowed_cidrs"`
+				DeniedCIDRs    []string `json:"denied_cidrs"`
+				AllowedDomains []string `json:"allowed_domains"`
+			} `json:"egress"`
+		}
+		if err := json.Unmarshal(networkConfig, &persisted); err != nil {
+			return "", 0, 0, fmt.Errorf("parse persisted network_config: %w", err)
+		}
+		if len(persisted.Egress.AllowedCIDRs) != 0 || len(persisted.Egress.DeniedCIDRs) != 0 || len(persisted.Egress.AllowedDomains) != 0 {
+			req.SandboxNetwork = &vmdpb.SandboxNetworkConfig{
+				Egress: &vmdpb.SandboxNetworkEgressConfig{
+					AllowedCidrs:   persisted.Egress.AllowedCIDRs,
+					DeniedCidrs:    persisted.Egress.DeniedCIDRs,
+					AllowedDomains: persisted.Egress.AllowedDomains,
+				},
+			}
+		}
+	}
+	resp, err := c.client.ResumeVM(ctx, req)
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("gRPC ResumeVM: %w", err)
 	}

@@ -56,6 +56,30 @@ locals {
   # started for an incident is never stopped again by a later apply.
   active_vmd_ip = var.active_sandbox_host == "standby" ? module.sandbox_host_b.internal_ip : module.sandbox_host.internal_ip
 
+  # The host currently serving vmd traffic, and so the host whose HOST_ID
+  # tags its metrics. Alert filters must key on this, not on sandbox_host,
+  # or a standby promotion leaves them watching a host_id that stopped
+  # emitting.
+  active_host_name = var.active_sandbox_host == "standby" ? module.sandbox_host_b.instance_name : module.sandbox_host.instance_name
+
+  # The host_id that actually tags this cell's metrics: vmd's HOST_ID runtime
+  # env, which is ALSO its identity in the host table. It is not derivable from
+  # the instance name — this cell's row predates the convention of naming rows
+  # after the instance, and HOST_ID must never be changed to match, because
+  # heartbeats and reconciler scoping key on the existing row. Alert filters
+  # that guess the instance name here select no series and never fire, which
+  # looks identical to a healthy host.
+  #
+  # Verify against the host before changing: grep '^HOST_ID=' /etc/sandbox/vmd.env
+  #
+  # Deliberately NOT the same as active_host_name, and the two must not be
+  # merged: the host-local collector stamps its own HOST_ID (the instance name,
+  # rewritten on every collector deploy) onto the hostmetrics pipeline, so
+  # host-level series like filesystem utilization carry the instance name while
+  # vmd's own OTLP series carry vmd's HOST_ID. One machine, two host_id values,
+  # depending on which process emitted the metric.
+  metrics_host_id = var.active_sandbox_host == "standby" ? "usw2-2" : "usw2"
+
   # Exactly one host carries component=vmd, the label the shared deploy
   # pipeline discovers; the other is parked under a cell-scoped label so
   # rollouts skip it instead of failing against a host that is out of service.
@@ -144,10 +168,12 @@ module "api" {
   service_account_email = data.google_service_account.api_runner.email
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
 
-  cpu_limit         = "2"
-  memory_limit      = "1Gi"
-  min_instances     = 2
-  max_instances     = 100
+  cpu_limit    = "2"
+  memory_limit = "1Gi"
+  # max_instances * DB_MAX_CONNS must stay under this cell's pooler
+  # client-connection limit; raising either means re-checking that product.
+  min_instances     = 10
+  max_instances     = 30
   startup_cpu_boost = true
   cpu_idle          = true
 
@@ -158,7 +184,7 @@ module "api" {
     SUPABASE_URL           = var.supabase_url
     SECRETS_SIGNING_KEY_ID = "v1"
     ALLOW_EPHEMERAL_SEED   = "0"
-    DB_MAX_CONNS           = "12"
+    DB_MAX_CONNS           = "15"
     VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
   }
@@ -292,6 +318,40 @@ module "observability" {
       instance_name = module.sandbox_host.instance_name
       instance_id   = module.sandbox_host.instance_id
     }
+  }
+  # Backup pipeline alerts scoped to this cell's host via the host_id
+  # metric label (HOST_ID on the host matches the instance name). Follows
+  # active_sandbox_host so a standby promotion keeps the filter on whichever
+  # host is actually emitting.
+  # Thresholds are the module defaults; the rationale for each sits on
+  # the module's variables.
+  backup_alerts = {
+    host_id        = local.metrics_host_id
+    display_prefix = "Backup / ${local.active_host_name}"
+  }
+  # Launch-path health for the same host: the pruned launcher mount namespace
+  # being unavailable (VM starts fall back to walking the full host mount
+  # table) and live network namespaces accumulating. Both degrade latency
+  # while the service still reports healthy, so neither has another signal.
+  #
+  # Module defaults: page after 15 minutes on the legacy path; at 8,000 live
+  # namespaces sustained 30 minutes; and at 9,000 after only 5 minutes, since
+  # a host whose inflow has outrun the drain covers thousands of namespaces
+  # in half an hour. Both namespace levels are deliberately above vmd's
+  # reclaim ceiling (VMD_PAUSED_NETWORK_NETNS_THRESHOLD, currently 6,000) so
+  # they mean "the controller engaged and still lost", not "the controller is
+  # doing its job" — move them together with the ceiling or not at all.
+  launch_path_alerts = {
+    host_id        = local.metrics_host_id
+    display_prefix = "Launch path / ${local.active_host_name}"
+  }
+  # Root-filesystem (OS disk) utilization for the same host, scoped through
+  # the same host_id label the backup metrics use, and following
+  # active_sandbox_host for the same reason. Module defaults: warn at 85%
+  # sustained 30 minutes, page at 95%.
+  host_disk_alerts = {
+    host_id        = local.active_host_name
+    display_prefix = "Infrastructure / ${local.active_host_name}"
   }
   labels = local.common_labels
 }

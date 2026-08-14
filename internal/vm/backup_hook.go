@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/backup"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // SetBackupStaging points the enqueue path at the uploader's hard-link
@@ -29,6 +30,14 @@ func (m *Manager) SetBackupStaging(dir string) {
 // as covered while nothing reached BoltDB.
 func (m *Manager) SetBackupEnqueue(fn func(backup.Task) error) {
 	m.backupEnqueue = fn
+}
+
+// SetBackupMetrics installs the optional backup metrics recorder. Same
+// startup-only pattern as SetBackupEnqueue; a nil recorder (metrics
+// disabled) is safe at every call site, and recording never affects
+// backup behavior.
+func (m *Manager) SetBackupMetrics(rec *telemetry.BackupRecorder) {
+	m.backupMetrics = rec
 }
 
 // SetBackupCovered installs the journal's coverage probe: whether a
@@ -94,6 +103,15 @@ func pauseManifestComplete(manifest []ManifestEntry) bool {
 // and the uploader's pre-verification abandons that generation, which is
 // the same safe outcome as any mutated source.
 func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath, diskBasePath string, log zerolog.Logger) []ManifestEntry {
+	// The pause-hook histogram measures exactly the synchronous time this
+	// hook holds the pause RPC path (detached workers are excluded by
+	// construction: they run past the return). A size-dependent
+	// synchronous term added here would otherwise surface only in logs;
+	// the metric makes that class of regression alert instead of hide.
+	start := time.Now()
+	defer func() {
+		m.backupMetrics.RecordPauseHookDuration(ctx, time.Since(start))
+	}()
 	// NOTHING here may scale with apparent disk size: pause latency must
 	// track what the guest dirtied, and hashing a sparse overlay's full
 	// apparent content costs seconds regardless of hasher. All
@@ -121,10 +139,13 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 			go m.rehashPendingBackup(ctx, prev, log)
 			return manifest
 		}
-		if dir, staged, err := backup.StagePending(ctx, m.backupStaging, vmID, pb.Token, diskBasePath, map[string]string{
+		stageStart := time.Now()
+		dir, staged, err := backup.StagePending(ctx, m.backupStaging, vmID, pb.Token, diskBasePath, map[string]string{
 			"vmstate.snap": snapshotPath,
 			"rootfs.ext4":  diskPath,
-		}); err == nil {
+		})
+		m.backupMetrics.RecordStageDuration(ctx, time.Since(stageStart))
+		if err == nil {
 			pb.OrigSnapshotPath = snapshotPath
 			pb.OrigDiskPath = diskPath
 			pb.StagedDir = dir
@@ -167,8 +188,13 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 // staging) it runs the at-rest flow over the mutable originals, proving
 // the bytes are not being written before trusting a hash of them.
 // Terminal outcomes clear the pending record; only transient failures
-// keep it for the sweep.
-func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) {
+// keep it for the sweep. Returns the generation this call enqueued (""
+// when it enqueued nothing) and whether it ran the flow at all: false
+// means the per-VM busy guard yielded to an older worker. The
+// generation is read from the capture slot while the guard is still
+// held, so it is attributable to this call by construction: no other
+// worker for this VM can interleave an enqueue before the read.
+func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) (string, bool) {
 	if m.rehashDone != nil {
 		defer m.rehashDone()
 	}
@@ -184,9 +210,22 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	// worker's exact-token cleanup no-ops against it.
 	m.healPendingBackup(pb, log)
 	if _, busy := m.pendingInFlight.LoadOrStore(pb.VMID, struct{}{}); busy {
-		return
+		return "", false
 	}
 	defer m.pendingInFlight.Delete(pb.VMID)
+	// Clear any stale capture at guard acquisition: a previous worker's
+	// enqueue may have left its generation in the slot after releasing
+	// the guard. From here, only this run's flow can write it, so
+	// whatever the guarded read finds below is this call's enqueue.
+	m.lastSandboxEnqueue.Delete(pb.VMID)
+	capturedGen := func() string {
+		if v, ok := m.lastSandboxEnqueue.LoadAndDelete(pb.VMID); ok {
+			if gen, _ := v.(string); gen != "" {
+				return gen
+			}
+		}
+		return ""
+	}
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 	defer cancel()
 	if pb.StagedDir != "" {
@@ -197,9 +236,10 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 		// retention promise wants a destroyed sandbox's last pause in
 		// the bucket.
 		m.enqueueStagedPending(rctx, pb, log)
-		return
+		return capturedGen(), true
 	}
 	m.rehashUnstagedLocked(rctx, pb, log)
+	return capturedGen(), true
 }
 
 // rehashUnstagedLocked is the at-rest flow over mutable original paths,
@@ -255,7 +295,9 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 			return
 		}
 	}
+	hashStart := time.Now()
 	retried := collectPauseManifest(rctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, pb.DiskBasePath, log)
+	m.backupMetrics.RecordHashDuration(rctx, time.Since(hashStart))
 	if pb.DiskBasePath != "" {
 		// Re-check AFTER hashing too: the disk hash can run for minutes,
 		// and a base swapped inside that window would have been stat'ed
@@ -297,7 +339,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 		m.healPendingBackup(pb, log)
 		return
 	}
-	if ok, staged := m.enqueueBackup(pb.VMID, retried); ok {
+	if ok, staged, _ := m.enqueueBackup(pb.VMID, retried, pb.backupPriority()); ok {
 		if staged {
 			m.deletePendingBackupIf(pb, log)
 			return
@@ -416,7 +458,9 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 			}
 		}
 	}
+	hashStart := time.Now()
 	entries := collectPauseManifest(ctx, pb.SnapshotPath, pb.DiskPath, baseSrc, pb.DiskBasePath, log)
+	m.backupMetrics.RecordHashDuration(ctx, time.Since(hashStart))
 	if !pauseManifestComplete(entries) {
 		log.Warn().Str("vm_id", pb.VMID).
 			Msg("staged pause backup hash failed transiently; keeping pending record")
@@ -443,7 +487,9 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 	// above), so the enqueued task is FULLY staged and needs no at-rest
 	// fallback, which could not succeed for a resumed sandbox anyway.
 	if pb.DiskBasePath != "" {
+		baseStageStart := time.Now()
 		stagedBase, err := backup.StageSharedBase(m.backupStaging, baseSrc, baseSHAFromEntries(entries), false)
+		m.backupMetrics.RecordStageDuration(ctx, time.Since(baseStageStart))
 		if err != nil {
 			log.Warn().Err(err).Str("vm_id", pb.VMID).
 				Msg("staged pause backup: base staging failed; keeping pending record")
@@ -487,7 +533,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 			entries[i].Path = p
 		}
 	}
-	if ok, _ := m.enqueueBackup(pb.VMID, entries); ok {
+	if ok, _, _ := m.enqueueBackup(pb.VMID, entries, pb.backupPriority()); ok {
 		m.deletePendingBackupIf(pb, log)
 		return
 	}
@@ -678,6 +724,131 @@ func fileMissing(path string) bool {
 	return os.IsNotExist(err)
 }
 
+// backfillProgressEvery paces backfill progress logs: frequent enough to
+// show liveness on a multi-hour pass, rare enough not to flood.
+const backfillProgressEvery = 250
+
+// BackfillPausedBackups walks the durable VM records and mints a
+// pending-backup marker for every paused sandbox whose current snapshot
+// has never been through the backup pipeline, then drains each marker
+// through the existing rehash flow. It exists for fleets that predate
+// the uploader: their sandboxes paused before backup was enabled and
+// will never pause again on their own, so without this sweep their only
+// copy stays on host-local disk forever.
+//
+// Safe to re-run: a durable per-VM ledger records the snapshot identity
+// each mint covered, so reruns and later boots skip everything already
+// handled and only pick up snapshots that changed (and a changed
+// snapshot means a pause happened, whose own flow already covered it;
+// the re-mint converges on the same content-addressed generation).
+// Backfill work rides PriorityBestEffort in the journal and holds at
+// most one shared rehash slot, so live pause backups always win both the
+// hashing budget and the upload queue. Call after reattach for the same
+// reason as RecoverPendingBackups: the at-rest verdict reads the
+// instance map.
+func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger) {
+	m.backfillCapturing.Store(true)
+	defer func() {
+		m.backfillCapturing.Store(false)
+		m.lastSandboxEnqueue.Range(func(k, _ any) bool {
+			m.lastSandboxEnqueue.Delete(k)
+			return true
+		})
+	}()
+	if m.backupEnqueue == nil || m.state == nil {
+		return
+	}
+	m.ensureRehashSlots()
+	recs, err := m.state.All()
+	if err != nil {
+		log.Error().Err(err).Msg("backup backfill: listing vm records failed")
+		return
+	}
+	live := make(map[string]struct{}, len(recs))
+	var minted, covered, unreadable, writeFailed int
+	for _, rec := range recs {
+		live[rec.ID] = struct{}{}
+		if ctx.Err() != nil {
+			return
+		}
+		if rec.Status != StatusPaused || rec.SnapshotPath == "" || rec.DiskPath == "" {
+			continue
+		}
+		id, err := baseIdentity(rec.SnapshotPath)
+		if err != nil {
+			// Missing or unreadable snapshot: nothing to back up right now.
+			// Deliberately not recorded in the ledger, so a rerun retries.
+			unreadable++
+			continue
+		}
+		if prev, gen, ok, err := m.state.GetBackfillMark(rec.ID); err == nil && ok && prev == id && gen != "" {
+			// The mark binds the snapshot to the exact generation its
+			// mint enqueued, so the probe is a point lookup: pending or
+			// completed for THAT generation. An older generation's
+			// completion (even one still in flight when the mark was
+			// written) can never satisfy it, and an abandoned upload
+			// makes the mark stale and re-mints below. Probe errors keep
+			// the skip (transient journal trouble must not stampede
+			// re-hashing), and a nil probe trusts the ledger as before.
+			stale := false
+			if m.backupCovered != nil {
+				probe := backup.Task{SandboxID: rec.ID, Generation: gen}
+				if cov, err := m.backupCovered(probe); err == nil && !cov {
+					stale = true
+				}
+			}
+			if !stale {
+				covered++
+				continue
+			}
+		}
+		pb := newPendingBackup(rec.ID, rec.SnapshotPath, rec.DiskPath, rec.BasePath)
+		pb.BestEffort = true
+		wrote, err := m.state.PutPendingBackupIfAbsent(pb)
+		if err != nil {
+			log.Warn().Err(err).Str("vm_id", rec.ID).Msg("backup backfill: marker write failed")
+			writeFailed++
+			continue
+		}
+		if !wrote {
+			// A marker already owns this VM's coverage (a live pause's, or
+			// one retained on a transient failure); the sweep retries it on
+			// its own cadence.
+			covered++
+			continue
+		}
+		minted++
+		select {
+		case m.rehashSlots <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		gen, ran := m.rehashPendingBackup(ctx, pb, log)
+		<-m.rehashSlots
+		// Ledger AFTER the mint's synchronous rehash, bound to the
+		// generation the guarded flow itself returned: the capture is
+		// read while the per-VM guard is still held, so it cannot belong
+		// to any other worker. A yielded run (ran=false) or a mint that
+		// enqueued nothing writes no mark; the marker machinery owns the
+		// outcome and the next pass re-evaluates.
+		if ran && gen != "" {
+			if err := m.state.PutBackfillMark(rec.ID, id, gen); err != nil {
+				log.Warn().Err(err).Str("vm_id", rec.ID).Msg("backup backfill: ledger write failed")
+			}
+		}
+		if minted%backfillProgressEvery == 0 {
+			log.Info().Int("minted", minted).Int("already_covered", covered).
+				Msg("backup backfill progress")
+		}
+	}
+	if err := m.state.PruneBackfillMarks(live); err != nil {
+		log.Warn().Err(err).Msg("backup backfill: ledger prune failed")
+	}
+	log.Info().Int("minted", minted).Int("already_covered", covered).
+		Int("snapshot_unreadable", unreadable).Int("marker_write_failed", writeFailed).
+		Msg("backup backfill pass complete")
+}
+
 // retryEnqueue re-attempts a journal write for a manifest whose digests
 // already describe at-rest bytes: only the write failed, so no rehash
 // and no still-paused sandbox is needed (the uploader's pre-verification
@@ -687,7 +858,7 @@ func (m *Manager) retryEnqueue(pb PendingBackup, manifest []ManifestEntry, log z
 	m.healPendingBackup(pb, log)
 	var staged bool
 	enqueued := retryWithBackoff(func() bool {
-		ok, s := m.enqueueBackup(pb.VMID, manifest)
+		ok, s, _ := m.enqueueBackup(pb.VMID, manifest, pb.backupPriority())
 		staged = s
 		return ok
 	})
@@ -872,6 +1043,16 @@ func (m *Manager) pausedAt(vmID, snapshotPath string) bool {
 	return inst.Status == StatusPaused && inst.SnapshotPath == snapshotPath
 }
 
+// backupPriority is the journal tier a marker's generation uploads at:
+// best-effort for backfill-minted markers, pause priority for markers a
+// real pause minted.
+func (pb PendingBackup) backupPriority() backup.Priority {
+	if pb.BestEffort {
+		return backup.PriorityBestEffort
+	}
+	return backup.PriorityPause
+}
+
 // enqueueBackup hands a pause's manifest to the backup pipeline,
 // reporting whether a task was enqueued. The generation is
 // content-addressed over every artifact digest, so genuine retries
@@ -883,9 +1064,9 @@ func (m *Manager) pausedAt(vmID, snapshotPath string) bool {
 // Enqueue is a local BoltDB write (milliseconds) and must never fail the
 // pause: the artifacts on disk are valid regardless, and the journal is
 // the retry mechanism, not the caller.
-func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) (bool, bool) {
+func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio backup.Priority) (bool, bool, string) {
 	if m.backupEnqueue == nil || len(manifest) == 0 {
-		return false, false
+		return false, false, ""
 	}
 	files := make([]backup.TaskFile, 0, len(manifest))
 	for _, e := range manifest {
@@ -902,7 +1083,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) (bool, bo
 	if !pauseManifestComplete(manifest) {
 		m.log.Warn().Str("vm_id", vmID).
 			Msg("pause manifest missing a durable artifact digest; generation not enqueued for backup")
-		return false, false
+		return false, false, ""
 	}
 	task := backup.Task{
 		SandboxID: vmID,
@@ -911,7 +1092,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) (bool, bo
 		// objects under one prefix.
 		Generation: backup.GenerationKey(files),
 		Files:      files,
-		Priority:   backup.PriorityPause,
+		Priority:   prio,
 	}
 	// Stage before enqueueing: teardown of a destroyed sandbox unlinks
 	// the artifacts, and the queued upload must survive it to honor the
@@ -944,8 +1125,11 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) (bool, bo
 		}
 		before, statErr := os.Stat(diskPath)
 		if statErr == nil && m.atRest(probeCtx(), vmID, snapPath) {
-			if err := backup.StageTask(m.backupStaging, &task); err != nil {
-				m.log.Warn().Err(err).Str("vm_id", vmID).
+			stageStart := time.Now()
+			stageErr := backup.StageTask(m.backupStaging, &task)
+			m.backupMetrics.RecordStageDuration(context.Background(), time.Since(stageStart))
+			if stageErr != nil {
+				m.log.Warn().Err(stageErr).Str("vm_id", vmID).
 					Msg("backup staging failed; uploading from original paths")
 			} else if after, err := os.Stat(diskPath); err == nil &&
 				os.SameFile(before, after) &&
@@ -955,7 +1139,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) (bool, bo
 			} else {
 				m.log.Warn().Str("vm_id", vmID).
 					Msg("sandbox left at-rest during staging; uploading from original paths")
-				task = rebuildTask(vmID, manifest)
+				task = rebuildTask(vmID, manifest, prio)
 			}
 		}
 	}
@@ -963,9 +1147,12 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry) (bool, bo
 	if err := m.backupEnqueue(task); err != nil {
 		m.log.Error().Err(err).Str("vm_id", vmID).
 			Msg("backup enqueue failed; pause not journaled")
-		return false, false
+		return false, false, ""
 	}
-	return true, staged
+	if m.backfillCapturing.Load() {
+		m.lastSandboxEnqueue.Store(vmID, task.Generation)
+	}
+	return true, staged, task.Generation
 }
 
 // probeCtx bounds a systemd liveness probe: these run on detached
@@ -994,7 +1181,7 @@ func taskFullyStaged(root string, task backup.Task) bool {
 
 // rebuildTask reconstructs the enqueue task from the manifest with its
 // original paths, discarding any staged rewrites.
-func rebuildTask(vmID string, manifest []ManifestEntry) backup.Task {
+func rebuildTask(vmID string, manifest []ManifestEntry, prio backup.Priority) backup.Task {
 	files := make([]backup.TaskFile, 0, len(manifest))
 	for _, e := range manifest {
 		files = append(files, backup.TaskFile{
@@ -1011,7 +1198,7 @@ func rebuildTask(vmID string, manifest []ManifestEntry) backup.Task {
 		SandboxID:  vmID,
 		Generation: backup.GenerationKey(files),
 		Files:      files,
-		Priority:   backup.PriorityPause,
+		Priority:   prio,
 	}
 }
 
