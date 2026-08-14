@@ -445,6 +445,26 @@ func (r *drainingHostRows) Values() ([]any, error)                       { retur
 func (r *drainingHostRows) RawValues() [][]byte                          { return nil }
 func (r *drainingHostRows) Conn() *pgx.Conn                              { return nil }
 
+type unpausedRows struct {
+	rows []db.CountUnpausedOnDrainingHostsRow
+	idx  int
+}
+
+func (r *unpausedRows) Next() bool { r.idx++; return r.idx <= len(r.rows) }
+func (r *unpausedRows) Scan(dest ...any) error {
+	row := r.rows[r.idx-1]
+	*dest[0].(*string) = row.HostID
+	*dest[1].(*int64) = row.Unpaused
+	return nil
+}
+func (r *unpausedRows) Close()                                       {}
+func (r *unpausedRows) Err() error                                   { return nil }
+func (r *unpausedRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *unpausedRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *unpausedRows) Values() ([]any, error)                       { return nil, nil }
+func (r *unpausedRows) RawValues() [][]byte                          { return nil }
+func (r *unpausedRows) Conn() *pgx.Conn                              { return nil }
+
 // TestDrain_PausesActivesOnDrainingHost pins the drain saga end to end: a
 // draining host's claimed sandbox is paused via VMD and finalized with the
 // maintenance trigger — the same battle-tested path as the timeout reaper.
@@ -465,18 +485,14 @@ func TestDrain_PausesActivesOnDrainingHost(t *testing.T) {
 					}}}, nil
 				case strings.Contains(sql, "-- name: ClaimDrainingSandboxes :many"):
 					return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
+				case strings.Contains(sql, "-- name: CountUnpausedOnDrainingHosts :many"):
+					atomic.AddInt32(&remainingChecks, 1)
+					return &unpausedRows{}, nil
 				}
 				return newStubRows(nil), nil
 			},
 			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-				switch {
-				case strings.Contains(sql, "-- name: CountUnpausedOnHost :one"):
-					atomic.AddInt32(&remainingChecks, 1)
-					return &mockRow{scanFn: func(dest ...any) error {
-						*dest[0].(*int64) = 0
-						return nil
-					}}
-				case strings.Contains(sql, "upserted AS"):
+				if strings.Contains(sql, "upserted AS") {
 					atomic.AddInt32(&finalizeCalls, 1)
 					return finalizePauseRow(uuid.New())
 				}
@@ -541,16 +557,13 @@ func TestDrain_VMDFailureRevertsToActive(t *testing.T) {
 					return &drainingHostRows{hosts: []db.ListDrainingHostsRow{{ID: "host-a"}}}, nil
 				case strings.Contains(sql, "-- name: ClaimDrainingSandboxes :many"):
 					return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
+				case strings.Contains(sql, "-- name: CountUnpausedOnDrainingHosts :many"):
+					return &unpausedRows{rows: []db.CountUnpausedOnDrainingHostsRow{{HostID: "host-a", Unpaused: 1}}}, nil
 				}
 				return newStubRows(nil), nil
 			},
 			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 				switch {
-				case strings.Contains(sql, "-- name: CountUnpausedOnHost :one"):
-					return &mockRow{scanFn: func(dest ...any) error {
-						*dest[0].(*int64) = 1
-						return nil
-					}}
 				case strings.Contains(sql, "FROM sandbox_active_interval"):
 					return notFoundRow()
 				}
@@ -593,12 +606,6 @@ func TestDrain_BatchSharedAcrossHosts(t *testing.T) {
 				return newStubRows(nil), nil
 			},
 			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-				if strings.Contains(sql, "-- name: CountUnpausedOnHost :one") {
-					return &mockRow{scanFn: func(dest ...any) error {
-						*dest[0].(*int64) = 0
-						return nil
-					}}
-				}
 				return activityRow()
 			},
 		},
@@ -646,11 +653,6 @@ func TestDrain_TickBudgetBoundsFleetWideWork(t *testing.T) {
 			},
 			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 				switch {
-				case strings.Contains(sql, "-- name: CountUnpausedOnHost :one"):
-					return &mockRow{scanFn: func(dest ...any) error {
-						*dest[0].(*int64) = 0
-						return nil
-					}}
 				case strings.Contains(sql, "upserted AS"):
 					return finalizePauseRow(uuid.New())
 				case strings.Contains(sql, "FROM sandbox_active_interval"):

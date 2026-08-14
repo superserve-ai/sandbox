@@ -363,6 +363,7 @@ const listDrainingHosts = `-- name: ListDrainingHosts :many
 SELECT id, maintenance_window_start
 FROM host
 WHERE status = 'draining'
+ORDER BY maintenance_window_start ASC NULLS LAST, id
 `
 
 type ListDrainingHostsRow struct {
@@ -370,8 +371,11 @@ type ListDrainingHostsRow struct {
 	MaintenanceWindowStart pgtype.Timestamptz `json:"maintenance_window_start"`
 }
 
-// Hosts being drained ahead of an announced restart. The reaper pauses their
-// remaining active sandboxes; maintenance_window_start drives the
+// Hosts being drained ahead of an announced restart, most urgent first: the
+// claim budget is spent in list order, so the nearest maintenance deadline
+// must come first — a host restarting in minutes cannot sit behind manual
+// drains (NULL window, no deadline pressure: deliberately last) or hosts
+// with later windows. maintenance_window_start also drives the
 // drain-incomplete alert.
 func (q *Queries) ListDrainingHosts(ctx context.Context) ([]ListDrainingHostsRow, error) {
 	rows, err := q.db.Query(ctx, listDrainingHosts)

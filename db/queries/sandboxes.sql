@@ -826,14 +826,18 @@ SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
 
--- name: CountUnpausedOnHost :one
--- Sandboxes on a host still in a state that would not survive a host
--- restart. Drives the drain-progress log and the drain-incomplete alert.
-SELECT count(*)
-FROM sandbox
-WHERE host_id = $1
-  AND destroyed_at IS NULL
-  AND status IN ('active', 'pausing', 'resuming', 'starting');
+-- name: CountUnpausedOnDrainingHosts :many
+-- Per draining host, how many sandboxes are still in a state that would not
+-- survive a host restart. ONE grouped query per drain tick regardless of
+-- fleet size — a per-host count loop would turn accumulated draining hosts
+-- into fleet-sized DB work every tick. Hosts absent from the result have
+-- zero. Drives the drain-progress log and the drain-incomplete alert.
+SELECT s.host_id, count(*) AS unpaused
+FROM sandbox s
+JOIN host h ON h.id = s.host_id AND h.status = 'draining'
+WHERE s.destroyed_at IS NULL
+  AND s.status IN ('active', 'pausing', 'resuming', 'starting')
+GROUP BY s.host_id;
 
 -- name: UpdateSandboxAutoDelete :execrows
 -- Set or clear (NULL) the auto-delete window. The deadline counts continuous

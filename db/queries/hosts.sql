@@ -60,12 +60,16 @@ WHERE status = 'active'
 RETURNING id, maintenance_window_start;
 
 -- name: ListDrainingHosts :many
--- Hosts being drained ahead of an announced restart. The reaper pauses their
--- remaining active sandboxes; maintenance_window_start drives the
+-- Hosts being drained ahead of an announced restart, most urgent first: the
+-- claim budget is spent in list order, so the nearest maintenance deadline
+-- must come first — a host restarting in minutes cannot sit behind manual
+-- drains (NULL window, no deadline pressure: deliberately last) or hosts
+-- with later windows. maintenance_window_start also drives the
 -- drain-incomplete alert.
 SELECT id, maintenance_window_start
 FROM host
-WHERE status = 'draining';
+WHERE status = 'draining'
+ORDER BY maintenance_window_start ASC NULLS LAST, id;
 
 -- name: UpdateHostHeartbeat :one
 -- Returns the host row so the caller can verify the host exists. Also

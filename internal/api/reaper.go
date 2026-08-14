@@ -609,13 +609,18 @@ func (h *Handlers) drainOnce(ctx context.Context, batchSize int32, parallelism i
 		})
 	}
 
+	counts, err := h.DB.CountUnpausedOnDrainingHosts(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("drain: progress counts failed")
+		return
+	}
+	unpausedByHost := make(map[string]int64, len(counts))
+	for _, c := range counts {
+		unpausedByHost[c.HostID] = c.Unpaused
+	}
 	for _, host := range hosts {
 		l := log.With().Str("host_id", host.ID).Logger()
-		remaining, err := h.DB.CountUnpausedOnHost(ctx, host.ID)
-		if err != nil {
-			l.Error().Err(err).Msg("drain: progress count failed")
-			continue
-		}
+		remaining := unpausedByHost[host.ID]
 		switch {
 		case remaining == 0 && len(all) > 0:
 			l.Warn().Msg("drain complete: host has no sandboxes left that a restart would destroy")
