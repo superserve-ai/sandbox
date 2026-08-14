@@ -83,3 +83,4 @@ override.tf.json
 .terraformrc
 terraform.rc
 .envrc
+*.orig
