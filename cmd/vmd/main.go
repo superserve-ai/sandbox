@@ -758,6 +758,24 @@ func main() {
 			// must not suppress uploading into this one.
 			return journal.Covered(bucket, t)
 		})
+		// Verified generations report back to the control plane so backup
+		// coverage is a DB query. Rides the uploader's durable outbox:
+		// failed deliveries stay outboxed and retry on ack-time and idle
+		// flushes. Requires the same wiring the heartbeat uses; without
+		// it, uploads still run and only the write-back is off.
+		if cfg.ControlPlaneURL != "" && os.Getenv("INTERNAL_API_TOKEN") != "" {
+			reporter := &vm.BackupReporter{
+				ControlPlaneURL: cfg.ControlPlaneURL,
+				HostID:          cfg.HostID,
+				Token:           os.Getenv("INTERNAL_API_TOKEN"),
+				Bucket:          bucket,
+				Log:             log.With().Str("component", "backup").Logger(),
+			}
+			uploader.OnVerified = reporter.Deliver
+			log.Info().Msg("backup coverage write-back enabled")
+		} else {
+			log.Warn().Msg("backup coverage write-back disabled: control plane URL or internal token unset")
+		}
 		// The uploader must fully stop before the journal and GCS client
 		// close under it: a verification or Nack cut off mid-write leaves
 		// a finalized object the journal never recorded, which the
@@ -801,9 +819,15 @@ func main() {
 				} else {
 					log.Warn().Err(err).Msg("backup metrics: journal pending read failed, dropping gauge from sample")
 				}
-				if oldest, ok, err := backupJournal.OldestEnqueuedAt(); err == nil {
-					if ok {
-						s.OldestPendingAge = time.Since(oldest)
+				if oldest, err := backupJournal.OldestEnqueuedAtByPriority(); err == nil {
+					if t, ok := oldest[backup.PriorityPause]; ok {
+						s.OldestPauseAge = time.Since(t)
+					}
+					if t, ok := oldest[backup.PriorityCheckpoint]; ok {
+						s.OldestCheckpointAge = time.Since(t)
+					}
+					if t, ok := oldest[backup.PriorityBestEffort]; ok {
+						s.OldestBestEffortAge = time.Since(t)
 					}
 					s.OldestPendingAgeOK = true
 				} else {
@@ -1012,13 +1036,12 @@ func main() {
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 	switch {
 	case adoptNetPool && slotsReserved && sweepSafe:
-		// Adopt the slots the previous run abandoned (or crashed out of) in
-		// the background: the pool starts warm within seconds instead of
-		// refilling from scratch, and boot never blocks on the pass.
-		go func() {
-			defer sentrylog.Recover("netpool adoption")
-			netPool.AdoptOrphanSlots(ctx)
-		}()
+		// Adopt the slots the previous run abandoned (or crashed out of):
+		// the pool starts warm within seconds instead of refilling from
+		// scratch. StartAdoption marks the pass underway before returning,
+		// so requests racing boot wait on it instead of building inline;
+		// the pass itself runs in the background and never blocks boot.
+		netPool.StartAdoption(ctx)
 	case adoptNetPool:
 		// Without a completed reservation pass — or with an unprotected
 		// recordless survivor — adoption cannot tell live VM namespaces from
@@ -1049,6 +1072,34 @@ func main() {
 		// meta (both no-ops when backup is disabled).
 		mgr.RecoverPendingBackups(ctx, log)
 		mgr.RecoverTemplateBackups(ctx, log)
+		// One-time coverage for sandboxes that paused before the uploader
+		// existed and will never pause again on their own. Off by default:
+		// the pass reads every paused snapshot once, so it's enabled per
+		// host, run to completion, and turned back off. The ledger makes
+		// reruns cheap (only changed or previously unreadable snapshots
+		// are revisited).
+		if os.Getenv("BACKUP_BACKFILL") == "1" {
+			go func() {
+				defer sentrylog.Recover("backup backfill")
+				blog := log.With().Str("component", "backup").Logger()
+				// Re-sweep periodically while the flag is on, not once per
+				// boot: the uploader's retry ceiling can abandon a minted
+				// upload long after the startup pass returned, and these
+				// sandboxes may never pause again to self-heal. Converged
+				// passes are cheap (ledger marks plus coverage probes skip
+				// everything covered), so the cadence buys convergence
+				// without re-hashing. Turn the flag off only once coverage
+				// is verified, not merely once a pass has run.
+				for {
+					mgr.BackfillPausedBackups(ctx, blog)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(6 * time.Hour):
+					}
+				}
+			}()
+		}
 	}()
 
 	// ---- Optional DB connection for the reconciler ----
@@ -1157,6 +1208,14 @@ func main() {
 	// Fast pre-serve init is done (slots reserved, namespaces swept, pool fill
 	// backgrounded). Open the gate; pool warm-up and full reattach continue in
 	// the background, and requests load any not-yet-reattached VM on demand.
+	// Boot-time pool patience lives in SetupVM's bounded ClaimWait (with a
+	// longer budget while adoption runs), deliberately NOT here: only
+	// slot-allocating requests should ever wait on the pool. Pause and
+	// destroy never allocate; resume usually reuses its saved namespace and
+	// pays nothing, but a resume whose namespace is gone (or a stateless
+	// restore) allocates like a create and shares its bounded wait. A gate
+	// at this level would hold even the non-allocating paths behind
+	// inventory they never use.
 	startupReady.Store(true)
 	log.Info().Msg("startup complete — gRPC serving requests")
 

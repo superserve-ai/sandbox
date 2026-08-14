@@ -101,6 +101,15 @@ func FinalizeTeamBillingPeriodWithCredits(
 	if err != nil {
 		return FinalizeTeamBillingPeriodResult{}, err
 	}
+	exportRows, err := q.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("list billing export attempts for finalization: %w", err)
+	}
+	storageBillingEnabled := storageBillingEnabledFromExportAttempts(exportRows)
 
 	ratesAt, err := q.ListActivePricingRatesForTeam(ctx, db.ListActivePricingRatesForTeamParams{
 		TeamID:      teamID,
@@ -109,7 +118,7 @@ func FinalizeTeamBillingPeriodWithCredits(
 	if err != nil {
 		return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("list pricing rates for team at billing period: %w", err)
 	}
-	pricingRates, err := validateSummaryPricingRatesForFinalization(ratesAt)
+	pricingRates, err := validateSummaryPricingRatesForFinalization(ratesAt, storageBillingEnabled)
 	if err != nil {
 		return FinalizeTeamBillingPeriodResult{}, err
 	}
@@ -137,9 +146,12 @@ func FinalizeTeamBillingPeriodWithCredits(
 	if err != nil {
 		return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("convert memory price failed: %w", err)
 	}
-	storageRate, err := exactDecimalFromNumeric(pricingRates["storage_gib"].PriceUsd)
-	if err != nil {
-		return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("convert storage price failed: %w", err)
+	storageRate := exactDecimalZero()
+	if storageBillingEnabled {
+		storageRate, err = exactDecimalFromNumeric(pricingRates["storage_gib"].PriceUsd)
+		if err != nil {
+			return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("convert storage price failed: %w", err)
+		}
 	}
 
 	grantRows, err := lockActiveCreditGrants(ctx, tx, teamID, periodEnd)
@@ -286,13 +298,16 @@ func FinalizeTeamBillingPeriodWithCredits(
 	if err != nil {
 		return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("convert memory breakdown failed: %w", err)
 	}
-	storageUSD, err := storageGibSeconds.Mul(storageRate).Quantize(billingMoneyScale)
-	if err != nil {
-		return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("convert storage breakdown failed: %w", err)
-	}
-	storageUSDNumeric, err := storageUSD.Numeric()
-	if err != nil {
-		return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("convert storage breakdown failed: %w", err)
+	storageUSDNumeric := pgtype.Numeric{}
+	if storageBillingEnabled {
+		storageUSD, err := storageGibSeconds.Mul(storageRate).Quantize(billingMoneyScale)
+		if err != nil {
+			return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("convert storage breakdown failed: %w", err)
+		}
+		storageUSDNumeric, err = storageUSD.Numeric()
+		if err != nil {
+			return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("convert storage breakdown failed: %w", err)
+		}
 	}
 
 	return FinalizeTeamBillingPeriodResult{
@@ -310,6 +325,24 @@ func FinalizeTeamBillingPeriodWithCredits(
 			},
 		},
 	}, nil
+}
+
+func storageBillingEnabledFromExportAttempts(rows []db.BillingUsageExport) bool {
+	for _, row := range rows {
+		if row.ResourceType == "storage" && isSuccessfulBillingExportAttempt(row.Status) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSuccessfulBillingExportAttempt(status string) bool {
+	switch status {
+	case "sent", "accepted":
+		return true
+	default:
+		return false
+	}
 }
 
 type exactDecimal struct {
@@ -428,28 +461,32 @@ func maxInt(a, b int) int {
 }
 
 func ValidateSummaryPricingRates(rows []db.ListActivePricingRatesForTeamCurrentRow) (map[string]db.ListActivePricingRatesForTeamCurrentRow, error) {
-	return validateSummaryPricingRatesCurrent(rows)
+	return validateSummaryPricingRatesCurrent(rows, false)
 }
 
-func validateSummaryPricingRatesCurrent(rows []db.ListActivePricingRatesForTeamCurrentRow) (map[string]db.ListActivePricingRatesForTeamCurrentRow, error) {
+func validateSummaryPricingRatesCurrent(rows []db.ListActivePricingRatesForTeamCurrentRow, storageBillingEnabled bool) (map[string]db.ListActivePricingRatesForTeamCurrentRow, error) {
 	if len(rows) == 0 {
 		return nil, errors.New("billing pricing plan has no active rates")
 	}
 
-	rates := make(map[string]db.ListActivePricingRatesForTeamCurrentRow, len(requiredSummaryResources))
+	required := requiredSummaryResources(storageBillingEnabled)
+	rates := make(map[string]db.ListActivePricingRatesForTeamCurrentRow, len(required))
 	for _, row := range rows {
-		if _, ok := requiredSummaryResources[row.Resource]; !ok {
+		if _, ok := required[row.Resource]; !ok && row.Resource != "storage_gib" {
 			return nil, fmt.Errorf("billing pricing plan has an unsupported active rate: resource=%s", row.Resource)
 		}
 		if row.Unit != "second" {
 			return nil, fmt.Errorf("billing pricing plan has an unsupported active rate: resource=%s unit=%s", row.Resource, row.Unit)
+		}
+		if row.Resource == "storage_gib" && !storageBillingEnabled {
+			continue
 		}
 		if _, ok := rates[row.Resource]; ok {
 			return nil, fmt.Errorf("billing pricing plan returned duplicate active rates: resource=%s", row.Resource)
 		}
 		rates[row.Resource] = row
 	}
-	for resource := range requiredSummaryResources {
+	for resource := range required {
 		if _, ok := rates[resource]; !ok {
 			return nil, fmt.Errorf("billing summary pricing plan is missing an active rate: resource=%s", resource)
 		}
@@ -457,7 +494,7 @@ func validateSummaryPricingRatesCurrent(rows []db.ListActivePricingRatesForTeamC
 	return rates, nil
 }
 
-func validateSummaryPricingRatesForFinalization(rows []db.ListActivePricingRatesForTeamRow) (map[string]db.ListActivePricingRatesForTeamCurrentRow, error) {
+func validateSummaryPricingRatesForFinalization(rows []db.ListActivePricingRatesForTeamRow, storageBillingEnabled bool) (map[string]db.ListActivePricingRatesForTeamCurrentRow, error) {
 	converted := make([]db.ListActivePricingRatesForTeamCurrentRow, 0, len(rows))
 	for _, row := range rows {
 		converted = append(converted, db.ListActivePricingRatesForTeamCurrentRow{
@@ -470,7 +507,7 @@ func validateSummaryPricingRatesForFinalization(rows []db.ListActivePricingRates
 			EffectiveFrom: row.EffectiveFrom,
 		})
 	}
-	return validateSummaryPricingRatesCurrent(converted)
+	return validateSummaryPricingRatesCurrent(converted, storageBillingEnabled)
 }
 
 func FinalizeExportedBillingPeriods(ctx context.Context, pool *pgxpool.Pool, batchSize int) (int, error) {
