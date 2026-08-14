@@ -367,6 +367,10 @@ func TestReceipt_QuiesceTimeoutWritesNothing(t *testing.T) {
 	p := newTestPool(t, m)
 	p.abandonOnStop = true
 
+	oldWait := abandonStopWait
+	abandonStopWait = 50 * time.Millisecond
+	t.Cleanup(func() { abandonStopWait = oldWait })
+
 	// A worker that never observes stopCh in time: hold the wait group past
 	// the quiesce bound so Stop must give up.
 	p.wg.Add(1)
@@ -376,7 +380,7 @@ func TestReceipt_QuiesceTimeoutWritesNothing(t *testing.T) {
 	tStart := time.Now()
 	p.Stop()
 	close(release)
-	if time.Since(tStart) > 10*time.Second {
+	if time.Since(tStart) > 5*time.Second {
 		t.Fatal("Stop must stay bounded")
 	}
 	if p.quiesced {
@@ -385,5 +389,153 @@ func TestReceipt_QuiesceTimeoutWritesNothing(t *testing.T) {
 	p.CommitReceipt()
 	if _, err := os.Stat(receiptPath); !os.IsNotExist(err) {
 		t.Fatal("timeout quiesce must write no receipt")
+	}
+}
+
+// stubAttachVerify overrides the attach+verify seam.
+func stubAttachVerify(t *testing.T, fn func(FirewallConfig) (*Firewall, error)) {
+	t.Helper()
+	old := attachAndVerifyFirewall
+	attachAndVerifyFirewall = fn
+	t.Cleanup(func() { attachAndVerifyFirewall = old })
+}
+
+// TestFastAdopt_UnverifiedFirewallDemotes pins the security gate: an attach
+// that cannot verify the kernel objects must demote, never publish a slot
+// whose namespace may hold no enforcement.
+func TestFastAdopt_UnverifiedFirewallDemotes(t *testing.T) {
+	withReceiptSeams(t, "boot-a", "9")
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.abandonOnStop = true
+
+	touchNS(t, dir, "ns-1")
+	if err := os.WriteFile(filepath.Join(hostNetDir, "veth-1"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeTestReceipt(t, &poolReceipt{
+		BootID: "boot-a", Generation: 8, Fingerprint: slotPolicyFingerprint(), Fresh: []int{1},
+	})
+	stubNsExecGo(t, func(ns string, inner func() error) error { return inner() })
+	stubAttachVerify(t, func(FirewallConfig) (*Firewall, error) {
+		return nil, fmt.Errorf("attached but unverified: chain missing")
+	})
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(*Manager, context.Context, string) error { return nil })
+	var fullPath atomic.Int64
+	stubAdoptSlot(t, func(_ *Manager, _ context.Context, idx int) (*VMNetInfo, string, error) {
+		fullPath.Add(1)
+		return &VMNetInfo{Namespace: nsNameForSlot(idx), HostIP: hostIPForSlot(idx)}, vethNameForSlot(idx), nil
+	})
+
+	adopted, _, _ := p.AdoptOrphanSlots(context.Background())
+	if adopted != 1 || fullPath.Load() != 1 {
+		t.Fatalf("unverified slot must demote to full path: adopted=%d fullPath=%d", adopted, fullPath.Load())
+	}
+}
+
+// TestFastAdopt_PanicDemotes pins index accounting: a panic inside vouched
+// validation must land the index in the full path, never strand it.
+func TestFastAdopt_PanicDemotes(t *testing.T) {
+	withReceiptSeams(t, "boot-a", "9")
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.abandonOnStop = true
+
+	touchNS(t, dir, "ns-1")
+	if err := os.WriteFile(filepath.Join(hostNetDir, "veth-1"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeTestReceipt(t, &poolReceipt{
+		BootID: "boot-a", Generation: 8, Fingerprint: slotPolicyFingerprint(), Fresh: []int{1},
+	})
+	stubNsExecGo(t, func(ns string, inner func() error) error { panic("validation blew up") })
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(*Manager, context.Context, string) error { return nil })
+	var fullPath atomic.Int64
+	stubAdoptSlot(t, func(_ *Manager, _ context.Context, idx int) (*VMNetInfo, string, error) {
+		fullPath.Add(1)
+		return &VMNetInfo{Namespace: nsNameForSlot(idx), HostIP: hostIPForSlot(idx)}, vethNameForSlot(idx), nil
+	})
+
+	adopted, _, _ := p.AdoptOrphanSlots(context.Background())
+	if adopted != 1 || fullPath.Load() != 1 {
+		t.Fatalf("panicking validation must demote: adopted=%d fullPath=%d", adopted, fullPath.Load())
+	}
+}
+
+// TestFastAdopt_TimeoutDemotesAndAborts pins the wedge protection: a hung
+// in-namespace validation demotes its slot after the bound, and systemic
+// timeouts abort the whole fast pass instead of hanging adoption.
+func TestFastAdopt_TimeoutDemotesAndAborts(t *testing.T) {
+	withReceiptSeams(t, "boot-a", "9")
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.abandonOnStop = true
+
+	oldTimeout := fastAdoptSlotTimeout
+	fastAdoptSlotTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { fastAdoptSlotTimeout = oldTimeout })
+
+	const slots = 6
+	var vouched []int
+	for i := 1; i <= slots; i++ {
+		touchNS(t, dir, fmt.Sprintf("ns-%d", i))
+		if err := os.WriteFile(filepath.Join(hostNetDir, fmt.Sprintf("veth-%d", i)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		vouched = append(vouched, i)
+	}
+	writeTestReceipt(t, &poolReceipt{
+		BootID: "boot-a", Generation: 8, Fingerprint: slotPolicyFingerprint(), Fresh: vouched,
+	})
+	// The abandoned validation goroutines outlive the adoption pass by
+	// design; the test must unblock AND drain them before the stub seam is
+	// restored, or their late reads race the cleanup write. t.Cleanup runs
+	// LIFO: restore is registered first (runs last), drain second (runs
+	// first).
+	block := make(chan struct{})
+	var entered, exited atomic.Int64
+	oldExec := nsExecGoFunc
+	t.Cleanup(func() { nsExecGoFunc = oldExec })
+	nsExecGoFunc = func(ns string, inner func() error) error {
+		entered.Add(1)
+		<-block
+		exited.Add(1)
+		return nil
+	}
+	t.Cleanup(func() {
+		close(block)
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			e := entered.Load()
+			time.Sleep(50 * time.Millisecond)
+			if entered.Load() == e && exited.Load() == e {
+				return
+			}
+		}
+		t.Log("warning: abandoned validators did not drain")
+	})
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(*Manager, context.Context, string) error { return nil })
+	var fullPath atomic.Int64
+	stubAdoptSlot(t, func(_ *Manager, _ context.Context, idx int) (*VMNetInfo, string, error) {
+		fullPath.Add(1)
+		return &VMNetInfo{Namespace: nsNameForSlot(idx), HostIP: hostIPForSlot(idx)}, vethNameForSlot(idx), nil
+	})
+
+	done := make(chan struct{})
+	var adopted int64
+	go func() { adopted, _, _ = p.AdoptOrphanSlots(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("adoption hung on wedged fast-path validation")
+	}
+	if adopted != slots || fullPath.Load() != slots {
+		t.Fatalf("every wedged slot must reach the full path: adopted=%d fullPath=%d", adopted, fullPath.Load())
 	}
 }

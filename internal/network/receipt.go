@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // The pool receipt is not cached state — it is a short-lived capability
@@ -178,51 +179,122 @@ func consumePoolReceipt() (*poolReceipt, string) {
 // validation without real kernel namespaces.
 var nsExecGoFunc = nsExecGo
 
+// attachAndVerifyFirewall binds a handle to the namespace's existing ruleset
+// and confirms the kernel actually holds it. A seam so tests can exercise
+// the demotion paths without kernel nftables.
+var attachAndVerifyFirewall = func(cfg FirewallConfig) (*Firewall, error) {
+	fw, err := AttachFirewall(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := fw.VerifyAttached(); err != nil {
+		_ = fw.Close()
+		return nil, fmt.Errorf("attached but unverified: %w", err)
+	}
+	return fw, nil
+}
+
+// fastAdoptSlotTimeout bounds one vouched slot's in-namespace validation.
+// The checks are milliseconds when healthy; the bound exists because netlink
+// can wedge with a pinned thread (the same failure the full path bounds at
+// its larger budget), and a wedged fast path must degrade to the full path,
+// never hang the adoption pass.
+var fastAdoptSlotTimeout = 3 * time.Second
+
 // fastAdoptVouched runs the cheap validation a vouched slot must still pass
 // before rejoining inventory: namespace present, host veth present, zero
 // occupants (from the caller's single batched /proc scan), and — inside the
-// namespace — the tap device present and a firewall handle attachable to
-// the previous process's ruleset. No teardown, no reinstall, no routes: the
-// kernel objects were settled inventory of the immediately preceding
-// process and the fingerprint proves the policy that built them is current.
-// Any failure returns nil and the slot is demoted to the full path.
-func (p *Pool) fastAdoptVouched(idx int, nsSet, vethSet map[string]bool, occupied map[string]bool) *preallocSlot {
+// namespace — the tap device present and the previous process's ruleset
+// verified present in the kernel and attached. No teardown, no reinstall,
+// no routes: the kernel objects were settled inventory of the immediately
+// preceding process and the fingerprint proves the policy that built them
+// is current. Failure demotes to the full path (slot=nil); timedOut also
+// reports the in-namespace worker wedging so the caller can abort the fast
+// pass systemically. A panic in the validation demotes rather than killing
+// the worker — a pool-owned index must always land in one path or the other.
+func (p *Pool) fastAdoptVouched(idx int, nsSet, vethSet map[string]bool, occupied map[string]bool) (slot *preallocSlot, timedOut bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.log.Error().Interface("panic", r).Int("slot", idx).
+				Msg("pool: vouched slot validation panicked — demoting to full adoption")
+			slot = nil
+		}
+	}()
 	nsName := nsNameForSlot(idx)
 	vethName := vethNameForSlot(idx)
 	if !nsSet[nsName] || !vethSet[vethName] || occupied[nsName] {
-		return nil
+		return nil, false
 	}
-	var fw *Firewall
-	err := nsExecGoFunc(nsName, func() error {
-		if _, err := net.InterfaceByName(TAPName); err != nil {
-			return fmt.Errorf("tap missing: %w", err)
+
+	type result struct {
+		fw  *Firewall
+		err error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		// The result send must happen on EVERY exit — a panic that killed
+		// this goroutine silently would leave the select below waiting out
+		// the timeout and misclassify the failure as a wedge, feeding the
+		// systemic abort counter.
+		var fw *Firewall
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("validation panicked: %v", r)
+				}
+			}()
+			err = nsExecGoFunc(nsName, func() error {
+				if _, err := net.InterfaceByName(TAPName); err != nil {
+					return fmt.Errorf("tap missing: %w", err)
+				}
+				var aerr error
+				fw, aerr = attachAndVerifyFirewall(FirewallConfig{
+					TAPInterface: TAPName,
+					VethPeer:     "eth0",
+					VMIP:         VMInternalIP,
+					HostIP:       hostIPForSlot(idx),
+					GatewayIP:    VMGatewayIP,
+				})
+				return aerr
+			})
+		}()
+		if err != nil && fw != nil {
+			_ = fw.Close()
+			fw = nil
 		}
-		var aerr error
-		fw, aerr = AttachFirewall(FirewallConfig{
-			TAPInterface: TAPName,
-			VethPeer:     "eth0",
-			VMIP:         VMInternalIP,
-			HostIP:       hostIPForSlot(idx),
-			GatewayIP:    VMGatewayIP,
-		})
-		return aerr
-	})
-	if err != nil {
-		p.log.Debug().Err(err).Int("slot", idx).Msg("pool: vouched slot failed fast validation — demoting to full adoption")
-		return nil
-	}
-	return &preallocSlot{
-		idx: idx,
-		info: &VMNetInfo{
-			Namespace:  nsName,
-			TAPDevice:  TAPName,
-			VMIP:       VMInternalIP,
-			GatewayIP:  VMGatewayIP,
-			HostIP:     hostIPForSlot(idx),
-			MACAddress: macForSlot(idx),
-			Firewall:   fw,
-		},
-		vethName: vethName,
-		adopted:  true,
+		resCh <- result{fw, err}
+	}()
+
+	select {
+	case r := <-resCh:
+		if r.err != nil {
+			p.log.Debug().Err(r.err).Int("slot", idx).Msg("pool: vouched slot failed fast validation — demoting to full adoption")
+			return nil, false
+		}
+		return &preallocSlot{
+			idx: idx,
+			info: &VMNetInfo{
+				Namespace:  nsName,
+				TAPDevice:  TAPName,
+				VMIP:       VMInternalIP,
+				GatewayIP:  VMGatewayIP,
+				HostIP:     hostIPForSlot(idx),
+				MACAddress: macForSlot(idx),
+				Firewall:   r.fw,
+			},
+			vethName: vethName,
+			adopted:  true,
+		}, false
+	case <-time.After(fastAdoptSlotTimeout):
+		// Abandon the pinned worker; when it eventually finishes, its handle
+		// must not leak.
+		go func() {
+			if r := <-resCh; r.fw != nil {
+				_ = r.fw.Close()
+			}
+		}()
+		p.log.Warn().Int("slot", idx).Msg("pool: vouched slot validation timed out — demoting to full adoption")
+		return nil, true
 	}
 }

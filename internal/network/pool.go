@@ -166,10 +166,7 @@ const (
 	// under a second, and a tight bound keeps a stalled backlog (and Stop)
 	// from dragging.
 	resetTapTimeout = 3 * time.Second
-	// abandonStopWait bounds Stop's wait for in-flight pool goroutines under
-	// abandon-on-stop. Only quiesces logging — abandoned slots are recovered
-	// by boot-time adoption regardless.
-	abandonStopWait = 2 * time.Second
+	PLACEHOLDER_REMOVED
 	// adoptConcurrency bounds parallel orphan adoptions: each runs /proc
 	// scans and possibly a tap rebuild, and boot is exactly when the host is
 	// also reattaching VMs — keep the sweep gentle.
@@ -190,6 +187,18 @@ const (
 	// forgets. The escape is bounded by the claim budget regardless.
 	defaultAdoptEscapeStreak = 32
 )
+
+// abandonStopWait bounds Stop's wait for in-flight pool goroutines under
+// abandon-on-stop. It must exceed the longest operation a worker can
+// legally be inside — a queued tap rebuild (resetTapTimeout) plus
+// scheduling margin — because a completed join is what licenses the
+// shutdown receipt: a bound shorter than legal work would silently forfeit
+// the receipt on every deploy that lands during churn, exactly when it
+// matters. Verify-polls waiting out a slow guest (up to verifyMaxWait) can
+// still exceed this; those shutdowns forfeit the receipt deliberately
+// rather than holding the restart hostage. A var so tests can bound their
+// own runtime.
+var abandonStopWait = 10 * time.Second
 
 // Adoption pass phases (Pool.adoptPhase).
 const (
@@ -731,6 +740,7 @@ func (p *Pool) adoptFromReceipt(ctx context.Context, candidates []int) (remainin
 	}
 
 	var demoted int64
+	var timeouts atomic.Int64
 	var mu sync.Mutex
 	work := make(chan int)
 	var workers sync.WaitGroup
@@ -740,7 +750,10 @@ func (p *Pool) adoptFromReceipt(ctx context.Context, candidates []int) (remainin
 			defer workers.Done()
 			defer sentrylog.Recover("netpool-receipt-adopt")
 			for idx := range work {
-				slot := p.fastAdoptVouched(idx, nsSet, vethSet, occupied)
+				slot, timedOut := p.fastAdoptVouched(idx, nsSet, vethSet, occupied)
+				if timedOut {
+					timeouts.Add(1)
+				}
 				if slot == nil {
 					mu.Lock()
 					remaining = append(remaining, idx)
@@ -749,8 +762,13 @@ func (p *Pool) adoptFromReceipt(ctx context.Context, candidates []int) (remainin
 					continue
 				}
 				if !p.placeVouched(slot, preferRecycled[idx]) {
-					// No channel space: not a defect, just surplus. Route
-					// through the full path, which owns overflow teardown.
+					// No channel space: not a defect, just surplus. Close the
+					// attached handle — the full path opens its own — and
+					// route the index through it, which owns overflow
+					// teardown.
+					if slot.info.Firewall != nil {
+						_ = slot.info.Firewall.Close()
+					}
 					mu.Lock()
 					remaining = append(remaining, idx)
 					demoted++
@@ -767,6 +785,18 @@ func (p *Pool) adoptFromReceipt(ctx context.Context, candidates []int) (remainin
 	}
 feed:
 	for i, idx := range toValidate {
+		if timeouts.Load() >= adoptTimeoutAbort {
+			// Wedges are systemic (a stuck netlink wedges every candidate)
+			// and each strands a pinned thread — same reasoning as the full
+			// pass's abort. The remainder goes to the full path, which has
+			// its own bound and abort.
+			p.log.Error().Int64("timeouts", timeouts.Load()).
+				Msg("pool: receipt fast path aborting — validation timing out systemically")
+			mu.Lock()
+			remaining = append(remaining, toValidate[i:]...)
+			mu.Unlock()
+			break feed
+		}
 		select {
 		case work <- idx:
 		case <-p.stopCh:
