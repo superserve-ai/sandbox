@@ -1211,12 +1211,20 @@ func main() {
 
 	// ---- Heartbeat to control plane ----
 	if cfg.ControlPlaneURL != "" {
+		// Self-description is opt-in per host: set only after the control
+		// plane understands the fields (older ones reject unknown keys).
+		memoryMib, vcpus := vm.DetectHostCapacity()
 		lc.start("heartbeat", func() error {
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
-				ControlPlaneURL: cfg.ControlPlaneURL,
-				HostID:          cfg.HostID,
-				Token:           os.Getenv("INTERNAL_API_TOKEN"),
-				ProxyHealthURL:  os.Getenv("PROXY_HEALTH_URL"),
+				ControlPlaneURL:    cfg.ControlPlaneURL,
+				HostID:             cfg.HostID,
+				Token:              os.Getenv("INTERNAL_API_TOKEN"),
+				ProxyHealthURL:     os.Getenv("PROXY_HEALTH_URL"),
+				AdvertiseVMDAddr:   os.Getenv("VMD_ADVERTISE_ADDR"),
+				AdvertiseProxyAddr: os.Getenv("PROXY_ADVERTISE_ADDR"),
+				Region:             os.Getenv("HOST_REGION"),
+				CapacityMemoryMib:  memoryMib,
+				CapacityVcpus:      vcpus,
 			}, log)
 			return nil
 		})
