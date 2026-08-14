@@ -448,6 +448,18 @@ def main() -> int:
             sudo install -d -m 0755 /etc/systemd/system/superserve-vmd.service.d
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-rollback-guard.conf /etc/systemd/system/superserve-vmd.service.d/10-rollback-guard.conf
             sudo systemctl daemon-reload
+            # daemon-reload alone does not apply [Slice] resource values to
+            # an already-active cgroup (same systemd behavior the TasksMax
+            # block below works around), and sandboxes.slice is active on
+            # any host with VMs. Apply the weights to the live slice;
+            # --runtime keeps the unit file the durable source for boot.
+            # Keep the values in lockstep with deploy/sandboxes.slice.
+            #
+            # WARNING: this runtime override survives a rollback to an
+            # older script revision (which cannot know to clear it) and
+            # lasts until reboot. To clear it by hand:
+            #   systemctl set-property --runtime sandboxes.slice CPUWeight=100 IOWeight=100
+            sudo systemctl set-property --runtime sandboxes.slice CPUWeight=400 IOWeight=400 2>/dev/null || true
             sudo systemctl enable --quiet superserve-vmd.socket
             sudo systemctl enable --now --quiet superserve-maintenance-watch.timer
             # Delegated cgroup subtree for direct-spawn VMs. Enable for boot, but
