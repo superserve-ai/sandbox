@@ -41,22 +41,22 @@ type Firewall struct {
 	userDenySet        *nftables.Set
 	userAllowSet       *nftables.Set
 
-	tapIface   string
-	vethPeer   string // namespace-side veth (e.g. "eth0")
-	vmIP       string // VM internal IP (169.254.0.21)
-	hostIP     string // host-side IP for this sandbox
-	gatewayIP  string // orchestrator IP allowed through firewall
+	tapIface  string
+	vethPeer  string // namespace-side veth (e.g. "eth0")
+	vmIP      string // VM internal IP (169.254.0.21)
+	hostIP    string // host-side IP for this sandbox
+	gatewayIP string // orchestrator IP allowed through firewall
 
 	// TCP proxy ports for domain-based filtering.
 }
 
 // FirewallConfig holds the parameters needed to create a Firewall.
 type FirewallConfig struct {
-	TAPInterface   string
-	VethPeer       string // namespace-side veth name
-	VMIP           string
-	HostIP         string
-	GatewayIP      string // IP always allowed (orchestrator/gateway)
+	TAPInterface string
+	VethPeer     string // namespace-side veth name
+	VMIP         string
+	HostIP       string
+	GatewayIP    string // IP always allowed (orchestrator/gateway)
 }
 
 // NewFirewall creates nftables rules inside the current network namespace.
@@ -426,7 +426,6 @@ func (fw *Firewall) installMSSClamping() {
 		),
 	})
 }
-
 
 // ---------------------------------------------------------------------------
 // ReplaceUserRules — atomic set replacement

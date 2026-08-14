@@ -1,6 +1,12 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/rs/zerolog"
+)
 
 func TestParseSecretsProxyAddr(t *testing.T) {
 	t.Parallel()
@@ -67,4 +73,52 @@ func TestPausedNetworkReclaimTriggersConfigured(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLifecycle_CleanIntentionalShutdownGate pins the receipt-minting
+// invariant: only a signal-initiated shutdown with no service error and no
+// closer failure qualifies. An unexpected service return — even error-free —
+// and a failing closer must both disqualify.
+func TestLifecycle_CleanIntentionalShutdownGate(t *testing.T) {
+	log := zerolog.Nop()
+
+	t.Run("signal initiated and clean", func(t *testing.T) {
+		lc := newLifecycle(log)
+		lc.noteSignalInitiated()
+		lc.shutdown(context.Background())
+		if !lc.cleanIntentionalShutdown() {
+			t.Fatal("clean signal-initiated shutdown must qualify")
+		}
+	})
+
+	t.Run("unexpected error-free service return", func(t *testing.T) {
+		lc := newLifecycle(log)
+		lc.start("svc", func() error { return nil })
+		lc.wait(context.Background())
+		lc.shutdown(context.Background())
+		if lc.cleanIntentionalShutdown() {
+			t.Fatal("a service returning on its own is not intentional, even without error")
+		}
+	})
+
+	t.Run("service error", func(t *testing.T) {
+		lc := newLifecycle(log)
+		lc.noteSignalInitiated()
+		lc.start("svc", func() error { return fmt.Errorf("boom") })
+		lc.wait(context.Background())
+		lc.shutdown(context.Background())
+		if lc.cleanIntentionalShutdown() {
+			t.Fatal("a service error must disqualify")
+		}
+	})
+
+	t.Run("closer failure", func(t *testing.T) {
+		lc := newLifecycle(log)
+		lc.noteSignalInitiated()
+		lc.addCloser("bad", func(context.Context) error { return fmt.Errorf("close failed") })
+		lc.shutdown(context.Background())
+		if lc.cleanIntentionalShutdown() {
+			t.Fatal("a failing closer must disqualify")
+		}
+	})
 }
