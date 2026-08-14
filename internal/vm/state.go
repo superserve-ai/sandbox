@@ -154,6 +154,10 @@ type VMRecord struct {
 	// and a resume relaunch verifies readiness synchronously before
 	// clearing it.
 	Unverified bool `json:"unverified,omitempty"`
+	// RevivalPending marks a record kept alive across a revival attempt:
+	// it is the retry's anchor (revive refuses unknown sandboxes), so
+	// startup stale cleanup must park it instead of deleting it.
+	RevivalPending bool `json:"revival_pending,omitempty"`
 	// TeardownPending mirrors VMInstance.TeardownPending: a non-empty value
 	// is an explicit, durable claim that this record's resources were
 	// deliberately retained after a failed op and the reconciler owns the
@@ -619,6 +623,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		MACAddress:                 inst.MACAddress,
 		Status:                     inst.Status,
 		Unverified:                 inst.Unverified,
+		RevivalPending:             inst.RevivalPending,
 		TeardownPending:            inst.TeardownPending,
 		RunDirID:                   inst.RunDirID,
 		Namespace:                  inst.Namespace,
@@ -708,6 +713,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		MACAddress:                 rec.MACAddress,
 		Status:                     rec.Status,
 		Unverified:                 rec.Unverified,
+		RevivalPending:             rec.RevivalPending,
 		TeardownPending:            rec.TeardownPending,
 		RunDirID:                   rec.RunDirID,
 		Namespace:                  rec.Namespace,

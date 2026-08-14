@@ -89,25 +89,26 @@ func (s VMStatus) String() string {
 
 // VMInstance holds the runtime state of a single microVM.
 type VMInstance struct {
-	ID           string
-	PID          int
-	SocketPath   string
-	VsockPath    string
-	IP           string
-	TAPDevice    string
-	MACAddress   string
-	Status       VMStatus
-	Unverified   bool // Running persisted before boxd readiness (see VMRecord)
-	Config       VMConfig
-	RunDirID     string // Directory name under RunDir for this VM's files.
-	Namespace    string // Network namespace name.
-	DiskPath     string
-	SnapshotPath string
-	MemFilePath  string
-	CreatedAt    time.Time
-	Metadata     map[string]string
-	TeamID       string // owning team; carried for data-plane usage attribution
-	OwnerID      string // creating user; empty when unknown
+	ID             string
+	PID            int
+	SocketPath     string
+	VsockPath      string
+	IP             string
+	TAPDevice      string
+	MACAddress     string
+	Status         VMStatus
+	Unverified     bool // Running persisted before boxd readiness (see VMRecord)
+	RevivalPending bool // revival attempt in flight (see VMRecord)
+	Config         VMConfig
+	RunDirID       string // Directory name under RunDir for this VM's files.
+	Namespace      string // Network namespace name.
+	DiskPath       string
+	SnapshotPath   string
+	MemFilePath    string
+	CreatedAt      time.Time
+	Metadata       map[string]string
+	TeamID         string // owning team; carried for data-plane usage attribution
+	OwnerID        string // creating user; empty when unknown
 	// PausedAt records when this VM last entered the paused state. It drives
 	// oldest-first pressure reclamation. Zero means the field is unset on a
 	// legacy record; callers fall back to CreatedAt and then place any fully
@@ -3053,6 +3054,20 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// Park it as Error instead (durable via the publish tail), preserving the
 	// value for the binary that understands it. The live-cgroup correction
 	// above already repaired the one case reality can prove.
+	// A revival interrupted by a restart must keep its record: it is the
+	// retry's anchor (revive refuses unknown sandboxes), and the stale
+	// cleanup below would delete it as a dead non-paused record. Park it
+	// as Error without adopting; the retry's at-rest probe gates any
+	// residue before a new boot, and the retry clears the mark.
+	if rec.RevivalPending && rec.Status != StatusPaused {
+		log.Warn().Msg("revival interrupted by restart — parking record for retry")
+		rec.Status = StatusError
+		if err := m.state.Put(rec); err != nil {
+			log.Error().Err(err).Msg("park interrupted-revival record")
+		}
+		return nil, false
+	}
+
 	unmanageableMode := !knownSupervision(rec.Supervision)
 	if unmanageableMode {
 		log.Error().Str("supervision", string(rec.Supervision)).

@@ -233,22 +233,28 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		}
 	}()
 	// Exactly one destroy (ours) may separate the record read from this
-	// point. More means an external destroy interleaved: its deletion is
-	// authoritative and revival must not recreate the sandbox.
+	// point; more means an external destroy interleaved, and its deletion
+	// is authoritative. The check and the record's return to the store
+	// happen under the record-owner mutex so a destroy cannot complete
+	// between them and be silently undone by the write. The record rides
+	// out the copy marked RevivalPending: the copy can take minutes on a
+	// full disk, a crash there must not leave the sandbox recordless
+	// (revival refuses unknown sandboxes), and startup stale cleanup
+	// parks pending records instead of deleting them.
+	unlockOwner := m.lockRecordOwner(vmID)
 	if m.destroyEpoch(vmID) != epochAtRead+1 {
+		unlockOwner()
 		return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while revival was preparing; the destroy is authoritative", vmID)
 	}
-	// The salvage copy can take minutes on a full disk, and a vmd crash
-	// there must not leave the sandbox recordless: revival refuses
-	// unknown sandboxes, so a missing record bricks every retry. The
-	// zombie record returns to the store for the copy's duration; the
-	// boot's seeded persists overwrite it truthfully, and the failure
-	// and destroy paths handle it from there.
 	if m.state != nil {
-		if perr := m.state.Put(*prevRec); perr != nil {
+		pending := *prevRec
+		pending.RevivalPending = true
+		if perr := m.state.Put(pending); perr != nil {
+			unlockOwner()
 			return nil, status.Errorf(codes.Internal, "keep record across boot: %v", perr)
 		}
 	}
+	unlockOwner()
 	teardownDur := time.Since(reviveStart)
 	// The revived VM lives under the fleet's real supervision, seeded
 	// from the zombie's recorded mode (default unit for records that
@@ -281,6 +287,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// preview policy as legacy-public.
 	seed := func(inst *VMInstance) {
 		inst.Unverified = true
+		inst.RevivalPending = true
 		inst.TeamID = prevRec.TeamID
 		inst.OwnerID = prevRec.OwnerID
 		inst.PreviewAccess = prevRec.PreviewAccess
@@ -323,6 +330,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// verified running VM.
 	inst.mu.Lock()
 	inst.Unverified = false
+	inst.RevivalPending = false
 	inst.mu.Unlock()
 	// Durable record: reattach and the reconciler must know this VM
 	// after a vmd restart, exactly like any created VM. A revival the
