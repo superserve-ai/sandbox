@@ -1210,6 +1210,11 @@ type ReviveVMRequest struct {
 	// with allow or deny rules must not come back running open. Same
 	// ownership as ResumeVM's rules: the control plane knows them, the
 	// host does not.
+	// Base image for overlay-mode salvages: the sparse overlay's holes
+	// are windows to this shared read-only base, and booting the overlay
+	// standalone would corrupt the guest. Empty defaults to the zombie's
+	// recorded base; explicitly empty with no record boots standalone.
+	BasePath       string   `protobuf:"bytes,8,opt,name=base_path,json=basePath,proto3" json:"base_path,omitempty"`
 	AllowedCidrs   []string `protobuf:"bytes,5,rep,name=allowed_cidrs,json=allowedCidrs,proto3" json:"allowed_cidrs,omitempty"`
 	DeniedCidrs    []string `protobuf:"bytes,6,rep,name=denied_cidrs,json=deniedCidrs,proto3" json:"denied_cidrs,omitempty"`
 	AllowedDomains []string `protobuf:"bytes,7,rep,name=allowed_domains,json=allowedDomains,proto3" json:"allowed_domains,omitempty"`
@@ -1273,6 +1278,13 @@ func (x *ReviveVMRequest) GetMemMib() uint32 {
 		return x.MemMib
 	}
 	return 0
+}
+
+func (x *ReviveVMRequest) GetBasePath() string {
+	if x != nil {
+		return x.BasePath
+	}
+	return ""
 }
 
 func (x *ReviveVMRequest) GetAllowedCidrs() []string {
@@ -3751,12 +3763,13 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x11DestroyVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1d\n" +
 	"\n" +
-	"cleaned_up\x18\x02 \x01(\bR\tcleanedUp\"\xe1\x01\n" +
+	"cleaned_up\x18\x02 \x01(\bR\tcleanedUp\"\xfe\x01\n" +
 	"\x0fReviveVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1b\n" +
 	"\tdisk_path\x18\x02 \x01(\tR\bdiskPath\x12\x12\n" +
 	"\x04vcpu\x18\x03 \x01(\rR\x04vcpu\x12\x17\n" +
-	"\amem_mib\x18\x04 \x01(\rR\x06memMib\x12#\n" +
+	"\amem_mib\x18\x04 \x01(\rR\x06memMib\x12\x1b\n" +
+	"\tbase_path\x18\b \x01(\tR\bbasePath\x12#\n" +
 	"\rallowed_cidrs\x18\x05 \x03(\tR\fallowedCidrs\x12!\n" +
 	"\fdenied_cidrs\x18\x06 \x03(\tR\vdeniedCidrs\x12'\n" +
 	"\x0fallowed_domains\x18\a \x03(\tR\x0eallowedDomains\"H\n" +

@@ -62,6 +62,17 @@ func runRevive(args []string) int {
 			continue
 		}
 		req := &vmdpb.ReviveVMRequest{VmId: fields[0], DiskPath: fields[1]}
+		// Optional named tokens anywhere after the disk: base=<path> for
+		// overlay salvages (defaults to the sandbox's recorded base).
+		rest := fields[2:]
+		fields = fields[:2]
+		for _, tok := range rest {
+			if p, ok := strings.CutPrefix(tok, "base="); ok {
+				req.BasePath = p
+			} else {
+				fields = append(fields, tok)
+			}
+		}
 		// Malformed resource fields reject the line rather than silently
 		// booting at defaults: a typo must not revive a 32 GiB workload
 		// into a 1 GiB VM.

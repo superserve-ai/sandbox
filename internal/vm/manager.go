@@ -828,7 +828,12 @@ func pidIsVMFirecracker(pid int, vmID string) bool {
 // coldBootFromRootfs is the parameterized form: boot a VM from a specific
 // rootfs at the requested vcpu/memory. Used by BuildTemplate to boot the
 // build VM from a freshly-produced rootfs at the template's target shape.
-func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath string, vcpu, memMiB uint32) (*VMInstance, error) {
+// basePath, when non-empty, boots the rootfs as a sparse overlay backed
+// by that shared read-only base (the fork's overlay drive mode); the
+// per-VM copy must then be hole-exact, so it reflinks strictly rather
+// than falling back to a heuristic sparse copy that could turn
+// guest-written zeros into holes exposing base content.
+func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath string, vcpu, memMiB uint32) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
@@ -858,16 +863,26 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 			MemoryMiB:  memMiB,
 			KernelPath: m.cfg.KernelPath,
 			RootfsPath: rootfsPath,
+			BasePath:   basePath,
 		},
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
-	log.Info().Str("rootfs", rootfsPath).Uint32("vcpu", vcpu).Uint32("mem_mib", memMiB).Msg("cold-booting VM")
+	log.Info().Str("rootfs", rootfsPath).Str("base", basePath).Uint32("vcpu", vcpu).Uint32("mem_mib", memMiB).Msg("cold-booting VM")
 
-	// 1. Copy the rootfs for this VM.
-	diskPath, err := m.copyRootfs(ctx, vmID, rootfsPath)
+	// 1. Copy the rootfs for this VM. Overlay sources demand a
+	// hole-exact copy (reflink, no heuristic fallback): every hole is a
+	// window to the base, and a guest-written zero run misdetected as a
+	// hole would silently resurface base content.
+	var diskPath string
+	var err error
+	if basePath != "" {
+		diskPath, err = m.copyRootfsExact(ctx, vmID, rootfsPath)
+	} else {
+		diskPath, err = m.copyRootfs(ctx, vmID, rootfsPath)
+	}
 	if err != nil {
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
@@ -903,6 +918,7 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 		KernelPath: m.cfg.KernelPath,
 		KernelArgs: "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=0 random.trust_cpu=on",
 		RootfsPath: diskPath,
+		BasePath:   basePath,
 		VCPUCount:  int(vcpu),
 		MemSizeMiB: int(memMiB),
 		TAPDevice:  network.TAPName,
@@ -4200,6 +4216,22 @@ func (m *Manager) copyRootfs(ctx context.Context, dirName, srcRootfs string) (st
 		return "", fmt.Errorf("copy rootfs: %s: %w", string(out), err)
 	}
 
+	return diskPath, nil
+}
+
+// copyRootfsExact reflinks the source into the VM's run dir with no
+// fallback: extent-exact or error, for overlay sources whose holes are
+// semantically load-bearing.
+func (m *Manager) copyRootfsExact(ctx context.Context, dirName, srcRootfs string) (string, error) {
+	vmDir := filepath.Join(m.cfg.RunDir, dirName)
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir vm dir: %w", err)
+	}
+	diskPath := filepath.Join(vmDir, "rootfs.ext4")
+	cmd := exec.CommandContext(ctx, "cp", "--reflink=always", srcRootfs, diskPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("exact copy (source and run dir must share a reflink filesystem): %s: %w", string(out), err)
+	}
 	return diskPath, nil
 }
 

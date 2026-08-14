@@ -28,7 +28,7 @@ import (
 // only after this returns, and the ordinary auto-pause machinery then
 // takes the revived sandbox through the standard pause path, which is
 // what lands it paused with a fresh, uploaded generation.
-func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath string, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
+func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
 	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
 		return nil, status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
 	}
@@ -80,6 +80,25 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath string, vcpu, mem
 		}
 	}
 
+	// Overlay-mode sandboxes salvage as sparse overlays whose holes are
+	// windows to a shared base image; booting one standalone would read
+	// every hole as zeros and corrupt the guest's filesystem. The base
+	// comes from the request or, absent there, the zombie's own durable
+	// record, and when neither names one the disk boots standalone
+	// (legacy full-image sandboxes). A named base must exist.
+	if basePath == "" && prevRec != nil {
+		basePath = prevRec.BasePath
+	}
+	if basePath != "" {
+		bfi, err := os.Stat(basePath)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "base_path: %v", err)
+		}
+		if !bfi.Mode().IsRegular() {
+			return nil, status.Errorf(codes.InvalidArgument, "base_path %q is not a regular file", basePath)
+		}
+	}
+
 	// The salvage must live outside the zombie's run directory: the
 	// forced teardown below removes that directory, and a salvage
 	// inside it would be deleted before the boot could copy it.
@@ -100,7 +119,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath string, vcpu, mem
 	if err := m.DestroyVM(ctx, vmID, true); err != nil {
 		return nil, fmt.Errorf("clear residue: %w", err)
 	}
-	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, vcpu, memMiB)
+	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, vcpu, memMiB)
 	if err != nil {
 		return nil, err
 	}

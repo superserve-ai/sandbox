@@ -281,6 +281,11 @@ message ReviveVMRequest {
   // with allow or deny rules must not come back running open. Same
   // ownership as ResumeVM's rules: the control plane knows them, the
   // host does not.
+  // Base image for overlay-mode salvages: the sparse overlay's holes
+  // are windows to this shared read-only base, and booting the overlay
+  // standalone would corrupt the guest. Empty defaults to the zombie's
+  // recorded base; explicitly empty with no record boots standalone.
+  string base_path = 8;
   repeated string allowed_cidrs = 5;
   repeated string denied_cidrs = 6;
   repeated string allowed_domains = 7;
