@@ -76,6 +76,24 @@ func RecordSandboxTransition(ctx context.Context, operation, result, hostID stri
 	})
 }
 
+// RecordResumeSettleWait records ResumeSandbox waiting through a racing
+// finalize-pause write. Callers should only invoke this when the loop
+// actually waited (more than one read) — it is meant to run once per
+// affected resume, not once per poll iteration.
+func RecordResumeSettleWait(ctx context.Context, settled bool, hostID string, waited time.Duration, reads int) {
+	result := telemetry.SettleResultTimeout
+	if settled {
+		result = telemetry.SettleResultSettled
+	}
+	currentTelemetryRecorder().RecordSandboxResumeSettleWait(ctx, telemetry.SandboxResumeSettleWait{
+		Result:   result,
+		Region:   SandboxIDRegion(),
+		HostID:   hostID,
+		Duration: waited,
+		Reads:    int64(reads),
+	})
+}
+
 // SandboxLifecycleTelemetry records coarse user-visible sandbox lifecycle
 // transitions from the routed API surface. It intentionally emits only bounded
 // labels; sandbox IDs, team IDs, user IDs, request IDs, URLs, and raw errors are

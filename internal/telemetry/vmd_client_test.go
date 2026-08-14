@@ -12,6 +12,8 @@ type captureRecorder struct {
 
 func (r *captureRecorder) RecordSandboxTransition(context.Context, SandboxTransition) {}
 
+func (r *captureRecorder) RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait) {}
+
 func (r *captureRecorder) RecordVMDCall(_ context.Context, call VMDCall) {
 	r.vmdCalls = append(r.vmdCalls, call)
 }

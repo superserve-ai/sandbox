@@ -12,6 +12,14 @@ const (
 	ResultTimeout  = "timeout"
 )
 
+// Result values for SandboxResumeSettleWait. Distinct from the ResultX enum
+// above: a settle wait always resolves as either "the racing write landed"
+// or "we gave up waiting for it" — neither maps onto success/error/conflict.
+const (
+	SettleResultSettled = "settled"
+	SettleResultTimeout = "timeout"
+)
+
 // SandboxTransition records low-cardinality operational lifecycle metrics.
 // Keep tenant, user, API key, and sandbox identifiers out of metric labels;
 // use logs or traces for per-sandbox investigation.
@@ -21,6 +29,21 @@ type SandboxTransition struct {
 	Region    string
 	HostID    string
 	Duration  time.Duration
+}
+
+// SandboxResumeSettleWait records ResumeSandbox waiting through a racing
+// finalize-pause write (pausing -> paused) before it could proceed or gave
+// up. Emitted once per resume that had to wait past the first read — never
+// per poll — so its volume tracks resume request rate, not poll count. This
+// is what lets "resume settled through a race" be told apart from "resume
+// was just slow" in dashboards, since both would otherwise fold into the
+// same overall resume duration histogram.
+type SandboxResumeSettleWait struct {
+	Result   string // "settled" or "timeout"
+	Region   string
+	HostID   string
+	Duration time.Duration
+	Reads    int64
 }
 
 // VMDCall records operational health for calls to VM daemons. Method and
@@ -89,6 +112,7 @@ type LauncherState struct {
 // operational metrics into Postgres.
 type Recorder interface {
 	RecordSandboxTransition(context.Context, SandboxTransition)
+	RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait)
 	RecordVMDCall(context.Context, VMDCall)
 	RecordHostCapacity(context.Context, HostCapacity)
 	RecordDBPoolStats(context.Context, DBPoolStats)
@@ -98,10 +122,11 @@ type Recorder interface {
 
 type noopRecorder struct{}
 
-func NewNoopRecorder() Recorder                                                         { return noopRecorder{} }
-func (noopRecorder) RecordSandboxTransition(context.Context, SandboxTransition)         {}
-func (noopRecorder) RecordVMDCall(context.Context, VMDCall)                             {}
-func (noopRecorder) RecordHostCapacity(context.Context, HostCapacity)                   {}
-func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)                     {}
-func (noopRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure) {}
-func (noopRecorder) RecordLauncherState(context.Context, LauncherState)                 {}
+func NewNoopRecorder() Recorder                                                             { return noopRecorder{} }
+func (noopRecorder) RecordSandboxTransition(context.Context, SandboxTransition)             {}
+func (noopRecorder) RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait) {}
+func (noopRecorder) RecordVMDCall(context.Context, VMDCall)                                 {}
+func (noopRecorder) RecordHostCapacity(context.Context, HostCapacity)                       {}
+func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)                         {}
+func (noopRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)     {}
+func (noopRecorder) RecordLauncherState(context.Context, LauncherState)                     {}

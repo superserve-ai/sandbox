@@ -1377,19 +1377,30 @@ func TestResumeSandbox_SettlesPausingToPaused(t *testing.T) {
 }
 
 // A sandbox stuck in 'pausing' past the settle window (finalize-pause lost
-// or genuinely stalled, not just racing) still 409s. Shrink the window so
-// this persistent case stays fast.
+// or genuinely stalled, not just racing) still 409s. This is also the
+// regression test for the settle poll's backoff: the pre-backoff code
+// re-read on a fixed 50ms interval, which over the (longer) 6s activate
+// window it used to share cost up to ~120 synchronous GetSandbox calls per
+// stuck resume — a burst of pause/resume calls against the same stuck
+// sandbox would amplify DB load exactly when finalize-pause is already
+// struggling. Shrink pausingSettleWindow so the persistent case stays fast
+// while still exercising several backoff steps, and assert the read count
+// stays in the single digits instead of growing with the window.
 func TestResumeSandbox_PersistentPausing_409(t *testing.T) {
-	prev := activateSettleWindow
-	activateSettleWindow = 100 * time.Millisecond
-	defer func() { activateSettleWindow = prev }()
+	prev := pausingSettleWindow
+	pausingSettleWindow = time.Second
+	defer func() { pausingSettleWindow = prev }()
 
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPausing}
 
+	var reads int32
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+		queryRowFn: func(context.Context, string, ...any) pgx.Row {
+			atomic.AddInt32(&reads, 1)
+			return sandboxRow(sb)
+		},
 	}
 	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
 	w := httptest.NewRecorder()
@@ -1397,6 +1408,12 @@ func TestResumeSandbox_PersistentPausing_409(t *testing.T) {
 
 	if w.Code != http.StatusConflict {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+	// A fixed 50ms poll over this 1s window would read ~20 times; the
+	// backed-off poll (50ms doubling up to 500ms) should land around 6 and
+	// stay nowhere near the old ~120-read worst case.
+	if got := atomic.LoadInt32(&reads); got < 2 || got > 15 {
+		t.Errorf("GetSandbox reads = %d, want in [2, 15] (bounded, backed-off poll)", got)
 	}
 }
 
