@@ -99,7 +99,7 @@ func loadConfig() (Config, error) {
 		HostInterface:           envOrDefault("HOST_INTERFACE", "eth0"),
 		TemplateBuilderBin:      envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
 		BoxdBinaryPath:          envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
-		HostID:                  envOrDefault("HOST_ID", "default"),
+		HostID:                  requireEnv("HOST_ID"),
 		DatabaseURL:             os.Getenv("DATABASE_URL"),
 		ControlPlaneURL:         os.Getenv("CONTROL_PLANE_URL"),
 		SecretsProxySocket:      os.Getenv("SECRETSPROXY_SOCKET"),
@@ -111,6 +111,14 @@ func loadConfig() (Config, error) {
 	}
 	if cfg.BaseRootfsPath == "" {
 		return Config{}, fmt.Errorf("BASE_ROOTFS_PATH environment variable is required")
+	}
+	// HOST_ID scopes heartbeats and reconciler state; two daemons sharing an
+	// identity reap each other's sandboxes, so refuse to start rather than
+	// fall back to a shared placeholder. The literal "default" stays allowed:
+	// one production host's row predates instance-named identities and still
+	// keys on it, so it can only be banned once that identity is migrated.
+	if cfg.HostID == "" {
+		return Config{}, fmt.Errorf("HOST_ID environment variable is required and must be this host's unique identity")
 	}
 
 	if cfg.SecretsProxySandboxAddr != "" {

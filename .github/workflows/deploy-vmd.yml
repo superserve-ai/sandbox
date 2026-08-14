@@ -260,6 +260,13 @@ jobs:
           VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           BACKUP_BUCKET: superserve-artifact-backup-use4
+          # Stage two of the backfill rollout, expedited: 585 of the
+          # cell's 678 paused sandboxes predate the uploader and have no
+          # copy off the host's SSD, which has now failed twice in one
+          # day. The sweep makes them durable within hours of the host
+          # returning. Removing this line disables the sweep on the next
+          # deploy.
+          BACKUP_BACKFILL: "1"
           # Keeps the backup journal off the root disk — it's written
           # continuously while backups drain and can stall the uploader
           # if the (small) root disk fills.
