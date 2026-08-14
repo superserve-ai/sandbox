@@ -712,13 +712,22 @@ func main() {
 		}
 		// Megabits per second, as the name says: 1 Mbit/s = 125000 B/s.
 		bytesPerSec := rate.Limit(mbps) * 125000
+		// Drain workers, not a bandwidth knob: per-task overhead is what
+		// bounds throughput once the pause rate outruns one serial loop.
+		// All workers share the single limiter above, so raising this
+		// never raises total egress past the bandwidth cap.
+		workers, _ := strconv.Atoi(envOrDefault("BACKUP_UPLOAD_CONCURRENCY", "1"))
+		if workers < 1 {
+			workers = 1
+		}
 		uploader := &backup.Uploader{
-			Journal:    journal,
-			Store:      backup.NewGCSStore(gcsClient, bucket),
-			Limiter:    rate.NewLimiter(bytesPerSec, 32<<20),
-			Log:        log.With().Str("component", "backup").Logger(),
-			VMDVersion: os.Getenv("SENTRY_RELEASE"),
-			Metrics:    backupMetrics,
+			Journal:     journal,
+			Store:       backup.NewGCSStore(gcsClient, bucket),
+			Limiter:     rate.NewLimiter(bytesPerSec, 32<<20),
+			Concurrency: workers,
+			Log:         log.With().Str("component", "backup").Logger(),
+			VMDVersion:  os.Getenv("SENTRY_RELEASE"),
+			Metrics:     backupMetrics,
 		}
 		// Staging pins enqueued artifacts so sandbox teardown cannot
 		// erase a queued generation; the sweep clears residue from
@@ -798,7 +807,7 @@ func main() {
 			defer close(upDone)
 			return uploader.Run(upCtx)
 		})
-		log.Info().Str("bucket", bucket).Int("bandwidth_mbps", mbps).Msg("backup uploader enabled")
+		log.Info().Str("bucket", bucket).Int("bandwidth_mbps", mbps).Int("workers", workers).Msg("backup uploader enabled")
 	}
 
 	// ---- Backup metrics sampler ----
