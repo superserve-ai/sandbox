@@ -173,7 +173,7 @@ func TestHostCapabilityBatchGateLocksExactActiveHeartbeat(t *testing.T) {
 	for _, required := range []string{
 		"WITH target_host AS MATERIALIZED",
 		"WHERE id = sqlc.arg('host_id')",
-		"status = 'active'",
+		"status IN ('active', 'draining')",
 		"last_heartbeat_at IS NOT NULL",
 		"FOR SHARE",
 		"unnest(sqlc.arg('required_capabilities')::text[])",
@@ -212,7 +212,7 @@ func TestHostHasCapabilitiesUnlockedRunsSameDivisionWithoutRowLock(t *testing.T)
 	for _, required := range []string{
 		"WITH target_host AS MATERIALIZED",
 		"WHERE id = sqlc.arg('host_id')",
-		"status = 'active'",
+		"status IN ('active', 'draining')",
 		"last_heartbeat_at IS NOT NULL",
 		"unnest(sqlc.arg('required_capabilities')::text[])",
 		"hc.host_id = h.id",
