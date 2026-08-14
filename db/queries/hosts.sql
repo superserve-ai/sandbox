@@ -15,10 +15,34 @@ INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacit
 VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
 
--- name: UpdateHostStatus :exec
+-- name: RegisterHost :one
+-- Self-registration from a first heartbeat. Starts in 'provisioning' so the
+-- scheduler never sees the host until an operator activates it. Stamps
+-- last_heartbeat_at because capability attestation keys on it: without a
+-- heartbeat time, InsertHostCapability is a silent no-op.
+INSERT INTO host (id, vmd_addr, proxy_addr, region, status,
+                  capacity_memory_mib, capacity_vcpus, last_heartbeat_at)
+VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, now())
+RETURNING *;
+
+-- name: GetHostForUpdate :one
+-- Row-locked read for the heartbeat's identity check, so the guard and the
+-- heartbeat update see the same row version inside one transaction.
+SELECT * FROM host WHERE id = $1 FOR UPDATE;
+
+-- name: UpdateHostAddresses :exec
+-- Re-provision path: the identity is reclaiming its row from a new address
+-- after the old holder went silent. Guarded by the handler's staleness check.
+UPDATE host
+SET vmd_addr = $2, proxy_addr = $3, region = $4,
+    capacity_memory_mib = $5, capacity_vcpus = $6, updated_at = now()
+WHERE id = $1;
+
+-- name: UpdateHostStatus :one
 UPDATE host
 SET status = $2, updated_at = now()
-WHERE id = $1;
+WHERE id = $1
+RETURNING *;
 
 -- name: UpdateHostHeartbeat :one
 -- Returns the host row so the caller can verify the host exists. Also
@@ -147,3 +171,18 @@ WHERE h.status = 'active'
   )
 GROUP BY h.id
 ORDER BY COUNT(s.id) ASC;
+
+-- name: ListHostsAdmin :many
+-- Operator view (hostctl): every host regardless of status, with live
+-- sandbox counts. Paused count is here for drain progress visibility.
+SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
+       h.capacity_memory_mib, h.capacity_vcpus,
+       h.last_heartbeat_at, h.created_at, h.updated_at,
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('active', 'starting')
+                                      AND s.destroyed_at IS NULL), 0)::int AS running_count,
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status = 'paused'
+                                      AND s.destroyed_at IS NULL), 0)::int AS paused_count
+FROM host h
+LEFT JOIN sandbox s ON s.host_id = h.id
+GROUP BY h.id
+ORDER BY h.created_at ASC;

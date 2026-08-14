@@ -83,6 +83,30 @@ func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
 	return i, err
 }
 
+const getHostForUpdate = `-- name: GetHostForUpdate :one
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host WHERE id = $1 FOR UPDATE
+`
+
+// Row-locked read for the heartbeat's identity check, so the guard and the
+// heartbeat update see the same row version inside one transaction.
+func (q *Queries) GetHostForUpdate(ctx context.Context, id string) (Host, error) {
+	row := q.db.QueryRow(ctx, getHostForUpdate, id)
+	var i Host
+	err := row.Scan(
+		&i.ID,
+		&i.VmdAddr,
+		&i.ProxyAddr,
+		&i.Region,
+		&i.Status,
+		&i.CapacityMemoryMib,
+		&i.CapacityVcpus,
+		&i.LastHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const hostHasCapabilities = `-- name: HostHasCapabilities :one
 WITH target_host AS MATERIALIZED (
   SELECT id, last_heartbeat_at
@@ -331,6 +355,70 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 	return items, nil
 }
 
+const listHostsAdmin = `-- name: ListHostsAdmin :many
+SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
+       h.capacity_memory_mib, h.capacity_vcpus,
+       h.last_heartbeat_at, h.created_at, h.updated_at,
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('active', 'starting')
+                                      AND s.destroyed_at IS NULL), 0)::int AS running_count,
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status = 'paused'
+                                      AND s.destroyed_at IS NULL), 0)::int AS paused_count
+FROM host h
+LEFT JOIN sandbox s ON s.host_id = h.id
+GROUP BY h.id
+ORDER BY h.created_at ASC
+`
+
+type ListHostsAdminRow struct {
+	ID                string             `json:"id"`
+	VmdAddr           string             `json:"vmd_addr"`
+	ProxyAddr         string             `json:"proxy_addr"`
+	Region            string             `json:"region"`
+	Status            string             `json:"status"`
+	CapacityMemoryMib int32              `json:"capacity_memory_mib"`
+	CapacityVcpus     int32              `json:"capacity_vcpus"`
+	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	RunningCount      int32              `json:"running_count"`
+	PausedCount       int32              `json:"paused_count"`
+}
+
+// Operator view (hostctl): every host regardless of status, with live
+// sandbox counts. Paused count is here for drain progress visibility.
+func (q *Queries) ListHostsAdmin(ctx context.Context) ([]ListHostsAdminRow, error) {
+	rows, err := q.db.Query(ctx, listHostsAdmin)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListHostsAdminRow{}
+	for rows.Next() {
+		var i ListHostsAdminRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.VmdAddr,
+			&i.ProxyAddr,
+			&i.Region,
+			&i.Status,
+			&i.CapacityMemoryMib,
+			&i.CapacityVcpus,
+			&i.LastHeartbeatAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.RunningCount,
+			&i.PausedCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listStaleHosts = `-- name: ListStaleHosts :many
 SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
 WHERE status = 'active'
@@ -380,6 +468,81 @@ WHERE id = $1 AND status = 'active'
 
 func (q *Queries) MarkHostUnhealthy(ctx context.Context, id string) error {
 	_, err := q.db.Exec(ctx, markHostUnhealthy, id)
+	return err
+}
+
+const registerHost = `-- name: RegisterHost :one
+INSERT INTO host (id, vmd_addr, proxy_addr, region, status,
+                  capacity_memory_mib, capacity_vcpus, last_heartbeat_at)
+VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, now())
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
+`
+
+type RegisterHostParams struct {
+	ID                string `json:"id"`
+	VmdAddr           string `json:"vmd_addr"`
+	ProxyAddr         string `json:"proxy_addr"`
+	Region            string `json:"region"`
+	CapacityMemoryMib int32  `json:"capacity_memory_mib"`
+	CapacityVcpus     int32  `json:"capacity_vcpus"`
+}
+
+// Self-registration from a first heartbeat. Starts in 'provisioning' so the
+// scheduler never sees the host until an operator activates it. Stamps
+// last_heartbeat_at because capability attestation keys on it: without a
+// heartbeat time, InsertHostCapability is a silent no-op.
+func (q *Queries) RegisterHost(ctx context.Context, arg RegisterHostParams) (Host, error) {
+	row := q.db.QueryRow(ctx, registerHost,
+		arg.ID,
+		arg.VmdAddr,
+		arg.ProxyAddr,
+		arg.Region,
+		arg.CapacityMemoryMib,
+		arg.CapacityVcpus,
+	)
+	var i Host
+	err := row.Scan(
+		&i.ID,
+		&i.VmdAddr,
+		&i.ProxyAddr,
+		&i.Region,
+		&i.Status,
+		&i.CapacityMemoryMib,
+		&i.CapacityVcpus,
+		&i.LastHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateHostAddresses = `-- name: UpdateHostAddresses :exec
+UPDATE host
+SET vmd_addr = $2, proxy_addr = $3, region = $4,
+    capacity_memory_mib = $5, capacity_vcpus = $6, updated_at = now()
+WHERE id = $1
+`
+
+type UpdateHostAddressesParams struct {
+	ID                string `json:"id"`
+	VmdAddr           string `json:"vmd_addr"`
+	ProxyAddr         string `json:"proxy_addr"`
+	Region            string `json:"region"`
+	CapacityMemoryMib int32  `json:"capacity_memory_mib"`
+	CapacityVcpus     int32  `json:"capacity_vcpus"`
+}
+
+// Re-provision path: the identity is reclaiming its row from a new address
+// after the old holder went silent. Guarded by the handler's staleness check.
+func (q *Queries) UpdateHostAddresses(ctx context.Context, arg UpdateHostAddressesParams) error {
+	_, err := q.db.Exec(ctx, updateHostAddresses,
+		arg.ID,
+		arg.VmdAddr,
+		arg.ProxyAddr,
+		arg.Region,
+		arg.CapacityMemoryMib,
+		arg.CapacityVcpus,
+	)
 	return err
 }
 
@@ -437,10 +600,11 @@ func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) (UpdateHos
 	return i, err
 }
 
-const updateHostStatus = `-- name: UpdateHostStatus :exec
+const updateHostStatus = `-- name: UpdateHostStatus :one
 UPDATE host
 SET status = $2, updated_at = now()
 WHERE id = $1
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
 `
 
 type UpdateHostStatusParams struct {
@@ -448,7 +612,20 @@ type UpdateHostStatusParams struct {
 	Status string `json:"status"`
 }
 
-func (q *Queries) UpdateHostStatus(ctx context.Context, arg UpdateHostStatusParams) error {
-	_, err := q.db.Exec(ctx, updateHostStatus, arg.ID, arg.Status)
-	return err
+func (q *Queries) UpdateHostStatus(ctx context.Context, arg UpdateHostStatusParams) (Host, error) {
+	row := q.db.QueryRow(ctx, updateHostStatus, arg.ID, arg.Status)
+	var i Host
+	err := row.Scan(
+		&i.ID,
+		&i.VmdAddr,
+		&i.ProxyAddr,
+		&i.Region,
+		&i.Status,
+		&i.CapacityMemoryMib,
+		&i.CapacityVcpus,
+		&i.LastHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }

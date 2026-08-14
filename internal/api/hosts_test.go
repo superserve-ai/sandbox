@@ -28,11 +28,15 @@ func TestHostHeartbeatReplacesAdvertisedCapabilities(t *testing.T) {
 	var gotCapabilities []string
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if !strings.Contains(sql, "-- name: UpdateHostHeartbeat :one") {
+			switch {
+			case strings.Contains(sql, "-- name: GetHostForUpdate :one"):
+				return hostRow(db.Host{ID: args[0].(string), Status: "active"})
+			case strings.Contains(sql, "-- name: UpdateHostHeartbeat :one"):
+				gotHostID = args[0].(string)
+				return hostRow(db.Host{ID: gotHostID, Status: "active"})
+			default:
 				return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
 			}
-			gotHostID = args[0].(string)
-			return hostRow(db.Host{ID: gotHostID, Status: "active"})
 		},
 		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 			switch {
@@ -73,11 +77,15 @@ func TestHostHeartbeatWithoutBodyClearsCapabilities(t *testing.T) {
 	cleared := false
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if !strings.Contains(sql, "-- name: UpdateHostHeartbeat :one") {
+			switch {
+			case strings.Contains(sql, "-- name: GetHostForUpdate :one"):
+				return hostRow(db.Host{ID: args[0].(string), Status: "active"})
+			case strings.Contains(sql, "-- name: UpdateHostHeartbeat :one"):
+				called = true
+				return hostRow(db.Host{ID: args[0].(string), Status: "active"})
+			default:
 				return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
 			}
-			called = true
-			return hostRow(db.Host{ID: args[0].(string), Status: "active"})
 		},
 		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 			if !strings.Contains(sql, "-- name: DeleteHostCapabilities :exec") {
