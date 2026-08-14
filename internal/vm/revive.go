@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -53,13 +54,33 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		inst.mu.RLock()
 		st, snap, mem, baseMem := inst.Status, inst.SnapshotPath, inst.MemFilePath, inst.BaseMemPath
 		inst.mu.RUnlock()
+		inst.mu.RLock()
+		pausedDisk := inst.DiskPath
+		if pausedDisk == "" {
+			rundirKey := vmID
+			if inst.RunDirID != "" {
+				rundirKey = inst.RunDirID
+			}
+			fname := "rootfs.ext4"
+			if inst.Config.BasePath != "" {
+				fname = "overlay.ext4"
+			}
+			pausedDisk = filepath.Join(m.cfg.RunDir, rundirKey, fname)
+		}
+		pausedBase := inst.Config.BasePath
+		inst.mu.RUnlock()
 		if st == StatusPaused && snap != "" {
 			// The refusal delegates to resume, so it only holds when
 			// resume is actually possible: every recorded pause artifact
 			// must still exist. A paused record whose snapshot or memory
 			// file is gone is unresumable, and refusing revival too
 			// would strand a sandbox that has a usable salvaged disk.
-			if statRegularFile(snap) && mem != "" && statRegularFile(mem) && (baseMem == "" || statRegularFile(baseMem)) {
+			// The disk resume would boot (recorded, or inferred from the
+			// run directory exactly as resume infers it) and any overlay
+			// base count as pause artifacts too: a paused VM that lost
+			// its rootfs is precisely the case the salvaged disk exists
+			// to recover.
+			if statRegularFile(snap) && mem != "" && statRegularFile(mem) && (baseMem == "" || statRegularFile(baseMem)) && statRegularFile(pausedDisk) && (pausedBase == "" || statRegularFile(pausedBase)) {
 				return nil, status.Errorf(codes.FailedPrecondition, "vm %s is paused with a snapshot; resume owns healthy paused VMs", vmID)
 			}
 			m.log.Warn().Str("vm_id", vmID).Msg("paused record has missing snapshot artifacts; treating as unresumable and allowing revival")
@@ -236,6 +257,12 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	}
 	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, rules, seed, true, supervision, vcpu, memMiB)
 	if err != nil {
+		// An unconfirmed stop of the spawned VM keeps the boot's
+		// truthful StatusError record: restoring the zombie record over
+		// a possibly-live replacement would misdescribe the host.
+		if errors.Is(err, errSpawnedStopUnconfirmed) {
+			teardownFailed = true
+		}
 		return nil, err
 	}
 	bootDur := time.Since(phaseStart)

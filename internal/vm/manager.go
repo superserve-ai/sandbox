@@ -1013,6 +1013,12 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 				m.cleanupRunDir(vmID)
 			}
 			m.setStatus(vmID, StatusError)
+			if stopFailed {
+				// Callers that roll back durable state must know the
+				// spawned VM may still be alive: the StatusError record
+				// above is the truthful one to keep.
+				return nil, fmt.Errorf("start firecracker (supervised): %w: %w", lerr, errSpawnedStopUnconfirmed)
+			}
 			return nil, fmt.Errorf("start firecracker (supervised): %w", lerr)
 		}
 	} else {
@@ -3872,6 +3878,11 @@ func (m *Manager) instanceClaimsCgroup(vmID string) bool {
 	defer inst.mu.RUnlock()
 	return cgroupSupervised(inst.Supervision)
 }
+
+// errSpawnedStopUnconfirmed marks a cold-boot failure whose spawned VM
+// could not be confirmed stopped; its resources and error record were
+// deliberately retained for a forced teardown.
+var errSpawnedStopUnconfirmed = errors.New("spawned VM stop unconfirmed")
 
 // lockRecordOwner acquires vmID's record-ownership mutex (see
 // recordOwnerMus) and returns its unlock.
