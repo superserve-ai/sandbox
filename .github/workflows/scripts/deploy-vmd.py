@@ -148,6 +148,7 @@ BUNDLE_FILES = [
     "deploy/superserve-vms.service",
     "deploy/vmd-rollback-guard",
     "deploy/superserve-vmd-rollback-guard.conf",
+    "deploy/superserve-vmd-start-generation.conf",
     "deploy/superserve-secretsproxy.service",
     "deploy/firecracker@.service",
     "deploy/firecracker-netns@.service",
@@ -447,6 +448,10 @@ def main() -> int:
             sudo install -m 0755 {extract_dir}/deploy/vmd-rollback-guard {install_dir}/vmd-rollback-guard
             sudo install -d -m 0755 /etc/systemd/system/superserve-vmd.service.d
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-rollback-guard.conf /etc/systemd/system/superserve-vmd.service.d/10-rollback-guard.conf
+            # Start-generation stamp: proves receipt succession (see the
+            # drop-in's header). A drop-in for the same reason as the guard
+            # above — it must survive deploys of revisions that predate it.
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-start-generation.conf /etc/systemd/system/superserve-vmd.service.d/20-start-generation.conf
             sudo systemctl daemon-reload
             # daemon-reload alone does not apply [Slice] resource values to
             # an already-active cgroup (same systemd behavior the TasksMax
