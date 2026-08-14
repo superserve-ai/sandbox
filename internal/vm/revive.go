@@ -100,6 +100,11 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// back public) and ownership. Captured before the teardown deletes
 	// the record; absence is fine, the fields stay zero for sandboxes
 	// that never set policy.
+	// Sampled before the record read: any destroy completing after this
+	// point is visible as an epoch step, so a deletion that interleaves
+	// anywhere between reading the record and committing the
+	// replacement is detected rather than silently resurrected.
+	epochAtRead := m.destroyEpoch(vmID)
 	var prevRec *VMRecord
 	if m.state != nil {
 		if rec, err := m.state.Get(vmID); err == nil {
@@ -180,7 +185,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// external destroy that fully completed in between (tombstone
 	// already cleared) is visible and owns the record's absence.
 	selfDestroys := uint64(0)
-	epochBase := m.destroyEpoch(vmID)
+	epochBase := epochAtRead + 1
 	// A teardown that cannot confirm the replacement stopped must also
 	// suppress the rollback: restoring the zombie record over a
 	// still-live unready VM would lie about the host's state, and
@@ -216,6 +221,12 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 			m.log.Error().Err(perr).Str("vm_id", vmID).Msg("restore zombie record after failed revival")
 		}
 	}()
+	// Exactly one destroy (ours) may separate the record read from this
+	// point. More means an external destroy interleaved: its deletion is
+	// authoritative and revival must not recreate the sandbox.
+	if m.destroyEpoch(vmID) != epochAtRead+1 {
+		return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while revival was preparing; the destroy is authoritative", vmID)
+	}
 	teardownDur := time.Since(reviveStart)
 	// The revived VM lives under the fleet's real supervision, seeded
 	// from the zombie's recorded mode (default unit for records that
@@ -306,8 +317,15 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	_, stillTracked := m.vms[vmID]
 	m.mu.RUnlock()
 	_, beingDestroyed := m.destroying.Load(vmID)
-	if !stillTracked || beingDestroyed {
-		if wrote {
+	// An epoch ahead of our own count means a destroy completed in the
+	// pre-registration gap, where it could not see the replacement to
+	// remove it: the deletion is still authoritative, so the booted
+	// replacement goes too.
+	externallyDestroyed := m.destroyEpoch(vmID) != epochBase+selfDestroys
+	if !stillTracked || beingDestroyed || externallyDestroyed {
+		if externallyDestroyed && stillTracked && !beingDestroyed {
+			teardownSelf(context.WithoutCancel(ctx))
+		} else if wrote {
 			m.deleteState(vmID)
 		}
 		committed = true
@@ -333,10 +351,12 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	return inst, nil
 }
 
-// statRegularFile reports whether path exists and is a regular file.
+// statRegularFile reports whether path exists as a non-empty regular
+// file. Zero length rejects: a truncated or never-finalized artifact is
+// as unresumable as a missing one.
 func statRegularFile(path string) bool {
 	fi, err := os.Stat(path)
-	return err == nil && fi.Mode().IsRegular()
+	return err == nil && fi.Mode().IsRegular() && fi.Size() > 0
 }
 
 // reviveBoxdReadyBudget bounds the wait for a revived guest's boxd. Cold
