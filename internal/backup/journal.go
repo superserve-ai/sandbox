@@ -3,8 +3,10 @@ package backup
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -85,6 +87,13 @@ type Task struct {
 	// the uploader-owned staging tree; the dedupe upgrade in Enqueue is
 	// one-way toward staged.
 	Staged bool `json:"staged,omitempty"`
+	// ClaimToken fences resolution against lease steals: Next stamps the
+	// claim's token here, and Ack/Nack refuse to touch a row whose live
+	// claim carries a different token (the lease expired and another
+	// worker took over; its resolution supersedes this one). Never
+	// persisted — claims are process-local, and a serialized token would
+	// outlive the claim table it indexes into.
+	ClaimToken uint64 `json:"-"`
 	// VerifiedBucket names the store identity this completion was
 	// verified against. Set only on the outbox copy at ack time: a
 	// notification delivered after a restart with a different
@@ -122,6 +131,34 @@ func (t *Task) HasVerified(object string) bool {
 // staging deletable, so it must never fire early.
 type Journal struct {
 	db *bolt.DB
+
+	// mu guards claims AND spans every claim-coupled row mutation: Next's
+	// whole scan-and-claim, and the ownership check plus bolt write in
+	// Ack/Nack. Holding it across the writes is what makes the fencing
+	// airtight — a stale worker's resolution and a thief's cannot
+	// interleave against the same row, because whichever acquires mu
+	// second sees the full effect of the first.
+	mu sync.Mutex
+	// claims marks queue keys handed out by Next and not yet resolved by
+	// Ack or Nack, so concurrent workers each receive a distinct task.
+	// Deliberately in-memory: bolt's exclusive file lock makes the journal
+	// single-process, so a claim can only ever be held by this process,
+	// and a crash releases every claim by construction — persisting them
+	// would instead make a restarted vmd wait out stale leases before
+	// resuming in-flight work. The expiry is a backstop for a worker
+	// goroutine wedged past any plausible upload; the token fences the
+	// wedged worker's late resolution if it ever resumes after a steal.
+	claims map[string]claim
+	// claimSeq issues claim tokens, under mu. Starts from 1 so a zero
+	// ClaimToken (a task never handed out by Next, e.g. direct test
+	// calls) can never match a live claim.
+	claimSeq uint64
+}
+
+// claim is one outstanding lease: when it lapses and who holds it.
+type claim struct {
+	until time.Time
+	token uint64
 }
 
 var (
@@ -175,6 +212,13 @@ const pruneExamineLimit = 64
 // (prefixed so it sorts apart from object names, which never start NUL).
 var pruneCursorKey = []byte("\x00prune_cursor")
 
+// claimTTL bounds how long an unresolved claim excludes its task from
+// Next. Sized above the slowest plausible upload at the bandwidth cap (a
+// multi-GB shared base at 100 Mbit/s runs tens of minutes), so expiry
+// only ever fires on a genuinely wedged worker; the steal it then permits
+// is safe, just redundant.
+const claimTTL = time.Hour
+
 // NewJournal opens (creating if needed) the journal bucket in db. The
 // caller owns the bolt DB; sharing vmd's state DB keeps one fsync domain.
 func NewJournal(db *bolt.DB) (*Journal, error) {
@@ -189,7 +233,7 @@ func NewJournal(db *bolt.DB) (*Journal, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create journal bucket: %w", err)
 	}
-	return &Journal{db: db}, nil
+	return &Journal{db: db, claims: make(map[string]claim)}, nil
 }
 
 // readyAt is when the task becomes runnable: its enqueue time until a
@@ -254,7 +298,14 @@ func (j *Journal) Enqueue(task Task) error {
 	if err != nil {
 		return err
 	}
-	return j.db.Update(func(tx *bolt.Tx) error {
+	// Under mu for the claim move below: a promotion that re-keys a row
+	// a worker is actively uploading must move the claim in the same
+	// critical section, or the scan would see the re-keyed row as
+	// unclaimed and hand it to a second worker mid-upload.
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var moveFrom, moveTo []byte
+	uerr := j.db.Update(func(tx *bolt.Tx) error {
 		queue := tx.Bucket(journalBucket)
 		idx := tx.Bucket(indexBucket)
 		// One point lookup; a stale index entry (its queue key gone, e.g.
@@ -273,11 +324,19 @@ func (j *Journal) Enqueue(task Task) error {
 				var cur Task
 				if err := json.Unmarshal(existing, &cur); err != nil {
 					// An undecodable row must not swallow the incoming
-					// task as a silent dedupe: replace it.
-					if err := queue.Put(qk, val); err != nil {
+					// task as a silent dedupe: replace it — under the
+					// incoming task's OWN key, never the corrupt row's.
+					// Every row living at exactly its task's key is what
+					// resolution fencing leans on for durable ownership
+					// evidence; a row parked under a foreign key could be
+					// claimed but never acked.
+					if err := queue.Delete(qk); err != nil {
 						return err
 					}
-					return idx.Put(task.indexKey(), qk)
+					if err := queue.Put(task.key(), val); err != nil {
+						return err
+					}
+					return idx.Put(task.indexKey(), task.key())
 				}
 				changed := false
 				if task.Staged && !cur.Staged {
@@ -306,6 +365,8 @@ func (j *Journal) Enqueue(task Task) error {
 					if err := queue.Delete(qk); err != nil {
 						return err
 					}
+					moveFrom = append([]byte(nil), qk...)
+					moveTo = append([]byte(nil), nk...)
 				}
 				if err := queue.Put(nk, upgraded); err != nil {
 					return err
@@ -318,18 +379,43 @@ func (j *Journal) Enqueue(task Task) error {
 		}
 		return idx.Put(task.indexKey(), task.key())
 	})
+	if uerr == nil && moveFrom != nil {
+		// The promotion re-keyed the row; a live claim moves with it so
+		// the holder's resolution still finds its own claim and the scan
+		// keeps skipping the row.
+		if c, held := j.claims[string(moveFrom)]; held {
+			j.claims[string(moveTo)] = c
+			delete(j.claims, string(moveFrom))
+		}
+	}
+	return uerr
 }
 
-// Next returns the highest-priority runnable task (NotBefore in the past),
-// or ok=false when the queue has nothing runnable. Keys sort by
-// readiness within each priority, so the first decodable entry of a
-// priority answers for the whole priority: not ready means nothing
-// behind it is ready either, and the cursor seeks straight to the next
-// priority. A corrupt entry must never wedge the queue: it is deleted
-// (self-healing) rather than surfaced as a permanent error, and the scan
-// continues past it.
+// Next returns the highest-priority runnable task (NotBefore in the past)
+// and claims it until Ack or Nack resolves it, or ok=false when the queue
+// has nothing runnable and unclaimed. Keys sort by readiness within each
+// priority, so the first decodable UNCLAIMED entry of a priority answers
+// for the whole priority: claimed entries were ready when claimed and so
+// sort with the ready entries at the front of their tier, meaning they
+// are skipped individually (ownership is not readiness — the entry behind
+// a claimed one may be free), while a deferred entry still proves nothing
+// behind it in the tier is ready and the cursor seeks straight to the
+// next priority. A corrupt entry must never wedge the queue: it is
+// deleted (self-healing) rather than surfaced as a permanent error, and
+// the scan continues past it.
 func (j *Journal) Next(now time.Time) (Task, bool, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	// Expired claims (a worker wedged past claimTTL) become claimable
+	// again here; no separate reaper. The token check in Ack/Nack fences
+	// the original holder if it ever resumes after the steal.
+	for k, c := range j.claims {
+		if !c.until.After(now) {
+			delete(j.claims, k)
+		}
+	}
 	var task Task
+	var claimKey string
 	var corrupt [][]byte
 	found := false
 	err := j.db.View(func(tx *bolt.Tx) error {
@@ -341,13 +427,22 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 				k, v = c.Next()
 				continue
 			}
+			if _, claimed := j.claims[string(k)]; claimed {
+				k, v = c.Next()
+				continue
+			}
 			if !t.NotBefore.After(now) {
 				task = t
+				// The stored key and task.key() agree by invariant (every
+				// write path stores a row under exactly its task's key);
+				// claim under the stored key so the scan's own view is
+				// what the claim indexes.
+				claimKey = string(k)
 				found = true
 				break
 			}
-			// Earliest entry of this priority is deferred: skip the
-			// whole priority.
+			// Earliest unclaimed entry of this priority is deferred: skip
+			// the whole priority.
 			k, v = c.Seek(append([]byte(fmt.Sprintf("%d", t.Priority+1)), '/'))
 		}
 		return nil
@@ -378,8 +473,20 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 			return Task{}, false, fmt.Errorf("drop corrupt journal entries: %w", err)
 		}
 	}
+	if found {
+		j.claimSeq++
+		j.claims[claimKey] = claim{until: now.Add(claimTTL), token: j.claimSeq}
+		task.ClaimToken = j.claimSeq
+	}
 	return task, found, nil
 }
+
+// errClaimStolen reports a resolution refused because the caller's lease
+// expired and another worker claimed the task; the thief's eventual Ack
+// or Nack is authoritative, and the stale caller's completed work is
+// safe to discard unresolved (objects are content-addressed and
+// create-only, and any verification it recorded is already durable).
+var errClaimStolen = fmt.Errorf("backup task claim expired and was reclaimed by another worker")
 
 // currentKey resolves the task's live queue key through the dedupe
 // index: a concurrent enqueue can promote and re-key the row while an
@@ -393,36 +500,128 @@ func currentKey(tx *bolt.Tx, task *Task) []byte {
 	return task.key()
 }
 
+// resolveOwned locates task's live row inside tx and verifies the caller
+// still owns it, returning the row's current key and stored value.
+// Callers hold mu. Ownership is three checks, each covering a window the
+// others cannot:
+//
+//   - a live claim on the current key must carry the caller's token —
+//     catches a steal while the thief is still working;
+//   - the row must exist at its current key — catches a thief's Ack,
+//     which deletes row and index (currentKey then falls back to a
+//     snapshot key with no row under it);
+//   - the stored Attempts must equal the snapshot's — catches a thief's
+//     Nack after its claim was dropped: the reschedule incremented
+//     Attempts, durable evidence no live claim can carry. Promotion
+//     re-keys but never touches Attempts, so a legitimate holder whose
+//     row was promoted mid-flight still passes.
+func (j *Journal) resolveOwned(tx *bolt.Tx, task *Task) ([]byte, []byte, error) {
+	qk := currentKey(tx, task)
+	existing := tx.Bucket(journalBucket).Get(qk)
+	if existing == nil {
+		return nil, nil, errClaimStolen
+	}
+	if c, held := j.claims[string(qk)]; held && c.token != task.ClaimToken {
+		return nil, nil, errClaimStolen
+	}
+	var cur Task
+	if err := json.Unmarshal(existing, &cur); err == nil && cur.Attempts != task.Attempts {
+		return nil, nil, errClaimStolen
+	}
+	return qk, existing, nil
+}
+
+// Release frees task's claim without resolving it, for the one drain
+// outcome that is neither an Ack nor a Nack: an abandoned mutable-path
+// attempt whose row a concurrent dedupe upgraded to staged snapshots.
+// The row is deliberately left queued for the next drain, and without
+// this release it would sit invisibly claimed until the TTL expired.
+// Token-checked like every resolution (a stale caller must not free a
+// claim a thief now holds), and resolved through the index: a promotion
+// may have moved the row, and the claim moved with it.
+func (j *Journal) Release(task Task) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	qk := task.key()
+	_ = j.db.View(func(tx *bolt.Tx) error {
+		qk = currentKey(tx, &task)
+		return nil
+	})
+	key := string(qk)
+	if c, held := j.claims[key]; held && c.token == task.ClaimToken {
+		delete(j.claims, key)
+	}
+}
+
 // RecordVerification persists BOTH verification records in one
 // transaction: the task's own progress (survives nacks) and the durable
 // history (survives acks). Atomicity is the point: a crash between two
 // separate writes would leave a task that trusts its dedupe while the
 // history never learns of the object, silently degrading later unchanged
 // re-pauses to abandonment.
+// Fenced like every row write, but WITHOUT dropping the claim — this is
+// mid-flight progress, not resolution. An unfenced write here would
+// recreate the row a replacement worker already resolved, forging
+// exactly the durable row-presence evidence Ack and Nack fence on.
+// The fence rejects only the ROW half: the history entry records that
+// these exact object bytes were stream-verified, which is object-level
+// truth independent of who owns the row now — and it must survive the
+// steal, because the replacement's own upload of a non-shared object
+// this caller already finalized dedupes against it and, per the strict
+// no-history rule, would otherwise abandon a generation whose bytes are
+// provably good. History-without-row-progress is the safe direction of
+// the usual atomicity concern (the caller adopts in-memory trust only
+// on full success), so the stolen path still returns errClaimStolen
+// after recording it.
 func (j *Journal) RecordVerification(task Task, object string, now time.Time) error {
-	return j.db.Update(func(tx *bolt.Tx) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var qk, nk []byte
+	err := j.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(journalBucket)
-		old := currentKey(tx, &task)
-		mergeRow(b.Get(old), &task)
+		existing, rerr := []byte(nil), error(nil)
+		qk, existing, rerr = j.resolveOwned(tx, &task)
+		if rerr != nil {
+			return rerr
+		}
+		mergeRow(existing, &task)
 		val, err := json.Marshal(task)
 		if err != nil {
 			return err
 		}
 		// mergeRow may have adopted a promoted priority, moving the
 		// row's key; write exactly one row and keep the index on it.
-		if nk := task.key(); !bytes.Equal(old, nk) {
-			if err := b.Delete(old); err != nil {
+		nk = task.key()
+		if !bytes.Equal(qk, nk) {
+			if err := b.Delete(qk); err != nil {
 				return err
 			}
 		}
-		if err := b.Put(task.key(), val); err != nil {
+		if err := b.Put(nk, val); err != nil {
 			return err
 		}
-		if err := tx.Bucket(indexBucket).Put(task.indexKey(), task.key()); err != nil {
+		if err := tx.Bucket(indexBucket).Put(task.indexKey(), nk); err != nil {
 			return err
 		}
 		return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
 	})
+	if err == nil && nk != nil && !bytes.Equal(qk, nk) {
+		// This write re-keyed the row; the caller's live claim moves
+		// with it, or the scan would hand the row out to a second worker
+		// mid-upload.
+		if c, held := j.claims[string(qk)]; held {
+			j.claims[string(nk)] = c
+			delete(j.claims, string(qk))
+		}
+	}
+	if errors.Is(err, errClaimStolen) {
+		if herr := j.db.Update(func(tx *bolt.Tx) error {
+			return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
+		}); herr != nil {
+			return herr
+		}
+	}
+	return err
 }
 
 // PendingBaseSHAs returns the content hashes of every base image some
@@ -554,20 +753,27 @@ func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
 func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, error) {
 	completed := completedScope != ""
 	now := time.Now()
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	cleared := true
+	var qk []byte
 	err := j.db.Update(func(tx *bolt.Tx) error {
-		// Resolve through the index: a promotion re-keyed row must be
-		// deleted where it lives, or the ack would drop only the index
-		// and leave the row orphaned for Next to run again.
-		qk := currentKey(tx, &task)
+		// Resolution is ownership-checked (see resolveOwned) and resolved
+		// through the index: a promotion re-keyed row must be deleted
+		// where it lives, or the ack would drop only the index and leave
+		// the row orphaned for Next to run again.
+		var existing []byte
+		var rerr error
+		qk, existing, rerr = j.resolveOwned(tx, &task)
+		if rerr != nil {
+			return rerr
+		}
 		if !completed {
-			if existing := tx.Bucket(journalBucket).Get(qk); existing != nil {
-				var cur Task
-				if json.Unmarshal(existing, &cur) == nil &&
-					((cur.Staged && !task.Staged) || cur.Priority < task.Priority) {
-					cleared = false
-					return nil
-				}
+			var cur Task
+			if json.Unmarshal(existing, &cur) == nil &&
+				((cur.Staged && !task.Staged) || cur.Priority < task.Priority) {
+				cleared = false
+				return nil
 			}
 		}
 		if err := tx.Bucket(journalBucket).Delete(qk); err != nil {
@@ -649,6 +855,14 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, erro
 		}
 		return vb.Put(pruneCursorKey, next)
 	})
+	// Drop the claim on every outcome except a steal (the claim then
+	// belongs to the thief). A retained upgraded row (cleared=false)
+	// must be immediately drainable, and a failed transaction leaves the
+	// row intact for any worker to retry promptly instead of waiting out
+	// the TTL.
+	if !errors.Is(err, errClaimStolen) && qk != nil {
+		delete(j.claims, string(qk))
+	}
 	return cleared, err
 }
 
@@ -660,26 +874,36 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, erro
 // and persisting the caller's snapshot verbatim would silently undo the
 // upgrade after its marker was already cleared.
 func (j *Journal) Nack(task Task, now time.Time) error {
-	task.Attempts++
-	backoff := time.Duration(1<<min(task.Attempts, 8)) * time.Second
-	const maxBackoff = 10 * time.Minute
-	if backoff > maxBackoff {
-		backoff = maxBackoff
-	}
-	task.NotBefore = now.Add(backoff)
-	return j.db.Update(func(tx *bolt.Tx) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var qk []byte
+	err := j.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(journalBucket)
-		// Resolve through the index, not the caller's snapshot: a
+		// Ownership-checked against the PRE-reschedule snapshot (the
+		// Attempts increment below is this resolution's own edit), and
+		// resolved through the index, not the caller's snapshot: a
 		// concurrent promotion re-keyed the row, and deleting the stale
 		// key while writing a snapshot-keyed retry would fork the task
 		// into two rows.
-		old := currentKey(tx, &task)
-		mergeRow(b.Get(old), &task)
+		var existing []byte
+		var rerr error
+		qk, existing, rerr = j.resolveOwned(tx, &task)
+		if rerr != nil {
+			return rerr
+		}
+		task.Attempts++
+		backoff := time.Duration(1<<min(task.Attempts, 8)) * time.Second
+		const maxBackoff = 10 * time.Minute
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+		task.NotBefore = now.Add(backoff)
+		mergeRow(existing, &task)
 		val, err := json.Marshal(task)
 		if err != nil {
 			return err
 		}
-		if err := b.Delete(old); err != nil {
+		if err := b.Delete(qk); err != nil {
 			return err
 		}
 		if err := b.Put(task.key(), val); err != nil {
@@ -688,6 +912,14 @@ func (j *Journal) Nack(task Task, now time.Time) error {
 		// The deferral re-keyed the row; the dedupe index must follow.
 		return tx.Bucket(indexBucket).Put(task.indexKey(), task.key())
 	})
+	// Drop the claim on every outcome except a steal (the claim then
+	// belongs to the thief): the deferred row must not stay invisibly
+	// claimed, and a failed transaction leaves the row intact for any
+	// worker to retry promptly instead of waiting out the TTL.
+	if !errors.Is(err, errClaimStolen) && qk != nil {
+		delete(j.claims, string(qk))
+	}
+	return err
 }
 
 // mergeRow folds the stored row's authoritative fields into the
