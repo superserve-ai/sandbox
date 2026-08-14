@@ -950,31 +950,38 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 	var pid int
 	if supervised {
 		spawnedPID, actual, lerr := m.launchFirecracker(ctx, vmID, socketPath, diskPath, basePath, netInfo.Namespace, supervision, true, false)
+		// Stamp before the error branch too: a cgroup launch that forked
+		// Firecracker but failed confirmation leaves a live process, so
+		// the instance must say cgroup for stops to target it rather
+		// than no-op a unit.
+		inst.mu.Lock()
+		inst.Supervision = actual
+		inst.mu.Unlock()
+		// The mandatory stop must not run under the RPC's possibly-
+		// expired context: a canceled stop leaves a live supervised
+		// Firecracker, and freeing its slot and run directory
+		// underneath it is the wedge the stop exists to prevent.
 		stopFailed := false
+		stopSpawned := func() {
+			if serr := m.stopVM(context.WithoutCancel(ctx), vmID, actual); serr != nil {
+				stopFailed = true
+				log.Error().Err(serr).Msg("stop spawned VM after failed cold boot; residue left for forced teardown")
+			}
+		}
+		if lerr != nil {
+			// A failed launch can itself leave a live process (a cgroup
+			// spawn whose internal kill was unconfirmed), so the
+			// confirmed stop runs here too before anything is freed.
+			stopSpawned()
+		} else if lerr = waitForSocket(socketPath, 10*time.Second); lerr != nil {
+			stopSpawned()
+		} else if lerr = ConfigureMachine(socketPath, fcCfg); lerr != nil {
+			stopSpawned()
+		} else if lerr = StartInstance(socketPath); lerr != nil {
+			stopSpawned()
+		}
 		if lerr == nil {
-			// The mandatory stop must not run under the RPC's possibly-
-			// expired context: a canceled stop leaves a live supervised
-			// Firecracker, and freeing its slot and run directory
-			// underneath it is the wedge the stop exists to prevent.
-			stopSpawned := func() {
-				if serr := m.stopVM(context.WithoutCancel(ctx), vmID, actual); serr != nil {
-					stopFailed = true
-					log.Error().Err(serr).Msg("stop spawned VM after failed cold boot; residue left for forced teardown")
-				}
-			}
-			if lerr = waitForSocket(socketPath, 10*time.Second); lerr != nil {
-				stopSpawned()
-			} else if lerr = ConfigureMachine(socketPath, fcCfg); lerr != nil {
-				stopSpawned()
-			} else if lerr = StartInstance(socketPath); lerr != nil {
-				stopSpawned()
-			}
-			if lerr == nil {
-				pid = spawnedPID
-				inst.mu.Lock()
-				inst.Supervision = actual
-				inst.mu.Unlock()
-			}
+			pid = spawnedPID
 		}
 		if lerr != nil {
 			// A failed stop forbids freeing resources: the slot and run

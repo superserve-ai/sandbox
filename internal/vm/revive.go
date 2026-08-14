@@ -126,6 +126,19 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		return nil, status.Errorf(codes.InvalidArgument, "disk_path %q is inside the VM's run directory, which revival deletes; copy the salvage elsewhere first", diskPath)
 	}
 	diskPath = resolved
+	// The base dies in the same teardown if it lives inside the run
+	// directory: revival would delete it, boot a broken overlay, and
+	// restore a record pointing at a file that no longer exists.
+	if basePath != "" {
+		resolvedBase, berr := filepath.EvalSymlinks(basePath)
+		if berr != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "base_path: %v", berr)
+		}
+		if strings.HasPrefix(resolvedBase+string(filepath.Separator), vmRunDir) || strings.HasPrefix(resolvedBase, vmRunDir) {
+			return nil, status.Errorf(codes.InvalidArgument, "base_path %q is inside the VM's run directory, which revival deletes; stage the base elsewhere first", basePath)
+		}
+		basePath = resolvedBase
+	}
 
 	reviveStart := time.Now()
 	// Force-clear the zombie's residue. Fail closed on error: booting
@@ -221,7 +234,24 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// state store cannot record is not a revival: an unrecorded running
 	// VM would be invisible to reconciliation and refused by the next
 	// revive's liveness probe, so fail closed and tear down.
-	if !m.persistState(inst) {
+	wrote := m.persistState(inst)
+	// Post-write ownership recheck, resume's discipline: a concurrent
+	// force-destroy can complete during the readiness wait, and the
+	// write above would then resurrect a Running record for a VM that
+	// no longer exists. The destroy owns the outcome, so delete the
+	// resurrected record and suppress the zombie-record restore too.
+	m.mu.RLock()
+	_, stillTracked := m.vms[vmID]
+	m.mu.RUnlock()
+	_, beingDestroyed := m.destroying.Load(vmID)
+	if !stillTracked || beingDestroyed {
+		if wrote {
+			m.deleteState(vmID)
+		}
+		committed = true
+		return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while revival was completing", vmID)
+	}
+	if !wrote {
 		_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
 		return nil, status.Error(codes.Internal, "revived VM could not be durably recorded; torn down for clean retry")
 	}
