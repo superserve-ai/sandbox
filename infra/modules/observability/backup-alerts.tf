@@ -1,15 +1,20 @@
 # Backup pipeline alerting. The vmd daemon exports backup metrics through
 # the host-local OTel collector into Managed Prometheus; these policies
 # watch one cell's host via the bounded host_id label (never sandbox or
-# customer identifiers). PromQL conditions fire while the query returns a
-# series, so each query folds its threshold into the expression.
+# customer identifiers). Classic threshold conditions with explicit
+# metric.type, NOT PromQL: the managed-Prometheus policy validator
+# rejects bare metric names whenever the series is absent or ambiguous
+# at apply time (the same trap the launch-path alerts hit), so every
+# later policy edit under PromQL is a potential 400. Threshold
+# conditions skip that validation and are the module's established
+# pattern.
 #
 # The set exists for two failure classes: pause-path latency regressions
 # that only a pause-hook duration metric can catch, and a production host
 # running with backup silently disabled (backup_enabled=0).
 
 locals {
-  backup_host_matcher = var.backup_alerts == null ? "" : "host_id=\"${var.backup_alerts.host_id}\""
+  backup_filter_suffix = var.backup_alerts == null ? "" : " AND metric.labels.host_id = \"${var.backup_alerts.host_id}\""
 
   backup_alert_conditions = var.backup_alerts == null ? {} : merge({
     upload_failures = {
@@ -19,7 +24,12 @@ locals {
       # attempts/hour; the threshold catches a single stuck task on any
       # cell regardless of its pause volume, without firing on
       # transient bucket errors that clear on retry.
-      query         = "sum(rate(backup_upload_total{result=\"failed\", ${local.backup_host_matcher}}[30m])) * 3600 > ${var.backup_alerts.upload_failures_per_hour}"
+      metric_type  = "prometheus.googleapis.com/backup_upload_total/counter"
+      extra_filter = " AND metric.labels.result = \"failed\""
+      comparison   = "COMPARISON_GT"
+      # ALIGN_RATE yields per-second; the variable speaks per-hour.
+      threshold     = var.backup_alerts.upload_failures_per_hour / 3600
+      aligner       = "ALIGN_RATE"
       duration      = "1800s"
       documentation = <<-EOT
         Backup upload attempts on ${var.backup_alerts.host_id} have been failing at more than ${var.backup_alerts.upload_failures_per_hour}/hour for 30 minutes. The journal retries with capped backoff, so sustained failures mean the bucket, credentials, or network path is broken and the backlog is growing.
@@ -35,7 +45,16 @@ locals {
       # minute even on a busy cell. A 30 minute
       # old queue head means the drain loop is stalled or falling behind,
       # and every queued pause is unmet durability (RPO) exposure.
-      query         = "max(backup_oldest_pending_age_seconds{${local.backup_host_matcher}}) > ${var.backup_alerts.oldest_pending_age_seconds}"
+      # Scoped to the pause tier: pause generations should ship in
+      # seconds, while checkpoint and best-effort backlogs (the backfill
+      # sweep in particular) are deliberately patient, drain only in
+      # idle pipe time, and would otherwise hold this alert firing for
+      # the whole enablement window.
+      metric_type   = "prometheus.googleapis.com/backup_oldest_pending_age_seconds/gauge"
+      extra_filter  = " AND metric.labels.priority = \"pause\""
+      comparison    = "COMPARISON_GT"
+      threshold     = var.backup_alerts.oldest_pending_age_seconds
+      aligner       = "ALIGN_MAX"
       duration      = "900s"
       documentation = <<-EOT
         The oldest queued backup generation on ${var.backup_alerts.host_id} has been waiting more than ${var.backup_alerts.oldest_pending_age_seconds}s. Queued pauses are not yet durable in the bucket, so this is direct restore-point exposure.
@@ -53,7 +72,11 @@ locals {
       # bytes; 2s p99 catches that while tolerating the occasional large
       # staged overlay. The 1h rate window keeps the quantile meaningful
       # on a low-traffic cell.
-      query         = "histogram_quantile(0.99, sum by (le) (rate(backup_pause_hook_duration_seconds_bucket{${local.backup_host_matcher}}[1h]))) > ${var.backup_alerts.pause_hook_p99_seconds}"
+      metric_type   = "prometheus.googleapis.com/backup_pause_hook_duration_seconds/histogram"
+      extra_filter  = ""
+      comparison    = "COMPARISON_GT"
+      threshold     = var.backup_alerts.pause_hook_p99_seconds
+      aligner       = "ALIGN_PERCENTILE_99"
       duration      = "1800s"
       documentation = <<-EOT
         The p99 of the synchronous backup hook on the pause RPC path on ${var.backup_alerts.host_id} exceeded ${var.backup_alerts.pause_hook_p99_seconds}s for 30 minutes. This latency is paid by every pause the control plane issues.
@@ -71,7 +94,11 @@ locals {
       # onto the uploader (its own change), the gauge sits at zero and
       # this policy is armed but structurally quiet; it cannot false
       # positive, only wake once a consumer exists.
-      query         = "min(backup_outbox_pending{${local.backup_host_matcher}}) > 0"
+      metric_type   = "prometheus.googleapis.com/backup_outbox_pending/gauge"
+      extra_filter  = ""
+      comparison    = "COMPARISON_GT"
+      threshold     = 0
+      aligner       = "ALIGN_MIN"
       duration      = var.backup_alerts.outbox_stalled_duration
       documentation = <<-EOT
         Completed backup generations on ${var.backup_alerts.host_id} have had undelivered completion notifications for the whole alert window. Downstream coverage bookkeeping and staging cleanup key on these signals.
@@ -87,7 +114,11 @@ locals {
         # precisely so a host with backup misconfigured reports 0 instead
         # of nothing; without it, a misconfigured host is indistinguishable
         # from one emitting no metrics. 30 minutes tolerates deploy churn.
-        query         = "max(backup_enabled{${local.backup_host_matcher}}) < 1"
+        metric_type   = "prometheus.googleapis.com/backup_enabled/gauge"
+        extra_filter  = ""
+        comparison    = "COMPARISON_LT"
+        threshold     = 1
+        aligner       = "ALIGN_MAX"
         duration      = "1800s"
         documentation = <<-EOT
           ${var.backup_alerts.host_id} is running with the backup pipeline disabled (backup_enabled=0, meaning BACKUP_BUCKET is unset). Every pause on this host is currently without a durable copy.
@@ -111,10 +142,18 @@ resource "google_monitoring_alert_policy" "backup" {
   conditions {
     display_name = each.value.display_name
 
-    condition_prometheus_query_language {
-      query               = each.value.query
-      duration            = each.value.duration
-      evaluation_interval = "30s"
+    condition_threshold {
+      filter          = "metric.type = \"${each.value.metric_type}\" AND resource.type = \"prometheus_target\"${each.value.extra_filter}${local.backup_filter_suffix}"
+      comparison      = each.value.comparison
+      threshold_value = each.value.threshold
+      duration        = each.value.duration
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = each.value.aligner
+      }
+      trigger {
+        count = 1
+      }
     }
   }
 
@@ -140,7 +179,7 @@ resource "google_monitoring_alert_policy" "backup" {
 # on. Series carry the same bounded host_id label as the backup metrics.
 
 locals {
-  host_disk_matcher = var.host_disk_alerts == null ? "" : "host_id=\"${var.host_disk_alerts.host_id}\""
+  host_disk_filter_suffix = var.host_disk_alerts == null ? "" : " AND metric.labels.host_id = \"${var.host_disk_alerts.host_id}\""
 
   host_disk_alert_conditions = var.host_disk_alerts == null ? {} : {
     root_fs_warning = {
@@ -150,7 +189,11 @@ locals {
       # deploy artifacts, so cleanup can happen deliberately instead of
       # under pressure. Sustaining it for 30 minutes filters spikes from
       # transient files that free themselves.
-      query         = "max(system_filesystem_utilization{mountpoint=\"/\", ${local.host_disk_matcher}}) > ${var.host_disk_alerts.warning_utilization}"
+      metric_type   = "prometheus.googleapis.com/system_filesystem_utilization/gauge"
+      extra_filter  = " AND metric.labels.mountpoint = \"/\""
+      comparison    = "COMPARISON_GT"
+      threshold     = var.host_disk_alerts.warning_utilization
+      aligner       = "ALIGN_MAX"
       duration      = var.host_disk_alerts.warning_duration
       documentation = <<-EOT
         Root filesystem utilization on ${var.host_disk_alerts.host_id} has stayed above ${format("%.0f", var.host_disk_alerts.warning_utilization * 100)}% for the alert window. This is the OS disk, not the sandbox data arrays; it holds logs, journals, package state, and deployed binaries, and it has no automatic reclaim.
@@ -167,7 +210,11 @@ locals {
       # takes down the host's control services and blocks deploys. That
       # is worth a page while there is still room to act; the short
       # window only debounces single-scrape blips.
-      query         = "max(system_filesystem_utilization{mountpoint=\"/\", ${local.host_disk_matcher}}) > ${var.host_disk_alerts.critical_utilization}"
+      metric_type   = "prometheus.googleapis.com/system_filesystem_utilization/gauge"
+      extra_filter  = " AND metric.labels.mountpoint = \"/\""
+      comparison    = "COMPARISON_GT"
+      threshold     = var.host_disk_alerts.critical_utilization
+      aligner       = "ALIGN_MAX"
       duration      = var.host_disk_alerts.critical_duration
       documentation = <<-EOT
         Root filesystem utilization on ${var.host_disk_alerts.host_id} is above ${format("%.0f", var.host_disk_alerts.critical_utilization * 100)}%. The OS disk is close to exhaustion; once writes fail, the host's control services (vmd, the collector, systemd journal) degrade and deploys to the host stop working.
@@ -191,10 +238,18 @@ resource "google_monitoring_alert_policy" "host_disk" {
   conditions {
     display_name = each.value.display_name
 
-    condition_prometheus_query_language {
-      query               = each.value.query
-      duration            = each.value.duration
-      evaluation_interval = "30s"
+    condition_threshold {
+      filter          = "metric.type = \"${each.value.metric_type}\" AND resource.type = \"prometheus_target\"${each.value.extra_filter}${local.host_disk_filter_suffix}"
+      comparison      = each.value.comparison
+      threshold_value = each.value.threshold
+      duration        = each.value.duration
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = each.value.aligner
+      }
+      trigger {
+        count = 1
+      }
     }
   }
 

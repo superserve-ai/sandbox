@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -278,16 +279,38 @@ func (j *Journal) Enqueue(task Task) error {
 					}
 					return idx.Put(task.indexKey(), qk)
 				}
+				changed := false
 				if task.Staged && !cur.Staged {
 					cur.Files = task.Files
 					cur.Staged = true
-					upgraded, err := json.Marshal(cur)
-					if err != nil {
+					changed = true
+				}
+				// Priority promotion, one-way toward more urgent: a live
+				// pause re-enqueueing a generation the backfill queued at
+				// best-effort must not leave it waiting behind checkpoint
+				// traffic. The queue key embeds the priority, so promotion
+				// re-keys the row; attempts and NotBefore stay with it.
+				if task.Priority < cur.Priority {
+					cur.Priority = task.Priority
+					changed = true
+				}
+				if !changed {
+					return nil
+				}
+				upgraded, err := json.Marshal(cur)
+				if err != nil {
+					return err
+				}
+				nk := cur.key()
+				if !bytes.Equal(nk, qk) {
+					if err := queue.Delete(qk); err != nil {
 						return err
 					}
-					return queue.Put(qk, upgraded)
 				}
-				return nil
+				if err := queue.Put(nk, upgraded); err != nil {
+					return err
+				}
+				return idx.Put(cur.indexKey(), nk)
 			}
 		}
 		if err := queue.Put(task.key(), val); err != nil {
@@ -358,6 +381,18 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 	return task, found, nil
 }
 
+// currentKey resolves the task's live queue key through the dedupe
+// index: a concurrent enqueue can promote and re-key the row while an
+// attempt is in flight, so the caller's snapshot must never be trusted
+// to name the stored row. Falls back to the snapshot's own key when the
+// index has no entry.
+func currentKey(tx *bolt.Tx, task *Task) []byte {
+	if qk := tx.Bucket(indexBucket).Get(task.indexKey()); qk != nil {
+		return append([]byte(nil), qk...)
+	}
+	return task.key()
+}
+
 // RecordVerification persists BOTH verification records in one
 // transaction: the task's own progress (survives nacks) and the durable
 // history (survives acks). Atomicity is the point: a crash between two
@@ -367,12 +402,23 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 func (j *Journal) RecordVerification(task Task, object string, now time.Time) error {
 	return j.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(journalBucket)
-		mergeRow(b.Get(task.key()), &task)
+		old := currentKey(tx, &task)
+		mergeRow(b.Get(old), &task)
 		val, err := json.Marshal(task)
 		if err != nil {
 			return err
 		}
+		// mergeRow may have adopted a promoted priority, moving the
+		// row's key; write exactly one row and keep the index on it.
+		if nk := task.key(); !bytes.Equal(old, nk) {
+			if err := b.Delete(old); err != nil {
+				return err
+			}
+		}
 		if err := b.Put(task.key(), val); err != nil {
+			return err
+		}
+		if err := tx.Bucket(indexBucket).Put(task.indexKey(), task.key()); err != nil {
 			return err
 		}
 		return tx.Bucket(verifiedBucket).Put([]byte(object), []byte(fmt.Sprintf("%d", now.UnixNano())))
@@ -486,21 +532,45 @@ func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
 	return ok, err
 }
 
-// Ack removes a finished task. Called only after every object of the
-// generation is verified in the bucket (or the task was abandoned).
-// completed records the owner+generation in the durable completions
-// bucket within the SAME transaction: the ack deletes the queue row, so
-// this record is the only survivor telling recovery sweeps the
-// generation is already in the bucket. notify additionally records the
-// task in the notification outbox, likewise transactionally: the ack
-// that makes the task's completion otherwise unrecoverable is the last
-// durable moment to remember that a completion signal is still owed.
+// Ack removes a finished task, reporting whether the row was actually
+// cleared. Called only after every object of the generation is verified
+// in the bucket (or the task was abandoned). completed records the
+// owner+generation in the durable completions bucket within the SAME
+// transaction: the ack deletes the queue row, so this record is the only
+// survivor telling recovery sweeps the generation is already in the
+// bucket. notify additionally records the task in the notification
+// outbox, likewise transactionally: the ack that makes the task's
+// completion otherwise unrecoverable is the last durable moment to
+// remember that a completion signal is still owed.
+//
+// An ABANDONMENT (empty scope) whose stored row was upgraded since the
+// attempt began (staged, or promoted to a more urgent tier by a live
+// pause) clears nothing and returns false: the failure verdict belongs
+// to the stale snapshot, and deleting the upgraded row would destroy a
+// live pause's coverage and let removeStagedTask reap its staged files.
+// The upgraded row retries on its own schedule. A completion ack always
+// clears: the generation is durable regardless of what upgraded.
 // Piggybacks a bounded lazy prune of expired verification history.
-func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
+func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, error) {
 	completed := completedScope != ""
 	now := time.Now()
-	return j.db.Update(func(tx *bolt.Tx) error {
-		if err := tx.Bucket(journalBucket).Delete(task.key()); err != nil {
+	cleared := true
+	err := j.db.Update(func(tx *bolt.Tx) error {
+		// Resolve through the index: a promotion re-keyed row must be
+		// deleted where it lives, or the ack would drop only the index
+		// and leave the row orphaned for Next to run again.
+		qk := currentKey(tx, &task)
+		if !completed {
+			if existing := tx.Bucket(journalBucket).Get(qk); existing != nil {
+				var cur Task
+				if json.Unmarshal(existing, &cur) == nil &&
+					((cur.Staged && !task.Staged) || cur.Priority < task.Priority) {
+					cleared = false
+					return nil
+				}
+			}
+		}
+		if err := tx.Bucket(journalBucket).Delete(qk); err != nil {
 			return err
 		}
 		if err := tx.Bucket(indexBucket).Delete(task.indexKey()); err != nil {
@@ -579,6 +649,7 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 		}
 		return vb.Put(pruneCursorKey, next)
 	})
+	return cleared, err
 }
 
 // Nack records a failed attempt and reschedules with exponential backoff
@@ -589,7 +660,6 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) error {
 // and persisting the caller's snapshot verbatim would silently undo the
 // upgrade after its marker was already cleared.
 func (j *Journal) Nack(task Task, now time.Time) error {
-	old := task.key()
 	task.Attempts++
 	backoff := time.Duration(1<<min(task.Attempts, 8)) * time.Second
 	const maxBackoff = 10 * time.Minute
@@ -599,6 +669,11 @@ func (j *Journal) Nack(task Task, now time.Time) error {
 	task.NotBefore = now.Add(backoff)
 	return j.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(journalBucket)
+		// Resolve through the index, not the caller's snapshot: a
+		// concurrent promotion re-keyed the row, and deleting the stale
+		// key while writing a snapshot-keyed retry would fork the task
+		// into two rows.
+		old := currentKey(tx, &task)
 		mergeRow(b.Get(old), &task)
 		val, err := json.Marshal(task)
 		if err != nil {
@@ -630,6 +705,12 @@ func mergeRow(existing []byte, task *Task) {
 		task.Files = cur.Files
 		task.Staged = true
 	}
+	// A promotion that landed while this attempt ran must survive the
+	// write-back, or the retry would demote the row to the snapshot's
+	// stale priority.
+	if cur.Priority < task.Priority {
+		task.Priority = cur.Priority
+	}
 	seen := make(map[string]bool, len(task.VerifiedObjects))
 	for _, o := range task.VerifiedObjects {
 		seen[o] = true
@@ -641,27 +722,28 @@ func mergeRow(existing []byte, task *Task) {
 	}
 }
 
-// OldestEnqueuedAt returns the earliest EnqueuedAt among queued tasks,
-// ok=false when the queue holds none. Enqueue time rather than readiness
-// deliberately: a task deferred by retry backoff is still backlog, and
-// the age gauge this feeds is about how stale the oldest owed upload is.
-func (j *Journal) OldestEnqueuedAt() (time.Time, bool, error) {
-	var oldest time.Time
-	found := false
+// OldestEnqueuedAtByPriority returns the earliest EnqueuedAt among
+// queued tasks per priority tier. Age is measured from enqueue, not
+// readiness: a nacked task in backoff is still unmet backlog. Per-tier
+// resolution exists because the tiers have opposite service
+// expectations: a pause generation should ship in seconds, while a
+// best-effort backfill backlog is deliberately patient and must not
+// trip the pause tier's freshness alerting.
+func (j *Journal) OldestEnqueuedAtByPriority() (map[Priority]time.Time, error) {
+	oldest := map[Priority]time.Time{}
 	err := j.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(journalBucket).ForEach(func(_, v []byte) error {
 			var t Task
-			if err := json.Unmarshal(v, &t); err != nil {
-				return nil // corrupt entries are dropped by Next, not counted
+			if json.Unmarshal(v, &t) != nil {
+				return nil
 			}
-			if !found || t.EnqueuedAt.Before(oldest) {
-				oldest = t.EnqueuedAt
-				found = true
+			if cur, ok := oldest[t.Priority]; !ok || t.EnqueuedAt.Before(cur) {
+				oldest[t.Priority] = t.EnqueuedAt
 			}
 			return nil
 		})
 	})
-	return oldest, found, err
+	return oldest, err
 }
 
 // OutboxDepth reports how many completed tasks still owe their
