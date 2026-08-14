@@ -33,6 +33,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -1190,6 +1191,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	waitStart := time.Now()
 	poll := pausingSettlePollStart
 	reads := 0
+	canceled := false
 	var sandbox db.Sandbox
 	for {
 		var err error
@@ -1208,9 +1210,20 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 			return
 		}
 		if sandbox.Status == db.SandboxStatusPausing && time.Now().Before(deadline) {
-			time.Sleep(poll)
-			poll = nextSettlePollInterval(poll)
-			continue
+			// Context-aware wait: a client that disconnects or hits its
+			// deadline mid-backoff releases this goroutine at cancellation
+			// instead of holding it for the rest of the interval — and skips
+			// the re-read, which on a canceled context could only fail and be
+			// misreported as an internal DB error.
+			timer := time.NewTimer(poll)
+			select {
+			case <-timer.C:
+				poll = nextSettlePollInterval(poll)
+				continue
+			case <-c.Request.Context().Done():
+				timer.Stop()
+				canceled = true
+			}
 		}
 		break
 	}
@@ -1219,14 +1232,28 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	// stays off the hot path.
 	if reads > 1 {
 		waited := time.Since(waitStart)
-		settled := sandbox.Status != db.SandboxStatusPausing
+		// Only pausing→paused counts as settled: a row that left 'pausing'
+		// for any other state (a failed pause reverting to active, a delete
+		// claiming the row) still 409s below, and folding it into "settled"
+		// would contaminate the metric with pause failures.
+		var result string
+		switch {
+		case canceled:
+			result = telemetry.SettleResultCanceled
+		case sandbox.Status == db.SandboxStatusPaused:
+			result = telemetry.SettleResultSettled
+		case sandbox.Status == db.SandboxStatusPausing:
+			result = telemetry.SettleResultTimeout
+		default:
+			result = telemetry.SettleResultDiverged
+		}
 		log.Warn().
 			Str("sandbox_id", sandboxID.String()).
 			Dur("waited", waited).
 			Int("reads", reads).
-			Bool("settled", settled).
+			Str("result", result).
 			Msg("resume waited for racing pause finalize to settle")
-		RecordResumeSettleWait(c.Request.Context(), settled, sandbox.HostID, waited, reads)
+		RecordResumeSettleWait(c.Request.Context(), result, sandbox.HostID, waited, reads)
 	}
 	SetTelemetryHostID(c, sandbox.HostID)
 

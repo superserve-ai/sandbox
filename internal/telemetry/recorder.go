@@ -13,11 +13,17 @@ const (
 )
 
 // Result values for SandboxResumeSettleWait. Distinct from the ResultX enum
-// above: a settle wait always resolves as either "the racing write landed"
-// or "we gave up waiting for it" — neither maps onto success/error/conflict.
+// above: none of these outcomes map onto success/error/conflict.
+// "Settled" means specifically pausing→paused — the outcome the wait exists
+// for. A row that left 'pausing' for any other state (a failed pause
+// reverting to active, a delete claiming the row) diverged: the resume still
+// 409s, and counting it as settled would contaminate the settle metric with
+// pause failures.
 const (
-	SettleResultSettled = "settled"
-	SettleResultTimeout = "timeout"
+	SettleResultSettled  = "settled"  // pausing → paused; the resume proceeds
+	SettleResultDiverged = "diverged" // pausing → any non-paused state; the resume 409s
+	SettleResultTimeout  = "timeout"  // still 'pausing' when the window expired
+	SettleResultCanceled = "canceled" // caller disconnected or timed out mid-wait
 )
 
 // SandboxTransition records low-cardinality operational lifecycle metrics.
@@ -39,7 +45,7 @@ type SandboxTransition struct {
 // was just slow" in dashboards, since both would otherwise fold into the
 // same overall resume duration histogram.
 type SandboxResumeSettleWait struct {
-	Result   string // "settled" or "timeout"
+	Result   string // one of the SettleResult* constants
 	Region   string
 	HostID   string
 	Duration time.Duration

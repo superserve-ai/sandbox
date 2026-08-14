@@ -77,14 +77,11 @@ func RecordSandboxTransition(ctx context.Context, operation, result, hostID stri
 }
 
 // RecordResumeSettleWait records ResumeSandbox waiting through a racing
-// finalize-pause write. Callers should only invoke this when the loop
-// actually waited (more than one read) — it is meant to run once per
-// affected resume, not once per poll iteration.
-func RecordResumeSettleWait(ctx context.Context, settled bool, hostID string, waited time.Duration, reads int) {
-	result := telemetry.SettleResultTimeout
-	if settled {
-		result = telemetry.SettleResultSettled
-	}
+// finalize-pause write; result is one of the telemetry.SettleResult*
+// constants. Callers should only invoke this when the loop actually waited
+// (more than one read) — it is meant to run once per affected resume, not
+// once per poll iteration.
+func RecordResumeSettleWait(ctx context.Context, result, hostID string, waited time.Duration, reads int) {
 	currentTelemetryRecorder().RecordSandboxResumeSettleWait(ctx, telemetry.SandboxResumeSettleWait{
 		Result:   result,
 		Region:   SandboxIDRegion(),

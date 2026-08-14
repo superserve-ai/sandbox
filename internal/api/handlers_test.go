@@ -27,6 +27,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -1414,6 +1415,86 @@ func TestResumeSandbox_PersistentPausing_409(t *testing.T) {
 	// stay nowhere near the old ~120-read worst case.
 	if got := atomic.LoadInt32(&reads); got < 2 || got > 15 {
 		t.Errorf("GetSandbox reads = %d, want in [2, 15] (bounded, backed-off poll)", got)
+	}
+}
+
+// settleWaitCapture records the last resume-settle-wait metric emission,
+// delegating everything else to the noop recorder.
+type settleWaitCapture struct {
+	telemetry.Recorder
+	last *telemetry.SandboxResumeSettleWait
+}
+
+func (s *settleWaitCapture) RecordSandboxResumeSettleWait(_ context.Context, w telemetry.SandboxResumeSettleWait) {
+	s.last = &w
+}
+
+// A row that leaves 'pausing' for a non-paused state mid-poll (a failed
+// pause reverting to active) is not a settle: the resume still 409s and the
+// metric must say "diverged", not "settled".
+func TestResumeSandbox_PausingDivergesToActive_409(t *testing.T) {
+	capture := &settleWaitCapture{Recorder: telemetry.NewNoopRecorder()}
+	SetTelemetryRecorder(capture)
+	defer SetTelemetryRecorder(nil)
+
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+
+	var reads int32
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row {
+			status := db.SandboxStatusPausing
+			if atomic.AddInt32(&reads, 1) > 1 {
+				status = db.SandboxStatusActive // pause failed; async revert landed
+			}
+			return sandboxRow(db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: status})
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+	if capture.last == nil {
+		t.Fatal("settle-wait metric not emitted despite a waited resume")
+	}
+	if capture.last.Result != telemetry.SettleResultDiverged {
+		t.Errorf("settle result = %q, want %q (reverted pause must not count as settled)", capture.last.Result, telemetry.SettleResultDiverged)
+	}
+}
+
+// A client that cancels mid-backoff must release the handler at cancellation:
+// no riding out the rest of the poll interval, and no follow-up GetSandbox on
+// the already-canceled context.
+func TestResumeSandbox_CanceledDuringSettle_StopsPolling(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var reads int32
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row {
+			atomic.AddInt32(&reads, 1)
+			cancel() // client goes away right after the first read
+			return sandboxRow(db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPausing})
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	start := time.Now()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()).WithContext(ctx))
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+	if got := atomic.LoadInt32(&reads); got != 1 {
+		t.Errorf("GetSandbox reads = %d, want 1 (no re-read on a canceled context)", got)
+	}
+	if elapsed >= pausingSettleWindow {
+		t.Errorf("handler held for %v, want prompt return on cancellation (window %v)", elapsed, pausingSettleWindow)
 	}
 }
 
