@@ -138,6 +138,15 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	if !knownSupervision(supervision) {
 		supervision = SupervisionUnit
 	}
+	// Omitted shape means the sandbox's own recorded shape, not the
+	// cold-boot fallback of 1 vCPU and 1 GiB: a larger workload revived
+	// undersized would report clean and then fail under its normal load.
+	if vcpu == 0 {
+		vcpu = prevRec.VCPU
+	}
+	if memMiB == 0 {
+		memMiB = prevRec.MemoryMiB
+	}
 	phaseStart := time.Now()
 	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, true, supervision, vcpu, memMiB)
 	if err != nil {
