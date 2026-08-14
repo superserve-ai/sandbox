@@ -570,3 +570,41 @@ func TestDrain_VMDFailureRevertsToActive(t *testing.T) {
 		t.Fatalf("failed pause must revert to active, got %d reverts", atomic.LoadInt32(&reverts))
 	}
 }
+
+// TestDrain_BatchSharedAcrossHosts pins the per-tick work bound: with N
+// draining hosts, each gets batchSize/N of the claim budget and the pauses
+// dispatch through one shared fan-out — a slow host cannot starve the rest
+// or blow ReaperConfig's documented per-cycle bound.
+func TestDrain_BatchSharedAcrossHosts(t *testing.T) {
+	var claimSizes []int32
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+				switch {
+				case strings.Contains(sql, "-- name: ListDrainingHosts :many"):
+					return &drainingHostRows{hosts: []db.ListDrainingHostsRow{{ID: "host-a"}, {ID: "host-b"}}}, nil
+				case strings.Contains(sql, "-- name: ClaimDrainingSandboxes :many"):
+					claimSizes = append(claimSizes, args[1].(int32))
+					return newStubRows(nil), nil
+				}
+				return newStubRows(nil), nil
+			},
+			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+				if strings.Contains(sql, "-- name: CountUnpausedOnHost :one") {
+					return &mockRow{scanFn: func(dest ...any) error {
+						*dest[0].(*int64) = 0
+						return nil
+					}}
+				}
+				return activityRow()
+			},
+		},
+		&stubVMD{},
+	)
+
+	h.drainOnce(context.Background(), 10, 2)
+
+	if len(claimSizes) != 2 || claimSizes[0] != 5 || claimSizes[1] != 5 {
+		t.Fatalf("claim sizes %v, want [5 5] — batch split across hosts", claimSizes)
+	}
+}

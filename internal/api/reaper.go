@@ -507,29 +507,49 @@ func (h *Handlers) drainOnce(ctx context.Context, batchSize int32, parallelism i
 		log.Error().Err(err).Msg("drain: listing draining hosts failed")
 		return
 	}
+	if len(hosts) == 0 {
+		return
+	}
+
+	// BatchSize bounds the whole tick, not each host: it is ReaperConfig's
+	// documented per-cycle work bound, and a slow host must not starve the
+	// others of their share of it. Claims are split across hosts and all
+	// claimed sandboxes dispatch through ONE bounded fan-out, so pauses
+	// interleave across hosts instead of serializing host by host.
+	perHost := batchSize / int32(len(hosts))
+	if perHost < 1 {
+		perHost = 1
+	}
+	var all []db.ClaimDrainingSandboxesRow
 	for _, host := range hosts {
-		l := log.With().Str("host_id", host.ID).Logger()
 		claimed, err := h.DB.ClaimDrainingSandboxes(ctx, db.ClaimDrainingSandboxesParams{
-			HostID: host.ID, BatchSize: batchSize,
+			HostID: host.ID, BatchSize: perHost,
 		})
 		if err != nil {
-			l.Error().Err(err).Msg("drain: claim failed")
+			log.Error().Err(err).Str("host_id", host.ID).Msg("drain: claim failed")
 			continue
 		}
 		if len(claimed) > 0 {
-			l.Info().Int("claimed", len(claimed)).Msg("drain: pausing active sandboxes on draining host")
-			dispatchBounded(ctx, claimed, parallelism, func(row db.ClaimDrainingSandboxesRow) {
-				h.pauseClaimed(ctx, db.ClaimExpiredSandboxesRow(row), drainPauseCause)
-			})
+			log.Info().Str("host_id", host.ID).Int("claimed", len(claimed)).
+				Msg("drain: pausing active sandboxes on draining host")
+			all = append(all, claimed...)
 		}
+	}
+	if len(all) > 0 {
+		dispatchBounded(ctx, all, parallelism, func(row db.ClaimDrainingSandboxesRow) {
+			h.pauseClaimed(ctx, db.ClaimExpiredSandboxesRow(row), drainPauseCause)
+		})
+	}
 
+	for _, host := range hosts {
+		l := log.With().Str("host_id", host.ID).Logger()
 		remaining, err := h.DB.CountUnpausedOnHost(ctx, host.ID)
 		if err != nil {
 			l.Error().Err(err).Msg("drain: progress count failed")
 			continue
 		}
 		switch {
-		case remaining == 0 && len(claimed) > 0:
+		case remaining == 0 && len(all) > 0:
 			l.Warn().Msg("drain complete: host has no sandboxes left that a restart would destroy")
 		case remaining > 0 && host.MaintenanceWindowStart.Valid &&
 			time.Until(host.MaintenanceWindowStart.Time) < drainIncompleteLead:

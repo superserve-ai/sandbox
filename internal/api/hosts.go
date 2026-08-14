@@ -155,7 +155,15 @@ func (h *Handlers) recordMaintenanceWindow(ctx context.Context, hostID, raw, sta
 		log.Error().Err(err).Str("host_id", hostID).Msg("failed to record maintenance window")
 		return status
 	}
-	if window == nil || status != "active" || time.Until(*window) > drainLeadTime {
+	until := time.Duration(0)
+	if window != nil {
+		until = time.Until(*window)
+	}
+	// Drain only inside the lead window. The lower bound matters as much as
+	// the upper: a recorded window well in the past (metadata that never
+	// cleared after the restart happened) must not re-drain a host an
+	// operator just un-drained.
+	if window == nil || status != "active" || until > drainLeadTime || until < -drainLeadTime {
 		return status
 	}
 	n, err := h.DB.DrainHost(ctx, hostID)

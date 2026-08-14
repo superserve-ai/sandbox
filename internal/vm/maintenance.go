@@ -49,11 +49,9 @@ func probeMaintenanceWindow(ctx context.Context, client *http.Client) (*time.Tim
 	if err != nil {
 		return nil, fmt.Errorf("read metadata response: %w", err)
 	}
-	if resp.StatusCode == http.StatusNotFound {
-		// No maintenance resource at all — nothing announced.
-		return nil, nil
-	}
 	if resp.StatusCode != http.StatusOK {
+		// Includes 404: only a 200 is meaningful (a transient 404 must not
+		// erase a recorded window — the explicit clear is a 200 saying NONE).
 		return nil, fmt.Errorf("metadata returned %d", resp.StatusCode)
 	}
 	trimmed := string(body)

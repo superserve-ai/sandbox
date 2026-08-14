@@ -282,3 +282,25 @@ func TestDrainEndpoints(t *testing.T) {
 		})
 	}
 }
+
+// TestHostHeartbeatStalePastWindowDoesNotDrain pins the lower bound of the
+// drain window: a recorded window well in the past (metadata that never
+// cleared after the restart already happened) must not re-drain a host an
+// operator just un-drained.
+func TestHostHeartbeatStalePastWindowDoesNotDrain(t *testing.T) {
+	mock, windowWrites, _ := drainTestMock(t, "active", false)
+	h := &Handlers{DB: db.New(mock)}
+	stale := time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339)
+
+	w := postHeartbeat(t, h, `{"maintenance_window_start":"`+stale+`"}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if *windowWrites != 1 {
+		t.Fatalf("windowWrites=%d, want 1 — stale window is still recorded, just not acted on", *windowWrites)
+	}
+	if !strings.Contains(w.Body.String(), `"active"`) {
+		t.Fatalf("host must stay active on a stale window, got %s", w.Body.String())
+	}
+}

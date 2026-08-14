@@ -45,11 +45,10 @@ func TestProbeMaintenanceWindow(t *testing.T) {
 		}
 	})
 
-	t.Run("404 means nothing announced", func(t *testing.T) {
+	t.Run("404 is unknowable, not cleared", func(t *testing.T) {
 		withMaintenanceServer(t, 404, "not found")
-		got, err := probeMaintenanceWindow(context.Background(), client)
-		if err != nil || got != nil {
-			t.Fatalf("want nil/nil, got %v err %v", got, err)
+		if _, err := probeMaintenanceWindow(context.Background(), client); err == nil {
+			t.Fatal("404 must be an error — a transient one must not erase a recorded window")
 		}
 	})
 
