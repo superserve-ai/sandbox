@@ -277,6 +277,13 @@ message ReviveVMRequest {
   string disk_path = 2;
   uint32 vcpu = 3;
   uint32 mem_mib = 4;
+  // Egress policy, applied before revival reports success: a sandbox
+  // with allow or deny rules must not come back running open. Same
+  // ownership as ResumeVM's rules: the control plane knows them, the
+  // host does not.
+  repeated string allowed_cidrs = 5;
+  repeated string denied_cidrs = 6;
+  repeated string allowed_domains = 7;
 }
 
 message ReviveVMResponse {

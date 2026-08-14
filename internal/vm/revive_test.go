@@ -21,10 +21,10 @@ func TestReviveVMGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := m.ReviveVM(context.Background(), "../escape", disk, 1, 128); status.Code(err) != codes.InvalidArgument {
+	if _, err := m.ReviveVM(context.Background(), "../escape", disk, 1, 128, nil); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("traversal id: %v, want InvalidArgument", err)
 	}
-	if _, err := m.ReviveVM(context.Background(), "vm-1", filepath.Join(t.TempDir(), "absent.ext4"), 1, 128); status.Code(err) != codes.InvalidArgument {
+	if _, err := m.ReviveVM(context.Background(), "vm-1", filepath.Join(t.TempDir(), "absent.ext4"), 1, 128, nil); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("missing disk: %v, want InvalidArgument", err)
 	}
 
@@ -37,7 +37,7 @@ func TestReviveVMGuards(t *testing.T) {
 	m.mu.Lock()
 	m.vms["vm-paused"] = &VMInstance{ID: "vm-paused", Status: StatusPaused, SnapshotPath: "/snapshots/vm-paused/vmstate.snap"}
 	m.mu.Unlock()
-	if _, err := m.ReviveVM(context.Background(), "vm-paused", disk, 1, 128); status.Code(err) != codes.FailedPrecondition {
+	if _, err := m.ReviveVM(context.Background(), "vm-paused", disk, 1, 128, nil); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("healthy paused: %v, want FailedPrecondition", err)
 	}
 }

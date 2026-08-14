@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/superserve-ai/sandbox/internal/network"
+
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -26,7 +28,7 @@ import (
 // only after this returns, and the ordinary auto-pause machinery then
 // takes the revived sandbox through the standard pause path, which is
 // what lands it paused with a fresh, uploaded generation.
-func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath string, vcpu, memMiB uint32) (*VMInstance, error) {
+func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath string, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
 	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
 		return nil, status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
 	}
@@ -66,6 +68,18 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath string, vcpu, mem
 	if !m.vmConfirmedAtRest(ctx, vmID) {
 		return nil, status.Errorf(codes.FailedPrecondition, "vm %s is not confirmed at rest; revive only replaces dead VMs", vmID)
 	}
+	// The zombie's durable record carries policy that must survive
+	// revival: preview publication (a private preview must not come
+	// back public) and ownership. Captured before the teardown deletes
+	// the record; absence is fine, the fields stay zero for sandboxes
+	// that never set policy.
+	var prevRec *VMRecord
+	if m.state != nil {
+		if rec, err := m.state.Get(vmID); err == nil {
+			prevRec = rec
+		}
+	}
+
 	// The salvage must live outside the zombie's run directory: the
 	// forced teardown below removes that directory, and a salvage
 	// inside it would be deleted before the boot could copy it.
@@ -90,6 +104,35 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath string, vcpu, mem
 	if err != nil {
 		return nil, err
 	}
+	// Egress policy applies before success is reported and before the
+	// DB row can flip: a sandbox with allow or deny rules must not run
+	// open. The rules travel on the request (the control plane owns
+	// them, exactly as ResumeVM's do).
+	if rules != nil {
+		inst.mu.RLock()
+		netInfo := &network.VMNetInfo{HostIP: inst.IP, TAPDevice: inst.TAPDevice, Namespace: inst.Namespace}
+		inst.mu.RUnlock()
+		if err := m.applySandboxNetworkRules(vmID, netInfo, rules); err != nil {
+			_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
+			return nil, status.Errorf(codes.Internal, "apply network rules: %v", err)
+		}
+	}
+	// Preview policy carries over from the prior record verbatim.
+	if prevRec != nil {
+		ports := previewPortsFromRecord(prevRec.PreviewPorts, prevRec.PreviewPortAccess, prevRec.PreviewPortTokenVersions)
+		inst.mu.Lock()
+		inst.PreviewAccess = prevRec.PreviewAccess
+		inst.PreviewPorts = ports
+		inst.PreviewPolicyRevision = prevRec.PreviewPolicyRevision
+		inst.PreviewTokenPolicyRevision = prevRec.PreviewTokenPolicyRevision
+		if inst.TeamID == "" {
+			inst.TeamID = prevRec.TeamID
+		}
+		if inst.OwnerID == "" {
+			inst.OwnerID = prevRec.OwnerID
+		}
+		inst.mu.Unlock()
+	}
 	inst.mu.RLock()
 	ip := inst.IP
 	inst.mu.RUnlock()
@@ -100,7 +143,10 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath string, vcpu, mem
 	// back down so the retry starts clean and the salvage stays
 	// pristine.
 	if err := m.waitForBoxd(ctx, ip, reviveBoxdReadyBudget); err != nil {
-		_ = m.DestroyVM(ctx, vmID, true)
+		// Teardown must not run under the RPC's possibly-expired
+		// context: a canceled stop leaves exactly the half-cleared state
+		// revival exists to avoid.
+		_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
 		return nil, status.Errorf(codes.Unavailable, "guest did not become ready: %v", err)
 	}
 	// Durable record: reattach and the reconciler must know this VM
@@ -109,7 +155,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath string, vcpu, mem
 	// VM would be invisible to reconciliation and refused by the next
 	// revive's liveness probe, so fail closed and tear down.
 	if !m.persistState(inst) {
-		_ = m.DestroyVM(ctx, vmID, true)
+		_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
 		return nil, status.Error(codes.Internal, "revived VM could not be durably recorded; torn down for clean retry")
 	}
 	return inst, nil
