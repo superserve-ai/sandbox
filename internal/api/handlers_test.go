@@ -1317,6 +1317,89 @@ func TestResumeSandbox_NotPaused(t *testing.T) {
 	}
 }
 
+// PauseSandbox responds once vmd's PauseVM RPC completes, then flips
+// pausing -> paused via fire-and-forget bookkeeping. The owner's own
+// immediate follow-up resume may read the row before that write lands; the
+// settle window must absorb it: a 'pausing' row that flips to 'paused'
+// mid-poll returns 200, not 409.
+func TestResumeSandbox_SettlesPausingToPaused(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", SizeBytes: 1024, Trigger: "pause",
+	}
+
+	var reads int32
+	vmd := &stubVMD{
+		resumeFn: func(_ context.Context, id, _, _ string, _ []byte) (string, error) {
+			return "10.0.0.5", nil
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			case strings.Contains(sql, "FROM sandbox"):
+				row := sb
+				if atomic.AddInt32(&reads, 1) == 1 {
+					row.Status = db.SandboxStatusPausing // finalize-pause still in flight
+				}
+				return sandboxRow(row)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{
+		VMD:    vmd,
+		DB:     db.New(mock),
+		Config: &config.Config{SandboxAccessTokenSeed: []byte("test-seed-for-hmac-32-bytes-min!!")},
+	}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (settle window must absorb the async finalize-pause); body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if got := atomic.LoadInt32(&reads); got < 2 {
+		t.Errorf("GetSandbox reads = %d, want >= 2 (must have polled)", got)
+	}
+}
+
+// A sandbox stuck in 'pausing' past the settle window (finalize-pause lost
+// or genuinely stalled, not just racing) still 409s. Shrink the window so
+// this persistent case stays fast.
+func TestResumeSandbox_PersistentPausing_409(t *testing.T) {
+	prev := activateSettleWindow
+	activateSettleWindow = 100 * time.Millisecond
+	defer func() { activateSettleWindow = prev }()
+
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPausing}
+
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+}
+
 func TestResumeSandbox_NoSnapshotID(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()

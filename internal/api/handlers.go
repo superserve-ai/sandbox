@@ -306,12 +306,15 @@ func retryTransientBoot(parent context.Context, sandboxID string, boot func(cont
 // asyncTimeout is the deadline for fire-and-forget DB writes.
 const asyncTimeout = 5 * time.Second
 
-// activateSettleWindow bounds how long status-gated read paths wait for the
-// fire-and-forget activate write to land. Create/resume respond before the
-// starting/resuming→active flip commits, so the owner's immediate follow-up
-// (create then exec — the canonical SDK flow) may read the pre-flip status;
-// waiting briefly preserves read-your-writes instead of 409ing it. The write
-// lands in single-digit ms in the common case, which this covers.
+// activateSettleWindow bounds how long status-gated read paths wait for a
+// fire-and-forget write to land. Two distinct writes use it: create/resume's
+// starting/resuming→active flip (read by loadActiveOrResumeSandbox) and
+// pause's pausing→paused flip (read by ResumeSandbox) — in both cases the
+// owner's own immediate follow-up (create then exec; pause then resume — the
+// canonical SDK flows) may read the pre-flip status, so waiting briefly
+// preserves read-your-writes instead of 409ing an operation the client was
+// just told succeeded. The write lands in single-digit ms in the common
+// case, which this covers.
 //
 // It deliberately does NOT try to outlast a hostname-only create's pre-flip
 // stamp: that guest round trip can take tens of seconds on a cold-fault stall
@@ -1142,18 +1145,35 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
-		ID:     sandboxID,
-		TeamID: teamID,
-	})
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			respondError(c, ErrSandboxNotFound)
+	// PauseSandbox responds as soon as vmd's PauseVM RPC completes, then
+	// flips pausing -> paused via fire-and-forget bookkeeping (deliberately
+	// off the pause hot path — see finalize-pause in PauseSandbox). The
+	// owner's own immediate follow-up resume can therefore read the row
+	// before that write lands; poll through 'pausing' for the settle window
+	// rather than 409 an operation the client was just told succeeded. Any
+	// other non-paused status is a real conflict and fails immediately.
+	deadline := time.Now().Add(activateSettleWindow)
+	var sandbox db.Sandbox
+	for {
+		var err error
+		sandbox, err = h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+			ID:     sandboxID,
+			TeamID: teamID,
+		})
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				respondError(c, ErrSandboxNotFound)
+				return
+			}
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+			respondError(c, ErrInternal)
 			return
 		}
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-		respondError(c, ErrInternal)
-		return
+		if sandbox.Status == db.SandboxStatusPausing && time.Now().Before(deadline) {
+			time.Sleep(activateSettlePoll)
+			continue
+		}
+		break
 	}
 	SetTelemetryHostID(c, sandbox.HostID)
 
