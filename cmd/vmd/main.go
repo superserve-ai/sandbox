@@ -1045,13 +1045,12 @@ func main() {
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 	switch {
 	case adoptNetPool && slotsReserved && sweepSafe:
-		// Adopt the slots the previous run abandoned (or crashed out of) in
-		// the background: the pool starts warm within seconds instead of
-		// refilling from scratch, and boot never blocks on the pass.
-		go func() {
-			defer sentrylog.Recover("netpool adoption")
-			netPool.AdoptOrphanSlots(ctx)
-		}()
+		// Adopt the slots the previous run abandoned (or crashed out of):
+		// the pool starts warm within seconds instead of refilling from
+		// scratch. StartAdoption marks the pass underway before returning,
+		// so requests racing boot wait on it instead of building inline;
+		// the pass itself runs in the background and never blocks boot.
+		netPool.StartAdoption(ctx)
 	case adoptNetPool:
 		// Without a completed reservation pass — or with an unprotected
 		// recordless survivor — adoption cannot tell live VM namespaces from
@@ -1218,6 +1217,14 @@ func main() {
 	// Fast pre-serve init is done (slots reserved, namespaces swept, pool fill
 	// backgrounded). Open the gate; pool warm-up and full reattach continue in
 	// the background, and requests load any not-yet-reattached VM on demand.
+	// Boot-time pool patience lives in SetupVM's bounded ClaimWait (with a
+	// longer budget while adoption runs), deliberately NOT here: only
+	// slot-allocating requests should ever wait on the pool. Pause and
+	// destroy never allocate; resume usually reuses its saved namespace and
+	// pays nothing, but a resume whose namespace is gone (or a stateless
+	// restore) allocates like a create and shares its bounded wait. A gate
+	// at this level would hold even the non-allocating paths behind
+	// inventory they never use.
 	startupReady.Store(true)
 	log.Info().Msg("startup complete — gRPC serving requests")
 
