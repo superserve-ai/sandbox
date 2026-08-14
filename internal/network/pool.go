@@ -166,7 +166,6 @@ const (
 	// under a second, and a tight bound keeps a stalled backlog (and Stop)
 	// from dragging.
 	resetTapTimeout = 3 * time.Second
-	PLACEHOLDER_REMOVED
 	// adoptConcurrency bounds parallel orphan adoptions: each runs /proc
 	// scans and possibly a tap rebuild, and boot is exactly when the host is
 	// also reattaching VMs — keep the sweep gentle.
@@ -684,10 +683,11 @@ func (p *Pool) stopSlot(slot *preallocSlot) {
 }
 
 // adoptFromReceipt consumes the previous process's receipt and, for every
-// candidate it vouches for, runs cheap batched validation and places the
-// slot straight into inventory — no kill/poll, no firewall reinstall, no
-// route rewrite, no tap rebuild: those exist to re-derive or repair state
-// the receipt proves is already settled and current. Returns the remaining
+// candidate it vouches for, runs cheap batched validation — plus an
+// in-process firewall rebuild from current policy — and places the slot
+// straight into inventory. What it skips is the expensive re-derivation:
+// no kill/poll, no route-rewrite subprocesses, no tap rebuild; the receipt
+// proves that state is already settled and current. Returns the remaining
 // candidates (unvouched plus demoted) for the full path, and the count
 // placed. All scans are batched: one netns readdir, one host-interface
 // readdir, one /proc pass — the per-slot multiplier is the cost being
