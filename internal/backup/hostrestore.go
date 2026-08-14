@@ -72,6 +72,24 @@ func (a CaptureAnchor) matches(m *GenerationManifest) bool {
 	return true
 }
 
+// sameManifestContent reports whether two manifests name the same
+// artifact set with the same digests.
+func sameManifestContent(a, b *GenerationManifest) bool {
+	if len(a.Files) != len(b.Files) {
+		return false
+	}
+	byName := make(map[string]string, len(a.Files))
+	for _, f := range a.Files {
+		byName[f.Name] = f.SHA256
+	}
+	for _, f := range b.Files {
+		if byName[f.Name] != f.SHA256 {
+			return false
+		}
+	}
+	return true
+}
+
 type HostRestoreOutcome string
 
 const (
@@ -251,16 +269,39 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 		// pause that survived.
 		match := ""
 		matchAnchor := -1
+		var matchedGens []string
 		for ai, anchor := range item.Anchors {
 			for _, g := range gens {
 				if v, ok := manifestByGen.Load(g.Generation); ok && anchor.matches(v.(*GenerationManifest)) {
-					match = g.Generation
-					matchAnchor = ai
-					break
+					if match == "" {
+						match = g.Generation
+						matchAnchor = ai
+					}
+					matchedGens = append(matchedGens, g.Generation)
 				}
 			}
 			if match != "" {
 				break
+			}
+		}
+		// A partial anchor (vmstate-only, the pause-time manifest shape)
+		// can match several generations whose other artifacts differ; the
+		// digest set alone then cannot say which filesystem generation
+		// the anchor's pause captured, and picking newest would silently
+		// restore the wrong one. Identical matches are fine (re-uploaded
+		// duplicates of one capture); differing matches fail closed and
+		// name the candidates so the operator resolves with an explicit
+		// per-sandbox digest set.
+		if len(matchedGens) > 1 {
+			first, _ := manifestByGen.Load(matchedGens[0])
+			for _, g := range matchedGens[1:] {
+				v, _ := manifestByGen.Load(g)
+				if !sameManifestContent(first.(*GenerationManifest), v.(*GenerationManifest)) {
+					res.Outcome = HostRestoreFailed
+					res.Reason = fmt.Sprintf("anchor is ambiguous: generations %s match the recorded digest set but differ in content; supply the full digest set for this sandbox", strings.Join(matchedGens, ", "))
+					res.Duration = time.Since(start)
+					return res
+				}
 			}
 		}
 		switch {
