@@ -983,6 +983,12 @@ func seedTeamAndKeyWithRole(t *testing.T, roleName string) (uuid.UUID, string, u
 	if err != nil {
 		t.Fatalf("seedTeamAndKeyWithRole: create team: %v", err)
 	}
+	if _, err := testPool.Exec(ctx, `
+		DELETE FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'signup trial credit'
+	`, team.ID); err != nil {
+		t.Fatalf("seedTeamAndKeyWithRole: clear default trial grant: %v", err)
+	}
 
 	profileID := uuid.New()
 	if _, err := testPool.Exec(ctx,
@@ -1550,6 +1556,110 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	}
 	if _, ok := body["calculated_at"].(string); !ok {
 		t.Fatalf("calculated_at missing or not a string: %v", body["calculated_at"])
+	}
+}
+
+func TestIntegration_NewTeamReceivesSignupTrialCredit(t *testing.T) {
+	ctx := context.Background()
+	team, err := testQueries.CreateTeam(ctx, "trial-credit-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatalf("create team: %v", err)
+	}
+	teamID := team.ID
+
+	var amount, remaining float64
+	if err := testPool.QueryRow(ctx, `
+		SELECT amount_usd, remaining_usd
+		FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'signup trial credit'
+	`, teamID).Scan(&amount, &remaining); err != nil {
+		t.Fatalf("load signup trial credit: %v", err)
+	}
+	if amount != 5 || remaining != 5 {
+		t.Fatalf("signup trial credit = (%v, %v), want (5, 5)", amount, remaining)
+	}
+}
+
+func TestIntegration_CreateSandboxBlockedWhenTrialCreditIsExhausted(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
+		VALUES ($1, 5.000000, 0, 'signup trial credit')
+	`, teamID); err != nil {
+		t.Fatalf("exhaust signup trial credit: %v", err)
+	}
+
+	w := do(newRouter(t), "POST", "/sandboxes", ownerKey, `{"name":"trial-exhausted"}`)
+	if w.Code != http.StatusPaymentRequired {
+		t.Fatalf("create with exhausted trial: expected 402, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_GetBillingSummaryDefersPaymentSetupWhileCreditsRemain(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", ownerKey, `{"name":"billing-credit-trial"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: expected 201, got %d: %s", cw.Code, cw.Body.String())
+	}
+	sandboxID, err := uuid.Parse(mustJSON(t, cw)["id"].(string))
+	if err != nil {
+		t.Fatalf("parse sandbox id: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded compute billing interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_storage_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded storage billing interval: %v", err)
+	}
+
+	periodStart, periodEnd := billing.CurrentBillingPeriod(time.Now().UTC())
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable live billing mode: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'incomplete')
+		ON CONFLICT (team_id) DO UPDATE
+		SET stripe_customer_id = EXCLUDED.stripe_customer_id,
+		    stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+		    stripe_subscription_status = EXCLUDED.stripe_subscription_status
+	`, teamID, "cus_"+teamID.String(), "sub_"+teamID.String()); err != nil {
+		t.Fatalf("seed incomplete billing account: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
+		VALUES ($1, 10.000000, 10.000000, 'integration test trial credit')
+	`, teamID); err != nil {
+		t.Fatalf("seed billing trial credit: %v", err)
+	}
+
+	liveRouter := newBillingRouter(t, &fakeStripeClient{})
+	live := do(liveRouter, "GET", "/billing/summary", ownerKey, "")
+	if live.Code != http.StatusOK {
+		t.Fatalf("live billing summary with trial credit: expected 200, got %d: %s", live.Code, live.Body.String())
+	}
+	liveBody := mustJSON(t, live)
+	if got := liveBody["payment_setup_required"].(bool); got {
+		t.Fatal("payment_setup_required should be false while trial credit remains")
+	}
+	period, ok := liveBody["billing_period"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("billing_period not an object: %v", liveBody["billing_period"])
+	}
+	if got := period["start"].(string); got != periodStart.Format(time.RFC3339) {
+		t.Fatalf("period start = %q, want %q", got, periodStart.Format(time.RFC3339))
+	}
+	if got := period["end"].(string); got != periodEnd.Format(time.RFC3339) {
+		t.Fatalf("period end = %q, want %q", got, periodEnd.Format(time.RFC3339))
 	}
 }
 
