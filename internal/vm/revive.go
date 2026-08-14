@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -45,24 +47,39 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath string, vcpu, mem
 		return nil, err
 	}
 	defer unlock()
-	// Never revive over a live or healthy VM. The recorded status is
-	// exactly what a zombie lies about (a dead VM's record still says
-	// running), so liveness is probed from the process: a recorded
-	// running VM whose Firecracker actually answers for this id is
-	// alive and refused, while a record without a live process is the
-	// zombie this exists for. A paused VM with its snapshot is healthy
-	// at rest and refused too: resume owns that path, not revive.
+	// Never revive over a live or healthy VM. A paused VM with its
+	// snapshot is healthy at rest and refused: resume owns that path.
 	if inst, err := m.getInstance(vmID); err == nil {
 		inst.mu.RLock()
-		st, pid, snap := inst.Status, inst.PID, inst.SnapshotPath
+		st, snap := inst.Status, inst.SnapshotPath
 		inst.mu.RUnlock()
-		switch {
-		case (st == StatusRunning || st == StatusCreating) && pidIsVMFirecracker(pid, vmID):
-			return nil, status.Errorf(codes.FailedPrecondition, "vm %s has a live process; revive only replaces dead VMs", vmID)
-		case st == StatusPaused && snap != "":
+		if st == StatusPaused && snap != "" {
 			return nil, status.Errorf(codes.FailedPrecondition, "vm %s is paused with a snapshot; resume owns healthy paused VMs", vmID)
 		}
 	}
+	// Liveness comes from the supervisors, not the record or a PID: the
+	// record is exactly what a zombie lies about, and a live
+	// systemd-supervised VM can carry PID 0 while its MainPID resolves
+	// asynchronously. vmConfirmedAtRest requires BOTH possible
+	// supervisors terminally quiet, so a genuinely running VM of either
+	// mode refuses here rather than being torn down as a zombie.
+	if !m.vmConfirmedAtRest(ctx, vmID) {
+		return nil, status.Errorf(codes.FailedPrecondition, "vm %s is not confirmed at rest; revive only replaces dead VMs", vmID)
+	}
+	// The salvage must live outside the zombie's run directory: the
+	// forced teardown below removes that directory, and a salvage
+	// inside it would be deleted before the boot could copy it.
+	// Symlinks resolve first so a link cannot smuggle the source in.
+	resolved, err := filepath.EvalSymlinks(diskPath)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "disk_path: %v", err)
+	}
+	vmRunDir := filepath.Join(m.cfg.RunDir, vmID) + string(filepath.Separator)
+	if strings.HasPrefix(resolved+string(filepath.Separator), vmRunDir) || strings.HasPrefix(resolved, vmRunDir) {
+		return nil, status.Errorf(codes.InvalidArgument, "disk_path %q is inside the VM's run directory, which revival deletes; copy the salvage elsewhere first", diskPath)
+	}
+	diskPath = resolved
+
 	// Force-clear the zombie's residue. Fail closed on error: booting
 	// over half-cleared state (a live unit, an occupied network slot)
 	// is exactly the wedge class the teardown exists to prevent.
