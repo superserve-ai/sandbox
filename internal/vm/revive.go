@@ -79,6 +79,14 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 			prevRec = rec
 		}
 	}
+	// Revival replaces a sandbox the platform knows. Without a durable
+	// record (a mistyped or foreign id), proceeding would mint a
+	// brand-new VM with no control-plane row: unroutable, unbilled, and
+	// invisible until the reconciler flags it. Sandboxes whose record
+	// was genuinely lost recover through host restore, not revive.
+	if prevRec == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "vm %s has no durable record on this host; revive only replaces known sandboxes", vmID)
+	}
 
 	// Overlay-mode sandboxes salvage as sparse overlays whose holes are
 	// windows to a shared base image; booting one standalone would read
@@ -113,16 +121,20 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	}
 	diskPath = resolved
 
+	reviveStart := time.Now()
 	// Force-clear the zombie's residue. Fail closed on error: booting
 	// over half-cleared state (a live unit, an occupied network slot)
 	// is exactly the wedge class the teardown exists to prevent.
 	if err := m.DestroyVM(ctx, vmID, true); err != nil {
 		return nil, fmt.Errorf("clear residue: %w", err)
 	}
+	teardownDur := time.Since(reviveStart)
+	phaseStart := time.Now()
 	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, vcpu, memMiB)
 	if err != nil {
 		return nil, err
 	}
+	bootDur := time.Since(phaseStart)
 	// Egress policy applies before success is reported and before the
 	// DB row can flip: a sandbox with allow or deny rules must not run
 	// open. The rules travel on the request (the control plane owns
@@ -161,6 +173,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// active for a sandbox nobody can reach. On failure, tear the VM
 	// back down so the retry starts clean and the salvage stays
 	// pristine.
+	phaseStart = time.Now()
 	if err := m.waitForBoxd(ctx, ip, reviveBoxdReadyBudget); err != nil {
 		// Teardown must not run under the RPC's possibly-expired
 		// context: a canceled stop leaves exactly the half-cleared state
@@ -177,6 +190,15 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
 		return nil, status.Error(codes.Internal, "revived VM could not be durably recorded; torn down for clean retry")
 	}
+	// Rare operator path, so phase durations go to the structured log
+	// rather than a new metric surface: enough to see where a slow
+	// revival spent its time (teardown and copy fold into boot).
+	m.log.Info().Str("vm_id", vmID).
+		Dur("teardown", teardownDur).
+		Dur("copy_and_boot", bootDur).
+		Dur("readiness", time.Since(phaseStart)).
+		Dur("total", time.Since(reviveStart)).
+		Msg("sandbox revived")
 	return inst, nil
 }
 
