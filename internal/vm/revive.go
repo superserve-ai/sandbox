@@ -160,17 +160,31 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// already cleared) is visible and owns the record's absence.
 	selfDestroys := uint64(0)
 	epochBase := m.destroyEpoch(vmID)
+	// A teardown that cannot confirm the replacement stopped must also
+	// suppress the rollback: restoring the zombie record over a
+	// still-live unready VM would lie about the host's state, and
+	// DestroyVM's own failure discipline already leaves a truthful
+	// teardown-pending record for the forced retry.
+	teardownFailed := false
 	teardownSelf := func(c context.Context) {
 		selfDestroys++
-		_ = m.DestroyVM(c, vmID, true)
+		if derr := m.DestroyVM(c, vmID, true); derr != nil {
+			teardownFailed = true
+			m.log.Error().Err(derr).Str("vm_id", vmID).Msg("teardown after failed revival did not confirm; record left as-is")
+		}
 	}
 	defer func() {
-		if committed || m.state == nil {
+		if committed || teardownFailed || m.state == nil {
 			return
 		}
-		// An in-flight external force-destroy (tombstone) or a completed
-		// one (epoch ahead of our own count) owns the record's absence;
-		// resurrecting it would undo the destroy.
+		// The record-owner mutex makes the checks and the restore one
+		// unit against DestroyVM, which holds it through its epoch bump
+		// and tombstone clear: a destroy in flight is waited out and
+		// then seen by the epoch, and one starting later blocks until
+		// this write lands and then deletes it (the destroy wins). An
+		// external destroy owns the record's absence either way.
+		unlockOwner := m.lockRecordOwner(vmID)
+		defer unlockOwner()
 		if _, destroying := m.destroying.Load(vmID); destroying {
 			return
 		}
@@ -240,6 +254,9 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		// context: a canceled stop leaves exactly the half-cleared state
 		// revival exists to avoid.
 		teardownSelf(context.WithoutCancel(ctx))
+		if teardownFailed {
+			return nil, status.Errorf(codes.Internal, "guest did not become ready (%v) and teardown did not confirm; VM left for forced destroy", err)
+		}
 		return nil, status.Errorf(codes.Unavailable, "guest did not become ready: %v", err)
 	}
 	// The guest proved itself; the durable record may now claim a
@@ -271,6 +288,9 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	}
 	if !wrote {
 		teardownSelf(context.WithoutCancel(ctx))
+		if teardownFailed {
+			return nil, status.Error(codes.Internal, "revived VM could not be durably recorded and teardown did not confirm; VM left for forced destroy")
+		}
 		return nil, status.Error(codes.Internal, "revived VM could not be durably recorded; torn down for clean retry")
 	}
 	committed = true

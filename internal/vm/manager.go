@@ -508,6 +508,12 @@ type Manager struct {
 	// tombstone alone only spans an in-flight destroy, not a finished
 	// one.
 	destroyEpochs sync.Map // vmID -> *uint64
+	// recordOwnerMus serializes DestroyVM against revival's rollback:
+	// DestroyVM holds vmID's mutex from before the tombstone through the
+	// epoch bump and tombstone clear, so a rollback that acquires it and
+	// then checks the epoch cannot interleave with a destroy completing
+	// between its check and its restore write.
+	recordOwnerMus sync.Map // vmID -> *sync.Mutex
 }
 
 // trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
@@ -1050,6 +1056,8 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	// field). A tracked VM still resolves from m.vms below — this gates only
 	// reattach; an untracked one takes the record fallback, which carries all
 	// teardown needs.
+	unlockOwner := m.lockRecordOwner(vmID)
+	defer unlockOwner() // registered first: releases after the epoch bump and tombstone clear
 	m.destroying.Store(vmID, struct{}{})
 	defer m.destroying.Delete(vmID)
 	defer m.bumpDestroyEpoch(vmID) // LIFO: bumps before the tombstone clears
@@ -3863,6 +3871,15 @@ func (m *Manager) instanceClaimsCgroup(vmID string) bool {
 	inst.mu.RLock()
 	defer inst.mu.RUnlock()
 	return cgroupSupervised(inst.Supervision)
+}
+
+// lockRecordOwner acquires vmID's record-ownership mutex (see
+// recordOwnerMus) and returns its unlock.
+func (m *Manager) lockRecordOwner(vmID string) func() {
+	v, _ := m.recordOwnerMus.LoadOrStore(vmID, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // destroyEpoch reads vmID's completed-destroy counter.

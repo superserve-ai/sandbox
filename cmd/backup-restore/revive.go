@@ -82,6 +82,7 @@ func runRevive(args []string) int {
 		// overlay salvages (defaults to the sandbox's recorded base).
 		rest := fields[2:]
 		fields = fields[:2]
+		badField := false
 		for _, tok := range rest {
 			if p, ok := strings.CutPrefix(tok, "base="); ok {
 				req.BasePath = p
@@ -91,6 +92,11 @@ func runRevive(args []string) int {
 				req.DeniedCidrs = splitCommaList(p)
 			} else if p, ok := strings.CutPrefix(tok, "domains="); ok {
 				req.AllowedDomains = splitCommaList(p)
+			} else if strings.Contains(tok, "=") {
+				// A misspelled policy token must not silently revive
+				// without the intended policy.
+				fmt.Printf("FAILED %s: unknown token %q\n", req.VmId, tok)
+				badField = true
 			} else {
 				fields = append(fields, tok)
 			}
@@ -98,8 +104,11 @@ func runRevive(args []string) int {
 		// Malformed resource fields reject the line rather than silently
 		// booting at defaults: a typo must not revive a 32 GiB workload
 		// into a 1 GiB VM.
-		badField := false
-		if len(fields) > 2 {
+		if len(fields) > 4 {
+			fmt.Printf("FAILED %s: surplus positional fields %v\n", req.VmId, fields[4:])
+			badField = true
+		}
+		if !badField && len(fields) > 2 {
 			v, err := strconv.ParseUint(fields[2], 10, 32)
 			if err != nil {
 				fmt.Printf("FAILED %s: malformed vcpu %q\n", req.VmId, fields[2])
