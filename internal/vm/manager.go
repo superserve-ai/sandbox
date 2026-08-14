@@ -840,7 +840,7 @@ func pidIsVMFirecracker(pid int, vmID string) bool {
 // The flag is explicit because SupervisionUnit is the zero value: a
 // sentinel on the mode alone cannot distinguish "unit mode" from the
 // legacy unsupervised spawn kept for throwaway template-build VMs.
-func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath string, supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
+func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath string, rules *sandboxNetworkRules, supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
@@ -916,6 +916,17 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 	mac := inst.MACAddress
 	inst.mu.Unlock()
 
+	// Egress policy installs before the guest can execute a single
+	// instruction: resume's discipline (rules land before
+	// launchFirecracker), because a policied workload's startup services
+	// must never see the fresh slot's permissive defaults.
+	if err := m.applySandboxNetworkRules(vmID, netInfo, rules); err != nil {
+		m.netMgr.CleanupVM(vmID)
+		m.cleanupRunDir(vmID)
+		m.setStatus(vmID, StatusError)
+		return nil, fmt.Errorf("apply network rules: %w", err)
+	}
+
 	// 3. Build Firecracker machine configuration.
 	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
@@ -939,8 +950,18 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 	var pid int
 	if supervised {
 		spawnedPID, actual, lerr := m.launchFirecracker(ctx, vmID, socketPath, diskPath, basePath, netInfo.Namespace, supervision, true, false)
+		stopFailed := false
 		if lerr == nil {
-			stopSpawned := func() { _ = m.stopVM(ctx, vmID, actual) }
+			// The mandatory stop must not run under the RPC's possibly-
+			// expired context: a canceled stop leaves a live supervised
+			// Firecracker, and freeing its slot and run directory
+			// underneath it is the wedge the stop exists to prevent.
+			stopSpawned := func() {
+				if serr := m.stopVM(context.WithoutCancel(ctx), vmID, actual); serr != nil {
+					stopFailed = true
+					log.Error().Err(serr).Msg("stop spawned VM after failed cold boot; residue left for forced teardown")
+				}
+			}
 			if lerr = waitForSocket(socketPath, 10*time.Second); lerr != nil {
 				stopSpawned()
 			} else if lerr = ConfigureMachine(socketPath, fcCfg); lerr != nil {
@@ -956,8 +977,13 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 			}
 		}
 		if lerr != nil {
-			m.netMgr.CleanupVM(vmID)
-			m.cleanupRunDir(vmID)
+			// A failed stop forbids freeing resources: the slot and run
+			// directory may still be under a live Firecracker, so leave
+			// the residue for a forced DestroyVM to clear.
+			if !stopFailed {
+				m.netMgr.CleanupVM(vmID)
+				m.cleanupRunDir(vmID)
+			}
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("start firecracker (supervised): %w", lerr)
 		}

@@ -17,12 +17,28 @@ import (
 )
 
 // runRevive drives ReviveVM for a manifest of dead sandboxes, one per
-// line: `<sandbox-id> <disk-path> [vcpu] [mem-mib]`. Operator tool, run
+// line: `<sandbox-id> <disk-path> [vcpu] [mem-mib]` plus optional named
+// tokens `base=<path>`, `allow=<cidr,...>`, `deny=<cidr,...>`,
+// `domains=<domain,...>`. Egress tokens exist because vmd does not
+// record network policy: the control plane owns it, so a policied
+// sandbox must have its rules supplied here or reapplied before the
+// row activates. Operator tool, run
 // on the host next to vmd: the disk paths name salvaged copies staged
 // on the local array, and every line is attempted so the ledger reports
 // the full outcome rather than stopping at the first failure. The
 // control-plane status flip happens after this, per the runbook: vmd is
 // the authority on whether a VM is actually running again.
+// splitCommaList splits a comma-separated token value, dropping empties.
+func splitCommaList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func runRevive(args []string) int {
 	fs := flag.NewFlagSet("revive", flag.ExitOnError)
 	vmdAddr := fs.String("vmd", "127.0.0.1:50051", "vmd gRPC address")
@@ -69,6 +85,12 @@ func runRevive(args []string) int {
 		for _, tok := range rest {
 			if p, ok := strings.CutPrefix(tok, "base="); ok {
 				req.BasePath = p
+			} else if p, ok := strings.CutPrefix(tok, "allow="); ok {
+				req.AllowedCidrs = splitCommaList(p)
+			} else if p, ok := strings.CutPrefix(tok, "deny="); ok {
+				req.DeniedCidrs = splitCommaList(p)
+			} else if p, ok := strings.CutPrefix(tok, "domains="); ok {
+				req.AllowedDomains = splitCommaList(p)
 			} else {
 				fields = append(fields, tok)
 			}
@@ -109,6 +131,9 @@ func runRevive(args []string) int {
 		}
 		fmt.Printf("REVIVED %s ip=%s disk=%s\n", req.VmId, resp.GetHostIp(), resp.GetDiskPath())
 		fmt.Printf("  NOTE %s: env and secret bindings are NOT on the disk; re-inject via the control plane before activating the row\n", req.VmId)
+		if len(req.AllowedCidrs)+len(req.DeniedCidrs)+len(req.AllowedDomains) == 0 {
+			fmt.Printf("  NOTE %s: no egress tokens on the manifest line; if this sandbox has network policy, revive with allow=/deny=/domains= or reapply via the control plane before activating\n", req.VmId)
+		}
 		revived++
 	}
 	if err := sc.Err(); err != nil {

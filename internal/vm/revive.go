@@ -8,8 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/superserve-ai/sandbox/internal/network"
-
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -61,7 +59,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 			// must still exist. A paused record whose snapshot or memory
 			// file is gone is unresumable, and refusing revival too
 			// would strand a sandbox that has a usable salvaged disk.
-			if statRegularFile(snap) && (mem == "" || statRegularFile(mem)) && (baseMem == "" || statRegularFile(baseMem)) {
+			if statRegularFile(snap) && mem != "" && statRegularFile(mem) && (baseMem == "" || statRegularFile(baseMem)) {
 				return nil, status.Errorf(codes.FailedPrecondition, "vm %s is paused with a snapshot; resume owns healthy paused VMs", vmID)
 			}
 			m.log.Warn().Str("vm_id", vmID).Msg("paused record has missing snapshot artifacts; treating as unresumable and allowing revival")
@@ -147,6 +145,12 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		if committed || m.state == nil {
 			return
 		}
+		// An external force-destroy that raced this revival owns the
+		// record's absence; resurrecting it would undo the destroy. Same
+		// tombstone discipline as the persist guard.
+		if _, destroying := m.destroying.Load(vmID); destroying {
+			return
+		}
 		if perr := m.state.Put(*prevRec); perr != nil {
 			m.log.Error().Err(perr).Str("vm_id", vmID).Msg("restore zombie record after failed revival")
 		}
@@ -171,24 +175,14 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		memMiB = prevRec.MemoryMiB
 	}
 	phaseStart := time.Now()
-	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, true, supervision, vcpu, memMiB)
+	// Egress rules ride into the boot itself so they install before the
+	// guest executes (resume's ordering); the rules travel on the
+	// request, the control plane owns them, exactly as ResumeVM's do.
+	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, rules, true, supervision, vcpu, memMiB)
 	if err != nil {
 		return nil, err
 	}
 	bootDur := time.Since(phaseStart)
-	// Egress policy applies before success is reported and before the
-	// DB row can flip: a sandbox with allow or deny rules must not run
-	// open. The rules travel on the request (the control plane owns
-	// them, exactly as ResumeVM's do).
-	if rules != nil {
-		inst.mu.RLock()
-		netInfo := &network.VMNetInfo{HostIP: inst.IP, TAPDevice: inst.TAPDevice, Namespace: inst.Namespace}
-		inst.mu.RUnlock()
-		if err := m.applySandboxNetworkRules(vmID, netInfo, rules); err != nil {
-			_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
-			return nil, status.Errorf(codes.Internal, "apply network rules: %v", err)
-		}
-	}
 	// Preview policy carries over from the prior record verbatim.
 	if prevRec != nil {
 		ports := previewPortsFromRecord(prevRec.PreviewPorts, prevRec.PreviewPortAccess, prevRec.PreviewPortTokenVersions)
