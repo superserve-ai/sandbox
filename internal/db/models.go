@@ -358,16 +358,17 @@ type FeatureFlag struct {
 }
 
 type Host struct {
-	ID                string             `json:"id"`
-	VmdAddr           string             `json:"vmd_addr"`
-	ProxyAddr         string             `json:"proxy_addr"`
-	Region            string             `json:"region"`
-	Status            string             `json:"status"`
-	CapacityMemoryMib int32              `json:"capacity_memory_mib"`
-	CapacityVcpus     int32              `json:"capacity_vcpus"`
-	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
-	CreatedAt         time.Time          `json:"created_at"`
-	UpdatedAt         time.Time          `json:"updated_at"`
+	ID                     string             `json:"id"`
+	VmdAddr                string             `json:"vmd_addr"`
+	ProxyAddr              string             `json:"proxy_addr"`
+	Region                 string             `json:"region"`
+	Status                 string             `json:"status"`
+	CapacityMemoryMib      int32              `json:"capacity_memory_mib"`
+	CapacityVcpus          int32              `json:"capacity_vcpus"`
+	LastHeartbeatAt        pgtype.Timestamptz `json:"last_heartbeat_at"`
+	CreatedAt              time.Time          `json:"created_at"`
+	UpdatedAt              time.Time          `json:"updated_at"`
+	MaintenanceWindowStart pgtype.Timestamptz `json:"maintenance_window_start"`
 }
 
 // Data-plane capabilities jointly advertised by the currently running host services. heartbeat_at must match host.last_heartbeat_at, so an old control-plane heartbeat automatically invalidates an attestation it cannot replace.

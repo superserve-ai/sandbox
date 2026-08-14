@@ -15,7 +15,7 @@ import (
 const createHost = `-- name: CreateHost :one
 INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, maintenance_window_start
 `
 
 type CreateHostParams struct {
@@ -48,6 +48,7 @@ func (q *Queries) CreateHost(ctx context.Context, arg CreateHostParams) (Host, e
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaintenanceWindowStart,
 	)
 	return i, err
 }
@@ -61,8 +62,24 @@ func (q *Queries) DeleteHostCapabilities(ctx context.Context, hostID string) err
 	return err
 }
 
+const drainHost = `-- name: DrainHost :execrows
+UPDATE host
+SET status = 'draining', updated_at = now()
+WHERE id = $1 AND status = 'active'
+`
+
+// Guarded transition active -> draining: an unhealthy host must not be
+// "drained" into looking deliberately managed, and a double drain is a no-op.
+func (q *Queries) DrainHost(ctx context.Context, id string) (int64, error) {
+	result, err := q.db.Exec(ctx, drainHost, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getHost = `-- name: GetHost :one
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host WHERE id = $1
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, maintenance_window_start FROM host WHERE id = $1
 `
 
 func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
@@ -79,6 +96,7 @@ func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaintenanceWindowStart,
 	)
 	return i, err
 }
@@ -88,7 +106,10 @@ WITH target_host AS MATERIALIZED (
   SELECT id, last_heartbeat_at
   FROM host
   WHERE id = $2
-    AND status = 'active'
+    -- 'draining' still qualifies: a drain (announced host maintenance) stops
+    -- new placement, not service — resumes must keep working right up to the
+    -- window, and the drain reaper re-pauses whatever they re-activate.
+    AND status IN ('active', 'draining')
     AND last_heartbeat_at IS NOT NULL
   FOR SHARE
 )
@@ -130,7 +151,7 @@ WITH target_host AS MATERIALIZED (
   SELECT id, last_heartbeat_at
   FROM host
   WHERE id = $2
-    AND status = 'active'
+    AND status IN ('active', 'draining')  -- same rationale as HostHasCapabilities
     AND last_heartbeat_at IS NOT NULL
 )
 SELECT EXISTS (
@@ -186,7 +207,7 @@ func (q *Queries) InsertHostCapability(ctx context.Context, arg InsertHostCapabi
 }
 
 const listActiveHosts = `-- name: ListActiveHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, maintenance_window_start FROM host
 WHERE status = 'active'
 ORDER BY created_at ASC
 `
@@ -211,6 +232,7 @@ func (q *Queries) ListActiveHosts(ctx context.Context) ([]Host, error) {
 			&i.LastHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.MaintenanceWindowStart,
 		); err != nil {
 			return nil, err
 		}
@@ -295,8 +317,42 @@ func (q *Queries) ListActiveHostsByLoad(ctx context.Context, requiredCapabilitie
 	return items, nil
 }
 
+const listDrainingHosts = `-- name: ListDrainingHosts :many
+SELECT id, maintenance_window_start
+FROM host
+WHERE status = 'draining'
+`
+
+type ListDrainingHostsRow struct {
+	ID                     string             `json:"id"`
+	MaintenanceWindowStart pgtype.Timestamptz `json:"maintenance_window_start"`
+}
+
+// Hosts being drained ahead of an announced restart. The reaper pauses their
+// remaining active sandboxes; maintenance_window_start drives the
+// drain-incomplete alert.
+func (q *Queries) ListDrainingHosts(ctx context.Context) ([]ListDrainingHostsRow, error) {
+	rows, err := q.db.Query(ctx, listDrainingHosts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDrainingHostsRow{}
+	for rows.Next() {
+		var i ListDrainingHostsRow
+		if err := rows.Scan(&i.ID, &i.MaintenanceWindowStart); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listHosts = `-- name: ListHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, maintenance_window_start FROM host
 ORDER BY created_at ASC
 `
 
@@ -320,6 +376,7 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 			&i.LastHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.MaintenanceWindowStart,
 		); err != nil {
 			return nil, err
 		}
@@ -332,7 +389,7 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 }
 
 const listStaleHosts = `-- name: ListStaleHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, maintenance_window_start FROM host
 WHERE status = 'active'
   AND last_heartbeat_at IS NOT NULL
   AND last_heartbeat_at < $1
@@ -361,6 +418,7 @@ func (q *Queries) ListStaleHosts(ctx context.Context, lastHeartbeatAt pgtype.Tim
 			&i.LastHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.MaintenanceWindowStart,
 		); err != nil {
 			return nil, err
 		}
@@ -383,6 +441,24 @@ func (q *Queries) MarkHostUnhealthy(ctx context.Context, id string) error {
 	return err
 }
 
+const undrainHost = `-- name: UndrainHost :execrows
+UPDATE host
+SET status = 'active', updated_at = now()
+WHERE id = $1 AND status = 'draining'
+`
+
+// Guarded transition draining -> active. Deliberately manual-only (operator
+// endpoint): the mistake costs are asymmetric — staying drained too long
+// costs placement capacity, while un-draining on a flaky signal puts fresh
+// workloads on a machine about to restart. The heartbeat never un-drains.
+func (q *Queries) UndrainHost(ctx context.Context, id string) (int64, error) {
+	result, err := q.db.Exec(ctx, undrainHost, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateHostHeartbeat = `-- name: UpdateHostHeartbeat :one
 WITH prev AS (
     SELECT h.id, h.status FROM host h WHERE h.id = $1 FOR UPDATE
@@ -393,21 +469,22 @@ SET last_heartbeat_at = now(),
     updated_at = now()
 FROM prev
 WHERE host.id = prev.id
-RETURNING host.id, host.vmd_addr, host.proxy_addr, host.region, host.status, host.capacity_memory_mib, host.capacity_vcpus, host.last_heartbeat_at, host.created_at, host.updated_at, prev.status AS prev_status
+RETURNING host.id, host.vmd_addr, host.proxy_addr, host.region, host.status, host.capacity_memory_mib, host.capacity_vcpus, host.last_heartbeat_at, host.created_at, host.updated_at, host.maintenance_window_start, prev.status AS prev_status
 `
 
 type UpdateHostHeartbeatRow struct {
-	ID                string             `json:"id"`
-	VmdAddr           string             `json:"vmd_addr"`
-	ProxyAddr         string             `json:"proxy_addr"`
-	Region            string             `json:"region"`
-	Status            string             `json:"status"`
-	CapacityMemoryMib int32              `json:"capacity_memory_mib"`
-	CapacityVcpus     int32              `json:"capacity_vcpus"`
-	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
-	CreatedAt         time.Time          `json:"created_at"`
-	UpdatedAt         time.Time          `json:"updated_at"`
-	PrevStatus        string             `json:"prev_status"`
+	ID                     string             `json:"id"`
+	VmdAddr                string             `json:"vmd_addr"`
+	ProxyAddr              string             `json:"proxy_addr"`
+	Region                 string             `json:"region"`
+	Status                 string             `json:"status"`
+	CapacityMemoryMib      int32              `json:"capacity_memory_mib"`
+	CapacityVcpus          int32              `json:"capacity_vcpus"`
+	LastHeartbeatAt        pgtype.Timestamptz `json:"last_heartbeat_at"`
+	CreatedAt              time.Time          `json:"created_at"`
+	UpdatedAt              time.Time          `json:"updated_at"`
+	MaintenanceWindowStart pgtype.Timestamptz `json:"maintenance_window_start"`
+	PrevStatus             string             `json:"prev_status"`
 }
 
 // Returns the host row so the caller can verify the host exists. Also
@@ -432,9 +509,28 @@ func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) (UpdateHos
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MaintenanceWindowStart,
 		&i.PrevStatus,
 	)
 	return i, err
+}
+
+const updateHostMaintenanceWindow = `-- name: UpdateHostMaintenanceWindow :exec
+UPDATE host
+SET maintenance_window_start = $2, updated_at = now()
+WHERE id = $1
+`
+
+type UpdateHostMaintenanceWindowParams struct {
+	ID                     string             `json:"id"`
+	MaintenanceWindowStart pgtype.Timestamptz `json:"maintenance_window_start"`
+}
+
+// Records (or clears, with NULL) the machine's next announced maintenance
+// window, as reported by the host's heartbeat.
+func (q *Queries) UpdateHostMaintenanceWindow(ctx context.Context, arg UpdateHostMaintenanceWindowParams) error {
+	_, err := q.db.Exec(ctx, updateHostMaintenanceWindow, arg.ID, arg.MaintenanceWindowStart)
+	return err
 }
 
 const updateHostStatus = `-- name: UpdateHostStatus :exec

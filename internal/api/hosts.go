@@ -1,10 +1,13 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -17,7 +20,21 @@ const (
 
 type hostHeartbeatRequest struct {
 	Capabilities []string `json:"capabilities"`
+	// MaintenanceWindowStart: RFC3339 start of the machine's next announced
+	// maintenance window; empty string means an authoritative "nothing
+	// announced"; absent means the host couldn't tell this beat (keep the
+	// last known answer — a flaky metadata read must never un-record a
+	// window).
+	MaintenanceWindowStart *string `json:"maintenance_window_start,omitempty"`
 }
+
+// drainLeadTime is how far ahead of an announced maintenance window the host
+// begins draining (pausing its active sandboxes). Late on purpose: pausing
+// disrupts live workloads, so the platform waits until the restart is close;
+// a full fleet drain measures in low minutes, so an hour holds generous
+// margin for retries. One reviewed constant, derived from measured drain
+// time × safety factor — not host config.
+const drainLeadTime = time.Hour
 
 // HostHeartbeat handles POST /internal/hosts/:host_id/heartbeat.
 // VMD calls this every 30s to prove liveness. The control plane updates
@@ -104,5 +121,109 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": host.Status})
+	status := host.Status
+	if req.MaintenanceWindowStart != nil {
+		status = h.recordMaintenanceWindow(ctx, hostID, *req.MaintenanceWindowStart, status)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": status})
+}
+
+// recordMaintenanceWindow persists the heartbeat's announced-maintenance
+// answer and makes the drain decision: a host with a window inside
+// drainLeadTime flips active → draining, which removes it from placement and
+// puts the drain reaper to work pausing its active sandboxes. Un-draining is
+// deliberately NOT done here — see UndrainHost. Returns the (possibly
+// updated) host status for the heartbeat response.
+func (h *Handlers) recordMaintenanceWindow(ctx context.Context, hostID, raw, status string) string {
+	var window *time.Time
+	if raw != "" {
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			log.Warn().Str("host_id", hostID).Str("value", raw).Msg("heartbeat carried unparseable maintenance window; ignoring")
+			return status
+		}
+		window = &t
+	}
+	var ts pgtype.Timestamptz
+	if window != nil {
+		ts = pgtype.Timestamptz{Time: *window, Valid: true}
+	}
+	if err := h.DB.UpdateHostMaintenanceWindow(ctx, db.UpdateHostMaintenanceWindowParams{
+		ID: hostID, MaintenanceWindowStart: ts,
+	}); err != nil {
+		log.Error().Err(err).Str("host_id", hostID).Msg("failed to record maintenance window")
+		return status
+	}
+	if window == nil || status != "active" || time.Until(*window) > drainLeadTime {
+		return status
+	}
+	n, err := h.DB.DrainHost(ctx, hostID)
+	if err != nil {
+		log.Error().Err(err).Str("host_id", hostID).Msg("failed to drain host for maintenance")
+		return status
+	}
+	if n > 0 {
+		log.Warn().Str("host_id", hostID).Time("window_start", *window).
+			Msg("host maintenance window imminent — draining: placement stopped, active sandboxes will be paused")
+		if h.Scheduler != nil {
+			h.Scheduler.Invalidate()
+		}
+		return "draining"
+	}
+	return status
+}
+
+// DrainHost handles POST /internal/hosts/:host_id/drain — the operator
+// entry point for planned host work (reboots, kernel updates): drain, wait
+// for the drain-complete log/zero actives, then restart the host; paused
+// sandboxes survive where active ones would not.
+func (h *Handlers) DrainHost(c *gin.Context) {
+	hostID := c.Param("host_id")
+	if hostID == "" {
+		respondErrorMsg(c, "bad_request", "host_id is required", http.StatusBadRequest)
+		return
+	}
+	n, err := h.DB.DrainHost(c.Request.Context(), hostID)
+	if err != nil {
+		log.Error().Err(err).Str("host_id", hostID).Msg("DrainHost failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if n == 0 {
+		respondErrorMsg(c, "conflict", "host is not active (already draining, or unhealthy)", http.StatusConflict)
+		return
+	}
+	log.Warn().Str("host_id", hostID).Msg("host draining via operator request")
+	if h.Scheduler != nil {
+		h.Scheduler.Invalidate()
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "draining"})
+}
+
+// UndrainHost handles POST /internal/hosts/:host_id/undrain. Manual-only by
+// design: automatic un-draining on a cleared metadata signal would put fresh
+// workloads on a machine about to restart whenever the signal flickers; the
+// asymmetric mistake costs mean only the safe direction is automated.
+func (h *Handlers) UndrainHost(c *gin.Context) {
+	hostID := c.Param("host_id")
+	if hostID == "" {
+		respondErrorMsg(c, "bad_request", "host_id is required", http.StatusBadRequest)
+		return
+	}
+	n, err := h.DB.UndrainHost(c.Request.Context(), hostID)
+	if err != nil {
+		log.Error().Err(err).Str("host_id", hostID).Msg("UndrainHost failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if n == 0 {
+		respondErrorMsg(c, "conflict", "host is not draining", http.StatusConflict)
+		return
+	}
+	log.Info().Str("host_id", hostID).Msg("host un-drained via operator request")
+	if h.Scheduler != nil {
+		h.Scheduler.Invalidate()
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "active"})
 }

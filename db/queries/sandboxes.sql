@@ -776,6 +776,58 @@ SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
 
+-- name: ClaimDrainingSandboxes :many
+-- Atomically claims active sandboxes on a draining host and marks them
+-- 'pausing' — the host has an announced restart coming, and paused sandboxes
+-- survive a host restart where active ones cannot. Identical claim shape to
+-- ClaimExpiredSandboxes (FOR UPDATE OF s SKIP LOCKED for concurrent
+-- replicas; interval and billing closes bundled so a crashed claim can't
+-- leave books open) with the eligibility predicate swapped: every active
+-- sandbox on the host qualifies, oldest first.
+WITH draining AS (
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
+  FROM sandbox s
+  WHERE s.destroyed_at IS NULL
+    AND s.status = 'active'
+    AND s.host_id = sqlc.arg('host_id')
+  ORDER BY s.created_at ASC
+  LIMIT sqlc.arg('batch_size')
+  FOR UPDATE OF s SKIP LOCKED
+),
+paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  FROM draining
+  WHERE sandbox.id = draining.id
+  RETURNING draining.id, draining.team_id, draining.name, draining.snapshot_id, draining.host_id, sandbox.network_config
+),
+closed_intervals AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+),
+closed_billing_compute AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
+FROM paused p
+LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
+
+-- name: CountUnpausedOnHost :one
+-- Sandboxes on a host still in a state that would not survive a host
+-- restart. Drives the drain-progress log and the drain-incomplete alert.
+SELECT count(*)
+FROM sandbox
+WHERE host_id = $1
+  AND destroyed_at IS NULL
+  AND status IN ('active', 'pausing', 'resuming', 'starting');
+
 -- name: UpdateSandboxAutoDelete :execrows
 -- Set or clear (NULL) the auto-delete window. The deadline counts continuous
 -- paused time since the setting was applied: on an already-paused sandbox it

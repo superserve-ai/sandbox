@@ -80,6 +80,13 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 
 type heartbeatRequest struct {
 	Capabilities []string `json:"capabilities"`
+	// MaintenanceWindowStart is the machine's next announced maintenance
+	// window (RFC3339), omitted when none is announced or the metadata
+	// service couldn't answer — the control plane treats absence as "no
+	// change", never as "cleared", so a flaky metadata read can't un-drain
+	// a host about to restart. The explicit clear is the empty string set
+	// by a successful "nothing announced" probe.
+	MaintenanceWindowStart *string `json:"maintenance_window_start,omitempty"`
 }
 
 type proxyHealthResponse struct {
@@ -93,7 +100,20 @@ func sendHeartbeat(ctx context.Context, client *http.Client, url, token, proxyHe
 		capabilities = nil
 	}
 
-	body, err := json.Marshal(heartbeatRequest{Capabilities: capabilities})
+	var maintenance *string
+	if window, err := probeMaintenanceWindow(ctx, client); err != nil {
+		// Unknowable ≠ cleared: omit the field so the control plane keeps
+		// its last known answer.
+		log.Warn().Err(err).Msg("maintenance metadata probe failed; omitting from heartbeat")
+	} else if window != nil {
+		s := window.UTC().Format(time.RFC3339)
+		maintenance = &s
+	} else {
+		empty := ""
+		maintenance = &empty
+	}
+
+	body, err := json.Marshal(heartbeatRequest{Capabilities: capabilities, MaintenanceWindowStart: maintenance})
 	if err != nil {
 		log.Error().Err(err).Msg("failed to encode heartbeat body")
 		return

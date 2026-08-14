@@ -418,3 +418,155 @@ func TestRollbackPausedVM_PersistsReplacementHostAndIP(t *testing.T) {
 		t.Fatalf("rollback write order = %v, want host then status", callOrder)
 	}
 }
+
+// drainRows adapts stubRows to the queries drainOnce issues: the
+// ListDrainingHosts scan (id, maintenance_window_start) and the claim scan
+// (same shape as ClaimExpiredSandboxes).
+type drainingHostRows struct {
+	hosts []db.ListDrainingHostsRow
+	idx   int
+}
+
+func (r *drainingHostRows) Next() bool { r.idx++; return r.idx <= len(r.hosts) }
+func (r *drainingHostRows) Scan(dest ...any) error {
+	row := r.hosts[r.idx-1]
+	*dest[0].(*string) = row.ID
+	*dest[1].(*pgtype.Timestamptz) = row.MaintenanceWindowStart
+	return nil
+}
+func (r *drainingHostRows) Close()                                       {}
+func (r *drainingHostRows) Err() error                                   { return nil }
+func (r *drainingHostRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *drainingHostRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *drainingHostRows) Values() ([]any, error)                       { return nil, nil }
+func (r *drainingHostRows) RawValues() [][]byte                          { return nil }
+func (r *drainingHostRows) Conn() *pgx.Conn                              { return nil }
+
+// TestDrain_PausesActivesOnDrainingHost pins the drain saga end to end: a
+// draining host's claimed sandbox is paused via VMD and finalized with the
+// maintenance trigger — the same battle-tested path as the timeout reaper.
+func TestDrain_PausesActivesOnDrainingHost(t *testing.T) {
+	row := expiredRow("sbx-drain") // HostID empty: routes to the stub VMD, matching suite convention
+	var pausedID string
+	var finalizeCalls int32
+	var remainingChecks int32
+
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+				switch {
+				case strings.Contains(sql, "-- name: ListDrainingHosts :many"):
+					return &drainingHostRows{hosts: []db.ListDrainingHostsRow{{
+						ID:                     "host-a",
+						MaintenanceWindowStart: pgtype.Timestamptz{Time: time.Now().Add(50 * time.Minute), Valid: true},
+					}}}, nil
+				case strings.Contains(sql, "-- name: ClaimDrainingSandboxes :many"):
+					return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
+				}
+				return newStubRows(nil), nil
+			},
+			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+				switch {
+				case strings.Contains(sql, "-- name: CountUnpausedOnHost :one"):
+					atomic.AddInt32(&remainingChecks, 1)
+					return &mockRow{scanFn: func(dest ...any) error {
+						*dest[0].(*int64) = 0
+						return nil
+					}}
+				case strings.Contains(sql, "upserted AS"):
+					atomic.AddInt32(&finalizeCalls, 1)
+					return finalizePauseRow(uuid.New())
+				}
+				return activityRow()
+			},
+		},
+		&stubVMD{pauseFn: func(_ context.Context, id string, _ string) (string, string, error) {
+			pausedID = id
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		}},
+	)
+
+	h.drainOnce(context.Background(), 10, 1)
+
+	if pausedID != row.ID.String() {
+		t.Fatalf("expected drain to pause %s, got %q", row.ID, pausedID)
+	}
+	if got := atomic.LoadInt32(&finalizeCalls); got != 1 {
+		t.Fatalf("expected exactly 1 FinalizePause, got %d", got)
+	}
+	if atomic.LoadInt32(&remainingChecks) != 1 {
+		t.Fatal("drain must check remaining unpaused count for the alert decision")
+	}
+}
+
+// TestDrain_NoDrainingHostsNoWork pins the steady state: with nothing
+// draining, the drain arm issues no claims and no VMD calls.
+func TestDrain_NoDrainingHostsNoWork(t *testing.T) {
+	var claims int32
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+				if strings.Contains(sql, "-- name: ClaimDrainingSandboxes :many") {
+					atomic.AddInt32(&claims, 1)
+				}
+				return newStubRows(nil), nil
+			},
+		},
+		&stubVMD{pauseFn: func(_ context.Context, _ string, _ string) (string, string, error) {
+			t.Error("no VMD calls expected with no draining hosts")
+			return "", "", nil
+		}},
+	)
+	h.drainOnce(context.Background(), 10, 1)
+	if atomic.LoadInt32(&claims) != 0 {
+		t.Fatal("no claims expected with no draining hosts")
+	}
+}
+
+// TestDrain_VMDFailureRevertsToActive pins the saga's failure arm under the
+// maintenance cause: a pause the VMD refuses reverts the row to active so
+// the next tick retries, exactly like the timeout path.
+func TestDrain_VMDFailureRevertsToActive(t *testing.T) {
+	row := expiredRow("sbx-drain-fail")
+	var reverts int32
+
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+				switch {
+				case strings.Contains(sql, "-- name: ListDrainingHosts :many"):
+					return &drainingHostRows{hosts: []db.ListDrainingHostsRow{{ID: "host-a"}}}, nil
+				case strings.Contains(sql, "-- name: ClaimDrainingSandboxes :many"):
+					return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
+				}
+				return newStubRows(nil), nil
+			},
+			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+				switch {
+				case strings.Contains(sql, "-- name: CountUnpausedOnHost :one"):
+					return &mockRow{scanFn: func(dest ...any) error {
+						*dest[0].(*int64) = 1
+						return nil
+					}}
+				case strings.Contains(sql, "FROM sandbox_active_interval"):
+					return notFoundRow()
+				}
+				return activityRow()
+			},
+			execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+				if strings.Contains(sql, "-- name: UpdateSandboxStatus :exec") && len(args) > 1 && args[1] == db.SandboxStatusActive {
+					atomic.AddInt32(&reverts, 1)
+				}
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			},
+		},
+		&stubVMD{pauseFn: func(_ context.Context, _ string, _ string) (string, string, error) {
+			return "", "", errors.New("vmd unavailable")
+		}},
+	)
+
+	h.drainOnce(context.Background(), 10, 1)
+	if atomic.LoadInt32(&reverts) != 1 {
+		t.Fatalf("failed pause must revert to active, got %d reverts", atomic.LoadInt32(&reverts))
+	}
+}
