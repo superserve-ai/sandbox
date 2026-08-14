@@ -501,6 +501,13 @@ type Manager struct {
 	// the freed slot, and hand a live pointer to an IP the pool is recycling.
 	// Keyed vmID → struct{}{}; entries are always removed when destroy returns.
 	destroying sync.Map
+	// destroyEpochs counts completed DestroyVM calls per vmID (bumped on
+	// every exit, before the tombstone clears). A rollback that must
+	// distinguish its own teardowns from an external destroy that
+	// completed in between compares this against its expected count: the
+	// tombstone alone only spans an in-flight destroy, not a finished
+	// one.
+	destroyEpochs sync.Map // vmID -> *uint64
 }
 
 // trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
@@ -840,7 +847,7 @@ func pidIsVMFirecracker(pid int, vmID string) bool {
 // The flag is explicit because SupervisionUnit is the zero value: a
 // sentinel on the mode alone cannot distinguish "unit mode" from the
 // legacy unsupervised spawn kept for throwaway template-build VMs.
-func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath string, rules *sandboxNetworkRules, supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
+func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath string, rules *sandboxNetworkRules, seed func(*VMInstance), supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
@@ -872,6 +879,14 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 			RootfsPath: rootfsPath,
 			BasePath:   basePath,
 		},
+	}
+	// The seed runs before the instance is visible or persisted, so
+	// every intermediate durable write during the boot (each setStatus
+	// persists synchronously) already carries the caller's metadata; a
+	// crash mid-boot must not leave a record with empty ownership or
+	// preview policy, or one that claims a verified guest.
+	if seed != nil {
+		seed(inst)
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
@@ -1037,6 +1052,7 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	// teardown needs.
 	m.destroying.Store(vmID, struct{}{})
 	defer m.destroying.Delete(vmID)
+	defer m.bumpDestroyEpoch(vmID) // LIFO: bumps before the tombstone clears
 
 	// A paused or post-restart VM may be absent from m.vms. Don't early-return on
 	// that: unit stop and rundir removal are derivable from vmID and must run, or
@@ -3847,6 +3863,17 @@ func (m *Manager) instanceClaimsCgroup(vmID string) bool {
 	inst.mu.RLock()
 	defer inst.mu.RUnlock()
 	return cgroupSupervised(inst.Supervision)
+}
+
+// destroyEpoch reads vmID's completed-destroy counter.
+func (m *Manager) destroyEpoch(vmID string) uint64 {
+	v, _ := m.destroyEpochs.LoadOrStore(vmID, new(uint64))
+	return atomic.LoadUint64(v.(*uint64))
+}
+
+func (m *Manager) bumpDestroyEpoch(vmID string) {
+	v, _ := m.destroyEpochs.LoadOrStore(vmID, new(uint64))
+	atomic.AddUint64(v.(*uint64), 1)
 }
 
 func (m *Manager) setStatus(vmID string, s VMStatus) {

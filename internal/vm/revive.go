@@ -154,14 +154,27 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// record) and must not lose ownership, preview policy, shape, or
 	// base metadata.
 	committed := false
+	// Every destroy this revival performs is counted; the rollback
+	// compares the completed-destroy epoch against its own count, so an
+	// external destroy that fully completed in between (tombstone
+	// already cleared) is visible and owns the record's absence.
+	selfDestroys := uint64(0)
+	epochBase := m.destroyEpoch(vmID)
+	teardownSelf := func(c context.Context) {
+		selfDestroys++
+		_ = m.DestroyVM(c, vmID, true)
+	}
 	defer func() {
 		if committed || m.state == nil {
 			return
 		}
-		// An external force-destroy that raced this revival owns the
-		// record's absence; resurrecting it would undo the destroy. Same
-		// tombstone discipline as the persist guard.
+		// An in-flight external force-destroy (tombstone) or a completed
+		// one (epoch ahead of our own count) owns the record's absence;
+		// resurrecting it would undo the destroy.
 		if _, destroying := m.destroying.Load(vmID); destroying {
+			return
+		}
+		if m.destroyEpoch(vmID) != epochBase+selfDestroys {
 			return
 		}
 		if perr := m.state.Put(*prevRec); perr != nil {
@@ -191,27 +204,27 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// Egress rules ride into the boot itself so they install before the
 	// guest executes (resume's ordering); the rules travel on the
 	// request, the control plane owns them, exactly as ResumeVM's do.
-	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, rules, true, supervision, vcpu, memMiB)
+	// The zombie's policy and ownership seed the instance before it is
+	// visible or persisted, and the record stays Unverified until the
+	// guest proves itself: every intermediate durable write then carries
+	// full metadata, and a vmd crash during the boot or readiness wait
+	// leaves a record reattachment refuses to adopt as a live serving VM
+	// rather than one that trusts an unverified guest or reads empty
+	// preview policy as legacy-public.
+	seed := func(inst *VMInstance) {
+		inst.Unverified = true
+		inst.TeamID = prevRec.TeamID
+		inst.OwnerID = prevRec.OwnerID
+		inst.PreviewAccess = prevRec.PreviewAccess
+		inst.PreviewPorts = previewPortsFromRecord(prevRec.PreviewPorts, prevRec.PreviewPortAccess, prevRec.PreviewPortTokenVersions)
+		inst.PreviewPolicyRevision = prevRec.PreviewPolicyRevision
+		inst.PreviewTokenPolicyRevision = prevRec.PreviewTokenPolicyRevision
+	}
+	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, rules, seed, true, supervision, vcpu, memMiB)
 	if err != nil {
 		return nil, err
 	}
 	bootDur := time.Since(phaseStart)
-	// Preview policy carries over from the prior record verbatim.
-	if prevRec != nil {
-		ports := previewPortsFromRecord(prevRec.PreviewPorts, prevRec.PreviewPortAccess, prevRec.PreviewPortTokenVersions)
-		inst.mu.Lock()
-		inst.PreviewAccess = prevRec.PreviewAccess
-		inst.PreviewPorts = ports
-		inst.PreviewPolicyRevision = prevRec.PreviewPolicyRevision
-		inst.PreviewTokenPolicyRevision = prevRec.PreviewTokenPolicyRevision
-		if inst.TeamID == "" {
-			inst.TeamID = prevRec.TeamID
-		}
-		if inst.OwnerID == "" {
-			inst.OwnerID = prevRec.OwnerID
-		}
-		inst.mu.Unlock()
-	}
 	inst.mu.RLock()
 	ip := inst.IP
 	inst.mu.RUnlock()
@@ -226,9 +239,14 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		// Teardown must not run under the RPC's possibly-expired
 		// context: a canceled stop leaves exactly the half-cleared state
 		// revival exists to avoid.
-		_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
+		teardownSelf(context.WithoutCancel(ctx))
 		return nil, status.Errorf(codes.Unavailable, "guest did not become ready: %v", err)
 	}
+	// The guest proved itself; the durable record may now claim a
+	// verified running VM.
+	inst.mu.Lock()
+	inst.Unverified = false
+	inst.mu.Unlock()
 	// Durable record: reattach and the reconciler must know this VM
 	// after a vmd restart, exactly like any created VM. A revival the
 	// state store cannot record is not a revival: an unrecorded running
@@ -252,7 +270,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while revival was completing", vmID)
 	}
 	if !wrote {
-		_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
+		teardownSelf(context.WithoutCancel(ctx))
 		return nil, status.Error(codes.Internal, "revived VM could not be durably recorded; torn down for clean retry")
 	}
 	committed = true
