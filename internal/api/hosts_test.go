@@ -126,10 +126,11 @@ func (f *fakeHostRegistry) Invalidate(hostID string) {
 func TestHostHeartbeatReclaimEvictsCachedClient(t *testing.T) {
 	stale := pgtype.Timestamptz{Time: time.Now().Add(-3 * time.Minute), Valid: true}
 	fresh := pgtype.Timestamptz{Time: time.Now(), Valid: true}
-	body := `{"vmd_addr":"10.0.0.2:50051","proxy_addr":"10.0.0.2:5007",` +
+	full := `{"vmd_addr":"10.0.0.2:50051","proxy_addr":"10.0.0.2:5007",` +
 		`"region":"region-a","capacity_memory_mib":1024,"capacity_vcpus":8}`
+	partial := `{"vmd_addr":"10.0.0.2:50051","capacity_memory_mib":1024,"capacity_vcpus":8}`
 
-	run := func(t *testing.T, heartbeatAt pgtype.Timestamptz) (int, *fakeHostRegistry) {
+	run := func(t *testing.T, heartbeatAt pgtype.Timestamptz, body string) (int, *fakeHostRegistry) {
 		mock := &mockDBTX{
 			queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 				switch {
@@ -162,12 +163,17 @@ func TestHostHeartbeatReclaimEvictsCachedClient(t *testing.T) {
 		return w.Code, reg
 	}
 
-	if code, reg := run(t, stale); code != http.StatusOK ||
+	if code, reg := run(t, stale, full); code != http.StatusOK ||
 		len(reg.invalidated) != 1 || reg.invalidated[0] != "host-a" {
 		t.Fatalf("stale reclaim: code = %d invalidated = %v, want 200 [host-a]", code, reg.invalidated)
 	}
-	if code, reg := run(t, fresh); code != http.StatusConflict || len(reg.invalidated) != 0 {
+	if code, reg := run(t, fresh, full); code != http.StatusConflict || len(reg.invalidated) != 0 {
 		t.Fatalf("live conflict: code = %d invalidated = %v, want 409 none", code, reg.invalidated)
+	}
+	// A partial description must not reclaim (it would blank row fields) and
+	// must not heartbeat the row either — 400, no writes, no eviction.
+	if code, reg := run(t, stale, partial); code != http.StatusBadRequest || len(reg.invalidated) != 0 {
+		t.Fatalf("partial claim: code = %d invalidated = %v, want 400 none", code, reg.invalidated)
 	}
 }
 

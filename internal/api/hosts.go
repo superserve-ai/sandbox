@@ -38,8 +38,9 @@ func (r hostHeartbeatRequest) describesHost() bool {
 }
 
 var (
-	errHostNotRegistered    = errors.New("host not registered")
-	errHostIdentityConflict = errors.New("host identity in use")
+	errHostNotRegistered      = errors.New("host not registered")
+	errHostIdentityConflict   = errors.New("host identity in use")
+	errHostPartialDescription = errors.New("partial host description")
 )
 
 // HostHeartbeat handles POST /internal/hosts/:host_id/heartbeat.
@@ -124,6 +125,14 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 			if holderAlive {
 				return "", "", errHostIdentityConflict
 			}
+			// Claiming an existing identity from a new address is a
+			// re-registration: it rewrites the whole row, so it needs the
+			// whole description. A partial one would blank proxy_addr or
+			// region, and heartbeating without reclaiming would mark a row
+			// live while its address points at the silent old machine.
+			if !req.describesHost() {
+				return "", "", errHostPartialDescription
+			}
 			if err := q.UpdateHostAddresses(ctx, db.UpdateHostAddressesParams{
 				ID:                hostID,
 				VmdAddr:           req.VMDAddr,
@@ -175,6 +184,11 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
 			Msg("heartbeat rejected: identity in use by a live host at another address")
 		respondErrorMsg(c, "conflict", "host identity in use by a live host", http.StatusConflict)
+		return
+	case err == errHostPartialDescription:
+		log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
+			Msg("heartbeat rejected: address claim without a complete host description")
+		respondErrorMsg(c, "bad_request", "claiming a host address requires a complete host description", http.StatusBadRequest)
 		return
 	case err != nil:
 		log.Error().Err(err).Str("host_id", hostID).Msg("host heartbeat failed")
