@@ -3059,7 +3059,11 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// cleanup below would delete it as a dead non-paused record. Park it
 	// as Error without adopting; the retry's at-rest probe gates any
 	// residue before a new boot, and the retry clears the mark.
-	if rec.RevivalPending && rec.Status != StatusPaused {
+	// No status exclusion: a pending marker can ride a still-Paused
+	// record (revival of an unresumable paused zombie anchors before the
+	// first status write), and a crash there leaves the same possibly-
+	// live residue as any other interrupted attempt.
+	if rec.RevivalPending {
 		log.Warn().Msg("revival interrupted by restart — stopping residue and parking record for retry")
 		// The interrupted attempt may have left a live replacement, and
 		// the retry's at-rest probe would refuse while it runs; without a
