@@ -43,6 +43,9 @@ type OTelRecorder struct {
 
 	sandboxTransitions       metric.Int64Counter
 	sandboxDuration          metric.Float64Histogram
+	resumeSettleWaits        metric.Int64Counter
+	resumeSettleWaitDuration metric.Float64Histogram
+	resumeSettleWaitReads    metric.Int64Histogram
 	vmdCalls                 metric.Int64Counter
 	vmdDuration              metric.Float64Histogram
 	hostVCPU                 metric.Int64Gauge
@@ -99,6 +102,15 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.sandboxDuration, err = meter.Float64Histogram("sandbox_transition_duration_seconds"); err != nil {
+		return nil, err
+	}
+	if r.resumeSettleWaits, err = meter.Int64Counter("sandbox_resume_settle_wait_total"); err != nil {
+		return nil, err
+	}
+	if r.resumeSettleWaitDuration, err = meter.Float64Histogram("sandbox_resume_settle_wait_duration_seconds"); err != nil {
+		return nil, err
+	}
+	if r.resumeSettleWaitReads, err = meter.Int64Histogram("sandbox_resume_settle_wait_reads"); err != nil {
 		return nil, err
 	}
 	if r.vmdCalls, err = meter.Int64Counter("vmd_call_total"); err != nil {
@@ -191,6 +203,28 @@ func (r *OTelRecorder) RecordSandboxTransition(ctx context.Context, t SandboxTra
 	r.sandboxTransitions.Add(ctx, 1, opt)
 	if t.Duration > 0 {
 		r.sandboxDuration.Record(ctx, t.Duration.Seconds(), opt)
+	}
+}
+
+// RecordSandboxResumeSettleWait is called at most once per resume request —
+// only when ResumeSandbox actually had to wait out a racing finalize-pause —
+// so its cost does not scale with poll count.
+func (r *OTelRecorder) RecordSandboxResumeSettleWait(ctx context.Context, w SandboxResumeSettleWait) {
+	if r == nil {
+		return
+	}
+	attrs := r.attrs(
+		attribute.String("result", safeSettleResult(w.Result)),
+		attribute.String("region", safeRegion(w.Region)),
+		attribute.String("host_id", safeHostID(w.HostID)),
+	)
+	opt := metric.WithAttributes(attrs...)
+	r.resumeSettleWaits.Add(ctx, 1, opt)
+	if w.Duration > 0 {
+		r.resumeSettleWaitDuration.Record(ctx, w.Duration.Seconds(), opt)
+	}
+	if w.Reads > 0 {
+		r.resumeSettleWaitReads.Record(ctx, w.Reads, opt)
 	}
 }
 
@@ -320,6 +354,15 @@ func safeResult(v string) string {
 		return v
 	default:
 		return ResultError
+	}
+}
+
+func safeSettleResult(v string) string {
+	switch v {
+	case SettleResultSettled, SettleResultTimeout:
+		return v
+	default:
+		return SettleResultTimeout
 	}
 }
 

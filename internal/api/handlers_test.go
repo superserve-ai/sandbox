@@ -27,6 +27,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -1314,6 +1315,186 @@ func TestResumeSandbox_NotPaused(t *testing.T) {
 	}
 	if c := errorCode(parseJSON(t, w)); c != "conflict" {
 		t.Errorf("error code = %q, want %q", c, "conflict")
+	}
+}
+
+// PauseSandbox responds once vmd's PauseVM RPC completes, then flips
+// pausing -> paused via fire-and-forget bookkeeping. The owner's own
+// immediate follow-up resume may read the row before that write lands; the
+// settle window must absorb it: a 'pausing' row that flips to 'paused'
+// mid-poll returns 200, not 409.
+func TestResumeSandbox_SettlesPausingToPaused(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", SizeBytes: 1024, Trigger: "pause",
+	}
+
+	var reads int32
+	vmd := &stubVMD{
+		resumeFn: func(_ context.Context, id, _, _ string, _ []byte) (string, error) {
+			return "10.0.0.5", nil
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			case strings.Contains(sql, "FROM sandbox"):
+				row := sb
+				if atomic.AddInt32(&reads, 1) == 1 {
+					row.Status = db.SandboxStatusPausing // finalize-pause still in flight
+				}
+				return sandboxRow(row)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{
+		VMD:    vmd,
+		DB:     db.New(mock),
+		Config: &config.Config{SandboxAccessTokenSeed: []byte("test-seed-for-hmac-32-bytes-min!!")},
+	}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (settle window must absorb the async finalize-pause); body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if got := atomic.LoadInt32(&reads); got < 2 {
+		t.Errorf("GetSandbox reads = %d, want >= 2 (must have polled)", got)
+	}
+}
+
+// A sandbox stuck in 'pausing' past the settle window (finalize-pause lost
+// or genuinely stalled, not just racing) still 409s. This is also the
+// regression test for the settle poll's backoff: the pre-backoff code
+// re-read on a fixed 50ms interval, which over the (longer) 6s activate
+// window it used to share cost up to ~120 synchronous GetSandbox calls per
+// stuck resume — a burst of pause/resume calls against the same stuck
+// sandbox would amplify DB load exactly when finalize-pause is already
+// struggling. Shrink pausingSettleWindow so the persistent case stays fast
+// while still exercising several backoff steps, and assert the read count
+// stays in the single digits instead of growing with the window.
+func TestResumeSandbox_PersistentPausing_409(t *testing.T) {
+	prev := pausingSettleWindow
+	pausingSettleWindow = time.Second
+	defer func() { pausingSettleWindow = prev }()
+
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPausing}
+
+	var reads int32
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row {
+			atomic.AddInt32(&reads, 1)
+			return sandboxRow(sb)
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+	// A fixed 50ms poll over this 1s window would read ~20 times; the
+	// backed-off poll (50ms doubling up to 500ms) should land around 6 and
+	// stay nowhere near the old ~120-read worst case.
+	if got := atomic.LoadInt32(&reads); got < 2 || got > 15 {
+		t.Errorf("GetSandbox reads = %d, want in [2, 15] (bounded, backed-off poll)", got)
+	}
+}
+
+// settleWaitCapture records the last resume-settle-wait metric emission,
+// delegating everything else to the noop recorder.
+type settleWaitCapture struct {
+	telemetry.Recorder
+	last *telemetry.SandboxResumeSettleWait
+}
+
+func (s *settleWaitCapture) RecordSandboxResumeSettleWait(_ context.Context, w telemetry.SandboxResumeSettleWait) {
+	s.last = &w
+}
+
+// A row that leaves 'pausing' for a non-paused state mid-poll (a failed
+// pause reverting to active) is not a settle: the resume still 409s and the
+// metric must say "diverged", not "settled".
+func TestResumeSandbox_PausingDivergesToActive_409(t *testing.T) {
+	capture := &settleWaitCapture{Recorder: telemetry.NewNoopRecorder()}
+	SetTelemetryRecorder(capture)
+	defer SetTelemetryRecorder(nil)
+
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+
+	var reads int32
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row {
+			status := db.SandboxStatusPausing
+			if atomic.AddInt32(&reads, 1) > 1 {
+				status = db.SandboxStatusActive // pause failed; async revert landed
+			}
+			return sandboxRow(db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: status})
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+	if capture.last == nil {
+		t.Fatal("settle-wait metric not emitted despite a waited resume")
+	}
+	if capture.last.Result != telemetry.SettleResultDiverged {
+		t.Errorf("settle result = %q, want %q (reverted pause must not count as settled)", capture.last.Result, telemetry.SettleResultDiverged)
+	}
+}
+
+// A client that cancels mid-backoff must release the handler at cancellation:
+// no riding out the rest of the poll interval, and no follow-up GetSandbox on
+// the already-canceled context.
+func TestResumeSandbox_CanceledDuringSettle_StopsPolling(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var reads int32
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row {
+			atomic.AddInt32(&reads, 1)
+			cancel() // client goes away right after the first read
+			return sandboxRow(db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPausing})
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	start := time.Now()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()).WithContext(ctx))
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+	if got := atomic.LoadInt32(&reads); got != 1 {
+		t.Errorf("GetSandbox reads = %d, want 1 (no re-read on a canceled context)", got)
+	}
+	if elapsed >= pausingSettleWindow {
+		t.Errorf("handler held for %v, want prompt return on cancellation (window %v)", elapsed, pausingSettleWindow)
 	}
 }
 
