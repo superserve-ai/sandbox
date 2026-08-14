@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -358,5 +359,73 @@ func TestRecordPausedNetworkPressureEmitsControllerMetrics(t *testing.T) {
 		if !seen[name] {
 			t.Fatalf("metric %q not found", name)
 		}
+	}
+}
+
+// RecordLatencyPhase must label every sample with the bounded phase enums,
+// fold empties to addressable values, and fall back to the recorder's own
+// host identity when the caller has none (vmd/proxy).
+func TestRecordLatencyPhaseAttributes(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(ctx) })
+	meter := provider.Meter(instrumentationName)
+
+	phaseDuration, err := meter.Float64Histogram("sandbox_phase_duration_seconds")
+	if err != nil {
+		t.Fatalf("create phase histogram: %v", err)
+	}
+	recorder := &OTelRecorder{
+		provider:      provider,
+		serviceName:   "sandbox-vmd",
+		environment:   "staging",
+		hostID:        "host-abc",
+		phaseDuration: phaseDuration,
+	}
+
+	recorder.RecordLatencyPhase(ctx, LatencyPhase{
+		Plane:    "vmd",
+		Op:       "launch",
+		Phase:    "wait_socket",
+		Duration: 30 * time.Millisecond,
+		// Mode, Region, HostID empty: must fold, not vanish.
+	})
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	var dp *metricdata.HistogramDataPoint[float64]
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "sandbox_phase_duration_seconds" {
+				continue
+			}
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok || len(h.DataPoints) != 1 {
+				t.Fatalf("want one histogram datapoint, got %T / %d", m.Data, len(h.DataPoints))
+			}
+			dp = &h.DataPoints[0]
+		}
+	}
+	if dp == nil {
+		t.Fatal("phase histogram not collected")
+	}
+	want := map[string]string{
+		"plane":   "vmd",
+		"op":      "launch",
+		"phase":   "wait_socket",
+		"mode":    "none",
+		"host_id": "host-abc", // recorder fallback
+	}
+	for k, v := range want {
+		got, ok := dp.Attributes.Value(attribute.Key(k))
+		if !ok || got.AsString() != v {
+			t.Errorf("attribute %s = %q (present=%v), want %q", k, got.AsString(), ok, v)
+		}
+	}
+	if dp.Sum < 0.029 || dp.Sum > 0.031 {
+		t.Errorf("sum = %v, want ~0.030s", dp.Sum)
 	}
 }

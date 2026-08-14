@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 const (
@@ -137,6 +139,22 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		Int64("boxd_spawn_ms", boxdSpawnMs).
 		Int64("boxd_run_ms", boxdRunMs).
 		Msg("exec phases")
+	if h.recorder != nil {
+		for phase, d := range map[string]time.Duration{
+			"auth":       tAuthDone.Sub(tStart),
+			"boxd_spawn": time.Duration(boxdSpawnMs) * time.Millisecond,
+			"run":        time.Duration(boxdRunMs) * time.Millisecond,
+			"ttfb":       time.Duration(ttfbMs) * time.Millisecond,
+			"total":      time.Since(tStart),
+		} {
+			if d < 0 {
+				continue
+			}
+			h.recorder.RecordLatencyPhase(r.Context(), telemetry.LatencyPhase{
+				Plane: "dataplane", Op: "exec", Phase: phase, Duration: d,
+			})
+		}
+	}
 }
 
 // headerMs parses a millisecond timing header; -1 means absent or unparseable

@@ -634,6 +634,24 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 
 // SetStateStore attaches a BoltDB state store for durable persistence.
 // Must be called before any VM operations.
+
+// recordPhases emits one latency histogram sample per named phase (plane
+// "vmd"); the host label comes from the recorder's construction. Nil-safe
+// and negative durations are dropped, so call sites stay one-liners.
+func (m *Manager) recordPhases(op, mode string, phases map[string]time.Duration) {
+	if m.recorder == nil {
+		return
+	}
+	for phase, d := range phases {
+		if d < 0 {
+			continue
+		}
+		m.recorder.RecordLatencyPhase(context.Background(), telemetry.LatencyPhase{
+			Plane: "vmd", Op: op, Phase: phase, Mode: mode, Duration: d,
+		})
+	}
+}
+
 func (m *Manager) SetStateStore(s *StateStore) {
 	m.state = s
 }
@@ -2547,6 +2565,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Bool("ok", attemptErr == nil).
 			Int("attempt", attempt).
 			Msg("snapshot loaded")
+		if attemptErr == nil {
+			m.recordPhases("restore", "", map[string]time.Duration{"load_snapshot": time.Since(tFcReady)})
+		}
 		restoreErr = attemptErr
 
 		if restoreErr == nil {
@@ -2731,6 +2752,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		Int64("wait_boxd_ms", tBoxdReady.Sub(tBoxdStart).Milliseconds()).
 		Int64("persist_state_ms", tPersisted.Sub(tBoxdReady).Milliseconds()).
 		Msg("VM restored from snapshot")
+	m.recordPhases("restore", "", map[string]time.Duration{
+		"wait_boxd": tBoxdReady.Sub(tBoxdStart),
+		"persist":   tPersisted.Sub(tBoxdReady),
+	})
 	return inst, nil
 }
 
@@ -4679,6 +4704,12 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		Int64("start_unit_ms", tStartUnitDone.Sub(tStartUnit).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds()).
 		Msg("fc startup phases")
+	m.recordPhases("launch", "unit", map[string]time.Duration{
+		"prestart":    tStartUnit.Sub(tPrestart),
+		"linger":      time.Duration(lingerCheckMs) * time.Millisecond,
+		"start_unit":  tStartUnitDone.Sub(tStartUnit),
+		"wait_socket": tSocketReady.Sub(tStartUnitDone),
+	})
 
 	// Read the PID asynchronously so the create path isn't slowed down
 	// by the ~15ms dbus roundtrip. The PID is populated in the instance

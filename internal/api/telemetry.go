@@ -76,6 +76,26 @@ func RecordSandboxTransition(ctx context.Context, operation, result, hostID stri
 	})
 }
 
+// RecordLatencyPhases emits one histogram sample per named phase of a
+// control-plane operation. Phases with negative durations (clock skew across
+// the async insert join) are dropped rather than recorded as zero.
+func RecordLatencyPhases(ctx context.Context, op, hostID string, phases map[string]time.Duration) {
+	rec := currentTelemetryRecorder()
+	for phase, d := range phases {
+		if d < 0 {
+			continue
+		}
+		rec.RecordLatencyPhase(ctx, telemetry.LatencyPhase{
+			Plane:    "controlplane",
+			Op:       op,
+			Phase:    phase,
+			Region:   SandboxIDRegion(),
+			HostID:   hostID,
+			Duration: d,
+		})
+	}
+}
+
 // RecordResumeSettleWait records ResumeSandbox waiting through a racing
 // finalize-pause write; result is one of the telemetry.SettleResult*
 // constants. Callers should only invoke this when the loop actually waited

@@ -669,6 +669,13 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 // after VMD resume succeeds, destroys the VM + reverts to paused.
 func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID) (string, bool) {
 	sandboxID := sandbox.ID
+	tResume := time.Now()
+	resumeOutcome := telemetry.ResultError
+	defer func() {
+		RecordSandboxTransition(c.Request.Context(), "resume", resumeOutcome, sandbox.HostID, time.Since(tResume))
+		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
+			map[string]time.Duration{"total": time.Since(tResume)})
+	}()
 
 	if !sandbox.SnapshotID.Valid {
 		log.Error().Str("sandbox_id", sandboxID.String()).Msg("paused sandbox has no snapshot_id")
@@ -1007,6 +1014,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// ActivateSandbox's CTE opens the sandbox_active_interval row (async).
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": sandboxID.String()})
+	resumeOutcome = telemetry.ResultSuccess
 	return currentPolicy.Access, true
 }
 
@@ -2582,6 +2590,17 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		Int64("post_ms", tPostDone.Sub(tInsertReceive).Milliseconds()).
 		Int64("total_ms", tPostDone.Sub(tStart).Milliseconds()).
 		Msg("CreateSandbox phases")
+	RecordLatencyPhases(c.Request.Context(), "create", hostID, map[string]time.Duration{
+		"auth":              time.Duration(c.GetInt64("auth_ms")) * time.Millisecond,
+		"lookup":            tLookupDone.Sub(tStart),
+		"sched":             tVmdStart.Sub(tLookupDone),
+		"vmd":               tVmdEnd.Sub(tVmdStart),
+		"insert":            tInsertEnd.Sub(tInsertStart),
+		"insert_wait":       tInsertReceive.Sub(tVmdEnd),
+		"post":              tPostDone.Sub(tInsertReceive),
+		"total":             tPostDone.Sub(tStart),
+	})
+	RecordSandboxTransition(c.Request.Context(), "create", telemetry.ResultSuccess, hostID, tPostDone.Sub(tStart))
 	c.JSON(http.StatusCreated, resp)
 }
 
@@ -2609,6 +2628,14 @@ func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id string) (sn
 }
 
 func (h *Handlers) PauseSandbox(c *gin.Context) {
+	tPause := time.Now()
+	pauseOutcome := telemetry.ResultError
+	pauseHostID := ""
+	defer func() {
+		RecordSandboxTransition(c.Request.Context(), "pause", pauseOutcome, pauseHostID, time.Since(tPause))
+		RecordLatencyPhases(c.Request.Context(), "pause", pauseHostID,
+			map[string]time.Duration{"total": time.Since(tPause)})
+	}()
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return
@@ -2631,6 +2658,9 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		ID:     sandboxID,
 		TeamID: teamID,
 	})
+	if err == nil {
+		pauseHostID = sandbox.HostID // label error outcomes past the claim too
+	}
 	if err != nil {
 		if err != pgx.ErrNoRows {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginPause failed")
@@ -2757,6 +2787,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// end of the VMD pause work, not the moment the sandbox left active.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
+	pauseOutcome = telemetry.ResultSuccess
 
 	c.Status(http.StatusNoContent)
 }

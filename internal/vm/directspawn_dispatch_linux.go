@@ -311,6 +311,12 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 		Int64("wait_socket_ms", tSocketReady.Sub(tSpawnDone).Milliseconds()).
 		Bool("direct", true).
 		Msg("fc startup phases")
+	m.recordPhases("launch", "direct", map[string]time.Duration{
+		"stop_prior":  stopPrior,
+		"prestart":    tStart.Sub(tPrestart),
+		"spawn":       tSpawnDone.Sub(tStart),
+		"wait_socket": tSocketReady.Sub(tSpawnDone),
+	})
 
 	return pid, nil
 }
