@@ -375,13 +375,25 @@ func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.Re
 			tmp.Close()
 			return nil, err
 		}
+		// Sync before close and rename, then sync the directory: the
+		// cache pathname must never outlive its contents across a power
+		// loss, or a rerun would serve a truncated base whose corruption
+		// only surfaces as per-sandbox digest failures downstream.
+		if err := tmp.Sync(); err != nil {
+			tmp.Close()
+			return nil, err
+		}
 		if err := tmp.Close(); err != nil {
 			return nil, err
 		}
-		// Rename-after-full-write: a crashed spool never masquerades as
-		// a cached base, and every restore's own digest verification
-		// still covers the served bytes end to end.
-		return nil, os.Rename(tmp.Name(), cached)
+		if err := os.Rename(tmp.Name(), cached); err != nil {
+			return nil, err
+		}
+		if dir, err := os.Open(filepath.Dir(cached)); err == nil {
+			_ = dir.Sync()
+			dir.Close()
+		}
+		return nil, nil
 	})
 	if err != nil {
 		return nil, err

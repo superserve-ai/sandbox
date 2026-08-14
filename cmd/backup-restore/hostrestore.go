@@ -174,6 +174,7 @@ func sandboxIDsFromFile(path string) ([]string, map[string][]backup.CaptureAncho
 	defer f.Close()
 	var ids []string
 	anchors := map[string][]backup.CaptureAnchor{}
+	seen := map[string]bool{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -181,6 +182,13 @@ func sandboxIDsFromFile(path string) ([]string, map[string][]backup.CaptureAncho
 			continue
 		}
 		fields := strings.Fields(line)
+		// Duplicates fail the whole file up front: two entries for one
+		// sandbox (a concatenated pair of replica exports) would race
+		// two restores at one destination under concurrency.
+		if seen[fields[0]] {
+			return nil, nil, fmt.Errorf("duplicate sandbox id %s in %s; deduplicate the export", fields[0], path)
+		}
+		seen[fields[0]] = true
 		ids = append(ids, fields[0])
 		// Anchors separate by commas, one per pause (newest first);
 		// within an anchor, name=sha tokens bind multiple files of the
@@ -191,11 +199,22 @@ func sandboxIDsFromFile(path string) ([]string, map[string][]backup.CaptureAncho
 		for _, tok := range fields[1:] {
 			a := backup.CaptureAnchor{}
 			for _, part := range strings.Split(tok, ",") {
-				if name, sha, ok := strings.Cut(part, "="); ok {
-					a[name] = sha
-				} else if part != "" {
-					a["vmstate.snap"] = part
+				name, sha, ok := strings.Cut(part, "=")
+				if !ok {
+					name, sha = "vmstate.snap", part
 				}
+				if sha == "" {
+					continue
+				}
+				// A malformed digest can never match a manifest, and an
+				// unmatchable anchor silently degrades selection to
+				// newest-completed: fail the file instead, since a
+				// truncated sha or a stray export prefix is operator
+				// input worth stopping on.
+				if !isHexDigest(sha) {
+					return nil, nil, fmt.Errorf("sandbox %s: %q is not a 64-hex sha256 digest", fields[0], sha)
+				}
+				a[name] = sha
 			}
 			if len(a) > 0 {
 				anchors[fields[0]] = append(anchors[fields[0]], a)
@@ -203,4 +222,17 @@ func sandboxIDsFromFile(path string) ([]string, map[string][]backup.CaptureAncho
 		}
 	}
 	return ids, anchors, sc.Err()
+}
+
+// isHexDigest reports whether s is a 64-character lowercase hex sha256.
+func isHexDigest(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
