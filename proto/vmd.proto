@@ -289,6 +289,14 @@ message ReviveVMRequest {
   repeated string allowed_cidrs = 5;
   repeated string denied_cidrs = 6;
   repeated string allowed_domains = 7;
+  // Sandbox configuration to re-inject after the guest is ready: a cold
+  // boot starts boxd with an empty context, and unlike snapshot resume
+  // no in-memory init state survives, so env and secret bindings must
+  // be delivered again. Same semantics as InjectSandboxEnv; when both
+  // are empty the caller owns re-injection before activating the row
+  // (the operator CLI prints that obligation per revived sandbox).
+  map<string, string> env_vars = 9;
+  string secrets_jwt = 10;
 }
 
 message ReviveVMResponse {

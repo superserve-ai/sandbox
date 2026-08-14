@@ -693,6 +693,26 @@ func (a *GRPCAdapter) ReviveVM(ctx context.Context, req *vmdpb.ReviveVMRequest) 
 		return nil, err
 	}
 	inst.mu.RLock()
-	defer inst.mu.RUnlock()
-	return &vmdpb.ReviveVMResponse{DiskPath: inst.DiskPath, HostIp: inst.IP}, nil
+	diskPath, hostIP := inst.DiskPath, inst.IP
+	inst.mu.RUnlock()
+	// A cold boot starts boxd with an empty context: unlike snapshot
+	// resume, no in-memory init state survives, so env and secret
+	// bindings re-inject here when the caller supplied them, reusing the
+	// standalone injection path verbatim (lock, proxy gate, retries).
+	// Empty config leaves re-injection to the caller before activation.
+	if len(req.GetEnvVars()) > 0 || req.GetSecretsJwt() != "" {
+		if _, err := a.InjectSandboxEnv(ctx, &vmdpb.InjectSandboxEnvRequest{
+			VmId:       req.GetVmId(),
+			EnvVars:    req.GetEnvVars(),
+			SecretsJwt: req.GetSecretsJwt(),
+		}); err != nil {
+			// The boot succeeded; the config did not land. Fail the RPC
+			// so the operator retries injection rather than activating a
+			// sandbox missing its env, but leave the VM up: re-running
+			// revive is guarded off by the liveness probe, and the
+			// standalone InjectSandboxEnv RPC is the retry path.
+			return nil, status.Errorf(codes.Internal, "revived but configuration injection failed; retry via InjectSandboxEnv: %v", err)
+		}
+	}
+	return &vmdpb.ReviveVMResponse{DiskPath: diskPath, HostIp: hostIP}, nil
 }

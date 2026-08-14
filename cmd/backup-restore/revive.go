@@ -108,6 +108,7 @@ func runRevive(args []string) int {
 			continue
 		}
 		fmt.Printf("REVIVED %s ip=%s disk=%s\n", req.VmId, resp.GetHostIp(), resp.GetDiskPath())
+		fmt.Printf("  NOTE %s: env and secret bindings are NOT on the disk; re-inject via the control plane before activating the row\n", req.VmId)
 		revived++
 	}
 	if err := sc.Err(); err != nil {
