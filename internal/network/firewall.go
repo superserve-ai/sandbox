@@ -41,22 +41,22 @@ type Firewall struct {
 	userDenySet        *nftables.Set
 	userAllowSet       *nftables.Set
 
-	tapIface   string
-	vethPeer   string // namespace-side veth (e.g. "eth0")
-	vmIP       string // VM internal IP (169.254.0.21)
-	hostIP     string // host-side IP for this sandbox
-	gatewayIP  string // orchestrator IP allowed through firewall
+	tapIface  string
+	vethPeer  string // namespace-side veth (e.g. "eth0")
+	vmIP      string // VM internal IP (169.254.0.21)
+	hostIP    string // host-side IP for this sandbox
+	gatewayIP string // orchestrator IP allowed through firewall
 
 	// TCP proxy ports for domain-based filtering.
 }
 
 // FirewallConfig holds the parameters needed to create a Firewall.
 type FirewallConfig struct {
-	TAPInterface   string
-	VethPeer       string // namespace-side veth name
-	VMIP           string
-	HostIP         string
-	GatewayIP      string // IP always allowed (orchestrator/gateway)
+	TAPInterface string
+	VethPeer     string // namespace-side veth name
+	VMIP         string
+	HostIP       string
+	GatewayIP    string // IP always allowed (orchestrator/gateway)
 }
 
 // NewFirewall creates nftables rules inside the current network namespace.
@@ -246,43 +246,6 @@ func ReinstallFirewall(cfg FirewallConfig) (*Firewall, error) {
 	return NewFirewall(cfg)
 }
 
-// VerifyAttached confirms the kernel actually holds the objects this handle
-// merely names: the table with all four chains, the four IP sets, and a
-// non-empty filter chain. AttachFirewall alone proves nothing — it binds
-// names without querying — so an attach to a flushed or corrupted namespace
-// would otherwise succeed and publish a slot with no enforcement. Must run
-// inside the slot's namespace, like the attach itself.
-func (fw *Firewall) VerifyAttached() error {
-	chains, err := fw.conn.ListChainsOfTableFamily(nftables.TableFamilyINet)
-	if err != nil {
-		return fmt.Errorf("list chains: %w", err)
-	}
-	found := map[string]bool{}
-	for _, c := range chains {
-		if c.Table != nil && c.Table.Name == fw.table.Name {
-			found[c.Name] = true
-		}
-	}
-	for _, want := range []string{fw.filterChain.Name, fw.natChain.Name, fw.postChain.Name, fw.fwdChain.Name} {
-		if !found[want] {
-			return fmt.Errorf("chain %q missing from kernel", want)
-		}
-	}
-	for _, set := range []*nftables.Set{fw.predefinedDenySet, fw.predefinedAllowSet, fw.userDenySet, fw.userAllowSet} {
-		if _, err := fw.conn.GetSetByName(fw.table, set.Name); err != nil {
-			return fmt.Errorf("set %q missing from kernel: %w", set.Name, err)
-		}
-	}
-	rules, err := fw.conn.GetRules(fw.table, fw.filterChain)
-	if err != nil {
-		return fmt.Errorf("get filter rules: %w", err)
-	}
-	if len(rules) == 0 {
-		return fmt.Errorf("filter chain present but empty")
-	}
-	return nil
-}
-
 // Close tears down the nftables connection. Kernel-level table and
 // rules persist across the close — they're owned by the kernel, not
 // by this netlink handle. AttachFirewall can re-bind to them later.
@@ -463,7 +426,6 @@ func (fw *Firewall) installMSSClamping() {
 		),
 	})
 }
-
 
 // ---------------------------------------------------------------------------
 // ReplaceUserRules — atomic set replacement

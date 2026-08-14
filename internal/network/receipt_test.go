@@ -392,18 +392,18 @@ func TestReceipt_QuiesceTimeoutWritesNothing(t *testing.T) {
 	}
 }
 
-// stubAttachVerify overrides the attach+verify seam.
-func stubAttachVerify(t *testing.T, fn func(FirewallConfig) (*Firewall, error)) {
+// stubReinstallFirewall overrides the in-namespace firewall rebuild seam.
+func stubReinstallFirewall(t *testing.T, fn func(FirewallConfig) (*Firewall, error)) {
 	t.Helper()
-	old := attachAndVerifyFirewall
-	attachAndVerifyFirewall = fn
-	t.Cleanup(func() { attachAndVerifyFirewall = old })
+	old := reinstallFirewallFunc
+	reinstallFirewallFunc = fn
+	t.Cleanup(func() { reinstallFirewallFunc = old })
 }
 
-// TestFastAdopt_UnverifiedFirewallDemotes pins the security gate: an attach
-// that cannot verify the kernel objects must demote, never publish a slot
-// whose namespace may hold no enforcement.
-func TestFastAdopt_UnverifiedFirewallDemotes(t *testing.T) {
+// TestFastAdopt_FirewallRebuildFailureDemotes pins the security gate: a
+// slot whose ruleset cannot be rebuilt must demote, never publish with
+// unknown enforcement.
+func TestFastAdopt_FirewallRebuildFailureDemotes(t *testing.T) {
 	withReceiptSeams(t, "boot-a", "9")
 	dir := withTestNetnsDir(t)
 	m := newTestManager()
@@ -418,8 +418,8 @@ func TestFastAdopt_UnverifiedFirewallDemotes(t *testing.T) {
 		BootID: "boot-a", Generation: 8, Fingerprint: slotPolicyFingerprint(), Fresh: []int{1},
 	})
 	stubNsExecGo(t, func(ns string, inner func() error) error { return inner() })
-	stubAttachVerify(t, func(FirewallConfig) (*Firewall, error) {
-		return nil, fmt.Errorf("attached but unverified: chain missing")
+	stubReinstallFirewall(t, func(FirewallConfig) (*Firewall, error) {
+		return nil, fmt.Errorf("delete stale table: netlink refused")
 	})
 	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
 	stubResetTap(t, func(*Manager, context.Context, string) error { return nil })
@@ -431,7 +431,7 @@ func TestFastAdopt_UnverifiedFirewallDemotes(t *testing.T) {
 
 	adopted, _, _ := p.AdoptOrphanSlots(context.Background())
 	if adopted != 1 || fullPath.Load() != 1 {
-		t.Fatalf("unverified slot must demote to full path: adopted=%d fullPath=%d", adopted, fullPath.Load())
+		t.Fatalf("unrebuildable slot must demote to full path: adopted=%d fullPath=%d", adopted, fullPath.Load())
 	}
 }
 

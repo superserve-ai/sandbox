@@ -179,20 +179,16 @@ func consumePoolReceipt() (*poolReceipt, string) {
 // validation without real kernel namespaces.
 var nsExecGoFunc = nsExecGo
 
-// attachAndVerifyFirewall binds a handle to the namespace's existing ruleset
-// and confirms the kernel actually holds it. A seam so tests can exercise
-// the demotion paths without kernel nftables.
-var attachAndVerifyFirewall = func(cfg FirewallConfig) (*Firewall, error) {
-	fw, err := AttachFirewall(cfg)
-	if err != nil {
-		return nil, err
-	}
-	if err := fw.VerifyAttached(); err != nil {
-		_ = fw.Close()
-		return nil, fmt.Errorf("attached but unverified: %w", err)
-	}
-	return fw, nil
-}
+// reinstallFirewallFunc is a seam over ReinstallFirewall so tests can
+// exercise the demotion paths without kernel nftables. The fast path
+// REBUILDS the ruleset rather than attaching to the previous process's:
+// rebuilding is a single in-process netlink batch (milliseconds — the
+// receipt's savings are the kill/poll, the route subprocesses, and the tap
+// rebuild, not this), and it makes the rules correct by construction
+// against current policy. Attach-and-verify was the alternative, and any
+// verification deep enough to actually prove enforcement converges on
+// reinstallation anyway.
+var reinstallFirewallFunc = ReinstallFirewall
 
 // fastAdoptSlotTimeout bounds one vouched slot's in-namespace validation.
 // The checks are milliseconds when healthy; the bound exists because netlink
@@ -204,11 +200,12 @@ var fastAdoptSlotTimeout = 3 * time.Second
 // fastAdoptVouched runs the cheap validation a vouched slot must still pass
 // before rejoining inventory: namespace present, host veth present, zero
 // occupants (from the caller's single batched /proc scan), and — inside the
-// namespace — the tap device present and the previous process's ruleset
-// verified present in the kernel and attached. No teardown, no reinstall,
-// no routes: the kernel objects were settled inventory of the immediately
-// preceding process and the fingerprint proves the policy that built them
-// is current. Failure demotes to the full path (slot=nil); timedOut also
+// namespace — the tap device present and the firewall ruleset rebuilt from
+// current policy (in-process netlink; requires the zero-occupant guarantee,
+// as the rebuild briefly drops enforcement). No kill/poll, no route
+// rewrites, no tap rebuild: the kernel objects were settled inventory of
+// the immediately preceding process and the fingerprint proves the policy
+// that shaped them is current. Failure demotes to the full path (slot=nil); timedOut also
 // reports the in-namespace worker wedging so the caller can abort the fast
 // pass systemically. A panic in the validation demotes rather than killing
 // the worker — a pool-owned index must always land in one path or the other.
@@ -249,7 +246,7 @@ func (p *Pool) fastAdoptVouched(idx int, nsSet, vethSet map[string]bool, occupie
 					return fmt.Errorf("tap missing: %w", err)
 				}
 				var aerr error
-				fw, aerr = attachAndVerifyFirewall(FirewallConfig{
+				fw, aerr = reinstallFirewallFunc(FirewallConfig{
 					TAPInterface: TAPName,
 					VethPeer:     "eth0",
 					VMIP:         VMInternalIP,
