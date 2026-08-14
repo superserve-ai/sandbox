@@ -361,6 +361,12 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		// untracked VMs, serializing behind any destroy still in flight.
 		teardownSelf(context.WithoutCancel(ctx))
 		committed = true
+		if teardownFailed {
+			// The destroy owns the outcome but the replacement could not
+			// be confirmed stopped; say so, rather than reporting a
+			// clean abort over a possibly-live VM.
+			return nil, status.Errorf(codes.Internal, "vm %s was destroyed while revival was completing and teardown did not confirm; residue left for forced destroy", vmID)
+		}
 		return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while revival was completing", vmID)
 	}
 	if !wrote {

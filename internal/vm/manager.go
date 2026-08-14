@@ -3060,7 +3060,20 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// as Error without adopting; the retry's at-rest probe gates any
 	// residue before a new boot, and the retry clears the mark.
 	if rec.RevivalPending && rec.Status != StatusPaused {
-		log.Warn().Msg("revival interrupted by restart — parking record for retry")
+		log.Warn().Msg("revival interrupted by restart — stopping residue and parking record for retry")
+		// The interrupted attempt may have left a live replacement, and
+		// the retry's at-rest probe would refuse while it runs; without a
+		// stop here (the reaper exempts pending records) recovery would
+		// wedge until a manual destroy. Bounded and best-effort: an
+		// unconfirmed stop still parks, the probe keeps refusing, and
+		// the operator's forced destroy resolves.
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coldBootStopBudget)
+		if knownSupervision(rec.Supervision) {
+			_ = m.stopVM(sctx, rec.ID, rec.Supervision)
+		} else {
+			_ = stopUnitWithBudget(sctx, systemdUnitName(rec.ID))
+		}
+		cancel()
 		rec.Status = StatusError
 		if err := m.state.Put(rec); err != nil {
 			log.Error().Err(err).Msg("park interrupted-revival record")
