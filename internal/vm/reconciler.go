@@ -12,6 +12,8 @@ import (
 
 	"errors"
 
+	"github.com/rs/zerolog"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -127,16 +129,43 @@ type Reconciler struct {
 	// prevKeptLive is the prior disk pass's protected live-sandbox count, used
 	// to detect a keep-set collapse. -1 until the first pass. Run loop only.
 	prevKeptLive int
+	// lastVmsWeight is the CPU/IO weight last applied to the direct-spawn
+	// service, so a pass that finds the same live direct-VM count skips the
+	// set-property. 0 until the first adjustment. Run loop only.
+	lastVmsWeight int
+
+	// markFailed flips a sandbox row to failed; a field so rule tests can
+	// capture the flip without a control-plane DB. Defaults to markFailedInDB.
+	markFailed func(ctx context.Context, vmID string, observed db.SandboxStatus) bool
+
+	// stopVM stops a VM by supervision mode; a field so rule tests can
+	// exercise the reap rules without a live systemd or a real kill (the
+	// cgroup arm's kill-and-wait budget is seconds). Defaults to mgr.stopVM.
+	stopVM func(ctx context.Context, vmID string, supervision Supervision) error
 }
 
 // NewReconciler creates a reconciler bound to a Manager.
 func NewReconciler(mgr *Manager, cfg ReconcilerConfig) *Reconciler {
-	return &Reconciler{
+	r := &Reconciler{
 		mgr:          mgr,
 		cfg:          cfg,
 		driftSeen:    make(map[string]time.Time),
 		prevKeptLive: -1,
 	}
+	r.markFailed = r.markFailedInDB
+	r.stopVM = mgr.stopVM
+	return r
+}
+
+// vmFullyDown is the mode-aware terminal proof a record release requires: a
+// unit VM's unit in a TERMINAL state, a cgroup VM's group conclusively empty.
+// The wrong-mode oracle answers vacuously (no unit exists for a cgroup VM),
+// so only this claim may precede markStale.
+func (r *Reconciler) vmFullyDown(ctx context.Context, vmID string, supervision Supervision) bool {
+	if cgroupSupervised(supervision) {
+		return r.mgr.cgroupDefinitelyDead(vmID)
+	}
+	return unitFullyDown(ctx, systemdUnitName(vmID))
 }
 
 // runTimeout bounds each reconciliation pass so a slow DB or stuck
@@ -195,20 +224,57 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// Pass timestamp; the disk scan derives its grace cutoff from it (rows
 	// destroyed within, and dirs touched within, DiskGracePeriod are kept).
 	snapshotTime := time.Now()
+	if reclaimed := r.mgr.reclaimPausedNetworkInventory(snapshotTime); reclaimed > 0 {
+		log.Info().Int("reclaimed", reclaimed).Msg("reclaimed paused network inventory")
+	}
 
-	// Source B: active systemd units.
-	ids, err := listActiveFirecrackerUnits(ctx)
+	// Source B: running VMs, as a fail-closed UNION of both supervision
+	// modes — active systemd units and populated per-VM cgroups. This set
+	// gates every destructive drift rule and the presence sweep, so a live
+	// VM missing from it would be marked failed and have its netns freed
+	// under a running Firecracker. If EITHER source errors, abort the whole
+	// pass: a partial set presents that source's VMs as dead. supervisionOf
+	// records which source listed each ID so the stop path can pick the
+	// right mechanism when the DB row (and its Supervision) is absent.
+	unitIDs, err := listActiveFirecrackerUnits(ctx)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list systemd units")
 		return
 	}
-	active := make(map[string]bool, len(ids))
-	for _, id := range ids {
+	active := make(map[string]bool)
+	supervisionOf := make(map[string]Supervision)
+	for _, id := range unitIDs {
 		if isBuildVM(id) {
 			continue
 		}
 		active[id] = true
+		supervisionOf[id] = SupervisionUnit
 	}
+	if r.mgr.cgroups != nil {
+		cgIDs, cerr := r.mgr.cgroups.scanVMCgroups()
+		if cerr != nil {
+			log.Error().Err(cerr).Msg("failed to scan vm cgroups")
+			return
+		}
+		for _, id := range cgIDs {
+			if isBuildVM(id) {
+				continue
+			}
+			pop, perr := r.mgr.cgroups.vmCgroupPopulated(id)
+			if perr != nil {
+				log.Error().Err(perr).Str("vm_id", id).Msg("failed to read vm cgroup state")
+				return
+			}
+			if pop {
+				active[id] = true
+				supervisionOf[id] = SupervisionCgroup
+			}
+		}
+	}
+
+	// Keep the direct-spawn service's scheduling weight proportional to how
+	// many direct VMs actually compete, now that both populations are known.
+	r.adjustDirectSpawnWeight(ctx, active, supervisionOf)
 
 	// Presence convergence rides the reconcile tick: give every quiesced legacy
 	// overlay its side-car, then persist the converged marker. No-op (one
@@ -269,148 +335,239 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 
 	now := time.Now()
 
-	// Drift 1: DB says active, systemd/socket says dead.
-	// Action: mark sandbox failed in DB + clean up BoltDB + in-memory.
-	if dbSandboxes != nil {
-		for id, sb := range dbSandboxes {
-			if sb.Sandbox.Status != db.SandboxStatusActive {
-				continue
-			}
-			if active[id] {
-				r.clearDrift(id)
-				continue
-			}
-			if !r.gracePeriodElapsed(id, now) {
-				continue
-			}
-			if !r.consumeAutoFailBudget(id) {
-				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "db_active_systemd_missing")
-				continue
-			}
-			log.Warn().Str("vm_id", id).Str("drift", "db_active_systemd_missing").
-				Msg("DB says active but VM is dead — marking failed")
-			r.markFailedInDB(ctx, id)
-			r.markStale(id)
-			r.writeAudit(ctx, id, "mark_failed", "VM dead while DB said active", "db_active_systemd_missing")
+	// errorRecord reports whether id's record reads Error. The tracked
+	// in-memory instance is authoritative when present: reattach can park an
+	// Error instance whose durable write failed (row still Running), and that
+	// VM must still be owned by the error rules. Statuses are fetched per
+	// candidate id so the common DB-mode pass stays ID-only.
+	errorRecord := func(id string) bool {
+		r.mgr.mu.RLock()
+		inst := r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if inst != nil {
+			inst.mu.RLock()
+			st := inst.Status
+			inst.mu.RUnlock()
+			return st == StatusError
 		}
+		if bolted != nil {
+			rec, ok := bolted[id]
+			return ok && rec.Status == StatusError
+		}
+		if _, ok := boltedIDs[id]; !ok {
+			return false
+		}
+		rec, err := r.mgr.state.Get(id)
+		return err == nil && rec != nil && rec.Status == StatusError
 	}
 
-	// Drift 1b: the unit is active but the Firecracker inside is an empty
-	// shell holding no microVM (see fcReportsEmptyShell) — e.g. the unit
-	// was restarted outside vmd, which destroys the guest; the replacement
-	// only becomes a VM again through vmd's own restore path. A mid-launch
-	// VM is briefly "Not started" between unit start and boot; the grace
-	// period (drift must persist across passes) plus the op-lock check and
-	// a re-probe under the lock filter that window.
-	if dbSandboxes != nil {
-		// Probe candidates concurrently under a stage budget: a wedged API
-		// burns its full timeout, and sequential probing would let a few
-		// wedged sockets starve every rule after this one. Budget-cutoff
-		// probes yield errors (non-evidence) and re-examine next pass.
-		var candidates []string
-		for id, sb := range dbSandboxes {
-			if sb.Sandbox.Status != db.SandboxStatusActive || !active[id] {
-				r.clearDrift("fcempty:" + id)
-				continue
-			}
-			candidates = append(candidates, id)
+	// Drift 0: recordless cgroup survivor. A cgroup in the running-set with
+	// no BoltDB record and no in-memory instance is a VM vmd cannot service —
+	// a crash between direct-spawn and the first persist. Drift 1/3 miss it
+	// (the DB row may still read creating/running, and those rules key off
+	// the record or skip nonterminal rows). Stop it after grace, under the op
+	// lock, re-checking that it's still recordless so an in-flight launch
+	// that just made the cgroup is never killed.
+	for id := range active {
+		if ctx.Err() != nil {
+			return
 		}
-		probeCtx, probeCancel := context.WithTimeout(ctx, 6*time.Second)
-		type probeResult struct {
-			empty bool
-			err   error
+		if supervisionOf[id] != SupervisionCgroup {
+			continue
 		}
-		probes := make(map[string]probeResult, len(candidates))
-		var probeMu sync.Mutex
-		var probeWG sync.WaitGroup
-		probeSem := make(chan struct{}, 16)
-		for _, id := range candidates {
-			probeWG.Add(1)
-			go func(id string) {
-				defer probeWG.Done()
-				probeSem <- struct{}{}
-				defer func() { <-probeSem }()
-				empty, perr := fcProbeShell(probeCtx, filepath.Join(r.mgr.cfg.RunDir, id, "firecracker.sock"))
-				probeMu.Lock()
-				probes[id] = probeResult{empty: empty, err: perr}
-				probeMu.Unlock()
-			}(id)
+		inBolt := false
+		if dbSandboxes == nil {
+			_, inBolt = bolted[id]
+		} else {
+			_, inBolt = boltedIDs[id]
 		}
-		probeWG.Wait()
-		probeCancel()
-
-		for _, id := range candidates {
-			res := probes[id]
-			if res.err != nil {
-				continue // no evidence either way; drift state untouched
-			}
-			if !res.empty {
-				r.clearDrift("fcempty:" + id)
-				continue
-			}
-			if !r.gracePeriodElapsed("fcempty:"+id, now) {
-				continue
-			}
-			unlockOp, ok := r.mgr.tryLockVMOp(id)
-			if !ok {
-				continue
-			}
-			// Re-probe under the lock: a restore may have loaded a microVM
-			// into this process since the pass began.
-			empty, perr := fcProbeShell(ctx, filepath.Join(r.mgr.cfg.RunDir, id, "firecracker.sock"))
-			if perr != nil || !empty {
-				unlockOp()
-				if perr == nil {
-					r.clearDrift("fcempty:" + id)
-				}
-				continue
-			}
-			if !r.consumeAutoFailBudget(id) {
-				unlockOp()
-				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "fc_empty_shell")
-				continue
-			}
-			log.Warn().Str("vm_id", id).Str("drift", "fc_empty_shell").
-				Msg("unit active but Firecracker holds no microVM — stopping the shell and marking failed")
-			err := stopUnit(ctx, systemdUnitName(id))
+		if inBolt {
+			continue
+		}
+		r.mgr.mu.RLock()
+		_, hasInst := r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if hasInst {
+			continue
+		}
+		if !r.gracePeriodElapsed("cgrouporphan:"+id, now) {
+			continue
+		}
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue // a launch/op holds the lock; re-evaluate next tick
+		}
+		// Re-check under the lock: a launch may have persisted the record or
+		// published the instance since the snapshot at the top of the pass. A
+		// read error reads as recorded (fail-closed) — a transient Has failure
+		// must not classify a freshly recorded live VM as recordless and kill it.
+		if has, herr := r.mgr.state.Has(id); herr != nil || has {
 			unlockOp()
-			if err != nil {
-				// Leave the row untouched (a failed row behind a live
-				// unit would strand it). Refund the budget slot only when
-				// the stop provably never happened; an accepted-but-
-				// unconfirmed job may still terminate the unit, and
-				// refunding those would let slow stops evade the budget.
-				if errors.Is(err, errStopNotEnqueued) {
-					r.refundAutoFailSlot()
-					r.writeAudit(ctx, id, "stop_failed", "empty-shell stop not enqueued; slot refunded, retrying next pass", "fc_empty_shell")
-				} else {
-					r.writeAudit(ctx, id, "stop_failed", "empty-shell stop unconfirmed; slot retained, retrying next pass", "fc_empty_shell")
-				}
-				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop empty-shell unit")
-				continue
+			r.clearDrift("cgrouporphan:" + id)
+			continue
+		}
+		r.mgr.mu.RLock()
+		_, hasInst = r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if hasInst {
+			unlockOp()
+			continue
+		}
+		if !r.consumeAutoFailBudget(id) {
+			unlockOp()
+			r.writeAudit(ctx, id, "budget_exhausted", "recordless cgroup stop suppressed by rate limit", "cgroup_orphan_no_record")
+			continue
+		}
+		log.Warn().Str("vm_id", id).Str("drift", "cgroup_orphan_no_record").
+			Msg("recordless cgroup survivor — stopping")
+		// Recover the netns from the live process BEFORE the kill, or the
+		// slot/veth/ns leaks: an untracked VM has no device record, so
+		// CleanupVMOrNamespace can only reclaim it given the namespace name.
+		// A protected survivor whose process just exited has no pid to read —
+		// fall back to the mapping the startup reap preserved.
+		nsName := r.mgr.netMgr.NamespaceForPID(r.mgr.cgroups.firstPID(id))
+		if nsName == "" {
+			if v, ok := r.mgr.survivorNS.Load(id); ok {
+				nsName = v.(string)
 			}
-			// The stop is committed; the DB transition must not be lost to
-			// the pass deadline expiring mid-rule (a stranded active row
-			// behind a dead unit costs another grace+budget cycle via the
-			// dead-VM rule). Detach from the pass context, bounded.
-			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-			r.markFailedInDB(persistCtx, id)
-			r.markStale(id)
-			r.writeAudit(persistCtx, id, "mark_failed", "empty Firecracker shell while DB said active", "fc_empty_shell")
-			persistCancel()
+		}
+		if err := r.mgr.stopVM(ctx, id, SupervisionCgroup); err != nil {
+			// If only the rmdir failed, the emptied group drops out of the
+			// populated active-set next pass and this drift never revisits it —
+			// stranding the netns/slot AND leaving the empty dir to block
+			// drain-check until restart. Once death is confirmed (empty), reclaim
+			// the netns and retry the rmdir; a clean removal fully reclaims the
+			// survivor. Skip on an inconclusive read so a live FC keeps its tap.
+			if pop, perr := r.mgr.cgroups.vmCgroupPopulated(id); perr == nil && !pop {
+				r.mgr.netMgr.CleanupVMOrNamespace(id, nsName)
+				r.mgr.survivorNS.Delete(id)
+				if rerr := r.mgr.cgroups.removeVMCgroup(ctx, id); rerr == nil {
+					unlockOp()
+					r.writeAudit(ctx, id, "orphan_stop", "recordless cgroup survivor (rmdir retried)", "cgroup_orphan_no_record")
+					r.clearDrift("cgrouporphan:" + id)
+					continue
+				}
+			}
+			log.Error().Err(err).Str("vm_id", id).Msg("failed to stop recordless cgroup — leaving for retry")
+			unlockOp()
+			continue
+		}
+		r.mgr.netMgr.CleanupVMOrNamespace(id, nsName)
+		r.mgr.survivorNS.Delete(id)
+		unlockOp()
+		r.writeAudit(ctx, id, "orphan_stop", "recordless cgroup survivor", "cgroup_orphan_no_record")
+		r.clearDrift("cgrouporphan:" + id)
+	}
+
+	// Drift 0b: empty cgroup directory no record owns. A per-VM group whose FC
+	// has exited but that was never removed (a recordless survivor whose
+	// process left on its own, an rmdir that failed transiently, or a verify
+	// throwaway's leftover behind a unit-mode record) stays OUT of the
+	// populated active-set, so Drift 0 never revisits it — and it keeps
+	// counting against drain-check until a restart. Reap the leftover
+	// directory, after grace + op-lock, re-checking it is still empty and
+	// unowned so an in-flight launch's fresh group is never removed.
+	// Non-destructive (an empty group has no process to kill), so it doesn't
+	// consume the auto-fail budget.
+	cgroupOwnedByRecord := func(id string) bool {
+		if dbSandboxes == nil {
+			rec, ok := bolted[id]
+			return ok && cgroupSupervised(rec.Supervision)
+		}
+		if _, ok := boltedIDs[id]; !ok {
+			return false
+		}
+		rec, err := r.mgr.state.Get(id)
+		if err != nil {
+			return true // unreadable: conservative, treat as owned
+		}
+		return rec != nil && cgroupSupervised(rec.Supervision)
+	}
+	if r.mgr.cgroups != nil {
+		if cgDirs, cgErr := r.mgr.cgroups.scanVMCgroups(); cgErr == nil {
+			for _, id := range cgDirs {
+				if ctx.Err() != nil {
+					return
+				}
+				if active[id] {
+					continue // populated (Drift 0 handles it)
+				}
+				// Build cgroups are NOT skipped here: the build-VM exclusion
+				// belongs on the liveness drifts (don't kill an in-flight build),
+				// not on janitorial removal of an already-empty dir. An in-flight
+				// build is populated (caught below) or holds the op-lock; only an
+				// empty leftover is reaped, and rmdir is non-destructive.
+				//
+				// The dir is owned only if the record OR the tracked instance
+				// CLAIMS cgroup supervision. A unit-mode record/instance over an
+				// empty group (a verify throwaway's rmdir that failed on a paused
+				// legacy VM) is rubble no other rule reaps, yet it counts against
+				// drain-check forever — a live unit instance does NOT own it.
+				// Unreadable record reads as owned (conservative); the op-lock and
+				// the populated re-check below guard an in-flight cgroup launch.
+				if cgroupOwnedByRecord(id) || r.mgr.instanceClaimsCgroup(id) {
+					continue
+				}
+				if !r.gracePeriodElapsed("cgroupempty:"+id, now) {
+					continue
+				}
+				unlockOp, ok := r.mgr.tryLockVMOp(id)
+				if !ok {
+					continue // a launch/op holds the lock
+				}
+				// Re-check under the lock: an in-flight launch may have persisted
+				// a record, published an instance, or forked FC into the group.
+				if cgroupOwnedByRecord(id) || r.mgr.instanceClaimsCgroup(id) {
+					unlockOp()
+					r.clearDrift("cgroupempty:" + id)
+					continue
+				}
+				if pop, perr := r.mgr.cgroups.vmCgroupPopulated(id); perr != nil || pop {
+					unlockOp()
+					continue // became populated or unreadable — not ours to remove
+				}
+				if err := r.mgr.cgroups.removeVMCgroup(ctx, id); err != nil {
+					log.Warn().Err(err).Str("vm_id", id).Msg("failed to reap empty recordless cgroup — retrying next pass")
+					unlockOp()
+					continue
+				}
+				// A protected survivor's process is gone, so the mapping
+				// preserved at startup is the only route left to its reserved
+				// slot and veth; spend it or they stay held until restart.
+				if ns, ok := r.mgr.survivorNS.LoadAndDelete(id); ok {
+					r.mgr.netMgr.CleanupVMOrNamespace(id, ns.(string))
+				}
+				unlockOp()
+				r.writeAudit(ctx, id, "orphan_reap", "empty recordless cgroup directory", "cgroup_empty_no_record")
+				r.clearDrift("cgroupempty:" + id)
+			}
 		}
 	}
+
+	// Drift 1: DB says active, systemd/socket says dead.
+	r.reapDeadActiveVMs(ctx, log, dbSandboxes, active, errorRecord, now)
+
+	r.failEmptyShells(ctx, log, dbSandboxes, active, supervisionOf, now)
 
 	// Drift 2: BoltDB says running but VM is actually dead, and DB is
 	// unavailable (reconciler running in BoltDB-only mode). Fall back to
 	// the old behavior: just clean up the stale BoltDB entry.
 	if dbSandboxes == nil {
 		for id, rec := range bolted {
+			if ctx.Err() != nil {
+				return
+			}
 			if rec.Status != StatusRunning {
 				continue
 			}
 			if active[id] {
 				r.clearDrift(id)
+				continue
+			}
+			// Error records are Drift 8's (see Drift 1). errorRecord, not
+			// rec.Status: a parked Error whose durable write failed still
+			// reads Running here.
+			if errorRecord(id) {
 				continue
 			}
 			if !r.gracePeriodElapsed(id, now) {
@@ -432,10 +589,28 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// after the caller gave up).
 	if dbSandboxes != nil {
 		for id := range active {
+			if ctx.Err() != nil {
+				return
+			}
 			sb, known := dbSandboxes[id]
 			deleted := known && sb.Sandbox.Status == db.SandboxStatusDeleted
 			failed := known && sb.Sandbox.Status == db.SandboxStatusFailed
 			if known && !deleted && !failed {
+				continue
+			}
+			// A recordless cgroup id is Drift 0's: it recovers the netns from
+			// the live pid before killing, under the op lock — this branch's
+			// markStale would read no record and leak the slot, and both
+			// rules would spend auto-fail budget on the same VM.
+			if supervisionOf[id] == SupervisionCgroup {
+				if _, ok := boltedIDs[id]; !ok {
+					continue
+				}
+			}
+			// Error records are Drift 8's (see Drift 1): its halves gate
+			// every record release on the terminal unit state, which this
+			// branch's stop does not.
+			if errorRecord(id) {
 				continue
 			}
 			if !r.gracePeriodElapsed("orphan:"+id, now) {
@@ -455,14 +630,167 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				kind = "systemd_active_db_failed"
 			}
 			log.Warn().Str("vm_id", id).Str("drift", kind).Msg("orphan systemd unit — stopping")
-			if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
-				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit")
+			if err := r.mgr.stopVM(ctx, id, supervisionOf[id]); err != nil {
+				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan VM")
 				continue
 			}
 			removeUnitDropIn(id)
 			r.markStale(id)
 			r.writeAudit(ctx, id, "orphan_stop", reason, kind)
 			r.clearDrift("orphan:" + id)
+		}
+	}
+
+	// Drift 8: BoltDB record in Error but its systemd unit is still active.
+	// Reattach parks an unmanageable VM this way (unit alive, API socket
+	// gone, stop unconfirmed) so no request path adopts it; no other rule
+	// stops the unit, which otherwise burns CPU/RAM until a user-driven
+	// relaunch or destroy. Keyed on BoltDB + systemd only, so it runs in
+	// both DB modes.
+	for id := range active {
+		if ctx.Err() != nil {
+			return
+		}
+		if !errorRecord(id) {
+			r.clearDrift("errunit:" + id)
+			continue
+		}
+		if !r.gracePeriodElapsed("errunit:"+id, now) {
+			continue
+		}
+		// Drift 7's discipline: lock before spending budget, then recheck
+		// the AUTHORITATIVE in-memory record — a relaunch can complete
+		// mid-pass (flip the record to Running, own the unit name, release
+		// the lock), and stopping then would kill the fresh VM.
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue
+		}
+		if r.mgr.instanceRunning(id) {
+			unlockOp()
+			r.clearDrift("errunit:" + id)
+			continue
+		}
+		if !r.consumeAutoFailBudget(id) {
+			unlockOp()
+			r.writeAudit(ctx, id, "budget_exhausted", "error_unit_stop suppressed by rate limit", "boltdb_error_unit_active")
+			continue
+		}
+		log.Warn().Str("vm_id", id).Str("drift", "boltdb_error_unit_active").
+			Msg("error-status VM with live unit — stopping")
+		if err := r.stopVM(ctx, id, supervisionOf[id]); err != nil {
+			unlockOp()
+			log.Error().Err(err).Str("vm_id", id).Msg("failed to stop error-status VM")
+			continue
+		}
+		// A nil stop can still mean a deactivating unit (the expired-wait
+		// settle reports those complete); release needs the mode-aware
+		// terminal claim (vmFullyDown). Not yet down → the record stays for
+		// the dead half to retry once it is.
+		if !r.vmFullyDown(ctx, id, supervisionOf[id]) {
+			unlockOp()
+			continue
+		}
+		removeUnitDropIn(id)
+		staleErr := r.markStale(id)
+		unlockOp()
+		// Flip the DB row with the already-grace-qualified reap: Drift 1
+		// cleared its marker while the unit was active, so leaving the row
+		// Active would advertise a dead sandbox for another full grace.
+		// Compare-and-set: a relaunch queued on the lock (or a resume the
+		// control plane already started) owns the row now, not this pass's
+		// snapshot. Not gated on the release: the unit is proven down either
+		// way, and the flip frees no resource (same reasoning as the wedge
+		// branch below).
+		if dbSandboxes != nil {
+			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
+				r.markFailedInDB(ctx, id, db.SandboxStatusActive)
+			}
+		}
+		r.finalizeErrorReap(ctx, id, "errunit:"+id, "error_unit_stop",
+			"live unit for error-status record", "boltdb_error_unit_active", staleErr)
+	}
+
+	// The dead-unit half of Drift 8: an Error record whose unit is gone —
+	// parked by an error path that stopped the unit, or left when the reap
+	// above stopped the unit but the record deletion failed. No other rule
+	// owns it (Drifts 1/3 key on other unit states, Drift 2 on Running,
+	// Drift 5 on missing DB rows). Grace gives the control plane's own
+	// destroy first claim on the record.
+	reapDeadError := func(id string) {
+		if ctx.Err() != nil {
+			return
+		}
+		if active[id] {
+			r.clearDrift("errdead:" + id)
+			return
+		}
+		// The unit is gone, so the active half no longer visits this id —
+		// its grace marker retires here, or a recurrence would inherit the
+		// old timestamp and skip the grace period.
+		r.clearDrift("errunit:" + id)
+		if !errorRecord(id) {
+			r.clearDrift("errdead:" + id)
+			return
+		}
+		if !r.gracePeriodElapsed("errdead:"+id, now) {
+			return
+		}
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			return
+		}
+		if r.mgr.instanceRunning(id) {
+			unlockOp()
+			r.clearDrift("errdead:" + id)
+			return
+		}
+		// Absence from the active-only snapshot is not terminal — an
+		// activating or deactivating unit still has a process, and markStale
+		// releases the record and namespace. Probe before spending budget.
+		// cgroupStillLive mirrors DestroyVM's mode-agnostic gate: a cgroup
+		// VM's absence from the snapshot already implies an empty group (the
+		// scan fails the pass closed), but release deserves the local proof,
+		// not one derived from the scan, the gate, and the lock together.
+		if !unitFullyDown(ctx, systemdUnitName(id)) || r.mgr.cgroupStillLive(id) {
+			// The record and namespace stay held until terminal, but the row
+			// must not keep billing and routing through a long wedge — a
+			// parked VM serves nothing, and flipping the row frees no
+			// resource, so the terminal gate doesn't apply. Fires once per
+			// wedge: the next pass's snapshot reads 'failed'.
+			if dbSandboxes != nil {
+				if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive && r.consumeAutoFailBudget(id) {
+					if r.markFailedInDB(ctx, id, db.SandboxStatusActive) {
+						r.writeAudit(ctx, id, "mark_failed", "wedged error VM: row flipped while awaiting terminal unit", "boltdb_error_unit_wedged")
+					}
+				}
+			}
+			unlockOp()
+			return
+		}
+		if !r.consumeAutoFailBudget(id) {
+			unlockOp()
+			return
+		}
+		staleErr := r.markStale(id)
+		unlockOp()
+		// Drift 1 skips Error records, so the row flip lands here (still
+		// compare-and-set: a relaunch may own the row by now).
+		if dbSandboxes != nil {
+			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
+				r.markFailedInDB(ctx, id, db.SandboxStatusActive)
+			}
+		}
+		r.finalizeErrorReap(ctx, id, "errdead:"+id, "stale_cleanup",
+			"error record with no unit", "boltdb_error_unit_missing", staleErr)
+	}
+	if bolted != nil {
+		for id := range bolted {
+			reapDeadError(id)
+		}
+	} else {
+		for id := range boltedIDs {
+			reapDeadError(id)
 		}
 	}
 
@@ -473,6 +801,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	// persists — keying off records could kill a just-launched resume.
 	if dbSandboxes != nil {
 		for id := range active {
+			if ctx.Err() != nil {
+				return
+			}
 			sb, known := dbSandboxes[id]
 			if !known || sb.Sandbox.Status != db.SandboxStatusPaused {
 				r.clearDrift("pausedunit:" + id)
@@ -509,7 +840,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			}
 			log.Warn().Str("vm_id", id).Str("drift", "systemd_active_db_paused").
 				Msg("live unit for paused sandbox — stopping")
-			err := stopUnit(ctx, systemdUnitName(id))
+			err := r.mgr.stopVM(ctx, id, supervisionOf[id])
 			unlockOp()
 			if err != nil {
 				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop paused sandbox's unit")
@@ -522,99 +853,17 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		}
 	}
 
-	// Drift 7b: a crash-window orphan nobody came back for. A restore that
-	// died between its optimistic persist and the verified one leaves a
-	// Running-but-unverified record behind a live unit; the control plane
-	// reverts its row to paused, and Drift 7 then defers forever because the
-	// record says Running. Unverified is what makes that deference wrong:
-	// readiness was never proven, so Running is a claim, not evidence.
-	//
-	// Runs on UnverifiedOrphanGrace, not the default — see that field for why
-	// this rule must lose the race with adoption. The sandbox row and its
-	// snapshot are untouched: only the orphaned process and its slot go, so a
-	// later resume still restores cleanly.
-	if dbSandboxes != nil {
-		for id := range active {
-			sb, known := dbSandboxes[id]
-			if !known || sb.Sandbox.Status != db.SandboxStatusPaused || !r.mgr.instanceUnverifiedRunning(id) {
-				r.clearDrift("unverifiedorphan:" + id)
-				continue
-			}
-			if !r.graceElapsed("unverifiedorphan:"+id, now, r.cfg.UnverifiedOrphanGrace) {
-				continue
-			}
-			// Same discipline as Drift 7: lock before spending budget, then
-			// re-check under it — an adoption completing mid-pass clears the
-			// marker, and stopping then would kill a healed VM.
-			unlockOp, ok := r.mgr.tryLockVMOp(id)
-			if !ok {
-				continue
-			}
-			if !r.mgr.instanceUnverifiedRunning(id) {
-				unlockOp()
-				r.clearDrift("unverifiedorphan:" + id)
-				continue
-			}
-			if !r.consumeAutoFailBudget(id) {
-				unlockOp()
-				r.writeAudit(ctx, id, "budget_exhausted", "unverified_orphan_stop suppressed by rate limit", "unverified_orphan_abandoned")
-				continue
-			}
-			log.Warn().Str("vm_id", id).Str("drift", "unverified_orphan_abandoned").
-				Msg("abandoned crash-window VM — stopping")
-			err := stopUnit(ctx, systemdUnitName(id))
-			if err != nil {
-				unlockOp()
-				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop abandoned crash-window unit")
-				continue
-			}
-			removeUnitDropIn(id)
-			staleErr := r.markStale(id)
-			unlockOp()
-			if staleErr != nil {
-				// The unit is stopped but the record, its map entry and its slot
-				// survive, and no rule matches an inactive unit. Report the
-				// partial cleanup rather than an orphan_stop that did not happen.
-				r.writeAudit(ctx, id, "stale_cleanup_failed", "unit stopped but record not deleted", "unverified_orphan_abandoned")
-				continue
-			}
-			r.writeAudit(ctx, id, "orphan_stop", "crash-window VM never adopted", "unverified_orphan_abandoned")
-			r.clearDrift("unverifiedorphan:" + id)
-		}
+	r.reapUnverifiedOrphans(ctx, log, dbSandboxes, active, supervisionOf, now)
+
+	// Rollback drain: with direct spawn disarmed, paused cgroup records are
+	// demoted back to unit supervision so the fleet converges to a state an
+	// older binary can manage (see demotePausedCgroupRecords).
+	if r.mgr.cgroups != nil && !r.mgr.directSpawnArmed.Load() {
+		r.demotePausedCgroupRecords(ctx, log)
 	}
 
 	// Drift 4: DB says paused, snapshot file missing on disk → mark failed.
-	if dbSandboxes != nil {
-		for id, sb := range dbSandboxes {
-			if sb.Sandbox.Status != db.SandboxStatusPaused || !sb.Sandbox.SnapshotID.Valid {
-				continue
-			}
-			// snapshot_path is joined in by ListSandboxesByHost, so this
-			// is a cheap struct field read instead of a per-row DB call.
-			// Skip when the snapshot row has been deleted (rare race).
-			if sb.SnapshotPath == nil || *sb.SnapshotPath == "" {
-				continue
-			}
-			snapPath := *sb.SnapshotPath
-			if _, statErr := os.Stat(snapPath); statErr == nil {
-				r.clearDrift("paused:" + id)
-				continue
-			}
-			if !r.gracePeriodElapsed("paused:"+id, now) {
-				continue
-			}
-			if !r.consumeAutoFailBudget(id) {
-				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "paused_snapshot_missing")
-				continue
-			}
-			log.Warn().Str("vm_id", id).Str("snapshot_path", snapPath).
-				Str("drift", "paused_snapshot_missing").
-				Msg("paused sandbox snapshot file missing — marking failed")
-			r.markFailedInDB(ctx, id)
-			r.writeAudit(ctx, id, "mark_failed", "snapshot file missing", "paused_snapshot_missing")
-			r.clearDrift("paused:" + id)
-		}
-	}
+	r.failMissingSnapshots(ctx, log, dbSandboxes, now)
 
 	// Drift 5: BoltDB record exists but DB has no corresponding sandbox
 	// row (either never written or soft-deleted). Clean up the BoltDB
@@ -625,6 +874,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// Fetch the full record only for the few IDs that look orphaned,
 		// not for every bolted entry.
 		for id := range boltedIDs {
+			if ctx.Err() != nil {
+				return
+			}
 			if _, ok := dbSandboxes[id]; ok {
 				continue
 			}
@@ -634,6 +886,13 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			rec, getErr := r.mgr.state.Get(id)
 			if getErr != nil || rec == nil {
 				r.clearDrift("bolt-orphan:" + id)
+				continue
+			}
+			// Error records are Drift 8's (see Drift 1): its halves gate
+			// every record release on the terminal unit state, and a
+			// transitional unit — absent from the active snapshot — would
+			// reach the markStale below with its process still alive.
+			if errorRecord(id) {
 				continue
 			}
 			// Only stopping a live unit is destructive; charge the budget there.
@@ -646,8 +905,8 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				}
 				log.Warn().Str("vm_id", id).Str("drift", "boltdb_present_db_missing").
 					Msg("live orphan systemd unit with no DB row — stopping")
-				if err := stopUnit(ctx, systemdUnitName(id)); err != nil {
-					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan unit from BoltDB — leaving for retry")
+				if err := r.mgr.stopVM(ctx, id, supervisionOf[id]); err != nil {
+					log.Error().Err(err).Str("vm_id", id).Msg("failed to stop orphan VM from BoltDB — leaving for retry")
 					continue
 				}
 				removeUnitDropIn(id)
@@ -997,6 +1256,55 @@ func dirSize(ctx context.Context, paths []string) int64 {
 	return total
 }
 
+// legacyUnitWeight is a legacy firecracker@ unit's default CPU/IO weight;
+// the direct-spawn service carries it per live direct VM (see below).
+const legacyUnitWeight = 100
+
+// maxUnitWeight is cgroup v2's cpu.weight/io.weight ceiling. Capping here past
+// ~100 live direct VMs only under-weights direct VMs — the safe direction,
+// never starving legacy.
+const maxUnitWeight = 10000
+
+// adjustDirectSpawnWeight keeps the direct-spawn service's scheduling weight
+// proportional to the number of direct VMs that actually compete (populated
+// cgroups in the running set). At legacyUnitWeight per live VM, each direct
+// VM weighs exactly one legacy peer, so the two populations share the slice
+// fairly at ANY mix — the property a static weight cannot hold, since it is
+// correct only at one population size (and over-weights direct VMs, starving
+// legacy under contention, precisely when direct VMs are few — early
+// migration). Runs each pass; set-property only fires when the count changed.
+func (r *Reconciler) adjustDirectSpawnWeight(ctx context.Context, active map[string]bool, supervisionOf map[string]Supervision) {
+	if r.mgr.cgroups == nil {
+		return // not managing cgroup VMs — the service holds only the idle keeper
+	}
+	live := 0
+	for id := range active {
+		if supervisionOf[id] == SupervisionCgroup {
+			live++
+		}
+	}
+	weight := live * legacyUnitWeight
+	if weight < legacyUnitWeight {
+		weight = legacyUnitWeight // an empty population still weighs one idle peer
+	}
+	if weight > maxUnitWeight {
+		weight = maxUnitWeight
+	}
+	if weight == r.lastVmsWeight {
+		return
+	}
+	if err := setUnitWeight(ctx, vmsUnitName, weight); err != nil {
+		// Left unrecorded so the next pass retries; the boot-time unit file
+		// value holds until it succeeds.
+		r.mgr.log.Warn().Err(err).Int("weight", weight).Int("live_direct", live).
+			Msg("reconciler: failed to set direct-spawn service weight")
+		return
+	}
+	r.mgr.log.Info().Int("weight", weight).Int("live_direct", live).
+		Msg("reconciler: adjusted direct-spawn service scheduling weight")
+	r.lastVmsWeight = weight
+}
+
 // gracePeriodElapsed records the first-seen timestamp for a drifted ID and
 // returns true once the configured grace period has passed. Used to absorb
 // transient states (e.g. VMD just started a VM and systemd hasn't fully
@@ -1018,6 +1326,19 @@ func (r *Reconciler) graceElapsed(key string, now time.Time, window time.Duratio
 	return now.Sub(firstSeen) >= window
 }
 
+// statPauseArtifact classifies a pause artifact for the missing-snapshot rule:
+// present (healed, or a new generation at the same path), confirmedMissing
+// (the only verdict that may flip the row), or neither — EACCES, I/O errors
+// and a spent ctx say nothing about the file, and marking a sandbox failed on
+// a non-answer would fail healthy generations.
+var statPauseArtifact = func(path string) (present, confirmedMissing bool) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, false
+	}
+	return false, errors.Is(err, os.ErrNotExist)
+}
+
 // clearDrift removes a drift marker once the VM returns to a healthy state.
 func (r *Reconciler) clearDrift(key string) {
 	r.mu.Lock()
@@ -1030,24 +1351,39 @@ func (r *Reconciler) clearDrift(key string) {
 // can't consume the whole run's budget.
 const dbQueryTimeout = 5 * time.Second
 
-// markFailedInDB writes status=failed for the given sandbox ID. The
-// underlying MarkSandboxFailed query is a CTE that also closes any open
+// markFailedInDB writes status=failed for the given sandbox ID,
+// version-guarded on the pass-start observation: the row flips only if
+// untouched since (every lifecycle transition bumps updated_at), so a stale
+// snapshot cannot overwrite a concurrent relaunch's row — even one that is
+// 'active' again. The underlying query's CTE also closes any open
 // sandbox_active_interval row atomically, so a crash/timeout between the
 // two writes is unreachable. No-op if the DB is not configured.
-func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string) {
+// markFailedInDB flips a sandbox row to failed, reporting whether it moved.
+// A refusal means a resume took the row since the pass snapshot, so callers
+// must not audit the transition or clear their drift on it.
+// unitFullyDownProbe is Drift 1's terminal-unit oracle; a var for tests.
+var unitFullyDownProbe = unitFullyDown
+
+func (r *Reconciler) markFailedInDB(ctx context.Context, vmID string, observed db.SandboxStatus) bool {
 	if r.cfg.DB == nil {
-		return
+		return true
 	}
 	id, err := uuid.Parse(vmID)
 	if err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: invalid vm_id for DB mark-failed")
-		return
+		return false
 	}
 	qctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()
-	if err := r.cfg.DB.MarkSandboxFailed(qctx, id); err != nil {
+	flipped, err := r.cfg.DB.MarkSandboxFailed(qctx, db.MarkSandboxFailedParams{ID: id, ObservedStatus: observed})
+	if err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to mark sandbox failed in DB")
+		return false
 	}
+	if flipped == 0 {
+		r.mgr.log.Info().Str("vm_id", vmID).Msg("reconciler: sandbox no longer active; mark-failed skipped")
+	}
+	return flipped > 0
 }
 
 // writeAudit appends a row to the reconciler_log table. No-op if the DB
@@ -1136,6 +1472,22 @@ func (r *Reconciler) refundAutoFailSlot() {
 	}
 }
 
+// finalizeErrorReap records the outcome of a Drift 8 release. A failed delete
+// leaves the record, its instance and its network slot held, so the marker
+// survives rather than retiring on a cleanup that did not happen.
+//
+// That also keeps the dead-unit half's retry on the very next pass, its grace
+// already elapsed. The active half gets no such benefit: its marker is retired
+// when the unit leaves the active set, so its retry waits out one more grace.
+func (r *Reconciler) finalizeErrorReap(ctx context.Context, vmID, marker, action, reason, driftKind string, staleErr error) {
+	if staleErr != nil {
+		r.writeAudit(ctx, vmID, "stale_cleanup_failed", reason+"; record not deleted", driftKind)
+		return
+	}
+	r.writeAudit(ctx, vmID, action, reason, driftKind)
+	r.clearDrift(marker)
+}
+
 // markStale deletes the stale BoltDB entry and drops the VM from the
 // in-memory map. The VM is already gone in reality; this just cleans up
 // VMD's cache.
@@ -1148,8 +1500,26 @@ func (r *Reconciler) markStale(vmID string) error {
 	// Capture the namespace before deleting the record: a VM whose teardown
 	// didn't run (e.g. a vmd timeout mid-DELETE) would otherwise leak its slot.
 	var namespace string
+	var supervision Supervision
 	if rec, err := r.mgr.state.Get(vmID); err == nil && rec != nil {
 		namespace = rec.Namespace
+		supervision = rec.Supervision
+	}
+	// The release chokepoint refuses unknown modes: every reconciler rule
+	// proves death via the unit and cgroup oracles, and a mode this binary
+	// predates may supervise a live FC neither can see. Only a deliberate
+	// destroy may release such a record.
+	if !knownSupervision(supervision) {
+		r.mgr.log.Error().Str("vm_id", vmID).Str("supervision", string(supervision)).
+			Msg("reconciler: unknown supervision mode — refusing release")
+		return fmt.Errorf("unknown supervision mode %q for vm %s: refusing release", supervision, vmID)
+	}
+	// Remove a direct-spawned VM's cgroup dir too, or an emptied group lingers
+	// as an unbounded fleet-size artifact.
+	if cgroupSupervised(supervision) && r.mgr.cgroups != nil {
+		// markStale has no ctx; the rmdir must complete (a lingering empty group
+		// is an unbounded artifact), so give it a background context.
+		_ = r.mgr.cgroups.removeVMCgroup(context.Background(), vmID)
 	}
 
 	// Delete from BoltDB first. Deleting from the map before BoltDB would
@@ -1176,4 +1546,418 @@ func (r *Reconciler) markStale(vmID string) error {
 	r.mgr.log.Warn().Str("component", "reconciler").Str("vm_id", vmID).
 		Str("action", "mark_stale").Msg("reconciler: cleaned up stale VM record")
 	return nil
+}
+
+// reapDeadActiveVMs is Drift 1's body: DB says active, systemd says the unit
+// is gone. Extracted so the stale-Running regression stays testable — the
+// rule must reap on unit evidence even while the in-memory record still
+// claims Running.
+// failEmptyShells is Drift 1b, extracted for direct rule tests.
+func (r *Reconciler) failEmptyShells(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool, supervisionOf map[string]Supervision, now time.Time) {
+	// Drift 1b: the unit is active but the Firecracker inside is an empty
+	// shell holding no microVM (see fcReportsEmptyShell) — e.g. the unit
+	// was restarted outside vmd, which destroys the guest; the replacement
+	// only becomes a VM again through vmd's own restore path. A mid-launch
+	// VM is briefly "Not started" between unit start and boot; the grace
+	// period (drift must persist across passes) plus the op-lock check and
+	// a re-probe under the lock filter that window.
+	if dbSandboxes != nil {
+		// Probe candidates concurrently under a stage budget: a wedged API
+		// burns its full timeout, and sequential probing would let a few
+		// wedged sockets starve every rule after this one. Budget-cutoff
+		// probes yield errors (non-evidence) and re-examine next pass.
+		var candidates []string
+		for id, sb := range dbSandboxes {
+			if sb.Sandbox.Status != db.SandboxStatusActive || !active[id] {
+				r.clearDrift("fcempty:" + id)
+				continue
+			}
+			candidates = append(candidates, id)
+		}
+		probeCtx, probeCancel := context.WithTimeout(ctx, 6*time.Second)
+		type probeResult struct {
+			empty bool
+			err   error
+		}
+		probes := make(map[string]probeResult, len(candidates))
+		var probeMu sync.Mutex
+		var probeWG sync.WaitGroup
+		probeSem := make(chan struct{}, 16)
+		for _, id := range candidates {
+			probeWG.Add(1)
+			go func(id string) {
+				defer probeWG.Done()
+				probeSem <- struct{}{}
+				defer func() { <-probeSem }()
+				empty, perr := fcProbeShell(probeCtx, filepath.Join(r.mgr.cfg.RunDir, id, "firecracker.sock"))
+				probeMu.Lock()
+				probes[id] = probeResult{empty: empty, err: perr}
+				probeMu.Unlock()
+			}(id)
+		}
+		probeWG.Wait()
+		probeCancel()
+
+		for _, id := range candidates {
+			if ctx.Err() != nil {
+				return
+			}
+			res := probes[id]
+			if res.err != nil {
+				continue // no evidence either way; drift state untouched
+			}
+			if !res.empty {
+				r.clearDrift("fcempty:" + id)
+				continue
+			}
+			if !r.gracePeriodElapsed("fcempty:"+id, now) {
+				continue
+			}
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			// Re-probe under the lock: a restore may have loaded a microVM
+			// into this process since the pass began.
+			empty, perr := fcProbeShell(ctx, filepath.Join(r.mgr.cfg.RunDir, id, "firecracker.sock"))
+			if perr != nil || !empty {
+				unlockOp()
+				if perr == nil {
+					r.clearDrift("fcempty:" + id)
+				}
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
+				r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "fc_empty_shell")
+				continue
+			}
+			log.Warn().Str("vm_id", id).Str("drift", "fc_empty_shell").
+				Msg("unit active but Firecracker holds no microVM — stopping the shell and marking failed")
+			err := r.stopVM(ctx, id, supervisionOf[id])
+			if err != nil {
+				unlockOp()
+				// Leave the row untouched (a failed row behind a live
+				// unit would strand it). Refund the budget slot only when
+				// the stop provably never happened; an accepted-but-
+				// unconfirmed job may still terminate the unit, and
+				// refunding those would let slow stops evade the budget.
+				if errors.Is(err, errStopNotEnqueued) {
+					r.refundAutoFailSlot()
+					r.writeAudit(ctx, id, "stop_failed", "empty-shell stop not enqueued; slot refunded, retrying next pass", "fc_empty_shell")
+				} else {
+					r.writeAudit(ctx, id, "stop_failed", "empty-shell stop unconfirmed; slot retained, retrying next pass", "fc_empty_shell")
+				}
+				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop empty-shell VM")
+				continue
+			}
+			// The row flip and release need the mode-aware terminal proof
+			// (vmFullyDown); not yet down → retry next pass.
+			if !r.vmFullyDown(ctx, id, supervisionOf[id]) {
+				unlockOp()
+				r.writeAudit(ctx, id, "stop_failed", "empty-shell stop not terminal; retrying next pass", "fc_empty_shell")
+				continue
+			}
+			unlockOp()
+			// The stop is committed; the DB transition must not be lost to
+			// the pass deadline expiring mid-rule (a stranded active row
+			// behind a dead unit costs another grace+budget cycle via the
+			// dead-VM rule). Detach from the pass context, bounded.
+			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			flipped := r.markFailedInDB(persistCtx, id, db.SandboxStatusActive)
+			r.markStale(id)
+			if flipped {
+				r.writeAudit(persistCtx, id, "mark_failed", "empty Firecracker shell while DB said active", "fc_empty_shell")
+			}
+			persistCancel()
+		}
+	}
+}
+
+// reapUnverifiedOrphans is Drift 7b, extracted for direct rule tests.
+func (r *Reconciler) reapUnverifiedOrphans(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool, supervisionOf map[string]Supervision, now time.Time) {
+	// Drift 7b: a crash-window orphan nobody came back for. A restore that
+	// died between its optimistic persist and the verified one leaves a
+	// Running-but-unverified record behind a live unit; the control plane
+	// reverts its row to paused, and Drift 7 then defers forever because the
+	// record says Running. Unverified is what makes that deference wrong:
+	// readiness was never proven, so Running is a claim, not evidence.
+	//
+	// Runs on UnverifiedOrphanGrace, not the default — see that field for why
+	// this rule must lose the race with adoption. The sandbox row and its
+	// snapshot are untouched: only the orphaned process and its slot go, so a
+	// later resume still restores cleanly.
+	if dbSandboxes != nil {
+		for id := range active {
+			if ctx.Err() != nil {
+				return
+			}
+			sb, known := dbSandboxes[id]
+			if !known || sb.Sandbox.Status != db.SandboxStatusPaused || !r.mgr.instanceUnverifiedRunning(id) {
+				r.clearDrift("unverifiedorphan:" + id)
+				continue
+			}
+			if !r.graceElapsed("unverifiedorphan:"+id, now, r.cfg.UnverifiedOrphanGrace) {
+				continue
+			}
+			// Same discipline as Drift 7: lock before spending budget, then
+			// re-check under it — an adoption completing mid-pass clears the
+			// marker, and stopping then would kill a healed VM.
+			unlockOp, ok := r.mgr.tryLockVMOp(id)
+			if !ok {
+				continue
+			}
+			if !r.mgr.instanceUnverifiedRunning(id) {
+				unlockOp()
+				r.clearDrift("unverifiedorphan:" + id)
+				continue
+			}
+			if !r.consumeAutoFailBudget(id) {
+				unlockOp()
+				r.writeAudit(ctx, id, "budget_exhausted", "unverified_orphan_stop suppressed by rate limit", "unverified_orphan_abandoned")
+				continue
+			}
+			log.Warn().Str("vm_id", id).Str("drift", "unverified_orphan_abandoned").
+				Msg("abandoned crash-window VM — stopping")
+			err := r.stopVM(ctx, id, supervisionOf[id])
+			if err != nil {
+				unlockOp()
+				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop abandoned crash-window VM")
+				continue
+			}
+			// Release needs the mode-aware terminal proof (vmFullyDown);
+			// not yet down → retry next pass.
+			if !r.vmFullyDown(ctx, id, supervisionOf[id]) {
+				unlockOp()
+				continue
+			}
+			removeUnitDropIn(id)
+			staleErr := r.markStale(id)
+			unlockOp()
+			if staleErr != nil {
+				// The unit is stopped but the record, its map entry and its slot
+				// survive, and no rule matches an inactive unit. Report the
+				// partial cleanup rather than an orphan_stop that did not happen.
+				r.writeAudit(ctx, id, "stale_cleanup_failed", "unit stopped but record not deleted", "unverified_orphan_abandoned")
+				continue
+			}
+			r.writeAudit(ctx, id, "orphan_stop", "crash-window VM never adopted", "unverified_orphan_abandoned")
+			r.clearDrift("unverifiedorphan:" + id)
+		}
+	}
+}
+
+// demotePausedCgroupRecords is the rollback drain. A paused cgroup sandbox
+// has no live process, so its supervision value only matters at the next
+// launch — but a cgroup record always relaunches cgroup, and sandboxes never
+// expire, so with direct spawn disarmed the fleet would otherwise hold
+// cgroup records (and block the downgrade guard) forever. With the flag off,
+// rewrite paused records to unit supervision — under the vm-op lock, re-read,
+// and only with the group conclusively empty — and remove the leftover group
+// dir. Re-arming simply re-promotes on the next launch, so a transient
+// flag-off loses nothing. Non-destructive: no process is touched and no
+// auto-fail budget is spent.
+func (r *Reconciler) demotePausedCgroupRecords(ctx context.Context, log zerolog.Logger) {
+	recs, err := r.mgr.state.All()
+	if err != nil {
+		log.Error().Err(err).Msg("demotion scan: cannot read state store")
+		return
+	}
+	for _, rec := range recs {
+		if ctx.Err() != nil {
+			return
+		}
+		if rec.Status != StatusPaused || !cgroupSupervised(rec.Supervision) || rec.Unverified {
+			continue
+		}
+		id := rec.ID
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue // a resume/destroy is in flight; next pass
+		}
+		// Re-read under the lock: a resume may have relaunched (Running) or a
+		// destroy deleted the record since the scan.
+		cur, gerr := r.mgr.state.Get(id)
+		if gerr != nil || cur == nil || cur.Status != StatusPaused || !cgroupSupervised(cur.Supervision) || cur.Unverified {
+			unlockOp()
+			continue
+		}
+		// Only a conclusively empty group proves no process depends on the
+		// cgroup mode; unreadable or populated defers to the drift rules.
+		if !r.mgr.cgroupDefinitelyDead(id) {
+			unlockOp()
+			continue
+		}
+		// A tracked instance that is not paused vetoes the demotion.
+		r.mgr.mu.RLock()
+		inst := r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if inst != nil {
+			inst.mu.RLock()
+			stillPaused := inst.Status == StatusPaused
+			inst.mu.RUnlock()
+			if !stillPaused {
+				unlockOp()
+				continue
+			}
+		}
+		// Disk first, then memory, all under the vm-op lock. Reattach
+		// publishes instances lock-free, so one may appear between the read
+		// above and the write: the memory pass below catches an instance
+		// published before it, and reattach's own post-publish re-read of
+		// the durable mode catches one published after — between them every
+		// interleaving converges.
+		cur.Supervision = SupervisionUnit
+		if wrote, perr := r.mgr.state.PutIfPresent(*cur); perr != nil || !wrote {
+			unlockOp()
+			continue
+		}
+		r.mgr.mu.RLock()
+		inst = r.mgr.vms[id]
+		r.mgr.mu.RUnlock()
+		if inst != nil {
+			inst.mu.Lock()
+			if inst.Status == StatusPaused {
+				inst.Supervision = SupervisionUnit
+			}
+			inst.mu.Unlock()
+		}
+		// The empty group dir would otherwise linger and keep counting
+		// against the drain guard until restart.
+		_ = r.mgr.cgroups.removeVMCgroup(context.WithoutCancel(ctx), id)
+		unlockOp()
+		log.Info().Str("vm_id", id).Msg("demoted paused cgroup record to unit supervision for rollback drain")
+		r.writeAudit(ctx, id, "supervision_demoted", "paused cgroup record demoted for rollback drain", "cgroup_drain_demotion")
+	}
+}
+
+func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool, errorRecord func(string) bool, now time.Time) {
+	for id, sb := range dbSandboxes {
+		if ctx.Err() != nil {
+			return
+		}
+		if sb.Sandbox.Status != db.SandboxStatusActive {
+			continue
+		}
+		if active[id] {
+			r.clearDrift(id)
+			continue
+		}
+		// Error records are Drift 8's: its halves gate every record
+		// release on the terminal unit state, which this branch does not
+		// probe — a deactivating unit is absent from the active snapshot
+		// while its process may live on.
+		if errorRecord(id) {
+			continue
+		}
+		if !r.gracePeriodElapsed(id, now) {
+			continue
+		}
+		// Lock before spending budget, then re-probe the UNIT under it —
+		// never instanceRunning: nothing updates the in-memory record when
+		// firecracker dies out from under vmd, so a stale Running instance
+		// is the very state this rule cleans up. A resume that relaunched
+		// mid-pass owns a live unit again, which this probe sees; an
+		// inconclusive probe defers to the next pass.
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue
+		}
+		if !unitFullyDownProbe(ctx, systemdUnitName(id)) {
+			// Pass ctx, not a background budget: N wedged probes must
+			// exhaust the pass deadline, not stack past it — an expired
+			// ctx fails the probe and defers, which is the safe verdict.
+			unlockOp()
+			continue
+		}
+		if !r.consumeAutoFailBudget(id) {
+			unlockOp()
+			r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "db_active_systemd_missing")
+			continue
+		}
+		log.Warn().Str("vm_id", id).Str("drift", "db_active_systemd_missing").
+			Msg("DB says active but VM is dead — marking failed")
+		flipped := r.markFailed(ctx, id, db.SandboxStatusActive)
+		staleErr := r.markStale(id)
+		unlockOp()
+		if staleErr != nil {
+			// The row is failed but the record and slot are still held, and
+			// no rule rematches that shape (this one needs an active row).
+			// The release retry is record-keyed and lives outside this
+			// rule; until then the leak is bounded by the next reattach —
+			// but it must be recorded, not silent.
+			r.writeAudit(ctx, id, "stale_cleanup_failed", "row failed but record not deleted", "db_active_systemd_missing")
+		}
+		if !flipped {
+			continue
+		}
+		r.writeAudit(ctx, id, "mark_failed", "VM dead while DB said active", "db_active_systemd_missing")
+	}
+}
+
+// failMissingSnapshots is Drift 4's body: a paused row whose snapshot artifact
+// is provably gone. Extracted for the same reason as reapDeadActiveVMs — the
+// lock-window race (a new pause writing the artifact while this rule waits on
+// the lifecycle lock) is only testable with the pass data injectable.
+func (r *Reconciler) failMissingSnapshots(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, now time.Time) {
+	for id, sb := range dbSandboxes {
+		if ctx.Err() != nil {
+			return
+		}
+		if sb.Sandbox.Status != db.SandboxStatusPaused || !sb.Sandbox.SnapshotID.Valid {
+			continue
+		}
+		// snapshot_path is joined in by ListSandboxesByHost, so this
+		// is a cheap struct field read instead of a per-row DB call.
+		// Skip when the snapshot row has been deleted (rare race).
+		if sb.SnapshotPath == nil || *sb.SnapshotPath == "" {
+			continue
+		}
+		snapPath := *sb.SnapshotPath
+		if _, statErr := os.Stat(snapPath); statErr == nil {
+			r.clearDrift("paused:" + id)
+			continue
+		}
+		if !r.gracePeriodElapsed("paused:"+id, now) {
+			continue
+		}
+		// Re-stat under the lifecycle lock before spending budget: a
+		// resume + re-pause since the pass snapshot writes NEW artifacts
+		// at this same path before the row returns to paused, so the row
+		// alone cannot tell the generations apart — the file can. The
+		// lock excludes an in-flight transition.
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
+			continue
+		}
+		present, confirmedMissing := statPauseArtifact(snapPath)
+		if present {
+			unlockOp()
+			r.clearDrift("paused:" + id)
+			continue
+		}
+		if !confirmedMissing {
+			unlockOp()
+			continue
+		}
+		if !r.consumeAutoFailBudget(id) {
+			unlockOp()
+			r.writeAudit(ctx, id, "budget_exhausted", "mark_failed suppressed by rate limit", "paused_snapshot_missing")
+			continue
+		}
+		log.Warn().Str("vm_id", id).Str("snapshot_path", snapPath).
+			Str("drift", "paused_snapshot_missing").
+			Msg("paused sandbox snapshot file missing — marking failed")
+		// Paused is the state this rule matched on, so that is what the
+		// flip asserts. A row that resumed since the pass snapshot refuses
+		// it, and keeping the marker lets the next pass re-evaluate rather
+		// than retiring a transition that never happened.
+		flipped := r.markFailed(ctx, id, db.SandboxStatusPaused)
+		unlockOp()
+		if !flipped {
+			continue
+		}
+		r.writeAudit(ctx, id, "mark_failed", "snapshot file missing", "paused_snapshot_missing")
+		r.clearDrift("paused:" + id)
+	}
 }

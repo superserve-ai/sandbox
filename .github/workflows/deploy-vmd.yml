@@ -28,18 +28,26 @@ on:
       - 'proto/**'
       - 'internal/vm/**'
       - 'internal/backup/**'
+      - 'internal/telemetry/**'
       - 'internal/network/**'
       - 'internal/builder/**'
       - 'internal/db/**'
       - 'internal/secretsproxy/**'
       - 'deploy/superserve-vmd.service'
       - 'deploy/superserve-vmd.socket'
+      - 'deploy/superserve-vms.service'
+      - 'deploy/vmd-rollback-guard'
+      - 'deploy/superserve-vmd-rollback-guard.conf'
+      - 'deploy/superserve-vmd-start-generation.conf'
       - 'deploy/superserve-secretsproxy.service'
       - 'deploy/firecracker@.service'
       - 'deploy/firecracker-netns@.service'
       - 'deploy/sandboxes.slice'
       - 'deploy/needrestart-superserve.conf'
       - 'deploy/apt-no-auto-upgrades.conf'
+      - 'deploy/maintenance-watch.sh'
+      - 'deploy/superserve-maintenance-watch.service'
+      - 'deploy/superserve-maintenance-watch.timer'
       - 'scripts/fc-cleanup'
       # The workflow + its deploy script must self-trigger (as deploy-otel does),
       # or a new cell/step lands without ever running until an unrelated vmd
@@ -47,9 +55,60 @@ on:
       - '.github/workflows/deploy-vmd.yml'
       - '.github/workflows/scripts/deploy-vmd.py'
 
+# Serialize runs rather than canceling: deploy-vmd.py stops vmd, rewrites
+# /etc/sandbox/vmd.env, and restarts it non-atomically across several steps
+# per host. Two overlapping runs racing that sequence on the same host can
+# interleave (e.g. both pass the backup-journal migration's source-present
+# check before either finishes), and canceling a run mid-sequence would
+# leave a host stopped or on a half-written env file. A queued run always
+# starts from the finished state of the one before it.
+concurrency:
+  group: deploy-vmd
+  cancel-in-progress: false
+
 jobs:
+  # Failing CI must not reach production control-plane hosts. CI is a
+  # separate workflow, so `needs:` can't reach it directly — poll the
+  # same-SHA run instead, same pattern as Deploy API's wait-for-migrations.
+  wait-for-ci:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for same-SHA CI to succeed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "Manual dispatch — operator owns this decision; skipping gate."
+            exit 0
+          fi
+
+          # CI runs on every push to main (no path filter), so a run for this
+          # SHA always exists — poll until it's visible and completed. ~20 min
+          # budget (60 × 20s), then fail closed: a deploy built from code that
+          # hasn't passed CI is worse than a late deploy.
+          for i in $(seq 1 60); do
+            run=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${{ github.sha }}&event=push" \
+              --jq '.workflow_runs[0] | if . == null then "absent absent" else "\(.status) \(.conclusion // "pending")" end')
+            status=${run% *}; conclusion=${run#* }
+            echo "attempt $i: status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CI succeeded; proceeding."
+                exit 0
+              fi
+              echo "CI concluded '$conclusion' — refusing to deploy unvalidated code."
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "Timed out waiting for CI; refusing to deploy."
+          exit 1
+
   deploy-staging:
     runs-on: ubuntu-latest
+    needs: [wait-for-ci]
     environment: staging
     permissions:
       contents: read
@@ -94,9 +153,42 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          # Fleet defaults for paused-network reclaim live in deployment
+          # config, not the binary. Operators can override them per host in
+          # /etc/sandbox/vmd.env after deployment.
+          VMD_PAUSED_NETWORK_RECLAIM: "true"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_NETNS_THRESHOLD: "6000"
+          VMD_PAUSED_NETWORK_NETNS_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "0"
+          VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "150"
+          VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           # Staging validates the backup uploader first; the production
           # cells get their buckets after the staging soak.
           BACKUP_BUCKET: superserve-artifact-backup-staging-usc1
+          # Stage one of the backfill rollout: staging first, then use4,
+          # then usw2, each gated on coverage convergence verified via
+          # the backup_generation table. Removing this line disables the
+          # sweep on the next deploy.
+          BACKUP_BACKFILL: "1"
+          # Keeps the backup journal off the root disk — it's written
+          # continuously while backups drain and can stall the uploader
+          # if the (small) root disk fills. Staging is a smaller instance
+          # with no NVMe-backed local SSD (unlike use4/usw2), so this
+          # points at its attached persistent disk instead of /mnt/localssd.
+          BACKUP_JOURNAL_PATH: /mnt/sandbox-data/backup.db
+          # Staging validates parallel drain first; production stays on
+          # vmd's single-worker default until this soaks. Workers share
+          # one bandwidth cap, so this raises task throughput only.
+          BACKUP_UPLOAD_CONCURRENCY: "2"
+          # Enables vmd's backup metrics exporter (host-local collector);
+          # the backup alert policies read these series.
+          OTEL_ENVIRONMENT: staging
+          MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
           python3 .github/workflows/scripts/deploy-vmd.py
 
@@ -152,12 +244,35 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          # Fleet defaults for paused-network reclaim live in deployment
+          # config, not the binary. Operators can override them per host in
+          # /etc/sandbox/vmd.env after deployment.
+          VMD_PAUSED_NETWORK_RECLAIM: "true"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_NETNS_THRESHOLD: "6000"
+          VMD_PAUSED_NETWORK_NETNS_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "0"
+          VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "150"
+          VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           BACKUP_BUCKET: superserve-artifact-backup-use4
+          # Keeps the backup journal off the root disk — it's written
+          # continuously while backups drain and can stall the uploader
+          # if the (small) root disk fills.
+          BACKUP_JOURNAL_PATH: /mnt/localssd/backup.db
+          # Enables vmd's backup metrics exporter (host-local collector);
+          # the cell's backup alert policies, including backup-disabled,
+          # cannot fire without these series.
+          OTEL_ENVIRONMENT: production
           # use4 is the "use" cell's Supabase + control plane.
           CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_PROD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
           INTERNAL_API_TOKEN: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
+          MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
           # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
           # filter and fan out to every VMD_LABEL match. use4 is the permanent
@@ -190,6 +305,20 @@ jobs:
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          # Fleet defaults for paused-network reclaim live in deployment
+          # config, not the binary. Operators can override them per host in
+          # /etc/sandbox/vmd.env after deployment.
+          VMD_PAUSED_NETWORK_RECLAIM: "true"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_NETNS_THRESHOLD: "6000"
+          VMD_PAUSED_NETWORK_NETNS_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "0"
+          VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "150"
+          VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           # usw is its own cell — separate Supabase project + control plane
           # from the "use" cell above.
@@ -199,6 +328,23 @@ jobs:
           # Enables the pause-backup uploader for the cell (validated on
           # staging first; the bucket is create-only for hosts).
           BACKUP_BUCKET: superserve-artifact-backup-usw2
+          # Keeps the backup journal off the root disk — it's written
+          # continuously while backups drain and can stall the uploader
+          # if the (small) root disk fills.
+          BACKUP_JOURNAL_PATH: /mnt/localssd/backup.db
+          # Two drain workers to clear the cell's pause-backup backlog:
+          # arrivals outpace the single-worker default here. Workers
+          # share one bandwidth cap (task throughput rises, egress does
+          # not), and the incremental host cost is one extra hash/read
+          # stream on a 192-core metal host with a 12-drive array.
+          # Held at 2 until the sandboxes.slice weighting lands; raise
+          # further only after it. Rollback is removing this line.
+          BACKUP_UPLOAD_CONCURRENCY: "2"
+          # Enables vmd's backup metrics exporter (host-local collector);
+          # the cell's backup alert policies, including backup-disabled,
+          # cannot fire without these series.
+          OTEL_ENVIRONMENT: production
+          MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
           # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
           # filter and fan out to every VMD_LABEL match — which would push

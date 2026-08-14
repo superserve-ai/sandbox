@@ -110,7 +110,7 @@ WITH paused AS (
     AND sandbox.team_id = $2
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'active'
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at
 ),
 closed_interval AS (
   UPDATE sandbox_active_interval
@@ -126,7 +126,7 @@ closed_billing_compute AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.status, p.vcpu_count, p.memory_mib, p.host_id, p.ip_address, p.pid, p.snapshot_id, p.created_at, p.updated_at, p.destroyed_at, p.network_config, p.timeout_seconds, p.metadata, p.template_id, p.snapshot_path, p.mem_path, p.base_path, p.delta_path, p.disk_mib, p.auto_delete_seconds, p.auto_delete_at
+SELECT p.id, p.team_id, p.name, p.status, p.vcpu_count, p.memory_mib, p.host_id, p.ip_address, p.pid, p.snapshot_id, p.created_at, p.updated_at, p.destroyed_at, p.network_config, p.timeout_seconds, p.metadata, p.template_id, p.snapshot_path, p.mem_path, p.base_path, p.delta_path, p.disk_mib, p.auto_delete_seconds, p.auto_delete_at, p.failed_at
 FROM paused p
 LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id
 `
@@ -161,6 +161,7 @@ type BeginPauseRow struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	FailedAt          pgtype.Timestamptz `json:"failed_at"`
 }
 
 // Atomic ownership + state check + transition to 'pausing' AND close of any
@@ -201,6 +202,7 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (BeginPa
 		&i.DiskMib,
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
+		&i.FailedAt,
 	)
 	return i, err
 }
@@ -209,7 +211,7 @@ const beginResume = `-- name: BeginResume :one
 UPDATE sandbox
 SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at
 `
 
 type BeginResumeParams struct {
@@ -249,6 +251,7 @@ func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandb
 		&i.DiskMib,
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
+		&i.FailedAt,
 	)
 	return i, err
 }
@@ -381,7 +384,7 @@ paused AS (
   SET status = 'pausing', updated_at = now()
   FROM expired
   WHERE sandbox.id = expired.id
-  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
+  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id, sandbox.network_config
 ),
 closed_intervals AS (
   -- Same atomicity story as BeginPause: bundle the active-interval close
@@ -402,17 +405,18 @@ closed_billing_compute AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id
 `
 
 type ClaimExpiredSandboxesRow struct {
-	ID         uuid.UUID   `json:"id"`
-	TeamID     uuid.UUID   `json:"team_id"`
-	Name       string      `json:"name"`
-	SnapshotID pgtype.UUID `json:"snapshot_id"`
-	HostID     string      `json:"host_id"`
+	ID            uuid.UUID   `json:"id"`
+	TeamID        uuid.UUID   `json:"team_id"`
+	Name          string      `json:"name"`
+	SnapshotID    pgtype.UUID `json:"snapshot_id"`
+	HostID        string      `json:"host_id"`
+	NetworkConfig []byte      `json:"network_config"`
 }
 
 // Atomically claims active sandboxes past their timeout and marks them 'pausing'.
@@ -444,6 +448,7 @@ func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]Cla
 			&i.Name,
 			&i.SnapshotID,
 			&i.HostID,
+			&i.NetworkConfig,
 		); err != nil {
 			return nil, err
 		}
@@ -504,13 +509,13 @@ const createSandbox = `-- name: CreateSandbox :one
 WITH ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $19::text, 0 FROM ins
   RETURNING sandbox_id
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -561,6 +566,7 @@ type CreateSandboxRow struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	FailedAt          pgtype.Timestamptz `json:"failed_at"`
 }
 
 // ID is supplied by the caller (generated in Go via uuid.New()) rather
@@ -621,6 +627,7 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (C
 		&i.DiskMib,
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
+		&i.FailedAt,
 	)
 	return i, err
 }
@@ -635,13 +642,13 @@ WITH tpl AS (
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
   SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $21::text, 0 FROM ins
   RETURNING sandbox_id
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -694,6 +701,7 @@ type CreateSandboxFromTemplateRow struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	FailedAt          pgtype.Timestamptz `json:"failed_at"`
 }
 
 // CreateSandbox variant that holds FOR KEY SHARE on the template row
@@ -750,6 +758,7 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 		&i.DiskMib,
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
+		&i.FailedAt,
 	)
 	return i, err
 }
@@ -764,7 +773,7 @@ WITH tpl AS (
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
   SELECT $4, $2, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, tpl_id, $15, $16, $17, $18, disk_mib, $19 FROM tpl
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $20::text, 0 FROM ins
@@ -774,7 +783,7 @@ WITH tpl AS (
   SELECT ins.id, ($21::uuid[])[i], ($22::text[])[i], ($23::text[])[i]
   FROM ins, generate_subscripts($21::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
@@ -830,6 +839,7 @@ type CreateSandboxFromTemplateWithSecretsRow struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	FailedAt          pgtype.Timestamptz `json:"failed_at"`
 }
 
 // CreateSandboxFromTemplate plus secret bindings in one statement (see
@@ -888,6 +898,7 @@ func (q *Queries) CreateSandboxFromTemplateWithSecrets(ctx context.Context, arg 
 		&i.DiskMib,
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
+		&i.FailedAt,
 	)
 	return i, err
 }
@@ -896,7 +907,7 @@ const createSandboxWithSecrets = `-- name: CreateSandboxWithSecrets :one
 WITH ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $19::text, 0 FROM ins
@@ -906,7 +917,7 @@ WITH ins AS (
   SELECT ins.id, ($20::uuid[])[i], ($21::text[])[i], ($22::text[])[i]
   FROM ins, generate_subscripts($20::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -960,6 +971,7 @@ type CreateSandboxWithSecretsRow struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	FailedAt          pgtype.Timestamptz `json:"failed_at"`
 }
 
 // CreateSandbox plus its strict preview policy and secret bindings in ONE
@@ -1018,6 +1030,7 @@ func (q *Queries) CreateSandboxWithSecrets(ctx context.Context, arg CreateSandbo
 		&i.DiskMib,
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
+		&i.FailedAt,
 	)
 	return i, err
 }
@@ -1368,7 +1381,7 @@ func (q *Queries) GetPublishedPreviewPort(ctx context.Context, arg GetPublishedP
 }
 
 const getSandbox = `-- name: GetSandbox :one
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
@@ -1405,6 +1418,7 @@ func (q *Queries) GetSandbox(ctx context.Context, arg GetSandboxParams) (Sandbox
 		&i.DiskMib,
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
+		&i.FailedAt,
 	)
 	return i, err
 }
@@ -1495,7 +1509,7 @@ func (q *Queries) GetSandboxStatusForPreviewMutation(ctx context.Context, arg Ge
 }
 
 const getSandboxWithPreviewPolicy = `-- name: GetSandboxWithPreviewPolicy :one
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at,
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at,
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS access
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -1542,6 +1556,7 @@ func (q *Queries) GetSandboxWithPreviewPolicy(ctx context.Context, arg GetSandbo
 		&i.Sandbox.DiskMib,
 		&i.Sandbox.AutoDeleteSeconds,
 		&i.Sandbox.AutoDeleteAt,
+		&i.Sandbox.FailedAt,
 		&i.Access,
 	)
 	return i, err
@@ -1702,7 +1717,7 @@ func (q *Queries) ListSandboxPreviewPoliciesByTeam(ctx context.Context, teamID u
 }
 
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, snap.path AS snapshot_path
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, snap.path AS snapshot_path
 FROM sandbox s
 LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
 WHERE s.host_id = $1 AND s.destroyed_at IS NULL
@@ -1749,6 +1764,7 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 			&i.Sandbox.DiskMib,
 			&i.Sandbox.AutoDeleteSeconds,
 			&i.Sandbox.AutoDeleteAt,
+			&i.Sandbox.FailedAt,
 			&i.SnapshotPath,
 		); err != nil {
 			return nil, err
@@ -1762,7 +1778,7 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 }
 
 const listSandboxesByTeamPaged = `-- name: ListSandboxesByTeamPaged :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at FROM sandbox
 WHERE team_id = $1
   AND destroyed_at IS NULL
   AND metadata @> $2
@@ -1844,6 +1860,7 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 			&i.DiskMib,
 			&i.AutoDeleteSeconds,
 			&i.AutoDeleteAt,
+			&i.FailedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1875,7 +1892,7 @@ func (q *Queries) LockSandboxForPreviewMutation(ctx context.Context, arg LockSan
 	return id, err
 }
 
-const markSandboxFailed = `-- name: MarkSandboxFailed :exec
+const markSandboxFailed = `-- name: MarkSandboxFailed :one
 WITH failed AS (
   UPDATE sandbox
   -- auto_delete_at is cleared: the deadline is only meaningful in 'paused',
@@ -1883,6 +1900,7 @@ WITH failed AS (
   -- ever returned to 'paused' by a recovery path.
   SET status = 'failed', auto_delete_at = NULL, updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
+    AND sandbox.status = $2
   RETURNING id
 ),
 closed_active AS (
@@ -1891,21 +1909,44 @@ closed_active AS (
   WHERE sandbox_id IN (SELECT id FROM failed)
     AND ended_at IS NULL
   RETURNING sandbox_id
+),
+closed_billing AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
+  WHERE sandbox_id IN (SELECT id FROM failed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
 )
-UPDATE sandbox_compute_billing_interval
-SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
-WHERE sandbox_id IN (SELECT id FROM failed)
-  AND ended_at IS NULL
+SELECT count(*) FROM failed
 `
+
+type MarkSandboxFailedParams struct {
+	ID             uuid.UUID     `json:"id"`
+	ObservedStatus SandboxStatus `json:"observed_status"`
+}
 
 // Used by the reconciler to mark a sandbox failed when VMD detects it is
 // actually gone. No team_id filter — the reconciler runs with host scope,
-// not team scope. The CTE bundles the active-interval close into the same
-// statement so a crash/timeout between the two writes can't leave the
-// interval open and have analytics count the actor as active forever.
-func (q *Queries) MarkSandboxFailed(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, markSandboxFailed, id)
-	return err
+// not team scope. Guarded on the lifecycle state the caller observed, not on
+// updated_at: that column moves for metadata and network-config edits too, so
+// a version compare would silently refuse the flip for a sandbox that is just
+// as dead. Callers pass the status their rule matched on — 'active' for a dead
+// VM, 'paused' for an unusable snapshot — so a row that has moved on since the
+// pass snapshot is left alone.
+// The CTEs bundle the interval closes into the same statement so a
+// crash/timeout between the writes can't leave an interval open and have
+// analytics count the actor as active forever.
+//
+// Counts the sandbox CTE, not the last statement: the billing interval is
+// only opened for teams with billing_metrics_write, so its row count reads 0
+// for a flip that did happen. Postgres runs every data-modifying CTE exactly
+// once whether or not the primary query reads its output, so selecting from
+// `failed` still performs both closes.
+func (q *Queries) MarkSandboxFailed(ctx context.Context, arg MarkSandboxFailedParams) (int64, error) {
+	row := q.db.QueryRow(ctx, markSandboxFailed, arg.ID, arg.ObservedStatus)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const markSandboxFailedInTeam = `-- name: MarkSandboxFailedInTeam :exec
@@ -2102,7 +2143,7 @@ func (q *Queries) UpdateSandboxAutoDelete(ctx context.Context, arg UpdateSandbox
 
 const updateSandboxHost = `-- name: UpdateSandboxHost :exec
 UPDATE sandbox
-SET host_id = $2, ip_address = $3, pid = $4, updated_at = now()
+SET host_id = $2, ip_address = $3, pid = COALESCE($4, pid), updated_at = now()
 WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL
 `
 

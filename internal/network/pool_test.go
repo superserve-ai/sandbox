@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,9 +44,11 @@ func newTestPool(t *testing.T, m *Manager) *Pool {
 		fresh:              make(chan *preallocSlot, 4),
 		recycled:           make(chan *preallocSlot, 4),
 		stopCh:             make(chan struct{}),
+		refillDrainGate:    make(chan struct{}),
 		verifyPollInterval: time.Millisecond,
 		verifyMaxWait:      50 * time.Millisecond,
 		resetSem:           make(chan struct{}, resetTapConcurrency),
+		adoptEscapeStreak:  defaultAdoptEscapeStreak,
 	}
 	t.Cleanup(func() {
 		select {
@@ -554,6 +559,54 @@ func TestPoolStop_LegacyTearsDownParkedVerify(t *testing.T) {
 	}
 }
 
+// A refill worker that was already blocked on a full pool must observe a
+// drain and drop the built slot instead of replacing the one the controller
+// just removed.
+func TestPoolDrainRejectsBlockedRefillSend(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+
+	for i := 0; i < cap(p.fresh); i++ {
+		p.fresh <- &preallocSlot{}
+	}
+
+	dropped := make(chan struct{})
+	errCh := make(chan string, 1)
+	started := make(chan struct{})
+	go func() {
+		slot := &preallocSlot{}
+		close(started)
+		select {
+		case p.fresh <- slot:
+			errCh <- "blocked refill send should not succeed once drain starts"
+		case <-p.refillDrainCh():
+			close(dropped)
+		case <-p.stopCh:
+		}
+	}()
+	<-started
+	time.Sleep(25 * time.Millisecond)
+
+	if drained := p.drain(1); drained != 1 {
+		t.Fatalf("drain = %d, want 1", drained)
+	}
+
+	select {
+	case <-dropped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked refill send did not observe drain")
+	}
+	select {
+	case msg := <-errCh:
+		t.Fatal(msg)
+	default:
+	}
+	if got := len(p.fresh); got != 3 {
+		t.Fatalf("fresh pool depth = %d, want 3 after draining one slot", got)
+	}
+}
+
 func TestAdoptOrphanSlots_ValidSlotBecomesClaimable(t *testing.T) {
 	dir := withTestNetnsDir(t)
 	touchNS(t, dir, "ns-7")
@@ -638,8 +691,8 @@ func TestClaimOrphanSlots_SkipsOwnedAndBumpsHighWater(t *testing.T) {
 
 func TestClaimOrphanSlots_RejectsOutOfRangeIndex(t *testing.T) {
 	dir := withTestNetnsDir(t)
-	touchNS(t, dir, "ns-99999999") // beyond MaxSlots: must never enter the allocator
-	touchNS(t, dir, "ns-0")        // below it: the allocator starts at 1
+	touchNS(t, dir, "ns-99999999")               // beyond MaxSlots: must never enter the allocator
+	touchNS(t, dir, "ns-0")                      // below it: the allocator starts at 1
 	touchNS(t, dir, "ns-9999999999999999999999") // overflows the parse negative
 	touchNS(t, dir, "ns-2")
 	m := newTestManager()
@@ -805,5 +858,315 @@ func TestAdoptOrphanSlots_SystemicTimeoutsAbortPass(t *testing.T) {
 	m.mu.Unlock()
 	if stranded != 0 {
 		t.Fatalf("aborted pass must release every claimed index, %d stranded", stranded)
+	}
+}
+
+// TestClaimWait_ConsumesProducedSlot pins the deploy-window contract: a
+// claimant that finds the pool momentarily empty while producers are running
+// waits and consumes their next slot instead of falling back to an inline
+// build — the fallback commitment is what turned restart windows into
+// tens-of-seconds creates.
+func TestClaimWait_ConsumesProducedSlot(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+
+	p.adoptPhase.Store(adoptPhaseScanning) // producers active, nothing delivered yet
+	touchNS(t, dir, "ns-1")
+	m.assignSlotLocked(1, poolOwner)
+	go func() {
+		time.Sleep(60 * time.Millisecond) // slot lands mid-wait
+		p.fresh <- &preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1", HostIP: "10.11.0.1"}, vethName: "veth-1"}
+		p.signalProgress()
+	}()
+
+	tStart := time.Now()
+	got := p.ClaimWait(context.Background(), "vm-x")
+	if got == nil {
+		t.Fatal("ClaimWait returned nil while a producer was delivering")
+	}
+	if got.Namespace != "ns-1" {
+		t.Fatalf("claimed %q, want ns-1", got.Namespace)
+	}
+	if waited := time.Since(tStart); waited > time.Second {
+		t.Fatalf("took %v, want roughly the producer's 60ms delivery", waited)
+	}
+}
+
+// TestClaimWait_NoDeclaredProducersReturnsImmediately pins the no-regression
+// contract: when no producer has declared itself active — refill workers all
+// idle or backing off, no adoption pass — ClaimWait must not burn its budget.
+// The pool being below target is NOT evidence of production; only a declared
+// worker is.
+func TestClaimWait_NoDeclaredProducersReturnsImmediately(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m) // empty, below target, but zero declared producers
+
+	tStart := time.Now()
+	if got := p.ClaimWait(context.Background(), "vm-x"); got != nil {
+		t.Fatalf("expected nil from a pool with no active producers, got %+v", got)
+	}
+	if waited := time.Since(tStart); waited > 500*time.Millisecond {
+		t.Fatalf("producerless pool held the claimant %v; must return without waiting", waited)
+	}
+}
+
+// TestClaimWait_SlowProducerStillWins pins the fix for the false-stall
+// regression: a single healthy build that takes longer than any polling
+// heuristic (here 900ms) must still be consumed by the waiting claimant,
+// because the worker's declared active state — not elapsed silence — is what
+// claimants trust.
+func TestClaimWait_SlowProducerStillWins(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+
+	p.refillActive.Add(1) // one worker declared mid-build
+	touchNS(t, dir, "ns-2")
+	m.assignSlotLocked(2, poolOwner)
+	go func() {
+		time.Sleep(900 * time.Millisecond) // slow but healthy build
+		p.fresh <- &preallocSlot{idx: 2, info: &VMNetInfo{Namespace: "ns-2", HostIP: "10.11.0.2"}, vethName: "veth-2"}
+		p.refillActive.Add(-1)
+		p.signalProgress()
+	}()
+
+	got := p.ClaimWait(context.Background(), "vm-x")
+	if got == nil {
+		t.Fatal("ClaimWait gave up on a declared, delivering producer")
+	}
+	if got.Namespace != "ns-2" {
+		t.Fatalf("claimed %q, want ns-2", got.Namespace)
+	}
+}
+
+// TestClaimWait_FinalClaimBeatsDeactivationRace pins the handoff edge: a slot
+// present in the pool must be won even when every producer reads inactive —
+// a producer can publish immediately before clearing its active state, and
+// the final Claim is what keeps that slot from being orphaned to an inline
+// build.
+func TestClaimWait_FinalClaimBeatsDeactivationRace(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+
+	touchNS(t, dir, "ns-3")
+	m.assignSlotLocked(3, poolOwner)
+	p.fresh <- &preallocSlot{idx: 3, info: &VMNetInfo{Namespace: "ns-3", HostIP: "10.11.0.3"}, vethName: "veth-3"}
+
+	if got := p.ClaimWait(context.Background(), "vm-x"); got == nil || got.Namespace != "ns-3" {
+		t.Fatalf("delivered slot must be claimed even with all producers inactive, got %+v", got)
+	}
+}
+
+// TestClaimWait_BurstConsumesExactlyWhatProducersDeliver pins the storm
+// contract this path exists for: a burst of claimants against a producing
+// pool must drain the producers' output exactly — every delivered slot
+// claimed by exactly one claimant, every unlucky claimant falling back once
+// production ends — with no slot lost and no double-claim.
+func TestClaimWait_BurstConsumesExactlyWhatProducersDeliver(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.fresh = make(chan *preallocSlot, 32)  // room for the whole delivery
+	p.adoptPhase.Store(adoptPhaseVerifying) // boot-shaped: adoption producing
+
+	const claimants, delivered = 20, 10
+	for i := 1; i <= delivered; i++ {
+		touchNS(t, dir, fmt.Sprintf("ns-%d", i))
+		m.assignSlotLocked(i, poolOwner)
+	}
+	go func() {
+		for i := 1; i <= delivered; i++ {
+			time.Sleep(15 * time.Millisecond) // trickle in mid-wait
+			p.fresh <- &preallocSlot{idx: i, info: &VMNetInfo{Namespace: fmt.Sprintf("ns-%d", i)}, vethName: fmt.Sprintf("veth-%d", i)}
+			p.signalProgress()
+		}
+		p.adoptPhase.Store(adoptPhaseIdle) // pass over — losers must stop waiting
+		p.signalProgress()
+	}()
+
+	results := make(chan *VMNetInfo, claimants)
+	for i := 0; i < claimants; i++ {
+		go func(n int) {
+			results <- p.ClaimWait(context.Background(), fmt.Sprintf("vm-%d", n))
+		}(i)
+	}
+
+	won := map[string]bool{}
+	var lost int
+	for i := 0; i < claimants; i++ {
+		if info := <-results; info == nil {
+			lost++
+		} else if won[info.Namespace] {
+			t.Fatalf("namespace %s claimed twice", info.Namespace)
+		} else {
+			won[info.Namespace] = true
+		}
+	}
+	if len(won) != delivered || lost != claimants-delivered {
+		t.Fatalf("won=%d lost=%d, want %d/%d", len(won), lost, delivered, claimants-delivered)
+	}
+}
+
+// TestClaimWait_BudgetFollowsTrust pins the escape contract: a claimant that
+// began waiting on a trusted adoption pass must be released promptly — not
+// after the full adoption budget — when the pass trips its no-yield escape
+// mid-wait.
+func TestClaimWait_BudgetFollowsTrust(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.adoptEscapeStreak = 1
+	p.adoptPhase.Store(adoptPhaseVerifying) // trusted at wait start
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		p.adoptYieldedNothing() // trips the escape at streak 1
+	}()
+
+	tStart := time.Now()
+	got := p.ClaimWait(context.Background(), "vm-x")
+	waited := time.Since(tStart)
+	if got != nil {
+		t.Fatalf("expected nil from an escaping pass, got %+v", got)
+	}
+	if waited >= poolClaimWaitBudget {
+		t.Fatalf("claimant held %v after trust was lost; must release well before the %v normal budget",
+			waited, poolClaimWaitBudget)
+	}
+}
+
+// TestAdoptTrust_EscapeIsReversible pins the trust state machine: the streak
+// trips the escape at the configured limit, any delivery resets both streak
+// and escape, and a fresh streak can trip it again.
+func TestAdoptTrust_EscapeIsReversible(t *testing.T) {
+	withTestNetnsDir(t)
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.adoptEscapeStreak = 3
+	p.adoptPhase.Store(adoptPhaseVerifying)
+
+	for i := 0; i < 2; i++ {
+		p.adoptYieldedNothing()
+	}
+	if !p.adoptionTrusted() {
+		t.Fatal("trust lost before the streak limit")
+	}
+	p.adoptYieldedNothing()
+	if p.adoptionTrusted() {
+		t.Fatal("streak limit reached but trust not suspended")
+	}
+	p.adoptDelivered()
+	if !p.adoptionTrusted() {
+		t.Fatal("delivery must restore trust")
+	}
+	if p.adoptStreak.Load() != 0 {
+		t.Fatalf("delivery must reset the streak, got %d", p.adoptStreak.Load())
+	}
+}
+
+// TestStartAdoption_PhaseVisibleBeforeReturn pins the startup-race fix: the
+// pass must be observable as underway the moment StartAdoption returns —
+// before its goroutine is ever scheduled — and a duplicate start must not
+// spawn a second pass.
+func TestStartAdoption_PhaseVisibleBeforeReturn(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-5")
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.abandonOnStop = true
+
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(*Manager, context.Context, string) error { return nil })
+	var passes atomic.Int64
+	stubAdoptSlot(t, func(_ *Manager, _ context.Context, idx int) (*VMNetInfo, string, error) {
+		passes.Add(1)
+		time.Sleep(100 * time.Millisecond) // hold the pass open for the assertions
+		return &VMNetInfo{Namespace: nsNameForSlot(idx), HostIP: hostIPForSlot(idx)}, vethNameForSlot(idx), nil
+	})
+
+	if !p.StartAdoption(context.Background()) {
+		t.Fatal("first StartAdoption must begin a pass")
+	}
+	if p.adoptPhase.Load() == adoptPhaseIdle {
+		t.Fatal("pass must be visible before StartAdoption returns")
+	}
+	if p.StartAdoption(context.Background()) {
+		t.Fatal("duplicate StartAdoption must no-op")
+	}
+
+	// Wait on the goroutine, not the phase: idle is set before the final veth
+	// sweep, so a phase poll can release the test while the pass still runs.
+	p.wg.Wait()
+	if p.adoptPhase.Load() != adoptPhaseIdle {
+		t.Fatal("pass never returned to idle")
+	}
+	if got := passes.Load(); got != 1 {
+		t.Fatalf("adopted %d times, want exactly 1 candidate processed by exactly 1 pass", got)
+	}
+}
+
+// BenchmarkClaimWaitBurst measures the broadcast-wakeup storm the design
+// accepts: every delivered slot wakes every waiter. One iteration is a full
+// burst — all claimants are parked in the wait loop BEFORE the timer starts
+// (untimed settle sleep), and the fresh channel has capacity one so each
+// delivery must be consumed before the next lands. Losers therefore really
+// sleep and really wake per delivery; ns/op and allocs/op quantify exactly
+// the churn a wake-one design would remove.
+func BenchmarkClaimWaitBurst(b *testing.B) {
+	const claimants, delivered = 200, 100
+
+	oldNs, oldHost := netnsDir, hostNetDir
+	defer func() { netnsDir, hostNetDir = oldNs, oldHost }()
+
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		netnsDir, hostNetDir = b.TempDir(), b.TempDir()
+		m := newTestManager()
+		p := &Pool{
+			mgr:               m,
+			log:               zerolog.Nop(),
+			newSize:           delivered,
+			fresh:             make(chan *preallocSlot, 1), // forces paced, per-delivery consumption
+			recycled:          make(chan *preallocSlot, 1),
+			stopCh:            make(chan struct{}),
+			refillDrainGate:   make(chan struct{}),
+			resetSem:          make(chan struct{}, resetTapConcurrency),
+			adoptEscapeStreak: defaultAdoptEscapeStreak,
+		}
+		p.adoptPhase.Store(adoptPhaseVerifying)
+		for j := 1; j <= delivered; j++ {
+			f, err := os.Create(filepath.Join(netnsDir, fmt.Sprintf("ns-%d", j)))
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = f.Close()
+			m.assignSlotLocked(j, poolOwner)
+		}
+
+		var wg sync.WaitGroup
+		for c := 0; c < claimants; c++ {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				p.ClaimWait(context.Background(), fmt.Sprintf("vm-%d", n))
+			}(c)
+		}
+		// Untimed settle: every claimant finds the pool empty and parks in
+		// the wait select before the first delivery is timed.
+		time.Sleep(50 * time.Millisecond)
+		b.StartTimer()
+
+		for j := 1; j <= delivered; j++ {
+			p.fresh <- &preallocSlot{idx: j, info: &VMNetInfo{Namespace: fmt.Sprintf("ns-%d", j)}, vethName: fmt.Sprintf("veth-%d", j)}
+			p.signalProgress()
+		}
+		p.adoptPhase.Store(adoptPhaseIdle)
+		p.signalProgress()
+		wg.Wait()
+		b.StopTimer()
+		close(p.stopCh)
 	}
 }

@@ -3,6 +3,9 @@ package vm
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
+	"path/filepath"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -21,6 +24,11 @@ var (
 	// completed: the async retry goroutine is not a durable record, and a
 	// crash or deploy during its window must not lose the pause's coverage.
 	pendingBackupBucketName = []byte("pending_backups")
+	// backfillMarkBucketName is the backup backfill ledger: vm ID → the
+	// snapshot stat identity whose coverage a backfill pass already minted.
+	// Without it every pass would re-hash the whole paused fleet to learn
+	// that nothing changed, since generation keys only exist after hashing.
+	backfillMarkBucketName = []byte("backup_backfill_marks")
 )
 
 // persistedPreviewPolicy is stored separately from VMRecord so a rollback to
@@ -145,12 +153,18 @@ type VMRecord struct {
 	// success), a pause clears it (a snapshotted guest was provably live),
 	// and a resume relaunch verifies readiness synchronously before
 	// clearing it.
-	Unverified   bool   `json:"unverified,omitempty"`
-	RunDirID     string `json:"rundir_id"`
-	Namespace    string `json:"namespace"`
-	DiskPath     string `json:"disk_path"`
-	SnapshotPath string `json:"snapshot_path,omitempty"`
-	MemFilePath  string `json:"mem_file_path,omitempty"`
+	Unverified bool `json:"unverified,omitempty"`
+	// TeardownPending mirrors VMInstance.TeardownPending: a non-empty value
+	// is an explicit, durable claim that this record's resources were
+	// deliberately retained after a failed op and the reconciler owns the
+	// residual teardown. Omitted when empty so rollback binaries read
+	// records unchanged.
+	TeardownPending string `json:"teardown_pending,omitempty"`
+	RunDirID        string `json:"rundir_id"`
+	Namespace       string `json:"namespace"`
+	DiskPath        string `json:"disk_path"`
+	SnapshotPath    string `json:"snapshot_path,omitempty"`
+	MemFilePath     string `json:"mem_file_path,omitempty"`
 	// Persisted so a layered (diff-overlay) sandbox resumes correctly after a vmd
 	// restart: non-empty means MemFilePath is an overlay to be served over this
 	// base. Without it, resume would load the overlay standalone and read the
@@ -169,6 +183,16 @@ type VMRecord struct {
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
+	// PausedAt marks when a sandbox last entered the paused state. Zero on
+	// records written before the field existed; callers needing an ordering
+	// key fall back to CreatedAt.
+	PausedAt time.Time `json:"paused_at,omitempty"`
+	// Supervision dispatches liveness/stop/reattach for this VM's current
+	// run. Empty (SupervisionUnit) is canonical for systemd-unit VMs so
+	// records written by this binary stay readable-and-correct under a
+	// rollback binary that predates the field; never write a non-empty
+	// value for unit mode.
+	Supervision Supervision `json:"supervision,omitempty"`
 	// Preview publication policy must survive vmd restarts; old records decode
 	// to empty/legacy behavior for backward compatibility.
 	PreviewAccess            string           `json:"preview_access,omitempty"`
@@ -181,10 +205,78 @@ type VMRecord struct {
 	PreviewTokenPolicyRevision int64 `json:"preview_token_policy_revision,omitempty"`
 }
 
+// Supervision is how a VM's current Firecracker run is supervised. A named
+// type (like VMStatus) so the liveness/stop/reattach/reconcile paths switch on
+// a checked value, not a bare string a typo could silently break.
+type Supervision string
+
+// Supervision values for VMInstance/VMRecord.
+const (
+	// SupervisionUnit: the VM runs as firecracker@<id>.service. Canonically
+	// the empty string — legacy records predate the field.
+	SupervisionUnit Supervision = ""
+	// SupervisionCgroup: the VM was direct-spawned into a per-VM cgroup
+	// under vmd's delegated subtree; no systemd unit exists for it.
+	SupervisionCgroup Supervision = "cgroup"
+)
+
+// String renders the mode for logs — the empty canonical value reads as "unit"
+// rather than blank.
+func (s Supervision) String() string {
+	if s == SupervisionUnit {
+		return "unit"
+	}
+	return string(s)
+}
+
+// knownSupervision reports whether s is a mode this binary can dispatch.
+// Anything else (store corruption, or a record written by a NEWER binary
+// with a mode this one predates) is unmanageable: dispatchers must refuse
+// or read inconclusive, never fall through to the unit path — its vacuous
+// probes would release a live non-unit FC's record and network.
+func knownSupervision(s Supervision) bool {
+	return s == SupervisionUnit || s == SupervisionCgroup
+}
+
+// cgroupSupervised reports whether a supervision value means the VM has no
+// systemd unit and lives in a per-VM cgroup.
+func cgroupSupervised(s Supervision) bool { return s == SupervisionCgroup }
+
+// StateBreadcrumbPath is the fixed, non-configurable location where vmd
+// records its RESOLVED state-store path. The host-resident rollback guard
+// reads it instead of re-deriving the path from env files, so the two can
+// never disagree about grammar; ArmDirectSpawn requires the write before
+// arming OR managing cgroup records, so "cgroup records exist without a
+// current breadcrumb" is unrepresentable.
+const StateBreadcrumbPath = "/var/lib/sandbox/vmd-state-path"
+
+// WriteStateBreadcrumb records the resolved state path atomically
+// (write+rename), so the guard never reads a torn value.
+func WriteStateBreadcrumb(statePath string) error {
+	return writeStateBreadcrumbTo(StateBreadcrumbPath, statePath)
+}
+
+func writeStateBreadcrumbTo(at, statePath string) error {
+	if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
+		return fmt.Errorf("state breadcrumb dir: %w", err)
+	}
+	tmp := at + ".tmp"
+	if err := os.WriteFile(tmp, []byte(statePath+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write state breadcrumb: %w", err)
+	}
+	if err := os.Rename(tmp, at); err != nil {
+		return fmt.Errorf("commit state breadcrumb: %w", err)
+	}
+	return nil
+}
+
 // StateStore wraps a BoltDB database for VM state persistence.
 type StateStore struct {
 	db *bolt.DB
 }
+
+// Path returns the resolved filesystem path of the open store.
+func (s *StateStore) Path() string { return s.db.Path() }
 
 // OpenStateStore opens (or creates) the BoltDB file at path.
 func OpenStateStore(path string) (*StateStore, error) {
@@ -198,6 +290,9 @@ func OpenStateStore(path string) (*StateStore, error) {
 			return err
 		}
 		if _, err := tx.CreateBucketIfNotExists(pendingBackupBucketName); err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(backfillMarkBucketName); err != nil {
 			return err
 		}
 		policies, err := tx.CreateBucketIfNotExists(previewPolicyBucketName)
@@ -243,6 +338,19 @@ func OpenStateStore(path string) (*StateStore, error) {
 	}); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize state store: %w", err)
+	}
+	return &StateStore{db: db}, nil
+}
+
+// OpenStateStoreReadOnly opens the BoltDB file for reading only. Unlike
+// OpenStateStore it neither creates the file nor writes a bucket, so a missing
+// DB or a store still locked by a running vmd fails here rather than reporting
+// an empty (falsely "drained") store — the drain guard depends on that
+// fail-closed behavior.
+func OpenStateStoreReadOnly(path string) (*StateStore, error) {
+	db, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: 1 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("open state store read-only %s: %w", path, err)
 	}
 	return &StateStore{db: db}, nil
 }
@@ -511,6 +619,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		MACAddress:                 inst.MACAddress,
 		Status:                     inst.Status,
 		Unverified:                 inst.Unverified,
+		TeardownPending:            inst.TeardownPending,
 		RunDirID:                   inst.RunDirID,
 		Namespace:                  inst.Namespace,
 		DiskPath:                   inst.DiskPath,
@@ -524,6 +633,8 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		BasePath:                   inst.Config.BasePath,
 		TeamID:                     inst.TeamID,
 		OwnerID:                    inst.OwnerID,
+		PausedAt:                   inst.PausedAt,
+		Supervision:                inst.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(inst.PreviewAccess, inst.PreviewPorts),
 		PreviewPorts:               previewPortsToRecord(inst.PreviewPorts),
 		PreviewPortAccess:          previewPortAccessToRecord(inst.PreviewPorts),
@@ -588,25 +699,28 @@ func toInstance(rec VMRecord) *VMInstance {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
 	return &VMInstance{
-		ID:                         rec.ID,
-		PID:                        rec.PID,
-		SocketPath:                 rec.SocketPath,
-		VsockPath:                  rec.VsockPath,
-		IP:                         rec.IP,
-		TAPDevice:                  rec.TAPDevice,
-		MACAddress:                 rec.MACAddress,
-		Status:                     rec.Status,
-		Unverified:                 rec.Unverified,
-		RunDirID:                   rec.RunDirID,
-		Namespace:                  rec.Namespace,
-		DiskPath:                   rec.DiskPath,
-		SnapshotPath:               rec.SnapshotPath,
-		MemFilePath:                rec.MemFilePath,
-		BaseMemPath:                rec.BaseMemPath,
-		CreatedAt:                  rec.CreatedAt,
-		Metadata:                   rec.Metadata,
-		TeamID:                     rec.TeamID,
-		OwnerID:                    rec.OwnerID,
+		ID:              rec.ID,
+		PID:             rec.PID,
+		SocketPath:      rec.SocketPath,
+		VsockPath:       rec.VsockPath,
+		IP:              rec.IP,
+		TAPDevice:       rec.TAPDevice,
+		MACAddress:      rec.MACAddress,
+		Status:          rec.Status,
+		Unverified:      rec.Unverified,
+		TeardownPending: rec.TeardownPending,
+		RunDirID:        rec.RunDirID,
+		Namespace:       rec.Namespace,
+		DiskPath:        rec.DiskPath,
+		SnapshotPath:    rec.SnapshotPath,
+		MemFilePath:     rec.MemFilePath,
+		BaseMemPath:     rec.BaseMemPath,
+		CreatedAt:       rec.CreatedAt,
+		Metadata:        rec.Metadata,
+		TeamID:          rec.TeamID,
+		OwnerID:         rec.OwnerID,
+		PausedAt:        rec.PausedAt,
+		Supervision:                rec.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(rec.PreviewAccess, ports),
 		PreviewPorts:               ports,
 		PreviewPolicyRevision:      rec.PreviewPolicyRevision,
@@ -635,6 +749,30 @@ type PendingBackup struct {
 	// marker was created: the rehash must prove it is hashing the
 	// pause-time base, not a same-path replacement.
 	BaseIdentity string `json:"base_identity,omitempty"`
+	// OrigSnapshotPath and OrigDiskPath preserve the pause-time artifact
+	// locations when staging repointed the primary paths at copies: if
+	// the copies are ever lost (sweep after a very long outage), a
+	// still-paused sandbox can fall back to the at-rest flow over the
+	// originals instead of dropping coverage.
+	OrigSnapshotPath string `json:"orig_snapshot_path,omitempty"`
+	OrigDiskPath     string `json:"orig_disk_path,omitempty"`
+	// StagedDir is the pending staging directory holding immutable
+	// pause-time copies of the mutable artifacts. When set, the worker
+	// hashes those copies and needs no at-rest proof for them: a resume
+	// cannot mutate a snapshot, so an immediately-resumed pause still
+	// gets its backup.
+	StagedDir string `json:"staged_dir,omitempty"`
+	// SnapshotIdentity is SnapshotPath's stat identity captured when the
+	// marker was created. A VM's snapshot path is fixed across pauses, so
+	// a resume-then-pause reuses the exact same pathname; only identity
+	// distinguishes a genuine RPC retry (same bytes) from a distinct pause
+	// that overwrote them, and the marker-reuse check is load-bearing on it.
+	SnapshotIdentity string `json:"snapshot_identity,omitempty"`
+	// BestEffort routes the eventual journal write to the lowest upload
+	// priority. Set by the backfill sweep, whose thousands of historical
+	// pauses must never delay a live pause's generation; absent (every
+	// marker minted by a real pause) means pause priority.
+	BestEffort bool `json:"best_effort,omitempty"`
 }
 
 // PutPendingBackup records (or refreshes) a pause's owed backup.
@@ -670,6 +808,27 @@ func (s *StateStore) PutPendingBackupIfOwner(p PendingBackup) error {
 	})
 }
 
+// PutPendingBackupIfAbsent writes the marker only when no marker exists
+// for the VM, reporting whether it wrote. The backfill mints through
+// this: a marker minted concurrently by a real pause owns the slot and
+// must never be replaced by backfill's view of the same sandbox.
+func (s *StateStore) PutPendingBackupIfAbsent(p PendingBackup) (bool, error) {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return false, err
+	}
+	wrote := false
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(pendingBackupBucketName)
+		if b.Get([]byte(p.VMID)) != nil {
+			return nil
+		}
+		wrote = true
+		return b.Put([]byte(p.VMID), data)
+	})
+	return wrote, err
+}
+
 // DeletePendingBackupIf clears the marker only while the given token
 // still owns it: an older pause's async worker finishing late must not
 // erase the record a newer pause has since written over the same key.
@@ -685,6 +844,90 @@ func (s *StateStore) DeletePendingBackupIf(vmID, token string) error {
 			return nil
 		}
 		return b.Delete([]byte(vmID))
+	})
+}
+
+// GetPendingBackup returns a VM's pending-backup marker, if any.
+func (s *StateStore) GetPendingBackup(vmID string) (PendingBackup, bool, error) {
+	var p PendingBackup
+	found := false
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(pendingBackupBucketName).Get([]byte(vmID))
+		if v == nil {
+			return nil
+		}
+		if json.Unmarshal(v, &p) == nil && p.VMID != "" {
+			found = true
+		}
+		return nil
+	})
+	return p, found, err
+}
+
+// PutBackfillMark records that a backfill pass minted coverage for this
+// exact snapshot identity, so reruns and later boots skip it without
+// re-hashing. Marks say "a marker was minted", never "the upload
+// verified": once minted, the pending-backup machinery owns the outcome.
+func (s *StateStore) PutBackfillMark(vmID, snapshotIdentity, generation string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(backfillMarkBucketName)
+		if b == nil {
+			return fmt.Errorf("backfill ledger bucket missing")
+		}
+		// Identity NUL generation: binding the mark to the exact
+		// generation its mint enqueued lets the skip path probe the
+		// journal with a point lookup, so no other generation's fate can
+		// masquerade as this snapshot's coverage.
+		return b.Put([]byte(vmID), []byte(snapshotIdentity+"\x00"+generation))
+	})
+}
+
+// GetBackfillMark returns the snapshot identity a backfill pass last
+// covered for this VM and the generation its mint enqueued, if any.
+func (s *StateStore) GetBackfillMark(vmID string) (string, string, bool, error) {
+	var id, gen string
+	found := false
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(backfillMarkBucketName)
+		if b == nil {
+			return nil
+		}
+		v := b.Get([]byte(vmID))
+		if v == nil {
+			return nil
+		}
+		id, found = string(v), true
+		if i := strings.IndexByte(id, 0); i >= 0 {
+			id, gen = id[:i], id[i+1:]
+		}
+		return nil
+	})
+	return id, gen, found, err
+}
+
+// PruneBackfillMarks drops ledger entries for VMs no longer in the
+// record set, so the ledger tracks the fleet instead of growing forever.
+func (s *StateStore) PruneBackfillMarks(keep map[string]struct{}) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(backfillMarkBucketName)
+		if b == nil {
+			return nil
+		}
+		var stale [][]byte
+		if err := b.ForEach(func(k, _ []byte) error {
+			if _, ok := keep[string(k)]; !ok {
+				stale = append(stale, append([]byte(nil), k...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, k := range stale {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 

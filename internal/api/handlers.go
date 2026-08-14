@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/netip"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -31,6 +33,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -43,6 +46,63 @@ const sandboxQuotaErrCode = "SS001"
 func isSandboxQuotaErr(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == sandboxQuotaErrCode
+}
+
+// isTransientCreateDBErr reports DB errors that are likely to resolve on a
+// retry instead of indicating a permanent create failure. Postgres restart and
+// shutdown states surface as SQLSTATE 57P0x; a context timeout/cancel from the
+// bounded insert context means the DB stayed unavailable past the create budget.
+func isTransientCreateDBErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if pgconn.SafeToRetry(err) {
+		return true
+	}
+	var netErr interface{ Timeout() bool }
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, io.EOF) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	case "57P01", "57P02", "57P03":
+		return true
+	default:
+		return false
+	}
+}
+
+func createSandboxTransientFailureReason(dbErr, vmdErr error) string {
+	switch {
+	case isVMDDeadline(vmdErr):
+		return "vmd timed out"
+	case isVMDUnavailable(vmdErr):
+		return fmt.Sprintf("vmd unavailable: %s", vmdErrorMessage(vmdErr))
+	case isTransientCreateDBErr(dbErr):
+		switch {
+		case errors.Is(dbErr, context.DeadlineExceeded):
+			return "database insert timed out"
+		case errors.Is(dbErr, context.Canceled):
+			return "database insert was canceled"
+		default:
+			var pgErr *pgconn.PgError
+			if errors.As(dbErr, &pgErr) {
+				return fmt.Sprintf("database restart: %s", pgErr.Code)
+			}
+			return "database insert is temporarily unavailable"
+		}
+	default:
+		return "sandbox create failed"
+	}
 }
 
 // respondQuotaExceeded best-effort fetches the team's cap for the message;
@@ -79,7 +139,8 @@ type Handlers struct {
 	Analytics *analytics.Client // when set, emits product-usage events; nil is a no-op
 	Encryptor secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
 	Signer    *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
-	Now       func() time.Time  // when set, returns the current UTC time for testable handlers
+	Stripe    StripeBillingClient
+	Now       func() time.Time // when set, returns the current UTC time for testable handlers
 
 	// asyncMu/asyncCond/asyncCount track fire-and-forget bookkeeping goroutines
 	// (ActivateSandbox, FinalizePause) so tests can wait for quiescence;
@@ -170,6 +231,7 @@ func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handle
 		VMD:    vmd,
 		DB:     queries,
 		Config: cfg,
+		Now:    time.Now,
 	}
 }
 
@@ -206,6 +268,12 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 // vmdTimeout is the default deadline for VMD gRPC calls.
 const vmdTimeout = 30 * time.Second
 
+// createInsertTimeout bounds the detached DB insert during sandbox create so a
+// Postgres restart cannot leave the write pending indefinitely after the boot
+// path has already given up. Kept at the same worst-case window as the
+// transient VMD retry budget.
+const createInsertTimeout = 2 * vmdTimeout
+
 // retryTransientBoot runs one vmd boot call under vmdTimeout and, when the
 // attempt dies on a transient — DeadlineExceeded, or Unavailable that
 // outlived the dial-site interceptor's window — with the caller's context
@@ -239,12 +307,13 @@ func retryTransientBoot(parent context.Context, sandboxID string, boot func(cont
 // asyncTimeout is the deadline for fire-and-forget DB writes.
 const asyncTimeout = 5 * time.Second
 
-// activateSettleWindow bounds how long status-gated read paths wait for the
-// fire-and-forget activate write to land. Create/resume respond before the
-// starting/resuming→active flip commits, so the owner's immediate follow-up
-// (create then exec — the canonical SDK flow) may read the pre-flip status;
-// waiting briefly preserves read-your-writes instead of 409ing it. The write
-// lands in single-digit ms in the common case, which this covers.
+// activateSettleWindow bounds how long loadActiveOrResumeSandbox waits for
+// create/resume's fire-and-forget starting/resuming→active flip to land. The
+// owner's own immediate follow-up (create then exec — the canonical SDK
+// flow) may read the pre-flip status, so waiting briefly preserves
+// read-your-writes instead of 409ing an operation the client was just told
+// succeeded. The write lands in single-digit ms in the common case, which
+// this covers.
 //
 // It deliberately does NOT try to outlast a hostname-only create's pre-flip
 // stamp: that guest round trip can take tens of seconds on a cold-fault stall
@@ -258,6 +327,41 @@ var activateSettleWindow = 6 * time.Second
 
 // activateSettlePoll is the re-read interval within activateSettleWindow.
 const activateSettlePoll = 50 * time.Millisecond
+
+// pausingSettleWindow bounds how long ResumeSandbox waits for a racing
+// finalize-pause write (pausing→paused, read by ResumeSandbox) to land
+// before treating the sandbox as genuinely stuck and returning 409. It is
+// separate from activateSettleWindow on purpose: unlike create/resume's
+// hostname stamp, finalize-pause has no guest round trip — it is a local DB
+// write that either lands in single-digit ms (the common case) or is stuck
+// for a reason more waiting won't fix (DB contention, a crashed worker), so
+// riding out the full 6s activate window buys nothing here and just holds
+// the resume request open. Var, not const, so tests can shrink it.
+var pausingSettleWindow = 2 * time.Second
+
+// pausingSettlePollStart is the first re-read interval in ResumeSandbox's
+// pausing-settle loop, matching activateSettlePoll so the common case
+// settles just as fast as a fixed-interval poll would. pausingSettlePollMax
+// caps how far nextSettlePollInterval backs off.
+//
+// A fixed 50ms poll over the full settle window costs up to ~120
+// synchronous reads when a sandbox is genuinely stuck in 'pausing' — a burst
+// of pause/resume calls hitting that case amplifies DB load exactly when
+// finalize-pause is already struggling to land. Backing off (see
+// nextSettlePollInterval) bounds that worst case to roughly a dozen reads.
+const (
+	pausingSettlePollStart = 50 * time.Millisecond
+	pausingSettlePollMax   = 500 * time.Millisecond
+)
+
+// nextSettlePollInterval doubles cur, capped at pausingSettlePollMax.
+func nextSettlePollInterval(cur time.Duration) time.Duration {
+	next := cur * 2
+	if next <= 0 || next > pausingSettlePollMax {
+		return pausingSettlePollMax
+	}
+	return next
+}
 
 // staleTransitionGrace is how long a sandbox must sit in a transitional state
 // (starting/resuming/pausing) before DELETE may claim it: past this, its worker
@@ -715,7 +819,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdTimeout)
 	defer bootCancel()
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
-		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath)
+		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig)
 	})
 	if err != nil {
 		if isVMDNotFound(err) {
@@ -789,7 +893,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// VM unreachable — nothing to preserve; mark failed rather than
 			// wedge in 'resuming' (the CTE also closes any open interval).
 			log.Error().Err(perr).Str("sandbox_id", sandboxID.String()).Msg("resume revert: PauseInstance failed, marking sandbox failed")
-			h.markSandboxFailedAsync(revertCtx, sandboxID, teamID, sandbox.HostID)
+			h.markSandboxFailedAsync(revertCtx, sandboxID, teamID, sandbox.HostID, false)
 			return
 		}
 		// Fresh deadline so a slow snapshot above can't starve the DB write.
@@ -1079,18 +1183,81 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
-		ID:     sandboxID,
-		TeamID: teamID,
-	})
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			respondError(c, ErrSandboxNotFound)
+	// PauseSandbox responds as soon as vmd's PauseVM RPC completes, then
+	// flips pausing -> paused via fire-and-forget bookkeeping (deliberately
+	// off the pause hot path — see finalize-pause in PauseSandbox). The
+	// owner's own immediate follow-up resume can therefore read the row
+	// before that write lands; poll through 'pausing' with a backed-off
+	// interval (nextSettlePollInterval) over pausingSettleWindow rather than
+	// 409 an operation the client was just told succeeded. Any other
+	// non-paused status is a real conflict and fails immediately.
+	deadline := time.Now().Add(pausingSettleWindow)
+	waitStart := time.Now()
+	poll := pausingSettlePollStart
+	reads := 0
+	canceled := false
+	var sandbox db.Sandbox
+	for {
+		var err error
+		sandbox, err = h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+			ID:     sandboxID,
+			TeamID: teamID,
+		})
+		reads++
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				respondError(c, ErrSandboxNotFound)
+				return
+			}
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+			respondError(c, ErrInternal)
 			return
 		}
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-		respondError(c, ErrInternal)
-		return
+		if sandbox.Status == db.SandboxStatusPausing && time.Now().Before(deadline) {
+			// Context-aware wait: a client that disconnects or hits its
+			// deadline mid-backoff releases this goroutine at cancellation
+			// instead of holding it for the rest of the interval — and skips
+			// the re-read, which on a canceled context could only fail and be
+			// misreported as an internal DB error.
+			timer := time.NewTimer(poll)
+			select {
+			case <-timer.C:
+				poll = nextSettlePollInterval(poll)
+				continue
+			case <-c.Request.Context().Done():
+				timer.Stop()
+				canceled = true
+			}
+		}
+		break
+	}
+	// The common case resolves on the first read, so this only fires for the
+	// racing/stuck case — once per affected resume, not once per poll — and
+	// stays off the hot path.
+	if reads > 1 {
+		waited := time.Since(waitStart)
+		// Only pausing→paused counts as settled: a row that left 'pausing'
+		// for any other state (a failed pause reverting to active, a delete
+		// claiming the row) still 409s below, and folding it into "settled"
+		// would contaminate the metric with pause failures.
+		var result string
+		switch {
+		case canceled:
+			result = telemetry.SettleResultCanceled
+		case sandbox.Status == db.SandboxStatusPaused:
+			result = telemetry.SettleResultSettled
+		case sandbox.Status == db.SandboxStatusPausing:
+			result = telemetry.SettleResultTimeout
+		default:
+			result = telemetry.SettleResultDiverged
+		}
+		log.Warn().
+			Str("sandbox_id", sandboxID.String()).
+			Dur("waited", waited).
+			Int("reads", reads).
+			Str("result", result).
+			Msg("resume waited for racing pause finalize to settle")
+		RecordResumeSettleWait(c.Request.Context(), result, sandbox.HostID, waited, reads)
 	}
 	SetTelemetryHostID(c, sandbox.HostID)
 
@@ -1909,7 +2076,20 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// VMD's ~100-200ms create latency, shaving that much off the p50.
 	sandboxID := uuid.New()
 
-	insertCtx := context.WithoutCancel(c.Request.Context())
+	// The detached insert keeps the happy path parallel, but it still needs a
+	// deadline so a DB restart cannot let the write linger long after the boot
+	// path has already failed.
+	insertCtx, insertCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), createInsertTimeout)
+	defer insertCancel()
+
+	// The shape shown while the sandbox is 'starting' — and kept if the create
+	// fails before activation. ActivateSandbox overwrites it with the actuals
+	// vmd reports once the VM is up.
+	insertVcpu, insertMemMiB := int32(defaultVcpu), int32(defaultMemoryMi)
+	if templateID.Valid && templateVcpu > 0 && templateMemMiB > 0 {
+		insertVcpu, insertMemMiB = int32(templateVcpu), int32(templateMemMiB)
+	}
+
 	type insertResult struct {
 		sandbox db.Sandbox
 		err     error
@@ -1929,8 +2109,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				TeamID:            teamID,
 				Name:              req.Name,
 				Status:            db.SandboxStatusStarting,
-				VcpuCount:         1, // placeholders; real values land via ActivateSandbox
-				MemoryMib:         1,
+				VcpuCount:         insertVcpu,
+				MemoryMib:         insertMemMiB,
 				HostID:            hostID,
 				TimeoutSeconds:    req.TimeoutSeconds,
 				AutoDeleteSeconds: req.AutoDeleteSeconds,
@@ -1951,8 +2131,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			TeamID:            teamID,
 			Name:              req.Name,
 			Status:            db.SandboxStatusStarting,
-			VcpuCount:         1,
-			MemoryMib:         1,
+			VcpuCount:         insertVcpu,
+			MemoryMib:         insertMemMiB,
 			HostID:            hostID,
 			TimeoutSeconds:    req.TimeoutSeconds,
 			AutoDeleteSeconds: req.AutoDeleteSeconds,
@@ -1991,8 +2171,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				ID:                sandboxID,
 				Name:              req.Name,
 				Status:            db.SandboxStatusStarting,
-				VcpuCount:         1, // placeholders; real values land via ActivateSandbox
-				MemoryMib:         1,
+				VcpuCount:         insertVcpu,
+				MemoryMib:         insertMemMiB,
 				HostID:            hostID,
 				TimeoutSeconds:    req.TimeoutSeconds,
 				AutoDeleteSeconds: req.AutoDeleteSeconds,
@@ -2013,8 +2193,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			TeamID:            teamID,
 			Name:              req.Name,
 			Status:            db.SandboxStatusStarting,
-			VcpuCount:         1,
-			MemoryMib:         1,
+			VcpuCount:         insertVcpu,
+			MemoryMib:         insertMemMiB,
 			HostID:            hostID,
 			TimeoutSeconds:    req.TimeoutSeconds,
 			AutoDeleteSeconds: req.AutoDeleteSeconds,
@@ -2057,6 +2237,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return ip, vcpu, memMiB, err
 	})
 	tVmdEnd := time.Now()
+	if vmdErr != nil {
+		// A failed boot should stop the detached insert from materializing a row
+		// after the VM path has already given up.
+		insertCancel()
+	}
 
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).
@@ -2070,35 +2255,78 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Per-team sandbox count cap; raised by sandbox_quota_on_insert trigger.
 	quotaExceeded := isSandboxQuotaErr(dbErr)
+	vmdTransientFailure := isVMDDeadline(vmdErr) || isVMDUnavailable(vmdErr)
+	transientCreateFailure := isTransientCreateDBErr(dbErr) || isVMDDeadline(vmdErr) || isVMDUnavailable(vmdErr)
+	transientReason := createSandboxTransientFailureReason(dbErr, vmdErr)
+
+	if dbErr != nil || vmdErr != nil {
+		// Any non-empty error can leave a VM behind, so clean it up best-effort
+		// before deciding which failure mode to report.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
+		if vmdErr != nil {
+			go func() {
+				defer cleanupCancel()
+				_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+			}()
+		} else {
+			_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+			cleanupCancel()
+		}
+	}
+
+	// If the create failed after the row may have been written, converge the
+	// sandbox to a terminal state asynchronously so the request does not sit on
+	// DB restarts or other transient cleanup work.
+	var failDone <-chan bool
+	if !templateRace && !quotaExceeded && (vmdErr != nil || transientCreateFailure) {
+		failDone = h.markSandboxFailedAsync(c.Request.Context(), sandboxID, teamID, hostID, dbErr != nil)
+	}
 
 	switch {
 	case dbErr != nil && vmdErr != nil:
-		// Both failed — nothing persisted, nothing to clean up.
-		log.Error().Err(dbErr).AnErr("vmd_err", vmdErr).Msg("CreateSandbox: DB and VMD both failed")
+		// Both failed — no durable row to keep, and cleanup above already ran
+		// best-effort in case the VM made it far enough to exist.
+		log.Error().Err(dbErr).AnErr("vmd_err", vmdErr).Str("reason", transientReason).Msg("CreateSandbox: DB and VMD both failed")
 		if templateRace {
 			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
 			return
 		}
 		if quotaExceeded {
 			h.respondQuotaExceeded(c, teamID)
+			return
+		}
+		if isVMDFileMissing(vmdErr) {
+			respondError(c, ErrHostStateMissing)
+			return
+		}
+		if vmdErr != nil && !vmdTransientFailure {
+			respondError(c, ErrInternal)
+			return
+		}
+		if transientCreateFailure {
+			respondErrorMsg(c, "service_unavailable", sandboxCreateTransientResponseMessage, http.StatusServiceUnavailable)
 			return
 		}
 		respondError(c, ErrInternal)
 		return
 	case dbErr != nil:
-		// DB insert failed but VMD succeeded — destroy the orphan VM so
-		// it doesn't linger on the host. Use a detached context so client
-		// disconnect doesn't leak the VM.
-		log.Error().Err(dbErr).Str("sandbox_id", sandboxID.String()).Msg("CreateSandbox: INSERT failed, destroying orphan VM")
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
-		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
-		cleanupCancel()
+		// DB insert failed but VMD succeeded or failed independently — the VM
+		// was already cleaned up best-effort above.
+		log.Error().Err(dbErr).Str("sandbox_id", sandboxID.String()).Str("reason", transientReason).Msg("CreateSandbox: INSERT failed")
 		if templateRace {
 			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
 			return
 		}
 		if quotaExceeded {
 			h.respondQuotaExceeded(c, teamID)
+			return
+		}
+		if isVMDFileMissing(vmdErr) {
+			respondError(c, ErrHostStateMissing)
+			return
+		}
+		if transientCreateFailure {
+			respondErrorMsg(c, "service_unavailable", sandboxCreateTransientResponseMessage, http.StatusServiceUnavailable)
 			return
 		}
 		respondError(c, ErrInternal)
@@ -2108,29 +2336,27 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// doesn't leave it stuck in "starting". The request middleware
 		// records the create failure metric from the HTTP status, so avoid
 		// emitting a second request-scoped transition here.
-		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
-		// A cancelled attempt can still complete on the host just after the
-		// deadline; best-effort destroy so a booted VM can't idle against a
-		// failed row until the reconciler sweeps it.
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
-		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
-		cleanupCancel()
-		failCtx, failCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), asyncTimeout)
-		defer failCancel()
-		if err := h.DB.UpdateSandboxStatus(failCtx, db.UpdateSandboxStatusParams{
-			ID:     sandbox.ID,
-			Status: db.SandboxStatusFailed,
-			TeamID: teamID,
-		}); err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("mark failed after VMD create failure")
-		} // Bindings are written before RestoreSnapshot, so a restore failure
-		// leaves them; clear them or this dead sandbox still shows as bound.
-		_ = h.DB.DeleteSandboxSecrets(failCtx, sandbox.ID)
-		// FailedPrecondition from vmd = snapshot/mem file missing on host.
-		// Surfaces on the from_template restore path; map to 503 so the
-		// user understands this is ops-side, not a bad request.
+		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Str("reason", transientReason).Msg("VMD create/resume failed")
+		if dbErr == nil && transientCreateFailure && failDone != nil {
+			select {
+			case released := <-failDone:
+				if !released {
+					log.Warn().Str("sandbox_id", sandbox.ID.String()).Msg("failed-state reconciliation did not finish before create response")
+					respondError(c, ErrInternal)
+					return
+				}
+			case <-time.After(asyncTimeout):
+				log.Warn().Str("sandbox_id", sandbox.ID.String()).Msg("timed out waiting for failed-state reconciliation after create failure")
+				respondError(c, ErrInternal)
+				return
+			}
+		}
 		if isVMDFileMissing(vmdErr) {
 			respondError(c, ErrHostStateMissing)
+			return
+		}
+		if transientCreateFailure {
+			respondErrorMsg(c, "service_unavailable", sandboxCreateTransientResponseMessage, http.StatusServiceUnavailable)
 			return
 		}
 		respondError(c, ErrInternal)
@@ -2454,7 +2680,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		// already dead, "active" was a lie.
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD PauseInstance: VM unavailable, marking sandbox failed")
-			h.markSandboxFailedAsync(c.Request.Context(), sandboxID, teamID, sandbox.HostID)
+			h.markSandboxFailedAsync(c.Request.Context(), sandboxID, teamID, sandbox.HostID, false)
 			respondError(c, ErrSandboxGone)
 			return
 		}

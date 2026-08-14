@@ -11,8 +11,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -105,7 +108,7 @@ func TestUploaderShipsGenerationAndAcks(t *testing.T) {
 	j, _ := testJournal(t)
 	store := newMemStore()
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 
 	task := writeTask(t, t.TempDir())
 	if err := j.Enqueue(task); err != nil {
@@ -189,7 +192,7 @@ func TestUploaderAbandonsVanishedSource(t *testing.T) {
 	j, _ := testJournal(t)
 	store := newMemStore()
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 
 	task := writeTask(t, t.TempDir())
 	if err := os.Remove(task.Files[0].Path); err != nil {
@@ -217,7 +220,7 @@ func TestUploaderAbandonsMutatedSource(t *testing.T) {
 	j, _ := testJournal(t)
 	store := newMemStore()
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 
 	task := writeTask(t, t.TempDir())
 	if err := j.Enqueue(task); err != nil {
@@ -316,7 +319,7 @@ func TestUploaderRoutesTemplateTasks(t *testing.T) {
 	j, _ := testJournal(t)
 	store := newMemStore()
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 
 	// Mixed queue: a sandbox pause and a template build, both pause priority.
 	sandbox := writeTask(t, t.TempDir())
@@ -440,7 +443,7 @@ func TestTemplateTaskAbandonsCleanlyOnVanishedSource(t *testing.T) {
 	store := newMemStore()
 	staging := t.TempDir()
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, StagingRoot: staging, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, StagingRoot: staging, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 
 	task := Task{
 		TemplateID: "tpl-1",
@@ -547,7 +550,7 @@ func TestUploaderWithholdsManifestOnMidStreamMutation(t *testing.T) {
 		},
 	}
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
@@ -627,7 +630,7 @@ func TestUploaderAbandonsUnverifiedDedupedObject(t *testing.T) {
 	overlayObj := "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[0].Path, "overlay.ext4")
 	store.objects[overlayObj] = []byte("CORRUPT!")
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
@@ -649,7 +652,7 @@ func TestUploaderTrustsHistoryForUnchangedRepause(t *testing.T) {
 	j, _ := testJournal(t)
 	store := newMemStore()
 	var verified []Task
-	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) { verified = append(verified, task) }}
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
 
 	// First pause: full upload, verified, acked.
 	task := writeTask(t, t.TempDir())
@@ -717,10 +720,15 @@ func TestJournalPruneSweepsHistoryAcrossAcks(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Each ack examines a bounded slice; successive acks sweep the rest.
+	// Acks resolve real rows (resolution is fenced on the row existing),
+	// so re-enqueue the task before each one.
 	task := Task{SandboxID: "sb", Generation: "g", Priority: PriorityPause,
 		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)}
 	for i := 0; i < 5; i++ {
-		if err := j.Ack(task, "", false); err != nil {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Ack(task, "", false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -751,12 +759,12 @@ func TestVerifiedNotificationSurvivesCrashBeforeDelivery(t *testing.T) {
 	}
 	// Simulate the first process: ack with notification owed, then crash
 	// before any delivery (no flush runs).
-	if err := j.Ack(task, "test-bucket", true); err != nil {
+	if _, err := j.Ack(task, "test-bucket", true); err != nil {
 		t.Fatal(err)
 	}
 
 	var delivered []Task
-	u := &Uploader{Journal: j, OnVerified: func(t Task) { delivered = append(delivered, t) }}
+	u := &Uploader{Journal: j, OnVerified: func(t Task) error { delivered = append(delivered, t); return nil }}
 	u.flushNotifications()
 	if len(delivered) != 1 || delivered[0].SandboxID != "sb" || delivered[0].Generation != "gen" {
 		t.Fatalf("delivered = %+v, want the acked task once", delivered)
@@ -777,10 +785,10 @@ func TestAbandonedAckLeavesNoNotification(t *testing.T) {
 	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Ack(task, "", false); err != nil {
+	if _, err := j.Ack(task, "", false); err != nil {
 		t.Fatal(err)
 	}
-	pending, err := j.PendingNotifications()
+	pending, err := j.PendingNotifications(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -821,7 +829,7 @@ func TestFailedVerificationWriteNotCarriedIntoTask(t *testing.T) {
 	db.Close()
 
 	u := &Uploader{Journal: j, Store: newMemStore()}
-	_, err = u.uploadFile(context.Background(), &task, task.Files[0])
+	_, _, err = u.uploadFile(context.Background(), &task, task.Files[0])
 	if err == nil {
 		t.Fatal("uploadFile succeeded despite a failed verification write")
 	}
@@ -1024,7 +1032,7 @@ func TestNextSkipsDeferredPriorityWithoutScanning(t *testing.T) {
 	// The nack re-keyed the row; ack through the same task state must
 	// clear it (index and queue agree on the new key).
 	nacked := got
-	if err := j.Ack(nacked, "", false); err != nil {
+	if _, err := j.Ack(nacked, "", false); err != nil {
 		t.Fatal(err)
 	}
 	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
@@ -1315,7 +1323,7 @@ func TestStagedBaseSurvivesTemplateGC(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(staging, "bases", hex.EncodeToString(baseSum[:]))); err != nil {
 		t.Fatalf("referenced staged base swept: %v", err)
 	}
-	if err := j.Ack(Task{SandboxID: "sb2", Generation: "g2", EnqueuedAt: time.Unix(3, 0)}, "", false); err != nil {
+	if _, err := j.Ack(Task{SandboxID: "sb2", Generation: "g2", EnqueuedAt: time.Unix(3, 0)}, "", false); err != nil {
 		t.Fatal(err)
 	}
 	ageStagingTree(t, staging)
@@ -1349,37 +1357,15 @@ func TestEnqueueDedupeUpgradesPaths(t *testing.T) {
 		t.Fatalf("queued task = %+v, want the staged upgrade", got)
 	}
 	// The upgrade is one-way: a later mutable-path enqueue of the same
-	// generation must not downgrade the staged row.
+	// generation must not downgrade the staged row. The first Next
+	// claimed the row, so re-reading it means outliving the claim: a
+	// clock past the lease is the release path that needs no Ack.
 	if err := j.Enqueue(orig); err != nil {
 		t.Fatal(err)
 	}
-	got, ok, err = j.Next(base.Add(time.Minute))
+	got, ok, err = j.Next(base.Add(time.Minute).Add(claimTTL))
 	if err != nil || !ok || got.Files[0].Path != "/staging/sb/gen/rootfs.ext4" {
 		t.Fatalf("staged row downgraded: %+v", got)
-	}
-}
-
-// Clone-only staging on a filesystem without reflink support degrades
-// cleanly: nothing staged, original paths untouched, no error.
-func TestStageTaskCloneFallsBackWithoutReflink(t *testing.T) {
-	dir := t.TempDir()
-	orig := filepath.Join(dir, "rootfs.ext4")
-	if err := os.WriteFile(orig, []byte("bytes"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	task := Task{SandboxID: "sb", Generation: "gen",
-		Files: []TaskFile{{Name: "rootfs.ext4", Path: orig, SHA256: "aa"}}}
-	all, err := StageTaskClone(filepath.Join(dir, "staging"), &task)
-	if err != nil {
-		t.Fatalf("clone-only staging errored: %v", err)
-	}
-	// This test tree may or may not sit on a reflink filesystem; either
-	// every file staged or none did, and unstaged files keep originals.
-	if !all && task.Files[0].Path != orig {
-		t.Fatalf("unstaged file path rewritten to %s", task.Files[0].Path)
-	}
-	if all && task.Files[0].Path == orig {
-		t.Fatal("allStaged reported but path not rewritten")
 	}
 }
 
@@ -1421,7 +1407,10 @@ func TestSharedBaseUploadsOnceThenSkipsTheStream(t *testing.T) {
 	}
 
 	t1 := makeTask("sb-one", "overlay one")
-	if completed, err := u.uploadTask(context.Background(), &t1); err != nil || !completed {
+	if err := j.Enqueue(t1); err != nil {
+		t.Fatal(err)
+	}
+	if completed, _, _, err := u.uploadTask(context.Background(), &t1); err != nil || !completed {
 		t.Fatalf("first upload: completed=%v err=%v", completed, err)
 	}
 	var baseObject string
@@ -1438,7 +1427,10 @@ func TestSharedBaseUploadsOnceThenSkipsTheStream(t *testing.T) {
 	}
 
 	t2 := makeTask("sb-two", "overlay two")
-	if completed, err := u.uploadTask(context.Background(), &t2); err != nil || !completed {
+	if err := j.Enqueue(t2); err != nil {
+		t.Fatal(err)
+	}
+	if completed, _, _, err := u.uploadTask(context.Background(), &t2); err != nil || !completed {
 		t.Fatalf("second upload: completed=%v err=%v", completed, err)
 	}
 	if store.creates[baseObject] != 1 {
@@ -1511,7 +1503,10 @@ func TestSharedDedupeRecordsHistoryForFutureSkips(t *testing.T) {
 	baseObject := SharedBaseObject(baseSHA, PackFingerprint(extents, apparent))
 	store.objects[baseObject] = []byte("already there")
 
-	if completed, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if completed, _, _, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
 		t.Fatalf("upload: completed=%v err=%v", completed, err)
 	}
 	if store.creates[baseObject] != 1 {
@@ -1631,7 +1626,7 @@ func TestLegacyUnscopedVerificationRecordsStillTrusted(t *testing.T) {
 	if err := j.MigrateVerificationScope(store.Identity()); err != nil {
 		t.Fatal(err)
 	}
-	completed, err := u.uploadTask(context.Background(), &task)
+	completed, _, _, err := u.uploadTask(context.Background(), &task)
 	if err != nil || !completed {
 		t.Fatalf("upload with migrated record: completed=%v err=%v (want dedupe trusted)", completed, err)
 	}
@@ -1646,5 +1641,1258 @@ func TestLegacyUnscopedVerificationRecordsStillTrusted(t *testing.T) {
 	}
 	if ok, err := j.WasVerified(store.Identity()+"\x00"+object, time.Now()); err != nil || !ok {
 		t.Fatalf("migrated record lost: ok=%v err=%v", ok, err)
+	}
+}
+
+// The pending-to-generation absorb requires identical vmstate bytes;
+// residue and byte-divergent destinations are replaced by the complete
+// pending copy.
+func TestFinishPendingStageAbsorbAndReplace(t *testing.T) {
+	root := t.TempDir()
+	mk := func(dir string, vmstate string, withDisk bool) {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "vmstate.snap"), []byte(vmstate), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if withDisk {
+			if err := os.WriteFile(filepath.Join(dir, "rootfs.ext4"), []byte("diskdata"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	stagedOf := func(dir string) map[string]string {
+		return map[string]string{
+			"vmstate.snap": filepath.Join(dir, "vmstate.snap"),
+			"rootfs.ext4":  filepath.Join(dir, "rootfs.ext4"),
+		}
+	}
+
+	// Identical destination: absorbed, pending removed.
+	p1 := filepath.Join(root, "sb", "pending-a")
+	g1 := filepath.Join(root, "sb", "gen-1")
+	mk(p1, "same-state", true)
+	mk(g1, "same-state", true)
+	if _, err := FinishPendingStage(p1, "gen-1", stagedOf(p1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p1); !os.IsNotExist(err) {
+		t.Fatal("identical destination did not absorb the pending copy")
+	}
+
+	// Residue destination (missing disk): replaced by the pending copy.
+	p2 := filepath.Join(root, "sb", "pending-b")
+	g2 := filepath.Join(root, "sb", "gen-2")
+	mk(p2, "state-b", true)
+	mk(g2, "state-b", false)
+	final, err := FinishPendingStage(p2, "gen-2", stagedOf(p2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(final["rootfs.ext4"]); err != nil {
+		t.Fatalf("residue destination not replaced: %v", err)
+	}
+
+	// Byte-divergent vmstate: replaced, never absorbed.
+	p3 := filepath.Join(root, "sb", "pending-c")
+	g3 := filepath.Join(root, "sb", "gen-3")
+	mk(p3, "state-c-pending", true)
+	mk(g3, "state-c-DIFFER!", true)
+	final3, err := FinishPendingStage(p3, "gen-3", stagedOf(p3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(final3["vmstate.snap"])
+	if err != nil || string(got) != "state-c-pending" {
+		t.Fatalf("divergent destination absorbed: %q err=%v", got, err)
+	}
+	_ = g3
+}
+
+// Pending-token directories are protected by the long orphan horizon,
+// not the short residue grace: a renewed (live) one survives sweeps,
+// and only a long-dead orphan is reaped.
+func TestSweepStagingProtectsLivePendingDirs(t *testing.T) {
+	root := t.TempDir()
+	j, _ := testJournal(t)
+	live := filepath.Join(root, "sb", "pending-live")
+	orphan := filepath.Join(root, "sb", "pending-orphan")
+	for _, d := range []string{live, orphan} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Age both past the ordinary grace; the live one got renewed by a
+	// worker two hours ago is still fine, the orphan is ancient.
+	twoHours := time.Now().Add(-2 * time.Hour)
+	ancient := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(live, twoHours, twoHours); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(orphan, ancient, ancient); err != nil {
+		t.Fatal(err)
+	}
+	SweepStaging(root, j, zerolog.Nop())
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("live pending dir swept: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatal("ancient orphan pending dir survived")
+	}
+}
+
+// The RPC-path staging respects the caller's deadline: an exhausted
+// deadline falls back rather than copying.
+func TestStagePendingRespectsDeadline(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "rootfs.ext4")
+	if err := os.WriteFile(src, []byte("bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second))
+	defer cancel()
+	if _, _, err := StagePending(ctx, root, "sb", "tok", "", map[string]string{"rootfs.ext4": src}); !errors.Is(err, ErrStageTooLarge) {
+		t.Fatalf("err = %v, want deadline fallback", err)
+	}
+}
+
+// cancelAfterFirstRead cancels its context after its first Read call
+// returns, letting a test deterministically land cancellation between
+// chunks of a copy rather than racing on wall-clock timing.
+type cancelAfterFirstRead struct {
+	r      io.Reader
+	cancel context.CancelFunc
+	fired  bool
+}
+
+func (c *cancelAfterFirstRead) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if !c.fired {
+		c.fired = true
+		c.cancel()
+	}
+	return n, err
+}
+
+// A single dense extent (no reflink support) can span the whole
+// inline-staging budget; a slow or contended disk must not run the copy
+// to completion regardless of the caller's deadline. copyExtentContext
+// chunks the copy and rechecks ctx between chunks so a cancellation
+// lands well before the full extent is copied.
+func TestCopyExtentContextHonorsCancellationBetweenChunks(t *testing.T) {
+	src := bytes.Repeat([]byte("x"), 3*copyExtentChunk)
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := &cancelAfterFirstRead{r: bytes.NewReader(src), cancel: cancel}
+	var dst bytes.Buffer
+	n, err := copyExtentContext(ctx, &dst, reader)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if n >= int64(len(src)) {
+		t.Fatalf("copied %d of %d bytes despite cancellation after the first chunk", n, len(src))
+	}
+}
+
+// fsync has no native cancellation; syncWithContext bounds it by ctx so
+// a slow or contended disk cannot block the RPC path's pause lock past
+// its deadline the way the size threshold and the copy's own bound
+// alone cannot.
+func TestSyncWithContextHonorsCancellation(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.CreateTemp(dir, "sync-ctx-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString("bytes"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	err = syncWithContext(ctx, f)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("syncWithContext blocked %v under a canceled context", elapsed)
+	}
+}
+
+func statIdentity(t *testing.T, path string) (dev, ino uint64, ctime syscall.Timespec) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("no stat_t identity")
+	}
+	return uint64(st.Dev), uint64(st.Ino), st.Ctim
+}
+
+// A hard link (and the unlink a failed copy's cleanup performs on it)
+// bumps the target inode's ctime. If the base pin were created before
+// the fallible per-file copies, a later copy failure's RemoveAll
+// cleanup would unlink it and silently change the base's identity out
+// from under a caller that snapshotted that identity before calling
+// StagePending, making an unstaged fallback misread an untouched base
+// as replaced. The pin must only be created once every copy in this
+// call has already succeeded.
+func TestStagePendingLeavesBaseIdentityUnchangedOnCopyFailure(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, "base.img")
+	if err := os.WriteFile(base, []byte("base-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeDev, beforeIno, beforeCtime := statIdentity(t, base)
+
+	missing := filepath.Join(root, "does-not-exist.ext4")
+	if _, _, err := StagePending(context.Background(), root, "sb", "tok", base, map[string]string{"rootfs.ext4": missing}); err == nil {
+		t.Fatal("expected staging to fail for a missing source file")
+	}
+
+	afterDev, afterIno, afterCtime := statIdentity(t, base)
+	if beforeDev != afterDev || beforeIno != afterIno || beforeCtime != afterCtime {
+		t.Fatalf("base identity changed after a failed StagePending call: before=(%d,%d,%v) after=(%d,%d,%v)",
+			beforeDev, beforeIno, beforeCtime, afterDev, afterIno, afterCtime)
+	}
+	if _, err := os.Stat(filepath.Join(root, "sb", "pending-tok", BasePinName)); !os.IsNotExist(err) {
+		t.Fatalf("base.pin should not exist after a failed copy, got err=%v", err)
+	}
+}
+
+// FinishPendingStage's rename can preserve a stale mtime from the
+// pending directory, exposing an apparently-old, unjournaled generation
+// to a concurrent staging sweep before the renewal that follows the
+// rename gets to run. The rename and renewal now run inside one
+// singleflight call keyed on the final path, so a sweep's delete
+// attempt for that exact path arriving anywhere during the window joins
+// the flight instead of racing it independently — this must hold under
+// every goroutine interleaving, not just the common one, so the test
+// races real goroutines rather than asserting a fixed ordering.
+func TestFinishPendingStageSerializesWithConcurrentSweepDelete(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		root := t.TempDir()
+		sbDir := filepath.Join(root, "sb")
+		pendingDir := filepath.Join(sbDir, "pending-tok")
+		if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// A stale mtime, as if the pending directory sat untouched past
+		// the sweep's ordinary grace before this pause finally hashed.
+		old := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(pendingDir, old, old); err != nil {
+			t.Fatal(err)
+		}
+		generation := fmt.Sprintf("gen-%d", i)
+		final := filepath.Join(sbDir, generation)
+
+		var wg sync.WaitGroup
+		var finishErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, finishErr = FinishPendingStage(pendingDir, generation, map[string]string{"vmstate.snap": filepath.Join(pendingDir, "vmstate.snap")})
+		}()
+		go func() {
+			defer wg.Done()
+			// SweepStaging only ever learns about a generation directory
+			// via a real os.ReadDir listing, so in production it can never
+			// attempt this delete before the rename that creates the path
+			// has already happened on disk. Model that precondition (a
+			// version of this goroutine that raced the rename itself,
+			// rather than the file's existence, would win sometimes and
+			// isn't representative of how the sweep actually operates).
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				if _, err := os.Stat(final); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					return
+				}
+				runtime.Gosched()
+			}
+			// The sweep's exact delete logic for an unjournaled, stale
+			// generation directory.
+			_, _, _ = stagingFlights.Do(final, func() (any, error) {
+				if !fresherThan(final, stagingSweepGrace) {
+					_ = os.RemoveAll(final)
+				}
+				return nil, nil
+			})
+		}()
+		wg.Wait()
+
+		if finishErr != nil {
+			t.Fatalf("iteration %d: FinishPendingStage: %v", i, finishErr)
+		}
+		if _, err := os.Stat(filepath.Join(final, "vmstate.snap")); err != nil {
+			t.Fatalf("iteration %d: staged generation lost to a concurrent sweep delete: %v", i, err)
+		}
+	}
+}
+
+// FinishPendingStage's flight key can already be occupied by an
+// unrelated caller — a sweep evaluating pre-existing, incomplete
+// residue some other worker left at the exact same generation path.
+// Joining that flight must not let this call silently report success
+// against the sweep's decision about someone else's leftovers: it must
+// retry and end up performing its own rename/absorb logic against the
+// correct content.
+func TestFinishPendingStageRetriesWhenFlightKeyIsForeign(t *testing.T) {
+	root := t.TempDir()
+	sbDir := filepath.Join(root, "sb")
+	pendingDir := filepath.Join(sbDir, "pending-tok")
+	if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	correct := []byte("correct-vmstate-bytes")
+	if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), correct, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	generation := "gen-foreign"
+	final := filepath.Join(sbDir, generation)
+	// Pre-existing, incomplete residue at the destination, as if an
+	// interrupted worker-side stageTask left a partial generation
+	// directory here before this pause's rename ever runs.
+	if err := os.MkdirAll(final, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(final, "vmstate.snap"), []byte("stale-residue"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	occupying := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_, _, _ = stagingFlights.Do(final, func() (any, error) {
+			close(occupying)
+			<-release
+			return nil, nil
+		})
+	}()
+	<-occupying // the foreign flight is registered and holding the key
+
+	staged := map[string]string{"vmstate.snap": filepath.Join(pendingDir, "vmstate.snap")}
+	done := make(chan struct{})
+	var outPaths map[string]string
+	var finishErr error
+	go func() {
+		outPaths, finishErr = FinishPendingStage(pendingDir, generation, staged)
+		close(done)
+	}()
+
+	// Give FinishPendingStage's first Do call a chance to actually join
+	// the foreign flight before releasing it.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	<-done
+
+	if finishErr != nil {
+		t.Fatalf("FinishPendingStage: %v", finishErr)
+	}
+	got, err := os.ReadFile(outPaths["vmstate.snap"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, correct) {
+		t.Fatalf("final holds %q, want the correct staged bytes %q: coalescing into the foreign flight must not have been trusted blindly", got, correct)
+	}
+}
+
+// An interrupted worker-side stageTask can leave a same-size but
+// divergent rootfs.ext4 at the generation path (the mutable source
+// changed mid-copy). Absorbing on size alone would discard the correct
+// pending copy and enqueue the divergent one, which the uploader's own
+// verification then rejects, losing the pause. Content, not just size,
+// must match before absorbing.
+func TestFinishPendingStageReplacesDivergentSameSizeResidue(t *testing.T) {
+	root := t.TempDir()
+	sbDir := filepath.Join(root, "sb")
+	pendingDir := filepath.Join(sbDir, "pending-tok")
+	if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), []byte("vmstate-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	correctDisk := []byte("correct-disk-bytes-of-fixed-size")
+	if err := os.WriteFile(filepath.Join(pendingDir, "rootfs.ext4"), correctDisk, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	generation := "gen-divergent"
+	final := filepath.Join(sbDir, generation)
+	if err := os.MkdirAll(final, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// vmstate matches (same bytes) but rootfs.ext4 is the same size,
+	// different content: exactly what an interrupted stageTask residue
+	// looks like.
+	if err := os.WriteFile(filepath.Join(final, "vmstate.snap"), []byte("vmstate-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	divergentDisk := append([]byte(nil), correctDisk...)
+	divergentDisk[0] ^= 0xFF
+	if err := os.WriteFile(filepath.Join(final, "rootfs.ext4"), divergentDisk, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staged := map[string]string{
+		"vmstate.snap": filepath.Join(pendingDir, "vmstate.snap"),
+		"rootfs.ext4":  filepath.Join(pendingDir, "rootfs.ext4"),
+	}
+	outPaths, err := FinishPendingStage(pendingDir, generation, staged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(outPaths["rootfs.ext4"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, correctDisk) {
+		t.Fatalf("final rootfs.ext4 = %q, want the correct pending bytes %q: divergent same-size residue must not be absorbed", got, correctDisk)
+	}
+}
+
+// Absorbing a pre-existing generation directory with no base.pin
+// (worker-side stageTask never pins one) must not discard pendingDir's
+// pin along with the rest of pendingDir: the pin is the only thing
+// protecting the pause-time base from template GC, and final's content
+// being otherwise correct doesn't change that.
+func TestFinishPendingStageTransfersBasePinWhenAbsorbing(t *testing.T) {
+	root := t.TempDir()
+	sbDir := filepath.Join(root, "sb")
+	pendingDir := filepath.Join(sbDir, "pending-tok")
+	if err := os.MkdirAll(pendingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pendingDir, "vmstate.snap"), []byte("vmstate-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pendingDir, "rootfs.ext4"), []byte("disk-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pinContent := []byte("pinned base bytes")
+	if err := os.WriteFile(filepath.Join(pendingDir, BasePinName), pinContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	generation := "gen-absorb-pin"
+	final := filepath.Join(sbDir, generation)
+	if err := os.MkdirAll(final, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(final, "vmstate.snap"), []byte("vmstate-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(final, "rootfs.ext4"), []byte("disk-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staged := map[string]string{
+		"vmstate.snap": filepath.Join(pendingDir, "vmstate.snap"),
+		"rootfs.ext4":  filepath.Join(pendingDir, "rootfs.ext4"),
+	}
+	if _, err := FinishPendingStage(pendingDir, generation, staged); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(final, BasePinName))
+	if err != nil {
+		t.Fatalf("base.pin missing from final after absorption: %v", err)
+	}
+	if !bytes.Equal(got, pinContent) {
+		t.Fatalf("transferred pin content = %q, want %q", got, pinContent)
+	}
+}
+
+// A delivery the consumer cannot land (control plane down, request
+// rejected) keeps the signal outboxed: only a nil return clears it, and
+// the next flush redelivers.
+func TestFailedNotificationDeliveryRedelivers(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(task, "test-bucket", true); err != nil {
+		t.Fatal(err)
+	}
+
+	var delivered []Task
+	fail := true
+	u := &Uploader{Journal: j, OnVerified: func(t Task) error {
+		if fail {
+			return errors.New("control plane unavailable")
+		}
+		delivered = append(delivered, t)
+		return nil
+	}}
+	u.flushNotifications()
+	if len(delivered) != 0 {
+		t.Fatalf("delivered = %+v, want none while delivery fails", delivered)
+	}
+	pending, err := j.PendingNotifications(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("outbox = %+v, want the undelivered signal retained", pending)
+	}
+
+	// The failure armed the retry spacing; a flush inside the window is
+	// a no-op even with the consumer healthy again.
+	fail = false
+	u.flushNotifications()
+	if len(delivered) != 0 {
+		t.Fatalf("delivered = %+v inside the retry window, want none", delivered)
+	}
+	u.notifyRetryAt = time.Time{}
+	u.flushNotifications()
+	if len(delivered) != 1 || delivered[0].Generation != "gen" {
+		t.Fatalf("delivered = %+v, want the retained signal once", delivered)
+	}
+	if pending, err = j.PendingNotifications(0); err != nil || len(pending) != 0 {
+		t.Fatalf("outbox after success = %+v (err %v), want empty", pending, err)
+	}
+}
+
+// A delivery failure stops the batch: with the control plane down, every
+// entry would fail and each attempt can hold the drain goroutine for the
+// full request timeout. The whole batch redelivers after the window.
+func TestFailedNotificationDeliveryStopsTheBatch(t *testing.T) {
+	j, _ := testJournal(t)
+	for i, gen := range []string{"gen-1", "gen-2"} {
+		task := Task{SandboxID: "sb-" + gen, Generation: gen, EnqueuedAt: time.Unix(int64(i+1), 0)}
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Ack(task, "test-bucket", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	attempts := 0
+	u := &Uploader{Journal: j, OnVerified: func(Task) error {
+		attempts++
+		return errors.New("control plane unavailable")
+	}}
+	u.flushNotifications()
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want the batch stopped after the first failure", attempts)
+	}
+	if pending, err := j.PendingNotifications(0); err != nil || len(pending) != 2 {
+		t.Fatalf("outbox = %d entries (err %v), want both retained", len(pending), err)
+	}
+}
+
+// The outbox copy pins the bucket the upload verified against, so a
+// restart that repoints BACKUP_BUCKET cannot mislabel old completions.
+func TestOutboxPinsVerifiedBucket(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(task, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := j.PendingNotifications(0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("outbox = %v (err %v), want one entry", pending, err)
+	}
+	if pending[0].VerifiedBucket != "bucket-a" {
+		t.Fatalf("VerifiedBucket = %q, want the ack-time scope", pending[0].VerifiedBucket)
+	}
+	if pending[0].VerifiedAt.IsZero() {
+		t.Fatal("VerifiedAt not pinned at ack time")
+	}
+}
+
+// A task that keeps failing must not retry forever: unbounded retry
+// turns one stuck task class into monotonic journal and staging growth.
+// At the ceiling the task abandons (no completion, staging removed) and
+// the owner's next pause covers.
+func TestUploadRetriesExhaustedAbandons(t *testing.T) {
+	j, _ := testJournal(t)
+	staging := t.TempDir()
+	task := Task{SandboxID: "sb", Generation: "gen-stuck",
+		Files:      []TaskFile{{Name: "rootfs.ext4", Path: "/nonexistent/never-readable", SHA256: "aa", Size: 1}},
+		Attempts:   maxUploadAttempts - 1,
+		EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	staged := filepath.Join(staging, "sb", "gen-stuck")
+	if err := os.MkdirAll(staged, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	u := &Uploader{Journal: j, StagingRoot: staging,
+		Store: &memStore{}, Log: zerolog.Nop()}
+	// uploadTask must error (unreadable source with a manifest digest
+	// forces the failure path rather than clean abandonment).
+	worked, err := u.drainOne(context.Background(), time.Unix(10, 0))
+	if err != nil || !worked {
+		t.Fatalf("drainOne = %v %v", worked, err)
+	}
+	if pending, err := j.HasPending("sb", "gen-stuck"); err != nil || pending {
+		t.Fatalf("HasPending = %v (err %v), want the exhausted task gone", pending, err)
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Fatalf("staged dir still present (err %v), want removed on exhaustion", err)
+	}
+	if verified, err := j.WasVerified("gen-stuck", time.Unix(10, 0)); err != nil || verified {
+		t.Fatalf("WasVerified = %v (err %v), want no completion recorded", verified, err)
+	}
+}
+
+// Store failures are environmental and exempt from the retry ceiling: an
+// outage must never exhaust durable work whose bytes become uploadable
+// the moment the store recovers.
+func TestStoreErrorsExemptFromRetryCeiling(t *testing.T) {
+	j, _ := testJournal(t)
+	src := filepath.Join(t.TempDir(), "rootfs.ext4")
+	if err := os.WriteFile(src, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("x"))
+	task := Task{SandboxID: "sb", Generation: "gen-outage",
+		Files:      []TaskFile{{Name: "rootfs.ext4", Path: src, SHA256: hex.EncodeToString(sum[:]), Size: 1}},
+		Attempts:   maxUploadAttempts + 5,
+		EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	u := &Uploader{Journal: j, Store: outageStore{newMemStore()}, Log: zerolog.Nop()}
+	worked, err := u.drainOne(context.Background(), time.Unix(10, 0))
+	if err != nil || !worked {
+		t.Fatalf("drainOne = %v %v", worked, err)
+	}
+	if pending, err := j.HasPending("sb", "gen-outage"); err != nil || !pending {
+		t.Fatalf("HasPending = %v (err %v), want the task retained through the outage", pending, err)
+	}
+}
+
+// A retired staging tree drains under journal authority and the root
+// itself is removed only once nothing survives inside it.
+func TestLegacyStagingDrainsThenRemoves(t *testing.T) {
+	j, _ := testJournal(t)
+	legacy := filepath.Join(t.TempDir(), "backup-staging")
+	old := time.Now().Add(-2 * time.Hour)
+
+	// One dir a queued task still references, one orphan past grace.
+	kept := filepath.Join(legacy, "sb-live", "gen-live")
+	orphan := filepath.Join(legacy, "sb-dead", "gen-dead")
+	for _, d := range []string{kept, orphan} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(d, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.Enqueue(Task{SandboxID: "sb-live", Generation: "gen-live",
+		Files:      []TaskFile{{Name: "rootfs.ext4", Path: filepath.Join(kept, "rootfs.ext4"), SHA256: "aa", Size: 1}},
+		EnqueuedAt: time.Unix(1, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(legacy, "bases"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	u := &Uploader{Journal: j, LegacyStagingRoot: legacy, Log: zerolog.Nop()}
+	u.sweepLegacyStaging()
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan survived the legacy sweep (err %v)", err)
+	}
+	if _, err := os.Stat(kept); err != nil {
+		t.Fatalf("referenced staging deleted by the legacy sweep: %v", err)
+	}
+	if u.LegacyStagingRoot == "" {
+		t.Fatal("legacy root cleared while a referenced entry survives")
+	}
+
+	// Drain the reference; the next sweep empties and removes the root.
+	// The ack must name the row's exact identity (EnqueuedAt included):
+	// resolution is fenced on the row existing at the task's own key.
+	if _, err := j.Ack(Task{SandboxID: "sb-live", Generation: "gen-live", EnqueuedAt: time.Unix(1, 0)}, "", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(kept, old, old); err != nil {
+		t.Fatal(err)
+	}
+	u.sweepLegacyStaging()
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy root survived after draining (err %v)", err)
+	}
+	if u.LegacyStagingRoot != "" {
+		t.Fatal("legacy root not cleared after removal")
+	}
+}
+
+// rendezvousStore blocks every Create until two have arrived: only a
+// genuinely parallel drain (two workers mid-upload at once) can pass.
+type rendezvousStore struct {
+	*memStore
+	arrivals atomic.Int32
+	gate     chan struct{}
+}
+
+func (r *rendezvousStore) Create(ctx context.Context, object string, rd io.Reader) (bool, error) {
+	if r.arrivals.Add(1) == 2 {
+		close(r.gate)
+	}
+	select {
+	case <-r.gate:
+	case <-time.After(10 * time.Second):
+		return false, errors.New("no concurrent upload arrived: drain is serial")
+	}
+	return r.memStore.Create(ctx, object, rd)
+}
+
+// Two workers drain two tasks at the same time, sharing the journal's
+// claims: every object is created exactly once (no duplicated work) and
+// the whole backlog completes.
+func TestRunDrainsConcurrentlyWithoutDuplicating(t *testing.T) {
+	j, _ := testJournal(t)
+	store := &rendezvousStore{memStore: newMemStore(), gate: make(chan struct{})}
+	dirA, dirB := t.TempDir(), t.TempDir()
+	taskA := writeTask(t, dirA)
+	taskB := writeTask(t, dirB)
+	taskB.SandboxID = "sb-2"
+	// Distinct bytes so the two generations share no objects.
+	if err := os.WriteFile(taskB.Files[0].Path, []byte("diskdatb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	taskB.Files[0].SHA256 = digestOf([]byte("diskdatb"))
+	for _, task := range []Task{taskA, taskB} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	u := &Uploader{Journal: j, Store: store, Concurrency: 2, Tick: time.Millisecond}
+	done := make(chan error, 1)
+	go func() { done <- u.Run(ctx) }()
+	deadline := time.After(15 * time.Second)
+	for {
+		counts, err := j.Pending()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if counts[PriorityPause] == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("backlog never drained: %v", counts)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"sandboxes/sb-1/gen-abc/manifest.json",
+		"sandboxes/sb-2/gen-abc/manifest.json",
+	} {
+		if _, ok := store.objects[want]; !ok {
+			t.Fatalf("missing %s; objects: %v", want, len(store.objects))
+		}
+	}
+	// Claims made each task exclusive: nothing was uploaded twice.
+	for obj, n := range store.creates {
+		if n != 1 {
+			t.Fatalf("object %s created %d times, want 1", obj, n)
+		}
+	}
+}
+
+// baseGateStore blocks shared-base creates until released, counting the
+// attempts: coalescing means the second generation's worker waits on the
+// per-object lock instead of issuing its own multi-GB stream.
+type baseGateStore struct {
+	*memStore
+	release      chan struct{}
+	entered      chan struct{}
+	enteredOnce  sync.Once
+	baseAttempts atomic.Int32
+}
+
+func (s *baseGateStore) Create(ctx context.Context, object string, r io.Reader) (bool, error) {
+	if strings.HasPrefix(object, "bases/") {
+		s.baseAttempts.Add(1)
+		s.enteredOnce.Do(func() { close(s.entered) })
+		select {
+		case <-s.release:
+		case <-time.After(10 * time.Second):
+			return false, errors.New("base gate never released")
+		}
+	}
+	return s.memStore.Create(ctx, object, r)
+}
+
+// Two generations on the same not-yet-verified base drain concurrently:
+// exactly one worker streams the base, the other waits on the shared
+// lock and reuses the winner's recorded verification.
+func TestConcurrentWorkersCoalesceSharedBaseUpload(t *testing.T) {
+	j, _ := testJournal(t)
+	store := &baseGateStore{memStore: newMemStore(), release: make(chan struct{}), entered: make(chan struct{})}
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.ext4")
+	baseData := []byte("shared base bytes")
+	if err := os.WriteFile(base, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseSHA := digestOf(baseData)
+	for i, sb := range []string{"sb-1", "sb-2"} {
+		overlay := filepath.Join(dir, fmt.Sprintf("overlay-%d.ext4", i))
+		data := []byte(fmt.Sprintf("overlay-%d", i))
+		if err := os.WriteFile(overlay, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		task := Task{
+			SandboxID:  sb,
+			Generation: fmt.Sprintf("gen-%d", i),
+			Priority:   PriorityPause,
+			EnqueuedAt: time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC),
+			Files: []TaskFile{{
+				Name: "overlay.ext4", Path: overlay, SHA256: digestOf(data), Size: int64(len(data)),
+				BasePath: base, BaseSHA256: baseSHA,
+			}},
+		}
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	u := &Uploader{Journal: j, Store: store, Concurrency: 2, Tick: time.Millisecond}
+	done := make(chan error, 1)
+	go func() { done <- u.Run(ctx) }()
+	// One worker is mid-stream on the base; give the other time to reach
+	// the shared lock, then confirm it did NOT start a second stream.
+	<-store.entered
+	time.Sleep(200 * time.Millisecond)
+	if n := store.baseAttempts.Load(); n != 1 {
+		t.Fatalf("base create attempts while gated = %d, want 1 (second worker must wait, not stream)", n)
+	}
+	close(store.release)
+	deadline := time.After(15 * time.Second)
+	for {
+		counts, err := j.Pending()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if counts[PriorityPause] == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("backlog never drained: %v", counts)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if n := store.baseAttempts.Load(); n != 1 {
+		t.Fatalf("total base create attempts = %d, want 1 (waiter reuses verification)", n)
+	}
+	for _, want := range []string{
+		"sandboxes/sb-1/gen-0/manifest.json",
+		"sandboxes/sb-2/gen-1/manifest.json",
+	} {
+		if _, ok := store.objects[want]; !ok {
+			t.Fatalf("missing %s", want)
+		}
+	}
+}
+
+// outageStore fails every Create, the shape of a store outage.
+type outageStore struct{ BlobStore }
+
+func (outageStore) Create(context.Context, string, io.Reader) (bool, error) {
+	return false, errors.New("store unavailable")
+}
+
+// After a bucket repoint, the same generation legitimately completes once
+// per bucket. Outbox entries are keyed by verified bucket, so the second
+// ack must not overwrite the first bucket's undelivered signal, and
+// clearing one delivery leaves the other outboxed.
+func TestOutboxKeepsPerBucketNotifications(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(task, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(task, "bucket-b", true); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := j.PendingNotifications(0)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("outbox = %d entries (err %v), want one per bucket", len(pending), err)
+	}
+	buckets := map[string]bool{}
+	for _, p := range pending {
+		buckets[p.VerifiedBucket] = true
+	}
+	if !buckets["bucket-a"] || !buckets["bucket-b"] {
+		t.Fatalf("outbox buckets = %v, want both pinned buckets", buckets)
+	}
+
+	// Clearing one bucket's delivery leaves the other signal outboxed.
+	cleared := pending[0]
+	if err := j.ClearNotification(cleared); err != nil {
+		t.Fatal(err)
+	}
+	rest, err := j.PendingNotifications(0)
+	if err != nil || len(rest) != 1 {
+		t.Fatalf("outbox after clear = %d entries (err %v), want 1", len(rest), err)
+	}
+	if rest[0].VerifiedBucket == cleared.VerifiedBucket {
+		t.Fatal("clear removed the wrong bucket's entry")
+	}
+}
+
+// Across the key-format upgrade, a legacy unscoped entry and a scoped
+// entry for the same owner/generation can coexist. Clearing one shape
+// must not discard the other's undelivered signal.
+func TestClearNotificationLeavesOtherKeyShape(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	// Legacy entry: written under the unscoped key with no pinned bucket,
+	// as the pre-upgrade code did.
+	legacy := task
+	legacyVal, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(outboxBucket).Put(task.indexKey(), legacyVal)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Scoped entry from the current code.
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(task, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := j.PendingNotifications(0)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("outbox = %d entries (err %v), want both shapes", len(pending), err)
+	}
+	var scoped Task
+	for _, p := range pending {
+		if p.VerifiedBucket != "" {
+			scoped = p
+		}
+	}
+	if err := j.ClearNotification(scoped); err != nil {
+		t.Fatal(err)
+	}
+	rest, err := j.PendingNotifications(0)
+	if err != nil || len(rest) != 1 || rest[0].VerifiedBucket != "" {
+		t.Fatalf("after scoped clear = %+v (err %v), want the legacy entry retained", rest, err)
+	}
+	if err := j.ClearNotification(rest[0]); err != nil {
+		t.Fatal(err)
+	}
+	if final, _ := j.PendingNotifications(0); len(final) != 0 {
+		t.Fatalf("after legacy clear = %d entries, want empty", len(final))
+	}
+}
+
+// Completions acked before reporter wiring existed have no outbox entry
+// and their sandboxes may never pause again; the seed backfills them
+// into the outbox once per scope, without touching other scopes or
+// overwriting live entries.
+func TestSeedOutboxFromCompletions(t *testing.T) {
+	j, _ := testJournal(t)
+	// Pre-rollout acks: completed, but notify=false (no consumer existed).
+	sb := Task{SandboxID: "sb-old", Generation: "gen-1", EnqueuedAt: time.Unix(1, 0)}
+	tpl := Task{TemplateID: "tpl", BuildID: "b1", Generation: "gen-2", EnqueuedAt: time.Unix(2, 0)}
+	other := Task{SandboxID: "sb-other", Generation: "gen-3", EnqueuedAt: time.Unix(3, 0)}
+	for _, task := range []Task{sb, tpl} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Ack(task, "bucket-a", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.Enqueue(other); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(other, "bucket-b", false); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := j.SeedOutboxFromCompletions(); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := j.PendingNotifications(0)
+	if err != nil || len(pending) != 3 {
+		t.Fatalf("outbox after seed = %d entries (err %v), want all three scopes' completions", len(pending), err)
+	}
+	for _, p := range pending {
+		want := "bucket-a"
+		if p.SandboxID == "sb-other" {
+			// Every recorded scope seeds, each entry pinning its own
+			// bucket: pre-reporter completions under an earlier
+			// BACKUP_BUCKET still name real objects there.
+			want = "bucket-b"
+		}
+		if p.VerifiedBucket != want || p.VerifiedAt.IsZero() {
+			t.Fatalf("seeded entry = %+v, want pinned %s and ack instant", p, want)
+		}
+		if p.TemplateID == "tpl" && p.BuildID != "b1" {
+			t.Fatalf("template seed lost its build id: %+v", p)
+		}
+	}
+
+	// Delivery clears, and a second seed resurrects nothing already
+	// processed (the high-water mark advanced past those acks).
+	for _, p := range pending {
+		if err := j.ClearNotification(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := j.SeedOutboxFromCompletions(); err != nil {
+		t.Fatal(err)
+	}
+	if rest, _ := j.PendingNotifications(0); len(rest) != 0 {
+		t.Fatalf("second seed resurrected %d entries, want 0", len(rest))
+	}
+
+	// A completion acked AFTER the last seed (a rollback window running
+	// an older uploader, whose acks bank nothing) is caught by the next
+	// seed instead of being suppressed forever.
+	late := Task{SandboxID: "sb-late", Generation: "gen-late", EnqueuedAt: time.Unix(9, 0)}
+	if err := j.Enqueue(late); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(late, "bucket-a", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.SeedOutboxFromCompletions(); err != nil {
+		t.Fatal(err)
+	}
+	caught, err := j.PendingNotifications(0)
+	if err != nil || len(caught) != 1 || caught[0].SandboxID != "sb-late" {
+		t.Fatalf("post-rollback seed = %+v (err %v), want the late completion", caught, err)
+	}
+}
+
+// Completions bank their notification even without a consumer: a vmd
+// running with reporting unwired must not lose the window's signals,
+// since the seed marker is once per scope and cannot rescan.
+func TestCompletionsOutboxWithoutConsumer(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	u := &Uploader{Journal: j, Store: newMemStore()}
+	worked, err := u.drainOne(context.Background(), time.Now())
+	if err != nil || !worked {
+		t.Fatalf("drainOne: worked=%v err=%v", worked, err)
+	}
+	pending, err := j.PendingNotifications(0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("outbox = %d entries (err %v), want the completion banked", len(pending), err)
+	}
+	if pending[0].VerifiedBucket == "" {
+		t.Fatal("banked entry missing its pinned bucket")
+	}
+}
+
+// A deep outbox converges across bounded flushes instead of holding the
+// drain loop through every entry at once.
+func TestFlushNotificationsBoundsTheBatch(t *testing.T) {
+	j, _ := testJournal(t)
+	for i := 0; i < notifyFlushBatch+5; i++ {
+		task := Task{SandboxID: fmt.Sprintf("sb-%03d", i), Generation: fmt.Sprintf("gen-%03d", i), EnqueuedAt: time.Unix(int64(i+1), 0)}
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Ack(task, "bucket", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	delivered := 0
+	u := &Uploader{Journal: j, OnVerified: func(Task) error { delivered++; return nil }}
+	u.flushNotifications()
+	if delivered != notifyFlushBatch {
+		t.Fatalf("first flush delivered %d, want the batch bound %d", delivered, notifyFlushBatch)
+	}
+	u.flushNotifications()
+	if delivered != notifyFlushBatch+5 {
+		t.Fatalf("second flush delivered %d total, want all %d", delivered, notifyFlushBatch+5)
+	}
+}
+
+// A history larger than one chunk seeds across multiple bounded
+// transactions, resuming at the persisted cursor, and the high-water
+// mark advances only when a full scan completes.
+func TestSeedChunksAndResumes(t *testing.T) {
+	j, _ := testJournal(t)
+	total := seedChunkLimit + 40
+	for i := 0; i < total; i++ {
+		task := Task{SandboxID: fmt.Sprintf("sb-%04d", i), Generation: fmt.Sprintf("gen-%04d", i), EnqueuedAt: time.Unix(int64(i+1), 0)}
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Ack(task, "bucket-a", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done, err := j.SeedOutboxFromCompletions()
+	if err != nil || done {
+		t.Fatalf("first chunk done=%v err=%v, want an incomplete scan", done, err)
+	}
+	rounds := 1
+	for !done {
+		if rounds > 10 {
+			t.Fatal("seed never completed")
+		}
+		done, err = j.SeedOutboxFromCompletions()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rounds++
+	}
+	if pending, err := j.PendingNotifications(0); err != nil || len(pending) != total {
+		t.Fatalf("outbox after chunked seed = %d (err %v), want %d", len(pending), err, total)
+	}
+	// Converged history: passes paginate cheaply and reach the fixed
+	// point (a clean top-to-end pass finding nothing new) without
+	// changing the outbox.
+	done, rounds = false, 0
+	for !done {
+		if rounds > 10 {
+			t.Fatal("converged seed never reached its fixed point")
+		}
+		done, err = j.SeedOutboxFromCompletions()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rounds++
+	}
+	if pending, _ := j.PendingNotifications(0); len(pending) != total {
+		t.Fatalf("converged passes changed outbox to %d, want %d", len(pending), total)
+	}
+}
+
+// A rollback-interval re-ack of the SAME generation overwrites the
+// completion instant without touching the seeded record; the seed must
+// treat the mismatch as unseeded and deliver the newer instant.
+func TestSeedReseedsReacknowledgedCompletion(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(task, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+	banked, err := j.PendingNotifications(0)
+	if err != nil || len(banked) != 1 {
+		t.Fatalf("banked = %v err=%v", banked, err)
+	}
+	first := banked[0].VerifiedAt
+	if err := j.ClearNotification(banked[0]); err != nil {
+		t.Fatal(err)
+	}
+	for done := false; !done; {
+		if done, err = j.SeedOutboxFromCompletions(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rest, _ := j.PendingNotifications(0); len(rest) != 0 {
+		t.Fatalf("seed resurrected a delivered completion: %v", rest)
+	}
+
+	// The old binary re-acks the same generation (no outbox banking).
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(task, "bucket-a", false); err != nil {
+		t.Fatal(err)
+	}
+	for done := false; !done; {
+		if done, err = j.SeedOutboxFromCompletions(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reseeded, err := j.PendingNotifications(0)
+	if err != nil || len(reseeded) != 1 {
+		t.Fatalf("re-ack not reseeded: %v err=%v", reseeded, err)
+	}
+	if !reseeded[0].VerifiedAt.After(first) {
+		t.Fatalf("reseeded instant %v not after first %v", reseeded[0].VerifiedAt, first)
+	}
+}
+
+// A rollback re-ack while the previous notification is still outboxed
+// must refresh the entry's instant in place, preserving its payload.
+func TestSeedRefreshesUndeliveredEntryOnReack(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0),
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/p", SHA256: "aa", Size: 1}}}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(task, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+	banked, _ := j.PendingNotifications(0)
+	first := banked[0].VerifiedAt
+
+	// Rollback re-ack before delivery: completion instant moves on.
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(task, "bucket-a", false); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	for done := false; !done; {
+		if done, err = j.SeedOutboxFromCompletions(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refreshed, err := j.PendingNotifications(0)
+	if err != nil || len(refreshed) != 1 {
+		t.Fatalf("outbox = %v err=%v, want one refreshed entry", refreshed, err)
+	}
+	if !refreshed[0].VerifiedAt.After(first) {
+		t.Fatalf("instant %v not refreshed past %v", refreshed[0].VerifiedAt, first)
+	}
+	if len(refreshed[0].Files) != 1 {
+		t.Fatalf("refresh lost the entry's file manifest: %+v", refreshed[0])
 	}
 }

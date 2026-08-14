@@ -7,6 +7,37 @@ CPUAccounting=yes
 MemoryAccounting=yes
 IOAccounting=yes
 
+# Weight sandbox VMs above everything in system.slice under contention.
+# cgroup weights only compare SIBLINGS, and this slice's root-level
+# siblings (system.slice, user.slice, init.scope, machine.slice where
+# present — default weight 100 each) split first: weights set on
+# individual services inside system.slice (vmd included) can never bias
+# those services against the VMs here. 400 is a 4:1 advantage over EACH
+# default-weight sibling, not a fixed share: 80% of CPU and IO when only
+# system.slice competes (vmd's backup hashing and upload streaming, the
+# proxy, every other daemon divide its 100), less as more siblings have
+# runnable work (~67% with user.slice also busy — SSH sessions,
+# including the deploy itself, run there). Weights are proportional
+# shares rather than caps, so an idle host's full throughput stays
+# available to whoever wants it (background backup drain included).
+# IOWeight additionally requires an io-cost model on the device to bite
+# (kernel-dependent); CPUWeight is the load-bearing half.
+#
+# Known tradeoff: vmd's synchronous lifecycle orchestration (launch,
+# pause, resume RPC handling) shares system.slice's reduced footing —
+# the slice split cannot distinguish it from vmd's background work.
+# Narrower than it sounds: the heavy half of those paths (snapshot and
+# guest-memory writes) runs inside the Firecracker processes, which sit
+# in THIS slice on the favored side; vmd's own synchronous share is the
+# O(dirtied-bytes) staging copy and small hashes. The pause-hook
+# duration histogram is the guard metric for the remainder — a
+# regression there under load argues for isolating the uploader's
+# workers instead (thread-scoped cgroups cover CPU; full IO isolation
+# needs the uploader out-of-process, since io is a domain controller),
+# not for weakening this split.
+CPUWeight=400
+IOWeight=400
+
 # Memory ceiling: percentage is of total host RAM (correct semantics).
 MemoryMax=95%
 

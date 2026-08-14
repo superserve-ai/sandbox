@@ -50,10 +50,10 @@ func (c *instrumentedVMDClient) PauseInstance(ctx context.Context, instanceID, s
 	return c.next.PauseInstance(ctx, instanceID, snapshotDir)
 }
 
-func (c *instrumentedVMDClient) ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error) {
+func (c *instrumentedVMDClient) ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte) (ipAddress string, actualVcpu, actualMemMiB uint32, err error) {
 	started := time.Now()
 	defer func() { c.record(ctx, "ResumeVM", started, err) }()
-	return c.next.ResumeInstance(ctx, instanceID, snapshotPath, memPath)
+	return c.next.ResumeInstance(ctx, instanceID, snapshotPath, memPath, networkConfig)
 }
 
 func (c *instrumentedVMDClient) RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, err error) {

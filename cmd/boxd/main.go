@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1391,47 +1392,140 @@ func writeStorageFull(w http.ResponseWriter, partialPath string) {
 	_, _ = w.Write([]byte(storageFullResponse))
 }
 
-func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		// mkdir itself can hit ENOSPC if the sandbox is already
-		// brimming — inodes exhausted, no room for a new directory
-		// entry. Surface it as the same storage-full error so users
-		// get one consistent code for "you're out of disk" regardless
-		// of which syscall tripped it.
-		if errors.Is(err, syscall.ENOSPC) {
-			writeStorageFull(w, "")
-			return
+// staleHandleRetryBudget bounds total wall-clock time spent retrying a
+// write that fails with ESTALE, not attempt count. Observed ESTALE
+// failures aren't a cheap instant syscall error — the write() call
+// itself has been seen blocking for several seconds (up to ~18s) before
+// returning ESTALE, so a fixed attempt count could multiply an already
+// slow failure by 4x and blow well past any caller's timeout. Bounding
+// by elapsed time means a single slow attempt already exhausts the
+// budget and we fail fast with roughly the same latency as before,
+// while a fast-resolving stale handle still gets a few quick retries
+// within the window.
+const staleHandleRetryBudget = 5 * time.Second
+
+// staleHandleRetryDelay is the pause between retry attempts. It's small
+// and fixed rather than exponential: staleHandleRetryBudget is what
+// actually bounds total latency, so growing the backoff on top of that
+// would just eat into the retry budget without a compensating benefit.
+const staleHandleRetryDelay = 150 * time.Millisecond
+
+// staleHandleRetryBodyLimit caps how large a request body we'll buffer
+// in memory to make it replayable across ESTALE retries. Retrying means
+// replaying the same bytes into a fresh open(), which needs the body
+// in memory, but buffering an arbitrarily large upload risks OOMing the
+// guest -- the proxy allows uploads up to 4 GiB (internal/proxy/files.go),
+// far larger than typical guest memory. Bodies at or under the limit get
+// buffered and retried; anything larger streams straight through with a
+// single attempt and no retry, the same behavior as before this logic
+// existed.
+const staleHandleRetryBodyLimit = 32 << 20 // 32 MiB
+
+// staleHandleRetryTotalBudget bounds the AGGREGATE bytes buffered for
+// ESTALE retry across all concurrent uploads, not just one request. The
+// per-request cap alone isn't enough: the proxy allows up to 200
+// concurrent connections to a single sandbox (internal/proxy/proxy.go),
+// and the smallest supported sandbox has only 256 MiB of RAM total
+// (internal/api/handlers_template.go) -- eight simultaneous near-cap
+// uploads could otherwise buffer the guest's entire memory allocation
+// between them, before boxd's own overhead or the guest OS. A request
+// that can't get a reservation falls back to the streamed, non-retrying
+// path, the same degradation an oversized single body already gets.
+const staleHandleRetryTotalBudget = 32 << 20 // 32 MiB
+
+var staleHandleRetryBytesInFlight atomic.Int64
+
+// reserveRetryBudget attempts to claim n bytes from the shared retry
+// buffering budget, returning false if that would exceed it.
+func reserveRetryBudget(n int64) bool {
+	for {
+		cur := staleHandleRetryBytesInFlight.Load()
+		if cur+n > staleHandleRetryTotalBudget {
+			return false
 		}
-		errJSON, _ := json.Marshal(map[string]string{"error": "mkdir: " + err.Error()})
-		http.Error(w, string(errJSON), http.StatusInternalServerError)
-		return
+		if staleHandleRetryBytesInFlight.CompareAndSwap(cur, cur+n) {
+			return true
+		}
+	}
+}
+
+func releaseRetryBudget(n int64) {
+	staleHandleRetryBytesInFlight.Add(-n)
+}
+
+func isStaleHandle(err error) bool {
+	return errors.Is(err, syscall.ESTALE)
+}
+
+// writeFileAttempt performs one mkdir+open+write+close cycle, copying
+// body into the file. It's split out so handleFileUpload can retry the
+// whole sequence on ESTALE — the mkdir and the open can each
+// independently observe a stale handle on the same mount. body is an
+// io.Reader rather than a []byte so the same function serves both the
+// buffered (retryable) and streamed (large-upload) paths.
+func writeFileAttempt(path string, body io.Reader) (int64, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return 0, fmt.Errorf("mkdir: %w", err)
 	}
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		if errors.Is(err, syscall.ENOSPC) {
-			writeStorageFull(w, "")
-			return
-		}
-		errJSON, _ := json.Marshal(map[string]string{"error": "create file: " + err.Error()})
+		return 0, fmt.Errorf("create file: %w", err)
+	}
+
+	written, werr := io.Copy(f, body)
+	cerr := f.Close()
+	if werr != nil {
+		_ = os.Remove(path)
+		return 0, fmt.Errorf("write: %w", werr)
+	}
+	if cerr != nil {
+		_ = os.Remove(path)
+		return 0, fmt.Errorf("write: %w", cerr)
+	}
+	return written, nil
+}
+
+func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
+	// Peek up to the retry-buffer limit rather than reading the whole
+	// body blindly. If the body is larger than the limit, len(peeked)
+	// comes back as limit+1 without hitting EOF, and we fall through to
+	// the streamed, non-retrying path with those bytes stitched back
+	// onto the front of the body.
+	peeked, err := io.ReadAll(io.LimitReader(r.Body, staleHandleRetryBodyLimit+1))
+	if err != nil {
+		errJSON, _ := json.Marshal(map[string]string{"error": "read body: " + err.Error()})
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
 		return
 	}
 
-	written, err := io.Copy(f, r.Body)
-	f.Close()
+	var written int64
+	peekedLen := int64(len(peeked))
+	if peekedLen > staleHandleRetryBodyLimit || !reserveRetryBudget(peekedLen) {
+		// Too large to buffer at all, or the aggregate budget is
+		// currently claimed by other concurrent uploads -- stream
+		// through once with no retry rather than risk an OOM.
+		written, err = writeFileAttempt(path, io.MultiReader(bytes.NewReader(peeked), r.Body))
+	} else {
+		defer releaseRetryBudget(peekedLen)
+		deadline := time.Now().Add(staleHandleRetryBudget)
+		for {
+			written, err = writeFileAttempt(path, bytes.NewReader(peeked))
+			if err == nil || !isStaleHandle(err) || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(staleHandleRetryDelay)
+			if time.Now().After(deadline) {
+				break
+			}
+		}
+	}
 	if err != nil {
-		// Remove the partial file — a truncated upload is never useful
-		// to the caller. This handles both ENOSPC (disk full) and
-		// client disconnect (network drop, cancel) so interrupted
-		// uploads don't leave orphaned files eating disk space.
-		_ = os.Remove(path)
-
 		if errors.Is(err, syscall.ENOSPC) {
 			writeStorageFull(w, "")
 			return
 		}
-		errJSON, _ := json.Marshal(map[string]string{"error": "write: " + err.Error()})
+		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
 		return
 	}

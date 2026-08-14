@@ -90,7 +90,7 @@ WITH tpl AS (
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
@@ -156,7 +156,7 @@ WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 
 -- name: UpdateSandboxHost :exec
 UPDATE sandbox
-SET host_id = $2, ip_address = $3, pid = $4, updated_at = now()
+SET host_id = $2, ip_address = $3, pid = COALESCE($4, pid), updated_at = now()
 WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL;
 
 -- name: ActivateSandbox :exec
@@ -277,12 +277,24 @@ WHERE host_id = sqlc.arg(host_id)
   AND destroyed_at IS NOT NULL
   AND destroyed_at > sqlc.arg(destroyed_after);
 
--- name: MarkSandboxFailed :exec
+-- name: MarkSandboxFailed :one
 -- Used by the reconciler to mark a sandbox failed when VMD detects it is
 -- actually gone. No team_id filter — the reconciler runs with host scope,
--- not team scope. The CTE bundles the active-interval close into the same
--- statement so a crash/timeout between the two writes can't leave the
--- interval open and have analytics count the actor as active forever.
+-- not team scope. Guarded on the lifecycle state the caller observed, not on
+-- updated_at: that column moves for metadata and network-config edits too, so
+-- a version compare would silently refuse the flip for a sandbox that is just
+-- as dead. Callers pass the status their rule matched on — 'active' for a dead
+-- VM, 'paused' for an unusable snapshot — so a row that has moved on since the
+-- pass snapshot is left alone.
+-- The CTEs bundle the interval closes into the same statement so a
+-- crash/timeout between the writes can't leave an interval open and have
+-- analytics count the actor as active forever.
+--
+-- Counts the sandbox CTE, not the last statement: the billing interval is
+-- only opened for teams with billing_metrics_write, so its row count reads 0
+-- for a flip that did happen. Postgres runs every data-modifying CTE exactly
+-- once whether or not the primary query reads its output, so selecting from
+-- `failed` still performs both closes.
 WITH failed AS (
   UPDATE sandbox
   -- auto_delete_at is cleared: the deadline is only meaningful in 'paused',
@@ -290,6 +302,7 @@ WITH failed AS (
   -- ever returned to 'paused' by a recovery path.
   SET status = 'failed', auto_delete_at = NULL, updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
+    AND sandbox.status = sqlc.arg(observed_status)
   RETURNING id
 ),
 closed_active AS (
@@ -298,11 +311,15 @@ closed_active AS (
   WHERE sandbox_id IN (SELECT id FROM failed)
     AND ended_at IS NULL
   RETURNING sandbox_id
+),
+closed_billing AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
+  WHERE sandbox_id IN (SELECT id FROM failed)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
 )
-UPDATE sandbox_compute_billing_interval
-SET ended_at = GREATEST(now(), started_at), end_reason = 'failed'
-WHERE sandbox_id IN (SELECT id FROM failed)
-  AND ended_at IS NULL;
+SELECT count(*) FROM failed;
 
 -- name: MarkSandboxFailedInTeam :exec
 -- Like MarkSandboxFailed but with a team_id tenant check, used by handler
@@ -734,7 +751,7 @@ paused AS (
   SET status = 'pausing', updated_at = now()
   FROM expired
   WHERE sandbox.id = expired.id
-  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
+  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id, sandbox.network_config
 ),
 closed_intervals AS (
   -- Same atomicity story as BeginPause: bundle the active-interval close
@@ -755,7 +772,7 @@ closed_billing_compute AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
 

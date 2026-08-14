@@ -12,6 +12,8 @@ type captureRecorder struct {
 
 func (r *captureRecorder) RecordSandboxTransition(context.Context, SandboxTransition) {}
 
+func (r *captureRecorder) RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait) {}
+
 func (r *captureRecorder) RecordVMDCall(_ context.Context, call VMDCall) {
 	r.vmdCalls = append(r.vmdCalls, call)
 }
@@ -19,6 +21,10 @@ func (r *captureRecorder) RecordVMDCall(_ context.Context, call VMDCall) {
 func (r *captureRecorder) RecordHostCapacity(context.Context, HostCapacity) {}
 
 func (r *captureRecorder) RecordDBPoolStats(context.Context, DBPoolStats) {}
+
+func (r *captureRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure) {}
+
+func (r *captureRecorder) RecordLauncherState(context.Context, LauncherState) {}
 
 func TestInstrumentedVMDClientRecordsHostID(t *testing.T) {
 	recorder := &captureRecorder{}
