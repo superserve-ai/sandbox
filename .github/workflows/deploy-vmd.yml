@@ -180,6 +180,10 @@ jobs:
           # with no NVMe-backed local SSD (unlike use4/usw2), so this
           # points at its attached persistent disk instead of /mnt/localssd.
           BACKUP_JOURNAL_PATH: /mnt/sandbox-data/backup.db
+          # Staging validates parallel drain first; production stays on
+          # vmd's single-worker default until this soaks. Workers share
+          # one bandwidth cap, so this raises task throughput only.
+          BACKUP_UPLOAD_CONCURRENCY: "2"
           # Enables vmd's backup metrics exporter (host-local collector);
           # the backup alert policies read these series.
           OTEL_ENVIRONMENT: staging
@@ -327,6 +331,14 @@ jobs:
           # continuously while backups drain and can stall the uploader
           # if the (small) root disk fills.
           BACKUP_JOURNAL_PATH: /mnt/localssd/backup.db
+          # Two drain workers to clear the cell's pause-backup backlog:
+          # arrivals outpace the single-worker default here. Workers
+          # share one bandwidth cap (task throughput rises, egress does
+          # not), and the incremental host cost is one extra hash/read
+          # stream on a 192-core metal host with a 12-drive array.
+          # Held at 2 until the sandboxes.slice weighting lands; raise
+          # further only after it. Rollback is removing this line.
+          BACKUP_UPLOAD_CONCURRENCY: "2"
           # Enables vmd's backup metrics exporter (host-local collector);
           # the cell's backup alert policies, including backup-disabled,
           # cannot fire without these series.

@@ -712,13 +712,22 @@ func main() {
 		}
 		// Megabits per second, as the name says: 1 Mbit/s = 125000 B/s.
 		bytesPerSec := rate.Limit(mbps) * 125000
+		// Drain workers, not a bandwidth knob: per-task overhead is what
+		// bounds throughput once the pause rate outruns one serial loop.
+		// All workers share the single limiter above, so raising this
+		// never raises total egress past the bandwidth cap.
+		workers, _ := strconv.Atoi(envOrDefault("BACKUP_UPLOAD_CONCURRENCY", "1"))
+		if workers < 1 {
+			workers = 1
+		}
 		uploader := &backup.Uploader{
-			Journal:    journal,
-			Store:      backup.NewGCSStore(gcsClient, bucket),
-			Limiter:    rate.NewLimiter(bytesPerSec, 32<<20),
-			Log:        log.With().Str("component", "backup").Logger(),
-			VMDVersion: os.Getenv("SENTRY_RELEASE"),
-			Metrics:    backupMetrics,
+			Journal:     journal,
+			Store:       backup.NewGCSStore(gcsClient, bucket),
+			Limiter:     rate.NewLimiter(bytesPerSec, 32<<20),
+			Concurrency: workers,
+			Log:         log.With().Str("component", "backup").Logger(),
+			VMDVersion:  os.Getenv("SENTRY_RELEASE"),
+			Metrics:     backupMetrics,
 		}
 		// Staging pins enqueued artifacts so sandbox teardown cannot
 		// erase a queued generation; the sweep clears residue from
@@ -798,7 +807,7 @@ func main() {
 			defer close(upDone)
 			return uploader.Run(upCtx)
 		})
-		log.Info().Str("bucket", bucket).Int("bandwidth_mbps", mbps).Msg("backup uploader enabled")
+		log.Info().Str("bucket", bucket).Int("bandwidth_mbps", mbps).Int("workers", workers).Msg("backup uploader enabled")
 	}
 
 	// ---- Backup metrics sampler ----
@@ -819,9 +828,15 @@ func main() {
 				} else {
 					log.Warn().Err(err).Msg("backup metrics: journal pending read failed, dropping gauge from sample")
 				}
-				if oldest, ok, err := backupJournal.OldestEnqueuedAt(); err == nil {
-					if ok {
-						s.OldestPendingAge = time.Since(oldest)
+				if oldest, err := backupJournal.OldestEnqueuedAtByPriority(); err == nil {
+					if t, ok := oldest[backup.PriorityPause]; ok {
+						s.OldestPauseAge = time.Since(t)
+					}
+					if t, ok := oldest[backup.PriorityCheckpoint]; ok {
+						s.OldestCheckpointAge = time.Since(t)
+					}
+					if t, ok := oldest[backup.PriorityBestEffort]; ok {
+						s.OldestBestEffortAge = time.Since(t)
 					}
 					s.OldestPendingAgeOK = true
 				} else {
@@ -1030,13 +1045,12 @@ func main() {
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 	switch {
 	case adoptNetPool && slotsReserved && sweepSafe:
-		// Adopt the slots the previous run abandoned (or crashed out of) in
-		// the background: the pool starts warm within seconds instead of
-		// refilling from scratch, and boot never blocks on the pass.
-		go func() {
-			defer sentrylog.Recover("netpool adoption")
-			netPool.AdoptOrphanSlots(ctx)
-		}()
+		// Adopt the slots the previous run abandoned (or crashed out of):
+		// the pool starts warm within seconds instead of refilling from
+		// scratch. StartAdoption marks the pass underway before returning,
+		// so requests racing boot wait on it instead of building inline;
+		// the pass itself runs in the background and never blocks boot.
+		netPool.StartAdoption(ctx)
 	case adoptNetPool:
 		// Without a completed reservation pass — or with an unprotected
 		// recordless survivor — adoption cannot tell live VM namespaces from
@@ -1203,6 +1217,14 @@ func main() {
 	// Fast pre-serve init is done (slots reserved, namespaces swept, pool fill
 	// backgrounded). Open the gate; pool warm-up and full reattach continue in
 	// the background, and requests load any not-yet-reattached VM on demand.
+	// Boot-time pool patience lives in SetupVM's bounded ClaimWait (with a
+	// longer budget while adoption runs), deliberately NOT here: only
+	// slot-allocating requests should ever wait on the pool. Pause and
+	// destroy never allocate; resume usually reuses its saved namespace and
+	// pays nothing, but a resume whose namespace is gone (or a stateless
+	// restore) allocates like a create and shares its bounded wait. A gate
+	// at this level would hold even the non-allocating paths behind
+	// inventory they never use.
 	startupReady.Store(true)
 	log.Info().Msg("startup complete — gRPC serving requests")
 

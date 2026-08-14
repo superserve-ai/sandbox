@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -719,9 +720,14 @@ func TestJournalPruneSweepsHistoryAcrossAcks(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Each ack examines a bounded slice; successive acks sweep the rest.
+	// Acks resolve real rows (resolution is fenced on the row existing),
+	// so re-enqueue the task before each one.
 	task := Task{SandboxID: "sb", Generation: "g", Priority: PriorityPause,
 		EnqueuedAt: time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)}
 	for i := 0; i < 5; i++ {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := j.Ack(task, "", false); err != nil {
 			t.Fatal(err)
 		}
@@ -1351,11 +1357,13 @@ func TestEnqueueDedupeUpgradesPaths(t *testing.T) {
 		t.Fatalf("queued task = %+v, want the staged upgrade", got)
 	}
 	// The upgrade is one-way: a later mutable-path enqueue of the same
-	// generation must not downgrade the staged row.
+	// generation must not downgrade the staged row. The first Next
+	// claimed the row, so re-reading it means outliving the claim: a
+	// clock past the lease is the release path that needs no Ack.
 	if err := j.Enqueue(orig); err != nil {
 		t.Fatal(err)
 	}
-	got, ok, err = j.Next(base.Add(time.Minute))
+	got, ok, err = j.Next(base.Add(time.Minute).Add(claimTTL))
 	if err != nil || !ok || got.Files[0].Path != "/staging/sb/gen/rootfs.ext4" {
 		t.Fatalf("staged row downgraded: %+v", got)
 	}
@@ -1399,6 +1407,9 @@ func TestSharedBaseUploadsOnceThenSkipsTheStream(t *testing.T) {
 	}
 
 	t1 := makeTask("sb-one", "overlay one")
+	if err := j.Enqueue(t1); err != nil {
+		t.Fatal(err)
+	}
 	if completed, _, _, err := u.uploadTask(context.Background(), &t1); err != nil || !completed {
 		t.Fatalf("first upload: completed=%v err=%v", completed, err)
 	}
@@ -1416,6 +1427,9 @@ func TestSharedBaseUploadsOnceThenSkipsTheStream(t *testing.T) {
 	}
 
 	t2 := makeTask("sb-two", "overlay two")
+	if err := j.Enqueue(t2); err != nil {
+		t.Fatal(err)
+	}
 	if completed, _, _, err := u.uploadTask(context.Background(), &t2); err != nil || !completed {
 		t.Fatalf("second upload: completed=%v err=%v", completed, err)
 	}
@@ -1489,6 +1503,9 @@ func TestSharedDedupeRecordsHistoryForFutureSkips(t *testing.T) {
 	baseObject := SharedBaseObject(baseSHA, PackFingerprint(extents, apparent))
 	store.objects[baseObject] = []byte("already there")
 
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
 	if completed, _, _, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
 		t.Fatalf("upload: completed=%v err=%v", completed, err)
 	}
@@ -2306,7 +2323,9 @@ func TestLegacyStagingDrainsThenRemoves(t *testing.T) {
 	}
 
 	// Drain the reference; the next sweep empties and removes the root.
-	if _, err := j.Ack(Task{SandboxID: "sb-live", Generation: "gen-live"}, "", false); err != nil {
+	// The ack must name the row's exact identity (EnqueuedAt included):
+	// resolution is fenced on the row existing at the task's own key.
+	if _, err := j.Ack(Task{SandboxID: "sb-live", Generation: "gen-live", EnqueuedAt: time.Unix(1, 0)}, "", false); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chtimes(kept, old, old); err != nil {
@@ -2318,6 +2337,188 @@ func TestLegacyStagingDrainsThenRemoves(t *testing.T) {
 	}
 	if u.LegacyStagingRoot != "" {
 		t.Fatal("legacy root not cleared after removal")
+	}
+}
+
+// rendezvousStore blocks every Create until two have arrived: only a
+// genuinely parallel drain (two workers mid-upload at once) can pass.
+type rendezvousStore struct {
+	*memStore
+	arrivals atomic.Int32
+	gate     chan struct{}
+}
+
+func (r *rendezvousStore) Create(ctx context.Context, object string, rd io.Reader) (bool, error) {
+	if r.arrivals.Add(1) == 2 {
+		close(r.gate)
+	}
+	select {
+	case <-r.gate:
+	case <-time.After(10 * time.Second):
+		return false, errors.New("no concurrent upload arrived: drain is serial")
+	}
+	return r.memStore.Create(ctx, object, rd)
+}
+
+// Two workers drain two tasks at the same time, sharing the journal's
+// claims: every object is created exactly once (no duplicated work) and
+// the whole backlog completes.
+func TestRunDrainsConcurrentlyWithoutDuplicating(t *testing.T) {
+	j, _ := testJournal(t)
+	store := &rendezvousStore{memStore: newMemStore(), gate: make(chan struct{})}
+	dirA, dirB := t.TempDir(), t.TempDir()
+	taskA := writeTask(t, dirA)
+	taskB := writeTask(t, dirB)
+	taskB.SandboxID = "sb-2"
+	// Distinct bytes so the two generations share no objects.
+	if err := os.WriteFile(taskB.Files[0].Path, []byte("diskdatb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	taskB.Files[0].SHA256 = digestOf([]byte("diskdatb"))
+	for _, task := range []Task{taskA, taskB} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	u := &Uploader{Journal: j, Store: store, Concurrency: 2, Tick: time.Millisecond}
+	done := make(chan error, 1)
+	go func() { done <- u.Run(ctx) }()
+	deadline := time.After(15 * time.Second)
+	for {
+		counts, err := j.Pending()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if counts[PriorityPause] == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("backlog never drained: %v", counts)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"sandboxes/sb-1/gen-abc/manifest.json",
+		"sandboxes/sb-2/gen-abc/manifest.json",
+	} {
+		if _, ok := store.objects[want]; !ok {
+			t.Fatalf("missing %s; objects: %v", want, len(store.objects))
+		}
+	}
+	// Claims made each task exclusive: nothing was uploaded twice.
+	for obj, n := range store.creates {
+		if n != 1 {
+			t.Fatalf("object %s created %d times, want 1", obj, n)
+		}
+	}
+}
+
+// baseGateStore blocks shared-base creates until released, counting the
+// attempts: coalescing means the second generation's worker waits on the
+// per-object lock instead of issuing its own multi-GB stream.
+type baseGateStore struct {
+	*memStore
+	release      chan struct{}
+	entered      chan struct{}
+	enteredOnce  sync.Once
+	baseAttempts atomic.Int32
+}
+
+func (s *baseGateStore) Create(ctx context.Context, object string, r io.Reader) (bool, error) {
+	if strings.HasPrefix(object, "bases/") {
+		s.baseAttempts.Add(1)
+		s.enteredOnce.Do(func() { close(s.entered) })
+		select {
+		case <-s.release:
+		case <-time.After(10 * time.Second):
+			return false, errors.New("base gate never released")
+		}
+	}
+	return s.memStore.Create(ctx, object, r)
+}
+
+// Two generations on the same not-yet-verified base drain concurrently:
+// exactly one worker streams the base, the other waits on the shared
+// lock and reuses the winner's recorded verification.
+func TestConcurrentWorkersCoalesceSharedBaseUpload(t *testing.T) {
+	j, _ := testJournal(t)
+	store := &baseGateStore{memStore: newMemStore(), release: make(chan struct{}), entered: make(chan struct{})}
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.ext4")
+	baseData := []byte("shared base bytes")
+	if err := os.WriteFile(base, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseSHA := digestOf(baseData)
+	for i, sb := range []string{"sb-1", "sb-2"} {
+		overlay := filepath.Join(dir, fmt.Sprintf("overlay-%d.ext4", i))
+		data := []byte(fmt.Sprintf("overlay-%d", i))
+		if err := os.WriteFile(overlay, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		task := Task{
+			SandboxID:  sb,
+			Generation: fmt.Sprintf("gen-%d", i),
+			Priority:   PriorityPause,
+			EnqueuedAt: time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC),
+			Files: []TaskFile{{
+				Name: "overlay.ext4", Path: overlay, SHA256: digestOf(data), Size: int64(len(data)),
+				BasePath: base, BaseSHA256: baseSHA,
+			}},
+		}
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	u := &Uploader{Journal: j, Store: store, Concurrency: 2, Tick: time.Millisecond}
+	done := make(chan error, 1)
+	go func() { done <- u.Run(ctx) }()
+	// One worker is mid-stream on the base; give the other time to reach
+	// the shared lock, then confirm it did NOT start a second stream.
+	<-store.entered
+	time.Sleep(200 * time.Millisecond)
+	if n := store.baseAttempts.Load(); n != 1 {
+		t.Fatalf("base create attempts while gated = %d, want 1 (second worker must wait, not stream)", n)
+	}
+	close(store.release)
+	deadline := time.After(15 * time.Second)
+	for {
+		counts, err := j.Pending()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if counts[PriorityPause] == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("backlog never drained: %v", counts)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if n := store.baseAttempts.Load(); n != 1 {
+		t.Fatalf("total base create attempts = %d, want 1 (waiter reuses verification)", n)
+	}
+	for _, want := range []string{
+		"sandboxes/sb-1/gen-0/manifest.json",
+		"sandboxes/sb-2/gen-1/manifest.json",
+	} {
+		if _, ok := store.objects[want]; !ok {
+			t.Fatalf("missing %s", want)
+		}
 	}
 }
 

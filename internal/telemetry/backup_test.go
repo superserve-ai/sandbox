@@ -137,17 +137,18 @@ func TestBackupRecorderRecordsSampleGauges(t *testing.T) {
 	r, reader := testBackupRecorder(t)
 
 	r.RecordSample(ctx, BackupSample{
-		Enabled:            false,
-		PendingPause:       3,
-		PendingCheckpoint:  2,
-		PendingBestEffort:  1,
-		PendingOK:          true,
-		OldestPendingAge:   90 * time.Second,
-		OldestPendingAgeOK: true,
-		PendingMarkers:     4,
-		PendingMarkersOK:   true,
-		OutboxPending:      5,
-		OutboxPendingOK:    true,
+		Enabled:             false,
+		PendingPause:        3,
+		PendingCheckpoint:   2,
+		PendingBestEffort:   1,
+		PendingOK:           true,
+		OldestPauseAge:      90 * time.Second,
+		OldestBestEffortAge: 4 * time.Hour,
+		OldestPendingAgeOK:  true,
+		PendingMarkers:      4,
+		PendingMarkersOK:    true,
+		OutboxPending:       5,
+		OutboxPendingOK:     true,
 	})
 
 	metrics := collectMetrics(t, reader)
@@ -178,8 +179,24 @@ func TestBackupRecorderRecordsSampleGauges(t *testing.T) {
 	}
 
 	age := metrics["backup_oldest_pending_age_seconds"].Data.(metricdata.Gauge[float64])
-	if len(age.DataPoints) != 1 || age.DataPoints[0].Value != 90 {
-		t.Fatalf("backup_oldest_pending_age_seconds = %#v, want one point of 90", age.DataPoints)
+	ageByPriority := map[string]float64{}
+	for _, dp := range age.DataPoints {
+		for _, kv := range dp.Attributes.ToSlice() {
+			if string(kv.Key) == "priority" {
+				ageByPriority[kv.Value.AsString()] = dp.Value
+			}
+		}
+	}
+	wantAge := map[string]float64{
+		BackupPriorityPause:      90,
+		BackupPriorityCheckpoint: 0,
+		BackupPriorityBestEffort: 4 * 3600,
+	}
+	for priority, wantValue := range wantAge {
+		if ageByPriority[priority] != wantValue {
+			t.Fatalf("backup_oldest_pending_age_seconds[%s] = %v, want %v (all: %v)",
+				priority, ageByPriority[priority], wantValue, ageByPriority)
+		}
 	}
 
 	markers := metrics["backup_pending_markers"].Data.(metricdata.Gauge[int64])
@@ -199,12 +216,14 @@ func TestBackupRecorderClampsNegativeAge(t *testing.T) {
 	ctx := context.Background()
 	r, reader := testBackupRecorder(t)
 
-	r.RecordSample(ctx, BackupSample{Enabled: true, OldestPendingAge: -time.Minute, OldestPendingAgeOK: true})
+	r.RecordSample(ctx, BackupSample{Enabled: true, OldestPauseAge: -time.Minute, OldestPendingAgeOK: true})
 
 	metrics := collectMetrics(t, reader)
 	age := metrics["backup_oldest_pending_age_seconds"].Data.(metricdata.Gauge[float64])
-	if len(age.DataPoints) != 1 || age.DataPoints[0].Value != 0 {
-		t.Fatalf("backup_oldest_pending_age_seconds = %#v, want one point of 0", age.DataPoints)
+	for _, dp := range age.DataPoints {
+		if dp.Value != 0 {
+			t.Fatalf("backup_oldest_pending_age_seconds = %#v, want every tier clamped to 0", age.DataPoints)
+		}
 	}
 }
 
