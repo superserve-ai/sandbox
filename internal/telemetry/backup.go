@@ -48,10 +48,13 @@ type BackupSample struct {
 	PendingPause, PendingCheckpoint, PendingBestEffort int
 	PendingOK                                          bool
 
-	// OldestPendingAge is the age of the oldest queued task's enqueue
-	// time; zero when the queue is empty.
-	OldestPendingAge   time.Duration
-	OldestPendingAgeOK bool
+	// Oldest*Age is the age of each tier's oldest queued task by enqueue
+	// time; zero when that tier is empty. Per tier because the tiers
+	// have opposite service expectations: pause freshness is the alerted
+	// signal, while a best-effort backfill backlog is deliberately
+	// patient.
+	OldestPauseAge, OldestCheckpointAge, OldestBestEffortAge time.Duration
+	OldestPendingAgeOK                                       bool
 
 	PendingMarkers   int
 	PendingMarkersOK bool
@@ -260,11 +263,21 @@ func (r *BackupRecorder) RecordSample(ctx context.Context, s BackupSample) {
 			metric.WithAttributes(r.attrs(attribute.String("priority", BackupPriorityBestEffort))...))
 	}
 	if s.OldestPendingAgeOK {
-		age := s.OldestPendingAge.Seconds()
-		if age < 0 { // clock skew must not report a negative backlog
-			age = 0
+		for _, tier := range []struct {
+			age      time.Duration
+			priority string
+		}{
+			{s.OldestPauseAge, BackupPriorityPause},
+			{s.OldestCheckpointAge, BackupPriorityCheckpoint},
+			{s.OldestBestEffortAge, BackupPriorityBestEffort},
+		} {
+			age := tier.age.Seconds()
+			if age < 0 { // clock skew must not report a negative backlog
+				age = 0
+			}
+			r.oldestPendingAge.Record(ctx, age,
+				metric.WithAttributes(r.attrs(attribute.String("priority", tier.priority))...))
 		}
-		r.oldestPendingAge.Record(ctx, age, opt)
 	}
 	if s.PendingMarkersOK {
 		r.pendingMarkers.Record(ctx, int64(s.PendingMarkers), opt)

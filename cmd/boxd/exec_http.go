@@ -246,8 +246,12 @@ func (s *processService) handleExecStream(w http.ResponseWriter, r *http.Request
 
 	keepaliveCtx, stopKeepalive := context.WithCancel(r.Context())
 	defer stopKeepalive()
+	// Read the interval before spawning: the goroutine can outlive this
+	// handler's return by a scheduling beat, and tests that override the
+	// package var between cases must never race that late read.
+	keepaliveInterval := sseKeepaliveInterval
 	go func() {
-		ticker := time.NewTicker(sseKeepaliveInterval)
+		ticker := time.NewTicker(keepaliveInterval)
 		defer ticker.Stop()
 		for {
 			select {

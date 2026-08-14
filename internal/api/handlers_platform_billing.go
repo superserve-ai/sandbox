@@ -244,6 +244,16 @@ rates AS (
 			  AND unit = 'second'
 			  AND resource IN ('vcpu', 'memory_gib', 'storage_gib')
 		) AS rate_count,
+		count(*) FILTER (
+			WHERE rate_rank = 1
+			  AND unit = 'second'
+			  AND resource IN ('vcpu', 'memory_gib')
+		) AS required_rate_count,
+		count(*) FILTER (
+			WHERE rate_rank = 1
+			  AND unit = 'second'
+			  AND resource = 'storage_gib'
+		) AS storage_rate_count,
 		max(price_usd) FILTER (WHERE rate_rank = 1 AND unit = 'second' AND resource = 'vcpu') AS vcpu_rate,
 		max(price_usd) FILTER (WHERE rate_rank = 1 AND unit = 'second' AND resource = 'memory_gib') AS memory_rate,
 		max(price_usd) FILTER (WHERE rate_rank = 1 AND unit = 'second' AND resource = 'storage_gib') AS storage_rate
@@ -328,12 +338,17 @@ costed AS (
 		ac.available_usd,
 		(cu.vcpu_seconds * r.vcpu_rate) AS compute_usd,
 		((cu.memory_mib_seconds / 1024.0) * r.memory_rate) AS memory_usd,
-		((su.storage_mib_seconds / 1024.0) * r.storage_rate) AS storage_usd,
 		CASE
-			WHEN COALESCE(r.rate_count, 0) <> 3
+			WHEN feature_enabled('billing_storage_billing_enabled', sp.team_id)
+			THEN ((su.storage_mib_seconds / 1024.0) * r.storage_rate)
+			ELSE 0
+		END AS storage_usd,
+		CASE
+			WHEN COALESCE(r.required_rate_count, 0) <> 2
 			  OR r.vcpu_rate IS NULL
 			  OR r.memory_rate IS NULL
-			  OR r.storage_rate IS NULL
+			  OR (feature_enabled('billing_storage_billing_enabled', sp.team_id) AND COALESCE(r.storage_rate_count, 0) <> 1)
+			  OR (feature_enabled('billing_storage_billing_enabled', sp.team_id) AND r.storage_rate IS NULL)
 			THEN 'pricing_unavailable'
 		END AS error_code
 	FROM selected_plans sp
@@ -499,6 +514,16 @@ rates AS (
 			  AND unit = 'second'
 			  AND resource IN ('vcpu', 'memory_gib', 'storage_gib')
 		) AS rate_count,
+		count(*) FILTER (
+			WHERE rate_rank = 1
+			  AND unit = 'second'
+			  AND resource IN ('vcpu', 'memory_gib')
+		) AS required_rate_count,
+		count(*) FILTER (
+			WHERE rate_rank = 1
+			  AND unit = 'second'
+			  AND resource = 'storage_gib'
+		) AS storage_rate_count,
 		max(price_usd) FILTER (WHERE rate_rank = 1 AND unit = 'second' AND resource = 'vcpu') AS vcpu_rate,
 		max(price_usd) FILTER (WHERE rate_rank = 1 AND unit = 'second' AND resource = 'memory_gib') AS memory_rate,
 		max(price_usd) FILTER (WHERE rate_rank = 1 AND unit = 'second' AND resource = 'storage_gib') AS storage_rate
@@ -583,12 +608,17 @@ costed AS (
 		ac.available_usd,
 		(cu.vcpu_seconds * r.vcpu_rate) AS compute_usd,
 		((cu.memory_mib_seconds / 1024.0) * r.memory_rate) AS memory_usd,
-		((su.storage_mib_seconds / 1024.0) * r.storage_rate) AS storage_usd,
 		CASE
-			WHEN COALESCE(r.rate_count, 0) <> 3
+			WHEN feature_enabled('billing_storage_billing_enabled', sp.team_id)
+			THEN ((su.storage_mib_seconds / 1024.0) * r.storage_rate)
+			ELSE 0
+		END AS storage_usd,
+		CASE
+			WHEN COALESCE(r.required_rate_count, 0) <> 2
 			  OR r.vcpu_rate IS NULL
 			  OR r.memory_rate IS NULL
-			  OR r.storage_rate IS NULL
+			  OR (feature_enabled('billing_storage_billing_enabled', sp.team_id) AND COALESCE(r.storage_rate_count, 0) <> 1)
+			  OR (feature_enabled('billing_storage_billing_enabled', sp.team_id) AND r.storage_rate IS NULL)
 			THEN 'pricing_unavailable'
 		END AS error_code
 	FROM selected_plans sp

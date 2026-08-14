@@ -8,12 +8,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-var requiredSummaryResources = map[string]struct{}{
-	"memory_gib":  {},
-	"storage_gib": {},
-	"vcpu":        {},
-}
-
 type SummaryBreakdown struct {
 	ComputeUSD float64
 	MemoryUSD  float64
@@ -42,11 +36,14 @@ func CalculateSummaryCharges(
 	memoryRate float64,
 	storageRate float64,
 	creditsAvailable float64,
+	storageBillingEnabled bool,
 ) SummaryCharges {
 	breakdown := SummaryBreakdown{
 		ComputeUSD: vcpuSeconds * vcpuRate,
 		MemoryUSD:  memoryGibSeconds * memoryRate,
-		StorageUSD: storageGibSeconds * storageRate,
+	}
+	if storageBillingEnabled {
+		breakdown.StorageUSD = storageGibSeconds * storageRate
 	}
 	currentCharges := breakdown.ComputeUSD + breakdown.MemoryUSD + breakdown.StorageUSD
 	creditsApplied := math.Min(currentCharges, creditsAvailable)
@@ -58,6 +55,17 @@ func CalculateSummaryCharges(
 		ExpectedInvoiceAmountUSD: currentCharges - creditsApplied,
 		Breakdown:                breakdown,
 	}
+}
+
+func requiredSummaryResources(storageBillingEnabled bool) map[string]struct{} {
+	resources := map[string]struct{}{
+		"memory_gib": {},
+		"vcpu":       {},
+	}
+	if storageBillingEnabled {
+		resources["storage_gib"] = struct{}{}
+	}
+	return resources
 }
 
 func NumericFloat64(n pgtype.Numeric) (float64, error) {

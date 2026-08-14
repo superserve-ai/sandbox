@@ -33,6 +33,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -138,7 +139,8 @@ type Handlers struct {
 	Analytics *analytics.Client // when set, emits product-usage events; nil is a no-op
 	Encryptor secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
 	Signer    *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
-	Now       func() time.Time  // when set, returns the current UTC time for testable handlers
+	Stripe    StripeBillingClient
+	Now       func() time.Time // when set, returns the current UTC time for testable handlers
 
 	// asyncMu/asyncCond/asyncCount track fire-and-forget bookkeeping goroutines
 	// (ActivateSandbox, FinalizePause) so tests can wait for quiescence;
@@ -229,6 +231,7 @@ func NewHandlers(vmd VMDClient, queries *db.Queries, cfg *config.Config) *Handle
 		VMD:    vmd,
 		DB:     queries,
 		Config: cfg,
+		Now:    time.Now,
 	}
 }
 
@@ -304,12 +307,13 @@ func retryTransientBoot(parent context.Context, sandboxID string, boot func(cont
 // asyncTimeout is the deadline for fire-and-forget DB writes.
 const asyncTimeout = 5 * time.Second
 
-// activateSettleWindow bounds how long status-gated read paths wait for the
-// fire-and-forget activate write to land. Create/resume respond before the
-// starting/resuming→active flip commits, so the owner's immediate follow-up
-// (create then exec — the canonical SDK flow) may read the pre-flip status;
-// waiting briefly preserves read-your-writes instead of 409ing it. The write
-// lands in single-digit ms in the common case, which this covers.
+// activateSettleWindow bounds how long loadActiveOrResumeSandbox waits for
+// create/resume's fire-and-forget starting/resuming→active flip to land. The
+// owner's own immediate follow-up (create then exec — the canonical SDK
+// flow) may read the pre-flip status, so waiting briefly preserves
+// read-your-writes instead of 409ing an operation the client was just told
+// succeeded. The write lands in single-digit ms in the common case, which
+// this covers.
 //
 // It deliberately does NOT try to outlast a hostname-only create's pre-flip
 // stamp: that guest round trip can take tens of seconds on a cold-fault stall
@@ -323,6 +327,41 @@ var activateSettleWindow = 6 * time.Second
 
 // activateSettlePoll is the re-read interval within activateSettleWindow.
 const activateSettlePoll = 50 * time.Millisecond
+
+// pausingSettleWindow bounds how long ResumeSandbox waits for a racing
+// finalize-pause write (pausing→paused, read by ResumeSandbox) to land
+// before treating the sandbox as genuinely stuck and returning 409. It is
+// separate from activateSettleWindow on purpose: unlike create/resume's
+// hostname stamp, finalize-pause has no guest round trip — it is a local DB
+// write that either lands in single-digit ms (the common case) or is stuck
+// for a reason more waiting won't fix (DB contention, a crashed worker), so
+// riding out the full 6s activate window buys nothing here and just holds
+// the resume request open. Var, not const, so tests can shrink it.
+var pausingSettleWindow = 2 * time.Second
+
+// pausingSettlePollStart is the first re-read interval in ResumeSandbox's
+// pausing-settle loop, matching activateSettlePoll so the common case
+// settles just as fast as a fixed-interval poll would. pausingSettlePollMax
+// caps how far nextSettlePollInterval backs off.
+//
+// A fixed 50ms poll over the full settle window costs up to ~120
+// synchronous reads when a sandbox is genuinely stuck in 'pausing' — a burst
+// of pause/resume calls hitting that case amplifies DB load exactly when
+// finalize-pause is already struggling to land. Backing off (see
+// nextSettlePollInterval) bounds that worst case to roughly a dozen reads.
+const (
+	pausingSettlePollStart = 50 * time.Millisecond
+	pausingSettlePollMax   = 500 * time.Millisecond
+)
+
+// nextSettlePollInterval doubles cur, capped at pausingSettlePollMax.
+func nextSettlePollInterval(cur time.Duration) time.Duration {
+	next := cur * 2
+	if next <= 0 || next > pausingSettlePollMax {
+		return pausingSettlePollMax
+	}
+	return next
+}
 
 // staleTransitionGrace is how long a sandbox must sit in a transitional state
 // (starting/resuming/pausing) before DELETE may claim it: past this, its worker
@@ -1140,18 +1179,81 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
-		ID:     sandboxID,
-		TeamID: teamID,
-	})
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			respondError(c, ErrSandboxNotFound)
+	// PauseSandbox responds as soon as vmd's PauseVM RPC completes, then
+	// flips pausing -> paused via fire-and-forget bookkeeping (deliberately
+	// off the pause hot path — see finalize-pause in PauseSandbox). The
+	// owner's own immediate follow-up resume can therefore read the row
+	// before that write lands; poll through 'pausing' with a backed-off
+	// interval (nextSettlePollInterval) over pausingSettleWindow rather than
+	// 409 an operation the client was just told succeeded. Any other
+	// non-paused status is a real conflict and fails immediately.
+	deadline := time.Now().Add(pausingSettleWindow)
+	waitStart := time.Now()
+	poll := pausingSettlePollStart
+	reads := 0
+	canceled := false
+	var sandbox db.Sandbox
+	for {
+		var err error
+		sandbox, err = h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+			ID:     sandboxID,
+			TeamID: teamID,
+		})
+		reads++
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				respondError(c, ErrSandboxNotFound)
+				return
+			}
+			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+			respondError(c, ErrInternal)
 			return
 		}
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-		respondError(c, ErrInternal)
-		return
+		if sandbox.Status == db.SandboxStatusPausing && time.Now().Before(deadline) {
+			// Context-aware wait: a client that disconnects or hits its
+			// deadline mid-backoff releases this goroutine at cancellation
+			// instead of holding it for the rest of the interval — and skips
+			// the re-read, which on a canceled context could only fail and be
+			// misreported as an internal DB error.
+			timer := time.NewTimer(poll)
+			select {
+			case <-timer.C:
+				poll = nextSettlePollInterval(poll)
+				continue
+			case <-c.Request.Context().Done():
+				timer.Stop()
+				canceled = true
+			}
+		}
+		break
+	}
+	// The common case resolves on the first read, so this only fires for the
+	// racing/stuck case — once per affected resume, not once per poll — and
+	// stays off the hot path.
+	if reads > 1 {
+		waited := time.Since(waitStart)
+		// Only pausing→paused counts as settled: a row that left 'pausing'
+		// for any other state (a failed pause reverting to active, a delete
+		// claiming the row) still 409s below, and folding it into "settled"
+		// would contaminate the metric with pause failures.
+		var result string
+		switch {
+		case canceled:
+			result = telemetry.SettleResultCanceled
+		case sandbox.Status == db.SandboxStatusPaused:
+			result = telemetry.SettleResultSettled
+		case sandbox.Status == db.SandboxStatusPausing:
+			result = telemetry.SettleResultTimeout
+		default:
+			result = telemetry.SettleResultDiverged
+		}
+		log.Warn().
+			Str("sandbox_id", sandboxID.String()).
+			Dur("waited", waited).
+			Int("reads", reads).
+			Str("result", result).
+			Msg("resume waited for racing pause finalize to settle")
+		RecordResumeSettleWait(c.Request.Context(), result, sandbox.HostID, waited, reads)
 	}
 	SetTelemetryHostID(c, sandbox.HostID)
 
