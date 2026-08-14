@@ -38,6 +38,7 @@ on:
       - 'deploy/superserve-vms.service'
       - 'deploy/vmd-rollback-guard'
       - 'deploy/superserve-vmd-rollback-guard.conf'
+      - 'deploy/superserve-vmd-start-generation.conf'
       - 'deploy/superserve-secretsproxy.service'
       - 'deploy/firecracker@.service'
       - 'deploy/firecracker-netns@.service'
