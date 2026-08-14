@@ -15,12 +15,20 @@ trap 'rm -f "$tmp"' EXIT
 code=$(curl -s -o "$tmp" -w '%{http_code}' -H "Metadata-Flavor: Google" \
     --connect-timeout 5 --max-time 30 "$ENDPOINT") || code=000
 
-# Only a 200 decides: its body is either the literal NONE (nothing scheduled)
-# or the pending notice. Any other code is a transient metadata-server problem
+# Only a 200 decides: its body is either NONE (nothing scheduled) or the
+# pending notice. Any other code is a transient metadata-server problem
 # — skip the poll rather than misread it as "notice cleared".
+#
+# alt=json makes the server JSON-encode the value, so "nothing scheduled"
+# arrives as the QUOTED string "NONE" while a real notice is a bare JSON
+# object. Strip one surrounding pair of quotes before the comparison, or
+# every host pages itself with a notice of "NONE".
 case "$code" in
 200)
     notice=$(cat "$tmp")
+    case "$notice" in
+    '"'*'"') notice=$(printf '%s' "$notice" | sed -e 's/^"//' -e 's/"$//') ;;
+    esac
     [ "$notice" = "NONE" ] && notice=""
     ;;
 *)
