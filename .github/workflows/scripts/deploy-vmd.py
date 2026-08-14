@@ -998,10 +998,9 @@ def main() -> int:
             fi
             # The config window is over: lift the mask and perform the one
             # and only boot of this deploy. The mask above makes mid-window
-            # reactivation impossible, so this restart serves the socket'''s
-            # backlogged connections with the final, fully-migrated config —
-            # `restart` (not `start`) kept for robustness if the unit were
-            # ever active here through some path this script didn'''t take.
+            # reactivation impossible, so this restart serves the backlogged
+            # connections with the final, fully-migrated config. `restart`
+            # rather than `start` purely for robustness against untaken paths.
             sudo systemctl unmask --runtime {service}
             sudo systemctl restart {service}
             sleep 3
