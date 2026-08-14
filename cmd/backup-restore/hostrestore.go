@@ -127,6 +127,16 @@ func sandboxIDsFromDB(ctx context.Context, dbURL, hostID string) ([]string, map[
 	// automatically as they appear, and the residual vmstate-collision
 	// ambiguity until then is a recovery-point nuance the ledger's
 	// generation column makes auditable.
+	// A mistyped or foreign-cell host id must not read as a clean empty
+	// restore: verify the host row exists before enumerating, so "host
+	// unknown" and "host has no sandboxes" stay distinguishable.
+	var hostExists bool
+	if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM host WHERE id = $1)`, hostID).Scan(&hostExists); err != nil {
+		return nil, nil, fmt.Errorf("verify host: %w", err)
+	}
+	if !hostExists {
+		return nil, nil, fmt.Errorf("host %q is not in this cell's host table; check the id and the cell", hostID)
+	}
 	rows, err := conn.Query(ctx, `
 		SELECT sb.id, COALESCE((
 		  SELECT json_agg(sd.digests ORDER BY sd.gen DESC)
@@ -204,7 +214,10 @@ func sandboxIDsFromFile(path string) ([]string, map[string][]backup.CaptureAncho
 					name, sha = "vmstate.snap", part
 				}
 				if sha == "" {
-					continue
+					// A provided-but-empty digest (a nullable replica
+					// column leaking through) must not silently drop the
+					// anchor and degrade selection to completion order.
+					return nil, nil, fmt.Errorf("sandbox %s: empty digest in anchor token %q", fields[0], tok)
 				}
 				// A malformed digest can never match a manifest, and an
 				// unmatchable anchor silently degrades selection to
