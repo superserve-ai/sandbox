@@ -139,6 +139,12 @@ type HostRestoreReport struct {
 type HostRestorer struct {
 	Reader BlobReader
 	Lister BlobLister
+	// seenObjects attributes each packed object to the first result that
+	// claims it, so summed PackedBytes equal actual ingress: shared
+	// template bases appear in every dependent's manifest but download
+	// once through the base cache. Reset per Run.
+	seenObjects sync.Map
+
 	// Concurrency bounds parallel restores. The replacement host is cold
 	// (no customer traffic yet), so the bound exists to keep the fetch
 	// path below the NIC and disk ceilings, not to protect tenants, and
@@ -347,7 +353,7 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 			res.Duration = time.Since(start)
 			return res
 		}
-		res.PackedBytes, res.ApparentBytes = manifestBytes(m)
+		res.PackedBytes, res.ApparentBytes = h.manifestBytes(m)
 		res.Outcome = HostRestoreCoverable
 		res.Duration = time.Since(start)
 		return res
@@ -363,14 +369,16 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 		res.Duration = time.Since(start)
 		return res
 	}
-	if _, err := RestoreGeneration(ctx, h.Reader, item.SandboxID, res.Generation, dest, nil); err != nil {
+	m, err := RestoreGeneration(ctx, h.Reader, item.SandboxID, res.Generation, dest, nil)
+	if err != nil {
 		res.Outcome, res.Reason = HostRestoreFailed, err.Error()
 		res.Duration = time.Since(start)
 		return res
 	}
-	if m, merr := fetchManifest(ctx, h.Reader, item.SandboxID, res.Generation, func(string, ...any) {}); merr == nil {
-		res.PackedBytes, res.ApparentBytes = manifestBytes(m)
-	}
+	// RestoreGeneration already fetched and authenticated this manifest;
+	// a second read would add one GCS request per sandbox and could
+	// silently zero the totals on a transient failure.
+	res.PackedBytes, res.ApparentBytes = h.manifestBytes(m)
 	res.Outcome = HostRestoreRestored
 	res.Duration = time.Since(start)
 	return res
@@ -378,9 +386,14 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 
 // manifestBytes totals a generation's packed (network) and apparent
 // (on-disk) sizes.
-func manifestBytes(m *GenerationManifest) (packed, apparent int64) {
+func (h *HostRestorer) manifestBytes(m *GenerationManifest) (packed, apparent int64) {
 	for _, f := range m.Files {
-		packed += f.PackedSize
+		// Packed bytes count each object once host-wide (see
+		// seenObjects); apparent bytes are per-destination and count
+		// fully for every sandbox.
+		if _, loaded := h.seenObjects.LoadOrStore(f.Object, struct{}{}); !loaded {
+			packed += f.PackedSize
+		}
 		apparent += f.Size
 	}
 	return packed, apparent
