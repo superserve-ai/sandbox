@@ -692,6 +692,16 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			continue
 		}
 		removeUnitDropIn(id)
+		// A parked revival anchor keeps its record: the stop above cleared
+		// the residue, which is exactly what the interrupted revival's
+		// retry needs to pass its at-rest probe, but deleting the record
+		// would fail the retry against the known-sandbox guard (the same
+		// exemption the dead-unit half applies).
+		if r.mgr.recordRevivalPending(id) {
+			unlockOp()
+			r.clearDrift("errunit:" + id)
+			continue
+		}
 		staleErr := r.markStale(id)
 		unlockOp()
 		// Flip the DB row with the already-grace-qualified reap: Drift 1
@@ -731,6 +741,14 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		r.clearDrift("errunit:" + id)
 		if !errorRecord(id) {
 			r.clearDrift("errdead:" + id)
+			return
+		}
+		// A parked revival anchor is not an ordinary dead Error record:
+		// the operator's retry needs it to pass the known-sandbox guard,
+		// so reaping it would recreate exactly the unrecoverable state
+		// the marker exists to prevent. The operator's revive or an
+		// explicit destroy retires it.
+		if r.mgr.recordRevivalPending(id) {
 			return
 		}
 		if !r.gracePeriodElapsed("errdead:"+id, now) {

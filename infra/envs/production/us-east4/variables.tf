@@ -70,6 +70,12 @@ variable "reservation_name" {
   default     = null
 }
 
+variable "standby_reservation_name" {
+  description = "Reservation to target for the z3 standby, kept SEPARATE from reservation_name: the latter names a c4-metal reservation that a z3 instance cannot consume, so sharing the variable would break the standby the moment the primary's reservation is set. Null uses default affinity (a matching z3 reservation, if any)."
+  type        = string
+  default     = null
+}
+
 variable "create_network" {
   type    = bool
   default = false
@@ -129,4 +135,15 @@ variable "notification_channel_ids" {
   description = "Existing monitored Cloud Monitoring notification channel resource names for infrastructure alerts."
   type        = list(string)
   default     = []
+}
+
+variable "active_sandbox_host" {
+  description = "Which sandbox host serves the cell: primary or standby."
+  type        = string
+  default     = "primary"
+
+  validation {
+    condition     = contains(["primary", "standby"], var.active_sandbox_host)
+    error_message = "active_sandbox_host must be primary or standby."
+  }
 }
