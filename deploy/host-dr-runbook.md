@@ -108,6 +108,15 @@ filesystem is the customer's last pause. This is the step that turns
   The host row's `draining` state does not gate resumes (host status
   is not consulted on the resume path), so the row status is the only
   real lock.
+- Already-paused rows need the same gate applied BY HAND: host death
+  does not touch them (the detector only marks the host unhealthy, and
+  the reconciler leaves a paused row alone once its restored
+  `vmstate.snap` exists), so they stay `BeginResume`-eligible the
+  moment the replacement heartbeats. Before starting the replacement,
+  move the dead host's paused rows to `failed` with a compare-and-set
+  on `status = 'paused'` scoped to the host id, and flip each back to
+  `paused` only after its cold-boot validation, exactly like the rows
+  that failed at host death.
 - Sandboxes that were RUNNING at host death come back with their last
   generation's files; their timeline should show the recovery honestly
   rather than pretending continuity.

@@ -47,6 +47,12 @@ type HostRestoreResult struct {
 	Outcome    HostRestoreOutcome
 	Reason     string
 	Duration   time.Duration
+	// PackedBytes is what the selected generation moves over the
+	// network; ApparentBytes what it lands on disk. Zero when no
+	// generation was selected. These make the ledger sufficient for RTO
+	// sizing against the operator's own bandwidth.
+	PackedBytes   int64
+	ApparentBytes int64
 }
 
 // CaptureAnchor is one pause's recorded digest set: file name to
@@ -119,6 +125,10 @@ type HostRestoreReport struct {
 	Uncovered int
 	Failed    int
 	Elapsed   time.Duration
+	// Totals over results that selected a generation (see
+	// HostRestoreResult byte fields).
+	PackedBytes   int64
+	ApparentBytes int64
 }
 
 // HostRestorer bulk-restores every enumerated owner's newest completed
@@ -205,6 +215,8 @@ func (h *HostRestorer) Run(ctx context.Context, items []HostRestoreItem) *HostRe
 		default:
 			report.Failed++
 		}
+		report.PackedBytes += r.PackedBytes
+		report.ApparentBytes += r.ApparentBytes
 	}
 	return report
 }
@@ -329,11 +341,13 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 		// selected manifest (identity, self-derived generation key,
 		// consistency pairs) so a corrupt or misplaced manifest shows up
 		// in the dry-run ledger, not mid-recovery.
-		if _, err := fetchManifest(ctx, h.Reader, item.SandboxID, res.Generation, func(string, ...any) {}); err != nil {
+		m, err := fetchManifest(ctx, h.Reader, item.SandboxID, res.Generation, func(string, ...any) {})
+		if err != nil {
 			res.Outcome, res.Reason = HostRestoreFailed, fmt.Sprintf("manifest validation: %v", err)
 			res.Duration = time.Since(start)
 			return res
 		}
+		res.PackedBytes, res.ApparentBytes = manifestBytes(m)
 		res.Outcome = HostRestoreCoverable
 		res.Duration = time.Since(start)
 		return res
@@ -354,9 +368,22 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 		res.Duration = time.Since(start)
 		return res
 	}
+	if m, merr := fetchManifest(ctx, h.Reader, item.SandboxID, res.Generation, func(string, ...any) {}); merr == nil {
+		res.PackedBytes, res.ApparentBytes = manifestBytes(m)
+	}
 	res.Outcome = HostRestoreRestored
 	res.Duration = time.Since(start)
 	return res
+}
+
+// manifestBytes totals a generation's packed (network) and apparent
+// (on-disk) sizes.
+func manifestBytes(m *GenerationManifest) (packed, apparent int64) {
+	for _, f := range m.Files {
+		packed += f.PackedSize
+		apparent += f.Size
+	}
+	return packed, apparent
 }
 
 // anchorProbeBatch bounds concurrent manifest fetches within one
@@ -429,9 +456,20 @@ func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.Re
 		if err := os.Rename(tmp.Name(), cached); err != nil {
 			return nil, err
 		}
-		if dir, err := os.Open(filepath.Dir(cached)); err == nil {
-			_ = dir.Sync()
+		// The rename is only durable once the directory entry is synced;
+		// a discarded failure here would report a cache commit that a
+		// power loss can undo, and the crash-safe rerun guarantee rests
+		// on this entry surviving.
+		dir, err := os.Open(filepath.Dir(cached))
+		if err != nil {
+			return nil, err
+		}
+		if err := dir.Sync(); err != nil {
 			dir.Close()
+			return nil, err
+		}
+		if err := dir.Close(); err != nil {
+			return nil, err
 		}
 		return nil, nil
 	})
