@@ -3087,10 +3087,22 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				budget = rem
 			}
 		}
+		// The pass deadline bounds stop STARTS, not stop internals: some
+		// stop branches strip cancellation and run their own internal
+		// budgets, so the deadline is rechecked between the two stops
+		// and the overshoot is bounded by at most one internal budget.
 		if budget > 0 {
 			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
 			_ = m.stopVM(sctx, rec.ID, SupervisionUnit)
-			_ = m.stopVM(sctx, rec.ID, SupervisionCgroup)
+			remaining := true
+			if d, ok := m.reattachStopDeadline.Load().(time.Time); ok && !d.IsZero() && time.Until(d) <= 0 {
+				remaining = false
+			}
+			if remaining {
+				_ = m.stopVM(sctx, rec.ID, SupervisionCgroup)
+			} else {
+				log.Warn().Msg("reattach stop budget exhausted after unit stop; skipping cgroup stop")
+			}
 			cancel()
 		} else {
 			log.Warn().Msg("reattach stop budget exhausted; parking without residue stop")

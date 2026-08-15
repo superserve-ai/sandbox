@@ -302,6 +302,14 @@ message ReviveVMRequest {
   // empty base_path means "use the recorded base", and a flattened
   // image's sparse zero regions must not read through to the old base.
   bool standalone_disk = 11;
+  // Operator attestation that this sandbox belongs to this host even
+  // though no durable record remains (startup stale cleanup deletes
+  // dead records, exactly the state a to-be-revived zombie is in after
+  // a vmd restart). Requires explicit vcpu, mem_mib, and a base
+  // disposition (base_path or standalone_disk): there is no record to
+  // default from. Ownership, preview policy, env, secrets, and egress
+  // all re-establish through the control plane before the row flips.
+  bool allow_recordless = 12;
 }
 
 message ReviveVMResponse {

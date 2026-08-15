@@ -98,6 +98,11 @@ func runRevive(args []string) int {
 				req.DeniedCidrs = splitCommaList(p)
 			} else if p, ok := strings.CutPrefix(tok, "domains="); ok {
 				req.AllowedDomains = splitCommaList(p)
+			} else if tok == "recordless" {
+				// Operator attestation for sandboxes whose vmd record was
+				// deleted by a restart's stale cleanup; the RPC enforces
+				// the explicit shape and base this mode requires.
+				req.AllowRecordless = true
 			} else if strings.Contains(tok, "=") {
 				// A misspelled policy token must not silently revive
 				// without the intended policy.

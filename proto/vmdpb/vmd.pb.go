@@ -1231,8 +1231,16 @@ type ReviveVMRequest struct {
 	// empty base_path means "use the recorded base", and a flattened
 	// image's sparse zero regions must not read through to the old base.
 	StandaloneDisk bool `protobuf:"varint,11,opt,name=standalone_disk,json=standaloneDisk,proto3" json:"standalone_disk,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Operator attestation that this sandbox belongs to this host even
+	// though no durable record remains (startup stale cleanup deletes
+	// dead records, exactly the state a to-be-revived zombie is in after
+	// a vmd restart). Requires explicit vcpu, mem_mib, and a base
+	// disposition (base_path or standalone_disk): there is no record to
+	// default from. Ownership, preview policy, env, secrets, and egress
+	// all re-establish through the control plane before the row flips.
+	AllowRecordless bool `protobuf:"varint,12,opt,name=allow_recordless,json=allowRecordless,proto3" json:"allow_recordless,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ReviveVMRequest) Reset() {
@@ -1338,6 +1346,13 @@ func (x *ReviveVMRequest) GetSecretsJwt() string {
 func (x *ReviveVMRequest) GetStandaloneDisk() bool {
 	if x != nil {
 		return x.StandaloneDisk
+	}
+	return false
+}
+
+func (x *ReviveVMRequest) GetAllowRecordless() bool {
+	if x != nil {
+		return x.AllowRecordless
 	}
 	return false
 }
@@ -3797,7 +3812,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x11DestroyVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1d\n" +
 	"\n" +
-	"cleaned_up\x18\x02 \x01(\bR\tcleanedUp\"\xd0\x03\n" +
+	"cleaned_up\x18\x02 \x01(\bR\tcleanedUp\"\xfb\x03\n" +
 	"\x0fReviveVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1b\n" +
 	"\tdisk_path\x18\x02 \x01(\tR\bdiskPath\x12\x12\n" +
@@ -3811,7 +3826,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\vsecrets_jwt\x18\n" +
 	" \x01(\tR\n" +
 	"secretsJwt\x12'\n" +
-	"\x0fstandalone_disk\x18\v \x01(\bR\x0estandaloneDisk\x1a:\n" +
+	"\x0fstandalone_disk\x18\v \x01(\bR\x0estandaloneDisk\x12)\n" +
+	"\x10allow_recordless\x18\f \x01(\bR\x0fallowRecordless\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"H\n" +

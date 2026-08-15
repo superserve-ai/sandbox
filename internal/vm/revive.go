@@ -27,7 +27,7 @@ import (
 // only after this returns, and the ordinary auto-pause machinery then
 // takes the revived sandbox through the standard pause path, which is
 // what lands it paused with a fresh, uploaded generation.
-func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string, standaloneDisk bool, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
+func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string, standaloneDisk, allowRecordless bool, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
 	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
 		return nil, status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
 	}
@@ -117,7 +117,25 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// invisible until the reconciler flags it. Sandboxes whose record
 	// was genuinely lost recover through host restore, not revive.
 	if prevRec == nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "vm %s has no durable record on this host; revive only replaces known sandboxes", vmID)
+		// Startup stale cleanup deletes dead non-paused records, which is
+		// exactly the state a to-be-revived zombie is in after a vmd
+		// restart; without an escape hatch the recovery path dies with
+		// the record. allow_recordless is the operator's attestation that
+		// the sandbox belongs to this host. Nothing can be defaulted
+		// without a record, so the shape and base disposition must be
+		// explicit, and the synthesized record carries no ownership or
+		// preview policy: the control plane re-establishes those before
+		// the row flips, and the default preview posture is private.
+		if !allowRecordless {
+			return nil, status.Errorf(codes.FailedPrecondition, "vm %s has no durable record on this host; revive only replaces known sandboxes (allow_recordless overrides with explicit shape and base)", vmID)
+		}
+		if vcpu == 0 || memMiB == 0 {
+			return nil, status.Error(codes.InvalidArgument, "allow_recordless requires explicit vcpu and mem_mib")
+		}
+		if basePath == "" && !standaloneDisk {
+			return nil, status.Error(codes.InvalidArgument, "allow_recordless requires base_path or standalone_disk; there is no record to name the base")
+		}
+		prevRec = &VMRecord{ID: vmID, Status: StatusError, Supervision: SupervisionUnit}
 	}
 
 	// Overlay-mode sandboxes salvage as sparse overlays whose holes are
