@@ -238,7 +238,18 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 			teardownFailed = true
 			m.log.Error().Err(derr).Str("vm_id", vmID).Msg("teardown after failed revival did not confirm; record left as-is")
 		} else {
+			// The destroy completed and bumped the epoch, so it counts as
+			// ours either way; but DestroyVM can log-and-ignore a failed
+			// unit stop and still return nil, and restoring durable
+			// state or recycling the slot under a live replacement needs
+			// the terminal claim, exactly as the supervised cold-boot
+			// path requires it. Both supervisors, since the failed
+			// attempt's mode may not be what the record says.
 			selfDestroys++
+			if !(vmUnitFullyDown(vmID) && m.cgroupDefinitelyDead(vmID)) {
+				teardownFailed = true
+				m.log.Error().Str("vm_id", vmID).Msg("replacement not terminally down after teardown; rollback suppressed, residue left for forced destroy")
+			}
 		}
 	}
 	defer func() {
