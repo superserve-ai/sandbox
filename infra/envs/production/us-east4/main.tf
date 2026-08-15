@@ -205,7 +205,13 @@ module "api" {
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "15"
     VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
-    KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+    # The active host's row identity, following active_sandbox_host in lock
+    # step with VMD_GRPC_ADDRESS. The build supervisor and the scheduler
+    # fallback resolve a host row through this; leaving it at the implicit
+    # "default" would, after promotion, dispatch template builds to the
+    # retired primary. Same value as metrics_host_id (the host's HOST_ID).
+    DEFAULT_HOST_ID  = local.metrics_host_id
+    KMS_KEY_RESOURCE = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
 
     # Control-plane OTLP metrics export, mirroring the retired us-central1
     # primary. The host-local superserve-otel-collector receives OTLP on :4318
