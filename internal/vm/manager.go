@@ -89,25 +89,27 @@ func (s VMStatus) String() string {
 
 // VMInstance holds the runtime state of a single microVM.
 type VMInstance struct {
-	ID           string
-	PID          int
-	SocketPath   string
-	VsockPath    string
-	IP           string
-	TAPDevice    string
-	MACAddress   string
-	Status       VMStatus
-	Unverified   bool // Running persisted before boxd readiness (see VMRecord)
-	Config       VMConfig
-	RunDirID     string // Directory name under RunDir for this VM's files.
-	Namespace    string // Network namespace name.
-	DiskPath     string
-	SnapshotPath string
-	MemFilePath  string
-	CreatedAt    time.Time
-	Metadata     map[string]string
-	TeamID       string // owning team; carried for data-plane usage attribution
-	OwnerID      string // creating user; empty when unknown
+	ID             string
+	PID            int
+	SocketPath     string
+	VsockPath      string
+	IP             string
+	TAPDevice      string
+	MACAddress     string
+	Status         VMStatus
+	Unverified     bool   // Running persisted before boxd readiness (see VMRecord)
+	RevivalPending bool   // revival attempt in flight (see VMRecord)
+	RevivedDisk    string // resolved salvage path of a completed revival (see VMRecord)
+	Config         VMConfig
+	RunDirID       string // Directory name under RunDir for this VM's files.
+	Namespace      string // Network namespace name.
+	DiskPath       string
+	SnapshotPath   string
+	MemFilePath    string
+	CreatedAt      time.Time
+	Metadata       map[string]string
+	TeamID         string // owning team; carried for data-plane usage attribution
+	OwnerID        string // creating user; empty when unknown
 	// PausedAt records when this VM last entered the paused state. It drives
 	// oldest-first pressure reclamation. Zero means the field is unset on a
 	// legacy record; callers fall back to CreatedAt and then place any fully
@@ -501,6 +503,31 @@ type Manager struct {
 	// the freed slot, and hand a live pointer to an IP the pool is recycling.
 	// Keyed vmID → struct{}{}; entries are always removed when destroy returns.
 	destroying sync.Map
+	// destroyEpochs counts completed DestroyVM calls per vmID (bumped on
+	// every exit, before the tombstone clears). A rollback that must
+	// distinguish its own teardowns from an external destroy that
+	// completed in between compares this against its expected count: the
+	// tombstone alone only spans an in-flight destroy, not a finished
+	// one.
+	destroyEpochs sync.Map // vmID -> *uint64
+	// recordOwnerMus serializes DestroyVM against revival's rollback:
+	// DestroyVM holds vmID's mutex from before the tombstone through the
+	// epoch bump and tombstone clear, so a rollback that acquires it and
+	// then checks the epoch cannot interleave with a destroy completing
+	// between its check and its restore write.
+	recordOwnerMus sync.Map // vmID -> *sync.Mutex
+	// preserveRecordOnDestroy converts record deletion into an overwrite
+	// with the stored pending anchor while a revival is in flight:
+	// revival refuses unknown sandboxes, so any delete-then-rewrite gap
+	// (its own residue clear most of all) would brick the retry if vmd
+	// crashed inside it. Revival's destroy-wins paths bypass it with
+	// deleteStateForce once an external destroy is detected.
+	preserveRecordOnDestroy sync.Map // vmID -> VMRecord
+	// reattachStopDeadline bounds the aggregate time the eager reattach
+	// pass may spend stopping interrupted-revival residue: the pass is
+	// serial, and per-record stop budgets would otherwise stack into
+	// minutes of postponed reconciliation.
+	reattachStopDeadline atomic.Value // time.Time
 }
 
 // trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
@@ -828,7 +855,19 @@ func pidIsVMFirecracker(pid int, vmID string) bool {
 // coldBootFromRootfs is the parameterized form: boot a VM from a specific
 // rootfs at the requested vcpu/memory. Used by BuildTemplate to boot the
 // build VM from a freshly-produced rootfs at the template's target shape.
-func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath string, vcpu, memMiB uint32) (*VMInstance, error) {
+// basePath, when non-empty, boots the rootfs as a sparse overlay backed
+// by that shared read-only base (the fork's overlay drive mode); the
+// per-VM copy must then be hole-exact, so it reflinks strictly rather
+// than falling back to a heuristic sparse copy that could turn
+// guest-written zeros into holes exposing base content.
+// supervised spawns the VM under the fleet's real lifecycle supervision
+// (systemd unit or validated cgroup, seeded by `supervision`) through
+// the same dispatcher resume uses, so auto-pause's mode-directed stop
+// and every at-rest oracle see the VM the way they see any sandbox.
+// The flag is explicit because SupervisionUnit is the zero value: a
+// sentinel on the mode alone cannot distinguish "unit mode" from the
+// legacy unsupervised spawn kept for throwaway template-build VMs.
+func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath string, rules *sandboxNetworkRules, seed func(*VMInstance), preLaunch func() error, supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
@@ -858,16 +897,34 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 			MemoryMiB:  memMiB,
 			KernelPath: m.cfg.KernelPath,
 			RootfsPath: rootfsPath,
+			BasePath:   basePath,
 		},
+	}
+	// The seed runs before the instance is visible or persisted, so
+	// every intermediate durable write during the boot (each setStatus
+	// persists synchronously) already carries the caller's metadata; a
+	// crash mid-boot must not leave a record with empty ownership or
+	// preview policy, or one that claims a verified guest.
+	if seed != nil {
+		seed(inst)
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
-	log.Info().Str("rootfs", rootfsPath).Uint32("vcpu", vcpu).Uint32("mem_mib", memMiB).Msg("cold-booting VM")
+	log.Info().Str("rootfs", rootfsPath).Str("base", basePath).Uint32("vcpu", vcpu).Uint32("mem_mib", memMiB).Msg("cold-booting VM")
 
-	// 1. Copy the rootfs for this VM.
-	diskPath, err := m.copyRootfs(ctx, vmID, rootfsPath)
+	// 1. Copy the rootfs for this VM. Overlay sources demand a
+	// hole-exact copy (reflink, no heuristic fallback): every hole is a
+	// window to the base, and a guest-written zero run misdetected as a
+	// hole would silently resurface base content.
+	var diskPath string
+	var err error
+	if basePath != "" {
+		diskPath, err = m.copyRootfsExact(ctx, vmID, rootfsPath)
+	} else {
+		diskPath, err = m.copyRootfs(ctx, vmID, rootfsPath)
+	}
 	if err != nil {
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
@@ -894,6 +951,32 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 	mac := inst.MACAddress
 	inst.mu.Unlock()
 
+	// Egress policy installs before the guest can execute a single
+	// instruction: resume's discipline (rules land before
+	// launchFirecracker), because a policied workload's startup services
+	// must never see the fresh slot's permissive defaults.
+	if err := m.applySandboxNetworkRules(vmID, netInfo, rules); err != nil {
+		m.netMgr.CleanupVM(vmID)
+		m.cleanupRunDir(vmID)
+		m.setStatus(vmID, StatusError)
+		return nil, fmt.Errorf("apply network rules: %w", err)
+	}
+
+	// A caller-supplied gate right before Firecracker starts: revival's
+	// last chance to notice an external destroy that completed after
+	// network setup began (network setup blocks, so the epoch check at
+	// prep time is already stale by the time execution reaches here).
+	// Without this, revival could launch onto a slot/TAP a destroy
+	// already handed back to the pool.
+	if preLaunch != nil {
+		if perr := preLaunch(); perr != nil {
+			m.netMgr.CleanupVM(vmID)
+			m.cleanupRunDir(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, perr
+		}
+	}
+
 	// 3. Build Firecracker machine configuration.
 	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
@@ -903,6 +986,7 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 		KernelPath: m.cfg.KernelPath,
 		KernelArgs: "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=0 random.trust_cpu=on",
 		RootfsPath: diskPath,
+		BasePath:   basePath,
 		VCPUCount:  int(vcpu),
 		MemSizeMiB: int(memMiB),
 		TAPDevice:  network.TAPName,
@@ -913,12 +997,85 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 	}
 
 	// 4. Start Firecracker inside the network namespace, configure, and boot.
-	pid, err := m.startFirecrackerColdBoot(ctx, vmID, socketPath, fcCfg, netInfo.Namespace)
-	if err != nil {
-		m.netMgr.CleanupVM(vmID)
-		m.cleanupRunDir(vmID)
-		m.setStatus(vmID, StatusError)
-		return nil, fmt.Errorf("start firecracker: %w", err)
+	var pid int
+	if supervised {
+		spawnedPID, actual, lerr := m.launchFirecracker(ctx, vmID, socketPath, diskPath, basePath, netInfo.Namespace, supervision, true, false)
+		// Stamp before the error branch too: a cgroup launch that forked
+		// Firecracker but failed confirmation leaves a live process, so
+		// the instance must say cgroup for stops to target it rather
+		// than no-op a unit.
+		inst.mu.Lock()
+		inst.Supervision = actual
+		inst.mu.Unlock()
+		// The mandatory stop must not run under the RPC's possibly-
+		// expired context: a canceled stop leaves a live supervised
+		// Firecracker, and freeing its slot and run directory
+		// underneath it is the wedge the stop exists to prevent.
+		stopFailed := false
+		stopSpawned := func() {
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coldBootStopBudget)
+			defer cancel()
+			if serr := m.stopVM(sctx, vmID, actual); serr != nil {
+				stopFailed = true
+				log.Error().Err(serr).Msg("stop spawned VM after failed cold boot; residue left for forced teardown")
+				return
+			}
+			// A nil stop can still mean a deactivating unit (the expired
+			// stop wait settles those as complete while the process may
+			// hold its socket): release requires the terminal claim,
+			// exactly as every stale-cleanup path holds it.
+			var down bool
+			if cgroupSupervised(actual) {
+				down = m.cgroupDefinitelyDead(vmID) && vmUnitFullyDown(vmID)
+			} else {
+				down = vmUnitFullyDown(vmID)
+			}
+			if !down {
+				stopFailed = true
+				log.Error().Msg("spawned VM not terminally down after stop; residue left for forced teardown")
+			}
+		}
+		if lerr != nil {
+			// A failed launch can itself leave a live process (a cgroup
+			// spawn whose internal kill was unconfirmed), so the
+			// confirmed stop runs here too before anything is freed.
+			stopSpawned()
+		} else if lerr = waitForSocket(socketPath, 10*time.Second); lerr != nil {
+			stopSpawned()
+		} else if lerr = ConfigureMachine(socketPath, fcCfg); lerr != nil {
+			stopSpawned()
+		} else if lerr = StartInstance(socketPath); lerr != nil {
+			stopSpawned()
+		}
+		if lerr == nil {
+			pid = spawnedPID
+		}
+		if lerr != nil {
+			// A failed stop forbids freeing resources: the slot and run
+			// directory may still be under a live Firecracker, so leave
+			// the residue for a forced DestroyVM to clear.
+			if !stopFailed {
+				m.netMgr.CleanupVM(vmID)
+				m.cleanupRunDir(vmID)
+			}
+			m.setStatus(vmID, StatusError)
+			if stopFailed {
+				// Callers that roll back durable state must know the
+				// spawned VM may still be alive: the StatusError record
+				// above is the truthful one to keep.
+				return nil, fmt.Errorf("start firecracker (supervised): %w: %w", lerr, errSpawnedStopUnconfirmed)
+			}
+			return nil, fmt.Errorf("start firecracker (supervised): %w", lerr)
+		}
+	} else {
+		var serr error
+		pid, serr = m.startFirecrackerColdBoot(ctx, vmID, socketPath, fcCfg, netInfo.Namespace)
+		if serr != nil {
+			m.netMgr.CleanupVM(vmID)
+			m.cleanupRunDir(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("start firecracker: %w", serr)
+		}
 	}
 
 	inst.mu.Lock()
@@ -936,7 +1093,7 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 // ---------------------------------------------------------------------------
 
 // DestroyVM terminates a VM and cleans up all its resources.
-func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error {
+func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) (err error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Bool("force", force).Msg("destroying VM")
 
@@ -951,8 +1108,28 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	// field). A tracked VM still resolves from m.vms below — this gates only
 	// reattach; an untracked one takes the record fallback, which carries all
 	// teardown needs.
+	unlockOwner := m.lockRecordOwner(vmID)
+	defer unlockOwner() // registered first: releases after the epoch bump and tombstone clear
+	// An external destroy retires any revival anchor: its success must
+	// mean the record is durably gone, not preserved until an in-flight
+	// revival's cleanup happens to run. Revival's own teardowns mark
+	// their context and keep the preserve (their record deletion is the
+	// crash gap the preserve exists to close).
+	if v := ctx.Value(reviveTeardownCtxKey{}); v == nil {
+		m.preserveRecordOnDestroy.Delete(vmID)
+	}
 	m.destroying.Store(vmID, struct{}{})
 	defer m.destroying.Delete(vmID)
+	// Only a SUCCESSFUL destroy advances the epoch (LIFO: before the
+	// tombstone clears): revival treats an epoch step as an
+	// authoritative deletion and force-deletes the anchor, but a failed
+	// destroy deliberately left residue and record for a forced retry,
+	// and counting it would destroy the only durable record.
+	defer func() {
+		if err == nil {
+			m.bumpDestroyEpoch(vmID)
+		}
+	}()
 
 	// A paused or post-restart VM may be absent from m.vms. Don't early-return on
 	// that: unit stop and rundir removal are derivable from vmID and must run, or
@@ -2793,6 +2970,7 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	// lazy load can't run reattachRecord for a vmID while the eager pass is mid
 	// stale-cleanup for the same one. reattachByID re-reads the record inside the
 	// flight, so a DestroyVM between the snapshot and here can't resurrect it.
+	m.reattachStopDeadline.Store(time.Now().Add(reattachStopPassBudget))
 	for _, snap := range records {
 		// Stop on shutdown: a cancelled ctx makes liveness checks fail, which
 		// would otherwise misfire the stale-cleanup path against live VMs.
@@ -2893,6 +3071,87 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	m.mu.RUnlock()
 
 	log := m.log.With().Str("vm_id", rec.ID).Logger()
+
+	// A revival interrupted by a restart must keep its record: it is the
+	// retry's anchor (revive refuses unknown sandboxes), and the stale
+	// cleanup below would delete it as a dead non-paused record. Park it
+	// as Error without adopting; the retry's at-rest probe gates any
+	// residue before a new boot, and the retry clears the mark.
+	// No status exclusion: a pending marker can ride a still-Paused
+	// record (revival of an unresumable paused zombie anchors before the
+	// first status write), and a crash there leaves the same possibly-
+	// live residue as any other interrupted attempt.
+	if rec.RevivalPending {
+		// A revival in flight holds vmID's op lock (ReviveVM's very
+		// first step) and already owns this record's fate; stopping its
+		// newly launched replacement or overwriting its state out from
+		// under it would be exactly the corruption this cleanup exists
+		// to prevent for a CRASHED attempt. Skip when the lock is held
+		// (non-blocking: this pass must not stall on a live revival) and
+		// let that attempt's own commit or rollback resolve the record.
+		if unlockTry, ok := m.tryLockVMOp(rec.ID); ok {
+			unlockTry()
+		} else {
+			log.Info().Msg("revival in flight (op lock held) — leaving pending record for that attempt to resolve")
+			return nil, false
+		}
+		log.Warn().Msg("revival interrupted by restart — stopping residue and parking record for retry")
+		// The interrupted attempt may have left a live replacement, and
+		// the retry's at-rest probe would refuse while it runs; without a
+		// stop here (the reaper exempts pending records) recovery would
+		// wedge until a manual destroy. Bounded and best-effort: an
+		// unconfirmed stop still parks, the probe keeps refusing, and
+		// the operator's forced destroy resolves.
+		// Both supervisors stop, not just the recorded mode: a cgroup
+		// launch can fall back to a unit mid-crash (errScopeGone), so the
+		// record's mode may not name the residue's real supervisor. The
+		// budget is the per-record cap clipped to the pass-wide deadline,
+		// so many pending records cannot stack stops into minutes of
+		// postponed reconciliation; past the deadline the stop is
+		// skipped, the record still parks, and the retry's at-rest probe
+		// keeps refusing until the operator resolves.
+		budget := coldBootStopBudget
+		if d, ok := m.reattachStopDeadline.Load().(time.Time); ok && !d.IsZero() {
+			if rem := time.Until(d); rem < budget {
+				budget = rem
+			}
+		}
+		// The pass deadline bounds stop STARTS, not stop internals: some
+		// stop branches strip cancellation and run their own internal
+		// budgets, so the deadline is rechecked between the two stops
+		// and the overshoot is bounded by at most one internal budget.
+		if budget > 0 {
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
+			_ = m.stopVM(sctx, rec.ID, SupervisionUnit)
+			remaining := true
+			if d, ok := m.reattachStopDeadline.Load().(time.Time); ok && !d.IsZero() && time.Until(d) <= 0 {
+				remaining = false
+			}
+			if remaining {
+				_ = m.stopVM(sctx, rec.ID, SupervisionCgroup)
+			} else {
+				log.Warn().Msg("reattach stop budget exhausted after unit stop; skipping cgroup stop")
+			}
+			cancel()
+		} else {
+			log.Warn().Msg("reattach stop budget exhausted; parking without residue stop")
+		}
+		rec.Status = StatusError
+		// Presence-conditional parking, deliberately WITHOUT the
+		// record-owner mutex: a concurrent DestroyVM holds that mutex
+		// while joining this very reattach flight through getInstance,
+		// so taking it here would deadlock both. PutIfPresent is a
+		// single Bolt transaction, which is discrimination enough: a
+		// destroy's delete landing first makes this a no-op, and one
+		// landing after deletes the parked record. The destroy wins
+		// both orderings.
+		if wrote, err := m.state.PutIfPresent(rec); err != nil {
+			log.Error().Err(err).Msg("park interrupted-revival record")
+		} else if !wrote {
+			log.Info().Msg("interrupted-revival record deleted by a destroy; leaving it deleted")
+		}
+		return nil, false
+	}
 
 	// A live cgroup is ground truth for supervision, reconciled before we
 	// trust the record's mode or status. Two crash windows produce a
@@ -3765,6 +4024,52 @@ func (m *Manager) instanceClaimsCgroup(vmID string) bool {
 	return cgroupSupervised(inst.Supervision)
 }
 
+// errSpawnedStopUnconfirmed marks a cold-boot failure whose spawned VM
+// could not be confirmed stopped; its resources and error record were
+// deliberately retained for a forced teardown.
+var errSpawnedStopUnconfirmed = errors.New("spawned VM stop unconfirmed")
+
+// reattachStopPassBudget bounds the aggregate residue-stop time of one
+// eager reattach pass (see reattachStopDeadline).
+const reattachStopPassBudget = 90 * time.Second
+
+// coldBootStopBudget bounds the detached stop of a spawned VM after a
+// failed cold boot: detachment protects the stop from the caller's spent
+// deadline, but an unbounded stop would let a hung systemctl wedge the
+// lifecycle path indefinitely (see stopUnitBudget for the same
+// discipline).
+const coldBootStopBudget = 30 * time.Second
+
+// lockRecordOwner acquires vmID's record-ownership mutex (see
+// recordOwnerMus) and returns its unlock.
+func (m *Manager) lockRecordOwner(vmID string) func() {
+	v, _ := m.recordOwnerMus.LoadOrStore(vmID, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// recordRevivalPending reports whether vmID's durable record is marked
+// as an in-flight revival's retry anchor (see VMRecord.RevivalPending).
+func (m *Manager) recordRevivalPending(vmID string) bool {
+	if m.state == nil {
+		return false
+	}
+	rec, err := m.state.Get(vmID)
+	return err == nil && rec != nil && rec.RevivalPending
+}
+
+// destroyEpoch reads vmID's completed-destroy counter.
+func (m *Manager) destroyEpoch(vmID string) uint64 {
+	v, _ := m.destroyEpochs.LoadOrStore(vmID, new(uint64))
+	return atomic.LoadUint64(v.(*uint64))
+}
+
+func (m *Manager) bumpDestroyEpoch(vmID string) {
+	v, _ := m.destroyEpochs.LoadOrStore(vmID, new(uint64))
+	atomic.AddUint64(v.(*uint64), 1)
+}
+
 func (m *Manager) setStatus(vmID string, s VMStatus) {
 	m.mu.RLock()
 	inst, ok := m.vms[vmID]
@@ -4174,9 +4479,33 @@ func (m *Manager) deleteState(vmID string) {
 	if isBuildVM(vmID) {
 		return
 	}
+	if v, ok := m.preserveRecordOnDestroy.Load(vmID); ok {
+		// A revival is in flight: the record is its retry anchor, so
+		// deletion becomes an overwrite with the pending-marked record.
+		// There is no recordless instant for a crash to land in.
+		rec := v.(VMRecord)
+		if err := m.state.Put(rec); err != nil {
+			m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to preserve revival anchor in BoltDB")
+		}
+		return
+	}
 	if err := m.state.Delete(vmID); err != nil {
 		m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to delete VM state from BoltDB")
 	}
+}
+
+// reviveTeardownCtxKey marks a context as belonging to revival's own
+// teardown calls: DestroyVM preserves the revival anchor for those and
+// retires it for every other caller.
+type reviveTeardownCtxKey struct{}
+
+// deleteStateForce removes the durable record even while a revival's
+// preserve entry is active: revival's own destroy-wins paths call it
+// once an external destroy is detected, because the deletion is then
+// authoritative and the anchor must not survive it.
+func (m *Manager) deleteStateForce(vmID string) {
+	m.preserveRecordOnDestroy.Delete(vmID)
+	m.deleteState(vmID)
 }
 
 func (m *Manager) removeVM(vmID string) {
@@ -4200,6 +4529,22 @@ func (m *Manager) copyRootfs(ctx context.Context, dirName, srcRootfs string) (st
 		return "", fmt.Errorf("copy rootfs: %s: %w", string(out), err)
 	}
 
+	return diskPath, nil
+}
+
+// copyRootfsExact reflinks the source into the VM's run dir with no
+// fallback: extent-exact or error, for overlay sources whose holes are
+// semantically load-bearing.
+func (m *Manager) copyRootfsExact(ctx context.Context, dirName, srcRootfs string) (string, error) {
+	vmDir := filepath.Join(m.cfg.RunDir, dirName)
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir vm dir: %w", err)
+	}
+	diskPath := filepath.Join(vmDir, "rootfs.ext4")
+	cmd := exec.CommandContext(ctx, "cp", "--reflink=always", srcRootfs, diskPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("exact copy (source and run dir must share a reflink filesystem): %s: %w", string(out), err)
+	}
 	return diskPath, nil
 }
 

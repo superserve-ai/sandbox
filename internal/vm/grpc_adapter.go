@@ -676,3 +676,43 @@ func vmStatusToProto(s VMStatus) vmdpb.VMStatus {
 		return vmdpb.VMStatus_VM_STATUS_UNSPECIFIED
 	}
 }
+
+// ReviveVM cold-boots a dead sandbox from a salvaged copy of its own
+// disk; see Manager.ReviveVM for the liveness and residue semantics.
+func (a *GRPCAdapter) ReviveVM(ctx context.Context, req *vmdpb.ReviveVMRequest) (*vmdpb.ReviveVMResponse, error) {
+	var rules *sandboxNetworkRules
+	if len(req.GetAllowedCidrs()) > 0 || len(req.GetDeniedCidrs()) > 0 || len(req.GetAllowedDomains()) > 0 {
+		rules = &sandboxNetworkRules{
+			allowedCIDRs:   req.GetAllowedCidrs(),
+			deniedCIDRs:    req.GetDeniedCidrs(),
+			allowedDomains: req.GetAllowedDomains(),
+		}
+	}
+	inst, err := a.mgr.ReviveVM(ctx, req.GetVmId(), req.GetDiskPath(), req.GetBasePath(), req.GetStandaloneDisk(), req.GetAllowRecordless(), req.GetTeamId(), req.GetOwnerId(), req.GetVcpu(), req.GetMemMib(), rules)
+	if err != nil {
+		return nil, err
+	}
+	inst.mu.RLock()
+	diskPath, hostIP := inst.DiskPath, inst.IP
+	inst.mu.RUnlock()
+	// A cold boot starts boxd with an empty context: unlike snapshot
+	// resume, no in-memory init state survives, so env and secret
+	// bindings re-inject here when the caller supplied them, reusing the
+	// standalone injection path verbatim (lock, proxy gate, retries).
+	// Empty config leaves re-injection to the caller before activation.
+	if len(req.GetEnvVars()) > 0 || req.GetSecretsJwt() != "" {
+		if _, err := a.InjectSandboxEnv(ctx, &vmdpb.InjectSandboxEnvRequest{
+			VmId:       req.GetVmId(),
+			EnvVars:    req.GetEnvVars(),
+			SecretsJwt: req.GetSecretsJwt(),
+		}); err != nil {
+			// The boot succeeded; the config did not land. Fail the RPC
+			// so the operator retries injection rather than activating a
+			// sandbox missing its env, but leave the VM up: re-running
+			// revive is guarded off by the liveness probe, and the
+			// standalone InjectSandboxEnv RPC is the retry path.
+			return nil, status.Errorf(codes.Internal, "revived but configuration injection failed; retry via InjectSandboxEnv: %v", err)
+		}
+	}
+	return &vmdpb.ReviveVMResponse{DiskPath: diskPath, HostIp: hostIP}, nil
+}
