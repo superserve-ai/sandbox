@@ -427,7 +427,18 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		inst.PreviewTokenPolicyRevision = prevRec.PreviewTokenPolicyRevision
 		inst.Metadata = prevRec.Metadata
 	}
-	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, rules, seed, true, supervision, vcpu, memMiB)
+	// Network setup blocks, so the epoch check at prep time is already
+	// stale by the time coldBootFromRootfs is ready to launch; this closes
+	// that window instead of only catching it after guest readiness,
+	// where a destroy has already had time to hand the slot/TAP back to
+	// the pool.
+	preLaunch := func() error {
+		if m.destroyEpoch(vmID) != epochBase {
+			return status.Errorf(codes.Aborted, "vm %s was destroyed while revival's network setup was running; the destroy is authoritative", vmID)
+		}
+		return nil
+	}
+	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, rules, seed, preLaunch, true, supervision, vcpu, memMiB)
 	if err != nil {
 		// An unconfirmed stop of the spawned VM keeps the boot's
 		// truthful StatusError record: restoring the zombie record over

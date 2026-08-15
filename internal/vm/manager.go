@@ -867,7 +867,7 @@ func pidIsVMFirecracker(pid int, vmID string) bool {
 // The flag is explicit because SupervisionUnit is the zero value: a
 // sentinel on the mode alone cannot distinguish "unit mode" from the
 // legacy unsupervised spawn kept for throwaway template-build VMs.
-func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath string, rules *sandboxNetworkRules, seed func(*VMInstance), supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
+func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath string, rules *sandboxNetworkRules, seed func(*VMInstance), preLaunch func() error, supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
@@ -960,6 +960,21 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("apply network rules: %w", err)
+	}
+
+	// A caller-supplied gate right before Firecracker starts: revival's
+	// last chance to notice an external destroy that completed after
+	// network setup began (network setup blocks, so the epoch check at
+	// prep time is already stale by the time execution reaches here).
+	// Without this, revival could launch onto a slot/TAP a destroy
+	// already handed back to the pool.
+	if preLaunch != nil {
+		if perr := preLaunch(); perr != nil {
+			m.netMgr.CleanupVM(vmID)
+			m.cleanupRunDir(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, perr
+		}
 	}
 
 	// 3. Build Firecracker machine configuration.
@@ -3067,6 +3082,19 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// first status write), and a crash there leaves the same possibly-
 	// live residue as any other interrupted attempt.
 	if rec.RevivalPending {
+		// A revival in flight holds vmID's op lock (ReviveVM's very
+		// first step) and already owns this record's fate; stopping its
+		// newly launched replacement or overwriting its state out from
+		// under it would be exactly the corruption this cleanup exists
+		// to prevent for a CRASHED attempt. Skip when the lock is held
+		// (non-blocking: this pass must not stall on a live revival) and
+		// let that attempt's own commit or rollback resolve the record.
+		if unlockTry, ok := m.tryLockVMOp(rec.ID); ok {
+			unlockTry()
+		} else {
+			log.Info().Msg("revival in flight (op lock held) — leaving pending record for that attempt to resolve")
+			return nil, false
+		}
 		log.Warn().Msg("revival interrupted by restart — stopping residue and parking record for retry")
 		// The interrupted attempt may have left a live replacement, and
 		// the retry's at-rest probe would refuse while it runs; without a
