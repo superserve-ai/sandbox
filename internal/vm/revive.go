@@ -154,7 +154,15 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "disk_path: %v", err)
 	}
-	vmRunDir := filepath.Join(m.cfg.RunDir, vmID) + string(filepath.Separator)
+	// The run dir resolves through the same symlink canonicalization as
+	// the salvage path: comparing a physical salvage path against an
+	// unresolved configured prefix would let a salvage inside a
+	// symlinked run directory slip past and be deleted by the teardown.
+	runDirRoot := m.cfg.RunDir
+	if resolvedRoot, rerr := filepath.EvalSymlinks(runDirRoot); rerr == nil {
+		runDirRoot = resolvedRoot
+	}
+	vmRunDir := filepath.Join(runDirRoot, vmID) + string(filepath.Separator)
 	if strings.HasPrefix(resolved+string(filepath.Separator), vmRunDir) || strings.HasPrefix(resolved, vmRunDir) {
 		return nil, status.Errorf(codes.InvalidArgument, "disk_path %q is inside the VM's run directory, which revival deletes; copy the salvage elsewhere first", diskPath)
 	}

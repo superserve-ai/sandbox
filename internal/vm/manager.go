@@ -515,6 +515,11 @@ type Manager struct {
 	// then checks the epoch cannot interleave with a destroy completing
 	// between its check and its restore write.
 	recordOwnerMus sync.Map // vmID -> *sync.Mutex
+	// reattachStopDeadline bounds the aggregate time the eager reattach
+	// pass may spend stopping interrupted-revival residue: the pass is
+	// serial, and per-record stop budgets would otherwise stack into
+	// minutes of postponed reconciliation.
+	reattachStopDeadline atomic.Value // time.Time
 }
 
 // trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
@@ -2910,6 +2915,7 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	// lazy load can't run reattachRecord for a vmID while the eager pass is mid
 	// stale-cleanup for the same one. reattachByID re-reads the record inside the
 	// flight, so a DestroyVM between the snapshot and here can't resurrect it.
+	m.reattachStopDeadline.Store(time.Now().Add(reattachStopPassBudget))
 	for _, snap := range records {
 		// Stop on shutdown: a cancelled ctx makes liveness checks fail, which
 		// would otherwise misfire the stale-cleanup path against live VMs.
@@ -3071,13 +3077,28 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		// wedge until a manual destroy. Bounded and best-effort: an
 		// unconfirmed stop still parks, the probe keeps refusing, and
 		// the operator's forced destroy resolves.
-		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coldBootStopBudget)
-		if knownSupervision(rec.Supervision) {
-			_ = m.stopVM(sctx, rec.ID, rec.Supervision)
-		} else {
-			_ = stopUnitWithBudget(sctx, systemdUnitName(rec.ID))
+		// Both supervisors stop, not just the recorded mode: a cgroup
+		// launch can fall back to a unit mid-crash (errScopeGone), so the
+		// record's mode may not name the residue's real supervisor. The
+		// budget is the per-record cap clipped to the pass-wide deadline,
+		// so many pending records cannot stack stops into minutes of
+		// postponed reconciliation; past the deadline the stop is
+		// skipped, the record still parks, and the retry's at-rest probe
+		// keeps refusing until the operator resolves.
+		budget := coldBootStopBudget
+		if d, ok := m.reattachStopDeadline.Load().(time.Time); ok && !d.IsZero() {
+			if rem := time.Until(d); rem < budget {
+				budget = rem
+			}
 		}
-		cancel()
+		if budget > 0 {
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
+			_ = m.stopVM(sctx, rec.ID, SupervisionUnit)
+			_ = m.stopVM(sctx, rec.ID, SupervisionCgroup)
+			cancel()
+		} else {
+			log.Warn().Msg("reattach stop budget exhausted; parking without residue stop")
+		}
 		rec.Status = StatusError
 		if err := m.state.Put(rec); err != nil {
 			log.Error().Err(err).Msg("park interrupted-revival record")
@@ -3917,6 +3938,10 @@ func (m *Manager) instanceClaimsCgroup(vmID string) bool {
 // could not be confirmed stopped; its resources and error record were
 // deliberately retained for a forced teardown.
 var errSpawnedStopUnconfirmed = errors.New("spawned VM stop unconfirmed")
+
+// reattachStopPassBudget bounds the aggregate residue-stop time of one
+// eager reattach pass (see reattachStopDeadline).
+const reattachStopPassBudget = 90 * time.Second
 
 // coldBootStopBudget bounds the detached stop of a spawned VM after a
 // failed cold boot: detachment protects the stop from the caller's spent
