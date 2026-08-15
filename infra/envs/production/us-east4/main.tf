@@ -62,25 +62,16 @@ locals {
   # series like filesystem utilization carry the instance name while vmd's own
   # OTLP series carry this. One machine, two host_id values, depending on which
   # process emitted the metric.
-  # Standby value is the instance name, NOT a short "use4-2": deploy-vmd.py
-  # initializes a new host's HOST_ID from its instance name, so the alert
-  # filter must match that exact identity or it selects a series vmd never
-  # emits. The primary keeps the legacy "default" (predates the convention).
+  # Standby value derives from the instance name so it always matches the
+  # host's deployed HOST_ID; the primary keeps its existing "default".
   metrics_host_id = var.active_sandbox_host == "standby" ? module.sandbox_host_b.instance_name : "default"
 
-  # The control plane dials whichever host active_sandbox_host selects. The
-  # selected host must already be running and serving before it is applied —
-  # instance run state is operational, not Terraform-managed.
-  active_vmd_ip = var.active_sandbox_host == "standby" ? module.sandbox_host_b.internal_ip : module.sandbox_host.internal_ip
-
-  # The host currently serving vmd traffic, and so the host whose instance name
-  # tags its host-level (collector) metrics. Alert filters key on this so a
-  # standby promotion keeps them watching whichever host is actually emitting.
+  # The host selected by active_sandbox_host, used for the control-plane
+  # address and the alert identity.
+  active_vmd_ip    = var.active_sandbox_host == "standby" ? module.sandbox_host_b.internal_ip : module.sandbox_host.internal_ip
   active_host_name = var.active_sandbox_host == "standby" ? module.sandbox_host_b.instance_name : module.sandbox_host.instance_name
 
-  # Exactly one host carries component=vmd, the label the shared deploy
-  # pipeline discovers; the other is parked under a cell-scoped label so
-  # rollouts skip it instead of failing against a host that is out of service.
+  # The active host is labelled for the deploy pipeline; the other is parked.
   primary_component = var.active_sandbox_host == "primary" ? "vmd" : "vmd-use4-standby"
   standby_component = var.active_sandbox_host == "standby" ? "vmd" : "vmd-use4-standby"
 }
@@ -205,11 +196,8 @@ module "api" {
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "15"
     VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
-    # The active host's row identity, following active_sandbox_host in lock
-    # step with VMD_GRPC_ADDRESS. The build supervisor and the scheduler
-    # fallback resolve a host row through this; leaving it at the implicit
-    # "default" would, after promotion, dispatch template builds to the
-    # retired primary. Same value as metrics_host_id (the host's HOST_ID).
+    # Active host's identity, following active_sandbox_host alongside the
+    # address above. Same value as metrics_host_id.
     DEFAULT_HOST_ID  = local.metrics_host_id
     KMS_KEY_RESOURCE = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
 
@@ -368,17 +356,9 @@ module "sandbox_host" {
   }
 }
 
-# Cold standby for the cell, normally kept stopped, on a DISTINCT identity
-# from the primary's HOST_ID=default — two hosts under one identity would
-# reconcile each other's sandboxes. Its HOST_ID is its instance name (the
-# deploy script's new-host default); do not hand-provision a different value,
-# or the alert filters (metrics_host_id) watch a series vmd never emits.
-#
-# active_sandbox_host flips only what Terraform owns: the control-plane dial,
-# DEFAULT_HOST_ID, the deploy-fleet label, and the alert identity. It does NOT
-# move sandbox placement (the scheduler keys on host.status) or the data-plane
-# proxy backend, so promotion is a multi-step operational cutover, not a lone
-# flag flip — follow the internal host-migration runbook.
+# Cold standby for the cell, normally kept stopped. Distinct identity from
+# the primary (its HOST_ID is its instance name) so the two never share one.
+# Promotion is an operational procedure, not just flipping active_sandbox_host.
 module "sandbox_host_b" {
   source = "../../../modules/sandbox-host"
 
