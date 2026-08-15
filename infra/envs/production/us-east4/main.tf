@@ -62,7 +62,11 @@ locals {
   # series like filesystem utilization carry the instance name while vmd's own
   # OTLP series carry this. One machine, two host_id values, depending on which
   # process emitted the metric.
-  metrics_host_id = var.active_sandbox_host == "standby" ? "use4-2" : "default"
+  # Standby value is the instance name, NOT a short "use4-2": deploy-vmd.py
+  # initializes a new host's HOST_ID from its instance name, so the alert
+  # filter must match that exact identity or it selects a series vmd never
+  # emits. The primary keeps the legacy "default" (predates the convention).
+  metrics_host_id = var.active_sandbox_host == "standby" ? module.sandbox_host_b.instance_name : "default"
 
   # The control plane dials whichever host active_sandbox_host selects. The
   # selected host must already be running and serving before it is applied —
@@ -359,8 +363,11 @@ module "sandbox_host" {
 }
 
 # Cold standby for the cell, normally kept stopped, on a DISTINCT identity
-# (use4-2) from the primary's HOST_ID=default — while the c4 primary still
-# serves, two hosts under one identity would reconcile each other's sandboxes.
+# from the primary's HOST_ID=default — while the c4 primary still serves, two
+# hosts under one identity would reconcile each other's sandboxes. The
+# standby's HOST_ID is its instance name (superserve-vmd-use4-2), set by
+# deploy-vmd.py's new-host default; do not hand-provision a different value,
+# or the alert filters (metrics_host_id) will watch a series vmd never emits.
 #
 # active_sandbox_host controls only what Terraform owns: which host the
 # control plane DIALS (VMD_GRPC_ADDRESS), the deploy-fleet label, and the
