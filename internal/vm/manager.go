@@ -515,6 +515,13 @@ type Manager struct {
 	// then checks the epoch cannot interleave with a destroy completing
 	// between its check and its restore write.
 	recordOwnerMus sync.Map // vmID -> *sync.Mutex
+	// preserveRecordOnDestroy converts record deletion into an overwrite
+	// with the stored pending anchor while a revival is in flight:
+	// revival refuses unknown sandboxes, so any delete-then-rewrite gap
+	// (its own residue clear most of all) would brick the retry if vmd
+	// crashed inside it. Revival's destroy-wins paths bypass it with
+	// deleteStateForce once an external destroy is detected.
+	preserveRecordOnDestroy sync.Map // vmID -> VMRecord
 	// reattachStopDeadline bounds the aggregate time the eager reattach
 	// pass may spend stopping interrupted-revival residue: the pass is
 	// serial, and per-record stop budgets would otherwise stack into
@@ -3032,49 +3039,6 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 
 	log := m.log.With().Str("vm_id", rec.ID).Logger()
 
-	// A live cgroup is ground truth for supervision, reconciled before we
-	// trust the record's mode or status. Two crash windows produce a
-	// disagreement: a crash mid unit→cgroup flip leaves the record still
-	// saying unit over a live cgroup; a crash mid-resume leaves a Paused
-	// record with a live half-restored FC.
-	supervisionCorrected := false
-	if m.cgroups != nil {
-		// An unreadable cgroup.events reads as populated (fail-closed): falling
-		// through to the stale unit mode would free networking under a live
-		// cgroup FC that the unit liveness check reads as dead.
-		if pop, perr := m.cgroups.vmCgroupPopulated(rec.ID); perr != nil || pop {
-			// Stamp cgroup mode FIRST, unconditionally: even if the kill
-			// below fails (host contention), the published record must never
-			// say unit over a live cgroup, or a later destroy stops a
-			// nonexistent unit and a resume launches a unit alongside it. This
-			// is a no-op when the record already says cgroup (the common clean
-			// reattach), so capture the disagreement before overwriting it —
-			// only an ACTUAL correction is worth a WARN, not every reattach.
-			wasNonCgroup := !cgroupSupervised(rec.Supervision)
-			supervisionCorrected = wasNonCgroup
-			rec.Supervision = SupervisionCgroup
-			if rec.Status == StatusPaused {
-				// A paused VM has no live process — this is a mid-resume
-				// orphan. Kill it and keep the record Paused so a fresh
-				// resume retries cleanly. On kill failure the reconciler
-				// backstops (the record is now cgroup-mode).
-				log.Warn().Msg("live cgroup for a paused record — killing mid-resume orphan")
-				_ = m.stopVM(ctx, rec.ID, SupervisionCgroup)
-			} else if wasNonCgroup {
-				// Only when the record actually disagreed with the live cgroup
-				// (a crash mid unit→cgroup flip), never on a clean reattach.
-				log.Warn().Msg("live cgroup with a non-cgroup record — corrected supervision to cgroup")
-			}
-		}
-	}
-
-	// An unknown supervision mode (store corruption, or a record written by a
-	// NEWER binary) is unmanageable: the dispatchers refuse it, and the stale
-	// cleanup below would probe the wrong oracle — a nonexistent unit reads
-	// vacuously down, releasing record and network under a possibly-live FC.
-	// Park it as Error instead (durable via the publish tail), preserving the
-	// value for the binary that understands it. The live-cgroup correction
-	// above already repaired the one case reality can prove.
 	// A revival interrupted by a restart must keep its record: it is the
 	// retry's anchor (revive refuses unknown sandboxes), and the stale
 	// cleanup below would delete it as a dead non-paused record. Park it
@@ -3130,6 +3094,49 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		return nil, false
 	}
 
+	// A live cgroup is ground truth for supervision, reconciled before we
+	// trust the record's mode or status. Two crash windows produce a
+	// disagreement: a crash mid unit→cgroup flip leaves the record still
+	// saying unit over a live cgroup; a crash mid-resume leaves a Paused
+	// record with a live half-restored FC.
+	supervisionCorrected := false
+	if m.cgroups != nil {
+		// An unreadable cgroup.events reads as populated (fail-closed): falling
+		// through to the stale unit mode would free networking under a live
+		// cgroup FC that the unit liveness check reads as dead.
+		if pop, perr := m.cgroups.vmCgroupPopulated(rec.ID); perr != nil || pop {
+			// Stamp cgroup mode FIRST, unconditionally: even if the kill
+			// below fails (host contention), the published record must never
+			// say unit over a live cgroup, or a later destroy stops a
+			// nonexistent unit and a resume launches a unit alongside it. This
+			// is a no-op when the record already says cgroup (the common clean
+			// reattach), so capture the disagreement before overwriting it —
+			// only an ACTUAL correction is worth a WARN, not every reattach.
+			wasNonCgroup := !cgroupSupervised(rec.Supervision)
+			supervisionCorrected = wasNonCgroup
+			rec.Supervision = SupervisionCgroup
+			if rec.Status == StatusPaused {
+				// A paused VM has no live process — this is a mid-resume
+				// orphan. Kill it and keep the record Paused so a fresh
+				// resume retries cleanly. On kill failure the reconciler
+				// backstops (the record is now cgroup-mode).
+				log.Warn().Msg("live cgroup for a paused record — killing mid-resume orphan")
+				_ = m.stopVM(ctx, rec.ID, SupervisionCgroup)
+			} else if wasNonCgroup {
+				// Only when the record actually disagreed with the live cgroup
+				// (a crash mid unit→cgroup flip), never on a clean reattach.
+				log.Warn().Msg("live cgroup with a non-cgroup record — corrected supervision to cgroup")
+			}
+		}
+	}
+
+	// An unknown supervision mode (store corruption, or a record written by a
+	// NEWER binary) is unmanageable: the dispatchers refuse it, and the stale
+	// cleanup below would probe the wrong oracle — a nonexistent unit reads
+	// vacuously down, releasing record and network under a possibly-live FC.
+	// Park it as Error instead (durable via the publish tail), preserving the
+	// value for the binary that understands it. The live-cgroup correction
+	// above already repaired the one case reality can prove.
 	unmanageableMode := !knownSupervision(rec.Supervision)
 	if unmanageableMode {
 		log.Error().Str("supervision", string(rec.Supervision)).
@@ -4413,9 +4420,28 @@ func (m *Manager) deleteState(vmID string) {
 	if isBuildVM(vmID) {
 		return
 	}
+	if v, ok := m.preserveRecordOnDestroy.Load(vmID); ok {
+		// A revival is in flight: the record is its retry anchor, so
+		// deletion becomes an overwrite with the pending-marked record.
+		// There is no recordless instant for a crash to land in.
+		rec := v.(VMRecord)
+		if err := m.state.Put(rec); err != nil {
+			m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to preserve revival anchor in BoltDB")
+		}
+		return
+	}
 	if err := m.state.Delete(vmID); err != nil {
 		m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to delete VM state from BoltDB")
 	}
+}
+
+// deleteStateForce removes the durable record even while a revival's
+// preserve entry is active: revival's own destroy-wins paths call it
+// once an external destroy is detected, because the deletion is then
+// authoritative and the anchor must not survive it.
+func (m *Manager) deleteStateForce(vmID string) {
+	m.preserveRecordOnDestroy.Delete(vmID)
+	m.deleteState(vmID)
 }
 
 func (m *Manager) removeVM(vmID string) {

@@ -185,6 +185,15 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// Force-clear the zombie's residue. Fail closed on error: booting
 	// over half-cleared state (a live unit, an occupied network slot)
 	// is exactly the wedge class the teardown exists to prevent.
+	// The preserve entry precedes the residue clear: the teardown's own
+	// record deletion is exactly the delete-then-rewrite gap that must
+	// not exist.
+	{
+		pending := *prevRec
+		pending.RevivalPending = true
+		m.preserveRecordOnDestroy.Store(vmID, pending)
+	}
+	defer m.preserveRecordOnDestroy.Delete(vmID)
 	if err := m.DestroyVM(ctx, vmID, true); err != nil {
 		return nil, fmt.Errorf("clear residue: %w", err)
 	}
@@ -234,9 +243,16 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 			return
 		}
 		if m.destroyEpoch(vmID) != epochBase+selfDestroys {
+			// A destroy interleaved. Anything this attempt re-persisted
+			// (a pending Error record from a failed boot, or the
+			// preserved anchor) undoes that authoritative deletion, so
+			// delete deliberately, through the preserve.
+			m.deleteStateForce(vmID)
 			return
 		}
-		if perr := m.state.Put(*prevRec); perr != nil {
+		restored := *prevRec
+		restored.RevivalPending = true
+		if perr := m.state.Put(restored); perr != nil {
 			m.log.Error().Err(perr).Str("vm_id", vmID).Msg("restore zombie record after failed revival")
 		}
 	}()
@@ -346,28 +362,28 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// state store cannot record is not a revival: an unrecorded running
 	// VM would be invisible to reconciliation and refused by the next
 	// revive's liveness probe, so fail closed and tear down.
-	wrote := m.persistState(inst)
-	// Post-write ownership recheck, resume's discipline: a concurrent
-	// force-destroy can complete during the readiness wait, and the
-	// write above would then resurrect a Running record for a VM that
-	// no longer exists. The destroy owns the outcome, so delete the
-	// resurrected record and suppress the zombie-record restore too.
+	// Ownership check BEFORE the verified persist, atomic with it under
+	// the record-owner mutex: writing first would leave a crash window
+	// in which a destroyed sandbox's restart adopts an ordinary
+	// verified Running record. DestroyVM holds the same mutex for its
+	// whole run, so a destroy either completed before this block (and
+	// the epoch shows it) or waits until the commit is durable and then
+	// deletes it, destroy-wins either way.
+	unlockCommit := m.lockRecordOwner(vmID)
 	m.mu.RLock()
 	_, stillTracked := m.vms[vmID]
 	m.mu.RUnlock()
 	_, beingDestroyed := m.destroying.Load(vmID)
-	// An epoch ahead of our own count means a destroy completed in the
-	// pre-registration gap, where it could not see the replacement to
-	// remove it: the deletion is still authoritative, so the booted
-	// replacement goes too.
 	externallyDestroyed := m.destroyEpoch(vmID) != epochBase+selfDestroys
 	if !stillTracked || beingDestroyed || externallyDestroyed {
+		unlockCommit()
 		// Whatever the interleaving, the replacement or its residue must
 		// go: a destroy that raced the boot may have missed the spawned
 		// process or the just-written record (it can complete before
 		// either exists), and DestroyVM force-cleans residue even for
 		// untracked VMs, serializing behind any destroy still in flight.
 		teardownSelf(context.WithoutCancel(ctx))
+		m.deleteStateForce(vmID)
 		committed = true
 		if teardownFailed {
 			// The destroy owns the outcome but the replacement could not
@@ -377,6 +393,8 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		}
 		return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while revival was completing", vmID)
 	}
+	wrote := m.persistState(inst)
+	unlockCommit()
 	if !wrote {
 		teardownSelf(context.WithoutCancel(ctx))
 		if teardownFailed {
@@ -385,6 +403,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		return nil, status.Error(codes.Internal, "revived VM could not be durably recorded; torn down for clean retry")
 	}
 	committed = true
+	m.preserveRecordOnDestroy.Delete(vmID)
 	// Rare operator path, so phase durations go to the structured log
 	// rather than a new metric surface: enough to see where a slow
 	// revival spent its time (teardown and copy fold into boot).
