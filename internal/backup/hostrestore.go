@@ -163,9 +163,24 @@ type HostRestorer struct {
 // the playbook, not an abort at the first missing owner.
 func (h *HostRestorer) Run(ctx context.Context, items []HostRestoreItem) *HostRestoreReport {
 	start := time.Now()
+	// Fresh per-run accounting: stale entries from a prior Run would
+	// silently omit re-downloaded objects from the packed totals.
+	h.seenObjects.Range(func(k, _ any) bool {
+		h.seenObjects.Delete(k)
+		return true
+	})
 	workers := h.Concurrency
 	if workers <= 0 {
 		workers = 4
+	}
+	// Never more goroutines than work, and never an unbounded operator
+	// typo: a six-digit -concurrency would allocate that many workers
+	// before dispatching a single item.
+	if workers > len(items) {
+		workers = len(items)
+	}
+	if workers > 64 {
+		workers = 64
 	}
 	results := make([]HostRestoreResult, len(items))
 	work := make(chan int)
@@ -253,6 +268,7 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 	// is newest-first with early exit so the common case pays one fetch,
 	// candidates probe in small parallel batches, and history depth is
 	// capped by retention once GC lands.
+	var selManifest *GenerationManifest
 	if len(item.Anchors) > 0 {
 		var manifestByGen sync.Map
 		unreadable := 0
@@ -322,6 +338,9 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 		}
 		switch {
 		case match != "" && unreadable == 0:
+			if v, ok := manifestByGen.Load(match); ok {
+				selManifest = v.(*GenerationManifest)
+			}
 			// Acceptance requires the scan to be complete: an unreadable
 			// manifest could match a newer anchor than the one found, or
 			// be a content-differing duplicate of the winning anchor's
@@ -347,11 +366,18 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 		// selected manifest (identity, self-derived generation key,
 		// consistency pairs) so a corrupt or misplaced manifest shows up
 		// in the dry-run ledger, not mid-recovery.
-		m, err := fetchManifest(ctx, h.Reader, item.SandboxID, res.Generation, func(string, ...any) {})
-		if err != nil {
-			res.Outcome, res.Reason = HostRestoreFailed, fmt.Sprintf("manifest validation: %v", err)
-			res.Duration = time.Since(start)
-			return res
+		// The anchored scan already fetched and authenticated every
+		// candidate; refetching the winner would add one GCS request per
+		// sandbox host-wide for bytes already in hand.
+		m := selManifest
+		if m == nil {
+			var err error
+			m, err = fetchManifest(ctx, h.Reader, item.SandboxID, res.Generation, func(string, ...any) {})
+			if err != nil {
+				res.Outcome, res.Reason = HostRestoreFailed, fmt.Sprintf("manifest validation: %v", err)
+				res.Duration = time.Since(start)
+				return res
+			}
 		}
 		res.PackedBytes, res.ApparentBytes = h.manifestBytes(m)
 		res.Outcome = HostRestoreCoverable

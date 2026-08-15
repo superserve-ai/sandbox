@@ -130,12 +130,20 @@ func sandboxIDsFromDB(ctx context.Context, dbURL, hostID string) ([]string, map[
 	// A mistyped or foreign-cell host id must not read as a clean empty
 	// restore: verify the host row exists before enumerating, so "host
 	// unknown" and "host has no sandboxes" stay distinguishable.
-	var hostExists bool
-	if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM host WHERE id = $1)`, hostID).Scan(&hostExists); err != nil {
+	var hostStatus string
+	err = conn.QueryRow(ctx, `SELECT status FROM host WHERE id = $1`, hostID).Scan(&hostStatus)
+	if err == pgx.ErrNoRows {
+		return nil, nil, fmt.Errorf("host %q is not in this cell's host table; check the id and the cell", hostID)
+	}
+	if err != nil {
 		return nil, nil, fmt.Errorf("verify host: %w", err)
 	}
-	if !hostExists {
-		return nil, nil, fmt.Errorf("host %q is not in this cell's host table; check the id and the cell", hostID)
+	// An active host is still taking placements, so the one-time
+	// inventory below would silently miss sandboxes assigned after the
+	// query and report an incomplete ledger as complete. The runbook's
+	// freeze comes first; enumeration refuses to proceed without it.
+	if hostStatus == "active" {
+		return nil, nil, fmt.Errorf("host %q is still active and taking placements; freeze it (unhealthy or draining) before enumerating", hostID)
 	}
 	rows, err := conn.Query(ctx, `
 		SELECT sb.id, COALESCE((
