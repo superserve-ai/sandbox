@@ -3086,15 +3086,20 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		// first step) and already owns this record's fate; stopping its
 		// newly launched replacement or overwriting its state out from
 		// under it would be exactly the corruption this cleanup exists
-		// to prevent for a CRASHED attempt. Skip when the lock is held
-		// (non-blocking: this pass must not stall on a live revival) and
-		// let that attempt's own commit or rollback resolve the record.
-		if unlockTry, ok := m.tryLockVMOp(rec.ID); ok {
-			unlockTry()
-		} else {
+		// to prevent for a CRASHED attempt. The lock is held through the
+		// WHOLE cleanup below (stop and park), not just checked and
+		// released, or a fresh revive could start the instant it
+		// released and race the rest of this block exactly as if the
+		// check had never happened. Non-blocking: this pass must not
+		// stall on a live revival, so a held lock skips cleanup entirely
+		// and leaves that attempt's own commit or rollback to resolve
+		// the record.
+		unlockTry, ok := m.tryLockVMOp(rec.ID)
+		if !ok {
 			log.Info().Msg("revival in flight (op lock held) — leaving pending record for that attempt to resolve")
 			return nil, false
 		}
+		defer unlockTry()
 		log.Warn().Msg("revival interrupted by restart — stopping residue and parking record for retry")
 		// The interrupted attempt may have left a live replacement, and
 		// the retry's at-rest probe would refuse while it runs; without a
