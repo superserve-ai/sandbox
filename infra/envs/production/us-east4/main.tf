@@ -369,35 +369,16 @@ module "sandbox_host" {
 }
 
 # Cold standby for the cell, normally kept stopped, on a DISTINCT identity
-# from the primary's HOST_ID=default — while the c4 primary still serves, two
-# hosts under one identity would reconcile each other's sandboxes. The
-# standby's HOST_ID is its instance name (superserve-vmd-use4-2), set by
-# deploy-vmd.py's new-host default; do not hand-provision a different value,
-# or the alert filters (metrics_host_id) will watch a series vmd never emits.
+# from the primary's HOST_ID=default — two hosts under one identity would
+# reconcile each other's sandboxes. Its HOST_ID is its instance name (the
+# deploy script's new-host default); do not hand-provision a different value,
+# or the alert filters (metrics_host_id) watch a series vmd never emits.
 #
-# active_sandbox_host controls only what Terraform owns: which host the
-# control plane DIALS (VMD_GRPC_ADDRESS), the deploy-fleet label, and the
-# alert/metrics identity. It does NOT move sandbox PLACEMENT: the scheduler
-# selects any host row with status='active' (ListActiveHostsByLoad), which is
-# DB state, not Terraform. So the flag alone is not a safe promotion — with
-# both rows active, new creates would land on both hosts, including the
-# standby before its restore/cutover work is done.
-#
-# Promotion procedure, in this order:
-#   1. The standby's host row starts and STAYS status='draining' through
-#      provisioning and validation — the scheduler never places on a draining
-#      host, and a heartbeat does not un-drain it (UpdateHostHeartbeat only
-#      reactivates 'unhealthy'). So the standby can run and heartbeat safely
-#      while parked.
-#   2. When ready: drain the PRIMARY (status='draining' + pause its active
-#      sandboxes via the host-drain path) so it stops taking new creates.
-#   3. Promote the standby: its row 'draining' -> 'active', then set
-#      active_sandbox_host = "standby" and apply so the control plane dials it
-#      and the deploy fleet follows.
-#   4. Retire the primary once drained and its paused sandboxes are restored
-#      onto the standby from GCS backup (local-SSD snapshots do not migrate).
-# Steps 1-2 and 4 are operational (DB/status + backup restore), not Terraform;
-# only step 3's apply is captured here.
+# active_sandbox_host flips only what Terraform owns: the control-plane dial,
+# DEFAULT_HOST_ID, the deploy-fleet label, and the alert identity. It does NOT
+# move sandbox placement (the scheduler keys on host.status) or the data-plane
+# proxy backend, so promotion is a multi-step operational cutover, not a lone
+# flag flip — follow the internal host-migration runbook.
 module "sandbox_host_b" {
   source = "../../../modules/sandbox-host"
 
