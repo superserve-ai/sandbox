@@ -11,6 +11,9 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
 // ReviveVM cold-boots a sandbox whose VM died, from a salvaged copy of
@@ -85,6 +88,20 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 				// actually reports live before short-circuiting, the same
 				// oracle the fresh-attempt path uses for its own refusal.
 				if !m.vmConfirmedAtRest(ctx, vmID) {
+					// Only the disk (immutable: it names the boot this
+					// instance already ran) short-circuits. Policy is
+					// mutable and reapplies on every idempotent hit, so a
+					// retry with corrected allow/deny/domain rules is not
+					// silently ignored the way returning early outright
+					// would leave it.
+					if rules != nil {
+						inst.mu.RLock()
+						netInfo := &network.VMNetInfo{HostIP: inst.IP, TAPDevice: inst.TAPDevice, Namespace: inst.Namespace}
+						inst.mu.RUnlock()
+						if perr := m.applySandboxNetworkRules(vmID, netInfo, rules); perr != nil {
+							return nil, status.Errorf(codes.Internal, "reapply network rules on idempotent revive: %v", perr)
+						}
+					}
 					return inst, nil
 				}
 			}
@@ -162,7 +179,11 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 			// after the fact.
 			return nil, status.Error(codes.InvalidArgument, "allow_recordless requires team_id; data-plane attribution has no other source")
 		}
-		prevRec = &VMRecord{ID: vmID, Status: StatusError, Supervision: SupervisionUnit, TeamID: teamID, OwnerID: ownerID}
+		// Empty PreviewAccess reads as legacy-public to the preview
+		// proxy (every listening non-privileged port routable), which
+		// would expose the workload before an operator sets real policy.
+		// Recordless revival fails closed to private instead.
+		prevRec = &VMRecord{ID: vmID, Status: StatusError, Supervision: SupervisionUnit, TeamID: teamID, OwnerID: ownerID, PreviewAccess: preview.AccessPrivate}
 	}
 
 	// Overlay-mode sandboxes salvage as sparse overlays whose holes are
