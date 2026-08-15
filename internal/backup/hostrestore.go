@@ -270,6 +270,14 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 	// small parallel batches, and history depth is capped by retention
 	// once GC lands.
 	var selManifest *GenerationManifest
+	if len(item.Anchors) == 0 {
+		// No capture anchors at all (a digest-less sandboxes file, or a
+		// DB with no artifact-manifest rows for this sandbox) means
+		// selection runs on completion order with no way to know whether
+		// it matches capture order. The ledger says so, or the runbook's
+		// rollback grep would miss these sandboxes entirely.
+		res.Reason = "capture anchors unavailable; using newest completed generation (completion order)"
+	}
 	if len(item.Anchors) > 0 {
 		var manifestByGen sync.Map
 		unreadable := 0
@@ -425,10 +433,17 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 // (on-disk) sizes.
 func (h *HostRestorer) manifestBytes(m *GenerationManifest) (packed, apparent int64) {
 	for _, f := range m.Files {
-		// Packed bytes count each object once host-wide (see
-		// seenObjects); apparent bytes are per-destination and count
-		// fully for every sandbox.
-		if _, loaded := h.seenObjects.LoadOrStore(f.Object, struct{}{}); !loaded {
+		// Only shared objects (full bucket paths, downloaded once via
+		// the base cache) dedupe host-wide: generation-local entries
+		// record bare relative names that can collide across sandboxes
+		// while naming different bytes, and deduping those would
+		// understate the transfer. Apparent bytes are per-destination
+		// and count fully for every sandbox.
+		if isSharedEntry(f) {
+			if _, loaded := h.seenObjects.LoadOrStore(f.Object, struct{}{}); !loaded {
+				packed += f.PackedSize
+			}
+		} else {
 			packed += f.PackedSize
 		}
 		apparent += f.Size

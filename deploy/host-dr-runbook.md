@@ -163,7 +163,8 @@ From the ledger:
   never completed but which restored an older generation reports
   restored/coverable with a reason beginning `latest pause not in
   bucket` (older-capture anchor matches and completion-order fallbacks
-  both carry it). Grep the ledger for that prefix to
+  both carry it), and anchor-less sandboxes carry `capture anchors
+  unavailable`. Grep the ledger for both prefixes to
   find every sandbox that came back on an older capture, and fold
   those teams into the same notification as the uncovered ones, with
   the restored generation's timestamp as the last-known-good.
