@@ -310,6 +310,11 @@ message ReviveVMRequest {
   // default from. Ownership, preview policy, env, secrets, and egress
   // all re-establish through the control plane before the row flips.
   bool allow_recordless = 12;
+  // Ownership for the synthesized record: required whenever
+  // allow_recordless is set (there is no other source), and threaded
+  // straight to data-plane usage attribution.
+  string team_id = 13;
+  string owner_id = 14;
 }
 
 message ReviveVMResponse {

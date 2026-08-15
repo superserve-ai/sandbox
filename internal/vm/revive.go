@@ -27,7 +27,7 @@ import (
 // only after this returns, and the ordinary auto-pause machinery then
 // takes the revived sandbox through the standard pause path, which is
 // what lands it paused with a fresh, uploaded generation.
-func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string, standaloneDisk, allowRecordless bool, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
+func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string, standaloneDisk, allowRecordless bool, teamID, ownerID string, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
 	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
 		return nil, status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
 	}
@@ -80,7 +80,13 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		inst.mu.RUnlock()
 		if liveStatus == StatusRunning && !liveUnverified && revivedDisk != "" {
 			if rd, rerr := filepath.EvalSymlinks(diskPath); rerr == nil && rd == revivedDisk {
-				return inst, nil
+				// The record alone is exactly what a zombie lies about
+				// (the reason this RPC exists): confirm the supervisor
+				// actually reports live before short-circuiting, the same
+				// oracle the fresh-attempt path uses for its own refusal.
+				if !m.vmConfirmedAtRest(ctx, vmID) {
+					return inst, nil
+				}
 			}
 		}
 		if st == StatusPaused && snap != "" {
@@ -149,7 +155,14 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		if basePath == "" && !standaloneDisk {
 			return nil, status.Error(codes.InvalidArgument, "allow_recordless requires base_path or standalone_disk; there is no record to name the base")
 		}
-		prevRec = &VMRecord{ID: vmID, Status: StatusError, Supervision: SupervisionUnit}
+		if teamID == "" {
+			// Optional for OwnerID (individual sandboxes may have none),
+			// required for TeamID: exec/file usage attribution and
+			// billing key on it, and there is no follow-up RPC to add it
+			// after the fact.
+			return nil, status.Error(codes.InvalidArgument, "allow_recordless requires team_id; data-plane attribution has no other source")
+		}
+		prevRec = &VMRecord{ID: vmID, Status: StatusError, Supervision: SupervisionUnit, TeamID: teamID, OwnerID: ownerID}
 	}
 
 	// Overlay-mode sandboxes salvage as sparse overlays whose holes are

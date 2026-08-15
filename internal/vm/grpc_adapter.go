@@ -688,7 +688,7 @@ func (a *GRPCAdapter) ReviveVM(ctx context.Context, req *vmdpb.ReviveVMRequest) 
 			allowedDomains: req.GetAllowedDomains(),
 		}
 	}
-	inst, err := a.mgr.ReviveVM(ctx, req.GetVmId(), req.GetDiskPath(), req.GetBasePath(), req.GetStandaloneDisk(), req.GetAllowRecordless(), req.GetVcpu(), req.GetMemMib(), rules)
+	inst, err := a.mgr.ReviveVM(ctx, req.GetVmId(), req.GetDiskPath(), req.GetBasePath(), req.GetStandaloneDisk(), req.GetAllowRecordless(), req.GetTeamId(), req.GetOwnerId(), req.GetVcpu(), req.GetMemMib(), rules)
 	if err != nil {
 		return nil, err
 	}

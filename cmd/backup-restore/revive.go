@@ -101,8 +101,13 @@ func runRevive(args []string) int {
 			} else if tok == "recordless" {
 				// Operator attestation for sandboxes whose vmd record was
 				// deleted by a restart's stale cleanup; the RPC enforces
-				// the explicit shape and base this mode requires.
+				// the explicit shape, base, and ownership this mode
+				// requires.
 				req.AllowRecordless = true
+			} else if p, ok := strings.CutPrefix(tok, "team="); ok {
+				req.TeamId = p
+			} else if p, ok := strings.CutPrefix(tok, "owner="); ok {
+				req.OwnerId = p
 			} else if strings.Contains(tok, "=") {
 				// A misspelled policy token must not silently revive
 				// without the intended policy.

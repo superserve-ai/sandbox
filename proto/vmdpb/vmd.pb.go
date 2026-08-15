@@ -1239,8 +1239,13 @@ type ReviveVMRequest struct {
 	// default from. Ownership, preview policy, env, secrets, and egress
 	// all re-establish through the control plane before the row flips.
 	AllowRecordless bool `protobuf:"varint,12,opt,name=allow_recordless,json=allowRecordless,proto3" json:"allow_recordless,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Ownership for the synthesized record: required whenever
+	// allow_recordless is set (there is no other source), and threaded
+	// straight to data-plane usage attribution.
+	TeamId        string `protobuf:"bytes,13,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"`
+	OwnerId       string `protobuf:"bytes,14,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ReviveVMRequest) Reset() {
@@ -1355,6 +1360,20 @@ func (x *ReviveVMRequest) GetAllowRecordless() bool {
 		return x.AllowRecordless
 	}
 	return false
+}
+
+func (x *ReviveVMRequest) GetTeamId() string {
+	if x != nil {
+		return x.TeamId
+	}
+	return ""
+}
+
+func (x *ReviveVMRequest) GetOwnerId() string {
+	if x != nil {
+		return x.OwnerId
+	}
+	return ""
 }
 
 type ReviveVMResponse struct {
@@ -3812,7 +3831,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x11DestroyVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1d\n" +
 	"\n" +
-	"cleaned_up\x18\x02 \x01(\bR\tcleanedUp\"\xfb\x03\n" +
+	"cleaned_up\x18\x02 \x01(\bR\tcleanedUp\"\xaf\x04\n" +
 	"\x0fReviveVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1b\n" +
 	"\tdisk_path\x18\x02 \x01(\tR\bdiskPath\x12\x12\n" +
@@ -3827,7 +3846,9 @@ const file_proto_vmd_proto_rawDesc = "" +
 	" \x01(\tR\n" +
 	"secretsJwt\x12'\n" +
 	"\x0fstandalone_disk\x18\v \x01(\bR\x0estandaloneDisk\x12)\n" +
-	"\x10allow_recordless\x18\f \x01(\bR\x0fallowRecordless\x1a:\n" +
+	"\x10allow_recordless\x18\f \x01(\bR\x0fallowRecordless\x12\x17\n" +
+	"\ateam_id\x18\r \x01(\tR\x06teamId\x12\x19\n" +
+	"\bowner_id\x18\x0e \x01(\tR\aownerId\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"H\n" +
