@@ -187,12 +187,22 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// is exactly the wedge class the teardown exists to prevent.
 	// The preserve entry precedes the residue clear: the teardown's own
 	// record deletion is exactly the delete-then-rewrite gap that must
-	// not exist.
+	// not exist. Installed under the record-owner mutex with an epoch
+	// check: an external destroy clears the preserve at entry and holds
+	// this mutex to completion, so the entry can never be repopulated
+	// under a destroy still in flight, and one that completed since the
+	// record read is visible here and aborts the revival.
+	unlockInstall := m.lockRecordOwner(vmID)
+	if m.destroyEpoch(vmID) != epochAtRead {
+		unlockInstall()
+		return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while revival was preparing; the destroy is authoritative", vmID)
+	}
 	{
 		pending := *prevRec
 		pending.RevivalPending = true
 		m.preserveRecordOnDestroy.Store(vmID, pending)
 	}
+	unlockInstall()
 	defer m.preserveRecordOnDestroy.Delete(vmID)
 	if err := m.DestroyVM(context.WithValue(ctx, reviveTeardownCtxKey{}, true), vmID, true); err != nil {
 		return nil, fmt.Errorf("clear residue: %w", err)
@@ -217,15 +227,18 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// teardown-pending record for the forced retry.
 	teardownFailed := false
 	teardownSelf := func(c context.Context) {
-		selfDestroys++
 		// Detached from the RPC's deadline but bounded: a hung stop must
 		// not wedge the RPC and the per-VM lifecycle lock indefinitely.
 		dctx, cancel := context.WithTimeout(context.WithoutCancel(c), reviveTeardownBudget)
 		defer cancel()
 		dctx = context.WithValue(dctx, reviveTeardownCtxKey{}, true)
+		// The count mirrors the epoch: only successful destroys bump it,
+		// so only successful teardowns count as our own.
 		if derr := m.DestroyVM(dctx, vmID, true); derr != nil {
 			teardownFailed = true
 			m.log.Error().Err(derr).Str("vm_id", vmID).Msg("teardown after failed revival did not confirm; record left as-is")
+		} else {
+			selfDestroys++
 		}
 	}
 	defer func() {

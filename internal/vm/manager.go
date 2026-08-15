@@ -1077,7 +1077,7 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 // ---------------------------------------------------------------------------
 
 // DestroyVM terminates a VM and cleans up all its resources.
-func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error {
+func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) (err error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Bool("force", force).Msg("destroying VM")
 
@@ -1104,7 +1104,16 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	}
 	m.destroying.Store(vmID, struct{}{})
 	defer m.destroying.Delete(vmID)
-	defer m.bumpDestroyEpoch(vmID) // LIFO: bumps before the tombstone clears
+	// Only a SUCCESSFUL destroy advances the epoch (LIFO: before the
+	// tombstone clears): revival treats an epoch step as an
+	// authoritative deletion and force-deletes the anchor, but a failed
+	// destroy deliberately left residue and record for a forced retry,
+	// and counting it would destroy the only durable record.
+	defer func() {
+		if err == nil {
+			m.bumpDestroyEpoch(vmID)
+		}
+	}()
 
 	// A paused or post-restart VM may be absent from m.vms. Don't early-return on
 	// that: unit stop and rundir removal are derivable from vmID and must run, or
