@@ -130,3 +130,14 @@ variable "notification_channel_ids" {
   type        = list(string)
   default     = []
 }
+
+variable "active_sandbox_host" {
+  description = "Which sandbox host serves the cell: primary or standby."
+  type        = string
+  default     = "primary"
+
+  validation {
+    condition     = contains(["primary", "standby"], var.active_sandbox_host)
+    error_message = "active_sandbox_host must be primary or standby."
+  }
+}

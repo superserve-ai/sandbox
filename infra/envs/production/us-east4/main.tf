@@ -62,7 +62,23 @@ locals {
   # series like filesystem utilization carry the instance name while vmd's own
   # OTLP series carry this. One machine, two host_id values, depending on which
   # process emitted the metric.
-  metrics_host_id = "default"
+  metrics_host_id = var.active_sandbox_host == "standby" ? "use4-2" : "default"
+
+  # The control plane dials whichever host active_sandbox_host selects. The
+  # selected host must already be running and serving before it is applied —
+  # instance run state is operational, not Terraform-managed.
+  active_vmd_ip = var.active_sandbox_host == "standby" ? module.sandbox_host_b.internal_ip : module.sandbox_host.internal_ip
+
+  # The host currently serving vmd traffic, and so the host whose instance name
+  # tags its host-level (collector) metrics. Alert filters key on this so a
+  # standby promotion keeps them watching whichever host is actually emitting.
+  active_host_name = var.active_sandbox_host == "standby" ? module.sandbox_host_b.instance_name : module.sandbox_host.instance_name
+
+  # Exactly one host carries component=vmd, the label the shared deploy
+  # pipeline discovers; the other is parked under a cell-scoped label so
+  # rollouts skip it instead of failing against a host that is out of service.
+  primary_component = var.active_sandbox_host == "primary" ? "vmd" : "vmd-use4-standby"
+  standby_component = var.active_sandbox_host == "standby" ? "vmd" : "vmd-use4-standby"
 }
 
 module "network" {
@@ -184,7 +200,7 @@ module "api" {
     SECRETS_SIGNING_KEY_ID = "v1"
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "15"
-    VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
+    VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
 
     # Control-plane OTLP metrics export, mirroring the retired us-central1
@@ -192,7 +208,7 @@ module "api" {
     # and forwards to Google Managed Prometheus; the use4 network already admits
     # the Cloud Run sender range to the host on 4317/4318 (allow_otel_ingress).
     OTEL_ENVIRONMENT            = local.environment
-    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${module.sandbox_host.internal_ip}:4318"
+    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${local.active_vmd_ip}:4318"
     OTEL_EXPORT_INTERVAL        = "15s"
     OTEL_METRICS_ENABLED        = "true"
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
@@ -296,7 +312,7 @@ module "sandbox_host" {
   # flipping it to "ready" (to match the deployment-registry selector) is a
   # separate, intentional change, not part of this import PR.
   labels = merge(local.sandbox_host_labels, {
-    component                  = "vmd"
+    component                  = local.primary_component
     sandbox_role               = "vmd"
     sandbox_status             = "provisioning"
     "goog-ops-agent-policy"    = "v2-template-1-7-0"
@@ -342,6 +358,64 @@ module "sandbox_host" {
   }
 }
 
+# Cold standby for the cell, normally kept stopped. Promotion = start this
+# host, then set active_sandbox_host = "standby" and apply: the switch routes
+# the control plane here and moves the deploy-fleet label off the primary.
+# A DISTINCT identity (use4-2) from the primary's HOST_ID=default: while the
+# c4 primary still serves, two hosts under one identity would reconcile each
+# other's sandboxes. Paused-sandbox continuity at cutover is an operational
+# step (restore from GCS backup), not a Terraform concern.
+module "sandbox_host_b" {
+  source = "../../../modules/sandbox-host"
+
+  project_id    = local.project_id
+  environment   = local.environment
+  region        = local.region
+  zone          = local.zone
+  instance_name = "superserve-vmd-${local.resource_suffix}-2"
+  # Explicit, NOT var.machine_type (c4): this standby is the z3 replacement
+  # for the maintenance-prone c4 primary.
+  machine_type = "z3-highmem-192-highlssd-metal"
+  subnet       = module.network.subnetwork_self_link
+  internal_ip  = "10.2.0.3"
+  tags         = ["vmd-use4"]
+
+  labels = merge(local.sandbox_host_labels, {
+    component                  = local.standby_component
+    sandbox_role               = "vmd"
+    sandbox_status             = "provisioning"
+    "goog-ops-agent-policy"    = "v2-template-1-7-0"
+    "vanta-contains-user-data" = "true"
+    "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
+  })
+
+  service_account_email = data.google_service_account.api_runner.email
+
+  # 22.04 to match the primary and this cell's snapshot lineage (existing
+  # paused sandboxes and us-central1-seeded snapshots are 22.04-taken); a
+  # host-OS mismatch has been observed to break snapshot restore.
+  boot_disk_image = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
+
+  # Metal machine types reject the API-default pd-standard boot disk.
+  boot_disk_type = var.boot_disk_type
+
+  can_ip_forward      = false
+  on_host_maintenance = "TERMINATE"
+
+  reservation_name = var.reservation_name
+
+  metadata = {
+    enable-osconfig = "TRUE"
+    enable-oslogin  = "TRUE"
+    startup-script = templatefile("${path.module}/../../../../deploy/unbound/unbound-bootstrap.sh.tftpl", {
+      guest_cidr         = "10.11.0.0/16"
+      local_dns_port     = "19053"
+      dot_hostname       = "j0mqwd9sm7.cloudflare-gateway.com"
+      dot_upstream_addrs = ["162.159.36.5", "162.159.46.5"]
+    })
+  }
+}
+
 module "observability" {
   source = "../../../modules/observability"
 
@@ -354,6 +428,12 @@ module "observability" {
       instance_name = module.sandbox_host.instance_name
       instance_id   = module.sandbox_host.instance_id
     }
+    # Inert while the standby is stopped (no data, no fire).
+    sandbox_host_b = {
+      display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / CPU saturation"
+      instance_name = module.sandbox_host_b.instance_name
+      instance_id   = module.sandbox_host_b.instance_id
+    }
   }
   # Backup pipeline alerts scoped to this cell's host via the host_id
   # metric label (vmd's HOST_ID — see metrics_host_id, which is not the
@@ -363,7 +443,7 @@ module "observability" {
   # times/hour under the capped backoff), not on pause volume.
   backup_alerts = {
     host_id        = local.metrics_host_id
-    display_prefix = "Backup / ${module.sandbox_host.instance_name}"
+    display_prefix = "Backup / ${local.active_host_name}"
   }
   # Launch-path health for the same host: the pruned launcher mount namespace
   # being unavailable (VM starts fall back to walking the full host mount
@@ -379,20 +459,27 @@ module "observability" {
   # doing its job" — move them together with the ceiling or not at all.
   launch_path_alerts = {
     host_id        = local.metrics_host_id
-    display_prefix = "Launch path / ${module.sandbox_host.instance_name}"
+    display_prefix = "Launch path / ${local.active_host_name}"
   }
   # Root-filesystem (OS disk) utilization for the same host, scoped through
   # the same host_id label the backup metrics use. Module defaults: warn at
   # 85% sustained 30 minutes, page at 95%.
   host_disk_alerts = {
-    host_id        = module.sandbox_host.instance_name
-    display_prefix = "Infrastructure / ${module.sandbox_host.instance_name}"
+    host_id        = local.active_host_name
+    display_prefix = "Infrastructure / ${local.active_host_name}"
   }
   host_maintenance_event_alerts = {
     sandbox_host = {
       display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / host maintenance event"
       instance_name = module.sandbox_host.instance_name
       instance_id   = module.sandbox_host.instance_id
+    }
+    # Inert while stopped; fires once the standby is running and a window is
+    # scheduled on it — the exact signal that motivated this replacement.
+    sandbox_host_b = {
+      display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / host maintenance event"
+      instance_name = module.sandbox_host_b.instance_name
+      instance_id   = module.sandbox_host_b.instance_id
     }
   }
   labels = local.common_labels
