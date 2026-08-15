@@ -78,15 +78,18 @@ remove the cache directory after the exercise.
 ## 4. Validate a sample
 
 Cold-boot a handful of restored sandboxes before the remap. The
-executable path is the revive subcommand (ships with the revival PR;
-until it merges, this step is a manual overlay mount): on the
-replacement host, next to its vmd, write a manifest with one line per
-sandbox and run it.
+executable path is the revive subcommand from the companion revival
+PR: it is a hard prerequisite of this runbook, so treat the pair as
+one deliverable and do NOT proceed to remap on a host without it. On
+the replacement host, next to its vmd, write a manifest with one line
+per sandbox and run it.
 
 ```
-# manifest line shape; base= comes from the restored .base-cache when
-# the sandbox's ledger entry names an overlay artifact:
-#   <sandbox-id> <dest-root>/<id>/overlay.ext4 base=<dest-root>/.base-cache/<base-object>
+# manifest line shape. base= is the sandbox's RECONSTRUCTED base,
+# which restore materializes inside the sandbox's own destination as
+# base-<sha256>.ext4 (the .base-cache directory holds packed network
+# blobs, NOT mountable images; never point base= at it):
+#   <sandbox-id> <dest-root>/<id>/overlay.ext4 base=<dest-root>/<id>/base-<sha256>.ext4
 #   <sandbox-id> <dest-root>/<id>/rootfs.ext4          # full-image sandboxes
 backup-restore revive -manifest revive.txt -vmd 127.0.0.1:50051
 ```

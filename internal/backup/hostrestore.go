@@ -261,13 +261,14 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 	res.Generation = gens[0].Generation
 	// Prefer the generation whose vmstate digest matches the control
 	// plane's latest pause: completion order is not capture order. The
-	// scan is complete, not truncated: any bound invites a silent
-	// rollback the moment enough retry-delayed older uploads complete
-	// after the latest pause's (correctness outranks DR speed here).
-	// Cost stays bounded in practice: manifests are kilobytes, the walk
-	// is newest-first with early exit so the common case pays one fetch,
-	// candidates probe in small parallel batches, and history depth is
-	// capped by retention once GC lands.
+	// scan fetches EVERY completed generation's manifest by design, not
+	// as an oversight: acceptance requires proving no unreadable
+	// candidate hides a newer-anchor match, and ambiguity detection
+	// requires seeing every generation the winning anchor matches, so
+	// both guarantees are load-bearing on completeness. Cost stays
+	// bounded in practice: manifests are kilobytes, candidates probe in
+	// small parallel batches, and history depth is capped by retention
+	// once GC lands.
 	var selManifest *GenerationManifest
 	if len(item.Anchors) > 0 {
 		var manifestByGen sync.Map
