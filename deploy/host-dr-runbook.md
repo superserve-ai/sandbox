@@ -84,6 +84,13 @@ filesystem is the customer's last pause. This is the step that turns
 
 ## 5. Remap and reopen
 
+- Set the host row to `draining` FIRST, before the replacement vmd
+  starts heartbeating. The heartbeat auto-recovers `unhealthy` rows to
+  `active` (the transient-outage path), and an active host is
+  immediately placement-eligible; without the draining flip the remap
+  silently reopens the host to new sandboxes before a single restore
+  is validated. `draining` survives heartbeats, so it holds while the
+  replacement reports in.
 - Point the DB at the replacement: update the `host` row (or its
   `vmd_addr`) and set the replacement's `HOST_ID` to the dead host's row
   id. Host identity must match the row id exactly; a mismatch silently
@@ -99,6 +106,8 @@ filesystem is the customer's last pause. This is the step that turns
 - Sandboxes that were RUNNING at host death come back with their last
   generation's files; their timeline should show the recovery honestly
   rather than pretending continuity.
+- Flip the row to `active` only at the very end, after the manual
+  cold-boot validation has run: that flip is what reopens placement.
 
 ## 6. Partial-failure playbook
 
