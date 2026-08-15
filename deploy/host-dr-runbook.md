@@ -69,11 +69,11 @@ be consumed. Re-running is idempotent: destinations whose completion
 marker already records the target generation are reported restored and
 skipped. The JSON ledger lands in the dest root.
 
-Restore is bandwidth-bound; at measured fleet sizes (tens of MB packed
-per sandbox) a full cell restores in well under an hour. Shared template
-bases spool once into `<dest-root>/.base-cache` and serve every
-dependent sandbox from disk; remove the cache directory after the
-exercise.
+Restore is bandwidth-bound: estimate the window from your own
+inventory (the dry-run ledger totals the bytes to move) against the
+replacement's ingress bandwidth. Shared template bases spool once into
+`<dest-root>/.base-cache` and serve every dependent sandbox from disk;
+remove the cache directory after the exercise.
 
 ## 4. Validate a sample
 
@@ -101,8 +101,13 @@ filesystem is the customer's last pause. This is the step that turns
   wired into vmd (tracked as the restore tooling's remaining
   acceptance), recovered sandboxes must be brought back through the
   validated manual cold-boot procedure from step 4, not by letting
-  clients resume them; keep scheduling frozen for recovered sandboxes
-  until that wiring exists or the manual boot has run.
+  clients resume them. The enforceable gate is the sandbox row status:
+  `BeginResume` only claims rows in `paused`, so leave recovered rows
+  in the failed state the reconciler put them in at host death, and
+  flip a row to `paused` only after its manual cold-boot validation.
+  The host row's `draining` state does not gate resumes (host status
+  is not consulted on the resume path), so the row status is the only
+  real lock.
 - Sandboxes that were RUNNING at host death come back with their last
   generation's files; their timeline should show the recovery honestly
   rather than pretending continuity.
