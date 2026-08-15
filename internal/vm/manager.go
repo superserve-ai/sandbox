@@ -3100,9 +3100,18 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			log.Warn().Msg("reattach stop budget exhausted; parking without residue stop")
 		}
 		rec.Status = StatusError
-		if err := m.state.Put(rec); err != nil {
+		// Park under the record-owner mutex with a presence-conditional
+		// write: a destroy completing during the residue stop owns the
+		// record's absence, and an unconditional Put would resurrect a
+		// record both reapers now deliberately exempt, undoing the
+		// destroy indefinitely.
+		unlockOwner := m.lockRecordOwner(rec.ID)
+		if wrote, err := m.state.PutIfPresent(rec); err != nil {
 			log.Error().Err(err).Msg("park interrupted-revival record")
+		} else if !wrote {
+			log.Info().Msg("interrupted-revival record deleted by a destroy; leaving it deleted")
 		}
+		unlockOwner()
 		return nil, false
 	}
 
