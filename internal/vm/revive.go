@@ -194,7 +194,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		m.preserveRecordOnDestroy.Store(vmID, pending)
 	}
 	defer m.preserveRecordOnDestroy.Delete(vmID)
-	if err := m.DestroyVM(ctx, vmID, true); err != nil {
+	if err := m.DestroyVM(context.WithValue(ctx, reviveTeardownCtxKey{}, true), vmID, true); err != nil {
 		return nil, fmt.Errorf("clear residue: %w", err)
 	}
 	// The teardown above deleted the zombie's durable record, and a
@@ -222,6 +222,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		// not wedge the RPC and the per-VM lifecycle lock indefinitely.
 		dctx, cancel := context.WithTimeout(context.WithoutCancel(c), reviveTeardownBudget)
 		defer cancel()
+		dctx = context.WithValue(dctx, reviveTeardownCtxKey{}, true)
 		if derr := m.DestroyVM(dctx, vmID, true); derr != nil {
 			teardownFailed = true
 			m.log.Error().Err(derr).Str("vm_id", vmID).Msg("teardown after failed revival did not confirm; record left as-is")

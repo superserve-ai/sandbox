@@ -1094,6 +1094,14 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	// teardown needs.
 	unlockOwner := m.lockRecordOwner(vmID)
 	defer unlockOwner() // registered first: releases after the epoch bump and tombstone clear
+	// An external destroy retires any revival anchor: its success must
+	// mean the record is durably gone, not preserved until an in-flight
+	// revival's cleanup happens to run. Revival's own teardowns mark
+	// their context and keep the preserve (their record deletion is the
+	// crash gap the preserve exists to close).
+	if v := ctx.Value(reviveTeardownCtxKey{}); v == nil {
+		m.preserveRecordOnDestroy.Delete(vmID)
+	}
 	m.destroying.Store(vmID, struct{}{})
 	defer m.destroying.Delete(vmID)
 	defer m.bumpDestroyEpoch(vmID) // LIFO: bumps before the tombstone clears
@@ -3079,18 +3087,19 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			log.Warn().Msg("reattach stop budget exhausted; parking without residue stop")
 		}
 		rec.Status = StatusError
-		// Park under the record-owner mutex with a presence-conditional
-		// write: a destroy completing during the residue stop owns the
-		// record's absence, and an unconditional Put would resurrect a
-		// record both reapers now deliberately exempt, undoing the
-		// destroy indefinitely.
-		unlockOwner := m.lockRecordOwner(rec.ID)
+		// Presence-conditional parking, deliberately WITHOUT the
+		// record-owner mutex: a concurrent DestroyVM holds that mutex
+		// while joining this very reattach flight through getInstance,
+		// so taking it here would deadlock both. PutIfPresent is a
+		// single Bolt transaction, which is discrimination enough: a
+		// destroy's delete landing first makes this a no-op, and one
+		// landing after deletes the parked record. The destroy wins
+		// both orderings.
 		if wrote, err := m.state.PutIfPresent(rec); err != nil {
 			log.Error().Err(err).Msg("park interrupted-revival record")
 		} else if !wrote {
 			log.Info().Msg("interrupted-revival record deleted by a destroy; leaving it deleted")
 		}
-		unlockOwner()
 		return nil, false
 	}
 
@@ -4434,6 +4443,11 @@ func (m *Manager) deleteState(vmID string) {
 		m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to delete VM state from BoltDB")
 	}
 }
+
+// reviveTeardownCtxKey marks a context as belonging to revival's own
+// teardown calls: DestroyVM preserves the revival anchor for those and
+// retires it for every other caller.
+type reviveTeardownCtxKey struct{}
 
 // deleteStateForce removes the durable record even while a revival's
 // preserve entry is active: revival's own destroy-wins paths call it
