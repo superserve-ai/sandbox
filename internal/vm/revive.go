@@ -168,6 +168,17 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	// forced teardown below removes that directory, and a salvage
 	// inside it would be deleted before the boot could copy it.
 	// Symlinks resolve first so a link cannot smuggle the source in.
+	// Absolute paths only: EvalSymlinks keeps relative inputs relative,
+	// which defeats the prefix comparison against the absolute run
+	// directory (a salvage inside it would slip past and be deleted by
+	// the teardown), and a relative base breaks inside Firecracker's
+	// mount namespace.
+	if !filepath.IsAbs(diskPath) {
+		return nil, status.Errorf(codes.InvalidArgument, "disk_path %q must be absolute", diskPath)
+	}
+	if basePath != "" && !filepath.IsAbs(basePath) {
+		return nil, status.Errorf(codes.InvalidArgument, "base_path %q must be absolute", basePath)
+	}
 	resolved, err := filepath.EvalSymlinks(diskPath)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "disk_path: %v", err)
