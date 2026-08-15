@@ -21,6 +21,11 @@ boot_disk_type        = "hyperdisk-balanced"
 # default affinity, which auto-consumes that matching reservation in the zone.
 reservation_name = null
 
+# Which host serves the cell. "standby" points the control-plane dial
+# (VMD_GRPC_ADDRESS + DEFAULT_HOST_ID), the deploy-fleet component label, and
+# the alert identity at the standby host module.
+active_sandbox_host = "standby"
+
 # A5 control plane — same "use" cell as us-central1. Point every runtime secret
 # at the shared, suffix-less use-cell secrets (not per-region "-use4" names) so
 # this service reads the same DB, seeds, and signing keys as us-central1 during
