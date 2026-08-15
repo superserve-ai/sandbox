@@ -246,7 +246,11 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 			// path requires it. Both supervisors, since the failed
 			// attempt's mode may not be what the record says.
 			selfDestroys++
-			if !(vmUnitFullyDown(vmID) && m.cgroupDefinitelyDead(vmID)) {
+			// cgroupStillLive is the mode-agnostic gate (DestroyVM's own):
+			// a nil cgroup subtree (unit-only hosts, the default config)
+			// reads as no cgroup residue, where the definitely-dead probe
+			// would read it as never-dead and mark every teardown failed.
+			if !vmUnitFullyDown(vmID) || m.cgroupStillLive(vmID) {
 				teardownFailed = true
 				m.log.Error().Str("vm_id", vmID).Msg("replacement not terminally down after teardown; rollback suppressed, residue left for forced destroy")
 			}
