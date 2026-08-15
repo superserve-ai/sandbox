@@ -97,8 +97,9 @@ type VMInstance struct {
 	TAPDevice      string
 	MACAddress     string
 	Status         VMStatus
-	Unverified     bool // Running persisted before boxd readiness (see VMRecord)
-	RevivalPending bool // revival attempt in flight (see VMRecord)
+	Unverified     bool   // Running persisted before boxd readiness (see VMRecord)
+	RevivalPending bool   // revival attempt in flight (see VMRecord)
+	RevivedDisk    string // resolved salvage path of a completed revival (see VMRecord)
 	Config         VMConfig
 	RunDirID       string // Directory name under RunDir for this VM's files.
 	Namespace      string // Network namespace name.

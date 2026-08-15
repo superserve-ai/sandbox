@@ -69,6 +69,20 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		}
 		pausedBase := inst.Config.BasePath
 		inst.mu.RUnlock()
+		// Idempotency: a live, verified VM whose recorded salvage path
+		// matches this request is this request's own completed work (a
+		// lost RPC response, or a retry after a failed post-commit
+		// injection). Returning it lets the caller resume the documented
+		// post-steps instead of stranding a successful revival behind
+		// the liveness guard. Any other live VM still refuses below.
+		inst.mu.RLock()
+		liveStatus, liveUnverified, revivedDisk := inst.Status, inst.Unverified, inst.RevivedDisk
+		inst.mu.RUnlock()
+		if liveStatus == StatusRunning && !liveUnverified && revivedDisk != "" {
+			if rd, rerr := filepath.EvalSymlinks(diskPath); rerr == nil && rd == revivedDisk {
+				return inst, nil
+			}
+		}
 		if st == StatusPaused && snap != "" {
 			// The refusal delegates to resume, so it only holds when
 			// resume is actually possible: every recorded pause artifact
@@ -370,6 +384,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	seed := func(inst *VMInstance) {
 		inst.Unverified = true
 		inst.RevivalPending = true
+		inst.RevivedDisk = diskPath
 		inst.TeamID = prevRec.TeamID
 		inst.OwnerID = prevRec.OwnerID
 		inst.PreviewAccess = prevRec.PreviewAccess

@@ -158,6 +158,11 @@ type VMRecord struct {
 	// it is the retry's anchor (revive refuses unknown sandboxes), so
 	// startup stale cleanup must park it instead of deleting it.
 	RevivalPending bool `json:"revival_pending,omitempty"`
+	// RevivedDisk records the resolved salvage path a completed revival
+	// booted from: the idempotency witness that lets a retry of the same
+	// request (a lost RPC response, a failed post-commit injection)
+	// recognize the live VM as its own completed work.
+	RevivedDisk string `json:"revived_disk,omitempty"`
 	// TeardownPending mirrors VMInstance.TeardownPending: a non-empty value
 	// is an explicit, durable claim that this record's resources were
 	// deliberately retained after a failed op and the reconciler owns the
@@ -624,6 +629,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		Status:                     inst.Status,
 		Unverified:                 inst.Unverified,
 		RevivalPending:             inst.RevivalPending,
+		RevivedDisk:                inst.RevivedDisk,
 		TeardownPending:            inst.TeardownPending,
 		RunDirID:                   inst.RunDirID,
 		Namespace:                  inst.Namespace,
@@ -714,6 +720,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		Status:                     rec.Status,
 		Unverified:                 rec.Unverified,
 		RevivalPending:             rec.RevivalPending,
+		RevivedDisk:                rec.RevivedDisk,
 		TeardownPending:            rec.TeardownPending,
 		RunDirID:                   rec.RunDirID,
 		Namespace:                  rec.Namespace,
