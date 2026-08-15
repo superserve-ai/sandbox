@@ -995,6 +995,21 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 			if serr := m.stopVM(sctx, vmID, actual); serr != nil {
 				stopFailed = true
 				log.Error().Err(serr).Msg("stop spawned VM after failed cold boot; residue left for forced teardown")
+				return
+			}
+			// A nil stop can still mean a deactivating unit (the expired
+			// stop wait settles those as complete while the process may
+			// hold its socket): release requires the terminal claim,
+			// exactly as every stale-cleanup path holds it.
+			var down bool
+			if cgroupSupervised(actual) {
+				down = m.cgroupDefinitelyDead(vmID) && vmUnitFullyDown(vmID)
+			} else {
+				down = vmUnitFullyDown(vmID)
+			}
+			if !down {
+				stopFailed = true
+				log.Error().Msg("spawned VM not terminally down after stop; residue left for forced teardown")
 			}
 		}
 		if lerr != nil {
