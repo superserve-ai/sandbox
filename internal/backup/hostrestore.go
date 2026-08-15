@@ -302,12 +302,14 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 		// first anchor with a matching manifest is the newest captured
 		// pause that survived.
 		match := ""
+		matchAnchor := -1
 		var matchedGens []string
-		for _, anchor := range item.Anchors {
+		for ai, anchor := range item.Anchors {
 			for _, g := range gens {
 				if v, ok := manifestByGen.Load(g.Generation); ok && anchor.matches(v.(*GenerationManifest)) {
 					if match == "" {
 						match = g.Generation
+						matchAnchor = ai
 					}
 					matchedGens = append(matchedGens, g.Generation)
 				}
@@ -340,6 +342,14 @@ func (h *HostRestorer) restoreOne(ctx context.Context, item HostRestoreItem) Hos
 		case match != "" && unreadable == 0:
 			if v, ok := manifestByGen.Load(match); ok {
 				selManifest = v.(*GenerationManifest)
+			}
+			// An older capture winning is a fallback exactly like the
+			// no-anchor case: the newest pause's upload never completed.
+			// The ledger must say so, or the runbook's rollback grep
+			// misses every sandbox that silently came back on an older
+			// pause.
+			if matchAnchor > 0 {
+				res.Reason = fmt.Sprintf("latest pause not in bucket; restored an older captured pause (capture %d of the recorded history)", matchAnchor+1)
 			}
 			// Acceptance requires the scan to be complete: an unreadable
 			// manifest could match a newer anchor than the one found, or

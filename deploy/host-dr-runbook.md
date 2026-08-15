@@ -158,8 +158,9 @@ From the ledger:
   -sandbox <id>` lists every restorable generation, newest first.
 - Fallback restores are NOT uncovered: a sandbox whose newest pause
   never completed but which restored an older generation reports
-  restored/coverable with reason `latest pause not in bucket; using
-  newest completed generation`. Grep the ledger for that reason to
+  restored/coverable with a reason beginning `latest pause not in
+  bucket` (older-capture anchor matches and completion-order fallbacks
+  both carry it). Grep the ledger for that prefix to
   find every sandbox that came back on an older capture, and fold
   those teams into the same notification as the uncovered ones, with
   the restored generation's timestamp as the last-known-good.
