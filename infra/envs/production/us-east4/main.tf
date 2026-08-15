@@ -416,7 +416,9 @@ module "sandbox_host_b" {
   can_ip_forward      = false
   on_host_maintenance = "TERMINATE"
 
-  reservation_name = var.reservation_name
+  # Distinct from the primary's reservation_name: that names a c4-metal
+  # reservation a z3 cannot consume (see standby_reservation_name).
+  reservation_name = var.standby_reservation_name
 
   metadata = {
     enable-osconfig = "TRUE"
