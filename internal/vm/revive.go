@@ -109,12 +109,23 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 					// success. lockVMOp is held for the whole RPC but
 					// DestroyVM deliberately bypasses it, so this is the
 					// same destroy-wins recheck the fresh-boot commit path
-					// uses, applied to the idempotent shortcut.
+					// uses, applied to the idempotent shortcut. The two
+					// observations must be atomic with DestroyVM's own
+					// run, not just with each other: DestroyVM holds the
+					// record-owner mutex for its whole run (tombstone
+					// through epoch bump and tombstone clear), so taking
+					// it here means either DestroyVM hasn't started (we
+					// see live), is mid-flight (we block until it
+					// finishes, then see gone), or has fully finished (we
+					// already see gone, since removeVM runs before the
+					// mutex releases) — never the torn read a separate
+					// tracked-then-destroying check could observe.
+					unlockOwner := m.lockRecordOwner(vmID)
 					m.mu.RLock()
 					_, stillTracked := m.vms[vmID]
 					m.mu.RUnlock()
-					_, beingDestroyed := m.destroying.Load(vmID)
-					if !stillTracked || beingDestroyed {
+					unlockOwner()
+					if !stillTracked {
 						return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while revival's idempotent retry was completing", vmID)
 					}
 					return inst, nil
