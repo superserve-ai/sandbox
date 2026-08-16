@@ -465,8 +465,9 @@ func buildAuditSink(ctx context.Context, cfg *config) (secretsproxy.AuditSink, f
 	// The pgxpool default is max(4, NumCPU), which scales with host cores and
 	// silently consumes the cell pooler's client-connection budget on large
 	// hosts. This pool only serves batched audit flushes (low concurrency by
-	// construction), so a small fixed cap is enough.
-	poolCfg.MaxConns = 8
+	// construction), so a small cap is enough. A ceiling, not a floor: an
+	// explicitly lower pool_max_conns in the URL stays in effect.
+	poolCfg.MaxConns = min(poolCfg.MaxConns, 8)
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to audit DB: %w", err)

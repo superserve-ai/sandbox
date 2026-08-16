@@ -1163,8 +1163,9 @@ func main() {
 		// and silently consumes the cell pooler's client-connection budget on
 		// large hosts. This pool serves serial reconciler passes and the
 		// batched flow sink (low concurrency by construction), so a small
-		// fixed cap is enough.
-		dbCfg.MaxConns = 8
+		// cap is enough. A ceiling, not a floor: an explicitly lower
+		// pool_max_conns in the URL stays in effect.
+		dbCfg.MaxConns = min(dbCfg.MaxConns, 8)
 		dbPool, dbErr := pgxpool.NewWithConfig(ctx, dbCfg)
 		if dbErr != nil {
 			log.Fatal().Err(dbErr).Msg("failed to connect to database for reconciler")
