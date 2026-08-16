@@ -1777,6 +1777,166 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 	return items, nil
 }
 
+const listSandboxesByTeamCreatedAsc = `-- name: ListSandboxesByTeamCreatedAsc :many
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at FROM sandbox
+WHERE team_id = $1
+  AND destroyed_at IS NULL
+  AND metadata @> $2
+  AND ($3::text IS NULL OR status::text = $3::text)
+  AND ($4::text IS NULL
+       OR name ILIKE '%' || $4::text || '%')
+ORDER BY created_at ASC
+LIMIT $6::bigint
+OFFSET COALESCE($5::bigint, 0)
+`
+
+type ListSandboxesByTeamCreatedAscParams struct {
+	TeamID     uuid.UUID `json:"team_id"`
+	Metadata   []byte    `json:"metadata"`
+	Status     *string   `json:"status"`
+	NameSearch *string   `json:"name_search"`
+	RowOffset  *int64    `json:"row_offset"`
+	RowLimit   *int64    `json:"row_limit"`
+}
+
+func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSandboxesByTeamCreatedAscParams) ([]Sandbox, error) {
+	rows, err := q.db.Query(ctx, listSandboxesByTeamCreatedAsc,
+		arg.TeamID,
+		arg.Metadata,
+		arg.Status,
+		arg.NameSearch,
+		arg.RowOffset,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Sandbox{}
+	for rows.Next() {
+		var i Sandbox
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.Status,
+			&i.VcpuCount,
+			&i.MemoryMib,
+			&i.HostID,
+			&i.IpAddress,
+			&i.Pid,
+			&i.SnapshotID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DestroyedAt,
+			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.Metadata,
+			&i.TemplateID,
+			&i.SnapshotPath,
+			&i.MemPath,
+			&i.BasePath,
+			&i.DeltaPath,
+			&i.DiskMib,
+			&i.AutoDeleteSeconds,
+			&i.AutoDeleteAt,
+			&i.FailedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSandboxesByTeamCreatedDesc = `-- name: ListSandboxesByTeamCreatedDesc :many
+
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at FROM sandbox
+WHERE team_id = $1
+  AND destroyed_at IS NULL
+  AND metadata @> $2
+  AND ($3::text IS NULL OR status::text = $3::text)
+  AND ($4::text IS NULL
+       OR name ILIKE '%' || $4::text || '%')
+ORDER BY created_at DESC
+LIMIT $6::bigint
+OFFSET COALESCE($5::bigint, 0)
+`
+
+type ListSandboxesByTeamCreatedDescParams struct {
+	TeamID     uuid.UUID `json:"team_id"`
+	Metadata   []byte    `json:"metadata"`
+	Status     *string   `json:"status"`
+	NameSearch *string   `json:"name_search"`
+	RowOffset  *int64    `json:"row_offset"`
+	RowLimit   *int64    `json:"row_limit"`
+}
+
+// Static created_at variants of ListSandboxesByTeamPaged. The plain ORDER BY
+// lets the planner walk idx_sandbox_team_created_active (forward for DESC,
+// backward for ASC) and stop at LIMIT, where the guarded-CASE ORDER BY in
+// ListSandboxesByTeamPaged is opaque to it and forces a sort of the entire
+// filtered set on every call. created_at is the default sort and the only one
+// unpaginated SDK/MCP callers ever use, so these two cover the hot path;
+// name/status sorts stay on the flexible query below. Filters and pagination
+// are identical to the flexible query, including the NULL @row_limit "return
+// everything" contract.
+func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSandboxesByTeamCreatedDescParams) ([]Sandbox, error) {
+	rows, err := q.db.Query(ctx, listSandboxesByTeamCreatedDesc,
+		arg.TeamID,
+		arg.Metadata,
+		arg.Status,
+		arg.NameSearch,
+		arg.RowOffset,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Sandbox{}
+	for rows.Next() {
+		var i Sandbox
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.Status,
+			&i.VcpuCount,
+			&i.MemoryMib,
+			&i.HostID,
+			&i.IpAddress,
+			&i.Pid,
+			&i.SnapshotID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DestroyedAt,
+			&i.NetworkConfig,
+			&i.TimeoutSeconds,
+			&i.Metadata,
+			&i.TemplateID,
+			&i.SnapshotPath,
+			&i.MemPath,
+			&i.BasePath,
+			&i.DeltaPath,
+			&i.DiskMib,
+			&i.AutoDeleteSeconds,
+			&i.AutoDeleteAt,
+			&i.FailedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSandboxesByTeamPaged = `-- name: ListSandboxesByTeamPaged :many
 SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at FROM sandbox
 WHERE team_id = $1
@@ -1807,7 +1967,10 @@ type ListSandboxesByTeamPagedParams struct {
 	RowLimit   *int64    `json:"row_limit"`
 }
 
-// Paginated, sortable, filterable team sandbox list backing the console.
+// Paginated, sortable, filterable team sandbox list backing the console. Only
+// serves the non-default sorts (name/status); the default created_at sort is
+// handled by the static ListSandboxesByTeamCreated{Desc,Asc} queries above,
+// which the planner can satisfy from an index.
 //
 // Filters (all optional, AND'd): metadata containment (@> — pass '{}'::jsonb
 // to match everything), status equality, and a case-insensitive name

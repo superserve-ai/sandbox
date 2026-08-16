@@ -110,8 +110,45 @@ WHERE base_path = $1 AND destroyed_at IS NULL;
 SELECT DISTINCT base_path FROM sandbox
 WHERE base_path IS NOT NULL AND destroyed_at IS NULL;
 
+-- Static created_at variants of ListSandboxesByTeamPaged. The plain ORDER BY
+-- lets the planner walk idx_sandbox_team_created_active (forward for DESC,
+-- backward for ASC) and stop at LIMIT, where the guarded-CASE ORDER BY in
+-- ListSandboxesByTeamPaged is opaque to it and forces a sort of the entire
+-- filtered set on every call. created_at is the default sort and the only one
+-- unpaginated SDK/MCP callers ever use, so these two cover the hot path;
+-- name/status sorts stay on the flexible query below. Filters and pagination
+-- are identical to the flexible query, including the NULL @row_limit "return
+-- everything" contract.
+
+-- name: ListSandboxesByTeamCreatedDesc :many
+SELECT * FROM sandbox
+WHERE team_id = @team_id
+  AND destroyed_at IS NULL
+  AND metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('name_search')::text IS NULL
+       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+ORDER BY created_at DESC
+LIMIT sqlc.narg('row_limit')::bigint
+OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
+
+-- name: ListSandboxesByTeamCreatedAsc :many
+SELECT * FROM sandbox
+WHERE team_id = @team_id
+  AND destroyed_at IS NULL
+  AND metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('name_search')::text IS NULL
+       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+ORDER BY created_at ASC
+LIMIT sqlc.narg('row_limit')::bigint
+OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
+
 -- name: ListSandboxesByTeamPaged :many
--- Paginated, sortable, filterable team sandbox list backing the console.
+-- Paginated, sortable, filterable team sandbox list backing the console. Only
+-- serves the non-default sorts (name/status); the default created_at sort is
+-- handled by the static ListSandboxesByTeamCreated{Desc,Asc} queries above,
+-- which the planner can satisfy from an index.
 --
 -- Filters (all optional, AND'd): metadata containment (@> — pass '{}'::jsonb
 -- to match everything), status equality, and a case-insensitive name
