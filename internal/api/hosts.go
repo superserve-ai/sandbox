@@ -1,10 +1,13 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -17,6 +20,12 @@ const (
 
 type hostHeartbeatRequest struct {
 	Capabilities []string `json:"capabilities"`
+	// MaintenanceWindowStart: RFC3339 start of the machine's next announced
+	// maintenance window; empty string means an authoritative "nothing
+	// announced"; absent means the host couldn't tell this beat (keep the
+	// last known answer — a flaky metadata read must never un-record a
+	// window).
+	MaintenanceWindowStart *string `json:"maintenance_window_start,omitempty"`
 }
 
 // HostHeartbeat handles POST /internal/hosts/:host_id/heartbeat.
@@ -104,5 +113,86 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		}
 	}
 
+	if req.MaintenanceWindowStart != nil {
+		h.recordMaintenanceWindow(ctx, hostID, *req.MaintenanceWindowStart)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"status": host.Status})
+}
+
+// recordMaintenanceWindow persists the heartbeat's announced-maintenance
+// answer — recording ONLY. The drain decision deliberately does not live
+// here: it is driven from the persisted deadline by the reaper's drain loop
+// (see drainDueHosts), so a window recorded hours ago still drains on time
+// even if every later metadata probe fails or the reporting host rolls back
+// to a version that stops sending the field.
+func (h *Handlers) recordMaintenanceWindow(ctx context.Context, hostID, raw string) {
+	var ts pgtype.Timestamptz
+	if raw != "" {
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			log.Warn().Str("host_id", hostID).Str("value", raw).Msg("heartbeat carried unparseable maintenance window; ignoring")
+			return
+		}
+		ts = pgtype.Timestamptz{Time: t, Valid: true}
+	}
+	if err := h.DB.UpdateHostMaintenanceWindow(ctx, db.UpdateHostMaintenanceWindowParams{
+		ID: hostID, MaintenanceWindowStart: ts,
+	}); err != nil {
+		log.Error().Err(err).Str("host_id", hostID).Msg("failed to record maintenance window")
+	}
+}
+
+// DrainHost handles POST /internal/hosts/:host_id/drain — the operator
+// entry point for planned host work (reboots, kernel updates): drain, wait
+// for the drain-complete log/zero actives, then restart the host; paused
+// sandboxes survive where active ones would not.
+func (h *Handlers) DrainHost(c *gin.Context) {
+	hostID := c.Param("host_id")
+	if hostID == "" {
+		respondErrorMsg(c, "bad_request", "host_id is required", http.StatusBadRequest)
+		return
+	}
+	n, err := h.DB.DrainHost(c.Request.Context(), hostID)
+	if err != nil {
+		log.Error().Err(err).Str("host_id", hostID).Msg("DrainHost failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if n == 0 {
+		respondErrorMsg(c, "conflict", "host is not active (already draining, or unhealthy)", http.StatusConflict)
+		return
+	}
+	log.Warn().Str("host_id", hostID).Msg("host draining via operator request")
+	if h.Scheduler != nil {
+		h.Scheduler.Invalidate()
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "draining"})
+}
+
+// UndrainHost handles POST /internal/hosts/:host_id/undrain. Manual-only by
+// design: automatic un-draining on a cleared metadata signal would put fresh
+// workloads on a machine about to restart whenever the signal flickers; the
+// asymmetric mistake costs mean only the safe direction is automated.
+func (h *Handlers) UndrainHost(c *gin.Context) {
+	hostID := c.Param("host_id")
+	if hostID == "" {
+		respondErrorMsg(c, "bad_request", "host_id is required", http.StatusBadRequest)
+		return
+	}
+	n, err := h.DB.UndrainHost(c.Request.Context(), hostID)
+	if err != nil {
+		log.Error().Err(err).Str("host_id", hostID).Msg("UndrainHost failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if n == 0 {
+		respondErrorMsg(c, "conflict", "host is not draining", http.StatusConflict)
+		return
+	}
+	log.Info().Str("host_id", hostID).Msg("host un-drained via operator request")
+	if h.Scheduler != nil {
+		h.Scheduler.Invalidate()
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "active"})
 }

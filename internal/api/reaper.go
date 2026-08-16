@@ -52,6 +52,7 @@ func DefaultReaperConfig() ReaperConfig {
 //     cannot starve the control plane for extended periods.
 func (h *Handlers) StartTimeoutReaper(ctx context.Context, cfg ReaperConfig) {
 	go h.reaperLoop(ctx, cfg)
+	go h.drainLoop(ctx, cfg)
 }
 
 func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
@@ -272,7 +273,34 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 // Failure handling:
 //   - Step 1 fails → VM is still running → revert DB to 'active'.
 //   - Step 2 fails → VM is stopped → call rollbackPausedVM (resume + revert).
+//
+// pauseCause names why the platform is pausing a sandbox it claimed —
+// telemetry transition, DB trigger, and activity verb differ per cause but
+// the saga is identical.
+type pauseCause struct {
+	transition string // telemetry transition name
+	trigger    string // FinalizePause trigger column
+	activity   string // activity-log verb
+	doneMsg    string
+}
+
+var timeoutPauseCause = pauseCause{
+	transition: "timeout_pause", trigger: "timeout", activity: "timeout_paused",
+	doneMsg: "reaper: sandbox paused due to timeout",
+}
+
+// drainPauseCause: the sandbox's host has an announced restart coming;
+// pausing converts it into the form that survives host death.
+var drainPauseCause = pauseCause{
+	transition: "maintenance_pause", trigger: "maintenance", activity: "maintenance_paused",
+	doneMsg: "reaper: sandbox paused for host maintenance drain",
+}
+
 func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxesRow) {
+	h.pauseClaimed(ctx, sbx, timeoutPauseCause)
+}
+
+func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, cause pauseCause) {
 	l := log.With().
 		Str("sandbox_id", sbx.ID.String()).
 		Str("team_id", sbx.TeamID.String()).
@@ -287,7 +315,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD failed — reverting to active")
-		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
+		RecordSandboxTransition(ctx, cause.transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.revertToActiveOrFail(ctx, sbx, vmdLookupErr, l)
 		return
 	}
@@ -297,7 +325,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		// Retry (see pauseWithRetry) didn't converge — the VM genuinely
 		// didn't pause, so revert to active and let the next tick retry.
 		l.Error().Err(err).Msg("reaper: VMD PauseInstance failed — reverting to active")
-		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
+		RecordSandboxTransition(ctx, cause.transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.revertToActiveOrFail(ctx, sbx, err, l)
 		return
 	}
@@ -310,21 +338,21 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		TeamID:  sbx.TeamID,
 		Path:    snapshotPath,
 		MemPath: &memPath,
-		Trigger: "timeout",
+		Trigger: cause.trigger,
 	}
 	applyManifest(&params, manifest)
 	if _, err := h.finalizePause(postCtx, params); err != nil {
 		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
-		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
+		RecordSandboxTransition(ctx, cause.transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
 		return
 	}
 
-	l.Info().Msg("reaper: sandbox paused due to timeout")
-	RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultSuccess, sbx.HostID, time.Since(started))
+	l.Info().Msg(cause.doneMsg)
+	RecordSandboxTransition(ctx, cause.transition, telemetry.ResultSuccess, sbx.HostID, time.Since(started))
 	// Interval was already closed at the top of pauseExpired; FinalizePause
 	// is the end of the VMD pause work, not the leave-active moment.
-	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", "timeout_paused", "success", &sbx.Name, nil, nil)
+	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", cause.activity, "success", &sbx.Name, nil, nil)
 }
 
 // rollbackPausedVM is the saga compensation for a failed pause. The VM is
@@ -458,4 +486,154 @@ func (h *Handlers) markSandboxFailed(ctx context.Context, sbx db.ClaimExpiredSan
 	}
 	RecordSandboxTransition(ctx, "fail", telemetry.ResultSuccess, sbx.HostID, time.Since(started))
 	l.Error().Str("reason", reason).Msg("reaper: TERMINAL — sandbox marked 'failed', manual recovery required")
+}
+
+// drainLeadTime is how far ahead of an announced maintenance window the host
+// begins draining (pausing its active sandboxes). Late on purpose: pausing
+// disrupts live workloads, so the platform waits until the restart is close;
+// a full fleet drain measures in low minutes, so an hour holds generous
+// margin for retries. One reviewed constant, derived from measured drain
+// time × safety factor — not host config.
+const drainLeadTime = time.Hour
+
+// drainLoop runs host draining on its own cadence, independent of the
+// cleanup loop: a drain batch can legitimately block for minutes on slow
+// pauses, and the DB-only sweeps (intervals, revocations, snapshots) must
+// not queue behind it — nor drain behind them. Missed ticks coalesce.
+func (h *Handlers) drainLoop(ctx context.Context, cfg ReaperConfig) {
+	parallelism := cfg.Parallelism
+	if parallelism <= 0 {
+		parallelism = 10
+	}
+	if int32(parallelism) > cfg.BatchSize {
+		parallelism = int(cfg.BatchSize)
+	}
+	ticker := time.NewTicker(cfg.Interval)
+	defer ticker.Stop()
+	for {
+		sentrylog.RunSafe("host-drain", func() {
+			h.drainDueHosts(ctx)
+			h.drainOnce(ctx, cfg.BatchSize, parallelism)
+		})
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// drainDueHosts is the drain decision's single home: it flips active hosts
+// whose PERSISTED maintenance window has entered the lead period. Driving
+// this from recorded state rather than freshly reported heartbeat values
+// means a window recorded hours ago drains on time even if every later
+// metadata probe fails.
+func (h *Handlers) drainDueHosts(ctx context.Context) {
+	due, err := h.DB.DrainHostsDueForMaintenance(ctx, int32(drainLeadTime/time.Second))
+	if err != nil {
+		log.Error().Err(err).Msg("drain: flipping due hosts failed")
+		return
+	}
+	if len(due) == 0 {
+		return
+	}
+	for _, host := range due {
+		log.Warn().Str("host_id", host.ID).Time("window_start", host.MaintenanceWindowStart.Time).
+			Msg("host maintenance window imminent — draining: placement stopped, active sandboxes will be paused")
+	}
+	if h.Scheduler != nil {
+		h.Scheduler.Invalidate()
+	}
+}
+
+// drainIncompleteLead is how close to a host's maintenance window unpaused
+// sandboxes become an alert-worthy emergency: past this point a human gets
+// the last word while there is still time to act. Sentry forwards
+// error-level logs, which is the alerting path for the control plane.
+const drainIncompleteLead = 10 * time.Minute
+
+// drainOnce pauses active sandboxes on every draining host — the drain half
+// of announced-host-restart handling (the heartbeat/operator side flips
+// hosts to 'draining'; see HostHeartbeat and DrainHost). Runs every reaper
+// tick, so anything that becomes active during the drain window (resumes,
+// fallback placements) is re-claimed on the next pass: customers keep
+// working until the last sweep and lose nothing. Reuses the timeout
+// reaper's claim shape and pause saga wholesale.
+func (h *Handlers) drainOnce(ctx context.Context, batchSize int32, parallelism int) {
+	hosts, err := h.DB.ListDrainingHosts(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("drain: listing draining hosts failed")
+		return
+	}
+	if len(hosts) == 0 {
+		return
+	}
+
+	// BatchSize bounds the whole tick, not each host: it is ReaperConfig's
+	// documented per-cycle work bound, and neither a slow host nor a large
+	// draining fleet may exceed it. A running budget is split evenly over
+	// the hosts still to claim and spent by ACTUAL claims, so hosts with
+	// nothing active donate their share onward; when the budget runs out,
+	// later hosts wait for the next tick — logged, never silent. All
+	// claimed sandboxes dispatch through ONE bounded fan-out, so pauses
+	// interleave across hosts instead of serializing host by host.
+	remaining := batchSize
+	var all []db.ClaimDrainingSandboxesRow
+	for i, host := range hosts {
+		if remaining <= 0 {
+			log.Info().Int("hosts_deferred", len(hosts)-i).
+				Msg("drain: tick budget spent — remaining hosts drain next tick")
+			break
+		}
+		per := remaining / int32(len(hosts)-i)
+		if per < 1 {
+			per = 1
+		}
+		claimed, err := h.DB.ClaimDrainingSandboxes(ctx, db.ClaimDrainingSandboxesParams{
+			HostID: host.ID, BatchSize: per,
+		})
+		if err != nil {
+			log.Error().Err(err).Str("host_id", host.ID).Msg("drain: claim failed")
+			continue
+		}
+		if len(claimed) > 0 {
+			remaining -= int32(len(claimed))
+			log.Info().Str("host_id", host.ID).Int("claimed", len(claimed)).
+				Msg("drain: pausing active sandboxes on draining host")
+			all = append(all, claimed...)
+		}
+	}
+	if len(all) > 0 {
+		dispatchBounded(ctx, all, parallelism, func(row db.ClaimDrainingSandboxesRow) {
+			h.pauseClaimed(ctx, db.ClaimExpiredSandboxesRow(row), drainPauseCause)
+		})
+	}
+
+	counts, err := h.DB.CountUnpausedOnDrainingHosts(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("drain: progress counts failed")
+		return
+	}
+	unpausedByHost := make(map[string]int64, len(counts))
+	for _, c := range counts {
+		unpausedByHost[c.HostID] = c.Unpaused
+	}
+	for _, host := range hosts {
+		l := log.With().Str("host_id", host.ID).Logger()
+		remaining := unpausedByHost[host.ID]
+		switch {
+		case remaining == 0 && len(all) > 0:
+			l.Warn().Msg("drain complete: host has no sandboxes left that a restart would destroy")
+		case remaining > 0 && host.MaintenanceWindowStart.Valid &&
+			time.Until(host.MaintenanceWindowStart.Time) < drainIncompleteLead:
+			// The alert this feature is built around: the window is nearly
+			// here and sandboxes remain unpaused — every tick re-raises it
+			// until either the drain converges or a human intervenes.
+			l.Error().Int64("unpaused", remaining).
+				Time("window_start", host.MaintenanceWindowStart.Time).
+				Msg("drain incomplete with maintenance window imminent — unpaused sandboxes will not survive the restart")
+		case remaining > 0:
+			l.Info().Int64("unpaused", remaining).Msg("drain in progress")
+		}
+	}
 }

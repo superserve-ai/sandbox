@@ -358,6 +358,98 @@ func (q *Queries) ClaimAutoDeleteSandboxes(ctx context.Context, arg ClaimAutoDel
 	return items, nil
 }
 
+const claimDrainingSandboxes = `-- name: ClaimDrainingSandboxes :many
+WITH draining AS (
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
+  FROM sandbox s
+  WHERE s.destroyed_at IS NULL
+    AND s.status = 'active'
+    AND s.host_id = $1
+    -- Re-checked inside the claim: an operator un-drain between the tick's
+    -- host listing and this statement must not let a stale tick pause
+    -- sandboxes (including fresh placements) on a now-active host.
+    AND EXISTS (
+      SELECT 1 FROM host h
+      WHERE h.id = s.host_id AND h.status = 'draining'
+    )
+  ORDER BY s.created_at ASC
+  LIMIT $2
+  FOR UPDATE OF s SKIP LOCKED
+),
+paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  FROM draining
+  WHERE sandbox.id = draining.id
+  RETURNING draining.id, draining.team_id, draining.name, draining.snapshot_id, draining.host_id, sandbox.network_config
+),
+closed_intervals AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+),
+closed_billing_compute AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
+FROM paused p
+LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id
+`
+
+type ClaimDrainingSandboxesParams struct {
+	HostID    string `json:"host_id"`
+	BatchSize int32  `json:"batch_size"`
+}
+
+type ClaimDrainingSandboxesRow struct {
+	ID            uuid.UUID   `json:"id"`
+	TeamID        uuid.UUID   `json:"team_id"`
+	Name          string      `json:"name"`
+	SnapshotID    pgtype.UUID `json:"snapshot_id"`
+	HostID        string      `json:"host_id"`
+	NetworkConfig []byte      `json:"network_config"`
+}
+
+// Atomically claims active sandboxes on a draining host and marks them
+// 'pausing' — the host has an announced restart coming, and paused sandboxes
+// survive a host restart where active ones cannot. Identical claim shape to
+// ClaimExpiredSandboxes (FOR UPDATE OF s SKIP LOCKED for concurrent
+// replicas; interval and billing closes bundled so a crashed claim can't
+// leave books open) with the eligibility predicate swapped: every active
+// sandbox on the host qualifies, oldest first.
+func (q *Queries) ClaimDrainingSandboxes(ctx context.Context, arg ClaimDrainingSandboxesParams) ([]ClaimDrainingSandboxesRow, error) {
+	rows, err := q.db.Query(ctx, claimDrainingSandboxes, arg.HostID, arg.BatchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClaimDrainingSandboxesRow{}
+	for rows.Next() {
+		var i ClaimDrainingSandboxesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.SnapshotID,
+			&i.HostID,
+			&i.NetworkConfig,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const claimExpiredSandboxes = `-- name: ClaimExpiredSandboxes :many
 WITH open_sessions AS (
   -- Current session start per sandbox: the open interval, computed once.
@@ -503,6 +595,45 @@ func (q *Queries) CountSandboxesByTeamPaged(ctx context.Context, arg CountSandbo
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const countUnpausedOnDrainingHosts = `-- name: CountUnpausedOnDrainingHosts :many
+SELECT s.host_id, count(*) AS unpaused
+FROM sandbox s
+JOIN host h ON h.id = s.host_id AND h.status = 'draining'
+WHERE s.destroyed_at IS NULL
+  AND s.status IN ('active', 'pausing', 'resuming', 'starting')
+GROUP BY s.host_id
+`
+
+type CountUnpausedOnDrainingHostsRow struct {
+	HostID   string `json:"host_id"`
+	Unpaused int64  `json:"unpaused"`
+}
+
+// Per draining host, how many sandboxes are still in a state that would not
+// survive a host restart. ONE grouped query per drain tick regardless of
+// fleet size — a per-host count loop would turn accumulated draining hosts
+// into fleet-sized DB work every tick. Hosts absent from the result have
+// zero. Drives the drain-progress log and the drain-incomplete alert.
+func (q *Queries) CountUnpausedOnDrainingHosts(ctx context.Context) ([]CountUnpausedOnDrainingHostsRow, error) {
+	rows, err := q.db.Query(ctx, countUnpausedOnDrainingHosts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CountUnpausedOnDrainingHostsRow{}
+	for rows.Next() {
+		var i CountUnpausedOnDrainingHostsRow
+		if err := rows.Scan(&i.HostID, &i.Unpaused); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const createSandbox = `-- name: CreateSandbox :one

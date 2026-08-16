@@ -20,6 +20,57 @@ UPDATE host
 SET status = $2, updated_at = now()
 WHERE id = $1;
 
+-- name: UpdateHostMaintenanceWindow :exec
+-- Records (or clears, with NULL) the machine's next announced maintenance
+-- window, as reported by the host's heartbeat.
+UPDATE host
+SET maintenance_window_start = $2, updated_at = now()
+WHERE id = $1;
+
+-- name: DrainHost :execrows
+-- Guarded transition active -> draining: an unhealthy host must not be
+-- "drained" into looking deliberately managed, and a double drain is a no-op.
+UPDATE host
+SET status = 'draining', updated_at = now()
+WHERE id = $1 AND status = 'active';
+
+-- name: UndrainHost :execrows
+-- Guarded transition draining -> active. Deliberately manual-only (operator
+-- endpoint): the mistake costs are asymmetric — staying drained too long
+-- costs placement capacity, while un-draining on a flaky signal puts fresh
+-- workloads on a machine about to restart. The heartbeat never un-drains.
+UPDATE host
+SET status = 'active', updated_at = now()
+WHERE id = $1 AND status = 'draining';
+
+-- name: DrainHostsDueForMaintenance :many
+-- Flips active hosts whose RECORDED maintenance window has entered the lead
+-- period. This is the drain decision's single home: driving it from the
+-- persisted deadline (not from freshly reported values) means a window
+-- recorded hours ago still drains on time even if every later metadata
+-- probe fails. The lower bound keeps long-stale windows (metadata that
+-- never cleared after a completed restart) from re-draining an un-drained
+-- host.
+UPDATE host
+SET status = 'draining', updated_at = now()
+WHERE status = 'active'
+  AND maintenance_window_start IS NOT NULL
+  AND maintenance_window_start <= now() + make_interval(secs => sqlc.arg('lead_seconds')::int)
+  AND maintenance_window_start >= now() - make_interval(secs => sqlc.arg('lead_seconds')::int)
+RETURNING id, maintenance_window_start;
+
+-- name: ListDrainingHosts :many
+-- Hosts being drained ahead of an announced restart, most urgent first: the
+-- claim budget is spent in list order, so the nearest maintenance deadline
+-- must come first — a host restarting in minutes cannot sit behind manual
+-- drains (NULL window, no deadline pressure: deliberately last) or hosts
+-- with later windows. maintenance_window_start also drives the
+-- drain-incomplete alert.
+SELECT id, maintenance_window_start
+FROM host
+WHERE status = 'draining'
+ORDER BY maintenance_window_start ASC NULLS LAST, id;
+
 -- name: UpdateHostHeartbeat :one
 -- Returns the host row so the caller can verify the host exists. Also
 -- re-activates unhealthy hosts that resume heartbeating — this is the
@@ -60,7 +111,10 @@ WITH target_host AS MATERIALIZED (
   SELECT id, last_heartbeat_at
   FROM host
   WHERE id = sqlc.arg('host_id')
-    AND status = 'active'
+    -- 'draining' still qualifies: a drain (announced host maintenance) stops
+    -- new placement, not service — resumes must keep working right up to the
+    -- window, and the drain reaper re-pauses whatever they re-activate.
+    AND status IN ('active', 'draining')
     AND last_heartbeat_at IS NOT NULL
   FOR SHARE
 )
@@ -89,7 +143,7 @@ WITH target_host AS MATERIALIZED (
   SELECT id, last_heartbeat_at
   FROM host
   WHERE id = sqlc.arg('host_id')
-    AND status = 'active'
+    AND status IN ('active', 'draining')  -- same rationale as HostHasCapabilities
     AND last_heartbeat_at IS NOT NULL
 )
 SELECT EXISTS (

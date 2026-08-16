@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
@@ -121,5 +123,139 @@ func TestHostHeartbeatRejectsMalformedCapabilityBeforeDB(t *testing.T) {
 	}
 	if called {
 		t.Fatal("invalid heartbeat reached the database")
+	}
+}
+
+func drainTestMock(t *testing.T, hostStatus string, wantDrain bool) (*mockDBTX, *int32, *int32) {
+	t.Helper()
+	var windowWrites, drains int32
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if !strings.Contains(sql, "-- name: UpdateHostHeartbeat :one") {
+				return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
+			}
+			return hostRow(db.Host{ID: args[0].(string), Status: hostStatus})
+		},
+		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+			switch {
+			case strings.Contains(sql, "-- name: DeleteHostCapabilities :exec"),
+				strings.Contains(sql, "-- name: InsertHostCapability :exec"):
+			case strings.Contains(sql, "-- name: UpdateHostMaintenanceWindow :exec"):
+				atomic.AddInt32(&windowWrites, 1)
+			case strings.Contains(sql, "-- name: DrainHost :execrows"):
+				atomic.AddInt32(&drains, 1)
+				if !wantDrain {
+					t.Error("DrainHost must not run in this scenario")
+				}
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			default:
+				return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec: %s", sql)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	return mock, &windowWrites, &drains
+}
+
+func postHeartbeat(t *testing.T, h *Handlers, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/internal/hosts/host-a/heartbeat", strings.NewReader(body))
+	setupHostHeartbeatRouter(h).ServeHTTP(w, req)
+	return w
+}
+
+// TestHostHeartbeatRecordsWithoutDeciding pins the recorder-only contract:
+// even an imminent window is only persisted — the drain decision lives in
+// the reaper's drain loop, driven from the persisted deadline, so it fires
+// on time regardless of what later heartbeats manage to report.
+func TestHostHeartbeatRecordsWithoutDeciding(t *testing.T) {
+	mock, windowWrites, drains := drainTestMock(t, "active", false)
+	h := &Handlers{DB: db.New(mock)}
+	soon := time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339)
+
+	w := postHeartbeat(t, h, `{"maintenance_window_start":"`+soon+`"}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if *windowWrites != 1 || *drains != 0 {
+		t.Fatalf("windowWrites=%d drains=%d, want 1/0 — heartbeat records, reaper decides", *windowWrites, *drains)
+	}
+}
+
+// TestHostHeartbeatOmittedMaintenanceKeepsState pins the flaky-metadata
+// rule: absence means "no change" — no window write, no drain.
+func TestHostHeartbeatOmittedMaintenanceKeepsState(t *testing.T) {
+	mock, windowWrites, _ := drainTestMock(t, "active", false)
+	h := &Handlers{DB: db.New(mock)}
+
+	w := postHeartbeat(t, h, `{"capabilities":[]}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if *windowWrites != 0 {
+		t.Fatalf("windowWrites=%d, want 0 — absence must not touch recorded state", *windowWrites)
+	}
+}
+
+// TestHostHeartbeatClearRecordsEmptyWindow pins the authoritative clear: an
+// empty string means "nothing announced" and nulls the recorded window —
+// without un-draining anything (that stays manual).
+func TestHostHeartbeatClearRecordsEmptyWindow(t *testing.T) {
+	mock, windowWrites, drains := drainTestMock(t, "draining", false)
+	h := &Handlers{DB: db.New(mock)}
+
+	w := postHeartbeat(t, h, `{"maintenance_window_start":""}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if *windowWrites != 1 || *drains != 0 {
+		t.Fatalf("windowWrites=%d drains=%d, want 1/0 — clear records but never un-drains", *windowWrites, *drains)
+	}
+}
+
+func setupDrainRouter(h *Handlers) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/internal/hosts/:host_id/drain", h.DrainHost)
+	r.POST("/internal/hosts/:host_id/undrain", h.UndrainHost)
+	return r
+}
+
+// TestDrainEndpoints pins the operator surface: guarded transitions with a
+// 409 when the host is not in the expected source state.
+func TestDrainEndpoints(t *testing.T) {
+	cases := []struct {
+		name     string
+		path     string
+		affected int64
+		wantCode int
+	}{
+		{"drain active host", "/internal/hosts/host-a/drain", 1, http.StatusOK},
+		{"drain non-active host conflicts", "/internal/hosts/host-a/drain", 0, http.StatusConflict},
+		{"undrain draining host", "/internal/hosts/host-a/undrain", 1, http.StatusOK},
+		{"undrain non-draining host conflicts", "/internal/hosts/host-a/undrain", 0, http.StatusConflict},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &mockDBTX{
+				execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+					if !strings.Contains(sql, "-- name: DrainHost :execrows") && !strings.Contains(sql, "-- name: UndrainHost :execrows") {
+						return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec: %s", sql)
+					}
+					return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", tc.affected)), nil
+				},
+			}
+			h := &Handlers{DB: db.New(mock)}
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+			setupDrainRouter(h).ServeHTTP(w, req)
+			if w.Code != tc.wantCode {
+				t.Fatalf("code %d, want %d: %s", w.Code, tc.wantCode, w.Body.String())
+			}
+		})
 	}
 }
