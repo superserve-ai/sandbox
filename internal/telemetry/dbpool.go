@@ -83,8 +83,10 @@ const saturationStreakThreshold = 4
 // ambiguity with memory: zero-idle samples hold the episode open (and count
 // toward the threshold), cancellation evidence at ANY point in the episode
 // arms it, and it fires only when armed. Legit full utilization never arms;
-// a real wedge always does, because every caller here carries a deadline and
-// its cancellation is evidence. Fires once per episode; a sample with idle
+// a wedge touched by request traffic always does, because request-path
+// callers carry deadlines whose cancellations are the evidence (see
+// StartDBPoolSaturationLog for the accepted boundaries beyond that).
+// Fires once per episode; a sample with idle
 // connections ends the episode and re-arms. Pure state machine so the
 // decision is testable without a live pool.
 type saturationDetector struct {
@@ -123,9 +125,13 @@ func (d *saturationDetector) observe(zeroIdle, waited bool) bool {
 // EmptyAcquireCount also counts routine connection construction during
 // scale-up and would page on a cold burst doing legitimate work. Two
 // boundaries are accepted and deliberate: a caller with no deadline blocked
-// forever produces no cancel (every caller here carries one), and a fully
-// unreachable database fails dials with errors counted by neither counter,
-// but that mode is already loud in per-request error logs. One residual
+// forever produces no cancel on its own — request-path callers all carry
+// deadlines and share the pool, so any wedge with request traffic in the
+// episode still arms this, but background workers acquiring under the
+// process root context (the billing services) could starve silently in a
+// window with no request traffic at all. And a fully unreachable database
+// fails dials with errors counted by neither counter, but that mode is
+// already loud in per-request error logs. One residual
 // ambiguity is also accepted: pgxpool counts an Acquire under an
 // already-dead context as canceled without proving it waited, and Stat()
 // exposes no blocked-waiter gauge to do better — a full minute of zero idle

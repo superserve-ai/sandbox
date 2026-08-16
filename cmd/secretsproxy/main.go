@@ -468,6 +468,10 @@ func buildAuditSink(ctx context.Context, cfg *config) (secretsproxy.AuditSink, f
 	// construction), so a small cap is enough. A ceiling, not a floor: an
 	// explicitly lower pool_max_conns in the URL stays in effect.
 	poolCfg.MaxConns = min(poolCfg.MaxConns, 8)
+	// URL-configured minima above the cap would make the config
+	// invalid and fail startup; lower them with it.
+	poolCfg.MinConns = min(poolCfg.MinConns, poolCfg.MaxConns)
+	poolCfg.MinIdleConns = min(poolCfg.MinIdleConns, poolCfg.MaxConns)
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to audit DB: %w", err)

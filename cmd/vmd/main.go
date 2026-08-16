@@ -1166,6 +1166,10 @@ func main() {
 		// cap is enough. A ceiling, not a floor: an explicitly lower
 		// pool_max_conns in the URL stays in effect.
 		dbCfg.MaxConns = min(dbCfg.MaxConns, 8)
+		// URL-configured minima above the cap would make the config
+		// invalid and fail startup; lower them with it.
+		dbCfg.MinConns = min(dbCfg.MinConns, dbCfg.MaxConns)
+		dbCfg.MinIdleConns = min(dbCfg.MinIdleConns, dbCfg.MaxConns)
 		dbPool, dbErr := pgxpool.NewWithConfig(ctx, dbCfg)
 		if dbErr != nil {
 			log.Fatal().Err(dbErr).Msg("failed to connect to database for reconciler")
