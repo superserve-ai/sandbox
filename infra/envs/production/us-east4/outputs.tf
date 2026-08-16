@@ -5,7 +5,7 @@ output "network_contract" {
 
 output "sandbox_host_contract" {
   description = "Rendered us-east4 sandbox host contract."
-  value       = module.sandbox_host.contract
+  value       = module.sandbox_host_b.contract
 }
 
 output "deployment_config" {

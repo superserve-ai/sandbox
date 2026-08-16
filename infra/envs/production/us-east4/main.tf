@@ -46,34 +46,17 @@ locals {
     application        = "sandbox-host"
   })
 
-  # The host_id that actually tags vmd's own metrics: its HOST_ID runtime env,
-  # which is ALSO its identity in the host table. Not derivable from the
-  # instance name — this cell's row predates the convention of naming rows
-  # after the instance, and HOST_ID must never be changed to match, because
-  # heartbeats and reconciler scoping key on the existing row. An alert filter
-  # that guesses the instance name selects no series and never fires, which
-  # looks identical to a healthy host.
+  # The host_id that tags vmd's own metrics and scopes the reconciler: its
+  # HOST_ID runtime env, which is ALSO its identity in the host table. The
+  # cell's sole host derives it from the instance name (its deployed HOST_ID),
+  # so DEFAULT_HOST_ID and every alert filter match the live host exactly.
   #
   # Verify against the host before changing: grep '^HOST_ID=' /etc/sandbox/vmd.env
-  #
-  # Deliberately NOT the instance name, and the two must not be merged: the
-  # host-local collector stamps its own HOST_ID (the instance name, rewritten
-  # on every collector deploy) onto the hostmetrics pipeline, so host-level
-  # series like filesystem utilization carry the instance name while vmd's own
-  # OTLP series carry this. One machine, two host_id values, depending on which
-  # process emitted the metric.
-  # Standby value derives from the instance name so it always matches the
-  # host's deployed HOST_ID; the primary keeps its existing "default".
-  metrics_host_id = var.active_sandbox_host == "standby" ? module.sandbox_host_b.instance_name : "default"
+  metrics_host_id = module.sandbox_host_b.instance_name
 
-  # The host selected by active_sandbox_host, used for the control-plane
-  # address and the alert identity.
-  active_vmd_ip    = var.active_sandbox_host == "standby" ? module.sandbox_host_b.internal_ip : module.sandbox_host.internal_ip
-  active_host_name = var.active_sandbox_host == "standby" ? module.sandbox_host_b.instance_name : module.sandbox_host.instance_name
-
-  # The active host is labelled for the deploy pipeline; the other is parked.
-  primary_component = var.active_sandbox_host == "primary" ? "vmd" : "vmd-use4-standby"
-  standby_component = var.active_sandbox_host == "standby" ? "vmd" : "vmd-use4-standby"
+  # Control-plane address + alert identity for the cell's host.
+  active_vmd_ip    = module.sandbox_host_b.internal_ip
+  active_host_name = module.sandbox_host_b.instance_name
 }
 
 module "network" {
@@ -196,8 +179,8 @@ module "api" {
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "15"
     VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
-    # Active host's identity, following active_sandbox_host alongside the
-    # address above. Same value as metrics_host_id.
+    # The cell host's identity, alongside the address above. Same value as
+    # metrics_host_id.
     DEFAULT_HOST_ID  = local.metrics_host_id
     KMS_KEY_RESOURCE = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
 
@@ -289,76 +272,9 @@ module "cloud_ids" {
   labels                     = local.common_labels
 }
 
-module "sandbox_host" {
-  source = "../../../modules/sandbox-host"
-
-  project_id    = local.project_id
-  environment   = local.environment
-  region        = local.region
-  zone          = local.zone
-  instance_name = "superserve-vmd-${local.resource_suffix}"
-  machine_type  = var.machine_type
-  subnet        = module.network.subnetwork_self_link
-  internal_ip   = var.host_internal_ip
-  tags          = ["vmd-use4"]
-
-  # Declare the discovery labels CD and the scheduler key on (component=vmd,
-  # sandbox_role=vmd, ops-agent) — they were added out-of-band at cutover and
-  # `labels` is NOT in the module's ignore_changes, so declaring them keeps a
-  # later apply from stripping them. Values here match the LIVE host exactly so
-  # this stays a no-op adoption: sandbox_status is still "provisioning" live;
-  # flipping it to "ready" (to match the deployment-registry selector) is a
-  # separate, intentional change, not part of this import PR.
-  labels = merge(local.sandbox_host_labels, {
-    component                  = local.primary_component
-    sandbox_role               = "vmd"
-    sandbox_status             = "provisioning"
-    "goog-ops-agent-policy"    = "v2-template-1-7-0"
-    "vanta-contains-user-data" = "true"
-    "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
-  })
-
-  service_account_email = data.google_service_account.api_runner.email
-
-  # Matches the live us-central1 prod host (Ubuntu 22.04 LTS), NOT this
-  # module's typical 24.04 default — the current prod host actually runs
-  # 22.04, and a host-OS kernel mismatch between hosts has been observed to
-  # break snapshot restore. Since this host must restore snapshots copied
-  # from us-central1, matching its OS/kernel family is the safe choice.
-  boot_disk_image = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
-
-  # C4 (like Z3) has no Persistent Disk support — the boot disk must be a
-  # Hyperdisk type, or the instance insert is rejected.
-  boot_disk_type = var.boot_disk_type
-
-  can_ip_forward      = false
-  on_host_maintenance = "TERMINATE"
-
-  reservation_name = var.reservation_name
-
-  # startup-script codifies the guest-DNS bootstrap (unbound + DoT to the
-  # Cloudflare Gateway). The live host was hand-staged, so this exists mainly
-  # for a clean rebuild — sandbox-host keeps `metadata` in ignore_changes, so
-  # adding it here does not perturb the running instance.
-  metadata = {
-    enable-osconfig = "TRUE"
-    enable-oslogin  = "TRUE"
-    startup-script = templatefile("${path.module}/../../../../deploy/unbound/unbound-bootstrap.sh.tftpl", {
-      # Guest network range allowed to query the resolver.
-      guest_cidr     = "10.11.0.0/16"
-      local_dns_port = "19053"
-      # Cloudflare Zero Trust Gateway DoT location endpoint.
-      dot_hostname = "j0mqwd9sm7.cloudflare-gateway.com"
-      # Anycast IPs the location endpoint resolves to (unbound needs an IP here,
-      # not a hostname). Matches the live host's unbound config, verified 2026-07-22.
-      dot_upstream_addrs = ["162.159.36.5", "162.159.46.5"]
-    })
-  }
-}
-
-# Cold standby for the cell, normally kept stopped. Distinct identity from
-# the primary (its HOST_ID is its instance name) so the two never share one.
-# Promotion is an operational procedure, not just flipping active_sandbox_host.
+# The cell's sole sandbox/VMD host. Distinct identity (its HOST_ID is its
+# instance name) carried over from when it was provisioned as the standby.
+# It replaced the original c4 host, whose module was removed after cutover.
 module "sandbox_host_b" {
   source = "../../../modules/sandbox-host"
 
@@ -367,15 +283,14 @@ module "sandbox_host_b" {
   region        = local.region
   zone          = local.zone
   instance_name = "superserve-vmd-${local.resource_suffix}-2"
-  # Explicit, NOT var.machine_type (c4): this standby is the z3 replacement
-  # for the maintenance-prone c4 primary.
+  # The z3 replacement for the retired, maintenance-prone c4 host.
   machine_type = "z3-highmem-192-highlssd-metal"
   subnet       = module.network.subnetwork_self_link
   internal_ip  = "10.2.0.3"
   tags         = ["vmd-use4"]
 
   labels = merge(local.sandbox_host_labels, {
-    component                  = local.standby_component
+    component                  = "vmd"
     sandbox_role               = "vmd"
     sandbox_status             = "provisioning"
     "goog-ops-agent-policy"    = "v2-template-1-7-0"
@@ -396,8 +311,8 @@ module "sandbox_host_b" {
   can_ip_forward      = false
   on_host_maintenance = "TERMINATE"
 
-  # Distinct from the primary's reservation_name: that names a c4-metal
-  # reservation a z3 cannot consume (see standby_reservation_name).
+  # Targets a z3 reservation (see standby_reservation_name); null uses default
+  # affinity against a matching z3 reservation in the zone.
   reservation_name = var.standby_reservation_name
 
   metadata = {
@@ -419,12 +334,6 @@ module "observability" {
   environment              = local.environment
   notification_channel_ids = var.notification_channel_ids
   compute_instance_cpu_alerts = {
-    sandbox_host = {
-      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
-      instance_name = module.sandbox_host.instance_name
-      instance_id   = module.sandbox_host.instance_id
-    }
-    # Inert while the standby is stopped (no data, no fire).
     sandbox_host_b = {
       display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / CPU saturation"
       instance_name = module.sandbox_host_b.instance_name
@@ -465,13 +374,8 @@ module "observability" {
     display_prefix = "Infrastructure / ${local.active_host_name}"
   }
   host_maintenance_event_alerts = {
-    sandbox_host = {
-      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / host maintenance event"
-      instance_name = module.sandbox_host.instance_name
-      instance_id   = module.sandbox_host.instance_id
-    }
-    # Inert while stopped; fires once the standby is running and a window is
-    # scheduled on it — the exact signal that motivated this replacement.
+    # Fires when a maintenance window is scheduled on the host — the exact
+    # signal that motivated retiring the maintenance-prone c4.
     sandbox_host_b = {
       display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / host maintenance event"
       instance_name = module.sandbox_host_b.instance_name

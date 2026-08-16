@@ -13,18 +13,7 @@ subnet_cidr            = "10.2.0.0/24"
 # needs ~2x max_instances of headroom (Google's documented minimum is /26), so
 # this is a /22, mirroring the usw2 cell's 10.1.4.0/22 in the 10.2 block.
 connector_subnet_cidr = "10.2.4.0/22"
-host_internal_ip      = "10.2.0.2"
-machine_type          = "c4-highmem-288-lssd-metal"
 boot_disk_type        = "hyperdisk-balanced"
-# The reservation-us-east-c4-288-lssd-metal reservation is non-specific
-# (specificReservationRequired=false), so it can't be targeted by name. Null =
-# default affinity, which auto-consumes that matching reservation in the zone.
-reservation_name = null
-
-# Which host serves the cell. "standby" points the control-plane dial
-# (VMD_GRPC_ADDRESS + DEFAULT_HOST_ID), the deploy-fleet component label, and
-# the alert identity at the standby host module.
-active_sandbox_host = "standby"
 
 # A5 control plane — same "use" cell as us-central1. Point every runtime secret
 # at the shared, suffix-less use-cell secrets (not per-region "-use4" names) so
