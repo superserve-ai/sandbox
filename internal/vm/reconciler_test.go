@@ -117,7 +117,7 @@ func TestDirSize(t *testing.T) {
 // reclaim only UUIDs present in no source at all.
 func TestDiskKeepSet(t *testing.T) {
 	row := func(s db.SandboxStatus) db.ListSandboxesByHostRow {
-		return db.ListSandboxesByHostRow{Sandbox: db.Sandbox{Status: s}}
+		return db.ListSandboxesByHostRow{Status: s}
 	}
 	const (
 		recentID = "44444444-4444-4444-4444-444444444444" // recently destroyed → kept
@@ -278,7 +278,7 @@ func TestReclaimDiskOrphans_SkipsLiveSandbox(t *testing.T) {
 		onDisk[id] = sandboxDirInfo{paths: []string{p}}
 	}
 	dbSandboxes := map[string]db.ListSandboxesByHostRow{
-		uuidA: {Sandbox: db.Sandbox{Status: db.SandboxStatusPaused}}, // live → must not move
+		uuidA: {Status: db.SandboxStatusPaused}, // live → must not move
 	}
 
 	r := &Reconciler{
@@ -662,7 +662,7 @@ func TestReapDeadActiveVMs_StaleRunningRecordDoesNotVetoReap(t *testing.T) {
 	rows := func(id string) map[string]db.ListSandboxesByHostRow {
 		sbID := uuid.MustParse(id)
 		return map[string]db.ListSandboxesByHostRow{
-			id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+			id: {ID: sbID, Status: db.SandboxStatusActive},
 		}
 	}
 	noError := func(string) bool { return false }
@@ -718,7 +718,7 @@ func TestReapDeadActiveVMs_ExpiredContextStopsBeforeAnyWork(t *testing.T) {
 		if err := store.Put(VMRecord{ID: id, Status: StatusRunning}); err != nil {
 			t.Fatal(err)
 		}
-		rows[id] = db.ListSandboxesByHostRow{Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}}
+		rows[id] = db.ListSandboxesByHostRow{ID: sbID, Status: db.SandboxStatusActive}
 	}
 
 	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
@@ -774,14 +774,18 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 		}
 		return r, id, flips
 	}
-	rows := func(id, snapPath string) map[string]db.ListSandboxesByHostRow {
+	// input builds a paused row plus the batched snapshot-path map that
+	// resolvePausedSnapshotPaths would supply in production (path is a
+	// missing file, so Drift 4 evaluates the miss).
+	input := func(t *testing.T, id string) (map[string]db.ListSandboxesByHostRow, map[uuid.UUID]string) {
+		t.Helper()
 		sbID := uuid.MustParse(id)
+		snapPath := filepath.Join(t.TempDir(), "gone.snap")
 		return map[string]db.ListSandboxesByHostRow{
-			id: {
-				Sandbox:      db.Sandbox{ID: sbID, Status: db.SandboxStatusPaused, SnapshotID: pgtype.UUID{Bytes: sbID, Valid: true}},
-				SnapshotPath: &snapPath,
-			},
-		}
+				id: {ID: sbID, Status: db.SandboxStatusPaused, SnapshotID: pgtype.UUID{Bytes: sbID, Valid: true}},
+			}, map[uuid.UUID]string{
+				sbID: snapPath,
+			}
 	}
 	stubStat := func(t *testing.T, present, missing bool) {
 		t.Helper()
@@ -793,7 +797,8 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 	t.Run("new generation written while waiting on the lock heals", func(t *testing.T) {
 		r, id, flips := newFixture(t)
 		stubStat(t, true, false) // the pause completed: artifact present at re-stat
-		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		dbRows, paths := input(t, id)
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), dbRows, paths, time.Now())
 		if len(*flips) != 0 {
 			t.Fatalf("a fresh pause generation must not be failed, got %v", *flips)
 		}
@@ -808,7 +813,8 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 	t.Run("inconclusive stat defers and keeps the marker", func(t *testing.T) {
 		r, id, flips := newFixture(t)
 		stubStat(t, false, false)
-		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		dbRows, paths := input(t, id)
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), dbRows, paths, time.Now())
 		if len(*flips) != 0 {
 			t.Fatalf("an inconclusive read must never fail a sandbox, got %v", *flips)
 		}
@@ -823,7 +829,8 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 	t.Run("proven absence flips the row", func(t *testing.T) {
 		r, id, flips := newFixture(t)
 		stubStat(t, false, true)
-		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		dbRows, paths := input(t, id)
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), dbRows, paths, time.Now())
 		if len(*flips) != 1 {
 			t.Fatalf("proven absence must flip exactly once, got %v", *flips)
 		}
@@ -834,7 +841,8 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 		stubStat(t, false, true)
 		r.mgr.vmOpCh(id) <- struct{}{} // a pause/resume holds the lock
 		defer func() { <-r.mgr.vmOpCh(id) }()
-		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		dbRows, paths := input(t, id)
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), dbRows, paths, time.Now())
 		if len(*flips) != 0 {
 			t.Fatalf("a locked VM must defer, got %v", *flips)
 		}
@@ -964,7 +972,7 @@ func TestReapUnverifiedOrphans_CgroupOrphan_ModeAwareStopAndProof(t *testing.T) 
 
 	sbID := uuid.MustParse(id)
 	rows := map[string]db.ListSandboxesByHostRow{
-		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusPaused}},
+		id: {ID: sbID, Status: db.SandboxStatusPaused},
 	}
 	active := map[string]bool{id: true}
 	sup := map[string]Supervision{id: SupervisionCgroup}
@@ -1032,7 +1040,7 @@ func TestFailEmptyShells_CgroupShell_ModeAwareStopAndProof(t *testing.T) {
 
 	sbID := uuid.MustParse(id)
 	rows := map[string]db.ListSandboxesByHostRow{
-		id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+		id: {ID: sbID, Status: db.SandboxStatusActive},
 	}
 	active := map[string]bool{id: true}
 	sup := map[string]Supervision{id: SupervisionCgroup}
