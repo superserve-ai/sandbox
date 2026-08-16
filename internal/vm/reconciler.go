@@ -1919,11 +1919,17 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 // is provably gone. Extracted for the same reason as reapDeadActiveVMs — the
 // lock-window race (a new pause writing the artifact while this rule waits on
 // the lifecycle lock) is only testable with the pass data injectable.
+// snapshotPathBatchSize bounds the per-call size of the paused-snapshot PK
+// lookup. A busy host can hold tens of thousands of paused sandboxes, so the
+// lookup is issued in several modest ANY() queries instead of one oversized
+// uuid[] parameter and one very large result set.
+const snapshotPathBatchSize = 10000
+
 // resolvePausedSnapshotPaths batch-fetches on-disk snapshot paths for the
-// paused sandboxes on this host in a single PK lookup, replacing the per-
+// paused sandboxes on this host in chunked PK lookups, replacing the per-
 // inventory LEFT JOIN that ListSandboxesByHost used to carry. Returns nil when
-// the DB is unset, there are no paused candidates, or the lookup fails — Drift
-// 4 then safely no-ops for this pass.
+// the DB is unset, there are no paused candidates, or any chunk lookup fails —
+// Drift 4 then safely no-ops for this pass rather than acting on a partial map.
 func (r *Reconciler) resolvePausedSnapshotPaths(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow) map[uuid.UUID]string {
 	if r.cfg.DB == nil {
 		return nil
@@ -1937,18 +1943,22 @@ func (r *Reconciler) resolvePausedSnapshotPaths(ctx context.Context, log zerolog
 	if len(snapIDs) == 0 {
 		return nil
 	}
-	// ponytail: single ANY() over the paused set; chunk snapIDs if a host ever
-	// holds so many paused sandboxes that the param gets unwieldy.
-	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	rows, err := r.cfg.DB.GetSnapshotPathsByIDs(qctx, snapIDs)
-	cancel()
-	if err != nil {
-		log.Error().Err(err).Msg("resolvePausedSnapshotPaths: batch snapshot-path lookup failed")
-		return nil
-	}
-	pathByID := make(map[uuid.UUID]string, len(rows))
-	for _, row := range rows {
-		pathByID[row.ID] = row.Path
+	pathByID := make(map[uuid.UUID]string, len(snapIDs))
+	for start := 0; start < len(snapIDs); start += snapshotPathBatchSize {
+		end := start + snapshotPathBatchSize
+		if end > len(snapIDs) {
+			end = len(snapIDs)
+		}
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		rows, err := r.cfg.DB.GetSnapshotPathsByIDs(qctx, snapIDs[start:end])
+		cancel()
+		if err != nil {
+			log.Error().Err(err).Msg("resolvePausedSnapshotPaths: batch snapshot-path lookup failed")
+			return nil
+		}
+		for _, row := range rows {
+			pathByID[row.ID] = row.Path
+		}
 	}
 	return pathByID
 }

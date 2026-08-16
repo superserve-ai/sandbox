@@ -4,6 +4,12 @@
 -- join — so the pass stays cheap even on hosts with very large live-sandbox
 -- counts (where the previous full-row + LEFT JOIN scan dominated DB load).
 --
+-- On a high-churn sandbox table the scan is not literally zero-heap: an
+-- index-only scan still visits the heap for pages the visibility map does not
+-- yet mark all-visible, i.e. recently modified rows, until autovacuum catches
+-- up. It remains a large win — the steady-state bulk of rows is all-visible and
+-- served from the index alone — just not a guarantee of no heap access.
+--
 -- On a populated database this index must be pre-built CONCURRENTLY, by hand:
 -- the migration runner wraps every file in a transaction, where CONCURRENTLY
 -- cannot run, and a plain build blocks all sandbox writes for the duration of
