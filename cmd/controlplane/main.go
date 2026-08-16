@@ -137,6 +137,22 @@ func run() error {
 			poolCfg.MaxConns = int32(n)
 		}
 	}
+	// Lifetime + jitter bound how long any one connection can persist and
+	// stagger recycling so a pool's worth of connections never expires (and
+	// redials) in the same instant. ConnectTimeout bounds the dial itself, so
+	// re-establishment after churn fails fast instead of stacking behind a
+	// slow pooler. All of these act on idle or released connections only: a
+	// connection a caller holds and never releases is out of the pool's
+	// reach, which is what the saturation log below exists to surface.
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnLifetimeJitter = 5 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 30 * time.Second
+	// Clamped to the cap: a DB_MAX_CONNS below 2 is a valid override, and
+	// pgxpool rejects (rather than clamps) a minimum above the maximum,
+	// which would fail startup instead of running with a smaller pool.
+	poolCfg.MinIdleConns = min(2, poolCfg.MaxConns)
+	poolCfg.ConnConfig.ConnectTimeout = 5 * time.Second
 	dbPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
@@ -146,6 +162,10 @@ func run() error {
 		return fmt.Errorf("ping database: %w", err)
 	}
 	log.Info().Msg("connected to database")
+	// Deliberately outside the OTel gate: sustained pool saturation must
+	// surface through plain logs even in cells where metrics export is
+	// disabled or the pipeline is down.
+	telemetry.StartDBPoolSaturationLog(ctx, dbPool, log.Logger, 15*time.Second)
 	if cfg.OTelMetricsEnabled {
 		telemetry.StartDBPoolSampler(ctx, dbPool, recorder, cfg.OTelExportInterval)
 		telemetry.StartHostCapacitySampler(ctx, dbPool, recorder, cfg.OTelExportInterval)
