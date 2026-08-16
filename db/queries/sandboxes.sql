@@ -297,12 +297,21 @@ SELECT id FROM destroyed;
 SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL);
 
 -- name: ListSandboxesByHost :many
--- Used by the VMD reconciler. snapshot_path is joined so the paused-sandbox
--- drift check can stat the file without a per-row snapshot lookup.
-SELECT sqlc.embed(s), snap.path AS snapshot_path
+-- Used by the VMD reconciler's per-host drift pass. Returns only the fields
+-- the drift checks read (status + snapshot linkage) so the scan stays
+-- index-only via idx_sandbox_host_reconcile even on hosts with very large
+-- live-sandbox counts. Snapshot paths are fetched separately, in one batch,
+-- for just the paused candidates that need them (see GetSnapshotPathsByIDs) —
+-- avoiding a LEFT JOIN across the entire host inventory every pass.
+SELECT s.id, s.status, s.snapshot_id
 FROM sandbox s
-LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
 WHERE s.host_id = $1 AND s.destroyed_at IS NULL;
+
+-- name: GetSnapshotPathsByIDs :many
+-- Batched snapshot-path lookup for the reconciler's paused-snapshot drift
+-- check. Replaces the old per-inventory join with a PK lookup over just the
+-- snapshot IDs of paused sandboxes.
+SELECT id, path FROM snapshot WHERE id = ANY(@ids::uuid[]);
 
 -- name: ListRecentlyDestroyedSandboxIDsByHost :many
 -- Used by the VMD disk reconciler so a sandbox destroyed within the grace

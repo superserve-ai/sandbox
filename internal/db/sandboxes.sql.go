@@ -1562,6 +1562,38 @@ func (q *Queries) GetSandboxWithPreviewPolicy(ctx context.Context, arg GetSandbo
 	return i, err
 }
 
+const getSnapshotPathsByIDs = `-- name: GetSnapshotPathsByIDs :many
+SELECT id, path FROM snapshot WHERE id = ANY($1::uuid[])
+`
+
+type GetSnapshotPathsByIDsRow struct {
+	ID   uuid.UUID `json:"id"`
+	Path string    `json:"path"`
+}
+
+// Batched snapshot-path lookup for the reconciler's paused-snapshot drift
+// check. Replaces the old per-inventory join with a PK lookup over just the
+// snapshot IDs of paused sandboxes.
+func (q *Queries) GetSnapshotPathsByIDs(ctx context.Context, ids []uuid.UUID) ([]GetSnapshotPathsByIDsRow, error) {
+	rows, err := q.db.Query(ctx, getSnapshotPathsByIDs, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetSnapshotPathsByIDsRow{}
+	for rows.Next() {
+		var i GetSnapshotPathsByIDsRow
+		if err := rows.Scan(&i.ID, &i.Path); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const hasLegacySnapshotUnique = `-- name: HasLegacySnapshotUnique :one
 SELECT (to_regclass('public.snapshot_sandbox_unique') IS NOT NULL)::bool AS legacy
 `
@@ -1717,19 +1749,23 @@ func (q *Queries) ListSandboxPreviewPoliciesByTeam(ctx context.Context, teamID u
 }
 
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, snap.path AS snapshot_path
+SELECT s.id, s.status, s.snapshot_id
 FROM sandbox s
-LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
 WHERE s.host_id = $1 AND s.destroyed_at IS NULL
 `
 
 type ListSandboxesByHostRow struct {
-	Sandbox      Sandbox `json:"sandbox"`
-	SnapshotPath *string `json:"snapshot_path"`
+	ID         uuid.UUID     `json:"id"`
+	Status     SandboxStatus `json:"status"`
+	SnapshotID pgtype.UUID   `json:"snapshot_id"`
 }
 
-// Used by the VMD reconciler. snapshot_path is joined so the paused-sandbox
-// drift check can stat the file without a per-row snapshot lookup.
+// Used by the VMD reconciler's per-host drift pass. Returns only the fields
+// the drift checks read (status + snapshot linkage) so the scan stays
+// index-only via idx_sandbox_host_reconcile even on hosts with very large
+// live-sandbox counts. Snapshot paths are fetched separately, in one batch,
+// for just the paused candidates that need them (see GetSnapshotPathsByIDs) —
+// avoiding a LEFT JOIN across the entire host inventory every pass.
 func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]ListSandboxesByHostRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxesByHost, hostID)
 	if err != nil {
@@ -1739,34 +1775,7 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 	items := []ListSandboxesByHostRow{}
 	for rows.Next() {
 		var i ListSandboxesByHostRow
-		if err := rows.Scan(
-			&i.Sandbox.ID,
-			&i.Sandbox.TeamID,
-			&i.Sandbox.Name,
-			&i.Sandbox.Status,
-			&i.Sandbox.VcpuCount,
-			&i.Sandbox.MemoryMib,
-			&i.Sandbox.HostID,
-			&i.Sandbox.IpAddress,
-			&i.Sandbox.Pid,
-			&i.Sandbox.SnapshotID,
-			&i.Sandbox.CreatedAt,
-			&i.Sandbox.UpdatedAt,
-			&i.Sandbox.DestroyedAt,
-			&i.Sandbox.NetworkConfig,
-			&i.Sandbox.TimeoutSeconds,
-			&i.Sandbox.Metadata,
-			&i.Sandbox.TemplateID,
-			&i.Sandbox.SnapshotPath,
-			&i.Sandbox.MemPath,
-			&i.Sandbox.BasePath,
-			&i.Sandbox.DeltaPath,
-			&i.Sandbox.DiskMib,
-			&i.Sandbox.AutoDeleteSeconds,
-			&i.Sandbox.AutoDeleteAt,
-			&i.Sandbox.FailedAt,
-			&i.SnapshotPath,
-		); err != nil {
+		if err := rows.Scan(&i.ID, &i.Status, &i.SnapshotID); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
