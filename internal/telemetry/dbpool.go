@@ -125,9 +125,13 @@ func (d *saturationDetector) observe(zeroIdle, waited bool) bool {
 // boundaries are accepted and deliberate: a caller with no deadline blocked
 // forever produces no cancel (every caller here carries one), and a fully
 // unreachable database fails dials with errors counted by neither counter,
-// but that mode is already loud in per-request error logs. This log exists
-// for the quiet wedge: requests queuing then timing out while the database
-// looks healthy. Unlike StartDBPoolSampler it is not gated on metrics
+// but that mode is already loud in per-request error logs. One residual
+// ambiguity is also accepted: pgxpool counts an Acquire under an
+// already-dead context as canceled without proving it waited, and Stat()
+// exposes no blocked-waiter gauge to do better — a full minute of zero idle
+// plus a canceled acquire is judged worth an error either way. This log
+// exists for the quiet wedge: requests queuing then timing out while the
+// database looks healthy. Unlike StartDBPoolSampler it is not gated on metrics
 // export.
 func StartDBPoolSaturationLog(ctx context.Context, pool *pgxpool.Pool, log zerolog.Logger, interval time.Duration) {
 	if pool == nil {
