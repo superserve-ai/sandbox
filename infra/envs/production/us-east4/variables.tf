@@ -46,32 +46,14 @@ variable "connector_subnet_cidr" {
   default     = "10.2.0.0/24"
 }
 
-variable "host_internal_ip" {
-  description = "Reserved internal IP for the vmd host."
-  type        = string
-  default     = "10.2.0.2"
-}
-
-variable "machine_type" {
-  description = "Sandbox/VMD host machine type."
-  type        = string
-  default     = "c4-highmem-288-lssd-metal"
-}
-
 variable "boot_disk_type" {
   description = "Boot disk type. C4 metal has no Persistent Disk support, so this must be a Hyperdisk type."
   type        = string
   default     = "hyperdisk-balanced"
 }
 
-variable "reservation_name" {
-  description = "Name of a reservation to specifically target — only valid if that reservation has specificReservationRequired=true. Null uses default affinity, which automatically consumes a matching (non-specific) reservation in the zone. The us-east4 c4-metal reservation was created without specificReservationRequired, so it must be consumed this way rather than targeted by name."
-  type        = string
-  default     = null
-}
-
 variable "standby_reservation_name" {
-  description = "Reservation to target for the z3 standby, kept SEPARATE from reservation_name: the latter names a c4-metal reservation that a z3 instance cannot consume, so sharing the variable would break the standby the moment the primary's reservation is set. Null uses default affinity (a matching z3 reservation, if any)."
+  description = "Reservation to target for the z3 host. Null uses default affinity, which auto-consumes a matching (non-specific) z3 reservation in the zone."
   type        = string
   default     = null
 }
@@ -135,15 +117,4 @@ variable "notification_channel_ids" {
   description = "Existing monitored Cloud Monitoring notification channel resource names for infrastructure alerts."
   type        = list(string)
   default     = []
-}
-
-variable "active_sandbox_host" {
-  description = "Which sandbox host serves the cell: primary or standby."
-  type        = string
-  default     = "primary"
-
-  validation {
-    condition     = contains(["primary", "standby"], var.active_sandbox_host)
-    error_message = "active_sandbox_host must be primary or standby."
-  }
 }
