@@ -148,7 +148,10 @@ func run() error {
 	poolCfg.MaxConnLifetimeJitter = 5 * time.Minute
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
 	poolCfg.HealthCheckPeriod = 30 * time.Second
-	poolCfg.MinIdleConns = 2
+	// Clamped to the cap: a DB_MAX_CONNS below 2 is a valid override, and
+	// pgxpool rejects (rather than clamps) a minimum above the maximum,
+	// which would fail startup instead of running with a smaller pool.
+	poolCfg.MinIdleConns = min(2, poolCfg.MaxConns)
 	poolCfg.ConnConfig.ConnectTimeout = 5 * time.Second
 	dbPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
