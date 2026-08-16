@@ -163,9 +163,16 @@ module "api" {
 
   cpu_limit    = "2"
   memory_limit = "1Gi"
-  # max_instances * DB_MAX_CONNS must stay under the pooler's client-connection
-  # limit; raising either means re-checking that product. Declared rather than
-  # left to drift: the module's ignore_changes is ineffective for the v2 resource.
+  # Pooler client budget is 1,000 (XL tier), and the binding case is a
+  # deploy under full load: max_instances applies per revision and Cloud Run
+  # can overlap the old and new revisions completely, so the ceiling is
+  # 60 instances x DB_MAX_CONNS. At 15 that is 900, plus explicitly capped
+  # host services (vmd 8, secretsproxy 8) and ops clients ~= 940 worst case.
+  # Any higher per-instance cap breaks that overlap math; burst headroom
+  # comes from fast queries and pool lifecycle bounds, not a larger cap.
+  # MaxConns is a cap, not a floor: idle instances hold ~MinIdleConns each,
+  # so realized usage sits far below the ceiling. Declared rather than left to drift: the
+  # module's ignore_changes is ineffective for the v2 resource.
   min_instances     = 10
   max_instances     = 30
   startup_cpu_boost = true

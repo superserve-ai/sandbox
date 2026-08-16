@@ -120,6 +120,17 @@ module "network" {
       }]
       description = "Allow API-to-VMD gRPC traffic"
     }
+    allow_otel_ingress = {
+      name          = "superserve-usw2-allow-cr-to-host-otel"
+      direction     = "INGRESS"
+      source_ranges = [var.connector_subnet_cidr]
+      target_tags   = ["vmd-usw2"]
+      allow = [{
+        protocol = "tcp"
+        ports    = ["4317", "4318"]
+      }]
+      description = "Allow Cloud Run connector traffic to host-local OTLP endpoints."
+    }
   }
 
   labels = local.common_labels
@@ -170,8 +181,15 @@ module "api" {
 
   cpu_limit    = "2"
   memory_limit = "1Gi"
-  # max_instances * DB_MAX_CONNS must stay under this cell's pooler
-  # client-connection limit; raising either means re-checking that product.
+  # Pooler client budget is 1,000 (XL tier), and the binding case is a
+  # deploy under full load: max_instances applies per revision and Cloud Run
+  # can overlap the old and new revisions completely, so the ceiling is
+  # 60 instances x DB_MAX_CONNS. At 15 that is 900, plus explicitly capped
+  # host services (vmd 8, secretsproxy 8) and ops clients ~= 940 worst case.
+  # Any higher per-instance cap breaks that overlap math; burst headroom
+  # comes from fast queries and pool lifecycle bounds, not a larger cap.
+  # MaxConns is a cap, not a floor: idle instances hold ~MinIdleConns each,
+  # so realized usage sits far below the ceiling.
   min_instances     = 10
   max_instances     = 30
   startup_cpu_boost = true
@@ -187,6 +205,20 @@ module "api" {
     DB_MAX_CONNS           = "15"
     VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+
+    # Control-plane OTLP metrics export, matching us-east4. The host-local
+    # superserve-otel-collector receives OTLP on :4318 and forwards to Google
+    # Managed Prometheus; the usw2 firewall admits the Cloud Run sender range
+    # to the host on 4317/4318 (allow_otel_ingress). The endpoint follows
+    # active_vmd_ip, but the collector is installed by the deploy workflow
+    # (which targets the active host's labels): a standby promotion must
+    # re-run the otel deploy or metrics export silently drops until it does.
+    # Export failure is non-fatal to the control plane.
+    OTEL_ENVIRONMENT            = local.environment
+    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${local.active_vmd_ip}:4318"
+    OTEL_EXPORT_INTERVAL        = "15s"
+    OTEL_METRICS_ENABLED        = "true"
+    OTEL_SERVICE_NAME           = "sandbox-controlplane"
   }
 
   secrets = {
