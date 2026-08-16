@@ -340,6 +340,14 @@ type ManagerConfig struct {
 	// without the preconditions degrades to the unit path with a loud
 	// error, never to a fleet that dies on the next vmd deploy.
 	DirectSpawn bool
+
+	// BareVMCgroups launches each VM into a cgroup with NO controllers
+	// enabled. Controller attachment is the dominant, host-size-priced cost
+	// of cgroup creation, so concurrent launches queue on it; bare groups
+	// keep the lifecycle machinery (cgroup.kill/events) and give up per-VM
+	// scheduling fairness and memory accounting — containment stays at
+	// sandboxes.slice and the guest RAM bound is Firecracker's own.
+	BareVMCgroups bool
 }
 
 // ---------------------------------------------------------------------------

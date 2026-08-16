@@ -24,9 +24,10 @@ var ErrCgroupVMsUnmanageable = errors.New("existing cgroup-mode VMs cannot be ma
 // superserve-vms.service under sandboxes.slice — sharing the one aggregate
 // memory ceiling with the legacy firecracker@ units, while vmd itself stays in
 // system.slice outside the VM memory and kill domains. vmd adopts that scope
-// (never creates it), moves its keeper into keeper/, enables controllers on the
-// root, and gives every direct-spawned VM its own <vmID>/ group. PID 1 is never
-// involved per VM — that per-unit serialization is the cost this path deletes.
+// (never creates it), moves its keeper into keeper/, configures child
+// controllers per BareVMCgroups, and gives every direct-spawned VM its own
+// <vmID>/ group. PID 1 is never involved per VM — that per-unit serialization
+// is the cost this path deletes.
 
 const (
 	cgroupMount = "/sys/fs/cgroup"
@@ -141,7 +142,6 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 		}
 	}
 	m.cgroups = tree // existing cgroup VMs are now manageable
-
 	// Run the launch validations in manage-only mode too (flag off here
 	// implies cgroup VMs exist): a record's relaunch forks a new FC just
 	// like a fresh create, and a failure must refuse it, never spawn
@@ -165,6 +165,40 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	// stay manageable even on a host that somehow lost its guard.
 	if gerr := rollbackGuardInstalled(); gerr != nil {
 		return false, fmt.Errorf("host rollback guard not installed — refusing to arm: %w", gerr)
+	}
+	// Controller mode is configured LAST, only after every arm precondition
+	// has passed: it mutates live children (disabling strips their domains,
+	// enabling allocates per-child kernel state), and a failed arm must not
+	// leave the fleet converged to a mode no launch will use. Manage-only
+	// passes never reach here, so they never mutate the mode existing VMs
+	// were created under.
+	if m.cfg.BareVMCgroups {
+		// Disable failure is loud, never silent, but not fatal: with
+		// controllers still enabled the host is merely on the slower
+		// pre-bare behavior, which is correct. (Disabling is legal with
+		// live children — their controller state tears down in place.)
+		if _, derr := configureChildControllers(filepath.Join(tree.vms, "cgroup.subtree_control"), true); derr != nil {
+			m.log.Error().Err(derr).Msg("bare vm cgroups requested but child controllers remain enabled — launches pay full cgroup-creation cost")
+		}
+	} else {
+		wasBare, cfgErr := configureChildControllers(filepath.Join(tree.vms, "cgroup.subtree_control"), false)
+		if cfgErr != nil {
+			// Arming needs the controllers it was asked for; the fleet
+			// stays manageable (kill/liveness are controller-independent),
+			// so refuse the arm rather than crash or arm half-configured.
+			return false, cfgErr
+		}
+		if wasBare {
+			// Leaving bare mode re-exposes memory.oom.group on already-
+			// running children at the kernel default 0, and nothing else
+			// rewrites it (that happens only at create) — stamp them, or
+			// they keep per-process OOM semantics until relaunch.
+			if n, cerr := restoreChildOOMGroup(tree); cerr != nil {
+				m.log.Error().Err(cerr).Msg("could not restore oom.group on existing VM cgroups — they retain per-process OOM semantics until relaunch")
+			} else if n > 0 {
+				m.log.Info().Int("cgroups", n).Msg("restored whole-VM OOM semantics on existing cgroups after leaving bare mode")
+			}
+		}
 	}
 	m.directSpawnArmed.Store(true)
 	return true, nil
@@ -386,14 +420,14 @@ func (m *Manager) hasCgroupRecords() (bool, error) {
 	return false, nil
 }
 
-// adoptVmsScope resolves and prepares the shipped superserve-vms.service
-// delegated subtree for direct spawn. It reads the unit's ControlGroup (never
-// constructs the path), moves the keeper process into keeper/ so the delegated
-// root is free of processes (cgroup v2 no-internal-process rule), and enables
-// the memory+pids controllers on that root so per-VM groups get their files.
-// No memory.max here: the subtree lives under sandboxes.slice and inherits its
-// 95% ceiling hierarchically. Idempotent across vmd restarts, where the keeper
-// already sits in keeper/ and controllers are already enabled.
+// adoptVmsScope resolves the shipped superserve-vms.service delegated
+// subtree and prepares it for management: it reads the unit's ControlGroup
+// (never constructs the path) and moves the keeper process into keeper/ so
+// the delegated root is free of processes (cgroup v2 no-internal-process
+// rule). It deliberately does NOT touch cgroup.subtree_control — controller
+// mode is configureChildControllers, which only an ARMING startup may run;
+// a manage-only pass (rollback/drain) adopts the tree exactly as the
+// previous life left it. Idempotent across vmd restarts.
 func adoptVmsScope(ctx context.Context) (*cgroupTree, error) {
 	rel, err := unitControlGroup(ctx, vmsUnitName)
 	if err != nil {
@@ -413,8 +447,8 @@ func adoptVmsScope(ctx context.Context) (*cgroupTree, error) {
 		return nil, fmt.Errorf("mkdir keeper: %w", err)
 	}
 	// Move any process still in the delegated root (the keeper on first
-	// bootstrap; none on a restart) into keeper/, so controllers can be enabled
-	// on the now-empty root. Per-VM groups live in vms/<id>, not here.
+	// bootstrap; none on a restart) into keeper/, so controllers can be
+	// enabled on the now-empty root when an arming startup configures it.
 	pids, err := readCgroupProcs(t.vms)
 	if err != nil {
 		return nil, fmt.Errorf("read scope root procs: %w", err)
@@ -425,21 +459,151 @@ func adoptVmsScope(ctx context.Context) (*cgroupTree, error) {
 			return nil, fmt.Errorf("move keeper pid %d: %w", pid, err)
 		}
 	}
-	// root's subtree_control gives its children (vms/<id>/) their controller
-	// files. memory+pids are REQUIRED — per-VM memory.oom.group must exist or
-	// createVMCgroup fails — so a failure here is a fail-closed arm refusal.
-	subtree := filepath.Join(t.vms, "cgroup.subtree_control")
-	if err := os.WriteFile(subtree, []byte("+memory +pids"), 0o644); err != nil {
-		return nil, fmt.Errorf("enable memory/pids on scope root: %w", err)
-	}
-	// cpu+io make each per-VM cgroup its OWN scheduling domain at the default
-	// weight 100 — one peer of every other direct VM and of each legacy
-	// firecracker@ unit, the per-VM isolation adjustDirectSpawnWeight assumes.
-	// Best-effort: a kernel that can't delegate them leaves per-VM CPU to
-	// CFS (per-thread) as before, which is a fairness downgrade, not a
-	// safety one — never worth refusing to arm over.
-	_ = os.WriteFile(subtree, []byte("+cpu +io"), 0o644)
 	return t, nil
+}
+
+// configureChildControllers sets the per-VM controller mode on the scope's
+// subtree_control — ARMING startups only; a manage-only pass must never
+// change the mode existing VMs were created under. bare disables every
+// enabled controller (verified); otherwise memory+pids are enabled (REQUIRED
+// — per-VM memory.oom.group must exist or createVMCgroup fails, so a failure
+// here refuses arming) and cpu+io best-effort: each per-VM group becomes its
+// own scheduling domain at the default weight 100, one peer of every other
+// direct VM and legacy firecracker@ unit (the per-VM isolation
+// adjustDirectSpawnWeight assumes); a kernel that can't delegate them leaves
+// per-VM CPU to CFS as before — a fairness downgrade, not a safety one.
+// wasBare reports whether the memory controller was absent beforehand — the
+// host ran bare, so the caller must restore oom.group on existing children.
+func configureChildControllers(subtree string, bare bool) (wasBare bool, err error) {
+	if bare {
+		return false, disableChildControllers(subtree)
+	}
+	// Captured BEFORE the enable overwrites the evidence. An unreadable
+	// value reads as "was bare" — the restore is cheap and idempotent,
+	// skipping a needed repair is not.
+	wasBare = true
+	if cur, rerr := os.ReadFile(subtree); rerr == nil {
+		wasBare = !subtreeHasController(string(cur), "memory")
+	}
+	if err := os.WriteFile(subtree, []byte("+memory +pids"), 0o644); err != nil {
+		return false, fmt.Errorf("enable memory/pids on scope root: %w", err)
+	}
+	_ = os.WriteFile(subtree, []byte("+cpu +io"), 0o644)
+	return wasBare, nil
+}
+
+// subtreeHasController reports whether a cgroup.subtree_control value lists
+// the named controller.
+func subtreeHasController(val, name string) bool {
+	for _, f := range strings.Fields(val) {
+		if f == name {
+			return true
+		}
+	}
+	return false
+}
+
+// disableChildControllers turns off every controller currently enabled in the
+// given cgroup.subtree_control file and verifies the result, so the caller
+// never continues silently believing children are bare while controllers are
+// still attached. A single atomic write: multi-controller subtree writes
+// apply all-or-nothing.
+func disableChildControllers(subtreePath string) error {
+	current, err := os.ReadFile(subtreePath)
+	if err != nil {
+		return fmt.Errorf("read subtree_control: %w", err)
+	}
+	spec := disableSpecFor(string(current))
+	if spec != "" {
+		if err := os.WriteFile(subtreePath, []byte(spec), 0o644); err != nil {
+			return fmt.Errorf("write %q: %w", spec, err)
+		}
+	}
+	after, err := os.ReadFile(subtreePath)
+	if err != nil {
+		return fmt.Errorf("verify subtree_control: %w", err)
+	}
+	if remaining := strings.TrimSpace(string(after)); remaining != "" {
+		return fmt.Errorf("controllers still enabled after disable: %q", remaining)
+	}
+	return nil
+}
+
+// scopeDyingDescendants reads nr_dying_descendants from the VM scope's
+// cgroup.stat — cgroups removed but not yet reclaimed. False when the scope
+// is not managed or the file is unreadable.
+func (m *Manager) scopeDyingDescendants() (int, bool) {
+	if m.cgroups == nil {
+		return 0, false
+	}
+	data, err := os.ReadFile(filepath.Join(m.cgroups.vms, "cgroup.stat"))
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if rest, ok := strings.CutPrefix(line, "nr_dying_descendants "); ok {
+			if n, perr := strconv.Atoi(strings.TrimSpace(rest)); perr == nil {
+				return n, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// restoreChildOOMGroup writes memory.oom.group=1 on every per-VM cgroup that
+// has the file but does not already claim it — the children created while the
+// host ran bare, whose file reappeared at the kernel default 0 when the memory
+// controller came back. Returns how many were stamped. Reserved names and
+// children without the file (memory controller not enabled) are skipped.
+func restoreChildOOMGroup(t *cgroupTree) (int, error) {
+	entries, err := os.ReadDir(t.vms)
+	if err != nil {
+		return 0, fmt.Errorf("scan scope for oom.group restore: %w", err)
+	}
+	restored := 0
+	var firstErr error
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == keeperSubdir {
+			continue
+		}
+		path := filepath.Join(t.vms, e.Name(), "memory.oom.group")
+		data, rerr := os.ReadFile(path)
+		if os.IsNotExist(rerr) {
+			continue // no memory controller on this child: nothing to restore
+		}
+		if rerr != nil {
+			// Anything else means this child's OOM setting is NOT known
+			// restored — swallowing it would report a clean transition over
+			// a VM left with per-process OOM semantics.
+			if firstErr == nil {
+				firstErr = fmt.Errorf("read oom.group on %s: %w", e.Name(), rerr)
+			}
+			continue
+		}
+		if strings.TrimSpace(string(data)) == "1" {
+			continue
+		}
+		if werr := os.WriteFile(path, []byte("1"), 0o644); werr != nil && firstErr == nil {
+			firstErr = fmt.Errorf("set oom.group on %s: %w", e.Name(), werr)
+		} else if werr == nil {
+			restored++
+		}
+	}
+	return restored, firstErr
+}
+
+// disableSpecFor builds the "-a -b" write that disables every controller
+// listed in a subtree_control value; empty when nothing is enabled.
+func disableSpecFor(current string) string {
+	fields := strings.Fields(current)
+	if len(fields) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(fields))
+	for _, f := range fields {
+		parts = append(parts, "-"+f)
+	}
+	return strings.Join(parts, " ")
 }
 
 // sandboxesSliceReserved reports whether sandboxes.slice — the single ceiling
@@ -578,13 +742,35 @@ func (t *cgroupTree) createVMCgroup(vmID string) (*os.File, error) {
 			return nil, fmt.Errorf("%w: mkdir vm cgroup: %v", errScopeGone, err)
 		}
 		return nil, fmt.Errorf("mkdir vm cgroup: %w", err)
+	} else if err != nil {
+		// EEXIST tolerance is for a leftover GROUP (replace semantics); a
+		// non-directory squatting on the path must fail, not be opened as
+		// the VM's cgroup.
+		if fi, serr := os.Stat(dir); serr != nil || !fi.IsDir() {
+			return nil, fmt.Errorf("vm cgroup path %s exists and is not a directory", dir)
+		}
 	}
 	// Failures past the mkdir remove the group: nothing was cloned into it,
 	// and a leftover empty dir behind a persisted record is invisible to the
 	// empty-group reap (which skips recorded IDs) yet blocks drain-check.
-	if err := os.WriteFile(filepath.Join(dir, "memory.oom.group"), []byte("1"), 0o644); err != nil {
+	// oom.group exists only when the parent enables the memory controller
+	// (absent under BareVMCgroups). Without it, whole-VM OOM semantics hold
+	// anyway TODAY because the launch chain execs down to a single process —
+	// an invariant this relies on: adding a second per-VM process (a sidecar)
+	// requires revisiting bare groups or OOM can take one process, not the VM.
+	// Only definitive absence skips the write: any other stat failure on a
+	// controller-enabled host would silently drop mandatory OOM setup.
+	oomPath := filepath.Join(dir, "memory.oom.group")
+	switch _, serr := os.Stat(oomPath); {
+	case serr == nil:
+		if err := os.WriteFile(oomPath, []byte("1"), 0o644); err != nil {
+			_ = os.Remove(dir)
+			return nil, fmt.Errorf("set oom.group: %w", err)
+		}
+	case os.IsNotExist(serr): // bare mode — no memory controller on children
+	default:
 		_ = os.Remove(dir)
-		return nil, fmt.Errorf("set oom.group: %w", err)
+		return nil, fmt.Errorf("stat oom.group: %w", serr)
 	}
 	f, err := os.Open(dir)
 	if err != nil {
