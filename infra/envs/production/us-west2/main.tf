@@ -219,6 +219,12 @@ module "api" {
     OTEL_EXPORT_INTERVAL        = "15s"
     OTEL_METRICS_ENABLED        = "true"
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
+
+    # The serving host's identity for VMD-call metric labels, following
+    # active_sandbox_host like the address above. Without it the wrapper
+    # falls back to labeling every series "default", which host-grouped
+    # dashboards cannot attribute and a standby promotion would not update.
+    DEFAULT_HOST_ID = local.metrics_host_id
   }
 
   secrets = {
