@@ -367,6 +367,17 @@ module "observability" {
     host_id        = local.metrics_host_id
     display_prefix = "Backup / ${local.active_host_name}"
   }
+  # Backup coverage: paused sandboxes with no verified backup at all,
+  # sampled by the control plane from this cell's database. Created
+  # disabled so the policy config is validated and enablement is a
+  # one-field flip once the cell's backfill backlog converges to zero.
+  # regions lists the host table's region column values in this cell's
+  # database, NOT GCP region names; "usw" is the only value present.
+  backup_coverage_alerts = {
+    enabled        = false
+    display_prefix = "Backup coverage / us-west2"
+    regions        = ["usw"]
+  }
   # Launch-path health for the same host: the pruned launcher mount namespace
   # being unavailable (VM starts fall back to walking the full host mount
   # table) and live network namespaces accumulating. Both degrade latency

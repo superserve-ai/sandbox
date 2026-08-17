@@ -135,6 +135,79 @@ variable "backup_alerts" {
   default = null
 }
 
+variable "backup_coverage_alerts" {
+  description = <<-EOT
+    Alert policy over the control plane's per-cell backup coverage
+    gauge (backup_uncovered_paused_sandboxes): paused, non-destroyed
+    sandboxes with no verified backup generation, grouped by region and
+    host_id. Unlike backup_alerts, these series are emitted by the
+    control plane from database state, not by a vmd host, so they are
+    not scoped to one HOST_ID and deliberately do not share
+    backup_alerts' host filter.
+
+    The policy defaults to disabled (enabled = false) even when this
+    object is set: cells currently carry large known-uncovered backlogs
+    (a region-wide backfill that has not yet converged, and migration
+    leftovers still pending classification), so an armed policy today
+    would fire permanently and teach responders to ignore it. Flip
+    enabled to true per environment once its backlog has converged to
+    zero. Null omits the policy entirely.
+  EOT
+  type = object({
+    display_prefix = string
+    # Arm the policy. Kept separate from the object's presence so the
+    # policy can be created disabled, reviewed in the console, and
+    # flipped on without a shape change once coverage converges.
+    enabled = optional(bool, false)
+    # Scope the policies to one cell via the series' region label.
+    # Production cells share a monitoring project, so once more than
+    # one cell exports the gauge, an unscoped instance would watch (and
+    # duplicate alerts for) every cell's series. A list, one condition
+    # per entry, because a cell's database can legitimately carry more
+    # than one host-region value: the use cell is a host swap whose
+    # host rows have already been relabeled across regions once, and a
+    # single-region scope would silently miss series still labeled with
+    # a retired value. List every region value present in the cell's
+    # host table (the host table's region column, not GCP region
+    # names; a guess selects no series). Leave null only while a
+    # single cell emits the metric. A non-empty list also arms a
+    # companion policy over region="unknown" series (paused sandboxes
+    # whose host row is gone), which region scoping would otherwise
+    # hide.
+    regions = optional(list(string))
+    # Uncovered paused sandboxes tolerated per series. Zero: any paused
+    # sandbox without a verified backup that persists for the window is
+    # unmet durability exposure.
+    uncovered_threshold = optional(number, 0)
+    # Sustained window. A backup trails its pause by queue and upload
+    # time, so an hour tolerates normal drain latency (and the sweep
+    # re-enqueueing after a restart) while still catching a stalled
+    # pipeline within the day.
+    uncovered_duration = optional(string, "3600s")
+  })
+  default = null
+
+  # Region values flow into Monitoring filters, resource addresses, and
+  # the user_labels alert_type ("backup_coverage_uncovered_paused_"
+  # plus the value, against Monitoring's 63-character lowercase label
+  # limit), and the host table's region column constrains none of that:
+  # reject here rather than fail mid-apply. "unknown" is reserved for
+  # the orphaned-host companion policy, and duplicates would collide as
+  # resource keys.
+  validation {
+    condition = var.backup_coverage_alerts == null ? true : (
+      var.backup_coverage_alerts.regions == null ? true : (
+        length(var.backup_coverage_alerts.regions) == length(distinct(var.backup_coverage_alerts.regions)) &&
+        alltrue([
+          for region in var.backup_coverage_alerts.regions :
+          can(regex("^[a-z0-9][a-z0-9-]{0,29}$", region)) && region != "unknown"
+        ])
+      )
+    )
+    error_message = "backup_coverage_alerts.regions entries must be unique, must not be \"unknown\", and must match ^[a-z0-9][a-z0-9-]{0,29}$ (lowercase alphanumerics and dashes, at most 30 characters)."
+  }
+}
+
 variable "host_disk_alerts" {
   description = <<-EOT
     Alert policies over root-filesystem utilization exported by the

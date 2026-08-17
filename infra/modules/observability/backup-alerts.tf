@@ -177,6 +177,142 @@ resource "google_monitoring_alert_policy" "backup" {
   })
 }
 
+# Backup coverage alerting. The control plane samples, per host row (or
+# 'unknown' for paused sandboxes whose host row is gone), how many
+# paused, non-destroyed sandboxes have no verified backup generation.
+# These series come from the control plane's database sampler, not from
+# a vmd host, so they are kept out of local.backup_alert_conditions: the
+# shared filter above unconditionally appends the host-scoped
+# backup_filter_suffix, which would pin this cell-wide gauge to a single
+# vmd HOST_ID and silently select the wrong series. Same classic
+# threshold-condition shape as the rest of the module (explicit
+# metric.type, never PromQL; see the header).
+
+locals {
+  # Per-cell scope. Production cells share one monitoring project, so a
+  # policy without a scope watches every cell's series once more than
+  # one cell exports the gauge. One condition per configured region
+  # value: a cell's database can carry more than one (the use cell's
+  # host rows have already been relabeled across regions once), and a
+  # single-region filter would silently miss series labeled with the
+  # other values.
+  backup_coverage_regions = var.backup_coverage_alerts == null ? [] : coalesce(var.backup_coverage_alerts.regions, [])
+
+  # ALIGN_MIN over 60s windows: the count must sit above the threshold
+  # for the whole duration, so a backlog that is actively draining
+  # through zero resets the clock and only sustained exposure fires.
+  # The sampler emits an explicit 0 for a host whose paused population
+  # is fully covered, which is what lets these policies clear
+  # deterministically instead of waiting out missing-data auto close.
+  backup_coverage_alert_conditions = var.backup_coverage_alerts == null ? {} : merge(
+    length(local.backup_coverage_regions) == 0 ? {
+      uncovered_paused = {
+        display_name  = "${var.backup_coverage_alerts.display_prefix} / paused sandboxes without verified backup"
+        metric_type   = "prometheus.googleapis.com/backup_uncovered_paused_sandboxes/gauge"
+        extra_filter  = ""
+        comparison    = "COMPARISON_GT"
+        threshold     = var.backup_coverage_alerts.uncovered_threshold
+        aligner       = "ALIGN_MIN"
+        duration      = var.backup_coverage_alerts.uncovered_duration
+        documentation = <<-EOT
+          A host has had more than ${var.backup_coverage_alerts.uncovered_threshold} paused sandboxes without any verified backup generation for the whole alert window (see the series' region and host_id labels). Every one of them is a pause that cannot be restored from the bucket if the host's local tier is lost.
+
+          Owner: Infrastructure Operations. Response: check whether the host's vmd backup pipeline is running and draining (backup_enabled, backup_journal_pending, backup_upload_total{result="failed"}), whether completion reports are reaching the control plane, and use backup_uncovered_oldest_age_seconds to judge how stale the exposure is.
+        EOT
+      }
+      } : {
+      for region in local.backup_coverage_regions : "uncovered_paused_${region}" => {
+        display_name  = "${var.backup_coverage_alerts.display_prefix} / paused sandboxes without verified backup (${region})"
+        metric_type   = "prometheus.googleapis.com/backup_uncovered_paused_sandboxes/gauge"
+        extra_filter  = " AND metric.labels.region = \"${region}\""
+        comparison    = "COMPARISON_GT"
+        threshold     = var.backup_coverage_alerts.uncovered_threshold
+        aligner       = "ALIGN_MIN"
+        duration      = var.backup_coverage_alerts.uncovered_duration
+        documentation = <<-EOT
+          A host in region "${region}" has had more than ${var.backup_coverage_alerts.uncovered_threshold} paused sandboxes without any verified backup generation for the whole alert window (see the series' host_id label). Every one of them is a pause that cannot be restored from the bucket if the host's local tier is lost.
+
+          Owner: Infrastructure Operations. Response: check whether the host's vmd backup pipeline is running and draining (backup_enabled, backup_journal_pending, backup_upload_total{result="failed"}), whether completion reports are reaching the control plane, and use backup_uncovered_oldest_age_seconds to judge how stale the exposure is.
+        EOT
+      }
+    },
+    # A region-scoped policy hides the worst case: when a host row is
+    # deleted, its uncovered sandboxes re-label as region="unknown" and
+    # the old region series stops being observed, so the scoped
+    # policies above would clear while the exposure persists. Whenever
+    # region scoping is in effect, this companion watches the unknown
+    # series. Every scoped cell instance carries it, so orphaned
+    # exposure pages even though its owning cell is ambiguous;
+    # duplicate pages across cells are the acceptable cost of never
+    # losing sight of it.
+    length(local.backup_coverage_regions) == 0 ? {} : {
+      uncovered_orphaned = {
+        display_name  = "${var.backup_coverage_alerts.display_prefix} / paused sandboxes on missing host rows without verified backup"
+        metric_type   = "prometheus.googleapis.com/backup_uncovered_paused_sandboxes/gauge"
+        extra_filter  = " AND metric.labels.region = \"unknown\""
+        comparison    = "COMPARISON_GT"
+        threshold     = var.backup_coverage_alerts.uncovered_threshold
+        aligner       = "ALIGN_MIN"
+        duration      = var.backup_coverage_alerts.uncovered_duration
+        documentation = <<-EOT
+          Paused sandboxes whose host row no longer exists have had no verified backup generation for the whole alert window (region="unknown"; host_id is the sandbox's pinned host). These are the highest-exposure rows this metric tracks: the host that held their local artifacts is gone from the fleet table, so the bucket copy that does not exist is the only durability they could have had.
+
+          Owner: Infrastructure Operations. Response: identify the sandboxes via the host_id label and the sandbox table (paused, not destroyed, host_id without a host row), determine whether the host's local tier still physically exists, and drive recovery or classification; do not silence this as migration noise without accounting for every sandbox behind it.
+        EOT
+      }
+  })
+}
+
+resource "google_monitoring_alert_policy" "backup_coverage" {
+  for_each = local.backup_coverage_alert_conditions
+
+  project      = var.project_id
+  display_name = each.value.display_name
+  combiner     = "OR"
+  # Created disabled by default: cells carry known uncovered backlogs
+  # (backfill not yet converged, unclassified migration debris) that
+  # would hold this alert firing permanently. Flip the variable's
+  # enabled knob per environment once its backlog converges.
+  enabled               = var.backup_coverage_alerts.enabled
+  notification_channels = var.notification_channel_ids
+
+  conditions {
+    display_name = each.value.display_name
+
+    condition_threshold {
+      # No backup_filter_suffix here: region/host_id on these series
+      # come from control-plane database rows, not from a vmd HOST_ID.
+      # Cell scoping rides each condition's extra_filter instead.
+      filter          = "metric.type = \"${each.value.metric_type}\" AND resource.type = \"prometheus_target\"${each.value.extra_filter}"
+      comparison      = each.value.comparison
+      threshold_value = each.value.threshold
+      duration        = each.value.duration
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = each.value.aligner
+        cross_series_reducer = try(each.value.reducer, null)
+      }
+      trigger {
+        count = 1
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  documentation {
+    content   = each.value.documentation
+    mime_type = "text/markdown"
+  }
+
+  user_labels = merge(var.labels, {
+    alert_type = "backup_coverage_${each.key}"
+    managed_by = "terraform"
+  })
+}
+
 # Host root-filesystem alerting. The host-local collector's hostmetrics
 # receiver exports utilization for the root mountpoint only (the sandbox
 # data arrays are separate filesystems with their own reclaim logic), so

@@ -154,6 +154,7 @@ locals {
     compute_instance_cpu_alerts   = var.compute_instance_cpu_alerts
     host_maintenance_event_alerts = var.host_maintenance_event_alerts
     backup_alerts                 = var.backup_alerts
+    backup_coverage_alerts        = var.backup_coverage_alerts
     host_disk_alerts              = var.host_disk_alerts
     log_buckets                   = var.log_buckets
     uptime_checks                 = var.uptime_checks

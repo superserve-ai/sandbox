@@ -169,6 +169,10 @@ func run() error {
 	if cfg.OTelMetricsEnabled {
 		telemetry.StartDBPoolSampler(ctx, dbPool, recorder, cfg.OTelExportInterval)
 		telemetry.StartHostCapacitySampler(ctx, dbPool, recorder, cfg.OTelExportInterval)
+		// No-op when OTel init failed and recorder is the noop: the
+		// coverage sampler holds a cell-wide lease in exchange for
+		// exporting, and a replica that cannot export must not win it.
+		telemetry.StartBackupCoverageSampler(ctx, dbPool, recorder, cfg.OTelExportInterval)
 	}
 
 	reconcileSystemTeamQuota(ctx, dbPool, cfg.SystemTeamID)

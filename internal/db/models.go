@@ -780,6 +780,13 @@ type TeamSandboxCounter struct {
 	Cnt    int32     `json:"cnt"`
 }
 
+type TelemetrySamplerLease struct {
+	Name        string    `json:"name"`
+	LockedBy    string    `json:"locked_by"`
+	LockedUntil time.Time `json:"locked_until"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 type Template struct {
 	ID           uuid.UUID          `json:"id"`
 	TeamID       uuid.UUID          `json:"team_id"`

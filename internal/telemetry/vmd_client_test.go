@@ -20,6 +20,8 @@ func (r *captureRecorder) RecordVMDCall(_ context.Context, call VMDCall) {
 
 func (r *captureRecorder) RecordHostCapacity(context.Context, HostCapacity) {}
 
+func (r *captureRecorder) RecordBackupCoverage(context.Context, []BackupCoverage) {}
+
 func (r *captureRecorder) RecordDBPoolStats(context.Context, DBPoolStats) {}
 
 func (r *captureRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure) {}
