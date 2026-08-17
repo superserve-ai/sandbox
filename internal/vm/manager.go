@@ -2496,6 +2496,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	case m.restoreSem <- struct{}{}:
 		defer func() { <-m.restoreSem }()
 	case <-ctx.Done():
+		// The full-deadline queue wait is the worst restore-queue latency —
+		// emit it, or saturation incidents vanish from entry_to_sem.
+		m.recordPhases("restore", "", map[string]time.Duration{"entry_to_sem": time.Since(tEntry)})
 		return nil, ctx.Err()
 	}
 	tSemAcquired := time.Now()

@@ -16,6 +16,8 @@ import (
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
+
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 const (
@@ -118,6 +120,33 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 		http.NotFound(w, r)
 		return
 	}
+	// Connect latency only (auth + upgrade): the bridged session that
+	// follows lasts as long as the client wants and is deliberately NOT a
+	// latency sample — folding session lifetimes into exec histograms would
+	// bury the one-shot percentiles under user behavior. Deferred so failed
+	// connects land too, with whichever stages they reached.
+	tConnect := time.Now()
+	var tAuthDone, tEstablished time.Time
+	defer func() {
+		if h.recorder == nil {
+			return
+		}
+		phases := map[string]time.Duration{"total": time.Since(tConnect)}
+		if !tAuthDone.IsZero() {
+			phases["auth"] = tAuthDone.Sub(tConnect)
+		}
+		if !tEstablished.IsZero() {
+			phases["establish"] = tEstablished.Sub(tAuthDone)
+		}
+		for phase, d := range phases {
+			if d < 0 {
+				continue
+			}
+			h.recorder.RecordLatencyPhase(r.Context(), telemetry.LatencyPhase{
+				Plane: "dataplane", Op: "exec_connect", Phase: phase, Duration: d,
+			})
+		}
+	}()
 
 	// Token rides in Sec-WebSocket-Protocol, never the URL. Scrub any query
 	// and discourage Referer leakage, matching the terminal bridge.
@@ -131,6 +160,7 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 	}
 
 	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
+	tAuthDone = time.Now()
 	if fail != nil {
 		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("exec/ws: auth failed")
 		fail.write(w)
@@ -148,6 +178,9 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 	}
 
 	ws, err := websocket.Accept(w, r, acceptOpts)
+	if err == nil {
+		tEstablished = time.Now()
+	}
 	if err != nil {
 		h.log.Warn().Err(err).Msg("exec/ws: WS upgrade failed")
 		return
