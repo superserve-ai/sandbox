@@ -150,7 +150,8 @@ def main() -> int:
             SANDBOX_ACCESS_TOKEN_SEED={access_seed}
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}
-            SENTRY_DSN={sentry_dsn}{otel_env_lines}
+            SENTRY_DSN={sentry_dsn}
+            HOST_ID={name}{otel_env_lines}
             PROXYENV
             sudo chmod 0600 /etc/sandbox/proxy.env
 
