@@ -65,43 +65,56 @@ func main() {
 	}
 }
 
-// Placement fencing is cache-based until the reservation work lands: every
-// control-plane replica keeps serving its cached candidate set for up to
-// the scheduler TTL plus its stale grace (30s+30s). Zero counts observed
-// before that window — or observed only once — prove nothing.
+// Placement fencing is cache-based until the reservation work lands, and
+// the counts read the sandbox TABLE — but a create admitted just before the
+// convergence cutoff boots its VM BEFORE inserting the row (boot runs under
+// a 2×30s context including one retry), so the host can carry invisible
+// work well after placement stopped. The quiet window therefore must cover
+// the longest admitted-but-uninserted create plus its failure cleanup, not
+// merely a few polls:
+//
+//	drainConvergence — scheduler cache TTL + stale grace (30s+30s): when
+//	  the last stale replica can still ADMIT a create.
+//	drainQuietWindow — continuous zeros required AFTER that: 2×30s boot
+//	  (incl. retry) + insert/cleanup visibility margin.
 const (
 	drainConvergence = 60 * time.Second
+	drainQuietWindow = 90 * time.Second
 	drainPollEvery   = 5 * time.Second
-	drainStablePolls = 3
 	drainWaitCeiling = 15 * time.Minute
 )
 
 // waitDrained blocks through the convergence window, then polls until
-// RUNNING, BUSY, and BUILDS read zero on drainStablePolls consecutive
-// observations. It reports drained — and is explicit that drained is not
-// the same as safe to retire while PAUSED is nonzero.
+// RUNNING, BUSY, and BUILDS read zero continuously for drainQuietWindow.
+// It aborts if the host leaves 'draining' (a concurrent activation would
+// otherwise let it report "drained" while placement is enabled again), and
+// is explicit that drained is not safe-to-retire while PAUSED is nonzero.
 func (c client) waitDrained(hostID string) error {
 	fmt.Printf("%s -> draining; waiting %s for placement convergence across replicas...\n",
 		hostID, drainConvergence)
 	time.Sleep(drainConvergence)
 
 	deadline := time.Now().Add(drainWaitCeiling)
-	stable := 0
+	var quietSince time.Time
 	for {
 		h, err := c.hostRow(hostID)
 		if err != nil {
 			return err
 		}
+		if h.Status != "draining" {
+			return fmt.Errorf("host %s status changed to %q while waiting; placement may be enabled again — aborting", hostID, h.Status)
+		}
 		busy := h.RunningCount + h.TransitionalCount + h.BuildingCount
-		if busy == 0 {
-			stable++
-		} else {
-			stable = 0
+		switch {
+		case busy != 0:
+			quietSince = time.Time{}
 			fmt.Printf("still busy: running=%d busy=%d builds=%d\n",
 				h.RunningCount, h.TransitionalCount, h.BuildingCount)
+		case quietSince.IsZero():
+			quietSince = time.Now()
 		}
-		if stable >= drainStablePolls {
-			fmt.Printf("%s drained: counts stably zero over %d observations.\n", hostID, drainStablePolls)
+		if !quietSince.IsZero() && time.Since(quietSince) >= drainQuietWindow {
+			fmt.Printf("%s drained: counts zero continuously for %s.\n", hostID, drainQuietWindow)
 			if h.PausedCount > 0 {
 				fmt.Printf("NOT safe to retire: %d paused sandboxes have their snapshots on this host's local disk.\n",
 					h.PausedCount)

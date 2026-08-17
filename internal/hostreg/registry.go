@@ -69,6 +69,11 @@ type Registry struct {
 	// id ever seen (fleet-bounded).
 	gens    map[string]uint64
 	resolve singleflight.Group // one row-read/dial resolution in flight per host
+	// refreshing holds hosts with a refresh-ahead goroutine in flight.
+	// Singleflight dedupes the underlying read but not the goroutines
+	// waiting on it — without this guard, every warm call in the refresh
+	// window would park a goroutine behind a slow (up to 2s) read.
+	refreshing sync.Map // hostID → struct{}
 }
 
 // New creates a Registry backed by the host table.
@@ -131,9 +136,14 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 			// background while still being served fresh, so the blocking
 			// due-verification read almost never lands on a request.
 			// Suppressed while degraded — after a failure, pacing belongs
-			// to the backoff alone. Singleflight dedupes the window's
-			// callers; the generation guard keeps the async result safe.
-			go func() { _, _ = r.resolveClient(context.WithoutCancel(ctx), hostID) }()
+			// to the backoff alone. One goroutine per host at a time; the
+			// generation guard keeps the async result safe.
+			if _, busy := r.refreshing.LoadOrStore(hostID, struct{}{}); !busy {
+				go func() {
+					defer r.refreshing.Delete(hostID)
+					_, _ = r.resolveClient(context.WithoutCancel(ctx), hostID)
+				}()
+			}
 		}
 		return e.client, nil
 	}

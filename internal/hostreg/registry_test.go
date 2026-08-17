@@ -3,6 +3,7 @@ package hostreg
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -598,5 +599,51 @@ func TestClientForFastPathHonorsLeaseDuringBackoff(t *testing.T) {
 	time.Sleep(40 * time.Millisecond)
 	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
 		t.Fatal("lease expired mid-backoff: dispatch must fail closed, got a client")
+	}
+}
+
+// Refresh-ahead launches ONE background goroutine per host, no matter how
+// many warm calls land in the refresh window while the read is slow —
+// singleflight dedupes the read, but only this guard bounds the goroutines
+// parked behind it.
+func TestClientForRefreshAheadLaunchesOneGoroutine(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+	r.recheck = 300 * time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.nextCheckAt = time.Now().Add(30 * time.Millisecond) // inside the refresh window, still fresh
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+
+	gate := make(chan struct{})
+	store.setGate(gate) // the background read parks until released
+	before := runtime.NumGoroutine()
+	for i := 0; i < 50; i++ {
+		if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+			t.Fatalf("warm ClientFor %d: %v", i, err)
+		}
+	}
+	after := runtime.NumGoroutine()
+	if after-before > 5 {
+		t.Fatalf("goroutines grew by %d during a slow refresh, want ≤ 5 (one refresh per host)", after-before)
+	}
+	store.setGate(nil)
+	close(gate)
+	// Let the refresh finish so it doesn't leak into other tests.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, loaded := r.refreshing.Load("host-a"); !loaded {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("refresh goroutine never finished")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
