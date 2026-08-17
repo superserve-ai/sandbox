@@ -1366,32 +1366,6 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "Stripe webhook payload is missing id or type", http.StatusBadRequest)
 		return
 	}
-	if isStripeMeterErrorEvent(event.Type) && len(bytes.TrimSpace(event.Data.Object)) == 0 {
-		retriever, ok := h.Stripe.(stripeEventRetriever)
-		if !ok {
-			respondErrorMsg(c, "service_unavailable", "Stripe event retrieval is not configured", http.StatusServiceUnavailable)
-			return
-		}
-		fullEvent, err := retriever.RetrieveEvent(c.Request.Context(), event.ID)
-		if err != nil {
-			log.Error().Err(err).Str("event_id", event.ID).Msg("retrieve Stripe thin event failed")
-			respondError(c, ErrInternal)
-			return
-		}
-		var retrieved struct {
-			Data json.RawMessage `json:"data"`
-		}
-		if err := json.Unmarshal(fullEvent, &retrieved); err != nil || len(bytes.TrimSpace(retrieved.Data)) == 0 {
-			if err == nil {
-				err = errors.New("Stripe thin event response has no data")
-			}
-			log.Error().Err(err).Str("event_id", event.ID).Msg("decode Stripe thin event failed")
-			respondError(c, ErrInternal)
-			return
-		}
-		event.Data.Object = retrieved.Data
-	}
-
 	if h.Pool == nil {
 		respondErrorMsg(c, "service_unavailable", "billing transactions are not configured", http.StatusServiceUnavailable)
 		return
@@ -1428,6 +1402,11 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 					return
 				}
 				c.JSON(http.StatusOK, gin.H{"status": "duplicate"})
+				return
+			}
+			if err := h.expandStripeThinMeterEvent(c.Request.Context(), &event); err != nil {
+				log.Error().Err(err).Str("event_id", event.ID).Msg("retrieve Stripe thin event failed")
+				respondError(c, ErrInternal)
 				return
 			}
 			if err := h.processStripeWebhookEvent(c.Request.Context(), q, event); err != nil {
@@ -1467,6 +1446,11 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 		return
 	}
 	_ = row
+	if err := h.expandStripeThinMeterEvent(c.Request.Context(), &event); err != nil {
+		log.Error().Err(err).Str("event_id", event.ID).Msg("retrieve Stripe thin event failed")
+		respondError(c, ErrInternal)
+		return
+	}
 
 	if err := h.processStripeWebhookEvent(c.Request.Context(), q, event); err != nil {
 		msg := err.Error()
@@ -1498,6 +1482,31 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *Handlers) expandStripeThinMeterEvent(ctx context.Context, event *stripeEventEnvelope) error {
+	if !isStripeMeterErrorEvent(event.Type) || len(bytes.TrimSpace(event.Data.Object)) != 0 {
+		return nil
+	}
+	retriever, ok := h.Stripe.(stripeEventRetriever)
+	if !ok {
+		return errors.New("Stripe event retrieval is not configured")
+	}
+	fullEvent, err := retriever.RetrieveEvent(ctx, event.ID)
+	if err != nil {
+		return err
+	}
+	var retrieved struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(fullEvent, &retrieved); err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(retrieved.Data)) == 0 {
+		return errors.New("Stripe thin event response has no data")
+	}
+	event.Data.Object = retrieved.Data
+	return nil
 }
 
 func isStripeMeterErrorEvent(eventType string) bool {
