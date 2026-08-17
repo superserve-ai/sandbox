@@ -1624,7 +1624,10 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 					Status: "failed",
 					Error:  stringPtr(errMsg),
 				})
-				return err
+				if err != nil {
+					return err
+				}
+				return fmt.Errorf("stripe meter error arrived after billing period finalization")
 			}
 			return fmt.Errorf("stripe meter error has no matching finalized export")
 		}
