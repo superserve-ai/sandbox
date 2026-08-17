@@ -1,0 +1,39 @@
+[Unit]
+Description=Superserve vmd generation %i
+After=network-online.target superserve-vmd-gateway.service superserve-vms.service
+Wants=network-online.target superserve-vms.service
+Requires=superserve-vmd-gateway.service
+
+# A vmd generation. It serves control-plane gRPC and the resolver on private
+# unix sockets under /run/vmd (the gateway routes the public ports to them), and
+# takes the single-writer host lease before mutating any host state — so at most
+# one generation is ever the writer. Type=notify: systemd reports the unit
+# active only once vmd has finished startup and called sd_notify READY, not when
+# the process forks. The handoff drives start/stop; generations are not enabled
+# at boot, and a generation is never auto-restarted (Restart=no) so a crashed
+# one does not race the next for the lease.
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/bin/vmd
+Environment=VMD_GENERATION_ID=%i
+Environment=VMD_PRIVATE_SOCKET=/run/vmd/gen-%i-grpc.sock
+Environment=VMD_RESOLVER_SOCKET=/run/vmd/gen-%i-resolver.sock
+EnvironmentFile=/etc/sandbox/vmd.env
+
+# Signal only the main process, never the cgroup: VMs run under sandboxes.slice
+# / superserve-vms.service and must survive a generation swap.
+KillMode=process
+Delegate=yes
+Restart=no
+
+# Above the daemon's own bounded-shutdown proven maximum, so systemd force-kills
+# a generation that violates its shutdown contract and the kernel then releases
+# the writer lease for the next one.
+TimeoutStopSec=45
+
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vmd-%i

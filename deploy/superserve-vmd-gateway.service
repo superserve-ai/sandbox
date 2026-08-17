@@ -1,0 +1,27 @@
+[Unit]
+Description=Superserve vmd gateway (stable front for the control-plane and resolver ports)
+After=network-online.target
+Wants=network-online.target
+
+# The gateway owns the public ports for the life of the host and routes them to
+# whichever vmd generation currently holds the writer lease, over that
+# generation's private unix sockets under /run/vmd. It is the one unit that must
+# not blue-green: it stays up across generation cutovers so client connections
+# and the kernel listen sockets survive a deploy. RuntimeDirectoryPreserve keeps
+# /run/vmd (and the generation sockets in it) across a gateway restart.
+
+[Service]
+ExecStart=/usr/local/bin/vmd-gateway \
+  --grpc-addr=:50051 \
+  --resolver-addr=127.0.0.1:9090 \
+  --control-sock=/run/vmd/gateway-control.sock
+Restart=always
+RestartSec=1
+RuntimeDirectory=vmd
+RuntimeDirectoryPreserve=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vmd-gateway
+
+[Install]
+WantedBy=multi-user.target
