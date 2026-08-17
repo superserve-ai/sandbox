@@ -105,7 +105,11 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 // returning or caching the just-invalidated address. Concurrent callers for
 // one host share a single resolution.
 func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.Client, error) {
-	v, err, _ := r.resolve.Do(hostID, func() (any, error) {
+	// DoChan rather than Do: the shared resolution keeps running on its
+	// detached context and still fills the cache, but each caller waits only
+	// as long as its own request lives — a canceled create/resume stops
+	// holding its handler goroutine here.
+	ch := r.resolve.DoChan(hostID, func() (any, error) {
 		// Detached context: singleflight followers share the leader's
 		// result, so the leader's per-request cancellation must not decide
 		// the resolution for everyone behind it.
@@ -198,11 +202,16 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 		}
 		return nil, fmt.Errorf("host %q address changed repeatedly during resolution; retry", hostID)
 	})
-	if err != nil {
-		return nil, err
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		c, _ := res.Val.(vmdclient.Client) // comma-ok: a nil client stays a plain nil
+		return c, nil
 	}
-	c, _ := v.(vmdclient.Client) // comma-ok: a nil client stays a plain nil
-	return c, nil
 }
 
 // Invalidate drops the cached client for hostID so the next ClientFor

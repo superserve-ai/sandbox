@@ -403,3 +403,45 @@ func TestClientForFailsClosedWhenNewAddressUndialable(t *testing.T) {
 		t.Fatalf("dials = %d, want 3 (initial, failed re-dial, recovery)", got)
 	}
 }
+
+// A caller whose request is canceled must stop waiting for a slow
+// resolution immediately; the shared resolution finishes on its detached
+// context and still fills the cache for the callers that follow.
+func TestClientForCanceledCallerStopsWaiting(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	gate := make(chan struct{})
+	store.setGate(gate) // hold the row read open: resolution is slow
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(ctx, "host-a")
+		done <- err
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("canceled caller got a client, want context error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled caller still waiting on the shared resolution")
+	}
+
+	// The abandoned resolution completes and caches; the next caller is
+	// served without a new resolution.
+	store.setGate(nil)
+	close(gate)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("resolution never completed after the caller abandoned it")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
