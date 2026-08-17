@@ -1956,6 +1956,10 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			log.Warn().Err(err).
 				Int64("wait_boxd_ms", time.Since(probeStart).Milliseconds()).
 				Msg("boxd not reachable after resume")
+			// Emit the timeout sample too: dropping it would censor exactly
+			// the exec-unavailable incidents this series exists to reveal —
+			// they'd appear as missing observations instead of a ~30s mode.
+			m.recordPhases("resume", "", map[string]time.Duration{"wait_boxd": time.Since(probeStart)})
 			return
 		}
 		log.Info().
