@@ -76,7 +76,13 @@ func main() {
 			log.Error().Err(rerr).Msg("otel metrics init failed; proxy metrics disabled")
 		} else {
 			proxyHandler.WithTelemetry(rec)
-			defer func() { _ = rec.Shutdown(context.Background()) }()
+			defer func() {
+				// Bounded: a stalled collector must not hang proxy restarts
+				// on the final flush.
+				flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = rec.Shutdown(flushCtx)
+			}()
 			log.Info().Msg("otel metrics enabled")
 		}
 	}

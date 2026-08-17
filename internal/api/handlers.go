@@ -2065,6 +2065,39 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Select a host for this sandbox.
 	var hostID string
+	var tVmdStart, tVmdEnd, tInsertStart, tInsertEnd, tInsertReceive, tPostDone time.Time
+	// Deferred so failed and timed-out creates land in the phase histograms
+	// too — a success-only emission makes the distributions look healthier
+	// than the transition series. Stages that never ran stay absent; a vmd
+	// stage that errored before its end-stamp reports its elapsed time.
+	defer func() {
+		phases := map[string]time.Duration{
+			"auth":  time.Duration(c.GetInt64("auth_ms")) * time.Millisecond,
+			"total": time.Since(tStart),
+		}
+		if !tLookupDone.IsZero() {
+			phases["lookup"] = tLookupDone.Sub(tStart)
+			if !tVmdStart.IsZero() {
+				phases["sched"] = tVmdStart.Sub(tLookupDone)
+			}
+		}
+		switch {
+		case !tVmdEnd.IsZero():
+			phases["vmd"] = tVmdEnd.Sub(tVmdStart)
+		case !tVmdStart.IsZero():
+			phases["vmd"] = time.Since(tVmdStart)
+		}
+		if !tInsertStart.IsZero() && !tInsertEnd.IsZero() {
+			phases["insert"] = tInsertEnd.Sub(tInsertStart)
+		}
+		if !tVmdEnd.IsZero() && !tInsertReceive.IsZero() {
+			phases["insert_wait"] = tInsertReceive.Sub(tVmdEnd)
+		}
+		if !tInsertReceive.IsZero() && !tPostDone.IsZero() {
+			phases["post"] = tPostDone.Sub(tInsertReceive)
+		}
+		RecordLatencyPhases(c.Request.Context(), "create", hostID, phases)
+	}()
 	requiredCapabilities := []string{preview.HostCapabilityPorts}
 	if previewAccess == preview.AccessPrivate {
 		requiredCapabilities = previewBrowserCapabilities()
@@ -2242,7 +2275,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return db.Sandbox(row), err
 	}
 
-	var tInsertStart, tInsertEnd time.Time
 	go func() {
 		tInsertStart = time.Now()
 		// Quota is enforced by the sandbox_quota_on_insert trigger.
@@ -2261,7 +2293,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// returns its source IP. For sandboxes with secrets, a follow-up
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
-	tVmdStart := time.Now()
+	tVmdStart = time.Now()
 	// The closure runs synchronously inside retryTransientBoot; a retry
 	// overwrites the capture with the attempt that produced the returned VM.
 	var previewProtocol string
@@ -2270,7 +2302,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		previewProtocol = protocol
 		return ip, vcpu, memMiB, err
 	})
-	tVmdEnd := time.Now()
+	tVmdEnd = time.Now()
 	if vmdErr != nil {
 		// A failed boot should stop the detached insert from materializing a row
 		// after the VM path has already given up.
@@ -2280,7 +2312,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).
 	insertRes := <-insertCh
-	tInsertReceive := time.Now()
+	tInsertReceive = time.Now()
 	sandbox := insertRes.sandbox
 	dbErr := insertRes.err
 
@@ -2586,7 +2618,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("failed to apply network rules at creation")
 		}
 	}
-	tPostDone := time.Now()
+	tPostDone = time.Now()
 
 	var createdMeta []byte
 	if fromTemplateName != "" {
@@ -2620,16 +2652,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		Int64("post_ms", tPostDone.Sub(tInsertReceive).Milliseconds()).
 		Int64("total_ms", tPostDone.Sub(tStart).Milliseconds()).
 		Msg("CreateSandbox phases")
-	RecordLatencyPhases(c.Request.Context(), "create", hostID, map[string]time.Duration{
-		"auth":        time.Duration(c.GetInt64("auth_ms")) * time.Millisecond,
-		"lookup":      tLookupDone.Sub(tStart),
-		"sched":       tVmdStart.Sub(tLookupDone),
-		"vmd":         tVmdEnd.Sub(tVmdStart),
-		"insert":      tInsertEnd.Sub(tInsertStart),
-		"insert_wait": tInsertReceive.Sub(tVmdEnd),
-		"post":        tPostDone.Sub(tInsertReceive),
-		"total":       tPostDone.Sub(tStart),
-	})
 	c.JSON(http.StatusCreated, resp)
 }
 

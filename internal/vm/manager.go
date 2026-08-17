@@ -2784,9 +2784,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Bool("ok", attemptErr == nil).
 			Int("attempt", attempt).
 			Msg("snapshot loaded")
-		if attemptErr == nil {
-			m.recordPhases("restore", "", map[string]time.Duration{"load_snapshot": time.Since(tFcReady)})
-		}
+		// Failed attempts included: a slow failing load (tap-busy retry,
+		// terminal failure) must appear in the distribution, not vanish.
+		m.recordPhases("restore", "", map[string]time.Duration{"load_snapshot": time.Since(tFcReady)})
 		restoreErr = attemptErr
 
 		if restoreErr == nil {
