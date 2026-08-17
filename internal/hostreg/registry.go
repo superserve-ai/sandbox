@@ -96,20 +96,42 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 // dispatch on any read blip would trade it for routine unavailability.
 func (r *Registry) verifyAndGet(ctx context.Context, hostID string, stale entry) (vmdclient.Client, error) {
 	v, err, _ := r.verify.Do(hostID, func() (any, error) {
+		// Detached context: singleflight followers share the leader's
+		// result, so the leader's per-request cancellation must not decide
+		// the verification for everyone behind it.
+		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+
 		// Bounded retry: if an invalidation (an address reclaim landing on
 		// this replica) races the verification, the result is discarded and
 		// the row re-read, so a verification started against an older row
 		// version can never resurrect an invalidated address as verified.
+		var lastErr error
 		for attempt := 0; attempt < 2; attempt++ {
 			r.mu.RLock()
 			startGen := r.gens[hostID]
 			r.mu.RUnlock()
 
-			host, err := r.db.GetHost(ctx, hostID)
+			host, err := r.db.GetHost(vctx, hostID)
 			if err != nil {
-				log.Warn().Err(err).Str("host_id", hostID).
-					Msg("host address verification failed; dispatching via cached client")
-				return stale.client, nil
+				// Falling back to the cached client is only safe while the
+				// entry is demonstrably not invalidated: still present at
+				// the same address. An invalidated entry with an unreadable
+				// row retries, then fails closed — the invalidation had a
+				// reason, and dispatching past it risks the wrong machine.
+				r.mu.RLock()
+				e, ok := r.clients[hostID]
+				r.mu.RUnlock()
+				if ok && e.addr == stale.addr {
+					log.Warn().Err(err).Str("host_id", hostID).
+						Msg("host address verification failed; dispatching via cached client")
+					return stale.client, nil
+				}
+				if ok {
+					return e.client, nil // repopulated fresh by another path
+				}
+				lastErr = err
+				continue
 			}
 			if host.VmdAddr == stale.addr {
 				r.mu.Lock()
@@ -145,6 +167,9 @@ func (r *Registry) verifyAndGet(ctx context.Context, hostID string, stale entry)
 			r.clients[hostID] = entry{client: c, addr: host.VmdAddr, checkedAt: time.Now()}
 			r.mu.Unlock()
 			return c, nil
+		}
+		if lastErr != nil {
+			return nil, fmt.Errorf("verify host %q after invalidation: %w", hostID, lastErr)
 		}
 		return nil, fmt.Errorf("host %q address changed repeatedly during verification; retry", hostID)
 	})

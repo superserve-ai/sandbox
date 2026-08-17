@@ -16,13 +16,26 @@ import (
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-// hostDB serves GetHost with a switchable vmd_addr.
+// hostDB serves GetHost with a switchable vmd_addr, optional read failure,
+// and an optional gate that holds reads open while a test interleaves.
 type hostDB struct {
-	mu   sync.Mutex
-	addr string
+	mu       sync.Mutex
+	addr     string
+	failRead bool
+	gate     chan struct{} // non-nil: QueryRow waits until closed
 }
 
 func (h *hostDB) setAddr(a string) { h.mu.Lock(); h.addr = a; h.mu.Unlock() }
+func (h *hostDB) setFailRead(v bool) {
+	h.mu.Lock()
+	h.failRead = v
+	h.mu.Unlock()
+}
+func (h *hostDB) setGate(c chan struct{}) { h.mu.Lock(); h.gate = c; h.mu.Unlock() }
+
+type errRow struct{ err error }
+
+func (r errRow) Scan(...any) error { return r.err }
 
 func (h *hostDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec")
@@ -32,8 +45,14 @@ func (h *hostDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
 }
 func (h *hostDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
 	h.mu.Lock()
-	addr := h.addr
+	addr, fail, gate := h.addr, h.failRead, h.gate
 	h.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	if fail {
+		return errRow{err: fmt.Errorf("connection reset")}
+	}
 	id := args[0].(string)
 	return hostScanRow(func(dest ...any) error {
 		*dest[0].(*string) = id
@@ -110,6 +129,72 @@ func TestClientForKeepsClientWhenAddressUnchanged(t *testing.T) {
 	}
 	if dials.Load() != 1 {
 		t.Fatalf("dials = %d, want 1 (verification must not re-dial an unchanged address)", dials.Load())
+	}
+}
+
+// A transient read failure with NO invalidation keeps the availability
+// softness: the still-cached client is returned rather than failing the op.
+func TestClientForServesCachedOnReadBlipWithoutInvalidation(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	store.setFailRead(true)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("read blip must serve the cached client, got error: %v", err)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+}
+
+// A read failure AFTER the entry was invalidated must fail closed: the
+// invalidation had a reason (an address reclaim), and dispatching the
+// pre-invalidation client past it risks the machine that lost the identity.
+func TestClientForFailsClosedWhenInvalidatedAndRowUnreadable(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	gate := make(chan struct{})
+	store.setGate(gate)
+	store.setFailRead(true)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		done <- err
+	}()
+	// The verification read is in flight (or about to be); land the
+	// invalidation, then let the read fail.
+	time.Sleep(2 * time.Millisecond)
+	r.Invalidate("host-a")
+	close(gate)
+
+	if err := <-done; err == nil {
+		t.Fatal("invalidated entry with unreadable row must fail closed, got a client")
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1 (nothing new may be dialed through a failed verification)", dials.Load())
 	}
 }
 
