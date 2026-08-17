@@ -81,6 +81,16 @@ func (c *Controller) Current() Generation {
 	return c.current
 }
 
+// SetCurrent overrides the controller's notion of the live generation. The
+// operator-facing set-active escape hatch calls this so a later deploy's
+// compare-and-swap and its drain target reflect the generation actually routed
+// to, rather than a stale one.
+func (c *Controller) SetCurrent(gen Generation) {
+	c.mu.Lock()
+	c.current = gen
+	c.mu.Unlock()
+}
+
 // Deploy performs one cutover from expectedCurrent to next. It is:
 //   - serialized: a second concurrent Deploy returns ErrDeployInProgress;
 //   - idempotent: if next is already live, it returns nil without acting;
@@ -125,20 +135,24 @@ func (c *Controller) run(ctx context.Context, prev, next Generation) error {
 		return fmt.Errorf("await ready %s: %w", next.ID, err)
 	}
 
-	// 2. Drain the old generation and let it exit, releasing the writer lease.
-	//    This happens BEFORE the quiesce hold: the gateway still routes to the
-	//    old generation while it drains, so its gRPC answers retryable
-	//    Unavailable (the control plane retries) and the resolver keeps serving
-	//    — the quiesce window stays as short as activation, not the whole drain.
+	// 2. Gateway begins the admission hold BEFORE the old generation is
+	//    stopped. Otherwise new requests keep routing to the old generation
+	//    while systemctl stop is closing its listeners — gRPC calls hit a dead
+	//    upstream and resolver requests get a 502 from the reverse proxy. With
+	//    the hold in place first, gRPC is refused with retryable Unavailable
+	//    (the control plane retries) and resolver requests wait for resume, so
+	//    the whole drain+activate window is failure-free. Keeping it short is a
+	//    function of drain speed (bounded generation shutdown).
+	c.act.Quiesce(true)
+
+	// 3. Drain the old generation and let it exit, releasing the writer lease.
 	if prev.ID != "" {
 		if err := c.act.DrainAndStop(ctx, prev); err != nil {
 			_ = c.act.DrainAndStop(ctx, next) // clean up the unused standby
+			c.act.Quiesce(false)
 			return fmt.Errorf("drain %s: %w", prev.ID, err)
 		}
 	}
-
-	// 3. Gateway begins the bounded admission hold for the brief switch window.
-	c.act.Quiesce(true)
 
 	// 4. New generation acquires the lease, builds its active runtime,
 	//    revalidates host state, and becomes ready. On failure, roll back.

@@ -145,11 +145,17 @@ def run_or_die(cmd, context):
 # after extraction.
 BUNDLE_FILES = [
     "bin/vmd",
+    "bin/vmd-gateway",
     "bin/boxd",
     "bin/template-builder",
     "bin/secretsproxy",
     "deploy/superserve-vmd.service",
     "deploy/superserve-vmd.socket",
+    "deploy/superserve-vmd-gateway.service",
+    "deploy/superserve-vmd@.service",
+    "deploy/superserve-vmd-legacy-guard.conf",
+    "deploy/vmd_handoff.py",
+    "deploy/vmd-gateway-bootstrap.sh",
     "deploy/superserve-vms.service",
     "deploy/vmd-rollback-guard",
     "deploy/superserve-vmd-rollback-guard.conf",
@@ -417,6 +423,23 @@ def main() -> int:
             # Install vmd + template-builder binaries.
             sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd
             sudo install -m 0755 {extract_dir}/bin/template-builder {install_dir}/template-builder
+
+            # Install the blue-green gateway artifacts INERTLY: the gateway
+            # binary, a version-tagged vmd for generation units (so a generation
+            # runs its own binary and rollback runs the prior one), the units,
+            # the legacy start guard, and the handoff trigger. Nothing is
+            # enabled or started here — the per-host bootstrap activates
+            # blue-green; the legacy startup sequence below is unchanged. On a
+            # host not yet bootstrapped, the guard drop-in is a no-op because its
+            # marker (/etc/sandbox/gateway-topology) does not exist.
+            sudo install -m 0755 {extract_dir}/bin/vmd-gateway {install_dir}/vmd-gateway
+            sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd-{sha}
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-gateway.service /etc/systemd/system/superserve-vmd-gateway.service
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd@.service /etc/systemd/system/superserve-vmd@.service
+            sudo install -d /etc/systemd/system/superserve-vmd.service.d
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-legacy-guard.conf /etc/systemd/system/superserve-vmd.service.d/30-legacy-guard.conf
+            sudo install -m 0755 {extract_dir}/deploy/vmd_handoff.py {install_dir}/vmd-handoff
+            sudo install -m 0755 {extract_dir}/deploy/vmd-gateway-bootstrap.sh {install_dir}/vmd-gateway-bootstrap
 
             # Install systemd units. A running socket unit keeps its
             # originally-bound fds across daemon-reload + start (start is a

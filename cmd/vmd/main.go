@@ -1530,7 +1530,17 @@ func main() {
 	cancel()                // propagate cancellation to any service still blocked on ctx
 
 	// ---- Run closers in LIFO order with a hard deadline ----
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// A gateway-fronted generation drains fast on purpose: during a cutover the
+	// gateway holds new requests while this old generation stops, so a long
+	// graceful drain would stretch that hold (and the resolver's bounded wait).
+	// New RPCs are already refused (startup gate / the gateway hold), so a short
+	// grace for in-flight calls, then a forced stop, keeps the switch window
+	// small. Legacy startup keeps the full 30s.
+	shutdownGrace := 30 * time.Second
+	if genPrivateSocket != "" {
+		shutdownGrace = 3 * time.Second
+	}
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer shutdownCancel()
 	lc.shutdown(shutdownCtx)
 	// Hold the writer lease until the process is truly done: an os.File is

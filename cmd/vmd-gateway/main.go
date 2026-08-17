@@ -256,6 +256,11 @@ func (cs *controlState) apply(fields []string) string {
 		up := gateway.Upstream{Generation: fields[1], GRPCSocket: fields[2], ResolverSocket: fields[3]}
 		cs.gw.SetActive(up)
 		persistActive(cs.statePath, up)
+		if cs.ctrl != nil {
+			// Keep controller state in sync so a later deploy's CAS + drain
+			// target reflect what is actually routed to.
+			cs.ctrl.SetCurrent(handoff.Generation{ID: fields[1], GRPCSocket: fields[2], ResolverSocket: fields[3]})
+		}
 		return "OK"
 	case "quiesce":
 		if len(fields) != 2 || (fields[1] != "on" && fields[1] != "off") {
