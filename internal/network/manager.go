@@ -374,6 +374,9 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 	tBuild := time.Now()
 	info, _, err := m.setupSlot(ctx, idx)
 	if err != nil {
+		// A failed build can be the slowest sample; emit it or the histogram
+		// censors exactly the setups worth investigating.
+		m.recordNetPhase("on_demand_setup", time.Since(tBuild))
 		// Build failed — release the index (we are its sole owner) so it isn't
 		// leaked. releaseIfOwned keeps it correct even if state moved under us.
 		m.releaseIfOwned(idx, vmID)
