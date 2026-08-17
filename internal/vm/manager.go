@@ -2507,22 +2507,36 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// the in-flight one) so failed attempts — which can consume most of the
 	// restore deadline — form the phase tails instead of vanishing.
 	restorePhasesRecorded := false
-	var tDiskReady, tNetReady, tFcReady time.Time
+	var attempt int
+	var tDiskReady, tNetReady, tFcReady, tAttemptStart time.Time
 	defer func() {
 		if restorePhasesRecorded {
 			return
 		}
-		phases := map[string]time.Duration{"entry_to_sem": tSemAcquired.Sub(tEntry)}
-		switch {
-		case tDiskReady.IsZero():
-			phases["sem_to_disk"] = time.Since(tSemAcquired)
-		case tNetReady.IsZero():
-			phases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
-			phases["disk_to_net"] = time.Since(tDiskReady)
-		default:
-			phases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
-			phases["disk_to_net"] = tNetReady.Sub(tDiskReady)
-			phases["net_to_fc"] = time.Since(tNetReady)
+		phases := map[string]time.Duration{}
+		if attempt <= 1 {
+			phases["entry_to_sem"] = tSemAcquired.Sub(tEntry)
+			switch {
+			case tDiskReady.IsZero():
+				phases["sem_to_disk"] = time.Since(tSemAcquired)
+			case tNetReady.IsZero():
+				phases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
+				phases["disk_to_net"] = time.Since(tDiskReady)
+			default:
+				phases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
+				phases["disk_to_net"] = tNetReady.Sub(tDiskReady)
+				phases["net_to_fc"] = time.Since(tNetReady)
+			}
+		} else {
+			// Retry attempt died mid-setup: the pre-loop phases went out with
+			// attempt 1, so measure this attempt's setup from its own start.
+			switch {
+			case tNetReady.IsZero():
+				phases["disk_to_net"] = time.Since(tAttemptStart)
+			default:
+				phases["disk_to_net"] = tNetReady.Sub(tAttemptStart)
+				phases["net_to_fc"] = time.Since(tNetReady)
+			}
 		}
 		m.recordPhases("restore", "", phases)
 	}()
@@ -2675,8 +2689,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// retried on a different slot; the failed slot is torn down. inPlace resumes
 	// reuse a specific VM's own slot and never retry.
 	const maxRestoreAttempts = 3
-	for attempt := 1; ; attempt++ {
-		tAttemptStart := time.Now()
+	for attempt = 1; ; attempt++ {
+		tAttemptStart = time.Now()
+		if attempt > 1 {
+			restorePhasesRecorded = false
+			tNetReady, tFcReady = time.Time{}, time.Time{}
+		}
 		var tapDevice, macAddr, nsName string
 		hostIP = ""
 		if inPlace {
@@ -2768,15 +2786,16 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Float64("mem_psi_avg10", memPSI).
 			Int("attempt", attempt).
 			Msg("restoring snapshot")
-		if attempt == 1 {
-			restorePhasesRecorded = true
-			m.recordPhases("restore", "", map[string]time.Duration{
-				"entry_to_sem": tSemAcquired.Sub(tEntry),
-				"sem_to_disk":  tDiskReady.Sub(tSemAcquired),
-				"disk_to_net":  tNetReady.Sub(netBase),
-				"net_to_fc":    tFcReady.Sub(tNetReady),
-			})
+		restorePhasesRecorded = true
+		attemptPhases := map[string]time.Duration{
+			"disk_to_net": tNetReady.Sub(netBase),
+			"net_to_fc":   tFcReady.Sub(tNetReady),
 		}
+		if attempt == 1 {
+			attemptPhases["entry_to_sem"] = tSemAcquired.Sub(tEntry)
+			attemptPhases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
+		}
+		m.recordPhases("restore", "", attemptPhases)
 
 		// attemptErr is this attempt's result alone; it lands in restoreErr after
 		// the load log so a stale prior-attempt error can never leak into the
@@ -2956,6 +2975,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// evicted) legitimately needs more than a warm same-host resume, and a
 	// timeout here is destructive — the error path below tears down the VM.
 	if err := m.waitForBoxd(ctx, hostIP, 30*time.Second); err != nil {
+		// Emit the exhausted readiness wait immediately, before teardown, so
+		// the sample measures the probe (not unit stop + resource release +
+		// persist join) and the concurrent-destroy return below can't skip it.
+		m.recordPhases("restore", "", map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
 		// Teardown first — none of it touches BoltDB, so a stalled persist
 		// cannot keep the failed restore's unit and network alive.
 		m.stopUnitDuringRestoreError(vmID)
@@ -2977,9 +3000,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 		}
 		m.setStatus(vmID, StatusError)
-		// Emit the exhausted readiness wait: cold/unhealthy restores must
-		// form the wait_boxd tail, not disappear from it.
-		m.recordPhases("restore", "", map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
 	tBoxdReady := time.Now()
