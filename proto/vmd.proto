@@ -66,6 +66,12 @@ service VMDaemon {
   // SetupNetwork configures networking for a VM (TAP device, NAT, IP allocation).
   rpc SetupNetwork(SetupNetworkRequest) returns (SetupNetworkResponse);
 
+  // ReviveVM cold-boots a sandbox whose VM died, from a salvaged copy of
+  // its own disk. Operator recovery surface: the salvaged image already
+  // carries the sandbox's identity, so nothing is re-injected, and any
+  // residue of the dead VM is force-torn-down first.
+  rpc ReviveVM(ReviveVMRequest) returns (ReviveVMResponse);
+
   // UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
   rpc UpdateSandboxNetwork(UpdateSandboxNetworkRequest) returns (UpdateSandboxNetworkResponse);
 
@@ -263,6 +269,59 @@ message DestroyVMResponse {
 // ---------------------------------------------------------------------------
 // PauseVM (sleep — snapshot then stop)
 // ---------------------------------------------------------------------------
+
+message ReviveVMRequest {
+  string vm_id = 1;
+  // Absolute path on the host to the salvaged disk image. Copied, never
+  // mounted in place: a failed boot leaves the salvage pristine.
+  string disk_path = 2;
+  uint32 vcpu = 3;
+  uint32 mem_mib = 4;
+  // Egress policy, applied before revival reports success: a sandbox
+  // with allow or deny rules must not come back running open. Same
+  // ownership as ResumeVM's rules: the control plane knows them, the
+  // host does not.
+  // Base image for overlay-mode salvages: the sparse overlay's holes
+  // are windows to this shared read-only base, and booting the overlay
+  // standalone would corrupt the guest. Empty defaults to the zombie's
+  // recorded base; explicitly empty with no record boots standalone.
+  string base_path = 8;
+  repeated string allowed_cidrs = 5;
+  repeated string denied_cidrs = 6;
+  repeated string allowed_domains = 7;
+  // Sandbox configuration to re-inject after the guest is ready: a cold
+  // boot starts boxd with an empty context, and unlike snapshot resume
+  // no in-memory init state survives, so env and secret bindings must
+  // be delivered again. Same semantics as InjectSandboxEnv; when both
+  // are empty the caller owns re-injection before activating the row
+  // (the operator CLI prints that obligation per revived sandbox).
+  map<string, string> env_vars = 9;
+  string secrets_jwt = 10;
+  // The salvage is a standalone or flattened image: boot it without any
+  // base, ignoring the base recorded on the sandbox. Needed because an
+  // empty base_path means "use the recorded base", and a flattened
+  // image's sparse zero regions must not read through to the old base.
+  bool standalone_disk = 11;
+  // Operator attestation that this sandbox belongs to this host even
+  // though no durable record remains (startup stale cleanup deletes
+  // dead records, exactly the state a to-be-revived zombie is in after
+  // a vmd restart). Requires explicit vcpu, mem_mib, and a base
+  // disposition (base_path or standalone_disk): there is no record to
+  // default from. Ownership, preview policy, env, secrets, and egress
+  // all re-establish through the control plane before the row flips.
+  bool allow_recordless = 12;
+  // Ownership for the synthesized record: required whenever
+  // allow_recordless is set (there is no other source), and threaded
+  // straight to data-plane usage attribution.
+  string team_id = 13;
+  string owner_id = 14;
+}
+
+message ReviveVMResponse {
+  // The per-VM copy the revived VM actually boots from.
+  string disk_path = 1;
+  string host_ip = 2;
+}
 
 message PauseVMRequest {
   string vm_id = 1;

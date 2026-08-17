@@ -344,9 +344,13 @@ jobs:
           # share one bandwidth cap (task throughput rises, egress does
           # not), and the incremental host cost is one extra hash/read
           # stream on a 192-core metal host with a 12-drive array.
-          # Held at 2 until the sandboxes.slice weighting lands; raise
-          # further only after it. Rollback is removing this line.
-          BACKUP_UPLOAD_CONCURRENCY: "2"
+          # Sized from measured rates with the sandboxes.slice weighting
+          # live: arrivals peak ~1.2k generations/h while each worker
+          # drains ~215/h, so 2 treads water at peak and 6 clears the
+          # backlog (~1.3k/h) with margin. Aggregate egress stays under
+          # the shared bandwidth cap (~22 Mbit/s observed at 2 workers,
+          # cap 100). Rollback is lowering the number.
+          BACKUP_UPLOAD_CONCURRENCY: "6"
           # Enables vmd's backup metrics exporter (host-local collector);
           # the cell's backup alert policies, including backup-disabled,
           # cannot fire without these series.

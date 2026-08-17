@@ -46,23 +46,17 @@ locals {
     application        = "sandbox-host"
   })
 
-  # The host_id that actually tags vmd's own metrics: its HOST_ID runtime env,
-  # which is ALSO its identity in the host table. Not derivable from the
-  # instance name — this cell's row predates the convention of naming rows
-  # after the instance, and HOST_ID must never be changed to match, because
-  # heartbeats and reconciler scoping key on the existing row. An alert filter
-  # that guesses the instance name selects no series and never fires, which
-  # looks identical to a healthy host.
+  # The host_id that tags vmd's own metrics and scopes the reconciler: its
+  # HOST_ID runtime env, which is ALSO its identity in the host table. The
+  # cell's sole host derives it from the instance name (its deployed HOST_ID),
+  # so DEFAULT_HOST_ID and every alert filter match the live host exactly.
   #
   # Verify against the host before changing: grep '^HOST_ID=' /etc/sandbox/vmd.env
-  #
-  # Deliberately NOT the instance name, and the two must not be merged: the
-  # host-local collector stamps its own HOST_ID (the instance name, rewritten
-  # on every collector deploy) onto the hostmetrics pipeline, so host-level
-  # series like filesystem utilization carry the instance name while vmd's own
-  # OTLP series carry this. One machine, two host_id values, depending on which
-  # process emitted the metric.
-  metrics_host_id = "default"
+  metrics_host_id = module.sandbox_host_b.instance_name
+
+  # Control-plane address + alert identity for the cell's host.
+  active_vmd_ip    = module.sandbox_host_b.internal_ip
+  active_host_name = module.sandbox_host_b.instance_name
 }
 
 module "network" {
@@ -169,9 +163,16 @@ module "api" {
 
   cpu_limit    = "2"
   memory_limit = "1Gi"
-  # max_instances * DB_MAX_CONNS must stay under the pooler's client-connection
-  # limit; raising either means re-checking that product. Declared rather than
-  # left to drift: the module's ignore_changes is ineffective for the v2 resource.
+  # Pooler client budget is 1,000 (XL tier), and the binding case is a
+  # deploy under full load: max_instances applies per revision and Cloud Run
+  # can overlap the old and new revisions completely, so the ceiling is
+  # 60 instances x DB_MAX_CONNS. At 15 that is 900, plus explicitly capped
+  # host services (vmd 8, secretsproxy 8) and ops clients ~= 940 worst case.
+  # Any higher per-instance cap breaks that overlap math; burst headroom
+  # comes from fast queries and pool lifecycle bounds, not a larger cap.
+  # MaxConns is a cap, not a floor: idle instances hold ~MinIdleConns each,
+  # so realized usage sits far below the ceiling. Declared rather than left to drift: the
+  # module's ignore_changes is ineffective for the v2 resource.
   min_instances     = 10
   max_instances     = 30
   startup_cpu_boost = true
@@ -184,15 +185,18 @@ module "api" {
     SECRETS_SIGNING_KEY_ID = "v1"
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "15"
-    VMD_GRPC_ADDRESS       = format("%s:50051", module.sandbox_host.internal_ip)
-    KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+    VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
+    # The cell host's identity, alongside the address above. Same value as
+    # metrics_host_id.
+    DEFAULT_HOST_ID  = local.metrics_host_id
+    KMS_KEY_RESOURCE = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
 
     # Control-plane OTLP metrics export, mirroring the retired us-central1
     # primary. The host-local superserve-otel-collector receives OTLP on :4318
     # and forwards to Google Managed Prometheus; the use4 network already admits
     # the Cloud Run sender range to the host on 4317/4318 (allow_otel_ingress).
     OTEL_ENVIRONMENT            = local.environment
-    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${module.sandbox_host.internal_ip}:4318"
+    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${local.active_vmd_ip}:4318"
     OTEL_EXPORT_INTERVAL        = "15s"
     OTEL_METRICS_ENABLED        = "true"
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
@@ -275,26 +279,23 @@ module "cloud_ids" {
   labels                     = local.common_labels
 }
 
-module "sandbox_host" {
+# The cell's sole sandbox/VMD host. Distinct identity (its HOST_ID is its
+# instance name) carried over from when it was provisioned as the standby.
+# It replaced the original c4 host, whose module was removed after cutover.
+module "sandbox_host_b" {
   source = "../../../modules/sandbox-host"
 
   project_id    = local.project_id
   environment   = local.environment
   region        = local.region
   zone          = local.zone
-  instance_name = "superserve-vmd-${local.resource_suffix}"
-  machine_type  = var.machine_type
-  subnet        = module.network.subnetwork_self_link
-  internal_ip   = var.host_internal_ip
-  tags          = ["vmd-use4"]
+  instance_name = "superserve-vmd-${local.resource_suffix}-2"
+  # The z3 replacement for the retired, maintenance-prone c4 host.
+  machine_type = "z3-highmem-192-highlssd-metal"
+  subnet       = module.network.subnetwork_self_link
+  internal_ip  = "10.2.0.3"
+  tags         = ["vmd-use4"]
 
-  # Declare the discovery labels CD and the scheduler key on (component=vmd,
-  # sandbox_role=vmd, ops-agent) — they were added out-of-band at cutover and
-  # `labels` is NOT in the module's ignore_changes, so declaring them keeps a
-  # later apply from stripping them. Values here match the LIVE host exactly so
-  # this stays a no-op adoption: sandbox_status is still "provisioning" live;
-  # flipping it to "ready" (to match the deployment-registry selector) is a
-  # separate, intentional change, not part of this import PR.
   labels = merge(local.sandbox_host_labels, {
     component                  = "vmd"
     sandbox_role               = "vmd"
@@ -306,37 +307,28 @@ module "sandbox_host" {
 
   service_account_email = data.google_service_account.api_runner.email
 
-  # Matches the live us-central1 prod host (Ubuntu 22.04 LTS), NOT this
-  # module's typical 24.04 default — the current prod host actually runs
-  # 22.04, and a host-OS kernel mismatch between hosts has been observed to
-  # break snapshot restore. Since this host must restore snapshots copied
-  # from us-central1, matching its OS/kernel family is the safe choice.
+  # 22.04 to match the primary and this cell's snapshot lineage (existing
+  # paused sandboxes and us-central1-seeded snapshots are 22.04-taken); a
+  # host-OS mismatch has been observed to break snapshot restore.
   boot_disk_image = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
 
-  # C4 (like Z3) has no Persistent Disk support — the boot disk must be a
-  # Hyperdisk type, or the instance insert is rejected.
+  # Metal machine types reject the API-default pd-standard boot disk.
   boot_disk_type = var.boot_disk_type
 
   can_ip_forward      = false
   on_host_maintenance = "TERMINATE"
 
-  reservation_name = var.reservation_name
+  # Targets a z3 reservation (see standby_reservation_name); null uses default
+  # affinity against a matching z3 reservation in the zone.
+  reservation_name = var.standby_reservation_name
 
-  # startup-script codifies the guest-DNS bootstrap (unbound + DoT to the
-  # Cloudflare Gateway). The live host was hand-staged, so this exists mainly
-  # for a clean rebuild — sandbox-host keeps `metadata` in ignore_changes, so
-  # adding it here does not perturb the running instance.
   metadata = {
     enable-osconfig = "TRUE"
     enable-oslogin  = "TRUE"
     startup-script = templatefile("${path.module}/../../../../deploy/unbound/unbound-bootstrap.sh.tftpl", {
-      # Guest network range allowed to query the resolver.
-      guest_cidr     = "10.11.0.0/16"
-      local_dns_port = "19053"
-      # Cloudflare Zero Trust Gateway DoT location endpoint.
-      dot_hostname = "j0mqwd9sm7.cloudflare-gateway.com"
-      # Anycast IPs the location endpoint resolves to (unbound needs an IP here,
-      # not a hostname). Matches the live host's unbound config, verified 2026-07-22.
+      guest_cidr         = "10.11.0.0/16"
+      local_dns_port     = "19053"
+      dot_hostname       = "j0mqwd9sm7.cloudflare-gateway.com"
       dot_upstream_addrs = ["162.159.36.5", "162.159.46.5"]
     })
   }
@@ -349,10 +341,10 @@ module "observability" {
   environment              = local.environment
   notification_channel_ids = var.notification_channel_ids
   compute_instance_cpu_alerts = {
-    sandbox_host = {
-      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
-      instance_name = module.sandbox_host.instance_name
-      instance_id   = module.sandbox_host.instance_id
+    sandbox_host_b = {
+      display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / CPU saturation"
+      instance_name = module.sandbox_host_b.instance_name
+      instance_id   = module.sandbox_host_b.instance_id
     }
   }
   # Backup pipeline alerts scoped to this cell's host via the host_id
@@ -363,7 +355,7 @@ module "observability" {
   # times/hour under the capped backoff), not on pause volume.
   backup_alerts = {
     host_id        = local.metrics_host_id
-    display_prefix = "Backup / ${module.sandbox_host.instance_name}"
+    display_prefix = "Backup / ${local.active_host_name}"
   }
   # Launch-path health for the same host: the pruned launcher mount namespace
   # being unavailable (VM starts fall back to walking the full host mount
@@ -379,20 +371,22 @@ module "observability" {
   # doing its job" — move them together with the ceiling or not at all.
   launch_path_alerts = {
     host_id        = local.metrics_host_id
-    display_prefix = "Launch path / ${module.sandbox_host.instance_name}"
+    display_prefix = "Launch path / ${local.active_host_name}"
   }
   # Root-filesystem (OS disk) utilization for the same host, scoped through
   # the same host_id label the backup metrics use. Module defaults: warn at
   # 85% sustained 30 minutes, page at 95%.
   host_disk_alerts = {
-    host_id        = module.sandbox_host.instance_name
-    display_prefix = "Infrastructure / ${module.sandbox_host.instance_name}"
+    host_id        = local.active_host_name
+    display_prefix = "Infrastructure / ${local.active_host_name}"
   }
   host_maintenance_event_alerts = {
-    sandbox_host = {
-      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / host maintenance event"
-      instance_name = module.sandbox_host.instance_name
-      instance_id   = module.sandbox_host.instance_id
+    # Fires when a maintenance window is scheduled on the host — the exact
+    # signal that motivated retiring the maintenance-prone c4.
+    sandbox_host_b = {
+      display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / host maintenance event"
+      instance_name = module.sandbox_host_b.instance_name
+      instance_id   = module.sandbox_host_b.instance_id
     }
   }
   labels = local.common_labels

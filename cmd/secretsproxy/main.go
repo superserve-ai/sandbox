@@ -458,7 +458,21 @@ func buildAuditSink(ctx context.Context, cfg *config) (secretsproxy.AuditSink, f
 		}
 		return nil, nil, fmt.Errorf("DATABASE_URL is required; set SECRETSPROXY_AUDIT_DISABLED=true to run without audit")
 	}
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse audit DB URL: %w", err)
+	}
+	// The pgxpool default is max(4, NumCPU), which scales with host cores and
+	// silently consumes the cell pooler's client-connection budget on large
+	// hosts. This pool only serves batched audit flushes (low concurrency by
+	// construction), so a small cap is enough. A ceiling, not a floor: an
+	// explicitly lower pool_max_conns in the URL stays in effect.
+	poolCfg.MaxConns = min(poolCfg.MaxConns, 8)
+	// URL-configured minima above the cap would make the config
+	// invalid and fail startup; lower them with it.
+	poolCfg.MinConns = min(poolCfg.MinConns, poolCfg.MaxConns)
+	poolCfg.MinIdleConns = min(poolCfg.MinIdleConns, poolCfg.MaxConns)
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to audit DB: %w", err)
 	}

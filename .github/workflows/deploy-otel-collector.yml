@@ -107,7 +107,11 @@ jobs:
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: us-west2
-          VMD_FILTER: labels.component=vmd AND labels.environment=production AND labels.region=us-west2
+          # sandbox_role remains vmd on both the active host and the cold
+          # standby, while component is intentionally moved during promotion.
+          # Provisioning both running hosts keeps the collector ready before
+          # active_sandbox_host routes control-plane OTLP traffic to standby.
+          VMD_FILTER: labels.sandbox_role=vmd AND labels.environment=production AND labels.region=us-west2
           OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
         run: |
           python3 .github/workflows/scripts/deploy-otel-collector.py

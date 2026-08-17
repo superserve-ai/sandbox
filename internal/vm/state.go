@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"path/filepath"
+	"strings"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -154,6 +154,15 @@ type VMRecord struct {
 	// and a resume relaunch verifies readiness synchronously before
 	// clearing it.
 	Unverified bool `json:"unverified,omitempty"`
+	// RevivalPending marks a record kept alive across a revival attempt:
+	// it is the retry's anchor (revive refuses unknown sandboxes), so
+	// startup stale cleanup must park it instead of deleting it.
+	RevivalPending bool `json:"revival_pending,omitempty"`
+	// RevivedDisk records the resolved salvage path a completed revival
+	// booted from: the idempotency witness that lets a retry of the same
+	// request (a lost RPC response, a failed post-commit injection)
+	// recognize the live VM as its own completed work.
+	RevivedDisk string `json:"revived_disk,omitempty"`
 	// TeardownPending mirrors VMInstance.TeardownPending: a non-empty value
 	// is an explicit, durable claim that this record's resources were
 	// deliberately retained after a failed op and the reconciler owns the
@@ -619,6 +628,8 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		MACAddress:                 inst.MACAddress,
 		Status:                     inst.Status,
 		Unverified:                 inst.Unverified,
+		RevivalPending:             inst.RevivalPending,
+		RevivedDisk:                inst.RevivedDisk,
 		TeardownPending:            inst.TeardownPending,
 		RunDirID:                   inst.RunDirID,
 		Namespace:                  inst.Namespace,
@@ -699,27 +710,29 @@ func toInstance(rec VMRecord) *VMInstance {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
 	return &VMInstance{
-		ID:              rec.ID,
-		PID:             rec.PID,
-		SocketPath:      rec.SocketPath,
-		VsockPath:       rec.VsockPath,
-		IP:              rec.IP,
-		TAPDevice:       rec.TAPDevice,
-		MACAddress:      rec.MACAddress,
-		Status:          rec.Status,
-		Unverified:      rec.Unverified,
-		TeardownPending: rec.TeardownPending,
-		RunDirID:        rec.RunDirID,
-		Namespace:       rec.Namespace,
-		DiskPath:        rec.DiskPath,
-		SnapshotPath:    rec.SnapshotPath,
-		MemFilePath:     rec.MemFilePath,
-		BaseMemPath:     rec.BaseMemPath,
-		CreatedAt:       rec.CreatedAt,
-		Metadata:        rec.Metadata,
-		TeamID:          rec.TeamID,
-		OwnerID:         rec.OwnerID,
-		PausedAt:        rec.PausedAt,
+		ID:                         rec.ID,
+		PID:                        rec.PID,
+		SocketPath:                 rec.SocketPath,
+		VsockPath:                  rec.VsockPath,
+		IP:                         rec.IP,
+		TAPDevice:                  rec.TAPDevice,
+		MACAddress:                 rec.MACAddress,
+		Status:                     rec.Status,
+		Unverified:                 rec.Unverified,
+		RevivalPending:             rec.RevivalPending,
+		RevivedDisk:                rec.RevivedDisk,
+		TeardownPending:            rec.TeardownPending,
+		RunDirID:                   rec.RunDirID,
+		Namespace:                  rec.Namespace,
+		DiskPath:                   rec.DiskPath,
+		SnapshotPath:               rec.SnapshotPath,
+		MemFilePath:                rec.MemFilePath,
+		BaseMemPath:                rec.BaseMemPath,
+		CreatedAt:                  rec.CreatedAt,
+		Metadata:                   rec.Metadata,
+		TeamID:                     rec.TeamID,
+		OwnerID:                    rec.OwnerID,
+		PausedAt:                   rec.PausedAt,
 		Supervision:                rec.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(rec.PreviewAccess, ports),
 		PreviewPorts:               ports,

@@ -1659,8 +1659,10 @@ func decodeMetadata(raw []byte) map[string]string {
 // Sandbox List + Get
 // ---------------------------------------------------------------------------
 
-// sandboxSortColumns are the columns ListSandboxes accepts for `?sort=`. Each
-// maps to a guarded ORDER BY term in ListSandboxesByTeamPaged.
+// sandboxSortColumns are the columns ListSandboxes accepts for `?sort=`.
+// created_at routes to the static ListSandboxesByTeamCreated{Desc,Asc}
+// queries; name and status map to guarded ORDER BY terms in
+// ListSandboxesByTeamPaged.
 var sandboxSortColumns = []string{"created_at", "name", "status"}
 
 // sandboxStatusFilterValues are the values ListSandboxes accepts for
@@ -1728,18 +1730,46 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 	nameSearch := searchTerm(c.Query("q"))
 
 	ctx := c.Request.Context()
-	sandboxes, err := h.DB.ListSandboxesByTeamPaged(ctx, db.ListSandboxesByTeamPagedParams{
-		TeamID:     teamID,
-		Metadata:   metadataJSON,
-		Status:     statusFilter,
-		NameSearch: nameSearch,
-		SortBy:     pg.SortBy,
-		SortDir:    pg.SortDir,
-		RowOffset:  pg.Offset,
-		RowLimit:   pg.Limit,
-	})
+	// The default created_at sort is the hot path (and the only sort
+	// unpaginated SDK callers use), so it goes through the static-ORDER BY
+	// queries the planner can serve from idx_sandbox_team_created_active
+	// instead of sorting the whole filtered set. The rare console-only
+	// name/status sorts stay on the flexible CASE-based query.
+	var sandboxes []db.Sandbox
+	if pg.SortBy == "created_at" {
+		if pg.SortDir == "asc" {
+			sandboxes, err = h.DB.ListSandboxesByTeamCreatedAsc(ctx, db.ListSandboxesByTeamCreatedAscParams{
+				TeamID:     teamID,
+				Metadata:   metadataJSON,
+				Status:     statusFilter,
+				NameSearch: nameSearch,
+				RowOffset:  pg.Offset,
+				RowLimit:   pg.Limit,
+			})
+		} else {
+			sandboxes, err = h.DB.ListSandboxesByTeamCreatedDesc(ctx, db.ListSandboxesByTeamCreatedDescParams{
+				TeamID:     teamID,
+				Metadata:   metadataJSON,
+				Status:     statusFilter,
+				NameSearch: nameSearch,
+				RowOffset:  pg.Offset,
+				RowLimit:   pg.Limit,
+			})
+		}
+	} else {
+		sandboxes, err = h.DB.ListSandboxesByTeamPaged(ctx, db.ListSandboxesByTeamPagedParams{
+			TeamID:     teamID,
+			Metadata:   metadataJSON,
+			Status:     statusFilter,
+			NameSearch: nameSearch,
+			SortBy:     pg.SortBy,
+			SortDir:    pg.SortDir,
+			RowOffset:  pg.Offset,
+			RowLimit:   pg.Limit,
+		})
+	}
 	if err != nil {
-		log.Error().Err(err).Msg("DB ListSandboxesByTeamPaged failed")
+		log.Error().Err(err).Msg("DB list sandboxes by team failed")
 		respondError(c, ErrInternal)
 		return
 	}

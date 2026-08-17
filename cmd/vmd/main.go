@@ -99,7 +99,7 @@ func loadConfig() (Config, error) {
 		HostInterface:           envOrDefault("HOST_INTERFACE", "eth0"),
 		TemplateBuilderBin:      envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
 		BoxdBinaryPath:          envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
-		HostID:                  envOrDefault("HOST_ID", "default"),
+		HostID:                  requireEnv("HOST_ID"),
 		DatabaseURL:             os.Getenv("DATABASE_URL"),
 		ControlPlaneURL:         os.Getenv("CONTROL_PLANE_URL"),
 		SecretsProxySocket:      os.Getenv("SECRETSPROXY_SOCKET"),
@@ -111,6 +111,14 @@ func loadConfig() (Config, error) {
 	}
 	if cfg.BaseRootfsPath == "" {
 		return Config{}, fmt.Errorf("BASE_ROOTFS_PATH environment variable is required")
+	}
+	// HOST_ID scopes heartbeats and reconciler state; two daemons sharing an
+	// identity reap each other's sandboxes, so refuse to start rather than
+	// fall back to a shared placeholder. The literal "default" stays allowed:
+	// one production host's row predates instance-named identities and still
+	// keys on it, so it can only be banned once that identity is migrated.
+	if cfg.HostID == "" {
+		return Config{}, fmt.Errorf("HOST_ID environment variable is required and must be this host's unique identity")
 	}
 
 	if cfg.SecretsProxySandboxAddr != "" {
@@ -1147,7 +1155,22 @@ func main() {
 	// BoltDB ↔ systemd comparison only.
 	var reconcilerDB *dbq.Queries
 	if cfg.DatabaseURL != "" {
-		dbPool, dbErr := pgxpool.New(ctx, cfg.DatabaseURL)
+		dbCfg, dbErr := pgxpool.ParseConfig(cfg.DatabaseURL)
+		if dbErr != nil {
+			log.Fatal().Err(dbErr).Msg("failed to parse database URL for reconciler")
+		}
+		// The pgxpool default is max(4, NumCPU), which scales with host cores
+		// and silently consumes the cell pooler's client-connection budget on
+		// large hosts. This pool serves serial reconciler passes and the
+		// batched flow sink (low concurrency by construction), so a small
+		// cap is enough. A ceiling, not a floor: an explicitly lower
+		// pool_max_conns in the URL stays in effect.
+		dbCfg.MaxConns = min(dbCfg.MaxConns, 8)
+		// URL-configured minima above the cap would make the config
+		// invalid and fail startup; lower them with it.
+		dbCfg.MinConns = min(dbCfg.MinConns, dbCfg.MaxConns)
+		dbCfg.MinIdleConns = min(dbCfg.MinIdleConns, dbCfg.MaxConns)
+		dbPool, dbErr := pgxpool.NewWithConfig(ctx, dbCfg)
 		if dbErr != nil {
 			log.Fatal().Err(dbErr).Msg("failed to connect to database for reconciler")
 		}

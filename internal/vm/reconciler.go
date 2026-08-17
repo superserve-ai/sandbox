@@ -295,7 +295,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		} else {
 			dbSandboxes = make(map[string]db.ListSandboxesByHostRow, len(rows))
 			for _, row := range rows {
-				dbSandboxes[row.Sandbox.ID.String()] = row
+				dbSandboxes[row.ID.String()] = row
 			}
 		}
 	}
@@ -593,8 +593,8 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				return
 			}
 			sb, known := dbSandboxes[id]
-			deleted := known && sb.Sandbox.Status == db.SandboxStatusDeleted
-			failed := known && sb.Sandbox.Status == db.SandboxStatusFailed
+			deleted := known && sb.Status == db.SandboxStatusDeleted
+			failed := known && sb.Status == db.SandboxStatusFailed
 			if known && !deleted && !failed {
 				continue
 			}
@@ -692,6 +692,16 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			continue
 		}
 		removeUnitDropIn(id)
+		// A parked revival anchor keeps its record: the stop above cleared
+		// the residue, which is exactly what the interrupted revival's
+		// retry needs to pass its at-rest probe, but deleting the record
+		// would fail the retry against the known-sandbox guard (the same
+		// exemption the dead-unit half applies).
+		if r.mgr.recordRevivalPending(id) {
+			unlockOp()
+			r.clearDrift("errunit:" + id)
+			continue
+		}
 		staleErr := r.markStale(id)
 		unlockOp()
 		// Flip the DB row with the already-grace-qualified reap: Drift 1
@@ -703,7 +713,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// way, and the flip frees no resource (same reasoning as the wedge
 		// branch below).
 		if dbSandboxes != nil {
-			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
+			if sb, known := dbSandboxes[id]; known && sb.Status == db.SandboxStatusActive {
 				r.markFailedInDB(ctx, id, db.SandboxStatusActive)
 			}
 		}
@@ -733,6 +743,14 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			r.clearDrift("errdead:" + id)
 			return
 		}
+		// A parked revival anchor is not an ordinary dead Error record:
+		// the operator's retry needs it to pass the known-sandbox guard,
+		// so reaping it would recreate exactly the unrecoverable state
+		// the marker exists to prevent. The operator's revive or an
+		// explicit destroy retires it.
+		if r.mgr.recordRevivalPending(id) {
+			return
+		}
 		if !r.gracePeriodElapsed("errdead:"+id, now) {
 			return
 		}
@@ -759,7 +777,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			// resource, so the terminal gate doesn't apply. Fires once per
 			// wedge: the next pass's snapshot reads 'failed'.
 			if dbSandboxes != nil {
-				if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive && r.consumeAutoFailBudget(id) {
+				if sb, known := dbSandboxes[id]; known && sb.Status == db.SandboxStatusActive && r.consumeAutoFailBudget(id) {
 					if r.markFailedInDB(ctx, id, db.SandboxStatusActive) {
 						r.writeAudit(ctx, id, "mark_failed", "wedged error VM: row flipped while awaiting terminal unit", "boltdb_error_unit_wedged")
 					}
@@ -777,7 +795,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 		// Drift 1 skips Error records, so the row flip lands here (still
 		// compare-and-set: a relaunch may own the row by now).
 		if dbSandboxes != nil {
-			if sb, known := dbSandboxes[id]; known && sb.Sandbox.Status == db.SandboxStatusActive {
+			if sb, known := dbSandboxes[id]; known && sb.Status == db.SandboxStatusActive {
 				r.markFailedInDB(ctx, id, db.SandboxStatusActive)
 			}
 		}
@@ -805,7 +823,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				return
 			}
 			sb, known := dbSandboxes[id]
-			if !known || sb.Sandbox.Status != db.SandboxStatusPaused {
+			if !known || sb.Status != db.SandboxStatusPaused {
 				r.clearDrift("pausedunit:" + id)
 				continue
 			}
@@ -863,7 +881,9 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	}
 
 	// Drift 4: DB says paused, snapshot file missing on disk → mark failed.
-	r.failMissingSnapshots(ctx, log, dbSandboxes, now)
+	// Snapshot paths for the paused candidates are resolved in one batched
+	// lookup rather than joined across the whole inventory in the list query.
+	r.failMissingSnapshots(ctx, log, dbSandboxes, r.resolvePausedSnapshotPaths(ctx, log, dbSandboxes), now)
 
 	// Drift 5: BoltDB record exists but DB has no corresponding sandbox
 	// row (either never written or soft-deleted). Clean up the BoltDB
@@ -968,7 +988,7 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 	// Protected live sandboxes — used by the collapse guard and the audit log.
 	var keptActive, keptPaused int
 	for _, row := range dbSandboxes {
-		switch row.Sandbox.Status {
+		switch row.Status {
 		case db.SandboxStatusActive:
 			keptActive++
 		case db.SandboxStatusPaused:
@@ -1568,7 +1588,7 @@ func (r *Reconciler) failEmptyShells(ctx context.Context, log zerolog.Logger, db
 		// probes yield errors (non-evidence) and re-examine next pass.
 		var candidates []string
 		for id, sb := range dbSandboxes {
-			if sb.Sandbox.Status != db.SandboxStatusActive || !active[id] {
+			if sb.Status != db.SandboxStatusActive || !active[id] {
 				r.clearDrift("fcempty:" + id)
 				continue
 			}
@@ -1693,7 +1713,7 @@ func (r *Reconciler) reapUnverifiedOrphans(ctx context.Context, log zerolog.Logg
 				return
 			}
 			sb, known := dbSandboxes[id]
-			if !known || sb.Sandbox.Status != db.SandboxStatusPaused || !r.mgr.instanceUnverifiedRunning(id) {
+			if !known || sb.Status != db.SandboxStatusPaused || !r.mgr.instanceUnverifiedRunning(id) {
 				r.clearDrift("unverifiedorphan:" + id)
 				continue
 			}
@@ -1836,7 +1856,7 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 		if ctx.Err() != nil {
 			return
 		}
-		if sb.Sandbox.Status != db.SandboxStatusActive {
+		if sb.Status != db.SandboxStatusActive {
 			continue
 		}
 		if active[id] {
@@ -1899,21 +1919,64 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 // is provably gone. Extracted for the same reason as reapDeadActiveVMs — the
 // lock-window race (a new pause writing the artifact while this rule waits on
 // the lifecycle lock) is only testable with the pass data injectable.
-func (r *Reconciler) failMissingSnapshots(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, now time.Time) {
+// snapshotPathBatchSize bounds the per-call size of the paused-snapshot PK
+// lookup. A busy host can hold tens of thousands of paused sandboxes, so the
+// lookup is issued in several modest ANY() queries instead of one oversized
+// uuid[] parameter and one very large result set.
+const snapshotPathBatchSize = 10000
+
+// resolvePausedSnapshotPaths batch-fetches on-disk snapshot paths for the
+// paused sandboxes on this host in chunked PK lookups, replacing the per-
+// inventory LEFT JOIN that ListSandboxesByHost used to carry. Returns nil when
+// the DB is unset, there are no paused candidates, or any chunk lookup fails —
+// Drift 4 then safely no-ops for this pass rather than acting on a partial map.
+func (r *Reconciler) resolvePausedSnapshotPaths(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow) map[uuid.UUID]string {
+	if r.cfg.DB == nil {
+		return nil
+	}
+	snapIDs := make([]uuid.UUID, 0)
+	for _, sb := range dbSandboxes {
+		if sb.Status == db.SandboxStatusPaused && sb.SnapshotID.Valid {
+			snapIDs = append(snapIDs, uuid.UUID(sb.SnapshotID.Bytes))
+		}
+	}
+	if len(snapIDs) == 0 {
+		return nil
+	}
+	pathByID := make(map[uuid.UUID]string, len(snapIDs))
+	for start := 0; start < len(snapIDs); start += snapshotPathBatchSize {
+		end := start + snapshotPathBatchSize
+		if end > len(snapIDs) {
+			end = len(snapIDs)
+		}
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		rows, err := r.cfg.DB.GetSnapshotPathsByIDs(qctx, snapIDs[start:end])
+		cancel()
+		if err != nil {
+			log.Error().Err(err).Msg("resolvePausedSnapshotPaths: batch snapshot-path lookup failed")
+			return nil
+		}
+		for _, row := range rows {
+			pathByID[row.ID] = row.Path
+		}
+	}
+	return pathByID
+}
+
+func (r *Reconciler) failMissingSnapshots(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, pathByID map[uuid.UUID]string, now time.Time) {
 	for id, sb := range dbSandboxes {
 		if ctx.Err() != nil {
 			return
 		}
-		if sb.Sandbox.Status != db.SandboxStatusPaused || !sb.Sandbox.SnapshotID.Valid {
+		if sb.Status != db.SandboxStatusPaused || !sb.SnapshotID.Valid {
 			continue
 		}
-		// snapshot_path is joined in by ListSandboxesByHost, so this
-		// is a cheap struct field read instead of a per-row DB call.
-		// Skip when the snapshot row has been deleted (rare race).
-		if sb.SnapshotPath == nil || *sb.SnapshotPath == "" {
+		// Path from resolvePausedSnapshotPaths' batched lookup. Empty means the
+		// snapshot row was deleted (rare race) or has no path — skip.
+		snapPath := pathByID[uuid.UUID(sb.SnapshotID.Bytes)]
+		if snapPath == "" {
 			continue
 		}
-		snapPath := *sb.SnapshotPath
 		if _, statErr := os.Stat(snapPath); statErr == nil {
 			r.clearDrift("paused:" + id)
 			continue
