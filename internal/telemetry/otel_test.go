@@ -429,3 +429,24 @@ func TestRecordLatencyPhaseAttributes(t *testing.T) {
 		t.Errorf("sum = %v, want ~0.030s", dp.Sum)
 	}
 }
+
+// The phase histogram sits on lifecycle paths; its per-sample cost must stay
+// in the microsecond class (in-memory bucket update, no I/O — the OTLP export
+// runs on the periodic reader, never on the caller).
+func BenchmarkRecordLatencyPhase(b *testing.B) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	b.Cleanup(func() { _ = provider.Shutdown(ctx) })
+	meter := provider.Meter(instrumentationName)
+	h, err := meter.Float64Histogram("sandbox_phase_duration_seconds")
+	if err != nil {
+		b.Fatal(err)
+	}
+	r := &OTelRecorder{provider: provider, hostID: "host-abc", phaseDuration: h}
+	p := LatencyPhase{Plane: "vmd", Op: "launch", Phase: "wait_socket", Mode: "direct", Duration: 30 * time.Millisecond}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.RecordLatencyPhase(ctx, p)
+	}
+}
