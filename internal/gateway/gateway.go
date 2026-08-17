@@ -31,11 +31,24 @@ type Gateway struct {
 	transports map[string]*http.Transport // resolver HTTP transports, per socket
 }
 
+// Stream and message limits must mirror vmd's own gRPC server so the gateway
+// never becomes the tighter bottleneck: without an explicit stream limit gRPC
+// clients self-cap at 100 streams/conn, and the default 4 MiB message size
+// would reject requests vmd accepts.
+const (
+	maxConcurrentStreams = 2000
+	maxMessageBytes      = 64 << 20 // 64 MiB
+)
+
 // New returns a Gateway with an empty routing table.
 func New() *Gateway {
 	return &Gateway{
-		router:       NewRouter(),
-		resolverHold: 5 * time.Second,
+		router: NewRouter(),
+		// Longer than any normal cutover's quiesce window (now just the new
+		// generation's activation, since draining happens before the hold). The
+		// caller's own request context still bounds an individual wait, so a
+		// generous cap never pins a request past when its client gave up.
+		resolverHold: 30 * time.Second,
 		conns:        map[string]*grpc.ClientConn{},
 		transports:   map[string]*http.Transport{},
 	}
@@ -44,12 +57,42 @@ func New() *Gateway {
 // Router exposes the routing/quiesce control surface.
 func (g *Gateway) Router() *Router { return g.router }
 
+// SetActive points the gateway at a generation and evicts cached upstream
+// connections/transports for sockets that are no longer routed to, so drained
+// generations do not leak a ClientConn/Transport for the host's lifetime.
+func (g *Gateway) SetActive(up Upstream) {
+	g.router.SetActive(up)
+	g.evictExcept(up.GRPCSocket, up.ResolverSocket)
+}
+
+func (g *Gateway) evictExcept(grpcSocket, resolverSocket string) {
+	g.connMu.Lock()
+	for s, c := range g.conns {
+		if s != grpcSocket {
+			_ = c.Close()
+			delete(g.conns, s)
+		}
+	}
+	g.connMu.Unlock()
+	g.rtMu.Lock()
+	for s, t := range g.transports {
+		if s != resolverSocket {
+			t.CloseIdleConnections()
+			delete(g.transports, s)
+		}
+	}
+	g.rtMu.Unlock()
+}
+
 // GRPCServer builds the transparent-proxy gRPC server that serves the public
 // control-plane port. Serve it on the public listener.
 func (g *Gateway) GRPCServer() *grpc.Server {
 	return grpc.NewServer(
 		grpc.ForceServerCodecV2(rawCodec{}),
 		grpc.UnknownServiceHandler(g.direct),
+		grpc.MaxConcurrentStreams(maxConcurrentStreams),
+		grpc.MaxRecvMsgSize(maxMessageBytes),
+		grpc.MaxSendMsgSize(maxMessageBytes),
 	)
 }
 
@@ -65,7 +108,11 @@ func (g *Gateway) upstreamConn(socket string) (*grpc.ClientConn, error) {
 	c, err := grpc.NewClient(
 		"unix://"+socket,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(rawCodec{})),
+		grpc.WithDefaultCallOptions(
+			grpc.ForceCodecV2(rawCodec{}),
+			grpc.MaxCallRecvMsgSize(maxMessageBytes),
+			grpc.MaxCallSendMsgSize(maxMessageBytes),
+		),
 	)
 	if err != nil {
 		return nil, err

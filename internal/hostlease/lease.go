@@ -30,16 +30,6 @@ type WriterLease struct {
 	path string
 }
 
-// Capability is proof that its holder owns the host writer role. Code that
-// mutates host state requires one, so mutating without the lease is not
-// representable. It is non-copyable — go vet's copylocks check flags any copy —
-// because write ownership is unique and must not be duplicated or outlive its
-// lease.
-type Capability struct {
-	noCopy noCopy
-	lease  *WriterLease
-}
-
 // Acquire opens (creating if absent, mode 0600) the lockfile at path and takes
 // an exclusive, non-blocking flock. Returns ErrHeld if another process
 // currently owns the lease, so the caller — not this primitive — owns the
@@ -49,31 +39,23 @@ type Capability struct {
 // fd is close-on-exec (Go opens all descriptors O_CLOEXEC), so a fork+exec'd
 // subprocess such as a builder releases its copy on exec and cannot keep the
 // lock alive past this process.
-func Acquire(path string) (*WriterLease, *Capability, error) {
+func Acquire(path string) (*WriterLease, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open lockfile %s: %w", path, err)
+		return nil, fmt.Errorf("open lockfile %s: %w", path, err)
 	}
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		f.Close()
 		if errors.Is(err, unix.EWOULDBLOCK) {
-			return nil, nil, ErrHeld
+			return nil, ErrHeld
 		}
-		return nil, nil, fmt.Errorf("flock %s: %w", path, err)
+		return nil, fmt.Errorf("flock %s: %w", path, err)
 	}
-	l := &WriterLease{f: f, path: path}
-	return l, &Capability{lease: l}, nil
+	return &WriterLease{f: f, path: path}, nil
 }
 
 // Path returns the lockfile path.
 func (l *WriterLease) Path() string { return l.path }
-
-// Owns reports whether cap is the capability minted by this lease. A defensive
-// check for code paths that accept a Capability and want to confirm it belongs
-// to the lease they hold.
-func (l *WriterLease) Owns(cap *Capability) bool {
-	return cap != nil && cap.lease == l
-}
 
 // Close drops the lease by closing the fd; the kernel releases the flock.
 //
@@ -89,10 +71,3 @@ func (l *WriterLease) Close() error {
 	l.f = nil
 	return err
 }
-
-// noCopy triggers `go vet -copylocks` on any value copy of a struct that
-// embeds it. It has no runtime effect.
-type noCopy struct{}
-
-func (*noCopy) Lock()   {}
-func (*noCopy) Unlock() {}

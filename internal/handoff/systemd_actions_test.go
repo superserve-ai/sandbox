@@ -57,8 +57,8 @@ func TestSystemdActionsDeploySequence(t *testing.T) {
 	want := []string{
 		"run: systemctl start superserve-vmd@b",
 		"send[/run/vmd/gen-b-ctl.sock]: status",
-		"gw: quiesce on",
 		"run: systemctl stop superserve-vmd@a",
+		"gw: quiesce on",
 		"send[/run/vmd/gen-b-ctl.sock]: activate",
 		"gw: set-active b",
 		"gw: quiesce off",

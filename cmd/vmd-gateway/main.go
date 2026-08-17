@@ -39,24 +39,71 @@ func genResolverPath(id string) string { return "/run/vmd/gen-" + id + "-resolve
 func genControlPath(id string) string  { return "/run/vmd/gen-" + id + "-ctl.sock" }
 func unitName(id string) string        { return "superserve-vmd@" + id }
 
-// gwAdapter lets the in-process handoff controller steer routing directly.
-type gwAdapter struct{ gw *gateway.Gateway }
+// gwAdapter lets the in-process handoff controller steer routing directly, and
+// persists the active generation so the gateway can rediscover it after a
+// restart (its routing/controller state is otherwise only in memory).
+type gwAdapter struct {
+	gw        *gateway.Gateway
+	statePath string
+}
 
 func (a gwAdapter) Quiesce(on bool) { a.gw.Router().Quiesce(on) }
 func (a gwAdapter) SetActive(gen handoff.Generation) {
-	a.gw.Router().SetActive(gateway.Upstream{
-		Generation:     gen.ID,
-		GRPCSocket:     gen.GRPCSocket,
-		ResolverSocket: gen.ResolverSocket,
-	})
+	up := gateway.Upstream{Generation: gen.ID, GRPCSocket: gen.GRPCSocket, ResolverSocket: gen.ResolverSocket}
+	a.gw.SetActive(up)
+	persistActive(a.statePath, up)
+}
+
+// persistActive atomically records the active generation so a restarted gateway
+// can restore routing. Best effort — a failure just means the restart falls
+// back to probing/redeploy.
+func persistActive(path string, up gateway.Upstream) {
+	if path == "" {
+		return
+	}
+	data := up.Generation + "\n" + up.GRPCSocket + "\n" + up.ResolverSocket + "\n"
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(data), 0o644); err == nil {
+		_ = os.Rename(tmp, path)
+	}
+}
+
+func loadActive(path string) (gateway.Upstream, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return gateway.Upstream{}, false
+	}
+	parts := strings.SplitN(strings.TrimRight(string(b), "\n"), "\n", 3)
+	if len(parts) < 3 || parts[0] == "" || parts[1] == "" {
+		return gateway.Upstream{}, false
+	}
+	return gateway.Upstream{Generation: parts[0], GRPCSocket: parts[1], ResolverSocket: parts[2]}, true
+}
+
+// probeGenAlive reports whether a generation's control socket answers, i.e. the
+// generation process is still running.
+func probeGenAlive(sock string, timeout time.Duration) bool {
+	d := net.Dialer{}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	conn, err := d.DialContext(ctx, "unix", sock)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	fmt.Fprintln(conn, "status")
+	sc := bufio.NewScanner(conn)
+	return sc.Scan() && strings.HasPrefix(sc.Text(), "OK")
 }
 
 // controlState is the target of the gateway control socket: raw routing
 // commands plus controller-driven deploys.
 type controlState struct {
-	gw   *gateway.Gateway
-	ctrl *handoff.Controller
-	log  zerolog.Logger
+	gw        *gateway.Gateway
+	ctrl      *handoff.Controller
+	log       zerolog.Logger
+	statePath string
 }
 
 func main() {
@@ -66,19 +113,41 @@ func main() {
 	initialID := flag.String("initial-gen-id", "", "generation id to route to at startup")
 	initialGRPC := flag.String("initial-gen-grpc", "", "generation gRPC socket to route to at startup")
 	initialResolver := flag.String("initial-gen-resolver", "", "generation resolver socket to route to at startup")
+	statePath := flag.String("state-file", "/var/lib/sandbox/active-generation", "records the active generation for restart recovery")
 	flag.Parse()
 
 	log := zerolog.New(os.Stderr).With().Timestamp().Str("service", "vmd-gateway").Logger()
 
 	gw := gateway.New()
+	adapter := gwAdapter{gw: gw, statePath: *statePath}
+	actions := handoff.NewSystemdActions(adapter, unitName, genControlPath)
+
+	// Determine the active generation: explicit flags win; otherwise recover
+	// from the persisted record, since routing/controller state is only in
+	// memory and must be rediscovered after a gateway restart.
+	var initial gateway.Upstream
+	var recoverGen *gateway.Upstream
 	if *initialGRPC != "" {
-		gw.Router().SetActive(gateway.Upstream{
-			Generation:     *initialID,
-			GRPCSocket:     *initialGRPC,
-			ResolverSocket: *initialResolver,
-		})
-		log.Info().Str("generation", *initialID).Str("grpc", *initialGRPC).
-			Str("resolver", *initialResolver).Msg("initial upstream set")
+		initial = gateway.Upstream{Generation: *initialID, GRPCSocket: *initialGRPC, ResolverSocket: *initialResolver}
+	} else if up, ok := loadActive(*statePath); ok {
+		if probeGenAlive(genControlPath(up.Generation), 2*time.Second) {
+			initial = up
+			log.Info().Str("generation", up.Generation).Msg("restored active route after restart")
+		} else {
+			// The recorded generation isn't running (gateway+generation crash,
+			// or host reboot): redeploy it once serving is up.
+			u := up
+			recoverGen = &u
+			log.Warn().Str("generation", up.Generation).Msg("recorded generation not running — will redeploy")
+		}
+	}
+
+	controller := handoff.New(actions, handoff.Generation{
+		ID: initial.Generation, GRPCSocket: initial.GRPCSocket, ResolverSocket: initial.ResolverSocket,
+	})
+	if initial.GRPCSocket != "" {
+		gw.SetActive(initial)
+		persistActive(*statePath, initial)
 	}
 
 	grpcLis, err := net.Listen("tcp", *grpcAddr)
@@ -101,18 +170,23 @@ func main() {
 		}
 	}()
 
-	actions := handoff.NewSystemdActions(gwAdapter{gw}, unitName, genControlPath)
-	controller := handoff.New(actions, handoff.Generation{
-		ID:             *initialID,
-		GRPCSocket:     *initialGRPC,
-		ResolverSocket: *initialResolver,
-	})
-
 	ctlLis, err := listenControl(*controlSock)
 	if err != nil {
 		log.Fatal().Err(err).Str("sock", *controlSock).Msg("control socket listen")
 	}
-	go serveControl(ctlLis, &controlState{gw: gw, ctrl: controller, log: log})
+	go serveControl(ctlLis, &controlState{gw: gw, ctrl: controller, log: log, statePath: *statePath})
+
+	// The recorded generation was gone: bring it back up via a normal deploy.
+	if recoverGen != nil {
+		go func(u gateway.Upstream) {
+			log.Info().Str("generation", u.Generation).Msg("recovery deploy starting")
+			if err := controller.Deploy(context.Background(), handoff.Generation{}, handoff.Generation{
+				ID: u.Generation, GRPCSocket: u.GRPCSocket, ResolverSocket: u.ResolverSocket,
+			}); err != nil {
+				log.Error().Err(err).Str("generation", u.Generation).Msg("recovery deploy failed")
+			}
+		}(*recoverGen)
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -166,11 +240,9 @@ func (cs *controlState) apply(fields []string) string {
 		if len(fields) != 4 {
 			return "ERR usage: set-active <generation-id> <grpc-socket> <resolver-socket>"
 		}
-		cs.gw.Router().SetActive(gateway.Upstream{
-			Generation:     fields[1],
-			GRPCSocket:     fields[2],
-			ResolverSocket: fields[3],
-		})
+		up := gateway.Upstream{Generation: fields[1], GRPCSocket: fields[2], ResolverSocket: fields[3]}
+		cs.gw.SetActive(up)
+		persistActive(cs.statePath, up)
 		return "OK"
 	case "quiesce":
 		if len(fields) != 2 || (fields[1] != "on" && fields[1] != "off") {

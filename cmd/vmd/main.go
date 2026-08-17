@@ -325,23 +325,23 @@ func runDrainCheck() int {
 // acquireWriterLease takes the single-writer host lease, retrying while a
 // previous generation is still exiting, until the wait budget elapses. The
 // lease is held for the life of the process and released only on exit.
-func acquireWriterLease(ctx context.Context, path string, wait time.Duration, log zerolog.Logger) (*hostlease.WriterLease, *hostlease.Capability, error) {
+func acquireWriterLease(ctx context.Context, path string, wait time.Duration, log zerolog.Logger) (*hostlease.WriterLease, error) {
 	deadline := time.Now().Add(wait)
 	for {
-		l, capability, err := hostlease.Acquire(path)
+		l, err := hostlease.Acquire(path)
 		if err == nil {
-			return l, capability, nil
+			return l, nil
 		}
 		if err != hostlease.ErrHeld {
-			return nil, nil, err
+			return nil, err
 		}
 		if time.Now().After(deadline) {
-			return nil, nil, fmt.Errorf("writer lease still held after %s: %w", wait, err)
+			return nil, fmt.Errorf("writer lease still held after %s: %w", wait, err)
 		}
 		log.Info().Msg("host writer lease held by previous generation; waiting")
 		select {
 		case <-ctx.Done():
-			return nil, nil, ctx.Err()
+			return nil, ctx.Err()
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
@@ -356,11 +356,77 @@ func listenUnixClean(path string) (net.Listener, error) {
 	return net.Listen("unix", path)
 }
 
-// serveGenControl serves a generation's control socket. "activate" triggers
-// activation and blocks until the daemon reports the outcome on the reply
-// channel; "status" reports the current phase (preflight/active). This is how
-// the handoff controller drives a generation from preflight to active.
-func serveGenControl(lis net.Listener, activate chan<- chan string, phase *atomic.Value) {
+// genControl is a generation's control-socket state machine. It makes
+// "activate" idempotent: the first caller triggers activation and blocks until
+// the daemon reports the outcome; callers arriving while activation is in
+// flight wait for the same result; callers after the generation is already
+// active get an immediate "OK active" instead of deadlocking. This is what lets
+// a re-deploy onto the already-live generation (e.g. gateway-restart recovery)
+// succeed rather than time out.
+type genControl struct {
+	mu      sync.Mutex
+	phase   string        // "preflight" | "activating" | "active"
+	done    chan struct{} // closed when phase reaches active
+	trigger chan chan string
+	result  string
+}
+
+func newGenControl() *genControl {
+	return &genControl{phase: "preflight", done: make(chan struct{}), trigger: make(chan chan string, 1)}
+}
+
+// requestActivate is invoked by the control socket. It returns the activation
+// result, blocking until the generation is active.
+func (g *genControl) requestActivate() string {
+	g.mu.Lock()
+	switch g.phase {
+	case "active":
+		res := g.result
+		g.mu.Unlock()
+		return res
+	case "activating":
+		done := g.done
+		g.mu.Unlock()
+		<-done
+		g.mu.Lock()
+		res := g.result
+		g.mu.Unlock()
+		return res
+	default: // preflight — this caller triggers activation
+		g.phase = "activating"
+		reply := make(chan string, 1)
+		g.trigger <- reply
+		g.mu.Unlock()
+		return <-reply
+	}
+}
+
+// awaitActivate blocks until a control caller has requested activation, then
+// returns a completion func the daemon calls once it knows the outcome.
+func (g *genControl) awaitActivate(ctx context.Context) (func(result string), bool) {
+	select {
+	case reply := <-g.trigger:
+		return func(result string) {
+			g.mu.Lock()
+			g.phase = "active"
+			g.result = result
+			close(g.done)
+			g.mu.Unlock()
+			reply <- result
+		}, true
+	case <-ctx.Done():
+		return nil, false
+	}
+}
+
+func (g *genControl) status() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return "OK phase=" + g.phase
+}
+
+// serveGenControl serves a generation's control socket against a genControl.
+func serveGenControl(lis net.Listener, gc *genControl) {
 	for {
 		conn, err := lis.Accept()
 		if err != nil {
@@ -372,12 +438,9 @@ func serveGenControl(lis net.Listener, activate chan<- chan string, phase *atomi
 			for sc.Scan() {
 				switch strings.TrimSpace(sc.Text()) {
 				case "activate":
-					reply := make(chan string, 1)
-					activate <- reply
-					fmt.Fprintln(c, <-reply)
+					fmt.Fprintln(c, gc.requestActivate())
 				case "status":
-					p, _ := phase.Load().(string)
-					fmt.Fprintln(c, "OK phase="+p)
+					fmt.Fprintln(c, gc.status())
 				default:
 					fmt.Fprintln(c, "ERR unknown command")
 				}
@@ -460,6 +523,69 @@ func main() {
 
 	lc := newLifecycle(log)
 
+	// ---- Generation preflight + activation (gateway-fronted mode) ----
+	// A gateway-fronted generation (VMD_PRIVATE_SOCKET set) runs in two phases.
+	// PREFLIGHT: bind the private sockets and validate — holding no lease and
+	// mutating no host state — so it runs safely while the previous generation
+	// is still the writer. It signals readiness, then blocks for an "activate"
+	// command on its control socket. ACTIVATE: take the single writer lease
+	// before ANY host-state mutation below (egress table, network firewall,
+	// BoltDB, reattach), held for the life of the process — released only on
+	// exit, so at most one generation is ever the writer. Legacy startup (no
+	// private socket) leaves lis/localLis nil; they are bound below.
+	genPrivateSocket := os.Getenv("VMD_PRIVATE_SOCKET")
+	genResolverSocket := os.Getenv("VMD_RESOLVER_SOCKET")
+	genControlSocket := os.Getenv("VMD_GEN_CONTROL_SOCKET")
+	generationID := os.Getenv("VMD_GENERATION_ID")
+	var lis, localLis net.Listener
+	var writerLease *hostlease.WriterLease
+	var activateDone func(string)
+	if genPrivateSocket != "" {
+		if genControlSocket == "" {
+			log.Fatal().Msg("generation mode requires VMD_GEN_CONTROL_SOCKET")
+		}
+		var lerr error
+		if lis, lerr = listenUnixClean(genPrivateSocket); lerr != nil {
+			log.Fatal().Err(lerr).Str("socket", genPrivateSocket).Msg("preflight: bind gRPC socket")
+		}
+		if genResolverSocket != "" {
+			if localLis, lerr = listenUnixClean(genResolverSocket); lerr != nil {
+				log.Fatal().Err(lerr).Str("socket", genResolverSocket).Msg("preflight: bind resolver socket")
+			}
+		}
+		gc := newGenControl()
+		ctlLis, cerr := listenUnixClean(genControlSocket)
+		if cerr != nil {
+			log.Fatal().Err(cerr).Str("socket", genControlSocket).Msg("preflight: bind control socket")
+		}
+		go serveGenControl(ctlLis, gc)
+
+		// Preflight-ready. For a Type=notify unit this marks the unit active, so
+		// the controller's "start standby" returns; activation follows on the
+		// control socket while the old generation drains.
+		if err := sdnotify.Ready(); err != nil {
+			log.Warn().Err(err).Msg("sd_notify READY (preflight) failed")
+		}
+		_ = sdnotify.Status("preflight — awaiting activation")
+		log.Info().Str("generation", generationID).Msg("preflight complete — awaiting activation")
+
+		done, ok := gc.awaitActivate(ctx)
+		if !ok {
+			log.Info().Msg("cancelled during preflight; exiting")
+			return
+		}
+		activateDone = done
+
+		lockPath := envOrDefault("VMD_WRITER_LOCK", filepath.Join(filepath.Dir(cfg.RunDir), "vmd-writer.lock"))
+		wl, aerr := acquireWriterLease(ctx, lockPath, 30*time.Second, log)
+		if aerr != nil {
+			activateDone("ERR " + aerr.Error())
+			log.Fatal().Err(aerr).Str("lock", lockPath).Msg("activation: acquire writer lease")
+		}
+		writerLease = wl
+		log.Info().Str("generation", generationID).Str("lock", lockPath).Msg("activated — writer lease acquired")
+	}
+
 	// ---- Egress blocklist (optional) ----
 	// VMD_EGRESS_BLOCKLIST_CONFIG points at the operator-supplied config
 	// (feeds, pinned domains/CIDRs, blocked ports). Unset = no global
@@ -500,72 +626,6 @@ func main() {
 		}
 		netMgrOpts = append(netMgrOpts, network.WithDNSRedirectPort(uint16(port)))
 		log.Info().Uint64("port", port).Msg("guest DNS redirect enabled")
-	}
-
-	// ---- Generation preflight + activation (gateway-fronted mode) ----
-	// A gateway-fronted generation (VMD_PRIVATE_SOCKET set) runs in two phases.
-	// PREFLIGHT: bind the private sockets and validate, holding no lease and
-	// mutating no host state, so this runs safely while the previous generation
-	// is still active. It signals readiness and then blocks for an "activate"
-	// command on its control socket. ACTIVATE: take the single writer lease
-	// before any host-state mutation below, held for the life of the process —
-	// released only on exit, so at most one generation is ever the writer.
-	// Legacy startup (no private socket) is unchanged: lis/localLis stay nil
-	// here and are bound in the listener section below.
-	genPrivateSocket := os.Getenv("VMD_PRIVATE_SOCKET")
-	genResolverSocket := os.Getenv("VMD_RESOLVER_SOCKET")
-	genControlSocket := os.Getenv("VMD_GEN_CONTROL_SOCKET")
-	generationID := os.Getenv("VMD_GENERATION_ID")
-	var lis, localLis net.Listener
-	var writerLease *hostlease.WriterLease
-	var activateReply chan string
-	if genPrivateSocket != "" {
-		var lerr error
-		if lis, lerr = listenUnixClean(genPrivateSocket); lerr != nil {
-			log.Fatal().Err(lerr).Str("socket", genPrivateSocket).Msg("preflight: bind gRPC socket")
-		}
-		if genResolverSocket != "" {
-			if localLis, lerr = listenUnixClean(genResolverSocket); lerr != nil {
-				log.Fatal().Err(lerr).Str("socket", genResolverSocket).Msg("preflight: bind resolver socket")
-			}
-		}
-		phase := &atomic.Value{}
-		phase.Store("preflight")
-		activate := make(chan chan string, 1)
-		if genControlSocket != "" {
-			ctlLis, cerr := listenUnixClean(genControlSocket)
-			if cerr != nil {
-				log.Fatal().Err(cerr).Str("socket", genControlSocket).Msg("preflight: bind control socket")
-			}
-			go serveGenControl(ctlLis, activate, phase)
-		}
-		// Preflight-ready. For a Type=notify unit this marks the unit active, so
-		// the controller's "start standby" returns; activation follows on the
-		// control socket while the old generation drains.
-		if err := sdnotify.Ready(); err != nil {
-			log.Warn().Err(err).Msg("sd_notify READY (preflight) failed")
-		}
-		_ = sdnotify.Status("preflight — awaiting activation")
-		log.Info().Str("generation", generationID).Msg("preflight complete — awaiting activation")
-
-		select {
-		case activateReply = <-activate:
-		case <-ctx.Done():
-			log.Info().Msg("cancelled during preflight; exiting")
-			return
-		}
-
-		lockPath := envOrDefault("VMD_WRITER_LOCK", filepath.Join(filepath.Dir(cfg.RunDir), "vmd-writer.lock"))
-		wl, _, aerr := acquireWriterLease(ctx, lockPath, 30*time.Second, log)
-		if aerr != nil {
-			if activateReply != nil {
-				activateReply <- "ERR " + aerr.Error()
-			}
-			log.Fatal().Err(aerr).Str("lock", lockPath).Msg("activation: acquire writer lease")
-		}
-		writerLease = wl
-		phase.Store("active")
-		log.Info().Str("generation", generationID).Str("lock", lockPath).Msg("activated — writer lease acquired")
 	}
 
 	// ---- Network manager + host firewall ----
@@ -1421,10 +1481,11 @@ func main() {
 	// inventory they never use.
 	startupReady.Store(true)
 	log.Info().Msg("startup complete — gRPC serving requests")
-	// In generation mode, release the controller's "activate" call now that the
-	// daemon is fully serving as the writer. No-op otherwise.
-	if activateReply != nil {
-		activateReply <- "OK active"
+	// In generation mode, mark the generation active and release the
+	// controller's "activate" call now that the daemon is fully serving as the
+	// writer. No-op otherwise.
+	if activateDone != nil {
+		activateDone("OK active")
 	}
 	// Report readiness to systemd (Type=notify). No-op when not socket-notified.
 	if err := sdnotify.Ready(); err != nil {

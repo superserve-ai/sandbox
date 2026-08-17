@@ -12,18 +12,12 @@ import (
 func TestAcquireIsExclusiveAndReacquirable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vmd-writer.lock")
 
-	l1, cap1, err := Acquire(path)
+	l1, err := Acquire(path)
 	if err != nil {
 		t.Fatalf("first Acquire: %v", err)
 	}
-	if !l1.Owns(cap1) {
-		t.Fatal("capability is not backed by the lease that minted it")
-	}
-	if l1.Owns(nil) {
-		t.Fatal("Owns(nil) must be false")
-	}
 
-	if _, _, err := Acquire(path); err != ErrHeld {
+	if _, err := Acquire(path); err != ErrHeld {
 		t.Fatalf("second Acquire while held = %v, want ErrHeld", err)
 	}
 
@@ -31,7 +25,7 @@ func TestAcquireIsExclusiveAndReacquirable(t *testing.T) {
 	if err := l1.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	l2, _, err := Acquire(path)
+	l2, err := Acquire(path)
 	if err != nil {
 		t.Fatalf("re-Acquire after release: %v", err)
 	}
