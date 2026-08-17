@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"sync"
@@ -30,7 +31,9 @@ import (
 	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/blocklist"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/hostlease"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/sdnotify"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vm"
@@ -317,6 +320,40 @@ func runDrainCheck() int {
 	return 3
 }
 
+// acquireWriterLease takes the single-writer host lease, retrying while a
+// previous generation is still exiting, until the wait budget elapses. The
+// lease is held for the life of the process and released only on exit.
+func acquireWriterLease(ctx context.Context, path string, wait time.Duration, log zerolog.Logger) (*hostlease.WriterLease, *hostlease.Capability, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		l, capability, err := hostlease.Acquire(path)
+		if err == nil {
+			return l, capability, nil
+		}
+		if err != hostlease.ErrHeld {
+			return nil, nil, err
+		}
+		if time.Now().After(deadline) {
+			return nil, nil, fmt.Errorf("writer lease still held after %s: %w", wait, err)
+		}
+		log.Info().Msg("host writer lease held by previous generation; waiting")
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// listenUnixClean binds a unix socket, first clearing a stale file left at the
+// path by a crashed predecessor (the caller's own private address).
+func listenUnixClean(path string) (net.Listener, error) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	return net.Listen("unix", path)
+}
+
 func main() {
 	// Maintenance subcommands run before any daemon setup and exit. They must
 	// not open the state store in write mode or start services.
@@ -431,6 +468,25 @@ func main() {
 		}
 		netMgrOpts = append(netMgrOpts, network.WithDNSRedirectPort(uint16(port)))
 		log.Info().Uint64("port", port).Msg("guest DNS redirect enabled")
+	}
+
+	// ---- Host writer lease (generation mode) ----
+	// A gateway-fronted generation (VMD_PRIVATE_SOCKET set) takes the single
+	// writer lease before any host-state mutation below, and holds it for the
+	// life of the process — released only on exit, so at most one generation
+	// ever mutates host state. Legacy startup (no private socket) is unchanged.
+	genPrivateSocket := os.Getenv("VMD_PRIVATE_SOCKET")
+	genResolverSocket := os.Getenv("VMD_RESOLVER_SOCKET")
+	generationID := os.Getenv("VMD_GENERATION_ID")
+	var writerLease *hostlease.WriterLease
+	if genPrivateSocket != "" {
+		lockPath := envOrDefault("VMD_WRITER_LOCK", filepath.Join(filepath.Dir(cfg.RunDir), "vmd-writer.lock"))
+		wl, _, lerr := acquireWriterLease(ctx, lockPath, 30*time.Second, log)
+		if lerr != nil {
+			log.Fatal().Err(lerr).Str("lock", lockPath).Msg("failed to acquire host writer lease")
+		}
+		writerLease = wl
+		log.Info().Str("generation", generationID).Str("lock", lockPath).Msg("host writer lease acquired")
 	}
 
 	// ---- Network manager + host firewall ----
@@ -927,7 +983,20 @@ func main() {
 	// must be skipped. Without a socket unit (dev, tests, hosts not yet
 	// migrated) both servers bind directly, exactly as before.
 	var lis, localLis net.Listener
-	if inherited, aerr := activation.Listeners(); aerr == nil {
+	if genPrivateSocket != "" {
+		// Generation mode: the gateway owns the public ports and routes to these
+		// private unix sockets, so bind them directly and skip socket activation.
+		var lerr error
+		if lis, lerr = listenUnixClean(genPrivateSocket); lerr != nil {
+			log.Fatal().Err(lerr).Str("socket", genPrivateSocket).Msg("failed to bind private gRPC socket")
+		}
+		if genResolverSocket != "" {
+			if localLis, lerr = listenUnixClean(genResolverSocket); lerr != nil {
+				log.Fatal().Err(lerr).Str("socket", genResolverSocket).Msg("failed to bind private resolver socket")
+			}
+		}
+		log.Info().Str("grpc", genPrivateSocket).Str("resolver", genResolverSocket).Msg("generation mode: serving on private sockets")
+	} else if inherited, aerr := activation.Listeners(); aerr == nil {
 		for _, l := range inherited {
 			if l == nil {
 				continue
@@ -969,13 +1038,15 @@ func main() {
 				Msg("socket unit passed listeners but none matches GRPC_PORT — check the unit's ListenStream against GRPC_PORT")
 		}
 	}
-	if lis != nil {
-		log.Info().Str("addr", lis.Addr().String()).Msg("gRPC listener inherited from systemd socket unit")
-	} else {
-		var lerr error
-		lis, lerr = net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
-		if lerr != nil {
-			log.Fatal().Err(lerr).Int("port", cfg.GRPCPort).Msg("failed to listen")
+	if genPrivateSocket == "" {
+		if lis != nil {
+			log.Info().Str("addr", lis.Addr().String()).Msg("gRPC listener inherited from systemd socket unit")
+		} else {
+			var lerr error
+			lis, lerr = net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
+			if lerr != nil {
+				log.Fatal().Err(lerr).Int("port", cfg.GRPCPort).Msg("failed to listen")
+			}
 		}
 	}
 	// Set explicitly, else gRPC clients self-cap at 100 streams/conn
@@ -1281,6 +1352,11 @@ func main() {
 	// inventory they never use.
 	startupReady.Store(true)
 	log.Info().Msg("startup complete — gRPC serving requests")
+	// Report readiness to systemd (Type=notify). No-op when not socket-notified.
+	if err := sdnotify.Ready(); err != nil {
+		log.Warn().Err(err).Msg("sd_notify READY failed")
+	}
+	_ = sdnotify.Status("serving")
 
 	// ---- Wait for signal or service failure ----
 	sigCh := make(chan os.Signal, 1)
@@ -1315,12 +1391,17 @@ func main() {
 	}()
 
 	lc.wait(ctx)
-	cancel() // propagate cancellation to any service still blocked on ctx
+	_ = sdnotify.Stopping() // tell systemd we are draining (no-op if not notified)
+	cancel()                // propagate cancellation to any service still blocked on ctx
 
 	// ---- Run closers in LIFO order with a hard deadline ----
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 	lc.shutdown(shutdownCtx)
+	// Hold the writer lease until the process is truly done: an os.File is
+	// finalizer-closed if it becomes unreachable, which would release the flock
+	// early. KeepAlive pins it to here.
+	runtime.KeepAlive(writerLease)
 
 	if lc.firstErr != nil {
 		log.Error().Err(lc.firstErr).Str("service", lc.errName).Msg("VM daemon shutdown after service error")
