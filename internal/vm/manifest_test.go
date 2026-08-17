@@ -37,6 +37,24 @@ func TestHashFile(t *testing.T) {
 	}
 }
 
+func TestAllocatedBytesUnavailableIsDistinctFromZero(t *testing.T) {
+	if value, ok := allocatedBytes(filepath.Join(t.TempDir(), "missing")); ok || value != 0 {
+		t.Fatalf("missing allocation = (%d, %v), want unavailable", value, ok)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	value, ok := allocatedBytes(path)
+	if !ok {
+		t.Fatal("empty file allocation measurement unavailable")
+	}
+	if value < 0 {
+		t.Fatalf("empty file allocation = %d, want non-negative", value)
+	}
+}
+
 func TestCollectPauseManifest(t *testing.T) {
 	dir := t.TempDir()
 	vmstate := filepath.Join(dir, "vmstate.snap")

@@ -22,8 +22,10 @@ type ManifestEntry struct {
 	FileName  string
 	Path      string
 	SizeBytes int64
-	SHA256    string
-	BasePath  string
+	// -1 means the host could not read allocation metadata; zero is valid.
+	AllocatedBytes int64
+	SHA256         string
+	BasePath       string
 }
 
 // Client defines the subset of the VM daemon gRPC interface used by the
@@ -183,16 +185,20 @@ type BuildLogEvent struct {
 // BuildStatusResult is the decoded form of vmdpb.GetBuildStatusResponse.
 // Status values: "running", "snapshotting", "ready", "failed", "cancelled".
 type BuildStatusResult struct {
-	NotFound       bool
-	Status         string
-	SnapshotPath   string // populated on ready
-	MemFilePath    string // populated on ready
-	RootfsPath     string // populated on ready
-	BasePath       string // populated on ready, overlay-mode templates only
-	DeltaPath      string // populated on ready, overlay-mode templates only
-	ResolvedDigest string // populated on ready
-	SizeBytes      int64  // populated on ready
-	ErrorMessage   string // populated on failed/cancelled
-	StartedAtUnix  int64
-	EndedAtUnix    int64
+	NotFound                bool
+	Status                  string
+	SnapshotPath            string // populated on ready
+	MemFilePath             string // populated on ready
+	RootfsPath              string // populated on ready
+	BasePath                string // populated on ready, overlay-mode templates only
+	DeltaPath               string // populated on ready, overlay-mode templates only
+	ResolvedDigest          string // populated on ready
+	SizeBytes               int64  // populated on ready
+	RootfsAllocatedBytes    int64  // populated on ready
+	BaseAllocatedBytes      int64  // populated on ready
+	DeltaAllocatedBytes     int64  // populated on ready
+	AllocatedBytesSupported bool   // true when the daemon populated allocation fields
+	ErrorMessage            string // populated on failed/cancelled
+	StartedAtUnix           int64
+	EndedAtUnix             int64
 }

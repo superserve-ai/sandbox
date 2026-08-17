@@ -242,6 +242,7 @@ func loadDurableBuild(snapshotRoot, buildVMID string) (BuildStatusSnapshot, bool
 	if err != nil || !buildArtifactsPresent(res) {
 		return BuildStatusSnapshot{}, false
 	}
+	populateBuildAllocations(res)
 	return BuildStatusSnapshot{
 		BuildVMID:  buildVMID,
 		TemplateID: filepath.Base(filepath.Dir(dir)),
@@ -266,6 +267,15 @@ func buildArtifactsPresent(r *BuildTemplateResult) bool {
 		}
 	}
 	return true
+}
+
+func populateBuildAllocations(result *BuildTemplateResult) {
+	if result == nil {
+		return
+	}
+	result.RootfsAllocatedBytes = physicalAllocatedBytes(result.RootfsPath)
+	result.BaseAllocatedBytes = physicalAllocatedBytes(result.BasePath)
+	result.DeltaAllocatedBytes = physicalAllocatedBytes(result.DeltaPath)
 }
 
 // CancelBuild marks a build cancelled and signals its template-builder

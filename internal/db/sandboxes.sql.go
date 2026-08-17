@@ -1267,17 +1267,26 @@ fresh AS (
   SELECT unnest($8::text[]) AS file_name,
          unnest($9::text[])      AS path,
          unnest($10::bigint[])    AS size_bytes,
-         unnest($11::text[])    AS sha256,
-         unnest($12::text[]) AS base_path
+         unnest($11::bigint[]) AS allocated_bytes,
+         unnest($12::text[])    AS sha256,
+         unnest($13::text[]) AS base_path
 ),
 kept AS (
-  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
-  SELECT u.snap_id, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
+  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256, base_path)
+  SELECT u.snap_id, f.file_name, f.path, f.size_bytes,
+         CASE WHEN f.allocated_bytes IS NULL OR f.allocated_bytes < 0 THEN
+                COALESCE((SELECT am.allocated_bytes
+                          FROM artifact_manifest am
+                          WHERE am.snapshot_id = u.snap_id
+                            AND am.file_name = f.file_name), 0)
+              ELSE COALESCE(f.allocated_bytes, 0) END,
+         f.sha256, NULLIF(f.base_path, '')
   FROM upserted u CROSS JOIN fresh f
   ON CONFLICT (snapshot_id, file_name) WHERE snapshot_id IS NOT NULL
   DO UPDATE SET
       path = EXCLUDED.path,
       size_bytes = EXCLUDED.size_bytes,
+      allocated_bytes = EXCLUDED.allocated_bytes,
       sha256 = EXCLUDED.sha256,
       base_path = EXCLUDED.base_path,
       created_at = now()
@@ -1303,18 +1312,19 @@ RETURNING upserted.snap_id::uuid AS snapshot_id
 `
 
 type FinalizePauseParams struct {
-	ID                uuid.UUID `json:"id"`
-	TeamID            uuid.UUID `json:"team_id"`
-	Path              string    `json:"path"`
-	MemPath           *string   `json:"mem_path"`
-	SizeBytes         int64     `json:"size_bytes"`
-	Trigger           string    `json:"trigger"`
-	PauseToken        string    `json:"pause_token"`
-	ManifestFileNames []string  `json:"manifest_file_names"`
-	ManifestPaths     []string  `json:"manifest_paths"`
-	ManifestSizes     []int64   `json:"manifest_sizes"`
-	ManifestDigests   []string  `json:"manifest_digests"`
-	ManifestBasePaths []string  `json:"manifest_base_paths"`
+	ID                     uuid.UUID `json:"id"`
+	TeamID                 uuid.UUID `json:"team_id"`
+	Path                   string    `json:"path"`
+	MemPath                *string   `json:"mem_path"`
+	SizeBytes              int64     `json:"size_bytes"`
+	Trigger                string    `json:"trigger"`
+	PauseToken             string    `json:"pause_token"`
+	ManifestFileNames      []string  `json:"manifest_file_names"`
+	ManifestPaths          []string  `json:"manifest_paths"`
+	ManifestSizes          []int64   `json:"manifest_sizes"`
+	ManifestAllocatedBytes []int64   `json:"manifest_allocated_bytes"`
+	ManifestDigests        []string  `json:"manifest_digests"`
+	ManifestBasePaths      []string  `json:"manifest_base_paths"`
 }
 
 // Upsert the sandbox's live snapshot row and flip status to 'paused'.
@@ -1344,6 +1354,7 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (u
 		arg.ManifestFileNames,
 		arg.ManifestPaths,
 		arg.ManifestSizes,
+		arg.ManifestAllocatedBytes,
 		arg.ManifestDigests,
 		arg.ManifestBasePaths,
 	)
@@ -1387,12 +1398,21 @@ fresh AS (
   SELECT unnest($8::text[]) AS file_name,
          unnest($9::text[])      AS path,
          unnest($10::bigint[])    AS size_bytes,
-         unnest($11::text[])    AS sha256,
-         unnest($12::text[]) AS base_path
+         unnest($11::bigint[]) AS allocated_bytes,
+         unnest($12::text[])    AS sha256,
+         unnest($13::text[]) AS base_path
 ),
 manifested AS (
-  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
-  SELECT i.snap_id, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
+  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256, base_path)
+  SELECT i.snap_id, f.file_name, f.path, f.size_bytes,
+         CASE WHEN f.allocated_bytes IS NULL OR f.allocated_bytes < 0 THEN
+                COALESCE((SELECT am.allocated_bytes
+                          FROM artifact_manifest am
+                          JOIN sandbox sb ON sb.snapshot_id = am.snapshot_id
+                          WHERE sb.id = $1
+                            AND am.file_name = f.file_name), 0)
+              ELSE COALESCE(f.allocated_bytes, 0) END,
+         f.sha256, NULLIF(f.base_path, '')
   FROM inserted i CROSS JOIN fresh f
   RETURNING id
 )
@@ -1408,18 +1428,19 @@ RETURNING inserted.snap_id::uuid AS snapshot_id
 `
 
 type FinalizePauseGenerationParams struct {
-	ID                uuid.UUID   `json:"id"`
-	TeamID            uuid.UUID   `json:"team_id"`
-	Path              string      `json:"path"`
-	MemPath           *string     `json:"mem_path"`
-	SizeBytes         interface{} `json:"size_bytes"`
-	Trigger           string      `json:"trigger"`
-	PauseToken        string      `json:"pause_token"`
-	ManifestFileNames []string    `json:"manifest_file_names"`
-	ManifestPaths     []string    `json:"manifest_paths"`
-	ManifestSizes     []int64     `json:"manifest_sizes"`
-	ManifestDigests   []string    `json:"manifest_digests"`
-	ManifestBasePaths []string    `json:"manifest_base_paths"`
+	ID                     uuid.UUID   `json:"id"`
+	TeamID                 uuid.UUID   `json:"team_id"`
+	Path                   string      `json:"path"`
+	MemPath                *string     `json:"mem_path"`
+	SizeBytes              interface{} `json:"size_bytes"`
+	Trigger                string      `json:"trigger"`
+	PauseToken             string      `json:"pause_token"`
+	ManifestFileNames      []string    `json:"manifest_file_names"`
+	ManifestPaths          []string    `json:"manifest_paths"`
+	ManifestSizes          []int64     `json:"manifest_sizes"`
+	ManifestAllocatedBytes []int64     `json:"manifest_allocated_bytes"`
+	ManifestDigests        []string    `json:"manifest_digests"`
+	ManifestBasePaths      []string    `json:"manifest_base_paths"`
 }
 
 // Generations-mode finalize: INSERT a new snapshot row per pause instead of
@@ -1441,6 +1462,7 @@ func (q *Queries) FinalizePauseGeneration(ctx context.Context, arg FinalizePause
 		arg.ManifestFileNames,
 		arg.ManifestPaths,
 		arg.ManifestSizes,
+		arg.ManifestAllocatedBytes,
 		arg.ManifestDigests,
 		arg.ManifestBasePaths,
 	)
