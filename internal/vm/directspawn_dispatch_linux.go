@@ -296,6 +296,14 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 	}
 	if err := waitForSocket(socketPath, socketWait); err != nil {
 		m.log.Warn().Str("vm_id", vmID).Err(err).Msg("firecracker socket missing after direct launch")
+		// Emit the coarse phases with the exhausted wait: the slowest launch
+		// incidents must form the histogram's tail, not vanish from it.
+		m.recordPhases("launch", "direct", map[string]time.Duration{
+			"stop_prior":  stopPrior,
+			"prestart":    tStart.Sub(tPrestart),
+			"spawn":       tSpawnDone.Sub(tStart),
+			"wait_socket": time.Since(tSpawnDone),
+		})
 		_ = m.cgroups.killVMCgroup(context.WithoutCancel(ctx), vmID, directCgroupStopBudget)
 		m.awaitReaper(vmID)
 		_ = m.cgroups.removeVMCgroup(context.WithoutCancel(ctx), vmID)

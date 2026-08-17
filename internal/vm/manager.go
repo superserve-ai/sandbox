@@ -2909,6 +2909,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 		}
 		m.setStatus(vmID, StatusError)
+		// Emit the exhausted readiness wait: cold/unhealthy restores must
+		// form the wait_boxd tail, not disappear from it.
+		m.recordPhases("restore", "", map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
 	tBoxdReady := time.Now()
@@ -5119,6 +5122,14 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		status := unitFailureSummary(ctx, systemdUnitName(vmID))
 		m.log.Warn().Str("vm_id", vmID).Str("unit_state", status).Err(err).
 			Msg("firecracker socket missing after launch")
+		// Emit the coarse phases with the exhausted wait: the slowest launch
+		// incidents must form the histogram's tail, not vanish from it.
+		m.recordPhases("launch", "unit", map[string]time.Duration{
+			"prestart":    tStartUnit.Sub(tPrestart),
+			"linger":      time.Duration(lingerCheckMs) * time.Millisecond,
+			"start_unit":  tStartUnitDone.Sub(tStartUnit),
+			"wait_socket": time.Since(tStartUnitDone),
+		})
 		// Detached budget: the caller's ctx may be at its deadline here, and
 		// this stop must run or the just-launched unit leaks.
 		_ = stopUnitWithBudget(ctx, systemdUnitName(vmID))
