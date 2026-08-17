@@ -297,7 +297,13 @@ func (s *StateStore) Path() string { return s.db.Path() }
 
 // OpenStateStore opens (or creates) the BoltDB file at path.
 func OpenStateStore(path string) (*StateStore, error) {
-	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 1 * time.Second})
+	// NoFreelistSync stops bbolt writing+fsyncing the freelist on every commit,
+	// whose cost otherwise grows with the DB's free-page count (churn) and adds
+	// up on write paths like pause. The freelist is rebuilt from the page tree
+	// on the next open — startup already scans every record below — so this is a
+	// pure write-side win with no data-safety cost (data pages and meta are
+	// still synced).
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 1 * time.Second, NoFreelistSync: true})
 	if err != nil {
 		return nil, fmt.Errorf("open state store %s: %w", path, err)
 	}
@@ -445,8 +451,12 @@ func (s *StateStore) PutIfPresent(rec VMRecord) (bool, error) {
 // monotonically safe (worst case a spurious full snapshot next pause, never a
 // diff against a stale bitmap). No-op if the record is absent or already
 // disarmed.
+//
+// Uses Update, not Batch: this is on the synchronous pre-snapshot path, where
+// Batch's coalescing delay would add latency; the read-and-conditional-write
+// stays in one transaction so there is no read-then-write race.
 func (s *StateStore) ClearDirtyTrackingArmed(vmID string) error {
-	return s.db.Batch(func(tx *bolt.Tx) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
 		records := tx.Bucket(bucketName)
 		key := []byte(vmID)
 		data := records.Get(key)
