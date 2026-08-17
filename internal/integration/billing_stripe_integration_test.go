@@ -44,6 +44,15 @@ type fakeStripeClient struct {
 	nextPortalURL   string
 }
 
+type thinEventStripeClient struct {
+	*fakeStripeClient
+	retrieved json.RawMessage
+}
+
+func (f *thinEventStripeClient) RetrieveEvent(context.Context, string) (json.RawMessage, error) {
+	return f.retrieved, nil
+}
+
 func (f *fakeStripeClient) CreateCustomer(_ context.Context, params api.StripeCreateCustomerParams) (api.StripeCustomer, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -831,6 +840,46 @@ func TestIntegration_StripeWebhookDuplicateDeliveryIsSafe(t *testing.T) {
 	}
 	if !account.StripeSubscriptionEventAt.Valid || !account.StripeSubscriptionEventAt.Time.Equal(createdAt) {
 		t.Fatalf("subscription event at = %v, want %v", account.StripeSubscriptionEventAt, createdAt)
+	}
+}
+
+func TestIntegration_StripeThinMeterErrorReconcilesByIdempotencyKey(t *testing.T) {
+	ctx := context.Background()
+	teamID, periodID, periodStart, periodEnd := seedBillingPeriodForStripe(t, true, true)
+	adminID := seedPlatformAdminProfile(t)
+	baseStripe := &fakeStripeClient{}
+	if w := doInternal(newBillingRouter(t, baseStripe), "POST", "/internal/teams/"+teamID.String()+"/billing/periods/"+periodID+"/export", adminID.String(), ""); w.Code != http.StatusOK {
+		t.Fatalf("live export: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	rows, err := testQueries.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd})
+	if err != nil || len(rows) == 0 || rows[0].StripeIdempotencyKey == nil {
+		t.Fatalf("load live export attempts: err=%v rows=%d", err, len(rows))
+	}
+	fullData, err := json.Marshal(map[string]any{
+		"developer_message_summary": "There is 1 invalid event",
+		"reason":                    map[string]any{"error_types": []any{map[string]any{"sample_errors": []any{map[string]any{"request": map[string]any{"idempotency_key": *rows[0].StripeIdempotencyKey}}}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrieved, err := json.Marshal(map[string]json.RawMessage{"data": fullData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripe := &thinEventStripeClient{fakeStripeClient: &fakeStripeClient{}, retrieved: retrieved}
+	r := newBillingRouter(t, stripe)
+	payload, err := json.Marshal(map[string]any{"id": "evt_thin_meter_error", "type": "v1.billing.meter.error_report_triggered", "created": "2026-07-02T12:00:00.000Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC()))
+	if w := doRequest(r, req); w.Code != http.StatusOK {
+		t.Fatalf("thin meter webhook: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := exportAttemptCount(t, teamID, "failed"); got == 0 {
+		t.Fatal("thin meter webhook did not mark the matched export failed")
 	}
 }
 
