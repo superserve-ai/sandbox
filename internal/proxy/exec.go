@@ -112,9 +112,10 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 	// are what split it further.
 	var (
 		upstreamStatus int
-		ttfbMs         int64 = -1
-		boxdSpawnMs    int64 = -1
-		boxdRunMs      int64 = -1
+		ttfb           time.Duration = -1
+		ttfbMs         int64         = -1
+		boxdSpawnMs    int64         = -1
+		boxdRunMs      int64         = -1
 		tProxy         time.Time
 	)
 
@@ -137,7 +138,9 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		// -1: stream each chunk as it arrives — required for SSE.
 		FlushInterval: -1,
 		ModifyResponse: func(resp *http.Response) error {
-			ttfbMs = time.Since(tProxy).Milliseconds()
+			// Raw duration for the histogram (sub-ms buckets); ms for the log.
+			ttfb = time.Since(tProxy)
+			ttfbMs = ttfb.Milliseconds()
 			upstreamStatus = resp.StatusCode
 			boxdSpawnMs = headerMs(resp, "X-Boxd-Spawn-Ms")
 			boxdRunMs = headerMs(resp, "X-Boxd-Run-Ms")
@@ -176,7 +179,7 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 			"auth":       tAuthDone.Sub(tStart),
 			"boxd_spawn": time.Duration(boxdSpawnMs) * time.Millisecond,
 			"run":        time.Duration(boxdRunMs) * time.Millisecond,
-			"ttfb":       time.Duration(ttfbMs) * time.Millisecond,
+			"ttfb":       ttfb,
 			"total":      time.Since(tStart),
 		} {
 			if d < 0 {
