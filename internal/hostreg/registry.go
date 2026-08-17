@@ -72,6 +72,16 @@ func (r *Registry) recheckTTL() time.Duration {
 	return addrRecheckTTL
 }
 
+// verifyFailureBackoff paces re-verification while the host row is
+// unreadable: capped at 5s so convergence after a reclaim stays quick once
+// the DB recovers, and never longer than the recheck TTL itself.
+func (r *Registry) verifyFailureBackoff() time.Duration {
+	if ttl := r.recheckTTL(); ttl < 5*time.Second {
+		return ttl
+	}
+	return 5 * time.Second
+}
+
 // ClientFor returns the VMD client for the given host. A cached client
 // within its verification window is returned as-is; anything else — first
 // use, or a client past the recheck TTL — resolves against the host row
@@ -118,9 +128,18 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				// unreadable row: retry, then fail closed — the
 				// invalidation had a reason, and dispatching past it risks
 				// the machine that lost the identity.
-				r.mu.RLock()
+				r.mu.Lock()
 				e, ok := r.clients[hostID]
-				r.mu.RUnlock()
+				if ok {
+					// Bounded backoff: leave the entry "fresh" for a short
+					// window so a degraded DB is retried on a pace, not on
+					// every call. An invalidation still cuts through — it
+					// deletes the entry, and this bump only touches one
+					// that survived.
+					e.checkedAt = time.Now().Add(r.verifyFailureBackoff() - r.recheckTTL())
+					r.clients[hostID] = e
+				}
+				r.mu.Unlock()
 				if ok {
 					log.Warn().Err(err).Str("host_id", hostID).
 						Msg("host address verification failed; dispatching via cached client")

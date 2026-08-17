@@ -23,6 +23,7 @@ type hostDB struct {
 	addr     string
 	failRead bool
 	gate     chan struct{} // non-nil: QueryRow waits until closed
+	reads    atomic.Int64
 }
 
 func (h *hostDB) setAddr(a string) { h.mu.Lock(); h.addr = a; h.mu.Unlock() }
@@ -37,6 +38,8 @@ type errRow struct{ err error }
 
 func (r errRow) Scan(...any) error { return r.err }
 
+func (h *hostDB) readCount() int64 { return h.reads.Load() }
+
 func (h *hostDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec")
 }
@@ -44,6 +47,7 @@ func (h *hostDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	return nil, fmt.Errorf("unexpected Query")
 }
 func (h *hostDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
+	h.reads.Add(1)
 	h.mu.Lock()
 	addr, fail, gate := h.addr, h.failRead, h.gate
 	h.mu.Unlock()
@@ -208,6 +212,51 @@ func TestClientForServesCachedOnReadBlipWithoutInvalidation(t *testing.T) {
 	}
 	if dials.Load() != 1 {
 		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+}
+
+// Sustained read failure must not become a read (and a warning) per call:
+// the failed verification backs off, serving the cached client without
+// touching the DB until the backoff lapses.
+func TestClientForBacksOffFailedVerification(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+	r.recheck = 100 * time.Millisecond // backoff = min(5s, ttl) = 100ms
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Expire the entry and break the DB.
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.checkedAt = time.Now().Add(-time.Second)
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+	store.setFailRead(true)
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("degraded ClientFor: %v", err)
+	}
+	after := store.readCount() // seed read + 1 failed verification
+
+	// Immediate repeat calls stay inside the backoff: zero further reads.
+	for i := 0; i < 10; i++ {
+		if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+			t.Fatalf("backoff ClientFor %d: %v", i, err)
+		}
+	}
+	if got := store.readCount(); got != after {
+		t.Fatalf("reads during backoff = %d, want %d (no per-call reads)", got, after)
+	}
+
+	// Past the backoff, verification is retried again.
+	time.Sleep(120 * time.Millisecond)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("post-backoff ClientFor: %v", err)
+	}
+	if got := store.readCount(); got != after+1 {
+		t.Fatalf("reads after backoff = %d, want %d (one paced retry)", got, after+1)
 	}
 }
 
