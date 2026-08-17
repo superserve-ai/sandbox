@@ -1368,9 +1368,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			return "", "", nil, fmt.Errorf("write-ahead disarm before pause snapshot for vm %s: %w", vmID, err)
 		}
 	}
-	// snapshotType classifies which memory image this pause wrote, for the phase
-	// log below: "full" writes the whole guest RAM (seconds), "layered"/"diff"
-	// write only dirtied pages (fast). It defaults to "full" so the two Full
+	// snapshotType for the phase log below; defaults to "full" so the two Full
 	// branches need no assignment.
 	snapshotType := "full"
 	tSnapStart := time.Now()
@@ -1575,13 +1573,11 @@ func shouldRearmDirtyTracking(enabled bool, rec VMRecord) bool {
 }
 
 // writeAheadDisarm clears the in-memory dirty-tracking flag and durably clears
-// the persisted armed bit BEFORE returning, so a snapshot that is about to
-// reset Firecracker's dirty bitmap cannot leave a stale armed=true for a later
-// reattach to trust. Callers that hold no vm-op lock are safe: the field-level
-// clear never clobbers a concurrent lifecycle op, and disarming is monotonically
-// safe (worst case a spurious Full snapshot, never a diff against a stale
-// bitmap). Returns an error only if the durable clear fails, so the caller can
-// refuse the snapshot rather than proceed on an un-disarmed record.
+// the persisted armed bit before returning, so a snapshot about to reset
+// Firecracker's dirty bitmap cannot leave a stale armed=true for a later
+// reattach to trust. Returns an error only if the durable clear fails, so the
+// caller can refuse the snapshot rather than proceed un-disarmed. Callers hold
+// the vm-op lock across this and the snapshot.
 func (m *Manager) writeAheadDisarm(inst *VMInstance) error {
 	inst.mu.Lock()
 	inst.DirtyTracked = false

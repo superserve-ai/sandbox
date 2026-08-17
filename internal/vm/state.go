@@ -438,17 +438,11 @@ func (s *StateStore) PutIfPresent(rec VMRecord) (bool, error) {
 }
 
 // ClearDirtyTrackingArmed durably clears the dirty-tracking-armed bit on a
-// record, touching no other field. Snapshot paths that reset Firecracker's
-// dirty bitmap use this to disarm ahead of the reset while holding no vm-op
-// lock: a whole-record write from such a path could roll back a concurrent
-// lifecycle op's changes, whereas a field-level clear cannot — and disarming is
-// monotonically safe (worst case a spurious full snapshot next pause, never a
-// diff against a stale bitmap). No-op if the record is absent or already
-// disarmed.
-//
-// Uses Update, not Batch: this is on the synchronous pre-snapshot path, where
-// Batch's coalescing delay would add latency; the read-and-conditional-write
-// stays in one transaction so there is no read-then-write race.
+// record, touching no other field, so a snapshot path can disarm ahead of a
+// bitmap-resetting snapshot. Field-level rather than a whole-record write so it
+// preserves any newer fields a rollback binary wouldn't know about. No-op if the
+// record is absent or already disarmed. Uses Update, not Batch, to avoid the
+// coalescing delay on this synchronous pre-snapshot path.
 func (s *StateStore) ClearDirtyTrackingArmed(vmID string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		records := tx.Bucket(bucketName)
