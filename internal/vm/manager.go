@@ -1266,6 +1266,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	}
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
+	tPauseStart := time.Now()
 
 	// Retried pause (response lost mid-RPC): re-snapshotting a stopped VM
 	// dials a dead socket and ends with the record deleted. Return the
@@ -1364,6 +1365,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			return "", "", nil, fmt.Errorf("write-ahead disarm before pause snapshot for vm %s: %w", vmID, err)
 		}
 	}
+	// snapshotType classifies which memory image this pause wrote, for the phase
+	// log below: "full" writes the whole guest RAM (seconds), "layered"/"diff"
+	// write only dirtied pages (fast). It defaults to "full" so the two Full
+	// branches need no assignment.
+	snapshotType := "full"
+	tSnapStart := time.Now()
 	switch {
 	case layered:
 		memPath = overlayPath
@@ -1394,6 +1401,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			}
 		}
 		if usable {
+			snapshotType = "layered"
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
 			saveStart := time.Now()
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
@@ -1424,6 +1432,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// mem.snap when tracking was armed this run and mem.snap is the resume base —
 		// dirtied offsets are resident/never re-faulted, disjoint from clean reads.
 		if shouldWriteDiff(m.cfg.IncrementalSnapshotEnabled, dirtyTracked, memPath, instMemFile, fileExists(memPath)) {
+			snapshotType = "diff"
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating diff snapshot")
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create diff snapshot: %w", err))
@@ -1435,6 +1444,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			}
 		}
 	}
+
+	tSnapDone := time.Now()
 
 	// Stop the Firecracker process — snapshot is already on disk. A stop
 	// that fails must NOT fail the pause: the artifacts are valid and the
@@ -1468,6 +1479,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		}
 	}
 	stopCancel()
+	tStopDone := time.Now()
 
 	inst.mu.Lock()
 	inst.Status = StatusPaused
@@ -1529,7 +1541,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		go m.rehashPendingBackup(ctx, pb, log)
 	}
 
-	log.Info().Msg("VM paused")
+	log.Info().
+		Str("snapshot_type", snapshotType).
+		Int64("snapshot_ms", tSnapDone.Sub(tSnapStart).Milliseconds()).
+		Int64("stop_ms", tStopDone.Sub(tSnapDone).Milliseconds()).
+		Int64("pause_ms", time.Since(tPauseStart).Milliseconds()).
+		Msg("VM paused")
 	return snapshotPath, memPath, manifest, nil
 }
 
