@@ -25,6 +25,8 @@ func (r *captureTelemetryRecorder) RecordSandboxTransition(_ context.Context, t 
 func (r *captureTelemetryRecorder) RecordSandboxResumeSettleWait(context.Context, telemetry.SandboxResumeSettleWait) {
 }
 func (r *captureTelemetryRecorder) RecordVMDCall(context.Context, telemetry.VMDCall) {}
+func (r *captureTelemetryRecorder) RecordHostResolution(context.Context, telemetry.HostResolution) {
+}
 func (r *captureTelemetryRecorder) RecordHostCapacity(context.Context, telemetry.HostCapacity) {
 }
 func (r *captureTelemetryRecorder) RecordDBPoolStats(context.Context, telemetry.DBPoolStats) {}
