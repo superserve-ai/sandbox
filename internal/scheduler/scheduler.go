@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -64,7 +66,24 @@ func (s *LeastLoaded) SelectHost(ctx context.Context, requiredCapabilities []str
 	}
 	if len(hosts) == 0 {
 		if s.DefaultHostID != "" {
-			return s.DefaultHostID, nil
+			// The legacy fallback exists so creation works before the host
+			// table is populated. It must not route to a row that exists in
+			// a non-active state — a freshly self-registered 'provisioning'
+			// host under the default ID would take traffic before an
+			// operator activates it.
+			host, err := s.DB.GetHost(ctx, s.DefaultHostID)
+			switch {
+			case errors.Is(err, pgx.ErrNoRows):
+				return s.DefaultHostID, nil // unpopulated table: bootstrap path
+			case err != nil:
+				return "", err
+			case host.Status == "active":
+				// Present but filtered out by capabilities; the create-time
+				// capability gate still enforces. Preserves prior behavior.
+				return s.DefaultHostID, nil
+			default:
+				return "", fmt.Errorf("no active hosts available (default host is %s)", host.Status)
+			}
 		}
 		return "", fmt.Errorf("no active hosts available")
 	}
