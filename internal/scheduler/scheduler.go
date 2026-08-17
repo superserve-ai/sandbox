@@ -24,6 +24,14 @@ type Scheduler interface {
 
 const defaultCacheTTL = 30 * time.Second
 
+// hostsFillTimeout bounds every candidate-set fill, blocking and background
+// alike. This is a published contract, not just hygiene: a fill that reads
+// the host set before a drain commits and finishes after it stamps a
+// pre-drain view as fresh, so the drain's total staleness budget is
+// TTL + grace + THIS bound. hostctl's drain convergence window is derived
+// from that sum — widening this widens what --wait must cover.
+const hostsFillTimeout = 5 * time.Second
+
 // LeastLoaded picks the active host with the fewest running sandboxes
 // using the "power of two random choices" algorithm. Instead of always
 // picking the globally least-loaded host (which causes thundering herd
@@ -160,7 +168,7 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 		if time.Since(entry.cachedAt) >= s.ttl() && s.refreshing.CompareAndSwap(false, true) {
 			// Detached: the refresh outlives the triggering request. On error the
 			// stale set stays servable and the next expired call retries.
-			qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostsFillTimeout)
 			go func() {
 				defer cancel()
 				defer s.refreshing.Store(false)
@@ -192,7 +200,13 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	if entry, ok := s.cache[key]; ok && time.Since(entry.cachedAt) < s.ttl()+hostsStaleGrace {
 		return entry, nil
 	}
-	fresh, err := s.fillEntry(ctx, normalized)
+	// Bound the blocking fill like the background refresh: fill duration
+	// extends how long a pre-drain read of the host set can be stamped as
+	// fresh after the drain commits, so ops tooling (hostctl --wait) can
+	// only budget for it if it has a hard ceiling.
+	fillCtx, fillCancel := context.WithTimeout(ctx, hostsFillTimeout)
+	fresh, err := s.fillEntry(fillCtx, normalized)
+	fillCancel()
 	if err != nil {
 		return hostCacheEntry{}, err
 	}

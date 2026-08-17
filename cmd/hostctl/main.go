@@ -73,12 +73,15 @@ func main() {
 // the longest admitted-but-uninserted create plus its failure cleanup, not
 // merely a few polls:
 //
-//	drainConvergence — scheduler cache TTL + stale grace (30s+30s): when
-//	  the last stale replica can still ADMIT a create.
+//	drainConvergence — when the last stale replica can still ADMIT a
+//	  create: scheduler cache TTL + stale grace (30s+30s), PLUS the fill
+//	  bound (5s — a fill that reads the host set before the drain commits
+//	  and finishes after it stamps a pre-drain view as fresh at its END),
+//	  plus margin. Derivation lives with scheduler.hostsFillTimeout.
 //	drainQuietWindow — continuous zeros required AFTER that: 2×30s boot
 //	  (incl. retry) + insert/cleanup visibility margin.
 const (
-	drainConvergence = 60 * time.Second
+	drainConvergence = 70 * time.Second
 	drainQuietWindow = 90 * time.Second
 	drainPollEvery   = 5 * time.Second
 	drainWaitCeiling = 15 * time.Minute
