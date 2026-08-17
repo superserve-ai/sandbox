@@ -206,11 +206,11 @@ func TestClientForServesCachedOnReadBlipWithinLease(t *testing.T) {
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	// Verification due (checkedAt aged), but the last successful
-	// verification is recent: within the lease.
+	// Verification due now, but the last successful verification is
+	// recent: within the lease.
 	r.mu.Lock()
 	e := r.clients["host-a"]
-	e.checkedAt = time.Now().Add(-150 * time.Millisecond)
+	e.nextCheckAt = time.Now()
 	r.clients["host-a"] = e
 	r.mu.Unlock()
 	store.setFailRead(true)
@@ -240,7 +240,7 @@ func TestClientForFailsClosedPastUnverifiedLease(t *testing.T) {
 	}
 	r.mu.Lock()
 	e := r.clients["host-a"]
-	e.checkedAt = time.Now().Add(-300 * time.Millisecond)
+	e.nextCheckAt = time.Now()
 	e.verifiedAt = time.Now().Add(-300 * time.Millisecond)
 	r.clients["host-a"] = e
 	r.mu.Unlock()
@@ -273,7 +273,7 @@ func TestClientForRefreshesAheadOfExpiry(t *testing.T) {
 	reads := store.readCount()
 	r.mu.Lock()
 	e := r.clients["host-a"]
-	e.checkedAt = time.Now().Add(-250 * time.Millisecond) // >80%, still fresh
+	e.nextCheckAt = time.Now().Add(50 * time.Millisecond) // inside the last fifth, still fresh
 	r.clients["host-a"] = e
 	r.mu.Unlock()
 
@@ -312,7 +312,7 @@ func TestClientForBacksOffFailedVerification(t *testing.T) {
 	// Expire the entry and break the DB.
 	r.mu.Lock()
 	e := r.clients["host-a"]
-	e.checkedAt = time.Now().Add(-time.Second)
+	e.nextCheckAt = time.Now().Add(-time.Second)
 	r.clients["host-a"] = e
 	r.mu.Unlock()
 	store.setFailRead(true)
@@ -525,5 +525,78 @@ func TestClientForCanceledCallerStopsWaiting(t *testing.T) {
 			t.Fatal("resolution never completed after the caller abandoned it")
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// With the production ratio (backoff ≪ TTL), a failed verification must NOT
+// re-fire through refresh-ahead: after a failure, the entry sits inside what
+// would be the refresh-ahead window, and only the backoff may schedule the
+// next read. Repeated calls during the backoff do zero reads.
+func TestClientForFailureSuppressesRefreshAhead(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+	r.recheck = 300 * time.Millisecond
+	r.failBackoff = 50 * time.Millisecond // production shape: backoff ≪ TTL
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.nextCheckAt = time.Now()
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+	store.setFailRead(true)
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("degraded ClientFor: %v", err)
+	}
+	after := store.readCount()
+	// nextCheckAt = now+50ms, which is deep inside the 60ms refresh-ahead
+	// margin — the old clock arithmetic would fire a read per call here.
+	for i := 0; i < 10; i++ {
+		if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+			t.Fatalf("backoff ClientFor %d: %v", i, err)
+		}
+	}
+	// Give any (wrong) async refresh a moment to land before asserting.
+	time.Sleep(20 * time.Millisecond)
+	if got := store.readCount(); got != after {
+		t.Fatalf("reads during backoff = %d, want %d (refresh-ahead must stay suppressed while degraded)", got, after)
+	}
+}
+
+// The fast path itself enforces the lease: a failure backoff that outlives
+// the lease must not keep serving — the next call goes to resolution and
+// fails closed while reads are still failing.
+func TestClientForFastPathHonorsLeaseDuringBackoff(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+	r.recheck = 100 * time.Millisecond // lease = 200ms
+	r.failBackoff = 80 * time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Verification due; lease nearly exhausted (30ms left of 200ms).
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.nextCheckAt = time.Now()
+	e.verifiedAt = time.Now().Add(-170 * time.Millisecond)
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+	store.setFailRead(true)
+
+	// Within lease: served, and an 80ms backoff window opens.
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("within-lease ClientFor: %v", err)
+	}
+	// 40ms later the backoff is still open but the lease has expired: the
+	// fast path must refuse and resolution must fail closed.
+	time.Sleep(40 * time.Millisecond)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("lease expired mid-backoff: dispatch must fail closed, got a client")
 	}
 }

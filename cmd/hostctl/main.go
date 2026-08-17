@@ -25,6 +25,7 @@ import (
 func main() {
 	url := flag.String("url", os.Getenv("CONTROL_PLANE_URL"), "control plane base URL (env CONTROL_PLANE_URL)")
 	token := flag.String("token", os.Getenv("OPERATOR_API_TOKEN"), "operator API token (env OPERATOR_API_TOKEN)")
+	wait := flag.Bool("wait", false, "drain only: block until placement has converged and counts read stably zero")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "usage: hostctl [flags] <list|activate|drain> [host-id]\n")
 		flag.PrintDefaults()
@@ -44,7 +45,16 @@ func main() {
 	case cmd == "activate" && arg != "":
 		err = cli.setStatus(arg, "active")
 	case cmd == "drain" && arg != "":
-		err = cli.setStatus(arg, "draining")
+		if err = cli.setStatus(arg, "draining"); err == nil {
+			if *wait {
+				err = cli.waitDrained(arg)
+			} else {
+				fmt.Printf("note: other control-plane replicas may still place work for up to %s\n"+
+					"(scheduler cache TTL + stale grace); do not trust zero counts before that.\n"+
+					"Re-run with --wait, or poll `hostctl list` until counts read stably zero.\n",
+					drainConvergence)
+			}
+		}
 	default:
 		flag.Usage()
 		os.Exit(2)
@@ -52,6 +62,56 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "hostctl:", err)
 		os.Exit(1)
+	}
+}
+
+// Placement fencing is cache-based until the reservation work lands: every
+// control-plane replica keeps serving its cached candidate set for up to
+// the scheduler TTL plus its stale grace (30s+30s). Zero counts observed
+// before that window — or observed only once — prove nothing.
+const (
+	drainConvergence = 60 * time.Second
+	drainPollEvery   = 5 * time.Second
+	drainStablePolls = 3
+	drainWaitCeiling = 15 * time.Minute
+)
+
+// waitDrained blocks through the convergence window, then polls until
+// RUNNING, BUSY, and BUILDS read zero on drainStablePolls consecutive
+// observations. It reports drained — and is explicit that drained is not
+// the same as safe to retire while PAUSED is nonzero.
+func (c client) waitDrained(hostID string) error {
+	fmt.Printf("%s -> draining; waiting %s for placement convergence across replicas...\n",
+		hostID, drainConvergence)
+	time.Sleep(drainConvergence)
+
+	deadline := time.Now().Add(drainWaitCeiling)
+	stable := 0
+	for {
+		h, err := c.hostRow(hostID)
+		if err != nil {
+			return err
+		}
+		busy := h.RunningCount + h.TransitionalCount + h.BuildingCount
+		if busy == 0 {
+			stable++
+		} else {
+			stable = 0
+			fmt.Printf("still busy: running=%d busy=%d builds=%d\n",
+				h.RunningCount, h.TransitionalCount, h.BuildingCount)
+		}
+		if stable >= drainStablePolls {
+			fmt.Printf("%s drained: counts stably zero over %d observations.\n", hostID, drainStablePolls)
+			if h.PausedCount > 0 {
+				fmt.Printf("NOT safe to retire: %d paused sandboxes have their snapshots on this host's local disk.\n",
+					h.PausedCount)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("host %s not drained after %s; see `hostctl list`", hostID, drainWaitCeiling)
+		}
+		time.Sleep(drainPollEvery)
 	}
 }
 
@@ -81,29 +141,52 @@ func (c client) do(method, path string, body io.Reader) (*http.Response, error) 
 	return resp, nil
 }
 
-func (c client) list() error {
+type hostView struct {
+	ID                string  `json:"id"`
+	Status            string  `json:"status"`
+	Region            string  `json:"region"`
+	VMDAddr           string  `json:"vmd_addr"`
+	LastHeartbeatAt   *string `json:"last_heartbeat_at"`
+	RunningCount      int     `json:"running_count"`
+	TransitionalCount int     `json:"transitional_count"`
+	PausedCount       int     `json:"paused_count"`
+	BuildingCount     int     `json:"building_count"`
+}
+
+func (c client) hosts() ([]hostView, error) {
 	resp, err := c.do(http.MethodGet, "/internal/hosts", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Hosts []hostView `json:"hosts"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Hosts, nil
+}
+
+func (c client) hostRow(hostID string) (hostView, error) {
+	hosts, err := c.hosts()
+	if err != nil {
+		return hostView{}, err
+	}
+	for _, h := range hosts {
+		if h.ID == hostID {
+			return h, nil
+		}
+	}
+	return hostView{}, fmt.Errorf("host %q not found", hostID)
+}
+
+func (c client) list() error {
+	hosts, err := c.hosts()
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-
-	var out struct {
-		Hosts []struct {
-			ID              string  `json:"id"`
-			Status          string  `json:"status"`
-			Region          string  `json:"region"`
-			VMDAddr         string  `json:"vmd_addr"`
-			LastHeartbeatAt   *string `json:"last_heartbeat_at"`
-			RunningCount      int     `json:"running_count"`
-			TransitionalCount int     `json:"transitional_count"`
-			PausedCount       int     `json:"paused_count"`
-			BuildingCount     int     `json:"building_count"`
-		} `json:"hosts"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return err
-	}
+	out := struct{ Hosts []hostView }{hosts}
 
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 	// BUSY counts pausing/resuming sandboxes and BUILDS counts in-flight

@@ -33,13 +33,19 @@ const addrRecheckTTL = 30 * time.Second
 type entry struct {
 	client vmdclient.Client
 	addr   string
-	// checkedAt paces verification (bumped by the failure backoff too);
-	// verifiedAt records the last SUCCESSFUL row verification and is the
-	// clock the serve-stale lease runs on. They must stay separate: if the
-	// backoff bumped the lease clock, sustained read failures would extend
-	// the lease forever and "stale" would never fail closed.
-	checkedAt  time.Time
+	// verifiedAt records the last SUCCESSFUL row verification — the clock
+	// the serve-stale lease runs on; it advances only on success, so
+	// sustained read failures run the lease out and fail closed.
 	verifiedAt time.Time
+	// nextCheckAt is when verification becomes due: verifiedAt+TTL after a
+	// success, now+backoff after a failure. Explicit state rather than
+	// arithmetic on one clock, so the failure backoff can never place the
+	// entry inside the refresh-ahead window and defeat its own pacing.
+	nextCheckAt time.Time
+	// degraded marks the last verification attempt as failed. It suppresses
+	// refresh-ahead: while degraded, verification happens only at
+	// nextCheckAt via the blocking path, paced by the backoff.
+	degraded bool
 }
 
 // Registry maps host IDs to VMD clients, cached on first use.
@@ -47,6 +53,10 @@ type Registry struct {
 	db      *db.Queries
 	dial    DialFunc
 	recheck time.Duration // 0 = addrRecheckTTL; tests shorten it
+	// failBackoff overrides verifyFailureBackoff for tests, which need a
+	// backoff strictly shorter than the TTL to reproduce the production
+	// ratio (5s vs 30s) — equal values mask backoff/refresh interactions.
+	failBackoff time.Duration
 
 	mu      sync.RWMutex
 	clients map[string]entry
@@ -82,6 +92,9 @@ func (r *Registry) recheckTTL() time.Duration {
 // unreadable: capped at 5s so convergence after a reclaim stays quick once
 // the DB recovers, and never longer than the recheck TTL itself.
 func (r *Registry) verifyFailureBackoff() time.Duration {
+	if r.failBackoff > 0 {
+		return r.failBackoff
+	}
 	if ttl := r.recheckTTL(); ttl < 5*time.Second {
 		return ttl
 	}
@@ -107,13 +120,19 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 	r.mu.RLock()
 	e, ok := r.clients[hostID]
 	r.mu.RUnlock()
-	if ok && time.Since(e.checkedAt) < r.recheckTTL() {
-		if time.Since(e.checkedAt) >= r.recheckTTL()*4/5 {
+	now := time.Now()
+	// The fast path requires BOTH clocks: not yet due (nextCheckAt) and
+	// still inside the verified lease. Without the lease check here, a
+	// failure backoff could keep serving for its whole window after the
+	// lease expired mid-backoff.
+	if ok && now.Before(e.nextCheckAt) && now.Sub(e.verifiedAt) < r.unverifiedLease() {
+		if !e.degraded && e.nextCheckAt.Sub(now) <= r.recheckTTL()/5 {
 			// Refresh ahead of expiry: warm traffic re-verifies in the
 			// background while still being served fresh, so the blocking
 			// due-verification read almost never lands on a request.
-			// Singleflight dedupes the window's callers; the generation
-			// guard keeps the async result safe.
+			// Suppressed while degraded — after a failure, pacing belongs
+			// to the backoff alone. Singleflight dedupes the window's
+			// callers; the generation guard keeps the async result safe.
 			go func() { _, _ = r.resolveClient(context.WithoutCancel(ctx), hostID) }()
 		}
 		return e.client, nil
@@ -160,12 +179,14 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				e, ok := r.clients[hostID]
 				withinLease := ok && time.Since(e.verifiedAt) < r.unverifiedLease()
 				if withinLease {
-					// Bounded backoff: leave the entry "fresh" for a short
-					// window so a degraded DB is retried on a pace, not on
-					// every call. Bumps checkedAt only — verifiedAt (the
-					// lease clock) advances solely on successful reads, so
+					// Bounded backoff: the next verification is due after
+					// the backoff, not before, and degraded suppresses
+					// refresh-ahead — so a failing DB is retried on the
+					// backoff's pace, never per call. verifiedAt (the lease
+					// clock) advances solely on successful reads, so
 					// sustained failure runs the lease out and fails closed.
-					e.checkedAt = time.Now().Add(r.verifyFailureBackoff() - r.recheckTTL())
+					e.nextCheckAt = time.Now().Add(r.verifyFailureBackoff())
+					e.degraded = true
 					r.clients[hostID] = e
 				}
 				r.mu.Unlock()
@@ -189,7 +210,7 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 			}
 			if e, ok := r.clients[hostID]; ok && e.addr == host.VmdAddr {
 				now := time.Now()
-				e.checkedAt, e.verifiedAt = now, now
+				e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
 				r.clients[hostID] = e
 				r.mu.Unlock()
 				return e.client, nil
@@ -220,7 +241,10 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				continue
 			}
 			now := time.Now()
-			r.clients[hostID] = entry{client: c, addr: host.VmdAddr, checkedAt: now, verifiedAt: now}
+			r.clients[hostID] = entry{
+				client: c, addr: host.VmdAddr,
+				verifiedAt: now, nextCheckAt: now.Add(r.recheckTTL()),
+			}
 			r.mu.Unlock()
 			return c, nil
 		}
