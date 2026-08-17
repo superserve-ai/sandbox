@@ -73,9 +73,10 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 		return
 	}
 
-	if _, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
 		ID: sandboxID, TeamID: teamID,
-	}); err != nil {
+	})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			respondError(c, ErrSandboxNotFound)
 			return
@@ -84,6 +85,7 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	l := sandboxLogger(sandbox.ID.String(), sandbox.HostID)
 
 	limit, err := parseAuditLimit(c.Query("limit"))
 	if err != nil {
@@ -114,7 +116,7 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 		CursorTs: cursor.ts, CursorKind: cursor.kind, CursorID: cursor.id,
 	})
 	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListNetFlowEvents failed")
+		l.Error().Err(err).Msg("DB ListNetFlowEvents failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -127,7 +129,7 @@ func (h *Handlers) GetSandboxNetwork(c *gin.Context) {
 			CursorTs: cursor.ts, CursorKind: cursor.kind, CursorID: cursor.id,
 		})
 		if err != nil {
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB ListProxyAuditEvents failed")
+			l.Error().Err(err).Msg("DB ListProxyAuditEvents failed")
 			respondError(c, ErrInternal)
 			return
 		}

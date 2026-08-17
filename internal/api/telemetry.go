@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
@@ -64,6 +66,17 @@ func telemetryHostID(c *gin.Context) string {
 	}
 	hostID, _ := v.(string)
 	return hostID
+}
+
+func sandboxLogger(sandboxID, hostID string) zerolog.Logger {
+	return sandboxLoggerFrom(log.Logger, sandboxID, hostID)
+}
+
+func sandboxLoggerFrom(base zerolog.Logger, sandboxID, hostID string) zerolog.Logger {
+	return base.With().
+		Str("sandbox_id", sandboxID).
+		Str("host_id", hostID).
+		Logger()
 }
 
 func RecordSandboxTransition(ctx context.Context, operation, result, hostID string, duration time.Duration) {

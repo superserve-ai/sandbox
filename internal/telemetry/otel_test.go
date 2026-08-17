@@ -197,6 +197,96 @@ func TestRecordVMDCallEmitsHostIDAndMethodAttributes(t *testing.T) {
 			)
 		}
 	}
+	if _, ok := attributes["sandbox_id"]; ok {
+		t.Fatalf("vmd_call_duration_seconds unexpectedly included sandbox_id: %#v", attributes)
+	}
+}
+
+func TestRecordSandboxTransitionEmitsHostIDAndNoSandboxID(t *testing.T) {
+	ctx := context.Background()
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+	)
+	t.Cleanup(func() {
+		if err := provider.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown meter provider: %v", err)
+		}
+	})
+
+	meter := provider.Meter(instrumentationName)
+
+	transitionTotal, err := meter.Int64Counter("sandbox_transition_total")
+	if err != nil {
+		t.Fatalf("create sandbox transition counter: %v", err)
+	}
+	transitionDuration, err := meter.Float64Histogram("sandbox_transition_duration_seconds")
+	if err != nil {
+		t.Fatalf("create sandbox transition duration histogram: %v", err)
+	}
+
+	recorder := &OTelRecorder{
+		provider:           provider,
+		serviceName:        "sandbox-controlplane",
+		environment:        "staging",
+		sandboxTransitions: transitionTotal,
+		sandboxDuration:    transitionDuration,
+	}
+
+	recorder.RecordSandboxTransition(ctx, SandboxTransition{
+		Operation: "create",
+		Result:    ResultSuccess,
+		Region:    "us-central1",
+		HostID:    "host-123",
+		Duration:  125 * time.Millisecond,
+	})
+
+	var resourceMetrics metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &resourceMetrics); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+
+	var datapoint *metricdata.HistogramDataPoint[float64]
+	for _, scopeMetrics := range resourceMetrics.ScopeMetrics {
+		for _, metric := range scopeMetrics.Metrics {
+			if metric.Name != "sandbox_transition_duration_seconds" {
+				continue
+			}
+			histogram, ok := metric.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("metric data type = %T, want metricdata.Histogram[float64]", metric.Data)
+			}
+			if len(histogram.DataPoints) != 1 {
+				t.Fatalf("histogram datapoints = %d, want 1", len(histogram.DataPoints))
+			}
+			datapoint = &histogram.DataPoints[0]
+		}
+	}
+	if datapoint == nil {
+		t.Fatal("sandbox_transition_duration_seconds metric not found")
+	}
+
+	attributes := make(map[string]string)
+	for _, attr := range datapoint.Attributes.ToSlice() {
+		attributes[string(attr.Key)] = attr.Value.AsString()
+	}
+
+	for key, wantValue := range map[string]string{
+		"service.name": "sandbox-controlplane",
+		"environment":  "staging",
+		"operation":    "create",
+		"result":       ResultSuccess,
+		"region":       "us-central1",
+		"host_id":      "host-123",
+	} {
+		if got := attributes[key]; got != wantValue {
+			t.Fatalf("attribute %q = %q, want %q; all attributes: %#v", key, got, wantValue, attributes)
+		}
+	}
+	if _, ok := attributes["sandbox_id"]; ok {
+		t.Fatalf("sandbox_transition_duration_seconds unexpectedly included sandbox_id: %#v", attributes)
+	}
 }
 
 func TestRecordPausedNetworkPressureEmitsControllerMetrics(t *testing.T) {

@@ -367,8 +367,10 @@ func fsyncBuildArtifacts(snapDir string, paths ...string) error {
 
 func setupNetwork(ctx context.Context, hostIface string, slotIndex int, vmID string) (*network.Manager, *network.VMNetInfo, func(), error) {
 	log := newLogger("network")
+	// template-builder inherits HOST_ID from the VMD process that launches it.
 	mgr, err := network.NewManager(ctx, hostIface, log,
 		network.WithExactSlot(slotIndex),
+		network.WithHostID(os.Getenv("HOST_ID")),
 		network.WithHTTPProxyPort(0), // no egress proxy for builds
 	)
 	if err != nil {
