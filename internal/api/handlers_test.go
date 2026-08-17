@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -749,6 +752,81 @@ func TestDeleteSandbox_TeardownError_StillCommits(t *testing.T) {
 
 	if w.Code != http.StatusNoContent {
 		t.Errorf("status = %d, want %d (teardown is best-effort after the claim); body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+}
+
+func TestDeleteSandbox_TeardownError_RecordsTelemetryAndHostAwareLog(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	hostID := "host-1"
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: hostID, Name: "sb", Status: db.SandboxStatusActive}
+
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() {
+		SetTelemetryRecorder(nil)
+	})
+
+	var buf bytes.Buffer
+	oldLogger := log.Logger
+	log.Logger = zerolog.New(&buf)
+	t.Cleanup(func() {
+		log.Logger = oldLogger
+	})
+
+	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error {
+		return fmt.Errorf("vmd unreachable")
+	}}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag(""), nil
+		},
+	}
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(SandboxLifecycleTelemetry())
+	r.Use(func(c *gin.Context) {
+		c.Set("team_id", teamID.String())
+		c.Next()
+	})
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	r.DELETE("/sandboxes/:sandbox_id", h.DeleteSandbox)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, deleteRequest(sandboxID.String()))
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if len(rec.transitions) != 1 {
+		t.Fatalf("recorded %d lifecycle transitions, want 1", len(rec.transitions))
+	}
+	got := rec.transitions[0]
+	if got.Operation != "delete" {
+		t.Fatalf("operation = %q, want delete", got.Operation)
+	}
+	if got.Result != telemetry.ResultSuccess {
+		t.Fatalf("result = %q, want %q", got.Result, telemetry.ResultSuccess)
+	}
+	if got.HostID != hostID {
+		t.Fatalf("host_id = %q, want %q", got.HostID, hostID)
+	}
+	out := buf.String()
+	for _, want := range []string{`"sandbox_id":"` + sandboxID.String() + `"`, `"host_id":"` + hostID + `"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("log output %q missing %q", out, want)
+		}
 	}
 }
 

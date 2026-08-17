@@ -7,6 +7,7 @@ can supply a full gcloud filter to scope the fan-out to a specific cell.
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -20,6 +21,67 @@ OTEL_ARCHITECTURES = {
     "amd64": "x86_64",
     "arm64": "aarch64",
 }
+
+
+def _command_failure(action: str, command: list[str], exc: subprocess.CalledProcessError) -> RuntimeError:
+    return RuntimeError(
+        f"{action} failed (exit {exc.returncode}): {' '.join(command)}\n"
+        f"--- stdout ---\n{exc.stdout or ''}\n"
+        f"--- stderr ---\n{exc.stderr or ''}"
+    )
+
+
+def _parse_remote_probe(stdout: str, stderr: str) -> tuple[str, str]:
+    host_uname = next(
+        (line.removeprefix("__OTEL_ARCH__=").strip()
+         for line in stdout.splitlines() if line.startswith("__OTEL_ARCH__=")),
+        None,
+    )
+    if not host_uname:
+        raise RuntimeError(
+            "could not determine host architecture\n"
+            f"--- stdout ---\n{stdout}\n"
+            f"--- stderr ---\n{stderr}"
+        )
+
+    staging_dir = next(
+        (line.removeprefix("__OTEL_STAGING__=").strip()
+         for line in stdout.splitlines() if line.startswith("__OTEL_STAGING__=")),
+        None,
+    )
+    if not staging_dir or not re.fullmatch(r"/tmp/otel-collector\.[A-Za-z0-9_-]+", staging_dir):
+        raise RuntimeError(
+            "could not determine safe remote staging directory\n"
+            f"--- stdout ---\n{stdout}\n"
+            f"--- stderr ---\n{stderr}"
+        )
+    return host_uname, staging_dir
+
+
+def _health_check_script() -> str:
+    return textwrap.dedent(
+        """
+        if ! systemd_status=$(sudo systemctl is-active superserve-otel-collector 2>&1); then
+          echo "ERROR: systemd active check failed: $systemd_status" >&2
+          sudo systemctl status --no-pager --full superserve-otel-collector >&2 || true
+          sudo journalctl -u superserve-otel-collector --no-pager -n 80 >&2 || true
+          exit 1
+        fi
+
+        if ! health_response=$(curl -sSf http://127.0.0.1:13133/ 2>&1); then
+          echo "ERROR: collector health endpoint (13133) failed: $health_response" >&2
+          exit 1
+        fi
+
+        if ! metrics_response=$(curl -sSf http://127.0.0.1:8888/metrics 2>&1); then
+          echo "ERROR: collector self-metrics endpoint (8888) failed: $metrics_response" >&2
+          exit 1
+        fi
+        if ! grep '^otelcol_' >/dev/null <<<"$metrics_response"; then
+          echo "ERROR: collector self-metrics assertion (8888) failed" >&2
+          exit 1
+        fi
+        """).strip()
 
 
 def prepare_collector_binaries() -> dict[str, str]:
@@ -125,31 +187,44 @@ def main() -> int:
         zone_name = zone.split("/")[-1]
         tag = f"{name}/{zone}"
 
-        host_arch_result = subprocess.run(
-            [
+        probe_command = [
+            "gcloud", "compute", "ssh", name,
+            f"--zone={zone}", f"--project={project}",
+            "--quiet", "--tunnel-through-iap", "--command",
+            'staging_dir="$(mktemp -d /tmp/otel-collector.XXXXXX)" && '
+            'printf "__OTEL_ARCH__=%s\\n__OTEL_STAGING__=%s\\n" "$(uname -m)" "$staging_dir"',
+        ]
+        try:
+            host_arch_result = subprocess.run(
+                probe_command,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise _command_failure(f"[{tag}] architecture/staging SSH probe", probe_command, exc) from exc
+        host_uname, staging_dir = _parse_remote_probe(
+            host_arch_result.stdout, host_arch_result.stderr
+        )
+
+        def cleanup_staging() -> None:
+            cleanup_command = [
                 "gcloud", "compute", "ssh", name,
                 f"--zone={zone}", f"--project={project}",
                 "--quiet", "--tunnel-through-iap",
-                "--command",
-                'printf "__OTEL_ARCH__=%s\\n" "$(uname -m)"',
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-        host_uname = None
-        for line in host_arch_result.stdout.splitlines():
-            if line.startswith("__OTEL_ARCH__="):
-                host_uname = line.removeprefix("__OTEL_ARCH__=").strip()
-                break
-
-        if not host_uname:
-            raise RuntimeError(
-                "could not determine host architecture\\n"
-                f"--- stdout ---\\n{host_arch_result.stdout}\\n"
-                f"--- stderr ---\\n{host_arch_result.stderr}"
-            )
+                "--command", f"rm -rf -- {shlex.quote(staging_dir)}",
+            ]
+            cleanup_result = subprocess.run(cleanup_command, capture_output=True, text=True)
+            if cleanup_result.returncode != 0:
+                print(
+                    _command_failure(
+                        f"[{tag}] staging cleanup", cleanup_command,
+                        subprocess.CalledProcessError(
+                            cleanup_result.returncode, cleanup_command,
+                            output=cleanup_result.stdout, stderr=cleanup_result.stderr,
+                        ),
+                    ), file=sys.stderr,
+                )
 
         selected_arch = None
         for otel_arch, uname_arch in OTEL_ARCHITECTURES.items():
@@ -157,28 +232,29 @@ def main() -> int:
                 selected_arch = otel_arch
                 break
         if selected_arch is None:
+            cleanup_staging()
             raise RuntimeError(f"unsupported host architecture: {host_uname}")
 
         uploads = [
-            ("deploy/otel/collector-gmp.yaml", "/tmp/collector-gmp.yaml"),
+            ("deploy/otel/collector-gmp.yaml", f"{staging_dir}/collector-gmp.yaml"),
             (
                 "deploy/superserve-otel-collector.service",
-                "/tmp/superserve-otel-collector.service",
+                f"{staging_dir}/superserve-otel-collector.service",
             ),
-            (collector_binaries[selected_arch], "/tmp/otelcol-contrib"),
+            (collector_binaries[selected_arch], f"{staging_dir}/otelcol-contrib"),
         ]
 
         for src, dst in uploads:
-            subprocess.run(
-                [
+            upload_command = [
                     "gcloud", "compute", "scp", src, f"{name}:{dst}",
                     f"--zone={zone}", f"--project={project}",
                     "--quiet", "--tunnel-through-iap",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+                ]
+            try:
+                subprocess.run(upload_command, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as exc:
+                cleanup_staging()
+                raise _command_failure(f"[{tag}] upload {src}", upload_command, exc) from exc
 
         print(f"[{tag}] collector files uploaded")
 
@@ -188,21 +264,23 @@ def main() -> int:
 
             OTEL_VERSION="{OTEL_COLLECTOR_VERSION}"
             OTEL_BINARY="/usr/local/bin/otelcol-contrib"
+            STAGING_DIR={shlex.quote(staging_dir)}
+            trap 'rm -rf -- "$STAGING_DIR"' EXIT
 
             if [ ! -x "$OTEL_BINARY" ] || \
                ! "$OTEL_BINARY" --version 2>/dev/null | grep -Fq "$OTEL_VERSION"; then
               echo "Installing otelcol-contrib v$OTEL_VERSION from uploaded artifact"
-              sudo install -m 0755 /tmp/otelcol-contrib "$OTEL_BINARY"
+              sudo install -m 0755 "$STAGING_DIR/otelcol-contrib" "$OTEL_BINARY"
             else
               echo "otelcol-contrib v$OTEL_VERSION is already installed"
             fi
 
             sudo install -D -m 0644 \
-              /tmp/collector-gmp.yaml \
+              "$STAGING_DIR/collector-gmp.yaml" \
               /etc/sandbox/otel/collector-gmp.yaml
 
             sudo install -D -m 0644 \
-              /tmp/superserve-otel-collector.service \
+              "$STAGING_DIR/superserve-otel-collector.service" \
               /etc/systemd/system/superserve-otel-collector.service
 
             sudo mkdir -p /etc/sandbox/otel
@@ -219,32 +297,26 @@ def main() -> int:
 
             sleep 5
 
-            sudo systemctl is-active --quiet superserve-otel-collector || (
-              echo "ERROR: superserve-otel-collector failed to become active after restart" >&2
-              sudo systemctl status --no-pager --full superserve-otel-collector >&2 || true
-              sudo journalctl -u superserve-otel-collector --no-pager -n 80 >&2 || true
-              exit 1
-            )
-
-            curl -sf http://127.0.0.1:13133/ >/dev/null
-            curl -sf http://127.0.0.1:8888/metrics | grep -q '^otelcol_'
+            {_health_check_script()}
             """
         )
 
-        result = subprocess.run(
-            [
+        deploy_command = [
                 "gcloud", "compute", "ssh", name,
                 f"--zone={zone}", f"--project={project}",
                 "--quiet", "--tunnel-through-iap",
                 "--command", deploy_script,
-            ],
+            ]
+        result = subprocess.run(
+            deploy_command,
             capture_output=True,
             text=True,
         )
 
         if result.returncode != 0:
+            cleanup_staging()
             raise RuntimeError(
-                "collector not healthy\n"
+                f"[{tag}] collector deployment/health checks failed (exit {result.returncode})\n"
                 f"--- stdout ---\n{result.stdout}\n"
                 f"--- stderr ---\n{result.stderr}"
             )

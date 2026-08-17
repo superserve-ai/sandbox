@@ -122,6 +122,7 @@ const poolWaitLogThreshold = 250 * time.Millisecond
 
 type Manager struct {
 	hostInterface string
+	hostID        string
 	log           zerolog.Logger
 
 	// setupSem bounds concurrent setupSlot builds (see setupSlotConcurrency).
@@ -205,6 +206,11 @@ func (m *Manager) SetEgressProxy(p *EgressProxy) {
 
 // ManagerOption configures optional Manager behavior.
 type ManagerOption func(*Manager)
+
+// WithHostID supplies the persisted VMD host identity for network-operation logs.
+func WithHostID(hostID string) ManagerOption {
+	return func(m *Manager) { m.hostID = hostID }
+}
 
 // WithExactSlot pins the Manager to exactly slot idx: it claims that one index
 // or fails with ErrNoSlots, never advancing to idx+1. A template-builder
@@ -329,7 +335,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		if info := m.pool.ClaimWait(ctx, vmID); info != nil {
 			m.registerEgress(vmID, info)
 			if waited := time.Since(tWait); waited >= poolWaitLogThreshold {
-				m.log.Info().Str("vm_id", vmID).
+				m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).
 					Int64("pool_wait_ms", waited.Milliseconds()).
 					Msg("pool: claim satisfied after waiting on refill")
 			}
@@ -341,7 +347,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		m.log.Info().Str("vm_id", vmID).
+		m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).
 			Int64("pool_wait_ms", time.Since(tWait).Milliseconds()).
 			Msg("network pool empty, falling back to on-demand setup")
 	}
@@ -366,7 +372,7 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 	m.registerEgress(vmID, info)
 
 	m.log.Info().
-		Str("vm_id", vmID).
+		Str("vm_id", vmID).Str("host_id", m.hostID).
 		Str("namespace", info.Namespace).
 		Str("host_ip", info.HostIP).
 		Int64("on_demand_setup_ms", time.Since(tBuild).Milliseconds()).
@@ -581,7 +587,7 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 
 	idx, parsed := slotFromNamespace(info.Namespace)
 	if !parsed {
-		m.log.Warn().Str("vm_id", vmID).Str("namespace", info.Namespace).Msg("cleanup: unparseable namespace — skipping slot reclaim")
+		m.log.Warn().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", info.Namespace).Msg("cleanup: unparseable namespace — skipping slot reclaim")
 		return
 	}
 	vethName := fmt.Sprintf("veth-%d", idx)
@@ -600,7 +606,7 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 		owned := m.slotOwner[idx] == vmID
 		m.mu.Unlock()
 		if !owned {
-			m.log.Warn().Str("vm_id", vmID).Int("slot", idx).
+			m.log.Warn().Str("vm_id", vmID).Str("host_id", m.hostID).Int("slot", idx).
 				Msg("cleanup skipped — slot no longer owned by this VM")
 			return
 		}
@@ -617,7 +623,7 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	// concurrent claim pop the idx, see the netns still present, and discard it
 	// for good.
 	if !m.claimTeardown(idx, vmID) {
-		m.log.Warn().Str("vm_id", vmID).Int("slot", idx).
+		m.log.Warn().Str("vm_id", vmID).Str("host_id", m.hostID).Int("slot", idx).
 			Msg("teardown skipped — slot no longer owned by this VM")
 		return
 	}
@@ -628,7 +634,7 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	}
 	if info.Firewall != nil {
 		if err := info.Firewall.Close(); err != nil {
-			m.log.Warn().Err(err).Str("vm_id", vmID).Msg("error closing namespace firewall")
+			m.log.Warn().Err(err).Str("vm_id", vmID).Str("host_id", m.hostID).Msg("error closing namespace firewall")
 		}
 	}
 
@@ -637,7 +643,7 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	// owner on the teardown-not-recycle path) would keep the namespace and its
 	// tap alive but anonymous: unfindable by pidsInNs, the sweep, or the gauge.
 	if killed := killProcessesInNs(info.Namespace); killed > 0 {
-		m.log.Info().Str("namespace", info.Namespace).Int("killed", killed).
+		m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", info.Namespace).Int("killed", killed).
 			Msg("cleanup: killed lingering processes before namespace teardown")
 	}
 
@@ -651,7 +657,7 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	_ = run(ctx, "ip", "link", "del", vethName)
 	_ = run(ctx, "ip", "netns", "del", info.Namespace)
 
-	m.log.Info().Str("vm_id", vmID).Str("namespace", info.Namespace).Msg("network namespace cleaned up")
+	m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", info.Namespace).Msg("network namespace cleaned up")
 }
 
 // CleanupVMOrNamespace tears down a VM's network slot. When the VM is tracked
@@ -686,13 +692,13 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 	// only unlinks the name, so a namespace with a live holder lingers (keeping
 	// its tap0) until that process exits. Mirrors SweepOrphanNamespaces.
 	if killed := killProcessesInNs(fallbackNamespace); killed > 0 {
-		m.log.Info().Str("namespace", fallbackNamespace).Int("killed", killed).
+		m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", fallbackNamespace).Int("killed", killed).
 			Msg("cleanup: killed lingering processes before namespace teardown")
 	}
 	// Tear down both sides even if the netns is already gone: `ip netns del`
 	// only removes the in-namespace side, so the host-side veth-N can outlive it.
 	m.cleanupFull(fallbackNamespace, fmt.Sprintf("veth-%d", idx))
-	m.log.Info().Str("vm_id", vmID).Str("namespace", fallbackNamespace).Int("slot", idx).
+	m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", fallbackNamespace).Int("slot", idx).
 		Msg("reclaimed network slot for untracked VM")
 }
 
@@ -717,11 +723,11 @@ func (m *Manager) TeardownVMOrNamespace(vmID, fallbackNamespace string) {
 	defer m.releaseIfOwned(idx, teardownOwner)
 
 	if killed := killProcessesInNs(fallbackNamespace); killed > 0 {
-		m.log.Info().Str("namespace", fallbackNamespace).Int("killed", killed).
+		m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", fallbackNamespace).Int("killed", killed).
 			Msg("cleanup: killed lingering processes before namespace teardown")
 	}
 	m.cleanupFull(fallbackNamespace, fmt.Sprintf("veth-%d", idx))
-	m.log.Info().Str("vm_id", vmID).Str("namespace", fallbackNamespace).Int("slot", idx).
+	m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", fallbackNamespace).Int("slot", idx).
 		Msg("forcefully tore down network slot for untracked VM")
 }
 
@@ -774,7 +780,7 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 		fw = f
 		return nil
 	}); err != nil {
-		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("reattach: in-namespace firewall handle not restored (existing rules still enforce traffic)")
+		m.log.Warn().Err(err).Str("vm_id", vmID).Str("host_id", m.hostID).Msg("reattach: in-namespace firewall handle not restored (existing rules still enforce traffic)")
 	}
 
 	m.mu.Lock()
@@ -804,7 +810,7 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	}
 	m.registerEgress(vmID, info)
 
-	m.log.Info().Str("vm_id", vmID).Int("slot", idx).Str("host_ip", hostIP).Bool("fw_attached", fw != nil).Msg("reattached VM network state")
+	m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Int("slot", idx).Str("host_ip", hostIP).Bool("fw_attached", fw != nil).Msg("reattached VM network state")
 	return nil
 }
 
@@ -863,7 +869,7 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 		// Preserve Firewall handle for future UpdateFirewallRules.
 		info = existing
 	case !nsExists(namespace):
-		m.log.Warn().Str("vm_id", vmID).Str("namespace", namespace).Int("slot", idx).Msg("netns missing — rebuilding slot at original index")
+		m.log.Warn().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", namespace).Int("slot", idx).Msg("netns missing — rebuilding slot at original index")
 		// ip netns delete only tears down the inside-ns side; the host-side
 		// veth-N can survive and collide with setupSlot's fresh veth creation.
 		m.cleanupFull(namespace, fmt.Sprintf("veth-%d", idx))
@@ -872,7 +878,7 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 			return nil, fmt.Errorf("ensure %s: rebuild slot %d: %w", vmID, idx, err)
 		}
 		if macAddress != "" && built.MACAddress != macAddress {
-			m.log.Warn().Str("vm_id", vmID).Str("expected", macAddress).Str("got", built.MACAddress).Msg("rebuilt MAC differs from stored — deterministic mapping may have drifted")
+			m.log.Warn().Str("vm_id", vmID).Str("host_id", m.hostID).Str("expected", macAddress).Str("got", built.MACAddress).Msg("rebuilt MAC differs from stored — deterministic mapping may have drifted")
 		}
 		info = built
 	default:
