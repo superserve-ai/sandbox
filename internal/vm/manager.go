@@ -2136,18 +2136,21 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 
 // CreateVMSnapshot captures a point-in-time snapshot of a running VM.
 func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, err error) {
-	// Serialize with pause/resume/reattach on this VM (see lockVMOp). This
-	// ad-hoc Full snapshot resets Firecracker's dirty bitmap, so it must not
-	// interleave with a concurrent lifecycle write that could durably re-arm
-	// dirty tracking between the write-ahead disarm and the bitmap reset — which
-	// would leave a stale armed=true for a reattach to trust against a reset
-	// bitmap. Taken before getInstance so a racing lazy-reattach is serialized
-	// too. The RPC is the sole caller and holds no lock, so this cannot deadlock.
-	unlockOp, err := m.lockVMOp(ctx, vmID)
-	if err != nil {
-		return "", "", err
+	// Only when dirty-tracking persistence is on: serialize with pause/resume/
+	// reattach (see lockVMOp) so the write-ahead disarm below cannot race a
+	// concurrent write that durably re-arms between the clear and the bitmap
+	// reset — which would leave a stale armed=true for a reattach to trust. With
+	// the feature off there is no disarm, so no lock is taken and this path's
+	// behavior is unchanged. Taken before getInstance so a racing lazy-reattach
+	// is serialized too; the RPC is the sole caller and holds no lock, so this
+	// cannot deadlock.
+	if m.cfg.PersistDirtyTrackingEnabled {
+		unlockOp, err := m.lockVMOp(ctx, vmID)
+		if err != nil {
+			return "", "", err
+		}
+		defer unlockOp()
 	}
-	defer unlockOp()
 
 	inst, err := m.getInstance(vmID)
 	if err != nil {
