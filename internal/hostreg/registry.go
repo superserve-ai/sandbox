@@ -44,7 +44,13 @@ type Registry struct {
 
 	mu      sync.RWMutex
 	clients map[string]entry
-	verify  singleflight.Group // one address verification in flight per host
+	// gens is bumped per host by Invalidate. A verification snapshots the
+	// generation before reading the row and discards its result if the
+	// generation moved — otherwise a dial finishing after a concurrent
+	// invalidation would resurrect the just-invalidated address as freshly
+	// verified. Grows one counter per host id ever seen (fleet-bounded).
+	gens   map[string]uint64
+	verify singleflight.Group // one address verification in flight per host
 }
 
 // New creates a Registry backed by the host table.
@@ -53,6 +59,7 @@ func New(queries *db.Queries, dial DialFunc) *Registry {
 		db:      queries,
 		dial:    dial,
 		clients: make(map[string]entry),
+		gens:    make(map[string]uint64),
 	}
 }
 
@@ -89,35 +96,57 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 // dispatch on any read blip would trade it for routine unavailability.
 func (r *Registry) verifyAndGet(ctx context.Context, hostID string, stale entry) (vmdclient.Client, error) {
 	v, err, _ := r.verify.Do(hostID, func() (any, error) {
-		host, err := r.db.GetHost(ctx, hostID)
-		if err != nil {
-			log.Warn().Err(err).Str("host_id", hostID).
-				Msg("host address verification failed; dispatching via cached client")
-			return stale.client, nil
-		}
-		if host.VmdAddr == stale.addr {
-			r.mu.Lock()
-			if e, ok := r.clients[hostID]; ok && e.addr == stale.addr {
-				e.checkedAt = time.Now()
-				r.clients[hostID] = e
+		// Bounded retry: if an invalidation (an address reclaim landing on
+		// this replica) races the verification, the result is discarded and
+		// the row re-read, so a verification started against an older row
+		// version can never resurrect an invalidated address as verified.
+		for attempt := 0; attempt < 2; attempt++ {
+			r.mu.RLock()
+			startGen := r.gens[hostID]
+			r.mu.RUnlock()
+
+			host, err := r.db.GetHost(ctx, hostID)
+			if err != nil {
+				log.Warn().Err(err).Str("host_id", hostID).
+					Msg("host address verification failed; dispatching via cached client")
+				return stale.client, nil
 			}
+			if host.VmdAddr == stale.addr {
+				r.mu.Lock()
+				if r.gens[hostID] != startGen {
+					r.mu.Unlock()
+					continue // invalidated mid-verification; re-read the row
+				}
+				if e, ok := r.clients[hostID]; ok && e.addr == stale.addr {
+					e.checkedAt = time.Now()
+					r.clients[hostID] = e
+				}
+				r.mu.Unlock()
+				return stale.client, nil
+			}
+			log.Warn().Str("host_id", hostID).Str("old_addr", stale.addr).
+				Str("new_addr", host.VmdAddr).
+				Msg("host address changed; re-dialing before dispatch")
+			c, err := r.dial(hostID, host.VmdAddr, func() { r.Invalidate(hostID) })
+			if err != nil {
+				// No falling back to the old-address client here: failing
+				// loudly beats executing on the machine that lost this identity.
+				r.Invalidate(hostID)
+				return nil, fmt.Errorf("dial VMD at %s for host %q: %w", host.VmdAddr, hostID, err)
+			}
+			r.mu.Lock()
+			if r.gens[hostID] != startGen {
+				// A reclaim landed while dialing: this address is already
+				// old. Drop the dialed client and verify against the row
+				// as it stands now.
+				r.mu.Unlock()
+				continue
+			}
+			r.clients[hostID] = entry{client: c, addr: host.VmdAddr, checkedAt: time.Now()}
 			r.mu.Unlock()
-			return stale.client, nil
+			return c, nil
 		}
-		log.Warn().Str("host_id", hostID).Str("old_addr", stale.addr).
-			Str("new_addr", host.VmdAddr).
-			Msg("host address changed; re-dialing before dispatch")
-		c, err := r.dial(hostID, host.VmdAddr, func() { r.Invalidate(hostID) })
-		if err != nil {
-			// No falling back to the old-address client here: failing
-			// loudly beats executing on the machine that lost this identity.
-			r.Invalidate(hostID)
-			return nil, fmt.Errorf("dial VMD at %s for host %q: %w", host.VmdAddr, hostID, err)
-		}
-		r.mu.Lock()
-		r.clients[hostID] = entry{client: c, addr: host.VmdAddr, checkedAt: time.Now()}
-		r.mu.Unlock()
-		return c, nil
+		return nil, fmt.Errorf("host %q address changed repeatedly during verification; retry", hostID)
 	})
 	if err != nil {
 		return nil, err
@@ -150,9 +179,12 @@ func (r *Registry) dialAndCache(ctx context.Context, hostID string) (vmdclient.C
 }
 
 // Invalidate drops the cached client for hostID so the next ClientFor
-// call re-resolves the host's address.
+// call re-resolves the host's address, and bumps the host's generation so
+// any in-flight verification discards its result instead of repopulating
+// the entry it just removed.
 func (r *Registry) Invalidate(hostID string) {
 	r.mu.Lock()
 	delete(r.clients, hostID)
+	r.gens[hostID]++
 	r.mu.Unlock()
 }
