@@ -68,12 +68,12 @@ def _health_check_script() -> str:
           exit 1
         fi
 
-        if ! health_response=$(curl -sf http://127.0.0.1:13133/ 2>&1); then
+        if ! health_response=$(curl -sSf http://127.0.0.1:13133/ 2>&1); then
           echo "ERROR: collector health endpoint (13133) failed: $health_response" >&2
           exit 1
         fi
 
-        if ! metrics_response=$(curl -sf http://127.0.0.1:8888/metrics 2>&1); then
+        if ! metrics_response=$(curl -sSf http://127.0.0.1:8888/metrics 2>&1); then
           echo "ERROR: collector self-metrics endpoint (8888) failed: $metrics_response" >&2
           exit 1
         fi
