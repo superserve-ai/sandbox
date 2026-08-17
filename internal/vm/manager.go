@@ -1252,6 +1252,10 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) (err e
 // durable artifacts (disk state + vmstate); see collectPauseManifest for
 // what is included and why memory files are not.
 func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, manifest []ManifestEntry, err error) {
+	// Before lockVMOp so pause_ms includes lock-queueing/contention, not just the
+	// work after the lock is held.
+	tPauseStart := time.Now()
+
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate pause
 	// waits, then hits the already-paused guard.
 	unlockOp, err := m.lockVMOp(ctx, vmID)
@@ -1266,7 +1270,6 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	}
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
-	tPauseStart := time.Now()
 
 	// Retried pause (response lost mid-RPC): re-snapshotting a stopped VM
 	// dials a dead socket and ends with the record deleted. Return the
@@ -2137,6 +2140,19 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 
 // CreateVMSnapshot captures a point-in-time snapshot of a running VM.
 func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, err error) {
+	// Serialize with pause/resume/reattach on this VM (see lockVMOp). This
+	// ad-hoc Full snapshot resets Firecracker's dirty bitmap, so it must not
+	// interleave with a concurrent lifecycle write that could durably re-arm
+	// dirty tracking between the write-ahead disarm and the bitmap reset — which
+	// would leave a stale armed=true for a reattach to trust against a reset
+	// bitmap. Taken before getInstance so a racing lazy-reattach is serialized
+	// too. The RPC is the sole caller and holds no lock, so this cannot deadlock.
+	unlockOp, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return "", "", err
+	}
+	defer unlockOp()
+
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return "", "", err
@@ -2154,10 +2170,10 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 
 	// This Full snapshot resets Firecracker's dirty bitmap, so the diff baseline
 	// relative to the resume base is gone; the next pause must go Full. When
-	// persistence is enabled, disarm DURABLY and ahead of the snapshot: this path
-	// holds no vm-op lock, so a field-level clear (never a whole-record write) is
-	// used to avoid clobbering a concurrent lifecycle op, and doing it before the
-	// bitmap reset closes the crash window a reattach could otherwise re-arm into.
+	// persistence is enabled, disarm DURABLY and ahead of the snapshot — under
+	// the vm-op lock above, so no concurrent write re-arms between the clear and
+	// the reset. The field-level clear (never a whole-record write) is still
+	// used so it touches only the armed bit and preserves any newer fields.
 	if m.cfg.PersistDirtyTrackingEnabled {
 		if err := m.writeAheadDisarm(inst); err != nil {
 			return "", "", fmt.Errorf("write-ahead disarm before ad-hoc snapshot for vm %s: %w", vmID, err)

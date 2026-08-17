@@ -2475,10 +2475,11 @@ func TestShouldRearmDirtyTracking(t *testing.T) {
 	}
 }
 
-// The ad-hoc snapshot path holds no vm-op lock, so it must not do a whole-record
-// write (persistState) that could clobber a concurrent lifecycle op. A
-// field-level ClearDirtyTrackingArmed is the permitted exception: it touches
-// only the armed bit and disarming is monotonically safe.
+// The ad-hoc snapshot path disarms dirty tracking with a field-level
+// ClearDirtyTrackingArmed, not a whole-record persistState: a targeted clear
+// touches only the armed bit and preserves any newer fields a rollback binary
+// wouldn't know about. (The vm-op lock it now holds serializes it with other
+// lifecycle writers; the field-level clear is still preferred for minimality.)
 func TestCreateVMSnapshotDoesNotPersist(t *testing.T) {
 	src, err := os.ReadFile("manager.go")
 	if err != nil {
@@ -2493,8 +2494,14 @@ func TestCreateVMSnapshotDoesNotPersist(t *testing.T) {
 	if end < 0 {
 		t.Fatal("could not bound CreateVMSnapshot")
 	}
-	if body := fn[start : start+end]; strings.Contains(body, "persistState(") {
-		t.Fatal("CreateVMSnapshot must not persist: it holds no vm-op lock, so a full-record write can clobber a concurrent lifecycle op")
+	body := fn[start : start+end]
+	if strings.Contains(body, "persistState(") {
+		t.Fatal("CreateVMSnapshot must not whole-record persist: use the field-level ClearDirtyTrackingArmed clear")
+	}
+	// It must serialize with pause/resume so its disarm+snapshot cannot race a
+	// concurrent write that re-arms dirty tracking against the reset bitmap.
+	if !strings.Contains(body, "lockVMOp(") {
+		t.Fatal("CreateVMSnapshot must hold the vm-op lock across disarm + snapshot")
 	}
 }
 
