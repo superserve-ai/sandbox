@@ -112,6 +112,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			}
 			setAPIKeyContext(c, entry)
 			c.Set("auth_ms", time.Since(authStart).Milliseconds())
+			c.Set("auth_duration", time.Since(authStart))
 			c.Next()
 			return
 		}
@@ -161,6 +162,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 
 		setAPIKeyContext(c, entry)
 		c.Set("auth_ms", time.Since(authStart).Milliseconds())
+		c.Set("auth_duration", time.Since(authStart))
 		c.Next()
 	}
 }

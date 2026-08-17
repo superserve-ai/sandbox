@@ -641,7 +641,11 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		case db.SandboxStatusPaused:
 			// The resume returns the post-restore access it pushed to VMD, so
 			// the response reports exactly what the VM enforces.
+			tResume := time.Now()
 			resumedAccess, ok := h.resumePausedSandbox(c, &sandbox, teamID)
+			// Emitted for failures too — auto-resume totals must not censor.
+			RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
+				map[string]time.Duration{"total": time.Since(tResume)})
 			if !ok {
 				return nil, ""
 			}
@@ -670,14 +674,6 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 // after VMD resume succeeds, destroys the VM + reverts to paused.
 func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID) (string, bool) {
 	sandboxID := sandbox.ID
-	tResume := time.Now()
-	// Transition counts/results come from the SandboxLifecycleTelemetry
-	// middleware; this defer emits only the phase-series total so the
-	// resume phase histogram is self-consistent.
-	defer func() {
-		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
-			map[string]time.Duration{"total": time.Since(tResume)})
-	}()
 	l := sandboxLogger(sandboxID.String(), sandbox.HostID)
 
 	if !sandbox.SnapshotID.Valid {
@@ -1176,6 +1172,17 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 }
 
 func (h *Handlers) ResumeSandbox(c *gin.Context) {
+	tResume := time.Now()
+	var sandbox db.Sandbox
+	// Registered before ANY return: a resume that burns the whole pausing
+	// settle window and then 409s is among the slowest resume requests and
+	// must land in the total distribution. Transition counts/results come
+	// from the SandboxLifecycleTelemetry middleware; this emits only the
+	// phase-series total. HostID is empty until the row loads.
+	defer func() {
+		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
+			map[string]time.Duration{"total": time.Since(tResume)})
+	}()
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return
@@ -1202,7 +1209,6 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	poll := pausingSettlePollStart
 	reads := 0
 	canceled := false
-	var sandbox db.Sandbox
 	for {
 		var err error
 		sandbox, err = h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
@@ -1933,8 +1939,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// its end-stamp reports its elapsed time; total always emits.
 	defer func() {
 		phases := map[string]time.Duration{
-			"auth":  time.Duration(c.GetInt64("auth_ms")) * time.Millisecond,
 			"total": time.Since(tStart),
+		}
+		// auth_duration keeps nanosecond resolution; the ms field truncates
+		// the sub-millisecond cached-key fast path to zero.
+		if v, ok := c.Get("auth_duration"); ok {
+			if d, ok := v.(time.Duration); ok {
+				phases["auth"] = d
+			}
+		} else {
+			phases["auth"] = time.Duration(c.GetInt64("auth_ms")) * time.Millisecond
 		}
 		if !tLookupDone.IsZero() {
 			phases["lookup"] = tLookupDone.Sub(tStart)
