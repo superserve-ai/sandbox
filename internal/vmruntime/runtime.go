@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/superserve-ai/sandbox/internal/hostlease"
 )
@@ -100,6 +101,10 @@ type ActiveRuntime struct {
 	mu      sync.Mutex
 	closers []namedCloser
 	closed  bool
+
+	drainMu  sync.Mutex
+	draining bool
+	inflight sync.WaitGroup
 }
 
 type namedCloser struct {
@@ -143,29 +148,96 @@ func (a *ActiveRuntime) AddCloser(name string, fn func() error) {
 	a.mu.Unlock()
 }
 
-// Close destroys the ActiveRuntime completely: it runs every registered closer
-// in reverse order, then closes the private socket. It is idempotent and
-// returns the first teardown error (after running the rest). Ownership of the
-// host writer role is dropped by the subsequent process exit, not by Close.
-func (a *ActiveRuntime) Close() error {
-	a.mu.Lock()
-	if a.closed {
-		a.mu.Unlock()
-		return nil
+// TrackRPC admits an incoming RPC. It returns (done, true) for an admitted RPC
+// — the caller must invoke done when the RPC finishes — or (noop, false) once
+// draining has begun, in which case the caller must reject the RPC with a
+// retryable codes.Unavailable. The admit-and-count is atomic with the drain
+// flag, so no RPC is ever admitted after BeginDrain and then missed by the
+// in-flight wait in Shutdown.
+func (a *ActiveRuntime) TrackRPC() (done func(), admitted bool) {
+	a.drainMu.Lock()
+	defer a.drainMu.Unlock()
+	if a.draining {
+		return func() {}, false
 	}
-	a.closed = true
-	closers := a.closers
-	a.closers = nil
-	a.mu.Unlock()
+	a.inflight.Add(1)
+	return a.inflight.Done, true
+}
 
+// BeginDrain stops admitting new RPCs. Idempotent.
+func (a *ActiveRuntime) BeginDrain() {
+	a.drainMu.Lock()
+	a.draining = true
+	a.drainMu.Unlock()
+}
+
+// Shutdown runs the bounded drain sequence and returns the names of any steps
+// that did not finish within their deadline — the caller logs them and lets the
+// process exit (the kernel then releases the writer lease). The total time is
+// bounded by drainGrace + perStep × (number of closers), so callers size it
+// below systemd's TimeoutStopSec, which force-kills a violator.
+//
+// Sequence: stop admitting new RPCs, wait up to drainGrace for in-flight RPCs
+// to finish, then run every registered closer in reverse order — each bounded
+// by perStep so one stuck store cannot stall the whole shutdown.
+func (a *ActiveRuntime) Shutdown(drainGrace, perStep time.Duration) []string {
+	a.BeginDrain()
+
+	inflightDone := make(chan struct{})
+	go func() { a.inflight.Wait(); close(inflightDone) }()
+	var overran []string
+	select {
+	case <-inflightDone:
+	case <-time.After(drainGrace):
+		overran = append(overran, "in-flight-rpcs")
+	}
+
+	for _, c := range a.takeClosers() {
+		errc := make(chan error, 1)
+		go func(fn func() error) { errc <- fn() }(c.close)
+		select {
+		case <-errc:
+		case <-time.After(perStep):
+			overran = append(overran, c.name)
+		}
+	}
+	_ = a.pre.Close()
+	return overran
+}
+
+// Close destroys the ActiveRuntime completely without the drain wait: it runs
+// every registered closer in reverse order, then closes the private socket. It
+// is idempotent and returns the first teardown error. Prefer Shutdown for a
+// live daemon; Close is the unbounded teardown for tests and non-serving exits.
+// Ownership of the host writer role is dropped by process exit, not by Close.
+func (a *ActiveRuntime) Close() error {
 	var firstErr error
-	for i := len(closers) - 1; i >= 0; i-- {
-		if err := closers[i].close(); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("close %s: %w", closers[i].name, err)
+	for _, c := range a.takeClosers() {
+		if err := c.close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("close %s: %w", c.name, err)
 		}
 	}
 	if err := a.pre.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr
+}
+
+// takeClosers atomically marks the runtime closed and returns the registered
+// closers in reverse (teardown) order. A second call returns nil, making both
+// Close and Shutdown idempotent and mutually exclusive.
+func (a *ActiveRuntime) takeClosers() []namedCloser {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return nil
+	}
+	a.closed = true
+	closers := a.closers
+	a.closers = nil
+	// Reverse into teardown order.
+	for i, j := 0, len(closers)-1; i < j; i, j = i+1, j-1 {
+		closers[i], closers[j] = closers[j], closers[i]
+	}
+	return closers
 }
