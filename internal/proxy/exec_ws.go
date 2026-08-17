@@ -165,6 +165,9 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 
 	token := extractTerminalToken(r)
 	if token == "" {
+		// The token check IS the auth phase for this request; stamp it so
+		// the common 401 path lands in the auth series too.
+		tAuthDone = time.Now()
 		http.Error(w, "missing token (pass as Sec-WebSocket-Protocol: token.<value>)", http.StatusUnauthorized)
 		return
 	}

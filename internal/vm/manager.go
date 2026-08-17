@@ -1423,6 +1423,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
 			saveStart := time.Now()
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
+				snapshotDur = time.Since(tSnapshot)
 				// A failed diff may have left a partial overlay. Drop the .base sidecar
 				// so a later restore can't treat that partial data as a valid layered
 				// overlay — without the sidecar it's refused (overlay-without-base),
@@ -1441,6 +1442,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		} else {
 			memPath, baseMemPath = fullPath, ""
 			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
+				snapshotDur = time.Since(tSnapshot)
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 			}
 		}
@@ -1453,11 +1455,13 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			snapshotType = "diff"
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating diff snapshot")
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
+				snapshotDur = time.Since(tSnapshot)
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create diff snapshot: %w", err))
 			}
 		} else {
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating snapshot")
 			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
+				snapshotDur = time.Since(tSnapshot)
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 			}
 		}
@@ -2515,34 +2519,40 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// restore deadline — form the phase tails instead of vanishing.
 	restorePhasesRecorded := false
 	var attempt int
-	var tDiskReady, tNetReady, tFcReady, tAttemptStart time.Time
+	var tDiskReady, tNetReady, tFcReady, tAttemptStart, tFailBoundary time.Time
 	defer func() {
 		if restorePhasesRecorded {
 			return
+		}
+		// The failure branches stamp tFailBoundary before their cleanup so
+		// the in-flight stage's elapsed time excludes teardown/persistence.
+		end := time.Now()
+		if !tFailBoundary.IsZero() {
+			end = tFailBoundary
 		}
 		phases := map[string]time.Duration{}
 		if attempt <= 1 {
 			phases["entry_to_sem"] = tSemAcquired.Sub(tEntry)
 			switch {
 			case tDiskReady.IsZero():
-				phases["sem_to_disk"] = time.Since(tSemAcquired)
+				phases["sem_to_disk"] = end.Sub(tSemAcquired)
 			case tNetReady.IsZero():
 				phases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
-				phases["disk_to_net"] = time.Since(tDiskReady)
+				phases["disk_to_net"] = end.Sub(tDiskReady)
 			default:
 				phases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
 				phases["disk_to_net"] = tNetReady.Sub(tDiskReady)
-				phases["net_to_fc"] = time.Since(tNetReady)
+				phases["net_to_fc"] = end.Sub(tNetReady)
 			}
 		} else {
 			// Retry attempt died mid-setup: the pre-loop phases went out with
 			// attempt 1, so measure this attempt's setup from its own start.
 			switch {
 			case tNetReady.IsZero():
-				phases["disk_to_net"] = time.Since(tAttemptStart)
+				phases["disk_to_net"] = end.Sub(tAttemptStart)
 			default:
 				phases["disk_to_net"] = tNetReady.Sub(tAttemptStart)
-				phases["net_to_fc"] = time.Since(tNetReady)
+				phases["net_to_fc"] = end.Sub(tNetReady)
 			}
 		}
 		m.recordPhases("restore", "", phases)
@@ -2673,6 +2683,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
 	}
 	if diskErr != nil {
+		tFailBoundary = time.Now()
 		m.setStatus(vmID, StatusError)
 		return nil, diskErr
 	}
@@ -2717,6 +2728,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if tapDevice == "" {
 			netInfo, netErr := m.netMgr.SetupVM(ctx, vmID, netCfg)
 			if netErr != nil {
+				tFailBoundary = time.Now()
 				cleanupAfterRestoreFailure()
 				m.setStatus(vmID, StatusError)
 				return nil, fmt.Errorf("setup network: %w", netErr)
@@ -2763,6 +2775,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.Supervision = supervision
 		inst.mu.Unlock()
 		if startErr != nil {
+			tFailBoundary = time.Now()
 			m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("start firecracker: %w", startErr)

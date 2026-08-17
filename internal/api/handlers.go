@@ -1958,8 +1958,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		if !tVmdEnd.IsZero() && !tInsertReceive.IsZero() {
 			phases["insert_wait"] = tInsertReceive.Sub(tVmdEnd)
 		}
-		if !tInsertReceive.IsZero() && !tPostDone.IsZero() {
-			phases["post"] = tPostDone.Sub(tInsertReceive)
+		if !tInsertReceive.IsZero() {
+			if !tPostDone.IsZero() {
+				phases["post"] = tPostDone.Sub(tInsertReceive)
+			} else {
+				// Post-boot work (attestation, token minting, env inject)
+				// died mid-stage; report its elapsed time.
+				phases["post"] = time.Since(tInsertReceive)
+			}
 		}
 		RecordLatencyPhases(c.Request.Context(), "create", hostID, phases)
 	}()
