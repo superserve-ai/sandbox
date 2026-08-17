@@ -120,6 +120,7 @@ type Recorder interface {
 	RecordSandboxTransition(context.Context, SandboxTransition)
 	RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait)
 	RecordVMDCall(context.Context, VMDCall)
+	RecordHostResolution(context.Context, HostResolution)
 	RecordHostCapacity(context.Context, HostCapacity)
 	RecordDBPoolStats(context.Context, DBPoolStats)
 	RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)
@@ -132,6 +133,7 @@ func NewNoopRecorder() Recorder                                                 
 func (noopRecorder) RecordSandboxTransition(context.Context, SandboxTransition)             {}
 func (noopRecorder) RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait) {}
 func (noopRecorder) RecordVMDCall(context.Context, VMDCall)                                 {}
+func (noopRecorder) RecordHostResolution(context.Context, HostResolution)                   {}
 func (noopRecorder) RecordHostCapacity(context.Context, HostCapacity)                       {}
 func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)                         {}
 func (noopRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)     {}

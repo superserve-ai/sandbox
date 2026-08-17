@@ -413,3 +413,101 @@ func TestIntegration_TryDispatchBuildRefusesNonActiveHost(t *testing.T) {
 		t.Fatalf("claim with missing host row = %d rows, want 1 (bootstrap)", n)
 	}
 }
+
+// Once an identity is bound (registration, reclaim, or opt-in), a
+// description-less heartbeat is rejected WITHOUT mutating the row: after B
+// reclaims A's id, old daemon A — whose legacy sender omits the description
+// entirely — must not keep refreshing liveness or capabilities on a row
+// that now belongs to B.
+func TestIntegration_HostIdentityBound_RejectsLegacyHeartbeatAfterReclaim(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
+	r := newRouter(t)
+	hostID := "bnd-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
+
+	// A self-registers: the identity is bound from birth.
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{"capabilities":["preview_ports_v1"],`+hostDescription+`}`); w.Code != http.StatusOK {
+		t.Fatalf("register: %d %s", w.Code, w.Body.String())
+	}
+	host, _ := testQueries.GetHost(ctx, hostID)
+	if !host.IdentityBound {
+		t.Fatal("self-registration must bind the identity")
+	}
+
+	// B reclaims after A goes silent.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE host SET last_heartbeat_at = now() - interval '3 minutes' WHERE id = $1`, hostID); err != nil {
+		t.Fatalf("age heartbeat: %v", err)
+	}
+	intruder := `"vmd_addr":"10.9.0.8:50051","proxy_addr":"10.9.0.8:5007",` +
+		`"region":"test-region","capacity_memory_mib":1024,"capacity_vcpus":8`
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{"capabilities":["preview_ports_v1"],`+intruder+`}`); w.Code != http.StatusOK {
+		t.Fatalf("reclaim: %d %s", w.Code, w.Body.String())
+	}
+	before, _ := testQueries.GetHost(ctx, hostID)
+	var capsBefore int
+	if err := testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM host_capability WHERE host_id = $1`, hostID).Scan(&capsBefore); err != nil {
+		t.Fatalf("count capabilities: %v", err)
+	}
+
+	// Old daemon A resumes its legacy, description-less heartbeat: rejected,
+	// and nothing about the row moves — not liveness, not status, not caps.
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{"capabilities":[]}`); w.Code != http.StatusConflict {
+		t.Fatalf("legacy heartbeat on bound identity = %d, want 409", w.Code)
+	}
+	after, _ := testQueries.GetHost(ctx, hostID)
+	if !after.LastHeartbeatAt.Time.Equal(before.LastHeartbeatAt.Time) {
+		t.Fatal("rejected heartbeat must not refresh last_heartbeat_at")
+	}
+	if after.Status != before.Status || after.VmdAddr != before.VmdAddr {
+		t.Fatalf("rejected heartbeat mutated row: %s/%s -> %s/%s",
+			before.Status, before.VmdAddr, after.Status, after.VmdAddr)
+	}
+	var capsAfter int
+	if err := testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM host_capability WHERE host_id = $1`, hostID).Scan(&capsAfter); err != nil {
+		t.Fatalf("count capabilities: %v", err)
+	}
+	if capsAfter != capsBefore {
+		t.Fatalf("rejected heartbeat changed capabilities: %d -> %d", capsBefore, capsAfter)
+	}
+}
+
+// Legacy rows (hand-created, never described) keep accepting description-less
+// heartbeats until their holder opts in with a complete description at the
+// current address — after which legacy heartbeats are rejected for good.
+func TestIntegration_HostIdentityOptIn(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
+	r := newRouter(t)
+	hostID := "opt-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
+
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID: hostID, VmdAddr: "10.9.0.7:50051", ProxyAddr: "10.9.0.7:5007",
+		Region: "test-region", CapacityMemoryMib: 1024, CapacityVcpus: 8,
+	}); err != nil {
+		t.Fatalf("create legacy host: %v", err)
+	}
+
+	// Legacy heartbeat accepted while unbound — today's fleet behavior.
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{"capabilities":[]}`); w.Code != http.StatusOK {
+		t.Fatalf("legacy heartbeat on unbound row = %d, want 200", w.Code)
+	}
+	// A complete description at the current address binds the identity.
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{`+hostDescription+`}`); w.Code != http.StatusOK {
+		t.Fatalf("opt-in heartbeat = %d, want 200", w.Code)
+	}
+	host, _ := testQueries.GetHost(ctx, hostID)
+	if !host.IdentityBound {
+		t.Fatal("complete description at current address must bind the identity")
+	}
+	// From here, description-less heartbeats are rejected.
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{"capabilities":[]}`); w.Code != http.StatusConflict {
+		t.Fatalf("legacy heartbeat on bound row = %d, want 409", w.Code)
+	}
+}

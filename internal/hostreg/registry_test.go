@@ -70,6 +70,7 @@ func (h *hostDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
 		*dest[7].(*pgtype.Timestamptz) = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 		*dest[8].(*time.Time) = time.Now()
 		*dest[9].(*time.Time) = time.Now()
+		*dest[10].(*bool) = false
 		return nil
 	})
 }

@@ -48,6 +48,7 @@ type OTelRecorder struct {
 	resumeSettleWaitReads    metric.Int64Histogram
 	vmdCalls                 metric.Int64Counter
 	vmdDuration              metric.Float64Histogram
+	hostResolutionDuration   metric.Float64Histogram
 	hostVCPU                 metric.Int64Gauge
 	hostMemoryMiB            metric.Int64Gauge
 	hostSandboxes            metric.Int64Gauge
@@ -114,6 +115,9 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.vmdCalls, err = meter.Int64Counter("vmd_call_total"); err != nil {
+		return nil, err
+	}
+	if r.hostResolutionDuration, err = meter.Float64Histogram("host_resolution_duration_seconds"); err != nil {
 		return nil, err
 	}
 	if r.vmdDuration, err = meter.Float64Histogram("vmd_call_duration_seconds"); err != nil {
@@ -243,6 +247,25 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 	if c.Duration > 0 {
 		r.vmdDuration.Record(ctx, c.Duration.Seconds(), opt)
 	}
+}
+
+func (r *OTelRecorder) RecordHostResolution(ctx context.Context, h HostResolution) {
+	if r == nil {
+		return
+	}
+	kind, mode := h.Kind, h.Mode
+	if kind != "cold" && kind != "due" {
+		kind = "other"
+	}
+	if mode != "blocking" && mode != "background" {
+		mode = "other"
+	}
+	opt := metric.WithAttributes(r.attrs(
+		attribute.String("kind", kind),
+		attribute.String("mode", mode),
+		attribute.String("result", safeResult(h.Result)),
+	)...)
+	r.hostResolutionDuration.Record(ctx, h.Duration.Seconds(), opt)
 }
 
 func (r *OTelRecorder) RecordHostCapacity(ctx context.Context, c HostCapacity) {

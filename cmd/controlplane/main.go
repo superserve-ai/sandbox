@@ -245,7 +245,17 @@ func run() error {
 		}
 		return telemetry.WrapVMDClient(newGRPCVMDClient(conn), recorder, api.SandboxIDRegion(), hostID), nil
 	}
-	handlers.Hosts = hostreg.New(queries, dialVMD)
+	hostRegistry := hostreg.New(queries, dialVMD)
+	hostRegistry.Observe = func(kind, mode string, d time.Duration, err error) {
+		result := telemetry.ResultSuccess
+		if err != nil {
+			result = telemetry.ResultError
+		}
+		recorder.RecordHostResolution(context.Background(), telemetry.HostResolution{
+			Kind: kind, Mode: mode, Result: result, Duration: d,
+		})
+	}
+	handlers.Hosts = hostRegistry
 	sched := &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
 	handlers.Scheduler = sched
 

@@ -42,6 +42,7 @@ var (
 	errHostNotRegistered      = errors.New("host not registered")
 	errHostIdentityConflict   = errors.New("host identity in use")
 	errHostPartialDescription = errors.New("partial host description")
+	errHostIdentityRequired   = errors.New("host identity required")
 )
 
 // HostHeartbeat handles POST /internal/hosts/:host_id/heartbeat.
@@ -120,6 +121,16 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 			return "", "", err
 		}
 
+		// Once a row is identity-bound, description-less heartbeats are
+		// rejected outright. The shared internal token cannot distinguish
+		// daemons, so after a reclaim the previous holder's legacy
+		// heartbeats would otherwise keep refreshing liveness and
+		// capabilities on a row that now belongs to another machine —
+		// and its reconciler would keep operating under an id it lost.
+		if host.IdentityBound && !req.describesHost() {
+			return "", "", errHostIdentityRequired
+		}
+
 		if req.VMDAddr != "" && req.VMDAddr != host.VmdAddr {
 			holderAlive := host.LastHeartbeatAt.Valid &&
 				time.Since(host.LastHeartbeatAt.Time) < heartbeatTimeout
@@ -161,6 +172,14 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		if err := insertCapabilities(ctx, q, hostID, capabilities); err != nil {
 			return "", "", err
 		}
+		// Opt-in: a complete description at the row's current address binds
+		// the identity, so later description-less heartbeats for this id
+		// are rejected. (Registration and reclaim bind in their own writes.)
+		if !host.IdentityBound && req.describesHost() && req.VMDAddr == host.VmdAddr {
+			if err := q.BindHostIdentity(ctx, hostID); err != nil {
+				return "", "", err
+			}
+		}
 		return row.Status, row.PrevStatus, nil
 	}
 
@@ -185,6 +204,13 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
 			Msg("heartbeat rejected: identity in use by a live host at another address")
 		respondErrorMsg(c, "conflict", "host identity in use by a live host", http.StatusConflict)
+		return
+	case err == errHostIdentityRequired:
+		log.Warn().Str("host_id", hostID).
+			Msg("heartbeat rejected: identity-bound host sent a description-less heartbeat")
+		respondErrorMsg(c, "conflict",
+			"host identity is bound; heartbeats must carry the complete self-description",
+			http.StatusConflict)
 		return
 	case err == errHostPartialDescription:
 		log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).

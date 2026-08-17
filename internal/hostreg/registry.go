@@ -53,6 +53,12 @@ type Registry struct {
 	db      *db.Queries
 	dial    DialFunc
 	recheck time.Duration // 0 = addrRecheckTTL; tests shorten it
+	// Observe, when set, records each resolution: kind is "cold" (no
+	// cached client) or "due" (verification due); mode is "blocking" (a
+	// request waited on it) or "background" (refresh-ahead). A blocking
+	// resolution is a bounded (~2s worst-case) component of create/resume
+	// tail latency and must be attributable on its own.
+	Observe func(kind, mode string, d time.Duration, err error)
 	// failBackoff overrides verifyFailureBackoff for tests, which need a
 	// backoff strictly shorter than the TTL to reproduce the production
 	// ratio (5s vs 30s) — equal values mask backoff/refresh interactions.
@@ -141,13 +147,28 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 			if _, busy := r.refreshing.LoadOrStore(hostID, struct{}{}); !busy {
 				go func() {
 					defer r.refreshing.Delete(hostID)
-					_, _ = r.resolveClient(context.WithoutCancel(ctx), hostID)
+					started := time.Now()
+					_, err := r.resolveClient(context.WithoutCancel(ctx), hostID)
+					r.observe("due", "background", started, err)
 				}()
 			}
 		}
 		return e.client, nil
 	}
-	return r.resolveClient(ctx, hostID)
+	kind := "cold"
+	if ok {
+		kind = "due"
+	}
+	started := time.Now()
+	c, err := r.resolveClient(ctx, hostID)
+	r.observe(kind, "blocking", started, err)
+	return c, err
+}
+
+func (r *Registry) observe(kind, mode string, started time.Time, err error) {
+	if r.Observe != nil {
+		r.Observe(kind, mode, time.Since(started), err)
+	}
 }
 
 // resolveClient is the single path for both first-use dials and due

@@ -12,10 +12,23 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const bindHostIdentity = `-- name: BindHostIdentity :exec
+UPDATE host
+SET identity_bound = true, updated_at = now()
+WHERE id = $1
+`
+
+// Opt-in: an existing (legacy) row whose holder sent a complete
+// self-description at its current address enters identity-bound mode.
+func (q *Queries) BindHostIdentity(ctx context.Context, id string) error {
+	_, err := q.db.Exec(ctx, bindHostIdentity, id)
+	return err
+}
+
 const createHost = `-- name: CreateHost :one
 INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound
 `
 
 type CreateHostParams struct {
@@ -48,6 +61,7 @@ func (q *Queries) CreateHost(ctx context.Context, arg CreateHostParams) (Host, e
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.IdentityBound,
 	)
 	return i, err
 }
@@ -62,7 +76,7 @@ func (q *Queries) DeleteHostCapabilities(ctx context.Context, hostID string) err
 }
 
 const getHost = `-- name: GetHost :one
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host WHERE id = $1
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host WHERE id = $1
 `
 
 func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
@@ -79,12 +93,13 @@ func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.IdentityBound,
 	)
 	return i, err
 }
 
 const getHostForUpdate = `-- name: GetHostForUpdate :one
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host WHERE id = $1 FOR UPDATE
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host WHERE id = $1 FOR UPDATE
 `
 
 // Row-locked read for the heartbeat's identity check, so the guard and the
@@ -103,6 +118,7 @@ func (q *Queries) GetHostForUpdate(ctx context.Context, id string) (Host, error)
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.IdentityBound,
 	)
 	return i, err
 }
@@ -210,7 +226,7 @@ func (q *Queries) InsertHostCapability(ctx context.Context, arg InsertHostCapabi
 }
 
 const listActiveHosts = `-- name: ListActiveHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host
 WHERE status = 'active'
 ORDER BY created_at ASC
 `
@@ -235,6 +251,7 @@ func (q *Queries) ListActiveHosts(ctx context.Context) ([]Host, error) {
 			&i.LastHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.IdentityBound,
 		); err != nil {
 			return nil, err
 		}
@@ -320,7 +337,7 @@ func (q *Queries) ListActiveHostsByLoad(ctx context.Context, requiredCapabilitie
 }
 
 const listHosts = `-- name: ListHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host
 ORDER BY created_at ASC
 `
 
@@ -344,6 +361,7 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 			&i.LastHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.IdentityBound,
 		); err != nil {
 			return nil, err
 		}
@@ -433,7 +451,7 @@ func (q *Queries) ListHostsAdmin(ctx context.Context) ([]ListHostsAdminRow, erro
 }
 
 const listStaleHosts = `-- name: ListStaleHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host
 WHERE status = 'active'
   AND last_heartbeat_at IS NOT NULL
   AND last_heartbeat_at < $1
@@ -462,6 +480,7 @@ func (q *Queries) ListStaleHosts(ctx context.Context, lastHeartbeatAt pgtype.Tim
 			&i.LastHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.IdentityBound,
 		); err != nil {
 			return nil, err
 		}
@@ -486,9 +505,10 @@ func (q *Queries) MarkHostUnhealthy(ctx context.Context, id string) error {
 
 const registerHost = `-- name: RegisterHost :one
 INSERT INTO host (id, vmd_addr, proxy_addr, region, status,
-                  capacity_memory_mib, capacity_vcpus, last_heartbeat_at)
-VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, now())
-RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
+                  capacity_memory_mib, capacity_vcpus, last_heartbeat_at,
+                  identity_bound)
+VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, now(), true)
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound
 `
 
 type RegisterHostParams struct {
@@ -525,6 +545,7 @@ func (q *Queries) RegisterHost(ctx context.Context, arg RegisterHostParams) (Hos
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.IdentityBound,
 	)
 	return i, err
 }
@@ -533,7 +554,7 @@ const updateHostAddresses = `-- name: UpdateHostAddresses :exec
 UPDATE host
 SET vmd_addr = $2, proxy_addr = $3, region = $4,
     capacity_memory_mib = $5, capacity_vcpus = $6,
-    status = 'provisioning', updated_at = now()
+    status = 'provisioning', identity_bound = true, updated_at = now()
 WHERE id = $1
 `
 
@@ -574,7 +595,7 @@ SET last_heartbeat_at = now(),
     updated_at = now()
 FROM prev
 WHERE host.id = prev.id
-RETURNING host.id, host.vmd_addr, host.proxy_addr, host.region, host.status, host.capacity_memory_mib, host.capacity_vcpus, host.last_heartbeat_at, host.created_at, host.updated_at, prev.status AS prev_status
+RETURNING host.id, host.vmd_addr, host.proxy_addr, host.region, host.status, host.capacity_memory_mib, host.capacity_vcpus, host.last_heartbeat_at, host.created_at, host.updated_at, host.identity_bound, prev.status AS prev_status
 `
 
 type UpdateHostHeartbeatRow struct {
@@ -588,6 +609,7 @@ type UpdateHostHeartbeatRow struct {
 	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
+	IdentityBound     bool               `json:"identity_bound"`
 	PrevStatus        string             `json:"prev_status"`
 }
 
@@ -613,6 +635,7 @@ func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) (UpdateHos
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.IdentityBound,
 		&i.PrevStatus,
 	)
 	return i, err
@@ -625,7 +648,7 @@ WHERE id = $1
   AND ($2 <> 'active'
        OR (last_heartbeat_at IS NOT NULL
            AND last_heartbeat_at > $3))
-RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound
 `
 
 type UpdateHostStatusParams struct {
@@ -653,6 +676,7 @@ func (q *Queries) UpdateHostStatus(ctx context.Context, arg UpdateHostStatusPara
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.IdentityBound,
 	)
 	return i, err
 }

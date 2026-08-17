@@ -21,8 +21,9 @@ RETURNING *;
 -- last_heartbeat_at because capability attestation keys on it: without a
 -- heartbeat time, InsertHostCapability is a silent no-op.
 INSERT INTO host (id, vmd_addr, proxy_addr, region, status,
-                  capacity_memory_mib, capacity_vcpus, last_heartbeat_at)
-VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, now())
+                  capacity_memory_mib, capacity_vcpus, last_heartbeat_at,
+                  identity_bound)
+VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, now(), true)
 RETURNING *;
 
 -- name: GetHostForUpdate :one
@@ -40,7 +41,14 @@ SELECT * FROM host WHERE id = $1 FOR UPDATE;
 UPDATE host
 SET vmd_addr = $2, proxy_addr = $3, region = $4,
     capacity_memory_mib = $5, capacity_vcpus = $6,
-    status = 'provisioning', updated_at = now()
+    status = 'provisioning', identity_bound = true, updated_at = now()
+WHERE id = $1;
+
+-- name: BindHostIdentity :exec
+-- Opt-in: an existing (legacy) row whose holder sent a complete
+-- self-description at its current address enters identity-bound mode.
+UPDATE host
+SET identity_bound = true, updated_at = now()
 WHERE id = $1;
 
 -- name: UpdateHostStatus :one
