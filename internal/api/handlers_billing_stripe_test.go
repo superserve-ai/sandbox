@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"io"
 	"math"
 	"net/http"
@@ -11,6 +12,35 @@ import (
 
 	"github.com/google/uuid"
 )
+
+func TestStripeMeterErrorDetailsExtractsThinEventRequest(t *testing.T) {
+	payload := json.RawMessage(`{"developer_message_summary":"There is 1 invalid event","reason":{"error_types":[{"sample_errors":[{"error_message":"invalid customer","request":{"idempotency_key":"meter-event:test"}}]}]}}`)
+	identifier, eventName, customerID, requestKey, message, err := stripeMeterErrorDetails(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identifier != "" || eventName != "" || customerID != "" {
+		t.Fatalf("unexpected direct fields: %q %q %q", identifier, eventName, customerID)
+	}
+	if requestKey != "meter-event:test" {
+		t.Fatalf("request key = %q", requestKey)
+	}
+	if message != "There is 1 invalid event" {
+		t.Fatalf("message = %q", message)
+	}
+}
+
+func TestStripeEventTimestampAcceptsSnapshotAndThinFormats(t *testing.T) {
+	for _, input := range []string{`1724910852`, `"2024-08-28T20:54:12.051Z"`} {
+		var timestamp stripeEventTimestamp
+		if err := json.Unmarshal([]byte(input), &timestamp); err != nil {
+			t.Fatalf("unmarshal %s: %v", input, err)
+		}
+		if timestamp == 0 {
+			t.Fatalf("timestamp %s was zero", input)
+		}
+	}
+}
 
 type stripeMeterEventRoundTripper struct {
 	identifier     string

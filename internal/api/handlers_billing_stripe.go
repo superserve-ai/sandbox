@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -43,6 +44,10 @@ type StripeBillingClient interface {
 	CreateCheckoutSession(ctx context.Context, params StripeCreateCheckoutSessionParams) (StripeCheckoutSession, error)
 	CreateCustomerPortalSession(ctx context.Context, params StripeCreateCustomerPortalSessionParams) (StripePortalSession, error)
 	ReportMeterEvent(ctx context.Context, params StripeReportMeterEventParams) error
+}
+
+type stripeEventRetriever interface {
+	RetrieveEvent(ctx context.Context, eventID string) (json.RawMessage, error)
 }
 
 type StripeCreateCustomerParams struct {
@@ -181,8 +186,31 @@ type billingSessionResponse struct {
 type stripeEventEnvelope struct {
 	ID      string                  `json:"id"`
 	Type    string                  `json:"type"`
-	Created int64                   `json:"created"`
+	Created stripeEventTimestamp    `json:"created"`
 	Data    stripeEventEnvelopeData `json:"data"`
+}
+
+type stripeEventTimestamp int64
+
+func (t *stripeEventTimestamp) UnmarshalJSON(data []byte) error {
+	if len(data) > 0 && data[0] == '"' {
+		var value string
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil {
+			return err
+		}
+		*t = stripeEventTimestamp(parsed.Unix())
+		return nil
+	}
+	var value int64
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*t = stripeEventTimestamp(value)
+	return nil
 }
 
 type stripeEventEnvelopeData struct {
@@ -292,6 +320,14 @@ func (c *stripeHTTPClient) ReportMeterEvent(ctx context.Context, params StripeRe
 	form.Set("payload[stripe_customer_id]", params.CustomerID)
 	form.Set("payload[value]", params.Value)
 	return c.doForm(ctx, http.MethodPost, "/v1/billing/meter_events", form, nil, params.IdempotencyKey)
+}
+
+func (c *stripeHTTPClient) RetrieveEvent(ctx context.Context, eventID string) (json.RawMessage, error) {
+	var raw json.RawMessage
+	if err := c.doForm(ctx, http.MethodGet, "/v2/core/events/"+url.PathEscape(eventID), nil, &raw, ""); err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
 
 func (c *stripeHTTPClient) doForm(ctx context.Context, method, path string, form url.Values, out any, idempotencyKey string) error {
@@ -764,7 +800,7 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 		activeResources[item.ResourceType] = struct{}{}
 	}
 	for i, row := range existing {
-		if (row.Status != "pending" && row.Status != "failed") || hasResource(activeResources, row.ResourceType) {
+		if (row.Status != "pending" && row.Status != "failed") || (exportEnabled && hasResource(activeResources, row.ResourceType)) {
 			continue
 		}
 		updatedRow, updateErr := q.UpdateBillingUsageExportStatus(ctx, db.UpdateBillingUsageExportStatusParams{
@@ -956,6 +992,7 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 				ResourceType:               resourceType,
 				StripeCustomerID:           account.StripeCustomerID,
 				StripeMeterEventIdentifier: item.Identifier,
+				StripeIdempotencyKey:       stringPtr(stripeMeterEventIdempotencyKey(item.Identifier, item.EventName, derefString(account.StripeCustomerID), stripeMeterQuantityString(item.Value), periodEnd.UTC().Add(-time.Second).Unix())),
 				StripeEventName:            item.EventName,
 				Value:                      numericFromFloat(item.Value),
 				Status:                     status,
@@ -1315,6 +1352,31 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "Stripe webhook payload is missing id or type", http.StatusBadRequest)
 		return
 	}
+	if isStripeMeterErrorEvent(event.Type) && len(bytes.TrimSpace(event.Data.Object)) == 0 {
+		retriever, ok := h.Stripe.(stripeEventRetriever)
+		if !ok {
+			respondErrorMsg(c, "service_unavailable", "Stripe event retrieval is not configured", http.StatusServiceUnavailable)
+			return
+		}
+		fullEvent, err := retriever.RetrieveEvent(c.Request.Context(), event.ID)
+		if err != nil {
+			log.Error().Err(err).Str("event_id", event.ID).Msg("retrieve Stripe thin event failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		var retrieved struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(fullEvent, &retrieved); err != nil || len(bytes.TrimSpace(retrieved.Data)) == 0 {
+			if err == nil {
+				err = errors.New("Stripe thin event response has no data")
+			}
+			log.Error().Err(err).Str("event_id", event.ID).Msg("decode Stripe thin event failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		event.Data.Object = retrieved.Data
+	}
 
 	if h.Pool == nil {
 		respondErrorMsg(c, "service_unavailable", "billing transactions are not configured", http.StatusServiceUnavailable)
@@ -1424,8 +1486,12 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
+func isStripeMeterErrorEvent(eventType string) bool {
+	return eventType == "billing.meter.error_report_triggered" || eventType == "v1.billing.meter.error_report_triggered"
+}
+
 func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries, event stripeEventEnvelope) error {
-	eventAt := stripeEventTime(event.Created)
+	eventAt := stripeEventTime(int64(event.Created))
 	switch event.Type {
 	case "checkout.session.completed":
 		var obj stripeCheckoutCompletedObject
@@ -1480,7 +1546,7 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 			CurrentPeriodStart:        timestamptzFromUnix(start),
 			CurrentPeriodEnd:          timestamptzFromUnix(end),
 			CancelAtPeriodEnd:         boolPtr(obj.CancelAtPeriodEnd),
-			StripeSubscriptionEventAt: timestamptzFromUnix(event.Created),
+			StripeSubscriptionEventAt: timestamptzFromUnix(int64(event.Created)),
 		})
 		return err
 	case "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
@@ -1507,14 +1573,19 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 		})
 		return err
 	case "billing.meter.error_report_triggered", "v1.billing.meter.error_report_triggered":
-		var raw map[string]any
-		if err := json.Unmarshal(event.Data.Object, &raw); err != nil {
+		identifier, eventName, customerID, requestKey, errMsg, err := stripeMeterErrorDetails(event.Data.Object)
+		if err != nil {
 			return err
 		}
-		identifier, _ := raw["identifier"].(string)
-		eventName, _ := raw["event_name"].(string)
-		customerID, _ := raw["stripe_customer_id"].(string)
-		errMsg, _ := raw["reason"].(string)
+		if identifier == "" && requestKey != "" {
+			row, lookupErr := q.GetBillingUsageExportByIdempotencyKey(ctx, stringPtr(requestKey))
+			if lookupErr == nil {
+				identifier = row.StripeMeterEventIdentifier
+			}
+		}
+		if identifier == "" {
+			return fmt.Errorf("stripe meter error event has no export identifier")
+		}
 		teamID, start, end, resourceType, err := parseMeterIdentifier(identifier)
 		if err != nil {
 			return nil
@@ -1535,9 +1606,6 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 			}
 			return perr
 		}
-		if period.FinalizedAt.Valid {
-			return nil
-		}
 		existing, lerr := q.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
 			TeamID:      teamID,
 			PeriodStart: start,
@@ -1545,6 +1613,20 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 		})
 		if lerr != nil {
 			return lerr
+		}
+		if period.FinalizedAt.Valid {
+			for i := len(existing) - 1; i >= 0; i-- {
+				if existing[i].StripeMeterEventIdentifier != identifier {
+					continue
+				}
+				_, err = q.UpdateBillingUsageExportStatus(ctx, db.UpdateBillingUsageExportStatusParams{
+					ID:     existing[i].ID,
+					Status: "failed",
+					Error:  stringPtr(errMsg),
+				})
+				return err
+			}
+			return fmt.Errorf("stripe meter error has no matching finalized export")
 		}
 		latest := latestLiveExportByResource(existing)[billingExportResourceType(resourceType)]
 		if latest.ID != uuid.Nil && latest.StripeMeterEventIdentifier != identifier {
@@ -1595,6 +1677,7 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 			ResourceType:               billingExportResourceType(resourceType),
 			StripeCustomerID:           stringPtr(customerID),
 			StripeMeterEventIdentifier: identifier,
+			StripeIdempotencyKey:       stringPtr(requestKey),
 			StripeEventName:            eventName,
 			Value:                      numericFromFloat(0),
 			Status:                     "failed",
@@ -1604,6 +1687,53 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 	default:
 		return nil
 	}
+}
+
+func stripeMeterErrorDetails(payload []byte) (identifier, eventName, customerID, requestKey, message string, err error) {
+	var value any
+	if err = json.Unmarshal(payload, &value); err != nil {
+		return "", "", "", "", "", err
+	}
+	var walk func(any)
+	walk = func(current any) {
+		switch item := current.(type) {
+		case map[string]any:
+			for key, nested := range item {
+				text, ok := nested.(string)
+				if ok {
+					switch key {
+					case "identifier":
+						if identifier == "" {
+							identifier = text
+						}
+					case "event_name":
+						if eventName == "" {
+							eventName = text
+						}
+					case "stripe_customer_id":
+						if customerID == "" {
+							customerID = text
+						}
+					case "idempotency_key":
+						if requestKey == "" {
+							requestKey = text
+						}
+					case "reason", "error_message", "developer_message_summary":
+						if message == "" {
+							message = text
+						}
+					}
+				}
+				walk(nested)
+			}
+		case []any:
+			for _, nested := range item {
+				walk(nested)
+			}
+		}
+	}
+	walk(value)
+	return
 }
 
 func (h *Handlers) authorizeTeamBillingRead(c *gin.Context, platform bool) (uuid.UUID, bool) {
@@ -2206,6 +2336,11 @@ func stripeMeterQuantity(value float64) (string, bool) {
 		return "", false
 	}
 	return formatted, true
+}
+
+func stripeMeterQuantityString(value float64) string {
+	formatted, _ := stripeMeterQuantity(value)
+	return formatted
 }
 
 func stripeMeterRoundedValue(value float64) float64 {

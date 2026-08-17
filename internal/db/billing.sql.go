@@ -259,6 +259,7 @@ INSERT INTO billing_usage_export (
     resource_type,
     stripe_customer_id,
     stripe_meter_event_identifier,
+    stripe_idempotency_key,
     stripe_event_name,
     value,
     status,
@@ -276,9 +277,10 @@ VALUES (
     $8,
     $9,
     $10,
-    $11
+    $11,
+    $12
 )
-RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at
+RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
 `
 
 type CreateBillingUsageExportParams struct {
@@ -288,6 +290,7 @@ type CreateBillingUsageExportParams struct {
 	ResourceType               string             `json:"resource_type"`
 	StripeCustomerID           *string            `json:"stripe_customer_id"`
 	StripeMeterEventIdentifier string             `json:"stripe_meter_event_identifier"`
+	StripeIdempotencyKey       *string            `json:"stripe_idempotency_key"`
 	StripeEventName            string             `json:"stripe_event_name"`
 	Value                      pgtype.Numeric     `json:"value"`
 	Status                     string             `json:"status"`
@@ -303,6 +306,7 @@ func (q *Queries) CreateBillingUsageExport(ctx context.Context, arg CreateBillin
 		arg.ResourceType,
 		arg.StripeCustomerID,
 		arg.StripeMeterEventIdentifier,
+		arg.StripeIdempotencyKey,
 		arg.StripeEventName,
 		arg.Value,
 		arg.Status,
@@ -325,6 +329,7 @@ func (q *Queries) CreateBillingUsageExport(ctx context.Context, arg CreateBillin
 		&i.CreatedAt,
 		&i.SentAt,
 		&i.UpdatedAt,
+		&i.StripeIdempotencyKey,
 	)
 	return i, err
 }
@@ -385,6 +390,37 @@ func (q *Queries) GetActiveTeamBillingPeriod(ctx context.Context, teamID uuid.UU
 		&i.GrossChargesUsd,
 		&i.CreditsAppliedUsd,
 		&i.NetInvoiceAmountUsd,
+	)
+	return i, err
+}
+
+const getBillingUsageExportByIdempotencyKey = `-- name: GetBillingUsageExportByIdempotencyKey :one
+SELECT id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
+FROM billing_usage_export
+WHERE stripe_idempotency_key = $1
+ORDER BY created_at DESC, id DESC
+LIMIT 1
+`
+
+func (q *Queries) GetBillingUsageExportByIdempotencyKey(ctx context.Context, stripeIdempotencyKey *string) (BillingUsageExport, error) {
+	row := q.db.QueryRow(ctx, getBillingUsageExportByIdempotencyKey, stripeIdempotencyKey)
+	var i BillingUsageExport
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.ResourceType,
+		&i.StripeCustomerID,
+		&i.StripeMeterEventIdentifier,
+		&i.StripeEventName,
+		&i.Value,
+		&i.Status,
+		&i.Error,
+		&i.CreatedAt,
+		&i.SentAt,
+		&i.UpdatedAt,
+		&i.StripeIdempotencyKey,
 	)
 	return i, err
 }
@@ -952,7 +988,7 @@ func (q *Queries) ListActivePricingRatesForTeam(ctx context.Context, arg ListAct
 }
 
 const listBillingUsageExportsForPeriod = `-- name: ListBillingUsageExportsForPeriod :many
-SELECT id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at
+SELECT id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
 FROM billing_usage_export
 WHERE team_id = $1
   AND period_start = $2
@@ -990,6 +1026,7 @@ func (q *Queries) ListBillingUsageExportsForPeriod(ctx context.Context, arg List
 			&i.CreatedAt,
 			&i.SentAt,
 			&i.UpdatedAt,
+			&i.StripeIdempotencyKey,
 		); err != nil {
 			return nil, err
 		}
@@ -1344,7 +1381,7 @@ SET status = 'sent',
     updated_at = now()
 WHERE id = $2
   AND status = 'pending'
-RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at
+RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
 `
 
 type MarkBillingUsageExportSentParams struct {
@@ -1370,6 +1407,7 @@ func (q *Queries) MarkBillingUsageExportSent(ctx context.Context, arg MarkBillin
 		&i.CreatedAt,
 		&i.SentAt,
 		&i.UpdatedAt,
+		&i.StripeIdempotencyKey,
 	)
 	return i, err
 }
@@ -1740,7 +1778,7 @@ SET status = $1,
     sent_at = COALESCE($3, billing_usage_export.sent_at),
     updated_at = now()
 WHERE id = $4
-RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at
+RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
 `
 
 type UpdateBillingUsageExportStatusParams struct {
@@ -1773,6 +1811,7 @@ func (q *Queries) UpdateBillingUsageExportStatus(ctx context.Context, arg Update
 		&i.CreatedAt,
 		&i.SentAt,
 		&i.UpdatedAt,
+		&i.StripeIdempotencyKey,
 	)
 	return i, err
 }
