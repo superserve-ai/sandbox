@@ -536,6 +536,12 @@ func main() {
 				Msg("paused network reclaim is enabled but no pressure trigger is configured; reclamation will remain inert until at least one threshold is raised")
 		}
 	}
+	// One instance ID for the whole process: vmd builds both an
+	// OTelRecorder (below) and a BackupRecorder (further down) under the
+	// same service.name, and each defaults its own random ID independently
+	// if not told otherwise — which would misrepresent this single vmd
+	// process as two separate GMP targets.
+	otelInstanceID := telemetry.NewInstanceID()
 	recorder := telemetry.NewNoopRecorder()
 	if envOrDefault("OTEL_METRICS_ENABLED", "false") == "true" {
 		otelExportInterval, err := time.ParseDuration(envOrDefault("OTEL_EXPORT_INTERVAL", "15s"))
@@ -544,6 +550,7 @@ func main() {
 		}
 		otelRecorder, err := telemetry.NewOTelRecorder(ctx, telemetry.OTelConfig{
 			HostID:         cfg.HostID,
+			InstanceID:     otelInstanceID,
 			ServiceName:    envOrDefault("OTEL_SERVICE_NAME", "sandbox-vmd"),
 			ServiceVersion: os.Getenv("OTEL_SERVICE_VERSION"),
 			Environment:    envOrDefault("OTEL_ENVIRONMENT", "dev"),
@@ -703,6 +710,7 @@ func main() {
 				Endpoint:       envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
 				Insecure:       os.Getenv("OTEL_EXPORTER_OTLP_INSECURE") == "true",
 				ExportInterval: exportInterval,
+				InstanceID:     otelInstanceID,
 			},
 			HostID: cfg.HostID,
 		})
