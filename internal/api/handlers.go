@@ -1931,7 +1931,7 @@ func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uui
 func (h *Handlers) CreateSandbox(c *gin.Context) {
 	tStart := time.Now()
 	var hostID string
-	var tLookupDone, tVmdStart, tVmdEnd, tInsertStart, tInsertEnd, tInsertReceive, tPostStart, tPostDone time.Time
+	var tLookupDone, tSchedStart, tVmdStart, tVmdEnd, tInsertStart, tInsertEnd, tInsertReceive, tPostStart, tPostDone time.Time
 	// Registered before ANY return so failed, timed-out, and rejected
 	// creates land in the phase histograms too — a success-only emission
 	// makes the distributions look healthier than the transition series.
@@ -1952,12 +1952,17 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		if !tLookupDone.IsZero() {
 			phases["lookup"] = tLookupDone.Sub(tStart)
+		}
+		// Gated on scheduling actually starting: template rejections after
+		// lookup (not ready, missing paths) return before placement and must
+		// not add bogus scheduling samples.
+		if !tSchedStart.IsZero() {
 			if !tVmdStart.IsZero() {
-				phases["sched"] = tVmdStart.Sub(tLookupDone)
+				phases["sched"] = tVmdStart.Sub(tSchedStart)
 			} else {
 				// Placement/attestation died mid-stage; report its elapsed
 				// time so slow failed scheduling stays visible in sched.
-				phases["sched"] = time.Since(tLookupDone)
+				phases["sched"] = time.Since(tSchedStart)
 			}
 		}
 		switch {
@@ -2131,6 +2136,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 
 	// Select a host for this sandbox.
+	tSchedStart = time.Now()
 	requiredCapabilities := []string{preview.HostCapabilityPorts}
 	if previewAccess == preview.AccessPrivate {
 		requiredCapabilities = previewBrowserCapabilities()
@@ -2679,7 +2685,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	l.Info().
 		Int64("auth_ms", c.GetInt64("auth_ms")).
 		Int64("lookup_ms", tLookupDone.Sub(tStart).Milliseconds()).
-		Int64("sched_ms", tVmdStart.Sub(tLookupDone).Milliseconds()).
+		Int64("sched_ms", tVmdStart.Sub(tSchedStart).Milliseconds()).
 		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
 		Bool("vmd_retried", vmdRetried).
 		Int64("insert_ms", tInsertEnd.Sub(tInsertStart).Milliseconds()).
