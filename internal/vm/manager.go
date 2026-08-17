@@ -1705,6 +1705,11 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		}
 		if !tFcStart.IsZero() {
 			phases["ensure_slot"] = tFcStart.Sub(tSlot)
+		} else {
+			// Slot/network preparation died mid-stage — report its elapsed
+			// time, or slow failed preparation stays invisible in the phase
+			// meant to identify it.
+			phases["ensure_slot"] = time.Since(tSlot)
 		}
 		switch {
 		case !tRestoreDone.IsZero():

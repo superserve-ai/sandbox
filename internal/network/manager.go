@@ -364,6 +364,9 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		// request must not enter the inline path, whose slot-index claim can
 		// trigger reclaim scans over the full namespace table.
 		if err := ctx.Err(); err != nil {
+			// A cancelled wait is the full-deadline tail of pool_wait during
+			// saturation — sample it before bailing.
+			m.recordNetPhase("pool_wait", time.Since(tWait))
 			return nil, err
 		}
 		m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).
