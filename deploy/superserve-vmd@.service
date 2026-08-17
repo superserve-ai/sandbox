@@ -16,7 +16,12 @@ Requires=superserve-vmd-gateway.service
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=/usr/local/bin/vmd
+# The generation id (%i) IS the release version, and each generation runs its
+# own versioned binary. A rollback restarts the previous generation, which runs
+# the previous binary — a genuine binary rollback, not a restart onto whatever
+# was installed last. The deploy installs /usr/local/bin/vmd-<version> and
+# retains the prior one so rollback has something to run.
+ExecStart=/usr/local/bin/vmd-%i
 Environment=VMD_GENERATION_ID=%i
 Environment=VMD_PRIVATE_SOCKET=/run/vmd/gen-%i-grpc.sock
 Environment=VMD_RESOLVER_SOCKET=/run/vmd/gen-%i-resolver.sock
