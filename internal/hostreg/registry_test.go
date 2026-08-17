@@ -132,6 +132,60 @@ func TestClientForKeepsClientWhenAddressUnchanged(t *testing.T) {
 	}
 }
 
+// A COLD dial (no cached entry) raced by an invalidation must also discard
+// its result: the row was read before the reclaim committed, so the dialed
+// client points at the old machine. The resolution re-reads and returns a
+// client for the newest address — the caller never receives the old one.
+func TestClientForColdDialRacedByInvalidateReturnsNewestAddress(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dialStarted := make(chan struct{})
+	dialRelease := make(chan struct{})
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		if addr == "10.0.0.1:50051" {
+			close(dialStarted)
+			<-dialRelease // hold the cold dial open while the reclaim lands
+		}
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		done <- err
+	}()
+
+	<-dialStarted // resolution read .1 and is dialing it
+	store.setAddr("10.0.0.2:50051")
+	r.Invalidate("host-a") // the reclaim to .2 commits mid-dial
+	close(dialRelease)
+
+	if err := <-done; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != "10.0.0.1:50051" || got[1] != "10.0.0.2:50051" {
+		t.Fatalf("dial sequence = %v, want [.1 discarded, .2 returned]", got)
+	}
+	// The settled entry serves the newest address without another dial.
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("post-race ClientFor: %v", err)
+	}
+	mu.Lock()
+	n := len(dialed)
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("dials after settle = %d, want 2", n)
+	}
+}
+
 // A transient read failure with NO invalidation keeps the availability
 // softness: the still-cached client is returned rather than failing the op.
 func TestClientForServesCachedOnReadBlipWithoutInvalidation(t *testing.T) {
