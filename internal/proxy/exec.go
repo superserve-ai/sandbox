@@ -140,6 +140,14 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		Int64("boxd_run_ms", boxdRunMs).
 		Msg("exec phases")
 	if h.recorder != nil {
+		// mode splits the series: buffered ttfb includes the whole command run
+		// (boxd writes headers at completion), streaming ttfb is setup only
+		// (headers before the process starts). Mixed, the percentiles would
+		// track transport mix instead of either latency.
+		mode := "buffered"
+		if streaming {
+			mode = "stream"
+		}
 		for phase, d := range map[string]time.Duration{
 			"auth":       tAuthDone.Sub(tStart),
 			"boxd_spawn": time.Duration(boxdSpawnMs) * time.Millisecond,
@@ -151,7 +159,7 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 				continue
 			}
 			h.recorder.RecordLatencyPhase(r.Context(), telemetry.LatencyPhase{
-				Plane: "dataplane", Op: "exec", Phase: phase, Duration: d,
+				Plane: "dataplane", Op: "exec", Phase: phase, Mode: mode, Duration: d,
 			})
 		}
 	}

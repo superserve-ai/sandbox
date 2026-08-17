@@ -123,15 +123,20 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 	// Connect latency only (auth + upgrade): the bridged session that
 	// follows lasts as long as the client wants and is deliberately NOT a
 	// latency sample — folding session lifetimes into exec histograms would
-	// bury the one-shot percentiles under user behavior. Deferred so failed
-	// connects land too, with whichever stages they reached.
+	// bury the one-shot percentiles under user behavior. Success emits
+	// before bridging (total ends at establishment); the defer covers only
+	// pre-establishment failures, with whichever stages they reached.
 	tConnect := time.Now()
 	var tAuthDone, tEstablished time.Time
-	defer func() {
+	emitConnectPhases := func() {
 		if h.recorder == nil {
 			return
 		}
-		phases := map[string]time.Duration{"total": time.Since(tConnect)}
+		end := time.Now()
+		if !tEstablished.IsZero() {
+			end = tEstablished
+		}
+		phases := map[string]time.Duration{"total": end.Sub(tConnect)}
 		if !tAuthDone.IsZero() {
 			phases["auth"] = tAuthDone.Sub(tConnect)
 		}
@@ -145,6 +150,11 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 			h.recorder.RecordLatencyPhase(r.Context(), telemetry.LatencyPhase{
 				Plane: "dataplane", Op: "exec_connect", Phase: phase, Duration: d,
 			})
+		}
+	}
+	defer func() {
+		if tEstablished.IsZero() {
+			emitConnectPhases()
 		}
 	}()
 
@@ -178,13 +188,12 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 	}
 
 	ws, err := websocket.Accept(w, r, acceptOpts)
-	if err == nil {
-		tEstablished = time.Now()
-	}
 	if err != nil {
 		h.log.Warn().Err(err).Msg("exec/ws: WS upgrade failed")
 		return
 	}
+	tEstablished = time.Now()
+	emitConnectPhases()
 	ws.SetReadLimit(maxExecReadBytes)
 
 	transport := h.transports.get(instanceID, info)

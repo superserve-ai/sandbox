@@ -5197,14 +5197,18 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		"wait_socket": tSocketReady.Sub(tStartUnitDone),
 	}
 	// Window opens at tStartUnit (pre-enqueue): the unit's script can stamp
-	// before the no-block start call returns. chain reports relative to
-	// tStartUnitDone, clamped at zero when the unit won that race.
+	// before the no-block start call returns. The split boundary is clamped
+	// to tStartUnitDone so both sides use it: chain + fc_socket always
+	// equals wait_socket exactly.
 	if ts, ok := readFCExecStamp(socketPath, tStartUnit, tSocketReady); ok {
-		chain := max(ts.Sub(tStartUnitDone), 0)
-		ev = ev.Int64("chain_ms", chain.Milliseconds()).
-			Int64("fc_socket_ms", tSocketReady.Sub(ts).Milliseconds())
-		unitPhases["chain"] = chain
-		unitPhases["fc_socket"] = tSocketReady.Sub(ts)
+		boundary := ts
+		if boundary.Before(tStartUnitDone) {
+			boundary = tStartUnitDone
+		}
+		ev = ev.Int64("chain_ms", boundary.Sub(tStartUnitDone).Milliseconds()).
+			Int64("fc_socket_ms", tSocketReady.Sub(boundary).Milliseconds())
+		unitPhases["chain"] = boundary.Sub(tStartUnitDone)
+		unitPhases["fc_socket"] = tSocketReady.Sub(boundary)
 	}
 	ev.Msg("fc startup phases")
 	m.recordPhases("launch", "unit", unitPhases)
