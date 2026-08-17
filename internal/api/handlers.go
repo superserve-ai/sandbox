@@ -1925,7 +1925,7 @@ func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uui
 func (h *Handlers) CreateSandbox(c *gin.Context) {
 	tStart := time.Now()
 	var hostID string
-	var tLookupDone, tVmdStart, tVmdEnd, tInsertStart, tInsertEnd, tInsertReceive, tPostDone time.Time
+	var tLookupDone, tVmdStart, tVmdEnd, tInsertStart, tInsertEnd, tInsertReceive, tPostStart, tPostDone time.Time
 	// Registered before ANY return so failed, timed-out, and rejected
 	// creates land in the phase histograms too — a success-only emission
 	// makes the distributions look healthier than the transition series.
@@ -1958,13 +1958,17 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		if !tVmdEnd.IsZero() && !tInsertReceive.IsZero() {
 			phases["insert_wait"] = tInsertReceive.Sub(tVmdEnd)
 		}
-		if !tInsertReceive.IsZero() {
+		if !tPostStart.IsZero() {
+			// Gated on the post stage actually starting: a create that failed
+			// at the insert join returns after cleanup (DestroyInstance,
+			// failed-state reconciliation) without ever entering this stage,
+			// and that cleanup must not masquerade as post latency.
 			if !tPostDone.IsZero() {
-				phases["post"] = tPostDone.Sub(tInsertReceive)
+				phases["post"] = tPostDone.Sub(tPostStart)
 			} else {
 				// Post-boot work (attestation, token minting, env inject)
 				// died mid-stage; report its elapsed time.
-				phases["post"] = time.Since(tInsertReceive)
+				phases["post"] = time.Since(tPostStart)
 			}
 		}
 		RecordLatencyPhases(c.Request.Context(), "create", hostID, phases)
@@ -2452,6 +2456,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// sandbox that boots without its env vars is unusable. (Hostname-only
 	// creates run the same call inside the activation goroutine instead;
 	// a failure there fails the row before it ever goes active.)
+	tPostStart = time.Now()
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
@@ -2665,7 +2670,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		Bool("vmd_retried", vmdRetried).
 		Int64("insert_ms", tInsertEnd.Sub(tInsertStart).Milliseconds()).
 		Int64("insert_wait_after_vmd_ms", tInsertReceive.Sub(tVmdEnd).Milliseconds()).
-		Int64("post_ms", tPostDone.Sub(tInsertReceive).Milliseconds()).
+		Int64("post_ms", tPostDone.Sub(tPostStart).Milliseconds()).
 		Int64("total_ms", tPostDone.Sub(tStart).Milliseconds()).
 		Msg("CreateSandbox phases")
 	c.JSON(http.StatusCreated, resp)
