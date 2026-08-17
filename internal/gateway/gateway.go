@@ -44,10 +44,11 @@ const (
 func New() *Gateway {
 	return &Gateway{
 		router: NewRouter(),
-		// Longer than any normal cutover's quiesce window (now just the new
-		// generation's activation, since draining happens before the hold). The
-		// caller's own request context still bounds an individual wait, so a
-		// generous cap never pins a request past when its client gave up.
+		// Safety cap only. The controller holds the resolver just for the
+		// budget-bounded stop+activate window (~5s) and releases it, so a request
+		// normally waits far less than this. The cap protects against a hold that
+		// is never released (e.g. a crashed cutover); the caller's own request
+		// context bounds an individual wait regardless.
 		resolverHoldMax: 30 * time.Second,
 		conns:           map[string]*grpc.ClientConn{},
 		transports:      map[string]*http.Transport{},
