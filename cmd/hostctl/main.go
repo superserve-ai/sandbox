@@ -2,9 +2,12 @@
 // activate a provisioning host, drain a host out of placement. It talks to
 // the control plane's internal API — never to the database.
 //
-//	CONTROL_PLANE_URL=https://... INTERNAL_API_TOKEN=... hostctl list
+//	CONTROL_PLANE_URL=https://... OPERATOR_API_TOKEN=... hostctl list
 //	hostctl activate <host-id>
 //	hostctl drain <host-id>
+//
+// The operator token is distinct from the vmd-held internal token: hosts
+// must not hold the credential that approves them.
 package main
 
 import (
@@ -21,7 +24,7 @@ import (
 
 func main() {
 	url := flag.String("url", os.Getenv("CONTROL_PLANE_URL"), "control plane base URL (env CONTROL_PLANE_URL)")
-	token := flag.String("token", os.Getenv("INTERNAL_API_TOKEN"), "internal API token (env INTERNAL_API_TOKEN)")
+	token := flag.String("token", os.Getenv("OPERATOR_API_TOKEN"), "operator API token (env OPERATOR_API_TOKEN)")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "usage: hostctl [flags] <list|activate|drain> [host-id]\n")
 		flag.PrintDefaults()
@@ -29,7 +32,7 @@ func main() {
 	flag.Parse()
 
 	if *url == "" || *token == "" {
-		fmt.Fprintln(os.Stderr, "hostctl: CONTROL_PLANE_URL and INTERNAL_API_TOKEN are required")
+		fmt.Fprintln(os.Stderr, "hostctl: CONTROL_PLANE_URL and OPERATOR_API_TOKEN are required")
 		os.Exit(2)
 	}
 	cli := client{base: strings.TrimRight(*url, "/"), token: *token}

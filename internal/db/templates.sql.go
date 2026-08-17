@@ -1097,7 +1097,8 @@ SET status = 'building',
     updated_at = now(),
     vmd_host_id = $2,
     vmd_build_vm_id = $3
-WHERE id = $1 AND status = 'pending'
+WHERE template_build.id = $1 AND template_build.status = 'pending'
+  AND COALESCE((SELECT h.status = 'active' FROM host h WHERE h.id = $2), true)
 `
 
 type TryDispatchBuildParams struct {
@@ -1109,6 +1110,9 @@ type TryDispatchBuildParams struct {
 // Claims a pending row for dispatch. Stamps host + caller-generated
 // build_vm_id up front so a timed-out BuildTemplate RPC can still be
 // reconciled by GetBuildStatus on the next tick.
+// The claim itself requires the target host to be active WHEN a row for it
+// exists (a drain landing between the supervisor's pre-check and this claim
+// must lose the race); a missing row keeps the bootstrap path dispatching.
 func (q *Queries) TryDispatchBuild(ctx context.Context, arg TryDispatchBuildParams) (int64, error) {
 	result, err := q.db.Exec(ctx, tryDispatchBuild, arg.ID, arg.VmdHostID, arg.VmdBuildVmID)
 	if err != nil {

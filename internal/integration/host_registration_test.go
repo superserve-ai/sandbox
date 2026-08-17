@@ -9,6 +9,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 func hostHeartbeat(t *testing.T, r http.Handler, token, hostID, body string) *httptest.ResponseRecorder {
@@ -45,6 +49,7 @@ func cleanupHost(t *testing.T, hostID string) {
 func TestIntegration_HostRegistration_SelfRegistersProvisioning(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
 	r := newRouter(t)
 	hostID := "reg-" + strings.ToLower(t.Name()[len(t.Name())-8:])
 	cleanupHost(t, hostID)
@@ -91,6 +96,7 @@ func TestIntegration_HostRegistration_SelfRegistersProvisioning(t *testing.T) {
 // behavior: 404, nothing created. Legacy vmds cannot register implicitly.
 func TestIntegration_HostRegistration_NoDescriptionIs404(t *testing.T) {
 	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
 	r := newRouter(t)
 
 	w := hostHeartbeat(t, r, "itok-hostreg", "ghost-host", `{"capabilities":[]}`)
@@ -106,6 +112,7 @@ func TestIntegration_HostRegistration_NoDescriptionIs404(t *testing.T) {
 func TestIntegration_HostRegistration_IdentityConflictAndReclaim(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
 	r := newRouter(t)
 	hostID := "dup-" + strings.ToLower(t.Name()[len(t.Name())-8:])
 	cleanupHost(t, hostID)
@@ -144,6 +151,7 @@ func TestIntegration_HostRegistration_IdentityConflictAndReclaim(t *testing.T) {
 // machine-managed and unknown values rejected.
 func TestIntegration_HostStatus_OperatorTransitions(t *testing.T) {
 	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
 	r := newRouter(t)
 	hostID := "act-" + strings.ToLower(t.Name()[len(t.Name())-8:])
 	cleanupHost(t, hostID)
@@ -156,7 +164,7 @@ func TestIntegration_HostStatus_OperatorTransitions(t *testing.T) {
 		req := httptest.NewRequest("POST", "/internal/hosts/"+id+"/status",
 			strings.NewReader(`{"status":"`+status+`"}`))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer itok-hostreg")
+		req.Header.Set("Authorization", "Bearer optok-hostreg")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		return w
@@ -184,6 +192,7 @@ func TestIntegration_HostStatus_OperatorTransitions(t *testing.T) {
 func TestIntegration_HostActivateRequiresFreshHeartbeat(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
 	r := newRouter(t)
 	hostID := "stl-" + strings.ToLower(t.Name()[len(t.Name())-8:])
 	cleanupHost(t, hostID)
@@ -201,7 +210,7 @@ func TestIntegration_HostActivateRequiresFreshHeartbeat(t *testing.T) {
 		req := httptest.NewRequest("POST", "/internal/hosts/"+hostID+"/status",
 			strings.NewReader(`{"status":"`+status+`"}`))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer itok-hostreg")
+		req.Header.Set("Authorization", "Bearer optok-hostreg")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		return w
@@ -232,6 +241,7 @@ func TestIntegration_HostList_IncludesProvisioningAndBuilds(t *testing.T) {
 	ctx := context.Background()
 	_, apiKey := seedTeamAndKey(t)
 	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
 	r := newRouter(t)
 	hostID := "lst-" + strings.ToLower(t.Name()[len(t.Name())-8:])
 	cleanupHost(t, hostID)
@@ -255,7 +265,7 @@ func TestIntegration_HostList_IncludesProvisioningAndBuilds(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/internal/hosts", nil)
-	req.Header.Set("Authorization", "Bearer itok-hostreg")
+	req.Header.Set("Authorization", "Bearer optok-hostreg")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -283,4 +293,106 @@ func TestIntegration_HostList_IncludesProvisioningAndBuilds(t *testing.T) {
 		}
 	}
 	t.Fatalf("host %s not in list", hostID)
+}
+
+// Host lifecycle approval must not be reachable with the credential the
+// hosts themselves hold: the vmd-held internal token gets 401 on operator
+// endpoints (a self-registered host cannot approve itself), and the
+// operator token gets 401 on the heartbeat.
+func TestIntegration_HostStatus_RequiresOperatorCredential(t *testing.T) {
+	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
+	r := newRouter(t)
+	hostID := "sec-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
+
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{`+hostDescription+`}`); w.Code != http.StatusOK {
+		t.Fatalf("seed host: %d %s", w.Code, w.Body.String())
+	}
+
+	// The vmd credential must not activate the host it registered.
+	req := httptest.NewRequest("POST", "/internal/hosts/"+hostID+"/status",
+		strings.NewReader(`{"status":"active"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer itok-hostreg")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("internal token on status = %d, want 401", w.Code)
+	}
+	if host, _ := testQueries.GetHost(context.Background(), hostID); host.Status != "provisioning" {
+		t.Fatalf("status = %s, want provisioning untouched", host.Status)
+	}
+
+	// And the operator credential is not a heartbeat credential.
+	if w := hostHeartbeat(t, r, "optok-hostreg", hostID, `{`+hostDescription+`}`); w.Code != http.StatusUnauthorized {
+		t.Fatalf("operator token on heartbeat = %d, want 401", w.Code)
+	}
+}
+
+// The build claim itself re-asserts host status: a drain landing between
+// the supervisor's pre-check and the claim must lose — TryDispatchBuild
+// refuses to move a pending build onto a non-active host. A missing host
+// row (bootstrap mode) keeps dispatching.
+func TestIntegration_TryDispatchBuildRefusesNonActiveHost(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
+	r := newRouter(t)
+	hostID := "bld-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
+
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{`+hostDescription+`}`); w.Code != http.StatusOK {
+		t.Fatalf("seed host: %d %s", w.Code, w.Body.String())
+	}
+	if _, err := testPool.Exec(ctx,
+		`UPDATE host SET status = 'draining' WHERE id = $1`, hostID); err != nil {
+		t.Fatalf("drain host: %v", err)
+	}
+
+	tw := do(r, "POST", "/templates", apiKey,
+		`{"name":"dispatch-gate-probe","build_spec":{"from":"debian:12-slim","steps":[]}}`)
+	if tw.Code != http.StatusAccepted {
+		t.Fatalf("create template: %d %s", tw.Code, tw.Body.String())
+	}
+	templateID := mustJSON(t, tw)["id"].(string)
+	var buildID uuid.UUID
+	if err := testPool.QueryRow(ctx,
+		`SELECT id FROM template_build WHERE template_id = $1`, templateID).Scan(&buildID); err != nil {
+		t.Fatalf("find pending build: %v", err)
+	}
+
+	vmID := "build-" + buildID.String()
+	claim := func(host string) int64 {
+		n, err := testQueries.TryDispatchBuild(ctx, db.TryDispatchBuildParams{
+			ID: buildID, VmdHostID: &host, VmdBuildVmID: &vmID,
+		})
+		if err != nil {
+			t.Fatalf("TryDispatchBuild(%s): %v", host, err)
+		}
+		return n
+	}
+
+	if n := claim(hostID); n != 0 {
+		t.Fatalf("claim on draining host = %d rows, want 0", n)
+	}
+	if _, err := testPool.Exec(ctx,
+		`UPDATE host SET status = 'active' WHERE id = $1`, hostID); err != nil {
+		t.Fatalf("activate host: %v", err)
+	}
+	if n := claim(hostID); n != 1 {
+		t.Fatalf("claim on active host = %d rows, want 1", n)
+	}
+
+	// Bootstrap parity: a host id with no row dispatches. Reset the build to
+	// pending first (it was just claimed).
+	if _, err := testPool.Exec(ctx,
+		`UPDATE template_build SET status = 'pending', vmd_host_id = NULL WHERE id = $1`,
+		buildID); err != nil {
+		t.Fatalf("reset build: %v", err)
+	}
+	if n := claim("no-such-host"); n != 1 {
+		t.Fatalf("claim with missing host row = %d rows, want 1 (bootstrap)", n)
+	}
 }

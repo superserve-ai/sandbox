@@ -107,6 +107,17 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	r.GET("/billing/pricing/public", h.GetPublicBillingPricing)
 	r.POST("/stripe/webhook", h.HandleStripeWebhook)
 
+	// Operator endpoints — authenticated via OPERATOR_API_TOKEN, a separate
+	// credential from the infra-internal token that every vmd host holds
+	// for heartbeats. Host lifecycle approval must not be reachable with a
+	// credential the hosts themselves possess.
+	operator := r.Group("/internal")
+	operator.Use(OperatorAuth(), InternalActorFromHeader())
+	{
+		operator.GET("/hosts", h.HostList)
+		operator.POST("/hosts/:host_id/status", h.HostUpdateStatus)
+	}
+
 	// Internal endpoints — authenticated via a shared token (not per-team
 	// API keys). Called by infrastructure components (VMD heartbeat) and
 	// not exposed to customers. The token is checked by InternalAuth
@@ -116,8 +127,6 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	internal.Use(InternalAuth(), InternalActorFromHeader())
 	{
 		internal.POST("/hosts/:host_id/heartbeat", h.HostHeartbeat)
-		internal.GET("/hosts", h.HostList)
-		internal.POST("/hosts/:host_id/status", h.HostUpdateStatus)
 		internal.POST("/hosts/:host_id/backups", h.ReportHostBackup)
 		internal.POST("/secrets/decrypt", h.DecryptSecret)
 		internal.GET("/jwks", h.JWKS)

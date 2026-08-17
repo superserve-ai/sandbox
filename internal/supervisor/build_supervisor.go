@@ -322,8 +322,14 @@ func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBui
 	// Hold new builds off a host an operator took out of rotation: a build
 	// started on a draining host would be interrupted by its retirement.
 	// The build stays pending and is retried next tick, so it dispatches
-	// as soon as the host is active again (or, later, elsewhere).
-	if host, err := s.q.GetHost(ctx, hostID); !buildHostAccepting(host.Status, err) {
+	// as soon as the host is active again (or, later, elsewhere). This
+	// pre-check exists for the log line and to skip cheaply; the claim in
+	// TryDispatchBuild re-asserts host status atomically, so a drain
+	// landing after this read still wins.
+	statusCtx, statusCancel := context.WithTimeout(ctx, 5*time.Second)
+	host, hostErr := s.q.GetHost(statusCtx, hostID)
+	statusCancel()
+	if !buildHostAccepting(host.Status, hostErr) {
 		rowLog.Warn().Str("host_id", hostID).Str("host_status", host.Status).
 			Msg("build host not active; leaving build pending")
 		return nil

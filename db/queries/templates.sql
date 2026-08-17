@@ -221,13 +221,17 @@ LIMIT $1;
 -- Claims a pending row for dispatch. Stamps host + caller-generated
 -- build_vm_id up front so a timed-out BuildTemplate RPC can still be
 -- reconciled by GetBuildStatus on the next tick.
+-- The claim itself requires the target host to be active WHEN a row for it
+-- exists (a drain landing between the supervisor's pre-check and this claim
+-- must lose the race); a missing row keeps the bootstrap path dispatching.
 UPDATE template_build
 SET status = 'building',
     started_at = now(),
     updated_at = now(),
     vmd_host_id = $2,
     vmd_build_vm_id = $3
-WHERE id = $1 AND status = 'pending';
+WHERE template_build.id = $1 AND template_build.status = 'pending'
+  AND COALESCE((SELECT h.status = 'active' FROM host h WHERE h.id = $2), true);
 
 -- name: ListActiveBuilds :many
 -- Read-only: builds the supervisor is currently watching. Used per tick to
