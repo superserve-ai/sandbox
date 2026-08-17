@@ -105,7 +105,7 @@ func TestDeployHappyPath(t *testing.T) {
 	if err := c.Deploy(context.Background(), Generation{ID: "A"}, Generation{ID: "B", GRPCSocket: "/tmp/b.sock"}); err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
-	want := []string{"StartStandby", "AwaitReady", "QuiesceGRPC(true)", "Drain", "DrainAndStop", "QuiesceResolver(true)", "Activate", "SetActive:B", "QuiesceResolver(false)", "QuiesceGRPC(false)", "Stabilize"}
+	want := []string{"StartStandby", "AwaitReady", "QuiesceGRPC(true)", "Drain", "QuiesceResolver(true)", "DrainAndStop", "Activate", "SetActive:B", "QuiesceResolver(false)", "QuiesceGRPC(false)", "Stabilize"}
 	if !eq(m.seq(), want) {
 		t.Fatalf("sequence = %v, want %v", m.seq(), want)
 	}

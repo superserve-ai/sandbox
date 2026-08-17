@@ -77,14 +77,21 @@ var (
 	ErrDeployPostponed = errors.New("handoff: deploy postponed — in-flight operations did not drain in budget")
 )
 
+// Explicit, separately-enforced phase budgets. Each is bounded in code so no
+// phase can silently run to systemd's stop timeout or the parent context.
+//
+//	steady-state gRPC hold  = drain + stopActivate      = 10s  (< 15s retry, margin)
+//	failure-path gRPC hold  = drain + stopActivate + rollback = 14s (< 15s)
+//	resolver hold           = stopActivate              ≤ 5s   (< 6s resolver deadline)
 const (
-	// totalGRPCHold bounds the whole control-plane hold across a cutover, sized
-	// under the control plane's Unavailable retry window so held callers still
-	// retry onto the new generation successfully.
-	totalGRPCHold = 12 * time.Second
-	// rollbackReserve is kept at the end of the budget so a late failure can roll
-	// back to the old generation without blowing the total.
-	rollbackReserve = 3 * time.Second
+	// drainBudget bounds waiting for the old generation's in-flight operations.
+	drainBudget = 5 * time.Second
+	// stopActivateBudget is the HARD, SHARED deadline for stopping the old
+	// generation and activating the new one. It is also the resolver hold, so it
+	// must stay under the resolver's 6s caller deadline.
+	stopActivateBudget = 5 * time.Second
+	// rollbackBudget bounds a full rollback to the old generation.
+	rollbackBudget = 4 * time.Second
 )
 
 // Controller serializes and orchestrates generation cutovers on one host.
@@ -205,20 +212,18 @@ func (c *Controller) run(ctx context.Context, prev, next Generation) error {
 		return fmt.Errorf("await ready %s: %w", next.ID, err)
 	}
 
-	// 2. Hold gRPC BEFORE touching the old generation: new calls are refused
+	// 2. Hold gRPC before touching the old generation: new calls are refused
 	//    with retryable Unavailable (the control plane retries). The resolver is
-	//    NOT held here — it is read-only, so the old generation keeps answering
-	//    lookups while it drains. The hold has a hard total budget with time
-	//    reserved for rollback, so it never outlasts the caller's retry window.
+	//    NOT held yet — it is read-only, so the old generation keeps answering
+	//    lookups while it drains.
 	c.act.QuiesceGRPC(true)
-	rollbackBy := time.Now().Add(totalGRPCHold - rollbackReserve)
 
-	// 3. Abortable drain: ask the old generation to finish its in-flight
-	//    operations within budget. If they DON'T drain in time, abort the deploy
-	//    — resume the old generation and postpone. The customer operation
+	// 3. Abortable drain (its own budget): ask the old generation to finish its
+	//    in-flight operations. If they DON'T drain in time, abort the deploy —
+	//    resume the old generation and postpone. The customer operation
 	//    completes normally; the deploy loses to availability, never the reverse.
 	if prev.ID != "" {
-		drained, err := c.act.Drain(ctx, prev, time.Until(rollbackBy))
+		drained, err := c.act.Drain(ctx, prev, drainBudget)
 		if err != nil {
 			c.abortDrain(ctx, prev, next)
 			return fmt.Errorf("drain %s: %w", prev.ID, err)
@@ -227,26 +232,39 @@ func (c *Controller) run(ctx context.Context, prev, next Generation) error {
 			c.abortDrain(ctx, prev, next)
 			return fmt.Errorf("%w: %s", ErrDeployPostponed, prev.ID)
 		}
-		// Drained: stop the old generation (releasing the writer lease).
-		if err := c.act.DrainAndStop(ctx, prev); err != nil {
+	}
+
+	// 4. Hold the resolver NOW — before stopping the old generation, which
+	//    closes its resolver as it exits. Holding first means requests wait for
+	//    resume instead of hitting a dead socket (502) in the gap. The resolver
+	//    is held only for the stop+activate window, which is budget-bounded
+	//    below the resolver's 6s caller deadline.
+	c.act.QuiesceResolver(true)
+
+	// 5. Stop the old generation and activate the new one under one HARD, SHARED
+	//    deadline. Activate is bounded by whatever remains of that budget after
+	//    the stop, so the two together can never exceed stopActivateBudget.
+	saDeadline := time.Now().Add(stopActivateBudget)
+	if prev.ID != "" {
+		stopCtx, stopCancel := context.WithDeadline(ctx, saDeadline)
+		err := c.act.DrainAndStop(stopCtx, prev)
+		stopCancel()
+		if err != nil {
+			c.act.QuiesceResolver(false)
 			c.act.QuiesceGRPC(false)
 			_ = c.act.DrainAndStop(ctx, next)
 			return fmt.Errorf("stop drained %s: %w", prev.ID, err)
 		}
 	}
 
-	// 4. Now hold the resolver too — only for the brief activation window.
-	c.act.QuiesceResolver(true)
-
-	// 5. New generation acquires the lease and becomes ready, bounded by the
-	//    remaining budget before the rollback reserve. On failure, roll back —
-	//    and stay fail-closed (holds ON) if the rollback itself fails, rather
-	//    than releasing traffic onto a dead upstream.
-	actCtx, cancel := context.WithDeadline(ctx, rollbackBy)
+	// 6. New generation acquires the lease and becomes ready. On failure, roll
+	//    back within its own hard budget — and stay fail-closed (holds ON) if the
+	//    rollback itself fails, rather than releasing onto a dead upstream.
+	actCtx, actCancel := context.WithDeadline(ctx, saDeadline)
 	err := c.act.Activate(actCtx, next)
-	cancel()
+	actCancel()
 	if err != nil {
-		if rbErr := c.rollback(ctx, next, prev); rbErr != nil {
+		if rbErr := c.boundedRollback(ctx, next, prev); rbErr != nil {
 			return fmt.Errorf("activate %s failed; rollback failed, holding traffic: %v; %w", next.ID, rbErr, err)
 		}
 		c.act.QuiesceResolver(false)
@@ -254,17 +272,17 @@ func (c *Controller) run(ctx context.Context, prev, next Generation) error {
 		return fmt.Errorf("activate %s: %w", next.ID, err)
 	}
 
-	// 6. Gateway atomically switches and releases the held requests.
+	// 7. Gateway atomically switches and releases the held requests.
 	c.act.SetActive(next)
 	c.act.QuiesceResolver(false)
 	c.act.QuiesceGRPC(false)
 
-	// 7. Watch the new generation settle BEFORE committing it as current, so a
+	// 8. Watch the new generation settle BEFORE committing it as current, so a
 	//    poller sees the deploy land only once it is stably serving.
 	if err := c.act.Stabilize(ctx, next); err != nil {
 		c.act.QuiesceGRPC(true)
 		c.act.QuiesceResolver(true)
-		if rbErr := c.rollback(ctx, next, prev); rbErr != nil {
+		if rbErr := c.boundedRollback(ctx, next, prev); rbErr != nil {
 			return fmt.Errorf("stabilize %s failed; rollback failed, holding traffic: %v; %w", next.ID, rbErr, err)
 		}
 		c.act.QuiesceResolver(false)
@@ -286,6 +304,14 @@ func (c *Controller) abortDrain(ctx context.Context, prev, next Generation) {
 	_ = c.act.Undrain(ctx, prev)
 	c.act.QuiesceGRPC(false)
 	_ = c.act.DrainAndStop(ctx, next)
+}
+
+// boundedRollback runs rollback under its own hard deadline so recovery cannot
+// run to the parent context / systemd stop timeout.
+func (c *Controller) boundedRollback(ctx context.Context, next, prev Generation) error {
+	rbCtx, cancel := context.WithTimeout(ctx, rollbackBudget)
+	defer cancel()
+	return c.rollback(rbCtx, next, prev)
 }
 
 // rollback recovers to the previous generation and returns an error if it could

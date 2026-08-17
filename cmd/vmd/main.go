@@ -1616,17 +1616,15 @@ func main() {
 	cancel()                // propagate cancellation to any service still blocked on ctx
 
 	// ---- Run closers in LIFO order with a hard deadline ----
-	// A gateway-fronted generation lets its in-flight VM operations finish
-	// before exiting — GracefulStop drains active RPCs (new ones are already
-	// refused by the gateway hold and the startup gate) so a create/pause/resume
-	// underway during a cutover is not cut mid-flight and retried against the new
-	// generation. The bound sits just under the control plane's Unavailable
-	// retry window (15s) so the held gRPC callers still retry onto the new
-	// generation successfully; systemd's TimeoutStopSec force-kills a violator.
-	// Legacy startup keeps the full 30s.
+	// A gateway-fronted generation stops FAST: its in-flight operations were
+	// already drained by the handoff's explicit drain phase (the `drain` control
+	// command) before systemctl stop was issued, so shutdown here only flushes
+	// and closes stores. A short grace keeps the stop within the handoff's
+	// stop+activate budget (and thus the resolver hold under its deadline);
+	// systemd's TimeoutStopSec force-kills a violator. Legacy startup keeps 30s.
 	shutdownGrace := 30 * time.Second
 	if genPrivateSocket != "" {
-		shutdownGrace = 12 * time.Second
+		shutdownGrace = 3 * time.Second
 	}
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer shutdownCancel()

@@ -41,10 +41,11 @@ Delegate=yes
 Restart=on-failure
 RestartSec=2
 
-# Above the daemon's own bounded-shutdown proven maximum, so systemd force-kills
-# a generation that violates its shutdown contract and the kernel then releases
-# the writer lease for the next one.
-TimeoutStopSec=45
+# In-flight operations are drained by the handoff BEFORE stop, so a stop only
+# flushes stores — it should complete in a few seconds. Force-kill quickly if it
+# doesn't, so a stuck stop can't overrun the handoff's stop+activate budget; the
+# kernel then releases the writer lease for the next generation.
+TimeoutStopSec=10
 
 LimitNOFILE=65536
 StandardOutput=journal
