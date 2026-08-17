@@ -1,7 +1,9 @@
 package network
 
 import (
+	"bytes"
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -252,6 +254,19 @@ func TestIsAllowed(t *testing.T) {
 					tc.hostname, tc.dstIP, gotAllowed, gotMatch, tc.wantAllowed, tc.wantMatch)
 			}
 		})
+	}
+}
+
+func TestEgressProxySandboxLoggerIncludesHostID(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewEgressProxy(0, 0, 0, 1, zerolog.New(&buf))
+	p.SetHostID("host-123")
+	l := p.sandboxLogger("sandbox-123")
+	l.Warn().Msg("blocked")
+	for _, want := range []string{`"sandbox_id":"sandbox-123"`, `"host_id":"host-123"`} {
+		if !strings.Contains(buf.String(), want) {
+			t.Fatalf("log output %q missing %q", buf.String(), want)
+		}
 	}
 }
 
