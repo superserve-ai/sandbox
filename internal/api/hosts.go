@@ -304,6 +304,7 @@ func (h *Handlers) HostList(c *gin.Context) {
 		CapacityVcpus     int32   `json:"capacity_vcpus"`
 		LastHeartbeatAt   *string `json:"last_heartbeat_at"`
 		RunningCount      int32   `json:"running_count"`
+		TransitionalCount int32   `json:"transitional_count"`
 		PausedCount       int32   `json:"paused_count"`
 	}
 	hosts := make([]hostView, 0, len(rows))
@@ -314,6 +315,7 @@ func (h *Handlers) HostList(c *gin.Context) {
 			CapacityMemoryMib: r.CapacityMemoryMib,
 			CapacityVcpus:     r.CapacityVcpus,
 			RunningCount:      r.RunningCount,
+			TransitionalCount: r.TransitionalCount,
 			PausedCount:       r.PausedCount,
 		}
 		if r.LastHeartbeatAt.Valid {

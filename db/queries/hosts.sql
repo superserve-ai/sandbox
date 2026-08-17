@@ -182,12 +182,16 @@ ORDER BY COUNT(s.id) ASC;
 
 -- name: ListHostsAdmin :many
 -- Operator view (hostctl): every host regardless of status, with live
--- sandbox counts. Paused count is here for drain progress visibility.
+-- sandbox counts for drain progress. transitional counts pausing/resuming
+-- sandboxes whose lifecycle RPC is still using the host — a host is not
+-- drained while any exist, even when running and paused both read zero.
 SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        h.capacity_memory_mib, h.capacity_vcpus,
        h.last_heartbeat_at, h.created_at, h.updated_at,
        COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('active', 'starting')
                                       AND s.destroyed_at IS NULL), 0)::int AS running_count,
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('pausing', 'resuming')
+                                      AND s.destroyed_at IS NULL), 0)::int AS transitional_count,
        COALESCE(COUNT(s.id) FILTER (WHERE s.status = 'paused'
                                       AND s.destroyed_at IS NULL), 0)::int AS paused_count
 FROM host h

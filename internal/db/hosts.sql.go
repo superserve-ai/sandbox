@@ -361,6 +361,8 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        h.last_heartbeat_at, h.created_at, h.updated_at,
        COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('active', 'starting')
                                       AND s.destroyed_at IS NULL), 0)::int AS running_count,
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('pausing', 'resuming')
+                                      AND s.destroyed_at IS NULL), 0)::int AS transitional_count,
        COALESCE(COUNT(s.id) FILTER (WHERE s.status = 'paused'
                                       AND s.destroyed_at IS NULL), 0)::int AS paused_count
 FROM host h
@@ -381,11 +383,14 @@ type ListHostsAdminRow struct {
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
 	RunningCount      int32              `json:"running_count"`
+	TransitionalCount int32              `json:"transitional_count"`
 	PausedCount       int32              `json:"paused_count"`
 }
 
 // Operator view (hostctl): every host regardless of status, with live
-// sandbox counts. Paused count is here for drain progress visibility.
+// sandbox counts for drain progress. transitional counts pausing/resuming
+// sandboxes whose lifecycle RPC is still using the host — a host is not
+// drained while any exist, even when running and paused both read zero.
 func (q *Queries) ListHostsAdmin(ctx context.Context) ([]ListHostsAdminRow, error) {
 	rows, err := q.db.Query(ctx, listHostsAdmin)
 	if err != nil {
@@ -407,6 +412,7 @@ func (q *Queries) ListHostsAdmin(ctx context.Context) ([]ListHostsAdminRow, erro
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.RunningCount,
+			&i.TransitionalCount,
 			&i.PausedCount,
 		); err != nil {
 			return nil, err

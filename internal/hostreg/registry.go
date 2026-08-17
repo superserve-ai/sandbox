@@ -122,33 +122,41 @@ func (r *Registry) verifyAndGet(ctx context.Context, hostID string, stale entry)
 				r.mu.RLock()
 				e, ok := r.clients[hostID]
 				r.mu.RUnlock()
-				if ok && e.addr == stale.addr {
+				if ok {
+					// Whatever entry the cache holds now — the original or a
+					// replacement — is the best available knowledge.
 					log.Warn().Err(err).Str("host_id", hostID).
 						Msg("host address verification failed; dispatching via cached client")
-					return stale.client, nil
-				}
-				if ok {
-					return e.client, nil // repopulated fresh by another path
+					return e.client, nil
 				}
 				lastErr = err
 				continue
 			}
-			if host.VmdAddr == stale.addr {
-				r.mu.Lock()
-				if r.gens[hostID] != startGen {
-					r.mu.Unlock()
-					continue // invalidated mid-verification; re-read the row
-				}
-				if e, ok := r.clients[hostID]; ok && e.addr == stale.addr {
-					e.checkedAt = time.Now()
-					r.clients[hostID] = e
-				}
+			// If the cache already holds an entry at the row's address —
+			// the common case, or a replacement another caller dialed after
+			// an invalidation — that entry's client is the one to return.
+			// Returning the snapshot instead could hand back a client whose
+			// transport was already invalidated as dead.
+			r.mu.Lock()
+			if r.gens[hostID] != startGen {
 				r.mu.Unlock()
-				return stale.client, nil
+				continue // invalidated mid-verification; re-read the row
 			}
-			log.Warn().Str("host_id", hostID).Str("old_addr", stale.addr).
-				Str("new_addr", host.VmdAddr).
-				Msg("host address changed; re-dialing before dispatch")
+			if e, ok := r.clients[hostID]; ok && e.addr == host.VmdAddr {
+				e.checkedAt = time.Now()
+				r.clients[hostID] = e
+				r.mu.Unlock()
+				return e.client, nil
+			}
+			r.mu.Unlock()
+
+			// No usable entry for the row's address: dial it. This covers
+			// both an address change and an invalidated-but-unmoved host.
+			if host.VmdAddr != stale.addr {
+				log.Warn().Str("host_id", hostID).Str("old_addr", stale.addr).
+					Str("new_addr", host.VmdAddr).
+					Msg("host address changed; re-dialing before dispatch")
+			}
 			c, err := r.dial(hostID, host.VmdAddr, func() { r.Invalidate(hostID) })
 			if err != nil {
 				// No falling back to the old-address client here: failing
