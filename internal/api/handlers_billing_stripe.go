@@ -1072,10 +1072,24 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 			}
 			continue
 		}
+		idempotencyKey := derefString(row.StripeIdempotencyKey)
+		if idempotencyKey == "" {
+			idempotencyKey = stripeMeterEventIdempotencyKey(row.StripeMeterEventIdentifier, row.StripeEventName, derefString(row.StripeCustomerID), meterValue, periodEnd.UTC().Add(-time.Second).Unix())
+			_, setErr := h.DB.SetBillingUsageExportIdempotencyKey(ctx, db.SetBillingUsageExportIdempotencyKeyParams{
+				ID:                   row.ID,
+				StripeIdempotencyKey: stringPtr(idempotencyKey),
+			})
+			if setErr != nil {
+				if !errors.Is(setErr, pgx.ErrNoRows) {
+					respondError(c, ErrInternal)
+					return
+				}
+			}
+		}
 
 		err = h.Stripe.ReportMeterEvent(ctx, StripeReportMeterEventParams{
 			Identifier:     row.StripeMeterEventIdentifier,
-			IdempotencyKey: stripeMeterEventIdempotencyKey(row.StripeMeterEventIdentifier, row.StripeEventName, derefString(row.StripeCustomerID), meterValue, periodEnd.UTC().Add(-time.Second).Unix()),
+			IdempotencyKey: idempotencyKey,
 			EventName:      row.StripeEventName,
 			CustomerID:     derefString(row.StripeCustomerID),
 			Value:          meterValue,
@@ -1573,6 +1587,17 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 		})
 		return err
 	case "billing.meter.error_report_triggered", "v1.billing.meter.error_report_triggered":
+		if samples := stripeMeterErrorSamplePayloads(event.Data.Object); len(samples) > 1 {
+			for _, sample := range samples[1:] {
+				if err := h.processStripeWebhookEvent(ctx, q, stripeEventEnvelope{
+					ID:   event.ID,
+					Type: event.Type,
+					Data: stripeEventEnvelopeData{Object: sample},
+				}); err != nil {
+					return err
+				}
+			}
+		}
 		identifier, eventName, customerID, requestKey, errMsg, err := stripeMeterErrorDetails(event.Data.Object)
 		if err != nil {
 			return err
@@ -1692,11 +1717,55 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 	}
 }
 
+func stripeMeterErrorSamplePayloads(payload []byte) [][]byte {
+	var value any
+	if json.Unmarshal(payload, &value) != nil {
+		return nil
+	}
+	var samples []map[string]any
+	var walk func(any)
+	walk = func(current any) {
+		switch item := current.(type) {
+		case map[string]any:
+			if request, ok := item["request"].(map[string]any); ok {
+				sample := map[string]any{}
+				for key, value := range request {
+					sample[key] = value
+				}
+				if message, ok := item["error_message"].(string); ok {
+					sample["reason"] = message
+				}
+				samples = append(samples, sample)
+			}
+			for _, nested := range item {
+				walk(nested)
+			}
+		case []any:
+			for _, nested := range item {
+				walk(nested)
+			}
+		}
+	}
+	walk(value)
+	if len(samples) == 0 {
+		return [][]byte{payload}
+	}
+	encoded := make([][]byte, 0, len(samples))
+	for _, sample := range samples {
+		data, err := json.Marshal(sample)
+		if err == nil {
+			encoded = append(encoded, data)
+		}
+	}
+	return encoded
+}
+
 func stripeMeterErrorDetails(payload []byte) (identifier, eventName, customerID, requestKey, message string, err error) {
 	var value any
 	if err = json.Unmarshal(payload, &value); err != nil {
 		return "", "", "", "", "", err
 	}
+	var summary string
 	var walk func(any)
 	walk = func(current any) {
 		switch item := current.(type) {
@@ -1722,6 +1791,9 @@ func stripeMeterErrorDetails(payload []byte) (identifier, eventName, customerID,
 							requestKey = text
 						}
 					case "reason", "error_message", "developer_message_summary":
+						if key == "developer_message_summary" {
+							summary = text
+						}
 						if message == "" {
 							message = text
 						}
@@ -1736,6 +1808,9 @@ func stripeMeterErrorDetails(payload []byte) (identifier, eventName, customerID,
 		}
 	}
 	walk(value)
+	if summary != "" {
+		message = summary
+	}
 	return
 }
 

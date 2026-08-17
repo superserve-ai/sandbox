@@ -1714,6 +1714,43 @@ func (q *Queries) ResolveBillingPeriodAnomaly(ctx context.Context, arg ResolveBi
 	return i, err
 }
 
+const setBillingUsageExportIdempotencyKey = `-- name: SetBillingUsageExportIdempotencyKey :one
+UPDATE billing_usage_export
+SET stripe_idempotency_key = $1,
+    updated_at = now()
+WHERE id = $2
+  AND stripe_idempotency_key IS NULL
+RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
+`
+
+type SetBillingUsageExportIdempotencyKeyParams struct {
+	StripeIdempotencyKey *string   `json:"stripe_idempotency_key"`
+	ID                   uuid.UUID `json:"id"`
+}
+
+func (q *Queries) SetBillingUsageExportIdempotencyKey(ctx context.Context, arg SetBillingUsageExportIdempotencyKeyParams) (BillingUsageExport, error) {
+	row := q.db.QueryRow(ctx, setBillingUsageExportIdempotencyKey, arg.StripeIdempotencyKey, arg.ID)
+	var i BillingUsageExport
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.ResourceType,
+		&i.StripeCustomerID,
+		&i.StripeMeterEventIdentifier,
+		&i.StripeEventName,
+		&i.Value,
+		&i.Status,
+		&i.Error,
+		&i.CreatedAt,
+		&i.SentAt,
+		&i.UpdatedAt,
+		&i.StripeIdempotencyKey,
+	)
+	return i, err
+}
+
 const setFeatureFlag = `-- name: SetFeatureFlag :one
 INSERT INTO feature_flag (key, enabled, description)
 VALUES ($1, $2, $3)

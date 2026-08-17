@@ -522,6 +522,14 @@ WHERE id = sqlc.arg(id)
   AND status = 'pending'
 RETURNING *;
 
+-- name: SetBillingUsageExportIdempotencyKey :one
+UPDATE billing_usage_export
+SET stripe_idempotency_key = sqlc.arg(stripe_idempotency_key),
+    updated_at = now()
+WHERE id = sqlc.arg(id)
+  AND stripe_idempotency_key IS NULL
+RETURNING *;
+
 -- name: ListBillingUsageExportsForPeriod :many
 SELECT *
 FROM billing_usage_export

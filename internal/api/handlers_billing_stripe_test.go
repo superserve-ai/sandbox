@@ -42,6 +42,27 @@ func TestStripeEventTimestampAcceptsSnapshotAndThinFormats(t *testing.T) {
 	}
 }
 
+func TestStripeMeterErrorSamplePayloadsIncludesEveryRequest(t *testing.T) {
+	payload := json.RawMessage(`{"reason":{"error_types":[{"sample_errors":[{"error_message":"first","request":{"idempotency_key":"meter-event:first"}},{"error_message":"second","request":{"idempotency_key":"meter-event:second"}}]}]}}`)
+	samples := stripeMeterErrorSamplePayloads(payload)
+	if len(samples) != 2 {
+		t.Fatalf("sample count = %d, want 2", len(samples))
+	}
+	for _, want := range []string{"meter-event:first", "meter-event:second"} {
+		found := false
+		for _, sample := range samples {
+			_, _, _, key, _, err := stripeMeterErrorDetails(sample)
+			if err == nil && key == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("missing sample %q", want)
+		}
+	}
+}
+
 type stripeMeterEventRoundTripper struct {
 	identifier     string
 	idempotencyKey string
