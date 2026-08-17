@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -73,7 +74,10 @@ func loadActive(path string) (gateway.Upstream, bool) {
 	if err != nil {
 		return gateway.Upstream{}, false
 	}
-	parts := strings.SplitN(strings.TrimRight(string(b), "\n"), "\n", 3)
+	// Split (not TrimRight+SplitN): the record ends in a newline, so a trailing
+	// empty resolver field must survive as its own segment rather than being
+	// trimmed away — otherwise a valid record parses as too few fields.
+	parts := strings.Split(string(b), "\n")
 	if len(parts) < 3 || parts[0] == "" || parts[1] == "" {
 		return gateway.Upstream{}, false
 	}
@@ -104,6 +108,15 @@ type controlState struct {
 	ctrl      *handoff.Controller
 	log       zerolog.Logger
 	statePath string
+
+	mu     sync.Mutex
+	deploy deployStatus
+}
+
+// deployStatus is the outcome of the most recent deploy, so the trigger can
+// distinguish in-progress from succeeded/failed instead of polling to a timeout.
+type deployStatus struct {
+	id, state, err string // state: "" (idle) | "running" | "done" | "failed"
 }
 
 func main() {
@@ -272,16 +285,35 @@ func (cs *controlState) apply(fields []string) string {
 			ResolverSocket: genResolverPath(fields[1]),
 		}
 		expected := cs.ctrl.Current()
+		cs.mu.Lock()
+		cs.deploy = deployStatus{id: next.ID, state: "running"}
+		cs.mu.Unlock()
 		// Detached: the deploy runs to completion even if this control
-		// connection drops. Poll "current" to see when it lands.
+		// connection drops. Poll "deploy-status" to see how it lands.
 		go func() {
-			if err := cs.ctrl.Deploy(context.Background(), expected, next); err != nil {
+			err := cs.ctrl.Deploy(context.Background(), expected, next)
+			cs.mu.Lock()
+			if err != nil {
+				cs.deploy = deployStatus{id: next.ID, state: "failed", err: err.Error()}
+			} else {
+				cs.deploy = deployStatus{id: next.ID, state: "done"}
+			}
+			cs.mu.Unlock()
+			if err != nil {
 				cs.log.Error().Err(err).Str("generation", next.ID).Msg("deploy failed")
 			} else {
 				cs.log.Info().Str("generation", next.ID).Msg("deploy complete")
 			}
 		}()
 		return "OK deploying " + fields[1]
+	case "deploy-status":
+		cs.mu.Lock()
+		d := cs.deploy
+		cs.mu.Unlock()
+		if d.state == "" {
+			return "OK state=idle"
+		}
+		return fmt.Sprintf("OK state=%s generation=%s error=%q", d.state, d.id, d.err)
 	default:
 		return "ERR unknown command " + fields[0]
 	}

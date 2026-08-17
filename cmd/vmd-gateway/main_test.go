@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -37,5 +38,26 @@ func TestApplyControl(t *testing.T) {
 		if got := cs.apply(bad); !strings.HasPrefix(got, "ERR") {
 			t.Fatalf("apply(%v) = %q, want ERR", bad, got)
 		}
+	}
+}
+
+func TestPersistLoadRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "active-generation")
+
+	// Full record round-trips.
+	persistActive(path, gateway.Upstream{Generation: "b", GRPCSocket: "/g.sock", ResolverSocket: "/r.sock"})
+	if up, ok := loadActive(path); !ok || up.Generation != "b" || up.ResolverSocket != "/r.sock" {
+		t.Fatalf("round-trip = %+v ok=%v", up, ok)
+	}
+
+	// A trailing-empty resolver field must still load (regression: TrimRight+SplitN dropped it).
+	persistActive(path, gateway.Upstream{Generation: "b", GRPCSocket: "/g.sock", ResolverSocket: ""})
+	if up, ok := loadActive(path); !ok || up.Generation != "b" || up.ResolverSocket != "" {
+		t.Fatalf("empty-resolver record dropped: %+v ok=%v", up, ok)
+	}
+
+	// Missing file → no record.
+	if _, ok := loadActive(filepath.Join(t.TempDir(), "nope")); ok {
+		t.Fatal("missing file should not load")
 	}
 }

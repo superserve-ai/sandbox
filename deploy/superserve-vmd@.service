@@ -1,8 +1,10 @@
 [Unit]
 Description=Superserve vmd generation %i
+# Ordering + a soft want only — NOT Requires. A generation must not be torn down
+# when the gateway restarts (the gateway is a separately deployable front); its
+# routing/controller state recovers on its own.
 After=network-online.target superserve-vmd-gateway.service superserve-vms.service
-Wants=network-online.target superserve-vms.service
-Requires=superserve-vmd-gateway.service
+Wants=network-online.target superserve-vms.service superserve-vmd-gateway.service
 
 # A vmd generation. It serves control-plane gRPC and the resolver on private
 # unix sockets under /run/vmd (the gateway routes the public ports to them), and

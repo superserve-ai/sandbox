@@ -541,17 +541,19 @@ func main() {
 	var writerLease *hostlease.WriterLease
 	var activateDone func(string)
 	if genPrivateSocket != "" {
-		if genControlSocket == "" {
-			log.Fatal().Msg("generation mode requires VMD_GEN_CONTROL_SOCKET")
+		// All three private sockets are required in generation mode. In
+		// particular the resolver must bind privately — if it were left unset,
+		// the resolver would fall through to binding the real public port the
+		// gateway already owns and fail with EADDRINUSE.
+		if genControlSocket == "" || genResolverSocket == "" {
+			log.Fatal().Msg("generation mode requires VMD_GEN_CONTROL_SOCKET and VMD_RESOLVER_SOCKET")
 		}
 		var lerr error
 		if lis, lerr = listenUnixClean(genPrivateSocket); lerr != nil {
 			log.Fatal().Err(lerr).Str("socket", genPrivateSocket).Msg("preflight: bind gRPC socket")
 		}
-		if genResolverSocket != "" {
-			if localLis, lerr = listenUnixClean(genResolverSocket); lerr != nil {
-				log.Fatal().Err(lerr).Str("socket", genResolverSocket).Msg("preflight: bind resolver socket")
-			}
+		if localLis, lerr = listenUnixClean(genResolverSocket); lerr != nil {
+			log.Fatal().Err(lerr).Str("socket", genResolverSocket).Msg("preflight: bind resolver socket")
 		}
 		gc := newGenControl()
 		ctlLis, cerr := listenUnixClean(genControlSocket)
@@ -1166,15 +1168,13 @@ func main() {
 					Msg("socket unit passed listeners but none matches GRPC_PORT — check the unit's ListenStream against GRPC_PORT")
 			}
 		}
-		if genPrivateSocket == "" {
-			if lis != nil {
-				log.Info().Str("addr", lis.Addr().String()).Msg("gRPC listener inherited from systemd socket unit")
-			} else {
-				var lerr error
-				lis, lerr = net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
-				if lerr != nil {
-					log.Fatal().Err(lerr).Int("port", cfg.GRPCPort).Msg("failed to listen")
-				}
+		if lis != nil {
+			log.Info().Str("addr", lis.Addr().String()).Msg("gRPC listener inherited from systemd socket unit")
+		} else {
+			var lerr error
+			lis, lerr = net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
+			if lerr != nil {
+				log.Fatal().Err(lerr).Int("port", cfg.GRPCPort).Msg("failed to listen")
 			}
 		}
 	}

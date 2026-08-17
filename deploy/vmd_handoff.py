@@ -33,13 +33,19 @@ def main() -> int:
     if not resp.startswith("OK"):
         return 1
 
-    want = "OK current=" + args.generation
+    # Poll the deploy outcome rather than "current", so a failed+rolled-back
+    # deploy surfaces its real error immediately instead of polling to a timeout.
     deadline = time.time() + args.timeout
     while time.time() < deadline:
-        cur = send(args.control_sock, "current")
-        if cur == want:
-            print("handoff complete: " + cur)
+        st = send(args.control_sock, "deploy-status")
+        parts = st.split(maxsplit=2)  # ["OK", "state=...", "generation=... error=..."]
+        state = parts[1] if len(parts) > 1 else ""
+        if state == "state=done":
+            print("handoff complete: " + st)
             return 0
+        if state == "state=failed":
+            print("handoff failed: " + st, file=sys.stderr)
+            return 1
         time.sleep(2)
 
     print("timeout waiting for handoff to complete", file=sys.stderr)
