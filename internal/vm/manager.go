@@ -1262,6 +1262,28 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// Timed from BEFORE the op lock so pause_ms includes lock queueing —
 	// a duplicate-pause pile-up shows here rather than hiding.
 	tPause := time.Now()
+	var snapshotType string
+	var tSnapshot time.Time
+	var snapshotDur, stopDur time.Duration
+	// Deferred, gated on snapshot work having begun: a CreateSnapshot that
+	// burns seconds and then fails must land in the pause distributions —
+	// those are among the slowest pauses. The already-paused retry guard
+	// (before tSnapshot) still deliberately emits nothing.
+	defer func() {
+		if tSnapshot.IsZero() {
+			return
+		}
+		phases := map[string]time.Duration{"total": time.Since(tPause)}
+		if snapshotDur > 0 {
+			phases["snapshot"] = snapshotDur
+		} else {
+			phases["snapshot"] = time.Since(tSnapshot)
+		}
+		if stopDur > 0 {
+			phases["stop"] = stopDur
+		}
+		m.recordPhases("pause", snapshotType, phases)
+	}()
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate pause
 	// waits, then hits the already-paused guard.
 	unlockOp, err := m.lockVMOp(ctx, vmID)
@@ -1361,8 +1383,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	baseMemPath := ""
 	// Which memory image this pause writes — the field that makes a slow
 	// full-snapshot pause visible at a glance. Bounded: layered|diff|full.
-	snapshotType := "full"
-	tSnapshot := time.Now()
+	snapshotType = "full"
+	tSnapshot = time.Now()
 	// CreateDiffSnapshot merges in place: an interrupted diff has no surviving copy
 	// of the file it overwrites (for layered, only the session delta — the template
 	// base is untouched; for in-place, the VM's own mem.snap). Crash-atomicity of the
@@ -1452,7 +1474,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// snapshot is durable and the record reaches Paused either way; the
 	// budget only bounds how long this handler lingers past the RPC, and a
 	// straggler VM is still reclaimed by the reconciler.
-	snapshotDur := time.Since(tSnapshot)
+	snapshotDur = time.Since(tSnapshot)
 	inst.mu.RLock()
 	pauseSupervision := inst.Supervision
 	inst.mu.RUnlock()
@@ -1475,7 +1497,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		}
 	}
 	stopCancel()
-	stopDur := time.Since(tStop)
+	stopDur = time.Since(tStop)
 
 	inst.mu.Lock()
 	inst.Status = StatusPaused
@@ -1543,11 +1565,6 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		Int64("stop_ms", stopDur.Milliseconds()).
 		Int64("pause_ms", time.Since(tPause).Milliseconds()).
 		Msg("VM paused")
-	m.recordPhases("pause", snapshotType, map[string]time.Duration{
-		"snapshot": snapshotDur,
-		"stop":     stopDur,
-		"total":    time.Since(tPause),
-	})
 	return snapshotPath, memPath, manifest, nil
 }
 
@@ -1667,6 +1684,36 @@ func fileExists(path string) bool {
 func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string, networkRules *sandboxNetworkRules) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
+	var tSlot, tFcStart, tFcDone, tRestore, tRestoreDone time.Time
+	// Deferred, gated on real resume work having begun (tSlot): failed
+	// resumes must land in the phase distributions with whichever stages
+	// they reached — success-only emission hides the slowest failures.
+	// Precondition rejections before the slot claim emit nothing.
+	defer func() {
+		if tSlot.IsZero() {
+			return
+		}
+		phases := map[string]time.Duration{
+			"prep":  tSlot.Sub(tEntry),
+			"total": time.Since(tEntry),
+		}
+		switch {
+		case !tFcDone.IsZero():
+			phases["fc_start"] = tFcDone.Sub(tFcStart)
+		case !tFcStart.IsZero():
+			phases["fc_start"] = time.Since(tFcStart)
+		}
+		if !tFcStart.IsZero() {
+			phases["ensure_slot"] = tFcStart.Sub(tSlot)
+		}
+		switch {
+		case !tRestoreDone.IsZero():
+			phases["restore"] = tRestoreDone.Sub(tRestore)
+		case !tRestore.IsZero():
+			phases["restore"] = time.Since(tRestore)
+		}
+		m.recordPhases("resume", "", phases)
+	}()
 	needsNetworkCleanup := false
 	defer func() {
 		if needsNetworkCleanup {
@@ -1788,7 +1835,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	vmDir := filepath.Join(m.cfg.RunDir, rundirKey)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 
-	tSlot := time.Now()
+	tSlot = time.Now()
 	var netInfo *network.VMNetInfo
 	nsName := inst.Namespace
 	if nsName != "" {
@@ -1810,7 +1857,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		return nil, err
 	}
 
-	tFcStart := time.Now()
+	tFcStart = time.Now()
 	inst.mu.RLock()
 	resumeExisting := inst.Supervision
 	inst.mu.RUnlock()
@@ -1826,7 +1873,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
-	tFcDone := time.Now()
+	tFcDone = time.Now()
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
 	// A base is needed only when memPath is itself a diff overlay. Keying on memPath
@@ -1850,7 +1897,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
 		}
 	}
-	tRestore := time.Now()
+	tRestore = time.Now()
 	var dirtyTracked bool
 	var restoreErr error
 	if m.restoreForResumeHook != nil {
@@ -1858,7 +1905,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	} else {
 		dirtyTracked, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
 	}
-	tRestoreDone := time.Now()
+	tRestoreDone = time.Now()
 	if restoreErr != nil {
 		// Firecracker is already running; stop the unit before returning or it leaks.
 		m.stopUnitDuringRestoreError(vmID)
@@ -1931,13 +1978,6 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		Int64("restore_ms", tRestoreDone.Sub(tRestore).Milliseconds()).
 		Int64("total_ms", time.Since(tEntry).Milliseconds()).
 		Msg("VM resumed from snapshot")
-	m.recordPhases("resume", "", map[string]time.Duration{
-		"prep":        tSlot.Sub(tEntry),
-		"ensure_slot": tFcStart.Sub(tSlot),
-		"fc_start":    tFcDone.Sub(tFcStart),
-		"restore":     tRestoreDone.Sub(tRestore),
-		"total":       time.Since(tEntry),
-	})
 
 	// Telemetry only: measure how long boxd takes to become reachable after
 	// the vCPUs resume. Detached — status is already running and the probe

@@ -1919,6 +1919,41 @@ func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uui
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
 	tStart := time.Now()
+	var hostID string
+	var tLookupDone, tVmdStart, tVmdEnd, tInsertStart, tInsertEnd, tInsertReceive, tPostDone time.Time
+	// Registered before ANY return so failed, timed-out, and rejected
+	// creates land in the phase histograms too — a success-only emission
+	// makes the distributions look healthier than the transition series.
+	// Stages that never ran stay absent; a vmd stage that errored before
+	// its end-stamp reports its elapsed time; total always emits.
+	defer func() {
+		phases := map[string]time.Duration{
+			"auth":  time.Duration(c.GetInt64("auth_ms")) * time.Millisecond,
+			"total": time.Since(tStart),
+		}
+		if !tLookupDone.IsZero() {
+			phases["lookup"] = tLookupDone.Sub(tStart)
+			if !tVmdStart.IsZero() {
+				phases["sched"] = tVmdStart.Sub(tLookupDone)
+			}
+		}
+		switch {
+		case !tVmdEnd.IsZero():
+			phases["vmd"] = tVmdEnd.Sub(tVmdStart)
+		case !tVmdStart.IsZero():
+			phases["vmd"] = time.Since(tVmdStart)
+		}
+		if !tInsertStart.IsZero() && !tInsertEnd.IsZero() {
+			phases["insert"] = tInsertEnd.Sub(tInsertStart)
+		}
+		if !tVmdEnd.IsZero() && !tInsertReceive.IsZero() {
+			phases["insert_wait"] = tInsertReceive.Sub(tVmdEnd)
+		}
+		if !tInsertReceive.IsZero() && !tPostDone.IsZero() {
+			phases["post"] = tPostDone.Sub(tInsertReceive)
+		}
+		RecordLatencyPhases(c.Request.Context(), "create", hostID, phases)
+	}()
 	var req createSandboxRequest
 	if err := bindJSONStrict(c, &req); err != nil {
 		respondErrorMsg(c, "bad_request", "Request body is not valid JSON or contains unknown fields.", http.StatusBadRequest)
@@ -2029,7 +2064,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// authoritative shape.
 	var templateVcpu, templateMemMiB uint32
 	var fromTemplateName, fromTemplateID string
-	var tLookupDone time.Time
 	if req.FromTemplate != nil {
 		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
 		tLookupDone = time.Now()
@@ -2064,40 +2098,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 
 	// Select a host for this sandbox.
-	var hostID string
-	var tVmdStart, tVmdEnd, tInsertStart, tInsertEnd, tInsertReceive, tPostDone time.Time
-	// Deferred so failed and timed-out creates land in the phase histograms
-	// too — a success-only emission makes the distributions look healthier
-	// than the transition series. Stages that never ran stay absent; a vmd
-	// stage that errored before its end-stamp reports its elapsed time.
-	defer func() {
-		phases := map[string]time.Duration{
-			"auth":  time.Duration(c.GetInt64("auth_ms")) * time.Millisecond,
-			"total": time.Since(tStart),
-		}
-		if !tLookupDone.IsZero() {
-			phases["lookup"] = tLookupDone.Sub(tStart)
-			if !tVmdStart.IsZero() {
-				phases["sched"] = tVmdStart.Sub(tLookupDone)
-			}
-		}
-		switch {
-		case !tVmdEnd.IsZero():
-			phases["vmd"] = tVmdEnd.Sub(tVmdStart)
-		case !tVmdStart.IsZero():
-			phases["vmd"] = time.Since(tVmdStart)
-		}
-		if !tInsertStart.IsZero() && !tInsertEnd.IsZero() {
-			phases["insert"] = tInsertEnd.Sub(tInsertStart)
-		}
-		if !tVmdEnd.IsZero() && !tInsertReceive.IsZero() {
-			phases["insert_wait"] = tInsertReceive.Sub(tVmdEnd)
-		}
-		if !tInsertReceive.IsZero() && !tPostDone.IsZero() {
-			phases["post"] = tPostDone.Sub(tInsertReceive)
-		}
-		RecordLatencyPhases(c.Request.Context(), "create", hostID, phases)
-	}()
 	requiredCapabilities := []string{preview.HostCapabilityPorts}
 	if previewAccess == preview.AccessPrivate {
 		requiredCapabilities = previewBrowserCapabilities()
