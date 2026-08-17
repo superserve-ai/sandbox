@@ -1259,6 +1259,9 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) (err e
 // durable artifacts (disk state + vmstate); see collectPauseManifest for
 // what is included and why memory files are not.
 func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, manifest []ManifestEntry, err error) {
+	// Timed from BEFORE the op lock so pause_ms includes lock queueing —
+	// a duplicate-pause pile-up shows here rather than hiding.
+	tPause := time.Now()
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate pause
 	// waits, then hits the already-paused guard.
 	unlockOp, err := m.lockVMOp(ctx, vmID)
@@ -1356,6 +1359,10 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	layered := m.cfg.IncrementalSnapshotEnabled && dirtyTracked && instBaseMem != "" &&
 		(instMemFile == instBaseMem || overlayPath == instMemFile)
 	baseMemPath := ""
+	// Which memory image this pause writes — the field that makes a slow
+	// full-snapshot pause visible at a glance. Bounded: layered|diff|full.
+	snapshotType := "full"
+	tSnapshot := time.Now()
 	// CreateDiffSnapshot merges in place: an interrupted diff has no surviving copy
 	// of the file it overwrites (for layered, only the session delta — the template
 	// base is untouched; for in-place, the VM's own mem.snap). Crash-atomicity of the
@@ -1390,6 +1397,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 			}
 		}
 		if usable {
+			snapshotType = "layered"
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
 			saveStart := time.Now()
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
@@ -1420,6 +1428,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// mem.snap when tracking was armed this run and mem.snap is the resume base —
 		// dirtied offsets are resident/never re-faulted, disjoint from clean reads.
 		if shouldWriteDiff(m.cfg.IncrementalSnapshotEnabled, dirtyTracked, memPath, instMemFile, fileExists(memPath)) {
+			snapshotType = "diff"
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating diff snapshot")
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create diff snapshot: %w", err))
@@ -1443,10 +1452,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// snapshot is durable and the record reaches Paused either way; the
 	// budget only bounds how long this handler lingers past the RPC, and a
 	// straggler VM is still reclaimed by the reconciler.
+	snapshotDur := time.Since(tSnapshot)
 	inst.mu.RLock()
 	pauseSupervision := inst.Supervision
 	inst.mu.RUnlock()
 	stopConfirmed := true
+	tStop := time.Now()
 	stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), stopUnitBudget)
 	stopErr := m.stopVM(stopCtx, vmID, pauseSupervision)
 	if stopErr != nil {
@@ -1464,6 +1475,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		}
 	}
 	stopCancel()
+	stopDur := time.Since(tStop)
 
 	inst.mu.Lock()
 	inst.Status = StatusPaused
@@ -1525,7 +1537,17 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		go m.rehashPendingBackup(ctx, pb, log)
 	}
 
-	log.Info().Msg("VM paused")
+	log.Info().
+		Str("snapshot_type", snapshotType).
+		Int64("snapshot_ms", snapshotDur.Milliseconds()).
+		Int64("stop_ms", stopDur.Milliseconds()).
+		Int64("pause_ms", time.Since(tPause).Milliseconds()).
+		Msg("VM paused")
+	m.recordPhases("pause", snapshotType, map[string]time.Duration{
+		"snapshot": snapshotDur,
+		"stop":     stopDur,
+		"total":    time.Since(tPause),
+	})
 	return snapshotPath, memPath, manifest, nil
 }
 
