@@ -15,7 +15,7 @@ func TestRouterQuiesceResumeSignalsWaiters(t *testing.T) {
 		t.Fatal("fresh router should not be quiescing")
 	}
 
-	r.SetActive(Upstream{Generation: "A", Socket: "/tmp/a.sock"})
+	r.SetActive(Upstream{Generation: "A", GRPCSocket: "/tmp/a.sock", ResolverSocket: "/tmp/a-res.sock"})
 	r.Quiesce(true)
 	if up, q := r.Active(); !q || up.Generation != "A" {
 		t.Fatalf("after Quiesce(true): up=%v quiescing=%v", up, q)

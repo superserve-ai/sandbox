@@ -10,10 +10,10 @@ import (
 func TestApplyControl(t *testing.T) {
 	gw := gateway.New()
 
-	if got := applyControl([]string{"set-active", "B", "/tmp/b.sock"}, gw); got != "OK" {
+	if got := applyControl([]string{"set-active", "B", "/tmp/b.sock", "/tmp/b-res.sock"}, gw); got != "OK" {
 		t.Fatalf("set-active = %q", got)
 	}
-	if up, _ := gw.Router().Active(); up.Generation != "B" || up.Socket != "/tmp/b.sock" {
+	if up, _ := gw.Router().Active(); up.Generation != "B" || up.GRPCSocket != "/tmp/b.sock" || up.ResolverSocket != "/tmp/b-res.sock" {
 		t.Fatalf("router not updated: %+v", up)
 	}
 

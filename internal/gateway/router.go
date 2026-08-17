@@ -11,13 +11,17 @@ package gateway
 
 import "sync"
 
-// Upstream identifies the vmd generation the gateway currently routes to.
+// Upstream identifies the vmd generation the gateway currently routes to. The
+// gateway fronts two ports, so a generation exposes two private sockets: one
+// for control-plane gRPC and one for the loopback resolver's HTTP.
 type Upstream struct {
 	// Generation is an opaque id for the vmd generation (for logging/metrics).
 	Generation string
-	// Socket is the generation's private unix socket path. Empty means no
-	// active upstream yet (startup, or between generations).
-	Socket string
+	// GRPCSocket is the generation's private control-plane gRPC socket. Empty
+	// means no active upstream yet (startup, or between generations).
+	GRPCSocket string
+	// ResolverSocket is the generation's private resolver HTTP socket.
+	ResolverSocket string
 }
 
 // Router holds the gateway's routing state: the active upstream and whether new

@@ -92,7 +92,7 @@ func (g *Gateway) ResolverHandler() http.Handler {
 				return
 			}
 		}
-		if up.Socket == "" {
+		if up.ResolverSocket == "" {
 			http.Error(w, "no upstream", http.StatusServiceUnavailable)
 			return
 		}
@@ -101,7 +101,7 @@ func (g *Gateway) ResolverHandler() http.Handler {
 				pr.Out.URL.Scheme = "http"
 				pr.Out.URL.Host = "vmd" // ignored by the unix transport
 			},
-			Transport: g.resolverTransport(up.Socket),
+			Transport: g.resolverTransport(up.ResolverSocket),
 		}
 		proxy.ServeHTTP(w, r)
 	})

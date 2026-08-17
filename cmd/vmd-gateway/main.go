@@ -36,15 +36,21 @@ func main() {
 	resolverAddr := flag.String("resolver-addr", "127.0.0.1:9090", "public resolver HTTP listen address")
 	controlSock := flag.String("control-sock", "/run/vmd/gateway-control.sock", "local control unix socket")
 	initialID := flag.String("initial-gen-id", "", "generation id to route to at startup")
-	initialSock := flag.String("initial-gen-sock", "", "generation upstream socket to route to at startup")
+	initialGRPC := flag.String("initial-gen-grpc", "", "generation gRPC socket to route to at startup")
+	initialResolver := flag.String("initial-gen-resolver", "", "generation resolver socket to route to at startup")
 	flag.Parse()
 
 	log := zerolog.New(os.Stderr).With().Timestamp().Str("service", "vmd-gateway").Logger()
 
 	gw := gateway.New()
-	if *initialSock != "" {
-		gw.Router().SetActive(gateway.Upstream{Generation: *initialID, Socket: *initialSock})
-		log.Info().Str("generation", *initialID).Str("socket", *initialSock).Msg("initial upstream set")
+	if *initialGRPC != "" {
+		gw.Router().SetActive(gateway.Upstream{
+			Generation:     *initialID,
+			GRPCSocket:     *initialGRPC,
+			ResolverSocket: *initialResolver,
+		})
+		log.Info().Str("generation", *initialID).Str("grpc", *initialGRPC).
+			Str("resolver", *initialResolver).Msg("initial upstream set")
 	}
 
 	grpcLis, err := net.Listen("tcp", *grpcAddr)
@@ -122,10 +128,14 @@ func applyControl(fields []string, gw *gateway.Gateway) string {
 	}
 	switch fields[0] {
 	case "set-active":
-		if len(fields) != 3 {
-			return "ERR usage: set-active <generation-id> <upstream-socket>"
+		if len(fields) != 4 {
+			return "ERR usage: set-active <generation-id> <grpc-socket> <resolver-socket>"
 		}
-		gw.Router().SetActive(gateway.Upstream{Generation: fields[1], Socket: fields[2]})
+		gw.Router().SetActive(gateway.Upstream{
+			Generation:     fields[1],
+			GRPCSocket:     fields[2],
+			ResolverSocket: fields[3],
+		})
 		return "OK"
 	case "quiesce":
 		if len(fields) != 2 || (fields[1] != "on" && fields[1] != "off") {
@@ -135,7 +145,8 @@ func applyControl(fields []string, gw *gateway.Gateway) string {
 		return "OK"
 	case "status":
 		up, q := gw.Router().Active()
-		return fmt.Sprintf("OK generation=%q socket=%q quiescing=%t", up.Generation, up.Socket, q)
+		return fmt.Sprintf("OK generation=%q grpc=%q resolver=%q quiescing=%t",
+			up.Generation, up.GRPCSocket, up.ResolverSocket, q)
 	default:
 		return "ERR unknown command " + fields[0]
 	}

@@ -57,7 +57,7 @@ func TestGatewayTransparentProxy(t *testing.T) {
 
 	// Gateway in front, pointed at the backend.
 	gw := New()
-	gw.Router().SetActive(Upstream{Generation: "A", Socket: backendSock})
+	gw.Router().SetActive(Upstream{Generation: "A", GRPCSocket: backendSock})
 	defer gw.Close()
 	fl, err := net.Listen("unix", frontSock)
 	if err != nil {

@@ -16,10 +16,12 @@ import (
 	"sync"
 )
 
-// Generation identifies one vmd generation: an opaque id and its private socket.
+// Generation identifies one vmd generation: an opaque id and its two private
+// sockets (control-plane gRPC and resolver HTTP), which the gateway routes to.
 type Generation struct {
-	ID     string
-	Socket string
+	ID             string
+	GRPCSocket     string
+	ResolverSocket string
 }
 
 // Actions are the effects the controller drives, in the order the handoff

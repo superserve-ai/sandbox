@@ -82,8 +82,8 @@ func eq(a, b []string) bool {
 
 func TestDeployHappyPath(t *testing.T) {
 	m := &mockActions{}
-	c := New(m, Generation{ID: "A", Socket: "/tmp/a.sock"})
-	if err := c.Deploy(context.Background(), Generation{ID: "A"}, Generation{ID: "B", Socket: "/tmp/b.sock"}); err != nil {
+	c := New(m, Generation{ID: "A", GRPCSocket: "/tmp/a.sock"})
+	if err := c.Deploy(context.Background(), Generation{ID: "A"}, Generation{ID: "B", GRPCSocket: "/tmp/b.sock"}); err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
 	want := []string{"StartStandby", "AwaitReady", "Quiesce(true)", "DrainAndStop", "Activate", "SetActive:B", "Quiesce(false)", "Stabilize"}

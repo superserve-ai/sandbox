@@ -49,14 +49,14 @@ func (g *Gateway) direct(_ any, serverStream grpc.ServerStream) error {
 	}
 
 	up, quiescing := g.router.Active()
-	if quiescing || up.Socket == "" {
+	if quiescing || up.GRPCSocket == "" {
 		// Bounded quiesce for gRPC: refuse with a retryable status. The control
 		// plane retries Unavailable across a cutover, so this is invisible for
 		// unary RPCs.
 		return status.Error(codes.Unavailable, "gateway draining; retry")
 	}
 
-	conn, err := g.upstreamConn(up.Socket)
+	conn, err := g.upstreamConn(up.GRPCSocket)
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "gateway: dial upstream: %v", err)
 	}
