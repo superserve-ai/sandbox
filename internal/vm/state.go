@@ -297,13 +297,7 @@ func (s *StateStore) Path() string { return s.db.Path() }
 
 // OpenStateStore opens (or creates) the BoltDB file at path.
 func OpenStateStore(path string) (*StateStore, error) {
-	// NoFreelistSync stops bbolt writing+fsyncing the freelist on every commit,
-	// whose cost otherwise grows with the DB's free-page count (churn) and adds
-	// up on write paths like pause. The freelist is rebuilt from the page tree
-	// on the next open — startup already scans every record below — so this is a
-	// pure write-side win with no data-safety cost (data pages and meta are
-	// still synced).
-	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 1 * time.Second, NoFreelistSync: true})
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		return nil, fmt.Errorf("open state store %s: %w", path, err)
 	}
@@ -463,15 +457,20 @@ func (s *StateStore) ClearDirtyTrackingArmed(vmID string) error {
 		if data == nil {
 			return nil
 		}
-		var rec VMRecord
-		if err := json.Unmarshal(data, &rec); err != nil {
+		// Edit the raw JSON object rather than round-tripping through VMRecord:
+		// a newer VMD (rollback / mixed-version deploy) may have added fields
+		// this binary's struct drops, and this clear must touch only the armed
+		// bit. The field is omitempty, so deleting the key is equivalent to
+		// false and preserves every other key untouched.
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(data, &obj); err != nil {
 			return err
 		}
-		if !rec.DirtyTrackingArmed {
+		if v, ok := obj["dirty_tracking_armed"]; !ok || string(v) != "true" {
 			return nil
 		}
-		rec.DirtyTrackingArmed = false
-		out, err := json.Marshal(rec)
+		delete(obj, "dirty_tracking_armed")
+		out, err := json.Marshal(obj)
 		if err != nil {
 			return err
 		}
@@ -659,15 +658,15 @@ func (s *StateStore) IDs() (map[string]struct{}, error) {
 }
 
 // toRecord converts a VMInstance to a persistable VMRecord.
-func toRecord(inst *VMInstance) VMRecord {
+func toRecord(inst *VMInstance, persistDirtyArmed bool) VMRecord {
 	inst.mu.RLock()
 	defer inst.mu.RUnlock()
-	return toRecordLocked(inst)
+	return toRecordLocked(inst, persistDirtyArmed)
 }
 
 // toRecordLocked snapshots an instance while its caller holds inst.mu. It is
 // used when a state write must be serialized with the in-memory mutation.
-func toRecordLocked(inst *VMInstance) VMRecord {
+func toRecordLocked(inst *VMInstance, persistDirtyArmed bool) VMRecord {
 	return VMRecord{
 		ID:                         inst.ID,
 		PID:                        inst.PID,
@@ -687,7 +686,13 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		SnapshotPath:               inst.SnapshotPath,
 		MemFilePath:                inst.MemFilePath,
 		BaseMemPath:                inst.BaseMemPath,
-		DirtyTrackingArmed:         inst.DirtyTracked,
+		// Only persisted when the feature is on: otherwise a stale armed=true
+		// could survive a bitmap-resetting snapshot (its write-ahead disarm is
+		// gated off too) and be trusted the moment the flag is later enabled.
+		// Gating the write here means no armed bit can exist while off, so
+		// enabling is always safe — a VM whose bit was never persisted simply
+		// takes one full pause after enable, then heals.
+		DirtyTrackingArmed: inst.DirtyTracked && persistDirtyArmed,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,

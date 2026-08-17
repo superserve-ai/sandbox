@@ -25,7 +25,7 @@ func TestPreviewPolicyRecordRoundTrip(t *testing.T) {
 		PreviewPolicyRevision: 7,
 	}
 
-	rec := toRecord(inst)
+	rec := toRecord(inst, false)
 	if rec.PreviewAccess != preview.AccessPrivate || rec.PreviewPolicyRevision != 7 {
 		t.Fatalf("record policy = (%q, %d), want restrictive fallback (%q, 7)", rec.PreviewAccess, rec.PreviewPolicyRevision, preview.AccessPrivate)
 	}
@@ -78,7 +78,7 @@ func TestPausedAtRoundTrip(t *testing.T) {
 		PausedAt: pausedAt,
 	}
 
-	rec := toRecord(inst)
+	rec := toRecord(inst, false)
 	if !rec.PausedAt.Equal(pausedAt) {
 		t.Fatalf("record paused_at = %v, want %v", rec.PausedAt, pausedAt)
 	}

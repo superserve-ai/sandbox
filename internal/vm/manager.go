@@ -4031,7 +4031,7 @@ func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, preview
 	// record before advancing memory so a failed write leaves the old revision
 	// retryable instead of acknowledging a policy that a restart would lose.
 	if m.state != nil && !isBuildVM(inst.ID) {
-		record := toRecordLocked(inst)
+		record := toRecordLocked(inst, m.cfg.PersistDirtyTrackingEnabled)
 		record.PreviewAccess = previewAccess
 		record.PreviewPorts = previewPortsToRecord(nextPorts)
 		record.PreviewPortAccess = previewPortAccessToRecord(nextPorts)
@@ -4455,7 +4455,7 @@ func (m *Manager) releasePausedNetworkSlot(rec VMRecord, shrink bool) (bool, err
 			return false, nil
 		}
 		inst.mu.Unlock()
-		cleared := toRecord(inst)
+		cleared := toRecord(inst, m.cfg.PersistDirtyTrackingEnabled)
 		cleared.Namespace = ""
 		cleared.IP = ""
 		cleared.TAPDevice = ""
@@ -4518,7 +4518,7 @@ func (m *Manager) persistState(inst *VMInstance) bool {
 	if isBuildVM(inst.ID) {
 		return true
 	}
-	if err := m.state.Put(toRecord(inst)); err != nil {
+	if err := m.state.Put(toRecord(inst, m.cfg.PersistDirtyTrackingEnabled)); err != nil {
 		m.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to persist VM state to BoltDB")
 		return false
 	}
@@ -4534,7 +4534,7 @@ func (m *Manager) persistStateIfPresent(inst *VMInstance) (wrote bool, err error
 	if m.state == nil || isBuildVM(inst.ID) {
 		return true, nil
 	}
-	wrote, err = m.state.PutIfPresent(toRecord(inst))
+	wrote, err = m.state.PutIfPresent(toRecord(inst, m.cfg.PersistDirtyTrackingEnabled))
 	if err != nil {
 		m.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to persist VM state to BoltDB")
 		return false, err

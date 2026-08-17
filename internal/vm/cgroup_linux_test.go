@@ -290,7 +290,7 @@ func TestUnknownSupervisionFailsClosed(t *testing.T) {
 // after which every unit oracle reads it as dead.
 func TestSupervisionRoundTrip(t *testing.T) {
 	inst := &VMInstance{ID: "vm-1", Supervision: SupervisionCgroup}
-	rec := toRecord(inst)
+	rec := toRecord(inst, false)
 	if rec.Supervision != SupervisionCgroup {
 		t.Fatal("toRecord dropped Supervision")
 	}
@@ -308,7 +308,7 @@ func TestSupervisionRoundTrip(t *testing.T) {
 	if cgroupSupervised(legacy.Supervision) || legacy.Supervision != SupervisionUnit {
 		t.Fatal("legacy record must be unit-supervised")
 	}
-	out, err := json.Marshal(toRecord(&VMInstance{ID: "u", Supervision: SupervisionUnit}))
+	out, err := json.Marshal(toRecord(&VMInstance{ID: "u", Supervision: SupervisionUnit}, false))
 	if err != nil {
 		t.Fatal(err)
 	}

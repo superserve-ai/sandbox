@@ -1858,14 +1858,14 @@ func TestRetriedLaunchTargetFlagsUnverifiedRecord(t *testing.T) {
 		t.Fatal("a verified Running record must be adoptable without verification")
 	}
 
-	out, err := json.Marshal(toRecord(existing))
+	out, err := json.Marshal(toRecord(existing, false))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(out), "unverified") {
 		t.Fatalf("verified records must omit the unverified key, got %s", out)
 	}
-	unv := toRecord(&VMInstance{ID: "u", Status: StatusRunning, Unverified: true})
+	unv := toRecord(&VMInstance{ID: "u", Status: StatusRunning, Unverified: true}, false)
 	round, err := json.Marshal(unv)
 	if err != nil {
 		t.Fatal(err)
@@ -2077,7 +2077,7 @@ func TestResumeVM_UnverifiedTarget_VerifiedAndAdopted(t *testing.T) {
 		SnapshotPath: "/snapshots/vm-1/vmstate.snap",
 		MemFilePath:  "/snapshots/vm-1/mem.snap",
 	}
-	if err := store.Put(toRecord(existing)); err != nil {
+	if err := store.Put(toRecord(existing, false)); err != nil {
 		t.Fatal(err)
 	}
 	mgr := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
@@ -2402,7 +2402,7 @@ func TestResumeVM_CorpseVerdict_ClearsRunningBeforeRelaunch(t *testing.T) {
 		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
 		SnapshotPath: "/nonexistent/vmstate.snap", MemFilePath: "/nonexistent/mem.snap",
 	}
-	if err := store.Put(toRecord(existing)); err != nil {
+	if err := store.Put(toRecord(existing, false)); err != nil {
 		t.Fatal(err)
 	}
 	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
@@ -2439,14 +2439,19 @@ func TestResumeVM_CorpseVerdict_ClearsRunningBeforeRelaunch(t *testing.T) {
 // Firecracker whose dirty bitmap survived the restart.
 func TestToRecordPersistsDirtyTrackingArmed(t *testing.T) {
 	armed := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTracked: true}
-	if rec := toRecord(armed); !rec.DirtyTrackingArmed {
-		t.Fatal("toRecord must persist DirtyTracked as DirtyTrackingArmed")
+	if rec := toRecord(armed, true); !rec.DirtyTrackingArmed {
+		t.Fatal("toRecord must persist DirtyTracked as DirtyTrackingArmed when the feature is enabled")
+	}
+	// Gated off: the armed bit must NOT be persisted, so no stale true can be
+	// trusted the moment the flag is later enabled.
+	if rec := toRecord(armed, false); rec.DirtyTrackingArmed {
+		t.Fatal("toRecord must not persist the armed bit when the feature is off")
 	}
 	unarmed := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTracked: false}
-	if rec := toRecord(unarmed); rec.DirtyTrackingArmed {
+	if rec := toRecord(unarmed, true); rec.DirtyTrackingArmed {
 		t.Fatal("toRecord must not report armed for an un-armed instance")
 	}
-	if inst := toInstance(toRecord(armed)); inst.DirtyTracked {
+	if inst := toInstance(toRecord(armed, true)); inst.DirtyTracked {
 		t.Fatal("toInstance must leave DirtyTracked false; re-arming belongs to reattachRecord")
 	}
 }
@@ -2514,7 +2519,7 @@ func TestResumeVM_CorpseVerdictUnrecordable_RefusesRelaunch(t *testing.T) {
 		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
 		SnapshotPath: "/nonexistent/vmstate.snap", MemFilePath: "/nonexistent/mem.snap",
 	}
-	if err := store.Put(toRecord(existing)); err != nil {
+	if err := store.Put(toRecord(existing, false)); err != nil {
 		t.Fatal(err)
 	}
 	store.Close() // every later write fails — the store is broken
@@ -3018,7 +3023,7 @@ func TestReleaseFailedRestore_ParksExplicitDurableMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	inst := &VMInstance{ID: "vm-1", Status: StatusError, Supervision: SupervisionCgroup}
-	if err := store.Put(toRecord(inst)); err != nil {
+	if err := store.Put(toRecord(inst, false)); err != nil {
 		t.Fatal(err)
 	}
 	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
