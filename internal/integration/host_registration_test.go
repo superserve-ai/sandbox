@@ -25,6 +25,19 @@ func hostHeartbeat(t *testing.T, r http.Handler, token, hostID, body string) *ht
 const hostDescription = `"vmd_addr":"10.9.0.7:50051","proxy_addr":"10.9.0.7:5007",` +
 	`"region":"test-region","capacity_memory_mib":1024,"capacity_vcpus":8`
 
+// cleanupHost removes the test's host row so a leftover 'active' host can
+// never be picked by another test's scheduler (its address isn't dialable —
+// a leaked active row makes unrelated sandbox creates flake).
+func cleanupHost(t *testing.T, hostID string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(context.Background(),
+			`DELETE FROM host WHERE id = $1`, hostID); err != nil {
+			t.Errorf("cleanup host %s: %v", hostID, err)
+		}
+	})
+}
+
 // A heartbeat for an unknown host id carrying a self-description registers
 // the host in 'provisioning' with its capabilities bound to the heartbeat;
 // further heartbeats never promote it past provisioning on their own.
@@ -33,6 +46,7 @@ func TestIntegration_HostRegistration_SelfRegistersProvisioning(t *testing.T) {
 	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
 	r := newRouter(t)
 	hostID := "reg-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
 
 	w := hostHeartbeat(t, r, "itok-hostreg", hostID,
 		`{"capabilities":["preview_ports_v1"],`+hostDescription+`}`)
@@ -93,6 +107,7 @@ func TestIntegration_HostRegistration_IdentityConflictAndReclaim(t *testing.T) {
 	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
 	r := newRouter(t)
 	hostID := "dup-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
 
 	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{`+hostDescription+`}`); w.Code != http.StatusOK {
 		t.Fatalf("seed host: %d %s", w.Code, w.Body.String())
@@ -130,6 +145,7 @@ func TestIntegration_HostStatus_OperatorTransitions(t *testing.T) {
 	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
 	r := newRouter(t)
 	hostID := "act-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
 
 	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{`+hostDescription+`}`); w.Code != http.StatusOK {
 		t.Fatalf("seed host: %d %s", w.Code, w.Body.String())
@@ -159,11 +175,62 @@ func TestIntegration_HostStatus_OperatorTransitions(t *testing.T) {
 	}
 }
 
+// Activating a host whose heartbeat went stale must be refused: the
+// unhealthy detector only watches active rows, so a dead provisioning host
+// would otherwise sit exposed to placement until the detector's next pass.
+// Draining a silent host stays allowed, and a fresh heartbeat re-enables
+// activation.
+func TestIntegration_HostActivateRequiresFreshHeartbeat(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	r := newRouter(t)
+	hostID := "stl-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
+
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{`+hostDescription+`}`); w.Code != http.StatusOK {
+		t.Fatalf("seed host: %d %s", w.Code, w.Body.String())
+	}
+	if _, err := testPool.Exec(ctx,
+		`UPDATE host SET last_heartbeat_at = now() - interval '3 minutes' WHERE id = $1`,
+		hostID); err != nil {
+		t.Fatalf("age heartbeat: %v", err)
+	}
+
+	setStatus := func(status string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/internal/hosts/"+hostID+"/status",
+			strings.NewReader(`{"status":"`+status+`"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer itok-hostreg")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	if w := setStatus("active"); w.Code != http.StatusConflict {
+		t.Fatalf("stale activate = %d %s, want 409", w.Code, w.Body.String())
+	}
+	if host, _ := testQueries.GetHost(ctx, hostID); host.Status != "provisioning" {
+		t.Fatalf("refused activation must not change status, got %s", host.Status)
+	}
+	if w := setStatus("draining"); w.Code != http.StatusOK {
+		t.Fatalf("stale drain = %d %s, want 200 (draining a dead host is legitimate)", w.Code, w.Body.String())
+	}
+
+	// A fresh heartbeat makes the host activatable again.
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{`+hostDescription+`}`); w.Code != http.StatusOK {
+		t.Fatalf("revive heartbeat: %d %s", w.Code, w.Body.String())
+	}
+	if w := setStatus("active"); w.Code != http.StatusOK {
+		t.Fatalf("fresh activate = %d %s, want 200", w.Code, w.Body.String())
+	}
+}
+
 // The operator list shows every status, not just active.
 func TestIntegration_HostList_IncludesProvisioning(t *testing.T) {
 	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
 	r := newRouter(t)
 	hostID := "lst-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
 
 	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{`+hostDescription+`}`); w.Code != http.StatusOK {
 		t.Fatalf("seed host: %d %s", w.Code, w.Body.String())

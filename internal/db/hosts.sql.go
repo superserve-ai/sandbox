@@ -604,16 +604,25 @@ const updateHostStatus = `-- name: UpdateHostStatus :one
 UPDATE host
 SET status = $2, updated_at = now()
 WHERE id = $1
+  AND ($2 <> 'active'
+       OR (last_heartbeat_at IS NOT NULL
+           AND last_heartbeat_at > $3))
 RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
 `
 
 type UpdateHostStatusParams struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
+	ID                   string             `json:"id"`
+	Status               string             `json:"status"`
+	ActiveHeartbeatAfter pgtype.Timestamptz `json:"active_heartbeat_after"`
 }
 
+// Activation requires a live heartbeat: a provisioning host that died
+// before the operator activated it must not become schedulable — the
+// unhealthy detector only watches active rows, so it would sit exposed to
+// placement until the detector's next pass. Non-active targets carry no
+// freshness requirement; draining a dead host is legitimate.
 func (q *Queries) UpdateHostStatus(ctx context.Context, arg UpdateHostStatusParams) (Host, error) {
-	row := q.db.QueryRow(ctx, updateHostStatus, arg.ID, arg.Status)
+	row := q.db.QueryRow(ctx, updateHostStatus, arg.ID, arg.Status, arg.ActiveHeartbeatAfter)
 	var i Host
 	err := row.Scan(
 		&i.ID,

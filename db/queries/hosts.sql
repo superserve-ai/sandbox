@@ -39,9 +39,17 @@ SET vmd_addr = $2, proxy_addr = $3, region = $4,
 WHERE id = $1;
 
 -- name: UpdateHostStatus :one
+-- Activation requires a live heartbeat: a provisioning host that died
+-- before the operator activated it must not become schedulable — the
+-- unhealthy detector only watches active rows, so it would sit exposed to
+-- placement until the detector's next pass. Non-active targets carry no
+-- freshness requirement; draining a dead host is legitimate.
 UPDATE host
 SET status = $2, updated_at = now()
 WHERE id = $1
+  AND ($2 <> 'active'
+       OR (last_heartbeat_at IS NOT NULL
+           AND last_heartbeat_at > sqlc.arg(active_heartbeat_after)))
 RETURNING *;
 
 -- name: UpdateHostHeartbeat :one

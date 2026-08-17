@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -248,11 +249,25 @@ func (h *Handlers) HostUpdateStatus(c *gin.Context) {
 		return
 	}
 
-	host, err := h.DB.UpdateHostStatus(c.Request.Context(), db.UpdateHostStatusParams{
+	ctx := c.Request.Context()
+	host, err := h.DB.UpdateHostStatus(ctx, db.UpdateHostStatusParams{
 		ID: hostID, Status: req.Status,
+		// Activation demands a heartbeat fresher than the unhealthy
+		// threshold; the predicate lives in the UPDATE so there is no
+		// check-then-act window.
+		ActiveHeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true},
 	})
 	if err == pgx.ErrNoRows {
-		respondErrorMsg(c, "not_found", "host not found", http.StatusNotFound)
+		// Zero rows is either an unknown host or an activation refused for
+		// heartbeat staleness — disambiguate for the operator.
+		if _, gerr := h.DB.GetHost(ctx, hostID); gerr == pgx.ErrNoRows {
+			respondErrorMsg(c, "not_found", "host not found", http.StatusNotFound)
+			return
+		}
+		log.Warn().Str("host_id", hostID).Msg("activation refused: heartbeat stale or absent")
+		respondErrorMsg(c, "conflict",
+			"host has no live heartbeat; refusing to activate a host the fleet cannot see",
+			http.StatusConflict)
 		return
 	}
 	if err != nil {
