@@ -95,6 +95,7 @@ func (c client) list() error {
 			RunningCount      int     `json:"running_count"`
 			TransitionalCount int     `json:"transitional_count"`
 			PausedCount       int     `json:"paused_count"`
+			BuildingCount     int     `json:"building_count"`
 		} `json:"hosts"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -102,9 +103,11 @@ func (c client) list() error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	// BUSY counts pausing/resuming sandboxes whose lifecycle RPC is still on
-	// the host: a host is not drained until RUNNING and BUSY are both zero.
-	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tPAUSED")
+	// BUSY counts pausing/resuming sandboxes and BUILDS counts in-flight
+	// template builds — both mean a lifecycle RPC or build VM is still using
+	// the host. A host is not drained until RUNNING, BUSY, and BUILDS are
+	// all zero.
+	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED")
 	for _, h := range out.Hosts {
 		beat := "never"
 		if h.LastHeartbeatAt != nil {
@@ -112,8 +115,8 @@ func (c client) list() error {
 				beat = fmt.Sprintf("%ds ago", int(time.Since(t).Seconds()))
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\n",
-			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.PausedCount)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\n",
+			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount)
 	}
 	return w.Flush()
 }

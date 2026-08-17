@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -225,8 +226,11 @@ func TestIntegration_HostActivateRequiresFreshHeartbeat(t *testing.T) {
 	}
 }
 
-// The operator list shows every status, not just active.
-func TestIntegration_HostList_IncludesProvisioning(t *testing.T) {
+// The operator list shows every status, not just active, and counts
+// in-flight template builds so drain progress can see build VMs.
+func TestIntegration_HostList_IncludesProvisioningAndBuilds(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
 	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
 	r := newRouter(t)
 	hostID := "lst-" + strings.ToLower(t.Name()[len(t.Name())-8:])
@@ -236,6 +240,20 @@ func TestIntegration_HostList_IncludesProvisioning(t *testing.T) {
 		t.Fatalf("seed host: %d %s", w.Code, w.Body.String())
 	}
 
+	// A template submit auto-creates a pending build; move it onto this
+	// host in 'building' to simulate an in-flight build VM.
+	tw := do(r, "POST", "/templates", apiKey,
+		`{"name":"hostlist-build-probe","build_spec":{"from":"debian:12-slim","steps":[]}}`)
+	if tw.Code != http.StatusAccepted {
+		t.Fatalf("create template: %d %s", tw.Code, tw.Body.String())
+	}
+	templateID := mustJSON(t, tw)["id"].(string)
+	if _, err := testPool.Exec(ctx,
+		`UPDATE template_build SET status = 'building', vmd_host_id = $2 WHERE template_id = $1`,
+		templateID, hostID); err != nil {
+		t.Fatalf("mark build in-flight: %v", err)
+	}
+
 	req := httptest.NewRequest("GET", "/internal/hosts", nil)
 	req.Header.Set("Authorization", "Bearer itok-hostreg")
 	w := httptest.NewRecorder()
@@ -243,8 +261,26 @@ func TestIntegration_HostList_IncludesProvisioning(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("list: %d %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), `"`+hostID+`"`) ||
-		!strings.Contains(w.Body.String(), `"provisioning"`) {
-		t.Fatalf("list missing provisioning host: %s", w.Body.String())
+	body := w.Body.String()
+	if !strings.Contains(body, `"`+hostID+`"`) || !strings.Contains(body, `"provisioning"`) {
+		t.Fatalf("list missing provisioning host: %s", body)
 	}
+	var out struct {
+		Hosts []struct {
+			ID            string `json:"id"`
+			BuildingCount int32  `json:"building_count"`
+		} `json:"hosts"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	for _, h := range out.Hosts {
+		if h.ID == hostID {
+			if h.BuildingCount != 1 {
+				t.Fatalf("building_count = %d, want 1 (in-flight build must show in drain progress)", h.BuildingCount)
+			}
+			return
+		}
+	}
+	t.Fatalf("host %s not in list", hostID)
 }

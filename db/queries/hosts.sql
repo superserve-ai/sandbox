@@ -193,7 +193,12 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('pausing', 'resuming')
                                       AND s.destroyed_at IS NULL), 0)::int AS transitional_count,
        COALESCE(COUNT(s.id) FILTER (WHERE s.status = 'paused'
-                                      AND s.destroyed_at IS NULL), 0)::int AS paused_count
+                                      AND s.destroyed_at IS NULL), 0)::int AS paused_count,
+       -- Scalar subquery, not a second LEFT JOIN: joining two child tables
+       -- would cross-multiply the per-host rows and corrupt the counts.
+       COALESCE((SELECT COUNT(*) FROM template_build tb
+                 WHERE tb.vmd_host_id = h.id
+                   AND tb.status IN ('building', 'snapshotting')), 0)::int AS building_count
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
 GROUP BY h.id
