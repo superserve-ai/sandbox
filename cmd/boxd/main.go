@@ -53,7 +53,7 @@ func blockedPath(p string) error {
 
 // safePath validates and cleans a filesystem path. It rejects paths that could
 // damage the VM's ability to function (init, boxd, /proc, /sys, /dev) and
-// prevents path traversal to root.
+// requires paths to be absolute.
 //
 // NOTE: this is purely lexical — it does NOT resolve symlinks, so a path whose
 // components symlink into a blocklisted location still passes here. Directory
@@ -61,8 +61,8 @@ func blockedPath(p string) error {
 // (resolveWithinBlocklist) before reading it.
 func safePath(raw string) (string, error) {
 	p := filepath.Clean(raw)
-	if p == "/" || p == "." {
-		return "", fmt.Errorf("cannot operate on root directory")
+	if p == "." || !strings.HasPrefix(p, "/") {
+		return "", fmt.Errorf("path must be absolute")
 	}
 	if err := blockedPath(p); err != nil {
 		return "", err
@@ -833,6 +833,9 @@ func (s *filesystemService) MakeDir(ctx context.Context, req *connect.Request[pb
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
+	if path == "/" {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("cannot create root directory"))
+	}
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
@@ -843,6 +846,9 @@ func (s *filesystemService) Remove(ctx context.Context, req *connect.Request[pb.
 	path, err := safePath(req.Msg.GetPath())
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	if path == "/" {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("cannot remove root directory"))
 	}
 	if err := os.RemoveAll(path); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
@@ -858,6 +864,9 @@ func (s *filesystemService) Move(ctx context.Context, req *connect.Request[pb.Mo
 	dst, err := safePath(req.Msg.GetDestination())
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	if src == "/" || dst == "/" {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("cannot move root directory"))
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
@@ -1186,6 +1195,10 @@ func (c *cappedWriter) seal() { c.sealed = true }
 // whole download. Entries are written as the walk proceeds — constant memory,
 // no temp file.
 func serveDirAsZip(ctx context.Context, w http.ResponseWriter, dirPath string) {
+	if dirPath == "/" {
+		writeJSONError(w, http.StatusBadRequest, "refusing to archive root directory")
+		return
+	}
 	// Resolve the parent's real path first so a symlinked component — a leaf, or
 	// an INTERMEDIATE one (a -> /, then a/proc) — can't anchor the archive root
 	// outside the requested tree: os.OpenRoot follows symlinks while opening its
@@ -1487,6 +1500,12 @@ func writeFileAttempt(path string, body io.Reader) (int64, error) {
 }
 
 func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
+	if path == "/" {
+		errJSON, _ := json.Marshal(map[string]string{"error": "cannot upload to root directory"})
+		http.Error(w, string(errJSON), http.StatusBadRequest)
+		return
+	}
+
 	// Peek up to the retry-buffer limit rather than reading the whole
 	// body blindly. If the body is larger than the limit, len(peeked)
 	// comes back as limit+1 without hitting EOF, and we fall through to
