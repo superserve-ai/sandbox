@@ -16,7 +16,7 @@ verify_plan() {
 
   terraform show -json "${plan_file}" | jq -e --arg host_address "${host_address}" '
   def resources: .. | objects | select(has("address") and has("values"));
-  ([resources | select(.address == "module.api.google_cloud_run_v2_service.this")][0].values.template.containers[0].env
+  ([resources | select(.address == "module.api.google_cloud_run_v2_service.this")][0].values.template[0].containers[0].env
     | map({key: .name, value: .value}) | from_entries) as $env
   | ([resources | select(.address == $host_address)][0].values.network_interface[0].network_ip) as $host_ip
   | ([resources | select(.address == $host_address)][0].values.tags) as $host_tags
