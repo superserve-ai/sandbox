@@ -34,7 +34,12 @@ EnvironmentFile=/etc/sandbox/vmd.env
 # / superserve-vms.service and must survive a generation swap.
 KillMode=process
 Delegate=yes
-Restart=no
+# Auto-restart only on a CRASH (non-zero exit / signal), never on a clean stop —
+# a deploy's `systemctl stop` exits 0 and must stay stopped. A crashed
+# generation restarts into preflight (it does not auto-become writer); the
+# gateway detects that and re-activates it, so a mid-life crash self-heals.
+Restart=on-failure
+RestartSec=2
 
 # Above the daemon's own bounded-shutdown proven maximum, so systemd force-kills
 # a generation that violates its shutdown contract and the kernel then releases

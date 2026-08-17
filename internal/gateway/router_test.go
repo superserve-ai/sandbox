@@ -5,39 +5,52 @@ import (
 	"time"
 )
 
-func TestRouterQuiesceResumeSignalsWaiters(t *testing.T) {
+func TestRouterGRPCHoldIsIndependent(t *testing.T) {
+	r := NewRouter()
+	r.SetActive(Upstream{Generation: "A", GRPCSocket: "/tmp/a.sock", ResolverSocket: "/tmp/a-res.sock"})
+
+	// Holding gRPC must NOT hold the resolver — the resolver keeps serving while
+	// the old generation drains.
+	r.QuiesceGRPC(true)
+	if _, held := r.Active(); !held {
+		t.Fatal("gRPC should be held")
+	}
+	if _, resHeld, _ := r.resolverState(); resHeld {
+		t.Fatal("resolver must not be held by QuiesceGRPC")
+	}
+}
+
+func TestRouterResolverResumeSignalsWaiters(t *testing.T) {
 	r := NewRouter()
 
-	// Un-quiesced: the resume channel is already closed (no wait).
-	select {
-	case <-r.resumedChan():
-	default:
-		t.Fatal("fresh router should not be quiescing")
+	// Un-held: the resume channel is already closed (no wait).
+	_, held, ch := r.resolverState()
+	if held {
+		t.Fatal("fresh router should not hold the resolver")
 	}
-
-	r.SetActive(Upstream{Generation: "A", GRPCSocket: "/tmp/a.sock", ResolverSocket: "/tmp/a-res.sock"})
-	r.Quiesce(true)
-	if up, q := r.Active(); !q || up.Generation != "A" {
-		t.Fatalf("after Quiesce(true): up=%v quiescing=%v", up, q)
-	}
-
-	// A waiter blocks until resume.
-	ch := r.resumedChan()
 	select {
 	case <-ch:
-		t.Fatal("resume channel closed while still quiescing")
+	default:
+		t.Fatal("fresh resolver resume channel should be closed")
+	}
+
+	r.QuiesceResolver(true)
+	_, held, ch = r.resolverState()
+	if !held {
+		t.Fatal("resolver should be held")
+	}
+	select {
+	case <-ch:
+		t.Fatal("resume channel closed while still held")
 	default:
 	}
 
 	done := make(chan struct{})
 	go func() { <-ch; close(done) }()
-	r.Quiesce(false)
+	r.QuiesceResolver(false)
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("waiter not released after Quiesce(false)")
-	}
-	if _, q := r.Active(); q {
-		t.Fatal("still quiescing after resume")
+		t.Fatal("waiter not released after QuiesceResolver(false)")
 	}
 }

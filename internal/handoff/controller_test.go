@@ -11,11 +11,12 @@ import (
 // mockActions records the call sequence and can inject a failure at a named step
 // or block StartStandby to exercise the single-deploy lock.
 type mockActions struct {
-	mu       sync.Mutex
-	calls    []string
-	failAt   string
-	block    chan struct{} // if non-nil, StartStandby blocks on it
-	rolledTo string
+	mu           sync.Mutex
+	calls        []string
+	failAt       string
+	failRollback bool
+	block        chan struct{} // if non-nil, StartStandby blocks on it
+	rolledTo     string
 }
 
 func (m *mockActions) record(s string) {
@@ -46,12 +47,11 @@ func (m *mockActions) AwaitReady(ctx context.Context, n Generation) error {
 	m.record("AwaitReady")
 	return m.err("AwaitReady")
 }
-func (m *mockActions) Quiesce(on bool) {
-	if on {
-		m.record("Quiesce(true)")
-	} else {
-		m.record("Quiesce(false)")
-	}
+func (m *mockActions) QuiesceGRPC(on bool) {
+	m.record("QuiesceGRPC(" + map[bool]string{true: "true", false: "false"}[on] + ")")
+}
+func (m *mockActions) QuiesceResolver(on bool) {
+	m.record("QuiesceResolver(" + map[bool]string{true: "true", false: "false"}[on] + ")")
 }
 func (m *mockActions) DrainAndStop(ctx context.Context, p Generation) error {
 	m.record("DrainAndStop")
@@ -68,6 +68,9 @@ func (m *mockActions) Stabilize(ctx context.Context, g Generation) error {
 }
 func (m *mockActions) Rollback(ctx context.Context, p Generation) error {
 	m.record("Rollback")
+	if m.failRollback {
+		return errors.New("rollback failed")
+	}
 	m.rolledTo = p.ID
 	return nil
 }
@@ -90,7 +93,7 @@ func TestDeployHappyPath(t *testing.T) {
 	if err := c.Deploy(context.Background(), Generation{ID: "A"}, Generation{ID: "B", GRPCSocket: "/tmp/b.sock"}); err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
-	want := []string{"StartStandby", "AwaitReady", "Quiesce(true)", "DrainAndStop", "Activate", "SetActive:B", "Quiesce(false)", "Stabilize"}
+	want := []string{"StartStandby", "AwaitReady", "QuiesceGRPC(true)", "DrainAndStop", "QuiesceResolver(true)", "Activate", "SetActive:B", "QuiesceResolver(false)", "QuiesceGRPC(false)", "Stabilize"}
 	if !eq(m.seq(), want) {
 		t.Fatalf("sequence = %v, want %v", m.seq(), want)
 	}
@@ -134,10 +137,23 @@ func TestActivateFailureRollsBack(t *testing.T) {
 	if c.Current().ID != "A" {
 		t.Fatalf("current = %s, want A after rollback", c.Current().ID)
 	}
-	// Gateway must be resumed even on the failure path.
+	// Gateway must be resumed (both holds) after a successful rollback.
 	got := m.seq()
-	if got[len(got)-1] != "Quiesce(false)" && !contains(got, "Quiesce(false)") {
+	if !contains(got, "QuiesceGRPC(false)") || !contains(got, "QuiesceResolver(false)") {
 		t.Fatalf("gateway not resumed after rollback: %v", got)
+	}
+}
+
+func TestRollbackFailureStaysFailClosed(t *testing.T) {
+	// Activate fails AND restoring the previous generation fails: the controller
+	// must NOT release traffic (no Quiesce(false)) — it holds fail-closed.
+	m := &mockActions{failAt: "Activate", failRollback: true}
+	c := New(m, Generation{ID: "A"})
+	if err := c.Deploy(context.Background(), Generation{ID: "A"}, Generation{ID: "B"}); err == nil {
+		t.Fatal("expected error when activate and rollback both fail")
+	}
+	if contains(m.seq(), "QuiesceGRPC(false)") || contains(m.seq(), "QuiesceResolver(false)") {
+		t.Fatalf("must stay fail-closed (no resume) when rollback fails: %v", m.seq())
 	}
 }
 

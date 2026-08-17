@@ -9,8 +9,11 @@ import (
 
 type fakeGateway struct{ rec func(string) }
 
-func (f *fakeGateway) Quiesce(on bool) {
-	f.rec("gw: quiesce " + map[bool]string{true: "on", false: "off"}[on])
+func (f *fakeGateway) QuiesceGRPC(on bool) {
+	f.rec("gw: quiesce-grpc " + map[bool]string{true: "on", false: "off"}[on])
+}
+func (f *fakeGateway) QuiesceResolver(on bool) {
+	f.rec("gw: quiesce-resolver " + map[bool]string{true: "on", false: "off"}[on])
 }
 func (f *fakeGateway) SetActive(gen Generation) { f.rec("gw: set-active " + gen.ID) }
 
@@ -57,11 +60,13 @@ func TestSystemdActionsDeploySequence(t *testing.T) {
 	want := []string{
 		"run: systemctl start superserve-vmd@b",
 		"send[/run/vmd/gen-b-ctl.sock]: status",
-		"gw: quiesce on",
+		"gw: quiesce-grpc on",
 		"run: systemctl stop superserve-vmd@a",
+		"gw: quiesce-resolver on",
 		"send[/run/vmd/gen-b-ctl.sock]: activate",
 		"gw: set-active b",
-		"gw: quiesce off",
+		"gw: quiesce-resolver off",
+		"gw: quiesce-grpc off",
 		"send[/run/vmd/gen-b-ctl.sock]: status",
 	}
 	mu.Lock()

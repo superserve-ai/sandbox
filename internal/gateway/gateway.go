@@ -22,7 +22,7 @@ type Gateway struct {
 	// cutover to finish before failing. Data-plane requests query the resolver
 	// live and its results are uncacheable (they carry current access policy),
 	// so a cutover holds the request rather than returning 503.
-	resolverHold time.Duration
+	resolverHoldMax time.Duration
 
 	connMu sync.Mutex
 	conns  map[string]*grpc.ClientConn // upstream gRPC conns, keyed by socket
@@ -48,9 +48,9 @@ func New() *Gateway {
 		// generation's activation, since draining happens before the hold). The
 		// caller's own request context still bounds an individual wait, so a
 		// generous cap never pins a request past when its client gave up.
-		resolverHold: 30 * time.Second,
-		conns:        map[string]*grpc.ClientConn{},
-		transports:   map[string]*http.Transport{},
+		resolverHoldMax: 30 * time.Second,
+		conns:           map[string]*grpc.ClientConn{},
+		transports:      map[string]*http.Transport{},
 	}
 }
 
@@ -127,12 +127,12 @@ func (g *Gateway) upstreamConn(socket string) (*grpc.ClientConn, error) {
 // the edge proxy queries this live per data-plane request.
 func (g *Gateway) ResolverHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		up, quiescing := g.router.Active()
-		if quiescing {
+		up, held, resumed := g.router.resolverState()
+		if held {
 			select {
-			case <-g.router.resumedChan():
-				up, _ = g.router.Active()
-			case <-time.After(g.resolverHold):
+			case <-resumed:
+				up, _, _ = g.router.resolverState()
+			case <-time.After(g.resolverHoldMax):
 				http.Error(w, "gateway draining", http.StatusServiceUnavailable)
 				return
 			case <-r.Context().Done():

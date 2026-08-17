@@ -24,23 +24,27 @@ type Upstream struct {
 	ResolverSocket string
 }
 
-// Router holds the gateway's routing state: the active upstream and whether new
-// traffic is being quiesced during a cutover. It is safe for concurrent use.
+// Router holds the gateway's routing state: the active upstream and two
+// independent admission holds. The gRPC hold covers the whole cutover (single
+// writer; the control plane retries Unavailable). The resolver hold is separate
+// and much shorter — the resolver is read-only, so the previous generation
+// keeps answering it while it drains; only the brief activation window needs a
+// hold, keeping resolver requests under the caller's short timeout.
 type Router struct {
-	mu        sync.RWMutex
-	active    Upstream
-	quiescing bool
-	// resumed is closed when quiescing clears; a fresh (open) channel is
-	// installed when quiescing begins. Waiters grab the current channel and
-	// select on it to block for the duration of a cutover.
-	resumed chan struct{}
+	mu           sync.RWMutex
+	active       Upstream
+	grpcHold     bool
+	resolverHold bool
+	// resolverResumed is closed when the resolver hold clears; a fresh channel
+	// is installed when it begins. Resolver waiters select on it.
+	resolverResumed chan struct{}
 }
 
 // NewRouter returns a Router that starts un-quiesced with no upstream.
 func NewRouter() *Router {
 	ch := make(chan struct{})
 	close(ch)
-	return &Router{resumed: ch}
+	return &Router{resolverResumed: ch}
 }
 
 // SetActive atomically points the gateway at a new upstream generation. Callers
@@ -52,32 +56,40 @@ func (r *Router) SetActive(u Upstream) {
 	r.mu.Unlock()
 }
 
-// Quiesce turns the admission hold on or off. While quiescing, gRPC calls are
-// refused with a retryable status and resolver requests are held (see the
-// serving paths). Idempotent.
-func (r *Router) Quiesce(on bool) {
+// QuiesceGRPC turns the control-plane admission hold on or off. While held, gRPC
+// calls are refused with a retryable status. Idempotent.
+func (r *Router) QuiesceGRPC(on bool) {
+	r.mu.Lock()
+	r.grpcHold = on
+	r.mu.Unlock()
+}
+
+// QuiesceResolver turns the resolver admission hold on or off. While held,
+// resolver requests wait (bounded) for resume rather than 503-ing. Idempotent.
+func (r *Router) QuiesceResolver(on bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	switch {
-	case on && !r.quiescing:
-		r.quiescing = true
-		r.resumed = make(chan struct{})
-	case !on && r.quiescing:
-		r.quiescing = false
-		close(r.resumed)
+	case on && !r.resolverHold:
+		r.resolverHold = true
+		r.resolverResumed = make(chan struct{})
+	case !on && r.resolverHold:
+		r.resolverHold = false
+		close(r.resolverResumed)
 	}
 }
 
-// Active returns the current upstream and whether the gateway is quiescing.
+// Active returns the current upstream and whether gRPC is being held.
 func (r *Router) Active() (Upstream, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.active, r.quiescing
+	return r.active, r.grpcHold
 }
 
-// resumedChan returns the channel that closes when the current quiesce clears.
-func (r *Router) resumedChan() chan struct{} {
+// resolverState returns the current upstream, whether the resolver is held, and
+// the channel that closes on resume.
+func (r *Router) resolverState() (Upstream, bool, chan struct{}) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.resumed
+	return r.active, r.resolverHold, r.resolverResumed
 }

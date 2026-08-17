@@ -32,8 +32,13 @@ type Actions interface {
 	StartStandby(ctx context.Context, next Generation) error
 	// AwaitReady blocks until the next generation reports ready-to-activate.
 	AwaitReady(ctx context.Context, next Generation) error
-	// Quiesce turns the gateway admission hold on or off.
-	Quiesce(on bool)
+	// QuiesceGRPC turns the control-plane admission hold on or off (held across
+	// the whole cutover; the control plane retries Unavailable).
+	QuiesceGRPC(on bool)
+	// QuiesceResolver turns the resolver admission hold on or off (held only for
+	// the brief activation window, since the old generation answers read-only
+	// lookups while it drains).
+	QuiesceResolver(on bool)
 	// DrainAndStop drains the previous generation and waits for it to exit,
 	// which releases the writer lease. A no-op prev (empty id) is never passed.
 	DrainAndStop(ctx context.Context, prev Generation) error
@@ -79,6 +84,48 @@ func (c *Controller) Current() Generation {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.current
+}
+
+// Deploying reports whether a deploy or recovery is in progress, so a health
+// monitor does not mistake a generation intentionally stopped mid-cutover for a
+// crash.
+func (c *Controller) Deploying() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deploying
+}
+
+// Reactivate re-activates a generation that crashed and was auto-restarted into
+// preflight — bringing it back to serving as the writer without a full deploy.
+// Serialized against deploys by the same single-deploy lock.
+func (c *Controller) Reactivate(ctx context.Context, gen Generation) error {
+	c.mu.Lock()
+	if c.deploying {
+		c.mu.Unlock()
+		return ErrDeployInProgress
+	}
+	c.deploying = true
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.deploying = false
+		c.mu.Unlock()
+	}()
+
+	c.act.QuiesceGRPC(true)
+	c.act.QuiesceResolver(true)
+	if err := c.act.Activate(ctx, gen); err != nil {
+		c.act.QuiesceResolver(false)
+		c.act.QuiesceGRPC(false)
+		return fmt.Errorf("reactivate %s: %w", gen.ID, err)
+	}
+	c.act.SetActive(gen)
+	c.act.QuiesceResolver(false)
+	c.act.QuiesceGRPC(false)
+	c.mu.Lock()
+	c.current = gen
+	c.mu.Unlock()
+	return nil
 }
 
 // SetCurrent overrides the controller's notion of the live generation. The
@@ -135,43 +182,53 @@ func (c *Controller) run(ctx context.Context, prev, next Generation) error {
 		return fmt.Errorf("await ready %s: %w", next.ID, err)
 	}
 
-	// 2. Gateway begins the admission hold BEFORE the old generation is
-	//    stopped. Otherwise new requests keep routing to the old generation
-	//    while systemctl stop is closing its listeners — gRPC calls hit a dead
-	//    upstream and resolver requests get a 502 from the reverse proxy. With
-	//    the hold in place first, gRPC is refused with retryable Unavailable
-	//    (the control plane retries) and resolver requests wait for resume, so
-	//    the whole drain+activate window is failure-free. Keeping it short is a
-	//    function of drain speed (bounded generation shutdown).
-	c.act.Quiesce(true)
+	// 2. Hold gRPC BEFORE stopping the old generation: otherwise new calls keep
+	//    routing to it while systemctl stop closes its listeners and hit a dead
+	//    upstream. gRPC is refused with retryable Unavailable (the control plane
+	//    retries). The resolver is deliberately NOT held here — it is read-only,
+	//    so the old generation keeps answering lookups while it drains.
+	c.act.QuiesceGRPC(true)
 
 	// 3. Drain the old generation and let it exit, releasing the writer lease.
 	if prev.ID != "" {
 		if err := c.act.DrainAndStop(ctx, prev); err != nil {
 			_ = c.act.DrainAndStop(ctx, next) // clean up the unused standby
-			c.act.Quiesce(false)
+			c.act.QuiesceGRPC(false)
 			return fmt.Errorf("drain %s: %w", prev.ID, err)
 		}
 	}
 
-	// 4. New generation acquires the lease, builds its active runtime,
-	//    revalidates host state, and becomes ready. On failure, roll back.
+	// 4. Now hold the resolver too — only for the brief activation window.
+	c.act.QuiesceResolver(true)
+
+	// 5. New generation acquires the lease, builds its active runtime,
+	//    revalidates host state, and becomes ready. On failure, roll back —
+	//    and stay fail-closed (holds ON) if the rollback itself fails, rather
+	//    than releasing traffic onto a dead upstream.
 	if err := c.act.Activate(ctx, next); err != nil {
-		c.rollback(ctx, next, prev)
-		c.act.Quiesce(false)
+		if rbErr := c.rollback(ctx, next, prev); rbErr != nil {
+			return fmt.Errorf("activate %s failed; rollback failed, holding traffic: %v; %w", next.ID, rbErr, err)
+		}
+		c.act.QuiesceResolver(false)
+		c.act.QuiesceGRPC(false)
 		return fmt.Errorf("activate %s: %w", next.ID, err)
 	}
 
-	// 5. Gateway atomically switches and releases the held requests.
+	// 6. Gateway atomically switches and releases the held requests.
 	c.act.SetActive(next)
-	c.act.Quiesce(false)
+	c.act.QuiesceResolver(false)
+	c.act.QuiesceGRPC(false)
 
-	// 6. Watch the new generation settle BEFORE committing it as current, so a
+	// 7. Watch the new generation settle BEFORE committing it as current, so a
 	//    poller sees the deploy land only once it is stably serving.
 	if err := c.act.Stabilize(ctx, next); err != nil {
-		c.act.Quiesce(true)
-		c.rollback(ctx, next, prev)
-		c.act.Quiesce(false)
+		c.act.QuiesceGRPC(true)
+		c.act.QuiesceResolver(true)
+		if rbErr := c.rollback(ctx, next, prev); rbErr != nil {
+			return fmt.Errorf("stabilize %s failed; rollback failed, holding traffic: %v; %w", next.ID, rbErr, err)
+		}
+		c.act.QuiesceResolver(false)
+		c.act.QuiesceGRPC(false)
 		return fmt.Errorf("stabilize %s: %w", next.ID, err)
 	}
 
@@ -181,19 +238,24 @@ func (c *Controller) run(ctx context.Context, prev, next Generation) error {
 	return nil
 }
 
-// rollback recovers to the previous generation. The failed new generation may
-// still hold the writer lease (it activated, or partially did), so it is
-// stopped FIRST — releasing the lease — before the previous generation is
-// restarted as a fresh process and the gateway is repointed at it.
-func (c *Controller) rollback(ctx context.Context, next, prev Generation) {
-	_ = c.act.DrainAndStop(ctx, next) // release the lease the failed gen may hold
+// rollback recovers to the previous generation and returns an error if it could
+// not — the caller then stays fail-closed (traffic held) rather than releasing
+// onto a dead upstream. The failed new generation may still hold the writer
+// lease, so it is stopped FIRST (releasing the lease) before the previous
+// generation is restarted and the gateway repointed at it.
+func (c *Controller) rollback(ctx context.Context, next, prev Generation) error {
+	if err := c.act.DrainAndStop(ctx, next); err != nil {
+		return fmt.Errorf("stop failed generation %s: %w", next.ID, err)
+	}
 	if prev.ID == "" {
-		return
+		return errors.New("no previous generation to restore")
 	}
-	if err := c.act.Rollback(ctx, prev); err == nil {
-		c.act.SetActive(prev)
-		c.mu.Lock()
-		c.current = prev
-		c.mu.Unlock()
+	if err := c.act.Rollback(ctx, prev); err != nil {
+		return fmt.Errorf("restore %s: %w", prev.ID, err)
 	}
+	c.act.SetActive(prev)
+	c.mu.Lock()
+	c.current = prev
+	c.mu.Unlock()
+	return nil
 }

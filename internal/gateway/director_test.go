@@ -113,14 +113,14 @@ func TestGatewayTransparentProxy(t *testing.T) {
 	}
 
 	// Quiesce → retryable Unavailable.
-	gw.Router().Quiesce(true)
+	gw.Router().QuiesceGRPC(true)
 	_, err = client.Check(ctx, &healthpb.HealthCheckRequest{Service: "svc"})
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("Check while quiescing = %v, want Unavailable", err)
 	}
 
 	// Resume → serving again.
-	gw.Router().Quiesce(false)
+	gw.Router().QuiesceGRPC(false)
 	if _, err := client.Check(ctx, &healthpb.HealthCheckRequest{Service: "svc"}); err != nil {
 		t.Fatalf("Check after resume: %v", err)
 	}

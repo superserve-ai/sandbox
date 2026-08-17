@@ -496,7 +496,11 @@ def main() -> int:
             # lasts until reboot. To clear it by hand:
             #   systemctl set-property --runtime sandboxes.slice CPUWeight=100 IOWeight=100
             sudo systemctl set-property --runtime sandboxes.slice CPUWeight=400 IOWeight=400 2>/dev/null || true
-            sudo systemctl enable --quiet superserve-vmd.socket
+            # Don't (re-)enable the legacy socket on a bootstrapped host — the
+            # gateway owns the port and the bootstrap disabled it deliberately.
+            if [ ! -f /etc/sandbox/gateway-topology ]; then
+                sudo systemctl enable --quiet superserve-vmd.socket
+            fi
             sudo systemctl enable --now --quiet superserve-maintenance-watch.timer
             # Delegated cgroup subtree for direct-spawn VMs. Enable for boot, but
             # START only when the delegated root has no child cgroups yet (fresh /
@@ -1030,33 +1034,42 @@ def main() -> int:
                     echo "migrated backup journal: $OLD_BACKUP_JOURNAL_PATH -> $NEW_BACKUP_JOURNAL_PATH"
                 fi
             fi
-            if [ "$SOCKET_CHANGED" = 1 ]; then
-                # Socket unit changed: rebind so the new ListenStream/options
-                # apply. Brief refused window, but only on the rare deploy that
-                # edits the socket file. Steady state keeps the socket up so
-                # connections backlog across the vmd swap instead of refusing.
-                sudo systemctl restart superserve-vmd.socket
+            if [ -f /etc/sandbox/gateway-topology ]; then
+                # Bootstrapped host: the gateway owns the public ports and the
+                # legacy service is fenced off, so restarting it would fail. Roll
+                # out the freshly-installed version as a blue-green generation
+                # handoff instead. vmd-handoff exits non-zero if the cutover fails.
+                echo "gateway topology detected — deploying generation {sha} via handoff"
+                sudo {install_dir}/vmd-handoff {sha}
             else
-                sudo systemctl start superserve-vmd.socket
+                if [ "$SOCKET_CHANGED" = 1 ]; then
+                    # Socket unit changed: rebind so the new ListenStream/options
+                    # apply. Brief refused window, but only on the rare deploy that
+                    # edits the socket file. Steady state keeps the socket up so
+                    # connections backlog across the vmd swap instead of refusing.
+                    sudo systemctl restart superserve-vmd.socket
+                else
+                    sudo systemctl start superserve-vmd.socket
+                fi
+                # `restart`, not `start`: the socket unit stays active through
+                # the whole block above by design (zero-downtime — connections
+                # backlog instead of refusing), so a connection arriving during
+                # the stop window can already have made systemd reactivate
+                # {service} against the pre-migration vmd.env. `start` is a
+                # no-op against an already-active unit and would leave that
+                # reactivated process running on the old path indefinitely;
+                # `restart` guarantees the process running once this script
+                # exits is always the one reading the final, fully-migrated
+                # config, whether or not a reactivation race occurred.
+                sudo systemctl restart {service}
+                sleep 3
+                sudo systemctl is-active --quiet {service} || (
+                    echo "ERROR: {service} failed to become active after restart" >&2
+                    sudo systemctl status --no-pager {service} >&2 || true
+                    sudo journalctl -u {service} --no-pager -n 40 >&2 || true
+                    exit 1
+                )
             fi
-            # `restart`, not `start`: the socket unit stays active through
-            # the whole block above by design (zero-downtime — connections
-            # backlog instead of refusing), so a connection arriving during
-            # the stop window can already have made systemd reactivate
-            # {service} against the pre-migration vmd.env. `start` is a
-            # no-op against an already-active unit and would leave that
-            # reactivated process running on the old path indefinitely;
-            # `restart` guarantees the process running once this script
-            # exits is always the one reading the final, fully-migrated
-            # config, whether or not a reactivation race occurred.
-            sudo systemctl restart {service}
-            sleep 3
-            sudo systemctl is-active --quiet {service} || (
-                echo "ERROR: {service} failed to become active after restart" >&2
-                sudo systemctl status --no-pager {service} >&2 || true
-                sudo journalctl -u {service} --no-pager -n 40 >&2 || true
-                exit 1
-            )
             # {service} is confirmed active on the final config: disarm the
             # journal-migration recovery trap (a no-op if it was never
             # armed this run). Anything past this point is unrelated to the

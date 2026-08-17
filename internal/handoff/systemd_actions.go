@@ -14,7 +14,8 @@ import (
 // controller runs inside the gateway process, so these are direct in-process
 // calls, not socket round-trips.
 type GatewayController interface {
-	Quiesce(on bool)
+	QuiesceGRPC(on bool)
+	QuiesceResolver(on bool)
 	SetActive(gen Generation)
 }
 
@@ -106,8 +107,11 @@ func (a *SystemdActions) AwaitReady(ctx context.Context, next Generation) error 
 	return nil
 }
 
-// Quiesce toggles the gateway admission hold (in-process).
-func (a *SystemdActions) Quiesce(on bool) { a.Gateway.Quiesce(on) }
+// QuiesceGRPC toggles the gateway's control-plane admission hold (in-process).
+func (a *SystemdActions) QuiesceGRPC(on bool) { a.Gateway.QuiesceGRPC(on) }
+
+// QuiesceResolver toggles the gateway's resolver admission hold (in-process).
+func (a *SystemdActions) QuiesceResolver(on bool) { a.Gateway.QuiesceResolver(on) }
 
 // DrainAndStop stops the previous generation. systemctl stop blocks until the
 // unit is inactive — the generation drains, flushes, and exits, which releases
