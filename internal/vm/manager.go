@@ -2502,6 +2502,30 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, ctx.Err()
 	}
 	tSemAcquired := time.Now()
+	// Failed restores return before the first-attempt success block below
+	// records the setup phases; emit whichever stages completed (elapsed for
+	// the in-flight one) so failed attempts — which can consume most of the
+	// restore deadline — form the phase tails instead of vanishing.
+	restorePhasesRecorded := false
+	var tDiskReady, tNetReady, tFcReady time.Time
+	defer func() {
+		if restorePhasesRecorded {
+			return
+		}
+		phases := map[string]time.Duration{"entry_to_sem": tSemAcquired.Sub(tEntry)}
+		switch {
+		case tDiskReady.IsZero():
+			phases["sem_to_disk"] = time.Since(tSemAcquired)
+		case tNetReady.IsZero():
+			phases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
+			phases["disk_to_net"] = time.Since(tDiskReady)
+		default:
+			phases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
+			phases["disk_to_net"] = tNetReady.Sub(tDiskReady)
+			phases["net_to_fc"] = time.Since(tNetReady)
+		}
+		m.recordPhases("restore", "", phases)
+	}()
 	// Cold/hot segmentation tags for the phase log, sampled once (not per
 	// attempt): concurrency, template-cache age, and host CPU/mem pressure.
 	// warmthPath is the file that actually drives fault-in — for a layered
@@ -2631,7 +2655,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		m.setStatus(vmID, StatusError)
 		return nil, diskErr
 	}
-	tDiskReady := time.Now()
+	tDiskReady = time.Now()
 
 	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
@@ -2677,7 +2701,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			hostIP = netInfo.HostIP
 			nsName = netInfo.Namespace
 		}
-		tNetReady := time.Now()
+		tNetReady = time.Now()
 
 		// Publish all the network/disk/socket fields before starting Firecracker
 		// so the in-memory view is consistent for concurrent readers.
@@ -2722,7 +2746,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.PID = pid
 		inst.Supervision = supervision
 		inst.mu.Unlock()
-		tFcReady := time.Now()
+		tFcReady = time.Now()
 
 		// Attempts after the first measure from the attempt start, so a retry's
 		// disk_to_net_ms doesn't absorb the whole failed previous attempt.
@@ -2745,6 +2769,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Int("attempt", attempt).
 			Msg("restoring snapshot")
 		if attempt == 1 {
+			restorePhasesRecorded = true
 			m.recordPhases("restore", "", map[string]time.Duration{
 				"entry_to_sem": tSemAcquired.Sub(tEntry),
 				"sem_to_disk":  tDiskReady.Sub(tSemAcquired),
