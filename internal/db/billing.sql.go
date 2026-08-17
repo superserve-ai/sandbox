@@ -425,6 +425,37 @@ func (q *Queries) GetBillingUsageExportByIdempotencyKey(ctx context.Context, str
 	return i, err
 }
 
+const getBillingUsageExportByIdentifier = `-- name: GetBillingUsageExportByIdentifier :one
+SELECT id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
+FROM billing_usage_export
+WHERE stripe_meter_event_identifier = $1
+ORDER BY created_at DESC, id DESC
+LIMIT 1
+`
+
+func (q *Queries) GetBillingUsageExportByIdentifier(ctx context.Context, stripeMeterEventIdentifier string) (BillingUsageExport, error) {
+	row := q.db.QueryRow(ctx, getBillingUsageExportByIdentifier, stripeMeterEventIdentifier)
+	var i BillingUsageExport
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.ResourceType,
+		&i.StripeCustomerID,
+		&i.StripeMeterEventIdentifier,
+		&i.StripeEventName,
+		&i.Value,
+		&i.Status,
+		&i.Error,
+		&i.CreatedAt,
+		&i.SentAt,
+		&i.UpdatedAt,
+		&i.StripeIdempotencyKey,
+	)
+	return i, err
+}
+
 const getStripeWebhookEvent = `-- name: GetStripeWebhookEvent :one
 SELECT event_id, event_type, payload, received_at, processed_at, last_error, updated_at
 FROM stripe_webhook_event
@@ -1719,7 +1750,7 @@ UPDATE billing_usage_export
 SET stripe_idempotency_key = $1,
     updated_at = now()
 WHERE id = $2
-  AND stripe_idempotency_key IS NULL
+  AND (stripe_idempotency_key IS NULL OR stripe_idempotency_key = stripe_meter_event_identifier)
 RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
 `
 

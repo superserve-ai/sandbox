@@ -1073,7 +1073,7 @@ func (h *Handlers) ExportTeamBillingPeriod(c *gin.Context) {
 			continue
 		}
 		idempotencyKey := derefString(row.StripeIdempotencyKey)
-		if idempotencyKey == "" {
+		if idempotencyKey == "" || idempotencyKey == row.StripeMeterEventIdentifier {
 			idempotencyKey = stripeMeterEventIdempotencyKey(row.StripeMeterEventIdentifier, row.StripeEventName, derefString(row.StripeCustomerID), meterValue, periodEnd.UTC().Add(-time.Second).Unix())
 			_, setErr := h.DB.SetBillingUsageExportIdempotencyKey(ctx, db.SetBillingUsageExportIdempotencyKeyParams{
 				ID:                   row.ID,
@@ -1606,6 +1606,11 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 			row, lookupErr := q.GetBillingUsageExportByIdempotencyKey(ctx, stringPtr(requestKey))
 			if lookupErr == nil {
 				identifier = row.StripeMeterEventIdentifier
+			} else if errors.Is(lookupErr, pgx.ErrNoRows) {
+				row, lookupErr = q.GetBillingUsageExportByIdentifier(ctx, requestKey)
+				if lookupErr == nil {
+					identifier = row.StripeMeterEventIdentifier
+				}
 			}
 		}
 		if identifier == "" {

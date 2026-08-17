@@ -527,7 +527,7 @@ UPDATE billing_usage_export
 SET stripe_idempotency_key = sqlc.arg(stripe_idempotency_key),
     updated_at = now()
 WHERE id = sqlc.arg(id)
-  AND stripe_idempotency_key IS NULL
+  AND (stripe_idempotency_key IS NULL OR stripe_idempotency_key = stripe_meter_event_identifier)
 RETURNING *;
 
 -- name: ListBillingUsageExportsForPeriod :many
@@ -542,6 +542,13 @@ ORDER BY created_at ASC, id ASC;
 SELECT *
 FROM billing_usage_export
 WHERE stripe_idempotency_key = sqlc.arg(stripe_idempotency_key)
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+
+-- name: GetBillingUsageExportByIdentifier :one
+SELECT *
+FROM billing_usage_export
+WHERE stripe_meter_event_identifier = sqlc.arg(stripe_meter_event_identifier)
 ORDER BY created_at DESC, id DESC
 LIMIT 1;
 
