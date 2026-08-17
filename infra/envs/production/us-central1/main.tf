@@ -45,14 +45,15 @@ resource "google_project_service" "monitoring" {
 }
 
 locals {
-  project_id                = var.project_id
-  environment               = var.environment
-  region                    = var.region
-  zone                      = var.zone
-  resource_suffix           = coalesce(var.resource_suffix, var.environment)
-  service_account_suffix    = coalesce(var.service_account_suffix, local.resource_suffix)
-  api_sa_key                = "superserve_api"
-  api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
+  project_id                        = var.project_id
+  environment                       = var.environment
+  region                            = var.region
+  zone                              = var.zone
+  resource_suffix                   = coalesce(var.resource_suffix, var.environment)
+  service_account_suffix            = coalesce(var.service_account_suffix, local.resource_suffix)
+  api_sa_key                        = "superserve_api"
+  api_service_account_email         = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
+  logging_mcp_service_account_email = "superserve-logging-mcp@${local.project_id}.iam.gserviceaccount.com"
 
   common_labels = {
     environment = local.environment
@@ -101,6 +102,11 @@ module "iam" {
       account_id   = "grafana-monitoring"
       display_name = "Grafana Monitoring"
     }
+    logging_mcp = {
+      account_id   = "superserve-logging-mcp"
+      display_name = "Superserve Cloud Logging MCP Reader"
+      description  = "Dedicated read-only identity for AI-assisted Cloud Logging investigation via Google's managed MCP server."
+    }
   }
   project_bindings = {
     production_host_metric_writer = {
@@ -120,6 +126,18 @@ module "iam" {
       role = "roles/browser"
       members = [
         "serviceAccount:grafana-monitoring@${local.project_id}.iam.gserviceaccount.com"
+      ]
+    }
+    logging_mcp_tool_user = {
+      role = "roles/mcp.toolUser"
+      members = [
+        "serviceAccount:${local.logging_mcp_service_account_email}"
+      ]
+    }
+    logging_mcp_logs_viewer = {
+      role = "roles/logging.viewer"
+      members = [
+        "serviceAccount:${local.logging_mcp_service_account_email}"
       ]
     }
   }
