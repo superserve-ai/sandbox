@@ -1159,7 +1159,22 @@ func main() {
 	// BoltDB ↔ systemd comparison only.
 	var reconcilerDB *dbq.Queries
 	if cfg.DatabaseURL != "" {
-		dbPool, dbErr := pgxpool.New(ctx, cfg.DatabaseURL)
+		dbCfg, dbErr := pgxpool.ParseConfig(cfg.DatabaseURL)
+		if dbErr != nil {
+			log.Fatal().Err(dbErr).Msg("failed to parse database URL for reconciler")
+		}
+		// The pgxpool default is max(4, NumCPU), which scales with host cores
+		// and silently consumes the cell pooler's client-connection budget on
+		// large hosts. This pool serves serial reconciler passes and the
+		// batched flow sink (low concurrency by construction), so a small
+		// cap is enough. A ceiling, not a floor: an explicitly lower
+		// pool_max_conns in the URL stays in effect.
+		dbCfg.MaxConns = min(dbCfg.MaxConns, 8)
+		// URL-configured minima above the cap would make the config
+		// invalid and fail startup; lower them with it.
+		dbCfg.MinConns = min(dbCfg.MinConns, dbCfg.MaxConns)
+		dbCfg.MinIdleConns = min(dbCfg.MinIdleConns, dbCfg.MaxConns)
+		dbPool, dbErr := pgxpool.NewWithConfig(ctx, dbCfg)
 		if dbErr != nil {
 			log.Fatal().Err(dbErr).Msg("failed to connect to database for reconciler")
 		}
