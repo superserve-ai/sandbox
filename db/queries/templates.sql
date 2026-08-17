@@ -224,6 +224,12 @@ LIMIT $1;
 -- The claim itself requires the target host to be active WHEN a row for it
 -- exists (a drain landing between the supervisor's pre-check and this claim
 -- must lose the race); a missing row keeps the bootstrap path dispatching.
+-- FOR SHARE serializes the claim against a concurrent drain's row UPDATE:
+-- without the lock, the statement snapshot could predate a drain that
+-- commits mid-claim, and the build would start on the drained host anyway.
+WITH target_host AS (
+    SELECT h.status FROM host h WHERE h.id = $2 FOR SHARE
+)
 UPDATE template_build
 SET status = 'building',
     started_at = now(),
@@ -231,7 +237,7 @@ SET status = 'building',
     vmd_host_id = $2,
     vmd_build_vm_id = $3
 WHERE template_build.id = $1 AND template_build.status = 'pending'
-  AND COALESCE((SELECT h.status = 'active' FROM host h WHERE h.id = $2), true);
+  AND COALESCE((SELECT th.status = 'active' FROM target_host th), true);
 
 -- name: ListActiveBuilds :many
 -- Read-only: builds the supervisor is currently watching. Used per tick to

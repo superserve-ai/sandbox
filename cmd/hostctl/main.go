@@ -108,8 +108,11 @@ func (c client) list() error {
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 	// BUSY counts pausing/resuming sandboxes and BUILDS counts in-flight
 	// template builds — both mean a lifecycle RPC or build VM is still using
-	// the host. A host is not drained until RUNNING, BUSY, and BUILDS are
-	// all zero.
+	// the host. RUNNING+BUSY+BUILDS at zero means DRAINED: no new work will
+	// land. It does NOT mean safe to retire: PAUSED sandboxes' snapshots
+	// live on the host's local disk and resume is pinned to it, so retiring
+	// the machine strands every one of them. Until cross-host restore
+	// exists, retirement additionally requires PAUSED = 0.
 	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED")
 	for _, h := range out.Hosts {
 		beat := "never"

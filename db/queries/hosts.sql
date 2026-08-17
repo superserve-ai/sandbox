@@ -33,9 +33,14 @@ SELECT * FROM host WHERE id = $1 FOR UPDATE;
 -- name: UpdateHostAddresses :exec
 -- Re-provision path: the identity is reclaiming its row from a new address
 -- after the old holder went silent. Guarded by the handler's staleness check.
+-- The reclaim DEMOTES the row to provisioning in the same statement: an
+-- address change is a re-registration, and every holder of the vmd-internal
+-- token can trigger one after two minutes of silence — it must never leave
+-- (or make) a host schedulable without the operator credential re-approving.
 UPDATE host
 SET vmd_addr = $2, proxy_addr = $3, region = $4,
-    capacity_memory_mib = $5, capacity_vcpus = $6, updated_at = now()
+    capacity_memory_mib = $5, capacity_vcpus = $6,
+    status = 'provisioning', updated_at = now()
 WHERE id = $1;
 
 -- name: UpdateHostStatus :one

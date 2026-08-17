@@ -31,9 +31,15 @@ type DialFunc func(hostID, addr string, onDead func()) (vmdclient.Client, error)
 const addrRecheckTTL = 30 * time.Second
 
 type entry struct {
-	client    vmdclient.Client
-	addr      string
-	checkedAt time.Time
+	client vmdclient.Client
+	addr   string
+	// checkedAt paces verification (bumped by the failure backoff too);
+	// verifiedAt records the last SUCCESSFUL row verification and is the
+	// clock the serve-stale lease runs on. They must stay separate: if the
+	// backoff bumped the lease clock, sustained read failures would extend
+	// the lease forever and "stale" would never fail closed.
+	checkedAt  time.Time
+	verifiedAt time.Time
 }
 
 // Registry maps host IDs to VMD clients, cached on first use.
@@ -82,6 +88,16 @@ func (r *Registry) verifyFailureBackoff() time.Duration {
 	return 5 * time.Second
 }
 
+// unverifiedLease bounds how long a client may be dispatched without a
+// successful row verification when reads are failing. Within the lease a
+// read blip serves the cached client (availability); past it dispatch fails
+// closed — another replica may have reclaimed the identity, and "we could
+// not check" must not mean "forever" (a sustained DB problem would
+// otherwise keep routing to a machine that lost the identity indefinitely).
+func (r *Registry) unverifiedLease() time.Duration {
+	return 2 * r.recheckTTL()
+}
+
 // ClientFor returns the VMD client for the given host. A cached client
 // within its verification window is returned as-is; anything else — first
 // use, or a client past the recheck TTL — resolves against the host row
@@ -92,6 +108,14 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 	e, ok := r.clients[hostID]
 	r.mu.RUnlock()
 	if ok && time.Since(e.checkedAt) < r.recheckTTL() {
+		if time.Since(e.checkedAt) >= r.recheckTTL()*4/5 {
+			// Refresh ahead of expiry: warm traffic re-verifies in the
+			// background while still being served fresh, so the blocking
+			// due-verification read almost never lands on a request.
+			// Singleflight dedupes the window's callers; the generation
+			// guard keeps the async result safe.
+			go func() { _, _ = r.resolveClient(context.WithoutCancel(ctx), hostID) }()
+		}
 		return e.client, nil
 	}
 	return r.resolveClient(ctx, hostID)
@@ -113,7 +137,7 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 		// Detached context: singleflight followers share the leader's
 		// result, so the leader's per-request cancellation must not decide
 		// the resolution for everyone behind it.
-		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 		defer cancel()
 
 		var lastErr error
@@ -134,19 +158,20 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				// the machine that lost the identity.
 				r.mu.Lock()
 				e, ok := r.clients[hostID]
-				if ok {
+				withinLease := ok && time.Since(e.verifiedAt) < r.unverifiedLease()
+				if withinLease {
 					// Bounded backoff: leave the entry "fresh" for a short
 					// window so a degraded DB is retried on a pace, not on
-					// every call. An invalidation still cuts through — it
-					// deletes the entry, and this bump only touches one
-					// that survived.
+					// every call. Bumps checkedAt only — verifiedAt (the
+					// lease clock) advances solely on successful reads, so
+					// sustained failure runs the lease out and fails closed.
 					e.checkedAt = time.Now().Add(r.verifyFailureBackoff() - r.recheckTTL())
 					r.clients[hostID] = e
 				}
 				r.mu.Unlock()
-				if ok {
+				if withinLease {
 					log.Warn().Err(err).Str("host_id", hostID).
-						Msg("host address verification failed; dispatching via cached client")
+						Msg("host address verification failed; dispatching via cached client within lease")
 					return e.client, nil
 				}
 				lastErr = err
@@ -163,7 +188,8 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				continue // invalidated mid-read; re-read the row
 			}
 			if e, ok := r.clients[hostID]; ok && e.addr == host.VmdAddr {
-				e.checkedAt = time.Now()
+				now := time.Now()
+				e.checkedAt, e.verifiedAt = now, now
 				r.clients[hostID] = e
 				r.mu.Unlock()
 				return e.client, nil
@@ -193,7 +219,8 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				r.mu.Unlock()
 				continue
 			}
-			r.clients[hostID] = entry{client: c, addr: host.VmdAddr, checkedAt: time.Now()}
+			now := time.Now()
+			r.clients[hostID] = entry{client: c, addr: host.VmdAddr, checkedAt: now, verifiedAt: now}
 			r.mu.Unlock()
 			return c, nil
 		}

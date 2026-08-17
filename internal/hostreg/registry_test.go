@@ -191,8 +191,9 @@ func TestClientForColdDialRacedByInvalidateReturnsNewestAddress(t *testing.T) {
 }
 
 // A transient read failure with NO invalidation keeps the availability
-// softness: the still-cached client is returned rather than failing the op.
-func TestClientForServesCachedOnReadBlipWithoutInvalidation(t *testing.T) {
+// softness while the last successful verification is within the lease: the
+// still-cached client is returned rather than failing the op.
+func TestClientForServesCachedOnReadBlipWithinLease(t *testing.T) {
 	store := &hostDB{addr: "10.0.0.1:50051"}
 	var dials atomic.Int64
 	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
@@ -200,18 +201,99 @@ func TestClientForServesCachedOnReadBlipWithoutInvalidation(t *testing.T) {
 		return nil, nil
 	}
 	r := New(db.New(store), dial)
-	r.recheck = time.Millisecond
+	r.recheck = 100 * time.Millisecond // lease = 200ms
 
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	time.Sleep(5 * time.Millisecond)
+	// Verification due (checkedAt aged), but the last successful
+	// verification is recent: within the lease.
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.checkedAt = time.Now().Add(-150 * time.Millisecond)
+	r.clients["host-a"] = e
+	r.mu.Unlock()
 	store.setFailRead(true)
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
-		t.Fatalf("read blip must serve the cached client, got error: %v", err)
+		t.Fatalf("read blip within lease must serve the cached client, got error: %v", err)
 	}
 	if dials.Load() != 1 {
 		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+}
+
+// Past the unverified lease, a failing row read fails CLOSED: "we could not
+// check" must not keep dispatching forever to a machine that may have lost
+// the identity. Recovery is immediate once reads succeed again.
+func TestClientForFailsClosedPastUnverifiedLease(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = 100 * time.Millisecond // lease = 200ms
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.checkedAt = time.Now().Add(-300 * time.Millisecond)
+	e.verifiedAt = time.Now().Add(-300 * time.Millisecond)
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+	store.setFailRead(true)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("read failure past the lease must fail closed, got a client")
+	}
+	store.setFailRead(false)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("recovery after reads resume: %v", err)
+	}
+}
+
+// Inside the last fifth of the verification window, a fresh call triggers a
+// background refresh so the blocking due-verification read almost never
+// lands on a request.
+func TestClientForRefreshesAheadOfExpiry(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = 300 * time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	reads := store.readCount()
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.checkedAt = time.Now().Add(-250 * time.Millisecond) // >80%, still fresh
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("fresh call in refresh-ahead window: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for store.readCount() < reads+1 {
+		if time.Now().After(deadline) {
+			t.Fatal("background refresh never read the row")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// The refresh renewed the entry: an immediate call neither reads nor dials.
+	after := store.readCount()
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("post-refresh call: %v", err)
+	}
+	if store.readCount() != after || dials.Load() != 1 {
+		t.Fatalf("post-refresh reads/dials = %d/%d, want %d/1", store.readCount(), dials.Load(), after)
 	}
 }
 

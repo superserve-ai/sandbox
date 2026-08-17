@@ -132,7 +132,21 @@ func TestIntegration_HostRegistration_IdentityConflictAndReclaim(t *testing.T) {
 		t.Fatalf("conflict must not rewrite vmd_addr, got %s", host.VmdAddr)
 	}
 
-	// Holder goes silent past the unhealthy threshold → identity released.
+	// Activate the holder so the reclaim's demotion below is meaningful.
+	areq := httptest.NewRequest("POST", "/internal/hosts/"+hostID+"/status",
+		strings.NewReader(`{"status":"active"}`))
+	areq.Header.Set("Content-Type", "application/json")
+	areq.Header.Set("Authorization", "Bearer optok-hostreg")
+	aw := httptest.NewRecorder()
+	r.ServeHTTP(aw, areq)
+	if aw.Code != http.StatusOK {
+		t.Fatalf("activate holder: %d %s", aw.Code, aw.Body.String())
+	}
+
+	// Holder goes silent past the unhealthy threshold → identity released,
+	// but the claimant must NOT inherit the active status: every vmd shares
+	// the internal token, so a reclaim is a re-registration that demotes to
+	// provisioning until the operator re-approves.
 	if _, err := testPool.Exec(ctx,
 		`UPDATE host SET last_heartbeat_at = now() - interval '3 minutes' WHERE id = $1`,
 		hostID); err != nil {
@@ -144,6 +158,9 @@ func TestIntegration_HostRegistration_IdentityConflictAndReclaim(t *testing.T) {
 	host, _ = testQueries.GetHost(ctx, hostID)
 	if host.VmdAddr != "10.9.0.8:50051" {
 		t.Fatalf("reclaim must update vmd_addr, got %s", host.VmdAddr)
+	}
+	if host.Status != "provisioning" {
+		t.Fatalf("reclaimed identity status = %s, want provisioning (no self-approval)", host.Status)
 	}
 }
 

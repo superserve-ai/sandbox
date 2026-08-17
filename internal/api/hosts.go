@@ -201,11 +201,18 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		log.Info().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
 			Str("region", req.Region).Msg("host self-registered as provisioning")
 	}
-	if reclaimed && h.Hosts != nil {
-		// The row's vmd_addr changed; a cached client still dials the old
-		// machine (the registry only self-evicts on dead transports, and a
-		// live old daemon would silently take the wrong host's RPCs).
-		h.Hosts.Invalidate(hostID)
+	if reclaimed {
+		if h.Hosts != nil {
+			// The row's vmd_addr changed; a cached client still dials the old
+			// machine (the registry only self-evicts on dead transports, and a
+			// live old daemon would silently take the wrong host's RPCs).
+			h.Hosts.Invalidate(hostID)
+		}
+		if h.Scheduler != nil {
+			// The reclaim demoted the row to provisioning; a previously
+			// active host must leave the candidate set now, not at TTL.
+			h.Scheduler.Invalidate()
+		}
 	}
 	if prevStatus == "unhealthy" && status == "active" {
 		// The heartbeat just recovered this host; drop the scheduler's cached

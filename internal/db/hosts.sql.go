@@ -532,7 +532,8 @@ func (q *Queries) RegisterHost(ctx context.Context, arg RegisterHostParams) (Hos
 const updateHostAddresses = `-- name: UpdateHostAddresses :exec
 UPDATE host
 SET vmd_addr = $2, proxy_addr = $3, region = $4,
-    capacity_memory_mib = $5, capacity_vcpus = $6, updated_at = now()
+    capacity_memory_mib = $5, capacity_vcpus = $6,
+    status = 'provisioning', updated_at = now()
 WHERE id = $1
 `
 
@@ -547,6 +548,10 @@ type UpdateHostAddressesParams struct {
 
 // Re-provision path: the identity is reclaiming its row from a new address
 // after the old holder went silent. Guarded by the handler's staleness check.
+// The reclaim DEMOTES the row to provisioning in the same statement: an
+// address change is a re-registration, and every holder of the vmd-internal
+// token can trigger one after two minutes of silence — it must never leave
+// (or make) a host schedulable without the operator credential re-approving.
 func (q *Queries) UpdateHostAddresses(ctx context.Context, arg UpdateHostAddressesParams) error {
 	_, err := q.db.Exec(ctx, updateHostAddresses,
 		arg.ID,
