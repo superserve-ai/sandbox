@@ -105,8 +105,26 @@ func TestSelectHostFallbackRefusesNonActiveDefault(t *testing.T) {
 	}
 }
 
+// The fallback status is resolved once per cache fill, not per create: in
+// bootstrap mode the SWR cache must keep eliminating per-create DB I/O.
+func TestSelectHostFallbackStatusIsCached(t *testing.T) {
+	mock := &fallbackProbe{row: schedulerErrorRow{err: pgx.ErrNoRows}}
+	s := &LeastLoaded{DB: db.New(mock), DefaultHostID: "default", TTL: time.Minute}
+	for i := 0; i < 5; i++ {
+		if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "default" {
+			t.Fatalf("select %d: got (%q, %v)", i, id, err)
+		}
+	}
+	if got := mock.rowCalls.Load(); got != 1 {
+		t.Fatalf("GetHost calls = %d, want 1 (per fill, not per create)", got)
+	}
+}
+
 // fallbackProbe returns zero active hosts and serves GetHost from a canned row.
-type fallbackProbe struct{ row pgx.Row }
+type fallbackProbe struct {
+	row      pgx.Row
+	rowCalls atomic.Int64
+}
 
 func (f *fallbackProbe) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec")
@@ -114,7 +132,10 @@ func (f *fallbackProbe) Exec(context.Context, string, ...any) (pgconn.CommandTag
 func (f *fallbackProbe) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	return schedulerEmptyRows{}, nil
 }
-func (f *fallbackProbe) QueryRow(context.Context, string, ...any) pgx.Row { return f.row }
+func (f *fallbackProbe) QueryRow(context.Context, string, ...any) pgx.Row {
+	f.rowCalls.Add(1)
+	return f.row
+}
 
 func TestLeastLoadedQueryExcludesHostsWithoutPreviewEnforcement(t *testing.T) {
 	capture := &queryCapture{}

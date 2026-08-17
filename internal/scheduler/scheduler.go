@@ -50,6 +50,11 @@ type LeastLoaded struct {
 type hostCacheEntry struct {
 	hosts    []db.ListActiveHostsByLoadRow
 	cachedAt time.Time
+	// defaultStatus is the DefaultHostID row's status, resolved at fill time
+	// only when hosts is empty — so the fallback decision in SelectHost never
+	// queries on the per-create path. "missing" = no row (bootstrap mode,
+	// fallback allowed); "" = not resolved (candidates exist or no default).
+	defaultStatus string
 }
 
 func (s *LeastLoaded) ttl() time.Duration {
@@ -60,29 +65,30 @@ func (s *LeastLoaded) ttl() time.Duration {
 }
 
 func (s *LeastLoaded) SelectHost(ctx context.Context, requiredCapabilities []string) (string, error) {
-	hosts, err := s.loadHosts(ctx, requiredCapabilities)
+	entry, err := s.loadHosts(ctx, requiredCapabilities)
 	if err != nil {
 		return "", err
 	}
+	hosts := entry.hosts
 	if len(hosts) == 0 {
 		if s.DefaultHostID != "" {
 			// The legacy fallback exists so creation works before the host
 			// table is populated. It must not route to a row that exists in
 			// a non-active state — a freshly self-registered 'provisioning'
 			// host under the default ID would take traffic before an
-			// operator activates it.
-			host, err := s.DB.GetHost(ctx, s.DefaultHostID)
-			switch {
-			case errors.Is(err, pgx.ErrNoRows):
-				return s.DefaultHostID, nil // unpopulated table: bootstrap path
-			case err != nil:
-				return "", err
-			case host.Status == "active":
+			// operator activates it. The status was resolved at cache-fill
+			// time (fillEntry); status changes invalidate the cache.
+			switch entry.defaultStatus {
+			case "missing": // unpopulated table: bootstrap path
+				return s.DefaultHostID, nil
+			case "active":
 				// Present but filtered out by capabilities; the create-time
 				// capability gate still enforces. Preserves prior behavior.
 				return s.DefaultHostID, nil
+			case "":
+				return "", fmt.Errorf("no active hosts available")
 			default:
-				return "", fmt.Errorf("no active hosts available (default host is %s)", host.Status)
+				return "", fmt.Errorf("no active hosts available (default host is %s)", entry.defaultStatus)
 			}
 		}
 		return "", fmt.Errorf("no active hosts available")
@@ -117,7 +123,30 @@ const hostsStaleGrace = 30 * time.Second
 // included, up to hostsStaleGrace — and refreshes it in the background once
 // the TTL lapses. The first call for a set, a post-Invalidate call, and any
 // call past the grace window block on a fresh load.
-func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []string) ([]db.ListActiveHostsByLoadRow, error) {
+// fillEntry loads the candidate set and, when it comes back empty, resolves
+// the default host's status in the same fill — one query per cache fill, not
+// one per create. Status changes reach the cache through Invalidate.
+func (s *LeastLoaded) fillEntry(ctx context.Context, normalized []string) (hostCacheEntry, error) {
+	hosts, err := s.DB.ListActiveHostsByLoad(ctx, normalized)
+	if err != nil {
+		return hostCacheEntry{}, fmt.Errorf("list active hosts by load: %w", err)
+	}
+	entry := hostCacheEntry{hosts: hosts, cachedAt: time.Now()}
+	if len(hosts) == 0 && s.DefaultHostID != "" {
+		host, err := s.DB.GetHost(ctx, s.DefaultHostID)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			entry.defaultStatus = "missing"
+		case err != nil:
+			return hostCacheEntry{}, fmt.Errorf("get default host %q: %w", s.DefaultHostID, err)
+		default:
+			entry.defaultStatus = host.Status
+		}
+	}
+	return entry, nil
+}
+
+func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []string) (hostCacheEntry, error) {
 	key, normalized := capabilityCacheKey(requiredCapabilities)
 	s.mu.RLock()
 	entry, cached := s.cache[key]
@@ -135,7 +164,7 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 			go func() {
 				defer cancel()
 				defer s.refreshing.Store(false)
-				hosts, err := s.DB.ListActiveHostsByLoad(qctx, normalized)
+				fresh, err := s.fillEntry(qctx, normalized)
 				if err != nil {
 					log.Warn().Err(err).Strs("required_capabilities", normalized).
 						Msg("host list refresh failed; serving stale until the grace window expires")
@@ -148,12 +177,12 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 					if s.cache == nil {
 						s.cache = make(map[string]hostCacheEntry)
 					}
-					s.cache[key] = hostCacheEntry{hosts: hosts, cachedAt: time.Now()}
+					s.cache[key] = fresh
 				}
 				s.mu.Unlock()
 			}()
 		}
-		return entry.hosts, nil
+		return entry, nil
 	}
 
 	s.mu.Lock()
@@ -161,11 +190,11 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	// Double-check: another blocked caller may have reloaded this capability
 	// set while we waited. A past-grace entry is what we are here to replace.
 	if entry, ok := s.cache[key]; ok && time.Since(entry.cachedAt) < s.ttl()+hostsStaleGrace {
-		return entry.hosts, nil
+		return entry, nil
 	}
-	hosts, err := s.DB.ListActiveHostsByLoad(ctx, normalized)
+	fresh, err := s.fillEntry(ctx, normalized)
 	if err != nil {
-		return nil, fmt.Errorf("list active hosts by load: %w", err)
+		return hostCacheEntry{}, err
 	}
 	// Bump the generation so any older in-flight background refresh cannot
 	// land after this blocking load and replace it with an earlier snapshot.
@@ -173,8 +202,8 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	if s.cache == nil {
 		s.cache = make(map[string]hostCacheEntry)
 	}
-	s.cache[key] = hostCacheEntry{hosts: hosts, cachedAt: time.Now()}
-	return hosts, nil
+	s.cache[key] = fresh
+	return fresh, nil
 }
 
 func capabilityCacheKey(capabilities []string) (string, []string) {
