@@ -22,7 +22,10 @@ on:
       - 'cmd/proxy/**'
       - 'internal/proxy/**'
       - 'internal/auth/**'
+      - 'internal/telemetry/**'
       - 'deploy/proxy.service'
+      - '.github/workflows/deploy-proxy.yml'
+      - '.github/workflows/scripts/deploy-proxy.py'
 
 jobs:
   deploy-staging:
