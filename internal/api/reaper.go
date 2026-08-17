@@ -242,6 +242,7 @@ const autoDeleteTeardownTimeout = 2 * time.Minute
 func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDeleteSandboxesRow) {
 	l := log.With().
 		Str("sandbox_id", sbx.ID.String()).
+		Str("host_id", sbx.HostID).
 		Str("team_id", sbx.TeamID.String()).
 		Str("name", sbx.Name).
 		Logger()
@@ -275,6 +276,7 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxesRow) {
 	l := log.With().
 		Str("sandbox_id", sbx.ID.String()).
+		Str("host_id", sbx.HostID).
 		Str("team_id", sbx.TeamID.String()).
 		Str("name", sbx.Name).
 		Logger()
@@ -354,7 +356,7 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 	// retry as the user-facing boots — the background ctx never reads dead,
 	// which is right: a rollback landing late still beats marking the
 	// sandbox failed.
-	ipAddr, _, _, _, err := retryTransientBoot(ctx, sbx.ID.String(), func(rctx context.Context) (string, uint32, uint32, error) {
+	ipAddr, _, _, _, err := retryTransientBoot(ctx, sbx.ID.String(), sbx.HostID, func(rctx context.Context) (string, uint32, uint32, error) {
 		return vmd.ResumeInstance(rctx, sbx.ID.String(), snapshotPath, memPath, sbx.NetworkConfig)
 	})
 	if err != nil {
