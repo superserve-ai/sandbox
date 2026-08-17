@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"cloud.google.com/go/storage"
 	"context"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -354,6 +356,36 @@ func listenUnixClean(path string) (net.Listener, error) {
 	return net.Listen("unix", path)
 }
 
+// serveGenControl serves a generation's control socket. "activate" triggers
+// activation and blocks until the daemon reports the outcome on the reply
+// channel; "status" reports the current phase (preflight/active). This is how
+// the handoff controller drives a generation from preflight to active.
+func serveGenControl(lis net.Listener, activate chan<- chan string, phase *atomic.Value) {
+	for {
+		conn, err := lis.Accept()
+		if err != nil {
+			return // listener closed
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			sc := bufio.NewScanner(c)
+			for sc.Scan() {
+				switch strings.TrimSpace(sc.Text()) {
+				case "activate":
+					reply := make(chan string, 1)
+					activate <- reply
+					fmt.Fprintln(c, <-reply)
+				case "status":
+					p, _ := phase.Load().(string)
+					fmt.Fprintln(c, "OK phase="+p)
+				default:
+					fmt.Fprintln(c, "ERR unknown command")
+				}
+			}
+		}(conn)
+	}
+}
+
 func main() {
 	// Maintenance subcommands run before any daemon setup and exit. They must
 	// not open the state store in write mode or start services.
@@ -470,23 +502,70 @@ func main() {
 		log.Info().Uint64("port", port).Msg("guest DNS redirect enabled")
 	}
 
-	// ---- Host writer lease (generation mode) ----
-	// A gateway-fronted generation (VMD_PRIVATE_SOCKET set) takes the single
-	// writer lease before any host-state mutation below, and holds it for the
-	// life of the process — released only on exit, so at most one generation
-	// ever mutates host state. Legacy startup (no private socket) is unchanged.
+	// ---- Generation preflight + activation (gateway-fronted mode) ----
+	// A gateway-fronted generation (VMD_PRIVATE_SOCKET set) runs in two phases.
+	// PREFLIGHT: bind the private sockets and validate, holding no lease and
+	// mutating no host state, so this runs safely while the previous generation
+	// is still active. It signals readiness and then blocks for an "activate"
+	// command on its control socket. ACTIVATE: take the single writer lease
+	// before any host-state mutation below, held for the life of the process —
+	// released only on exit, so at most one generation is ever the writer.
+	// Legacy startup (no private socket) is unchanged: lis/localLis stay nil
+	// here and are bound in the listener section below.
 	genPrivateSocket := os.Getenv("VMD_PRIVATE_SOCKET")
 	genResolverSocket := os.Getenv("VMD_RESOLVER_SOCKET")
+	genControlSocket := os.Getenv("VMD_GEN_CONTROL_SOCKET")
 	generationID := os.Getenv("VMD_GENERATION_ID")
+	var lis, localLis net.Listener
 	var writerLease *hostlease.WriterLease
+	var activateReply chan string
 	if genPrivateSocket != "" {
+		var lerr error
+		if lis, lerr = listenUnixClean(genPrivateSocket); lerr != nil {
+			log.Fatal().Err(lerr).Str("socket", genPrivateSocket).Msg("preflight: bind gRPC socket")
+		}
+		if genResolverSocket != "" {
+			if localLis, lerr = listenUnixClean(genResolverSocket); lerr != nil {
+				log.Fatal().Err(lerr).Str("socket", genResolverSocket).Msg("preflight: bind resolver socket")
+			}
+		}
+		phase := &atomic.Value{}
+		phase.Store("preflight")
+		activate := make(chan chan string, 1)
+		if genControlSocket != "" {
+			ctlLis, cerr := listenUnixClean(genControlSocket)
+			if cerr != nil {
+				log.Fatal().Err(cerr).Str("socket", genControlSocket).Msg("preflight: bind control socket")
+			}
+			go serveGenControl(ctlLis, activate, phase)
+		}
+		// Preflight-ready. For a Type=notify unit this marks the unit active, so
+		// the controller's "start standby" returns; activation follows on the
+		// control socket while the old generation drains.
+		if err := sdnotify.Ready(); err != nil {
+			log.Warn().Err(err).Msg("sd_notify READY (preflight) failed")
+		}
+		_ = sdnotify.Status("preflight — awaiting activation")
+		log.Info().Str("generation", generationID).Msg("preflight complete — awaiting activation")
+
+		select {
+		case activateReply = <-activate:
+		case <-ctx.Done():
+			log.Info().Msg("cancelled during preflight; exiting")
+			return
+		}
+
 		lockPath := envOrDefault("VMD_WRITER_LOCK", filepath.Join(filepath.Dir(cfg.RunDir), "vmd-writer.lock"))
-		wl, _, lerr := acquireWriterLease(ctx, lockPath, 30*time.Second, log)
-		if lerr != nil {
-			log.Fatal().Err(lerr).Str("lock", lockPath).Msg("failed to acquire host writer lease")
+		wl, _, aerr := acquireWriterLease(ctx, lockPath, 30*time.Second, log)
+		if aerr != nil {
+			if activateReply != nil {
+				activateReply <- "ERR " + aerr.Error()
+			}
+			log.Fatal().Err(aerr).Str("lock", lockPath).Msg("activation: acquire writer lease")
 		}
 		writerLease = wl
-		log.Info().Str("generation", generationID).Str("lock", lockPath).Msg("host writer lease acquired")
+		phase.Store("active")
+		log.Info().Str("generation", generationID).Str("lock", lockPath).Msg("activated — writer lease acquired")
 	}
 
 	// ---- Network manager + host firewall ----
@@ -982,70 +1061,60 @@ func main() {
 	// matching survives reordering, and nil entries (non-listener fds)
 	// must be skipped. Without a socket unit (dev, tests, hosts not yet
 	// migrated) both servers bind directly, exactly as before.
-	var lis, localLis net.Listener
-	if genPrivateSocket != "" {
-		// Generation mode: the gateway owns the public ports and routes to these
-		// private unix sockets, so bind them directly and skip socket activation.
-		var lerr error
-		if lis, lerr = listenUnixClean(genPrivateSocket); lerr != nil {
-			log.Fatal().Err(lerr).Str("socket", genPrivateSocket).Msg("failed to bind private gRPC socket")
-		}
-		if genResolverSocket != "" {
-			if localLis, lerr = listenUnixClean(genResolverSocket); lerr != nil {
-				log.Fatal().Err(lerr).Str("socket", genResolverSocket).Msg("failed to bind private resolver socket")
-			}
-		}
-		log.Info().Str("grpc", genPrivateSocket).Str("resolver", genResolverSocket).Msg("generation mode: serving on private sockets")
-	} else if inherited, aerr := activation.Listeners(); aerr == nil {
-		for _, l := range inherited {
-			if l == nil {
-				continue
-			}
-			ta, ok := l.Addr().(*net.TCPAddr)
-			if !ok {
-				_ = l.Close()
-				continue
-			}
-			switch ta.Port {
-			case cfg.GRPCPort:
-				// A bare ListenStream=<port> can pass separate v4/v6 fds; keep
-				// the first, close dups so the fd isn't leaked.
-				if lis != nil {
-					log.Warn().Str("addr", ta.String()).Msg("duplicate inherited gRPC listener — closing")
-					_ = l.Close()
-					continue
-				}
-				lis = l
-			case localHTTPPort:
-				if !ta.IP.IsLoopback() {
-					log.Fatal().Str("addr", ta.String()).Msg("inherited resolver listener must be loopback-only")
-				}
-				if localLis != nil {
-					log.Warn().Str("addr", ta.String()).Msg("duplicate inherited resolver listener — closing")
-					_ = l.Close()
-					continue
-				}
-				localLis = l
-			default:
-				log.Warn().Str("addr", ta.String()).Msg("inherited listener matches no known port — closing")
-				_ = l.Close()
-			}
-		}
-		// systemd already owns the port; a direct bind would EADDRINUSE or
-		// serve a port nothing dials. Fail loudly rather than split-brain.
-		if len(inherited) > 0 && lis == nil {
-			log.Fatal().Int("grpc_port", cfg.GRPCPort).
-				Msg("socket unit passed listeners but none matches GRPC_PORT — check the unit's ListenStream against GRPC_PORT")
-		}
-	}
+	// In generation mode lis/localLis were bound during preflight above; legacy
+	// startup inherits from the socket unit or binds directly here.
 	if genPrivateSocket == "" {
-		if lis != nil {
-			log.Info().Str("addr", lis.Addr().String()).Msg("gRPC listener inherited from systemd socket unit")
-		} else {
-			var lerr error
-			lis, lerr = net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
-			if lerr != nil {
-				log.Fatal().Err(lerr).Int("port", cfg.GRPCPort).Msg("failed to listen")
+		if inherited, aerr := activation.Listeners(); aerr == nil {
+			for _, l := range inherited {
+				if l == nil {
+					continue
+				}
+				ta, ok := l.Addr().(*net.TCPAddr)
+				if !ok {
+					_ = l.Close()
+					continue
+				}
+				switch ta.Port {
+				case cfg.GRPCPort:
+					// A bare ListenStream=<port> can pass separate v4/v6 fds; keep
+					// the first, close dups so the fd isn't leaked.
+					if lis != nil {
+						log.Warn().Str("addr", ta.String()).Msg("duplicate inherited gRPC listener — closing")
+						_ = l.Close()
+						continue
+					}
+					lis = l
+				case localHTTPPort:
+					if !ta.IP.IsLoopback() {
+						log.Fatal().Str("addr", ta.String()).Msg("inherited resolver listener must be loopback-only")
+					}
+					if localLis != nil {
+						log.Warn().Str("addr", ta.String()).Msg("duplicate inherited resolver listener — closing")
+						_ = l.Close()
+						continue
+					}
+					localLis = l
+				default:
+					log.Warn().Str("addr", ta.String()).Msg("inherited listener matches no known port — closing")
+					_ = l.Close()
+				}
+			}
+			// systemd already owns the port; a direct bind would EADDRINUSE or
+			// serve a port nothing dials. Fail loudly rather than split-brain.
+			if len(inherited) > 0 && lis == nil {
+				log.Fatal().Int("grpc_port", cfg.GRPCPort).
+					Msg("socket unit passed listeners but none matches GRPC_PORT — check the unit's ListenStream against GRPC_PORT")
+			}
+		}
+		if genPrivateSocket == "" {
+			if lis != nil {
+				log.Info().Str("addr", lis.Addr().String()).Msg("gRPC listener inherited from systemd socket unit")
+			} else {
+				var lerr error
+				lis, lerr = net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
+				if lerr != nil {
+					log.Fatal().Err(lerr).Int("port", cfg.GRPCPort).Msg("failed to listen")
+				}
 			}
 		}
 	}
@@ -1352,11 +1421,16 @@ func main() {
 	// inventory they never use.
 	startupReady.Store(true)
 	log.Info().Msg("startup complete — gRPC serving requests")
+	// In generation mode, release the controller's "activate" call now that the
+	// daemon is fully serving as the writer. No-op otherwise.
+	if activateReply != nil {
+		activateReply <- "OK active"
+	}
 	// Report readiness to systemd (Type=notify). No-op when not socket-notified.
 	if err := sdnotify.Ready(); err != nil {
 		log.Warn().Err(err).Msg("sd_notify READY failed")
 	}
-	_ = sdnotify.Status("serving")
+	_ = sdnotify.Status("active — serving")
 
 	// ---- Wait for signal or service failure ----
 	sigCh := make(chan os.Signal, 1)
