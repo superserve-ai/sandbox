@@ -17,12 +17,14 @@ const instrumentationName = "github.com/superserve-ai/sandbox/internal/telemetry
 
 // latencyBuckets are the histogram boundaries (seconds) for every duration
 // instrument. The SDK default boundaries start at 5s, which flattens the
-// sub-second range all sandbox latencies live in; these cover 100µs–60s so
-// histogram_quantile can resolve millisecond-scale p50s and second-scale
-// tails from the same series.
+// sub-second range all sandbox latencies live in; these cover 100µs–30min so
+// histogram_quantile can resolve millisecond-scale p50s, second-scale tails,
+// and the legitimately long operations (caller-timed execs, streaming
+// responses, boot-retry worst cases) from the same series. Anything past
+// 30 minutes is pathological and may collapse into +Inf.
 var latencyBuckets = []float64{
 	0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
-	0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
+	0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 900, 1800,
 }
 
 // OTelConfig contains the app-level metrics settings needed by the recorder.
