@@ -68,6 +68,9 @@ jobs:
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_STAGING }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_STAGING }}
+          # Enables the proxy's OTLP exporter (host-local collector) so the
+          # data-plane exec phase histograms export.
+          OTEL_ENVIRONMENT: staging
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_STAGING }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
         run: |
@@ -122,6 +125,7 @@ jobs:
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_PROD }}
+          OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
@@ -162,6 +166,7 @@ jobs:
           SHA: ${{ github.sha }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_USW }}
+          OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}

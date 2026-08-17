@@ -5011,7 +5011,13 @@ func fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID str
 	//
 	// The date stamp right before the exec splits wait_socket into shell-chain
 	// time and Firecracker-side time (see readFCExecStamp). Best-effort: a date
-	// without %N or an unwritable dir must never block the launch.
+	// without %N or an unwritable dir must never block the launch. Cost: one
+	// fork+exec and a one-line page-cache write, ~1ms inside a phase measured
+	// in tens of ms — and it lands INSIDE wait_socket, so the split it buys is
+	// also what would expose it if it ever grew. No fork-free alternative
+	// exists here: POSIX sh has no sub-second clock builtin, and Firecracker's
+	// own --start-time-us reporting lands in a metrics sink this fleet does
+	// not run.
 	inner := fmt.Sprintf("%s%s && { date +%%s%%N >%s 2>/dev/null || true; } && exec %s --api-sock %s --id %s",
 		setupCmds, sysfs, shellquote.Single(fcExecStampPath(socketPath)),
 		shellquote.Single(fcBin), shellquote.Single(socketPath), shellquote.Single(vmID))
@@ -5132,10 +5138,14 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		"start_unit":  tStartUnitDone.Sub(tStartUnit),
 		"wait_socket": tSocketReady.Sub(tStartUnitDone),
 	}
-	if ts, ok := readFCExecStamp(socketPath, tStartUnitDone, tSocketReady); ok {
-		ev = ev.Int64("chain_ms", ts.Sub(tStartUnitDone).Milliseconds()).
+	// Window opens at tStartUnit (pre-enqueue): the unit's script can stamp
+	// before the no-block start call returns. chain reports relative to
+	// tStartUnitDone, clamped at zero when the unit won that race.
+	if ts, ok := readFCExecStamp(socketPath, tStartUnit, tSocketReady); ok {
+		chain := max(ts.Sub(tStartUnitDone), 0)
+		ev = ev.Int64("chain_ms", chain.Milliseconds()).
 			Int64("fc_socket_ms", tSocketReady.Sub(ts).Milliseconds())
-		unitPhases["chain"] = ts.Sub(tStartUnitDone)
+		unitPhases["chain"] = chain
 		unitPhases["fc_socket"] = tSocketReady.Sub(ts)
 	}
 	ev.Msg("fc startup phases")

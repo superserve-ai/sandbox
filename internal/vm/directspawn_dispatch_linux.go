@@ -320,10 +320,16 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 		"spawn":       tSpawnDone.Sub(tStart),
 		"wait_socket": tSocketReady.Sub(tSpawnDone),
 	}
-	if ts, ok := readFCExecStamp(socketPath, tSpawnDone, tSocketReady); ok {
-		ev = ev.Int64("chain_ms", ts.Sub(tSpawnDone).Milliseconds()).
+	// Validity window opens at tStart (pre-fork), not tSpawnDone: a fast
+	// child can run the script and stamp BEFORE the parent returns from the
+	// fork, and rejecting those would drop samples exactly when the chain is
+	// fastest. chain still reports relative to tSpawnDone (clamped at zero
+	// for the child-won-the-race case) so it stays the wait_socket split.
+	if ts, ok := readFCExecStamp(socketPath, tStart, tSocketReady); ok {
+		chain := max(ts.Sub(tSpawnDone), 0)
+		ev = ev.Int64("chain_ms", chain.Milliseconds()).
 			Int64("fc_socket_ms", tSocketReady.Sub(ts).Milliseconds())
-		launchPhases["chain"] = ts.Sub(tSpawnDone)
+		launchPhases["chain"] = chain
 		launchPhases["fc_socket"] = tSocketReady.Sub(ts)
 	}
 	ev.Msg("fc startup phases")

@@ -67,6 +67,15 @@ def main() -> int:
         print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
         return 1
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
+    # Empty = skip: enabling the proxy's OTLP exporter is a per-environment
+    # opt-in, matching the vmd deploy's OTEL_ENVIRONMENT convention.
+    otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
+    otel_env_lines = ""
+    if otel_environment:
+        otel_env_lines = (
+            "\n            OTEL_METRICS_ENABLED=true"
+            f"\n            OTEL_ENVIRONMENT={otel_environment}"
+        )
     if sentry_dsn and not re.fullmatch(r"https://[A-Za-z0-9@./:_\-]+", sentry_dsn):
         print("ERROR: SENTRY_DSN must be a https:// URL or empty", file=sys.stderr)
         return 1
@@ -141,7 +150,7 @@ def main() -> int:
             SANDBOX_ACCESS_TOKEN_SEED={access_seed}
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}
-            SENTRY_DSN={sentry_dsn}
+            SENTRY_DSN={sentry_dsn}{otel_env_lines}
             PROXYENV
             sudo chmod 0600 /etc/sandbox/proxy.env
 
