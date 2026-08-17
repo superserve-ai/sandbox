@@ -54,11 +54,11 @@ type hostScanRow func(...any) error
 
 func (r hostScanRow) Scan(dest ...any) error { return r(dest...) }
 
-// A cached client whose host row changed address must be evicted within one
-// recheck interval — the address change happens on whichever control-plane
-// replica served the heartbeat, and every other replica converges through
-// this recheck rather than dialing the old machine forever.
-func TestClientForEvictsWhenRowAddressChanges(t *testing.T) {
+// A client whose host row changed address must be re-dialed BEFORE the next
+// dispatch once its recheck is due — never returned pointing at the old
+// machine. The address change lands on whichever control-plane replica
+// served the heartbeat; every other replica converges through this check.
+func TestClientForRedialsBeforeDispatchWhenAddressChanges(t *testing.T) {
 	store := &hostDB{addr: "10.0.0.1:50051"}
 	var dials atomic.Int64
 	var lastAddr atomic.Value
@@ -77,30 +77,21 @@ func TestClientForEvictsWhenRowAddressChanges(t *testing.T) {
 		t.Fatalf("first dial = %d/%v", dials.Load(), lastAddr.Load())
 	}
 
-	// Row address changes (identity reclaimed elsewhere). Stale-serve means
-	// the very next call may still return the old client, but the recheck it
-	// triggers must evict, and a following call re-dials the new address.
 	store.setAddr("10.0.0.2:50051")
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		time.Sleep(2 * time.Millisecond)
-		if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
-			t.Fatalf("ClientFor: %v", err)
-		}
-		if dials.Load() >= 2 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("cached client never evicted after address change; dials = %d", dials.Load())
-		}
+	time.Sleep(5 * time.Millisecond) // entry is now due for verification
+
+	// Blocking semantics: this single call must verify and re-dial.
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor after address change: %v", err)
 	}
-	if got := lastAddr.Load().(string); got != "10.0.0.2:50051" {
-		t.Fatalf("re-dial went to %q, want the new address", got)
+	if dials.Load() != 2 || lastAddr.Load().(string) != "10.0.0.2:50051" {
+		t.Fatalf("after change: dials = %d addr = %v, want 2 dials at the new address",
+			dials.Load(), lastAddr.Load())
 	}
 }
 
-// An unchanged address must refresh the recheck clock without evicting:
-// steady state stays at one dial no matter how many calls arrive.
+// An unchanged address must refresh the recheck clock without re-dialing:
+// steady state stays at one dial no matter how many verifications run.
 func TestClientForKeepsClientWhenAddressUnchanged(t *testing.T) {
 	store := &hostDB{addr: "10.0.0.1:50051"}
 	var dials atomic.Int64
@@ -118,6 +109,45 @@ func TestClientForKeepsClientWhenAddressUnchanged(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	if dials.Load() != 1 {
-		t.Fatalf("dials = %d, want 1 (rechecks must not re-dial an unchanged address)", dials.Load())
+		t.Fatalf("dials = %d, want 1 (verification must not re-dial an unchanged address)", dials.Load())
+	}
+}
+
+// When the address changed but the new machine cannot be dialed, ClientFor
+// must fail loudly — never quietly hand back the old-address client, which
+// would execute the operation on the machine that lost this identity.
+func TestClientForFailsClosedWhenNewAddressUndialable(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	var failDial atomic.Bool
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		if failDial.Load() {
+			return nil, fmt.Errorf("connection refused")
+		}
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("first ClientFor: %v", err)
+	}
+
+	store.setAddr("10.0.0.2:50051")
+	failDial.Store(true)
+	time.Sleep(5 * time.Millisecond)
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("ClientFor returned a client while the new address is undialable")
+	}
+
+	// Recovery: once the new machine is reachable, the next call succeeds.
+	failDial.Store(false)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor after recovery: %v", err)
+	}
+	if got := dials.Load(); got != 3 {
+		t.Fatalf("dials = %d, want 3 (initial, failed re-dial, recovery)", got)
 	}
 }
