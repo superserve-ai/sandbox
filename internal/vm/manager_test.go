@@ -1,7 +1,6 @@
 package vm
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -2434,25 +2433,47 @@ func TestResumeVM_CorpseVerdict_ClearsRunningBeforeRelaunch(t *testing.T) {
 // be a pure clobber, able to resurrect a concurrent lifecycle op's fields (the
 // crash-window marker most damagingly). If DirtyTracked ever becomes durable,
 // this fails: that path then needs the lock before it may persist.
-func TestToRecordIgnoresDirtyTracked(t *testing.T) {
-	base := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTracked: false}
-	dirty := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTracked: true}
-
-	a, err := json.Marshal(toRecord(base))
-	if err != nil {
-		t.Fatal(err)
+// toRecord persists the dirty-tracking-armed state so a reattach can re-arm it,
+// but toInstance must NOT restore it: re-arming is a reattach-only decision
+// (shouldRearmDirtyTracking), gated on the feature flag and a confirmed-Running
+// Firecracker whose dirty bitmap survived the restart.
+func TestToRecordPersistsDirtyTrackingArmed(t *testing.T) {
+	armed := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTracked: true}
+	if rec := toRecord(armed); !rec.DirtyTrackingArmed {
+		t.Fatal("toRecord must persist DirtyTracked as DirtyTrackingArmed")
 	}
-	b, err := json.Marshal(toRecord(dirty))
-	if err != nil {
-		t.Fatal(err)
+	unarmed := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTracked: false}
+	if rec := toRecord(unarmed); rec.DirtyTrackingArmed {
+		t.Fatal("toRecord must not report armed for an un-armed instance")
 	}
-	if !bytes.Equal(a, b) {
-		t.Fatalf("DirtyTracked is now persisted — CreateVMSnapshot must take the vm-op lock before persisting:\n %s\n %s", a, b)
+	if inst := toInstance(toRecord(armed)); inst.DirtyTracked {
+		t.Fatal("toInstance must leave DirtyTracked false; re-arming belongs to reattachRecord")
 	}
 }
 
-// The ad-hoc snapshot path must not write the record at all: it holds no
-// vm-op lock, so any write races whatever lifecycle op is in flight.
+func TestShouldRearmDirtyTracking(t *testing.T) {
+	runningArmed := VMRecord{Status: StatusRunning, DirtyTrackingArmed: true}
+	if !shouldRearmDirtyTracking(true, runningArmed) {
+		t.Fatal("enabled + running + armed must re-arm")
+	}
+	if shouldRearmDirtyTracking(false, runningArmed) {
+		t.Fatal("disabled must never re-arm (flag gate protects the unverified bitmap-survival invariant)")
+	}
+	if shouldRearmDirtyTracking(true, VMRecord{Status: StatusRunning}) {
+		t.Fatal("un-armed record must not re-arm")
+	}
+	if shouldRearmDirtyTracking(true, VMRecord{Status: StatusPaused, DirtyTrackingArmed: true}) {
+		t.Fatal("paused record must not re-arm — it re-arms through its next resume")
+	}
+	if shouldRearmDirtyTracking(true, VMRecord{Status: StatusError, DirtyTrackingArmed: true}) {
+		t.Fatal("error/parked record must not re-arm")
+	}
+}
+
+// The ad-hoc snapshot path holds no vm-op lock, so it must not do a whole-record
+// write (persistState) that could clobber a concurrent lifecycle op. A
+// field-level ClearDirtyTrackingArmed is the permitted exception: it touches
+// only the armed bit and disarming is monotonically safe.
 func TestCreateVMSnapshotDoesNotPersist(t *testing.T) {
 	src, err := os.ReadFile("manager.go")
 	if err != nil {

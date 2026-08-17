@@ -302,6 +302,17 @@ type ManagerConfig struct {
 	// ResumeUffdEnabled. Default false.
 	IncrementalSnapshotEnabled bool
 
+	// PersistDirtyTrackingEnabled persists the dirty-tracking-armed state and
+	// re-arms it when a running VM is reattached after a vmd restart, so the
+	// restart no longer forces that VM's next pause to a Full snapshot. Default
+	// false: enabling it re-arms a diff against Firecracker's existing dirty
+	// bitmap after a reattach, which is only correct if that bitmap survives a
+	// vmd restart on the deployed Firecracker fork — an invariant that must be
+	// verified before turning this on, since re-arming against a reset bitmap
+	// would corrupt the diff. Requires IncrementalSnapshotEnabled to have any
+	// effect.
+	PersistDirtyTrackingEnabled bool
+
 	// HandlerDeathAbortEnabled tells the in-process UFFD handler to abort Firecracker
 	// on an unexpected handler death (instead of letting the guest freeze on its next
 	// page fault). The dead VM then surfaces via the unit-inactive → reconciler path
@@ -1342,6 +1353,17 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// of the file it overwrites (for layered, only the session delta — the template
 	// base is untouched; for in-place, the VM's own mem.snap). Crash-atomicity of the
 	// diff is the durability-boundary work, intentionally out of scope here.
+	//
+	// The Diff-vs-Full decision above already read dirtyTracked into locals, so
+	// disarm the durable armed bit now — before any snapshot resets the bitmap.
+	// A crash between here and the paused record must not leave armed=true, or a
+	// reattach would re-arm a diff against a bitmap this snapshot reset. Refuse
+	// the pause if the durable clear fails rather than take that risk.
+	if m.cfg.PersistDirtyTrackingEnabled {
+		if err := m.writeAheadDisarm(inst); err != nil {
+			return "", "", nil, fmt.Errorf("write-ahead disarm before pause snapshot for vm %s: %w", vmID, err)
+		}
+	}
 	switch {
 	case layered:
 		memPath = overlayPath
@@ -1519,6 +1541,35 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 // not a template/layered base — the in-place diff merges into that resume file.
 func shouldWriteDiff(incremental, dirtyTracked bool, memPath, resumeMemPath string, memFileExists bool) bool {
 	return incremental && dirtyTracked && memPath == resumeMemPath && memFileExists
+}
+
+// shouldRearmDirtyTracking reports whether a reattached record's persisted
+// dirty-tracking-armed state is safe to restore into the live instance. Only a
+// confirmed-Running record qualifies (a paused VM re-arms through its next
+// resume; a reattach re-arms an already-live Firecracker), and only when the
+// feature is enabled. The write-ahead disarm guarantees the persisted bit is
+// false throughout the window where a snapshot has reset the bitmap but the
+// record still reads Running, so a true here means the live bitmap is intact.
+func shouldRearmDirtyTracking(enabled bool, rec VMRecord) bool {
+	return enabled && rec.Status == StatusRunning && rec.DirtyTrackingArmed
+}
+
+// writeAheadDisarm clears the in-memory dirty-tracking flag and durably clears
+// the persisted armed bit BEFORE returning, so a snapshot that is about to
+// reset Firecracker's dirty bitmap cannot leave a stale armed=true for a later
+// reattach to trust. Callers that hold no vm-op lock are safe: the field-level
+// clear never clobbers a concurrent lifecycle op, and disarming is monotonically
+// safe (worst case a spurious Full snapshot, never a diff against a stale
+// bitmap). Returns an error only if the durable clear fails, so the caller can
+// refuse the snapshot rather than proceed on an un-disarmed record.
+func (m *Manager) writeAheadDisarm(inst *VMInstance) error {
+	inst.mu.Lock()
+	inst.DirtyTracked = false
+	inst.mu.Unlock()
+	if m.state == nil {
+		return nil
+	}
+	return m.state.ClearDirtyTrackingArmed(inst.ID)
 }
 
 // layeredBaseSidecarPath is where the layered base (template) path is recorded
@@ -2084,20 +2135,27 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	snapshotPath = filepath.Join(snapshotDir, "vmstate.snap")
 	memPath = filepath.Join(snapshotDir, "mem.snap")
 
+	// This Full snapshot resets Firecracker's dirty bitmap, so the diff baseline
+	// relative to the resume base is gone; the next pause must go Full. When
+	// persistence is enabled, disarm DURABLY and ahead of the snapshot: this path
+	// holds no vm-op lock, so a field-level clear (never a whole-record write) is
+	// used to avoid clobbering a concurrent lifecycle op, and doing it before the
+	// bitmap reset closes the crash window a reattach could otherwise re-arm into.
+	if m.cfg.PersistDirtyTrackingEnabled {
+		if err := m.writeAheadDisarm(inst); err != nil {
+			return "", "", fmt.Errorf("write-ahead disarm before ad-hoc snapshot for vm %s: %w", vmID, err)
+		}
+	}
+
 	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 		return "", "", fmt.Errorf("create snapshot: %w", err)
 	}
 
-	// This Full snapshot reset Firecracker's dirty bitmap, so the diff baseline
-	// relative to the resume base is gone. Clear the flag now — before the unpause,
-	// which can fail and return early — so a later pause can't take the Diff path
-	// against the stale baseline and miss pages dirtied between resume and this
-	// ad-hoc snapshot. Forces the next pause back to Full.
-	//
-	// Not persisted, deliberately: DirtyTracked is not in VMRecord, so a write
-	// here would duplicate the durable record while clobbering fields a
-	// concurrent lifecycle op just changed — this path holds no vm-op lock.
-	// Persisting from here needs that lock; see TestToRecordIgnoresDirtyTracked.
+	// Clear the in-memory flag before the unpause (which can fail and return
+	// early) so a later pause can't take the Diff path against the reset bitmap
+	// and miss pages dirtied between resume and this ad-hoc snapshot. When
+	// persistence is enabled the durable clear above already covers the reattach
+	// case; this keeps the in-memory field consistent on the flag-off path too.
 	inst.mu.Lock()
 	inst.DirtyTracked = false
 	inst.mu.Unlock()
@@ -3322,6 +3380,19 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	}
 
 	inst := toInstance(rec)
+
+	// Re-arm dirty tracking for a confirmed-Running reattach: the Firecracker
+	// process survived the vmd restart and kept tracking, so the persisted armed
+	// bit is safe to restore — without this, DirtyTracked defaults false and the
+	// VM's next pause writes a Full snapshot. toInstance leaves it false by
+	// design; this is the one path that reconnects to a live FC without going
+	// through an arming restore. Gated on the feature flag (pending the
+	// bitmap-survives-restart verification) and guarded so it never re-arms a
+	// paused/parked record or the crash-during-snapshot window (write-ahead
+	// disarm keeps the bit false there).
+	if shouldRearmDirtyTracking(m.cfg.PersistDirtyTrackingEnabled, rec) {
+		inst.DirtyTracked = true
+	}
 
 	// Bail early if another caller (a request, or the background pass) already
 	// published this VM.

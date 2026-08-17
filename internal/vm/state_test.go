@@ -137,6 +137,47 @@ func TestStateStorePausedAtRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStateStoreClearDirtyTrackingArmed(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	// A record persisted armed, plus other fields that the field-level clear
+	// must leave untouched.
+	if err := store.Put(VMRecord{
+		ID:                 "vm-armed",
+		Status:             StatusRunning,
+		MemFilePath:        "/snap/mem.snap",
+		DirtyTrackingArmed: true,
+	}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	if err := store.ClearDirtyTrackingArmed("vm-armed"); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	got, err := store.Get("vm-armed")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.DirtyTrackingArmed {
+		t.Fatal("armed bit must be cleared")
+	}
+	if got.MemFilePath != "/snap/mem.snap" || got.Status != StatusRunning {
+		t.Fatalf("clear must not touch other fields: %+v", got)
+	}
+
+	// Absent record and already-disarmed record are both no-op successes.
+	if err := store.ClearDirtyTrackingArmed("vm-absent"); err != nil {
+		t.Fatalf("clear absent must be a no-op: %v", err)
+	}
+	if err := store.ClearDirtyTrackingArmed("vm-armed"); err != nil {
+		t.Fatalf("clear already-disarmed must be a no-op: %v", err)
+	}
+}
+
 func TestStateStorePrimaryRecordUsesRestrictiveRollbackFallback(t *testing.T) {
 	s, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

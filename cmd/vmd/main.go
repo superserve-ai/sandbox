@@ -450,6 +450,7 @@ func main() {
 	resumeUffdEnabled := envOrDefault("VMD_RESUME_UFFD", "false") == "true"
 	verifySnapshotEnabled := envOrDefault("VMD_VERIFY_SNAPSHOT_ENABLED", "false") == "true"
 	incrementalSnapshotEnabled := envOrDefault("VMD_INCREMENTAL_SNAPSHOT", "false") == "true"
+	persistDirtyTrackingEnabled := envOrDefault("VMD_PERSIST_DIRTY_TRACKING", "false") == "true"
 	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
 	// Tri-state: "auto" (default) lets vmd enforce only after its convergence
 	// sweep proves every layered overlay has a presence side-car; "always"
@@ -599,6 +600,7 @@ func main() {
 		ResumeUffdEnabled:                   resumeUffdEnabled,
 		VerifySnapshotEnabled:               verifySnapshotEnabled,
 		IncrementalSnapshotEnabled:          incrementalSnapshotEnabled,
+		PersistDirtyTrackingEnabled:         persistDirtyTrackingEnabled,
 		HandlerDeathAbortEnabled:            handlerDeathAbortEnabled,
 		RequirePresenceSidecar:              requirePresenceSidecar,
 		PausedNetworkReclaimEnabled:         pausedNetworkReclaimEnabled,

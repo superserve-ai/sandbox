@@ -178,11 +178,19 @@ type VMRecord struct {
 	// restart: non-empty means MemFilePath is an overlay to be served over this
 	// base. Without it, resume would load the overlay standalone and read the
 	// base's pages as zero holes.
-	BaseMemPath string            `json:"base_mem_path,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	VCPU        uint32            `json:"vcpu"`
-	MemoryMiB   uint32            `json:"memory_mib"`
+	BaseMemPath string `json:"base_mem_path,omitempty"`
+	// DirtyTrackingArmed records whether this VM's current Firecracker run was
+	// launched with dirty-page tracking on. Persisted so a reattach after a vmd
+	// restart can re-arm the in-memory flag (which otherwise defaults false and
+	// forces the next pause of a running VM to a full snapshot). Written false
+	// AHEAD of any snapshot that resets the bitmap (see write-ahead disarm), so
+	// a crash mid-snapshot never leaves a stale true for a reattach to trust
+	// against a reset bitmap. Old records decode to false (safe).
+	DirtyTrackingArmed bool              `json:"dirty_tracking_armed,omitempty"`
+	CreatedAt          time.Time         `json:"created_at"`
+	Metadata           map[string]string `json:"metadata,omitempty"`
+	VCPU               uint32            `json:"vcpu"`
+	MemoryMiB          uint32            `json:"memory_mib"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
 	// dual-symlink mount namespace). DeltaDir is intentionally NOT
@@ -429,6 +437,38 @@ func (s *StateStore) PutIfPresent(rec VMRecord) (bool, error) {
 	return wrote, err
 }
 
+// ClearDirtyTrackingArmed durably clears the dirty-tracking-armed bit on a
+// record, touching no other field. Snapshot paths that reset Firecracker's
+// dirty bitmap use this to disarm ahead of the reset while holding no vm-op
+// lock: a whole-record write from such a path could roll back a concurrent
+// lifecycle op's changes, whereas a field-level clear cannot — and disarming is
+// monotonically safe (worst case a spurious full snapshot next pause, never a
+// diff against a stale bitmap). No-op if the record is absent or already
+// disarmed.
+func (s *StateStore) ClearDirtyTrackingArmed(vmID string) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
+		records := tx.Bucket(bucketName)
+		key := []byte(vmID)
+		data := records.Get(key)
+		if data == nil {
+			return nil
+		}
+		var rec VMRecord
+		if err := json.Unmarshal(data, &rec); err != nil {
+			return err
+		}
+		if !rec.DirtyTrackingArmed {
+			return nil
+		}
+		rec.DirtyTrackingArmed = false
+		out, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		return records.Put(key, out)
+	})
+}
+
 // putRecord writes both representations atomically and reports whether the
 // primary lifecycle record was written. A sidecar without a primary record is
 // an orphan left by an old-binary delete and must never influence a new VM.
@@ -637,6 +677,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		SnapshotPath:               inst.SnapshotPath,
 		MemFilePath:                inst.MemFilePath,
 		BaseMemPath:                inst.BaseMemPath,
+		DirtyTrackingArmed:         inst.DirtyTracked,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
