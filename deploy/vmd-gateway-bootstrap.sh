@@ -22,12 +22,15 @@ require "$BIN/vmd-handoff"
 [ -f /etc/systemd/system/superserve-vmd-gateway.service ] || { echo "gateway unit not installed — deploy first" >&2; exit 1; }
 [ -f /etc/sandbox/vmd.env ] || { echo "missing /etc/sandbox/vmd.env" >&2; exit 1; }
 
-# Roll back to the legacy topology on any failure: unfence, stop the gateway
-# (freeing the ports), and bring the legacy service back. Stop the gateway
-# BEFORE starting legacy so the port is free.
+# Roll back to the legacy topology on any failure. Stop the generation FIRST —
+# if vmd-handoff already activated it, it holds the writer lease, and legacy vmd
+# is lease-unaware, so starting legacy alongside a live generation would put two
+# writers on the same host state. Then stop the gateway (freeing the ports), and
+# only then bring the legacy service back.
 restore_legacy() {
 	echo "== bootstrap failed — restoring legacy topology ==" >&2
 	rm -f /etc/sandbox/gateway-topology
+	systemctl stop "superserve-vmd@$VERSION.service" 2>/dev/null || true
 	systemctl stop superserve-vmd-gateway.service 2>/dev/null || true
 	systemctl enable --now superserve-vmd.socket 2>/dev/null || true
 	systemctl start superserve-vmd.service 2>/dev/null || true

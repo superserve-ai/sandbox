@@ -40,10 +40,13 @@ def main() -> int:
         st = send(args.control_sock, "deploy-status")
         parts = st.split(maxsplit=2)  # ["OK", "state=...", "generation=... error=..."]
         state = parts[1] if len(parts) > 1 else ""
-        if state == "state=done":
+        # Only accept a terminal status that names OUR generation — otherwise an
+        # overlapping deploy's result could be mistaken for ours.
+        mine = ("generation=" + args.generation) in st
+        if state == "state=done" and mine:
             print("handoff complete: " + st)
             return 0
-        if state == "state=failed":
+        if state == "state=failed" and mine:
             print("handoff failed: " + st, file=sys.stderr)
             return 1
         time.sleep(2)

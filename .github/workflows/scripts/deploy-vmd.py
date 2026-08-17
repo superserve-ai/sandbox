@@ -432,8 +432,14 @@ def main() -> int:
             # blue-green; the legacy startup sequence below is unchanged. On a
             # host not yet bootstrapped, the guard drop-in is a no-op because its
             # marker (/etc/sandbox/gateway-topology) does not exist.
+            OLD_GW_HASH=$(sha256sum {install_dir}/vmd-gateway 2>/dev/null | awk '{{print $1}}' || echo none)
             sudo install -m 0755 {extract_dir}/bin/vmd-gateway {install_dir}/vmd-gateway
+            NEW_GW_HASH=$(sha256sum {install_dir}/vmd-gateway | awk '{{print $1}}')
             sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd-{sha}
+            # Retain only the most recent versioned generation binaries (the
+            # running one plus rollback candidates) so the root disk does not grow
+            # without bound. Matches vmd-<hex-sha> only, never vmd / vmd-gateway.
+            ls -t {install_dir}/vmd-[0-9a-f]* 2>/dev/null | tail -n +6 | xargs -r sudo rm -f
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-gateway.service /etc/systemd/system/superserve-vmd-gateway.service
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd@.service /etc/systemd/system/superserve-vmd@.service
             sudo install -d /etc/systemd/system/superserve-vmd.service.d
@@ -1039,6 +1045,15 @@ def main() -> int:
                 # legacy service is fenced off, so restarting it would fail. Roll
                 # out the freshly-installed version as a blue-green generation
                 # handoff instead. vmd-handoff exits non-zero if the cutover fails.
+                # If the gateway binary itself changed, restart the stable
+                # gateway so gateway/router/handoff fixes actually run. It
+                # rediscovers the live generation on startup and restores routing;
+                # clients reconnect and the control plane retries the brief blip.
+                if [ "$OLD_GW_HASH" != "$NEW_GW_HASH" ]; then
+                    echo "gateway binary changed — restarting the gateway"
+                    sudo systemctl restart superserve-vmd-gateway.service
+                    sleep 2
+                fi
                 echo "gateway topology detected — deploying generation {sha} via handoff"
                 sudo {install_dir}/vmd-handoff {sha}
             else
