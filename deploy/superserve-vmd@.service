@@ -20,6 +20,7 @@ ExecStart=/usr/local/bin/vmd
 Environment=VMD_GENERATION_ID=%i
 Environment=VMD_PRIVATE_SOCKET=/run/vmd/gen-%i-grpc.sock
 Environment=VMD_RESOLVER_SOCKET=/run/vmd/gen-%i-resolver.sock
+Environment=VMD_GEN_CONTROL_SOCKET=/run/vmd/gen-%i-ctl.sock
 EnvironmentFile=/etc/sandbox/vmd.env
 
 # Signal only the main process, never the cgroup: VMs run under sandboxes.slice

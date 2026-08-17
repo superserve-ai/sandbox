@@ -23,7 +23,11 @@ func (m *mockActions) record(s string) {
 	m.calls = append(m.calls, s)
 	m.mu.Unlock()
 }
-func (m *mockActions) seq() []string { m.mu.Lock(); defer m.mu.Unlock(); return append([]string(nil), m.calls...) }
+func (m *mockActions) seq() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.calls...)
+}
 func (m *mockActions) err(step string) error {
 	if m.failAt == step {
 		return errors.New(step + " failed")

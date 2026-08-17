@@ -29,7 +29,35 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/gateway"
+	"github.com/superserve-ai/sandbox/internal/handoff"
 )
+
+// Generation socket/unit naming — the single source of truth shared by the
+// gateway, the generation units, and the handoff controller.
+func genGRPCPath(id string) string     { return "/run/vmd/gen-" + id + "-grpc.sock" }
+func genResolverPath(id string) string { return "/run/vmd/gen-" + id + "-resolver.sock" }
+func genControlPath(id string) string  { return "/run/vmd/gen-" + id + "-ctl.sock" }
+func unitName(id string) string        { return "superserve-vmd@" + id }
+
+// gwAdapter lets the in-process handoff controller steer routing directly.
+type gwAdapter struct{ gw *gateway.Gateway }
+
+func (a gwAdapter) Quiesce(on bool) { a.gw.Router().Quiesce(on) }
+func (a gwAdapter) SetActive(gen handoff.Generation) {
+	a.gw.Router().SetActive(gateway.Upstream{
+		Generation:     gen.ID,
+		GRPCSocket:     gen.GRPCSocket,
+		ResolverSocket: gen.ResolverSocket,
+	})
+}
+
+// controlState is the target of the gateway control socket: raw routing
+// commands plus controller-driven deploys.
+type controlState struct {
+	gw   *gateway.Gateway
+	ctrl *handoff.Controller
+	log  zerolog.Logger
+}
 
 func main() {
 	grpcAddr := flag.String("grpc-addr", ":50051", "public control-plane gRPC listen address")
@@ -73,11 +101,18 @@ func main() {
 		}
 	}()
 
+	actions := handoff.NewSystemdActions(gwAdapter{gw}, unitName, genControlPath)
+	controller := handoff.New(actions, handoff.Generation{
+		ID:             *initialID,
+		GRPCSocket:     *initialGRPC,
+		ResolverSocket: *initialResolver,
+	})
+
 	ctlLis, err := listenControl(*controlSock)
 	if err != nil {
 		log.Fatal().Err(err).Str("sock", *controlSock).Msg("control socket listen")
 	}
-	go serveControl(ctlLis, gw, log)
+	go serveControl(ctlLis, &controlState{gw: gw, ctrl: controller, log: log})
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -102,27 +137,27 @@ func listenControl(path string) (net.Listener, error) {
 	return net.Listen("unix", path)
 }
 
-func serveControl(lis net.Listener, gw *gateway.Gateway, log zerolog.Logger) {
+func serveControl(lis net.Listener, cs *controlState) {
 	for {
 		conn, err := lis.Accept()
 		if err != nil {
 			return // listener closed on shutdown
 		}
-		go handleControl(conn, gw, log)
+		go cs.handle(conn)
 	}
 }
 
-func handleControl(conn net.Conn, gw *gateway.Gateway, log zerolog.Logger) {
+func (cs *controlState) handle(conn net.Conn) {
 	defer conn.Close()
 	sc := bufio.NewScanner(conn)
 	for sc.Scan() {
-		resp := applyControl(strings.Fields(sc.Text()), gw)
+		resp := cs.apply(strings.Fields(sc.Text()))
 		fmt.Fprintln(conn, resp)
-		log.Info().Str("cmd", sc.Text()).Str("resp", resp).Msg("control command")
+		cs.log.Info().Str("cmd", sc.Text()).Str("resp", resp).Msg("control command")
 	}
 }
 
-func applyControl(fields []string, gw *gateway.Gateway) string {
+func (cs *controlState) apply(fields []string) string {
 	if len(fields) == 0 {
 		return "ERR empty"
 	}
@@ -131,7 +166,7 @@ func applyControl(fields []string, gw *gateway.Gateway) string {
 		if len(fields) != 4 {
 			return "ERR usage: set-active <generation-id> <grpc-socket> <resolver-socket>"
 		}
-		gw.Router().SetActive(gateway.Upstream{
+		cs.gw.Router().SetActive(gateway.Upstream{
 			Generation:     fields[1],
 			GRPCSocket:     fields[2],
 			ResolverSocket: fields[3],
@@ -141,12 +176,40 @@ func applyControl(fields []string, gw *gateway.Gateway) string {
 		if len(fields) != 2 || (fields[1] != "on" && fields[1] != "off") {
 			return "ERR usage: quiesce on|off"
 		}
-		gw.Router().Quiesce(fields[1] == "on")
+		cs.gw.Router().Quiesce(fields[1] == "on")
 		return "OK"
 	case "status":
-		up, q := gw.Router().Active()
+		up, q := cs.gw.Router().Active()
 		return fmt.Sprintf("OK generation=%q grpc=%q resolver=%q quiescing=%t",
 			up.Generation, up.GRPCSocket, up.ResolverSocket, q)
+	case "current":
+		if cs.ctrl == nil {
+			return "ERR no controller"
+		}
+		return "OK current=" + cs.ctrl.Current().ID
+	case "deploy":
+		if cs.ctrl == nil {
+			return "ERR no controller"
+		}
+		if len(fields) != 2 {
+			return "ERR usage: deploy <generation-id>"
+		}
+		next := handoff.Generation{
+			ID:             fields[1],
+			GRPCSocket:     genGRPCPath(fields[1]),
+			ResolverSocket: genResolverPath(fields[1]),
+		}
+		expected := cs.ctrl.Current()
+		// Detached: the deploy runs to completion even if this control
+		// connection drops. Poll "current" to see when it lands.
+		go func() {
+			if err := cs.ctrl.Deploy(context.Background(), expected, next); err != nil {
+				cs.log.Error().Err(err).Str("generation", next.ID).Msg("deploy failed")
+			} else {
+				cs.log.Info().Str("generation", next.ID).Msg("deploy complete")
+			}
+		}()
+		return "OK deploying " + fields[1]
 	default:
 		return "ERR unknown command " + fields[0]
 	}
