@@ -15,6 +15,7 @@ type mockActions struct {
 	calls        []string
 	failAt       string
 	failRollback bool
+	drainBusy    bool          // if true, Drain reports not-drained (abort path)
 	block        chan struct{} // if non-nil, StartStandby blocks on it
 	rolledTo     string
 }
@@ -52,6 +53,17 @@ func (m *mockActions) QuiesceGRPC(on bool) {
 }
 func (m *mockActions) QuiesceResolver(on bool) {
 	m.record("QuiesceResolver(" + map[bool]string{true: "true", false: "false"}[on] + ")")
+}
+func (m *mockActions) Drain(ctx context.Context, g Generation, budget time.Duration) (bool, error) {
+	m.record("Drain")
+	if m.drainBusy {
+		return false, nil
+	}
+	return true, m.err("Drain")
+}
+func (m *mockActions) Undrain(ctx context.Context, g Generation) error {
+	m.record("Undrain")
+	return nil
 }
 func (m *mockActions) DrainAndStop(ctx context.Context, p Generation) error {
 	m.record("DrainAndStop")
@@ -93,7 +105,7 @@ func TestDeployHappyPath(t *testing.T) {
 	if err := c.Deploy(context.Background(), Generation{ID: "A"}, Generation{ID: "B", GRPCSocket: "/tmp/b.sock"}); err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
-	want := []string{"StartStandby", "AwaitReady", "QuiesceGRPC(true)", "DrainAndStop", "QuiesceResolver(true)", "Activate", "SetActive:B", "QuiesceResolver(false)", "QuiesceGRPC(false)", "Stabilize"}
+	want := []string{"StartStandby", "AwaitReady", "QuiesceGRPC(true)", "Drain", "DrainAndStop", "QuiesceResolver(true)", "Activate", "SetActive:B", "QuiesceResolver(false)", "QuiesceGRPC(false)", "Stabilize"}
 	if !eq(m.seq(), want) {
 		t.Fatalf("sequence = %v, want %v", m.seq(), want)
 	}
@@ -141,6 +153,35 @@ func TestActivateFailureRollsBack(t *testing.T) {
 	got := m.seq()
 	if !contains(got, "QuiesceGRPC(false)") || !contains(got, "QuiesceResolver(false)") {
 		t.Fatalf("gateway not resumed after rollback: %v", got)
+	}
+}
+
+func TestDrainBudgetExceededAbortsNotCuts(t *testing.T) {
+	// Old generation can't drain in budget: the deploy must ABORT — resume the
+	// old generation (Undrain), never stop it, drop the standby, and postpone.
+	m := &mockActions{drainBusy: true}
+	c := New(m, Generation{ID: "A", GRPCSocket: "/a-grpc", ResolverSocket: "/a-res"})
+	err := c.Deploy(context.Background(), Generation{ID: "A"}, Generation{ID: "B"})
+	if !errors.Is(err, ErrDeployPostponed) {
+		t.Fatalf("Deploy = %v, want ErrDeployPostponed", err)
+	}
+	seq := m.seq()
+	// The old generation must be resumed (Undrain) and never stopped.
+	if !contains(seq, "Undrain") {
+		t.Fatalf("must Undrain the old generation on abort: %v", seq)
+	}
+	// Exactly the standby (next) is stopped — never the old writer. The mock
+	// records "DrainAndStop" for either; assert the old generation stays current.
+	if c.Current().ID != "A" {
+		t.Fatalf("old generation must remain current after abort, got %s", c.Current().ID)
+	}
+	// Gateway must be resumed.
+	if !contains(seq, "QuiesceGRPC(false)") {
+		t.Fatalf("gateway not resumed after abort: %v", seq)
+	}
+	// Never activated the new generation.
+	if contains(seq, "Activate") {
+		t.Fatalf("must not activate on a drain abort: %v", seq)
 	}
 }
 

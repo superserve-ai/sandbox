@@ -425,8 +425,66 @@ func (g *genControl) status() string {
 	return "OK phase=" + g.phase
 }
 
+// drainGate tracks in-flight mutating (unary) RPCs and can refuse new ones so a
+// generation can be drained to zero before it stops. Replayable streams (build
+// logs) are deliberately NOT tracked, so they never block a drain — the gateway
+// reconnects them onto the new generation.
+type drainGate struct {
+	mu       sync.Mutex
+	draining bool
+	inflight int
+}
+
+func newDrainGate() *drainGate { return &drainGate{} }
+
+// admit registers a new RPC, or returns false if draining (the interceptor then
+// refuses it with a retryable status).
+func (g *drainGate) admit() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.draining {
+		return false
+	}
+	g.inflight++
+	return true
+}
+
+func (g *drainGate) done() {
+	g.mu.Lock()
+	g.inflight--
+	g.mu.Unlock()
+}
+
+func (g *drainGate) undrain() {
+	g.mu.Lock()
+	g.draining = false
+	g.mu.Unlock()
+}
+
+// drainToZero begins draining and waits up to budget for in-flight RPCs to
+// finish. Returns true if they drained; false if the budget elapsed (leaving
+// draining set — the caller resumes it explicitly via undrain).
+func (g *drainGate) drainToZero(budget time.Duration) bool {
+	g.mu.Lock()
+	g.draining = true
+	g.mu.Unlock()
+	deadline := time.Now().Add(budget)
+	for {
+		g.mu.Lock()
+		n := g.inflight
+		g.mu.Unlock()
+		if n == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // serveGenControl serves a generation's control socket against a genControl.
-func serveGenControl(lis net.Listener, gc *genControl) {
+func serveGenControl(lis net.Listener, gc *genControl, drain *drainGate) {
 	for {
 		conn, err := lis.Accept()
 		if err != nil {
@@ -436,11 +494,31 @@ func serveGenControl(lis net.Listener, gc *genControl) {
 			defer c.Close()
 			sc := bufio.NewScanner(c)
 			for sc.Scan() {
-				switch strings.TrimSpace(sc.Text()) {
+				fields := strings.Fields(sc.Text())
+				if len(fields) == 0 {
+					fmt.Fprintln(c, "ERR empty")
+					continue
+				}
+				switch fields[0] {
 				case "activate":
 					fmt.Fprintln(c, gc.requestActivate())
 				case "status":
 					fmt.Fprintln(c, gc.status())
+				case "drain":
+					budgetMs := 9000
+					if len(fields) == 2 {
+						if v, err := strconv.Atoi(fields[1]); err == nil {
+							budgetMs = v
+						}
+					}
+					if drain.drainToZero(time.Duration(budgetMs) * time.Millisecond) {
+						fmt.Fprintln(c, "OK drained")
+					} else {
+						fmt.Fprintln(c, "OK busy")
+					}
+				case "undrain":
+					drain.undrain()
+					fmt.Fprintln(c, "OK")
 				default:
 					fmt.Fprintln(c, "ERR unknown command")
 				}
@@ -533,6 +611,7 @@ func main() {
 	// BoltDB, reattach), held for the life of the process — released only on
 	// exit, so at most one generation is ever the writer. Legacy startup (no
 	// private socket) leaves lis/localLis nil; they are bound below.
+	drain := newDrainGate()
 	genPrivateSocket := os.Getenv("VMD_PRIVATE_SOCKET")
 	genResolverSocket := os.Getenv("VMD_RESOLVER_SOCKET")
 	genControlSocket := os.Getenv("VMD_GEN_CONTROL_SOCKET")
@@ -560,7 +639,7 @@ func main() {
 		if cerr != nil {
 			log.Fatal().Err(cerr).Str("socket", genControlSocket).Msg("preflight: bind control socket")
 		}
-		go serveGenControl(ctlLis, gc)
+		go serveGenControl(ctlLis, gc, drain)
 
 		// Preflight-ready. For a Type=notify unit this marks the unit active, so
 		// the controller's "start standby" returns; activation follows on the
@@ -1188,6 +1267,13 @@ func main() {
 			if !startupReady.Load() {
 				return nil, notReady()
 			}
+			// Track in-flight unary RPCs and refuse new ones while draining, so a
+			// generation can drain to zero before it stops. The gateway's own
+			// hold already refuses most new traffic; this closes the local race.
+			if !drain.admit() {
+				return nil, status.Error(codes.Unavailable, "vmd is draining for a handoff, retry shortly")
+			}
+			defer drain.done()
 			return handler(ctx, req)
 		}),
 		grpc.StreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {

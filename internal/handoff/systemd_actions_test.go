@@ -36,6 +36,12 @@ func TestSystemdActionsDeploySequence(t *testing.T) {
 			return nil
 		},
 		send: func(_ context.Context, sock, cmd string) (string, error) {
+			// Normalize the drain budget (a timing-dependent number) for a stable
+			// recorded sequence.
+			if strings.HasPrefix(cmd, "drain") {
+				rec("send[" + sock + "]: drain")
+				return "OK drained", nil
+			}
 			rec("send[" + sock + "]: " + cmd)
 			switch {
 			case strings.HasPrefix(cmd, "activate"):
@@ -61,6 +67,7 @@ func TestSystemdActionsDeploySequence(t *testing.T) {
 		"run: systemctl start superserve-vmd@b",
 		"send[/run/vmd/gen-b-ctl.sock]: status",
 		"gw: quiesce-grpc on",
+		"send[/run/vmd/gen-a-ctl.sock]: drain",
 		"run: systemctl stop superserve-vmd@a",
 		"gw: quiesce-resolver on",
 		"send[/run/vmd/gen-b-ctl.sock]: activate",

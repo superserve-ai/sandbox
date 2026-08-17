@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // Generation identifies one vmd generation: an opaque id and its two private
@@ -39,6 +40,14 @@ type Actions interface {
 	// the brief activation window, since the old generation answers read-only
 	// lookups while it drains).
 	QuiesceResolver(on bool)
+	// Drain asks a generation to stop admitting new mutating RPCs and wait for
+	// its in-flight ones to finish, within budget. Returns (true, nil) if fully
+	// drained; (false, nil) if the budget elapsed with operations still in
+	// flight — the caller must then Undrain and postpone, never force-cut.
+	Drain(ctx context.Context, gen Generation, budget time.Duration) (bool, error)
+	// Undrain clears a generation's draining state so it resumes serving as the
+	// writer — used when a drain is aborted.
+	Undrain(ctx context.Context, gen Generation) error
 	// DrainAndStop drains the previous generation and waits for it to exit,
 	// which releases the writer lease. A no-op prev (empty id) is never passed.
 	DrainAndStop(ctx context.Context, prev Generation) error
@@ -62,6 +71,20 @@ var (
 	// ErrCASMismatch is returned when expectedCurrent does not match the live
 	// active generation — a stale or concurrent deploy.
 	ErrCASMismatch = errors.New("handoff: current generation does not match expected")
+	// ErrDeployPostponed is returned when the old generation could not drain its
+	// in-flight operations within budget. The deploy is aborted with the old
+	// generation still serving — the operation completes; retry when quieter.
+	ErrDeployPostponed = errors.New("handoff: deploy postponed — in-flight operations did not drain in budget")
+)
+
+const (
+	// totalGRPCHold bounds the whole control-plane hold across a cutover, sized
+	// under the control plane's Unavailable retry window so held callers still
+	// retry onto the new generation successfully.
+	totalGRPCHold = 12 * time.Second
+	// rollbackReserve is kept at the end of the budget so a late failure can roll
+	// back to the old generation without blowing the total.
+	rollbackReserve = 3 * time.Second
 )
 
 // Controller serializes and orchestrates generation cutovers on one host.
@@ -182,30 +205,47 @@ func (c *Controller) run(ctx context.Context, prev, next Generation) error {
 		return fmt.Errorf("await ready %s: %w", next.ID, err)
 	}
 
-	// 2. Hold gRPC BEFORE stopping the old generation: otherwise new calls keep
-	//    routing to it while systemctl stop closes its listeners and hit a dead
-	//    upstream. gRPC is refused with retryable Unavailable (the control plane
-	//    retries). The resolver is deliberately NOT held here — it is read-only,
-	//    so the old generation keeps answering lookups while it drains.
+	// 2. Hold gRPC BEFORE touching the old generation: new calls are refused
+	//    with retryable Unavailable (the control plane retries). The resolver is
+	//    NOT held here — it is read-only, so the old generation keeps answering
+	//    lookups while it drains. The hold has a hard total budget with time
+	//    reserved for rollback, so it never outlasts the caller's retry window.
 	c.act.QuiesceGRPC(true)
+	rollbackBy := time.Now().Add(totalGRPCHold - rollbackReserve)
 
-	// 3. Drain the old generation and let it exit, releasing the writer lease.
+	// 3. Abortable drain: ask the old generation to finish its in-flight
+	//    operations within budget. If they DON'T drain in time, abort the deploy
+	//    — resume the old generation and postpone. The customer operation
+	//    completes normally; the deploy loses to availability, never the reverse.
 	if prev.ID != "" {
-		if err := c.act.DrainAndStop(ctx, prev); err != nil {
-			_ = c.act.DrainAndStop(ctx, next) // clean up the unused standby
-			c.act.QuiesceGRPC(false)
+		drained, err := c.act.Drain(ctx, prev, time.Until(rollbackBy))
+		if err != nil {
+			c.abortDrain(ctx, prev, next)
 			return fmt.Errorf("drain %s: %w", prev.ID, err)
+		}
+		if !drained {
+			c.abortDrain(ctx, prev, next)
+			return fmt.Errorf("%w: %s", ErrDeployPostponed, prev.ID)
+		}
+		// Drained: stop the old generation (releasing the writer lease).
+		if err := c.act.DrainAndStop(ctx, prev); err != nil {
+			c.act.QuiesceGRPC(false)
+			_ = c.act.DrainAndStop(ctx, next)
+			return fmt.Errorf("stop drained %s: %w", prev.ID, err)
 		}
 	}
 
 	// 4. Now hold the resolver too — only for the brief activation window.
 	c.act.QuiesceResolver(true)
 
-	// 5. New generation acquires the lease, builds its active runtime,
-	//    revalidates host state, and becomes ready. On failure, roll back —
+	// 5. New generation acquires the lease and becomes ready, bounded by the
+	//    remaining budget before the rollback reserve. On failure, roll back —
 	//    and stay fail-closed (holds ON) if the rollback itself fails, rather
 	//    than releasing traffic onto a dead upstream.
-	if err := c.act.Activate(ctx, next); err != nil {
+	actCtx, cancel := context.WithDeadline(ctx, rollbackBy)
+	err := c.act.Activate(actCtx, next)
+	cancel()
+	if err != nil {
 		if rbErr := c.rollback(ctx, next, prev); rbErr != nil {
 			return fmt.Errorf("activate %s failed; rollback failed, holding traffic: %v; %w", next.ID, rbErr, err)
 		}
@@ -236,6 +276,16 @@ func (c *Controller) run(ctx context.Context, prev, next Generation) error {
 	c.current = next
 	c.mu.Unlock()
 	return nil
+}
+
+// abortDrain undoes an in-progress cutover when the old generation could not
+// drain in budget: the old generation resumes as writer (its lease was never
+// released), the gateway hold is lifted, and the unused standby is stopped. No
+// customer operation is cut.
+func (c *Controller) abortDrain(ctx context.Context, prev, next Generation) {
+	_ = c.act.Undrain(ctx, prev)
+	c.act.QuiesceGRPC(false)
+	_ = c.act.DrainAndStop(ctx, next)
 }
 
 // rollback recovers to the previous generation and returns an error if it could

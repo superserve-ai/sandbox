@@ -113,9 +113,37 @@ func (a *SystemdActions) QuiesceGRPC(on bool) { a.Gateway.QuiesceGRPC(on) }
 // QuiesceResolver toggles the gateway's resolver admission hold (in-process).
 func (a *SystemdActions) QuiesceResolver(on bool) { a.Gateway.QuiesceResolver(on) }
 
+// Drain asks a generation (over its control socket) to stop admitting new
+// mutating RPCs and wait up to budget for its in-flight ones to finish. The
+// generation replies "OK drained" or "OK busy ...".
+func (a *SystemdActions) Drain(ctx context.Context, gen Generation, budget time.Duration) (bool, error) {
+	dctx, cancel := context.WithTimeout(ctx, budget+2*time.Second)
+	defer cancel()
+	resp, err := a.send(dctx, a.GenControl(gen.ID), fmt.Sprintf("drain %d", budget.Milliseconds()))
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case strings.Contains(resp, "drained"):
+		return true, nil
+	case strings.Contains(resp, "busy"):
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected drain reply from %s: %s", gen.ID, resp)
+	}
+}
+
+// Undrain clears a generation's draining state so it resumes as writer.
+func (a *SystemdActions) Undrain(ctx context.Context, gen Generation) error {
+	uctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := a.send(uctx, a.GenControl(gen.ID), "undrain")
+	return err
+}
+
 // DrainAndStop stops the previous generation. systemctl stop blocks until the
-// unit is inactive — the generation drains, flushes, and exits, which releases
-// the writer lease.
+// unit is inactive — the generation flushes and exits, which releases the
+// writer lease. (In-flight operations were already drained by Drain.)
 func (a *SystemdActions) DrainAndStop(ctx context.Context, prev Generation) error {
 	return a.run(ctx, "systemctl", "stop", a.Unit(prev.ID))
 }
