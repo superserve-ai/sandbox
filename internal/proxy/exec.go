@@ -80,6 +80,9 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 
 	token := r.Header.Get(accessTokenHeader)
 	if token == "" {
+		// The token check IS the auth phase for this request; stamp it so
+		// the common 401 path lands in the auth series too.
+		tAuthDone = time.Now()
 		http.Error(w, "missing X-Access-Token header", http.StatusUnauthorized)
 		return
 	}

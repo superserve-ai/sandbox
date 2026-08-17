@@ -144,6 +144,11 @@ def main() -> int:
             sudo systemctl enable proxy
 
             sudo mkdir -p /etc/sandbox
+            # HOST_ID must match vmd's: it is the host's logical identity and
+            # is deliberately preserved across deploys (a replacement host
+            # keeps its predecessor's row ID), so copy vmd's value and fall
+            # back to the instance name only when no vmd env exists yet.
+            host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/vmd.env 2>/dev/null | head -n1 || true)
             sudo tee /etc/sandbox/proxy.env > /dev/null <<PROXYENV
             PROXY_DOMAIN={proxy_domain}
             PROXY_DOMAINS={proxy_domains}
@@ -151,7 +156,7 @@ def main() -> int:
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}
             SENTRY_DSN={sentry_dsn}
-            HOST_ID={name}{otel_env_lines}
+            HOST_ID=${{host_id:-{name}}}{otel_env_lines}
             PROXYENV
             sudo chmod 0600 /etc/sandbox/proxy.env
 

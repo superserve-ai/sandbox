@@ -1940,6 +1940,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			phases["lookup"] = tLookupDone.Sub(tStart)
 			if !tVmdStart.IsZero() {
 				phases["sched"] = tVmdStart.Sub(tLookupDone)
+			} else {
+				// Placement/attestation died mid-stage; report its elapsed
+				// time so slow failed scheduling stays visible in sched.
+				phases["sched"] = time.Since(tLookupDone)
 			}
 		}
 		switch {

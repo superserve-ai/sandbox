@@ -1685,10 +1685,18 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
 	var tSlot, tFcStart, tFcDone, tRestore, tRestoreDone time.Time
+	needsNetworkCleanup := false
+	defer func() {
+		if needsNetworkCleanup {
+			m.netMgr.TeardownVM(vmID)
+		}
+	}()
 	// Deferred, gated on real resume work having begun (tSlot): failed
 	// resumes must land in the phase distributions with whichever stages
 	// they reached — success-only emission hides the slowest failures.
 	// Precondition rejections before the slot claim emit nothing.
+	// Registered after the network-cleanup defer so it runs BEFORE
+	// TeardownVM: the elapsed-time fallbacks must not absorb teardown.
 	defer func() {
 		if tSlot.IsZero() {
 			return
@@ -1718,12 +1726,6 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			phases["restore"] = time.Since(tRestore)
 		}
 		m.recordPhases("resume", "", phases)
-	}()
-	needsNetworkCleanup := false
-	defer func() {
-		if needsNetworkCleanup {
-			m.netMgr.TeardownVM(vmID)
-		}
 	}()
 
 	inst, err := m.getInstance(vmID)
