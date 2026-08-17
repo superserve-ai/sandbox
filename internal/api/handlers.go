@@ -670,9 +670,10 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID) (string, bool) {
 	sandboxID := sandbox.ID
 	tResume := time.Now()
-	resumeOutcome := telemetry.ResultError
+	// Transition counts/results come from the SandboxLifecycleTelemetry
+	// middleware; this defer emits only the phase-series total so the
+	// resume phase histogram is self-consistent.
 	defer func() {
-		RecordSandboxTransition(c.Request.Context(), "resume", resumeOutcome, sandbox.HostID, time.Since(tResume))
 		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
 			map[string]time.Duration{"total": time.Since(tResume)})
 	}()
@@ -1014,7 +1015,6 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// ActivateSandbox's CTE opens the sandbox_active_interval row (async).
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": sandboxID.String()})
-	resumeOutcome = telemetry.ResultSuccess
 	return currentPolicy.Access, true
 }
 
@@ -2630,7 +2630,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		"post":        tPostDone.Sub(tInsertReceive),
 		"total":       tPostDone.Sub(tStart),
 	})
-	RecordSandboxTransition(c.Request.Context(), "create", telemetry.ResultSuccess, hostID, tPostDone.Sub(tStart))
 	c.JSON(http.StatusCreated, resp)
 }
 
@@ -2659,10 +2658,10 @@ func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id string) (sn
 
 func (h *Handlers) PauseSandbox(c *gin.Context) {
 	tPause := time.Now()
-	pauseOutcome := telemetry.ResultError
+	// Transition counts/results come from the SandboxLifecycleTelemetry
+	// middleware; this defer emits only the phase-series total.
 	pauseHostID := ""
 	defer func() {
-		RecordSandboxTransition(c.Request.Context(), "pause", pauseOutcome, pauseHostID, time.Since(tPause))
 		RecordLatencyPhases(c.Request.Context(), "pause", pauseHostID,
 			map[string]time.Duration{"total": time.Since(tPause)})
 	}()
@@ -2817,8 +2816,6 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// end of the VMD pause work, not the moment the sandbox left active.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
-	pauseOutcome = telemetry.ResultSuccess
-
 	c.Status(http.StatusNoContent)
 }
 
