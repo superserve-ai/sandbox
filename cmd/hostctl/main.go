@@ -7,7 +7,9 @@
 //	hostctl drain <host-id>
 //
 // The operator token is distinct from the vmd-held internal token: hosts
-// must not hold the credential that approves them.
+// must not hold the credential that approves them. The token's secret must
+// be provisioned into the control plane's deployment before these commands
+// work; until then the operator endpoints reject everything by design.
 package main
 
 import (

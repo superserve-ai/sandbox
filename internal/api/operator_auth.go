@@ -19,6 +19,13 @@ import (
 // activation the moment it self-registers, bypassing the provisioning
 // review. The machines being operated must never hold the key that
 // operates them.
+//
+// Rollout is deliberately staged: deployments enable these endpoints by
+// creating the OPERATOR_API_TOKEN secret and mapping it into the control
+// plane's environment (alongside INTERNAL_API_TOKEN in the deployment
+// config). Until that provisioning lands, operator endpoints are disabled —
+// every request is rejected — which is the intended dormant state, not a
+// misconfiguration.
 func OperatorAuth() gin.HandlerFunc {
 	token := os.Getenv("OPERATOR_API_TOKEN")
 
