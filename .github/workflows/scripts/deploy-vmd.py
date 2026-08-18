@@ -1043,14 +1043,13 @@ def main() -> int:
             sudo systemctl restart {service}
             # Wait for APPLICATION readiness, not is-active: the unit is
             # Type=simple, so "active" only proves the process forked, while vmd
-            # answers Unavailable until it logs startup-complete (its real gate,
-            # ~12s in prod). Scope the scan to the unit's CURRENT systemd
-            # invocation so neither a prior boot's nor a crashed-and-replaced
-            # process's ready line counts, then re-confirm that invocation is
-            # still current+active when the line is seen. Read journalctl into a
-            # var (no pipe) so a match can't SIGPIPE it under pipefail — same
-            # reason as the find -print -quit above. Fail with the recovery trap
-            # still armed on timeout.
+            # answers Unavailable until it logs startup-complete — its real gate,
+            # which can lag the fork. Scope the scan to the unit's CURRENT
+            # systemd invocation so no prior-boot or crashed-and-replaced ready
+            # line counts, and re-confirm that invocation is still current+active
+            # when the line is seen. Read journalctl into a var (no pipe) so a
+            # match can't SIGPIPE it under pipefail (as with the find -print
+            # -quit above). Fail with the recovery trap still armed on timeout.
             READY=0
             for i in $(seq 1 90); do
                 INVOCATION=$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)
