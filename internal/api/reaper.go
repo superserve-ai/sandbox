@@ -20,10 +20,9 @@ const defaultSweepInterval = 10 * time.Minute
 type ReaperConfig struct {
 	// Interval is how often the reaper polls for expired sandboxes.
 	Interval time.Duration
-	// SweepInterval paces the DB-only maintenance sweeps. They back up cleanup
-	// the request path already does, and each scans accumulated history to
-	// usually find nothing — on every instance, since the loop runs on all of
-	// them. 0 → 10m.
+	// SweepInterval paces the DB-only maintenance sweeps (see sweepLoop),
+	// whose scans cost the same whether or not there is anything to find —
+	// on every instance, since the loop runs on all of them. 0 → 10m.
 	SweepInterval time.Duration
 	// BatchSize bounds the number of sandboxes paused per cycle so a
 	// sudden wave of expirations cannot tie up the control plane.
@@ -82,29 +81,24 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 		Int("parallelism", parallelism).
 		Msg("timeout reaper started")
 
+	// Own goroutine, not another case in the select below: the poll's pauses
+	// and auto-delete teardowns block for host round trips, and sharing this
+	// goroutine would let a slow batch hold off the sweeps — the reason they
+	// ran last in the single-ticker loop this replaced. Concurrency here is
+	// not new: every control-plane instance already runs both loops.
+	go h.sweepLoop(ctx, sweepInterval)
+
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
-	sweepTicker := time.NewTicker(sweepInterval)
-	defer sweepTicker.Stop()
 
-	// Caller-set deadlines: these keep the poll interval.
 	runTick := func() {
 		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
 		sentrylog.RunSafe("auto-delete", func() { h.reapAutoDeleteOnce(ctx, cfg.BatchSize, parallelism) })
 	}
 
-	// On their own ticker, so a slow host during auto-delete's batch teardown
-	// cannot delay them and their scan cost is not tied to the poll rate.
-	runSweeps := func() {
-		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
-		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx) })
-		sentrylog.RunSafe("snapshot-row-sweep", func() { h.sweepOrphanedSnapshotRows(ctx) })
-	}
-
 	// Run once immediately so a control plane restart does not delay
 	// cleanup by up to `interval` seconds.
 	runTick()
-	runSweeps()
 
 	for {
 		select {
@@ -113,7 +107,32 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 			return
 		case <-ticker.C:
 			runTick()
-		case <-sweepTicker.C:
+		}
+	}
+}
+
+// sweepLoop runs the DB-only maintenance sweeps: backstops for cleanup the
+// request path already performs, each scanning accumulated history to usually
+// find nothing.
+func (h *Handlers) sweepLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	runSweeps := func() {
+		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
+		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx) })
+		sentrylog.RunSafe("snapshot-row-sweep", func() { h.sweepOrphanedSnapshotRows(ctx) })
+	}
+
+	// Immediately, so a restart after a crash cleans up without waiting a
+	// full interval.
+	runSweeps()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 			runSweeps()
 		}
 	}
