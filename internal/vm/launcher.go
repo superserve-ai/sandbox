@@ -262,10 +262,6 @@ func unescapeMountinfo(s string) string {
 func (m *Manager) startSampler(ctx context.Context, name string, every time.Duration, fn func()) {
 	go func() {
 		defer sentrylog.Recover(name)
-		// One immediate sample so the startup window has a value, not only after
-		// the first interval — the netns/mount counts are the fleet-size
-		// correlates for the startup phase timings.
-		fn()
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for {
@@ -286,6 +282,19 @@ func (m *Manager) startSampler(ctx context.Context, name string, every time.Dura
 // the per-launch warns carry the vm_id detail but make a poor time series.
 // One /proc/mounts read per tick.
 func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duration) {
+	// One immediate gauge-only sample so the startup window has a mount count
+	// (the fleet-size correlate for the startup phase timings) without waiting
+	// out the first interval. Async: the caller is the startup goroutine and
+	// this scan must not sit on the readiness path. Deliberately NOT the full
+	// tick body: revalidation during the in-flight boot-time launcher build
+	// would burn the rebuild cooldown on a single-flight no-op.
+	go func() {
+		defer sentrylog.Recover("mount-count first sample")
+		total, nsfs := hostMountCounts()
+		m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
+			Bool("launcher_ready", m.launcherReady.Load()).
+			Msg("host mount table")
+	}()
 	m.startSampler(ctx, "mount-count sampler", every, func() {
 		total, nsfs := hostMountCounts()
 		m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
@@ -305,12 +314,21 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 // netns_orphaned (namespaces with no owning slot) is the leak signal: sustained
 // growth means teardown is leaking. One /run/netns readdir per tick.
 func (m *Manager) StartNetnsLeakSampler(ctx context.Context, every time.Duration) {
-	m.startSampler(ctx, "netns-leak sampler", every, func() {
+	sample := func() {
 		netnsTotal, ownedSlots, orphaned := m.netMgr.NetnsStats()
 		m.log.Info().Int("netns_total", netnsTotal).Int("owned_slots", ownedSlots).
 			Int("netns_orphaned", orphaned).
 			Msg("netns leak gauge")
-	})
+	}
+	// One immediate sample so the startup window has a netns count — the
+	// fleet-size correlate for the startup phase timings. Async: the caller is
+	// the startup goroutine and NetnsStats readdirs /run/netns under the
+	// allocator lock, which must not sit on the readiness path.
+	go func() {
+		defer sentrylog.Recover("netns-leak first sample")
+		sample()
+	}()
+	m.startSampler(ctx, "netns-leak sampler", every, sample)
 }
 
 // revalidateLauncher re-syncs launcherReady with the live pin each tick: drop to

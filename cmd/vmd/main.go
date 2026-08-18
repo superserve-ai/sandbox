@@ -324,30 +324,54 @@ type startupTimer struct {
 	log   zerolog.Logger
 	start time.Time
 	last  time.Time
+	// Marks are timestamped on the startup goroutine but WRITTEN from a
+	// dedicated goroutine: a backpressured stdout/collector must never let the
+	// instrumentation delay the readiness it is measuring. Buffered well above
+	// the phase count, so sends never block; an overflow drops the record
+	// (telemetry) rather than stalling startup.
+	ch chan startupPhaseRecord
+}
+
+type startupPhaseRecord struct {
+	phase      string
+	enabled    bool
+	phaseDur   time.Duration
+	sinceStart time.Duration
+	count      int
 }
 
 func newStartupTimer(log zerolog.Logger) *startupTimer {
 	now := time.Now()
-	return &startupTimer{log: log, start: now, last: now}
+	s := &startupTimer{log: log, start: now, last: now, ch: make(chan startupPhaseRecord, 64)}
+	go func() {
+		for r := range s.ch {
+			e := s.log.Info().
+				Str("startup_phase", r.phase).
+				Bool("enabled", r.enabled).
+				Dur("phase_ms", r.phaseDur).
+				Dur("since_start_ms", r.sinceStart)
+			if r.count >= 0 {
+				e = e.Int("count", r.count)
+			}
+			e.Msg("startup phase timing")
+		}
+	}()
+	return s
 }
 
-// mark logs the segment ending here (duration since the previous mark, plus
-// cumulative since start). Every phase boundary is emitted even when its
-// optional work is skipped (enabled=false, ~0 duration) so phase labels stay
-// comparable across host configs and the partition stays attributable. Main-
-// goroutine only — it mutates last; background work logs its own duration.
+// mark records the segment ending here (duration since the previous mark, plus
+// cumulative since start); the log write happens off this goroutine. Every
+// phase boundary is emitted even when its optional work is skipped
+// (enabled=false, ~0 duration) so phase labels stay comparable across host
+// configs and the partition stays attributable. Main-goroutine only — it
+// mutates last; background work logs its own duration.
 // count >= 0 attaches an aggregate, -1 omits it.
 func (s *startupTimer) mark(phase string, enabled bool, count int) {
 	now := time.Now()
-	e := s.log.Info().
-		Str("startup_phase", phase).
-		Bool("enabled", enabled).
-		Dur("phase_ms", now.Sub(s.last)).
-		Dur("since_start_ms", now.Sub(s.start))
-	if count >= 0 {
-		e = e.Int("count", count)
+	select {
+	case s.ch <- startupPhaseRecord{phase: phase, enabled: enabled, phaseDur: now.Sub(s.last), sinceStart: now.Sub(s.start), count: count}:
+	default:
 	}
-	e.Msg("startup phase timing")
 	s.last = now
 }
 
