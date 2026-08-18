@@ -359,7 +359,18 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        -- would cross-multiply the per-host rows and corrupt the counts.
        COALESCE((SELECT COUNT(*) FROM template_build tb
                  WHERE tb.vmd_host_id = h.id
-                   AND tb.status IN ('building', 'snapshotting')), 0)::int AS building_count
+                   AND tb.status IN ('building', 'snapshotting')), 0)::int AS building_count,
+       -- Paused sandboxes with NO durable backup generation: the ones whose
+       -- only copy lives on this host's local disk. Retiring the machine
+       -- destroys them outright; even paused-with-coverage stays pinned
+       -- here until cross-host restore exists, but unbacked is the
+       -- irrecoverable class an operator must never retire past.
+       COALESCE((SELECT COUNT(*) FROM sandbox s2
+                 WHERE s2.host_id = h.id
+                   AND s2.status = 'paused'
+                   AND s2.destroyed_at IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM backup_generation bg
+                                   WHERE bg.sandbox_id = s2.id)), 0)::int AS paused_unbacked_count
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
 GROUP BY h.id
@@ -367,20 +378,21 @@ ORDER BY h.created_at ASC
 `
 
 type ListHostsAdminRow struct {
-	ID                string             `json:"id"`
-	VmdAddr           string             `json:"vmd_addr"`
-	ProxyAddr         string             `json:"proxy_addr"`
-	Region            string             `json:"region"`
-	Status            string             `json:"status"`
-	CapacityMemoryMib int32              `json:"capacity_memory_mib"`
-	CapacityVcpus     int32              `json:"capacity_vcpus"`
-	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
-	CreatedAt         time.Time          `json:"created_at"`
-	UpdatedAt         time.Time          `json:"updated_at"`
-	RunningCount      int32              `json:"running_count"`
-	TransitionalCount int32              `json:"transitional_count"`
-	PausedCount       int32              `json:"paused_count"`
-	BuildingCount     int32              `json:"building_count"`
+	ID                  string             `json:"id"`
+	VmdAddr             string             `json:"vmd_addr"`
+	ProxyAddr           string             `json:"proxy_addr"`
+	Region              string             `json:"region"`
+	Status              string             `json:"status"`
+	CapacityMemoryMib   int32              `json:"capacity_memory_mib"`
+	CapacityVcpus       int32              `json:"capacity_vcpus"`
+	LastHeartbeatAt     pgtype.Timestamptz `json:"last_heartbeat_at"`
+	CreatedAt           time.Time          `json:"created_at"`
+	UpdatedAt           time.Time          `json:"updated_at"`
+	RunningCount        int32              `json:"running_count"`
+	TransitionalCount   int32              `json:"transitional_count"`
+	PausedCount         int32              `json:"paused_count"`
+	BuildingCount       int32              `json:"building_count"`
+	PausedUnbackedCount int32              `json:"paused_unbacked_count"`
 }
 
 // Operator view (hostctl): every host regardless of status, with live
@@ -411,6 +423,7 @@ func (q *Queries) ListHostsAdmin(ctx context.Context) ([]ListHostsAdminRow, erro
 			&i.TransitionalCount,
 			&i.PausedCount,
 			&i.BuildingCount,
+			&i.PausedUnbackedCount,
 		); err != nil {
 			return nil, err
 		}

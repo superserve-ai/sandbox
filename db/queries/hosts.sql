@@ -222,7 +222,18 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        -- would cross-multiply the per-host rows and corrupt the counts.
        COALESCE((SELECT COUNT(*) FROM template_build tb
                  WHERE tb.vmd_host_id = h.id
-                   AND tb.status IN ('building', 'snapshotting')), 0)::int AS building_count
+                   AND tb.status IN ('building', 'snapshotting')), 0)::int AS building_count,
+       -- Paused sandboxes with NO durable backup generation: the ones whose
+       -- only copy lives on this host's local disk. Retiring the machine
+       -- destroys them outright; even paused-with-coverage stays pinned
+       -- here until cross-host restore exists, but unbacked is the
+       -- irrecoverable class an operator must never retire past.
+       COALESCE((SELECT COUNT(*) FROM sandbox s2
+                 WHERE s2.host_id = h.id
+                   AND s2.status = 'paused'
+                   AND s2.destroyed_at IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM backup_generation bg
+                                   WHERE bg.sandbox_id = s2.id)), 0)::int AS paused_unbacked_count
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
 GROUP BY h.id

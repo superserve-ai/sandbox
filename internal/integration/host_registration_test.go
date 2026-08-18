@@ -511,3 +511,74 @@ func TestIntegration_HostIdentityOptIn(t *testing.T) {
 		t.Fatalf("legacy heartbeat on bound row = %d, want 409", w.Code)
 	}
 }
+
+// UNBACKED counts the paused sandboxes whose ONLY copy is the host's local
+// disk — no durable backup generation anywhere. A durable copy moves a
+// sandbox out of the count; it is the number that must be zero before
+// retiring a machine is even discussable.
+func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
+	r := newRouter(t)
+	hostID := "ubk-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
+
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{`+hostDescription+`}`); w.Code != http.StatusOK {
+		t.Fatalf("seed host: %d %s", w.Code, w.Body.String())
+	}
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"unbacked-probe"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := mustJSON(t, cw)["id"].(string)
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET status = 'paused', host_id = $2 WHERE id = $1`,
+		sandboxID, hostID); err != nil {
+		t.Fatalf("pin paused sandbox: %v", err)
+	}
+
+	counts := func() (paused, unbacked int32) {
+		req := httptest.NewRequest("GET", "/internal/hosts", nil)
+		req.Header.Set("Authorization", "Bearer optok-hostreg")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("list: %d %s", w.Code, w.Body.String())
+		}
+		var out struct {
+			Hosts []struct {
+				ID             string `json:"id"`
+				PausedCount    int32  `json:"paused_count"`
+				PausedUnbacked int32  `json:"paused_unbacked_count"`
+			} `json:"hosts"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		for _, h := range out.Hosts {
+			if h.ID == hostID {
+				return h.PausedCount, h.PausedUnbacked
+			}
+		}
+		t.Fatalf("host %s not in list", hostID)
+		return 0, 0
+	}
+
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("before backup: paused=%d unbacked=%d, want 1/1", paused, unbacked)
+	}
+
+	// A durable generation appears (as the upload-report path would record
+	// it): the sandbox stays paused but leaves the unbacked class.
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
+		 VALUES ($1, repeat('a', 64), 'cell-bucket', now(), '[]'::jsonb)`,
+		sandboxID); err != nil {
+		t.Fatalf("record backup generation: %v", err)
+	}
+	if paused, unbacked := counts(); paused != 1 || unbacked != 0 {
+		t.Fatalf("after backup: paused=%d unbacked=%d, want 1/0", paused, unbacked)
+	}
+}

@@ -329,6 +329,7 @@ func (h *Handlers) HostList(c *gin.Context) {
 		TransitionalCount int32   `json:"transitional_count"`
 		PausedCount       int32   `json:"paused_count"`
 		BuildingCount     int32   `json:"building_count"`
+		PausedUnbacked    int32   `json:"paused_unbacked_count"`
 	}
 	hosts := make([]hostView, 0, len(rows))
 	for _, r := range rows {
@@ -341,6 +342,7 @@ func (h *Handlers) HostList(c *gin.Context) {
 			TransitionalCount: r.TransitionalCount,
 			PausedCount:       r.PausedCount,
 			BuildingCount:     r.BuildingCount,
+			PausedUnbacked:    r.PausedUnbackedCount,
 		}
 		if r.LastHeartbeatAt.Valid {
 			s := r.LastHeartbeatAt.Time.UTC().Format(time.RFC3339)

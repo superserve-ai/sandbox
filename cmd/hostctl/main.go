@@ -171,6 +171,7 @@ type hostView struct {
 	TransitionalCount int     `json:"transitional_count"`
 	PausedCount       int     `json:"paused_count"`
 	BuildingCount     int     `json:"building_count"`
+	PausedUnbacked    int     `json:"paused_unbacked_count"`
 }
 
 func (c client) hosts() ([]hostView, error) {
@@ -215,8 +216,11 @@ func (c client) list() error {
 	// land. It does NOT mean safe to retire: PAUSED sandboxes' snapshots
 	// live on the host's local disk and resume is pinned to it, so retiring
 	// the machine strands every one of them. Until cross-host restore
-	// exists, retirement additionally requires PAUSED = 0.
-	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED")
+	// exists, retirement additionally requires PAUSED = 0. UNBACKED is the
+	// irrecoverable subset — paused sandboxes with no durable backup copy
+	// anywhere; retiring the machine destroys those outright, so that
+	// number must read zero before retirement is even discussable.
+	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED\tUNBACKED")
 	for _, h := range out.Hosts {
 		beat := "never"
 		if h.LastHeartbeatAt != nil {
@@ -224,8 +228,8 @@ func (c client) list() error {
 				beat = fmt.Sprintf("%ds ago", int(time.Since(t).Seconds()))
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\n",
-			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\n",
+			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount, h.PausedUnbacked)
 	}
 	return w.Flush()
 }
