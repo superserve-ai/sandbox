@@ -481,6 +481,7 @@ INSERT INTO billing_usage_export (
     resource_type,
     stripe_customer_id,
     stripe_meter_event_identifier,
+    stripe_idempotency_key,
     stripe_event_name,
     value,
     status,
@@ -494,6 +495,7 @@ VALUES (
     sqlc.arg(resource_type),
     sqlc.narg(stripe_customer_id),
     sqlc.arg(stripe_meter_event_identifier),
+    sqlc.narg(stripe_idempotency_key),
     sqlc.arg(stripe_event_name),
     sqlc.arg(value),
     sqlc.arg(status),
@@ -511,13 +513,44 @@ SET status = sqlc.arg(status),
 WHERE id = sqlc.arg(id)
 RETURNING *;
 
+-- name: MarkBillingUsageExportSent :one
+UPDATE billing_usage_export
+SET status = 'sent',
+    sent_at = sqlc.arg(sent_at),
+    updated_at = now()
+WHERE id = sqlc.arg(id)
+  AND status = 'pending'
+RETURNING *;
+
+-- name: SetBillingUsageExportIdempotencyKey :one
+UPDATE billing_usage_export
+SET stripe_idempotency_key = sqlc.arg(stripe_idempotency_key),
+    updated_at = now()
+WHERE id = sqlc.arg(id)
+  AND (stripe_idempotency_key IS NULL OR stripe_idempotency_key = stripe_meter_event_identifier)
+RETURNING *;
+
 -- name: ListBillingUsageExportsForPeriod :many
 SELECT *
 FROM billing_usage_export
 WHERE team_id = sqlc.arg(team_id)
   AND period_start = sqlc.arg(period_start)
   AND period_end = sqlc.arg(period_end)
-ORDER BY created_at ASC;
+ORDER BY created_at ASC, id ASC;
+
+-- name: GetBillingUsageExportByIdempotencyKey :one
+SELECT *
+FROM billing_usage_export
+WHERE stripe_idempotency_key = sqlc.arg(stripe_idempotency_key)
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+
+-- name: GetBillingUsageExportByIdentifier :one
+SELECT *
+FROM billing_usage_export
+WHERE stripe_meter_event_identifier = sqlc.arg(stripe_meter_event_identifier)
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
 
 -- name: CreateStripeWebhookEvent :one
 INSERT INTO stripe_webhook_event (event_id, event_type, payload)
