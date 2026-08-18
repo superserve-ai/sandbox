@@ -159,32 +159,50 @@ func TestLifecycle_CleanIntentionalShutdownGate(t *testing.T) {
 	})
 }
 
-// A closer that overruns its deadline is still running, so shutdown must abort
-// rather than close the dependency it may still be using out from under it. The
-// sequence stays bounded and records the failure.
-func TestShutdownAbortsOnWedgedCloser(t *testing.T) {
+// A closer that fails or overruns may still have a worker touching its
+// dependencies' resources, so shutdown must abort rather than close those
+// dependencies out from under it. Covers all three failure shapes; each must
+// leave the dependency unclosed, stay bounded, and record the error.
+func TestShutdownAbortsOnCloserFailure(t *testing.T) {
 	prev := perCloserShutdownTimeout
 	perCloserShutdownTimeout = 50 * time.Millisecond
 	defer func() { perCloserShutdownTimeout = prev }()
 
-	lc := newLifecycle(zerolog.Nop())
-	var depClosed atomic.Bool
-	// LIFO shutdown: registered dep, wedged, latest runs as latest, wedged,
-	// dep. dep (registered first, run last) is the wedged closer's dependency;
-	// it must NOT be closed while the wedged closer is still running.
-	lc.addCloser("dep", func(context.Context) error { depClosed.Store(true); return nil })
-	lc.addCloser("wedged", func(context.Context) error { select {} }) // ponytail: never returns, ignores ctx
-	lc.addCloser("latest", func(context.Context) error { return nil })
+	run := func(t *testing.T, failing func(context.Context) error) {
+		lc := newLifecycle(zerolog.Nop())
+		var depClosed atomic.Bool
+		// LIFO shutdown: registered dep, failing, latest runs as latest,
+		// failing, dep. dep (registered first, run last) is the failing
+		// closer's dependency and must NOT be closed after the abort.
+		lc.addCloser("dep", func(context.Context) error { depClosed.Store(true); return nil })
+		lc.addCloser("failing", failing)
+		lc.addCloser("latest", func(context.Context) error { return nil })
 
-	start := time.Now()
-	lc.shutdown(context.Background())
-	if d := time.Since(start); d > 2*time.Second {
-		t.Fatalf("shutdown not bounded: took %v", d)
+		start := time.Now()
+		lc.shutdown(context.Background())
+		if d := time.Since(start); d > 2*time.Second {
+			t.Fatalf("shutdown not bounded: took %v", d)
+		}
+		if depClosed.Load() {
+			t.Fatal("dependency closed after a failed/overrun closer — must abort instead")
+		}
+		if lc.closerErr == nil {
+			t.Fatal("failed closer must record closerErr (bars vouching)")
+		}
 	}
-	if depClosed.Load() {
-		t.Fatal("dependency closed under a still-running closer — must abort instead")
-	}
-	if lc.closerErr == nil {
-		t.Fatal("wedged closer must record closerErr (bars vouching)")
-	}
+
+	// Respects ctx and returns ctx.Err() at its deadline — its worker may still
+	// be live, and the outer select can receive this from done instead of
+	// selecting closerCtx.Done(). Must still abort.
+	t.Run("returns ctx.Err at deadline", func(t *testing.T) {
+		run(t, func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() })
+	})
+	// Returns a plain error promptly — the done branch must also abort.
+	t.Run("returns error", func(t *testing.T) {
+		run(t, func(context.Context) error { return fmt.Errorf("boom") })
+	})
+	// Ignores ctx entirely and never returns — the deadline branch aborts.
+	t.Run("wedged, ignores ctx", func(t *testing.T) {
+		run(t, func(context.Context) error { select {} }) // ponytail: never returns
+	})
 }

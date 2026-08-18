@@ -276,15 +276,19 @@ func (lc *lifecycle) wait(ctx context.Context) {
 // ponytail: a circuit-breaker budget, not a correctness assumption — tune freely.
 var perCloserShutdownTimeout = 12 * time.Second
 
-// shutdown runs every registered closer in reverse (dependency) order. A
-// closer that RETURNS an error is logged and the loop continues — it is done
-// touching its resources, so its dependencies are safe to close. A closer that
-// OVERRUNS its deadline is still running, so the loop must NOT keep closing the
-// dependencies it may still be using (use-after-close): it records the failure
-// and aborts the sequence, leaving the rest to process exit (and systemd
-// TimeoutStopSec). Each closer runs under its own deadline and off the main
-// goroutine. Any failed or timed-out closer records closerErr, which bars this
-// shutdown from vouching for inventory it may have left inconsistent.
+// shutdown runs registered closers in reverse (dependency) order, each under
+// its own deadline and off the main goroutine. Any non-nil outcome — a returned
+// error OR an overrun deadline — aborts the sequence rather than continuing.
+// The two are indistinguishable and both unsafe to continue past: a closer that
+// returns ctx.Err() at its deadline (the uploader and flow sink do) may still
+// have a worker touching the resources its dependencies own, and at the
+// deadline the select can receive that error from done instead of selecting
+// closerCtx.Done(). Because closers run in dependency order, continuing would
+// close BoltDB/GCS/DB out from under a live worker — a use-after-close. On
+// abort the remaining descriptors are reclaimed by process exit (systemd
+// TimeoutStopSec is the final backstop), and the recorded closerErr bars this
+// shutdown from vouching for inventory it may have left inconsistent. A clean
+// shutdown returns nil from every closer and closes the whole chain.
 func (lc *lifecycle) shutdown(ctx context.Context) {
 	lc.mu.Lock()
 	closers := slices.Clone(lc.closers)
@@ -299,18 +303,17 @@ func (lc *lifecycle) shutdown(ctx context.Context) {
 		// forever on a receiver that has moved on.
 		done := make(chan error, 1)
 		go func() { done <- c.close(closerCtx) }()
+		var err error
 		select {
-		case err := <-done:
-			cancel()
-			if err != nil {
-				lc.log.Error().Err(err).Str("service", c.name).Msg("close returned error")
-				lc.recordCloserErr(fmt.Errorf("%s: %w", c.name, err))
-			}
+		case err = <-done:
 		case <-closerCtx.Done():
-			cancel()
-			lc.log.Error().Str("service", c.name).Dur("deadline", perCloserShutdownTimeout).
-				Msg("closer exceeded its shutdown deadline; aborting graceful shutdown")
-			lc.recordCloserErr(fmt.Errorf("%s: shutdown deadline exceeded", c.name))
+			err = fmt.Errorf("shutdown deadline exceeded")
+		}
+		cancel()
+		if err != nil {
+			lc.log.Error().Err(err).Str("service", c.name).
+				Msg("closer failed or overran; aborting graceful shutdown")
+			lc.recordCloserErr(fmt.Errorf("%s: %w", c.name, err))
 			return
 		}
 	}
