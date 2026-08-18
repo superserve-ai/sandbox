@@ -788,9 +788,9 @@ func main() {
 	oss := stateStore.OpenStats()
 	st.emit(func() {
 		log.Info().Dur("bolt_open_ms", oss.BoltOpen).Dur("policy_scan_ms", oss.PolicyScan).
-			Dur("record_scan_ms", oss.RecordScan).Int("records", oss.Records).
-			Int("policies", oss.Policies).Int("orphans_deleted", oss.OrphansDeleted).
-			Msg("state store open breakdown")
+			Dur("record_scan_ms", oss.RecordScan).Dur("tx_residual_ms", oss.TxResidual).
+			Int("records", oss.Records).Int("policies", oss.Policies).
+			Int("orphans_deleted", oss.OrphansDeleted).Msg("state store open breakdown")
 	})
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
@@ -1256,10 +1256,6 @@ func main() {
 			Msg("skipping network pool adoption: live namespaces not provably protected")
 	}
 
-	// Leak gauge for network namespaces — independent of the launcher path, and
-	// started after StartPool so its first read observes an initialized pool.
-	mgr.StartNetnsLeakSampler(ctx, time.Minute)
-
 	// pool_start: StartPool (async fill), adoption wiring, launcher-ns setup.
 	st.mark("pool_start", true, -1)
 
@@ -1461,6 +1457,12 @@ func main() {
 	startupReady.Store(true)
 	st.mark("ready", true, -1)
 	log.Info().Msg("startup complete — gRPC serving requests")
+
+	// Leak gauge for network namespaces — independent of the launcher path.
+	// Started AFTER readiness (and so after StartPool): its immediate first
+	// sample walks the fleet under the allocator lock, which must not contend
+	// with pool fill, reattach, or a first slot-allocating request pre-ready.
+	mgr.StartNetnsLeakSampler(ctx, time.Minute)
 
 	// ---- Wait for signal or service failure ----
 	sigCh := make(chan os.Signal, 1)

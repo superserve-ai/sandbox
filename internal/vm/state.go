@@ -291,6 +291,7 @@ type StateStoreOpenStats struct {
 	BoltOpen       time.Duration // bolt.Open: mmap + freelist load
 	PolicyScan     time.Duration // sidecar orphan scan + deletes
 	RecordScan     time.Duration // primary record scan + policy migration
+	TxResidual     time.Duration // db.Update outside the scans: bucket creates + commit/fsync
 	Records        int
 	Policies       int
 	OrphansDeleted int
@@ -311,6 +312,7 @@ func OpenStateStore(path string) (*StateStore, error) {
 		return nil, fmt.Errorf("open state store %s: %w", path, err)
 	}
 	stats.BoltOpen = time.Since(tOpen)
+	tTx := time.Now()
 	if err := db.Update(func(tx *bolt.Tx) error {
 		records, err := tx.CreateBucketIfNotExists(bucketName)
 		if err != nil {
@@ -374,6 +376,9 @@ func OpenStateStore(path string) (*StateStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("initialize state store: %w", err)
 	}
+	// db.Update time outside the two scans: bucket creation plus the Bolt
+	// commit/fsync, which only happens after the callback returns.
+	stats.TxResidual = time.Since(tTx) - stats.PolicyScan - stats.RecordScan
 	return &StateStore{db: db, openStats: stats}, nil
 }
 
