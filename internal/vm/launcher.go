@@ -262,6 +262,10 @@ func unescapeMountinfo(s string) string {
 func (m *Manager) startSampler(ctx context.Context, name string, every time.Duration, fn func()) {
 	go func() {
 		defer sentrylog.Recover(name)
+		// One immediate sample so the startup window has a value, not only after
+		// the first interval — the netns/mount counts are the fleet-size
+		// correlates for the startup phase timings.
+		fn()
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for {
