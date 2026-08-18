@@ -193,10 +193,9 @@ type lifecycle struct {
 	// receipt: only a deliberate, fully clean shutdown may vouch.
 	signalInitiated bool
 	closerErr       error
-	// forcedRPCStop is set when the gRPC drain hit its budget and active RPCs
-	// were force-cancelled. A cancelled create/pause/resume may have left state
-	// the next boot must reconcile, so this bars the pool receipt — the drain
-	// budget is a circuit breaker, never a proven-safe cancellation bound.
+	// forcedRPCStop is set when the gRPC drain overran its budget and active
+	// RPCs were force-cancelled — a possibly-inconsistent state the next boot
+	// must reconcile, so it bars the pool receipt.
 	forcedRPCStop bool
 
 	done   chan struct{}
@@ -284,11 +283,10 @@ func (lc *lifecycle) wait(ctx context.Context) {
 // perCloserShutdownTimeout bounds each closer independently during shutdown.
 // A closer that ignores cancellation must not stall the closers after it or
 // hang the process — the loop aborts the graceful sequence if one overruns,
-// so total shutdown stays bounded. When it bounds the gRPC drain, a hit budget
-// force-cancels active RPCs AND marks the shutdown unclean (see the gRPC
-// closer), so overrunning it costs a next-boot reconcile — never a silent clean
-// handoff. It is a circuit breaker, not a proven-safe cancellation bound.
-// systemd TimeoutStopSec is the final backstop if the process wedges past this.
+// so total shutdown stays bounded. Bounding the gRPC drain, a hit budget
+// force-cancels active RPCs and marks the shutdown unclean (see the gRPC
+// closer) — a circuit breaker (overrun costs a reconcile), not a proven-safe
+// cancellation bound. systemd TimeoutStopSec is the final backstop.
 var perCloserShutdownTimeout = 12 * time.Second
 
 // shutdown runs registered closers in reverse (dependency) order, each under
@@ -1314,11 +1312,9 @@ func main() {
 		case <-done:
 			log.Info().Msg("gRPC server stopped gracefully")
 		case <-shutdownCtx.Done():
-			// Force-cancel active RPCs to stay bounded, but mark the shutdown
-			// unclean: a cancelled create/pause/resume may have left state the
-			// next boot must reconcile, so this can never be a clean handoff
-			// that vouches the pool receipt. Return nil (not an error) so the
-			// remaining closers still flush their state gracefully.
+			// Force-cancel to stay bounded, but mark the shutdown unclean so it
+			// can't vouch the pool receipt. Return nil (below) so the remaining
+			// closers still flush state.
 			log.Warn().Msg("graceful shutdown timed out — forcing gRPC stop; marking shutdown unclean")
 			lc.noteForcedRPCStop()
 			grpcServer.Stop()

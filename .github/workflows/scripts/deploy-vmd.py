@@ -1040,16 +1040,14 @@ def main() -> int:
             # `restart` guarantees the process running once this script
             # exits is always the one reading the final, fully-migrated
             # config, whether or not a reactivation race occurred.
-            # Capture the moment just before restart so the readiness scan sees
-            # only the NEW process's log line, never a prior boot's.
+            # Timestamp before the restart so the readiness scan sees only the
+            # new process's log line.
             READY_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
             sudo systemctl restart {service}
-            # Wait for APPLICATION readiness, not just is-active. The unit is
-            # Type=simple, so "active" means only that the process forked, while
-            # vmd answers Unavailable until it logs startup-complete — its real
-            # request gate, which measured prod startup reaches in ~12s. Poll for
-            # that line, bounded well above it, and fail (leaving the recovery
-            # trap armed) if the process never gets there or dies trying.
+            # Wait for APPLICATION readiness, not is-active: the unit is
+            # Type=simple, so "active" only means the process forked, while vmd
+            # answers Unavailable until it logs startup-complete (its real gate,
+            # ~12s in prod). Fail with the recovery trap still armed on timeout.
             READY=0
             for i in $(seq 1 90); do
                 if sudo journalctl -u {service} --since "$READY_SINCE" --no-pager 2>/dev/null | grep -qF "gRPC serving requests"; then
