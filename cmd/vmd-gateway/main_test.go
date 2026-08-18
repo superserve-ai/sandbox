@@ -4,9 +4,31 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/gateway"
+	"github.com/superserve-ai/sandbox/internal/handoff"
 )
+
+func TestBudgetsFromEnv(t *testing.T) {
+	log := zerolog.Nop()
+	def := handoff.DefaultBudgets()
+
+	t.Setenv("VMD_HANDOFF_DRAIN_BUDGET", "7s")
+	if got := budgetsFromEnv(def, log); got.Drain != 7*time.Second {
+		t.Fatalf("valid drain = %v, want 7s", got.Drain)
+	}
+
+	// Zero, negative, over-max, and unparseable must all fall back to the default.
+	for _, bad := range []string{"0", "-5s", "10m", "nonsense"} {
+		t.Setenv("VMD_HANDOFF_DRAIN_BUDGET", bad)
+		if got := budgetsFromEnv(def, log); got.Drain != def.Drain {
+			t.Fatalf("bad value %q accepted: got %v, want default %v", bad, got.Drain, def.Drain)
+		}
+	}
+}
 
 func TestApplyControl(t *testing.T) {
 	cs := &controlState{gw: gateway.New()}

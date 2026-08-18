@@ -436,10 +436,9 @@ def main() -> int:
             sudo install -m 0755 {extract_dir}/bin/vmd-gateway {install_dir}/vmd-gateway
             NEW_GW_HASH=$(sha256sum {install_dir}/vmd-gateway | awk '{{print $1}}')
             sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd-{sha}
-            # Retain only the most recent versioned generation binaries (the
-            # running one plus rollback candidates) so the root disk does not grow
-            # without bound. Matches vmd-<hex-sha> only, never vmd / vmd-gateway.
-            ls -t {install_dir}/vmd-[0-9a-f]* 2>/dev/null | tail -n +6 | xargs -r sudo rm -f
+            # NOTE: old generation binaries are pruned AFTER a successful cutover
+            # (below), never here — pruning by mtime before cutover could delete
+            # the still-serving generation's binary and break rollback/recovery.
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-gateway.service /etc/systemd/system/superserve-vmd-gateway.service
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd@.service /etc/systemd/system/superserve-vmd@.service
             sudo install -d /etc/systemd/system/superserve-vmd.service.d
@@ -841,7 +840,16 @@ def main() -> int:
             # (old path unchanged, no old file, or a destination already
             # migrated by an earlier deploy) so this is a no-op in steady
             # state.
-            if [ -n {q_backup_journal} ]; then
+            if [ -n {q_backup_journal} ] && [ -f /etc/sandbox/gateway-topology ]; then
+                # On a gateway host the active generation is RUNNING and holds its
+                # BoltDB open — copying/renaming the journal file underneath it
+                # would corrupt a live database (the legacy stop above does not
+                # stop the generation). Skip the migration entirely; the env is
+                # left untouched so no restart opens an empty DB at a new path. A
+                # journal-path change on a gateway host is a drained maintenance
+                # operation, not a routine deploy.
+                echo "note: skipping legacy backup-journal migration on gateway host (would touch a live BoltDB)"
+            elif [ -n {q_backup_journal} ]; then
                 # {service} was already stopped above (unconditionally, for
                 # every deploy) before this block is even reached, so any
                 # failure exit between here and the restart/health-check
@@ -1085,6 +1093,17 @@ def main() -> int:
                     exit 1
                 )
             fi
+            # Prune old generation binaries now that the cutover (or legacy
+            # restart) has succeeded — never before, and never the currently
+            # serving generation. The serving id comes from the gateway's
+            # active-generation record (absent on legacy hosts, where these
+            # binaries are unused so mtime pruning is safe); keep the 5 newest as
+            # rollback candidates.
+            ACTIVE_GEN=$(head -1 /var/lib/sandbox/active-generation 2>/dev/null || true)
+            for b in $(ls -t {install_dir}/vmd-[0-9a-f]* 2>/dev/null | tail -n +6); do
+                [ "$b" = "{install_dir}/vmd-$ACTIVE_GEN" ] && continue
+                sudo rm -f "$b"
+            done
             # {service} is confirmed active on the final config: disarm the
             # journal-migration recovery trap (a no-op if it was never
             # armed this run). Anything past this point is unrelated to the

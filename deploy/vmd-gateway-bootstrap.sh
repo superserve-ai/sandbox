@@ -29,16 +29,25 @@ require "$BIN/vmd-handoff"
 [ -f /etc/systemd/system/superserve-vmd-gateway.service ] || { echo "gateway unit not installed — deploy first" >&2; exit 1; }
 [ -f /etc/sandbox/vmd.env ] || { echo "missing /etc/sandbox/vmd.env" >&2; exit 1; }
 
-# Roll back to the legacy topology on any failure. Stop the generation FIRST —
-# if vmd-handoff already activated it, it holds the writer lease, and legacy vmd
-# is lease-unaware, so starting legacy alongside a live generation would put two
-# writers on the same host state. Then stop the gateway (freeing the ports), and
-# only then bring the legacy service back.
+WRITER_LOCK=/var/lib/sandbox/vmd-writer.lock
+
+# Roll back to the legacy topology on any failure — but NEVER start legacy vmd
+# (which is lease-unaware) while a generation might still hold the writer lease,
+# or two writers would mutate host state at once. So: keep the fence installed,
+# stop the gateway and every generation, and confirm the writer lease is
+# actually free before unfencing and starting legacy. If it is not free, leave
+# the host fenced (an outage) and require manual repair — a bounded outage is
+# strictly safer than concurrent writers.
 restore_legacy() {
-	echo "== bootstrap failed — restoring legacy topology ==" >&2
-	rm -f /etc/sandbox/gateway-topology
-	systemctl stop "superserve-vmd@$VERSION.service" 2>/dev/null || true
+	echo "== bootstrap failed — attempting to restore legacy topology ==" >&2
+	systemctl stop 'superserve-vmd@*' 2>/dev/null || true
 	systemctl stop superserve-vmd-gateway.service 2>/dev/null || true
+	# flock -n exits non-zero if the lease is still held.
+	if ! flock -n "$WRITER_LOCK" true 2>/dev/null; then
+		echo "FATAL: writer lease still held after stopping generations — NOT starting legacy (would double-write). Repair manually." >&2
+		return
+	fi
+	rm -f /etc/sandbox/gateway-topology
 	systemctl enable --now superserve-vmd.socket 2>/dev/null || true
 	systemctl start superserve-vmd.service 2>/dev/null || true
 }

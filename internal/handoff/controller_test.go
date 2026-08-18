@@ -185,6 +185,21 @@ func TestDrainBudgetExceededAbortsNotCuts(t *testing.T) {
 	}
 }
 
+func TestAmbiguousStopHoldsFailClosed(t *testing.T) {
+	// Stopping the old generation fails (ambiguous — it may be half-stopped or
+	// still serving). The controller must HOLD traffic (no release) rather than
+	// route onto an uncertain upstream. Recovery: restart the gateway, which
+	// rediscovers the live writer or redeploys the recorded generation.
+	m := &mockActions{failAt: "DrainAndStop"}
+	c := New(m, Generation{ID: "A"})
+	if err := c.Deploy(context.Background(), Generation{ID: "A"}, Generation{ID: "B"}); err == nil {
+		t.Fatal("expected error on ambiguous stop")
+	}
+	if contains(m.seq(), "QuiesceGRPC(false)") || contains(m.seq(), "QuiesceResolver(false)") {
+		t.Fatalf("must hold fail-closed on ambiguous stop, not release: %v", m.seq())
+	}
+}
+
 func TestRollbackFailureStaysFailClosed(t *testing.T) {
 	// Activate fails AND restoring the previous generation fails: the controller
 	// must NOT release traffic (no Quiesce(false)) — it holds fail-closed.

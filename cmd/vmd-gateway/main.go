@@ -41,8 +41,13 @@ func genResolverPath(id string) string { return "/run/vmd/gen-" + id + "-resolve
 func genControlPath(id string) string  { return "/run/vmd/gen-" + id + "-ctl.sock" }
 func unitName(id string) string        { return "superserve-vmd@" + id }
 
+// maxHandoffBudget caps any single phase budget — a sane upper bound so a
+// fat-fingered value can't hold traffic for minutes.
+const maxHandoffBudget = 2 * time.Minute
+
 // budgetsFromEnv overrides the default per-phase budgets from configuration.
-// Durations use Go syntax (e.g. "30s"). Invalid values are logged and ignored.
+// Durations use Go syntax (e.g. "30s"). A value that is unparseable, <= 0, or
+// larger than maxHandoffBudget is rejected with a warning and the default kept.
 func budgetsFromEnv(b handoff.Budgets, log zerolog.Logger) handoff.Budgets {
 	parse := func(env string, dst *time.Duration) {
 		v := os.Getenv(env)
@@ -50,11 +55,16 @@ func budgetsFromEnv(b handoff.Budgets, log zerolog.Logger) handoff.Budgets {
 			return
 		}
 		d, err := time.ParseDuration(v)
-		if err != nil {
-			log.Warn().Str("env", env).Str("value", v).Msg("invalid handoff budget; using default")
-			return
+		switch {
+		case err != nil:
+			log.Warn().Str("env", env).Str("value", v).Msg("unparseable handoff budget; using default")
+		case d <= 0:
+			log.Warn().Str("env", env).Str("value", v).Msg("handoff budget must be > 0; using default")
+		case d > maxHandoffBudget:
+			log.Warn().Str("env", env).Str("value", v).Dur("max", maxHandoffBudget).Msg("handoff budget exceeds max; using default")
+		default:
+			*dst = d
 		}
-		*dst = d
 	}
 	parse("VMD_HANDOFF_DRAIN_BUDGET", &b.Drain)
 	parse("VMD_HANDOFF_STOPACTIVATE_BUDGET", &b.StopActivate)
@@ -276,7 +286,15 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = resolverSrv.Shutdown(shutdownCtx)
-	grpcSrv.GracefulStop()
+	// Bounded graceful stop: a long-lived stream (e.g. build logs) must not pin
+	// the gateway open forever on upgrade. Drain briefly, then force-stop.
+	stopped := make(chan struct{})
+	go func() { grpcSrv.GracefulStop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		grpcSrv.Stop()
+	}
 	gw.Close()
 	_ = ctlLis.Close()
 	_ = os.Remove(*controlSock)

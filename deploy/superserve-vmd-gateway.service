@@ -17,6 +17,9 @@ ExecStart=/usr/local/bin/vmd-gateway \
   --control-sock=/run/vmd/gateway-control.sock
 Restart=always
 RestartSec=1
+# The gateway itself does a bounded graceful stop then a force-stop; this is the
+# systemd backstop so an upgrade restart can never hang on a stuck stream.
+TimeoutStopSec=15
 RuntimeDirectory=vmd
 RuntimeDirectoryPreserve=yes
 StandardOutput=journal

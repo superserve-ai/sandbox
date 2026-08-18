@@ -287,9 +287,14 @@ func (c *Controller) run(ctx context.Context, prev, next Generation) error {
 		if err != nil {
 			// Ambiguous: the old generation may be half-stopped (no writer) or
 			// still serving. Do NOT release traffic onto it — hold, fail-closed,
-			// and abort. An operator / the gateway monitor recovers.
+			// and abort. RECOVERY: restart the gateway
+			// (`systemctl restart superserve-vmd-gateway`) — on startup it
+			// rediscovers the live writer and restores routing, or, if none is
+			// serving, redeploys the recorded generation from scratch (no drain,
+			// since there is no old generation to drain). The holds reset with
+			// the fresh gateway process.
 			_ = c.act.DrainAndStop(ctx, next) // drop the unused standby
-			return fmt.Errorf("stop %s ambiguous; holding traffic (fail-closed): %w", prev.ID, err)
+			return fmt.Errorf("stop %s ambiguous; holding traffic (fail-closed) — restart the gateway to recover: %w", prev.ID, err)
 		}
 	}
 
