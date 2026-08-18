@@ -1040,18 +1040,34 @@ def main() -> int:
             # `restart` guarantees the process running once this script
             # exits is always the one reading the final, fully-migrated
             # config, whether or not a reactivation race occurred.
+            # Capture the moment just before restart so the readiness scan sees
+            # only the NEW process's log line, never a prior boot's.
+            READY_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
             sudo systemctl restart {service}
-            sleep 3
-            sudo systemctl is-active --quiet {service} || (
-                echo "ERROR: {service} failed to become active after restart" >&2
+            # Wait for APPLICATION readiness, not just is-active. The unit is
+            # Type=simple, so "active" means only that the process forked, while
+            # vmd answers Unavailable until it logs startup-complete — its real
+            # request gate, which measured prod startup reaches in ~12s. Poll for
+            # that line, bounded well above it, and fail (leaving the recovery
+            # trap armed) if the process never gets there or dies trying.
+            READY=0
+            for i in $(seq 1 90); do
+                if sudo journalctl -u {service} --since "$READY_SINCE" --no-pager 2>/dev/null | grep -qF "gRPC serving requests"; then
+                    READY=1
+                    break
+                fi
+                sleep 1
+            done
+            if [ "$READY" != 1 ]; then
+                echo "ERROR: {service} did not reach application readiness (startupReady) within 90s after restart" >&2
                 sudo systemctl status --no-pager {service} >&2 || true
-                sudo journalctl -u {service} --no-pager -n 40 >&2 || true
+                sudo journalctl -u {service} --since "$READY_SINCE" --no-pager -n 80 >&2 || true
                 exit 1
-            )
-            # {service} is confirmed active on the final config: disarm the
-            # journal-migration recovery trap (a no-op if it was never
-            # armed this run). Anything past this point is unrelated to the
-            # backup journal and shouldn't restart vmd on failure.
+            fi
+            # {service} is confirmed serving requests on the final config: disarm
+            # the journal-migration recovery trap (a no-op if it was never armed
+            # this run). Anything past this point is unrelated to the backup
+            # journal and shouldn't restart vmd on failure.
             trap - EXIT
 
             # Restart secretsproxy; tolerate missing env file on hosts not
