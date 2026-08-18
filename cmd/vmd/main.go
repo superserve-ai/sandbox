@@ -1176,9 +1176,13 @@ func main() {
 		// adopt-in-cutover would cost.
 		reattachStart := time.Now()
 		reattached, stale := mgr.ReattachAll(ctx)
-		log.Info().Str("startup_phase", "reattach_background").
+		// Concurrent with the sequential startup partition (runs in this
+		// goroutine), so its phase_ms must NOT be summed with the partition
+		// marks. Flagged concurrent=true and given a distinct message so a
+		// grep for "startup phase timing" excludes it from the partition sum.
+		log.Info().Str("startup_phase", "reattach_background").Bool("concurrent", true).
 			Dur("phase_ms", time.Since(reattachStart)).Int("count", reattached+stale).
-			Msg("startup phase timing")
+			Msg("startup background phase timing")
 		if reattached > 0 || stale > 0 {
 			log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
 		}
