@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -155,4 +157,32 @@ func TestLifecycle_CleanIntentionalShutdownGate(t *testing.T) {
 			t.Fatal("a failing closer must disqualify")
 		}
 	})
+}
+
+// A closer that ignores cancellation must be abandoned rather than hang the
+// daemon: shutdown stays bounded and the closers after it still run.
+func TestShutdownAbandonsWedgedCloser(t *testing.T) {
+	prev := perCloserShutdownTimeout
+	perCloserShutdownTimeout = 50 * time.Millisecond
+	defer func() { perCloserShutdownTimeout = prev }()
+
+	lc := newLifecycle(zerolog.Nop())
+	var earliestRan atomic.Bool
+	// LIFO shutdown: registered A, B, C runs as C, B, A. B wedges in the
+	// middle; A (registered first, run last) proves the loop moved past it.
+	lc.addCloser("A-earliest", func(context.Context) error { earliestRan.Store(true); return nil })
+	lc.addCloser("B-wedged", func(context.Context) error { select {} }) // ponytail: never returns, ignores ctx
+	lc.addCloser("C-latest", func(context.Context) error { return nil })
+
+	start := time.Now()
+	lc.shutdown(context.Background())
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("shutdown not bounded: took %v", d)
+	}
+	if !earliestRan.Load() {
+		t.Fatal("closer after the wedged one never ran — abandonment failed")
+	}
+	if lc.closerErr == nil {
+		t.Fatal("wedged closer must record closerErr (bars vouching)")
+	}
 }
