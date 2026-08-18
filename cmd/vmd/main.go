@@ -369,6 +369,64 @@ func runDrainCheck() int {
 	return 3
 }
 
+// startupTimer partitions startup into contiguous phases: each mark logs the
+// interval since the previous mark, so the segments tile the whole start→ready
+// timeline with no gap. Observability only — no control flow, startup path only.
+type startupTimer struct {
+	log   zerolog.Logger
+	start time.Time
+	last  time.Time
+	// Marks and breakdown records are timestamped on the startup goroutine but
+	// written from a dedicated one, so a backpressured stdout can't delay the
+	// readiness being measured. Buffered above the record count: sends never
+	// block, overflow drops the record rather than stalling startup.
+	ch chan func()
+}
+
+func newStartupTimer(log zerolog.Logger) *startupTimer {
+	now := time.Now()
+	s := &startupTimer{log: log, start: now, last: now, ch: make(chan func(), 64)}
+	go func() {
+		for fn := range s.ch {
+			fn()
+		}
+	}()
+	return s
+}
+
+// emit queues a log write on the timer's writer goroutine — for startup
+// breakdown records whose values are already computed; never blocks.
+func (s *startupTimer) emit(fn func()) {
+	select {
+	case s.ch <- fn:
+	default:
+	}
+}
+
+// mark records the segment ending here (duration since the previous mark, plus
+// cumulative since start); the log write happens off this goroutine. Every
+// phase boundary is emitted even when its optional work is skipped
+// (enabled=false, ~0 duration) so phase labels stay comparable across host
+// configs and the partition stays attributable. Main-goroutine only — it
+// mutates last; background work logs its own duration.
+// count >= 0 attaches an aggregate, -1 omits it.
+func (s *startupTimer) mark(phase string, enabled bool, count int) {
+	now := time.Now()
+	phaseDur, sinceStart := now.Sub(s.last), now.Sub(s.start)
+	s.emit(func() {
+		e := s.log.Info().
+			Str("startup_phase", phase).
+			Bool("enabled", enabled).
+			Dur("phase_ms", phaseDur).
+			Dur("since_start_ms", sinceStart)
+		if count >= 0 {
+			e = e.Int("count", count)
+		}
+		e.Msg("startup phase timing")
+	})
+	s.last = now
+}
+
 func main() {
 	// Maintenance subcommands run before any daemon setup and exit. They must
 	// not open the state store in write mode or start services.
@@ -396,6 +454,10 @@ func main() {
 		Timestamp().
 		Str("service", "vmd").
 		Logger()
+
+	// Startup phase timing (observability only) — created at the earliest point
+	// the logger is up, so since_start_ms covers all daemon-start work.
+	st := newStartupTimer(log)
 
 	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
 		if err := sentry.Init(sentry.ClientOptions{Dsn: dsn, EnableLogs: true}); err != nil {
@@ -486,6 +548,9 @@ func main() {
 	}
 
 	// ---- Network manager + host firewall ----
+	// preliminary: sentry init, config parse, tool lookups, dir creation, and
+	// egress/DNS option wiring — everything before the network manager builds.
+	st.mark("preliminary", true, -1)
 	netMgrOpts = append(netMgrOpts,
 		network.WithHostID(cfg.HostID),
 		network.WithSecretsProxyAddr(cfg.SecretsProxySandboxDst, cfg.SecretsProxySandboxPort))
@@ -493,6 +558,7 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize network manager")
 	}
+	st.mark("network_firewall", true, -1)
 	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
 	// ---- VM manager ----
@@ -688,6 +754,8 @@ func main() {
 	egressProxy.SetHostID(cfg.HostID)
 	mgr.SetEgressProxy(egressProxy)
 	netMgr.SetEgressProxy(egressProxy)
+	st.mark("vm_manager_init", true, -1)
+	hostEgressCIDRs := 0
 	if blockList != nil {
 		egressProxy.SetBlocklist(blockList)
 		// Mirror IP/CIDR entries into a host-level nftables drop set so they
@@ -701,10 +769,13 @@ func main() {
 		// the first feed fetch (which may block up to feedFetchTimeout per
 		// feed). Otherwise seeded CIDRs go unenforced on non-proxied ports
 		// during the startup window.
-		hostBlock.UpdateCIDRs(blockList.CIDRs())
+		seedCIDRs := blockList.CIDRs()
+		hostBlock.UpdateCIDRs(seedCIDRs)
+		hostEgressCIDRs = len(seedCIDRs)
 		lc.addCloser("host egress block", func(_ context.Context) error { return hostBlock.Close() })
 		lc.start("egress blocklist", func() error { return blockList.Start(ctx) })
 	}
+	st.mark("host_egress_block", blockList != nil, hostEgressCIDRs)
 	lc.start("egress proxy", func() error { return egressProxy.Start(ctx) })
 
 	// ---- BoltDB state store ----
@@ -713,6 +784,14 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Str("path", statePath).Msg("failed to open state store")
 	}
+	st.mark("state_store_open", true, -1)
+	oss := stateStore.OpenStats()
+	st.emit(func() {
+		log.Info().Dur("bolt_open_ms", oss.BoltOpen).Dur("policy_scan_ms", oss.PolicyScan).
+			Dur("record_scan_ms", oss.RecordScan).Dur("tx_residual_ms", oss.TxResidual).
+			Int("records", oss.Records).Int("policies", oss.Policies).
+			Int("orphans_deleted", oss.OrphansDeleted).Msg("state store open breakdown")
+	})
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
 
@@ -734,6 +813,7 @@ func main() {
 	} else if arms {
 		log.Info().Msg("direct spawn armed: new VMs launch into the delegated cgroup subtree")
 	}
+	st.mark("cgroup_arm", true, -1)
 
 	// ---- Backup metrics recorder ----
 	// Optional OTLP recorder for the backup pipeline, exporting to the
@@ -820,6 +900,8 @@ func main() {
 			VMDVersion:  os.Getenv("SENTRY_RELEASE"),
 			Metrics:     backupMetrics,
 		}
+		// backup_setup: metrics recorder, journal open, GCS storage.NewClient, uploader.
+		st.mark("backup_setup", true, -1)
 		// Staging pins enqueued artifacts so sandbox teardown cannot
 		// erase a queued generation; the sweep clears residue from
 		// crashes between staging and enqueue. The tree lives inside
@@ -845,11 +927,21 @@ func main() {
 		// outage longer than the sweep's orphan horizon needs this renewal
 		// or it reads as an abandoned directory and gets deleted out from
 		// under a still-durable pause.
-		mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
-		backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
+		renewedMarkers := mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
+		ss := backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
 		if legacyStaging != "" {
-			backup.SweepStaging(legacyStaging, journal, log.With().Str("component", "backup").Logger())
+			ls := backup.SweepStaging(legacyStaging, journal, log.With().Str("component", "backup").Logger())
+			ss.Sandboxes += ls.Sandboxes
+			ss.Generations += ls.Generations
+			ss.Bases += ls.Bases
+			ss.Pending += ls.Pending
 		}
+		st.emit(func() {
+			log.Info().Int("renewed_markers", renewedMarkers).Int("sandboxes", ss.Sandboxes).
+				Int("generations", ss.Generations).Int("bases", ss.Bases).Int("pending", ss.Pending).
+				Msg("backup staging scan breakdown")
+		})
+		st.mark("backup_staging_scan", true, -1)
 		uploader.StagingRoot = stagingRoot
 		mgr.SetBackupStaging(stagingRoot)
 		mgr.SetBackupEnqueue(journal.Enqueue)
@@ -899,6 +991,11 @@ func main() {
 			return uploader.Run(upCtx)
 		})
 		log.Info().Str("bucket", bucket).Int("bandwidth_mbps", mbps).Int("workers", workers).Msg("backup uploader enabled")
+	} else {
+		// Backups disabled: emit the phase boundaries anyway so the partition
+		// stays comparable across hosts (skipped => ~0 duration).
+		st.mark("backup_setup", false, -1)
+		st.mark("backup_staging_scan", false, -1)
 	}
 
 	// ---- Backup metrics sampler ----
@@ -1068,11 +1165,15 @@ func main() {
 	// Closer is registered later (after the manager/pool closers) so it runs
 	// first on shutdown — stop accepting before those are torn down.
 
+	// grpc_setup: server construction, listener bind, adapter registration.
+	st.mark("grpc_setup", true, -1)
+
 	// ---- Startup network prep (fast; must precede StartPool) ----
 	// Reserve slots held by existing VMs (so the pool can't hand out a colliding
 	// one) and sweep leaked namespaces. The per-VM reattach runs in the background
 	// below; VMs it hasn't reached are loaded on-demand on first request.
 	slotsReserved := mgr.ReserveStartupSlots(ctx)
+	st.mark("slot_reserve", true, -1)
 	// Reap direct-spawn VMs whose record never persisted (crash between spawn
 	// and first write). They have no record to reserve their slot, so the
 	// sweep/adoption below would tear their netns down under a live FC or
@@ -1085,7 +1186,9 @@ func main() {
 	// means a survivor could NOT be protected — every reclaim path below
 	// (sweep AND adoption) must stand down for this boot.
 	protectedNs, sweepSafe := mgr.ReapRecordlessCgroupVMs(ctx)
+	st.mark("cgroup_reap", true, -1)
 	adoptNetPool := envOrDefault("VMD_NET_POOL_ADOPT", "false") == "true"
+	sweepRan := false
 	if !adoptNetPool {
 		// Under adoption, orphan namespaces are warm-pool candidates instead
 		// of garbage; the adoption pass below validates or sweeps each one.
@@ -1100,10 +1203,12 @@ func main() {
 			if n := netMgr.ReclaimUnusedSlots(); n > 0 {
 				log.Info().Int("slots", n).Msg("reclaimed slot indexes freed by the startup orphan sweep")
 			}
+			sweepRan = true // sweep + the slot reclaim it feeds
 		} else {
 			log.Warn().Msg("skipping startup orphan namespace sweep: an unresolved live cgroup survivor could be reclaimed")
 		}
 	}
+	st.mark("namespace_sweep", sweepRan, -1)
 
 	// Launcher launch path, enabled per host via VMD_LAUNCH_VIA_LAUNCHER_NS.
 	if launchViaLauncherNS {
@@ -1151,9 +1256,8 @@ func main() {
 			Msg("skipping network pool adoption: live namespaces not provably protected")
 	}
 
-	// Leak gauge for network namespaces — independent of the launcher path, and
-	// started after StartPool so its first read observes an initialized pool.
-	mgr.StartNetnsLeakSampler(ctx, time.Minute)
+	// pool_start: StartPool (async fill), adoption wiring, launcher-ns setup.
+	st.mark("pool_start", true, -1)
 
 	// ---- Background full reattach ----
 	// Off the critical path (requests load their VM on demand); proactively
@@ -1161,7 +1265,15 @@ func main() {
 	// service — a completing lc service trips lifecycle shutdown.
 	go func() {
 		defer sentrylog.Recover("startup reattach")
+		// O(N) reattach, off the critical path — timed here (not via the
+		// single-goroutine marks) and flagged concurrent, distinct message, so
+		// its phase_ms is never summed into the partition. count sizes a
+		// synchronous adopt-in-cutover.
+		reattachStart := time.Now()
 		reattached, stale := mgr.ReattachAll(ctx)
+		log.Info().Str("startup_phase", "reattach_background").Bool("concurrent", true).
+			Dur("phase_ms", time.Since(reattachStart)).Int("count", reattached+stale).
+			Msg("startup background phase timing")
 		if reattached > 0 || stale > 0 {
 			log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
 		}
@@ -1231,6 +1343,7 @@ func main() {
 		if err := dbPool.Ping(ctx); err != nil {
 			log.Fatal().Err(err).Msg("failed to ping database for reconciler")
 		}
+		st.mark("db_connect", true, -1)
 		reconcilerDB = dbq.New(dbPool)
 		lc.addCloser("reconciler db pool", func(_ context.Context) error {
 			dbPool.Close()
@@ -1248,6 +1361,7 @@ func main() {
 		log.Info().Msg("egress flow logging enabled")
 	} else {
 		log.Warn().Msg("DATABASE_URL unset — reconciler will run in BoltDB↔systemd-only mode")
+		st.mark("db_connect", false, -1)
 	}
 
 	// ---- Continuous reconciler ----
@@ -1338,8 +1452,17 @@ func main() {
 	// restore) allocates like a create and shares its bounded wait. A gate
 	// at this level would hold even the non-allocating paths behind
 	// inventory they never use.
+	// pre_ready: reconciler, heartbeat, local HTTP — the tail before serving.
+	st.mark("pre_ready", true, -1)
 	startupReady.Store(true)
+	st.mark("ready", true, -1)
 	log.Info().Msg("startup complete — gRPC serving requests")
+
+	// Leak gauge for network namespaces — independent of the launcher path.
+	// Started AFTER readiness (and so after StartPool): its immediate first
+	// sample walks the fleet under the allocator lock, which must not contend
+	// with pool fill, reattach, or a first slot-allocating request pre-ready.
+	mgr.StartNetnsLeakSampler(ctx, time.Minute)
 
 	// ---- Wait for signal or service failure ----
 	sigCh := make(chan os.Signal, 1)
