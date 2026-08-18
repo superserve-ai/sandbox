@@ -435,6 +435,7 @@ func main() {
 
 	// ---- Network manager + host firewall ----
 	netMgrOpts = append(netMgrOpts,
+		network.WithHostID(cfg.HostID),
 		network.WithSecretsProxyAddr(cfg.SecretsProxySandboxDst, cfg.SecretsProxySandboxPort))
 	netMgr, err := network.NewManager(ctx, cfg.HostInterface, log, netMgrOpts...)
 	if err != nil {
@@ -639,6 +640,7 @@ func main() {
 		maxConnsPerSandbox,
 		log,
 	)
+	egressProxy.SetHostID(cfg.HostID)
 	mgr.SetEgressProxy(egressProxy)
 	netMgr.SetEgressProxy(egressProxy)
 	if blockList != nil {
