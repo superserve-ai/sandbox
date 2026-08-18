@@ -96,24 +96,34 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 	return all, nil
 }
 
-// inlineStageLimit bounds the packed bytes a pause may copy on the RPC
+// inlineStageLimit bounds the packed bytes a pause may COPY on the RPC
 // path. Sparse copies scale with REAL bytes, so a typical overlay (tens
 // of MB dirtied) stages in tens of milliseconds; a pathologically dense
 // overlay must not drag the pause RPC back into seconds, and falls back
-// to the marker-only worker path.
+// to the marker-only worker path. Reflink clones are exempt: a clone is
+// O(metadata) regardless of packed size, so on a reflink-capable
+// filesystem no pause is ever too large to stage inline.
 const inlineStageLimit = 256 << 20
 
 // ErrStageTooLarge reports a pause whose packed disk exceeds the inline
 // staging budget.
 var ErrStageTooLarge = errors.New("packed size exceeds the inline staging budget")
 
-// StagePending sparse-copies a pause's mutable artifacts into a
+// cloneFn is the reflink implementation, swappable by tests: whether
+// FICLONE works depends on the filesystem the test tree happens to live
+// on, and both the clone-first and copy-fallback paths need to be
+// exercisable deterministically.
+var cloneFn = cloneFile
+
+// StagePending snapshots a pause's mutable artifacts into a
 // pending-token directory under the staging root, called on the pause
 // RPC path WHILE the VM operation lock is held: nothing can resume yet,
 // so the copies are pause-time bytes by construction, and the detached
 // worker can hash them at leisure with no at-rest race. Returns the
-// staged directory and the staged path per file name. The copy is
-// O(real bytes), the same scaling as the pause itself.
+// staged directory and the staged path per file name. Each file is
+// reflink-cloned when the filesystem supports it — O(metadata), no size
+// cap — and sparse-copied otherwise, O(real bytes) under the inline
+// budget, the same scaling as the pause itself.
 // BasePinName is the hard link StagePending creates to the overlay's
 // base image inside the pending directory. A link is O(1) on the RPC
 // path and keeps the base's inode alive past template GC, so a pause
@@ -125,26 +135,6 @@ const BasePinName = "base.pin"
 func StagePending(ctx context.Context, root, vmID, token, basePath string, files map[string]string) (string, map[string]string, error) {
 	if root == "" {
 		return "", nil, errors.New("staging disabled")
-	}
-	// The copy is O(real bytes) but a contended disk makes even that
-	// slow; respect the RPC deadline the way hashing always did, and
-	// fall back to the marker-only path rather than pinning the caller.
-	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < 3*time.Second {
-		return "", nil, ErrStageTooLarge
-	}
-	if disk, ok := files["rootfs.ext4"]; ok {
-		f, err := os.Open(disk)
-		if err != nil {
-			return "", nil, err
-		}
-		extents, _, err := Extents(f)
-		f.Close()
-		if err != nil {
-			return "", nil, err
-		}
-		if PackedSize(extents) > inlineStageLimit {
-			return "", nil, ErrStageTooLarge
-		}
 	}
 	dir := filepath.Join(root, vmID, "pending-"+token)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -160,12 +150,30 @@ func StagePending(ctx context.Context, root, vmID, token, basePath string, files
 		return "", nil, err
 	}
 	staged := make(map[string]string, len(files))
+	// The deadline and packed-size guards protect the RPC path from the
+	// byte COPY only, so they run lazily on the first file a reflink
+	// clone cannot cover — never before a clone attempt. Guarding up
+	// front would demote every large pause to the marker-only path (and
+	// concede its fast-resume window) on exactly the filesystems where
+	// staging it is free.
+	copyGuarded := false
 	for name, src := range files {
 		if err := ctx.Err(); err != nil {
 			_ = os.RemoveAll(dir)
 			return "", nil, err
 		}
 		dst := filepath.Join(dir, name)
+		if err := snapshotFileMode(ctx, dst, src, true); err == nil {
+			staged[name] = dst
+			continue
+		}
+		if !copyGuarded {
+			copyGuarded = true
+			if err := inlineCopyBudget(ctx, files); err != nil {
+				_ = os.RemoveAll(dir)
+				return "", nil, err
+			}
+		}
 		if err := snapshotFileMode(ctx, dst, src, false); err != nil {
 			_ = os.RemoveAll(dir)
 			return "", nil, err
@@ -190,6 +198,33 @@ func StagePending(ctx context.Context, root, vmID, token, basePath string, files
 		return "", nil, err
 	}
 	return dir, staged, nil
+}
+
+// inlineCopyBudget decides whether the byte-copy fallback may run on the
+// RPC path at all: a contended disk makes even an O(real bytes) copy
+// slow, so an almost-spent deadline falls back to the marker-only path
+// rather than pinning the caller, and a pathologically dense overlay
+// (packed bytes over the inline limit) does the same rather than drag
+// the pause RPC back into seconds.
+func inlineCopyBudget(ctx context.Context, files map[string]string) error {
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < 3*time.Second {
+		return ErrStageTooLarge
+	}
+	if disk, ok := files["rootfs.ext4"]; ok {
+		f, err := os.Open(disk)
+		if err != nil {
+			return err
+		}
+		extents, _, err := Extents(f)
+		f.Close()
+		if err != nil {
+			return err
+		}
+		if PackedSize(extents) > inlineStageLimit {
+			return ErrStageTooLarge
+		}
+	}
+	return nil
 }
 
 // FinishPendingStage renames a hashed pending directory to its
@@ -445,7 +480,7 @@ func snapshotClone(dst, src string) error {
 		return err
 	}
 	tmp := out.Name()
-	if err := cloneFile(out, in); err != nil {
+	if err := cloneFn(out, in); err != nil {
 		out.Close()
 		os.Remove(tmp)
 		return err
@@ -484,7 +519,7 @@ func snapshotFile(ctx context.Context, dst, src string) error {
 		return err
 	}
 	tmp := out.Name()
-	if err := cloneFile(out, in); err != nil {
+	if err := cloneFn(out, in); err != nil {
 		extents, _, xerr := Extents(in)
 		if xerr != nil {
 			out.Close()

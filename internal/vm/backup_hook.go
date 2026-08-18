@@ -116,20 +116,22 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	// track what the guest dirtied, and hashing a sparse overlay's full
 	// apparent content costs seconds regardless of hasher. All
 	// size-dependent hashing runs in the detached worker; the RPC path
-	// pays a marker write, an O(real bytes) staging copy, and the
-	// tens-of-KB vmstate hash for the control plane's manifest rows.
+	// pays a marker write, a staging step (reflink clone where the
+	// filesystem supports it, O(real bytes) capped copy otherwise), and
+	// the tens-of-KB vmstate hash for the control plane's manifest rows.
 	manifest := collectVMStateEntry(ctx, snapshotPath, log)
 	if m.backupEnqueue == nil {
 		return manifest
 	}
 	pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
-	// Inline sparse staging under the still-held VM operation lock:
-	// copying scales with REAL bytes (the same O(dirtied) scaling as the
-	// pause itself, tens of ms for typical overlays), and the immutable
-	// copies close the fast-resume window entirely: a resume racing the
-	// worker cannot mutate a snapshot, so even an instantly-resumed
-	// pause keeps its backup. Oversized or failed staging falls back to
-	// the marker-only path, whose worker requires the at-rest proof and
+	// Inline staging under the still-held VM operation lock: a reflink
+	// clone is O(metadata) at any size, and the copy fallback scales
+	// with REAL bytes (the same O(dirtied) scaling as the pause itself,
+	// tens of ms for typical overlays). The immutable snapshots close
+	// the fast-resume window entirely: a resume racing the worker
+	// cannot mutate them, so even an instantly-resumed pause keeps its
+	// backup. Oversized-copy or failed staging falls back to the
+	// marker-only path, whose worker requires the at-rest proof and
 	// concedes fast-resume pauses to supersession.
 	if m.backupStaging != "" {
 		// A control-plane retry of the same pause must not pay a second
