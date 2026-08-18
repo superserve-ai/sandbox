@@ -193,6 +193,10 @@ type lifecycle struct {
 	// receipt: only a deliberate, fully clean shutdown may vouch.
 	signalInitiated bool
 	closerErr       error
+	// forcedRPCStop is set when the gRPC drain overran its budget and active
+	// RPCs were force-cancelled — a possibly-inconsistent state the next boot
+	// must reconcile, so it bars the pool receipt.
+	forcedRPCStop bool
 
 	done   chan struct{}
 	doneCh sync.Once
@@ -249,13 +253,21 @@ func (lc *lifecycle) noteSignalInitiated() {
 	lc.mu.Unlock()
 }
 
+// noteForcedRPCStop marks that the gRPC drain overran its budget and active
+// RPCs were force-cancelled, so this shutdown can never be treated as clean.
+func (lc *lifecycle) noteForcedRPCStop() {
+	lc.mu.Lock()
+	lc.forcedRPCStop = true
+	lc.mu.Unlock()
+}
+
 // cleanIntentionalShutdown reports whether this was a signal-initiated
 // shutdown in which no service errored and every closer succeeded — the
 // only condition under which state may be vouched for.
 func (lc *lifecycle) cleanIntentionalShutdown() bool {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
-	return lc.signalInitiated && lc.firstErr == nil && lc.closerErr == nil
+	return lc.signalInitiated && lc.firstErr == nil && lc.closerErr == nil && !lc.forcedRPCStop
 }
 
 // wait blocks until shutdown is signaled (by a service exit, context
@@ -268,9 +280,30 @@ func (lc *lifecycle) wait(ctx context.Context) {
 	}
 }
 
-// shutdown runs every registered closer in reverse order, collecting
-// errors but never stopping on the first failure — we want every
-// resource to get a chance to clean up.
+// perCloserShutdownTimeout bounds each closer independently during shutdown.
+// A closer that ignores cancellation must not stall the closers after it or
+// hang the process — the loop aborts the graceful sequence if one overruns,
+// so total shutdown stays bounded. Bounding the gRPC drain, a hit budget
+// force-cancels active RPCs, aborts the remaining closers, and marks the
+// shutdown unclean — a circuit breaker (overrun costs a reconcile), not a
+// proven-safe cancellation bound. Chosen to sit under the 30s overall shutdown
+// budget and the unit's TimeoutStopSec backstop, leaving room for the closers
+// after it.
+var perCloserShutdownTimeout = 15 * time.Second
+
+// shutdown runs registered closers in reverse (dependency) order, each under
+// its own deadline and off the main goroutine. Any non-nil outcome — a returned
+// error OR an overrun deadline — aborts the sequence rather than continuing.
+// The two are indistinguishable and both unsafe to continue past: a closer that
+// returns ctx.Err() at its deadline (the uploader and flow sink do) may still
+// have a worker touching the resources its dependencies own, and at the
+// deadline the select can receive that error from done instead of selecting
+// closerCtx.Done(). Because closers run in dependency order, continuing would
+// close BoltDB/GCS/DB out from under a live worker — a use-after-close. On
+// abort the remaining descriptors are reclaimed by process exit (systemd
+// TimeoutStopSec is the final backstop), and the recorded closerErr bars this
+// shutdown from vouching for inventory it may have left inconsistent. A clean
+// shutdown returns nil from every closer and closes the whole chain.
 func (lc *lifecycle) shutdown(ctx context.Context) {
 	lc.mu.Lock()
 	closers := slices.Clone(lc.closers)
@@ -279,15 +312,34 @@ func (lc *lifecycle) shutdown(ctx context.Context) {
 
 	for _, c := range closers {
 		lc.log.Info().Str("service", c.name).Msg("closing")
-		if err := c.close(ctx); err != nil {
-			lc.log.Error().Err(err).Str("service", c.name).Msg("close returned error")
-			lc.mu.Lock()
-			if lc.closerErr == nil {
-				lc.closerErr = fmt.Errorf("%s: %w", c.name, err)
-			}
-			lc.mu.Unlock()
+		closerCtx, cancel := context.WithTimeout(ctx, perCloserShutdownTimeout)
+		// Buffered so a closer that overruns can still send and exit (or leak
+		// harmlessly — the process is on its way down) rather than block
+		// forever on a receiver that has moved on.
+		done := make(chan error, 1)
+		go func() { done <- c.close(closerCtx) }()
+		var err error
+		select {
+		case err = <-done:
+		case <-closerCtx.Done():
+			err = fmt.Errorf("shutdown deadline exceeded")
+		}
+		cancel()
+		if err != nil {
+			lc.log.Error().Err(err).Str("service", c.name).
+				Msg("closer failed or overran; aborting graceful shutdown")
+			lc.recordCloserErr(fmt.Errorf("%s: %w", c.name, err))
+			return
 		}
 	}
+}
+
+func (lc *lifecycle) recordCloserErr(err error) {
+	lc.mu.Lock()
+	if lc.closerErr == nil {
+		lc.closerErr = err
+	}
+	lc.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,11 +1313,18 @@ func main() {
 		select {
 		case <-done:
 			log.Info().Msg("gRPC server stopped gracefully")
+			return nil
 		case <-shutdownCtx.Done():
-			log.Warn().Msg("graceful shutdown timed out, forcing stop")
+			// Stop() force-cancels transports but does not wait for handlers (no
+			// WaitForHandlers — that would let a WithoutCancel handler defeat the
+			// bound), so they may still be using the store/pool/DB. Return an
+			// error to abort the remaining closers rather than close those under
+			// a live handler; process exit reclaims the rest.
+			log.Warn().Msg("graceful shutdown timed out — forcing gRPC stop; aborting remaining cleanup")
+			lc.noteForcedRPCStop()
 			grpcServer.Stop()
+			return fmt.Errorf("forced gRPC stop; handlers may still be running")
 		}
-		return nil
 	})
 
 	// Fast pre-serve init is done (slots reserved, namespaces swept, pool fill
