@@ -42,15 +42,23 @@ class DeployVmdOrderingTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r"systemctl restart \{service\}", SOURCE)), 1)
 
     def test_waits_for_application_readiness_not_just_is_active(self):
-        # The post-restart gate waits for vmd's real request gate (startupReady,
-        # logged as "gRPC serving requests"): the unit is Type=simple, so
-        # is-active alone means only that the process forked.
-        self.assertIn('grep -qF "gRPC serving requests"', SOURCE)
+        # Readiness gates on vmd's real request gate (startupReady, logged as
+        # "gRPC serving requests"), scoped to the unit's CURRENT systemd
+        # invocation — not a bare is-active (Type=simple only proves the process
+        # forked) and not a prior/crashed invocation's line.
+        self.assertRegex(SOURCE, r"-g 'gRPC serving requests'")
+        self.assertIn("_SYSTEMD_INVOCATION_ID", SOURCE)
         # ...and must not gate readiness on a bare sleep + is-active.
         self.assertNotRegex(
             SOURCE,
             r"sleep 3\s*\n\s*sudo systemctl is-active --quiet \{service\}",
         )
+
+    def test_readiness_scan_does_not_pipe_journalctl_to_grep(self):
+        # Under `set -o pipefail`, grep closing the pipe on a match SIGPIPEs
+        # journalctl and the pipeline reads non-zero even on success — a false
+        # timeout. The readiness scan must capture output, not pipe to grep -q.
+        self.assertNotRegex(SOURCE, r"journalctl[^\n]*\|\s*grep -q")
 
 
 if __name__ == "__main__":

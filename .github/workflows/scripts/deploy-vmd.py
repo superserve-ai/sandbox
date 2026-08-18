@@ -1040,26 +1040,35 @@ def main() -> int:
             # `restart` guarantees the process running once this script
             # exits is always the one reading the final, fully-migrated
             # config, whether or not a reactivation race occurred.
-            # Timestamp before the restart so the readiness scan sees only the
-            # new process's log line.
-            READY_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
             sudo systemctl restart {service}
             # Wait for APPLICATION readiness, not is-active: the unit is
-            # Type=simple, so "active" only means the process forked, while vmd
+            # Type=simple, so "active" only proves the process forked, while vmd
             # answers Unavailable until it logs startup-complete (its real gate,
-            # ~12s in prod). Fail with the recovery trap still armed on timeout.
+            # ~12s in prod). Scope the scan to the unit's CURRENT systemd
+            # invocation so neither a prior boot's nor a crashed-and-replaced
+            # process's ready line counts, then re-confirm that invocation is
+            # still current+active when the line is seen. Read journalctl into a
+            # var (no pipe) so a match can't SIGPIPE it under pipefail — same
+            # reason as the find -print -quit above. Fail with the recovery trap
+            # still armed on timeout.
             READY=0
             for i in $(seq 1 90); do
-                if sudo journalctl -u {service} --since "$READY_SINCE" --no-pager 2>/dev/null | grep -qF "gRPC serving requests"; then
-                    READY=1
-                    break
+                INVOCATION=$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)
+                if [ -n "$INVOCATION" ]; then
+                    MATCH=$(sudo journalctl "_SYSTEMD_INVOCATION_ID=$INVOCATION" -g 'gRPC serving requests' --no-pager 2>/dev/null || true)
+                    if [ -n "$MATCH" ] \
+                       && [ "$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)" = "$INVOCATION" ] \
+                       && sudo systemctl is-active --quiet {service}; then
+                        READY=1
+                        break
+                    fi
                 fi
                 sleep 1
             done
             if [ "$READY" != 1 ]; then
                 echo "ERROR: {service} did not reach application readiness (startupReady) within 90s after restart" >&2
                 sudo systemctl status --no-pager {service} >&2 || true
-                sudo journalctl -u {service} --since "$READY_SINCE" --no-pager -n 80 >&2 || true
+                sudo journalctl -u {service} --no-pager -n 80 >&2 || true
                 exit 1
             fi
             # {service} is confirmed serving requests on the final config: disarm
