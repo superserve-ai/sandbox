@@ -246,23 +246,31 @@ func (h *Handlers) authzService() *authz.Service {
 }
 
 // vmdForHost returns the VMDClient for the given host. When a registry is
-// configured, it resolves via DB lookup. If the lookup fails because the host
-// row is missing (legacy sandbox with a backfilled host_id whose row is gone),
-// falls back to the default VMD client so existing sandboxes keep working
-// during the migration period. Any other error is surfaced.
+// configured, it resolves via DB lookup; a missing host row is a hard
+// error, never a fallback. The old migration-period fallback to the default
+// client is gone: with more than one host it silently routes lifecycle
+// operations to whichever machine the default happens to be — the wrong one
+// for every sandbox not on it — and in a cell whose real host id coincides
+// with the default, the misroute doesn't even fail loudly. A sandbox row
+// pointing at an unregistered host is data corruption to surface, not paper
+// over. (The registry-less mode, Hosts == nil, remains the explicit
+// test/dev wiring.)
 func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, error) {
 	if h.Hosts == nil {
 		return h.VMD, nil
 	}
 	c, err := h.Hosts.ClientFor(ctx, hostID)
-	if err == nil {
-		return c, nil
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Distinct, alertable log: this firing means a sandbox row
+			// references a host the control plane does not know.
+			log.Error().Str("host_id", hostID).
+				Msg("host_not_registered: sandbox routed to an unknown host; refusing to fall back")
+			return nil, fmt.Errorf("host %q not registered: %w", hostID, err)
+		}
+		return nil, err
 	}
-	if errors.Is(err, pgx.ErrNoRows) && h.VMD != nil {
-		log.Warn().Err(err).Str("host_id", hostID).Msg("unknown host row; falling back to default VMD client")
-		return h.VMD, nil
-	}
-	return nil, err
+	return c, nil
 }
 
 // vmdTimeout is the default deadline for VMD gRPC calls.

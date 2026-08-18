@@ -1,0 +1,52 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
+)
+
+type routeFakeRegistry struct{ err error }
+
+func (f *routeFakeRegistry) ClientFor(context.Context, string) (vmdclient.Client, error) {
+	return nil, f.err
+}
+
+// Invalidate keeps the fake compatible with the registry interface as it
+// grows an eviction method.
+func (f *routeFakeRegistry) Invalidate(string) {}
+
+// A sandbox row referencing an unregistered host is a hard error, never a
+// silent fallback to the default client: with more than one host the
+// default is the wrong machine for every sandbox not on it, and when the
+// real host id coincides with the default, the misroute never even fails.
+func TestVMDForHostRefusesFallbackOnMissingHostRow(t *testing.T) {
+	h := &Handlers{
+		Hosts: &routeFakeRegistry{err: fmt.Errorf("get host: %w", pgx.ErrNoRows)},
+	}
+	c, err := h.vmdForHost(context.Background(), "ghost-host")
+	if err == nil {
+		t.Fatalf("missing host row returned a client (%v), want hard error", c)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("error = %v, want not-registered wrapping ErrNoRows", err)
+	}
+
+	// Non-not-found lookup errors surface unchanged.
+	h.Hosts = &routeFakeRegistry{err: fmt.Errorf("dial refused")}
+	if _, err := h.vmdForHost(context.Background(), "host-a"); err == nil {
+		t.Fatal("lookup error returned a client, want error")
+	}
+
+	// Registry-less wiring (tests/dev) still uses the default client.
+	h.Hosts = nil
+	if c, err := h.vmdForHost(context.Background(), "host-a"); err != nil || c != h.VMD {
+		t.Fatalf("nil registry: got (%v, %v), want default client", c, err)
+	}
+}

@@ -263,10 +263,14 @@ func run() error {
 		if hostID == "" || handlers.Hosts == nil {
 			return vmdClient, nil
 		}
+		// No fallback on lookup failure: dispatching a build through the
+		// default client sends it to whichever machine that happens to be,
+		// and with multiple hosts that is the wrong one. The supervisor's
+		// dispatch path already fails the build cleanly on resolver errors,
+		// which is honest; a silently misrouted build is not.
 		c, err := handlers.Hosts.ClientFor(rctx, hostID)
 		if err != nil {
-			log.Warn().Err(err).Str("host_id", hostID).Msg("supervisor: host lookup failed, using default client")
-			return vmdClient, nil
+			return nil, fmt.Errorf("resolve build host %q: %w", hostID, err)
 		}
 		return c, nil
 	}
