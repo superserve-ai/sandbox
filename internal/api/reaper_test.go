@@ -369,6 +369,40 @@ func TestReaper_LoopRunsImmediately(t *testing.T) {
 	t.Fatal("reaper did not run immediately on startup")
 }
 
+// An unset SweepInterval must fall back to the default — a zero value reaching
+// time.NewTicker panics — and the sweeps must still run at startup so a restart
+// after a crash cleans up without waiting a full sweep period.
+func TestReaper_SweepsRunOnStartupWithUnsetSweepInterval(t *testing.T) {
+	var snapshotSweeps int32
+
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+				if strings.Contains(sql, "DELETE FROM snapshot s") {
+					atomic.AddInt32(&snapshotSweeps, 1)
+				}
+				return pgconn.NewCommandTag("DELETE 0"), nil
+			},
+		},
+		&stubVMD{},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Long poll interval so nothing here depends on a ticker firing.
+	h.StartTimeoutReaper(ctx, ReaperConfig{Interval: 24 * time.Hour, BatchSize: 10})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&snapshotSweeps) > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("snapshot sweep did not run on startup")
+}
+
 // rollbackPausedVM must persist the resumed host/IP before it flips the row
 // back to active, otherwise the DB can keep advertising a recycled slot.
 func TestRollbackPausedVM_PersistsReplacementHostAndIP(t *testing.T) {
