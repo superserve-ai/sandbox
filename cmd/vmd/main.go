@@ -193,6 +193,11 @@ type lifecycle struct {
 	// receipt: only a deliberate, fully clean shutdown may vouch.
 	signalInitiated bool
 	closerErr       error
+	// forcedRPCStop is set when the gRPC drain hit its budget and active RPCs
+	// were force-cancelled. A cancelled create/pause/resume may have left state
+	// the next boot must reconcile, so this bars the pool receipt — the drain
+	// budget is a circuit breaker, never a proven-safe cancellation bound.
+	forcedRPCStop bool
 
 	done   chan struct{}
 	doneCh sync.Once
@@ -249,13 +254,21 @@ func (lc *lifecycle) noteSignalInitiated() {
 	lc.mu.Unlock()
 }
 
+// noteForcedRPCStop marks that the gRPC drain overran its budget and active
+// RPCs were force-cancelled, so this shutdown can never be treated as clean.
+func (lc *lifecycle) noteForcedRPCStop() {
+	lc.mu.Lock()
+	lc.forcedRPCStop = true
+	lc.mu.Unlock()
+}
+
 // cleanIntentionalShutdown reports whether this was a signal-initiated
 // shutdown in which no service errored and every closer succeeded — the
 // only condition under which state may be vouched for.
 func (lc *lifecycle) cleanIntentionalShutdown() bool {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
-	return lc.signalInitiated && lc.firstErr == nil && lc.closerErr == nil
+	return lc.signalInitiated && lc.firstErr == nil && lc.closerErr == nil && !lc.forcedRPCStop
 }
 
 // wait blocks until shutdown is signaled (by a service exit, context
@@ -271,9 +284,11 @@ func (lc *lifecycle) wait(ctx context.Context) {
 // perCloserShutdownTimeout bounds each closer independently during shutdown.
 // A closer that ignores cancellation must not stall the closers after it or
 // hang the process — the loop aborts the graceful sequence if one overruns,
-// so total shutdown stays bounded. systemd TimeoutStopSec is the final backstop
-// if the process itself wedges past this.
-// ponytail: a circuit-breaker budget, not a correctness assumption — tune freely.
+// so total shutdown stays bounded. When it bounds the gRPC drain, a hit budget
+// force-cancels active RPCs AND marks the shutdown unclean (see the gRPC
+// closer), so overrunning it costs a next-boot reconcile — never a silent clean
+// handoff. It is a circuit breaker, not a proven-safe cancellation bound.
+// systemd TimeoutStopSec is the final backstop if the process wedges past this.
 var perCloserShutdownTimeout = 12 * time.Second
 
 // shutdown runs registered closers in reverse (dependency) order, each under
@@ -1299,7 +1314,13 @@ func main() {
 		case <-done:
 			log.Info().Msg("gRPC server stopped gracefully")
 		case <-shutdownCtx.Done():
-			log.Warn().Msg("graceful shutdown timed out, forcing stop")
+			// Force-cancel active RPCs to stay bounded, but mark the shutdown
+			// unclean: a cancelled create/pause/resume may have left state the
+			// next boot must reconcile, so this can never be a clean handoff
+			// that vouches the pool receipt. Return nil (not an error) so the
+			// remaining closers still flush their state gracefully.
+			log.Warn().Msg("graceful shutdown timed out — forcing gRPC stop; marking shutdown unclean")
+			lc.noteForcedRPCStop()
 			grpcServer.Stop()
 		}
 		return nil

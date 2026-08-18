@@ -157,6 +157,18 @@ func TestLifecycle_CleanIntentionalShutdownGate(t *testing.T) {
 			t.Fatal("a failing closer must disqualify")
 		}
 	})
+
+	t.Run("forced gRPC stop", func(t *testing.T) {
+		// A drain that overran its budget and force-cancelled active RPCs may
+		// have left state the next boot must reconcile — never a clean handoff.
+		lc := newLifecycle(log)
+		lc.noteSignalInitiated()
+		lc.noteForcedRPCStop()
+		lc.shutdown(context.Background())
+		if lc.cleanIntentionalShutdown() {
+			t.Fatal("a forced gRPC stop must disqualify")
+		}
+	})
 }
 
 // A closer that fails or overruns may still have a worker touching its
