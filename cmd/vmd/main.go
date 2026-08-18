@@ -699,6 +699,11 @@ func main() {
 		log.Fatal().Err(err).Str("path", statePath).Msg("failed to open state store")
 	}
 	st.mark("state_store_open", -1)
+	oss := stateStore.OpenStats()
+	log.Info().Dur("bolt_open_ms", oss.BoltOpen).Dur("policy_scan_ms", oss.PolicyScan).
+		Dur("record_scan_ms", oss.RecordScan).Int("records", oss.Records).
+		Int("policies", oss.Policies).Int("orphans_deleted", oss.OrphansDeleted).
+		Msg("state store open breakdown")
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
 
@@ -835,10 +840,16 @@ func main() {
 		// or it reads as an abandoned directory and gets deleted out from
 		// under a still-durable pause.
 		mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
-		backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
+		ss := backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
 		if legacyStaging != "" {
-			backup.SweepStaging(legacyStaging, journal, log.With().Str("component", "backup").Logger())
+			ls := backup.SweepStaging(legacyStaging, journal, log.With().Str("component", "backup").Logger())
+			ss.Sandboxes += ls.Sandboxes
+			ss.Generations += ls.Generations
+			ss.Bases += ls.Bases
+			ss.Pending += ls.Pending
 		}
+		log.Info().Int("sandboxes", ss.Sandboxes).Int("generations", ss.Generations).
+			Int("bases", ss.Bases).Int("pending", ss.Pending).Msg("backup staging scan breakdown")
 		st.mark("backup_staging_scan", -1)
 		uploader.StagingRoot = stagingRoot
 		mgr.SetBackupStaging(stagingRoot)

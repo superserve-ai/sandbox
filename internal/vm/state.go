@@ -281,18 +281,36 @@ func writeStateBreadcrumbTo(at, statePath string) error {
 
 // StateStore wraps a BoltDB database for VM state persistence.
 type StateStore struct {
-	db *bolt.DB
+	db        *bolt.DB
+	openStats StateStoreOpenStats
 }
+
+// StateStoreOpenStats breaks OpenStateStore's cost into its sub-steps for
+// startup timing. Observability only.
+type StateStoreOpenStats struct {
+	BoltOpen       time.Duration // bolt.Open: mmap + freelist load
+	PolicyScan     time.Duration // sidecar orphan scan + deletes
+	RecordScan     time.Duration // primary record scan + policy migration
+	Records        int
+	Policies       int
+	OrphansDeleted int
+}
+
+// OpenStats returns the timing/count breakdown captured while the store opened.
+func (s *StateStore) OpenStats() StateStoreOpenStats { return s.openStats }
 
 // Path returns the resolved filesystem path of the open store.
 func (s *StateStore) Path() string { return s.db.Path() }
 
 // OpenStateStore opens (or creates) the BoltDB file at path.
 func OpenStateStore(path string) (*StateStore, error) {
+	var stats StateStoreOpenStats
+	tOpen := time.Now()
 	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		return nil, fmt.Errorf("open state store %s: %w", path, err)
 	}
+	stats.BoltOpen = time.Since(tOpen)
 	if err := db.Update(func(tx *bolt.Tx) error {
 		records, err := tx.CreateBucketIfNotExists(bucketName)
 		if err != nil {
@@ -312,8 +330,10 @@ func OpenStateStore(path string) (*StateStore, error) {
 		// An old VMD can delete the primary record without knowing about the
 		// sidecar bucket. Remove those orphans before migrating so a later VM
 		// reusing the same key cannot inherit deleted policy state.
+		tPolicy := time.Now()
 		var orphanKeys [][]byte
 		if err := policies.ForEach(func(k, _ []byte) error {
+			stats.Policies++
 			if records.Get(k) == nil {
 				orphanKeys = append(orphanKeys, append([]byte(nil), k...))
 			}
@@ -326,11 +346,15 @@ func OpenStateStore(path string) (*StateStore, error) {
 				return err
 			}
 		}
+		stats.OrphansDeleted = len(orphanKeys)
+		stats.PolicyScan = time.Since(tPolicy)
 
 		// Seed the sidecar for records written by the immediately preceding
 		// schema. Once present, the sidecar is authoritative and is never
 		// replaced from the primary JSON during startup.
-		return records.ForEach(func(k, v []byte) error {
+		tRecord := time.Now()
+		err = records.ForEach(func(k, v []byte) error {
+			stats.Records++
 			if policies.Get(k) != nil {
 				return nil
 			}
@@ -344,11 +368,13 @@ func OpenStateStore(path string) (*StateStore, error) {
 			}
 			return putPreviewPolicy(policies, k, policy)
 		})
+		stats.RecordScan = time.Since(tRecord)
+		return err
 	}); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize state store: %w", err)
 	}
-	return &StateStore{db: db}, nil
+	return &StateStore{db: db, openStats: stats}, nil
 }
 
 // OpenStateStoreReadOnly opens the BoltDB file for reading only. Unlike
