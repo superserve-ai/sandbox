@@ -335,6 +335,13 @@ jobs:
           # Enables the pause-backup uploader for the cell (validated on
           # staging first; the bucket is create-only for hosts).
           BACKUP_BUCKET: superserve-artifact-backup-usw2
+          # Sweeps paused sandboxes that predate the uploader into the
+          # backup bucket; without it they have no copy off the host's
+          # local SSD. Backfill work rides the best-effort tier, so live
+          # pause uploads keep queue priority and egress stays under the
+          # shared bandwidth cap. Removing this line disables the sweep
+          # on the next deploy.
+          BACKUP_BACKFILL: "1"
           # Keeps the backup journal off the root disk — it's written
           # continuously while backups drain and can stall the uploader
           # if the (small) root disk fills.
