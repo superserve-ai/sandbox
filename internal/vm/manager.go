@@ -3509,9 +3509,13 @@ func (m *Manager) ReserveStartupSlots(context.Context) bool {
 	// every unused index below it. Hand those back now, while records are the
 	// only owners and "unowned with no namespace" provably means free.
 	reclaimed := m.netMgr.ReclaimUnusedSlots()
-	m.log.Info().Dur("record_load_ms", loadMS).Dur("reserve_reclaim_ms", time.Since(tReserve)).
-		Int("records", len(recs)).Int("reservations", len(slots)).Int("reclaimed", reclaimed).
-		Msg("startup slot reservation breakdown")
+	// Async: the write must not sit on the startup path.
+	reserveDur := time.Since(tReserve)
+	go func() {
+		m.log.Info().Dur("record_load_ms", loadMS).Dur("reserve_reclaim_ms", reserveDur).
+			Int("records", len(recs)).Int("reservations", len(slots)).Int("reclaimed", reclaimed).
+			Msg("startup slot reservation breakdown")
+	}()
 	if reclaimed > 0 {
 		m.log.Info().Int("slots", reclaimed).Msg("reclaimed unused network slot indexes")
 	}
@@ -3600,8 +3604,12 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) (protected []stri
 			}
 		}
 	}
-	m.log.Info().Int("scanned", scanned).Int("recorded", recorded).Int("recordless", recordless).
-		Int("reaped", reaped).Int("protected", len(protected)).Msg("cgroup reap breakdown")
+	// Async: the write must not sit on the startup path.
+	nProtected := len(protected)
+	go func() {
+		m.log.Info().Int("scanned", scanned).Int("recorded", recorded).Int("recordless", recordless).
+			Int("reaped", reaped).Int("protected", nProtected).Msg("cgroup reap breakdown")
+	}()
 	return protected, sweepSafe
 }
 

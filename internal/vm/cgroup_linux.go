@@ -101,9 +101,14 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 		}
 	}
 	// Detection (record + delegated-tree scan) split from the systemd/cgroup
-	// validation below, for startup timing.
-	m.log.Info().Dur("cgroup_detect_ms", time.Since(tScan)).Bool("has_cgroup_vms", haveCgroupVMs).
-		Msg("cgroup arm: detection scan")
+	// validation below, for startup timing. Async: the write must not sit on
+	// the startup path.
+	detectDur := time.Since(tScan)
+	haveVMs := haveCgroupVMs
+	go func() {
+		m.log.Info().Dur("cgroup_detect_ms", detectDur).Bool("has_cgroup_vms", haveVMs).
+			Msg("cgroup arm: detection scan")
+	}()
 	if !wantArm && !haveCgroupVMs {
 		return false, nil // nothing to arm, nothing to manage
 	}

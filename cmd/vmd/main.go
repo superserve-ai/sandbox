@@ -376,38 +376,31 @@ type startupTimer struct {
 	log   zerolog.Logger
 	start time.Time
 	last  time.Time
-	// Marks are timestamped on the startup goroutine but written from a
-	// dedicated one, so a backpressured stdout can't delay the readiness being
-	// measured. Buffered above the phase count: sends never block, overflow
-	// drops the record rather than stalling startup.
-	ch chan startupPhaseRecord
-}
-
-type startupPhaseRecord struct {
-	phase      string
-	enabled    bool
-	phaseDur   time.Duration
-	sinceStart time.Duration
-	count      int
+	// Marks and breakdown records are timestamped on the startup goroutine but
+	// written from a dedicated one, so a backpressured stdout can't delay the
+	// readiness being measured. Buffered above the record count: sends never
+	// block, overflow drops the record rather than stalling startup.
+	ch chan func()
 }
 
 func newStartupTimer(log zerolog.Logger) *startupTimer {
 	now := time.Now()
-	s := &startupTimer{log: log, start: now, last: now, ch: make(chan startupPhaseRecord, 64)}
+	s := &startupTimer{log: log, start: now, last: now, ch: make(chan func(), 64)}
 	go func() {
-		for r := range s.ch {
-			e := s.log.Info().
-				Str("startup_phase", r.phase).
-				Bool("enabled", r.enabled).
-				Dur("phase_ms", r.phaseDur).
-				Dur("since_start_ms", r.sinceStart)
-			if r.count >= 0 {
-				e = e.Int("count", r.count)
-			}
-			e.Msg("startup phase timing")
+		for fn := range s.ch {
+			fn()
 		}
 	}()
 	return s
+}
+
+// emit queues a log write on the timer's writer goroutine — for startup
+// breakdown records whose values are already computed; never blocks.
+func (s *startupTimer) emit(fn func()) {
+	select {
+	case s.ch <- fn:
+	default:
+	}
 }
 
 // mark records the segment ending here (duration since the previous mark, plus
@@ -419,10 +412,18 @@ func newStartupTimer(log zerolog.Logger) *startupTimer {
 // count >= 0 attaches an aggregate, -1 omits it.
 func (s *startupTimer) mark(phase string, enabled bool, count int) {
 	now := time.Now()
-	select {
-	case s.ch <- startupPhaseRecord{phase: phase, enabled: enabled, phaseDur: now.Sub(s.last), sinceStart: now.Sub(s.start), count: count}:
-	default:
-	}
+	phaseDur, sinceStart := now.Sub(s.last), now.Sub(s.start)
+	s.emit(func() {
+		e := s.log.Info().
+			Str("startup_phase", phase).
+			Bool("enabled", enabled).
+			Dur("phase_ms", phaseDur).
+			Dur("since_start_ms", sinceStart)
+		if count >= 0 {
+			e = e.Int("count", count)
+		}
+		e.Msg("startup phase timing")
+	})
 	s.last = now
 }
 
@@ -785,10 +786,12 @@ func main() {
 	}
 	st.mark("state_store_open", true, -1)
 	oss := stateStore.OpenStats()
-	log.Info().Dur("bolt_open_ms", oss.BoltOpen).Dur("policy_scan_ms", oss.PolicyScan).
-		Dur("record_scan_ms", oss.RecordScan).Int("records", oss.Records).
-		Int("policies", oss.Policies).Int("orphans_deleted", oss.OrphansDeleted).
-		Msg("state store open breakdown")
+	st.emit(func() {
+		log.Info().Dur("bolt_open_ms", oss.BoltOpen).Dur("policy_scan_ms", oss.PolicyScan).
+			Dur("record_scan_ms", oss.RecordScan).Int("records", oss.Records).
+			Int("policies", oss.Policies).Int("orphans_deleted", oss.OrphansDeleted).
+			Msg("state store open breakdown")
+	})
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
 
@@ -933,9 +936,11 @@ func main() {
 			ss.Bases += ls.Bases
 			ss.Pending += ls.Pending
 		}
-		log.Info().Int("renewed_markers", renewedMarkers).Int("sandboxes", ss.Sandboxes).
-			Int("generations", ss.Generations).Int("bases", ss.Bases).Int("pending", ss.Pending).
-			Msg("backup staging scan breakdown")
+		st.emit(func() {
+			log.Info().Int("renewed_markers", renewedMarkers).Int("sandboxes", ss.Sandboxes).
+				Int("generations", ss.Generations).Int("bases", ss.Bases).Int("pending", ss.Pending).
+				Msg("backup staging scan breakdown")
+		})
 		st.mark("backup_staging_scan", true, -1)
 		uploader.StagingRoot = stagingRoot
 		mgr.SetBackupStaging(stagingRoot)

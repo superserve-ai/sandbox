@@ -290,8 +290,13 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 	if err := installHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, mgr.dnsRedirectPort, mgr.secretsProxyDst, mgr.secretsProxyPort, mgr.blockedEgressPorts, mgr.ownsEgressPortChain, log.With().Str("component", "host_fw").Logger()); err != nil {
 		return nil, fmt.Errorf("install host firewall: %w", err)
 	}
-	mgr.log.Info().Dur("pre_network_ms", preNet).Dur("firewall_install_ms", time.Since(tFW)).
-		Msg("network manager init breakdown")
+	// Async: a backpressured log writer must not extend startup — the values
+	// are already computed.
+	fwInstall := time.Since(tFW)
+	go func() {
+		mgr.log.Info().Dur("pre_network_ms", preNet).Dur("firewall_install_ms", fwInstall).
+			Msg("network manager init breakdown")
+	}()
 
 	return mgr, nil
 }
