@@ -317,11 +317,9 @@ func runDrainCheck() int {
 	return 3
 }
 
-// startupTimer emits one structured log line per startup phase. Each mark
-// records the interval since the previous mark, so consecutive marks partition
-// the whole startup with no gap — no phase's cost can hide between timers.
-// Observability only: it changes no control flow and runs only on the startup
-// path, so a prod-sized restart reveals which phase dominates.
+// startupTimer partitions startup into contiguous phases: each mark logs the
+// interval since the previous mark, so the segments tile the whole start→ready
+// timeline with no gap. Observability only — no control flow, startup path only.
 type startupTimer struct {
 	log   zerolog.Logger
 	start time.Time
@@ -333,11 +331,9 @@ func newStartupTimer(log zerolog.Logger) *startupTimer {
 	return &startupTimer{log: log, start: now, last: now}
 }
 
-// mark logs the segment that ended here: its duration since the previous mark
-// and the cumulative time since startup began. Call only from the main startup
-// goroutine — it mutates last; background work logs its own duration directly.
-// count >= 0 attaches an aggregate that accurately represents this phase's
-// work; -1 omits it.
+// mark logs the segment ending here (duration since the previous mark, plus
+// cumulative since start). Main-goroutine only — it mutates last; background
+// work logs its own duration. count >= 0 attaches an aggregate, -1 omits it.
 func (s *startupTimer) mark(phase string, count int) {
 	now := time.Now()
 	e := s.log.Info().
@@ -425,9 +421,7 @@ func main() {
 
 	lc := newLifecycle(log)
 
-	// Startup phase timing — observability only (see startupTimer). Started as
-	// early as the daemon path allows so since_start_ms approximates the full
-	// time to readiness.
+	// Startup phase timing (observability only) — see startupTimer.
 	st := newStartupTimer(log)
 
 	// ---- Egress blocklist (optional) ----
@@ -813,8 +807,7 @@ func main() {
 			VMDVersion:  os.Getenv("SENTRY_RELEASE"),
 			Metrics:     backupMetrics,
 		}
-		// backup_setup covers the whole backup-subsystem init: metrics
-		// recorder, journal open, GCS storage.NewClient, and uploader.
+		// backup_setup: metrics recorder, journal open, GCS storage.NewClient, uploader.
 		st.mark("backup_setup", -1)
 		// Staging pins enqueued artifacts so sandbox teardown cannot
 		// erase a queued generation; the sweep clears residue from
@@ -1065,8 +1058,7 @@ func main() {
 	// Closer is registered later (after the manager/pool closers) so it runs
 	// first on shutdown — stop accepting before those are torn down.
 
-	// grpc_setup covers gRPC server construction, listener inherit/bind, and
-	// adapter registration since the previous mark.
+	// grpc_setup: server construction, listener bind, adapter registration.
 	st.mark("grpc_setup", -1)
 
 	// ---- Startup network prep (fast; must precede StartPool) ----
@@ -1103,8 +1095,7 @@ func main() {
 			if n := netMgr.ReclaimUnusedSlots(); n > 0 {
 				log.Info().Int("slots", n).Msg("reclaimed slot indexes freed by the startup orphan sweep")
 			}
-			// Covers the orphan sweep AND the slot reclaim it feeds.
-			st.mark("namespace_sweep", -1)
+			st.mark("namespace_sweep", -1) // sweep + the slot reclaim it feeds
 		} else {
 			log.Warn().Msg("skipping startup orphan namespace sweep: an unresolved live cgroup survivor could be reclaimed")
 		}
@@ -1160,8 +1151,7 @@ func main() {
 	// started after StartPool so its first read observes an initialized pool.
 	mgr.StartNetnsLeakSampler(ctx, time.Minute)
 
-	// pool_start covers StartPool (returns immediately; fills in the
-	// background), pool adoption wiring, and the launcher-namespace setup.
+	// pool_start: StartPool (async fill), adoption wiring, launcher-ns setup.
 	st.mark("pool_start", -1)
 
 	// ---- Background full reattach ----
@@ -1170,16 +1160,12 @@ func main() {
 	// service — a completing lc service trips lifecycle shutdown.
 	go func() {
 		defer sentrylog.Recover("startup reattach")
-		// Off the critical path, but it is the O(N) reattach work. Timed
-		// independently of the startup marks (which are single-goroutine) and
-		// logged with its record count to size what a synchronous
-		// adopt-in-cutover would cost.
+		// O(N) reattach, off the critical path — timed here (not via the
+		// single-goroutine marks) and flagged concurrent, distinct message, so
+		// its phase_ms is never summed into the partition. count sizes a
+		// synchronous adopt-in-cutover.
 		reattachStart := time.Now()
 		reattached, stale := mgr.ReattachAll(ctx)
-		// Concurrent with the sequential startup partition (runs in this
-		// goroutine), so its phase_ms must NOT be summed with the partition
-		// marks. Flagged concurrent=true and given a distinct message so a
-		// grep for "startup phase timing" excludes it from the partition sum.
 		log.Info().Str("startup_phase", "reattach_background").Bool("concurrent", true).
 			Dur("phase_ms", time.Since(reattachStart)).Int("count", reattached+stale).
 			Msg("startup background phase timing")
@@ -1353,8 +1339,7 @@ func main() {
 	// restore) allocates like a create and shares its bounded wait. A gate
 	// at this level would hold even the non-allocating paths behind
 	// inventory they never use.
-	// pre_ready covers the reconciler, heartbeat, and local HTTP setup since
-	// db_connect — the tail of the critical path before requests are served.
+	// pre_ready: reconciler, heartbeat, local HTTP — the tail before serving.
 	st.mark("pre_ready", -1)
 	startupReady.Store(true)
 	st.mark("ready", -1)
