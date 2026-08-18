@@ -790,7 +790,7 @@ def main() -> int:
                 fi
             fi
 
-            # Stop vmd here ONLY in the exceptional cases that need the ports
+            # Stop here ONLY in the exceptional cases that need the ports
             # released before the socket unit (re)binds: the one-time migration
             # from a direct-bound vmd to socket activation (the socket unit is
             # not yet the active listener, so the old process still owns the
@@ -799,10 +799,19 @@ def main() -> int:
             # across the swap — stopping vmd here instead would leave it down
             # for the whole config window with the socket still listening, so a
             # connection arriving in that gap socket-activates a throwaway vmd
-            # that the restart below then kills. The single restart further
-            # down does the cutover with connections backlogging on the socket.
+            # that the restart below then kills. A normal binary deploy never
+            # reaches this stop; the single restart further down does its
+            # cutover with connections backlogging on the socket.
+            #
+            # Stop BOTH units, not just vmd: on a socket-definition change the
+            # old socket is still active, so leaving it listening would let a
+            # connection socket-activate an interim vmd during the rebind
+            # window — the very race this gating exists to remove. Stopping an
+            # inactive socket (the migration case) is a harmless no-op. The
+            # socket comes back with its new definition at the rebind block
+            # below; that rare deploy accepts a brief refused window.
             if ! systemctl is-active --quiet superserve-vmd.socket || [ "$SOCKET_CHANGED" = 1 ]; then
-                sudo systemctl stop {service}
+                sudo systemctl stop superserve-vmd.socket {service}
             fi
 
             # Migrate the backup journal to its new path now that vmd is

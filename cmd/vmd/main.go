@@ -270,18 +270,21 @@ func (lc *lifecycle) wait(ctx context.Context) {
 
 // perCloserShutdownTimeout bounds each closer independently during shutdown.
 // A closer that ignores cancellation must not stall the closers after it or
-// hang the process — the loop abandons one that overruns and moves on, so
-// total shutdown stays bounded. systemd TimeoutStopSec is the final backstop
-// if the process itself wedges past the sum of these.
+// hang the process — the loop aborts the graceful sequence if one overruns,
+// so total shutdown stays bounded. systemd TimeoutStopSec is the final backstop
+// if the process itself wedges past this.
 // ponytail: a circuit-breaker budget, not a correctness assumption — tune freely.
 var perCloserShutdownTimeout = 12 * time.Second
 
-// shutdown runs every registered closer in reverse order, collecting errors
-// but never stopping on the first failure — every resource gets a chance to
-// clean up. Each closer runs under its own deadline and off the main
-// goroutine, so one that wedges is abandoned rather than hanging the daemon;
-// an abandoned or failed closer records closerErr, which bars this shutdown
-// from vouching for inventory it may have left inconsistent.
+// shutdown runs every registered closer in reverse (dependency) order. A
+// closer that RETURNS an error is logged and the loop continues — it is done
+// touching its resources, so its dependencies are safe to close. A closer that
+// OVERRUNS its deadline is still running, so the loop must NOT keep closing the
+// dependencies it may still be using (use-after-close): it records the failure
+// and aborts the sequence, leaving the rest to process exit (and systemd
+// TimeoutStopSec). Each closer runs under its own deadline and off the main
+// goroutine. Any failed or timed-out closer records closerErr, which bars this
+// shutdown from vouching for inventory it may have left inconsistent.
 func (lc *lifecycle) shutdown(ctx context.Context) {
 	lc.mu.Lock()
 	closers := slices.Clone(lc.closers)
@@ -291,23 +294,25 @@ func (lc *lifecycle) shutdown(ctx context.Context) {
 	for _, c := range closers {
 		lc.log.Info().Str("service", c.name).Msg("closing")
 		closerCtx, cancel := context.WithTimeout(ctx, perCloserShutdownTimeout)
-		// Buffered so an abandoned closer's goroutine can still send and exit
-		// (or leak harmlessly — the process is on its way down) rather than
-		// block forever on a receiver that has already moved on.
+		// Buffered so a closer that overruns can still send and exit (or leak
+		// harmlessly — the process is on its way down) rather than block
+		// forever on a receiver that has moved on.
 		done := make(chan error, 1)
 		go func() { done <- c.close(closerCtx) }()
 		select {
 		case err := <-done:
+			cancel()
 			if err != nil {
 				lc.log.Error().Err(err).Str("service", c.name).Msg("close returned error")
 				lc.recordCloserErr(fmt.Errorf("%s: %w", c.name, err))
 			}
 		case <-closerCtx.Done():
+			cancel()
 			lc.log.Error().Str("service", c.name).Dur("deadline", perCloserShutdownTimeout).
-				Msg("closer exceeded its shutdown deadline; abandoning")
+				Msg("closer exceeded its shutdown deadline; aborting graceful shutdown")
 			lc.recordCloserErr(fmt.Errorf("%s: shutdown deadline exceeded", c.name))
+			return
 		}
-		cancel()
 	}
 }
 
