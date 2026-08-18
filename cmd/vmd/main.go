@@ -675,6 +675,7 @@ func main() {
 		egressProxy.SetBlocklist(blockList)
 		// Mirror IP/CIDR entries into a host-level nftables drop set so they
 		// are enforced on every port, not just the proxied web ports.
+		hostEgressT0 := time.Now()
 		hostBlock, err := network.NewHostEgressBlock(log)
 		if err != nil {
 			log.Fatal().Err(err).Msg("failed to install host egress block table")
@@ -684,7 +685,9 @@ func main() {
 		// the first feed fetch (which may block up to feedFetchTimeout per
 		// feed). Otherwise seeded CIDRs go unenforced on non-proxied ports
 		// during the startup window.
-		hostBlock.UpdateCIDRs(blockList.CIDRs())
+		seedCIDRs := blockList.CIDRs()
+		hostBlock.UpdateCIDRs(seedCIDRs)
+		st.done("host_egress_block", hostEgressT0, len(seedCIDRs))
 		lc.addCloser("host egress block", func(_ context.Context) error { return hostBlock.Close() })
 		lc.start("egress blocklist", func() error { return blockList.Start(ctx) })
 	}
@@ -787,10 +790,12 @@ func main() {
 	var backupJournal *backup.Journal
 	if bucket := backupBucket; bucket != "" {
 		journalPath := envOrDefault("BACKUP_JOURNAL_PATH", filepath.Join(filepath.Dir(cfg.RunDir), "backup.db"))
+		journalOpenT0 := time.Now()
 		bdb, err := bolt.Open(journalPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 		if err != nil {
 			log.Fatal().Err(err).Str("path", journalPath).Msg("failed to open backup journal")
 		}
+		st.done("backup_journal_open", journalOpenT0, -1)
 		lc.addCloser("backup journal", func(_ context.Context) error { return bdb.Close() })
 		journal, err := backup.NewJournal(bdb)
 		if err != nil {
@@ -1097,7 +1102,9 @@ func main() {
 	// namespaces so the non-adoption sweep keeps them too. sweepSafe=false
 	// means a survivor could NOT be protected — every reclaim path below
 	// (sweep AND adoption) must stand down for this boot.
+	cgroupReapT0 := time.Now()
 	protectedNs, sweepSafe := mgr.ReapRecordlessCgroupVMs(ctx)
+	st.done("cgroup_reap", cgroupReapT0, len(protectedNs))
 	adoptNetPool := envOrDefault("VMD_NET_POOL_ADOPT", "false") == "true"
 	if !adoptNetPool {
 		// Under adoption, orphan namespaces are warm-pool candidates instead
@@ -1353,6 +1360,14 @@ func main() {
 	// restore) allocates like a create and shares its bounded wait. A gate
 	// at this level would hold even the non-allocating paths behind
 	// inventory they never use.
+	// Startup host inventory — observability only. The host-scale netns count
+	// is the O(N) driver for the network setup, namespace sweep, and reattach
+	// phases; logged here so it sits in the same startup burst as their
+	// durations. Host mount counts arrive shortly after from the mount sampler.
+	netnsTotal, netnsOwned, netnsOrphaned := netMgr.NetnsStats()
+	log.Info().Int("netns_total", netnsTotal).Int("netns_owned", netnsOwned).
+		Int("netns_orphaned", netnsOrphaned).Msg("startup host inventory")
+
 	startupReady.Store(true)
 	st.done("ready", st.start, -1)
 	log.Info().Msg("startup complete — gRPC serving requests")
