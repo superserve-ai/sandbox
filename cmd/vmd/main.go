@@ -286,8 +286,9 @@ func (lc *lifecycle) wait(ctx context.Context) {
 // so total shutdown stays bounded. Bounding the gRPC drain, a hit budget
 // force-cancels active RPCs and marks the shutdown unclean (see the gRPC
 // closer) — a circuit breaker (overrun costs a reconcile), not a proven-safe
-// cancellation bound. systemd TimeoutStopSec is the final backstop.
-var perCloserShutdownTimeout = 12 * time.Second
+// cancellation bound. Chosen to sit under the 30s overall shutdown budget and
+// the unit's TimeoutStopSec backstop, leaving room for the closers after it.
+var perCloserShutdownTimeout = 15 * time.Second
 
 // shutdown runs registered closers in reverse (dependency) order, each under
 // its own deadline and off the main goroutine. Any non-nil outcome — a returned
