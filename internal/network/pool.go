@@ -858,6 +858,7 @@ func (p *Pool) placeVouched(slot *preallocSlot, preferRecycled bool) bool {
 // scanning phase before its goroutine is spawned, so no request can observe
 // the gap between launch and the pass actually starting.
 func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped int64) {
+	tStart := time.Now()
 	// Direct callers (tests, legacy paths) enter the phase here; via
 	// StartAdoption it is already scanning and the CAS no-ops. The deferred
 	// reset is the panic backstop AND clears the trust state for the next
@@ -941,7 +942,8 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 				Msg("pool: adoption aborted — validation timing out systemically; remaining slots left for a later boot")
 		}
 		p.log.Info().Int64("adopted", nAdopted.Load()).Int64("torn_down", nInvalid.Load()).
-			Int64("skipped", nSkipped.Load()).Msg("pool: adoption pass complete")
+			Int64("skipped", nSkipped.Load()).Int("candidates", len(indexes)).
+			Dur("duration_ms", time.Since(tStart)).Msg("pool: adoption pass complete")
 		// Accumulate — adopted already carries the receipt fast path's count.
 		adopted += nAdopted.Load()
 		invalid, skipped = nInvalid.Load(), nSkipped.Load()
