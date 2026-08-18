@@ -10,8 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -40,6 +42,15 @@ type fakeStripeClient struct {
 	nextCustomerID  string
 	nextCheckoutURL string
 	nextPortalURL   string
+}
+
+type thinEventStripeClient struct {
+	*fakeStripeClient
+	retrieved json.RawMessage
+}
+
+func (f *thinEventStripeClient) RetrieveEvent(context.Context, string) (json.RawMessage, error) {
+	return f.retrieved, nil
 }
 
 func (f *fakeStripeClient) CreateCustomer(_ context.Context, params api.StripeCreateCustomerParams) (api.StripeCustomer, error) {
@@ -288,6 +299,14 @@ func TestIntegration_ShadowBillingSkipsStripeCalls(t *testing.T) {
 	if got := exportAttemptCount(t, teamID, "skipped_shadow"); got != 2 {
 		t.Fatalf("skipped shadow attempts = %d, want 2", got)
 	}
+
+	replay := doInternal(r, "POST", "/internal/teams/"+teamID.String()+"/billing/periods/"+periodID+"/export", adminID.String(), "")
+	if replay.Code != http.StatusOK {
+		t.Fatalf("shadow export replay: expected 200, got %d: %s", replay.Code, replay.Body.String())
+	}
+	if got := exportAttemptCount(t, teamID, "skipped_shadow"); got != 2 {
+		t.Fatalf("shadow replay changed skipped shadow attempts to %d, want still 2", got)
+	}
 }
 
 func TestIntegration_LiveBillingSendsStripeEventsAndIsIdempotent(t *testing.T) {
@@ -295,24 +314,99 @@ func TestIntegration_LiveBillingSendsStripeEventsAndIsIdempotent(t *testing.T) {
 	adminID := seedPlatformAdminProfile(t)
 	stripe := &fakeStripeClient{}
 	r := newBillingRouter(t, stripe)
+	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+	const (
+		wantCPUHours     = 1.0
+		wantMemoryHours  = 1.0
+		wantStorageHours = 1.0
+	)
+	result, err := testPool.Exec(context.Background(), `
+		UPDATE sandbox_compute_billing_interval
+		SET ended_at = $2
+		WHERE team_id = $1
+	`, teamID, periodStart.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("update compute billing interval: %v", err)
+	}
+	if rows := result.RowsAffected(); rows != 1 {
+		t.Fatalf("updated compute billing intervals = %d, want 1", rows)
+	}
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_storage_billing_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable storage billing: %v", err)
+	}
+
+	previewResp := do(r, "GET", "/teams/"+teamID.String()+"/billing/periods/"+periodID+"/export-preview", viewerKey, "")
+	if previewResp.Code != http.StatusOK {
+		t.Fatalf("export preview: expected 200, got %d: %s", previewResp.Code, previewResp.Body.String())
+	}
+	var preview struct {
+		Items []struct {
+			EventName string  `json:"stripe_event_name"`
+			Value     float64 `json:"value"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(previewResp.Body.Bytes(), &preview); err != nil {
+		t.Fatalf("decode export preview: %v", err)
+	}
+	if got := len(preview.Items); got != 3 {
+		t.Fatalf("preview item count = %d, want 3", got)
+	}
+	wantPreview := map[string]float64{}
+	for _, item := range preview.Items {
+		wantPreview[item.EventName] = item.Value
+	}
+	if got := len(wantPreview); got != 3 {
+		t.Fatalf("preview item count = %d, want 3", got)
+	}
+	for eventName, wantValue := range map[string]float64{
+		"cpu_vcpu_hours":    wantCPUHours,
+		"memory_gib_hours":  wantMemoryHours,
+		"storage_gib_hours": wantStorageHours,
+	} {
+		if got, ok := wantPreview[eventName]; !ok || math.Abs(got-wantValue) > 1e-9 {
+			t.Fatalf("preview %s quantity = %v, want %v", eventName, got, wantValue)
+		}
+	}
 
 	first := doInternal(r, "POST", "/internal/teams/"+teamID.String()+"/billing/periods/"+periodID+"/export", adminID.String(), "")
 	if first.Code != http.StatusOK {
 		t.Fatalf("live export: expected 200, got %d: %s", first.Code, first.Body.String())
 	}
-	if got := len(stripe.reportCalls); got != 2 {
-		t.Fatalf("first export stripe calls = %d, want 2", got)
+	if got := len(stripe.reportCalls); got != 3 {
+		t.Fatalf("first export stripe calls = %d, want 3", got)
 	}
+	stripeEventCounts := map[string]int{}
 	for i, call := range stripe.reportCalls {
+		stripeEventCounts[call.EventName]++
 		if got := len(call.Identifier); got > 100 {
 			t.Fatalf("stripe identifier %d length = %d, want <= 100", i, got)
 		}
-		if got := call.Value; got != "7200" {
-			t.Fatalf("stripe call %d quantity = %q, want 7200 seconds", i, got)
+		wantValue, ok := wantPreview[call.EventName]
+		if !ok {
+			t.Fatalf("unexpected stripe event name %q", call.EventName)
+		}
+		gotValue, err := strconv.ParseFloat(call.Value, 64)
+		if err != nil {
+			t.Fatalf("parse stripe call %d quantity %q: %v", i, call.Value, err)
+		}
+		if call.Value != "1.000000000000" {
+			t.Fatalf("stripe call %d serialized quantity = %q, want 1.000000000000", i, call.Value)
+		}
+		if math.Abs(gotValue-wantValue) > 1e-6 {
+			t.Fatalf("stripe call %d quantity = %v, want %v from preview", i, gotValue, wantValue)
 		}
 		wantTimestamp := periodEnd.UTC().Add(-time.Second).Unix()
 		if call.Timestamp != wantTimestamp {
 			t.Fatalf("stripe call %d timestamp = %d, want %d", i, call.Timestamp, wantTimestamp)
+		}
+	}
+	for eventName := range wantPreview {
+		if got := stripeEventCounts[eventName]; got != 1 {
+			t.Fatalf("stripe %s event count = %d, want 1", eventName, got)
 		}
 	}
 	if got := billingPeriodStatus(t, teamID, periodStart, periodEnd); got != "exported" {
@@ -326,8 +420,8 @@ func TestIntegration_LiveBillingSendsStripeEventsAndIsIdempotent(t *testing.T) {
 	if second.Code != http.StatusOK {
 		t.Fatalf("idempotent export replay: expected 200, got %d: %s", second.Code, second.Body.String())
 	}
-	if got := len(stripe.reportCalls); got != 2 {
-		t.Fatalf("second export changed stripe call count to %d, want still 2", got)
+	if got := len(stripe.reportCalls); got != 3 {
+		t.Fatalf("second export changed stripe call count to %d, want still 3", got)
 	}
 }
 
@@ -749,6 +843,46 @@ func TestIntegration_StripeWebhookDuplicateDeliveryIsSafe(t *testing.T) {
 	}
 }
 
+func TestIntegration_StripeThinMeterErrorReconcilesByIdempotencyKey(t *testing.T) {
+	ctx := context.Background()
+	teamID, periodID, periodStart, periodEnd := seedBillingPeriodForStripe(t, true, true)
+	adminID := seedPlatformAdminProfile(t)
+	baseStripe := &fakeStripeClient{}
+	if w := doInternal(newBillingRouter(t, baseStripe), "POST", "/internal/teams/"+teamID.String()+"/billing/periods/"+periodID+"/export", adminID.String(), ""); w.Code != http.StatusOK {
+		t.Fatalf("live export: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	rows, err := testQueries.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd})
+	if err != nil || len(rows) == 0 || rows[0].StripeIdempotencyKey == nil {
+		t.Fatalf("load live export attempts: err=%v rows=%d", err, len(rows))
+	}
+	fullData, err := json.Marshal(map[string]any{
+		"developer_message_summary": "There is 1 invalid event",
+		"reason":                    map[string]any{"error_types": []any{map[string]any{"sample_errors": []any{map[string]any{"request": map[string]any{"idempotency_key": *rows[0].StripeIdempotencyKey}}}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrieved, err := json.Marshal(map[string]json.RawMessage{"data": fullData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripe := &thinEventStripeClient{fakeStripeClient: &fakeStripeClient{}, retrieved: retrieved}
+	r := newBillingRouter(t, stripe)
+	payload, err := json.Marshal(map[string]any{"id": "evt_thin_meter_error", "type": "v1.billing.meter.error_report_triggered", "created": "2026-07-02T12:00:00.000Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC()))
+	if w := doRequest(r, req); w.Code != http.StatusOK {
+		t.Fatalf("thin meter webhook: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := exportAttemptCount(t, teamID, "failed"); got == 0 {
+		t.Fatal("thin meter webhook did not mark the matched export failed")
+	}
+}
+
 func TestIntegration_StripeWebhookIgnoresForeignOrStaleSubscriptionEvents(t *testing.T) {
 	ctx := context.Background()
 	teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
@@ -893,17 +1027,19 @@ func TestIntegration_StripeSubmissionFailureFreezesUsageOnRetry(t *testing.T) {
 		t.Fatalf("partial live export stripe calls = %d, want 2", got)
 	}
 	for i, call := range stripe.reportCalls {
-		if got := call.Value; got != "7200" {
-			t.Fatalf("partial export call %d quantity = %q, want 7200 seconds", i, got)
+		if got := call.Value; got != "2.000000000000" {
+			t.Fatalf("partial export call %d quantity = %q, want 2 normalized hours", i, got)
 		}
 	}
+	failedCall := stripe.reportCalls[1]
 
 	if _, err := testPool.Exec(context.Background(), `
-		UPDATE sandbox_compute_billing_interval
-		SET ended_at = $1
-		WHERE team_id = $2
-	`, periodStart.Add(3*time.Hour), teamID); err != nil {
-		t.Fatalf("mutate compute interval for retry: %v", err)
+		UPDATE team_billing_usage
+		SET vcpu_seconds = 10800,
+		    memory_mib_seconds = 11059200
+		WHERE team_id = $1 AND period_start = $2 AND period_end = $3
+	`, teamID, periodStart, periodEnd); err != nil {
+		t.Fatalf("mutate frozen usage for retry: %v", err)
 	}
 
 	second := doInternal(r, "POST", "/internal/teams/"+teamID.String()+"/billing/periods/"+periodID+"/export", adminID.String(), "")
@@ -913,11 +1049,47 @@ func TestIntegration_StripeSubmissionFailureFreezesUsageOnRetry(t *testing.T) {
 	if got := len(stripe.reportCalls); got != 3 {
 		t.Fatalf("retry stripe calls = %d, want 3", got)
 	}
-	if got := stripe.reportCalls[2].Value; got != "7200" {
-		t.Fatalf("retry stripe quantity = %q, want frozen 7200 seconds", got)
+	if got := stripe.reportCalls[2].Value; got != "3.000000000000" {
+		t.Fatalf("retry stripe quantity = %q, want changed 3 normalized hours", got)
+	}
+	if got := stripe.reportCalls[2].Identifier; got == failedCall.Identifier {
+		t.Fatalf("retry reused Stripe meter identifier %q after payload changed", got)
+	}
+	if !strings.HasPrefix(stripe.reportCalls[2].Identifier, "team:") {
+		t.Fatalf("retry Stripe meter identifier = %q, want logical meter identifier prefix", stripe.reportCalls[2].Identifier)
+	}
+	if got := stripe.reportCalls[2].IdempotencyKey; got == failedCall.IdempotencyKey {
+		t.Fatalf("retry reused idempotency key %q after payload changed", got)
 	}
 	if got := billingPeriodStatus(t, teamID, periodStart, periodEnd); got != "exported" {
 		t.Fatalf("period status after retry = %q, want exported", got)
+	}
+}
+
+func TestIntegration_StripeSubmissionFailureRetryKeepsIdentifierForUnchangedPayload(t *testing.T) {
+	teamID, periodID, _, _ := seedBillingPeriodForStripe(t, true, true)
+	adminID := seedPlatformAdminProfile(t)
+	stripe := &fakeStripeClient{reportErr: fmt.Errorf("meter rejected"), reportErrAt: 2}
+	r := newBillingRouter(t, stripe)
+
+	first := doInternal(r, "POST", "/internal/teams/"+teamID.String()+"/billing/periods/"+periodID+"/export", adminID.String(), "")
+	if first.Code != http.StatusBadGateway {
+		t.Fatalf("failed live export: expected 502, got %d: %s", first.Code, first.Body.String())
+	}
+	failedCall := stripe.reportCalls[1]
+
+	second := doInternal(r, "POST", "/internal/teams/"+teamID.String()+"/billing/periods/"+periodID+"/export", adminID.String(), "")
+	if second.Code != http.StatusOK {
+		t.Fatalf("unchanged payload retry: expected 200, got %d: %s", second.Code, second.Body.String())
+	}
+	if got := stripe.reportCalls[2].Identifier; got != failedCall.Identifier {
+		t.Fatalf("unchanged payload retry identifier = %q, want %q", got, failedCall.Identifier)
+	}
+	if got := stripe.reportCalls[2].IdempotencyKey; got != failedCall.IdempotencyKey {
+		t.Fatalf("unchanged payload retry idempotency key = %q, want %q", got, failedCall.IdempotencyKey)
+	}
+	if got := stripe.reportCalls[2].Value; got != failedCall.Value {
+		t.Fatalf("unchanged payload retry value = %q, want %q", got, failedCall.Value)
 	}
 }
 

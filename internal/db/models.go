@@ -328,6 +328,7 @@ type BillingUsageExport struct {
 	CreatedAt                  time.Time          `json:"created_at"`
 	SentAt                     pgtype.Timestamptz `json:"sent_at"`
 	UpdatedAt                  time.Time          `json:"updated_at"`
+	StripeIdempotencyKey       *string            `json:"stripe_idempotency_key"`
 }
 
 type DeviceCode struct {
