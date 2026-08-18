@@ -1053,14 +1053,16 @@ def main() -> int:
             READY=0
             for i in $(seq 1 90); do
                 INVOCATION=$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)
-                if [ -n "$INVOCATION" ]; then
-                    MATCH=$(sudo journalctl "_SYSTEMD_INVOCATION_ID=$INVOCATION" -g 'gRPC serving requests' --no-pager 2>/dev/null || true)
-                    if [ -n "$MATCH" ] \
-                       && [ "$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)" = "$INVOCATION" ] \
-                       && sudo systemctl is-active --quiet {service}; then
-                        READY=1
-                        break
-                    fi
+                # journalctl -g exits nonzero on no match (and prints
+                # "-- No entries --" to stdout), so drive the check off its exit
+                # status — capturing stdout would read that marker as a false
+                # positive. No `|| true`: that would swallow the no-match status.
+                if [ -n "$INVOCATION" ] \
+                   && sudo journalctl "_SYSTEMD_INVOCATION_ID=$INVOCATION" --quiet -g 'gRPC serving requests' --no-pager >/dev/null 2>&1 \
+                   && [ "$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)" = "$INVOCATION" ] \
+                   && sudo systemctl is-active --quiet {service}; then
+                    READY=1
+                    break
                 fi
                 sleep 1
             done
