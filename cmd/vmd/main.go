@@ -284,10 +284,11 @@ func (lc *lifecycle) wait(ctx context.Context) {
 // A closer that ignores cancellation must not stall the closers after it or
 // hang the process — the loop aborts the graceful sequence if one overruns,
 // so total shutdown stays bounded. Bounding the gRPC drain, a hit budget
-// force-cancels active RPCs and marks the shutdown unclean (see the gRPC
-// closer) — a circuit breaker (overrun costs a reconcile), not a proven-safe
-// cancellation bound. Chosen to sit under the 30s overall shutdown budget and
-// the unit's TimeoutStopSec backstop, leaving room for the closers after it.
+// force-cancels active RPCs, aborts the remaining closers (a forced stop leaves
+// handlers running — see the gRPC closer), and marks the shutdown unclean — a
+// circuit breaker (overrun costs a reconcile), not a proven-safe cancellation
+// bound. Chosen to sit under the 30s overall shutdown budget and the unit's
+// TimeoutStopSec backstop, leaving room for the closers after it.
 var perCloserShutdownTimeout = 15 * time.Second
 
 // shutdown runs registered closers in reverse (dependency) order, each under
@@ -1312,15 +1313,21 @@ func main() {
 		select {
 		case <-done:
 			log.Info().Msg("gRPC server stopped gracefully")
+			return nil
 		case <-shutdownCtx.Done():
-			// Force-cancel to stay bounded, but mark the shutdown unclean so it
-			// can't vouch the pool receipt. Return nil (below) so the remaining
-			// closers still flush state.
-			log.Warn().Msg("graceful shutdown timed out — forcing gRPC stop; marking shutdown unclean")
+			// Stop() closes transports but does NOT wait for handler goroutines
+			// (no WaitForHandlers — deliberately, so a handler that detached its
+			// context via WithoutCancel can't defeat the shutdown bound). Those
+			// handlers may still be using the store/pool/DB, so return an error:
+			// the shutdown loop then ABORTS the remaining dependency closers
+			// instead of closing resources out from under a live handler, and
+			// process exit reclaims everything together. Marked unclean so the
+			// next boot reconciles.
+			log.Warn().Msg("graceful shutdown timed out — forcing gRPC stop; aborting remaining cleanup")
 			lc.noteForcedRPCStop()
 			grpcServer.Stop()
+			return fmt.Errorf("forced gRPC stop; handlers may still be running")
 		}
-		return nil
 	})
 
 	// Fast pre-serve init is done (slots reserved, namespaces swept, pool fill
