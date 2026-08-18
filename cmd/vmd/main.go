@@ -284,11 +284,11 @@ func (lc *lifecycle) wait(ctx context.Context) {
 // A closer that ignores cancellation must not stall the closers after it or
 // hang the process — the loop aborts the graceful sequence if one overruns,
 // so total shutdown stays bounded. Bounding the gRPC drain, a hit budget
-// force-cancels active RPCs, aborts the remaining closers (a forced stop leaves
-// handlers running — see the gRPC closer), and marks the shutdown unclean — a
-// circuit breaker (overrun costs a reconcile), not a proven-safe cancellation
-// bound. Chosen to sit under the 30s overall shutdown budget and the unit's
-// TimeoutStopSec backstop, leaving room for the closers after it.
+// force-cancels active RPCs, aborts the remaining closers, and marks the
+// shutdown unclean — a circuit breaker (overrun costs a reconcile), not a
+// proven-safe cancellation bound. Chosen to sit under the 30s overall shutdown
+// budget and the unit's TimeoutStopSec backstop, leaving room for the closers
+// after it.
 var perCloserShutdownTimeout = 15 * time.Second
 
 // shutdown runs registered closers in reverse (dependency) order, each under
@@ -1315,14 +1315,11 @@ func main() {
 			log.Info().Msg("gRPC server stopped gracefully")
 			return nil
 		case <-shutdownCtx.Done():
-			// Stop() closes transports but does NOT wait for handler goroutines
-			// (no WaitForHandlers — deliberately, so a handler that detached its
-			// context via WithoutCancel can't defeat the shutdown bound). Those
-			// handlers may still be using the store/pool/DB, so return an error:
-			// the shutdown loop then ABORTS the remaining dependency closers
-			// instead of closing resources out from under a live handler, and
-			// process exit reclaims everything together. Marked unclean so the
-			// next boot reconciles.
+			// Stop() force-cancels transports but does not wait for handlers (no
+			// WaitForHandlers — that would let a WithoutCancel handler defeat the
+			// bound), so they may still be using the store/pool/DB. Return an
+			// error to abort the remaining closers rather than close those under
+			// a live handler; process exit reclaims the rest.
 			log.Warn().Msg("graceful shutdown timed out — forcing gRPC stop; aborting remaining cleanup")
 			lc.noteForcedRPCStop()
 			grpcServer.Stop()
