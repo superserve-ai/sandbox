@@ -679,16 +679,19 @@ func fresherThan(path string, grace time.Duration) bool {
 // residue of a crash between staging and enqueue, or of an ack whose
 // cleanup was interrupted. Runs at startup before the uploader drains
 // and periodically from the drain loop thereafter.
-func SweepStaging(root string, j *Journal, log zerolog.Logger) {
+// SweepStaging reaps orphaned staged artifacts under root. It returns the
+// number of top-level staged entries it enumerated — a telemetry signal for
+// startup timing that callers may ignore.
+func SweepStaging(root string, j *Journal, log zerolog.Logger) int {
 	if root == "" {
-		return
+		return 0
 	}
 	sandboxes, err := os.ReadDir(root)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Warn().Err(err).Msg("backup staging sweep: read root failed")
 		}
-		return
+		return 0
 	}
 	referenced, err := j.PendingBaseSHAs()
 	if err != nil {
@@ -766,6 +769,7 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 		}
 		_ = os.Remove(sbDir)
 	}
+	return len(sandboxes)
 }
 
 // ResolveStagingRoot picks the staging tree location. The default lives

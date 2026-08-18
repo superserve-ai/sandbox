@@ -704,11 +704,17 @@ func main() {
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
 
-	// Startup inventory — observability only. One cheap read of the record set
-	// gives the master N and its network/cgroup breakdown, to correlate with
-	// the phase durations. Host-total netns/mounts are emitted separately by
-	// the reconciler's periodic gauge shortly after startup.
-	if recs, aerr := stateStore.All(); aerr == nil {
+	// Startup inventory — observability only, emitted asynchronously so its
+	// full-record scan never sits on the readiness path (BoltDB allows
+	// concurrent readers). Gives the master N and its network/cgroup breakdown
+	// to correlate with the phase durations; the same records are scanned by
+	// ArmDirectSpawn/ReserveStartupSlots on the critical path, so this adds no
+	// synchronous work.
+	go func() {
+		recs, aerr := stateStore.All()
+		if aerr != nil {
+			return
+		}
 		var withNS, cgroup int
 		for _, r := range recs {
 			if r.Namespace != "" {
@@ -720,7 +726,7 @@ func main() {
 		}
 		log.Info().Int("vm_records", len(recs)).Int("records_with_namespace", withNS).
 			Int("cgroup_records", cgroup).Msg("startup inventory")
-	}
+	}()
 
 	// Arm direct spawn AFTER the state store is attached (hasCgroupRecords
 	// reads it to decide rollback-management; the rollback-guard breadcrumb
@@ -856,14 +862,10 @@ func main() {
 		// or it reads as an abandoned directory and gets deleted out from
 		// under a still-durable pause.
 		stagingT0 := time.Now()
-		stagedEntries := 0
-		if entries, rerr := os.ReadDir(stagingRoot); rerr == nil {
-			stagedEntries = len(entries)
-		}
 		mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
-		backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
+		stagedEntries := backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
 		if legacyStaging != "" {
-			backup.SweepStaging(legacyStaging, journal, log.With().Str("component", "backup").Logger())
+			stagedEntries += backup.SweepStaging(legacyStaging, journal, log.With().Str("component", "backup").Logger())
 		}
 		st.done("backup_staging_scan", stagingT0, stagedEntries)
 		uploader.StagingRoot = stagingRoot
@@ -1360,15 +1362,17 @@ func main() {
 	// restore) allocates like a create and shares its bounded wait. A gate
 	// at this level would hold even the non-allocating paths behind
 	// inventory they never use.
-	// Startup host inventory — observability only. The host-scale netns count
-	// is the O(N) driver for the network setup, namespace sweep, and reattach
-	// phases; logged here so it sits in the same startup burst as their
-	// durations. Host mount counts arrive shortly after from the mount sampler.
-	netnsTotal, netnsOwned, netnsOrphaned := netMgr.NetnsStats()
-	mountTotal, nsfsTotal := vm.HostMountCounts()
-	log.Info().Int("netns_total", netnsTotal).Int("netns_owned", netnsOwned).
-		Int("netns_orphaned", netnsOrphaned).Int("host_mount_count", mountTotal).
-		Int("host_nsfs_count", nsfsTotal).Msg("startup host inventory")
+	// Startup host inventory — observability only, emitted asynchronously so
+	// its /run/netns and /proc/mounts scans never sit on the readiness path.
+	// These host-scale counts drive O(N) for the network setup, namespace
+	// sweep, and reattach phases.
+	go func() {
+		netnsTotal, netnsOwned, netnsOrphaned := netMgr.NetnsStats()
+		mountTotal, nsfsTotal := vm.HostMountCounts()
+		log.Info().Int("netns_total", netnsTotal).Int("netns_owned", netnsOwned).
+			Int("netns_orphaned", netnsOrphaned).Int("host_mount_count", mountTotal).
+			Int("host_nsfs_count", nsfsTotal).Msg("startup host inventory")
+	}()
 
 	startupReady.Store(true)
 	st.done("ready", st.start, -1)
