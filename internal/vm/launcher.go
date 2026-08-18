@@ -375,6 +375,11 @@ func (m *Manager) retryLauncherBuild(ctx context.Context) {
 
 // hostMountCounts returns the total mount count and the nsfs subset (the
 // per-netns bind mounts) from /proc/mounts.
+// HostMountCounts returns the host's total mount count and its nsfs subset,
+// read from /proc/mounts. Exported for the one-shot startup host inventory;
+// StartMountCountSampler emits the same counts periodically. Observability only.
+func HostMountCounts() (total, nsfs int) { return hostMountCounts() }
+
 func hostMountCounts() (total, nsfs int) {
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {

@@ -1365,8 +1365,10 @@ func main() {
 	// phases; logged here so it sits in the same startup burst as their
 	// durations. Host mount counts arrive shortly after from the mount sampler.
 	netnsTotal, netnsOwned, netnsOrphaned := netMgr.NetnsStats()
+	mountTotal, nsfsTotal := vm.HostMountCounts()
 	log.Info().Int("netns_total", netnsTotal).Int("netns_owned", netnsOwned).
-		Int("netns_orphaned", netnsOrphaned).Msg("startup host inventory")
+		Int("netns_orphaned", netnsOrphaned).Int("host_mount_count", mountTotal).
+		Int("host_nsfs_count", nsfsTotal).Msg("startup host inventory")
 
 	startupReady.Store(true)
 	st.done("ready", st.start, -1)
