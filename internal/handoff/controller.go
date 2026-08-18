@@ -77,26 +77,42 @@ var (
 	ErrDeployPostponed = errors.New("handoff: deploy postponed — in-flight operations did not drain in budget")
 )
 
-// Explicit, separately-enforced phase budgets. Each is bounded in code so no
-// phase can silently run to systemd's stop timeout or the parent context.
-//
-//	steady-state gRPC hold  = drain + stopActivate      = 10s  (< 15s retry, margin)
-//	failure-path gRPC hold  = drain + stopActivate + rollback = 14s (< 15s)
-//	resolver hold           = stopActivate              ≤ 5s   (< 6s resolver deadline)
-const (
-	// drainBudget bounds waiting for the old generation's in-flight operations.
-	drainBudget = 5 * time.Second
-	// stopActivateBudget is the HARD, SHARED deadline for stopping the old
-	// generation and activating the new one. It is also the resolver hold, so it
-	// must stay under the resolver's 6s caller deadline.
-	stopActivateBudget = 5 * time.Second
-	// rollbackBudget bounds a full rollback to the old generation.
-	rollbackBudget = 4 * time.Second
-)
+// Budgets are the per-phase deadlines, each enforced in code so no phase runs to
+// systemd's stop timeout or the parent context. They are CONFIGURATION, not
+// constants: the production-safe values depend on a host's real drain/activation
+// times, which must be measured on staging first. The defaults are deliberately
+// GENEROUS so a staging canary measures real activation instead of repeatedly
+// timing out — they are NOT the low-latency production targets.
+type Budgets struct {
+	// Drain bounds waiting for the old generation's in-flight operations.
+	Drain time.Duration
+	// StopActivate is the hard, shared deadline for stopping the old generation
+	// and activating the new one. It is also the resolver hold; a production
+	// value must stay under the resolver's 6s caller deadline, which is only
+	// achievable once the freeze/READ_ONLY lifecycle removes activation from the
+	// resolver hold. Until then, keep it generous and measure.
+	StopActivate time.Duration
+	// Rollback bounds a full rollback to the old generation.
+	Rollback time.Duration
+}
+
+// DefaultBudgets are generous, staging-measurement values — not production
+// targets. Override via configuration once staging supplies real numbers.
+func DefaultBudgets() Budgets {
+	return Budgets{
+		Drain:        30 * time.Second,
+		StopActivate: 30 * time.Second,
+		Rollback:     15 * time.Second,
+	}
+}
 
 // Controller serializes and orchestrates generation cutovers on one host.
 type Controller struct {
-	act Actions
+	act     Actions
+	budgets Budgets
+	// observe, if set, is called with each phase's name and measured duration,
+	// so staging can record real drain/stop/activation/rollback times.
+	observe func(phase string, dur time.Duration)
 
 	mu        sync.Mutex
 	deploying bool
@@ -104,9 +120,22 @@ type Controller struct {
 }
 
 // New returns a Controller whose live generation is `current` (empty on first
-// bringup).
+// bringup), with generous default budgets.
 func New(act Actions, current Generation) *Controller {
-	return &Controller{act: act, current: current}
+	return &Controller{act: act, current: current, budgets: DefaultBudgets()}
+}
+
+// SetBudgets overrides the per-phase deadlines (from configuration).
+func (c *Controller) SetBudgets(b Budgets) { c.budgets = b }
+
+// SetPhaseObserver registers a callback invoked with each phase's duration.
+func (c *Controller) SetPhaseObserver(f func(phase string, dur time.Duration)) { c.observe = f }
+
+// phase records a phase's duration via the observer (if set).
+func (c *Controller) phase(name string, start time.Time) {
+	if c.observe != nil {
+		c.observe(name, time.Since(start))
+	}
 }
 
 // Current returns the live active generation.
@@ -223,46 +252,55 @@ func (c *Controller) run(ctx context.Context, prev, next Generation) error {
 	//    resume the old generation and postpone. The customer operation
 	//    completes normally; the deploy loses to availability, never the reverse.
 	if prev.ID != "" {
-		drained, err := c.act.Drain(ctx, prev, drainBudget)
+		t := time.Now()
+		drained, err := c.act.Drain(ctx, prev, c.budgets.Drain)
+		c.phase("drain", t)
 		if err != nil {
-			c.abortDrain(ctx, prev, next)
+			if abErr := c.abortDrain(ctx, prev, next); abErr != nil {
+				return fmt.Errorf("drain %s failed (%v); %w", prev.ID, err, abErr)
+			}
 			return fmt.Errorf("drain %s: %w", prev.ID, err)
 		}
 		if !drained {
-			c.abortDrain(ctx, prev, next)
+			if abErr := c.abortDrain(ctx, prev, next); abErr != nil {
+				return fmt.Errorf("%w: %s; %v", ErrDeployPostponed, prev.ID, abErr)
+			}
 			return fmt.Errorf("%w: %s", ErrDeployPostponed, prev.ID)
 		}
 	}
 
 	// 4. Hold the resolver NOW — before stopping the old generation, which
 	//    closes its resolver as it exits. Holding first means requests wait for
-	//    resume instead of hitting a dead socket (502) in the gap. The resolver
-	//    is held only for the stop+activate window, which is budget-bounded
-	//    below the resolver's 6s caller deadline.
+	//    resume instead of hitting a dead socket (502) in the gap.
 	c.act.QuiesceResolver(true)
 
 	// 5. Stop the old generation and activate the new one under one HARD, SHARED
-	//    deadline. Activate is bounded by whatever remains of that budget after
-	//    the stop, so the two together can never exceed stopActivateBudget.
-	saDeadline := time.Now().Add(stopActivateBudget)
+	//    deadline. Activate is bounded by whatever remains after the stop, so the
+	//    two together can never exceed StopActivate.
+	saDeadline := time.Now().Add(c.budgets.StopActivate)
 	if prev.ID != "" {
+		t := time.Now()
 		stopCtx, stopCancel := context.WithDeadline(ctx, saDeadline)
 		err := c.act.DrainAndStop(stopCtx, prev)
 		stopCancel()
+		c.phase("stop", t)
 		if err != nil {
-			c.act.QuiesceResolver(false)
-			c.act.QuiesceGRPC(false)
-			_ = c.act.DrainAndStop(ctx, next)
-			return fmt.Errorf("stop drained %s: %w", prev.ID, err)
+			// Ambiguous: the old generation may be half-stopped (no writer) or
+			// still serving. Do NOT release traffic onto it — hold, fail-closed,
+			// and abort. An operator / the gateway monitor recovers.
+			_ = c.act.DrainAndStop(ctx, next) // drop the unused standby
+			return fmt.Errorf("stop %s ambiguous; holding traffic (fail-closed): %w", prev.ID, err)
 		}
 	}
 
 	// 6. New generation acquires the lease and becomes ready. On failure, roll
 	//    back within its own hard budget — and stay fail-closed (holds ON) if the
 	//    rollback itself fails, rather than releasing onto a dead upstream.
+	tAct := time.Now()
 	actCtx, actCancel := context.WithDeadline(ctx, saDeadline)
 	err := c.act.Activate(actCtx, next)
 	actCancel()
+	c.phase("activate", tAct)
 	if err != nil {
 		if rbErr := c.boundedRollback(ctx, next, prev); rbErr != nil {
 			return fmt.Errorf("activate %s failed; rollback failed, holding traffic: %v; %w", next.ID, rbErr, err)
@@ -297,21 +335,29 @@ func (c *Controller) run(ctx context.Context, prev, next Generation) error {
 }
 
 // abortDrain undoes an in-progress cutover when the old generation could not
-// drain in budget: the old generation resumes as writer (its lease was never
-// released), the gateway hold is lifted, and the unused standby is stopped. No
-// customer operation is cut.
-func (c *Controller) abortDrain(ctx context.Context, prev, next Generation) {
-	_ = c.act.Undrain(ctx, prev)
+// drain in budget. The unused standby is stopped, then the old generation is
+// resumed (its lease was never released). Only if the resume is CONFIRMED does
+// it lift the gateway hold — an ambiguous undrain returns an error and leaves
+// traffic held (fail-closed), rather than releasing onto a generation that may
+// still be refusing mutations. No customer operation is cut either way.
+func (c *Controller) abortDrain(ctx context.Context, prev, next Generation) error {
+	_ = c.act.DrainAndStop(ctx, next) // drop the unused standby
+	if err := c.act.Undrain(ctx, prev); err != nil {
+		return fmt.Errorf("undrain %s ambiguous; holding traffic (fail-closed): %w", prev.ID, err)
+	}
 	c.act.QuiesceGRPC(false)
-	_ = c.act.DrainAndStop(ctx, next)
+	return nil
 }
 
 // boundedRollback runs rollback under its own hard deadline so recovery cannot
 // run to the parent context / systemd stop timeout.
 func (c *Controller) boundedRollback(ctx context.Context, next, prev Generation) error {
-	rbCtx, cancel := context.WithTimeout(ctx, rollbackBudget)
+	t := time.Now()
+	rbCtx, cancel := context.WithTimeout(ctx, c.budgets.Rollback)
 	defer cancel()
-	return c.rollback(rbCtx, next, prev)
+	err := c.rollback(rbCtx, next, prev)
+	c.phase("rollback", t)
+	return err
 }
 
 // rollback recovers to the previous generation and returns an error if it could

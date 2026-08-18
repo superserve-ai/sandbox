@@ -41,6 +41,27 @@ func genResolverPath(id string) string { return "/run/vmd/gen-" + id + "-resolve
 func genControlPath(id string) string  { return "/run/vmd/gen-" + id + "-ctl.sock" }
 func unitName(id string) string        { return "superserve-vmd@" + id }
 
+// budgetsFromEnv overrides the default per-phase budgets from configuration.
+// Durations use Go syntax (e.g. "30s"). Invalid values are logged and ignored.
+func budgetsFromEnv(b handoff.Budgets, log zerolog.Logger) handoff.Budgets {
+	parse := func(env string, dst *time.Duration) {
+		v := os.Getenv(env)
+		if v == "" {
+			return
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			log.Warn().Str("env", env).Str("value", v).Msg("invalid handoff budget; using default")
+			return
+		}
+		*dst = d
+	}
+	parse("VMD_HANDOFF_DRAIN_BUDGET", &b.Drain)
+	parse("VMD_HANDOFF_STOPACTIVATE_BUDGET", &b.StopActivate)
+	parse("VMD_HANDOFF_ROLLBACK_BUDGET", &b.Rollback)
+	return b
+}
+
 // gwAdapter lets the in-process handoff controller steer routing directly, and
 // persists the active generation so the gateway can rediscover it after a
 // restart (its routing/controller state is otherwise only in memory).
@@ -191,6 +212,12 @@ func main() {
 
 	controller := handoff.New(actions, handoff.Generation{
 		ID: initial.Generation, GRPCSocket: initial.GRPCSocket, ResolverSocket: initial.ResolverSocket,
+	})
+	controller.SetBudgets(budgetsFromEnv(handoff.DefaultBudgets(), log))
+	// Emit each cutover phase's real duration so staging can measure drain, stop,
+	// activation, and rollback before production budgets are chosen.
+	controller.SetPhaseObserver(func(phase string, d time.Duration) {
+		log.Info().Str("phase", phase).Dur("duration", d).Msg("handoff phase")
 	})
 	if initial.GRPCSocket != "" {
 		gw.SetActive(initial)

@@ -12,7 +12,14 @@
 # left with the legacy unit fenced and no generation serving.
 set -euo pipefail
 
-VERSION="${1:?usage: vmd-gateway-bootstrap <initial-generation-version>}"
+VERSION="${1:?usage: vmd-gateway-bootstrap <initial-generation-version> confirm}"
+# Opt-in guard: this is a supervised, one-way migration of THIS host to the
+# gateway topology and briefly interrupts the data plane. Require an explicit
+# "confirm" so it can never be triggered incidentally (e.g. by CD).
+if [ "${2:-}" != "confirm" ]; then
+	echo "refusing: re-run as 'vmd-gateway-bootstrap $VERSION confirm' to migrate this host" >&2
+	exit 1
+fi
 BIN=/usr/local/bin
 
 require() { [ -x "$1" ] || { echo "missing $1 — run a normal deploy first" >&2; exit 1; }; }
