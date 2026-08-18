@@ -376,11 +376,10 @@ type startupTimer struct {
 	log   zerolog.Logger
 	start time.Time
 	last  time.Time
-	// Marks are timestamped on the startup goroutine but WRITTEN from a
-	// dedicated goroutine: a backpressured stdout/collector must never let the
-	// instrumentation delay the readiness it is measuring. Buffered well above
-	// the phase count, so sends never block; an overflow drops the record
-	// (telemetry) rather than stalling startup.
+	// Marks are timestamped on the startup goroutine but written from a
+	// dedicated one, so a backpressured stdout can't delay the readiness being
+	// measured. Buffered above the phase count: sends never block, overflow
+	// drops the record rather than stalling startup.
 	ch chan startupPhaseRecord
 }
 
