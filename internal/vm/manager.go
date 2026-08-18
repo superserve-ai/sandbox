@@ -3549,6 +3549,8 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) (protected []stri
 		return nil, false
 	}
 	sweepSafe = true
+	scanned := len(cgIDs)
+	var recorded, recordless, reaped int
 	for _, id := range cgIDs {
 		// Build VMs ARE reaped here: pre-gate every cgroup is a previous-life
 		// survivor, and a build's cgroup is recordless (persistState omits build
@@ -3562,14 +3564,21 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) (protected []stri
 				// protected set — the sweep must not run on this startup.
 				sweepSafe = false
 				m.log.Warn().Err(herr).Str("vm_id", id).Msg("record lookup failed for cgroup survivor — skipping startup orphan sweep")
+			} else {
+				recorded++
 			}
 			continue // recorded (reattach owns it) or unreadable
 		}
+		recordless++
 		m.log.Warn().Str("vm_id", id).Msg("recordless cgroup survivor at startup — reaping")
 		// Capture the netns before the kill: an FC that survives it is still in
 		// the group, but a clean kill removes it and firstPID would read empty.
 		ns := m.netMgr.NamespaceForPID(m.cgroups.firstPID(id))
-		if serr := m.stopVM(ctx, id, SupervisionCgroup); serr != nil {
+		serr := m.stopVM(ctx, id, SupervisionCgroup)
+		if serr == nil {
+			reaped++
+		}
+		if serr != nil {
 			m.log.Error().Err(serr).Str("vm_id", id).Msg("failed to reap recordless cgroup")
 			// Liveness decides first — populated or unreadable == maybe-alive.
 			// A confirmed-empty group whose rmdir merely failed is dead, its
@@ -3591,6 +3600,8 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) (protected []stri
 			}
 		}
 	}
+	m.log.Info().Int("scanned", scanned).Int("recorded", recorded).Int("recordless", recordless).
+		Int("reaped", reaped).Int("protected", len(protected)).Msg("cgroup reap breakdown")
 	return protected, sweepSafe
 }
 

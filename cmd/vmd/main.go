@@ -839,7 +839,7 @@ func main() {
 		// outage longer than the sweep's orphan horizon needs this renewal
 		// or it reads as an abandoned directory and gets deleted out from
 		// under a still-durable pause.
-		mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
+		renewedMarkers := mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
 		ss := backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
 		if legacyStaging != "" {
 			ls := backup.SweepStaging(legacyStaging, journal, log.With().Str("component", "backup").Logger())
@@ -848,8 +848,9 @@ func main() {
 			ss.Bases += ls.Bases
 			ss.Pending += ls.Pending
 		}
-		log.Info().Int("sandboxes", ss.Sandboxes).Int("generations", ss.Generations).
-			Int("bases", ss.Bases).Int("pending", ss.Pending).Msg("backup staging scan breakdown")
+		log.Info().Int("renewed_markers", renewedMarkers).Int("sandboxes", ss.Sandboxes).
+			Int("generations", ss.Generations).Int("bases", ss.Bases).Int("pending", ss.Pending).
+			Msg("backup staging scan breakdown")
 		st.mark("backup_staging_scan", -1)
 		uploader.StagingRoot = stagingRoot
 		mgr.SetBackupStaging(stagingRoot)
