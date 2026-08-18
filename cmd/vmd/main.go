@@ -161,6 +161,22 @@ func requireEnv(key string) string {
 	return os.Getenv(key)
 }
 
+// envInt32Fatal parses an optional non-negative int32 env var. Unset or
+// empty is 0 (feature stays off); a set-but-unparseable value is a
+// misconfiguration and must stop the process, not silently disable or
+// distort what it configures.
+func envInt32Fatal(log zerolog.Logger, key string) int32 {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 32)
+	if err != nil || n < 0 {
+		log.Fatal().Str(key, v).Msg("must be a non-negative integer")
+	}
+	return int32(n)
+}
+
 // ---------------------------------------------------------------------------
 // Service lifecycle
 // ---------------------------------------------------------------------------
@@ -1213,7 +1229,21 @@ func main() {
 	if cfg.ControlPlaneURL != "" {
 		// Self-description is opt-in per host: set only after the control
 		// plane understands the fields (older ones reject unknown keys).
-		memoryMib, vcpus := vm.DetectHostCapacity()
+		//
+		// Capacity is EXPLICITLY CONFIGURED schedulable capacity, never
+		// detected physical totals: these values become admission limits
+		// for placement, and raw machine totals include everything the OS,
+		// the daemons, and the deliberate cgroup headroom already spend —
+		// publishing them would over-admit until the kernel OOM-kills a
+		// customer VM. Unset capacity keeps the host un-advertised.
+		memoryMib := envInt32Fatal(log, "VMD_SCHEDULABLE_MEMORY_MIB")
+		vcpus := envInt32Fatal(log, "VMD_SCHEDULABLE_VCPUS")
+		if physMib, physCPU := vm.DetectHostCapacity(); (physMib > 0 && memoryMib > physMib) || vcpus > physCPU {
+			log.Warn().
+				Int32("configured_memory_mib", memoryMib).Int32("physical_memory_mib", physMib).
+				Int32("configured_vcpus", vcpus).Int32("physical_vcpus", physCPU).
+				Msg("configured schedulable capacity exceeds physical capacity — check for a units mistake")
+		}
 		lc.start("heartbeat", func() error {
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
 				ControlPlaneURL:    cfg.ControlPlaneURL,

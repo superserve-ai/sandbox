@@ -49,8 +49,11 @@ type HeartbeatConfig struct {
 	AdvertiseVMDAddr   string
 	AdvertiseProxyAddr string
 	Region             string
-	CapacityMemoryMib  int32
-	CapacityVcpus      int32
+	// Capacity fields are the host's SCHEDULABLE capacity — explicitly
+	// configured limits that placement may admit against — never detected
+	// physical totals.
+	CapacityMemoryMib int32
+	CapacityVcpus     int32
 }
 
 // StartHeartbeat launches a background goroutine that periodically POSTs
@@ -166,10 +169,13 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 	}
 }
 
-// DetectHostCapacity reports the machine's memory (MiB) and logical CPU
-// count for heartbeat self-description. Memory comes from /proc/meminfo;
-// on any read or parse failure it returns 0, which disables advertising
-// rather than registering a host with an invented capacity.
+// DetectHostCapacity reports the machine's PHYSICAL memory (MiB) and
+// logical CPU count. Never advertised as capacity — the schedulable
+// capacity a host registers is explicitly configured, because physical
+// totals include everything the OS, the daemons, and the cgroup headroom
+// already spend, and publishing them as admission limits would over-admit.
+// Used only to sanity-check the configured values. Memory comes from
+// /proc/meminfo; on any read or parse failure it returns 0.
 func DetectHostCapacity() (memoryMib, vcpus int32) {
 	vcpus = int32(runtime.NumCPU())
 	data, err := os.ReadFile("/proc/meminfo")
