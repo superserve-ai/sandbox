@@ -421,12 +421,12 @@ WHERE billing_period_anomaly.id = sqlc.arg(id)
 RETURNING *;
 
 -- name: GetTeamBillingAccount :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id
 FROM team_billing_account
 WHERE team_id = sqlc.arg(team_id);
 
 -- name: GetTeamBillingAccountByStripeCustomerID :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id
 FROM team_billing_account
 WHERE stripe_customer_id = sqlc.arg(stripe_customer_id);
 
@@ -777,6 +777,43 @@ FROM team_credit_grant
 WHERE team_id = sqlc.arg(team_id)
   AND remaining_usd > 0
   AND (expires_at IS NULL OR expires_at > now());
+
+-- name: IsTeamSandboxBillingEligible :one
+SELECT team_sandbox_billing_eligible(sqlc.arg(team_id)) AS eligible;
+
+-- name: RefreshTeamTrialEligibility :exec
+INSERT INTO team_trial_eligibility_cache (team_id, eligible, updated_at)
+SELECT sqlc.arg(team_id), refresh_team_trial_eligibility(sqlc.arg(team_id)), now()
+ON CONFLICT (team_id) DO UPDATE
+SET eligible = EXCLUDED.eligible,
+    updated_at = EXCLUDED.updated_at;
+
+-- name: ListTeamsWithActiveTrialSandboxes :many
+SELECT DISTINCT s.team_id
+FROM sandbox s
+JOIN team_credit_grant g
+  ON g.team_id = s.team_id
+  AND g.reason = 'signup trial credit'
+LEFT JOIN team_billing_account a ON a.team_id = s.team_id
+WHERE s.destroyed_at IS NULL
+  AND s.status = 'active'
+  AND a.trial_ended_at IS NULL
+  AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+ORDER BY s.team_id
+LIMIT sqlc.arg(batch_limit);
+
+-- name: ListTeamsWithActiveIneligibleSandboxes :many
+SELECT DISTINCT s.team_id
+FROM sandbox s
+WHERE s.destroyed_at IS NULL
+  AND s.status = 'active'
+  AND NOT team_sandbox_billing_eligible(s.team_id)
+  AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+ORDER BY s.team_id
+LIMIT sqlc.arg(batch_limit);
+
+-- name: ActivateTeamBilling :exec
+SELECT activate_team_billing(sqlc.arg(team_id), sqlc.arg(stripe_grant_id));
 
 -- name: ListTeamCreditGrants :many
 SELECT *
