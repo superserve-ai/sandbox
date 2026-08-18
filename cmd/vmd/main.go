@@ -317,6 +317,34 @@ func runDrainCheck() int {
 	return 3
 }
 
+// startupTimer emits one structured log line per startup phase — the phase's
+// own wall-clock duration, the cumulative time since the daemon began starting,
+// and, where cheap to compute, the aggregate count the phase processed.
+// Observability only: it changes no control flow and runs only on the startup
+// path, so a prod-sized restart reveals which phase dominates and what scales
+// with fleet size.
+type startupTimer struct {
+	log   zerolog.Logger
+	start time.Time
+}
+
+func newStartupTimer(log zerolog.Logger) *startupTimer {
+	return &startupTimer{log: log, start: time.Now()}
+}
+
+// done records a phase that began at t0. Pass count >= 0 to log an aggregate
+// size (VM records, staged entries); pass -1 to omit it.
+func (s *startupTimer) done(phase string, t0 time.Time, count int) {
+	e := s.log.Info().
+		Str("startup_phase", phase).
+		Dur("phase_ms", time.Since(t0)).
+		Dur("since_start_ms", time.Since(s.start))
+	if count >= 0 {
+		e = e.Int("count", count)
+	}
+	e.Msg("startup phase timing")
+}
+
 func main() {
 	// Maintenance subcommands run before any daemon setup and exit. They must
 	// not open the state store in write mode or start services.
@@ -391,6 +419,11 @@ func main() {
 
 	lc := newLifecycle(log)
 
+	// Startup phase timing — observability only (see startupTimer). Started as
+	// early as the daemon path allows so since_start_ms approximates the full
+	// time to readiness.
+	st := newStartupTimer(log)
+
 	// ---- Egress blocklist (optional) ----
 	// VMD_EGRESS_BLOCKLIST_CONFIG points at the operator-supplied config
 	// (feeds, pinned domains/CIDRs, blocked ports). Unset = no global
@@ -437,10 +470,12 @@ func main() {
 	netMgrOpts = append(netMgrOpts,
 		network.WithHostID(cfg.HostID),
 		network.WithSecretsProxyAddr(cfg.SecretsProxySandboxDst, cfg.SecretsProxySandboxPort))
+	netFirewallT0 := time.Now()
 	netMgr, err := network.NewManager(ctx, cfg.HostInterface, log, netMgrOpts...)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize network manager")
 	}
+	st.done("network_firewall", netFirewallT0, -1)
 	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
 	// ---- VM manager ----
@@ -657,12 +692,32 @@ func main() {
 
 	// ---- BoltDB state store ----
 	statePath := envOrDefault("VMD_STATE_PATH", filepath.Join(filepath.Dir(cfg.RunDir), "vmd.db"))
+	stateStoreT0 := time.Now()
 	stateStore, err := vm.OpenStateStore(statePath)
 	if err != nil {
 		log.Fatal().Err(err).Str("path", statePath).Msg("failed to open state store")
 	}
+	st.done("state_store_open", stateStoreT0, -1)
 	mgr.SetStateStore(stateStore)
 	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
+
+	// Startup inventory — observability only. One cheap read of the record set
+	// gives the master N and its network/cgroup breakdown, to correlate with
+	// the phase durations. Host-total netns/mounts are emitted separately by
+	// the reconciler's periodic gauge shortly after startup.
+	if recs, aerr := stateStore.All(); aerr == nil {
+		var withNS, cgroup int
+		for _, r := range recs {
+			if r.Namespace != "" {
+				withNS++
+			}
+			if r.Supervision == vm.SupervisionCgroup {
+				cgroup++
+			}
+		}
+		log.Info().Int("vm_records", len(recs)).Int("records_with_namespace", withNS).
+			Int("cgroup_records", cgroup).Msg("startup inventory")
+	}
 
 	// Arm direct spawn AFTER the state store is attached (hasCgroupRecords
 	// reads it to decide rollback-management; the rollback-guard breadcrumb
@@ -671,6 +726,7 @@ func main() {
 	// unit's config proves the survival property (Delegate + KillMode=
 	// process); a refusal degrades new launches to the unit path but still
 	// initializes the subtree for managing any existing cgroup VMs.
+	cgroupArmT0 := time.Now()
 	if arms, err := mgr.ArmDirectSpawn(ctx); err != nil {
 		if errors.Is(err, vm.ErrCgroupVMsUnmanageable) {
 			// Existing cgroup VMs can't be adopted — refuse to come up "ready"
@@ -682,6 +738,7 @@ func main() {
 	} else if arms {
 		log.Info().Msg("direct spawn armed: new VMs launch into the delegated cgroup subtree")
 	}
+	st.done("cgroup_arm", cgroupArmT0, -1)
 
 	// ---- Backup metrics recorder ----
 	// Optional OTLP recorder for the backup pipeline, exporting to the
@@ -793,11 +850,17 @@ func main() {
 		// outage longer than the sweep's orphan horizon needs this renewal
 		// or it reads as an abandoned directory and gets deleted out from
 		// under a still-durable pause.
+		stagingT0 := time.Now()
+		stagedEntries := 0
+		if entries, rerr := os.ReadDir(stagingRoot); rerr == nil {
+			stagedEntries = len(entries)
+		}
 		mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
 		backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
 		if legacyStaging != "" {
 			backup.SweepStaging(legacyStaging, journal, log.With().Str("component", "backup").Logger())
 		}
+		st.done("backup_staging_scan", stagingT0, stagedEntries)
 		uploader.StagingRoot = stagingRoot
 		mgr.SetBackupStaging(stagingRoot)
 		mgr.SetBackupEnqueue(journal.Enqueue)
@@ -1020,7 +1083,9 @@ func main() {
 	// Reserve slots held by existing VMs (so the pool can't hand out a colliding
 	// one) and sweep leaked namespaces. The per-VM reattach runs in the background
 	// below; VMs it hasn't reached are loaded on-demand on first request.
+	slotReserveT0 := time.Now()
 	slotsReserved := mgr.ReserveStartupSlots(ctx)
+	st.done("slot_reserve", slotReserveT0, -1)
 	// Reap direct-spawn VMs whose record never persisted (crash between spawn
 	// and first write). They have no record to reserve their slot, so the
 	// sweep/adoption below would tear their netns down under a live FC or
@@ -1040,7 +1105,9 @@ func main() {
 		// Skip the sweep when the reap couldn't guarantee a live survivor's
 		// ns is spared (see ReapRecordlessCgroupVMs).
 		if sweepSafe {
+			nsSweepT0 := time.Now()
 			mgr.SweepStartupOrphanNamespaces(protectedNs...)
+			st.done("namespace_sweep", nsSweepT0, -1)
 			// The reservation-time reclaim ran before this sweep and counted
 			// these namespaces as occupied. Nothing revisits them below the
 			// ceiling — claims just take fresh indexes — so rescan now or the
@@ -1109,7 +1176,12 @@ func main() {
 	// service — a completing lc service trips lifecycle shutdown.
 	go func() {
 		defer sentrylog.Recover("startup reattach")
+		reattachT0 := time.Now()
 		reattached, stale := mgr.ReattachAll(ctx)
+		// Off the critical path (backgrounded), but it is the O(N) reattach
+		// work — timed with its record count to size what a synchronous
+		// adopt-in-cutover would cost.
+		st.done("reattach_background", reattachT0, reattached+stale)
 		if reattached > 0 || stale > 0 {
 			log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
 		}
@@ -1172,6 +1244,7 @@ func main() {
 		// invalid and fail startup; lower them with it.
 		dbCfg.MinConns = min(dbCfg.MinConns, dbCfg.MaxConns)
 		dbCfg.MinIdleConns = min(dbCfg.MinIdleConns, dbCfg.MaxConns)
+		dbConnectT0 := time.Now()
 		dbPool, dbErr := pgxpool.NewWithConfig(ctx, dbCfg)
 		if dbErr != nil {
 			log.Fatal().Err(dbErr).Msg("failed to connect to database for reconciler")
@@ -1179,6 +1252,7 @@ func main() {
 		if err := dbPool.Ping(ctx); err != nil {
 			log.Fatal().Err(err).Msg("failed to ping database for reconciler")
 		}
+		st.done("db_connect", dbConnectT0, -1)
 		reconcilerDB = dbq.New(dbPool)
 		lc.addCloser("reconciler db pool", func(_ context.Context) error {
 			dbPool.Close()
@@ -1280,6 +1354,7 @@ func main() {
 	// at this level would hold even the non-allocating paths behind
 	// inventory they never use.
 	startupReady.Store(true)
+	st.done("ready", st.start, -1)
 	log.Info().Msg("startup complete — gRPC serving requests")
 
 	// ---- Wait for signal or service failure ----
