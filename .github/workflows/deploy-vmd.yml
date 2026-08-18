@@ -346,18 +346,26 @@ jobs:
           # continuously while backups drain and can stall the uploader
           # if the (small) root disk fills.
           BACKUP_JOURNAL_PATH: /mnt/localssd/backup.db
-          # Two drain workers to clear the cell's pause-backup backlog:
+          # Drain workers to clear the cell's pause-backup backlog:
           # arrivals outpace the single-worker default here. Workers
           # share one bandwidth cap (task throughput rises, egress does
           # not), and the incremental host cost is one extra hash/read
           # stream on a 192-core metal host with a 12-drive array.
-          # Sized from measured rates with the sandboxes.slice weighting
-          # live: arrivals peak ~1.2k generations/h while each worker
-          # drains ~215/h, so 2 treads water at peak and 6 clears the
-          # backlog (~1.3k/h) with margin. Aggregate egress stays under
-          # the shared bandwidth cap (~22 Mbit/s observed at 2 workers,
-          # cap 100). Rollback is lowering the number.
-          BACKUP_UPLOAD_CONCURRENCY: "6"
+          # Arrivals are not steady: a share of this cell's traffic pauses
+          # in scheduled batches rather than continuously, so a batch can
+          # arrive faster than it drains even when the hourly average is
+          # comfortable. At 6 workers a batch took long enough to drain
+          # that the next one landed before the backlog cleared, so the
+          # backlog-age alert paged on every batch (confirmed against
+          # backup_journal_pending{priority="pause"} and the control
+          # plane's pause-endpoint request log). 12 workers roughly halves
+          # the drain time, leaving real idle time between batches;
+          # re-check against the same series if batch sizes grow.
+          # Aggregate egress stays under the shared bandwidth cap (~22
+          # Mbit/s observed at 2 workers, cap 100) since throughput here
+          # is bounded by per-task overhead, not bandwidth. Rollback is
+          # lowering the number.
+          BACKUP_UPLOAD_CONCURRENCY: "12"
           # Enables vmd's backup metrics exporter (host-local collector);
           # the cell's backup alert policies, including backup-disabled,
           # cannot fire without these series.
