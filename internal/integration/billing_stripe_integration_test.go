@@ -32,16 +32,17 @@ import (
 const testStripeWebhookSecret = "whsec_test_secret"
 
 type fakeStripeClient struct {
-	mu              sync.Mutex
-	reportCalls     []api.StripeReportMeterEventParams
-	checkoutCalls   []api.StripeCreateCheckoutSessionParams
-	portalCalls     []api.StripeCreateCustomerPortalSessionParams
-	customerCalls   []api.StripeCreateCustomerParams
-	reportErr       error
-	reportErrAt     int
-	nextCustomerID  string
-	nextCheckoutURL string
-	nextPortalURL   string
+	mu               sync.Mutex
+	reportCalls      []api.StripeReportMeterEventParams
+	checkoutCalls    []api.StripeCreateCheckoutSessionParams
+	portalCalls      []api.StripeCreateCustomerPortalSessionParams
+	customerCalls    []api.StripeCreateCustomerParams
+	creditGrantCalls []api.StripeCreateBillingCreditGrantParams
+	reportErr        error
+	reportErrAt      int
+	nextCustomerID   string
+	nextCheckoutURL  string
+	nextPortalURL    string
 }
 
 type thinEventStripeClient struct {
@@ -62,6 +63,13 @@ func (f *fakeStripeClient) CreateCustomer(_ context.Context, params api.StripeCr
 		id = "cus_test_default"
 	}
 	return api.StripeCustomer{ID: id}, nil
+}
+
+func (f *fakeStripeClient) CreateBillingCreditGrant(_ context.Context, params api.StripeCreateBillingCreditGrantParams) (api.StripeBillingCreditGrant, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.creditGrantCalls = append(f.creditGrantCalls, params)
+	return api.StripeBillingCreditGrant{ID: "credgrant_test_123"}, nil
 }
 
 func (f *fakeStripeClient) CreateCheckoutSession(_ context.Context, params api.StripeCreateCheckoutSessionParams) (api.StripeCheckoutSession, error) {
@@ -458,6 +466,82 @@ func TestIntegration_CreateStripeCheckoutSessionUsesConfiguredPrice(t *testing.T
 	}
 	if got := stripe.checkoutCalls[0].IdempotencyKey; got == "" {
 		t.Fatal("checkout idempotency key was not set")
+	}
+}
+
+func TestIntegration_StripeActivationEndsTrialAndGrantsPromoCreditOnce(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	customerID := "cus_" + teamID.String()
+	subscriptionID := "sub_" + teamID.String()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'incomplete')
+	`, teamID, customerID, subscriptionID); err != nil {
+		t.Fatalf("seed incomplete billing account: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
+		VALUES ($1, 5.000000, 5.000000, 'signup trial credit')
+	`, teamID); err != nil {
+		t.Fatalf("seed signup trial credit: %v", err)
+	}
+
+	created := time.Now().UTC().Truncate(time.Second)
+	periodStart := created
+	periodEnd := created.AddDate(0, 1, 0)
+	stripe := &fakeStripeClient{}
+	r := newBillingRouter(t, stripe)
+	for i, eventID := range []string{"evt_trial_activation", "evt_trial_activation_replay"} {
+		eventCreated := created.Add(time.Duration(i) * time.Second)
+		payload := stripeSubscriptionWebhookPayload(t, eventID, "customer.subscription.updated", subscriptionID, customerID, "active", eventCreated, periodStart, periodEnd)
+		req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Stripe-Signature", stripeSignature(t, payload, eventCreated))
+		w := doRequest(r, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("activation webhook %s: expected 200, got %d: %s", eventID, w.Code, w.Body.String())
+		}
+	}
+
+	var trialRemaining float64
+	if err := testPool.QueryRow(ctx, `
+		SELECT remaining_usd
+		FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'signup trial credit'
+	`, teamID).Scan(&trialRemaining); err != nil {
+		t.Fatalf("load trial credit after activation: %v", err)
+	}
+	if trialRemaining != 0 {
+		t.Fatalf("trial credit remaining = %v, want 0", trialRemaining)
+	}
+	var promoCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'stripe promotional credit' AND amount_usd = 95
+	`, teamID).Scan(&promoCount); err != nil {
+		t.Fatalf("count promotional grants: %v", err)
+	}
+	if promoCount != 0 {
+		t.Fatalf("local promotional grant count = %d, want 0", promoCount)
+	}
+	var trialEndedAt, promoGrantedAt *time.Time
+	var stripeGrantID *string
+	if err := testPool.QueryRow(ctx, `
+		SELECT trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id
+		FROM team_billing_account WHERE team_id = $1
+	`, teamID).Scan(&trialEndedAt, &promoGrantedAt, &stripeGrantID); err != nil {
+		t.Fatalf("load billing transition state: %v", err)
+	}
+	if trialEndedAt == nil || promoGrantedAt == nil || stripeGrantID == nil || *stripeGrantID != "credgrant_test_123" {
+		t.Fatal("billing activation state was not persisted")
+	}
+	if got := len(stripe.creditGrantCalls); got != 1 {
+		t.Fatalf("Stripe credit grant calls = %d, want 1", got)
+	}
+	if got := stripe.creditGrantCalls[0].AmountCents; got != 9500 {
+		t.Fatalf("Stripe credit grant amount = %d, want 9500 cents", got)
 	}
 }
 

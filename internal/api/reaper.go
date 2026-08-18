@@ -59,6 +59,30 @@ func DefaultReaperConfig() ReaperConfig {
 //     cannot starve the control plane for extended periods.
 func (h *Handlers) StartTimeoutReaper(ctx context.Context, cfg ReaperConfig) {
 	go h.reaperLoop(ctx, cfg)
+	go h.trialEligibilityLoop(ctx, cfg.Interval)
+}
+
+func (h *Handlers) trialEligibilityLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	run := func() {
+		deadline := 2 * time.Minute
+		if interval > 0 && interval < deadline {
+			deadline = interval
+		}
+		qctx, cancel := context.WithTimeout(ctx, deadline)
+		defer cancel()
+		sentrylog.RunSafe("billing-trial-eligibility", func() { h.refreshActiveTrialEligibility(qctx) })
+	}
+	run()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
 
 func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
@@ -315,6 +339,21 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 //   - Step 1 fails → VM is still running → revert DB to 'active'.
 //   - Step 2 fails → VM is stopped → call rollbackPausedVM (resume + revert).
 func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxesRow) {
+	h.pauseClaimed(ctx, sbx, "timeout", "timeout_pause", "timeout_paused", "reaper: sandbox paused due to timeout")
+}
+
+func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBillingIneligibleSandboxesRow) {
+	h.pauseClaimed(ctx, db.ClaimExpiredSandboxesRow{
+		ID:            sbx.ID,
+		TeamID:        sbx.TeamID,
+		Name:          sbx.Name,
+		SnapshotID:    sbx.SnapshotID,
+		HostID:        sbx.HostID,
+		NetworkConfig: sbx.NetworkConfig,
+	}, "billing_ineligible", "billing_ineligible_pause", "billing_ineligible_paused", "billing: sandbox paused after eligibility loss")
+}
+
+func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, trigger, transition, activity, successMessage string) {
 	l := log.With().
 		Str("sandbox_id", sbx.ID.String()).
 		Str("host_id", sbx.HostID).
@@ -330,7 +369,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD failed — reverting to active")
-		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
+		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.revertToActiveOrFail(ctx, sbx, vmdLookupErr, l)
 		return
 	}
@@ -340,7 +379,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		// Retry (see pauseWithRetry) didn't converge — the VM genuinely
 		// didn't pause, so revert to active and let the next tick retry.
 		l.Error().Err(err).Msg("reaper: VMD PauseInstance failed — reverting to active")
-		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
+		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.revertToActiveOrFail(ctx, sbx, err, l)
 		return
 	}
@@ -353,21 +392,21 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		TeamID:  sbx.TeamID,
 		Path:    snapshotPath,
 		MemPath: &memPath,
-		Trigger: "timeout",
+		Trigger: trigger,
 	}
 	applyManifest(&params, manifest)
 	if _, err := h.finalizePause(postCtx, params); err != nil {
 		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
-		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
+		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
 		return
 	}
 
-	l.Info().Msg("reaper: sandbox paused due to timeout")
-	RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultSuccess, sbx.HostID, time.Since(started))
+	l.Info().Msg(successMessage)
+	RecordSandboxTransition(ctx, transition, telemetry.ResultSuccess, sbx.HostID, time.Since(started))
 	// Interval was already closed at the top of pauseExpired; FinalizePause
 	// is the end of the VMD pause work, not the leave-active moment.
-	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", "timeout_paused", "success", &sbx.Name, nil, nil)
+	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", activity, "success", &sbx.Name, nil, nil)
 }
 
 // rollbackPausedVM is the saga compensation for a failed pause. The VM is

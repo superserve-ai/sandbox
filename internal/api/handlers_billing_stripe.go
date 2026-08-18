@@ -41,6 +41,7 @@ var errBillingRedirectOriginsNotConfigured = errors.New("billing redirect origin
 
 type StripeBillingClient interface {
 	CreateCustomer(ctx context.Context, params StripeCreateCustomerParams) (StripeCustomer, error)
+	CreateBillingCreditGrant(ctx context.Context, params StripeCreateBillingCreditGrantParams) (StripeBillingCreditGrant, error)
 	CreateCheckoutSession(ctx context.Context, params StripeCreateCheckoutSessionParams) (StripeCheckoutSession, error)
 	CreateCustomerPortalSession(ctx context.Context, params StripeCreateCustomerPortalSessionParams) (StripePortalSession, error)
 	ReportMeterEvent(ctx context.Context, params StripeReportMeterEventParams) error
@@ -57,6 +58,16 @@ type StripeCreateCustomerParams struct {
 }
 
 type StripeCustomer struct {
+	ID string
+}
+
+type StripeCreateBillingCreditGrantParams struct {
+	CustomerID     string
+	AmountCents    int64
+	IdempotencyKey string
+}
+
+type StripeBillingCreditGrant struct {
 	ID string
 }
 
@@ -275,6 +286,23 @@ func (c *stripeHTTPClient) CreateCustomer(ctx context.Context, params StripeCrea
 		return StripeCustomer{}, err
 	}
 	return StripeCustomer{ID: resp.ID}, nil
+}
+
+func (c *stripeHTTPClient) CreateBillingCreditGrant(ctx context.Context, params StripeCreateBillingCreditGrantParams) (StripeBillingCreditGrant, error) {
+	form := url.Values{}
+	form.Set("customer", params.CustomerID)
+	form.Set("category", "promotional")
+	form.Set("amount[type]", "monetary")
+	form.Set("amount[monetary][currency]", "usd")
+	form.Set("amount[monetary][value]", strconv.FormatInt(params.AmountCents, 10))
+	form.Set("applicability_config[scope][price_type]", "metered")
+	var resp struct {
+		ID string `json:"id"`
+	}
+	if err := c.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &resp, params.IdempotencyKey); err != nil {
+		return StripeBillingCreditGrant{}, err
+	}
+	return StripeBillingCreditGrant{ID: resp.ID}, nil
 }
 
 func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params StripeCreateCheckoutSessionParams) (StripeCheckoutSession, error) {
@@ -1401,6 +1429,7 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 					respondError(c, ErrInternal)
 					return
 				}
+				h.scheduleBillingEligibilityReconciliation(c.Request.Context(), event)
 				c.JSON(http.StatusOK, gin.H{"status": "duplicate"})
 				return
 			}
@@ -1438,6 +1467,7 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 				respondError(c, ErrInternal)
 				return
 			}
+			h.scheduleBillingEligibilityReconciliation(c.Request.Context(), event)
 			c.JSON(http.StatusOK, gin.H{"status": "ok"})
 			return
 		}
@@ -1481,6 +1511,7 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	h.scheduleBillingEligibilityReconciliation(c.Request.Context(), event)
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
@@ -1531,7 +1562,7 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 			StripeSubscriptionID: stringPtr(obj.Subscription),
 		})
 		return err
-	case "customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted":
+	case "customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted", "customer.subscription.paused", "customer.subscription.resumed":
 		var obj stripeSubscriptionObject
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 			return err
@@ -1558,20 +1589,50 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 			}
 		}
 		start, end, ok := stripeSubscriptionPeriodBounds(obj)
-		if !ok {
+		terminalStatus := strings.EqualFold(obj.Status, "unpaid") || strings.EqualFold(obj.Status, "canceled") || strings.EqualFold(obj.Status, "paused") || event.Type == "customer.subscription.deleted"
+		if !ok && !terminalStatus {
 			return nil
+		}
+		var periodStart, periodEnd pgtype.Timestamptz
+		if ok {
+			periodStart = timestamptzFromUnix(start)
+			periodEnd = timestamptzFromUnix(end)
 		}
 		_, err = q.UpsertTeamBillingAccountSubscription(ctx, db.UpsertTeamBillingAccountSubscriptionParams{
 			TeamID:                    account.TeamID,
 			StripeCustomerID:          stringPtr(obj.Customer),
 			StripeSubscriptionID:      stringPtr(obj.ID),
 			StripeSubscriptionStatus:  stringPtr(obj.Status),
-			CurrentPeriodStart:        timestamptzFromUnix(start),
-			CurrentPeriodEnd:          timestamptzFromUnix(end),
+			CurrentPeriodStart:        periodStart,
+			CurrentPeriodEnd:          periodEnd,
 			CancelAtPeriodEnd:         boolPtr(obj.CancelAtPeriodEnd),
 			StripeSubscriptionEventAt: timestamptzFromUnix(int64(event.Created)),
 		})
-		return err
+		if err != nil {
+			return err
+		}
+		if strings.EqualFold(obj.Status, "active") || strings.EqualFold(obj.Status, "trialing") {
+			grantID := derefString(account.StripeActivationCreditGrantID)
+			if grantID == "" {
+				if h.Stripe == nil {
+					return fmt.Errorf("Stripe billing client is not configured")
+				}
+				grant, gerr := h.Stripe.CreateBillingCreditGrant(ctx, StripeCreateBillingCreditGrantParams{
+					CustomerID:     obj.Customer,
+					AmountCents:    9500,
+					IdempotencyKey: "stripe-activation-credit-" + account.TeamID.String(),
+				})
+				if gerr != nil {
+					return gerr
+				}
+				if strings.TrimSpace(grant.ID) == "" {
+					return fmt.Errorf("Stripe credit grant response did not include an ID")
+				}
+				grantID = grant.ID
+			}
+			return q.ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: account.TeamID, StripeGrantID: grantID})
+		}
+		return nil
 	case "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
 		var obj stripeInvoiceObject
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
