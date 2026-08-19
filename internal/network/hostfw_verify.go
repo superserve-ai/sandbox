@@ -274,14 +274,19 @@ func ruleCannotMatchSandboxIngress(tokens []string) bool {
 // vmd security block:
 //   - "strict": DROP/REJECT — only tightens enforcement; allowed to stay
 //     above the block, and repair must preserve it there.
-//   - "inert": no -j at all — matches nothing into an action.
+//   - "inert": no -j and no -g — matches nothing into an action or control
+//     transfer.
 //   - "permissive": ACCEPT — a proven bypass; the only class repair may
 //     auto-demote below the block.
-//   - "ambiguous": anything else (RETURN, MARK, jumps into operator chains,
-//     NAT actions) — semantics unknown, so the owner fails startup without
+//   - "ambiguous": anything else — RETURN, MARK, NAT actions, -j into an
+//     operator chain, and -g/--goto (control flow into another chain even
+//     without -j) — semantics unknown, so the owner fails startup without
 //     mutating rather than guess.
 func foreignDisposition(tokens []string) string {
 	for i, t := range tokens {
+		if t == "-g" || t == "--goto" {
+			return "ambiguous"
+		}
 		if t == "-j" && i+1 < len(tokens) {
 			switch tokens[i+1] {
 			case "DROP", "REJECT":

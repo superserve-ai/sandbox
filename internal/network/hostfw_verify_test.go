@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -555,3 +556,93 @@ func FuzzParseIPTablesSave(f *testing.F) {
 }
 
 var _ = zerolog.Nop
+
+func TestForeignGotoIsAmbiguous(t *testing.T) {
+	// -g/--goto is control flow without -j; it must never read as inert.
+	for _, tokens := range [][]string{
+		{"-i", "veth+", "-g", "OPERATOR_CHAIN"},
+		{"-i", "veth+", "--goto", "OPERATOR_CHAIN"},
+	} {
+		if got := foreignDisposition(tokens); got != "ambiguous" {
+			t.Fatalf("%v disposition = %s, want ambiguous", tokens, got)
+		}
+	}
+	spec := testSpec(true)
+	rules, chains := specKernel(spec, nil)
+	fw := rules["filter/FORWARD"]
+	rules["filter/FORWARD"] = append([][]string{{"-i", "veth+", "-g", "OPERATOR_CHAIN"}}, fw...)
+	if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "preceded-ambiguous" {
+		t.Fatalf("ok=%v class=%s", ok, class)
+	}
+}
+
+func TestRepairPreservesInterleavedStrictRule(t *testing.T) {
+	// A restrictive DROP interleaved BETWEEN vmd rules (not just above the
+	// block) must stay above the rebuilt ACCEPT — demoting it would silently
+	// disable an operator rule.
+	spec := testSpec(true)
+	rules, chains := specKernel(spec, nil)
+	strict := []string{"-i", "veth+", "-p", "tcp", "--dport", "22", "-j", "DROP"}
+	fw := rules["filter/FORWARD"]
+	// Interleave the strict rule between clamp and the accepts, and misorder
+	// the clamp to force a repair.
+	interleaved := append([][]string{}, fw[0], fw[1], strict, fw[3], fw[4], fw[2])
+	rules["filter/FORWARD"] = interleaved
+
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	got := k.rules["filter/FORWARD"]
+	strictIdx, acceptIdx := -1, -1
+	for i, r := range got {
+		if ruleEqual(r, strict) {
+			strictIdx = i
+		}
+		if acceptIdx == -1 && ruleEqual(r, []string{"-i", "veth+", "-o", "eth0", "-j", "ACCEPT"}) {
+			acceptIdx = i
+		}
+	}
+	if strictIdx == -1 || strictIdx > acceptIdx {
+		t.Fatalf("interleaved strict DROP not preserved above the ACCEPT (strict=%d accept=%d)", strictIdx, acceptIdx)
+	}
+	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+		t.Fatalf("post-repair verify failed: %s %s", class, detail)
+	}
+}
+
+func TestLockHostFirewallSerializes(t *testing.T) {
+	orig := hostFirewallLockPath
+	hostFirewallLockPath = t.TempDir() + "/hostfw.lock"
+	defer func() { hostFirewallLockPath = orig }()
+
+	unlock, err := lockHostFirewall()
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	acquired := make(chan struct{})
+	go func() {
+		u2, err := lockHostFirewall()
+		if err != nil {
+			t.Errorf("second lock: %v", err)
+			close(acquired)
+			return
+		}
+		close(acquired)
+		u2()
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second lock acquired while held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second lock never acquired after release")
+	}
+}

@@ -12,8 +12,10 @@ package network
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/coreos/go-iptables/iptables"
@@ -43,6 +45,21 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	}
 	log.Warn().Str("mismatch", class).Str("detail", detail).
 		Msg("host firewall verification failed — running full install")
+
+	// Serialize the whole read-modify-write against every cooperating writer
+	// (the vmd daemon and template-builder both route through here): the
+	// repair's flush-and-rebuild is built from a dump, and a rule another
+	// process adds between dump and restore would be silently erased. The
+	// xtables lock only covers individual commands (and iptables-nft ignores
+	// it entirely), so cooperating processes hold this flock across the full
+	// install→repair→verify sequence. Third-party writers racing the (µs)
+	// dump→restore window remain a documented residual; their tools' own
+	// retry/reconcile loops re-add what a raced rebuild dropped.
+	unlock, err := lockHostFirewall()
+	if err != nil {
+		return fmt.Errorf("host firewall lock: %w", err)
+	}
+	defer unlock()
 
 	// Slow path: the installer, byte-for-byte today's behavior.
 	tRepair := time.Now()
@@ -122,26 +139,38 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 			}
 			return false
 		}
-		oldFirst := len(got)
+		oldLast := -1
 		for i, g := range got {
 			if isOurs(g) {
-				oldFirst = i
-				break
+				oldLast = i
 			}
 		}
+		// Partition every foreign rule that sat anywhere within the old block
+		// span by DISPOSITION, not position: a restrictive DROP interleaved
+		// between vmd rules must stay ABOVE the rebuilt block (demoting it
+		// below the broad ACCEPT would silently disable it), a proven-
+		// permissive ACCEPT is demoted below, and anything ambiguous aborts
+		// without mutation. Foreign rules after the old block keep their tail
+		// position untouched.
 		var above, below [][]string
 		for i, g := range got {
 			if isOurs(g) {
 				continue // all copies replaced by the canonical block
 			}
-			if i < oldFirst && (ruleCannotMatchSandboxIngress(g) || foreignDisposition(g) == "strict" || foreignDisposition(g) == "inert") {
-				above = append(above, g)
+			if i > oldLast {
+				below = append(below, g)
 				continue
 			}
-			if i < oldFirst && foreignDisposition(g) == "ambiguous" {
-				return fmt.Errorf("ambiguous foreign rule above the security block in %s (%s) — refusing to reorder", key, strings.Join(g, " "))
+			switch {
+			case ruleCannotMatchSandboxIngress(g):
+				above = append(above, g) // cannot interact with sandbox traffic
+			case foreignDisposition(g) == "strict" || foreignDisposition(g) == "inert":
+				above = append(above, g)
+			case foreignDisposition(g) == "permissive":
+				below = append(below, g)
+			default:
+				return fmt.Errorf("ambiguous foreign rule within the security block span in %s (%s) — refusing to reorder", key, strings.Join(g, " "))
 			}
-			below = append(below, g) // demoted permissive rules and everything after the block
 		}
 		lines := []string{"-F " + chain}
 		for _, g := range above {
@@ -181,6 +210,27 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 // installHostFirewallFn is a test seam over the real installer, so the
 // non-owner no-repair branch can be exercised without iptables.
 var installHostFirewallFn = installHostFirewall
+
+// hostFirewallLockPath is the advisory lock serializing cooperating
+// firewall writers' slow paths. Var for tests.
+var hostFirewallLockPath = "/run/sandbox-hostfw.lock"
+
+// lockHostFirewall takes a blocking exclusive flock; the holder is another
+// cooperating startup, so waiting (rather than timing out) is correct.
+func lockHostFirewall() (func(), error) {
+	f, err := os.OpenFile(hostFirewallLockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}, nil
+}
 
 // restoreIPTables applies one iptables-restore transaction. --noflush so only
 // the chains the input explicitly flushes are touched; -w waits on the
