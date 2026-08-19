@@ -830,6 +830,8 @@ func TestOperatorRulesNeverReadAsStale(t *testing.T) {
 		{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", "8443"},
 		{"-i", "veth+", "-p", "tcp", "-d", "10.0.0.5", "--dport", "9443", "-j", "REDIRECT", "--to-port", "9443"},
 		{"-i", "veth+", "-p", "tcp", "--dport", "8080", "-j", "REDIRECT", "--to-port", "999", "-m", "comment", "--comment", "operator rule"},
+		// an operator rule identical to a current vmd rule, minus the marker
+		{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", "3129"},
 	} {
 		if staleManagedRule(tokens, want) {
 			t.Fatalf("operator redirect misread as stale vmd rule: %v", tokens)
@@ -837,35 +839,70 @@ func TestOperatorRulesNeverReadAsStale(t *testing.T) {
 	}
 }
 
-func TestUnmarkedTwinIsUpgradeMigrated(t *testing.T) {
-	// The pre-marker generation of exactly a current rule (identical
-	// parameters, no marker) is stale: deleting it and keeping the marked
-	// twin is behavior-preserving — the one-time upgrade migration.
+func TestUnmarkedTwinsToleratedNeverDeleted(t *testing.T) {
+	// A rule equal to a current vmd rule modulo the marker is either the
+	// pre-marker generation or an operator rule that is semantically
+	// identical — ownership is unknowable, so it is tolerated as a shadow and
+	// NEVER deleted.
 	spec := testSpec(true)
 	want := spec.sharedOrdered["filter/FORWARD"]
 	unmarkedDrop := []string{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP"}
-	if !staleManagedRule(unmarkedDrop, want) {
-		t.Fatal("unmarked exact twin not recognized as upgrade-stale")
+	if staleManagedRule(unmarkedDrop, want) {
+		t.Fatal("unmarked rule must never read as stale (marker-only staleness)")
 	}
+	if !unmarkedTwin(unmarkedDrop, want) {
+		t.Fatal("unmarked exact twin not recognized as tolerated shadow")
+	}
+
+	// Twins above the block (incl. a PREROUTING redirect twin) verify intact.
 	rules, chains := specKernel(spec, nil)
 	rules["filter/FORWARD"] = append([][]string{unmarkedDrop}, rules["filter/FORWARD"]...)
-	if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "stale-managed" {
-		t.Fatalf("ok=%v class=%s", ok, class)
+	unmarkedTLS := []string{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", "3129"}
+	rules["nat/PREROUTING"] = append([][]string{unmarkedTLS}, rules["nat/PREROUTING"]...)
+	if ok, class := mustVerify(t, renderDump(rules, chains), spec); !ok {
+		t.Fatalf("tolerated twins flagged: %s", class)
 	}
+
+	// A repair forced by an unrelated mismatch must not delete the twins.
+	fw := rules["filter/FORWARD"]
+	fw[3], fw[4] = fw[4], fw[3] // misorder clamp vs accept
+	rules["filter/FORWARD"] = fw
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
 	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair: %v", err)
 	}
-	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
-		t.Fatalf("post-migration verify failed: %s %s", class, detail)
-	}
+	foundDrop, foundTLS := false, false
 	for _, r := range k.rules["filter/FORWARD"] {
 		if ruleEqual(r, unmarkedDrop) {
-			t.Fatal("unmarked twin survived migration")
+			foundDrop = true
 		}
+	}
+	for _, r := range k.rules["nat/PREROUTING"] {
+		if ruleEqual(r, unmarkedTLS) {
+			foundTLS = true
+		}
+	}
+	if !foundDrop || !foundTLS {
+		t.Fatalf("repair deleted a tolerated twin (drop=%v tls=%v)", foundDrop, foundTLS)
+	}
+	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+		t.Fatalf("post-repair verify failed: %s %s", class, detail)
+	}
+}
+
+func TestNonOwnerFastPathOnOwnerConfiguredHost(t *testing.T) {
+	// Template-builder alongside a running daemon: the daemon's marked jumps
+	// and redirects are absent from the non-owner's partial spec and must
+	// read as the owner's rules — NOT stale — so the non-owner fast path
+	// succeeds without mutating anything.
+	ownerSpec := testSpec(true)
+	rules, chains := specKernel(ownerSpec, nil)
+	nonOwner := testSpec(false)
+	if ok, class := mustVerify(t, renderDump(rules, chains), nonOwner); !ok {
+		t.Fatalf("non-owner fast path failed on an owner-configured host: %s", class)
 	}
 }
 

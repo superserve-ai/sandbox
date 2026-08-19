@@ -132,7 +132,7 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 		if len(want) == 0 {
 			continue
 		}
-		single := hostFWSpec{sharedOrdered: map[string][]fwRule{key: want}, headGuarded: map[string]bool{key: spec.headGuarded[key]}}
+		single := hostFWSpec{sharedOrdered: map[string][]fwRule{key: want}, headGuarded: map[string]bool{key: spec.headGuarded[key]}, owner: spec.owner}
 		ok, class, detail := verifyHostFirewall(d, single)
 		if ok {
 			continue
@@ -186,7 +186,7 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 						break
 					}
 				}
-				if !isOurs && !staleManagedRule(g, want) && !ruleCannotMatchSandboxIngress(g) && foreignDisposition(g) == "strict" {
+				if !isOurs && !staleManagedRule(g, want) && !unmarkedTwin(g, want) && !ruleCannotMatchSandboxIngress(g) && foreignDisposition(g) == "strict" {
 					return fmt.Errorf("stricter foreign rule above a vmd redirect in %s (%s) — refusing to reorder past it", key, strings.Join(g, " "))
 				}
 			}

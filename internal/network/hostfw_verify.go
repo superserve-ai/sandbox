@@ -45,6 +45,10 @@ type hostFWSpec struct {
 	// `-i veth+ -j ACCEPT` above them would bypass the drops yet leave their
 	// relative order intact.
 	headGuarded map[string]bool
+	// owner: stale reconciliation and head guarding apply only to the daemon;
+	// a non-owner's partial spec must treat the daemon's marked rules as the
+	// owner's, never as stale.
+	owner bool
 }
 
 // vmdRuleMarker is the explicit ownership marker every vmd rule in a SHARED
@@ -102,6 +106,7 @@ func hostFWSpecFor(hostIface string, httpProxyPort, tlsProxyPort, dnsRedirectPor
 		{"nat", "POSTROUTING", marked("-s", vmIPRange, "-o", hostIface, "-j", "MASQUERADE")},
 	}
 
+	spec.owner = manageOwnedChains
 	if manageOwnedChains {
 		spec.headGuarded = map[string]bool{"filter/FORWARD": true, "nat/PREROUTING": true}
 		spec.ownedChains = map[string][]fwRule{}
@@ -428,23 +433,29 @@ func stripMarkerGroup(groups []string) []string {
 }
 
 // staleManagedRule reports whether a non-spec dump rule is provably a stale
-// vmd rule, by explicit ownership only — never by shape, so an operator rule
-// can never be reconciled away:
-//   - it carries the vmd marker but no longer matches the current spec (a
-//     previous configuration's rule after a supported config change); or
-//   - it equals a current spec rule modulo the marker (the pre-marker
-//     generation of exactly this rule — identical parameters, so deleting it
-//     and keeping the marked twin is behavior-preserving; this is the
-//     one-time upgrade migration).
+// vmd rule: it carries the explicit ownership marker but no longer matches
+// the current spec (a previous configuration's rule after a supported config
+// change). Marker-only, never shape or modulo-marker inference — vmd NEVER
+// deletes an unmarked rule, because an operator rule that happens to be
+// identical to a vmd rule today must survive vmd's future config changes.
 func staleManagedRule(tokens []string, want []fwRule) bool {
+	if !hasVMDMarker(tokens) {
+		return false
+	}
 	for _, w := range want {
 		if ruleEqual(w.args, tokens) {
 			return false // it IS a current rule
 		}
 	}
-	if hasVMDMarker(tokens) {
-		return true
-	}
+	return true
+}
+
+// unmarkedTwin reports whether a dump rule equals a current spec rule modulo
+// the ownership marker — the pre-marker generation of this exact rule, or an
+// operator rule that is semantically identical to it. Such rules are
+// TOLERATED SHADOWS: skipped by every scan (they enforce exactly what the
+// marked rule enforces) and never deleted (ownership is unknowable).
+func unmarkedTwin(tokens []string, want []fwRule) bool {
 	g, ok := canonicalRule(tokens)
 	if !ok {
 		return false
@@ -462,20 +473,24 @@ func staleManagedRule(tokens []string, want []fwRule) bool {
 func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, detail string) {
 	for key, want := range spec.sharedOrdered {
 		got := d.rules[key]
-		// Stale managed rules (a previous configuration's redirects) are a
+		// Stale managed rules (a previous configuration's marked rules) are a
 		// repairable mismatch, recognized before the head guard would
 		// misclassify them as ambiguous foreign rules and block startup on a
-		// supported config change.
-		for _, g := range got {
-			isOurs := false
-			for _, w := range want {
-				if ruleEqual(w.args, g) {
-					isOurs = true
-					break
+		// supported config change. Owner only: a non-owner's partial spec must
+		// read the daemon's marked rules as the owner's, not as stale, or its
+		// fast path could never succeed.
+		if spec.owner {
+			for _, g := range got {
+				isOurs := false
+				for _, w := range want {
+					if ruleEqual(w.args, g) {
+						isOurs = true
+						break
+					}
 				}
-			}
-			if !isOurs && staleManagedRule(g, want) {
-				return false, "stale-managed", key + ": " + emitRuleTokens(g)
+				if !isOurs && staleManagedRule(g, want) {
+					return false, "stale-managed", key + ": " + emitRuleTokens(g)
+				}
 			}
 		}
 		// Head guard: no foreign rule capable of matching sandbox traffic may
@@ -520,8 +535,8 @@ func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, 
 						break
 					}
 				}
-				if isOurs || ruleCannotMatchSandboxIngress(got[i]) {
-					continue
+				if isOurs || unmarkedTwin(got[i], want) || ruleCannotMatchSandboxIngress(got[i]) {
+					continue // twins enforce exactly what the marked rule does
 				}
 				inSecurityZone := guardEnd == -1 || i < guardEnd
 				switch foreignDisposition(got[i]) {
