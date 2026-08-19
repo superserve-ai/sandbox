@@ -1791,42 +1791,6 @@ func (q *Queries) ListRecentlyDestroyedSandboxIDsByHost(ctx context.Context, arg
 	return items, nil
 }
 
-const listSandboxPreviewPoliciesByTeam = `-- name: ListSandboxPreviewPoliciesByTeam :many
-SELECT
-  s.id AS sandbox_id,
-  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
-  COALESCE(p.revision, 0)::bigint AS revision
-FROM sandbox s
-LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
-WHERE s.team_id = $1 AND s.destroyed_at IS NULL
-`
-
-type ListSandboxPreviewPoliciesByTeamRow struct {
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	Access    string    `json:"access"`
-	Revision  int64     `json:"revision"`
-}
-
-func (q *Queries) ListSandboxPreviewPoliciesByTeam(ctx context.Context, teamID uuid.UUID) ([]ListSandboxPreviewPoliciesByTeamRow, error) {
-	rows, err := q.db.Query(ctx, listSandboxPreviewPoliciesByTeam, teamID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListSandboxPreviewPoliciesByTeamRow{}
-	for rows.Next() {
-		var i ListSandboxPreviewPoliciesByTeamRow
-		if err := rows.Scan(&i.SandboxID, &i.Access, &i.Revision); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many
 SELECT s.id, s.status, s.snapshot_id
 FROM sandbox s
@@ -1866,14 +1830,17 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 }
 
 const listSandboxesByTeamCreatedAsc = `-- name: ListSandboxesByTeamCreatedAsc :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at FROM sandbox
-WHERE team_id = $1
-  AND destroyed_at IS NULL
-  AND metadata @> $2
-  AND ($3::text IS NULL OR status::text = $3::text)
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = $1
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> $2
+  AND ($3::text IS NULL OR s.status::text = $3::text)
   AND ($4::text IS NULL
-       OR name ILIKE '%' || $4::text || '%')
-ORDER BY created_at ASC
+       OR s.name ILIKE '%' || $4::text || '%')
+ORDER BY s.created_at ASC
 LIMIT $6::bigint
 OFFSET COALESCE($5::bigint, 0)
 `
@@ -1887,7 +1854,12 @@ type ListSandboxesByTeamCreatedAscParams struct {
 	RowLimit   *int64    `json:"row_limit"`
 }
 
-func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSandboxesByTeamCreatedAscParams) ([]Sandbox, error) {
+type ListSandboxesByTeamCreatedAscRow struct {
+	Sandbox       Sandbox `json:"sandbox"`
+	PreviewAccess string  `json:"preview_access"`
+}
+
+func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSandboxesByTeamCreatedAscParams) ([]ListSandboxesByTeamCreatedAscRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxesByTeamCreatedAsc,
 		arg.TeamID,
 		arg.Metadata,
@@ -1900,35 +1872,36 @@ func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSan
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Sandbox{}
+	items := []ListSandboxesByTeamCreatedAscRow{}
 	for rows.Next() {
-		var i Sandbox
+		var i ListSandboxesByTeamCreatedAscRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.VcpuCount,
-			&i.MemoryMib,
-			&i.HostID,
-			&i.IpAddress,
-			&i.Pid,
-			&i.SnapshotID,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DestroyedAt,
-			&i.NetworkConfig,
-			&i.TimeoutSeconds,
-			&i.Metadata,
-			&i.TemplateID,
-			&i.SnapshotPath,
-			&i.MemPath,
-			&i.BasePath,
-			&i.DeltaPath,
-			&i.DiskMib,
-			&i.AutoDeleteSeconds,
-			&i.AutoDeleteAt,
-			&i.FailedAt,
+			&i.Sandbox.ID,
+			&i.Sandbox.TeamID,
+			&i.Sandbox.Name,
+			&i.Sandbox.Status,
+			&i.Sandbox.VcpuCount,
+			&i.Sandbox.MemoryMib,
+			&i.Sandbox.HostID,
+			&i.Sandbox.IpAddress,
+			&i.Sandbox.Pid,
+			&i.Sandbox.SnapshotID,
+			&i.Sandbox.CreatedAt,
+			&i.Sandbox.UpdatedAt,
+			&i.Sandbox.DestroyedAt,
+			&i.Sandbox.NetworkConfig,
+			&i.Sandbox.TimeoutSeconds,
+			&i.Sandbox.Metadata,
+			&i.Sandbox.TemplateID,
+			&i.Sandbox.SnapshotPath,
+			&i.Sandbox.MemPath,
+			&i.Sandbox.BasePath,
+			&i.Sandbox.DeltaPath,
+			&i.Sandbox.DiskMib,
+			&i.Sandbox.AutoDeleteSeconds,
+			&i.Sandbox.AutoDeleteAt,
+			&i.Sandbox.FailedAt,
+			&i.PreviewAccess,
 		); err != nil {
 			return nil, err
 		}
@@ -1942,14 +1915,17 @@ func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSan
 
 const listSandboxesByTeamCreatedDesc = `-- name: ListSandboxesByTeamCreatedDesc :many
 
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at FROM sandbox
-WHERE team_id = $1
-  AND destroyed_at IS NULL
-  AND metadata @> $2
-  AND ($3::text IS NULL OR status::text = $3::text)
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = $1
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> $2
+  AND ($3::text IS NULL OR s.status::text = $3::text)
   AND ($4::text IS NULL
-       OR name ILIKE '%' || $4::text || '%')
-ORDER BY created_at DESC
+       OR s.name ILIKE '%' || $4::text || '%')
+ORDER BY s.created_at DESC
 LIMIT $6::bigint
 OFFSET COALESCE($5::bigint, 0)
 `
@@ -1963,6 +1939,11 @@ type ListSandboxesByTeamCreatedDescParams struct {
 	RowLimit   *int64    `json:"row_limit"`
 }
 
+type ListSandboxesByTeamCreatedDescRow struct {
+	Sandbox       Sandbox `json:"sandbox"`
+	PreviewAccess string  `json:"preview_access"`
+}
+
 // Static created_at variants of ListSandboxesByTeamPaged. The plain ORDER BY
 // lets the planner walk idx_sandbox_team_created_active (forward for DESC,
 // backward for ASC) and stop at LIMIT, where the guarded-CASE ORDER BY in
@@ -1972,7 +1953,11 @@ type ListSandboxesByTeamCreatedDescParams struct {
 // name/status sorts stay on the flexible query below. Filters and pagination
 // are identical to the flexible query, including the NULL @row_limit "return
 // everything" contract.
-func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSandboxesByTeamCreatedDescParams) ([]Sandbox, error) {
+//
+// All three carry the effective preview access, so the list decorates its page
+// from one round trip. The join is 1:1 on sandbox_preview_policy's primary key,
+// so it cannot multiply rows and leaves the LIMIT pushdown intact.
+func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSandboxesByTeamCreatedDescParams) ([]ListSandboxesByTeamCreatedDescRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxesByTeamCreatedDesc,
 		arg.TeamID,
 		arg.Metadata,
@@ -1985,35 +1970,36 @@ func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSa
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Sandbox{}
+	items := []ListSandboxesByTeamCreatedDescRow{}
 	for rows.Next() {
-		var i Sandbox
+		var i ListSandboxesByTeamCreatedDescRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.VcpuCount,
-			&i.MemoryMib,
-			&i.HostID,
-			&i.IpAddress,
-			&i.Pid,
-			&i.SnapshotID,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DestroyedAt,
-			&i.NetworkConfig,
-			&i.TimeoutSeconds,
-			&i.Metadata,
-			&i.TemplateID,
-			&i.SnapshotPath,
-			&i.MemPath,
-			&i.BasePath,
-			&i.DeltaPath,
-			&i.DiskMib,
-			&i.AutoDeleteSeconds,
-			&i.AutoDeleteAt,
-			&i.FailedAt,
+			&i.Sandbox.ID,
+			&i.Sandbox.TeamID,
+			&i.Sandbox.Name,
+			&i.Sandbox.Status,
+			&i.Sandbox.VcpuCount,
+			&i.Sandbox.MemoryMib,
+			&i.Sandbox.HostID,
+			&i.Sandbox.IpAddress,
+			&i.Sandbox.Pid,
+			&i.Sandbox.SnapshotID,
+			&i.Sandbox.CreatedAt,
+			&i.Sandbox.UpdatedAt,
+			&i.Sandbox.DestroyedAt,
+			&i.Sandbox.NetworkConfig,
+			&i.Sandbox.TimeoutSeconds,
+			&i.Sandbox.Metadata,
+			&i.Sandbox.TemplateID,
+			&i.Sandbox.SnapshotPath,
+			&i.Sandbox.MemPath,
+			&i.Sandbox.BasePath,
+			&i.Sandbox.DeltaPath,
+			&i.Sandbox.DiskMib,
+			&i.Sandbox.AutoDeleteSeconds,
+			&i.Sandbox.AutoDeleteAt,
+			&i.Sandbox.FailedAt,
+			&i.PreviewAccess,
 		); err != nil {
 			return nil, err
 		}
@@ -2026,20 +2012,23 @@ func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSa
 }
 
 const listSandboxesByTeamPaged = `-- name: ListSandboxesByTeamPaged :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at FROM sandbox
-WHERE team_id = $1
-  AND destroyed_at IS NULL
-  AND metadata @> $2
-  AND ($3::text IS NULL OR status::text = $3::text)
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = $1
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> $2
+  AND ($3::text IS NULL OR s.status::text = $3::text)
   AND ($4::text IS NULL
-       OR name ILIKE '%' || $4::text || '%')
+       OR s.name ILIKE '%' || $4::text || '%')
 ORDER BY
-  CASE WHEN $5::text = 'name'   AND $6::text = 'asc'  THEN name END ASC,
-  CASE WHEN $5::text = 'name'   AND $6::text = 'desc' THEN name END DESC,
-  CASE WHEN $5::text = 'status' AND $6::text = 'asc'  THEN status::text END ASC,
-  CASE WHEN $5::text = 'status' AND $6::text = 'desc' THEN status::text END DESC,
-  CASE WHEN $5::text = 'created_at' AND $6::text = 'asc' THEN created_at END ASC,
-  created_at DESC
+  CASE WHEN $5::text = 'name'   AND $6::text = 'asc'  THEN s.name END ASC,
+  CASE WHEN $5::text = 'name'   AND $6::text = 'desc' THEN s.name END DESC,
+  CASE WHEN $5::text = 'status' AND $6::text = 'asc'  THEN s.status::text END ASC,
+  CASE WHEN $5::text = 'status' AND $6::text = 'desc' THEN s.status::text END DESC,
+  CASE WHEN $5::text = 'created_at' AND $6::text = 'asc' THEN s.created_at END ASC,
+  s.created_at DESC
 LIMIT $8::bigint
 OFFSET COALESCE($7::bigint, 0)
 `
@@ -2055,6 +2044,11 @@ type ListSandboxesByTeamPagedParams struct {
 	RowLimit   *int64    `json:"row_limit"`
 }
 
+type ListSandboxesByTeamPagedRow struct {
+	Sandbox       Sandbox `json:"sandbox"`
+	PreviewAccess string  `json:"preview_access"`
+}
+
 // Paginated, sortable, filterable team sandbox list backing the console. Only
 // serves the non-default sorts (name/status); the default created_at sort is
 // handled by the static ListSandboxesByTeamCreated{Desc,Asc} queries above,
@@ -2068,7 +2062,7 @@ type ListSandboxesByTeamPagedParams struct {
 // no-op), with created_at DESC as the stable tiebreaker and default. A NULL
 // @row_limit returns all rows, preserving the pre-pagination "return
 // everything" default so unpaginated SDK/MCP callers are unaffected.
-func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxesByTeamPagedParams) ([]Sandbox, error) {
+func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxesByTeamPagedParams) ([]ListSandboxesByTeamPagedRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxesByTeamPaged,
 		arg.TeamID,
 		arg.Metadata,
@@ -2083,35 +2077,36 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Sandbox{}
+	items := []ListSandboxesByTeamPagedRow{}
 	for rows.Next() {
-		var i Sandbox
+		var i ListSandboxesByTeamPagedRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.VcpuCount,
-			&i.MemoryMib,
-			&i.HostID,
-			&i.IpAddress,
-			&i.Pid,
-			&i.SnapshotID,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DestroyedAt,
-			&i.NetworkConfig,
-			&i.TimeoutSeconds,
-			&i.Metadata,
-			&i.TemplateID,
-			&i.SnapshotPath,
-			&i.MemPath,
-			&i.BasePath,
-			&i.DeltaPath,
-			&i.DiskMib,
-			&i.AutoDeleteSeconds,
-			&i.AutoDeleteAt,
-			&i.FailedAt,
+			&i.Sandbox.ID,
+			&i.Sandbox.TeamID,
+			&i.Sandbox.Name,
+			&i.Sandbox.Status,
+			&i.Sandbox.VcpuCount,
+			&i.Sandbox.MemoryMib,
+			&i.Sandbox.HostID,
+			&i.Sandbox.IpAddress,
+			&i.Sandbox.Pid,
+			&i.Sandbox.SnapshotID,
+			&i.Sandbox.CreatedAt,
+			&i.Sandbox.UpdatedAt,
+			&i.Sandbox.DestroyedAt,
+			&i.Sandbox.NetworkConfig,
+			&i.Sandbox.TimeoutSeconds,
+			&i.Sandbox.Metadata,
+			&i.Sandbox.TemplateID,
+			&i.Sandbox.SnapshotPath,
+			&i.Sandbox.MemPath,
+			&i.Sandbox.BasePath,
+			&i.Sandbox.DeltaPath,
+			&i.Sandbox.DiskMib,
+			&i.Sandbox.AutoDeleteSeconds,
+			&i.Sandbox.AutoDeleteAt,
+			&i.Sandbox.FailedAt,
+			&i.PreviewAccess,
 		); err != nil {
 			return nil, err
 		}
