@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -226,6 +227,7 @@ type fakeKernel struct {
 	rules    map[string][][]string
 	chains   []string
 	restores int
+	inputs   []string
 }
 
 func (k *fakeKernel) install(t *testing.T) func() {
@@ -234,6 +236,7 @@ func (k *fakeKernel) install(t *testing.T) func() {
 	dumpIPTables = func(context.Context) (string, error) { return renderDump(k.rules, k.chains), nil }
 	restoreIPTables = func(_ context.Context, input string) error {
 		k.restores++
+		k.inputs = append(k.inputs, input)
 		table := ""
 		for _, line := range strings.Split(input, "\n") {
 			line = strings.TrimSpace(line)
@@ -243,6 +246,31 @@ func (k *fakeKernel) install(t *testing.T) func() {
 				table = line[1:]
 			case strings.HasPrefix(line, "-F "):
 				k.rules[table+"/"+strings.TrimPrefix(line, "-F ")] = nil
+			case strings.HasPrefix(line, "-D "):
+				fields := strings.Fields(line)
+				key := table + "/" + fields[1]
+				spec := fields[2:]
+				found := false
+				for i, r := range k.rules[key] {
+					if ruleEqual(spec, r) {
+						k.rules[key] = append(k.rules[key][:i:i], k.rules[key][i+1:]...)
+						found = true
+						break
+					}
+				}
+				if !found {
+					return fmt.Errorf("fake kernel: -D no match: %q", line)
+				}
+			case strings.HasPrefix(line, "-I "):
+				fields := strings.Fields(line)
+				key := table + "/" + fields[1]
+				n, err := strconv.Atoi(fields[2])
+				if err != nil || n < 1 || n > len(k.rules[key])+1 {
+					return fmt.Errorf("fake kernel: bad -I position: %q", line)
+				}
+				rule := append([]string(nil), fields[3:]...)
+				rs := k.rules[key]
+				k.rules[key] = append(rs[:n-1:n-1], append([][]string{rule}, rs[n-1:]...)...)
 			case strings.HasPrefix(line, "-A "):
 				fields := strings.Fields(line)
 				key := table + "/" + fields[1]
@@ -619,13 +647,13 @@ func TestLockHostFirewallSerializes(t *testing.T) {
 	hostFirewallLockPath = t.TempDir() + "/hostfw.lock"
 	defer func() { hostFirewallLockPath = orig }()
 
-	unlock, err := lockHostFirewall()
+	unlock, err := lockHostFirewall(context.Background())
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
 	acquired := make(chan struct{})
 	go func() {
-		u2, err := lockHostFirewall()
+		u2, err := lockHostFirewall(context.Background())
 		if err != nil {
 			t.Errorf("second lock: %v", err)
 			close(acquired)
@@ -644,5 +672,80 @@ func TestLockHostFirewallSerializes(t *testing.T) {
 	case <-acquired:
 	case <-time.After(2 * time.Second):
 		t.Fatal("second lock never acquired after release")
+	}
+}
+
+func TestLockHostFirewallHonorsContext(t *testing.T) {
+	orig := hostFirewallLockPath
+	hostFirewallLockPath = t.TempDir() + "/hostfw.lock"
+	defer func() { hostFirewallLockPath = orig }()
+
+	unlock, err := lockHostFirewall(context.Background())
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := lockHostFirewall(ctx); err == nil {
+		t.Fatal("contended lock with cancelled context must fail, not block")
+	}
+}
+
+func TestRepairNeverNamesForeignRules(t *testing.T) {
+	// The transaction may only reference vmd's own rules: no flushes, and
+	// every -D/-I/-A rulespec must match the spec — so a foreign rule added
+	// at ANY moment (even between dump and restore) cannot be deleted.
+	spec := testSpec(true)
+	rules, chains := specKernel(spec, map[string][][]string{
+		"filter/FORWARD": {{"-i", "docker0", "-j", "ACCEPT"}},
+	})
+	fw := rules["filter/FORWARD"]
+	fw[2], fw[3] = fw[3], fw[2] // force repair
+	rules["filter/FORWARD"] = fw
+
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	specRules := map[string]bool{}
+	for _, want := range spec.sharedOrdered {
+		for _, w := range want {
+			c, _ := canonicalRule(w.args)
+			specRules[strings.Join(c, "|")] = true
+		}
+	}
+	for _, input := range k.inputs {
+		for _, line := range strings.Split(input, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || line == "COMMIT" || strings.HasPrefix(line, "*") {
+				continue
+			}
+			if strings.HasPrefix(line, "-F ") {
+				t.Fatalf("repair flushed a shared chain: %q", line)
+			}
+			fields := strings.Fields(line)
+			args := fields[2:]
+			if fields[0] == "-I" {
+				args = fields[3:]
+			}
+			c, ok := canonicalRule(args)
+			if !ok || !specRules[strings.Join(c, "|")] {
+				t.Fatalf("repair referenced a non-vmd rule: %q", line)
+			}
+		}
+	}
+	// And the foreign rule is still present.
+	found := false
+	for _, r := range k.rules["filter/FORWARD"] {
+		if len(r) >= 2 && r[1] == "docker0" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("foreign rule lost")
 	}
 }

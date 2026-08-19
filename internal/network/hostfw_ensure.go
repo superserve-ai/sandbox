@@ -46,16 +46,13 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	log.Warn().Str("mismatch", class).Str("detail", detail).
 		Msg("host firewall verification failed — running full install")
 
-	// Serialize the whole read-modify-write against every cooperating writer
-	// (the vmd daemon and template-builder both route through here): the
-	// repair's flush-and-rebuild is built from a dump, and a rule another
-	// process adds between dump and restore would be silently erased. The
-	// xtables lock only covers individual commands (and iptables-nft ignores
-	// it entirely), so cooperating processes hold this flock across the full
-	// install→repair→verify sequence. Third-party writers racing the (µs)
-	// dump→restore window remain a documented residual; their tools' own
-	// retry/reconcile loops re-add what a raced rebuild dropped.
-	unlock, err := lockHostFirewall()
+	// Serialize the read-modify-write against the cooperating writers (the
+	// vmd daemon and template-builder both route through here) so their
+	// install/repair sequences cannot interleave: the xtables lock only
+	// covers individual commands, and iptables-nft ignores it entirely.
+	// Third-party rules are safe regardless of any race — repair never
+	// names, moves, or flushes a foreign rule (see repairSharedOrdering).
+	unlock, err := lockHostFirewall(ctx)
 	if err != nil {
 		return fmt.Errorf("host firewall lock: %w", err)
 	}
@@ -107,18 +104,24 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	}
 }
 
-// repairSharedOrdering rewrites each wrong shared chain in ONE atomic
-// iptables-restore --noflush transaction per table: the chain is flushed and
-// rebuilt inside a single kernel commit, so there is no mid-repair window for
-// traffic to observe and no line-number arithmetic to race a concurrent
-// iptables writer (restore holds the xtables lock for the whole commit).
+// repairSharedOrdering repositions the vmd rules in each wrong shared chain
+// in ONE atomic iptables-restore --noflush transaction per table, without
+// ever naming, moving, or flushing a foreign rule — so a rule any third
+// party adds or holds at any moment can never be deleted by repair, raced or
+// not. Per chain the transaction is:
 //
-// The rebuilt chain is: foreign rules that legitimately preceded the block
-// (provably veth-incapable, or veth-capable but strict/inert — an operator's
-// stricter DROP stays ABOVE vmd's ACCEPT), then the canonical vmd block, then
-// every remaining foreign rule in its original relative order. A veth-capable
-// AMBIGUOUS foreign rule above the block aborts without mutation — the
-// verifier fails startup for the operator to resolve. OWNER ONLY.
+//   - `-D <chain> <our exact rulespec>`, once per existing copy — an exact-
+//     rulespec delete can only ever match a vmd rule;
+//   - security rules (drops, owned-chain jumps, PREROUTING redirects)
+//     re-inserted at head positions 1..k, so they run before anything else;
+//   - plumbing (MSS clamp, ACCEPTs, MASQUERADE) re-appended at the tail —
+//     which is also why a stricter foreign DROP anywhere in the chain stays
+//     effective: it always precedes the re-appended broad ACCEPT.
+//
+// A veth-capable AMBIGUOUS foreign rule above the security block still
+// aborts without mutation: head-inserting our rules would demote its unknown
+// control flow below our enforcement, and that call is the operator's.
+// OWNER ONLY.
 func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) error {
 	perTable := map[string][]string{} // table → restore lines
 	for key, want := range spec.sharedOrdered {
@@ -126,62 +129,34 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 			continue
 		}
 		single := hostFWSpec{sharedOrdered: map[string][]fwRule{key: want}, headGuarded: map[string]bool{key: spec.headGuarded[key]}}
-		if ok, _, _ := verifyHostFirewall(d, single); ok {
+		ok, class, detail := verifyHostFirewall(d, single)
+		if ok {
 			continue
+		}
+		if class == "preceded-ambiguous" {
+			return fmt.Errorf("%s — refusing to reorder past an ambiguous foreign rule", detail)
 		}
 		table, chain, _ := strings.Cut(key, "/")
 		got := d.rules[key]
-		isOurs := func(g []string) bool {
-			for _, w := range want {
+		var lines []string
+		for _, w := range want {
+			for _, g := range got {
 				if ruleEqual(w.args, g) {
-					return true
+					lines = append(lines, "-D "+chain+" "+strings.Join(w.args, " "))
 				}
 			}
-			return false
 		}
-		oldLast := -1
-		for i, g := range got {
-			if isOurs(g) {
-				oldLast = i
-			}
-		}
-		// Partition every foreign rule that sat anywhere within the old block
-		// span by DISPOSITION, not position: a restrictive DROP interleaved
-		// between vmd rules must stay ABOVE the rebuilt block (demoting it
-		// below the broad ACCEPT would silently disable it), a proven-
-		// permissive ACCEPT is demoted below, and anything ambiguous aborts
-		// without mutation. Foreign rules after the old block keep their tail
-		// position untouched.
-		var above, below [][]string
-		for i, g := range got {
-			if isOurs(g) {
-				continue // all copies replaced by the canonical block
-			}
-			if i > oldLast {
-				below = append(below, g)
-				continue
-			}
-			switch {
-			case ruleCannotMatchSandboxIngress(g):
-				above = append(above, g) // cannot interact with sandbox traffic
-			case foreignDisposition(g) == "strict" || foreignDisposition(g) == "inert":
-				above = append(above, g)
-			case foreignDisposition(g) == "permissive":
-				below = append(below, g)
-			default:
-				return fmt.Errorf("ambiguous foreign rule within the security block span in %s (%s) — refusing to reorder", key, strings.Join(g, " "))
-			}
-		}
-		lines := []string{"-F " + chain}
-		for _, g := range above {
-			lines = append(lines, "-A "+chain+" "+strings.Join(g, " "))
-		}
+		headPos := 0
+		var tail []string
 		for _, w := range want {
-			lines = append(lines, "-A "+chain+" "+strings.Join(w.args, " "))
+			if securityRule(key, w) {
+				headPos++
+				lines = append(lines, fmt.Sprintf("-I %s %d %s", chain, headPos, strings.Join(w.args, " ")))
+			} else {
+				tail = append(tail, "-A "+chain+" "+strings.Join(w.args, " "))
+			}
 		}
-		for _, g := range below {
-			lines = append(lines, "-A "+chain+" "+strings.Join(g, " "))
-		}
+		lines = append(lines, tail...)
 		perTable[table] = append(perTable[table], lines...)
 	}
 	for _, table := range []string{"filter", "nat"} {
@@ -215,21 +190,43 @@ var installHostFirewallFn = installHostFirewall
 // firewall writers' slow paths. Var for tests.
 var hostFirewallLockPath = "/run/sandbox-hostfw.lock"
 
-// lockHostFirewall takes a blocking exclusive flock; the holder is another
-// cooperating startup, so waiting (rather than timing out) is correct.
-func lockHostFirewall() (func(), error) {
+// hostFirewallLockTimeout bounds lock acquisition: the holder is another
+// cooperating startup (normally seconds), and a wedged one must fail this
+// startup with a clear error rather than block it indefinitely — the
+// supervisor's restart retries against a hopefully-unwedged holder.
+const hostFirewallLockTimeout = 2 * time.Minute
+
+// lockHostFirewall acquires the exclusive flock, polling non-blocking so the
+// wait honors ctx and the timeout.
+func lockHostFirewall(ctx context.Context) (func(), error) {
 	f, err := os.OpenFile(hostFirewallLockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, err
+	deadline := time.Now().Add(hostFirewallLockTimeout)
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() {
+				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+				f.Close()
+			}, nil
+		}
+		if err != syscall.EWOULDBLOCK {
+			f.Close()
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			f.Close()
+			return nil, fmt.Errorf("timed out after %v waiting for %s (held by another firewall writer?)", hostFirewallLockTimeout, hostFirewallLockPath)
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		f.Close()
-	}, nil
 }
 
 // restoreIPTables applies one iptables-restore transaction. --noflush so only
