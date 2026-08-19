@@ -97,7 +97,7 @@ func hostFWSpecFor(hostIface string, httpProxyPort, tlsProxyPort, dnsRedirectPor
 	if tlsProxyPort > 0 {
 		pre = append(pre, fwRule{"nat", "PREROUTING", marked("-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", tlsProxyPort))})
 	}
-	if secretsProxyPort > 0 && net.ParseIP(secretsProxyDst) != nil {
+	if ip := net.ParseIP(secretsProxyDst); secretsProxyPort > 0 && ip != nil && ip.To4() != nil {
 		pre = append(pre, fwRule{"nat", "PREROUTING", marked("-i", "veth+", "-p", "tcp", "-d", secretsProxyDst, "--dport", fmt.Sprintf("%d", secretsProxyPort), "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", secretsProxyPort))})
 	}
 	spec.sharedOrdered["nat/PREROUTING"] = pre

@@ -1077,3 +1077,20 @@ func TestPostLockReverifySkipsInstall(t *testing.T) {
 		t.Fatalf("ensure: %v", err)
 	}
 }
+
+func TestInvalidSecretsProxyDstFailsBeforeFastPath(t *testing.T) {
+	// A requested secrets redirect with an invalid destination must fail
+	// startup — never silently drop out of the spec and verify intact.
+	origDump := dumpIPTables
+	dumpIPTables = func(context.Context) (string, error) {
+		t.Fatal("validation must fail before any dump")
+		return "", nil
+	}
+	defer func() { dumpIPTables = origDump }()
+	iface, hp, tp, dp, _, _, bp := testSpecParams()
+	for _, dst := range []string{"", "not-an-ip", "fe80::1"} {
+		if err := ensureHostFirewall(context.Background(), iface, hp, tp, dp, dst, 9443, bp, true, zerolog.Nop()); err == nil {
+			t.Fatalf("dst %q accepted", dst)
+		}
+	}
+}

@@ -12,6 +12,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -25,6 +26,15 @@ import (
 // ensureHostFirewall verifies the host ruleset and installs/repairs only on
 // mismatch. Drop-in replacement for calling installHostFirewall directly.
 func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tlsProxyPort, dnsRedirectPort uint16, secretsProxyDst string, secretsProxyPort uint16, blockedPorts []uint16, manageOwnedChains bool, log zerolog.Logger) error {
+	// Validate before the fast path, with the installer's exact requirement:
+	// a requested-but-invalid secrets redirect must fail startup, never
+	// silently vanish from the spec and let an otherwise-intact ruleset
+	// verify without it.
+	if secretsProxyPort > 0 {
+		if ip := net.ParseIP(secretsProxyDst); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("invalid secretsProxyDst %q (must be IPv4)", secretsProxyDst)
+		}
+	}
 	spec := hostFWSpecFor(hostIface, httpProxyPort, tlsProxyPort, dnsRedirectPort, secretsProxyDst, secretsProxyPort, blockedPorts, manageOwnedChains)
 
 	tVerify := time.Now()
