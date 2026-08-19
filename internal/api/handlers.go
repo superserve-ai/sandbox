@@ -1179,7 +1179,7 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 }
 
 func (h *Handlers) ResumeSandbox(c *gin.Context) {
-	tResume := time.Now()
+	tResume := PhaseStart(c)
 	var sandbox db.Sandbox
 	// Registered before ANY return: a resume that burns the whole pausing
 	// settle window and then 409s is among the slowest resume requests and
@@ -1948,15 +1948,9 @@ func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uui
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
 	tHandler := time.Now()
-	// total is based on the middleware's stamp so it covers auth too — a
-	// slow auth cache miss must never make the auth phase exceed its own
-	// total. lookup stays based on handler entry so it doesn't absorb auth.
-	tStart := tHandler
-	if v, ok := c.Get("auth_start"); ok {
-		if t, ok := v.(time.Time); ok {
-			tStart = t
-		}
-	}
+	// total is based on the auth boundary so it covers a slow cache miss;
+	// lookup stays based on handler entry so it doesn't absorb auth.
+	tStart := PhaseStart(c)
 	var hostID string
 	var tLookupDone, tSchedStart, tVmdStart, tVmdEnd, tInsertStart, tInsertEnd, tInsertReceive, tPostStart, tPostDone time.Time
 	// Registered before ANY return so failed, timed-out, and rejected
@@ -2754,7 +2748,7 @@ func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id string) (sn
 }
 
 func (h *Handlers) PauseSandbox(c *gin.Context) {
-	tPause := time.Now()
+	tPause := PhaseStart(c)
 	// Transition counts/results come from the SandboxLifecycleTelemetry
 	// middleware; this defer emits only the phase-series total.
 	pauseHostID := ""

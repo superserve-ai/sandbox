@@ -64,6 +64,21 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		// latency includes a slow auth cache miss (auth must never exceed
 		// its own request's total).
 		c.Set("auth_start", authStart)
+		// An auth abort never reaches the handler whose defer emits the
+		// op's phase series, so the slowest auth attempts (cache-miss
+		// timeouts, invalid keys) would vanish from those distributions.
+		// Emit auth+total for lifecycle routes here instead.
+		handlerReached := false
+		defer func() {
+			if handlerReached {
+				return
+			}
+			if op, ok := sandboxLifecycleOperation(c.Request.Method, c.FullPath()); ok {
+				d := time.Since(authStart)
+				RecordLatencyPhases(c.Request.Context(), op, "",
+					map[string]time.Duration{"auth": d, "total": d})
+			}
+		}()
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" {
 			respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
@@ -117,6 +132,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			setAPIKeyContext(c, entry)
 			c.Set("auth_ms", time.Since(authStart).Milliseconds())
 			c.Set("auth_duration", time.Since(authStart))
+			handlerReached = true
 			c.Next()
 			return
 		}
@@ -167,6 +183,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		setAPIKeyContext(c, entry)
 		c.Set("auth_ms", time.Since(authStart).Milliseconds())
 		c.Set("auth_duration", time.Since(authStart))
+		handlerReached = true
 		c.Next()
 	}
 }

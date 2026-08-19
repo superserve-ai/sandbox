@@ -79,6 +79,18 @@ func sandboxLoggerFrom(base zerolog.Logger, sandboxID, hostID string) zerolog.Lo
 		Logger()
 }
 
+// PhaseStart returns the auth middleware's start stamp when present, so
+// handler phase totals cover a slow auth cache miss (the auth phase must
+// never exceed its own request's total). Falls back to now.
+func PhaseStart(c *gin.Context) time.Time {
+	if v, ok := c.Get("auth_start"); ok {
+		if t, ok := v.(time.Time); ok {
+			return t
+		}
+	}
+	return time.Now()
+}
+
 func RecordSandboxTransition(ctx context.Context, operation, result, hostID string, duration time.Duration) {
 	currentTelemetryRecorder().RecordSandboxTransition(ctx, telemetry.SandboxTransition{
 		Operation: operation,
