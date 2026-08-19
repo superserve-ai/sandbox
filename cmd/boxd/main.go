@@ -1457,20 +1457,42 @@ func isStaleHandle(err error) bool {
 	return errors.Is(err, syscall.ESTALE)
 }
 
+// parseFileMode parses an optional octal mode string (e.g. "0755", "755", "0o755").
+// If raw is empty, it returns 0o644 (default regular file permissions).
+func parseFileMode(raw string) (fs.FileMode, error) {
+	if raw == "" {
+		return 0o644, nil
+	}
+	cleaned := strings.TrimPrefix(strings.TrimPrefix(raw, "0o"), "0O")
+	val, err := strconv.ParseUint(cleaned, 8, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid mode %q: must be an octal permission (e.g. 0755 or 0644)", raw)
+	}
+	if val > 0o777 {
+		return 0, fmt.Errorf("invalid mode %q: permission bits out of range (0000-0777)", raw)
+	}
+	return fs.FileMode(val), nil
+}
+
 // writeFileAttempt performs one mkdir+open+write+close cycle, copying
 // body into the file. It's split out so handleFileUpload can retry the
 // whole sequence on ESTALE — the mkdir and the open can each
 // independently observe a stale handle on the same mount. body is an
 // io.Reader rather than a []byte so the same function serves both the
 // buffered (retryable) and streamed (large-upload) paths.
-func writeFileAttempt(path string, body io.Reader) (int64, error) {
+func writeFileAttempt(path string, body io.Reader, mode fs.FileMode) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return 0, fmt.Errorf("mkdir: %w", err)
 	}
 
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return 0, fmt.Errorf("create file: %w", err)
+	}
+	if err := f.Chmod(mode); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return 0, fmt.Errorf("chmod file: %w", err)
 	}
 
 	written, werr := io.Copy(f, body)
@@ -1487,6 +1509,11 @@ func writeFileAttempt(path string, body io.Reader) (int64, error) {
 }
 
 func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
+	mode, err := parseFileMode(r.URL.Query().Get("mode"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	// Peek up to the retry-buffer limit rather than reading the whole
 	// body blindly. If the body is larger than the limit, len(peeked)
 	// comes back as limit+1 without hitting EOF, and we fall through to
@@ -1505,12 +1532,12 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
 		// Too large to buffer at all, or the aggregate budget is
 		// currently claimed by other concurrent uploads -- stream
 		// through once with no retry rather than risk an OOM.
-		written, err = writeFileAttempt(path, io.MultiReader(bytes.NewReader(peeked), r.Body))
+		written, err = writeFileAttempt(path, io.MultiReader(bytes.NewReader(peeked), r.Body), mode)
 	} else {
 		defer releaseRetryBudget(peekedLen)
 		deadline := time.Now().Add(staleHandleRetryBudget)
 		for {
-			written, err = writeFileAttempt(path, bytes.NewReader(peeked))
+			written, err = writeFileAttempt(path, bytes.NewReader(peeked), mode)
 			if err == nil || !isStaleHandle(err) || time.Now().After(deadline) {
 				break
 			}
@@ -1531,5 +1558,9 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{"path": path, "size": written})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"path": path,
+		"size": written,
+		"mode": fmt.Sprintf("%04o", mode),
+	})
 }

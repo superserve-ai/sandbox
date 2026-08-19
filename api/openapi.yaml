@@ -1913,6 +1913,16 @@ paths:
       description: Creates parent directories as needed and overwrites any existing file.
       security:
         - accessToken: []
+      parameters:
+        - name: mode
+          in: query
+          required: false
+          description: >
+            Optional POSIX file permission mode in octal (e.g. `0755` for executable, `0644` for regular file).
+            Defaults to `0644`.
+          schema:
+            type: string
+            example: "0755"
       requestBody:
         required: true
         content:
@@ -3687,9 +3697,13 @@ components:
           type: integer
           format: int64
           description: Number of bytes written.
+        mode:
+          type: string
+          description: POSIX file mode string in octal representation (e.g. `0644`, `0755`).
       example:
         path: /home/user/out.txt
         size: 1024
+        mode: "0644"
 
     CreateSecretRequest:
       type: object

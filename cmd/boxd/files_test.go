@@ -755,3 +755,131 @@ func TestServeDirAsZip_AbortsOnCanceledContext(t *testing.T) {
 		t.Fatalf("zip walk wrote %d entries after the context was canceled; want 0 (aborted)", len(zr.File))
 	}
 }
+
+func TestFileUpload_DefaultMode(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "script.sh")
+	req := httptest.NewRequest(http.MethodPost, "/files?path="+url.QueryEscape(p), strings.NewReader("#!/bin/sh\necho hi\n"))
+	w := httptest.NewRecorder()
+	handleFiles(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp["path"] != p {
+		t.Errorf("path = %v, want %q", resp["path"], p)
+	}
+	if resp["mode"] != "0644" {
+		t.Errorf("mode = %v, want 0644", resp["mode"])
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("stat uploaded file: %v", err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Errorf("file permissions = %04o, want 0644", info.Mode().Perm())
+	}
+}
+
+func TestFileUpload_CustomMode_Executable(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "run.sh")
+	req := httptest.NewRequest(http.MethodPost, "/files?path="+url.QueryEscape(p)+"&mode=0755", strings.NewReader("#!/bin/sh\necho executable\n"))
+	w := httptest.NewRecorder()
+	handleFiles(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp["mode"] != "0755" {
+		t.Errorf("mode = %v, want 0755", resp["mode"])
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("stat uploaded file: %v", err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Errorf("file permissions = %04o, want 0755", info.Mode().Perm())
+	}
+}
+
+func TestFileUpload_CustomMode_Prefixes(t *testing.T) {
+	cases := []struct {
+		modeQuery string
+		wantPerm  os.FileMode
+		wantMode  string
+	}{
+		{"700", 0o700, "0700"},
+		{"0600", 0o600, "0600"},
+		{"0o750", 0o750, "0750"},
+	}
+	for _, tc := range cases {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "test.bin")
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/files?path=%s&mode=%s", url.QueryEscape(p), tc.modeQuery), strings.NewReader("data"))
+		w := httptest.NewRecorder()
+		handleFiles(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("mode=%q: status = %d, want 200; body: %s", tc.modeQuery, w.Code, w.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if resp["mode"] != tc.wantMode {
+			t.Errorf("mode query %q: response mode = %v, want %q", tc.modeQuery, resp["mode"], tc.wantMode)
+		}
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		if info.Mode().Perm() != tc.wantPerm {
+			t.Errorf("mode query %q: perm = %04o, want %04o", tc.modeQuery, info.Mode().Perm(), tc.wantPerm)
+		}
+	}
+}
+
+func TestFileUpload_InvalidMode_Rejected(t *testing.T) {
+	invalidModes := []string{"invalid", "888", "01777", "999", "-1", "07777"}
+	dir := t.TempDir()
+	for _, m := range invalidModes {
+		p := filepath.Join(dir, "test.txt")
+		req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/files?path=%s&mode=%s", url.QueryEscape(p), m), strings.NewReader("data"))
+		w := httptest.NewRecorder()
+		handleFiles(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("mode=%q: status = %d, want 400; body: %s", m, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "mode") {
+			t.Errorf("mode=%q: body %q should mention mode", m, w.Body.String())
+		}
+	}
+}
+
+func TestFileUpload_OverwritesExistingFilePermissions(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "perm_change.sh")
+	if err := os.WriteFile(p, []byte("echo 1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/files?path="+url.QueryEscape(p)+"&mode=0755", strings.NewReader("echo 2"))
+	w := httptest.NewRecorder()
+	handleFiles(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Errorf("overwritten file perm = %04o, want 0755", info.Mode().Perm())
+	}
+}
