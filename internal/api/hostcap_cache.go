@@ -124,16 +124,17 @@ func (h *Handlers) logHostCapabilityMiss(ctx context.Context, hostID string, cap
 	event := log.Warn().
 		Str("host_id", hostID).
 		Strs("required_capabilities", capabilities)
-	host, err := h.DB.GetHost(ctx, hostID)
+	diagnostics, err := h.DB.GetHostCapabilityDiagnostics(ctx, hostID)
 	if err != nil {
 		event.Err(err).Msg("host capability attestation missing; host diagnostics failed")
 		return
 	}
 	event.
-		Str("host_status", host.Status).
-		Str("vmd_addr", host.VmdAddr).
-		Str("proxy_addr", host.ProxyAddr).
-		Interface("last_heartbeat_at", host.LastHeartbeatAt).
+		Str("host_status", diagnostics.HostStatus).
+		Str("vmd_addr", diagnostics.VmdAddr).
+		Str("proxy_addr", diagnostics.ProxyAddr).
+		Str("last_heartbeat_at", diagnostics.LastHeartbeatAt).
+		RawJSON("capability_rows", []byte(diagnostics.CapabilityRows)).
 		Msg("host capability attestation missing")
 }
 
