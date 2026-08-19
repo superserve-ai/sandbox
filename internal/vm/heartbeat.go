@@ -120,7 +120,7 @@ func sendHeartbeat(ctx context.Context, client *http.Client, url, token, proxyHe
 		log.Warn().Int("status", resp.StatusCode).Strs("capabilities", capabilities).Msg("heartbeat got non-200 response")
 		return
 	}
-	log.Debug().
+	log.Info().
 		Int("status", resp.StatusCode).
 		Str("url", url).
 		Str("proxy_health_url", proxyHealthURL).
