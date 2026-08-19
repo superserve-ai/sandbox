@@ -68,7 +68,11 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	if out, err := dumpIPTables(ctx); err == nil {
 		if d, perr := parseIPTablesSave(out); perr == nil {
 			if ok, _, _ := verifyHostFirewall(d, spec); ok {
-				log.Info().Msg("host firewall converged by a concurrent writer while waiting — install skipped")
+				// Async: the write must not extend the lock hold or this
+				// startup — every queued waiter is behind it.
+				go func() {
+					log.Info().Msg("host firewall converged by a concurrent writer while waiting — install skipped")
+				}()
 				return nil
 			}
 		}
