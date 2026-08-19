@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -24,6 +27,10 @@ func setupHostHeartbeatRouter(h *Handlers) *gin.Engine {
 }
 
 func TestHostHeartbeatSyncsAdvertisedCapabilities(t *testing.T) {
+	var logOutput bytes.Buffer
+	oldLogger := log.Logger
+	log.Logger = zerolog.New(&logOutput)
+	defer func() { log.Logger = oldLogger }()
 	var gotHostID string
 	var gotCapabilities []string
 	mock := &mockDBTX{
@@ -58,6 +65,12 @@ func TestHostHeartbeatSyncsAdvertisedCapabilities(t *testing.T) {
 	}
 	if len(gotCapabilities) != 1 || gotCapabilities[0] != preview.HostCapabilityPorts {
 		t.Fatalf("capabilities = %#v, want [%q]", gotCapabilities, preview.HostCapabilityPorts)
+	}
+	if !bytes.Contains(logOutput.Bytes(), []byte(`"message":"host heartbeat persisted"`)) ||
+		!bytes.Contains(logOutput.Bytes(), []byte(`"host_id":"host-a"`)) ||
+		!bytes.Contains(logOutput.Bytes(), []byte(`"capabilities":["preview_ports_v1"]`)) ||
+		!bytes.Contains(logOutput.Bytes(), []byte(`"last_heartbeat_at"`)) {
+		t.Fatalf("heartbeat persistence diagnostics=%s, want host, capabilities, and generation", logOutput.String())
 	}
 }
 

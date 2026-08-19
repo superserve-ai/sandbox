@@ -90,6 +90,14 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		return
 	}
 
+	log.Debug().
+		Str("host_id", hostID).
+		Strs("capabilities", capabilities).
+		Interface("last_heartbeat_at", host.LastHeartbeatAt).
+		Str("status", host.Status).
+		Str("prev_status", host.PrevStatus).
+		Msg("host heartbeat persisted")
+
 	if host.PrevStatus == "unhealthy" && host.Status == "active" {
 		// The heartbeat just recovered this host; drop the scheduler's cached
 		// list so its capacity is usable now, not after the cache TTL.

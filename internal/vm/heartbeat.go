@@ -56,6 +56,7 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	log.Info().
+		Str("host_id", cfg.HostID).
 		Str("url", url).
 		Str("proxy_health_url", proxyHealthURL).
 		Dur("interval", interval).
@@ -65,7 +66,7 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	defer ticker.Stop()
 
 	// Fire once immediately so the host is marked alive on startup.
-	sendHeartbeat(ctx, client, url, token, proxyHealthURL, log)
+	sendHeartbeat(ctx, client, cfg.HostID, url, token, proxyHealthURL, log)
 
 	for {
 		select {
@@ -73,7 +74,7 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 			log.Info().Msg("heartbeat exiting")
 			return
 		case <-ticker.C:
-			sendHeartbeat(ctx, client, url, token, proxyHealthURL, log)
+			sendHeartbeat(ctx, client, cfg.HostID, url, token, proxyHealthURL, log)
 		}
 	}
 }
@@ -86,21 +87,32 @@ type proxyHealthResponse struct {
 	Capabilities []string `json:"capabilities"`
 }
 
-func sendHeartbeat(ctx context.Context, client *http.Client, url, token, proxyHealthURL string, log zerolog.Logger) {
+func sendHeartbeat(ctx context.Context, client *http.Client, hostID, url, token, proxyHealthURL string, log zerolog.Logger) {
+	started := time.Now()
 	capabilities, err := proxyPreviewCapabilities(ctx, client, proxyHealthURL)
 	if err != nil {
-		log.Warn().Err(err).Msg("proxy capability probe failed; advertising no preview capabilities")
+		log.Debug().Err(err).
+			Str("host_id", hostID).
+			Dur("duration", time.Since(started)).
+			Msg("proxy capability probe failed; advertising no preview capabilities")
+		log.Warn().Err(err).Str("host_id", hostID).Msg("proxy capability probe failed; advertising no preview capabilities")
 		capabilities = nil
 	}
 
+	log.Debug().
+		Str("host_id", hostID).
+		Str("proxy_health_url", proxyHealthURL).
+		Strs("capabilities", capabilities).
+		Msg("sending heartbeat")
+
 	body, err := json.Marshal(heartbeatRequest{Capabilities: capabilities})
 	if err != nil {
-		log.Error().Err(err).Msg("failed to encode heartbeat body")
+		log.Error().Err(err).Str("host_id", hostID).Msg("failed to encode heartbeat body")
 		return
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		log.Error().Err(err).Msg("failed to create heartbeat request")
+		log.Error().Err(err).Str("host_id", hostID).Msg("failed to create heartbeat request")
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -110,15 +122,43 @@ func sendHeartbeat(ctx context.Context, client *http.Client, url, token, proxyHe
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Warn().Err(err).Msg("heartbeat failed")
+		log.Debug().Err(err).
+			Str("host_id", hostID).
+			Strs("capabilities", capabilities).
+			Dur("duration", time.Since(started)).
+			Msg("heartbeat failed")
+		log.Warn().Err(err).
+			Str("host_id", hostID).
+			Strs("capabilities", capabilities).
+			Dur("duration", time.Since(started)).
+			Msg("heartbeat failed")
 		return
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Warn().Int("status", resp.StatusCode).Msg("heartbeat got non-200 response")
+		log.Debug().
+			Str("host_id", hostID).
+			Strs("capabilities", capabilities).
+			Int("status", resp.StatusCode).
+			Dur("duration", time.Since(started)).
+			Msg("heartbeat got non-200 response")
+		log.Warn().
+			Str("host_id", hostID).
+			Strs("capabilities", capabilities).
+			Int("status", resp.StatusCode).
+			Dur("duration", time.Since(started)).
+			Msg("heartbeat got non-200 response")
+		return
 	}
+
+	log.Debug().
+		Str("host_id", hostID).
+		Strs("capabilities", capabilities).
+		Int("status", resp.StatusCode).
+		Dur("duration", time.Since(started)).
+		Msg("heartbeat completed")
 }
 
 func proxyPreviewCapabilities(ctx context.Context, client *http.Client, healthURL string) ([]string, error) {

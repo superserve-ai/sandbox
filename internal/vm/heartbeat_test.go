@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 )
 
 func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
+	var logOutput bytes.Buffer
 	var got heartbeatRequest
 	var gotPath, gotAuthorization string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -37,7 +39,7 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 	}))
 	defer server.Close()
 
-	sendHeartbeat(context.Background(), server.Client(), server.URL+"/internal/hosts/host-a/heartbeat", "shared", server.URL+"/health", zerolog.Nop())
+	sendHeartbeat(context.Background(), server.Client(), "host-a", server.URL+"/internal/hosts/host-a/heartbeat", "shared", server.URL+"/health", zerolog.New(&logOutput))
 
 	if gotPath != "/internal/hosts/host-a/heartbeat" {
 		t.Fatalf("path = %q", gotPath)
@@ -51,6 +53,12 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Capabilities, want) {
 		t.Fatalf("capabilities = %#v, want %#v", got.Capabilities, want)
+	}
+	if !bytes.Contains(logOutput.Bytes(), []byte(`"message":"sending heartbeat"`)) ||
+		!bytes.Contains(logOutput.Bytes(), []byte(`"host_id":"host-a"`)) ||
+		!bytes.Contains(logOutput.Bytes(), []byte(`"capabilities":["preview_ports_v1","preview_port_access_v1","preview_port_tokens_v1","preview_port_browser_auth_v1"]`)) ||
+		!bytes.Contains(logOutput.Bytes(), []byte(`"message":"heartbeat completed"`)) {
+		t.Fatalf("heartbeat diagnostics=%s, want advertised capabilities and completion", logOutput.String())
 	}
 }
 
@@ -188,10 +196,50 @@ func TestSendHeartbeatOmitsCapabilityForOldOrUnavailableProxy(t *testing.T) {
 			}))
 			defer server.Close()
 
-			sendHeartbeat(context.Background(), server.Client(), server.URL+"/internal/hosts/host-a/heartbeat", "", server.URL+"/health", zerolog.Nop())
+			sendHeartbeat(context.Background(), server.Client(), "host-a", server.URL+"/internal/hosts/host-a/heartbeat", "", server.URL+"/health", zerolog.Nop())
 			if len(got.Capabilities) != 0 {
 				t.Fatalf("capabilities = %#v, want empty", got.Capabilities)
 			}
 		})
 	}
+}
+
+func TestSendHeartbeatFailureDiagnosticsIncludeDebugDurationAndStatus(t *testing.T) {
+	t.Run("non-200 response", func(t *testing.T) {
+		var logOutput bytes.Buffer
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/health" {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(proxyHealthResponse{Capabilities: []string{preview.HostCapabilityPorts}})
+				return
+			}
+			w.WriteHeader(http.StatusConflict)
+		}))
+		defer server.Close()
+
+		sendHeartbeat(context.Background(), server.Client(), "host-a", server.URL+"/heartbeat", "", server.URL+"/health", zerolog.New(&logOutput))
+		output := logOutput.String()
+		if !bytes.Contains(logOutput.Bytes(), []byte(`"level":"debug"`)) ||
+			!bytes.Contains(logOutput.Bytes(), []byte(`"message":"heartbeat got non-200 response"`)) ||
+			!bytes.Contains(logOutput.Bytes(), []byte(`"status":409`)) ||
+			!bytes.Contains(logOutput.Bytes(), []byte(`"duration"`)) {
+			t.Fatalf("failure diagnostics=%s, want debug status and duration", output)
+		}
+	})
+
+	t.Run("transport failure", func(t *testing.T) {
+		var logOutput bytes.Buffer
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		url := server.URL
+		server.Close()
+
+		sendHeartbeat(context.Background(), http.DefaultClient, "host-a", url+"/heartbeat", "", url+"/health", zerolog.New(&logOutput))
+		if !bytes.Contains(logOutput.Bytes(), []byte(`"level":"debug"`)) ||
+			!bytes.Contains(logOutput.Bytes(), []byte(`"message":"heartbeat failed"`)) ||
+			!bytes.Contains(logOutput.Bytes(), []byte(`"duration"`)) {
+			t.Fatalf("failure diagnostics=%s, want debug duration", logOutput.String())
+		}
+	})
 }
