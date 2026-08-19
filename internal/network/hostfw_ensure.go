@@ -47,14 +47,18 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 
 	// Slow path: the installer, byte-for-byte today's behavior.
 	tRepair := time.Now()
-	if err := installHostFirewall(hostIface, httpProxyPort, tlsProxyPort, dnsRedirectPort, secretsProxyDst, secretsProxyPort, blockedPorts, manageOwnedChains, log); err != nil {
+	if err := installHostFirewallFn(hostIface, httpProxyPort, tlsProxyPort, dnsRedirectPort, secretsProxyDst, secretsProxyPort, blockedPorts, manageOwnedChains, log); err != nil {
 		return err
 	}
 
 	// The installer is idempotent-by-presence, so a pre-existing rule in an
-	// ineffective position (or a duplicate) survives it. Repair ordering and
-	// multiplicity for the vmd rules in shared chains, then require the
-	// verifier to pass before this process is allowed to serve.
+	// ineffective position (or a duplicate, or a foreign rule above the
+	// security block) survives it. The OWNER repairs those and must then pass
+	// verification before serving. Non-owners never mutate shared-chain
+	// ordering: their partial spec omits the daemon's jumps, so
+	// "canonicalizing" it could hoist an ACCEPT above the daemon's drops —
+	// they install (presence only, today's behavior) and leave ordering to
+	// the daemon.
 	for pass := 0; ; pass++ {
 		out, err := dumpIPTables(ctx)
 		if err != nil {
@@ -70,12 +74,17 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 				Msg("host firewall installed and verified")
 			return nil
 		}
-		// One repair attempt for the classes the installer cannot fix.
-		if pass > 0 || (class != "misordered" && class != "duplicate-rule") {
+		if !manageOwnedChains {
+			log.Warn().Str("mismatch", class).Str("detail", detail).
+				Msg("host firewall not fully verified — ordering repair is the daemon's; continuing with installed rules")
+			return nil
+		}
+		repairable := class == "misordered" || class == "duplicate-rule" || class == "preceded"
+		if pass > 0 || !repairable {
 			return fmt.Errorf("host firewall failed verification after install (%s: %s) — refusing to serve with unverified enforcement", class, detail)
 		}
 		log.Warn().Str("mismatch", class).Str("detail", detail).
-			Msg("host firewall misordered/duplicated after install — canonicalizing rule order")
+			Msg("host firewall needs canonicalization after install — repairing rule order")
 		if err := repairSharedOrdering(ctx, d, spec); err != nil {
 			return fmt.Errorf("host firewall ordering repair: %w", err)
 		}
@@ -84,10 +93,12 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 
 // repairSharedOrdering rewrites each shared chain's vmd rules into canonical
 // order with multiplicity one, without ever weakening enforcement: the
-// canonical block is INSERTED at the top first (a transient duplicate of a
-// DROP/jump/clamp/ACCEPT never loosens anything), and only then are the old
-// copies below it deleted, last occurrence first, by line number. Unrelated
-// host rules are never touched.
+// canonical block is inserted TOP-DOWN at explicit positions 1..N — so the
+// drops and jumps are in place at the head before the broad ACCEPT is added
+// below them, and an insertion failure part-way leaves only extra enforcement,
+// never a bypass. Only then are the old copies below the block deleted, last
+// occurrence first, by line number. Unrelated host rules are never touched.
+// OWNER ONLY: a non-owner's partial spec must never reorder shared chains.
 func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) error {
 	for key, want := range spec.sharedOrdered {
 		if len(want) == 0 {
@@ -95,14 +106,15 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 		}
 		table, chain, _ := strings.Cut(key, "/")
 		// Only repair chains that are actually wrong.
-		single := hostFWSpec{sharedOrdered: map[string][]fwRule{key: want}}
+		single := hostFWSpec{sharedOrdered: map[string][]fwRule{key: want}, headGuarded: map[string]bool{key: spec.headGuarded[key]}}
 		if ok, _, _ := verifyHostFirewall(d, single); ok {
 			continue
 		}
-		// Insert the canonical block at the top (reverse order so want[0]
-		// lands at position 1).
-		for i := len(want) - 1; i >= 0; i-- {
-			args := append([]string{"-w", "5", "-t", table, "-I", chain, "1"}, want[i].args...)
+		// Insert the canonical block forward at positions 1, 2, 3, ...:
+		// want[0] (a drop/jump) claims the head first; each subsequent rule
+		// lands directly below the already-inserted block.
+		for i, w := range want {
+			args := append([]string{"-w", "5", "-t", table, "-I", chain, strconv.Itoa(i + 1)}, w.args...)
 			if out, err := runIPTables(ctx, args); err != nil {
 				return fmt.Errorf("insert canonical %s rule: %s: %w", key, out, err)
 			}
@@ -143,6 +155,10 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 	}
 	return nil
 }
+
+// installHostFirewallFn is a test seam over the real installer, so the
+// non-owner no-repair branch can be exercised without iptables.
+var installHostFirewallFn = installHostFirewall
 
 // runIPTables execs iptables with the xtables lock wait already in args and a
 // hard timeout. Used only on the (rare) repair path.

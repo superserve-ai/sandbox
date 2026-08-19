@@ -39,6 +39,12 @@ func (r fwRule) key() string { return r.table + "/" + r.chain }
 type hostFWSpec struct {
 	sharedOrdered map[string][]fwRule
 	ownedChains   map[string][]fwRule
+	// headGuarded chains (owner only) additionally require that no rule
+	// capable of matching sandbox traffic precedes the vmd security block:
+	// relative order among our own rules is not enough when a foreign
+	// `-i veth+ -j ACCEPT` above them would bypass the drops yet leave their
+	// relative order intact.
+	headGuarded map[string]bool
 }
 
 // hostFWSpecFor builds the specification from the same parameters
@@ -87,12 +93,26 @@ func hostFWSpecFor(hostIface string, httpProxyPort, tlsProxyPort, dnsRedirectPor
 	}
 
 	if manageOwnedChains {
+		spec.headGuarded = map[string]bool{"filter/FORWARD": true, "nat/PREROUTING": true}
 		spec.ownedChains = map[string][]fwRule{}
 		var drops []fwRule
 		dropPorts := blockedPorts
 		if dnsRedirectPort > 0 {
 			dropPorts = append(append([]uint16(nil), blockedPorts...), 853)
 		}
+		// Deduplicate, preserving first-occurrence order: the installer's
+		// AppendUnique collapses duplicates (853 configured AND implied by the
+		// DNS redirect, or a doubled config entry), so a spec that kept them
+		// could never verify post-install.
+		seen := map[uint16]bool{}
+		uniq := dropPorts[:0:0]
+		for _, p := range dropPorts {
+			if !seen[p] {
+				seen[p] = true
+				uniq = append(uniq, p)
+			}
+		}
+		dropPorts = uniq
 		for _, port := range dropPorts {
 			for _, proto := range []string{"tcp", "udp"} {
 				drops = append(drops, fwRule{"filter", portDropChain, []string{"-p", proto, "--dport", fmt.Sprintf("%d", port), "-j", "DROP"}})
@@ -135,10 +155,10 @@ func canonicalRule(args []string) (groups []string, ok bool) {
 			a = "--to-port"
 		}
 		n, known := ruleArity[a]
-		if !known || i+n >= len(args)+1 && n > 0 {
+		if !known {
 			return nil, false
 		}
-		if i+n > len(args) {
+		if i+n >= len(args) && n > 0 { // operand(s) missing
 			return nil, false
 		}
 		vals := args[i+1 : i+1+n]
@@ -221,9 +241,84 @@ func parseIPTablesSave(out string) (*parsedDump, error) {
 // the spec rules' relative order must equal the canonical order; unrelated
 // rules are ignored. Owned chains: contents must equal the spec exactly, in
 // order, with nothing extra.
+// ruleCannotMatchSandboxIngress conservatively decides whether a foreign rule
+// positioned above the vmd security block is provably unable to match sandbox
+// (veth) traffic: it must carry a non-negated explicit input interface whose
+// pattern cannot cover a veth device. Anything else — no -i at all, a
+// negation, a veth-covering prefix wildcard, unparseable shapes — reads as
+// capable, which at worst costs a repair pass, never a bypass.
+func ruleCannotMatchSandboxIngress(tokens []string) bool {
+	for i, t := range tokens {
+		if t != "-i" {
+			continue
+		}
+		if i > 0 && tokens[i-1] == "!" {
+			return false // "everything except X" matches veth
+		}
+		if i+1 >= len(tokens) {
+			return false
+		}
+		v := tokens[i+1]
+		if strings.HasPrefix(v, "veth") {
+			return false
+		}
+		if strings.HasSuffix(v, "+") && strings.HasPrefix("veth", strings.TrimSuffix(v, "+")) {
+			return false // e.g. "v+" or "+" covers veth devices
+		}
+		return true
+	}
+	return false // no input-interface constraint: can match anything
+}
+
+// securityRule reports whether a spec rule is enforcement (a drop, an owned-
+// chain jump, or a PREROUTING redirect) as opposed to plumbing a foreign rule
+// may harmlessly shadow (ACCEPTs, the MSS clamp).
+func securityRule(key string, w fwRule) bool {
+	if key == "nat/PREROUTING" {
+		return true // every vmd PREROUTING rule steers traffic into enforcement
+	}
+	last := w.args[len(w.args)-1]
+	return last == "DROP" || last == portDropChain
+}
+
 func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, detail string) {
 	for key, want := range spec.sharedOrdered {
 		got := d.rules[key]
+		// Head guard: no foreign rule capable of matching sandbox traffic may
+		// sit above (or interleave) the vmd security rules — relative order
+		// among our own rules alone would still verify with a foreign
+		// `-i veth+ -j ACCEPT` above the drops. The guarded region extends
+		// through our LAST security rule (drops/jumps/redirects); foreign
+		// rules below that only shadow our own ACCEPTs/clamp, which drops have
+		// already run ahead of.
+		if spec.headGuarded[key] {
+			guardEnd := -1 // index in got of our last security rule
+			for _, w := range want {
+				if !securityRule(key, w) {
+					continue
+				}
+				for i, g := range got {
+					if ruleEqual(w.args, g) && i > guardEnd {
+						guardEnd = i
+					}
+				}
+			}
+			for i := 0; i < len(got); i++ {
+				if guardEnd != -1 && i >= guardEnd {
+					break
+				}
+				isOurs := false
+				for _, w := range want {
+					if ruleEqual(w.args, got[i]) {
+						isOurs = true
+						break
+					}
+				}
+				if !isOurs && !ruleCannotMatchSandboxIngress(got[i]) {
+					return false, "preceded", key + ": " + strings.Join(got[i], " ")
+				}
+			}
+		}
 		lastIdx := -1
 		for _, w := range want {
 			found := -1

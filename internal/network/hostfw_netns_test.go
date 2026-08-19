@@ -9,6 +9,7 @@ package network
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -16,11 +17,37 @@ import (
 	"github.com/rs/zerolog"
 )
 
-func requireIPTables(t *testing.T) {
+// requireIsolatedIPTables re-execs the test inside a fresh network namespace
+// (unshare -n) so it can never touch the machine's real firewall; the child
+// runs with the env marker set and does the actual work. Skips where the
+// namespace or iptables is unavailable. HOSTFW_DESTRUCTIVE_TEST=1 opts out of
+// isolation for environments (a disposable container) where unshare is
+// unavailable but mutating the namespace is acceptable.
+func requireIsolatedIPTables(t *testing.T) {
 	t.Helper()
-	if err := exec.Command("iptables", "-w", "1", "-L", "-n").Run(); err != nil {
-		t.Skipf("iptables unavailable (need root+NET_ADMIN): %v", err)
+	if os.Getenv("HOSTFW_TEST_IN_NETNS") == "1" || os.Getenv("HOSTFW_DESTRUCTIVE_TEST") == "1" {
+		if err := exec.Command("iptables", "-w", "1", "-L", "-n").Run(); err != nil {
+			t.Skipf("iptables unavailable (need root+NET_ADMIN): %v", err)
+		}
+		return
 	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skipf("cannot resolve test binary: %v", err)
+	}
+	cmd := exec.Command("unshare", "-n", exe, "-test.run", "^"+t.Name()+"$", "-test.v")
+	cmd.Env = append(os.Environ(), "HOSTFW_TEST_IN_NETNS=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "unavailable") || strings.Contains(string(out), "Operation not permitted") {
+			t.Skipf("cannot isolate a network namespace: %v: %s", err, out)
+		}
+		t.Fatalf("isolated run failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "PASS") {
+		t.Fatalf("isolated run did not pass:\n%s", out)
+	}
+	t.SkipNow() // work happened in the isolated child
 }
 
 func ipt(t *testing.T, args ...string) {
@@ -52,7 +79,7 @@ func verifyNow(t *testing.T) (bool, string) {
 }
 
 func TestRealInstallDumpVerifyRoundTrip(t *testing.T) {
-	requireIPTables(t)
+	requireIsolatedIPTables(t)
 
 	// Fresh install must converge and then verify intact — this is the
 	// normalization ground truth (spec args vs real iptables-save output).
