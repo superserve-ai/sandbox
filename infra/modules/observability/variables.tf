@@ -115,6 +115,13 @@ variable "backup_alerts" {
     # normally well under a minute even on a busy cell, and a 30 minute
     # old head means the drain is stalled or the backlog is growing.
     oldest_pending_age_seconds = optional(number, 1800)
+    # Sustained window for the backlog-age condition. 15 minutes is enough
+    # margin for a cell whose pause arrivals are roughly steady; a cell
+    # whose traffic arrives in scheduled batches (a scheduler firing many
+    # sandboxes' work at once) can legitimately push the queue past the
+    # threshold for longer while it drains a single batch, so that cell's
+    # override should exceed the batch's expected drain time.
+    oldest_pending_age_duration = optional(string, "900s")
     # p99 of the synchronous pause-RPC backup hook. The hook is bounded
     # by design to a marker write, an O(dirtied-bytes) staging copy, and
     # a tens-of-KB vmstate hash: tens to low hundreds of ms. A
