@@ -518,6 +518,8 @@ type Sandbox struct {
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
+	// True once any secret binding has existed for this sandbox; false when the sandbox was created without one; NULL for rows predating the column. Never cleared — a detached or failure-cleared binding may still have had a JWT minted against it. Destroy revokes unless this is false.
+	HadSecretBindings *bool `json:"had_secret_bindings"`
 }
 
 type SandboxActiveInterval struct {

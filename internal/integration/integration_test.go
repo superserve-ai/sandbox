@@ -4802,13 +4802,15 @@ func TestIntegration_DeleteSandbox_Success(t *testing.T) {
 		t.Fatal("expected sandbox to be gone after delete")
 	}
 
-	// The revocation row is written in the same statement as the soft-delete.
+	// This sandbox never had a secret binding, so no JWT was minted and destroy
+	// writes no revocation — see TestIntegration_DestroyRevokesOnlySecretsSandboxes
+	// for both directions of that gate.
 	var revoked int
 	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_revocation WHERE sandbox_id = $1`, sandboxID).Scan(&revoked); err != nil {
 		t.Fatalf("revocation query: %v", err)
 	}
-	if revoked != 1 {
-		t.Errorf("sandbox_revocation rows = %d, want 1", revoked)
+	if revoked != 0 {
+		t.Errorf("sandbox_revocation rows = %d, want 0 for a sandbox that never had secrets", revoked)
 	}
 }
 
