@@ -30,11 +30,15 @@ COMMENT ON COLUMN sandbox.had_secret_bindings IS
 -- deploy, a rolled-back revision, or manual SQL. An application-side stamp would
 -- be a convention only the current code follows, and a binding written without
 -- it would let destroy skip the revocation for a credential that was issued.
+-- Statement-level over a transition table, not per row: a create with secrets
+-- writes up to the binding cap in one statement, and a per-row trigger would
+-- probe the parent once per binding inside the synchronous create.
 CREATE OR REPLACE FUNCTION sandbox_mark_secret_bound() RETURNS trigger
     LANGUAGE plpgsql AS $$
 BEGIN
-  UPDATE sandbox SET had_secret_bindings = true
-  WHERE id = NEW.sandbox_id AND had_secret_bindings IS DISTINCT FROM true;
+  UPDATE sandbox s SET had_secret_bindings = true
+  WHERE s.id IN (SELECT DISTINCT i.sandbox_id FROM inserted i)
+    AND s.had_secret_bindings IS DISTINCT FROM true;
   RETURN NULL;
 END;
 $$;
@@ -42,6 +46,7 @@ $$;
 DROP TRIGGER IF EXISTS sandbox_secret_marks_bound ON sandbox_secret;
 CREATE TRIGGER sandbox_secret_marks_bound
     AFTER INSERT ON sandbox_secret
-    FOR EACH ROW EXECUTE FUNCTION sandbox_mark_secret_bound();
+    REFERENCING NEW TABLE AS inserted
+    FOR EACH STATEMENT EXECUTE FUNCTION sandbox_mark_secret_bound();
 
 COMMIT;
