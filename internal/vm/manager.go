@@ -1688,7 +1688,8 @@ func fileExists(path string) bool {
 func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string, networkRules *sandboxNetworkRules) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
-	var tSlot, tVerify, tVerifyDone, tFcStart, tFcDone, tRestore, tRestoreDone time.Time
+	var tSlot, tVerify, tFcStart, tFcDone, tRestore, tRestoreDone time.Time
+	var verifyDur time.Duration
 	needsNetworkCleanup := false
 	defer func() {
 		if needsNetworkCleanup {
@@ -1702,20 +1703,22 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// Registered after the network-cleanup defer so it runs BEFORE
 	// TeardownVM: the elapsed-time fallbacks must not absorb teardown.
 	defer func() {
-		if tSlot.IsZero() && tVerify.IsZero() {
+		if !tVerify.IsZero() {
+			// Died mid-probe; count the elapsed verification time.
+			verifyDur += time.Since(tVerify)
+		}
+		if tSlot.IsZero() && verifyDur == 0 {
 			return
 		}
 		phases := map[string]time.Duration{
 			"total": time.Since(tEntry),
 		}
-		// Pre-slot adoption verification (up to the boxd probe window) is
-		// real resume work; a slow adopted retry must not vanish.
-		if !tVerify.IsZero() {
-			if !tVerifyDone.IsZero() {
-				phases["verify"] = tVerifyDone.Sub(tVerify)
-			} else {
-				phases["verify"] = time.Since(tVerify)
-			}
+		// Synchronous readiness verification — the pre-slot adoption gate
+		// and the post-restore gate for relaunched unverified records — is
+		// real resume work (each a bounded multi-second wait); a slow probe
+		// must not vanish from the distributions.
+		if verifyDur > 0 {
+			phases["verify"] = verifyDur
 		}
 		if tSlot.IsZero() {
 			m.recordPhases("resume", "", phases)
@@ -1778,7 +1781,8 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// gate restore adoption uses; success heals the marker durably.
 		tVerify = time.Now()
 		verr := m.verifyBoxdReady(ctx, existing.IP)
-		tVerifyDone = time.Now()
+		verifyDur += time.Since(tVerify)
+		tVerify = time.Time{}
 		if verr != nil {
 			// A genuine verdict (see verifyBoxdReady): the record is a corpse.
 			// Record it before relaunching: the relaunch can still fail a
@@ -1964,7 +1968,11 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// (detached probe below). The guest was just relaunched from its
 		// snapshot, so this teardown discards nothing of value — but only a
 		// GENUINE verdict may reach it; see verifyBoxdReady.
-		if verr := m.verifyBoxdReady(ctx, netInfo.HostIP); verr != nil {
+		tVerify = time.Now()
+		verr := m.verifyBoxdReady(ctx, netInfo.HostIP)
+		verifyDur += time.Since(tVerify)
+		tVerify = time.Time{}
+		if verr != nil {
 			m.stopUnitDuringRestoreError(vmID)
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("boxd not ready after relaunch of unverified vm %s: %w", vmID, verr)
@@ -2468,7 +2476,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// adopting — a bounded WAIT, not a single probe, so a warming VM
 			// passes. Verified records adopt without this gate: readiness was
 			// proven once, and a wedged boxd here must not demote a live VM.
-			if err := m.verifyBoxdReady(ctx, existing.IP); err != nil {
+			tVerify := time.Now()
+			err := m.verifyBoxdReady(ctx, existing.IP)
+			// Emitted here, success and failure alike: this branch returns
+			// before the phase defer below is registered, and a crash-window
+			// adoption can wait out the whole probe budget.
+			m.recordPhases("restore", "", map[string]time.Duration{"verify": time.Since(tVerify)})
+			if err != nil {
 				// A destroy racing the wait is the one thing that says nothing
 				// about the VM; match the sibling destroyed-paths.
 				m.mu.RLock()
