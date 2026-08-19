@@ -255,7 +255,7 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[22].(**int32) = s.AutoDeleteSeconds
 		*dest[23].(*pgtype.Timestamptz) = s.AutoDeleteAt
 		*dest[24].(*pgtype.Timestamptz) = s.FailedAt
-		*dest[25].(*bool) = s.HadSecretBindings
+		*dest[25].(**bool) = s.HadSecretBindings
 		if len(dest) == 27 {
 			// GetSandboxWithPreviewPolicy: trailing COALESCE'd effective access.
 			*dest[26].(*string) = "legacy_public"

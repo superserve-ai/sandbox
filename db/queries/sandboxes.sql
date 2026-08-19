@@ -10,8 +10,8 @@
 -- can observe a new sandbox through the rolling-deploy legacy fallback, and
 -- quota admission remains statement-sized.
 WITH ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, had_secret_bindings)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, false)
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -33,8 +33,8 @@ WITH tpl AS (
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
+  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false FROM tpl
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -268,8 +268,10 @@ WITH destroyed AS (
 revoked AS (
   -- Only sandboxes that ever had a binding: the proxy consults this set only
   -- after a secrets JWT authenticates, and a JWT is minted only for those.
+  -- IS NOT FALSE, so rows predating the column (NULL, history unknown) still
+  -- revoke.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
-  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed WHERE had_secret_bindings
+  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed WHERE had_secret_bindings IS NOT FALSE
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -923,7 +925,7 @@ destroyed AS (
 revoked AS (
   -- Gated as in DestroySandbox; see the note there.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
-  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed WHERE had_secret_bindings
+  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed WHERE had_secret_bindings IS NOT FALSE
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (

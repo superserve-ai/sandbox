@@ -58,6 +58,18 @@ func TestIntegration_DestroyRevokesOnlySecretsSandboxes(t *testing.T) {
 	if !revocationExists(t, bound) {
 		t.Error("sandbox that had a binding was NOT revoked; a leaked JWT would stay valid")
 	}
+
+	// NULL is a row predating the column: binding history is unknowable, so it
+	// must still revoke. Guessing "no" would leave a leaked JWT valid.
+	legacy := insertSandboxAt(t, teamID, "legacy-"+uuid.New().String()[:8], "active", time.Now())
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET had_secret_bindings = NULL WHERE id = $1`, legacy); err != nil {
+		t.Fatalf("clear marker: %v", err)
+	}
+	destroy(t, teamID, legacy)
+	if !revocationExists(t, legacy) {
+		t.Error("pre-column sandbox was NOT revoked; unknown history must revoke conservatively")
+	}
 }
 
 // The marker must survive the binding going away. Detach clears the row, and the

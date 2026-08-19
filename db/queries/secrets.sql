@@ -71,7 +71,7 @@ WITH bound AS (
   VALUES (sqlc.arg(sandbox_id), sqlc.arg(secret_id), sqlc.arg(env_key), sqlc.narg(proxy_token))
 )
 UPDATE sandbox SET had_secret_bindings = true
-WHERE id = sqlc.arg(sandbox_id) AND NOT had_secret_bindings;
+WHERE id = sqlc.arg(sandbox_id) AND had_secret_bindings IS DISTINCT FROM true;
 
 -- name: ClaimSandboxSecretProxyToken :one
 -- Persist a proxy token minted on the fly for a legacy (NULL-token) binding.

@@ -162,7 +162,7 @@ type BeginPauseRow struct {
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
-	HadSecretBindings bool               `json:"had_secret_bindings"`
+	HadSecretBindings *bool              `json:"had_secret_bindings"`
 }
 
 // Atomic ownership + state check + transition to 'pausing' AND close of any
@@ -282,7 +282,7 @@ destroyed AS (
 revoked AS (
   -- Gated as in DestroySandbox; see the note there.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
-  SELECT id, $2 FROM destroyed WHERE had_secret_bindings
+  SELECT id, $2 FROM destroyed WHERE had_secret_bindings IS NOT FALSE
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -590,8 +590,8 @@ func (q *Queries) CountSandboxesByTeamPaged(ctx context.Context, arg CountSandbo
 
 const createSandbox = `-- name: CreateSandbox :one
 WITH ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, had_secret_bindings)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, false)
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -650,7 +650,7 @@ type CreateSandboxRow struct {
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
-	HadSecretBindings bool               `json:"had_secret_bindings"`
+	HadSecretBindings *bool              `json:"had_secret_bindings"`
 }
 
 // ID is supplied by the caller (generated in Go via uuid.New()) rather
@@ -725,8 +725,8 @@ WITH tpl AS (
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
+  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false FROM tpl
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -787,7 +787,7 @@ type CreateSandboxFromTemplateRow struct {
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
-	HadSecretBindings bool               `json:"had_secret_bindings"`
+	HadSecretBindings *bool              `json:"had_secret_bindings"`
 }
 
 // CreateSandbox variant that holds FOR KEY SHARE on the template row
@@ -927,7 +927,7 @@ type CreateSandboxFromTemplateWithSecretsRow struct {
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
-	HadSecretBindings bool               `json:"had_secret_bindings"`
+	HadSecretBindings *bool              `json:"had_secret_bindings"`
 }
 
 // CreateSandboxFromTemplate plus secret bindings in one statement (see
@@ -1061,7 +1061,7 @@ type CreateSandboxWithSecretsRow struct {
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
-	HadSecretBindings bool               `json:"had_secret_bindings"`
+	HadSecretBindings *bool              `json:"had_secret_bindings"`
 }
 
 // CreateSandbox plus its strict preview policy and secret bindings in ONE
@@ -1142,8 +1142,10 @@ WITH destroyed AS (
 revoked AS (
   -- Only sandboxes that ever had a binding: the proxy consults this set only
   -- after a secrets JWT authenticates, and a JWT is minted only for those.
+  -- IS NOT FALSE, so rows predating the column (NULL, history unknown) still
+  -- revoke.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
-  SELECT id, $4 FROM destroyed WHERE had_secret_bindings
+  SELECT id, $4 FROM destroyed WHERE had_secret_bindings IS NOT FALSE
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (

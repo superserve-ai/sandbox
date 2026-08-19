@@ -19,7 +19,7 @@ WITH bound AS (
   VALUES ($1, $2, $3, $4)
 )
 UPDATE sandbox SET had_secret_bindings = true
-WHERE id = $1 AND NOT had_secret_bindings
+WHERE id = $1 AND had_secret_bindings IS DISTINCT FROM true
 `
 
 type AddSandboxSecretParams struct {

@@ -3,25 +3,26 @@
 -- sandboxes with secret bindings — so most entries revoke a credential that was
 -- never issued and then sit for the 90-day JWT lifetime. Destroy now gates on
 -- this marker.
+--
+-- Nullable with no default, and no backfill: NULL means the row predates the
+-- marker, where binding history cannot be reconstructed (the mark-failed paths
+-- clear bindings without leaving a revoked_proxy_token). Destroy treats NULL as
+-- "may have had a credential" and still revokes, so no existing sandbox loses
+-- its revocation. Both properties matter: guessing would leave a leaked JWT
+-- valid, and a backfilling UPDATE would hold this statement's ACCESS EXCLUSIVE
+-- lock across the whole table.
 
 BEGIN;
 
 SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE sandbox
-    ADD COLUMN IF NOT EXISTS had_secret_bindings boolean NOT NULL DEFAULT false;
+    ADD COLUMN IF NOT EXISTS had_secret_bindings boolean;
 
 COMMENT ON COLUMN sandbox.had_secret_bindings IS
-    'True once any secret binding has existed for this sandbox. Never cleared: '
-    'a detached or failure-cleared binding may still have had a JWT minted '
-    'against it, and destroy gates revocation on this column.';
-
--- Backfill, or an already-bound sandbox would destroy without a revocation.
--- Detached bindings are caught via revoked_proxy_token, which a detach writes.
-UPDATE sandbox s
-SET had_secret_bindings = true
-WHERE NOT s.had_secret_bindings
-  AND (EXISTS (SELECT 1 FROM sandbox_secret ss WHERE ss.sandbox_id = s.id)
-       OR EXISTS (SELECT 1 FROM revoked_proxy_token rt WHERE rt.sandbox_id = s.id));
+    'True once any secret binding has existed for this sandbox; false when the '
+    'sandbox was created without one; NULL for rows predating the column. Never '
+    'cleared — a detached or failure-cleared binding may still have had a JWT '
+    'minted against it. Destroy revokes unless this is false.';
 
 COMMIT;
