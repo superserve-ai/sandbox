@@ -1007,3 +1007,73 @@ func TestVerifyGuardsClampFromPrecedingTerminalAccept(t *testing.T) {
 		}
 	})
 }
+
+func TestUnmarkedAcceptTwinAboveDropsFlags(t *testing.T) {
+	// An ACCEPT twin is terminal: above the drops it is a bypass exactly like
+	// a foreign ACCEPT — it must flag, repair must converge by heading the
+	// security block above it, and the twin itself must survive.
+	spec := testSpec(true)
+	twin := []string{"-i", "veth+", "-o", "eth0", "-j", "ACCEPT"} // unmarked
+	rules, chains := specKernel(spec, nil)
+	rules["filter/FORWARD"] = append([][]string{twin}, rules["filter/FORWARD"]...)
+
+	if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "preceded" {
+		t.Fatalf("ok=%v class=%s, want preceded", ok, class)
+	}
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+		t.Fatalf("post-repair verify failed: %s %s", class, detail)
+	}
+	found := false
+	for _, r := range k.rules["filter/FORWARD"] {
+		if ruleEqual(r, twin) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("accept twin deleted — twins must survive repair")
+	}
+}
+
+func TestPostLockReverifySkipsInstall(t *testing.T) {
+	// Writers queued on the lock must re-verify after acquiring it: if the
+	// first holder converged the ruleset, the waiters skip the installer.
+	origLock := hostFirewallLockPath
+	hostFirewallLockPath = t.TempDir() + "/hostfw.lock"
+	defer func() { hostFirewallLockPath = origLock }()
+
+	spec := testSpec(true)
+	good, chains := specKernel(spec, nil)
+	goodDump := renderDump(good, chains)
+	bad, _ := specKernel(spec, nil)
+	bad["filter/FORWARD"] = bad["filter/FORWARD"][1:] // missing rule
+	badDump := renderDump(bad, chains)
+
+	calls := 0
+	origDump := dumpIPTables
+	dumpIPTables = func(context.Context) (string, error) {
+		calls++
+		if calls == 1 {
+			return badDump, nil // pre-lock fast path: mismatch
+		}
+		return goodDump, nil // post-lock: another writer converged it
+	}
+	defer func() { dumpIPTables = origDump }()
+	origInstall := installHostFirewallFn
+	installHostFirewallFn = func(string, uint16, uint16, uint16, string, uint16, []uint16, bool, zerolog.Logger) error {
+		t.Fatal("installer ran despite post-lock convergence")
+		return nil
+	}
+	defer func() { installHostFirewallFn = origInstall }()
+
+	iface, hp, tp, dp, sd, sp, bp := testSpecParams()
+	if err := ensureHostFirewall(context.Background(), iface, hp, tp, dp, sd, sp, bp, true, zerolog.Nop()); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+}

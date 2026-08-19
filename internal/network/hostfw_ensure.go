@@ -62,6 +62,18 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	}
 	defer unlock()
 
+	// Another cooperating writer may have converged the ruleset while this
+	// process waited on the lock — re-verify before paying for the installer
+	// and its mutations.
+	if out, err := dumpIPTables(ctx); err == nil {
+		if d, perr := parseIPTablesSave(out); perr == nil {
+			if ok, _, _ := verifyHostFirewall(d, spec); ok {
+				log.Info().Msg("host firewall converged by a concurrent writer while waiting — install skipped")
+				return nil
+			}
+		}
+	}
+
 	// Slow path: the installer, byte-for-byte today's behavior.
 	tRepair := time.Now()
 	if err := installHostFirewallFn(hostIface, httpProxyPort, tlsProxyPort, dnsRedirectPort, secretsProxyDst, secretsProxyPort, blockedPorts, manageOwnedChains, log); err != nil {

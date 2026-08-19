@@ -535,8 +535,15 @@ func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, 
 						break
 					}
 				}
-				if isOurs || unmarkedTwin(got[i], want) || ruleCannotMatchSandboxIngress(got[i]) {
-					continue // twins enforce exactly what the marked rule does
+				// Twins are preserved and usually tolerated — a drop/redirect/
+				// clamp twin enforces the same thing anywhere. But an ACCEPT
+				// twin is TERMINAL: above the drops it is a bypass exactly like
+				// a foreign ACCEPT, so permissive twins fall through to
+				// classification (repair converges by heading the security
+				// block above them; the twin itself is still never deleted).
+				twin := unmarkedTwin(got[i], want)
+				if isOurs || (twin && foreignDisposition(got[i]) != "permissive") || ruleCannotMatchSandboxIngress(got[i]) {
+					continue
 				}
 				inSecurityZone := guardEnd == -1 || i < guardEnd
 				switch foreignDisposition(got[i]) {
