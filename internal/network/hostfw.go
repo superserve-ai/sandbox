@@ -69,7 +69,7 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 	// UDP/443 DROP must precede the veth+ ACCEPT below so QUIC traffic
 	// (which would bypass the SNI allowlist) is dropped before the broad
 	// ACCEPT terminates the chain walk. This rule is static.
-	udpDrop := []string{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP"}
+	udpDrop := marked("-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP")
 	exists, err := ipt.Exists("filter", "FORWARD", udpDrop...)
 	if err != nil {
 		return fmt.Errorf("check veth+ UDP/443 DROP: %w", err)
@@ -109,7 +109,7 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 				}
 			}
 		}
-		portJump := []string{"-i", "veth+", "-j", portDropChain}
+		portJump := marked("-i", "veth+", "-j", portDropChain)
 		exists, err = ipt.Exists("filter", "FORWARD", portJump...)
 		if err != nil {
 			return fmt.Errorf("check %s jump: %w", portDropChain, err)
@@ -132,7 +132,7 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 				return fmt.Errorf("add DNS redirect to %s: %w", dnsRedirectChain, err)
 			}
 		}
-		dnsJump := []string{"-i", "veth+", "-j", dnsRedirectChain}
+		dnsJump := marked("-i", "veth+", "-j", dnsRedirectChain)
 		exists, err = ipt.Exists("nat", "PREROUTING", dnsJump...)
 		if err != nil {
 			return fmt.Errorf("check %s jump: %w", dnsRedirectChain, err)
@@ -144,11 +144,11 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 		}
 	}
 
-	if err := ipt.AppendUnique("filter", "FORWARD",
+	if err := ipt.AppendUnique("filter", "FORWARD", marked(
 		"-o", hostIface,
 		"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
 		"-j", "TCPMSS", "--clamp-mss-to-pmtu",
-	); err != nil {
+	)...); err != nil {
 		return fmt.Errorf("add MSS clamp: %w", err)
 	}
 
@@ -157,17 +157,17 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 		args         []string
 	}
 	rules := []rule{
-		{"filter", "FORWARD", []string{"-i", "veth+", "-o", hostIface, "-j", "ACCEPT"}},
-		{"filter", "FORWARD", []string{"-i", hostIface, "-o", "veth+", "-j", "ACCEPT"}},
-		{"nat", "POSTROUTING", []string{"-s", vmIPRange, "-o", hostIface, "-j", "MASQUERADE"}},
+		{"filter", "FORWARD", marked("-i", "veth+", "-o", hostIface, "-j", "ACCEPT")},
+		{"filter", "FORWARD", marked("-i", hostIface, "-o", "veth+", "-j", "ACCEPT")},
+		{"nat", "POSTROUTING", marked("-s", vmIPRange, "-o", hostIface, "-j", "MASQUERADE")},
 	}
 	if httpProxyPort > 0 {
 		rules = append(rules, rule{"nat", "PREROUTING",
-			[]string{"-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", httpProxyPort)}})
+			marked("-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", httpProxyPort))})
 	}
 	if tlsProxyPort > 0 {
 		rules = append(rules, rule{"nat", "PREROUTING",
-			[]string{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", tlsProxyPort)}})
+			marked("-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", tlsProxyPort))})
 	}
 	if secretsProxyPort > 0 {
 		if ip := net.ParseIP(secretsProxyDst); ip == nil || ip.To4() == nil {
@@ -175,8 +175,8 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 		}
 		// -d narrows the match so we don't intercept unrelated dport-9443 traffic.
 		rules = append(rules, rule{"nat", "PREROUTING",
-			[]string{"-i", "veth+", "-p", "tcp", "-d", secretsProxyDst, "--dport", fmt.Sprintf("%d", secretsProxyPort),
-				"-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", secretsProxyPort)}})
+			marked("-i", "veth+", "-p", "tcp", "-d", secretsProxyDst, "--dport", fmt.Sprintf("%d", secretsProxyPort),
+				"-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", secretsProxyPort))})
 	}
 	for _, r := range rules {
 		if err := ipt.AppendUnique(r.table, r.chain, r.args...); err != nil {

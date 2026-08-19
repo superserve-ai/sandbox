@@ -155,8 +155,8 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 					break
 				}
 			}
-			if !isOurs && staleManagedRule(key, g) {
-				staleLines = append(staleLines, "-D "+chain+" "+strings.Join(g, " "))
+			if !isOurs && staleManagedRule(g, want) {
+				staleLines = append(staleLines, "-D "+chain+" "+emitRuleTokens(g))
 			}
 		}
 		// PREROUTING's head-inserted rules are TERMINAL redirects: re-inserting
@@ -186,7 +186,7 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 						break
 					}
 				}
-				if !isOurs && !staleManagedRule(key, g) && !ruleCannotMatchSandboxIngress(g) && foreignDisposition(g) == "strict" {
+				if !isOurs && !staleManagedRule(g, want) && !ruleCannotMatchSandboxIngress(g) && foreignDisposition(g) == "strict" {
 					return fmt.Errorf("stricter foreign rule above a vmd redirect in %s (%s) — refusing to reorder past it", key, strings.Join(g, " "))
 				}
 			}
@@ -195,7 +195,7 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 		for _, w := range want {
 			for _, g := range got {
 				if ruleEqual(w.args, g) {
-					lines = append(lines, "-D "+chain+" "+strings.Join(w.args, " "))
+					lines = append(lines, "-D "+chain+" "+emitRuleTokens(w.args))
 				}
 			}
 		}
@@ -204,9 +204,9 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 		for _, w := range want {
 			if headRule(key, w) {
 				headPos++
-				lines = append(lines, fmt.Sprintf("-I %s %d %s", chain, headPos, strings.Join(w.args, " ")))
+				lines = append(lines, fmt.Sprintf("-I %s %d %s", chain, headPos, emitRuleTokens(w.args)))
 			} else {
-				tail = append(tail, "-A "+chain+" "+strings.Join(w.args, " "))
+				tail = append(tail, "-A "+chain+" "+emitRuleTokens(w.args))
 			}
 		}
 		lines = append(lines, tail...)

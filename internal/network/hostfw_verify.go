@@ -47,6 +47,16 @@ type hostFWSpec struct {
 	headGuarded map[string]bool
 }
 
+// vmdRuleMarker is the explicit ownership marker every vmd rule in a SHARED
+// chain carries (owned chains need none — the whole chain is vmd's). Stale
+// reconciliation keys on this marker, never on rule shape, so an operator
+// rule can never be mistaken for a stale vmd rule.
+const vmdRuleMarker = "vmd-managed"
+
+var vmdMarkerArgs = []string{"-m", "comment", "--comment", vmdRuleMarker}
+
+func marked(args ...string) []string { return append(args, vmdMarkerArgs...) }
+
 // hostFWSpecFor builds the specification from the same parameters
 // installHostFirewall receives. The rule args here must stay in lockstep with
 // the installer; the round-trip test (install → dump → verify) enforces that.
@@ -59,13 +69,13 @@ func hostFWSpecFor(hostIface string, httpProxyPort, tlsProxyPort, dnsRedirectPor
 	// outbound SYNs are accepted before clamping.
 	fwd := []fwRule{}
 	if manageOwnedChains {
-		fwd = append(fwd, fwRule{"filter", "FORWARD", []string{"-i", "veth+", "-j", portDropChain}})
+		fwd = append(fwd, fwRule{"filter", "FORWARD", marked("-i", "veth+", "-j", portDropChain)})
 	}
 	fwd = append(fwd,
-		fwRule{"filter", "FORWARD", []string{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP"}},
-		fwRule{"filter", "FORWARD", []string{"-o", hostIface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"}},
-		fwRule{"filter", "FORWARD", []string{"-i", "veth+", "-o", hostIface, "-j", "ACCEPT"}},
-		fwRule{"filter", "FORWARD", []string{"-i", hostIface, "-o", "veth+", "-j", "ACCEPT"}},
+		fwRule{"filter", "FORWARD", marked("-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP")},
+		fwRule{"filter", "FORWARD", marked("-o", hostIface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu")},
+		fwRule{"filter", "FORWARD", marked("-i", "veth+", "-o", hostIface, "-j", "ACCEPT")},
+		fwRule{"filter", "FORWARD", marked("-i", hostIface, "-o", "veth+", "-j", "ACCEPT")},
 	)
 	spec.sharedOrdered["filter/FORWARD"] = fwd
 
@@ -75,21 +85,21 @@ func hostFWSpecFor(hostIface string, httpProxyPort, tlsProxyPort, dnsRedirectPor
 	// collision.
 	pre := []fwRule{}
 	if manageOwnedChains {
-		pre = append(pre, fwRule{"nat", "PREROUTING", []string{"-i", "veth+", "-j", dnsRedirectChain}})
+		pre = append(pre, fwRule{"nat", "PREROUTING", marked("-i", "veth+", "-j", dnsRedirectChain)})
 	}
 	if httpProxyPort > 0 {
-		pre = append(pre, fwRule{"nat", "PREROUTING", []string{"-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", httpProxyPort)}})
+		pre = append(pre, fwRule{"nat", "PREROUTING", marked("-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", httpProxyPort))})
 	}
 	if tlsProxyPort > 0 {
-		pre = append(pre, fwRule{"nat", "PREROUTING", []string{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", tlsProxyPort)}})
+		pre = append(pre, fwRule{"nat", "PREROUTING", marked("-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", tlsProxyPort))})
 	}
 	if secretsProxyPort > 0 && net.ParseIP(secretsProxyDst) != nil {
-		pre = append(pre, fwRule{"nat", "PREROUTING", []string{"-i", "veth+", "-p", "tcp", "-d", secretsProxyDst, "--dport", fmt.Sprintf("%d", secretsProxyPort), "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", secretsProxyPort)}})
+		pre = append(pre, fwRule{"nat", "PREROUTING", marked("-i", "veth+", "-p", "tcp", "-d", secretsProxyDst, "--dport", fmt.Sprintf("%d", secretsProxyPort), "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", secretsProxyPort))})
 	}
 	spec.sharedOrdered["nat/PREROUTING"] = pre
 
 	spec.sharedOrdered["nat/POSTROUTING"] = []fwRule{
-		{"nat", "POSTROUTING", []string{"-s", vmIPRange, "-o", hostIface, "-j", "MASQUERADE"}},
+		{"nat", "POSTROUTING", marked("-s", vmIPRange, "-o", hostIface, "-j", "MASQUERADE")},
 	}
 
 	if manageOwnedChains {
@@ -134,7 +144,7 @@ func hostFWSpecFor(hostIface string, httpProxyPort, tlsProxyPort, dnsRedirectPor
 // can only ever cause a NON-match (→ slow path), never a false intact.
 var ruleArity = map[string]int{
 	"-i": 1, "-o": 1, "-p": 1, "-s": 1, "-d": 1, "-j": 1,
-	"--dport": 1, "--to-port": 1, "--tcp-flags": 2, "--clamp-mss-to-pmtu": 0,
+	"--dport": 1, "--to-port": 1, "--tcp-flags": 2, "--clamp-mss-to-pmtu": 0, "--comment": 1,
 }
 
 // canonicalRule reduces a rule's arguments to a sorted set of option groups,
@@ -147,7 +157,7 @@ var ruleArity = map[string]int{
 func canonicalRule(args []string) (groups []string, ok bool) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		if a == "-m" && i+1 < len(args) && (args[i+1] == "tcp" || args[i+1] == "udp") {
+		if a == "-m" && i+1 < len(args) && (args[i+1] == "tcp" || args[i+1] == "udp" || args[i+1] == "comment") {
 			i++
 			continue
 		}
@@ -186,6 +196,62 @@ func ruleEqual(specArgs, dumpArgs []string) bool {
 	return true
 }
 
+// splitRuleTokens tokenizes an iptables-save rule line with quote awareness:
+// a double-quoted span (as iptables-save emits for --comment values, with
+// backslash escaping) is ONE token, quotes stripped. Without this, tokens
+// inside a foreign rule's comment string ("audit -j DROP rule") would leak
+// into target classification and could misread a permissive rule as strict.
+// An unbalanced quote is an error — the caller treats it as unparseable.
+func splitRuleTokens(line string) ([]string, error) {
+	var tokens []string
+	var cur strings.Builder
+	inQuote, escaped, started := false, false, false
+	flush := func() {
+		if started {
+			tokens = append(tokens, cur.String())
+			cur.Reset()
+			started = false
+		}
+	}
+	for _, r := range line {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			started = true
+			escaped = false
+		case r == '\\' && inQuote:
+			escaped = true
+		case r == '"':
+			inQuote = !inQuote
+			started = true // an empty quoted string is still a token
+		case (r == ' ' || r == '\t') && !inQuote:
+			flush()
+		default:
+			cur.WriteRune(r)
+			started = true
+		}
+	}
+	if inQuote || escaped {
+		return nil, fmt.Errorf("unbalanced quote")
+	}
+	flush()
+	return tokens, nil
+}
+
+// emitRuleTokens renders tokens back into an iptables-restore argument
+// string, re-quoting any token containing whitespace (comment values).
+func emitRuleTokens(tokens []string) string {
+	parts := make([]string, len(tokens))
+	for i, t := range tokens {
+		if strings.ContainsAny(t, " \t\"") {
+			parts[i] = `"` + strings.ReplaceAll(strings.ReplaceAll(t, `\`, `\\`), `"`, `\"`) + `"`
+		} else {
+			parts[i] = t
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
 // parsedDump is an iptables-save dump reduced to append-order rule lists per
 // "table/chain", plus the set of chains each table declares.
 type parsedDump struct {
@@ -221,7 +287,10 @@ func parseIPTablesSave(out string) (*parsedDump, error) {
 			if table == "" {
 				return nil, fmt.Errorf("rule before table header: %q", line)
 			}
-			fields := strings.Fields(line)
+			fields, err := splitRuleTokens(line)
+			if err != nil {
+				return nil, fmt.Errorf("malformed rule line: %q: %w", line, err)
+			}
 			if len(fields) < 2 {
 				return nil, fmt.Errorf("malformed rule line: %q", line)
 			}
@@ -308,8 +377,18 @@ func securityRule(key string, w fwRule) bool {
 	if key == "nat/PREROUTING" {
 		return true // every vmd PREROUTING rule steers traffic into enforcement
 	}
-	last := w.args[len(w.args)-1]
-	return last == "DROP" || last == portDropChain
+	t := jumpTarget(w.args)
+	return t == "DROP" || t == portDropChain
+}
+
+// jumpTarget returns the -j target of a rule, or "".
+func jumpTarget(args []string) string {
+	for i, a := range args {
+		if a == "-j" && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
 }
 
 // headRule reports whether repair re-inserts a spec rule at the chain head:
@@ -320,38 +399,62 @@ func headRule(key string, w fwRule) bool {
 	if securityRule(key, w) {
 		return true
 	}
-	return w.args[len(w.args)-1] == "--clamp-mss-to-pmtu"
+	return jumpTarget(w.args) == "TCPMSS"
 }
 
-// staleManagedRule reports whether a non-spec dump rule matches one of vmd's
-// own PREROUTING redirect shapes with different parameter values — the
-// previous configuration's rule (secretsproxy address/port or proxy port
-// changed across a restart). These are reconciled (deleted) by repair rather
-// than treated as unrecoverable foreign rules: the shapes are unmistakably
-// vmd's (veth+ ingress REDIRECTs; the secretsproxy form additionally requires
-// dport == to-port, which only vmd generates). Only PREROUTING shapes are
-// recognized — stale variants elsewhere never block startup.
-func staleManagedRule(key string, tokens []string) bool {
-	if key != "nat/PREROUTING" {
-		return false
-	}
+// hasVMDMarker reports whether a dump rule carries vmd's ownership comment.
+func hasVMDMarker(tokens []string) bool {
 	groups, ok := canonicalRule(tokens)
 	if !ok {
 		return false
 	}
-	g := map[string]string{}
-	for _, e := range groups {
-		opt, val, _ := strings.Cut(e, " ")
-		g[opt] = val
+	for _, g := range groups {
+		if g == "--comment "+vmdRuleMarker {
+			return true
+		}
 	}
-	if g["-i"] != "veth+" || g["-p"] != "tcp" || g["-j"] != "REDIRECT" || g["--to-port"] == "" || g["--dport"] == "" {
+	return false
+}
+
+// stripMarkerGroup removes the ownership-comment group from canonical form.
+func stripMarkerGroup(groups []string) []string {
+	out := groups[:0:0]
+	for _, g := range groups {
+		if g != "--comment "+vmdRuleMarker {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// staleManagedRule reports whether a non-spec dump rule is provably a stale
+// vmd rule, by explicit ownership only — never by shape, so an operator rule
+// can never be reconciled away:
+//   - it carries the vmd marker but no longer matches the current spec (a
+//     previous configuration's rule after a supported config change); or
+//   - it equals a current spec rule modulo the marker (the pre-marker
+//     generation of exactly this rule — identical parameters, so deleting it
+//     and keeping the marked twin is behavior-preserving; this is the
+//     one-time upgrade migration).
+func staleManagedRule(tokens []string, want []fwRule) bool {
+	for _, w := range want {
+		if ruleEqual(w.args, tokens) {
+			return false // it IS a current rule
+		}
+	}
+	if hasVMDMarker(tokens) {
+		return true
+	}
+	g, ok := canonicalRule(tokens)
+	if !ok {
 		return false
 	}
-	switch len(groups) {
-	case 5: // http/tls shape: fixed web dport, any to-port
-		return g["--dport"] == "80" || g["--dport"] == "443"
-	case 6: // secretsproxy shape: -d plus the vmd-distinctive dport==to-port
-		return g["-d"] != "" && g["--dport"] == g["--to-port"]
+	bare := strings.Join(stripMarkerGroup(g), "|")
+	for _, w := range want {
+		wg, wok := canonicalRule(w.args)
+		if wok && strings.Join(stripMarkerGroup(wg), "|") == bare {
+			return true
+		}
 	}
 	return false
 }
@@ -371,8 +474,8 @@ func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, 
 					break
 				}
 			}
-			if !isOurs && staleManagedRule(key, g) {
-				return false, "stale-managed", key + ": " + strings.Join(g, " ")
+			if !isOurs && staleManagedRule(g, want) {
+				return false, "stale-managed", key + ": " + emitRuleTokens(g)
 			}
 		}
 		// Head guard: no foreign rule capable of matching sandbox traffic may

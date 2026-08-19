@@ -67,6 +67,11 @@ func saveForm(args []string) []string {
 		if a == "--to-port" {
 			out[len(out)-1] = "--to-ports"
 		}
+		if a == "--comment" && i+1 < len(args) {
+			out = append(out, "\""+args[i+1]+"\"")
+			i++
+			continue
+		}
 		if a == "-d" && i+1 < len(args) && !strings.Contains(args[i+1], "/") {
 			out = append(out, args[i+1]+"/32")
 			i++
@@ -376,7 +381,7 @@ func TestRepairPreservesStricterForeignRulesAbove(t *testing.T) {
 		if ruleEqual(r, strict) {
 			strictIdx = i
 		}
-		if acceptIdx == -1 && ruleEqual(r, []string{"-i", "veth+", "-o", "eth0", "-j", "ACCEPT"}) {
+		if acceptIdx == -1 && ruleEqual(r, marked("-i", "veth+", "-o", "eth0", "-j", "ACCEPT")) {
 			acceptIdx = i
 		}
 	}
@@ -539,18 +544,24 @@ func TestNonOwnerNeverRunsRepair(t *testing.T) {
 
 func TestNormalizeRoundTripShapes(t *testing.T) {
 	spec := testSpec(true)
+	roundTrip := func(key string, w fwRule) {
+		line := "-A X " + strings.Join(saveForm(w.args), " ")
+		tokens, err := splitRuleTokens(line)
+		if err != nil {
+			t.Fatalf("%s rule line unparseable: %v", key, err)
+		}
+		if !ruleEqual(w.args, tokens[2:]) {
+			t.Fatalf("%s rule does not round-trip: %v vs %v", key, w.args, tokens[2:])
+		}
+	}
 	for key, want := range spec.sharedOrdered {
 		for _, w := range want {
-			if !ruleEqual(w.args, saveForm(w.args)) {
-				t.Fatalf("%s rule does not round-trip: %v vs %v", key, w.args, saveForm(w.args))
-			}
+			roundTrip(key, w)
 		}
 	}
 	for key, want := range spec.ownedChains {
 		for _, w := range want {
-			if !ruleEqual(w.args, saveForm(w.args)) {
-				t.Fatalf("%s rule does not round-trip: %v", key, w.args)
-			}
+			roundTrip(key, w)
 		}
 	}
 }
@@ -562,6 +573,7 @@ func FuzzParseIPTablesSave(f *testing.F) {
 	f.Add("*filter\n:FORWARD ACCEPT [0:0]\n-A FORWARD -i veth+ -j DROP\nCOMMIT\n")
 	f.Add("")
 	f.Add("*filter\n-A FORWARD -i\nCOMMIT\n") // truncated operand — must not panic
+	f.Add("*filter\n:FORWARD ACCEPT [0:0]\n-A FORWARD -i veth+ -m comment --comment \"a -j DROP b\" -j ACCEPT\nCOMMIT\n")
 	f.Fuzz(func(t *testing.T, in string) {
 		d, err := parseIPTablesSave(in)
 		if err != nil {
@@ -575,7 +587,7 @@ func FuzzParseIPTablesSave(f *testing.F) {
 			// contain the udp drop in FORWARD.
 			found := false
 			for _, r := range d.rules["filter/FORWARD"] {
-				if ruleEqual(r, []string{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP"}) {
+				if ruleEqual(r, marked("-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP")) {
 					found = true
 				}
 			}
@@ -632,7 +644,7 @@ func TestRepairPreservesInterleavedStrictRule(t *testing.T) {
 		if ruleEqual(r, strict) {
 			strictIdx = i
 		}
-		if acceptIdx == -1 && ruleEqual(r, []string{"-i", "veth+", "-o", "eth0", "-j", "ACCEPT"}) {
+		if acceptIdx == -1 && ruleEqual(r, marked("-i", "veth+", "-o", "eth0", "-j", "ACCEPT")) {
 			acceptIdx = i
 		}
 	}
@@ -782,8 +794,8 @@ func TestStaleManagedRedirectIsReconciledNotFatal(t *testing.T) {
 	// repairable stale-managed mismatch — not preceded-ambiguous — and repair
 	// must delete it while foreign redirects stay untouched.
 	spec := testSpec(true)
-	oldSecrets := []string{"-i", "veth+", "-p", "tcp", "-d", "169.254.0.99", "--dport", "9443", "-j", "REDIRECT", "--to-port", "9443"}
-	oldTLS := []string{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", "9999"}
+	oldSecrets := marked("-i", "veth+", "-p", "tcp", "-d", "169.254.0.99", "--dport", "9443", "-j", "REDIRECT", "--to-port", "9443")
+	oldTLS := marked("-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", "9999")
 	rules, chains := specKernel(spec, nil)
 	rules["nat/PREROUTING"] = append([][]string{oldSecrets, oldTLS}, rules["nat/PREROUTING"]...)
 
@@ -808,17 +820,76 @@ func TestStaleManagedRedirectIsReconciledNotFatal(t *testing.T) {
 	}
 }
 
-func TestStaleShapeDoesNotMatchOperatorRedirect(t *testing.T) {
-	// An operator's own redirect (custom dport, to-port != dport) must never
-	// read as a stale vmd rule.
+func TestOperatorRulesNeverReadAsStale(t *testing.T) {
+	// Staleness is keyed on the explicit ownership marker, never on shape: an
+	// operator redirect — even one colliding with vmd ports — must never be
+	// reconciled away.
+	want := testSpec(true).sharedOrdered["nat/PREROUTING"]
 	for _, tokens := range [][]string{
-		{"-i", "veth+", "-p", "tcp", "--dport", "8080", "-j", "REDIRECT", "--to-port", "999"},
-		{"-i", "veth+", "-p", "tcp", "-d", "10.0.0.5", "--dport", "9443", "-j", "REDIRECT", "--to-port", "1234"},
-		{"-i", "eth0", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", "8443"},
+		{"-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", "8888"},
+		{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", "8443"},
+		{"-i", "veth+", "-p", "tcp", "-d", "10.0.0.5", "--dport", "9443", "-j", "REDIRECT", "--to-port", "9443"},
+		{"-i", "veth+", "-p", "tcp", "--dport", "8080", "-j", "REDIRECT", "--to-port", "999", "-m", "comment", "--comment", "operator rule"},
 	} {
-		if staleManagedRule("nat/PREROUTING", tokens) {
+		if staleManagedRule(tokens, want) {
 			t.Fatalf("operator redirect misread as stale vmd rule: %v", tokens)
 		}
+	}
+}
+
+func TestUnmarkedTwinIsUpgradeMigrated(t *testing.T) {
+	// The pre-marker generation of exactly a current rule (identical
+	// parameters, no marker) is stale: deleting it and keeping the marked
+	// twin is behavior-preserving — the one-time upgrade migration.
+	spec := testSpec(true)
+	want := spec.sharedOrdered["filter/FORWARD"]
+	unmarkedDrop := []string{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP"}
+	if !staleManagedRule(unmarkedDrop, want) {
+		t.Fatal("unmarked exact twin not recognized as upgrade-stale")
+	}
+	rules, chains := specKernel(spec, nil)
+	rules["filter/FORWARD"] = append([][]string{unmarkedDrop}, rules["filter/FORWARD"]...)
+	if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "stale-managed" {
+		t.Fatalf("ok=%v class=%s", ok, class)
+	}
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+		t.Fatalf("post-migration verify failed: %s %s", class, detail)
+	}
+	for _, r := range k.rules["filter/FORWARD"] {
+		if ruleEqual(r, unmarkedDrop) {
+			t.Fatal("unmarked twin survived migration")
+		}
+	}
+}
+
+func TestQuotedCommentCannotSpoofDisposition(t *testing.T) {
+	// A foreign ACCEPT whose comment contains "-j DROP" must still classify
+	// as permissive — quote-aware tokenization keeps the comment one token.
+	line := `-A FORWARD -i veth+ -m comment --comment "audit -j DROP rule" -j ACCEPT`
+	tokens, err := splitRuleTokens(line)
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	if got := foreignDisposition(tokens[2:]); got != "permissive" {
+		t.Fatalf("disposition = %s, want permissive", got)
+	}
+	// And end to end: that rule above the drops must flag, not pass.
+	spec := testSpec(true)
+	rules, chains := specKernel(spec, nil)
+	fw := rules["filter/FORWARD"]
+	rules["filter/FORWARD"] = append([][]string{{"-i", "veth+", "-m", "comment", "--comment", "audit -j DROP rule", "-j", "ACCEPT"}}, fw...)
+	if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "preceded" {
+		t.Fatalf("ok=%v class=%s, want preceded", ok, class)
+	}
+	if _, err := splitRuleTokens(`-A FORWARD -m comment --comment "unbalanced`); err == nil {
+		t.Fatal("unbalanced quote must error")
 	}
 }
 
@@ -845,7 +916,7 @@ func TestRepairKeepsClampAheadOfForeignAccept(t *testing.T) {
 	got := k.rules["filter/FORWARD"]
 	clampIdx, foreignIdx := -1, -1
 	for i, r := range got {
-		if ruleEqual(r, []string{"-o", "eth0", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"}) {
+		if ruleEqual(r, marked("-o", "eth0", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu")) {
 			clampIdx = i
 		}
 		if ruleEqual(r, foreignAccept) {

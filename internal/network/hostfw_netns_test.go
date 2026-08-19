@@ -105,14 +105,15 @@ func TestRealInstallDumpVerifyRoundTrip(t *testing.T) {
 		do   func(t *testing.T)
 	}{
 		{"remove shared rule", func(t *testing.T) {
-			ipt(t, "-D", "FORWARD", "-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP")
+			ipt(t, append([]string{"-D", "FORWARD"}, marked("-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP")...)...)
 		}},
 		{"duplicate shared rule", func(t *testing.T) {
-			ipt(t, "-A", "FORWARD", "-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP")
+			ipt(t, append([]string{"-A", "FORWARD"}, marked("-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP")...)...)
 		}},
 		{"reorder (clamp after accept)", func(t *testing.T) {
-			ipt(t, "-D", "FORWARD", "-o", "eth0", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu")
-			ipt(t, "-A", "FORWARD", "-o", "eth0", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu")
+			clamp := marked("-o", "eth0", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu")
+			ipt(t, append([]string{"-D", "FORWARD"}, clamp...)...)
+			ipt(t, append([]string{"-A", "FORWARD"}, clamp...)...)
 		}},
 		{"mutate owned rule", func(t *testing.T) {
 			ipt(t, "-t", "filter", "-F", portDropChain)
@@ -122,7 +123,7 @@ func TestRealInstallDumpVerifyRoundTrip(t *testing.T) {
 			ipt(t, "-t", "filter", "-A", portDropChain, "-p", "tcp", "--dport", "12345", "-j", "DROP")
 		}},
 		{"delete owned chain jump", func(t *testing.T) {
-			ipt(t, "-D", "FORWARD", "-i", "veth+", "-j", portDropChain)
+			ipt(t, append([]string{"-D", "FORWARD"}, marked("-i", "veth+", "-j", portDropChain)...)...)
 		}},
 		{"flush nat redirect chain", func(t *testing.T) {
 			ipt(t, "-t", "nat", "-F", dnsRedirectChain)
@@ -145,7 +146,7 @@ func TestRealInstallDumpVerifyRoundTrip(t *testing.T) {
 
 	// Unrelated host rule must survive an install/repair cycle untouched.
 	ipt(t, "-A", "FORWARD", "-i", "dummy0", "-j", "ACCEPT")
-	ipt(t, "-D", "FORWARD", "-i", "veth+", "-o", "eth0", "-j", "ACCEPT") // force slow path
+	ipt(t, append([]string{"-D", "FORWARD"}, marked("-i", "veth+", "-o", "eth0", "-j", "ACCEPT")...)...) // force slow path
 	if err := ensure(t); err != nil {
 		t.Fatalf("ensure with unrelated rule: %v", err)
 	}
