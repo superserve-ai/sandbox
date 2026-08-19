@@ -378,24 +378,36 @@ func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, 
 		// Head guard: no foreign rule capable of matching sandbox traffic may
 		// sit above (or interleave) the vmd security rules — relative order
 		// among our own rules alone would still verify with a foreign
-		// `-i veth+ -j ACCEPT` above the drops. The guarded region extends
-		// through our LAST security rule (drops/jumps/redirects); foreign
-		// rules below that only shadow our own ACCEPTs/clamp, which drops have
-		// already run ahead of.
+		// `-i veth+ -j ACCEPT` above the drops. Two zones:
+		//   - through our LAST security rule (drops/jumps/redirects):
+		//     permissive foreigns are a proven bypass (preceded, repairable),
+		//     ambiguous ones fail distinctly;
+		//   - from there through the MSS clamp: a TERMINAL permissive foreign
+		//     still flags (matching SYNs would exit unclamped — repair puts
+		//     the clamp back at the head), but non-terminal unknowns are
+		//     tolerated as before — enforcement has already run.
 		if spec.headGuarded[key] {
-			guardEnd := -1 // index in got of our last security rule
+			guardEnd, clampEnd := -1, -1
 			for _, w := range want {
-				if !securityRule(key, w) {
-					continue
-				}
+				isHead := headRule(key, w)
 				for i, g := range got {
-					if ruleEqual(w.args, g) && i > guardEnd {
+					if !ruleEqual(w.args, g) {
+						continue
+					}
+					if securityRule(key, w) && i > guardEnd {
 						guardEnd = i
+					}
+					if isHead && i > clampEnd {
+						clampEnd = i
 					}
 				}
 			}
+			scanEnd := guardEnd
+			if clampEnd > scanEnd {
+				scanEnd = clampEnd
+			}
 			for i := 0; i < len(got); i++ {
-				if guardEnd != -1 && i >= guardEnd {
+				if scanEnd != -1 && i >= scanEnd {
 					break
 				}
 				isOurs := false
@@ -408,13 +420,18 @@ func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, 
 				if isOurs || ruleCannotMatchSandboxIngress(got[i]) {
 					continue
 				}
+				inSecurityZone := guardEnd == -1 || i < guardEnd
 				switch foreignDisposition(got[i]) {
 				case "strict", "inert":
 					// Only tightens (or does nothing): allowed above the block.
 				case "permissive":
 					return false, "preceded", key + ": " + strings.Join(got[i], " ")
 				default:
-					return false, "preceded-ambiguous", key + ": " + strings.Join(got[i], " ")
+					if inSecurityZone {
+						return false, "preceded-ambiguous", key + ": " + strings.Join(got[i], " ")
+					}
+					// Non-terminal unknown between the drops and the clamp:
+					// tolerated — it cannot provably bypass the clamp.
 				}
 			}
 		}

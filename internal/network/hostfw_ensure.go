@@ -222,16 +222,6 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 			return fmt.Errorf("atomic %s repair: %w", table, err)
 		}
 	}
-	// Refresh the caller's dump for the next verification pass.
-	out, err := dumpIPTables(ctx)
-	if err != nil {
-		return err
-	}
-	nd, perr := parseIPTablesSave(out)
-	if perr != nil {
-		return perr
-	}
-	*d = *nd
 	return nil
 }
 

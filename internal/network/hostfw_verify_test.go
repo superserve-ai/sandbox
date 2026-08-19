@@ -860,3 +860,42 @@ func TestRepairKeepsClampAheadOfForeignAccept(t *testing.T) {
 		t.Fatalf("post-repair verify failed: %s %s", class, detail)
 	}
 }
+
+func TestVerifyGuardsClampFromPrecedingTerminalAccept(t *testing.T) {
+	spec := testSpec(true)
+
+	t.Run("terminal accept between drops and clamp flags", func(t *testing.T) {
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		foreign := []string{"-i", "veth+", "-p", "tcp", "--dport", "8443", "-j", "ACCEPT"}
+		rules["filter/FORWARD"] = append(fw[:2:2], append([][]string{foreign}, fw[2:]...)...)
+		if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "preceded" {
+			t.Fatalf("ok=%v class=%s, want preceded", ok, class)
+		}
+	})
+	t.Run("non-terminal unknown between drops and clamp tolerated", func(t *testing.T) {
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		logRule := []string{"-i", "veth+", "-j", "LOG"}
+		rules["filter/FORWARD"] = append(fw[:2:2], append([][]string{logRule}, fw[2:]...)...)
+		if ok, class := mustVerify(t, renderDump(rules, chains), spec); !ok {
+			t.Fatalf("non-terminal unknown past the drops flagged: %s", class)
+		}
+	})
+	t.Run("repair converges the flagged accept", func(t *testing.T) {
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		foreign := []string{"-i", "veth+", "-p", "tcp", "--dport", "8443", "-j", "ACCEPT"}
+		rules["filter/FORWARD"] = append(fw[:2:2], append([][]string{foreign}, fw[2:]...)...)
+		k := &fakeKernel{rules: rules, chains: chains}
+		defer k.install(t)()
+		d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+		if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+			t.Fatalf("repair: %v", err)
+		}
+		nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+		if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+			t.Fatalf("post-repair verify failed: %s %s", class, detail)
+		}
+	})
+}
