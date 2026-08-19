@@ -120,6 +120,23 @@ func (c *hostCapCache) refreshFailed(key string) {
 	c.mu.Unlock()
 }
 
+func (h *Handlers) logHostCapabilityMiss(ctx context.Context, hostID string, capabilities []string) {
+	event := log.Warn().
+		Str("host_id", hostID).
+		Strs("required_capabilities", capabilities)
+	host, err := h.DB.GetHost(ctx, hostID)
+	if err != nil {
+		event.Err(err).Msg("host capability attestation missing; host diagnostics failed")
+		return
+	}
+	event.
+		Str("host_status", host.Status).
+		Str("vmd_addr", host.VmdAddr).
+		Str("proxy_addr", host.ProxyAddr).
+		Interface("last_heartbeat_at", host.LastHeartbeatAt).
+		Msg("host capability attestation missing")
+}
+
 // fetch coalesces concurrent misses: one flight runs the read under a
 // detached, bounded context (it may outlive the caller), stores the outcome,
 // and every waiter shares the result — but each waiter still selects on its
@@ -137,6 +154,7 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 			c.put(key, start)
 		default:
 			c.remove(key)
+			h.logHostCapabilityMiss(qctx, params.HostID, params.RequiredCapabilities)
 		}
 		return has, err
 	})
@@ -156,7 +174,11 @@ func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string,
 	c.init()
 	params := db.HostHasCapabilitiesUnlockedParams{HostID: hostID, RequiredCapabilities: capabilities}
 	if c.ttl <= 0 {
-		return h.DB.HostHasCapabilitiesUnlocked(ctx, params)
+		has, err := h.DB.HostHasCapabilitiesUnlocked(ctx, params)
+		if err == nil && !has {
+			h.logHostCapabilityMiss(ctx, hostID, capabilities)
+		}
+		return has, err
 	}
 	sorted := append([]string(nil), capabilities...)
 	sort.Strings(sorted)
