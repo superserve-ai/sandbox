@@ -15,15 +15,14 @@ import (
 )
 
 // hostCapCache is an in-process, TTL-bounded, positive-only cache of host
-// capability attestations, fronting HostHasCapabilitiesUnlocked on the
-// standalone pre-flight paths. Same shape as apiKeyCache: only affirmative
-// results are cached (a missing capability or an error always re-reads, so a
-// capability 409 is always fresh), an expired entry is served for a short
-// grace while one background flight refreshes it, and concurrent misses
-// coalesce. The fail-closed gates (transactional validation, VMD's post-boot
-// attestation) do not go through this cache. Cardinality is hosts ×
-// capability sets; puts sweep expired entries, so memory tracks the active
-// fleet.
+// capability attestations, fronting the standalone unlocked capability check.
+// Same shape as apiKeyCache: only affirmative results are cached (a missing
+// capability or an error always re-reads, so a capability 409 is always fresh),
+// an expired entry is served for a short grace while one background flight
+// refreshes it, and concurrent misses coalesce. The fail-closed gates
+// (transactional validation, VMD's post-boot attestation) do not go through
+// this cache. Cardinality is hosts × capability sets; puts sweep expired
+// entries, so memory tracks the active fleet.
 const (
 	// The TTL also bounds how long a just-fenced host or dropped capability
 	// can keep passing this pre-flight (the create path already tolerates the
@@ -120,18 +119,10 @@ func (c *hostCapCache) refreshFailed(key string) {
 	c.mu.Unlock()
 }
 
-func (h *Handlers) logHostCapabilityMiss(ctx context.Context, hostID string, capabilities []string) {
-	event := log.Warn().
+func logHostCapabilityMiss(hostID string, capabilities []string, diagnostics db.HostCapabilityCheckDiagnostics) {
+	log.Warn().
 		Str("host_id", hostID).
-		Strs("required_capabilities", capabilities)
-	diagCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-	defer cancel()
-	diagnostics, err := h.DB.GetHostCapabilityDiagnostics(diagCtx, hostID)
-	if err != nil {
-		event.Err(err).Msg("host capability attestation missing; host diagnostics failed")
-		return
-	}
-	event.
+		Strs("required_capabilities", capabilities).
 		Str("host_status", diagnostics.HostStatus).
 		Str("vmd_addr", diagnostics.VmdAddr).
 		Str("proxy_addr", diagnostics.ProxyAddr).
@@ -150,16 +141,16 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 		start := time.Now()
 		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		has, err := h.DB.HostHasCapabilitiesUnlocked(qctx, params)
+		result, err := h.DB.CheckHostCapabilitiesWithDiagnostics(qctx, params.HostID, params.RequiredCapabilities)
 		switch {
 		case err != nil:
-		case has:
+		case result.HasCapabilities:
 			c.put(key, start)
 		default:
 			c.remove(key)
-			h.logHostCapabilityMiss(qctx, params.HostID, params.RequiredCapabilities)
+			logHostCapabilityMiss(params.HostID, params.RequiredCapabilities, result)
 		}
-		return has, err
+		return result.HasCapabilities, err
 	})
 	select {
 	case res := <-ch:
@@ -177,11 +168,11 @@ func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string,
 	c.init()
 	params := db.HostHasCapabilitiesUnlockedParams{HostID: hostID, RequiredCapabilities: capabilities}
 	if c.ttl <= 0 {
-		has, err := h.DB.HostHasCapabilitiesUnlocked(ctx, params)
-		if err == nil && !has {
-			h.logHostCapabilityMiss(ctx, hostID, capabilities)
+		result, err := h.DB.CheckHostCapabilitiesWithDiagnostics(ctx, hostID, capabilities)
+		if err == nil && !result.HasCapabilities {
+			logHostCapabilityMiss(hostID, capabilities, result)
 		}
-		return has, err
+		return result.HasCapabilities, err
 	}
 	sorted := append([]string(nil), capabilities...)
 	sort.Strings(sorted)
