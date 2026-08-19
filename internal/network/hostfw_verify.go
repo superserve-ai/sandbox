@@ -266,13 +266,18 @@ func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, 
 
 // dumpIPTables runs iptables-save once (both tables in one invocation) with a
 // hard timeout. iptables-save is read-only and does not take the xtables
-// lock; the timeout guards a wedged binary.
+// lock; the timeout guards a wedged binary. Only stdout is parsed: on the
+// iptables-nft backend, foreign native-nft tables (the host egress-block
+// table) produce warnings that must not poison parsing — comment-form ones on
+// stdout are skipped by the parser, and stderr never reaches it.
 var dumpIPTables = func(ctx context.Context) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "iptables-save").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("iptables-save: %s: %w", strings.TrimSpace(string(out)), err)
+	var stdout, stderr strings.Builder
+	cmd := exec.CommandContext(ctx, "iptables-save")
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("iptables-save: %s: %w", strings.TrimSpace(stderr.String()), err)
 	}
-	return string(out), nil
+	return stdout.String(), nil
 }

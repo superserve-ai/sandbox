@@ -195,6 +195,17 @@ func TestVerifyWithoutOwnedChainsIgnoresThem(t *testing.T) {
 	}
 }
 
+func TestParseToleratesIncompatibleTableComments(t *testing.T) {
+	// iptables-nft-save flags foreign native-nft tables (our host egress-block
+	// table) as comment lines; they must parse cleanly, not force a slow path.
+	spec := testSpec(true)
+	rules, chains := specKernel(spec, nil)
+	dump := "# Table `sandbox_egress_block' is incompatible, use 'nft' tool.\n" + renderDump(rules, chains)
+	if ok, class := mustVerify(t, dump, spec); !ok {
+		t.Fatalf("incompatible-table comment broke verification: %s", class)
+	}
+}
+
 func TestParseRejectsUnknownSyntax(t *testing.T) {
 	for _, bad := range []string{
 		"*filter\ngarbage line\nCOMMIT\n",
