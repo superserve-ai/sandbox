@@ -1688,7 +1688,7 @@ func fileExists(path string) bool {
 func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string, networkRules *sandboxNetworkRules) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
-	var tSlot, tFcStart, tFcDone, tRestore, tRestoreDone time.Time
+	var tSlot, tVerify, tVerifyDone, tFcStart, tFcDone, tRestore, tRestoreDone time.Time
 	needsNetworkCleanup := false
 	defer func() {
 		if needsNetworkCleanup {
@@ -1702,13 +1702,26 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// Registered after the network-cleanup defer so it runs BEFORE
 	// TeardownVM: the elapsed-time fallbacks must not absorb teardown.
 	defer func() {
-		if tSlot.IsZero() {
+		if tSlot.IsZero() && tVerify.IsZero() {
 			return
 		}
 		phases := map[string]time.Duration{
-			"prep":  tSlot.Sub(tEntry),
 			"total": time.Since(tEntry),
 		}
+		// Pre-slot adoption verification (up to the boxd probe window) is
+		// real resume work; a slow adopted retry must not vanish.
+		if !tVerify.IsZero() {
+			if !tVerifyDone.IsZero() {
+				phases["verify"] = tVerifyDone.Sub(tVerify)
+			} else {
+				phases["verify"] = time.Since(tVerify)
+			}
+		}
+		if tSlot.IsZero() {
+			m.recordPhases("resume", "", phases)
+			return
+		}
+		phases["prep"] = tSlot.Sub(tEntry)
 		switch {
 		case !tFcDone.IsZero():
 			phases["fc_start"] = tFcDone.Sub(tFcStart)
@@ -1763,7 +1776,10 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// BOTH directions: blind adoption hands back a corpse, blind refusal
 		// relaunches over a possibly-live guest. Evidence decides, with the
 		// gate restore adoption uses; success heals the marker durably.
-		if verr := m.verifyBoxdReady(ctx, existing.IP); verr != nil {
+		tVerify = time.Now()
+		verr := m.verifyBoxdReady(ctx, existing.IP)
+		tVerifyDone = time.Now()
+		if verr != nil {
 			// A genuine verdict (see verifyBoxdReady): the record is a corpse.
 			// Record it before relaunching: the relaunch can still fail a
 			// precondition, and those paths return without touching status
