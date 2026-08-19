@@ -822,6 +822,43 @@ SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
 
+-- name: ClaimBillingIneligibleSandboxes :many
+-- Atomically claims active sandboxes for a team whose billing eligibility was
+-- lost. The bounded batch and SKIP LOCKED make this safe to retry and keep
+-- webhook reconciliation off the request's critical path.
+WITH candidates AS (
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
+  FROM sandbox s
+  WHERE s.team_id = $1
+    AND s.destroyed_at IS NULL
+    AND s.status = 'active'
+    AND NOT team_sandbox_billing_eligible(s.team_id)
+  ORDER BY s.created_at ASC
+  LIMIT $2
+  FOR UPDATE OF s SKIP LOCKED
+), paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  FROM candidates
+  WHERE sandbox.id = candidates.id
+  RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config
+), closed_intervals AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+), closed_billing_compute AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
+FROM paused p
+LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
+
 -- name: UpdateSandboxAutoDelete :execrows
 -- Set or clear (NULL) the auto-delete window. The deadline counts continuous
 -- paused time since the setting was applied: on an already-paused sandbox it

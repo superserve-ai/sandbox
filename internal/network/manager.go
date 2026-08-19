@@ -281,6 +281,9 @@ func (m *Manager) recordNetPhase(phase string, d time.Duration) {
 }
 
 func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, opts ...ManagerOption) (*Manager, error) {
+	// Split pre-network config (ip_forward + option wiring) from the actual
+	// firewall install so a slow startup network_firewall phase is unambiguous.
+	tPreNet := time.Now()
 	if err := enableIPForward(ctx); err != nil {
 		return nil, err
 	}
@@ -299,10 +302,19 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 	for _, opt := range opts {
 		opt(mgr)
 	}
+	preNet := time.Since(tPreNet)
 
+	tFW := time.Now()
 	if err := installHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, mgr.dnsRedirectPort, mgr.secretsProxyDst, mgr.secretsProxyPort, mgr.blockedEgressPorts, mgr.ownsEgressPortChain, log.With().Str("component", "host_fw").Logger()); err != nil {
 		return nil, fmt.Errorf("install host firewall: %w", err)
 	}
+	// Async: a backpressured log writer must not extend startup — the values
+	// are already computed.
+	fwInstall := time.Since(tFW)
+	go func() {
+		mgr.log.Info().Dur("pre_network_ms", preNet).Dur("firewall_install_ms", fwInstall).
+			Msg("network manager init breakdown")
+	}()
 
 	return mgr, nil
 }

@@ -639,6 +639,9 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		case db.SandboxStatusActive:
 			return &sandbox, row.Access
 		case db.SandboxStatusPaused:
+			if !h.requireBillingEligible(c, teamID) {
+				return nil, ""
+			}
 			// The resume returns the post-restore access it pushed to VMD, so
 			// the response reports exactly what the VM enforces.
 			tResume := time.Now()
@@ -1003,7 +1006,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}); err != nil {
 			l.Error().Err(err).Msg("async DB ActivateSandbox failed — re-pausing")
 			pauseAndRevert()
+			return
 		}
+		billingCtx, billingCancel := context.WithTimeout(context.WithoutCancel(revertCtx), 2*time.Minute)
+		h.reconcileActivatedSandbox(billingCtx, teamID)
+		billingCancel()
 	})
 
 	sandbox.VcpuCount = int32(actualVcpu)
@@ -1193,6 +1200,9 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 	if !h.requireTeamSandboxWrite(c, teamID) {
+		return
+	}
+	if !h.requireBillingEligible(c, teamID) {
 		return
 	}
 
@@ -2074,6 +2084,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if !h.requireTeamSandboxWrite(c, teamID) {
 		return
 	}
+	if !h.requireBillingEligible(c, teamID) {
+		return
+	}
 
 	// Resolve secret references before spinning up the VM so a typo 400s cleanly.
 	secretBindings, secretMeta, appErr := h.resolveSecretBindingsForCreate(c.Request.Context(), teamID, req.Secrets)
@@ -2647,7 +2660,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			ActorID:   actorUUID(actorID),
 		}); err != nil {
 			l.Error().Err(err).Msg("async DB ActivateSandbox failed")
+			return
 		}
+		billingCtx, billingCancel := context.WithTimeout(context.WithoutCancel(activateCtx), 2*time.Minute)
+		h.reconcileActivatedSandbox(billingCtx, teamID)
+		billingCancel()
 	})
 
 	// Network rules stay blocking: a 201 must imply "egress rules applied",

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/metric"
@@ -42,6 +43,23 @@ type OTelConfig struct {
 	// alerted on per host. Empty (the control plane, which is not per-host)
 	// records as "unknown".
 	HostID string
+	// InstanceID identifies this specific process for the resource-level
+	// service.instance.id attribute. Every db_pool_*/vmd_call_*/etc. series
+	// this recorder emits shares the same metric name, service.name, and
+	// (for host-scoped calls) host_id — nothing distinguishes one process
+	// from another. That's invisible with exactly one process per service,
+	// but the control plane runs as multiple concurrent Cloud Run
+	// instances, so every replica exports identical series in the same
+	// window. The collector's resourcedetection/gcp processor only fills in
+	// a resource attribute when the sender didn't already set it (its
+	// override:false), and it has nothing GCP-native to detect for a
+	// Cloud Run OTLP client — so without InstanceID every replica's data
+	// collapses onto the collector's own host identity once it lands in
+	// Google Managed Prometheus, and GMP's one-point-per-series-per-request
+	// rule drops every write past the first. Left empty, NewOTelRecorder
+	// generates a random one so uniqueness never depends on the caller
+	// remembering to plumb one through.
+	InstanceID string
 }
 
 // OTelRecorder emits the sandbox control plane's bounded operational metrics
@@ -52,6 +70,7 @@ type OTelRecorder struct {
 	serviceName string
 	environment string
 	hostID      string
+	instanceID  string
 
 	sandboxTransitions       metric.Int64Counter
 	sandboxDuration          metric.Float64Histogram
@@ -98,6 +117,7 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	if cfg.ExportInterval <= 0 {
 		cfg.ExportInterval = 15 * time.Second
 	}
+	cfg.InstanceID = resolveInstanceID(cfg.InstanceID)
 
 	provider, err := newOTLPMeterProvider(ctx, cfg)
 	if err != nil {
@@ -110,6 +130,7 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		serviceName: cfg.ServiceName,
 		environment: cfg.Environment,
 		hostID:      safeHostID(cfg.HostID),
+		instanceID:  cfg.InstanceID,
 	}
 	if r.sandboxTransitions, err = meter.Int64Counter("sandbox_transition_total"); err != nil {
 		return nil, err
@@ -478,14 +499,7 @@ func newOTLPMeterProvider(ctx context.Context, cfg OTelConfig) (*sdkmetric.Meter
 		return nil, fmt.Errorf("create otlp metric exporter: %w", err)
 	}
 
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes("",
-			attribute.String("service.name", cfg.ServiceName),
-			attribute.String("service.version", cfg.ServiceVersion),
-			attribute.String("environment", cfg.Environment),
-		),
-	)
+	res, err := buildOTelResource(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create otel resource: %w", err)
 	}
@@ -494,4 +508,50 @@ func newOTLPMeterProvider(ctx context.Context, cfg OTelConfig) (*sdkmetric.Meter
 		sdkmetric.WithResource(res),
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(cfg.ExportInterval))),
 	), nil
+}
+
+// NewInstanceID generates a random per-process identity for
+// OTelConfig.InstanceID / BackupOTelConfig.InstanceID. A process that
+// constructs more than one recorder — vmd builds both an OTelRecorder and
+// a BackupRecorder — must call this once and pass the same value to every
+// recorder it builds. Left to each constructor's own default, every
+// recorder in the process mints its own random ID, and GMP ends up
+// representing one process as several different service.instance.id
+// targets instead of one.
+func NewInstanceID() string {
+	return resolveInstanceID("")
+}
+
+// resolveInstanceID returns id unchanged if the caller supplied one, or a
+// freshly generated one otherwise. Every constructor that builds a meter
+// provider (NewOTelRecorder, NewBackupRecorder) must call this itself
+// before using cfg.InstanceID: OTelConfig is passed by value throughout
+// this package, so a default applied only inside a shared helper like
+// newOTLPMeterProvider or buildOTelResource never propagates back to the
+// caller's copy, silently leaving that caller's resource attribute empty.
+func resolveInstanceID(id string) string {
+	if id != "" {
+		return id
+	}
+	return uuid.New().String()
+}
+
+// buildOTelResource is the process-level identity attached once per
+// MeterProvider (as opposed to attrs()/selfAttrs(), which are stamped on
+// every individual data point). cfg must already have InstanceID resolved
+// via resolveInstanceID — see NewOTelRecorder and NewBackupRecorder.
+func buildOTelResource(cfg OTelConfig) (*resource.Resource, error) {
+	return resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes("",
+			attribute.String("service.name", cfg.ServiceName),
+			attribute.String("service.version", cfg.ServiceVersion),
+			attribute.String("environment", cfg.Environment),
+			// Gives GMP's prometheus_target resource mapping a real
+			// per-process instance identity to key on instead of falling
+			// back to whatever the collector's own resourcedetection fills
+			// in — see OTelConfig.InstanceID.
+			attribute.String("service.instance.id", cfg.InstanceID),
+		),
+	)
 }

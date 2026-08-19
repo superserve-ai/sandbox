@@ -358,6 +358,85 @@ func (q *Queries) ClaimAutoDeleteSandboxes(ctx context.Context, arg ClaimAutoDel
 	return items, nil
 }
 
+const claimBillingIneligibleSandboxes = `-- name: ClaimBillingIneligibleSandboxes :many
+WITH candidates AS (
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
+  FROM sandbox s
+  WHERE s.team_id = $1
+    AND s.destroyed_at IS NULL
+    AND s.status = 'active'
+    AND NOT team_sandbox_billing_eligible(s.team_id)
+  ORDER BY s.created_at ASC
+  LIMIT $2
+  FOR UPDATE OF s SKIP LOCKED
+), paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  FROM candidates
+  WHERE sandbox.id = candidates.id
+  RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config
+), closed_intervals AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+), closed_billing_compute AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
+FROM paused p
+LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id
+`
+
+type ClaimBillingIneligibleSandboxesParams struct {
+	TeamID uuid.UUID `json:"team_id"`
+	Limit  int32     `json:"limit"`
+}
+
+type ClaimBillingIneligibleSandboxesRow struct {
+	ID            uuid.UUID   `json:"id"`
+	TeamID        uuid.UUID   `json:"team_id"`
+	Name          string      `json:"name"`
+	SnapshotID    pgtype.UUID `json:"snapshot_id"`
+	HostID        string      `json:"host_id"`
+	NetworkConfig []byte      `json:"network_config"`
+}
+
+// Atomically claims active sandboxes for a team whose billing eligibility was
+// lost. The bounded batch and SKIP LOCKED make this safe to retry and keep
+// webhook reconciliation off the request's critical path.
+func (q *Queries) ClaimBillingIneligibleSandboxes(ctx context.Context, arg ClaimBillingIneligibleSandboxesParams) ([]ClaimBillingIneligibleSandboxesRow, error) {
+	rows, err := q.db.Query(ctx, claimBillingIneligibleSandboxes, arg.TeamID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClaimBillingIneligibleSandboxesRow{}
+	for rows.Next() {
+		var i ClaimBillingIneligibleSandboxesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.SnapshotID,
+			&i.HostID,
+			&i.NetworkConfig,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const claimExpiredSandboxes = `-- name: ClaimExpiredSandboxes :many
 WITH open_sessions AS (
   -- Current session start per sandbox: the open interval, computed once.

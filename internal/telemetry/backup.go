@@ -74,6 +74,7 @@ type BackupRecorder struct {
 	serviceName string
 	environment string
 	hostID      string
+	instanceID  string
 
 	enabled           metric.Int64Gauge
 	journalPending    metric.Int64Gauge
@@ -117,6 +118,10 @@ func NewBackupRecorder(ctx context.Context, cfg BackupOTelConfig) (*BackupRecord
 	if cfg.ExportInterval <= 0 {
 		cfg.ExportInterval = 15 * time.Second
 	}
+	// Every meter-provider constructor in this package must resolve its own
+	// InstanceID — see resolveInstanceID for why this can't live in a
+	// shared helper further down the call chain.
+	cfg.InstanceID = resolveInstanceID(cfg.InstanceID)
 	provider, err := newOTLPMeterProvider(ctx, cfg.OTelConfig)
 	if err != nil {
 		return nil, err
@@ -133,6 +138,7 @@ func NewBackupRecorderWithProvider(provider *sdkmetric.MeterProvider, cfg Backup
 		serviceName: cfg.ServiceName,
 		environment: cfg.Environment,
 		hostID:      safeHostID(cfg.HostID),
+		instanceID:  cfg.InstanceID,
 	}
 	var err error
 	if r.enabled, err = meter.Int64Gauge("backup_enabled"); err != nil {

@@ -643,15 +643,16 @@ func (m *Manager) dropStagedPending(pb PendingBackup, log zerolog.Logger) {
 // from an abandoned directory, and the sweep deletes it — discarding the
 // only durable copy of an otherwise-recoverable pause. Needs only the
 // BoltDB state (no instance map), so it's safe to call this early.
-func (m *Manager) RenewPendingStaging(log zerolog.Logger) {
+func (m *Manager) RenewPendingStaging(log zerolog.Logger) int {
 	if m.state == nil {
-		return
+		return 0
 	}
 	pending, err := m.state.ListPendingBackups()
 	if err != nil {
 		log.Warn().Err(err).Msg("renew pending staging: list failed")
-		return
+		return 0
 	}
+	renewed := 0
 	for _, pb := range pending {
 		if pb.StagedDir == "" {
 			continue
@@ -664,7 +665,9 @@ func (m *Manager) RenewPendingStaging(log zerolog.Logger) {
 		// unrenewed and indistinguishable from an orphan to the sweep.
 		resolved := m.resolveStagedLocation(pb)
 		backup.RenewStaged(resolved.StagedDir)
+		renewed++
 	}
+	return renewed
 }
 
 // RecoverPendingBackups re-runs every pause that still owed its backup

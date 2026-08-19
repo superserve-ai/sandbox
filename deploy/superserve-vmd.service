@@ -38,6 +38,12 @@ Delegate=yes
 Restart=always
 RestartSec=2
 
+# Bounded stop: vmd runs its own per-closer-deadline shutdown and exits well
+# within this window. If the process itself wedges, systemd force-kills here
+# rather than letting a stop drag on (the default is 90s). Set above vmd's
+# internal shutdown budget so a healthy stop always completes on its own first.
+TimeoutStopSec=45s
+
 # Environment
 EnvironmentFile=/etc/sandbox/vmd.env
 

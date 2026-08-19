@@ -3651,18 +3651,17 @@ func (m *Manager) SweepStartupOrphanNamespaces(extraKeep ...string) {
 	if m.state == nil {
 		return
 	}
-	recs, err := m.state.All()
+	// Keep-set from the slot index — same content the record scan produced.
+	nsByID, err := m.state.SlotNamespaces()
 	if err != nil {
 		// Sweeping with an empty keep-set would delete every live VM's
-		// namespace — skip entirely when the records can't be read.
-		m.log.Error().Err(err).Msg("sweep: cannot read state — skipping orphan namespace sweep")
+		// namespace — skip entirely when the index can't be read.
+		m.log.Error().Err(err).Msg("sweep: cannot read slot index — skipping orphan namespace sweep")
 		return
 	}
-	keepNs := make(map[string]bool)
-	for _, rec := range recs {
-		if rec.Namespace != "" {
-			keepNs[rec.Namespace] = true
-		}
+	keepNs := make(map[string]bool, len(nsByID))
+	for _, ns := range nsByID {
+		keepNs[ns] = true
 	}
 	// Recordless cgroup survivors whose FC outlived the reap: keep their tap
 	// intact so the slot isn't recycled under a live process. The reconciler
@@ -3689,17 +3688,28 @@ func (m *Manager) ReserveStartupSlots(context.Context) bool {
 	if m.state == nil {
 		return false
 	}
-	recs, err := m.state.All()
+	tLoad := time.Now()
+	slots, err := m.state.SlotNamespaces()
 	if err != nil {
-		m.log.Error().Err(err).Msg("failed to read state for startup slot reservation")
+		m.log.Error().Err(err).Msg("failed to read slot index for startup slot reservation")
 		return false
 	}
-	m.netMgr.ReserveSlotsAbove(collectStartupSlots(recs))
+	loadMS := time.Since(tLoad)
+	tReserve := time.Now()
+	m.netMgr.ReserveSlotsAbove(slots)
 	// Reservations pin the allocator above the highest record index, stranding
 	// every unused index below it. Hand those back now, while records are the
 	// only owners and "unowned with no namespace" provably means free.
-	if n := m.netMgr.ReclaimUnusedSlots(); n > 0 {
-		m.log.Info().Int("slots", n).Msg("reclaimed unused network slot indexes")
+	reclaimed := m.netMgr.ReclaimUnusedSlots()
+	// Async: the write must not sit on the startup path.
+	reserveDur := time.Since(tReserve)
+	go func() {
+		m.log.Info().Dur("slot_index_load_ms", loadMS).Dur("reserve_reclaim_ms", reserveDur).
+			Int("reservations", len(slots)).Int("reclaimed", reclaimed).
+			Msg("startup slot reservation breakdown")
+	}()
+	if reclaimed > 0 {
+		m.log.Info().Int("slots", reclaimed).Msg("reclaimed unused network slot indexes")
 	}
 	return true
 }
@@ -3735,6 +3745,8 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) (protected []stri
 		return nil, false
 	}
 	sweepSafe = true
+	scanned := len(cgIDs)
+	var recorded, recordless, reaped int
 	for _, id := range cgIDs {
 		// Build VMs ARE reaped here: pre-gate every cgroup is a previous-life
 		// survivor, and a build's cgroup is recordless (persistState omits build
@@ -3748,14 +3760,21 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) (protected []stri
 				// protected set — the sweep must not run on this startup.
 				sweepSafe = false
 				m.log.Warn().Err(herr).Str("vm_id", id).Msg("record lookup failed for cgroup survivor — skipping startup orphan sweep")
+			} else {
+				recorded++
 			}
 			continue // recorded (reattach owns it) or unreadable
 		}
+		recordless++
 		m.log.Warn().Str("vm_id", id).Msg("recordless cgroup survivor at startup — reaping")
 		// Capture the netns before the kill: an FC that survives it is still in
 		// the group, but a clean kill removes it and firstPID would read empty.
 		ns := m.netMgr.NamespaceForPID(m.cgroups.firstPID(id))
-		if serr := m.stopVM(ctx, id, SupervisionCgroup); serr != nil {
+		serr := m.stopVM(ctx, id, SupervisionCgroup)
+		if serr == nil {
+			reaped++
+		}
+		if serr != nil {
 			m.log.Error().Err(serr).Str("vm_id", id).Msg("failed to reap recordless cgroup")
 			// Liveness decides first — populated or unreadable == maybe-alive.
 			// A confirmed-empty group whose rmdir merely failed is dead, its
@@ -3777,6 +3796,12 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) (protected []stri
 			}
 		}
 	}
+	// Async: the write must not sit on the startup path.
+	nProtected := len(protected)
+	go func() {
+		m.log.Info().Int("scanned", scanned).Int("recorded", recorded).Int("recordless", recordless).
+			Int("reaped", reaped).Int("protected", nProtected).Msg("cgroup reap breakdown")
+	}()
 	return protected, sweepSafe
 }
 
