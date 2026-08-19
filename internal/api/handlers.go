@@ -1948,6 +1948,13 @@ func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uui
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
 	tStart := time.Now()
+	// Rebase onto the middleware's stamp so total covers auth too — a slow
+	// auth cache miss must never make the auth phase exceed its own total.
+	if v, ok := c.Get("auth_start"); ok {
+		if t, ok := v.(time.Time); ok {
+			tStart = t
+		}
+	}
 	var hostID string
 	var tLookupDone, tSchedStart, tVmdStart, tVmdEnd, tInsertStart, tInsertEnd, tInsertReceive, tPostStart, tPostDone time.Time
 	// Registered before ANY return so failed, timed-out, and rejected

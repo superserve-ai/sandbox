@@ -60,6 +60,10 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 	}
 	return func(c *gin.Context) {
 		authStart := time.Now()
+		// Handlers base their phase-series totals on this so user-visible
+		// latency includes a slow auth cache miss (auth must never exceed
+		// its own request's total).
+		c.Set("auth_start", authStart)
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" {
 			respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
