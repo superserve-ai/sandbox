@@ -1352,6 +1352,19 @@ func main() {
 		// invalid and fail startup; lower them with it.
 		dbCfg.MinConns = min(dbCfg.MinConns, dbCfg.MaxConns)
 		dbCfg.MinIdleConns = min(dbCfg.MinIdleConns, dbCfg.MaxConns)
+		// Without an explicit lifetime, pgxpool defaults to an unjittered
+		// 1-hour MaxConnLifetime. Every host in a fleet booted around the
+		// same time then expires its reconciler connections in lockstep,
+		// which the pooler sees as a synchronized mass-reconnect storm.
+		// Same tuning as the controlplane pool (cmd/controlplane/main.go),
+		// which sets these unconditionally rather than trying to detect a
+		// DATABASE_URL override — pgxpool.ParseConfig can't tell "operator
+		// set this to the default value" apart from "left it unset," and
+		// nothing in this repo's deployments configures these via DSN.
+		dbCfg.MaxConnLifetime = 30 * time.Minute
+		dbCfg.MaxConnLifetimeJitter = 5 * time.Minute
+		dbCfg.MaxConnIdleTime = 5 * time.Minute
+		dbCfg.HealthCheckPeriod = 30 * time.Second
 		dbPool, dbErr := pgxpool.NewWithConfig(ctx, dbCfg)
 		if dbErr != nil {
 			log.Fatal().Err(dbErr).Msg("failed to connect to database for reconciler")
