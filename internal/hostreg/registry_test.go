@@ -648,3 +648,55 @@ func TestClientForRefreshAheadLaunchesOneGoroutine(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// Observe fires once per EXECUTED resolution — never per waiter. A burst of
+// callers sharing one gated flight contributes exactly one sample, and a
+// caller that cancels its wait records nothing: the sample belongs to the
+// resolution (which succeeds behind the canceled waiter), not the waiters.
+func TestObserveRecordsPerResolutionNotPerWaiter(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	gate := make(chan struct{})
+	store.setGate(gate) // hold the flight's row read open
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+
+	var mu sync.Mutex
+	type sample struct {
+		kind string
+		err  error
+	}
+	var samples []sample
+	r.Observe = func(kind string, _ time.Duration, err error) {
+		mu.Lock()
+		samples = append(samples, sample{kind, err})
+		mu.Unlock()
+	}
+
+	// Ten cold waiters share one flight; one of them cancels mid-wait.
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		ctx := context.Background()
+		if i == 0 {
+			ctx = cancelCtx
+		}
+		wg.Add(1)
+		go func(ctx context.Context) {
+			defer wg.Done()
+			_, _ = r.ClientFor(ctx, "host-a")
+		}(ctx)
+	}
+	time.Sleep(20 * time.Millisecond) // let the waiters pile onto the flight
+	cancel()
+	close(gate)
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(samples) != 1 {
+		t.Fatalf("samples = %d (%v), want exactly 1 per executed resolution", len(samples), samples)
+	}
+	if samples[0].kind != "cold" || samples[0].err != nil {
+		t.Fatalf("sample = %+v, want cold/success (the canceled waiter must not record an error)", samples[0])
+	}
+}

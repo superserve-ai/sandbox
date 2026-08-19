@@ -53,12 +53,15 @@ type Registry struct {
 	db      *db.Queries
 	dial    DialFunc
 	recheck time.Duration // 0 = addrRecheckTTL; tests shorten it
-	// Observe, when set, records each resolution: kind is "cold" (no
-	// cached client) or "due" (verification due); mode is "blocking" (a
-	// request waited on it) or "background" (refresh-ahead). A blocking
-	// resolution is a bounded (~2s worst-case) component of create/resume
-	// tail latency and must be attributable on its own.
-	Observe func(kind, mode string, d time.Duration, err error)
+	// Observe, when set, records each EXECUTED resolution exactly once —
+	// inside the shared singleflight flight, not per waiter, so a burst of
+	// lifecycle requests on one cold/expired entry contributes one sample,
+	// and a canceled waiter cannot record an error for a resolution that
+	// succeeded behind it. kind is "cold" (no cached client at flight
+	// start) or "due" (re-verification). A blocking resolution is a
+	// bounded (~2s worst-case) component of create/resume tail latency and
+	// must be attributable on its own.
+	Observe func(kind string, d time.Duration, err error)
 	// failBackoff overrides verifyFailureBackoff for tests, which need a
 	// backoff strictly shorter than the TTL to reproduce the production
 	// ratio (5s vs 30s) — equal values mask backoff/refresh interactions.
@@ -147,28 +150,13 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 			if _, busy := r.refreshing.LoadOrStore(hostID, struct{}{}); !busy {
 				go func() {
 					defer r.refreshing.Delete(hostID)
-					started := time.Now()
-					_, err := r.resolveClient(context.WithoutCancel(ctx), hostID)
-					r.observe("due", "background", started, err)
+					_, _ = r.resolveClient(context.WithoutCancel(ctx), hostID)
 				}()
 			}
 		}
 		return e.client, nil
 	}
-	kind := "cold"
-	if ok {
-		kind = "due"
-	}
-	started := time.Now()
-	c, err := r.resolveClient(ctx, hostID)
-	r.observe(kind, "blocking", started, err)
-	return c, err
-}
-
-func (r *Registry) observe(kind, mode string, started time.Time, err error) {
-	if r.Observe != nil {
-		r.Observe(kind, mode, time.Since(started), err)
-	}
+	return r.resolveClient(ctx, hostID)
 }
 
 // resolveClient is the single path for both first-use dials and due
@@ -183,12 +171,27 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 	// detached context and still fills the cache, but each caller waits only
 	// as long as its own request lives — a canceled create/resume stops
 	// holding its handler goroutine here.
-	ch := r.resolve.DoChan(hostID, func() (any, error) {
+	ch := r.resolve.DoChan(hostID, func() (v any, err error) {
 		// Detached context: singleflight followers share the leader's
 		// result, so the leader's per-request cancellation must not decide
 		// the resolution for everyone behind it.
 		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 		defer cancel()
+
+		// One observation per executed flight: kind fixed at flight start,
+		// duration and result those of the resolution itself, regardless
+		// of how many callers share it or abandon their wait.
+		if r.Observe != nil {
+			r.mu.RLock()
+			_, hadEntry := r.clients[hostID]
+			r.mu.RUnlock()
+			kind := "cold"
+			if hadEntry {
+				kind = "due"
+			}
+			started := time.Now()
+			defer func() { r.Observe(kind, time.Since(started), err) }()
+		}
 
 		var lastErr error
 		for attempt := 0; attempt < 2; attempt++ {

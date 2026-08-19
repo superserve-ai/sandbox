@@ -274,16 +274,12 @@ func (r *OTelRecorder) RecordHostResolution(ctx context.Context, h HostResolutio
 	if r == nil {
 		return
 	}
-	kind, mode := h.Kind, h.Mode
+	kind := h.Kind
 	if kind != "cold" && kind != "due" {
 		kind = "other"
 	}
-	if mode != "blocking" && mode != "background" {
-		mode = "other"
-	}
 	opt := metric.WithAttributes(r.attrs(
 		attribute.String("kind", kind),
-		attribute.String("mode", mode),
 		attribute.String("result", safeResult(h.Result)),
 	)...)
 	r.hostResolutionDuration.Record(ctx, h.Duration.Seconds(), opt)
