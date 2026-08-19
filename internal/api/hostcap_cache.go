@@ -124,7 +124,9 @@ func (h *Handlers) logHostCapabilityMiss(ctx context.Context, hostID string, cap
 	event := log.Warn().
 		Str("host_id", hostID).
 		Strs("required_capabilities", capabilities)
-	diagnostics, err := h.DB.GetHostCapabilityDiagnostics(ctx, hostID)
+	diagCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	diagnostics, err := h.DB.GetHostCapabilityDiagnostics(diagCtx, hostID)
 	if err != nil {
 		event.Err(err).Msg("host capability attestation missing; host diagnostics failed")
 		return
