@@ -1947,9 +1947,11 @@ func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uui
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
-	tStart := time.Now()
-	// Rebase onto the middleware's stamp so total covers auth too — a slow
-	// auth cache miss must never make the auth phase exceed its own total.
+	tHandler := time.Now()
+	// total is based on the middleware's stamp so it covers auth too — a
+	// slow auth cache miss must never make the auth phase exceed its own
+	// total. lookup stays based on handler entry so it doesn't absorb auth.
+	tStart := tHandler
 	if v, ok := c.Get("auth_start"); ok {
 		if t, ok := v.(time.Time); ok {
 			tStart = t
@@ -1976,7 +1978,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			phases["auth"] = time.Duration(c.GetInt64("auth_ms")) * time.Millisecond
 		}
 		if !tLookupDone.IsZero() {
-			phases["lookup"] = tLookupDone.Sub(tStart)
+			phases["lookup"] = tLookupDone.Sub(tHandler)
 		}
 		// Gated on scheduling actually starting: template rejections after
 		// lookup (not ready, missing paths) return before placement and must
@@ -2716,7 +2718,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	l.Info().
 		Int64("auth_ms", c.GetInt64("auth_ms")).
-		Int64("lookup_ms", tLookupDone.Sub(tStart).Milliseconds()).
+		Int64("lookup_ms", tLookupDone.Sub(tHandler).Milliseconds()).
 		Int64("sched_ms", tVmdStart.Sub(tSchedStart).Milliseconds()).
 		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
 		Bool("vmd_retried", vmdRetried).
