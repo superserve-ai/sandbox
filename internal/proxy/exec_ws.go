@@ -127,7 +127,7 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 	// before bridging (total ends at establishment); the defer covers only
 	// pre-establishment failures, with whichever stages they reached.
 	tConnect := time.Now()
-	var tAuthDone, tEstablished time.Time
+	var tAuthDone, tEstablishStart, tEstablished time.Time
 	emitConnectPhases := func() {
 		if h.recorder == nil {
 			return
@@ -140,8 +140,14 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 		if !tAuthDone.IsZero() {
 			phases["auth"] = tAuthDone.Sub(tConnect)
 		}
-		if !tEstablished.IsZero() {
-			phases["establish"] = tEstablished.Sub(tAuthDone)
+		if !tEstablishStart.IsZero() {
+			if !tEstablished.IsZero() {
+				phases["establish"] = tEstablished.Sub(tEstablishStart)
+			} else {
+				// Upgrade failed or died mid-handshake; its elapsed time
+				// still belongs in the establish tail.
+				phases["establish"] = time.Since(tEstablishStart)
+			}
 		}
 		for phase, d := range phases {
 			if d < 0 {
@@ -190,6 +196,7 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 		CompressionMode:    websocket.CompressionDisabled,
 	}
 
+	tEstablishStart = time.Now()
 	ws, err := websocket.Accept(w, r, acceptOpts)
 	if err != nil {
 		h.log.Warn().Err(err).Msg("exec/ws: WS upgrade failed")

@@ -5263,6 +5263,13 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 
 	tStartUnit := time.Now()
 	if err := restartUnit(ctx, systemdUnitName(vmID)); err != nil {
+		// A failed unit start (D-Bus round trip or systemctl fallback eating
+		// the deadline) can be the slowest part of a launch — sample it.
+		m.recordPhases("launch", "unit", map[string]time.Duration{
+			"prestart":   tStartUnit.Sub(tPrestart),
+			"linger":     time.Duration(lingerCheckMs) * time.Millisecond,
+			"start_unit": time.Since(tStartUnit),
+		})
 		return 0, fmt.Errorf("start systemd unit: %w", err)
 	}
 	tStartUnitDone := time.Now()
