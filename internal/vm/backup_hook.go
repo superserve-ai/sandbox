@@ -296,7 +296,9 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 		}
 	}
 	hashStart := time.Now()
+	tHash := time.Now()
 	retried := collectPauseManifest(rctx, pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath, pb.DiskBasePath, log)
+	m.recordPhases("pause", "", map[string]time.Duration{"manifest_hash": time.Since(tHash)})
 	m.backupMetrics.RecordHashDuration(rctx, time.Since(hashStart))
 	if pb.DiskBasePath != "" {
 		// Re-check AFTER hashing too: the disk hash can run for minutes,
@@ -459,7 +461,9 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 		}
 	}
 	hashStart := time.Now()
+	tHash := time.Now()
 	entries := collectPauseManifest(ctx, pb.SnapshotPath, pb.DiskPath, baseSrc, pb.DiskBasePath, log)
+	m.recordPhases("pause", "", map[string]time.Duration{"manifest_hash": time.Since(tHash)})
 	m.backupMetrics.RecordHashDuration(ctx, time.Since(hashStart))
 	if !pauseManifestComplete(entries) {
 		log.Warn().Str("vm_id", pb.VMID).
