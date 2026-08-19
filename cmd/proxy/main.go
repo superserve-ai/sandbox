@@ -19,6 +19,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/proxy"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 func main() {
@@ -57,6 +58,34 @@ func main() {
 
 	resolver := proxy.NewVMDResolver(vmdAddr)
 	proxyHandler := proxy.NewHandler(domains, resolver, log)
+	if envOrDefault("OTEL_METRICS_ENABLED", "false") == "true" {
+		interval, ierr := time.ParseDuration(envOrDefault("OTEL_EXPORT_INTERVAL", "15s"))
+		if ierr != nil {
+			log.Warn().Err(ierr).Msg("invalid OTEL_EXPORT_INTERVAL; using 15s")
+			interval = 15 * time.Second
+		}
+		rec, rerr := telemetry.NewOTelRecorder(ctx, telemetry.OTelConfig{
+			HostID:         os.Getenv("HOST_ID"),
+			ServiceName:    envOrDefault("OTEL_SERVICE_NAME", "sandbox-proxy"),
+			ServiceVersion: os.Getenv("OTEL_SERVICE_VERSION"),
+			Environment:    envOrDefault("OTEL_ENVIRONMENT", "dev"),
+			Endpoint:       envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+			ExportInterval: interval,
+		})
+		if rerr != nil {
+			log.Error().Err(rerr).Msg("otel metrics init failed; proxy metrics disabled")
+		} else {
+			proxyHandler.WithTelemetry(rec)
+			defer func() {
+				// Bounded: a stalled collector must not hang proxy restarts
+				// on the final flush.
+				flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = rec.Shutdown(flushCtx)
+			}()
+			log.Info().Msg("otel metrics enabled")
+		}
+	}
 	proxyHandler.StartSweeper(ctx)
 
 	// Product-usage analytics for exec/files — no-op when POSTHOG_KEY is unset.

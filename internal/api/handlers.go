@@ -644,7 +644,11 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			}
 			// The resume returns the post-restore access it pushed to VMD, so
 			// the response reports exactly what the VM enforces.
+			tResume := time.Now()
 			resumedAccess, ok := h.resumePausedSandbox(c, &sandbox, teamID)
+			// Emitted for failures too — auto-resume totals must not censor.
+			RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
+				map[string]time.Duration{"total": time.Since(tResume)})
 			if !ok {
 				return nil, ""
 			}
@@ -1175,6 +1179,17 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 }
 
 func (h *Handlers) ResumeSandbox(c *gin.Context) {
+	tResume := PhaseStart(c)
+	var sandbox db.Sandbox
+	// Registered before ANY return: a resume that burns the whole pausing
+	// settle window and then 409s is among the slowest resume requests and
+	// must land in the total distribution. Transition counts/results come
+	// from the SandboxLifecycleTelemetry middleware; this emits only the
+	// phase-series total. HostID is empty until the row loads.
+	defer func() {
+		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
+			map[string]time.Duration{"total": time.Since(tResume)})
+	}()
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return
@@ -1204,7 +1219,6 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	poll := pausingSettlePollStart
 	reads := 0
 	canceled := false
-	var sandbox db.Sandbox
 	for {
 		var err error
 		sandbox, err = h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
@@ -1297,6 +1311,14 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 // ---------------------------------------------------------------------------
 
 func (h *Handlers) DeleteSandbox(c *gin.Context) {
+	tDelete := PhaseStart(c)
+	deleteHostID := ""
+	// Transition counts/results come from the SandboxLifecycleTelemetry
+	// middleware; this defer emits only the phase-series total.
+	defer func() {
+		RecordLatencyPhases(c.Request.Context(), "delete", deleteHostID,
+			map[string]time.Duration{"total": time.Since(tDelete)})
+	}()
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return
@@ -1326,6 +1348,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	}
 
 	SetTelemetryHostID(c, sandbox.HostID)
+	deleteHostID = sandbox.HostID
 	l := sandboxLogger(sandboxID.String(), sandbox.HostID)
 	// Claim the sandbox for deletion atomically. The guarded soft-delete fires
 	// from a quiescent state (active/paused/failed) or a transitional state whose
@@ -1933,7 +1956,72 @@ func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uui
 }
 
 func (h *Handlers) CreateSandbox(c *gin.Context) {
-	tStart := time.Now()
+	tHandler := time.Now()
+	// total is based on the auth boundary so it covers a slow cache miss;
+	// lookup stays based on handler entry so it doesn't absorb auth.
+	tStart := PhaseStart(c)
+	var hostID string
+	var tLookupDone, tSchedStart, tVmdStart, tVmdEnd, tInsertStart, tInsertEnd, tInsertReceive, tPostStart, tPostDone time.Time
+	// Registered before ANY return so failed, timed-out, and rejected
+	// creates land in the phase histograms too — a success-only emission
+	// makes the distributions look healthier than the transition series.
+	// Stages that never ran stay absent; a vmd stage that errored before
+	// its end-stamp reports its elapsed time; total always emits.
+	defer func() {
+		phases := map[string]time.Duration{
+			"total": time.Since(tStart),
+		}
+		// auth_duration keeps nanosecond resolution; the ms field truncates
+		// the sub-millisecond cached-key fast path to zero.
+		if v, ok := c.Get("auth_duration"); ok {
+			if d, ok := v.(time.Duration); ok {
+				phases["auth"] = d
+			}
+		} else {
+			phases["auth"] = time.Duration(c.GetInt64("auth_ms")) * time.Millisecond
+		}
+		if !tLookupDone.IsZero() {
+			phases["lookup"] = tLookupDone.Sub(tHandler)
+		}
+		// Gated on scheduling actually starting: template rejections after
+		// lookup (not ready, missing paths) return before placement and must
+		// not add bogus scheduling samples.
+		if !tSchedStart.IsZero() {
+			if !tVmdStart.IsZero() {
+				phases["sched"] = tVmdStart.Sub(tSchedStart)
+			} else {
+				// Placement/attestation died mid-stage; report its elapsed
+				// time so slow failed scheduling stays visible in sched.
+				phases["sched"] = time.Since(tSchedStart)
+			}
+		}
+		switch {
+		case !tVmdEnd.IsZero():
+			phases["vmd"] = tVmdEnd.Sub(tVmdStart)
+		case !tVmdStart.IsZero():
+			phases["vmd"] = time.Since(tVmdStart)
+		}
+		if !tInsertStart.IsZero() && !tInsertEnd.IsZero() {
+			phases["insert"] = tInsertEnd.Sub(tInsertStart)
+		}
+		if !tVmdEnd.IsZero() && !tInsertReceive.IsZero() {
+			phases["insert_wait"] = tInsertReceive.Sub(tVmdEnd)
+		}
+		if !tPostStart.IsZero() {
+			// Gated on the post stage actually starting: a create that failed
+			// at the insert join returns after cleanup (DestroyInstance,
+			// failed-state reconciliation) without ever entering this stage,
+			// and that cleanup must not masquerade as post latency.
+			if !tPostDone.IsZero() {
+				phases["post"] = tPostDone.Sub(tPostStart)
+			} else {
+				// Post-boot work (attestation, token minting, env inject)
+				// died mid-stage; report its elapsed time.
+				phases["post"] = time.Since(tPostStart)
+			}
+		}
+		RecordLatencyPhases(c.Request.Context(), "create", hostID, phases)
+	}()
 	var req createSandboxRequest
 	if err := bindJSONStrict(c, &req); err != nil {
 		respondErrorMsg(c, "bad_request", "Request body is not valid JSON or contains unknown fields.", http.StatusBadRequest)
@@ -2047,7 +2135,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// authoritative shape.
 	var templateVcpu, templateMemMiB uint32
 	var fromTemplateName, fromTemplateID string
-	var tLookupDone time.Time
 	if req.FromTemplate != nil {
 		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
 		tLookupDone = time.Now()
@@ -2082,7 +2169,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 
 	// Select a host for this sandbox.
-	var hostID string
+	tSchedStart = time.Now()
 	requiredCapabilities := []string{preview.HostCapabilityPorts}
 	if previewAccess == preview.AccessPrivate {
 		requiredCapabilities = previewBrowserCapabilities()
@@ -2262,7 +2349,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return db.Sandbox(row), err
 	}
 
-	var tInsertStart, tInsertEnd time.Time
 	go func() {
 		tInsertStart = time.Now()
 		// Quota is enforced by the sandbox_quota_on_insert trigger.
@@ -2281,7 +2367,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// returns its source IP. For sandboxes with secrets, a follow-up
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
-	tVmdStart := time.Now()
+	tVmdStart = time.Now()
 	// The closure runs synchronously inside retryTransientBoot; a retry
 	// overwrites the capture with the attempt that produced the returned VM.
 	var previewProtocol string
@@ -2290,7 +2376,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		previewProtocol = protocol
 		return ip, vcpu, memMiB, err
 	})
-	tVmdEnd := time.Now()
+	tVmdEnd = time.Now()
 	if vmdErr != nil {
 		// A failed boot should stop the detached insert from materializing a row
 		// after the VM path has already given up.
@@ -2300,7 +2386,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).
 	insertRes := <-insertCh
-	tInsertReceive := time.Now()
+	tInsertReceive = time.Now()
 	sandbox := insertRes.sandbox
 	dbErr := insertRes.err
 
@@ -2423,6 +2509,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// sandbox that boots without its env vars is unusable. (Hostname-only
 	// creates run the same call inside the activation goroutine instead;
 	// a failure there fails the row before it ever goes active.)
+	tPostStart = time.Now()
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
@@ -2610,7 +2697,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			l.Error().Err(err).Msg("failed to apply network rules at creation")
 		}
 	}
-	tPostDone := time.Now()
+	tPostDone = time.Now()
 
 	var createdMeta []byte
 	if fromTemplateName != "" {
@@ -2634,13 +2721,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	l.Info().
 		Int64("auth_ms", c.GetInt64("auth_ms")).
-		Int64("lookup_ms", tLookupDone.Sub(tStart).Milliseconds()).
-		Int64("sched_ms", tVmdStart.Sub(tLookupDone).Milliseconds()).
+		Int64("lookup_ms", tLookupDone.Sub(tHandler).Milliseconds()).
+		Int64("sched_ms", tVmdStart.Sub(tSchedStart).Milliseconds()).
 		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
 		Bool("vmd_retried", vmdRetried).
 		Int64("insert_ms", tInsertEnd.Sub(tInsertStart).Milliseconds()).
 		Int64("insert_wait_after_vmd_ms", tInsertReceive.Sub(tVmdEnd).Milliseconds()).
-		Int64("post_ms", tPostDone.Sub(tInsertReceive).Milliseconds()).
+		Int64("post_ms", tPostDone.Sub(tPostStart).Milliseconds()).
 		Int64("total_ms", tPostDone.Sub(tStart).Milliseconds()).
 		Msg("CreateSandbox phases")
 	c.JSON(http.StatusCreated, resp)
@@ -2670,6 +2757,14 @@ func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id string) (sn
 }
 
 func (h *Handlers) PauseSandbox(c *gin.Context) {
+	tPause := PhaseStart(c)
+	// Transition counts/results come from the SandboxLifecycleTelemetry
+	// middleware; this defer emits only the phase-series total.
+	pauseHostID := ""
+	defer func() {
+		RecordLatencyPhases(c.Request.Context(), "pause", pauseHostID,
+			map[string]time.Duration{"total": time.Since(tPause)})
+	}()
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return
@@ -2692,6 +2787,9 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		ID:     sandboxID,
 		TeamID: teamID,
 	})
+	if err == nil {
+		pauseHostID = sandbox.HostID // label error outcomes past the claim too
+	}
 	if err != nil {
 		if err != pgx.ErrNoRows {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginPause failed")
@@ -2818,7 +2916,6 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// end of the VMD pause work, not the moment the sandbox left active.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
-
 	c.Status(http.StatusNoContent)
 }
 
