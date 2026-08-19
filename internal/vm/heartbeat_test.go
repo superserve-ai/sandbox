@@ -204,7 +204,7 @@ func TestSendHeartbeatOmitsCapabilityForOldOrUnavailableProxy(t *testing.T) {
 	}
 }
 
-func TestSendHeartbeatFailureDiagnosticsIncludeDebugDurationAndStatus(t *testing.T) {
+func TestSendHeartbeatFailureDiagnosticsIncludeWarningDurationAndStatus(t *testing.T) {
 	t.Run("non-200 response", func(t *testing.T) {
 		var logOutput bytes.Buffer
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -219,11 +219,11 @@ func TestSendHeartbeatFailureDiagnosticsIncludeDebugDurationAndStatus(t *testing
 
 		sendHeartbeat(context.Background(), server.Client(), "host-a", server.URL+"/heartbeat", "", server.URL+"/health", zerolog.New(&logOutput))
 		output := logOutput.String()
-		if !bytes.Contains(logOutput.Bytes(), []byte(`"level":"debug"`)) ||
+		if !bytes.Contains(logOutput.Bytes(), []byte(`"level":"warn"`)) ||
 			!bytes.Contains(logOutput.Bytes(), []byte(`"message":"heartbeat got non-200 response"`)) ||
 			!bytes.Contains(logOutput.Bytes(), []byte(`"status":409`)) ||
 			!bytes.Contains(logOutput.Bytes(), []byte(`"duration"`)) {
-			t.Fatalf("failure diagnostics=%s, want debug status and duration", output)
+			t.Fatalf("failure diagnostics=%s, want warn status and duration", output)
 		}
 	})
 
@@ -236,10 +236,10 @@ func TestSendHeartbeatFailureDiagnosticsIncludeDebugDurationAndStatus(t *testing
 		server.Close()
 
 		sendHeartbeat(context.Background(), http.DefaultClient, "host-a", url+"/heartbeat", "", url+"/health", zerolog.New(&logOutput))
-		if !bytes.Contains(logOutput.Bytes(), []byte(`"level":"debug"`)) ||
+		if !bytes.Contains(logOutput.Bytes(), []byte(`"level":"warn"`)) ||
 			!bytes.Contains(logOutput.Bytes(), []byte(`"message":"heartbeat failed"`)) ||
 			!bytes.Contains(logOutput.Bytes(), []byte(`"duration"`)) {
-			t.Fatalf("failure diagnostics=%s, want debug duration", logOutput.String())
+			t.Fatalf("failure diagnostics=%s, want warn duration", logOutput.String())
 		}
 	})
 }

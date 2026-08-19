@@ -91,11 +91,10 @@ func sendHeartbeat(ctx context.Context, client *http.Client, hostID, url, token,
 	started := time.Now()
 	capabilities, err := proxyPreviewCapabilities(ctx, client, proxyHealthURL)
 	if err != nil {
-		log.Debug().Err(err).
+		log.Warn().Err(err).
 			Str("host_id", hostID).
 			Dur("duration", time.Since(started)).
 			Msg("proxy capability probe failed; advertising no preview capabilities")
-		log.Warn().Err(err).Str("host_id", hostID).Msg("proxy capability probe failed; advertising no preview capabilities")
 		capabilities = nil
 	}
 
@@ -122,11 +121,6 @@ func sendHeartbeat(ctx context.Context, client *http.Client, hostID, url, token,
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Debug().Err(err).
-			Str("host_id", hostID).
-			Strs("capabilities", capabilities).
-			Dur("duration", time.Since(started)).
-			Msg("heartbeat failed")
 		log.Warn().Err(err).
 			Str("host_id", hostID).
 			Strs("capabilities", capabilities).
@@ -138,12 +132,6 @@ func sendHeartbeat(ctx context.Context, client *http.Client, hostID, url, token,
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Debug().
-			Str("host_id", hostID).
-			Strs("capabilities", capabilities).
-			Int("status", resp.StatusCode).
-			Dur("duration", time.Since(started)).
-			Msg("heartbeat got non-200 response")
 		log.Warn().
 			Str("host_id", hostID).
 			Strs("capabilities", capabilities).

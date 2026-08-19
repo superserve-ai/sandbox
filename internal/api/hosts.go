@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
@@ -90,10 +91,15 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		return
 	}
 
+	var lastHeartbeatAt any
+	if host.LastHeartbeatAt.Valid {
+		lastHeartbeatAt = host.LastHeartbeatAt.Time.Format(time.RFC3339Nano)
+	}
+
 	log.Debug().
 		Str("host_id", hostID).
 		Strs("capabilities", capabilities).
-		Interface("last_heartbeat_at", host.LastHeartbeatAt).
+		Interface("last_heartbeat_at", lastHeartbeatAt).
 		Str("status", host.Status).
 		Str("prev_status", host.PrevStatus).
 		Msg("host heartbeat persisted")

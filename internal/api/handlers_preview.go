@@ -367,16 +367,22 @@ func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string,
 				if row.Capability == nil {
 					continue
 				}
+				var hbAt any
+				if row.HeartbeatAt.Valid {
+					hbAt = row.HeartbeatAt.Time.Format(time.RFC3339Nano)
+				}
 				rows = append(rows, map[string]any{
 					"capability":   *row.Capability,
-					"heartbeat_at": row.HeartbeatAt,
+					"heartbeat_at": hbAt,
 				})
 			}
 			var generation any
 			var hostStatus any
 			var capabilitiesMatch any
 			if len(snapshot) > 0 {
-				generation = snapshot[0].LastHeartbeatAt
+				if snapshot[0].LastHeartbeatAt.Valid {
+					generation = snapshot[0].LastHeartbeatAt.Time.Format(time.RFC3339Nano)
+				}
 				hostStatus = snapshot[0].Status
 				capabilitiesMatch = snapshot[0].CapabilitiesMatch
 			}
