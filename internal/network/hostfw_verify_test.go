@@ -775,3 +775,88 @@ func TestRepairRefusesStrictForeignAbovePreroutingRedirect(t *testing.T) {
 		t.Fatalf("refusal must not mutate, got %d restores", k.restores)
 	}
 }
+
+func TestStaleManagedRedirectIsReconciledNotFatal(t *testing.T) {
+	// A supported config change (secretsproxy address, proxy port) leaves the
+	// previous generation's redirect installed. It must classify as a
+	// repairable stale-managed mismatch — not preceded-ambiguous — and repair
+	// must delete it while foreign redirects stay untouched.
+	spec := testSpec(true)
+	oldSecrets := []string{"-i", "veth+", "-p", "tcp", "-d", "169.254.0.99", "--dport", "9443", "-j", "REDIRECT", "--to-port", "9443"}
+	oldTLS := []string{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", "9999"}
+	rules, chains := specKernel(spec, nil)
+	rules["nat/PREROUTING"] = append([][]string{oldSecrets, oldTLS}, rules["nat/PREROUTING"]...)
+
+	if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "stale-managed" {
+		t.Fatalf("ok=%v class=%s, want stale-managed", ok, class)
+	}
+
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+		t.Fatalf("post-repair verify failed: %s %s", class, detail)
+	}
+	for _, r := range k.rules["nat/PREROUTING"] {
+		if ruleEqual(r, oldSecrets) || ruleEqual(r, oldTLS) {
+			t.Fatalf("stale managed redirect survived reconciliation: %v", r)
+		}
+	}
+}
+
+func TestStaleShapeDoesNotMatchOperatorRedirect(t *testing.T) {
+	// An operator's own redirect (custom dport, to-port != dport) must never
+	// read as a stale vmd rule.
+	for _, tokens := range [][]string{
+		{"-i", "veth+", "-p", "tcp", "--dport", "8080", "-j", "REDIRECT", "--to-port", "999"},
+		{"-i", "veth+", "-p", "tcp", "-d", "10.0.0.5", "--dport", "9443", "-j", "REDIRECT", "--to-port", "1234"},
+		{"-i", "eth0", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", "8443"},
+	} {
+		if staleManagedRule("nat/PREROUTING", tokens) {
+			t.Fatalf("operator redirect misread as stale vmd rule: %v", tokens)
+		}
+	}
+}
+
+func TestRepairKeepsClampAheadOfForeignAccept(t *testing.T) {
+	// A tolerated foreign veth ACCEPT below the drops must not end up ahead
+	// of the MSS clamp after a repair — unclamped sandbox SYNs would leave
+	// FORWARD before TCPMSS runs.
+	spec := testSpec(true)
+	rules, chains := specKernel(spec, nil)
+	foreignAccept := []string{"-i", "veth+", "-p", "tcp", "--dport", "8443", "-j", "ACCEPT"}
+	fw := rules["filter/FORWARD"]
+	// Foreign accept after the drops (tolerated), duplicate udp drop at the
+	// end to force a repair.
+	fw = append(fw[:2:2], append([][]string{foreignAccept}, fw[2:]...)...)
+	fw = append(fw, append([]string(nil), fw[1]...))
+	rules["filter/FORWARD"] = fw
+
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	got := k.rules["filter/FORWARD"]
+	clampIdx, foreignIdx := -1, -1
+	for i, r := range got {
+		if ruleEqual(r, []string{"-o", "eth0", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"}) {
+			clampIdx = i
+		}
+		if ruleEqual(r, foreignAccept) {
+			foreignIdx = i
+		}
+	}
+	if clampIdx == -1 || foreignIdx == -1 || clampIdx > foreignIdx {
+		t.Fatalf("clamp not ahead of foreign accept after repair (clamp=%d foreign=%d)", clampIdx, foreignIdx)
+	}
+	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+		t.Fatalf("post-repair verify failed: %s %s", class, detail)
+	}
+}

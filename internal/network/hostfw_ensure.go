@@ -33,8 +33,12 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 		if d, perr := parseIPTablesSave(out); perr == nil {
 			var ok bool
 			if ok, class, detail = verifyHostFirewall(d, spec); ok {
-				log.Info().Dur("verify_ms", time.Since(tVerify)).
-					Msg("host firewall verified intact — install skipped")
+				// Async: an informational write must not extend the fast path.
+				verifyDur := time.Since(tVerify)
+				go func() {
+					log.Info().Dur("verify_ms", verifyDur).
+						Msg("host firewall verified intact — install skipped")
+				}()
 				return nil
 			}
 		} else {
@@ -92,7 +96,7 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 				Msg("host firewall not fully verified — ordering repair is the daemon's; continuing with installed rules")
 			return nil
 		}
-		repairable := class == "misordered" || class == "duplicate-rule" || class == "preceded"
+		repairable := class == "misordered" || class == "duplicate-rule" || class == "preceded" || class == "stale-managed"
 		if pass > 0 || !repairable {
 			return fmt.Errorf("host firewall failed verification after install (%s: %s) — refusing to serve with unverified enforcement", class, detail)
 		}
@@ -138,6 +142,23 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 		}
 		table, chain, _ := strings.Cut(key, "/")
 		got := d.rules[key]
+		// Reconcile stale managed rules (a previous configuration's
+		// redirects): deleted by their exact dump rulespec — they are vmd's
+		// own rules from an older parameterization, the shared-chain analog
+		// of the owned chains' flush-and-rebuild reconciliation.
+		var staleLines []string
+		for _, g := range got {
+			isOurs := false
+			for _, w := range want {
+				if ruleEqual(w.args, g) {
+					isOurs = true
+					break
+				}
+			}
+			if !isOurs && staleManagedRule(key, g) {
+				staleLines = append(staleLines, "-D "+chain+" "+strings.Join(g, " "))
+			}
+		}
 		// PREROUTING's head-inserted rules are TERMINAL redirects: re-inserting
 		// them at the absolute head would demote a stricter foreign rule that
 		// currently runs before one of ours to below the redirect, where the
@@ -165,12 +186,12 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 						break
 					}
 				}
-				if !isOurs && !ruleCannotMatchSandboxIngress(g) && foreignDisposition(g) == "strict" {
+				if !isOurs && !staleManagedRule(key, g) && !ruleCannotMatchSandboxIngress(g) && foreignDisposition(g) == "strict" {
 					return fmt.Errorf("stricter foreign rule above a vmd redirect in %s (%s) — refusing to reorder past it", key, strings.Join(g, " "))
 				}
 			}
 		}
-		var lines []string
+		lines := staleLines
 		for _, w := range want {
 			for _, g := range got {
 				if ruleEqual(w.args, g) {
@@ -181,7 +202,7 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 		headPos := 0
 		var tail []string
 		for _, w := range want {
-			if securityRule(key, w) {
+			if headRule(key, w) {
 				headPos++
 				lines = append(lines, fmt.Sprintf("-I %s %d %s", chain, headPos, strings.Join(w.args, " ")))
 			} else {

@@ -312,9 +312,69 @@ func securityRule(key string, w fwRule) bool {
 	return last == "DROP" || last == portDropChain
 }
 
+// headRule reports whether repair re-inserts a spec rule at the chain head:
+// the security rules, plus the MSS clamp — the clamp is non-terminal (running
+// it before the drops is harmless) but MUST precede any terminal ACCEPT,
+// including a tolerated foreign one, or sandbox SYNs leave FORWARD unclamped.
+func headRule(key string, w fwRule) bool {
+	if securityRule(key, w) {
+		return true
+	}
+	return w.args[len(w.args)-1] == "--clamp-mss-to-pmtu"
+}
+
+// staleManagedRule reports whether a non-spec dump rule matches one of vmd's
+// own PREROUTING redirect shapes with different parameter values — the
+// previous configuration's rule (secretsproxy address/port or proxy port
+// changed across a restart). These are reconciled (deleted) by repair rather
+// than treated as unrecoverable foreign rules: the shapes are unmistakably
+// vmd's (veth+ ingress REDIRECTs; the secretsproxy form additionally requires
+// dport == to-port, which only vmd generates). Only PREROUTING shapes are
+// recognized — stale variants elsewhere never block startup.
+func staleManagedRule(key string, tokens []string) bool {
+	if key != "nat/PREROUTING" {
+		return false
+	}
+	groups, ok := canonicalRule(tokens)
+	if !ok {
+		return false
+	}
+	g := map[string]string{}
+	for _, e := range groups {
+		opt, val, _ := strings.Cut(e, " ")
+		g[opt] = val
+	}
+	if g["-i"] != "veth+" || g["-p"] != "tcp" || g["-j"] != "REDIRECT" || g["--to-port"] == "" || g["--dport"] == "" {
+		return false
+	}
+	switch len(groups) {
+	case 5: // http/tls shape: fixed web dport, any to-port
+		return g["--dport"] == "80" || g["--dport"] == "443"
+	case 6: // secretsproxy shape: -d plus the vmd-distinctive dport==to-port
+		return g["-d"] != "" && g["--dport"] == g["--to-port"]
+	}
+	return false
+}
+
 func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, detail string) {
 	for key, want := range spec.sharedOrdered {
 		got := d.rules[key]
+		// Stale managed rules (a previous configuration's redirects) are a
+		// repairable mismatch, recognized before the head guard would
+		// misclassify them as ambiguous foreign rules and block startup on a
+		// supported config change.
+		for _, g := range got {
+			isOurs := false
+			for _, w := range want {
+				if ruleEqual(w.args, g) {
+					isOurs = true
+					break
+				}
+			}
+			if !isOurs && staleManagedRule(key, g) {
+				return false, "stale-managed", key + ": " + strings.Join(g, " ")
+			}
+		}
 		// Head guard: no foreign rule capable of matching sandbox traffic may
 		// sit above (or interleave) the vmd security rules — relative order
 		// among our own rules alone would still verify with a foreign
