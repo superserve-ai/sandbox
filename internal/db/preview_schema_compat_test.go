@@ -141,7 +141,8 @@ func TestHostCapabilityAttestationIsBoundToCurrentHeartbeat(t *testing.T) {
 		t.Fatalf("read host queries: %v", err)
 	}
 	queries := string(raw)
-	if !strings.Contains(queries, "SELECT id, sqlc.arg(capability), last_heartbeat_at") {
+	if !strings.Contains(queries, "INSERT INTO host_capability (host_id, capability, heartbeat_at)") ||
+		!strings.Contains(queries, "SELECT h.id, a.capability, h.last_heartbeat_at") {
 		t.Fatal("capability insert is not stamped with the heartbeat it attests")
 	}
 	if got := strings.Count(queries, "hc.heartbeat_at = h.last_heartbeat_at"); got < 2 {
@@ -149,6 +150,35 @@ func TestHostCapabilityAttestationIsBoundToCurrentHeartbeat(t *testing.T) {
 	}
 	if !strings.Contains(queries, "h.status = 'active'") {
 		t.Fatal("host capability gate accepts capabilities from an unhealthy host")
+	}
+}
+
+func TestSyncHostCapabilitiesUsesCompleteSetSemantics(t *testing.T) {
+	path := filepath.Join("..", "..", "db", "queries", "hosts.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read host queries: %v", err)
+	}
+	queries := string(raw)
+	start := strings.Index(queries, "-- name: SyncHostCapabilities :exec")
+	if start < 0 {
+		t.Fatal("capability synchronization query is missing")
+	}
+	end := strings.Index(queries[start:], "-- name:")
+	if end > 0 {
+		queries = queries[start : start+end]
+	} else {
+		queries = queries[start:]
+	}
+	for _, required := range []string{
+		"unnest(COALESCE(sqlc.arg(capabilities)::text[], ARRAY[]::text[]))",
+		"ON CONFLICT (host_id, capability)",
+		"DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at",
+		"NOT (hc.capability = ANY(COALESCE(sqlc.arg(capabilities)::text[], ARRAY[]::text[])))",
+	} {
+		if !strings.Contains(queries, required) {
+			t.Errorf("sync query is missing %q", required)
+		}
 	}
 }
 

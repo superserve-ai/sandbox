@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -92,6 +94,119 @@ func TestHostCapacityQueryTimeoutIndependentOfInterval(t *testing.T) {
 		}
 	}
 }
+
+// resourceAttr looks up a single resource-level attribute by key, the
+// counterpart to the point-level attribute maps the other tests build from
+// datapoint.Attributes.
+func resourceAttr(t *testing.T, kvs []attribute.KeyValue, key string) (string, bool) {
+	t.Helper()
+	for _, kv := range kvs {
+		if string(kv.Key) == key {
+			return kv.Value.AsString(), true
+		}
+	}
+	return "", false
+}
+
+func TestNewInstanceIDIsUniqueAndNonEmpty(t *testing.T) {
+	a := NewInstanceID()
+	b := NewInstanceID()
+	if a == "" || b == "" {
+		t.Fatalf("NewInstanceID returned empty value: a=%q b=%q", a, b)
+	}
+	if a == b {
+		t.Fatalf("two NewInstanceID calls returned the same value %q", a)
+	}
+}
+
+func TestBuildOTelResourceGeneratesUniqueInstanceIDsPerReplica(t *testing.T) {
+	// Simulates two concurrent Cloud Run replicas of the same service, each
+	// constructing its own recorder from the same base config. Without a
+	// per-process instance.id, both would export identical
+	// service.name+environment series and collide as duplicate time series
+	// once they land in Google Managed Prometheus (the bug this fix closes).
+	cfg := OTelConfig{
+		ServiceName: "sandbox-controlplane",
+		Environment: "production",
+	}
+	cfg.InstanceID = uuid.New().String()
+	resA, err := buildOTelResource(cfg)
+	if err != nil {
+		t.Fatalf("buildOTelResource (replica A): %v", err)
+	}
+
+	cfg.InstanceID = uuid.New().String()
+	resB, err := buildOTelResource(cfg)
+	if err != nil {
+		t.Fatalf("buildOTelResource (replica B): %v", err)
+	}
+
+	idA, ok := resourceAttr(t, resA.Attributes(), "service.instance.id")
+	if !ok || idA == "" {
+		t.Fatalf("replica A resource missing non-empty service.instance.id: %#v", resA.Attributes())
+	}
+	idB, ok := resourceAttr(t, resB.Attributes(), "service.instance.id")
+	if !ok || idB == "" {
+		t.Fatalf("replica B resource missing non-empty service.instance.id: %#v", resB.Attributes())
+	}
+	if idA == idB {
+		t.Fatalf("replica A and B share service.instance.id %q; each replica must be independently identifiable", idA)
+	}
+}
+
+func TestBuildOTelResourceHonorsExplicitInstanceID(t *testing.T) {
+	cfg := OTelConfig{
+		ServiceName: "sandbox-vmd",
+		Environment: "production",
+		InstanceID:  "usw2-fixed-id",
+	}
+	res, err := buildOTelResource(cfg)
+	if err != nil {
+		t.Fatalf("buildOTelResource: %v", err)
+	}
+	if got, ok := resourceAttr(t, res.Attributes(), "service.instance.id"); !ok || got != "usw2-fixed-id" {
+		t.Fatalf("service.instance.id = %q, ok=%v, want %q", got, ok, "usw2-fixed-id")
+	}
+}
+
+func TestNewOTelRecorderDefaultsInstanceIDWhenUnset(t *testing.T) {
+	ctx := context.Background()
+
+	makeRecorder := func() *OTelRecorder {
+		t.Helper()
+		r, err := NewOTelRecorder(ctx, OTelConfig{
+			ServiceName: "sandbox-controlplane",
+			Environment: "production",
+			// Endpoint left at its default; NewOTelRecorder only
+			// constructs the OTLP client here, it does not dial out.
+		})
+		if err != nil {
+			t.Fatalf("NewOTelRecorder: %v", err)
+		}
+		t.Cleanup(func() {
+			shutdownCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			// Best-effort: Shutdown force-flushes to the configured OTLP
+			// endpoint, which nothing is listening on in this test. That
+			// flush failure is expected here and orthogonal to what this
+			// test checks (instance ID uniqueness), so it's swallowed
+			// rather than failing the test.
+			_ = r.Shutdown(shutdownCtx)
+		})
+		return r
+	}
+
+	first := makeRecorder()
+	second := makeRecorder()
+
+	if first.instanceID == "" {
+		t.Fatal("NewOTelRecorder left InstanceID empty; every replica would export identical series")
+	}
+	if first.instanceID == second.instanceID {
+		t.Fatalf("two NewOTelRecorder calls produced the same instanceID %q", first.instanceID)
+	}
+}
+
 func TestRecordVMDCallEmitsHostIDAndMethodAttributes(t *testing.T) {
 	ctx := context.Background()
 

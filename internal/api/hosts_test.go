@@ -23,7 +23,7 @@ func setupHostHeartbeatRouter(h *Handlers) *gin.Engine {
 	return r
 }
 
-func TestHostHeartbeatReplacesAdvertisedCapabilities(t *testing.T) {
+func TestHostHeartbeatSyncsAdvertisedCapabilities(t *testing.T) {
 	var gotHostID string
 	var gotCapabilities []string
 	mock := &mockDBTX{
@@ -35,20 +35,13 @@ func TestHostHeartbeatReplacesAdvertisedCapabilities(t *testing.T) {
 			return hostRow(db.Host{ID: gotHostID, Status: "active"})
 		},
 		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-			switch {
-			case strings.Contains(sql, "-- name: DeleteHostCapabilities :exec"):
-				if args[0] != "host-a" {
-					t.Errorf("delete host id = %v, want host-a", args[0])
-				}
-				gotCapabilities = nil
-			case strings.Contains(sql, "-- name: InsertHostCapability :exec"):
-				if args[1] != "host-a" {
-					t.Errorf("insert host id = %v, want host-a", args[1])
-				}
-				gotCapabilities = append(gotCapabilities, args[0].(string))
-			default:
+			if !strings.Contains(sql, "-- name: SyncHostCapabilities :exec") {
 				return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec: %s", sql)
 			}
+			if args[0] != "host-a" {
+				t.Errorf("sync host id = %v, want host-a", args[0])
+			}
+			gotCapabilities = append(gotCapabilities, args[1].([]string)...)
 			return pgconn.NewCommandTag("INSERT 0 1"), nil
 		},
 	}
@@ -70,7 +63,7 @@ func TestHostHeartbeatReplacesAdvertisedCapabilities(t *testing.T) {
 
 func TestHostHeartbeatWithoutBodyClearsCapabilities(t *testing.T) {
 	called := false
-	cleared := false
+	var gotCapabilities []string
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if !strings.Contains(sql, "-- name: UpdateHostHeartbeat :one") {
@@ -80,13 +73,13 @@ func TestHostHeartbeatWithoutBodyClearsCapabilities(t *testing.T) {
 			return hostRow(db.Host{ID: args[0].(string), Status: "active"})
 		},
 		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-			if !strings.Contains(sql, "-- name: DeleteHostCapabilities :exec") {
+			if !strings.Contains(sql, "-- name: SyncHostCapabilities :exec") {
 				return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec: %s", sql)
 			}
 			if args[0] != "host-old" {
-				t.Errorf("delete host id = %v, want host-old", args[0])
+				t.Errorf("sync host id = %v, want host-old", args[0])
 			}
-			cleared = true
+			gotCapabilities = args[1].([]string)
 			return pgconn.NewCommandTag("DELETE 1"), nil
 		},
 	}
@@ -95,8 +88,8 @@ func TestHostHeartbeatWithoutBodyClearsCapabilities(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/internal/hosts/host-old/heartbeat", nil)
 	setupHostHeartbeatRouter(h).ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK || !called || !cleared {
-		t.Fatalf("status = %d called = %v cleared = %v, want 200/true/true; body: %s", w.Code, called, cleared, w.Body.String())
+	if w.Code != http.StatusOK || !called || gotCapabilities == nil || len(gotCapabilities) != 0 {
+		t.Fatalf("status = %d called = %v capabilities = %#v, want 200/true/empty; body: %s", w.Code, called, gotCapabilities, w.Body.String())
 	}
 }
 
