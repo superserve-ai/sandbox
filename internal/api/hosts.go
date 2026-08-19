@@ -59,15 +59,10 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		}
 		// Missing capabilities is an explicit empty replacement. This clears a
 		// stale attestation immediately when VMD can no longer verify its proxy.
-		if err := q.DeleteHostCapabilities(ctx, hostID); err != nil {
+		if err := q.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+			HostID: hostID, Capabilities: capabilities,
+		}); err != nil {
 			return db.UpdateHostHeartbeatRow{}, err
-		}
-		for _, capability := range capabilities {
-			if err := q.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
-				HostID: hostID, Capability: capability,
-			}); err != nil {
-				return db.UpdateHostHeartbeatRow{}, err
-			}
 		}
 		return host, nil
 	}
