@@ -20,6 +20,16 @@ import (
 var (
 	bucketName              = []byte("vms")
 	previewPolicyBucketName = []byte("vm_preview_policies")
+	// Derived, safety-critical startup indexes: sparse projections of the
+	// records bucket (cgroup-supervised membership; vmID→namespace for records
+	// holding a network slot), maintained inside the same transaction as every
+	// record write and trusted at open only when the clean-close stamp proves
+	// no other writer ran since (see OpenStateStore). Fail-closed: any doubt
+	// rebuilds both from the records in one projection pass.
+	idxCgroupBucketName = []byte("idx_cgroup_vms")
+	idxSlotNSBucketName = []byte("idx_slot_ns")
+	metaBucketName      = []byte("meta")
+	metaIndexTrustKey   = []byte("index_trust")
 	// pendingBackupBucketName records pauses whose backup enqueue has not
 	// completed: the async retry goroutine is not a durable record, and a
 	// crash or deploy during its window must not lose the pause's coverage.
@@ -251,6 +261,19 @@ func knownSupervision(s Supervision) bool {
 // systemd unit and lives in a per-VM cgroup.
 func cgroupSupervised(s Supervision) bool { return s == SupervisionCgroup }
 
+// indexSchemaVersion versions the startup-index layout and trust-stamp format.
+// Bump on any change to what the index buckets contain or mean; a mismatched
+// stamp forces a projection rebuild.
+const indexSchemaVersion = 1
+
+// indexTrustStamp is the single versioned trust value written on clean close.
+// TxID is the stamp transaction's own Bolt txid — see the trust check in
+// OpenStateStore for the validity rule.
+type indexTrustStamp struct {
+	Version int `json:"version"`
+	TxID    int `json:"txid"`
+}
+
 // StateBreadcrumbPath is the fixed, non-configurable location where vmd
 // records its RESOLVED state-store path. The host-resident rollback guard
 // reads it instead of re-deriving the path from env files, so the two can
@@ -289,12 +312,17 @@ type StateStore struct {
 // startup timing. Observability only.
 type StateStoreOpenStats struct {
 	BoltOpen       time.Duration // bolt.Open: mmap + freelist load
-	PolicyScan     time.Duration // sidecar orphan scan + deletes
-	RecordScan     time.Duration // primary record scan + policy migration
+	PolicyScan     time.Duration // sidecar orphan scan + deletes (untrusted boots only)
+	RecordScan     time.Duration // projection pass: index rebuild + policy seeding (untrusted boots only)
 	TxResidual     time.Duration // db.Update outside the scans: bucket creates + commit/fsync
 	Records        int
 	Policies       int
 	OrphansDeleted int
+	// IndexTrusted reports whether the startup indexes were trusted at open
+	// (clean-close stamp valid) or rebuilt; IndexTrustReason is "trusted" or
+	// why not: no-stamp, bad-stamp, version-mismatch, txid-moved.
+	IndexTrusted     bool
+	IndexTrustReason string
 }
 
 // OpenStats returns the timing/count breakdown captured while the store opened.
@@ -312,6 +340,43 @@ func OpenStateStore(path string) (*StateStore, error) {
 		return nil, fmt.Errorf("open state store %s: %w", path, err)
 	}
 	stats.BoltOpen = time.Since(tOpen)
+
+	// Trust check in a read transaction, before the bucket-create tx below
+	// bumps the txid. The stamp is valid only while it is still the store's
+	// last write; anything since (index-unaware binary, crash that never
+	// stamped, external tool) moved the txid — fail closed and rebuild.
+	trusted, reason := false, "no-stamp"
+	if verr := db.View(func(tx *bolt.Tx) error {
+		meta := tx.Bucket(metaBucketName)
+		if meta == nil {
+			return nil
+		}
+		raw := meta.Get(metaIndexTrustKey)
+		if raw == nil {
+			return nil
+		}
+		var stamp indexTrustStamp
+		if err := json.Unmarshal(raw, &stamp); err != nil {
+			reason = "bad-stamp"
+			return nil
+		}
+		if stamp.Version != indexSchemaVersion {
+			reason = "version-mismatch"
+			return nil
+		}
+		if tx.ID() != stamp.TxID {
+			reason = "txid-moved"
+			return nil
+		}
+		trusted, reason = true, "trusted"
+		return nil
+	}); verr != nil {
+		db.Close()
+		return nil, fmt.Errorf("read index trust: %w", verr)
+	}
+	stats.IndexTrusted = trusted
+	stats.IndexTrustReason = reason
+
 	tTx := time.Now()
 	if err := db.Update(func(tx *bolt.Tx) error {
 		records, err := tx.CreateBucketIfNotExists(bucketName)
@@ -328,10 +393,47 @@ func OpenStateStore(path string) (*StateStore, error) {
 		if err != nil {
 			return err
 		}
+		meta, err := tx.CreateBucketIfNotExists(metaBucketName)
+		if err != nil {
+			return err
+		}
+		// Consume the stamp: it is re-written only by the next clean close,
+		// so a crash mid-run can never leave a valid stamp behind.
+		if err := meta.Delete(metaIndexTrustKey); err != nil {
+			return err
+		}
+
+		if trusted {
+			// Indexes were maintained transactionally by the binary that
+			// stamped, and nothing wrote since: skip the projection rebuild
+			// AND the policy migration pass (both are repairs for
+			// index-unaware writers, which the txid check just ruled out).
+			return nil
+		}
+
+		// Projection rebuild, fail-closed: recreate both index buckets from
+		// scratch — an upsert-only rebuild would let entries stale-deleted by
+		// an old binary survive — then repopulate from the records in ONE
+		// decode pass that also runs the policy migration work.
+		for _, name := range [][]byte{idxCgroupBucketName, idxSlotNSBucketName} {
+			if tx.Bucket(name) != nil {
+				if err := tx.DeleteBucket(name); err != nil {
+					return err
+				}
+			}
+		}
+		idxCg, err := tx.CreateBucket(idxCgroupBucketName)
+		if err != nil {
+			return err
+		}
+		idxNS, err := tx.CreateBucket(idxSlotNSBucketName)
+		if err != nil {
+			return err
+		}
 
 		// An old VMD can delete the primary record without knowing about the
-		// sidecar bucket. Remove those orphans before migrating so a later VM
-		// reusing the same key cannot inherit deleted policy state.
+		// sidecar bucket. Remove those orphans so a later VM reusing the same
+		// key cannot inherit deleted policy state.
 		tPolicy := time.Now()
 		var orphanKeys [][]byte
 		if err := policies.ForEach(func(k, _ []byte) error {
@@ -351,18 +453,28 @@ func OpenStateStore(path string) (*StateStore, error) {
 		stats.OrphansDeleted = len(orphanKeys)
 		stats.PolicyScan = time.Since(tPolicy)
 
-		// Seed the sidecar for records written by the immediately preceding
-		// schema. Once present, the sidecar is authoritative and is never
-		// replaced from the primary JSON during startup.
+		// One projection pass: decode each record once, rebuild both indexes,
+		// and seed missing policy sidecars (records written by the immediately
+		// preceding schema; once present, the sidecar is authoritative).
 		tRecord := time.Now()
 		err = records.ForEach(func(k, v []byte) error {
 			stats.Records++
-			if policies.Get(k) != nil {
-				return nil
-			}
 			var rec VMRecord
 			if err := json.Unmarshal(v, &rec); err != nil {
-				return fmt.Errorf("unmarshal vm record during preview policy migration: %w", err)
+				return fmt.Errorf("unmarshal vm record during startup projection: %w", err)
+			}
+			if cgroupSupervised(rec.Supervision) {
+				if err := idxCg.Put(k, []byte{1}); err != nil {
+					return err
+				}
+			}
+			if rec.Namespace != "" {
+				if err := idxNS.Put(k, []byte(rec.Namespace)); err != nil {
+					return err
+				}
+			}
+			if policies.Get(k) != nil {
+				return nil
 			}
 			policy := previewPolicyFromRecord(rec)
 			if !policy.isSet() {
@@ -440,8 +552,52 @@ func (s *StateStore) Delete(vmID string) error {
 		if err := tx.Bucket(bucketName).Delete(key); err != nil {
 			return err
 		}
+		if err := dropIndexEntries(tx, key); err != nil {
+			return err
+		}
 		return tx.Bucket(previewPolicyBucketName).Delete(key)
 	})
+}
+
+// maintainIndexes keeps the sparse startup indexes in sync with a record
+// write, inside the record's own transaction. Read-compare-write: only an
+// actual membership or namespace change touches a bucket, so bulk rewrites of
+// unchanged records (reattach, reconciliation) dirty no index pages. Safe
+// under Batch retry — every operation is idempotent.
+func maintainIndexes(tx *bolt.Tx, key []byte, rec VMRecord) error {
+	cg := tx.Bucket(idxCgroupBucketName)
+	if want, has := cgroupSupervised(rec.Supervision), cg.Get(key) != nil; want != has {
+		if want {
+			if err := cg.Put(key, []byte{1}); err != nil {
+				return err
+			}
+		} else if err := cg.Delete(key); err != nil {
+			return err
+		}
+	}
+	ns := tx.Bucket(idxSlotNSBucketName)
+	cur := ns.Get(key)
+	switch {
+	case rec.Namespace == "" && cur != nil:
+		return ns.Delete(key)
+	case rec.Namespace != "" && string(cur) != rec.Namespace:
+		return ns.Put(key, []byte(rec.Namespace))
+	}
+	return nil
+}
+
+// dropIndexEntries removes a key from both startup indexes — for a deleted or
+// provably absent record. Conditional for the same page-dirtying reason.
+func dropIndexEntries(tx *bolt.Tx, key []byte) error {
+	if cg := tx.Bucket(idxCgroupBucketName); cg.Get(key) != nil {
+		if err := cg.Delete(key); err != nil {
+			return err
+		}
+	}
+	if ns := tx.Bucket(idxSlotNSBucketName); ns.Get(key) != nil {
+		return ns.Delete(key)
+	}
+	return nil
 }
 
 // PutIfPresent writes rec only if its key still exists, returning false if not.
@@ -473,7 +629,8 @@ func putRecord(tx *bolt.Tx, incoming VMRecord, onlyIfPresent bool) (bool, error)
 			return false, err
 		}
 		if onlyIfPresent {
-			return false, nil
+			// No record will exist after this tx: leave no index residue.
+			return false, dropIndexEntries(tx, key)
 		}
 	}
 
@@ -506,6 +663,9 @@ func putRecord(tx *bolt.Tx, incoming VMRecord, onlyIfPresent bool) (bool, error)
 		return false, fmt.Errorf("marshal vm record: %w", err)
 	}
 	if err := records.Put(key, data); err != nil {
+		return false, err
+	}
+	if err := maintainIndexes(tx, key, incoming); err != nil {
 		return false, err
 	}
 	if incomingPolicy.isSet() {
@@ -624,6 +784,55 @@ func (s *StateStore) All() ([]VMRecord, error) {
 		})
 	})
 	return records, err
+}
+
+// HasCgroupRecords reports whether any record is cgroup-supervised — a
+// first-key check on the idx_cgroup_vms projection, authoritative because the
+// projection is trusted-or-rebuilt at open.
+func (s *StateStore) HasCgroupRecords() (bool, error) {
+	var has bool
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(idxCgroupBucketName)
+		if b == nil {
+			return fmt.Errorf("cgroup index bucket missing (store not opened via OpenStateStore)")
+		}
+		k, _ := b.Cursor().First()
+		has = k != nil
+		return nil
+	})
+	return has, err
+}
+
+// SlotNamespaces returns vmID→namespace for every record holding a network
+// slot, from the idx_slot_ns projection — O(occupied slots), no record decode.
+func (s *StateStore) SlotNamespaces() (map[string]string, error) {
+	out := make(map[string]string)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(idxSlotNSBucketName)
+		if b == nil {
+			return fmt.Errorf("slot index bucket missing (store not opened via OpenStateStore)")
+		}
+		return b.ForEach(func(k, v []byte) error {
+			out[string(k)] = string(v)
+			return nil
+		})
+	})
+	return out, err
+}
+
+// StampIndexTrust writes the clean-close trust stamp. It must be this
+// process's last write to the store: the stamp records its own transaction id,
+// and the next open trusts the indexes only while that is still the store's
+// last transaction. Callers treat a failure as "no stamp" — the next boot
+// rebuilds.
+func (s *StateStore) StampIndexTrust() error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		stamp, err := json.Marshal(indexTrustStamp{Version: indexSchemaVersion, TxID: tx.ID()})
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(metaBucketName).Put(metaIndexTrustKey, stamp)
+	})
 }
 
 // IDs returns the set of persisted VM IDs without unmarshaling records.

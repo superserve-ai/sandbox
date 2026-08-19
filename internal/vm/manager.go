@@ -3457,18 +3457,17 @@ func (m *Manager) SweepStartupOrphanNamespaces(extraKeep ...string) {
 	if m.state == nil {
 		return
 	}
-	recs, err := m.state.All()
+	// Keep-set from the slot index — same content the record scan produced.
+	nsByID, err := m.state.SlotNamespaces()
 	if err != nil {
 		// Sweeping with an empty keep-set would delete every live VM's
-		// namespace — skip entirely when the records can't be read.
-		m.log.Error().Err(err).Msg("sweep: cannot read state — skipping orphan namespace sweep")
+		// namespace — skip entirely when the index can't be read.
+		m.log.Error().Err(err).Msg("sweep: cannot read slot index — skipping orphan namespace sweep")
 		return
 	}
-	keepNs := make(map[string]bool)
-	for _, rec := range recs {
-		if rec.Namespace != "" {
-			keepNs[rec.Namespace] = true
-		}
+	keepNs := make(map[string]bool, len(nsByID))
+	for _, ns := range nsByID {
+		keepNs[ns] = true
 	}
 	// Recordless cgroup survivors whose FC outlived the reap: keep their tap
 	// intact so the slot isn't recycled under a live process. The reconciler
@@ -3496,14 +3495,13 @@ func (m *Manager) ReserveStartupSlots(context.Context) bool {
 		return false
 	}
 	tLoad := time.Now()
-	recs, err := m.state.All()
+	slots, err := m.state.SlotNamespaces()
 	if err != nil {
-		m.log.Error().Err(err).Msg("failed to read state for startup slot reservation")
+		m.log.Error().Err(err).Msg("failed to read slot index for startup slot reservation")
 		return false
 	}
 	loadMS := time.Since(tLoad)
 	tReserve := time.Now()
-	slots := collectStartupSlots(recs)
 	m.netMgr.ReserveSlotsAbove(slots)
 	// Reservations pin the allocator above the highest record index, stranding
 	// every unused index below it. Hand those back now, while records are the
@@ -3512,8 +3510,8 @@ func (m *Manager) ReserveStartupSlots(context.Context) bool {
 	// Async: the write must not sit on the startup path.
 	reserveDur := time.Since(tReserve)
 	go func() {
-		m.log.Info().Dur("record_load_ms", loadMS).Dur("reserve_reclaim_ms", reserveDur).
-			Int("records", len(recs)).Int("reservations", len(slots)).Int("reclaimed", reclaimed).
+		m.log.Info().Dur("slot_index_load_ms", loadMS).Dur("reserve_reclaim_ms", reserveDur).
+			Int("reservations", len(slots)).Int("reclaimed", reclaimed).
 			Msg("startup slot reservation breakdown")
 	}()
 	if reclaimed > 0 {

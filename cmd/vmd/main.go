@@ -791,9 +791,25 @@ func main() {
 			Dur("record_scan_ms", oss.RecordScan).Dur("tx_residual_ms", oss.TxResidual).
 			Int("records", oss.Records).Int("policies", oss.Policies).
 			Int("orphans_deleted", oss.OrphansDeleted).Msg("state store open breakdown")
+		// Dedicated, alertable line: a host that rebuild-loops (trusted=false
+		// on every boot) has a writer defeating the clean-close stamp.
+		log.Info().Bool("trusted", oss.IndexTrusted).Str("reason", oss.IndexTrustReason).
+			Msg("startup index trust")
 	})
 	mgr.SetStateStore(stateStore)
-	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
+	lc.addCloser("state store", func(_ context.Context) error {
+		// Clean-close trust stamp: written only when shutdown reaches this
+		// closer (an aborted closer chain skips it → next boot rebuilds the
+		// startup indexes). One durable write inside the deploy gap — logged
+		// with its own duration so disk-pressure cost is visible.
+		tStamp := time.Now()
+		if err := stateStore.StampIndexTrust(); err != nil {
+			log.Warn().Err(err).Msg("index trust stamp failed — next boot rebuilds startup indexes")
+		} else {
+			log.Info().Dur("stamp_ms", time.Since(tStamp)).Msg("startup index trust stamped")
+		}
+		return stateStore.Close()
+	})
 
 	// Arm direct spawn AFTER the state store is attached (hasCgroupRecords
 	// reads it to decide rollback-management; the rollback-guard breadcrumb

@@ -384,16 +384,7 @@ func (m *Manager) hasCgroupRecords() (bool, error) {
 	if m.state == nil {
 		return false, nil
 	}
-	recs, err := m.state.All()
-	if err != nil {
-		return false, err
-	}
-	for _, r := range recs {
-		if cgroupSupervised(r.Supervision) {
-			return true, nil
-		}
-	}
-	return false, nil
+	return m.state.HasCgroupRecords()
 }
 
 // adoptVmsScope resolves and prepares the shipped superserve-vms.service
