@@ -75,6 +75,7 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	log.Info().
+		Str("host_id", cfg.HostID).
 		Str("url", url).
 		Str("proxy_health_url", proxyHealthURL).
 		Dur("interval", interval).
@@ -128,11 +129,17 @@ type proxyHealthResponse struct {
 }
 
 func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token, proxyHealthURL string, log zerolog.Logger) {
+	started := time.Now()
 	capabilities, err := proxyPreviewCapabilities(ctx, client, proxyHealthURL)
 	if err != nil {
-		log.Warn().Err(err).Msg("proxy capability probe failed; advertising no preview capabilities")
+		log.Warn().Err(err).Str("host_id", cfg.HostID).
+			Dur("duration", time.Since(started)).
+			Msg("proxy capability probe failed; advertising no preview capabilities")
 		capabilities = nil
 	}
+	log.Debug().Str("host_id", cfg.HostID).
+		Str("proxy_health_url", proxyHealthURL).Strs("capabilities", capabilities).
+		Msg("sending heartbeat")
 
 	body, err := json.Marshal(buildHeartbeatRequest(cfg, capabilities))
 	if err != nil {
@@ -151,7 +158,9 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Warn().Err(err).Msg("heartbeat failed")
+		log.Warn().Err(err).Str("host_id", cfg.HostID).
+			Strs("capabilities", capabilities).Dur("duration", time.Since(started)).
+			Msg("heartbeat failed")
 		return
 	}
 	io.Copy(io.Discard, resp.Body)
@@ -163,9 +172,17 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 		// the control plane refuses updates either way — but say why loudly:
 		// this is a provisioning error an operator must resolve.
 		log.Error().Int("status", resp.StatusCode).
+			Str("host_id", cfg.HostID).Strs("capabilities", capabilities).
+			Dur("duration", time.Since(started)).
 			Msg("heartbeat rejected: host identity in use by a live host at another address")
 	case resp.StatusCode != http.StatusOK:
-		log.Warn().Int("status", resp.StatusCode).Msg("heartbeat got non-200 response")
+		log.Warn().Int("status", resp.StatusCode).Str("host_id", cfg.HostID).
+			Strs("capabilities", capabilities).Dur("duration", time.Since(started)).
+			Msg("heartbeat got non-200 response")
+	default:
+		log.Debug().Str("host_id", cfg.HostID).Strs("capabilities", capabilities).
+			Int("status", resp.StatusCode).Dur("duration", time.Since(started)).
+			Msg("heartbeat completed")
 	}
 }
 
