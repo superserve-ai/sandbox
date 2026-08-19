@@ -25,4 +25,23 @@ COMMENT ON COLUMN sandbox.had_secret_bindings IS
     'cleared — a detached or failure-cleared binding may still have had a JWT '
     'minted against it. Destroy revokes unless this is false.';
 
+-- The marker is stamped by a trigger, not by the writing statement, so it holds
+-- for every writer: a previous API revision still serving during a rolling
+-- deploy, a rolled-back revision, or manual SQL. An application-side stamp would
+-- be a convention only the current code follows, and a binding written without
+-- it would let destroy skip the revocation for a credential that was issued.
+CREATE OR REPLACE FUNCTION sandbox_mark_secret_bound() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE sandbox SET had_secret_bindings = true
+  WHERE id = NEW.sandbox_id AND had_secret_bindings IS DISTINCT FROM true;
+  RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS sandbox_secret_marks_bound ON sandbox_secret;
+CREATE TRIGGER sandbox_secret_marks_bound
+    AFTER INSERT ON sandbox_secret
+    FOR EACH ROW EXECUTE FUNCTION sandbox_mark_secret_bound();
+
 COMMIT;

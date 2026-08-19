@@ -16,40 +16,32 @@ import (
 const addSandboxSecret = `-- name: AddSandboxSecret :execrows
 WITH live AS (
   SELECT s.id AS sandbox_id FROM sandbox s
-  WHERE s.id = $1 AND s.destroyed_at IS NULL
+  WHERE s.id = $4 AND s.destroyed_at IS NULL
   FOR UPDATE
-), bound AS (
-  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-  SELECT live.sandbox_id, $2, $3, $4 FROM live
 )
-UPDATE sandbox SET had_secret_bindings = true
-FROM live WHERE sandbox.id = live.sandbox_id
+INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+SELECT live.sandbox_id, $1, $2, $3 FROM live
 `
 
 type AddSandboxSecretParams struct {
-	SandboxID  uuid.UUID `json:"sandbox_id"`
 	SecretID   uuid.UUID `json:"secret_id"`
 	EnvKey     string    `json:"env_key"`
 	ProxyToken *string   `json:"proxy_token"`
+	SandboxID  uuid.UUID `json:"sandbox_id"`
 }
 
-// Stamps had_secret_bindings alongside the binding: destroy gates revocation on
-// it, and it must survive this binding later being detached or cleared.
-//
-// FOR UPDATE on the sandbox row, taken before the insert because both later
-// CTEs depend on it, serializes this against every destroy path. A destroy that
+// FOR UPDATE on the sandbox row, taken before the insert because the insert
+// depends on it, serializes this against every destroy path. A destroy that
 // already committed leaves `live` empty, so nothing is bound and 0 rows come
 // back — the caller must not mint a JWT for a sandbox that no longer exists. A
-// destroy that has not started blocks until this commits and then sees the
-// marker, so it still writes the revocation. The marker is set unconditionally
-// rather than only when unset, so the returned count means "sandbox was live",
-// not "marker changed".
+// destroy that has not started blocks until this commits, by which point the
+// had_secret_bindings trigger has fired, so it still writes the revocation.
 func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretParams) (int64, error) {
 	result, err := q.db.Exec(ctx, addSandboxSecret,
-		arg.SandboxID,
 		arg.SecretID,
 		arg.EnvKey,
 		arg.ProxyToken,
+		arg.SandboxID,
 	)
 	if err != nil {
 		return 0, err
