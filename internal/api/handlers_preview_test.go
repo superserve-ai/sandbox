@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc/codes"
@@ -412,6 +413,9 @@ func TestRequireHostPreviewCapabilitiesLogsDiagnosticSnapshot(t *testing.T) {
 	oldLogger := log.Logger
 	log.Logger = zerolog.New(&logOutput)
 	defer func() { log.Logger = oldLogger }()
+	capName := preview.HostCapabilityPorts
+	match := false
+	hbTime := time.Date(2026, 8, 20, 2, 0, 0, 0, time.UTC)
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			if strings.Contains(sql, "HostHasCapabilitiesUnlocked") {
@@ -422,7 +426,17 @@ func TestRequireHostPreviewCapabilitiesLogsDiagnosticSnapshot(t *testing.T) {
 		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 			if strings.Contains(sql, "GetHostCapabilityDiagnostics") {
 				diagnosticCalls++
-				return emptyRows{}, nil
+				return &mockDiagnosticRows{
+					rows: []db.GetHostCapabilityDiagnosticsRow{
+						{
+							LastHeartbeatAt:   pgtype.Timestamptz{Time: hbTime, Valid: true},
+							Status:            "active",
+							CapabilitiesMatch: &match,
+							Capability:        &capName,
+							HeartbeatAt:       pgtype.Timestamptz{Time: hbTime, Valid: true},
+						},
+					},
+				}, nil
 			}
 			return nil, fmt.Errorf("unexpected Query: %s", sql)
 		},
@@ -441,12 +455,41 @@ func TestRequireHostPreviewCapabilitiesLogsDiagnosticSnapshot(t *testing.T) {
 		t.Fatalf("diagnostic query calls=%d, want 1", diagnosticCalls)
 	}
 	if !strings.Contains(logOutput.String(), `"message":"preview capability enforcement rejected request"`) ||
-		!strings.Contains(logOutput.String(), `"host_capabilities":[]`) ||
-		!strings.Contains(logOutput.String(), `"last_heartbeat_at":null`) ||
+		!strings.Contains(logOutput.String(), `"capability":"preview_ports_v1"`) ||
+		!strings.Contains(logOutput.String(), `"last_heartbeat_at":"2026-08-20T02:00:00Z"`) ||
+		!strings.Contains(logOutput.String(), `"heartbeat_at":"2026-08-20T02:00:00Z"`) ||
+		!strings.Contains(logOutput.String(), `"host_status":"active"`) ||
+		!strings.Contains(logOutput.String(), `"capabilities_match":false`) ||
 		!strings.Contains(logOutput.String(), `"sandbox_id":"example-sandbox"`) {
-		t.Fatalf("diagnostic snapshot log=%s, want rejection fields", logOutput.String())
+		t.Fatalf("diagnostic snapshot log=%s, want formatted rejection fields", logOutput.String())
 	}
 }
+
+type mockDiagnosticRows struct {
+	rows []db.GetHostCapabilityDiagnosticsRow
+	idx  int
+}
+
+func (r *mockDiagnosticRows) Close()                                       {}
+func (r *mockDiagnosticRows) Err() error                                   { return nil }
+func (r *mockDiagnosticRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *mockDiagnosticRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *mockDiagnosticRows) Next() bool {
+	return r.idx < len(r.rows)
+}
+func (r *mockDiagnosticRows) Scan(dest ...any) error {
+	row := r.rows[r.idx]
+	r.idx++
+	*dest[0].(*pgtype.Timestamptz) = row.LastHeartbeatAt
+	*dest[1].(*string) = row.Status
+	*dest[2].(**bool) = row.CapabilitiesMatch
+	*dest[3].(**string) = row.Capability
+	*dest[4].(*pgtype.Timestamptz) = row.HeartbeatAt
+	return nil
+}
+func (r *mockDiagnosticRows) Values() ([]any, error) { return nil, nil }
+func (r *mockDiagnosticRows) RawValues() [][]byte    { return nil }
+func (r *mockDiagnosticRows) Conn() *pgx.Conn        { return nil }
 
 func TestRequireHostPreviewCapabilitiesCoalescesConcurrentDiagnosticQueries(t *testing.T) {
 	var diagnosticCalls int

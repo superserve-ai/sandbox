@@ -8,10 +8,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -39,7 +41,11 @@ func TestHostHeartbeatSyncsAdvertisedCapabilities(t *testing.T) {
 				return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
 			}
 			gotHostID = args[0].(string)
-			return hostRow(db.Host{ID: gotHostID, Status: "active"})
+			return hostRow(db.Host{
+				ID:              gotHostID,
+				Status:          "active",
+				LastHeartbeatAt: pgtype.Timestamptz{Time: time.Date(2026, 8, 20, 2, 0, 0, 0, time.UTC), Valid: true},
+			})
 		},
 		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 			if !strings.Contains(sql, "-- name: SyncHostCapabilities :exec") {
@@ -69,8 +75,8 @@ func TestHostHeartbeatSyncsAdvertisedCapabilities(t *testing.T) {
 	if !bytes.Contains(logOutput.Bytes(), []byte(`"message":"host heartbeat persisted"`)) ||
 		!bytes.Contains(logOutput.Bytes(), []byte(`"host_id":"host-a"`)) ||
 		!bytes.Contains(logOutput.Bytes(), []byte(`"capabilities":["preview_ports_v1"]`)) ||
-		!bytes.Contains(logOutput.Bytes(), []byte(`"last_heartbeat_at"`)) {
-		t.Fatalf("heartbeat persistence diagnostics=%s, want host, capabilities, and generation", logOutput.String())
+		!bytes.Contains(logOutput.Bytes(), []byte(`"last_heartbeat_at":"2026-08-20T02:00:00Z"`)) {
+		t.Fatalf("heartbeat persistence diagnostics=%s, want host, capabilities, and formatted generation", logOutput.String())
 	}
 }
 

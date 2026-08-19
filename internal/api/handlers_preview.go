@@ -350,7 +350,8 @@ func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string,
 	}
 	if !hasCapabilities {
 		diagnosticCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), previewCapabilityDiagnosticTimeout)
-		res, diagnosticErr, _ := h.diagnosticGroup.Do(hostID, func() (any, error) {
+		flightKey := hostID + ":" + strings.Join(capabilities, ",")
+		res, diagnosticErr, _ := h.diagnosticGroup.Do(flightKey, func() (any, error) {
 			return h.DB.GetHostCapabilityDiagnostics(diagnosticCtx, db.GetHostCapabilityDiagnosticsParams{
 				HostID:               hostID,
 				RequiredCapabilities: capabilities,
@@ -370,22 +371,16 @@ func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string,
 				if row.Capability == nil {
 					continue
 				}
-				var hbAt any
-				if row.HeartbeatAt.Valid {
-					hbAt = row.HeartbeatAt.Time.Format(time.RFC3339Nano)
-				}
 				rows = append(rows, map[string]any{
 					"capability":   *row.Capability,
-					"heartbeat_at": hbAt,
+					"heartbeat_at": timestamptzString(row.HeartbeatAt),
 				})
 			}
 			var generation any
 			var hostStatus any
 			var capabilitiesMatch any
 			if len(snapshot) > 0 {
-				if snapshot[0].LastHeartbeatAt.Valid {
-					generation = snapshot[0].LastHeartbeatAt.Time.Format(time.RFC3339Nano)
-				}
+				generation = timestamptzString(snapshot[0].LastHeartbeatAt)
 				hostStatus = snapshot[0].Status
 				capabilitiesMatch = snapshot[0].CapabilitiesMatch
 			}

@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -91,15 +92,10 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		return
 	}
 
-	var lastHeartbeatAt any
-	if host.LastHeartbeatAt.Valid {
-		lastHeartbeatAt = host.LastHeartbeatAt.Time.Format(time.RFC3339Nano)
-	}
-
 	log.Debug().
 		Str("host_id", hostID).
 		Strs("capabilities", capabilities).
-		Interface("last_heartbeat_at", lastHeartbeatAt).
+		Interface("last_heartbeat_at", timestamptzString(host.LastHeartbeatAt)).
 		Str("status", host.Status).
 		Str("prev_status", host.PrevStatus).
 		Msg("host heartbeat persisted")
@@ -114,4 +110,12 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": host.Status})
+}
+
+// timestamptzString formats a pgtype.Timestamptz as an RFC3339Nano string for structured logs, or nil if invalid.
+func timestamptzString(ts pgtype.Timestamptz) any {
+	if !ts.Valid {
+		return nil
+	}
+	return ts.Time.Format(time.RFC3339Nano)
 }
