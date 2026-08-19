@@ -384,8 +384,6 @@ func (m *Manager) hasCgroupRecords() (bool, error) {
 	if m.state == nil {
 		return false, nil
 	}
-	// The cgroup projection index — trusted or rebuilt at open — replaces the
-	// former full-store decode here.
 	return m.state.HasCgroupRecords()
 }
 

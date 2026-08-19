@@ -3457,8 +3457,7 @@ func (m *Manager) SweepStartupOrphanNamespaces(extraKeep ...string) {
 	if m.state == nil {
 		return
 	}
-	// Keep-set from the slot projection index (vmID→namespace, trusted or
-	// rebuilt at open) — same content the former full-record decode produced.
+	// Keep-set from the slot index — same content the record scan produced.
 	nsByID, err := m.state.SlotNamespaces()
 	if err != nil {
 		// Sweeping with an empty keep-set would delete every live VM's
@@ -3496,8 +3495,6 @@ func (m *Manager) ReserveStartupSlots(context.Context) bool {
 		return false
 	}
 	tLoad := time.Now()
-	// The slot projection index (vmID→namespace, trusted or rebuilt at open)
-	// replaces the former full-store decode: O(occupied slots), not O(records).
 	slots, err := m.state.SlotNamespaces()
 	if err != nil {
 		m.log.Error().Err(err).Msg("failed to read slot index for startup slot reservation")

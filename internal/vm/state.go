@@ -267,9 +267,8 @@ func cgroupSupervised(s Supervision) bool { return s == SupervisionCgroup }
 const indexSchemaVersion = 1
 
 // indexTrustStamp is the single versioned trust value written on clean close.
-// TxID is the stamp transaction's own Bolt txid: the stamp is valid only while
-// it is still the store's last write, so ANY writer since — an index-unaware
-// binary, a crash that never stamped, an external tool — invalidates it.
+// TxID is the stamp transaction's own Bolt txid — see the trust check in
+// OpenStateStore for the validity rule.
 type indexTrustStamp struct {
 	Version int `json:"version"`
 	TxID    int `json:"txid"`
@@ -787,10 +786,9 @@ func (s *StateStore) All() ([]VMRecord, error) {
 	return records, err
 }
 
-// HasCgroupRecords reports whether any record is cgroup-supervised, from the
-// idx_cgroup_vms projection — a first-key check against a full-store decode.
-// The projection is trusted-or-rebuilt at open, so it is always authoritative
-// here.
+// HasCgroupRecords reports whether any record is cgroup-supervised — a
+// first-key check on the idx_cgroup_vms projection, authoritative because the
+// projection is trusted-or-rebuilt at open.
 func (s *StateStore) HasCgroupRecords() (bool, error) {
 	var has bool
 	err := s.db.View(func(tx *bolt.Tx) error {
