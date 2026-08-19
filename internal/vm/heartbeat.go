@@ -40,7 +40,7 @@ type HeartbeatConfig struct {
 // StartHeartbeat launches a background goroutine that periodically POSTs
 // to the control plane's heartbeat endpoint. Blocks until ctx is cancelled.
 func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger) {
-	log = log.With().Str("component", "heartbeat").Logger()
+	log = log.With().Str("component", "heartbeat").Str("host_id", cfg.HostID).Logger()
 
 	interval := cfg.Interval
 	if interval <= 0 {
@@ -110,15 +110,22 @@ func sendHeartbeat(ctx context.Context, client *http.Client, url, token, proxyHe
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Warn().Err(err).Msg("heartbeat failed")
+		log.Warn().Err(err).Strs("capabilities", capabilities).Msg("heartbeat failed")
 		return
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Warn().Int("status", resp.StatusCode).Msg("heartbeat got non-200 response")
+		log.Warn().Int("status", resp.StatusCode).Strs("capabilities", capabilities).Msg("heartbeat got non-200 response")
+		return
 	}
+	log.Debug().
+		Int("status", resp.StatusCode).
+		Str("url", url).
+		Str("proxy_health_url", proxyHealthURL).
+		Strs("capabilities", capabilities).
+		Msg("heartbeat sent")
 }
 
 func proxyPreviewCapabilities(ctx context.Context, client *http.Client, healthURL string) ([]string, error) {
