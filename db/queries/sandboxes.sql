@@ -119,28 +119,38 @@ WHERE base_path IS NOT NULL AND destroyed_at IS NULL;
 -- name/status sorts stay on the flexible query below. Filters and pagination
 -- are identical to the flexible query, including the NULL @row_limit "return
 -- everything" contract.
+--
+-- All three carry the effective preview access, so the list decorates its page
+-- from one round trip. The join is 1:1 on sandbox_preview_policy's primary key,
+-- so it cannot multiply rows and leaves the LIMIT pushdown intact.
 
 -- name: ListSandboxesByTeamCreatedDesc :many
-SELECT * FROM sandbox
-WHERE team_id = @team_id
-  AND destroyed_at IS NULL
-  AND metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+SELECT sqlc.embed(s),
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = @team_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
   AND (sqlc.narg('name_search')::text IS NULL
-       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%')
-ORDER BY created_at DESC
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+ORDER BY s.created_at DESC
 LIMIT sqlc.narg('row_limit')::bigint
 OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 
 -- name: ListSandboxesByTeamCreatedAsc :many
-SELECT * FROM sandbox
-WHERE team_id = @team_id
-  AND destroyed_at IS NULL
-  AND metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+SELECT sqlc.embed(s),
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = @team_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
   AND (sqlc.narg('name_search')::text IS NULL
-       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%')
-ORDER BY created_at ASC
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+ORDER BY s.created_at ASC
 LIMIT sqlc.narg('row_limit')::bigint
 OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 
@@ -158,20 +168,23 @@ OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 -- no-op), with created_at DESC as the stable tiebreaker and default. A NULL
 -- @row_limit returns all rows, preserving the pre-pagination "return
 -- everything" default so unpaginated SDK/MCP callers are unaffected.
-SELECT * FROM sandbox
-WHERE team_id = @team_id
-  AND destroyed_at IS NULL
-  AND metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+SELECT sqlc.embed(s),
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = @team_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
   AND (sqlc.narg('name_search')::text IS NULL
-       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
 ORDER BY
-  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'asc'  THEN name END ASC,
-  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'desc' THEN name END DESC,
-  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'asc'  THEN status::text END ASC,
-  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'desc' THEN status::text END DESC,
-  CASE WHEN @sort_by::text = 'created_at' AND @sort_dir::text = 'asc' THEN created_at END ASC,
-  created_at DESC
+  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'asc'  THEN s.name END ASC,
+  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'desc' THEN s.name END DESC,
+  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'asc'  THEN s.status::text END ASC,
+  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'desc' THEN s.status::text END DESC,
+  CASE WHEN @sort_by::text = 'created_at' AND @sort_dir::text = 'asc' THEN s.created_at END ASC,
+  s.created_at DESC
 LIMIT sqlc.narg('row_limit')::bigint
 OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 
@@ -638,15 +651,6 @@ SELECT sqlc.embed(s),
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL;
-
--- name: ListSandboxPreviewPoliciesByTeam :many
-SELECT
-  s.id AS sandbox_id,
-  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
-  COALESCE(p.revision, 0)::bigint AS revision
-FROM sandbox s
-LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
-WHERE s.team_id = $1 AND s.destroyed_at IS NULL;
 
 -- name: LockSandboxForPreviewMutation :one
 -- The sandbox row exists for both legacy (no policy row) and strict sandboxes,
