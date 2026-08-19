@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -444,6 +445,60 @@ func TestRequireHostPreviewCapabilitiesLogsDiagnosticSnapshot(t *testing.T) {
 		!strings.Contains(logOutput.String(), `"last_heartbeat_at":null`) ||
 		!strings.Contains(logOutput.String(), `"sandbox_id":"example-sandbox"`) {
 		t.Fatalf("diagnostic snapshot log=%s, want rejection fields", logOutput.String())
+	}
+}
+
+func TestRequireHostPreviewCapabilitiesCoalescesConcurrentDiagnosticQueries(t *testing.T) {
+	var diagnosticCalls int
+	var mu sync.Mutex
+	releaseQuery := make(chan struct{})
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "HostHasCapabilitiesUnlocked") {
+				return scalarBoolRow(false)
+			}
+			return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "GetHostCapabilityDiagnostics") {
+				mu.Lock()
+				diagnosticCalls++
+				mu.Unlock()
+				<-releaseQuery
+				return emptyRows{}, nil
+			}
+			return nil, fmt.Errorf("unexpected Query: %s", sql)
+		},
+	}
+	h := &Handlers{DB: db.New(mock)}
+
+	var wg sync.WaitGroup
+	const concurrent = 5
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Params = gin.Params{{Key: "sandbox_id", Value: fmt.Sprintf("sandbox-%d", idx)}}
+			c.Request = httptest.NewRequest(http.MethodGet, "/preview", nil)
+			if h.requireHostPreviewCapabilities(c, "shared-host", preview.HostCapabilityPorts) {
+				t.Errorf("request %d unexpectedly succeeded", idx)
+			}
+			assertPreviewCapabilityConflictResponse(t, w)
+		}(i)
+	}
+
+	// Give goroutines time to enter the singleflight call.
+	time.Sleep(20 * time.Millisecond)
+	close(releaseQuery)
+	wg.Wait()
+
+	mu.Lock()
+	calls := diagnosticCalls
+	mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("diagnostic query calls = %d, want 1 (singleflight must coalesce concurrent queries)", calls)
 	}
 }
 

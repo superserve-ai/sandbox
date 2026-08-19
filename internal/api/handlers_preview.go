@@ -350,9 +350,11 @@ func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string,
 	}
 	if !hasCapabilities {
 		diagnosticCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), previewCapabilityDiagnosticTimeout)
-		snapshot, diagnosticErr := h.DB.GetHostCapabilityDiagnostics(diagnosticCtx, db.GetHostCapabilityDiagnosticsParams{
-			HostID:               hostID,
-			RequiredCapabilities: capabilities,
+		res, diagnosticErr, _ := h.diagnosticGroup.Do(hostID, func() (any, error) {
+			return h.DB.GetHostCapabilityDiagnostics(diagnosticCtx, db.GetHostCapabilityDiagnosticsParams{
+				HostID:               hostID,
+				RequiredCapabilities: capabilities,
+			})
 		})
 		cancel()
 		if diagnosticErr != nil {
@@ -362,6 +364,7 @@ func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string,
 				Str("sandbox_id", c.Param("sandbox_id")).
 				Msg("preview capability rejection diagnostics failed")
 		} else {
+			snapshot, _ := res.([]db.GetHostCapabilityDiagnosticsRow)
 			rows := make([]map[string]any, 0, len(snapshot))
 			for _, row := range snapshot {
 				if row.Capability == nil {
