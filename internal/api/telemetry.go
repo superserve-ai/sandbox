@@ -15,6 +15,10 @@ import (
 
 const telemetryHostIDKey = "telemetry_host_id"
 
+// phaseSeriesOwnedKey marks that a handler's deferred phase emission owns
+// this request's samples (set by PhaseStart, read by APIKeyAuth's fallback).
+const phaseSeriesOwnedKey = "phase_series_owned"
+
 type telemetryRecorderHolder struct {
 	recorder telemetry.Recorder
 }
@@ -79,6 +83,21 @@ func sandboxLoggerFrom(base zerolog.Logger, sandboxID, hostID string) zerolog.Lo
 		Logger()
 }
 
+// PhaseStart returns the auth middleware's start stamp when present, so
+// handler phase totals cover a slow auth cache miss (the auth phase must
+// never exceed its own request's total). Falls back to now.
+func PhaseStart(c *gin.Context) time.Time {
+	// Mark the phase series as handler-owned so the auth middleware's
+	// abort-path emission stays silent — only one of the two ever emits.
+	c.Set(phaseSeriesOwnedKey, true)
+	if v, ok := c.Get("auth_start"); ok {
+		if t, ok := v.(time.Time); ok {
+			return t
+		}
+	}
+	return time.Now()
+}
+
 func RecordSandboxTransition(ctx context.Context, operation, result, hostID string, duration time.Duration) {
 	currentTelemetryRecorder().RecordSandboxTransition(ctx, telemetry.SandboxTransition{
 		Operation: operation,
@@ -87,6 +106,26 @@ func RecordSandboxTransition(ctx context.Context, operation, result, hostID stri
 		HostID:    hostID,
 		Duration:  duration,
 	})
+}
+
+// RecordLatencyPhases emits one histogram sample per named phase of a
+// control-plane operation. Phases with negative durations (clock skew across
+// the async insert join) are dropped rather than recorded as zero.
+func RecordLatencyPhases(ctx context.Context, op, hostID string, phases map[string]time.Duration) {
+	rec := currentTelemetryRecorder()
+	for phase, d := range phases {
+		if d < 0 {
+			continue
+		}
+		rec.RecordLatencyPhase(ctx, telemetry.LatencyPhase{
+			Plane:    "controlplane",
+			Op:       op,
+			Phase:    phase,
+			Region:   SandboxIDRegion(),
+			HostID:   hostID,
+			Duration: d,
+		})
+	}
 }
 
 // RecordResumeSettleWait records ResumeSandbox waiting through a racing

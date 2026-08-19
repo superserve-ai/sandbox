@@ -16,6 +16,8 @@ import (
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
+
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 const (
@@ -118,6 +120,49 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 		http.NotFound(w, r)
 		return
 	}
+	// Connect latency only (auth + upgrade): the bridged session that
+	// follows lasts as long as the client wants and is deliberately NOT a
+	// latency sample — folding session lifetimes into exec histograms would
+	// bury the one-shot percentiles under user behavior. Success emits
+	// before bridging (total ends at establishment); the defer covers only
+	// pre-establishment failures, with whichever stages they reached.
+	tConnect := time.Now()
+	var tAuthDone, tEstablishStart, tEstablished time.Time
+	emitConnectPhases := func() {
+		if h.recorder == nil {
+			return
+		}
+		end := time.Now()
+		if !tEstablished.IsZero() {
+			end = tEstablished
+		}
+		phases := map[string]time.Duration{"total": end.Sub(tConnect)}
+		if !tAuthDone.IsZero() {
+			phases["auth"] = tAuthDone.Sub(tConnect)
+		}
+		if !tEstablishStart.IsZero() {
+			if !tEstablished.IsZero() {
+				phases["establish"] = tEstablished.Sub(tEstablishStart)
+			} else {
+				// Upgrade failed or died mid-handshake; its elapsed time
+				// still belongs in the establish tail.
+				phases["establish"] = time.Since(tEstablishStart)
+			}
+		}
+		for phase, d := range phases {
+			if d < 0 {
+				continue
+			}
+			h.recorder.RecordLatencyPhase(r.Context(), telemetry.LatencyPhase{
+				Plane: "dataplane", Op: "exec_connect", Phase: phase, Duration: d,
+			})
+		}
+	}
+	defer func() {
+		if tEstablished.IsZero() {
+			emitConnectPhases()
+		}
+	}()
 
 	// Token rides in Sec-WebSocket-Protocol, never the URL. Scrub any query
 	// and discourage Referer leakage, matching the terminal bridge.
@@ -126,11 +171,15 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 
 	token := extractTerminalToken(r)
 	if token == "" {
+		// The token check IS the auth phase for this request; stamp it so
+		// the common 401 path lands in the auth series too.
+		tAuthDone = time.Now()
 		http.Error(w, "missing token (pass as Sec-WebSocket-Protocol: token.<value>)", http.StatusUnauthorized)
 		return
 	}
 
 	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
+	tAuthDone = time.Now()
 	if fail != nil {
 		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("exec/ws: auth failed")
 		fail.write(w)
@@ -147,11 +196,14 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 		CompressionMode:    websocket.CompressionDisabled,
 	}
 
+	tEstablishStart = time.Now()
 	ws, err := websocket.Accept(w, r, acceptOpts)
 	if err != nil {
 		h.log.Warn().Err(err).Msg("exec/ws: WS upgrade failed")
 		return
 	}
+	tEstablished = time.Now()
+	emitConnectPhases()
 	ws.SetReadLimit(maxExecReadBytes)
 
 	transport := h.transports.get(instanceID, info)
