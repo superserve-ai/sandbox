@@ -64,8 +64,14 @@ RETURNING *;
 SELECT pg_advisory_xact_lock(hashtext($1)::bigint);
 
 -- name: AddSandboxSecret :exec
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-VALUES ($1, $2, $3, $4);
+-- Stamps had_secret_bindings alongside the binding: destroy gates revocation on
+-- it, and it must survive this binding later being detached or cleared.
+WITH bound AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  VALUES (sqlc.arg(sandbox_id), sqlc.arg(secret_id), sqlc.arg(env_key), sqlc.narg(proxy_token))
+)
+UPDATE sandbox SET had_secret_bindings = true
+WHERE id = sqlc.arg(sandbox_id) AND NOT had_secret_bindings;
 
 -- name: ClaimSandboxSecretProxyToken :one
 -- Persist a proxy token minted on the fly for a legacy (NULL-token) binding.

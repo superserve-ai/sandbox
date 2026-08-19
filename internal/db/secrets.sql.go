@@ -14,8 +14,12 @@ import (
 )
 
 const addSandboxSecret = `-- name: AddSandboxSecret :exec
-INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-VALUES ($1, $2, $3, $4)
+WITH bound AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  VALUES ($1, $2, $3, $4)
+)
+UPDATE sandbox SET had_secret_bindings = true
+WHERE id = $1 AND NOT had_secret_bindings
 `
 
 type AddSandboxSecretParams struct {
@@ -25,6 +29,8 @@ type AddSandboxSecretParams struct {
 	ProxyToken *string   `json:"proxy_token"`
 }
 
+// Stamps had_secret_bindings alongside the binding: destroy gates revocation on
+// it, and it must survive this binding later being detached or cleared.
 func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretParams) error {
 	_, err := q.db.Exec(ctx, addSandboxSecret,
 		arg.SandboxID,
