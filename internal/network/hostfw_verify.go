@@ -270,6 +270,32 @@ func ruleCannotMatchSandboxIngress(tokens []string) bool {
 	return false // no input-interface constraint: can match anything
 }
 
+// foreignDisposition classifies a veth-capable foreign rule found above the
+// vmd security block:
+//   - "strict": DROP/REJECT — only tightens enforcement; allowed to stay
+//     above the block, and repair must preserve it there.
+//   - "inert": no -j at all — matches nothing into an action.
+//   - "permissive": ACCEPT — a proven bypass; the only class repair may
+//     auto-demote below the block.
+//   - "ambiguous": anything else (RETURN, MARK, jumps into operator chains,
+//     NAT actions) — semantics unknown, so the owner fails startup without
+//     mutating rather than guess.
+func foreignDisposition(tokens []string) string {
+	for i, t := range tokens {
+		if t == "-j" && i+1 < len(tokens) {
+			switch tokens[i+1] {
+			case "DROP", "REJECT":
+				return "strict"
+			case "ACCEPT":
+				return "permissive"
+			default:
+				return "ambiguous"
+			}
+		}
+	}
+	return "inert"
+}
+
 // securityRule reports whether a spec rule is enforcement (a drop, an owned-
 // chain jump, or a PREROUTING redirect) as opposed to plumbing a foreign rule
 // may harmlessly shadow (ACCEPTs, the MSS clamp).
@@ -314,8 +340,16 @@ func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, 
 						break
 					}
 				}
-				if !isOurs && !ruleCannotMatchSandboxIngress(got[i]) {
+				if isOurs || ruleCannotMatchSandboxIngress(got[i]) {
+					continue
+				}
+				switch foreignDisposition(got[i]) {
+				case "strict", "inert":
+					// Only tightens (or does nothing): allowed above the block.
+				case "permissive":
 					return false, "preceded", key + ": " + strings.Join(got[i], " ")
+				default:
+					return false, "preceded-ambiguous", key + ": " + strings.Join(got[i], " ")
 				}
 			}
 		}

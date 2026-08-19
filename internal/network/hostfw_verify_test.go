@@ -3,7 +3,6 @@ package network
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -219,42 +218,41 @@ func TestParseRejectsUnknownSyntax(t *testing.T) {
 	}
 }
 
-// fakeKernel backs the dump/run seams so ensureHostFirewall's repair loop can
-// be exercised without iptables. It supports the two operations repair uses:
-// -I chain 1 and -D chain <n>.
+// fakeKernel backs the dump/restore seams so the repair path can be
+// exercised without iptables; its restore handler implements the -F/-A
+// subset atomic repair emits.
 type fakeKernel struct {
-	rules  map[string][][]string
-	chains []string
+	rules    map[string][][]string
+	chains   []string
+	restores int
 }
 
 func (k *fakeKernel) install(t *testing.T) func() {
 	t.Helper()
-	origDump, origRun := dumpIPTables, runIPTables
+	origDump, origRestore := dumpIPTables, restoreIPTables
 	dumpIPTables = func(context.Context) (string, error) { return renderDump(k.rules, k.chains), nil }
-	runIPTables = func(_ context.Context, args []string) (string, error) {
-		// args: -w 5 -t <table> (-I chain <n> rule... | -D chain <n>)
-		table, op, chain := args[3], args[4], args[5]
-		key := table + "/" + chain
-		n, _ := strconv.Atoi(args[6])
-		switch op {
-		case "-I":
-			rule := append([]string(nil), args[7:]...)
-			if n < 1 || n > len(k.rules[key])+1 {
-				return "", fmt.Errorf("fake kernel: insert position %d out of range", n)
+	restoreIPTables = func(_ context.Context, input string) error {
+		k.restores++
+		table := ""
+		for _, line := range strings.Split(input, "\n") {
+			line = strings.TrimSpace(line)
+			switch {
+			case line == "" || line == "COMMIT":
+			case strings.HasPrefix(line, "*"):
+				table = line[1:]
+			case strings.HasPrefix(line, "-F "):
+				k.rules[table+"/"+strings.TrimPrefix(line, "-F ")] = nil
+			case strings.HasPrefix(line, "-A "):
+				fields := strings.Fields(line)
+				key := table + "/" + fields[1]
+				k.rules[key] = append(k.rules[key], fields[2:])
+			default:
+				return fmt.Errorf("fake kernel: unsupported restore line %q", line)
 			}
-			rs := k.rules[key]
-			k.rules[key] = append(rs[:n-1], append([][]string{rule}, rs[n-1:]...)...)
-		case "-D":
-			if n < 1 || n > len(k.rules[key]) {
-				return "", fmt.Errorf("fake kernel: delete position %d out of range", n)
-			}
-			k.rules[key] = append(k.rules[key][:n-1], k.rules[key][n:]...)
-		default:
-			return "", fmt.Errorf("fake kernel: unsupported op %v", args)
 		}
-		return "", nil
+		return nil
 	}
-	return func() { dumpIPTables, runIPTables = origDump, origRun }
+	return func() { dumpIPTables, restoreIPTables = origDump, origRestore }
 }
 
 func TestRepairCanonicalizesMisorderAndDuplicates(t *testing.T) {
@@ -301,64 +299,85 @@ func TestRepairCanonicalizesMisorderAndDuplicates(t *testing.T) {
 	}
 }
 
-func TestRepairNeverWeakensEnforcementMidFlight(t *testing.T) {
-	// At every single mutation step: (a) the udp/443 DROP exists somewhere,
-	// and (b) the number of veth+→host ACCEPTs with NO udp drop above them
-	// never exceeds its starting value — the reverse-insert bug put a fresh
-	// ACCEPT at the chain head before any drop, which this catches.
+func TestRepairIsOneAtomicTransactionPerTable(t *testing.T) {
+	// The old repair inserted/deleted rule-by-rule (a bypass window and a
+	// line-number race); the rebuilt chain must now land in a single restore
+	// commit per table, with the final state verified.
 	spec := testSpec(true)
 	rules, chains := specKernel(spec, nil)
 	fw := rules["filter/FORWARD"]
-	// Misorder: move the udp drop to the end (after the ACCEPTs).
 	drop := fw[1]
-	fw = append(append(fw[:1:1], fw[2:]...), drop)
+	fw = append(append(fw[:1:1], fw[2:]...), drop) // misorder: drop at the end
 	rules["filter/FORWARD"] = fw
 
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
-
-	udpDrop := []string{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP"}
-	acceptOut := []string{"-i", "veth+", "-o", "eth0", "-j", "ACCEPT"}
-	unguardedAccepts := func() int {
-		n, dropsSeen := 0, 0
-		for _, r := range k.rules["filter/FORWARD"] {
-			if ruleEqual(r, udpDrop) {
-				dropsSeen++
-			}
-			if ruleEqual(r, acceptOut) && dropsSeen == 0 {
-				n++
-			}
-		}
-		return n
-	}
-	baseline := unguardedAccepts()
-
-	origRun := runIPTables
-	runIPTables = func(ctx context.Context, args []string) (string, error) {
-		out, err := origRun(ctx, args)
-		found := false
-		for _, r := range k.rules["filter/FORWARD"] {
-			if ruleEqual(r, udpDrop) {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatal("udp/443 DROP absent mid-repair — enforcement gap")
-		}
-		if got := unguardedAccepts(); got > baseline {
-			t.Fatalf("unguarded ACCEPT count rose mid-repair (%d > %d) — bypass window", got, baseline)
-		}
-		return out, err
-	}
-
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
 	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair: %v", err)
 	}
-	runIPTables = origRun
+	if k.restores != 1 {
+		t.Fatalf("want exactly one restore transaction, got %d", k.restores)
+	}
 	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
 	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
 		t.Fatalf("post-repair verify failed: %s %s", class, detail)
+	}
+}
+
+func TestRepairPreservesStricterForeignRulesAbove(t *testing.T) {
+	// An operator's stricter veth DROP above the block must stay ABOVE vmd's
+	// broad ACCEPT through a repair — demoting it would shadow it into a no-op.
+	spec := testSpec(true)
+	rules, chains := specKernel(spec, nil)
+	strict := []string{"-i", "veth+", "-p", "tcp", "--dport", "22", "-j", "DROP"}
+	fw := rules["filter/FORWARD"]
+	fw[2], fw[3] = fw[3], fw[2] // force a repair via misordered clamp
+	rules["filter/FORWARD"] = append([][]string{strict}, fw...)
+
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	got := k.rules["filter/FORWARD"]
+	strictIdx, acceptIdx := -1, -1
+	for i, r := range got {
+		if ruleEqual(r, strict) {
+			strictIdx = i
+		}
+		if acceptIdx == -1 && ruleEqual(r, []string{"-i", "veth+", "-o", "eth0", "-j", "ACCEPT"}) {
+			acceptIdx = i
+		}
+	}
+	if strictIdx == -1 {
+		t.Fatal("stricter foreign DROP deleted by repair")
+	}
+	if strictIdx > acceptIdx {
+		t.Fatalf("stricter foreign DROP demoted below the ACCEPT (%d > %d)", strictIdx, acceptIdx)
+	}
+	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+		t.Fatalf("post-repair verify failed: %s %s", class, detail)
+	}
+}
+
+func TestRepairRefusesAmbiguousForeignRuleAbove(t *testing.T) {
+	spec := testSpec(true)
+	rules, chains := specKernel(spec, nil)
+	fw := rules["filter/FORWARD"]
+	fw[2], fw[3] = fw[3], fw[2] // needs repair
+	rules["filter/FORWARD"] = append([][]string{{"-i", "veth+", "-j", "OPERATOR_CHAIN"}}, fw...)
+
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err == nil {
+		t.Fatal("repair must refuse to reorder past an ambiguous foreign jump")
+	}
+	if k.restores != 0 {
+		t.Fatalf("refusal must not mutate, got %d restores", k.restores)
 	}
 }
 
@@ -379,6 +398,22 @@ func TestVerifyHeadGuard(t *testing.T) {
 		withGap := append([][]string{fw[0], {"-j", "ACCEPT"}}, fw[1:]...)
 		rules["filter/FORWARD"] = withGap
 		if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "preceded" {
+			t.Fatalf("ok=%v class=%s", ok, class)
+		}
+	})
+	t.Run("stricter veth DROP above the block is fine", func(t *testing.T) {
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		rules["filter/FORWARD"] = append([][]string{{"-i", "veth+", "-p", "tcp", "--dport", "22", "-j", "DROP"}}, fw...)
+		if ok, class := mustVerify(t, renderDump(rules, chains), spec); !ok {
+			t.Fatalf("stricter foreign DROP flagged: %s", class)
+		}
+	})
+	t.Run("ambiguous veth jump above the block fails distinctly", func(t *testing.T) {
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		rules["filter/FORWARD"] = append([][]string{{"-i", "veth+", "-j", "OPERATOR_CHAIN"}}, fw...)
+		if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "preceded-ambiguous" {
 			t.Fatalf("ok=%v class=%s", ok, class)
 		}
 	})
@@ -457,12 +492,12 @@ func TestNonOwnerNeverRunsRepair(t *testing.T) {
 	origInstall := installHostFirewallFn
 	installHostFirewallFn = func(string, uint16, uint16, uint16, string, uint16, []uint16, bool, zerolog.Logger) error { return nil }
 	defer func() { installHostFirewallFn = origInstall }()
-	origRun := runIPTables
-	runIPTables = func(context.Context, []string) (string, error) {
+	origRestore := restoreIPTables
+	restoreIPTables = func(context.Context, string) error {
 		t.Fatal("non-owner mutated shared-chain ordering")
-		return "", nil
+		return nil
 	}
-	defer func() { runIPTables = origRun }()
+	defer func() { restoreIPTables = origRestore }()
 
 	iface, hp, tp, dp, sd, sp, bp := testSpecParams()
 	if err := ensureHostFirewall(context.Background(), iface, hp, tp, dp, sd, sp, bp, false, zerolog.Nop()); err != nil {

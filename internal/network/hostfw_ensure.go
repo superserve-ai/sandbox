@@ -13,7 +13,6 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
-	"strconv"
 	"strings"
 	"time"
 
@@ -91,68 +90,91 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	}
 }
 
-// repairSharedOrdering rewrites each shared chain's vmd rules into canonical
-// order with multiplicity one, without ever weakening enforcement: the
-// canonical block is inserted TOP-DOWN at explicit positions 1..N — so the
-// drops and jumps are in place at the head before the broad ACCEPT is added
-// below them, and an insertion failure part-way leaves only extra enforcement,
-// never a bypass. Only then are the old copies below the block deleted, last
-// occurrence first, by line number. Unrelated host rules are never touched.
-// OWNER ONLY: a non-owner's partial spec must never reorder shared chains.
+// repairSharedOrdering rewrites each wrong shared chain in ONE atomic
+// iptables-restore --noflush transaction per table: the chain is flushed and
+// rebuilt inside a single kernel commit, so there is no mid-repair window for
+// traffic to observe and no line-number arithmetic to race a concurrent
+// iptables writer (restore holds the xtables lock for the whole commit).
+//
+// The rebuilt chain is: foreign rules that legitimately preceded the block
+// (provably veth-incapable, or veth-capable but strict/inert — an operator's
+// stricter DROP stays ABOVE vmd's ACCEPT), then the canonical vmd block, then
+// every remaining foreign rule in its original relative order. A veth-capable
+// AMBIGUOUS foreign rule above the block aborts without mutation — the
+// verifier fails startup for the operator to resolve. OWNER ONLY.
 func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) error {
+	perTable := map[string][]string{} // table → restore lines
 	for key, want := range spec.sharedOrdered {
 		if len(want) == 0 {
 			continue
 		}
-		table, chain, _ := strings.Cut(key, "/")
-		// Only repair chains that are actually wrong.
 		single := hostFWSpec{sharedOrdered: map[string][]fwRule{key: want}, headGuarded: map[string]bool{key: spec.headGuarded[key]}}
 		if ok, _, _ := verifyHostFirewall(d, single); ok {
 			continue
 		}
-		// Insert the canonical block forward at positions 1, 2, 3, ...:
-		// want[0] (a drop/jump) claims the head first; each subsequent rule
-		// lands directly below the already-inserted block.
-		for i, w := range want {
-			args := append([]string{"-w", "5", "-t", table, "-I", chain, strconv.Itoa(i + 1)}, w.args...)
-			if out, err := runIPTables(ctx, args); err != nil {
-				return fmt.Errorf("insert canonical %s rule: %s: %w", key, out, err)
-			}
-		}
-		// Delete every copy of each vmd rule beyond the first, last first so
-		// line numbers stay valid, re-dumping after each pass of deletions.
-		for {
-			out, err := dumpIPTables(ctx)
-			if err != nil {
-				return err
-			}
-			nd, perr := parseIPTablesSave(out)
-			if perr != nil {
-				return perr
-			}
-			extra := -1 // 1-based line number of a duplicate to delete
-			got := nd.rules[key]
+		table, chain, _ := strings.Cut(key, "/")
+		got := d.rules[key]
+		isOurs := func(g []string) bool {
 			for _, w := range want {
-				seen := 0
-				for i, g := range got {
-					if ruleEqual(w.args, g) {
-						seen++
-						if seen > 1 {
-							extra = i + 1 // keep the topmost (canonical) copy
-						}
-					}
+				if ruleEqual(w.args, g) {
+					return true
 				}
 			}
-			if extra == -1 {
-				*d = *nd // hand the refreshed dump back for the next chain's check
+			return false
+		}
+		oldFirst := len(got)
+		for i, g := range got {
+			if isOurs(g) {
+				oldFirst = i
 				break
 			}
-			args := []string{"-w", "5", "-t", table, "-D", chain, strconv.Itoa(extra)}
-			if out, err := runIPTables(ctx, args); err != nil {
-				return fmt.Errorf("delete duplicate %s rule %d: %s: %w", key, extra, out, err)
+		}
+		var above, below [][]string
+		for i, g := range got {
+			if isOurs(g) {
+				continue // all copies replaced by the canonical block
 			}
+			if i < oldFirst && (ruleCannotMatchSandboxIngress(g) || foreignDisposition(g) == "strict" || foreignDisposition(g) == "inert") {
+				above = append(above, g)
+				continue
+			}
+			if i < oldFirst && foreignDisposition(g) == "ambiguous" {
+				return fmt.Errorf("ambiguous foreign rule above the security block in %s (%s) — refusing to reorder", key, strings.Join(g, " "))
+			}
+			below = append(below, g) // demoted permissive rules and everything after the block
+		}
+		lines := []string{"-F " + chain}
+		for _, g := range above {
+			lines = append(lines, "-A "+chain+" "+strings.Join(g, " "))
+		}
+		for _, w := range want {
+			lines = append(lines, "-A "+chain+" "+strings.Join(w.args, " "))
+		}
+		for _, g := range below {
+			lines = append(lines, "-A "+chain+" "+strings.Join(g, " "))
+		}
+		perTable[table] = append(perTable[table], lines...)
+	}
+	for _, table := range []string{"filter", "nat"} {
+		lines := perTable[table]
+		if len(lines) == 0 {
+			continue
+		}
+		input := "*" + table + "\n" + strings.Join(lines, "\n") + "\nCOMMIT\n"
+		if err := restoreIPTables(ctx, input); err != nil {
+			return fmt.Errorf("atomic %s repair: %w", table, err)
 		}
 	}
+	// Refresh the caller's dump for the next verification pass.
+	out, err := dumpIPTables(ctx)
+	if err != nil {
+		return err
+	}
+	nd, perr := parseIPTablesSave(out)
+	if perr != nil {
+		return perr
+	}
+	*d = *nd
 	return nil
 }
 
@@ -160,13 +182,20 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 // non-owner no-repair branch can be exercised without iptables.
 var installHostFirewallFn = installHostFirewall
 
-// runIPTables execs iptables with the xtables lock wait already in args and a
-// hard timeout. Used only on the (rare) repair path.
-var runIPTables = func(ctx context.Context, args []string) (string, error) {
+// restoreIPTables applies one iptables-restore transaction. --noflush so only
+// the chains the input explicitly flushes are touched; -w waits on the
+// xtables lock, making the whole rebuild atomic against concurrent writers.
+var restoreIPTables = func(ctx context.Context, input string) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "iptables", args...).CombinedOutput()
-	return strings.TrimSpace(string(out)), err
+	cmd := exec.CommandContext(ctx, "iptables-restore", "-w", "5", "--noflush")
+	cmd.Stdin = strings.NewReader(input)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("iptables-restore: %s: %w", strings.TrimSpace(stderr.String()), err)
+	}
+	return nil
 }
 
 // iptablesBackendProbe exists only to document why iptables.New is not called

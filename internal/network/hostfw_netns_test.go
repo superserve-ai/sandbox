@@ -31,6 +31,9 @@ func requireIsolatedIPTables(t *testing.T) {
 		}
 		return
 	}
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skipf("unshare not installed: %v", err)
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		t.Skipf("cannot resolve test binary: %v", err)
