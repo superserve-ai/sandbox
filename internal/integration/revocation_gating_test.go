@@ -43,7 +43,13 @@ func TestIntegration_DestroyRevokesOnlySecretsSandboxes(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedTeamAndKey(t)
 
+	// false is what the create queries write for a sandbox with no secrets;
+	// insertSandboxAt does not set the column, so set it as a real create would.
 	plain := insertSandboxAt(t, teamID, "plain-"+uuid.New().String()[:8], "active", time.Now())
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET had_secret_bindings = false WHERE id = $1`, plain); err != nil {
+		t.Fatalf("mark unbound: %v", err)
+	}
 	destroy(t, teamID, plain)
 	if revocationExists(t, plain) {
 		t.Error("sandbox that never had a binding was revoked; the set grows with every delete")
@@ -61,11 +67,8 @@ func TestIntegration_DestroyRevokesOnlySecretsSandboxes(t *testing.T) {
 
 	// NULL is a row predating the column: binding history is unknowable, so it
 	// must still revoke. Guessing "no" would leave a leaked JWT valid.
+	// insertSandboxAt leaves the column unset, which is exactly that state.
 	legacy := insertSandboxAt(t, teamID, "legacy-"+uuid.New().String()[:8], "active", time.Now())
-	if _, err := testPool.Exec(ctx,
-		`UPDATE sandbox SET had_secret_bindings = NULL WHERE id = $1`, legacy); err != nil {
-		t.Fatalf("clear marker: %v", err)
-	}
 	destroy(t, teamID, legacy)
 	if !revocationExists(t, legacy) {
 		t.Error("pre-column sandbox was NOT revoked; unknown history must revoke conservatively")
@@ -79,6 +82,12 @@ func TestIntegration_SecretsMarkerSurvivesBindingRemoval(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedTeamAndKey(t)
 	sandboxID := insertSandboxAt(t, teamID, "detached-"+uuid.New().String()[:8], "active", time.Now())
+	// Start from false, as a secretless create writes: NULL would revoke on its
+	// own and the assertion below could not fail for the right reason.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET had_secret_bindings = false WHERE id = $1`, sandboxID); err != nil {
+		t.Fatalf("mark unbound: %v", err)
+	}
 
 	var secretID uuid.UUID
 	if err := testPool.QueryRow(ctx,
