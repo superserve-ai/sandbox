@@ -23,6 +23,20 @@ func revocationExists(t *testing.T, sandboxID uuid.UUID) bool {
 	return n > 0
 }
 
+func seedSecret(t *testing.T, teamID uuid.UUID) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := testPool.QueryRow(context.Background(),
+		`INSERT INTO secret (team_id, name, auth_type, hosts, ciphertext, encrypted_dek, kek_id)
+		 VALUES ($1, $2, 'bearer', ARRAY['example.com'], '\x00'::bytea, '\x00'::bytea, 'test-kek')
+		 RETURNING id`,
+		teamID, "sec-"+uuid.New().String()[:8],
+	).Scan(&id); err != nil {
+		t.Fatalf("seed secret: %v", err)
+	}
+	return id
+}
+
 func destroy(t *testing.T, teamID, sandboxID uuid.UUID) {
 	t.Helper()
 	if _, err := testQueries.DestroySandbox(context.Background(), db.DestroySandboxParams{
@@ -75,6 +89,37 @@ func TestIntegration_DestroyRevokesOnlySecretsSandboxes(t *testing.T) {
 	}
 }
 
+// Binding a destroyed sandbox must bind nothing and report it. Destroy has
+// already read had_secret_bindings by then, so a JWT minted after it would
+// never be revoked; the caller relies on the row count to stop before minting.
+func TestIntegration_AddSandboxSecretRefusesDestroyedSandbox(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID := insertSandboxAt(t, teamID, "gone-"+uuid.New().String()[:8], "active", time.Now())
+	secretID := seedSecret(t, teamID)
+	destroy(t, teamID, sandboxID)
+
+	token := "tok-" + uuid.New().String()[:8]
+	bound, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{
+		SandboxID: sandboxID, SecretID: secretID, EnvKey: "API_KEY", ProxyToken: &token,
+	})
+	if err != nil {
+		t.Fatalf("AddSandboxSecret against a destroyed sandbox: %v", err)
+	}
+	if bound != 0 {
+		t.Errorf("rows = %d, want 0 — a destroyed sandbox must not accept a binding", bound)
+	}
+
+	var bindings int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM sandbox_secret WHERE sandbox_id = $1`, sandboxID).Scan(&bindings); err != nil {
+		t.Fatalf("count bindings: %v", err)
+	}
+	if bindings != 0 {
+		t.Errorf("bindings = %d, want 0", bindings)
+	}
+}
+
 // The marker must survive the binding going away. Detach clears the row, and the
 // mark-failed paths clear all of them, but a JWT may already have been minted
 // and injected — so a live-bindings check would under-revoke exactly there.
@@ -89,18 +134,10 @@ func TestIntegration_SecretsMarkerSurvivesBindingRemoval(t *testing.T) {
 		t.Fatalf("mark unbound: %v", err)
 	}
 
-	var secretID uuid.UUID
-	if err := testPool.QueryRow(ctx,
-		`INSERT INTO secret (team_id, name, auth_type, hosts, ciphertext, encrypted_dek, kek_id)
-		 VALUES ($1, $2, 'bearer', ARRAY['example.com'], '\x00'::bytea, '\x00'::bytea, 'test-kek')
-		 RETURNING id`,
-		teamID, "sec-"+uuid.New().String()[:8],
-	).Scan(&secretID); err != nil {
-		t.Fatalf("seed secret: %v", err)
-	}
+	secretID := seedSecret(t, teamID)
 
 	token := "tok-" + uuid.New().String()[:8]
-	if err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{
+	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{
 		SandboxID: sandboxID, SecretID: secretID, EnvKey: "API_KEY", ProxyToken: &token,
 	}); err != nil {
 		t.Fatalf("AddSandboxSecret: %v", err)

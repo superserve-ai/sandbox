@@ -13,13 +13,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const addSandboxSecret = `-- name: AddSandboxSecret :exec
-WITH bound AS (
+const addSandboxSecret = `-- name: AddSandboxSecret :execrows
+WITH live AS (
+  SELECT s.id AS sandbox_id FROM sandbox s
+  WHERE s.id = $1 AND s.destroyed_at IS NULL
+  FOR UPDATE
+), bound AS (
   INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-  VALUES ($1, $2, $3, $4)
+  SELECT live.sandbox_id, $2, $3, $4 FROM live
 )
 UPDATE sandbox SET had_secret_bindings = true
-WHERE id = $1 AND had_secret_bindings IS DISTINCT FROM true
+FROM live WHERE sandbox.id = live.sandbox_id
 `
 
 type AddSandboxSecretParams struct {
@@ -31,14 +35,26 @@ type AddSandboxSecretParams struct {
 
 // Stamps had_secret_bindings alongside the binding: destroy gates revocation on
 // it, and it must survive this binding later being detached or cleared.
-func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretParams) error {
-	_, err := q.db.Exec(ctx, addSandboxSecret,
+//
+// FOR UPDATE on the sandbox row, taken before the insert because both later
+// CTEs depend on it, serializes this against every destroy path. A destroy that
+// already committed leaves `live` empty, so nothing is bound and 0 rows come
+// back — the caller must not mint a JWT for a sandbox that no longer exists. A
+// destroy that has not started blocks until this commits and then sees the
+// marker, so it still writes the revocation. The marker is set unconditionally
+// rather than only when unset, so the returned count means "sandbox was live",
+// not "marker changed".
+func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretParams) (int64, error) {
+	result, err := q.db.Exec(ctx, addSandboxSecret,
 		arg.SandboxID,
 		arg.SecretID,
 		arg.EnvKey,
 		arg.ProxyToken,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const claimSandboxSecretProxyToken = `-- name: ClaimSandboxSecretProxyToken :one
