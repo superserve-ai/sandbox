@@ -138,6 +138,38 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 		}
 		table, chain, _ := strings.Cut(key, "/")
 		got := d.rules[key]
+		// PREROUTING's head-inserted rules are TERMINAL redirects: re-inserting
+		// them at the absolute head would demote a stricter foreign rule that
+		// currently runs before one of ours to below the redirect, where the
+		// terminal target shadows it into a no-op. (FORWARD is safe — its head
+		// rules are drops, which a demoted foreign strict rule still runs
+		// after.) Position-relative insertion would reintroduce the races this
+		// design removed, so refuse and leave the call to the operator.
+		if key == "nat/PREROUTING" {
+			lastOurs := -1
+			for i, g := range got {
+				for _, w := range want {
+					if ruleEqual(w.args, g) && i > lastOurs {
+						lastOurs = i
+					}
+				}
+			}
+			for i, g := range got {
+				if i >= lastOurs && lastOurs != -1 {
+					break
+				}
+				isOurs := false
+				for _, w := range want {
+					if ruleEqual(w.args, g) {
+						isOurs = true
+						break
+					}
+				}
+				if !isOurs && !ruleCannotMatchSandboxIngress(g) && foreignDisposition(g) == "strict" {
+					return fmt.Errorf("stricter foreign rule above a vmd redirect in %s (%s) — refusing to reorder past it", key, strings.Join(g, " "))
+				}
+			}
+		}
 		var lines []string
 		for _, w := range want {
 			for _, g := range got {

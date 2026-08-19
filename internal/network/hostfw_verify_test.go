@@ -510,6 +510,9 @@ func TestNonOwnerNeverRunsRepair(t *testing.T) {
 	// Template-builder shape: post-install verification failure must not
 	// mutate shared-chain ordering (its partial spec omits the daemon's
 	// jumps) — it logs and proceeds.
+	origLock := hostFirewallLockPath
+	hostFirewallLockPath = t.TempDir() + "/hostfw.lock" // unprivileged runners cannot open /run
+	defer func() { hostFirewallLockPath = origLock }()
 	unowned := testSpec(false)
 	rules, chains := specKernel(unowned, nil)
 	fw := rules["filter/FORWARD"]
@@ -747,5 +750,28 @@ func TestRepairNeverNamesForeignRules(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("foreign rule lost")
+	}
+}
+
+func TestRepairRefusesStrictForeignAbovePreroutingRedirect(t *testing.T) {
+	// PREROUTING redirects are terminal: head-inserting ours would demote a
+	// foreign DROP that ran before a redirect to below it, silently disabling
+	// the operator rule. Repair must refuse without mutation.
+	spec := testSpec(true)
+	rules, chains := specKernel(spec, nil)
+	pre := rules["nat/PREROUTING"]
+	strict := []string{"-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "DROP"}
+	// Strict foreign above the redirects, plus a misorder to force repair.
+	pre[1], pre[2] = pre[2], pre[1]
+	rules["nat/PREROUTING"] = append([][]string{strict}, pre...)
+
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err == nil {
+		t.Fatal("repair must refuse to demote a stricter foreign rule below a terminal redirect")
+	}
+	if k.restores != 0 {
+		t.Fatalf("refusal must not mutate, got %d restores", k.restores)
 	}
 }
