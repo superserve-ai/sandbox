@@ -1311,6 +1311,14 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 // ---------------------------------------------------------------------------
 
 func (h *Handlers) DeleteSandbox(c *gin.Context) {
+	tDelete := PhaseStart(c)
+	deleteHostID := ""
+	// Transition counts/results come from the SandboxLifecycleTelemetry
+	// middleware; this defer emits only the phase-series total.
+	defer func() {
+		RecordLatencyPhases(c.Request.Context(), "delete", deleteHostID,
+			map[string]time.Duration{"total": time.Since(tDelete)})
+	}()
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
 		return
@@ -1340,6 +1348,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	}
 
 	SetTelemetryHostID(c, sandbox.HostID)
+	deleteHostID = sandbox.HostID
 	l := sandboxLogger(sandboxID.String(), sandbox.HostID)
 	// Claim the sandbox for deletion atomically. The guarded soft-delete fires
 	// from a quiescent state (active/paused/failed) or a transitional state whose

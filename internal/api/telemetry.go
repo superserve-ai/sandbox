@@ -15,6 +15,10 @@ import (
 
 const telemetryHostIDKey = "telemetry_host_id"
 
+// phaseSeriesOwnedKey marks that a handler's deferred phase emission owns
+// this request's samples (set by PhaseStart, read by APIKeyAuth's fallback).
+const phaseSeriesOwnedKey = "phase_series_owned"
+
 type telemetryRecorderHolder struct {
 	recorder telemetry.Recorder
 }
@@ -83,6 +87,9 @@ func sandboxLoggerFrom(base zerolog.Logger, sandboxID, hostID string) zerolog.Lo
 // handler phase totals cover a slow auth cache miss (the auth phase must
 // never exceed its own request's total). Falls back to now.
 func PhaseStart(c *gin.Context) time.Time {
+	// Mark the phase series as handler-owned so the auth middleware's
+	// abort-path emission stays silent — only one of the two ever emits.
+	c.Set(phaseSeriesOwnedKey, true)
 	if v, ok := c.Get("auth_start"); ok {
 		if t, ok := v.(time.Time); ok {
 			return t

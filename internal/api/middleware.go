@@ -64,20 +64,30 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		// latency includes a slow auth cache miss (auth must never exceed
 		// its own request's total).
 		c.Set("auth_start", authStart)
-		// An auth abort never reaches the handler whose defer emits the
-		// op's phase series, so the slowest auth attempts (cache-miss
-		// timeouts, invalid keys) would vanish from those distributions.
-		// Emit auth+total for lifecycle routes here instead.
-		handlerReached := false
+		// A request aborted before its handler (auth failure, or a
+		// downstream middleware like the team rate limit) never runs the
+		// handler defer that emits the op's phase series, so those slow
+		// exits would vanish from the distributions. Emit here unless a
+		// handler claimed ownership via PhaseStart.
 		defer func() {
-			if handlerReached {
+			if _, owned := c.Get(phaseSeriesOwnedKey); owned {
 				return
 			}
-			if op, ok := sandboxLifecycleOperation(c.Request.Method, c.FullPath()); ok {
-				d := time.Since(authStart)
-				RecordLatencyPhases(c.Request.Context(), op, "",
-					map[string]time.Duration{"auth": d, "total": d})
+			op, ok := sandboxLifecycleOperation(c.Request.Method, c.FullPath())
+			if !ok {
+				return
 			}
+			phases := map[string]time.Duration{"total": time.Since(authStart)}
+			if v, ok := c.Get("auth_duration"); ok {
+				// Auth completed; the abort came later (e.g. rate limit).
+				if d, ok := v.(time.Duration); ok {
+					phases["auth"] = d
+				}
+			} else {
+				// Aborted inside auth itself.
+				phases["auth"] = time.Since(authStart)
+			}
+			RecordLatencyPhases(c.Request.Context(), op, "", phases)
 		}()
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" {
@@ -132,7 +142,6 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			setAPIKeyContext(c, entry)
 			c.Set("auth_ms", time.Since(authStart).Milliseconds())
 			c.Set("auth_duration", time.Since(authStart))
-			handlerReached = true
 			c.Next()
 			return
 		}
@@ -183,7 +192,6 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		setAPIKeyContext(c, entry)
 		c.Set("auth_ms", time.Since(authStart).Milliseconds())
 		c.Set("auth_duration", time.Since(authStart))
-		handlerReached = true
 		c.Next()
 	}
 }
