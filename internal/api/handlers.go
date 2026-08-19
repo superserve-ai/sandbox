@@ -643,6 +643,9 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		case db.SandboxStatusActive:
 			return &sandbox, row.Access
 		case db.SandboxStatusPaused:
+			if !h.requireBillingEligible(c, teamID) {
+				return nil, ""
+			}
 			// The resume returns the post-restore access it pushed to VMD, so
 			// the response reports exactly what the VM enforces.
 			resumedAccess, ok := h.resumePausedSandbox(c, &sandbox, teamID)
@@ -1003,7 +1006,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}); err != nil {
 			l.Error().Err(err).Msg("async DB ActivateSandbox failed — re-pausing")
 			pauseAndRevert()
+			return
 		}
+		billingCtx, billingCancel := context.WithTimeout(context.WithoutCancel(revertCtx), 2*time.Minute)
+		h.reconcileActivatedSandbox(billingCtx, teamID)
+		billingCancel()
 	})
 
 	sandbox.VcpuCount = int32(actualVcpu)
@@ -1182,6 +1189,9 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 	if !h.requireTeamSandboxWrite(c, teamID) {
+		return
+	}
+	if !h.requireBillingEligible(c, teamID) {
 		return
 	}
 
@@ -1740,29 +1750,45 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 	// queries the planner can serve from idx_sandbox_team_created_active
 	// instead of sorting the whole filtered set. The rare console-only
 	// name/status sorts stay on the flexible CASE-based query.
-	var sandboxes []db.Sandbox
-	if pg.SortBy == "created_at" {
-		if pg.SortDir == "asc" {
-			sandboxes, err = h.DB.ListSandboxesByTeamCreatedAsc(ctx, db.ListSandboxesByTeamCreatedAscParams{
-				TeamID:     teamID,
-				Metadata:   metadataJSON,
-				Status:     statusFilter,
-				NameSearch: nameSearch,
-				RowOffset:  pg.Offset,
-				RowLimit:   pg.Limit,
-			})
-		} else {
-			sandboxes, err = h.DB.ListSandboxesByTeamCreatedDesc(ctx, db.ListSandboxesByTeamCreatedDescParams{
-				TeamID:     teamID,
-				Metadata:   metadataJSON,
-				Status:     statusFilter,
-				NameSearch: nameSearch,
-				RowOffset:  pg.Offset,
-				RowLimit:   pg.Limit,
-			})
+	// The three variants differ only in ORDER BY, but sqlc names a row type per
+	// query; normalize so the response build below stays one pass.
+	type listRow struct {
+		sandbox       db.Sandbox
+		previewAccess string
+	}
+	var sandboxes []listRow
+	switch {
+	case pg.SortBy == "created_at" && pg.SortDir == "asc":
+		var rows []db.ListSandboxesByTeamCreatedAscRow
+		rows, err = h.DB.ListSandboxesByTeamCreatedAsc(ctx, db.ListSandboxesByTeamCreatedAscParams{
+			TeamID:     teamID,
+			Metadata:   metadataJSON,
+			Status:     statusFilter,
+			NameSearch: nameSearch,
+			RowOffset:  pg.Offset,
+			RowLimit:   pg.Limit,
+		})
+		sandboxes = make([]listRow, len(rows))
+		for i, r := range rows {
+			sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
 		}
-	} else {
-		sandboxes, err = h.DB.ListSandboxesByTeamPaged(ctx, db.ListSandboxesByTeamPagedParams{
+	case pg.SortBy == "created_at":
+		var rows []db.ListSandboxesByTeamCreatedDescRow
+		rows, err = h.DB.ListSandboxesByTeamCreatedDesc(ctx, db.ListSandboxesByTeamCreatedDescParams{
+			TeamID:     teamID,
+			Metadata:   metadataJSON,
+			Status:     statusFilter,
+			NameSearch: nameSearch,
+			RowOffset:  pg.Offset,
+			RowLimit:   pg.Limit,
+		})
+		sandboxes = make([]listRow, len(rows))
+		for i, r := range rows {
+			sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
+		}
+	default:
+		var rows []db.ListSandboxesByTeamPagedRow
+		rows, err = h.DB.ListSandboxesByTeamPaged(ctx, db.ListSandboxesByTeamPagedParams{
 			TeamID:     teamID,
 			Metadata:   metadataJSON,
 			Status:     statusFilter,
@@ -1772,6 +1798,10 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 			RowOffset:  pg.Offset,
 			RowLimit:   pg.Limit,
 		})
+		sandboxes = make([]listRow, len(rows))
+		for i, r := range rows {
+			sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
+		}
 	}
 	if err != nil {
 		log.Error().Err(err).Msg("DB list sandboxes by team failed")
@@ -1793,23 +1823,11 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		return
 	}
 	c.Header("X-Total-Count", strconv.FormatInt(total, 10))
-	policies, err := h.DB.ListSandboxPreviewPoliciesByTeam(ctx, teamID)
-	if err != nil {
-		log.Error().Err(err).Msg("DB ListSandboxPreviewPoliciesByTeam failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	previewAccessBySandbox := make(map[uuid.UUID]string, len(policies))
-	for _, policy := range policies {
-		previewAccessBySandbox[policy.SandboxID] = policy.Access
-	}
 
 	out := make([]sandboxResponse, len(sandboxes))
 	for i, s := range sandboxes {
-		out[i] = h.sandboxToResponse(s)
-		if access, ok := previewAccessBySandbox[s.ID]; ok {
-			out[i].PreviewAccess = access
-		}
+		out[i] = h.sandboxToResponse(s.sandbox)
+		out[i].PreviewAccess = s.previewAccess
 	}
 	c.JSON(http.StatusOK, out)
 }
@@ -2000,6 +2018,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 	if !h.requireTeamSandboxWrite(c, teamID) {
+		return
+	}
+	if !h.requireBillingEligible(c, teamID) {
 		return
 	}
 
@@ -2576,7 +2597,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			ActorID:   actorUUID(actorID),
 		}); err != nil {
 			l.Error().Err(err).Msg("async DB ActivateSandbox failed")
+			return
 		}
+		billingCtx, billingCancel := context.WithTimeout(context.WithoutCancel(activateCtx), 2*time.Minute)
+		h.reconcileActivatedSandbox(billingCtx, teamID)
+		billingCancel()
 	})
 
 	// Network rules stay blocking: a 201 must imply "egress rules applied",

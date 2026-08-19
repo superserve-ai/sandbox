@@ -85,16 +85,27 @@ FROM prev
 WHERE host.id = prev.id
 RETURNING host.*, prev.status AS prev_status;
 
--- name: DeleteHostCapabilities :exec
-DELETE FROM host_capability WHERE host_id = $1;
-
--- name: InsertHostCapability :exec
-INSERT INTO host_capability (host_id, capability, heartbeat_at)
-SELECT id, sqlc.arg(capability), last_heartbeat_at
-FROM host
-WHERE id = sqlc.arg(host_id) AND last_heartbeat_at IS NOT NULL
-ON CONFLICT (host_id, capability)
-DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at;
+-- name: SyncHostCapabilities :exec
+-- Refresh the advertised set in place and prune only capabilities omitted by
+-- this heartbeat. Empty capabilities intentionally remove the entire set.
+WITH current_host AS (
+    SELECT id, last_heartbeat_at
+    FROM host
+    WHERE id = sqlc.arg(host_id) AND last_heartbeat_at IS NOT NULL
+), advertised AS (
+    SELECT DISTINCT unnest(COALESCE(sqlc.arg(capabilities)::text[], ARRAY[]::text[])) AS capability
+), upserted AS (
+    INSERT INTO host_capability (host_id, capability, heartbeat_at)
+    SELECT h.id, a.capability, h.last_heartbeat_at
+    FROM current_host h
+    CROSS JOIN advertised a
+    ON CONFLICT (host_id, capability)
+    DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at
+    RETURNING capability
+)
+DELETE FROM host_capability hc
+WHERE hc.host_id = sqlc.arg(host_id)
+  AND NOT (hc.capability = ANY(COALESCE(sqlc.arg(capabilities)::text[], ARRAY[]::text[])));
 
 -- name: HostHasCapabilities :one
 -- Lock the one active host row whose heartbeat anchors this capability set.

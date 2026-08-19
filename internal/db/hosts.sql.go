@@ -66,15 +66,6 @@ func (q *Queries) CreateHost(ctx context.Context, arg CreateHostParams) (Host, e
 	return i, err
 }
 
-const deleteHostCapabilities = `-- name: DeleteHostCapabilities :exec
-DELETE FROM host_capability WHERE host_id = $1
-`
-
-func (q *Queries) DeleteHostCapabilities(ctx context.Context, hostID string) error {
-	_, err := q.db.Exec(ctx, deleteHostCapabilities, hostID)
-	return err
-}
-
 const getHost = `-- name: GetHost :one
 SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host WHERE id = $1
 `
@@ -204,25 +195,6 @@ func (q *Queries) HostHasCapabilitiesUnlocked(ctx context.Context, arg HostHasCa
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
-}
-
-const insertHostCapability = `-- name: InsertHostCapability :exec
-INSERT INTO host_capability (host_id, capability, heartbeat_at)
-SELECT id, $1, last_heartbeat_at
-FROM host
-WHERE id = $2 AND last_heartbeat_at IS NOT NULL
-ON CONFLICT (host_id, capability)
-DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at
-`
-
-type InsertHostCapabilityParams struct {
-	Capability string `json:"capability"`
-	HostID     string `json:"host_id"`
-}
-
-func (q *Queries) InsertHostCapability(ctx context.Context, arg InsertHostCapabilityParams) error {
-	_, err := q.db.Exec(ctx, insertHostCapability, arg.Capability, arg.HostID)
-	return err
 }
 
 const listActiveHosts = `-- name: ListActiveHosts :many
@@ -548,6 +520,39 @@ func (q *Queries) RegisterHost(ctx context.Context, arg RegisterHostParams) (Hos
 		&i.IdentityBound,
 	)
 	return i, err
+}
+
+const syncHostCapabilities = `-- name: SyncHostCapabilities :exec
+WITH current_host AS (
+    SELECT id, last_heartbeat_at
+    FROM host
+    WHERE id = $1 AND last_heartbeat_at IS NOT NULL
+), advertised AS (
+    SELECT DISTINCT unnest(COALESCE($2::text[], ARRAY[]::text[])) AS capability
+), upserted AS (
+    INSERT INTO host_capability (host_id, capability, heartbeat_at)
+    SELECT h.id, a.capability, h.last_heartbeat_at
+    FROM current_host h
+    CROSS JOIN advertised a
+    ON CONFLICT (host_id, capability)
+    DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at
+    RETURNING capability
+)
+DELETE FROM host_capability hc
+WHERE hc.host_id = $1
+  AND NOT (hc.capability = ANY(COALESCE($2::text[], ARRAY[]::text[])))
+`
+
+type SyncHostCapabilitiesParams struct {
+	HostID       string   `json:"host_id"`
+	Capabilities []string `json:"capabilities"`
+}
+
+// Refresh the advertised set in place and prune only capabilities omitted by
+// this heartbeat. Empty capabilities intentionally remove the entire set.
+func (q *Queries) SyncHostCapabilities(ctx context.Context, arg SyncHostCapabilitiesParams) error {
+	_, err := q.db.Exec(ctx, syncHostCapabilities, arg.HostID, arg.Capabilities)
+	return err
 }
 
 const updateHostAddresses = `-- name: UpdateHostAddresses :exec

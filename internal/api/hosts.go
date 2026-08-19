@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -112,7 +111,9 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 				return "", "", err
 			}
 			registered = true
-			if err := insertCapabilities(ctx, q, hostID, capabilities); err != nil {
+			if err := q.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+				HostID: hostID, Capabilities: capabilities,
+			}); err != nil {
 				return "", "", err
 			}
 			return created.Status, created.Status, nil
@@ -166,10 +167,9 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		}
 		// Missing capabilities is an explicit empty replacement. This clears a
 		// stale attestation immediately when VMD can no longer verify its proxy.
-		if err := q.DeleteHostCapabilities(ctx, hostID); err != nil {
-			return "", "", err
-		}
-		if err := insertCapabilities(ctx, q, hostID, capabilities); err != nil {
+		if err := q.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+			HostID: hostID, Capabilities: capabilities,
+		}); err != nil {
 			return "", "", err
 		}
 		// Opt-in: a complete description at the row's current address binds
@@ -250,17 +250,6 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": status})
-}
-
-func insertCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities []string) error {
-	for _, capability := range capabilities {
-		if err := q.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
-			HostID: hostID, Capability: capability,
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 type hostStatusRequest struct {
