@@ -21,6 +21,11 @@ func capMockHandlers(reads *atomic.Int64, answer *atomic.Bool) *Handlers {
 			reads.Add(1)
 			return &mockRow{scanFn: func(dest ...any) error {
 				*(dest[0].(*bool)) = answer.Load()
+				*(dest[1].(*string)) = "active"
+				*(dest[2].(*string)) = "http://vmd"
+				*(dest[3].(*string)) = "http://proxy"
+				*(dest[4].(*string)) = "2026-08-19T00:00:00.000000Z"
+				*(dest[5].(*string)) = `[]`
 				return nil
 			}}
 		},
@@ -147,8 +152,9 @@ func TestHostCapCacheStaleGraceAndEviction(t *testing.T) {
 }
 
 // The transactional validate must issue the locked query; the pre-flight
-// cache must issue the unlocked one. Pins the routing so a refactor can't
-// silently drop FOR SHARE from the mutation path.
+// cache must issue the same-snapshot unlocked diagnostic query. Pins the
+// routing so a refactor can't silently drop FOR SHARE from the mutation path
+// or move diagnostics into a later statement that could observe healed state.
 func TestCapabilityQueryRouting(t *testing.T) {
 	var mu sync.Mutex
 	var sqls []string
@@ -156,8 +162,19 @@ func TestCapabilityQueryRouting(t *testing.T) {
 		mu.Lock()
 		sqls = append(sqls, sql)
 		mu.Unlock()
+		if strings.Contains(sql, "-- name: HostHasCapabilities :one") {
+			return &mockRow{scanFn: func(dest ...any) error {
+				*(dest[0].(*bool)) = true
+				return nil
+			}}
+		}
 		return &mockRow{scanFn: func(dest ...any) error {
 			*(dest[0].(*bool)) = true
+			*(dest[1].(*string)) = "active"
+			*(dest[2].(*string)) = "http://vmd"
+			*(dest[3].(*string)) = "http://proxy"
+			*(dest[4].(*string)) = "2026-08-19T00:00:00.000000Z"
+			*(dest[5].(*string)) = `[]`
 			return nil
 		}}
 	}}
@@ -180,8 +197,8 @@ func TestCapabilityQueryRouting(t *testing.T) {
 	mu.Lock()
 	last := sqls[len(sqls)-1]
 	mu.Unlock()
-	if !strings.Contains(last, "-- name: HostHasCapabilitiesUnlocked :one") || strings.Contains(last, "FOR SHARE") {
-		t.Fatalf("pre-flight must use the unlocked query, got: %.60s", last)
+	if strings.Contains(last, "FOR SHARE") || !strings.Contains(last, "matches_current_heartbeat") || !strings.Contains(last, "jsonb_agg") {
+		t.Fatalf("pre-flight must use the unlocked same-snapshot diagnostic query, got: %.120s", last)
 	}
 }
 
