@@ -264,6 +264,14 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 	if h.Hosts == nil {
 		return h.VMD, nil
 	}
+	if hostID == "" {
+		// An empty id is unambiguous: no host can register one and vmd
+		// refuses to start without one, so it only reaches here from
+		// records that predate host tracking (e.g. a build row with a
+		// NULL vmd_host_id whose logs are being streamed). Legacy
+		// records ran on the configured default by definition.
+		return h.VMD, nil
+	}
 	c, err := h.Hosts.ClientFor(ctx, hostID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

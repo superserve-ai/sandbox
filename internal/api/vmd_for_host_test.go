@@ -75,4 +75,11 @@ func TestVMDForHostBootstrapDefaultKeepsRouting(t *testing.T) {
 	if _, err := h.vmdForHost(context.Background(), "host-b"); err == nil {
 		t.Fatal("non-default missing row returned a client, want hard error")
 	}
+
+	// An empty id — only reachable from records that predate host
+	// tracking (nullable build host columns) — routes to the configured
+	// default without consulting the registry at all.
+	if c, err := h.vmdForHost(context.Background(), ""); err != nil || c != VMDClient(fake) {
+		t.Fatalf("legacy empty id: got (%v, %v), want configured default client", c, err)
+	}
 }
