@@ -277,6 +277,36 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 	return c, nil
 }
 
+// revertPauseAsync undoes BeginPause's claim after a pause that failed
+// before completing — status back to 'active' and the billing interval
+// reopened. Runs detached from the caller's cancellation (a client
+// disconnect must not orphan the revert) while keeping trace context.
+func (h *Handlers) revertPauseAsync(c *gin.Context, sandboxID, teamID uuid.UUID, l zerolog.Logger) {
+	revertCtx := context.WithoutCancel(c.Request.Context())
+	actorID := actorIDFromContext(c)
+	go func() {
+		ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
+		defer cancel()
+		if revertErr := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
+			ID:     sandboxID,
+			Status: db.SandboxStatusActive,
+			TeamID: teamID,
+		}); revertErr != nil {
+			l.Error().Err(revertErr).Msg("async revert to active failed")
+			return
+		}
+		// Reopen the interval closed at BeginPause — the sandbox is back
+		// to 'active' and should resume being counted as such.
+		if openErr := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+			SandboxID: sandboxID,
+			TeamID:    teamID,
+			ActorID:   actorUUID(actorID),
+		}); openErr != nil {
+			l.Error().Err(openErr).Msg("async reopen interval after revert failed")
+		}
+	}()
+}
+
 // vmdTimeout is the default deadline for VMD gRPC calls.
 const vmdTimeout = 30 * time.Second
 
@@ -2832,10 +2862,16 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// with the status transition; nothing to do here. If the pause
 	// subsequently fails, the revert paths reopen a new interval.
 
-	// Resolve the VMD client for this sandbox's host.
+	// Resolve the VMD client for this sandbox's host. BeginPause has
+	// already claimed 'pausing' and closed the billing interval, so a
+	// lookup failure — now a real path when the host row is missing —
+	// must compensate exactly like a daemon failure, or the sandbox is
+	// stuck in 'pausing' and unbilled even after the registration is
+	// repaired.
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("resolve VMD for pause failed")
+		h.revertPauseAsync(c, sandboxID, teamID, l)
 		respondError(c, ErrInternal)
 		return
 	}
@@ -2854,32 +2890,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		}
 
 		l.Error().Err(err).Msg("VMD PauseInstance failed")
-		// Revert status to active asynchronously. Detach cancellation so
-		// the revert survives client disconnect, but keep trace context
-		// so the revert is linked to the original pause request.
-		revertCtx := context.WithoutCancel(c.Request.Context())
-		actorID := actorIDFromContext(c)
-		go func() {
-			ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
-			defer cancel()
-			if revertErr := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
-				ID:     sandboxID,
-				Status: db.SandboxStatusActive,
-				TeamID: teamID,
-			}); revertErr != nil {
-				l.Error().Err(revertErr).Msg("async revert to active failed")
-				return
-			}
-			// Reopen the interval we closed at BeginPause — sandbox is
-			// back to 'active' and should resume being counted as such.
-			if openErr := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
-				SandboxID: sandboxID,
-				TeamID:    teamID,
-				ActorID:   actorUUID(actorID),
-			}); openErr != nil {
-				l.Error().Err(openErr).Msg("async reopen interval after revert failed")
-			}
-		}()
+		h.revertPauseAsync(c, sandboxID, teamID, l)
 		respondError(c, ErrInternal)
 		return
 	}
