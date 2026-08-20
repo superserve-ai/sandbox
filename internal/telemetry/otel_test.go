@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -92,6 +94,119 @@ func TestHostCapacityQueryTimeoutIndependentOfInterval(t *testing.T) {
 		}
 	}
 }
+
+// resourceAttr looks up a single resource-level attribute by key, the
+// counterpart to the point-level attribute maps the other tests build from
+// datapoint.Attributes.
+func resourceAttr(t *testing.T, kvs []attribute.KeyValue, key string) (string, bool) {
+	t.Helper()
+	for _, kv := range kvs {
+		if string(kv.Key) == key {
+			return kv.Value.AsString(), true
+		}
+	}
+	return "", false
+}
+
+func TestNewInstanceIDIsUniqueAndNonEmpty(t *testing.T) {
+	a := NewInstanceID()
+	b := NewInstanceID()
+	if a == "" || b == "" {
+		t.Fatalf("NewInstanceID returned empty value: a=%q b=%q", a, b)
+	}
+	if a == b {
+		t.Fatalf("two NewInstanceID calls returned the same value %q", a)
+	}
+}
+
+func TestBuildOTelResourceGeneratesUniqueInstanceIDsPerReplica(t *testing.T) {
+	// Simulates two concurrent Cloud Run replicas of the same service, each
+	// constructing its own recorder from the same base config. Without a
+	// per-process instance.id, both would export identical
+	// service.name+environment series and collide as duplicate time series
+	// once they land in Google Managed Prometheus (the bug this fix closes).
+	cfg := OTelConfig{
+		ServiceName: "sandbox-controlplane",
+		Environment: "production",
+	}
+	cfg.InstanceID = uuid.New().String()
+	resA, err := buildOTelResource(cfg)
+	if err != nil {
+		t.Fatalf("buildOTelResource (replica A): %v", err)
+	}
+
+	cfg.InstanceID = uuid.New().String()
+	resB, err := buildOTelResource(cfg)
+	if err != nil {
+		t.Fatalf("buildOTelResource (replica B): %v", err)
+	}
+
+	idA, ok := resourceAttr(t, resA.Attributes(), "service.instance.id")
+	if !ok || idA == "" {
+		t.Fatalf("replica A resource missing non-empty service.instance.id: %#v", resA.Attributes())
+	}
+	idB, ok := resourceAttr(t, resB.Attributes(), "service.instance.id")
+	if !ok || idB == "" {
+		t.Fatalf("replica B resource missing non-empty service.instance.id: %#v", resB.Attributes())
+	}
+	if idA == idB {
+		t.Fatalf("replica A and B share service.instance.id %q; each replica must be independently identifiable", idA)
+	}
+}
+
+func TestBuildOTelResourceHonorsExplicitInstanceID(t *testing.T) {
+	cfg := OTelConfig{
+		ServiceName: "sandbox-vmd",
+		Environment: "production",
+		InstanceID:  "usw2-fixed-id",
+	}
+	res, err := buildOTelResource(cfg)
+	if err != nil {
+		t.Fatalf("buildOTelResource: %v", err)
+	}
+	if got, ok := resourceAttr(t, res.Attributes(), "service.instance.id"); !ok || got != "usw2-fixed-id" {
+		t.Fatalf("service.instance.id = %q, ok=%v, want %q", got, ok, "usw2-fixed-id")
+	}
+}
+
+func TestNewOTelRecorderDefaultsInstanceIDWhenUnset(t *testing.T) {
+	ctx := context.Background()
+
+	makeRecorder := func() *OTelRecorder {
+		t.Helper()
+		r, err := NewOTelRecorder(ctx, OTelConfig{
+			ServiceName: "sandbox-controlplane",
+			Environment: "production",
+			// Endpoint left at its default; NewOTelRecorder only
+			// constructs the OTLP client here, it does not dial out.
+		})
+		if err != nil {
+			t.Fatalf("NewOTelRecorder: %v", err)
+		}
+		t.Cleanup(func() {
+			shutdownCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			// Best-effort: Shutdown force-flushes to the configured OTLP
+			// endpoint, which nothing is listening on in this test. That
+			// flush failure is expected here and orthogonal to what this
+			// test checks (instance ID uniqueness), so it's swallowed
+			// rather than failing the test.
+			_ = r.Shutdown(shutdownCtx)
+		})
+		return r
+	}
+
+	first := makeRecorder()
+	second := makeRecorder()
+
+	if first.instanceID == "" {
+		t.Fatal("NewOTelRecorder left InstanceID empty; every replica would export identical series")
+	}
+	if first.instanceID == second.instanceID {
+		t.Fatalf("two NewOTelRecorder calls produced the same instanceID %q", first.instanceID)
+	}
+}
+
 func TestRecordVMDCallEmitsHostIDAndMethodAttributes(t *testing.T) {
 	ctx := context.Background()
 
@@ -195,6 +310,96 @@ func TestRecordVMDCallEmitsHostIDAndMethodAttributes(t *testing.T) {
 				attributes,
 			)
 		}
+	}
+	if _, ok := attributes["sandbox_id"]; ok {
+		t.Fatalf("vmd_call_duration_seconds unexpectedly included sandbox_id: %#v", attributes)
+	}
+}
+
+func TestRecordSandboxTransitionEmitsHostIDAndNoSandboxID(t *testing.T) {
+	ctx := context.Background()
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+	)
+	t.Cleanup(func() {
+		if err := provider.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown meter provider: %v", err)
+		}
+	})
+
+	meter := provider.Meter(instrumentationName)
+
+	transitionTotal, err := meter.Int64Counter("sandbox_transition_total")
+	if err != nil {
+		t.Fatalf("create sandbox transition counter: %v", err)
+	}
+	transitionDuration, err := meter.Float64Histogram("sandbox_transition_duration_seconds")
+	if err != nil {
+		t.Fatalf("create sandbox transition duration histogram: %v", err)
+	}
+
+	recorder := &OTelRecorder{
+		provider:           provider,
+		serviceName:        "sandbox-controlplane",
+		environment:        "staging",
+		sandboxTransitions: transitionTotal,
+		sandboxDuration:    transitionDuration,
+	}
+
+	recorder.RecordSandboxTransition(ctx, SandboxTransition{
+		Operation: "create",
+		Result:    ResultSuccess,
+		Region:    "us-central1",
+		HostID:    "host-123",
+		Duration:  125 * time.Millisecond,
+	})
+
+	var resourceMetrics metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &resourceMetrics); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+
+	var datapoint *metricdata.HistogramDataPoint[float64]
+	for _, scopeMetrics := range resourceMetrics.ScopeMetrics {
+		for _, metric := range scopeMetrics.Metrics {
+			if metric.Name != "sandbox_transition_duration_seconds" {
+				continue
+			}
+			histogram, ok := metric.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("metric data type = %T, want metricdata.Histogram[float64]", metric.Data)
+			}
+			if len(histogram.DataPoints) != 1 {
+				t.Fatalf("histogram datapoints = %d, want 1", len(histogram.DataPoints))
+			}
+			datapoint = &histogram.DataPoints[0]
+		}
+	}
+	if datapoint == nil {
+		t.Fatal("sandbox_transition_duration_seconds metric not found")
+	}
+
+	attributes := make(map[string]string)
+	for _, attr := range datapoint.Attributes.ToSlice() {
+		attributes[string(attr.Key)] = attr.Value.AsString()
+	}
+
+	for key, wantValue := range map[string]string{
+		"service.name": "sandbox-controlplane",
+		"environment":  "staging",
+		"operation":    "create",
+		"result":       ResultSuccess,
+		"region":       "us-central1",
+		"host_id":      "host-123",
+	} {
+		if got := attributes[key]; got != wantValue {
+			t.Fatalf("attribute %q = %q, want %q; all attributes: %#v", key, got, wantValue, attributes)
+		}
+	}
+	if _, ok := attributes["sandbox_id"]; ok {
+		t.Fatalf("sandbox_transition_duration_seconds unexpectedly included sandbox_id: %#v", attributes)
 	}
 }
 
@@ -358,5 +563,94 @@ func TestRecordPausedNetworkPressureEmitsControllerMetrics(t *testing.T) {
 		if !seen[name] {
 			t.Fatalf("metric %q not found", name)
 		}
+	}
+}
+
+// RecordLatencyPhase must label every sample with the bounded phase enums,
+// fold empties to addressable values, and fall back to the recorder's own
+// host identity when the caller has none (vmd/proxy).
+func TestRecordLatencyPhaseAttributes(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(ctx) })
+	meter := provider.Meter(instrumentationName)
+
+	phaseDuration, err := meter.Float64Histogram("sandbox_phase_duration_seconds")
+	if err != nil {
+		t.Fatalf("create phase histogram: %v", err)
+	}
+	recorder := &OTelRecorder{
+		provider:      provider,
+		serviceName:   "sandbox-vmd",
+		environment:   "staging",
+		hostID:        "host-abc",
+		phaseDuration: phaseDuration,
+	}
+
+	recorder.RecordLatencyPhase(ctx, LatencyPhase{
+		Plane:    "vmd",
+		Op:       "launch",
+		Phase:    "wait_socket",
+		Duration: 30 * time.Millisecond,
+		// Mode, Region, HostID empty: must fold, not vanish.
+	})
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	var dp *metricdata.HistogramDataPoint[float64]
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "sandbox_phase_duration_seconds" {
+				continue
+			}
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok || len(h.DataPoints) != 1 {
+				t.Fatalf("want one histogram datapoint, got %T / %d", m.Data, len(h.DataPoints))
+			}
+			dp = &h.DataPoints[0]
+		}
+	}
+	if dp == nil {
+		t.Fatal("phase histogram not collected")
+	}
+	want := map[string]string{
+		"plane":   "vmd",
+		"op":      "launch",
+		"phase":   "wait_socket",
+		"mode":    "none",
+		"host_id": "host-abc", // recorder fallback
+	}
+	for k, v := range want {
+		got, ok := dp.Attributes.Value(attribute.Key(k))
+		if !ok || got.AsString() != v {
+			t.Errorf("attribute %s = %q (present=%v), want %q", k, got.AsString(), ok, v)
+		}
+	}
+	if dp.Sum < 0.029 || dp.Sum > 0.031 {
+		t.Errorf("sum = %v, want ~0.030s", dp.Sum)
+	}
+}
+
+// The phase histogram sits on lifecycle paths; its per-sample cost must stay
+// in the microsecond class (in-memory bucket update, no I/O — the OTLP export
+// runs on the periodic reader, never on the caller).
+func BenchmarkRecordLatencyPhase(b *testing.B) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	b.Cleanup(func() { _ = provider.Shutdown(ctx) })
+	meter := provider.Meter(instrumentationName)
+	h, err := meter.Float64Histogram("sandbox_phase_duration_seconds")
+	if err != nil {
+		b.Fatal(err)
+	}
+	r := &OTelRecorder{provider: provider, hostID: "host-abc", phaseDuration: h}
+	p := LatencyPhase{Plane: "vmd", Op: "launch", Phase: "wait_socket", Mode: "direct", Duration: 30 * time.Millisecond}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.RecordLatencyPhase(ctx, p)
 	}
 }

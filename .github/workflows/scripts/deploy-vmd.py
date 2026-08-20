@@ -790,11 +790,29 @@ def main() -> int:
                 fi
             fi
 
-            # Stop before starting the socket unit: on the first deploy of
-            # socket activation the old direct-bound vmd still holds the
-            # ports, and a plain restart can bind the socket unit before the
-            # old process has released them. Idempotent in steady state.
-            sudo systemctl stop {service}
+            # Stop here ONLY in the exceptional cases that need the ports
+            # released before the socket unit (re)binds: the one-time migration
+            # from a direct-bound vmd to socket activation (the socket unit is
+            # not yet the active listener, so the old process still owns the
+            # ports), or a socket-definition change that forces a rebind. In
+            # steady state the socket unit already owns the ports and stays up
+            # across the swap — stopping vmd here instead would leave it down
+            # for the whole config window with the socket still listening, so a
+            # connection arriving in that gap socket-activates a throwaway vmd
+            # that the restart below then kills. A normal binary deploy never
+            # reaches this stop; the single restart further down does its
+            # cutover with connections backlogging on the socket.
+            #
+            # Stop BOTH units, not just vmd: on a socket-definition change the
+            # old socket is still active, so leaving it listening would let a
+            # connection socket-activate an interim vmd during the rebind
+            # window — the very race this gating exists to remove. Stopping an
+            # inactive socket (the migration case) is a harmless no-op. The
+            # socket comes back with its new definition at the rebind block
+            # below; that rare deploy accepts a brief refused window.
+            if ! systemctl is-active --quiet superserve-vmd.socket || [ "$SOCKET_CHANGED" = 1 ]; then
+                sudo systemctl stop superserve-vmd.socket {service}
+            fi
 
             # Migrate the backup journal to its new path now that vmd is
             # stopped (the file is closed, safe to move), then upsert
@@ -809,17 +827,16 @@ def main() -> int:
             # migrated by an earlier deploy) so this is a no-op in steady
             # state.
             if [ -n {q_backup_journal} ]; then
-                # {service} was already stopped above (unconditionally, for
-                # every deploy) before this block is even reached, so any
-                # failure exit between here and the restart/health-check
-                # block further down would otherwise leave it down with
-                # nothing to bring it back — including from the mount
-                # recheck just below, and from the fallible env write later
-                # in this block. Arm recovery up front, for the whole
-                # section, rather than only around the parts that also stop
-                # the socket. A no-op start on units that were never
-                # stopped. Disarmed only once {service} is confirmed active
-                # again, near the end of this script.
+                # This block stops superserve-vmd.socket and {service} itself
+                # when the journal path changes (below), and the gated stop
+                # above may already have stopped {service} on a socket
+                # migration. Either way, arm recovery up front for the whole
+                # section so any failure exit between here and the
+                # restart/health-check block — the mount recheck just below, or
+                # the fallible env write later — cannot leave a unit down with
+                # nothing to bring it back. A start on units that were never
+                # stopped is a harmless no-op. Disarmed only once {service} is
+                # confirmed active again, near the end of this script.
                 #
                 # Re-verifies the mount at fire time rather than blindly
                 # restarting: $BJ_ANCESTOR is set below and stays valid for
@@ -903,24 +920,21 @@ def main() -> int:
                 fi
 
                 if [ "$OLD_BACKUP_JOURNAL_PATH" != "$NEW_BACKUP_JOURNAL_PATH" ]; then
-                    # {service} was stopped above, but superserve-vmd.socket
-                    # stays active the rest of this script by design
-                    # (zero-downtime deploys), so a connection landing in the
-                    # gap between that stop and here can already have
-                    # socket-activated vmd against the still-current old
-                    # path — even when $OLD_BACKUP_JOURNAL_PATH has no file
-                    # yet (a host's first deploy of this setting): vmd would
-                    # then create one there on activation, and it becomes an
-                    # orphan the moment vmd.env is rewritten below to name
-                    # the new path, with nothing left to migrate it. Stop the
-                    # socket too, whenever the path is changing at all, not
-                    # just when there's a file to migrate. Re-enabled by the
-                    # socket restart/start block and the {service} restart
-                    # later in this script, once vmd.env names the new path.
-                    # The recovery trap armed at the top of this block
-                    # already covers a failure here too — it stops the
-                    # socket now as well, not just {service}, but the trap's
-                    # start of both units on any exit applies regardless.
+                    # The socket unit stays up across a normal deploy by design
+                    # (connections backlog instead of refusing), so a
+                    # connection landing here could socket-activate vmd against
+                    # the still-current old path — even when
+                    # $OLD_BACKUP_JOURNAL_PATH has no file yet (a host's first
+                    # deploy of this setting): vmd would then create one there
+                    # on activation, and it becomes an orphan the moment
+                    # vmd.env is rewritten below to name the new path, with
+                    # nothing left to migrate it. Stop BOTH units here,
+                    # whenever the path is changing at all, not just when
+                    # there's a file to migrate. Re-enabled by the socket
+                    # restart/start block and the {service} restart later in
+                    # this script, once vmd.env names the new path. The
+                    # recovery trap armed at the top of this block covers a
+                    # failure here too.
                     sudo systemctl stop superserve-vmd.socket {service}
                     if [ -f "$OLD_BACKUP_JOURNAL_PATH" ]; then
                         # $OLD_BACKUP_JOURNAL_PATH still present under its
@@ -1027,17 +1041,41 @@ def main() -> int:
             # exits is always the one reading the final, fully-migrated
             # config, whether or not a reactivation race occurred.
             sudo systemctl restart {service}
-            sleep 3
-            sudo systemctl is-active --quiet {service} || (
-                echo "ERROR: {service} failed to become active after restart" >&2
+            # Wait for APPLICATION readiness, not is-active: the unit is
+            # Type=simple, so "active" only proves the process forked, while vmd
+            # answers Unavailable until it logs startup-complete — its real gate,
+            # which can lag the fork. Scope the scan to the unit's CURRENT
+            # systemd invocation so no prior-boot or crashed-and-replaced ready
+            # line counts, and re-confirm that invocation is still current+active
+            # when the line is seen. Read journalctl into a var (no pipe) so a
+            # match can't SIGPIPE it under pipefail (as with the find -print
+            # -quit above). Fail with the recovery trap still armed on timeout.
+            READY=0
+            for i in $(seq 1 90); do
+                INVOCATION=$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)
+                # journalctl -g exits nonzero on no match (and prints
+                # "-- No entries --" to stdout), so drive the check off its exit
+                # status — capturing stdout would read that marker as a false
+                # positive. No `|| true`: that would swallow the no-match status.
+                if [ -n "$INVOCATION" ] \
+                   && sudo journalctl "_SYSTEMD_INVOCATION_ID=$INVOCATION" --quiet -g 'gRPC serving requests' --no-pager >/dev/null 2>&1 \
+                   && [ "$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)" = "$INVOCATION" ] \
+                   && sudo systemctl is-active --quiet {service}; then
+                    READY=1
+                    break
+                fi
+                sleep 1
+            done
+            if [ "$READY" != 1 ]; then
+                echo "ERROR: {service} did not reach application readiness (startupReady) within 90s after restart" >&2
                 sudo systemctl status --no-pager {service} >&2 || true
-                sudo journalctl -u {service} --no-pager -n 40 >&2 || true
+                sudo journalctl -u {service} --no-pager -n 80 >&2 || true
                 exit 1
-            )
-            # {service} is confirmed active on the final config: disarm the
-            # journal-migration recovery trap (a no-op if it was never
-            # armed this run). Anything past this point is unrelated to the
-            # backup journal and shouldn't restart vmd on failure.
+            fi
+            # {service} is confirmed serving requests on the final config: disarm
+            # the journal-migration recovery trap (a no-op if it was never armed
+            # this run). Anything past this point is unrelated to the backup
+            # journal and shouldn't restart vmd on failure.
             trap - EXIT
 
             # Restart secretsproxy; tolerate missing env file on hosts not

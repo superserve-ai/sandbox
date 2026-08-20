@@ -55,7 +55,7 @@ locals {
       comparison    = "COMPARISON_GT"
       threshold     = var.backup_alerts.oldest_pending_age_seconds
       aligner       = "ALIGN_MAX"
-      duration      = "900s"
+      duration      = var.backup_alerts.oldest_pending_age_duration
       documentation = <<-EOT
         The oldest queued backup generation on ${var.backup_alerts.host_id} has been waiting more than ${var.backup_alerts.oldest_pending_age_seconds}s. Queued pauses are not yet durable in the bucket, so this is direct restore-point exposure.
 

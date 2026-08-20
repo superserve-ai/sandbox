@@ -153,12 +153,23 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		if len(existing) >= SecretsBindingsCap {
 			return errBindingCapReached
 		}
-		return q.AddSandboxSecret(ctx, db.AddSandboxSecretParams{
+		// 0 rows means a destroy committed between the read above and this
+		// write. Bail before the JWT is minted: the revocation gate already
+		// read had_secret_bindings, so a credential issued now would not be
+		// revoked.
+		bound, lerr := q.AddSandboxSecret(ctx, db.AddSandboxSecretParams{
 			SandboxID:  sandboxID,
 			SecretID:   secret.ID,
 			EnvKey:     req.EnvKey,
 			ProxyToken: &token,
 		})
+		if lerr != nil {
+			return lerr
+		}
+		if bound == 0 {
+			return errSandboxMidTransition
+		}
+		return nil
 	}
 
 	if h.Pool == nil {

@@ -156,17 +156,16 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 	if _, err := q.UpdateHostHeartbeat(ctx, testDefaultHostID); err != nil {
 		return fmt.Errorf("heartbeat default host: %w", err)
 	}
-	for _, capability := range []string{
+	capabilities := []string{
 		preview.HostCapabilityPorts,
 		preview.HostCapabilityPortAccess,
 		preview.HostCapabilityPortTokens,
 		preview.HostCapabilityPortBrowserAuth,
-	} {
-		if err := q.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
-			HostID: testDefaultHostID, Capability: capability,
-		}); err != nil {
-			return fmt.Errorf("advertise %s: %w", capability, err)
-		}
+	}
+	if err := q.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+		HostID: testDefaultHostID, Capabilities: capabilities,
+	}); err != nil {
+		return fmt.Errorf("advertise capabilities: %w", err)
 	}
 
 	capable, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
@@ -209,8 +208,9 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 	if _, err := testQueries.UpdateHostHeartbeat(ctx, hostID); err != nil {
 		t.Fatalf("heartbeat host: %v", err)
 	}
-	params := db.InsertHostCapabilityParams{HostID: hostID, Capability: preview.HostCapabilityPorts}
-	if err := testQueries.InsertHostCapability(ctx, params); err != nil {
+	if err := testQueries.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+		HostID: hostID, Capabilities: []string{preview.HostCapabilityPorts},
+	}); err != nil {
 		t.Fatalf("advertise capability: %v", err)
 	}
 	hasCapability := func() bool {
@@ -669,12 +669,10 @@ func seedActivePreviewHost(t *testing.T, capabilities ...string) string {
 	if _, err := testQueries.UpdateHostHeartbeat(ctx, hostID); err != nil {
 		t.Fatalf("heartbeat preview host: %v", err)
 	}
-	for _, capability := range capabilities {
-		if err := testQueries.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
-			HostID: hostID, Capability: capability,
-		}); err != nil {
-			t.Fatalf("advertise preview host %s: %v", capability, err)
-		}
+	if err := testQueries.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+		HostID: hostID, Capabilities: capabilities,
+	}); err != nil {
+		t.Fatalf("advertise preview host capabilities: %v", err)
 	}
 	return hostID
 }
@@ -702,6 +700,97 @@ func readPreviewCredentialState(t *testing.T, sandboxID uuid.UUID) (version, rev
 		t.Fatalf("read preview credential state: %v", err)
 	}
 	return version, revision
+}
+
+func TestIntegration_SyncHostCapabilitiesRefreshesCompleteSet(t *testing.T) {
+	ctx := context.Background()
+	hostID := "sync-capability-host-" + uuid.New().String()[:8]
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID: hostID, VmdAddr: "localhost:0", ProxyAddr: "localhost:0", Region: "test",
+		CapacityMemoryMib: 1024, CapacityVcpus: 1,
+	}); err != nil {
+		t.Fatalf("create host: %v", err)
+	}
+	if _, err := testQueries.UpdateHostHeartbeat(ctx, hostID); err != nil {
+		t.Fatalf("initial heartbeat: %v", err)
+	}
+	if err := testQueries.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+		HostID: hostID, Capabilities: []string{"cap-a", "cap-b"},
+	}); err != nil {
+		t.Fatalf("initial capability sync: %v", err)
+	}
+	var initialHeartbeat, initialCapabilityCreatedAt time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT h.last_heartbeat_at, hc.created_at
+		FROM host h
+		JOIN host_capability hc ON hc.host_id = h.id AND hc.capability = 'cap-a'
+		WHERE h.id = $1`, hostID).Scan(&initialHeartbeat, &initialCapabilityCreatedAt); err != nil {
+		t.Fatalf("read initial heartbeat: %v", err)
+	}
+
+	if _, err := testQueries.UpdateHostHeartbeat(ctx, hostID); err != nil {
+		t.Fatalf("refresh heartbeat: %v", err)
+	}
+	if err := testQueries.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+		HostID: hostID, Capabilities: []string{"cap-a", "cap-c"},
+	}); err != nil {
+		t.Fatalf("refresh capability sync: %v", err)
+	}
+
+	rows, err := testPool.Query(ctx, `
+		SELECT hc.capability, hc.heartbeat_at, hc.created_at, h.last_heartbeat_at
+		FROM host_capability hc
+		JOIN host h ON h.id = hc.host_id
+		WHERE hc.host_id = $1
+		ORDER BY hc.capability`, hostID)
+	if err != nil {
+		t.Fatalf("read synchronized capabilities: %v", err)
+	}
+	defer rows.Close()
+	got := make(map[string]time.Time)
+	for rows.Next() {
+		var capability string
+		var capabilityHeartbeat, capabilityCreatedAt, hostHeartbeat time.Time
+		if err := rows.Scan(&capability, &capabilityHeartbeat, &capabilityCreatedAt, &hostHeartbeat); err != nil {
+			t.Fatalf("scan synchronized capability: %v", err)
+		}
+		if !capabilityHeartbeat.Equal(hostHeartbeat) {
+			t.Fatalf("capability %q heartbeat = %v, host heartbeat = %v", capability, capabilityHeartbeat, hostHeartbeat)
+		}
+		got[capability] = capabilityHeartbeat
+		if capability == "cap-a" && !capabilityCreatedAt.Equal(initialCapabilityCreatedAt) {
+			t.Fatalf("unchanged capability created_at = %v, initial = %v; want row identity preserved", capabilityCreatedAt, initialCapabilityCreatedAt)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate synchronized capabilities: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("synchronized capabilities = %#v, want cap-a and cap-c", got)
+	}
+	if _, ok := got["cap-a"]; !ok {
+		t.Fatal("unchanged capability cap-a was not refreshed")
+	}
+	if !got["cap-a"].After(initialHeartbeat) {
+		t.Fatalf("unchanged capability heartbeat = %v, initial heartbeat = %v; want refresh", got["cap-a"], initialHeartbeat)
+	}
+	if _, ok := got["cap-c"]; !ok {
+		t.Fatal("new capability cap-c was not inserted")
+	}
+	if _, ok := got["cap-b"]; ok {
+		t.Fatal("omitted capability cap-b was not pruned")
+	}
+
+	if err := testQueries.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{HostID: hostID}); err != nil {
+		t.Fatalf("empty capability sync: %v", err)
+	}
+	var remaining int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM host_capability WHERE host_id = $1`, hostID).Scan(&remaining); err != nil {
+		t.Fatalf("count cleared capabilities: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("capabilities after empty sync = %d, want 0", remaining)
+	}
 }
 
 func TestIntegration_MintDeliveryFailureRollsBackRevisionAndReturnsNoCredential(t *testing.T) {
@@ -982,6 +1071,12 @@ func seedTeamAndKeyWithRole(t *testing.T, roleName string) (uuid.UUID, string, u
 	team, err := testQueries.CreateTeam(ctx, "team-"+uuid.New().String()[:8])
 	if err != nil {
 		t.Fatalf("seedTeamAndKeyWithRole: create team: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		DELETE FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'signup trial credit'
+	`, team.ID); err != nil {
+		t.Fatalf("seedTeamAndKeyWithRole: clear default trial grant: %v", err)
 	}
 
 	profileID := uuid.New()
@@ -1550,6 +1645,110 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	}
 	if _, ok := body["calculated_at"].(string); !ok {
 		t.Fatalf("calculated_at missing or not a string: %v", body["calculated_at"])
+	}
+}
+
+func TestIntegration_NewTeamReceivesSignupTrialCredit(t *testing.T) {
+	ctx := context.Background()
+	team, err := testQueries.CreateTeam(ctx, "trial-credit-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatalf("create team: %v", err)
+	}
+	teamID := team.ID
+
+	var amount, remaining float64
+	if err := testPool.QueryRow(ctx, `
+		SELECT amount_usd, remaining_usd
+		FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'signup trial credit'
+	`, teamID).Scan(&amount, &remaining); err != nil {
+		t.Fatalf("load signup trial credit: %v", err)
+	}
+	if amount != 5 || remaining != 5 {
+		t.Fatalf("signup trial credit = (%v, %v), want (5, 5)", amount, remaining)
+	}
+}
+
+func TestIntegration_CreateSandboxBlockedWhenTrialCreditIsExhausted(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
+		VALUES ($1, 5.000000, 0, 'signup trial credit')
+	`, teamID); err != nil {
+		t.Fatalf("exhaust signup trial credit: %v", err)
+	}
+
+	w := do(newRouter(t), "POST", "/sandboxes", ownerKey, `{"name":"trial-exhausted"}`)
+	if w.Code != http.StatusPaymentRequired {
+		t.Fatalf("create with exhausted trial: expected 402, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_GetBillingSummaryDefersPaymentSetupWhileCreditsRemain(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", ownerKey, `{"name":"billing-credit-trial"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: expected 201, got %d: %s", cw.Code, cw.Body.String())
+	}
+	sandboxID, err := uuid.Parse(mustJSON(t, cw)["id"].(string))
+	if err != nil {
+		t.Fatalf("parse sandbox id: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded compute billing interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_storage_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded storage billing interval: %v", err)
+	}
+
+	periodStart, periodEnd := billing.CurrentBillingPeriod(time.Now().UTC())
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable live billing mode: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'incomplete')
+		ON CONFLICT (team_id) DO UPDATE
+		SET stripe_customer_id = EXCLUDED.stripe_customer_id,
+		    stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+		    stripe_subscription_status = EXCLUDED.stripe_subscription_status
+	`, teamID, "cus_"+teamID.String(), "sub_"+teamID.String()); err != nil {
+		t.Fatalf("seed incomplete billing account: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
+		VALUES ($1, 10.000000, 10.000000, 'integration test trial credit')
+	`, teamID); err != nil {
+		t.Fatalf("seed billing trial credit: %v", err)
+	}
+
+	liveRouter := newBillingRouter(t, &fakeStripeClient{})
+	live := do(liveRouter, "GET", "/billing/summary", ownerKey, "")
+	if live.Code != http.StatusOK {
+		t.Fatalf("live billing summary with trial credit: expected 200, got %d: %s", live.Code, live.Body.String())
+	}
+	liveBody := mustJSON(t, live)
+	if got := liveBody["payment_setup_required"].(bool); got {
+		t.Fatal("payment_setup_required should be false while trial credit remains")
+	}
+	period, ok := liveBody["billing_period"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("billing_period not an object: %v", liveBody["billing_period"])
+	}
+	if got := period["start"].(string); got != periodStart.Format(time.RFC3339) {
+		t.Fatalf("period start = %q, want %q", got, periodStart.Format(time.RFC3339))
+	}
+	if got := period["end"].(string); got != periodEnd.Format(time.RFC3339) {
+		t.Fatalf("period end = %q, want %q", got, periodEnd.Format(time.RFC3339))
 	}
 }
 
@@ -4603,13 +4802,15 @@ func TestIntegration_DeleteSandbox_Success(t *testing.T) {
 		t.Fatal("expected sandbox to be gone after delete")
 	}
 
-	// The revocation row is written in the same statement as the soft-delete.
+	// This sandbox never had a secret binding, so no JWT was minted and destroy
+	// writes no revocation — see TestIntegration_DestroyRevokesOnlySecretsSandboxes
+	// for both directions of that gate.
 	var revoked int
 	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_revocation WHERE sandbox_id = $1`, sandboxID).Scan(&revoked); err != nil {
 		t.Fatalf("revocation query: %v", err)
 	}
-	if revoked != 1 {
-		t.Errorf("sandbox_revocation rows = %d, want 1", revoked)
+	if revoked != 0 {
+		t.Errorf("sandbox_revocation rows = %d, want 0 for a sandbox that never had secrets", revoked)
 	}
 }
 

@@ -67,6 +67,15 @@ def main() -> int:
         print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
         return 1
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
+    # Empty = skip: enabling the proxy's OTLP exporter is a per-environment
+    # opt-in, matching the vmd deploy's OTEL_ENVIRONMENT convention.
+    otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
+    otel_env_lines = ""
+    if otel_environment:
+        otel_env_lines = (
+            "\n            OTEL_METRICS_ENABLED=true"
+            f"\n            OTEL_ENVIRONMENT={otel_environment}"
+        )
     if sentry_dsn and not re.fullmatch(r"https://[A-Za-z0-9@./:_\-]+", sentry_dsn):
         print("ERROR: SENTRY_DSN must be a https:// URL or empty", file=sys.stderr)
         return 1
@@ -135,6 +144,11 @@ def main() -> int:
             sudo systemctl enable proxy
 
             sudo mkdir -p /etc/sandbox
+            # HOST_ID must match vmd's: it is the host's logical identity and
+            # is deliberately preserved across deploys (a replacement host
+            # keeps its predecessor's row ID), so copy vmd's value and fall
+            # back to the instance name only when no vmd env exists yet.
+            host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/vmd.env 2>/dev/null | head -n1 || true)
             sudo tee /etc/sandbox/proxy.env > /dev/null <<PROXYENV
             PROXY_DOMAIN={proxy_domain}
             PROXY_DOMAINS={proxy_domains}
@@ -142,6 +156,7 @@ def main() -> int:
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}
             SENTRY_DSN={sentry_dsn}
+            HOST_ID=${{host_id:-{name}}}{otel_env_lines}
             PROXYENV
             sudo chmod 0600 /etc/sandbox/proxy.env
 

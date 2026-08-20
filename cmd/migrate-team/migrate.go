@@ -421,6 +421,19 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	for _, t := range migratedTables {
 		copied, skipped, err := copyTable(ctx, src, dst, t, cfg.teamID, transforms[t.name])
 		if err == nil && t.name == "team" {
+			// Team creation in a current cell provisions the signup grant. A
+			// migration must preserve the source ledger exactly, so remove the
+			// destination-side default before team_credit_grant is copied.
+			if _, herr := dst.Exec(ctx, `
+				DELETE FROM team_credit_grant
+				WHERE team_id = $1 AND reason = 'signup trial credit'`, cfg.teamID); herr != nil {
+				return fmt.Errorf("clear destination signup credit: %w", herr)
+			}
+			if _, herr := dst.Exec(ctx, `
+				DELETE FROM team_trial_eligibility_cache
+				WHERE team_id = $1`, cfg.teamID); herr != nil {
+				return fmt.Errorf("clear destination trial eligibility cache: %w", herr)
+			}
 			// The moment intervals land, the dest scheduler could discover
 			// this team under the default-TRUE rollup flag and mint jobs,
 			// cursors, and hourly rows that never existed in source —

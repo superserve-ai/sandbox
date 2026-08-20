@@ -14,10 +14,16 @@ import (
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
+const defaultSweepInterval = 10 * time.Minute
+
 // ReaperConfig controls the timeout reaper loop.
 type ReaperConfig struct {
 	// Interval is how often the reaper polls for expired sandboxes.
 	Interval time.Duration
+	// SweepInterval paces the DB-only maintenance sweeps (see sweepLoop),
+	// whose scans cost the same whether or not there is anything to find —
+	// on every instance, since the loop runs on all of them. 0 → 10m.
+	SweepInterval time.Duration
 	// BatchSize bounds the number of sandboxes paused per cycle so a
 	// sudden wave of expirations cannot tie up the control plane.
 	BatchSize int32
@@ -28,9 +34,10 @@ type ReaperConfig struct {
 // DefaultReaperConfig returns sensible defaults for the timeout reaper.
 func DefaultReaperConfig() ReaperConfig {
 	return ReaperConfig{
-		Interval:    30 * time.Second,
-		BatchSize:   50,
-		Parallelism: 10,
+		Interval:      30 * time.Second,
+		SweepInterval: defaultSweepInterval,
+		BatchSize:     50,
+		Parallelism:   10,
 	}
 }
 
@@ -52,6 +59,30 @@ func DefaultReaperConfig() ReaperConfig {
 //     cannot starve the control plane for extended periods.
 func (h *Handlers) StartTimeoutReaper(ctx context.Context, cfg ReaperConfig) {
 	go h.reaperLoop(ctx, cfg)
+	go h.trialEligibilityLoop(ctx, cfg.Interval)
+}
+
+func (h *Handlers) trialEligibilityLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	run := func() {
+		deadline := 2 * time.Minute
+		if interval > 0 && interval < deadline {
+			deadline = interval
+		}
+		qctx, cancel := context.WithTimeout(ctx, deadline)
+		defer cancel()
+		sentrylog.RunSafe("billing-trial-eligibility", func() { h.refreshActiveTrialEligibility(qctx) })
+	}
+	run()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
 
 func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
@@ -62,23 +93,30 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 	if int32(parallelism) > cfg.BatchSize {
 		parallelism = int(cfg.BatchSize)
 	}
+	sweepInterval := cfg.SweepInterval
+	if sweepInterval <= 0 {
+		sweepInterval = defaultSweepInterval
+	}
 
 	log.Info().
 		Dur("interval", cfg.Interval).
+		Dur("sweep_interval", sweepInterval).
 		Int32("batch_size", cfg.BatchSize).
 		Int("parallelism", parallelism).
 		Msg("timeout reaper started")
+
+	// Own goroutine, not another case in the select below: the poll's pauses
+	// and auto-delete teardowns block for host round trips, and sharing this
+	// goroutine would let a slow batch hold off the sweeps — the reason they
+	// ran last in the single-ticker loop this replaced. Concurrency here is
+	// not new: every control-plane instance already runs both loops.
+	go h.sweepLoop(ctx, sweepInterval)
 
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 
 	runTick := func() {
 		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
-		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
-		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx) })
-		sentrylog.RunSafe("snapshot-row-sweep", func() { h.sweepOrphanedSnapshotRows(ctx) })
-		// Auto-delete runs after the DB-only sweeps (interval/revocation/
-		// snapshot) so a slow host during its batch teardown can't delay them.
 		sentrylog.RunSafe("auto-delete", func() { h.reapAutoDeleteOnce(ctx, cfg.BatchSize, parallelism) })
 	}
 
@@ -93,6 +131,33 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 			return
 		case <-ticker.C:
 			runTick()
+		}
+	}
+}
+
+// sweepLoop runs the DB-only maintenance sweeps: backstops for cleanup the
+// request path already performs, each scanning accumulated history to usually
+// find nothing.
+func (h *Handlers) sweepLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	runSweeps := func() {
+		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
+		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx) })
+		sentrylog.RunSafe("snapshot-row-sweep", func() { h.sweepOrphanedSnapshotRows(ctx) })
+	}
+
+	// Immediately, so a restart after a crash cleans up without waiting a
+	// full interval.
+	runSweeps()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runSweeps()
 		}
 	}
 }
@@ -242,6 +307,7 @@ const autoDeleteTeardownTimeout = 2 * time.Minute
 func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDeleteSandboxesRow) {
 	l := log.With().
 		Str("sandbox_id", sbx.ID.String()).
+		Str("host_id", sbx.HostID).
 		Str("team_id", sbx.TeamID.String()).
 		Str("name", sbx.Name).
 		Logger()
@@ -273,8 +339,24 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 //   - Step 1 fails → VM is still running → revert DB to 'active'.
 //   - Step 2 fails → VM is stopped → call rollbackPausedVM (resume + revert).
 func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxesRow) {
+	h.pauseClaimed(ctx, sbx, "timeout", "timeout_pause", "timeout_paused", "reaper: sandbox paused due to timeout")
+}
+
+func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBillingIneligibleSandboxesRow) {
+	h.pauseClaimed(ctx, db.ClaimExpiredSandboxesRow{
+		ID:            sbx.ID,
+		TeamID:        sbx.TeamID,
+		Name:          sbx.Name,
+		SnapshotID:    sbx.SnapshotID,
+		HostID:        sbx.HostID,
+		NetworkConfig: sbx.NetworkConfig,
+	}, "billing_ineligible", "billing_ineligible_pause", "billing_ineligible_paused", "billing: sandbox paused after eligibility loss")
+}
+
+func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, trigger, transition, activity, successMessage string) {
 	l := log.With().
 		Str("sandbox_id", sbx.ID.String()).
+		Str("host_id", sbx.HostID).
 		Str("team_id", sbx.TeamID.String()).
 		Str("name", sbx.Name).
 		Logger()
@@ -287,7 +369,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD failed — reverting to active")
-		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
+		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.revertToActiveOrFail(ctx, sbx, vmdLookupErr, l)
 		return
 	}
@@ -297,7 +379,7 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		// Retry (see pauseWithRetry) didn't converge — the VM genuinely
 		// didn't pause, so revert to active and let the next tick retry.
 		l.Error().Err(err).Msg("reaper: VMD PauseInstance failed — reverting to active")
-		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
+		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.revertToActiveOrFail(ctx, sbx, err, l)
 		return
 	}
@@ -310,21 +392,21 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		TeamID:  sbx.TeamID,
 		Path:    snapshotPath,
 		MemPath: &memPath,
-		Trigger: "timeout",
+		Trigger: trigger,
 	}
 	applyManifest(&params, manifest)
 	if _, err := h.finalizePause(postCtx, params); err != nil {
 		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
-		RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultError, sbx.HostID, time.Since(started))
+		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
 		return
 	}
 
-	l.Info().Msg("reaper: sandbox paused due to timeout")
-	RecordSandboxTransition(ctx, "timeout_pause", telemetry.ResultSuccess, sbx.HostID, time.Since(started))
+	l.Info().Msg(successMessage)
+	RecordSandboxTransition(ctx, transition, telemetry.ResultSuccess, sbx.HostID, time.Since(started))
 	// Interval was already closed at the top of pauseExpired; FinalizePause
 	// is the end of the VMD pause work, not the leave-active moment.
-	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", "timeout_paused", "success", &sbx.Name, nil, nil)
+	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", activity, "success", &sbx.Name, nil, nil)
 }
 
 // rollbackPausedVM is the saga compensation for a failed pause. The VM is
@@ -354,7 +436,7 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 	// retry as the user-facing boots — the background ctx never reads dead,
 	// which is right: a rollback landing late still beats marking the
 	// sandbox failed.
-	ipAddr, _, _, _, err := retryTransientBoot(ctx, sbx.ID.String(), func(rctx context.Context) (string, uint32, uint32, error) {
+	ipAddr, _, _, _, err := retryTransientBoot(ctx, sbx.ID.String(), sbx.HostID, func(rctx context.Context) (string, uint32, uint32, error) {
 		return vmd.ResumeInstance(rctx, sbx.ID.String(), snapshotPath, memPath, sbx.NetworkConfig)
 	})
 	if err != nil {
