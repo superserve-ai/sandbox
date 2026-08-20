@@ -17,14 +17,17 @@ PR titles, PR descriptions, review comments — is public.
   number.
 - **No internal URLs** (dashboards, trackers, internal docs) in committed
   files.
-- **PR bodies may link the tracker item they resolve.** A single line at the
-  top of a PR description — `Fixes: <Linear issue URL>` or
-  `Fixes: <Sentry issue URL>` — is fine even though the destination is
-  internal-only; outside readers just see a dead link, same as any other
-  private reference. This does not relax anything above: PR titles, code,
-  comments, commits, and fixtures still describe the change in plain words
-  with no ticket IDs or internal URLs, and the PR body must still explain
-  the change in prose, not rely on the link alone.
+- **PR bodies may link the tracker item they relate to.** A single line at
+  the top of a PR description, verb matched to what the PR actually does:
+  `Fixes: <URL>` for a bug fix or a Sentry alert this resolves,
+  `Implements: <URL>` for a Linear issue or spec this builds out,
+  `Relates to: <URL>` for a PR that's part of a larger tracked effort
+  without fully resolving it. The destination being internal-only is fine;
+  outside readers just see a dead link, same as any other private
+  reference. This does not relax anything above: PR titles, code, comments,
+  commits, and fixtures still describe the change in plain words with no
+  ticket IDs or internal URLs, and the PR body must still explain the
+  change in prose, not rely on the link alone.
 
 Cross-referencing public artifacts is fine: other PRs and issues in this
 repository, upstream project issues, and public documentation.
