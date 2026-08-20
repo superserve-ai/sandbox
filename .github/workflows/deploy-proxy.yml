@@ -31,6 +31,8 @@ on:
       - 'internal/telemetry/**'
       - 'internal/vmdclient/**'
       - 'proto/**'
+      - 'go.mod'
+      - 'go.sum'
       - 'deploy/proxy.service'
       - '.github/workflows/deploy-proxy.yml'
       - '.github/workflows/scripts/deploy-proxy.py'

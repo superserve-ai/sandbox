@@ -153,49 +153,54 @@ jobs:
 
       # A push touching only paths absent from a deploy workflow's filters runs
       # no job at all — the change merges and never ships, with nothing in the
-      # Actions tab to notice. Derive what each workflow deploys and require its
-      # filters to cover every package those binaries import.
+      # Actions tab to notice. Derive what each workflow builds and require its
+      # filters to cover everything those binaries are built from.
       - name: Every imported package must trigger its deploy
         run: |
           fail=0
+          # Filter paths, minus the /** suffix. Coverage is a prefix test: a
+          # filter covers a path when it is that path or one of its parents, so
+          # proto/** covers proto/boxdpb.
+          covered() {
+            for t in $2; do
+              case "$1" in "$t"|"$t"/*) return 0;; esac
+            done
+            return 1
+          }
           check() {
             workflow="$1"; shift
-            # Filter paths, minus the /** suffix: a filter covers a package when
-            # it is that package or one of its parents, so compare by prefix
-            # rather than equality (proto/** covers proto/boxdpb).
             triggers=$(awk '/^on:/,/^jobs:/' "$workflow" \
               | grep -oE "'[a-z][a-z0-9._/-]*(/\*\*)?'" \
               | tr -d "'" | sed 's|/\*\*$||' | sort -u || true)
-            # Every module-local dependency, not just internal/: the proxy
-            # reaches proto/boxdpb, and generated protocol code changing without
-            # a redeploy is the same staleness this guards against.
+            # Module-local deps (not just internal/ — the proxy reaches
+            # proto/boxdpb), the command dirs themselves, and the module files:
+            # a dependency bump touching only go.mod must redeploy too.
             deps=$(go list -deps "$@" \
-              | sed -n 's|^github.com/superserve-ai/sandbox/||p' \
-              | grep -v '^cmd/' | sort -u)
-            for dep in $deps; do
-              covered=0
-              for t in $triggers; do
-                case "$dep" in "$t"|"$t"/*) covered=1; break;; esac
-              done
-              if [ "$covered" -eq 0 ]; then
-                echo "::error file=$workflow::$workflow ships a binary importing $dep but does not list it — changes to $dep would merge without deploying"
+              | sed -n 's|^github.com/superserve-ai/sandbox/||p' | sort -u)
+            for path in $deps go.mod go.sum; do
+              if ! covered "$path" "$triggers"; then
+                echo "::error file=$workflow::$workflow ships a binary built from $path but does not list it — changes to $path would merge without deploying"
                 fail=1
               fi
             done
           }
-          # Both the workflow list and each one's binaries come from the
-          # workflows themselves, so a newly added deploy workflow is covered
-          # without editing this job — the failure mode being guarded against is
-          # precisely someone forgetting to update a hand-maintained list.
-          # `|| true` on the extraction: the step runs under `-eo pipefail`, so
-          # an unmatched grep would kill the job instead of reaching the skip.
+          # Binaries come from each workflow's build commands (or the Dockerfile
+          # it builds), never from its path filters: deriving them from the very
+          # list being validated would let an omitted cmd/ entry hide itself.
+          # `|| true` throughout: the step runs under `-eo pipefail`, so an
+          # unmatched grep would kill the job instead of reaching the checks.
           for wf in .github/workflows/deploy-*.yml; do
-            bins=$(awk '/^on:/,/^jobs:/' "$wf" \
-              | grep -oE "cmd/[a-z-]+" | sort -u | sed 's|^|./|' || true)
+            bins=$(grep -oE 'go build[^|;]*\./cmd/[a-z-]+' "$wf" \
+              | grep -oE '\./cmd/[a-z-]+' | sort -u || true)
+            if [ -z "$bins" ] && grep -q 'docker build' "$wf"; then
+              bins=$(grep -oE 'go build[^|;]*\./cmd/[a-z-]+' Dockerfile \
+                | grep -oE '\./cmd/[a-z-]+' | sort -u || true)
+            fi
             if [ -z "$bins" ]; then
-              echo "$(basename "$wf"): ships no Go binary, skipping"
+              echo "$(basename "$wf"): builds no Go binary, skipping"
               continue
             fi
+            echo "$(basename "$wf"): $(echo $bins)"
             check "$wf" $bins
           done
           [ $fail -eq 0 ] && echo "deploy triggers cover every imported package"

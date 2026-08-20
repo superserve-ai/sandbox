@@ -59,6 +59,8 @@ on:
       - 'deploy/superserve-maintenance-watch.service'
       - 'deploy/superserve-maintenance-watch.timer'
       - 'scripts/fc-cleanup'
+      - 'go.mod'
+      - 'go.sum'
       # The workflow + its deploy script must self-trigger (as deploy-otel does),
       # or a new cell/step lands without ever running until an unrelated vmd
       # asset changes — leaving that host on stale binaries.
