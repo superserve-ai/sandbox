@@ -12,7 +12,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -20,30 +19,29 @@ import (
 
 // A pause that fails after BeginPause — whether at host resolution or at the
 // daemon — must compensate: status back to 'active' AND the billing interval
-// reopened. Without both, the sandbox is stuck in 'pausing' and unbilled
-// even after the underlying problem is repaired.
+// reopened. The two facts commit as ONE statement (RevertPauseToActive), so
+// this test asserts that single query fires with the sandbox's identity; the
+// atomicity and status-gating live in the SQL and are covered by the
+// integration test.
 func TestRevertPauseAsyncRestoresStatusAndInterval(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
 	var mu sync.Mutex
-	var reverted, reopened bool
+	var reverted bool
 	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
-		},
-		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if !strings.Contains(sql, "-- name: RevertPauseToActive :one") {
+				return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
+			}
 			mu.Lock()
 			defer mu.Unlock()
-			switch {
-			case strings.Contains(sql, "-- name: UpdateSandboxStatus :exec"):
-				if args[1] != db.SandboxStatusActive {
-					t.Errorf("revert status = %v, want active", args[1])
-				}
-				reverted = true
-			case strings.Contains(sql, "-- name: OpenSandboxActiveInterval :exec"):
-				reopened = true
-			default:
-				return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec: %s", sql)
+			if args[0] != sandboxID || args[1] != teamID {
+				t.Errorf("revert args = %v, %v; want %v, %v", args[0], args[1], sandboxID, teamID)
 			}
-			return pgconn.NewCommandTag("UPDATE 1"), nil
+			reverted = true
+			return &mockRow{scanFn: func(dest ...any) error {
+				*dest[0].(*int64) = 1
+				return nil
+			}}
 		},
 	}
 	h := &Handlers{DB: db.New(mock)}
@@ -52,19 +50,18 @@ func TestRevertPauseAsyncRestoresStatusAndInterval(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest("POST", "/sandboxes/x/pause", nil)
 
-	h.revertPauseAsync(c, uuid.New(), uuid.New(), zerolog.Nop())
+	h.revertPauseAsync(c, sandboxID, teamID, zerolog.Nop())
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		mu.Lock()
-		done := reverted && reopened
+		done := reverted
 		mu.Unlock()
 		if done {
 			return
 		}
 		if time.Now().After(deadline) {
-			mu.Lock()
-			t.Fatalf("revert incomplete: status=%v interval=%v", reverted, reopened)
+			t.Fatal("revert query never fired")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}

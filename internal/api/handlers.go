@@ -293,30 +293,29 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 
 // revertPauseAsync undoes BeginPause's claim after a pause that failed
 // before completing — status back to 'active' and the billing interval
-// reopened. Runs detached from the caller's cancellation (a client
-// disconnect must not orphan the revert) while keeping trace context.
+// reopened, in ONE statement (RevertPauseToActive) so a failure between the
+// two facts is unrepresentable. Runs detached from the caller's cancellation
+// (a client disconnect must not orphan the revert) while keeping trace
+// context.
 func (h *Handlers) revertPauseAsync(c *gin.Context, sandboxID, teamID uuid.UUID, l zerolog.Logger) {
 	revertCtx := context.WithoutCancel(c.Request.Context())
 	actorID := actorIDFromContext(c)
 	go func() {
 		ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
 		defer cancel()
-		if revertErr := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
-			ID:     sandboxID,
-			Status: db.SandboxStatusActive,
-			TeamID: teamID,
-		}); revertErr != nil {
-			l.Error().Err(revertErr).Msg("async revert to active failed")
-			return
-		}
-		// Reopen the interval closed at BeginPause — the sandbox is back
-		// to 'active' and should resume being counted as such.
-		if openErr := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
+		n, err := h.DB.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
 			SandboxID: sandboxID,
 			TeamID:    teamID,
 			ActorID:   actorUUID(actorID),
-		}); openErr != nil {
-			l.Error().Err(openErr).Msg("async reopen interval after revert failed")
+		})
+		if err != nil {
+			l.Error().Err(err).Msg("async pause revert failed")
+			return
+		}
+		if n == 0 {
+			// Another transition (delete, reaper) moved the sandbox out
+			// of 'pausing' first; its state wins over the revert.
+			l.Warn().Msg("pause revert skipped: sandbox no longer pausing")
 		}
 	}()
 }

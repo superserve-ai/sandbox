@@ -444,6 +444,18 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 	vmd, err := s.resolve(statusCtx, hostID)
 	if err != nil {
 		cancel()
+		if errors.Is(err, ErrBuildHostGone) {
+			// Terminal here for the same reason as in dispatch: the
+			// registration is gone and never returns without operator
+			// action. Retrying each tick would hold the build's
+			// concurrency slot until the build-timeout reap for an
+			// error that is by definition non-retryable.
+			rowLog.Error().Err(err).Str("host_id", hostID).Msg("build host no longer registered; failing build")
+			errMsg := fmt.Sprintf("build host is no longer registered (%s); retry the build", hostID)
+			s.failBuild(ctx, row.ID, errMsg)
+			s.logBuildCompleted(ctx, row, "error", errMsg, "")
+			return
+		}
 		rowLog.Warn().Err(err).Str("host_id", hostID).Msg("resolve VMD for poll failed; will retry next tick")
 		return
 	}

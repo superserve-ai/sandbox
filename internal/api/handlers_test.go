@@ -230,6 +230,14 @@ func sandboxRow(s db.Sandbox) *mockRow {
 				return nil
 			}
 		}
+		// Single-count scans (RevertPauseToActive's reverted-row count) from
+		// lifecycle mocks that route every QueryRow here: report success.
+		if len(dest) == 1 {
+			if n, ok := dest[0].(*int64); ok {
+				*n = 1
+				return nil
+			}
+		}
 		*dest[0].(*uuid.UUID) = s.ID
 		*dest[1].(*uuid.UUID) = s.TeamID
 		*dest[2].(*string) = s.Name
