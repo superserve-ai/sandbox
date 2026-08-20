@@ -51,13 +51,18 @@ type backupFileReport struct {
 // the host's durable outbox; the insert is idempotent on
 // (owner, bucket, generation).
 type backupReport struct {
-	SandboxID   string             `json:"sandbox_id,omitempty"`
-	TemplateID  string             `json:"template_id,omitempty"`
-	BuildID     string             `json:"build_id,omitempty"`
-	Generation  string             `json:"generation"`
-	Bucket      string             `json:"bucket"`
-	CompletedAt time.Time          `json:"completed_at"`
-	Files       []backupFileReport `json:"files"`
+	SandboxID   string    `json:"sandbox_id,omitempty"`
+	TemplateID  string    `json:"template_id,omitempty"`
+	BuildID     string    `json:"build_id,omitempty"`
+	Generation  string    `json:"generation"`
+	Bucket      string    `json:"bucket"`
+	CompletedAt time.Time `json:"completed_at"`
+	// PauseToken echoes the identity this control plane minted for the
+	// pause that produced the generation (threaded through the pause RPC
+	// and the host's journal). Empty from older hosts and pre-token
+	// outbox entries.
+	PauseToken string             `json:"pause_token,omitempty"`
+	Files      []backupFileReport `json:"files"`
 }
 
 // ReportHostBackup handles POST /internal/hosts/:host_id/backups.
@@ -244,27 +249,47 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		// report contradicts (or lacks) means it describes a different
 		// pause. Rows are vmstate-only today and tighten the match
 		// automatically as richer manifests appear.
-		if !hasDisk || !hasVMState {
-			return nil
-		}
-		for _, row := range manifest {
-			if byName[row.FileName] != row.Sha256 {
-				return nil
+		contentMatch := hasDisk && hasVMState
+		if contentMatch {
+			for _, row := range manifest {
+				if byName[row.FileName] != row.Sha256 {
+					contentMatch = false
+					break
+				}
 			}
 		}
 		snapshotID := manifest[0].SnapshotID
-		// The match verdict is only true HERE, under the row lock, against
-		// the head manifest — persist it as the generation's coverage
-		// identity (snapshot row + its per-pause generation counter) so
-		// coverage reads never re-derive it from timestamps or content.
-		if err := q.MarkSandboxBackupCovered(ctx, db.MarkSandboxBackupCoveredParams{
-			SandboxID:          pgtype.UUID{Bytes: sandboxID, Valid: true},
-			Bucket:             req.Bucket,
-			Generation:         req.Generation,
-			SnapshotID:         pgtype.UUID{Bytes: snapshotID, Valid: true},
-			SnapshotGeneration: &manifest[0].SnapshotGeneration,
-		}); err != nil {
-			return err
+		// Coverage identity, decided under the row lock. Content must match
+		// in every case (the digests are what restore fetches); the token
+		// decides WHOSE pause that content is:
+		//  - Tokened report + equal tokens: names the exact pause — closes
+		//    the vmstate-collision window content alone leaves open
+		//    (pause-time manifests are vmstate-only).
+		//  - Tokenless report (older host, pre-token outbox entry,
+		//    backfill mint): content identity alone, as before.
+		//  - Non-empty tokens that DIFFER are proof of a DIFFERENT pause:
+		//    never mark, even on digest coincidence.
+		tokenConflict := req.PauseToken != "" && manifest[0].PauseToken != req.PauseToken
+		if contentMatch && !tokenConflict {
+			// Persist the verdict as the generation's coverage identity
+			// (snapshot row + its per-pause generation counter) so
+			// coverage reads never re-derive it from timestamps or
+			// content.
+			if err := q.MarkSandboxBackupCovered(ctx, db.MarkSandboxBackupCoveredParams{
+				SandboxID:          pgtype.UUID{Bytes: sandboxID, Valid: true},
+				Bucket:             req.Bucket,
+				Generation:         req.Generation,
+				SnapshotID:         pgtype.UUID{Bytes: snapshotID, Valid: true},
+				SnapshotGeneration: &manifest[0].SnapshotGeneration,
+			}); err != nil {
+				return err
+			}
+		}
+		// Size sync keys on content: the sizes describe these exact bytes.
+		// A token conflict skips it too — the report describes some other
+		// pause's artifacts regardless of digest coincidence.
+		if !contentMatch || tokenConflict {
+			return nil
 		}
 		if err := q.SetSnapshotSizeBytes(ctx, db.SetSnapshotSizeBytesParams{
 			ID: snapshotID, SizeBytes: total,

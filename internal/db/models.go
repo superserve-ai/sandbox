@@ -632,6 +632,7 @@ type Snapshot struct {
 	MemPath    *string   `json:"mem_path"`
 	Generation int64     `json:"generation"`
 	Name       *string   `json:"name"`
+	PauseToken *string   `json:"pause_token"`
 }
 
 type StripeWebhookEvent struct {

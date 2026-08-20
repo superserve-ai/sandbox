@@ -72,8 +72,13 @@ type Task struct {
 	Generation string     `json:"generation"`
 	Files      []TaskFile `json:"files"`
 	Priority   Priority   `json:"priority"`
-	EnqueuedAt time.Time  `json:"enqueued_at"`
-	Attempts   int        `json:"attempts"`
+	// PauseToken names the exact pause this sandbox generation captured
+	// (control-plane-minted, threaded through the pause RPC). Rides the
+	// journal so the completion report can carry it; empty on template
+	// tasks, pre-token entries, and backfill mints.
+	PauseToken string    `json:"pause_token,omitempty"`
+	EnqueuedAt time.Time `json:"enqueued_at"`
+	Attempts   int       `json:"attempts"`
 	// NotBefore delays retry after a failure (exponential backoff).
 	NotBefore time.Time `json:"not_before,omitempty"`
 	// VerifiedObjects records objects whose streamed bytes this task has

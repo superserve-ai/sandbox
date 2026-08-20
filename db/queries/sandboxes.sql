@@ -487,12 +487,16 @@ WITH target AS (
   FOR UPDATE
 ),
 upserted AS (
-  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
-  SELECT target.id, target.team_id, @path, @mem_path, @size_bytes, @trigger FROM target
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, pause_token)
+  SELECT target.id, target.team_id, @path, @mem_path, @size_bytes, @trigger,
+         NULLIF(@pause_token::text, '') FROM target
   ON CONFLICT (sandbox_id)
   DO UPDATE SET
     path = EXCLUDED.path,
     mem_path = EXCLUDED.mem_path,
+    -- The token names THIS pause; it replaces unconditionally, like the
+    -- artifacts it identifies.
+    pause_token = EXCLUDED.pause_token,
     -- Compatibility mode while snapshot_sandbox_unique exists: history is
     -- still one row, but the generation counter advances so consumers see
     -- monotonic generations before and after the contract-phase index drop.
@@ -583,7 +587,7 @@ WITH target AS (
   FOR UPDATE
 ),
 inserted AS (
-  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation)
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation, pause_token)
   SELECT target.id, target.team_id, @path, @mem_path,
          -- A non-positive total means the manifest was partial (hash budget
          -- exhausted or a file failed to hash): carry the prior head's
@@ -595,7 +599,8 @@ inserted AS (
                              WHERE s.sandbox_id = target.id
                              ORDER BY s.generation DESC LIMIT 1), 0) END,
          @trigger,
-         COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1
+         COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1,
+         NULLIF(@pause_token::text, '')
   FROM target
   RETURNING snapshot.id AS snap_id
 ),

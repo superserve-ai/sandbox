@@ -83,7 +83,8 @@ SELECT id, status, updated_at FROM sandbox WHERE id = $1 FOR UPDATE;
 -- contents are possible), so the report must match EVERY recorded row.
 -- Pause-time manifests are vmstate-only today; rows tighten the match
 -- automatically as richer manifests appear.
-SELECT s.id AS snapshot_id, s.generation AS snapshot_generation, am.file_name, am.sha256
+SELECT s.id AS snapshot_id, s.generation AS snapshot_generation,
+       COALESCE(s.pause_token, '') AS pause_token, am.file_name, am.sha256
 FROM snapshot s
 JOIN artifact_manifest am ON am.snapshot_id = s.id
 WHERE s.sandbox_id = $1
@@ -91,13 +92,15 @@ WHERE s.sandbox_id = $1
 ORDER BY am.file_name;
 
 -- name: MarkSandboxBackupCovered :exec
--- Persists the report handler's identity verdict: this generation's
--- manifest matched every digest the head snapshot's pause-time manifest
--- recorded, verified under the sandbox row lock. (snapshot_id,
--- snapshot_generation) names the exact pause — the generation counter
--- distinguishes pauses even while the legacy finalize reuses one
--- snapshot row id. Written in the report's transaction, so the coverage
--- row and its identity link commit together.
+-- Persists the report handler's identity verdict, verified under the
+-- sandbox row lock: either the report's pause_token equals the head
+-- snapshot's (STRONG — names the exact pause), or a tokenless report's
+-- manifest matched every recorded digest (legacy fallback).
+-- (snapshot_id, snapshot_generation) names the exact pause — the
+-- generation counter distinguishes pauses even while the legacy
+-- finalize reuses one snapshot row id. Written in the report's
+-- transaction, so the coverage row and its identity link commit
+-- together.
 UPDATE backup_generation
 SET covered_snapshot_id = sqlc.arg(snapshot_id),
     covered_snapshot_generation = sqlc.arg(snapshot_generation)

@@ -48,13 +48,17 @@ type backupReportFile struct {
 }
 
 type backupReportBody struct {
-	SandboxID   string             `json:"sandbox_id,omitempty"`
-	TemplateID  string             `json:"template_id,omitempty"`
-	BuildID     string             `json:"build_id,omitempty"`
-	Generation  string             `json:"generation"`
-	Bucket      string             `json:"bucket"`
-	CompletedAt time.Time          `json:"completed_at"`
-	Files       []backupReportFile `json:"files"`
+	SandboxID   string    `json:"sandbox_id,omitempty"`
+	TemplateID  string    `json:"template_id,omitempty"`
+	BuildID     string    `json:"build_id,omitempty"`
+	Generation  string    `json:"generation"`
+	Bucket      string    `json:"bucket"`
+	CompletedAt time.Time `json:"completed_at"`
+	// PauseToken names the exact pause this generation captured, echoed
+	// from the pause RPC through the journal; empty for pre-token entries
+	// and backfill mints, which fall back to content matching.
+	PauseToken string             `json:"pause_token,omitempty"`
+	Files      []backupReportFile `json:"files"`
 }
 
 // Deliver reports one verified generation. CompletedAt is the ack-time
@@ -90,6 +94,7 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 		Generation:  task.Generation,
 		Bucket:      bucket,
 		CompletedAt: completedAt.UTC(),
+		PauseToken:  task.PauseToken,
 		Files:       make([]backupReportFile, 0, len(files)),
 	}
 	for _, f := range files {

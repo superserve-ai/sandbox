@@ -326,6 +326,14 @@ message ReviveVMResponse {
 message PauseVMRequest {
   string vm_id = 1;
   string snapshot_dir = 2;   // Directory to store the snapshot artifacts.
+  // Caller-minted identity for THIS pause. The daemon threads it through
+  // the backup pipeline so the eventual upload report can name the exact
+  // pause it covers — content digests cannot (identical vmstate bytes with
+  // different disk contents are possible), and timestamps cannot (reports
+  // are delivered at-least-once from a durable outbox, arbitrarily late).
+  // Empty from an older caller: the report simply carries no token and
+  // coverage matching falls back to content.
+  string pause_token = 3;
 }
 
 message PauseVMResponse {

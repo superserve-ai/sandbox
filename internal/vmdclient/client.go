@@ -33,8 +33,10 @@ type Client interface {
 	DestroyInstance(ctx context.Context, instanceID string, force bool) error
 	// PauseInstance pauses the VM and returns its snapshot artifacts plus a
 	// per-file integrity manifest (disk state + vmstate; mem files are
-	// host-local only and not manifested).
-	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, manifest []ManifestEntry, err error)
+	// host-local only and not manifested). pauseToken is the caller-minted
+	// identity for this pause; the daemon threads it into the eventual
+	// backup report so coverage can name the exact pause it verified.
+	PauseInstance(ctx context.Context, instanceID, snapshotDir, pauseToken string) (snapshotPath, memPath string, manifest []ManifestEntry, err error)
 	// ResumeInstance restores a paused VM.
 	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when

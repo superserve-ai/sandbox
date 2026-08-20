@@ -298,7 +298,7 @@ type stubVMD struct {
 }
 
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
-func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string, []vmdclient.ManifestEntry, error) {
+func (s *stubVMD) PauseInstance(_ context.Context, _, _, _ string) (string, string, []vmdclient.ManifestEntry, error) {
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, nil
 }
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte) (string, uint32, uint32, error) {

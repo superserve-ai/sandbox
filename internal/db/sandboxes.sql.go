@@ -1236,12 +1236,16 @@ WITH target AS (
   FOR UPDATE
 ),
 upserted AS (
-  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
-  SELECT target.id, target.team_id, $3, $4, $5, $6 FROM target
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, pause_token)
+  SELECT target.id, target.team_id, $3, $4, $5, $6,
+         NULLIF($7::text, '') FROM target
   ON CONFLICT (sandbox_id)
   DO UPDATE SET
     path = EXCLUDED.path,
     mem_path = EXCLUDED.mem_path,
+    -- The token names THIS pause; it replaces unconditionally, like the
+    -- artifacts it identifies.
+    pause_token = EXCLUDED.pause_token,
     -- Compatibility mode while snapshot_sandbox_unique exists: history is
     -- still one row, but the generation counter advances so consumers see
     -- monotonic generations before and after the contract-phase index drop.
@@ -1260,11 +1264,11 @@ upserted AS (
   RETURNING snapshot.id AS snap_id
 ),
 fresh AS (
-  SELECT unnest($7::text[]) AS file_name,
-         unnest($8::text[])      AS path,
-         unnest($9::bigint[])    AS size_bytes,
-         unnest($10::text[])    AS sha256,
-         unnest($11::text[]) AS base_path
+  SELECT unnest($8::text[]) AS file_name,
+         unnest($9::text[])      AS path,
+         unnest($10::bigint[])    AS size_bytes,
+         unnest($11::text[])    AS sha256,
+         unnest($12::text[]) AS base_path
 ),
 kept AS (
   INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
@@ -1305,6 +1309,7 @@ type FinalizePauseParams struct {
 	MemPath           *string   `json:"mem_path"`
 	SizeBytes         int64     `json:"size_bytes"`
 	Trigger           string    `json:"trigger"`
+	PauseToken        string    `json:"pause_token"`
 	ManifestFileNames []string  `json:"manifest_file_names"`
 	ManifestPaths     []string  `json:"manifest_paths"`
 	ManifestSizes     []int64   `json:"manifest_sizes"`
@@ -1335,6 +1340,7 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (u
 		arg.MemPath,
 		arg.SizeBytes,
 		arg.Trigger,
+		arg.PauseToken,
 		arg.ManifestFileNames,
 		arg.ManifestPaths,
 		arg.ManifestSizes,
@@ -1360,7 +1366,7 @@ WITH target AS (
   FOR UPDATE
 ),
 inserted AS (
-  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation)
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation, pause_token)
   SELECT target.id, target.team_id, $3, $4,
          -- A non-positive total means the manifest was partial (hash budget
          -- exhausted or a file failed to hash): carry the prior head's
@@ -1372,16 +1378,17 @@ inserted AS (
                              WHERE s.sandbox_id = target.id
                              ORDER BY s.generation DESC LIMIT 1), 0) END,
          $6,
-         COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1
+         COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1,
+         NULLIF($7::text, '')
   FROM target
   RETURNING snapshot.id AS snap_id
 ),
 fresh AS (
-  SELECT unnest($7::text[]) AS file_name,
-         unnest($8::text[])      AS path,
-         unnest($9::bigint[])    AS size_bytes,
-         unnest($10::text[])    AS sha256,
-         unnest($11::text[]) AS base_path
+  SELECT unnest($8::text[]) AS file_name,
+         unnest($9::text[])      AS path,
+         unnest($10::bigint[])    AS size_bytes,
+         unnest($11::text[])    AS sha256,
+         unnest($12::text[]) AS base_path
 ),
 manifested AS (
   INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
@@ -1407,6 +1414,7 @@ type FinalizePauseGenerationParams struct {
 	MemPath           *string     `json:"mem_path"`
 	SizeBytes         interface{} `json:"size_bytes"`
 	Trigger           string      `json:"trigger"`
+	PauseToken        string      `json:"pause_token"`
 	ManifestFileNames []string    `json:"manifest_file_names"`
 	ManifestPaths     []string    `json:"manifest_paths"`
 	ManifestSizes     []int64     `json:"manifest_sizes"`
@@ -1429,6 +1437,7 @@ func (q *Queries) FinalizePauseGeneration(ctx context.Context, arg FinalizePause
 		arg.MemPath,
 		arg.SizeBytes,
 		arg.Trigger,
+		arg.PauseToken,
 		arg.ManifestFileNames,
 		arg.ManifestPaths,
 		arg.ManifestSizes,

@@ -417,10 +417,11 @@ func (c *grpcVMDClient) DestroyInstance(ctx context.Context, vmID string, force 
 	return nil
 }
 
-func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir string) (string, string, []vmdclient.ManifestEntry, error) {
+func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir, pauseToken string) (string, string, []vmdclient.ManifestEntry, error) {
 	resp, err := c.client.PauseVM(ctx, &vmdpb.PauseVMRequest{
 		VmId:        vmID,
 		SnapshotDir: snapshotDir,
+		PauseToken:  pauseToken,
 	})
 	if err != nil {
 		return "", "", nil, fmt.Errorf("gRPC PauseVM: %w", err)

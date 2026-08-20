@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -374,7 +375,10 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		return
 	}
 
-	snapshotPath, memPath, manifest, err := pauseWithRetry(ctx, vmd, sbx.ID.String())
+	// Minted per pause; returns in the host's upload report to name this
+	// exact pause for coverage linkage.
+	pauseToken := uuid.NewString()
+	snapshotPath, memPath, manifest, err := pauseWithRetry(ctx, vmd, sbx.ID.String(), pauseToken)
 	if err != nil {
 		// Retry (see pauseWithRetry) didn't converge — the VM genuinely
 		// didn't pause, so revert to active and let the next tick retry.
@@ -388,11 +392,12 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	defer postCancel()
 
 	params := db.FinalizePauseParams{
-		ID:      sbx.ID,
-		TeamID:  sbx.TeamID,
-		Path:    snapshotPath,
-		MemPath: &memPath,
-		Trigger: trigger,
+		ID:         sbx.ID,
+		TeamID:     sbx.TeamID,
+		Path:       snapshotPath,
+		MemPath:    &memPath,
+		Trigger:    trigger,
+		PauseToken: pauseToken,
 	}
 	applyManifest(&params, manifest)
 	if _, err := h.finalizePause(postCtx, params); err != nil {

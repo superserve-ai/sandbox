@@ -102,7 +102,7 @@ func pauseManifestComplete(manifest []ManifestEntry) bool {
 // sandbox resumes while the rehash runs, the digests capture torn bytes
 // and the uploader's pre-verification abandons that generation, which is
 // the same safe outcome as any mutated source.
-func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath, diskBasePath string, log zerolog.Logger) []ManifestEntry {
+func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath, diskBasePath, pauseToken string, log zerolog.Logger) []ManifestEntry {
 	// The pause-hook histogram measures exactly the synchronous time this
 	// hook holds the pause RPC path (detached workers are excluded by
 	// construction: they run past the return). A size-dependent
@@ -122,7 +122,7 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	if m.backupEnqueue == nil {
 		return manifest
 	}
-	pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
+	pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath, pauseToken)
 	// Inline sparse staging under the still-held VM operation lock:
 	// copying scales with REAL bytes (the same O(dirtied) scaling as the
 	// pause itself, tens of ms for typical overlays), and the immutable
@@ -341,7 +341,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 		m.healPendingBackup(pb, log)
 		return
 	}
-	if ok, staged, _ := m.enqueueBackup(pb.VMID, retried, pb.backupPriority()); ok {
+	if ok, staged, _ := m.enqueueBackup(pb.VMID, retried, pb.backupPriority(), pb.PauseToken); ok {
 		if staged {
 			m.deletePendingBackupIf(pb, log)
 			return
@@ -537,7 +537,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 			entries[i].Path = p
 		}
 	}
-	if ok, _, _ := m.enqueueBackup(pb.VMID, entries, pb.backupPriority()); ok {
+	if ok, _, _ := m.enqueueBackup(pb.VMID, entries, pb.backupPriority(), pb.PauseToken); ok {
 		m.deletePendingBackupIf(pb, log)
 		return
 	}
@@ -809,7 +809,7 @@ func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger)
 				continue
 			}
 		}
-		pb := newPendingBackup(rec.ID, rec.SnapshotPath, rec.DiskPath, rec.BasePath)
+		pb := newPendingBackup(rec.ID, rec.SnapshotPath, rec.DiskPath, rec.BasePath, "")
 		pb.BestEffort = true
 		wrote, err := m.state.PutPendingBackupIfAbsent(pb)
 		if err != nil {
@@ -865,7 +865,7 @@ func (m *Manager) retryEnqueue(pb PendingBackup, manifest []ManifestEntry, log z
 	m.healPendingBackup(pb, log)
 	var staged bool
 	enqueued := retryWithBackoff(func() bool {
-		ok, s, _ := m.enqueueBackup(pb.VMID, manifest, pb.backupPriority())
+		ok, s, _ := m.enqueueBackup(pb.VMID, manifest, pb.backupPriority(), pb.PauseToken)
 		staged = s
 		return ok
 	})
@@ -928,10 +928,10 @@ func (m *Manager) healPendingBackup(pb PendingBackup, log zerolog.Logger) {
 // rehash can prove it is hashing the pause-time base and not a
 // same-path replacement, and so a later pause of the same VM (fixed
 // snapshot pathname) can be told apart from a retry of this one.
-func newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath string) PendingBackup {
+func newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath, pauseToken string) PendingBackup {
 	pb := PendingBackup{
 		VMID: vmID, SnapshotPath: snapshotPath, DiskPath: diskPath, DiskBasePath: diskBasePath,
-		Token: newPendingToken(),
+		Token: newPendingToken(), PauseToken: pauseToken,
 	}
 	if diskBasePath != "" {
 		if id, err := baseIdentity(diskBasePath); err == nil {
@@ -1071,7 +1071,7 @@ func (pb PendingBackup) backupPriority() backup.Priority {
 // Enqueue is a local BoltDB write (milliseconds) and must never fail the
 // pause: the artifacts on disk are valid regardless, and the journal is
 // the retry mechanism, not the caller.
-func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio backup.Priority) (bool, bool, string) {
+func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio backup.Priority, pauseToken string) (bool, bool, string) {
 	if m.backupEnqueue == nil || len(manifest) == 0 {
 		return false, false, ""
 	}
@@ -1100,6 +1100,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio back
 		Generation: backup.GenerationKey(files),
 		Files:      files,
 		Priority:   prio,
+		PauseToken: pauseToken,
 	}
 	// Stage before enqueueing: teardown of a destroyed sandbox unlinks
 	// the artifacts, and the queued upload must survive it to honor the
@@ -1146,7 +1147,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio back
 			} else {
 				m.log.Warn().Str("vm_id", vmID).
 					Msg("sandbox left at-rest during staging; uploading from original paths")
-				task = rebuildTask(vmID, manifest, prio)
+				task = rebuildTask(vmID, manifest, prio, pauseToken)
 			}
 		}
 	}
@@ -1188,7 +1189,7 @@ func taskFullyStaged(root string, task backup.Task) bool {
 
 // rebuildTask reconstructs the enqueue task from the manifest with its
 // original paths, discarding any staged rewrites.
-func rebuildTask(vmID string, manifest []ManifestEntry, prio backup.Priority) backup.Task {
+func rebuildTask(vmID string, manifest []ManifestEntry, prio backup.Priority, pauseToken string) backup.Task {
 	files := make([]backup.TaskFile, 0, len(manifest))
 	for _, e := range manifest {
 		files = append(files, backup.TaskFile{
@@ -1206,6 +1207,7 @@ func rebuildTask(vmID string, manifest []ManifestEntry, prio backup.Priority) ba
 		Generation: backup.GenerationKey(files),
 		Files:      files,
 		Priority:   prio,
+		PauseToken: pauseToken,
 	}
 }
 

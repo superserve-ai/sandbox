@@ -57,7 +57,8 @@ func (q *Queries) LatestSandboxBackup(ctx context.Context, sandboxID pgtype.UUID
 }
 
 const latestSnapshotManifest = `-- name: LatestSnapshotManifest :many
-SELECT s.id AS snapshot_id, s.generation AS snapshot_generation, am.file_name, am.sha256
+SELECT s.id AS snapshot_id, s.generation AS snapshot_generation,
+       COALESCE(s.pause_token, '') AS pause_token, am.file_name, am.sha256
 FROM snapshot s
 JOIN artifact_manifest am ON am.snapshot_id = s.id
 WHERE s.sandbox_id = $1
@@ -68,6 +69,7 @@ ORDER BY am.file_name
 type LatestSnapshotManifestRow struct {
 	SnapshotID         uuid.UUID `json:"snapshot_id"`
 	SnapshotGeneration int64     `json:"snapshot_generation"`
+	PauseToken         string    `json:"pause_token"`
 	FileName           string    `json:"file_name"`
 	Sha256             string    `json:"sha256"`
 }
@@ -91,6 +93,7 @@ func (q *Queries) LatestSnapshotManifest(ctx context.Context, sandboxID uuid.UUI
 		if err := rows.Scan(
 			&i.SnapshotID,
 			&i.SnapshotGeneration,
+			&i.PauseToken,
 			&i.FileName,
 			&i.Sha256,
 		); err != nil {
@@ -144,13 +147,15 @@ type MarkSandboxBackupCoveredParams struct {
 	Generation         string      `json:"generation"`
 }
 
-// Persists the report handler's identity verdict: this generation's
-// manifest matched every digest the head snapshot's pause-time manifest
-// recorded, verified under the sandbox row lock. (snapshot_id,
-// snapshot_generation) names the exact pause — the generation counter
-// distinguishes pauses even while the legacy finalize reuses one
-// snapshot row id. Written in the report's transaction, so the coverage
-// row and its identity link commit together.
+// Persists the report handler's identity verdict, verified under the
+// sandbox row lock: either the report's pause_token equals the head
+// snapshot's (STRONG — names the exact pause), or a tokenless report's
+// manifest matched every recorded digest (legacy fallback).
+// (snapshot_id, snapshot_generation) names the exact pause — the
+// generation counter distinguishes pauses even while the legacy
+// finalize reuses one snapshot row id. Written in the report's
+// transaction, so the coverage row and its identity link commit
+// together.
 func (q *Queries) MarkSandboxBackupCovered(ctx context.Context, arg MarkSandboxBackupCoveredParams) error {
 	_, err := q.db.Exec(ctx, markSandboxBackupCovered,
 		arg.SnapshotID,

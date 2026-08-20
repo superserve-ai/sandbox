@@ -42,7 +42,7 @@ func TestBackupPauseRecordsHookDuration(t *testing.T) {
 	m.SetBackupMetrics(rec)
 	// Backup disabled (no enqueue hook): the hook returns after the
 	// vmstate entry, and the histogram must still see the call.
-	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-test", zerolog.Nop())
 
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &rm); err != nil {
@@ -73,7 +73,7 @@ func TestBackupPauseNilRecorderSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := &Manager{}
-	if got := m.backupPause(context.Background(), "vm-1", snap, filepath.Join(dir, "rootfs.ext4"), "", zerolog.Nop()); len(got) != 1 {
+	if got := m.backupPause(context.Background(), "vm-1", snap, filepath.Join(dir, "rootfs.ext4"), "", "tok-test", zerolog.Nop()); len(got) != 1 {
 		t.Fatalf("manifest entries = %d, want the vmstate entry", len(got))
 	}
 }

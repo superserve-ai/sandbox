@@ -46,7 +46,7 @@ func (a *GRPCAdapter) DestroyVM(ctx context.Context, req *vmdpb.DestroyVMRequest
 }
 
 func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*vmdpb.PauseVMResponse, error) {
-	snapshotPath, memPath, manifest, err := a.mgr.PauseVM(ctx, req.GetVmId(), req.GetSnapshotDir())
+	snapshotPath, memPath, manifest, err := a.mgr.PauseVM(ctx, req.GetVmId(), req.GetSnapshotDir(), req.GetPauseToken())
 	if err != nil {
 		return nil, err
 	}

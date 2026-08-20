@@ -535,14 +535,14 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 		t.Fatalf("create sandbox: %d %s", cw.Code, cw.Body.String())
 	}
 	sandboxID := mustJSON(t, cw)["id"].(string)
-	// Pause with a head snapshot row AND its pause-time manifest, as
-	// FinalizePause leaves them: the coverage probe matches generations
-	// against the manifest's content identity.
+	// Pause with a head snapshot row, its pause-time manifest, AND the
+	// pause token FinalizePause stores: reports naming that token match
+	// the STRONG identity path; tokenless reports fall back to content.
 	shaA, shaB := strings.Repeat("a", 64), strings.Repeat("b", 64)
 	if _, err := testPool.Exec(ctx,
 		`WITH snap AS (
-		   INSERT INTO snapshot (sandbox_id, team_id, path, trigger)
-		   SELECT id, team_id, '/snap/rootfs', 'pause' FROM sandbox WHERE id = $1
+		   INSERT INTO snapshot (sandbox_id, team_id, path, trigger, pause_token)
+		   SELECT id, team_id, '/snap/rootfs', 'pause', 'tok-1' FROM sandbox WHERE id = $1
 		   RETURNING id
 		 ),
 		 manifest AS (
@@ -590,10 +590,14 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 	// Reports go through the REAL handler: coverage is only ever linked to
 	// a pause by ReportHostBackup's under-lock identity match, and this
 	// test must exercise that code, not hand-write its conclusions.
-	report := func(genKey, vmstateSHA, rootfsSHA string) {
+	report := func(genKey, vmstateSHA, rootfsSHA, pauseToken string) {
 		t.Helper()
-		body := fmt.Sprintf(`{"sandbox_id":%q,"generation":%q,"bucket":"cell-bucket","completed_at":%q,"files":[{"name":"vmstate.snap","size_bytes":1,"sha256":%q},{"name":"rootfs.ext4","size_bytes":1,"sha256":%q}]}`,
-			sandboxID, genKey, time.Now().UTC().Format(time.RFC3339), vmstateSHA, rootfsSHA)
+		tokenField := ""
+		if pauseToken != "" {
+			tokenField = fmt.Sprintf(`"pause_token":%q,`, pauseToken)
+		}
+		body := fmt.Sprintf(`{"sandbox_id":%q,"generation":%q,"bucket":"cell-bucket","completed_at":%q,%s"files":[{"name":"vmstate.snap","size_bytes":1,"sha256":%q},{"name":"rootfs.ext4","size_bytes":1,"sha256":%q}]}`,
+			sandboxID, genKey, time.Now().UTC().Format(time.RFC3339), tokenField, vmstateSHA, rootfsSHA)
 		req := httptest.NewRequest("POST", "/internal/hosts/"+hostID+"/backups", strings.NewReader(body))
 		req.Header.Set("Authorization", "Bearer itok-hostreg")
 		req.Header.Set("Content-Type", "application/json")
@@ -605,21 +609,22 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 	}
 	shaX, shaY := strings.Repeat("d", 64), strings.Repeat("e", 64)
 
-	// A verified report matching the pause's recorded manifest arrives:
-	// the handler links the generation to this pause and the sandbox
+	// A verified report carrying this pause's token arrives: the handler
+	// links the generation via the STRONG identity path and the sandbox
 	// leaves the unbacked class.
-	report(strings.Repeat("1", 64), shaA, shaX)
+	report(strings.Repeat("1", 64), shaA, shaX, "tok-1")
 	if paused, unbacked := counts(); paused != 1 || unbacked != 0 {
 		t.Fatalf("after backup: paused=%d unbacked=%d, want 1/0", paused, unbacked)
 	}
 
-	// Resume + re-pause: the finalize rewrites the manifest digests and
+	// Resume + re-pause: the finalize rewrites the manifest digests,
 	// advances the snapshot's generation counter (legacy mode reuses the
-	// row id — the counter is what names the pause). Every earlier link
-	// now points at a pause that no longer exists.
+	// row id — the counter is what names the pause), and stores the new
+	// pause's token. Every earlier link now points at a pause that no
+	// longer exists.
 	if _, err := testPool.Exec(ctx,
 		`WITH snap AS (
-		   UPDATE snapshot SET generation = generation + 1
+		   UPDATE snapshot SET generation = generation + 1, pause_token = 'tok-2'
 		   WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)
 		   RETURNING id
 		 )
@@ -633,16 +638,25 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 	}
 
 	// The previous pause's report, delayed in the outbox, redelivers
-	// AFTER the re-pause. The handler matches it against the CURRENT
-	// manifest, fails, and links nothing — even though every timestamp on
-	// it is fresh.
-	report(strings.Repeat("1", 64), shaA, shaX)
+	// AFTER the re-pause. Token AND content both mismatch; nothing links.
+	report(strings.Repeat("1", 64), shaA, shaX, "tok-1")
 	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
 		t.Fatalf("after delayed stale report: paused=%d unbacked=%d, want 1/1 (late delivery of old content must not fake coverage)", paused, unbacked)
 	}
 
-	// The current pause's own report arrives and matches: covered again.
-	report(strings.Repeat("2", 64), shaB, shaY)
+	// The collision attack the token exists to stop: a delayed report
+	// whose CONTENT coincides with the current manifest (pause-time
+	// manifests are vmstate-only, so only the vmstate digest must
+	// collide) but whose token names the previous pause. Content says
+	// covered; the token conflict vetoes it.
+	report(strings.Repeat("3", 64), shaB, shaX, "tok-1")
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("after token-conflict report: paused=%d unbacked=%d, want 1/1 (digest coincidence must not fake coverage)", paused, unbacked)
+	}
+
+	// A tokenless report (older host, pre-token outbox entry) with
+	// matching content: the legacy fallback path links it.
+	report(strings.Repeat("2", 64), shaB, shaY, "")
 	if paused, unbacked := counts(); paused != 1 || unbacked != 0 {
 		t.Fatalf("after current-pause backup: paused=%d unbacked=%d, want 1/0", paused, unbacked)
 	}
