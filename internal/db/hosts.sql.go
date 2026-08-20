@@ -367,29 +367,35 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        -- exists, but unbacked is the irrecoverable class an operator must
        -- never retire past.
        --
-       -- "Current pause" means a generation completed at/after the head
-       -- snapshot's created_at (which refreshes on every pause finalize) —
-       -- a generation recorded for some EARLIER pause does not cover data
-       -- written since. completed_at is the host's clock, stored exactly as
-       -- reported (see RecordSandboxBackupGeneration), so it is capped at
-       -- reported_at — the server-clocked receive instant, fixed at insert —
-       -- exactly as LatestSandboxBackup ranks freshness: a skewed-ahead host
-       -- cannot make a previous pause's generation read as covering this
-       -- one. An unchanged re-pause re-verifying the same generation
-       -- refreshes reported_at and correctly reads covered. The comparison
-       -- errs conservative: an upload whose report lands just before the
-       -- finalize reads as unbacked until the next report, never the
-       -- reverse. A paused sandbox with no snapshot row counts as unbacked
-       -- for the same reason.
+       -- "Covers the current pause" is decided by CONTENT IDENTITY, never
+       -- by timestamps: a generation counts only if its files manifest
+       -- contains every (name, sha256) the head snapshot's pause-time
+       -- manifest recorded — the same match the backup-report path applies
+       -- (see backups.go: vmstate alone is not a unique pause identity, so
+       -- the report must match EVERY recorded row). No clock comparison
+       -- survives delayed outbox delivery plus host-clock skew, which can
+       -- land a PREVIOUS pause's generation with both of its timestamps
+       -- past the current snapshot's created_at; identical content, by
+       -- contrast, means the pause's data IS in the bucket regardless of
+       -- when the report arrived. Errs conservative: a snapshot with no
+       -- recorded manifest rows, or a generation whose manifest was never
+       -- reported (coverage-only outbox seed), cannot be identified and
+       -- counts as unbacked.
        COALESCE((SELECT COUNT(*) FROM sandbox s2
                  WHERE s2.host_id = h.id
                    AND s2.status = 'paused'
                    AND s2.destroyed_at IS NULL
-                   AND NOT EXISTS (SELECT 1
-                                   FROM snapshot snap
-                                   JOIN backup_generation bg ON bg.sandbox_id = s2.id
-                                   WHERE snap.id = s2.snapshot_id
-                                     AND LEAST(bg.completed_at, bg.reported_at) >= snap.created_at)), 0)::int AS paused_unbacked_count
+                   AND NOT EXISTS (
+                     SELECT 1 FROM backup_generation bg
+                     WHERE bg.sandbox_id = s2.id
+                       AND EXISTS (SELECT 1 FROM artifact_manifest am
+                                   WHERE am.snapshot_id = s2.snapshot_id)
+                       AND NOT EXISTS (
+                         SELECT 1 FROM artifact_manifest am
+                         WHERE am.snapshot_id = s2.snapshot_id
+                           AND NOT (bg.files @> jsonb_build_array(
+                                 jsonb_build_object('name', am.file_name,
+                                                    'sha256', am.sha256)))))), 0)::int AS paused_unbacked_count
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
 WHERE $1::text IS NULL OR h.id = $1
