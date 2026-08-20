@@ -311,7 +311,7 @@ func TestRepairCanonicalizesMisorderAndDuplicates(t *testing.T) {
 	if ok, _, _ := verifyHostFirewall(d, spec); ok {
 		t.Fatal("sabotaged ruleset verified — test broken")
 	}
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair: %v", err)
 	}
 	nd, err := parseIPTablesSave(renderDump(k.rules, k.chains))
@@ -347,7 +347,7 @@ func TestRepairIsOneAtomicTransactionPerTable(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair: %v", err)
 	}
 	if k.restores != 1 {
@@ -372,7 +372,7 @@ func TestRepairPreservesStricterForeignRulesAbove(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair: %v", err)
 	}
 	got := k.rules["filter/FORWARD"]
@@ -407,7 +407,7 @@ func TestRepairRefusesAmbiguousForeignRuleAbove(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err == nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err == nil {
 		t.Fatal("repair must refuse to reorder past an ambiguous foreign jump")
 	}
 	if k.restores != 0 {
@@ -474,7 +474,7 @@ func TestVerifyHeadGuard(t *testing.T) {
 		k := &fakeKernel{rules: rules, chains: chains}
 		defer k.install(t)()
 		d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-		if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 			t.Fatalf("repair: %v", err)
 		}
 		nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
@@ -643,7 +643,7 @@ func TestRepairPreservesInterleavedStrictRule(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair: %v", err)
 	}
 	got := k.rules["filter/FORWARD"]
@@ -737,7 +737,7 @@ func TestRepairNeverNamesForeignRules(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair: %v", err)
 	}
 	specRules := map[string]bool{}
@@ -794,7 +794,7 @@ func TestRepairRefusesStrictForeignAbovePreroutingRedirect(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err == nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err == nil {
 		t.Fatal("repair must refuse to demote a stricter foreign rule below a terminal redirect")
 	}
 	if k.restores != 0 {
@@ -820,7 +820,7 @@ func TestStaleManagedRedirectIsReconciledNotFatal(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair: %v", err)
 	}
 	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
@@ -886,7 +886,7 @@ func TestLegacyPreMarkerRedirectsReconciled(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair: %v", err)
 	}
 	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
@@ -940,7 +940,7 @@ func TestUnmarkedTwinsToleratedNeverDeleted(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair: %v", err)
 	}
 	foundDrop, foundTLS := false, false
@@ -974,7 +974,7 @@ func TestRepairRefusesToStarveObserverAbovePreroutingRedirect(t *testing.T) {
 	rules, chains := specKernel(spec, nil)
 	rules["nat/PREROUTING"] = append([][]string{observer, stale}, rules["nat/PREROUTING"]...)
 	d, _ := parseIPTablesSave(renderDump(rules, chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err == nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err == nil {
 		t.Fatal("repair reordered past an observer above a vmd redirect")
 	}
 
@@ -984,7 +984,7 @@ func TestRepairRefusesToStarveObserverAbovePreroutingRedirect(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ = parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair refused with observer below the redirects: %v", err)
 	}
 	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
@@ -1003,7 +1003,7 @@ func TestRepairRefusesToPromoteTerminalNATBelowMasquerade(t *testing.T) {
 	rules, chains := specKernel(spec, nil)
 	rules["nat/POSTROUTING"] = append(rules["nat/POSTROUTING"], snat, masq) // dup forces repair
 	d, _ := parseIPTablesSave(renderDump(rules, chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err == nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err == nil {
 		t.Fatal("repair promoted a foreign terminal NAT rule past the MASQUERADE")
 	}
 
@@ -1014,7 +1014,7 @@ func TestRepairRefusesToPromoteTerminalNATBelowMasquerade(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ = parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair refused with foreign NAT already above: %v", err)
 	}
 	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
@@ -1028,8 +1028,46 @@ func TestRepairRefusesToPromoteTerminalNATBelowMasquerade(t *testing.T) {
 	k2 := &fakeKernel{rules: rules, chains: chains}
 	defer k2.install(t)()
 	d, _ = parseIPTablesSave(renderDump(k2.rules, k2.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair refused with observer below: %v", err)
+	}
+}
+
+func TestConcurrentWriterDuringRepairDetected(t *testing.T) {
+	// A NON-cooperating writer inserting between the repair's snapshot dump
+	// and the next verification dump must fail startup: verification alone
+	// tolerates the rule (an observer), but the absolute-head inserts may
+	// have changed its effective position — only the prediction compare can
+	// tell.
+	spec := testSpec(true)
+	rules, chains := specKernel(spec, nil)
+	masq := marked("-s", "10.11.0.0/16", "-o", "eth0", "-j", "MASQUERADE")
+	rules["nat/POSTROUTING"] = append(rules["nat/POSTROUTING"], masq) // duplicate forces repair
+
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	fakeRestore := restoreIPTables
+	restoreIPTables = func(ctx context.Context, input string) error {
+		if err := fakeRestore(ctx, input); err != nil {
+			return err
+		}
+		if strings.HasPrefix(input, "*nat") {
+			k.rules["nat/POSTROUTING"] = append([][]string{{"-s", "10.11.0.0/16", "-j", "LOG"}}, k.rules["nat/POSTROUTING"]...)
+		}
+		return nil
+	}
+	defer func() { restoreIPTables = fakeRestore }()
+	origInstall := installHostFirewallFn
+	installHostFirewallFn = func(string, uint16, uint16, uint16, string, uint16, []uint16, bool, zerolog.Logger) error { return nil }
+	defer func() { installHostFirewallFn = origInstall }()
+	origLock := hostFirewallLockPath
+	hostFirewallLockPath = t.TempDir() + "/hostfw.lock"
+	defer func() { hostFirewallLockPath = origLock }()
+
+	iface, hp, tp, dp, sd, sp, bp := testSpecParams()
+	err := ensureHostFirewall(context.Background(), iface, hp, tp, dp, sd, sp, bp, true, zerolog.Nop())
+	if err == nil || !strings.Contains(err.Error(), "concurrent") {
+		t.Fatalf("concurrent writer not detected, got: %v", err)
 	}
 }
 
@@ -1087,7 +1125,7 @@ func TestRepairKeepsClampAheadOfForeignAccept(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair: %v", err)
 	}
 	got := k.rules["filter/FORWARD"]
@@ -1158,7 +1196,7 @@ func TestVerifyGuardsClampFromPrecedingTerminalAccept(t *testing.T) {
 		k := &fakeKernel{rules: rules, chains: chains}
 		defer k.install(t)()
 		d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-		if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 			t.Fatalf("repair: %v", err)
 		}
 		nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
@@ -1183,7 +1221,7 @@ func TestUnmarkedAcceptTwinAboveDropsFlags(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
 		t.Fatalf("repair: %v", err)
 	}
 	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))

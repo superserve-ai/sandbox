@@ -107,6 +107,7 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	// "canonicalizing" it could hoist an ACCEPT above the daemon's drops —
 	// they install (presence only, today's behavior) and leave ordering to
 	// the daemon.
+	var predicted map[string][][]string
 	for pass := 0; ; pass++ {
 		out, err := dumpIPTables(ctx)
 		if err != nil {
@@ -115,6 +116,21 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 		d, perr := parseIPTablesSave(out)
 		if perr != nil {
 			return fmt.Errorf("host firewall post-install parse: %w", perr)
+		}
+		// A repaired chain must contain exactly what the repair's snapshot
+		// predicted. Any deviation means a non-cooperating writer interleaved
+		// with the restore and the absolute-position inserts may have changed
+		// its rule's effective position — refuse rather than serve a state
+		// that silently reordered someone else's rule.
+		for key, wantChain := range predicted {
+			gotChain := d.rules[key]
+			same := len(gotChain) == len(wantChain)
+			for i := 0; same && i < len(wantChain); i++ {
+				same = ruleEqual(wantChain[i], gotChain[i])
+			}
+			if !same {
+				return fmt.Errorf("host firewall chain %s changed underneath the repair — concurrent non-cooperating writer; refusing to serve from a stale snapshot", key)
+			}
 		}
 		ok, class, detail := verifyHostFirewall(d, spec)
 		// Async: informational writes must not hold the lock (or startup)
@@ -142,7 +158,7 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 			log.Warn().Str("mismatch", class).Str("detail", detail).
 				Msg("host firewall needs canonicalization after install — repairing rule order")
 		}()
-		if err := repairSharedOrdering(ctx, d, spec); err != nil {
+		if predicted, err = repairSharedOrdering(ctx, d, spec); err != nil {
 			return fmt.Errorf("host firewall ordering repair: %w", err)
 		}
 	}
@@ -162,6 +178,15 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 //     which is also why a stricter foreign DROP anywhere in the chain stays
 //     effective: it always precedes the re-appended broad ACCEPT.
 //
+// Because the restore rebuilds each chain from the verification dump's
+// snapshot, repair also returns the exact per-chain contents that snapshot
+// plus the transaction predicts. The caller MUST compare the next dump
+// against this prediction before trusting verification: a NON-cooperating
+// writer (one not holding the flock) that inserts a rule between the dump
+// and the restore would otherwise be silently reordered by the absolute-head
+// inserts — e.g. a fresh strict rule demoted below a terminal redirect —
+// with post-repair verification tolerating the result.
+//
 // A veth-capable AMBIGUOUS foreign rule above the security block still
 // aborts without mutation: head-inserting our rules would demote its unknown
 // control flow below our enforcement, and that call is the operator's. The
@@ -173,7 +198,8 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 // filter/FORWARD needs neither: its head rules are non-shadowing drops, and
 // promoting strictness there is acceptable by design.
 // OWNER ONLY.
-func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) error {
+func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (map[string][][]string, error) {
+	predicted := map[string][][]string{}
 	perTable := map[string][]string{} // table → restore lines
 	for key, want := range spec.sharedOrdered {
 		if len(want) == 0 {
@@ -185,7 +211,7 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 			continue
 		}
 		if class == "preceded-ambiguous" {
-			return fmt.Errorf("%s — refusing to reorder past an ambiguous foreign rule", detail)
+			return nil, fmt.Errorf("%s — refusing to reorder past an ambiguous foreign rule", detail)
 		}
 		table, chain, _ := strings.Cut(key, "/")
 		got := d.rules[key]
@@ -236,7 +262,7 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 				if !isOurs && !staleVMDRule(key, g, want) && !unmarkedTwin(g, want) && !ruleCannotMatchSandboxIngress(g) {
 					switch foreignDisposition(g) {
 					case "strict", "observer":
-						return fmt.Errorf("foreign %s rule above a vmd redirect in %s (%s) — head-inserting the terminal redirects would starve it of matching traffic; refusing", foreignDisposition(g), key, strings.Join(g, " "))
+						return nil, fmt.Errorf("foreign %s rule above a vmd redirect in %s (%s) — head-inserting the terminal redirects would starve it of matching traffic; refusing", foreignDisposition(g), key, strings.Join(g, " "))
 					}
 				}
 			}
@@ -276,7 +302,7 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 					switch foreignDisposition(g) {
 					case "strict", "inert", "observer":
 					default:
-						return fmt.Errorf("foreign terminal-capable rule below a vmd nat rule in %s (%s) — re-appending ours would promote it; refusing", key, strings.Join(g, " "))
+						return nil, fmt.Errorf("foreign terminal-capable rule below a vmd nat rule in %s (%s) — re-appending ours would promote it; refusing", key, strings.Join(g, " "))
 					}
 				}
 			}
@@ -289,17 +315,34 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 				}
 			}
 		}
+		var remainder [][]string
+		for _, g := range got {
+			isOurs := false
+			for _, w := range want {
+				if ruleEqual(w.args, g) {
+					isOurs = true
+					break
+				}
+			}
+			if !isOurs && !staleVMDRule(key, g, want) {
+				remainder = append(remainder, g)
+			}
+		}
 		headPos := 0
+		var heads, tailRules [][]string
 		var tail []string
 		for _, w := range want {
 			if headRule(key, w) {
 				headPos++
 				lines = append(lines, fmt.Sprintf("-I %s %d %s", chain, headPos, emitRuleTokens(w.args)))
+				heads = append(heads, w.args)
 			} else {
 				tail = append(tail, "-A "+chain+" "+emitRuleTokens(w.args))
+				tailRules = append(tailRules, w.args)
 			}
 		}
 		lines = append(lines, tail...)
+		predicted[key] = append(append(heads, remainder...), tailRules...)
 		perTable[table] = append(perTable[table], lines...)
 	}
 	for _, table := range []string{"filter", "nat"} {
@@ -309,10 +352,10 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 		}
 		input := "*" + table + "\n" + strings.Join(lines, "\n") + "\nCOMMIT\n"
 		if err := restoreIPTables(ctx, input); err != nil {
-			return fmt.Errorf("atomic %s repair: %w", table, err)
+			return nil, fmt.Errorf("atomic %s repair: %w", table, err)
 		}
 	}
-	return nil
+	return predicted, nil
 }
 
 // installHostFirewallFn is a test seam over the real installer, so the
