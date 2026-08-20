@@ -603,4 +603,18 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
 		t.Fatalf("after re-pause: paused=%d unbacked=%d, want 1/1 (stale generation must not count as coverage)", paused, unbacked)
 	}
+
+	// Skewed-ahead host clock: the stale generation's completed_at lands
+	// past the new snapshot's created_at, but its server-clocked
+	// reported_at (fixed at insert, before the re-pause) caps it — the
+	// previous pause's backup must not read as covering this one.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE backup_generation SET completed_at = now() + interval '2 hours'
+		 WHERE sandbox_id = $1`,
+		sandboxID); err != nil {
+		t.Fatalf("future-stamp generation: %v", err)
+	}
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("with skewed completed_at: paused=%d unbacked=%d, want 1/1 (host clock must not fake coverage)", paused, unbacked)
+	}
 }

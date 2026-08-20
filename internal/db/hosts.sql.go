@@ -370,10 +370,17 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        -- "Current pause" means a generation completed at/after the head
        -- snapshot's created_at (which refreshes on every pause finalize) —
        -- a generation recorded for some EARLIER pause does not cover data
-       -- written since. The comparison errs conservative: an upload that
-       -- completed just before the finalize landed reads as unbacked until
-       -- the next report, never the reverse. A paused sandbox with no
-       -- snapshot row counts as unbacked for the same reason.
+       -- written since. completed_at is the host's clock, stored exactly as
+       -- reported (see RecordSandboxBackupGeneration), so it is capped at
+       -- reported_at — the server-clocked receive instant, fixed at insert —
+       -- exactly as LatestSandboxBackup ranks freshness: a skewed-ahead host
+       -- cannot make a previous pause's generation read as covering this
+       -- one. An unchanged re-pause re-verifying the same generation
+       -- refreshes reported_at and correctly reads covered. The comparison
+       -- errs conservative: an upload whose report lands just before the
+       -- finalize reads as unbacked until the next report, never the
+       -- reverse. A paused sandbox with no snapshot row counts as unbacked
+       -- for the same reason.
        COALESCE((SELECT COUNT(*) FROM sandbox s2
                  WHERE s2.host_id = h.id
                    AND s2.status = 'paused'
@@ -382,7 +389,7 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
                                    FROM snapshot snap
                                    JOIN backup_generation bg ON bg.sandbox_id = s2.id
                                    WHERE snap.id = s2.snapshot_id
-                                     AND bg.completed_at >= snap.created_at)), 0)::int AS paused_unbacked_count
+                                     AND LEAST(bg.completed_at, bg.reported_at) >= snap.created_at)), 0)::int AS paused_unbacked_count
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
 WHERE $1::text IS NULL OR h.id = $1
