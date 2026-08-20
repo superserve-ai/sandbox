@@ -158,21 +158,24 @@ jobs:
       - name: Every imported package must trigger its deploy
         run: |
           fail=0
+          # Union across every binary the workflow ships, not just the one it is
+          # named for: deploy-vmd builds four, so a package imported only by
+          # boxd or secretsproxy would otherwise pass unlisted.
           check() {
-            binary="$1" workflow="$2"
+            workflow="$1"; shift
             triggers=$(awk '/^on:/,/^jobs:/' "$workflow" | grep -oE "internal/[a-z]+" | sort -u)
-            deps=$(go list -deps "$binary" \
+            deps=$(go list -deps "$@" \
               | grep 'superserve-ai/sandbox/internal/' \
               | sed 's|.*/\(internal/[a-z]*\).*|\1|' | sort -u)
             missing=$(comm -23 <(echo "$deps") <(echo "$triggers"))
             if [ -n "$missing" ]; then
               for pkg in $missing; do
-                echo "::error file=$workflow::$binary imports $pkg but $workflow does not list it — changes to $pkg would merge without deploying"
+                echo "::error file=$workflow::$workflow ships a binary importing $pkg but does not list it — changes to $pkg would merge without deploying"
               done
               fail=1
             fi
           }
-          check ./cmd/controlplane .github/workflows/deploy-api.yml
-          check ./cmd/vmd .github/workflows/deploy-vmd.yml
+          check .github/workflows/deploy-api.yml ./cmd/controlplane
+          check .github/workflows/deploy-vmd.yml ./cmd/vmd ./cmd/boxd ./cmd/template-builder ./cmd/secretsproxy
           [ $fail -eq 0 ] && echo "deploy triggers cover every imported package"
           exit $fail
