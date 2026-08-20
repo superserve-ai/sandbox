@@ -89,6 +89,80 @@ func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
 	return i, err
 }
 
+const getHostCapabilityDiagnostics = `-- name: GetHostCapabilityDiagnostics :many
+WITH host_snapshot AS (
+  SELECT h.id,
+         h.status,
+         h.last_heartbeat_at,
+         (
+           h.status = 'active'
+           AND h.last_heartbeat_at IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1
+             FROM unnest($1::text[]) AS required(capability)
+             WHERE NOT EXISTS (
+               SELECT 1
+               FROM host_capability required_hc
+               WHERE required_hc.host_id = h.id
+                 AND required_hc.capability = required.capability
+                 AND required_hc.heartbeat_at = h.last_heartbeat_at
+             )
+           )
+         ) AS capabilities_match
+  FROM host h
+  WHERE h.id = $2
+)
+SELECT hs.last_heartbeat_at,
+       hs.status,
+       hs.capabilities_match,
+       hc.capability,
+       hc.heartbeat_at
+FROM host_snapshot hs
+LEFT JOIN host_capability hc ON hc.host_id = hs.id
+ORDER BY hc.capability ASC
+`
+
+type GetHostCapabilityDiagnosticsParams struct {
+	RequiredCapabilities []string `json:"required_capabilities"`
+	HostID               string   `json:"host_id"`
+}
+
+type GetHostCapabilityDiagnosticsRow struct {
+	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Status            string             `json:"status"`
+	CapabilitiesMatch *bool              `json:"capabilities_match"`
+	Capability        *string            `json:"capability"`
+	HeartbeatAt       pgtype.Timestamptz `json:"heartbeat_at"`
+}
+
+// Snapshot the host heartbeat generation and every capability attestation for
+// best-effort diagnostics when capability enforcement rejects a request.
+func (q *Queries) GetHostCapabilityDiagnostics(ctx context.Context, arg GetHostCapabilityDiagnosticsParams) ([]GetHostCapabilityDiagnosticsRow, error) {
+	rows, err := q.db.Query(ctx, getHostCapabilityDiagnostics, arg.RequiredCapabilities, arg.HostID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetHostCapabilityDiagnosticsRow{}
+	for rows.Next() {
+		var i GetHostCapabilityDiagnosticsRow
+		if err := rows.Scan(
+			&i.LastHeartbeatAt,
+			&i.Status,
+			&i.CapabilitiesMatch,
+			&i.Capability,
+			&i.HeartbeatAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getHostForUpdate = `-- name: GetHostForUpdate :one
 SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host WHERE id = $1 FOR UPDATE
 `

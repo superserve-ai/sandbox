@@ -3,8 +3,10 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
+	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -32,6 +35,14 @@ const maxBackupReportFiles = 512
 
 var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// fingerprintHex bounds a reported packing fingerprint to the hex the
+// uploader emits. Charset over exact length on purpose: today's
+// fingerprints are 12 hex chars, but pinning the width here would make
+// any future widening a silent coverage-dropping incompatibility, while
+// the charset is what keeps arbitrary bytes out of a field that will
+// become deletion authority.
+var fingerprintHex = regexp.MustCompile(`^[0-9a-f]{1,64}$`)
+
 // backupFileReport is one artifact in a verified generation, as recorded
 // in the generation's bucket manifest. Host paths deliberately do not
 // appear: they name staging locations that stop existing after the
@@ -44,6 +55,14 @@ type backupFileReport struct {
 	// Shared marks an artifact stored bucket-wide under bases/ rather
 	// than inside the generation prefix.
 	Shared bool `json:"shared,omitempty"`
+	// Object is the exact bucket object path the host wrote for this
+	// entry (the packing-fingerprint-suffixed name under the generation
+	// prefix, or the full bases/ path for shared entries). Persisted
+	// verbatim into the files jsonb so lifecycle GC can name a
+	// generation's objects from the DB without listing the bucket.
+	// Optional: reports from hosts predating the field omit it, and
+	// those generations' bucket manifests remain their path authority.
+	Object string `json:"object,omitempty"`
 }
 
 // backupReport is a host's notice that one generation is fully uploaded
@@ -63,6 +82,39 @@ type backupReport struct {
 	// outbox entries.
 	PauseToken string             `json:"pause_token,omitempty"`
 	Files      []backupFileReport `json:"files"`
+}
+
+// validateReportedObject pins an optional per-file object path to the
+// layout the uploader can actually write: shared entries under their
+// content-addressed bases/ name, everything else under the report
+// owner's generation prefix bound to the entry's own file name, with a
+// non-empty single-segment packing-fingerprint suffix either way. The
+// expected prefix comes from the same layout helpers the uploader
+// names objects with, so this check cannot drift from the write side.
+// It matters because these paths are meant to become deletion authority
+// for a lifecycle GC: a buggy host must not be able to park another
+// owner's object (or a generation's manifest) in this ledger entry.
+func validateReportedObject(req backupReport, f backupFileReport) error {
+	var prefix string
+	if f.Shared {
+		prefix = backup.SharedBaseObject(f.SHA256, "")
+	} else {
+		var err error
+		if req.SandboxID != "" {
+			prefix, err = backup.SandboxObject(req.SandboxID, req.Generation, f.Name)
+		} else {
+			prefix, err = backup.TemplateObject(req.TemplateID, req.BuildID, req.Generation, f.Name)
+		}
+		if err != nil {
+			return fmt.Errorf("object for %q: %w", f.Name, err)
+		}
+		prefix += ".p"
+	}
+	fp, ok := strings.CutPrefix(f.Object, prefix)
+	if !ok || !fingerprintHex.MatchString(fp) {
+		return fmt.Errorf("object for %q must name this entry under its own prefix with a hex packing fingerprint", f.Name)
+	}
+	return nil
 }
 
 // ReportHostBackup handles POST /internal/hosts/:host_id/backups.
@@ -102,6 +154,7 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "files must carry the generation manifest", http.StatusBadRequest)
 		return
 	}
+	withObjects := 0
 	for _, f := range req.Files {
 		if f.Name == "" || f.SizeBytes < 0 || !sha256Hex.MatchString(f.SHA256) {
 			respondErrorMsg(c, "bad_request", "each file needs a name, size, and sha256", http.StatusBadRequest)
@@ -111,6 +164,22 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 			respondErrorMsg(c, "bad_request", "base_sha256 must be sha256 hex when present", http.StatusBadRequest)
 			return
 		}
+		if f.Object != "" {
+			if err := validateReportedObject(req, f); err != nil {
+				respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+				return
+			}
+			withObjects++
+		}
+	}
+	// Paths land all-or-none: a conforming host finalizes a report with
+	// every path or (a deduped manifest, a legacy entry) none, and the
+	// upsert's demotion guard treats ANY path as a path-bearing manifest,
+	// so accepting a mixed set would let it replace a complete ledger
+	// entry with a partial one.
+	if withObjects != 0 && withObjects != len(req.Files) {
+		respondErrorMsg(c, "bad_request", "object paths must cover every file or none", http.StatusBadRequest)
+		return
 	}
 	if (req.SandboxID == "") == (req.TemplateID == "") {
 		respondErrorMsg(c, "bad_request", "exactly one of sandbox_id or template_id is required", http.StatusBadRequest)

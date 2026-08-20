@@ -38,13 +38,18 @@ type BackupReporter struct {
 
 // backupReportFile mirrors the control plane's manifest entry shape.
 // Host paths deliberately do not travel: they name staging locations
-// that stop existing once the upload acks.
+// that stop existing once the upload acks. Object is the exact bucket
+// object path the upload wrote (fingerprint-suffixed, full bases/ path
+// for shared entries), empty on entries outboxed before the field
+// existed; the control plane stores it so a future GC can name a
+// generation's objects without listing the bucket.
 type backupReportFile struct {
 	Name       string `json:"name"`
 	SizeBytes  int64  `json:"size_bytes"`
 	SHA256     string `json:"sha256"`
 	BaseSHA256 string `json:"base_sha256,omitempty"`
 	Shared     bool   `json:"shared,omitempty"`
+	Object     string `json:"object,omitempty"`
 }
 
 type backupReportBody struct {
@@ -104,18 +109,115 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 			SHA256:     f.SHA256,
 			BaseSHA256: f.BaseSHA256,
 			Shared:     f.Shared,
+			Object:     f.Object,
 		})
 	}
+	status, statusLine, msg, err := r.post(body)
+	if err != nil {
+		return err
+	}
+	// Any 2xx clears the outbox entry, including accepted-but-orphaned
+	// reports: only the control plane knows whether an owner row exists,
+	// and redelivering an unacceptable report forever helps nobody.
+	if status >= 200 && status < 300 {
+		return nil
+	}
+	// A control plane from before the object field binds report bodies
+	// strictly and 400s the unknown field, which the permanent-rejection
+	// drop below would turn into a lost coverage row on every report this
+	// host sends during the rollout (or rollback) window. Degrade once to
+	// the pre-field payload: the report then lands exactly as an old
+	// vmd's would, and the acceptance clears the outbox entry, so those
+	// generations keep their coverage but stay pathless in the ledger
+	// permanently (their bucket manifests remain the path authority,
+	// like every pre-upgrade generation's; the control plane's
+	// enrichment arm upgrades the row if a rich report is ever
+	// redelivered). Deliberately NOT retained for a rich redelivery:
+	// holding the entry would re-deliver it every flush against the old
+	// control plane and head-of-line block every signal behind it.
+	// Gated on the binder's own unknown-field message so a rejection a
+	// NEW control plane issues (a path failing validation) is never
+	// stripped past the check it failed.
+	if permanentReject(status) && isUnknownObjectField(msg) && stripObjectPaths(&body) {
+		r.Log.Warn().Str("generation", task.Generation).
+			Str("status", statusLine).Str("response", string(msg)).
+			Msg("backup report rejected; retrying without object paths for an older control plane")
+		status, statusLine, msg, err = r.post(body)
+		if err != nil {
+			return err
+		}
+		if status >= 200 && status < 300 {
+			return nil
+		}
+	}
+	// A permanent rejection can never succeed on retry, and the flush
+	// stops at the first failure, so returning an error here would wedge
+	// every later report on this host behind one poisoned entry forever.
+	// Drop it loudly instead: the generation stays durable in the bucket,
+	// only its coverage row is lost.
+	if permanentReject(status) {
+		r.Log.Error().Str("generation", task.Generation).
+			Str("sandbox_id", task.SandboxID).Str("template_id", task.TemplateID).
+			Str("status", statusLine).Str("response", string(msg)).
+			Msg("backup report permanently rejected; dropping its coverage row")
+		return nil
+	}
+	return fmt.Errorf("backup report rejected: %s: %s", statusLine, msg)
+}
+
+// permanentReject reports whether a status can never succeed on
+// redelivery. Auth and pressure statuses stay retryable, since a rotated
+// token or a throttled control plane would otherwise silently drain the
+// whole outbox; 404 means the control plane has not deployed the route
+// yet (vmd can roll out first), so the report becomes deliverable when
+// the rollout completes and must survive in the outbox.
+func permanentReject(status int) bool {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden,
+		http.StatusRequestTimeout, http.StatusTooManyRequests,
+		http.StatusNotFound:
+		return false
+	}
+	return status >= 400 && status < 500
+}
+
+// isUnknownObjectField matches a pre-field control plane's strict-binder
+// rejection, which names the field it refused (encoding/json's
+// DisallowUnknownFields error, quoted or JSON-escaped in the response
+// body). Anything else is a genuine rejection of the report's content
+// and must not be retried stripped.
+func isUnknownObjectField(msg []byte) bool {
+	return bytes.Contains(msg, []byte(`unknown field "object"`)) ||
+		bytes.Contains(msg, []byte(`unknown field \"object\"`))
+}
+
+// stripObjectPaths clears every per-file object path in place, reporting
+// whether any were present.
+func stripObjectPaths(body *backupReportBody) bool {
+	stripped := false
+	for i := range body.Files {
+		if body.Files[i].Object != "" {
+			body.Files[i].Object = ""
+			stripped = true
+		}
+	}
+	return stripped
+}
+
+// post performs one delivery attempt, returning the response status and
+// up to 512 bytes of a non-2xx body. err is transport-level only; HTTP
+// rejections are the caller's to classify.
+func (r *BackupReporter) post(body backupReportBody) (status int, statusLine string, msg []byte, err error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("marshal backup report: %w", err)
+		return 0, "", nil, fmt.Errorf("marshal backup report: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	url := fmt.Sprintf("%s/internal/hosts/%s/backups", r.ControlPlaneURL, r.HostID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("build backup report request: %w", err)
+		return 0, "", nil, fmt.Errorf("build backup report request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+r.Token)
@@ -125,38 +227,12 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("deliver backup report: %w", err)
+		return 0, "", nil, fmt.Errorf("deliver backup report: %w", err)
 	}
 	defer resp.Body.Close()
-	// Any 2xx clears the outbox entry, including accepted-but-orphaned
-	// reports: only the control plane knows whether an owner row exists,
-	// and redelivering an unacceptable report forever helps nobody.
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return nil
+		return resp.StatusCode, resp.Status, nil, nil
 	}
-	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	// A permanent rejection can never succeed on retry, and the flush
-	// stops at the first failure, so returning an error here would wedge
-	// every later report on this host behind one poisoned entry forever.
-	// Drop it loudly instead: the generation stays durable in the bucket,
-	// only its coverage row is lost. Auth and pressure statuses stay
-	// retryable, since a rotated token or a throttled control plane would
-	// otherwise silently drain the whole outbox.
-	switch resp.StatusCode {
-	case http.StatusUnauthorized, http.StatusForbidden,
-		http.StatusRequestTimeout, http.StatusTooManyRequests,
-		// 404 means the control plane has not deployed the route yet
-		// (vmd can roll out first); the report becomes deliverable when
-		// the rollout completes, so it must survive in the outbox.
-		http.StatusNotFound:
-	default:
-		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			r.Log.Error().Str("generation", task.Generation).
-				Str("sandbox_id", task.SandboxID).Str("template_id", task.TemplateID).
-				Str("status", resp.Status).Str("response", string(msg)).
-				Msg("backup report permanently rejected; dropping its coverage row")
-			return nil
-		}
-	}
-	return fmt.Errorf("backup report rejected: %s: %s", resp.Status, string(msg))
+	msg, _ = io.ReadAll(io.LimitReader(resp.Body, 512))
+	return resp.StatusCode, resp.Status, msg, nil
 }

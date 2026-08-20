@@ -264,3 +264,37 @@ LEFT JOIN sandbox s ON s.host_id = h.id
 WHERE sqlc.narg(id)::text IS NULL OR h.id = sqlc.narg(id)
 GROUP BY h.id
 ORDER BY h.created_at ASC;
+
+-- name: GetHostCapabilityDiagnostics :many
+-- Snapshot the host heartbeat generation and every capability attestation for
+-- best-effort diagnostics when capability enforcement rejects a request.
+WITH host_snapshot AS (
+  SELECT h.id,
+         h.status,
+         h.last_heartbeat_at,
+         (
+           h.status = 'active'
+           AND h.last_heartbeat_at IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1
+             FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+             WHERE NOT EXISTS (
+               SELECT 1
+               FROM host_capability required_hc
+               WHERE required_hc.host_id = h.id
+                 AND required_hc.capability = required.capability
+                 AND required_hc.heartbeat_at = h.last_heartbeat_at
+             )
+           )
+         ) AS capabilities_match
+  FROM host h
+  WHERE h.id = sqlc.arg('host_id')
+)
+SELECT hs.last_heartbeat_at,
+       hs.status,
+       hs.capabilities_match,
+       hc.capability,
+       hc.heartbeat_at
+FROM host_snapshot hs
+LEFT JOIN host_capability hc ON hc.host_id = hs.id
+ORDER BY hc.capability ASC;

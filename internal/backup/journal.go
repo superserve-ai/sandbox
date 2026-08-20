@@ -55,6 +55,14 @@ type TaskFile struct {
 	// so each base version uploads exactly once fleet-wide and every
 	// generation's manifest points at the same immutable object.
 	Shared bool `json:"shared,omitempty"`
+	// Object is the exact bucket object path the upload wrote for this
+	// entry (packing fingerprint included, and the full bases/ path for
+	// shared entries). Captured from the store write itself when the
+	// finalized manifest is banked on the outbox copy, so coverage
+	// reports can name objects without re-deriving them. Empty on queue
+	// rows and on outbox entries written before the field existed;
+	// consumers must treat it as optional.
+	Object string `json:"object,omitempty"`
 }
 
 // Task is one generation awaiting upload. Tasks are idempotent: the
@@ -117,6 +125,17 @@ type Task struct {
 	// and content hash, not chronology), so stamping delivery time would
 	// let an older generation delivered later rank as the newest backup.
 	VerifiedAt time.Time `json:"verified_at,omitempty"`
+}
+
+// filesCarryObjects reports whether any entry records its exact bucket
+// object path.
+func filesCarryObjects(files []TaskFile) bool {
+	for _, f := range files {
+		if f.Object != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // HasVerified reports whether this task already verified object.
@@ -817,6 +836,20 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, erro
 			var rowTask Task
 			if json.Unmarshal(existing, &rowTask) == nil && rowTask.PauseToken != "" {
 				nt.PauseToken = rowTask.PauseToken
+			}
+			// An undelivered entry that carries object paths must not be
+			// demoted by a pathless re-completion (an unchanged re-pause
+			// whose manifest create deduped reports no paths, since the
+			// published manifest is the path authority): mirror the seed's
+			// refresh-in-place and keep the richer manifest under the new
+			// instant, matching the control plane's own no-demotion rule.
+			if prevOutbox := tx.Bucket(outboxBucket).Get(completionKey(completedScope, task)); prevOutbox != nil {
+				var cur Task
+				if json.Unmarshal(prevOutbox, &cur) == nil &&
+					filesCarryObjects(cur.Files) && !filesCarryObjects(nt.Files) {
+					nt.Files = cur.Files
+					nt.FilesFinal = cur.FilesFinal
+				}
 			}
 			val, err := json.Marshal(nt)
 			if err != nil {

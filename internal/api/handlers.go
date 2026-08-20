@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
@@ -170,6 +171,10 @@ type Handlers struct {
 	// the standalone pre-flight checks (see hostcap_cache.go). Zero value is
 	// ready to use.
 	hostCaps hostCapCache
+
+	// diagnosticGroup coalesces concurrent capability rejection snapshots for
+	// the same host and required capability set.
+	diagnosticGroup singleflight.Group
 }
 
 // asyncBookkeeping runs fire-and-forget post-VMD work in a background
