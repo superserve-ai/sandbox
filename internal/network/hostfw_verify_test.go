@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1136,6 +1137,42 @@ func TestConcurrentWriterDuringRepairDetected(t *testing.T) {
 	err := ensureHostFirewall(context.Background(), iface, hp, tp, dp, sd, sp, bp, true, zerolog.Nop())
 	if err == nil || !strings.Contains(err.Error(), "concurrent") {
 		t.Fatalf("concurrent writer not detected, got: %v", err)
+	}
+}
+
+func TestPredictionCompareToleratesUnparseableForeignRules(t *testing.T) {
+	// A preserved foreign rule with options outside ruleArity (e.g.
+	// -m conntrack) canonicalizes on neither side of the prediction compare —
+	// exact token equality must recognize it as unchanged instead of
+	// misreporting a non-cooperating writer.
+	spec := testSpec(true)
+	rules, chains := specKernel(spec, nil)
+	fw := rules["filter/FORWARD"]
+	fw[3], fw[4] = fw[4], fw[3] // misorder clamp vs accept to force repair
+	conntrack := []string{"-i", "veth+", "-m", "conntrack", "--ctstate", "INVALID", "-j", "DROP"}
+	rules["filter/FORWARD"] = append(fw[:2:2], append([][]string{conntrack}, fw[2:]...)...)
+
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	origInstall := installHostFirewallFn
+	installHostFirewallFn = func(string, uint16, uint16, uint16, string, uint16, []uint16, bool, zerolog.Logger) error { return nil }
+	defer func() { installHostFirewallFn = origInstall }()
+	origLock := hostFirewallLockPath
+	hostFirewallLockPath = t.TempDir() + "/hostfw.lock"
+	defer func() { hostFirewallLockPath = origLock }()
+
+	iface, hp, tp, dp, sd, sp, bp := testSpecParams()
+	if err := ensureHostFirewall(context.Background(), iface, hp, tp, dp, sd, sp, bp, true, zerolog.Nop()); err != nil {
+		t.Fatalf("repair with a preserved unparseable foreign rule failed: %v", err)
+	}
+	found := false
+	for _, r := range k.rules["filter/FORWARD"] {
+		if slices.Equal(r, conntrack) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("unparseable foreign rule not preserved by repair")
 	}
 }
 

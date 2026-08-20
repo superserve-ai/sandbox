@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -126,7 +127,11 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 			gotChain := d.rules[key]
 			same := len(gotChain) == len(wantChain)
 			for i := 0; same && i < len(wantChain); i++ {
-				same = ruleEqual(wantChain[i], gotChain[i])
+				// Preserved foreign rules may use options canonicalRule does
+				// not know (ruleEqual fails closed on those) — but both
+				// snapshots carry them as identical iptables-save tokens, so
+				// exact token equality decides what canonicalization cannot.
+				same = ruleEqual(wantChain[i], gotChain[i]) || slices.Equal(wantChain[i], gotChain[i])
 			}
 			if !same {
 				return fmt.Errorf("host firewall chain %s changed underneath the repair — concurrent non-cooperating writer; refusing to serve from a stale snapshot", key)
