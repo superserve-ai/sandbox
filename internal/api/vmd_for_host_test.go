@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -48,5 +49,30 @@ func TestVMDForHostRefusesFallbackOnMissingHostRow(t *testing.T) {
 	h.Hosts = nil
 	if c, err := h.vmdForHost(context.Background(), "host-a"); err != nil || c != h.VMD {
 		t.Fatalf("nil registry: got (%v, %v), want default client", c, err)
+	}
+}
+
+// Bootstrap parity: the CONFIGURED DEFAULT id keeps routing to the
+// configured default client when its row is missing (unpopulated host
+// table, the supported single-host mode — the scheduler fallback and the
+// build resolver preserve the same mapping). Any OTHER id with a missing
+// row stays a hard error even with bootstrap config present.
+func TestVMDForHostBootstrapDefaultKeepsRouting(t *testing.T) {
+	h := &Handlers{
+		Hosts:  &routeFakeRegistry{err: fmt.Errorf("get host: %w", pgx.ErrNoRows)},
+		Config: &config.Config{DefaultHostID: "default"},
+		VMD:    nil, // nil default client also refuses (guarded)
+	}
+
+	// Default id + missing row + a configured default client → bootstrap.
+	fake := &stubVMD{}
+	h.VMD = fake
+	if c, err := h.vmdForHost(context.Background(), "default"); err != nil || c != VMDClient(fake) {
+		t.Fatalf("bootstrap default: got (%v, %v), want configured default client", c, err)
+	}
+
+	// A non-default id with a missing row is still corruption to surface.
+	if _, err := h.vmdForHost(context.Background(), "host-b"); err == nil {
+		t.Fatal("non-default missing row returned a client, want hard error")
 	}
 }

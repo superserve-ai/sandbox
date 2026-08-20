@@ -251,14 +251,15 @@ func (h *Handlers) authzService() *authz.Service {
 
 // vmdForHost returns the VMDClient for the given host. When a registry is
 // configured, it resolves via DB lookup; a missing host row is a hard
-// error, never a fallback. The old migration-period fallback to the default
-// client is gone: with more than one host it silently routes lifecycle
-// operations to whichever machine the default happens to be — the wrong one
-// for every sandbox not on it — and in a cell whose real host id coincides
-// with the default, the misroute doesn't even fail loudly. A sandbox row
-// pointing at an unregistered host is data corruption to surface, not paper
-// over. (The registry-less mode, Hosts == nil, remains the explicit
-// test/dev wiring.)
+// error, never a fallback — with more than one host, falling back silently
+// routes lifecycle operations to whichever machine the default happens to
+// be, the wrong one for every sandbox not on it. One deliberate exception,
+// matching the scheduler fallback and the build resolver: the CONFIGURED
+// DEFAULT id keeps routing to the configured default client when its row is
+// missing, because an unpopulated host table is the supported single-host
+// bootstrap mode and all three paths must agree on it. Any other id with a
+// missing row is data corruption to surface, not paper over. (The
+// registry-less mode, Hosts == nil, remains the explicit test/dev wiring.)
 func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, error) {
 	if h.Hosts == nil {
 		return h.VMD, nil
@@ -266,6 +267,11 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 	c, err := h.Hosts.ClientFor(ctx, hostID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			if h.Config != nil && hostID == h.Config.DefaultHostID && h.VMD != nil {
+				log.Warn().Str("host_id", hostID).
+					Msg("default host row missing (bootstrap mode); using configured default client")
+				return h.VMD, nil
+			}
 			// Distinct, alertable log: this firing means a sandbox row
 			// references a host the control plane does not know.
 			log.Error().Str("host_id", hostID).
