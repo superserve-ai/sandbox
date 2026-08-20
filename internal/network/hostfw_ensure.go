@@ -190,13 +190,14 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 // A veth-capable AMBIGUOUS foreign rule above the security block still
 // aborts without mutation: head-inserting our rules would demote its unknown
 // control flow below our enforcement, and that call is the operator's. The
-// same refusal covers nat rules whose EFFECTIVE position repair would change:
-// a strict or observer foreign rule above a vmd PREROUTING redirect (head-
-// inserting the terminal redirects would starve it of matching traffic), and
-// a terminal-capable foreign rule below a vmd nat plumbing rule (re-appending
-// ours at the tail would promote it into the traffic ours handled first).
-// filter/FORWARD needs neither: its head rules are non-shadowing drops, and
-// promoting strictness there is acceptable by design.
+// same refusal covers foreign rules whose EFFECTIVE position repair would
+// change: an observer above any vmd terminal rule — a PREROUTING redirect or
+// a FORWARD drop — would be starved of the traffic it currently sees by the
+// head inserts, a strict rule above a PREROUTING redirect would be shadowed
+// by the terminal redirect, and a terminal-capable foreign rule below a vmd
+// nat plumbing rule would be promoted into the traffic ours handled first by
+// the tail re-append. A strict rule in FORWARD keeps its verdict wherever it
+// lands, so its promotion or demotion is acceptable by design.
 // OWNER ONLY.
 func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (map[string][][]string, error) {
 	predicted := map[string][][]string{}
@@ -232,24 +233,24 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 				staleLines = append(staleLines, "-D "+chain+" "+emitRuleTokens(g))
 			}
 		}
-		// PREROUTING's head-inserted rules are TERMINAL redirects: re-inserting
-		// them at the absolute head would demote a stricter foreign rule that
-		// currently runs before one of ours to below the redirect, where the
-		// terminal target shadows it into a no-op. (FORWARD is safe — its head
-		// rules are drops, which a demoted foreign strict rule still runs
-		// after.) Position-relative insertion would reintroduce the races this
-		// design removed, so refuse and leave the call to the operator.
-		if key == "nat/PREROUTING" {
-			lastOurs := -1
+		// Head-inserting our rules demotes everything currently above them
+		// below TERMINAL enforcement — PREROUTING redirects or FORWARD drops.
+		// An observer there would be starved of the traffic it currently
+		// sees; a strict rule above a PREROUTING redirect would be shadowed
+		// into a no-op (in FORWARD it keeps its verdict wherever it lands).
+		// Position-relative insertion would reintroduce the races this design
+		// removed, so refuse and leave the call to the operator.
+		if spec.headGuarded[key] {
+			lastTerm := -1
 			for i, g := range got {
 				for _, w := range want {
-					if ruleEqual(w.args, g) && i > lastOurs {
-						lastOurs = i
+					if securityRule(key, w) && ruleEqual(w.args, g) && i > lastTerm {
+						lastTerm = i
 					}
 				}
 			}
 			for i, g := range got {
-				if i >= lastOurs && lastOurs != -1 {
+				if i >= lastTerm {
 					break
 				}
 				isOurs := false
@@ -260,9 +261,9 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 					}
 				}
 				if !isOurs && !staleVMDRule(key, g, want) && !unmarkedTwin(g, want) && !ruleCannotMatchSandboxIngress(g) {
-					switch foreignDisposition(g) {
-					case "strict", "observer":
-						return nil, fmt.Errorf("foreign %s rule above a vmd redirect in %s (%s) — head-inserting the terminal redirects would starve it of matching traffic; refusing", foreignDisposition(g), key, strings.Join(g, " "))
+					switch disp := foreignDisposition(g); {
+					case disp == "observer", disp == "strict" && key == "nat/PREROUTING":
+						return nil, fmt.Errorf("foreign %s rule above a vmd terminal rule in %s (%s) — head-inserting ours would starve it of matching traffic; refusing", disp, key, strings.Join(g, " "))
 					}
 				}
 			}

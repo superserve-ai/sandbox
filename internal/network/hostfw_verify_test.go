@@ -993,6 +993,39 @@ func TestRepairRefusesToStarveObserverAbovePreroutingRedirect(t *testing.T) {
 	}
 }
 
+func TestRepairRefusesToStarveObserverAboveForwardDrops(t *testing.T) {
+	// Same starvation rule in filter/FORWARD: an observer above the terminal
+	// drops loses the blocked traffic it currently logs if the drops are
+	// head-inserted above it. Below the drops it loses nothing.
+	spec := testSpec(true)
+	observer := []string{"-i", "veth+", "-j", "NFLOG", "--nflog-group", "7"}
+
+	rules, chains := specKernel(spec, nil)
+	fw := rules["filter/FORWARD"]
+	fw[3], fw[4] = fw[4], fw[3] // misorder clamp vs accept to force repair
+	rules["filter/FORWARD"] = append([][]string{observer}, fw...)
+	d, _ := parseIPTablesSave(renderDump(rules, chains))
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err == nil {
+		t.Fatal("repair reordered past an observer above the FORWARD drops")
+	}
+
+	// Between the last drop and the clamp: nothing terminal crosses it.
+	rules, chains = specKernel(spec, nil)
+	fw = rules["filter/FORWARD"]
+	fw[3], fw[4] = fw[4], fw[3]
+	rules["filter/FORWARD"] = append(fw[:2:2], append([][]string{observer}, fw[2:]...)...)
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ = parseIPTablesSave(renderDump(k.rules, k.chains))
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair refused with observer below the drops: %v", err)
+	}
+	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+		t.Fatalf("post-repair verify failed: %s %s", class, detail)
+	}
+}
+
 func TestRepairRefusesToPromoteTerminalNATBelowMasquerade(t *testing.T) {
 	spec := testSpec(true)
 	masq := marked("-s", "10.11.0.0/16", "-o", "eth0", "-j", "MASQUERADE")
