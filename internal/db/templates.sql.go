@@ -1034,6 +1034,28 @@ func (q *Queries) ReapStaleBuilds(ctx context.Context, arg ReapStaleBuildsParams
 	return items, nil
 }
 
+const requeueBuildDispatch = `-- name: RequeueBuildDispatch :execrows
+UPDATE template_build
+SET status = 'pending',
+    vmd_host_id = NULL,
+    vmd_build_vm_id = NULL,
+    started_at = NULL,
+    updated_at = now()
+WHERE id = $1 AND status = 'building'
+`
+
+// Returns a just-claimed build to pending after a TRANSIENT dispatch
+// failure (e.g. a host-resolution timeout), so the next tick retries it
+// instead of failing a customer's build on a blip. Bounded: the pending
+// reap keys on created_at, so requeueing never extends a build's life.
+func (q *Queries) RequeueBuildDispatch(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, requeueBuildDispatch, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const softDeleteTemplateIfUnused = `-- name: SoftDeleteTemplateIfUnused :one
 WITH locked AS (
   SELECT t.id AS tpl_id FROM template t

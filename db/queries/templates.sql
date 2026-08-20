@@ -239,6 +239,19 @@ SET status = 'building',
 WHERE template_build.id = $1 AND template_build.status = 'pending'
   AND COALESCE((SELECT th.status = 'active' FROM target_host th), true);
 
+-- name: RequeueBuildDispatch :execrows
+-- Returns a just-claimed build to pending after a TRANSIENT dispatch
+-- failure (e.g. a host-resolution timeout), so the next tick retries it
+-- instead of failing a customer's build on a blip. Bounded: the pending
+-- reap keys on created_at, so requeueing never extends a build's life.
+UPDATE template_build
+SET status = 'pending',
+    vmd_host_id = NULL,
+    vmd_build_vm_id = NULL,
+    started_at = NULL,
+    updated_at = now()
+WHERE id = $1 AND status = 'building';
+
 -- name: ListActiveBuilds :many
 -- Read-only: builds the supervisor is currently watching. Used per tick to
 -- poll vmd for status. No row-level lock — these are already past 'pending'.

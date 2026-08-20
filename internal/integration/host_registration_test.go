@@ -402,13 +402,29 @@ func TestIntegration_TryDispatchBuildRefusesNonActiveHost(t *testing.T) {
 		t.Fatalf("claim on active host = %d rows, want 1", n)
 	}
 
-	// Bootstrap parity: a host id with no row dispatches. Reset the build to
-	// pending first (it was just claimed).
-	if _, err := testPool.Exec(ctx,
-		`UPDATE template_build SET status = 'pending', vmd_host_id = NULL WHERE id = $1`,
-		buildID); err != nil {
-		t.Fatalf("reset build: %v", err)
+	// A transient dispatch failure requeues the claim: back to pending,
+	// host and vm ids cleared, claimable again — never a permanently
+	// failed build on a lookup blip.
+	if n, err := testQueries.RequeueBuildDispatch(ctx, buildID); err != nil || n != 1 {
+		t.Fatalf("requeue claimed build = (%d, %v), want 1 row", n, err)
 	}
+	var st string
+	var hostCol, vmCol *string
+	if err := testPool.QueryRow(ctx,
+		`SELECT status, vmd_host_id, vmd_build_vm_id FROM template_build WHERE id = $1`,
+		buildID).Scan(&st, &hostCol, &vmCol); err != nil {
+		t.Fatalf("read requeued build: %v", err)
+	}
+	if st != "pending" || hostCol != nil || vmCol != nil {
+		t.Fatalf("requeued build = %s/%v/%v, want pending with cleared host and vm ids", st, hostCol, vmCol)
+	}
+	// Requeue is idempotent-by-guard: a second call on a pending row is a no-op.
+	if n, err := testQueries.RequeueBuildDispatch(ctx, buildID); err != nil || n != 0 {
+		t.Fatalf("requeue of pending build = (%d, %v), want 0 rows", n, err)
+	}
+
+	// Bootstrap parity: a host id with no row dispatches (build is pending
+	// again after the requeue above).
 	if n := claim("no-such-host"); n != 1 {
 		t.Fatalf("claim with missing host row = %d rows, want 1 (bootstrap)", n)
 	}

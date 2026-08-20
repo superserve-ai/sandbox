@@ -290,6 +290,11 @@ func run() error {
 					Msg("supervisor: default host row missing (bootstrap mode); using configured default client")
 				return vmdClient, nil
 			}
+			if errors.Is(err, pgx.ErrNoRows) {
+				// Missing non-default registration: terminal, never
+				// retryable without operator action.
+				return nil, fmt.Errorf("build host %q not registered: %w", hostID, supervisor.ErrBuildHostGone)
+			}
 			return nil, fmt.Errorf("resolve build host %q: %w", hostID, err)
 		}
 		return c, nil

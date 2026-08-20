@@ -99,6 +99,12 @@ func DefaultBuildSupervisorConfig(hostID string) BuildSupervisorConfig {
 // Resolver returns the VMD client for a host ID.
 type Resolver func(ctx context.Context, hostID string) (vmdclient.Client, error)
 
+// ErrBuildHostGone marks a host resolution failure as TERMINAL: the build's
+// host id has no registration and never will without operator action.
+// Resolvers wrap it for that case only; any other resolution error is
+// treated as transient and the claimed build is requeued for retry.
+var ErrBuildHostGone = errors.New("build host not registered")
+
 // BuildSupervisor wraps the per-tick logic. Stateless across ticks — all
 // state lives in the DB. Safe to instantiate once at controlplane boot and
 // Start() with the process-lifetime context.
@@ -355,10 +361,26 @@ func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBui
 	defer dispatchCancel()
 	vmd, err := s.resolve(dispatchCtx, hostID)
 	if err != nil {
-		rowLog.Error().Err(err).Str("host_id", hostID).Msg("resolve VMD for dispatch failed")
-		errMsg := fmt.Sprintf("dispatch_failed: build host unreachable (%s)", hostID)
-		s.failBuild(ctx, row.ID, errMsg)
-		s.logBuildCompleted(ctx, row, "error", errMsg, "")
+		if errors.Is(err, ErrBuildHostGone) {
+			// Terminal: the host id has no registration. Fail loudly.
+			rowLog.Error().Err(err).Str("host_id", hostID).Msg("resolve VMD for dispatch failed")
+			errMsg := fmt.Sprintf("dispatch_failed: build host unreachable (%s)", hostID)
+			s.failBuild(ctx, row.ID, errMsg)
+			s.logBuildCompleted(ctx, row, "error", errMsg, "")
+			return err
+		}
+		// Transient (DB blip, lookup timeout): the claim must not become a
+		// permanently failed customer build. Return it to pending; the
+		// next tick retries, and the pending reap (keyed on created_at)
+		// bounds how long a build can keep retrying.
+		rowLog.Warn().Err(err).Str("host_id", hostID).
+			Msg("transient build-host resolution failure; requeueing build")
+		rqCtx, rqCancel := context.WithTimeout(ctx, 5*time.Second)
+		if _, rqErr := s.q.RequeueBuildDispatch(rqCtx, row.ID); rqErr != nil {
+			// Leave it claimed: the build-timeout reap recovers it later.
+			rowLog.Error().Err(rqErr).Msg("requeue after transient resolution failure failed")
+		}
+		rqCancel()
 		return err
 	}
 	_, err = vmd.BuildTemplate(dispatchCtx, vmdclient.BuildTemplateInput{
