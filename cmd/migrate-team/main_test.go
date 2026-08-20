@@ -214,6 +214,10 @@ func seedFixture(t *testing.T) *fixture {
 
 	// Source cell: the team under migration.
 	mustExec(t, srcPool, `INSERT INTO team (id, name) VALUES ($1, 'migration-drill')`, f.team)
+	// This fixture supplies its own credit ledger below; do not include the
+	// signup grant that current team creation provisions automatically.
+	mustExec(t, srcPool, `DELETE FROM team_credit_grant WHERE team_id = $1 AND reason = 'signup trial credit'`, f.team)
+	mustExec(t, srcPool, `DELETE FROM team_trial_eligibility_cache WHERE team_id = $1`, f.team)
 	mustExec(t, srcPool, `INSERT INTO profile (id, email, provider, provider_id) VALUES ($1, 'owner@example.com', 'google', 'google-owner')`, f.owner)
 	mustExec(t, srcPool, `INSERT INTO profile (id, email, provider, provider_id) VALUES ($1, 'member@example.com', 'google', 'google-member')`, f.member)
 	mustExec(t, srcPool, `INSERT INTO team_member (team_id, profile_id, role) VALUES ($1, $2, 'owner'), ($1, $3, 'member')`, f.team, f.owner, f.member)
@@ -446,6 +450,8 @@ func seedFixture(t *testing.T) *fixture {
 		"billing_rollup_job":                 1,
 		"billing_rollup_team_backfill_state": 1,
 		"team_feature_flag":                  2,
+		"team_billing_account":               0,
+		"team_trial_eligibility_cache":       0,
 		"team_pricing_plan":                  1,
 		"team_credit_grant":                  1,
 		"team_credit_ledger":                 1,

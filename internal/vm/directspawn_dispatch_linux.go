@@ -296,6 +296,14 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 	}
 	if err := waitForSocket(socketPath, socketWait); err != nil {
 		m.log.Warn().Str("vm_id", vmID).Err(err).Msg("firecracker socket missing after direct launch")
+		// Emit the coarse phases with the exhausted wait: the slowest launch
+		// incidents must form the histogram's tail, not vanish from it.
+		m.recordPhases("launch", "direct", map[string]time.Duration{
+			"stop_prior":  stopPrior,
+			"prestart":    tStart.Sub(tPrestart),
+			"spawn":       tSpawnDone.Sub(tStart),
+			"wait_socket": time.Since(tSpawnDone),
+		})
 		_ = m.cgroups.killVMCgroup(context.WithoutCancel(ctx), vmID, directCgroupStopBudget)
 		m.awaitReaper(vmID)
 		_ = m.cgroups.removeVMCgroup(context.WithoutCancel(ctx), vmID)
@@ -303,14 +311,40 @@ func (m *Manager) startFirecrackerDirect(ctx context.Context, vmID, socketPath, 
 	}
 	tSocketReady := time.Now()
 
-	m.log.Info().
+	ev := m.log.Info().
 		Str("vm_id", vmID).
 		Int64("stop_prior_ms", stopPrior.Milliseconds()).
 		Int64("prestart_ms", tStart.Sub(tPrestart).Milliseconds()).
 		Int64("spawn_ms", tSpawnDone.Sub(tStart).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tSpawnDone).Milliseconds()).
-		Bool("direct", true).
-		Msg("fc startup phases")
+		Bool("direct", true)
+	// chain = fork return → the script's pre-exec stamp (nsenter/unshare/
+	// mounts); fc_socket = Firecracker init plus our detection latency.
+	// Emitted to both the log and the phase histogram when the stamp is
+	// usable; the coarse phases always emit.
+	launchPhases := map[string]time.Duration{
+		"stop_prior":  stopPrior,
+		"prestart":    tStart.Sub(tPrestart),
+		"spawn":       tSpawnDone.Sub(tStart),
+		"wait_socket": tSocketReady.Sub(tSpawnDone),
+	}
+	// Validity window opens at tStart (pre-fork), not tSpawnDone: a fast
+	// child can run the script and stamp BEFORE the parent returns from the
+	// fork, and rejecting those would drop samples exactly when the chain is
+	// fastest. The split boundary is clamped to tSpawnDone so both sides use
+	// it: chain + fc_socket always equals wait_socket exactly.
+	if ts, ok := readFCExecStamp(socketPath, tStart, tSocketReady); ok {
+		boundary := ts
+		if boundary.Before(tSpawnDone) {
+			boundary = tSpawnDone
+		}
+		ev = ev.Int64("chain_ms", boundary.Sub(tSpawnDone).Milliseconds()).
+			Int64("fc_socket_ms", tSocketReady.Sub(boundary).Milliseconds())
+		launchPhases["chain"] = boundary.Sub(tSpawnDone)
+		launchPhases["fc_socket"] = tSocketReady.Sub(boundary)
+	}
+	ev.Msg("fc startup phases")
+	m.recordPhases("launch", "direct", launchPhases)
 
 	return pid, nil
 }

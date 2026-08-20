@@ -113,6 +113,20 @@ type LauncherState struct {
 	Ready bool
 }
 
+// LatencyPhase records one timed phase of a sandbox operation, the unit the
+// latency dashboards aggregate (p50/p90/p99 via histogram_quantile). Every
+// label is a bounded enum owned by the emitting call site — never tenant,
+// sandbox, or error text.
+type LatencyPhase struct {
+	Plane    string // controlplane | vmd | dataplane
+	Op       string // create | resume | launch | restore | exec
+	Phase    string // e.g. sched, vmd, cgroup, wait_socket, wait_boxd, run
+	Mode     string // direct | unit | "" where supervision doesn't apply
+	Region   string
+	HostID   string
+	Duration time.Duration
+}
+
 // Recorder is the operational metrics boundary. Implementations should emit
 // OpenTelemetry metrics through a collector; callers should not write ad hoc
 // operational metrics into Postgres.
@@ -120,10 +134,12 @@ type Recorder interface {
 	RecordSandboxTransition(context.Context, SandboxTransition)
 	RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait)
 	RecordVMDCall(context.Context, VMDCall)
+	RecordHostResolution(context.Context, HostResolution)
 	RecordHostCapacity(context.Context, HostCapacity)
 	RecordDBPoolStats(context.Context, DBPoolStats)
 	RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)
 	RecordLauncherState(context.Context, LauncherState)
+	RecordLatencyPhase(context.Context, LatencyPhase)
 }
 
 type noopRecorder struct{}
@@ -132,7 +148,9 @@ func NewNoopRecorder() Recorder                                                 
 func (noopRecorder) RecordSandboxTransition(context.Context, SandboxTransition)             {}
 func (noopRecorder) RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait) {}
 func (noopRecorder) RecordVMDCall(context.Context, VMDCall)                                 {}
+func (noopRecorder) RecordHostResolution(context.Context, HostResolution)                   {}
 func (noopRecorder) RecordHostCapacity(context.Context, HostCapacity)                       {}
 func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)                         {}
 func (noopRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)     {}
 func (noopRecorder) RecordLauncherState(context.Context, LauncherState)                     {}
+func (noopRecorder) RecordLatencyPhase(context.Context, LatencyPhase)                       {}

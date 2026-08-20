@@ -13,26 +13,40 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const addSandboxSecret = `-- name: AddSandboxSecret :exec
+const addSandboxSecret = `-- name: AddSandboxSecret :execrows
+WITH live AS (
+  SELECT s.id AS sandbox_id FROM sandbox s
+  WHERE s.id = $4 AND s.destroyed_at IS NULL
+  FOR UPDATE
+)
 INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-VALUES ($1, $2, $3, $4)
+SELECT live.sandbox_id, $1, $2, $3 FROM live
 `
 
 type AddSandboxSecretParams struct {
-	SandboxID  uuid.UUID `json:"sandbox_id"`
 	SecretID   uuid.UUID `json:"secret_id"`
 	EnvKey     string    `json:"env_key"`
 	ProxyToken *string   `json:"proxy_token"`
+	SandboxID  uuid.UUID `json:"sandbox_id"`
 }
 
-func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretParams) error {
-	_, err := q.db.Exec(ctx, addSandboxSecret,
-		arg.SandboxID,
+// FOR UPDATE on the sandbox row, taken before the insert because the insert
+// depends on it, serializes this against every destroy path. A destroy that
+// already committed leaves `live` empty, so nothing is bound and 0 rows come
+// back — the caller must not mint a JWT for a sandbox that no longer exists. A
+// destroy that has not started blocks until this commits, by which point the
+// had_secret_bindings trigger has fired, so it still writes the revocation.
+func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretParams) (int64, error) {
+	result, err := q.db.Exec(ctx, addSandboxSecret,
 		arg.SecretID,
 		arg.EnvKey,
 		arg.ProxyToken,
+		arg.SandboxID,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const claimSandboxSecretProxyToken = `-- name: ClaimSandboxSecretProxyToken :one

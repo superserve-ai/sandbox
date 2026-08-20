@@ -110,7 +110,7 @@ WITH paused AS (
     AND sandbox.team_id = $2
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'active'
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings
 ),
 closed_interval AS (
   UPDATE sandbox_active_interval
@@ -126,7 +126,7 @@ closed_billing_compute AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.status, p.vcpu_count, p.memory_mib, p.host_id, p.ip_address, p.pid, p.snapshot_id, p.created_at, p.updated_at, p.destroyed_at, p.network_config, p.timeout_seconds, p.metadata, p.template_id, p.snapshot_path, p.mem_path, p.base_path, p.delta_path, p.disk_mib, p.auto_delete_seconds, p.auto_delete_at, p.failed_at
+SELECT p.id, p.team_id, p.name, p.status, p.vcpu_count, p.memory_mib, p.host_id, p.ip_address, p.pid, p.snapshot_id, p.created_at, p.updated_at, p.destroyed_at, p.network_config, p.timeout_seconds, p.metadata, p.template_id, p.snapshot_path, p.mem_path, p.base_path, p.delta_path, p.disk_mib, p.auto_delete_seconds, p.auto_delete_at, p.failed_at, p.had_secret_bindings
 FROM paused p
 LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id
 `
@@ -162,6 +162,7 @@ type BeginPauseRow struct {
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
+	HadSecretBindings *bool              `json:"had_secret_bindings"`
 }
 
 // Atomic ownership + state check + transition to 'pausing' AND close of any
@@ -203,6 +204,7 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (BeginPa
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
 		&i.FailedAt,
+		&i.HadSecretBindings,
 	)
 	return i, err
 }
@@ -211,7 +213,7 @@ const beginResume = `-- name: BeginResume :one
 UPDATE sandbox
 SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings
 `
 
 type BeginResumeParams struct {
@@ -252,6 +254,7 @@ func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandb
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
 		&i.FailedAt,
+		&i.HadSecretBindings,
 	)
 	return i, err
 }
@@ -274,11 +277,12 @@ destroyed AS (
   FROM due
   WHERE sandbox.id = due.id
   RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.host_id,
-            sandbox.base_path, sandbox.template_id
+            sandbox.base_path, sandbox.template_id, sandbox.had_secret_bindings
 ),
 revoked AS (
+  -- Gated as in DestroySandbox; see the note there.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
-  SELECT id, $2 FROM destroyed
+  SELECT id, $2 FROM destroyed WHERE had_secret_bindings IS NOT FALSE
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -347,6 +351,85 @@ func (q *Queries) ClaimAutoDeleteSandboxes(ctx context.Context, arg ClaimAutoDel
 			&i.HostID,
 			&i.BasePath,
 			&i.TemplateID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const claimBillingIneligibleSandboxes = `-- name: ClaimBillingIneligibleSandboxes :many
+WITH candidates AS (
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
+  FROM sandbox s
+  WHERE s.team_id = $1
+    AND s.destroyed_at IS NULL
+    AND s.status = 'active'
+    AND NOT team_sandbox_billing_eligible(s.team_id)
+  ORDER BY s.created_at ASC
+  LIMIT $2
+  FOR UPDATE OF s SKIP LOCKED
+), paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  FROM candidates
+  WHERE sandbox.id = candidates.id
+  RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config
+), closed_intervals AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+), closed_billing_compute AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
+FROM paused p
+LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id
+`
+
+type ClaimBillingIneligibleSandboxesParams struct {
+	TeamID uuid.UUID `json:"team_id"`
+	Limit  int32     `json:"limit"`
+}
+
+type ClaimBillingIneligibleSandboxesRow struct {
+	ID            uuid.UUID   `json:"id"`
+	TeamID        uuid.UUID   `json:"team_id"`
+	Name          string      `json:"name"`
+	SnapshotID    pgtype.UUID `json:"snapshot_id"`
+	HostID        string      `json:"host_id"`
+	NetworkConfig []byte      `json:"network_config"`
+}
+
+// Atomically claims active sandboxes for a team whose billing eligibility was
+// lost. The bounded batch and SKIP LOCKED make this safe to retry and keep
+// webhook reconciliation off the request's critical path.
+func (q *Queries) ClaimBillingIneligibleSandboxes(ctx context.Context, arg ClaimBillingIneligibleSandboxesParams) ([]ClaimBillingIneligibleSandboxesRow, error) {
+	rows, err := q.db.Query(ctx, claimBillingIneligibleSandboxes, arg.TeamID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClaimBillingIneligibleSandboxesRow{}
+	for rows.Next() {
+		var i ClaimBillingIneligibleSandboxesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.SnapshotID,
+			&i.HostID,
+			&i.NetworkConfig,
 		); err != nil {
 			return nil, err
 		}
@@ -507,15 +590,15 @@ func (q *Queries) CountSandboxesByTeamPaged(ctx context.Context, arg CountSandbo
 
 const createSandbox = `-- name: CreateSandbox :one
 WITH ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, had_secret_bindings)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, false)
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $19::text, 0 FROM ins
   RETURNING sandbox_id
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -567,6 +650,7 @@ type CreateSandboxRow struct {
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
+	HadSecretBindings *bool              `json:"had_secret_bindings"`
 }
 
 // ID is supplied by the caller (generated in Go via uuid.New()) rather
@@ -628,6 +712,7 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (C
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
 		&i.FailedAt,
+		&i.HadSecretBindings,
 	)
 	return i, err
 }
@@ -640,15 +725,15 @@ WITH tpl AS (
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
+  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false FROM tpl
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $21::text, 0 FROM ins
   RETURNING sandbox_id
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -702,6 +787,7 @@ type CreateSandboxFromTemplateRow struct {
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
+	HadSecretBindings *bool              `json:"had_secret_bindings"`
 }
 
 // CreateSandbox variant that holds FOR KEY SHARE on the template row
@@ -759,6 +845,7 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
 		&i.FailedAt,
+		&i.HadSecretBindings,
 	)
 	return i, err
 }
@@ -771,9 +858,9 @@ WITH tpl AS (
     AND (t.team_id = $2 OR t.team_id = $3)
   FOR KEY SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-  SELECT $4, $2, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, tpl_id, $15, $16, $17, $18, disk_mib, $19 FROM tpl
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
+  SELECT $4, $2, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, tpl_id, $15, $16, $17, $18, disk_mib, $19, true FROM tpl
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $20::text, 0 FROM ins
@@ -783,7 +870,7 @@ WITH tpl AS (
   SELECT ins.id, ($21::uuid[])[i], ($22::text[])[i], ($23::text[])[i]
   FROM ins, generate_subscripts($21::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
@@ -840,6 +927,7 @@ type CreateSandboxFromTemplateWithSecretsRow struct {
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
+	HadSecretBindings *bool              `json:"had_secret_bindings"`
 }
 
 // CreateSandboxFromTemplate plus secret bindings in one statement (see
@@ -899,15 +987,16 @@ func (q *Queries) CreateSandboxFromTemplateWithSecrets(ctx context.Context, arg 
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
 		&i.FailedAt,
+		&i.HadSecretBindings,
 	)
 	return i, err
 }
 
 const createSandboxWithSecrets = `-- name: CreateSandboxWithSecrets :one
 WITH ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, had_secret_bindings)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, true)
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $19::text, 0 FROM ins
@@ -917,7 +1006,7 @@ WITH ins AS (
   SELECT ins.id, ($20::uuid[])[i], ($21::text[])[i], ($22::text[])[i]
   FROM ins, generate_subscripts($20::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -972,6 +1061,7 @@ type CreateSandboxWithSecretsRow struct {
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
+	HadSecretBindings *bool              `json:"had_secret_bindings"`
 }
 
 // CreateSandbox plus its strict preview policy and secret bindings in ONE
@@ -1031,6 +1121,7 @@ func (q *Queries) CreateSandboxWithSecrets(ctx context.Context, arg CreateSandbo
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
 		&i.FailedAt,
+		&i.HadSecretBindings,
 	)
 	return i, err
 }
@@ -1046,11 +1137,15 @@ WITH destroyed AS (
       OR (sandbox.status IN ('starting', 'resuming', 'pausing')
           AND sandbox.updated_at < $3)
     )
-  RETURNING id
+  RETURNING id, had_secret_bindings
 ),
 revoked AS (
+  -- Only sandboxes that ever had a binding: the proxy consults this set only
+  -- after a secrets JWT authenticates, and a JWT is minted only for those.
+  -- IS NOT FALSE, so rows predating the column (NULL, history unknown) still
+  -- revoke.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
-  SELECT id, $4 FROM destroyed
+  SELECT id, $4 FROM destroyed WHERE had_secret_bindings IS NOT FALSE
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -1381,7 +1476,7 @@ func (q *Queries) GetPublishedPreviewPort(ctx context.Context, arg GetPublishedP
 }
 
 const getSandbox = `-- name: GetSandbox :one
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
@@ -1419,6 +1514,7 @@ func (q *Queries) GetSandbox(ctx context.Context, arg GetSandboxParams) (Sandbox
 		&i.AutoDeleteSeconds,
 		&i.AutoDeleteAt,
 		&i.FailedAt,
+		&i.HadSecretBindings,
 	)
 	return i, err
 }
@@ -1509,7 +1605,7 @@ func (q *Queries) GetSandboxStatusForPreviewMutation(ctx context.Context, arg Ge
 }
 
 const getSandboxWithPreviewPolicy = `-- name: GetSandboxWithPreviewPolicy :one
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at,
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings,
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS access
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -1557,6 +1653,7 @@ func (q *Queries) GetSandboxWithPreviewPolicy(ctx context.Context, arg GetSandbo
 		&i.Sandbox.AutoDeleteSeconds,
 		&i.Sandbox.AutoDeleteAt,
 		&i.Sandbox.FailedAt,
+		&i.Sandbox.HadSecretBindings,
 		&i.Access,
 	)
 	return i, err
@@ -1712,42 +1809,6 @@ func (q *Queries) ListRecentlyDestroyedSandboxIDsByHost(ctx context.Context, arg
 	return items, nil
 }
 
-const listSandboxPreviewPoliciesByTeam = `-- name: ListSandboxPreviewPoliciesByTeam :many
-SELECT
-  s.id AS sandbox_id,
-  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
-  COALESCE(p.revision, 0)::bigint AS revision
-FROM sandbox s
-LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
-WHERE s.team_id = $1 AND s.destroyed_at IS NULL
-`
-
-type ListSandboxPreviewPoliciesByTeamRow struct {
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	Access    string    `json:"access"`
-	Revision  int64     `json:"revision"`
-}
-
-func (q *Queries) ListSandboxPreviewPoliciesByTeam(ctx context.Context, teamID uuid.UUID) ([]ListSandboxPreviewPoliciesByTeamRow, error) {
-	rows, err := q.db.Query(ctx, listSandboxPreviewPoliciesByTeam, teamID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListSandboxPreviewPoliciesByTeamRow{}
-	for rows.Next() {
-		var i ListSandboxPreviewPoliciesByTeamRow
-		if err := rows.Scan(&i.SandboxID, &i.Access, &i.Revision); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listSandboxesByHost = `-- name: ListSandboxesByHost :many
 SELECT s.id, s.status, s.snapshot_id
 FROM sandbox s
@@ -1787,14 +1848,17 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 }
 
 const listSandboxesByTeamCreatedAsc = `-- name: ListSandboxesByTeamCreatedAsc :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at FROM sandbox
-WHERE team_id = $1
-  AND destroyed_at IS NULL
-  AND metadata @> $2
-  AND ($3::text IS NULL OR status::text = $3::text)
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = $1
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> $2
+  AND ($3::text IS NULL OR s.status::text = $3::text)
   AND ($4::text IS NULL
-       OR name ILIKE '%' || $4::text || '%')
-ORDER BY created_at ASC
+       OR s.name ILIKE '%' || $4::text || '%')
+ORDER BY s.created_at ASC
 LIMIT $6::bigint
 OFFSET COALESCE($5::bigint, 0)
 `
@@ -1808,7 +1872,12 @@ type ListSandboxesByTeamCreatedAscParams struct {
 	RowLimit   *int64    `json:"row_limit"`
 }
 
-func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSandboxesByTeamCreatedAscParams) ([]Sandbox, error) {
+type ListSandboxesByTeamCreatedAscRow struct {
+	Sandbox       Sandbox `json:"sandbox"`
+	PreviewAccess string  `json:"preview_access"`
+}
+
+func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSandboxesByTeamCreatedAscParams) ([]ListSandboxesByTeamCreatedAscRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxesByTeamCreatedAsc,
 		arg.TeamID,
 		arg.Metadata,
@@ -1821,35 +1890,37 @@ func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSan
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Sandbox{}
+	items := []ListSandboxesByTeamCreatedAscRow{}
 	for rows.Next() {
-		var i Sandbox
+		var i ListSandboxesByTeamCreatedAscRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.VcpuCount,
-			&i.MemoryMib,
-			&i.HostID,
-			&i.IpAddress,
-			&i.Pid,
-			&i.SnapshotID,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DestroyedAt,
-			&i.NetworkConfig,
-			&i.TimeoutSeconds,
-			&i.Metadata,
-			&i.TemplateID,
-			&i.SnapshotPath,
-			&i.MemPath,
-			&i.BasePath,
-			&i.DeltaPath,
-			&i.DiskMib,
-			&i.AutoDeleteSeconds,
-			&i.AutoDeleteAt,
-			&i.FailedAt,
+			&i.Sandbox.ID,
+			&i.Sandbox.TeamID,
+			&i.Sandbox.Name,
+			&i.Sandbox.Status,
+			&i.Sandbox.VcpuCount,
+			&i.Sandbox.MemoryMib,
+			&i.Sandbox.HostID,
+			&i.Sandbox.IpAddress,
+			&i.Sandbox.Pid,
+			&i.Sandbox.SnapshotID,
+			&i.Sandbox.CreatedAt,
+			&i.Sandbox.UpdatedAt,
+			&i.Sandbox.DestroyedAt,
+			&i.Sandbox.NetworkConfig,
+			&i.Sandbox.TimeoutSeconds,
+			&i.Sandbox.Metadata,
+			&i.Sandbox.TemplateID,
+			&i.Sandbox.SnapshotPath,
+			&i.Sandbox.MemPath,
+			&i.Sandbox.BasePath,
+			&i.Sandbox.DeltaPath,
+			&i.Sandbox.DiskMib,
+			&i.Sandbox.AutoDeleteSeconds,
+			&i.Sandbox.AutoDeleteAt,
+			&i.Sandbox.FailedAt,
+			&i.Sandbox.HadSecretBindings,
+			&i.PreviewAccess,
 		); err != nil {
 			return nil, err
 		}
@@ -1863,14 +1934,17 @@ func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSan
 
 const listSandboxesByTeamCreatedDesc = `-- name: ListSandboxesByTeamCreatedDesc :many
 
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at FROM sandbox
-WHERE team_id = $1
-  AND destroyed_at IS NULL
-  AND metadata @> $2
-  AND ($3::text IS NULL OR status::text = $3::text)
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = $1
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> $2
+  AND ($3::text IS NULL OR s.status::text = $3::text)
   AND ($4::text IS NULL
-       OR name ILIKE '%' || $4::text || '%')
-ORDER BY created_at DESC
+       OR s.name ILIKE '%' || $4::text || '%')
+ORDER BY s.created_at DESC
 LIMIT $6::bigint
 OFFSET COALESCE($5::bigint, 0)
 `
@@ -1884,6 +1958,11 @@ type ListSandboxesByTeamCreatedDescParams struct {
 	RowLimit   *int64    `json:"row_limit"`
 }
 
+type ListSandboxesByTeamCreatedDescRow struct {
+	Sandbox       Sandbox `json:"sandbox"`
+	PreviewAccess string  `json:"preview_access"`
+}
+
 // Static created_at variants of ListSandboxesByTeamPaged. The plain ORDER BY
 // lets the planner walk idx_sandbox_team_created_active (forward for DESC,
 // backward for ASC) and stop at LIMIT, where the guarded-CASE ORDER BY in
@@ -1893,7 +1972,11 @@ type ListSandboxesByTeamCreatedDescParams struct {
 // name/status sorts stay on the flexible query below. Filters and pagination
 // are identical to the flexible query, including the NULL @row_limit "return
 // everything" contract.
-func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSandboxesByTeamCreatedDescParams) ([]Sandbox, error) {
+//
+// All three carry the effective preview access, so the list decorates its page
+// from one round trip. The join is 1:1 on sandbox_preview_policy's primary key,
+// so it cannot multiply rows and leaves the LIMIT pushdown intact.
+func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSandboxesByTeamCreatedDescParams) ([]ListSandboxesByTeamCreatedDescRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxesByTeamCreatedDesc,
 		arg.TeamID,
 		arg.Metadata,
@@ -1906,35 +1989,37 @@ func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSa
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Sandbox{}
+	items := []ListSandboxesByTeamCreatedDescRow{}
 	for rows.Next() {
-		var i Sandbox
+		var i ListSandboxesByTeamCreatedDescRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.VcpuCount,
-			&i.MemoryMib,
-			&i.HostID,
-			&i.IpAddress,
-			&i.Pid,
-			&i.SnapshotID,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DestroyedAt,
-			&i.NetworkConfig,
-			&i.TimeoutSeconds,
-			&i.Metadata,
-			&i.TemplateID,
-			&i.SnapshotPath,
-			&i.MemPath,
-			&i.BasePath,
-			&i.DeltaPath,
-			&i.DiskMib,
-			&i.AutoDeleteSeconds,
-			&i.AutoDeleteAt,
-			&i.FailedAt,
+			&i.Sandbox.ID,
+			&i.Sandbox.TeamID,
+			&i.Sandbox.Name,
+			&i.Sandbox.Status,
+			&i.Sandbox.VcpuCount,
+			&i.Sandbox.MemoryMib,
+			&i.Sandbox.HostID,
+			&i.Sandbox.IpAddress,
+			&i.Sandbox.Pid,
+			&i.Sandbox.SnapshotID,
+			&i.Sandbox.CreatedAt,
+			&i.Sandbox.UpdatedAt,
+			&i.Sandbox.DestroyedAt,
+			&i.Sandbox.NetworkConfig,
+			&i.Sandbox.TimeoutSeconds,
+			&i.Sandbox.Metadata,
+			&i.Sandbox.TemplateID,
+			&i.Sandbox.SnapshotPath,
+			&i.Sandbox.MemPath,
+			&i.Sandbox.BasePath,
+			&i.Sandbox.DeltaPath,
+			&i.Sandbox.DiskMib,
+			&i.Sandbox.AutoDeleteSeconds,
+			&i.Sandbox.AutoDeleteAt,
+			&i.Sandbox.FailedAt,
+			&i.Sandbox.HadSecretBindings,
+			&i.PreviewAccess,
 		); err != nil {
 			return nil, err
 		}
@@ -1947,20 +2032,23 @@ func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSa
 }
 
 const listSandboxesByTeamPaged = `-- name: ListSandboxesByTeamPaged :many
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at FROM sandbox
-WHERE team_id = $1
-  AND destroyed_at IS NULL
-  AND metadata @> $2
-  AND ($3::text IS NULL OR status::text = $3::text)
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = $1
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> $2
+  AND ($3::text IS NULL OR s.status::text = $3::text)
   AND ($4::text IS NULL
-       OR name ILIKE '%' || $4::text || '%')
+       OR s.name ILIKE '%' || $4::text || '%')
 ORDER BY
-  CASE WHEN $5::text = 'name'   AND $6::text = 'asc'  THEN name END ASC,
-  CASE WHEN $5::text = 'name'   AND $6::text = 'desc' THEN name END DESC,
-  CASE WHEN $5::text = 'status' AND $6::text = 'asc'  THEN status::text END ASC,
-  CASE WHEN $5::text = 'status' AND $6::text = 'desc' THEN status::text END DESC,
-  CASE WHEN $5::text = 'created_at' AND $6::text = 'asc' THEN created_at END ASC,
-  created_at DESC
+  CASE WHEN $5::text = 'name'   AND $6::text = 'asc'  THEN s.name END ASC,
+  CASE WHEN $5::text = 'name'   AND $6::text = 'desc' THEN s.name END DESC,
+  CASE WHEN $5::text = 'status' AND $6::text = 'asc'  THEN s.status::text END ASC,
+  CASE WHEN $5::text = 'status' AND $6::text = 'desc' THEN s.status::text END DESC,
+  CASE WHEN $5::text = 'created_at' AND $6::text = 'asc' THEN s.created_at END ASC,
+  s.created_at DESC
 LIMIT $8::bigint
 OFFSET COALESCE($7::bigint, 0)
 `
@@ -1976,6 +2064,11 @@ type ListSandboxesByTeamPagedParams struct {
 	RowLimit   *int64    `json:"row_limit"`
 }
 
+type ListSandboxesByTeamPagedRow struct {
+	Sandbox       Sandbox `json:"sandbox"`
+	PreviewAccess string  `json:"preview_access"`
+}
+
 // Paginated, sortable, filterable team sandbox list backing the console. Only
 // serves the non-default sorts (name/status); the default created_at sort is
 // handled by the static ListSandboxesByTeamCreated{Desc,Asc} queries above,
@@ -1989,7 +2082,7 @@ type ListSandboxesByTeamPagedParams struct {
 // no-op), with created_at DESC as the stable tiebreaker and default. A NULL
 // @row_limit returns all rows, preserving the pre-pagination "return
 // everything" default so unpaginated SDK/MCP callers are unaffected.
-func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxesByTeamPagedParams) ([]Sandbox, error) {
+func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxesByTeamPagedParams) ([]ListSandboxesByTeamPagedRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxesByTeamPaged,
 		arg.TeamID,
 		arg.Metadata,
@@ -2004,35 +2097,37 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Sandbox{}
+	items := []ListSandboxesByTeamPagedRow{}
 	for rows.Next() {
-		var i Sandbox
+		var i ListSandboxesByTeamPagedRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.Status,
-			&i.VcpuCount,
-			&i.MemoryMib,
-			&i.HostID,
-			&i.IpAddress,
-			&i.Pid,
-			&i.SnapshotID,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DestroyedAt,
-			&i.NetworkConfig,
-			&i.TimeoutSeconds,
-			&i.Metadata,
-			&i.TemplateID,
-			&i.SnapshotPath,
-			&i.MemPath,
-			&i.BasePath,
-			&i.DeltaPath,
-			&i.DiskMib,
-			&i.AutoDeleteSeconds,
-			&i.AutoDeleteAt,
-			&i.FailedAt,
+			&i.Sandbox.ID,
+			&i.Sandbox.TeamID,
+			&i.Sandbox.Name,
+			&i.Sandbox.Status,
+			&i.Sandbox.VcpuCount,
+			&i.Sandbox.MemoryMib,
+			&i.Sandbox.HostID,
+			&i.Sandbox.IpAddress,
+			&i.Sandbox.Pid,
+			&i.Sandbox.SnapshotID,
+			&i.Sandbox.CreatedAt,
+			&i.Sandbox.UpdatedAt,
+			&i.Sandbox.DestroyedAt,
+			&i.Sandbox.NetworkConfig,
+			&i.Sandbox.TimeoutSeconds,
+			&i.Sandbox.Metadata,
+			&i.Sandbox.TemplateID,
+			&i.Sandbox.SnapshotPath,
+			&i.Sandbox.MemPath,
+			&i.Sandbox.BasePath,
+			&i.Sandbox.DeltaPath,
+			&i.Sandbox.DiskMib,
+			&i.Sandbox.AutoDeleteSeconds,
+			&i.Sandbox.AutoDeleteAt,
+			&i.Sandbox.FailedAt,
+			&i.Sandbox.HadSecretBindings,
+			&i.PreviewAccess,
 		); err != nil {
 			return nil, err
 		}

@@ -15,6 +15,8 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/superserve-ai/sandbox/internal/telemetry"
+
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -67,6 +69,9 @@ type Handler struct {
 	sandboxConns *connLimiter
 	ipConns      *connLimiter
 	log          zerolog.Logger
+	// recorder receives per-exec latency phases; nil (the default) records
+	// nothing. Set via WithTelemetry.
+	recorder telemetry.Recorder
 
 	// seedKey is the HMAC seed shared with the control plane. Both
 	// sides derive per-sandbox access tokens as HMAC-SHA256(seed, sandboxID).
@@ -121,6 +126,13 @@ func (h *Handler) originAllowed(origin string) bool {
 
 // NewHandler creates a proxy Handler that only accepts requests whose Host
 // header ends in ".{domain}" for one of the given domains.
+// WithTelemetry attaches the operational metrics recorder; per-exec latency
+// phases are emitted through it.
+func (h *Handler) WithTelemetry(r telemetry.Recorder) *Handler {
+	h.recorder = r
+	return h
+}
+
 func NewHandler(domains []string, resolver Resolver, log zerolog.Logger) *Handler {
 	h := &Handler{
 		domains:      domains,
