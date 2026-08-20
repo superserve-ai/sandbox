@@ -207,14 +207,16 @@ locals {
   backup_coverage_alert_conditions = var.backup_coverage_alerts == null ? {} : merge(
     length(local.backup_coverage_regions) == 0 ? {
       uncovered_paused = {
-        display_name  = "${var.backup_coverage_alerts.display_prefix} / paused sandboxes without verified backup"
-        metric_type   = "prometheus.googleapis.com/backup_uncovered_paused_sandboxes/gauge"
-        extra_filter  = ""
-        comparison    = "COMPARISON_GT"
-        threshold     = var.backup_coverage_alerts.uncovered_threshold
-        aligner       = "ALIGN_MIN"
-        duration      = var.backup_coverage_alerts.uncovered_duration
-        documentation = <<-EOT
+        display_name    = "${var.backup_coverage_alerts.display_prefix} / paused sandboxes without verified backup"
+        metric_type     = "prometheus.googleapis.com/backup_uncovered_paused_sandboxes/gauge"
+        extra_filter    = ""
+        comparison      = "COMPARISON_GT"
+        threshold       = var.backup_coverage_alerts.uncovered_threshold
+        aligner         = "ALIGN_MIN"
+        reducer         = "REDUCE_MAX"
+        group_by_fields = ["metric.label.region", "metric.label.host_id"]
+        duration        = var.backup_coverage_alerts.uncovered_duration
+        documentation   = <<-EOT
           A host has had more than ${var.backup_coverage_alerts.uncovered_threshold} paused sandboxes without any verified backup generation for the whole alert window (see the series' region and host_id labels). Every one of them is a pause that cannot be restored from the bucket if the host's local tier is lost.
 
           Owner: Infrastructure Operations. Response: check whether the host's vmd backup pipeline is running and draining (backup_enabled, backup_journal_pending, backup_upload_total{result="failed"}), whether completion reports are reaching the control plane, and use backup_uncovered_oldest_age_seconds to judge how stale the exposure is.
@@ -222,14 +224,16 @@ locals {
       }
       } : {
       for region in local.backup_coverage_regions : "uncovered_paused_${region}" => {
-        display_name  = "${var.backup_coverage_alerts.display_prefix} / paused sandboxes without verified backup (${region})"
-        metric_type   = "prometheus.googleapis.com/backup_uncovered_paused_sandboxes/gauge"
-        extra_filter  = " AND metric.labels.region = \"${region}\""
-        comparison    = "COMPARISON_GT"
-        threshold     = var.backup_coverage_alerts.uncovered_threshold
-        aligner       = "ALIGN_MIN"
-        duration      = var.backup_coverage_alerts.uncovered_duration
-        documentation = <<-EOT
+        display_name    = "${var.backup_coverage_alerts.display_prefix} / paused sandboxes without verified backup (${region})"
+        metric_type     = "prometheus.googleapis.com/backup_uncovered_paused_sandboxes/gauge"
+        extra_filter    = " AND metric.labels.region = \"${region}\""
+        comparison      = "COMPARISON_GT"
+        threshold       = var.backup_coverage_alerts.uncovered_threshold
+        aligner         = "ALIGN_MIN"
+        reducer         = "REDUCE_MAX"
+        group_by_fields = ["metric.label.region", "metric.label.host_id"]
+        duration        = var.backup_coverage_alerts.uncovered_duration
+        documentation   = <<-EOT
           A host in region "${region}" has had more than ${var.backup_coverage_alerts.uncovered_threshold} paused sandboxes without any verified backup generation for the whole alert window (see the series' host_id label). Every one of them is a pause that cannot be restored from the bucket if the host's local tier is lost.
 
           Owner: Infrastructure Operations. Response: check whether the host's vmd backup pipeline is running and draining (backup_enabled, backup_journal_pending, backup_upload_total{result="failed"}), whether completion reports are reaching the control plane, and use backup_uncovered_oldest_age_seconds to judge how stale the exposure is.
@@ -247,14 +251,16 @@ locals {
     # losing sight of it.
     length(local.backup_coverage_regions) == 0 ? {} : {
       uncovered_orphaned = {
-        display_name  = "${var.backup_coverage_alerts.display_prefix} / paused sandboxes on missing host rows without verified backup"
-        metric_type   = "prometheus.googleapis.com/backup_uncovered_paused_sandboxes/gauge"
-        extra_filter  = " AND metric.labels.region = \"unknown\""
-        comparison    = "COMPARISON_GT"
-        threshold     = var.backup_coverage_alerts.uncovered_threshold
-        aligner       = "ALIGN_MIN"
-        duration      = var.backup_coverage_alerts.uncovered_duration
-        documentation = <<-EOT
+        display_name    = "${var.backup_coverage_alerts.display_prefix} / paused sandboxes on missing host rows without verified backup"
+        metric_type     = "prometheus.googleapis.com/backup_uncovered_paused_sandboxes/gauge"
+        extra_filter    = " AND metric.labels.region = \"unknown\""
+        comparison      = "COMPARISON_GT"
+        threshold       = var.backup_coverage_alerts.uncovered_threshold
+        aligner         = "ALIGN_MIN"
+        reducer         = "REDUCE_MAX"
+        group_by_fields = ["metric.label.region", "metric.label.host_id"]
+        duration        = var.backup_coverage_alerts.uncovered_duration
+        documentation   = <<-EOT
           Paused sandboxes whose host row no longer exists have had no verified backup generation for the whole alert window (region="unknown"; host_id is the sandbox's pinned host). These are the highest-exposure rows this metric tracks: the host that held their local artifacts is gone from the fleet table, so the bucket copy that does not exist is the only durability they could have had.
 
           Owner: Infrastructure Operations. Response: identify the sandboxes via the host_id label and the sandbox table (paused, not destroyed, host_id without a host row), determine whether the host's local tier still physically exists, and drive recovery or classification; do not silence this as migration noise without accounting for every sandbox behind it.
@@ -288,9 +294,22 @@ resource "google_monitoring_alert_policy" "backup_coverage" {
       threshold_value = each.value.threshold
       duration        = each.value.duration
       aggregations {
-        alignment_period     = "60s"
-        per_series_aligner   = each.value.aligner
+        alignment_period   = "60s"
+        per_series_aligner = each.value.aligner
+        # Coverage series carry service.instance.id (each vmd/controlplane
+        # process has a unique one, internal/telemetry/otel.go): the leader-
+        # elected sampler's identity changes on every deploy, crash, or
+        # autoscale event that moves the telemetry_sampler_lease. Without
+        # reducing that dimension away, a lease handoff starts a brand new
+        # series and resets this condition's sustained-duration window,
+        # which can suppress the alert indefinitely under routine churn.
+        # Grouping by region + host_id keeps per-host/per-region alerting
+        # granularity while collapsing across whichever replica currently
+        # holds the lease; REDUCE_MAX is safe here because at most one
+        # replica emits fresh points at a time, so it just follows the
+        # active leader's value instead of averaging it against stale ones.
         cross_series_reducer = try(each.value.reducer, null)
+        group_by_fields      = try(each.value.group_by_fields, null)
       }
       trigger {
         count = 1
