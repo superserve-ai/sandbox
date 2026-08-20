@@ -205,6 +205,9 @@ module "api" {
     STRIPE_WEBHOOK_SECRET = {
       secret = google_secret_manager_secret.stripe_webhook_secret.secret_id
     }
+    STRIPE_METER_ERROR_WEBHOOK_SECRET = {
+      secret = google_secret_manager_secret.stripe_meter_error_webhook_secret.secret_id
+    }
   }
   vpc_connector = module.network.vpc_connector_id
   labels        = local.common_labels
@@ -213,6 +216,7 @@ module "api" {
     google_secret_manager_secret_iam_member.api_runtime_system_team_id,
     google_secret_manager_secret_iam_member.api_runtime_stripe_secret_key,
     google_secret_manager_secret_iam_member.api_runtime_stripe_webhook_secret,
+    google_secret_manager_secret_iam_member.api_runtime_stripe_meter_error_webhook_secret,
   ]
 }
 resource "google_compute_disk" "sandbox_data" {
@@ -261,6 +265,13 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_stripe_webhook_s
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
 }
+
+resource "google_secret_manager_secret_iam_member" "api_runtime_stripe_meter_error_webhook_secret" {
+  project   = local.project_id
+  secret_id = google_secret_manager_secret.stripe_meter_error_webhook_secret.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
+}
 resource "google_secret_manager_secret" "stripe_secret_key" {
   project   = local.project_id
   secret_id = "stripe-secret-key-${local.resource_suffix}"
@@ -275,6 +286,17 @@ resource "google_secret_manager_secret" "stripe_secret_key" {
 resource "google_secret_manager_secret" "stripe_webhook_secret" {
   project   = local.project_id
   secret_id = "stripe-webhook-secret-${local.resource_suffix}"
+
+  replication {
+    auto {}
+  }
+
+  labels = local.common_labels
+}
+
+resource "google_secret_manager_secret" "stripe_meter_error_webhook_secret" {
+  project   = local.project_id
+  secret_id = "stripe-meter-error-webhook-secret-${local.resource_suffix}"
 
   replication {
     auto {}
