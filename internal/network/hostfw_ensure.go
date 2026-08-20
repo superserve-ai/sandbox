@@ -278,43 +278,47 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 				}
 			}
 		}
-		// nat plumbing is re-appended at the tail, which promotes any foreign
-		// rule currently sitting below our effective copy. In nat a promoted
-		// terminal rule (SNAT, MASQUERADE, ACCEPT, ...) changes the mapping
-		// for traffic our rule handled first — refuse rather than reorder
-		// across it. Strict, inert, and observer rules cannot change a
-		// verdict, so their promotion is harmless.
-		if table == "nat" {
-			for _, w := range want {
-				if headRule(key, w) {
-					continue
+		// Plumbing is re-appended at the tail, which promotes any foreign rule
+		// currently sitting below our effective copy — rules our terminal
+		// plumbing made unreachable would begin seeing traffic. Refuse when
+		// the promoted rule could change a verdict: in nat, anything
+		// terminal-capable (a promoted SNAT/MASQUERADE/ACCEPT changes the
+		// mapping ours applied first; a strict rule below only ever tightens
+		// what NAT already skipped); in filter, a strict or unknown rule
+		// (promoted above our ACCEPTs it starts blocking sandbox traffic —
+		// while a promoted ACCEPT is verdict-identical to ours). Inert and
+		// observer rules never change a verdict.
+		for _, w := range want {
+			if headRule(key, w) {
+				continue
+			}
+			first := -1
+			for i, g := range got {
+				if ruleEqual(w.args, g) {
+					first = i
+					break
 				}
-				first := -1
-				for i, g := range got {
-					if ruleEqual(w.args, g) {
-						first = i
+			}
+			if first == -1 {
+				continue
+			}
+			for _, g := range got[first+1:] {
+				isOurs := false
+				for _, o := range want {
+					if ruleEqual(o.args, g) {
+						isOurs = true
 						break
 					}
 				}
-				if first == -1 {
+				if isOurs || staleVMDRule(key, g, want) || unmarkedTwin(g, want) || ruleCannotMatchSandboxIngress(g) {
 					continue
 				}
-				for _, g := range got[first+1:] {
-					isOurs := false
-					for _, o := range want {
-						if ruleEqual(o.args, g) {
-							isOurs = true
-							break
-						}
-					}
-					if isOurs || staleVMDRule(key, g, want) || unmarkedTwin(g, want) || ruleCannotMatchSandboxIngress(g) {
-						continue
-					}
-					switch foreignDisposition(g) {
-					case "strict", "inert", "observer":
-					default:
-						return nil, fmt.Errorf("foreign terminal-capable rule below a vmd nat rule in %s (%s) — re-appending ours would promote it; refusing", key, strings.Join(g, " "))
-					}
+				disp := foreignDisposition(g)
+				tolerated := disp == "inert" || disp == "observer" ||
+					(table == "nat" && disp == "strict") ||
+					(table == "filter" && disp == "permissive")
+				if !tolerated {
+					return nil, fmt.Errorf("foreign %s rule below a vmd rule in %s (%s) — re-appending ours would promote it; refusing", disp, key, strings.Join(g, " "))
 				}
 			}
 		}
