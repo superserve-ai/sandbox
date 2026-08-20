@@ -451,6 +451,14 @@ func TestVerifyHeadGuard(t *testing.T) {
 			t.Fatalf("ok=%v class=%s", ok, class)
 		}
 	})
+	t.Run("observer rule above the block is fine", func(t *testing.T) {
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		rules["filter/FORWARD"] = append([][]string{{"-i", "veth+", "-j", "LOG", "--log-prefix", "fw:"}}, fw...)
+		if ok, class := mustVerify(t, renderDump(rules, chains), spec); !ok {
+			t.Fatalf("non-terminal observer above the block flagged: %s", class)
+		}
+	})
 	t.Run("foreign docker rule above the block is fine", func(t *testing.T) {
 		rules, chains := specKernel(spec, nil)
 		fw := rules["filter/FORWARD"]
@@ -827,9 +835,9 @@ func TestStaleManagedRedirectIsReconciledNotFatal(t *testing.T) {
 }
 
 func TestOperatorRulesNeverReadAsStale(t *testing.T) {
-	// Staleness is keyed on the explicit ownership marker, never on shape: an
-	// operator redirect — even one colliding with vmd ports — must never be
-	// reconciled away.
+	// staleManagedRule is keyed on the explicit ownership marker, never on
+	// shape. Shape-based retirement exists only for the exact pre-marker vmd
+	// redirect templates (staleVMDRule → legacyManagedRedirect below).
 	want := testSpec(true).sharedOrdered["nat/PREROUTING"]
 	for _, tokens := range [][]string{
 		{"-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", "8888"},
@@ -840,8 +848,64 @@ func TestOperatorRulesNeverReadAsStale(t *testing.T) {
 		{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", "3129"},
 	} {
 		if staleManagedRule(tokens, want) {
-			t.Fatalf("operator redirect misread as stale vmd rule: %v", tokens)
+			t.Fatalf("unmarked redirect misread as marked-stale: %v", tokens)
 		}
+	}
+	// Rules that carry a comment, use another dport, or twin a current rule
+	// are NEVER retired by shape — only the bare historical templates are.
+	for _, tokens := range [][]string{
+		{"-i", "veth+", "-p", "tcp", "--dport", "8080", "-j", "REDIRECT", "--to-port", "999", "-m", "comment", "--comment", "operator rule"},
+		{"-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", "8888", "-m", "comment", "--comment", "operator rule"},
+		{"-i", "veth+", "-p", "tcp", "--dport", "8080", "-j", "REDIRECT", "--to-port", "9090"},
+		{"-i", "veth+", "-p", "tcp", "-d", "10.0.0.5", "--dport", "9443", "-j", "REDIRECT", "--to-port", "8443"},
+		{"-i", "eth0", "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", "8888"},
+		// twin of the current TLS redirect: tolerated shadow, not stale
+		{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", "3129"},
+	} {
+		if staleVMDRule("nat/PREROUTING", tokens, want) {
+			t.Fatalf("non-template redirect retired by shape: %v", tokens)
+		}
+	}
+}
+
+func TestLegacyPreMarkerRedirectsReconciled(t *testing.T) {
+	// A host upgraded from the pre-marker installer keeps its old unmarked
+	// redirects as tolerated twins — until the config changes. Then the
+	// legacy rule would keep redirecting live sandbox traffic to a dead port,
+	// so the exact historical templates are retired like marked stale rules.
+	spec := testSpec(true)
+	legacyHTTP := []string{"-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", "9999"}
+	legacySecrets := []string{"-i", "veth+", "-p", "tcp", "-d", "169.254.9.9", "--dport", "8443", "-j", "REDIRECT", "--to-port", "8443"}
+
+	rules, chains := specKernel(spec, nil)
+	rules["nat/PREROUTING"] = append([][]string{legacyHTTP, legacySecrets}, rules["nat/PREROUTING"]...)
+	if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "stale-managed" {
+		t.Fatalf("ok=%v class=%s, want stale-managed", ok, class)
+	}
+
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+		t.Fatalf("post-repair verify failed: %s %s", class, detail)
+	}
+	for _, r := range k.rules["nat/PREROUTING"] {
+		if ruleEqual(r, legacyHTTP) || ruleEqual(r, legacySecrets) {
+			t.Fatalf("legacy pre-marker redirect survived reconciliation: %v", r)
+		}
+	}
+
+	// While the config still matches, the legacy rule is a twin: tolerated,
+	// verification intact, nothing to repair.
+	twin := []string{"-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", "3128"}
+	rules, chains = specKernel(spec, nil)
+	rules["nat/PREROUTING"] = append([][]string{twin}, rules["nat/PREROUTING"]...)
+	if ok, class := mustVerify(t, renderDump(rules, chains), spec); !ok {
+		t.Fatalf("current-config legacy twin flagged: %s", class)
 	}
 }
 
@@ -987,13 +1051,33 @@ func TestVerifyGuardsClampFromPrecedingTerminalAccept(t *testing.T) {
 			t.Fatalf("ok=%v class=%s, want preceded", ok, class)
 		}
 	})
-	t.Run("non-terminal unknown between drops and clamp tolerated", func(t *testing.T) {
+	t.Run("observer between drops and clamp tolerated", func(t *testing.T) {
 		rules, chains := specKernel(spec, nil)
 		fw := rules["filter/FORWARD"]
 		logRule := []string{"-i", "veth+", "-j", "LOG"}
 		rules["filter/FORWARD"] = append(fw[:2:2], append([][]string{logRule}, fw[2:]...)...)
 		if ok, class := mustVerify(t, renderDump(rules, chains), spec); !ok {
-			t.Fatalf("non-terminal unknown past the drops flagged: %s", class)
+			t.Fatalf("non-terminal observer past the drops flagged: %s", class)
+		}
+	})
+	// Unknown control flow between the drops and the clamp can reach an
+	// ACCEPT (or RETURN into an ACCEPT policy) before the clamp runs, so it
+	// must fail exactly like ambiguity above the drops.
+	t.Run("ambiguous control flow between drops and clamp fails", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			rule []string
+		}{
+			{"operator chain jump", []string{"-i", "veth+", "-j", "OPERATOR_CHAIN"}},
+			{"return", []string{"-i", "veth+", "-j", "RETURN"}},
+			{"goto", []string{"-i", "veth+", "-g", "OPERATOR_CHAIN"}},
+		} {
+			rules, chains := specKernel(spec, nil)
+			fw := rules["filter/FORWARD"]
+			rules["filter/FORWARD"] = append(fw[:2:2], append([][]string{tc.rule}, fw[2:]...)...)
+			if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "preceded-ambiguous" {
+				t.Fatalf("%s: ok=%v class=%s, want preceded-ambiguous", tc.name, ok, class)
+			}
 		}
 	})
 	t.Run("repair converges the flagged accept", func(t *testing.T) {

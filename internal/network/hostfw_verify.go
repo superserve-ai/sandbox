@@ -352,10 +352,13 @@ func ruleCannotMatchSandboxIngress(tokens []string) bool {
 //     transfer.
 //   - "permissive": ACCEPT — a proven bypass; the only class repair may
 //     auto-demote below the block.
-//   - "ambiguous": anything else — RETURN, MARK, NAT actions, -j into an
-//     operator chain, and -g/--goto (control flow into another chain even
-//     without -j) — semantics unknown, so the owner fails startup without
-//     mutating rather than guess.
+//   - "observer": a provably NON-TERMINAL extension target (LOG, MARK, ...) —
+//     the packet always continues to the next rule, so it can neither accept
+//     nor divert traffic away from enforcement or the clamp.
+//   - "ambiguous": anything else — RETURN, NAT actions, -j into an operator
+//     chain, and -g/--goto (control flow into another chain even without
+//     -j) — semantics unknown, so the owner fails startup without mutating
+//     rather than guess.
 func foreignDisposition(tokens []string) string {
 	for i, t := range tokens {
 		if t == "-g" || t == "--goto" {
@@ -367,6 +370,8 @@ func foreignDisposition(tokens []string) string {
 				return "strict"
 			case "ACCEPT":
 				return "permissive"
+			case "LOG", "NFLOG", "ULOG", "MARK", "CONNMARK", "TRACE", "AUDIT", "SET", "CLASSIFY", "TOS", "TTL", "HL":
+				return "observer"
 			default:
 				return "ambiguous"
 			}
@@ -435,9 +440,9 @@ func stripMarkerGroup(groups []string) []string {
 // staleManagedRule reports whether a non-spec dump rule is provably a stale
 // vmd rule: it carries the explicit ownership marker but no longer matches
 // the current spec (a previous configuration's rule after a supported config
-// change). Marker-only, never shape or modulo-marker inference — vmd NEVER
-// deletes an unmarked rule, because an operator rule that happens to be
-// identical to a vmd rule today must survive vmd's future config changes.
+// change). Marker-only — the sole exception to "vmd never deletes an unmarked
+// rule" is the pre-marker generation of its own redirects, see
+// legacyManagedRedirect.
 func staleManagedRule(tokens []string, want []fwRule) bool {
 	if !hasVMDMarker(tokens) {
 		return false
@@ -455,6 +460,56 @@ func staleManagedRule(tokens []string, want []fwRule) bool {
 // operator rule that is semantically identical to it. Such rules are
 // TOLERATED SHADOWS: skipped by every scan (they enforce exactly what the
 // marked rule enforces) and never deleted (ownership is unknowable).
+// legacyManagedRedirect reports whether an UNMARKED nat/PREROUTING rule is,
+// shape-for-shape, a redirect this installer produced before rules carried
+// the ownership marker: the veth+ HTTP/TLS proxy redirect (fixed dport 80 or
+// 443) or the destination-narrowed secrets redirect (dport equal to
+// --to-port). Nothing else qualifies — any extra match, comment, or other
+// dport reads as foreign. Left in place as a tolerated twin, such a rule is
+// harmless while the config still matches it; but after the feature is
+// re-pointed or disabled it would keep redirecting live sandbox traffic to a
+// dead port while verification reports intact — so one that no longer twins a
+// current spec rule is retired exactly like a marked stale rule (the one
+// carve-out from never deleting unmarked rules; these chains are vmd's
+// declared management domain for veth+ traffic).
+func legacyManagedRedirect(key string, tokens []string) bool {
+	if key != "nat/PREROUTING" || hasVMDMarker(tokens) {
+		return false
+	}
+	groups, ok := canonicalRule(tokens)
+	if !ok {
+		return false
+	}
+	opts := make(map[string]string, len(groups))
+	for _, g := range groups {
+		opt, val, _ := strings.Cut(g, " ")
+		if _, dup := opts[opt]; dup {
+			return false
+		}
+		opts[opt] = val
+	}
+	if opts["-i"] != "veth+" || opts["-p"] != "tcp" || opts["-j"] != "REDIRECT" || opts["--to-port"] == "" {
+		return false
+	}
+	switch len(opts) {
+	case 5: // -i, -p, --dport, -j, --to-port: the HTTP/TLS proxy redirect
+		return opts["--dport"] == "80" || opts["--dport"] == "443"
+	case 6: // plus -d: the secrets redirect (its dport mirrors the proxy port)
+		return opts["-d"] != "" && opts["--dport"] != "" && opts["--dport"] == opts["--to-port"]
+	}
+	return false
+}
+
+// staleVMDRule reports whether a non-spec dump rule is provably vmd's own
+// from an older configuration — marked but no longer current, or a pre-marker
+// redirect shape that no longer twins a current rule.
+func staleVMDRule(key string, tokens []string, want []fwRule) bool {
+	if staleManagedRule(tokens, want) {
+		return true
+	}
+	return legacyManagedRedirect(key, tokens) && !unmarkedTwin(tokens, want)
+}
+
 func unmarkedTwin(tokens []string, want []fwRule) bool {
 	g, ok := canonicalRule(tokens)
 	if !ok {
@@ -488,44 +543,36 @@ func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, 
 						break
 					}
 				}
-				if !isOurs && staleManagedRule(g, want) {
+				if !isOurs && staleVMDRule(key, g, want) {
 					return false, "stale-managed", key + ": " + emitRuleTokens(g)
 				}
 			}
 		}
 		// Head guard: no foreign rule capable of matching sandbox traffic may
-		// sit above (or interleave) the vmd security rules — relative order
-		// among our own rules alone would still verify with a foreign
-		// `-i veth+ -j ACCEPT` above the drops. Two zones:
-		//   - through our LAST security rule (drops/jumps/redirects):
-		//     permissive foreigns are a proven bypass (preceded, repairable),
-		//     ambiguous ones fail distinctly;
-		//   - from there through the MSS clamp: a TERMINAL permissive foreign
-		//     still flags (matching SYNs would exit unclamped — repair puts
-		//     the clamp back at the head), but non-terminal unknowns are
-		//     tolerated as before — enforcement has already run.
+		// sit above (or interleave) the vmd head rules — relative order among
+		// our own rules alone would still verify with a foreign
+		// `-i veth+ -j ACCEPT` above the drops. The guarded prefix runs
+		// through our LAST head rule (the security rules plus the MSS clamp):
+		// strict and observer rules only tighten or watch, a permissive
+		// (ACCEPT) rule is a proven bypass — of the drops or of the clamp —
+		// and is repairable, and unknown control flow (RETURN, -g, a jump to
+		// an operator chain) could accept or divert matching traffic before
+		// enforcement or the clamp runs, so it fails distinctly and is never
+		// reordered past.
 		if spec.headGuarded[key] {
-			guardEnd, clampEnd := -1, -1
+			headEnd := -1
 			for _, w := range want {
-				isHead := headRule(key, w)
+				if !headRule(key, w) {
+					continue
+				}
 				for i, g := range got {
-					if !ruleEqual(w.args, g) {
-						continue
-					}
-					if securityRule(key, w) && i > guardEnd {
-						guardEnd = i
-					}
-					if isHead && i > clampEnd {
-						clampEnd = i
+					if ruleEqual(w.args, g) && i > headEnd {
+						headEnd = i
 					}
 				}
 			}
-			scanEnd := guardEnd
-			if clampEnd > scanEnd {
-				scanEnd = clampEnd
-			}
 			for i := 0; i < len(got); i++ {
-				if scanEnd != -1 && i >= scanEnd {
+				if headEnd != -1 && i >= headEnd {
 					break
 				}
 				isOurs := false
@@ -545,18 +592,13 @@ func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, 
 				if isOurs || (twin && foreignDisposition(got[i]) != "permissive") || ruleCannotMatchSandboxIngress(got[i]) {
 					continue
 				}
-				inSecurityZone := guardEnd == -1 || i < guardEnd
 				switch foreignDisposition(got[i]) {
-				case "strict", "inert":
-					// Only tightens (or does nothing): allowed above the block.
+				case "strict", "inert", "observer":
+					// Tightens, observes, or does nothing: allowed above.
 				case "permissive":
 					return false, "preceded", key + ": " + strings.Join(got[i], " ")
 				default:
-					if inSecurityZone {
-						return false, "preceded-ambiguous", key + ": " + strings.Join(got[i], " ")
-					}
-					// Non-terminal unknown between the drops and the clamp:
-					// tolerated — it cannot provably bypass the clamp.
+					return false, "preceded-ambiguous", key + ": " + strings.Join(got[i], " ")
 				}
 			}
 		}

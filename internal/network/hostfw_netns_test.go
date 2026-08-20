@@ -128,6 +128,10 @@ func TestRealInstallDumpVerifyRoundTrip(t *testing.T) {
 		{"flush nat redirect chain", func(t *testing.T) {
 			ipt(t, "-t", "nat", "-F", dnsRedirectChain)
 		}},
+		{"legacy pre-marker redirect", func(t *testing.T) {
+			ipt(t, "-t", "nat", "-I", "PREROUTING", "1",
+				"-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-ports", "9999")
+		}},
 	}
 	for _, s := range sabotages {
 		t.Run(s.name, func(t *testing.T) {
