@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -33,9 +34,36 @@ func (c *queryCapture) Query(_ context.Context, sql string, args ...any) (pgx.Ro
 	return schedulerEmptyRows{}, nil
 }
 
-func (c *queryCapture) QueryRow(context.Context, string, ...any) pgx.Row {
-	return schedulerErrorRow{err: fmt.Errorf("unexpected QueryRow")}
+func (c *queryCapture) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	// The empty-candidate fallback verifies the default host's status; an
+	// active row preserves the old fallback behavior in these tests.
+	if strings.Contains(sql, "-- name: GetHost :one") {
+		return schedulerHostRow(args[0].(string), "active")
+	}
+	return schedulerErrorRow{err: fmt.Errorf("unexpected QueryRow: %s", sql)}
 }
+
+// schedulerHostRow scans like a host row: sqlc's 10-column SELECT * order.
+func schedulerHostRow(id, status string) pgx.Row {
+	return schedulerScanRow{scan: func(dest ...any) error {
+		*dest[0].(*string) = id
+		*dest[1].(*string) = "10.0.0.1:50051"
+		*dest[2].(*string) = "10.0.0.1:5007"
+		*dest[3].(*string) = "region-a"
+		*dest[4].(*string) = status
+		*dest[5].(*int32) = 1024
+		*dest[6].(*int32) = 8
+		*dest[7].(*pgtype.Timestamptz) = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+		*dest[8].(*time.Time) = time.Now()
+		*dest[9].(*time.Time) = time.Now()
+		*dest[10].(*bool) = false
+		return nil
+	}}
+}
+
+type schedulerScanRow struct{ scan func(...any) error }
+
+func (r schedulerScanRow) Scan(dest ...any) error { return r.scan(dest...) }
 
 type schedulerErrorRow struct{ err error }
 
@@ -52,6 +80,63 @@ func (schedulerEmptyRows) Scan(...any) error                            { return
 func (schedulerEmptyRows) Values() ([]any, error)                       { return nil, nil }
 func (schedulerEmptyRows) RawValues() [][]byte                          { return nil }
 func (schedulerEmptyRows) Conn() *pgx.Conn                              { return nil }
+
+// The legacy DefaultHostID fallback must never route to a host row that
+// exists in a non-active state: a freshly self-registered 'provisioning'
+// host under the default ID would otherwise take creates before an operator
+// activates it. Only a genuinely missing row (unpopulated table, the
+// bootstrap case) or an active row may fall back.
+func TestSelectHostFallbackRefusesNonActiveDefault(t *testing.T) {
+	run := func(t *testing.T, row pgx.Row) (string, error) {
+		mock := &fallbackProbe{row: row}
+		s := &LeastLoaded{DB: db.New(mock), DefaultHostID: "default"}
+		return s.SelectHost(context.Background(), nil)
+	}
+
+	for _, status := range []string{"provisioning", "draining", "unhealthy"} {
+		if id, err := run(t, schedulerHostRow("default", status)); err == nil {
+			t.Fatalf("status %s: fallback returned %q, want error", status, id)
+		}
+	}
+	if id, err := run(t, schedulerHostRow("default", "active")); err != nil || id != "default" {
+		t.Fatalf("active: got (%q, %v), want (default, nil)", id, err)
+	}
+	if id, err := run(t, schedulerErrorRow{err: pgx.ErrNoRows}); err != nil || id != "default" {
+		t.Fatalf("missing row (bootstrap): got (%q, %v), want (default, nil)", id, err)
+	}
+}
+
+// The fallback status is resolved once per cache fill, not per create: in
+// bootstrap mode the SWR cache must keep eliminating per-create DB I/O.
+func TestSelectHostFallbackStatusIsCached(t *testing.T) {
+	mock := &fallbackProbe{row: schedulerErrorRow{err: pgx.ErrNoRows}}
+	s := &LeastLoaded{DB: db.New(mock), DefaultHostID: "default", TTL: time.Minute}
+	for i := 0; i < 5; i++ {
+		if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "default" {
+			t.Fatalf("select %d: got (%q, %v)", i, id, err)
+		}
+	}
+	if got := mock.rowCalls.Load(); got != 1 {
+		t.Fatalf("GetHost calls = %d, want 1 (per fill, not per create)", got)
+	}
+}
+
+// fallbackProbe returns zero active hosts and serves GetHost from a canned row.
+type fallbackProbe struct {
+	row      pgx.Row
+	rowCalls atomic.Int64
+}
+
+func (f *fallbackProbe) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec")
+}
+func (f *fallbackProbe) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return schedulerEmptyRows{}, nil
+}
+func (f *fallbackProbe) QueryRow(context.Context, string, ...any) pgx.Row {
+	f.rowCalls.Add(1)
+	return f.row
+}
 
 func TestLeastLoadedQueryExcludesHostsWithoutPreviewEnforcement(t *testing.T) {
 	capture := &queryCapture{}
