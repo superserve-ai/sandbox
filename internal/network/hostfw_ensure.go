@@ -115,22 +115,31 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 			return fmt.Errorf("host firewall post-install parse: %w", perr)
 		}
 		ok, class, detail := verifyHostFirewall(d, spec)
+		// Async: informational writes must not hold the lock (or startup)
+		// hostage to a backpressured log sink — waiters are queued behind it.
 		if ok {
-			log.Info().Dur("repair_ms", time.Since(tRepair)).Int("repair_passes", pass).
-				Msg("host firewall installed and verified")
+			repairDur, passes := time.Since(tRepair), pass
+			go func() {
+				log.Info().Dur("repair_ms", repairDur).Int("repair_passes", passes).
+					Msg("host firewall installed and verified")
+			}()
 			return nil
 		}
 		if !manageOwnedChains {
-			log.Warn().Str("mismatch", class).Str("detail", detail).
-				Msg("host firewall not fully verified — ordering repair is the daemon's; continuing with installed rules")
+			go func() {
+				log.Warn().Str("mismatch", class).Str("detail", detail).
+					Msg("host firewall not fully verified — ordering repair is the daemon's; continuing with installed rules")
+			}()
 			return nil
 		}
 		repairable := class == "misordered" || class == "duplicate-rule" || class == "preceded" || class == "stale-managed"
 		if pass > 0 || !repairable {
 			return fmt.Errorf("host firewall failed verification after install (%s: %s) — refusing to serve with unverified enforcement", class, detail)
 		}
-		log.Warn().Str("mismatch", class).Str("detail", detail).
-			Msg("host firewall needs canonicalization after install — repairing rule order")
+		go func() {
+			log.Warn().Str("mismatch", class).Str("detail", detail).
+				Msg("host firewall needs canonicalization after install — repairing rule order")
+		}()
 		if err := repairSharedOrdering(ctx, d, spec); err != nil {
 			return fmt.Errorf("host firewall ordering repair: %w", err)
 		}

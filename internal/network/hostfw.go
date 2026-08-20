@@ -184,11 +184,15 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 		}
 	}
 
-	log.Info().
-		Str("host_iface", hostIface).
-		Str("secrets_proxy_dst", secretsProxyDst).
-		Uint16("secrets_proxy_port", secretsProxyPort).
-		Msg("host firewall ready (static prefix rules)")
+	// Async: callers may hold the cooperating-writer lock; an informational
+	// write must not extend the hold.
+	go func() {
+		log.Info().
+			Str("host_iface", hostIface).
+			Str("secrets_proxy_dst", secretsProxyDst).
+			Uint16("secrets_proxy_port", secretsProxyPort).
+			Msg("host firewall ready (static prefix rules)")
+	}()
 	return nil
 }
 
