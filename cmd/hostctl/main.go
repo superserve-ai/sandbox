@@ -202,10 +202,15 @@ func (c client) hostRow(hostID string) (hostView, error) {
 	if err != nil {
 		return hostView{}, err
 	}
-	if len(hosts) == 0 {
-		return hostView{}, fmt.Errorf("host %q not found", hostID)
+	// Scan by ID rather than taking hosts[0]: a control plane that predates
+	// the ?id= filter ignores it and returns the whole fleet, and drain
+	// must never end up monitoring whichever host sorts first.
+	for _, h := range hosts {
+		if h.ID == hostID {
+			return h, nil
+		}
 	}
-	return hosts[0], nil
+	return hostView{}, fmt.Errorf("host %q not found", hostID)
 }
 
 func (c client) list() error {
