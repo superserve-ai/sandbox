@@ -11,12 +11,20 @@ PR titles, PR descriptions, review comments — is public.
   text. Use neutral placeholders (`pilot-team`, `example-team`) in tests and
   plain descriptions ("a customer with a large fleet") in prose.
 - **No internal ticket references.** Do not cite issue-tracker IDs
-  (`SS-123`-style) anywhere in the repo or in PR titles/descriptions. They
+  (`SS-123`-style) in code, comments, test fixtures, or commit messages. They
   are dead links to outside readers and leak internal planning. Describe the
   purpose in words instead: "part of the multi-region rollout", not a ticket
   number.
 - **No internal URLs** (dashboards, trackers, internal docs) in committed
-  files or PR text.
+  files.
+- **PR bodies may link the tracker item they resolve.** A single line at the
+  top of a PR description — `Fixes: <Linear issue URL>` or
+  `Fixes: <Sentry issue URL>` — is fine even though the destination is
+  internal-only; outside readers just see a dead link, same as any other
+  private reference. This does not relax anything above: PR titles, code,
+  comments, commits, and fixtures still describe the change in plain words
+  with no ticket IDs or internal URLs, and the PR body must still explain
+  the change in prose, not rely on the link alone.
 
 Cross-referencing public artifacts is fine: other PRs and issues in this
 repository, upstream project issues, and public documentation.
