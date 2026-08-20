@@ -1078,6 +1078,30 @@ func TestRepairRefusesToPromoteBlockerBelowForwardAccepts(t *testing.T) {
 		t.Fatal("repair promoted a foreign DROP above the FORWARD accepts")
 	}
 
+	// Reverse direction: a DROP on sandbox-BOUND traffic below the managed
+	// eth→veth ACCEPT is just as unreachable today and just as harmful
+	// promoted — the ingress-only exemption must not skip it.
+	rules, chains = specKernel(spec, nil)
+	fw = rules["filter/FORWARD"]
+	fw[3], fw[4] = fw[4], fw[3]
+	rules["filter/FORWARD"] = append(fw, []string{"-i", "eth0", "-o", "veth+", "-j", "DROP"})
+	d, _ = parseIPTablesSave(renderDump(rules, chains))
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err == nil {
+		t.Fatal("repair promoted a foreign DROP on sandbox-bound traffic above the accepts")
+	}
+
+	// Provably neither direction (non-veth -i AND -o): exempt, repair runs.
+	rules, chains = specKernel(spec, nil)
+	fw = rules["filter/FORWARD"]
+	fw[3], fw[4] = fw[4], fw[3]
+	rules["filter/FORWARD"] = append(fw, []string{"-i", "eth0", "-o", "wg0", "-j", "DROP"})
+	k0 := &fakeKernel{rules: rules, chains: chains}
+	defer k0.install(t)()
+	d, _ = parseIPTablesSave(renderDump(k0.rules, k0.chains))
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair refused a rule that can match no sandbox traffic: %v", err)
+	}
+
 	rules, chains = specKernel(spec, nil)
 	fw = rules["filter/FORWARD"]
 	fw[3], fw[4] = fw[4], fw[3]

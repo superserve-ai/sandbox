@@ -310,7 +310,7 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 						break
 					}
 				}
-				if isOurs || staleVMDRule(key, g, want) || unmarkedTwin(g, want) || ruleCannotMatchSandboxIngress(g) {
+				if isOurs || staleVMDRule(key, g, want) || unmarkedTwin(g, want) || ruleCannotMatchSandboxTraffic(g) {
 					continue
 				}
 				disp := foreignDisposition(g)

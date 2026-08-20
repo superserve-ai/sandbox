@@ -316,14 +316,27 @@ func parseIPTablesSave(out string) (*parsedDump, error) {
 // rules are ignored. Owned chains: contents must equal the spec exactly, in
 // order, with nothing extra.
 // ruleCannotMatchSandboxIngress conservatively decides whether a foreign rule
-// positioned above the vmd security block is provably unable to match sandbox
-// (veth) traffic: it must carry a non-negated explicit input interface whose
-// pattern cannot cover a veth device. Anything else — no -i at all, a
-// negation, a veth-covering prefix wildcard, unparseable shapes — reads as
-// capable, which at worst costs a repair pass, never a bypass.
+// positioned above the vmd security block is provably unable to match
+// sandbox-ORIGINATED (veth ingress) traffic: it must carry a non-negated
+// explicit input interface whose pattern cannot cover a veth device. Anything
+// else — no -i at all, a negation, a veth-covering prefix wildcard,
+// unparseable shapes — reads as capable, which at worst costs a repair pass,
+// never a bypass.
 func ruleCannotMatchSandboxIngress(tokens []string) bool {
+	return ruleCannotMatchVethVia(tokens, "-i")
+}
+
+// ruleCannotMatchSandboxTraffic is the two-direction form for the tail
+// promotion guard: the plumbing it protects terminates sandbox-originated
+// (-i veth+) AND sandbox-bound (-o veth+) traffic, so a foreign rule is only
+// exempt when it provably matches neither direction.
+func ruleCannotMatchSandboxTraffic(tokens []string) bool {
+	return ruleCannotMatchVethVia(tokens, "-i") && ruleCannotMatchVethVia(tokens, "-o")
+}
+
+func ruleCannotMatchVethVia(tokens []string, flag string) bool {
 	for i, t := range tokens {
-		if t != "-i" {
+		if t != flag {
 			continue
 		}
 		if i > 0 && tokens[i-1] == "!" {
@@ -341,7 +354,7 @@ func ruleCannotMatchSandboxIngress(tokens []string) bool {
 		}
 		return true
 	}
-	return false // no input-interface constraint: can match anything
+	return false // no interface constraint on this direction: can match anything
 }
 
 // foreignDisposition classifies a veth-capable foreign rule found above the
