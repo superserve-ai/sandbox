@@ -5,10 +5,12 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -585,61 +587,62 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 		t.Fatalf("before backup: paused=%d unbacked=%d, want 1/1", paused, unbacked)
 	}
 
-	// A generation whose manifest matches the pause's recorded content
-	// arrives (as the upload-report path would record it): the sandbox
-	// stays paused but leaves the unbacked class.
-	if _, err := testPool.Exec(ctx,
-		`INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
-		 VALUES ($1, $2, 'cell-bucket', now(),
-		         jsonb_build_array(jsonb_build_object(
-		           'name', 'vmstate.snap', 'size_bytes', 1, 'sha256', $2::text)))`,
-		sandboxID, shaA); err != nil {
-		t.Fatalf("record backup generation: %v", err)
+	// Reports go through the REAL handler: coverage is only ever linked to
+	// a pause by ReportHostBackup's under-lock identity match, and this
+	// test must exercise that code, not hand-write its conclusions.
+	report := func(genKey, vmstateSHA, rootfsSHA string) {
+		t.Helper()
+		body := fmt.Sprintf(`{"sandbox_id":%q,"generation":%q,"bucket":"cell-bucket","completed_at":%q,"files":[{"name":"vmstate.snap","size_bytes":1,"sha256":%q},{"name":"rootfs.ext4","size_bytes":1,"sha256":%q}]}`,
+			sandboxID, genKey, time.Now().UTC().Format(time.RFC3339), vmstateSHA, rootfsSHA)
+		req := httptest.NewRequest("POST", "/internal/hosts/"+hostID+"/backups", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer itok-hostreg")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("report backup: %d %s", w.Code, w.Body.String())
+		}
 	}
+	shaX, shaY := strings.Repeat("d", 64), strings.Repeat("e", 64)
+
+	// A verified report matching the pause's recorded manifest arrives:
+	// the handler links the generation to this pause and the sandbox
+	// leaves the unbacked class.
+	report(strings.Repeat("1", 64), shaA, shaX)
 	if paused, unbacked := counts(); paused != 1 || unbacked != 0 {
 		t.Fatalf("after backup: paused=%d unbacked=%d, want 1/0", paused, unbacked)
 	}
 
-	// Resume + re-pause: FinalizePause rewrites the pause-time manifest
-	// with the new content's digests, so the old generation no longer
-	// matches and the sandbox re-enters the unbacked class — regardless of
-	// any timestamp on the old generation.
+	// Resume + re-pause: the finalize rewrites the manifest digests and
+	// advances the snapshot's generation counter (legacy mode reuses the
+	// row id — the counter is what names the pause). Every earlier link
+	// now points at a pause that no longer exists.
 	if _, err := testPool.Exec(ctx,
-		`UPDATE artifact_manifest SET sha256 = $2
-		 WHERE snapshot_id = (SELECT snapshot_id FROM sandbox WHERE id = $1)`,
+		`WITH snap AS (
+		   UPDATE snapshot SET generation = generation + 1
+		   WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)
+		   RETURNING id
+		 )
+		 UPDATE artifact_manifest SET sha256 = $2
+		 WHERE snapshot_id IN (SELECT id FROM snap)`,
 		sandboxID, shaB); err != nil {
-		t.Fatalf("advance manifest to a new pause: %v", err)
+		t.Fatalf("advance to a new pause: %v", err)
 	}
 	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
-		t.Fatalf("after re-pause: paused=%d unbacked=%d, want 1/1 (stale generation must not count as coverage)", paused, unbacked)
+		t.Fatalf("after re-pause: paused=%d unbacked=%d, want 1/1 (stale link must not count as coverage)", paused, unbacked)
 	}
 
-	// The previous pause's report, delayed in the outbox, lands AFTER the
-	// re-pause with fresh server timestamps and a skewed-ahead
-	// completed_at. No clock comparison survives this; content identity
-	// does — its manifest names the old content, so it must not cover the
-	// current pause.
-	if _, err := testPool.Exec(ctx,
-		`INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
-		 VALUES ($1, repeat('c', 64), 'cell-bucket', now() + interval '2 hours',
-		         jsonb_build_array(jsonb_build_object(
-		           'name', 'vmstate.snap', 'size_bytes', 1, 'sha256', $2::text)))`,
-		sandboxID, shaA); err != nil {
-		t.Fatalf("deliver delayed stale report: %v", err)
-	}
+	// The previous pause's report, delayed in the outbox, redelivers
+	// AFTER the re-pause. The handler matches it against the CURRENT
+	// manifest, fails, and links nothing — even though every timestamp on
+	// it is fresh.
+	report(strings.Repeat("1", 64), shaA, shaX)
 	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
 		t.Fatalf("after delayed stale report: paused=%d unbacked=%d, want 1/1 (late delivery of old content must not fake coverage)", paused, unbacked)
 	}
 
-	// The current pause's own report arrives: covered again.
-	if _, err := testPool.Exec(ctx,
-		`INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
-		 VALUES ($1, $2, 'cell-bucket', now(),
-		         jsonb_build_array(jsonb_build_object(
-		           'name', 'vmstate.snap', 'size_bytes', 1, 'sha256', $2::text)))`,
-		sandboxID, shaB); err != nil {
-		t.Fatalf("record current-pause generation: %v", err)
-	}
+	// The current pause's own report arrives and matches: covered again.
+	report(strings.Repeat("2", 64), shaB, shaY)
 	if paused, unbacked := counts(); paused != 1 || unbacked != 0 {
 		t.Fatalf("after current-pause backup: paused=%d unbacked=%d, want 1/0", paused, unbacked)
 	}

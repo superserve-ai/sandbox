@@ -230,35 +230,31 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        -- exists, but unbacked is the irrecoverable class an operator must
        -- never retire past.
        --
-       -- "Covers the current pause" is decided by CONTENT IDENTITY, never
-       -- by timestamps: a generation counts only if its files manifest
-       -- contains every (name, sha256) the head snapshot's pause-time
-       -- manifest recorded — the same match the backup-report path applies
-       -- (see backups.go: vmstate alone is not a unique pause identity, so
-       -- the report must match EVERY recorded row). No clock comparison
-       -- survives delayed outbox delivery plus host-clock skew, which can
-       -- land a PREVIOUS pause's generation with both of its timestamps
-       -- past the current snapshot's created_at; identical content, by
-       -- contrast, means the pause's data IS in the bucket regardless of
-       -- when the report arrived. Errs conservative: a snapshot with no
-       -- recorded manifest rows, or a generation whose manifest was never
-       -- reported (coverage-only outbox seed), cannot be identified and
-       -- counts as unbacked.
+       -- "Covers the current pause" reads the PERSISTED identity link the
+       -- report handler writes (MarkSandboxBackupCovered): a generation
+       -- counts only if its verified manifest matched the head snapshot's
+       -- recorded digests at report time, under the same row lock the
+       -- pause finalize takes — and the link names both the snapshot row
+       -- and its per-pause generation counter, so a re-pause (which
+       -- advances the counter even when the legacy finalize reuses the
+       -- row id) unlinks every earlier generation. Nothing here infers
+       -- identity from timestamps or manifest containment at read time:
+       -- both misidentify a previous pause's generation under delayed
+       -- outbox delivery. Errs conservative: a generation recorded before
+       -- this linkage existed (or whose report predates the current
+       -- pause) reads as unbacked until its next redelivery re-verifies
+       -- it against the current manifest.
        COALESCE((SELECT COUNT(*) FROM sandbox s2
                  WHERE s2.host_id = h.id
                    AND s2.status = 'paused'
                    AND s2.destroyed_at IS NULL
                    AND NOT EXISTS (
-                     SELECT 1 FROM backup_generation bg
+                     SELECT 1
+                     FROM backup_generation bg
+                     JOIN snapshot snap ON snap.id = s2.snapshot_id
                      WHERE bg.sandbox_id = s2.id
-                       AND EXISTS (SELECT 1 FROM artifact_manifest am
-                                   WHERE am.snapshot_id = s2.snapshot_id)
-                       AND NOT EXISTS (
-                         SELECT 1 FROM artifact_manifest am
-                         WHERE am.snapshot_id = s2.snapshot_id
-                           AND NOT (bg.files @> jsonb_build_array(
-                                 jsonb_build_object('name', am.file_name,
-                                                    'sha256', am.sha256)))))), 0)::int AS paused_unbacked_count
+                       AND bg.covered_snapshot_id = snap.id
+                       AND bg.covered_snapshot_generation = snap.generation)), 0)::int AS paused_unbacked_count
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
 -- The optional id filter exists for drain polling: `hostctl drain --wait`

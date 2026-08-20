@@ -57,7 +57,7 @@ func (q *Queries) LatestSandboxBackup(ctx context.Context, sandboxID pgtype.UUID
 }
 
 const latestSnapshotManifest = `-- name: LatestSnapshotManifest :many
-SELECT s.id AS snapshot_id, am.file_name, am.sha256
+SELECT s.id AS snapshot_id, s.generation AS snapshot_generation, am.file_name, am.sha256
 FROM snapshot s
 JOIN artifact_manifest am ON am.snapshot_id = s.id
 WHERE s.sandbox_id = $1
@@ -66,9 +66,10 @@ ORDER BY am.file_name
 `
 
 type LatestSnapshotManifestRow struct {
-	SnapshotID uuid.UUID `json:"snapshot_id"`
-	FileName   string    `json:"file_name"`
-	Sha256     string    `json:"sha256"`
+	SnapshotID         uuid.UUID `json:"snapshot_id"`
+	SnapshotGeneration int64     `json:"snapshot_generation"`
+	FileName           string    `json:"file_name"`
+	Sha256             string    `json:"sha256"`
 }
 
 // The sandbox's newest snapshot row with every digest its pause-time
@@ -87,7 +88,12 @@ func (q *Queries) LatestSnapshotManifest(ctx context.Context, sandboxID uuid.UUI
 	items := []LatestSnapshotManifestRow{}
 	for rows.Next() {
 		var i LatestSnapshotManifestRow
-		if err := rows.Scan(&i.SnapshotID, &i.FileName, &i.Sha256); err != nil {
+		if err := rows.Scan(
+			&i.SnapshotID,
+			&i.SnapshotGeneration,
+			&i.FileName,
+			&i.Sha256,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -119,6 +125,41 @@ func (q *Queries) LockSandboxRow(ctx context.Context, id uuid.UUID) (LockSandbox
 	var i LockSandboxRowRow
 	err := row.Scan(&i.ID, &i.Status, &i.UpdatedAt)
 	return i, err
+}
+
+const markSandboxBackupCovered = `-- name: MarkSandboxBackupCovered :exec
+UPDATE backup_generation
+SET covered_snapshot_id = $1,
+    covered_snapshot_generation = $2
+WHERE sandbox_id = $3
+  AND bucket = $4
+  AND generation = $5
+`
+
+type MarkSandboxBackupCoveredParams struct {
+	SnapshotID         pgtype.UUID `json:"snapshot_id"`
+	SnapshotGeneration *int64      `json:"snapshot_generation"`
+	SandboxID          pgtype.UUID `json:"sandbox_id"`
+	Bucket             string      `json:"bucket"`
+	Generation         string      `json:"generation"`
+}
+
+// Persists the report handler's identity verdict: this generation's
+// manifest matched every digest the head snapshot's pause-time manifest
+// recorded, verified under the sandbox row lock. (snapshot_id,
+// snapshot_generation) names the exact pause — the generation counter
+// distinguishes pauses even while the legacy finalize reuses one
+// snapshot row id. Written in the report's transaction, so the coverage
+// row and its identity link commit together.
+func (q *Queries) MarkSandboxBackupCovered(ctx context.Context, arg MarkSandboxBackupCoveredParams) error {
+	_, err := q.db.Exec(ctx, markSandboxBackupCovered,
+		arg.SnapshotID,
+		arg.SnapshotGeneration,
+		arg.SandboxID,
+		arg.Bucket,
+		arg.Generation,
+	)
+	return err
 }
 
 const recordSandboxBackupGeneration = `-- name: RecordSandboxBackupGeneration :execrows

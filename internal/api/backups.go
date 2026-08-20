@@ -253,6 +253,19 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 			}
 		}
 		snapshotID := manifest[0].SnapshotID
+		// The match verdict is only true HERE, under the row lock, against
+		// the head manifest — persist it as the generation's coverage
+		// identity (snapshot row + its per-pause generation counter) so
+		// coverage reads never re-derive it from timestamps or content.
+		if err := q.MarkSandboxBackupCovered(ctx, db.MarkSandboxBackupCoveredParams{
+			SandboxID:          pgtype.UUID{Bytes: sandboxID, Valid: true},
+			Bucket:             req.Bucket,
+			Generation:         req.Generation,
+			SnapshotID:         pgtype.UUID{Bytes: snapshotID, Valid: true},
+			SnapshotGeneration: &manifest[0].SnapshotGeneration,
+		}); err != nil {
+			return err
+		}
 		if err := q.SetSnapshotSizeBytes(ctx, db.SetSnapshotSizeBytesParams{
 			ID: snapshotID, SizeBytes: total,
 		}); err != nil {
