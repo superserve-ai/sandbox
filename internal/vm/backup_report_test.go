@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,5 +130,106 @@ func TestBackupReporterDropsPermanentRejections(t *testing.T) {
 	status = http.StatusUnauthorized
 	if err := r.Deliver(task); err == nil {
 		t.Fatal("Deliver on 401 = nil, want error so a rotated token retries")
+	}
+}
+
+// A finalized manifest's exact object paths travel on the wire, shared
+// bases under their full bases/ path; entries without recorded paths
+// serialize no object key at all, so an old vmd's payload shape is
+// unchanged.
+func TestBackupReporterCarriesObjectPaths(t *testing.T) {
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	r := &BackupReporter{ControlPlaneURL: srv.URL, HostID: "h", Token: "t", Bucket: "b", Log: zerolog.Nop()}
+
+	task := backup.Task{SandboxID: "sb", Generation: "g", FilesFinal: true,
+		Files: []backup.TaskFile{
+			{Name: "rootfs.ext4", SHA256: "aa", Size: 4, Object: "sandboxes/sb/g/rootfs.ext4.pabc123"},
+			{Name: "base-bb.ext4", SHA256: "bb", Size: 8, Shared: true, Object: "bases/bb.pdef456"},
+		}}
+	if err := r.Deliver(task); err != nil {
+		t.Fatal(err)
+	}
+	var gotBody backupReportBody
+	if err := json.Unmarshal(raw, &gotBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(gotBody.Files) != 2 ||
+		gotBody.Files[0].Object != "sandboxes/sb/g/rootfs.ext4.pabc123" ||
+		gotBody.Files[1].Object != "bases/bb.pdef456" {
+		t.Fatalf("files = %+v, want the recorded object paths", gotBody.Files)
+	}
+
+	legacy := backup.Task{SandboxID: "sb", Generation: "g", FilesFinal: true,
+		Files: []backup.TaskFile{{Name: "rootfs.ext4", SHA256: "aa", Size: 4}}}
+	if err := r.Deliver(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"object"`) {
+		t.Fatalf("legacy payload = %s, want no object key on the wire", raw)
+	}
+}
+
+// An old control plane binds report bodies strictly and 400s the object
+// field as unknown; the reporter degrades once to the pre-field payload
+// instead of dropping the coverage row, and still drops when even that
+// is rejected. Only the binder's own unknown-field message triggers the
+// degraded retry: any other 400 (a new control plane rejecting a
+// malformed path) drops on the first attempt, never stripped past the
+// validation it failed.
+func TestBackupReporterStripsObjectPathsForOldControlPlane(t *testing.T) {
+	acceptStripped := true
+	// The strict binder's message as respondErrorMsg actually ships it:
+	// JSON-escaped inside the error envelope.
+	reject := `{"error":{"code":"bad_request","message":"Invalid request body: json: unknown field \"object\""}}`
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		if strings.Contains(string(body), `"object"`) || !acceptStripped {
+			http.Error(w, reject, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	r := &BackupReporter{ControlPlaneURL: srv.URL, HostID: "h", Token: "t", Bucket: "b", Log: zerolog.Nop()}
+	task := backup.Task{SandboxID: "sb", Generation: "g", FilesFinal: true,
+		Files: []backup.TaskFile{{Name: "rootfs.ext4", SHA256: "aa", Size: 4,
+			Object: "sandboxes/sb/g/rootfs.ext4.pabc123"}}}
+
+	if err := r.Deliver(task); err != nil {
+		t.Fatalf("Deliver = %v, want nil after the stripped retry lands", err)
+	}
+	if len(bodies) != 2 || !strings.Contains(bodies[0], `"object"`) || strings.Contains(bodies[1], `"object"`) {
+		t.Fatalf("bodies = %q, want one attempt with objects then one without", bodies)
+	}
+
+	// A rejection that persists without the field is genuinely permanent:
+	// exactly one stripped retry, then the drop that keeps the outbox
+	// moving.
+	bodies = nil
+	acceptStripped = false
+	if err := r.Deliver(task); err != nil {
+		t.Fatalf("Deliver = %v, want nil so the poisoned entry clears", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("attempts = %d, want exactly one stripped retry", len(bodies))
+	}
+
+	// A 400 without the unknown-field marker is a content rejection from
+	// a control plane that understands the field: no stripped retry.
+	bodies = nil
+	reject = `{"error":{"code":"bad_request","message":"object for \"rootfs.ext4\" must name this entry under its own prefix"}}`
+	acceptStripped = true
+	if err := r.Deliver(task); err != nil {
+		t.Fatalf("Deliver = %v, want nil so the poisoned entry clears", err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("attempts = %d, want a single non-stripped attempt", len(bodies))
 	}
 }
