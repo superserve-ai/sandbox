@@ -506,7 +506,11 @@ func SharedBaseName(sha string) string {
 // task.Files alone omits. Shared sizes come from the staged or original
 // source when it still exists and are zero otherwise: delivery can
 // outlive ack-time staging cleanup, and the base object's authoritative
-// size lives in the bucket manifest either way.
+// size lives in the bucket manifest either way. Entries carry no object
+// paths: only the finalized manifest knows the packing fingerprints the
+// upload actually wrote, and re-deriving them from local files that may
+// have been relaid (or removed) since could name objects that were never
+// written. The bucket manifest remains those generations' path authority.
 func (t *Task) ReportedFiles() []TaskFile {
 	out := append([]TaskFile(nil), t.Files...)
 	seen := map[string]bool{}
@@ -543,8 +547,12 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 		VMDVersion: u.VMDVersion,
 	}
 	uploadedBases := map[string]bool{}
+	// objectPaths mirrors gen.Files entry for entry with the exact bucket
+	// object each upload wrote (the value handed to the store), so the
+	// finalized report below names objects without re-deriving them.
+	var objectPaths []string
 	for _, file := range task.Files {
-		mf, n, err := u.uploadFile(ctx, task, file)
+		mf, obj, n, err := u.uploadFile(ctx, task, file)
 		streamed += n
 		if err != nil {
 			if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
@@ -559,6 +567,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 			return false, nil, streamed, err
 		}
 		gen.Files = append(gen.Files, mf)
+		objectPaths = append(objectPaths, obj)
 		// An overlay's holes are backed by its base image, and the bucket
 		// is the only copy that survives host loss: a generation whose
 		// manifest names a base that exists nowhere durable is not
@@ -577,7 +586,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				}
 				return false, nil, streamed, err
 			}
-			bmf, n, err := u.uploadFile(ctx, task, bf)
+			bmf, bobj, n, err := u.uploadFile(ctx, task, bf)
 			streamed += n
 			if err != nil {
 				if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
@@ -589,6 +598,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 			}
 			uploadedBases[file.BaseSHA256] = true
 			gen.Files = append(gen.Files, bmf)
+			objectPaths = append(objectPaths, bobj)
 		}
 	}
 	manifestObject, err := task.objectName(ManifestObject)
@@ -609,13 +619,30 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 	// The finalized reportable set, captured while every size and digest
 	// is authoritative: reconstructing it at delivery time would stat
 	// staged copies that ack-time cleanup may have already removed,
-	// recording zero-size entries in coverage.
+	// recording zero-size entries in coverage. Each entry carries the
+	// exact object path its upload wrote, which is what lets a DB-driven
+	// GC name a generation's objects without listing the bucket.
+	//
+	// ONLY when this attempt published the manifest: a deduped manifest
+	// means an earlier attempt already finalized this generation, and
+	// that manifest is the restore authority for which fingerprinted
+	// objects belong to it. This attempt's paths can disagree (a retry
+	// over physically relaid files packs fresh fingerprints), and hosts
+	// cannot read the manifest back to check, so recording them could
+	// hand GC names the published manifest never blessed. Report no
+	// paths instead; the bucket manifest stays the path authority,
+	// exactly as for pre-upgrade generations.
 	finalized = make([]TaskFile, 0, len(gen.Files))
-	for _, mf := range gen.Files {
+	for i, mf := range gen.Files {
+		object := ""
+		if created {
+			object = objectPaths[i]
+		}
 		finalized = append(finalized, TaskFile{
 			Name: mf.Name, SHA256: mf.SHA256, Size: mf.Size,
 			BasePath: mf.BasePath, BaseSHA256: mf.BaseSHA256,
 			Shared: strings.HasPrefix(mf.Object, "bases/"),
+			Object: object,
 		})
 	}
 	return true, finalized, streamed, nil
@@ -728,21 +755,24 @@ func (u *Uploader) verifiedHere(task *Task, object string) (bool, error) {
 	return u.Journal.WasVerified(u.verificationKey(object), u.clock())
 }
 
-// uploadFile ships one artifact object. shipped counts bytes written
-// into a newly created object (zero on dedupes, skips, and failures that
-// abort the create), so byte accounting reflects storage actually done.
-func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_ ManifestFile, shipped int64, _ error) {
+// uploadFile ships one artifact object. objectPath is the exact bucket
+// object the artifact lives under (the same value handed to the store),
+// returned so completion bookkeeping records the path actually written
+// rather than re-deriving it. shipped counts bytes written into a newly
+// created object (zero on dedupes, skips, and failures that abort the
+// create), so byte accounting reflects storage actually done.
+func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_ ManifestFile, objectPath string, shipped int64, _ error) {
 	if file.Name == ManifestObject {
-		return ManifestFile{}, 0, fmt.Errorf("artifact name %q collides with the manifest object", file.Name)
+		return ManifestFile{}, "", 0, fmt.Errorf("artifact name %q collides with the manifest object", file.Name)
 	}
 	f, err := os.Open(file.Path)
 	if err != nil {
-		return ManifestFile{}, 0, err
+		return ManifestFile{}, "", 0, err
 	}
 	defer f.Close()
 	extents, apparent, err := Extents(f)
 	if err != nil {
-		return ManifestFile{}, 0, fmt.Errorf("extents %s: %w", file.Path, err)
+		return ManifestFile{}, "", 0, fmt.Errorf("extents %s: %w", file.Path, err)
 	}
 	// The object name embeds the packing fingerprint: a retry over a
 	// physically relaid file (same apparent content, different extents)
@@ -760,7 +790,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		objectName = file.Name + ".p" + PackFingerprint(extents, apparent)
 		object, err = task.objectName(objectName)
 		if err != nil {
-			return ManifestFile{}, 0, err
+			return ManifestFile{}, "", 0, err
 		}
 	}
 	if file.Shared {
@@ -800,7 +830,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 				Size:       apparent,
 				PackedSize: PackedSize(extents),
 				Extents:    extents,
-			}, 0, nil
+			}, object, 0, nil
 		}
 	}
 	// Verify the source still matches the digest recorded at pause time
@@ -809,12 +839,12 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 	// above, so an already-verified base is never re-read at all.
 	sum, err := hashApparent(ctx, f, extents, apparent)
 	if err != nil {
-		return ManifestFile{}, 0, fmt.Errorf("verify %s: %w", file.Path, err)
+		return ManifestFile{}, "", 0, fmt.Errorf("verify %s: %w", file.Path, err)
 	}
 	if sum != file.SHA256 {
 		task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
 			Msg("backup source changed since pause; abandoning generation")
-		return ManifestFile{}, 0, errSourceChanged
+		return ManifestFile{}, "", 0, errSourceChanged
 	}
 	// The stream hasher digests the apparent content of what is ACTUALLY
 	// shipped (packed bytes as streamed, zeros for the holes), closing the
@@ -827,7 +857,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 	reader := &limitedReader{r: hasher, limiter: u.Limiter, ctx: ctx}
 	created, err := u.Store.Create(ctx, object, reader)
 	if err != nil {
-		return ManifestFile{}, 0, storeError{err}
+		return ManifestFile{}, "", 0, storeError{err}
 	}
 	if created {
 		// The store finalized a new object from this stream; these bytes
@@ -843,7 +873,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 			task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
 				Bool("fully_streamed", complete).
 				Msg("backup source changed during upload; abandoning generation")
-			return ManifestFile{}, shipped, errSourceChanged
+			return ManifestFile{}, "", shipped, errSourceChanged
 		}
 		// Persist that these exact object bytes were verified BEFORE any
 		// further progress, both in the task (survives nacks) and in the
@@ -872,7 +902,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 			time.Sleep(delay)
 		}
 		if recErr != nil {
-			return ManifestFile{}, shipped, fmt.Errorf("record verification of %s: %w", object, recErr)
+			return ManifestFile{}, "", shipped, fmt.Errorf("record verification of %s: %w", object, recErr)
 		}
 		task.VerifiedObjects = verified
 	} else if file.Shared {
@@ -896,11 +926,11 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 			next.VerifiedObjects = append(append([]string(nil), task.VerifiedObjects...), u.verificationKey(object))
 		}
 		if err := u.Journal.RecordVerification(next, u.verificationKey(object), u.clock()); err != nil {
-			return ManifestFile{}, 0, fmt.Errorf("record shared dedupe of %s: %w", object, err)
+			return ManifestFile{}, "", 0, fmt.Errorf("record shared dedupe of %s: %w", object, err)
 		}
 		task.VerifiedObjects = next.VerifiedObjects
 	} else if ok, err := u.verifiedHere(task, object); err != nil {
-		return ManifestFile{}, 0, err
+		return ManifestFile{}, "", 0, err
 	} else if !ok {
 		// The object already existed (dedupe). Stream consumption proves
 		// nothing here: small objects buffer fully before the
@@ -913,7 +943,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		// identity cannot read them back).
 		task.logOwner(u.Log.Warn().Str("object", object)).
 			Msg("deduped object has no verification history; abandoning generation")
-		return ManifestFile{}, 0, errSourceChanged
+		return ManifestFile{}, "", 0, errSourceChanged
 	}
 	return ManifestFile{
 		Name:       file.Name,
@@ -924,7 +954,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		Size:       apparent,
 		PackedSize: PackedSize(extents),
 		Extents:    extents,
-	}, shipped, nil
+	}, object, shipped, nil
 }
 
 // HashFileApparent digests a file's full apparent content the sparse
