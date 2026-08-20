@@ -123,8 +123,8 @@ func (c client) waitDrained(hostID string) error {
 		if !quietSince.IsZero() && time.Since(quietSince) >= drainQuietWindow {
 			fmt.Printf("%s drained: counts zero continuously for %s.\n", hostID, drainQuietWindow)
 			if h.PausedCount > 0 {
-				fmt.Printf("NOT safe to retire: %d paused sandboxes have their snapshots on this host's local disk.\n",
-					h.PausedCount)
+				fmt.Printf("NOT safe to retire: %d paused sandboxes have their snapshots on this host's local disk (%d without a durable backup — irrecoverable if the disk is lost).\n",
+					h.PausedCount, h.PausedUnbacked)
 			}
 			return nil
 		}
