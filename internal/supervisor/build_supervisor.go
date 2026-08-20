@@ -319,11 +319,27 @@ func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBui
 	hostID := s.cfg.HostID
 	buildVMID := "build-" + row.ID.String()
 
+	// Hold new builds off a host an operator took out of rotation: a build
+	// started on a draining host would be interrupted by its retirement.
+	// The build stays pending and is retried next tick, so it dispatches
+	// as soon as the host is active again (or, later, elsewhere). This
+	// pre-check exists for the log line and to skip cheaply; the claim in
+	// TryDispatchBuild re-asserts host status atomically, so a drain
+	// landing after this read still wins.
+	statusCtx, statusCancel := context.WithTimeout(ctx, 5*time.Second)
+	host, hostErr := s.q.GetHost(statusCtx, hostID)
+	statusCancel()
+	if !buildHostAccepting(host.Status, hostErr) {
+		rowLog.Warn().Str("host_id", hostID).Str("host_status", host.Status).
+			Msg("build host not active; leaving build pending")
+		return nil
+	}
+
 	claimCtx, claimCancel := context.WithTimeout(ctx, 5*time.Second)
 	affected, err := s.q.TryDispatchBuild(claimCtx, db.TryDispatchBuildParams{
-		ID:             row.ID,
-		VmdHostID:      &hostID,
-		VmdBuildVmID:   &buildVMID,
+		ID:           row.ID,
+		VmdHostID:    &hostID,
+		VmdBuildVmID: &buildVMID,
 	})
 	claimCancel()
 	if err != nil {
@@ -773,4 +789,16 @@ func reconcileDecision(
 		out = append(out, e)
 	}
 	return out
+}
+
+// buildHostAccepting reports whether build dispatch may proceed for the
+// host. Only a positively known non-active status holds builds: a missing
+// row (bootstrap mode, host table unpopulated) or a transient read error
+// must not stall the build pipeline — dispatch failure handling covers a
+// genuinely unreachable host.
+func buildHostAccepting(status string, err error) bool {
+	if err != nil {
+		return true
+	}
+	return status == "active"
 }

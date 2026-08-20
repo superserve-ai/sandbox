@@ -63,9 +63,20 @@ RETURNING *;
 -- check and insert serialize across API instances, not just the in-process lock.
 SELECT pg_advisory_xact_lock(hashtext($1)::bigint);
 
--- name: AddSandboxSecret :exec
+-- name: AddSandboxSecret :execrows
+-- FOR UPDATE on the sandbox row, taken before the insert because the insert
+-- depends on it, serializes this against every destroy path. A destroy that
+-- already committed leaves `live` empty, so nothing is bound and 0 rows come
+-- back — the caller must not mint a JWT for a sandbox that no longer exists. A
+-- destroy that has not started blocks until this commits, by which point the
+-- had_secret_bindings trigger has fired, so it still writes the revocation.
+WITH live AS (
+  SELECT s.id AS sandbox_id FROM sandbox s
+  WHERE s.id = sqlc.arg(sandbox_id) AND s.destroyed_at IS NULL
+  FOR UPDATE
+)
 INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-VALUES ($1, $2, $3, $4);
+SELECT live.sandbox_id, sqlc.arg(secret_id), sqlc.arg(env_key), sqlc.narg(proxy_token) FROM live;
 
 -- name: ClaimSandboxSecretProxyToken :one
 -- Persist a proxy token minted on the fly for a legacy (NULL-token) binding.

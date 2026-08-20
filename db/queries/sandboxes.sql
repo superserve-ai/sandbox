@@ -10,8 +10,8 @@
 -- can observe a new sandbox through the rolling-deploy legacy fallback, and
 -- quota admission remains statement-sized.
 WITH ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, had_secret_bindings)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, false)
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -33,8 +33,8 @@ WITH tpl AS (
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
+  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false FROM tpl
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -51,8 +51,8 @@ JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 -- concurrent quota checks until it commits, and a multi-statement transaction
 -- would stretch that window across client round trips.
 WITH ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-  VALUES (@id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, @template_id, @snapshot_path, @mem_path, @base_path, @delta_path, @auto_delete_seconds)
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, had_secret_bindings)
+  VALUES (@id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, @template_id, @snapshot_path, @mem_path, @base_path, @delta_path, @auto_delete_seconds, true)
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -78,8 +78,8 @@ WITH tpl AS (
     AND (t.team_id = @team_id OR t.team_id = @system_team_id)
   FOR KEY SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-  SELECT @id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, tpl_id, @snapshot_path, @mem_path, @base_path, @delta_path, disk_mib, @auto_delete_seconds FROM tpl
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
+  SELECT @id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, tpl_id, @snapshot_path, @mem_path, @base_path, @delta_path, disk_mib, @auto_delete_seconds, true FROM tpl
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -90,7 +90,7 @@ WITH tpl AS (
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
@@ -119,28 +119,38 @@ WHERE base_path IS NOT NULL AND destroyed_at IS NULL;
 -- name/status sorts stay on the flexible query below. Filters and pagination
 -- are identical to the flexible query, including the NULL @row_limit "return
 -- everything" contract.
+--
+-- All three carry the effective preview access, so the list decorates its page
+-- from one round trip. The join is 1:1 on sandbox_preview_policy's primary key,
+-- so it cannot multiply rows and leaves the LIMIT pushdown intact.
 
 -- name: ListSandboxesByTeamCreatedDesc :many
-SELECT * FROM sandbox
-WHERE team_id = @team_id
-  AND destroyed_at IS NULL
-  AND metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+SELECT sqlc.embed(s),
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = @team_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
   AND (sqlc.narg('name_search')::text IS NULL
-       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%')
-ORDER BY created_at DESC
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+ORDER BY s.created_at DESC
 LIMIT sqlc.narg('row_limit')::bigint
 OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 
 -- name: ListSandboxesByTeamCreatedAsc :many
-SELECT * FROM sandbox
-WHERE team_id = @team_id
-  AND destroyed_at IS NULL
-  AND metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+SELECT sqlc.embed(s),
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = @team_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
   AND (sqlc.narg('name_search')::text IS NULL
-       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%')
-ORDER BY created_at ASC
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+ORDER BY s.created_at ASC
 LIMIT sqlc.narg('row_limit')::bigint
 OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 
@@ -158,20 +168,23 @@ OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 -- no-op), with created_at DESC as the stable tiebreaker and default. A NULL
 -- @row_limit returns all rows, preserving the pre-pagination "return
 -- everything" default so unpaginated SDK/MCP callers are unaffected.
-SELECT * FROM sandbox
-WHERE team_id = @team_id
-  AND destroyed_at IS NULL
-  AND metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+SELECT sqlc.embed(s),
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = @team_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
   AND (sqlc.narg('name_search')::text IS NULL
-       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
 ORDER BY
-  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'asc'  THEN name END ASC,
-  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'desc' THEN name END DESC,
-  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'asc'  THEN status::text END ASC,
-  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'desc' THEN status::text END DESC,
-  CASE WHEN @sort_by::text = 'created_at' AND @sort_dir::text = 'asc' THEN created_at END ASC,
-  created_at DESC
+  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'asc'  THEN s.name END ASC,
+  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'desc' THEN s.name END DESC,
+  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'asc'  THEN s.status::text END ASC,
+  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'desc' THEN s.status::text END DESC,
+  CASE WHEN @sort_by::text = 'created_at' AND @sort_dir::text = 'asc' THEN s.created_at END ASC,
+  s.created_at DESC
 LIMIT sqlc.narg('row_limit')::bigint
 OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 
@@ -263,11 +276,15 @@ WITH destroyed AS (
       OR (sandbox.status IN ('starting', 'resuming', 'pausing')
           AND sandbox.updated_at < sqlc.arg(stale_transitional_before))
     )
-  RETURNING id
+  RETURNING id, had_secret_bindings
 ),
 revoked AS (
+  -- Only sandboxes that ever had a binding: the proxy consults this set only
+  -- after a secrets JWT authenticates, and a JWT is minted only for those.
+  -- IS NOT FALSE, so rows predating the column (NULL, history unknown) still
+  -- revoke.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
-  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed
+  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed WHERE had_secret_bindings IS NOT FALSE
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -635,15 +652,6 @@ FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL;
 
--- name: ListSandboxPreviewPoliciesByTeam :many
-SELECT
-  s.id AS sandbox_id,
-  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
-  COALESCE(p.revision, 0)::bigint AS revision
-FROM sandbox s
-LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
-WHERE s.team_id = $1 AND s.destroyed_at IS NULL;
-
 -- name: LockSandboxForPreviewMutation :one
 -- The sandbox row exists for both legacy (no policy row) and strict sandboxes,
 -- so it is the stable per-sandbox serialization point across the transition.
@@ -822,6 +830,43 @@ SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
 
+-- name: ClaimBillingIneligibleSandboxes :many
+-- Atomically claims active sandboxes for a team whose billing eligibility was
+-- lost. The bounded batch and SKIP LOCKED make this safe to retry and keep
+-- webhook reconciliation off the request's critical path.
+WITH candidates AS (
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
+  FROM sandbox s
+  WHERE s.team_id = $1
+    AND s.destroyed_at IS NULL
+    AND s.status = 'active'
+    AND NOT team_sandbox_billing_eligible(s.team_id)
+  ORDER BY s.created_at ASC
+  LIMIT $2
+  FOR UPDATE OF s SKIP LOCKED
+), paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now()
+  FROM candidates
+  WHERE sandbox.id = candidates.id
+  RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config
+), closed_intervals AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+), closed_billing_compute AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
+FROM paused p
+LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
+
 -- name: UpdateSandboxAutoDelete :execrows
 -- Set or clear (NULL) the auto-delete window. The deadline counts continuous
 -- paused time since the setting was applied: on an already-paused sandbox it
@@ -879,11 +924,12 @@ destroyed AS (
   FROM due
   WHERE sandbox.id = due.id
   RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.host_id,
-            sandbox.base_path, sandbox.template_id
+            sandbox.base_path, sandbox.template_id, sandbox.had_secret_bindings
 ),
 revoked AS (
+  -- Gated as in DestroySandbox; see the note there.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
-  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed
+  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed WHERE had_secret_bindings IS NOT FALSE
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (

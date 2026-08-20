@@ -282,6 +282,18 @@ func (m *Manager) startSampler(ctx context.Context, name string, every time.Dura
 // the per-launch warns carry the vm_id detail but make a poor time series.
 // One /proc/mounts read per tick.
 func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duration) {
+	// One immediate sample so the startup window has a mount count (a
+	// fleet-size correlate for the startup phase timings); async so the scan
+	// stays off the readiness path. Gauge-only, NOT the full tick body:
+	// revalidation during the in-flight boot-time launcher build would burn
+	// the rebuild cooldown on a single-flight no-op.
+	go func() {
+		defer sentrylog.Recover("mount-count first sample")
+		total, nsfs := hostMountCounts()
+		m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
+			Bool("launcher_ready", m.launcherReady.Load()).
+			Msg("host mount table")
+	}()
 	m.startSampler(ctx, "mount-count sampler", every, func() {
 		total, nsfs := hostMountCounts()
 		m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
@@ -301,12 +313,19 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 // netns_orphaned (namespaces with no owning slot) is the leak signal: sustained
 // growth means teardown is leaking. One /run/netns readdir per tick.
 func (m *Manager) StartNetnsLeakSampler(ctx context.Context, every time.Duration) {
-	m.startSampler(ctx, "netns-leak sampler", every, func() {
+	sample := func() {
 		netnsTotal, ownedSlots, orphaned := m.netMgr.NetnsStats()
 		m.log.Info().Int("netns_total", netnsTotal).Int("owned_slots", ownedSlots).
 			Int("netns_orphaned", orphaned).
 			Msg("netns leak gauge")
-	})
+	}
+	// Immediate first sample (same rationale as StartMountCountSampler); async
+	// because NetnsStats readdirs /run/netns under the allocator lock.
+	go func() {
+		defer sentrylog.Recover("netns-leak first sample")
+		sample()
+	}()
+	m.startSampler(ctx, "netns-leak sampler", every, sample)
 }
 
 // revalidateLauncher re-syncs launcherReady with the live pin each tick: drop to
