@@ -358,6 +358,16 @@ func (j *Journal) Enqueue(task Task) error {
 					cur.Priority = task.Priority
 					changed = true
 				}
+				// Pause-token refresh, newest wins: an unchanged re-pause
+				// converges on the same content generation but is a NEW
+				// logical pause — the control plane stored the new token on
+				// the snapshot, and a report still carrying the old one
+				// would be refused as another pause's. A tokenless enqueue
+				// (backfill mint) never erases a real token.
+				if task.PauseToken != "" && task.PauseToken != cur.PauseToken {
+					cur.PauseToken = task.PauseToken
+					changed = true
+				}
 				if !changed {
 					return nil
 				}
@@ -800,6 +810,14 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, erro
 			nt := task
 			nt.VerifiedBucket = completedScope
 			nt.VerifiedAt = now.UTC()
+			// Adopt the ROW's pause token over the claim-time copy: an
+			// unchanged re-pause during this upload refreshed the queued
+			// row's token (Enqueue), and the report must carry the newest
+			// or the control plane refuses it as another pause's.
+			var rowTask Task
+			if json.Unmarshal(existing, &rowTask) == nil && rowTask.PauseToken != "" {
+				nt.PauseToken = rowTask.PauseToken
+			}
 			val, err := json.Marshal(nt)
 			if err != nil {
 				return err

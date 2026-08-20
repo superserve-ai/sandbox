@@ -136,6 +136,14 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 		// copy: reuse the existing marker (its staged files, base pin,
 		// and pause-time base identity) when one covers this snapshot.
 		if prev, ok := m.reusablePendingBackup(vmID, snapshotPath); ok {
+			// Same artifacts, NEW logical pause: adopt the new pause's
+			// token before the worker runs, or the eventual report would
+			// carry the old pause's identity and be refused against the
+			// snapshot row the control plane just re-tokened.
+			if pauseToken != "" && prev.PauseToken != pauseToken {
+				prev.PauseToken = pauseToken
+				m.healPendingBackup(prev, log)
+			}
 			go m.rehashPendingBackup(ctx, prev, log)
 			return manifest
 		}
