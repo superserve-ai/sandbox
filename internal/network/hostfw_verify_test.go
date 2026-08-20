@@ -1026,6 +1026,41 @@ func TestRepairRefusesToStarveObserverAboveForwardDrops(t *testing.T) {
 	}
 }
 
+func TestRepairRefusesToDemoteRejectBelowForwardDrops(t *testing.T) {
+	// A foreign REJECT above the drops answers traffic a vmd DROP would
+	// silence: demoting it changes client-visible behavior, so repair
+	// refuses. A foreign DROP is silent either way and may move (covered by
+	// TestRepairPreservesStricterForeignRulesAbove).
+	spec := testSpec(true)
+	reject := []string{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "REJECT"}
+
+	rules, chains := specKernel(spec, nil)
+	fw := rules["filter/FORWARD"]
+	fw[3], fw[4] = fw[4], fw[3] // misorder clamp vs accept to force repair
+	rules["filter/FORWARD"] = append([][]string{reject}, fw...)
+	d, _ := parseIPTablesSave(renderDump(rules, chains))
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err == nil {
+		t.Fatal("repair demoted a foreign REJECT below the FORWARD drops")
+	}
+
+	// Below the terminal drops it already answers nothing ours silences:
+	// repair proceeds.
+	rules, chains = specKernel(spec, nil)
+	fw = rules["filter/FORWARD"]
+	fw[3], fw[4] = fw[4], fw[3]
+	rules["filter/FORWARD"] = append(fw[:2:2], append([][]string{reject}, fw[2:]...)...)
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ = parseIPTablesSave(renderDump(k.rules, k.chains))
+	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair refused with REJECT below the drops: %v", err)
+	}
+	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+		t.Fatalf("post-repair verify failed: %s %s", class, detail)
+	}
+}
+
 func TestRepairRefusesToPromoteTerminalNATBelowMasquerade(t *testing.T) {
 	spec := testSpec(true)
 	masq := marked("-s", "10.11.0.0/16", "-o", "eth0", "-j", "MASQUERADE")

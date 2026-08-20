@@ -196,8 +196,10 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 // head inserts, a strict rule above a PREROUTING redirect would be shadowed
 // by the terminal redirect, and a terminal-capable foreign rule below a vmd
 // nat plumbing rule would be promoted into the traffic ours handled first by
-// the tail re-append. A strict rule in FORWARD keeps its verdict wherever it
-// lands, so its promotion or demotion is acceptable by design.
+// the tail re-append. Only a foreign DROP in FORWARD keeps its exact
+// observable behavior wherever it lands — a REJECT demoted below an
+// overlapping vmd DROP would stop answering, turning configured rejections
+// into silent drops, so it refuses like the rest.
 // OWNER ONLY.
 func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (map[string][][]string, error) {
 	predicted := map[string][][]string{}
@@ -237,7 +239,9 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 		// below TERMINAL enforcement — PREROUTING redirects or FORWARD drops.
 		// An observer there would be starved of the traffic it currently
 		// sees; a strict rule above a PREROUTING redirect would be shadowed
-		// into a no-op (in FORWARD it keeps its verdict wherever it lands).
+		// into a no-op; a REJECT above a FORWARD drop would fall silent for
+		// overlapping traffic. Only a foreign DROP below vmd's FORWARD drops
+		// behaves identically (silent either way).
 		// Position-relative insertion would reintroduce the races this design
 		// removed, so refuse and leave the call to the operator.
 		if spec.headGuarded[key] {
@@ -262,7 +266,8 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 				}
 				if !isOurs && !staleVMDRule(key, g, want) && !unmarkedTwin(g, want) && !ruleCannotMatchSandboxIngress(g) {
 					switch disp := foreignDisposition(g); {
-					case disp == "observer", disp == "strict" && key == "nat/PREROUTING":
+					case disp == "observer",
+						disp == "strict" && (key == "nat/PREROUTING" || jumpTarget(g) == "REJECT"):
 						return nil, fmt.Errorf("foreign %s rule above a vmd terminal rule in %s (%s) — head-inserting ours would starve it of matching traffic; refusing", disp, key, strings.Join(g, " "))
 					}
 				}
