@@ -158,50 +158,76 @@ jobs:
       - name: Every imported package must trigger its deploy
         run: |
           fail=0
-          # Filter paths, minus the /** suffix. Coverage is a prefix test: a
-          # filter covers a path when it is that path or one of its parents, so
-          # proto/** covers proto/boxdpb.
-          covered() {
+          # A source directory is covered only by a recursive filter on it or an
+          # ancestor. GitHub's non-recursive form matches a file at exactly that
+          # path, so 'internal/db' does NOT start a deploy for internal/db/db.go
+          # — treating the two forms alike would pass a workflow that never fires.
+          covered_dir() {
             for t in $2; do
-              case "$1" in "$t"|"$t"/*) return 0;; esac
+              case "$t" in */'**') base=${t%/'**'};; *) continue;; esac
+              case "$1" in "$base"|"$base"/*) return 0;; esac
             done
             return 1
           }
+          # A single file is covered by naming it exactly, or by a recursive
+          # filter on a directory above it.
+          covered_file() {
+            for t in $2; do
+              case "$t" in
+                */'**') base=${t%/'**'}; case "$1" in "$base"/*) return 0;; esac ;;
+                *) [ "$1" = "$t" ] && return 0 ;;
+              esac
+            done
+            return 1
+          }
+          report() {
+            echo "::error file=$1::$1 ships a binary built from $2 but does not list it — changes to $2 would merge without deploying"
+            fail=1
+          }
           check() {
-            workflow="$1"; shift
+            workflow="$1"; files="$2"; shift 2
+            # Globs are kept, not stripped: the two filter forms mean different
+            # things and covered_dir/covered_file rely on telling them apart.
             triggers=$(awk '/^on:/,/^jobs:/' "$workflow" \
-              | grep -oE "'[a-z][a-z0-9._/-]*(/\*\*)?'" \
-              | tr -d "'" | sed 's|/\*\*$||' | sort -u || true)
-            # Module-local deps (not just internal/ — the proxy reaches
-            # proto/boxdpb), the command dirs themselves, and the module files:
-            # a dependency bump touching only go.mod must redeploy too.
+              | grep -oE "'[A-Za-z][A-Za-z0-9._/-]*(/\*\*)?'" | tr -d "'" | sort -u || true)
+            # Module-local deps — not just internal/, since the proxy reaches
+            # proto/boxdpb and stale generated protocol code is the same hazard.
             deps=$(go list -deps "$@" \
               | sed -n 's|^github.com/superserve-ai/sandbox/||p' | sort -u)
-            for path in $deps go.mod go.sum; do
-              if ! covered "$path" "$triggers"; then
-                echo "::error file=$workflow::$workflow ships a binary built from $path but does not list it — changes to $path would merge without deploying"
-                fail=1
-              fi
+            for path in $deps; do
+              covered_dir "$path" "$triggers" || report "$workflow" "$path"
+            done
+            # Module files, plus any Dockerfile this workflow builds through: a
+            # dependency bump or an image change must redeploy too.
+            for path in go.mod go.sum $files; do
+              covered_file "$path" "$triggers" || report "$workflow" "$path"
             done
           }
+          # Expand the workflow list while globbing is still on, then turn it off
+          # for the rest: trigger patterns contain ** and must be compared as
+          # literals, not expanded against the working tree.
+          workflows=$(echo .github/workflows/deploy-*.yml)
+          set -f
           # Binaries come from each workflow's build commands (or the Dockerfile
           # it builds), never from its path filters: deriving them from the very
           # list being validated would let an omitted cmd/ entry hide itself.
           # `|| true` throughout: the step runs under `-eo pipefail`, so an
           # unmatched grep would kill the job instead of reaching the checks.
-          for wf in .github/workflows/deploy-*.yml; do
+          for wf in $workflows; do
+            files=""
             bins=$(grep -oE 'go build[^|;]*\./cmd/[a-z-]+' "$wf" \
               | grep -oE '\./cmd/[a-z-]+' | sort -u || true)
             if [ -z "$bins" ] && grep -q 'docker build' "$wf"; then
               bins=$(grep -oE 'go build[^|;]*\./cmd/[a-z-]+' Dockerfile \
                 | grep -oE '\./cmd/[a-z-]+' | sort -u || true)
+              files="Dockerfile"
             fi
             if [ -z "$bins" ]; then
               echo "$(basename "$wf"): builds no Go binary, skipping"
               continue
             fi
             echo "$(basename "$wf"): $(echo $bins)"
-            check "$wf" $bins
+            check "$wf" "$files" $bins
           done
           [ $fail -eq 0 ] && echo "deploy triggers cover every imported package"
           exit $fail
