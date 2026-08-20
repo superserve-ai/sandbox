@@ -914,6 +914,25 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		task.logOwner(u.Log.Warn().Str("object", object)).
 			Msg("deduped object has no verification history; abandoning generation")
 		return ManifestFile{}, 0, errSourceChanged
+	} else {
+		// Verified within retention, but the record's clock has run since
+		// the object's ORIGINAL write and is never touched again on a
+		// plain read. Without a refresh, an object that dedupes
+		// successfully on every single re-pause still runs out the
+		// original write's window and abandons once verifiedRetention
+		// passes, forever after (a content-addressed object that already
+		// exists can never be freshly re-uploaded to reset the clock).
+		// Resetting it here only ever extends trust that is CURRENTLY
+		// valid; an expired record is never resurrected, that stays the
+		// abandon path above.
+		next := *task
+		if !next.HasVerified(u.verificationKey(object)) {
+			next.VerifiedObjects = append(append([]string(nil), task.VerifiedObjects...), u.verificationKey(object))
+		}
+		if err := u.Journal.RecordVerification(next, u.verificationKey(object), u.clock()); err != nil {
+			return ManifestFile{}, 0, fmt.Errorf("refresh verification of %s: %w", object, err)
+		}
+		task.VerifiedObjects = next.VerifiedObjects
 	}
 	return ManifestFile{
 		Name:       file.Name,
