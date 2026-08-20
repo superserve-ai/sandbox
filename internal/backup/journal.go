@@ -966,6 +966,14 @@ func mergeRow(existing []byte, task *Task) {
 	if cur.Priority < task.Priority {
 		task.Priority = cur.Priority
 	}
+	// A pause-token refresh that landed while this attempt ran (an
+	// unchanged re-pause re-enqueueing the same generation) must survive
+	// too: the write-back would otherwise revert the row to the claim-time
+	// token and the retry's report would name a pause the control plane
+	// no longer recognizes.
+	if cur.PauseToken != "" {
+		task.PauseToken = cur.PauseToken
+	}
 	seen := make(map[string]bool, len(task.VerifiedObjects))
 	for _, o := range task.VerifiedObjects {
 		seen[o] = true
@@ -1276,9 +1284,23 @@ func (j *Journal) ClearNotification(task Task) error {
 		// cleared entry's own shape means a still-undelivered legacy
 		// entry survives a scoped clear for the same owner/generation.
 		b := tx.Bucket(outboxBucket)
+		key := completionKey(task.VerifiedBucket, task)
 		if task.VerifiedBucket == "" {
-			return b.Delete(task.indexKey())
+			key = task.indexKey()
 		}
-		return b.Delete(completionKey(task.VerifiedBucket, task))
+		// Clear only the notification that was actually delivered: an
+		// unchanged re-pause acking the same owner/bucket/generation
+		// overwrites this key with a NEWER pause token, and deleting by
+		// key alone would discard that undelivered signal — the stale
+		// token just delivered cannot cover the new pause, so the host
+		// would read unbacked forever. A mismatched entry stays for its
+		// own delivery pass.
+		if existing := b.Get(key); existing != nil {
+			var stored Task
+			if json.Unmarshal(existing, &stored) == nil && stored.PauseToken != task.PauseToken {
+				return nil
+			}
+		}
+		return b.Delete(key)
 	})
 }
