@@ -66,24 +66,27 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	// covers individual commands, and iptables-nft ignores it entirely.
 	// Third-party rules are safe regardless of any race — repair never
 	// names, moves, or flushes a foreign rule (see repairSharedOrdering).
-	unlock, err := lockHostFirewall(ctx)
+	unlock, waited, err := lockHostFirewall(ctx)
 	if err != nil {
 		return fmt.Errorf("host firewall lock: %w", err)
 	}
 	defer unlock()
 
-	// Another cooperating writer may have converged the ruleset while this
-	// process waited on the lock — re-verify before paying for the installer
-	// and its mutations.
-	if out, err := dumpIPTables(ctx); err == nil {
-		if d, perr := parseIPTablesSave(out); perr == nil {
-			if ok, _, _ := verifyHostFirewall(d, spec); ok {
-				// Async: the write must not extend the lock hold or this
-				// startup — every queued waiter is behind it.
-				go func() {
-					log.Info().Msg("host firewall converged by a concurrent writer while waiting — install skipped")
-				}()
-				return nil
+	// A writer this process actually waited behind may have converged the
+	// ruleset — re-verify before paying for the installer and its mutations.
+	// Skipped on an uncontended acquire: nothing ran in between, and the
+	// extra dump would tax every fresh-host and genuine-drift startup.
+	if waited {
+		if out, err := dumpIPTables(ctx); err == nil {
+			if d, perr := parseIPTablesSave(out); perr == nil {
+				if ok, _, _ := verifyHostFirewall(d, spec); ok {
+					// Async: the write must not extend the lock hold or this
+					// startup — every queued waiter is behind it.
+					go func() {
+						log.Info().Msg("host firewall converged by a concurrent writer while waiting — install skipped")
+					}()
+					return nil
+				}
 			}
 		}
 	}
@@ -266,11 +269,12 @@ var hostFirewallLockPath = "/run/sandbox-hostfw.lock"
 const hostFirewallLockTimeout = 2 * time.Minute
 
 // lockHostFirewall acquires the exclusive flock, polling non-blocking so the
-// wait honors ctx and the timeout.
-func lockHostFirewall(ctx context.Context) (func(), error) {
+// wait honors ctx and the timeout. waited reports whether another writer held
+// the lock first — only then is a post-lock re-verify worth a dump.
+func lockHostFirewall(ctx context.Context) (unlock func(), waited bool, err error) {
 	f, err := os.OpenFile(hostFirewallLockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	deadline := time.Now().Add(hostFirewallLockTimeout)
 	for {
@@ -279,20 +283,21 @@ func lockHostFirewall(ctx context.Context) (func(), error) {
 			return func() {
 				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 				f.Close()
-			}, nil
+			}, waited, nil
 		}
 		if err != syscall.EWOULDBLOCK {
 			f.Close()
-			return nil, err
+			return nil, false, err
 		}
+		waited = true
 		if time.Now().After(deadline) {
 			f.Close()
-			return nil, fmt.Errorf("timed out after %v waiting for %s (held by another firewall writer?)", hostFirewallLockTimeout, hostFirewallLockPath)
+			return nil, false, fmt.Errorf("timed out after %v waiting for %s (held by another firewall writer?)", hostFirewallLockTimeout, hostFirewallLockPath)
 		}
 		select {
 		case <-ctx.Done():
 			f.Close()
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		case <-time.After(100 * time.Millisecond):
 		}
 	}

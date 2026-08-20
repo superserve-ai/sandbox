@@ -662,17 +662,23 @@ func TestLockHostFirewallSerializes(t *testing.T) {
 	hostFirewallLockPath = t.TempDir() + "/hostfw.lock"
 	defer func() { hostFirewallLockPath = orig }()
 
-	unlock, err := lockHostFirewall(context.Background())
+	unlock, waited, err := lockHostFirewall(context.Background())
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
+	if waited {
+		t.Fatal("uncontended acquire reported waited")
+	}
 	acquired := make(chan struct{})
 	go func() {
-		u2, err := lockHostFirewall(context.Background())
+		u2, waited2, err := lockHostFirewall(context.Background())
 		if err != nil {
 			t.Errorf("second lock: %v", err)
 			close(acquired)
 			return
+		}
+		if !waited2 {
+			t.Errorf("contended acquire did not report waited")
 		}
 		close(acquired)
 		u2()
@@ -695,7 +701,7 @@ func TestLockHostFirewallHonorsContext(t *testing.T) {
 	hostFirewallLockPath = t.TempDir() + "/hostfw.lock"
 	defer func() { hostFirewallLockPath = orig }()
 
-	unlock, err := lockHostFirewall(context.Background())
+	unlock, _, err := lockHostFirewall(context.Background())
 	if err != nil {
 		t.Fatalf("lock: %v", err)
 	}
@@ -703,7 +709,7 @@ func TestLockHostFirewallHonorsContext(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	if _, err := lockHostFirewall(ctx); err == nil {
+	if _, _, err := lockHostFirewall(ctx); err == nil {
 		t.Fatal("contended lock with cancelled context must fail, not block")
 	}
 }
@@ -1072,8 +1078,20 @@ func TestPostLockReverifySkipsInstall(t *testing.T) {
 	}
 	defer func() { installHostFirewallFn = origInstall }()
 
-	iface, hp, tp, dp, sd, sp, bp := testSpecParams()
-	if err := ensureHostFirewall(context.Background(), iface, hp, tp, dp, sd, sp, bp, true, zerolog.Nop()); err != nil {
+	// Contend the lock so ensure actually waits — the re-verify is reserved
+	// for waiters; an uncontended acquire goes straight to the installer.
+	hold, _, err := lockHostFirewall(context.Background())
+	if err != nil {
+		t.Fatalf("hold lock: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		iface, hp, tp, dp, sd, sp, bp := testSpecParams()
+		done <- ensureHostFirewall(context.Background(), iface, hp, tp, dp, sd, sp, bp, true, zerolog.Nop())
+	}()
+	time.Sleep(300 * time.Millisecond) // let ensure hit the contended lock
+	hold()
+	if err := <-done; err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 }
