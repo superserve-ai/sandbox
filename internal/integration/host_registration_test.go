@@ -533,8 +533,17 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 		t.Fatalf("create sandbox: %d %s", cw.Code, cw.Body.String())
 	}
 	sandboxID := mustJSON(t, cw)["id"].(string)
+	// Pause with a head snapshot row, as FinalizePause leaves it: the
+	// coverage probe compares generations against snapshot.created_at.
 	if _, err := testPool.Exec(ctx,
-		`UPDATE sandbox SET status = 'paused', host_id = $2 WHERE id = $1`,
+		`WITH snap AS (
+		   INSERT INTO snapshot (sandbox_id, team_id, path, trigger)
+		   SELECT id, team_id, '/snap/rootfs', 'pause' FROM sandbox WHERE id = $1
+		   RETURNING id
+		 )
+		 UPDATE sandbox SET status = 'paused', host_id = $2,
+		        snapshot_id = (SELECT id FROM snap)
+		 WHERE id = $1`,
 		sandboxID, hostID); err != nil {
 		t.Fatalf("pin paused sandbox: %v", err)
 	}
@@ -580,5 +589,18 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 	}
 	if paused, unbacked := counts(); paused != 1 || unbacked != 0 {
 		t.Fatalf("after backup: paused=%d unbacked=%d, want 1/0", paused, unbacked)
+	}
+
+	// Resume + re-pause: the head snapshot's created_at moves past every
+	// recorded generation, so the old backup no longer covers the current
+	// pause and the sandbox re-enters the unbacked class.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE snapshot SET created_at = now() + interval '1 second'
+		 WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)`,
+		sandboxID); err != nil {
+		t.Fatalf("advance snapshot to a new pause: %v", err)
+	}
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("after re-pause: paused=%d unbacked=%d, want 1/1 (stale generation must not count as coverage)", paused, unbacked)
 	}
 }

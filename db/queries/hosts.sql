@@ -223,17 +223,29 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        COALESCE((SELECT COUNT(*) FROM template_build tb
                  WHERE tb.vmd_host_id = h.id
                    AND tb.status IN ('building', 'snapshotting')), 0)::int AS building_count,
-       -- Paused sandboxes with NO durable backup generation: the ones whose
-       -- only copy lives on this host's local disk. Retiring the machine
-       -- destroys them outright; even paused-with-coverage stays pinned
-       -- here until cross-host restore exists, but unbacked is the
-       -- irrecoverable class an operator must never retire past.
+       -- Paused sandboxes whose CURRENT pause has no durable backup: the
+       -- ones whose only up-to-date copy lives on this host's local disk.
+       -- Retiring the machine destroys them outright; even
+       -- paused-with-coverage stays pinned here until cross-host restore
+       -- exists, but unbacked is the irrecoverable class an operator must
+       -- never retire past.
+       --
+       -- "Current pause" means a generation completed at/after the head
+       -- snapshot's created_at (which refreshes on every pause finalize) —
+       -- a generation recorded for some EARLIER pause does not cover data
+       -- written since. The comparison errs conservative: an upload that
+       -- completed just before the finalize landed reads as unbacked until
+       -- the next report, never the reverse. A paused sandbox with no
+       -- snapshot row counts as unbacked for the same reason.
        COALESCE((SELECT COUNT(*) FROM sandbox s2
                  WHERE s2.host_id = h.id
                    AND s2.status = 'paused'
                    AND s2.destroyed_at IS NULL
-                   AND NOT EXISTS (SELECT 1 FROM backup_generation bg
-                                   WHERE bg.sandbox_id = s2.id)), 0)::int AS paused_unbacked_count
+                   AND NOT EXISTS (SELECT 1
+                                   FROM snapshot snap
+                                   JOIN backup_generation bg ON bg.sandbox_id = s2.id
+                                   WHERE snap.id = s2.snapshot_id
+                                     AND bg.completed_at >= snap.created_at)), 0)::int AS paused_unbacked_count
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
 -- The optional id filter exists for drain polling: `hostctl drain --wait`
