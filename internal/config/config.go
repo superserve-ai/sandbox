@@ -21,13 +21,14 @@ type Config struct {
 	VMDAddress  string // VMD_GRPC_ADDRESS, default "localhost:50051"
 	DatabaseURL string // DATABASE_URL, required
 
-	StripeSecretKey        string   // STRIPE_SECRET_KEY
-	StripeWebhookSecret    string   // STRIPE_WEBHOOK_SECRET
-	StripeAPIBaseURL       string   // STRIPE_API_BASE_URL, default "https://api.stripe.com"
-	StripeAPIVersion       string   // STRIPE_API_VERSION, required for Stripe requests
-	StripeCheckoutPriceIDs []string // STRIPE_CHECKOUT_PRICE_IDS, required for checkout sessions
-	BillingResources       []BillingResourceConfig
-	AppAllowedOrigins      []string // APP_ALLOWED_ORIGINS, comma-separated browser origins allowed in billing redirects
+	StripeSecretKey               string   // STRIPE_SECRET_KEY
+	StripeWebhookSecret           string   // STRIPE_WEBHOOK_SECRET (snapshot lifecycle destination)
+	StripeMeterErrorWebhookSecret string   // STRIPE_METER_ERROR_WEBHOOK_SECRET (thin meter-error destination)
+	StripeAPIBaseURL              string   // STRIPE_API_BASE_URL, default "https://api.stripe.com"
+	StripeAPIVersion              string   // STRIPE_API_VERSION, required for Stripe requests
+	StripeCheckoutPriceIDs        []string // STRIPE_CHECKOUT_PRICE_IDS, required for checkout sessions
+	BillingResources              []BillingResourceConfig
+	AppAllowedOrigins             []string // APP_ALLOWED_ORIGINS, comma-separated browser origins allowed in billing redirects
 
 	// SandboxAccessTokenSeed is the HMAC seed shared with the edge
 	// proxy. Both sides derive per-sandbox access tokens as
@@ -98,31 +99,32 @@ func Load() (*Config, error) {
 	checkoutPriceIDs := checkoutPriceIDs()
 
 	cfg := &Config{
-		Port:                   envOrDefault("API_PORT", "8080"),
-		VMDAddress:             envOrDefault("VMD_GRPC_ADDRESS", "localhost:50051"),
-		DatabaseURL:            dbURL,
-		StripeSecretKey:        os.Getenv("STRIPE_SECRET_KEY"),
-		StripeWebhookSecret:    os.Getenv("STRIPE_WEBHOOK_SECRET"),
-		StripeAPIBaseURL:       envOrDefault("STRIPE_API_BASE_URL", "https://api.stripe.com"),
-		StripeAPIVersion:       strings.TrimSpace(os.Getenv("STRIPE_API_VERSION")),
-		StripeCheckoutPriceIDs: checkoutPriceIDs,
-		BillingResources:       billingResources(checkoutPriceIDs),
-		AppAllowedOrigins:      splitCSV(os.Getenv("APP_ALLOWED_ORIGINS")),
-		SandboxAccessTokenSeed: seed,
-		EdgeProxyDomain:        envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
-		DefaultHostID:          envOrDefault("DEFAULT_HOST_ID", "default"),
-		SystemTeamID:           os.Getenv("SYSTEM_TEAM_ID"),
-		SentryDSN:              os.Getenv("SENTRY_DSN"),
-		KMSKeyResource:         os.Getenv("KMS_KEY_RESOURCE"),
-		SecretsSigningKey:      os.Getenv("SECRETS_SIGNING_KEY"),
-		SecretsSigningKeyID:    envOrDefault("SECRETS_SIGNING_KEY_ID", "v1"),
-		OTelMetricsEnabled:     boolEnv("OTEL_METRICS_ENABLED", false),
-		OTelServiceName:        envOrDefault("OTEL_SERVICE_NAME", "sandbox-controlplane"),
-		OTelServiceVersion:     os.Getenv("OTEL_SERVICE_VERSION"),
-		OTelEnvironment:        envOrDefault("OTEL_ENVIRONMENT", "dev"),
-		OTelEndpoint:           envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
-		OTelInsecure:           boolEnv("OTEL_EXPORTER_OTLP_INSECURE", false),
-		OTelExportInterval:     exportInterval,
+		Port:                          envOrDefault("API_PORT", "8080"),
+		VMDAddress:                    envOrDefault("VMD_GRPC_ADDRESS", "localhost:50051"),
+		DatabaseURL:                   dbURL,
+		StripeSecretKey:               os.Getenv("STRIPE_SECRET_KEY"),
+		StripeWebhookSecret:           os.Getenv("STRIPE_WEBHOOK_SECRET"),
+		StripeMeterErrorWebhookSecret: os.Getenv("STRIPE_METER_ERROR_WEBHOOK_SECRET"),
+		StripeAPIBaseURL:              envOrDefault("STRIPE_API_BASE_URL", "https://api.stripe.com"),
+		StripeAPIVersion:              strings.TrimSpace(os.Getenv("STRIPE_API_VERSION")),
+		StripeCheckoutPriceIDs:        checkoutPriceIDs,
+		BillingResources:              billingResources(checkoutPriceIDs),
+		AppAllowedOrigins:             splitCSV(os.Getenv("APP_ALLOWED_ORIGINS")),
+		SandboxAccessTokenSeed:        seed,
+		EdgeProxyDomain:               envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
+		DefaultHostID:                 envOrDefault("DEFAULT_HOST_ID", "default"),
+		SystemTeamID:                  os.Getenv("SYSTEM_TEAM_ID"),
+		SentryDSN:                     os.Getenv("SENTRY_DSN"),
+		KMSKeyResource:                os.Getenv("KMS_KEY_RESOURCE"),
+		SecretsSigningKey:             os.Getenv("SECRETS_SIGNING_KEY"),
+		SecretsSigningKeyID:           envOrDefault("SECRETS_SIGNING_KEY_ID", "v1"),
+		OTelMetricsEnabled:            boolEnv("OTEL_METRICS_ENABLED", false),
+		OTelServiceName:               envOrDefault("OTEL_SERVICE_NAME", "sandbox-controlplane"),
+		OTelServiceVersion:            os.Getenv("OTEL_SERVICE_VERSION"),
+		OTelEnvironment:               envOrDefault("OTEL_ENVIRONMENT", "dev"),
+		OTelEndpoint:                  envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+		OTelInsecure:                  boolEnv("OTEL_EXPORTER_OTLP_INSECURE", false),
+		OTelExportInterval:            exportInterval,
 	}
 	return cfg, nil
 }

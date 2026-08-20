@@ -1366,7 +1366,7 @@ func (h *Handlers) CreateStripeCustomerPortalSession(c *gin.Context) {
 }
 
 func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
-	if h.Config == nil || strings.TrimSpace(h.Config.StripeWebhookSecret) == "" {
+	if h.Config == nil || (strings.TrimSpace(h.Config.StripeWebhookSecret) == "" && strings.TrimSpace(h.Config.StripeMeterErrorWebhookSecret) == "") {
 		respondErrorMsg(c, "service_unavailable", "Stripe webhook secret is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -1380,7 +1380,7 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	if err := verifyStripeWebhookSignature(payload, c.GetHeader("Stripe-Signature"), h.Config.StripeWebhookSecret, h.nowUTC()); err != nil {
+	if err := verifyStripeWebhookSignatureWithSecrets(payload, c.GetHeader("Stripe-Signature"), h.nowUTC(), h.Config.StripeWebhookSecret, h.Config.StripeMeterErrorWebhookSecret); err != nil {
 		respondErrorMsg(c, "unauthorized", "invalid Stripe webhook signature", http.StatusUnauthorized)
 		return
 	}
