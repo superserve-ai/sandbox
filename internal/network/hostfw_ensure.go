@@ -57,8 +57,10 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	} else {
 		detail = err.Error()
 	}
-	log.Warn().Str("mismatch", class).Str("detail", detail).
-		Msg("host firewall verification failed — running full install")
+	go func() {
+		log.Warn().Str("mismatch", class).Str("detail", detail).
+			Msg("host firewall verification failed — running full install")
+	}()
 
 	// Serialize the read-modify-write against the cooperating writers (the
 	// vmd daemon and template-builder both route through here) so their
