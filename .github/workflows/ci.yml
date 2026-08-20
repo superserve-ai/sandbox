@@ -153,34 +153,45 @@ jobs:
 
       # A push touching only paths absent from a deploy workflow's filters runs
       # no job at all — the change merges and never ships, with nothing in the
-      # Actions tab to notice. Derive each binary's real dependencies and
-      # require the workflow to list them.
+      # Actions tab to notice. Derive what each workflow deploys and require its
+      # filters to cover every package those binaries import.
       - name: Every imported package must trigger its deploy
         run: |
           fail=0
-          # Union across every binary the workflow ships, not just the one it is
-          # named for: deploy-vmd builds four, so a package imported only by
-          # boxd or secretsproxy would otherwise pass unlisted.
           check() {
             workflow="$1"; shift
-            triggers=$(awk '/^on:/,/^jobs:/' "$workflow" | grep -oE "internal/[a-z]+" | sort -u)
+            # Filter paths, minus the /** suffix: a filter covers a package when
+            # it is that package or one of its parents, so compare by prefix
+            # rather than equality (proto/** covers proto/boxdpb).
+            triggers=$(awk '/^on:/,/^jobs:/' "$workflow" \
+              | grep -oE "'[a-z][a-z0-9._/-]*(/\*\*)?'" \
+              | tr -d "'" | sed 's|/\*\*$||' | sort -u || true)
+            # Every module-local dependency, not just internal/: the proxy
+            # reaches proto/boxdpb, and generated protocol code changing without
+            # a redeploy is the same staleness this guards against.
             deps=$(go list -deps "$@" \
-              | grep 'superserve-ai/sandbox/internal/' \
-              | sed 's|.*/\(internal/[a-z]*\).*|\1|' | sort -u)
-            missing=$(comm -23 <(echo "$deps") <(echo "$triggers"))
-            if [ -n "$missing" ]; then
-              for pkg in $missing; do
-                echo "::error file=$workflow::$workflow ships a binary importing $pkg but does not list it — changes to $pkg would merge without deploying"
+              | sed -n 's|^github.com/superserve-ai/sandbox/||p' \
+              | grep -v '^cmd/' | sort -u)
+            for dep in $deps; do
+              covered=0
+              for t in $triggers; do
+                case "$dep" in "$t"|"$t"/*) covered=1; break;; esac
               done
-              fail=1
-            fi
+              if [ "$covered" -eq 0 ]; then
+                echo "::error file=$workflow::$workflow ships a binary importing $dep but does not list it — changes to $dep would merge without deploying"
+                fail=1
+              fi
+            done
           }
           # Both the workflow list and each one's binaries come from the
           # workflows themselves, so a newly added deploy workflow is covered
           # without editing this job — the failure mode being guarded against is
           # precisely someone forgetting to update a hand-maintained list.
+          # `|| true` on the extraction: the step runs under `-eo pipefail`, so
+          # an unmatched grep would kill the job instead of reaching the skip.
           for wf in .github/workflows/deploy-*.yml; do
-            bins=$(awk '/^on:/,/^jobs:/' "$wf" | grep -oE "cmd/[a-z-]+" | sort -u | sed 's|^|./|')
+            bins=$(awk '/^on:/,/^jobs:/' "$wf" \
+              | grep -oE "cmd/[a-z-]+" | sort -u | sed 's|^|./|' || true)
             if [ -z "$bins" ]; then
               echo "$(basename "$wf"): ships no Go binary, skipping"
               continue

@@ -30,6 +30,7 @@ on:
       - 'internal/sentrylog/**'
       - 'internal/telemetry/**'
       - 'internal/vmdclient/**'
+      - 'proto/**'
       - 'deploy/proxy.service'
       - '.github/workflows/deploy-proxy.yml'
       - '.github/workflows/scripts/deploy-proxy.py'
