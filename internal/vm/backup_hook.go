@@ -136,13 +136,22 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 		// copy: reuse the existing marker (its staged files, base pin,
 		// and pause-time base identity) when one covers this snapshot.
 		if prev, ok := m.reusablePendingBackup(vmID, snapshotPath); ok {
-			// Same artifacts, NEW logical pause: adopt the new pause's
-			// token before the worker runs, or the eventual report would
-			// carry the old pause's identity and be refused against the
-			// snapshot row the control plane just re-tokened.
+			// Same artifacts, NEW logical pause: supersede the marker with
+			// fresh OWNERSHIP as well as the new pause token. Rotating only
+			// the pause token would leave a still-running old worker's
+			// owner-guarded writes valid — it could enqueue its stale
+			// in-memory token and then delete the refreshed marker, leaving
+			// nothing to retry with the new identity. With a new ownership
+			// token the old worker's heal and delete both no-op (not
+			// owner), its own busy-guard exit is followed by the sweep
+			// re-running this marker, and a stale-token enqueue it may
+			// still land is corrected when this marker's run re-enqueues
+			// the generation (the journal keeps the newest token on
+			// dedupe).
 			if pauseToken != "" && prev.PauseToken != pauseToken {
+				prev.Token = newPendingToken()
 				prev.PauseToken = pauseToken
-				m.healPendingBackup(prev, log)
+				m.persistPendingBackup(prev, log)
 			}
 			go m.rehashPendingBackup(ctx, prev, log)
 			return manifest

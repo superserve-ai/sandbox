@@ -1738,3 +1738,65 @@ func TestBackfillRemintsAfterAbandonedTask(t *testing.T) {
 		t.Fatalf("probe-error pass enqueued %d tasks, want 0", n)
 	}
 }
+
+// An unchanged re-pause that reuses a live staged marker is a NEW logical
+// pause: the reuse must rotate the marker's ownership token along with
+// the pause token, so a still-running old worker's owner-guarded cleanup
+// cannot delete the refreshed marker after enqueueing its stale identity.
+func TestMarkerReuseRotatesOwnershipWithPauseToken(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return false },
+	}
+	m.backupStaging = staging
+	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+	// Park the workers at the busy guard, as a still-running old worker
+	// would hold it in production.
+	m.pendingInFlight.Store("vm-1", struct{}{})
+	awaitRehashWorkers(t, m, 2)
+
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-pause-1", zerolog.Nop())
+	first, ok, err := m.state.GetPendingBackup("vm-1")
+	if err != nil || !ok {
+		t.Fatalf("first marker: ok=%v err=%v", ok, err)
+	}
+	if first.PauseToken != "tok-pause-1" {
+		t.Fatalf("first marker pause token = %q", first.PauseToken)
+	}
+
+	// Re-pause on identical artifacts with a new control-plane token.
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-pause-2", zerolog.Nop())
+	second, ok, err := m.state.GetPendingBackup("vm-1")
+	if err != nil || !ok {
+		t.Fatalf("second marker: ok=%v err=%v", ok, err)
+	}
+	if second.PauseToken != "tok-pause-2" {
+		t.Fatalf("marker pause token = %q, want tok-pause-2", second.PauseToken)
+	}
+	if second.Token == first.Token {
+		t.Fatal("ownership token not rotated: the old worker's cleanup could still delete the refreshed marker")
+	}
+
+	// The old worker's owner-guarded cleanup must no-op against it.
+	if err := m.state.DeletePendingBackupIf("vm-1", first.Token); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := m.state.GetPendingBackup("vm-1"); !ok {
+		t.Fatal("refreshed marker deleted by the old ownership token")
+	}
+}
