@@ -30,6 +30,7 @@ import (
 )
 
 const testStripeWebhookSecret = "whsec_test_secret"
+const testStripeMeterErrorWebhookSecret = "whsec_test_meter_error_secret"
 
 type fakeStripeClient struct {
 	mu               sync.Mutex
@@ -108,13 +109,14 @@ func newBillingRouter(t *testing.T, stripe api.StripeBillingClient) *gin.Engine 
 	t.Helper()
 	t.Setenv("INTERNAL_API_TOKEN", internalRBACToken)
 	cfg := &config.Config{
-		Port:                   "0",
-		VMDAddress:             "localhost:0",
-		SystemTeamID:           testSystemTeamID.String(),
-		StripeWebhookSecret:    testStripeWebhookSecret,
-		StripeAPIVersion:       "2025-06-30",
-		StripeCheckoutPriceIDs: []string{"price_cpu", "price_memory", "price_storage"},
-		AppAllowedOrigins:      []string{"https://app.superserve.test"},
+		Port:                          "0",
+		VMDAddress:                    "localhost:0",
+		SystemTeamID:                  testSystemTeamID.String(),
+		StripeWebhookSecret:           testStripeWebhookSecret,
+		StripeMeterErrorWebhookSecret: testStripeMeterErrorWebhookSecret,
+		StripeAPIVersion:              "2025-06-30",
+		StripeCheckoutPriceIDs:        []string{"price_cpu", "price_memory", "price_storage"},
+		AppAllowedOrigins:             []string{"https://app.superserve.test"},
 	}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
 	h.Pool = testPool
@@ -202,9 +204,13 @@ func apiPeriodID(start, end time.Time) string {
 	return start.Format(time.RFC3339) + "," + end.Format(time.RFC3339)
 }
 
-func stripeSignature(t *testing.T, payload []byte, ts time.Time) string {
+func stripeSignature(t *testing.T, payload []byte, ts time.Time, secret ...string) string {
 	t.Helper()
-	mac := hmac.New(sha256.New, []byte(testStripeWebhookSecret))
+	signingSecret := testStripeWebhookSecret
+	if len(secret) > 0 {
+		signingSecret = secret[0]
+	}
+	mac := hmac.New(sha256.New, []byte(signingSecret))
 	mac.Write([]byte(fmt.Sprintf("%d.", ts.Unix())))
 	mac.Write(payload)
 	return fmt.Sprintf("t=%d,v1=%s", ts.Unix(), hex.EncodeToString(mac.Sum(nil)))
@@ -958,12 +964,18 @@ func TestIntegration_StripeThinMeterErrorReconcilesByIdempotencyKey(t *testing.T
 	}
 	req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC()))
+	req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC(), testStripeMeterErrorWebhookSecret))
 	if w := doRequest(r, req); w.Code != http.StatusOK {
 		t.Fatalf("thin meter webhook: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 	if got := exportAttemptCount(t, teamID, "failed"); got == 0 {
 		t.Fatal("thin meter webhook did not mark the matched export failed")
+	}
+	invalidReq := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+	invalidReq.Header.Set("Content-Type", "application/json")
+	invalidReq.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC(), "whsec_unconfigured"))
+	if w := doRequest(r, invalidReq); w.Code != http.StatusUnauthorized {
+		t.Fatalf("webhook with unknown signing secret: expected 401, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
