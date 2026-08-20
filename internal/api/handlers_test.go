@@ -71,12 +71,14 @@ func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) er
 	}
 	return nil
 }
-func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir, pauseToken string) (string, string, []vmdclient.ManifestEntry, error) {
+func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error) {
+	// Echo like a current daemon; token-drop cases stub pauseFn and are
+	// covered by the client-layer echo comparison, not this fake.
 	if s.pauseFn != nil {
 		snap, mem, err := s.pauseFn(ctx, id, snapshotDir)
-		return snap, mem, nil, err
+		return snap, mem, nil, pauseToken, err
 	}
-	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil, nil
+	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
 func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte) (string, uint32, uint32, error) {
 	if s.resumeFn != nil {
@@ -3856,7 +3858,7 @@ func TestPauseWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
 		}
 		return "/snap/vmstate.snap", "/snap/mem.snap", nil
 	}}
-	snap, mem, _, err := pauseWithRetry(context.Background(), vmd, "vm-1", "tok-test")
+	snap, mem, _, _, err := pauseWithRetry(context.Background(), vmd, "vm-1", "tok-test")
 	if err != nil {
 		t.Fatalf("retry should recover a transient failure, got %v", err)
 	}
@@ -3875,7 +3877,7 @@ func TestPauseWithRetry_NotFoundIsTerminal(t *testing.T) {
 		calls++
 		return "", "", notFound
 	}}
-	_, _, _, err := pauseWithRetry(context.Background(), vmd, "vm-1", "tok-test")
+	_, _, _, _, err := pauseWithRetry(context.Background(), vmd, "vm-1", "tok-test")
 	if !isVMDNotFound(err) {
 		t.Fatalf("expected NotFound to surface, got %v", err)
 	}

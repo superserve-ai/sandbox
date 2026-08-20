@@ -654,10 +654,39 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 		t.Fatalf("after token-conflict report: paused=%d unbacked=%d, want 1/1 (digest coincidence must not fake coverage)", paused, unbacked)
 	}
 
-	// A tokenless report (older host, pre-token outbox entry) with
-	// matching content: the legacy fallback path links it.
+	// A tokenless report against a TOKENED snapshot: rejected. A tokened
+	// pause's own report always carries the echoed token, so a tokenless
+	// one is necessarily some other pause's — content match or not.
 	report(strings.Repeat("2", 64), shaB, shaY, "")
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("after tokenless report on tokened snapshot: paused=%d unbacked=%d, want 1/1", paused, unbacked)
+	}
+
+	// The current pause's own report, carrying its token: covered.
+	report(strings.Repeat("4", 64), shaB, shaY, "tok-2")
 	if paused, unbacked := counts(); paused != 1 || unbacked != 0 {
 		t.Fatalf("after current-pause backup: paused=%d unbacked=%d, want 1/0", paused, unbacked)
+	}
+
+	// Legacy pair: a snapshot finalized without a token (older daemon —
+	// the finalize stores only the echo) accepts a tokenless report on
+	// content identity, as before tokens existed.
+	if _, err := testPool.Exec(ctx,
+		`WITH snap AS (
+		   UPDATE snapshot SET generation = generation + 1, pause_token = NULL
+		   WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)
+		   RETURNING id
+		 )
+		 UPDATE artifact_manifest SET sha256 = $2
+		 WHERE snapshot_id IN (SELECT id FROM snap)`,
+		sandboxID, strings.Repeat("f", 64)); err != nil {
+		t.Fatalf("advance to a tokenless pause: %v", err)
+	}
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("after tokenless re-pause: paused=%d unbacked=%d, want 1/1", paused, unbacked)
+	}
+	report(strings.Repeat("5", 64), strings.Repeat("f", 64), shaY, "")
+	if paused, unbacked := counts(); paused != 1 || unbacked != 0 {
+		t.Fatalf("after legacy content-matched backup: paused=%d unbacked=%d, want 1/0", paused, unbacked)
 	}
 }

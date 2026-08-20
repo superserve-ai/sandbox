@@ -1504,7 +1504,13 @@ type PauseVMResponse struct {
 	// Integrity manifest for the pause's durable artifacts (disk state +
 	// vmstate). Memory files are deliberately absent: they never leave the
 	// host, and hashing multi-GiB mem images would stretch the pause RPC.
-	Manifest      []*ArtifactManifestEntry `protobuf:"bytes,4,rep,name=manifest,proto3" json:"manifest,omitempty"`
+	Manifest []*ArtifactManifestEntry `protobuf:"bytes,4,rep,name=manifest,proto3" json:"manifest,omitempty"`
+	// Echo of the request's pause_token, present only when this daemon
+	// threaded it into the backup pipeline. The caller stores the token on
+	// the snapshot row ONLY on a matching echo: a token stored for a
+	// daemon that dropped it would demand an echo its reports can never
+	// produce, reading every backup as unmatched.
+	PauseToken    string `protobuf:"bytes,5,opt,name=pause_token,json=pauseToken,proto3" json:"pause_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1565,6 +1571,13 @@ func (x *PauseVMResponse) GetManifest() []*ArtifactManifestEntry {
 		return x.Manifest
 	}
 	return nil
+}
+
+func (x *PauseVMResponse) GetPauseToken() string {
+	if x != nil {
+		return x.PauseToken
+	}
+	return ""
 }
 
 // ArtifactManifestEntry describes one finalized artifact file: its identity
@@ -3874,12 +3887,14 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12!\n" +
 	"\fsnapshot_dir\x18\x02 \x01(\tR\vsnapshotDir\x12\x1f\n" +
 	"\vpause_token\x18\x03 \x01(\tR\n" +
-	"pauseToken\"\xb5\x01\n" +
+	"pauseToken\"\xd6\x01\n" +
 	"\x0fPauseVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12D\n" +
-	"\bmanifest\x18\x04 \x03(\v2(.superserve.vmd.v1.ArtifactManifestEntryR\bmanifest\"\x9c\x01\n" +
+	"\bmanifest\x18\x04 \x03(\v2(.superserve.vmd.v1.ArtifactManifestEntryR\bmanifest\x12\x1f\n" +
+	"\vpause_token\x18\x05 \x01(\tR\n" +
+	"pauseToken\"\x9c\x01\n" +
 	"\x15ArtifactManifestEntry\x12\x1b\n" +
 	"\tfile_name\x18\x01 \x01(\tR\bfileName\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x1d\n" +

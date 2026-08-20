@@ -65,6 +65,9 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
 		Manifest:     entries,
+		// Echo: this daemon threaded the token into the backup pipeline,
+		// so the caller may store it and require it of reports.
+		PauseToken: req.GetPauseToken(),
 	}, nil
 }
 

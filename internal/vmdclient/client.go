@@ -36,7 +36,11 @@ type Client interface {
 	// host-local only and not manifested). pauseToken is the caller-minted
 	// identity for this pause; the daemon threads it into the eventual
 	// backup report so coverage can name the exact pause it verified.
-	PauseInstance(ctx context.Context, instanceID, snapshotDir, pauseToken string) (snapshotPath, memPath string, manifest []ManifestEntry, err error)
+	// ackedToken echoes pauseToken ONLY when the daemon threaded it ("" from
+	// an older daemon): the caller must store on the snapshot row exactly
+	// what came back, or it would demand of reports an identity the host
+	// can never produce.
+	PauseInstance(ctx context.Context, instanceID, snapshotDir, pauseToken string) (snapshotPath, memPath string, manifest []ManifestEntry, ackedToken string, err error)
 	// ResumeInstance restores a paused VM.
 	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when

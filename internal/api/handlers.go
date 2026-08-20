@@ -900,7 +900,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		// dirtied the disk before the failed finalize was detected, so the
 		// artifacts on disk are fresh. Record their manifest below; keeping
 		// the pre-resume hashes would leave stale integrity data.
-		snapPath, memPath, manifest, perr := vmd.PauseInstance(pctx, sandboxID.String(), "", pauseToken)
+		snapPath, memPath, manifest, ackedPauseToken, perr := vmd.PauseInstance(pctx, sandboxID.String(), "", pauseToken)
 		pcancel()
 		if perr != nil {
 			// VM unreachable — nothing to preserve; mark failed rather than
@@ -918,8 +918,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			TeamID:     teamID,
 			Path:       snapPath,
 			MemPath:    &memPath,
-			Trigger:    "resume_revert",
-			PauseToken: pauseToken,
+			Trigger: "resume_revert",
+			// Only the daemon's echo may be stored (see PauseSandbox).
+			PauseToken: ackedPauseToken,
 		}
 		applyManifest(&params, manifest)
 		if _, ferr := h.finalizePause(fctx, params); ferr != nil {
@@ -2751,12 +2752,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // row to active would drift it against a paused VM; PauseVM is idempotent, so
 // the retry returns the recorded snapshot and the row converges to paused.
 // NotFound is terminal — the VM is genuinely gone.
-func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id, pauseToken string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, err error) {
+func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id, pauseToken string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
 	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
-	snapshotPath, memPath, manifest, err = vmd.PauseInstance(ctx, id, "", pauseToken)
+	snapshotPath, memPath, manifest, ackedToken, err = vmd.PauseInstance(ctx, id, "", pauseToken)
 	cancel()
 	if err == nil || isVMDNotFound(err) {
-		return snapshotPath, memPath, manifest, err
+		return snapshotPath, memPath, manifest, ackedToken, err
 	}
 	// Detach from the request ctx: the client's deadline may already have
 	// fired, but the reconciliation to a consistent state must still run.
@@ -2842,7 +2843,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// pipeline and returns in the upload report, naming this exact pause
 	// for coverage linkage.
 	pauseToken := uuid.NewString()
-	snapshotPath, memPath, manifest, err := pauseWithRetry(c.Request.Context(), vmd, sandboxID.String(), pauseToken)
+	snapshotPath, memPath, manifest, ackedPauseToken, err := pauseWithRetry(c.Request.Context(), vmd, sandboxID.String(), pauseToken)
 	if err != nil {
 		// VMD says the VM doesn't exist — it crashed or was removed out-of-band.
 		// Mark the sandbox failed and return 410 Gone. No revert — the VM is
@@ -2908,8 +2909,11 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 			TeamID:     teamID,
 			Path:       snapshotPath,
 			MemPath:    &memPath,
-			Trigger:    "pause",
-			PauseToken: pauseToken,
+			Trigger: "pause",
+			// Store only what the daemon ECHOED: an older daemon drops the
+			// token, and storing it anyway would demand of its reports an
+			// identity they can never carry.
+			PauseToken: ackedPauseToken,
 		}
 		applyManifest(&params, manifest)
 		if _, err := h.finalizePause(fctx, params); err != nil {
