@@ -392,10 +392,10 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	defer postCancel()
 
 	params := db.FinalizePauseParams{
-		ID:         sbx.ID,
-		TeamID:     sbx.TeamID,
-		Path:       snapshotPath,
-		MemPath:    &memPath,
+		ID:      sbx.ID,
+		TeamID:  sbx.TeamID,
+		Path:    snapshotPath,
+		MemPath: &memPath,
 		Trigger: trigger,
 		// Only the daemon's echo may be stored (see PauseSandbox).
 		PauseToken: ackedPauseToken,

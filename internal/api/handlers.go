@@ -914,10 +914,10 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		fctx, fcancel := context.WithTimeout(revertCtx, vmdTimeout)
 		defer fcancel()
 		params := db.FinalizePauseParams{
-			ID:         sandboxID,
-			TeamID:     teamID,
-			Path:       snapPath,
-			MemPath:    &memPath,
+			ID:      sandboxID,
+			TeamID:  teamID,
+			Path:    snapPath,
+			MemPath: &memPath,
 			Trigger: "resume_revert",
 			// Only the daemon's echo may be stored (see PauseSandbox).
 			PauseToken: ackedPauseToken,
@@ -2905,10 +2905,10 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		fctx, fcancel := context.WithTimeout(finalizeCtx, asyncTimeout)
 		defer fcancel()
 		params := db.FinalizePauseParams{
-			ID:         sandboxID,
-			TeamID:     teamID,
-			Path:       snapshotPath,
-			MemPath:    &memPath,
+			ID:      sandboxID,
+			TeamID:  teamID,
+			Path:    snapshotPath,
+			MemPath: &memPath,
 			Trigger: "pause",
 			// Store only what the daemon ECHOED: an older daemon drops the
 			// token, and storing it anyway would demand of its reports an
