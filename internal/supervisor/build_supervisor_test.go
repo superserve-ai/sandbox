@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
@@ -184,6 +185,32 @@ func TestBuildKeyFromPath(t *testing.T) {
 			}
 			if k != tc.wantKey {
 				t.Errorf("key = %q, want %q", k, tc.wantKey)
+			}
+		})
+	}
+}
+
+// Build dispatch holds only on a positively known non-active host: draining
+// and provisioning hold, but a missing row (bootstrap mode) or a transient
+// read error must not stall the build pipeline.
+func TestBuildHostAccepting(t *testing.T) {
+	cases := []struct {
+		name   string
+		status string
+		err    error
+		want   bool
+	}{
+		{"active dispatches", "active", nil, true},
+		{"draining holds", "draining", nil, false},
+		{"provisioning holds", "provisioning", nil, false},
+		{"unhealthy holds", "unhealthy", nil, false},
+		{"missing row dispatches", "", pgx.ErrNoRows, true},
+		{"read error dispatches", "", fmt.Errorf("connection reset"), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildHostAccepting(tc.status, tc.err); got != tc.want {
+				t.Fatalf("buildHostAccepting(%q, %v) = %v, want %v", tc.status, tc.err, got, tc.want)
 			}
 		})
 	}

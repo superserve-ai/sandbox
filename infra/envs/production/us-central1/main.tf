@@ -131,6 +131,12 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
     "slack-quota-alert-webhook",
     coalesce(var.sentry_dsn_secret_name, "sentry-dsn"),
     coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}"),
+    "stripe-secret-key-use",
+    "stripe-webhook-secret-use",
+    "stripe-meter-error-webhook-secret-use",
+    "stripe-secret-key-usw",
+    "stripe-webhook-secret-usw",
+    "stripe-meter-error-webhook-secret-usw",
   ])
 
   project   = local.project_id
