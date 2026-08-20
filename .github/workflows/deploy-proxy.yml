@@ -19,10 +19,17 @@ on:
   push:
     branches: [main]
     paths:
+      # Every internal package the proxy imports must be listed, or a change to
+      # it merges without deploying. Enforced by the deploy-trigger-coverage CI
+      # check against `go list -deps`.
       - 'cmd/proxy/**'
-      - 'internal/proxy/**'
+      - 'internal/analytics/**'
       - 'internal/auth/**'
+      - 'internal/preview/**'
+      - 'internal/proxy/**'
+      - 'internal/sentrylog/**'
       - 'internal/telemetry/**'
+      - 'internal/vmdclient/**'
       - 'deploy/proxy.service'
       - '.github/workflows/deploy-proxy.yml'
       - '.github/workflows/scripts/deploy-proxy.py'

@@ -175,7 +175,17 @@ jobs:
               fail=1
             fi
           }
-          check .github/workflows/deploy-api.yml ./cmd/controlplane
-          check .github/workflows/deploy-vmd.yml ./cmd/vmd ./cmd/boxd ./cmd/template-builder ./cmd/secretsproxy
+          # Both the workflow list and each one's binaries come from the
+          # workflows themselves, so a newly added deploy workflow is covered
+          # without editing this job — the failure mode being guarded against is
+          # precisely someone forgetting to update a hand-maintained list.
+          for wf in .github/workflows/deploy-*.yml; do
+            bins=$(awk '/^on:/,/^jobs:/' "$wf" | grep -oE "cmd/[a-z-]+" | sort -u | sed 's|^|./|')
+            if [ -z "$bins" ]; then
+              echo "$(basename "$wf"): ships no Go binary, skipping"
+              continue
+            fi
+            check "$wf" $bins
+          done
           [ $fail -eq 0 ] && echo "deploy triggers cover every imported package"
           exit $fail
