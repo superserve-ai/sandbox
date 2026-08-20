@@ -540,7 +540,10 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 	}
 
 	counts := func() (paused, unbacked int32) {
-		req := httptest.NewRequest("GET", "/internal/hosts", nil)
+		// The scoped form drain polling uses: only the target host's row
+		// comes back, so the counts asserted below are also proof the
+		// filter path computes them correctly.
+		req := httptest.NewRequest("GET", "/internal/hosts?id="+hostID, nil)
 		req.Header.Set("Authorization", "Bearer optok-hostreg")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
@@ -557,13 +560,10 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
-		for _, h := range out.Hosts {
-			if h.ID == hostID {
-				return h.PausedCount, h.PausedUnbacked
-			}
+		if len(out.Hosts) != 1 || out.Hosts[0].ID != hostID {
+			t.Fatalf("filtered list returned %d hosts, want exactly %s", len(out.Hosts), hostID)
 		}
-		t.Fatalf("host %s not in list", hostID)
-		return 0, 0
+		return out.Hosts[0].PausedCount, out.Hosts[0].PausedUnbacked
 	}
 
 	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {

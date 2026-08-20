@@ -307,9 +307,14 @@ func (h *Handlers) HostUpdateStatus(c *gin.Context) {
 }
 
 // HostList handles GET /internal/hosts — the operator view behind
-// `hostctl list`: every host with liveness and sandbox counts.
+// `hostctl list`: every host with liveness and sandbox counts. `?id=` scopes
+// the counts to one host so drain polling doesn't recompute them fleet-wide.
 func (h *Handlers) HostList(c *gin.Context) {
-	rows, err := h.DB.ListHostsAdmin(c.Request.Context())
+	var idFilter *string
+	if id := c.Query("id"); id != "" {
+		idFilter = &id
+	}
+	rows, err := h.DB.ListHostsAdmin(c.Request.Context(), idFilter)
 	if err != nil {
 		log.Error().Err(err).Msg("ListHostsAdmin failed")
 		respondError(c, ErrInternal)

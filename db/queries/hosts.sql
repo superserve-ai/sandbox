@@ -236,5 +236,10 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
                                    WHERE bg.sandbox_id = s2.id)), 0)::int AS paused_unbacked_count
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
+-- The optional id filter exists for drain polling: `hostctl drain --wait`
+-- re-reads one host every few seconds, and the per-host counts (the
+-- backup-coverage probe especially) must not be recomputed for the whole
+-- fleet on every poll.
+WHERE sqlc.narg(id)::text IS NULL OR h.id = sqlc.narg(id)
 GROUP BY h.id
 ORDER BY h.created_at ASC;

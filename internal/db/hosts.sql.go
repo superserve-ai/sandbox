@@ -373,6 +373,7 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
                                    WHERE bg.sandbox_id = s2.id)), 0)::int AS paused_unbacked_count
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
+WHERE $1::text IS NULL OR h.id = $1
 GROUP BY h.id
 ORDER BY h.created_at ASC
 `
@@ -399,8 +400,12 @@ type ListHostsAdminRow struct {
 // sandbox counts for drain progress. transitional counts pausing/resuming
 // sandboxes whose lifecycle RPC is still using the host — a host is not
 // drained while any exist, even when running and paused both read zero.
-func (q *Queries) ListHostsAdmin(ctx context.Context) ([]ListHostsAdminRow, error) {
-	rows, err := q.db.Query(ctx, listHostsAdmin)
+// The optional id filter exists for drain polling: `hostctl drain --wait`
+// re-reads one host every few seconds, and the per-host counts (the
+// backup-coverage probe especially) must not be recomputed for the whole
+// fleet on every poll.
+func (q *Queries) ListHostsAdmin(ctx context.Context, id *string) ([]ListHostsAdminRow, error) {
+	rows, err := q.db.Query(ctx, listHostsAdmin, id)
 	if err != nil {
 		return nil, err
 	}

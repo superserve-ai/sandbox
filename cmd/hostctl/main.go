@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -174,8 +175,8 @@ type hostView struct {
 	PausedUnbacked    int     `json:"paused_unbacked_count"`
 }
 
-func (c client) hosts() ([]hostView, error) {
-	resp, err := c.do(http.MethodGet, "/internal/hosts", nil)
+func (c client) hostsPath(path string) ([]hostView, error) {
+	resp, err := c.do(http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -189,17 +190,22 @@ func (c client) hosts() ([]hostView, error) {
 	return out.Hosts, nil
 }
 
+func (c client) hosts() ([]hostView, error) {
+	return c.hostsPath("/internal/hosts")
+}
+
+// hostRow fetches ONE host's row. Scoped server-side because drain polls it
+// every few seconds — the unscoped list recomputes sandbox and
+// backup-coverage counts for the whole fleet.
 func (c client) hostRow(hostID string) (hostView, error) {
-	hosts, err := c.hosts()
+	hosts, err := c.hostsPath("/internal/hosts?id=" + url.QueryEscape(hostID))
 	if err != nil {
 		return hostView{}, err
 	}
-	for _, h := range hosts {
-		if h.ID == hostID {
-			return h, nil
-		}
+	if len(hosts) == 0 {
+		return hostView{}, fmt.Errorf("host %q not found", hostID)
 	}
-	return hostView{}, fmt.Errorf("host %q not found", hostID)
+	return hosts[0], nil
 }
 
 func (c client) list() error {
