@@ -358,7 +358,11 @@ WHERE t.id = build_done.tpl_id
 -- Mark builds failed if they have stayed in pending past pending_timeout, or
 -- in building/snapshotting past build_timeout. Returns affected rows so the
 -- caller can call vmd.CancelBuild for orphan VM cleanup. Same idempotent
--- pattern as ClaimExpiredSandboxes.
+-- pattern as ClaimExpiredSandboxes. A never-ready template fails together
+-- with its timed-out build (mirroring FailBuild): this reap is the bound on
+-- requeued dispatch retries, and a bound that strands the template in
+-- 'building' forever is not a bound. Templates with a prior successful
+-- build keep their 'ready' status.
 WITH stale AS (
   SELECT id, template_id, team_id, vmd_host_id, vmd_build_vm_id FROM template_build
   WHERE
@@ -368,12 +372,25 @@ WITH stale AS (
   ORDER BY created_at ASC
   LIMIT $1
   FOR UPDATE SKIP LOCKED
+),
+build_done AS (
+  UPDATE template_build
+  SET status = 'failed',
+      finalized_at = now(),
+      updated_at = now(),
+      error_message = 'build timed out'
+  FROM stale
+  WHERE template_build.id = stale.id
+  RETURNING template_build.id
+),
+tpl_update AS (
+  UPDATE template
+  SET status = 'failed',
+      error_message = 'build timed out',
+      updated_at = now()
+  FROM stale
+  WHERE template.id = stale.template_id
+    AND template.status IN ('pending', 'building')
+  RETURNING template.id
 )
-UPDATE template_build
-SET status = 'failed',
-    finalized_at = now(),
-    updated_at = now(),
-    error_message = 'build timed out'
-FROM stale
-WHERE template_build.id = stale.id
-RETURNING template_build.id, stale.template_id, stale.team_id, stale.vmd_host_id, stale.vmd_build_vm_id;
+SELECT stale.id, stale.template_id, stale.team_id, stale.vmd_host_id, stale.vmd_build_vm_id FROM stale;

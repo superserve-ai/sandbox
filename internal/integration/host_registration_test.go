@@ -527,3 +527,82 @@ func TestIntegration_HostIdentityOptIn(t *testing.T) {
 		t.Fatalf("legacy heartbeat on bound row = %d, want 409", w.Code)
 	}
 }
+
+// The stale-build reap is the bound on requeued dispatch retries, so it
+// must be complete: a timed-out build fails its never-ready template too
+// (a template stuck in 'building' forever is not a bound), while a
+// template that already reached 'ready' keeps its status.
+func TestIntegration_ReapStaleBuilds_FailsNeverReadyTemplate(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
+	r := newRouter(t)
+
+	tw := do(r, "POST", "/templates", apiKey,
+		`{"name":"reap-template-probe","build_spec":{"from":"debian:12-slim","steps":[]}}`)
+	if tw.Code != http.StatusAccepted {
+		t.Fatalf("create template: %d %s", tw.Code, tw.Body.String())
+	}
+	templateID := mustJSON(t, tw)["id"].(string)
+
+	// Age the pending build past the reap's pending timeout.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE template_build SET created_at = now() - interval '10 minutes' WHERE template_id = $1`,
+		templateID); err != nil {
+		t.Fatalf("age build: %v", err)
+	}
+
+	reaped, err := testQueries.ReapStaleBuilds(ctx, db.ReapStaleBuildsParams{
+		Limit: 20, PendingTimeoutSeconds: 120, BuildTimeoutSeconds: 1800,
+	})
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	found := false
+	for _, row := range reaped {
+		if row.TemplateID.String() == templateID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("aged build not reaped (reaped %d rows)", len(reaped))
+	}
+
+	var buildStatus, templateStatus string
+	if err := testPool.QueryRow(ctx,
+		`SELECT tb.status::text, t.status::text FROM template_build tb
+		 JOIN template t ON t.id = tb.template_id WHERE tb.template_id = $1`,
+		templateID).Scan(&buildStatus, &templateStatus); err != nil {
+		t.Fatalf("read statuses: %v", err)
+	}
+	if buildStatus != "failed" || templateStatus != "failed" {
+		t.Fatalf("after reap: build=%s template=%s, want failed/failed", buildStatus, templateStatus)
+	}
+
+	// A template that already reached 'ready' keeps it when a later build
+	// times out.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE template SET status = 'ready', error_message = NULL WHERE id = $1`,
+		templateID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`UPDATE template_build SET status = 'pending', finalized_at = NULL,
+		 created_at = now() - interval '10 minutes' WHERE template_id = $1`,
+		templateID); err != nil {
+		t.Fatalf("stage second stale build: %v", err)
+	}
+	if _, err := testQueries.ReapStaleBuilds(ctx, db.ReapStaleBuildsParams{
+		Limit: 20, PendingTimeoutSeconds: 120, BuildTimeoutSeconds: 1800,
+	}); err != nil {
+		t.Fatalf("second reap: %v", err)
+	}
+	if err := testPool.QueryRow(ctx,
+		`SELECT status::text FROM template WHERE id = $1`, templateID).Scan(&templateStatus); err != nil {
+		t.Fatalf("read template: %v", err)
+	}
+	if templateStatus != "ready" {
+		t.Fatalf("ready template after build timeout = %s, want ready untouched", templateStatus)
+	}
+}

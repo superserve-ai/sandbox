@@ -375,7 +375,10 @@ func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBui
 		// bounds how long a build can keep retrying.
 		rowLog.Warn().Err(err).Str("host_id", hostID).
 			Msg("transient build-host resolution failure; requeueing build")
-		rqCtx, rqCancel := context.WithTimeout(ctx, 5*time.Second)
+		// Detached like failBuild's write: shutdown cancelling the tick is
+		// exactly when the resolve fails Canceled, and the requeue must
+		// still land or the claim stays 'building' with no VM behind it.
+		rqCtx, rqCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		if _, rqErr := s.q.RequeueBuildDispatch(rqCtx, row.ID); rqErr != nil {
 			// Leave it claimed: the build-timeout reap recovers it later.
 			rowLog.Error().Err(rqErr).Msg("requeue after transient resolution failure failed")
