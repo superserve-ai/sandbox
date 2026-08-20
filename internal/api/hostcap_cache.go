@@ -14,6 +14,12 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
+// hostCapQueryTimeout bounds every capability lookup, cached-miss and
+// cache-disabled alike. Part of hostctl's post-admission drain budget:
+// admission → capability lookup (this bound) → registry resolve (2s) →
+// bounded boot. Widening it widens what drain --wait must cover.
+const hostCapQueryTimeout = 5 * time.Second
+
 // hostCapCache is an in-process, TTL-bounded, positive-only cache of host
 // capability attestations, fronting HostHasCapabilitiesUnlocked on the
 // standalone pre-flight paths. Same shape as apiKeyCache: only affirmative
@@ -128,7 +134,7 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 	c := &h.hostCaps
 	ch := c.group.DoChan(key, func() (interface{}, error) {
 		start := time.Now()
-		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostCapQueryTimeout)
 		defer cancel()
 		has, err := h.DB.HostHasCapabilitiesUnlocked(qctx, params)
 		switch {
@@ -156,7 +162,13 @@ func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string,
 	c.init()
 	params := db.HostHasCapabilitiesUnlockedParams{HostID: hostID, RequiredCapabilities: capabilities}
 	if c.ttl <= 0 {
-		return h.DB.HostHasCapabilitiesUnlocked(ctx, params)
+		// Same bound as the cached fetch: this lookup sits between scheduler
+		// admission and the bounded boot work, and ops tooling (hostctl
+		// --wait) budgets a fixed post-admission margin for it — an
+		// unbounded read here would silently break that arithmetic.
+		qctx, cancel := context.WithTimeout(ctx, hostCapQueryTimeout)
+		defer cancel()
+		return h.DB.HostHasCapabilitiesUnlocked(qctx, params)
 	}
 	sorted := append([]string(nil), capabilities...)
 	sort.Strings(sorted)

@@ -7,6 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -35,6 +39,21 @@ type HeartbeatConfig struct {
 
 	// Interval is how often the heartbeat fires. Default: 30s.
 	Interval time.Duration
+
+	// Self-description for control-plane self-registration. Sent only when
+	// AdvertiseVMDAddr, AdvertiseProxyAddr, and Region are all set: older
+	// control planes bind heartbeat bodies strictly and reject unknown
+	// fields, so advertising is opt-in per host (deploy sets the env only
+	// once the control plane understands it). With none set, the payload is
+	// byte-identical to what pre-registration vmds send.
+	AdvertiseVMDAddr   string
+	AdvertiseProxyAddr string
+	Region             string
+	// Capacity fields are the host's SCHEDULABLE capacity — explicitly
+	// configured limits that placement may admit against — never detected
+	// physical totals.
+	CapacityMemoryMib int32
+	CapacityVcpus     int32
 }
 
 // StartHeartbeat launches a background goroutine that periodically POSTs
@@ -65,7 +84,7 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	defer ticker.Stop()
 
 	// Fire once immediately so the host is marked alive on startup.
-	sendHeartbeat(ctx, client, url, token, proxyHealthURL, log)
+	sendHeartbeat(ctx, client, cfg, url, token, proxyHealthURL, log)
 
 	for {
 		select {
@@ -73,27 +92,49 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 			log.Info().Msg("heartbeat exiting")
 			return
 		case <-ticker.C:
-			sendHeartbeat(ctx, client, url, token, proxyHealthURL, log)
+			sendHeartbeat(ctx, client, cfg, url, token, proxyHealthURL, log)
 		}
 	}
 }
 
 type heartbeatRequest struct {
 	Capabilities []string `json:"capabilities"`
+
+	VMDAddr           string `json:"vmd_addr,omitempty"`
+	ProxyAddr         string `json:"proxy_addr,omitempty"`
+	Region            string `json:"region,omitempty"`
+	CapacityMemoryMib int32  `json:"capacity_memory_mib,omitempty"`
+	CapacityVcpus     int32  `json:"capacity_vcpus,omitempty"`
+}
+
+// buildHeartbeatRequest attaches the self-description only when it is
+// complete; a partial description would register a broken host row, and any
+// description at all breaks against control planes that predate it.
+func buildHeartbeatRequest(cfg HeartbeatConfig, capabilities []string) heartbeatRequest {
+	req := heartbeatRequest{Capabilities: capabilities}
+	if cfg.AdvertiseVMDAddr != "" && cfg.AdvertiseProxyAddr != "" && cfg.Region != "" &&
+		cfg.CapacityMemoryMib > 0 && cfg.CapacityVcpus > 0 {
+		req.VMDAddr = cfg.AdvertiseVMDAddr
+		req.ProxyAddr = cfg.AdvertiseProxyAddr
+		req.Region = cfg.Region
+		req.CapacityMemoryMib = cfg.CapacityMemoryMib
+		req.CapacityVcpus = cfg.CapacityVcpus
+	}
+	return req
 }
 
 type proxyHealthResponse struct {
 	Capabilities []string `json:"capabilities"`
 }
 
-func sendHeartbeat(ctx context.Context, client *http.Client, url, token, proxyHealthURL string, log zerolog.Logger) {
+func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token, proxyHealthURL string, log zerolog.Logger) {
 	capabilities, err := proxyPreviewCapabilities(ctx, client, proxyHealthURL)
 	if err != nil {
 		log.Warn().Err(err).Msg("proxy capability probe failed; advertising no preview capabilities")
 		capabilities = nil
 	}
 
-	body, err := json.Marshal(heartbeatRequest{Capabilities: capabilities})
+	body, err := json.Marshal(buildHeartbeatRequest(cfg, capabilities))
 	if err != nil {
 		log.Error().Err(err).Msg("failed to encode heartbeat body")
 		return
@@ -116,9 +157,46 @@ func sendHeartbeat(ctx context.Context, client *http.Client, url, token, proxyHe
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	switch {
+	case resp.StatusCode == http.StatusConflict:
+		// Another live daemon holds this host identity. Keep heartbeating —
+		// the control plane refuses updates either way — but say why loudly:
+		// this is a provisioning error an operator must resolve.
+		log.Error().Int("status", resp.StatusCode).
+			Msg("heartbeat rejected: host identity in use by a live host at another address")
+	case resp.StatusCode != http.StatusOK:
 		log.Warn().Int("status", resp.StatusCode).Msg("heartbeat got non-200 response")
 	}
+}
+
+// DetectHostCapacity reports the machine's PHYSICAL memory (MiB) and
+// logical CPU count. Never advertised as capacity — the schedulable
+// capacity a host registers is explicitly configured, because physical
+// totals include everything the OS, the daemons, and the cgroup headroom
+// already spend, and publishing them as admission limits would over-admit.
+// Used only to sanity-check the configured values. Memory comes from
+// /proc/meminfo; on any read or parse failure it returns 0.
+func DetectHostCapacity() (memoryMib, vcpus int32) {
+	vcpus = int32(runtime.NumCPU())
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, vcpus
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0, vcpus
+		}
+		kb, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return 0, vcpus
+		}
+		return int32(kb / 1024), vcpus
+	}
+	return 0, vcpus
 }
 
 func proxyPreviewCapabilities(ctx context.Context, client *http.Client, healthURL string) ([]string, error) {

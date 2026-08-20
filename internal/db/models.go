@@ -369,6 +369,7 @@ type Host struct {
 	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
+	IdentityBound     bool               `json:"identity_bound"`
 }
 
 // Data-plane capabilities jointly advertised by the currently running host services. heartbeat_at must match host.last_heartbeat_at, so an old control-plane heartbeat automatically invalidates an attestation it cannot replace.

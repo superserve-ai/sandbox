@@ -126,6 +126,10 @@ type Scheduler interface {
 // HostRegistry resolves a host ID to a VMD client.
 type HostRegistry interface {
 	ClientFor(ctx context.Context, hostID string) (vmdclient.Client, error)
+	// Invalidate drops any cached client for hostID so the next ClientFor
+	// re-reads the host row. Callers that change a host's address must
+	// invalidate, or RPCs keep flowing to the previous machine.
+	Invalidate(hostID string)
 }
 
 // Handlers holds shared dependencies for all route handlers.

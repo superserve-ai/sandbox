@@ -276,6 +276,7 @@ func hostRow(h db.Host) *mockRow {
 		*dest[7].(*pgtype.Timestamptz) = h.LastHeartbeatAt
 		*dest[8].(*time.Time) = h.CreatedAt
 		*dest[9].(*time.Time) = h.UpdatedAt
+		*dest[10].(*bool) = h.IdentityBound
 		return nil
 	}}
 }
