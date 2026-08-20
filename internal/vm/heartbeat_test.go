@@ -37,7 +37,7 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 	}))
 	defer server.Close()
 
-	sendHeartbeat(context.Background(), server.Client(), server.URL+"/internal/hosts/host-a/heartbeat", "shared", server.URL+"/health", zerolog.Nop())
+	sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{}, server.URL+"/internal/hosts/host-a/heartbeat", "shared", server.URL+"/health", zerolog.Nop())
 
 	if gotPath != "/internal/hosts/host-a/heartbeat" {
 		t.Fatalf("path = %q", gotPath)
@@ -188,10 +188,49 @@ func TestSendHeartbeatOmitsCapabilityForOldOrUnavailableProxy(t *testing.T) {
 			}))
 			defer server.Close()
 
-			sendHeartbeat(context.Background(), server.Client(), server.URL+"/internal/hosts/host-a/heartbeat", "", server.URL+"/health", zerolog.Nop())
+			sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{}, server.URL+"/internal/hosts/host-a/heartbeat", "", server.URL+"/health", zerolog.Nop())
 			if len(got.Capabilities) != 0 {
 				t.Fatalf("capabilities = %#v, want empty", got.Capabilities)
 			}
 		})
+	}
+}
+
+// The heartbeat payload must stay byte-identical to the pre-registration
+// format unless a complete self-description is configured: control planes
+// that predate self-registration bind the body strictly and reject unknown
+// fields, so a partial or accidental description would kill every heartbeat.
+func TestBuildHeartbeatRequestOmitsIncompleteDescription(t *testing.T) {
+	full := HeartbeatConfig{
+		AdvertiseVMDAddr:   "10.0.0.5:50051",
+		AdvertiseProxyAddr: "10.0.0.5:5007",
+		Region:             "region-a",
+		CapacityMemoryMib:  1024,
+		CapacityVcpus:      8,
+	}
+
+	partials := map[string]HeartbeatConfig{
+		"nothing set":    {},
+		"missing vmd":    {AdvertiseProxyAddr: full.AdvertiseProxyAddr, Region: full.Region, CapacityMemoryMib: 1024, CapacityVcpus: 8},
+		"missing proxy":  {AdvertiseVMDAddr: full.AdvertiseVMDAddr, Region: full.Region, CapacityMemoryMib: 1024, CapacityVcpus: 8},
+		"missing region": {AdvertiseVMDAddr: full.AdvertiseVMDAddr, AdvertiseProxyAddr: full.AdvertiseProxyAddr, CapacityMemoryMib: 1024, CapacityVcpus: 8},
+		"zero memory":    {AdvertiseVMDAddr: full.AdvertiseVMDAddr, AdvertiseProxyAddr: full.AdvertiseProxyAddr, Region: full.Region, CapacityVcpus: 8},
+	}
+	legacy, _ := json.Marshal(heartbeatRequest{Capabilities: []string{"preview_ports_v1"}})
+	for name, cfg := range partials {
+		got, err := json.Marshal(buildHeartbeatRequest(cfg, []string{"preview_ports_v1"}))
+		if err != nil {
+			t.Fatalf("%s: marshal: %v", name, err)
+		}
+		if string(got) != string(legacy) {
+			t.Fatalf("%s: payload = %s, want legacy %s", name, got, legacy)
+		}
+	}
+
+	got, _ := json.Marshal(buildHeartbeatRequest(full, nil))
+	want := `{"capabilities":null,"vmd_addr":"10.0.0.5:50051","proxy_addr":"10.0.0.5:5007",` +
+		`"region":"region-a","capacity_memory_mib":1024,"capacity_vcpus":8}`
+	if string(got) != want {
+		t.Fatalf("full description = %s, want %s", got, want)
 	}
 }

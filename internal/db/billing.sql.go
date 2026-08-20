@@ -13,6 +13,20 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const activateTeamBilling = `-- name: ActivateTeamBilling :exec
+SELECT activate_team_billing($1, $2)
+`
+
+type ActivateTeamBillingParams struct {
+	TeamID        uuid.UUID `json:"team_id"`
+	StripeGrantID string    `json:"stripe_grant_id"`
+}
+
+func (q *Queries) ActivateTeamBilling(ctx context.Context, arg ActivateTeamBillingParams) error {
+	_, err := q.db.Exec(ctx, activateTeamBilling, arg.TeamID, arg.StripeGrantID)
+	return err
+}
+
 const applyTeamCreditGrant = `-- name: ApplyTeamCreditGrant :one
 UPDATE team_credit_grant
 SET remaining_usd = remaining_usd - $1,
@@ -259,6 +273,7 @@ INSERT INTO billing_usage_export (
     resource_type,
     stripe_customer_id,
     stripe_meter_event_identifier,
+    stripe_idempotency_key,
     stripe_event_name,
     value,
     status,
@@ -276,9 +291,10 @@ VALUES (
     $8,
     $9,
     $10,
-    $11
+    $11,
+    $12
 )
-RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at
+RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
 `
 
 type CreateBillingUsageExportParams struct {
@@ -288,6 +304,7 @@ type CreateBillingUsageExportParams struct {
 	ResourceType               string             `json:"resource_type"`
 	StripeCustomerID           *string            `json:"stripe_customer_id"`
 	StripeMeterEventIdentifier string             `json:"stripe_meter_event_identifier"`
+	StripeIdempotencyKey       *string            `json:"stripe_idempotency_key"`
 	StripeEventName            string             `json:"stripe_event_name"`
 	Value                      pgtype.Numeric     `json:"value"`
 	Status                     string             `json:"status"`
@@ -303,6 +320,7 @@ func (q *Queries) CreateBillingUsageExport(ctx context.Context, arg CreateBillin
 		arg.ResourceType,
 		arg.StripeCustomerID,
 		arg.StripeMeterEventIdentifier,
+		arg.StripeIdempotencyKey,
 		arg.StripeEventName,
 		arg.Value,
 		arg.Status,
@@ -325,6 +343,7 @@ func (q *Queries) CreateBillingUsageExport(ctx context.Context, arg CreateBillin
 		&i.CreatedAt,
 		&i.SentAt,
 		&i.UpdatedAt,
+		&i.StripeIdempotencyKey,
 	)
 	return i, err
 }
@@ -385,6 +404,68 @@ func (q *Queries) GetActiveTeamBillingPeriod(ctx context.Context, teamID uuid.UU
 		&i.GrossChargesUsd,
 		&i.CreditsAppliedUsd,
 		&i.NetInvoiceAmountUsd,
+	)
+	return i, err
+}
+
+const getBillingUsageExportByIdempotencyKey = `-- name: GetBillingUsageExportByIdempotencyKey :one
+SELECT id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
+FROM billing_usage_export
+WHERE stripe_idempotency_key = $1
+ORDER BY created_at DESC, id DESC
+LIMIT 1
+`
+
+func (q *Queries) GetBillingUsageExportByIdempotencyKey(ctx context.Context, stripeIdempotencyKey *string) (BillingUsageExport, error) {
+	row := q.db.QueryRow(ctx, getBillingUsageExportByIdempotencyKey, stripeIdempotencyKey)
+	var i BillingUsageExport
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.ResourceType,
+		&i.StripeCustomerID,
+		&i.StripeMeterEventIdentifier,
+		&i.StripeEventName,
+		&i.Value,
+		&i.Status,
+		&i.Error,
+		&i.CreatedAt,
+		&i.SentAt,
+		&i.UpdatedAt,
+		&i.StripeIdempotencyKey,
+	)
+	return i, err
+}
+
+const getBillingUsageExportByIdentifier = `-- name: GetBillingUsageExportByIdentifier :one
+SELECT id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
+FROM billing_usage_export
+WHERE stripe_meter_event_identifier = $1
+ORDER BY created_at DESC, id DESC
+LIMIT 1
+`
+
+func (q *Queries) GetBillingUsageExportByIdentifier(ctx context.Context, stripeMeterEventIdentifier string) (BillingUsageExport, error) {
+	row := q.db.QueryRow(ctx, getBillingUsageExportByIdentifier, stripeMeterEventIdentifier)
+	var i BillingUsageExport
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.ResourceType,
+		&i.StripeCustomerID,
+		&i.StripeMeterEventIdentifier,
+		&i.StripeEventName,
+		&i.Value,
+		&i.Status,
+		&i.Error,
+		&i.CreatedAt,
+		&i.SentAt,
+		&i.UpdatedAt,
+		&i.StripeIdempotencyKey,
 	)
 	return i, err
 }
@@ -454,23 +535,26 @@ func (q *Queries) GetTeamActivePricingPlan(ctx context.Context, teamID uuid.UUID
 }
 
 const getTeamBillingAccount = `-- name: GetTeamBillingAccount :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id
 FROM team_billing_account
 WHERE team_id = $1
 `
 
 type GetTeamBillingAccountRow struct {
-	TeamID                    uuid.UUID          `json:"team_id"`
-	StripeCustomerID          *string            `json:"stripe_customer_id"`
-	StripeSubscriptionID      *string            `json:"stripe_subscription_id"`
-	StripeSubscriptionStatus  *string            `json:"stripe_subscription_status"`
-	StripeInvoiceStatus       *string            `json:"stripe_invoice_status"`
-	StripeSubscriptionEventAt pgtype.Timestamptz `json:"stripe_subscription_event_at"`
-	CurrentPeriodStart        pgtype.Timestamptz `json:"current_period_start"`
-	CurrentPeriodEnd          pgtype.Timestamptz `json:"current_period_end"`
-	CancelAtPeriodEnd         bool               `json:"cancel_at_period_end"`
-	CreatedAt                 time.Time          `json:"created_at"`
-	UpdatedAt                 time.Time          `json:"updated_at"`
+	TeamID                          uuid.UUID          `json:"team_id"`
+	StripeCustomerID                *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID            *string            `json:"stripe_subscription_id"`
+	StripeSubscriptionStatus        *string            `json:"stripe_subscription_status"`
+	StripeInvoiceStatus             *string            `json:"stripe_invoice_status"`
+	StripeSubscriptionEventAt       pgtype.Timestamptz `json:"stripe_subscription_event_at"`
+	CurrentPeriodStart              pgtype.Timestamptz `json:"current_period_start"`
+	CurrentPeriodEnd                pgtype.Timestamptz `json:"current_period_end"`
+	CancelAtPeriodEnd               bool               `json:"cancel_at_period_end"`
+	CreatedAt                       time.Time          `json:"created_at"`
+	UpdatedAt                       time.Time          `json:"updated_at"`
+	TrialEndedAt                    pgtype.Timestamptz `json:"trial_ended_at"`
+	StripeActivationCreditGrantedAt pgtype.Timestamptz `json:"stripe_activation_credit_granted_at"`
+	StripeActivationCreditGrantID   *string            `json:"stripe_activation_credit_grant_id"`
 }
 
 func (q *Queries) GetTeamBillingAccount(ctx context.Context, teamID uuid.UUID) (GetTeamBillingAccountRow, error) {
@@ -488,28 +572,34 @@ func (q *Queries) GetTeamBillingAccount(ctx context.Context, teamID uuid.UUID) (
 		&i.CancelAtPeriodEnd,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.TrialEndedAt,
+		&i.StripeActivationCreditGrantedAt,
+		&i.StripeActivationCreditGrantID,
 	)
 	return i, err
 }
 
 const getTeamBillingAccountByStripeCustomerID = `-- name: GetTeamBillingAccountByStripeCustomerID :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id
 FROM team_billing_account
 WHERE stripe_customer_id = $1
 `
 
 type GetTeamBillingAccountByStripeCustomerIDRow struct {
-	TeamID                    uuid.UUID          `json:"team_id"`
-	StripeCustomerID          *string            `json:"stripe_customer_id"`
-	StripeSubscriptionID      *string            `json:"stripe_subscription_id"`
-	StripeSubscriptionStatus  *string            `json:"stripe_subscription_status"`
-	StripeInvoiceStatus       *string            `json:"stripe_invoice_status"`
-	StripeSubscriptionEventAt pgtype.Timestamptz `json:"stripe_subscription_event_at"`
-	CurrentPeriodStart        pgtype.Timestamptz `json:"current_period_start"`
-	CurrentPeriodEnd          pgtype.Timestamptz `json:"current_period_end"`
-	CancelAtPeriodEnd         bool               `json:"cancel_at_period_end"`
-	CreatedAt                 time.Time          `json:"created_at"`
-	UpdatedAt                 time.Time          `json:"updated_at"`
+	TeamID                          uuid.UUID          `json:"team_id"`
+	StripeCustomerID                *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID            *string            `json:"stripe_subscription_id"`
+	StripeSubscriptionStatus        *string            `json:"stripe_subscription_status"`
+	StripeInvoiceStatus             *string            `json:"stripe_invoice_status"`
+	StripeSubscriptionEventAt       pgtype.Timestamptz `json:"stripe_subscription_event_at"`
+	CurrentPeriodStart              pgtype.Timestamptz `json:"current_period_start"`
+	CurrentPeriodEnd                pgtype.Timestamptz `json:"current_period_end"`
+	CancelAtPeriodEnd               bool               `json:"cancel_at_period_end"`
+	CreatedAt                       time.Time          `json:"created_at"`
+	UpdatedAt                       time.Time          `json:"updated_at"`
+	TrialEndedAt                    pgtype.Timestamptz `json:"trial_ended_at"`
+	StripeActivationCreditGrantedAt pgtype.Timestamptz `json:"stripe_activation_credit_granted_at"`
+	StripeActivationCreditGrantID   *string            `json:"stripe_activation_credit_grant_id"`
 }
 
 func (q *Queries) GetTeamBillingAccountByStripeCustomerID(ctx context.Context, stripeCustomerID *string) (GetTeamBillingAccountByStripeCustomerIDRow, error) {
@@ -527,6 +617,9 @@ func (q *Queries) GetTeamBillingAccountByStripeCustomerID(ctx context.Context, s
 		&i.CancelAtPeriodEnd,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.TrialEndedAt,
+		&i.StripeActivationCreditGrantedAt,
+		&i.StripeActivationCreditGrantID,
 	)
 	return i, err
 }
@@ -789,6 +882,17 @@ func (q *Queries) IsFeatureEnabledForTeam(ctx context.Context, arg IsFeatureEnab
 	return enabled, err
 }
 
+const isTeamSandboxBillingEligible = `-- name: IsTeamSandboxBillingEligible :one
+SELECT team_sandbox_billing_eligible($1) AS eligible
+`
+
+func (q *Queries) IsTeamSandboxBillingEligible(ctx context.Context, teamID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, isTeamSandboxBillingEligible, teamID)
+	var eligible bool
+	err := row.Scan(&eligible)
+	return eligible, err
+}
+
 const listActivePricingRates = `-- name: ListActivePricingRates :many
 WITH ranked_rates AS (
     SELECT
@@ -952,12 +1056,12 @@ func (q *Queries) ListActivePricingRatesForTeam(ctx context.Context, arg ListAct
 }
 
 const listBillingUsageExportsForPeriod = `-- name: ListBillingUsageExportsForPeriod :many
-SELECT id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at
+SELECT id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
 FROM billing_usage_export
 WHERE team_id = $1
   AND period_start = $2
   AND period_end = $3
-ORDER BY created_at ASC
+ORDER BY created_at ASC, id ASC
 `
 
 type ListBillingUsageExportsForPeriodParams struct {
@@ -990,6 +1094,7 @@ func (q *Queries) ListBillingUsageExportsForPeriod(ctx context.Context, arg List
 			&i.CreatedAt,
 			&i.SentAt,
 			&i.UpdatedAt,
+			&i.StripeIdempotencyKey,
 		); err != nil {
 			return nil, err
 		}
@@ -1283,6 +1388,82 @@ func (q *Queries) ListTeamCreditGrants(ctx context.Context, teamID uuid.UUID) ([
 	return items, nil
 }
 
+const listTeamsWithActiveIneligibleSandboxes = `-- name: ListTeamsWithActiveIneligibleSandboxes :many
+SELECT DISTINCT s.team_id
+FROM sandbox s
+WHERE s.destroyed_at IS NULL
+  AND s.status = 'active'
+  AND NOT team_sandbox_billing_eligible(s.team_id)
+  AND s.team_id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+ORDER BY s.team_id
+LIMIT $2
+`
+
+type ListTeamsWithActiveIneligibleSandboxesParams struct {
+	AfterTeamID pgtype.UUID `json:"after_team_id"`
+	BatchLimit  int32       `json:"batch_limit"`
+}
+
+func (q *Queries) ListTeamsWithActiveIneligibleSandboxes(ctx context.Context, arg ListTeamsWithActiveIneligibleSandboxesParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listTeamsWithActiveIneligibleSandboxes, arg.AfterTeamID, arg.BatchLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var team_id uuid.UUID
+		if err := rows.Scan(&team_id); err != nil {
+			return nil, err
+		}
+		items = append(items, team_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTeamsWithActiveTrialSandboxes = `-- name: ListTeamsWithActiveTrialSandboxes :many
+SELECT DISTINCT s.team_id
+FROM sandbox s
+JOIN team_credit_grant g
+  ON g.team_id = s.team_id
+  AND g.reason = 'signup trial credit'
+LEFT JOIN team_billing_account a ON a.team_id = s.team_id
+WHERE s.destroyed_at IS NULL
+  AND s.status = 'active'
+  AND a.trial_ended_at IS NULL
+  AND s.team_id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+ORDER BY s.team_id
+LIMIT $2
+`
+
+type ListTeamsWithActiveTrialSandboxesParams struct {
+	AfterTeamID pgtype.UUID `json:"after_team_id"`
+	BatchLimit  int32       `json:"batch_limit"`
+}
+
+func (q *Queries) ListTeamsWithActiveTrialSandboxes(ctx context.Context, arg ListTeamsWithActiveTrialSandboxesParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listTeamsWithActiveTrialSandboxes, arg.AfterTeamID, arg.BatchLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var team_id uuid.UUID
+		if err := rows.Scan(&team_id); err != nil {
+			return nil, err
+		}
+		items = append(items, team_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUnresolvedBillingPeriodAnomalies = `-- name: ListUnresolvedBillingPeriodAnomalies :many
 SELECT id, team_id, period_start, period_end, severity, kind, sandbox_id, details, detected_at, resolved_at, resolved_by
 FROM billing_period_anomaly
@@ -1335,6 +1516,44 @@ func (q *Queries) ListUnresolvedBillingPeriodAnomalies(ctx context.Context, arg 
 		return nil, err
 	}
 	return items, nil
+}
+
+const markBillingUsageExportSent = `-- name: MarkBillingUsageExportSent :one
+UPDATE billing_usage_export
+SET status = 'sent',
+    sent_at = $1,
+    updated_at = now()
+WHERE id = $2
+  AND status = 'pending'
+RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
+`
+
+type MarkBillingUsageExportSentParams struct {
+	SentAt pgtype.Timestamptz `json:"sent_at"`
+	ID     uuid.UUID          `json:"id"`
+}
+
+func (q *Queries) MarkBillingUsageExportSent(ctx context.Context, arg MarkBillingUsageExportSentParams) (BillingUsageExport, error) {
+	row := q.db.QueryRow(ctx, markBillingUsageExportSent, arg.SentAt, arg.ID)
+	var i BillingUsageExport
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.ResourceType,
+		&i.StripeCustomerID,
+		&i.StripeMeterEventIdentifier,
+		&i.StripeEventName,
+		&i.Value,
+		&i.Status,
+		&i.Error,
+		&i.CreatedAt,
+		&i.SentAt,
+		&i.UpdatedAt,
+		&i.StripeIdempotencyKey,
+	)
+	return i, err
 }
 
 const markStripeWebhookEventFailed = `-- name: MarkStripeWebhookEventFailed :one
@@ -1606,6 +1825,19 @@ func (q *Queries) RecordTeamCreditLedgerEntry(ctx context.Context, arg RecordTea
 	return i, err
 }
 
+const refreshTeamTrialEligibility = `-- name: RefreshTeamTrialEligibility :exec
+INSERT INTO team_trial_eligibility_cache (team_id, eligible, updated_at)
+SELECT $1, refresh_team_trial_eligibility($1), now()
+ON CONFLICT (team_id) DO UPDATE
+SET eligible = EXCLUDED.eligible,
+    updated_at = EXCLUDED.updated_at
+`
+
+func (q *Queries) RefreshTeamTrialEligibility(ctx context.Context, teamID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, refreshTeamTrialEligibility, teamID)
+	return err
+}
+
 const resolveBillingPeriodAnomaly = `-- name: ResolveBillingPeriodAnomaly :one
 UPDATE billing_period_anomaly
 SET resolved_at = now(),
@@ -1635,6 +1867,43 @@ func (q *Queries) ResolveBillingPeriodAnomaly(ctx context.Context, arg ResolveBi
 		&i.DetectedAt,
 		&i.ResolvedAt,
 		&i.ResolvedBy,
+	)
+	return i, err
+}
+
+const setBillingUsageExportIdempotencyKey = `-- name: SetBillingUsageExportIdempotencyKey :one
+UPDATE billing_usage_export
+SET stripe_idempotency_key = $1,
+    updated_at = now()
+WHERE id = $2
+  AND (stripe_idempotency_key IS NULL OR stripe_idempotency_key = stripe_meter_event_identifier)
+RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
+`
+
+type SetBillingUsageExportIdempotencyKeyParams struct {
+	StripeIdempotencyKey *string   `json:"stripe_idempotency_key"`
+	ID                   uuid.UUID `json:"id"`
+}
+
+func (q *Queries) SetBillingUsageExportIdempotencyKey(ctx context.Context, arg SetBillingUsageExportIdempotencyKeyParams) (BillingUsageExport, error) {
+	row := q.db.QueryRow(ctx, setBillingUsageExportIdempotencyKey, arg.StripeIdempotencyKey, arg.ID)
+	var i BillingUsageExport
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.ResourceType,
+		&i.StripeCustomerID,
+		&i.StripeMeterEventIdentifier,
+		&i.StripeEventName,
+		&i.Value,
+		&i.Status,
+		&i.Error,
+		&i.CreatedAt,
+		&i.SentAt,
+		&i.UpdatedAt,
+		&i.StripeIdempotencyKey,
 	)
 	return i, err
 }
@@ -1703,7 +1972,7 @@ SET status = $1,
     sent_at = COALESCE($3, billing_usage_export.sent_at),
     updated_at = now()
 WHERE id = $4
-RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at
+RETURNING id, team_id, period_start, period_end, resource_type, stripe_customer_id, stripe_meter_event_identifier, stripe_event_name, value, status, error, created_at, sent_at, updated_at, stripe_idempotency_key
 `
 
 type UpdateBillingUsageExportStatusParams struct {
@@ -1736,6 +2005,7 @@ func (q *Queries) UpdateBillingUsageExportStatus(ctx context.Context, arg Update
 		&i.CreatedAt,
 		&i.SentAt,
 		&i.UpdatedAt,
+		&i.StripeIdempotencyKey,
 	)
 	return i, err
 }
@@ -1746,7 +2016,7 @@ VALUES ($1, $2)
 ON CONFLICT (team_id) DO UPDATE
 SET stripe_customer_id = EXCLUDED.stripe_customer_id,
     updated_at = now()
-RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id
 `
 
 type UpsertTeamBillingAccountCustomerParams struct {
@@ -1769,6 +2039,9 @@ func (q *Queries) UpsertTeamBillingAccountCustomer(ctx context.Context, arg Upse
 		&i.UpdatedAt,
 		&i.StripeInvoiceStatus,
 		&i.StripeSubscriptionEventAt,
+		&i.TrialEndedAt,
+		&i.StripeActivationCreditGrantedAt,
+		&i.StripeActivationCreditGrantID,
 	)
 	return i, err
 }
@@ -1806,7 +2079,7 @@ SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_acco
     current_period_end = COALESCE(EXCLUDED.current_period_end, team_billing_account.current_period_end),
     cancel_at_period_end = COALESCE($9, team_billing_account.cancel_at_period_end),
     updated_at = now()
-RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id
 `
 
 type UpsertTeamBillingAccountSubscriptionParams struct {
@@ -1846,6 +2119,9 @@ func (q *Queries) UpsertTeamBillingAccountSubscription(ctx context.Context, arg 
 		&i.UpdatedAt,
 		&i.StripeInvoiceStatus,
 		&i.StripeSubscriptionEventAt,
+		&i.TrialEndedAt,
+		&i.StripeActivationCreditGrantedAt,
+		&i.StripeActivationCreditGrantID,
 	)
 	return i, err
 }

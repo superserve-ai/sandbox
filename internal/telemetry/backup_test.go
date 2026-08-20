@@ -26,6 +26,43 @@ func TestBackupRecorderNilSafe(t *testing.T) {
 	}
 }
 
+// NewBackupRecorder calls newOTLPMeterProvider directly rather than going
+// through NewOTelRecorder, so it must resolve InstanceID itself — this
+// guards against that defaulting silently drifting out of sync between the
+// two constructors again (see resolveInstanceID).
+func TestNewBackupRecorderDefaultsInstanceID(t *testing.T) {
+	ctx := context.Background()
+
+	makeRecorder := func() *BackupRecorder {
+		t.Helper()
+		r, err := NewBackupRecorder(ctx, BackupOTelConfig{
+			HostID: "usw2",
+		})
+		if err != nil {
+			t.Fatalf("NewBackupRecorder: %v", err)
+		}
+		t.Cleanup(func() {
+			shutdownCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			// Best-effort: nothing is listening on the default OTLP
+			// endpoint in this test, so the force-flush inside Shutdown is
+			// expected to fail; that's orthogonal to what's under test.
+			_ = r.Shutdown(shutdownCtx)
+		})
+		return r
+	}
+
+	first := makeRecorder()
+	second := makeRecorder()
+
+	if first.instanceID == "" {
+		t.Fatal("NewBackupRecorder left InstanceID empty; every replica would export identical series")
+	}
+	if first.instanceID == second.instanceID {
+		t.Fatalf("two NewBackupRecorder calls produced the same instanceID %q", first.instanceID)
+	}
+}
+
 func TestSafeUploadResultBoundsValues(t *testing.T) {
 	for _, result := range []string{BackupUploadVerified, BackupUploadDeduped, BackupUploadAbandoned, BackupUploadFailed} {
 		if got := safeUploadResult(result); got != result {

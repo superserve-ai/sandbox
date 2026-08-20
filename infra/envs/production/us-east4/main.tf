@@ -200,6 +200,8 @@ module "api" {
     OTEL_EXPORT_INTERVAL        = "15s"
     OTEL_METRICS_ENABLED        = "true"
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
+    STRIPE_API_BASE_URL         = "https://api.stripe.com"
+    STRIPE_API_VERSION          = "2026-05-27.dahlia"
   }
 
   secrets = {
@@ -226,6 +228,15 @@ module "api" {
     }
     POSTHOG_KEY = {
       secret = "posthog-project-key"
+    }
+    STRIPE_SECRET_KEY = {
+      secret = "stripe-secret-key-use"
+    }
+    STRIPE_WEBHOOK_SECRET = {
+      secret = "stripe-webhook-secret-use"
+    }
+    STRIPE_METER_ERROR_WEBHOOK_SECRET = {
+      secret = "stripe-meter-error-webhook-secret-use"
     }
   }
 

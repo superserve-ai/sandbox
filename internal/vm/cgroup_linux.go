@@ -82,6 +82,7 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 	// A state-store read failure is FATAL: a corrupt/unreadable BoltDB means the
 	// daemon can't load any VM record (reattach and the reconciler both fail),
 	// so coming up "ready" would hide it and leave every cgroup VM unmanaged.
+	tScan := time.Now()
 	hasRecords, rerr := m.hasCgroupRecords()
 	if rerr != nil {
 		return false, fmt.Errorf("%w: cannot read state store: %v", ErrCgroupVMsUnmanageable, rerr)
@@ -99,6 +100,15 @@ func (m *Manager) ArmDirectSpawn(ctx context.Context) (bool, error) {
 			haveCgroupVMs = treeHas
 		}
 	}
+	// Detection (record + delegated-tree scan) split from the systemd/cgroup
+	// validation below, for startup timing. Async: the write must not sit on
+	// the startup path.
+	detectDur := time.Since(tScan)
+	haveVMs := haveCgroupVMs
+	go func() {
+		m.log.Info().Dur("cgroup_detect_ms", detectDur).Bool("has_cgroup_vms", haveVMs).
+			Msg("cgroup arm: detection scan")
+	}()
 	if !wantArm && !haveCgroupVMs {
 		return false, nil // nothing to arm, nothing to manage
 	}
@@ -374,16 +384,7 @@ func (m *Manager) hasCgroupRecords() (bool, error) {
 	if m.state == nil {
 		return false, nil
 	}
-	recs, err := m.state.All()
-	if err != nil {
-		return false, err
-	}
-	for _, r := range recs {
-		if cgroupSupervised(r.Supervision) {
-			return true, nil
-		}
-	}
-	return false, nil
+	return m.state.HasCgroupRecords()
 }
 
 // adoptVmsScope resolves and prepares the shipped superserve-vms.service

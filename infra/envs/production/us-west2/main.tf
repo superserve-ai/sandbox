@@ -219,6 +219,8 @@ module "api" {
     OTEL_EXPORT_INTERVAL        = "15s"
     OTEL_METRICS_ENABLED        = "true"
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
+    STRIPE_API_BASE_URL         = "https://api.stripe.com"
+    STRIPE_API_VERSION          = "2026-05-27.dahlia"
 
     # The serving host's identity for VMD-call metric labels, following
     # active_sandbox_host like the address above. Without it the wrapper
@@ -251,6 +253,15 @@ module "api" {
     }
     POSTHOG_KEY = {
       secret = "posthog-project-key"
+    }
+    STRIPE_SECRET_KEY = {
+      secret = "stripe-secret-key-usw"
+    }
+    STRIPE_WEBHOOK_SECRET = {
+      secret = "stripe-webhook-secret-usw"
+    }
+    STRIPE_METER_ERROR_WEBHOOK_SECRET = {
+      secret = "stripe-meter-error-webhook-secret-usw"
     }
   }
 
@@ -361,11 +372,20 @@ module "observability" {
   # metric label (HOST_ID on the host matches the instance name). Follows
   # active_sandbox_host so a standby promotion keeps the filter on whichever
   # host is actually emitting.
-  # Thresholds are the module defaults; the rationale for each sits on
-  # the module's variables.
+  # Thresholds are the module defaults except oldest_pending_age_duration;
+  # the rationale for each default sits on the module's variables.
   backup_alerts = {
     host_id        = local.metrics_host_id
     display_prefix = "Backup / ${local.active_host_name}"
+    # A share of this cell's traffic pauses in scheduled batches rather
+    # than steadily, confirmed via backup_journal_pending{priority="pause"}
+    # and the control plane's pause-endpoint request log. The module
+    # default's 15-minute window was shorter than a single batch's drain
+    # time, so it paged on every batch. 20 minutes plus the
+    # BACKUP_UPLOAD_CONCURRENCY bump in deploy-vmd.yml should clear a
+    # batch before this sustains, while still catching a drain that's
+    # actually stalled.
+    oldest_pending_age_duration = "1200s"
   }
   # Backup coverage: paused sandboxes with no verified backup at all,
   # sampled by the control plane from this cell's database. Created

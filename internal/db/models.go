@@ -328,6 +328,7 @@ type BillingUsageExport struct {
 	CreatedAt                  time.Time          `json:"created_at"`
 	SentAt                     pgtype.Timestamptz `json:"sent_at"`
 	UpdatedAt                  time.Time          `json:"updated_at"`
+	StripeIdempotencyKey       *string            `json:"stripe_idempotency_key"`
 }
 
 type DeviceCode struct {
@@ -368,6 +369,7 @@ type Host struct {
 	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
+	IdentityBound     bool               `json:"identity_bound"`
 }
 
 // Data-plane capabilities jointly advertised by the currently running host services. heartbeat_at must match host.last_heartbeat_at, so an old control-plane heartbeat automatically invalidates an attestation it cannot replace.
@@ -517,6 +519,8 @@ type Sandbox struct {
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
+	// True once any secret binding has existed for this sandbox; false when the sandbox was created without one; NULL for rows predating the column. Never cleared — a detached or failure-cleared binding may still have had a JWT minted against it. Destroy revokes unless this is false.
+	HadSecretBindings *bool `json:"had_secret_bindings"`
 }
 
 type SandboxActiveInterval struct {
@@ -663,17 +667,20 @@ type TeamActiveSandboxCount struct {
 }
 
 type TeamBillingAccount struct {
-	TeamID                    uuid.UUID          `json:"team_id"`
-	StripeCustomerID          *string            `json:"stripe_customer_id"`
-	StripeSubscriptionID      *string            `json:"stripe_subscription_id"`
-	StripeSubscriptionStatus  *string            `json:"stripe_subscription_status"`
-	CurrentPeriodStart        pgtype.Timestamptz `json:"current_period_start"`
-	CurrentPeriodEnd          pgtype.Timestamptz `json:"current_period_end"`
-	CancelAtPeriodEnd         bool               `json:"cancel_at_period_end"`
-	CreatedAt                 time.Time          `json:"created_at"`
-	UpdatedAt                 time.Time          `json:"updated_at"`
-	StripeInvoiceStatus       *string            `json:"stripe_invoice_status"`
-	StripeSubscriptionEventAt pgtype.Timestamptz `json:"stripe_subscription_event_at"`
+	TeamID                          uuid.UUID          `json:"team_id"`
+	StripeCustomerID                *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID            *string            `json:"stripe_subscription_id"`
+	StripeSubscriptionStatus        *string            `json:"stripe_subscription_status"`
+	CurrentPeriodStart              pgtype.Timestamptz `json:"current_period_start"`
+	CurrentPeriodEnd                pgtype.Timestamptz `json:"current_period_end"`
+	CancelAtPeriodEnd               bool               `json:"cancel_at_period_end"`
+	CreatedAt                       time.Time          `json:"created_at"`
+	UpdatedAt                       time.Time          `json:"updated_at"`
+	StripeInvoiceStatus             *string            `json:"stripe_invoice_status"`
+	StripeSubscriptionEventAt       pgtype.Timestamptz `json:"stripe_subscription_event_at"`
+	TrialEndedAt                    pgtype.Timestamptz `json:"trial_ended_at"`
+	StripeActivationCreditGrantedAt pgtype.Timestamptz `json:"stripe_activation_credit_granted_at"`
+	StripeActivationCreditGrantID   *string            `json:"stripe_activation_credit_grant_id"`
 }
 
 type TeamBillingPeriod struct {
@@ -778,6 +785,12 @@ type TeamSandboxCounter struct {
 	TeamID uuid.UUID `json:"team_id"`
 	Shard  int16     `json:"shard"`
 	Cnt    int32     `json:"cnt"`
+}
+
+type TeamTrialEligibilityCache struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	Eligible  bool      `json:"eligible"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type TelemetrySamplerLease struct {

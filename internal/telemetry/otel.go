@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/metric"
@@ -15,6 +16,18 @@ import (
 )
 
 const instrumentationName = "github.com/superserve-ai/sandbox/internal/telemetry"
+
+// latencyBuckets are the histogram boundaries (seconds) for every duration
+// instrument. The SDK default boundaries start at 5s, which flattens the
+// sub-second range all sandbox latencies live in; these cover 100µs–30min so
+// histogram_quantile can resolve millisecond-scale p50s, second-scale tails,
+// and the legitimately long operations (caller-timed execs, streaming
+// responses, boot-retry worst cases) from the same series. Anything past
+// 30 minutes is pathological and may collapse into +Inf.
+var latencyBuckets = []float64{
+	0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+	0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 900, 1800,
+}
 
 // OTelConfig contains the app-level metrics settings needed by the recorder.
 type OTelConfig struct {
@@ -31,6 +44,23 @@ type OTelConfig struct {
 	// alerted on per host. Empty (the control plane, which is not per-host)
 	// records as "unknown".
 	HostID string
+	// InstanceID identifies this specific process for the resource-level
+	// service.instance.id attribute. Every db_pool_*/vmd_call_*/etc. series
+	// this recorder emits shares the same metric name, service.name, and
+	// (for host-scoped calls) host_id — nothing distinguishes one process
+	// from another. That's invisible with exactly one process per service,
+	// but the control plane runs as multiple concurrent Cloud Run
+	// instances, so every replica exports identical series in the same
+	// window. The collector's resourcedetection/gcp processor only fills in
+	// a resource attribute when the sender didn't already set it (its
+	// override:false), and it has nothing GCP-native to detect for a
+	// Cloud Run OTLP client — so without InstanceID every replica's data
+	// collapses onto the collector's own host identity once it lands in
+	// Google Managed Prometheus, and GMP's one-point-per-series-per-request
+	// rule drops every write past the first. Left empty, NewOTelRecorder
+	// generates a random one so uniqueness never depends on the caller
+	// remembering to plumb one through.
+	InstanceID string
 }
 
 // OTelRecorder emits the sandbox control plane's bounded operational metrics
@@ -41,6 +71,7 @@ type OTelRecorder struct {
 	serviceName string
 	environment string
 	hostID      string
+	instanceID  string
 
 	sandboxTransitions       metric.Int64Counter
 	sandboxDuration          metric.Float64Histogram
@@ -49,6 +80,7 @@ type OTelRecorder struct {
 	resumeSettleWaitReads    metric.Int64Histogram
 	vmdCalls                 metric.Int64Counter
 	vmdDuration              metric.Float64Histogram
+	hostResolutionDuration   metric.Float64Histogram
 	hostVCPU                 metric.Int64Gauge
 	hostMemoryMiB            metric.Int64Gauge
 	hostSandboxes            metric.Int64Gauge
@@ -69,6 +101,7 @@ type OTelRecorder struct {
 	dbEmptyAcquire           metric.Int64Counter
 	dbCanceledAcquire        metric.Int64Counter
 	dbAcquireDurationSeconds metric.Float64Counter
+	phaseDuration            metric.Float64Histogram
 	pausedNetworkSlotsTotal  metric.Int64Gauge
 	pausedNetworkSlotsUsed   metric.Int64Gauge
 	pausedNetworkSlotsAvail  metric.Int64Gauge
@@ -96,6 +129,7 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	if cfg.ExportInterval <= 0 {
 		cfg.ExportInterval = 15 * time.Second
 	}
+	cfg.InstanceID = resolveInstanceID(cfg.InstanceID)
 
 	provider, err := newOTLPMeterProvider(ctx, cfg)
 	if err != nil {
@@ -108,17 +142,20 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		serviceName: cfg.ServiceName,
 		environment: cfg.Environment,
 		hostID:      safeHostID(cfg.HostID),
+		instanceID:  cfg.InstanceID,
 	}
 	if r.sandboxTransitions, err = meter.Int64Counter("sandbox_transition_total"); err != nil {
 		return nil, err
 	}
-	if r.sandboxDuration, err = meter.Float64Histogram("sandbox_transition_duration_seconds"); err != nil {
+	if r.sandboxDuration, err = meter.Float64Histogram("sandbox_transition_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
 		return nil, err
 	}
 	if r.resumeSettleWaits, err = meter.Int64Counter("sandbox_resume_settle_wait_total"); err != nil {
 		return nil, err
 	}
-	if r.resumeSettleWaitDuration, err = meter.Float64Histogram("sandbox_resume_settle_wait_duration_seconds"); err != nil {
+	if r.resumeSettleWaitDuration, err = meter.Float64Histogram("sandbox_resume_settle_wait_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
 		return nil, err
 	}
 	if r.resumeSettleWaitReads, err = meter.Int64Histogram("sandbox_resume_settle_wait_reads"); err != nil {
@@ -127,7 +164,16 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	if r.vmdCalls, err = meter.Int64Counter("vmd_call_total"); err != nil {
 		return nil, err
 	}
-	if r.vmdDuration, err = meter.Float64Histogram("vmd_call_duration_seconds"); err != nil {
+	if r.hostResolutionDuration, err = meter.Float64Histogram("host_resolution_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.vmdDuration, err = meter.Float64Histogram("vmd_call_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.phaseDuration, err = meter.Float64Histogram("sandbox_phase_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
 		return nil, err
 	}
 	if r.hostVCPU, err = meter.Int64Gauge("host_capacity_used_vcpu"); err != nil {
@@ -265,6 +311,21 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 	}
 }
 
+func (r *OTelRecorder) RecordHostResolution(ctx context.Context, h HostResolution) {
+	if r == nil {
+		return
+	}
+	kind := h.Kind
+	if kind != "cold" && kind != "due" {
+		kind = "other"
+	}
+	opt := metric.WithAttributes(r.attrs(
+		attribute.String("kind", kind),
+		attribute.String("result", safeResult(h.Result)),
+	)...)
+	r.hostResolutionDuration.Record(ctx, h.Duration.Seconds(), opt)
+}
+
 func (r *OTelRecorder) RecordHostCapacity(ctx context.Context, c HostCapacity) {
 	if r == nil {
 		return
@@ -350,6 +411,33 @@ func (r *OTelRecorder) RecordLauncherState(ctx context.Context, s LauncherState)
 		ready = 1
 	}
 	r.launcherReady.Record(ctx, ready, metric.WithAttributes(r.selfAttrs()...))
+}
+
+// RecordLatencyPhase emits one phase sample into the shared phase histogram.
+// Empty labels record as "unknown"/"none" so a missing value can never mint
+// an unbounded series, and the host label falls back to the recorder's own
+// host identity (vmd/proxy set it at construction; the control plane passes
+// the scheduled host per call).
+func (r *OTelRecorder) RecordLatencyPhase(ctx context.Context, p LatencyPhase) {
+	if r == nil {
+		return
+	}
+	host := p.HostID
+	if host == "" {
+		host = r.hostID
+	}
+	mode := p.Mode
+	if mode == "" {
+		mode = "none"
+	}
+	r.phaseDuration.Record(ctx, p.Duration.Seconds(), metric.WithAttributes(r.attrs(
+		attribute.String("plane", safeLabel(p.Plane)),
+		attribute.String("op", safeLabel(p.Op)),
+		attribute.String("phase", safeLabel(p.Phase)),
+		attribute.String("mode", safeLabel(mode)),
+		attribute.String("region", safeRegion(p.Region)),
+		attribute.String("host_id", safeHostID(host)),
+	)...))
 }
 
 func (r *OTelRecorder) RecordPausedNetworkPressure(ctx context.Context, p PausedNetworkPressure) {
@@ -461,6 +549,15 @@ func safeRegion(v string) string {
 	return v
 }
 
+// safeLabel bounds a metric label: empty records as "unknown" rather than an
+// empty string, keeping every series addressable in queries.
+func safeLabel(v string) string {
+	if v == "" {
+		return "unknown"
+	}
+	return v
+}
+
 func safeHostID(v string) string {
 	if v == "" {
 		return "unknown"
@@ -481,14 +578,7 @@ func newOTLPMeterProvider(ctx context.Context, cfg OTelConfig) (*sdkmetric.Meter
 		return nil, fmt.Errorf("create otlp metric exporter: %w", err)
 	}
 
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes("",
-			attribute.String("service.name", cfg.ServiceName),
-			attribute.String("service.version", cfg.ServiceVersion),
-			attribute.String("environment", cfg.Environment),
-		),
-	)
+	res, err := buildOTelResource(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create otel resource: %w", err)
 	}
@@ -497,4 +587,50 @@ func newOTLPMeterProvider(ctx context.Context, cfg OTelConfig) (*sdkmetric.Meter
 		sdkmetric.WithResource(res),
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(cfg.ExportInterval))),
 	), nil
+}
+
+// NewInstanceID generates a random per-process identity for
+// OTelConfig.InstanceID / BackupOTelConfig.InstanceID. A process that
+// constructs more than one recorder — vmd builds both an OTelRecorder and
+// a BackupRecorder — must call this once and pass the same value to every
+// recorder it builds. Left to each constructor's own default, every
+// recorder in the process mints its own random ID, and GMP ends up
+// representing one process as several different service.instance.id
+// targets instead of one.
+func NewInstanceID() string {
+	return resolveInstanceID("")
+}
+
+// resolveInstanceID returns id unchanged if the caller supplied one, or a
+// freshly generated one otherwise. Every constructor that builds a meter
+// provider (NewOTelRecorder, NewBackupRecorder) must call this itself
+// before using cfg.InstanceID: OTelConfig is passed by value throughout
+// this package, so a default applied only inside a shared helper like
+// newOTLPMeterProvider or buildOTelResource never propagates back to the
+// caller's copy, silently leaving that caller's resource attribute empty.
+func resolveInstanceID(id string) string {
+	if id != "" {
+		return id
+	}
+	return uuid.New().String()
+}
+
+// buildOTelResource is the process-level identity attached once per
+// MeterProvider (as opposed to attrs()/selfAttrs(), which are stamped on
+// every individual data point). cfg must already have InstanceID resolved
+// via resolveInstanceID — see NewOTelRecorder and NewBackupRecorder.
+func buildOTelResource(cfg OTelConfig) (*resource.Resource, error) {
+	return resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes("",
+			attribute.String("service.name", cfg.ServiceName),
+			attribute.String("service.version", cfg.ServiceVersion),
+			attribute.String("environment", cfg.Environment),
+			// Gives GMP's prometheus_target resource mapping a real
+			// per-process instance identity to key on instead of falling
+			// back to whatever the collector's own resourcedetection fills
+			// in — see OTelConfig.InstanceID.
+			attribute.String("service.instance.id", cfg.InstanceID),
+		),
+	)
 }

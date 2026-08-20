@@ -255,9 +255,10 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[22].(**int32) = s.AutoDeleteSeconds
 		*dest[23].(*pgtype.Timestamptz) = s.AutoDeleteAt
 		*dest[24].(*pgtype.Timestamptz) = s.FailedAt
-		if len(dest) == 26 {
+		*dest[25].(**bool) = s.HadSecretBindings
+		if len(dest) == 27 {
 			// GetSandboxWithPreviewPolicy: trailing COALESCE'd effective access.
-			*dest[25].(*string) = "legacy_public"
+			*dest[26].(*string) = "legacy_public"
 		}
 		return nil
 	}}
@@ -275,6 +276,7 @@ func hostRow(h db.Host) *mockRow {
 		*dest[7].(*pgtype.Timestamptz) = h.LastHeartbeatAt
 		*dest[8].(*time.Time) = h.CreatedAt
 		*dest[9].(*time.Time) = h.UpdatedAt
+		*dest[10].(*bool) = h.IdentityBound
 		return nil
 	}}
 }
@@ -3929,6 +3931,7 @@ func TestCreateSandbox_InsertCarriesTemplateShape(t *testing.T) {
 	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Scheduler: &stubScheduler{hostID: "public-host"}}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"shaped"}`))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusCreated, w.Body.String())

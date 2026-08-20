@@ -679,16 +679,23 @@ func fresherThan(path string, grace time.Duration) bool {
 // residue of a crash between staging and enqueue, or of an ack whose
 // cleanup was interrupted. Runs at startup before the uploader drains
 // and periodically from the drain loop thereafter.
-func SweepStaging(root string, j *Journal, log zerolog.Logger) {
+// SweepStats reports what a SweepStaging pass visited — a telemetry signal for
+// startup timing that callers may ignore.
+type SweepStats struct {
+	Sandboxes, Generations, Bases, Pending int
+}
+
+func SweepStaging(root string, j *Journal, log zerolog.Logger) SweepStats {
+	var stats SweepStats
 	if root == "" {
-		return
+		return stats
 	}
 	sandboxes, err := os.ReadDir(root)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Warn().Err(err).Msg("backup staging sweep: read root failed")
 		}
-		return
+		return stats
 	}
 	referenced, err := j.PendingBaseSHAs()
 	if err != nil {
@@ -710,6 +717,7 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 				continue
 			}
 			for _, b := range bases {
+				stats.Bases++
 				staged := filepath.Join(root, "bases", b.Name())
 				if !referenced[b.Name()] {
 					// Serialize with renewStaged and re-check freshness
@@ -726,6 +734,7 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 			}
 			continue
 		}
+		stats.Sandboxes++
 		sbDir := filepath.Join(root, sb.Name())
 		gens, err := os.ReadDir(sbDir)
 		if err != nil {
@@ -735,6 +744,7 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 			if !g.IsDir() {
 				continue
 			}
+			stats.Generations++
 			pending, err := j.HasPending(sb.Name(), g.Name())
 			if err != nil {
 				log.Warn().Err(err).Msg("backup staging sweep: journal lookup failed")
@@ -742,6 +752,7 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 			}
 			staged := filepath.Join(sbDir, g.Name())
 			if strings.HasPrefix(g.Name(), "pending-") {
+				stats.Pending++
 				// Marker-owned: the journal has no row for a pause that
 				// has not enqueued yet. Live markers renew the dir; only
 				// long-dead orphans are reaped.
@@ -766,6 +777,7 @@ func SweepStaging(root string, j *Journal, log zerolog.Logger) {
 		}
 		_ = os.Remove(sbDir)
 	}
+	return stats
 }
 
 // ResolveStagingRoot picks the staging tree location. The default lives
