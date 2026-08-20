@@ -27,13 +27,24 @@ on:
   push:
     branches: [main]
     paths:
+      # Every internal package the control-plane binary imports must be listed,
+      # or a change to it merges without deploying — silently, since a push that
+      # matches no path is not a skipped job but no job at all. The
+      # deploy-trigger-coverage CI check enforces this against `go list -deps`.
       - 'cmd/controlplane/**'
+      - 'internal/analytics/**'
       - 'internal/api/**'
+      - 'internal/auth/**'
+      - 'internal/authz/**'
+      - 'internal/billing/**'
+      - 'internal/builder/**'
       - 'internal/config/**'
       - 'internal/db/**'
       - 'internal/hostreg/**'
+      - 'internal/preview/**'
       - 'internal/scheduler/**'
       - 'internal/secrets/**'
+      - 'internal/sentrylog/**'
       - 'internal/supervisor/**'
       - 'internal/telemetry/**'
       - 'internal/vmdclient/**'

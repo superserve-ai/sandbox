@@ -140,3 +140,39 @@ jobs:
           done
           [ $fail -eq 0 ] && echo "all new migrations are correctly ordered"
           exit $fail
+
+  deploy-trigger-coverage:
+    name: Deploy Trigger Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # A push touching only paths absent from a deploy workflow's filters runs
+      # no job at all — the change merges and never ships, with nothing in the
+      # Actions tab to notice. Derive each binary's real dependencies and
+      # require the workflow to list them.
+      - name: Every imported package must trigger its deploy
+        run: |
+          fail=0
+          check() {
+            binary="$1" workflow="$2"
+            triggers=$(awk '/^on:/,/^jobs:/' "$workflow" | grep -oE "internal/[a-z]+" | sort -u)
+            deps=$(go list -deps "$binary" \
+              | grep 'superserve-ai/sandbox/internal/' \
+              | sed 's|.*/\(internal/[a-z]*\).*|\1|' | sort -u)
+            missing=$(comm -23 <(echo "$deps") <(echo "$triggers"))
+            if [ -n "$missing" ]; then
+              for pkg in $missing; do
+                echo "::error file=$workflow::$binary imports $pkg but $workflow does not list it — changes to $pkg would merge without deploying"
+              done
+              fail=1
+            fi
+          }
+          check ./cmd/controlplane .github/workflows/deploy-api.yml
+          check ./cmd/vmd .github/workflows/deploy-vmd.yml
+          [ $fail -eq 0 ] && echo "deploy triggers cover every imported package"
+          exit $fail
