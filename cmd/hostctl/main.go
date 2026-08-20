@@ -124,8 +124,12 @@ func (c client) waitDrained(hostID string) error {
 		if !quietSince.IsZero() && time.Since(quietSince) >= drainQuietWindow {
 			fmt.Printf("%s drained: counts zero continuously for %s.\n", hostID, drainQuietWindow)
 			if h.PausedCount > 0 {
-				fmt.Printf("NOT safe to retire: %d paused sandboxes have their snapshots on this host's local disk (%d without a durable backup — irrecoverable if the disk is lost).\n",
-					h.PausedCount, h.PausedUnbacked)
+				coverage := "backup coverage unknown — control plane predates coverage reporting"
+				if h.PausedUnbacked != nil {
+					coverage = fmt.Sprintf("%d without a durable backup — irrecoverable if the disk is lost", *h.PausedUnbacked)
+				}
+				fmt.Printf("NOT safe to retire: %d paused sandboxes have their snapshots on this host's local disk (%s).\n",
+					h.PausedCount, coverage)
 			}
 			return nil
 		}
@@ -172,7 +176,9 @@ type hostView struct {
 	TransitionalCount int     `json:"transitional_count"`
 	PausedCount       int     `json:"paused_count"`
 	BuildingCount     int     `json:"building_count"`
-	PausedUnbacked    int     `json:"paused_unbacked_count"`
+	// Pointer: a control plane predating coverage reporting omits the field,
+	// and "unknown" must never render as a safety-relevant 0.
+	PausedUnbacked *int `json:"paused_unbacked_count"`
 }
 
 func (c client) hostsPath(path string) ([]hostView, error) {
@@ -239,8 +245,12 @@ func (c client) list() error {
 				beat = fmt.Sprintf("%ds ago", int(time.Since(t).Seconds()))
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\n",
-			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount, h.PausedUnbacked)
+		unbacked := "?"
+		if h.PausedUnbacked != nil {
+			unbacked = fmt.Sprintf("%d", *h.PausedUnbacked)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\n",
+			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount, unbacked)
 	}
 	return w.Flush()
 }
