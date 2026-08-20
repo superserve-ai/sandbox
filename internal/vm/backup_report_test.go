@@ -233,3 +233,45 @@ func TestBackupReporterStripsObjectPathsForOldControlPlane(t *testing.T) {
 		t.Fatalf("attempts = %d, want a single non-stripped attempt", len(bodies))
 	}
 }
+
+// A control plane from before the pause token 400s the unknown field; the
+// reporter must degrade to a tokenless payload rather than dropping the
+// generation's only durable notification. A control plane predating BOTH
+// new fields rejects them one at a time, so the downgrades must chain.
+func TestBackupReporterStripsPauseTokenForOldControlPlane(t *testing.T) {
+	rejectToken := `{"error":{"code":"bad_request","message":"Invalid request body: json: unknown field \"pause_token\""}}`
+	rejectObject := `{"error":{"code":"bad_request","message":"Invalid request body: json: unknown field \"object\""}}`
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		// The strict decoder stops at the FIRST unknown field.
+		if strings.Contains(string(body), `"pause_token"`) {
+			http.Error(w, rejectToken, http.StatusBadRequest)
+			return
+		}
+		if strings.Contains(string(body), `"object"`) {
+			http.Error(w, rejectObject, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	r := &BackupReporter{ControlPlaneURL: srv.URL, HostID: "h", Token: "t", Bucket: "b", Log: zerolog.Nop()}
+	task := backup.Task{SandboxID: "sb", Generation: "g", FilesFinal: true,
+		PauseToken: "tok-1",
+		Files: []backup.TaskFile{{Name: "rootfs.ext4", SHA256: "aa", Size: 4,
+			Object: "sandboxes/sb/g/rootfs.ext4.pabc123"}}}
+
+	if err := r.Deliver(task); err != nil {
+		t.Fatalf("Deliver = %v, want nil after chained downgrades land", err)
+	}
+	if len(bodies) != 3 {
+		t.Fatalf("attempts = %d (%q), want 3: full, tokenless, tokenless+pathless", len(bodies), bodies)
+	}
+	if !strings.Contains(bodies[0], `"pause_token"`) ||
+		strings.Contains(bodies[1], `"pause_token"`) || !strings.Contains(bodies[1], `"object"`) ||
+		strings.Contains(bodies[2], `"pause_token"`) || strings.Contains(bodies[2], `"object"`) {
+		t.Fatalf("bodies = %q, want token stripped first, then object paths", bodies)
+	}
+}
