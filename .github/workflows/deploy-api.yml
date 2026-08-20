@@ -36,6 +36,7 @@ on:
       - 'internal/api/**'
       - 'internal/auth/**'
       - 'internal/authz/**'
+      - 'internal/backup/**'
       - 'internal/billing/**'
       - 'internal/builder/**'
       - 'internal/config/**'
