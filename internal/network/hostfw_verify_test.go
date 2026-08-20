@@ -963,6 +963,76 @@ func TestUnmarkedTwinsToleratedNeverDeleted(t *testing.T) {
 	}
 }
 
+func TestRepairRefusesToStarveObserverAbovePreroutingRedirect(t *testing.T) {
+	// An observer above a vmd redirect is tolerated by verification, but
+	// head-inserting the terminal redirects during a repair would starve it
+	// of the traffic it currently sees — refuse, like the strict case.
+	spec := testSpec(true)
+	stale := marked("-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", "9999")
+	observer := []string{"-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "LOG", "--log-prefix", "http:"}
+
+	rules, chains := specKernel(spec, nil)
+	rules["nat/PREROUTING"] = append([][]string{observer, stale}, rules["nat/PREROUTING"]...)
+	d, _ := parseIPTablesSave(renderDump(rules, chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err == nil {
+		t.Fatal("repair reordered past an observer above a vmd redirect")
+	}
+
+	// The same observer BELOW every vmd redirect loses nothing: repair runs.
+	rules, chains = specKernel(spec, nil)
+	rules["nat/PREROUTING"] = append(rules["nat/PREROUTING"], stale, observer)
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ = parseIPTablesSave(renderDump(k.rules, k.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair refused with observer below the redirects: %v", err)
+	}
+	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+		t.Fatalf("post-repair verify failed: %s %s", class, detail)
+	}
+}
+
+func TestRepairRefusesToPromoteTerminalNATBelowMasquerade(t *testing.T) {
+	spec := testSpec(true)
+	masq := marked("-s", "10.11.0.0/16", "-o", "eth0", "-j", "MASQUERADE")
+	snat := []string{"-s", "10.11.0.0/16", "-o", "eth0", "-j", "SNAT", "--to-source", "192.0.2.7"}
+
+	// Foreign terminal NAT below our effective MASQUERADE: re-appending ours
+	// would promote it into traffic ours handled first — refuse.
+	rules, chains := specKernel(spec, nil)
+	rules["nat/POSTROUTING"] = append(rules["nat/POSTROUTING"], snat, masq) // dup forces repair
+	d, _ := parseIPTablesSave(renderDump(rules, chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err == nil {
+		t.Fatal("repair promoted a foreign terminal NAT rule past the MASQUERADE")
+	}
+
+	// The same rule ABOVE ours is already effective; repair keeps that
+	// relative order and proceeds.
+	rules, chains = specKernel(spec, nil)
+	rules["nat/POSTROUTING"] = append([][]string{snat}, append(rules["nat/POSTROUTING"], masq)...)
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+	d, _ = parseIPTablesSave(renderDump(k.rules, k.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair refused with foreign NAT already above: %v", err)
+	}
+	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+		t.Fatalf("post-repair verify failed: %s %s", class, detail)
+	}
+
+	// An observer below ours cannot change a verdict: repair proceeds.
+	rules, chains = specKernel(spec, nil)
+	rules["nat/POSTROUTING"] = append(rules["nat/POSTROUTING"], []string{"-s", "10.11.0.0/16", "-j", "LOG"}, masq)
+	k2 := &fakeKernel{rules: rules, chains: chains}
+	defer k2.install(t)()
+	d, _ = parseIPTablesSave(renderDump(k2.rules, k2.chains))
+	if err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+		t.Fatalf("repair refused with observer below: %v", err)
+	}
+}
+
 func TestNonOwnerFastPathOnOwnerConfiguredHost(t *testing.T) {
 	// Template-builder alongside a running daemon: the daemon's marked jumps
 	// and redirects are absent from the non-owner's partial spec and must

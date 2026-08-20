@@ -164,7 +164,14 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 //
 // A veth-capable AMBIGUOUS foreign rule above the security block still
 // aborts without mutation: head-inserting our rules would demote its unknown
-// control flow below our enforcement, and that call is the operator's.
+// control flow below our enforcement, and that call is the operator's. The
+// same refusal covers nat rules whose EFFECTIVE position repair would change:
+// a strict or observer foreign rule above a vmd PREROUTING redirect (head-
+// inserting the terminal redirects would starve it of matching traffic), and
+// a terminal-capable foreign rule below a vmd nat plumbing rule (re-appending
+// ours at the tail would promote it into the traffic ours handled first).
+// filter/FORWARD needs neither: its head rules are non-shadowing drops, and
+// promoting strictness there is acceptable by design.
 // OWNER ONLY.
 func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) error {
 	perTable := map[string][]string{} // table → restore lines
@@ -226,8 +233,51 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) e
 						break
 					}
 				}
-				if !isOurs && !staleVMDRule(key, g, want) && !unmarkedTwin(g, want) && !ruleCannotMatchSandboxIngress(g) && foreignDisposition(g) == "strict" {
-					return fmt.Errorf("stricter foreign rule above a vmd redirect in %s (%s) — refusing to reorder past it", key, strings.Join(g, " "))
+				if !isOurs && !staleVMDRule(key, g, want) && !unmarkedTwin(g, want) && !ruleCannotMatchSandboxIngress(g) {
+					switch foreignDisposition(g) {
+					case "strict", "observer":
+						return fmt.Errorf("foreign %s rule above a vmd redirect in %s (%s) — head-inserting the terminal redirects would starve it of matching traffic; refusing", foreignDisposition(g), key, strings.Join(g, " "))
+					}
+				}
+			}
+		}
+		// nat plumbing is re-appended at the tail, which promotes any foreign
+		// rule currently sitting below our effective copy. In nat a promoted
+		// terminal rule (SNAT, MASQUERADE, ACCEPT, ...) changes the mapping
+		// for traffic our rule handled first — refuse rather than reorder
+		// across it. Strict, inert, and observer rules cannot change a
+		// verdict, so their promotion is harmless.
+		if table == "nat" {
+			for _, w := range want {
+				if headRule(key, w) {
+					continue
+				}
+				first := -1
+				for i, g := range got {
+					if ruleEqual(w.args, g) {
+						first = i
+						break
+					}
+				}
+				if first == -1 {
+					continue
+				}
+				for _, g := range got[first+1:] {
+					isOurs := false
+					for _, o := range want {
+						if ruleEqual(o.args, g) {
+							isOurs = true
+							break
+						}
+					}
+					if isOurs || staleVMDRule(key, g, want) || unmarkedTwin(g, want) || ruleCannotMatchSandboxIngress(g) {
+						continue
+					}
+					switch foreignDisposition(g) {
+					case "strict", "inert", "observer":
+					default:
+						return fmt.Errorf("foreign terminal-capable rule below a vmd nat rule in %s (%s) — re-appending ours would promote it; refusing", key, strings.Join(g, " "))
+					}
 				}
 			}
 		}
