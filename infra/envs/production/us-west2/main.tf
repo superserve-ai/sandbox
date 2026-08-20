@@ -219,6 +219,8 @@ module "api" {
     OTEL_EXPORT_INTERVAL        = "15s"
     OTEL_METRICS_ENABLED        = "true"
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
+    STRIPE_API_BASE_URL         = "https://api.stripe.com"
+    STRIPE_API_VERSION          = "2026-05-27.dahlia"
 
     # The serving host's identity for VMD-call metric labels, following
     # active_sandbox_host like the address above. Without it the wrapper
@@ -251,6 +253,15 @@ module "api" {
     }
     POSTHOG_KEY = {
       secret = "posthog-project-key"
+    }
+    STRIPE_SECRET_KEY = {
+      secret = "stripe-secret-key-usw"
+    }
+    STRIPE_WEBHOOK_SECRET = {
+      secret = "stripe-webhook-secret-usw"
+    }
+    STRIPE_METER_ERROR_WEBHOOK_SECRET = {
+      secret = "stripe-meter-error-webhook-secret-usw"
     }
   }
 
