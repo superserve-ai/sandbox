@@ -342,3 +342,57 @@ func TestPressureReadyStaysClosedOnOrphansOrFailedScan(t *testing.T) {
 		t.Fatal("PressureReady = false after a clean, conclusive pass")
 	}
 }
+
+// A stale record's failure handling has two legitimate endings, and the
+// publication gate must read them differently:
+//   - unit-supervised, stop unconfirmed: the record is PARKED as Error in
+//     the instance map — represented, its allocation still counted — so
+//     the gate may open;
+//   - cgroup-supervised, death unprovable (no delegated subtree, or a
+//     populated group): reattach returns with the record retained and NO
+//     instance — a possibly-live Firecracker pressure cannot see — so
+//     the gate must stay closed.
+func TestPressureReadyStaysClosedOnRetainedUnrepresentedRecord(t *testing.T) {
+	listActiveFCUnits = func(context.Context) ([]string, error) { return nil, nil }
+	origDown, origStop := vmUnitFullyDown, staleUnitStopConfirmed
+	defer func() {
+		listActiveFCUnits = listActiveFirecrackerUnits
+		vmUnitFullyDown, staleUnitStopConfirmed = origDown, origStop
+	}()
+	vmUnitFullyDown = func(string) bool { return false }                          // not provably terminal
+	staleUnitStopConfirmed = func(context.Context, string) bool { return false } // stop unconfirmed
+
+	run := func(t *testing.T, supervision Supervision) *Manager {
+		dir := t.TempDir()
+		st, err := OpenStateStore(filepath.Join(dir, "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		if err := st.Put(VMRecord{ID: "vm-1", Status: StatusRunning,
+			Supervision: supervision,
+			SocketPath:  filepath.Join(dir, "missing.sock")}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{log: zerolog.Nop(), state: st,
+			vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+		m.ReattachAll(context.Background())
+		return m
+	}
+
+	// Cgroup mode with no delegated subtree: death unprovable, record
+	// retained, no instance — closed.
+	if m := run(t, SupervisionCgroup); m.PressureReady() {
+		t.Fatal("PressureReady = true with a retained, unrepresented cgroup record")
+	}
+
+	// Unit mode: the unconfirmed stop parks the record as Error IN the
+	// map — represented and counted — so the gate opens.
+	m := run(t, SupervisionUnit)
+	if !m.PressureReady() {
+		t.Fatal("PressureReady = false for a parked (represented) Error record")
+	}
+	if _, ok := m.vms["vm-1"]; !ok {
+		t.Fatal("parked record not in the instance map")
+	}
+}

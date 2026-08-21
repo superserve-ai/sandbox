@@ -3278,6 +3278,33 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	// BoltDB records). Stale records deleted above free their own namespace
 	// inline (see reattachRecord), so a re-sweep isn't needed.
 
+	// Final invariant, checked over OUTCOMES rather than by classifying
+	// reattach's internal paths (which would rot as reattach evolves):
+	// every startup record must have ended either REPRESENTED (an
+	// instance in the map — running, paused, or parked Error, all of
+	// which pressure can see) or CONCLUSIVELY GONE (its stale cleanup
+	// deleted the record). A record that is neither — retained in the
+	// store with no instance, e.g. a cgroup VM whose socket vanished and
+	// whose stop could not be confirmed — is a possibly-live VM that
+	// pressure cannot count, so publication stays closed.
+	if conclusive {
+		for _, rec := range records {
+			m.mu.RLock()
+			_, represented := m.vms[rec.ID]
+			m.mu.RUnlock()
+			if represented {
+				continue
+			}
+			cur, gerr := m.state.Get(rec.ID)
+			if gerr != nil || cur != nil {
+				conclusive = false
+				m.log.Warn().Str("vm_id", rec.ID).
+					Msg("startup record neither represented nor removed; pressure publication stays suppressed")
+				break
+			}
+		}
+	}
+
 	// Explicit store at the SUCCESSFUL return, never a defer: a defer runs
 	// during panic unwinding too, and a panic mid-pass would mark a
 	// half-rebuilt map ready — publishing exactly the partial snapshot
