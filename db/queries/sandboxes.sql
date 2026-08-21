@@ -444,6 +444,42 @@ SELECT p.*
 FROM paused p
 LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id;
 
+-- name: RevertPauseToActive :one
+-- BeginPause's mirror for the failed-pause compensation path: status back to
+-- 'active' AND the interval reopened in one statement, so an error between
+-- two separate writes cannot leave an active sandbox unbilled, and the reopen
+-- applies only to the row THIS statement moved out of 'pausing' — a
+-- concurrent transition cannot interleave between the two facts. Gated on
+-- status = 'pausing': if another actor already moved the sandbox on
+-- (delete, reaper failover), their transition wins and this returns 0.
+WITH reverted AS (
+  UPDATE sandbox
+  SET status = 'active', updated_at = now()
+  WHERE sandbox.id = sqlc.arg(sandbox_id)
+    AND sandbox.team_id = sqlc.arg(team_id)
+    AND sandbox.destroyed_at IS NULL
+    AND sandbox.status = 'pausing'
+  RETURNING id, team_id, vcpu_count, memory_mib
+),
+opened_active AS (
+  INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
+  SELECT r.id, r.team_id, sqlc.arg(actor_id), now()
+  FROM reverted r
+  ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+  RETURNING sandbox_id
+),
+opened_billing AS (
+  INSERT INTO sandbox_compute_billing_interval (
+    sandbox_id, team_id, vcpu_count, memory_mib, started_at
+  )
+  SELECT r.id, r.team_id, r.vcpu_count, r.memory_mib, now()
+  FROM opened_active oa
+  JOIN reverted r ON r.id = oa.sandbox_id
+  WHERE feature_enabled('billing_metrics_write', r.team_id)
+  ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+)
+SELECT count(*) FROM reverted;
+
 -- name: BeginResume :one
 -- Atomic claim for resume: transitions 'paused' to 'resuming' in one
 -- statement. A 0-row result means another resume (explicit or auto) has

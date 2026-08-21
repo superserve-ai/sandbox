@@ -2295,6 +2295,56 @@ func (q *Queries) PublishPort(ctx context.Context, arg PublishPortParams) (Publi
 	return i, err
 }
 
+const revertPauseToActive = `-- name: RevertPauseToActive :one
+WITH reverted AS (
+  UPDATE sandbox
+  SET status = 'active', updated_at = now()
+  WHERE sandbox.id = $1
+    AND sandbox.team_id = $2
+    AND sandbox.destroyed_at IS NULL
+    AND sandbox.status = 'pausing'
+  RETURNING id, team_id, vcpu_count, memory_mib
+),
+opened_active AS (
+  INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
+  SELECT r.id, r.team_id, $3, now()
+  FROM reverted r
+  ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+  RETURNING sandbox_id
+),
+opened_billing AS (
+  INSERT INTO sandbox_compute_billing_interval (
+    sandbox_id, team_id, vcpu_count, memory_mib, started_at
+  )
+  SELECT r.id, r.team_id, r.vcpu_count, r.memory_mib, now()
+  FROM opened_active oa
+  JOIN reverted r ON r.id = oa.sandbox_id
+  WHERE feature_enabled('billing_metrics_write', r.team_id)
+  ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+)
+SELECT count(*) FROM reverted
+`
+
+type RevertPauseToActiveParams struct {
+	SandboxID uuid.UUID   `json:"sandbox_id"`
+	TeamID    uuid.UUID   `json:"team_id"`
+	ActorID   pgtype.UUID `json:"actor_id"`
+}
+
+// BeginPause's mirror for the failed-pause compensation path: status back to
+// 'active' AND the interval reopened in one statement, so an error between
+// two separate writes cannot leave an active sandbox unbilled, and the reopen
+// applies only to the row THIS statement moved out of 'pausing' — a
+// concurrent transition cannot interleave between the two facts. Gated on
+// status = 'pausing': if another actor already moved the sandbox on
+// (delete, reaper failover), their transition wins and this returns 0.
+func (q *Queries) RevertPauseToActive(ctx context.Context, arg RevertPauseToActiveParams) (int64, error) {
+	row := q.db.QueryRow(ctx, revertPauseToActive, arg.SandboxID, arg.TeamID, arg.ActorID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const revertResumeToPaused = `-- name: RevertResumeToPaused :exec
 UPDATE sandbox
 SET status = 'paused',
