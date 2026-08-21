@@ -253,15 +253,17 @@ type AuditLog struct {
 }
 
 type BackupGeneration struct {
-	ID          uuid.UUID   `json:"id"`
-	SandboxID   pgtype.UUID `json:"sandbox_id"`
-	TemplateID  pgtype.UUID `json:"template_id"`
-	BuildID     *string     `json:"build_id"`
-	Generation  string      `json:"generation"`
-	Bucket      string      `json:"bucket"`
-	CompletedAt time.Time   `json:"completed_at"`
-	ReportedAt  time.Time   `json:"reported_at"`
-	Files       []byte      `json:"files"`
+	ID                        uuid.UUID   `json:"id"`
+	SandboxID                 pgtype.UUID `json:"sandbox_id"`
+	TemplateID                pgtype.UUID `json:"template_id"`
+	BuildID                   *string     `json:"build_id"`
+	Generation                string      `json:"generation"`
+	Bucket                    string      `json:"bucket"`
+	CompletedAt               time.Time   `json:"completed_at"`
+	ReportedAt                time.Time   `json:"reported_at"`
+	Files                     []byte      `json:"files"`
+	CoveredSnapshotID         pgtype.UUID `json:"covered_snapshot_id"`
+	CoveredSnapshotGeneration *int64      `json:"covered_snapshot_generation"`
 }
 
 type BillingPeriodAnomaly struct {
@@ -646,6 +648,7 @@ type Snapshot struct {
 	MemPath    *string   `json:"mem_path"`
 	Generation int64     `json:"generation"`
 	Name       *string   `json:"name"`
+	PauseToken *string   `json:"pause_token"`
 }
 
 type StripeWebhookEvent struct {

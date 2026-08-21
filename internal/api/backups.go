@@ -22,8 +22,19 @@ import (
 
 // errFinalizeInFlight rolls a report's transaction back when the
 // sandbox is mid-finalize: coverage re-records idempotently on
-// redelivery, and the size sync lands once the snapshot row exists.
+// redelivery, and the link and size sync land once the snapshot row
+// exists.
 var errFinalizeInFlight = errors.New("pause finalization in flight")
+
+// finalizeInFlight reports whether a FinalizePause may be about to commit
+// for this sandbox: 'pausing' on the normal pause path, 'resuming' on the
+// resume-revert path (pauseAndRevert finalizes a pause from that status).
+// Bounded by recency so a permanently stranded transition cannot
+// head-of-line-block the host's outbox forever.
+func finalizeInFlight(status string, updatedAt time.Time) bool {
+	return (status == "pausing" || status == "resuming") &&
+		time.Since(updatedAt) < 10*time.Minute
+}
 
 // maxBackupReportFiles bounds a report's manifest jsonb. Sandbox
 // generations carry a handful of files, but template builds ship every
@@ -70,13 +81,18 @@ type backupFileReport struct {
 // the host's durable outbox; the insert is idempotent on
 // (owner, bucket, generation).
 type backupReport struct {
-	SandboxID   string             `json:"sandbox_id,omitempty"`
-	TemplateID  string             `json:"template_id,omitempty"`
-	BuildID     string             `json:"build_id,omitempty"`
-	Generation  string             `json:"generation"`
-	Bucket      string             `json:"bucket"`
-	CompletedAt time.Time          `json:"completed_at"`
-	Files       []backupFileReport `json:"files"`
+	SandboxID   string    `json:"sandbox_id,omitempty"`
+	TemplateID  string    `json:"template_id,omitempty"`
+	BuildID     string    `json:"build_id,omitempty"`
+	Generation  string    `json:"generation"`
+	Bucket      string    `json:"bucket"`
+	CompletedAt time.Time `json:"completed_at"`
+	// PauseToken echoes the identity this control plane minted for the
+	// pause that produced the generation (threaded through the pause RPC
+	// and the host's journal). Empty from older hosts and pre-token
+	// outbox entries.
+	PauseToken string             `json:"pause_token,omitempty"`
+	Files      []backupFileReport `json:"files"`
 }
 
 // validateReportedObject pins an optional per-file object path to the
@@ -226,7 +242,7 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 				return err
 			}
 			haveSandbox = err == nil
-			if haveSandbox && sbRow.Status == "pausing" && time.Since(sbRow.UpdatedAt) < 10*time.Minute {
+			if haveSandbox && finalizeInFlight(string(sbRow.Status), sbRow.UpdatedAt) {
 				return errFinalizeInFlight
 			}
 		}
@@ -266,21 +282,26 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 			}
 			return err
 		}
-		// 'pausing' means FinalizePause has not committed this pause's
-		// snapshot row yet (it takes the same row lock we now hold): a
-		// fast upload's report arriving in that window would match the
-		// PREVIOUS snapshot's vmstate and silently skip the new one's
-		// size sync forever, since a 200 clears the host's outbox. Roll
-		// the whole transaction back as retryable instead; redelivery
-		// re-records coverage idempotently and the sync lands once the
-		// finalize has committed.
+		// A transitional status means a FinalizePause may commit this
+		// sandbox's next snapshot row at any moment (it takes the same
+		// row lock we now hold): 'pausing' on the normal path, and
+		// 'resuming' because pauseAndRevert re-pauses a VM whose resume
+		// finalization failed — the sandbox stays 'resuming' from
+		// PauseInstance until that finalize lands. A fast or deduplicated
+		// upload reporting in either window would be evaluated against
+		// the PREVIOUS snapshot's manifest and token, fail to link, and
+		// return 200 — clearing the host's outbox before the pause it
+		// covers exists to link against. Roll the whole transaction back
+		// as retryable instead; redelivery re-records coverage
+		// idempotently and the link and size sync land once the finalize
+		// has committed.
 		// Time-bounded: a finalize that failed permanently leaves the
-		// sandbox stranded in 'pausing' with no retry scheduled, and an
-		// unconditional 503 would head-of-line-block the host's outbox
-		// forever. A fresh 'pausing' retries; a stale one proceeds, and
-		// the vmstate match below skips the sync exactly as for any
-		// other settled mismatch.
-		if row.Status == "pausing" && time.Since(row.UpdatedAt) < 10*time.Minute {
+		// sandbox stranded in a transitional status with no retry
+		// scheduled, and an unconditional 503 would head-of-line-block
+		// the host's outbox forever. A fresh transition retries; a stale
+		// one proceeds, and the identity checks below refuse exactly as
+		// for any other settled mismatch.
+		if finalizeInFlight(string(row.Status), row.UpdatedAt) {
 			return errFinalizeInFlight
 		}
 		manifest, err := q.LatestSnapshotManifest(ctx, sandboxID)
@@ -313,15 +334,59 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		// report contradicts (or lacks) means it describes a different
 		// pause. Rows are vmstate-only today and tighten the match
 		// automatically as richer manifests appear.
-		if !hasDisk || !hasVMState {
-			return nil
-		}
-		for _, row := range manifest {
-			if byName[row.FileName] != row.Sha256 {
-				return nil
+		contentMatch := hasDisk && hasVMState
+		if contentMatch {
+			for _, row := range manifest {
+				if byName[row.FileName] != row.Sha256 {
+					contentMatch = false
+					break
+				}
 			}
 		}
 		snapshotID := manifest[0].SnapshotID
+		// Coverage links — the operator's retirement gate — require a
+		// VERIFIED pause identity: content match plus STRICT token
+		// equality, both sides non-empty. There is deliberately no
+		// tokenless fallback: pause-time manifests are vmstate-only, and
+		// vmstate digest coincidence across pauses is exactly the
+		// evidence the migration refused to backfill links from —
+		// accepting it live while refusing it historically would be
+		// incoherent. A pause finalized without a token (older daemon, or
+		// an old control-plane replica that minted none) therefore stays
+		// unlinked and reads unbacked until the sandbox next pauses
+		// through the token path: over-reported risk, never a false zero,
+		// converging as the fleet does. A STALE token — an old replica's
+		// legacy one-row upsert preserving the column it does not mention
+		// — cannot reach this predicate: the migration's trigger clears a
+		// token whose value did not move across a generation advance, so
+		// the row reads honestly tokenless (unlinked) rather than
+		// mislinkable when the old pause's delayed report carries a
+		// colliding vmstate digest.
+		linkable := contentMatch && req.PauseToken != "" &&
+			req.PauseToken == manifest[0].PauseToken
+		if linkable {
+			// Persist the verdict as the generation's coverage identity
+			// (snapshot row + its per-pause generation counter) so
+			// coverage reads never re-derive it from timestamps or
+			// content.
+			if err := q.MarkSandboxBackupCovered(ctx, db.MarkSandboxBackupCoveredParams{
+				SandboxID:          pgtype.UUID{Bytes: sandboxID, Valid: true},
+				Bucket:             req.Bucket,
+				Generation:         req.Generation,
+				SnapshotID:         pgtype.UUID{Bytes: snapshotID, Valid: true},
+				SnapshotGeneration: &manifest[0].SnapshotGeneration,
+			}); err != nil {
+				return err
+			}
+		}
+		// Size sync is a SEPARATE, lower-stakes concern (display sizes,
+		// not the retirement gate) and predates tokens: it keeps its
+		// original content gate for token-free pairs so old-daemon fleets
+		// don't regress, refusing only a definite token disagreement —
+		// that report provably describes another pause's artifacts.
+		if !contentMatch || req.PauseToken != manifest[0].PauseToken {
+			return nil
+		}
 		if err := q.SetSnapshotSizeBytes(ctx, db.SetSnapshotSizeBytesParams{
 			ID: snapshotID, SizeBytes: total,
 		}); err != nil {

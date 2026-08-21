@@ -239,6 +239,19 @@ SET status = 'building',
 WHERE template_build.id = $1 AND template_build.status = 'pending'
   AND COALESCE((SELECT th.status = 'active' FROM target_host th), true);
 
+-- name: RequeueBuildDispatch :execrows
+-- Returns a just-claimed build to pending after a TRANSIENT dispatch
+-- failure (e.g. a host-resolution timeout), so the next tick retries it
+-- instead of failing a customer's build on a blip. Bounded: the pending
+-- reap keys on created_at, so requeueing never extends a build's life.
+UPDATE template_build
+SET status = 'pending',
+    vmd_host_id = NULL,
+    vmd_build_vm_id = NULL,
+    started_at = NULL,
+    updated_at = now()
+WHERE id = $1 AND status = 'building';
+
 -- name: ListActiveBuilds :many
 -- Read-only: builds the supervisor is currently watching. Used per tick to
 -- poll vmd for status. No row-level lock — these are already past 'pending'.
@@ -345,7 +358,11 @@ WHERE t.id = build_done.tpl_id
 -- Mark builds failed if they have stayed in pending past pending_timeout, or
 -- in building/snapshotting past build_timeout. Returns affected rows so the
 -- caller can call vmd.CancelBuild for orphan VM cleanup. Same idempotent
--- pattern as ClaimExpiredSandboxes.
+-- pattern as ClaimExpiredSandboxes. A never-ready template fails together
+-- with its timed-out build (mirroring FailBuild): this reap is the bound on
+-- requeued dispatch retries, and a bound that strands the template in
+-- 'building' forever is not a bound. Templates with a prior successful
+-- build keep their 'ready' status.
 WITH stale AS (
   SELECT id, template_id, team_id, vmd_host_id, vmd_build_vm_id FROM template_build
   WHERE
@@ -355,12 +372,25 @@ WITH stale AS (
   ORDER BY created_at ASC
   LIMIT $1
   FOR UPDATE SKIP LOCKED
+),
+build_done AS (
+  UPDATE template_build
+  SET status = 'failed',
+      finalized_at = now(),
+      updated_at = now(),
+      error_message = 'build timed out'
+  FROM stale
+  WHERE template_build.id = stale.id
+  RETURNING template_build.id
+),
+tpl_update AS (
+  UPDATE template
+  SET status = 'failed',
+      error_message = 'build timed out',
+      updated_at = now()
+  FROM stale
+  WHERE template.id = stale.template_id
+    AND template.status IN ('pending', 'building')
+  RETURNING template.id
 )
-UPDATE template_build
-SET status = 'failed',
-    finalized_at = now(),
-    updated_at = now(),
-    error_message = 'build timed out'
-FROM stale
-WHERE template_build.id = stale.id
-RETURNING template_build.id, stale.template_id, stale.team_id, stale.vmd_host_id, stale.vmd_build_vm_id;
+SELECT stale.id, stale.template_id, stale.team_id, stale.vmd_host_id, stale.vmd_build_vm_id FROM stale;

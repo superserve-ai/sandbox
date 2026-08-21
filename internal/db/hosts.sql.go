@@ -446,6 +446,38 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        COALESCE((SELECT COUNT(*) FROM template_build tb
                  WHERE tb.vmd_host_id = h.id
                    AND tb.status IN ('building', 'snapshotting')), 0)::int AS building_count,
+       -- Paused sandboxes whose CURRENT pause has no durable backup: the
+       -- ones whose only up-to-date copy lives on this host's local disk.
+       -- Retiring the machine destroys them outright; even
+       -- paused-with-coverage stays pinned here until cross-host restore
+       -- exists, but unbacked is the irrecoverable class an operator must
+       -- never retire past.
+       --
+       -- "Covers the current pause" reads the PERSISTED identity link the
+       -- report handler writes (MarkSandboxBackupCovered): a generation
+       -- counts only if its verified manifest matched the head snapshot's
+       -- recorded digests at report time, under the same row lock the
+       -- pause finalize takes — and the link names both the snapshot row
+       -- and its per-pause generation counter, so a re-pause (which
+       -- advances the counter even when the legacy finalize reuses the
+       -- row id) unlinks every earlier generation. Nothing here infers
+       -- identity from timestamps or manifest containment at read time:
+       -- both misidentify a previous pause's generation under delayed
+       -- outbox delivery. Errs conservative: a generation recorded before
+       -- this linkage existed (or whose report predates the current
+       -- pause) reads as unbacked until its next redelivery re-verifies
+       -- it against the current manifest.
+       COALESCE((SELECT COUNT(*) FROM sandbox s2
+                 WHERE s2.host_id = h.id
+                   AND s2.status = 'paused'
+                   AND s2.destroyed_at IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM backup_generation bg
+                     JOIN snapshot snap ON snap.id = s2.snapshot_id
+                     WHERE bg.sandbox_id = s2.id
+                       AND bg.covered_snapshot_id = snap.id
+                       AND bg.covered_snapshot_generation = snap.generation)), 0)::int AS paused_unbacked_count,
        -- Live pressure, when the host publishes it (NULL otherwise): the
        -- vmd-reported allocation view, alongside the DB-derived counts
        -- above. hp is 1:1 by primary key, so it cannot multiply the
@@ -460,6 +492,7 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
 LEFT JOIN host_pressure hp ON hp.host_id = h.id
+WHERE $1::text IS NULL OR h.id = $1
 GROUP BY h.id, hp.host_id
 ORDER BY h.created_at ASC
 `
@@ -479,6 +512,7 @@ type ListHostsAdminRow struct {
 	TransitionalCount             int32              `json:"transitional_count"`
 	PausedCount                   int32              `json:"paused_count"`
 	BuildingCount                 int32              `json:"building_count"`
+	PausedUnbackedCount           int32              `json:"paused_unbacked_count"`
 	PressureAllocatedMemoryMib    *int64             `json:"pressure_allocated_memory_mib"`
 	PressureAllocatedVcpus        *int64             `json:"pressure_allocated_vcpus"`
 	PressureRunningSandboxes      *int32             `json:"pressure_running_sandboxes"`
@@ -492,8 +526,12 @@ type ListHostsAdminRow struct {
 // sandbox counts for drain progress. transitional counts pausing/resuming
 // sandboxes whose lifecycle RPC is still using the host — a host is not
 // drained while any exist, even when running and paused both read zero.
-func (q *Queries) ListHostsAdmin(ctx context.Context) ([]ListHostsAdminRow, error) {
-	rows, err := q.db.Query(ctx, listHostsAdmin)
+// The optional id filter exists for drain polling: `hostctl drain --wait`
+// re-reads one host every few seconds, and the per-host counts (the
+// backup-coverage probe especially) must not be recomputed for the whole
+// fleet on every poll.
+func (q *Queries) ListHostsAdmin(ctx context.Context, id *string) ([]ListHostsAdminRow, error) {
+	rows, err := q.db.Query(ctx, listHostsAdmin, id)
 	if err != nil {
 		return nil, err
 	}
@@ -516,6 +554,7 @@ func (q *Queries) ListHostsAdmin(ctx context.Context) ([]ListHostsAdminRow, erro
 			&i.TransitionalCount,
 			&i.PausedCount,
 			&i.BuildingCount,
+			&i.PausedUnbackedCount,
 			&i.PressureAllocatedMemoryMib,
 			&i.PressureAllocatedVcpus,
 			&i.PressureRunningSandboxes,

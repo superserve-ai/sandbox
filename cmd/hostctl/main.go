@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -123,8 +124,12 @@ func (c client) waitDrained(hostID string) error {
 		if !quietSince.IsZero() && time.Since(quietSince) >= drainQuietWindow {
 			fmt.Printf("%s drained: counts zero continuously for %s.\n", hostID, drainQuietWindow)
 			if h.PausedCount > 0 {
-				fmt.Printf("NOT safe to retire: %d paused sandboxes have their snapshots on this host's local disk.\n",
-					h.PausedCount)
+				coverage := "backup coverage unknown — control plane predates coverage reporting"
+				if h.PausedUnbacked != nil {
+					coverage = fmt.Sprintf("%d without a durable backup — irrecoverable if the disk is lost", *h.PausedUnbacked)
+				}
+				fmt.Printf("NOT safe to retire: %d paused sandboxes have their snapshots on this host's local disk (%s).\n",
+					h.PausedCount, coverage)
 			}
 			return nil
 		}
@@ -171,8 +176,10 @@ type hostView struct {
 	TransitionalCount int     `json:"transitional_count"`
 	PausedCount       int     `json:"paused_count"`
 	BuildingCount     int     `json:"building_count"`
-	// Pointers: nil means the host has never published pressure — shown
-	// as "-" so unknown never reads as a plausible zero.
+	// Pointers throughout: nil means the control plane (or host) never
+	// produced the value — shown as "-"/unknown so absence never reads
+	// as a plausible, safety-relevant zero.
+	PausedUnbacked             *int    `json:"paused_unbacked_count"`
 	PressureAllocatedMemoryMib *int64  `json:"pressure_allocated_memory_mib"`
 	PressureAllocatedVcpus     *int64  `json:"pressure_allocated_vcpus"`
 	CapacityMemoryMib          int     `json:"capacity_memory_mib"`
@@ -180,8 +187,8 @@ type hostView struct {
 	PressureReportedAt         *string `json:"pressure_reported_at"`
 }
 
-func (c client) hosts() ([]hostView, error) {
-	resp, err := c.do(http.MethodGet, "/internal/hosts", nil)
+func (c client) hostsPath(path string) ([]hostView, error) {
+	resp, err := c.do(http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -195,11 +202,21 @@ func (c client) hosts() ([]hostView, error) {
 	return out.Hosts, nil
 }
 
+func (c client) hosts() ([]hostView, error) {
+	return c.hostsPath("/internal/hosts")
+}
+
+// hostRow fetches ONE host's row. Scoped server-side because drain polls it
+// every few seconds — the unscoped list recomputes sandbox and
+// backup-coverage counts for the whole fleet.
 func (c client) hostRow(hostID string) (hostView, error) {
-	hosts, err := c.hosts()
+	hosts, err := c.hostsPath("/internal/hosts?id=" + url.QueryEscape(hostID))
 	if err != nil {
 		return hostView{}, err
 	}
+	// Scan by ID rather than taking hosts[0]: a control plane that predates
+	// the ?id= filter ignores it and returns the whole fleet, and drain
+	// must never end up monitoring whichever host sorts first.
 	for _, h := range hosts {
 		if h.ID == hostID {
 			return h, nil
@@ -222,17 +239,24 @@ func (c client) list() error {
 	// land. It does NOT mean safe to retire: PAUSED sandboxes' snapshots
 	// live on the host's local disk and resume is pinned to it, so retiring
 	// the machine strands every one of them. Until cross-host restore
-	// exists, retirement additionally requires PAUSED = 0.
+	// exists, retirement additionally requires PAUSED = 0. UNBACKED is the
+	// irrecoverable subset — paused sandboxes with no durable backup copy
+	// anywhere; retiring the machine destroys those outright, so that
+	// number must read zero before retirement is even discussable.
 	// ALLOC is the vmd-reported live allocation against configured
 	// capacity (mem MiB, vcpus); P_AGE is the pressure report's age. "-"
 	// means the host has never published pressure.
-	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED\tALLOC\tP_AGE")
+	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED\tUNBACKED\tALLOC\tP_AGE")
 	for _, h := range out.Hosts {
 		beat := "never"
 		if h.LastHeartbeatAt != nil {
 			if t, err := time.Parse(time.RFC3339, *h.LastHeartbeatAt); err == nil {
 				beat = fmt.Sprintf("%ds ago", int(time.Since(t).Seconds()))
 			}
+		}
+		unbacked := "?"
+		if h.PausedUnbacked != nil {
+			unbacked = fmt.Sprintf("%d", *h.PausedUnbacked)
 		}
 		alloc, pAge := "-", "-"
 		if h.PressureAllocatedMemoryMib != nil && h.PressureAllocatedVcpus != nil {
@@ -245,8 +269,8 @@ func (c client) list() error {
 				pAge = fmt.Sprintf("%ds", int(time.Since(t).Seconds()))
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
-			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount, alloc, pAge)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
+			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount, unbacked, alloc, pAge)
 	}
 	return w.Flush()
 }

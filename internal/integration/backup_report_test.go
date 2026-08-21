@@ -397,3 +397,57 @@ func TestIntegration_BackupReport_ObjectPathEnrichmentOrder(t *testing.T) {
 		t.Fatalf("reported_at = %s, want the freshness cap untouched by enrichment", reportedAt)
 	}
 }
+
+// A report landing while the sandbox is in a TRANSITIONAL status —
+// 'pausing' on the normal path, 'resuming' while pauseAndRevert
+// re-pauses a failed resume — must be deferred (503, entry stays
+// outboxed): evaluated in that window it would match the PREVIOUS
+// snapshot's identity, fail to link, and clear the outbox before the
+// pause it covers exists. A stale transition proceeds so a stranded
+// sandbox cannot wedge the outbox.
+func TestIntegration_BackupReport_DefersDuringTransitionalStatus(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	t.Setenv("INTERNAL_API_TOKEN", "itok-report")
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"report-defer"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	deliver := func() int {
+		report := `{"sandbox_id":"` + sid + `","generation":"` + genKey + `",` +
+			`"bucket":"cell-bucket","completed_at":"2026-08-11T10:00:00Z","files":[` +
+			`{"name":"rootfs.ext4","size_bytes":4096,"sha256":"` + diskSHA + `"},` +
+			`{"name":"vmstate.snap","size_bytes":128,"sha256":"` + vmstateSHA + `"}]}`
+		req := httptest.NewRequest("POST", "/internal/hosts/host-1/backups", strings.NewReader(report))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer itok-report")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	for _, status := range []string{"pausing", "resuming"} {
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET status = $2, updated_at = now() WHERE id = $1`,
+			sandboxID, status); err != nil {
+			t.Fatalf("force %s: %v", status, err)
+		}
+		if code := deliver(); code != http.StatusServiceUnavailable {
+			t.Fatalf("report during fresh %q = %d, want 503 (deferred)", status, code)
+		}
+		// Stale transition: the guard yields and the report proceeds.
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET updated_at = now() - interval '20 minutes' WHERE id = $1`,
+			sandboxID); err != nil {
+			t.Fatalf("age %s: %v", status, err)
+		}
+		if code := deliver(); code != http.StatusOK {
+			t.Fatalf("report during stale %q = %d, want 200", status, code)
+		}
+	}
+}

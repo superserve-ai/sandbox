@@ -1374,7 +1374,7 @@ func TestPauseVM_AlreadyPaused_ReturnsRecordedSnapshot(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
 
-	snap, mem, _, err := mgr.PauseVM(context.Background(), "vm-1", "")
+	snap, mem, _, err := mgr.PauseVM(context.Background(), "vm-1", "", "tok-test")
 	if err != nil {
 		t.Fatalf("retried pause of a paused VM should succeed, got %v", err)
 	}
@@ -1393,7 +1393,7 @@ func TestPauseVM_AlreadyPausedButArtifactsMissing_Fails(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
 
-	_, _, _, err := mgr.PauseVM(context.Background(), "vm-1", "")
+	_, _, _, err := mgr.PauseVM(context.Background(), "vm-1", "", "tok-test")
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition for dangling artifacts, got %v", err)
 	}
@@ -2544,7 +2544,7 @@ func TestCommitResumeState_DestroyInProgress_NotReportedSuccessful(t *testing.T)
 func TestPauseVM_ErrorInstance_FailsFast(t *testing.T) {
 	inst := &VMInstance{ID: "vm-1", Status: StatusError}
 	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
-	_, _, _, err := m.PauseVM(context.Background(), "vm-1", "")
+	_, _, _, err := m.PauseVM(context.Background(), "vm-1", "", "tok-test")
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition for an error-state VM, got %v", err)
 	}
@@ -2876,7 +2876,7 @@ func TestPauseVM_RetryRepersistsPausedState(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", dir); err == nil {
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", dir, "tok-test"); err == nil {
 		t.Fatal("a retry that cannot record the paused state must not report success")
 	}
 
@@ -2887,7 +2887,7 @@ func TestPauseVM_RetryRepersistsPausedState(t *testing.T) {
 	}
 	defer reopened.Close()
 	m.state = reopened
-	gotSnap, gotMem, _, err := m.PauseVM(context.Background(), "vm-1", dir)
+	gotSnap, gotMem, _, err := m.PauseVM(context.Background(), "vm-1", dir, "tok-test")
 	if err != nil {
 		t.Fatalf("retry must succeed once the store recovers: %v", err)
 	}

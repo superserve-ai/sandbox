@@ -1275,7 +1275,7 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) (err e
 // manifest carries integrity metadata (sha256 + size) for the pause's
 // durable artifacts (disk state + vmstate); see collectPauseManifest for
 // what is included and why memory files are not.
-func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, manifest []ManifestEntry, err error) {
+func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken string) (snapshotPath, memPath string, manifest []ManifestEntry, err error) {
 	// Timed from BEFORE the op lock so pause_ms includes lock queueing —
 	// a duplicate-pause pile-up shows here rather than hiding.
 	tPause := time.Now()
@@ -1348,7 +1348,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// backs up only once the unit is confirmed dead.
 		var manifest []ManifestEntry
 		if m.vmConfirmedAtRest(ctx, vmID) {
-			manifest = m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, log)
+			manifest = m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, pauseToken, log)
 		} else {
 			log.Warn().Msg("pause backup skipped on retry: unit not confirmed dead")
 		}
@@ -1567,7 +1567,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// probe the at-rest proof uses — on a detached probe ctx, since the
 	// caller's may be spent (the stop above detached for exactly that).
 	if stopConfirmed && m.vmConfirmedAtRest(probeCtx(), vmID) {
-		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
+		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, pauseToken, log)
 	} else if m.backupEnqueue != nil {
 		log.Warn().Msg("pause backup deferred: unit not confirmed fully down, bytes may still be changing")
 		// The pause still owes its backup. Leave a pending marker AND a
@@ -1575,7 +1575,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// a transiently failed write here), its at-rest proof holds the
 		// backup off until the unit is truly down, and the periodic
 		// sweep keeps retrying after the worker gives up.
-		pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
+		pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath, pauseToken)
 		m.persistPendingBackup(pb, log)
 		go m.rehashPendingBackup(ctx, pb, log)
 	}
