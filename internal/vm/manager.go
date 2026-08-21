@@ -3166,6 +3166,28 @@ func (m *Manager) ShutdownAll() {
 // API socket is reachable, VMD reattaches. Stale BoltDB entries (dead process)
 // are cleaned up. Orphan systemd units (running but not in BoltDB) are logged
 // so the reconciler can handle them.
+// vmKnownNow reports whether id is represented in the CURRENT instance
+// map or state store — as opposed to ReattachAll's startup-time record
+// snapshot. The orphan scans run in a background pass that concurrent
+// creates and restores can outrun: a VM born after the snapshot shows up
+// in the unit/cgroup scans without being in knownIDs, and must neither
+// be reported to the reconciler as an orphan nor keep the pressure gate
+// closed. An unreadable store answers false — unknown fails closed.
+func (m *Manager) vmKnownNow(id string) bool {
+	m.mu.RLock()
+	_, ok := m.vms[id]
+	m.mu.RUnlock()
+	if ok {
+		return true
+	}
+	if m.state != nil {
+		if rec, err := m.state.Get(id); err == nil && rec != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	if m.state == nil {
 		// No persisted state means nothing to reattach: an empty map IS
@@ -3237,6 +3259,12 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	} else {
 		for _, id := range activeIDs {
 			if !knownIDs[id] {
+				if m.vmKnownNow(id) {
+					// Born after the startup snapshot (a concurrent
+					// create/restore racing this background pass): fully
+					// represented, not an orphan.
+					continue
+				}
 				// A live Firecracker with no record: its memory is real
 				// and unrepresentable in pressure.
 				conclusive = false
@@ -3261,7 +3289,7 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	if m.cgroups != nil {
 		if cgIDs, cerr := m.cgroups.scanVMCgroups(); cerr == nil {
 			for _, id := range cgIDs {
-				if knownIDs[id] || isBuildVM(id) {
+				if knownIDs[id] || isBuildVM(id) || m.vmKnownNow(id) {
 					continue
 				}
 				conclusive = false

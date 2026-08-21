@@ -341,6 +341,17 @@ func TestPressureReadyStaysClosedOnOrphansOrFailedScan(t *testing.T) {
 	if !m3.PressureReady() {
 		t.Fatal("PressureReady = false after a clean, conclusive pass")
 	}
+
+	// A unit that appears in the scan but is REPRESENTED in the current
+	// instance map is not an orphan — it is a create/restore that raced
+	// the background pass and must not keep the gate closed.
+	listActiveFCUnits = func(context.Context) ([]string, error) { return []string{"racing-vm"}, nil }
+	m4 := newMgr(t)
+	m4.vms["racing-vm"] = &VMInstance{Status: StatusRunning, Config: VMConfig{VCPU: 1, MemoryMiB: 256}}
+	m4.ReattachAll(context.Background())
+	if !m4.PressureReady() {
+		t.Fatal("PressureReady = false for a concurrently created, fully represented VM")
+	}
 }
 
 // A stale record's failure handling has two legitimate endings, and the
