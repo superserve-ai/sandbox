@@ -18,13 +18,23 @@ ALTER TABLE backup_generation
 
 -- pause_token is the control plane's minted identity for the pause that
 -- produced this snapshot row, sent through the pause RPC and echoed back
--- in the host's upload report. Token equality is the STRONG coverage
--- match: it names the exact pause, where content digests cannot
--- (identical vmstate bytes with different disk contents are possible
--- while pause-time manifests are vmstate-only) and timestamps cannot
--- (reports are delivered at-least-once, arbitrarily late). NULL on rows
--- finalized before the token existed; their reports carry no token and
--- fall back to content matching.
+-- in the host's upload report. Coverage links require token equality
+-- with both sides present: it names the exact pause, where content
+-- digests cannot (identical vmstate bytes with different disk contents
+-- are possible while pause-time manifests are vmstate-only) and
+-- timestamps cannot (reports are delivered at-least-once, arbitrarily
+-- late). NULL on rows finalized before the token existed; their reports
+-- carry no token and stay UNLINKED — the same evidence standard the
+-- no-backfill decision below applies to history.
+--
+-- Rolling-deploy wrinkle, accepted as inert: a pre-change replica's
+-- legacy one-row finalize does not mention this column, so PostgreSQL
+-- preserves the PREVIOUS pause's token under the rewritten artifacts.
+-- That stale token cannot mislink anything — the new pause's report is
+-- tokenless (an old replica minted none) and tokenless reports never
+-- link, while the old pause's delayed tokened report fails the content
+-- match against the rewritten manifest. The stale value is overwritten
+-- by the sandbox's next new-replica pause.
 ALTER TABLE snapshot
     ADD COLUMN IF NOT EXISTS pause_token text;
 

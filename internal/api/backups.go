@@ -328,21 +328,25 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 			}
 		}
 		snapshotID := manifest[0].SnapshotID
-		// Coverage identity, decided under the row lock. Content must match
-		// in every case (the digests are what restore fetches); the token
-		// decides WHOSE pause that content is, and the sides must AGREE:
-		//  - Both tokened and equal: names the exact pause — closes the
-		//    vmstate-collision window content alone leaves open (pause-time
-		//    manifests are vmstate-only).
-		//  - Both tokenless (snapshot finalized before tokens existed, or
-		//    by a daemon that dropped them — the finalize stores only the
-		//    daemon's echo): content identity alone, as before.
-		//  - ANY asymmetry or mismatch refuses the link. A tokenless report
-		//    against a tokened snapshot is necessarily some other pause's
-		//    (a tokened pause's own report always carries the token the
-		//    daemon echoed), and digest coincidence must not fake coverage.
-		tokenBound := req.PauseToken == manifest[0].PauseToken
-		if contentMatch && tokenBound {
+		// Coverage links — the operator's retirement gate — require a
+		// VERIFIED pause identity: content match plus STRICT token
+		// equality, both sides non-empty. There is deliberately no
+		// tokenless fallback: pause-time manifests are vmstate-only, and
+		// vmstate digest coincidence across pauses is exactly the
+		// evidence the migration refused to backfill links from —
+		// accepting it live while refusing it historically would be
+		// incoherent. A pause finalized without a token (older daemon, or
+		// an old control-plane replica that minted none) therefore stays
+		// unlinked and reads unbacked until the sandbox next pauses
+		// through the token path: over-reported risk, never a false zero,
+		// converging as the fleet does. This also makes a STALE token —
+		// an old replica's legacy one-row upsert preserves the column it
+		// does not mention — inert: the new pause's tokenless report
+		// cannot link regardless, and the old pause's delayed tokened
+		// report fails the content match against the rewritten manifest.
+		linkable := contentMatch && req.PauseToken != "" &&
+			req.PauseToken == manifest[0].PauseToken
+		if linkable {
 			// Persist the verdict as the generation's coverage identity
 			// (snapshot row + its per-pause generation counter) so
 			// coverage reads never re-derive it from timestamps or
@@ -357,10 +361,12 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 				return err
 			}
 		}
-		// Size sync keys on content: the sizes describe these exact bytes.
-		// A token disagreement skips it too — the report describes some
-		// other pause's artifacts regardless of digest coincidence.
-		if !contentMatch || !tokenBound {
+		// Size sync is a SEPARATE, lower-stakes concern (display sizes,
+		// not the retirement gate) and predates tokens: it keeps its
+		// original content gate for token-free pairs so old-daemon fleets
+		// don't regress, refusing only a definite token disagreement —
+		// that report provably describes another pause's artifacts.
+		if !contentMatch || req.PauseToken != manifest[0].PauseToken {
 			return nil
 		}
 		if err := q.SetSnapshotSizeBytes(ctx, db.SetSnapshotSizeBytesParams{

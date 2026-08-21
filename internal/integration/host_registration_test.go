@@ -668,9 +668,12 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 		t.Fatalf("after current-pause backup: paused=%d unbacked=%d, want 1/0", paused, unbacked)
 	}
 
-	// Legacy pair: a snapshot finalized without a token (older daemon —
-	// the finalize stores only the echo) accepts a tokenless report on
-	// content identity, as before tokens existed.
+	// A pause finalized WITHOUT a token (older daemon, or an old
+	// control-plane replica): its tokenless report must stay unlinked
+	// even on a perfect content match. There is no tokenless fallback —
+	// vmstate-only manifests are the same evidence the migration refused
+	// to backfill from, and the count over-reports until the sandbox
+	// pauses through the token path.
 	if _, err := testPool.Exec(ctx,
 		`WITH snap AS (
 		   UPDATE snapshot SET generation = generation + 1, pause_token = NULL
@@ -682,12 +685,37 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 		sandboxID, strings.Repeat("f", 64)); err != nil {
 		t.Fatalf("advance to a tokenless pause: %v", err)
 	}
-	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
-		t.Fatalf("after tokenless re-pause: paused=%d unbacked=%d, want 1/1", paused, unbacked)
-	}
 	report(strings.Repeat("5", 64), strings.Repeat("f", 64), shaY, "")
-	if paused, unbacked := counts(); paused != 1 || unbacked != 0 {
-		t.Fatalf("after legacy content-matched backup: paused=%d unbacked=%d, want 1/0", paused, unbacked)
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("after tokenless content-matched report: paused=%d unbacked=%d, want 1/1 (no tokenless links)", paused, unbacked)
+	}
+
+	// The P2 rolling-deploy wrinkle: an old replica's legacy finalize
+	// preserves the PREVIOUS pause's token under rewritten artifacts.
+	// Neither the new pause's tokenless report (no tokenless links) nor
+	// the old pause's delayed tokened report (content mismatch against
+	// the rewritten manifest) may link through the stale value.
+	if _, err := testPool.Exec(ctx,
+		`WITH snap AS (
+		   UPDATE snapshot SET generation = generation + 1, pause_token = 'tok-stale'
+		   WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)
+		   RETURNING id
+		 )
+		 UPDATE artifact_manifest SET sha256 = $2
+		 WHERE snapshot_id IN (SELECT id FROM snap)`,
+		sandboxID, strings.Repeat("a", 60)+"beef"); err != nil {
+		t.Fatalf("simulate legacy-upsert stale token: %v", err)
+	}
+	// Old pause's delayed report: token matches the stale value, content
+	// names the OLD digests — refused.
+	report(strings.Repeat("6", 64), shaB, shaY, "tok-stale")
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("stale-token delayed report linked: paused=%d unbacked=%d, want 1/1", paused, unbacked)
+	}
+	// New pause's tokenless report: content matches, no token — refused.
+	report(strings.Repeat("7", 64), strings.Repeat("a", 60)+"beef", shaY, "")
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("tokenless report linked through stale-token row: paused=%d unbacked=%d, want 1/1", paused, unbacked)
 	}
 }
 
