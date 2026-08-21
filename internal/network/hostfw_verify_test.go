@@ -462,12 +462,51 @@ func TestVerifyHeadGuard(t *testing.T) {
 			t.Fatalf("non-terminal observer above the block flagged: %s", class)
 		}
 	})
-	t.Run("foreign docker rule above the block is fine", func(t *testing.T) {
+	t.Run("docker accept above the jumps is a repairable bypass", func(t *testing.T) {
+		// No -o constraint: it can accept docker→sandbox traffic before the
+		// owned chain's DROP decides it. Sandbox-bound matters, not just
+		// sandbox-originated.
 		rules, chains := specKernel(spec, nil)
 		fw := rules["filter/FORWARD"]
 		rules["filter/FORWARD"] = append([][]string{{"-i", "docker0", "-j", "ACCEPT"}}, fw...)
+		if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "preceded" {
+			t.Fatalf("ok=%v class=%s, want preceded", ok, class)
+		}
+	})
+	t.Run("interface-disjoint rule above the block is fine", func(t *testing.T) {
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		rules["filter/FORWARD"] = append([][]string{{"-i", "docker0", "-o", "wg0", "-j", "ACCEPT"}}, fw...)
 		if ok, class := mustVerify(t, renderDump(rules, chains), spec); !ok {
-			t.Fatalf("explicit non-veth interface flagged: %s", class)
+			t.Fatalf("both-directions-excluded rule flagged: %s", class)
+		}
+	})
+	t.Run("sandbox-bound accept above the jumps flags and repairs", func(t *testing.T) {
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		foreign := []string{"-i", "docker0", "-o", sandboxVethPattern, "-j", "ACCEPT"}
+		rules["filter/FORWARD"] = append([][]string{foreign}, fw...)
+		if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "preceded" {
+			t.Fatalf("ok=%v class=%s, want preceded", ok, class)
+		}
+		k := &fakeKernel{rules: rules, chains: chains}
+		defer k.install(t)()
+		d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+		if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+			t.Fatalf("repair: %v", err)
+		}
+		nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+		if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+			t.Fatalf("post-repair verify failed: %s %s", class, detail)
+		}
+		found := false
+		for _, r := range k.rules["filter/FORWARD"] {
+			if ruleEqual(r, foreign) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatal("foreign sandbox-bound accept deleted by repair")
 		}
 	})
 	t.Run("repair converges a preceded chain", func(t *testing.T) {
@@ -597,7 +636,7 @@ func FuzzParseIPTablesSave(f *testing.F) {
 			// contain the ingress entry jump in FORWARD.
 			found := false
 			for _, r := range d.rules["filter/FORWARD"] {
-				if ruleEqual(r, marked("-i", "veth+", "-j", forwardChain)) {
+				if ruleEqual(r, marked("-i", sandboxVethPattern, "-j", forwardChain)) {
 					found = true
 				}
 			}
@@ -653,7 +692,7 @@ func TestRepairPreservesInterleavedStrictRule(t *testing.T) {
 		if ruleEqual(r, strict) {
 			strictIdx = i
 		}
-		if ruleEqual(r, marked("-i", "veth+", "-j", forwardChain)) && i > jumpIdx {
+		if ruleEqual(r, marked("-i", sandboxVethPattern, "-j", forwardChain)) && i > jumpIdx {
 			jumpIdx = i
 		}
 	}
@@ -930,7 +969,7 @@ func TestUnmarkedTwinsToleratedNeverDeleted(t *testing.T) {
 	// NEVER deleted.
 	spec := testSpec(true)
 	want := spec.sharedOrdered["filter/FORWARD"]
-	unmarkedJump := []string{"-i", "veth+", "-j", forwardChain}
+	unmarkedJump := []string{"-i", sandboxVethPattern, "-j", forwardChain}
 	if staleManagedRule(unmarkedJump, want) {
 		t.Fatal("unmarked rule must never read as stale (marker-only staleness)")
 	}

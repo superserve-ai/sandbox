@@ -100,8 +100,8 @@ func TestRealInstallDumpVerifyRoundTrip(t *testing.T) {
 
 	// Mutation matrix: each sabotage must be detected, and ensure must
 	// repair back to verified.
-	inJump := marked("-i", "veth+", "-j", forwardChain)
-	outJump := marked("-o", "veth+", "-j", forwardChain)
+	inJump := marked("-i", sandboxVethPattern, "-j", forwardChain)
+	outJump := marked("-o", sandboxVethPattern, "-j", forwardChain)
 	sabotages := []struct {
 		name string
 		do   func(t *testing.T)
@@ -117,7 +117,7 @@ func TestRealInstallDumpVerifyRoundTrip(t *testing.T) {
 			ipt(t, append([]string{"-A", "FORWARD"}, inJump...)...)
 		}},
 		{"remove owned forward rule", func(t *testing.T) {
-			ipt(t, "-D", forwardChain, "-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP")
+			ipt(t, "-D", forwardChain, "-i", sandboxVethPattern, "-p", "udp", "--dport", "443", "-j", "DROP")
 		}},
 		{"extra rule in owned forward chain", func(t *testing.T) {
 			ipt(t, "-A", forwardChain, "-p", "tcp", "--dport", "12345", "-j", "ACCEPT")

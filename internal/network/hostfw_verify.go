@@ -76,11 +76,11 @@ func hostFWSpecFor(hostIface string, httpProxyPort, tlsProxyPort, dnsRedirectPor
 	// Everything else lives in owned chains, verified exactly.
 	if manageOwnedChains {
 		spec.sharedOrdered["filter/FORWARD"] = []fwRule{
-			{"filter", "FORWARD", marked("-i", "veth+", "-j", forwardChain)},
-			{"filter", "FORWARD", marked("-o", "veth+", "-j", forwardChain)},
+			{"filter", "FORWARD", marked("-i", sandboxVethPattern, "-j", forwardChain)},
+			{"filter", "FORWARD", marked("-o", sandboxVethPattern, "-j", forwardChain)},
 		}
 		spec.sharedOrdered["nat/PREROUTING"] = []fwRule{
-			{"nat", "PREROUTING", marked("-i", "veth+", "-j", preroutingChain)},
+			{"nat", "PREROUTING", marked("-i", sandboxVethPattern, "-j", preroutingChain)},
 		}
 	}
 	spec.sharedOrdered["nat/POSTROUTING"] = []fwRule{
@@ -761,7 +761,7 @@ func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, 
 				// classification (repair converges by re-heading the jumps;
 				// the twin itself is still never deleted).
 				twin := unmarkedTwin(got[i], want)
-				if isOurs || (twin && foreignDisposition(got[i]) != "permissive") || ruleCannotMatchSandboxIngress(got[i]) {
+				if isOurs || (twin && foreignDisposition(got[i]) != "permissive") || ruleCannotMatchSandboxTraffic(got[i]) {
 					continue
 				}
 				switch foreignDisposition(got[i]) {

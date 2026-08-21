@@ -43,6 +43,12 @@ const forwardChain = "SANDBOX_FORWARD"
 // via a single veth-scoped jump at the head of PREROUTING.
 const preroutingChain = "SANDBOX_PREROUTING"
 
+// sandboxVethPattern matches exactly vmd's own interfaces (veth-<slot>) and
+// nothing else. A bare veth+ would also capture other agents' veth-named
+// interfaces (Docker's auto-generated vethXXXX ports, hand-made pairs) and
+// pull their traffic into the sandbox chains — through to the terminal DROP.
+const sandboxVethPattern = "veth-+"
+
 // vmdOwnedChains names every chain vmd creates and reconciles. A rule that
 // jumps into one of them is vmd's regardless of marker: the chain namespace
 // itself is ours.
@@ -141,9 +147,9 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 			pos          int
 			args         []string
 		}{
-			{"filter", "FORWARD", 1, marked("-i", "veth+", "-j", forwardChain)},
-			{"filter", "FORWARD", 2, marked("-o", "veth+", "-j", forwardChain)},
-			{"nat", "PREROUTING", 1, marked("-i", "veth+", "-j", preroutingChain)},
+			{"filter", "FORWARD", 1, marked("-i", sandboxVethPattern, "-j", forwardChain)},
+			{"filter", "FORWARD", 2, marked("-o", sandboxVethPattern, "-j", forwardChain)},
+			{"nat", "PREROUTING", 1, marked("-i", sandboxVethPattern, "-j", preroutingChain)},
 		}
 		for _, j := range jumps {
 			exists, err := ipt.Exists(j.table, j.chain, j.args...)
@@ -179,11 +185,11 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 // need no veth match beyond direction.
 func forwardChainRules(hostIface string) [][]string {
 	return [][]string{
-		{"-i", "veth+", "-j", portDropChain},
-		{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP"},
+		{"-i", sandboxVethPattern, "-j", portDropChain},
+		{"-i", sandboxVethPattern, "-p", "udp", "--dport", "443", "-j", "DROP"},
 		{"-o", hostIface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"},
-		{"-i", "veth+", "-o", hostIface, "-j", "ACCEPT"},
-		{"-i", hostIface, "-o", "veth+", "-j", "ACCEPT"},
+		{"-i", sandboxVethPattern, "-o", hostIface, "-j", "ACCEPT"},
+		{"-i", hostIface, "-o", sandboxVethPattern, "-j", "ACCEPT"},
 		{"-j", "DROP"},
 	}
 }
