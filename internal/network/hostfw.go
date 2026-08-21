@@ -97,8 +97,12 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 	// through an empty chain into the foreign FORWARD rules — and a failure
 	// mid-repopulation would strand it there. A declared chain inside a
 	// --noflush restore is created-or-flushed and refilled in a single
-	// commit; on error the previous contents remain. Contents come from the
-	// same spec the verifier checks, so the two cannot drift.
+	// commit; on error the previous contents remain. Each chain gets an
+	// explicit -F inside the transaction — --noflush preserves existing
+	// contents on the legacy backend, so relying on the declaration alone to
+	// clear a pre-existing chain would append after stale rules there.
+	// Contents come from the same spec the verifier checks, so the two
+	// cannot drift.
 	if manageOwnedChains {
 		spec := hostFWSpecFor(hostIface, httpProxyPort, tlsProxyPort, dnsRedirectPort, secretsProxyDst, secretsProxyPort, blockedPorts, true)
 		for _, table := range []string{"filter", "nat"} {
@@ -112,6 +116,9 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 			sort.Strings(chains)
 			for _, chain := range chains {
 				lines = append(lines, ":"+chain+" - [0:0]")
+			}
+			for _, chain := range chains {
+				lines = append(lines, "-F "+chain)
 			}
 			for _, chain := range chains {
 				for _, w := range spec.ownedChains[table+"/"+chain] {
