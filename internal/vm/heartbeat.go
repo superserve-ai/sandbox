@@ -54,6 +54,30 @@ type HeartbeatConfig struct {
 	// physical totals.
 	CapacityMemoryMib int32
 	CapacityVcpus     int32
+
+	// Pressure, when set, is sampled after each SUCCESSFUL heartbeat and
+	// published to the separate best-effort pressure endpoint — never
+	// inside the heartbeat body, so no pressure outcome can ever affect
+	// host liveness. Nil (older wiring, tests, hosts without the advertise
+	// config) publishes nothing and the process behaves exactly as before.
+	Pressure func() HostPressure
+	// MaxSandboxes and MaxNetworkSlots are operator-configured admission
+	// limits published alongside pressure; 0 means unset (no cap).
+	MaxSandboxes    int32
+	MaxNetworkSlots int32
+}
+
+// pressureProbeEvery is how many beats a publisher that found the
+// pressure endpoint unsupported (404: an older control plane) waits
+// before probing again. Jittered per process so a fleet that all backed
+// off during one deploy does not re-probe in lockstep.
+const pressureProbeEvery = 20
+
+// pressureState tracks the publisher's back-off across beats. Owned by
+// the heartbeat goroutine; never shared.
+type pressureState struct {
+	unsupported     bool
+	beatsUntilProbe int
 }
 
 // StartHeartbeat launches a background goroutine that periodically POSTs
@@ -84,8 +108,13 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	pressureURL := fmt.Sprintf("%s/internal/hosts/%s/pressure", cfg.ControlPlaneURL, cfg.HostID)
+	ps := &pressureState{}
+
 	// Fire once immediately so the host is marked alive on startup.
-	sendHeartbeat(ctx, client, cfg, url, token, proxyHealthURL, log)
+	if sendHeartbeat(ctx, client, cfg, url, token, proxyHealthURL, log) {
+		sendPressure(ctx, client, cfg, pressureURL, token, ps, log)
+	}
 
 	for {
 		select {
@@ -93,8 +122,103 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 			log.Info().Msg("heartbeat exiting")
 			return
 		case <-ticker.C:
-			sendHeartbeat(ctx, client, cfg, url, token, proxyHealthURL, log)
+			// Pressure publishes only AFTER a successful heartbeat, and to
+			// its own endpoint: liveness never carries it, and the ordering
+			// disambiguates the pressure 404 (after a 200 heartbeat the
+			// host row provably exists, so 404 can only mean an older
+			// control plane without the route).
+			if sendHeartbeat(ctx, client, cfg, url, token, proxyHealthURL, log) {
+				sendPressure(ctx, client, cfg, pressureURL, token, ps, log)
+			}
 		}
+	}
+}
+
+// pressureRequest is the pressure endpoint's body. vmd_addr is the
+// identity fence: the control plane refuses a report whose address does
+// not match the host row, so a reclaimed-away daemon cannot overwrite
+// the new holder's numbers.
+type pressureRequest struct {
+	VMDAddr               string `json:"vmd_addr"`
+	RunningSandboxes      int32  `json:"running_sandboxes"`
+	ProvisioningSandboxes int32  `json:"provisioning_sandboxes"`
+	PausedSandboxes       int32  `json:"paused_sandboxes"`
+	AllocatedMemoryMib    int64  `json:"allocated_memory_mib"`
+	AllocatedVcpus        int64  `json:"allocated_vcpus"`
+	UsedNetSlots          int32  `json:"used_net_slots"`
+	ProvisioningNetSlots  int32  `json:"provisioning_net_slots"`
+	WarmNetSlots          int32  `json:"warm_net_slots"`
+	NetSlotCeiling        int32  `json:"net_slot_ceiling"`
+	MaxNetworkSlots       int32  `json:"max_network_slots,omitempty"`
+	MaxSandboxes          int32  `json:"max_sandboxes,omitempty"`
+}
+
+// sendPressure publishes the capacity summary, best-effort. Runs only
+// after a successful heartbeat. A 404 means the control plane predates
+// the endpoint: back off and re-probe every pressureProbeEvery beats
+// (jittered), so a rollout or rollback converges without operator
+// action. Every other failure — auth, identity conflict, 5xx, transport
+// — logs and retries on the next beat at the normal cadence; none of
+// them back anything off, and none can affect the heartbeat that
+// already succeeded.
+func sendPressure(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token string, ps *pressureState, log zerolog.Logger) {
+	if cfg.Pressure == nil || cfg.AdvertiseVMDAddr == "" {
+		return
+	}
+	if ps.unsupported {
+		ps.beatsUntilProbe--
+		if ps.beatsUntilProbe > 0 {
+			return
+		}
+		ps.unsupported = false
+	}
+	p := cfg.Pressure()
+	body, err := json.Marshal(pressureRequest{
+		VMDAddr:               cfg.AdvertiseVMDAddr,
+		RunningSandboxes:      p.RunningSandboxes,
+		ProvisioningSandboxes: p.ProvisioningSandboxes,
+		PausedSandboxes:       p.PausedSandboxes,
+		AllocatedMemoryMib:    p.AllocatedMemoryMib,
+		AllocatedVcpus:        p.AllocatedVcpus,
+		UsedNetSlots:          p.UsedNetSlots,
+		ProvisioningNetSlots:  p.ProvisioningNetSlots,
+		WarmNetSlots:          p.WarmNetSlots,
+		NetSlotCeiling:        p.NetSlotCeiling,
+		MaxNetworkSlots:       cfg.MaxNetworkSlots,
+		MaxSandboxes:          cfg.MaxSandboxes,
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("failed to encode pressure body")
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
+	if err != nil {
+		log.Error().Err(err).Msg("failed to create pressure request")
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Warn().Err(err).Str("host_id", cfg.HostID).Msg("pressure publish failed; retrying next beat")
+		return
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		ps.unsupported = true
+		ps.beatsUntilProbe = pressureProbeEvery + int(time.Now().UnixNano()%7)
+		log.Info().Str("host_id", cfg.HostID).Int("probe_after_beats", ps.beatsUntilProbe).
+			Msg("control plane does not support pressure publication; backing off")
+	case resp.StatusCode == http.StatusConflict:
+		log.Error().Str("host_id", cfg.HostID).
+			Msg("pressure publish rejected: host identity held by another address")
+	case resp.StatusCode != http.StatusOK:
+		log.Warn().Int("status", resp.StatusCode).Str("host_id", cfg.HostID).
+			Msg("pressure publish got non-200 response; retrying next beat")
 	}
 }
 
@@ -128,7 +252,7 @@ type proxyHealthResponse struct {
 	Capabilities []string `json:"capabilities"`
 }
 
-func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token, proxyHealthURL string, log zerolog.Logger) {
+func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token, proxyHealthURL string, log zerolog.Logger) bool {
 	started := time.Now()
 	capabilities, err := proxyPreviewCapabilities(ctx, client, proxyHealthURL)
 	if err != nil {
@@ -144,12 +268,12 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 	body, err := json.Marshal(buildHeartbeatRequest(cfg, capabilities))
 	if err != nil {
 		log.Error().Err(err).Msg("failed to encode heartbeat body")
-		return
+		return false
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		log.Error().Err(err).Msg("failed to create heartbeat request")
-		return
+		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
@@ -161,7 +285,7 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 		log.Warn().Err(err).Str("host_id", cfg.HostID).
 			Strs("capabilities", capabilities).Dur("duration", time.Since(started)).
 			Msg("heartbeat failed")
-		return
+		return false
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
@@ -175,14 +299,17 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 			Str("host_id", cfg.HostID).Strs("capabilities", capabilities).
 			Dur("duration", time.Since(started)).
 			Msg("heartbeat rejected: host identity in use by a live host at another address")
+		return false
 	case resp.StatusCode != http.StatusOK:
 		log.Warn().Int("status", resp.StatusCode).Str("host_id", cfg.HostID).
 			Strs("capabilities", capabilities).Dur("duration", time.Since(started)).
 			Msg("heartbeat got non-200 response")
+		return false
 	default:
 		log.Debug().Str("host_id", cfg.HostID).Strs("capabilities", capabilities).
 			Int("status", resp.StatusCode).Dur("duration", time.Since(started)).
 			Msg("heartbeat completed")
+		return true
 	}
 }
 

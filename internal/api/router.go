@@ -127,6 +127,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	internal.Use(InternalAuth(), InternalActorFromHeader())
 	{
 		internal.POST("/hosts/:host_id/heartbeat", h.HostHeartbeat)
+		internal.PUT("/hosts/:host_id/pressure", h.HostReportPressure)
 		internal.POST("/hosts/:host_id/backups", h.ReportHostBackup)
 		internal.POST("/secrets/decrypt", h.DecryptSecret)
 		internal.GET("/jwks", h.JWKS)

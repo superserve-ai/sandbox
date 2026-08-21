@@ -1461,6 +1461,13 @@ func main() {
 				Region:             os.Getenv("HOST_REGION"),
 				CapacityMemoryMib:  memoryMib,
 				CapacityVcpus:      vcpus,
+				// Live capacity pressure, published to its own best-effort
+				// endpoint after each successful heartbeat; in-memory
+				// counters only. The limits are operator admission knobs;
+				// 0 (unset) means no cap.
+				Pressure:        mgr.CapacityPressure,
+				MaxSandboxes:    envInt32Fatal(log, "VMD_MAX_SANDBOXES"),
+				MaxNetworkSlots: envInt32Fatal(log, "VMD_MAX_NETWORK_SLOTS"),
 			}, log)
 			return nil
 		})

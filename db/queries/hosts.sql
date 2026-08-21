@@ -222,10 +222,22 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        -- would cross-multiply the per-host rows and corrupt the counts.
        COALESCE((SELECT COUNT(*) FROM template_build tb
                  WHERE tb.vmd_host_id = h.id
-                   AND tb.status IN ('building', 'snapshotting')), 0)::int AS building_count
+                   AND tb.status IN ('building', 'snapshotting')), 0)::int AS building_count,
+       -- Live pressure, when the host publishes it (NULL otherwise): the
+       -- vmd-reported allocation view, alongside the DB-derived counts
+       -- above. hp is 1:1 by primary key, so it cannot multiply the
+       -- sandbox join's count rows.
+       hp.allocated_memory_mib AS pressure_allocated_memory_mib,
+       hp.allocated_vcpus AS pressure_allocated_vcpus,
+       hp.running_sandboxes AS pressure_running_sandboxes,
+       hp.provisioning_sandboxes AS pressure_provisioning_sandboxes,
+       hp.used_net_slots AS pressure_used_net_slots,
+       hp.warm_net_slots AS pressure_warm_net_slots,
+       hp.reported_at AS pressure_reported_at
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
-GROUP BY h.id
+LEFT JOIN host_pressure hp ON hp.host_id = h.id
+GROUP BY h.id, hp.host_id
 ORDER BY h.created_at ASC;
 
 -- name: GetHostCapabilityDiagnostics :many
@@ -261,3 +273,44 @@ SELECT hs.last_heartbeat_at,
 FROM host_snapshot hs
 LEFT JOIN host_capability hc ON hc.host_id = hs.id
 ORDER BY hc.capability ASC;
+
+-- name: UpsertHostPressure :execrows
+-- Records a host's live pressure report, identity-fenced: the write
+-- lands only while the report's vmd_addr matches the host row, so a
+-- daemon whose identity was reclaimed cannot overwrite the new
+-- holder's numbers (mirrors the heartbeat's reclaim semantics). 0 rows
+-- = unknown host or address mismatch; the handler disambiguates.
+-- Last-write-wins wholesale, reported_at from the DATABASE clock: this
+-- pair is the reconciliation contract (see the host_pressure table
+-- comment).
+INSERT INTO host_pressure (
+    host_id, running_sandboxes, provisioning_sandboxes, paused_sandboxes,
+    allocated_memory_mib, allocated_vcpus,
+    used_net_slots, provisioning_net_slots, warm_net_slots,
+    net_slot_ceiling, max_network_slots, max_sandboxes, reported_at
+)
+SELECT h.id, @running_sandboxes, @provisioning_sandboxes, @paused_sandboxes,
+       @allocated_memory_mib, @allocated_vcpus,
+       @used_net_slots, @provisioning_net_slots, @warm_net_slots,
+       @net_slot_ceiling, @max_network_slots, @max_sandboxes, now()
+FROM host h
+WHERE h.id = @host_id AND h.vmd_addr = @vmd_addr
+ON CONFLICT (host_id) DO UPDATE SET
+    running_sandboxes = EXCLUDED.running_sandboxes,
+    provisioning_sandboxes = EXCLUDED.provisioning_sandboxes,
+    paused_sandboxes = EXCLUDED.paused_sandboxes,
+    allocated_memory_mib = EXCLUDED.allocated_memory_mib,
+    allocated_vcpus = EXCLUDED.allocated_vcpus,
+    used_net_slots = EXCLUDED.used_net_slots,
+    provisioning_net_slots = EXCLUDED.provisioning_net_slots,
+    warm_net_slots = EXCLUDED.warm_net_slots,
+    net_slot_ceiling = EXCLUDED.net_slot_ceiling,
+    max_network_slots = EXCLUDED.max_network_slots,
+    max_sandboxes = EXCLUDED.max_sandboxes,
+    reported_at = EXCLUDED.reported_at;
+
+-- name: DeleteHostPressure :exec
+-- Clears stored pressure when a host identity is reclaimed by a new
+-- machine: the old machine's numbers are meaningless for the new
+-- holder, and stale pressure must not survive into its tenure.
+DELETE FROM host_pressure WHERE host_id = $1;

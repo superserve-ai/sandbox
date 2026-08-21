@@ -85,7 +85,7 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 	// ending. CancelBuild is what stops it.
 	buildCtx, cancel := context.WithCancel(context.Background())
 
-	if _, err := m.registerBuild(buildVMID, req.TemplateID, cancel); err != nil {
+	if _, err := m.registerBuild(buildVMID, req.TemplateID, req.VCPU, req.MemoryMiB, cancel); err != nil {
 		cancel()
 		return "", err
 	}

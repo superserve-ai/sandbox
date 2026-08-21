@@ -171,6 +171,13 @@ type hostView struct {
 	TransitionalCount int     `json:"transitional_count"`
 	PausedCount       int     `json:"paused_count"`
 	BuildingCount     int     `json:"building_count"`
+	// Pointers: nil means the host has never published pressure — shown
+	// as "-" so unknown never reads as a plausible zero.
+	PressureAllocatedMemoryMib *int64  `json:"pressure_allocated_memory_mib"`
+	PressureAllocatedVcpus     *int64  `json:"pressure_allocated_vcpus"`
+	CapacityMemoryMib          int     `json:"capacity_memory_mib"`
+	CapacityVcpus              int     `json:"capacity_vcpus"`
+	PressureReportedAt         *string `json:"pressure_reported_at"`
 }
 
 func (c client) hosts() ([]hostView, error) {
@@ -216,7 +223,10 @@ func (c client) list() error {
 	// live on the host's local disk and resume is pinned to it, so retiring
 	// the machine strands every one of them. Until cross-host restore
 	// exists, retirement additionally requires PAUSED = 0.
-	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED")
+	// ALLOC is the vmd-reported live allocation against configured
+	// capacity (mem MiB, vcpus); P_AGE is the pressure report's age. "-"
+	// means the host has never published pressure.
+	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED\tALLOC\tP_AGE")
 	for _, h := range out.Hosts {
 		beat := "never"
 		if h.LastHeartbeatAt != nil {
@@ -224,8 +234,19 @@ func (c client) list() error {
 				beat = fmt.Sprintf("%ds ago", int(time.Since(t).Seconds()))
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\n",
-			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount)
+		alloc, pAge := "-", "-"
+		if h.PressureAllocatedMemoryMib != nil && h.PressureAllocatedVcpus != nil {
+			alloc = fmt.Sprintf("%d/%dMiB %d/%dcpu",
+				*h.PressureAllocatedMemoryMib, h.CapacityMemoryMib,
+				*h.PressureAllocatedVcpus, h.CapacityVcpus)
+		}
+		if h.PressureReportedAt != nil {
+			if t, err := time.Parse(time.RFC3339, *h.PressureReportedAt); err == nil {
+				pAge = fmt.Sprintf("%ds", int(time.Since(t).Seconds()))
+			}
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
+			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount, alloc, pAge)
 	}
 	return w.Flush()
 }

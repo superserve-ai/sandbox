@@ -178,6 +178,7 @@ type vmNetworkManager interface {
 	ReserveSlotsAbove(reservations map[string]string)
 	SetupVM(ctx context.Context, vmID string, cfg *network.Config) (*network.VMNetInfo, error)
 	PoolStats() (fresh, recycled int, enabled bool)
+	SlotPressure() network.SlotPressureStats
 	DrainWarmPool(max int) int
 	SweepOrphanNamespaces(keep map[string]bool) int
 	UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []string) error
@@ -4319,6 +4320,85 @@ func (m *Manager) setStatus(vmID string, s VMStatus) {
 	inst.Status = s
 	inst.mu.Unlock()
 	m.persistState(inst)
+}
+
+// HostPressure is the host-level capacity summary the pressure publisher
+// reports for placement: live counts and allocations only — vmd stays
+// authoritative for slot IDs, namespaces, and per-VM lifecycle. Warm
+// inventory is reported separately from consumed capacity, and the
+// operator's schedulable slot limit separately from the kernel-bounded
+// prepared-slot ceiling: collapsing either pair would make "can I place
+// here" and "can this host prepare another slot" indistinguishable.
+type HostPressure struct {
+	RunningSandboxes      int32
+	ProvisioningSandboxes int32 // creating VMs + in-flight template builds
+	PausedSandboxes       int32
+	AllocatedMemoryMib    int64 // running + creating VMs + in-flight builds
+	AllocatedVcpus        int64
+	UsedNetSlots          int32
+	ProvisioningNetSlots  int32 // pool refill workers building/delivering
+	WarmNetSlots          int32 // fully built, claimable now
+	NetSlotCeiling        int32 // IP-scheme hard bound, not an operator knob
+}
+
+// CapacityPressure computes the pressure summary from maintained
+// in-memory state only: a pointer snapshot of the instance map under the
+// manager lock, per-instance reads under each instance's own lock, the
+// build registry, and the network manager's counter reads. No filesystem
+// or namespace inspection — safe at any cadence, called from the
+// heartbeat goroutine (30s), never a lifecycle path. The result is an
+// eventually consistent sample by design; cross-subsystem atomicity is
+// deliberately not attempted.
+func (m *Manager) CapacityPressure() HostPressure {
+	var p HostPressure
+	m.mu.RLock()
+	instances := make([]*VMInstance, 0, len(m.vms))
+	for _, inst := range m.vms {
+		instances = append(instances, inst)
+	}
+	m.mu.RUnlock()
+	for _, inst := range instances {
+		inst.mu.RLock()
+		status, vcpu, mem := inst.Status, inst.Config.VCPU, inst.Config.MemoryMiB
+		inst.mu.RUnlock()
+		switch status {
+		case StatusRunning:
+			p.RunningSandboxes++
+		case StatusCreating:
+			p.ProvisioningSandboxes++
+		case StatusPaused:
+			// Paused VMs hold no memory or CPU; they hold disk and (until
+			// reclaim) a network slot, which UsedNetSlots already counts.
+			p.PausedSandboxes++
+			continue
+		default:
+			continue
+		}
+		p.AllocatedMemoryMib += int64(mem)
+		p.AllocatedVcpus += int64(vcpu)
+	}
+	// In-flight template builds run in a subprocess and never enter the
+	// instance map, but their memory and CPU are as real as any
+	// sandbox's, and build distribution (multi-host) will place against
+	// this number — a busy build host must not look idle.
+	m.buildsMu.RLock()
+	for _, rec := range m.builds {
+		if rec.Status.IsTerminal() {
+			continue
+		}
+		p.ProvisioningSandboxes++
+		p.AllocatedMemoryMib += int64(rec.MemoryMiB)
+		p.AllocatedVcpus += int64(rec.VCPU)
+	}
+	m.buildsMu.RUnlock()
+	if m.netMgr != nil {
+		st := m.netMgr.SlotPressure()
+		p.UsedNetSlots = int32(st.Used)
+		p.ProvisioningNetSlots = int32(st.Provisioning)
+		p.WarmNetSlots = int32(st.WarmReady)
+		p.NetSlotCeiling = int32(st.Ceiling)
+	}
+	return p
 }
 
 type pausedNetworkPressureSnapshot struct {

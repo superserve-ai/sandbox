@@ -156,6 +156,12 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 			}); err != nil {
 				return "", "", pgtype.Timestamptz{}, err
 			}
+			// The old machine's pressure is meaningless for the new
+			// holder: clear it in the same transaction, or a stale report
+			// would describe a machine that no longer holds the identity.
+			if err := q.DeleteHostPressure(ctx, hostID); err != nil {
+				return "", "", pgtype.Timestamptz{}, err
+			}
 			reclaimed = true
 			log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
 				Msg("host identity reclaimed from a silent holder")
@@ -334,6 +340,16 @@ func (h *Handlers) HostList(c *gin.Context) {
 		TransitionalCount int32   `json:"transitional_count"`
 		PausedCount       int32   `json:"paused_count"`
 		BuildingCount     int32   `json:"building_count"`
+		// Pressure fields are pointers: nil means the host has never
+		// published pressure (older vmd, or publication not enabled) —
+		// "unknown" must never render as a plausible zero.
+		PressureAllocatedMemoryMib *int64  `json:"pressure_allocated_memory_mib"`
+		PressureAllocatedVcpus     *int64  `json:"pressure_allocated_vcpus"`
+		PressureRunning            *int32  `json:"pressure_running_sandboxes"`
+		PressureProvisioning       *int32  `json:"pressure_provisioning_sandboxes"`
+		PressureUsedNetSlots       *int32  `json:"pressure_used_net_slots"`
+		PressureWarmNetSlots       *int32  `json:"pressure_warm_net_slots"`
+		PressureReportedAt         *string `json:"pressure_reported_at"`
 	}
 	hosts := make([]hostView, 0, len(rows))
 	for _, r := range rows {
@@ -351,6 +367,16 @@ func (h *Handlers) HostList(c *gin.Context) {
 			s := r.LastHeartbeatAt.Time.UTC().Format(time.RFC3339)
 			v.LastHeartbeatAt = &s
 		}
+		v.PressureAllocatedMemoryMib = r.PressureAllocatedMemoryMib
+		v.PressureAllocatedVcpus = r.PressureAllocatedVcpus
+		v.PressureRunning = r.PressureRunningSandboxes
+		v.PressureProvisioning = r.PressureProvisioningSandboxes
+		v.PressureUsedNetSlots = r.PressureUsedNetSlots
+		v.PressureWarmNetSlots = r.PressureWarmNetSlots
+		if r.PressureReportedAt.Valid {
+			s := r.PressureReportedAt.Time.UTC().Format(time.RFC3339)
+			v.PressureReportedAt = &s
+		}
 		hosts = append(hosts, v)
 	}
 	c.JSON(http.StatusOK, gin.H{"hosts": hosts})
@@ -361,4 +387,83 @@ func timestamptzString(ts pgtype.Timestamptz) any {
 		return nil
 	}
 	return ts.Time.Format(time.RFC3339Nano)
+}
+
+// pressureReport mirrors vmd's pressureRequest. vmd_addr is the identity
+// fence checked against the host row inside the upsert itself.
+type pressureReport struct {
+	VMDAddr               string `json:"vmd_addr"`
+	RunningSandboxes      int32  `json:"running_sandboxes"`
+	ProvisioningSandboxes int32  `json:"provisioning_sandboxes"`
+	PausedSandboxes       int32  `json:"paused_sandboxes"`
+	AllocatedMemoryMib    int64  `json:"allocated_memory_mib"`
+	AllocatedVcpus        int64  `json:"allocated_vcpus"`
+	UsedNetSlots          int32  `json:"used_net_slots"`
+	ProvisioningNetSlots  int32  `json:"provisioning_net_slots"`
+	WarmNetSlots          int32  `json:"warm_net_slots"`
+	NetSlotCeiling        int32  `json:"net_slot_ceiling"`
+	MaxNetworkSlots       int32  `json:"max_network_slots"`
+	MaxSandboxes          int32  `json:"max_sandboxes"`
+}
+
+func (r pressureReport) valid() bool {
+	return r.VMDAddr != "" && len(r.VMDAddr) <= 256 &&
+		r.RunningSandboxes >= 0 && r.ProvisioningSandboxes >= 0 &&
+		r.PausedSandboxes >= 0 && r.AllocatedMemoryMib >= 0 &&
+		r.AllocatedVcpus >= 0 && r.UsedNetSlots >= 0 &&
+		r.ProvisioningNetSlots >= 0 && r.WarmNetSlots >= 0 &&
+		r.NetSlotCeiling >= 0 && r.MaxNetworkSlots >= 0 && r.MaxSandboxes >= 0
+}
+
+// HostReportPressure handles PUT /internal/hosts/:host_id/pressure — the
+// best-effort capacity telemetry channel, deliberately SEPARATE from the
+// heartbeat: no outcome here can touch host liveness, and older control
+// planes simply lack the route (vmd backs off on the 404). The upsert is
+// identity-fenced on vmd_addr and wholesale last-write-wins with a
+// DB-clock reported_at; consumers treat any control-plane reservation
+// created after reported_at as a delta on top of this report.
+func (h *Handlers) HostReportPressure(c *gin.Context) {
+	hostID := c.Param("host_id")
+	if hostID == "" {
+		respondErrorMsg(c, "bad_request", "host_id is required", http.StatusBadRequest)
+		return
+	}
+	var req pressureReport
+	if err := bindJSONStrict(c, &req); err != nil {
+		respondErrorMsg(c, "bad_request", "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !req.valid() {
+		respondErrorMsg(c, "bad_request", "pressure fields must be non-negative and vmd_addr set", http.StatusBadRequest)
+		return
+	}
+	rows, err := h.DB.UpsertHostPressure(c.Request.Context(), db.UpsertHostPressureParams{
+		HostID:                hostID,
+		VmdAddr:               req.VMDAddr,
+		RunningSandboxes:      req.RunningSandboxes,
+		ProvisioningSandboxes: req.ProvisioningSandboxes,
+		PausedSandboxes:       req.PausedSandboxes,
+		AllocatedMemoryMib:    req.AllocatedMemoryMib,
+		AllocatedVcpus:        req.AllocatedVcpus,
+		UsedNetSlots:          req.UsedNetSlots,
+		ProvisioningNetSlots:  req.ProvisioningNetSlots,
+		WarmNetSlots:          req.WarmNetSlots,
+		NetSlotCeiling:        req.NetSlotCeiling,
+		MaxNetworkSlots:       req.MaxNetworkSlots,
+		MaxSandboxes:          req.MaxSandboxes,
+	})
+	if err != nil {
+		log.Error().Err(err).Str("host_id", hostID).Msg("UpsertHostPressure failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if rows == 0 {
+		// Unknown host or an address that no longer holds the identity.
+		// 409, not 404: after a successful heartbeat the row exists, so
+		// vmd must treat this as an identity problem to surface, never as
+		// "old control plane" (404 is reserved for exactly that).
+		respondErrorMsg(c, "conflict", "host identity is not held by this address", http.StatusConflict)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"recorded": true})
 }

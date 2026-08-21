@@ -380,6 +380,22 @@ type HostCapability struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+type HostPressure struct {
+	HostID                string    `json:"host_id"`
+	RunningSandboxes      int32     `json:"running_sandboxes"`
+	ProvisioningSandboxes int32     `json:"provisioning_sandboxes"`
+	PausedSandboxes       int32     `json:"paused_sandboxes"`
+	AllocatedMemoryMib    int64     `json:"allocated_memory_mib"`
+	AllocatedVcpus        int64     `json:"allocated_vcpus"`
+	UsedNetSlots          int32     `json:"used_net_slots"`
+	ProvisioningNetSlots  int32     `json:"provisioning_net_slots"`
+	WarmNetSlots          int32     `json:"warm_net_slots"`
+	NetSlotCeiling        int32     `json:"net_slot_ceiling"`
+	MaxNetworkSlots       int32     `json:"max_network_slots"`
+	MaxSandboxes          int32     `json:"max_sandboxes"`
+	ReportedAt            time.Time `json:"reported_at"`
+}
+
 type NetFlow struct {
 	ID         int64      `json:"id"`
 	Ts         time.Time  `json:"ts"`

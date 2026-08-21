@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -509,5 +510,118 @@ func TestIntegration_HostIdentityOptIn(t *testing.T) {
 	// From here, description-less heartbeats are rejected.
 	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{"capabilities":[]}`); w.Code != http.StatusConflict {
 		t.Fatalf("legacy heartbeat on bound row = %d, want 409", w.Code)
+	}
+}
+
+// The pressure endpoint upserts identity-fenced telemetry: only the
+// address holding the host identity may write, the row is wholesale
+// last-write-wins with a DB-clock reported_at, a reclaim clears it, and
+// the admin view carries it (null for hosts that never published).
+func TestIntegration_HostPressureLifecycle(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
+	r := newRouter(t)
+	hostID := "prs-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
+
+	// Self-register the host, then publish pressure from its address.
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{"capabilities":[],`+hostDescription+`}`); w.Code != http.StatusOK {
+		t.Fatalf("register: %d %s", w.Code, w.Body.String())
+	}
+	pressure := func(vmdAddr string, running int) *httptest.ResponseRecorder {
+		body := fmt.Sprintf(`{"vmd_addr":%q,"running_sandboxes":%d,"provisioning_sandboxes":1,"paused_sandboxes":2,"allocated_memory_mib":4096,"allocated_vcpus":6,"used_net_slots":9,"provisioning_net_slots":1,"warm_net_slots":32,"net_slot_ceiling":65000,"max_network_slots":500,"max_sandboxes":40}`, vmdAddr, running)
+		req := httptest.NewRequest("PUT", "/internal/hosts/"+hostID+"/pressure", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer itok-hostreg")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	if w := pressure("10.9.0.7:50051", 5); w.Code != http.StatusOK {
+		t.Fatalf("pressure: %d %s", w.Code, w.Body.String())
+	}
+	var running, maxSandboxes int
+	var reportedAge float64
+	if err := testPool.QueryRow(ctx,
+		`SELECT running_sandboxes, max_sandboxes,
+		        EXTRACT(EPOCH FROM (now() - reported_at))
+		 FROM host_pressure WHERE host_id = $1`, hostID).
+		Scan(&running, &maxSandboxes, &reportedAge); err != nil {
+		t.Fatalf("read pressure row: %v", err)
+	}
+	if running != 5 || maxSandboxes != 40 {
+		t.Fatalf("row = running %d max %d, want 5/40", running, maxSandboxes)
+	}
+	if reportedAge < 0 || reportedAge > 60 {
+		t.Fatalf("reported_at age = %fs, want DB-clock recent", reportedAge)
+	}
+
+	// Wrong address: identity fence refuses, row untouched.
+	if w := pressure("10.9.9.9:50051", 99); w.Code != http.StatusConflict {
+		t.Fatalf("mismatched addr = %d, want 409", w.Code)
+	}
+	if err := testPool.QueryRow(ctx,
+		`SELECT running_sandboxes FROM host_pressure WHERE host_id = $1`, hostID).
+		Scan(&running); err != nil || running != 5 {
+		t.Fatalf("row after fenced write: running=%d err=%v, want 5 untouched", running, err)
+	}
+
+	// Last-write-wins from the holder.
+	if w := pressure("10.9.0.7:50051", 8); w.Code != http.StatusOK {
+		t.Fatalf("second pressure: %d %s", w.Code, w.Body.String())
+	}
+
+	// Admin view carries it.
+	req := httptest.NewRequest("GET", "/internal/hosts", nil)
+	req.Header.Set("Authorization", "Bearer optok-hostreg")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: %d %s", w.Code, w.Body.String())
+	}
+	var out struct {
+		Hosts []struct {
+			ID              string `json:"id"`
+			PressureRunning *int32 `json:"pressure_running_sandboxes"`
+			PressureMem     *int64 `json:"pressure_allocated_memory_mib"`
+		} `json:"hosts"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	found := false
+	for _, h := range out.Hosts {
+		if h.ID != hostID {
+			continue
+		}
+		found = true
+		if h.PressureRunning == nil || *h.PressureRunning != 8 || h.PressureMem == nil || *h.PressureMem != 4096 {
+			t.Fatalf("admin pressure = %+v, want running 8 mem 4096", h)
+		}
+	}
+	if !found {
+		t.Fatalf("host %s not in admin list", hostID)
+	}
+
+	// A reclaim from a new address (old holder stale) clears pressure:
+	// the old machine's numbers mean nothing for the new holder.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE host SET last_heartbeat_at = now() - interval '10 minutes' WHERE id = $1`, hostID); err != nil {
+		t.Fatalf("age heartbeat: %v", err)
+	}
+	reclaimDesc := `"vmd_addr":"10.9.0.8:50051","proxy_addr":"10.9.0.8:5007",` +
+		`"region":"test-region","capacity_memory_mib":1024,"capacity_vcpus":8`
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{"capabilities":[],`+reclaimDesc+`}`); w.Code != http.StatusOK {
+		t.Fatalf("reclaim heartbeat: %d %s", w.Code, w.Body.String())
+	}
+	var count int
+	if err := testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM host_pressure WHERE host_id = $1`, hostID).Scan(&count); err != nil {
+		t.Fatalf("count pressure rows: %v", err)
+	}
+	if count != 0 {
+		t.Fatal("pressure row survived identity reclaim")
 	}
 }

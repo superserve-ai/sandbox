@@ -1782,6 +1782,38 @@ func (m *Manager) cleanupFull(nsName, vethName string) {
 	_ = run(ctx, "ip", "netns", "del", nsName)
 }
 
+// SlotPressureStats is the in-memory slot accounting the heartbeat's
+// pressure publisher reads: no filesystem or namespace inspection, just
+// counter and channel reads, so it is safe at any cadence.
+//
+//	Used:         slots owned by live VMs and builds (allocator truth)
+//	WarmReady:    pool slots fully built and claimable right now
+//	Provisioning: refill workers currently building or delivering a slot
+//	Ceiling:      the IP-scheme hard bound on total slots (not a knob)
+type SlotPressureStats struct {
+	Used         int
+	WarmReady    int
+	Provisioning int
+	Ceiling      int
+}
+
+// SlotPressure returns the current in-memory slot accounting. Pure reads:
+// one mutex for the owner map, channel lengths and an atomic for the pool.
+func (m *Manager) SlotPressure() SlotPressureStats {
+	st := SlotPressureStats{Ceiling: MaxSlots}
+	m.mu.Lock()
+	st.Used = len(m.slotOwner)
+	m.mu.Unlock()
+	if m.pool != nil {
+		fresh, recycled, ok := m.PoolStats()
+		if ok {
+			st.WarmReady = fresh + recycled
+		}
+		st.Provisioning = int(m.pool.refillActive.Load())
+	}
+	return st
+}
+
 // NetnsStats reports the ns-N namespaces on the host, the owned slot indices
 // (slotOwner covers every legitimate holder), and orphaned — namespaces with
 // no owner, the leak signal. Measured per namespace so owners without a
