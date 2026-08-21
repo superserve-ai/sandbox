@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -275,8 +276,26 @@ func run() error {
 		}
 		c, err := handlers.Hosts.ClientFor(rctx, hostID)
 		if err != nil {
-			log.Warn().Err(err).Str("host_id", hostID).Msg("supervisor: host lookup failed, using default client")
-			return vmdClient, nil
+			// Bootstrap parity: an unpopulated host table is a supported
+			// mode — buildHostAccepting and TryDispatchBuild both let a
+			// build dispatch when the default host's row is missing, and
+			// this resolver must agree or the just-claimed build is marked
+			// permanently failed right after those gates passed. Only the
+			// CONFIGURED DEFAULT id keeps that fallback; any other id with
+			// a missing row stays a hard error — a recorded build host
+			// that vanished must never silently reroute to a machine that
+			// never ran the build.
+			if errors.Is(err, pgx.ErrNoRows) && hostID == cfg.DefaultHostID {
+				log.Warn().Str("host_id", hostID).
+					Msg("supervisor: default host row missing (bootstrap mode); using configured default client")
+				return vmdClient, nil
+			}
+			if errors.Is(err, pgx.ErrNoRows) {
+				// Missing non-default registration: terminal, never
+				// retryable without operator action.
+				return nil, fmt.Errorf("build host %q not registered: %w", hostID, supervisor.ErrBuildHostGone)
+			}
+			return nil, fmt.Errorf("resolve build host %q: %w", hostID, err)
 		}
 		return c, nil
 	}

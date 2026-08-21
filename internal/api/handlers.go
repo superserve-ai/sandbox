@@ -255,23 +255,74 @@ func (h *Handlers) authzService() *authz.Service {
 }
 
 // vmdForHost returns the VMDClient for the given host. When a registry is
-// configured, it resolves via DB lookup. If the lookup fails because the host
-// row is missing (legacy sandbox with a backfilled host_id whose row is gone),
-// falls back to the default VMD client so existing sandboxes keep working
-// during the migration period. Any other error is surfaced.
+// configured, it resolves via DB lookup; a missing host row is a hard
+// error, never a fallback — with more than one host, falling back silently
+// routes lifecycle operations to whichever machine the default happens to
+// be, the wrong one for every sandbox not on it. One deliberate exception,
+// matching the scheduler fallback and the build resolver: the CONFIGURED
+// DEFAULT id keeps routing to the configured default client when its row is
+// missing, because an unpopulated host table is the supported single-host
+// bootstrap mode and all three paths must agree on it. Any other id with a
+// missing row is data corruption to surface, not paper over. (The
+// registry-less mode, Hosts == nil, remains the explicit test/dev wiring.)
 func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, error) {
 	if h.Hosts == nil {
 		return h.VMD, nil
 	}
-	c, err := h.Hosts.ClientFor(ctx, hostID)
-	if err == nil {
-		return c, nil
-	}
-	if errors.Is(err, pgx.ErrNoRows) && h.VMD != nil {
-		log.Warn().Err(err).Str("host_id", hostID).Msg("unknown host row; falling back to default VMD client")
+	if hostID == "" {
+		// An empty id is unambiguous: no host can register one and vmd
+		// refuses to start without one, so it only reaches here from
+		// records that predate host tracking (e.g. a build row with a
+		// NULL vmd_host_id whose logs are being streamed). Legacy
+		// records ran on the configured default by definition.
 		return h.VMD, nil
 	}
-	return nil, err
+	c, err := h.Hosts.ClientFor(ctx, hostID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			if h.Config != nil && hostID == h.Config.DefaultHostID && h.VMD != nil {
+				log.Warn().Str("host_id", hostID).
+					Msg("default host row missing (bootstrap mode); using configured default client")
+				return h.VMD, nil
+			}
+			// Distinct, alertable log: this firing means a sandbox row
+			// references a host the control plane does not know.
+			log.Error().Str("host_id", hostID).
+				Msg("host_not_registered: sandbox routed to an unknown host; refusing to fall back")
+			return nil, fmt.Errorf("host %q not registered: %w", hostID, err)
+		}
+		return nil, err
+	}
+	return c, nil
+}
+
+// revertPauseAsync undoes BeginPause's claim after a pause that failed
+// before completing — status back to 'active' and the billing interval
+// reopened, in ONE statement (RevertPauseToActive) so a failure between the
+// two facts is unrepresentable. Runs detached from the caller's cancellation
+// (a client disconnect must not orphan the revert) while keeping trace
+// context.
+func (h *Handlers) revertPauseAsync(c *gin.Context, sandboxID, teamID uuid.UUID, l zerolog.Logger) {
+	revertCtx := context.WithoutCancel(c.Request.Context())
+	actorID := actorIDFromContext(c)
+	go func() {
+		ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
+		defer cancel()
+		n, err := h.DB.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
+			SandboxID: sandboxID,
+			TeamID:    teamID,
+			ActorID:   actorUUID(actorID),
+		})
+		if err != nil {
+			l.Error().Err(err).Msg("async pause revert failed")
+			return
+		}
+		if n == 0 {
+			// Another transition (delete, reaper) moved the sandbox out
+			// of 'pausing' first; its state wins over the revert.
+			l.Warn().Msg("pause revert skipped: sandbox no longer pausing")
+		}
+	}()
 }
 
 // vmdTimeout is the default deadline for VMD gRPC calls.
@@ -2829,10 +2880,16 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// with the status transition; nothing to do here. If the pause
 	// subsequently fails, the revert paths reopen a new interval.
 
-	// Resolve the VMD client for this sandbox's host.
+	// Resolve the VMD client for this sandbox's host. BeginPause has
+	// already claimed 'pausing' and closed the billing interval, so a
+	// lookup failure — now a real path when the host row is missing —
+	// must compensate exactly like a daemon failure, or the sandbox is
+	// stuck in 'pausing' and unbilled even after the registration is
+	// repaired.
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("resolve VMD for pause failed")
+		h.revertPauseAsync(c, sandboxID, teamID, l)
 		respondError(c, ErrInternal)
 		return
 	}
@@ -2851,32 +2908,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		}
 
 		l.Error().Err(err).Msg("VMD PauseInstance failed")
-		// Revert status to active asynchronously. Detach cancellation so
-		// the revert survives client disconnect, but keep trace context
-		// so the revert is linked to the original pause request.
-		revertCtx := context.WithoutCancel(c.Request.Context())
-		actorID := actorIDFromContext(c)
-		go func() {
-			ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
-			defer cancel()
-			if revertErr := h.DB.UpdateSandboxStatus(ctx, db.UpdateSandboxStatusParams{
-				ID:     sandboxID,
-				Status: db.SandboxStatusActive,
-				TeamID: teamID,
-			}); revertErr != nil {
-				l.Error().Err(revertErr).Msg("async revert to active failed")
-				return
-			}
-			// Reopen the interval we closed at BeginPause — sandbox is
-			// back to 'active' and should resume being counted as such.
-			if openErr := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
-				SandboxID: sandboxID,
-				TeamID:    teamID,
-				ActorID:   actorUUID(actorID),
-			}); openErr != nil {
-				l.Error().Err(openErr).Msg("async reopen interval after revert failed")
-			}
-		}()
+		h.revertPauseAsync(c, sandboxID, teamID, l)
 		respondError(c, ErrInternal)
 		return
 	}
