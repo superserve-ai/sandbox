@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"sort"
+	"strings"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/rs/zerolog"
@@ -88,67 +90,45 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 		return fmt.Errorf("init iptables: %w", err)
 	}
 
-	// Owner: build the owned chains (flush + rebuild reconciles config
-	// changes away) and their veth-scoped entry jumps.
+	// Owner: rebuild the owned chains ATOMICALLY, one iptables-restore
+	// transaction per table. The live entry jumps keep referencing these
+	// chains throughout the slow path, so a flush-and-repopulate through
+	// individual commands would open a window where sandbox traffic falls
+	// through an empty chain into the foreign FORWARD rules — and a failure
+	// mid-repopulation would strand it there. A declared chain inside a
+	// --noflush restore is created-or-flushed and refilled in a single
+	// commit; on error the previous contents remain. Contents come from the
+	// same spec the verifier checks, so the two cannot drift.
 	if manageOwnedChains {
-		if err := ipt.ClearChain("filter", portDropChain); err != nil {
-			return fmt.Errorf("reset %s chain: %w", portDropChain, err)
-		}
-		dropPorts := blockedPorts
-		if dnsRedirectPort > 0 {
-			// The DNS redirect below only captures plain DNS on port 53.
-			// Encrypted DNS on its dedicated port (DoT/DoQ, 853) would
-			// silently sidestep the operator's resolver, so it is dropped
-			// whenever the redirect is active.
-			dropPorts = append(append([]uint16(nil), blockedPorts...), 853)
-		}
-		for _, port := range dropPorts {
-			for _, proto := range []string{"tcp", "udp"} {
-				if err := ipt.AppendUnique("filter", portDropChain,
-					"-p", proto, "--dport", fmt.Sprintf("%d", port), "-j", "DROP"); err != nil {
-					return fmt.Errorf("add %s/%d DROP to %s: %w", proto, port, portDropChain, err)
+		spec := hostFWSpecFor(hostIface, httpProxyPort, tlsProxyPort, dnsRedirectPort, secretsProxyDst, secretsProxyPort, blockedPorts, true)
+		for _, table := range []string{"filter", "nat"} {
+			var lines []string
+			var chains []string
+			for key := range spec.ownedChains {
+				if strings.HasPrefix(key, table+"/") {
+					chains = append(chains, strings.TrimPrefix(key, table+"/"))
 				}
 			}
-		}
-
-		// SANDBOX_FORWARD fully decides sandbox forwarding: enforcement
-		// first, the clamp before the ACCEPT that would terminate the walk,
-		// and a terminal DROP so unmatched sandbox traffic (e.g. veth→veth)
-		// never falls back into FORWARD.
-		if err := ipt.ClearChain("filter", forwardChain); err != nil {
-			return fmt.Errorf("reset %s chain: %w", forwardChain, err)
-		}
-		for _, args := range forwardChainRules(hostIface) {
-			if err := ipt.AppendUnique("filter", forwardChain, args...); err != nil {
-				return fmt.Errorf("add rule to %s: %w", forwardChain, err)
+			sort.Strings(chains)
+			for _, chain := range chains {
+				lines = append(lines, ":"+chain+" - [0:0]")
+			}
+			for _, chain := range chains {
+				for _, w := range spec.ownedChains[table+"/"+chain] {
+					lines = append(lines, "-A "+chain+" "+emitRuleTokens(w.args))
+				}
+			}
+			input := "*" + table + "\n" + strings.Join(lines, "\n") + "\nCOMMIT\n"
+			if err := restoreIPTables(context.Background(), input); err != nil {
+				return fmt.Errorf("atomic %s owned-chain rebuild: %w", table, err)
 			}
 		}
+	}
 
-		if err := ipt.ClearChain("nat", dnsRedirectChain); err != nil {
-			return fmt.Errorf("reset %s chain: %w", dnsRedirectChain, err)
-		}
-		for _, args := range dnsRedirectRules(dnsRedirectPort) {
-			if err := ipt.AppendUnique("nat", dnsRedirectChain, args...); err != nil {
-				return fmt.Errorf("add DNS redirect to %s: %w", dnsRedirectChain, err)
-			}
-		}
-
-		if err := ipt.ClearChain("nat", preroutingChain); err != nil {
-			return fmt.Errorf("reset %s chain: %w", preroutingChain, err)
-		}
-		preRules, err := preroutingChainRules(httpProxyPort, tlsProxyPort, secretsProxyDst, secretsProxyPort)
-		if err != nil {
-			return err
-		}
-		for _, args := range preRules {
-			if err := ipt.AppendUnique("nat", preroutingChain, args...); err != nil {
-				return fmt.Errorf("add rule to %s: %w", preroutingChain, err)
-			}
-		}
-
-		// Entry jumps at the head of the shared chains, in-jump before
-		// out-jump. Everything sandbox-related is decided in the owned
-		// chains, so nothing below these jumps can act on sandbox traffic.
+	// Entry jumps at the head of the shared chains, in-jump before
+	// out-jump. Everything sandbox-related is decided in the owned
+	// chains, so nothing below these jumps can act on sandbox traffic.
+	if manageOwnedChains {
 		jumps := []struct {
 			table, chain string
 			pos          int

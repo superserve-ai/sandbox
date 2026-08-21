@@ -1328,6 +1328,30 @@ func TestDockerCohabitation(t *testing.T) {
 			t.Fatalf("docker below the terminal jumps flagged: %s", class)
 		}
 	})
+	t.Run("goto into a safe chain still fails closed", func(t *testing.T) {
+		// -g never returns to the calling chain: even with an empty target,
+		// the rest of FORWARD — including vmd's entry jumps — is skipped.
+		rules, chains := dockerKernel(spec)
+		fw := rules["filter/FORWARD"]
+		rules["filter/FORWARD"] = append([][]string{{"-g", "DOCKER-USER"}}, fw...)
+		if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "preceded-ambiguous" {
+			t.Fatalf("ok=%v class=%s, want preceded-ambiguous", ok, class)
+		}
+	})
+	t.Run("negated conntrack accept is not established-only", func(t *testing.T) {
+		// "! --ctstate ESTABLISHED -j ACCEPT" admits NEW sandbox flows — the
+		// chain must read permissive (a repairable bypass), never safe.
+		rules, chains := dockerKernel(spec)
+		rules["filter/DOCKER-FORWARD"] = [][]string{
+			{"-j", "DOCKER-CT"}, {"-j", "DOCKER-INTERNAL"}, {"-j", "DOCKER-BRIDGE"},
+		}
+		rules["filter/DOCKER-CT"] = [][]string{
+			{"!", "--ctstate", "ESTABLISHED", "-j", "ACCEPT"},
+		}
+		if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "preceded" {
+			t.Fatalf("ok=%v class=%s, want preceded", ok, class)
+		}
+	})
 	t.Run("cycle in foreign chains fails closed", func(t *testing.T) {
 		rules, chains := dockerKernel(spec)
 		rules["filter/DOCKER-USER"] = [][]string{{"-j", "DOCKER-LOOP"}}

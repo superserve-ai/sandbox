@@ -363,12 +363,18 @@ func sourceDisjointFromVMRange(tokens []string) bool {
 // jumps (Docker's standard tree is three levels).
 const maxChainResolutionDepth = 5
 
-// controlTransferTarget returns the chain a rule transfers control into via
-// -j or -g. Only chains the dump itself declares qualify — an unknown target
-// name stays unresolvable and the caller fails closed.
+// controlTransferTarget returns the chain a rule JUMPS into via -j. Only
+// chains the dump itself declares qualify — an unknown target name stays
+// unresolvable and the caller fails closed. -g/--goto NEVER qualifies:
+// processing does not return to the chain containing the goto, so even a
+// goto into a provably-safe chain skips every rule below it — including the
+// vmd entry jumps — and falls through to the built-in policy.
 func controlTransferTarget(d *parsedDump, table string, tokens []string) (string, bool) {
 	for i, t := range tokens {
-		if (t == "-j" || t == "-g" || t == "--goto") && i+1 < len(tokens) && d.chains[table+"/"+tokens[i+1]] {
+		if t == "-g" || t == "--goto" {
+			return "", false
+		}
+		if t == "-j" && i+1 < len(tokens) && d.chains[table+"/"+tokens[i+1]] {
 			return tokens[i+1], true
 		}
 	}
@@ -390,6 +396,9 @@ func establishedOnlyAccept(tokens []string) bool {
 		}
 		if t != "--ctstate" || i+1 >= len(tokens) {
 			continue
+		}
+		if i > 0 && tokens[i-1] == "!" {
+			return false // "everything except ESTABLISHED" admits NEW flows
 		}
 		for _, st := range strings.Split(tokens[i+1], ",") {
 			if st != "RELATED" && st != "ESTABLISHED" {
