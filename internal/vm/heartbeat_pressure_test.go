@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -225,5 +226,43 @@ func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 	m.buildPressureVcpus.Add(-2)
 	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 0 || p.AllocatedMemoryMib != 0 {
 		t.Fatalf("after worker exit: %+v, want released", p)
+	}
+}
+
+// PressureReady fails CLOSED when the state inventory cannot be read: an
+// empty instance map on a possibly-full host must suppress publication
+// (leaving the previous report visibly aging) rather than advertise
+// fresh zeros that invite over-placement.
+func TestPressureReadyFailsClosedOnUnreadableState(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Closed store: All() errors, exactly like a corrupt/unreadable DB.
+	st.Close()
+	m := &Manager{state: st, vms: map[string]*VMInstance{}}
+	m.ReattachAll(context.Background())
+	if m.PressureReady() {
+		t.Fatal("PressureReady = true after a failed state read; must fail closed")
+	}
+
+	// A readable (empty) store completes normally and enables publication.
+	st2, err := OpenStateStore(filepath.Join(dir, "vmd2.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	m2 := &Manager{state: st2, vms: map[string]*VMInstance{}}
+	m2.ReattachAll(context.Background())
+	if !m2.PressureReady() {
+		t.Fatal("PressureReady = false after a successful reattach")
+	}
+
+	// No state store at all: nothing to reattach, empty is the truth.
+	m3 := &Manager{vms: map[string]*VMInstance{}}
+	m3.ReattachAll(context.Background())
+	if !m3.PressureReady() {
+		t.Fatal("PressureReady = false with no state store configured")
 	}
 }

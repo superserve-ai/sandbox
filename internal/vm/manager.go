@@ -3167,21 +3167,29 @@ func (m *Manager) ShutdownAll() {
 // are cleaned up. Orphan systemd units (running but not in BoltDB) are logged
 // so the reconciler can handle them.
 func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
-	// Set on EVERY exit, the error paths included: a host that cannot
-	// read its state store has nothing better to reattach from, and
-	// suppressing pressure forever would leave the control plane with an
-	// eternally stale report instead of the best available truth.
-	defer m.reattachComplete.Store(true)
 	if m.state == nil {
+		// No persisted state means nothing to reattach: an empty map IS
+		// this host's truth, so publication may begin.
 		m.log.Warn().Msg("no state store configured — skipping reattach")
+		m.reattachComplete.Store(true)
 		return 0, 0
 	}
 
 	records, err := m.state.All()
 	if err != nil {
-		m.log.Error().Err(err).Msg("failed to read BoltDB state — skipping reattach")
+		// FAIL CLOSED: the map is empty but the host may be full, and a
+		// fresh zero-pressure report would look current and trustworthy —
+		// inviting over-placement — where a suppressed one leaves the
+		// previous report visibly aging (reported_at is the staleness
+		// signal admission must gate on). Publication stays off until a
+		// restart reads the store successfully.
+		m.log.Error().Err(err).Msg("failed to read BoltDB state — skipping reattach; pressure publication stays suppressed")
 		return 0, 0
 	}
+	// The inventory was read: whatever the loop below reattaches (or
+	// cleans up) is the host's truth, so publication may begin once it
+	// finishes.
+	defer m.reattachComplete.Store(true)
 
 	// Build a set of BoltDB-known IDs for orphan detection.
 	knownIDs := make(map[string]bool, len(records))
