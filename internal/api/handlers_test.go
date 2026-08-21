@@ -3939,6 +3939,7 @@ func TestCreateSandbox_InsertCarriesTemplateShape(t *testing.T) {
 	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Scheduler: &stubScheduler{hostID: "public-host"}}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"shaped"}`))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusCreated, w.Body.String())
