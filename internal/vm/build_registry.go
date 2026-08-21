@@ -118,6 +118,11 @@ func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB ui
 		logs:       newBuildLogBuffer(),
 	}
 	m.builds[buildVMID] = rec
+	// Pressure counters pair with the worker-exit release in
+	// buildTemplateWorker; see the field comment on buildPressureCount.
+	m.buildPressureCount.Add(1)
+	m.buildPressureMem.Add(int64(memoryMiB))
+	m.buildPressureVcpus.Add(int64(vcpu))
 	return rec, nil
 }
 

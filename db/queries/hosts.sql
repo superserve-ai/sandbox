@@ -295,6 +295,13 @@ SELECT h.id, @running_sandboxes, @provisioning_sandboxes, @paused_sandboxes,
        @net_slot_ceiling, @max_network_slots, @max_sandboxes, now()
 FROM host h
 WHERE h.id = @host_id AND h.vmd_addr = @vmd_addr
+-- FOR SHARE serializes the address check against an identity reclaim
+-- (which takes the row FOR UPDATE): without it this statement could
+-- evaluate the old address from its snapshot and insert stale pressure
+-- AFTER the reclaim committed its delete. Locked, either the reclaim
+-- waits for this write (then deletes it), or this write waits and
+-- re-evaluates against the new address (then matches nothing).
+FOR SHARE
 ON CONFLICT (host_id) DO UPDATE SET
     running_sandboxes = EXCLUDED.running_sandboxes,
     provisioning_sandboxes = EXCLUDED.provisioning_sandboxes,

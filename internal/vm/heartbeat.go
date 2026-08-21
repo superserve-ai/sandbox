@@ -61,6 +61,12 @@ type HeartbeatConfig struct {
 	// host liveness. Nil (older wiring, tests, hosts without the advertise
 	// config) publishes nothing and the process behaves exactly as before.
 	Pressure func() HostPressure
+	// PressureReady, when set, holds publication off until it reports
+	// true — wired to the manager's reattach completion, so a restarting
+	// vmd never publishes a near-zero snapshot of a half-rebuilt instance
+	// map (the control plane keeps the previous report; its age is the
+	// staleness signal). Nil means always ready.
+	PressureReady func() bool
 	// MaxSandboxes and MaxNetworkSlots are operator-configured admission
 	// limits published alongside pressure; 0 means unset (no cap).
 	MaxSandboxes    int32
@@ -163,6 +169,9 @@ type pressureRequest struct {
 // already succeeded.
 func sendPressure(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token string, ps *pressureState, log zerolog.Logger) {
 	if cfg.Pressure == nil || cfg.AdvertiseVMDAddr == "" {
+		return
+	}
+	if cfg.PressureReady != nil && !cfg.PressureReady() {
 		return
 	}
 	if ps.unsupported {

@@ -1799,10 +1799,21 @@ type SlotPressureStats struct {
 
 // SlotPressure returns the current in-memory slot accounting. Pure reads:
 // one mutex for the owner map, channel lengths and an atomic for the pool.
+// Used counts only slots held by real owners (VMs, builds): pool-owned
+// slots — warm inventory and slots mid-build for the pool — are excluded
+// here and reported through WarmReady/Provisioning instead, so the same
+// slot can never appear in two pressure classes at once (Used + Warm +
+// Provisioning is what the prepared-slot ceiling bounds; double-counting
+// would corrupt that formula). One O(owned) walk of the map, at
+// heartbeat cadence only.
 func (m *Manager) SlotPressure() SlotPressureStats {
 	st := SlotPressureStats{Ceiling: MaxSlots}
 	m.mu.Lock()
-	st.Used = len(m.slotOwner)
+	for _, owner := range m.slotOwner {
+		if owner != poolOwner {
+			st.Used++
+		}
+	}
 	m.mu.Unlock()
 	if m.pool != nil {
 		fresh, recycled, ok := m.PoolStats()

@@ -99,6 +99,15 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 // records the outcome in the registry. Never returns an error — all failures
 // are logged and surfaced via completeBuild so GetBuildStatus sees them.
 func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req BuildTemplateRequest) {
+	// Release the pressure counters HERE — worker return is the
+	// subprocess-exit point — never at the terminal status transition: a
+	// cancel marks the record terminal while the build VM may still be
+	// dying, and its memory is real until the process is gone.
+	defer func() {
+		m.buildPressureCount.Add(-1)
+		m.buildPressureMem.Add(-int64(req.MemoryMiB))
+		m.buildPressureVcpus.Add(-int64(req.VCPU))
+	}()
 	result, err := m.buildTemplateSync(ctx, buildVMID, req)
 	m.completeBuild(buildVMID, result, err)
 }

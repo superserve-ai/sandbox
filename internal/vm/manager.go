@@ -483,6 +483,22 @@ type Manager struct {
 	// until process exit so late pollers can read terminal outcomes.
 	buildsMu sync.RWMutex
 	builds   map[string]*buildRecord
+	// In-flight build pressure, maintained as counters so CapacityPressure
+	// never scans the (indefinitely retained) build registry: incremented
+	// at registration, decremented ONLY when the build worker returns —
+	// the subprocess-exit point — so a cancelled build keeps its resources
+	// counted until the process is actually gone, not merely marked
+	// terminal.
+	buildPressureCount atomic.Int64
+	buildPressureMem   atomic.Int64
+	buildPressureVcpus atomic.Int64
+	// reattachComplete gates pressure publication: until the background
+	// reattach has rebuilt the instance map, CapacityPressure would
+	// report a near-zero allocation for a possibly-full host, and one
+	// such report after every vmd restart would briefly invite
+	// over-placement. The control plane keeps the previous report while
+	// publication is suppressed; its age is the staleness signal.
+	reattachComplete atomic.Bool
 
 	// vmOpLocks serializes lifecycle operations (restore, resume, pause) for
 	// a single vmID, so a retry or a concurrent actor can't stomp an
@@ -3151,6 +3167,11 @@ func (m *Manager) ShutdownAll() {
 // are cleaned up. Orphan systemd units (running but not in BoltDB) are logged
 // so the reconciler can handle them.
 func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
+	// Set on EVERY exit, the error paths included: a host that cannot
+	// read its state store has nothing better to reattach from, and
+	// suppressing pressure forever would leave the control plane with an
+	// eternally stale report instead of the best available truth.
+	defer m.reattachComplete.Store(true)
 	if m.state == nil {
 		m.log.Warn().Msg("no state store configured — skipping reattach")
 		return 0, 0
@@ -4341,6 +4362,13 @@ type HostPressure struct {
 	NetSlotCeiling        int32 // IP-scheme hard bound, not an operator knob
 }
 
+// PressureReady reports whether pressure publication may begin: false
+// until the startup reattach has rebuilt the instance map (see
+// reattachComplete).
+func (m *Manager) PressureReady() bool {
+	return m.reattachComplete.Load()
+}
+
 // CapacityPressure computes the pressure summary from maintained
 // in-memory state only: a pointer snapshot of the instance map under the
 // manager lock, per-instance reads under each instance's own lock, the
@@ -4371,6 +4399,12 @@ func (m *Manager) CapacityPressure() HostPressure {
 			// reclaim) a network slot, which UsedNetSlots already counts.
 			p.PausedSandboxes++
 			continue
+		case StatusError:
+			// Error records can deliberately retain a possibly-live
+			// Firecracker (stop unconfirmed): its memory and CPU may still
+			// be real, so they stay counted until teardown removes the
+			// record. Not a running or provisioning sandbox — only the
+			// allocation is kept, erring toward over-reporting pressure.
 		default:
 			continue
 		}
@@ -4380,17 +4414,14 @@ func (m *Manager) CapacityPressure() HostPressure {
 	// In-flight template builds run in a subprocess and never enter the
 	// instance map, but their memory and CPU are as real as any
 	// sandbox's, and build distribution (multi-host) will place against
-	// this number — a busy build host must not look idle.
-	m.buildsMu.RLock()
-	for _, rec := range m.builds {
-		if rec.Status.IsTerminal() {
-			continue
-		}
-		p.ProvisioningSandboxes++
-		p.AllocatedMemoryMib += int64(rec.MemoryMiB)
-		p.AllocatedVcpus += int64(rec.VCPU)
-	}
-	m.buildsMu.RUnlock()
+	// this number — a busy build host must not look idle. Counters, not a
+	// registry scan: records are retained indefinitely, and the counters
+	// release only at worker exit (see registerBuild/buildTemplateWorker),
+	// which also keeps a cancelled build counted until its subprocess is
+	// actually gone.
+	p.ProvisioningSandboxes += int32(m.buildPressureCount.Load())
+	p.AllocatedMemoryMib += m.buildPressureMem.Load()
+	p.AllocatedVcpus += m.buildPressureVcpus.Load()
 	if m.netMgr != nil {
 		st := m.netMgr.SlotPressure()
 		p.UsedNetSlots = int32(st.Used)

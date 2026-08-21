@@ -781,3 +781,22 @@ func TestCleanupUsesSharedVpeerDerivation(t *testing.T) {
 		}
 	}
 }
+
+// Used must exclude pool-owned slots: warm and mid-build inventory is
+// reported through its own classes, and a slot in two classes at once
+// would corrupt the prepared-slot ceiling formula.
+func TestSlotPressureExcludesPoolOwnedFromUsed(t *testing.T) {
+	m := &Manager{slotOwner: map[int]string{
+		1: "vm-a",
+		2: "vm-b",
+		3: poolOwner,
+		4: poolOwner,
+	}}
+	st := m.SlotPressure()
+	if st.Used != 2 {
+		t.Fatalf("Used = %d, want 2 (pool-owned excluded)", st.Used)
+	}
+	if st.Ceiling != MaxSlots {
+		t.Fatalf("Ceiling = %d", st.Ceiling)
+	}
+}

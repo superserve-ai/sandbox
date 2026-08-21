@@ -811,6 +811,7 @@ SELECT h.id, $1, $2, $3,
        $9, $10, $11, now()
 FROM host h
 WHERE h.id = $12 AND h.vmd_addr = $13
+FOR SHARE
 ON CONFLICT (host_id) DO UPDATE SET
     running_sandboxes = EXCLUDED.running_sandboxes,
     provisioning_sandboxes = EXCLUDED.provisioning_sandboxes,
@@ -850,6 +851,12 @@ type UpsertHostPressureParams struct {
 // Last-write-wins wholesale, reported_at from the DATABASE clock: this
 // pair is the reconciliation contract (see the host_pressure table
 // comment).
+// FOR SHARE serializes the address check against an identity reclaim
+// (which takes the row FOR UPDATE): without it this statement could
+// evaluate the old address from its snapshot and insert stale pressure
+// AFTER the reclaim committed its delete. Locked, either the reclaim
+// waits for this write (then deletes it), or this write waits and
+// re-evaluates against the new address (then matches nothing).
 func (q *Queries) UpsertHostPressure(ctx context.Context, arg UpsertHostPressureParams) (int64, error) {
 	result, err := q.db.Exec(ctx, upsertHostPressure,
 		arg.RunningSandboxes,

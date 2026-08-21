@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -623,5 +624,89 @@ func TestIntegration_HostPressureLifecycle(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatal("pressure row survived identity reclaim")
+	}
+}
+
+// A pressure write concurrent with an identity reclaim must serialize:
+// FOR SHARE on the host row means either the reclaim waits for the write
+// (then deletes it in its own transaction), or the write waits for the
+// reclaim (then matches nothing on the new address). Stale pressure must
+// never survive a reclaim.
+func TestIntegration_HostPressureSerializesWithReclaim(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	r := newRouter(t)
+	hostID := "prc-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
+
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{"capabilities":[],`+hostDescription+`}`); w.Code != http.StatusOK {
+		t.Fatalf("register: %d %s", w.Code, w.Body.String())
+	}
+	// Make the current holder stale so a new address may reclaim.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE host SET last_heartbeat_at = now() - interval '10 minutes' WHERE id = $1`, hostID); err != nil {
+		t.Fatalf("age heartbeat: %v", err)
+	}
+
+	// Transaction A: take the pressure statement's FOR SHARE lock on the
+	// host row at the OLD address and hold it open — the mid-statement
+	// pause the race needs.
+	txA, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback(ctx)
+	var lockedID string
+	if err := txA.QueryRow(ctx,
+		`SELECT id FROM host WHERE id = $1 AND vmd_addr = '10.9.0.7:50051' FOR SHARE`, hostID).
+		Scan(&lockedID); err != nil {
+		t.Fatalf("take FOR SHARE: %v", err)
+	}
+
+	// Concurrently: a reclaim heartbeat from a new address. Its FOR UPDATE
+	// must block behind A's FOR SHARE.
+	reclaimDone := make(chan int, 1)
+	go func() {
+		desc := `"vmd_addr":"10.9.0.9:50051","proxy_addr":"10.9.0.9:5007",` +
+			`"region":"test-region","capacity_memory_mib":1024,"capacity_vcpus":8`
+		w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{"capabilities":[],`+desc+`}`)
+		reclaimDone <- w.Code
+	}()
+	select {
+	case code := <-reclaimDone:
+		t.Fatalf("reclaim completed (%d) while pressure held FOR SHARE — no serialization", code)
+	case <-time.After(300 * time.Millisecond):
+		// Blocked, as required.
+	}
+
+	// A completes its pressure write under the lock, then commits.
+	if _, err := txA.Exec(ctx,
+		`INSERT INTO host_pressure (host_id, running_sandboxes, provisioning_sandboxes,
+		   paused_sandboxes, allocated_memory_mib, allocated_vcpus, used_net_slots,
+		   provisioning_net_slots, warm_net_slots, net_slot_ceiling)
+		 VALUES ($1, 3, 0, 0, 1024, 2, 3, 0, 8, 65000)`, hostID); err != nil {
+		t.Fatalf("pressure insert under lock: %v", err)
+	}
+	if err := txA.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reclaim proceeds — and its transaction deletes the pressure the
+	// old holder just wrote.
+	select {
+	case code := <-reclaimDone:
+		if code != http.StatusOK {
+			t.Fatalf("reclaim after unblock: %d", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reclaim never completed after lock release")
+	}
+	var count int
+	if err := testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM host_pressure WHERE host_id = $1`, hostID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("stale pressure from the old holder survived the reclaim")
 	}
 }

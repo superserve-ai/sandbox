@@ -1466,6 +1466,7 @@ func main() {
 				// counters only. The limits are operator admission knobs;
 				// 0 (unset) means no cap.
 				Pressure:        mgr.CapacityPressure,
+				PressureReady:   mgr.PressureReady,
 				MaxSandboxes:    envInt32Fatal(log, "VMD_MAX_SANDBOXES"),
 				MaxNetworkSlots: envInt32Fatal(log, "VMD_MAX_NETWORK_SLOTS"),
 			}, log)
