@@ -43,11 +43,16 @@ type buildRecord struct {
 	// as any sandbox's.
 	VCPU      uint32
 	MemoryMiB uint32
-	Status    BuildStatus
-	Result    *BuildTemplateResult // populated on ready
-	Error     string               // populated on failed/cancelled
-	StartedAt time.Time
-	EndedAt   time.Time // zero until terminal
+	// AllocReleased marks that this build's memory/vCPU pressure counters
+	// have been returned: the last build VM (subprocess, then the
+	// access-pattern recorder) is gone, even though the worker may keep
+	// hashing artifacts for minutes. Guarded by buildsMu.
+	AllocReleased bool
+	Status        BuildStatus
+	Result        *BuildTemplateResult // populated on ready
+	Error         string               // populated on failed/cancelled
+	StartedAt     time.Time
+	EndedAt       time.Time // zero until terminal
 
 	// cancel stops the goroutine running the build. Calling it under a
 	// non-terminal status transitions the record to cancelled once the

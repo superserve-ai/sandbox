@@ -3245,36 +3245,53 @@ func (m *Manager) recordRepresentedOrGone(id string) bool {
 	return false
 }
 
-// buildCgroupCurrent reports whether a build-prefixed cgroup belongs to
-// an IN-FLIGHT build in this process's registry — those are sized by the
-// build pressure counters and are not orphans. A blanket build-prefix
-// exemption would be wrong: a restart during access-pattern recording
-// leaves a live build-record-* Firecracker with no BoltDB record, no
-// instance, no registry entry, and no template-builder process for the
-// survivor scan to find — a leftover whose memory pressure cannot see,
-// which must keep the gate closed like any other orphan. Both id shapes
-// resolve to the registry: the build VM itself ("build-<template>") and
-// its access-pattern recorder ("build-record-<template>").
-func (m *Manager) buildCgroupCurrent(id string) bool {
+// releaseBuildAlloc returns a build's memory/vCPU pressure counters at
+// the moment its LAST VM is gone (subprocess reaped, recorder destroyed)
+// — never at worker return, which happens only after artifact hashing
+// that can run for minutes with no VM alive. Idempotent under buildsMu;
+// the worker's deferred call is the safety net for early error returns.
+func (m *Manager) releaseBuildAlloc(buildVMID string, vcpu, memoryMiB uint32) {
+	m.buildsMu.Lock()
+	rec, ok := m.builds[buildVMID]
+	if ok && rec.AllocReleased {
+		m.buildsMu.Unlock()
+		return
+	}
+	if ok {
+		rec.AllocReleased = true
+	}
+	m.buildsMu.Unlock()
+	m.buildPressureMem.Add(-int64(memoryMiB))
+	m.buildPressureVcpus.Add(-int64(vcpu))
+}
+
+// buildAllocCovers reports whether a build-prefixed id is currently
+// sized by the build pressure counters: an IN-FLIGHT registry build
+// whose allocation has not yet been released. Everything else —
+// leftovers from a dead daemon, terminal builds, and any build VM still
+// alive AFTER its allocation was returned (a recorder whose teardown
+// failed) — is NOT covered: the cgroup orphan gate treats it as
+// unrepresented, and the instance loop counts it directly. Both id
+// shapes resolve to the registry: the build VM itself
+// ("build-<build-row-uuid>") and its access-pattern recorder
+// ("build-record-<template>", matched by template id — registry keys are
+// caller-chosen, never reconstructable from the recorder name).
+func (m *Manager) buildAllocCovers(id string) bool {
 	if !isBuildVM(id) {
 		return false
 	}
 	m.buildsMu.RLock()
 	defer m.buildsMu.RUnlock()
-	// The recorder's id carries the TEMPLATE id, while registry keys
-	// carry the caller-chosen build VM id (the control plane sends
-	// "build-<build-row-uuid>") — so recorders match by template, never
-	// by key reconstruction.
 	if tpl, ok := strings.CutPrefix(id, "build-record-"); ok {
 		for _, rec := range m.builds {
-			if !rec.Status.IsTerminal() && rec.TemplateID == tpl {
+			if !rec.Status.IsTerminal() && !rec.AllocReleased && rec.TemplateID == tpl {
 				return true
 			}
 		}
 		return false
 	}
 	rec, ok := m.builds[id]
-	return ok && !rec.Status.IsTerminal()
+	return ok && !rec.Status.IsTerminal() && !rec.AllocReleased
 }
 
 // vmKnownNow reports whether id is represented in the CURRENT instance
@@ -3404,7 +3421,7 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	if m.cgroups != nil {
 		if cgIDs, cerr := m.cgroups.scanVMCgroups(); cerr == nil {
 			for _, id := range cgIDs {
-				if knownIDs[id] || m.vmKnownNow(id) || m.buildCgroupCurrent(id) {
+				if knownIDs[id] || m.vmKnownNow(id) || m.buildAllocCovers(id) {
 					continue
 				}
 				conclusive = false
@@ -4725,12 +4742,14 @@ func (m *Manager) CapacityPressure() HostPressure {
 	m.mu.RUnlock()
 	for _, snap := range instances {
 		// Build-pipeline VMs in the instance map (the access-pattern
-		// recorder that RecordAccessPattern restores) are already sized by
-		// the build pressure counters, which release only when the build
-		// worker returns — counting the instance too would report the same
-		// build as running AND provisioning with its allocation doubled
-		// for the whole recording window.
-		if isBuildVM(snap.id) {
+		// recorder that RecordAccessPattern restores) are skipped ONLY
+		// while the build pressure counters still size them — counting
+		// both would double the allocation for the recording window. A
+		// recorder still alive after its allocation was returned (its
+		// DestroyVM failed; the build moved on to hashing) is covered
+		// here like any other live instance, or it would be invisible
+		// forever: the reconciler also skips build-prefixed ids.
+		if m.buildAllocCovers(snap.id) {
 			continue
 		}
 		inst := snap.inst

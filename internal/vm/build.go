@@ -99,15 +99,15 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 // records the outcome in the registry. Never returns an error — all failures
 // are logged and surfaced via completeBuild so GetBuildStatus sees them.
 func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req BuildTemplateRequest) {
-	// Release the pressure counters HERE — worker return is the
-	// subprocess-exit point — never at the terminal status transition: a
-	// cancel marks the record terminal while the build VM may still be
-	// dying, and its memory is real until the process is gone.
-	defer func() {
-		m.buildPressureCount.Add(-1)
-		m.buildPressureMem.Add(-int64(req.MemoryMiB))
-		m.buildPressureVcpus.Add(-int64(req.VCPU))
-	}()
+	// The WORKFLOW count holds until the worker returns (the build stays
+	// provisioning through its artifact hashing), but the memory/vCPU
+	// allocation releases when the last build VM exits — normally at the
+	// sync point inside buildTemplateSync, with this deferred call as the
+	// safety net for early error returns. Releasing allocation at worker
+	// return would publish a full VM's memory during a hash-only interval
+	// that can run for minutes.
+	defer m.buildPressureCount.Add(-1)
+	defer m.releaseBuildAlloc(buildVMID, req.VCPU, req.MemoryMiB)
 	result, err := m.buildTemplateSync(ctx, buildVMID, req)
 	m.completeBuild(buildVMID, result, err)
 }
@@ -214,7 +214,11 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	// the build's ns-<idx>/veth-<idx> reservation guards nothing anymore.
 	// Release it before the hashing below: holding a network slot through
 	// minutes of disk reads would shrink sandbox capacity for no reason.
+	// The memory/vCPU pressure allocation returns at the same moment and
+	// for the same reason: every build VM is gone (a recorder whose
+	// teardown failed is counted by the instance loop from here on).
 	releaseSlot()
+	m.releaseBuildAlloc(buildVMID, req.VCPU, req.MemoryMiB)
 
 	// Durability: hash the finished artifact set (access.log included when
 	// recorded above), stamp the digests into build.meta.json, and enqueue

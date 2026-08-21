@@ -228,12 +228,20 @@ func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 4096 {
 		t.Fatalf("after cancel (subprocess may live): %+v, want still counted", p)
 	}
-	// Worker exit releases.
+	// The last build VM exits: allocation returns, the workflow count
+	// holds until the worker itself returns (hash-only interval).
+	m.releaseBuildAlloc("b1", 2, 4096)
+	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 0 {
+		t.Fatalf("after VM exit: %+v, want allocation released but still provisioning", p)
+	}
+	// Idempotent: the worker's safety-net defer must not double-release.
+	m.releaseBuildAlloc("b1", 2, 4096)
+	if got := m.buildPressureMem.Load(); got != 0 {
+		t.Fatalf("mem counter = %d after double release, want 0", got)
+	}
 	m.buildPressureCount.Add(-1)
-	m.buildPressureMem.Add(-4096)
-	m.buildPressureVcpus.Add(-2)
 	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 0 || p.AllocatedMemoryMib != 0 {
-		t.Fatalf("after worker exit: %+v, want released", p)
+		t.Fatalf("after worker exit: %+v, want fully released", p)
 	}
 }
 
@@ -551,31 +559,38 @@ func TestFindSurvivingBuildersExcludesOwnChildren(t *testing.T) {
 // in-flight registry build owns them: a leftover build or recorder VM
 // from a dead daemon has no registry entry and must keep the gate
 // closed like any other unrepresented Firecracker.
-func TestBuildCgroupCurrentDistinguishesLeftovers(t *testing.T) {
+func TestBuildAllocCoversDistinguishesLeftovers(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{}, builds: map[string]*buildRecord{}}
 	if _, err := m.registerBuild("build-row-uuid-1", "tpl-a", 1, 1024, func() {}); err != nil {
 		t.Fatal(err)
 	}
-	// Current build VM and its recorder: exempt.
-	if !m.buildCgroupCurrent("build-row-uuid-1") {
+	// Current build VM and its recorder: exempt while the allocation
+	// still covers them.
+	if !m.buildAllocCovers("build-row-uuid-1") {
 		t.Fatal("in-flight build cgroup not exempt")
 	}
-	if !m.buildCgroupCurrent("build-record-tpl-a") {
+	if !m.buildAllocCovers("build-record-tpl-a") {
 		t.Fatal("in-flight build's recorder cgroup not exempt")
 	}
 	// Leftovers from a previous daemon: not exempt.
-	if m.buildCgroupCurrent("build-row-uuid-9") {
+	if m.buildAllocCovers("build-row-uuid-9") {
 		t.Fatal("unknown build cgroup exempted")
 	}
-	if m.buildCgroupCurrent("build-record-tpl-z") {
+	if m.buildAllocCovers("build-record-tpl-z") {
 		t.Fatal("leftover recorder cgroup exempted")
 	}
-	// Terminal build: its cgroup is a leftover too.
+	// Allocation returned (hash-only interval): no longer covered, even
+	// though the build is still non-terminal.
+	m.releaseBuildAlloc("build-row-uuid-1", 1, 1024)
+	if m.buildAllocCovers("build-row-uuid-1") || m.buildAllocCovers("build-record-tpl-a") {
+		t.Fatal("alloc-released build's cgroups still exempted")
+	}
+	// Terminal build: a leftover too.
 	if !m.setBuildStatus("build-row-uuid-1", BuildStatusCancelled) {
 		t.Fatal("cancel failed")
 	}
-	if m.buildCgroupCurrent("build-row-uuid-1") || m.buildCgroupCurrent("build-record-tpl-a") {
-		t.Fatal("terminal build's cgroups still exempted")
+	if m.buildAllocCovers("build-row-uuid-1") {
+		t.Fatal("terminal build's cgroup still exempted")
 	}
 }
 
@@ -622,5 +637,17 @@ func TestCapacityPressureSkipsBuildInstances(t *testing.T) {
 	// 512 (customer) + 4096 (build counters, once) — not 8704.
 	if p.AllocatedMemoryMib != 4608 || p.AllocatedVcpus != 3 {
 		t.Fatalf("allocations = %+v, want the build counted exactly once", p)
+	}
+
+	// The recorder's teardown failed and the build moved on: allocation
+	// returned, recorder still alive in the map. It must now be counted
+	// directly — the leaked process would otherwise be invisible forever.
+	m.releaseBuildAlloc("build-tpl-a", 2, 4096)
+	p = m.CapacityPressure()
+	if p.AllocatedMemoryMib != 4608 || p.AllocatedVcpus != 3 {
+		t.Fatalf("allocations = %+v, want the leaked recorder counted by the instance loop", p)
+	}
+	if p.RunningSandboxes != 2 {
+		t.Fatalf("running = %d, want 2 (leaked recorder now visible)", p.RunningSandboxes)
 	}
 }
