@@ -266,3 +266,35 @@ func TestPressureReadyFailsClosedOnUnreadableState(t *testing.T) {
 		t.Fatal("PressureReady = false with no state store configured")
 	}
 }
+
+// A panic mid-reattach must leave publication CLOSED: the completion
+// store is explicit at the successful return, never a defer — a defer
+// runs during panic unwinding and would mark a half-rebuilt map ready,
+// publishing exactly the partial snapshot the gate exists to suppress.
+func TestPressureReadyStaysClosedOnReattachPanic(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+	reattachHook = func(string) { panic("mid-pass failure") }
+	defer func() { reattachHook = nil }()
+
+	func() {
+		// Stands in for the startup goroutine's sentrylog.Recover.
+		defer func() {
+			if recover() == nil {
+				t.Error("expected the reattach panic to propagate")
+			}
+		}()
+		m.ReattachAll(context.Background())
+	}()
+
+	if m.PressureReady() {
+		t.Fatal("PressureReady = true after a panic mid-reattach; the gate must stay closed")
+	}
+}

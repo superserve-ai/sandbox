@@ -3186,10 +3186,6 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		m.log.Error().Err(err).Msg("failed to read BoltDB state — skipping reattach; pressure publication stays suppressed")
 		return 0, 0
 	}
-	// The inventory was read: whatever the loop below reattaches (or
-	// cleans up) is the host's truth, so publication may begin once it
-	// finishes.
-	defer m.reattachComplete.Store(true)
 
 	// Build a set of BoltDB-known IDs for orphan detection.
 	knownIDs := make(map[string]bool, len(records))
@@ -3265,6 +3261,12 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	// BoltDB records). Stale records deleted above free their own namespace
 	// inline (see reattachRecord), so a re-sweep isn't needed.
 
+	// Explicit store at the SUCCESSFUL return, never a defer: a defer runs
+	// during panic unwinding too, and a panic mid-pass would mark a
+	// half-rebuilt map ready — publishing exactly the partial snapshot
+	// this flag exists to suppress. On a panic the flag stays false and
+	// publication stays closed for the process's lifetime.
+	m.reattachComplete.Store(true)
 	return reattached, stale
 }
 
