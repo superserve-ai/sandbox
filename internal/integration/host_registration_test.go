@@ -690,32 +690,47 @@ func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
 		t.Fatalf("after tokenless content-matched report: paused=%d unbacked=%d, want 1/1 (no tokenless links)", paused, unbacked)
 	}
 
-	// The P2 rolling-deploy wrinkle: an old replica's legacy finalize
-	// preserves the PREVIOUS pause's token under rewritten artifacts.
-	// Neither the new pause's tokenless report (no tokenless links) nor
-	// the old pause's delayed tokened report (content mismatch against
-	// the rewritten manifest) may link through the stale value.
+	// The rolling-deploy hazard: an old replica's legacy finalize does
+	// not mention pause_token, so the PREVIOUS pause's token would ride
+	// under the rewritten artifacts. First give the row a token again
+	// (a new-replica pause)...
 	if _, err := testPool.Exec(ctx,
 		`WITH snap AS (
-		   UPDATE snapshot SET generation = generation + 1, pause_token = 'tok-stale'
+		   UPDATE snapshot SET generation = generation + 1, pause_token = 'tok-3'
 		   WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)
 		   RETURNING id
 		 )
 		 UPDATE artifact_manifest SET sha256 = $2
 		 WHERE snapshot_id IN (SELECT id FROM snap)`,
-		sandboxID, strings.Repeat("a", 60)+"beef"); err != nil {
-		t.Fatalf("simulate legacy-upsert stale token: %v", err)
+		sandboxID, shaB); err != nil {
+		t.Fatalf("tokened pause: %v", err)
 	}
-	// Old pause's delayed report: token matches the stale value, content
-	// names the OLD digests — refused.
-	report(strings.Repeat("6", 64), shaB, shaY, "tok-stale")
-	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
-		t.Fatalf("stale-token delayed report linked: paused=%d unbacked=%d, want 1/1", paused, unbacked)
+	// ...then the old-writer signature: generation advances, the token
+	// column untouched. The migration's trigger must clear it. The
+	// manifest keeps the SAME vmstate digest — the collision case where
+	// the old pause's delayed report would otherwise match both the
+	// preserved token and the vmstate-only manifest.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE snapshot SET generation = generation + 1
+		 WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)`,
+		sandboxID); err != nil {
+		t.Fatalf("simulate legacy-upsert: %v", err)
 	}
-	// New pause's tokenless report: content matches, no token — refused.
-	report(strings.Repeat("7", 64), strings.Repeat("a", 60)+"beef", shaY, "")
+	var storedToken *string
+	if err := testPool.QueryRow(ctx,
+		`SELECT pause_token FROM snapshot WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)`,
+		sandboxID).Scan(&storedToken); err != nil {
+		t.Fatalf("read token: %v", err)
+	}
+	if storedToken != nil {
+		t.Fatalf("preserved token survived a legacy-style generation advance: %q", *storedToken)
+	}
+	// The old pause's delayed report: its token matches what the row
+	// WOULD have preserved, and its vmstate digest collides with the
+	// unchanged manifest. Cleared token means asymmetry — refused.
+	report(strings.Repeat("6", 64), shaB, shaY, "tok-3")
 	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
-		t.Fatalf("tokenless report linked through stale-token row: paused=%d unbacked=%d, want 1/1", paused, unbacked)
+		t.Fatalf("delayed report linked through a preserved token: paused=%d unbacked=%d, want 1/1", paused, unbacked)
 	}
 }
 

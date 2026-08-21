@@ -339,11 +339,13 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		// an old control-plane replica that minted none) therefore stays
 		// unlinked and reads unbacked until the sandbox next pauses
 		// through the token path: over-reported risk, never a false zero,
-		// converging as the fleet does. This also makes a STALE token —
-		// an old replica's legacy one-row upsert preserves the column it
-		// does not mention — inert: the new pause's tokenless report
-		// cannot link regardless, and the old pause's delayed tokened
-		// report fails the content match against the rewritten manifest.
+		// converging as the fleet does. A STALE token — an old replica's
+		// legacy one-row upsert preserving the column it does not mention
+		// — cannot reach this predicate: the migration's trigger clears a
+		// token whose value did not move across a generation advance, so
+		// the row reads honestly tokenless (unlinked) rather than
+		// mislinkable when the old pause's delayed report carries a
+		// colliding vmstate digest.
 		linkable := contentMatch && req.PauseToken != "" &&
 			req.PauseToken == manifest[0].PauseToken
 		if linkable {
