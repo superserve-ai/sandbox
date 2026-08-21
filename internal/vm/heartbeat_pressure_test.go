@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -134,6 +135,12 @@ func TestSendPressureRequiresConfig(t *testing.T) {
 // allocations while still counting the paused population, and includes
 // in-flight template builds — a busy build host must not look idle.
 func TestCapacityPressureCountsInstancesAndBuilds(t *testing.T) {
+	// A settled host: outside the young-process window, so the paused
+	// VM's exclusion below tests the steady state, not the post-restart
+	// conservative over-count.
+	origStart := vmProcessStart
+	vmProcessStart = time.Now().Add(-time.Hour)
+	defer func() { vmProcessStart = origStart }()
 	m := &Manager{
 		vms: map[string]*VMInstance{
 			"r1": {Status: StatusRunning, Config: VMConfig{VCPU: 2, MemoryMiB: 1024}},
@@ -301,7 +308,6 @@ func TestPressureReadyStaysClosedOnReattachPanic(t *testing.T) {
 	}
 }
 
-
 // A recordless orphan unit — a live Firecracker outside the instance map
 // — keeps publication closed: its memory is real and unrepresentable, so
 // a report would be a fresh undercount. A failed orphan scan is treated
@@ -370,7 +376,7 @@ func TestPressureReadyStaysClosedOnRetainedUnrepresentedRecord(t *testing.T) {
 		listActiveFCUnits = listActiveFirecrackerUnits
 		vmUnitFullyDown, staleUnitStopConfirmed = origDown, origStop
 	}()
-	vmUnitFullyDown = func(string) bool { return false }                          // not provably terminal
+	vmUnitFullyDown = func(string) bool { return false }                         // not provably terminal
 	staleUnitStopConfirmed = func(context.Context, string) bool { return false } // stop unconfirmed
 
 	run := func(t *testing.T, supervision Supervision) *Manager {
@@ -405,5 +411,62 @@ func TestPressureReadyStaysClosedOnRetainedUnrepresentedRecord(t *testing.T) {
 	}
 	if _, ok := m.vms["vm-1"]; !ok {
 		t.Fatal("parked record not in the instance map")
+	}
+}
+
+// "Paused" can lie about the process: mid-resume (restore window, op
+// lock held) and after an unconfirmed pause stop, Firecracker may be
+// live while the status reads Paused. Those windows must count the
+// allocation; a settled paused VM must not.
+func TestCapacityPressureCountsLivePausedWindows(t *testing.T) {
+	origStart := vmProcessStart
+	vmProcessStart = time.Now().Add(-time.Hour) // outside the settle window
+	defer func() { vmProcessStart = origStart }()
+
+	m := &Manager{vms: map[string]*VMInstance{
+		"settled":   {Status: StatusPaused, Config: VMConfig{VCPU: 2, MemoryMiB: 1024}},
+		"resuming":  {Status: StatusPaused, Config: VMConfig{VCPU: 4, MemoryMiB: 2048}},
+		"unstopped": {Status: StatusPaused, Config: VMConfig{VCPU: 8, MemoryMiB: 4096}},
+	}}
+	// Mid-resume: the lifecycle op lock is held.
+	m.vmOpCh("resuming") <- struct{}{}
+	defer func() { <-m.vmOpCh("resuming") }()
+	// Unconfirmed stop: the unit oracle remembers it.
+	recordUnitStop(systemdUnitName("unstopped"))
+	defer confirmUnitStopped(systemdUnitName("unstopped"))
+
+	p := m.CapacityPressure()
+	if p.PausedSandboxes != 3 {
+		t.Fatalf("paused = %d, want 3", p.PausedSandboxes)
+	}
+	// resuming (2048+4) + unstopped (4096+8); settled excluded.
+	if p.AllocatedMemoryMib != 6144 || p.AllocatedVcpus != 12 {
+		t.Fatalf("allocations = %+v, want only the live-window paused VMs counted", p)
+	}
+}
+
+// A surviving template-builder from the previous daemon holds unsizable
+// build-VM memory: publication stays gated until it exits.
+func TestPressureReadyWaitsForSurvivingBuilders(t *testing.T) {
+	m := &Manager{vms: map[string]*VMInstance{}}
+	m.reattachComplete.Store(true)
+	alive := map[int]bool{101: true, 102: true}
+	m.builderAlive = func(pid int) bool { return alive[pid] }
+	m.SetSurvivingBuilders([]int{101, 102})
+
+	if m.PressureReady() {
+		t.Fatal("PressureReady = true with surviving builders alive")
+	}
+	alive[101] = false
+	if m.PressureReady() {
+		t.Fatal("PressureReady = true with one surviving builder alive")
+	}
+	alive[102] = false
+	if !m.PressureReady() {
+		t.Fatal("PressureReady = false after all surviving builders exited")
+	}
+	// The list only shrinks: once open, it stays open.
+	if !m.PressureReady() {
+		t.Fatal("gate reclosed after opening")
 	}
 }

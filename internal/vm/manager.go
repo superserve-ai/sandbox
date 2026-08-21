@@ -492,6 +492,15 @@ type Manager struct {
 	buildPressureCount atomic.Int64
 	buildPressureMem   atomic.Int64
 	buildPressureVcpus atomic.Int64
+	// survivingBuilderPIDs are template-builder subprocesses observed at
+	// startup that outlived the previous daemon (deploy restarts kill only
+	// the main process): their build VMs hold real memory and CPU, but the
+	// registry that knew their sizes died with the old process, so their
+	// allocation is unrecoverable. Publication stays gated until they
+	// exit; builderAlive is a seam over the pid-liveness probe.
+	survivingBuilderPIDs []int
+	builderAlive         func(pid int) bool
+
 	// reattachComplete gates pressure publication: until the background
 	// reattach has rebuilt the instance map, CapacityPressure would
 	// report a near-zero allocation for a possibly-full host, and one
@@ -4450,11 +4459,83 @@ type HostPressure struct {
 	NetSlotCeiling        int32 // IP-scheme hard bound, not an operator knob
 }
 
+// SetSurvivingBuilders records template-builder subprocesses that
+// outlived the previous daemon. Startup-only, before the heartbeat
+// starts.
+func (m *Manager) SetSurvivingBuilders(pids []int) {
+	m.survivingBuilderPIDs = pids
+}
+
 // PressureReady reports whether pressure publication may begin: false
 // until the startup reattach has rebuilt the instance map (see
-// reattachComplete).
+// reattachComplete), and false while any surviving template-builder
+// subprocess is still running — its build VM consumes memory this
+// process cannot size (the registry died with its predecessor), so a
+// report would undercount until the survivor exits. The pid list only
+// shrinks; liveness is a signal-0 probe per surviving pid per beat.
 func (m *Manager) PressureReady() bool {
-	return m.reattachComplete.Load()
+	if !m.reattachComplete.Load() {
+		return false
+	}
+	if len(m.survivingBuilderPIDs) > 0 {
+		alive := m.builderAlive
+		if alive == nil {
+			alive = pidAlive
+		}
+		remaining := m.survivingBuilderPIDs[:0]
+		for _, pid := range m.survivingBuilderPIDs {
+			if alive(pid) {
+				remaining = append(remaining, pid)
+			}
+		}
+		m.survivingBuilderPIDs = remaining
+		if len(remaining) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// pidAlive reports whether pid exists (signal 0). A permission error
+// still means alive.
+func pidAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = proc.Signal(syscall.Signal(0))
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// FindSurvivingBuilders scans /proc for template-builder processes left
+// over from a previous daemon (KillMode=process restarts orphan them).
+// Startup-only: one directory walk, comparing each process's first
+// cmdline argument against the builder binary path.
+func FindSurvivingBuilders(builderBin string) []int {
+	if builderBin == "" {
+		return nil
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	self := os.Getpid()
+	var pids []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid == self {
+			continue
+		}
+		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+		if err != nil {
+			continue
+		}
+		args := strings.Split(string(cmdline), "\x00")
+		if len(args) > 0 && args[0] == builderBin {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
 }
 
 // CapacityPressure computes the pressure summary from maintained
@@ -4467,13 +4548,18 @@ func (m *Manager) PressureReady() bool {
 // deliberately not attempted.
 func (m *Manager) CapacityPressure() HostPressure {
 	var p HostPressure
+	type instSnap struct {
+		id   string
+		inst *VMInstance
+	}
 	m.mu.RLock()
-	instances := make([]*VMInstance, 0, len(m.vms))
-	for _, inst := range m.vms {
-		instances = append(instances, inst)
+	instances := make([]instSnap, 0, len(m.vms))
+	for id, inst := range m.vms {
+		instances = append(instances, instSnap{id: id, inst: inst})
 	}
 	m.mu.RUnlock()
-	for _, inst := range instances {
+	for _, snap := range instances {
+		inst := snap.inst
 		inst.mu.RLock()
 		status, vcpu, mem := inst.Status, inst.Config.VCPU, inst.Config.MemoryMiB
 		inst.mu.RUnlock()
@@ -4483,9 +4569,28 @@ func (m *Manager) CapacityPressure() HostPressure {
 		case StatusCreating:
 			p.ProvisioningSandboxes++
 		case StatusPaused:
-			// Paused VMs hold no memory or CPU; they hold disk and (until
-			// reclaim) a network slot, which UsedNetSlots already counts.
 			p.PausedSandboxes++
+			// A settled paused VM holds no memory or CPU — only disk and
+			// (until reclaim) a network slot, which UsedNetSlots already
+			// counts. But "paused" is also what the record reads while
+			// Firecracker may in fact be live: mid-resume (the restore
+			// window keeps StatusPaused until the flip to Running, with
+			// the VM's lifecycle lock held throughout), and after a pause
+			// whose stop was never confirmed (the unit oracle remembers
+			// exactly those). Count the allocation in both windows —
+			// capacity a live process consumes must never be advertised
+			// as free. unitMaybeWindingDown's young-process settle window
+			// makes every paused VM count for the first minutes after a
+			// vmd restart: deliberate over-reporting while stops from the
+			// previous process are unobservable. Residual: an unconfirmed
+			// CGROUP-mode pause stop is not visible to the unit oracle;
+			// that window is rare, short, and reconciler-owned, and
+			// probing cgroups here would put filesystem reads on every
+			// beat.
+			if len(m.vmOpCh(snap.id)) > 0 || unitMaybeWindingDown(systemdUnitName(snap.id)) {
+				p.AllocatedMemoryMib += int64(mem)
+				p.AllocatedVcpus += int64(vcpu)
+			}
 			continue
 		case StatusError:
 			// Error records can deliberately retain a possibly-live

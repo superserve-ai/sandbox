@@ -1450,6 +1450,14 @@ func main() {
 				Int32("configured_vcpus", vcpus).Int32("physical_vcpus", physCPU).
 				Msg("configured schedulable capacity exceeds physical capacity — check for a units mistake")
 		}
+		// Builders orphaned by the previous daemon (deploy restarts kill
+		// only the main process) hold unsizable build-VM memory; the
+		// pressure gate waits for them to exit.
+		if survivors := vm.FindSurvivingBuilders(cfg.TemplateBuilderBin); len(survivors) > 0 {
+			log.Warn().Ints("pids", survivors).
+				Msg("surviving template-builder processes detected; pressure publication deferred until they exit")
+			mgr.SetSurvivingBuilders(survivors)
+		}
 		lc.start("heartbeat", func() error {
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
 				ControlPlaneURL:    cfg.ControlPlaneURL,
