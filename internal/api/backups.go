@@ -22,8 +22,19 @@ import (
 
 // errFinalizeInFlight rolls a report's transaction back when the
 // sandbox is mid-finalize: coverage re-records idempotently on
-// redelivery, and the size sync lands once the snapshot row exists.
+// redelivery, and the link and size sync land once the snapshot row
+// exists.
 var errFinalizeInFlight = errors.New("pause finalization in flight")
+
+// finalizeInFlight reports whether a FinalizePause may be about to commit
+// for this sandbox: 'pausing' on the normal pause path, 'resuming' on the
+// resume-revert path (pauseAndRevert finalizes a pause from that status).
+// Bounded by recency so a permanently stranded transition cannot
+// head-of-line-block the host's outbox forever.
+func finalizeInFlight(status string, updatedAt time.Time) bool {
+	return (status == "pausing" || status == "resuming") &&
+		time.Since(updatedAt) < 10*time.Minute
+}
 
 // maxBackupReportFiles bounds a report's manifest jsonb. Sandbox
 // generations carry a handful of files, but template builds ship every
@@ -231,7 +242,7 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 				return err
 			}
 			haveSandbox = err == nil
-			if haveSandbox && sbRow.Status == "pausing" && time.Since(sbRow.UpdatedAt) < 10*time.Minute {
+			if haveSandbox && finalizeInFlight(string(sbRow.Status), sbRow.UpdatedAt) {
 				return errFinalizeInFlight
 			}
 		}
@@ -271,21 +282,26 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 			}
 			return err
 		}
-		// 'pausing' means FinalizePause has not committed this pause's
-		// snapshot row yet (it takes the same row lock we now hold): a
-		// fast upload's report arriving in that window would match the
-		// PREVIOUS snapshot's vmstate and silently skip the new one's
-		// size sync forever, since a 200 clears the host's outbox. Roll
-		// the whole transaction back as retryable instead; redelivery
-		// re-records coverage idempotently and the sync lands once the
-		// finalize has committed.
+		// A transitional status means a FinalizePause may commit this
+		// sandbox's next snapshot row at any moment (it takes the same
+		// row lock we now hold): 'pausing' on the normal path, and
+		// 'resuming' because pauseAndRevert re-pauses a VM whose resume
+		// finalization failed — the sandbox stays 'resuming' from
+		// PauseInstance until that finalize lands. A fast or deduplicated
+		// upload reporting in either window would be evaluated against
+		// the PREVIOUS snapshot's manifest and token, fail to link, and
+		// return 200 — clearing the host's outbox before the pause it
+		// covers exists to link against. Roll the whole transaction back
+		// as retryable instead; redelivery re-records coverage
+		// idempotently and the link and size sync land once the finalize
+		// has committed.
 		// Time-bounded: a finalize that failed permanently leaves the
-		// sandbox stranded in 'pausing' with no retry scheduled, and an
-		// unconditional 503 would head-of-line-block the host's outbox
-		// forever. A fresh 'pausing' retries; a stale one proceeds, and
-		// the vmstate match below skips the sync exactly as for any
-		// other settled mismatch.
-		if row.Status == "pausing" && time.Since(row.UpdatedAt) < 10*time.Minute {
+		// sandbox stranded in a transitional status with no retry
+		// scheduled, and an unconditional 503 would head-of-line-block
+		// the host's outbox forever. A fresh transition retries; a stale
+		// one proceeds, and the identity checks below refuse exactly as
+		// for any other settled mismatch.
+		if finalizeInFlight(string(row.Status), row.UpdatedAt) {
 			return errFinalizeInFlight
 		}
 		manifest, err := q.LatestSnapshotManifest(ctx, sandboxID)
