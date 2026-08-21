@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -495,5 +496,53 @@ func TestPressureReadyClosedWhileBuilderScanPending(t *testing.T) {
 			t.Fatal("PressureReady never opened after the scan completed empty")
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// A destroy racing the end of reattach removes the instance BEFORE
+// deleting the record; the gate must re-observe rather than permanently
+// close on that middle state.
+func TestPressureReadySurvivesConcurrentTeardown(t *testing.T) {
+	listActiveFCUnits = func(context.Context) ([]string, error) { return nil, nil }
+	defer func() { listActiveFCUnits = listActiveFirecrackerUnits }()
+
+	st, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Put(VMRecord{ID: "vm-1", Status: StatusPaused}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: st, vms: map[string]*VMInstance{}}
+	// Mid-teardown at gate time: instance already gone from the map,
+	// record still present, destroying marker held. The record delete
+	// lands shortly after — as a real destroy's would.
+	m.destroying.Store("vm-1", struct{}{})
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		_ = st.Delete("vm-1")
+		m.destroying.Delete("vm-1")
+	}()
+	m.ReattachAll(context.Background())
+	if !m.PressureReady() {
+		t.Fatal("PressureReady = false after a concurrent teardown completed cleanly")
+	}
+}
+
+// findSurvivingBuilders must not classify builders spawned by THIS
+// daemon as predecessors: their registry counters already size them, and
+// gating on them would suppress publication for the whole build.
+func TestFindSurvivingBuildersExcludesOwnChildren(t *testing.T) {
+	cmd := exec.Command("/bin/sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start child: %v", err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
+
+	for _, pid := range findSurvivingBuilders("/bin/sleep") {
+		if pid == cmd.Process.Pid {
+			t.Fatal("own child classified as a predecessor survivor")
+		}
 	}
 }

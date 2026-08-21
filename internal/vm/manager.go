@@ -3185,6 +3185,44 @@ func (m *Manager) ShutdownAll() {
 // API socket is reachable, VMD reattaches. Stale BoltDB entries (dead process)
 // are cleaned up. Orphan systemd units (running but not in BoltDB) are logged
 // so the reconciler can handle them.
+// recordRepresentedOrGone reports whether a startup record has settled
+// into one of the two states the pressure gate accepts: an instance in
+// the map, or no record in the store. The observation is RETRIED on a
+// short budget because it races teardown, which removes the instance
+// from the map BEFORE deleting the record (destroy, handleVMError):
+// reading that middle state once and closing the gate permanently would
+// let a successfully destroyed VM suppress every report until the next
+// restart. A teardown in flight is re-observed (the destroying marker
+// when present, otherwise the retry itself); a genuinely stuck state —
+// a retained record with no instance and no teardown — is stable across
+// the whole budget and still closes the gate. Runs only in the
+// background reattach goroutine, so the bounded sleeps cost no request.
+func (m *Manager) recordRepresentedOrGone(id string) bool {
+	const attempts = 6
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+		m.mu.RLock()
+		_, inMap := m.vms[id]
+		m.mu.RUnlock()
+		if inMap {
+			return true
+		}
+		if _, tearingDown := m.destroying.Load(id); tearingDown {
+			continue // mid-teardown; re-observe after it lands
+		}
+		cur, err := m.state.Get(id)
+		if err == nil && cur == nil {
+			return true // conclusively gone
+		}
+		// Record present (or store unreadable) with no instance: either a
+		// teardown between its map removal and record delete, or the
+		// genuinely stuck case. Re-observe.
+	}
+	return false
+}
+
 // vmKnownNow reports whether id is represented in the CURRENT instance
 // map or state store — as opposed to ReattachAll's startup-time record
 // snapshot. The orphan scans run in a background pass that concurrent
@@ -3336,19 +3374,13 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	// pressure cannot count, so publication stays closed.
 	if conclusive {
 		for _, rec := range records {
-			m.mu.RLock()
-			_, represented := m.vms[rec.ID]
-			m.mu.RUnlock()
-			if represented {
+			if m.recordRepresentedOrGone(rec.ID) {
 				continue
 			}
-			cur, gerr := m.state.Get(rec.ID)
-			if gerr != nil || cur != nil {
-				conclusive = false
-				m.log.Warn().Str("vm_id", rec.ID).
-					Msg("startup record neither represented nor removed; pressure publication stays suppressed")
-				break
-			}
+			conclusive = false
+			m.log.Warn().Str("vm_id", rec.ID).
+				Msg("startup record neither represented nor removed; pressure publication stays suppressed")
+			break
 		}
 	}
 
@@ -4571,11 +4603,46 @@ func findSurvivingBuilders(builderBin string) []int {
 			continue
 		}
 		args := strings.Split(string(cmdline), "\x00")
-		if len(args) > 0 && args[0] == builderBin {
-			pids = append(pids, pid)
+		if len(args) == 0 || args[0] != builderBin {
+			continue
 		}
+		// Only PREDECESSOR builders: a builder whose parent is this
+		// daemon belongs to a current, fully sized build (its registry
+		// counters already carry it) — classifying it as a survivor
+		// would suppress publication for the length of the build.
+		// Orphaned predecessors are reparented away from us, so the
+		// parent pid distinguishes the two.
+		if procPPID(e.Name()) == self {
+			continue
+		}
+		pids = append(pids, pid)
 	}
 	return pids
+}
+
+// procPPID reads a process's parent pid from /proc/<pid>/stat; 0 on any
+// parse failure (never matches a real daemon pid, so an unreadable stat
+// classifies as a survivor — the conservative direction).
+func procPPID(pidDir string) int {
+	stat, err := os.ReadFile("/proc/" + pidDir + "/stat")
+	if err != nil {
+		return 0
+	}
+	// Fields follow the parenthesized comm, which may itself contain
+	// spaces or parens: parse after the LAST ')'.
+	i := strings.LastIndexByte(string(stat), ')')
+	if i < 0 {
+		return 0
+	}
+	fields := strings.Fields(string(stat[i+1:]))
+	if len(fields) < 2 {
+		return 0
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0
+	}
+	return ppid
 }
 
 // CapacityPressure computes the pressure summary from maintained
