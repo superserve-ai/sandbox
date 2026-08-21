@@ -3204,11 +3204,22 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	// lazy load can't run reattachRecord for a vmID while the eager pass is mid
 	// stale-cleanup for the same one. reattachByID re-reads the record inside the
 	// flight, so a DestroyVM between the snapshot and here can't resurrect it.
+	// conclusive gates pressure publication, stricter than "the pass
+	// finished": every live VM's resources must be either represented in
+	// the instance map or conclusively gone. A recordless orphan unit, a
+	// failed orphan scan, or a shutdown-interrupted pass all leave
+	// possibly-live Firecrackers outside the map, and a report published
+	// over them would overwrite the previous report with a fresh
+	// undercount — worse than visibly stale data. Inconclusive keeps
+	// publication closed for the process's lifetime; the reconciler owns
+	// the orphans, and the next restart re-evaluates.
+	conclusive := true
 	m.reattachStopDeadline.Store(time.Now().Add(reattachStopPassBudget))
 	for _, snap := range records {
 		// Stop on shutdown: a cancelled ctx makes liveness checks fail, which
 		// would otherwise misfire the stale-cleanup path against live VMs.
 		if ctx.Err() != nil {
+			conclusive = false
 			break
 		}
 		if m.reattachByID(snap.ID, true) != nil {
@@ -3219,12 +3230,16 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	}
 
 	// Detect orphan units not in BoltDB, both supervision modes.
-	activeIDs, err := listActiveFirecrackerUnits(ctx)
+	activeIDs, err := listActiveFCUnits(ctx)
 	if err != nil {
+		conclusive = false
 		m.log.Warn().Err(err).Msg("failed to list active firecracker units — orphan detection skipped")
 	} else {
 		for _, id := range activeIDs {
 			if !knownIDs[id] {
+				// A live Firecracker with no record: its memory is real
+				// and unrepresentable in pressure.
+				conclusive = false
 				// Registered as an unconfirmed stop so a same-ID launch never
 				// reads this orphan as fresh: without a control-plane DB the
 				// reconciler never stops BoltDB-missing units, so this
@@ -3249,9 +3264,11 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 				if knownIDs[id] || isBuildVM(id) {
 					continue
 				}
+				conclusive = false
 				m.log.Warn().Str("vm_id", id).Msg("orphan vm cgroup detected (not in BoltDB) — will be handled by reconciler")
 			}
 		} else {
+			conclusive = false
 			m.log.Warn().Err(cerr).Msg("failed to scan vm cgroups — cgroup orphan detection skipped")
 		}
 	}
@@ -3265,8 +3282,14 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	// during panic unwinding too, and a panic mid-pass would mark a
 	// half-rebuilt map ready — publishing exactly the partial snapshot
 	// this flag exists to suppress. On a panic the flag stays false and
-	// publication stays closed for the process's lifetime.
-	m.reattachComplete.Store(true)
+	// publication stays closed for the process's lifetime. Gated on
+	// conclusive for the same reason: represented-or-conclusively-gone
+	// only.
+	if conclusive {
+		m.reattachComplete.Store(true)
+	} else {
+		m.log.Warn().Msg("reattach inconclusive (orphans or failed scans); pressure publication stays suppressed for this process")
+	}
 	return reattached, stale
 }
 

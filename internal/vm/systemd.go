@@ -427,6 +427,11 @@ func unitDefinitelyDead(ctx context.Context, unit string) bool {
 	return errors.As(err, &exitErr)
 }
 
+// listActiveFCUnits is ReattachAll's seam over the systemd unit lister:
+// tests stub it (real systemd is unavailable there), and the
+// conclusiveness gate on pressure publication depends on its outcome.
+var listActiveFCUnits = listActiveFirecrackerUnits
+
 // listActiveFirecrackerUnits returns the sandbox IDs of all running
 // firecracker@ units. Used during startup reattach. It lists
 // ActiveState=active only — a unit mid-deactivating is invisible here, which

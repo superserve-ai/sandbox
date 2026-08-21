@@ -234,6 +234,8 @@ func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 // (leaving the previous report visibly aging) rather than advertise
 // fresh zeros that invite over-placement.
 func TestPressureReadyFailsClosedOnUnreadableState(t *testing.T) {
+	listActiveFCUnits = func(context.Context) ([]string, error) { return nil, nil }
+	defer func() { listActiveFCUnits = listActiveFirecrackerUnits }()
 	dir := t.TempDir()
 	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
 	if err != nil {
@@ -296,5 +298,47 @@ func TestPressureReadyStaysClosedOnReattachPanic(t *testing.T) {
 
 	if m.PressureReady() {
 		t.Fatal("PressureReady = true after a panic mid-reattach; the gate must stay closed")
+	}
+}
+
+
+// A recordless orphan unit — a live Firecracker outside the instance map
+// — keeps publication closed: its memory is real and unrepresentable, so
+// a report would be a fresh undercount. A failed orphan scan is treated
+// the same: an unobserved orphan cannot be ruled out.
+func TestPressureReadyStaysClosedOnOrphansOrFailedScan(t *testing.T) {
+	defer func() { listActiveFCUnits = listActiveFirecrackerUnits }()
+
+	newMgr := func(t *testing.T) *Manager {
+		st, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		return &Manager{log: zerolog.Nop(), state: st, vms: map[string]*VMInstance{}}
+	}
+
+	// Orphan unit present.
+	listActiveFCUnits = func(context.Context) ([]string, error) { return []string{"ghost-vm"}, nil }
+	m := newMgr(t)
+	m.ReattachAll(context.Background())
+	if m.PressureReady() {
+		t.Fatal("PressureReady = true with a recordless orphan unit alive")
+	}
+
+	// Orphan scan failed.
+	listActiveFCUnits = func(context.Context) ([]string, error) { return nil, context.DeadlineExceeded }
+	m2 := newMgr(t)
+	m2.ReattachAll(context.Background())
+	if m2.PressureReady() {
+		t.Fatal("PressureReady = true after a failed orphan scan")
+	}
+
+	// Clean scan: publication opens.
+	listActiveFCUnits = func(context.Context) ([]string, error) { return nil, nil }
+	m3 := newMgr(t)
+	m3.ReattachAll(context.Background())
+	if !m3.PressureReady() {
+		t.Fatal("PressureReady = false after a clean, conclusive pass")
 	}
 }
