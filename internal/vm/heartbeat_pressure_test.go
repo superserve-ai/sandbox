@@ -470,3 +470,30 @@ func TestPressureReadyWaitsForSurvivingBuilders(t *testing.T) {
 		t.Fatal("gate reclosed after opening")
 	}
 }
+
+// Survivor discovery must never cost startup anything, yet the gate must
+// be closed from the instant it is requested: a heartbeat firing
+// mid-scan publishes nothing, and the result opens the gate only after
+// it lands.
+func TestPressureReadyClosedWhileBuilderScanPending(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	m.reattachComplete.Store(true)
+
+	release := make(chan struct{})
+	m.builderScan = func(string) []int {
+		<-release
+		return nil
+	}
+	m.ScanSurvivingBuildersAsync("/usr/local/bin/template-builder")
+	if m.PressureReady() {
+		t.Fatal("PressureReady = true while the survivor scan is still running")
+	}
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for !m.PressureReady() {
+		if time.Now().After(deadline) {
+			t.Fatal("PressureReady never opened after the scan completed empty")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}

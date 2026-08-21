@@ -500,6 +500,16 @@ type Manager struct {
 	// exit; builderAlive is a seam over the pid-liveness probe.
 	survivingBuilderPIDs []int
 	builderAlive         func(pid int) bool
+	// builderScanPending holds the gate closed from the moment survivor
+	// discovery is REQUESTED until the async scan lands its result: the
+	// first heartbeat can fire before the scan finishes, and an unscanned
+	// host must not publish as though no survivors exist. Set
+	// synchronously by ScanSurvivingBuildersAsync, cleared by its
+	// goroutine after survivingBuilderPIDs is written (the atomic
+	// store/load pair orders the write for the heartbeat's reader).
+	builderScanPending atomic.Bool
+	// builderScan is a test seam over findSurvivingBuilders.
+	builderScan func(builderBin string) []int
 
 	// reattachComplete gates pressure publication: until the background
 	// reattach has rebuilt the instance map, CapacityPressure would
@@ -4461,9 +4471,35 @@ type HostPressure struct {
 
 // SetSurvivingBuilders records template-builder subprocesses that
 // outlived the previous daemon. Startup-only, before the heartbeat
-// starts.
+// starts; tests use it directly.
 func (m *Manager) SetSurvivingBuilders(pids []int) {
 	m.survivingBuilderPIDs = pids
+}
+
+// ScanSurvivingBuildersAsync discovers builder subprocesses orphaned by
+// the previous daemon WITHOUT costing startup anything: the /proc walk
+// (one cmdline read per process on the host) runs in a goroutine, off
+// the path that gates gRPC readiness. The pending flag is set
+// synchronously before this returns, so a heartbeat that fires mid-scan
+// keeps publication closed rather than publishing as though no
+// survivors exist. Callers skip this entirely when pressure publication
+// is not configured — an unpublished host has no reader to protect.
+func (m *Manager) ScanSurvivingBuildersAsync(builderBin string) {
+	m.builderScanPending.Store(true)
+	go func() {
+		defer sentrylog.Recover("surviving-builder-scan")
+		scan := m.builderScan
+		if scan == nil {
+			scan = findSurvivingBuilders
+		}
+		pids := scan(builderBin)
+		if len(pids) > 0 {
+			m.log.Warn().Ints("pids", pids).
+				Msg("surviving template-builder processes detected; pressure publication deferred until they exit")
+		}
+		m.survivingBuilderPIDs = pids
+		m.builderScanPending.Store(false)
+	}()
 }
 
 // PressureReady reports whether pressure publication may begin: false
@@ -4475,6 +4511,9 @@ func (m *Manager) SetSurvivingBuilders(pids []int) {
 // shrinks; liveness is a signal-0 probe per surviving pid per beat.
 func (m *Manager) PressureReady() bool {
 	if !m.reattachComplete.Load() {
+		return false
+	}
+	if m.builderScanPending.Load() {
 		return false
 	}
 	if len(m.survivingBuilderPIDs) > 0 {
@@ -4507,11 +4546,12 @@ func pidAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
-// FindSurvivingBuilders scans /proc for template-builder processes left
+// findSurvivingBuilders scans /proc for template-builder processes left
 // over from a previous daemon (KillMode=process restarts orphan them).
-// Startup-only: one directory walk, comparing each process's first
-// cmdline argument against the builder binary path.
-func FindSurvivingBuilders(builderBin string) []int {
+// One directory walk with a cmdline read per process — which is exactly
+// why it only ever runs inside ScanSurvivingBuildersAsync's goroutine,
+// never on a startup or lifecycle path.
+func findSurvivingBuilders(builderBin string) []int {
 	if builderBin == "" {
 		return nil
 	}
