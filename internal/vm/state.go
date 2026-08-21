@@ -1026,6 +1026,12 @@ type PendingBackup struct {
 	// pauses must never delay a live pause's generation; absent (every
 	// marker minted by a real pause) means pause priority.
 	BestEffort bool `json:"best_effort,omitempty"`
+	// PauseToken is the control plane's identity for the pause that minted
+	// this marker, threaded into the upload report so coverage can name
+	// the exact pause it verified. Empty for markers minted before the
+	// token existed, by the backfill sweep, or by an older control plane;
+	// those reports fall back to content matching.
+	PauseToken string `json:"pause_token,omitempty"`
 }
 
 // PutPendingBackup records (or refreshes) a pause's owed backup.

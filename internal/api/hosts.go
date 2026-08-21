@@ -312,9 +312,14 @@ func (h *Handlers) HostUpdateStatus(c *gin.Context) {
 }
 
 // HostList handles GET /internal/hosts — the operator view behind
-// `hostctl list`: every host with liveness and sandbox counts.
+// `hostctl list`: every host with liveness and sandbox counts. `?id=` scopes
+// the counts to one host so drain polling doesn't recompute them fleet-wide.
 func (h *Handlers) HostList(c *gin.Context) {
-	rows, err := h.DB.ListHostsAdmin(c.Request.Context())
+	var idFilter *string
+	if id := c.Query("id"); id != "" {
+		idFilter = &id
+	}
+	rows, err := h.DB.ListHostsAdmin(c.Request.Context(), idFilter)
 	if err != nil {
 		log.Error().Err(err).Msg("ListHostsAdmin failed")
 		respondError(c, ErrInternal)
@@ -334,6 +339,7 @@ func (h *Handlers) HostList(c *gin.Context) {
 		TransitionalCount int32   `json:"transitional_count"`
 		PausedCount       int32   `json:"paused_count"`
 		BuildingCount     int32   `json:"building_count"`
+		PausedUnbacked    int32   `json:"paused_unbacked_count"`
 	}
 	hosts := make([]hostView, 0, len(rows))
 	for _, r := range rows {
@@ -346,6 +352,7 @@ func (h *Handlers) HostList(c *gin.Context) {
 			TransitionalCount: r.TransitionalCount,
 			PausedCount:       r.PausedCount,
 			BuildingCount:     r.BuildingCount,
+			PausedUnbacked:    r.PausedUnbackedCount,
 		}
 		if r.LastHeartbeatAt.Valid {
 			s := r.LastHeartbeatAt.Time.UTC().Format(time.RFC3339)

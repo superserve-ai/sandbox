@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -123,8 +124,12 @@ func (c client) waitDrained(hostID string) error {
 		if !quietSince.IsZero() && time.Since(quietSince) >= drainQuietWindow {
 			fmt.Printf("%s drained: counts zero continuously for %s.\n", hostID, drainQuietWindow)
 			if h.PausedCount > 0 {
-				fmt.Printf("NOT safe to retire: %d paused sandboxes have their snapshots on this host's local disk.\n",
-					h.PausedCount)
+				coverage := "backup coverage unknown — control plane predates coverage reporting"
+				if h.PausedUnbacked != nil {
+					coverage = fmt.Sprintf("%d without a durable backup — irrecoverable if the disk is lost", *h.PausedUnbacked)
+				}
+				fmt.Printf("NOT safe to retire: %d paused sandboxes have their snapshots on this host's local disk (%s).\n",
+					h.PausedCount, coverage)
 			}
 			return nil
 		}
@@ -171,10 +176,13 @@ type hostView struct {
 	TransitionalCount int     `json:"transitional_count"`
 	PausedCount       int     `json:"paused_count"`
 	BuildingCount     int     `json:"building_count"`
+	// Pointer: a control plane predating coverage reporting omits the field,
+	// and "unknown" must never render as a safety-relevant 0.
+	PausedUnbacked *int `json:"paused_unbacked_count"`
 }
 
-func (c client) hosts() ([]hostView, error) {
-	resp, err := c.do(http.MethodGet, "/internal/hosts", nil)
+func (c client) hostsPath(path string) ([]hostView, error) {
+	resp, err := c.do(http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -188,11 +196,21 @@ func (c client) hosts() ([]hostView, error) {
 	return out.Hosts, nil
 }
 
+func (c client) hosts() ([]hostView, error) {
+	return c.hostsPath("/internal/hosts")
+}
+
+// hostRow fetches ONE host's row. Scoped server-side because drain polls it
+// every few seconds — the unscoped list recomputes sandbox and
+// backup-coverage counts for the whole fleet.
 func (c client) hostRow(hostID string) (hostView, error) {
-	hosts, err := c.hosts()
+	hosts, err := c.hostsPath("/internal/hosts?id=" + url.QueryEscape(hostID))
 	if err != nil {
 		return hostView{}, err
 	}
+	// Scan by ID rather than taking hosts[0]: a control plane that predates
+	// the ?id= filter ignores it and returns the whole fleet, and drain
+	// must never end up monitoring whichever host sorts first.
 	for _, h := range hosts {
 		if h.ID == hostID {
 			return h, nil
@@ -215,8 +233,11 @@ func (c client) list() error {
 	// land. It does NOT mean safe to retire: PAUSED sandboxes' snapshots
 	// live on the host's local disk and resume is pinned to it, so retiring
 	// the machine strands every one of them. Until cross-host restore
-	// exists, retirement additionally requires PAUSED = 0.
-	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED")
+	// exists, retirement additionally requires PAUSED = 0. UNBACKED is the
+	// irrecoverable subset — paused sandboxes with no durable backup copy
+	// anywhere; retiring the machine destroys those outright, so that
+	// number must read zero before retirement is even discussable.
+	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED\tUNBACKED")
 	for _, h := range out.Hosts {
 		beat := "never"
 		if h.LastHeartbeatAt != nil {
@@ -224,8 +245,12 @@ func (c client) list() error {
 				beat = fmt.Sprintf("%ds ago", int(time.Since(t).Seconds()))
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\n",
-			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount)
+		unbacked := "?"
+		if h.PausedUnbacked != nil {
+			unbacked = fmt.Sprintf("%d", *h.PausedUnbacked)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\n",
+			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount, unbacked)
 	}
 	return w.Flush()
 }

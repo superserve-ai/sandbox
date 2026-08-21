@@ -436,13 +436,14 @@ func (c *grpcVMDClient) DestroyInstance(ctx context.Context, vmID string, force 
 	return nil
 }
 
-func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir string) (string, string, []vmdclient.ManifestEntry, error) {
+func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error) {
 	resp, err := c.client.PauseVM(ctx, &vmdpb.PauseVMRequest{
 		VmId:        vmID,
 		SnapshotDir: snapshotDir,
+		PauseToken:  pauseToken,
 	})
 	if err != nil {
-		return "", "", nil, fmt.Errorf("gRPC PauseVM: %w", err)
+		return "", "", nil, "", fmt.Errorf("gRPC PauseVM: %w", err)
 	}
 	manifest := make([]vmdclient.ManifestEntry, 0, len(resp.GetManifest()))
 	for _, e := range resp.GetManifest() {
@@ -454,7 +455,11 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir str
 			BasePath:  e.GetBasePath(),
 		})
 	}
-	return resp.SnapshotPath, resp.MemFilePath, manifest, nil
+	acked := ""
+	if resp.GetPauseToken() == pauseToken {
+		acked = pauseToken
+	}
+	return resp.SnapshotPath, resp.MemFilePath, manifest, acked, nil
 }
 
 func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, networkConfig []byte) (string, uint32, uint32, error) {
