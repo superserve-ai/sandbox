@@ -3362,7 +3362,11 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		}
 	}
 
-	// Detect orphan units not in BoltDB, both supervision modes.
+	// Detect orphan units not in BoltDB, both supervision modes. The
+	// gate's scan covers every state that can hold a live process
+	// (activating and deactivating included), unlike the reconciler's
+	// active-only sweep: a transitional recordless unit still holds
+	// memory, and missing it would open publication over it.
 	activeIDs, err := listActiveFCUnits(ctx)
 	if err != nil {
 		conclusive = false

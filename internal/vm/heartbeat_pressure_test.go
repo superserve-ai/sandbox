@@ -243,7 +243,7 @@ func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 // fresh zeros that invite over-placement.
 func TestPressureReadyFailsClosedOnUnreadableState(t *testing.T) {
 	listActiveFCUnits = func(context.Context) ([]string, error) { return nil, nil }
-	defer func() { listActiveFCUnits = listActiveFirecrackerUnits }()
+	defer func() { listActiveFCUnits = listLiveFirecrackerUnits }()
 	dir := t.TempDir()
 	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
 	if err != nil {
@@ -314,7 +314,7 @@ func TestPressureReadyStaysClosedOnReattachPanic(t *testing.T) {
 // a report would be a fresh undercount. A failed orphan scan is treated
 // the same: an unobserved orphan cannot be ruled out.
 func TestPressureReadyStaysClosedOnOrphansOrFailedScan(t *testing.T) {
-	defer func() { listActiveFCUnits = listActiveFirecrackerUnits }()
+	defer func() { listActiveFCUnits = listLiveFirecrackerUnits }()
 
 	newMgr := func(t *testing.T) *Manager {
 		st, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
@@ -374,7 +374,7 @@ func TestPressureReadyStaysClosedOnRetainedUnrepresentedRecord(t *testing.T) {
 	listActiveFCUnits = func(context.Context) ([]string, error) { return nil, nil }
 	origDown, origStop := vmUnitFullyDown, staleUnitStopConfirmed
 	defer func() {
-		listActiveFCUnits = listActiveFirecrackerUnits
+		listActiveFCUnits = listLiveFirecrackerUnits
 		vmUnitFullyDown, staleUnitStopConfirmed = origDown, origStop
 	}()
 	vmUnitFullyDown = func(string) bool { return false }                         // not provably terminal
@@ -504,7 +504,7 @@ func TestPressureReadyClosedWhileBuilderScanPending(t *testing.T) {
 // close on that middle state.
 func TestPressureReadySurvivesConcurrentTeardown(t *testing.T) {
 	listActiveFCUnits = func(context.Context) ([]string, error) { return nil, nil }
-	defer func() { listActiveFCUnits = listActiveFirecrackerUnits }()
+	defer func() { listActiveFCUnits = listLiveFirecrackerUnits }()
 
 	st, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
