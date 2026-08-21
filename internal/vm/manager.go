@@ -498,8 +498,8 @@ type Manager struct {
 	// registry that knew their sizes died with the old process, so their
 	// allocation is unrecoverable. Publication stays gated until they
 	// exit; builderAlive is a seam over the pid-liveness probe.
-	survivingBuilderPIDs []int
-	builderAlive         func(pid int) bool
+	survivingBuilders []builderProc
+	builderAlive      func(p builderProc) bool
 	// pausedStopUnconfirmed marks VMs whose pause-time stop could not be
 	// confirmed dead, in EITHER supervision mode: the record reads Paused
 	// while Firecracker may still hold its memory, and the cgroup mode has
@@ -520,7 +520,7 @@ type Manager struct {
 	// store/load pair orders the write for the heartbeat's reader).
 	builderScanPending atomic.Bool
 	// builderScan is a test seam over findSurvivingBuilders.
-	builderScan func(builderBin string) []int
+	builderScan func(builderBin string) []builderProc
 
 	// reattachComplete gates pressure publication: until the background
 	// reattach has rebuilt the instance map, CapacityPressure would
@@ -3266,12 +3266,16 @@ func (m *Manager) releaseBuildAlloc(buildVMID string, vcpu, memoryMiB uint32) {
 }
 
 // buildAllocCovers reports whether a build-prefixed id is currently
-// sized by the build pressure counters: an IN-FLIGHT registry build
-// whose allocation has not yet been released. Everything else —
-// leftovers from a dead daemon, terminal builds, and any build VM still
-// alive AFTER its allocation was returned (a recorder whose teardown
-// failed) — is NOT covered: the cgroup orphan gate treats it as
-// unrepresented, and the instance loop counts it directly. Both id
+// sized by the build pressure counters: a registry build whose
+// allocation has not yet been released. Coverage keys on AllocReleased
+// ALONE, never on terminal status — a cancel marks the record terminal
+// while the recorder VM may still be tearing down (up to its destroy
+// timeout) with the counters intentionally held, and a terminal check
+// here would count that recorder twice for the whole teardown. What is
+// NOT covered: leftovers from a dead daemon (empty registry), and any
+// build VM still alive AFTER its allocation was returned (a recorder
+// whose teardown failed) — the cgroup orphan gate treats those as
+// unrepresented and the instance loop counts them directly. Both id
 // shapes resolve to the registry: the build VM itself
 // ("build-<build-row-uuid>") and its access-pattern recorder
 // ("build-record-<template>", matched by template id — registry keys are
@@ -3284,14 +3288,14 @@ func (m *Manager) buildAllocCovers(id string) bool {
 	defer m.buildsMu.RUnlock()
 	if tpl, ok := strings.CutPrefix(id, "build-record-"); ok {
 		for _, rec := range m.builds {
-			if !rec.Status.IsTerminal() && !rec.AllocReleased && rec.TemplateID == tpl {
+			if !rec.AllocReleased && rec.TemplateID == tpl {
 				return true
 			}
 		}
 		return false
 	}
 	rec, ok := m.builds[id]
-	return ok && !rec.Status.IsTerminal() && !rec.AllocReleased
+	return ok && !rec.AllocReleased
 }
 
 // vmKnownNow reports whether id is represented in the CURRENT instance
@@ -4576,11 +4580,20 @@ type HostPressure struct {
 	NetSlotCeiling        int32 // IP-scheme hard bound, not an operator knob
 }
 
+// builderProc identifies a surviving builder by pid AND its kernel
+// start time: a bare pid can be recycled by an unrelated process between
+// probes, and a signal-0 check against the recycled pid would keep the
+// pressure gate closed for as long as that stranger lives.
+type builderProc struct {
+	pid   int
+	start uint64
+}
+
 // SetSurvivingBuilders records template-builder subprocesses that
 // outlived the previous daemon. Startup-only, before the heartbeat
 // starts; tests use it directly.
-func (m *Manager) SetSurvivingBuilders(pids []int) {
-	m.survivingBuilderPIDs = pids
+func (m *Manager) SetSurvivingBuilders(procs []builderProc) {
+	m.survivingBuilders = procs
 }
 
 // ScanSurvivingBuildersAsync discovers builder subprocesses orphaned by
@@ -4599,12 +4612,16 @@ func (m *Manager) ScanSurvivingBuildersAsync(builderBin string) {
 		if scan == nil {
 			scan = findSurvivingBuilders
 		}
-		pids := scan(builderBin)
-		if len(pids) > 0 {
+		procs := scan(builderBin)
+		if len(procs) > 0 {
+			pids := make([]int, 0, len(procs))
+			for _, bp := range procs {
+				pids = append(pids, bp.pid)
+			}
 			m.log.Warn().Ints("pids", pids).
 				Msg("surviving template-builder processes detected; pressure publication deferred until they exit")
 		}
-		m.survivingBuilderPIDs = pids
+		m.survivingBuilders = procs
 		m.builderScanPending.Store(false)
 	}()
 }
@@ -4623,18 +4640,18 @@ func (m *Manager) PressureReady() bool {
 	if m.builderScanPending.Load() {
 		return false
 	}
-	if len(m.survivingBuilderPIDs) > 0 {
+	if len(m.survivingBuilders) > 0 {
 		alive := m.builderAlive
 		if alive == nil {
-			alive = pidAlive
+			alive = builderProcAlive
 		}
-		remaining := m.survivingBuilderPIDs[:0]
-		for _, pid := range m.survivingBuilderPIDs {
-			if alive(pid) {
-				remaining = append(remaining, pid)
+		remaining := m.survivingBuilders[:0]
+		for _, bp := range m.survivingBuilders {
+			if alive(bp) {
+				remaining = append(remaining, bp)
 			}
 		}
-		m.survivingBuilderPIDs = remaining
+		m.survivingBuilders = remaining
 		if len(remaining) > 0 {
 			return false
 		}
@@ -4642,15 +4659,39 @@ func (m *Manager) PressureReady() bool {
 	return true
 }
 
-// pidAlive reports whether pid exists (signal 0). A permission error
-// still means alive.
-func pidAlive(pid int) bool {
-	proc, err := os.FindProcess(pid)
+// builderProcAlive reports whether the ORIGINAL surviving builder still
+// runs: the pid must exist AND its kernel start time must match the one
+// captured at discovery. A recycled pid fails the identity check and
+// releases the gate instead of holding it for a stranger's lifetime; an
+// unreadable stat reads as gone for the same reason (the original could
+// not have become unreadable while alive under the same pid).
+func builderProcAlive(bp builderProc) bool {
+	start, ok := procStartTime(strconv.Itoa(bp.pid))
+	return ok && start == bp.start
+}
+
+// procStartTime reads a process's kernel start time (clock ticks since
+// boot, /proc stat field 22) — the stable identity a pid alone lacks.
+func procStartTime(pidDir string) (uint64, bool) {
+	stat, err := os.ReadFile("/proc/" + pidDir + "/stat")
 	if err != nil {
-		return false
+		return 0, false
 	}
-	err = proc.Signal(syscall.Signal(0))
-	return err == nil || errors.Is(err, syscall.EPERM)
+	i := strings.LastIndexByte(string(stat), ')')
+	if i < 0 {
+		return 0, false
+	}
+	fields := strings.Fields(string(stat[i+1:]))
+	// Fields after comm: state=1, ppid=2, ... starttime is overall field
+	// 22, i.e. index 19 here.
+	if len(fields) < 20 {
+		return 0, false
+	}
+	start, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return start, true
 }
 
 // findSurvivingBuilders scans /proc for template-builder processes left
@@ -4658,7 +4699,7 @@ func pidAlive(pid int) bool {
 // One directory walk with a cmdline read per process — which is exactly
 // why it only ever runs inside ScanSurvivingBuildersAsync's goroutine,
 // never on a startup or lifecycle path.
-func findSurvivingBuilders(builderBin string) []int {
+func findSurvivingBuilders(builderBin string) []builderProc {
 	if builderBin == "" {
 		return nil
 	}
@@ -4667,7 +4708,7 @@ func findSurvivingBuilders(builderBin string) []int {
 		return nil
 	}
 	self := os.Getpid()
-	var pids []int
+	var procs []builderProc
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil || pid == self {
@@ -4690,9 +4731,14 @@ func findSurvivingBuilders(builderBin string) []int {
 		if procPPID(e.Name()) == self {
 			continue
 		}
-		pids = append(pids, pid)
+		start, ok := procStartTime(e.Name())
+		if !ok {
+			// Exited between the readdir and here: not a survivor.
+			continue
+		}
+		procs = append(procs, builderProc{pid: pid, start: start})
 	}
-	return pids
+	return procs
 }
 
 // procPPID reads a process's parent pid from /proc/<pid>/stat; 0 on any

@@ -460,8 +460,8 @@ func TestPressureReadyWaitsForSurvivingBuilders(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{}}
 	m.reattachComplete.Store(true)
 	alive := map[int]bool{101: true, 102: true}
-	m.builderAlive = func(pid int) bool { return alive[pid] }
-	m.SetSurvivingBuilders([]int{101, 102})
+	m.builderAlive = func(bp builderProc) bool { return alive[bp.pid] }
+	m.SetSurvivingBuilders([]builderProc{{pid: 101, start: 7}, {pid: 102, start: 9}})
 
 	if m.PressureReady() {
 		t.Fatal("PressureReady = true with surviving builders alive")
@@ -489,7 +489,7 @@ func TestPressureReadyClosedWhileBuilderScanPending(t *testing.T) {
 	m.reattachComplete.Store(true)
 
 	release := make(chan struct{})
-	m.builderScan = func(string) []int {
+	m.builderScan = func(string) []builderProc {
 		<-release
 		return nil
 	}
@@ -548,8 +548,8 @@ func TestFindSurvivingBuildersExcludesOwnChildren(t *testing.T) {
 	}
 	defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
 
-	for _, pid := range findSurvivingBuilders("/bin/sleep") {
-		if pid == cmd.Process.Pid {
+	for _, bp := range findSurvivingBuilders("/bin/sleep") {
+		if bp.pid == cmd.Process.Pid {
 			t.Fatal("own child classified as a predecessor survivor")
 		}
 	}
@@ -579,18 +579,20 @@ func TestBuildAllocCoversDistinguishesLeftovers(t *testing.T) {
 	if m.buildAllocCovers("build-record-tpl-z") {
 		t.Fatal("leftover recorder cgroup exempted")
 	}
-	// Allocation returned (hash-only interval): no longer covered, even
-	// though the build is still non-terminal.
-	m.releaseBuildAlloc("build-row-uuid-1", 1, 1024)
-	if m.buildAllocCovers("build-row-uuid-1") || m.buildAllocCovers("build-record-tpl-a") {
-		t.Fatal("alloc-released build's cgroups still exempted")
-	}
-	// Terminal build: a leftover too.
+	// A cancel marks the build terminal while its recorder may still be
+	// tearing down with the counters held: coverage must persist until
+	// the ALLOCATION releases, or the recorder is counted twice for the
+	// teardown window.
 	if !m.setBuildStatus("build-row-uuid-1", BuildStatusCancelled) {
 		t.Fatal("cancel failed")
 	}
-	if m.buildAllocCovers("build-row-uuid-1") {
-		t.Fatal("terminal build's cgroup still exempted")
+	if !m.buildAllocCovers("build-row-uuid-1") || !m.buildAllocCovers("build-record-tpl-a") {
+		t.Fatal("cancelled-but-unreleased build lost coverage: recorder double-counted during teardown")
+	}
+	// Allocation returned: no longer covered, terminal or not.
+	m.releaseBuildAlloc("build-row-uuid-1", 1, 1024)
+	if m.buildAllocCovers("build-row-uuid-1") || m.buildAllocCovers("build-record-tpl-a") {
+		t.Fatal("alloc-released build's cgroups still exempted")
 	}
 }
 
@@ -649,5 +651,31 @@ func TestCapacityPressureSkipsBuildInstances(t *testing.T) {
 	}
 	if p.RunningSandboxes != 2 {
 		t.Fatalf("running = %d, want 2 (leaked recorder now visible)", p.RunningSandboxes)
+	}
+}
+
+// A recycled pid must not hold the survivor gate: identity is pid AND
+// kernel start time, so a stranger reusing the pid fails the check and
+// the gate opens.
+func TestSurvivorGateReleasesOnPIDRecycle(t *testing.T) {
+	m := &Manager{vms: map[string]*VMInstance{}}
+	m.reattachComplete.Store(true)
+	// The "alive" probe sees SOME process at pid 101 — but with a
+	// different start time than the recorded survivor.
+	m.builderAlive = builderProcAliveWith(func(pid int) (uint64, bool) {
+		return 999, true // recycled: different identity
+	})
+	m.SetSurvivingBuilders([]builderProc{{pid: 101, start: 7}})
+	if !m.PressureReady() {
+		t.Fatal("PressureReady = false for a recycled pid; the original survivor is gone")
+	}
+}
+
+// builderProcAliveWith builds an identity-checking probe over a stubbed
+// start-time reader, mirroring builderProcAlive's comparison.
+func builderProcAliveWith(startOf func(pid int) (uint64, bool)) func(builderProc) bool {
+	return func(bp builderProc) bool {
+		start, ok := startOf(bp.pid)
+		return ok && start == bp.start
 	}
 }
