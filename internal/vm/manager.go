@@ -3223,6 +3223,38 @@ func (m *Manager) recordRepresentedOrGone(id string) bool {
 	return false
 }
 
+// buildCgroupCurrent reports whether a build-prefixed cgroup belongs to
+// an IN-FLIGHT build in this process's registry — those are sized by the
+// build pressure counters and are not orphans. A blanket build-prefix
+// exemption would be wrong: a restart during access-pattern recording
+// leaves a live build-record-* Firecracker with no BoltDB record, no
+// instance, no registry entry, and no template-builder process for the
+// survivor scan to find — a leftover whose memory pressure cannot see,
+// which must keep the gate closed like any other orphan. Both id shapes
+// resolve to the registry: the build VM itself ("build-<template>") and
+// its access-pattern recorder ("build-record-<template>").
+func (m *Manager) buildCgroupCurrent(id string) bool {
+	if !isBuildVM(id) {
+		return false
+	}
+	m.buildsMu.RLock()
+	defer m.buildsMu.RUnlock()
+	// The recorder's id carries the TEMPLATE id, while registry keys
+	// carry the caller-chosen build VM id (the control plane sends
+	// "build-<build-row-uuid>") — so recorders match by template, never
+	// by key reconstruction.
+	if tpl, ok := strings.CutPrefix(id, "build-record-"); ok {
+		for _, rec := range m.builds {
+			if !rec.Status.IsTerminal() && rec.TemplateID == tpl {
+				return true
+			}
+		}
+		return false
+	}
+	rec, ok := m.builds[id]
+	return ok && !rec.Status.IsTerminal()
+}
+
 // vmKnownNow reports whether id is represented in the CURRENT instance
 // map or state store — as opposed to ReattachAll's startup-time record
 // snapshot. The orphan scans run in a background pass that concurrent
@@ -3346,7 +3378,7 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	if m.cgroups != nil {
 		if cgIDs, cerr := m.cgroups.scanVMCgroups(); cerr == nil {
 			for _, id := range cgIDs {
-				if knownIDs[id] || isBuildVM(id) || m.vmKnownNow(id) {
+				if knownIDs[id] || m.vmKnownNow(id) || m.buildCgroupCurrent(id) {
 					continue
 				}
 				conclusive = false

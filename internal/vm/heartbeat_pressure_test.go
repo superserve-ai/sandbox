@@ -546,3 +546,35 @@ func TestFindSurvivingBuildersExcludesOwnChildren(t *testing.T) {
 		}
 	}
 }
+
+// Build-prefixed cgroups are exempt from the orphan gate ONLY while an
+// in-flight registry build owns them: a leftover build or recorder VM
+// from a dead daemon has no registry entry and must keep the gate
+// closed like any other unrepresented Firecracker.
+func TestBuildCgroupCurrentDistinguishesLeftovers(t *testing.T) {
+	m := &Manager{vms: map[string]*VMInstance{}, builds: map[string]*buildRecord{}}
+	if _, err := m.registerBuild("build-row-uuid-1", "tpl-a", 1, 1024, func() {}); err != nil {
+		t.Fatal(err)
+	}
+	// Current build VM and its recorder: exempt.
+	if !m.buildCgroupCurrent("build-row-uuid-1") {
+		t.Fatal("in-flight build cgroup not exempt")
+	}
+	if !m.buildCgroupCurrent("build-record-tpl-a") {
+		t.Fatal("in-flight build's recorder cgroup not exempt")
+	}
+	// Leftovers from a previous daemon: not exempt.
+	if m.buildCgroupCurrent("build-row-uuid-9") {
+		t.Fatal("unknown build cgroup exempted")
+	}
+	if m.buildCgroupCurrent("build-record-tpl-z") {
+		t.Fatal("leftover recorder cgroup exempted")
+	}
+	// Terminal build: its cgroup is a leftover too.
+	if !m.setBuildStatus("build-row-uuid-1", BuildStatusCancelled) {
+		t.Fatal("cancel failed")
+	}
+	if m.buildCgroupCurrent("build-row-uuid-1") || m.buildCgroupCurrent("build-record-tpl-a") {
+		t.Fatal("terminal build's cgroups still exempted")
+	}
+}
