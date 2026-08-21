@@ -500,6 +500,17 @@ type Manager struct {
 	// exit; builderAlive is a seam over the pid-liveness probe.
 	survivingBuilderPIDs []int
 	builderAlive         func(pid int) bool
+	// pausedStopUnconfirmed marks VMs whose pause-time stop could not be
+	// confirmed dead, in EITHER supervision mode: the record reads Paused
+	// while Firecracker may still hold its memory, and the cgroup mode has
+	// no unit-oracle entry to remember that by. CapacityPressure counts
+	// the allocation while the marker stands. Set by the pause path,
+	// cleared when the VM is provably resolved (resume relaunch, destroy
+	// teardown, or a pause retry that confirms rest); a reconciler reap
+	// that bypasses those paths leaves the marker to over-count until the
+	// sandbox next resumes or is destroyed — the conservative direction.
+	pausedStopUnconfirmed sync.Map // vmID -> struct{}
+
 	// builderScanPending holds the gate closed from the moment survivor
 	// discovery is REQUESTED until the async scan lands its result: the
 	// first heartbeat can fire before the scan finishes, and an unscanned
@@ -1367,6 +1378,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		// backs up only once the unit is confirmed dead.
 		var manifest []ManifestEntry
 		if m.vmConfirmedAtRest(ctx, vmID) {
+			// Rest is now proven: the earlier unconfirmed stop resolved.
+			m.pausedStopUnconfirmed.Delete(vmID)
 			manifest = m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, pauseToken, log)
 		} else {
 			log.Warn().Msg("pause backup skipped on retry: unit not confirmed dead")
@@ -1533,11 +1546,20 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		}
 		if stopErr != nil && !m.vmDefinitelyDead(stopCtx, vmID, pauseSupervision) {
 			stopConfirmed = false
+			// Pressure must keep counting this VM's allocation while the
+			// process may be live behind a Paused record (the unit oracle
+			// only covers unit mode; this marker covers both).
+			m.pausedStopUnconfirmed.Store(vmID, struct{}{})
 			log.Error().Err(stopErr).Msg("VM still running after pause; reconciler will reclaim it")
 		}
 	}
 	stopCancel()
 	stopDur = time.Since(tStop)
+	if stopConfirmed {
+		// A confirmed stop resolves any unconfirmed marker from an
+		// earlier pause of this VM (resume relaunched it in between).
+		m.pausedStopUnconfirmed.Delete(vmID)
+	}
 
 	inst.mu.Lock()
 	inst.Status = StatusPaused
@@ -4698,6 +4720,15 @@ func (m *Manager) CapacityPressure() HostPressure {
 	}
 	m.mu.RUnlock()
 	for _, snap := range instances {
+		// Build-pipeline VMs in the instance map (the access-pattern
+		// recorder that RecordAccessPattern restores) are already sized by
+		// the build pressure counters, which release only when the build
+		// worker returns — counting the instance too would report the same
+		// build as running AND provisioning with its allocation doubled
+		// for the whole recording window.
+		if isBuildVM(snap.id) {
+			continue
+		}
 		inst := snap.inst
 		inst.mu.RLock()
 		status, vcpu, mem := inst.Status, inst.Config.VCPU, inst.Config.MemoryMiB
@@ -4721,12 +4752,12 @@ func (m *Manager) CapacityPressure() HostPressure {
 			// as free. unitMaybeWindingDown's young-process settle window
 			// makes every paused VM count for the first minutes after a
 			// vmd restart: deliberate over-reporting while stops from the
-			// previous process are unobservable. Residual: an unconfirmed
-			// CGROUP-mode pause stop is not visible to the unit oracle;
-			// that window is rare, short, and reconciler-owned, and
-			// probing cgroups here would put filesystem reads on every
-			// beat.
-			if len(m.vmOpCh(snap.id)) > 0 || unitMaybeWindingDown(systemdUnitName(snap.id)) {
+			// previous process are unobservable. The pausedStopUnconfirmed
+			// marker covers what the unit oracle cannot see — an
+			// unconfirmed stop on a CGROUP-supervised VM — without putting
+			// cgroup filesystem probes on the beat.
+			_, stopUnconfirmed := m.pausedStopUnconfirmed.Load(snap.id)
+			if stopUnconfirmed || len(m.vmOpCh(snap.id)) > 0 || unitMaybeWindingDown(systemdUnitName(snap.id)) {
 				p.AllocatedMemoryMib += int64(mem)
 				p.AllocatedVcpus += int64(vcpu)
 			}
@@ -5193,6 +5224,7 @@ func (m *Manager) removeVM(vmID string) {
 	m.mu.Lock()
 	delete(m.vms, vmID)
 	m.mu.Unlock()
+	m.pausedStopUnconfirmed.Delete(vmID)
 	m.deleteState(vmID)
 }
 

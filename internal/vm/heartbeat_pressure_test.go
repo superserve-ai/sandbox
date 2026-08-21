@@ -578,3 +578,49 @@ func TestBuildCgroupCurrentDistinguishesLeftovers(t *testing.T) {
 		t.Fatal("terminal build's cgroups still exempted")
 	}
 }
+
+// An unconfirmed cgroup-mode pause stop has no unit-oracle entry; the
+// pausedStopUnconfirmed marker must keep the allocation counted, and a
+// later confirmed pause clears it.
+func TestCapacityPressureCountsUnconfirmedCgroupStop(t *testing.T) {
+	origStart := vmProcessStart
+	vmProcessStart = time.Now().Add(-time.Hour)
+	defer func() { vmProcessStart = origStart }()
+
+	m := &Manager{vms: map[string]*VMInstance{
+		"cg1": {Status: StatusPaused, Config: VMConfig{VCPU: 4, MemoryMiB: 2048}},
+	}}
+	m.pausedStopUnconfirmed.Store("cg1", struct{}{})
+	if p := m.CapacityPressure(); p.AllocatedMemoryMib != 2048 || p.AllocatedVcpus != 4 {
+		t.Fatalf("allocations = %+v, want the unconfirmed-stop VM counted", p)
+	}
+	m.pausedStopUnconfirmed.Delete("cg1")
+	if p := m.CapacityPressure(); p.AllocatedMemoryMib != 0 {
+		t.Fatalf("allocations = %+v, want zero after the stop was resolved", p)
+	}
+}
+
+// The access-pattern recorder lives in the instance map while its build's
+// counters still hold the allocation: the instance loop must skip
+// build-prefixed VMs or the build is double-counted for the whole
+// recording window.
+func TestCapacityPressureSkipsBuildInstances(t *testing.T) {
+	m := &Manager{
+		vms: map[string]*VMInstance{
+			"build-record-tpl-a": {Status: StatusRunning, Config: VMConfig{VCPU: 2, MemoryMiB: 4096}},
+			"customer-vm":        {Status: StatusRunning, Config: VMConfig{VCPU: 1, MemoryMiB: 512}},
+		},
+		builds: map[string]*buildRecord{},
+	}
+	if _, err := m.registerBuild("build-tpl-a", "tpl-a", 2, 4096, func() {}); err != nil {
+		t.Fatal(err)
+	}
+	p := m.CapacityPressure()
+	if p.RunningSandboxes != 1 {
+		t.Fatalf("running = %d, want 1 (recorder is not a customer sandbox)", p.RunningSandboxes)
+	}
+	// 512 (customer) + 4096 (build counters, once) — not 8704.
+	if p.AllocatedMemoryMib != 4608 || p.AllocatedVcpus != 3 {
+		t.Fatalf("allocations = %+v, want the build counted exactly once", p)
+	}
+}
