@@ -4766,6 +4766,24 @@ func procPPID(pidDir string) int {
 	return ppid
 }
 
+// vmPossiblyLive reports whether a VM whose status claims its process
+// should be gone (paused, error) may in fact still be running, from
+// in-memory signals only: an unconfirmed stop marker (either supervision
+// mode), a lifecycle op in flight (mid-resume restore, mid-teardown), or
+// the unit oracle remembering an unconfirmed stop (including the
+// young-process settle window after a restart, when stops from the
+// previous daemon are unobservable — deliberate over-reporting).
+// Residual, shared with the pause path: an unconfirmed CGROUP-mode stop
+// on a path that does not set the marker is invisible here; that window
+// is rare, short, and reconciler-owned, and probing cgroups would put
+// filesystem reads on every beat.
+func (m *Manager) vmPossiblyLive(id string) bool {
+	if _, unconfirmed := m.pausedStopUnconfirmed.Load(id); unconfirmed {
+		return true
+	}
+	return len(m.vmOpCh(id)) > 0 || unitMaybeWindingDown(systemdUnitName(id))
+}
+
 // CapacityPressure computes the pressure summary from maintained
 // in-memory state only: a pointer snapshot of the instance map under the
 // manager lock, per-instance reads under each instance's own lock, the
@@ -4818,25 +4836,27 @@ func (m *Manager) CapacityPressure() HostPressure {
 			// whose stop was never confirmed (the unit oracle remembers
 			// exactly those). Count the allocation in both windows —
 			// capacity a live process consumes must never be advertised
-			// as free. unitMaybeWindingDown's young-process settle window
-			// makes every paused VM count for the first minutes after a
-			// vmd restart: deliberate over-reporting while stops from the
-			// previous process are unobservable. The pausedStopUnconfirmed
-			// marker covers what the unit oracle cannot see — an
-			// unconfirmed stop on a CGROUP-supervised VM — without putting
-			// cgroup filesystem probes on the beat.
-			_, stopUnconfirmed := m.pausedStopUnconfirmed.Load(snap.id)
-			if stopUnconfirmed || len(m.vmOpCh(snap.id)) > 0 || unitMaybeWindingDown(systemdUnitName(snap.id)) {
+			// as free; vmPossiblyLive documents the signals and the shared
+			// residual.
+			if m.vmPossiblyLive(snap.id) {
 				p.AllocatedMemoryMib += int64(mem)
 				p.AllocatedVcpus += int64(vcpu)
 			}
 			continue
 		case StatusError:
-			// Error records can deliberately retain a possibly-live
-			// Firecracker (stop unconfirmed): its memory and CPU may still
-			// be real, so they stay counted until teardown removes the
-			// record. Not a running or provisioning sandbox — only the
-			// allocation is kept, erring toward over-reporting pressure.
+			// Error records split the same way paused ones do: one that
+			// deliberately retains a possibly-live Firecracker (stop
+			// unconfirmed) keeps its allocation counted, while one whose
+			// process provably never launched (pre-launch rootfs/network
+			// failure) or was confirmed stopped holds nothing — and a
+			// failed-resume record retained for retry can sit for a long
+			// time, so blanket-counting it would subtract phantom
+			// capacity from placement indefinitely. Not a running or
+			// provisioning sandbox either way; only the allocation is at
+			// stake.
+			if !m.vmPossiblyLive(snap.id) {
+				continue
+			}
 		default:
 			continue
 		}

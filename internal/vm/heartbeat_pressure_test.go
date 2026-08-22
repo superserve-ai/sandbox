@@ -191,21 +191,35 @@ func TestSendPressureWaitsForReattach(t *testing.T) {
 	}
 }
 
-// Error-status VMs keep their allocations counted: an error record can
-// retain a possibly-live Firecracker, so its memory is still real.
+// Error-status VMs split by liveness: one whose stop was never confirmed
+// keeps its allocation counted, while a provably-settled error record (a
+// pre-launch failure, or a confirmed stop — e.g. a failed resume
+// retained for retry) holds no process and must not subtract phantom
+// capacity indefinitely.
 func TestCapacityPressureCountsErrorVMAllocations(t *testing.T) {
+	origStart := vmProcessStart
+	vmProcessStart = time.Now().Add(-time.Hour) // settled host
+	defer func() { vmProcessStart = origStart }()
+
 	m := &Manager{
 		vms: map[string]*VMInstance{
-			"r1": {Status: StatusRunning, Config: VMConfig{VCPU: 2, MemoryMiB: 1024}},
-			"e1": {Status: StatusError, Config: VMConfig{VCPU: 4, MemoryMiB: 2048}},
+			"r1":        {Status: StatusRunning, Config: VMConfig{VCPU: 2, MemoryMiB: 1024}},
+			"e-live":    {Status: StatusError, Config: VMConfig{VCPU: 4, MemoryMiB: 2048}},
+			"e-settled": {Status: StatusError, Config: VMConfig{VCPU: 8, MemoryMiB: 8192}},
 		},
 	}
+	// e-live's stop was never confirmed; e-settled has no such signal.
+	recordUnitStop(systemdUnitName("e-live"))
+	defer confirmUnitStopped(systemdUnitName("e-live"))
+
 	p := m.CapacityPressure()
 	if p.RunningSandboxes != 1 || p.ProvisioningSandboxes != 0 {
-		t.Fatalf("counts = %+v (error VM must not count as running/provisioning)", p)
+		t.Fatalf("counts = %+v (error VMs must not count as running/provisioning)", p)
 	}
+	// 1024 (running) + 2048 (possibly-live error); the settled error's
+	// 8192 excluded.
 	if p.AllocatedMemoryMib != 3072 || p.AllocatedVcpus != 6 {
-		t.Fatalf("allocations = %+v, want error VM's resources included", p)
+		t.Fatalf("allocations = %+v, want only the possibly-live error VM included", p)
 	}
 }
 
