@@ -500,16 +500,26 @@ type Manager struct {
 	// exit; builderAlive is a seam over the pid-liveness probe.
 	survivingBuilders []builderProc
 	builderAlive      func(p builderProc) bool
-	// pausedStopUnconfirmed marks VMs whose pause-time stop could not be
-	// confirmed dead, in EITHER supervision mode: the record reads Paused
-	// while Firecracker may still hold its memory, and the cgroup mode has
-	// no unit-oracle entry to remember that by. CapacityPressure counts
-	// the allocation while the marker stands. Set by the pause path,
-	// cleared when the VM is provably resolved (resume relaunch, destroy
-	// teardown, or a pause retry that confirms rest); a reconciler reap
-	// that bypasses those paths leaves the marker to over-count until the
-	// sandbox next resumes or is destroyed — the conservative direction.
-	pausedStopUnconfirmed sync.Map // vmID -> struct{}
+	// pendingBuildCgroups are predecessor builds' cgroups found at
+	// startup: publication waits until each empties (the orphaned builder
+	// tears its own VM down on exit). Unlike a generic orphan cgroup this
+	// state is self-resolving, so it gates dynamically — PressureReady
+	// polls the remaining set, and the list only shrinks. Guarded by
+	// m.mu.
+	pendingBuildCgroups []string
+	// vmStopUnconfirmed marks VMs whose stop could not be confirmed
+	// dead, in EITHER supervision mode and from EITHER origin — a pause
+	// whose stop failed, or a failed spawn whose cleanup could not prove
+	// the cgroup empty (errSpawnedStopUnconfirmed): the record reads
+	// Paused/Error while Firecracker may still hold its memory, and the
+	// cgroup mode has no unit-oracle entry to remember that by.
+	// CapacityPressure counts the allocation while the marker stands.
+	// Cleared when the VM is provably resolved (confirmed pause stop,
+	// destroy teardown, or a pause retry that confirms rest); a
+	// reconciler reap that bypasses those paths leaves the marker to
+	// over-count until the sandbox next resumes or is destroyed — the
+	// conservative direction.
+	vmStopUnconfirmed sync.Map // vmID -> struct{}
 
 	// builderScanPending holds the gate closed from the moment survivor
 	// discovery is REQUESTED until the async scan lands its result: the
@@ -1125,6 +1135,12 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 			}
 			m.setStatus(vmID, StatusError)
 			if stopFailed {
+				// Supervision-independent marker: the unit oracle cannot
+				// see a cgroup-mode residue, and once the settle window
+				// expires pressure would otherwise stop charging memory
+				// this Firecracker may still hold. removeVM (the forced
+				// teardown) clears it.
+				m.vmStopUnconfirmed.Store(vmID, struct{}{})
 				// Callers that roll back durable state must know the
 				// spawned VM may still be alive: the StatusError record
 				// above is the truthful one to keep.
@@ -1379,7 +1395,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		var manifest []ManifestEntry
 		if m.vmConfirmedAtRest(ctx, vmID) {
 			// Rest is now proven: the earlier unconfirmed stop resolved.
-			m.pausedStopUnconfirmed.Delete(vmID)
+			m.vmStopUnconfirmed.Delete(vmID)
 			manifest = m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, pauseToken, log)
 		} else {
 			log.Warn().Msg("pause backup skipped on retry: unit not confirmed dead")
@@ -1549,7 +1565,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			// Pressure must keep counting this VM's allocation while the
 			// process may be live behind a Paused record (the unit oracle
 			// only covers unit mode; this marker covers both).
-			m.pausedStopUnconfirmed.Store(vmID, struct{}{})
+			m.vmStopUnconfirmed.Store(vmID, struct{}{})
 			log.Error().Err(stopErr).Msg("VM still running after pause; reconciler will reclaim it")
 		}
 	}
@@ -1558,7 +1574,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	if stopConfirmed {
 		// A confirmed stop resolves any unconfirmed marker from an
 		// earlier pause of this VM (resume relaunched it in between).
-		m.pausedStopUnconfirmed.Delete(vmID)
+		m.vmStopUnconfirmed.Delete(vmID)
 	}
 
 	inst.mu.Lock()
@@ -3428,6 +3444,21 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 				if knownIDs[id] || m.vmKnownNow(id) || m.buildAllocCovers(id) {
 					continue
 				}
+				if isBuildVM(id) {
+					// A predecessor build's cgroup: its builder process
+					// (when still running) tears its own VM down on exit,
+					// so this resolves on its own — gate DYNAMICALLY
+					// instead of poisoning conclusive, which never
+					// reevaluates and would suppress publication until
+					// the next restart even after the cgroup empties.
+					// PressureReady polls these until they are gone.
+					m.mu.Lock()
+					m.pendingBuildCgroups = append(m.pendingBuildCgroups, id)
+					m.mu.Unlock()
+					m.log.Warn().Str("vm_id", id).
+						Msg("predecessor build cgroup detected; pressure publication deferred until it empties")
+					continue
+				}
 				conclusive = false
 				m.log.Warn().Str("vm_id", id).Msg("orphan vm cgroup detected (not in BoltDB) — will be handled by reconciler")
 			}
@@ -4640,6 +4671,24 @@ func (m *Manager) PressureReady() bool {
 	if m.builderScanPending.Load() {
 		return false
 	}
+	m.mu.Lock()
+	if len(m.pendingBuildCgroups) > 0 {
+		remaining := m.pendingBuildCgroups[:0]
+		for _, id := range m.pendingBuildCgroups {
+			// Populated or unreadable keeps the gate closed; only a
+			// conclusively empty-or-absent group releases it. Bounded:
+			// one read per REMAINING leftover per beat, normally zero.
+			if m.cgroups == nil || !m.cgroupDefinitelyDead(id) {
+				remaining = append(remaining, id)
+			}
+		}
+		m.pendingBuildCgroups = remaining
+		if len(remaining) > 0 {
+			m.mu.Unlock()
+			return false
+		}
+	}
+	m.mu.Unlock()
 	if len(m.survivingBuilders) > 0 {
 		alive := m.builderAlive
 		if alive == nil {
@@ -4778,7 +4827,7 @@ func procPPID(pidDir string) int {
 // is rare, short, and reconciler-owned, and probing cgroups would put
 // filesystem reads on every beat.
 func (m *Manager) vmPossiblyLive(id string) bool {
-	if _, unconfirmed := m.pausedStopUnconfirmed.Load(id); unconfirmed {
+	if _, unconfirmed := m.vmStopUnconfirmed.Load(id); unconfirmed {
 		return true
 	}
 	return len(m.vmOpCh(id)) > 0 || unitMaybeWindingDown(systemdUnitName(id))
@@ -5313,7 +5362,7 @@ func (m *Manager) removeVM(vmID string) {
 	m.mu.Lock()
 	delete(m.vms, vmID)
 	m.mu.Unlock()
-	m.pausedStopUnconfirmed.Delete(vmID)
+	m.vmStopUnconfirmed.Delete(vmID)
 	m.deleteState(vmID)
 }
 

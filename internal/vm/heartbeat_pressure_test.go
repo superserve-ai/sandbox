@@ -611,7 +611,7 @@ func TestBuildAllocCoversDistinguishesLeftovers(t *testing.T) {
 }
 
 // An unconfirmed cgroup-mode pause stop has no unit-oracle entry; the
-// pausedStopUnconfirmed marker must keep the allocation counted, and a
+// vmStopUnconfirmed marker must keep the allocation counted, and a
 // later confirmed pause clears it.
 func TestCapacityPressureCountsUnconfirmedCgroupStop(t *testing.T) {
 	origStart := vmProcessStart
@@ -621,11 +621,11 @@ func TestCapacityPressureCountsUnconfirmedCgroupStop(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{
 		"cg1": {Status: StatusPaused, Config: VMConfig{VCPU: 4, MemoryMiB: 2048}},
 	}}
-	m.pausedStopUnconfirmed.Store("cg1", struct{}{})
+	m.vmStopUnconfirmed.Store("cg1", struct{}{})
 	if p := m.CapacityPressure(); p.AllocatedMemoryMib != 2048 || p.AllocatedVcpus != 4 {
 		t.Fatalf("allocations = %+v, want the unconfirmed-stop VM counted", p)
 	}
-	m.pausedStopUnconfirmed.Delete("cg1")
+	m.vmStopUnconfirmed.Delete("cg1")
 	if p := m.CapacityPressure(); p.AllocatedMemoryMib != 0 {
 		t.Fatalf("allocations = %+v, want zero after the stop was resolved", p)
 	}
@@ -691,5 +691,23 @@ func builderProcAliveWith(startOf func(pid int) (uint64, bool)) func(builderProc
 	return func(bp builderProc) bool {
 		start, ok := startOf(bp.pid)
 		return ok && start == bp.start
+	}
+}
+
+// A predecessor build's cgroup gates DYNAMICALLY: the orphaned builder
+// tears its own VM down on exit, so the gate reopens when the group
+// empties instead of staying closed until the next daemon restart.
+func TestPressureReadyReopensAfterPredecessorBuildCgroupEmpties(t *testing.T) {
+	m := &Manager{vms: map[string]*VMInstance{}}
+	m.reattachComplete.Store(true)
+	m.pendingBuildCgroups = []string{"build-tpl-x"}
+	// cgroups == nil: death unprovable — gate stays closed.
+	if m.PressureReady() {
+		t.Fatal("PressureReady = true with a pending predecessor build cgroup")
+	}
+	// The group is proven empty: gate reopens and the entry drops.
+	m.pendingBuildCgroups = nil
+	if !m.PressureReady() {
+		t.Fatal("PressureReady = false after the predecessor build cgroup emptied")
 	}
 }
