@@ -5638,6 +5638,20 @@ func (m *Manager) stopUnitDuringRestoreError(vmID string) {
 	if stopErr != nil {
 		m.log.Warn().Err(stopErr).Str("vm_id", vmID).Msg("stop failed during restore error cleanup")
 	}
+	// Marker symmetry keys on PROCESS death, not on the stop call's full
+	// success: a cgroup kill that emptied the group but failed the final
+	// rmdir returns an error while the processes are provably gone (the
+	// leftover directory is the harmless-residue class). A confirmed
+	// resolution clears any STALE marker from an earlier unconfirmed stop
+	// too — the resume's relaunch displaced that residue, and without the
+	// clear a retained Error/Paused record would charge memory for a
+	// process that no longer exists on every report until the sandbox
+	// next cycles.
+	resolved := stopErr == nil ||
+		(cgroupSupervised(supervision) && m.cgroupDefinitelyDead(vmID))
+	if resolved {
+		m.vmStopUnconfirmed.Delete(vmID)
+	}
 	if cgroupSupervised(supervision) {
 		// stopVM's cgroup path already sent cgroup.kill (SIGKILL to every
 		// process) and waited for the group to empty; a nil error means it
@@ -5646,7 +5660,7 @@ func (m *Manager) stopUnitDuringRestoreError(vmID string) {
 		// log it, and the slot stays safe because the pool recycles only
 		// after verifyAndRecycle confirms the netns empty, with the
 		// reconciler reaping the residual cgroup.
-		if stopErr != nil {
+		if stopErr != nil && !resolved {
 			// The unit oracle cannot see this residue, and the caller is
 			// about to persist a non-live status (Error/Paused) over a
 			// possibly-live Firecracker: preserve the verdict so pressure

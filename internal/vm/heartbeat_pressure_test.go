@@ -876,3 +876,41 @@ func TestLeakedRecorderNotHiddenByLaterBuild(t *testing.T) {
 		t.Fatalf("allocations = %+v, want leaked recorder visible alongside B", p)
 	}
 }
+
+// A stale unconfirmed-stop marker (an earlier pause) must be cleared by
+// a later cleanup whose stop CONFIRMS: the residue it described was
+// displaced by the resume's relaunch, and the confirmed stop of the
+// replacement proves nothing lives on. Only an unconfirmed cleanup
+// re-marks.
+func TestRestoreErrorCleanupClearsStaleMarkerOnConfirmedStop(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup}); err != nil {
+		t.Fatal(err)
+	}
+	// The group is conclusively EMPTY: the stop confirms immediately.
+	tree := &cgroupTree{vms: filepath.Join(dir, "vms")}
+	if err := os.MkdirAll(tree.vmCgroupDir("vm-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree.vmCgroupDir("vm-1"), "cgroup.events"),
+		[]byte("populated 0\nfrozen 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree.vmCgroupDir("vm-1"), "cgroup.kill"),
+		[]byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: st, cgroups: tree,
+		vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	m.vmStopUnconfirmed.Store("vm-1", struct{}{}) // stale, from an earlier pause
+
+	m.stopUnitDuringRestoreError("vm-1")
+	if _, marked := m.vmStopUnconfirmed.Load("vm-1"); marked {
+		t.Fatal("stale marker survived a confirmed stop; a gone process stays charged forever")
+	}
+}
