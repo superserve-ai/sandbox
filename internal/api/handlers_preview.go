@@ -26,6 +26,11 @@ import (
 
 const maxPreviewTokenExpirySeconds = 7 * 24 * 60 * 60
 
+// Capability rejection diagnostics are best-effort and must not inherit the
+// request's potentially long server timeout while waiting for a DB connection
+// or a stalled query.
+const previewCapabilityDiagnosticTimeout = 250 * time.Millisecond
+
 var (
 	errPreviewPortNotPublished = errors.New("preview port is not published")
 	errPreviewPortIsPublic     = errors.New("preview port is public")
@@ -344,6 +349,59 @@ func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string,
 		return false
 	}
 	if !hasCapabilities {
+		sandboxID := c.Param("sandbox_id")
+		requiredCapabilities := append([]string(nil), capabilities...)
+		h.asyncBookkeeping("preview-capability-diagnostics", func() {
+			diagnosticCtx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), previewCapabilityDiagnosticTimeout)
+			defer cancel()
+			flightKey := hostID + ":" + strings.Join(requiredCapabilities, ",")
+			result, diagnosticErr, _ := h.diagnosticGroup.Do(flightKey, func() (any, error) {
+				return h.DB.GetHostCapabilityDiagnostics(diagnosticCtx, db.GetHostCapabilityDiagnosticsParams{
+					HostID:               hostID,
+					RequiredCapabilities: requiredCapabilities,
+				})
+			})
+			if diagnosticErr != nil {
+				log.Warn().Err(diagnosticErr).
+					Str("host_id", hostID).
+					Strs("required_capabilities", requiredCapabilities).
+					Str("sandbox_id", sandboxID).
+					Msg("preview capability rejection diagnostics failed")
+				return
+			}
+			snapshot, ok := result.([]db.GetHostCapabilityDiagnosticsRow)
+			if !ok {
+				log.Warn().Str("host_id", hostID).Msg("preview capability rejection diagnostics returned an unexpected result")
+				return
+			}
+			rows := make([]map[string]any, 0, len(snapshot))
+			for _, row := range snapshot {
+				if row.Capability == nil {
+					continue
+				}
+				rows = append(rows, map[string]any{
+					"capability":   *row.Capability,
+					"heartbeat_at": timestamptzString(row.HeartbeatAt),
+				})
+			}
+			var generation any
+			var hostStatus any
+			var capabilitiesMatch any
+			if len(snapshot) > 0 {
+				generation = timestamptzString(snapshot[0].LastHeartbeatAt)
+				hostStatus = snapshot[0].Status
+				capabilitiesMatch = snapshot[0].CapabilitiesMatch
+			}
+			log.Warn().
+				Str("host_id", hostID).
+				Strs("required_capabilities", requiredCapabilities).
+				Str("sandbox_id", sandboxID).
+				Interface("last_heartbeat_at", generation).
+				Interface("host_status", hostStatus).
+				Interface("capabilities_match", capabilitiesMatch).
+				Interface("host_capabilities", rows).
+				Msg("preview capability enforcement rejected request")
+		})
 		respondErrorMsg(c, "conflict",
 			fmt.Sprintf("The sandbox's host does not enforce all required capabilities (%s); retry after the fleet is upgraded", strings.Join(capabilities, ", ")),
 			http.StatusConflict)

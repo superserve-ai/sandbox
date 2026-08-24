@@ -57,7 +57,8 @@ func (q *Queries) LatestSandboxBackup(ctx context.Context, sandboxID pgtype.UUID
 }
 
 const latestSnapshotManifest = `-- name: LatestSnapshotManifest :many
-SELECT s.id AS snapshot_id, am.file_name, am.sha256
+SELECT s.id AS snapshot_id, s.generation AS snapshot_generation,
+       COALESCE(s.pause_token, '') AS pause_token, am.file_name, am.sha256
 FROM snapshot s
 JOIN artifact_manifest am ON am.snapshot_id = s.id
 WHERE s.sandbox_id = $1
@@ -66,9 +67,11 @@ ORDER BY am.file_name
 `
 
 type LatestSnapshotManifestRow struct {
-	SnapshotID uuid.UUID `json:"snapshot_id"`
-	FileName   string    `json:"file_name"`
-	Sha256     string    `json:"sha256"`
+	SnapshotID         uuid.UUID `json:"snapshot_id"`
+	SnapshotGeneration int64     `json:"snapshot_generation"`
+	PauseToken         string    `json:"pause_token"`
+	FileName           string    `json:"file_name"`
+	Sha256             string    `json:"sha256"`
 }
 
 // The sandbox's newest snapshot row with every digest its pause-time
@@ -87,7 +90,13 @@ func (q *Queries) LatestSnapshotManifest(ctx context.Context, sandboxID uuid.UUI
 	items := []LatestSnapshotManifestRow{}
 	for rows.Next() {
 		var i LatestSnapshotManifestRow
-		if err := rows.Scan(&i.SnapshotID, &i.FileName, &i.Sha256); err != nil {
+		if err := rows.Scan(
+			&i.SnapshotID,
+			&i.SnapshotGeneration,
+			&i.PauseToken,
+			&i.FileName,
+			&i.Sha256,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -121,18 +130,82 @@ func (q *Queries) LockSandboxRow(ctx context.Context, id uuid.UUID) (LockSandbox
 	return i, err
 }
 
+const markSandboxBackupCovered = `-- name: MarkSandboxBackupCovered :exec
+UPDATE backup_generation
+SET covered_snapshot_id = $1,
+    covered_snapshot_generation = $2
+WHERE sandbox_id = $3
+  AND bucket = $4
+  AND generation = $5
+`
+
+type MarkSandboxBackupCoveredParams struct {
+	SnapshotID         pgtype.UUID `json:"snapshot_id"`
+	SnapshotGeneration *int64      `json:"snapshot_generation"`
+	SandboxID          pgtype.UUID `json:"sandbox_id"`
+	Bucket             string      `json:"bucket"`
+	Generation         string      `json:"generation"`
+}
+
+// Persists the report handler's identity verdict, verified under the
+// sandbox row lock: either the report's pause_token equals the head
+// snapshot's (STRONG — names the exact pause), or a tokenless report's
+// manifest matched every recorded digest (legacy fallback).
+// (snapshot_id, snapshot_generation) names the exact pause — the
+// generation counter distinguishes pauses even while the legacy
+// finalize reuses one snapshot row id. Written in the report's
+// transaction, so the coverage row and its identity link commit
+// together.
+func (q *Queries) MarkSandboxBackupCovered(ctx context.Context, arg MarkSandboxBackupCoveredParams) error {
+	_, err := q.db.Exec(ctx, markSandboxBackupCovered,
+		arg.SnapshotID,
+		arg.SnapshotGeneration,
+		arg.SandboxID,
+		arg.Bucket,
+		arg.Generation,
+	)
+	return err
+}
+
 const recordSandboxBackupGeneration = `-- name: RecordSandboxBackupGeneration :execrows
 INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (sandbox_id, bucket, generation) WHERE sandbox_id IS NOT NULL
-DO UPDATE SET completed_at = excluded.completed_at, reported_at = now(),
-  -- A coverage-only report (empty files: the outbox seed reconstructs
-  -- no manifest) must never erase a recorded manifest; richer reports
-  -- refresh it.
-  files = CASE WHEN jsonb_array_length(excluded.files) = 0
-               THEN backup_generation.files ELSE excluded.files END
+DO UPDATE SET
+  -- reported_at is the receive-instant freshness cap for skew-bounded
+  -- reads, so it moves only when a freshness arm fires: an
+  -- enrichment-only update re-describes the same verification and must
+  -- not advance when the control plane first learned of it.
+  reported_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+         OR (backup_generation.completed_at > now()
+             AND excluded.completed_at < backup_generation.completed_at)
+      THEN now()
+    ELSE backup_generation.reported_at END,
+  completed_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+      THEN excluded.completed_at
+    WHEN backup_generation.completed_at > now()
+         AND excluded.completed_at < backup_generation.completed_at
+      THEN excluded.completed_at
+    ELSE backup_generation.completed_at END,
+  -- files, in order: a coverage-only report (empty files: the outbox
+  -- seed reconstructs no manifest) must never erase a recorded
+  -- manifest; a manifest that carries object paths is frozen (the
+  -- bucket manifest it mirrors is immutable, redeliveries carry the
+  -- identical set, and nothing conforming can legitimately rename a
+  -- generation's objects, so first-writer-wins is what keeps the paths
+  -- deletion-trustworthy for GC); anything richer refreshes.
+  files = CASE
+    WHEN jsonb_array_length(excluded.files) = 0
+      THEN backup_generation.files
+    WHEN jsonb_path_exists(backup_generation.files, '$[*].object')
+      THEN backup_generation.files
+    ELSE excluded.files END
 WHERE excluded.completed_at > backup_generation.completed_at
    OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
+   OR (jsonb_path_exists(excluded.files, '$[*].object')
+       AND NOT jsonb_path_exists(backup_generation.files, '$[*].object'))
 `
 
 type RecordSandboxBackupGenerationParams struct {
@@ -153,7 +226,13 @@ type RecordSandboxBackupGenerationParams struct {
 // it exceeds now()) yields to ANY smaller incoming one, sane or merely
 // less skewed, so repair is monotone even when the correction lands
 // while some skew remains; redelivery of either report matches neither
-// arm and stays a no-op.
+// arm and stays a no-op. The third arm lets a report carrying object
+// paths enrich a row that lacks them regardless of freshness: a
+// rollout-window fallback can land a pathless copy of the same
+// verification first (same pinned instant, so the freshness arms never
+// fire for the redelivery), and the paths are what a lifecycle GC
+// reasons from. Enrichment leaves completed_at where it stands (the
+// CASE below): an older rich redelivery must not regress freshness.
 func (q *Queries) RecordSandboxBackupGeneration(ctx context.Context, arg RecordSandboxBackupGenerationParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordSandboxBackupGeneration,
 		arg.SandboxID,
@@ -172,14 +251,30 @@ const recordTemplateBackupGeneration = `-- name: RecordTemplateBackupGeneration 
 INSERT INTO backup_generation (template_id, build_id, generation, bucket, completed_at, files)
 VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (template_id, build_id, bucket, generation) WHERE template_id IS NOT NULL
-DO UPDATE SET completed_at = excluded.completed_at, reported_at = now(),
-  -- A coverage-only report (empty files: the outbox seed reconstructs
-  -- no manifest) must never erase a recorded manifest; richer reports
-  -- refresh it.
-  files = CASE WHEN jsonb_array_length(excluded.files) = 0
-               THEN backup_generation.files ELSE excluded.files END
+DO UPDATE SET
+  reported_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+         OR (backup_generation.completed_at > now()
+             AND excluded.completed_at < backup_generation.completed_at)
+      THEN now()
+    ELSE backup_generation.reported_at END,
+  completed_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+      THEN excluded.completed_at
+    WHEN backup_generation.completed_at > now()
+         AND excluded.completed_at < backup_generation.completed_at
+      THEN excluded.completed_at
+    ELSE backup_generation.completed_at END,
+  files = CASE
+    WHEN jsonb_array_length(excluded.files) = 0
+      THEN backup_generation.files
+    WHEN jsonb_path_exists(backup_generation.files, '$[*].object')
+      THEN backup_generation.files
+    ELSE excluded.files END
 WHERE excluded.completed_at > backup_generation.completed_at
    OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
+   OR (jsonb_path_exists(excluded.files, '$[*].object')
+       AND NOT jsonb_path_exists(backup_generation.files, '$[*].object'))
 `
 
 type RecordTemplateBackupGenerationParams struct {

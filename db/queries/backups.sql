@@ -9,18 +9,51 @@
 -- it exceeds now()) yields to ANY smaller incoming one, sane or merely
 -- less skewed, so repair is monotone even when the correction lands
 -- while some skew remains; redelivery of either report matches neither
--- arm and stays a no-op.
+-- arm and stays a no-op. The third arm lets a report carrying object
+-- paths enrich a row that lacks them regardless of freshness: a
+-- rollout-window fallback can land a pathless copy of the same
+-- verification first (same pinned instant, so the freshness arms never
+-- fire for the redelivery), and the paths are what a lifecycle GC
+-- reasons from. Enrichment leaves completed_at where it stands (the
+-- CASE below): an older rich redelivery must not regress freshness.
 INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (sandbox_id, bucket, generation) WHERE sandbox_id IS NOT NULL
-DO UPDATE SET completed_at = excluded.completed_at, reported_at = now(),
-  -- A coverage-only report (empty files: the outbox seed reconstructs
-  -- no manifest) must never erase a recorded manifest; richer reports
-  -- refresh it.
-  files = CASE WHEN jsonb_array_length(excluded.files) = 0
-               THEN backup_generation.files ELSE excluded.files END
+DO UPDATE SET
+  -- reported_at is the receive-instant freshness cap for skew-bounded
+  -- reads, so it moves only when a freshness arm fires: an
+  -- enrichment-only update re-describes the same verification and must
+  -- not advance when the control plane first learned of it.
+  reported_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+         OR (backup_generation.completed_at > now()
+             AND excluded.completed_at < backup_generation.completed_at)
+      THEN now()
+    ELSE backup_generation.reported_at END,
+  completed_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+      THEN excluded.completed_at
+    WHEN backup_generation.completed_at > now()
+         AND excluded.completed_at < backup_generation.completed_at
+      THEN excluded.completed_at
+    ELSE backup_generation.completed_at END,
+  -- files, in order: a coverage-only report (empty files: the outbox
+  -- seed reconstructs no manifest) must never erase a recorded
+  -- manifest; a manifest that carries object paths is frozen (the
+  -- bucket manifest it mirrors is immutable, redeliveries carry the
+  -- identical set, and nothing conforming can legitimately rename a
+  -- generation's objects, so first-writer-wins is what keeps the paths
+  -- deletion-trustworthy for GC); anything richer refreshes.
+  files = CASE
+    WHEN jsonb_array_length(excluded.files) = 0
+      THEN backup_generation.files
+    WHEN jsonb_path_exists(backup_generation.files, '$[*].object')
+      THEN backup_generation.files
+    ELSE excluded.files END
 WHERE excluded.completed_at > backup_generation.completed_at
-   OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at);
+   OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
+   OR (jsonb_path_exists(excluded.files, '$[*].object')
+       AND NOT jsonb_path_exists(backup_generation.files, '$[*].object'));
 
 -- name: RecordTemplateBackupGeneration :execrows
 -- Template variant of RecordSandboxBackupGeneration; the two exist
@@ -28,14 +61,30 @@ WHERE excluded.completed_at > backup_generation.completed_at
 INSERT INTO backup_generation (template_id, build_id, generation, bucket, completed_at, files)
 VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (template_id, build_id, bucket, generation) WHERE template_id IS NOT NULL
-DO UPDATE SET completed_at = excluded.completed_at, reported_at = now(),
-  -- A coverage-only report (empty files: the outbox seed reconstructs
-  -- no manifest) must never erase a recorded manifest; richer reports
-  -- refresh it.
-  files = CASE WHEN jsonb_array_length(excluded.files) = 0
-               THEN backup_generation.files ELSE excluded.files END
+DO UPDATE SET
+  reported_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+         OR (backup_generation.completed_at > now()
+             AND excluded.completed_at < backup_generation.completed_at)
+      THEN now()
+    ELSE backup_generation.reported_at END,
+  completed_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+      THEN excluded.completed_at
+    WHEN backup_generation.completed_at > now()
+         AND excluded.completed_at < backup_generation.completed_at
+      THEN excluded.completed_at
+    ELSE backup_generation.completed_at END,
+  files = CASE
+    WHEN jsonb_array_length(excluded.files) = 0
+      THEN backup_generation.files
+    WHEN jsonb_path_exists(backup_generation.files, '$[*].object')
+      THEN backup_generation.files
+    ELSE excluded.files END
 WHERE excluded.completed_at > backup_generation.completed_at
-   OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at);
+   OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
+   OR (jsonb_path_exists(excluded.files, '$[*].object')
+       AND NOT jsonb_path_exists(backup_generation.files, '$[*].object'));
 
 -- name: LatestSandboxBackup :one
 -- Freshness bounds future timestamps at read instead of rewriting them
@@ -83,12 +132,30 @@ SELECT id, status, updated_at FROM sandbox WHERE id = $1 FOR UPDATE;
 -- contents are possible), so the report must match EVERY recorded row.
 -- Pause-time manifests are vmstate-only today; rows tighten the match
 -- automatically as richer manifests appear.
-SELECT s.id AS snapshot_id, am.file_name, am.sha256
+SELECT s.id AS snapshot_id, s.generation AS snapshot_generation,
+       COALESCE(s.pause_token, '') AS pause_token, am.file_name, am.sha256
 FROM snapshot s
 JOIN artifact_manifest am ON am.snapshot_id = s.id
 WHERE s.sandbox_id = $1
   AND s.generation = (SELECT MAX(generation) FROM snapshot WHERE sandbox_id = $1)
 ORDER BY am.file_name;
+
+-- name: MarkSandboxBackupCovered :exec
+-- Persists the report handler's identity verdict, verified under the
+-- sandbox row lock: either the report's pause_token equals the head
+-- snapshot's (STRONG — names the exact pause), or a tokenless report's
+-- manifest matched every recorded digest (legacy fallback).
+-- (snapshot_id, snapshot_generation) names the exact pause — the
+-- generation counter distinguishes pauses even while the legacy
+-- finalize reuses one snapshot row id. Written in the report's
+-- transaction, so the coverage row and its identity link commit
+-- together.
+UPDATE backup_generation
+SET covered_snapshot_id = sqlc.arg(snapshot_id),
+    covered_snapshot_generation = sqlc.arg(snapshot_generation)
+WHERE sandbox_id = sqlc.arg(sandbox_id)
+  AND bucket = sqlc.arg(bucket)
+  AND generation = sqlc.arg(generation);
 
 -- name: SetSnapshotSizeBytes :exec
 UPDATE snapshot SET size_bytes = $2 WHERE id = $1;

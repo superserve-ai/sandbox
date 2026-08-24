@@ -5,10 +5,12 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -509,5 +511,309 @@ func TestIntegration_HostIdentityOptIn(t *testing.T) {
 	// From here, description-less heartbeats are rejected.
 	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{"capabilities":[]}`); w.Code != http.StatusConflict {
 		t.Fatalf("legacy heartbeat on bound row = %d, want 409", w.Code)
+	}
+}
+
+// UNBACKED counts the paused sandboxes whose ONLY copy is the host's local
+// disk — no durable backup generation anywhere. A durable copy moves a
+// sandbox out of the count; it is the number that must be zero before
+// retiring a machine is even discussable.
+func TestIntegration_HostList_CountsUnbackedPaused(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
+	r := newRouter(t)
+	hostID := "ubk-" + strings.ToLower(t.Name()[len(t.Name())-8:])
+	cleanupHost(t, hostID)
+
+	if w := hostHeartbeat(t, r, "itok-hostreg", hostID, `{`+hostDescription+`}`); w.Code != http.StatusOK {
+		t.Fatalf("seed host: %d %s", w.Code, w.Body.String())
+	}
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"unbacked-probe"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := mustJSON(t, cw)["id"].(string)
+	// Pause with a head snapshot row, its pause-time manifest, AND the
+	// pause token FinalizePause stores: reports naming that token match
+	// the STRONG identity path; tokenless reports fall back to content.
+	shaA, shaB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	if _, err := testPool.Exec(ctx,
+		`WITH snap AS (
+		   INSERT INTO snapshot (sandbox_id, team_id, path, trigger, pause_token)
+		   SELECT id, team_id, '/snap/rootfs', 'pause', 'tok-1' FROM sandbox WHERE id = $1
+		   RETURNING id
+		 ),
+		 manifest AS (
+		   INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256)
+		   SELECT id, 'vmstate.snap', '/snap/vmstate.snap', 1, $3 FROM snap
+		 )
+		 UPDATE sandbox SET status = 'paused', host_id = $2,
+		        snapshot_id = (SELECT id FROM snap)
+		 WHERE id = $1`,
+		sandboxID, hostID, shaA); err != nil {
+		t.Fatalf("pin paused sandbox: %v", err)
+	}
+
+	counts := func() (paused, unbacked int32) {
+		// The scoped form drain polling uses: only the target host's row
+		// comes back, so the counts asserted below are also proof the
+		// filter path computes them correctly.
+		req := httptest.NewRequest("GET", "/internal/hosts?id="+hostID, nil)
+		req.Header.Set("Authorization", "Bearer optok-hostreg")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("list: %d %s", w.Code, w.Body.String())
+		}
+		var out struct {
+			Hosts []struct {
+				ID             string `json:"id"`
+				PausedCount    int32  `json:"paused_count"`
+				PausedUnbacked int32  `json:"paused_unbacked_count"`
+			} `json:"hosts"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(out.Hosts) != 1 || out.Hosts[0].ID != hostID {
+			t.Fatalf("filtered list returned %d hosts, want exactly %s", len(out.Hosts), hostID)
+		}
+		return out.Hosts[0].PausedCount, out.Hosts[0].PausedUnbacked
+	}
+
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("before backup: paused=%d unbacked=%d, want 1/1", paused, unbacked)
+	}
+
+	// Reports go through the REAL handler: coverage is only ever linked to
+	// a pause by ReportHostBackup's under-lock identity match, and this
+	// test must exercise that code, not hand-write its conclusions.
+	report := func(genKey, vmstateSHA, rootfsSHA, pauseToken string) {
+		t.Helper()
+		tokenField := ""
+		if pauseToken != "" {
+			tokenField = fmt.Sprintf(`"pause_token":%q,`, pauseToken)
+		}
+		body := fmt.Sprintf(`{"sandbox_id":%q,"generation":%q,"bucket":"cell-bucket","completed_at":%q,%s"files":[{"name":"vmstate.snap","size_bytes":1,"sha256":%q},{"name":"rootfs.ext4","size_bytes":1,"sha256":%q}]}`,
+			sandboxID, genKey, time.Now().UTC().Format(time.RFC3339), tokenField, vmstateSHA, rootfsSHA)
+		req := httptest.NewRequest("POST", "/internal/hosts/"+hostID+"/backups", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer itok-hostreg")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("report backup: %d %s", w.Code, w.Body.String())
+		}
+	}
+	shaX, shaY := strings.Repeat("d", 64), strings.Repeat("e", 64)
+
+	// A verified report carrying this pause's token arrives: the handler
+	// links the generation via the STRONG identity path and the sandbox
+	// leaves the unbacked class.
+	report(strings.Repeat("1", 64), shaA, shaX, "tok-1")
+	if paused, unbacked := counts(); paused != 1 || unbacked != 0 {
+		t.Fatalf("after backup: paused=%d unbacked=%d, want 1/0", paused, unbacked)
+	}
+
+	// Resume + re-pause: the finalize rewrites the manifest digests,
+	// advances the snapshot's generation counter (legacy mode reuses the
+	// row id — the counter is what names the pause), and stores the new
+	// pause's token. Every earlier link now points at a pause that no
+	// longer exists.
+	if _, err := testPool.Exec(ctx,
+		`WITH snap AS (
+		   UPDATE snapshot SET generation = generation + 1, pause_token = 'tok-2'
+		   WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)
+		   RETURNING id
+		 )
+		 UPDATE artifact_manifest SET sha256 = $2
+		 WHERE snapshot_id IN (SELECT id FROM snap)`,
+		sandboxID, shaB); err != nil {
+		t.Fatalf("advance to a new pause: %v", err)
+	}
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("after re-pause: paused=%d unbacked=%d, want 1/1 (stale link must not count as coverage)", paused, unbacked)
+	}
+
+	// The previous pause's report, delayed in the outbox, redelivers
+	// AFTER the re-pause. Token AND content both mismatch; nothing links.
+	report(strings.Repeat("1", 64), shaA, shaX, "tok-1")
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("after delayed stale report: paused=%d unbacked=%d, want 1/1 (late delivery of old content must not fake coverage)", paused, unbacked)
+	}
+
+	// The collision attack the token exists to stop: a delayed report
+	// whose CONTENT coincides with the current manifest (pause-time
+	// manifests are vmstate-only, so only the vmstate digest must
+	// collide) but whose token names the previous pause. Content says
+	// covered; the token conflict vetoes it.
+	report(strings.Repeat("3", 64), shaB, shaX, "tok-1")
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("after token-conflict report: paused=%d unbacked=%d, want 1/1 (digest coincidence must not fake coverage)", paused, unbacked)
+	}
+
+	// A tokenless report against a TOKENED snapshot: rejected. A tokened
+	// pause's own report always carries the echoed token, so a tokenless
+	// one is necessarily some other pause's — content match or not.
+	report(strings.Repeat("2", 64), shaB, shaY, "")
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("after tokenless report on tokened snapshot: paused=%d unbacked=%d, want 1/1", paused, unbacked)
+	}
+
+	// The current pause's own report, carrying its token: covered.
+	report(strings.Repeat("4", 64), shaB, shaY, "tok-2")
+	if paused, unbacked := counts(); paused != 1 || unbacked != 0 {
+		t.Fatalf("after current-pause backup: paused=%d unbacked=%d, want 1/0", paused, unbacked)
+	}
+
+	// A pause finalized WITHOUT a token (older daemon, or an old
+	// control-plane replica): its tokenless report must stay unlinked
+	// even on a perfect content match. There is no tokenless fallback —
+	// vmstate-only manifests are the same evidence the migration refused
+	// to backfill from, and the count over-reports until the sandbox
+	// pauses through the token path.
+	if _, err := testPool.Exec(ctx,
+		`WITH snap AS (
+		   UPDATE snapshot SET generation = generation + 1, pause_token = NULL
+		   WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)
+		   RETURNING id
+		 )
+		 UPDATE artifact_manifest SET sha256 = $2
+		 WHERE snapshot_id IN (SELECT id FROM snap)`,
+		sandboxID, strings.Repeat("f", 64)); err != nil {
+		t.Fatalf("advance to a tokenless pause: %v", err)
+	}
+	report(strings.Repeat("5", 64), strings.Repeat("f", 64), shaY, "")
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("after tokenless content-matched report: paused=%d unbacked=%d, want 1/1 (no tokenless links)", paused, unbacked)
+	}
+
+	// The rolling-deploy hazard: an old replica's legacy finalize does
+	// not mention pause_token, so the PREVIOUS pause's token would ride
+	// under the rewritten artifacts. First give the row a token again
+	// (a new-replica pause)...
+	if _, err := testPool.Exec(ctx,
+		`WITH snap AS (
+		   UPDATE snapshot SET generation = generation + 1, pause_token = 'tok-3'
+		   WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)
+		   RETURNING id
+		 )
+		 UPDATE artifact_manifest SET sha256 = $2
+		 WHERE snapshot_id IN (SELECT id FROM snap)`,
+		sandboxID, shaB); err != nil {
+		t.Fatalf("tokened pause: %v", err)
+	}
+	// ...then the old-writer signature: generation advances, the token
+	// column untouched. The migration's trigger must clear it. The
+	// manifest keeps the SAME vmstate digest — the collision case where
+	// the old pause's delayed report would otherwise match both the
+	// preserved token and the vmstate-only manifest.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE snapshot SET generation = generation + 1
+		 WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)`,
+		sandboxID); err != nil {
+		t.Fatalf("simulate legacy-upsert: %v", err)
+	}
+	var storedToken *string
+	if err := testPool.QueryRow(ctx,
+		`SELECT pause_token FROM snapshot WHERE id = (SELECT snapshot_id FROM sandbox WHERE id = $1)`,
+		sandboxID).Scan(&storedToken); err != nil {
+		t.Fatalf("read token: %v", err)
+	}
+	if storedToken != nil {
+		t.Fatalf("preserved token survived a legacy-style generation advance: %q", *storedToken)
+	}
+	// The old pause's delayed report: its token matches what the row
+	// WOULD have preserved, and its vmstate digest collides with the
+	// unchanged manifest. Cleared token means asymmetry — refused.
+	report(strings.Repeat("6", 64), shaB, shaY, "tok-3")
+	if paused, unbacked := counts(); paused != 1 || unbacked != 1 {
+		t.Fatalf("delayed report linked through a preserved token: paused=%d unbacked=%d, want 1/1", paused, unbacked)
+	}
+}
+
+// The stale-build reap is the bound on requeued dispatch retries, so it
+// must be complete: a timed-out build fails its never-ready template too
+// (a template stuck in 'building' forever is not a bound), while a
+// template that already reached 'ready' keeps its status.
+
+// The stale-build reap is the bound on requeued dispatch retries, so it
+// must be complete: a timed-out build fails its never-ready template too
+// (a template stuck in 'building' forever is not a bound), while a
+// template that already reached 'ready' keeps its status.
+func TestIntegration_ReapStaleBuilds_FailsNeverReadyTemplate(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	t.Setenv("INTERNAL_API_TOKEN", "itok-hostreg")
+	t.Setenv("OPERATOR_API_TOKEN", "optok-hostreg")
+	r := newRouter(t)
+
+	tw := do(r, "POST", "/templates", apiKey,
+		`{"name":"reap-template-probe","build_spec":{"from":"debian:12-slim","steps":[]}}`)
+	if tw.Code != http.StatusAccepted {
+		t.Fatalf("create template: %d %s", tw.Code, tw.Body.String())
+	}
+	templateID := mustJSON(t, tw)["id"].(string)
+
+	// Age the pending build past the reap's pending timeout.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE template_build SET created_at = now() - interval '10 minutes' WHERE template_id = $1`,
+		templateID); err != nil {
+		t.Fatalf("age build: %v", err)
+	}
+
+	reaped, err := testQueries.ReapStaleBuilds(ctx, db.ReapStaleBuildsParams{
+		Limit: 20, PendingTimeoutSeconds: 120, BuildTimeoutSeconds: 1800,
+	})
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	found := false
+	for _, row := range reaped {
+		if row.TemplateID.String() == templateID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("aged build not reaped (reaped %d rows)", len(reaped))
+	}
+
+	var buildStatus, templateStatus string
+	if err := testPool.QueryRow(ctx,
+		`SELECT tb.status::text, t.status::text FROM template_build tb
+		 JOIN template t ON t.id = tb.template_id WHERE tb.template_id = $1`,
+		templateID).Scan(&buildStatus, &templateStatus); err != nil {
+		t.Fatalf("read statuses: %v", err)
+	}
+	if buildStatus != "failed" || templateStatus != "failed" {
+		t.Fatalf("after reap: build=%s template=%s, want failed/failed", buildStatus, templateStatus)
+	}
+
+	// A template that already reached 'ready' keeps it when a later build
+	// times out.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE template SET status = 'ready', error_message = NULL WHERE id = $1`,
+		templateID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`UPDATE template_build SET status = 'pending', finalized_at = NULL,
+		 created_at = now() - interval '10 minutes' WHERE template_id = $1`,
+		templateID); err != nil {
+		t.Fatalf("stage second stale build: %v", err)
+	}
+	if _, err := testQueries.ReapStaleBuilds(ctx, db.ReapStaleBuildsParams{
+		Limit: 20, PendingTimeoutSeconds: 120, BuildTimeoutSeconds: 1800,
+	}); err != nil {
+		t.Fatalf("second reap: %v", err)
+	}
+	if err := testPool.QueryRow(ctx,
+		`SELECT status::text FROM template WHERE id = $1`, templateID).Scan(&templateStatus); err != nil {
+		t.Fatalf("read template: %v", err)
+	}
+	if templateStatus != "ready" {
+		t.Fatalf("ready template after build timeout = %s, want ready untouched", templateStatus)
 	}
 }

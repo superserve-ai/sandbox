@@ -93,11 +93,11 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 	ctx := c.Request.Context()
 	registered := false
 	reclaimed := false
-	beat := func(q *db.Queries) (status, prevStatus string, _ error) {
+	beat := func(q *db.Queries) (status, prevStatus string, lastHeartbeatAt pgtype.Timestamptz, _ error) {
 		host, err := q.GetHostForUpdate(ctx, hostID)
 		if err == pgx.ErrNoRows {
 			if !req.describesHost() {
-				return "", "", errHostNotRegistered
+				return "", "", pgtype.Timestamptz{}, errHostNotRegistered
 			}
 			created, err := q.RegisterHost(ctx, db.RegisterHostParams{
 				ID:                hostID,
@@ -108,18 +108,18 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 				CapacityVcpus:     req.CapacityVcpus,
 			})
 			if err != nil {
-				return "", "", err
+				return "", "", pgtype.Timestamptz{}, err
 			}
 			registered = true
 			if err := q.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
 				HostID: hostID, Capabilities: capabilities,
 			}); err != nil {
-				return "", "", err
+				return "", "", pgtype.Timestamptz{}, err
 			}
-			return created.Status, created.Status, nil
+			return created.Status, created.Status, created.LastHeartbeatAt, nil
 		}
 		if err != nil {
-			return "", "", err
+			return "", "", pgtype.Timestamptz{}, err
 		}
 
 		// Once a row is identity-bound, description-less heartbeats are
@@ -129,14 +129,14 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		// capabilities on a row that now belongs to another machine —
 		// and its reconciler would keep operating under an id it lost.
 		if host.IdentityBound && !req.describesHost() {
-			return "", "", errHostIdentityRequired
+			return "", "", pgtype.Timestamptz{}, errHostIdentityRequired
 		}
 
 		if req.VMDAddr != "" && req.VMDAddr != host.VmdAddr {
 			holderAlive := host.LastHeartbeatAt.Valid &&
 				time.Since(host.LastHeartbeatAt.Time) < heartbeatTimeout
 			if holderAlive {
-				return "", "", errHostIdentityConflict
+				return "", "", pgtype.Timestamptz{}, errHostIdentityConflict
 			}
 			// Claiming an existing identity from a new address is a
 			// re-registration: it rewrites the whole row, so it needs the
@@ -144,7 +144,7 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 			// region, and heartbeating without reclaiming would mark a row
 			// live while its address points at the silent old machine.
 			if !req.describesHost() {
-				return "", "", errHostPartialDescription
+				return "", "", pgtype.Timestamptz{}, errHostPartialDescription
 			}
 			if err := q.UpdateHostAddresses(ctx, db.UpdateHostAddressesParams{
 				ID:                hostID,
@@ -154,7 +154,7 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 				CapacityMemoryMib: req.CapacityMemoryMib,
 				CapacityVcpus:     req.CapacityVcpus,
 			}); err != nil {
-				return "", "", err
+				return "", "", pgtype.Timestamptz{}, err
 			}
 			reclaimed = true
 			log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
@@ -163,35 +163,36 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 
 		row, err := q.UpdateHostHeartbeat(ctx, hostID)
 		if err != nil {
-			return "", "", err
+			return "", "", pgtype.Timestamptz{}, err
 		}
 		// Missing capabilities is an explicit empty replacement. This clears a
 		// stale attestation immediately when VMD can no longer verify its proxy.
 		if err := q.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
 			HostID: hostID, Capabilities: capabilities,
 		}); err != nil {
-			return "", "", err
+			return "", "", pgtype.Timestamptz{}, err
 		}
 		// Opt-in: a complete description at the row's current address binds
 		// the identity, so later description-less heartbeats for this id
 		// are rejected. (Registration and reclaim bind in their own writes.)
 		if !host.IdentityBound && req.describesHost() && req.VMDAddr == host.VmdAddr {
 			if err := q.BindHostIdentity(ctx, hostID); err != nil {
-				return "", "", err
+				return "", "", pgtype.Timestamptz{}, err
 			}
 		}
-		return row.Status, row.PrevStatus, nil
+		return row.Status, row.PrevStatus, row.LastHeartbeatAt, nil
 	}
 
 	var status, prevStatus string
+	var lastHeartbeatAt pgtype.Timestamptz
 	var err error
 	if h.Pool == nil {
-		status, prevStatus, err = beat(h.DB)
+		status, prevStatus, lastHeartbeatAt, err = beat(h.DB)
 	} else {
 		var tx pgx.Tx
 		if tx, err = h.Pool.Begin(ctx); err == nil {
 			defer tx.Rollback(ctx)
-			if status, prevStatus, err = beat(h.DB.WithTx(tx)); err == nil {
+			if status, prevStatus, lastHeartbeatAt, err = beat(h.DB.WithTx(tx)); err == nil {
 				err = tx.Commit(ctx)
 			}
 		}
@@ -240,6 +241,10 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 			h.Scheduler.Invalidate()
 		}
 	}
+	log.Debug().Str("host_id", hostID).Strs("capabilities", capabilities).
+		Interface("last_heartbeat_at", timestamptzString(lastHeartbeatAt)).
+		Str("status", status).Str("prev_status", prevStatus).
+		Msg("host heartbeat persisted")
 	if prevStatus == "unhealthy" && status == "active" {
 		// The heartbeat just recovered this host; drop the scheduler's cached
 		// list so its capacity is usable now, not after the cache TTL.
@@ -307,9 +312,14 @@ func (h *Handlers) HostUpdateStatus(c *gin.Context) {
 }
 
 // HostList handles GET /internal/hosts — the operator view behind
-// `hostctl list`: every host with liveness and sandbox counts.
+// `hostctl list`: every host with liveness and sandbox counts. `?id=` scopes
+// the counts to one host so drain polling doesn't recompute them fleet-wide.
 func (h *Handlers) HostList(c *gin.Context) {
-	rows, err := h.DB.ListHostsAdmin(c.Request.Context())
+	var idFilter *string
+	if id := c.Query("id"); id != "" {
+		idFilter = &id
+	}
+	rows, err := h.DB.ListHostsAdmin(c.Request.Context(), idFilter)
 	if err != nil {
 		log.Error().Err(err).Msg("ListHostsAdmin failed")
 		respondError(c, ErrInternal)
@@ -329,6 +339,7 @@ func (h *Handlers) HostList(c *gin.Context) {
 		TransitionalCount int32   `json:"transitional_count"`
 		PausedCount       int32   `json:"paused_count"`
 		BuildingCount     int32   `json:"building_count"`
+		PausedUnbacked    int32   `json:"paused_unbacked_count"`
 	}
 	hosts := make([]hostView, 0, len(rows))
 	for _, r := range rows {
@@ -341,6 +352,7 @@ func (h *Handlers) HostList(c *gin.Context) {
 			TransitionalCount: r.TransitionalCount,
 			PausedCount:       r.PausedCount,
 			BuildingCount:     r.BuildingCount,
+			PausedUnbacked:    r.PausedUnbackedCount,
 		}
 		if r.LastHeartbeatAt.Valid {
 			s := r.LastHeartbeatAt.Time.UTC().Format(time.RFC3339)
@@ -349,4 +361,11 @@ func (h *Handlers) HostList(c *gin.Context) {
 		hosts = append(hosts, v)
 	}
 	c.JSON(http.StatusOK, gin.H{"hosts": hosts})
+}
+
+func timestamptzString(ts pgtype.Timestamptz) any {
+	if !ts.Valid {
+		return nil
+	}
+	return ts.Time.Format(time.RFC3339Nano)
 }

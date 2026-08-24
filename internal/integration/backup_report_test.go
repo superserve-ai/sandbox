@@ -286,3 +286,168 @@ func TestIntegration_BackupReport_CoverageOnlyPreservesManifest(t *testing.T) {
 		t.Fatalf("completed_at = %s, want the newer instant kept", completedAt)
 	}
 }
+
+// The files jsonb follows a strict enrichment order, because the paths
+// are what a lifecycle GC reasons from: a pathless report (an older
+// host re-verifying the same content-addressed generation) refreshes
+// freshness without demoting recorded paths; a path-bearing report
+// enriches a pathless row even at an identical pinned instant (a
+// rollout-window fallback can land the pathless copy first) without
+// regressing freshness; and once paths are recorded they are frozen,
+// since the immutable bucket manifest they mirror can never change.
+func TestIntegration_BackupReport_ObjectPathEnrichmentOrder(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	t.Setenv("INTERNAL_API_TOKEN", "itok-paths")
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"path-guard"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	diskObj := "sandboxes/" + sid + "/" + genKey + "/rootfs.ext4.pabc123"
+	send := func(body string) {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/internal/hosts/host-1/backups", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer itok-paths")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("report: %d %s", w.Code, w.Body.String())
+		}
+	}
+	readFiles := func() string {
+		t.Helper()
+		var files string
+		if err := testPool.QueryRow(ctx,
+			`SELECT files::text FROM backup_generation WHERE sandbox_id = $1`, sid).Scan(&files); err != nil {
+			t.Fatal(err)
+		}
+		return files
+	}
+
+	send(`{"sandbox_id":"` + sid + `","generation":"` + genKey + `",` +
+		`"bucket":"cell-bucket","completed_at":"2026-08-11T10:00:00Z","files":[` +
+		`{"name":"rootfs.ext4","size_bytes":4096,"sha256":"` + diskSHA + `","object":"` + diskObj + `"}]}`)
+	if files := readFiles(); !strings.Contains(files, "rootfs.ext4.pabc123") {
+		t.Fatalf("path-bearing report not recorded: files = %s", files)
+	}
+
+	// The pathless redelivery: same generation, newer instant, no paths.
+	send(`{"sandbox_id":"` + sid + `","generation":"` + genKey + `",` +
+		`"bucket":"cell-bucket","completed_at":"2026-08-11T11:00:00Z","files":[` +
+		`{"name":"rootfs.ext4","size_bytes":4096,"sha256":"` + diskSHA + `"}]}`)
+	if files := readFiles(); !strings.Contains(files, "rootfs.ext4.pabc123") {
+		t.Fatalf("pathless redelivery erased the object paths: files = %s", files)
+	}
+
+	// Recorded paths are frozen: a newer report claiming different
+	// (structurally valid) fingerprints refreshes freshness only, since
+	// nothing conforming can rename an immutable generation's objects.
+	send(`{"sandbox_id":"` + sid + `","generation":"` + genKey + `",` +
+		`"bucket":"cell-bucket","completed_at":"2026-08-11T12:00:00Z","files":[` +
+		`{"name":"rootfs.ext4","size_bytes":4096,"sha256":"` + diskSHA + `","object":"` + diskObj + `2"}]}`)
+	files := readFiles()
+	if strings.Contains(files, "rootfs.ext4.pabc1232") || !strings.Contains(files, "rootfs.ext4.pabc123") {
+		t.Fatalf("recorded paths were not frozen: files = %s", files)
+	}
+	var completedAt string
+	if err := testPool.QueryRow(ctx,
+		`SELECT completed_at::text FROM backup_generation WHERE sandbox_id = $1`, sid).Scan(&completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(completedAt, "12:00:00") {
+		t.Fatalf("completed_at = %s, want freshness refreshed past the frozen files", completedAt)
+	}
+
+	// Enrichment at an identical pinned instant: the rollout-window
+	// fallback landed a pathless copy of this verification first, and
+	// the rich redelivery carries the same completed_at. The paths must
+	// land without moving completed_at.
+	gen2 := strings.Repeat("f0", 32)
+	disk2 := "sandboxes/" + sid + "/" + gen2 + "/rootfs.ext4.pdef456"
+	send(`{"sandbox_id":"` + sid + `","generation":"` + gen2 + `",` +
+		`"bucket":"cell-bucket","completed_at":"2026-08-11T10:30:00Z","files":[` +
+		`{"name":"rootfs.ext4","size_bytes":4096,"sha256":"` + diskSHA + `"}]}`)
+	// Pin reported_at so the enrichment below provably leaves the
+	// freshness cap where the first receipt set it.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE backup_generation SET reported_at = '2026-08-11T09:00:00Z' WHERE sandbox_id = $1 AND generation = $2`,
+		sid, gen2); err != nil {
+		t.Fatal(err)
+	}
+	send(`{"sandbox_id":"` + sid + `","generation":"` + gen2 + `",` +
+		`"bucket":"cell-bucket","completed_at":"2026-08-11T10:30:00Z","files":[` +
+		`{"name":"rootfs.ext4","size_bytes":4096,"sha256":"` + diskSHA + `","object":"` + disk2 + `"}]}`)
+	var reportedAt string
+	if err := testPool.QueryRow(ctx,
+		`SELECT files::text, completed_at::text, reported_at::text FROM backup_generation WHERE sandbox_id = $1 AND generation = $2`,
+		sid, gen2).Scan(&files, &completedAt, &reportedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(files, "rootfs.ext4.pdef456") {
+		t.Fatalf("equal-instant rich redelivery did not enrich: files = %s", files)
+	}
+	if !strings.Contains(completedAt, "10:30:00") {
+		t.Fatalf("completed_at = %s, want the pinned instant untouched by enrichment", completedAt)
+	}
+	if !strings.Contains(reportedAt, "09:00:00") {
+		t.Fatalf("reported_at = %s, want the freshness cap untouched by enrichment", reportedAt)
+	}
+}
+
+// A report landing while the sandbox is in a TRANSITIONAL status —
+// 'pausing' on the normal path, 'resuming' while pauseAndRevert
+// re-pauses a failed resume — must be deferred (503, entry stays
+// outboxed): evaluated in that window it would match the PREVIOUS
+// snapshot's identity, fail to link, and clear the outbox before the
+// pause it covers exists. A stale transition proceeds so a stranded
+// sandbox cannot wedge the outbox.
+func TestIntegration_BackupReport_DefersDuringTransitionalStatus(t *testing.T) {
+	ctx := context.Background()
+	_, apiKey := seedTeamAndKey(t)
+	t.Setenv("INTERNAL_API_TOKEN", "itok-report")
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"report-defer"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+
+	deliver := func() int {
+		report := `{"sandbox_id":"` + sid + `","generation":"` + genKey + `",` +
+			`"bucket":"cell-bucket","completed_at":"2026-08-11T10:00:00Z","files":[` +
+			`{"name":"rootfs.ext4","size_bytes":4096,"sha256":"` + diskSHA + `"},` +
+			`{"name":"vmstate.snap","size_bytes":128,"sha256":"` + vmstateSHA + `"}]}`
+		req := httptest.NewRequest("POST", "/internal/hosts/host-1/backups", strings.NewReader(report))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer itok-report")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	for _, status := range []string{"pausing", "resuming"} {
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET status = $2, updated_at = now() WHERE id = $1`,
+			sandboxID, status); err != nil {
+			t.Fatalf("force %s: %v", status, err)
+		}
+		if code := deliver(); code != http.StatusServiceUnavailable {
+			t.Fatalf("report during fresh %q = %d, want 503 (deferred)", status, code)
+		}
+		// Stale transition: the guard yields and the report proceeds.
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET updated_at = now() - interval '20 minutes' WHERE id = $1`,
+			sandboxID); err != nil {
+			t.Fatalf("age %s: %v", status, err)
+		}
+		if code := deliver(); code != http.StatusOK {
+			t.Fatalf("report during stale %q = %d, want 200", status, code)
+		}
+	}
+}

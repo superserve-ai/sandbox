@@ -144,8 +144,60 @@ func TestUploaderShipsGenerationAndAcks(t *testing.T) {
 	if len(verified) != 1 || verified[0].Generation != "gen-abc" {
 		t.Fatalf("verified hook = %+v", verified)
 	}
+	// The outboxed completion carries the finalized manifest whose object
+	// paths are exactly the store keys the upload wrote, fingerprints
+	// included: this is what lets a DB-driven GC name objects without
+	// listing the bucket.
+	if !verified[0].FilesFinal || len(verified[0].Files) != 2 {
+		t.Fatalf("finalized outbox files = %+v", verified[0].Files)
+	}
+	if got := verified[0].Files[0].Object; got != overlayObj {
+		t.Fatalf("recorded overlay object = %q, want %q", got, overlayObj)
+	}
+	if got := verified[0].Files[1].Object; got != vmstateObj {
+		t.Fatalf("recorded vmstate object = %q, want %q", got, vmstateObj)
+	}
+	for _, f := range verified[0].Files {
+		if _, ok := store.objects[f.Object]; !ok {
+			t.Fatalf("recorded object %q was never written to the store", f.Object)
+		}
+	}
 	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
 		t.Fatalf("task not acked: %v", counts)
+	}
+}
+
+// A completion whose manifest create deduped reports its coverage
+// WITHOUT object paths: an earlier attempt's manifest is the published
+// restore authority and may name different packing fingerprints (a
+// retry over relaid files), so the DB must never claim paths that
+// manifest never blessed. The rest of the manifest facts still travel.
+func TestDedupedManifestReportsNoObjectPaths(t *testing.T) {
+	j, _ := testJournal(t)
+	store := newMemStore()
+	var verified []Task
+	u := &Uploader{Journal: j, Store: store, OnVerified: func(task Task) error { verified = append(verified, task); return nil }}
+
+	task := writeTask(t, t.TempDir())
+	// An earlier attempt already published this generation's manifest.
+	store.objects["sandboxes/sb-1/gen-abc/manifest.json"] = []byte(`{"generation":"gen-abc"}`)
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	worked, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute))
+	if err != nil || !worked {
+		t.Fatalf("drain: worked=%v err=%v", worked, err)
+	}
+	if len(verified) != 1 || !verified[0].FilesFinal || len(verified[0].Files) != 2 {
+		t.Fatalf("verified = %+v, want one finalized completion", verified)
+	}
+	for _, f := range verified[0].Files {
+		if f.Object != "" {
+			t.Fatalf("deduped-manifest completion claims object %q; the published manifest is the authority", f.Object)
+		}
+		if f.SHA256 == "" || f.Size == 0 {
+			t.Fatalf("finalized entry lost manifest facts: %+v", f)
+		}
 	}
 }
 
@@ -890,6 +942,111 @@ func TestAbandonedAckLeavesNoNotification(t *testing.T) {
 	}
 }
 
+// Outbox entries are durable BoltDB records, so the object-path field is
+// additive: a new entry round-trips its recorded paths, and an entry a
+// pre-upgrade binary wrote (no object field anywhere) still decodes and
+// delivers with the field empty.
+func TestOutboxRoundTripsObjectPathsAndDecodesLegacyEntries(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb-new", Generation: "gen-new", EnqueuedAt: time.Unix(1, 0),
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/staging/rootfs.ext4", SHA256: "aa", Size: 4}}}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	// Mirror drainOne's completion ack: the outbox copy carries the
+	// finalized manifest with the exact object paths the upload wrote.
+	ackTask := task
+	ackTask.Files = []TaskFile{{Name: "rootfs.ext4", SHA256: "aa", Size: 4,
+		Object: "sandboxes/sb-new/gen-new/rootfs.ext4.pdeadbeef"}}
+	ackTask.FilesFinal = true
+	if _, err := j.Ack(ackTask, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// A pre-upgrade outbox entry, byte-for-byte as an older binary
+	// serialized it.
+	legacyTask := Task{SandboxID: "sb-old", Generation: "gen-old", VerifiedBucket: "bucket-a"}
+	legacy := []byte(`{"sandbox_id":"sb-old","generation":"gen-old",` +
+		`"files":[{"name":"rootfs.ext4","path":"/staging/old.ext4","sha256":"bb","size":9}],` +
+		`"files_final":true,"verified_bucket":"bucket-a","verified_at":"2026-08-01T00:00:00Z"}`)
+	if err := j.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(outboxBucket).Put(completionKey("bucket-a", legacyTask), legacy)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := j.PendingNotifications(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("outbox = %+v, want both entries", pending)
+	}
+	byOwner := map[string]Task{}
+	for _, p := range pending {
+		byOwner[p.SandboxID] = p
+	}
+	fresh := byOwner["sb-new"]
+	if !fresh.FilesFinal || len(fresh.Files) != 1 ||
+		fresh.Files[0].Object != "sandboxes/sb-new/gen-new/rootfs.ext4.pdeadbeef" {
+		t.Fatalf("upgraded entry = %+v, want the recorded object path back", fresh.Files)
+	}
+	old := byOwner["sb-old"]
+	if len(old.Files) != 1 || old.Files[0].SHA256 != "bb" || old.Files[0].Object != "" {
+		t.Fatalf("legacy entry = %+v, want intact files with no object path", old.Files)
+	}
+	if old.VerifiedBucket != "bucket-a" || old.VerifiedAt.IsZero() {
+		t.Fatalf("legacy entry lost pinned fields: %+v", old)
+	}
+}
+
+// An unchanged re-pause whose manifest create deduped acks a PATHLESS
+// completion for a generation whose path-bearing signal may still sit
+// undelivered in the outbox (the control plane was unreachable). The
+// re-ack must refresh the instant without demoting the richer manifest,
+// mirroring the control plane's own no-demotion rule.
+func TestReAckDoesNotDemotePathBearingOutboxEntry(t *testing.T) {
+	j, _ := testJournal(t)
+	task := Task{SandboxID: "sb", Generation: "gen", EnqueuedAt: time.Unix(1, 0),
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/staging/r", SHA256: "aa", Size: 4}}}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	rich := task
+	rich.Files = []TaskFile{{Name: "rootfs.ext4", SHA256: "aa", Size: 4,
+		Object: "sandboxes/sb/gen/rootfs.ext4.pabc123"}}
+	rich.FilesFinal = true
+	if _, err := j.Ack(rich, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// The re-pause re-enqueues the same generation; its manifest create
+	// dedupes, so this completion carries no paths.
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	pathless := task
+	pathless.Files = []TaskFile{{Name: "rootfs.ext4", SHA256: "aa", Size: 4}}
+	pathless.FilesFinal = true
+	if _, err := j.Ack(pathless, "bucket-a", true); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := j.PendingNotifications(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("outbox = %+v, want the merged entry", pending)
+	}
+	if got := pending[0].Files[0].Object; got != "sandboxes/sb/gen/rootfs.ext4.pabc123" {
+		t.Fatalf("re-ack demoted the outboxed manifest: %+v", pending[0].Files)
+	}
+	if !pending[0].FilesFinal || pending[0].VerifiedAt.IsZero() {
+		t.Fatalf("merged entry lost finalization or its instant: %+v", pending[0])
+	}
+}
+
 // A verification write that never reached disk must not ride into the
 // Nack inside the task's VerifiedObjects: the retry would then trust a
 // dedupe against durable history that does not exist.
@@ -922,7 +1079,7 @@ func TestFailedVerificationWriteNotCarriedIntoTask(t *testing.T) {
 	db.Close()
 
 	u := &Uploader{Journal: j, Store: newMemStore()}
-	_, _, err = u.uploadFile(context.Background(), &task, task.Files[0])
+	_, _, _, err = u.uploadFile(context.Background(), &task, task.Files[0])
 	if err == nil {
 		t.Fatal("uploadFile succeeded despite a failed verification write")
 	}
@@ -1247,6 +1404,33 @@ func TestOverlayGenerationUploadsSharedBase(t *testing.T) {
 	}
 	if !foundBase {
 		t.Fatalf("manifest lacks the shared base entry: %+v", gen.Files)
+	}
+	// Both outboxed completions record exact object paths, the shared
+	// base under its full bucket-wide bases/ path: including sb-y's,
+	// whose base upload was skipped via the verification history rather
+	// than streamed.
+	pending, err := j.PendingNotifications(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("outbox = %+v, want both completions", pending)
+	}
+	for _, task := range pending {
+		if !task.FilesFinal || len(task.Files) != 2 {
+			t.Fatalf("finalized files for %s = %+v", task.SandboxID, task.Files)
+		}
+		for _, f := range task.Files {
+			if _, ok := store.objects[f.Object]; !ok {
+				t.Fatalf("recorded object %q was never written to the store", f.Object)
+			}
+			if f.Shared != strings.HasPrefix(f.Object, "bases/"+baseSHA+".p") {
+				t.Fatalf("shared flag and object path disagree: %+v", f)
+			}
+			if !f.Shared && !strings.HasPrefix(f.Object, "sandboxes/"+task.SandboxID+"/"+task.Generation+"/") {
+				t.Fatalf("overlay object %q outside its generation prefix", f.Object)
+			}
+		}
 	}
 }
 

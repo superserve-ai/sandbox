@@ -1236,12 +1236,16 @@ WITH target AS (
   FOR UPDATE
 ),
 upserted AS (
-  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
-  SELECT target.id, target.team_id, $3, $4, $5, $6 FROM target
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, pause_token)
+  SELECT target.id, target.team_id, $3, $4, $5, $6,
+         NULLIF($7::text, '') FROM target
   ON CONFLICT (sandbox_id)
   DO UPDATE SET
     path = EXCLUDED.path,
     mem_path = EXCLUDED.mem_path,
+    -- The token names THIS pause; it replaces unconditionally, like the
+    -- artifacts it identifies.
+    pause_token = EXCLUDED.pause_token,
     -- Compatibility mode while snapshot_sandbox_unique exists: history is
     -- still one row, but the generation counter advances so consumers see
     -- monotonic generations before and after the contract-phase index drop.
@@ -1260,11 +1264,11 @@ upserted AS (
   RETURNING snapshot.id AS snap_id
 ),
 fresh AS (
-  SELECT unnest($7::text[]) AS file_name,
-         unnest($8::text[])      AS path,
-         unnest($9::bigint[])    AS size_bytes,
-         unnest($10::text[])    AS sha256,
-         unnest($11::text[]) AS base_path
+  SELECT unnest($8::text[]) AS file_name,
+         unnest($9::text[])      AS path,
+         unnest($10::bigint[])    AS size_bytes,
+         unnest($11::text[])    AS sha256,
+         unnest($12::text[]) AS base_path
 ),
 kept AS (
   INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
@@ -1305,6 +1309,7 @@ type FinalizePauseParams struct {
 	MemPath           *string   `json:"mem_path"`
 	SizeBytes         int64     `json:"size_bytes"`
 	Trigger           string    `json:"trigger"`
+	PauseToken        string    `json:"pause_token"`
 	ManifestFileNames []string  `json:"manifest_file_names"`
 	ManifestPaths     []string  `json:"manifest_paths"`
 	ManifestSizes     []int64   `json:"manifest_sizes"`
@@ -1335,6 +1340,7 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (u
 		arg.MemPath,
 		arg.SizeBytes,
 		arg.Trigger,
+		arg.PauseToken,
 		arg.ManifestFileNames,
 		arg.ManifestPaths,
 		arg.ManifestSizes,
@@ -1360,7 +1366,7 @@ WITH target AS (
   FOR UPDATE
 ),
 inserted AS (
-  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation)
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation, pause_token)
   SELECT target.id, target.team_id, $3, $4,
          -- A non-positive total means the manifest was partial (hash budget
          -- exhausted or a file failed to hash): carry the prior head's
@@ -1372,16 +1378,17 @@ inserted AS (
                              WHERE s.sandbox_id = target.id
                              ORDER BY s.generation DESC LIMIT 1), 0) END,
          $6,
-         COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1
+         COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1,
+         NULLIF($7::text, '')
   FROM target
   RETURNING snapshot.id AS snap_id
 ),
 fresh AS (
-  SELECT unnest($7::text[]) AS file_name,
-         unnest($8::text[])      AS path,
-         unnest($9::bigint[])    AS size_bytes,
-         unnest($10::text[])    AS sha256,
-         unnest($11::text[]) AS base_path
+  SELECT unnest($8::text[]) AS file_name,
+         unnest($9::text[])      AS path,
+         unnest($10::bigint[])    AS size_bytes,
+         unnest($11::text[])    AS sha256,
+         unnest($12::text[]) AS base_path
 ),
 manifested AS (
   INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
@@ -1407,6 +1414,7 @@ type FinalizePauseGenerationParams struct {
 	MemPath           *string     `json:"mem_path"`
 	SizeBytes         interface{} `json:"size_bytes"`
 	Trigger           string      `json:"trigger"`
+	PauseToken        string      `json:"pause_token"`
 	ManifestFileNames []string    `json:"manifest_file_names"`
 	ManifestPaths     []string    `json:"manifest_paths"`
 	ManifestSizes     []int64     `json:"manifest_sizes"`
@@ -1429,6 +1437,7 @@ func (q *Queries) FinalizePauseGeneration(ctx context.Context, arg FinalizePause
 		arg.MemPath,
 		arg.SizeBytes,
 		arg.Trigger,
+		arg.PauseToken,
 		arg.ManifestFileNames,
 		arg.ManifestPaths,
 		arg.ManifestSizes,
@@ -2284,6 +2293,56 @@ func (q *Queries) PublishPort(ctx context.Context, arg PublishPortParams) (Publi
 	var i PublishPortRow
 	err := row.Scan(&i.Port, &i.Access)
 	return i, err
+}
+
+const revertPauseToActive = `-- name: RevertPauseToActive :one
+WITH reverted AS (
+  UPDATE sandbox
+  SET status = 'active', updated_at = now()
+  WHERE sandbox.id = $1
+    AND sandbox.team_id = $2
+    AND sandbox.destroyed_at IS NULL
+    AND sandbox.status = 'pausing'
+  RETURNING id, team_id, vcpu_count, memory_mib
+),
+opened_active AS (
+  INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
+  SELECT r.id, r.team_id, $3, now()
+  FROM reverted r
+  ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+  RETURNING sandbox_id
+),
+opened_billing AS (
+  INSERT INTO sandbox_compute_billing_interval (
+    sandbox_id, team_id, vcpu_count, memory_mib, started_at
+  )
+  SELECT r.id, r.team_id, r.vcpu_count, r.memory_mib, now()
+  FROM opened_active oa
+  JOIN reverted r ON r.id = oa.sandbox_id
+  WHERE feature_enabled('billing_metrics_write', r.team_id)
+  ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+)
+SELECT count(*) FROM reverted
+`
+
+type RevertPauseToActiveParams struct {
+	SandboxID uuid.UUID   `json:"sandbox_id"`
+	TeamID    uuid.UUID   `json:"team_id"`
+	ActorID   pgtype.UUID `json:"actor_id"`
+}
+
+// BeginPause's mirror for the failed-pause compensation path: status back to
+// 'active' AND the interval reopened in one statement, so an error between
+// two separate writes cannot leave an active sandbox unbilled, and the reopen
+// applies only to the row THIS statement moved out of 'pausing' — a
+// concurrent transition cannot interleave between the two facts. Gated on
+// status = 'pausing': if another actor already moved the sandbox on
+// (delete, reaper failover), their transition wins and this returns 0.
+func (q *Queries) RevertPauseToActive(ctx context.Context, arg RevertPauseToActiveParams) (int64, error) {
+	row := q.db.QueryRow(ctx, revertPauseToActive, arg.SandboxID, arg.TeamID, arg.ActorID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const revertResumeToPaused = `-- name: RevertResumeToPaused :exec
