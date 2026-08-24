@@ -4899,7 +4899,14 @@ func findSurvivingBuilders(builderBin string) ([]builderProc, error) {
 		}
 		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue // exited between the readdir and here
+			}
+			// Inconclusive (fd exhaustion, transient I/O): this pid could
+			// BE the surviving builder, and skipping it would let the
+			// scan "succeed" without it. Fail the whole scan; the caller
+			// retries with the gate closed.
+			return nil, fmt.Errorf("survivor scan: read cmdline of pid %s: %w", e.Name(), err)
 		}
 		args := strings.Split(string(cmdline), "\x00")
 		if len(args) == 0 || args[0] != builderBin {
@@ -4914,10 +4921,18 @@ func findSurvivingBuilders(builderBin string) ([]builderProc, error) {
 		if procPPID(e.Name()) == self {
 			continue
 		}
-		start, ok := procStartTime(e.Name())
+		stat, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // exited between the readdir and here
+			}
+			return nil, fmt.Errorf("survivor scan: read stat of pid %s: %w", e.Name(), err)
+		}
+		start, ok := parseProcStartTime(stat)
 		if !ok {
-			// Exited between the readdir and here: not a survivor.
-			continue
+			// Readable but unparseable: cannot record an identity for a
+			// process that matched the builder binary — inconclusive.
+			return nil, fmt.Errorf("survivor scan: unparseable stat for pid %s", e.Name())
 		}
 		procs = append(procs, builderProc{pid: pid, start: start})
 	}
