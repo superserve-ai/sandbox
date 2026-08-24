@@ -298,8 +298,8 @@ type stubVMD struct {
 }
 
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
-func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string, []vmdclient.ManifestEntry, error) {
-	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, nil
+func (s *stubVMD) PauseInstance(_ context.Context, _, _, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error) {
+	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
@@ -2458,6 +2458,67 @@ func TestIntegration_PauseRevertExemptFromQuota(t *testing.T) {
 
 	if count := activeCount(t, teamID); count != 2 {
 		t.Errorf("active_sandbox_count = %d, want 2 (transient overcommit recorded, not blocked)", count)
+	}
+}
+
+// RevertPauseToActive is the single-statement compensation for a pause that
+// failed after BeginPause: status back to 'active' and the interval reopened
+// commit together, and only for a row still in 'pausing' — a sandbox some
+// other transition already moved on must not be touched.
+func TestIntegration_RevertPauseToActive(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"revert-atomic"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	if _, err := testQueries.BeginPause(ctx, db.BeginPauseParams{ID: sandboxID, TeamID: teamID}); err != nil {
+		t.Fatalf("BeginPause: %v", err)
+	}
+
+	n, err := testQueries.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+	})
+	if err != nil {
+		t.Fatalf("RevertPauseToActive: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("reverted %d rows, want 1", n)
+	}
+
+	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if sb.Status != db.SandboxStatusActive {
+		t.Errorf("status = %q, want active", sb.Status)
+	}
+	var open int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM sandbox_active_interval WHERE sandbox_id = $1 AND ended_at IS NULL`,
+		sandboxID).Scan(&open); err != nil {
+		t.Fatalf("count open intervals: %v", err)
+	}
+	if open != 1 {
+		t.Errorf("open intervals = %d, want 1 (revert must reopen exactly one)", open)
+	}
+
+	// Already active: the status gate makes a second revert a 0-row no-op —
+	// no error, no duplicate interval.
+	n, err = testQueries.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+	})
+	if err != nil {
+		t.Fatalf("second RevertPauseToActive: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("revert of non-pausing sandbox = %d rows, want 0", n)
 	}
 }
 

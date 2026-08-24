@@ -58,5 +58,6 @@ func (h *Handlers) finalizePause(ctx context.Context, params db.FinalizePausePar
 		ManifestSizes:     params.ManifestSizes,
 		ManifestDigests:   params.ManifestDigests,
 		ManifestBasePaths: params.ManifestBasePaths,
+		PauseToken:        params.PauseToken,
 	})
 }

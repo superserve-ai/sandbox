@@ -41,7 +41,7 @@ func TestBackupPauseRetriesAsynchronouslyWhenBudgetExhausted(t *testing.T) {
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
 	defer cancel()
-	manifest := m.backupPause(ctx, "vm-1", snap, disk, "", zerolog.Nop())
+	manifest := m.backupPause(ctx, "vm-1", snap, disk, "", "tok-test", zerolog.Nop())
 	if len(manifest) != 0 {
 		t.Fatalf("synchronous manifest = %v, want none under an expired deadline", manifest)
 	}
@@ -79,7 +79,7 @@ func TestBackupPauseNeverEnqueuesWithoutDiskDigest(t *testing.T) {
 	}
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
-	m.backupPause(context.Background(), "vm-1", snap, filepath.Join(dir, "missing.ext4"), "", zerolog.Nop())
+	m.backupPause(context.Background(), "vm-1", snap, filepath.Join(dir, "missing.ext4"), "", "tok-test", zerolog.Nop())
 
 	select {
 	case task := <-tasks:
@@ -110,7 +110,7 @@ func TestBackupPauseDropsRehashWhenSandboxNotAtRest(t *testing.T) {
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
 	defer cancel()
-	if got := m.backupPause(ctx, "vm-1", snap, disk, "", zerolog.Nop()); len(got) != 0 {
+	if got := m.backupPause(ctx, "vm-1", snap, disk, "", "tok-test", zerolog.Nop()); len(got) != 0 {
 		t.Fatalf("synchronous manifest = %v, want none", got)
 	}
 
@@ -144,7 +144,7 @@ func TestBackupPauseRetriesWhenJournalWriteFails(t *testing.T) {
 		return errors.New("no space left on device")
 	})
 
-	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-test", zerolog.Nop())
 
 	deadline := time.Now().Add(10 * time.Second)
 	for calls.Load() < 2 && time.Now().Before(deadline) {
@@ -174,7 +174,7 @@ func TestBackupPauseReturnsVMStateOnlyAndEnqueuesAsync(t *testing.T) {
 	}
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
-	manifest := m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+	manifest := m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-test", zerolog.Nop())
 	if len(manifest) != 1 || manifest[0].FileName != "vmstate.snap" {
 		t.Fatalf("synchronous manifest = %+v, want vmstate only", manifest)
 	}
@@ -210,7 +210,7 @@ func TestBackupPauseNeverEnqueuesWithoutVMStateDigest(t *testing.T) {
 	}
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
-	m.backupPause(context.Background(), "vm-1", missingSnap, disk, "", zerolog.Nop())
+	m.backupPause(context.Background(), "vm-1", missingSnap, disk, "", "tok-test", zerolog.Nop())
 
 	select {
 	case task := <-tasks:
@@ -251,7 +251,7 @@ func TestBackupPauseRetriesJournalWriteAfterRehash(t *testing.T) {
 	// enqueue attempt happens inside the rehash goroutine.
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
 	defer cancel()
-	if got := m.backupPause(ctx, "vm-1", snap, disk, "", zerolog.Nop()); len(got) != 0 {
+	if got := m.backupPause(ctx, "vm-1", snap, disk, "", "tok-test", zerolog.Nop()); len(got) != 0 {
 		t.Fatalf("synchronous manifest = %v, want none", got)
 	}
 
@@ -290,7 +290,7 @@ func TestBackupPauseDropsRehashWhenUnitNotDead(t *testing.T) {
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now())
 	defer cancel()
-	m.backupPause(ctx, "vm-1", snap, disk, "", zerolog.Nop())
+	m.backupPause(ctx, "vm-1", snap, disk, "", "tok-test", zerolog.Nop())
 
 	select {
 	case task := <-tasks:
@@ -660,7 +660,7 @@ func TestRehashRefusesReplacedBase(t *testing.T) {
 	}
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
-	pb := newPendingBackup("vm-1", snap, disk, base)
+	pb := newPendingBackup("vm-1", snap, disk, base, "tok-test")
 	if pb.BaseIdentity == "" {
 		t.Fatal("marker did not capture the base identity")
 	}
@@ -712,7 +712,7 @@ func TestBusyGuardStillPersistsNewerMarker(t *testing.T) {
 	// An older worker holds the slot.
 	m.pendingInFlight.Store("vm-1", struct{}{})
 
-	pb := newPendingBackup("vm-1", "/snap", "/disk", "")
+	pb := newPendingBackup("vm-1", "/snap", "/disk", "", "tok-test")
 	m.rehashPendingBackup(context.Background(), pb, zerolog.Nop())
 
 	pending, err := st.ListPendingBackups()
@@ -732,8 +732,8 @@ func TestHealIsNewestWins(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	older := newPendingBackup("vm-1", "/a", "/b", "")
-	newer := newPendingBackup("vm-1", "/c", "/d", "")
+	older := newPendingBackup("vm-1", "/a", "/b", "", "tok-test")
+	newer := newPendingBackup("vm-1", "/c", "/d", "", "tok-test")
 
 	if err := st.PutPendingBackup(older); err != nil {
 		t.Fatal(err)
@@ -775,7 +775,7 @@ func TestRecoveryTrustsDurableRecordWhenMapUnloaded(t *testing.T) {
 	if err := st.Put(VMRecord{ID: "vm-1", Status: StatusPaused, SnapshotPath: snap}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.PutPendingBackup(newPendingBackup("vm-1", snap, disk, "")); err != nil {
+	if err := st.PutPendingBackup(newPendingBackup("vm-1", snap, disk, "", "tok-test")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -828,7 +828,7 @@ func TestWorkerKeepsMarkerAndSkipsEnqueueWhenNotAtRest(t *testing.T) {
 	}
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
-	pb := newPendingBackup("vm-1", snap, disk, "")
+	pb := newPendingBackup("vm-1", snap, disk, "", "tok-test")
 	m.persistPendingBackup(pb, zerolog.Nop())
 	m.rehashPendingBackup(context.Background(), pb, zerolog.Nop())
 
@@ -876,7 +876,7 @@ func TestBackupPausePathIsDiskSizeIndependent(t *testing.T) {
 	awaitRehashWorkers(t, m, 1)
 
 	start := time.Now()
-	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-test", zerolog.Nop())
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("pause-path backup work took %v against an 8GB overlay; the RPC path must be disk-size independent", elapsed)
 	}
@@ -909,7 +909,7 @@ func TestFastResumeKeepsBackupViaInlineStaging(t *testing.T) {
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 	awaitRehashWorkers(t, m, 1)
 
-	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-test", zerolog.Nop())
 	// Mutate the originals immediately, as a resumed guest would.
 	if err := os.WriteFile(disk, []byte("post-resume bytes!!!"), 0o644); err != nil {
 		t.Fatal(err)
@@ -961,7 +961,7 @@ func TestBasePinSurvivesBaseDeletion(t *testing.T) {
 		return nil
 	})
 
-	m.backupPause(context.Background(), "vm-1", snap, disk, base, zerolog.Nop())
+	m.backupPause(context.Background(), "vm-1", snap, disk, base, "tok-test", zerolog.Nop())
 	// Template GC wins the race before the worker uploads.
 	if err := os.Remove(base); err != nil {
 		t.Fatal(err)
@@ -1043,7 +1043,7 @@ func TestBackupPauseCapturesBaseIdentityComparableToDiskBasePath(t *testing.T) {
 	m.pendingInFlight.Store("vm-1", struct{}{})
 	awaitRehashWorkers(t, m, 1)
 
-	m.backupPause(context.Background(), "vm-1", snap, disk, base, zerolog.Nop())
+	m.backupPause(context.Background(), "vm-1", snap, disk, base, "tok-test", zerolog.Nop())
 
 	pb, ok, err := st.GetPendingBackup("vm-1")
 	if err != nil {
@@ -1179,8 +1179,8 @@ func TestRetryPauseReusesExistingStagedMarker(t *testing.T) {
 	m.pendingInFlight.Store("vm-1", struct{}{})
 	awaitRehashWorkers(t, m, 2)
 
-	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
-	m.backupPause(context.Background(), "vm-1", snap, disk, "", zerolog.Nop())
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-test", zerolog.Nop())
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-test", zerolog.Nop())
 
 	entries, err := os.ReadDir(filepath.Join(staging, "vm-1"))
 	if err != nil {
@@ -1736,5 +1736,67 @@ func TestBackfillRemintsAfterAbandonedTask(t *testing.T) {
 	m.BackfillPausedBackups(context.Background(), zerolog.Nop())
 	if n := drain(); n != 0 {
 		t.Fatalf("probe-error pass enqueued %d tasks, want 0", n)
+	}
+}
+
+// An unchanged re-pause that reuses a live staged marker is a NEW logical
+// pause: the reuse must rotate the marker's ownership token along with
+// the pause token, so a still-running old worker's owner-guarded cleanup
+// cannot delete the refreshed marker after enqueueing its stale identity.
+func TestMarkerReuseRotatesOwnershipWithPauseToken(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	m := &Manager{
+		state:    st,
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return false },
+	}
+	m.backupStaging = staging
+	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
+	// Park the workers at the busy guard, as a still-running old worker
+	// would hold it in production.
+	m.pendingInFlight.Store("vm-1", struct{}{})
+	awaitRehashWorkers(t, m, 2)
+
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-pause-1", zerolog.Nop())
+	first, ok, err := m.state.GetPendingBackup("vm-1")
+	if err != nil || !ok {
+		t.Fatalf("first marker: ok=%v err=%v", ok, err)
+	}
+	if first.PauseToken != "tok-pause-1" {
+		t.Fatalf("first marker pause token = %q", first.PauseToken)
+	}
+
+	// Re-pause on identical artifacts with a new control-plane token.
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-pause-2", zerolog.Nop())
+	second, ok, err := m.state.GetPendingBackup("vm-1")
+	if err != nil || !ok {
+		t.Fatalf("second marker: ok=%v err=%v", ok, err)
+	}
+	if second.PauseToken != "tok-pause-2" {
+		t.Fatalf("marker pause token = %q, want tok-pause-2", second.PauseToken)
+	}
+	if second.Token == first.Token {
+		t.Fatal("ownership token not rotated: the old worker's cleanup could still delete the refreshed marker")
+	}
+
+	// The old worker's owner-guarded cleanup must no-op against it.
+	if err := m.state.DeletePendingBackupIf("vm-1", first.Token); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := m.state.GetPendingBackup("vm-1"); !ok {
+		t.Fatal("refreshed marker deleted by the old ownership token")
 	}
 }

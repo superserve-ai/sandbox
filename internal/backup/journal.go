@@ -80,8 +80,13 @@ type Task struct {
 	Generation string     `json:"generation"`
 	Files      []TaskFile `json:"files"`
 	Priority   Priority   `json:"priority"`
-	EnqueuedAt time.Time  `json:"enqueued_at"`
-	Attempts   int        `json:"attempts"`
+	// PauseToken names the exact pause this sandbox generation captured
+	// (control-plane-minted, threaded through the pause RPC). Rides the
+	// journal so the completion report can carry it; empty on template
+	// tasks, pre-token entries, and backfill mints.
+	PauseToken string    `json:"pause_token,omitempty"`
+	EnqueuedAt time.Time `json:"enqueued_at"`
+	Attempts   int       `json:"attempts"`
 	// NotBefore delays retry after a failure (exponential backoff).
 	NotBefore time.Time `json:"not_before,omitempty"`
 	// VerifiedObjects records objects whose streamed bytes this task has
@@ -370,6 +375,16 @@ func (j *Journal) Enqueue(task Task) error {
 				// re-keys the row; attempts and NotBefore stay with it.
 				if task.Priority < cur.Priority {
 					cur.Priority = task.Priority
+					changed = true
+				}
+				// Pause-token refresh, newest wins: an unchanged re-pause
+				// converges on the same content generation but is a NEW
+				// logical pause — the control plane stored the new token on
+				// the snapshot, and a report still carrying the old one
+				// would be refused as another pause's. A tokenless enqueue
+				// (backfill mint) never erases a real token.
+				if task.PauseToken != "" && task.PauseToken != cur.PauseToken {
+					cur.PauseToken = task.PauseToken
 					changed = true
 				}
 				if !changed {
@@ -814,15 +829,23 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, erro
 			nt := task
 			nt.VerifiedBucket = completedScope
 			nt.VerifiedAt = now.UTC()
+			// Adopt the ROW's pause token over the claim-time copy: an
+			// unchanged re-pause during this upload refreshed the queued
+			// row's token (Enqueue), and the report must carry the newest
+			// or the control plane refuses it as another pause's.
+			var rowTask Task
+			if json.Unmarshal(existing, &rowTask) == nil && rowTask.PauseToken != "" {
+				nt.PauseToken = rowTask.PauseToken
+			}
 			// An undelivered entry that carries object paths must not be
 			// demoted by a pathless re-completion (an unchanged re-pause
 			// whose manifest create deduped reports no paths, since the
 			// published manifest is the path authority): mirror the seed's
 			// refresh-in-place and keep the richer manifest under the new
 			// instant, matching the control plane's own no-demotion rule.
-			if existing := tx.Bucket(outboxBucket).Get(completionKey(completedScope, task)); existing != nil {
+			if prevOutbox := tx.Bucket(outboxBucket).Get(completionKey(completedScope, task)); prevOutbox != nil {
 				var cur Task
-				if json.Unmarshal(existing, &cur) == nil &&
+				if json.Unmarshal(prevOutbox, &cur) == nil &&
 					filesCarryObjects(cur.Files) && !filesCarryObjects(nt.Files) {
 					nt.Files = cur.Files
 					nt.FilesFinal = cur.FilesFinal
@@ -975,6 +998,14 @@ func mergeRow(existing []byte, task *Task) {
 	// stale priority.
 	if cur.Priority < task.Priority {
 		task.Priority = cur.Priority
+	}
+	// A pause-token refresh that landed while this attempt ran (an
+	// unchanged re-pause re-enqueueing the same generation) must survive
+	// too: the write-back would otherwise revert the row to the claim-time
+	// token and the retry's report would name a pause the control plane
+	// no longer recognizes.
+	if cur.PauseToken != "" {
+		task.PauseToken = cur.PauseToken
 	}
 	seen := make(map[string]bool, len(task.VerifiedObjects))
 	for _, o := range task.VerifiedObjects {
@@ -1286,9 +1317,23 @@ func (j *Journal) ClearNotification(task Task) error {
 		// cleared entry's own shape means a still-undelivered legacy
 		// entry survives a scoped clear for the same owner/generation.
 		b := tx.Bucket(outboxBucket)
+		key := completionKey(task.VerifiedBucket, task)
 		if task.VerifiedBucket == "" {
-			return b.Delete(task.indexKey())
+			key = task.indexKey()
 		}
-		return b.Delete(completionKey(task.VerifiedBucket, task))
+		// Clear only the notification that was actually delivered: an
+		// unchanged re-pause acking the same owner/bucket/generation
+		// overwrites this key with a NEWER pause token, and deleting by
+		// key alone would discard that undelivered signal — the stale
+		// token just delivered cannot cover the new pause, so the host
+		// would read unbacked forever. A mismatched entry stays for its
+		// own delivery pass.
+		if existing := b.Get(key); existing != nil {
+			var stored Task
+			if json.Unmarshal(existing, &stored) == nil && stored.PauseToken != task.PauseToken {
+				return nil
+			}
+		}
+		return b.Delete(key)
 	})
 }

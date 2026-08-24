@@ -53,13 +53,17 @@ type backupReportFile struct {
 }
 
 type backupReportBody struct {
-	SandboxID   string             `json:"sandbox_id,omitempty"`
-	TemplateID  string             `json:"template_id,omitempty"`
-	BuildID     string             `json:"build_id,omitempty"`
-	Generation  string             `json:"generation"`
-	Bucket      string             `json:"bucket"`
-	CompletedAt time.Time          `json:"completed_at"`
-	Files       []backupReportFile `json:"files"`
+	SandboxID   string    `json:"sandbox_id,omitempty"`
+	TemplateID  string    `json:"template_id,omitempty"`
+	BuildID     string    `json:"build_id,omitempty"`
+	Generation  string    `json:"generation"`
+	Bucket      string    `json:"bucket"`
+	CompletedAt time.Time `json:"completed_at"`
+	// PauseToken names the exact pause this generation captured, echoed
+	// from the pause RPC through the journal; empty for pre-token entries
+	// and backfill mints, which fall back to content matching.
+	PauseToken string             `json:"pause_token,omitempty"`
+	Files      []backupReportFile `json:"files"`
 }
 
 // Deliver reports one verified generation. CompletedAt is the ack-time
@@ -95,6 +99,7 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 		Generation:  task.Generation,
 		Bucket:      bucket,
 		CompletedAt: completedAt.UTC(),
+		PauseToken:  task.PauseToken,
 		Files:       make([]backupReportFile, 0, len(files)),
 	}
 	for _, f := range files {
@@ -117,26 +122,45 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	if status >= 200 && status < 300 {
 		return nil
 	}
-	// A control plane from before the object field binds report bodies
-	// strictly and 400s the unknown field, which the permanent-rejection
-	// drop below would turn into a lost coverage row on every report this
-	// host sends during the rollout (or rollback) window. Degrade once to
-	// the pre-field payload: the report then lands exactly as an old
-	// vmd's would, and the acceptance clears the outbox entry, so those
-	// generations keep their coverage but stay pathless in the ledger
-	// permanently (their bucket manifests remain the path authority,
-	// like every pre-upgrade generation's; the control plane's
-	// enrichment arm upgrades the row if a rich report is ever
-	// redelivered). Deliberately NOT retained for a rich redelivery:
-	// holding the entry would re-deliver it every flush against the old
-	// control plane and head-of-line block every signal behind it.
+	// A control plane from before a field binds report bodies strictly
+	// and 400s the unknown field, which the permanent-rejection drop
+	// below would turn into a lost coverage row on every report this
+	// host sends during the rollout (or rollback) window. Degrade to the
+	// pre-field payload: the report then lands exactly as an old vmd's
+	// would, and the acceptance clears the outbox entry. Degraded
+	// generations keep their coverage row but lose the stripped field's
+	// value permanently — pathless rows keep their bucket manifests as
+	// the path authority (the control plane's enrichment arm upgrades
+	// the row if a rich report is ever redelivered), and a stripped
+	// pause token leaves the generation unlinked until the next pause
+	// re-verifies coverage token-bound (the count reads unbacked
+	// meanwhile: over-reported risk, never a false zero). Deliberately
+	// NOT retained for a rich redelivery: holding the entry would
+	// re-deliver it every flush against the old control plane and
+	// head-of-line block every signal behind it.
 	// Gated on the binder's own unknown-field message so a rejection a
-	// NEW control plane issues (a path failing validation) is never
-	// stripped past the check it failed.
-	if permanentReject(status) && isUnknownObjectField(msg) && stripObjectPaths(&body) {
+	// NEW control plane issues (a value failing validation) is never
+	// stripped past the check it failed. Bounded loop: the decoder stops
+	// at the FIRST unknown field, so a control plane predating both
+	// fields rejects them one at a time.
+	for range [2]struct{}{} {
+		if !permanentReject(status) {
+			break
+		}
+		var downgraded string
+		switch {
+		case isUnknownPauseTokenField(msg) && body.PauseToken != "":
+			body.PauseToken = ""
+			downgraded = "pause token"
+		case isUnknownObjectField(msg) && stripObjectPaths(&body):
+			downgraded = "object paths"
+		}
+		if downgraded == "" {
+			break
+		}
 		r.Log.Warn().Str("generation", task.Generation).
 			Str("status", statusLine).Str("response", string(msg)).
-			Msg("backup report rejected; retrying without object paths for an older control plane")
+			Msgf("backup report rejected; retrying without %s for an older control plane", downgraded)
 		status, statusLine, msg, err = r.post(body)
 		if err != nil {
 			return err
@@ -181,6 +205,11 @@ func permanentReject(status int) bool {
 // DisallowUnknownFields error, quoted or JSON-escaped in the response
 // body). Anything else is a genuine rejection of the report's content
 // and must not be retried stripped.
+func isUnknownPauseTokenField(msg []byte) bool {
+	return bytes.Contains(msg, []byte(`unknown field "pause_token"`)) ||
+		bytes.Contains(msg, []byte(`unknown field \"pause_token\"`))
+}
+
 func isUnknownObjectField(msg []byte) bool {
 	return bytes.Contains(msg, []byte(`unknown field "object"`)) ||
 		bytes.Contains(msg, []byte(`unknown field \"object\"`))
