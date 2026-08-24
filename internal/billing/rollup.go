@@ -237,20 +237,12 @@ RETURNING true`
 	return claimed, err
 }
 
-// intervalTeamSetCTE selects the teams holding a compute or storage billing
-// interval overlapping the window [$1, $2). Both schedulers below bind $1/$2 to
-// their window bounds and append their own trailing CTEs.
-//
-// MATERIALIZED so the flag check runs against the deduplicated team set (~tens
-// of rows). Without the fence the planner pushes feature_enabled() into the
-// interval scans and evaluates it once per interval row.
-//
-// The open-interval arm has to stay sargable: wrapping ended_at in COALESCE
-// hides it from the planner and costs a full scan of both tables. This spelling
-// is equivalent — `$1 < LEAST(now(), $2)` is a row-independent guard in the
-// same conjunction, so wherever a row can match at all the COALESCE fallback
-// already exceeds $1 — and it reaches the partial index on each arm.
-const intervalTeamSetCTE = `
+func enqueueHour(ctx context.Context, pool *pgxpool.Pool, hourStart, hourEnd time.Time, refreshCompleted bool) (int64, error) {
+	// interval_team_set is MATERIALIZED so the flag check runs against the
+	// deduplicated team set (~tens of rows). Without the fence the planner
+	// pushes feature_enabled() into the interval scans and evaluates it once
+	// per interval row — tens of thousands of flag lookups per call.
+	const query = `
 WITH interval_team_set AS MATERIALIZED (
     SELECT DISTINCT team_id
     FROM (
@@ -258,7 +250,7 @@ WITH interval_team_set AS MATERIALIZED (
         FROM sandbox_compute_billing_interval i
         WHERE i.started_at < $2
           AND $1 < LEAST(now(), $2)
-          AND (i.ended_at IS NULL OR i.ended_at > $1)
+          AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
 
         UNION
 
@@ -266,12 +258,9 @@ WITH interval_team_set AS MATERIALIZED (
         FROM sandbox_storage_interval i
         WHERE i.started_at < $2
           AND $1 < LEAST(now(), $2)
-          AND (i.ended_at IS NULL OR i.ended_at > $1)
+          AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
     ) billing_teams
-)`
-
-func enqueueHour(ctx context.Context, pool *pgxpool.Pool, hourStart, hourEnd time.Time, refreshCompleted bool) (int64, error) {
-	const query = intervalTeamSetCTE + `,
+),
 candidate_teams AS (
     SELECT team_id FROM interval_team_set
     WHERE feature_enabled('billing_hourly_rollups', team_id)
@@ -438,7 +427,27 @@ func nextTeamBackfillBatches(ctx context.Context, pool *pgxpool.Pool, startHour,
 		teamLimit = defaultHourlyRollupBatchSize
 	}
 
-	const query = intervalTeamSetCTE + `,
+	// Same MATERIALIZED fence as enqueueHour: dedup the interval scan first,
+	// flag-check the resulting team set — not every interval row.
+	const query = `
+WITH interval_team_set AS MATERIALIZED (
+    SELECT DISTINCT team_id
+    FROM (
+        SELECT i.team_id
+        FROM sandbox_compute_billing_interval i
+        WHERE i.started_at < $2
+          AND $1 < LEAST(now(), $2)
+          AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
+
+        UNION
+
+        SELECT i.team_id
+        FROM sandbox_storage_interval i
+        WHERE i.started_at < $2
+          AND $1 < LEAST(now(), $2)
+          AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
+    ) billing_teams
+),
 interval_teams AS (
     SELECT team_id FROM interval_team_set
     WHERE feature_enabled('billing_hourly_rollups', team_id)
