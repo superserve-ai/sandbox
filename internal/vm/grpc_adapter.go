@@ -46,7 +46,7 @@ func (a *GRPCAdapter) DestroyVM(ctx context.Context, req *vmdpb.DestroyVMRequest
 }
 
 func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*vmdpb.PauseVMResponse, error) {
-	snapshotPath, memPath, manifest, err := a.mgr.PauseVM(ctx, req.GetVmId(), req.GetSnapshotDir())
+	snapshotPath, memPath, manifest, err := a.mgr.PauseVM(ctx, req.GetVmId(), req.GetSnapshotDir(), req.GetPauseToken())
 	if err != nil {
 		return nil, err
 	}
@@ -65,6 +65,9 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
 		Manifest:     entries,
+		// Echo: this daemon threaded the token into the backup pipeline,
+		// so the caller may store it and require it of reports.
+		PauseToken: req.GetPauseToken(),
 	}, nil
 }
 

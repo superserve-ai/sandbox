@@ -979,15 +979,28 @@ WITH stale AS (
   ORDER BY created_at ASC
   LIMIT $1
   FOR UPDATE SKIP LOCKED
+),
+build_done AS (
+  UPDATE template_build
+  SET status = 'failed',
+      finalized_at = now(),
+      updated_at = now(),
+      error_message = 'build timed out'
+  FROM stale
+  WHERE template_build.id = stale.id
+  RETURNING template_build.id
+),
+tpl_update AS (
+  UPDATE template
+  SET status = 'failed',
+      error_message = 'build timed out',
+      updated_at = now()
+  FROM stale
+  WHERE template.id = stale.template_id
+    AND template.status IN ('pending', 'building')
+  RETURNING template.id
 )
-UPDATE template_build
-SET status = 'failed',
-    finalized_at = now(),
-    updated_at = now(),
-    error_message = 'build timed out'
-FROM stale
-WHERE template_build.id = stale.id
-RETURNING template_build.id, stale.template_id, stale.team_id, stale.vmd_host_id, stale.vmd_build_vm_id
+SELECT stale.id, stale.template_id, stale.team_id, stale.vmd_host_id, stale.vmd_build_vm_id FROM stale
 `
 
 type ReapStaleBuildsParams struct {
@@ -1007,7 +1020,11 @@ type ReapStaleBuildsRow struct {
 // Mark builds failed if they have stayed in pending past pending_timeout, or
 // in building/snapshotting past build_timeout. Returns affected rows so the
 // caller can call vmd.CancelBuild for orphan VM cleanup. Same idempotent
-// pattern as ClaimExpiredSandboxes.
+// pattern as ClaimExpiredSandboxes. A never-ready template fails together
+// with its timed-out build (mirroring FailBuild): this reap is the bound on
+// requeued dispatch retries, and a bound that strands the template in
+// 'building' forever is not a bound. Templates with a prior successful
+// build keep their 'ready' status.
 func (q *Queries) ReapStaleBuilds(ctx context.Context, arg ReapStaleBuildsParams) ([]ReapStaleBuildsRow, error) {
 	rows, err := q.db.Query(ctx, reapStaleBuilds, arg.Limit, arg.PendingTimeoutSeconds, arg.BuildTimeoutSeconds)
 	if err != nil {
@@ -1032,6 +1049,28 @@ func (q *Queries) ReapStaleBuilds(ctx context.Context, arg ReapStaleBuildsParams
 		return nil, err
 	}
 	return items, nil
+}
+
+const requeueBuildDispatch = `-- name: RequeueBuildDispatch :execrows
+UPDATE template_build
+SET status = 'pending',
+    vmd_host_id = NULL,
+    vmd_build_vm_id = NULL,
+    started_at = NULL,
+    updated_at = now()
+WHERE id = $1 AND status = 'building'
+`
+
+// Returns a just-claimed build to pending after a TRANSIENT dispatch
+// failure (e.g. a host-resolution timeout), so the next tick retries it
+// instead of failing a customer's build on a blip. Bounded: the pending
+// reap keys on created_at, so requeueing never extends a build's life.
+func (q *Queries) RequeueBuildDispatch(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, requeueBuildDispatch, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const softDeleteTemplateIfUnused = `-- name: SoftDeleteTemplateIfUnused :one

@@ -71,12 +71,14 @@ func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) er
 	}
 	return nil
 }
-func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir string) (string, string, []vmdclient.ManifestEntry, error) {
+func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error) {
+	// Echo like a current daemon; token-drop cases stub pauseFn and are
+	// covered by the client-layer echo comparison, not this fake.
 	if s.pauseFn != nil {
 		snap, mem, err := s.pauseFn(ctx, id, snapshotDir)
-		return snap, mem, nil, err
+		return snap, mem, nil, pauseToken, err
 	}
-	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil, nil
+	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
 func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte) (string, uint32, uint32, error) {
 	if s.resumeFn != nil {
@@ -227,6 +229,14 @@ func sandboxRow(s db.Sandbox) *mockRow {
 				*access = "legacy_public"
 				*wireAccess = "legacy_public"
 				*revision = 0
+				return nil
+			}
+		}
+		// Single-count scans (RevertPauseToActive's reverted-row count) from
+		// lifecycle mocks that route every QueryRow here: report success.
+		if len(dest) == 1 {
+			if n, ok := dest[0].(*int64); ok {
+				*n = 1
 				return nil
 			}
 		}
@@ -3856,7 +3866,7 @@ func TestPauseWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
 		}
 		return "/snap/vmstate.snap", "/snap/mem.snap", nil
 	}}
-	snap, mem, _, err := pauseWithRetry(context.Background(), vmd, "vm-1")
+	snap, mem, _, _, err := pauseWithRetry(context.Background(), vmd, "vm-1", "tok-test")
 	if err != nil {
 		t.Fatalf("retry should recover a transient failure, got %v", err)
 	}
@@ -3875,7 +3885,7 @@ func TestPauseWithRetry_NotFoundIsTerminal(t *testing.T) {
 		calls++
 		return "", "", notFound
 	}}
-	_, _, _, err := pauseWithRetry(context.Background(), vmd, "vm-1")
+	_, _, _, _, err := pauseWithRetry(context.Background(), vmd, "vm-1", "tok-test")
 	if !isVMDNotFound(err) {
 		t.Fatalf("expected NotFound to surface, got %v", err)
 	}

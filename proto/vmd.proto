@@ -326,6 +326,14 @@ message ReviveVMResponse {
 message PauseVMRequest {
   string vm_id = 1;
   string snapshot_dir = 2;   // Directory to store the snapshot artifacts.
+  // Caller-minted identity for THIS pause. The daemon threads it through
+  // the backup pipeline so the eventual upload report can name the exact
+  // pause it covers — content digests cannot (identical vmstate bytes with
+  // different disk contents are possible), and timestamps cannot (reports
+  // are delivered at-least-once from a durable outbox, arbitrarily late).
+  // Empty from an older caller: the report simply carries no token and
+  // coverage matching falls back to content.
+  string pause_token = 3;
 }
 
 message PauseVMResponse {
@@ -336,6 +344,12 @@ message PauseVMResponse {
   // vmstate). Memory files are deliberately absent: they never leave the
   // host, and hashing multi-GiB mem images would stretch the pause RPC.
   repeated ArtifactManifestEntry manifest = 4;
+  // Echo of the request's pause_token, present only when this daemon
+  // threaded it into the backup pipeline. The caller stores the token on
+  // the snapshot row ONLY on a matching echo: a token stored for a
+  // daemon that dropped it would demand an echo its reports can never
+  // produce, reading every backup as unmatched.
+  string pause_token = 5;
 }
 
 // ArtifactManifestEntry describes one finalized artifact file: its identity

@@ -1430,9 +1430,17 @@ func (x *ReviveVMResponse) GetHostIp() string {
 }
 
 type PauseVMRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmId          string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
-	SnapshotDir   string                 `protobuf:"bytes,2,opt,name=snapshot_dir,json=snapshotDir,proto3" json:"snapshot_dir,omitempty"` // Directory to store the snapshot artifacts.
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	VmId        string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
+	SnapshotDir string                 `protobuf:"bytes,2,opt,name=snapshot_dir,json=snapshotDir,proto3" json:"snapshot_dir,omitempty"` // Directory to store the snapshot artifacts.
+	// Caller-minted identity for THIS pause. The daemon threads it through
+	// the backup pipeline so the eventual upload report can name the exact
+	// pause it covers — content digests cannot (identical vmstate bytes with
+	// different disk contents are possible), and timestamps cannot (reports
+	// are delivered at-least-once from a durable outbox, arbitrarily late).
+	// Empty from an older caller: the report simply carries no token and
+	// coverage matching falls back to content.
+	PauseToken    string `protobuf:"bytes,3,opt,name=pause_token,json=pauseToken,proto3" json:"pause_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1481,6 +1489,13 @@ func (x *PauseVMRequest) GetSnapshotDir() string {
 	return ""
 }
 
+func (x *PauseVMRequest) GetPauseToken() string {
+	if x != nil {
+		return x.PauseToken
+	}
+	return ""
+}
+
 type PauseVMResponse struct {
 	state        protoimpl.MessageState `protogen:"open.v1"`
 	VmId         string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
@@ -1489,7 +1504,13 @@ type PauseVMResponse struct {
 	// Integrity manifest for the pause's durable artifacts (disk state +
 	// vmstate). Memory files are deliberately absent: they never leave the
 	// host, and hashing multi-GiB mem images would stretch the pause RPC.
-	Manifest      []*ArtifactManifestEntry `protobuf:"bytes,4,rep,name=manifest,proto3" json:"manifest,omitempty"`
+	Manifest []*ArtifactManifestEntry `protobuf:"bytes,4,rep,name=manifest,proto3" json:"manifest,omitempty"`
+	// Echo of the request's pause_token, present only when this daemon
+	// threaded it into the backup pipeline. The caller stores the token on
+	// the snapshot row ONLY on a matching echo: a token stored for a
+	// daemon that dropped it would demand an echo its reports can never
+	// produce, reading every backup as unmatched.
+	PauseToken    string `protobuf:"bytes,5,opt,name=pause_token,json=pauseToken,proto3" json:"pause_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1550,6 +1571,13 @@ func (x *PauseVMResponse) GetManifest() []*ArtifactManifestEntry {
 		return x.Manifest
 	}
 	return nil
+}
+
+func (x *PauseVMResponse) GetPauseToken() string {
+	if x != nil {
+		return x.PauseToken
+	}
+	return ""
 }
 
 // ArtifactManifestEntry describes one finalized artifact file: its identity
@@ -3854,15 +3882,19 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"H\n" +
 	"\x10ReviveVMResponse\x12\x1b\n" +
 	"\tdisk_path\x18\x01 \x01(\tR\bdiskPath\x12\x17\n" +
-	"\ahost_ip\x18\x02 \x01(\tR\x06hostIp\"H\n" +
+	"\ahost_ip\x18\x02 \x01(\tR\x06hostIp\"i\n" +
 	"\x0ePauseVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12!\n" +
-	"\fsnapshot_dir\x18\x02 \x01(\tR\vsnapshotDir\"\xb5\x01\n" +
+	"\fsnapshot_dir\x18\x02 \x01(\tR\vsnapshotDir\x12\x1f\n" +
+	"\vpause_token\x18\x03 \x01(\tR\n" +
+	"pauseToken\"\xd6\x01\n" +
 	"\x0fPauseVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12D\n" +
-	"\bmanifest\x18\x04 \x03(\v2(.superserve.vmd.v1.ArtifactManifestEntryR\bmanifest\"\x9c\x01\n" +
+	"\bmanifest\x18\x04 \x03(\v2(.superserve.vmd.v1.ArtifactManifestEntryR\bmanifest\x12\x1f\n" +
+	"\vpause_token\x18\x05 \x01(\tR\n" +
+	"pauseToken\"\x9c\x01\n" +
 	"\x15ArtifactManifestEntry\x12\x1b\n" +
 	"\tfile_name\x18\x01 \x01(\tR\bfileName\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x1d\n" +

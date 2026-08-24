@@ -221,6 +221,8 @@ module "api" {
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
     STRIPE_API_BASE_URL         = "https://api.stripe.com"
     STRIPE_API_VERSION          = "2026-05-27.dahlia"
+    STRIPE_CHECKOUT_PRICE_IDS   = "price_1U60fMPyzR3Q9AgflfcjIHsp,price_1U60hxPyzR3Q9AgfOsciXQ43"
+    APP_ALLOWED_ORIGINS         = "https://console.superserve.ai"
 
     # The serving host's identity for VMD-call metric labels, following
     # active_sandbox_host like the address above. Without it the wrapper
