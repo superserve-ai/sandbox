@@ -5625,6 +5625,12 @@ func (m *Manager) stopUnitDuringRestoreError(vmID string) {
 		// after verifyAndRecycle confirms the netns empty, with the
 		// reconciler reaping the residual cgroup.
 		if stopErr != nil {
+			// The unit oracle cannot see this residue, and the caller is
+			// about to persist a non-live status (Error/Paused) over a
+			// possibly-live Firecracker: preserve the verdict so pressure
+			// keeps charging its memory until the reconciler's reap (which
+			// clears the marker through removeVM) proves the group empty.
+			m.vmStopUnconfirmed.Store(vmID, struct{}{})
 			m.log.Error().Err(stopErr).Str("vm_id", vmID).
 				Msg("cgroup VM not confirmed stopped; slot recycle gated on pool verification")
 		}

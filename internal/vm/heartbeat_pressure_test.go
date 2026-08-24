@@ -797,3 +797,37 @@ func TestReleaseBuildAllocIsGenerationKeyed(t *testing.T) {
 		t.Fatalf("mem counter = %d after both releases, want 0", got)
 	}
 }
+
+// stopUnitDuringRestoreError is the shared cleanup for failed restores
+// and resumes: an unconfirmed cgroup stop there must set the marker
+// before the caller persists a non-live status, or the surviving
+// Firecracker's memory disappears from pressure once the settle window
+// expires.
+func TestRestoreErrorCleanupMarksUnconfirmedCgroupStop(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	// Cgroup-supervised record whose group cannot be proven empty: the
+	// tree has a populated group, so stopVM's kill path fails to confirm.
+	if err := st.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup}); err != nil {
+		t.Fatal(err)
+	}
+	tree := &cgroupTree{vms: filepath.Join(dir, "vms")}
+	if err := os.MkdirAll(tree.vmCgroupDir("vm-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree.vmCgroupDir("vm-1"), "cgroup.events"),
+		[]byte("populated 1\nfrozen 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: st, cgroups: tree,
+		vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+
+	m.stopUnitDuringRestoreError("vm-1")
+	if _, marked := m.vmStopUnconfirmed.Load("vm-1"); !marked {
+		t.Fatal("unconfirmed cgroup stop in restore-error cleanup did not set the marker")
+	}
+}
