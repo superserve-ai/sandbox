@@ -230,7 +230,8 @@ func TestCapacityPressureCountsErrorVMAllocations(t *testing.T) {
 // (indefinitely retained) registry.
 func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{}, builds: map[string]*buildRecord{}}
-	if _, err := m.registerBuild("b1", "tpl", 2, 4096, func() {}); err != nil {
+	rec, err := m.registerBuild("b1", "tpl", 2, 4096, func() {})
+	if err != nil {
 		t.Fatal(err)
 	}
 	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 4096 {
@@ -245,12 +246,12 @@ func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 	}
 	// The last build VM exits: allocation returns, the workflow count
 	// holds until the worker itself returns (hash-only interval).
-	m.releaseBuildAlloc("b1", 2, 4096)
+	m.releaseBuildAlloc(rec, 2, 4096)
 	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 0 {
 		t.Fatalf("after VM exit: %+v, want allocation released but still provisioning", p)
 	}
 	// Idempotent: the worker's safety-net defer must not double-release.
-	m.releaseBuildAlloc("b1", 2, 4096)
+	m.releaseBuildAlloc(rec, 2, 4096)
 	if got := m.buildPressureMem.Load(); got != 0 {
 		t.Fatalf("mem counter = %d after double release, want 0", got)
 	}
@@ -576,7 +577,8 @@ func TestFindSurvivingBuildersExcludesOwnChildren(t *testing.T) {
 // closed like any other unrepresented Firecracker.
 func TestBuildAllocCoversDistinguishesLeftovers(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{}, builds: map[string]*buildRecord{}}
-	if _, err := m.registerBuild("build-row-uuid-1", "tpl-a", 1, 1024, func() {}); err != nil {
+	rec, err := m.registerBuild("build-row-uuid-1", "tpl-a", 1, 1024, func() {})
+	if err != nil {
 		t.Fatal(err)
 	}
 	// Current build VM and its recorder: exempt while the allocation
@@ -605,7 +607,7 @@ func TestBuildAllocCoversDistinguishesLeftovers(t *testing.T) {
 		t.Fatal("cancelled-but-unreleased build lost coverage: recorder double-counted during teardown")
 	}
 	// Allocation returned: no longer covered, terminal or not.
-	m.releaseBuildAlloc("build-row-uuid-1", 1, 1024)
+	m.releaseBuildAlloc(rec, 1, 1024)
 	if m.buildAllocCovers("build-row-uuid-1") || m.buildAllocCovers("build-record-tpl-a") {
 		t.Fatal("alloc-released build's cgroups still exempted")
 	}
@@ -644,7 +646,8 @@ func TestCapacityPressureSkipsBuildInstances(t *testing.T) {
 		},
 		builds: map[string]*buildRecord{},
 	}
-	if _, err := m.registerBuild("build-tpl-a", "tpl-a", 2, 4096, func() {}); err != nil {
+	recA, err := m.registerBuild("build-tpl-a", "tpl-a", 2, 4096, func() {})
+	if err != nil {
 		t.Fatal(err)
 	}
 	p := m.CapacityPressure()
@@ -659,7 +662,7 @@ func TestCapacityPressureSkipsBuildInstances(t *testing.T) {
 	// The recorder's teardown failed and the build moved on: allocation
 	// returned, recorder still alive in the map. It must now be counted
 	// directly — the leaked process would otherwise be invisible forever.
-	m.releaseBuildAlloc("build-tpl-a", 2, 4096)
+	m.releaseBuildAlloc(recA, 2, 4096)
 	p = m.CapacityPressure()
 	if p.AllocatedMemoryMib != 4608 || p.AllocatedVcpus != 3 {
 		t.Fatalf("allocations = %+v, want the leaked recorder counted by the instance loop", p)
@@ -758,5 +761,39 @@ func TestReattachReconstructsCgroupStopMarkers(t *testing.T) {
 	m2.ReattachAll(context.Background())
 	if _, marked := m2.vmStopUnconfirmed.Load("vm-1"); marked {
 		t.Fatal("marker reconstructed for a provably empty cgroup")
+	}
+}
+
+// A terminal build id may be re-registered while the OLD worker still
+// runs its deferred cleanup: the release must act on the generation that
+// incremented the counters, never on whatever record the id now names —
+// or the replacement build's allocation is silently hidden for life.
+func TestReleaseBuildAllocIsGenerationKeyed(t *testing.T) {
+	m := &Manager{vms: map[string]*VMInstance{}, builds: map[string]*buildRecord{}}
+	recOld, err := m.registerBuild("build-b1", "tpl", 2, 4096, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.setBuildStatus("build-b1", BuildStatusCancelled) {
+		t.Fatal("cancel failed")
+	}
+	// Reuse: a new build replaces the terminal record under the same id.
+	recNew, err := m.registerBuild("build-b1", "tpl", 4, 8192, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The old worker's deferred cleanup fires late.
+	m.releaseBuildAlloc(recOld, 2, 4096)
+
+	// The replacement's allocation must be fully intact and covered.
+	if got := m.buildPressureMem.Load(); got != 8192 {
+		t.Fatalf("mem counter = %d after old worker's release, want 8192", got)
+	}
+	if !m.buildAllocCovers("build-b1") {
+		t.Fatal("replacement build lost coverage to the old worker's release")
+	}
+	m.releaseBuildAlloc(recNew, 4, 8192)
+	if got := m.buildPressureMem.Load(); got != 0 {
+		t.Fatalf("mem counter = %d after both releases, want 0", got)
 	}
 }

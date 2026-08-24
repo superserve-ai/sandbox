@@ -85,12 +85,13 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 	// ending. CancelBuild is what stops it.
 	buildCtx, cancel := context.WithCancel(context.Background())
 
-	if _, err := m.registerBuild(buildVMID, req.TemplateID, req.VCPU, req.MemoryMiB, cancel); err != nil {
+	rec, err := m.registerBuild(buildVMID, req.TemplateID, req.VCPU, req.MemoryMiB, cancel)
+	if err != nil {
 		cancel()
 		return "", err
 	}
 
-	go func() { defer sentrylog.Recover("build-worker"); m.buildTemplateWorker(buildCtx, buildVMID, req) }()
+	go func() { defer sentrylog.Recover("build-worker"); m.buildTemplateWorker(buildCtx, buildVMID, req, rec) }()
 
 	return buildVMID, nil
 }
@@ -98,7 +99,7 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 // buildTemplateWorker is the goroutine body. Runs one build end-to-end and
 // records the outcome in the registry. Never returns an error — all failures
 // are logged and surfaced via completeBuild so GetBuildStatus sees them.
-func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req BuildTemplateRequest) {
+func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req BuildTemplateRequest, rec *buildRecord) {
 	// The WORKFLOW count holds until the worker returns (the build stays
 	// provisioning through its artifact hashing), but the memory/vCPU
 	// allocation releases when the last build VM exits — normally at the
@@ -107,15 +108,15 @@ func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req
 	// return would publish a full VM's memory during a hash-only interval
 	// that can run for minutes.
 	defer m.buildPressureCount.Add(-1)
-	defer m.releaseBuildAlloc(buildVMID, req.VCPU, req.MemoryMiB)
-	result, err := m.buildTemplateSync(ctx, buildVMID, req)
+	defer m.releaseBuildAlloc(rec, req.VCPU, req.MemoryMiB)
+	result, err := m.buildTemplateSync(ctx, buildVMID, req, rec)
 	m.completeBuild(buildVMID, result, err)
 }
 
 // buildTemplateSync delegates the build to the template-builder subprocess.
 // The subprocess owns its own network, Firecracker process, and boxd
 // connection — completely isolated from vmd's sandbox state.
-func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req BuildTemplateRequest) (*BuildTemplateResult, error) {
+func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req BuildTemplateRequest, rec *buildRecord) (*BuildTemplateResult, error) {
 	log := m.log.With().Str("template_id", req.TemplateID).Str("build_vm_id", buildVMID).Str("from", req.Spec.From).Logger()
 	log.Info().Msg("starting template build (subprocess)")
 	buildStart := time.Now()
@@ -218,7 +219,7 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	// for the same reason: every build VM is gone (a recorder whose
 	// teardown failed is counted by the instance loop from here on).
 	releaseSlot()
-	m.releaseBuildAlloc(buildVMID, req.VCPU, req.MemoryMiB)
+	m.releaseBuildAlloc(rec, req.VCPU, req.MemoryMiB)
 
 	// Durability: hash the finished artifact set (access.log included when
 	// recorded above), stamp the digests into build.meta.json, and enqueue

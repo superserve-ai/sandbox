@@ -3264,18 +3264,23 @@ func (m *Manager) recordRepresentedOrGone(id string) bool {
 // releaseBuildAlloc returns a build's memory/vCPU pressure counters at
 // the moment its LAST VM is gone (subprocess reaped, recorder destroyed)
 // — never at worker return, which happens only after artifact hashing
-// that can run for minutes with no VM alive. Idempotent under buildsMu;
-// the worker's deferred call is the safety net for early error returns.
-func (m *Manager) releaseBuildAlloc(buildVMID string, vcpu, memoryMiB uint32) {
+// that can run for minutes with no VM alive. Idempotent under buildsMu.
+// Keyed on the RECORD POINTER, never the build id: a terminal id may be
+// re-registered while the old worker still runs its deferred cleanup,
+// and an id-keyed release would mark the REPLACEMENT's allocation
+// released while subtracting the old sizes — hiding the new build's
+// memory for its whole lifetime. Each worker releases exactly the
+// record whose registration incremented the counters.
+func (m *Manager) releaseBuildAlloc(rec *buildRecord, vcpu, memoryMiB uint32) {
+	if rec == nil {
+		return
+	}
 	m.buildsMu.Lock()
-	rec, ok := m.builds[buildVMID]
-	if ok && rec.AllocReleased {
+	if rec.AllocReleased {
 		m.buildsMu.Unlock()
 		return
 	}
-	if ok {
-		rec.AllocReleased = true
-	}
+	rec.AllocReleased = true
 	m.buildsMu.Unlock()
 	m.buildPressureMem.Add(-int64(memoryMiB))
 	m.buildPressureVcpus.Add(-int64(vcpu))
@@ -3488,6 +3493,17 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 					m.mu.Unlock()
 					m.log.Warn().Str("vm_id", id).
 						Msg("predecessor build cgroup detected; pressure publication deferred until it empties")
+					continue
+				}
+				if m.cgroupDefinitelyDead(id) {
+					// A provably EMPTY residue directory (startup cleanup
+					// killed the process but rmdir failed) holds no memory
+					// or CPU and nothing will ever repopulate it: harmless
+					// to pressure, so it must not suppress publication
+					// until the next restart. The reconciler still owns
+					// removing the directory.
+					m.log.Warn().Str("vm_id", id).
+						Msg("empty orphan vm cgroup directory (reap residue); ignored for pressure")
 					continue
 				}
 				conclusive = false
