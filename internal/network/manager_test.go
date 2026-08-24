@@ -786,12 +786,13 @@ func TestCleanupUsesSharedVpeerDerivation(t *testing.T) {
 // reported through its own classes, and a slot in two classes at once
 // would corrupt the prepared-slot ceiling formula.
 func TestSlotPressureExcludesPoolOwnedFromUsed(t *testing.T) {
-	m := &Manager{slotOwner: map[int]string{
-		1: "vm-a",
-		2: "vm-b",
-		3: poolOwner,
-		4: poolOwner,
-	}}
+	m := &Manager{slotOwner: map[int]string{}}
+	m.mu.Lock()
+	m.setSlotOwnerLocked(1, "vm-a")
+	m.setSlotOwnerLocked(2, "vm-b")
+	m.setSlotOwnerLocked(3, poolOwner)
+	m.setSlotOwnerLocked(4, poolOwner)
+	m.mu.Unlock()
 	st := m.SlotPressure()
 	if st.Used != 2 {
 		t.Fatalf("Used = %d, want 2 (pool-owned excluded)", st.Used)
@@ -806,12 +807,13 @@ func TestSlotPressureExcludesPoolOwnedFromUsed(t *testing.T) {
 // Provisioning, not vanish from all three classes and advertise phantom
 // slot capacity.
 func TestSlotPressureCountsAdoptionBacklogAsProvisioning(t *testing.T) {
-	m := &Manager{slotOwner: map[int]string{
-		1: "vm-a",    // real owner
-		2: poolOwner, // warm (delivered below)
-		3: poolOwner, // adoption candidate, not yet warm
-		4: poolOwner, // adoption candidate, not yet warm
-	}}
+	m := &Manager{slotOwner: map[int]string{}}
+	m.mu.Lock()
+	m.setSlotOwnerLocked(1, "vm-a")    // real owner
+	m.setSlotOwnerLocked(2, poolOwner) // warm (delivered below)
+	m.setSlotOwnerLocked(3, poolOwner) // adoption candidate, not yet warm
+	m.setSlotOwnerLocked(4, poolOwner) // adoption candidate, not yet warm
+	m.mu.Unlock()
 	m.pool = &Pool{fresh: make(chan *preallocSlot, 4), recycled: make(chan *preallocSlot, 4)}
 	m.pool.fresh <- &preallocSlot{idx: 2}
 
@@ -825,4 +827,34 @@ func TestSlotPressureCountsAdoptionBacklogAsProvisioning(t *testing.T) {
 	if st.Provisioning != 2 {
 		t.Fatalf("Provisioning = %d, want 2 (adoption backlog visible)", st.Provisioning)
 	}
+}
+
+// The pressure counters must stay exact through every ownership
+// transition shape: claim, pool transfer, withhold, teardown, release.
+// Any drift here silently corrupts the ceiling formula forever.
+func TestSlotPressureCountersMatchRecount(t *testing.T) {
+	m := &Manager{slotOwner: map[int]string{}}
+	m.mu.Lock()
+	m.setSlotOwnerLocked(1, "vm-a")
+	m.setSlotOwnerLocked(2, poolOwner)
+	m.setSlotOwnerLocked(3, poolOwner)
+	m.setSlotOwnerLocked(2, "vm-b") // pool → VM transfer (Claim)
+	m.setSlotOwnerLocked(1, withheldOwner)
+	m.setSlotOwnerLocked(3, teardownOwner)
+	m.deleteSlotOwnerLocked(3)
+	m.setSlotOwnerLocked(4, poolOwner)
+	pool, used := 0, 0
+	for _, owner := range m.slotOwner {
+		if owner == poolOwner {
+			pool++
+		} else {
+			used++
+		}
+	}
+	if m.poolOwnedSlots != pool || m.usedOwnedSlots != used {
+		m.mu.Unlock()
+		t.Fatalf("counters (pool=%d used=%d) drifted from recount (pool=%d used=%d)",
+			m.poolOwnedSlots, m.usedOwnedSlots, pool, used)
+	}
+	m.mu.Unlock()
 }

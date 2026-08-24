@@ -132,8 +132,14 @@ type Manager struct {
 	// setupSem bounds concurrent setupSlot builds (see setupSlotConcurrency).
 	setupSem chan struct{}
 
-	mu         sync.Mutex
-	devices    map[string]*VMNetInfo
+	mu      sync.Mutex
+	devices map[string]*VMNetInfo
+	// poolOwnedSlots and usedOwnedSlots partition slotOwner by owner
+	// class, maintained by the set/delete helpers so pressure never walks
+	// the map. Guarded by mu.
+	poolOwnedSlots int
+	usedOwnedSlots int
+
 	freeSlots  []int // recycled slot indices, guaranteed absent from slotOwner
 	nextSlot   int   // next new slot (used when freeSlots is empty)
 	maxSlot    int   // new-slot ceiling; meaningful only when slotPinned (WithExactSlot)
@@ -967,15 +973,49 @@ const (
 	withheldOwner = "\x00withheld" // kernel state dirty and unremovable; parked until next boot
 )
 
+// setSlotOwnerLocked is the ONLY writer of slotOwner entries: it keeps
+// the pool/used counters exact across every ownership transition, so
+// SlotPressure reads two ints instead of walking an O(fleet) map under
+// the mutex that slot claims and network setup contend for. Caller must
+// hold m.mu.
+func (m *Manager) setSlotOwnerLocked(idx int, owner string) {
+	m.uncountSlotOwnerLocked(idx)
+	m.slotOwner[idx] = owner
+	if owner == poolOwner {
+		m.poolOwnedSlots++
+	} else {
+		m.usedOwnedSlots++
+	}
+}
+
+// deleteSlotOwnerLocked is the ONLY deleter of slotOwner entries; caller
+// must hold m.mu.
+func (m *Manager) deleteSlotOwnerLocked(idx int) {
+	m.uncountSlotOwnerLocked(idx)
+	delete(m.slotOwner, idx)
+}
+
+func (m *Manager) uncountSlotOwnerLocked(idx int) {
+	prev, ok := m.slotOwner[idx]
+	if !ok {
+		return
+	}
+	if prev == poolOwner {
+		m.poolOwnedSlots--
+	} else {
+		m.usedOwnedSlots--
+	}
+}
+
 // assignSlotLocked sets the owner of idx (a fresh claim or an owner transfer,
 // e.g. pool→VM on Claim). Caller must hold m.mu and must have already removed
 // idx from freeSlots (claimSlotIndex pops it; transfers keep it out).
-func (m *Manager) assignSlotLocked(idx int, owner string) { m.slotOwner[idx] = owner }
+func (m *Manager) assignSlotLocked(idx int, owner string) { m.setSlotOwnerLocked(idx, owner) }
 
 // reserveSlotLocked marks idx owned by a record and removes it from freeSlots if
 // present — the record-path acquire. Caller must hold m.mu.
 func (m *Manager) reserveSlotLocked(idx int, owner string) {
-	m.slotOwner[idx] = owner
+	m.setSlotOwnerLocked(idx, owner)
 	m.removeFromFreeSlotsLocked(idx)
 }
 
@@ -996,7 +1036,7 @@ func (m *Manager) releaseIfOwned(idx int, owner string) bool {
 	if m.slotOwner[idx] != owner {
 		return false
 	}
-	delete(m.slotOwner, idx)
+	m.deleteSlotOwnerLocked(idx)
 	m.freeSlots = append(m.freeSlots, idx)
 	return true
 }
@@ -1011,7 +1051,7 @@ func (m *Manager) withholdIfOwned(idx int, owner string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.slotOwner[idx] == owner {
-		m.slotOwner[idx] = withheldOwner
+		m.setSlotOwnerLocked(idx, withheldOwner)
 	}
 }
 
@@ -1054,7 +1094,7 @@ func (m *Manager) claimTeardown(idx int, owner string) bool {
 	if m.slotOwner[idx] != owner {
 		return false
 	}
-	m.slotOwner[idx] = teardownOwner
+	m.setSlotOwnerLocked(idx, teardownOwner)
 	return true
 }
 
@@ -1805,7 +1845,11 @@ type SlotPressureStats struct {
 // WarmReady/Provisioning instead, so the same slot can never appear in
 // two pressure classes at once (Used + Warm + Provisioning is what the
 // prepared-slot ceiling bounds; double-counting would corrupt that
-// formula). Provisioning is STRUCTURAL, not a worker count: every
+// formula). Constant-time: the counters are maintained at every
+// ownership transition (see setSlotOwnerLocked), never recomputed by
+// walking the map — the walk would hold the same mutex slot claims and
+// network setup need, for O(fleet) per beat.
+// Provisioning is STRUCTURAL, not a worker count: every
 // pool-owned slot that is not yet claimable from a warm channel is
 // in-flight inventory — refill builds and, after a restart with pool
 // adoption on, potentially hundreds of adoption candidates that hold
@@ -1814,15 +1858,9 @@ type SlotPressureStats struct {
 // One O(owned) walk of the map, at heartbeat cadence only.
 func (m *Manager) SlotPressure() SlotPressureStats {
 	st := SlotPressureStats{Ceiling: MaxSlots}
-	poolOwned := 0
 	m.mu.Lock()
-	for _, owner := range m.slotOwner {
-		if owner == poolOwner {
-			poolOwned++
-		} else {
-			st.Used++
-		}
-	}
+	poolOwned := m.poolOwnedSlots
+	st.Used = m.usedOwnedSlots
 	m.mu.Unlock()
 	if m.pool != nil {
 		fresh, recycled, ok := m.PoolStats()
