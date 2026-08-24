@@ -738,6 +738,99 @@ func TestUploaderTrustsHistoryForUnchangedRepause(t *testing.T) {
 	}
 }
 
+// TestUploaderRefreshesVerificationOnRepeatedDedupe covers a real
+// production regression: a verification record's clock used to be set
+// once, at the object's original upload, and never touched again on a
+// later dedupe. An object whose content stays unchanged for longer than
+// verifiedRetention would then abandon forever, even though every
+// intervening re-pause had successfully deduped and proven the bytes were
+// still good. This proves the clock now resets on every valid dedupe, so
+// continued legitimate reference never runs out the window.
+func TestUploaderRefreshesVerificationOnRepeatedDedupe(t *testing.T) {
+	j, _ := testJournal(t)
+	store := newMemStore()
+	var verified []Task
+	// Anchored to the real clock, not writeTask's fixed EnqueuedAt: Ack's
+	// incremental prune sweep (journal.go) stamps and compares against
+	// real time.Now() regardless of Uploader.Now, so a fake clock started
+	// far from the present would look already-expired the instant it is
+	// written, independent of anything this test is trying to exercise.
+	start := time.Now()
+	fake := start
+	u := &Uploader{
+		Journal:    j,
+		Store:      store,
+		OnVerified: func(task Task) error { verified = append(verified, task); return nil },
+		Now:        func() time.Time { return fake },
+	}
+
+	// First pause: full upload, verified, acked.
+	task := writeTask(t, t.TempDir())
+	task.EnqueuedAt = fake
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), fake); err != nil {
+		t.Fatal(err)
+	}
+	if len(verified) != 1 {
+		t.Fatalf("first pause not verified: %+v", verified)
+	}
+	overlayObj := "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[0].Path, "overlay.ext4")
+	key := store.Identity() + "\x00" + overlayObj
+	if ok, err := j.WasVerified(key, fake); err != nil || !ok {
+		t.Fatalf("WasVerified immediately after first upload = %v (err %v), want valid", ok, err)
+	}
+
+	// Repause just before the ORIGINAL write's retention window closes.
+	// Every object dedupes; per the fix this must refresh the durable
+	// record instead of merely reading it.
+	step := verifiedRetention - time.Hour
+	fake = fake.Add(step)
+	repause2 := task
+	repause2.EnqueuedAt = fake
+	repause2.VerifiedObjects = nil
+	if err := j.Enqueue(repause2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), fake); err != nil {
+		t.Fatal(err)
+	}
+	if len(verified) != 2 {
+		t.Fatalf("repause within the original window abandoned instead of completing: %+v", verified)
+	}
+
+	// Advance by the same distance again: elapsed time since the
+	// ORIGINAL write now exceeds verifiedRetention, so without the
+	// refresh above this repause would abandon. Elapsed time since the
+	// REFRESH is still within the window, so it must complete.
+	fake = fake.Add(step)
+	if elapsed := fake.Sub(start); elapsed <= verifiedRetention {
+		t.Fatalf("test setup: elapsed %v does not exceed original retention %v", elapsed, verifiedRetention)
+	}
+	repause3 := task
+	repause3.EnqueuedAt = fake
+	repause3.VerifiedObjects = nil
+	if err := j.Enqueue(repause3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), fake); err != nil {
+		t.Fatal(err)
+	}
+	if len(verified) != 3 {
+		t.Fatalf("repause past the original write's retention window abandoned; verification was not refreshed: %+v", verified)
+	}
+	if counts, _ := j.Pending(); counts[PriorityPause] != 0 {
+		t.Fatalf("final repause task still pending: %v", counts)
+	}
+
+	// Direct check: the record reads valid at a time that is only within
+	// retention when measured from the refresh, not the original write.
+	if ok, err := j.WasVerified(key, fake); err != nil || !ok {
+		t.Fatalf("WasVerified after refresh = %v (err %v), want valid", ok, err)
+	}
+}
+
 func TestJournalSameContentSandboxesDoNotCollide(t *testing.T) {
 	j, _ := testJournal(t)
 	base := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
@@ -1808,6 +1901,9 @@ func TestLegacyUnscopedVerificationRecordsStillTrusted(t *testing.T) {
 	// The startup migration (as Run performs) claims the legacy record
 	// for the current bucket.
 	if err := j.MigrateVerificationScope(store.Identity()); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
 	completed, _, _, err := u.uploadTask(context.Background(), &task)
