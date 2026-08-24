@@ -42,6 +42,11 @@ type SnapshotLoadParams struct {
 
 	// Enable dirty page tracking to improve space efficiency of diff snapshots
 	TrackDirtyPages bool `json:"track_dirty_pages,omitempty"`
+
+	// Caller-chosen dirty-tracking session id (fork extension). Only meaningful with
+	// track_dirty_pages; installs a (session_id, generation=0) token that guarded
+	// snapshot requests can later compare against.
+	TrackingSessionID string `json:"tracking_session_id,omitempty"`
 }
 
 // Validate validates this snapshot load params

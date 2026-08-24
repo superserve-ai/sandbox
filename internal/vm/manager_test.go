@@ -2162,8 +2162,8 @@ func TestResumeVM_UnverifiedRelaunchVerifiesReplacementIP(t *testing.T) {
 		}
 		return 4321, SupervisionUnit, nil
 	}
-	mgr.restoreForResumeHook = func(_ string, _ string, _ string, _ string, _ *network.VMNetInfo) (bool, error) {
-		return true, nil
+	mgr.restoreForResumeHook = func(_ string, _ string, _ string, _ string, _ *network.VMNetInfo) (bool, string, error) {
+		return true, "", nil
 	}
 	adoptionBoxdReady = func(_ context.Context, _ *Manager, ip string) error {
 		verifiedIP = ip
@@ -2448,6 +2448,36 @@ func TestToRecordIgnoresDirtyTracked(t *testing.T) {
 	}
 	if !bytes.Equal(a, b) {
 		t.Fatalf("DirtyTracked is now persisted — CreateVMSnapshot must take the vm-op lock before persisting:\n %s\n %s", a, b)
+	}
+}
+
+// The dirty-tracking session id IS persisted (unlike DirtyTracked): the
+// pause-time token check makes a stale value safe, and reattach uses it to
+// keep a post-restart pause incremental — but only for RUNNING records, and
+// only when a session was actually armed.
+func TestDirtyTrackingSessionRoundTripAndRearm(t *testing.T) {
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTrackingSessionID: "abc123"}
+	rec := toRecord(inst)
+	if rec.DirtyTrackingSessionID != "abc123" {
+		t.Fatalf("session id not persisted: %+v", rec)
+	}
+	back := toInstance(rec)
+	if back.DirtyTrackingSessionID != "abc123" {
+		t.Fatalf("session id lost on fromRecord: %+v", back)
+	}
+	if !back.DirtyTracked {
+		t.Fatal("running record with a session must re-arm DirtyTracked optimistically")
+	}
+	// No session → no optimistic re-arm (flag off / pre-flag records).
+	rec.DirtyTrackingSessionID = ""
+	if toInstance(rec).DirtyTracked {
+		t.Fatal("running record without a session must not re-arm")
+	}
+	// Paused records never re-arm: the FC run the session named is gone.
+	rec.DirtyTrackingSessionID = "abc123"
+	rec.Status = StatusPaused
+	if toInstance(rec).DirtyTracked {
+		t.Fatal("paused record must not re-arm DirtyTracked")
 	}
 }
 

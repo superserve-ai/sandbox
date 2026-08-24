@@ -33,6 +33,22 @@ func isTornSnapshotErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), tornSnapshotMarker)
 }
 
+// ErrDirtyTrackingMismatch is the firecracker fork's rejection of a guarded
+// Diff snapshot whose expected session token no longer matches the live dirty
+// bitmap (something consumed it since tracking was armed — an ad-hoc snapshot,
+// or the token belongs to an earlier FC run). The rejection happens before the
+// bitmap or any output file is touched, so falling back to a Full snapshot of
+// the same paused VM is always safe.
+var ErrDirtyTrackingMismatch = errors.New("dirty-tracking session mismatch")
+
+// dirtyTrackingMismatchMarker is the substring the fork embeds in the
+// CreateSnapshotError::DirtyTrackingSessionMismatch display message.
+const dirtyTrackingMismatchMarker = "Dirty-tracking session mismatch"
+
+func isDirtyTrackingMismatchErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), dirtyTrackingMismatchMarker)
+}
+
 // ErrLayeredInvalidSnapshot is the firecracker fork's sentinel for a structurally
 // invalid layered restore (overlay/base size mismatch, huge-page overlay, block
 // size > page size, missing base). It is permanent — retrying or falling back to a
@@ -374,7 +390,7 @@ func VMState(ctx context.Context, socketPath string) (string, error) {
 	return info.State, nil
 }
 
-func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
+func CreateDiffSnapshot(socketPath, snapshotPath, memPath, expectedSessionID string) error {
 	fc := newFCClient(socketPath)
 	ctx := context.Background()
 
@@ -385,14 +401,29 @@ func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
 		return fmt.Errorf("pause VM: %w", err)
 	}
 
+	body := &models.SnapshotCreateParams{
+		SnapshotPath: &snapshotPath,
+		MemFilePath:  &memPath,
+		SnapshotType: models.SnapshotCreateParamsSnapshotTypeDiff,
+	}
+	// Guarded diff: Firecracker compares the token against the session it
+	// installed at load time and rejects — before consuming the bitmap or
+	// touching memPath — unless it matches exactly. The expected generation is
+	// always 0: vmd arms a fresh session per FC run and the pause is that
+	// run's only guarded snapshot, so any prior consumption (an ad-hoc full
+	// snapshot) shows up as a bumped generation and a clean rejection.
+	if expectedSessionID != "" {
+		var gen uint64
+		body.ExpectedSessionID = expectedSessionID
+		body.ExpectedGeneration = &gen
+	}
 	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
 		Context: ctx,
-		Body: &models.SnapshotCreateParams{
-			SnapshotPath: &snapshotPath,
-			MemFilePath:  &memPath,
-			SnapshotType: models.SnapshotCreateParamsSnapshotTypeDiff,
-		},
+		Body:    body,
 	}); err != nil {
+		if isDirtyTrackingMismatchErr(err) {
+			return fmt.Errorf("create diff snapshot: %w: %v", ErrDirtyTrackingMismatch, err)
+		}
 		return fmt.Errorf("create diff snapshot: %w", err)
 	}
 	return nil
@@ -525,6 +556,7 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 func RestoreSnapshotUffdInternalWithOverrides(
 	socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
 	trackDirty, abortOnHandlerDeath bool,
+	trackingSessionID string,
 ) error {
 	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -545,9 +577,12 @@ func RestoreSnapshotUffdInternalWithOverrides(
 				AbortOnHandlerDeath: abortOnHandlerDeath,
 			},
 			// Arms dirty-page tracking so the next pause can write an incremental
-			// (Diff) snapshot instead of a Full one.
-			TrackDirtyPages: trackDirty,
-			ResumeVM:        true,
+			// (Diff) snapshot instead of a Full one. The session id (guarded
+			// pause flag on) makes the armed bitmap provable: the pause's Diff
+			// request carries it back and Firecracker rejects a stale baseline.
+			TrackDirtyPages:   trackDirty,
+			TrackingSessionID: trackingSessionID,
+			ResumeVM:          true,
 			NetworkOverrides: []*models.NetworkOverride{
 				{IfaceID: &ifaceID, HostDevName: &tapDevice},
 			},

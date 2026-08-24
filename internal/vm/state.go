@@ -188,11 +188,19 @@ type VMRecord struct {
 	// restart: non-empty means MemFilePath is an overlay to be served over this
 	// base. Without it, resume would load the overlay standalone and read the
 	// base's pages as zero holes.
-	BaseMemPath string            `json:"base_mem_path,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	VCPU        uint32            `json:"vcpu"`
-	MemoryMiB   uint32            `json:"memory_mib"`
+	BaseMemPath string `json:"base_mem_path,omitempty"`
+	// The random token the running FC's dirty tracking was armed with (guarded
+	// pause flag on). Persisted so reattach after a vmd restart can keep the
+	// next pause incremental: the pause's Diff request carries the token back
+	// and Firecracker rejects it unless the bitmap is still the armed,
+	// unconsumed baseline — that atomic check, not this field, is the
+	// correctness boundary, so a stale value costs one rejected RPC and a Full
+	// pause, never a corrupt overlay.
+	DirtyTrackingSessionID string            `json:"dirty_tracking_session_id,omitempty"`
+	CreatedAt              time.Time         `json:"created_at"`
+	Metadata               map[string]string `json:"metadata,omitempty"`
+	VCPU                   uint32            `json:"vcpu"`
+	MemoryMiB              uint32            `json:"memory_mib"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
 	// dual-symlink mount namespace). DeltaDir is intentionally NOT
@@ -877,6 +885,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		SnapshotPath:               inst.SnapshotPath,
 		MemFilePath:                inst.MemFilePath,
 		BaseMemPath:                inst.BaseMemPath,
+		DirtyTrackingSessionID:     inst.DirtyTrackingSessionID,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
@@ -950,24 +959,32 @@ func toInstance(rec VMRecord) *VMInstance {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
 	return &VMInstance{
-		ID:                         rec.ID,
-		PID:                        rec.PID,
-		SocketPath:                 rec.SocketPath,
-		VsockPath:                  rec.VsockPath,
-		IP:                         rec.IP,
-		TAPDevice:                  rec.TAPDevice,
-		MACAddress:                 rec.MACAddress,
-		Status:                     rec.Status,
-		Unverified:                 rec.Unverified,
-		RevivalPending:             rec.RevivalPending,
-		RevivedDisk:                rec.RevivedDisk,
-		TeardownPending:            rec.TeardownPending,
-		RunDirID:                   rec.RunDirID,
-		Namespace:                  rec.Namespace,
-		DiskPath:                   rec.DiskPath,
-		SnapshotPath:               rec.SnapshotPath,
-		MemFilePath:                rec.MemFilePath,
-		BaseMemPath:                rec.BaseMemPath,
+		ID:                     rec.ID,
+		PID:                    rec.PID,
+		SocketPath:             rec.SocketPath,
+		VsockPath:              rec.VsockPath,
+		IP:                     rec.IP,
+		TAPDevice:              rec.TAPDevice,
+		MACAddress:             rec.MACAddress,
+		Status:                 rec.Status,
+		Unverified:             rec.Unverified,
+		RevivalPending:         rec.RevivalPending,
+		RevivedDisk:            rec.RevivedDisk,
+		TeardownPending:        rec.TeardownPending,
+		RunDirID:               rec.RunDirID,
+		Namespace:              rec.Namespace,
+		DiskPath:               rec.DiskPath,
+		SnapshotPath:           rec.SnapshotPath,
+		MemFilePath:            rec.MemFilePath,
+		BaseMemPath:            rec.BaseMemPath,
+		DirtyTrackingSessionID: rec.DirtyTrackingSessionID,
+		// Optimistic re-arm for an adopted running VM: the surviving FC's
+		// bitmap is intact, and the pause-time token check is the correctness
+		// boundary — if anything consumed the bitmap since the session was
+		// armed, the guarded Diff is rejected and that pause degrades to Full.
+		// Records without a session (flag off, or armed pre-flag) stay
+		// untracked and pause Full, exactly as before.
+		DirtyTracked:               rec.Status == StatusRunning && rec.DirtyTrackingSessionID != "",
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,

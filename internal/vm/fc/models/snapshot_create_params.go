@@ -20,6 +20,15 @@ type SnapshotCreateParams struct {
 	// Directory for block device delta files. When set, overlay block devices write delta files (containing only dirty blocks) into this directory, named {drive_id}.delta.
 	BlockDeltaDir string `json:"block_delta_dir,omitempty"`
 
+	// Expected dirty-bitmap generation accompanying expected_session_id (fork
+	// extension). Pointer so generation 0 — the common value — still serializes.
+	ExpectedGeneration *uint64 `json:"expected_generation,omitempty"`
+
+	// Expected dirty-tracking session id for a guarded snapshot (fork extension).
+	// Firecracker rejects the request before touching the dirty bitmap or any
+	// output file unless the token matches the session installed at load time.
+	ExpectedSessionID string `json:"expected_session_id,omitempty"`
+
 	// If true, bake each overlay's dirty blocks into its base.ext4 and zero the side-car bitmap. Only safe at template-creation time. Requires block_delta_dir.
 	Flatten bool `json:"flatten,omitempty"`
 
