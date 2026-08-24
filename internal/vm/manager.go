@@ -2602,9 +2602,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		warmthPath = base
 	}
 	tplAgeSecs := m.templateRestoreAge(warmthPath)
-	cpuPSI := psiSomeAvg10("/proc/pressure/cpu")
-	memPSI := psiSomeAvg10("/proc/pressure/memory")
-	ioPSI := psiSomeAvg10("/proc/pressure/io")
+	cpuPSI, memPSI, ioPSI := cachedPSI()
 
 	// Deterministic artifact/config preconditions, checked before ANY state
 	// changes: no provisional instance published (a refusal must not leave a
@@ -3032,11 +3030,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// the sample measures the probe (not unit stop + resource release +
 		// persist join) and the concurrent-destroy return below can't skip it.
 		m.recordPhases("restore", "", map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
-		// The console tail (FC log + guest serial) is the only witness to
-		// where the guest stalled between vCPU resume and first output; the
-		// teardown below deletes it, so capture it now. Failure path only —
-		// never touches a successful restore.
-		m.captureStallForensics(vmID, time.Since(tBoxdStart))
+		// The console (FC log + guest serial) is the only witness to where
+		// the guest stalled between vCPU resume and first output; the
+		// teardown below deletes it, so capture it now. Only for a genuine
+		// readiness timeout: a caller disconnect also lands here via ctx,
+		// and that aborting restore should neither pay the file read nor
+		// pollute the stall signal.
+		if ctx.Err() == nil {
+			m.captureStallForensics(vmID, time.Since(tBoxdStart))
+		}
 		// Teardown first — none of it touches BoltDB, so a stalled persist
 		// cannot keep the failed restore's unit and network alive.
 		m.stopUnitDuringRestoreError(vmID)
@@ -5522,6 +5524,31 @@ func waitForSocketConnectable(path string, deadline time.Time) error {
 	}
 }
 
+// psiSample caches the three PSI gauges: avg10 moves on a ten-second
+// window, so re-reading /proc on every semaphore-held restore buys nothing.
+// A burst of restores shares one refresh; a lone restore pays at most three
+// small /proc reads every cache period.
+type psiSample struct {
+	at            time.Time
+	cpu, mem, io1 float64
+}
+
+var psiCache atomic.Pointer[psiSample]
+
+func cachedPSI() (cpu, mem, io1 float64) {
+	if p := psiCache.Load(); p != nil && time.Since(p.at) < 2*time.Second {
+		return p.cpu, p.mem, p.io1
+	}
+	s := &psiSample{
+		at:  time.Now(),
+		cpu: psiSomeAvg10("/proc/pressure/cpu"),
+		mem: psiSomeAvg10("/proc/pressure/memory"),
+		io1: psiSomeAvg10("/proc/pressure/io"),
+	}
+	psiCache.Store(s)
+	return s.cpu, s.mem, s.io1
+}
+
 // tailFile returns up to n trailing bytes of the file and its total size.
 func tailFile(path string, n int64) (string, int64, error) {
 	f, err := os.Open(path)
@@ -5544,24 +5571,92 @@ func tailFile(path string, n int64) (string, int64, error) {
 	return string(buf), st.Size(), nil
 }
 
-// captureStallForensics logs the tail of a VM's console after the guest
-// failed to become ready. A guest that loads its snapshot and then never
-// produces output dies with no other evidence — the rundir (console
-// included) is deleted by the failure teardown. An empty console is itself
-// the strongest signal: the guest stalled before its first line, i.e. in
-// the resume/page-fault window rather than in boot userspace.
+// stallForensicsDirName holds quarantined consoles from readiness-timeout
+// teardowns, inside RunDir (dot-prefixed so it can never collide with a VM
+// id). Files are root-only: guest serial is tenant-controlled data and must
+// not reach service logs or wider-readable paths.
+const stallForensicsDirName = ".stall-forensics"
+
+// stallForensicsKeep caps the quarantine so a stall storm cannot grow it
+// unbounded; oldest are dropped first (names sort by capture time).
+const stallForensicsKeep = 20
+
+// summarizeConsoleTail classifies console lines without exposing content:
+// Firecracker's own lines (timestamp + [vmid:fc_*] prefix), boxd's lines,
+// and anything else — which can only be guest output. That split answers
+// the diagnostic question by itself: zero guest/boxd lines means the guest
+// stalled before its first output (the resume/page-fault window), while
+// boxd lines mean it reached userspace.
+func summarizeConsoleTail(tail string) (fcLines, boxdLines, guestLines int, panicked bool) {
+	for _, line := range strings.Split(tail, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "[boxd]"):
+			boxdLines++
+		case strings.Contains(line, ":fc_") && strings.HasPrefix(line, "20"):
+			fcLines++
+		default:
+			guestLines++
+		}
+	}
+	panicked = strings.Contains(tail, "Kernel panic")
+	return
+}
+
+// captureStallForensics records a content-free summary of a VM's console
+// after the guest failed to become ready, and quarantines the raw file
+// (root-only, capped) for operator inspection — the failure teardown would
+// otherwise delete the only evidence. An empty console is itself the
+// strongest signal: the guest stalled before its first line.
 func (m *Manager) captureStallForensics(vmID string, waited time.Duration) {
-	tail, size, err := tailFile(filepath.Join(m.cfg.RunDir, vmID, "console.log"), 4096)
+	src := filepath.Join(m.cfg.RunDir, vmID, "console.log")
+	tail, size, err := tailFile(src, 4096)
 	if err != nil {
 		m.log.Warn().Str("vm_id", vmID).Err(err).
 			Msg("guest not ready — console unavailable for forensics")
 		return
 	}
+	fcLines, boxdLines, guestLines, panicked := summarizeConsoleTail(tail)
+
+	dir := filepath.Join(m.cfg.RunDir, stallForensicsDirName)
+	preserved := ""
+	if err := os.MkdirAll(dir, 0o700); err == nil {
+		dst := filepath.Join(dir, fmt.Sprintf("%d-%s.console.log", time.Now().Unix(), vmID))
+		if err := os.Rename(src, dst); err == nil {
+			_ = os.Chmod(dst, 0o600)
+			preserved = dst
+			pruneOldest(dir, stallForensicsKeep)
+		}
+	}
+
 	m.log.Warn().Str("vm_id", vmID).
 		Int64("wait_boxd_ms", waited.Milliseconds()).
 		Int64("console_bytes", size).
-		Str("console_tail", tail).
-		Msg("guest not ready within the readiness window — tearing down; console tail follows")
+		Int("console_fc_lines", fcLines).
+		Int("console_boxd_lines", boxdLines).
+		Int("console_guest_lines", guestLines).
+		Bool("console_panic", panicked).
+		Str("console_preserved", preserved).
+		Msg("guest not ready within the readiness window — tearing down")
+}
+
+// pruneOldest keeps at most keep entries in dir, dropping the oldest by
+// name (names begin with the capture unix time).
+func pruneOldest(dir string, keep int) {
+	ents, err := os.ReadDir(dir)
+	if err != nil || len(ents) <= keep {
+		return
+	}
+	names := make([]string, 0, len(ents))
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	for _, n := range names[:len(names)-keep] {
+		_ = os.Remove(filepath.Join(dir, n))
+	}
 }
 
 // boxdHealthProbe is the /health poll behind waitForBoxd; a var so tests can
