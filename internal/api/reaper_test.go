@@ -162,7 +162,7 @@ func TestReaper_NothingExpired(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(context.Background(), 10, 1)
+	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
 
 	if atomic.LoadInt32(&pauseCalled) != 0 {
 		t.Fatal("PauseInstance should not be called when no sandboxes are expired")
@@ -195,7 +195,7 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(context.Background(), 10, 1)
+	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
 
 	if pausedID != row.ID.String() {
 		t.Fatalf("expected PauseInstance called with %s, got %q", row.ID, pausedID)
@@ -235,7 +235,7 @@ func TestReaper_VMDFails(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(context.Background(), 10, 1)
+	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
 
 	// Both sandboxes are attempted, and pauseWithRetry retries each failure
 	// once (a timed-out pause may have completed on the host), so 2 sandboxes
@@ -266,7 +266,7 @@ func TestReaper_DBError(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(context.Background(), 10, 1)
+	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
 
 	if atomic.LoadInt32(&pauseCalled) != 0 {
 		t.Fatal("PauseInstance should not be called when DB query fails")
@@ -293,7 +293,7 @@ func TestReaper_BatchSizeRespected(t *testing.T) {
 		&stubVMD{},
 	)
 
-	h.reapOnce(context.Background(), 7, 1)
+	h.reapOnce(context.Background(), 7, 1, zerolog.Nop())
 
 	if got := atomic.LoadInt32(&capturedLimit); got != 7 {
 		t.Fatalf("expected batch size 7 passed to query, got %d", got)
@@ -325,7 +325,7 @@ func TestReaper_ContextCancelledMidBatch(t *testing.T) {
 		}},
 	)
 
-	h.reapOnce(ctx, 10, 1)
+	h.reapOnce(ctx, 10, 1, zerolog.Nop())
 
 	// The loop checks ctx.Done() between each sandbox. After cancel() the loop
 	// should exit before processing all 5.
