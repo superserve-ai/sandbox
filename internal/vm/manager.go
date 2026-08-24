@@ -2604,6 +2604,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	tplAgeSecs := m.templateRestoreAge(warmthPath)
 	cpuPSI := psiSomeAvg10("/proc/pressure/cpu")
 	memPSI := psiSomeAvg10("/proc/pressure/memory")
+	ioPSI := psiSomeAvg10("/proc/pressure/io")
 
 	// Deterministic artifact/config preconditions, checked before ANY state
 	// changes: no provisional instance published (a refusal must not leave a
@@ -2835,6 +2836,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Bool("uffd", useUffd).
 			Float64("cpu_psi_avg10", cpuPSI).
 			Float64("mem_psi_avg10", memPSI).
+			Float64("io_psi_avg10", ioPSI).
 			Int("attempt", attempt).
 			Msg("restoring snapshot")
 		restorePhasesRecorded = true
