@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -709,5 +710,53 @@ func TestPressureReadyReopensAfterPredecessorBuildCgroupEmpties(t *testing.T) {
 	m.pendingBuildCgroups = nil
 	if !m.PressureReady() {
 		t.Fatal("PressureReady = false after the predecessor build cgroup emptied")
+	}
+}
+
+// vmStopUnconfirmed is in-memory: a restart forgets that a
+// cgroup-supervised Paused/Error record's stop never confirmed. Reattach
+// must reconstruct the marker from the still-populated group so pressure
+// keeps charging the live process past the settle window.
+func TestReattachReconstructsCgroupStopMarkers(t *testing.T) {
+	listActiveFCUnits = func(context.Context) ([]string, error) { return nil, nil }
+	defer func() { listActiveFCUnits = listActiveFirecrackerUnits }()
+
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	// Cgroup-supervised paused record; its group still has a member.
+	if err := st.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionCgroup}); err != nil {
+		t.Fatal(err)
+	}
+	tree := &cgroupTree{vms: filepath.Join(dir, "vms")}
+	if err := os.MkdirAll(tree.vmCgroupDir("vm-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree.vmCgroupDir("vm-1"), "cgroup.events"),
+		[]byte("populated 1\nfrozen 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: st, cgroups: tree,
+		vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	m.ReattachAll(context.Background())
+
+	if _, marked := m.vmStopUnconfirmed.Load("vm-1"); !marked {
+		t.Fatal("marker not reconstructed for a populated cgroup behind a paused record")
+	}
+
+	// An EMPTY group must not re-mark: the stop resolved before the
+	// restart.
+	if err := os.WriteFile(filepath.Join(tree.vmCgroupDir("vm-1"), "cgroup.events"),
+		[]byte("populated 0\nfrozen 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m2 := &Manager{log: zerolog.Nop(), state: st, cgroups: tree,
+		vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	m2.ReattachAll(context.Background())
+	if _, marked := m2.vmStopUnconfirmed.Load("vm-1"); marked {
+		t.Fatal("marker reconstructed for a provably empty cgroup")
 	}
 }

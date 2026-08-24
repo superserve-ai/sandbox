@@ -3399,6 +3399,37 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		}
 	}
 
+	// Reconstruct unconfirmed-stop markers the previous process took to
+	// its grave: vmStopUnconfirmed is in-memory, so a restart after a
+	// cgroup-supervised pause or failed spawn whose stop never confirmed
+	// forgets that the record's Paused/Error status may be lying. The
+	// unit mode re-learns through the settle window plus the reconciler's
+	// re-recording of lingering units; the cgroup mode has no such path,
+	// so probe each cgroup-supervised Paused/Error record once here —
+	// startup-only, one file read per such record, off every beat — and
+	// re-mark those whose group is still populated (or unreadable:
+	// unknown fails toward counting). The reconciler's eventual reap
+	// clears the marker through removeVM as usual.
+	type residueCheck struct{ id string }
+	var residues []residueCheck
+	m.mu.RLock()
+	for id, inst := range m.vms {
+		inst.mu.RLock()
+		if cgroupSupervised(inst.Supervision) &&
+			(inst.Status == StatusPaused || inst.Status == StatusError) {
+			residues = append(residues, residueCheck{id: id})
+		}
+		inst.mu.RUnlock()
+	}
+	m.mu.RUnlock()
+	for _, r := range residues {
+		if m.cgroupStillLive(r.id) {
+			m.vmStopUnconfirmed.Store(r.id, struct{}{})
+			m.log.Warn().Str("vm_id", r.id).
+				Msg("cgroup still populated behind a paused/error record after restart; allocation stays counted")
+		}
+	}
+
 	// Detect orphan units not in BoltDB, both supervision modes. The
 	// gate's scan covers every state that can hold a live process
 	// (activating and deactivating included), unlike the reconciler's
