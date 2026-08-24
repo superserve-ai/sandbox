@@ -199,6 +199,11 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	// skips persistence + reconciler for this throwaway VM.
 	if m.cfg.UffdEnabled && m.cfg.UffdPrefetchEnabled {
 		recordingVMID := "build-record-" + req.TemplateID
+		// The recorder-coverage window: from here until the allocation
+		// release below, this build's counters own the recorder id.
+		m.buildsMu.Lock()
+		rec.RecorderLive = true
+		m.buildsMu.Unlock()
 		accessLogPath := filepath.Join(snapshotDir, accessLogFilename)
 		recCfg := VMConfig{
 			VCPU:      req.VCPU,

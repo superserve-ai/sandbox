@@ -581,13 +581,19 @@ func TestBuildAllocCoversDistinguishesLeftovers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Current build VM and its recorder: exempt while the allocation
-	// still covers them.
+	// Current build VM: exempt while the allocation covers it. The
+	// recorder id is covered only during ITS recording window.
 	if !m.buildAllocCovers("build-row-uuid-1") {
 		t.Fatal("in-flight build cgroup not exempt")
 	}
+	if m.buildAllocCovers("build-record-tpl-a") {
+		t.Fatal("recorder covered outside its recording window")
+	}
+	m.buildsMu.Lock()
+	rec.RecorderLive = true
+	m.buildsMu.Unlock()
 	if !m.buildAllocCovers("build-record-tpl-a") {
-		t.Fatal("in-flight build's recorder cgroup not exempt")
+		t.Fatal("in-flight build's recorder cgroup not exempt during recording")
 	}
 	// Leftovers from a previous daemon: not exempt.
 	if m.buildAllocCovers("build-row-uuid-9") {
@@ -650,6 +656,9 @@ func TestCapacityPressureSkipsBuildInstances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	m.buildsMu.Lock()
+	recA.RecorderLive = true // recording in progress
+	m.buildsMu.Unlock()
 	p := m.CapacityPressure()
 	if p.RunningSandboxes != 1 {
 		t.Fatalf("running = %d, want 1 (recorder is not a customer sandbox)", p.RunningSandboxes)
@@ -829,5 +838,41 @@ func TestRestoreErrorCleanupMarksUnconfirmedCgroupStop(t *testing.T) {
 	m.stopUnitDuringRestoreError("vm-1")
 	if _, marked := m.vmStopUnconfirmed.Load("vm-1"); !marked {
 		t.Fatal("unconfirmed cgroup stop in restore-error cleanup did not set the marker")
+	}
+}
+
+// A recorder leaked by build A (teardown failed, allocation released)
+// must stay instance-counted even while build B of the SAME template
+// runs: B's counters carry only B's VMs, and template-scoped coverage
+// would re-hide the leak for B's whole lifetime.
+func TestLeakedRecorderNotHiddenByLaterBuild(t *testing.T) {
+	m := &Manager{
+		vms: map[string]*VMInstance{
+			"build-record-tpl-a": {Status: StatusRunning, Config: VMConfig{VCPU: 2, MemoryMiB: 4096}},
+		},
+		builds: map[string]*buildRecord{},
+	}
+	recA, err := m.registerBuild("build-a", "tpl-a", 2, 4096, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.buildsMu.Lock()
+	recA.RecorderLive = true
+	m.buildsMu.Unlock()
+	// A's recorder teardown fails; A releases its allocation and exits.
+	m.releaseBuildAlloc(recA, 2, 4096)
+	if !m.setBuildStatus("build-a", BuildStatusFailed) {
+		t.Fatal("fail transition")
+	}
+	m.buildPressureCount.Add(-1)
+
+	// Build B for the same template starts (not yet recording).
+	if _, err := m.registerBuild("build-b", "tpl-a", 4, 8192, func() {}); err != nil {
+		t.Fatal(err)
+	}
+	p := m.CapacityPressure()
+	// 8192 (B's counters) + 4096 (leaked recorder, instance-counted).
+	if p.AllocatedMemoryMib != 12288 || p.AllocatedVcpus != 6 {
+		t.Fatalf("allocations = %+v, want leaked recorder visible alongside B", p)
 	}
 }

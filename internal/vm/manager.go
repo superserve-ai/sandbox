@@ -3281,6 +3281,7 @@ func (m *Manager) releaseBuildAlloc(rec *buildRecord, vcpu, memoryMiB uint32) {
 		return
 	}
 	rec.AllocReleased = true
+	rec.RecorderLive = false
 	m.buildsMu.Unlock()
 	m.buildPressureMem.Add(-int64(memoryMiB))
 	m.buildPressureVcpus.Add(-int64(vcpu))
@@ -3308,8 +3309,14 @@ func (m *Manager) buildAllocCovers(id string) bool {
 	m.buildsMu.RLock()
 	defer m.buildsMu.RUnlock()
 	if tpl, ok := strings.CutPrefix(id, "build-record-"); ok {
+		// Phase-scoped, not template-scoped: only a build whose OWN
+		// recorder is currently expected covers this id. A recorder
+		// leaked by an earlier build (teardown failed, allocation
+		// released) must stay instance-counted even while a LATER build
+		// of the same template runs — that build's counters carry only
+		// its own VMs.
 		for _, rec := range m.builds {
-			if !rec.AllocReleased && rec.TemplateID == tpl {
+			if rec.RecorderLive && rec.TemplateID == tpl {
 				return true
 			}
 		}
@@ -4718,24 +4725,39 @@ func (m *Manager) PressureReady() bool {
 	if m.builderScanPending.Load() {
 		return false
 	}
+	// Snapshot under the lock, PROBE OUTSIDE it: cgroupDefinitelyDead is
+	// a filesystem read, and m.mu is the same mutex create/restore need
+	// to publish instances — holding it across cgroup I/O would put this
+	// beat's probes on the lifecycle hot path. Reacquire only to shrink
+	// the list; entries proven dead in this pass are dropped, anything
+	// else (including ids appended concurrently) is kept.
 	m.mu.Lock()
-	if len(m.pendingBuildCgroups) > 0 {
-		remaining := m.pendingBuildCgroups[:0]
-		for _, id := range m.pendingBuildCgroups {
+	pending := append([]string(nil), m.pendingBuildCgroups...)
+	m.mu.Unlock()
+	if len(pending) > 0 {
+		dead := make(map[string]bool, len(pending))
+		for _, id := range pending {
 			// Populated or unreadable keeps the gate closed; only a
 			// conclusively empty-or-absent group releases it. Bounded:
 			// one read per REMAINING leftover per beat, normally zero.
-			if m.cgroups == nil || !m.cgroupDefinitelyDead(id) {
+			if m.cgroups != nil && m.cgroupDefinitelyDead(id) {
+				dead[id] = true
+			}
+		}
+		m.mu.Lock()
+		remaining := m.pendingBuildCgroups[:0]
+		for _, id := range m.pendingBuildCgroups {
+			if !dead[id] {
 				remaining = append(remaining, id)
 			}
 		}
 		m.pendingBuildCgroups = remaining
-		if len(remaining) > 0 {
-			m.mu.Unlock()
+		open := len(remaining) == 0
+		m.mu.Unlock()
+		if !open {
 			return false
 		}
 	}
-	m.mu.Unlock()
 	if len(m.survivingBuilders) > 0 {
 		alive := m.builderAlive
 		if alive == nil {

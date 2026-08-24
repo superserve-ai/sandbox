@@ -48,11 +48,18 @@ type buildRecord struct {
 	// access-pattern recorder) is gone, even though the worker may keep
 	// hashing artifacts for minutes. Guarded by buildsMu.
 	AllocReleased bool
-	Status        BuildStatus
-	Result        *BuildTemplateResult // populated on ready
-	Error         string               // populated on failed/cancelled
-	StartedAt     time.Time
-	EndedAt       time.Time // zero until terminal
+	// RecorderLive marks the window in which THIS build's access-pattern
+	// recorder VM is expected in the instance map and covered by the
+	// build's counters. Recorder ids carry only the template, so without
+	// this phase bit a recorder LEAKED by an earlier build would be
+	// re-hidden by any later build of the same template. Guarded by
+	// buildsMu; cleared together with the allocation release.
+	RecorderLive bool
+	Status       BuildStatus
+	Result       *BuildTemplateResult // populated on ready
+	Error        string               // populated on failed/cancelled
+	StartedAt    time.Time
+	EndedAt      time.Time // zero until terminal
 
 	// cancel stops the goroutine running the build. Calling it under a
 	// non-terminal status transitions the record to cancelled once the
