@@ -328,17 +328,27 @@ func (h *Handlers) revertPauseAsync(c *gin.Context, sandboxID, teamID uuid.UUID,
 // vmdTimeout is the default deadline for VMD gRPC calls.
 const vmdTimeout = 30 * time.Second
 
+// vmdBootTimeout is the deadline for the boot (restore) call specifically.
+// It must exceed VMD's own in-VM readiness cap (30s): when a guest never
+// becomes ready, VMD tears it down at that cap and returns a definitive
+// error. With an equal client deadline the two race, and the client usually
+// loses — it sees a generic deadline, classifies it transient, and retries
+// into the torn-down VM's state, surfacing a misleading secondary error.
+// The margin lets VMD's verdict arrive in-band, which is both the honest
+// error and a non-retryable one.
+const vmdBootTimeout = 40 * time.Second
+
 // createInsertTimeout bounds the detached DB insert during sandbox create so a
 // Postgres restart cannot leave the write pending indefinitely after the boot
 // path has already given up. Kept at the same worst-case window as the
 // transient VMD retry budget.
-const createInsertTimeout = 2 * vmdTimeout
+const createInsertTimeout = 2 * vmdBootTimeout
 
-// retryTransientBoot runs one vmd boot call under vmdTimeout and, when the
+// retryTransientBoot runs one vmd boot call under vmdBootTimeout and, when the
 // attempt dies on a transient — DeadlineExceeded, or Unavailable that
 // outlived the dial-site interceptor's window — with the caller's context
-// still alive, runs exactly one more under a fresh vmdTimeout; worst case
-// 2×vmdTimeout for a caller that waits, which stays under Cloud Run's 300s
+// still alive, runs exactly one more under a fresh vmdBootTimeout; worst case
+// 2×vmdBootTimeout for a caller that waits, which stays under Cloud Run's 300s
 // request timeout (the real ceiling; a serverless backend has no LB-level
 // timeout). The daemon serializes same-ID boots and
 // recognizes a completed prior attempt, so the retry either adopts the VM
@@ -351,7 +361,7 @@ const createInsertTimeout = 2 * vmdTimeout
 // surprising the caller.)
 func retryTransientBoot(parent context.Context, sandboxID, hostID string, boot func(context.Context) (string, uint32, uint32, error)) (ip string, vcpu, memMiB uint32, retried bool, err error) {
 	attempt := func() (string, uint32, uint32, error) {
-		ctx, cancel := context.WithTimeout(parent, vmdTimeout)
+		ctx, cancel := context.WithTimeout(parent, vmdBootTimeout)
 		defer cancel()
 		return boot(ctx)
 	}
@@ -881,7 +891,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// retry, and the stateless fallback all draw down the same 2×vmdTimeout
 	// budget, so a resume holds the row mid-transition for a bounded window
 	// no matter which path it walks.
-	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdTimeout)
+	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdBootTimeout)
 	defer bootCancel()
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), sandbox.HostID, func(ctx context.Context) (string, uint32, uint32, error) {
 		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig)

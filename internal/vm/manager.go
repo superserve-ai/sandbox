@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -3029,6 +3030,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// the sample measures the probe (not unit stop + resource release +
 		// persist join) and the concurrent-destroy return below can't skip it.
 		m.recordPhases("restore", "", map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
+		// The console tail (FC log + guest serial) is the only witness to
+		// where the guest stalled between vCPU resume and first output; the
+		// teardown below deletes it, so capture it now. Failure path only —
+		// never touches a successful restore.
+		m.captureStallForensics(vmID, time.Since(tBoxdStart))
 		// Teardown first — none of it touches BoltDB, so a stalled persist
 		// cannot keep the failed restore's unit and network alive.
 		m.stopUnitDuringRestoreError(vmID)
@@ -5512,6 +5518,48 @@ func waitForSocketConnectable(path string, deadline time.Time) error {
 		time.Sleep(interval)
 		interval = min(interval*2, 10*time.Millisecond)
 	}
+}
+
+// tailFile returns up to n trailing bytes of the file and its total size.
+func tailFile(path string, n int64) (string, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	off := st.Size() - n
+	if off < 0 {
+		off = 0
+	}
+	buf := make([]byte, st.Size()-off)
+	if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+		return "", st.Size(), err
+	}
+	return string(buf), st.Size(), nil
+}
+
+// captureStallForensics logs the tail of a VM's console after the guest
+// failed to become ready. A guest that loads its snapshot and then never
+// produces output dies with no other evidence — the rundir (console
+// included) is deleted by the failure teardown. An empty console is itself
+// the strongest signal: the guest stalled before its first line, i.e. in
+// the resume/page-fault window rather than in boot userspace.
+func (m *Manager) captureStallForensics(vmID string, waited time.Duration) {
+	tail, size, err := tailFile(filepath.Join(m.cfg.RunDir, vmID, "console.log"), 4096)
+	if err != nil {
+		m.log.Warn().Str("vm_id", vmID).Err(err).
+			Msg("guest not ready — console unavailable for forensics")
+		return
+	}
+	m.log.Warn().Str("vm_id", vmID).
+		Int64("wait_boxd_ms", waited.Milliseconds()).
+		Int64("console_bytes", size).
+		Str("console_tail", tail).
+		Msg("guest not ready within the readiness window — tearing down; console tail follows")
 }
 
 // boxdHealthProbe is the /health poll behind waitForBoxd; a var so tests can
