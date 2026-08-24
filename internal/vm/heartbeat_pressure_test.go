@@ -157,6 +157,7 @@ func TestCapacityPressureCountsInstancesAndBuilds(t *testing.T) {
 	if _, err := m.registerBuild("b1", "tpl", 2, 4096, func() {}); err != nil {
 		t.Fatal(err)
 	}
+	seedPressureIndex(m)
 	p := m.CapacityPressure()
 	if p.RunningSandboxes != 2 || p.ProvisioningSandboxes != 2 || p.PausedSandboxes != 1 {
 		t.Fatalf("counts = %+v", p)
@@ -213,6 +214,7 @@ func TestCapacityPressureCountsErrorVMAllocations(t *testing.T) {
 	recordUnitStop(systemdUnitName("e-live"))
 	defer confirmUnitStopped(systemdUnitName("e-live"))
 
+	seedPressureIndex(m)
 	p := m.CapacityPressure()
 	if p.RunningSandboxes != 1 || p.ProvisioningSandboxes != 0 {
 		t.Fatalf("counts = %+v (error VMs must not count as running/provisioning)", p)
@@ -234,6 +236,7 @@ func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	seedPressureIndex(m)
 	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 4096 {
 		t.Fatalf("after register: %+v", p)
 	}
@@ -241,12 +244,14 @@ func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 	if !m.setBuildStatus("b1", BuildStatusCancelled) {
 		t.Fatal("cancel transition failed")
 	}
+	seedPressureIndex(m)
 	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 4096 {
 		t.Fatalf("after cancel (subprocess may live): %+v, want still counted", p)
 	}
 	// The last build VM exits: allocation returns, the workflow count
 	// holds until the worker itself returns (hash-only interval).
 	m.releaseBuildAlloc(rec, 2, 4096)
+	seedPressureIndex(m)
 	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 0 {
 		t.Fatalf("after VM exit: %+v, want allocation released but still provisioning", p)
 	}
@@ -256,6 +261,7 @@ func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 		t.Fatalf("mem counter = %d after double release, want 0", got)
 	}
 	m.buildPressureCount.Add(-1)
+	seedPressureIndex(m)
 	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 0 || p.AllocatedMemoryMib != 0 {
 		t.Fatalf("after worker exit: %+v, want fully released", p)
 	}
@@ -460,6 +466,7 @@ func TestCapacityPressureCountsLivePausedWindows(t *testing.T) {
 	recordUnitStop(systemdUnitName("unstopped"))
 	defer confirmUnitStopped(systemdUnitName("unstopped"))
 
+	seedPressureIndex(m)
 	p := m.CapacityPressure()
 	if p.PausedSandboxes != 3 {
 		t.Fatalf("paused = %d, want 3", p.PausedSandboxes)
@@ -631,10 +638,12 @@ func TestCapacityPressureCountsUnconfirmedCgroupStop(t *testing.T) {
 		"cg1": {Status: StatusPaused, Config: VMConfig{VCPU: 4, MemoryMiB: 2048}},
 	}}
 	m.vmStopUnconfirmed.Store("cg1", struct{}{})
+	seedPressureIndex(m)
 	if p := m.CapacityPressure(); p.AllocatedMemoryMib != 2048 || p.AllocatedVcpus != 4 {
 		t.Fatalf("allocations = %+v, want the unconfirmed-stop VM counted", p)
 	}
 	m.vmStopUnconfirmed.Delete("cg1")
+	seedPressureIndex(m)
 	if p := m.CapacityPressure(); p.AllocatedMemoryMib != 0 {
 		t.Fatalf("allocations = %+v, want zero after the stop was resolved", p)
 	}
@@ -659,6 +668,7 @@ func TestCapacityPressureSkipsBuildInstances(t *testing.T) {
 	m.buildsMu.Lock()
 	recA.RecorderLive = true // recording in progress
 	m.buildsMu.Unlock()
+	seedPressureIndex(m)
 	p := m.CapacityPressure()
 	if p.RunningSandboxes != 1 {
 		t.Fatalf("running = %d, want 1 (recorder is not a customer sandbox)", p.RunningSandboxes)
@@ -672,6 +682,7 @@ func TestCapacityPressureSkipsBuildInstances(t *testing.T) {
 	// returned, recorder still alive in the map. It must now be counted
 	// directly — the leaked process would otherwise be invisible forever.
 	m.releaseBuildAlloc(recA, 2, 4096)
+	seedPressureIndex(m)
 	p = m.CapacityPressure()
 	if p.AllocatedMemoryMib != 4608 || p.AllocatedVcpus != 3 {
 		t.Fatalf("allocations = %+v, want the leaked recorder counted by the instance loop", p)
@@ -870,6 +881,7 @@ func TestLeakedRecorderNotHiddenByLaterBuild(t *testing.T) {
 	if _, err := m.registerBuild("build-b", "tpl-a", 4, 8192, func() {}); err != nil {
 		t.Fatal(err)
 	}
+	seedPressureIndex(m)
 	p := m.CapacityPressure()
 	// 8192 (B's counters) + 4096 (leaked recorder, instance-counted).
 	if p.AllocatedMemoryMib != 12288 || p.AllocatedVcpus != 6 {
@@ -912,5 +924,13 @@ func TestRestoreErrorCleanupClearsStaleMarkerOnConfirmedStop(t *testing.T) {
 	m.stopUnitDuringRestoreError("vm-1")
 	if _, marked := m.vmStopUnconfirmed.Load("vm-1"); marked {
 		t.Fatal("stale marker survived a confirmed stop; a gone process stays charged forever")
+	}
+}
+
+// seedPressureIndex mirrors a test-constructed vms map into the pressure
+// index, as the production membership helpers do.
+func seedPressureIndex(m *Manager) {
+	for id, inst := range m.vms {
+		m.indexVM(id, inst)
 	}
 }

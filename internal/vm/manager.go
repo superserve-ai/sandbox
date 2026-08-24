@@ -507,6 +507,15 @@ type Manager struct {
 	// polls the remaining set, and the list only shrinks. Guarded by
 	// m.mu.
 	pendingBuildCgroups []string
+	// pressureIndex mirrors m.vms membership for CapacityPressure: the
+	// beat ranges this sync.Map instead of copying the instance map under
+	// m.mu, so per-heartbeat telemetry never contends the lifecycle mutex
+	// cold boot and restore need to publish instances (an O(fleet) copy
+	// under that lock would stall them, scaled by the host's population).
+	// Maintained ONLY by indexVM/unindexVM, called adjacent to every
+	// m.vms insert/delete inside the same locked sections.
+	pressureIndex sync.Map // vmID -> *VMInstance
+
 	// vmStopUnconfirmed marks VMs whose stop could not be confirmed
 	// dead, in EITHER supervision mode and from EITHER origin — a pause
 	// whose stop failed, or a failed spawn whose cleanup could not prove
@@ -984,6 +993,7 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 		seed(inst)
 	}
 	m.vms[vmID] = inst
+	m.indexVM(vmID, inst)
 	m.mu.Unlock()
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
@@ -2240,8 +2250,19 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	// nothing spawned (stopVM is idempotent on a missing group or unit).
 	defer func() {
 		sctx, scancel := context.WithTimeout(context.Background(), stopUnitBudget)
-		_ = m.stopVM(sctx, vmID, verifySupervision)
+		stopErr := m.stopVM(sctx, vmID, verifySupervision)
 		scancel()
+		// Same verdict rule as pause and restore-error cleanup: the
+		// throwaway FC's memory is real until its death is proven, and
+		// the instance reads Paused — invisible to pressure without the
+		// marker. Resolution (including empty-group-with-failed-rmdir)
+		// clears any stale marker instead.
+		if stopErr == nil ||
+			(cgroupSupervised(verifySupervision) && m.cgroupDefinitelyDead(vmID)) {
+			m.vmStopUnconfirmed.Delete(vmID)
+		} else {
+			m.vmStopUnconfirmed.Store(vmID, struct{}{})
+		}
 	}()
 	if err != nil {
 		return "", fmt.Errorf("start firecracker for verify: %w", err)
@@ -2715,6 +2736,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		prevSupervision = prevInst.Supervision
 		prevInst.mu.RUnlock()
 		delete(m.vms, vmID)
+		m.unindexVM(vmID)
 		m.mu.Unlock()
 		_ = m.stopVM(ctx, vmID, prevSupervision)
 		m.mu.Lock()
@@ -2744,6 +2766,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		PreviewTokenPolicyRevision: inferPreviewTokenPolicyRevision(previewPorts, previewPolicyRevision),
 	}
 	m.vms[vmID] = inst
+	m.indexVM(vmID, inst)
 	m.mu.Unlock()
 
 	// A provably-fresh unit name — no known instance (lazyReattach already
@@ -3326,6 +3349,11 @@ func (m *Manager) buildAllocCovers(id string) bool {
 	return ok && !rec.AllocReleased
 }
 
+// indexVM and unindexVM keep pressureIndex in lockstep with m.vms; call
+// adjacent to every membership change, inside the same locked section.
+func (m *Manager) indexVM(id string, inst *VMInstance) { m.pressureIndex.Store(id, inst) }
+func (m *Manager) unindexVM(id string)                 { m.pressureIndex.Delete(id) }
+
 // vmKnownNow reports whether id is represented in the CURRENT instance
 // map or state store — as opposed to ReattachAll's startup-time record
 // snapshot. The orphan scans run in a background pass that concurrent
@@ -3885,6 +3913,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		return existing, true
 	}
 	m.vms[rec.ID] = inst
+	m.indexVM(rec.ID, inst)
 	m.mu.Unlock()
 
 	// Commit only if a concurrent DestroyVM didn't delete the record during
@@ -4272,6 +4301,7 @@ func (m *Manager) handleVMError(vmID string, origErr error) error {
 	inst.Status = StatusStopped
 	inst.mu.Unlock()
 	delete(m.vms, vmID)
+	m.unindexVM(vmID)
 	m.mu.Unlock()
 
 	m.log.Warn().Str("vm_id", vmID).Err(origErr).
@@ -4916,12 +4946,14 @@ func (m *Manager) CapacityPressure() HostPressure {
 		id   string
 		inst *VMInstance
 	}
-	m.mu.RLock()
-	instances := make([]instSnap, 0, len(m.vms))
-	for id, inst := range m.vms {
-		instances = append(instances, instSnap{id: id, inst: inst})
-	}
-	m.mu.RUnlock()
+	// Range the membership mirror, never m.vms: the walk is fleet-sized,
+	// and holding (even read-locking) the lifecycle mutex for it once per
+	// beat would stall cold boot and restore publishes behind telemetry.
+	var instances []instSnap
+	m.pressureIndex.Range(func(k, v any) bool {
+		instances = append(instances, instSnap{id: k.(string), inst: v.(*VMInstance)})
+		return true
+	})
 	for _, snap := range instances {
 		// Build-pipeline VMs in the instance map (the access-pattern
 		// recorder that RecordAccessPattern restores) are skipped ONLY
@@ -5386,6 +5418,7 @@ func (m *Manager) recordDeleted(vmID string) bool {
 func (m *Manager) undoReattach(vmID string) {
 	m.mu.Lock()
 	delete(m.vms, vmID)
+	m.unindexVM(vmID)
 	m.mu.Unlock()
 	m.netMgr.Forget(vmID)
 }
@@ -5430,6 +5463,7 @@ func (m *Manager) deleteStateForce(vmID string) {
 func (m *Manager) removeVM(vmID string) {
 	m.mu.Lock()
 	delete(m.vms, vmID)
+	m.unindexVM(vmID)
 	m.mu.Unlock()
 	m.vmStopUnconfirmed.Delete(vmID)
 	m.deleteState(vmID)
