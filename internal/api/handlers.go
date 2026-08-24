@@ -329,13 +329,13 @@ func (h *Handlers) revertPauseAsync(c *gin.Context, sandboxID, teamID uuid.UUID,
 const vmdTimeout = 30 * time.Second
 
 // vmdBootTimeout is the deadline for the boot (restore) call specifically.
-// It must exceed VMD's own in-VM readiness cap (30s): when a guest never
-// becomes ready, VMD tears it down at that cap and returns a definitive
-// error. With an equal client deadline the two race, and the client usually
-// loses — it sees a generic deadline, classifies it transient, and retries
-// into the torn-down VM's state, surfacing a misleading secondary error.
-// The margin lets VMD's verdict arrive in-band, which is both the honest
-// error and a non-retryable one.
+// It exceeds VMD's in-VM readiness cap (30s) so a guest that never becomes
+// ready yields VMD's definitive teardown error instead of a bare deadline —
+// which reads as transient and gets retried into the torn-down VM's state.
+// VMD guarantees the in-band verdict for ANY value here by clamping its
+// readiness wait to the RPC deadline; this margin simply grants the full
+// readiness window when setup is quick, rather than defining the race away
+// by arithmetic.
 const vmdBootTimeout = 40 * time.Second
 
 // createInsertTimeout bounds the detached DB insert during sandbox create so a

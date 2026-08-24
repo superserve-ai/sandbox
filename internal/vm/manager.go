@@ -3025,7 +3025,20 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// overlay from cold storage (first resume of a migrated VM, page cache
 	// evicted) legitimately needs more than a warm same-host resume, and a
 	// timeout here is destructive — the error path below tears down the VM.
-	if err := m.waitForBoxd(ctx, hostIP, 30*time.Second); err != nil {
+	//
+	// The window is clamped to the RPC deadline (less a teardown-and-reply
+	// margin) so the DEFINITIVE verdict always reaches the caller in-band:
+	// when setup ate into the budget, a shorter readiness wait plus an
+	// honest error beats letting the caller's deadline win the race — a
+	// bare DeadlineExceeded reads as transient and gets retried into this
+	// VM's torn-down state.
+	readiness := 30 * time.Second
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl) - 2*time.Second; remaining < readiness {
+			readiness = remaining
+		}
+	}
+	if err := m.waitForBoxd(ctx, hostIP, readiness); err != nil {
 		// Emit the exhausted readiness wait immediately, before teardown, so
 		// the sample measures the probe (not unit stop + resource release +
 		// persist join) and the concurrent-destroy return below can't skip it.
@@ -5613,23 +5626,36 @@ func summarizeConsoleTail(tail string) (fcLines, boxdLines, guestLines int, pani
 func (m *Manager) captureStallForensics(vmID string, waited time.Duration) {
 	src := filepath.Join(m.cfg.RunDir, vmID, "console.log")
 	tail, size, err := tailFile(src, 4096)
-	if err != nil {
-		m.log.Warn().Str("vm_id", vmID).Err(err).
-			Msg("guest not ready — console unavailable for forensics")
-		return
+	preserved := ""
+	if err == nil {
+		// Direct-spawn mode: the console file is about to be deleted by the
+		// teardown, so quarantine it (root-only, capped).
+		dir := filepath.Join(m.cfg.RunDir, stallForensicsDirName)
+		if mkErr := os.MkdirAll(dir, 0o700); mkErr == nil {
+			dst := filepath.Join(dir, fmt.Sprintf("%d-%s.console.log", time.Now().Unix(), vmID))
+			if rnErr := os.Rename(src, dst); rnErr == nil {
+				_ = os.Chmod(dst, 0o600)
+				preserved = dst
+				pruneOldest(dir, stallForensicsKeep)
+			}
+		}
+	} else {
+		// Unit-supervised mode has no per-VM console file — FC's output goes
+		// to journald, which survives the teardown on its own, so a summary
+		// is all that's needed. Failure path only; bounded.
+		jctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		out, jErr := exec.CommandContext(jctx, "journalctl", "-u", systemdUnitName(vmID),
+			"-n", "60", "--no-pager", "-o", "cat").Output()
+		if jErr != nil {
+			m.log.Warn().Str("vm_id", vmID).Err(err).AnErr("journal_err", jErr).
+				Msg("guest not ready — console unavailable for forensics")
+			return
+		}
+		tail, size = string(out), int64(len(out))
+		preserved = "journald"
 	}
 	fcLines, boxdLines, guestLines, panicked := summarizeConsoleTail(tail)
-
-	dir := filepath.Join(m.cfg.RunDir, stallForensicsDirName)
-	preserved := ""
-	if err := os.MkdirAll(dir, 0o700); err == nil {
-		dst := filepath.Join(dir, fmt.Sprintf("%d-%s.console.log", time.Now().Unix(), vmID))
-		if err := os.Rename(src, dst); err == nil {
-			_ = os.Chmod(dst, 0o600)
-			preserved = dst
-			pruneOldest(dir, stallForensicsKeep)
-		}
-	}
 
 	m.log.Warn().Str("vm_id", vmID).
 		Int64("wait_boxd_ms", waited.Milliseconds()).
