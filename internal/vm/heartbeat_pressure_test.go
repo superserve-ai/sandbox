@@ -997,3 +997,29 @@ func TestBuilderProcAliveVerdicts(t *testing.T) {
 		t.Fatal("absent process read as alive")
 	}
 }
+
+// An in-place restore stops the previous Firecracker before installing
+// its replacement: through that window the OLD instance must stay
+// visible to pressure (the index entry survives the map delete), and the
+// replacement overwrites the same key when installed.
+func TestInPlaceReplaceKeepsOldInstanceIndexed(t *testing.T) {
+	m := &Manager{vms: map[string]*VMInstance{}}
+	old := &VMInstance{Status: StatusRunning, Config: VMConfig{VCPU: 4, MemoryMiB: 2048}}
+	m.vms["vm-1"] = old
+	m.indexVM("vm-1", old)
+
+	// The in-place window: removed from the map, stop in flight — but
+	// still indexed.
+	delete(m.vms, "vm-1")
+	if p := m.CapacityPressure(); p.AllocatedMemoryMib != 2048 {
+		t.Fatalf("allocations = %+v, want the stopping VM still counted", p)
+	}
+
+	// Replacement installs over the same key.
+	repl := &VMInstance{Status: StatusCreating, Config: VMConfig{VCPU: 2, MemoryMiB: 1024}}
+	m.vms["vm-1"] = repl
+	m.indexVM("vm-1", repl)
+	if p := m.CapacityPressure(); p.AllocatedMemoryMib != 1024 || p.ProvisioningSandboxes != 1 {
+		t.Fatalf("allocations = %+v, want only the replacement counted", p)
+	}
+}

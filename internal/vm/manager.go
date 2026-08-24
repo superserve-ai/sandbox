@@ -2736,7 +2736,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		prevSupervision = prevInst.Supervision
 		prevInst.mu.RUnlock()
 		delete(m.vms, vmID)
-		m.unindexVM(vmID)
+		// Deliberately NOT unindexed: the old Firecracker is live until
+		// the stop below completes (and stays live if it doesn't), and a
+		// heartbeat during that window must keep counting its memory.
+		// The replacement's indexVM a few lines down overwrites the same
+		// key, so the old entry's lifetime ends exactly when the
+		// StatusCreating instance takes over the id — no window in which
+		// this VM's resources are invisible to pressure.
 		m.mu.Unlock()
 		_ = m.stopVM(ctx, vmID, prevSupervision)
 		m.mu.Lock()
