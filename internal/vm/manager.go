@@ -3050,7 +3050,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// and that aborting restore should neither pay the file read nor
 		// pollute the stall signal.
 		if ctx.Err() == nil {
-			m.captureStallForensics(vmID, time.Since(tBoxdStart))
+			m.captureStallForensics(vmID, time.Since(tBoxdStart), tAttemptStart)
 		}
 		// Teardown first — none of it touches BoltDB, so a stalled persist
 		// cannot keep the failed restore's unit and network alive.
@@ -5623,13 +5623,16 @@ func summarizeConsoleTail(tail string) (fcLines, boxdLines, guestLines int, pani
 // (root-only, capped) for operator inspection — the failure teardown would
 // otherwise delete the only evidence. An empty console is itself the
 // strongest signal: the guest stalled before its first line.
-func (m *Manager) captureStallForensics(vmID string, waited time.Duration) {
+//
+// Only the console-file rename runs synchronously (microseconds, and it must
+// beat the teardown's rundir delete). The unit-supervised fallback shells to
+// journalctl, so it runs detached: the journal survives the teardown on its
+// own, and the reply path must not spend its in-band-verdict margin on it.
+func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launchedAt time.Time) {
 	src := filepath.Join(m.cfg.RunDir, vmID, "console.log")
 	tail, size, err := tailFile(src, 4096)
-	preserved := ""
 	if err == nil {
-		// Direct-spawn mode: the console file is about to be deleted by the
-		// teardown, so quarantine it (root-only, capped).
+		preserved := ""
 		dir := filepath.Join(m.cfg.RunDir, stallForensicsDirName)
 		if mkErr := os.MkdirAll(dir, 0o700); mkErr == nil {
 			dst := filepath.Join(dir, fmt.Sprintf("%d-%s.console.log", time.Now().Unix(), vmID))
@@ -5639,24 +5642,30 @@ func (m *Manager) captureStallForensics(vmID string, waited time.Duration) {
 				pruneOldest(dir, stallForensicsKeep)
 			}
 		}
-	} else {
-		// Unit-supervised mode has no per-VM console file — FC's output goes
-		// to journald, which survives the teardown on its own, so a summary
-		// is all that's needed. Failure path only; bounded.
-		jctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		m.logStallSummary(vmID, waited, tail, size, preserved)
+		return
+	}
+	go func() {
+		defer sentrylog.Recover("stall-forensics-journal")
+		jctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		// --since bounds the sample to THIS launch: -u alone would mix in a
+		// prior invocation of the same unit name (old boxd output or an old
+		// panic would be attributed to this failure).
 		out, jErr := exec.CommandContext(jctx, "journalctl", "-u", systemdUnitName(vmID),
+			"--since", "@"+strconv.FormatInt(launchedAt.Unix(), 10),
 			"-n", "60", "--no-pager", "-o", "cat").Output()
 		if jErr != nil {
 			m.log.Warn().Str("vm_id", vmID).Err(err).AnErr("journal_err", jErr).
 				Msg("guest not ready — console unavailable for forensics")
 			return
 		}
-		tail, size = string(out), int64(len(out))
-		preserved = "journald"
-	}
-	fcLines, boxdLines, guestLines, panicked := summarizeConsoleTail(tail)
+		m.logStallSummary(vmID, waited, string(out), int64(len(out)), "journald")
+	}()
+}
 
+func (m *Manager) logStallSummary(vmID string, waited time.Duration, tail string, size int64, preserved string) {
+	fcLines, boxdLines, guestLines, panicked := summarizeConsoleTail(tail)
 	m.log.Warn().Str("vm_id", vmID).
 		Int64("wait_boxd_ms", waited.Milliseconds()).
 		Int64("console_bytes", size).
