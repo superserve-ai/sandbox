@@ -3026,15 +3026,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// evicted) legitimately needs more than a warm same-host resume, and a
 	// timeout here is destructive — the error path below tears down the VM.
 	//
-	// The window is clamped to the RPC deadline (less a teardown-and-reply
-	// margin) so the DEFINITIVE verdict always reaches the caller in-band:
-	// when setup ate into the budget, a shorter readiness wait plus an
-	// honest error beats letting the caller's deadline win the race — a
-	// bare DeadlineExceeded reads as transient and gets retried into this
-	// VM's torn-down state.
+	// The window is clamped to the RPC deadline less the WORST-CASE error
+	// path — the verdict returns only after teardown, so the reserve must
+	// cover it: the 10s bounded unit stop, the 2s surviving-unit resolve,
+	// and a reply margin. Then the DEFINITIVE verdict always reaches the
+	// caller in-band even when setup ate into the budget and the stop is
+	// stuck at its bound: an honest early error beats letting the caller's
+	// deadline win the race — a bare DeadlineExceeded reads as transient
+	// and gets retried into this VM's torn-down state.
+	const restoreVerdictReserve = 13 * time.Second
 	readiness := 30 * time.Second
 	if dl, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(dl) - 2*time.Second; remaining < readiness {
+		if remaining := time.Until(dl) - restoreVerdictReserve; remaining < readiness {
 			readiness = remaining
 		}
 	}
@@ -4888,7 +4891,7 @@ func isLeafName(s string) bool {
 // isReservedRunDirName reports whether name is a shared dir under RunDir
 // (template mount target, build tree) rather than a per-VM dir.
 func isReservedRunDirName(name string) bool {
-	return name == templateDirName || name == TemplatesDirName
+	return name == templateDirName || name == TemplatesDirName || name == stallForensicsDirName
 }
 
 // abortResumeLocked reverts a freshly-resumed VM back to Paused when a
@@ -5546,12 +5549,27 @@ type psiSample struct {
 	cpu, mem, io1 float64
 }
 
-var psiCache atomic.Pointer[psiSample]
+var (
+	psiCache      atomic.Pointer[psiSample]
+	psiRefreshing atomic.Bool
+)
 
 func cachedPSI() (cpu, mem, io1 float64) {
-	if p := psiCache.Load(); p != nil && time.Since(p.at) < 2*time.Second {
+	p := psiCache.Load()
+	if p != nil && time.Since(p.at) < 2*time.Second {
 		return p.cpu, p.mem, p.io1
 	}
+	// Exactly one caller refreshes; a concurrent burst on an expired cache
+	// serves the stale sample instead of stacking /proc reads on the
+	// semaphore-held path (avg10 moves on a ten-second window — staleness
+	// is immaterial, per-restore syscalls are not).
+	if !psiRefreshing.CompareAndSwap(false, true) {
+		if p != nil {
+			return p.cpu, p.mem, p.io1
+		}
+		return -1, -1, -1
+	}
+	defer psiRefreshing.Store(false)
 	s := &psiSample{
 		at:  time.Now(),
 		cpu: psiSomeAvg10("/proc/pressure/cpu"),

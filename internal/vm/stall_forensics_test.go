@@ -63,6 +63,15 @@ func TestSummarizeConsoleTail(t *testing.T) {
 	}
 }
 
+func TestForensicsDirNameIsReserved(t *testing.T) {
+	// The quarantine shares RunDir with per-VM dirs; a VM id equal to the
+	// directory name would alias it — restore cleanup could delete evidence
+	// and pruning could delete VM runtime files.
+	if !isReservedRunDirName(stallForensicsDirName) {
+		t.Fatal("stall-forensics dir name must be a reserved rundir name")
+	}
+}
+
 func TestPruneOldest(t *testing.T) {
 	dir := t.TempDir()
 	for i := 0; i < 5; i++ {

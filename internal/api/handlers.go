@@ -333,10 +333,10 @@ const vmdTimeout = 30 * time.Second
 // ready yields VMD's definitive teardown error instead of a bare deadline —
 // which reads as transient and gets retried into the torn-down VM's state.
 // VMD guarantees the in-band verdict for ANY value here by clamping its
-// readiness wait to the RPC deadline; this margin simply grants the full
-// readiness window when setup is quick, rather than defining the race away
-// by arithmetic.
-const vmdBootTimeout = 40 * time.Second
+// readiness wait to the deadline minus its worst-case error path (~13s of
+// bounded teardown); 45s grants the full 30s readiness window when setup is
+// quick, rather than defining the race away by arithmetic.
+const vmdBootTimeout = 45 * time.Second
 
 // createInsertTimeout bounds the detached DB insert during sandbox create so a
 // Postgres restart cannot leave the write pending indefinitely after the boot
