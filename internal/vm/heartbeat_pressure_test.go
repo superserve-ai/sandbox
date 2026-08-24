@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -512,9 +513,9 @@ func TestPressureReadyClosedWhileBuilderScanPending(t *testing.T) {
 	m.reattachComplete.Store(true)
 
 	release := make(chan struct{})
-	m.builderScan = func(string) []builderProc {
+	m.builderScan = func(string) ([]builderProc, error) {
 		<-release
-		return nil
+		return nil, nil
 	}
 	m.ScanSurvivingBuildersAsync("/usr/local/bin/template-builder")
 	if m.PressureReady() {
@@ -571,7 +572,11 @@ func TestFindSurvivingBuildersExcludesOwnChildren(t *testing.T) {
 	}
 	defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
 
-	for _, bp := range findSurvivingBuilders("/bin/sleep") {
+	survivors, err := findSurvivingBuilders("/bin/sleep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bp := range survivors {
 		if bp.pid == cmd.Process.Pid {
 			t.Fatal("own child classified as a predecessor survivor")
 		}
@@ -932,5 +937,63 @@ func TestRestoreErrorCleanupClearsStaleMarkerOnConfirmedStop(t *testing.T) {
 func seedPressureIndex(m *Manager) {
 	for id, inst := range m.vms {
 		m.indexVM(id, inst)
+	}
+}
+
+// A failed scan must keep the gate closed and retry — never convert to
+// an empty success — and only a successful scan clears the pending flag.
+func TestSurvivorScanRetriesOnFailure(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	m.reattachComplete.Store(true)
+	calls := 0
+	m.builderScan = func(string) ([]builderProc, error) {
+		calls++
+		if calls == 1 {
+			return nil, os.ErrDeadlineExceeded // transient failure
+		}
+		return nil, nil
+	}
+	m.ScanSurvivingBuildersAsync("/usr/local/bin/template-builder")
+	// While the first attempt has failed and the retry waits, the gate
+	// must be closed.
+	deadline := time.Now().Add(5 * time.Second)
+	for m.PressureReady() {
+		if time.Now().After(deadline) {
+			t.Fatal("gate open during failed survivor scan")
+		}
+		time.Sleep(2 * time.Millisecond)
+		if calls >= 2 {
+			break
+		}
+	}
+	// The retry (1s backoff) succeeds and the gate opens.
+	deadline = time.Now().Add(5 * time.Second)
+	for !m.PressureReady() {
+		if time.Now().After(deadline) {
+			t.Fatalf("gate never opened after scan succeeded (calls=%d)", calls)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Identity probing is three-way: absent stat = gone, mismatched start =
+// recycled = gone, everything else inconclusive = retained.
+func TestBuilderProcAliveVerdicts(t *testing.T) {
+	// A real live process (ourselves): matching identity = alive.
+	self := os.Getpid()
+	start, ok := procStartTime(strconv.Itoa(self))
+	if !ok {
+		t.Skip("cannot read own stat")
+	}
+	if !builderProcAlive(builderProc{pid: self, start: start}) {
+		t.Fatal("live process with matching identity read as gone")
+	}
+	// Same pid, wrong start time: recycled → gone.
+	if builderProcAlive(builderProc{pid: self, start: start + 999}) {
+		t.Fatal("recycled identity read as alive")
+	}
+	// Nonexistent pid: conclusively gone.
+	if builderProcAlive(builderProc{pid: 1 << 22, start: 1}) {
+		t.Fatal("absent process read as alive")
 	}
 }

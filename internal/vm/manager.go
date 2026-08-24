@@ -539,7 +539,7 @@ type Manager struct {
 	// store/load pair orders the write for the heartbeat's reader).
 	builderScanPending atomic.Bool
 	// builderScan is a test seam over findSurvivingBuilders.
-	builderScan func(builderBin string) []builderProc
+	builderScan func(builderBin string) ([]builderProc, error)
 
 	// reattachComplete gates pressure publication: until the background
 	// reattach has rebuilt the instance map, CapacityPressure would
@@ -4727,17 +4727,33 @@ func (m *Manager) ScanSurvivingBuildersAsync(builderBin string) {
 		if scan == nil {
 			scan = findSurvivingBuilders
 		}
-		procs := scan(builderBin)
-		if len(procs) > 0 {
-			pids := make([]int, 0, len(procs))
-			for _, bp := range procs {
-				pids = append(pids, bp.pid)
+		// Retry with backoff until a scan SUCCEEDS; the gate stays closed
+		// throughout. A transiently unreadable /proc must never read as
+		// "no survivors" — that would publish an undercount for the rest
+		// of a predecessor build's lifetime.
+		backoff := time.Second
+		for {
+			procs, err := scan(builderBin)
+			if err == nil {
+				if len(procs) > 0 {
+					pids := make([]int, 0, len(procs))
+					for _, bp := range procs {
+						pids = append(pids, bp.pid)
+					}
+					m.log.Warn().Ints("pids", pids).
+						Msg("surviving template-builder processes detected; pressure publication deferred until they exit")
+				}
+				m.survivingBuilders = procs
+				m.builderScanPending.Store(false)
+				return
 			}
-			m.log.Warn().Ints("pids", pids).
-				Msg("surviving template-builder processes detected; pressure publication deferred until they exit")
+			m.log.Warn().Err(err).Dur("retry_in", backoff).
+				Msg("survivor scan failed; pressure publication stays deferred")
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
 		}
-		m.survivingBuilders = procs
-		m.builderScanPending.Store(false)
 	}()
 }
 
@@ -4808,14 +4824,27 @@ func (m *Manager) PressureReady() bool {
 }
 
 // builderProcAlive reports whether the ORIGINAL surviving builder still
-// runs: the pid must exist AND its kernel start time must match the one
-// captured at discovery. A recycled pid fails the identity check and
-// releases the gate instead of holding it for a stranger's lifetime; an
-// unreadable stat reads as gone for the same reason (the original could
-// not have become unreadable while alive under the same pid).
+// runs. Three-way, never collapsing errors into a verdict: the process
+// is GONE only on conclusive evidence — the stat is absent (exited) or
+// its start time no longer matches (pid recycled by a stranger). Any
+// other read failure is about THIS process's ability to look (fd
+// exhaustion, transient I/O), not about the builder — inconclusive
+// retains the entry and the next beat re-probes, because dropping a
+// live unsized builder publishes an allocation undercount for the rest
+// of its build.
 func builderProcAlive(bp builderProc) bool {
-	start, ok := procStartTime(strconv.Itoa(bp.pid))
-	return ok && start == bp.start
+	stat, err := os.ReadFile("/proc/" + strconv.Itoa(bp.pid) + "/stat")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+			return false // conclusively gone
+		}
+		return true // inconclusive: retain, re-probe next beat
+	}
+	start, ok := parseProcStartTime(stat)
+	if !ok {
+		return true // readable but unparseable: inconclusive, retain
+	}
+	return start == bp.start
 }
 
 // procStartTime reads a process's kernel start time (clock ticks since
@@ -4825,6 +4854,10 @@ func procStartTime(pidDir string) (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
+	return parseProcStartTime(stat)
+}
+
+func parseProcStartTime(stat []byte) (uint64, bool) {
 	i := strings.LastIndexByte(string(stat), ')')
 	if i < 0 {
 		return 0, false
@@ -4846,14 +4879,16 @@ func procStartTime(pidDir string) (uint64, bool) {
 // over from a previous daemon (KillMode=process restarts orphan them).
 // One directory walk with a cmdline read per process — which is exactly
 // why it only ever runs inside ScanSurvivingBuildersAsync's goroutine,
-// never on a startup or lifecycle path.
-func findSurvivingBuilders(builderBin string) []builderProc {
+// never on a startup or lifecycle path. A failed WALK is an error, never
+// an empty result: converting fd exhaustion into "no survivors" would
+// open the gate over a live unsized builder for the rest of its build.
+func findSurvivingBuilders(builderBin string) ([]builderProc, error) {
 	if builderBin == "" {
-		return nil
+		return nil, nil
 	}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("survivor scan: read /proc: %w", err)
 	}
 	self := os.Getpid()
 	var procs []builderProc
@@ -4886,7 +4921,7 @@ func findSurvivingBuilders(builderBin string) []builderProc {
 		}
 		procs = append(procs, builderProc{pid: pid, start: start})
 	}
-	return procs
+	return procs, nil
 }
 
 // procPPID reads a process's parent pid from /proc/<pid>/stat; 0 on any
