@@ -800,3 +800,29 @@ func TestSlotPressureExcludesPoolOwnedFromUsed(t *testing.T) {
 		t.Fatalf("Ceiling = %d", st.Ceiling)
 	}
 }
+
+// After a restart with pool adoption on, adoption candidates are
+// pool-owned long before they reach a warm channel: they must surface as
+// Provisioning, not vanish from all three classes and advertise phantom
+// slot capacity.
+func TestSlotPressureCountsAdoptionBacklogAsProvisioning(t *testing.T) {
+	m := &Manager{slotOwner: map[int]string{
+		1: "vm-a",    // real owner
+		2: poolOwner, // warm (delivered below)
+		3: poolOwner, // adoption candidate, not yet warm
+		4: poolOwner, // adoption candidate, not yet warm
+	}}
+	m.pool = &Pool{fresh: make(chan *preallocSlot, 4), recycled: make(chan *preallocSlot, 4)}
+	m.pool.fresh <- &preallocSlot{idx: 2}
+
+	st := m.SlotPressure()
+	if st.Used != 1 {
+		t.Fatalf("Used = %d, want 1", st.Used)
+	}
+	if st.WarmReady != 1 {
+		t.Fatalf("WarmReady = %d, want 1", st.WarmReady)
+	}
+	if st.Provisioning != 2 {
+		t.Fatalf("Provisioning = %d, want 2 (adoption backlog visible)", st.Provisioning)
+	}
+}

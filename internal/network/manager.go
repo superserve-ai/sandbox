@@ -1800,17 +1800,26 @@ type SlotPressureStats struct {
 // SlotPressure returns the current in-memory slot accounting. Pure reads:
 // one mutex for the owner map, channel lengths and an atomic for the pool.
 // Used counts only slots held by real owners (VMs, builds): pool-owned
-// slots — warm inventory and slots mid-build for the pool — are excluded
-// here and reported through WarmReady/Provisioning instead, so the same
-// slot can never appear in two pressure classes at once (Used + Warm +
-// Provisioning is what the prepared-slot ceiling bounds; double-counting
-// would corrupt that formula). One O(owned) walk of the map, at
-// heartbeat cadence only.
+// slots — warm inventory, slots mid-build for the pool, and adoption
+// candidates claimed at startup — are excluded here and reported through
+// WarmReady/Provisioning instead, so the same slot can never appear in
+// two pressure classes at once (Used + Warm + Provisioning is what the
+// prepared-slot ceiling bounds; double-counting would corrupt that
+// formula). Provisioning is STRUCTURAL, not a worker count: every
+// pool-owned slot that is not yet claimable from a warm channel is
+// in-flight inventory — refill builds and, after a restart with pool
+// adoption on, potentially hundreds of adoption candidates that hold
+// real namespaces long before any refill worker touches them. The
+// refillActive floor covers workers that have not claimed an index yet.
+// One O(owned) walk of the map, at heartbeat cadence only.
 func (m *Manager) SlotPressure() SlotPressureStats {
 	st := SlotPressureStats{Ceiling: MaxSlots}
+	poolOwned := 0
 	m.mu.Lock()
 	for _, owner := range m.slotOwner {
-		if owner != poolOwner {
+		if owner == poolOwner {
+			poolOwned++
+		} else {
 			st.Used++
 		}
 	}
@@ -1820,7 +1829,13 @@ func (m *Manager) SlotPressure() SlotPressureStats {
 		if ok {
 			st.WarmReady = fresh + recycled
 		}
-		st.Provisioning = int(m.pool.refillActive.Load())
+		st.Provisioning = poolOwned - st.WarmReady
+		if refill := int(m.pool.refillActive.Load()); refill > st.Provisioning {
+			st.Provisioning = refill
+		}
+		if st.Provisioning < 0 {
+			st.Provisioning = 0
+		}
 	}
 	return st
 }
