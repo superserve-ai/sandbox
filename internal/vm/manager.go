@@ -646,6 +646,13 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		if err := os.MkdirAll(filepath.Join(cfg.RunDir, templateDirName), 0o755); err != nil {
 			return nil, fmt.Errorf("mkdir template magic dir: %w", err)
 		}
+		// Pre-created so the readiness-timeout verdict path only renames
+		// into it — even first-stall metadata I/O must not spend the
+		// reserve. Best-effort: if an ops cleanup removes it, the rename
+		// fails and forensics degrade to the journald summary.
+		if err := os.MkdirAll(filepath.Join(cfg.RunDir, stallForensicsDirName), 0o700); err != nil {
+			log.Warn().Err(err).Msg("stall-forensics dir unavailable; console quarantine disabled")
+		}
 	}
 	m := &Manager{
 		cfg:            cfg,
@@ -5717,7 +5724,7 @@ func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launc
 	// verdict reserve is never spent on forensics.
 	dir := filepath.Join(m.cfg.RunDir, stallForensicsDirName)
 	dst := filepath.Join(dir, fmt.Sprintf("%d-%s.console.log", failedAt.Unix(), vmID))
-	renamed := os.MkdirAll(dir, 0o700) == nil && os.Rename(src, dst) == nil
+	renamed := os.Rename(src, dst) == nil // dir pre-created at startup
 	go func() {
 		defer sentrylog.Recover("stall-forensics")
 		if renamed {
