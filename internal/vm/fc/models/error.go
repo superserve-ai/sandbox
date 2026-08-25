@@ -19,6 +19,12 @@ type Error struct {
 	// A description of the error condition
 	// Read Only: true
 	FaultMessage string `json:"fault_message,omitempty"`
+
+	// Stable machine-readable discriminator, present only for error classes
+	// clients must handle distinctly (fault_message is free-form and not a
+	// stable contract). Fork extension.
+	// Read Only: true
+	ErrorKind string `json:"error_kind,omitempty"`
 }
 
 // Validate validates this error

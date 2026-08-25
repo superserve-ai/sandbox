@@ -41,12 +41,22 @@ func isTornSnapshotErr(err error) bool {
 // the same paused VM is always safe.
 var ErrDirtyTrackingMismatch = errors.New("dirty-tracking session mismatch")
 
-// dirtyTrackingMismatchMarker is the substring the fork embeds in the
-// CreateSnapshotError::DirtyTrackingSessionMismatch display message.
-const dirtyTrackingMismatchMarker = "Dirty-tracking session mismatch"
+// dirtyTrackingMismatchKind is the stable error_kind discriminator the fork
+// returns for a rejected guarded snapshot; the free-form fault message is not
+// a contract. See the Error definition in the fork's swagger spec.
+const dirtyTrackingMismatchKind = "DirtyTrackingSessionMismatch"
 
 func isDirtyTrackingMismatchErr(err error) bool {
-	return err != nil && strings.Contains(err.Error(), dirtyTrackingMismatchMarker)
+	if err == nil {
+		return false
+	}
+	var badReq *operations.CreateSnapshotBadRequest
+	if errors.As(err, &badReq) {
+		return badReq.Payload != nil && badReq.Payload.ErrorKind == dirtyTrackingMismatchKind
+	}
+	// The generated client can surface an unparsed body (e.g. a default
+	// response); the serialized payload still carries the discriminator.
+	return strings.Contains(err.Error(), dirtyTrackingMismatchKind)
 }
 
 // ErrLayeredInvalidSnapshot is the firecracker fork's sentinel for a structurally
