@@ -446,6 +446,18 @@ type HostPressure struct {
 	MaxSandboxes          int32     `json:"max_sandboxes"`
 	UnknownAllocationVms  int32     `json:"unknown_allocation_vms"`
 	ReportedAt            time.Time `json:"reported_at"`
+	ChargedCount          int32     `json:"charged_count"`
+	ChargedMemoryMib      int64     `json:"charged_memory_mib"`
+	ChargedVcpus          int64     `json:"charged_vcpus"`
+}
+
+type HostReservation struct {
+	SandboxID      uuid.UUID          `json:"sandbox_id"`
+	HostID         string             `json:"host_id"`
+	MemoryMib      int32              `json:"memory_mib"`
+	Vcpus          int32              `json:"vcpus"`
+	CreatedAt      time.Time          `json:"created_at"`
+	MaterializedAt pgtype.Timestamptz `json:"materialized_at"`
 }
 
 type NetFlow struct {

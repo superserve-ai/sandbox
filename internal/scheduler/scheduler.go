@@ -22,6 +22,20 @@ type Scheduler interface {
 	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, err error)
 }
 
+// PlaceSandbox adapts the legacy least-loaded selection to the
+// placement interface: same host choice as SelectHost, no reservation
+// fence (so no lifecycle hooks on the returned Placement). AllowedHosts
+// is not honored here — the constraint's only producer (template
+// locality) requires the capacity scheduler; this adapter exists so the
+// default configuration keeps its exact pre-capacity behavior.
+func (s *LeastLoaded) PlaceSandbox(ctx context.Context, req PlacementRequest) (Placement, error) {
+	hostID, err := s.SelectHost(ctx, req.RequiredCapabilities)
+	if err != nil {
+		return Placement{}, err
+	}
+	return Placement{HostID: hostID}, nil
+}
+
 const defaultCacheTTL = 30 * time.Second
 
 // hostsFillTimeout bounds every candidate-set fill, blocking and background

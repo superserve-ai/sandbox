@@ -32,6 +32,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/scheduler"
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
@@ -116,10 +117,12 @@ func (h *Handlers) respondQuotaExceeded(c *gin.Context, teamID uuid.UUID) {
 	respondErrorMsg(c, "too_many_sandboxes", msg, http.StatusTooManyRequests)
 }
 
-// Scheduler selects a host for new sandboxes.
+// Scheduler places new sandboxes on hosts. A fenced implementation
+// (capacity admission) returns lifecycle hooks on the Placement; the
+// legacy least-loaded implementation returns a bare host ID.
 type Scheduler interface {
-	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, err error)
-	// Invalidate drops any cached host state so the next SelectHost
+	PlaceSandbox(ctx context.Context, req scheduler.PlacementRequest) (scheduler.Placement, error)
+	// Invalidate drops any cached host state so the next PlaceSandbox
 	// reflects host status changes immediately.
 	Invalidate()
 }
@@ -2264,19 +2267,66 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if previewAccess == preview.AccessPrivate {
 		requiredCapabilities = previewBrowserCapabilities()
 	}
+	// Generate the sandbox ID before placement: the DB INSERT and the
+	// VMD call still run in parallel off it (the ~10-20ms INSERT
+	// roundtrip hides behind VMD's ~100-200ms create latency), and a
+	// fenced placement's reservation ledger row carries the sandbox's
+	// real identity — which is what makes admission idempotent under
+	// control-plane retries.
+	sandboxID := uuid.New()
+
+	// The shape shown while the sandbox is 'starting' — and kept if the
+	// create fails before activation. ActivateSandbox overwrites it with
+	// the actuals vmd reports once the VM is up. Computed before
+	// placement because the capacity scheduler charges this shape into
+	// its reservation and its ranking.
+	insertVcpu, insertMemMiB := int32(defaultVcpu), int32(defaultMemoryMi)
+	if templateID.Valid && templateVcpu > 0 && templateMemMiB > 0 {
+		insertVcpu, insertMemMiB = int32(templateVcpu), int32(templateMemMiB)
+	}
+
+	var placement scheduler.Placement
 	if h.Scheduler != nil {
-		hostID, err = h.Scheduler.SelectHost(c.Request.Context(), requiredCapabilities)
+		placement, err = h.Scheduler.PlaceSandbox(c.Request.Context(), scheduler.PlacementRequest{
+			SandboxID:            sandboxID,
+			RequiredCapabilities: requiredCapabilities,
+			MemoryMib:            insertMemMiB,
+			Vcpus:                insertVcpu,
+		})
 		if err != nil {
-			log.Error().Err(err).Msg("scheduler SelectHost failed")
+			log.Error().Err(err).Msg("scheduler PlaceSandbox failed")
 			respondErrorMsg(c, "service_unavailable", "No hosts available", http.StatusServiceUnavailable)
 			return
 		}
+		hostID = placement.HostID
 	} else if h.Config != nil && h.Config.DefaultHostID != "" {
 		hostID = h.Config.DefaultHostID
 	} else {
 		hostID = "default"
 	}
 	SetTelemetryHostID(c, hostID)
+
+	// A fenced placement reserved real capacity on the host. Every path
+	// that leaves this handler without the VM alive must give the
+	// reservation back — the deferred abort covers them all (attestation
+	// early-returns, both failure legs, panics), detached from the
+	// request context so a hung-up client cannot keep the charge alive.
+	// The happy path flips placementConfirmed instead, right after the
+	// VM provably exists in vmd's instance map.
+	placementConfirmed := false
+	if placement.Abort != nil {
+		defer func() {
+			if placementConfirmed {
+				return
+			}
+			abortCtx, abortCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), createInsertTimeout)
+			abort := placement.Abort
+			go func() {
+				defer abortCancel()
+				abort(abortCtx)
+			}()
+		}()
+	}
 
 	// Re-attest after placement. The scheduler cache and the default-host path
 	// are only hints; this re-check is fresher (attestation-cache TTL vs the
@@ -2300,11 +2350,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Generate the sandbox ID in Go so the DB INSERT and the VMD call
-	// can run in parallel — both need the same ID and neither needs to
-	// wait on the other. This hides the ~10-20ms INSERT roundtrip behind
-	// VMD's ~100-200ms create latency, shaving that much off the p50.
-	sandboxID := uuid.New()
 	l := sandboxLogger(sandboxID.String(), hostID)
 
 	// The detached insert keeps the happy path parallel, but it still needs a
@@ -2312,14 +2357,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// path has already failed.
 	insertCtx, insertCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), createInsertTimeout)
 	defer insertCancel()
-
-	// The shape shown while the sandbox is 'starting' — and kept if the create
-	// fails before activation. ActivateSandbox overwrites it with the actuals
-	// vmd reports once the VM is up.
-	insertVcpu, insertMemMiB := int32(defaultVcpu), int32(defaultMemoryMi)
-	if templateID.Valid && templateVcpu > 0 && templateMemMiB > 0 {
-		insertVcpu, insertMemMiB = int32(templateVcpu), int32(templateMemMiB)
-	}
 
 	type insertResult struct {
 		sandbox db.Sandbox
@@ -2595,6 +2632,22 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		respondError(c, ErrInternal)
 		return
+	}
+
+	// Both legs succeeded: the VM is live in vmd's instance map, so a
+	// fenced placement can start its reservation's retirement clock now,
+	// detached and off the response path. Failures past this point
+	// (attestation, env inject) destroy the VM, and the materialized
+	// reservation simply retires on the next pressure report — a few
+	// seconds of conservative double-count, never an over-place.
+	placementConfirmed = true
+	if placement.Confirm != nil {
+		confirmCtx, confirmCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), createInsertTimeout)
+		confirm := placement.Confirm
+		go func() {
+			defer confirmCancel()
+			confirm(confirmCtx)
+		}()
 	}
 
 	// Phase 2: with the source IP known, mint the per-sandbox secrets JWT

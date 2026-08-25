@@ -81,6 +81,7 @@ type OTelRecorder struct {
 	vmdCalls                 metric.Int64Counter
 	vmdDuration              metric.Float64Histogram
 	hostResolutionDuration   metric.Float64Histogram
+	placementDuration        metric.Float64Histogram
 	hostVCPU                 metric.Int64Gauge
 	hostMemoryMiB            metric.Int64Gauge
 	hostSandboxes            metric.Int64Gauge
@@ -165,6 +166,10 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.hostResolutionDuration, err = meter.Float64Histogram("host_resolution_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.placementDuration, err = meter.Float64Histogram("sandbox_placement_duration_seconds",
 		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
 		return nil, err
 	}
@@ -309,6 +314,49 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 	if c.Duration > 0 {
 		r.vmdDuration.Record(ctx, c.Duration.Seconds(), opt)
 	}
+}
+
+// RecordPlacement emits the placement histogram. Attempts is clamped to
+// the scheduler's small retry bound so it stays label-safe even if a
+// future scheduler misbehaves.
+func (r *OTelRecorder) RecordPlacement(ctx context.Context, p Placement) {
+	if r == nil {
+		return
+	}
+	mode := p.Mode
+	switch mode {
+	case "capacity", "legacy", "fallback":
+	default:
+		mode = "other"
+	}
+	result := p.Result
+	switch result {
+	case "placed", "exhausted", "no_hosts", "error":
+	default:
+		result = "other"
+	}
+	reason := p.Reason
+	switch reason {
+	case "":
+		reason = "none"
+	case "sandbox_limit", "slot_limit", "raced":
+	default:
+		reason = "other"
+	}
+	attempts := p.Attempts
+	if attempts < 0 {
+		attempts = 0
+	}
+	if attempts > 9 {
+		attempts = 9
+	}
+	opt := metric.WithAttributes(r.attrs(
+		attribute.String("mode", mode),
+		attribute.String("result", result),
+		attribute.String("reason", reason),
+		attribute.Int("attempts", attempts),
+	)...)
+	r.placementDuration.Record(ctx, p.Duration.Seconds(), opt)
 }
 
 func (r *OTelRecorder) RecordHostResolution(ctx context.Context, h HostResolution) {

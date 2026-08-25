@@ -28,6 +28,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/config"
+	sched "github.com/superserve-ai/sandbox/internal/scheduler"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
@@ -59,9 +60,9 @@ type stubScheduler struct {
 	required []string
 }
 
-func (s *stubScheduler) SelectHost(_ context.Context, required []string) (string, error) {
-	s.required = append([]string(nil), required...)
-	return s.hostID, s.err
+func (s *stubScheduler) PlaceSandbox(_ context.Context, req sched.PlacementRequest) (sched.Placement, error) {
+	s.required = append([]string(nil), req.RequiredCapabilities...)
+	return sched.Placement{HostID: s.hostID}, s.err
 }
 
 func (s *stubScheduler) Invalidate() {}

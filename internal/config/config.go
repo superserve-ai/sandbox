@@ -44,6 +44,17 @@ type Config struct {
 	// is configured. Set via DEFAULT_HOST_ID; defaults to "default".
 	DefaultHostID string
 
+	// SchedulerCapacityAdmission enables capacity-based placement with
+	// atomic per-create reservations (scheduler.CapacityAware) instead
+	// of the legacy least-loaded choice. Opt-in via
+	// SCHEDULER_CAPACITY_ADMISSION=1. It only changes behavior for
+	// hosts that advertise capacity_pressure_v1, and it must stay off
+	// until every template a cell serves is present on every host it
+	// can place onto: template artifacts are host-local files, so
+	// unconstrained placement without that guarantee dispatches
+	// restores to hosts that cannot serve them.
+	SchedulerCapacityAdmission bool
+
 	// SystemTeamID owns curated templates that are visible to every team
 	// (python-3.11, node-22, etc.). Set via SYSTEM_TEAM_ID; empty means
 	// "no system team configured" and users see only their own templates.
@@ -113,6 +124,7 @@ func Load() (*Config, error) {
 		SandboxAccessTokenSeed:        seed,
 		EdgeProxyDomain:               envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
 		DefaultHostID:                 envOrDefault("DEFAULT_HOST_ID", "default"),
+		SchedulerCapacityAdmission:    boolEnv("SCHEDULER_CAPACITY_ADMISSION", false),
 		SystemTeamID:                  os.Getenv("SYSTEM_TEAM_ID"),
 		SentryDSN:                     os.Getenv("SENTRY_DSN"),
 		KMSKeyResource:                os.Getenv("KMS_KEY_RESOURCE"),

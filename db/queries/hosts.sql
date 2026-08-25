@@ -259,6 +259,17 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        -- vmd-reported allocation view, alongside the DB-derived counts
        -- above. hp is 1:1 by primary key, so it cannot multiply the
        -- sandbox join's count rows.
+       -- Unmaterialized capacity reservations within their lease: creates
+       -- admitted onto this host whose VM does not exist yet, so they
+       -- appear in NO other count. Drain tooling must treat them as busy
+       -- work — a host can read zero sandboxes during the
+       -- reservation-to-dispatch gap while a VM is about to launch.
+       -- (Materialized rows are deliberately excluded: their sandbox row
+       -- already exists and is counted above; they only await hygiene.)
+       COALESCE((SELECT COUNT(*) FROM host_reservation hr
+                 WHERE hr.host_id = h.id
+                   AND hr.materialized_at IS NULL
+                   AND hr.created_at > now() - make_interval(secs => sqlc.arg('reservation_lease_secs')::int)), 0)::int AS reserved_count,
        hp.allocated_memory_mib AS pressure_allocated_memory_mib,
        hp.allocated_vcpus AS pressure_allocated_vcpus,
        hp.running_sandboxes AS pressure_running_sandboxes,
@@ -358,10 +369,226 @@ ON CONFLICT (host_id) DO UPDATE SET
     max_network_slots = EXCLUDED.max_network_slots,
     max_sandboxes = EXCLUDED.max_sandboxes,
     unknown_allocation_vms = EXCLUDED.unknown_allocation_vms,
-    reported_at = EXCLUDED.reported_at;
+    reported_at = EXCLUDED.reported_at,
+    -- The control-plane-owned fence counters are RECOMPUTED from the
+    -- ledger against this report's own timestamp, never preserved and
+    -- never reset to zero. Recomputing is what makes the fence
+    -- self-healing: a missed decrement, a crashed replica's abandoned
+    -- row, or a double charge all converge within one heartbeat
+    -- interval. Resetting to zero instead would free capacity for VMs
+    -- this report cannot yet see — a report SAMPLED before a VM entered
+    -- vmd's instance map can ARRIVE after it, which is why a
+    -- materialized reservation keeps charging until a report clears its
+    -- materialization by the slack window.
+    charged_count = (SELECT COUNT(*) FROM host_reservation r
+                     WHERE r.host_id = EXCLUDED.host_id
+                       AND r.created_at > now() - make_interval(secs => @lease_secs::int)
+                       AND (r.materialized_at IS NULL
+                            OR r.materialized_at + make_interval(secs => @slack_secs::int) > now())),
+    charged_memory_mib = COALESCE((SELECT SUM(r.memory_mib) FROM host_reservation r
+                     WHERE r.host_id = EXCLUDED.host_id
+                       AND r.created_at > now() - make_interval(secs => @lease_secs::int)
+                       AND (r.materialized_at IS NULL
+                            OR r.materialized_at + make_interval(secs => @slack_secs::int) > now())), 0),
+    charged_vcpus = COALESCE((SELECT SUM(r.vcpus) FROM host_reservation r
+                     WHERE r.host_id = EXCLUDED.host_id
+                       AND r.created_at > now() - make_interval(secs => @lease_secs::int)
+                       AND (r.materialized_at IS NULL
+                            OR r.materialized_at + make_interval(secs => @slack_secs::int) > now())), 0);
 
 -- name: DeleteHostPressure :exec
 -- Clears stored pressure when a host identity is reclaimed by a new
 -- machine: the old machine's numbers are meaningless for the new
 -- holder, and stale pressure must not survive into its tenure.
 DELETE FROM host_pressure WHERE host_id = $1;
+
+-- name: ReserveHostCapacity :one
+-- The admission fence: atomically charges one create against the newest
+-- pressure report plus every reservation still in flight, and records
+-- the ledger row — one statement, one round trip, and the only
+-- synchronous scheduling work on the create path.
+--
+-- The UPDATE is what makes concurrent replicas safe, and it must be an
+-- UPDATE of the counters ON the pressure row rather than a COUNT over
+-- host_reservation. Under READ COMMITTED a statement's snapshot is
+-- taken before it blocks, so a replica waiting on a row lock would
+-- still count the ledger as it stood BEFORE the winner inserted its
+-- row — both would pass the same limit check and over-place. An UPDATE
+-- instead re-evaluates its WHERE clause against the committed row
+-- version after the lock is granted (EvalPlanQual), so the loser sees
+-- the winner's charge and fails the check. That re-evaluation is why
+-- the limits are tested against columns of this row.
+--
+-- Eligibility is fail-closed by construction: no pressure row, a stale
+-- report, or a non-active host all make the UPDATE match nothing and
+-- the INSERT insert nothing. A host whose publisher broke while its
+-- heartbeat stays healthy must stop taking placements, not fall back to
+-- counts admission cannot fence.
+--
+-- Hard admission checks are the OPERATOR limits the report carries
+-- (max_sandboxes, max_network_slots) plus the kernel slot ceiling.
+-- Memory and vcpus are deliberately NOT hard-capped: firecracker hosts
+-- overcommit both by design (lazy faulting), so capping allocations at
+-- physical capacity would refuse hosts that run fine today. They are
+-- charged for ranking only, until an operator-configured allocation
+-- limit exists.
+--
+-- Paused sandboxes count against max_sandboxes: resume is pinned to
+-- this host, so every paused sandbox is capacity it must be able to
+-- take back at any moment.
+--
+-- Slot arithmetic: warm slots are already-prepared inventory, so a
+-- charge only implies a NEW slot once the warm pool is exhausted —
+-- GREATEST(0, charged + 1 - warm) net-new on top of every slot that
+-- already exists (used + provisioning + warm).
+--
+-- The same-sandbox guard makes a control-plane retry idempotent. It
+-- reads the ledger from the statement snapshot, which is sound here
+-- because retries of one sandbox are sequential from one replica, never
+-- concurrent; a double charge would in any case self-heal at the next
+-- report, which recomputes these counters from the ledger.
+WITH held AS (
+    -- An admission this sandbox already holds ON THIS HOST: the retry
+    -- returns it unchanged rather than charging twice.
+    SELECT r.sandbox_id FROM host_reservation r
+    WHERE r.sandbox_id = @sandbox_id AND r.host_id = @host_id
+), bumped AS (
+    UPDATE host_pressure hp
+    SET charged_count = hp.charged_count + 1,
+        charged_memory_mib = hp.charged_memory_mib + @memory_mib::bigint,
+        charged_vcpus = hp.charged_vcpus + @vcpus::bigint
+    WHERE hp.host_id = @host_id
+      AND hp.reported_at > now() - make_interval(secs => sqlc.arg('freshness_secs')::int)
+      AND EXISTS (SELECT 1 FROM host h WHERE h.id = hp.host_id AND h.status = 'active')
+      AND NOT EXISTS (SELECT 1 FROM host_reservation r WHERE r.sandbox_id = @sandbox_id)
+      AND NOT EXISTS (SELECT 1 FROM held)
+      AND (hp.max_sandboxes <= 0
+           OR hp.running_sandboxes + hp.provisioning_sandboxes + hp.paused_sandboxes
+              + hp.charged_count + 1 <= hp.max_sandboxes)
+      AND (LEAST(NULLIF(hp.max_network_slots, 0), NULLIF(hp.net_slot_ceiling, 0)) IS NULL
+           OR hp.used_net_slots + hp.provisioning_net_slots + hp.warm_net_slots
+              + GREATEST(0, hp.charged_count + 1 - hp.warm_net_slots)
+              <= LEAST(NULLIF(hp.max_network_slots, 0), NULLIF(hp.net_slot_ceiling, 0)))
+    RETURNING hp.host_id
+), inserted AS (
+    INSERT INTO host_reservation (sandbox_id, host_id, memory_mib, vcpus)
+    SELECT @sandbox_id, b.host_id, @memory_mib, @vcpus FROM bumped b
+    -- A conflict means this sandbox is already admitted on a DIFFERENT
+    -- host. Insert nothing and return nothing: the caller sees a
+    -- rejection, which is the safe outcome — silently moving a
+    -- reservation would leave the first host charging for a sandbox
+    -- that will never land there, and a sandbox is bound to the host
+    -- its first admission chose. (Unreachable through the scheduler,
+    -- which admits once per create; the guard exists so it stays true.)
+    ON CONFLICT (sandbox_id) DO NOTHING
+    RETURNING sandbox_id
+)
+SELECT sandbox_id FROM inserted
+UNION ALL
+SELECT sandbox_id FROM held;
+
+-- name: ReleaseHostReservation :exec
+-- Frees a reservation whose create failed before the VM existed (vmd
+-- rejected, INSERT failed, handler aborted): the ledger row goes and
+-- its charge comes off the fence counters in the same statement, so the
+-- capacity is available to the very next admission rather than at the
+-- next report.
+--
+-- Clamped at zero and driven by the DELETE's own RETURNING, so it can
+-- only ever decrement for a row that actually existed — a duplicated
+-- abort (defer plus explicit call) deletes nothing the second time and
+-- therefore decrements nothing.
+WITH gone AS (
+    DELETE FROM host_reservation
+    WHERE sandbox_id = $1
+    RETURNING host_id, memory_mib, vcpus
+)
+UPDATE host_pressure hp
+SET charged_count = GREATEST(0, hp.charged_count - 1),
+    charged_memory_mib = GREATEST(0, hp.charged_memory_mib - g.memory_mib),
+    charged_vcpus = GREATEST(0, hp.charged_vcpus - g.vcpus)
+FROM gone g
+WHERE hp.host_id = g.host_id;
+
+-- name: MaterializeHostReservation :exec
+-- Stamps the moment the vmd create RPC returned: from here on the VM
+-- provably exists in vmd's instance map, so any pressure report SAMPLED
+-- after this instant includes it. The row keeps charging until a report
+-- arrives slack-clear of this stamp (see the table comment), then
+-- report-time hygiene deletes it.
+UPDATE host_reservation SET materialized_at = now()
+WHERE sandbox_id = $1 AND materialized_at IS NULL;
+
+-- name: RetireHostReservations :exec
+-- Report-time hygiene, run after every successful pressure upsert for
+-- the reporting host (once per 30s, never on the create path): deletes
+-- rows the charge predicate already ignores — materialized rows the
+-- fresh report now provably covers, and unmaterialized rows whose lease
+-- lapsed (the create crashed between reserve and dispatch). Correctness
+-- never depends on this running; it only keeps the ledger from growing
+-- one row per create forever.
+DELETE FROM host_reservation r
+WHERE r.host_id = sqlc.arg('host_id')
+  AND ((r.materialized_at IS NOT NULL
+        AND r.materialized_at + make_interval(secs => sqlc.arg('slack_secs')::int) < now())
+       OR (r.materialized_at IS NULL
+           AND r.created_at + make_interval(secs => sqlc.arg('lease_secs')::int) < now()));
+
+-- name: ListCapacityCandidates :many
+-- The capacity scheduler's candidate set, cached control-plane-side for
+-- the scheduler TTL: every active host passing the capability filter,
+-- with its newest pressure report, its live reservation charges, and
+-- the legacy sandbox count (the ranking signal for hosts that predate
+-- pressure publication). Freshness/eligibility policy lives in the
+-- scheduler; this query only distinguishes "capable" (advertised
+-- capacity_pressure_v1 on the CURRENT heartbeat) and reports the raw
+-- timestamps.
+--
+-- Scalar subqueries, not joins, for the per-host counts: a second
+-- one-to-many join would cross-multiply rows (same reasoning as
+-- ListHostsAdmin).
+SELECT h.id, h.region, h.capacity_memory_mib, h.capacity_vcpus,
+       EXISTS (
+         SELECT 1 FROM host_capability hc
+         WHERE hc.host_id = h.id
+           AND hc.capability = sqlc.arg('pressure_capability')::text
+           AND hc.heartbeat_at = h.last_heartbeat_at
+       ) AS pressure_capable,
+       hp.reported_at,
+       COALESCE(hp.running_sandboxes, 0)::int AS running_sandboxes,
+       COALESCE(hp.provisioning_sandboxes, 0)::int AS provisioning_sandboxes,
+       COALESCE(hp.paused_sandboxes, 0)::int AS paused_sandboxes,
+       COALESCE(hp.allocated_memory_mib, 0)::bigint AS allocated_memory_mib,
+       COALESCE(hp.allocated_vcpus, 0)::bigint AS allocated_vcpus,
+       COALESCE(hp.used_net_slots, 0)::int AS used_net_slots,
+       COALESCE(hp.provisioning_net_slots, 0)::int AS provisioning_net_slots,
+       COALESCE(hp.warm_net_slots, 0)::int AS warm_net_slots,
+       COALESCE(hp.net_slot_ceiling, 0)::int AS net_slot_ceiling,
+       COALESCE(hp.max_network_slots, 0)::int AS max_network_slots,
+       COALESCE(hp.max_sandboxes, 0)::int AS max_sandboxes,
+       -- The fence counters, maintained on the pressure row itself
+       -- (see ReserveHostCapacity): reading them here means the cached
+       -- candidate view ranks and pre-filters on the same numbers the
+       -- admission statement will test, with no per-host subqueries.
+       COALESCE(hp.charged_count, 0)::int AS charged_count,
+       COALESCE(hp.charged_memory_mib, 0)::bigint AS charged_memory_mib,
+       COALESCE(hp.charged_vcpus, 0)::bigint AS charged_vcpus,
+       COALESCE((
+         SELECT COUNT(*) FROM sandbox s
+         WHERE s.host_id = h.id
+           AND s.status IN ('active', 'starting')
+           AND s.destroyed_at IS NULL
+       ), 0)::int AS active_sandbox_count
+FROM host h
+LEFT JOIN host_pressure hp ON hp.host_id = h.id
+WHERE h.status = 'active'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  );

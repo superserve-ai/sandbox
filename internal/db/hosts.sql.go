@@ -9,6 +9,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -394,6 +395,137 @@ func (q *Queries) ListActiveHostsByLoad(ctx context.Context, requiredCapabilitie
 	return items, nil
 }
 
+const listCapacityCandidates = `-- name: ListCapacityCandidates :many
+SELECT h.id, h.region, h.capacity_memory_mib, h.capacity_vcpus,
+       EXISTS (
+         SELECT 1 FROM host_capability hc
+         WHERE hc.host_id = h.id
+           AND hc.capability = $1::text
+           AND hc.heartbeat_at = h.last_heartbeat_at
+       ) AS pressure_capable,
+       hp.reported_at,
+       COALESCE(hp.running_sandboxes, 0)::int AS running_sandboxes,
+       COALESCE(hp.provisioning_sandboxes, 0)::int AS provisioning_sandboxes,
+       COALESCE(hp.paused_sandboxes, 0)::int AS paused_sandboxes,
+       COALESCE(hp.allocated_memory_mib, 0)::bigint AS allocated_memory_mib,
+       COALESCE(hp.allocated_vcpus, 0)::bigint AS allocated_vcpus,
+       COALESCE(hp.used_net_slots, 0)::int AS used_net_slots,
+       COALESCE(hp.provisioning_net_slots, 0)::int AS provisioning_net_slots,
+       COALESCE(hp.warm_net_slots, 0)::int AS warm_net_slots,
+       COALESCE(hp.net_slot_ceiling, 0)::int AS net_slot_ceiling,
+       COALESCE(hp.max_network_slots, 0)::int AS max_network_slots,
+       COALESCE(hp.max_sandboxes, 0)::int AS max_sandboxes,
+       -- The fence counters, maintained on the pressure row itself
+       -- (see ReserveHostCapacity): reading them here means the cached
+       -- candidate view ranks and pre-filters on the same numbers the
+       -- admission statement will test, with no per-host subqueries.
+       COALESCE(hp.charged_count, 0)::int AS charged_count,
+       COALESCE(hp.charged_memory_mib, 0)::bigint AS charged_memory_mib,
+       COALESCE(hp.charged_vcpus, 0)::bigint AS charged_vcpus,
+       COALESCE((
+         SELECT COUNT(*) FROM sandbox s
+         WHERE s.host_id = h.id
+           AND s.status IN ('active', 'starting')
+           AND s.destroyed_at IS NULL
+       ), 0)::int AS active_sandbox_count
+FROM host h
+LEFT JOIN host_pressure hp ON hp.host_id = h.id
+WHERE h.status = 'active'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM unnest($2::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
+`
+
+type ListCapacityCandidatesParams struct {
+	PressureCapability   string   `json:"pressure_capability"`
+	RequiredCapabilities []string `json:"required_capabilities"`
+}
+
+type ListCapacityCandidatesRow struct {
+	ID                    string             `json:"id"`
+	Region                string             `json:"region"`
+	CapacityMemoryMib     int32              `json:"capacity_memory_mib"`
+	CapacityVcpus         int32              `json:"capacity_vcpus"`
+	PressureCapable       bool               `json:"pressure_capable"`
+	ReportedAt            pgtype.Timestamptz `json:"reported_at"`
+	RunningSandboxes      int32              `json:"running_sandboxes"`
+	ProvisioningSandboxes int32              `json:"provisioning_sandboxes"`
+	PausedSandboxes       int32              `json:"paused_sandboxes"`
+	AllocatedMemoryMib    int64              `json:"allocated_memory_mib"`
+	AllocatedVcpus        int64              `json:"allocated_vcpus"`
+	UsedNetSlots          int32              `json:"used_net_slots"`
+	ProvisioningNetSlots  int32              `json:"provisioning_net_slots"`
+	WarmNetSlots          int32              `json:"warm_net_slots"`
+	NetSlotCeiling        int32              `json:"net_slot_ceiling"`
+	MaxNetworkSlots       int32              `json:"max_network_slots"`
+	MaxSandboxes          int32              `json:"max_sandboxes"`
+	ChargedCount          int32              `json:"charged_count"`
+	ChargedMemoryMib      int64              `json:"charged_memory_mib"`
+	ChargedVcpus          int64              `json:"charged_vcpus"`
+	ActiveSandboxCount    int32              `json:"active_sandbox_count"`
+}
+
+// The capacity scheduler's candidate set, cached control-plane-side for
+// the scheduler TTL: every active host passing the capability filter,
+// with its newest pressure report, its live reservation charges, and
+// the legacy sandbox count (the ranking signal for hosts that predate
+// pressure publication). Freshness/eligibility policy lives in the
+// scheduler; this query only distinguishes "capable" (advertised
+// capacity_pressure_v1 on the CURRENT heartbeat) and reports the raw
+// timestamps.
+//
+// Scalar subqueries, not joins, for the per-host counts: a second
+// one-to-many join would cross-multiply rows (same reasoning as
+// ListHostsAdmin).
+func (q *Queries) ListCapacityCandidates(ctx context.Context, arg ListCapacityCandidatesParams) ([]ListCapacityCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listCapacityCandidates, arg.PressureCapability, arg.RequiredCapabilities)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCapacityCandidatesRow{}
+	for rows.Next() {
+		var i ListCapacityCandidatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Region,
+			&i.CapacityMemoryMib,
+			&i.CapacityVcpus,
+			&i.PressureCapable,
+			&i.ReportedAt,
+			&i.RunningSandboxes,
+			&i.ProvisioningSandboxes,
+			&i.PausedSandboxes,
+			&i.AllocatedMemoryMib,
+			&i.AllocatedVcpus,
+			&i.UsedNetSlots,
+			&i.ProvisioningNetSlots,
+			&i.WarmNetSlots,
+			&i.NetSlotCeiling,
+			&i.MaxNetworkSlots,
+			&i.MaxSandboxes,
+			&i.ChargedCount,
+			&i.ChargedMemoryMib,
+			&i.ChargedVcpus,
+			&i.ActiveSandboxCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listHosts = `-- name: ListHosts :many
 SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host
 ORDER BY created_at ASC
@@ -482,6 +614,17 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        -- vmd-reported allocation view, alongside the DB-derived counts
        -- above. hp is 1:1 by primary key, so it cannot multiply the
        -- sandbox join's count rows.
+       -- Unmaterialized capacity reservations within their lease: creates
+       -- admitted onto this host whose VM does not exist yet, so they
+       -- appear in NO other count. Drain tooling must treat them as busy
+       -- work — a host can read zero sandboxes during the
+       -- reservation-to-dispatch gap while a VM is about to launch.
+       -- (Materialized rows are deliberately excluded: their sandbox row
+       -- already exists and is counted above; they only await hygiene.)
+       COALESCE((SELECT COUNT(*) FROM host_reservation hr
+                 WHERE hr.host_id = h.id
+                   AND hr.materialized_at IS NULL
+                   AND hr.created_at > now() - make_interval(secs => $1::int)), 0)::int AS reserved_count,
        hp.allocated_memory_mib AS pressure_allocated_memory_mib,
        hp.allocated_vcpus AS pressure_allocated_vcpus,
        hp.running_sandboxes AS pressure_running_sandboxes,
@@ -496,10 +639,15 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
 LEFT JOIN host_pressure hp ON hp.host_id = h.id
-WHERE $1::text IS NULL OR h.id = $1
+WHERE $2::text IS NULL OR h.id = $2
 GROUP BY h.id, hp.host_id
 ORDER BY h.created_at ASC
 `
+
+type ListHostsAdminParams struct {
+	ReservationLeaseSecs int32   `json:"reservation_lease_secs"`
+	ID                   *string `json:"id"`
+}
 
 type ListHostsAdminRow struct {
 	ID                            string             `json:"id"`
@@ -517,6 +665,7 @@ type ListHostsAdminRow struct {
 	PausedCount                   int32              `json:"paused_count"`
 	BuildingCount                 int32              `json:"building_count"`
 	PausedUnbackedCount           int32              `json:"paused_unbacked_count"`
+	ReservedCount                 int32              `json:"reserved_count"`
 	PressureAllocatedMemoryMib    *int64             `json:"pressure_allocated_memory_mib"`
 	PressureAllocatedVcpus        *int64             `json:"pressure_allocated_vcpus"`
 	PressureRunningSandboxes      *int32             `json:"pressure_running_sandboxes"`
@@ -535,8 +684,8 @@ type ListHostsAdminRow struct {
 // re-reads one host every few seconds, and the per-host counts (the
 // backup-coverage probe especially) must not be recomputed for the whole
 // fleet on every poll.
-func (q *Queries) ListHostsAdmin(ctx context.Context, id *string) ([]ListHostsAdminRow, error) {
-	rows, err := q.db.Query(ctx, listHostsAdmin, id)
+func (q *Queries) ListHostsAdmin(ctx context.Context, arg ListHostsAdminParams) ([]ListHostsAdminRow, error) {
+	rows, err := q.db.Query(ctx, listHostsAdmin, arg.ReservationLeaseSecs, arg.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -560,6 +709,7 @@ func (q *Queries) ListHostsAdmin(ctx context.Context, id *string) ([]ListHostsAd
 			&i.PausedCount,
 			&i.BuildingCount,
 			&i.PausedUnbackedCount,
+			&i.ReservedCount,
 			&i.PressureAllocatedMemoryMib,
 			&i.PressureAllocatedVcpus,
 			&i.PressureRunningSandboxes,
@@ -632,6 +782,21 @@ func (q *Queries) MarkHostUnhealthy(ctx context.Context, id string) error {
 	return err
 }
 
+const materializeHostReservation = `-- name: MaterializeHostReservation :exec
+UPDATE host_reservation SET materialized_at = now()
+WHERE sandbox_id = $1 AND materialized_at IS NULL
+`
+
+// Stamps the moment the vmd create RPC returned: from here on the VM
+// provably exists in vmd's instance map, so any pressure report SAMPLED
+// after this instant includes it. The row keeps charging until a report
+// arrives slack-clear of this stamp (see the table comment), then
+// report-time hygiene deletes it.
+func (q *Queries) MaterializeHostReservation(ctx context.Context, sandboxID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, materializeHostReservation, sandboxID)
+	return err
+}
+
 const registerHost = `-- name: RegisterHost :one
 INSERT INTO host (id, vmd_addr, proxy_addr, region, status,
                   capacity_memory_mib, capacity_vcpus, last_heartbeat_at,
@@ -677,6 +842,169 @@ func (q *Queries) RegisterHost(ctx context.Context, arg RegisterHostParams) (Hos
 		&i.IdentityBound,
 	)
 	return i, err
+}
+
+const releaseHostReservation = `-- name: ReleaseHostReservation :exec
+WITH gone AS (
+    DELETE FROM host_reservation
+    WHERE sandbox_id = $1
+    RETURNING host_id, memory_mib, vcpus
+)
+UPDATE host_pressure hp
+SET charged_count = GREATEST(0, hp.charged_count - 1),
+    charged_memory_mib = GREATEST(0, hp.charged_memory_mib - g.memory_mib),
+    charged_vcpus = GREATEST(0, hp.charged_vcpus - g.vcpus)
+FROM gone g
+WHERE hp.host_id = g.host_id
+`
+
+// Frees a reservation whose create failed before the VM existed (vmd
+// rejected, INSERT failed, handler aborted): the ledger row goes and
+// its charge comes off the fence counters in the same statement, so the
+// capacity is available to the very next admission rather than at the
+// next report.
+//
+// Clamped at zero and driven by the DELETE's own RETURNING, so it can
+// only ever decrement for a row that actually existed — a duplicated
+// abort (defer plus explicit call) deletes nothing the second time and
+// therefore decrements nothing.
+func (q *Queries) ReleaseHostReservation(ctx context.Context, sandboxID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, releaseHostReservation, sandboxID)
+	return err
+}
+
+const reserveHostCapacity = `-- name: ReserveHostCapacity :one
+WITH held AS (
+    -- An admission this sandbox already holds ON THIS HOST: the retry
+    -- returns it unchanged rather than charging twice.
+    SELECT r.sandbox_id FROM host_reservation r
+    WHERE r.sandbox_id = $1 AND r.host_id = $2
+), bumped AS (
+    UPDATE host_pressure hp
+    SET charged_count = hp.charged_count + 1,
+        charged_memory_mib = hp.charged_memory_mib + $3::bigint,
+        charged_vcpus = hp.charged_vcpus + $4::bigint
+    WHERE hp.host_id = $2
+      AND hp.reported_at > now() - make_interval(secs => $5::int)
+      AND EXISTS (SELECT 1 FROM host h WHERE h.id = hp.host_id AND h.status = 'active')
+      AND NOT EXISTS (SELECT 1 FROM host_reservation r WHERE r.sandbox_id = $1)
+      AND NOT EXISTS (SELECT 1 FROM held)
+      AND (hp.max_sandboxes <= 0
+           OR hp.running_sandboxes + hp.provisioning_sandboxes + hp.paused_sandboxes
+              + hp.charged_count + 1 <= hp.max_sandboxes)
+      AND (LEAST(NULLIF(hp.max_network_slots, 0), NULLIF(hp.net_slot_ceiling, 0)) IS NULL
+           OR hp.used_net_slots + hp.provisioning_net_slots + hp.warm_net_slots
+              + GREATEST(0, hp.charged_count + 1 - hp.warm_net_slots)
+              <= LEAST(NULLIF(hp.max_network_slots, 0), NULLIF(hp.net_slot_ceiling, 0)))
+    RETURNING hp.host_id
+), inserted AS (
+    INSERT INTO host_reservation (sandbox_id, host_id, memory_mib, vcpus)
+    SELECT $1, b.host_id, $3, $4 FROM bumped b
+    -- A conflict means this sandbox is already admitted on a DIFFERENT
+    -- host. Insert nothing and return nothing: the caller sees a
+    -- rejection, which is the safe outcome — silently moving a
+    -- reservation would leave the first host charging for a sandbox
+    -- that will never land there, and a sandbox is bound to the host
+    -- its first admission chose. (Unreachable through the scheduler,
+    -- which admits once per create; the guard exists so it stays true.)
+    ON CONFLICT (sandbox_id) DO NOTHING
+    RETURNING sandbox_id
+)
+SELECT sandbox_id FROM inserted
+UNION ALL
+SELECT sandbox_id FROM held
+`
+
+type ReserveHostCapacityParams struct {
+	SandboxID     uuid.UUID `json:"sandbox_id"`
+	HostID        string    `json:"host_id"`
+	MemoryMib     int64     `json:"memory_mib"`
+	Vcpus         int64     `json:"vcpus"`
+	FreshnessSecs int32     `json:"freshness_secs"`
+}
+
+// The admission fence: atomically charges one create against the newest
+// pressure report plus every reservation still in flight, and records
+// the ledger row — one statement, one round trip, and the only
+// synchronous scheduling work on the create path.
+//
+// The UPDATE is what makes concurrent replicas safe, and it must be an
+// UPDATE of the counters ON the pressure row rather than a COUNT over
+// host_reservation. Under READ COMMITTED a statement's snapshot is
+// taken before it blocks, so a replica waiting on a row lock would
+// still count the ledger as it stood BEFORE the winner inserted its
+// row — both would pass the same limit check and over-place. An UPDATE
+// instead re-evaluates its WHERE clause against the committed row
+// version after the lock is granted (EvalPlanQual), so the loser sees
+// the winner's charge and fails the check. That re-evaluation is why
+// the limits are tested against columns of this row.
+//
+// Eligibility is fail-closed by construction: no pressure row, a stale
+// report, or a non-active host all make the UPDATE match nothing and
+// the INSERT insert nothing. A host whose publisher broke while its
+// heartbeat stays healthy must stop taking placements, not fall back to
+// counts admission cannot fence.
+//
+// Hard admission checks are the OPERATOR limits the report carries
+// (max_sandboxes, max_network_slots) plus the kernel slot ceiling.
+// Memory and vcpus are deliberately NOT hard-capped: firecracker hosts
+// overcommit both by design (lazy faulting), so capping allocations at
+// physical capacity would refuse hosts that run fine today. They are
+// charged for ranking only, until an operator-configured allocation
+// limit exists.
+//
+// Paused sandboxes count against max_sandboxes: resume is pinned to
+// this host, so every paused sandbox is capacity it must be able to
+// take back at any moment.
+//
+// Slot arithmetic: warm slots are already-prepared inventory, so a
+// charge only implies a NEW slot once the warm pool is exhausted —
+// GREATEST(0, charged + 1 - warm) net-new on top of every slot that
+// already exists (used + provisioning + warm).
+//
+// The same-sandbox guard makes a control-plane retry idempotent. It
+// reads the ledger from the statement snapshot, which is sound here
+// because retries of one sandbox are sequential from one replica, never
+// concurrent; a double charge would in any case self-heal at the next
+// report, which recomputes these counters from the ledger.
+func (q *Queries) ReserveHostCapacity(ctx context.Context, arg ReserveHostCapacityParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, reserveHostCapacity,
+		arg.SandboxID,
+		arg.HostID,
+		arg.MemoryMib,
+		arg.Vcpus,
+		arg.FreshnessSecs,
+	)
+	var sandbox_id uuid.UUID
+	err := row.Scan(&sandbox_id)
+	return sandbox_id, err
+}
+
+const retireHostReservations = `-- name: RetireHostReservations :exec
+DELETE FROM host_reservation r
+WHERE r.host_id = $1
+  AND ((r.materialized_at IS NOT NULL
+        AND r.materialized_at + make_interval(secs => $2::int) < now())
+       OR (r.materialized_at IS NULL
+           AND r.created_at + make_interval(secs => $3::int) < now()))
+`
+
+type RetireHostReservationsParams struct {
+	HostID    string `json:"host_id"`
+	SlackSecs int32  `json:"slack_secs"`
+	LeaseSecs int32  `json:"lease_secs"`
+}
+
+// Report-time hygiene, run after every successful pressure upsert for
+// the reporting host (once per 30s, never on the create path): deletes
+// rows the charge predicate already ignores — materialized rows the
+// fresh report now provably covers, and unmaterialized rows whose lease
+// lapsed (the create crashed between reserve and dispatch). Correctness
+// never depends on this running; it only keeps the ledger from growing
+// one row per create forever.
+func (q *Queries) RetireHostReservations(ctx context.Context, arg RetireHostReservationsParams) error {
+	_, err := q.db.Exec(ctx, retireHostReservations, arg.HostID, arg.SlackSecs, arg.LeaseSecs)
+	return err
 }
 
 const syncHostCapabilities = `-- name: SyncHostCapabilities :exec
@@ -872,7 +1200,32 @@ ON CONFLICT (host_id) DO UPDATE SET
     max_network_slots = EXCLUDED.max_network_slots,
     max_sandboxes = EXCLUDED.max_sandboxes,
     unknown_allocation_vms = EXCLUDED.unknown_allocation_vms,
-    reported_at = EXCLUDED.reported_at
+    reported_at = EXCLUDED.reported_at,
+    -- The control-plane-owned fence counters are RECOMPUTED from the
+    -- ledger against this report's own timestamp, never preserved and
+    -- never reset to zero. Recomputing is what makes the fence
+    -- self-healing: a missed decrement, a crashed replica's abandoned
+    -- row, or a double charge all converge within one heartbeat
+    -- interval. Resetting to zero instead would free capacity for VMs
+    -- this report cannot yet see — a report SAMPLED before a VM entered
+    -- vmd's instance map can ARRIVE after it, which is why a
+    -- materialized reservation keeps charging until a report clears its
+    -- materialization by the slack window.
+    charged_count = (SELECT COUNT(*) FROM host_reservation r
+                     WHERE r.host_id = EXCLUDED.host_id
+                       AND r.created_at > now() - make_interval(secs => $15::int)
+                       AND (r.materialized_at IS NULL
+                            OR r.materialized_at + make_interval(secs => $16::int) > now())),
+    charged_memory_mib = COALESCE((SELECT SUM(r.memory_mib) FROM host_reservation r
+                     WHERE r.host_id = EXCLUDED.host_id
+                       AND r.created_at > now() - make_interval(secs => $15::int)
+                       AND (r.materialized_at IS NULL
+                            OR r.materialized_at + make_interval(secs => $16::int) > now())), 0),
+    charged_vcpus = COALESCE((SELECT SUM(r.vcpus) FROM host_reservation r
+                     WHERE r.host_id = EXCLUDED.host_id
+                       AND r.created_at > now() - make_interval(secs => $15::int)
+                       AND (r.materialized_at IS NULL
+                            OR r.materialized_at + make_interval(secs => $16::int) > now())), 0)
 `
 
 type UpsertHostPressureParams struct {
@@ -890,6 +1243,8 @@ type UpsertHostPressureParams struct {
 	UnknownAllocationVms  int32  `json:"unknown_allocation_vms"`
 	HostID                string `json:"host_id"`
 	VmdAddr               string `json:"vmd_addr"`
+	LeaseSecs             int32  `json:"lease_secs"`
+	SlackSecs             int32  `json:"slack_secs"`
 }
 
 // Records a host's live pressure report, identity-fenced: the write
@@ -922,6 +1277,8 @@ func (q *Queries) UpsertHostPressure(ctx context.Context, arg UpsertHostPressure
 		arg.UnknownAllocationVms,
 		arg.HostID,
 		arg.VmdAddr,
+		arg.LeaseSecs,
+		arg.SlackSecs,
 	)
 	if err != nil {
 		return 0, err

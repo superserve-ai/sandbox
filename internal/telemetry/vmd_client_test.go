@@ -12,6 +12,7 @@ type captureRecorder struct {
 
 func (r *captureRecorder) RecordSandboxTransition(context.Context, SandboxTransition) {}
 func (r *captureRecorder) RecordHostResolution(context.Context, HostResolution)       {}
+func (r *captureRecorder) RecordPlacement(context.Context, Placement)                 {}
 
 func (r *captureRecorder) RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait) {}
 

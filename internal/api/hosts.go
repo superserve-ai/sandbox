@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/scheduler"
 )
 
 const (
@@ -349,7 +350,10 @@ func (h *Handlers) HostList(c *gin.Context) {
 	if id := c.Query("id"); id != "" {
 		idFilter = &id
 	}
-	rows, err := h.DB.ListHostsAdmin(c.Request.Context(), idFilter)
+	rows, err := h.DB.ListHostsAdmin(c.Request.Context(), db.ListHostsAdminParams{
+		ID:                   idFilter,
+		ReservationLeaseSecs: scheduler.ReservationLeaseSecs,
+	})
 	if err != nil {
 		log.Error().Err(err).Msg("ListHostsAdmin failed")
 		respondError(c, ErrInternal)
@@ -369,7 +373,11 @@ func (h *Handlers) HostList(c *gin.Context) {
 		TransitionalCount int32   `json:"transitional_count"`
 		PausedCount       int32   `json:"paused_count"`
 		BuildingCount     int32   `json:"building_count"`
-		PausedUnbacked    int32   `json:"paused_unbacked_count"`
+		// Creates admitted here whose VM does not exist yet (the
+		// reservation-to-dispatch gap). Busy work for drain purposes:
+		// zero everywhere else while a VM is about to launch.
+		ReservedCount  int32 `json:"reserved_count"`
+		PausedUnbacked int32 `json:"paused_unbacked_count"`
 		// Pressure fields are pointers: nil means the host has never
 		// published pressure (older vmd, or publication not enabled) —
 		// "unknown" must never render as a plausible zero.
@@ -396,6 +404,7 @@ func (h *Handlers) HostList(c *gin.Context) {
 			TransitionalCount: r.TransitionalCount,
 			PausedCount:       r.PausedCount,
 			BuildingCount:     r.BuildingCount,
+			ReservedCount:     r.ReservedCount,
 			PausedUnbacked:    r.PausedUnbackedCount,
 		}
 		if r.LastHeartbeatAt.Valid {
@@ -493,6 +502,11 @@ func (h *Handlers) HostReportPressure(c *gin.Context) {
 		MaxNetworkSlots:       req.MaxNetworkSlots,
 		MaxSandboxes:          req.MaxSandboxes,
 		UnknownAllocationVms:  req.UnknownAllocationVMs,
+		// The report is also the fence's reconciliation point: it
+		// recomputes the control-plane-owned charge counters from the
+		// reservation ledger against its own timestamp.
+		LeaseSecs: scheduler.ReservationLeaseSecs,
+		SlackSecs: scheduler.ReservationRetireSlackSecs,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("host_id", hostID).Msg("UpsertHostPressure failed")
@@ -506,6 +520,19 @@ func (h *Handlers) HostReportPressure(c *gin.Context) {
 		// "old control plane" (404 is reserved for exactly that).
 		respondErrorMsg(c, "conflict", "host identity is not held by this address", http.StatusConflict)
 		return
+	}
+	// Reservation hygiene rides the report cadence (once per 30s per
+	// host, never on the create path): drop ledger rows the admission
+	// charge predicate already ignores — materialized rows this fresh
+	// report now provably covers, and abandoned rows whose lease lapsed.
+	// Best-effort by design; correctness never depends on it running
+	// (see the host_reservation table comment).
+	if err := h.DB.RetireHostReservations(c.Request.Context(), db.RetireHostReservationsParams{
+		HostID:    hostID,
+		SlackSecs: scheduler.ReservationRetireSlackSecs,
+		LeaseSecs: scheduler.ReservationLeaseSecs,
+	}); err != nil {
+		log.Warn().Err(err).Str("host_id", hostID).Msg("reservation retirement failed; retrying on the next report")
 	}
 	c.JSON(http.StatusOK, gin.H{"recorded": true})
 }

@@ -148,6 +148,20 @@ type LatencyPhase struct {
 	Duration time.Duration
 }
 
+// Placement records one sandbox placement decision: which scheduling
+// mode ran, how it ended, how many fenced admission attempts it took,
+// and its end-to-end duration — the new synchronous component of create
+// latency when capacity admission is enabled, so it gets its own
+// histogram rather than hiding inside the create total. Every label is
+// a bounded enum owned by the scheduler.
+type Placement struct {
+	Mode     string // capacity | legacy | fallback
+	Result   string // placed | exhausted | no_hosts | error
+	Reason   string // "" | sandbox_limit | slot_limit | raced
+	Attempts int    // fenced admission statements run (0 outside capacity mode)
+	Duration time.Duration
+}
+
 // Recorder is the operational metrics boundary. Implementations should emit
 // OpenTelemetry metrics through a collector; callers should not write ad hoc
 // operational metrics into Postgres.
@@ -156,6 +170,7 @@ type Recorder interface {
 	RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait)
 	RecordVMDCall(context.Context, VMDCall)
 	RecordHostResolution(context.Context, HostResolution)
+	RecordPlacement(context.Context, Placement)
 	RecordHostCapacity(context.Context, HostCapacity)
 	RecordBackupCoverage(context.Context, []BackupCoverage)
 	RecordDBPoolStats(context.Context, DBPoolStats)
@@ -182,6 +197,7 @@ func (noopRecorder) RecordSandboxTransition(context.Context, SandboxTransition) 
 func (noopRecorder) RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait) {}
 func (noopRecorder) RecordVMDCall(context.Context, VMDCall)                                 {}
 func (noopRecorder) RecordHostResolution(context.Context, HostResolution)                   {}
+func (noopRecorder) RecordPlacement(context.Context, Placement)                             {}
 func (noopRecorder) RecordHostCapacity(context.Context, HostCapacity)                       {}
 func (noopRecorder) RecordBackupCoverage(context.Context, []BackupCoverage)                 {}
 func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)                         {}

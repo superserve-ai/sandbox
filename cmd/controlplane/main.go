@@ -262,8 +262,27 @@ func run() error {
 		})
 	}
 	handlers.Hosts = hostRegistry
-	sched := &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
-	handlers.Scheduler = sched
+	if cfg.SchedulerCapacityAdmission {
+		// Opt-in capacity placement: fenced admission for hosts that
+		// publish pressure, legacy least-loaded for hosts that don't,
+		// fail-closed for capable hosts whose reports went stale.
+		handlers.Scheduler = &scheduler.CapacityAware{
+			DB:            queries,
+			DefaultHostID: cfg.DefaultHostID,
+			Region:        api.SandboxIDRegion(),
+			Observe: func(obs scheduler.PlacementObservation) {
+				recorder.RecordPlacement(context.Background(), telemetry.Placement{
+					Mode:     obs.Mode,
+					Result:   obs.Result,
+					Reason:   obs.Reason,
+					Attempts: obs.Attempts,
+					Duration: obs.Duration,
+				})
+			},
+		}
+	} else {
+		handlers.Scheduler = &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
+	}
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
@@ -316,7 +335,7 @@ func run() error {
 	// The detector invalidates the scheduler's host cache when it marks a
 	// host unhealthy, so this instance stops routing to it at detection time
 	// rather than at cache expiry.
-	go api.StartHostDetector(ctx, queries, sched.Invalidate)
+	go api.StartHostDetector(ctx, queries, handlers.Scheduler.Invalidate)
 
 	// Billing dashboard rollups are provisional and recomputable from raw
 	// interval rows. Team-level feature flags decide which tenants roll up.

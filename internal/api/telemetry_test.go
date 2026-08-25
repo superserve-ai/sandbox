@@ -28,6 +28,8 @@ func (r *captureTelemetryRecorder) RecordVMDCall(context.Context, telemetry.VMDC
 func (r *captureTelemetryRecorder) RecordLatencyPhase(context.Context, telemetry.LatencyPhase) {}
 func (r *captureTelemetryRecorder) RecordHostResolution(context.Context, telemetry.HostResolution) {
 }
+func (r *captureTelemetryRecorder) RecordPlacement(context.Context, telemetry.Placement) {
+}
 func (r *captureTelemetryRecorder) RecordHostCapacity(context.Context, telemetry.HostCapacity) {
 }
 func (r *captureTelemetryRecorder) RecordBackupCoverage(context.Context, []telemetry.BackupCoverage) {

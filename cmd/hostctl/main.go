@@ -112,12 +112,22 @@ func (c client) waitDrained(hostID string) error {
 		if h.Status != "draining" {
 			return fmt.Errorf("host %s status changed to %q while waiting; placement may be enabled again — aborting", hostID, h.Status)
 		}
-		busy := h.RunningCount + h.TransitionalCount + h.BuildingCount
+		// Reservations count as busy: an admitted create whose VM has
+		// not launched yet is exactly the work drain exists to wait
+		// out — without it, the host reads zero during the
+		// reservation-to-dispatch gap while a VM is about to appear.
+		// (A drained host stops being admitted long before this reads
+		// zero: draining status excludes it from the candidate set.)
+		reserved := 0
+		if h.ReservedCount != nil {
+			reserved = *h.ReservedCount
+		}
+		busy := h.RunningCount + h.TransitionalCount + h.BuildingCount + reserved
 		switch {
 		case busy != 0:
 			quietSince = time.Time{}
-			fmt.Printf("still busy: running=%d busy=%d builds=%d\n",
-				h.RunningCount, h.TransitionalCount, h.BuildingCount)
+			fmt.Printf("still busy: running=%d busy=%d builds=%d reserved=%d\n",
+				h.RunningCount, h.TransitionalCount, h.BuildingCount, reserved)
 		case quietSince.IsZero():
 			quietSince = time.Now()
 		}
@@ -176,6 +186,7 @@ type hostView struct {
 	TransitionalCount int     `json:"transitional_count"`
 	PausedCount       int     `json:"paused_count"`
 	BuildingCount     int     `json:"building_count"`
+	ReservedCount     *int    `json:"reserved_count"`
 	// Pointers throughout: nil means the control plane (or host) never
 	// produced the value — shown as "-"/unknown so absence never reads
 	// as a plausible, safety-relevant zero.
@@ -250,7 +261,11 @@ func (c client) list() error {
 	// ALLOC counts live VMs the host could not size — the allocation is
 	// an undercount by that many VMs, so the host has LESS free capacity
 	// than the numbers suggest.
-	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED\tUNBACKED\tALLOC\tP_AGE")
+	// RSV counts capacity reservations for creates whose VM does not
+	// exist yet — admitted placements in the reservation-to-dispatch
+	// gap, visible in no other column. "-" means the control plane
+	// predates reservation reporting.
+	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tRSV\tPAUSED\tUNBACKED\tALLOC\tP_AGE")
 	for _, h := range out.Hosts {
 		beat := "never"
 		if h.LastHeartbeatAt != nil {
@@ -281,8 +296,12 @@ func (c client) list() error {
 				pAge = fmt.Sprintf("%ds", int(time.Since(t).Seconds()))
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
-			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount, unbacked, alloc, pAge)
+		reserved := "-"
+		if h.ReservedCount != nil {
+			reserved = fmt.Sprintf("%d", *h.ReservedCount)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%d\t%s\t%s\t%s\n",
+			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, reserved, h.PausedCount, unbacked, alloc, pAge)
 	}
 	return w.Flush()
 }

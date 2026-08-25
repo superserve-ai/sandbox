@@ -263,6 +263,15 @@ func sendPressure(ctx context.Context, client *http.Client, cfg HeartbeatConfig,
 	}
 }
 
+// capacityPressureCapability marks a heartbeat from a build configured
+// to publish capacity pressure for this host. The control-plane
+// scheduler keys its fail-closed rule on it: a host that advertises
+// this but has no fresh pressure report takes no NEW placements (its
+// publisher is broken or still converging), while a host that never
+// advertises it stays on legacy placement. Must match the
+// scheduler-side constant (internal/scheduler.HostCapabilityCapacityPressure).
+const capacityPressureCapability = "capacity_pressure_v1"
+
 type heartbeatRequest struct {
 	Capabilities      []string                      `json:"capabilities"`
 	Storage           []heartbeatStorageMeasurement `json:"storage,omitempty"`
@@ -342,6 +351,16 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 			Dur("duration", time.Since(started)).
 			Msg("proxy capability probe failed; advertising no preview capabilities")
 		capabilities = nil
+	}
+	if cfg.Pressure != nil && cfg.VMDAddr != "" {
+		// Advertised under exactly the condition sendPressure publishes —
+		// deliberately NOT gated on PressureReady: that is the transient
+		// startup gate, and "capable with no fresh report yet" is
+		// precisely how the scheduler should see a host whose reattach
+		// accounting is still converging (no new placements), rather
+		// than falling back to legacy counts the admission fence cannot
+		// see.
+		capabilities = append(capabilities, capacityPressureCapability)
 	}
 	return postHeartbeat(ctx, client, cfg, url, token, capabilities, storage, log, started)
 }
