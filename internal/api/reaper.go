@@ -59,7 +59,8 @@ func DefaultReaperConfig() ReaperConfig {
 //   - The batch size bounds work per tick so a burst of expirations
 //     cannot starve the control plane for extended periods.
 func (h *Handlers) StartTimeoutReaper(ctx context.Context, cfg ReaperConfig) {
-	go h.reaperLoop(ctx, cfg)
+	logger := log.Logger
+	go h.reaperLoop(ctx, cfg, logger)
 	go h.trialEligibilityLoop(ctx, cfg.Interval)
 }
 
@@ -86,7 +87,7 @@ func (h *Handlers) trialEligibilityLoop(ctx context.Context, interval time.Durat
 	}
 }
 
-func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
+func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig, logger zerolog.Logger) {
 	parallelism := cfg.Parallelism
 	if parallelism <= 0 {
 		parallelism = 10
@@ -99,7 +100,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 		sweepInterval = defaultSweepInterval
 	}
 
-	log.Info().
+	logger.Info().
 		Dur("interval", cfg.Interval).
 		Dur("sweep_interval", sweepInterval).
 		Int32("batch_size", cfg.BatchSize).
@@ -111,14 +112,14 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 	// goroutine would let a slow batch hold off the sweeps — the reason they
 	// ran last in the single-ticker loop this replaced. Concurrency here is
 	// not new: every control-plane instance already runs both loops.
-	go h.sweepLoop(ctx, sweepInterval)
+	go h.sweepLoop(ctx, sweepInterval, logger)
 
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 
 	runTick := func() {
-		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism) })
-		sentrylog.RunSafe("auto-delete", func() { h.reapAutoDeleteOnce(ctx, cfg.BatchSize, parallelism) })
+		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism, logger) })
+		sentrylog.RunSafe("auto-delete", func() { h.reapAutoDeleteOnce(ctx, cfg.BatchSize, parallelism, logger) })
 	}
 
 	// Run once immediately so a control plane restart does not delay
@@ -128,7 +129,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info().Msg("timeout reaper exiting")
+			logger.Info().Msg("timeout reaper exiting")
 			return
 		case <-ticker.C:
 			runTick()
@@ -139,14 +140,14 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig) {
 // sweepLoop runs the DB-only maintenance sweeps: backstops for cleanup the
 // request path already performs, each scanning accumulated history to usually
 // find nothing.
-func (h *Handlers) sweepLoop(ctx context.Context, interval time.Duration) {
+func (h *Handlers) sweepLoop(ctx context.Context, interval time.Duration, logger zerolog.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	runSweeps := func() {
-		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx) })
-		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx) })
-		sentrylog.RunSafe("snapshot-row-sweep", func() { h.sweepOrphanedSnapshotRows(ctx) })
+		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx, logger) })
+		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx, logger) })
+		sentrylog.RunSafe("snapshot-row-sweep", func() { h.sweepOrphanedSnapshotRows(ctx, logger) })
 	}
 
 	// Immediately, so a restart after a crash cleans up without waiting a
@@ -165,40 +166,40 @@ func (h *Handlers) sweepLoop(ctx context.Context, interval time.Duration) {
 
 // sweepOrphanedIntervals closes intervals left open on no-longer-active
 // sandboxes — defense-in-depth for WAU accuracy, off the request path.
-func (h *Handlers) sweepOrphanedIntervals(ctx context.Context) {
+func (h *Handlers) sweepOrphanedIntervals(ctx context.Context, logger zerolog.Logger) {
 	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	n, err := h.DB.CloseOrphanedActiveIntervals(qctx)
 	if err != nil {
-		log.Error().Err(err).Msg("reaper: CloseOrphanedActiveIntervals failed")
+		logger.Error().Err(err).Msg("reaper: CloseOrphanedActiveIntervals failed")
 		return
 	}
 	if n > 0 {
-		log.Warn().Int64("closed", n).Msg("reaper: closed orphaned active intervals")
+		logger.Warn().Int64("closed", n).Msg("reaper: closed orphaned active intervals")
 	}
 }
 
 // cleanupExpiredRevocations deletes sandbox_revocation and revoked_proxy_token
 // rows past their TTL — once no live JWT can carry them, the entries are moot.
-func (h *Handlers) cleanupExpiredRevocations(ctx context.Context) {
+func (h *Handlers) cleanupExpiredRevocations(ctx context.Context, logger zerolog.Logger) {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	n, err := h.DB.DeleteExpiredSandboxRevocations(queryCtx)
 	if err != nil {
-		log.Warn().Err(err).Msg("reaper: cleanup revocations failed")
+		logger.Warn().Err(err).Msg("reaper: cleanup revocations failed")
 		return
 	}
 	if n > 0 {
-		log.Info().Int64("reaped", n).Msg("reaper: deleted expired sandbox revocations")
+		logger.Info().Int64("reaped", n).Msg("reaper: deleted expired sandbox revocations")
 	}
 
 	tn, err := h.DB.DeleteExpiredRevokedProxyTokens(queryCtx)
 	if err != nil {
-		log.Warn().Err(err).Msg("reaper: cleanup revoked proxy tokens failed")
+		logger.Warn().Err(err).Msg("reaper: cleanup revoked proxy tokens failed")
 		return
 	}
 	if tn > 0 {
-		log.Info().Int64("reaped", tn).Msg("reaper: deleted expired revoked proxy tokens")
+		logger.Info().Int64("reaped", tn).Msg("reaper: deleted expired revoked proxy tokens")
 	}
 }
 
@@ -225,7 +226,7 @@ dispatch:
 	wg.Wait()
 }
 
-func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism int) {
+func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism int, logger zerolog.Logger) {
 	// Atomically claim expired active sandboxes and mark them 'pausing' in one
 	// CTE+UPDATE. FOR UPDATE SKIP LOCKED inside the query ensures that
 	// concurrent reaper replicas skip rows already being processed.
@@ -235,7 +236,7 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism in
 	expired, err := h.DB.ClaimExpiredSandboxes(queryCtx, batchSize)
 	queryCancel()
 	if err != nil {
-		log.Error().Err(err).Msg("reaper: ClaimExpiredSandboxes failed")
+		logger.Error().Err(err).Msg("reaper: ClaimExpiredSandboxes failed")
 		return
 	}
 
@@ -243,10 +244,10 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism in
 		return
 	}
 
-	log.Info().Int("count", len(expired)).Msg("reaper: pausing expired sandboxes")
+	logger.Info().Int("count", len(expired)).Msg("reaper: pausing expired sandboxes")
 
 	dispatchBounded(ctx, expired, parallelism, func(sbx db.ClaimExpiredSandboxesRow) {
-		h.pauseExpired(ctx, sbx)
+		h.pauseExpired(ctx, sbx, logger)
 	})
 }
 
@@ -255,16 +256,16 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism in
 // shutdown between the soft-delete claim and cleanupSandboxSnapshots).
 // Row deletion also unblocks the vm reconciler's disk scan, which reclaims
 // the now-orphaned files.
-func (h *Handlers) sweepOrphanedSnapshotRows(ctx context.Context) {
+func (h *Handlers) sweepOrphanedSnapshotRows(ctx context.Context, logger zerolog.Logger) {
 	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	n, err := h.DB.DeleteSnapshotsOfDestroyedSandboxes(qctx)
 	if err != nil {
-		log.Warn().Err(err).Msg("reaper: DeleteSnapshotsOfDestroyedSandboxes failed")
+		logger.Warn().Err(err).Msg("reaper: DeleteSnapshotsOfDestroyedSandboxes failed")
 		return
 	}
 	if n > 0 {
-		log.Warn().Int64("deleted", n).Msg("reaper: removed snapshot rows orphaned by unfinished destroy teardown")
+		logger.Warn().Int64("deleted", n).Msg("reaper: removed snapshot rows orphaned by unfinished destroy teardown")
 	}
 }
 
@@ -274,7 +275,7 @@ func (h *Handlers) sweepOrphanedSnapshotRows(ctx context.Context) {
 // best-effort teardown of VM state and artifacts — same contract as the
 // user-initiated DeleteSandbox, where the vm reconciler backstops any teardown
 // step that fails.
-func (h *Handlers) reapAutoDeleteOnce(ctx context.Context, batchSize int32, parallelism int) {
+func (h *Handlers) reapAutoDeleteOnce(ctx context.Context, batchSize int32, parallelism int, logger zerolog.Logger) {
 	queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
 	due, err := h.DB.ClaimAutoDeleteSandboxes(queryCtx, db.ClaimAutoDeleteSandboxesParams{
 		BatchSize:           batchSize,
@@ -282,7 +283,7 @@ func (h *Handlers) reapAutoDeleteOnce(ctx context.Context, batchSize int32, para
 	})
 	queryCancel()
 	if err != nil {
-		log.Error().Err(err).Msg("reaper: ClaimAutoDeleteSandboxes failed")
+		logger.Error().Err(err).Msg("reaper: ClaimAutoDeleteSandboxes failed")
 		return
 	}
 
@@ -290,10 +291,10 @@ func (h *Handlers) reapAutoDeleteOnce(ctx context.Context, batchSize int32, para
 		return
 	}
 
-	log.Info().Int("count", len(due)).Msg("reaper: deleting expired paused sandboxes")
+	logger.Info().Int("count", len(due)).Msg("reaper: deleting expired paused sandboxes")
 
 	dispatchBounded(ctx, due, parallelism, func(sbx db.ClaimAutoDeleteSandboxesRow) {
-		h.teardownAutoDeleted(ctx, sbx)
+		h.teardownAutoDeleted(ctx, sbx, logger)
 	})
 }
 
@@ -305,8 +306,8 @@ const autoDeleteTeardownTimeout = 2 * time.Minute
 
 // teardownAutoDeleted reclaims VM state for one sandbox already soft-deleted
 // by ClaimAutoDeleteSandboxes, via the same teardown path as DeleteSandbox.
-func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDeleteSandboxesRow) {
-	l := log.With().
+func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDeleteSandboxesRow, logger zerolog.Logger) {
+	l := logger.With().
 		Str("sandbox_id", sbx.ID.String()).
 		Str("host_id", sbx.HostID).
 		Str("team_id", sbx.TeamID.String()).
@@ -339,11 +340,11 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 // Failure handling:
 //   - Step 1 fails → VM is still running → revert DB to 'active'.
 //   - Step 2 fails → VM is stopped → call rollbackPausedVM (resume + revert).
-func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxesRow) {
-	h.pauseClaimed(ctx, sbx, "timeout", "timeout_pause", "timeout_paused", "reaper: sandbox paused due to timeout")
+func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, logger zerolog.Logger) {
+	h.pauseClaimed(ctx, sbx, "timeout", "timeout_pause", "timeout_paused", "reaper: sandbox paused due to timeout", logger)
 }
 
-func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBillingIneligibleSandboxesRow) {
+func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBillingIneligibleSandboxesRow, logger zerolog.Logger) {
 	h.pauseClaimed(ctx, db.ClaimExpiredSandboxesRow{
 		ID:            sbx.ID,
 		TeamID:        sbx.TeamID,
@@ -351,11 +352,11 @@ func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBilli
 		SnapshotID:    sbx.SnapshotID,
 		HostID:        sbx.HostID,
 		NetworkConfig: sbx.NetworkConfig,
-	}, "billing_ineligible", "billing_ineligible_pause", "billing_ineligible_paused", "billing: sandbox paused after eligibility loss")
+	}, "billing_ineligible", "billing_ineligible_pause", "billing_ineligible_paused", "billing: sandbox paused after eligibility loss", logger)
 }
 
-func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, trigger, transition, activity, successMessage string) {
-	l := log.With().
+func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, trigger, transition, activity, successMessage string, logger zerolog.Logger) {
+	l := logger.With().
 		Str("sandbox_id", sbx.ID.String()).
 		Str("host_id", sbx.HostID).
 		Str("team_id", sbx.TeamID.String()).

@@ -109,7 +109,7 @@ func (h *Handlers) pauseBillingIneligibleTeam(ctx context.Context, teamID uuid.U
 		dispatchBounded(cleanupCtx, rows, 10, func(sbx db.ClaimBillingIneligibleSandboxesRow) {
 			itemCtx, itemCancel := context.WithTimeout(cleanupCtx, 2*time.Minute)
 			defer itemCancel()
-			h.pauseBillingIneligible(itemCtx, sbx)
+			h.pauseBillingIneligible(itemCtx, sbx, log.Logger)
 		})
 		if len(rows) < int(billingEligibilityPauseBatchSize) || batch >= 99 {
 			if len(rows) > 0 {
