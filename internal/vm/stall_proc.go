@@ -103,7 +103,11 @@ func readProcFile(path string) string {
 // of a live Firecracker process. MUST be called before teardown: once the
 // process is killed, every answer here is gone.
 func captureProcState(pid int, vmID string) *procStallState {
-	st := &procStallState{PID: pid}
+	// -1, not the zero value: `total: 0` is the affirmative verdict "the
+	// guest is not waiting on memory at all — look elsewhere", so a counter
+	// we never managed to read must never render as that. Unreadable
+	// /proc/<pid>/fd, a capped scan, or a File-backend VM all land here.
+	st := &procStallState{PID: pid, UffdPending: -1, UffdTotal: -1}
 	deadline := time.Now().Add(stallCaptureBudget)
 	base := filepath.Join("/proc", strconv.Itoa(pid))
 	if _, err := os.Stat(base); err != nil {

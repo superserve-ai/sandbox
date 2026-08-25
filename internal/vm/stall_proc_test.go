@@ -44,6 +44,19 @@ func TestThreadReadsRespectTheBudget(t *testing.T) {
 	}
 }
 
+func TestUnreadCountersAreNotACleanObservation(t *testing.T) {
+	// A capture that never found the uffd must not report the same numbers
+	// as a capture that found it holding zero unresolved faults — those are
+	// opposite conclusions.
+	st := captureProcState(0, "any-vm") // fails before any fd scan
+	if st.UffdPending != -1 || st.UffdTotal != -1 {
+		t.Fatalf("unavailable counters reported as %d/%d, want -1/-1", st.UffdPending, st.UffdTotal)
+	}
+	if st.UffdFound {
+		t.Fatal("uffd reported as found when no scan ran")
+	}
+}
+
 func TestDumpNamesThePID(t *testing.T) {
 	st := &procStallState{PID: 4242, Truncated: true}
 	d := st.dump()
