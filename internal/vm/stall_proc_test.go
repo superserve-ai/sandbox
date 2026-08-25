@@ -30,7 +30,14 @@ func TestParseUffdCounters(t *testing.T) {
 func TestCaptureProcStateSelf(t *testing.T) {
 	// The live process always has a task dir; stacks may be unreadable
 	// (non-root, no CONFIG_STACKTRACE) and that must degrade, not fail.
-	st := captureProcState(os.Getpid())
+	// The identity token is taken from this process's own command line so the
+	// check passes for the test binary the way it passes for firecracker.
+	self := readProcFile("/proc/self/cmdline")
+	token := self
+	if i := strings.IndexByte(token, 0); i > 0 {
+		token = token[:i]
+	}
+	st := captureProcState(os.Getpid(), token)
 	if st.CaptureError != "" {
 		t.Fatalf("self capture errored: %s", st.CaptureError)
 	}
@@ -57,7 +64,7 @@ func TestCaptureProcStateSelf(t *testing.T) {
 func TestCaptureProcStateDeadProcess(t *testing.T) {
 	// PID 0 never has a /proc entry: a process that died before capture must
 	// report the gap rather than panic or fabricate an empty-but-clean state.
-	st := captureProcState(0)
+	st := captureProcState(0, "any-vm")
 	if st.CaptureError == "" {
 		t.Fatal("dead process must set CaptureError")
 	}
@@ -77,6 +84,22 @@ func TestReadProcFileCaps(t *testing.T) {
 	}
 	if readProcFile(filepath.Join(dir, "missing")) != "" {
 		t.Fatal("missing file must read as empty, not error")
+	}
+}
+
+func TestCaptureRefusesARecycledPID(t *testing.T) {
+	// A PID whose process is not this VM's firecracker must yield no capture:
+	// attributing a stranger's threads to this VM is worse than no evidence.
+	st := captureProcState(os.Getpid(), "00000000-0000-0000-0000-000000000000")
+	if st.CaptureError == "" {
+		t.Fatal("capture accepted a pid that is not this VM's firecracker")
+	}
+	if len(st.Threads) != 0 {
+		t.Fatalf("captured %d threads from an unrelated process", len(st.Threads))
+	}
+	// An empty vm id can never identify a process either.
+	if procIsVMFirecracker(os.Getpid(), "") {
+		t.Fatal("empty vm id must not match any process")
 	}
 }
 
@@ -223,8 +246,60 @@ func BenchmarkLaunchPIDHelpers(b *testing.B) {
 // to keep that budget claim measured rather than asserted.
 func BenchmarkCaptureProcState(b *testing.B) {
 	pid := os.Getpid()
+	token := readProcFile("/proc/self/cmdline")
+	if i := strings.IndexByte(token, 0); i > 0 {
+		token = token[:i]
+	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = captureProcState(pid)
+		_ = captureProcState(pid, token)
 	}
+}
+
+// Per-op cost is not the question under a burst — serialization is. These run
+// the launch-path helpers concurrently across DISTINCT instances, the shape a
+// 100- or 1000-create burst actually produces. Per-instance locks must not
+// contend at all; the one manager-wide read lock must not turn the burst
+// serial.
+func BenchmarkLaunchPIDHelpersParallel(b *testing.B) {
+	const vms = 1000
+	m := &Manager{vms: make(map[string]*VMInstance, vms)}
+	ids := make([]string, vms)
+	for i := 0; i < vms; i++ {
+		ids[i] = "vm-" + strconv.Itoa(i)
+		m.vms[ids[i]] = &VMInstance{}
+	}
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			id := ids[i%vms]
+			i++
+			inst := m.vms[id]
+			gen := beginLaunchAttempt(inst)
+			_ = m.launchGenFor(id)
+			publishLaunchPID(inst, 4242, SupervisionUnit)
+			publishResolvedPID(inst, gen, 4242)
+		}
+	})
+}
+
+// Isolates the manager-wide read lock, the only lock these helpers share
+// across VMs.
+func BenchmarkLaunchGenForParallel(b *testing.B) {
+	const vms = 1000
+	m := &Manager{vms: make(map[string]*VMInstance, vms)}
+	ids := make([]string, vms)
+	for i := 0; i < vms; i++ {
+		ids[i] = "vm-" + strconv.Itoa(i)
+		m.vms[ids[i]] = &VMInstance{}
+	}
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			_ = m.launchGenFor(ids[i%vms])
+			i++
+		}
+	})
 }

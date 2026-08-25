@@ -5811,7 +5811,7 @@ func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Durati
 	// Firecracker is still alive, i.e. before stopUnitDuringRestoreError.
 	var proc *procStallState
 	if pid > 0 {
-		proc = captureProcState(pid)
+		proc = captureProcState(pid, vmID)
 	}
 	src := filepath.Join(m.cfg.RunDir, vmID, "console.log")
 	// The ONLY work that must beat the teardown's rundir delete is moving

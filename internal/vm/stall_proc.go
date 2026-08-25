@@ -44,6 +44,15 @@ const (
 	stallProcFileMaxLen = 8 << 10
 )
 
+// stallCaptureBudget bounds the SYNCHRONOUS part of the capture. procfs reads
+// are normally in-memory and finish in well under a millisecond, but they are
+// still kernel calls that can stall under the same host pressure that
+// accompanies a stall. This runs inside the readiness-timeout verdict reserve
+// and ahead of teardown, so it must yield rather than hold the failed VM's
+// resources: an incomplete capture is worth strictly less than a delayed
+// verdict is harmful.
+const stallCaptureBudget = 250 * time.Millisecond
+
 // procThread is one thread's kernel-side state at stall time.
 type procThread struct {
 	TID   string
@@ -56,6 +65,7 @@ type procThread struct {
 // is still alive. Empty fields mean "unavailable", never "known absent".
 type procStallState struct {
 	PID          int
+	Truncated    bool
 	Threads      []procThread
 	UffdPending  int64
 	UffdTotal    int64
@@ -80,11 +90,22 @@ func readProcFile(path string) string {
 // captureProcState reads the per-thread kernel state and userfaultfd counters
 // of a live Firecracker process. MUST be called before teardown: once the
 // process is killed, every answer here is gone.
-func captureProcState(pid int) *procStallState {
+func captureProcState(pid int, vmID string) *procStallState {
 	st := &procStallState{PID: pid}
+	deadline := time.Now().Add(stallCaptureBudget)
 	base := filepath.Join("/proc", strconv.Itoa(pid))
 	if _, err := os.Stat(base); err != nil {
 		st.CaptureError = "process gone before capture"
+		return st
+	}
+	// A PID is only a name for a process while that process lives. If
+	// Firecracker exited during the readiness wait, the kernel is free to
+	// hand this number to anything, and capturing it would attribute a
+	// stranger's threads and stacks to this VM — worse than no evidence.
+	// Firecracker's command line carries the VM id, so the check is exact
+	// rather than a guess at "looks like a VMM".
+	if !procIsVMFirecracker(pid, vmID) {
+		st.CaptureError = "pid is no longer this VM's firecracker (exited, or recycled by another process)"
 		return st
 	}
 
@@ -93,7 +114,11 @@ func captureProcState(pid int) *procStallState {
 		st.CaptureError = "task dir unreadable: " + err.Error()
 	}
 	for i, e := range entries {
-		if i >= maxStallThreads {
+		if i >= maxStallThreads || time.Now().After(deadline) {
+			// Report what was gathered rather than spend the teardown
+			// reserve; the flag keeps a partial capture from reading as a
+			// complete one.
+			st.Truncated = true
 			break
 		}
 		tdir := filepath.Join(base, "task", e.Name())
@@ -123,6 +148,19 @@ func captureProcState(pid int) *procStallState {
 		st.UffdPending, st.UffdTotal = parseUffdCounters(st.UffdFdinfo)
 	}
 	return st
+}
+
+// procIsVMFirecracker reports whether pid is still the Firecracker process
+// belonging to vmID. The command line names the VM (its --id and the rundir
+// path in --api-sock both carry it), so a recycled PID or an unrelated
+// process fails the check.
+func procIsVMFirecracker(pid int, vmID string) bool {
+	if vmID == "" {
+		return false
+	}
+	// cmdline is NUL-separated; a substring match over the raw bytes is
+	// exactly what is needed here.
+	return strings.Contains(readProcFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline")), vmID)
 }
 
 // findUffdFD locates the userfaultfd descriptor by its anon-inode link target.
@@ -219,6 +257,7 @@ func (s *procStallState) dump() string {
 	if s.CaptureError != "" {
 		fmt.Fprintf(&b, "capture_error: %s\n", s.CaptureError)
 	}
+	fmt.Fprintf(&b, "truncated: %v\n", s.Truncated)
 	fmt.Fprintf(&b, "uffd_found: %v pending: %d total: %d\n\n", s.UffdFound, s.UffdPending, s.UffdTotal)
 	if s.UffdFdinfo != "" {
 		fmt.Fprintf(&b, "--- uffd fdinfo ---\n%s\n\n", s.UffdFdinfo)
@@ -253,6 +292,7 @@ func (m *Manager) logStallProcState(vmID string, waited time.Duration, st *procS
 		Int64("uffd_pending", st.UffdPending).
 		Int64("uffd_total", st.UffdTotal).
 		Int("threads", len(st.Threads)).
+		Bool("truncated", st.Truncated).
 		Str("thread_state", st.threadSummary()).
 		Str("procstate_preserved", preserved).
 		Str("capture_error", st.CaptureError).
