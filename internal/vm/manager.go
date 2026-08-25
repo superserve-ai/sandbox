@@ -3113,15 +3113,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				// it), and this write lands after the stale one by
 				// construction.
 				m.persistState(cur)
-				return
+			} else {
+				m.setStatus(vmID, StatusError)
 			}
-			m.setStatus(vmID, StatusError)
 			// DestroyVM bypasses the lifecycle lock, so its record delete
-			// can interleave anywhere around the write above and be
+			// can interleave anywhere around EITHER write above and be
 			// resurrected by it. Converge by compensation: if the VM is
 			// gone now, delete what we may have just written; a destroy
 			// landing after this check deletes it itself. Every
-			// interleaving ends with the record absent.
+			// interleaving ends with the record absent. (Under the held
+			// lifecycle lock a destroy is the only possible map mutation,
+			// so an untracked entry here can mean nothing else.)
 			m.mu.RLock()
 			_, still := m.vms[vmID]
 			m.mu.RUnlock()
