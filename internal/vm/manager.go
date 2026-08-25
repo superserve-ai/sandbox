@@ -3075,7 +3075,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// and that aborting restore should neither pay the file read nor
 		// pollute the stall signal.
 		if ctx.Err() == nil {
-			m.captureStallForensics(vmID, time.Since(tBoxdStart), tAttemptStart)
+			m.captureStallForensics(vmID, pid, time.Since(tBoxdStart), tAttemptStart)
 		}
 		// Teardown first — none of it touches BoltDB, so a stalled persist
 		// cannot keep the failed restore's unit and network alive.
@@ -5788,12 +5788,20 @@ func summarizeConsoleTail(tail string) (fcLines, boxdLines, guestLines int, pani
 // otherwise delete the only evidence. An empty console is itself the
 // strongest signal: the guest stalled before its first line.
 //
-// Only the console-file rename runs synchronously (microseconds, and it must
-// beat the teardown's rundir delete). The unit-supervised fallback shells to
-// journalctl, so it runs detached: the journal survives the teardown on its
-// own, and the reply path must not spend its in-band-verdict margin on it.
-func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launchedAt time.Time) {
+// Two things run synchronously because the teardown destroys their subject:
+// the console rename (the rundir is deleted) and the procfs read of the
+// Firecracker process (the process is killed). Both are in-memory operations
+// — a rename and a handful of procfs reads, no disk I/O — so the in-band
+// verdict margin is preserved. Formatting, logging, quarantine writes, and
+// the journald fallback all run detached.
+func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Duration, launchedAt time.Time) {
 	failedAt := time.Now()
+	// The kernel's answer to "blocked on what" — must be read while
+	// Firecracker is still alive, i.e. before stopUnitDuringRestoreError.
+	var proc *procStallState
+	if pid > 0 {
+		proc = captureProcState(pid)
+	}
 	src := filepath.Join(m.cfg.RunDir, vmID, "console.log")
 	// The ONLY work that must beat the teardown's rundir delete is moving
 	// the file out (direct-spawn mode; unit mode has no file, and its
@@ -5805,6 +5813,9 @@ func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launc
 	renamed := m.forensicsOK && os.Rename(src, dst) == nil // dir pre-created and secured at startup
 	go func() {
 		defer sentrylog.Recover("stall-forensics")
+		if proc != nil {
+			m.logStallProcState(vmID, waited, proc, dir, failedAt)
+		}
 		if renamed {
 			_ = os.Chmod(dst, 0o600)
 			tail, size, err := tailFile(dst, 4096)
