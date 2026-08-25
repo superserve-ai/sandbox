@@ -3075,7 +3075,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// and that aborting restore should neither pay the file read nor
 		// pollute the stall signal.
 		if ctx.Err() == nil {
-			m.captureStallForensics(vmID, pid, time.Since(tBoxdStart), tAttemptStart)
+			m.captureStallForensics(vmID, m.resolveFCPID(vmID, pid), time.Since(tBoxdStart), tAttemptStart)
 		}
 		// Teardown first — none of it touches BoltDB, so a stalled persist
 		// cannot keep the failed restore's unit and network alive.
@@ -5813,6 +5813,13 @@ func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Durati
 	renamed := m.forensicsOK && os.Rename(src, dst) == nil // dir pre-created and secured at startup
 	go func() {
 		defer sentrylog.Recover("stall-forensics")
+		// One prune covering every exit path: a stall can add a console file,
+		// a procstate file, or both, and the paths that produce no console
+		// (unit supervision, a console already gone) must not grow the
+		// quarantine without bound.
+		if m.forensicsOK {
+			defer pruneOldest(dir, stallForensicsKeep)
+		}
 		if proc != nil {
 			m.logStallProcState(vmID, waited, proc, dir, failedAt)
 		}
@@ -5825,7 +5832,6 @@ func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Durati
 			} else {
 				m.logStallSummary(vmID, waited, tail, size, dst)
 			}
-			pruneOldest(dir, stallForensicsKeep)
 			return
 		}
 		select {

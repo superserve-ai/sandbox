@@ -222,3 +222,24 @@ func (m *Manager) logStallProcState(vmID string, waited time.Duration, st *procS
 		Str("capture_error", st.CaptureError).
 		Msg("guest not ready — firecracker kernel state at stall")
 }
+
+// resolveFCPID returns the Firecracker PID to inspect at stall time.
+//
+// The launch return value is authoritative only for direct spawn: a
+// unit-supervised launch reports 0 and systemd's MainPID reaches the
+// instance record asynchronously, so the record is the fallback rather than
+// the exception. Both reads are in-memory — no systemd round trip on the
+// verdict path. A zero result means the PID is genuinely unknown and proc
+// capture is skipped rather than aimed at PID 0.
+func (m *Manager) resolveFCPID(vmID string, launchPID int) int {
+	if launchPID > 0 {
+		return launchPID
+	}
+	inst := m.trackedInstance(vmID)
+	if inst == nil {
+		return 0
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.PID
+}

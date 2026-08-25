@@ -80,6 +80,28 @@ func TestReadProcFileCaps(t *testing.T) {
 	}
 }
 
+func TestResolveFCPIDFallsBackToTheRecord(t *testing.T) {
+	// Direct spawn returns a real pid at launch; unit supervision returns 0
+	// and systemd's MainPID lands on the record asynchronously. Capture must
+	// find the process in BOTH shapes or the default path yields no evidence.
+	m := &Manager{vms: map[string]*VMInstance{
+		"unit-vm": {PID: 4242},
+		"no-pid":  {PID: 0},
+	}}
+	if got := m.resolveFCPID("unit-vm", 99); got != 99 {
+		t.Fatalf("launch pid ignored: got %d, want 99", got)
+	}
+	if got := m.resolveFCPID("unit-vm", 0); got != 4242 {
+		t.Fatalf("record pid not used for unit supervision: got %d, want 4242", got)
+	}
+	if got := m.resolveFCPID("no-pid", 0); got != 0 {
+		t.Fatalf("unknown pid must stay 0 (capture skipped), got %d", got)
+	}
+	if got := m.resolveFCPID("missing", 0); got != 0 {
+		t.Fatalf("untracked vm must yield 0, got %d", got)
+	}
+}
+
 func TestThreadSummaryShapesTheVerdict(t *testing.T) {
 	st := &procStallState{
 		Threads: []procThread{
