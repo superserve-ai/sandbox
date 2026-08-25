@@ -650,8 +650,14 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		// into it — even first-stall metadata I/O must not spend the
 		// reserve. Best-effort: if an ops cleanup removes it, the rename
 		// fails and forensics degrade to the journald summary.
-		if err := os.MkdirAll(filepath.Join(cfg.RunDir, stallForensicsDirName), 0o700); err != nil {
+		forensicsDir := filepath.Join(cfg.RunDir, stallForensicsDirName)
+		if err := os.MkdirAll(forensicsDir, 0o700); err != nil {
 			log.Warn().Err(err).Msg("stall-forensics dir unavailable; console quarantine disabled")
+		} else if err := os.Chmod(forensicsDir, 0o700); err != nil {
+			// MkdirAll leaves a PRE-EXISTING directory's mode alone, and
+			// consoles land here as 0644 before the deferred chmod — the
+			// directory mode is what actually fences other accounts.
+			log.Warn().Err(err).Msg("stall-forensics dir permissions not tightened")
 		}
 	}
 	m := &Manager{
@@ -5804,14 +5810,21 @@ func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launc
 		// Best-effort invocation pinning on top of the time bounds: the
 		// window can straddle a unit REPLACEMENT (a lingering same-ID unit
 		// restarted into this launch), whose tail time alone would admit.
-		// This races the teardown — an already-unloaded unit yields an
-		// empty id and the time bounds remain the (weaker) fallback.
+		// The lookup races both the teardown (unit unloaded → empty id)
+		// and a same-ID retry (id belongs to the NEW launch, whose entries
+		// the --until bound excludes → empty result). Both races degrade
+		// to the time-bounded query below instead of losing the summary.
+		pinned := false
 		if idOut, idErr := exec.CommandContext(jctx, "systemctl", "show", "-p", "InvocationID", "--value", unit).Output(); idErr == nil {
 			if id := strings.TrimSpace(string(idOut)); id != "" {
 				args = append(args, "_SYSTEMD_INVOCATION_ID="+id)
+				pinned = true
 			}
 		}
 		out, jErr := exec.CommandContext(jctx, "journalctl", args...).Output()
+		if pinned && jErr == nil && len(out) == 0 {
+			out, jErr = exec.CommandContext(jctx, "journalctl", args[:len(args)-1]...).Output()
+		}
 		if jErr != nil || len(out) == 0 {
 			m.log.Warn().Str("vm_id", vmID).AnErr("journal_err", jErr).
 				Msg("guest not ready — console unavailable for forensics")
