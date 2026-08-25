@@ -5832,7 +5832,14 @@ func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Durati
 	var proc *procStallState
 	if pid > 0 {
 		var finished bool
-		if proc, finished = captureProcStateBounded(pid, vmID); !finished {
+		// A late capture publishes itself rather than being discarded: a read
+		// slow enough to miss the budget signals exactly the host conditions
+		// worth diagnosing.
+		onLate := func(st *procStallState) {
+			m.log.Warn().Str("vm_id", vmID).Msg("guest not ready — proc capture completed after its budget")
+			m.logStallProcState(vmID, waited, st, dir, failedAt)
+		}
+		if proc, finished = captureProcStateBounded(pid, vmID, onLate); !finished {
 			m.log.Warn().Str("vm_id", vmID).Int("fc_pid", pid).
 				Msg("guest not ready — proc capture exceeded its budget; proceeding to teardown")
 		}

@@ -57,6 +57,45 @@ func TestUnreadCountersAreNotACleanObservation(t *testing.T) {
 	}
 }
 
+func TestLateCaptureIsPublishedNotDropped(t *testing.T) {
+	// A capture slower than the budget still carries the evidence that
+	// matters most, so it must be delivered — exactly once, and never to the
+	// caller after it has already given up.
+	late := make(chan *procStallState, 2)
+	orig := stallCaptureBudgetForTest
+	stallCaptureBudgetForTest = time.Nanosecond // force the caller to give up
+	defer func() { stallCaptureBudgetForTest = orig }()
+
+	st, finished := captureProcStateBounded(os.Getpid(), "not-this-vm", func(s *procStallState) {
+		late <- s
+	})
+	if finished {
+		// The worker beat the (nanosecond) budget; nothing was abandoned, so
+		// there is nothing to publish late.
+		if st == nil {
+			t.Fatal("finished capture returned no state")
+		}
+		return
+	}
+	if st != nil {
+		t.Fatal("unfinished capture returned state to the caller")
+	}
+	select {
+	case got := <-late:
+		if got == nil {
+			t.Fatal("late publication delivered nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("late capture was dropped instead of published")
+	}
+	// Exactly once: no second delivery.
+	select {
+	case <-late:
+		t.Fatal("late capture published more than once")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestDumpNamesThePID(t *testing.T) {
 	st := &procStallState{PID: 4242, Truncated: true}
 	d := st.dump()
@@ -347,14 +386,14 @@ func BenchmarkLaunchGenForParallel(b *testing.B) {
 func TestCaptureIsBoundedEvenWhenTheWorkerHangs(t *testing.T) {
 	// A pid that is not this VM's firecracker returns fast, proving the happy
 	// path reports completion.
-	if _, finished := captureProcStateBounded(os.Getpid(), "not-this-vm"); !finished {
+	if _, finished := captureProcStateBounded(os.Getpid(), "not-this-vm", nil); !finished {
 		t.Fatal("a fast capture reported as unfinished")
 	}
 	// The wait itself is what bounds the restore path: even in the worst case
 	// the caller returns within roughly the budget rather than blocking on an
 	// uninterruptible read.
 	start := time.Now()
-	_, _ = captureProcStateBounded(os.Getpid(), "not-this-vm")
+	_, _ = captureProcStateBounded(os.Getpid(), "not-this-vm", nil)
 	if elapsed := time.Since(start); elapsed > stallCaptureBudget*4 {
 		t.Fatalf("capture took %v, budget is %v", elapsed, stallCaptureBudget)
 	}

@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
@@ -56,6 +57,10 @@ const (
 // finishes and logs on its own, or dies with the read. An incomplete capture
 // is worth strictly less than a delayed verdict is harmful.
 const stallCaptureBudget = 250 * time.Millisecond
+
+// stallCaptureBudgetForTest is the budget actually used; a var so a test can
+// force the abandonment path deterministically.
+var stallCaptureBudgetForTest = stallCaptureBudget
 
 // procThread is one thread's kernel-side state at stall time.
 type procThread struct {
@@ -110,20 +115,39 @@ func readProcFile(path string) string {
 // procfs reads offer no cancellation and waiting further would spend the
 // verdict reserve on evidence rather than on returning the answer.
 //
-// The abandoned worker is harmless — it holds no locks and writes only to its
-// own state — and if it does complete it still logs, so a slow capture
-// degrades to a late one rather than a lost one.
-func captureProcStateBounded(pid int, vmID string) (*procStallState, bool) {
+// A capture that finishes late is still published — via onLate, on the
+// worker's own goroutine. Those are exactly the captures worth having: a
+// procfs read slow enough to blow the budget means a host under the kind of
+// pressure that accompanies a stall, so dropping the result would lose
+// evidence precisely in the cases this exists to explain.
+//
+// Ownership of the result is settled by a single compare-and-swap, so it is
+// delivered exactly once: whichever of the two arrives first claims it, and
+// a worker that lands in the same instant as the timeout still hands its
+// result to the caller rather than logging it twice.
+func captureProcStateBounded(pid int, vmID string, onLate func(*procStallState)) (*procStallState, bool) {
+	var claimed atomic.Bool
 	done := make(chan *procStallState, 1) // buffered: an abandoned worker must never block
 	go func() {
 		defer sentrylog.Recover("stall-proc-capture")
-		done <- captureProcState(pid, vmID)
+		st := captureProcState(pid, vmID)
+		if claimed.CompareAndSwap(false, true) {
+			done <- st
+			return
+		}
+		if onLate != nil {
+			onLate(st)
+		}
 	}()
 	select {
 	case st := <-done:
 		return st, true
-	case <-time.After(stallCaptureBudget):
-		return nil, false
+	case <-time.After(stallCaptureBudgetForTest):
+		if claimed.CompareAndSwap(false, true) {
+			return nil, false // the caller owns the abandonment; the worker will use onLate
+		}
+		// The worker claimed it in the same instant — take its result.
+		return <-done, true
 	}
 }
 
