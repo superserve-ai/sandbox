@@ -328,17 +328,27 @@ func (h *Handlers) revertPauseAsync(c *gin.Context, sandboxID, teamID uuid.UUID,
 // vmdTimeout is the default deadline for VMD gRPC calls.
 const vmdTimeout = 30 * time.Second
 
+// vmdBootTimeout is the deadline for the boot (restore) call specifically.
+// It exceeds VMD's in-VM readiness cap (30s) so a guest that never becomes
+// ready yields VMD's definitive teardown error instead of a bare deadline —
+// which reads as transient and gets retried into the torn-down VM's state.
+// VMD guarantees the in-band verdict for ANY value here by clamping its
+// readiness wait to the deadline minus its worst-case error path (~13s of
+// bounded teardown); 45s grants the full 30s readiness window when setup is
+// quick, rather than defining the race away by arithmetic.
+const vmdBootTimeout = 45 * time.Second
+
 // createInsertTimeout bounds the detached DB insert during sandbox create so a
 // Postgres restart cannot leave the write pending indefinitely after the boot
 // path has already given up. Kept at the same worst-case window as the
 // transient VMD retry budget.
-const createInsertTimeout = 2 * vmdTimeout
+const createInsertTimeout = 2 * vmdBootTimeout
 
-// retryTransientBoot runs one vmd boot call under vmdTimeout and, when the
+// retryTransientBoot runs one vmd boot call under vmdBootTimeout and, when the
 // attempt dies on a transient — DeadlineExceeded, or Unavailable that
 // outlived the dial-site interceptor's window — with the caller's context
-// still alive, runs exactly one more under a fresh vmdTimeout; worst case
-// 2×vmdTimeout for a caller that waits, which stays under Cloud Run's 300s
+// still alive, runs exactly one more under a fresh vmdBootTimeout; worst case
+// 2×vmdBootTimeout for a caller that waits, which stays under Cloud Run's 300s
 // request timeout (the real ceiling; a serverless backend has no LB-level
 // timeout). The daemon serializes same-ID boots and
 // recognizes a completed prior attempt, so the retry either adopts the VM
@@ -351,7 +361,7 @@ const createInsertTimeout = 2 * vmdTimeout
 // surprising the caller.)
 func retryTransientBoot(parent context.Context, sandboxID, hostID string, boot func(context.Context) (string, uint32, uint32, error)) (ip string, vcpu, memMiB uint32, retried bool, err error) {
 	attempt := func() (string, uint32, uint32, error) {
-		ctx, cancel := context.WithTimeout(parent, vmdTimeout)
+		ctx, cancel := context.WithTimeout(parent, vmdBootTimeout)
 		defer cancel()
 		return boot(ctx)
 	}
@@ -881,7 +891,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// retry, and the stateless fallback all draw down the same 2×vmdTimeout
 	// budget, so a resume holds the row mid-transition for a bounded window
 	// no matter which path it walks.
-	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdTimeout)
+	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdBootTimeout)
 	defer bootCancel()
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), sandbox.HostID, func(ctx context.Context) (string, uint32, uint32, error) {
 		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig)
@@ -895,7 +905,10 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// already has baked into the snapshot — not inject new ones.
 			// Single attempt under whatever remains of the sequence budget:
 			// the fallback is already the second recovery layer.
-			fctx, fcancel := context.WithTimeout(bootCtx, vmdTimeout)
+			// A stateless fallback is a full boot: it needs the boot budget,
+			// or VMD's deadline-clamped readiness window shrinks below the
+			// cold-fault allowance this path exists to serve.
+			fctx, fcancel := context.WithTimeout(bootCtx, vmdBootTimeout)
 			// The echo is not consulted here: the post-restore policy reapply
 			// below is this path's attestation.
 			ipAddress, actualVcpu, actualMemMiB, _, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, nil)
