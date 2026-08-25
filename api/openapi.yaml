@@ -68,6 +68,26 @@ paths:
                     type: string
                     example: "0.1.0"
 
+  /ready:
+    get:
+      operationId: readiness
+      tags: [System]
+      summary: Database readiness check
+      responses:
+        "200":
+          description: Database probe succeeded
+        "503":
+          description: Database connectivity is persistently unhealthy
+
+  /live:
+    get:
+      operationId: liveness
+      tags: [System]
+      summary: Process liveness check
+      responses:
+        "200":
+          description: Process is live
+
   /billing/pricing/public:
     get:
       operationId: getPublicBillingPricing

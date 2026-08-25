@@ -85,6 +85,23 @@ type DBPoolStats struct {
 	AcquireDurationSecondsDelta float64
 }
 
+// DBReadiness records the bounded dependency probe used by the HTTP readiness
+// endpoint. service.instance.id on the recorder resource identifies the
+// replica without adding a high-cardinality metric label.
+type DBReadiness struct {
+	Ready          bool
+	Unready        bool
+	ProbeSucceeded bool
+	Duration       time.Duration
+	Transition     string
+}
+
+// InstanceIdentity exposes the stable process identity for logs that cannot
+// inherit the recorder's resource attributes.
+type InstanceIdentity interface {
+	ServiceInstanceID() string
+}
+
 // PausedNetworkPressure records a pressure-controller snapshot and any reclaim
 // activity performed during that pass.
 type PausedNetworkPressure struct {
@@ -142,6 +159,13 @@ type Recorder interface {
 	RecordLatencyPhase(context.Context, LatencyPhase)
 }
 
+// ReadinessRecorder is optional so existing recorder implementations remain
+// source-compatible while readiness telemetry is rolled out.
+type ReadinessRecorder interface {
+	RecordDBReadiness(context.Context, DBReadiness)
+	RecordDBReadinessTransition(context.Context, string)
+}
+
 type noopRecorder struct{}
 
 func NewNoopRecorder() Recorder                                                             { return noopRecorder{} }
@@ -154,3 +178,5 @@ func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)             
 func (noopRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)     {}
 func (noopRecorder) RecordLauncherState(context.Context, LauncherState)                     {}
 func (noopRecorder) RecordLatencyPhase(context.Context, LatencyPhase)                       {}
+func (noopRecorder) RecordDBReadiness(context.Context, DBReadiness)                         {}
+func (noopRecorder) RecordDBReadinessTransition(context.Context, string)                    {}

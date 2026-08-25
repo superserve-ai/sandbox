@@ -13,7 +13,7 @@ import (
 // so they exit when the context is cancelled. In production this is the
 // process lifetime context; in tests it's the per-test context so each
 // router instance doesn't leak a cleanup goroutine.
-func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engine {
+func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool, configuredReadiness ...*DBReadiness) *gin.Engine {
 	r := gin.New()
 	// Global middleware: security headers, coarse per-IP rate limit
 	// (unauthenticated flood protection), logging, panic recovery.
@@ -103,6 +103,15 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	}
 
 	r.GET("/health", h.Health)
+	readiness := (*DBReadiness)(nil)
+	if len(configuredReadiness) > 0 {
+		readiness = configuredReadiness[0]
+	}
+	if readiness == nil {
+		readiness = NewDBReadiness(pool, currentTelemetryRecorder(), DefaultDBReadinessConfig())
+	}
+	r.GET("/ready", readiness.Handler)
+	r.GET("/live", readiness.LivenessHandler)
 	// Public pricing is intentionally unauthenticated so the marketing site can render current PAYG rates from the same source as billing.
 	r.GET("/billing/pricing/public", h.GetPublicBillingPricing)
 	r.POST("/stripe/webhook", h.HandleStripeWebhook)

@@ -101,6 +101,10 @@ type OTelRecorder struct {
 	pausedNetworkReclaimed   metric.Int64Counter
 	pausedNetworkPaused      metric.Int64Counter
 	launcherReady            metric.Int64Gauge
+	dbReadiness              metric.Int64Gauge
+	dbReadinessDuration      metric.Float64Histogram
+	dbReadinessOutcomes      metric.Int64Counter
+	dbReadinessTransitions   metric.Int64Counter
 }
 
 // NewOTelRecorder constructs an OTLP/HTTP metrics recorder. Call Shutdown on
@@ -225,7 +229,35 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	if r.launcherReady, err = meter.Int64Gauge("vmd_launcher_ready"); err != nil {
 		return nil, err
 	}
+	if err := initDBReadinessMetrics(r, meter); err != nil {
+		return nil, err
+	}
 	return r, nil
+}
+
+func initDBReadinessMetrics(r *OTelRecorder, meter metric.Meter) error {
+	var err error
+	if r.dbReadiness, err = meter.Int64Gauge("db_readiness_ready"); err != nil {
+		return err
+	}
+	if r.dbReadinessDuration, err = meter.Float64Histogram("db_readiness_probe_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return err
+	}
+	if r.dbReadinessOutcomes, err = meter.Int64Counter("db_readiness_probe_total"); err != nil {
+		return err
+	}
+	if r.dbReadinessTransitions, err = meter.Int64Counter("db_readiness_transition_total"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *OTelRecorder) ServiceInstanceID() string {
+	if r == nil {
+		return ""
+	}
+	return r.instanceID
 }
 
 func (r *OTelRecorder) Shutdown(ctx context.Context) error {
@@ -338,6 +370,54 @@ func (r *OTelRecorder) RecordDBPoolStats(ctx context.Context, s DBPoolStats) {
 	if s.AcquireDurationSecondsDelta > 0 {
 		r.dbAcquireDurationSeconds.Add(ctx, s.AcquireDurationSecondsDelta, opt)
 	}
+}
+
+// RecordDBReadiness emits the latest bounded SELECT 1 outcome and its probe
+// latency. The gauge is resource-scoped so every Cloud Run replica remains
+// independently attributable through service.instance.id.
+func (r *OTelRecorder) RecordDBReadiness(ctx context.Context, s DBReadiness) {
+	if r == nil {
+		return
+	}
+	attrs := r.readinessAttrs()
+	ready := int64(0)
+	if s.Ready {
+		ready = 1
+	}
+	opt := metric.WithAttributes(attrs...)
+	r.dbReadiness.Record(ctx, ready, opt)
+	if s.Duration > 0 {
+		r.dbReadinessDuration.Record(ctx, s.Duration.Seconds(), opt)
+	}
+	outcome := "failure"
+	if s.ProbeSucceeded {
+		outcome = "success"
+	}
+	r.dbReadinessOutcomes.Add(ctx, 1, metric.WithAttributes(
+		append(attrs, attribute.String("outcome", outcome))...,
+	))
+	if s.Transition != "" {
+		r.dbReadinessTransitions.Add(ctx, 1, metric.WithAttributes(
+			append(attrs, attribute.String("transition", s.Transition))...,
+		))
+	}
+}
+
+// RecordDBReadinessTransition emits an attributed state change independently
+// of the per-probe sample so recovery and ejection remain observable events.
+func (r *OTelRecorder) RecordDBReadinessTransition(ctx context.Context, transition string) {
+	if r == nil || transition == "" {
+		return
+	}
+	r.dbReadinessTransitions.Add(ctx, 1, metric.WithAttributes(
+		append(r.readinessAttrs(), attribute.String("transition", transition))...,
+	))
+}
+
+// readinessAttrs keeps every readiness signal directly attributable to the
+// emitting process, including state-transition events.
+func (r *OTelRecorder) readinessAttrs() []attribute.KeyValue {
+	return append(r.selfAttrs(), attribute.String("service.instance.id", r.instanceID))
 }
 
 // RecordLauncherState emits vmd_launcher_ready as 1/0. Alert on it: a sustained

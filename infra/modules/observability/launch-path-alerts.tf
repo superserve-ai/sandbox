@@ -123,3 +123,125 @@ resource "google_monitoring_alert_policy" "launch_path" {
     managed_by = "terraform"
   })
 }
+
+# Cloud Run replacement signals belong with the launch-path safety alerts: the
+# readiness/liveness configuration removes a bad replica, while these metrics
+# page when that safety mechanism churns unexpectedly.
+locals {
+  # Cloud Run documents instance-start records in varlog/system with a
+  # reason-bearing textPayload. Match that documented record shape, then
+  # exclude deployment rollout starts by their platform reason. The observed
+  # reason is deliberately not hard-coded: staging validation confirms which
+  # non-rollout reason accompanies a replacement in the deployed environment.
+  cloud_run_churn_log_filter = <<-EOT
+    log_id("varlog/system")
+    resource.type="cloud_run_revision"
+    resource.labels.service_name="%s"
+    labels.instanceId:*
+    textPayload =~ "^Starting new instance\\. Reason: [A-Z_]+ - "
+    NOT textPayload:"Reason: DEPLOYMENT_ROLLOUT"
+  EOT
+}
+
+resource "google_logging_metric" "cloud_run_churn" {
+  for_each = var.cloud_run_churn_alerts
+
+  project = var.project_id
+  name    = "${each.key}-${replace(each.value.service_name, "-", "_")}-cloud-run-replacements"
+  filter  = format(local.cloud_run_churn_log_filter, each.value.service_name)
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+    labels {
+      key         = "revision_name"
+      value_type  = "STRING"
+      description = "Cloud Run revision associated with the replacement event."
+    }
+    labels {
+      key         = "instance_id"
+      value_type  = "STRING"
+      description = "Cloud Run instance associated with the replacement event."
+    }
+  }
+
+  label_extractors = {
+    revision_name = "EXTRACT(resource.labels.revision_name)"
+    instance_id   = "EXTRACT(labels.instanceId)"
+  }
+}
+
+resource "google_monitoring_alert_policy" "cloud_run_churn" {
+  for_each = var.cloud_run_churn_alerts
+
+  project               = var.project_id
+  display_name          = each.value.display_name
+  combiner              = "OR"
+  enabled               = true
+  notification_channels = var.notification_channel_ids
+
+  lifecycle {
+    precondition {
+      condition = alltrue([
+        for channel_id in var.notification_channel_ids : can(regex(
+          "^projects/${var.project_id}/notificationChannels/[0-9]+$",
+          channel_id
+        ))
+      ])
+      error_message = "notification_channel_ids must reference monitored channels in the configured project using full resource names"
+    }
+    precondition {
+      condition     = each.value.repeat_threshold > 0 && each.value.fleet_threshold > 0
+      error_message = "Cloud Run churn thresholds must be greater than zero"
+    }
+  }
+
+  conditions {
+    display_name = "${each.value.service_name} unexpected replacement churn"
+
+    condition_threshold {
+      filter          = "metric.type = \"logging.googleapis.com/user/${google_logging_metric.cloud_run_churn[each.key].name}\" AND resource.type = \"global\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = each.value.repeat_threshold
+      # Compare one complete evaluation window so the threshold represents
+      # roughly N replacements in the configured window, rather than N per
+      # minute for the entire duration.
+      duration = "0s"
+      aggregations {
+        alignment_period   = each.value.duration
+        per_series_aligner = "ALIGN_SUM"
+        group_by_fields    = ["metric.label.revision_name"]
+      }
+    }
+  }
+
+  conditions {
+    display_name = "${each.value.service_name} correlated replacement churn"
+
+    condition_threshold {
+      filter          = "metric.type = \"logging.googleapis.com/user/${google_logging_metric.cloud_run_churn[each.key].name}\" AND resource.type = \"global\""
+      comparison      = "COMPARISON_GE"
+      threshold_value = each.value.fleet_threshold
+      duration        = "0s"
+      aggregations {
+        alignment_period     = each.value.duration
+        per_series_aligner   = "ALIGN_SUM"
+        cross_series_reducer = "REDUCE_COUNT"
+      }
+    }
+  }
+
+  alert_strategy { auto_close = "1800s" }
+
+  documentation {
+    content   = coalesce(each.value.documentation, "Unexpected Cloud Run replacement churn was detected for ${each.value.service_name}. The metric is limited to verified liveness-failure replacement events.")
+    mime_type = "text/markdown"
+  }
+
+  user_labels = merge(var.labels, {
+    alert_type   = "cloud_run_replacement_churn"
+    service_name = each.value.service_name
+    managed_by   = "terraform"
+  })
+}

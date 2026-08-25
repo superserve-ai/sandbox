@@ -145,6 +145,45 @@ resource "google_monitoring_alert_policy" "host_maintenance_events" {
   })
 }
 
+resource "google_monitoring_alert_policy" "db_readiness" {
+  for_each = var.db_readiness_alerts
+
+  project               = var.project_id
+  display_name          = each.value.display_name
+  combiner              = "OR"
+  enabled               = true
+  notification_channels = var.notification_channel_ids
+
+  conditions {
+    display_name = "${each.value.service_name} DB readiness unready"
+
+    condition_threshold {
+      filter          = "resource.type = \"prometheus_target\" AND resource.labels.service_name = \"${each.value.otel_service_name}\" AND metric.type = \"prometheus.googleapis.com/db_readiness_ready/gauge\""
+      comparison      = "COMPARISON_LT"
+      threshold_value = 1
+      duration        = each.value.duration
+
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_MIN"
+      }
+    }
+  }
+
+  alert_strategy { auto_close = "1800s" }
+
+  documentation {
+    content   = coalesce(each.value.documentation, "${each.value.service_name} has reported DB readiness=false for ${each.value.duration}; inspect the affected service.instance.id and dependency connectivity.")
+    mime_type = "text/markdown"
+  }
+
+  user_labels = merge(var.labels, {
+    alert_type   = "db_readiness"
+    service_name = each.value.service_name
+    managed_by   = "terraform"
+  })
+}
+
 locals {
   observability_contract = {
     project_id                    = var.project_id
@@ -153,6 +192,8 @@ locals {
     notification_channel_ids      = var.notification_channel_ids
     compute_instance_cpu_alerts   = var.compute_instance_cpu_alerts
     host_maintenance_event_alerts = var.host_maintenance_event_alerts
+    db_readiness_alerts           = var.db_readiness_alerts
+    cloud_run_churn_alerts        = var.cloud_run_churn_alerts
     backup_alerts                 = var.backup_alerts
     host_disk_alerts              = var.host_disk_alerts
     log_buckets                   = var.log_buckets
