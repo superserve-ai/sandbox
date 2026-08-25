@@ -5711,7 +5711,13 @@ func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launc
 			if rnErr := os.Rename(src, dst); rnErr == nil {
 				_ = os.Chmod(dst, 0o600)
 				preserved = dst
-				pruneOldest(dir, stallForensicsKeep)
+				// Only the rename must beat the teardown; the cap can be
+				// enforced off the verdict path (concurrent prunes race
+				// benignly — removals of already-removed entries no-op).
+				go func() {
+					defer sentrylog.Recover("stall-forensics-prune")
+					pruneOldest(dir, stallForensicsKeep)
+				}()
 			}
 		}
 		m.logStallSummary(vmID, waited, tail, size, preserved)
