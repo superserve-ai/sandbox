@@ -126,6 +126,46 @@ func TestPublishLaunchPIDNeverErasesAResolvedPID(t *testing.T) {
 	}
 }
 
+func TestForgetLaunchPIDClearsAStaleAttempt(t *testing.T) {
+	// A tap-busy retry reuses the instance; the previous unit's PID must not
+	// survive into the next attempt, or capture inspects a stopped (possibly
+	// recycled) process and reports it as this VM's.
+	inst := &VMInstance{PID: 555}
+	forgetLaunchPID(inst)
+	if inst.PID != 0 {
+		t.Fatalf("stale PID survived the retry: %d", inst.PID)
+	}
+	publishLaunchPID(inst, 0, SupervisionUnit) // unit launch returns 0
+	if inst.PID != 0 {
+		t.Fatalf("PID = %d, want 0 until the resolver publishes", inst.PID)
+	}
+}
+
+func TestThreadSummaryPrioritizesTheDiagnosis(t *testing.T) {
+	// A 32-vCPU VM has more threads than the summary renders, so ranking —
+	// not directory order — must decide what survives truncation.
+	var threads []procThread
+	for i := 0; i < 40; i++ {
+		threads = append(threads, procThread{TID: strconv.Itoa(i), Comm: "fc_vcpu" + strconv.Itoa(i)})
+	}
+	threads = append(threads,
+		procThread{TID: "98", Comm: "fc_vcpu31", Wchan: "handle_userfault"},
+		procThread{TID: "99", Comm: "uffd-internal", Stack: []string{"[<0>] poll_schedule_timeout"}},
+	)
+	got := st(threads).threadSummary()
+	if !strings.Contains(got, "uffd-internal") {
+		t.Fatalf("uffd handler dropped by truncation: %q", got)
+	}
+	if !strings.Contains(got, "handle_userfault") {
+		t.Fatalf("blocked thread dropped by truncation: %q", got)
+	}
+	if n := strings.Count(got, "|") + 1; n > maxSummaryThreads {
+		t.Fatalf("summary rendered %d threads, cap is %d", n, maxSummaryThreads)
+	}
+}
+
+func st(threads []procThread) *procStallState { return &procStallState{Threads: threads} }
+
 func TestThreadSummaryShapesTheVerdict(t *testing.T) {
 	st := &procStallState{
 		Threads: []procThread{

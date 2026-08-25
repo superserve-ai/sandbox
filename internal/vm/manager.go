@@ -2818,6 +2818,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// freshUnit && attempt == 1: only a first-attempt fresh unit may skip
 		// the linger query; a retry replaces the prior attempt's unit. The
 		// dispatcher threads it to the systemd path (irrelevant to cgroup).
+		// Forget the previous attempt's PID BEFORE this launch can spawn its
+		// own MainPID resolver: a retry reuses `inst`, and a stale PID that
+		// survives into the new attempt points at a stopped (possibly
+		// recycled) process — which stall capture would then inspect and
+		// report as this VM's.
+		forgetLaunchPID(inst)
 		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace || priorRunDir, freshUnit && attempt == 1)
 		// Stamp the chosen mode NOW, before the error branch: a launch that
 		// forked a cgroup FC but failed socket-readiness (and whose own kill

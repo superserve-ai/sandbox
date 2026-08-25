@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,7 +30,15 @@ import (
 // Bounds so a pathological process cannot turn forensics into a memory or log
 // problem. Firecracker runs a handful of threads (api, vmm, vcpus, uffd).
 const (
-	maxStallThreads     = 24
+	// Above any supported VM shape: the largest configuration runs 32 vCPU
+	// threads plus the api, vmm, uffd handler and watchdog. A cap that cut
+	// into that range would drop threads by directory order — including,
+	// possibly, the blocked vCPU or the handler this capture exists to find.
+	maxStallThreads = 96
+	// Threads rendered into the single-line summary; the dump file keeps all
+	// of them. Ordered by diagnostic value first, so the cap never hides the
+	// interesting ones.
+	maxSummaryThreads   = 10
 	maxStackFramesKept  = 12
 	maxStallFdScan      = 256
 	stallProcFileMaxLen = 8 << 10
@@ -160,8 +169,19 @@ func parseUffdCounters(fdinfo string) (pending, total int64) {
 // threadSummary renders one compact "comm@wchan:top-frame" token per thread —
 // enough to read the verdict off the log line without opening the dump.
 func (s *procStallState) threadSummary() string {
-	parts := make([]string, 0, len(s.Threads))
-	for _, t := range s.Threads {
+	// Rank before truncating: the uffd handler and any thread parked in the
+	// kernel are the diagnosis; idle api/vmm threads are filler. Ordering is
+	// stable within a rank so repeated captures read consistently.
+	ranked := make([]procThread, len(s.Threads))
+	copy(ranked, s.Threads)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return threadRank(ranked[i]) < threadRank(ranked[j])
+	})
+	if len(ranked) > maxSummaryThreads {
+		ranked = ranked[:maxSummaryThreads]
+	}
+	parts := make([]string, 0, len(ranked))
+	for _, t := range ranked {
 		top := ""
 		if len(t.Stack) > 0 {
 			top = t.Stack[0]
@@ -173,6 +193,22 @@ func (s *procStallState) threadSummary() string {
 		parts = append(parts, fmt.Sprintf("%s@%s:%s", t.Comm, wchan, top))
 	}
 	return strings.Join(parts, " | ")
+}
+
+// threadRank orders threads by how likely they are to carry the answer:
+// the uffd handler first, then anything blocked in the kernel, then the rest.
+func threadRank(t procThread) int {
+	name := strings.ToLower(t.Comm)
+	switch {
+	case strings.Contains(name, "uffd"):
+		return 0
+	case t.Wchan != "" && t.Wchan != "0":
+		return 1
+	case len(t.Stack) > 0:
+		return 2
+	default:
+		return 3
+	}
 }
 
 // dump renders the full capture for the quarantine file. Kernel stacks and
@@ -253,6 +289,15 @@ func (m *Manager) resolveFCPID(vmID string, launchPID int) int {
 // would erase it — leaving the record permanently PID-less for a VM that has
 // one, which costs the stall capture its subject and misleads anything else
 // reading the field. Zero means "not known yet", never "known to be none".
+// forgetLaunchPID clears a previous attempt's PID so the next launch starts
+// from "not known yet". Must run before the launch spawns its resolver, or it
+// would erase the very PID it is meant to make room for.
+func forgetLaunchPID(inst *VMInstance) {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	inst.PID = 0
+}
+
 func publishLaunchPID(inst *VMInstance, pid int, supervision Supervision) {
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
