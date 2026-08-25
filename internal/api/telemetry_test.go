@@ -30,6 +30,8 @@ func (r *captureTelemetryRecorder) RecordHostResolution(context.Context, telemet
 }
 func (r *captureTelemetryRecorder) RecordHostCapacity(context.Context, telemetry.HostCapacity) {
 }
+func (r *captureTelemetryRecorder) RecordBackupCoverage(context.Context, []telemetry.BackupCoverage) {
+}
 func (r *captureTelemetryRecorder) RecordDBPoolStats(context.Context, telemetry.DBPoolStats) {}
 func (r *captureTelemetryRecorder) RecordPausedNetworkPressure(context.Context, telemetry.PausedNetworkPressure) {
 }

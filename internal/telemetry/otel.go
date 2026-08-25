@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -83,6 +84,16 @@ type OTelRecorder struct {
 	hostVCPU                 metric.Int64Gauge
 	hostMemoryMiB            metric.Int64Gauge
 	hostSandboxes            metric.Int64Gauge
+	// Observable, uniquely in this file: coverage is published by one
+	// lease-elected replica per cell, and a synchronous gauge retains
+	// its last value per process, so a replica that lost leadership
+	// would keep exporting stale competing series for its lifetime.
+	// The callback exports only the current snapshot, so a non-leader
+	// (holding an empty snapshot) exports nothing at all.
+	backupUncoveredPaused    metric.Int64ObservableGauge
+	backupUncoveredOldestAge metric.Float64ObservableGauge
+	backupCoverageMu         sync.Mutex
+	backupCoverage           []BackupCoverage
 	dbAcquiredConns          metric.Int64Gauge
 	dbIdleConns              metric.Int64Gauge
 	dbTotalConns             metric.Int64Gauge
@@ -172,6 +183,15 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.hostSandboxes, err = meter.Int64Gauge("host_capacity_running_sandboxes"); err != nil {
+		return nil, err
+	}
+	if r.backupUncoveredPaused, err = meter.Int64ObservableGauge("backup_uncovered_paused_sandboxes"); err != nil {
+		return nil, err
+	}
+	if r.backupUncoveredOldestAge, err = meter.Float64ObservableGauge("backup_uncovered_oldest_age_seconds"); err != nil {
+		return nil, err
+	}
+	if _, err = meter.RegisterCallback(r.observeBackupCoverage, r.backupUncoveredPaused, r.backupUncoveredOldestAge); err != nil {
 		return nil, err
 	}
 	if r.dbAcquiredConns, err = meter.Int64Gauge("db_pool_acquired_conns"); err != nil {
@@ -315,6 +335,45 @@ func (r *OTelRecorder) RecordHostCapacity(ctx context.Context, c HostCapacity) {
 	r.hostVCPU.Record(ctx, c.UsedVCPU, opt)
 	r.hostMemoryMiB.Record(ctx, c.UsedMemoryMiB, opt)
 	r.hostSandboxes.Record(ctx, c.Sandboxes, opt)
+}
+
+// RecordBackupCoverage replaces the published durability-coverage
+// snapshot. Zero-valued entries are kept (an explicit zero is what lets
+// the coverage alert clear deterministically), a negative age from
+// clock skew between the database and the sampler clamps to zero, and
+// a nil snapshot means this replica is not the elected sampler and must
+// export nothing.
+func (r *OTelRecorder) RecordBackupCoverage(_ context.Context, snapshot []BackupCoverage) {
+	if r == nil {
+		return
+	}
+	cleaned := make([]BackupCoverage, 0, len(snapshot))
+	for _, c := range snapshot {
+		if c.OldestUncoveredAgeSeconds < 0 {
+			c.OldestUncoveredAgeSeconds = 0
+		}
+		cleaned = append(cleaned, c)
+	}
+	r.backupCoverageMu.Lock()
+	r.backupCoverage = cleaned
+	r.backupCoverageMu.Unlock()
+}
+
+// observeBackupCoverage exports the current coverage snapshot. Series
+// absent from the snapshot are simply not observed, which is how a
+// group that lost its last paused sandbox (or a replica that lost the
+// sampler lease) retires its series instead of freezing them.
+func (r *OTelRecorder) observeBackupCoverage(_ context.Context, o metric.Observer) error {
+	r.backupCoverageMu.Lock()
+	snapshot := r.backupCoverage
+	r.backupCoverageMu.Unlock()
+	for _, c := range snapshot {
+		attrs := r.attrs(attribute.String("region", safeRegion(c.Region)), attribute.String("host_id", safeHostID(c.HostID)))
+		opt := metric.WithAttributes(attrs...)
+		o.ObserveInt64(r.backupUncoveredPaused, c.UncoveredPaused, opt)
+		o.ObserveFloat64(r.backupUncoveredOldestAge, c.OldestUncoveredAgeSeconds, opt)
+	}
+	return nil
 }
 
 func (r *OTelRecorder) RecordDBPoolStats(ctx context.Context, s DBPoolStats) {

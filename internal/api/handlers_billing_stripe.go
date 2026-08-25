@@ -261,6 +261,15 @@ type stripeInvoiceObject struct {
 	Status       string `json:"status"`
 }
 
+type stripeWebhookRoutingDecision string
+
+const (
+	stripeWebhookRoutingDecisionInvalid  stripeWebhookRoutingDecision = "invalid"
+	stripeWebhookRoutingDecisionOwned    stripeWebhookRoutingDecision = "owned"
+	stripeWebhookRoutingDecisionNotOwned stripeWebhookRoutingDecision = "not_owned"
+	stripeWebhookRoutingDecisionGlobal   stripeWebhookRoutingDecision = "global"
+)
+
 func NewStripeBillingClient(cfg *config.Config) StripeBillingClient {
 	if cfg == nil || strings.TrimSpace(cfg.StripeSecretKey) == "" || strings.TrimSpace(cfg.StripeAPIVersion) == "" {
 		return nil
@@ -1399,115 +1408,113 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 		return
 	}
 
-	tx, err := h.Pool.BeginTx(c.Request.Context(), pgx.TxOptions{})
+	routing, err := h.resolveStripeWebhookRouting(c.Request.Context(), &event)
 	if err != nil {
-		log.Error().Err(err).Str("event_id", event.ID).Msg("begin Stripe webhook transaction failed")
+		log.Error().Err(err).Str("event_id", event.ID).Str("event_type", event.Type).Msg("resolve Stripe webhook routing failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if routing == stripeWebhookRoutingDecisionNotOwned {
+		log.Info().Str("routing_decision", string(routing)).Str("event_id", event.ID).Str("event_type", event.Type).Msg("Stripe webhook ignored for non-local ownership")
+		c.JSON(http.StatusOK, gin.H{"status": "ignored"})
+		return
+	}
+	if routing == stripeWebhookRoutingDecisionInvalid {
+		respondError(c, ErrInternal)
+		return
+	}
+
+	recordTx, err := h.Pool.BeginTx(c.Request.Context(), pgx.TxOptions{})
+	if err != nil {
+		log.Error().Err(err).Str("event_id", event.ID).Msg("begin Stripe webhook record transaction failed")
 		respondError(c, ErrInternal)
 		return
 	}
 	defer func() {
-		_ = tx.Rollback(c.Request.Context())
+		_ = recordTx.Rollback(c.Request.Context())
 	}()
-	q := h.DB.WithTx(tx)
+	recordQ := h.DB.WithTx(recordTx)
 
-	row, err := q.CreateStripeWebhookEvent(c.Request.Context(), db.CreateStripeWebhookEventParams{
+	if _, err := recordQ.CreateStripeWebhookEvent(c.Request.Context(), db.CreateStripeWebhookEventParams{
 		EventID:   event.ID,
 		EventType: event.Type,
 		Payload:   payload,
-	})
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			existing, gerr := q.GetStripeWebhookEventForUpdate(c.Request.Context(), event.ID)
-			if gerr != nil {
-				log.Error().Err(gerr).Str("event_id", event.ID).Msg("load existing Stripe webhook event failed")
-				respondError(c, ErrInternal)
-				return
-			}
-			if existing.ProcessedAt.Valid {
-				if err := tx.Commit(c.Request.Context()); err != nil {
-					log.Error().Err(err).Str("event_id", event.ID).Msg("commit duplicate Stripe webhook failed")
-					respondError(c, ErrInternal)
-					return
-				}
-				h.scheduleBillingEligibilityReconciliation(c.Request.Context(), event)
-				c.JSON(http.StatusOK, gin.H{"status": "duplicate"})
-				return
-			}
-			if err := h.expandStripeThinMeterEvent(c.Request.Context(), &event); err != nil {
-				log.Error().Err(err).Str("event_id", event.ID).Msg("retrieve Stripe thin event failed")
-				respondError(c, ErrInternal)
-				return
-			}
-			if err := h.processStripeWebhookEvent(c.Request.Context(), q, event); err != nil {
-				msg := err.Error()
-				if _, uerr := q.MarkStripeWebhookEventFailed(c.Request.Context(), db.MarkStripeWebhookEventFailedParams{
-					EventID:   event.ID,
-					LastError: &msg,
-				}); uerr != nil {
-					log.Error().Err(uerr).Str("event_id", event.ID).Msg("mark Stripe webhook failed state failed")
-					respondError(c, ErrInternal)
-					return
-				}
-				if err := tx.Commit(c.Request.Context()); err != nil {
-					log.Error().Err(err).Str("event_id", event.ID).Msg("commit failed Stripe webhook state failed")
-					respondError(c, ErrInternal)
-					return
-				}
-				log.Error().Err(err).Str("event_id", event.ID).Str("event_type", event.Type).Msg("process Stripe webhook retry failed")
-				respondError(c, ErrInternal)
-				return
-			}
-			if _, err := q.MarkStripeWebhookEventProcessed(c.Request.Context(), event.ID); err != nil {
-				log.Error().Err(err).Str("event_id", event.ID).Msg("mark Stripe webhook processed failed")
-				respondError(c, ErrInternal)
-				return
-			}
-			if err := tx.Commit(c.Request.Context()); err != nil {
-				log.Error().Err(err).Str("event_id", event.ID).Msg("commit retried Stripe webhook failed")
+	}); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			log.Error().Err(err).Str("event_id", event.ID).Msg("record Stripe webhook event failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		existing, gerr := recordQ.GetStripeWebhookEventForUpdate(c.Request.Context(), event.ID)
+		if gerr != nil {
+			log.Error().Err(gerr).Str("event_id", event.ID).Msg("load existing Stripe webhook event failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		if existing.ProcessedAt.Valid {
+			if err := recordTx.Commit(c.Request.Context()); err != nil {
+				log.Error().Err(err).Str("event_id", event.ID).Msg("commit duplicate Stripe webhook failed")
 				respondError(c, ErrInternal)
 				return
 			}
 			h.scheduleBillingEligibilityReconciliation(c.Request.Context(), event)
-			c.JSON(http.StatusOK, gin.H{"status": "ok"})
+			c.JSON(http.StatusOK, gin.H{"status": "duplicate"})
 			return
 		}
-		log.Error().Err(err).Str("event_id", event.ID).Msg("record Stripe webhook event failed")
-		respondError(c, ErrInternal)
-		return
 	}
-	_ = row
-	if err := h.expandStripeThinMeterEvent(c.Request.Context(), &event); err != nil {
-		log.Error().Err(err).Str("event_id", event.ID).Msg("retrieve Stripe thin event failed")
+	if err := recordTx.Commit(c.Request.Context()); err != nil {
+		log.Error().Err(err).Str("event_id", event.ID).Msg("commit Stripe webhook record failed")
 		respondError(c, ErrInternal)
 		return
 	}
 
+	processTx, err := h.Pool.BeginTx(c.Request.Context(), pgx.TxOptions{})
+	if err != nil {
+		log.Error().Err(err).Str("event_id", event.ID).Msg("begin Stripe webhook processing transaction failed")
+		if ferr := h.persistStripeWebhookFailure(c.Request.Context(), event.ID, err.Error()); ferr != nil {
+			log.Error().Err(ferr).Str("event_id", event.ID).Msg("persist Stripe webhook failed state failed")
+		}
+		respondError(c, ErrInternal)
+		return
+	}
+	defer func() {
+		_ = processTx.Rollback(c.Request.Context())
+	}()
+	q := h.DB.WithTx(processTx)
+
+	existing, err := q.GetStripeWebhookEventForUpdate(c.Request.Context(), event.ID)
+	if err != nil {
+		log.Error().Err(err).Str("event_id", event.ID).Msg("lock Stripe webhook event failed")
+		h.rollbackAndPersistStripeWebhookFailure(c.Request.Context(), processTx, event.ID, err.Error())
+		respondError(c, ErrInternal)
+		return
+	}
+	if existing.ProcessedAt.Valid {
+		if err := processTx.Commit(c.Request.Context()); err != nil {
+			log.Error().Err(err).Str("event_id", event.ID).Msg("commit duplicate Stripe webhook failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		h.scheduleBillingEligibilityReconciliation(c.Request.Context(), event)
+		c.JSON(http.StatusOK, gin.H{"status": "duplicate"})
+		return
+	}
+
 	if err := h.processStripeWebhookEvent(c.Request.Context(), q, event); err != nil {
-		msg := err.Error()
-		if _, uerr := q.MarkStripeWebhookEventFailed(c.Request.Context(), db.MarkStripeWebhookEventFailedParams{
-			EventID:   event.ID,
-			LastError: &msg,
-		}); uerr != nil {
-			log.Error().Err(uerr).Str("event_id", event.ID).Msg("mark Stripe webhook failed state failed")
-			respondError(c, ErrInternal)
-			return
-		}
-		if err := tx.Commit(c.Request.Context()); err != nil {
-			log.Error().Err(err).Str("event_id", event.ID).Msg("commit failed Stripe webhook state failed")
-			respondError(c, ErrInternal)
-			return
-		}
+		h.rollbackAndPersistStripeWebhookFailure(c.Request.Context(), processTx, event.ID, err.Error())
 		log.Error().Err(err).Str("event_id", event.ID).Str("event_type", event.Type).Msg("process Stripe webhook failed")
 		respondError(c, ErrInternal)
 		return
 	}
 	if _, err := q.MarkStripeWebhookEventProcessed(c.Request.Context(), event.ID); err != nil {
 		log.Error().Err(err).Str("event_id", event.ID).Msg("mark Stripe webhook processed failed")
+		h.rollbackAndPersistStripeWebhookFailure(c.Request.Context(), processTx, event.ID, err.Error())
 		respondError(c, ErrInternal)
 		return
 	}
-	if err := tx.Commit(c.Request.Context()); err != nil {
+	if err := processTx.Commit(c.Request.Context()); err != nil {
 		log.Error().Err(err).Str("event_id", event.ID).Msg("commit Stripe webhook failed")
+		h.rollbackAndPersistStripeWebhookFailure(c.Request.Context(), processTx, event.ID, err.Error())
 		respondError(c, ErrInternal)
 		return
 	}
@@ -1540,12 +1547,104 @@ func (h *Handlers) expandStripeThinMeterEvent(ctx context.Context, event *stripe
 	return nil
 }
 
+func (h *Handlers) persistStripeWebhookFailure(ctx context.Context, eventID, lastError string) error {
+	if h.Pool == nil {
+		return errors.New("billing transactions are not configured")
+	}
+	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+	q := h.DB.WithTx(tx)
+	if _, err := q.MarkStripeWebhookEventFailed(ctx, db.MarkStripeWebhookEventFailedParams{
+		EventID:   eventID,
+		LastError: &lastError,
+	}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (h *Handlers) rollbackAndPersistStripeWebhookFailure(ctx context.Context, tx pgx.Tx, eventID, lastError string) {
+	if rerr := tx.Rollback(ctx); rerr != nil {
+		log.Error().Err(rerr).Str("event_id", eventID).Msg("rollback failed Stripe webhook transaction failed")
+	}
+	if ferr := h.persistStripeWebhookFailure(ctx, eventID, lastError); ferr != nil {
+		log.Error().Err(ferr).Str("event_id", eventID).Msg("persist Stripe webhook failed state failed")
+	}
+}
+
+func (h *Handlers) resolveStripeWebhookRouting(ctx context.Context, event *stripeEventEnvelope) (stripeWebhookRoutingDecision, error) {
+	switch event.Type {
+	case "checkout.session.completed":
+		var obj stripeCheckoutCompletedObject
+		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
+			return stripeWebhookRoutingDecisionInvalid, err
+		}
+		teamID, err := uuid.Parse(strings.TrimSpace(obj.ClientReferenceID))
+		if err != nil {
+			return stripeWebhookRoutingDecisionNotOwned, nil
+		}
+		if _, err := h.DB.GetTeam(ctx, teamID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return stripeWebhookRoutingDecisionNotOwned, nil
+			}
+			return stripeWebhookRoutingDecisionInvalid, err
+		}
+		return stripeWebhookRoutingDecisionOwned, nil
+	case "customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted", "customer.subscription.paused", "customer.subscription.resumed":
+		var obj stripeSubscriptionObject
+		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
+			return stripeWebhookRoutingDecisionInvalid, err
+		}
+		customerID := strings.TrimSpace(obj.Customer)
+		if customerID == "" {
+			return stripeWebhookRoutingDecisionInvalid, fmt.Errorf("stripe subscription event has no customer")
+		}
+		if _, err := h.DB.GetTeamBillingAccountByStripeCustomerID(ctx, stringPtr(customerID)); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return stripeWebhookRoutingDecisionNotOwned, nil
+			}
+			return stripeWebhookRoutingDecisionInvalid, err
+		}
+		return stripeWebhookRoutingDecisionOwned, nil
+	case "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
+		var obj stripeInvoiceObject
+		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
+			return stripeWebhookRoutingDecisionInvalid, err
+		}
+		customerID := strings.TrimSpace(obj.Customer)
+		if customerID == "" {
+			return stripeWebhookRoutingDecisionInvalid, fmt.Errorf("stripe invoice event has no customer")
+		}
+		if _, err := h.DB.GetTeamBillingAccountByStripeCustomerID(ctx, stringPtr(customerID)); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return stripeWebhookRoutingDecisionNotOwned, nil
+			}
+			return stripeWebhookRoutingDecisionInvalid, err
+		}
+		return stripeWebhookRoutingDecisionOwned, nil
+	case "billing.meter.error_report_triggered", "v1.billing.meter.error_report_triggered":
+		return stripeWebhookRoutingDecisionGlobal, nil
+	default:
+		return stripeWebhookRoutingDecisionGlobal, nil
+	}
+}
+
 func isStripeMeterErrorEvent(eventType string) bool {
 	return eventType == "billing.meter.error_report_triggered" || eventType == "v1.billing.meter.error_report_triggered"
 }
 
 func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries, event stripeEventEnvelope) error {
 	eventAt := stripeEventTime(int64(event.Created))
+	if isStripeMeterErrorEvent(event.Type) && len(bytes.TrimSpace(event.Data.Object)) == 0 {
+		if err := h.expandStripeThinMeterEvent(ctx, &event); err != nil {
+			return err
+		}
+	}
 	switch event.Type {
 	case "checkout.session.completed":
 		var obj stripeCheckoutCompletedObject
@@ -1554,7 +1653,7 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 		}
 		teamID, err := uuid.Parse(strings.TrimSpace(obj.ClientReferenceID))
 		if err != nil {
-			return nil
+			return err
 		}
 		_, err = q.UpsertTeamBillingAccountSubscription(ctx, db.UpsertTeamBillingAccountSubscriptionParams{
 			TeamID:               teamID,
@@ -1569,9 +1668,6 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 		}
 		account, err := q.GetTeamBillingAccountByStripeCustomerID(ctx, stringPtr(obj.Customer))
 		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil
-			}
 			return err
 		}
 		if obj.ID == "" {
@@ -1640,9 +1736,6 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 		}
 		account, err := q.GetTeamBillingAccountByStripeCustomerID(ctx, stringPtr(obj.Customer))
 		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil
-			}
 			return err
 		}
 		status := strings.TrimSpace(obj.Status)
