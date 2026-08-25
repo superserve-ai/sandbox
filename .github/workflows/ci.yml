@@ -188,8 +188,11 @@ jobs:
             workflow="$1"; files="$2"; shift 2
             # Globs are kept, not stripped: the two filter forms mean different
             # things and covered_dir/covered_file rely on telling them apart.
+            # Only real sequence entries count: a commented-out path (# - '...')
+            # is ignored by GitHub and must be ignored here too, or the check
+            # blesses exactly the silent missed deployment it exists to catch.
             triggers=$(awk '/^on:/,/^jobs:/' "$workflow" \
-              | grep -oE "'[A-Za-z.][A-Za-z0-9._/-]*(/\*\*)?'" | tr -d "'" | sort -u || true)
+              | sed -n "s/^[[:space:]]*- '\([A-Za-z.][A-Za-z0-9._/*-]*\)'.*/\1/p" | sort -u || true)
             # Module-local deps — not just internal/, since the proxy reaches
             # proto/boxdpb and stale generated protocol code is the same hazard.
             deps=$(go list -deps "$@" \
