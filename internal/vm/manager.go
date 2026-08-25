@@ -1406,6 +1406,11 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// full-snapshot pause visible at a glance. Bounded: layered|diff|full.
 	snapshotType = "full"
 	tSnapshot = time.Now()
+	// orphanedOverlay is the accumulated mem.diff a layered→Full fallback
+	// strands: the record's artifact becomes mem.snap, so DeleteSnapshotFiles
+	// would never reclaim the overlay. It still backs the running VM via UFFD
+	// until the stop below, so removal is deferred to after a confirmed stop.
+	orphanedOverlay := ""
 	// CreateDiffSnapshot merges in place: an interrupted diff has no surviving copy
 	// of the file it overwrites (for layered, only the session delta — the template
 	// base is untouched; for in-place, the VM's own mem.snap). Crash-atomicity of the
@@ -1446,14 +1451,19 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath, trackingSessionID); err != nil {
 				if errors.Is(err, ErrDirtyTrackingMismatch) {
 					// The rejection happened before Firecracker touched the
-					// bitmap or the overlay, so the pre-work (fresh overlay,
-					// sidecar) unwinds cleanly and one Full pause is the safe
+					// bitmap or the overlay, so one Full pause is the safe
 					// degradation. The vCPUs are already paused; CreateSnapshot's
-					// own pause PATCH is idempotent.
+					// own pause PATCH is idempotent. An ACCUMULATING overlay
+					// (this VM resumed from mem.diff) is not pre-work though —
+					// it holds the prior pauses' pages and is about to become
+					// unreferenced; mark it for reclaim once the VM stops.
 					log.Warn().Str("vm_id", vmID).
 						Msg("pause: dirty-tracking session mismatch; falling back to full snapshot")
 					_ = os.Remove(layeredBaseSidecarPath(memPath))
 					_ = os.Remove(presence.SidecarPath(memPath))
+					if instMemFile == overlayPath {
+						orphanedOverlay = overlayPath
+					}
 					snapshotType = "full"
 					memPath, baseMemPath = fullPath, ""
 					if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
@@ -1480,6 +1490,11 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 				m.verifyPresenceRefreshed(memPath, saveStart, log)
 			}
 		} else {
+			// Same stranding as the mismatch fallback: an accumulating
+			// overlay this Full pause abandons is reclaimed after the stop.
+			if instMemFile == overlayPath {
+				orphanedOverlay = overlayPath
+			}
 			memPath, baseMemPath = fullPath, ""
 			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 				snapshotDur = time.Since(tSnapshot)
@@ -1554,6 +1569,23 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	}
 	stopCancel()
 	stopDur = time.Since(tStop)
+
+	// Reclaim an overlay a layered→Full fallback stranded. Only after a
+	// confirmed stop: until the FC process is dead its UFFD handler still
+	// serves guest pages from this file. Best-effort — a failed remove leaks
+	// disk, never correctness — but an unconfirmed stop must skip it, and
+	// then the file is leaked deliberately rather than yanked from under a
+	// possibly-live guest.
+	if orphanedOverlay != "" {
+		if stopConfirmed {
+			_ = os.Remove(orphanedOverlay)
+			_ = os.Remove(layeredBaseSidecarPath(orphanedOverlay))
+			_ = os.Remove(presence.SidecarPath(orphanedOverlay))
+		} else {
+			log.Warn().Str("path", orphanedOverlay).
+				Msg("pause: stranded overlay not reclaimed (stop unconfirmed)")
+		}
+	}
 
 	inst.mu.Lock()
 	inst.Status = StatusPaused
