@@ -727,6 +727,13 @@ func main() {
 	vm.SetSystemdDBusEnabled(systemdDBus)
 	log.Info().Bool("systemd_dbus", systemdDBus).Msg("systemd unit-operations transport")
 
+	// Capacity pressure is published only by a host that advertises its
+	// address — the same condition the heartbeat's publisher checks.
+	// Named once here because it also decides whether the manager does
+	// pressure-only startup accounting at all: on a host that never
+	// publishes, none of that work should run.
+	publishesPressure := os.Getenv("VMD_ADVERTISE_ADDR") != ""
+
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:                      cfg.FirecrackerBin,
 		JailerBin:                           cfg.JailerBin,
@@ -761,6 +768,7 @@ func main() {
 		LaunchViaLauncherNS:                 launchViaLauncherNS,
 		LauncherNSPath:                      os.Getenv("VMD_LAUNCHER_NS_PATH"),
 		DirectSpawn:                         envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
+		PressureAccounting:                  publishesPressure,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
@@ -1456,7 +1464,7 @@ func main() {
 		// and every survivor exits. Skipped when pressure publication is
 		// not configured: the /proc walk buys nothing for a host that
 		// never publishes.
-		if os.Getenv("VMD_ADVERTISE_ADDR") != "" {
+		if publishesPressure {
 			mgr.ScanSurvivingBuildersAsync(cfg.TemplateBuilderBin)
 		}
 		lc.start("heartbeat", func() error {

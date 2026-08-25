@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -768,7 +769,7 @@ func TestReattachReconstructsCgroupStopMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := &Manager{log: zerolog.Nop(), state: st, cgroups: tree,
-		vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+		vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}, pressureAccounting: true}
 	m.ReattachAll(context.Background())
 
 	if _, marked := m.vmStopUnconfirmed.Load("vm-1"); !marked {
@@ -782,10 +783,93 @@ func TestReattachReconstructsCgroupStopMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	m2 := &Manager{log: zerolog.Nop(), state: st, cgroups: tree,
-		vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+		vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}, pressureAccounting: true}
 	m2.ReattachAll(context.Background())
 	if _, marked := m2.vmStopUnconfirmed.Load("vm-1"); marked {
 		t.Fatal("marker reconstructed for a provably empty cgroup")
+	}
+}
+
+// The reconstruction exists ONLY to keep a future pressure report
+// honest, so a host that does not publish must not run it: no marker
+// work, and — the reason it matters — no fleet-sized walk competing with
+// the creates and restores arriving during a restart.
+func TestReattachSkipsMarkerReconstructionWithoutPressureAccounting(t *testing.T) {
+	listActiveFCUnits = func(context.Context) ([]string, error) { return nil, nil }
+	defer func() { listActiveFCUnits = listActiveFirecrackerUnits }()
+
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionCgroup}); err != nil {
+		t.Fatal(err)
+	}
+	tree := &cgroupTree{vms: filepath.Join(dir, "vms")}
+	if err := os.MkdirAll(tree.vmCgroupDir("vm-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree.vmCgroupDir("vm-1"), "cgroup.events"),
+		[]byte("populated 1\nfrozen 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same fixture as the reconstruction test above, accounting off.
+	m := &Manager{log: zerolog.Nop(), state: st, cgroups: tree,
+		vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	m.ReattachAll(context.Background())
+	if _, marked := m.vmStopUnconfirmed.Load("vm-1"); marked {
+		t.Fatal("pressure-only marker reconstruction ran on a host that never publishes")
+	}
+}
+
+// The reconstruction walk must not hold the lifecycle mutex: a restart
+// scan that did would make every concurrent create and restore (both
+// take m.mu.Lock to publish their instance) queue behind a fleet-sized
+// pass, and because the walk locks each instance, one instance held by a
+// slow write would turn a single-VM stall into a fleet-wide one. Proven
+// by holding m.mu for the duration of a reattach and requiring it to
+// finish anyway.
+func TestReattachMarkerReconstructionDoesNotHoldFleetLock(t *testing.T) {
+	listActiveFCUnits = func(context.Context) ([]string, error) { return nil, nil }
+	defer func() { listActiveFCUnits = listActiveFirecrackerUnits }()
+
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	tree := &cgroupTree{vms: filepath.Join(dir, "vms")}
+	m := &Manager{log: zerolog.Nop(), state: st, cgroups: tree,
+		vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}, pressureAccounting: true}
+
+	// A populated index the walk must range over, with the lifecycle
+	// map deliberately left empty: ranging pressureIndex is the point.
+	for i := 0; i < 64; i++ {
+		id := fmt.Sprintf("vm-%d", i)
+		inst := &VMInstance{ID: id, Status: StatusPaused, Supervision: SupervisionCgroup}
+		m.indexVM(id, inst)
+	}
+
+	// Hold the fleet lock for longer than the walk should take. A walk
+	// that acquires m.mu cannot finish until this releases; one that
+	// does not is unaffected.
+	m.mu.Lock()
+	release := time.AfterFunc(2*time.Second, m.mu.Unlock)
+	defer release.Stop()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.ReattachAll(context.Background())
+	}()
+	select {
+	case <-done:
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("reattach blocked on the fleet lock; the marker walk must range pressureIndex instead")
 	}
 }
 

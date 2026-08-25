@@ -342,6 +342,13 @@ type ManagerConfig struct {
 	// without the preconditions degrades to the unit path with a loud
 	// error, never to a fleet that dies on the next vmd deploy.
 	DirectSpawn bool
+
+	// PressureAccounting declares that this daemon publishes capacity
+	// pressure (set from the same condition that configures publication).
+	// Startup work that exists only to make a future report accurate is
+	// skipped when false, so a host that never publishes runs the
+	// startup path it ran before the feature existed.
+	PressureAccounting bool
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +527,14 @@ type Manager struct {
 	// Maintained ONLY by indexVM/unindexVM, called adjacent to every
 	// m.vms insert/delete inside the same locked sections.
 	pressureIndex sync.Map // vmID -> *VMInstance
+
+	// pressureAccounting reports whether this daemon publishes capacity
+	// pressure. Startup work that exists ONLY to make a future report
+	// accurate — the residue-marker reconstruction, the surviving-builder
+	// scan — is skipped entirely when it is false, so a host that never
+	// publishes runs exactly the startup path it ran before the feature
+	// existed. Set once before ReattachAll; never mutated after.
+	pressureAccounting bool
 
 	// vmStopUnconfirmed marks VMs whose stop could not be confirmed
 	// dead, in EITHER supervision mode and from EITHER origin — a pause
@@ -740,14 +755,15 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		}
 	}
 	m := &Manager{
-		forensicsOK:    forensicsQuarantineOK,
-		cfg:            cfg,
-		netMgr:         netMgr,
-		recorder:       cfg.TelemetryRecorder,
-		log:            log.With().Str("component", "vm_manager").Logger(),
-		vms:            make(map[string]*VMInstance),
-		restoreSem:     make(chan struct{}, maxRestores),
-		tplLastRestore: make(map[string]time.Time),
+		forensicsOK:        forensicsQuarantineOK,
+		cfg:                cfg,
+		netMgr:             netMgr,
+		recorder:           cfg.TelemetryRecorder,
+		log:                log.With().Str("component", "vm_manager").Logger(),
+		vms:                make(map[string]*VMInstance),
+		restoreSem:         make(chan struct{}, maxRestores),
+		tplLastRestore:     make(map[string]time.Time),
+		pressureAccounting: cfg.PressureAccounting,
 	}
 	m.loadPresenceConverged()
 	return m, nil
@@ -3569,23 +3585,38 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	// re-mark those whose group is still populated (or unreadable:
 	// unknown fails toward counting). The reconciler's eventual reap
 	// clears the marker through removeVM as usual.
-	type residueCheck struct{ id string }
-	var residues []residueCheck
-	m.mu.RLock()
-	for id, inst := range m.vms {
-		inst.mu.RLock()
-		if cgroupSupervised(inst.Supervision) &&
-			(inst.Status == StatusPaused || inst.Status == StatusError) {
-			residues = append(residues, residueCheck{id: id})
-		}
-		inst.mu.RUnlock()
-	}
-	m.mu.RUnlock()
-	for _, r := range residues {
-		if m.cgroupStillLive(r.id) {
-			m.vmStopUnconfirmed.Store(r.id, struct{}{})
-			m.log.Warn().Str("vm_id", r.id).
-				Msg("cgroup still populated behind a paused/error record after restart; allocation stays counted")
+	//
+	// Ranged over pressureIndex, never m.vms under m.mu: holding the
+	// lifecycle lock across a fleet-sized walk would make every
+	// concurrent create and restore (both need m.mu.Lock to publish
+	// their instance) queue behind this pass — and because the walk
+	// takes each instance's own lock, one instance held by a slow
+	// persistence write would extend that into a fleet-wide stall
+	// rather than a single-VM one. The sync.Map needs no global lock
+	// and each instance lock is taken with none held.
+	if m.pressureAccounting {
+		var residues []string
+		m.pressureIndex.Range(func(k, v any) bool {
+			id, _ := k.(string)
+			inst, _ := v.(*VMInstance)
+			if inst == nil {
+				return true
+			}
+			inst.mu.RLock()
+			supervised := cgroupSupervised(inst.Supervision)
+			parked := inst.Status == StatusPaused || inst.Status == StatusError
+			inst.mu.RUnlock()
+			if supervised && parked {
+				residues = append(residues, id)
+			}
+			return true
+		})
+		for _, id := range residues {
+			if m.cgroupStillLive(id) {
+				m.vmStopUnconfirmed.Store(id, struct{}{})
+				m.log.Warn().Str("vm_id", id).
+					Msg("cgroup still populated behind a paused/error record after restart; allocation stays counted")
+			}
 		}
 	}
 
