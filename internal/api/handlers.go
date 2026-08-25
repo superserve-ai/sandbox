@@ -905,7 +905,10 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// already has baked into the snapshot — not inject new ones.
 			// Single attempt under whatever remains of the sequence budget:
 			// the fallback is already the second recovery layer.
-			fctx, fcancel := context.WithTimeout(bootCtx, vmdTimeout)
+			// A stateless fallback is a full boot: it needs the boot budget,
+			// or VMD's deadline-clamped readiness window shrinks below the
+			// cold-fault allowance this path exists to serve.
+			fctx, fcancel := context.WithTimeout(bootCtx, vmdBootTimeout)
 			// The echo is not consulted here: the post-restore policy reapply
 			// below is this path's attestation.
 			ipAddress, actualVcpu, actualMemMiB, _, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, nil)

@@ -3076,10 +3076,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			defer sentrylog.Recover("restore-error-persist")
 			<-persistDone
 			m.mu.RLock()
-			_, tracked := m.vms[vmID]
+			cur, tracked := m.vms[vmID]
 			m.mu.RUnlock()
 			if !tracked {
 				m.deleteState(vmID)
+				return
+			}
+			if cur != inst {
+				// A same-ID retry replaced the entry while the persist was
+				// blocked; the replacement owns the record now, and this
+				// stale worker must not mark a possibly-successful new VM
+				// as failed.
 				return
 			}
 			m.setStatus(vmID, StatusError)
