@@ -423,7 +423,7 @@ func CreateDiffSnapshot(socketPath, snapshotPath, memPath, expectedSessionID str
 	// run's only guarded snapshot, so any prior consumption (an ad-hoc full
 	// snapshot) shows up as a bumped generation and a clean rejection.
 	if expectedSessionID != "" {
-		var gen uint64
+		var gen int64
 		body.ExpectedSessionID = expectedSessionID
 		body.ExpectedGeneration = &gen
 	}

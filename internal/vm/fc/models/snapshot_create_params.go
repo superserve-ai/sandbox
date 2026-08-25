@@ -21,8 +21,11 @@ type SnapshotCreateParams struct {
 	BlockDeltaDir string `json:"block_delta_dir,omitempty"`
 
 	// Expected dirty-bitmap generation accompanying expected_session_id (fork
-	// extension). Pointer so generation 0 — the common value — still serializes.
-	ExpectedGeneration *uint64 `json:"expected_generation,omitempty"`
+	// extension). Pointer so generation 0 — the common value — still
+	// serializes. int64, matching what go-swagger generates for the spec's
+	// format:int64/minimum:0 (swagger 2.0 has no unsigned type); Firecracker
+	// parses it as u64.
+	ExpectedGeneration *int64 `json:"expected_generation,omitempty"`
 
 	// Expected dirty-tracking session id for a guarded snapshot (fork extension).
 	// Firecracker rejects the request before touching the dirty bitmap or any

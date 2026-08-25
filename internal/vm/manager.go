@@ -2191,6 +2191,13 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 // newTrackingSessionID mints the random token a dirty-tracking session is
 // armed with. Uniqueness per arming event is all that matters — vmd is the
 // only API client — so 16 random bytes are ample.
+//
+// Deliberately synchronous on the restore path: on Linux crypto/rand is
+// getrandom(2), which blocks only until the kernel entropy pool initializes
+// once at early boot — a state a host running vmd left long ago. After that
+// it is a microsecond-scale call against the multi-millisecond LoadSnapshot
+// RPC it precedes, so a precomputed-token pool would add plumbing to shave
+// nothing measurable.
 func newTrackingSessionID() string {
 	var b [16]byte
 	if _, err := cryptorand.Read(b[:]); err != nil {
