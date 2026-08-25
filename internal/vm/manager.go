@@ -4991,11 +4991,39 @@ func (m *Manager) abortResumeLocked(vmID string) {
 	inst.DirtyTracked = false // FC process stopped; a fresh resume re-arms tracking.
 	inst.PausedAt = time.Now()
 	inst.mu.Unlock()
-	// Conditional: a concurrent destroy may have deleted the record; it owns
-	// the teardown then, and an unconditional write would resurrect a
-	// destroyed VM's record.
-	// Best-effort: an undurable revert is re-derived by the reconciler.
-	_, _ = m.persistStateIfPresent(inst)
+	// Durable convergence is deferred: the write is unbounded fsync work
+	// and this runs on reply paths whose deadline reserve covers only the
+	// bounded stop. In-memory Paused above is what a same-ID retry reads.
+	// The worker carries the standard protections: the lifecycle lock
+	// serializes it against retries, a replacement's record is repaired
+	// rather than clobbered by our stale instance, and the lock-bypassing
+	// destroy is compensated after the write (an undurable revert is also
+	// re-derived by the reconciler).
+	go func() {
+		defer sentrylog.Recover("resume-abort-persist")
+		unlock, lockErr := m.lockVMOp(context.Background(), vmID)
+		if lockErr != nil {
+			return
+		}
+		defer unlock()
+		m.mu.RLock()
+		cur, tracked := m.vms[vmID]
+		m.mu.RUnlock()
+		if !tracked {
+			return // the destroy owns teardown; nothing to write
+		}
+		if cur != inst {
+			m.persistState(cur)
+		} else {
+			_, _ = m.persistStateIfPresent(inst)
+		}
+		m.mu.RLock()
+		_, still := m.vms[vmID]
+		m.mu.RUnlock()
+		if !still {
+			m.deleteState(vmID)
+		}
+	}()
 }
 
 // releaseFailedRestore frees a failed restore's network slot and rundir —
@@ -5768,10 +5796,22 @@ func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launc
 		// retry whose newer lines -n would otherwise select. Microsecond
 		// stamps, since whole-second flooring could drop the failure
 		// second's own tail.
-		out, jErr := exec.CommandContext(jctx, "journalctl", "-u", systemdUnitName(vmID),
+		unit := systemdUnitName(vmID)
+		args := []string{"-u", unit,
 			"--since", journalStamp(launchedAt),
 			"--until", journalStamp(failedAt),
-			"-n", "60", "--no-pager", "-o", "cat").Output()
+			"-n", "60", "--no-pager", "-o", "cat"}
+		// Best-effort invocation pinning on top of the time bounds: the
+		// window can straddle a unit REPLACEMENT (a lingering same-ID unit
+		// restarted into this launch), whose tail time alone would admit.
+		// This races the teardown — an already-unloaded unit yields an
+		// empty id and the time bounds remain the (weaker) fallback.
+		if idOut, idErr := exec.CommandContext(jctx, "systemctl", "show", "-p", "InvocationID", "--value", unit).Output(); idErr == nil {
+			if id := strings.TrimSpace(string(idOut)); id != "" {
+				args = append(args, "_SYSTEMD_INVOCATION_ID="+id)
+			}
+		}
+		out, jErr := exec.CommandContext(jctx, "journalctl", args...).Output()
 		if jErr != nil || len(out) == 0 {
 			m.log.Warn().Str("vm_id", vmID).AnErr("journal_err", jErr).
 				Msg("guest not ready — console unavailable for forensics")
