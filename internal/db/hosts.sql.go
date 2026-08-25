@@ -887,8 +887,13 @@ WITH held AS (
     WHERE hp.host_id = $2
       AND hp.reported_at > now() - make_interval(secs => $5::int)
       AND EXISTS (SELECT 1 FROM host h WHERE h.id = hp.host_id AND h.status = 'active')
+      -- Charge only a sandbox that holds no reservation ANYWHERE. This
+      -- one guard covers both retry shapes: a repeat on this host
+      -- (returned unchanged from ` + "`" + `held` + "`" + ` below) and a re-admission on a
+      -- different host (refused outright — a sandbox stays bound to the
+      -- host its first admission chose, so two hosts can never charge
+      -- for the same one).
       AND NOT EXISTS (SELECT 1 FROM host_reservation r WHERE r.sandbox_id = $1)
-      AND NOT EXISTS (SELECT 1 FROM held)
       AND (hp.max_sandboxes <= 0
            OR hp.running_sandboxes + hp.provisioning_sandboxes + hp.paused_sandboxes
               + hp.charged_count + 1 <= hp.max_sandboxes)
@@ -900,13 +905,11 @@ WITH held AS (
 ), inserted AS (
     INSERT INTO host_reservation (sandbox_id, host_id, memory_mib, vcpus)
     SELECT $1, b.host_id, $3, $4 FROM bumped b
-    -- A conflict means this sandbox is already admitted on a DIFFERENT
-    -- host. Insert nothing and return nothing: the caller sees a
-    -- rejection, which is the safe outcome — silently moving a
-    -- reservation would leave the first host charging for a sandbox
-    -- that will never land there, and a sandbox is bound to the host
-    -- its first admission chose. (Unreachable through the scheduler,
-    -- which admits once per create; the guard exists so it stays true.)
+    -- Unreachable given the guard above (nothing is charged for a
+    -- sandbox that already holds a reservation, so this INSERT only
+    -- ever runs for one that does not). Kept so that a future edit to
+    -- that guard degrades into a refused admission rather than a
+    -- primary-key error on the create path.
     ON CONFLICT (sandbox_id) DO NOTHING
     RETURNING sandbox_id
 )
@@ -962,11 +965,14 @@ type ReserveHostCapacityParams struct {
 // GREATEST(0, charged + 1 - warm) net-new on top of every slot that
 // already exists (used + provisioning + warm).
 //
-// The same-sandbox guard makes a control-plane retry idempotent. It
-// reads the ledger from the statement snapshot, which is sound here
-// because retries of one sandbox are sequential from one replica, never
-// concurrent; a double charge would in any case self-heal at the next
-// report, which recomputes these counters from the ledger.
+// Retries are idempotent: a repeated admission for a sandbox that
+// already holds a reservation on this host returns that reservation
+// without charging again, and one that holds a reservation elsewhere is
+// refused. Those guards read the ledger from the statement snapshot,
+// which is sound because retries of one sandbox are sequential from one
+// replica, never concurrent; and a double charge would in any case
+// self-heal at the next report, which recomputes these counters from
+// the ledger.
 func (q *Queries) ReserveHostCapacity(ctx context.Context, arg ReserveHostCapacityParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, reserveHostCapacity,
 		arg.SandboxID,
