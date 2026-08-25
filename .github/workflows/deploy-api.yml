@@ -53,6 +53,10 @@ on:
       - 'go.mod'
       - 'go.sum'
       - 'Dockerfile'
+      # The workflow must self-trigger (as deploy-proxy and deploy-vmd do), or
+      # a deployment-command fix lands without ever running until an unrelated
+      # source change happens to redeploy.
+      - '.github/workflows/deploy-api.yml'
 
 jobs:
   detect-changes:

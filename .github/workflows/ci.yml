@@ -197,9 +197,10 @@ jobs:
             for path in $deps; do
               covered_dir "$path" "$triggers" || report "$workflow" "$path"
             done
-            # Module files, plus any Dockerfile this workflow builds through: a
-            # dependency bump or an image change must redeploy too.
-            for path in go.mod go.sum $files; do
+            # Module files, any Dockerfile this workflow builds through, and
+            # the workflow itself: a dependency bump, an image change, or a
+            # deployment-command fix must each redeploy too.
+            for path in go.mod go.sum "$workflow" $files; do
               covered_file "$path" "$triggers" || report "$workflow" "$path"
             done
           }
