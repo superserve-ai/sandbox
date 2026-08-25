@@ -3059,23 +3059,37 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// cannot keep the failed restore's unit and network alive.
 		m.stopUnitDuringRestoreError(vmID)
 		m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
-		// Join before the durable writes, or the goroutine's Running write
-		// could land after the Error write. Mirror the success path's
-		// post-join check: a concurrent destroy erased the record, and the
-		// joined write must not resurrect it — setStatus alone can't fix
-		// this (it no-ops on an untracked VM).
-		<-persistDone
+		// Durable-state convergence is unbounded fsync work (the persist
+		// join, then another synchronous Put) and BoltDB is slow under
+		// exactly the host pressure that stalls readiness — it must not
+		// spend the verdict reserve. The ordering the join protects
+		// (Running must not land after Error; a destroyed record must not
+		// be resurrected) moves intact into a detached worker: join, then
+		// re-check tracking, then write. The reply needs only a map read
+		// to pick its error; a destroy that lands during the persist join
+		// now returns the generic error instead of NotFound in that narrow
+		// race — the worker still converges the durable state either way.
 		m.mu.RLock()
 		_, stillTracked := m.vms[vmID]
 		m.mu.RUnlock()
+		go func() {
+			defer sentrylog.Recover("restore-error-persist")
+			<-persistDone
+			m.mu.RLock()
+			_, tracked := m.vms[vmID]
+			m.mu.RUnlock()
+			if !tracked {
+				m.deleteState(vmID)
+				return
+			}
+			m.setStatus(vmID, StatusError)
+		}()
 		if !stillTracked {
 			// The destroy owns the teardown; report it as such, like every
 			// sibling destroy-race path. A generic error here reads as
 			// transient and the control plane retries a destroyed sandbox.
-			m.deleteState(vmID)
 			return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 		}
-		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
 	tBoxdReady := time.Now()
@@ -5647,6 +5661,7 @@ func summarizeConsoleTail(tail string) (fcLines, boxdLines, guestLines int, pani
 // journalctl, so it runs detached: the journal survives the teardown on its
 // own, and the reply path must not spend its in-band-verdict margin on it.
 func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launchedAt time.Time) {
+	failedAt := time.Now()
 	src := filepath.Join(m.cfg.RunDir, vmID, "console.log")
 	tail, size, err := tailFile(src, 4096)
 	if err == nil {
@@ -5667,11 +5682,15 @@ func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launc
 		defer sentrylog.Recover("stall-forensics-journal")
 		jctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		// --since bounds the sample to THIS launch: -u alone would mix in a
-		// prior invocation of the same unit name (old boxd output or an old
-		// panic would be attributed to this failure).
+		// --since/--until bound the sample to THIS launch: -u alone would
+		// mix in a prior invocation of the same unit name, and this
+		// detached read can also outlive the teardown into a same-ID
+		// retry whose newer lines -n would otherwise select. Microsecond
+		// stamps, since whole-second flooring could drop the failure
+		// second's own tail.
 		out, jErr := exec.CommandContext(jctx, "journalctl", "-u", systemdUnitName(vmID),
-			"--since", "@"+strconv.FormatInt(launchedAt.Unix(), 10),
+			"--since", journalStamp(launchedAt),
+			"--until", journalStamp(failedAt),
 			"-n", "60", "--no-pager", "-o", "cat").Output()
 		if jErr != nil {
 			m.log.Warn().Str("vm_id", vmID).Err(err).AnErr("journal_err", jErr).
@@ -5693,6 +5712,11 @@ func (m *Manager) logStallSummary(vmID string, waited time.Duration, tail string
 		Bool("console_panic", panicked).
 		Str("console_preserved", preserved).
 		Msg("guest not ready within the readiness window — tearing down")
+}
+
+// journalStamp renders a journalctl @-timestamp with microsecond precision.
+func journalStamp(t time.Time) string {
+	return fmt.Sprintf("@%d.%06d", t.Unix(), t.Nanosecond()/1000)
 }
 
 // pruneOldest keeps at most keep entries in dir, dropping the oldest by
