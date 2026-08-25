@@ -670,7 +670,7 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		}
 	}
 	m := &Manager{
-		forensicsOK: forensicsQuarantineOK,
+		forensicsOK:    forensicsQuarantineOK,
 		cfg:            cfg,
 		netMgr:         netMgr,
 		recorder:       cfg.TelemetryRecorder,
@@ -5039,10 +5039,14 @@ func (m *Manager) releaseFailedRestore(vmID string, inPlace, tapBusy bool, clean
 			inst.mu.Lock()
 			inst.TeardownPending = "restore failed; cgroup process not proven dead; rundir and network retained; reconciler owns stop and release"
 			inst.mu.Unlock()
-			// Deferred: this runs inside the readiness-timeout verdict
-			// reserve, and the in-memory marker above already guides this
-			// life; a restart re-parks via reattach either way.
-			m.deferStatePersist("release-cgroup-persist", vmID, inst, true)
+			// SYNCHRONOUS on purpose, unlike this path's other durable
+			// writes: the marker is crash-safety-critical (pinned by test).
+			// A crash before it lands would lose the "reconciler owns stop
+			// and release" instruction while a possibly-live Firecracker
+			// still holds the tap and rundir. This branch fires only when a
+			// cgroup is provably live or unprovable — rare enough that the
+			// verdict reserve yields to resource safety here.
+			_, _ = m.persistStateIfPresent(inst)
 		}
 		return
 	}
