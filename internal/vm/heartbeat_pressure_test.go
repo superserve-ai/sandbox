@@ -1035,15 +1035,20 @@ func TestPressureReadyReopensAfterPredecessorBuildUnitExits(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{}}
 	m.reattachComplete.Store(true)
 	m.pendingBuildUnits = []string{"build-tpl-x"}
-	// In the test env the unit probe cannot confirm termination: closed.
+	// The unit is still terminating: closed.
+	vmUnitFullyDown = func(string) bool { return false }
 	if m.PressureReady() {
 		t.Fatal("PressureReady = true with a pending predecessor build unit")
 	}
 	// The unit exits (probe confirms): reopens and the entry drops.
-	m.mu.Lock()
-	m.pendingBuildUnits = nil
-	m.mu.Unlock()
+	vmUnitFullyDown = func(string) bool { return true }
 	if !m.PressureReady() {
 		t.Fatal("PressureReady = false after the predecessor build unit exited")
+	}
+	m.mu.Lock()
+	left := len(m.pendingBuildUnits)
+	m.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("pending units = %d after confirmed exit, want 0", left)
 	}
 }

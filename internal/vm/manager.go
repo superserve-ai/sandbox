@@ -4820,12 +4820,12 @@ func (m *Manager) PressureReady() bool {
 		for _, id := range pendingUnits {
 			// Same bound and same standard: only a TERMINALLY down unit
 			// releases the gate — deactivating may still flush guest
-			// writes.
-			pctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			if unitFullyDown(pctx, systemdUnitName(id)) {
+			// writes. Through the vmUnitFullyDown seam so tests control
+			// the verdict (real runners answer "not loaded" for absent
+			// units, containers error — both environment artifacts).
+			if vmUnitFullyDown(id) {
 				deadUnit[id] = true
 			}
-			cancel()
 		}
 		m.mu.Lock()
 		remainingCg := m.pendingBuildCgroups[:0]
