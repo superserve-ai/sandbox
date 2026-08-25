@@ -132,6 +132,35 @@ func TestResolveFCPIDFallsBackToTheRecord(t *testing.T) {
 	}
 }
 
+func TestGenerationsDoNotCollideAcrossInstanceReplacement(t *testing.T) {
+	// restoreVMSnapshot installs a FRESH VMInstance for the same VM id, so a
+	// per-instance counter would restart at zero and hand attempt 2 the same
+	// generation attempt 1 is still carrying — letting a delayed resolver
+	// publish a dead VM's PID into the live record.
+	m := &Manager{}
+	first := &VMInstance{}
+	genFirst := m.beginLaunchAttempt(first)
+
+	replacement := &VMInstance{} // same vm id, new instance
+	genSecond := m.beginLaunchAttempt(replacement)
+
+	if genFirst == genSecond {
+		t.Fatalf("generations collided across instances: %d", genFirst)
+	}
+	// The first attempt's resolver, arriving late, must not land on the
+	// replacement.
+	if publishResolvedPID(replacement, genFirst, 1111) {
+		t.Fatal("a stale resolver published into the replacement instance")
+	}
+	if replacement.PID != 0 {
+		t.Fatalf("replacement PID polluted: %d", replacement.PID)
+	}
+	// The replacement's own resolver still works.
+	if !publishResolvedPID(replacement, genSecond, 2222) || replacement.PID != 2222 {
+		t.Fatalf("live resolver rejected; PID=%d", replacement.PID)
+	}
+}
+
 func TestPublishLaunchPIDNeverErasesAResolvedPID(t *testing.T) {
 	// Unit supervision returns 0 from the launch while an async resolver
 	// publishes the real MainPID. Whichever lands second, the record must end
@@ -160,10 +189,11 @@ func TestLaunchGenerationFencesAStaleResolver(t *testing.T) {
 	// A tap-busy retry reuses the instance. Attempt 1's resolver may already
 	// hold a MainPID and be descheduled, so clearing the field is not enough:
 	// its late write must be dropped, or capture inspects the stopped unit.
+	m := &Manager{}
 	inst := &VMInstance{PID: 555}
 	gen1 := currentLaunchGen(inst)
 
-	gen2 := beginLaunchAttempt(inst) // retry starts
+	gen2 := m.beginLaunchAttempt(inst) // retry starts
 	if inst.PID != 0 {
 		t.Fatalf("stale PID survived the retry: %d", inst.PID)
 	}
@@ -240,7 +270,7 @@ func BenchmarkLaunchPIDHelpers(b *testing.B) {
 	inst := m.vms["vm"]
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		gen := beginLaunchAttempt(inst)
+		gen := m.beginLaunchAttempt(inst)
 		_ = m.launchGenFor("vm")
 		publishLaunchPID(inst, 4242, SupervisionUnit)
 		publishResolvedPID(inst, gen, 4242)
@@ -283,7 +313,7 @@ func BenchmarkLaunchPIDHelpersParallel(b *testing.B) {
 			id := ids[i%vms]
 			i++
 			inst := m.vms[id]
-			gen := beginLaunchAttempt(inst)
+			gen := m.beginLaunchAttempt(inst)
 			_ = m.launchGenFor(id)
 			publishLaunchPID(inst, 4242, SupervisionUnit)
 			publishResolvedPID(inst, gen, 4242)

@@ -503,6 +503,13 @@ type Manager struct {
 	// would turn a recoverable wedge into a permanent hang.
 	vmOpLocks sync.Map
 
+	// launchGenSeq issues launch generations. It is manager-global and
+	// monotonic on purpose: a per-instance counter restarts at zero whenever
+	// restoreVMSnapshot installs a fresh VMInstance for the same VM id, so
+	// two different attempts would both hold generation 1 and a delayed
+	// resolver from the first could publish its dead PID into the second.
+	launchGenSeq atomic.Uint64
+
 	// forensicsOK gates console quarantine: false when the root-only
 	// forensics directory could not be created or secured at startup.
 	forensicsOK bool
@@ -2829,7 +2836,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// survives into the new attempt points at a stopped (possibly
 		// recycled) process — which stall capture would then inspect and
 		// report as this VM's.
-		beginLaunchAttempt(inst)
+		m.beginLaunchAttempt(inst)
 		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace || priorRunDir, freshUnit && attempt == 1)
 		// Stamp the chosen mode NOW, before the error branch: a launch that
 		// forked a cgroup FC but failed socket-readiness (and whose own kill

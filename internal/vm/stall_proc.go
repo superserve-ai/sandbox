@@ -381,12 +381,13 @@ func (m *Manager) resolveFCPID(vmID string, launchPID int) int {
 // record with a stopped unit's PID moments after the clear. The generation is
 // what makes that write droppable. Must run before the launch spawns its own
 // resolver.
-func beginLaunchAttempt(inst *VMInstance) uint64 {
+func (m *Manager) beginLaunchAttempt(inst *VMInstance) uint64 {
+	gen := m.launchGenSeq.Add(1)
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
 	inst.PID = 0
-	inst.launchGen++
-	return inst.launchGen
+	inst.launchGen = gen
+	return gen
 }
 
 // publishResolvedPID records an asynchronously resolved MainPID, but only if
