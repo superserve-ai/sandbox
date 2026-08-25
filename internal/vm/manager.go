@@ -3104,9 +3104,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			}
 			if cur != inst {
 				// A same-ID retry replaced the entry while the persist was
-				// blocked; the replacement owns the record now, and this
-				// stale worker must not mark a possibly-successful new VM
-				// as failed.
+				// blocked. The stale optimistic write joined above may have
+				// landed AFTER the replacement's own durable write, leaving
+				// this torn-down instance as the last BoltDB value — a vmd
+				// restart would reattach stale PID/network state. Repair by
+				// re-persisting the replacement: it is stable under the
+				// lifecycle lock held here (a live retry would still hold
+				// it), and this write lands after the stale one by
+				// construction.
+				m.persistState(cur)
 				return
 			}
 			m.setStatus(vmID, StatusError)
@@ -5702,29 +5708,28 @@ func summarizeConsoleTail(tail string) (fcLines, boxdLines, guestLines int, pani
 func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launchedAt time.Time) {
 	failedAt := time.Now()
 	src := filepath.Join(m.cfg.RunDir, vmID, "console.log")
-	tail, size, err := tailFile(src, 4096)
-	if err == nil {
-		preserved := ""
-		dir := filepath.Join(m.cfg.RunDir, stallForensicsDirName)
-		if mkErr := os.MkdirAll(dir, 0o700); mkErr == nil {
-			dst := filepath.Join(dir, fmt.Sprintf("%d-%s.console.log", time.Now().Unix(), vmID))
-			if rnErr := os.Rename(src, dst); rnErr == nil {
-				_ = os.Chmod(dst, 0o600)
-				preserved = dst
-				// Only the rename must beat the teardown; the cap can be
-				// enforced off the verdict path (concurrent prunes race
-				// benignly — removals of already-removed entries no-op).
-				go func() {
-					defer sentrylog.Recover("stall-forensics-prune")
-					pruneOldest(dir, stallForensicsKeep)
-				}()
-			}
-		}
-		m.logStallSummary(vmID, waited, tail, size, preserved)
-		return
-	}
+	// The ONLY work that must beat the teardown's rundir delete is moving
+	// the file out (direct-spawn mode; unit mode has no file, and its
+	// journal survives on its own). Everything else — read, summary,
+	// chmod, pruning, the journald fallback — runs detached, so the
+	// verdict reserve is never spent on forensics.
+	dir := filepath.Join(m.cfg.RunDir, stallForensicsDirName)
+	dst := filepath.Join(dir, fmt.Sprintf("%d-%s.console.log", failedAt.Unix(), vmID))
+	renamed := os.MkdirAll(dir, 0o700) == nil && os.Rename(src, dst) == nil
 	go func() {
-		defer sentrylog.Recover("stall-forensics-journal")
+		defer sentrylog.Recover("stall-forensics")
+		if renamed {
+			_ = os.Chmod(dst, 0o600)
+			tail, size, err := tailFile(dst, 4096)
+			if err != nil {
+				m.log.Warn().Str("vm_id", vmID).Err(err).
+					Msg("guest not ready — quarantined console unreadable")
+			} else {
+				m.logStallSummary(vmID, waited, tail, size, dst)
+			}
+			pruneOldest(dir, stallForensicsKeep)
+			return
+		}
 		jctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		// --since/--until bound the sample to THIS launch: -u alone would
@@ -5737,8 +5742,8 @@ func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launc
 			"--since", journalStamp(launchedAt),
 			"--until", journalStamp(failedAt),
 			"-n", "60", "--no-pager", "-o", "cat").Output()
-		if jErr != nil {
-			m.log.Warn().Str("vm_id", vmID).Err(err).AnErr("journal_err", jErr).
+		if jErr != nil || len(out) == 0 {
+			m.log.Warn().Str("vm_id", vmID).AnErr("journal_err", jErr).
 				Msg("guest not ready — console unavailable for forensics")
 			return
 		}
