@@ -202,3 +202,29 @@ func TestThreadSummaryShapesTheVerdict(t *testing.T) {
 		t.Fatalf("empty wchan not normalized: %q", got)
 	}
 }
+
+// The launch-path helpers run on every restore attempt, so their cost is a
+// hot-path cost. Benchmarked to keep that claim honest rather than assumed.
+func BenchmarkLaunchPIDHelpers(b *testing.B) {
+	m := &Manager{vms: map[string]*VMInstance{"vm": {}}}
+	inst := m.vms["vm"]
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		gen := beginLaunchAttempt(inst)
+		_ = m.launchGenFor("vm")
+		publishLaunchPID(inst, 4242, SupervisionUnit)
+		publishResolvedPID(inst, gen, 4242)
+	}
+}
+
+// captureProcState is the one piece that must run synchronously before
+// teardown (the process is about to be killed), so it sits inside the
+// readiness-timeout verdict reserve. Benchmarked against the current process
+// to keep that budget claim measured rather than asserted.
+func BenchmarkCaptureProcState(b *testing.B) {
+	pid := os.Getpid()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = captureProcState(pid)
+	}
+}
