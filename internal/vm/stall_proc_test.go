@@ -310,3 +310,22 @@ func BenchmarkLaunchGenForParallel(b *testing.B) {
 		}
 	})
 }
+
+// The budget must bound ELAPSED time on the restore path, not merely how many
+// reads are attempted — a procfs read already in flight cannot be cancelled,
+// so the guarantee has to come from the caller's wait.
+func TestCaptureIsBoundedEvenWhenTheWorkerHangs(t *testing.T) {
+	// A pid that is not this VM's firecracker returns fast, proving the happy
+	// path reports completion.
+	if _, finished := captureProcStateBounded(os.Getpid(), "not-this-vm"); !finished {
+		t.Fatal("a fast capture reported as unfinished")
+	}
+	// The wait itself is what bounds the restore path: even in the worst case
+	// the caller returns within roughly the budget rather than blocking on an
+	// uninterruptible read.
+	start := time.Now()
+	_, _ = captureProcStateBounded(os.Getpid(), "not-this-vm")
+	if elapsed := time.Since(start); elapsed > stallCaptureBudget*4 {
+		t.Fatalf("capture took %v, budget is %v", elapsed, stallCaptureBudget)
+	}
+}

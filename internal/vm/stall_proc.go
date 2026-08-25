@@ -25,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // Bounds so a pathological process cannot turn forensics into a memory or log
@@ -44,13 +46,15 @@ const (
 	stallProcFileMaxLen = 8 << 10
 )
 
-// stallCaptureBudget bounds the SYNCHRONOUS part of the capture. procfs reads
-// are normally in-memory and finish in well under a millisecond, but they are
-// still kernel calls that can stall under the same host pressure that
-// accompanies a stall. This runs inside the readiness-timeout verdict reserve
-// and ahead of teardown, so it must yield rather than hold the failed VM's
-// resources: an incomplete capture is worth strictly less than a delayed
-// verdict is harmful.
+// stallCaptureBudget bounds how long the RESTORE PATH waits for the capture.
+//
+// The bound is enforced by waiting on a worker rather than by checking a
+// clock between reads: os.ReadFile cannot be interrupted, so a single stuck
+// procfs read would otherwise blow any pre-check budget and hold the verdict
+// reserve — the exact thing this reserve exists to protect. On expiry the
+// restore proceeds to teardown and the worker is abandoned; it either
+// finishes and logs on its own, or dies with the read. An incomplete capture
+// is worth strictly less than a delayed verdict is harmful.
 const stallCaptureBudget = 250 * time.Millisecond
 
 // procThread is one thread's kernel-side state at stall time.
@@ -75,10 +79,11 @@ type procStallState struct {
 }
 
 // readProcFileBy reads a procfs file only if the budget has not expired.
-// The deadline gates every read rather than only the start of an iteration:
-// this runs ahead of teardown inside the verdict reserve, so the bound has to
-// hold across the whole capture, not just its first step. ok=false means the
-// budget stopped the read.
+// This limits how much WORK the capture attempts once it is already over
+// time; it cannot bound elapsed time, because an os.ReadFile already in
+// flight has no cancellation path. Elapsed time is bounded by the caller
+// waiting on captureProcStateBounded. ok=false means the budget stopped this
+// read from starting.
 func readProcFileBy(path string, deadline time.Time) (string, bool) {
 	if !time.Now().Before(deadline) {
 		return "", false
@@ -99,9 +104,34 @@ func readProcFile(path string) string {
 	return strings.TrimRight(string(b), "\n")
 }
 
+// captureProcStateBounded runs the capture on a worker and returns whatever
+// it produced within stallCaptureBudget. A nil result means the worker did
+// not finish in time: the caller must proceed with teardown regardless, since
+// procfs reads offer no cancellation and waiting further would spend the
+// verdict reserve on evidence rather than on returning the answer.
+//
+// The abandoned worker is harmless — it holds no locks and writes only to its
+// own state — and if it does complete it still logs, so a slow capture
+// degrades to a late one rather than a lost one.
+func captureProcStateBounded(pid int, vmID string) (*procStallState, bool) {
+	done := make(chan *procStallState, 1) // buffered: an abandoned worker must never block
+	go func() {
+		defer sentrylog.Recover("stall-proc-capture")
+		done <- captureProcState(pid, vmID)
+	}()
+	select {
+	case st := <-done:
+		return st, true
+	case <-time.After(stallCaptureBudget):
+		return nil, false
+	}
+}
+
 // captureProcState reads the per-thread kernel state and userfaultfd counters
 // of a live Firecracker process. MUST be called before teardown: once the
-// process is killed, every answer here is gone.
+// process is killed, every answer here is gone. Callers on the verdict path
+// use captureProcStateBounded — the internal deadline below limits how much
+// work is attempted, but only the caller's wait bounds elapsed time.
 func captureProcState(pid int, vmID string) *procStallState {
 	// -1, not the zero value: `total: 0` is the affirmative verdict "the
 	// guest is not waiting on memory at all — look elsewhere", so a counter

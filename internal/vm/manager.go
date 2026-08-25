@@ -5824,7 +5824,11 @@ func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Durati
 	// costing us the console too.
 	var proc *procStallState
 	if pid > 0 {
-		proc = captureProcState(pid, vmID)
+		var finished bool
+		if proc, finished = captureProcStateBounded(pid, vmID); !finished {
+			m.log.Warn().Str("vm_id", vmID).Int("fc_pid", pid).
+				Msg("guest not ready — proc capture exceeded its budget; proceeding to teardown")
+		}
 	}
 	go func() {
 		defer sentrylog.Recover("stall-forensics")
