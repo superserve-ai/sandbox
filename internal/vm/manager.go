@@ -3072,6 +3072,16 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		m.mu.RLock()
 		_, stillTracked := m.vms[vmID]
 		m.mu.RUnlock()
+		if stillTracked {
+			// Mark the failure in-memory BEFORE returning: only the durable
+			// write may be deferred. A same-ID retry that wins the lifecycle
+			// lock right after this RPC returns must see Error — a lingering
+			// Running/Unverified corpse would route it into re-verifying a
+			// stopped VM instead of relaunching.
+			inst.mu.Lock()
+			inst.Status = StatusError
+			inst.mu.Unlock()
+		}
 		go func() {
 			defer sentrylog.Recover("restore-error-persist")
 			<-persistDone
@@ -3100,6 +3110,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				return
 			}
 			m.setStatus(vmID, StatusError)
+			// DestroyVM bypasses the lifecycle lock, so its record delete
+			// can interleave anywhere around the write above and be
+			// resurrected by it. Converge by compensation: if the VM is
+			// gone now, delete what we may have just written; a destroy
+			// landing after this check deletes it itself. Every
+			// interleaving ends with the record absent.
+			m.mu.RLock()
+			_, still := m.vms[vmID]
+			m.mu.RUnlock()
+			if !still {
+				m.deleteState(vmID)
+			}
 		}()
 		if !stillTracked {
 			// The destroy owns the teardown; report it as such, like every
