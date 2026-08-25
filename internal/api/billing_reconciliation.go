@@ -77,12 +77,29 @@ func (h *Handlers) reconcileActiveIneligibleTeams(ctx context.Context) {
 }
 
 func (h *Handlers) reconcileActivatedSandbox(ctx context.Context, teamID uuid.UUID) {
-	eligible, err := h.DB.IsTeamSandboxBillingEligible(ctx, teamID)
+	// Only the eligibility READ is coalesced: it is per-team, so a concurrent
+	// create burst shares one fresh look (never the request-path cache; this
+	// is the safety net) instead of one per sandbox. The pause claim stays
+	// with each caller — inside the flight, a sandbox activating after the
+	// leader's claim snapshot would join the flight and never be claimed
+	// until the next sweep. Each caller runs after its own activation
+	// committed, so its own claim always covers its own sandbox; concurrent
+	// claims partition safely (FOR UPDATE SKIP LOCKED), and the ineligible
+	// case is rare enough that their cost is irrelevant.
+	verdict, err, _ := h.activationRecheck.Do(teamID.String(), func() (interface{}, error) {
+		return h.DB.IsTeamSandboxBillingEligible(ctx, teamID)
+	})
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: activation eligibility check failed")
+		// No per-team retry: reads fail here exactly when the DB is already
+		// struggling, and high create churn would bank one untracked retry
+		// per team, all firing together 30s later. The 30s sweep
+		// (trialEligibilityLoop → reconcileActiveIneligibleTeams) already
+		// re-covers every team on the same timescale a retry would, with
+		// bounded, paced concurrency.
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: activation eligibility check failed; 30s sweep will re-cover")
 		return
 	}
-	if !eligible {
+	if !verdict.(bool) {
 		h.pauseBillingIneligibleTeam(ctx, teamID)
 	}
 }
