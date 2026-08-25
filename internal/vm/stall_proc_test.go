@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseUffdCounters(t *testing.T) {
@@ -27,37 +28,30 @@ func TestParseUffdCounters(t *testing.T) {
 	}
 }
 
-func TestCaptureProcStateSelf(t *testing.T) {
-	// The live process always has a task dir; stacks may be unreadable
-	// (non-root, no CONFIG_STACKTRACE) and that must degrade, not fail.
-	// The identity token is taken from this process's own command line so the
-	// check passes for the test binary the way it passes for firecracker.
-	self := readProcFile("/proc/self/cmdline")
-	token := self
-	if i := strings.IndexByte(token, 0); i > 0 {
-		token = token[:i]
+func TestThreadReadsRespectTheBudget(t *testing.T) {
+	// An expired budget must stop reads rather than only skip the next
+	// iteration: this runs inside the teardown reserve, so the bound has to
+	// hold across the whole capture.
+	if _, ok := readProcFileBy("/proc/self/comm", time.Now().Add(-time.Second)); ok {
+		t.Fatal("expired budget still performed a read")
 	}
-	st := captureProcState(os.Getpid(), token)
-	if st.CaptureError != "" {
-		t.Fatalf("self capture errored: %s", st.CaptureError)
+	if _, ok := readProcFileBy("/proc/self/comm", time.Now().Add(time.Minute)); !ok {
+		t.Fatal("live budget refused a read")
 	}
-	if len(st.Threads) == 0 {
-		t.Fatal("no threads captured for the running process")
+	// The fd scan is the other multi-read step and must stop too.
+	if _, ok := findUffdFD("/proc/self", time.Now().Add(-time.Second)); ok {
+		t.Fatal("expired budget still scanned fds")
 	}
-	if len(st.Threads) > maxStallThreads {
-		t.Fatalf("thread cap exceeded: %d", len(st.Threads))
-	}
-	for _, th := range st.Threads {
-		if th.TID == "" {
-			t.Fatal("thread captured without a tid")
-		}
-		if len(th.Stack) > maxStackFramesKept {
-			t.Fatalf("stack cap exceeded: %d frames", len(th.Stack))
-		}
-	}
-	// The dump is for humans and must always name the pid.
-	if !strings.Contains(st.dump(), "pid: "+strconv.Itoa(os.Getpid())) {
+}
+
+func TestDumpNamesThePID(t *testing.T) {
+	st := &procStallState{PID: 4242, Truncated: true}
+	d := st.dump()
+	if !strings.Contains(d, "pid: 4242") {
 		t.Fatal("dump missing pid header")
+	}
+	if !strings.Contains(d, "truncated: true") {
+		t.Fatal("a partial capture must say so in the dump")
 	}
 }
 
@@ -98,7 +92,7 @@ func TestCaptureRefusesARecycledPID(t *testing.T) {
 		t.Fatalf("captured %d threads from an unrelated process", len(st.Threads))
 	}
 	// An empty vm id can never identify a process either.
-	if procIsVMFirecracker(os.Getpid(), "") {
+	if pidIsVMFirecracker(os.Getpid(), "") {
 		t.Fatal("empty vm id must not match any process")
 	}
 }

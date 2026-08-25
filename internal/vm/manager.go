@@ -5807,12 +5807,7 @@ func summarizeConsoleTail(tail string) (fcLines, boxdLines, guestLines int, pani
 // the journald fallback all run detached.
 func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Duration, launchedAt time.Time) {
 	failedAt := time.Now()
-	// The kernel's answer to "blocked on what" — must be read while
-	// Firecracker is still alive, i.e. before stopUnitDuringRestoreError.
-	var proc *procStallState
-	if pid > 0 {
-		proc = captureProcState(pid, vmID)
-	}
+
 	src := filepath.Join(m.cfg.RunDir, vmID, "console.log")
 	// The ONLY work that must beat the teardown's rundir delete is moving
 	// the file out (direct-spawn mode; unit mode has no file, and its
@@ -5822,6 +5817,15 @@ func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Durati
 	dir := filepath.Join(m.cfg.RunDir, stallForensicsDirName)
 	dst := filepath.Join(dir, fmt.Sprintf("%d-%s.console.log", failedAt.Unix(), vmID))
 	renamed := m.forensicsOK && os.Rename(src, dst) == nil // dir pre-created and secured at startup
+	// Proc capture runs AFTER the rename: both are best-effort and race a
+	// concurrent DestroyVM (which bypasses the lifecycle lock and deletes the
+	// rundir), but the rename is microseconds while the capture may spend its
+	// whole budget — doing the cheap one first keeps a slow capture from
+	// costing us the console too.
+	var proc *procStallState
+	if pid > 0 {
+		proc = captureProcState(pid, vmID)
+	}
 	go func() {
 		defer sentrylog.Recover("stall-forensics")
 		// One prune covering every exit path: a stall can add a console file,

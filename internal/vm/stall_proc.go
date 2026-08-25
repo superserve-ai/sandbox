@@ -74,6 +74,18 @@ type procStallState struct {
 	CaptureError string
 }
 
+// readProcFileBy reads a procfs file only if the budget has not expired.
+// The deadline gates every read rather than only the start of an iteration:
+// this runs ahead of teardown inside the verdict reserve, so the bound has to
+// hold across the whole capture, not just its first step. ok=false means the
+// budget stopped the read.
+func readProcFileBy(path string, deadline time.Time) (string, bool) {
+	if !time.Now().Before(deadline) {
+		return "", false
+	}
+	return readProcFile(path), true
+}
+
 // readProcFile reads a small procfs file, capped. procfs reads are served
 // from kernel memory — no disk I/O, no blocking on the stalled guest.
 func readProcFile(path string) string {
@@ -104,7 +116,10 @@ func captureProcState(pid int, vmID string) *procStallState {
 	// stranger's threads and stacks to this VM — worse than no evidence.
 	// Firecracker's command line carries the VM id, so the check is exact
 	// rather than a guess at "looks like a VMM".
-	if !procIsVMFirecracker(pid, vmID) {
+	// pidIsVMFirecracker, not a substring test: a short VM id can appear in
+	// an unrelated process's argv, and this must match the firecracker
+	// binary plus the exact `--id <vmID>` token.
+	if !pidIsVMFirecracker(pid, vmID) {
 		st.CaptureError = "pid is no longer this VM's firecracker (exited, or recycled by another process)"
 		return st
 	}
@@ -122,15 +137,18 @@ func captureProcState(pid int, vmID string) *procStallState {
 			break
 		}
 		tdir := filepath.Join(base, "task", e.Name())
-		t := procThread{
-			TID:   e.Name(),
-			Comm:  readProcFile(filepath.Join(tdir, "comm")),
-			Wchan: readProcFile(filepath.Join(tdir, "wchan")),
+		comm, ok := readProcFileBy(filepath.Join(tdir, "comm"), deadline)
+		if !ok {
+			st.Truncated = true
+			break
 		}
+		wchan, _ := readProcFileBy(filepath.Join(tdir, "wchan"), deadline)
+		t := procThread{TID: e.Name(), Comm: comm, Wchan: wchan}
 		// The kernel stack is the direct answer to "blocked on what" — a
 		// userfaultfd wait, a page-cache read, a poll. Root-only and
 		// kernel-config dependent, hence best-effort.
-		if raw := readProcFile(filepath.Join(tdir, "stack")); raw != "" {
+		raw, _ := readProcFileBy(filepath.Join(tdir, "stack"), deadline)
+		if raw != "" {
 			frames := strings.Split(raw, "\n")
 			if len(frames) > maxStackFramesKept {
 				frames = frames[:maxStackFramesKept]
@@ -142,35 +160,27 @@ func captureProcState(pid int, vmID string) *procStallState {
 		st.Threads = append(st.Threads, t)
 	}
 
-	if fd, ok := findUffdFD(base); ok {
+	// The fd scan is the other multi-read step and must respect the same
+	// bound; the counters are the most valuable single signal, so it runs
+	// last and is skipped rather than allowed to overrun.
+	if fd, ok := findUffdFD(base, deadline); ok {
 		st.UffdFound = true
-		st.UffdFdinfo = readProcFile(filepath.Join(base, "fdinfo", fd))
+		st.UffdFdinfo, _ = readProcFileBy(filepath.Join(base, "fdinfo", fd), deadline)
 		st.UffdPending, st.UffdTotal = parseUffdCounters(st.UffdFdinfo)
+	} else if !time.Now().Before(deadline) {
+		st.Truncated = true
 	}
 	return st
 }
 
-// procIsVMFirecracker reports whether pid is still the Firecracker process
-// belonging to vmID. The command line names the VM (its --id and the rundir
-// path in --api-sock both carry it), so a recycled PID or an unrelated
-// process fails the check.
-func procIsVMFirecracker(pid int, vmID string) bool {
-	if vmID == "" {
-		return false
-	}
-	// cmdline is NUL-separated; a substring match over the raw bytes is
-	// exactly what is needed here.
-	return strings.Contains(readProcFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline")), vmID)
-}
-
 // findUffdFD locates the userfaultfd descriptor by its anon-inode link target.
-func findUffdFD(procBase string) (string, bool) {
+func findUffdFD(procBase string, deadline time.Time) (string, bool) {
 	entries, err := os.ReadDir(filepath.Join(procBase, "fd"))
 	if err != nil {
 		return "", false
 	}
 	for i, e := range entries {
-		if i >= maxStallFdScan {
+		if i >= maxStallFdScan || !time.Now().Before(deadline) {
 			break
 		}
 		target, err := os.Readlink(filepath.Join(procBase, "fd", e.Name()))
