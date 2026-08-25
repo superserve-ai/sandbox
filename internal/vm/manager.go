@@ -497,6 +497,10 @@ type Manager struct {
 	// would turn a recoverable wedge into a permanent hang.
 	vmOpLocks sync.Map
 
+	// forensicsOK gates console quarantine: false when the root-only
+	// forensics directory could not be created or secured at startup.
+	forensicsOK bool
+
 	// destroying holds the vmIDs currently inside DestroyVM, from just before
 	// the slot is freed until teardown completes. A lazy getInstance skips
 	// reattaching a listed VM: without this, a request that misses m.vms
@@ -642,6 +646,7 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 	// Magic mount target — every per-VM start script mounts tmpfs over it.
 	// Missing → "mount: failed" → opaque "wait for socket" timeout. Create
 	// at startup so an aggressive ops cleanup can't break sandbox/build paths.
+	forensicsQuarantineOK := false
 	if cfg.RunDir != "" {
 		if err := os.MkdirAll(filepath.Join(cfg.RunDir, templateDirName), 0o755); err != nil {
 			return nil, fmt.Errorf("mkdir template magic dir: %w", err)
@@ -651,16 +656,21 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		// reserve. Best-effort: if an ops cleanup removes it, the rename
 		// fails and forensics degrade to the journald summary.
 		forensicsDir := filepath.Join(cfg.RunDir, stallForensicsDirName)
+		// MkdirAll leaves a PRE-EXISTING directory's mode alone, and
+		// consoles land in it as 0644 before the deferred file chmod — the
+		// directory mode is what actually fences other accounts, so an
+		// unsecurable directory disables file quarantine entirely (the
+		// content-free summary and journald fallback still work).
 		if err := os.MkdirAll(forensicsDir, 0o700); err != nil {
 			log.Warn().Err(err).Msg("stall-forensics dir unavailable; console quarantine disabled")
 		} else if err := os.Chmod(forensicsDir, 0o700); err != nil {
-			// MkdirAll leaves a PRE-EXISTING directory's mode alone, and
-			// consoles land here as 0644 before the deferred chmod — the
-			// directory mode is what actually fences other accounts.
-			log.Warn().Err(err).Msg("stall-forensics dir permissions not tightened")
+			log.Warn().Err(err).Msg("stall-forensics dir not securable; console quarantine disabled")
+		} else {
+			forensicsQuarantineOK = true
 		}
 	}
 	m := &Manager{
+		forensicsOK: forensicsQuarantineOK,
 		cfg:            cfg,
 		netMgr:         netMgr,
 		recorder:       cfg.TelemetryRecorder,
@@ -5005,31 +5015,7 @@ func (m *Manager) abortResumeLocked(vmID string) {
 	// rather than clobbered by our stale instance, and the lock-bypassing
 	// destroy is compensated after the write (an undurable revert is also
 	// re-derived by the reconciler).
-	go func() {
-		defer sentrylog.Recover("resume-abort-persist")
-		unlock, lockErr := m.lockVMOp(context.Background(), vmID)
-		if lockErr != nil {
-			return
-		}
-		defer unlock()
-		m.mu.RLock()
-		cur, tracked := m.vms[vmID]
-		m.mu.RUnlock()
-		if !tracked {
-			return // the destroy owns teardown; nothing to write
-		}
-		if cur != inst {
-			m.persistState(cur)
-		} else {
-			_, _ = m.persistStateIfPresent(inst)
-		}
-		m.mu.RLock()
-		_, still := m.vms[vmID]
-		m.mu.RUnlock()
-		if !still {
-			m.deleteState(vmID)
-		}
-	}()
+	m.deferStatePersist("resume-abort-persist", vmID, inst, true)
 }
 
 // releaseFailedRestore frees a failed restore's network slot and rundir —
@@ -5053,7 +5039,10 @@ func (m *Manager) releaseFailedRestore(vmID string, inPlace, tapBusy bool, clean
 			inst.mu.Lock()
 			inst.TeardownPending = "restore failed; cgroup process not proven dead; rundir and network retained; reconciler owns stop and release"
 			inst.mu.Unlock()
-			_, _ = m.persistStateIfPresent(inst)
+			// Deferred: this runs inside the readiness-timeout verdict
+			// reserve, and the in-memory marker above already guides this
+			// life; a restart re-parks via reattach either way.
+			m.deferStatePersist("release-cgroup-persist", vmID, inst, true)
 		}
 		return
 	}
@@ -5710,6 +5699,44 @@ func tailFile(path string, n int64) (string, int64, error) {
 // rest for manual inspection.
 var stallJournalSem = make(chan struct{}, 2)
 
+// deferStatePersist converges an instance's durable record OFF the reply
+// path — persistence is unbounded fsync work and BoltDB is slow under
+// exactly the pressure that puts these paths in play. The in-memory state
+// must already be correct before calling (that is what concurrent readers
+// and same-ID retries see). The worker carries the standard protections:
+// the lifecycle lock serializes it against retries, a replacement's record
+// is repaired rather than clobbered by the stale instance, and the
+// lock-bypassing destroy is compensated after the write.
+func (m *Manager) deferStatePersist(scope, vmID string, inst *VMInstance, ifPresent bool) {
+	go func() {
+		defer sentrylog.Recover(scope)
+		unlock, lockErr := m.lockVMOp(context.Background(), vmID)
+		if lockErr != nil {
+			return
+		}
+		defer unlock()
+		m.mu.RLock()
+		cur, tracked := m.vms[vmID]
+		m.mu.RUnlock()
+		if !tracked {
+			return // the destroy owns teardown; nothing to write
+		}
+		if cur != inst {
+			m.persistState(cur)
+		} else if ifPresent {
+			_, _ = m.persistStateIfPresent(inst)
+		} else {
+			m.persistState(inst)
+		}
+		m.mu.RLock()
+		_, still := m.vms[vmID]
+		m.mu.RUnlock()
+		if !still {
+			m.deleteState(vmID)
+		}
+	}()
+}
+
 // bootVerdictReserve is the deadline slice reserved for a boot's WORST-CASE
 // error path so the definitive verdict still returns in-band: the 10s
 // bounded unit stop, the 2s surviving-unit resolve, and a reply margin.
@@ -5771,7 +5798,7 @@ func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launc
 	// verdict reserve is never spent on forensics.
 	dir := filepath.Join(m.cfg.RunDir, stallForensicsDirName)
 	dst := filepath.Join(dir, fmt.Sprintf("%d-%s.console.log", failedAt.Unix(), vmID))
-	renamed := os.Rename(src, dst) == nil // dir pre-created at startup
+	renamed := m.forensicsOK && os.Rename(src, dst) == nil // dir pre-created and secured at startup
 	go func() {
 		defer sentrylog.Recover("stall-forensics")
 		if renamed {
