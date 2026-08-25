@@ -1389,23 +1389,32 @@ func (q *Queries) ListTeamCreditGrants(ctx context.Context, teamID uuid.UUID) ([
 }
 
 const listTeamsWithActiveIneligibleSandboxes = `-- name: ListTeamsWithActiveIneligibleSandboxes :many
-SELECT DISTINCT s.team_id
-FROM sandbox s
-WHERE s.destroyed_at IS NULL
-  AND s.status = 'active'
-  AND NOT team_sandbox_billing_eligible(s.team_id)
-  AND s.team_id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-ORDER BY s.team_id
-LIMIT $2
+WITH active_teams AS MATERIALIZED (
+    SELECT DISTINCT s.team_id
+    FROM sandbox s
+    WHERE s.destroyed_at IS NULL
+      AND s.status = 'active'
+      AND s.team_id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+)
+SELECT team_id
+FROM active_teams
+WHERE NOT team_sandbox_billing_eligible(team_id)
+ORDER BY team_id
+LIMIT $1
 `
 
 type ListTeamsWithActiveIneligibleSandboxesParams struct {
-	AfterTeamID pgtype.UUID `json:"after_team_id"`
 	BatchLimit  int32       `json:"batch_limit"`
+	AfterTeamID pgtype.UUID `json:"after_team_id"`
 }
 
+// MATERIALIZED fence, same reason as the rollup's interval_team_set: dedupe
+// the active-team set first so team_sandbox_billing_eligible() runs once per
+// team. Inlined in the WHERE clause the planner may evaluate it per active
+// sandbox row — the function does three reads, and this sweep runs on a
+// timer against every control-plane instance.
 func (q *Queries) ListTeamsWithActiveIneligibleSandboxes(ctx context.Context, arg ListTeamsWithActiveIneligibleSandboxesParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, listTeamsWithActiveIneligibleSandboxes, arg.AfterTeamID, arg.BatchLimit)
+	rows, err := q.db.Query(ctx, listTeamsWithActiveIneligibleSandboxes, arg.BatchLimit, arg.AfterTeamID)
 	if err != nil {
 		return nil, err
 	}
