@@ -395,11 +395,21 @@ module "observability" {
   # one-field flip once the cell's backfill backlog converges to zero.
   # regions lists the host table's region column values in this cell's
   # database, NOT GCP region names; "usw" is the only value present.
-  backup_coverage_alerts = {
-    enabled        = false
-    display_prefix = "Backup coverage / us-west2"
-    regions        = ["usw"]
-  }
+  #
+  # Left null for now (was the object below): creating these alert_policy
+  # resources requires backup_uncovered_paused_sandboxes to already exist
+  # as a Cloud Monitoring metric type, but the controlplane code that
+  # emits it deploys through this same Terraform CD run's api job, which
+  # is itself gated on this apply succeeding. Deadlock: apply fails on
+  # "Cannot find metric" -> api deploy never runs -> metric never gets
+  # emitted -> apply keeps failing. Re-enable once a later deploy (with
+  # this block still null) has shipped the emitting code and the metric
+  # is confirmed present in Cloud Monitoring.
+  # backup_coverage_alerts = {
+  #   enabled        = false
+  #   display_prefix = "Backup coverage / us-west2"
+  #   regions        = ["usw"]
+  # }
   # Launch-path health for the same host: the pruned launcher mount namespace
   # being unavailable (VM starts fall back to walking the full host mount
   # table) and live network namespaces accumulating. Both degrade latency
