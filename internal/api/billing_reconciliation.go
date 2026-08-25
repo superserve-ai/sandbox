@@ -77,14 +77,23 @@ func (h *Handlers) reconcileActiveIneligibleTeams(ctx context.Context) {
 }
 
 func (h *Handlers) reconcileActivatedSandbox(ctx context.Context, teamID uuid.UUID) {
-	eligible, err := h.DB.IsTeamSandboxBillingEligible(ctx, teamID)
-	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: activation eligibility check failed")
-		return
-	}
-	if !eligible {
-		h.pauseBillingIneligibleTeam(ctx, teamID)
-	}
+	// Coalesced per team: the question — "did this team go ineligible while
+	// we were creating" — is per-team, so a concurrent create burst shares
+	// one fresh read (never the request-path cache; this is the safety net)
+	// instead of one per sandbox. Followers ride the leader's flight, so
+	// every activation still triggers a check, and the pause sweep already
+	// covers the whole team.
+	_, _, _ = h.activationRecheck.Do(teamID.String(), func() (interface{}, error) {
+		eligible, err := h.DB.IsTeamSandboxBillingEligible(ctx, teamID)
+		if err != nil {
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: activation eligibility check failed")
+			return nil, nil
+		}
+		if !eligible {
+			h.pauseBillingIneligibleTeam(ctx, teamID)
+		}
+		return nil, nil
+	})
 }
 
 // pauseBillingIneligibleTeam claims and pauses active sandboxes after Stripe
