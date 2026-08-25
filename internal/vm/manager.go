@@ -2833,10 +2833,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("start firecracker: %w", startErr)
 		}
-		inst.mu.Lock()
-		inst.PID = pid
-		inst.Supervision = supervision
-		inst.mu.Unlock()
+		publishLaunchPID(inst, pid, supervision)
 		tFcReady = time.Now()
 
 		// Attempts after the first measure from the attempt start, so a retry's

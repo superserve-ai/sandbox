@@ -243,3 +243,21 @@ func (m *Manager) resolveFCPID(vmID string, launchPID int) int {
 	defer inst.mu.RUnlock()
 	return inst.PID
 }
+
+// publishLaunchPID records what the launch learned about the Firecracker
+// process without ever un-learning what is already known.
+//
+// A unit-supervised launch returns 0 and resolves systemd's MainPID on its
+// own goroutine, so the resolver can publish the real PID before the
+// launching goroutine gets here. Assigning the returned zero unconditionally
+// would erase it — leaving the record permanently PID-less for a VM that has
+// one, which costs the stall capture its subject and misleads anything else
+// reading the field. Zero means "not known yet", never "known to be none".
+func publishLaunchPID(inst *VMInstance, pid int, supervision Supervision) {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if pid > 0 {
+		inst.PID = pid
+	}
+	inst.Supervision = supervision
+}

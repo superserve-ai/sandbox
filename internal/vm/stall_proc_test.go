@@ -102,6 +102,30 @@ func TestResolveFCPIDFallsBackToTheRecord(t *testing.T) {
 	}
 }
 
+func TestPublishLaunchPIDNeverErasesAResolvedPID(t *testing.T) {
+	// Unit supervision returns 0 from the launch while an async resolver
+	// publishes the real MainPID. Whichever lands second, the record must end
+	// up with the real PID.
+	inst := &VMInstance{}
+	publishLaunchPID(inst, 0, SupervisionUnit) // launch returns first
+	if inst.PID != 0 {
+		t.Fatalf("PID = %d, want 0 before resolution", inst.PID)
+	}
+	inst.PID = 777 // resolver publishes MainPID
+	publishLaunchPID(inst, 0, SupervisionUnit)
+	if inst.PID != 777 {
+		t.Fatalf("late zero erased the resolved PID: got %d, want 777", inst.PID)
+	}
+	// Direct spawn supplies a real PID at launch and must still win.
+	publishLaunchPID(inst, 1234, SupervisionUnit)
+	if inst.PID != 1234 {
+		t.Fatalf("launch PID not recorded: got %d, want 1234", inst.PID)
+	}
+	if inst.Supervision != SupervisionUnit {
+		t.Fatalf("supervision not recorded: %v", inst.Supervision)
+	}
+}
+
 func TestThreadSummaryShapesTheVerdict(t *testing.T) {
 	st := &procStallState{
 		Threads: []procThread{
