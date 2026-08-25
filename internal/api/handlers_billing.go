@@ -551,7 +551,7 @@ func (h *Handlers) requireBillingEligible(c *gin.Context, teamID uuid.UUID) bool
 		return true
 	}
 	started := time.Now()
-	eligible, err := h.DB.IsTeamSandboxBillingEligible(c.Request.Context(), teamID)
+	eligible, err := h.teamBillingEligibleCached(c.Request.Context(), teamID)
 	log.Debug().Str("team_id", teamID.String()).Int64("billing_eligibility_ms", time.Since(started).Milliseconds()).Msg("billing eligibility check")
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read sandbox billing eligibility failed")

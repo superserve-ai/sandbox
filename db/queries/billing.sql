@@ -803,13 +803,22 @@ ORDER BY s.team_id
 LIMIT sqlc.arg(batch_limit);
 
 -- name: ListTeamsWithActiveIneligibleSandboxes :many
-SELECT DISTINCT s.team_id
-FROM sandbox s
-WHERE s.destroyed_at IS NULL
-  AND s.status = 'active'
-  AND NOT team_sandbox_billing_eligible(s.team_id)
-  AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-ORDER BY s.team_id
+-- MATERIALIZED fence, same reason as the rollup's interval_team_set: dedupe
+-- the active-team set first so team_sandbox_billing_eligible() runs once per
+-- team. Inlined in the WHERE clause the planner may evaluate it per active
+-- sandbox row — the function does three reads, and this sweep runs on a
+-- timer against every control-plane instance.
+WITH active_teams AS MATERIALIZED (
+    SELECT DISTINCT s.team_id
+    FROM sandbox s
+    WHERE s.destroyed_at IS NULL
+      AND s.status = 'active'
+      AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+)
+SELECT team_id
+FROM active_teams
+WHERE NOT team_sandbox_billing_eligible(team_id)
+ORDER BY team_id
 LIMIT sqlc.arg(batch_limit);
 
 -- name: ActivateTeamBilling :exec

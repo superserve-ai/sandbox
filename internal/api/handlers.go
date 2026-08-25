@@ -175,6 +175,14 @@ type Handlers struct {
 	// diagnosticGroup coalesces concurrent capability rejection snapshots for
 	// the same host and required capability set.
 	diagnosticGroup singleflight.Group
+
+	// billingElig caches the per-team eligibility gate consulted on every
+	// create/resume (see billing_elig_cache.go). Zero value is ready to use.
+	billingElig billingEligCache
+
+	// activationRecheck coalesces the per-team post-activation eligibility
+	// recheck: a 100-create burst asks the same question 100 times.
+	activationRecheck singleflight.Group
 }
 
 // asyncBookkeeping runs fire-and-forget post-VMD work in a background
