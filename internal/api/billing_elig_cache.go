@@ -37,6 +37,11 @@ const (
 	// evictSamplePerPut caps how many entries a put inspects for expiry, so
 	// eviction cost never scales with team cardinality on the request path.
 	evictSamplePerPut = 8
+	// billingEligCacheMaxEntries is a hard memory bound: teams actively
+	// creating within one TTL window number in the hundreds, so thousands of
+	// live entries means churn the sampled eviction hasn't caught up with.
+	// Evicting an arbitrary entry is safe — this cache only saves a read.
+	billingEligCacheMaxEntries = 4096
 )
 
 type billingEligEntry struct {
@@ -87,6 +92,15 @@ func (c *billingEligCache) put(teamID uuid.UUID, eligible bool, checked time.Tim
 		if checked.Sub(e.checked) > e.ttl() {
 			delete(c.m, k)
 		}
+	}
+	// Hard cap, enforced after the expiry sample: drop arbitrary entries
+	// (random map order) until the insert fits. O(1) amortized — the map can
+	// exceed the cap by at most one entry per put.
+	for k := range c.m {
+		if len(c.m) < billingEligCacheMaxEntries {
+			break
+		}
+		delete(c.m, k)
 	}
 	c.m[teamID] = billingEligEntry{eligible: eligible, checked: checked}
 	c.mu.Unlock()

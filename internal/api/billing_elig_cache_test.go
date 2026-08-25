@@ -107,3 +107,24 @@ func TestReconcileActivatedSandboxCoalesces(t *testing.T) {
 		t.Fatalf("DB reads = %d, want 1 (burst rechecks must share one flight)", got)
 	}
 }
+
+// The map may never exceed its hard cap: memory stays bounded no matter how
+// many unique teams churn through faster than expiry-based eviction reclaims.
+func TestBillingEligCacheHardCap(t *testing.T) {
+	var reads atomic.Int64
+	var answer atomic.Bool
+	answer.Store(true)
+	h := eligMockHandlers(&reads, &answer, nil)
+
+	for i := 0; i < billingEligCacheMaxEntries+100; i++ {
+		if _, err := h.teamBillingEligibleCached(context.Background(), uuid.New()); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	h.billingElig.mu.Lock()
+	n := len(h.billingElig.m)
+	h.billingElig.mu.Unlock()
+	if n > billingEligCacheMaxEntries {
+		t.Fatalf("cache holds %d entries, cap is %d", n, billingEligCacheMaxEntries)
+	}
+}
