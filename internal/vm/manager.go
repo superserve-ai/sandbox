@@ -3075,6 +3075,16 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		go func() {
 			defer sentrylog.Recover("restore-error-persist")
 			<-persistDone
+			// The identity check and the Error write must be atomic against
+			// a same-ID retry, which serializes on the lifecycle lock: held
+			// here, the map entry cannot be replaced between check and
+			// write (only DestroyVM bypasses the lock, and its record
+			// delete makes setStatus a no-op — the safe direction).
+			unlock, lockErr := m.lockVMOp(context.Background(), vmID)
+			if lockErr != nil {
+				return
+			}
+			defer unlock()
 			m.mu.RLock()
 			cur, tracked := m.vms[vmID]
 			m.mu.RUnlock()
