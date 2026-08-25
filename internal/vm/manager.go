@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -496,6 +497,10 @@ type Manager struct {
 	// would turn a recoverable wedge into a permanent hang.
 	vmOpLocks sync.Map
 
+	// forensicsOK gates console quarantine: false when the root-only
+	// forensics directory could not be created or secured at startup.
+	forensicsOK bool
+
 	// destroying holds the vmIDs currently inside DestroyVM, from just before
 	// the slot is freed until teardown completes. A lazy getInstance skips
 	// reattaching a listed VM: without this, a request that misses m.vms
@@ -641,12 +646,31 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 	// Magic mount target — every per-VM start script mounts tmpfs over it.
 	// Missing → "mount: failed" → opaque "wait for socket" timeout. Create
 	// at startup so an aggressive ops cleanup can't break sandbox/build paths.
+	forensicsQuarantineOK := false
 	if cfg.RunDir != "" {
 		if err := os.MkdirAll(filepath.Join(cfg.RunDir, templateDirName), 0o755); err != nil {
 			return nil, fmt.Errorf("mkdir template magic dir: %w", err)
 		}
+		// Pre-created so the readiness-timeout verdict path only renames
+		// into it — even first-stall metadata I/O must not spend the
+		// reserve. Best-effort: if an ops cleanup removes it, the rename
+		// fails and forensics degrade to the journald summary.
+		forensicsDir := filepath.Join(cfg.RunDir, stallForensicsDirName)
+		// MkdirAll leaves a PRE-EXISTING directory's mode alone, and
+		// consoles land in it as 0644 before the deferred file chmod — the
+		// directory mode is what actually fences other accounts, so an
+		// unsecurable directory disables file quarantine entirely (the
+		// content-free summary and journald fallback still work).
+		if err := os.MkdirAll(forensicsDir, 0o700); err != nil {
+			log.Warn().Err(err).Msg("stall-forensics dir unavailable; console quarantine disabled")
+		} else if err := os.Chmod(forensicsDir, 0o700); err != nil {
+			log.Warn().Err(err).Msg("stall-forensics dir not securable; console quarantine disabled")
+		} else {
+			forensicsQuarantineOK = true
+		}
 	}
 	m := &Manager{
+		forensicsOK:    forensicsQuarantineOK,
 		cfg:            cfg,
 		netMgr:         netMgr,
 		recorder:       cfg.TelemetryRecorder,
@@ -2601,8 +2625,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		warmthPath = base
 	}
 	tplAgeSecs := m.templateRestoreAge(warmthPath)
-	cpuPSI := psiSomeAvg10("/proc/pressure/cpu")
-	memPSI := psiSomeAvg10("/proc/pressure/memory")
+	cpuPSI, memPSI, ioPSI := cachedPSI()
 
 	// Deterministic artifact/config preconditions, checked before ANY state
 	// changes: no provisional instance published (a refusal must not leave a
@@ -2834,6 +2857,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Bool("uffd", useUffd).
 			Float64("cpu_psi_avg10", cpuPSI).
 			Float64("mem_psi_avg10", memPSI).
+			Float64("io_psi_avg10", ioPSI).
 			Int("attempt", attempt).
 			Msg("restoring snapshot")
 		restorePhasesRecorded = true
@@ -3024,32 +3048,117 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// overlay from cold storage (first resume of a migrated VM, page cache
 	// evicted) legitimately needs more than a warm same-host resume, and a
 	// timeout here is destructive — the error path below tears down the VM.
-	if err := m.waitForBoxd(ctx, hostIP, 30*time.Second); err != nil {
+	//
+	// The window is clamped to the RPC deadline less the WORST-CASE error
+	// path — the verdict returns only after teardown, so the reserve must
+	// cover it: the 10s bounded unit stop, the 2s surviving-unit resolve,
+	// and a reply margin. Then the DEFINITIVE verdict always reaches the
+	// caller in-band even when setup ate into the budget and the stop is
+	// stuck at its bound: an honest early error beats letting the caller's
+	// deadline win the race — a bare DeadlineExceeded reads as transient
+	// and gets retried into this VM's torn-down state.
+	readiness := 30 * time.Second
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl) - bootVerdictReserve; remaining < readiness {
+			readiness = remaining
+		}
+	}
+	if err := m.waitForBoxd(ctx, hostIP, readiness); err != nil {
 		// Emit the exhausted readiness wait immediately, before teardown, so
 		// the sample measures the probe (not unit stop + resource release +
 		// persist join) and the concurrent-destroy return below can't skip it.
 		m.recordPhases("restore", "", map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
+		// The console (FC log + guest serial) is the only witness to where
+		// the guest stalled between vCPU resume and first output; the
+		// teardown below deletes it, so capture it now. Only for a genuine
+		// readiness timeout: a caller disconnect also lands here via ctx,
+		// and that aborting restore should neither pay the file read nor
+		// pollute the stall signal.
+		if ctx.Err() == nil {
+			m.captureStallForensics(vmID, time.Since(tBoxdStart), tAttemptStart)
+		}
 		// Teardown first — none of it touches BoltDB, so a stalled persist
 		// cannot keep the failed restore's unit and network alive.
 		m.stopUnitDuringRestoreError(vmID)
 		m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
-		// Join before the durable writes, or the goroutine's Running write
-		// could land after the Error write. Mirror the success path's
-		// post-join check: a concurrent destroy erased the record, and the
-		// joined write must not resurrect it — setStatus alone can't fix
-		// this (it no-ops on an untracked VM).
-		<-persistDone
+		// Durable-state convergence is unbounded fsync work (the persist
+		// join, then another synchronous Put) and BoltDB is slow under
+		// exactly the host pressure that stalls readiness — it must not
+		// spend the verdict reserve. The ordering the join protects
+		// (Running must not land after Error; a destroyed record must not
+		// be resurrected) moves intact into a detached worker: join, then
+		// re-check tracking, then write. The reply needs only a map read
+		// to pick its error; a destroy that lands during the persist join
+		// now returns the generic error instead of NotFound in that narrow
+		// race — the worker still converges the durable state either way.
 		m.mu.RLock()
 		_, stillTracked := m.vms[vmID]
 		m.mu.RUnlock()
+		if stillTracked {
+			// Mark the failure in-memory BEFORE returning: only the durable
+			// write may be deferred. A same-ID retry that wins the lifecycle
+			// lock right after this RPC returns must see Error — a lingering
+			// Running/Unverified corpse would route it into re-verifying a
+			// stopped VM instead of relaunching.
+			inst.mu.Lock()
+			inst.Status = StatusError
+			inst.mu.Unlock()
+		}
+		go func() {
+			defer sentrylog.Recover("restore-error-persist")
+			<-persistDone
+			// The identity check and the Error write must be atomic against
+			// a same-ID retry, which serializes on the lifecycle lock: held
+			// here, the map entry cannot be replaced between check and
+			// write (only DestroyVM bypasses the lock, and its record
+			// delete makes setStatus a no-op — the safe direction).
+			unlock, lockErr := m.lockVMOp(context.Background(), vmID)
+			if lockErr != nil {
+				return
+			}
+			defer unlock()
+			m.mu.RLock()
+			cur, tracked := m.vms[vmID]
+			m.mu.RUnlock()
+			if !tracked {
+				m.deleteState(vmID)
+				return
+			}
+			if cur != inst {
+				// A same-ID retry replaced the entry while the persist was
+				// blocked. The stale optimistic write joined above may have
+				// landed AFTER the replacement's own durable write, leaving
+				// this torn-down instance as the last BoltDB value — a vmd
+				// restart would reattach stale PID/network state. Repair by
+				// re-persisting the replacement: it is stable under the
+				// lifecycle lock held here (a live retry would still hold
+				// it), and this write lands after the stale one by
+				// construction.
+				m.persistState(cur)
+			} else {
+				m.setStatus(vmID, StatusError)
+			}
+			// DestroyVM bypasses the lifecycle lock, so its record delete
+			// can interleave anywhere around EITHER write above and be
+			// resurrected by it. Converge by compensation: if the VM is
+			// gone now, delete what we may have just written; a destroy
+			// landing after this check deletes it itself. Every
+			// interleaving ends with the record absent. (Under the held
+			// lifecycle lock a destroy is the only possible map mutation,
+			// so an untracked entry here can mean nothing else.)
+			m.mu.RLock()
+			_, still := m.vms[vmID]
+			m.mu.RUnlock()
+			if !still {
+				m.deleteState(vmID)
+			}
+		}()
 		if !stillTracked {
 			// The destroy owns the teardown; report it as such, like every
 			// sibling destroy-race path. A generic error here reads as
 			// transient and the control plane retries a destroyed sandbox.
-			m.deleteState(vmID)
 			return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 		}
-		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
 	tBoxdReady := time.Now()
@@ -4865,7 +4974,7 @@ func isLeafName(s string) bool {
 // isReservedRunDirName reports whether name is a shared dir under RunDir
 // (template mount target, build tree) rather than a per-VM dir.
 func isReservedRunDirName(name string) bool {
-	return name == templateDirName || name == TemplatesDirName
+	return name == templateDirName || name == TemplatesDirName || name == stallForensicsDirName
 }
 
 // abortResumeLocked reverts a freshly-resumed VM back to Paused when a
@@ -4898,11 +5007,15 @@ func (m *Manager) abortResumeLocked(vmID string) {
 	inst.DirtyTracked = false // FC process stopped; a fresh resume re-arms tracking.
 	inst.PausedAt = time.Now()
 	inst.mu.Unlock()
-	// Conditional: a concurrent destroy may have deleted the record; it owns
-	// the teardown then, and an unconditional write would resurrect a
-	// destroyed VM's record.
-	// Best-effort: an undurable revert is re-derived by the reconciler.
-	_, _ = m.persistStateIfPresent(inst)
+	// Durable convergence is deferred: the write is unbounded fsync work
+	// and this runs on reply paths whose deadline reserve covers only the
+	// bounded stop. In-memory Paused above is what a same-ID retry reads.
+	// The worker carries the standard protections: the lifecycle lock
+	// serializes it against retries, a replacement's record is repaired
+	// rather than clobbered by our stale instance, and the lock-bypassing
+	// destroy is compensated after the write (an undurable revert is also
+	// re-derived by the reconciler).
+	m.deferStatePersist("resume-abort-persist", vmID, inst, true)
 }
 
 // releaseFailedRestore frees a failed restore's network slot and rundir —
@@ -4926,6 +5039,13 @@ func (m *Manager) releaseFailedRestore(vmID string, inPlace, tapBusy bool, clean
 			inst.mu.Lock()
 			inst.TeardownPending = "restore failed; cgroup process not proven dead; rundir and network retained; reconciler owns stop and release"
 			inst.mu.Unlock()
+			// SYNCHRONOUS on purpose, unlike this path's other durable
+			// writes: the marker is crash-safety-critical (pinned by test).
+			// A crash before it lands would lose the "reconciler owns stop
+			// and release" instruction while a possibly-live Firecracker
+			// still holds the tap and rundir. This branch fires only when a
+			// cgroup is provably live or unprovable — rare enough that the
+			// verdict reserve yields to resource safety here.
 			_, _ = m.persistStateIfPresent(inst)
 		}
 		return
@@ -5514,6 +5634,272 @@ func waitForSocketConnectable(path string, deadline time.Time) error {
 	}
 }
 
+// psiSample caches the three PSI gauges: avg10 moves on a ten-second
+// window, so re-reading /proc on every semaphore-held restore buys nothing.
+// A burst of restores shares one refresh; a lone restore pays at most three
+// small /proc reads every cache period.
+type psiSample struct {
+	at            time.Time
+	cpu, mem, io1 float64
+}
+
+var (
+	psiCache      atomic.Pointer[psiSample]
+	psiRefreshing atomic.Bool
+)
+
+func cachedPSI() (cpu, mem, io1 float64) {
+	p := psiCache.Load()
+	if p != nil && time.Since(p.at) < 2*time.Second {
+		return p.cpu, p.mem, p.io1
+	}
+	// Exactly one caller refreshes; a concurrent burst on an expired cache
+	// serves the stale sample instead of stacking /proc reads on the
+	// semaphore-held path (avg10 moves on a ten-second window — staleness
+	// is immaterial, per-restore syscalls are not).
+	if !psiRefreshing.CompareAndSwap(false, true) {
+		if p != nil {
+			return p.cpu, p.mem, p.io1
+		}
+		return -1, -1, -1
+	}
+	defer psiRefreshing.Store(false)
+	s := &psiSample{
+		at:  time.Now(),
+		cpu: psiSomeAvg10("/proc/pressure/cpu"),
+		mem: psiSomeAvg10("/proc/pressure/memory"),
+		io1: psiSomeAvg10("/proc/pressure/io"),
+	}
+	psiCache.Store(s)
+	return s.cpu, s.mem, s.io1
+}
+
+// tailFile returns up to n trailing bytes of the file and its total size.
+func tailFile(path string, n int64) (string, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	off := st.Size() - n
+	if off < 0 {
+		off = 0
+	}
+	buf := make([]byte, st.Size()-off)
+	if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+		return "", st.Size(), err
+	}
+	return string(buf), st.Size(), nil
+}
+
+// stallJournalSem bounds concurrent journalctl fallbacks: a mass stall of
+// unit-supervised restores must not spawn hundreds of five-second processes
+// on an already pressured host. Saturated captures are skipped, not queued —
+// the first few consoles tell a burst's story, and the journal keeps the
+// rest for manual inspection.
+var stallJournalSem = make(chan struct{}, 2)
+
+// deferStatePersist converges an instance's durable record OFF the reply
+// path — persistence is unbounded fsync work and BoltDB is slow under
+// exactly the pressure that puts these paths in play. The in-memory state
+// must already be correct before calling (that is what concurrent readers
+// and same-ID retries see). The worker carries the standard protections:
+// the lifecycle lock serializes it against retries, a replacement's record
+// is repaired rather than clobbered by the stale instance, and the
+// lock-bypassing destroy is compensated after the write.
+func (m *Manager) deferStatePersist(scope, vmID string, inst *VMInstance, ifPresent bool) {
+	go func() {
+		defer sentrylog.Recover(scope)
+		unlock, lockErr := m.lockVMOp(context.Background(), vmID)
+		if lockErr != nil {
+			return
+		}
+		defer unlock()
+		m.mu.RLock()
+		cur, tracked := m.vms[vmID]
+		m.mu.RUnlock()
+		if !tracked {
+			return // the destroy owns teardown; nothing to write
+		}
+		if cur != inst {
+			m.persistState(cur)
+		} else if ifPresent {
+			_, _ = m.persistStateIfPresent(inst)
+		} else {
+			m.persistState(inst)
+		}
+		m.mu.RLock()
+		_, still := m.vms[vmID]
+		m.mu.RUnlock()
+		if !still {
+			m.deleteState(vmID)
+		}
+	}()
+}
+
+// bootVerdictReserve is the deadline slice reserved for a boot's WORST-CASE
+// error path so the definitive verdict still returns in-band: the 10s
+// bounded unit stop, the 2s surviving-unit resolve, and a reply margin.
+// Shared by the restore readiness clamp and the resume readiness clamp —
+// both gates tear down on timeout before replying.
+const bootVerdictReserve = 13 * time.Second
+
+// stallForensicsDirName holds quarantined consoles from readiness-timeout
+// teardowns, inside RunDir (dot-prefixed so it can never collide with a VM
+// id). Files are root-only: guest serial is tenant-controlled data and must
+// not reach service logs or wider-readable paths.
+const stallForensicsDirName = ".stall-forensics"
+
+// stallForensicsKeep caps the quarantine so a stall storm cannot grow it
+// unbounded; oldest are dropped first (names sort by capture time).
+const stallForensicsKeep = 20
+
+// summarizeConsoleTail classifies console lines without exposing content:
+// Firecracker's own lines (timestamp + [vmid:fc_*] prefix), boxd's lines,
+// and anything else — which can only be guest output. That split answers
+// the diagnostic question by itself: zero guest/boxd lines means the guest
+// stalled before its first output (the resume/page-fault window), while
+// boxd lines mean it reached userspace.
+func summarizeConsoleTail(tail string) (fcLines, boxdLines, guestLines int, panicked bool) {
+	for _, line := range strings.Split(tail, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "[boxd]"):
+			boxdLines++
+		case strings.Contains(line, ":fc_") && strings.HasPrefix(line, "20"):
+			fcLines++
+		default:
+			guestLines++
+		}
+	}
+	panicked = strings.Contains(tail, "Kernel panic")
+	return
+}
+
+// captureStallForensics records a content-free summary of a VM's console
+// after the guest failed to become ready, and quarantines the raw file
+// (root-only, capped) for operator inspection — the failure teardown would
+// otherwise delete the only evidence. An empty console is itself the
+// strongest signal: the guest stalled before its first line.
+//
+// Only the console-file rename runs synchronously (microseconds, and it must
+// beat the teardown's rundir delete). The unit-supervised fallback shells to
+// journalctl, so it runs detached: the journal survives the teardown on its
+// own, and the reply path must not spend its in-band-verdict margin on it.
+func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launchedAt time.Time) {
+	failedAt := time.Now()
+	src := filepath.Join(m.cfg.RunDir, vmID, "console.log")
+	// The ONLY work that must beat the teardown's rundir delete is moving
+	// the file out (direct-spawn mode; unit mode has no file, and its
+	// journal survives on its own). Everything else — read, summary,
+	// chmod, pruning, the journald fallback — runs detached, so the
+	// verdict reserve is never spent on forensics.
+	dir := filepath.Join(m.cfg.RunDir, stallForensicsDirName)
+	dst := filepath.Join(dir, fmt.Sprintf("%d-%s.console.log", failedAt.Unix(), vmID))
+	renamed := m.forensicsOK && os.Rename(src, dst) == nil // dir pre-created and secured at startup
+	go func() {
+		defer sentrylog.Recover("stall-forensics")
+		if renamed {
+			_ = os.Chmod(dst, 0o600)
+			tail, size, err := tailFile(dst, 4096)
+			if err != nil {
+				m.log.Warn().Str("vm_id", vmID).Err(err).
+					Msg("guest not ready — quarantined console unreadable")
+			} else {
+				m.logStallSummary(vmID, waited, tail, size, dst)
+			}
+			pruneOldest(dir, stallForensicsKeep)
+			return
+		}
+		select {
+		case stallJournalSem <- struct{}{}:
+			defer func() { <-stallJournalSem }()
+		default:
+			m.log.Warn().Str("vm_id", vmID).
+				Msg("guest not ready — journal forensics skipped (concurrent captures saturated)")
+			return
+		}
+		jctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// --since/--until bound the sample to THIS launch: -u alone would
+		// mix in a prior invocation of the same unit name, and this
+		// detached read can also outlive the teardown into a same-ID
+		// retry whose newer lines -n would otherwise select. Microsecond
+		// stamps, since whole-second flooring could drop the failure
+		// second's own tail.
+		unit := systemdUnitName(vmID)
+		args := []string{"-u", unit,
+			"--since", journalStamp(launchedAt),
+			"--until", journalStamp(failedAt),
+			"-n", "60", "--no-pager", "-o", "cat"}
+		// Best-effort invocation pinning on top of the time bounds: the
+		// window can straddle a unit REPLACEMENT (a lingering same-ID unit
+		// restarted into this launch), whose tail time alone would admit.
+		// The lookup races both the teardown (unit unloaded → empty id)
+		// and a same-ID retry (id belongs to the NEW launch, whose entries
+		// the --until bound excludes → empty result). Both races degrade
+		// to the time-bounded query below instead of losing the summary.
+		pinned := false
+		if idOut, idErr := exec.CommandContext(jctx, "systemctl", "show", "-p", "InvocationID", "--value", unit).Output(); idErr == nil {
+			if id := strings.TrimSpace(string(idOut)); id != "" {
+				args = append(args, "_SYSTEMD_INVOCATION_ID="+id)
+				pinned = true
+			}
+		}
+		out, jErr := exec.CommandContext(jctx, "journalctl", args...).Output()
+		if pinned && jErr == nil && len(out) == 0 {
+			out, jErr = exec.CommandContext(jctx, "journalctl", args[:len(args)-1]...).Output()
+		}
+		if jErr != nil || len(out) == 0 {
+			m.log.Warn().Str("vm_id", vmID).AnErr("journal_err", jErr).
+				Msg("guest not ready — console unavailable for forensics")
+			return
+		}
+		m.logStallSummary(vmID, waited, string(out), int64(len(out)), "journald")
+	}()
+}
+
+func (m *Manager) logStallSummary(vmID string, waited time.Duration, tail string, size int64, preserved string) {
+	fcLines, boxdLines, guestLines, panicked := summarizeConsoleTail(tail)
+	m.log.Warn().Str("vm_id", vmID).
+		Int64("wait_boxd_ms", waited.Milliseconds()).
+		Int64("console_bytes", size).
+		Int("console_fc_lines", fcLines).
+		Int("console_boxd_lines", boxdLines).
+		Int("console_guest_lines", guestLines).
+		Bool("console_panic", panicked).
+		Str("console_preserved", preserved).
+		Msg("guest not ready within the readiness window — tearing down")
+}
+
+// journalStamp renders a journalctl @-timestamp with microsecond precision.
+func journalStamp(t time.Time) string {
+	return fmt.Sprintf("@%d.%06d", t.Unix(), t.Nanosecond()/1000)
+}
+
+// pruneOldest keeps at most keep entries in dir, dropping the oldest by
+// name (names begin with the capture unix time).
+func pruneOldest(dir string, keep int) {
+	ents, err := os.ReadDir(dir)
+	if err != nil || len(ents) <= keep {
+		return
+	}
+	names := make([]string, 0, len(ents))
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	for _, n := range names[:len(names)-keep] {
+		_ = os.Remove(filepath.Join(dir, n))
+	}
+}
+
 // boxdHealthProbe is the /health poll behind waitForBoxd; a var so tests can
 // drive the readiness gate without a live guest.
 var boxdHealthProbe = waitForHTTPHealth
@@ -5540,7 +5926,19 @@ const boxdResumeReadyBudget = 30 * time.Second
 // snapshot so the retry does a clean fresh restore. Caller holds the VM's
 // lifecycle lock (abort mutates the record).
 func (m *Manager) resumeReadyOrAbort(callerCtx context.Context, vmID, ip string) error {
-	if err := m.waitForBoxd(context.WithoutCancel(callerCtx), ip, boxdResumeReadyBudget); err != nil {
+	// Detached from caller CANCELLATION on purpose (a disconnect must not
+	// abort a healthy resume mid-probe) — but clamped to the caller's
+	// DEADLINE like the restore gate: the abort below is bounded teardown
+	// plus persistence, and the definitive verdict must return in-band
+	// rather than losing the race to the client deadline and triggering a
+	// transient retry against the still-held lifecycle lock.
+	budget := boxdResumeReadyBudget
+	if dl, ok := callerCtx.Deadline(); ok {
+		if remaining := time.Until(dl) - bootVerdictReserve; remaining < budget {
+			budget = remaining
+		}
+	}
+	if err := m.waitForBoxd(context.WithoutCancel(callerCtx), ip, budget); err != nil {
 		m.abortResumeLocked(vmID)
 		return err
 	}
