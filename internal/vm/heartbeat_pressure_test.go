@@ -1052,3 +1052,37 @@ func TestPressureReadyReopensAfterPredecessorBuildUnitExits(t *testing.T) {
 		t.Fatalf("pending units = %d after confirmed exit, want 0", left)
 	}
 }
+
+// Completion is generation-bound like the allocation release: a replaced
+// worker's result must never become the replacement build's terminal
+// state (which the replacement's own worker could then never overwrite).
+func TestCompleteBuildDropsReplacedWorkerResult(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, builds: map[string]*buildRecord{}}
+	recOld, err := m.registerBuild("build-x", "tpl", 1, 1024, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.setBuildStatus("build-x", BuildStatusCancelled) {
+		t.Fatal("cancel failed")
+	}
+	recNew, err := m.registerBuild("build-x", "tpl", 1, 1024, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The old worker finishes late: its completion must be dropped.
+	m.completeBuild("build-x", recOld, nil, os.ErrDeadlineExceeded)
+	m.buildsMu.RLock()
+	status := m.builds["build-x"].Status
+	m.buildsMu.RUnlock()
+	if status.IsTerminal() {
+		t.Fatalf("replacement build terminated by the replaced worker's result (status %s)", status)
+	}
+	// The replacement's own completion lands normally.
+	m.completeBuild("build-x", recNew, &BuildTemplateResult{}, nil)
+	m.buildsMu.RLock()
+	status = m.builds["build-x"].Status
+	m.buildsMu.RUnlock()
+	if status != BuildStatusReady {
+		t.Fatalf("replacement's own completion did not land (status %s)", status)
+	}
+}

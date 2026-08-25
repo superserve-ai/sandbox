@@ -110,7 +110,7 @@ func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req
 	defer m.buildPressureCount.Add(-1)
 	defer m.releaseBuildAlloc(rec, req.VCPU, req.MemoryMiB)
 	result, err := m.buildTemplateSync(ctx, buildVMID, req, rec)
-	m.completeBuild(buildVMID, result, err)
+	m.completeBuild(buildVMID, rec, result, err)
 }
 
 // buildTemplateSync delegates the build to the template-builder subprocess.

@@ -160,11 +160,22 @@ func (m *Manager) setBuildStatus(buildVMID string, newStatus BuildStatus) bool {
 // or to failed with the error. Idempotent: if the record is already
 // terminal (e.g. cancelled before snapshot finished), the earlier terminal
 // status wins and this call is a no-op.
-func (m *Manager) completeBuild(buildVMID string, result *BuildTemplateResult, buildErr error) {
+func (m *Manager) completeBuild(buildVMID string, worker *buildRecord, result *BuildTemplateResult, buildErr error) {
 	m.buildsMu.Lock()
 	rec, ok := m.builds[buildVMID]
 	if !ok {
 		m.buildsMu.Unlock()
+		return
+	}
+	if rec != worker {
+		// The id was re-registered while this worker ran (a cancelled
+		// build retried before its worker exited): this completion
+		// belongs to the REPLACED generation, and publishing it would
+		// stamp the old result onto the new build's record as a frozen
+		// terminal state the new worker could never overwrite.
+		m.buildsMu.Unlock()
+		m.log.Warn().Str("build_vm_id", buildVMID).
+			Msg("dropping completion from a replaced build worker")
 		return
 	}
 	if rec.Status.IsTerminal() {
