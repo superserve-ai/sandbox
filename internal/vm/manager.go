@@ -5669,6 +5669,13 @@ func tailFile(path string, n int64) (string, int64, error) {
 	return string(buf), st.Size(), nil
 }
 
+// stallJournalSem bounds concurrent journalctl fallbacks: a mass stall of
+// unit-supervised restores must not spawn hundreds of five-second processes
+// on an already pressured host. Saturated captures are skipped, not queued —
+// the first few consoles tell a burst's story, and the journal keeps the
+// rest for manual inspection.
+var stallJournalSem = make(chan struct{}, 2)
+
 // bootVerdictReserve is the deadline slice reserved for a boot's WORST-CASE
 // error path so the definitive verdict still returns in-band: the 10s
 // bounded unit stop, the 2s surviving-unit resolve, and a reply margin.
@@ -5743,6 +5750,14 @@ func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launc
 				m.logStallSummary(vmID, waited, tail, size, dst)
 			}
 			pruneOldest(dir, stallForensicsKeep)
+			return
+		}
+		select {
+		case stallJournalSem <- struct{}{}:
+			defer func() { <-stallJournalSem }()
+		default:
+			m.log.Warn().Str("vm_id", vmID).
+				Msg("guest not ready — journal forensics skipped (concurrent captures saturated)")
 			return
 		}
 		jctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
