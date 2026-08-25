@@ -13,6 +13,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,10 +49,20 @@ type fakeStripeClient struct {
 
 type thinEventStripeClient struct {
 	*fakeStripeClient
-	retrieved json.RawMessage
+	retrieved         json.RawMessage
+	retrieveCalls     int
+	retrieveErrOnCall int
+	retrieveErr       error
 }
 
 func (f *thinEventStripeClient) RetrieveEvent(context.Context, string) (json.RawMessage, error) {
+	f.retrieveCalls++
+	if f.retrieveErrOnCall > 0 && f.retrieveCalls >= f.retrieveErrOnCall {
+		if f.retrieveErr != nil {
+			return nil, f.retrieveErr
+		}
+		return nil, errors.New("Stripe event retrieval failed")
+	}
 	return f.retrieved, nil
 }
 
@@ -251,6 +262,48 @@ func stripeSubscriptionWebhookPayload(t *testing.T, eventID, eventType, subscrip
 	return payload
 }
 
+func stripeCheckoutWebhookPayload(t *testing.T, eventID, clientReferenceID, customerID, subscriptionID string, created time.Time) []byte {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"id":      eventID,
+		"type":    "checkout.session.completed",
+		"created": created.Unix(),
+		"data": map[string]any{
+			"object": map[string]any{
+				"id":                  "cs_" + eventID,
+				"customer":            customerID,
+				"subscription":        subscriptionID,
+				"client_reference_id": clientReferenceID,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal checkout webhook payload: %v", err)
+	}
+	return payload
+}
+
+func stripeInvoiceWebhookPayload(t *testing.T, eventID, eventType, customerID, subscriptionID, status string, created time.Time) []byte {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"id":      eventID,
+		"type":    eventType,
+		"created": created.Unix(),
+		"data": map[string]any{
+			"object": map[string]any{
+				"id":           "in_" + eventID,
+				"customer":     customerID,
+				"subscription": subscriptionID,
+				"status":       status,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal invoice webhook payload: %v", err)
+	}
+	return payload
+}
+
 func doRequest(r *gin.Engine, req *http.Request) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -271,6 +324,32 @@ func exportAttemptCount(t *testing.T, teamID uuid.UUID, status string) int {
 	return n
 }
 
+func billingUsageExportRowCount(t *testing.T, teamID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT COUNT(*)
+		FROM billing_usage_export
+		WHERE team_id = $1
+	`, teamID).Scan(&n); err != nil {
+		t.Fatalf("count billing usage export rows: %v", err)
+	}
+	return n
+}
+
+func teamBillingAccountRowCount(t *testing.T, teamID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT COUNT(*)
+		FROM team_billing_account
+		WHERE team_id = $1
+	`, teamID).Scan(&n); err != nil {
+		t.Fatalf("count billing account rows: %v", err)
+	}
+	return n
+}
+
 func billingPeriodStatus(t *testing.T, teamID uuid.UUID, periodStart, periodEnd time.Time) string {
 	t.Helper()
 	var status string
@@ -282,6 +361,32 @@ func billingPeriodStatus(t *testing.T, teamID uuid.UUID, periodStart, periodEnd 
 		t.Fatalf("read billing period status: %v", err)
 	}
 	return status
+}
+
+func billingPeriodRowCount(t *testing.T, teamID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT COUNT(*)
+		FROM team_billing_period
+		WHERE team_id = $1
+	`, teamID).Scan(&n); err != nil {
+		t.Fatalf("count billing period rows: %v", err)
+	}
+	return n
+}
+
+func teamCreditGrantRowCount(t *testing.T, teamID uuid.UUID) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT COUNT(*)
+		FROM team_credit_grant
+		WHERE team_id = $1
+	`, teamID).Scan(&n); err != nil {
+		t.Fatalf("count credit grant rows: %v", err)
+	}
+	return n
 }
 
 func teamBillingUsageExportedAtValid(t *testing.T, teamID uuid.UUID, periodStart, periodEnd time.Time) bool {
@@ -933,6 +1038,505 @@ func TestIntegration_StripeWebhookDuplicateDeliveryIsSafe(t *testing.T) {
 	}
 }
 
+func TestIntegration_StripeWebhookIgnoresForeignOwnedEvents(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, periodStart, periodEnd := seedBillingPeriodForStripe(t, true, true)
+	before, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load billing account before foreign webhooks: %v", err)
+	}
+	beforeUsageExports, err := testQueries.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("load billing usage exports before foreign webhooks: %v", err)
+	}
+	beforeBillingPeriod, err := testQueries.GetTeamBillingPeriod(ctx, db.GetTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("load billing period before foreign webhooks: %v", err)
+	}
+	beforeCreditGrants, err := testQueries.ListTeamCreditGrants(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load credit grants before foreign webhooks: %v", err)
+	}
+	r := newBillingRouter(t, &fakeStripeClient{})
+	createdAt := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	foreignTeamID := uuid.New()
+	foreignCustomerID := "cus_" + foreignTeamID.String()
+	if _, err := testQueries.GetTeamBillingAccountByStripeCustomerID(ctx, &foreignCustomerID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("foreign Stripe customer should be absent before webhook delivery, got err=%v", err)
+	}
+	beforeForeignAccounts := teamBillingAccountRowCount(t, foreignTeamID)
+	beforeForeignUsageExports := billingUsageExportRowCount(t, foreignTeamID)
+	beforeForeignBillingPeriods := billingPeriodRowCount(t, foreignTeamID)
+	beforeForeignCreditGrants := teamCreditGrantRowCount(t, foreignTeamID)
+	assertForeignStateUnchanged := func(label string) {
+		t.Helper()
+		if got := teamBillingAccountRowCount(t, foreignTeamID); got != beforeForeignAccounts {
+			t.Fatalf("%s: foreign team_billing_account row count changed from %d to %d", label, beforeForeignAccounts, got)
+		}
+		if got := billingUsageExportRowCount(t, foreignTeamID); got != beforeForeignUsageExports {
+			t.Fatalf("%s: foreign billing_usage_export row count changed from %d to %d", label, beforeForeignUsageExports, got)
+		}
+		if got := billingPeriodRowCount(t, foreignTeamID); got != beforeForeignBillingPeriods {
+			t.Fatalf("%s: foreign team_billing_period row count changed from %d to %d", label, beforeForeignBillingPeriods, got)
+		}
+		if got := teamCreditGrantRowCount(t, foreignTeamID); got != beforeForeignCreditGrants {
+			t.Fatalf("%s: foreign team_credit_grant row count changed from %d to %d", label, beforeForeignCreditGrants, got)
+		}
+		if _, err := testQueries.GetTeamBillingAccountByStripeCustomerID(ctx, &foreignCustomerID); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("%s: foreign Stripe customer should remain absent after webhook delivery, got err=%v", label, err)
+		}
+	}
+
+	cases := []struct {
+		name    string
+		payload []byte
+	}{
+		{
+			name:    "checkout",
+			payload: stripeCheckoutWebhookPayload(t, "evt_foreign_checkout", foreignTeamID.String(), foreignCustomerID, "sub_foreign_checkout", createdAt),
+		},
+		{
+			name:    "subscription-created",
+			payload: stripeSubscriptionWebhookPayload(t, "evt_foreign_subscription_created", "customer.subscription.created", "sub_foreign_subscription_created", foreignCustomerID, "active", createdAt, createdAt, createdAt.Add(time.Hour)),
+		},
+		{
+			name:    "subscription-updated",
+			payload: stripeSubscriptionWebhookPayload(t, "evt_foreign_subscription_updated", "customer.subscription.updated", "sub_foreign_subscription_updated", foreignCustomerID, "active", createdAt, createdAt, createdAt.Add(time.Hour)),
+		},
+		{
+			name:    "subscription-deleted",
+			payload: stripeSubscriptionWebhookPayload(t, "evt_foreign_subscription_deleted", "customer.subscription.deleted", "sub_foreign_subscription_deleted", foreignCustomerID, "canceled", createdAt, createdAt, createdAt.Add(time.Hour)),
+		},
+		{
+			name:    "invoice-finalized",
+			payload: stripeInvoiceWebhookPayload(t, "evt_foreign_invoice_finalized", "invoice.finalized", foreignCustomerID, "sub_foreign_invoice_finalized", "open", createdAt),
+		},
+		{
+			name:    "invoice-failed",
+			payload: stripeInvoiceWebhookPayload(t, "evt_foreign_invoice_failed", "invoice.payment_failed", foreignCustomerID, "sub_foreign_invoice_failed", "open", createdAt),
+		},
+		{
+			name:    "invoice-paid",
+			payload: stripeInvoiceWebhookPayload(t, "evt_foreign_invoice_paid", "invoice.payment_succeeded", foreignCustomerID, "sub_foreign_invoice_paid", "paid", createdAt),
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(tc.payload)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Stripe-Signature", stripeSignature(t, tc.payload, time.Now().UTC()))
+			w := doRequest(r, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("foreign %s webhook: expected 200, got %d: %s", tc.name, w.Code, w.Body.String())
+			}
+			assertForeignStateUnchanged(tc.name)
+		})
+	}
+
+	after, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load billing account after foreign webhooks: %v", err)
+	}
+	if derefString(after.StripeCustomerID) != derefString(before.StripeCustomerID) {
+		t.Fatalf("stripe customer id changed from %q to %q", derefString(before.StripeCustomerID), derefString(after.StripeCustomerID))
+	}
+	if derefString(after.StripeSubscriptionID) != derefString(before.StripeSubscriptionID) {
+		t.Fatalf("stripe subscription id changed from %q to %q", derefString(before.StripeSubscriptionID), derefString(after.StripeSubscriptionID))
+	}
+	if derefString(after.StripeSubscriptionStatus) != derefString(before.StripeSubscriptionStatus) {
+		t.Fatalf("stripe subscription status changed from %q to %q", derefString(before.StripeSubscriptionStatus), derefString(after.StripeSubscriptionStatus))
+	}
+	if derefString(after.StripeInvoiceStatus) != derefString(before.StripeInvoiceStatus) {
+		t.Fatalf("stripe invoice status changed from %q to %q", derefString(before.StripeInvoiceStatus), derefString(after.StripeInvoiceStatus))
+	}
+	if after.StripeSubscriptionEventAt.Valid != before.StripeSubscriptionEventAt.Valid || (after.StripeSubscriptionEventAt.Valid && !after.StripeSubscriptionEventAt.Time.Equal(before.StripeSubscriptionEventAt.Time)) {
+		t.Fatalf("subscription event at changed from %v to %v", before.StripeSubscriptionEventAt, after.StripeSubscriptionEventAt)
+	}
+	if after.CurrentPeriodStart.Valid != before.CurrentPeriodStart.Valid || (after.CurrentPeriodStart.Valid && !after.CurrentPeriodStart.Time.Equal(before.CurrentPeriodStart.Time)) {
+		t.Fatalf("current period start changed from %v to %v", before.CurrentPeriodStart, after.CurrentPeriodStart)
+	}
+	if after.CurrentPeriodEnd.Valid != before.CurrentPeriodEnd.Valid || (after.CurrentPeriodEnd.Valid && !after.CurrentPeriodEnd.Time.Equal(before.CurrentPeriodEnd.Time)) {
+		t.Fatalf("current period end changed from %v to %v", before.CurrentPeriodEnd, after.CurrentPeriodEnd)
+	}
+	if after.CancelAtPeriodEnd != before.CancelAtPeriodEnd {
+		t.Fatalf("cancel_at_period_end changed from %v to %v", before.CancelAtPeriodEnd, after.CancelAtPeriodEnd)
+	}
+	if after.StripeActivationCreditGrantedAt.Valid != before.StripeActivationCreditGrantedAt.Valid || (after.StripeActivationCreditGrantedAt.Valid && !after.StripeActivationCreditGrantedAt.Time.Equal(before.StripeActivationCreditGrantedAt.Time)) {
+		t.Fatalf("stripe activation credit grant timestamp changed from %v to %v", before.StripeActivationCreditGrantedAt, after.StripeActivationCreditGrantedAt)
+	}
+	if derefString(after.StripeActivationCreditGrantID) != derefString(before.StripeActivationCreditGrantID) {
+		t.Fatalf("stripe activation credit grant id changed from %q to %q", derefString(before.StripeActivationCreditGrantID), derefString(after.StripeActivationCreditGrantID))
+	}
+	afterUsageExports, err := testQueries.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("load billing usage exports after foreign webhooks: %v", err)
+	}
+	if !reflect.DeepEqual(afterUsageExports, beforeUsageExports) {
+		t.Fatalf("billing_usage_export rows changed from %#v to %#v", beforeUsageExports, afterUsageExports)
+	}
+	afterBillingPeriod, err := testQueries.GetTeamBillingPeriod(ctx, db.GetTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("load billing period after foreign webhooks: %v", err)
+	}
+	if !reflect.DeepEqual(afterBillingPeriod, beforeBillingPeriod) {
+		t.Fatalf("team_billing_period row changed from %#v to %#v", beforeBillingPeriod, afterBillingPeriod)
+	}
+	afterCreditGrants, err := testQueries.ListTeamCreditGrants(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load credit grants after foreign webhooks: %v", err)
+	}
+	if !reflect.DeepEqual(afterCreditGrants, beforeCreditGrants) {
+		t.Fatalf("team_credit_grant rows changed from %#v to %#v", beforeCreditGrants, afterCreditGrants)
+	}
+	if got := teamBillingAccountRowCount(t, foreignTeamID); got != beforeForeignAccounts {
+		t.Fatalf("foreign team_billing_account row count changed from %d to %d", beforeForeignAccounts, got)
+	}
+	if got := billingUsageExportRowCount(t, foreignTeamID); got != beforeForeignUsageExports {
+		t.Fatalf("foreign billing_usage_export row count changed from %d to %d", beforeForeignUsageExports, got)
+	}
+	if got := billingPeriodRowCount(t, foreignTeamID); got != beforeForeignBillingPeriods {
+		t.Fatalf("foreign team_billing_period row count changed from %d to %d", beforeForeignBillingPeriods, got)
+	}
+	if got := teamCreditGrantRowCount(t, foreignTeamID); got != beforeForeignCreditGrants {
+		t.Fatalf("foreign team_credit_grant row count changed from %d to %d", beforeForeignCreditGrants, got)
+	}
+	if _, err := testQueries.GetTeamBillingAccountByStripeCustomerID(ctx, &foreignCustomerID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("foreign Stripe customer should remain absent after webhook delivery, got err=%v", err)
+	}
+}
+
+func TestIntegration_StripeWebhookPersistsFailureAfterRollback(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
+	r := newBillingRouter(t, &fakeStripeClient{})
+
+	createdAt := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	periodStart := createdAt.Add(2 * time.Hour)
+	periodEnd := createdAt.Add(time.Hour)
+	customerID := "cus_" + teamID.String()
+	payload := stripeSubscriptionWebhookPayload(t, "evt_processing_failure", "customer.subscription.updated", "sub_"+teamID.String(), customerID, "active", createdAt, periodStart, periodEnd)
+	req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC()))
+	w := doRequest(r, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("failing webhook: expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var lastError string
+	var processedAt pgtype.Timestamptz
+	if err := testPool.QueryRow(ctx, `
+		SELECT last_error, processed_at
+		FROM stripe_webhook_event
+		WHERE event_id = $1
+	`, "evt_processing_failure").Scan(&lastError, &processedAt); err != nil {
+		t.Fatalf("load failed webhook row: %v", err)
+	}
+	if !strings.Contains(lastError, "team_billing_account_period_valid") {
+		t.Fatalf("failed webhook last_error = %v, want original constraint failure", lastError)
+	}
+	if processedAt.Valid {
+		t.Fatalf("failed webhook processed_at = %v, want nil", processedAt)
+	}
+}
+
+func TestIntegration_StripeWebhookPersistsFailureAfterProcessedMarkRollback(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
+	r := newBillingRouter(t, &fakeStripeClient{})
+
+	_, err := testPool.Exec(ctx, `
+		CREATE OR REPLACE FUNCTION test_fail_stripe_webhook_mark_processed()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF NEW.processed_at IS DISTINCT FROM OLD.processed_at THEN
+				RAISE EXCEPTION 'forced stripe webhook processed_at update failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+	`)
+	if err != nil {
+		t.Fatalf("create mark-processed failure trigger function: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DROP TRIGGER IF EXISTS test_fail_stripe_webhook_mark_processed_trg ON stripe_webhook_event`)
+		_, _ = testPool.Exec(context.Background(), `DROP FUNCTION IF EXISTS test_fail_stripe_webhook_mark_processed()`)
+	})
+	if _, err := testPool.Exec(ctx, `
+		CREATE TRIGGER test_fail_stripe_webhook_mark_processed_trg
+		BEFORE UPDATE ON stripe_webhook_event
+		FOR EACH ROW
+		EXECUTE FUNCTION test_fail_stripe_webhook_mark_processed()
+	`); err != nil {
+		t.Fatalf("create mark-processed failure trigger: %v", err)
+	}
+
+	createdAt := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	periodStart := createdAt.Add(2 * time.Hour)
+	periodEnd := createdAt.Add(3 * time.Hour)
+	customerID := "cus_" + teamID.String()
+	payload := stripeSubscriptionWebhookPayload(t, "evt_mark_processed_failure", "customer.subscription.updated", "sub_"+teamID.String(), customerID, "active", createdAt, periodStart, periodEnd)
+	req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC()))
+	w := doRequest(r, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("mark-processed failing webhook: expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var lastError string
+	var processedAt pgtype.Timestamptz
+	if err := testPool.QueryRow(ctx, `
+		SELECT last_error, processed_at
+		FROM stripe_webhook_event
+		WHERE event_id = $1
+	`, "evt_mark_processed_failure").Scan(&lastError, &processedAt); err != nil {
+		t.Fatalf("load mark-processed failed webhook row: %v", err)
+	}
+	if !strings.Contains(lastError, "forced stripe webhook processed_at update failure") {
+		t.Fatalf("failed webhook last_error = %v, want original processed_at failure", lastError)
+	}
+	if processedAt.Valid {
+		t.Fatalf("failed webhook processed_at = %v, want nil", processedAt)
+	}
+}
+
+func TestIntegration_StripeWebhookPersistsFailureAfterCommitRollback(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
+	r := newBillingRouter(t, &fakeStripeClient{})
+
+	_, err := testPool.Exec(ctx, `
+		CREATE OR REPLACE FUNCTION test_fail_stripe_webhook_commit()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF NEW.event_id = 'evt_commit_failure' AND NEW.processed_at IS DISTINCT FROM OLD.processed_at THEN
+				RAISE EXCEPTION 'forced stripe webhook commit failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+	`)
+	if err != nil {
+		t.Fatalf("create commit failure trigger function: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DROP TRIGGER IF EXISTS test_fail_stripe_webhook_commit_trg ON stripe_webhook_event`)
+		_, _ = testPool.Exec(context.Background(), `DROP FUNCTION IF EXISTS test_fail_stripe_webhook_commit()`)
+	})
+	if _, err := testPool.Exec(ctx, `
+		CREATE CONSTRAINT TRIGGER test_fail_stripe_webhook_commit_trg
+		AFTER UPDATE ON stripe_webhook_event
+		DEFERRABLE INITIALLY DEFERRED
+		FOR EACH ROW
+		EXECUTE FUNCTION test_fail_stripe_webhook_commit()
+	`); err != nil {
+		t.Fatalf("create commit failure trigger: %v", err)
+	}
+
+	createdAt := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	periodStart := createdAt.Add(2 * time.Hour)
+	periodEnd := createdAt.Add(3 * time.Hour)
+	customerID := "cus_" + teamID.String()
+	payload := stripeSubscriptionWebhookPayload(t, "evt_commit_failure", "customer.subscription.updated", "sub_"+teamID.String(), customerID, "active", createdAt, periodStart, periodEnd)
+	req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC()))
+	w := doRequest(r, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("commit failing webhook: expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var lastError string
+	var processedAt pgtype.Timestamptz
+	if err := testPool.QueryRow(ctx, `
+		SELECT last_error, processed_at
+		FROM stripe_webhook_event
+		WHERE event_id = $1
+	`, "evt_commit_failure").Scan(&lastError, &processedAt); err != nil {
+		t.Fatalf("load commit-failed webhook row: %v", err)
+	}
+	if !strings.Contains(lastError, "forced stripe webhook commit failure") {
+		t.Fatalf("failed webhook last_error = %v, want original commit failure", lastError)
+	}
+	if processedAt.Valid {
+		t.Fatalf("failed webhook processed_at = %v, want nil", processedAt)
+	}
+}
+
+func TestIntegration_StripeThinMeterErrorFailsOnMalformedExpansion(t *testing.T) {
+	stripe := &thinEventStripeClient{fakeStripeClient: &fakeStripeClient{}, retrieved: []byte(`{"data":{}}`)}
+	r := newBillingRouter(t, stripe)
+	payload, err := json.Marshal(map[string]any{
+		"id":      "evt_thin_meter_error_invalid",
+		"type":    "v1.billing.meter.error_report_triggered",
+		"created": time.Now().UTC().Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal thin meter error payload: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC(), testStripeMeterErrorWebhookSecret))
+	w := doRequest(r, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("malformed thin meter webhook: expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_StripeThinMeterErrorIgnoresForeignTeam(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, periodStart, periodEnd := seedBillingPeriodForStripe(t, true, true)
+	beforeUsageExports := billingUsageExportRowCount(t, teamID)
+	beforeBillingPeriods := billingPeriodRowCount(t, teamID)
+	beforeCreditGrants := teamCreditGrantRowCount(t, teamID)
+	seedValue := pgtype.Numeric{}
+	if err := seedValue.Scan("0"); err != nil {
+		t.Fatalf("seed billing usage export value: %v", err)
+	}
+	seededExport, err := testQueries.CreateBillingUsageExport(context.Background(), db.CreateBillingUsageExportParams{
+		TeamID:                     teamID,
+		PeriodStart:                periodStart,
+		PeriodEnd:                  periodEnd,
+		ResourceType:               "cpu",
+		StripeCustomerID:           nil,
+		StripeMeterEventIdentifier: "thin-meter-foreign-export-check",
+		StripeIdempotencyKey:       nil,
+		StripeEventName:            "meter_usage_reported",
+		Value:                      seedValue,
+		Status:                     "pending",
+		Error:                      nil,
+		SentAt:                     pgtype.Timestamptz{},
+	})
+	if err != nil {
+		t.Fatalf("seed billing usage export: %v", err)
+	}
+	beforeUsageExports = billingUsageExportRowCount(t, teamID)
+	beforeUsageExportRows, err := testQueries.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("load billing usage exports before foreign webhook: %v", err)
+	}
+	foreignTeamID := uuid.New()
+	beforeForeignAccounts := teamBillingAccountRowCount(t, foreignTeamID)
+	beforeForeignUsageExports := billingUsageExportRowCount(t, foreignTeamID)
+	beforeForeignBillingPeriods := billingPeriodRowCount(t, foreignTeamID)
+	beforeForeignCreditGrants := teamCreditGrantRowCount(t, foreignTeamID)
+	identifier := fmt.Sprintf("team:%s:period:%d,%d:meter:cpu", foreignTeamID.String(), periodStart.Unix(), periodEnd.Unix())
+	fullData, err := json.Marshal(map[string]any{
+		"identifier":                identifier,
+		"developer_message_summary": "foreign meter error",
+	})
+	if err != nil {
+		t.Fatalf("marshal foreign meter error payload: %v", err)
+	}
+	retrieved, err := json.Marshal(map[string]json.RawMessage{"data": fullData})
+	if err != nil {
+		t.Fatalf("marshal foreign meter error retrieval payload: %v", err)
+	}
+	stripe := &thinEventStripeClient{fakeStripeClient: &fakeStripeClient{}, retrieved: retrieved}
+	r := newBillingRouter(t, stripe)
+	payload, err := json.Marshal(map[string]any{
+		"id":      "evt_foreign_meter_error",
+		"type":    "v1.billing.meter.error_report_triggered",
+		"created": time.Now().UTC().Unix(),
+	})
+	if err != nil {
+		t.Fatalf("marshal foreign meter error webhook payload: %v", err)
+	}
+	signedAt := time.Now().UTC()
+	req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", stripeSignature(t, payload, signedAt, testStripeMeterErrorWebhookSecret))
+	w := doRequest(r, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("foreign thin meter webhook: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := billingPeriodStatus(t, teamID, periodStart, periodEnd); got != "approved" {
+		t.Fatalf("foreign thin meter webhook changed local billing period status to %q", got)
+	}
+	afterExport, err := testQueries.GetBillingUsageExportByIdentifier(context.Background(), seededExport.StripeMeterEventIdentifier)
+	if err != nil {
+		t.Fatalf("load seeded billing usage export after foreign webhook: %v", err)
+	}
+	if afterExport.Status != seededExport.Status {
+		t.Fatalf("billing_usage_export status changed from %q to %q", seededExport.Status, afterExport.Status)
+	}
+	if derefString(afterExport.Error) != derefString(seededExport.Error) {
+		t.Fatalf("billing_usage_export error changed from %q to %q", derefString(seededExport.Error), derefString(afterExport.Error))
+	}
+	if afterExport.CreatedAt != seededExport.CreatedAt {
+		t.Fatalf("billing_usage_export created_at changed from %v to %v", seededExport.CreatedAt, afterExport.CreatedAt)
+	}
+	if afterExport.UpdatedAt != seededExport.UpdatedAt {
+		t.Fatalf("billing_usage_export updated_at changed from %v to %v", seededExport.UpdatedAt, afterExport.UpdatedAt)
+	}
+	if afterExport.SentAt.Valid != seededExport.SentAt.Valid || (afterExport.SentAt.Valid && !afterExport.SentAt.Time.Equal(seededExport.SentAt.Time)) {
+		t.Fatalf("billing_usage_export sent_at changed from %v to %v", seededExport.SentAt, afterExport.SentAt)
+	}
+	if derefString(afterExport.StripeIdempotencyKey) != derefString(seededExport.StripeIdempotencyKey) {
+		t.Fatalf("billing_usage_export idempotency key changed from %q to %q", derefString(seededExport.StripeIdempotencyKey), derefString(afterExport.StripeIdempotencyKey))
+	}
+	afterUsageExportRows, err := testQueries.ListBillingUsageExportsForPeriod(context.Background(), db.ListBillingUsageExportsForPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("load billing usage exports after foreign webhook: %v", err)
+	}
+	if !reflect.DeepEqual(afterUsageExportRows, beforeUsageExportRows) {
+		t.Fatalf("billing_usage_export rows changed from %#v to %#v", beforeUsageExportRows, afterUsageExportRows)
+	}
+	if got := billingUsageExportRowCount(t, teamID); got != beforeUsageExports {
+		t.Fatalf("billing_usage_export row count changed from %d to %d", beforeUsageExports, got)
+	}
+	if got := billingPeriodRowCount(t, teamID); got != beforeBillingPeriods {
+		t.Fatalf("team_billing_period row count changed from %d to %d", beforeBillingPeriods, got)
+	}
+	if got := teamCreditGrantRowCount(t, teamID); got != beforeCreditGrants {
+		t.Fatalf("team_credit_grant row count changed from %d to %d", beforeCreditGrants, got)
+	}
+	if got := teamBillingAccountRowCount(t, foreignTeamID); got != beforeForeignAccounts {
+		t.Fatalf("foreign team_billing_account row count changed from %d to %d", beforeForeignAccounts, got)
+	}
+	if got := billingUsageExportRowCount(t, foreignTeamID); got != beforeForeignUsageExports {
+		t.Fatalf("foreign billing_usage_export row count changed from %d to %d", beforeForeignUsageExports, got)
+	}
+	if got := billingPeriodRowCount(t, foreignTeamID); got != beforeForeignBillingPeriods {
+		t.Fatalf("foreign team_billing_period row count changed from %d to %d", beforeForeignBillingPeriods, got)
+	}
+	if got := teamCreditGrantRowCount(t, foreignTeamID); got != beforeForeignCreditGrants {
+		t.Fatalf("foreign team_credit_grant row count changed from %d to %d", beforeForeignCreditGrants, got)
+	}
+}
+
 func TestIntegration_StripeThinMeterErrorReconcilesByIdempotencyKey(t *testing.T) {
 	ctx := context.Background()
 	teamID, periodID, periodStart, periodEnd := seedBillingPeriodForStripe(t, true, true)
@@ -971,6 +1575,13 @@ func TestIntegration_StripeThinMeterErrorReconcilesByIdempotencyKey(t *testing.T
 	if got := exportAttemptCount(t, teamID, "failed"); got == 0 {
 		t.Fatal("thin meter webhook did not mark the matched export failed")
 	}
+	stripe.retrieveErrOnCall = 2
+	dupReq := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+	dupReq.Header.Set("Content-Type", "application/json")
+	dupReq.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC(), testStripeMeterErrorWebhookSecret))
+	if w := doRequest(r, dupReq); w.Code != http.StatusOK {
+		t.Fatalf("duplicate thin meter webhook: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
 	invalidReq := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
 	invalidReq.Header.Set("Content-Type", "application/json")
 	invalidReq.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC(), "whsec_unconfigured"))
@@ -981,7 +1592,27 @@ func TestIntegration_StripeThinMeterErrorReconcilesByIdempotencyKey(t *testing.T
 
 func TestIntegration_StripeWebhookIgnoresForeignOrStaleSubscriptionEvents(t *testing.T) {
 	ctx := context.Background()
-	teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
+	teamID, _, periodStart, periodEnd := seedBillingPeriodForStripe(t, true, true)
+	beforeUsageExports, err := testQueries.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("load billing usage exports before foreign/stale webhooks: %v", err)
+	}
+	beforeBillingPeriod, err := testQueries.GetTeamBillingPeriod(ctx, db.GetTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("load billing period before foreign/stale webhooks: %v", err)
+	}
+	beforeCreditGrants, err := testQueries.ListTeamCreditGrants(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load credit grants before foreign/stale webhooks: %v", err)
+	}
 	r := newBillingRouter(t, &fakeStripeClient{})
 
 	currentCreated := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
@@ -1030,6 +1661,35 @@ func TestIntegration_StripeWebhookIgnoresForeignOrStaleSubscriptionEvents(t *tes
 	}
 	if !account.StripeSubscriptionEventAt.Valid || !account.StripeSubscriptionEventAt.Time.Equal(currentCreated) {
 		t.Fatalf("subscription event at = %v, want %v", account.StripeSubscriptionEventAt, currentCreated)
+	}
+	afterUsageExports, err := testQueries.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("load billing usage exports after foreign/stale webhooks: %v", err)
+	}
+	if !reflect.DeepEqual(afterUsageExports, beforeUsageExports) {
+		t.Fatalf("billing_usage_export rows changed from %#v to %#v", beforeUsageExports, afterUsageExports)
+	}
+	afterBillingPeriod, err := testQueries.GetTeamBillingPeriod(ctx, db.GetTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("load billing period after foreign/stale webhooks: %v", err)
+	}
+	if !reflect.DeepEqual(afterBillingPeriod, beforeBillingPeriod) {
+		t.Fatalf("team_billing_period row changed from %#v to %#v", beforeBillingPeriod, afterBillingPeriod)
+	}
+	afterCreditGrants, err := testQueries.ListTeamCreditGrants(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load credit grants after foreign/stale webhooks: %v", err)
+	}
+	if !reflect.DeepEqual(afterCreditGrants, beforeCreditGrants) {
+		t.Fatalf("team_credit_grant rows changed from %#v to %#v", beforeCreditGrants, afterCreditGrants)
 	}
 }
 
