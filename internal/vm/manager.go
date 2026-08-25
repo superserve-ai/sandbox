@@ -5838,6 +5838,13 @@ func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Durati
 		onLate := func(st *procStallState) {
 			m.log.Warn().Str("vm_id", vmID).Msg("guest not ready — proc capture completed after its budget")
 			m.logStallProcState(vmID, waited, st, dir, failedAt)
+			// This write lands after the forensics goroutine's own prune has
+			// already run, so it must prune for itself or late captures
+			// accumulate outside the cap entirely. Concurrent prunes race
+			// benignly — removing an already-removed entry is a no-op.
+			if m.forensicsOK {
+				pruneOldest(dir, stallForensicsKeep)
+			}
 		}
 		if proc, finished = captureProcStateBounded(pid, vmID, onLate); !finished {
 			m.log.Warn().Str("vm_id", vmID).Int("fc_pid", pid).
