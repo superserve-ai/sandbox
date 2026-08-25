@@ -370,6 +370,21 @@ module "observability" {
     host_id        = local.metrics_host_id
     display_prefix = "Backup / ${local.active_host_name}"
   }
+  # Backup coverage: paused sandboxes with no verified backup at all,
+  # sampled by the control plane from this cell's database. Created
+  # disabled so the policy config is validated and enablement is a
+  # one-field flip once the cell's migration leftovers are classified
+  # and covered. regions lists the host table's region column values in
+  # the shared use-cell database, not GCP region names. The cell's host
+  # rows all read us-east4 today, but this database has served the cell
+  # under us-central1 labeling before the host swap, so the legacy
+  # value stays scoped: host rows relabeled or restored under it must
+  # not fall outside the alert.
+  backup_coverage_alerts = {
+    enabled        = false
+    display_prefix = "Backup coverage / us-east4"
+    regions        = ["us-east4", "us-central1"]
+  }
   # Launch-path health for the same host: the pruned launcher mount namespace
   # being unavailable (VM starts fall back to walking the full host mount
   # table) and live network namespaces accumulating. Both degrade latency

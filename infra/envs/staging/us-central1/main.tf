@@ -377,6 +377,16 @@ module "observability" {
     display_prefix      = "Backup / ${module.sandbox_host.instance_name}"
     alert_disabled_host = false
   }
+  # Backup coverage, same disabled-by-default shape as the production
+  # cells so staging validates the policy config (including the
+  # region-scoped companion condition) before it matters. regions lists
+  # the host table's region column values in this cell's database, not
+  # GCP region names; "us-central1" is the only value present.
+  backup_coverage_alerts = {
+    enabled        = false
+    display_prefix = "Backup coverage / staging"
+    regions        = ["us-central1"]
+  }
   # Root-filesystem (OS disk) utilization, same policies as the production
   # cells so staging validates the query shape first. Module defaults:
   # warn at 85% sustained 30 minutes, page at 95%.
