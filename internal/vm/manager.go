@@ -3768,6 +3768,17 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	}
 
 	inst := toInstance(rec)
+	// The flag is the circuit breaker, so a persisted token must not survive
+	// turning it off: toInstance re-arms optimistically from the record alone
+	// (it is pure, with no view of config). Without this, a host restarted
+	// with the flag off would keep sending guarded pauses — and against a
+	// rolled-back Firecracker that predates guarded snapshots, the unknown
+	// field fails the pause outright instead of degrading to Full, which is
+	// exactly the blast radius the flag exists to close.
+	if !m.cfg.DirtyTrackingSessionEnabled {
+		inst.DirtyTracked = false
+		inst.DirtyTrackingSessionID = ""
+	}
 
 	// Bail early if another caller (a request, or the background pass) already
 	// published this VM.

@@ -2481,6 +2481,54 @@ func TestDirtyTrackingSessionRoundTripAndRearm(t *testing.T) {
 	}
 }
 
+// The session flag is the feature's circuit breaker, so it must also govern
+// the optimistic re-arm on reattach: toInstance re-arms from the record alone
+// (it is pure), and a host restarted with the flag OFF must not keep sending
+// guarded pauses — against a rolled-back Firecracker the unknown field would
+// fail the pause outright instead of degrading to Full.
+func TestReattachRecord_SessionRearmHonorsFeatureGate(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive: not stale
+	defer func() { vmUnitFullyDown = origDown }()
+
+	reattach := func(t *testing.T, flagOn bool) *VMInstance {
+		t.Helper()
+		store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		rec := VMRecord{
+			ID: "vm-1", Status: StatusRunning, Supervision: SupervisionUnit,
+			DirtyTrackingSessionID: "session-a",
+		}
+		if err := store.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{
+			log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+			vms: map[string]*VMInstance{},
+			cfg: ManagerConfig{DirtyTrackingSessionEnabled: flagOn},
+		}
+		inst, ok := m.reattachRecord(context.Background(), rec, true)
+		if inst == nil || !ok {
+			t.Fatalf("a live unit must be adopted, got inst=%+v ok=%v", inst, ok)
+		}
+		return inst
+	}
+
+	on := reattach(t, true)
+	if !on.DirtyTracked || on.DirtyTrackingSessionID != "session-a" {
+		t.Fatalf("flag on: the persisted session must re-arm tracking, got tracked=%v id=%q",
+			on.DirtyTracked, on.DirtyTrackingSessionID)
+	}
+	off := reattach(t, false)
+	if off.DirtyTracked || off.DirtyTrackingSessionID != "" {
+		t.Fatalf("flag off: the persisted session must be ignored, got tracked=%v id=%q",
+			off.DirtyTracked, off.DirtyTrackingSessionID)
+	}
+}
+
 // The ad-hoc snapshot path must not write the record at all: it holds no
 // vm-op lock, so any write races whatever lifecycle op is in flight.
 func TestCreateVMSnapshotDoesNotPersist(t *testing.T) {

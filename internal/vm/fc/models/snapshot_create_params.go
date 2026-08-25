@@ -52,6 +52,10 @@ type SnapshotCreateParams struct {
 func (m *SnapshotCreateParams) Validate(formats strfmt.Registry) error {
 	var res []error
 
+	if err := m.validateExpectedGeneration(formats); err != nil {
+		res = append(res, err)
+	}
+
 	if err := m.validateMemFilePath(formats); err != nil {
 		res = append(res, err)
 	}
@@ -67,6 +71,18 @@ func (m *SnapshotCreateParams) Validate(formats strfmt.Registry) error {
 	if len(res) > 0 {
 		return errors.CompositeValidationError(res...)
 	}
+	return nil
+}
+
+func (m *SnapshotCreateParams) validateExpectedGeneration(formats strfmt.Registry) error {
+	if swag.IsZero(m.ExpectedGeneration) { // not required
+		return nil
+	}
+
+	if err := validate.MinimumInt("expected_generation", "body", *m.ExpectedGeneration, 0, false); err != nil {
+		return err
+	}
+
 	return nil
 }
 
