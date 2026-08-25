@@ -4962,7 +4962,18 @@ func findSurvivingBuilders(builderBin string) ([]builderProc, error) {
 		// would suppress publication for the length of the build.
 		// Orphaned predecessors are reparented away from us, so the
 		// parent pid distinguishes the two.
-		if procPPID(e.Name()) == self {
+		ppid, perr := procPPID(e.Name())
+		if perr != nil {
+			if errors.Is(perr, os.ErrNotExist) {
+				continue // exited between the readdir and here
+			}
+			// Inconclusive: classifying a CURRENT build's freshly
+			// launched builder as a predecessor would suppress
+			// publication for its whole build. Fail the scan; the
+			// caller retries with the gate closed.
+			return nil, fmt.Errorf("survivor scan: parent of pid %s: %w", e.Name(), perr)
+		}
+		if ppid == self {
 			continue
 		}
 		stat, err := os.ReadFile("/proc/" + e.Name() + "/stat")
@@ -4983,29 +4994,31 @@ func findSurvivingBuilders(builderBin string) ([]builderProc, error) {
 	return procs, nil
 }
 
-// procPPID reads a process's parent pid from /proc/<pid>/stat; 0 on any
-// parse failure (never matches a real daemon pid, so an unreadable stat
-// classifies as a survivor — the conservative direction).
-func procPPID(pidDir string) int {
+// procPPID reads a process's parent pid from /proc/<pid>/stat. Errors
+// propagate — a transient read or parse failure is NOT a verdict about
+// the process (converting it into "not our child" would misclassify a
+// current build's builder as a predecessor), and the caller decides how
+// to fail.
+func procPPID(pidDir string) (int, error) {
 	stat, err := os.ReadFile("/proc/" + pidDir + "/stat")
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	// Fields follow the parenthesized comm, which may itself contain
 	// spaces or parens: parse after the LAST ')'.
 	i := strings.LastIndexByte(string(stat), ')')
 	if i < 0 {
-		return 0
+		return 0, fmt.Errorf("unparseable stat for pid %s", pidDir)
 	}
 	fields := strings.Fields(string(stat[i+1:]))
 	if len(fields) < 2 {
-		return 0
+		return 0, fmt.Errorf("short stat for pid %s", pidDir)
 	}
 	ppid, err := strconv.Atoi(fields[1])
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("unparseable ppid for pid %s: %w", pidDir, err)
 	}
-	return ppid
+	return ppid, nil
 }
 
 // vmPossiblyLive reports whether a VM whose status claims its process

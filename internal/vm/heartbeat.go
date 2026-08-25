@@ -115,11 +115,27 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	defer ticker.Stop()
 
 	pressureURL := fmt.Sprintf("%s/internal/hosts/%s/pressure", cfg.ControlPlaneURL, cfg.HostID)
-	ps := &pressureState{}
+
+	// Pressure runs on its OWN goroutine, kicked (never blocked on) after
+	// each successful heartbeat: PressureReady's dynamic gates can probe
+	// systemd and cgroups with per-item budgets, and any of that on the
+	// heartbeat goroutine could starve ticker beats past the control
+	// plane's unhealthy threshold — best-effort telemetry must not be
+	// able to interrupt liveness, by construction. The kick channel has
+	// capacity one and drops when the worker is busy: a slow pressure
+	// pass skips beats instead of queueing them.
+	pressureKick := make(chan struct{}, 1)
+	go pressureLoop(ctx, client, cfg, pressureURL, token, pressureKick, log)
+	kickPressure := func() {
+		select {
+		case pressureKick <- struct{}{}:
+		default:
+		}
+	}
 
 	// Fire once immediately so the host is marked alive on startup.
 	if sendHeartbeat(ctx, client, cfg, url, token, proxyHealthURL, log) {
-		sendPressure(ctx, client, cfg, pressureURL, token, ps, log)
+		kickPressure()
 	}
 
 	for {
@@ -134,8 +150,22 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 			// host row provably exists, so 404 can only mean an older
 			// control plane without the route).
 			if sendHeartbeat(ctx, client, cfg, url, token, proxyHealthURL, log) {
-				sendPressure(ctx, client, cfg, pressureURL, token, ps, log)
+				kickPressure()
 			}
+		}
+	}
+}
+
+// pressureLoop owns the pressure publisher's state and serializes its
+// passes; one pass per kick, kicks dropped while busy.
+func pressureLoop(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token string, kick <-chan struct{}, log zerolog.Logger) {
+	ps := &pressureState{}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-kick:
+			sendPressure(ctx, client, cfg, url, token, ps, log)
 		}
 	}
 }
