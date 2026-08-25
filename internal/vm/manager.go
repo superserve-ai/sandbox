@@ -500,13 +500,17 @@ type Manager struct {
 	// exit; builderAlive is a seam over the pid-liveness probe.
 	survivingBuilders []builderProc
 	builderAlive      func(p builderProc) bool
-	// pendingBuildCgroups are predecessor builds' cgroups found at
-	// startup: publication waits until each empties (the orphaned builder
-	// tears its own VM down on exit). Unlike a generic orphan cgroup this
+	// pendingBuildCgroups and pendingBuildUnits are predecessor builds'
+	// leftovers found at startup — cgroup-mode groups and unit-mode
+	// firecracker@build-* units respectively: publication waits until
+	// each resolves (the orphaned builder tears its own VM down on exit,
+	// and the reconciler deliberately skips build-prefixed ids, so
+	// nothing else re-evaluates them). Unlike a generic orphan this
 	// state is self-resolving, so it gates dynamically — PressureReady
-	// polls the remaining set, and the list only shrinks. Guarded by
+	// polls the remaining sets, and the lists only shrink. Guarded by
 	// m.mu.
 	pendingBuildCgroups []string
+	pendingBuildUnits   []string
 	// pressureIndex mirrors m.vms membership for CapacityPressure: the
 	// beat ranges this sync.Map instead of copying the instance map under
 	// m.mu, so per-heartbeat telemetry never contends the lifecycle mutex
@@ -3494,6 +3498,21 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 					// represented, not an orphan.
 					continue
 				}
+				if isBuildVM(id) && !m.buildAllocCovers(id) {
+					// A predecessor build's unit (build-* or
+					// build-record-*): self-resolving — the orphaned
+					// builder tears its own VM down on exit — so gate
+					// DYNAMICALLY like the cgroup case below instead of
+					// poisoning conclusive, which never reevaluates and
+					// would suppress publication until the next restart.
+					m.mu.Lock()
+					m.pendingBuildUnits = append(m.pendingBuildUnits, id)
+					m.mu.Unlock()
+					recordUnitStop(systemdUnitName(id))
+					m.log.Warn().Str("vm_id", id).
+						Msg("predecessor build unit detected; pressure publication deferred until it exits")
+					continue
+				}
 				// A live Firecracker with no record: its memory is real
 				// and unrepresentable in pressure.
 				conclusive = false
@@ -4784,27 +4803,46 @@ func (m *Manager) PressureReady() bool {
 	// the list; entries proven dead in this pass are dropped, anything
 	// else (including ids appended concurrently) is kept.
 	m.mu.Lock()
-	pending := append([]string(nil), m.pendingBuildCgroups...)
+	pendingCg := append([]string(nil), m.pendingBuildCgroups...)
+	pendingUnits := append([]string(nil), m.pendingBuildUnits...)
 	m.mu.Unlock()
-	if len(pending) > 0 {
-		dead := make(map[string]bool, len(pending))
-		for _, id := range pending {
+	if len(pendingCg) > 0 || len(pendingUnits) > 0 {
+		deadCg := make(map[string]bool, len(pendingCg))
+		for _, id := range pendingCg {
 			// Populated or unreadable keeps the gate closed; only a
 			// conclusively empty-or-absent group releases it. Bounded:
 			// one read per REMAINING leftover per beat, normally zero.
 			if m.cgroups != nil && m.cgroupDefinitelyDead(id) {
-				dead[id] = true
+				deadCg[id] = true
 			}
+		}
+		deadUnit := make(map[string]bool, len(pendingUnits))
+		for _, id := range pendingUnits {
+			// Same bound and same standard: only a TERMINALLY down unit
+			// releases the gate — deactivating may still flush guest
+			// writes.
+			pctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if unitFullyDown(pctx, systemdUnitName(id)) {
+				deadUnit[id] = true
+			}
+			cancel()
 		}
 		m.mu.Lock()
-		remaining := m.pendingBuildCgroups[:0]
+		remainingCg := m.pendingBuildCgroups[:0]
 		for _, id := range m.pendingBuildCgroups {
-			if !dead[id] {
-				remaining = append(remaining, id)
+			if !deadCg[id] {
+				remainingCg = append(remainingCg, id)
 			}
 		}
-		m.pendingBuildCgroups = remaining
-		open := len(remaining) == 0
+		m.pendingBuildCgroups = remainingCg
+		remainingUnits := m.pendingBuildUnits[:0]
+		for _, id := range m.pendingBuildUnits {
+			if !deadUnit[id] {
+				remainingUnits = append(remainingUnits, id)
+			}
+		}
+		m.pendingBuildUnits = remainingUnits
+		open := len(remainingCg) == 0 && len(remainingUnits) == 0
 		m.mu.Unlock()
 		if !open {
 			return false

@@ -1023,3 +1023,27 @@ func TestInPlaceReplaceKeepsOldInstanceIndexed(t *testing.T) {
 		t.Fatalf("allocations = %+v, want only the replacement counted", p)
 	}
 }
+
+// A predecessor build's systemd unit gates dynamically, mirroring the
+// cgroup case: the orphaned builder tears its own VM down on exit, and
+// the reconciler skips build-prefixed ids, so a permanent conclusive
+// close would suppress publication until the next restart.
+func TestPressureReadyReopensAfterPredecessorBuildUnitExits(t *testing.T) {
+	origDead := vmUnitFullyDown
+	defer func() { vmUnitFullyDown = origDead }()
+
+	m := &Manager{vms: map[string]*VMInstance{}}
+	m.reattachComplete.Store(true)
+	m.pendingBuildUnits = []string{"build-tpl-x"}
+	// In the test env the unit probe cannot confirm termination: closed.
+	if m.PressureReady() {
+		t.Fatal("PressureReady = true with a pending predecessor build unit")
+	}
+	// The unit exits (probe confirms): reopens and the entry drops.
+	m.mu.Lock()
+	m.pendingBuildUnits = nil
+	m.mu.Unlock()
+	if !m.PressureReady() {
+		t.Fatal("PressureReady = false after the predecessor build unit exited")
+	}
+}
