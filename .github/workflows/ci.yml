@@ -181,7 +181,7 @@ jobs:
             return 1
           }
           report() {
-            echo "::error file=$1::$1 ships a binary built from $2 but does not list it — changes to $2 would merge without deploying"
+            echo "::error file=$1::$1 does not list $2 in its trigger paths — changes to $2 would merge without deploying"
             fail=1
           }
           check() {
@@ -189,7 +189,7 @@ jobs:
             # Globs are kept, not stripped: the two filter forms mean different
             # things and covered_dir/covered_file rely on telling them apart.
             triggers=$(awk '/^on:/,/^jobs:/' "$workflow" \
-              | grep -oE "'[A-Za-z][A-Za-z0-9._/-]*(/\*\*)?'" | tr -d "'" | sort -u || true)
+              | grep -oE "'[A-Za-z.][A-Za-z0-9._/-]*(/\*\*)?'" | tr -d "'" | sort -u || true)
             # Module-local deps — not just internal/, since the proxy reaches
             # proto/boxdpb and stale generated protocol code is the same hazard.
             deps=$(go list -deps "$@" \
