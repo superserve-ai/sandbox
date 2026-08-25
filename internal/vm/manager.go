@@ -3041,10 +3041,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// stuck at its bound: an honest early error beats letting the caller's
 	// deadline win the race — a bare DeadlineExceeded reads as transient
 	// and gets retried into this VM's torn-down state.
-	const restoreVerdictReserve = 13 * time.Second
 	readiness := 30 * time.Second
 	if dl, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(dl) - restoreVerdictReserve; remaining < readiness {
+		if remaining := time.Until(dl) - bootVerdictReserve; remaining < readiness {
 			readiness = remaining
 		}
 	}
@@ -5670,6 +5669,13 @@ func tailFile(path string, n int64) (string, int64, error) {
 	return string(buf), st.Size(), nil
 }
 
+// bootVerdictReserve is the deadline slice reserved for a boot's WORST-CASE
+// error path so the definitive verdict still returns in-band: the 10s
+// bounded unit stop, the 2s surviving-unit resolve, and a reply margin.
+// Shared by the restore readiness clamp and the resume readiness clamp —
+// both gates tear down on timeout before replying.
+const bootVerdictReserve = 13 * time.Second
+
 // stallForensicsDirName holds quarantined consoles from readiness-timeout
 // teardowns, inside RunDir (dot-prefixed so it can never collide with a VM
 // id). Files are root-only: guest serial is tenant-controlled data and must
@@ -5821,7 +5827,19 @@ const boxdResumeReadyBudget = 30 * time.Second
 // snapshot so the retry does a clean fresh restore. Caller holds the VM's
 // lifecycle lock (abort mutates the record).
 func (m *Manager) resumeReadyOrAbort(callerCtx context.Context, vmID, ip string) error {
-	if err := m.waitForBoxd(context.WithoutCancel(callerCtx), ip, boxdResumeReadyBudget); err != nil {
+	// Detached from caller CANCELLATION on purpose (a disconnect must not
+	// abort a healthy resume mid-probe) — but clamped to the caller's
+	// DEADLINE like the restore gate: the abort below is bounded teardown
+	// plus persistence, and the definitive verdict must return in-band
+	// rather than losing the race to the client deadline and triggering a
+	// transient retry against the still-held lifecycle lock.
+	budget := boxdResumeReadyBudget
+	if dl, ok := callerCtx.Deadline(); ok {
+		if remaining := time.Until(dl) - bootVerdictReserve; remaining < budget {
+			budget = remaining
+		}
+	}
+	if err := m.waitForBoxd(context.WithoutCancel(callerCtx), ip, budget); err != nil {
 		m.abortResumeLocked(vmID)
 		return err
 	}
