@@ -289,13 +289,42 @@ func (m *Manager) resolveFCPID(vmID string, launchPID int) int {
 // would erase it — leaving the record permanently PID-less for a VM that has
 // one, which costs the stall capture its subject and misleads anything else
 // reading the field. Zero means "not known yet", never "known to be none".
-// forgetLaunchPID clears a previous attempt's PID so the next launch starts
-// from "not known yet". Must run before the launch spawns its resolver, or it
-// would erase the very PID it is meant to make room for.
-func forgetLaunchPID(inst *VMInstance) {
+// beginLaunchAttempt clears the previous attempt's PID and opens a new
+// generation, returning it for this attempt's resolver to carry.
+//
+// Clearing alone is not enough: the prior attempt's resolver may already hold
+// a MainPID and simply not have written it yet, so it would repopulate the
+// record with a stopped unit's PID moments after the clear. The generation is
+// what makes that write droppable. Must run before the launch spawns its own
+// resolver.
+func beginLaunchAttempt(inst *VMInstance) uint64 {
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
 	inst.PID = 0
+	inst.launchGen++
+	return inst.launchGen
+}
+
+// publishResolvedPID records an asynchronously resolved MainPID, but only if
+// the attempt that started the resolver is still the current one.
+func publishResolvedPID(inst *VMInstance, gen uint64, pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if inst.launchGen != gen {
+		return false // a later attempt owns this record now
+	}
+	inst.PID = pid
+	return true
+}
+
+// currentLaunchGen reads the generation a launch should hand its resolver.
+func currentLaunchGen(inst *VMInstance) uint64 {
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.launchGen
 }
 
 func publishLaunchPID(inst *VMInstance, pid int, supervision Supervision) {
@@ -305,4 +334,15 @@ func publishLaunchPID(inst *VMInstance, pid int, supervision Supervision) {
 		inst.PID = pid
 	}
 	inst.Supervision = supervision
+}
+
+// launchGenFor returns the tracked instance's current launch generation, or 0
+// when the record is gone (a resolver carrying 0 can never match a real
+// attempt, so its write is dropped — the safe direction).
+func (m *Manager) launchGenFor(vmID string) uint64 {
+	inst := m.trackedInstance(vmID)
+	if inst == nil {
+		return 0
+	}
+	return currentLaunchGen(inst)
 }

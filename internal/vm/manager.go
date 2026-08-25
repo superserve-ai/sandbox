@@ -90,8 +90,14 @@ func (s VMStatus) String() string {
 
 // VMInstance holds the runtime state of a single microVM.
 type VMInstance struct {
-	ID             string
-	PID            int
+	ID  string
+	PID int
+	// launchGen fences PID publication to the attempt that started it. A
+	// retry reuses this instance, and the previous attempt's asynchronous
+	// MainPID resolver can still be in flight — writing a stopped unit's PID
+	// into the new attempt's record. Bumped under mu at each attempt start;
+	// a resolver whose captured generation no longer matches drops its write.
+	launchGen      uint64
 	SocketPath     string
 	VsockPath      string
 	IP             string
@@ -2823,7 +2829,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// survives into the new attempt points at a stopped (possibly
 		// recycled) process — which stall capture would then inspect and
 		// report as this VM's.
-		forgetLaunchPID(inst)
+		beginLaunchAttempt(inst)
 		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace || priorRunDir, freshUnit && attempt == 1)
 		// Stamp the chosen mode NOW, before the error branch: a launch that
 		// forked a cgroup FC but failed socket-readiness (and whose own kill
@@ -5466,7 +5472,7 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// Read the PID asynchronously so the create path isn't slowed down
 	// by the ~15ms dbus roundtrip. The PID is populated in the instance
 	// shortly after create returns and persisted to BoltDB.
-	go m.resolveAndSetPID(vmID)
+	go m.resolveAndSetPID(vmID, m.launchGenFor(vmID))
 
 	return 0, nil
 }
@@ -5493,7 +5499,7 @@ func (m *Manager) unitMainPID(ctx context.Context, vmID string) int {
 	return pid
 }
 
-func (m *Manager) resolveAndSetPID(vmID string) {
+func (m *Manager) resolveAndSetPID(vmID string, gen uint64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -5509,9 +5515,11 @@ func (m *Manager) resolveAndSetPID(vmID string) {
 		return
 	}
 
-	inst.mu.Lock()
-	inst.PID = pid
-	inst.mu.Unlock()
+	if !publishResolvedPID(inst, gen, pid) {
+		// A newer launch attempt owns this record; publishing here would
+		// point every later reader at a stopped unit.
+		return
+	}
 
 	// The persist must join the vm op critical section: unserialized, its
 	// snapshot could commit after the launching op's own writes (e.g. the

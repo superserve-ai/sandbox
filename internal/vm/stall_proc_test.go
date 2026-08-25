@@ -126,18 +126,37 @@ func TestPublishLaunchPIDNeverErasesAResolvedPID(t *testing.T) {
 	}
 }
 
-func TestForgetLaunchPIDClearsAStaleAttempt(t *testing.T) {
-	// A tap-busy retry reuses the instance; the previous unit's PID must not
-	// survive into the next attempt, or capture inspects a stopped (possibly
-	// recycled) process and reports it as this VM's.
+func TestLaunchGenerationFencesAStaleResolver(t *testing.T) {
+	// A tap-busy retry reuses the instance. Attempt 1's resolver may already
+	// hold a MainPID and be descheduled, so clearing the field is not enough:
+	// its late write must be dropped, or capture inspects the stopped unit.
 	inst := &VMInstance{PID: 555}
-	forgetLaunchPID(inst)
+	gen1 := currentLaunchGen(inst)
+
+	gen2 := beginLaunchAttempt(inst) // retry starts
 	if inst.PID != 0 {
 		t.Fatalf("stale PID survived the retry: %d", inst.PID)
 	}
-	publishLaunchPID(inst, 0, SupervisionUnit) // unit launch returns 0
+	if gen2 == gen1 {
+		t.Fatal("a new attempt must open a new generation")
+	}
+	if publishResolvedPID(inst, gen1, 555) {
+		t.Fatal("attempt 1's resolver published into attempt 2's record")
+	}
 	if inst.PID != 0 {
-		t.Fatalf("PID = %d, want 0 until the resolver publishes", inst.PID)
+		t.Fatalf("stale resolver wrote %d", inst.PID)
+	}
+
+	// Attempt 2's own resolver is accepted.
+	if !publishResolvedPID(inst, gen2, 909) {
+		t.Fatal("current attempt's resolver was rejected")
+	}
+	if inst.PID != 909 {
+		t.Fatalf("PID = %d, want 909", inst.PID)
+	}
+	// A resolver that found nothing never clobbers a known PID.
+	if publishResolvedPID(inst, gen2, 0) || inst.PID != 909 {
+		t.Fatalf("zero resolution disturbed the record: %d", inst.PID)
 	}
 }
 
