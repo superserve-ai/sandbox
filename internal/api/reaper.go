@@ -61,17 +61,8 @@ func DefaultReaperConfig() ReaperConfig {
 func (h *Handlers) StartTimeoutReaper(ctx context.Context, cfg ReaperConfig) {
 	logger := log.Logger
 	go h.reaperLoop(ctx, cfg, logger)
-	// Decoupled from the reaper's 30s tick: eligibility moves at
-	// dollars-per-hour granularity, and each pass aggregates a month of
-	// billing intervals per trial team — 30s bought nothing but DB load.
-	go h.trialEligibilityLoop(ctx, billingEligibilityRefreshInterval)
+	go h.trialEligibilityLoop(ctx, cfg.Interval)
 }
-
-// billingEligibilityRefreshInterval paces the trial-eligibility sweep. The
-// bound on how long an ineligible team keeps running is this interval plus
-// the pause saga, which stays far inside the 90-day revocation horizon the
-// sweep ultimately protects.
-const billingEligibilityRefreshInterval = 5 * time.Minute
 
 func (h *Handlers) trialEligibilityLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)

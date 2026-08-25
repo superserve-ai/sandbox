@@ -87,6 +87,12 @@ func (h *Handlers) reconcileActivatedSandbox(ctx context.Context, teamID uuid.UU
 		eligible, err := h.DB.IsTeamSandboxBillingEligible(ctx, teamID)
 		if err != nil {
 			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: activation eligibility check failed")
+			// Every overlapping activation shares this verdict, so a
+			// transient failure must not silently drop the whole burst's
+			// recheck. The delayed retry claims-and-pauses directly — the
+			// claim query is self-gating on eligibility, so retrying an
+			// eligible team pauses nothing.
+			h.retryBillingEligibilityReconciliation(teamID)
 			return nil, nil
 		}
 		if !eligible {

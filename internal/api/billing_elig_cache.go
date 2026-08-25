@@ -34,6 +34,9 @@ const (
 	// billingEligQueryTimeout bounds the shared flight's read; the query is
 	// three indexed lookups, so anything slower is the DB misbehaving.
 	billingEligQueryTimeout = 5 * time.Second
+	// evictSamplePerPut caps how many entries a put inspects for expiry, so
+	// eviction cost never scales with team cardinality on the request path.
+	evictSamplePerPut = 8
 )
 
 type billingEligEntry struct {
@@ -70,10 +73,17 @@ func (c *billingEligCache) put(teamID uuid.UUID, eligible bool, checked time.Tim
 	if c.m == nil {
 		c.m = make(map[uuid.UUID]billingEligEntry)
 	}
-	// Lazy sweep: teams that stop creating are never read again, so puts
-	// evict their expired entries. At most one put per team per TTL and the
-	// map is one entry per recently-active team, so this stays cheap.
+	// Bounded lazy eviction: teams that stop creating are never read again,
+	// so puts reclaim expired entries — but only a small random sample each
+	// (map iteration order is random), keeping this critical section O(1)
+	// no matter how many teams churn through. Puts outnumber expiries in
+	// steady state (at most one put per active team per TTL), so sampled
+	// reclamation keeps the map proportional to recently-active teams.
+	sampled := 0
 	for k, e := range c.m {
+		if sampled++; sampled > evictSamplePerPut {
+			break
+		}
 		if checked.Sub(e.checked) > e.ttl() {
 			delete(c.m, k)
 		}
@@ -93,6 +103,12 @@ func (h *Handlers) teamBillingEligibleCached(ctx context.Context, teamID uuid.UU
 		return eligible, nil
 	}
 	ch := c.group.DoChan(teamID.String(), func() (interface{}, error) {
+		// Re-check under the flight: a caller that missed while a previous
+		// flight was completing enters a fresh flight after it — without
+		// this, back-to-back flights double-read what the first just cached.
+		if eligible, ok := c.get(teamID, time.Now()); ok {
+			return eligible, nil
+		}
 		start := time.Now()
 		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), billingEligQueryTimeout)
 		defer cancel()
