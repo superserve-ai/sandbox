@@ -66,10 +66,10 @@ func TestLateCaptureIsPublishedNotDropped(t *testing.T) {
 	stallCaptureBudgetForTest = time.Nanosecond // force the caller to give up
 	defer func() { stallCaptureBudgetForTest = orig }()
 
-	st, finished := captureProcStateBounded(os.Getpid(), "not-this-vm", func(s *procStallState) {
+	st, outcome := captureProcStateBounded(os.Getpid(), "not-this-vm", func(s *procStallState) {
 		late <- s
 	})
-	if finished {
+	if outcome == captureOK {
 		// The worker beat the (nanosecond) budget; nothing was abandoned, so
 		// there is nothing to publish late.
 		if st == nil {
@@ -93,6 +93,36 @@ func TestLateCaptureIsPublishedNotDropped(t *testing.T) {
 	case <-late:
 		t.Fatal("late capture published more than once")
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestConcurrentCapturesAreBounded(t *testing.T) {
+	// A stall burst must not spawn an unbounded number of capture workers on
+	// an already pressured host: past the limit, captures are skipped rather
+	// than queued, and the skip is reported as such instead of masquerading
+	// as a budget timeout.
+	block := make(chan struct{})
+	filled := 0
+	for i := 0; i < cap(stallProcSem); i++ {
+		select {
+		case stallProcSem <- struct{}{}:
+			filled++
+		default:
+		}
+	}
+	defer func() {
+		close(block)
+		for i := 0; i < filled; i++ {
+			<-stallProcSem
+		}
+	}()
+
+	st, outcome := captureProcStateBounded(os.Getpid(), "not-this-vm", nil)
+	if outcome != captureSaturated {
+		t.Fatalf("outcome = %q, want %q when the limit is full", outcome, captureSaturated)
+	}
+	if st != nil {
+		t.Fatal("a skipped capture returned state")
 	}
 }
 
@@ -386,8 +416,8 @@ func BenchmarkLaunchGenForParallel(b *testing.B) {
 func TestCaptureIsBoundedEvenWhenTheWorkerHangs(t *testing.T) {
 	// A pid that is not this VM's firecracker returns fast, proving the happy
 	// path reports completion.
-	if _, finished := captureProcStateBounded(os.Getpid(), "not-this-vm", nil); !finished {
-		t.Fatal("a fast capture reported as unfinished")
+	if _, outcome := captureProcStateBounded(os.Getpid(), "not-this-vm", nil); outcome != captureOK {
+		t.Fatalf("a fast capture reported outcome %q", outcome)
 	}
 	// The wait itself is what bounds the restore path: even in the worst case
 	// the caller returns within roughly the budget rather than blocking on an

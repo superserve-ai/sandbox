@@ -5831,7 +5831,7 @@ func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Durati
 	// costing us the console too.
 	var proc *procStallState
 	if pid > 0 {
-		var finished bool
+		var outcome captureOutcome
 		// A late capture publishes itself rather than being discarded: a read
 		// slow enough to miss the budget signals exactly the host conditions
 		// worth diagnosing.
@@ -5846,9 +5846,9 @@ func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Durati
 				pruneOldest(dir, stallForensicsKeep)
 			}
 		}
-		if proc, finished = captureProcStateBounded(pid, vmID, onLate); !finished {
-			m.log.Warn().Str("vm_id", vmID).Int("fc_pid", pid).
-				Msg("guest not ready — proc capture exceeded its budget; proceeding to teardown")
+		if proc, outcome = captureProcStateBounded(pid, vmID, onLate); outcome != captureOK {
+			m.log.Warn().Str("vm_id", vmID).Int("fc_pid", pid).Str("outcome", string(outcome)).
+				Msg("guest not ready — proc capture did not complete inline; proceeding to teardown")
 		}
 	}
 	go func() {

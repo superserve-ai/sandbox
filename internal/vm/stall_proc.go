@@ -62,6 +62,25 @@ const stallCaptureBudget = 250 * time.Millisecond
 // force the abandonment path deterministically.
 var stallCaptureBudgetForTest = stallCaptureBudget
 
+// stallProcSem bounds concurrent proc captures. A readiness-stall burst can
+// time out many restores at once, and a worker whose procfs read outlives the
+// caller's budget keeps running — so without a cap, successive waves would
+// pile up blocked goroutines and procfs work on a host that is already
+// struggling. Saturated captures are SKIPPED rather than queued: queuing is
+// what produces the pile-up, and the first few captures of a burst explain it
+// as well as the hundredth would.
+var stallProcSem = make(chan struct{}, 4)
+
+// captureOutcome distinguishes why a capture produced nothing, so the log
+// says what actually happened instead of blaming the budget for everything.
+type captureOutcome string
+
+const (
+	captureOK        captureOutcome = "ok"
+	captureTimedOut  captureOutcome = "timed_out"
+	captureSaturated captureOutcome = "saturated"
+)
+
 // procThread is one thread's kernel-side state at stall time.
 type procThread struct {
 	TID   string
@@ -125,11 +144,19 @@ func readProcFile(path string) string {
 // delivered exactly once: whichever of the two arrives first claims it, and
 // a worker that lands in the same instant as the timeout still hands its
 // result to the caller rather than logging it twice.
-func captureProcStateBounded(pid int, vmID string, onLate func(*procStallState)) (*procStallState, bool) {
+func captureProcStateBounded(pid int, vmID string, onLate func(*procStallState)) (*procStallState, captureOutcome) {
+	// Try-acquire, never block: this runs on the verdict path, so a full
+	// semaphore must cost nothing at all.
+	select {
+	case stallProcSem <- struct{}{}:
+	default:
+		return nil, captureSaturated
+	}
 	var claimed atomic.Bool
 	done := make(chan *procStallState, 1) // buffered: an abandoned worker must never block
 	go func() {
 		defer sentrylog.Recover("stall-proc-capture")
+		defer func() { <-stallProcSem }()
 		st := captureProcState(pid, vmID)
 		if claimed.CompareAndSwap(false, true) {
 			done <- st
@@ -141,13 +168,13 @@ func captureProcStateBounded(pid int, vmID string, onLate func(*procStallState))
 	}()
 	select {
 	case st := <-done:
-		return st, true
+		return st, captureOK
 	case <-time.After(stallCaptureBudgetForTest):
 		if claimed.CompareAndSwap(false, true) {
-			return nil, false // the caller owns the abandonment; the worker will use onLate
+			return nil, captureTimedOut // the worker will publish via onLate
 		}
 		// The worker claimed it in the same instant — take its result.
-		return <-done, true
+		return <-done, captureOK
 	}
 }
 
