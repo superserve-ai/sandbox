@@ -26,7 +26,7 @@ const instrumentationName = "github.com/superserve-ai/sandbox/internal/telemetry
 // 30 minutes is pathological and may collapse into +Inf.
 var latencyBuckets = []float64{
 	0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
-	0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 900, 1800,
+	0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30, 60, 120, 300, 900, 1800,
 }
 
 // OTelConfig contains the app-level metrics settings needed by the recorder.
@@ -497,7 +497,7 @@ func (r *OTelRecorder) attrs(extra ...attribute.KeyValue) []attribute.KeyValue {
 
 func safeResult(v string) string {
 	switch v {
-	case ResultSuccess, ResultError, ResultConflict, ResultTimeout:
+	case ResultSuccess, ResultError, ResultConflict, ResultTimeout, ResultClientError:
 		return v
 	default:
 		return ResultError

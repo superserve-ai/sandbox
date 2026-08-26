@@ -180,6 +180,10 @@ func TestLifecycleResultBucketsTimeoutsAndConflicts(t *testing.T) {
 		http.StatusConflict:            telemetry.ResultConflict,
 		http.StatusRequestTimeout:      telemetry.ResultTimeout,
 		http.StatusGatewayTimeout:      telemetry.ResultTimeout,
+		http.StatusBadRequest:          telemetry.ResultClientError,
+		http.StatusNotFound:            telemetry.ResultClientError,
+		http.StatusUnauthorized:        telemetry.ResultClientError,
+		http.StatusTooManyRequests:     telemetry.ResultClientError,
 		http.StatusInternalServerError: telemetry.ResultError,
 	}
 	for status, want := range cases {
