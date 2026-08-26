@@ -1,30 +1,14 @@
 package vm
 
-// stall_diag.go — diagnostics gathered WHILE a guest is still stuck, rather
-// than at the moment it is killed.
+// stall_diag.go — diagnostics gathered while a guest is still stuck, rather
+// than at teardown (stall_proc.go).
 //
-// The teardown capture (stall_proc.go) answered where the stall is not: with
-// the memory handler idle and zero unresolved faults, the guest itself is the
-// thing that is stuck — one vCPU spinning in guest mode, another halted
-// waiting for an interrupt. Answering *why* needs signals that only exist
-// while the VM runs, and that take longer to collect than a teardown path can
-// afford.
-//
-// The timing is the whole idea. A healthy guest answers in tens of
-// milliseconds, so by a few seconds the outcome is already decided — yet vmd
-// then sits idle until the readiness deadline. Firing diagnostics into that
-// dead time costs the request nothing (it is not on the reply path at all)
-// and buys the better part of half a minute to work with, which is what makes
-// the slower, more decisive probes possible:
-//
-//   - KVM counters sampled twice: whether the spinning vCPU is exiting at all,
-//     and whether the halted one is being woken. A flat exit count means a
-//     tight guest loop; a flat halt_wakeup means nothing is arriving.
-//   - guest instruction pointers: which code the guest is actually looping in.
-//   - thread stacks re-read over time: whether the state is frozen or moving.
-//
-// Everything here is read-only with respect to the VM. Nothing interferes
-// with a guest that might still recover.
+// A healthy guest answers in tens of milliseconds, so once a readiness wait
+// has run for seconds the outcome is already decided and vmd is simply idle
+// until the deadline. Running the probes in that dead window keeps them off
+// the reply path entirely and leaves time for ones a teardown path could not
+// afford. Everything here is read-only with respect to the VM: nothing
+// interferes with a guest that might still recover.
 
 import (
 	"context"
@@ -42,37 +26,28 @@ import (
 )
 
 const (
-	// stallDiagAfter is how long a readiness wait must run before the guest
-	// is treated as stuck. Healthy restores finish about three orders of
-	// magnitude faster, and nothing has ever been observed recovering between
-	// a couple of seconds and the deadline, so this only ever fires on a
-	// guest that is already lost.
+	// Healthy restores finish three orders of magnitude faster than this, and
+	// no restore has been observed recovering between a couple of seconds and
+	// the deadline, so this only fires on a guest that is already lost.
 	stallDiagAfter = 5 * time.Second
 
-	// stallDiagSettle separates the two counter samples. Long enough that a
-	// slow-moving counter still shows movement, short enough to leave the
-	// rest of the window for the profile.
-	stallDiagSettle = 2 * time.Second
-
-	// stallDiagPerfWindow is how long the guest is profiled for instruction
-	// pointers. It runs inside the readiness window with room to spare.
+	stallDiagSettle     = 2 * time.Second
 	stallDiagPerfWindow = 3 * time.Second
 
-	// stallDiagBudget caps the whole battery so it can never outlive the
-	// readiness window and collide with teardown.
+	// Caps the battery so it can never outlive the readiness window and
+	// collide with teardown.
 	stallDiagBudget = 20 * time.Second
 )
 
-// stallDiagSem bounds concurrent diagnostic batteries. These are heavier than
-// the teardown capture — a profiler subprocess and several seconds of
-// sampling — so a burst of stalls must not turn diagnosis into load on a host
-// that is already unwell. Saturated attempts are skipped, not queued.
+// stallDiagSem bounds concurrent batteries: these run a profiler subprocess
+// for seconds, so a burst of stalls must not turn diagnosis into load on a
+// host that is already unwell. Saturated attempts are skipped, not queued.
 var stallDiagSem = make(chan struct{}, 2)
 
-// armEarlyStallDiagnostics schedules the battery to run if the guest is still
-// unready after stallDiagAfter. The returned func cancels it and is safe to
-// call on every path — on a healthy restore it stops a timer that never fired,
-// which is the entire cost of this feature on the happy path.
+// armEarlyStallDiagnostics schedules the battery for a guest still unready
+// after stallDiagAfter. The returned cancel is safe on every path; on a
+// healthy restore it stops a timer that never fired, which is this feature's
+// entire cost there.
 func (m *Manager) armEarlyStallDiagnostics(vmID string, launchPID int) func() {
 	timer := time.AfterFunc(stallDiagAfter, func() {
 		defer sentrylog.Recover("stall-diag-arm")
@@ -89,9 +64,8 @@ func (m *Manager) armEarlyStallDiagnostics(vmID string, launchPID int) func() {
 	return func() { timer.Stop() }
 }
 
-// runStallDiagnostics collects the live-VM evidence and logs it. Best-effort
-// throughout: a probe that fails contributes an empty field rather than
-// aborting the rest, because a partial answer still narrows the question.
+// runStallDiagnostics collects the live-VM evidence and logs it. A probe that
+// fails contributes an empty field rather than aborting the rest.
 func (m *Manager) runStallDiagnostics(vmID string, pid int) {
 	if pid <= 0 || !pidIsVMFirecracker(pid, vmID) {
 		return
@@ -127,8 +101,7 @@ func (m *Manager) runStallDiagnostics(vmID string, pid int) {
 	m.writeStallDiagDump(vmID, pid, deltas, guestIPs, threads)
 }
 
-// writeStallDiagDump preserves the full battery next to the other forensics
-// so a later reader has the raw numbers, not just the summary line.
+// writeStallDiagDump preserves the raw numbers next to the other forensics.
 func (m *Manager) writeStallDiagDump(vmID string, pid int, deltas map[string]int64, guestIPs []string, threads *procStallState) {
 	if !m.forensicsOK {
 		return
@@ -151,8 +124,8 @@ func (m *Manager) writeStallDiagDump(vmID string, pid int, deltas map[string]int
 }
 
 // readKVMCounters reads every per-VM and per-vCPU counter KVM exposes for
-// this process. Names are prefixed by their vcpu directory so a spinning and
-// a halted vCPU stay distinguishable — which is the entire point.
+// this process. Names carry their vcpu directory as a prefix, since telling
+// the spinning vCPU from the halted one is the entire point.
 func readKVMCounters(pid int) (map[string]int64, string) {
 	out := map[string]int64{}
 	base, err := kvmDebugDirFor(pid)
@@ -188,8 +161,8 @@ func readKVMCounters(pid int) (map[string]int64, string) {
 	return out, base
 }
 
-// kvmDebugDirFor finds the debugfs directory KVM created for this process.
-// The name is "<pid>-<instance>", so the pid alone is not a complete key.
+// kvmDebugDirFor finds KVM's debugfs directory for this process. The name is
+// "<pid>-<instance>", so matching must include the separator.
 func kvmDebugDirFor(pid int) (string, error) {
 	root := "/sys/kernel/debug/kvm"
 	entries, err := os.ReadDir(root)
@@ -205,9 +178,9 @@ func kvmDebugDirFor(pid int) (string, error) {
 	return "", os.ErrNotExist
 }
 
-// counterDeltas keeps only counters that MOVED. A stalled VM's interesting
-// signal is what is still ticking (or conspicuously not), and dropping the
-// hundreds of static counters is what makes the result readable.
+// counterDeltas keeps only counters that moved: what is still ticking (or
+// conspicuously not) is the signal, and dropping the hundreds of static
+// counters is what makes it readable.
 func counterDeltas(before, after map[string]int64) map[string]int64 {
 	deltas := map[string]int64{}
 	for k, a := range after {
@@ -238,17 +211,12 @@ func formatDeltas(deltas map[string]int64) string {
 	return strings.Join(parts, " ")
 }
 
-// guestIPPattern matches the instruction pointers perf reports for samples
-// taken while the CPU was in guest mode.
 var guestIPPattern = regexp.MustCompile(`(?m)^\s*([0-9a-f]{6,16})\s`)
 
-// sampleGuestIPs profiles the stalled process and returns the distinct guest
-// instruction pointers seen, most frequent first.
-//
-// Addresses rather than symbols on purpose: the shipped guest kernel is
-// stripped, so resolution happens offline against a kallsyms dump from a live
-// guest of the same image. Recording raw pointers keeps the host path simple
-// and the evidence durable.
+// sampleGuestIPs profiles the stalled process and returns distinct guest
+// instruction pointers, most frequent first. Addresses rather than symbols:
+// the shipped guest kernel is stripped, so resolution happens offline against
+// a kallsyms dump from a live guest of the same image.
 func sampleGuestIPs(ctx context.Context, pid int) []string {
 	tmp, err := os.MkdirTemp("", "stalldiag")
 	if err != nil {
