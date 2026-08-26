@@ -1,9 +1,8 @@
-.PHONY: build run test test-integration lint clean generate migrate image validate-boot deploy smoke-test seed-apikey seed-templates up down
+.PHONY: build run test test-integration lint clean generate migrate migrate-up image validate-boot deploy smoke-test seed-templates up down
 
 # Binary names
 CONTROLPLANE_BIN := bin/controlplane
 VMD_BIN := bin/vmd
-SEED_APIKEY_BIN := bin/seed-apikey
 SEED_TEMPLATES_BIN := bin/seed-templates
 BOXD_BIN := bin/boxd
 PROXY_BIN := bin/proxy
@@ -13,7 +12,7 @@ LDFLAGS := -ldflags "-s -w"
 
 ## Build
 
-build: build-controlplane build-vmd build-seed-apikey build-boxd build-proxy
+build: build-controlplane build-vmd build-seed-templates build-boxd build-proxy
 
 build-controlplane:
 	go build $(LDFLAGS) -o $(CONTROLPLANE_BIN) ./cmd/controlplane
@@ -21,16 +20,13 @@ build-controlplane:
 build-vmd:
 	go build $(LDFLAGS) -o $(VMD_BIN) ./cmd/vmd
 
-build-seed-apikey:
-	go build $(LDFLAGS) -o $(SEED_APIKEY_BIN) ./cmd/seed-apikey
-
 build-seed-templates:
 	go build $(LDFLAGS) -o $(SEED_TEMPLATES_BIN) ./cmd/seed-templates
 
 # Seed the 5 curated public templates. Requires DATABASE_URL + SYSTEM_TEAM_ID
 # in the environment. Idempotent — safe to run repeatedly.
 seed-templates: build-seed-templates
-	$(SEED_TEMPLATES_BIN) --dir superserve_templates
+	DATABASE_URL="$(DATABASE_URL)" $(SEED_TEMPLATES_BIN) --dir superserve_templates
 
 build-boxd:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o $(BOXD_BIN) ./cmd/boxd
@@ -85,8 +81,8 @@ db-reset: db-down db-up
 db-wait:
 	until docker exec $(DB_CONTAINER) pg_isready -U postgres -d sandbox_test; do sleep 1; done
 
-seed-apikey:
-	go run ./cmd/seed-apikey
+migrate: migrate-local
+migrate-up: migrate-local
 
 migrate-local:
 	for f in $$(ls supabase/migrations/*.sql | sort); do psql "$(DATABASE_URL)" -f $$f; done

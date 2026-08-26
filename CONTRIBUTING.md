@@ -13,8 +13,12 @@ git commit -s -m "your commit message"
 ## Development setup
 
 ```bash
-# Prerequisites: Go 1.25+, Docker
-docker compose up -d db
+# Prerequisites: Go 1.25+, Docker, golangci-lint
+export DATABASE_URL='postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable'
+export ALLOW_EPHEMERAL_SEED=1
+
+make db-up
+make db-wait
 make migrate-up
 make run-controlplane
 ```
