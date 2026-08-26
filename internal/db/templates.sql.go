@@ -390,7 +390,7 @@ WITH build_done AS (
       updated_at = now()
   WHERE template_build.id = $1 AND status IN ('building', 'snapshotting')
   RETURNING template_id
-)
+), updated AS (
 UPDATE template
 SET status = 'ready',
     rootfs_path = $2,
@@ -405,16 +405,63 @@ SET status = 'ready',
 FROM build_done
 WHERE template.id = build_done.template_id
 RETURNING template.id, template.team_id, template.name, template.status, template.build_spec, template.vcpu, template.memory_mib, template.disk_mib, template.rootfs_path, template.snapshot_path, template.mem_path, template.size_bytes, template.error_message, template.created_at, template.updated_at, template.built_at, template.deleted_at, template.base_path, template.delta_path
+), artifacts AS (
+INSERT INTO artifact_manifest (
+    template_id, file_name, path, size_bytes, allocated_bytes, sha256
+)
+SELECT DISTINCT ON (a.path) updated.id, a.file_name, a.path, a.size_bytes, a.allocated_bytes,
+       repeat('0', 64)
+FROM updated
+CROSS JOIN LATERAL (
+    VALUES
+        ('rootfs.ext4', updated.rootfs_path, COALESCE(updated.size_bytes, 0), $8::bigint),
+        ('base.ext4', updated.base_path, 0::bigint, $9::bigint),
+        ('delta.ext4', updated.delta_path, 0::bigint, $10::bigint)
+) AS a(file_name, path, size_bytes, allocated_bytes)
+WHERE a.path IS NOT NULL
+ORDER BY a.path, (a.file_name = 'rootfs.ext4') DESC
+ON CONFLICT (template_id, path) WHERE template_id IS NOT NULL DO UPDATE
+SET path = EXCLUDED.path,
+    size_bytes = EXCLUDED.size_bytes,
+    allocated_bytes = EXCLUDED.allocated_bytes
+RETURNING 1
+)
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path FROM updated
 `
 
 type FinalizeBuildParams struct {
-	ID           uuid.UUID `json:"id"`
-	RootfsPath   *string   `json:"rootfs_path"`
-	SnapshotPath *string   `json:"snapshot_path"`
-	MemPath      *string   `json:"mem_path"`
-	SizeBytes    *int64    `json:"size_bytes"`
-	BasePath     *string   `json:"base_path"`
-	DeltaPath    *string   `json:"delta_path"`
+	ID                   uuid.UUID `json:"id"`
+	RootfsPath           *string   `json:"rootfs_path"`
+	SnapshotPath         *string   `json:"snapshot_path"`
+	MemPath              *string   `json:"mem_path"`
+	SizeBytes            *int64    `json:"size_bytes"`
+	BasePath             *string   `json:"base_path"`
+	DeltaPath            *string   `json:"delta_path"`
+	RootfsAllocatedBytes int64     `json:"rootfs_allocated_bytes"`
+	BaseAllocatedBytes   int64     `json:"base_allocated_bytes"`
+	DeltaAllocatedBytes  int64     `json:"delta_allocated_bytes"`
+}
+
+type FinalizeBuildRow struct {
+	ID           uuid.UUID          `json:"id"`
+	TeamID       uuid.UUID          `json:"team_id"`
+	Name         string             `json:"name"`
+	Status       TemplateStatus     `json:"status"`
+	BuildSpec    []byte             `json:"build_spec"`
+	Vcpu         int32              `json:"vcpu"`
+	MemoryMib    int32              `json:"memory_mib"`
+	DiskMib      int32              `json:"disk_mib"`
+	RootfsPath   *string            `json:"rootfs_path"`
+	SnapshotPath *string            `json:"snapshot_path"`
+	MemPath      *string            `json:"mem_path"`
+	SizeBytes    *int64             `json:"size_bytes"`
+	ErrorMessage *string            `json:"error_message"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	BuiltAt      pgtype.Timestamptz `json:"built_at"`
+	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
+	BasePath     *string            `json:"base_path"`
+	DeltaPath    *string            `json:"delta_path"`
 }
 
 // Atomically transition template_build → ready and template → ready with
@@ -424,7 +471,7 @@ type FinalizeBuildParams struct {
 //
 // INVARIANT: status='ready' and template.base_path must become visible
 // together — the reconciler GCs build dirs not referenced by base_path.
-func (q *Queries) FinalizeBuild(ctx context.Context, arg FinalizeBuildParams) (Template, error) {
+func (q *Queries) FinalizeBuild(ctx context.Context, arg FinalizeBuildParams) (FinalizeBuildRow, error) {
 	row := q.db.QueryRow(ctx, finalizeBuild,
 		arg.ID,
 		arg.RootfsPath,
@@ -433,8 +480,11 @@ func (q *Queries) FinalizeBuild(ctx context.Context, arg FinalizeBuildParams) (T
 		arg.SizeBytes,
 		arg.BasePath,
 		arg.DeltaPath,
+		arg.RootfsAllocatedBytes,
+		arg.BaseAllocatedBytes,
+		arg.DeltaAllocatedBytes,
 	)
-	var i Template
+	var i FinalizeBuildRow
 	err := row.Scan(
 		&i.ID,
 		&i.TeamID,

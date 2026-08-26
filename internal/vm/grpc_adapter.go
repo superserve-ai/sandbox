@@ -6,6 +6,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
@@ -52,13 +53,18 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 	}
 	entries := make([]*vmdpb.ArtifactManifestEntry, 0, len(manifest))
 	for _, e := range manifest {
-		entries = append(entries, &vmdpb.ArtifactManifestEntry{
+		entry := &vmdpb.ArtifactManifestEntry{
 			FileName:  e.FileName,
 			Path:      e.Path,
 			SizeBytes: e.SizeBytes,
 			Sha256:    e.SHA256,
 			BasePath:  e.BasePath,
-		})
+		}
+		unknown := entry.ProtoReflect().GetUnknown()
+		unknown = protowire.AppendTag(unknown, 6, protowire.VarintType)
+		unknown = protowire.AppendVarint(unknown, uint64(e.AllocatedBytes))
+		entry.ProtoReflect().SetUnknown(unknown)
+		entries = append(entries, entry)
 	}
 	return &vmdpb.PauseVMResponse{
 		VmId:         req.GetVmId(),
@@ -575,6 +581,10 @@ func (a *GRPCAdapter) GetBuildStatus(ctx context.Context, req *vmdpb.GetBuildSta
 		resp.DeltaPath = snap.Result.DeltaPath
 		resp.ResolvedDigest = snap.Result.ResolvedDigest
 		resp.SizeBytes = snap.Result.SizeBytes
+		resp.SetAllocatedBytesSupported(true)
+		resp.SetRootfsAllocatedBytes(snap.Result.RootfsAllocatedBytes)
+		resp.SetBaseAllocatedBytes(snap.Result.BaseAllocatedBytes)
+		resp.SetDeltaAllocatedBytes(snap.Result.DeltaAllocatedBytes)
 	}
 	return resp, nil
 }

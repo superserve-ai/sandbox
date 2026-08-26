@@ -18,15 +18,15 @@ import (
 
 func pressureCfg(sample HostPressure) HeartbeatConfig {
 	return HeartbeatConfig{
-		HostID:             "host-a",
-		AdvertiseVMDAddr:   "10.0.0.9:50051",
-		AdvertiseProxyAddr: "10.0.0.9:5007",
-		Region:             "us-test1",
-		CapacityMemoryMib:  1024,
-		CapacityVcpus:      8,
-		Pressure:           func() HostPressure { return sample },
-		MaxSandboxes:       40,
-		MaxNetworkSlots:    500,
+		HostID:            "host-a",
+		VMDAddr:           "10.0.0.9:50051",
+		ProxyAddr:         "10.0.0.9:5007",
+		Region:            "us-test1",
+		CapacityMemoryMib: 1024,
+		CapacityVcpus:     8,
+		Pressure:          func() HostPressure { return sample },
+		MaxSandboxes:      40,
+		MaxNetworkSlots:   500,
 	}
 }
 
@@ -131,7 +131,7 @@ func TestSendPressureRequiresConfig(t *testing.T) {
 	sendPressure(context.Background(), srv.Client(), cfg, srv.URL, "tok", &pressureState{}, zerolog.Nop())
 
 	cfg = pressureCfg(HostPressure{})
-	cfg.AdvertiseVMDAddr = ""
+	cfg.VMDAddr = ""
 	sendPressure(context.Background(), srv.Client(), cfg, srv.URL, "tok", &pressureState{}, zerolog.Nop())
 }
 

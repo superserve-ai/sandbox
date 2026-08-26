@@ -3202,7 +3202,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			readiness = remaining
 		}
 	}
-	if err := m.waitForBoxd(ctx, hostIP, readiness); err != nil {
+	// Diagnostics fire from inside the readiness window if the guest is still
+	// unready after a few seconds — the teardown capture proved the guest
+	// itself is what stalls, and answering why needs signals that exist only
+	// while it runs. Cancelled on the healthy path, where the whole cost is a
+	// timer that never fires.
+	stopDiag := m.armEarlyStallDiagnostics(vmID, pid)
+	err := m.waitForBoxd(ctx, hostIP, readiness)
+	stopDiag()
+	if err != nil {
 		// Emit the exhausted readiness wait immediately, before teardown, so
 		// the sample measures the probe (not unit stop + resource release +
 		// persist join) and the concurrent-destroy return below can't skip it.

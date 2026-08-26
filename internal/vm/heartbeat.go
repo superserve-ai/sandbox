@@ -8,64 +8,50 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
-// HeartbeatConfig controls the VMD → control plane heartbeat loop.
+// Keep the stale logical-size billing window short for overlays activated
+// after startup while retaining a bounded, periodic fleet scan.
+const overlayStorageSampleInterval = 5 * time.Minute
+
 type HeartbeatConfig struct {
-	// ControlPlaneURL is the base URL of the control plane API (e.g.
-	// "http://localhost:8080"). The heartbeat POSTs to
-	// {ControlPlaneURL}/internal/hosts/{HostID}/heartbeat.
-	ControlPlaneURL string
-
-	// HostID is this host's identifier in the host table.
-	HostID string
-
-	// Token is the shared secret for authenticating internal API calls.
-	// Sent as `Authorization: Bearer <token>`.
-	Token string
-
-	// ProxyHealthURL is the host-local edge proxy health endpoint. The default
-	// is http://127.0.0.1:5007/health. VMD advertises preview-port enforcement
-	// only when this endpoint confirms the matching proxy protocol.
-	ProxyHealthURL string
-
-	// Interval is how often the heartbeat fires. Default: 30s.
-	Interval time.Duration
-
-	// Self-description for control-plane self-registration. Sent only when
-	// AdvertiseVMDAddr, AdvertiseProxyAddr, and Region are all set: older
-	// control planes bind heartbeat bodies strictly and reject unknown
-	// fields, so advertising is opt-in per host (deploy sets the env only
-	// once the control plane understands it). With none set, the payload is
-	// byte-identical to what pre-registration vmds send.
-	AdvertiseVMDAddr   string
-	AdvertiseProxyAddr string
-	Region             string
-	// Capacity fields are the host's SCHEDULABLE capacity — explicitly
-	// configured limits that placement may admit against — never detected
-	// physical totals.
+	ControlPlaneURL   string
+	HostID            string
+	Token             string
+	ProxyHealthURL    string
+	RunDir            string
+	Interval          time.Duration
+	VMDAddr           string
+	ProxyAddr         string
+	Region            string
 	CapacityMemoryMib int32
 	CapacityVcpus     int32
 
 	// Pressure, when set, is sampled after each SUCCESSFUL heartbeat and
 	// published to the separate best-effort pressure endpoint — never
 	// inside the heartbeat body, so no pressure outcome can ever affect
-	// host liveness. Nil (older wiring, tests, hosts without the advertise
-	// config) publishes nothing and the process behaves exactly as before.
+	// host liveness. Nil (older wiring, tests, hosts without the
+	// advertise config) publishes nothing and the process behaves
+	// exactly as before.
 	Pressure func() HostPressure
 	// PressureReady, when set, holds publication off until it reports
 	// true — wired to the manager's reattach completion, so a restarting
-	// vmd never publishes a near-zero snapshot of a half-rebuilt instance
-	// map (the control plane keeps the previous report; its age is the
-	// staleness signal). Nil means always ready.
+	// vmd never publishes a near-zero snapshot of a half-rebuilt
+	// instance map (the control plane keeps the previous report; its age
+	// is the staleness signal). Nil means always ready.
 	PressureReady func() bool
 	// MaxSandboxes and MaxNetworkSlots are operator-configured admission
 	// limits published alongside pressure; 0 means unset (no cap).
@@ -86,33 +72,25 @@ type pressureState struct {
 	beatsUntilProbe int
 }
 
-// StartHeartbeat launches a background goroutine that periodically POSTs
-// to the control plane's heartbeat endpoint. Blocks until ctx is cancelled.
 func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger) {
 	log = log.With().Str("component", "heartbeat").Logger()
-
 	interval := cfg.Interval
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
-
+	runDir := cfg.RunDir
+	if runDir == "" {
+		runDir = "/var/lib/sandbox/rundir"
+	}
 	url := fmt.Sprintf("%s/internal/hosts/%s/heartbeat", cfg.ControlPlaneURL, cfg.HostID)
-	token := cfg.Token
 	proxyHealthURL := cfg.ProxyHealthURL
 	if proxyHealthURL == "" {
 		proxyHealthURL = "http://127.0.0.1:5007/health"
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
+	log.Info().Str("url", url).Str("proxy_health_url", proxyHealthURL).Dur("interval", interval).Msg("heartbeat started")
 
-	log.Info().
-		Str("host_id", cfg.HostID).
-		Str("url", url).
-		Str("proxy_health_url", proxyHealthURL).
-		Dur("interval", interval).
-		Msg("heartbeat started")
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	cache := &heartbeatStorageCache{}
 
 	pressureURL := fmt.Sprintf("%s/internal/hosts/%s/pressure", cfg.ControlPlaneURL, cfg.HostID)
 
@@ -123,9 +101,10 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	// plane's unhealthy threshold — best-effort telemetry must not be
 	// able to interrupt liveness, by construction. The kick channel has
 	// capacity one and drops when the worker is busy: a slow pressure
-	// pass skips beats instead of queueing them.
+	// pass skips beats instead of queueing them. Same reasoning that
+	// keeps the storage sampler below off this goroutine.
 	pressureKick := make(chan struct{}, 1)
-	go pressureLoop(ctx, client, cfg, pressureURL, token, pressureKick, log)
+	go pressureLoop(ctx, client, cfg, pressureURL, cfg.Token, pressureKick, log)
 	kickPressure := func() {
 		select {
 		case pressureKick <- struct{}{}:
@@ -133,27 +112,46 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 		}
 	}
 
-	// Fire once immediately so the host is marked alive on startup.
-	if sendHeartbeat(ctx, client, cfg, url, token, proxyHealthURL, log) {
+	// Keep the first liveness POST independent of the fleet-sized filesystem
+	// scan. Storage sampling runs in a separate goroutine so heartbeat posts
+	// can continue even if a host has a large number of sandboxes.
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	if ok, _ := sendHeartbeat(ctx, client, cfg, url, cfg.Token, proxyHealthURL, nil, log); ok {
 		kickPressure()
 	}
-
+	go runOverlayStorageSampler(ctx, runDir, overlayStorageSampleInterval, cache, log)
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info().Msg("heartbeat exiting")
 			return
 		case <-ticker.C:
-			// Pressure publishes only AFTER a successful heartbeat, and to
-			// its own endpoint: liveness never carries it, and the ordering
-			// disambiguates the pressure 404 (after a 200 heartbeat the
-			// host row provably exists, so 404 can only mean an older
-			// control plane without the route).
-			if sendHeartbeat(ctx, client, cfg, url, token, proxyHealthURL, log) {
+			now := time.Now()
+			version, storage := cache.snapshot()
+			publishStorage := cache.shouldSend(version, now)
+			if !publishStorage {
+				storage = nil
+			}
+			// Pressure publishes only AFTER a successful heartbeat, and
+			// to its own endpoint: liveness never carries it, and the
+			// ordering disambiguates the pressure 404 (after a 200
+			// heartbeat the host row provably exists, so 404 can only
+			// mean an older control plane without the route).
+			ok, accepted := sendHeartbeat(ctx, client, cfg, url, cfg.Token, proxyHealthURL, storage, log)
+			if ok {
 				kickPressure()
+				if publishStorage && accepted {
+					cache.markSent(version, now)
+				}
 			}
 		}
 	}
+}
+
+type heartbeatStorageMeasurement struct {
+	SandboxID      string `json:"sandbox_id"`
+	AllocatedBytes int64  `json:"allocated_bytes"`
 }
 
 // pressureLoop owns the pressure publisher's state and serializes its
@@ -198,7 +196,7 @@ type pressureRequest struct {
 // them back anything off, and none can affect the heartbeat that
 // already succeeded.
 func sendPressure(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token string, ps *pressureState, log zerolog.Logger) {
-	if cfg.Pressure == nil || cfg.AdvertiseVMDAddr == "" {
+	if cfg.Pressure == nil || cfg.VMDAddr == "" {
 		return
 	}
 	if cfg.PressureReady != nil && !cfg.PressureReady() {
@@ -213,7 +211,7 @@ func sendPressure(ctx context.Context, client *http.Client, cfg HeartbeatConfig,
 	}
 	p := cfg.Pressure()
 	body, err := json.Marshal(pressureRequest{
-		VMDAddr:               cfg.AdvertiseVMDAddr,
+		VMDAddr:               cfg.VMDAddr,
 		RunningSandboxes:      p.RunningSandboxes,
 		ProvisioningSandboxes: p.ProvisioningSandboxes,
 		PausedSandboxes:       p.PausedSandboxes,
@@ -262,24 +260,140 @@ func sendPressure(ctx context.Context, client *http.Client, cfg HeartbeatConfig,
 }
 
 type heartbeatRequest struct {
-	Capabilities []string `json:"capabilities"`
-
-	VMDAddr           string `json:"vmd_addr,omitempty"`
-	ProxyAddr         string `json:"proxy_addr,omitempty"`
-	Region            string `json:"region,omitempty"`
-	CapacityMemoryMib int32  `json:"capacity_memory_mib,omitempty"`
-	CapacityVcpus     int32  `json:"capacity_vcpus,omitempty"`
+	Capabilities      []string                      `json:"capabilities"`
+	Storage           []heartbeatStorageMeasurement `json:"storage,omitempty"`
+	VMDAddr           string                        `json:"vmd_addr,omitempty"`
+	ProxyAddr         string                        `json:"proxy_addr,omitempty"`
+	Region            string                        `json:"region,omitempty"`
+	CapacityMemoryMib int32                         `json:"capacity_memory_mib,omitempty"`
+	CapacityVcpus     int32                         `json:"capacity_vcpus,omitempty"`
 }
 
-// buildHeartbeatRequest attaches the self-description only when it is
-// complete; a partial description would register a broken host row, and any
-// description at all breaks against control planes that predate it.
-func buildHeartbeatRequest(cfg HeartbeatConfig, capabilities []string) heartbeatRequest {
-	req := heartbeatRequest{Capabilities: capabilities}
-	if cfg.AdvertiseVMDAddr != "" && cfg.AdvertiseProxyAddr != "" && cfg.Region != "" &&
+type proxyHealthResponse struct {
+	Capabilities []string `json:"capabilities"`
+}
+
+type heartbeatStorageCache struct {
+	mu           sync.RWMutex
+	measurements []heartbeatStorageMeasurement
+	version      uint64
+	sentVersion  uint64
+	sentAt       time.Time
+}
+
+func (c *heartbeatStorageCache) snapshot() (uint64, []heartbeatStorageMeasurement) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.measurements) == 0 {
+		return c.version, nil
+	}
+	out := make([]heartbeatStorageMeasurement, len(c.measurements))
+	copy(out, c.measurements)
+	return c.version, out
+}
+
+func (c *heartbeatStorageCache) shouldSend(version uint64, now time.Time) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.measurements) == 0 {
+		return false
+	}
+	if version > c.sentVersion {
+		return true
+	}
+	return !c.sentAt.IsZero() && now.Sub(c.sentAt) >= overlayStorageSampleInterval
+}
+
+func (c *heartbeatStorageCache) markSent(version uint64, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if version < c.sentVersion {
+		return
+	}
+	c.sentVersion = version
+	c.sentAt = now
+}
+
+func (c *heartbeatStorageCache) store(measurements []heartbeatStorageMeasurement) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if reflect.DeepEqual(c.measurements, measurements) {
+		return
+	}
+	if len(measurements) == 0 {
+		c.measurements = nil
+		c.version++
+		return
+	}
+	c.measurements = make([]heartbeatStorageMeasurement, len(measurements))
+	copy(c.measurements, measurements)
+	c.version++
+}
+
+func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token, proxyHealthURL string, storage []heartbeatStorageMeasurement, log zerolog.Logger) (bool, bool) {
+	started := time.Now()
+	capabilities, err := proxyPreviewCapabilities(ctx, client, proxyHealthURL)
+	if err != nil {
+		log.Warn().Err(err).
+			Dur("duration", time.Since(started)).
+			Msg("proxy capability probe failed; advertising no preview capabilities")
+		capabilities = nil
+	}
+	return postHeartbeat(ctx, client, cfg, url, token, capabilities, storage, log, started)
+}
+
+func postHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token string, capabilities []string, storage []heartbeatStorageMeasurement, log zerolog.Logger, started time.Time) (bool, bool) {
+	body, err := json.Marshal(buildHeartbeatRequest(cfg, capabilities, storage))
+	if err != nil {
+		log.Error().Err(err).Msg("failed to encode heartbeat body")
+		return false, false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		log.Error().Err(err).Msg("failed to create heartbeat request")
+		return false, false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Warn().Err(err).Str("host_id", cfg.HostID).
+			Strs("capabilities", capabilities).Dur("duration", time.Since(started)).
+			Msg("heartbeat failed")
+		return false, false
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		if len(storage) > 0 && resp.StatusCode == http.StatusBadRequest && isStorageFieldUnsupported(respBody) {
+			log.Warn().
+				Int("status", resp.StatusCode).
+				Msg("heartbeat storage field rejected by an older control plane; retrying without storage")
+			return postHeartbeat(ctx, client, cfg, url, token, capabilities, nil, log, started)
+		}
+		log.Warn().Int("status", resp.StatusCode).Msg("heartbeat got non-200 response")
+		return false, false
+	}
+	return true, storage != nil
+}
+
+func isStorageFieldUnsupported(body []byte) bool {
+	return bytes.Contains(body, []byte(`unknown field "storage"`)) ||
+		bytes.Contains(body, []byte(`unknown field \"storage\"`))
+}
+
+func buildHeartbeatRequest(cfg HeartbeatConfig, capabilities []string, storage []heartbeatStorageMeasurement) heartbeatRequest {
+	req := heartbeatRequest{
+		Capabilities: capabilities,
+		Storage:      storage,
+	}
+	if cfg.VMDAddr != "" && cfg.ProxyAddr != "" && cfg.Region != "" &&
 		cfg.CapacityMemoryMib > 0 && cfg.CapacityVcpus > 0 {
-		req.VMDAddr = cfg.AdvertiseVMDAddr
-		req.ProxyAddr = cfg.AdvertiseProxyAddr
+		req.VMDAddr = cfg.VMDAddr
+		req.ProxyAddr = cfg.ProxyAddr
 		req.Region = cfg.Region
 		req.CapacityMemoryMib = cfg.CapacityMemoryMib
 		req.CapacityVcpus = cfg.CapacityVcpus
@@ -287,78 +401,37 @@ func buildHeartbeatRequest(cfg HeartbeatConfig, capabilities []string) heartbeat
 	return req
 }
 
-type proxyHealthResponse struct {
-	Capabilities []string `json:"capabilities"`
+func sampleOverlayStorage(runDir string, cache *heartbeatStorageCache, log zerolog.Logger) {
+	measurements, err := measureOverlayStorage(runDir)
+	if err != nil {
+		log.Warn().Err(err).Msg("overlay storage measurement failed; keeping previous cached sample")
+		return
+	}
+	cache.store(measurements)
 }
 
-func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token, proxyHealthURL string, log zerolog.Logger) bool {
-	started := time.Now()
-	capabilities, err := proxyPreviewCapabilities(ctx, client, proxyHealthURL)
-	if err != nil {
-		log.Warn().Err(err).Str("host_id", cfg.HostID).
-			Dur("duration", time.Since(started)).
-			Msg("proxy capability probe failed; advertising no preview capabilities")
-		capabilities = nil
+func runOverlayStorageSampler(ctx context.Context, runDir string, interval time.Duration, cache *heartbeatStorageCache, log zerolog.Logger) {
+	if interval <= 0 {
+		interval = overlayStorageSampleInterval
 	}
-	log.Debug().Str("host_id", cfg.HostID).
-		Str("proxy_health_url", proxyHealthURL).Strs("capabilities", capabilities).
-		Msg("sending heartbeat")
-
-	body, err := json.Marshal(buildHeartbeatRequest(cfg, capabilities))
-	if err != nil {
-		log.Error().Err(err).Msg("failed to encode heartbeat body")
-		return false
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		log.Error().Err(err).Msg("failed to create heartbeat request")
-		return false
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Warn().Err(err).Str("host_id", cfg.HostID).
-			Strs("capabilities", capabilities).Dur("duration", time.Since(started)).
-			Msg("heartbeat failed")
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	switch {
-	case resp.StatusCode == http.StatusConflict:
-		// Another live daemon holds this host identity. Keep heartbeating —
-		// the control plane refuses updates either way — but say why loudly:
-		// this is a provisioning error an operator must resolve.
-		log.Error().Int("status", resp.StatusCode).
-			Str("host_id", cfg.HostID).Strs("capabilities", capabilities).
-			Dur("duration", time.Since(started)).
-			Msg("heartbeat rejected: host identity in use by a live host at another address")
-		return false
-	case resp.StatusCode != http.StatusOK:
-		log.Warn().Int("status", resp.StatusCode).Str("host_id", cfg.HostID).
-			Strs("capabilities", capabilities).Dur("duration", time.Since(started)).
-			Msg("heartbeat got non-200 response")
-		return false
-	default:
-		log.Debug().Str("host_id", cfg.HostID).Strs("capabilities", capabilities).
-			Int("status", resp.StatusCode).Dur("duration", time.Since(started)).
-			Msg("heartbeat completed")
-		return true
+	sampleOverlayStorage(runDir, cache, log)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sampleOverlayStorage(runDir, cache, log)
+		}
 	}
 }
 
 // DetectHostCapacity reports the machine's PHYSICAL memory (MiB) and
-// logical CPU count. Never advertised as capacity — the schedulable
-// capacity a host registers is explicitly configured, because physical
-// totals include everything the OS, the daemons, and the cgroup headroom
-// already spend, and publishing them as admission limits would over-admit.
-// Used only to sanity-check the configured values. Memory comes from
-// /proc/meminfo; on any read or parse failure it returns 0.
+// logical CPU count. Never advertised as capacity: the schedulable
+// capacity a host registers is explicitly configured because physical
+// totals include everything the OS, the daemons, and the deliberate cgroup
+// headroom already spend.
 func DetectHostCapacity() (memoryMib, vcpus int32) {
 	vcpus = int32(runtime.NumCPU())
 	data, err := os.ReadFile("/proc/meminfo")
@@ -382,6 +455,44 @@ func DetectHostCapacity() (memoryMib, vcpus int32) {
 	return 0, vcpus
 }
 
+// measureOverlayStorage reads allocation metadata only; it never walks ext4
+// contents. st_blocks is the same physical allocation quantity used by du.
+func measureOverlayStorage(runDir string) ([]heartbeatStorageMeasurement, error) {
+	entries, err := os.ReadDir(runDir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]heartbeatStorageMeasurement, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := uuid.Parse(entry.Name()); err != nil {
+			continue
+		}
+		info, err := os.Stat(filepath.Join(runDir, entry.Name(), "overlay.ext4"))
+		if os.IsNotExist(err) {
+			// Legacy sandboxes keep their per-sandbox disk as rootfs.ext4.
+			info, err = os.Stat(filepath.Join(runDir, entry.Name(), "rootfs.ext4"))
+		}
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			continue
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			continue
+		}
+		out = append(out, heartbeatStorageMeasurement{
+			SandboxID:      entry.Name(),
+			AllocatedBytes: stat.Blocks * 512,
+		})
+	}
+	return out, nil
+}
+
 func proxyPreviewCapabilities(ctx context.Context, client *http.Client, healthURL string) ([]string, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -401,7 +512,6 @@ func proxyPreviewCapabilities(ctx context.Context, client *http.Client, healthUR
 	var health proxyHealthResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&health); err != nil {
 		if err == io.EOF {
-			// Pre-capability proxies returned an empty 200 health response.
 			return nil, nil
 		}
 		return nil, fmt.Errorf("decode proxy health: %w", err)

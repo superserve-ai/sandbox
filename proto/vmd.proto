@@ -193,6 +193,11 @@ message GetBuildStatusResponse {
   // Supervisors treat "unknown on this host" as a hard failure since vmd
   // doesn't survive across restarts for in-memory registry.
   bool not_found = 10;
+
+  // Host-side physical allocation for the reported template artifacts.
+  int64 rootfs_allocated_bytes = 13;
+  int64 base_allocated_bytes = 14;
+  int64 delta_allocated_bytes = 15;
 }
 
 message CancelBuildRequest {
@@ -360,7 +365,9 @@ message ArtifactManifestEntry {
   string path = 2;        // absolute path on the host
   int64 size_bytes = 3;
   string sha256 = 4;      // lowercase hex
-  string base_path = 5;   // overlay dependency ("" when self-contained)
+	string base_path = 5;   // overlay dependency ("" when self-contained)
+	// -1 means allocation metadata was unavailable; zero is a valid measurement.
+	int64 allocated_bytes = 6; // host physical allocation (st_blocks * 512)
 }
 
 // ---------------------------------------------------------------------------

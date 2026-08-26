@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -37,7 +41,14 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 	}))
 	defer server.Close()
 
-	sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{}, server.URL+"/internal/hosts/host-a/heartbeat", "shared", server.URL+"/health", zerolog.Nop())
+	sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{
+		HostID:            "host-a",
+		VMDAddr:           "10.0.0.2:50051",
+		ProxyAddr:         "10.0.0.2:5007",
+		Region:            "region-a",
+		CapacityMemoryMib: 1024,
+		CapacityVcpus:     8,
+	}, server.URL+"/internal/hosts/host-a/heartbeat", "shared", server.URL+"/health", nil, zerolog.Nop())
 
 	if gotPath != "/internal/hosts/host-a/heartbeat" {
 		t.Fatalf("path = %q", gotPath)
@@ -51,6 +62,12 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Capabilities, want) {
 		t.Fatalf("capabilities = %#v, want %#v", got.Capabilities, want)
+	}
+	if got.VMDAddr != "10.0.0.2:50051" || got.ProxyAddr != "10.0.0.2:5007" || got.Region != "region-a" {
+		t.Fatalf("heartbeat description = %#v", got)
+	}
+	if got.CapacityMemoryMib != 1024 || got.CapacityVcpus != 8 {
+		t.Fatalf("capacity = %#v", got)
 	}
 }
 
@@ -188,7 +205,7 @@ func TestSendHeartbeatOmitsCapabilityForOldOrUnavailableProxy(t *testing.T) {
 			}))
 			defer server.Close()
 
-			sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{}, server.URL+"/internal/hosts/host-a/heartbeat", "", server.URL+"/health", zerolog.Nop())
+			sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a"}, server.URL+"/internal/hosts/host-a/heartbeat", "", server.URL+"/health", nil, zerolog.Nop())
 			if len(got.Capabilities) != 0 {
 				t.Fatalf("capabilities = %#v, want empty", got.Capabilities)
 			}
@@ -196,41 +213,162 @@ func TestSendHeartbeatOmitsCapabilityForOldOrUnavailableProxy(t *testing.T) {
 	}
 }
 
-// The heartbeat payload must stay byte-identical to the pre-registration
-// format unless a complete self-description is configured: control planes
-// that predate self-registration bind the body strictly and reject unknown
-// fields, so a partial or accidental description would kill every heartbeat.
-func TestBuildHeartbeatRequestOmitsIncompleteDescription(t *testing.T) {
-	full := HeartbeatConfig{
-		AdvertiseVMDAddr:   "10.0.0.5:50051",
-		AdvertiseProxyAddr: "10.0.0.5:5007",
-		Region:             "region-a",
-		CapacityMemoryMib:  1024,
-		CapacityVcpus:      8,
+func TestMeasureOverlayStorageUsesAllocatedBlocks(t *testing.T) {
+	runDir := t.TempDir()
+	sandboxID := uuid.NewString()
+	if err := os.Mkdir(filepath.Join(runDir, sandboxID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(runDir, sandboxID, "overlay.ext4")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(64 << 20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{1}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
 	}
 
-	partials := map[string]HeartbeatConfig{
-		"nothing set":    {},
-		"missing vmd":    {AdvertiseProxyAddr: full.AdvertiseProxyAddr, Region: full.Region, CapacityMemoryMib: 1024, CapacityVcpus: 8},
-		"missing proxy":  {AdvertiseVMDAddr: full.AdvertiseVMDAddr, Region: full.Region, CapacityMemoryMib: 1024, CapacityVcpus: 8},
-		"missing region": {AdvertiseVMDAddr: full.AdvertiseVMDAddr, AdvertiseProxyAddr: full.AdvertiseProxyAddr, CapacityMemoryMib: 1024, CapacityVcpus: 8},
-		"zero memory":    {AdvertiseVMDAddr: full.AdvertiseVMDAddr, AdvertiseProxyAddr: full.AdvertiseProxyAddr, Region: full.Region, CapacityVcpus: 8},
+	got, err := measureOverlayStorage(runDir)
+	if err != nil {
+		t.Fatal(err)
 	}
-	legacy, _ := json.Marshal(heartbeatRequest{Capabilities: []string{"preview_ports_v1"}})
-	for name, cfg := range partials {
-		got, err := json.Marshal(buildHeartbeatRequest(cfg, []string{"preview_ports_v1"}))
-		if err != nil {
-			t.Fatalf("%s: marshal: %v", name, err)
-		}
-		if string(got) != string(legacy) {
-			t.Fatalf("%s: payload = %s, want legacy %s", name, got, legacy)
-		}
+	if len(got) != 1 || got[0].SandboxID != sandboxID {
+		t.Fatalf("measurements = %#v", got)
+	}
+	if got[0].AllocatedBytes >= 64<<20 || got[0].AllocatedBytes == 0 {
+		t.Fatalf("allocated bytes = %d, want nonzero and less than logical length", got[0].AllocatedBytes)
+	}
+}
+
+func TestMeasureOverlayStorageSkipsMissingOverlay(t *testing.T) {
+	runDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(runDir, uuid.NewString()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := measureOverlayStorage(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("measurements = %#v, want empty", got)
+	}
+}
+
+func TestMeasureOverlayStorageUsesLegacyRootfs(t *testing.T) {
+	runDir := t.TempDir()
+	sandboxID := uuid.NewString()
+	if err := os.Mkdir(filepath.Join(runDir, sandboxID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(runDir, sandboxID, "rootfs.ext4")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(64 << 20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{1}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
 	}
 
-	got, _ := json.Marshal(buildHeartbeatRequest(full, nil))
-	want := `{"capabilities":null,"vmd_addr":"10.0.0.5:50051","proxy_addr":"10.0.0.5:5007",` +
-		`"region":"region-a","capacity_memory_mib":1024,"capacity_vcpus":8}`
-	if string(got) != want {
-		t.Fatalf("full description = %s, want %s", got, want)
+	got, err := measureOverlayStorage(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SandboxID != sandboxID {
+		t.Fatalf("measurements = %#v", got)
+	}
+	if got[0].AllocatedBytes >= 64<<20 || got[0].AllocatedBytes == 0 {
+		t.Fatalf("allocated bytes = %d, want nonzero and less than logical length", got[0].AllocatedBytes)
+	}
+}
+
+func TestSendHeartbeatOmitsStorageWhenNil(t *testing.T) {
+	var got heartbeatRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			_ = json.NewEncoder(w).Encode(proxyHealthResponse{})
+		case "/heartbeat":
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Errorf("decode heartbeat: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a"}, server.URL+"/heartbeat", "", server.URL+"/health", nil, zerolog.Nop())
+	if got.Storage != nil {
+		t.Fatalf("storage = %#v, want omitted", got.Storage)
+	}
+}
+
+func TestSendHeartbeatRetriesWithoutStorageOnCompatibilityError(t *testing.T) {
+	var got []heartbeatRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			_ = json.NewEncoder(w).Encode(proxyHealthResponse{})
+		case "/heartbeat":
+			var req heartbeatRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode heartbeat: %v", err)
+			}
+			got = append(got, req)
+			if len(got) == 1 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"json: unknown field \"storage\""}}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	ok, accepted := sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a"}, server.URL+"/heartbeat", "", server.URL+"/health", []heartbeatStorageMeasurement{{SandboxID: "sandbox-a", AllocatedBytes: 1}}, zerolog.Nop())
+	if !ok {
+		t.Fatal("heartbeat should succeed after retrying without storage")
+	}
+	if accepted {
+		t.Fatal("storage should not be marked accepted when the control plane rejected it")
+	}
+	if len(got) != 2 {
+		t.Fatalf("requests = %d, want 2", len(got))
+	}
+	if len(got[0].Storage) == 0 {
+		t.Fatal("first request should carry storage")
+	}
+	if got[1].Storage != nil {
+		t.Fatalf("second request storage = %#v, want omitted", got[1].Storage)
+	}
+}
+
+func TestHeartbeatStorageCacheRetriesUnchangedSamplesAfterInterval(t *testing.T) {
+	cache := &heartbeatStorageCache{}
+	cache.store([]heartbeatStorageMeasurement{{SandboxID: "host-a", AllocatedBytes: 1}})
+	version, _ := cache.snapshot()
+	now := time.Now()
+
+	if !cache.shouldSend(version, now) {
+		t.Fatal("fresh measurements must be sent")
+	}
+	cache.markSent(version, now)
+
+	if cache.shouldSend(version, now.Add(overlayStorageSampleInterval-time.Second)) {
+		t.Fatal("unchanged measurements should stay suppressed until the retry interval")
+	}
+	if !cache.shouldSend(version, now.Add(overlayStorageSampleInterval)) {
+		t.Fatal("unchanged measurements must be retried after the retry interval")
 	}
 }

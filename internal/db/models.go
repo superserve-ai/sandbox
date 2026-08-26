@@ -227,17 +227,18 @@ type ApiKey struct {
 }
 
 type ArtifactManifest struct {
-	ID          uuid.UUID   `json:"id"`
-	SnapshotID  pgtype.UUID `json:"snapshot_id"`
-	TemplateID  pgtype.UUID `json:"template_id"`
-	FileName    string      `json:"file_name"`
-	Path        string      `json:"path"`
-	SizeBytes   int64       `json:"size_bytes"`
-	Sha256      string      `json:"sha256"`
-	BasePath    *string     `json:"base_path"`
-	GuestKernel *string     `json:"guest_kernel"`
-	VmdVersion  *string     `json:"vmd_version"`
-	CreatedAt   time.Time   `json:"created_at"`
+	ID             uuid.UUID   `json:"id"`
+	SnapshotID     pgtype.UUID `json:"snapshot_id"`
+	TemplateID     pgtype.UUID `json:"template_id"`
+	FileName       string      `json:"file_name"`
+	Path           string      `json:"path"`
+	SizeBytes      int64       `json:"size_bytes"`
+	Sha256         string      `json:"sha256"`
+	BasePath       *string     `json:"base_path"`
+	GuestKernel    *string     `json:"guest_kernel"`
+	VmdVersion     *string     `json:"vmd_version"`
+	CreatedAt      time.Time   `json:"created_at"`
+	AllocatedBytes int64       `json:"allocated_bytes"`
 }
 
 type AuditLog struct {
