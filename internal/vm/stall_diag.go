@@ -49,8 +49,16 @@ var stallDiagSem = make(chan struct{}, 2)
 // healthy restore it stops a timer that never fired, which is this feature's
 // entire cost there.
 func (m *Manager) armEarlyStallDiagnostics(vmID string, launchPID int) func() {
+	// Cancellation runs through a context, not the timer: Stop cannot recall
+	// a callback that already fired, so a restore that becomes ready just
+	// after the threshold would otherwise be profiled and logged as stalled —
+	// a false specimen in the very data this exists to produce.
+	ctx, cancel := context.WithCancel(context.Background())
 	timer := time.AfterFunc(stallDiagAfter, func() {
 		defer sentrylog.Recover("stall-diag-arm")
+		if ctx.Err() != nil {
+			return
+		}
 		select {
 		case stallDiagSem <- struct{}{}:
 		default:
@@ -59,32 +67,45 @@ func (m *Manager) armEarlyStallDiagnostics(vmID string, launchPID int) func() {
 			return
 		}
 		defer func() { <-stallDiagSem }()
-		m.runStallDiagnostics(vmID, m.resolveFCPID(vmID, launchPID))
+		m.runStallDiagnostics(ctx, vmID, m.resolveFCPID(vmID, launchPID))
 	})
-	return func() { timer.Stop() }
+	return func() {
+		timer.Stop()
+		cancel()
+	}
 }
 
 // runStallDiagnostics collects the live-VM evidence and logs it. A probe that
 // fails contributes an empty field rather than aborting the rest.
-func (m *Manager) runStallDiagnostics(vmID string, pid int) {
+func (m *Manager) runStallDiagnostics(parent context.Context, vmID string, pid int) {
 	if pid <= 0 || !pidIsVMFirecracker(pid, vmID) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), stallDiagBudget)
+	ctx, cancel := context.WithTimeout(parent, stallDiagBudget)
 	defer cancel()
+	deadline, _ := ctx.Deadline()
 	started := time.Now()
 
-	before, kvmDir := readKVMCounters(pid)
+	before, kvmDir := readKVMCounters(pid, deadline)
 	select {
 	case <-time.After(stallDiagSettle):
 	case <-ctx.Done():
 		return
 	}
-	after, _ := readKVMCounters(pid)
+	after, _ := readKVMCounters(pid, deadline)
 	deltas := counterDeltas(before, after)
 
 	guestIPs := sampleGuestIPs(ctx, pid)
-	threads := captureProcState(pid, vmID)
+	threads, _ := captureProcStateBounded(pid, vmID, nil)
+	if threads == nil {
+		threads = &procStallState{PID: pid, UffdPending: -1, UffdTotal: -1}
+	}
+
+	// The guest may have come up while the battery ran; publishing then would
+	// record a healthy restore as a stall.
+	if ctx.Err() != nil {
+		return
+	}
 
 	ev := m.log.Warn().Str("vm_id", vmID).
 		Int("fc_pid", pid).
@@ -126,7 +147,7 @@ func (m *Manager) writeStallDiagDump(vmID string, pid int, deltas map[string]int
 // readKVMCounters reads every per-VM and per-vCPU counter KVM exposes for
 // this process. Names carry their vcpu directory as a prefix, since telling
 // the spinning vCPU from the halted one is the entire point.
-func readKVMCounters(pid int) (map[string]int64, string) {
+func readKVMCounters(pid int, deadline time.Time) (map[string]int64, string) {
 	out := map[string]int64{}
 	base, err := kvmDebugDirFor(pid)
 	if err != nil {
@@ -141,11 +162,11 @@ func readKVMCounters(pid int) (map[string]int64, string) {
 			if e.IsDir() {
 				continue
 			}
-			raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
-			if err != nil {
-				continue
+			raw, ok := readProcFileBy(filepath.Join(dir, e.Name()), deadline)
+			if !ok {
+				return // out of budget; report what was gathered
 			}
-			if n, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64); err == nil {
+			if n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil {
 				out[prefix+e.Name()] = n
 			}
 		}
@@ -178,13 +199,43 @@ func kvmDebugDirFor(pid int) (string, error) {
 	return "", os.ErrNotExist
 }
 
-// counterDeltas keeps only counters that moved: what is still ticking (or
-// conspicuously not) is the signal, and dropping the hundreds of static
-// counters is what makes it readable.
+// alwaysReportCounters are reported even when they did not move. A zero here
+// is a finding, not noise: an exit count that stays flat while a vCPU burns
+// CPU says the guest is looping without ever leaving guest mode, and a halt
+// wakeup that never increments says nothing is being delivered to the halted
+// one. Omitting them would make "did not move" indistinguishable from "not
+// available".
+var alwaysReportCounters = map[string]bool{
+	"exits":                true,
+	"halt_exits":           true,
+	"halt_wakeup":          true,
+	"halt_successful_poll": true,
+	"halt_attempted_poll":  true,
+	"irq_injections":       true,
+	"irq_window_exits":     true,
+	"nmi_injections":       true,
+	"mmio_exits":           true,
+	"signal_exits":         true,
+	"insn_emulation":       true,
+	"request_irq_exits":    true,
+	"guest_mode":           true,
+}
+
+// counterDeltas reports counters that moved, plus the allowlist above whether
+// they moved or not. Dropping the hundreds of remaining static counters is
+// what keeps the result readable.
 func counterDeltas(before, after map[string]int64) map[string]int64 {
 	deltas := map[string]int64{}
 	for k, a := range after {
-		if b, ok := before[k]; ok && a != b {
+		b, ok := before[k]
+		if !ok {
+			continue
+		}
+		name := k
+		if i := strings.LastIndex(k, "/"); i >= 0 {
+			name = k[i+1:]
+		}
+		if a != b || alwaysReportCounters[name] {
 			deltas[k] = a - b
 		}
 	}
@@ -211,12 +262,32 @@ func formatDeltas(deltas map[string]int64) string {
 	return strings.Join(parts, " ")
 }
 
-var guestIPPattern = regexp.MustCompile(`(?m)^\s*([0-9a-f]{6,16})\s`)
+// guestSampleLine matches a perf script line of the form "<ip> <dso>", where
+// the dso identifies which address space the sample came from.
+var guestSampleLine = regexp.MustCompile(`(?m)^\s*([0-9a-f]{6,16})\s+(\S.*)$`)
 
-// sampleGuestIPs profiles the stalled process and returns distinct guest
-// instruction pointers, most frequent first. Addresses rather than symbols:
-// the shipped guest kernel is stripped, so resolution happens offline against
-// a kallsyms dump from a live guest of the same image.
+// guestDSO reports whether a perf dso field denotes guest address space.
+// perf labels guest samples with a guest-specific dso; anything else is a
+// host address inside Firecracker or the kernel.
+func guestDSO(dso string) bool {
+	return strings.Contains(strings.ToLower(dso), "guest")
+}
+
+// sampleGuestIPs profiles the stalled VM and returns distinct GUEST
+// instruction pointers, most frequent first.
+//
+// Two things make this trustworthy rather than merely plausible. It records
+// through `perf kvm --guest`, which is the interface built for guest
+// profiling — plain `perf record` on the pid samples the host side and would
+// hand back Firecracker and KVM addresses. And it keeps only samples perf
+// attributes to guest address space, so an address is either provably from
+// the guest or absent: reporting a host address as a guest RIP would send a
+// reader to resolve it against guest symbols and arrive at confident
+// nonsense, which is worse than reporting nothing.
+//
+// Addresses rather than symbols because the shipped guest kernel is stripped;
+// resolution happens offline against a kallsyms dump from a live guest of the
+// same image.
 func sampleGuestIPs(ctx context.Context, pid int) []string {
 	tmp, err := os.MkdirTemp("", "stalldiag")
 	if err != nil {
@@ -225,21 +296,23 @@ func sampleGuestIPs(ctx context.Context, pid int) []string {
 	defer os.RemoveAll(tmp)
 	data := filepath.Join(tmp, "perf.data")
 
-	rec := exec.CommandContext(ctx, "perf", "record", "-e", "cpu-clock", "-F", "97",
-		"--pid", strconv.Itoa(pid), "-o", data, "--", "sleep",
+	rec := exec.CommandContext(ctx, "perf", "kvm", "--guest", "record",
+		"-p", strconv.Itoa(pid), "-o", data, "--", "sleep",
 		strconv.Itoa(int(stallDiagPerfWindow/time.Second)))
 	if err := rec.Run(); err != nil {
 		return nil
 	}
-	script := exec.CommandContext(ctx, "perf", "script", "-i", data, "-F", "ip")
+	script := exec.CommandContext(ctx, "perf", "script", "-i", data, "-F", "ip,dso")
 	out, err := script.Output()
 	if err != nil {
 		return nil
 	}
 
 	counts := map[string]int{}
-	for _, m := range guestIPPattern.FindAllStringSubmatch(string(out), -1) {
-		counts[m[1]]++
+	for _, m := range guestSampleLine.FindAllStringSubmatch(string(out), -1) {
+		if guestDSO(m[2]) {
+			counts[m[1]]++
+		}
 	}
 	ips := make([]string, 0, len(counts))
 	for ip := range counts {
