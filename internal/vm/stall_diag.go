@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
@@ -144,9 +145,15 @@ func (m *Manager) writeStallDiagDump(vmID string, pid int, deltas map[string]int
 	}
 }
 
-// readKVMCounters reads every per-VM and per-vCPU counter KVM exposes for
-// this process. Names carry their vcpu directory as a prefix, since telling
-// the spinning vCPU from the halted one is the entire point.
+// readKVMCounters reads every counter KVM exposes for this process.
+//
+// The useful counters (exits, halt_wakeup, irq_injections, ...) live at the
+// VM level and are aggregated across vCPUs; the per-vCPU directories carry
+// only a handful of values. That is still enough: a flat VM-wide exit count
+// while a vCPU burns CPU proves a loop that never leaves guest mode, and the
+// per-vCPU guest_mode and pid entries say which vCPU is executing and map it
+// to the thread stacks captured alongside. Names keep their directory as a
+// prefix so the two levels stay distinguishable.
 func readKVMCounters(pid int, deadline time.Time) (map[string]int64, string) {
 	out := map[string]int64{}
 	base, err := kvmDebugDirFor(pid)
@@ -262,6 +269,24 @@ func formatDeltas(deltas map[string]int64) string {
 	return strings.Join(parts, " ")
 }
 
+// perfUsable caches whether perf can actually profile. Distributions ship a
+// wrapper at the usual path that only prints an "install linux-tools-<kernel>"
+// notice, so presence on PATH proves nothing and a stall must not spend a
+// subprocess discovering that every time.
+var perfUsable atomic.Pointer[bool]
+
+func perfIsUsable() bool {
+	if cached := perfUsable.Load(); cached != nil {
+		return *cached
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "perf", "--version").CombinedOutput()
+	ok := err == nil && !strings.Contains(string(out), "linux-tools")
+	perfUsable.Store(&ok)
+	return ok
+}
+
 // guestSampleLine matches a perf script line of the form "<ip> <dso>", where
 // the dso identifies which address space the sample came from.
 var guestSampleLine = regexp.MustCompile(`(?m)^\s*([0-9a-f]{6,16})\s+(\S.*)$`)
@@ -296,6 +321,9 @@ func sampleGuestIPs(ctx context.Context, pid int) []string {
 	defer os.RemoveAll(tmp)
 	data := filepath.Join(tmp, "perf.data")
 
+	if !perfIsUsable() {
+		return nil
+	}
 	rec := exec.CommandContext(ctx, "perf", "kvm", "--guest", "record",
 		"-p", strconv.Itoa(pid), "-o", data, "--", "sleep",
 		strconv.Itoa(int(stallDiagPerfWindow/time.Second)))

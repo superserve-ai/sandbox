@@ -69,6 +69,20 @@ func TestKVMDebugDirMatchesTheWholePIDToken(t *testing.T) {
 	}
 }
 
+func TestPerfStubIsNotTreatedAsUsable(t *testing.T) {
+	// Distributions ship a wrapper at perf's usual path that only prints an
+	// "install linux-tools-<kernel>" notice. Presence on PATH proves nothing,
+	// and profiling through the stub yields no samples at all.
+	stub := "perf not found for kernel 6.8.0-1063-gcp\n\nYou may need to install the following packages for this specific kernel:\n    linux-tools-6.8.0-1063-gcp\n"
+	if !strings.Contains(stub, "linux-tools") {
+		t.Fatal("test fixture no longer resembles the stub output")
+	}
+	real := "perf version 6.8.12\n"
+	if strings.Contains(real, "linux-tools") {
+		t.Fatal("a working perf must not be mistaken for the stub")
+	}
+}
+
 func TestOnlyGuestSamplesAreReported(t *testing.T) {
 	// A host address reported as a guest RIP would be resolved against guest
 	// symbols and yield confident nonsense — worse than reporting nothing.
