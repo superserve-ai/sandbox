@@ -52,6 +52,28 @@ const (
 // host that is already unwell. Saturated attempts are skipped, not queued.
 var stallDiagSem = make(chan struct{}, 2)
 
+// A host-wide stall can leave hundreds of restores unready at once, and one
+// warning per skipped restore would itself become load on a struggling host.
+// Skips are counted and reported as one aggregate warning per interval.
+var (
+	stallDiagSkips    atomic.Int64
+	stallDiagLastWarn atomic.Int64
+)
+
+const stallDiagWarnEvery = 30 * time.Second
+
+// claimSkipWarn records one saturated skip and reports whether this caller
+// should emit the aggregate warning, returning the skips it covers.
+func claimSkipWarn(now time.Time) (int64, bool) {
+	stallDiagSkips.Add(1)
+	last := stallDiagLastWarn.Load()
+	if now.UnixNano()-last < int64(stallDiagWarnEvery) ||
+		!stallDiagLastWarn.CompareAndSwap(last, now.UnixNano()) {
+		return 0, false
+	}
+	return stallDiagSkips.Swap(0), true
+}
+
 // armEarlyStallDiagnostics schedules the battery for a guest still unready
 // after stallDiagAfter. The returned cancel is safe on every path; on a
 // healthy restore it stops a timer that never fired, which is this feature's
@@ -76,8 +98,11 @@ func (m *Manager) armEarlyStallDiagnostics(vmID string, launchPID int) func() {
 		select {
 		case stallDiagSem <- struct{}{}:
 		default:
-			m.log.Warn().Str("vm_id", vmID).
-				Msg("guest slow to become ready — diagnostics skipped (concurrent batteries saturated)")
+			// vm_id is a sample, not the full set; skipped carries the count.
+			if n, ok := claimSkipWarn(time.Now()); ok {
+				m.log.Warn().Int64("skipped", n).Str("vm_id", vmID).
+					Msg("guests slow to become ready — diagnostics skipped (concurrent batteries saturated)")
+			}
 			return
 		}
 		defer func() { <-stallDiagSem }()
@@ -247,12 +272,6 @@ func kvmDebugDirFor(pid int) (string, error) {
 	return "", os.ErrNotExist
 }
 
-// alwaysReportCounters are reported even when they did not move. A zero here
-// is a finding, not noise: an exit count that stays flat while a vCPU burns
-// CPU says the guest is looping without ever leaving guest mode, and a halt
-// wakeup that never increments says nothing is being delivered to the halted
-// one. Omitting them would make "did not move" indistinguishable from "not
-// available".
 // kvmGauges hold a current value rather than a running total, so a delta of
 // zero says "unchanged", not "idle" — guest_mode 1→1 and 0→0 are opposite
 // findings that subtract to the same number. They are reported as values.
@@ -403,18 +422,20 @@ func formatDeltas(deltas map[string]int64) string {
 // subprocess discovering that every time.
 var perfUsable atomic.Pointer[bool]
 
-func perfIsUsable() bool {
+// perfIsUsable derives its probe from the battery's context so cancellation
+// reaches the subprocess instead of leaving it to run out its own clock.
+func perfIsUsable(parent context.Context) bool {
 	if cached := perfUsable.Load(); cached != nil {
 		return *cached
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "perf", "--version").CombinedOutput()
 	if err != nil {
-		// Could not run it at all — a fork failure or timeout under the very
-		// host pressure that accompanies a stall. That says nothing durable
-		// about perf, so it is not cached: caching it would silently disable
-		// guest profiling for the rest of this process's life.
+		// Could not run it at all — cancelled, a fork failure, or a timeout
+		// under the very host pressure that accompanies a stall. That says
+		// nothing durable about perf, so it is not cached: caching it would
+		// silently disable guest profiling for the rest of this process's life.
 		return false
 	}
 	// A command that ran gives a deterministic answer: the distribution stub
@@ -451,16 +472,15 @@ func guestDSO(dso string) bool {
 // resolution happens offline against a kallsyms dump from a live guest of the
 // same image.
 func sampleGuestIPs(ctx context.Context, pid int) []string {
+	if !perfIsUsable(ctx) {
+		return nil
+	}
 	tmp, err := os.MkdirTemp("", "stalldiag")
 	if err != nil {
 		return nil
 	}
 	defer os.RemoveAll(tmp)
 	data := filepath.Join(tmp, "perf.data")
-
-	if !perfIsUsable() {
-		return nil
-	}
 	rec := exec.CommandContext(ctx, "perf", "kvm", "--guest", "record",
 		"-F", stallDiagPerfHz, "--max-size", stallDiagPerfMaxSize,
 		"-p", strconv.Itoa(pid), "-o", data, "--", "sleep",

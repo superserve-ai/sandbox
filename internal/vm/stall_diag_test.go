@@ -172,6 +172,42 @@ func TestKVMDebugDirMatchesTheWholePIDToken(t *testing.T) {
 	}
 }
 
+func TestSaturationWarningsAreAggregated(t *testing.T) {
+	// A host-wide stall can leave hundreds of restores unready at once; one
+	// warning per skipped restore would itself be load on a struggling host,
+	// so skips accumulate into one counted warning per interval.
+	stallDiagSkips.Store(0)
+	stallDiagLastWarn.Store(0)
+	base := time.Unix(1000, 0)
+
+	if n, ok := claimSkipWarn(base); !ok || n != 1 {
+		t.Fatalf("first skip should warn with count 1, got %d %v", n, ok)
+	}
+	for i := 0; i < 400; i++ {
+		if _, ok := claimSkipWarn(base.Add(time.Second)); ok {
+			t.Fatal("skips within the interval must not each warn")
+		}
+	}
+	if n, ok := claimSkipWarn(base.Add(stallDiagWarnEvery + time.Second)); !ok || n != 401 {
+		t.Fatalf("next interval should warn with the accumulated 401 skips, got %d %v", n, ok)
+	}
+}
+
+func TestCancelledPerfProbeIsNotCached(t *testing.T) {
+	// A probe that never ran — cancelled by readiness completing — says
+	// nothing durable about perf. Caching its failure would silently disable
+	// guest profiling for the rest of the process's life.
+	perfUsable.Store(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if perfIsUsable(ctx) {
+		t.Fatal("a cancelled probe must not report perf as usable")
+	}
+	if perfUsable.Load() != nil {
+		t.Fatal("a probe that never ran must not be cached")
+	}
+}
+
 func TestPerfStubIsNotTreatedAsUsable(t *testing.T) {
 	// Distributions ship a wrapper at perf's usual path that only prints an
 	// "install linux-tools-<kernel>" notice. Presence on PATH proves nothing,
