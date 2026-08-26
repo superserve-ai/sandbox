@@ -90,8 +90,14 @@ func (s VMStatus) String() string {
 
 // VMInstance holds the runtime state of a single microVM.
 type VMInstance struct {
-	ID             string
-	PID            int
+	ID  string
+	PID int
+	// launchGen fences PID publication to the attempt that started it. A
+	// retry reuses this instance, and the previous attempt's asynchronous
+	// MainPID resolver can still be in flight — writing a stopped unit's PID
+	// into the new attempt's record. Bumped under mu at each attempt start;
+	// a resolver whose captured generation no longer matches drops its write.
+	launchGen      uint64
 	SocketPath     string
 	VsockPath      string
 	IP             string
@@ -496,6 +502,13 @@ type Manager struct {
 	// holds the lock until destroy SIGKILLs the process), so blocking it
 	// would turn a recoverable wedge into a permanent hang.
 	vmOpLocks sync.Map
+
+	// launchGenSeq issues launch generations. It is manager-global and
+	// monotonic on purpose: a per-instance counter restarts at zero whenever
+	// restoreVMSnapshot installs a fresh VMInstance for the same VM id, so
+	// two different attempts would both hold generation 1 and a delayed
+	// resolver from the first could publish its dead PID into the second.
+	launchGenSeq atomic.Uint64
 
 	// forensicsOK gates console quarantine: false when the root-only
 	// forensics directory could not be created or secured at startup.
@@ -2818,6 +2831,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// freshUnit && attempt == 1: only a first-attempt fresh unit may skip
 		// the linger query; a retry replaces the prior attempt's unit. The
 		// dispatcher threads it to the systemd path (irrelevant to cgroup).
+		// Forget the previous attempt's PID BEFORE this launch can spawn its
+		// own MainPID resolver: a retry reuses `inst`, and a stale PID that
+		// survives into the new attempt points at a stopped (possibly
+		// recycled) process — which stall capture would then inspect and
+		// report as this VM's.
+		m.beginLaunchAttempt(inst)
 		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace || priorRunDir, freshUnit && attempt == 1)
 		// Stamp the chosen mode NOW, before the error branch: a launch that
 		// forked a cgroup FC but failed socket-readiness (and whose own kill
@@ -2833,10 +2852,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("start firecracker: %w", startErr)
 		}
-		inst.mu.Lock()
-		inst.PID = pid
-		inst.Supervision = supervision
-		inst.mu.Unlock()
+		publishLaunchPID(inst, pid, supervision)
 		tFcReady = time.Now()
 
 		// Attempts after the first measure from the attempt start, so a retry's
@@ -3075,7 +3091,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// and that aborting restore should neither pay the file read nor
 		// pollute the stall signal.
 		if ctx.Err() == nil {
-			m.captureStallForensics(vmID, time.Since(tBoxdStart), tAttemptStart)
+			m.captureStallForensics(vmID, m.resolveFCPID(vmID, pid), time.Since(tBoxdStart), tAttemptStart)
 		}
 		// Teardown first — none of it touches BoltDB, so a stalled persist
 		// cannot keep the failed restore's unit and network alive.
@@ -5463,7 +5479,7 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// Read the PID asynchronously so the create path isn't slowed down
 	// by the ~15ms dbus roundtrip. The PID is populated in the instance
 	// shortly after create returns and persisted to BoltDB.
-	go m.resolveAndSetPID(vmID)
+	go m.resolveAndSetPID(vmID, m.launchGenFor(vmID))
 
 	return 0, nil
 }
@@ -5490,7 +5506,7 @@ func (m *Manager) unitMainPID(ctx context.Context, vmID string) int {
 	return pid
 }
 
-func (m *Manager) resolveAndSetPID(vmID string) {
+func (m *Manager) resolveAndSetPID(vmID string, gen uint64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -5506,9 +5522,11 @@ func (m *Manager) resolveAndSetPID(vmID string) {
 		return
 	}
 
-	inst.mu.Lock()
-	inst.PID = pid
-	inst.mu.Unlock()
+	if !publishResolvedPID(inst, gen, pid) {
+		// A newer launch attempt owns this record; publishing here would
+		// point every later reader at a stopped unit.
+		return
+	}
 
 	// The persist must join the vm op critical section: unserialized, its
 	// snapshot could commit after the launching op's own writes (e.g. the
@@ -5788,12 +5806,15 @@ func summarizeConsoleTail(tail string) (fcLines, boxdLines, guestLines int, pani
 // otherwise delete the only evidence. An empty console is itself the
 // strongest signal: the guest stalled before its first line.
 //
-// Only the console-file rename runs synchronously (microseconds, and it must
-// beat the teardown's rundir delete). The unit-supervised fallback shells to
-// journalctl, so it runs detached: the journal survives the teardown on its
-// own, and the reply path must not spend its in-band-verdict margin on it.
-func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launchedAt time.Time) {
+// Two things run synchronously because the teardown destroys their subject:
+// the console rename (the rundir is deleted) and the procfs read of the
+// Firecracker process (the process is killed). Both are in-memory operations
+// — a rename and a handful of procfs reads, no disk I/O — so the in-band
+// verdict margin is preserved. Formatting, logging, quarantine writes, and
+// the journald fallback all run detached.
+func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Duration, launchedAt time.Time) {
 	failedAt := time.Now()
+
 	src := filepath.Join(m.cfg.RunDir, vmID, "console.log")
 	// The ONLY work that must beat the teardown's rundir delete is moving
 	// the file out (direct-spawn mode; unit mode has no file, and its
@@ -5803,8 +5824,45 @@ func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launc
 	dir := filepath.Join(m.cfg.RunDir, stallForensicsDirName)
 	dst := filepath.Join(dir, fmt.Sprintf("%d-%s.console.log", failedAt.Unix(), vmID))
 	renamed := m.forensicsOK && os.Rename(src, dst) == nil // dir pre-created and secured at startup
+	// Proc capture runs AFTER the rename: both are best-effort and race a
+	// concurrent DestroyVM (which bypasses the lifecycle lock and deletes the
+	// rundir), but the rename is microseconds while the capture may spend its
+	// whole budget — doing the cheap one first keeps a slow capture from
+	// costing us the console too.
+	var proc *procStallState
+	if pid > 0 {
+		var outcome captureOutcome
+		// A late capture publishes itself rather than being discarded: a read
+		// slow enough to miss the budget signals exactly the host conditions
+		// worth diagnosing.
+		onLate := func(st *procStallState) {
+			m.log.Warn().Str("vm_id", vmID).Msg("guest not ready — proc capture completed after its budget")
+			m.logStallProcState(vmID, waited, st, dir, failedAt)
+			// This write lands after the forensics goroutine's own prune has
+			// already run, so it must prune for itself or late captures
+			// accumulate outside the cap entirely. Concurrent prunes race
+			// benignly — removing an already-removed entry is a no-op.
+			if m.forensicsOK {
+				pruneOldest(dir, stallForensicsKeep)
+			}
+		}
+		if proc, outcome = captureProcStateBounded(pid, vmID, onLate); outcome != captureOK {
+			m.log.Warn().Str("vm_id", vmID).Int("fc_pid", pid).Str("outcome", string(outcome)).
+				Msg("guest not ready — proc capture did not complete inline; proceeding to teardown")
+		}
+	}
 	go func() {
 		defer sentrylog.Recover("stall-forensics")
+		// One prune covering every exit path: a stall can add a console file,
+		// a procstate file, or both, and the paths that produce no console
+		// (unit supervision, a console already gone) must not grow the
+		// quarantine without bound.
+		if m.forensicsOK {
+			defer pruneOldest(dir, stallForensicsKeep)
+		}
+		if proc != nil {
+			m.logStallProcState(vmID, waited, proc, dir, failedAt)
+		}
 		if renamed {
 			_ = os.Chmod(dst, 0o600)
 			tail, size, err := tailFile(dst, 4096)
@@ -5814,7 +5872,6 @@ func (m *Manager) captureStallForensics(vmID string, waited time.Duration, launc
 			} else {
 				m.logStallSummary(vmID, waited, tail, size, dst)
 			}
-			pruneOldest(dir, stallForensicsKeep)
 			return
 		}
 		select {
