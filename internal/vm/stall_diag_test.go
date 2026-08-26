@@ -68,6 +68,24 @@ func TestExpensiveKVMEntriesAreNeverOpened(t *testing.T) {
 	}
 }
 
+func TestBatteryAbandonsAProcessThatChangedIdentity(t *testing.T) {
+	// The settle interval gives the stalled process time to exit, and the
+	// kernel may hand its number to another Firecracker. Recording that
+	// process's counters and guest addresses under this VM's id would be
+	// worse than recording nothing, so the battery abandons instead.
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	m.runStallDiagnostics(context.Background(), "00000000-0000-0000-0000-000000000000", os.Getpid())
+
+	// A cancelled battery must not start the shared-semaphore capture at all;
+	// stealing a slot there can make a genuine timeout skip its own capture.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	m.runStallDiagnostics(ctx, "any-vm", os.Getpid())
+	if len(stallProcSem) != 0 {
+		t.Fatalf("cancelled battery left %d proc-capture slots held", len(stallProcSem))
+	}
+}
+
 func TestGaugesAreReportedAsValuesNotDeltas(t *testing.T) {
 	// guest_mode and pid hold a current value, not a running total. As deltas
 	// they are actively misleading: 1→1 and 0→0 both subtract to zero, which

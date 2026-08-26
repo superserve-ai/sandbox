@@ -100,13 +100,31 @@ func (m *Manager) runStallDiagnostics(parent context.Context, vmID string, pid i
 	case <-ctx.Done():
 		return
 	}
+	// Re-check identity after the settle, before anything reads or profiles
+	// again. The process may have exited during those seconds and the kernel
+	// is free to hand its number to another Firecracker — whose counters and
+	// guest addresses would then be recorded under this VM's id. Abandoning
+	// the battery is the right trade: no evidence beats wrong evidence.
+	if ctx.Err() != nil || !pidIsVMFirecracker(pid, vmID) {
+		return
+	}
 	after, _ := readKVMCounters(pid, deadline)
 	deltas := counterDeltas(before, after)
 
-	guestIPs := sampleGuestIPs(ctx, pid)
-	threads, _ := captureProcStateBounded(pid, vmID, nil)
-	if threads == nil {
-		threads = &procStallState{PID: pid, UffdPending: -1, UffdTotal: -1}
+	var guestIPs []string
+	if ctx.Err() == nil {
+		guestIPs = sampleGuestIPs(ctx, pid)
+	}
+
+	// Only after profiling, and only if still wanted: this capture takes a
+	// slot in the semaphore the teardown path shares, so starting one for a
+	// battery that is already cancelled can make a genuine timeout skip its
+	// own capture as saturated.
+	threads := &procStallState{PID: pid, UffdPending: -1, UffdTotal: -1}
+	if ctx.Err() == nil {
+		if st, _ := captureProcStateBounded(pid, vmID, nil); st != nil {
+			threads = st
+		}
 	}
 
 	// The guest may have come up while the battery ran; publishing then would
