@@ -47,6 +47,27 @@ func TestCounterDeltasKeepMovementAndTheProofOfStillness(t *testing.T) {
 	}
 }
 
+func TestExpensiveKVMEntriesAreNeverOpened(t *testing.T) {
+	// Reading mmu_rmaps_stat takes the KVM MMU write lock and walks every
+	// memslot's reverse maps, blocking the guest's own fault handling. The
+	// cost is paid at open, so filtering after parsing would be too late.
+	// The *_hist entries are not single integers either.
+	for _, name := range []string{"mmu_rmaps_stat", "halt_poll_success_hist", "halt_poll_fail_hist", "halt_wait_hist"} {
+		if kvmReadable(name) {
+			t.Fatalf("%q would be opened; it is not a cheap integer", name)
+		}
+	}
+	// Entries the diagnosis depends on, all verified present on the hosts.
+	for _, name := range []string{
+		"exits", "halt_wakeup", "irq_injections", "remote_tlb_flush",
+		"remote_tlb_flush_requests", "notify_window_exits", "guest_mode", "pid",
+	} {
+		if !kvmReadable(name) {
+			t.Fatalf("%q must be readable — the diagnosis depends on it", name)
+		}
+	}
+}
+
 func TestGaugesAreReportedAsValuesNotDeltas(t *testing.T) {
 	// guest_mode and pid hold a current value, not a running total. As deltas
 	// they are actively misleading: 1→1 and 0→0 both subtract to zero, which

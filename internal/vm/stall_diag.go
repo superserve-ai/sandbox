@@ -157,7 +157,8 @@ func (m *Manager) writeStallDiagDump(vmID string, pid int, deltas, gauges map[st
 	}
 }
 
-// readKVMCounters reads every counter KVM exposes for this process.
+// readKVMCounters reads the allowlisted counters KVM exposes for this
+// process; see kvmReadable for why the set is explicit.
 //
 // The useful counters (exits, halt_wakeup, irq_injections, ...) live at the
 // VM level and are aggregated across vCPUs; the per-vCPU directories carry
@@ -178,7 +179,7 @@ func readKVMCounters(pid int, deadline time.Time) (map[string]int64, string) {
 			return
 		}
 		for _, e := range entries {
-			if e.IsDir() {
+			if e.IsDir() || !kvmReadable(e.Name()) {
 				continue
 			}
 			raw, ok := readProcFileBy(filepath.Join(dir, e.Name()), deadline)
@@ -235,19 +236,65 @@ var kvmGauges = map[string]bool{
 	"lapic_timer_advance_ns": true,
 }
 
+// alwaysReportCounters are reported even when they did not move. A zero here
+// is a finding, not noise: an exit count that stays flat while a vCPU burns
+// CPU says the guest is looping without ever leaving guest mode, and a halt
+// wakeup that never increments says nothing is reaching the halted one.
+// Omitting them would make "did not move" indistinguishable from "not
+// available". The tlb-flush and notify entries speak to whether one vCPU is
+// waiting on another to acknowledge an interrupt.
 var alwaysReportCounters = map[string]bool{
-	"exits":                true,
-	"halt_exits":           true,
-	"halt_wakeup":          true,
-	"halt_successful_poll": true,
-	"halt_attempted_poll":  true,
-	"irq_injections":       true,
-	"irq_window_exits":     true,
-	"nmi_injections":       true,
-	"mmio_exits":           true,
-	"signal_exits":         true,
-	"insn_emulation":       true,
-	"request_irq_exits":    true,
+	"exits":                     true,
+	"halt_exits":                true,
+	"halt_wakeup":               true,
+	"halt_successful_poll":      true,
+	"halt_attempted_poll":       true,
+	"irq_injections":            true,
+	"irq_window_exits":          true,
+	"nmi_injections":            true,
+	"request_irq_exits":         true,
+	"mmio_exits":                true,
+	"signal_exits":              true,
+	"insn_emulation":            true,
+	"remote_tlb_flush":          true,
+	"remote_tlb_flush_requests": true,
+	"notify_window_exits":       true,
+}
+
+// kvmExtraCounters are plain counters reported only when they move.
+var kvmExtraCounters = map[string]bool{
+	"irq_exits":           true,
+	"io_exits":            true,
+	"tlb_flush":           true,
+	"req_event":           true,
+	"blocking":            true,
+	"host_state_reload":   true,
+	"hypercalls":          true,
+	"nmi_window_exits":    true,
+	"halt_poll_invalid":   true,
+	"insn_emulation_fail": true,
+	"preemption_reported": true,
+	"preemption_other":    true,
+	"nx_lpage_splits":     true,
+	"pf_taken":            true,
+	"pf_fixed":            true,
+	"pf_fast":             true,
+	"pf_guest":            true,
+	"pf_spurious":         true,
+	"pf_emulate":          true,
+}
+
+// kvmReadable gates which debugfs entries are OPENED at all.
+//
+// Not every entry there is a cheap integer. Reading mmu_rmaps_stat takes
+// slots_lock and the MMU *write* lock and walks each memslot's reverse maps —
+// work proportional to guest memory, performed while blocking the guest's own
+// fault handling. Parsing the result and discarding it would be far too late:
+// the cost is paid at open. The *_hist entries are likewise not single
+// integers. A battery only ever runs against a VM that is already unwell, so
+// entries are named explicitly rather than discovered.
+func kvmReadable(name string) bool {
+	return alwaysReportCounters[name] || kvmGauges[name] || kvmExtraCounters[name]
 }
 
 // counterDeltas reports counters that moved, plus the allowlist above whether
