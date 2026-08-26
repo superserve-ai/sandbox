@@ -6,6 +6,7 @@ Current scope:
 
 - Cloud Monitoring dashboards from checked-in JSON definitions
 - Terraform-managed Compute Engine CPU saturation alert policies
+- Terraform-managed sandbox lifecycle latency and failed-transition alert policies
 
 Alert policies use the existing Cloud Monitoring notification channel resource
 names supplied by `notification_channel_ids`. Every channel must belong to the

@@ -6,10 +6,11 @@ import (
 )
 
 const (
-	ResultSuccess  = "success"
-	ResultError    = "error"
-	ResultConflict = "conflict"
-	ResultTimeout  = "timeout"
+	ResultSuccess     = "success"
+	ResultError       = "error"
+	ResultConflict    = "conflict"
+	ResultTimeout     = "timeout"
+	ResultClientError = "client_error"
 )
 
 // Result values for SandboxResumeSettleWait. Distinct from the ResultX enum
