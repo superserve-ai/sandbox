@@ -25,6 +25,7 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
@@ -452,11 +453,12 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir, pa
 	manifest := make([]vmdclient.ManifestEntry, 0, len(resp.GetManifest()))
 	for _, e := range resp.GetManifest() {
 		manifest = append(manifest, vmdclient.ManifestEntry{
-			FileName:  e.GetFileName(),
-			Path:      e.GetPath(),
-			SizeBytes: e.GetSizeBytes(),
-			SHA256:    e.GetSha256(),
-			BasePath:  e.GetBasePath(),
+			FileName:       e.GetFileName(),
+			Path:           e.GetPath(),
+			SizeBytes:      e.GetSizeBytes(),
+			SHA256:         e.GetSha256(),
+			BasePath:       e.GetBasePath(),
+			AllocatedBytes: artifactManifestAllocatedBytes(e),
 		})
 	}
 	acked := ""
@@ -730,19 +732,46 @@ func (c *grpcVMDClient) GetBuildStatus(ctx context.Context, buildVMID string) (v
 		return vmdclient.BuildStatusResult{}, fmt.Errorf("gRPC GetBuildStatus: %w", err)
 	}
 	return vmdclient.BuildStatusResult{
-		NotFound:       resp.GetNotFound(),
-		Status:         resp.GetStatus(),
-		SnapshotPath:   resp.GetSnapshotPath(),
-		MemFilePath:    resp.GetMemFilePath(),
-		RootfsPath:     resp.GetRootfsPath(),
-		BasePath:       resp.GetBasePath(),
-		DeltaPath:      resp.GetDeltaPath(),
-		ResolvedDigest: resp.GetResolvedDigest(),
-		SizeBytes:      resp.GetSizeBytes(),
-		ErrorMessage:   resp.GetErrorMessage(),
-		StartedAtUnix:  resp.GetStartedAtUnix(),
-		EndedAtUnix:    resp.GetEndedAtUnix(),
+		NotFound:                resp.GetNotFound(),
+		Status:                  resp.GetStatus(),
+		SnapshotPath:            resp.GetSnapshotPath(),
+		MemFilePath:             resp.GetMemFilePath(),
+		RootfsPath:              resp.GetRootfsPath(),
+		BasePath:                resp.GetBasePath(),
+		DeltaPath:               resp.GetDeltaPath(),
+		ResolvedDigest:          resp.GetResolvedDigest(),
+		SizeBytes:               resp.GetSizeBytes(),
+		RootfsAllocatedBytes:    resp.GetRootfsAllocatedBytes(),
+		BaseAllocatedBytes:      resp.GetBaseAllocatedBytes(),
+		DeltaAllocatedBytes:     resp.GetDeltaAllocatedBytes(),
+		AllocatedBytesSupported: resp.GetAllocatedBytesSupported(),
+		ErrorMessage:            resp.GetErrorMessage(),
+		StartedAtUnix:           resp.GetStartedAtUnix(),
+		EndedAtUnix:             resp.GetEndedAtUnix(),
 	}, nil
+}
+
+func artifactManifestAllocatedBytes(entry *vmdpb.ArtifactManifestEntry) int64 {
+	if entry == nil {
+		return -1
+	}
+	unknown := entry.ProtoReflect().GetUnknown()
+	for len(unknown) > 0 {
+		num, typ, n := protowire.ConsumeTag(unknown)
+		if n < 0 {
+			break
+		}
+		unknown = unknown[n:]
+		value, n := protowire.ConsumeVarint(unknown)
+		if n < 0 {
+			break
+		}
+		unknown = unknown[n:]
+		if num == 6 && typ == protowire.VarintType {
+			return int64(value)
+		}
+	}
+	return -1
 }
 
 func (c *grpcVMDClient) CancelBuild(ctx context.Context, buildVMID string) error {

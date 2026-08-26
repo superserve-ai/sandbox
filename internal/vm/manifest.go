@@ -26,8 +26,10 @@ type ManifestEntry struct {
 	FileName  string
 	Path      string
 	SizeBytes int64
-	SHA256    string
-	BasePath  string
+	// -1 means allocation metadata was unavailable; zero is a valid measurement.
+	AllocatedBytes int64
+	SHA256         string
+	BasePath       string
 	// BaseStagedPath is the staged snapshot to READ the base from when
 	// staging captured one; BasePath remains the recorded identity.
 	BaseStagedPath string
@@ -36,6 +38,18 @@ type ManifestEntry struct {
 	// same path changes the effective filesystem under an unchanged
 	// overlay, and only the content digest makes that a new generation.
 	BaseSHA256 string
+}
+
+func allocatedBytes(path string) (int64, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, false
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return st.Blocks * 512, true
 }
 
 const (
@@ -146,6 +160,10 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 			log.Warn().Err(err).Str("path", path).Msg("pause manifest: hash failed, entry skipped")
 			return
 		}
+		allocated := int64(-1)
+		if value, ok := allocatedBytes(path); ok {
+			allocated = value
+		}
 		var baseSum string
 		if basePath != "" {
 			baseSum, err = baseDigest(hctx, basePath, baseKeyPath)
@@ -156,12 +174,13 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 			}
 		}
 		entries = append(entries, ManifestEntry{
-			FileName:   name,
-			Path:       path,
-			SizeBytes:  size,
-			SHA256:     sum,
-			BasePath:   basePath,
-			BaseSHA256: baseSum,
+			FileName:       name,
+			Path:           path,
+			SizeBytes:      size,
+			AllocatedBytes: allocated,
+			SHA256:         sum,
+			BasePath:       basePath,
+			BaseSHA256:     baseSum,
 		})
 	}
 	// vmstate first: tiny and guaranteed inside any budget, so even a
@@ -384,11 +403,16 @@ func collectBuildManifest(ctx context.Context, snapshotDir string, extraPaths []
 			complete = false
 			return
 		}
+		allocated := int64(-1)
+		if value, ok := allocatedBytes(path); ok {
+			allocated = value
+		}
 		entries = append(entries, ManifestEntry{
-			FileName:  name,
-			Path:      path,
-			SizeBytes: size,
-			SHA256:    sum,
+			FileName:       name,
+			Path:           path,
+			SizeBytes:      size,
+			AllocatedBytes: allocated,
+			SHA256:         sum,
 		})
 	}
 	for _, de := range dirEntries {

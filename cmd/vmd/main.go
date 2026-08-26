@@ -8,6 +8,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/time/rate"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -69,6 +70,12 @@ type Config struct {
 	// heartbeat is disabled.
 	ControlPlaneURL string
 
+	// Heartbeat self-description overrides. When unset, the daemon infers
+	// addresses and region from the local interface and deployment defaults.
+	VMDAdvertiseAddr   string
+	ProxyAdvertiseAddr string
+	HostRegion         string
+
 	// SecretsProxySocket is the local secretsproxy daemon's control-RPC unix-socket path.
 	// When empty, broker registration is skipped.
 	SecretsProxySocket string
@@ -102,6 +109,9 @@ func loadConfig() (Config, error) {
 		HostID:                  requireEnv("HOST_ID"),
 		DatabaseURL:             os.Getenv("DATABASE_URL"),
 		ControlPlaneURL:         os.Getenv("CONTROL_PLANE_URL"),
+		VMDAdvertiseAddr:        os.Getenv("VMD_ADVERTISE_ADDR"),
+		ProxyAdvertiseAddr:      os.Getenv("PROXY_ADVERTISE_ADDR"),
+		HostRegion:              envOrDefault("HOST_REGION", os.Getenv("SANDBOX_ID_REGION")),
 		SecretsProxySocket:      os.Getenv("SECRETSPROXY_SOCKET"),
 		SecretsProxySandboxAddr: os.Getenv("SECRETSPROXY_SANDBOX_ADDR"),
 	}
@@ -159,6 +169,75 @@ func envOrDefault(key, fallback string) string {
 
 func requireEnv(key string) string {
 	return os.Getenv(key)
+}
+
+func hostInterfaceAddress(interfaceName string) (string, error) {
+	iface, err := net.InterfaceByName(interfaceName)
+	if err != nil {
+		return "", err
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return "", err
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil {
+			continue
+		}
+		if ipv4 := ip.To4(); ipv4 != nil {
+			return ipv4.String(), nil
+		}
+	}
+	return "", fmt.Errorf("no IPv4 address found on interface %q", interfaceName)
+}
+
+func advertisedVMDAddr(interfaceName string, grpcPort int, explicit string) (string, error) {
+	if explicit != "" {
+		if _, _, err := net.SplitHostPort(explicit); err != nil {
+			return "", err
+		}
+		return explicit, nil
+	}
+	ip, err := hostInterfaceAddress(interfaceName)
+	if err != nil {
+		return "", err
+	}
+	return net.JoinHostPort(ip, strconv.Itoa(grpcPort)), nil
+}
+
+func advertisedProxyAddr(interfaceName, proxyHealthURL, explicit string) (string, error) {
+	if explicit != "" {
+		if _, _, err := net.SplitHostPort(explicit); err != nil {
+			return "", err
+		}
+		return explicit, nil
+	}
+	u, err := url.Parse(proxyHealthURL)
+	if err != nil {
+		return "", err
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("proxy health URL %q has no host", proxyHealthURL)
+	}
+	host, port, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		return "", err
+	}
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		ip, err := hostInterfaceAddress(interfaceName)
+		if err != nil {
+			return "", err
+		}
+		return net.JoinHostPort(ip, port), nil
+	}
+	return u.Host, nil
 }
 
 // envInt32Fatal parses an optional non-negative int32 env var. Unset or
@@ -1450,17 +1529,33 @@ func main() {
 				Int32("configured_vcpus", vcpus).Int32("physical_vcpus", physCPU).
 				Msg("configured schedulable capacity exceeds physical capacity — check for a units mistake")
 		}
+		proxyHealthURL := os.Getenv("PROXY_HEALTH_URL")
+		if proxyHealthURL == "" {
+			proxyHealthURL = "http://127.0.0.1:5007/health"
+		}
+		vmdAddr, err := advertisedVMDAddr(cfg.HostInterface, cfg.GRPCPort, cfg.VMDAdvertiseAddr)
+		if err != nil {
+			log.Warn().Err(err).Str("host_interface", cfg.HostInterface).
+				Int("grpc_port", cfg.GRPCPort).
+				Msg("unable to resolve advertised VMD address; heartbeat will omit host self-description")
+		}
+		proxyAddr, err := advertisedProxyAddr(cfg.HostInterface, proxyHealthURL, cfg.ProxyAdvertiseAddr)
+		if err != nil {
+			log.Warn().Err(err).Str("proxy_health_url", proxyHealthURL).
+				Msg("unable to derive advertised proxy address; heartbeat will omit host self-description")
+		}
 		lc.start("heartbeat", func() error {
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
-				ControlPlaneURL:    cfg.ControlPlaneURL,
-				HostID:             cfg.HostID,
-				Token:              os.Getenv("INTERNAL_API_TOKEN"),
-				ProxyHealthURL:     os.Getenv("PROXY_HEALTH_URL"),
-				AdvertiseVMDAddr:   os.Getenv("VMD_ADVERTISE_ADDR"),
-				AdvertiseProxyAddr: os.Getenv("PROXY_ADVERTISE_ADDR"),
-				Region:             os.Getenv("HOST_REGION"),
-				CapacityMemoryMib:  memoryMib,
-				CapacityVcpus:      vcpus,
+				ControlPlaneURL:   cfg.ControlPlaneURL,
+				HostID:            cfg.HostID,
+				Token:             os.Getenv("INTERNAL_API_TOKEN"),
+				ProxyHealthURL:    proxyHealthURL,
+				RunDir:            cfg.RunDir,
+				VMDAddr:           vmdAddr,
+				ProxyAddr:         proxyAddr,
+				Region:            cfg.HostRegion,
+				CapacityMemoryMib: memoryMib,
+				CapacityVcpus:     vcpus,
 			}, log)
 			return nil
 		})

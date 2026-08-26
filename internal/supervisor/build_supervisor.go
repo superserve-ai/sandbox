@@ -493,11 +493,18 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 			rowLog.Info().Msg("build entered snapshotting phase")
 		}
 	case "ready":
+		if !res.AllocatedBytesSupported {
+			rowLog.Info().Msg("vmd build status lacks allocation-field support; waiting for upgraded host before finalizing")
+			return
+		}
 		finCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		rootfs := res.RootfsPath
 		snapPath := res.SnapshotPath
 		memPath := res.MemFilePath
 		size := res.SizeBytes
+		rootfsAllocated := res.RootfsAllocatedBytes
+		baseAllocated := res.BaseAllocatedBytes
+		deltaAllocated := res.DeltaAllocatedBytes
 		var basePathArg, deltaPathArg *string
 		if res.BasePath != "" {
 			basePathArg = &res.BasePath
@@ -506,13 +513,16 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 			deltaPathArg = &res.DeltaPath
 		}
 		tpl, err := s.q.FinalizeBuild(finCtx, db.FinalizeBuildParams{
-			ID:           row.ID,
-			RootfsPath:   &rootfs,
-			SnapshotPath: &snapPath,
-			MemPath:      &memPath,
-			SizeBytes:    &size,
-			BasePath:     basePathArg,
-			DeltaPath:    deltaPathArg,
+			ID:                   row.ID,
+			RootfsPath:           &rootfs,
+			SnapshotPath:         &snapPath,
+			MemPath:              &memPath,
+			SizeBytes:            &size,
+			BasePath:             basePathArg,
+			DeltaPath:            deltaPathArg,
+			RootfsAllocatedBytes: rootfsAllocated,
+			BaseAllocatedBytes:   baseAllocated,
+			DeltaAllocatedBytes:  deltaAllocated,
 		})
 		cancel()
 		if errors.Is(err, pgx.ErrNoRows) {
