@@ -50,7 +50,12 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "cannot connect to test database: %v\n", err)
 		os.Exit(1)
 	}
-	for _, name := range []string{"migrate_team_use", "migrate_team_usw"} {
+	// Keep parallel validation processes isolated. A shared pair of names lets
+	// another test binary drop these databases while this process is still
+	// exercising the migration phases.
+	dbSuffix := fmt.Sprintf("_%d", os.Getpid())
+	dbNames := []string{"migrate_team_use" + dbSuffix, "migrate_team_usw" + dbSuffix}
+	for _, name := range dbNames {
 		if _, err := admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %s WITH (FORCE)`, name)); err != nil {
 			fmt.Fprintf(os.Stderr, "drop %s: %v\n", name, err)
 			os.Exit(1)
@@ -62,9 +67,9 @@ func TestMain(m *testing.M) {
 	}
 	admin.Close(ctx)
 
-	srcURL, err = rewriteDBName(adminURL, "migrate_team_use")
+	srcURL, err = rewriteDBName(adminURL, dbNames[0])
 	if err == nil {
-		dstURL, err = rewriteDBName(adminURL, "migrate_team_usw")
+		dstURL, err = rewriteDBName(adminURL, dbNames[1])
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "rewrite database url: %v\n", err)

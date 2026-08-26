@@ -283,6 +283,22 @@ func (q *Queries) HostHasCapabilitiesUnlocked(ctx context.Context, arg HostHasCa
 	return exists, err
 }
 
+const isHostHeartbeatFresh = `-- name: IsHostHeartbeatFresh :one
+SELECT last_heartbeat_at IS NOT NULL
+   AND last_heartbeat_at >= clock_timestamp() - interval '2 minutes'
+FROM host
+WHERE id = $1
+`
+
+// Compare against the database clock so an application host whose clock is
+// skewed from PostgreSQL cannot incorrectly reclaim a live identity.
+func (q *Queries) IsHostHeartbeatFresh(ctx context.Context, id string) (*bool, error) {
+	row := q.db.QueryRow(ctx, isHostHeartbeatFresh, id)
+	var column_1 *bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const listActiveHosts = `-- name: ListActiveHosts :many
 SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host
 WHERE status = 'active'
@@ -636,7 +652,7 @@ const registerHost = `-- name: RegisterHost :one
 INSERT INTO host (id, vmd_addr, proxy_addr, region, status,
                   capacity_memory_mib, capacity_vcpus, last_heartbeat_at,
                   identity_bound)
-VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, now(), true)
+VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, clock_timestamp(), true)
 RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound
 `
 
@@ -752,7 +768,7 @@ WITH prev AS (
     SELECT h.id, h.status FROM host h WHERE h.id = $1 FOR UPDATE
 )
 UPDATE host
-SET last_heartbeat_at = now(),
+SET last_heartbeat_at = clock_timestamp(),
     status = CASE WHEN host.status = 'unhealthy' THEN 'active' ELSE host.status END,
     updated_at = now()
 FROM prev
@@ -809,14 +825,15 @@ SET status = $2, updated_at = now()
 WHERE id = $1
   AND ($2 <> 'active'
        OR (last_heartbeat_at IS NOT NULL
-           AND last_heartbeat_at > $3))
+           AND last_heartbeat_at > clock_timestamp() - interval '2 minutes'
+           AND $3::timestamptz IS NOT NULL))
 RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound
 `
 
 type UpdateHostStatusParams struct {
-	ID                   string             `json:"id"`
-	Status               string             `json:"status"`
-	ActiveHeartbeatAfter pgtype.Timestamptz `json:"active_heartbeat_after"`
+	ID                   string    `json:"id"`
+	Status               string    `json:"status"`
+	ActiveHeartbeatAfter time.Time `json:"active_heartbeat_after"`
 }
 
 // Activation requires a live heartbeat: a provisioning host that died

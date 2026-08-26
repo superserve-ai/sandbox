@@ -1535,9 +1535,15 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 		t.Fatalf("seed billing credit: %v", err)
 	}
 
-	requestStarted := time.Now().UTC()
+	var requestStarted time.Time
+	if err := testPool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&requestStarted); err != nil {
+		t.Fatalf("read database clock before billing summary: %v", err)
+	}
 	w := do(r, "GET", "/billing/summary", viewerKey, "")
-	requestFinished := time.Now().UTC()
+	var requestFinished time.Time
+	if err := testPool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&requestFinished); err != nil {
+		t.Fatalf("read database clock after billing summary: %v", err)
+	}
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -3456,7 +3462,10 @@ func TestIntegration_BillingRollupStaleLockIsClaimable(t *testing.T) {
 	r := newRouter(t)
 	hourStart := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
 	hourEnd := hourStart.Add(time.Hour)
-	staleLockedUntil := time.Now().UTC().Add(-time.Minute)
+	var staleLockedUntil time.Time
+	if err := testPool.QueryRow(ctx, `SELECT clock_timestamp() - interval '1 minute'`).Scan(&staleLockedUntil); err != nil {
+		t.Fatalf("read database clock for stale lock: %v", err)
+	}
 
 	enableBillingHourlyRollups(t, ctx, teamID)
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"stale-rollup-reclaim"}`)

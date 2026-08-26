@@ -44,6 +44,33 @@ variable "host_maintenance_event_alerts" {
   default = {}
 }
 
+variable "db_readiness_alerts" {
+  description = "Cloud Run DB readiness alerts keyed by service."
+  type = map(object({
+    display_name      = string
+    service_name      = string
+    otel_service_name = optional(string, "sandbox-controlplane")
+    documentation     = optional(string, null)
+    duration          = optional(string, "30s")
+  }))
+  default = {}
+}
+
+variable "cloud_run_churn_alerts" {
+  description = "Cloud Run replacement churn alerts keyed by service."
+  type = map(object({
+    display_name  = string
+    service_name  = string
+    documentation = optional(string, null)
+    duration      = optional(string, "300s")
+    # Page after roughly five unexpected starts for one revision in the
+    # evaluation window; rollout events are excluded by the log metric.
+    repeat_threshold = optional(number, 5)
+    fleet_threshold  = optional(number, 3)
+  }))
+  default = {}
+}
+
 variable "log_buckets" {
   description = "Logging bucket definitions keyed by logical name."
   type = map(object({

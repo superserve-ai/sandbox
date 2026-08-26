@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	kms "cloud.google.com/go/kms/apiv1"
@@ -164,6 +163,13 @@ func run() error {
 		return fmt.Errorf("ping database: %w", err)
 	}
 	log.Info().Msg("connected to database")
+	// Readiness is a separate, bounded dependency signal. /health remains
+	// DB-independent so Cloud Run can distinguish a live process from a
+	// replica that should be removed from new traffic.
+	dbReadiness := api.NewProductionDBReadiness(dbPool, recorder, nil)
+	// The production readiness monitor is owned by the control-plane lifecycle;
+	// SetupRouter only starts readiness instances it creates itself.
+	dbReadiness.Start(ctx)
 	// Deliberately outside the OTel gate: sustained pool saturation must
 	// surface through plain logs even in cells where metrics export is
 	// disabled or the pipeline is down.
@@ -265,7 +271,7 @@ func run() error {
 	sched := &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
 	handlers.Scheduler = sched
 
-	router := api.SetupRouter(ctx, handlers, dbPool)
+	router := api.SetupRouter(ctx, handlers, dbPool, dbReadiness)
 
 	// Launch the timeout reaper. This goroutine destroys sandboxes whose
 	// `timeout_seconds` hard cap has elapsed, regardless of state. Scoped

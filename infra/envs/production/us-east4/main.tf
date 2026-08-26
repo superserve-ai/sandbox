@@ -9,7 +9,7 @@ terraform {
   required_providers {
     google = {
       source  = "hashicorp/google"
-      version = "~> 6.0"
+      version = "~> 7.0"
     }
   }
 }
@@ -353,6 +353,18 @@ module "observability" {
   project_id               = local.project_id
   environment              = local.environment
   notification_channel_ids = var.notification_channel_ids
+  db_readiness_alerts = {
+    api = {
+      display_name = "API / ${local.resource_suffix} / DB readiness"
+      service_name = "superserve-api-${local.resource_suffix}"
+    }
+  }
+  cloud_run_churn_alerts = {
+    api = {
+      display_name = "API / ${local.resource_suffix} / unexpected replacement churn"
+      service_name = "superserve-api-${local.resource_suffix}"
+    }
+  }
   compute_instance_cpu_alerts = {
     sandbox_host_b = {
       display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / CPU saturation"

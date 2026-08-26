@@ -167,7 +167,9 @@ jobs:
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE }} \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
             --region ${{ vars.GCP_REGION }} \
-            --project ${{ vars.GCP_PROJECT }}
+            --project ${{ vars.GCP_PROJECT }} \
+            --liveness-probe=timeoutSeconds=1,periodSeconds=10,failureThreshold=1,httpGet.path=/live,httpGet.port=8080 \
+            --readiness-probe=timeoutSeconds=1,periodSeconds=10,failureThreshold=1,successThreshold=1,httpGet.path=/ready,httpGet.port=8080 \
 
       - name: Route traffic to the new revision
         run: |
@@ -333,7 +335,9 @@ jobs:
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USW }} \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
             --region ${{ vars.GCP_REGION_USW }} \
-            --project ${{ vars.GCP_PROJECT }}
+            --project ${{ vars.GCP_PROJECT }} \
+            --liveness-probe=timeoutSeconds=1,periodSeconds=10,failureThreshold=1,httpGet.path=/live,httpGet.port=8080 \
+            --readiness-probe=timeoutSeconds=1,periodSeconds=10,failureThreshold=1,successThreshold=1,httpGet.path=/ready,httpGet.port=8080 \
 
       - name: Route traffic to the new revision
         run: |
@@ -497,7 +501,9 @@ jobs:
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USE4 }} \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
             --region ${{ vars.GCP_REGION_USE4 }} \
-            --project ${{ vars.GCP_PROJECT }}
+            --project ${{ vars.GCP_PROJECT }} \
+            --liveness-probe=timeoutSeconds=1,periodSeconds=10,failureThreshold=1,httpGet.path=/live,httpGet.port=8080 \
+            --readiness-probe=timeoutSeconds=1,periodSeconds=10,failureThreshold=1,successThreshold=1,httpGet.path=/ready,httpGet.port=8080 \
 
       - name: Route traffic to the new revision
         run: |

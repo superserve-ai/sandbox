@@ -23,13 +23,21 @@ RETURNING *;
 INSERT INTO host (id, vmd_addr, proxy_addr, region, status,
                   capacity_memory_mib, capacity_vcpus, last_heartbeat_at,
                   identity_bound)
-VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, now(), true)
+VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, clock_timestamp(), true)
 RETURNING *;
 
 -- name: GetHostForUpdate :one
 -- Row-locked read for the heartbeat's identity check, so the guard and the
 -- heartbeat update see the same row version inside one transaction.
 SELECT * FROM host WHERE id = $1 FOR UPDATE;
+
+-- name: IsHostHeartbeatFresh :one
+-- Compare against the database clock so an application host whose clock is
+-- skewed from PostgreSQL cannot incorrectly reclaim a live identity.
+SELECT last_heartbeat_at IS NOT NULL
+   AND last_heartbeat_at >= clock_timestamp() - interval '2 minutes'
+FROM host
+WHERE id = $1;
 
 -- name: UpdateHostAddresses :exec
 -- Re-provision path: the identity is reclaiming its row from a new address
@@ -62,7 +70,8 @@ SET status = $2, updated_at = now()
 WHERE id = $1
   AND ($2 <> 'active'
        OR (last_heartbeat_at IS NOT NULL
-           AND last_heartbeat_at > sqlc.arg(active_heartbeat_after)))
+           AND last_heartbeat_at > clock_timestamp() - interval '2 minutes'
+           AND sqlc.arg(active_heartbeat_after)::timestamptz IS NOT NULL))
 RETURNING *;
 
 -- name: UpdateHostHeartbeat :one
@@ -78,7 +87,7 @@ WITH prev AS (
     SELECT h.id, h.status FROM host h WHERE h.id = $1 FOR UPDATE
 )
 UPDATE host
-SET last_heartbeat_at = now(),
+SET last_heartbeat_at = clock_timestamp(),
     status = CASE WHEN host.status = 'unhealthy' THEN 'active' ELSE host.status END,
     updated_at = now()
 FROM prev

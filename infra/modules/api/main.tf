@@ -48,6 +48,31 @@ resource "google_cloud_run_v2_service" "this" {
         container_port = 8080
       }
 
+      # The application gates readiness on sustained DB failure; remove
+      # traffic on the first failed platform readiness check.
+      readiness_probe {
+        http_get {
+          path = "/ready"
+          port = 8080
+        }
+
+        period_seconds    = 10
+        timeout_seconds   = 1
+        failure_threshold = 1
+        success_threshold = 1
+      }
+
+      liveness_probe {
+        http_get {
+          path = "/live"
+          port = 8080
+        }
+
+        period_seconds    = 10
+        timeout_seconds   = 1
+        failure_threshold = 1
+      }
+
       resources {
         limits = {
           cpu    = var.cpu_limit

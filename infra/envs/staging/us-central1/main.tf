@@ -369,6 +369,18 @@ module "observability" {
 
   project_id  = local.project_id
   environment = local.environment
+  db_readiness_alerts = {
+    api = {
+      display_name = "API / staging / DB readiness"
+      service_name = "superserve-api"
+    }
+  }
+  cloud_run_churn_alerts = {
+    api = {
+      display_name = "API / staging / unexpected replacement churn"
+      service_name = "superserve-api"
+    }
+  }
   # Backup pipeline alerts, same set as the production cells so staging
   # validates the queries before they matter. The disabled-host alert
   # stays off here: staging toggles BACKUP_BUCKET deliberately.

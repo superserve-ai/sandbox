@@ -108,6 +108,33 @@ func resourceAttr(t *testing.T, kvs []attribute.KeyValue, key string) (string, b
 	return "", false
 }
 
+func assertMetricResourceIdentity(t *testing.T, metrics metricdata.ResourceMetrics, metricName string) {
+	t.Helper()
+	if got, ok := resourceAttr(t, metrics.Resource.Attributes(), "service.instance.id"); !ok || got != "instance-123" {
+		t.Fatalf("%s service.instance.id = %q, ok=%v, want %q", metricName, got, ok, "instance-123")
+	}
+}
+
+func assertMetricInstanceAttribute(t *testing.T, attrs attribute.Set, metricName string) {
+	t.Helper()
+	if got, ok := attrs.Value(attribute.Key("service.instance.id")); !ok || got.AsString() != "instance-123" {
+		t.Fatalf("%s datapoint service.instance.id = %q, ok=%v, want %q", metricName, got.AsString(), ok, "instance-123")
+	}
+}
+
+func metricByName(t *testing.T, metrics metricdata.ResourceMetrics, name string) metricdata.Metrics {
+	t.Helper()
+	for _, scopeMetrics := range metrics.ScopeMetrics {
+		for _, metric := range scopeMetrics.Metrics {
+			if metric.Name == name {
+				return metric
+			}
+		}
+	}
+	t.Fatalf("metric %q not found", name)
+	return metricdata.Metrics{}
+}
+
 func TestNewInstanceIDIsUniqueAndNonEmpty(t *testing.T) {
 	a := NewInstanceID()
 	b := NewInstanceID()
@@ -204,6 +231,140 @@ func TestNewOTelRecorderDefaultsInstanceIDWhenUnset(t *testing.T) {
 	}
 	if first.instanceID == second.instanceID {
 		t.Fatalf("two NewOTelRecorder calls produced the same instanceID %q", first.instanceID)
+	}
+}
+
+func TestRecordDBReadinessEmitsMetricsWithInstanceIdentity(t *testing.T) {
+	ctx := context.Background()
+	configured, err := NewOTelRecorder(ctx, OTelConfig{
+		ServiceName: "sandbox-controlplane",
+		Environment: "staging",
+		InstanceID:  "instance-123",
+		Endpoint:    "http://127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatalf("NewOTelRecorder: %v", err)
+	}
+	t.Cleanup(func() { _ = configured.Shutdown(ctx) })
+	if configured.dbReadiness == nil || configured.dbReadinessDuration == nil || configured.dbReadinessOutcomes == nil || configured.dbReadinessTransitions == nil {
+		t.Fatal("NewOTelRecorder did not initialize DB readiness instruments")
+	}
+
+	reader := sdkmetric.NewManualReader()
+	res, err := buildOTelResource(OTelConfig{
+		ServiceName: "sandbox-controlplane",
+		Environment: "staging",
+		InstanceID:  "instance-123",
+	})
+	if err != nil {
+		t.Fatalf("buildOTelResource: %v", err)
+	}
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(res),
+		sdkmetric.WithReader(reader),
+	)
+	t.Cleanup(func() { _ = provider.Shutdown(ctx) })
+
+	meter := provider.Meter(instrumentationName)
+	recorder := &OTelRecorder{
+		provider:    provider,
+		serviceName: "sandbox-controlplane",
+		environment: "staging",
+		hostID:      "unknown",
+		instanceID:  "instance-123",
+	}
+	if err := initDBReadinessMetrics(recorder, meter); err != nil {
+		t.Fatalf("initDBReadinessMetrics: %v", err)
+	}
+
+	recorder.RecordDBReadiness(ctx, DBReadiness{Ready: false, ProbeSucceeded: false, Duration: 250 * time.Millisecond, Transition: "unready"})
+	recorder.RecordDBReadiness(ctx, DBReadiness{Ready: true, ProbeSucceeded: true, Duration: 100 * time.Millisecond, Transition: "recovered"})
+
+	var metrics metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &metrics); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	if got, ok := resourceAttr(t, metrics.Resource.Attributes(), "service.instance.id"); !ok || got != "instance-123" {
+		t.Fatalf("service.instance.id = %q, ok=%v, want %q", got, ok, "instance-123")
+	}
+
+	// Assert the two readiness instruments directly so a registration typo or
+	// missing datapoint cannot be hidden by unrelated telemetry output.
+	readiness := metricByName(t, metrics, "db_readiness_ready")
+	assertMetricResourceIdentity(t, metrics, readiness.Name)
+	readinessGauge, ok := readiness.Data.(metricdata.Gauge[int64])
+	if !ok || len(readinessGauge.DataPoints) != 1 || readinessGauge.DataPoints[0].Value != 1 {
+		t.Fatalf("readiness metric = %T %#v, want one datapoint with value 1", readiness.Data, readiness.Data)
+	}
+	assertMetricInstanceAttribute(t, readinessGauge.DataPoints[0].Attributes, readiness.Name)
+
+	duration := metricByName(t, metrics, "db_readiness_probe_duration_seconds")
+	assertMetricResourceIdentity(t, metrics, duration.Name)
+	durationHistogram, ok := duration.Data.(metricdata.Histogram[float64])
+	if !ok || len(durationHistogram.DataPoints) != 1 || durationHistogram.DataPoints[0].Sum != 0.35 {
+		t.Fatalf("duration metric = %T %#v, want one datapoint with sum 0.35", duration.Data, duration.Data)
+	}
+	assertMetricInstanceAttribute(t, durationHistogram.DataPoints[0].Attributes, duration.Name)
+
+	seen := map[string]bool{}
+	for _, scopeMetrics := range metrics.ScopeMetrics {
+		for _, metric := range scopeMetrics.Metrics {
+			seen[metric.Name] = true
+			switch metric.Name {
+			case "db_readiness_probe_total":
+				assertMetricResourceIdentity(t, metrics, metric.Name)
+				counter, ok := metric.Data.(metricdata.Sum[int64])
+				if !ok || len(counter.DataPoints) != 2 {
+					t.Fatalf("probe outcome metric = %T %#v, want two datapoints", metric.Data, metric.Data)
+				}
+				for _, datapoint := range counter.DataPoints {
+					if datapoint.Value != 1 {
+						t.Fatalf("probe outcome value = %d, want 1", datapoint.Value)
+					}
+					assertMetricInstanceAttribute(t, datapoint.Attributes, metric.Name)
+					if got, ok := datapoint.Attributes.Value(attribute.Key("outcome")); !ok || (got.AsString() != "failure" && got.AsString() != "success") {
+						t.Fatalf("probe outcome = %q, ok=%v, want failure or success", got.AsString(), ok)
+					}
+				}
+			case "db_readiness_transition_total":
+				assertMetricResourceIdentity(t, metrics, metric.Name)
+				counter, ok := metric.Data.(metricdata.Sum[int64])
+				if !ok || len(counter.DataPoints) != 2 {
+					t.Fatalf("transition metric = %T %#v, want two datapoints", metric.Data, metric.Data)
+				}
+				transitions := map[string]bool{}
+				transitionInstanceIDs := map[string]string{}
+				for _, datapoint := range counter.DataPoints {
+					if datapoint.Value != 1 {
+						t.Fatalf("transition value = %d, want 1", datapoint.Value)
+					}
+					assertMetricInstanceAttribute(t, datapoint.Attributes, metric.Name)
+					got, ok := datapoint.Attributes.Value(attribute.Key("transition"))
+					if !ok || (got.AsString() != "unready" && got.AsString() != "recovered") {
+						t.Fatalf("transition = %q, ok=%v, want unready or recovered", got.AsString(), ok)
+					}
+					transitions[got.AsString()] = true
+					if instanceID, ok := datapoint.Attributes.Value(attribute.Key("service.instance.id")); ok {
+						transitionInstanceIDs[got.AsString()] = instanceID.AsString()
+					}
+				}
+				for _, transition := range []string{"unready", "recovered"} {
+					if !transitions[transition] {
+						t.Errorf("transition %q not recorded", transition)
+					}
+				}
+				for _, transition := range []string{"unready", "recovered"} {
+					if got := transitionInstanceIDs[transition]; got != "instance-123" {
+						t.Errorf("%s transition service.instance.id = %q, want %q", transition, got, "instance-123")
+					}
+				}
+			}
+		}
+	}
+	for _, name := range []string{"db_readiness_ready", "db_readiness_probe_duration_seconds", "db_readiness_probe_total", "db_readiness_transition_total"} {
+		if !seen[name] {
+			t.Errorf("metric %q not found", name)
+		}
 	}
 }
 

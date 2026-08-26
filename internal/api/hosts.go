@@ -158,6 +158,14 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		if req.VMDAddr != "" && req.VMDAddr != host.VmdAddr {
 			holderAlive := host.LastHeartbeatAt.Valid &&
 				time.Since(host.LastHeartbeatAt.Time) < heartbeatTimeout
+			if h.Pool != nil {
+				var err error
+				fresh, err := q.IsHostHeartbeatFresh(ctx, hostID)
+				if err != nil {
+					return "", "", pgtype.Timestamptz{}, err
+				}
+				holderAlive = fresh != nil && *fresh
+			}
 			if holderAlive {
 				return "", "", errHostIdentityConflict
 			}
@@ -312,7 +320,7 @@ func (h *Handlers) HostUpdateStatus(c *gin.Context) {
 		// Activation demands a heartbeat fresher than the unhealthy
 		// threshold; the predicate lives in the UPDATE so there is no
 		// check-then-act window.
-		ActiveHeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true},
+		ActiveHeartbeatAfter: time.Now().Add(-heartbeatTimeout),
 	})
 	if err == pgx.ErrNoRows {
 		// Zero rows is either an unknown host or an activation refused for
