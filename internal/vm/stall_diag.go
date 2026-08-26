@@ -35,6 +35,13 @@ const (
 	stallDiagSettle     = 2 * time.Second
 	stallDiagPerfWindow = 3 * time.Second
 
+	// A stall means the host may already be struggling, so the profile is
+	// deliberately coarse: ~100 Hz is ample to identify a loop the guest has
+	// been spinning in for seconds, and the size cap bounds the write even if
+	// the rate assumption is ever wrong.
+	stallDiagPerfHz      = "97"
+	stallDiagPerfMaxSize = "32M"
+
 	// Caps the battery so it can never outlive the readiness window and
 	// collide with teardown.
 	stallDiagBudget = 20 * time.Second
@@ -113,6 +120,7 @@ func (m *Manager) runStallDiagnostics(parent context.Context, vmID string, pid i
 		Dur("stuck_for", time.Since(started)+stallDiagAfter).
 		Str("kvm_dir", kvmDir).
 		Str("kvm_deltas", formatDeltas(deltas)).
+		Str("kvm_gauges", formatGauges(latestGauges(after))).
 		Str("guest_ips", strings.Join(guestIPs, ",")).
 		Bool("uffd_found", threads.UffdFound).
 		Int64("uffd_pending", threads.UffdPending).
@@ -120,11 +128,11 @@ func (m *Manager) runStallDiagnostics(parent context.Context, vmID string, pid i
 		Str("thread_state", threads.threadSummary())
 	ev.Msg("guest still not ready — live diagnostics")
 
-	m.writeStallDiagDump(vmID, pid, deltas, guestIPs, threads)
+	m.writeStallDiagDump(vmID, pid, deltas, latestGauges(after), guestIPs, threads)
 }
 
 // writeStallDiagDump preserves the raw numbers next to the other forensics.
-func (m *Manager) writeStallDiagDump(vmID string, pid int, deltas map[string]int64, guestIPs []string, threads *procStallState) {
+func (m *Manager) writeStallDiagDump(vmID string, pid int, deltas, gauges map[string]int64, guestIPs []string, threads *procStallState) {
 	if !m.forensicsOK {
 		return
 	}
@@ -134,6 +142,10 @@ func (m *Manager) writeStallDiagDump(vmID string, pid int, deltas map[string]int
 	fmt.Fprintf(&b, "vm: %s\npid: %d\n\n--- kvm counter deltas over %s ---\n", vmID, pid, stallDiagSettle)
 	for _, k := range sortedKeys(deltas) {
 		fmt.Fprintf(&b, "  %-32s %d\n", k, deltas[k])
+	}
+	fmt.Fprintf(&b, "\n--- kvm gauges (current values) ---\n")
+	for _, k := range sortedKeys(gauges) {
+		fmt.Fprintf(&b, "  %-32s %d\n", k, gauges[k])
 	}
 	fmt.Fprintf(&b, "\n--- guest instruction pointers ---\n")
 	for _, ip := range guestIPs {
@@ -212,6 +224,17 @@ func kvmDebugDirFor(pid int) (string, error) {
 // wakeup that never increments says nothing is being delivered to the halted
 // one. Omitting them would make "did not move" indistinguishable from "not
 // available".
+// kvmGauges hold a current value rather than a running total, so a delta of
+// zero says "unchanged", not "idle" — guest_mode 1→1 and 0→0 are opposite
+// findings that subtract to the same number. They are reported as values.
+var kvmGauges = map[string]bool{
+	"guest_mode":             true,
+	"pid":                    true,
+	"tsc-offset":             true,
+	"tsc-scaling-ratio":      true,
+	"lapic_timer_advance_ns": true,
+}
+
 var alwaysReportCounters = map[string]bool{
 	"exits":                true,
 	"halt_exits":           true,
@@ -225,7 +248,6 @@ var alwaysReportCounters = map[string]bool{
 	"signal_exits":         true,
 	"insn_emulation":       true,
 	"request_irq_exits":    true,
-	"guest_mode":           true,
 }
 
 // counterDeltas reports counters that moved, plus the allowlist above whether
@@ -238,15 +260,34 @@ func counterDeltas(before, after map[string]int64) map[string]int64 {
 		if !ok {
 			continue
 		}
-		name := k
-		if i := strings.LastIndex(k, "/"); i >= 0 {
-			name = k[i+1:]
+		name := baseName(k)
+		if kvmGauges[name] {
+			continue // reported as a value; see latestGauges
 		}
 		if a != b || alwaysReportCounters[name] {
 			deltas[k] = a - b
 		}
 	}
 	return deltas
+}
+
+// latestGauges returns the current value of each gauge — which vCPU is in
+// guest mode, the thread each vCPU runs on, and the clock offsets.
+func latestGauges(sample map[string]int64) map[string]int64 {
+	out := map[string]int64{}
+	for k, v := range sample {
+		if kvmGauges[baseName(k)] {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func baseName(key string) string {
+	if i := strings.LastIndex(key, "/"); i >= 0 {
+		return key[i+1:]
+	}
+	return key
 }
 
 func sortedKeys(m map[string]int64) []string {
@@ -256,6 +297,18 @@ func sortedKeys(m map[string]int64) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// formatGauges renders current values (no sign), unlike deltas.
+func formatGauges(g map[string]int64) string {
+	if len(g) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(g))
+	for _, k := range sortedKeys(g) {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, g[k]))
+	}
+	return strings.Join(parts, " ")
 }
 
 func formatDeltas(deltas map[string]int64) string {
@@ -325,6 +378,7 @@ func sampleGuestIPs(ctx context.Context, pid int) []string {
 		return nil
 	}
 	rec := exec.CommandContext(ctx, "perf", "kvm", "--guest", "record",
+		"-F", stallDiagPerfHz, "--max-size", stallDiagPerfMaxSize,
 		"-p", strconv.Itoa(pid), "-o", data, "--", "sleep",
 		strconv.Itoa(int(stallDiagPerfWindow/time.Second)))
 	if err := rec.Run(); err != nil {

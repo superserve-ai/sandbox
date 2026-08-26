@@ -47,6 +47,45 @@ func TestCounterDeltasKeepMovementAndTheProofOfStillness(t *testing.T) {
 	}
 }
 
+func TestGaugesAreReportedAsValuesNotDeltas(t *testing.T) {
+	// guest_mode and pid hold a current value, not a running total. As deltas
+	// they are actively misleading: 1→1 and 0→0 both subtract to zero, which
+	// would leave the executing vCPU unidentifiable and drop the vCPU→thread
+	// mapping entirely.
+	before := map[string]int64{
+		"vcpu0/guest_mode": 1, "vcpu1/guest_mode": 0,
+		"vcpu0/pid": 4242, "vcpu1/pid": 4243,
+		"vm/exits": 100,
+	}
+	after := map[string]int64{
+		"vcpu0/guest_mode": 1, "vcpu1/guest_mode": 0,
+		"vcpu0/pid": 4242, "vcpu1/pid": 4243,
+		"vm/exits": 100,
+	}
+
+	d := counterDeltas(before, after)
+	for k := range d {
+		if strings.Contains(k, "guest_mode") || strings.Contains(k, "pid") {
+			t.Fatalf("gauge %q leaked into deltas, where it cannot be interpreted", k)
+		}
+	}
+
+	g := latestGauges(after)
+	if g["vcpu0/guest_mode"] != 1 || g["vcpu1/guest_mode"] != 0 {
+		t.Fatalf("guest_mode values lost: %v", g)
+	}
+	if g["vcpu0/pid"] != 4242 || g["vcpu1/pid"] != 4243 {
+		t.Fatalf("vcpu→thread mapping lost: %v", g)
+	}
+	// Rendered without a sign, unlike deltas.
+	if s := formatGauges(g); !strings.Contains(s, "vcpu0/guest_mode=1") {
+		t.Fatalf("gauges rendered as %q", s)
+	}
+	if formatGauges(nil) != "none" {
+		t.Fatal("empty gauges must render as none")
+	}
+}
+
 func TestKVMDebugDirMatchesTheWholePIDToken(t *testing.T) {
 	// KVM names its directories "<pid>-<instance>", so a prefix match on the
 	// bare pid would also match pid 12345 for pid 1234.
