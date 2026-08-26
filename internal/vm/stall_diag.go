@@ -62,6 +62,12 @@ func (m *Manager) armEarlyStallDiagnostics(vmID string, launchPID int) func() {
 	// after the threshold would otherwise be profiled and logged as stalled —
 	// a false specimen in the very data this exists to produce.
 	ctx, cancel := context.WithCancel(context.Background())
+	// settled decides, exactly once, whether this restore is published as a
+	// stall. Checking the context before writing is not enough: readiness can
+	// complete in the window between that check and the write, and the
+	// callback would still record a healthy restore as stalled. Whichever of
+	// the two arrives first claims the outcome.
+	var settled atomic.Bool
 	timer := time.AfterFunc(stallDiagAfter, func() {
 		defer sentrylog.Recover("stall-diag-arm")
 		if ctx.Err() != nil {
@@ -75,17 +81,20 @@ func (m *Manager) armEarlyStallDiagnostics(vmID string, launchPID int) func() {
 			return
 		}
 		defer func() { <-stallDiagSem }()
-		m.runStallDiagnostics(ctx, vmID, m.resolveFCPID(vmID, launchPID))
+		m.runStallDiagnostics(ctx, &settled, vmID, m.resolveFCPID(vmID, launchPID))
 	})
 	return func() {
 		timer.Stop()
+		// Claim the outcome before cancelling, so a battery about to publish
+		// loses the race rather than winning it.
+		settled.CompareAndSwap(false, true)
 		cancel()
 	}
 }
 
 // runStallDiagnostics collects the live-VM evidence and logs it. A probe that
 // fails contributes an empty field rather than aborting the rest.
-func (m *Manager) runStallDiagnostics(parent context.Context, vmID string, pid int) {
+func (m *Manager) runStallDiagnostics(parent context.Context, settled *atomic.Bool, vmID string, pid int) {
 	if pid <= 0 || !pidIsVMFirecracker(pid, vmID) {
 		return
 	}
@@ -127,9 +136,10 @@ func (m *Manager) runStallDiagnostics(parent context.Context, vmID string, pid i
 		}
 	}
 
-	// The guest may have come up while the battery ran; publishing then would
-	// record a healthy restore as a stall.
-	if ctx.Err() != nil {
+	// The guest may have come up while the battery ran. Claiming the outcome
+	// is what makes the decision final: if readiness already claimed it, this
+	// restore was healthy and must not be recorded as a stall.
+	if settled != nil && !settled.CompareAndSwap(false, true) {
 		return
 	}
 
@@ -400,7 +410,16 @@ func perfIsUsable() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "perf", "--version").CombinedOutput()
-	ok := err == nil && !strings.Contains(string(out), "linux-tools")
+	if err != nil {
+		// Could not run it at all — a fork failure or timeout under the very
+		// host pressure that accompanies a stall. That says nothing durable
+		// about perf, so it is not cached: caching it would silently disable
+		// guest profiling for the rest of this process's life.
+		return false
+	}
+	// A command that ran gives a deterministic answer: the distribution stub
+	// prints an "install linux-tools-<kernel>" notice instead of profiling.
+	ok := !strings.Contains(string(out), "linux-tools")
 	perfUsable.Store(&ok)
 	return ok
 }

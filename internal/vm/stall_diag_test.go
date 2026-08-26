@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -74,15 +75,39 @@ func TestBatteryAbandonsAProcessThatChangedIdentity(t *testing.T) {
 	// process's counters and guest addresses under this VM's id would be
 	// worse than recording nothing, so the battery abandons instead.
 	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
-	m.runStallDiagnostics(context.Background(), "00000000-0000-0000-0000-000000000000", os.Getpid())
+	m.runStallDiagnostics(context.Background(), nil, "00000000-0000-0000-0000-000000000000", os.Getpid())
 
 	// A cancelled battery must not start the shared-semaphore capture at all;
 	// stealing a slot there can make a genuine timeout skip its own capture.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	m.runStallDiagnostics(ctx, "any-vm", os.Getpid())
+	m.runStallDiagnostics(ctx, nil, "any-vm", os.Getpid())
 	if len(stallProcSem) != 0 {
 		t.Fatalf("cancelled battery left %d proc-capture slots held", len(stallProcSem))
+	}
+}
+
+func TestPublicationIsClaimedExactlyOnce(t *testing.T) {
+	// Readiness can complete in the window between the battery's last context
+	// check and its write, so the outcome is decided by a claim rather than a
+	// check: whoever arrives first wins, and the loser stays silent.
+	var settled atomic.Bool
+
+	// Readiness wins: the battery must not publish.
+	if !settled.CompareAndSwap(false, true) {
+		t.Fatal("first claim should succeed")
+	}
+	if settled.CompareAndSwap(false, true) {
+		t.Fatal("a second claim must fail — the outcome is already decided")
+	}
+
+	// Fresh restore, battery wins: readiness then finds it already claimed.
+	var other atomic.Bool
+	if !other.CompareAndSwap(false, true) {
+		t.Fatal("battery should be able to claim an unclaimed outcome")
+	}
+	if other.CompareAndSwap(false, true) {
+		t.Fatal("readiness must not re-claim after the battery published")
 	}
 }
 
@@ -211,7 +236,7 @@ func TestCancellationSuppressesABatteryAlreadyInFlight(t *testing.T) {
 	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
 	// A cancelled context must stop the battery before it profiles anything,
 	// even when handed a live pid.
-	m.runStallDiagnostics(ctx, "not-this-vm", os.Getpid())
+	m.runStallDiagnostics(ctx, nil, "not-this-vm", os.Getpid())
 	if ctx.Err() == nil {
 		t.Fatal("test setup: context should be cancelled")
 	}
@@ -221,6 +246,6 @@ func TestDiagnosticsRefuseAForeignPID(t *testing.T) {
 	// Same identity rule as the teardown capture: profiling and counter reads
 	// must never be aimed at a process that is not this VM's firecracker.
 	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
-	m.runStallDiagnostics(context.Background(), "00000000-0000-0000-0000-000000000000", os.Getpid())
-	m.runStallDiagnostics(context.Background(), "any-vm", 0)
+	m.runStallDiagnostics(context.Background(), nil, "00000000-0000-0000-0000-000000000000", os.Getpid())
+	m.runStallDiagnostics(context.Background(), nil, "any-vm", 0)
 }
