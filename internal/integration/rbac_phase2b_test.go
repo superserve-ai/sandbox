@@ -20,6 +20,7 @@ import (
 )
 
 const internalRBACToken = "integration-rbac-phase2b-token"
+const operatorRBACToken = "integration-operator-rbac-phase2b-token"
 
 func newInternalRouter(t *testing.T) *gin.Engine {
 	return newInternalRouterWithNow(t, nil)
@@ -28,6 +29,7 @@ func newInternalRouter(t *testing.T) *gin.Engine {
 func newInternalRouterWithNow(t *testing.T, now func() time.Time) *gin.Engine {
 	t.Helper()
 	t.Setenv("INTERNAL_API_TOKEN", internalRBACToken)
+	t.Setenv("OPERATOR_API_TOKEN", operatorRBACToken)
 	return newRouterWithNow(t, now)
 }
 
@@ -38,7 +40,11 @@ func doInternal(r *gin.Engine, method, path, actorID, body string) *httptest.Res
 	}
 	req := httptest.NewRequest(method, path, bodyReader)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+internalRBACToken)
+	token := internalRBACToken
+	if strings.HasPrefix(path, "/internal/abuse/") {
+		token = operatorRBACToken
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	if actorID != "" {
 		req.Header.Set("X-Actor-User-Id", actorID)
 	}
