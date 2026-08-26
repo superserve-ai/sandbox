@@ -44,6 +44,48 @@ func TestLoadConfigRequiresExplicitHostID(t *testing.T) {
 	}
 }
 
+func TestLoadConfigUsesHeartbeatOverrides(t *testing.T) {
+	t.Setenv("KERNEL_PATH", "/tmp/kernel")
+	t.Setenv("BASE_ROOTFS_PATH", "/tmp/rootfs")
+	t.Setenv("HOST_ID", "host-a")
+	t.Setenv("VMD_ADVERTISE_ADDR", "10.0.0.2:50051")
+	t.Setenv("PROXY_ADVERTISE_ADDR", "10.0.0.2:5007")
+	t.Setenv("HOST_REGION", "region-explicit")
+	t.Setenv("SANDBOX_ID_REGION", "region-fallback")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.VMDAdvertiseAddr != "10.0.0.2:50051" {
+		t.Fatalf("cfg.VMDAdvertiseAddr = %q, want explicit override", cfg.VMDAdvertiseAddr)
+	}
+	if cfg.ProxyAdvertiseAddr != "10.0.0.2:5007" {
+		t.Fatalf("cfg.ProxyAdvertiseAddr = %q, want explicit override", cfg.ProxyAdvertiseAddr)
+	}
+	if cfg.HostRegion != "region-explicit" {
+		t.Fatalf("cfg.HostRegion = %q, want explicit override", cfg.HostRegion)
+	}
+}
+
+func TestAdvertisedAddrsPreferExplicitOverrides(t *testing.T) {
+	vmdAddr, err := advertisedVMDAddr("does-not-matter", 50051, "10.0.0.2:50051")
+	if err != nil {
+		t.Fatalf("advertisedVMDAddr: %v", err)
+	}
+	if vmdAddr != "10.0.0.2:50051" {
+		t.Fatalf("advertisedVMDAddr = %q, want explicit override", vmdAddr)
+	}
+
+	proxyAddr, err := advertisedProxyAddr("does-not-matter", "http://127.0.0.1:5007/health", "10.0.0.2:5007")
+	if err != nil {
+		t.Fatalf("advertisedProxyAddr: %v", err)
+	}
+	if proxyAddr != "10.0.0.2:5007" {
+		t.Fatalf("advertisedProxyAddr = %q, want explicit override", proxyAddr)
+	}
+}
+
 func TestParseSecretsProxyAddr(t *testing.T) {
 	t.Parallel()
 

@@ -39,13 +39,16 @@ type BuildTemplateRequest struct {
 
 // BuildTemplateResult is returned on success.
 type BuildTemplateResult struct {
-	SnapshotPath   string
-	MemFilePath    string
-	RootfsPath     string
-	BasePath       string // overlay-mode templates only
-	DeltaPath      string // overlay-mode templates only
-	ResolvedDigest string // sha256:... of the resolved base image
-	SizeBytes      int64  // on-disk rootfs size
+	SnapshotPath         string
+	MemFilePath          string
+	RootfsPath           string
+	BasePath             string // overlay-mode templates only
+	DeltaPath            string // overlay-mode templates only
+	ResolvedDigest       string // sha256:... of the resolved base image
+	SizeBytes            int64  // on-disk rootfs size
+	RootfsAllocatedBytes int64
+	BaseAllocatedBytes   int64
+	DeltaAllocatedBytes  int64
 }
 
 // BuildTemplate starts a template build asynchronously and returns the
@@ -183,6 +186,7 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	if err != nil {
 		return nil, fmt.Errorf("read build meta: %w", err)
 	}
+	populateBuildAllocations(result)
 
 	// Best-effort: a missing access.log just means sandboxes fall back
 	// to sequential prefetch. The "build-" prefix must remain so isBuildVM
@@ -222,6 +226,21 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 
 	log.Info().Dur("total", time.Since(buildStart)).Msg("template build complete")
 	return result, nil
+}
+
+func physicalAllocatedBytes(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+	return stat.Blocks * 512
 }
 
 // backupBuildArtifacts makes a finished build's artifact set durable: hash

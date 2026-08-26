@@ -282,7 +282,7 @@ WITH build_done AS (
       updated_at = now()
   WHERE template_build.id = $1 AND status IN ('building', 'snapshotting')
   RETURNING template_id
-)
+), updated AS (
 UPDATE template
 SET status = 'ready',
     rootfs_path = $2,
@@ -296,7 +296,29 @@ SET status = 'ready',
     error_message = NULL
 FROM build_done
 WHERE template.id = build_done.template_id
-RETURNING template.*;
+RETURNING template.*
+), artifacts AS (
+INSERT INTO artifact_manifest (
+    template_id, file_name, path, size_bytes, allocated_bytes, sha256
+)
+SELECT DISTINCT ON (a.path) updated.id, a.file_name, a.path, a.size_bytes, a.allocated_bytes,
+       repeat('0', 64)
+FROM updated
+CROSS JOIN LATERAL (
+    VALUES
+        ('rootfs.ext4', updated.rootfs_path, COALESCE(updated.size_bytes, 0), sqlc.arg('rootfs_allocated_bytes')::bigint),
+        ('base.ext4', updated.base_path, 0::bigint, sqlc.arg('base_allocated_bytes')::bigint),
+        ('delta.ext4', updated.delta_path, 0::bigint, sqlc.arg('delta_allocated_bytes')::bigint)
+) AS a(file_name, path, size_bytes, allocated_bytes)
+WHERE a.path IS NOT NULL
+ORDER BY a.path, (a.file_name = 'rootfs.ext4') DESC
+ON CONFLICT (template_id, path) WHERE template_id IS NOT NULL DO UPDATE
+SET path = EXCLUDED.path,
+    size_bytes = EXCLUDED.size_bytes,
+    allocated_bytes = EXCLUDED.allocated_bytes
+RETURNING 1
+)
+SELECT * FROM updated;
 
 -- name: FailBuild :one
 -- Build row flips to failed if not already terminal; template flips only if

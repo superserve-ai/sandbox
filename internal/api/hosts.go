@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
@@ -17,10 +18,17 @@ const (
 	maxHostCapabilities     = 32
 	maxHostCapabilityLength = 64
 	maxHostFieldLength      = 256
+	maxHostStorageSamples   = 200000
 )
 
+type hostStorageMeasurement struct {
+	SandboxID      string `json:"sandbox_id"`
+	AllocatedBytes int64  `json:"allocated_bytes"`
+}
+
 type hostHeartbeatRequest struct {
-	Capabilities []string `json:"capabilities"`
+	Capabilities []string                 `json:"capabilities"`
+	Storage      []hostStorageMeasurement `json:"storage,omitempty"`
 
 	// Self-description, sent by vmds that support self-registration. When a
 	// heartbeat arrives for an unknown host id with a complete description,
@@ -49,14 +57,6 @@ var (
 // last_heartbeat_at; a background detector marks hosts unhealthy after
 // 2 minutes of silence. If the host was previously marked unhealthy, the
 // heartbeat automatically re-activates it (recovery from transient outage).
-//
-// A heartbeat for an unknown host id that carries a complete self-description
-// registers the host in 'provisioning' — never serving — until an operator
-// activates it. A heartbeat claiming an existing id from a different vmd_addr
-// is rejected while the row's holder is still heartbeating: two live daemons
-// must never share an identity (each would reconcile the other's sandboxes).
-// If the holder has gone silent past the unhealthy threshold, the identity is
-// released to the new address (re-provisioned host, new internal IP).
 func (h *Handlers) HostHeartbeat(c *gin.Context) {
 	hostID := c.Param("host_id")
 	if hostID == "" {
@@ -75,6 +75,10 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "too many capabilities", http.StatusBadRequest)
 		return
 	}
+	if len(req.Storage) > maxHostStorageSamples {
+		respondErrorMsg(c, "bad_request", "too many storage measurements", http.StatusBadRequest)
+		return
+	}
 	for _, f := range []string{req.VMDAddr, req.ProxyAddr, req.Region} {
 		if len(f) > maxHostFieldLength {
 			respondErrorMsg(c, "bad_request", "host description fields must be short", http.StatusBadRequest)
@@ -89,15 +93,31 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		}
 		capabilities = append(capabilities, capability)
 	}
+	storageIDs := make([]uuid.UUID, 0, len(req.Storage))
+	storageMiB := make([]int32, 0, len(req.Storage))
+	for _, measurement := range req.Storage {
+		sandboxID, err := uuid.Parse(measurement.SandboxID)
+		if err != nil || measurement.AllocatedBytes < 0 {
+			respondErrorMsg(c, "bad_request", "invalid storage measurement", http.StatusBadRequest)
+			return
+		}
+		mib := (measurement.AllocatedBytes + (1 << 20) - 1) >> 20
+		if mib > int64(^uint32(0)>>1) {
+			respondErrorMsg(c, "bad_request", "storage measurement is too large", http.StatusBadRequest)
+			return
+		}
+		storageIDs = append(storageIDs, sandboxID)
+		storageMiB = append(storageMiB, int32(mib))
+	}
 
 	ctx := c.Request.Context()
 	registered := false
 	reclaimed := false
-	beat := func(q *db.Queries) (status, prevStatus string, lastHeartbeatAt pgtype.Timestamptz, _ error) {
+	beat := func(q *db.Queries) (status, prevStatus string, _ error) {
 		host, err := q.GetHostForUpdate(ctx, hostID)
 		if err == pgx.ErrNoRows {
 			if !req.describesHost() {
-				return "", "", pgtype.Timestamptz{}, errHostNotRegistered
+				return "", "", errHostNotRegistered
 			}
 			created, err := q.RegisterHost(ctx, db.RegisterHostParams{
 				ID:                hostID,
@@ -108,43 +128,41 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 				CapacityVcpus:     req.CapacityVcpus,
 			})
 			if err != nil {
-				return "", "", pgtype.Timestamptz{}, err
+				return "", "", err
 			}
 			registered = true
 			if err := q.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
 				HostID: hostID, Capabilities: capabilities,
 			}); err != nil {
-				return "", "", pgtype.Timestamptz{}, err
+				return "", "", err
 			}
-			return created.Status, created.Status, created.LastHeartbeatAt, nil
+			if len(storageIDs) > 0 {
+				if _, err := q.UpdateHostSandboxStorageMeasurements(ctx, db.UpdateHostSandboxStorageMeasurementsParams{
+					SandboxIds: storageIDs,
+					DiskMib:    storageMiB,
+					HostID:     hostID,
+				}); err != nil {
+					return "", "", err
+				}
+			}
+			return created.Status, created.Status, nil
 		}
 		if err != nil {
-			return "", "", pgtype.Timestamptz{}, err
+			return "", "", err
 		}
 
-		// Once a row is identity-bound, description-less heartbeats are
-		// rejected outright. The shared internal token cannot distinguish
-		// daemons, so after a reclaim the previous holder's legacy
-		// heartbeats would otherwise keep refreshing liveness and
-		// capabilities on a row that now belongs to another machine —
-		// and its reconciler would keep operating under an id it lost.
 		if host.IdentityBound && !req.describesHost() {
-			return "", "", pgtype.Timestamptz{}, errHostIdentityRequired
+			return "", "", errHostIdentityRequired
 		}
 
 		if req.VMDAddr != "" && req.VMDAddr != host.VmdAddr {
 			holderAlive := host.LastHeartbeatAt.Valid &&
 				time.Since(host.LastHeartbeatAt.Time) < heartbeatTimeout
 			if holderAlive {
-				return "", "", pgtype.Timestamptz{}, errHostIdentityConflict
+				return "", "", errHostIdentityConflict
 			}
-			// Claiming an existing identity from a new address is a
-			// re-registration: it rewrites the whole row, so it needs the
-			// whole description. A partial one would blank proxy_addr or
-			// region, and heartbeating without reclaiming would mark a row
-			// live while its address points at the silent old machine.
 			if !req.describesHost() {
-				return "", "", pgtype.Timestamptz{}, errHostPartialDescription
+				return "", "", errHostPartialDescription
 			}
 			if err := q.UpdateHostAddresses(ctx, db.UpdateHostAddressesParams{
 				ID:                hostID,
@@ -154,7 +172,7 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 				CapacityMemoryMib: req.CapacityMemoryMib,
 				CapacityVcpus:     req.CapacityVcpus,
 			}); err != nil {
-				return "", "", pgtype.Timestamptz{}, err
+				return "", "", err
 			}
 			reclaimed = true
 			log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
@@ -163,63 +181,75 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 
 		row, err := q.UpdateHostHeartbeat(ctx, hostID)
 		if err != nil {
-			return "", "", pgtype.Timestamptz{}, err
+			return "", "", err
 		}
-		// Missing capabilities is an explicit empty replacement. This clears a
-		// stale attestation immediately when VMD can no longer verify its proxy.
 		if err := q.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
 			HostID: hostID, Capabilities: capabilities,
 		}); err != nil {
-			return "", "", pgtype.Timestamptz{}, err
+			return "", "", err
 		}
-		// Opt-in: a complete description at the row's current address binds
-		// the identity, so later description-less heartbeats for this id
-		// are rejected. (Registration and reclaim bind in their own writes.)
-		if !host.IdentityBound && req.describesHost() && req.VMDAddr == host.VmdAddr {
-			if err := q.BindHostIdentity(ctx, hostID); err != nil {
-				return "", "", pgtype.Timestamptz{}, err
+		if len(storageIDs) > 0 {
+			if _, err := q.UpdateHostSandboxStorageMeasurements(ctx, db.UpdateHostSandboxStorageMeasurementsParams{
+				SandboxIds: storageIDs,
+				DiskMib:    storageMiB,
+				HostID:     hostID,
+			}); err != nil {
+				return "", "", err
 			}
 		}
-		return row.Status, row.PrevStatus, row.LastHeartbeatAt, nil
+		if !host.IdentityBound && req.describesHost() && req.VMDAddr == host.VmdAddr {
+			if err := q.BindHostIdentity(ctx, hostID); err != nil {
+				return "", "", err
+			}
+		}
+		return row.Status, row.PrevStatus, nil
 	}
 
-	var status, prevStatus string
-	var lastHeartbeatAt pgtype.Timestamptz
+	var host db.UpdateHostHeartbeatRow
 	var err error
 	if h.Pool == nil {
-		status, prevStatus, lastHeartbeatAt, err = beat(h.DB)
+		var status, prevStatus string
+		status, prevStatus, err = beat(h.DB)
+		host.Status = status
+		host.PrevStatus = prevStatus
 	} else {
 		var tx pgx.Tx
 		if tx, err = h.Pool.Begin(ctx); err == nil {
 			defer tx.Rollback(ctx)
-			if status, prevStatus, lastHeartbeatAt, err = beat(h.DB.WithTx(tx)); err == nil {
+			var status, prevStatus string
+			if status, prevStatus, err = beat(h.DB.WithTx(tx)); err == nil {
+				host.Status = status
+				host.PrevStatus = prevStatus
 				err = tx.Commit(ctx)
 			}
 		}
 	}
-	switch {
-	case err == errHostNotRegistered:
-		respondErrorMsg(c, "not_found", "host not found", http.StatusNotFound)
-		return
-	case err == errHostIdentityConflict:
-		log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
-			Msg("heartbeat rejected: identity in use by a live host at another address")
-		respondErrorMsg(c, "conflict", "host identity in use by a live host", http.StatusConflict)
-		return
-	case err == errHostIdentityRequired:
-		log.Warn().Str("host_id", hostID).
-			Msg("heartbeat rejected: identity-bound host sent a description-less heartbeat")
-		respondErrorMsg(c, "conflict",
-			"host identity is bound; heartbeats must carry the complete self-description",
-			http.StatusConflict)
-		return
-	case err == errHostPartialDescription:
-		log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
-			Msg("heartbeat rejected: address claim without a complete host description")
-		respondErrorMsg(c, "bad_request", "claiming a host address requires a complete host description", http.StatusBadRequest)
-		return
-	case err != nil:
-		log.Error().Err(err).Str("host_id", hostID).Msg("host heartbeat failed")
+	if err != nil {
+		if err == errHostNotRegistered {
+			respondErrorMsg(c, "not_found", "host not found", http.StatusNotFound)
+			return
+		}
+		if err == errHostIdentityConflict {
+			log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
+				Msg("heartbeat rejected: identity in use by a live host at another address")
+			respondErrorMsg(c, "conflict", "host identity in use by a live host", http.StatusConflict)
+			return
+		}
+		if err == errHostIdentityRequired {
+			log.Warn().Str("host_id", hostID).
+				Msg("heartbeat rejected: identity-bound host sent a description-less heartbeat")
+			respondErrorMsg(c, "conflict",
+				"host identity is bound; heartbeats must carry the complete self-description",
+				http.StatusConflict)
+			return
+		}
+		if err == errHostPartialDescription {
+			log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
+				Msg("heartbeat rejected: address claim without a complete host description")
+			respondErrorMsg(c, "bad_request", "claiming a host address requires a complete host description", http.StatusBadRequest)
+			return
+		}
+		log.Error().Err(err).Str("host_id", hostID).Msg("UpdateHostHeartbeat failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -230,22 +260,16 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 	}
 	if reclaimed {
 		if h.Hosts != nil {
-			// The row's vmd_addr changed; a cached client still dials the old
-			// machine (the registry only self-evicts on dead transports, and a
-			// live old daemon would silently take the wrong host's RPCs).
 			h.Hosts.Invalidate(hostID)
 		}
 		if h.Scheduler != nil {
-			// The reclaim demoted the row to provisioning; a previously
-			// active host must leave the candidate set now, not at TTL.
 			h.Scheduler.Invalidate()
 		}
 	}
 	log.Debug().Str("host_id", hostID).Strs("capabilities", capabilities).
-		Interface("last_heartbeat_at", timestamptzString(lastHeartbeatAt)).
-		Str("status", status).Str("prev_status", prevStatus).
+		Str("status", host.Status).Str("prev_status", host.PrevStatus).
 		Msg("host heartbeat persisted")
-	if prevStatus == "unhealthy" && status == "active" {
+	if host.PrevStatus == "unhealthy" && host.Status == "active" {
 		// The heartbeat just recovered this host; drop the scheduler's cached
 		// list so its capacity is usable now, not after the cache TTL.
 		log.Info().Str("host_id", hostID).Msg("host recovered via heartbeat")
@@ -254,7 +278,7 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": status})
+	c.JSON(http.StatusOK, gin.H{"status": host.Status})
 }
 
 type hostStatusRequest struct {
@@ -344,8 +368,11 @@ func (h *Handlers) HostList(c *gin.Context) {
 	hosts := make([]hostView, 0, len(rows))
 	for _, r := range rows {
 		v := hostView{
-			ID: r.ID, Status: r.Status, Region: r.Region,
-			VMDAddr: r.VmdAddr, ProxyAddr: r.ProxyAddr,
+			ID:                r.ID,
+			Status:            r.Status,
+			Region:            r.Region,
+			VMDAddr:           r.VmdAddr,
+			ProxyAddr:         r.ProxyAddr,
 			CapacityMemoryMib: r.CapacityMemoryMib,
 			CapacityVcpus:     r.CapacityVcpus,
 			RunningCount:      r.RunningCount,

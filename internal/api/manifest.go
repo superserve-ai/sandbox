@@ -22,6 +22,7 @@ func applyManifest(p *db.FinalizePauseParams, manifest []vmdclient.ManifestEntry
 		p.ManifestFileNames = append(p.ManifestFileNames, e.FileName)
 		p.ManifestPaths = append(p.ManifestPaths, e.Path)
 		p.ManifestSizes = append(p.ManifestSizes, e.SizeBytes)
+		p.ManifestAllocatedBytes = append(p.ManifestAllocatedBytes, e.AllocatedBytes)
 		p.ManifestDigests = append(p.ManifestDigests, e.SHA256)
 		p.ManifestBasePaths = append(p.ManifestBasePaths, e.BasePath)
 	}

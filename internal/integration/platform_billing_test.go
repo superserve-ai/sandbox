@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -242,6 +244,131 @@ func TestPlatformBillingUsesCurrentPeriodLedgerToReconstructOpeningBalance(t *te
 	}
 	if got := row.Summary["credits_remaining_usd"].(float64); got < -0.000001 || got > 0.000001 {
 		t.Fatalf("credits_remaining_usd = %v, want 0", got)
+	}
+}
+
+func TestPlatformBillingDeduplicatesSharedArtifactStorage(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	fixedNow := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	r := newInternalRouterWithNow(t, func() time.Time { return fixedNow })
+	periodStart, _ := billing.CurrentBillingPeriod(fixedNow)
+	seedPlatformBillingRatesForTest(t, ctx, teamID, "platform-billing-shared-artifact-"+uuid.NewString(), periodStart.Add(-time.Hour))
+
+	const sharedPath = "/tmp/test/platform-shared-rootfs.ext4"
+	const sharedBytes = int64(8 * 1024 * 1024)
+	const sharedAllocatedBytes = int64(4096) // sparse artifact: logical length is intentionally much larger
+	const deltaPath = "/tmp/test/platform-derived-delta.ext4"
+	const deltaBytes = int64(2 * 1024 * 1024)
+	const deltaAllocatedBytes = int64(4096)
+	const zeroReferencePath = "/tmp/test/platform-zero-reference.ext4"
+	var sandboxIDs []uuid.UUID
+	var zeroReferenceSnapshotID uuid.UUID
+	for _, name := range []string{"platform-shared-a", "platform-shared-b", "platform-derived"} {
+		cw := do(r, http.MethodPost, "/sandboxes", ownerKey, fmt.Sprintf(`{"name":%q}`, name))
+		if cw.Code != http.StatusCreated {
+			t.Fatalf("create %s: %d %s", name, cw.Code, cw.Body.String())
+		}
+		sandboxIDs = append(sandboxIDs, uuid.MustParse(mustJSON(t, cw)["id"].(string)))
+	}
+
+	for i, sandboxID := range sandboxIDs {
+		basePath, deltaPathForSandbox := sharedPath, ""
+		if i == 2 {
+			deltaPathForSandbox = deltaPath
+		}
+		if _, err := testPool.Exec(ctx, `
+			UPDATE sandbox
+			SET created_at = $2, base_path = $4, delta_path = $5
+			WHERE id = $1 AND team_id = $3
+		`, sandboxID, periodStart, teamID, basePath, deltaPathForSandbox); err != nil {
+			t.Fatalf("prepare sandbox %d: %v", i, err)
+		}
+		var snapshotID uuid.UUID
+		if err := testPool.QueryRow(ctx, `
+			INSERT INTO snapshot (sandbox_id, team_id, path, trigger)
+			VALUES ($1, $2, $3, 'pause')
+			RETURNING id
+		`, sandboxID, teamID, fmt.Sprintf("/tmp/test/platform-snapshot-%d", i)).Scan(&snapshotID); err != nil {
+			t.Fatalf("seed snapshot %d: %v", i, err)
+		}
+		if i == 0 {
+			zeroReferenceSnapshotID = snapshotID
+		}
+		if _, err := testPool.Exec(ctx, `UPDATE sandbox SET snapshot_id = $2 WHERE id = $1`, sandboxID, snapshotID); err != nil {
+			t.Fatalf("link snapshot %d: %v", i, err)
+		}
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, snapshotID, fmt.Sprintf("platform-rootfs-%d.ext4", i), basePath, sharedBytes, sharedAllocatedBytes, strings.Repeat("0", 64)); err != nil {
+			t.Fatalf("seed artifact manifest %d: %v", i, err)
+		}
+		if i == 2 {
+			if _, err := testPool.Exec(ctx, `
+				INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256)
+				VALUES ($1, 'platform-derived-delta.ext4', $2, $3, $4, $5)
+			`, snapshotID, deltaPath, deltaBytes, deltaAllocatedBytes, strings.Repeat("1", 64)); err != nil {
+				t.Fatalf("seed derived delta: %v", err)
+			}
+		}
+		if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_storage_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+			t.Fatalf("clear seeded storage interval %d: %v", i, err)
+		}
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason)
+			VALUES ($1, $2, 1, $3, $4, 'deleted')
+		`, sandboxID, teamID, fixedNow.Add(-time.Minute), fixedNow); err != nil {
+			t.Fatalf("seed overlay interval %d: %v", i, err)
+		}
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE template SET rootfs_path = $1, size_bytes = $2 WHERE name = 'superserve/base'`, sharedPath, sharedBytes); err != nil {
+		t.Fatalf("set shared template artifact: %v", err)
+	}
+	// This retained manifest has no sandbox path reference and must not affect usage.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256)
+		VALUES ($1, 'platform-zero-reference.ext4', $2, 64 * 1024 * 1024, $3)
+	`, zeroReferenceSnapshotID, zeroReferencePath, strings.Repeat("2", 64)); err != nil {
+		t.Fatalf("seed zero-reference artifact: %v", err)
+	}
+
+	actorID := seedPlatformAdminProfile(t)
+	storageUSD := func(sort string) float64 {
+		resp := doInternal(r, http.MethodGet, fmt.Sprintf("/internal/billing?search=%s&sort=%s&order=asc", teamID, sort), actorID.String(), "")
+		if resp.Code != http.StatusOK {
+			t.Fatalf("platform billing (%s): %d %s", sort, resp.Code, resp.Body.String())
+		}
+		body := decodePlatformBilling(t, resp.Body.Bytes())
+		if len(body.Rows) != 1 || body.Rows[0].Summary == nil {
+			t.Fatalf("platform billing (%s) rows = %+v", sort, body.Rows)
+		}
+		return body.Rows[0].Summary["cost_breakdown_usd"].(map[string]any)["storage"].(float64)
+	}
+
+	metadataStorage := storageUSD("team_name")
+	chargesStorage := storageUSD("current_charges_usd")
+	if metadataStorage <= 0 || chargesStorage <= 0 {
+		t.Fatalf("storage charge = metadata:%v charges:%v, want positive", metadataStorage, chargesStorage)
+	}
+	if metadataStorage != chargesStorage {
+		t.Fatalf("storage charge differs by query path: metadata:%v charges:%v", metadataStorage, chargesStorage)
+	}
+	// The sparse shared and derived artifacts are retained through the billing
+	// request and must be charged once by allocated bytes, in addition to overlays.
+	artifactSeconds := (sharedAllocatedBytes + deltaAllocatedBytes) * int64(time.Minute.Seconds()) / (1024 * 1024)
+	wantStorage := (float64(artifactSeconds+3*60) / 1024) * 0.00000003
+	if diff := math.Abs(metadataStorage - wantStorage); diff > 1e-12 {
+		t.Fatalf("storage charge = %v, want %v (diff %v)", metadataStorage, wantStorage, diff)
+	}
+	resp := doInternal(r, http.MethodGet, fmt.Sprintf("/internal/billing?search=%s&sort=team_name&order=asc", teamID), actorID.String(), "")
+	body := decodePlatformBilling(t, resp.Body.Bytes())
+	gotStorageSeconds, ok := body.Rows[0].Summary["storage_mib_seconds"].(float64)
+	if !ok {
+		t.Fatalf("storage_mib_seconds = %v, want numeric", body.Rows[0].Summary["storage_mib_seconds"])
+	}
+	if diff := math.Abs(gotStorageSeconds - float64(artifactSeconds+3*60)); diff > 1e-6 {
+		t.Fatalf("storage_mib_seconds = %v, want %v (diff %v)", gotStorageSeconds, artifactSeconds+3*60, diff)
 	}
 }
 
