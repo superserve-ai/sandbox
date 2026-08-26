@@ -134,7 +134,7 @@ These cover:
 - sandbox lifecycle success, error, and latency
 - VMD error rate and p95 latency by host
 - host used vCPU, used memory, and running sandboxes
-- sandbox create rate plus conflict/error/timeout spikes as abuse signals
+- sandbox create rate plus conflict/error/timeout/client_error spikes as abuse signals
 - collector export failures, dropped metric points, queue pressure, and memory-limiter refusals
 
 ### Cardinality validation

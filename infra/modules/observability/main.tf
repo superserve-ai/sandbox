@@ -155,6 +155,8 @@ locals {
     host_maintenance_event_alerts = var.host_maintenance_event_alerts
     backup_alerts                 = var.backup_alerts
     backup_coverage_alerts        = var.backup_coverage_alerts
+    lifecycle_latency_alerts      = var.lifecycle_latency_alerts
+    failed_sandbox_alert_enabled  = var.failed_sandbox_alert_enabled
     host_disk_alerts              = var.host_disk_alerts
     log_buckets                   = var.log_buckets
     uptime_checks                 = var.uptime_checks
