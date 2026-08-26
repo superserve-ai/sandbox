@@ -48,6 +48,7 @@ func newTestManager() *Manager {
 		devices:   make(map[string]*VMNetInfo),
 		slotOwner: make(map[int]string),
 		nextSlot:  1,
+		ops:       shellSlotOps{},
 	}
 }
 

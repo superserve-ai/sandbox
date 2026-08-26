@@ -14,7 +14,6 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/superserve-ai/sandbox/internal/shellquote"
 
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
@@ -132,6 +131,12 @@ type Manager struct {
 	// setupSem bounds concurrent setupSlot builds (see setupSlotConcurrency).
 	setupSem chan struct{}
 
+	// ops issues the kernel operations for slot build, adoption, recycling,
+	// and teardown. The lifecycle logic above it is backend-agnostic.
+	ops slotNetOps
+	// useNetlinkOps selects the netlink backend at construction.
+	useNetlinkOps bool
+
 	mu         sync.Mutex
 	devices    map[string]*VMNetInfo
 	freeSlots  []int // recycled slot indices, guaranteed absent from slotOwner
@@ -214,6 +219,14 @@ type ManagerOption func(*Manager)
 // WithHostID supplies the persisted VMD host identity for network-operation logs.
 func WithHostID(hostID string) ManagerOption {
 	return func(m *Manager) { m.hostID = hostID }
+}
+
+// WithNetlinkSlotOps selects the netlink backend for slot network operations
+// instead of forking iproute2. Namespace-scoped operations then join the
+// target namespace directly, without the per-invocation mount-namespace clone
+// `ip netns exec` performs.
+func WithNetlinkSlotOps() ManagerOption {
+	return func(m *Manager) { m.useNetlinkOps = true }
 }
 
 // WithExactSlot pins the Manager to exactly slot idx: it claims that one index
@@ -301,6 +314,15 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 	}
 	for _, opt := range opts {
 		opt(mgr)
+	}
+	if mgr.useNetlinkOps {
+		ops, err := newNetlinkSlotOps()
+		if err != nil {
+			return nil, err
+		}
+		mgr.ops = ops
+	} else {
+		mgr.ops = shellSlotOps{}
 	}
 	preNet := time.Since(tPreNet)
 
@@ -475,50 +497,25 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		return nil, "", fmt.Errorf("namespace %s already exists (slot in use)", nsName)
 	}
 
-	if err := run(ctx, "ip", "netns", "add", nsName); err != nil {
+	if err := m.ops.AddNamespace(ctx, nsName); err != nil {
 		return nil, "", fmt.Errorf("create namespace: %w", err)
 	}
 
-	if err := nsRun(ctx, nsName, "ip", "link", "add", vethName, "type", "veth", "peer", "name", vpeerName); err != nil {
+	if err := m.ops.BuildSlotVeth(ctx, nsName, vethName, vpeerName, vpeerIP+"/31"); err != nil {
 		m.removeNS(nsName)
-		return nil, "", fmt.Errorf("create veth pair: %w", err)
+		return nil, "", err
 	}
 
-	if err := nsRun(ctx, nsName, "ip", "link", "set", vpeerName, "up"); err != nil {
-		m.removeNS(nsName)
-		return nil, "", fmt.Errorf("bring up vpeer: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "link", "set", vpeerName, "mtu", ifaceMTU); err != nil {
-		m.removeNS(nsName)
-		return nil, "", fmt.Errorf("set vpeer MTU: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "addr", "add", vpeerIP+"/31", "dev", vpeerName); err != nil {
-		m.removeNS(nsName)
-		return nil, "", fmt.Errorf("assign vpeer IP: %w", err)
-	}
-
-	if err := nsRun(ctx, nsName, "ip", "link", "set", vethName, "netns", "1"); err != nil {
+	if err := m.ops.MoveVethToHost(ctx, nsName, vethName); err != nil {
 		m.removeNS(nsName)
 		return nil, "", fmt.Errorf("move veth to host: %w", err)
 	}
 
-	if err := run(ctx, "ip", "link", "set", vethName, "up"); err != nil {
+	if err := m.ops.ConfigureHostVeth(ctx, vethName, vethIP+"/31"); err != nil {
 		// The veth now lives on the host, so it outlives the namespace:
 		// tear both down or the next build at this index collides with it.
 		m.cleanupFull(nsName, vethName)
-		return nil, "", fmt.Errorf("bring up veth: %w", err)
-	}
-	if err := run(ctx, "ip", "link", "set", vethName, "mtu", ifaceMTU); err != nil {
-		// The veth now lives on the host, so it outlives the namespace:
-		// tear both down or the next build at this index collides with it.
-		m.cleanupFull(nsName, vethName)
-		return nil, "", fmt.Errorf("set veth MTU: %w", err)
-	}
-	if err := run(ctx, "ip", "addr", "add", vethIP+"/31", "dev", vethName); err != nil {
-		// The veth now lives on the host, so it outlives the namespace:
-		// tear both down or the next build at this index collides with it.
-		m.cleanupFull(nsName, vethName)
-		return nil, "", fmt.Errorf("assign veth IP: %w", err)
+		return nil, "", err
 	}
 
 	// One tap-construction path for fresh and recycled slots, so their tap
@@ -528,9 +525,9 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		return nil, "", err
 	}
 
-	_ = nsRun(ctx, nsName, "ip", "link", "set", "lo", "up")
+	_ = m.ops.EnableLoopback(ctx, nsName)
 
-	if err := nsRun(ctx, nsName, "ip", "route", "add", "default", "via", vethIP); err != nil {
+	if err := m.ops.AddDefaultRoute(ctx, nsName, vethIP); err != nil {
 		m.cleanupFull(nsName, vethName)
 		return nil, "", fmt.Errorf("add default route in ns: %w", err)
 	}
@@ -551,7 +548,7 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		return nil, "", fmt.Errorf("init firewall: %w", err)
 	}
 
-	if err := run(ctx, "ip", "route", "add", hostCIDR, "via", vpeerIP, "dev", vethName); err != nil {
+	if err := m.ops.AddHostRoute(ctx, hostCIDR, vpeerIP, vethName); err != nil {
 		m.log.Debug().Err(err).Str("ns", nsName).Msg("host route (may already exist)")
 	}
 
@@ -577,15 +574,8 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 // decline to recycle. nftables rules match tap0 by name, so reusing the name
 // keeps them valid. Also the tap-construction path for setupSlot (the delete
 // is a no-op on a fresh namespace), keeping fresh and recycled taps identical.
-//
-// One exec for the whole rebuild: per-command `ip netns exec` invocations fork
-// twice each and serialize on the kernel's netlink lock under concurrent
-// resets. Interpolants are shell-quoted package constants.
 func (m *Manager) resetTap(ctx context.Context, nsName string) error {
-	script := fmt.Sprintf(
-		"ip link del %[1]s 2>/dev/null; ip tuntap add dev %[1]s mode tap && ip link set %[1]s up && ip link set %[1]s mtu %[2]s && ip addr add %[3]s dev %[1]s",
-		shellquote.Single(TAPName), shellquote.Single(ifaceMTU), shellquote.Single(tapCIDR))
-	if err := nsRun(ctx, nsName, "sh", "-c", script); err != nil {
+	if err := m.ops.RebuildTap(ctx, nsName); err != nil {
 		return fmt.Errorf("reset TAP: %w", err)
 	}
 	return nil
@@ -692,9 +682,9 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_ = run(ctx, "ip", "route", "del", hostCIDR, "via", vpeerIP, "dev", vethName)
-	_ = run(ctx, "ip", "link", "del", vethName)
-	_ = run(ctx, "ip", "netns", "del", info.Namespace)
+	_ = m.ops.DelHostRoute(ctx, hostCIDR, vpeerIP, vethName)
+	_ = m.ops.DelHostLink(ctx, vethName)
+	_ = m.ops.DelNamespace(ctx, info.Namespace)
 
 	m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", info.Namespace).Msg("network namespace cleaned up")
 }
@@ -1335,7 +1325,7 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := run(ctx, "ip", "link", "del", veth); err == nil {
+			if err := m.ops.DelHostLink(ctx, veth); err == nil {
 				m.log.Info().Str("veth", veth).Msg("swept orphan host veth")
 			}
 			cancel()
@@ -1520,15 +1510,15 @@ func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	// it, namespace side for its outbound traffic — and a crash can strand a
 	// namespace between address config and route install. Replace is
 	// idempotent, so any failure means the slot is structurally broken.
-	if err := run(ctx, "ip", "route", "replace", hostIP+"/32", "via", vpeerIPForSlot(idx), "dev", vethName); err != nil {
+	if err := m.ops.ReplaceHostRoute(ctx, hostIP+"/32", vpeerIPForSlot(idx), vethName); err != nil {
 		_ = fw.Close()
 		return nil, "", fmt.Errorf("adopt slot %d: host route: %w", idx, err)
 	}
-	if err := nsRun(ctx, nsName, "ip", "route", "replace", "default", "via", vethIPForSlot(idx)); err != nil {
+	if err := m.ops.ReplaceDefaultRoute(ctx, nsName, vethIPForSlot(idx)); err != nil {
 		_ = fw.Close()
 		return nil, "", fmt.Errorf("adopt slot %d: namespace default route: %w", idx, err)
 	}
-	_ = nsRun(ctx, nsName, "ip", "link", "set", "lo", "up")
+	_ = m.ops.EnableLoopback(ctx, nsName)
 
 	return &VMNetInfo{
 		Namespace:  nsName,
@@ -1561,7 +1551,7 @@ func (m *Manager) SweepStrayHostVeths() (swept int) {
 			// here, and the index must never become claimable — delete the
 			// stray link and move on.
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := run(ctx, "ip", "link", "del", veth); err == nil {
+			if err := m.ops.DelHostLink(ctx, veth); err == nil {
 				m.log.Info().Str("veth", veth).Msg("swept stray host veth")
 				swept++
 			}
@@ -1581,7 +1571,7 @@ func (m *Manager) SweepStrayHostVeths() (swept int) {
 		m.mu.Unlock()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		delErr := run(ctx, "ip", "link", "del", veth)
+		delErr := m.ops.DelHostLink(ctx, veth)
 		cancel()
 		if delErr == nil {
 			m.log.Info().Str("veth", veth).Msg("swept stray host veth")
@@ -1772,14 +1762,14 @@ func nsExists(nsName string) bool {
 func (m *Manager) removeNS(nsName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = run(ctx, "ip", "netns", "del", nsName)
+	_ = m.ops.DelNamespace(ctx, nsName)
 }
 
 func (m *Manager) cleanupFull(nsName, vethName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = run(ctx, "ip", "link", "del", vethName)
-	_ = run(ctx, "ip", "netns", "del", nsName)
+	_ = m.ops.DelHostLink(ctx, vethName)
+	_ = m.ops.DelNamespace(ctx, nsName)
 }
 
 // NetnsStats reports the ns-N namespaces on the host, the owned slot indices
