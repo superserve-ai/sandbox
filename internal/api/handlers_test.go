@@ -35,6 +35,7 @@ import (
 )
 
 type stubVMD struct {
+	restoreLimits    vmdclient.ResourceLimits
 	destroyFn        func(ctx context.Context, id string, force bool) error
 	pauseFn          func(ctx context.Context, id, snapshotDir string) (string, string, error)
 	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte) (string, error)
@@ -87,7 +88,8 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string) (string, uint32, uint32, string, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
+	s.restoreLimits = limits
 	protocol := preview.HostCapabilityPorts
 	if s.restorePreviewProtocol != nil {
 		protocol = *s.restorePreviewProtocol
@@ -3948,5 +3950,54 @@ func TestCreateSandbox_InsertCarriesTemplateShape(t *testing.T) {
 	}
 	if !sawVcpu || !sawMem {
 		t.Errorf("INSERT args missing template shape (vcpu4 seen=%v, mem8192 seen=%v) — placeholders written instead", sawVcpu, sawMem)
+	}
+}
+
+// Create must DECLARE the sandbox's allocation to vmd. Without it the
+// daemon cannot size the VM from the request and has to ask Firecracker
+// afterwards — one extra durable write per create, landing on the same
+// serialized writer the restore itself waits on. The declaration is what
+// keeps that work off the create path entirely.
+func TestCreateSandboxDeclaresResourceLimitsToVMD(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+				return previewCapableHostRow()
+			}
+			if strings.Contains(sql, "INSERT INTO sandbox") {
+				return sandboxRow(db.Sandbox{
+					ID: sandboxID, TeamID: teamID, Name: "sized",
+					Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 512,
+					CreatedAt: time.Now(),
+				})
+			}
+			if strings.Contains(sql, "FROM template") {
+				return templateRow(defaultReadyTemplate())
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Scheduler: &stubScheduler{hostID: "public-host"}}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"sized"}`))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
+	}
+
+	tpl := defaultReadyTemplate()
+	if vmd.restoreLimits.VCPU == 0 || vmd.restoreLimits.MemoryMiB == 0 {
+		t.Fatalf("restore was sent an undeclared allocation (%d vcpu / %d MiB); vmd would have to probe for it",
+			vmd.restoreLimits.VCPU, vmd.restoreLimits.MemoryMiB)
+	}
+	if vmd.restoreLimits.VCPU != uint32(tpl.Vcpu) || vmd.restoreLimits.MemoryMiB != uint32(tpl.MemoryMib) {
+		t.Fatalf("declared allocation = %d/%d, want the shape the row is inserted with (%d/%d)",
+			vmd.restoreLimits.VCPU, vmd.restoreLimits.MemoryMiB, tpl.Vcpu, tpl.MemoryMib)
 	}
 }

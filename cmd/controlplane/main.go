@@ -511,7 +511,7 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. For
 // sandboxes with secrets the caller passes envVars=nil and pushes env via
 // InjectSandboxEnv after minting a JWT against the returned source IP.
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string) (string, uint32, uint32, string, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
 		VmId:                  vmID,
 		SnapshotPath:          snapshotPath,
@@ -524,6 +524,13 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 		PreviewPorts:          previewPortsToProto(previewPorts),
 		PreviewPolicyRevision: previewPolicyRevision,
 		EnvVars:               envVars,
+		// Declared so the daemon can size this VM without asking
+		// Firecracker after the fact — that probe would land one extra
+		// durable write per restore on the same serialized writer the
+		// restore itself waits on, which shows up as create tail
+		// latency under bursts. Omitted (zero) only by callers that do
+		// not know the shape.
+		ResourceLimits: restoreResourceLimits(limits),
 	})
 	if err != nil {
 		return "", 0, 0, "", fmt.Errorf("gRPC RestoreSnapshot: %w", err)
@@ -534,6 +541,20 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 		mem = rl.GetMemoryMib()
 	}
 	return resp.IpAddress, vcpu, mem, resp.GetPreviewProtocol(), nil
+}
+
+// restoreResourceLimits maps a declared allocation onto the request
+// field, and stays nil when nothing was declared: an empty message would
+// be indistinguishable from "declared as zero" on the daemon side, where
+// zero is exactly the signal that means "recover this yourself".
+func restoreResourceLimits(limits vmdclient.ResourceLimits) *vmdpb.ResourceLimits {
+	if limits.VCPU == 0 || limits.MemoryMiB == 0 {
+		return nil
+	}
+	return &vmdpb.ResourceLimits{
+		VcpuCount: limits.VCPU,
+		MemoryMib: limits.MemoryMiB,
+	}
 }
 
 func previewPortsToProto(ports map[int32]vmdclient.PortPolicy) []*vmdpb.PreviewPort {

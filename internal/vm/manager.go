@@ -3182,10 +3182,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		defer close(persistDone)
 		optimisticOK = m.persistState(inst)
 	}()
-	// The vCPUs are live, so Firecracker answers its API: recover the
-	// allocation this restore was never told (see the helper). Detached
-	// — it must not join the readiness wait below.
-	m.backfillMachineConfigAsync(inst)
 
 	tBoxdStart := time.Now()
 	// Same window as first boot: a restore that has to fault its memory and
@@ -3500,20 +3496,20 @@ func (m *Manager) instanceIsCurrent(inst *VMInstance) bool {
 // did not declare one, so capacity accounting describes the real
 // machine rather than an empty request.
 //
-// The restore RPC carries resource limits only when the caller chooses
-// to send them, and the production control plane does not: it recovers
-// the sandbox's shape from its own row instead (the zero-check in its
-// create/resume handlers). That leaves VMConfig empty on a VM that is
-// nonetheless holding real memory, and anything sizing the host from
-// the instance map would count it as free — a host running hundreds of
-// restored sandboxes would publish a near-zero allocation and read as
-// idle. Firecracker itself is the authority here, so ask it.
+// Restores declare their allocation, so this is the recovery path for
+// records that predate that contract: they hold zeros, and a VM sized
+// zero reads as free capacity — a host full of such VMs would publish
+// as idle. Firecracker knows the real shape, so ask it.
 //
-// Runs OFF the caller's path, always: the probe is a unix-socket round
-// trip to a VM that just restored, and create/resume latency may never
-// pay for accounting. The published numbers are a beat late at worst —
-// the sample runs every 30 seconds and a missed one under-reports a
-// single VM until the next.
+// Deliberately NOT on the restore path. Probing every restore would add
+// a unix-socket round trip and, worse, one more durable write per
+// create onto Bolt's single writer — the same writer the restore itself
+// waits on, so under bursts those extra writes surface as create tail
+// latency. Startup-only recovery has no such caller to slow down.
+//
+// The published numbers are a beat late at worst — the sample runs
+// every 30 seconds and a missed one under-reports a single VM until the
+// next.
 //
 // Retries until it succeeds or the instance stops being current,
 // because a single transient socket error would otherwise leave a live
@@ -4267,11 +4263,15 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	m.indexVM(rec.ID, inst)
 	m.mu.Unlock()
 
-	// Records written before the allocation was recoverable carry zeros,
-	// and a paused VM holds no Firecracker to ask — so heal the running
-	// ones here. Detached, and a no-op for every record that already
-	// knows its size.
-	if rec.Status == StatusRunning {
+	// Legacy records only. Callers declare the allocation on restore, so
+	// anything created since carries its real size; what remains is
+	// records persisted before that — zero-sized, and unreadable without
+	// asking Firecracker. Startup-only, detached, a no-op for every
+	// record that already knows its size, and skipped entirely on hosts
+	// that never publish pressure: this exists solely to keep capacity
+	// accounting honest, so a host doing no accounting must not pay for
+	// it. A paused VM has no Firecracker to ask and is left alone.
+	if rec.Status == StatusRunning && m.pressureAccounting {
 		m.backfillMachineConfigAsync(inst)
 	}
 
