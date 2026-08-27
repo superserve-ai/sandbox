@@ -81,10 +81,11 @@ def fetch_release(version, workdir):
     return binary, digest
 
 
-def list_instances(project, region, label):
+def list_instances(project, region, label, running_only=True):
+    status = " AND status=RUNNING" if running_only else ""
     result = subprocess.run(
         ["gcloud", "compute", "instances", "list", f"--project={project}",
-         f"--filter=labels.{label} AND status=RUNNING",
+         f"--filter=labels.{label}{status}",
          "--format=csv[no-heading](name,zone)"],
         capture_output=True, text=True, check=True,
     )
@@ -95,9 +96,12 @@ def list_instances(project, region, label):
     ]
     # Scope by zone basename rather than in the gcloud filter: matching zone
     # URIs in a filter is easy to get subtly wrong, and a deploy that silently
-    # skips a host is exactly the drift this script exists to prevent.
+    # skips a host is exactly the drift this script exists to prevent. The
+    # zone's region must match exactly — a prefix test lets a truncated value
+    # like "us" pull in every region at once.
     return [
-        i for i in instances if i["zone"].split("/")[-1].startswith(f"{region}-")
+        i for i in instances
+        if i["zone"].split("/")[-1].rsplit("-", 1)[0] == region
     ]
 
 
@@ -137,19 +141,33 @@ if [ "$(sha256sum < "$live" | cut -d' ' -f1)" = "$digest" ]; then
 fi
 
 # Named after the digest it preserves, not the version installed: a
-# per-version name is wrong on redeploy, where `cp -n` keeps the older file
-# and the real predecessor is lost.
-backup="$live.pre-$(sha256sum < "$live" | cut -c1-12).bak"
+# per-version name is wrong on redeploy, where an existing file would be kept
+# and the real predecessor lost.
+live_digest=$(sha256sum < "$live" | cut -d' ' -f1)
+backup="$live.pre-${{live_digest:0:12}}.bak"
 
-# Chained: a failed backup must not be followed by an install that
-# overwrites what it should have preserved. `cp -n`, not `--update=none`
-# (needs coreutils >= 9.3). Writes alongside and renames — writing to the
-# live path exposes a half-written binary and fails with ETXTBSY.
+# Temp file then rename, and recreate unless the existing one already holds
+# the right bytes: skipping on path existence alone would accept a partial
+# file from an interrupted copy.
+if [ ! -f "$backup" ] || [ "$(sha256sum < "$backup" | cut -d' ' -f1)" != "$live_digest" ]; then
+  sudo rm -f "$backup.tmp"
+  sudo cp "$live" "$backup.tmp"
+  sudo mv -f "$backup.tmp" "$backup"
+fi
+
+# Only install against a backup proven to hold what it replaces.
+backup_digest=$(sha256sum < "$backup" | cut -d' ' -f1)
+if [ "$backup_digest" != "$live_digest" ]; then
+  echo "backup $backup holds $backup_digest, not the live $live_digest — abort"
+  exit 1
+fi
+
+# Write alongside and rename: writing to the live path exposes a half-written
+# binary to a launching sandbox and fails with ETXTBSY while one is running.
 incoming="$live.incoming"
 sudo rm -f "$incoming"
-sudo cp -n "$live" "$backup" \\
-  && sudo install -m 0755 "$staged" "$incoming" \\
-  && sudo mv -f "$incoming" "$live"
+sudo install -m 0755 "$staged" "$incoming"
+sudo mv -f "$incoming" "$live"
 
 # Prove the swap landed, and that what landed still runs here.
 installed=$(sha256sum < "$live" | cut -d' ' -f1)
@@ -199,6 +217,14 @@ def main() -> int:
 
         instances = list_instances(project, region, label)
         where = f"{project} ({region})"
+
+        # Discovery is RUNNING-only — a stopped host cannot be reached — so a
+        # cold standby keeps whatever binary it has. Name it, or promotion
+        # quietly puts an untracked binary into service.
+        for inst in list_instances(project, region, label, running_only=False):
+            if inst not in instances:
+                print(f"NOTE: {inst['name']} is not running and was skipped — "
+                      f"install {args.version} on it before promoting it")
         if not instances:
             print(f"No instances with label {label} found in {where}", file=sys.stderr)
             return 1

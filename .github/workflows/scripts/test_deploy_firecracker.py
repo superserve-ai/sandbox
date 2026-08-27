@@ -26,14 +26,24 @@ class InstallScriptSafetyTest(unittest.TestCase):
             if not line.lstrip().startswith("#")
         )
 
-    def test_backup_is_chained_to_install(self):
-        # An un-chained backup lets a FAILED backup be followed by an install
-        # that overwrites the binary the backup was meant to preserve.
+    def test_install_is_gated_on_a_verified_backup(self):
+        # The install must not proceed unless the backup provably holds the
+        # bytes it is about to replace: an interrupted or out-of-space copy
+        # can leave a partial file, and overwriting the live binary against it
+        # destroys the only good copy.
+        verify = self.commands.index('"$backup_digest" != "$live_digest"')
+        install = self.commands.index('mv -f "$incoming" "$live"')
+        self.assertLess(verify, install, "backup must be verified before install")
         self.assertRegex(
-            self.commands,
-            r"cp -n[^\n]*\\\n\s*&& sudo install",
-            "backup must be &&-chained to the install",
+            self.commands, r'backup_digest" != "\$live_digest"[^\n]*\n[^\n]*\n\s*exit 1',
+            "a mismatched backup must abort",
         )
+
+    def test_backup_is_written_atomically(self):
+        # A backup written straight to its final name can be left partial and
+        # then trusted by the next run, which skips an existing path.
+        self.assertRegex(self.commands, r'cp "\$live" "\$backup\.tmp"')
+        self.assertRegex(self.commands, r'mv -f "\$backup\.tmp" "\$backup"')
 
     def test_replaces_the_live_binary_by_rename(self):
         # Writing to the live pathname directly exposes a window where a
@@ -88,7 +98,7 @@ class InstallScriptSafetyTest(unittest.TestCase):
         # `cp -n` keeps the older file and the real predecessor is lost.
         self.assertRegex(
             self.commands,
-            r'backup="\$live\.pre-\$\(sha256sum < "\$live"',
+            r'backup="\$live\.pre-\$\{live_digest:0:12\}\.bak"',
             "the backup name must derive from the live binary's digest",
         )
         self.assertNotIn("pre-v1.2.3.bak", self.commands)

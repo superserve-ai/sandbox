@@ -4,8 +4,9 @@
 # runs identical bytes. Production never deploys without staging first.
 #
 # Running sandboxes are unaffected; PAUSED ones are not. Resuming one launches
-# a fresh Firecracker from this path, so the new binary must restore a
-# snapshot the old one wrote — hence the cross-upgrade resume gate below.
+# a fresh Firecracker from this path, so snapshots have to survive the swap in
+# both directions — the new binary must read what the old one wrote, and a
+# rollback must read what the new one wrote. Hence the staging gate below.
 
 name: Deploy Firecracker
 
@@ -24,8 +25,8 @@ on:
         options:
           - staging
           - production
-      snapshot_compat_verified:
-        description: 'Production only: a sandbox paused BEFORE this version was installed on staging was resumed successfully AFTER'
+      staging_verified:
+        description: 'Production only: on staging, (1) a fresh sandbox created under this version works, (2) a sandbox paused before the install resumed after it, and (3) a sandbox paused under this version resumes under the version you would roll back to'
         required: false
         default: false
         type: boolean
@@ -74,14 +75,15 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      # Deploying only proves NEW sandboxes work; the paused fleet resumes
-      # under this binary. Pause on staging, install, then resume.
-      - name: Require the cross-upgrade resume check
+      # Installing proves only that the binary loads. Snapshot formats are
+      # versioned, and the swap sits between what was written before it and
+      # what is resumed after — in both directions, rollback included.
+      - name: Require staging verification
         env:
-          VERIFIED: ${{ inputs.snapshot_compat_verified }}
+          VERIFIED: ${{ inputs.staging_verified }}
         run: |
           if [ "$VERIFIED" != "true" ]; then
-            echo "::error::snapshot_compat_verified is not set — pause a sandbox on staging BEFORE installing this version, resume it AFTER, and confirm it works before deploying to production"
+            echo "::error::staging_verified is not set. On staging, confirm all three before deploying to production: (1) a fresh sandbox created under this version works; (2) a sandbox paused BEFORE the install resumes AFTER it; (3) a sandbox paused under this version resumes under the version you would roll back to — otherwise the rollout is forward-only and rollback will strand those sandboxes."
             exit 1
           fi
 
