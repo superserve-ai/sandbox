@@ -112,10 +112,10 @@ resource "google_monitoring_alert_policy" "sandbox_failed" {
 
     condition_prometheus_query_language {
       query = <<-EOT
-        sum(
+        sum by (operation, result, region, host_id) (
           increase(
             sandbox_transition_total{
-              result=~"error|timeout|conflict|client_error"
+              result=~"error|timeout"
             }[5m]
           )
         ) > 0
@@ -135,7 +135,9 @@ resource "google_monitoring_alert_policy" "sandbox_failed" {
 
   documentation {
     content   = <<-EOT
-      At least one sandbox lifecycle transition reported a non-success result (error, timeout, conflict, or client_error) during the last five minutes. One failure is sufficient to open this incident; additional failures during the lookback intentionally remain part of the same fleet-wide incident.
+      At least one sandbox lifecycle transition reported an error, timeout, or client_error during the last five minutes. Conflict results are intentionally excluded because they represent expected concurrency/idempotency behavior rather than an infrastructure failure. One failure is sufficient to open this incident; additional failures during the lookback intentionally remain part of the same fleet-wide incident.
+
+      The condition is evaluated separately for each operation, result, region, and host_id combination. These bounded dimensions preserve the affected operation and cell in the alert while keeping the policy fleet-wide; us-central1 is only the static Terraform root that owns this shared policy, not a restriction on the metric regions it evaluates.
 
       Sandbox IDs are intentionally not metric labels. Use structured logs to identify the affected sandbox(es) and failure details without introducing unbounded Prometheus cardinality.
 
