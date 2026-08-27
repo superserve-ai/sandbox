@@ -18,6 +18,11 @@ import sys
 import tarfile
 import tempfile
 
+# The one repository the binary is published from. Not configurable: there is
+# a single fork, it does not vary by environment, and an unset variable would
+# silently become an empty string.
+RELEASE_REPO = "superserve-ai/firecracker"
+
 INSTALL_PATH = "/usr/local/bin/firecracker"
 # The pre-fork stock binary. It is the floor of any rollback, so a host that
 # has lost it must not be deployed to until it is restored.
@@ -49,14 +54,14 @@ def sha256_of(path):
     return h.hexdigest()
 
 
-def fetch_release(repo, version, workdir):
+def fetch_release(version, workdir):
     """Download and unpack the release, returning (binary_path, sha256).
 
     The digest is taken from the unpacked binary and cross-checked against the
     published .sha256, so a tampered or truncated download cannot reach a host.
     """
     run_or_die(
-        ["gh", "release", "download", version, "--repo", repo,
+        ["gh", "release", "download", version, "--repo", RELEASE_REPO,
          "--pattern", "firecracker.tar.gz", "--pattern", "firecracker.sha256",
          "--dir", workdir],
         f"download release {version}",
@@ -174,7 +179,6 @@ def deploy_to(inst, project, binary, version, digest):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", required=True, help="release tag to install")
-    ap.add_argument("--repo", required=True, help="owner/name the release is published in")
     args = ap.parse_args()
 
     project = os.environ["GCP_PROJECT"]
@@ -182,7 +186,7 @@ def main() -> int:
     label = os.environ["VMD_LABEL"]
 
     with tempfile.TemporaryDirectory() as workdir:
-        binary, digest = fetch_release(args.repo, args.version, workdir)
+        binary, digest = fetch_release(args.version, workdir)
 
         instances = list_instances(project, region, label)
         where = f"{project} ({region})" if region else project

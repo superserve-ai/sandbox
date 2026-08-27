@@ -55,8 +55,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 .github/workflows/scripts/deploy-firecracker.py \
-            --version '${{ inputs.version }}' \
-            --repo "${{ vars.FIRECRACKER_REPO }}"
+            --version '${{ inputs.version }}'
 
   deploy-production:
     name: Production
@@ -82,5 +81,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 .github/workflows/scripts/deploy-firecracker.py \
-            --version '${{ inputs.version }}' \
-            --repo "${{ vars.FIRECRACKER_REPO }}"
+            --version '${{ inputs.version }}'
