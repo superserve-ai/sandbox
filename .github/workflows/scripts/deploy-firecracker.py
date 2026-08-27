@@ -11,6 +11,7 @@ rest of the cell untouched.
 
 import argparse
 import hashlib
+import re
 import os
 import shlex
 import subprocess
@@ -116,6 +117,9 @@ def current_digest(inst, project):
     return (r.stdout or "").strip().splitlines()[-1].strip()
 
 
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
 def preflight(instances, project, expected):
     """Require every host to be on the same digest before any is changed.
 
@@ -140,6 +144,7 @@ def preflight(instances, project, expected):
         raise RuntimeError(
             f"hosts are on {distinct.pop()}, not the expected {expected}"
         )
+    return digests
 
 
 def install_script(version, digest):
@@ -241,6 +246,10 @@ def deploy_to(inst, project, binary, version, digest):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", required=True, help="release tag to install")
+    # Lets every cell be checked before any of them is changed, rather than
+    # discovering the second cell's state after the first has been mutated.
+    ap.add_argument("--preflight-only", action="store_true",
+                    help="verify what the hosts are running and exit")
     args = ap.parse_args()
 
     project = os.environ["GCP_PROJECT"]
@@ -262,7 +271,15 @@ def main() -> int:
             print(f"No instances with label {label} found in {where}", file=sys.stderr)
             return 1
         print(f"Installing {args.version} on {len(instances)} instance(s) in {where}")
-        preflight(instances, project, os.environ.get("EXPECTED_CURRENT_SHA256", "").strip())
+        expected = os.environ.get("EXPECTED_CURRENT_SHA256", "").strip()
+        if expected and not HEX64.match(expected):
+            print(f"EXPECTED_CURRENT_SHA256 is not a sha256 digest: {expected!r}",
+                  file=sys.stderr)
+            return 1
+        preflight(instances, project, expected)
+        if args.preflight_only:
+            print("preflight only — nothing installed")
+            return 0
 
         # Sequential, and stopping on the first failure: a swap only affects
         # VMs launched after it, so there is nothing to gain from racing, and

@@ -29,6 +29,10 @@ on:
         options:
           - staging
           - production
+      rollback_sha256:
+        description: 'Production only: sha256 of the binary production runs today — the one staging verified rolling back to'
+        required: false
+        type: string
       staging_verified:
         description: 'Production only: on staging, (1) a fresh sandbox created under this version works, (2) a sandbox paused before the install resumed after it, and (3) a sandbox paused under this version resumes under the version you would roll back to'
         required: false
@@ -82,6 +86,15 @@ jobs:
       # Installing proves only that the binary loads. Snapshot formats are
       # versioned, and the swap sits between what was written before it and
       # what is resumed after — in both directions, rollback included.
+      - name: Require the rollback digest
+        env:
+          ROLLBACK: ${{ inputs.rollback_sha256 }}
+        run: |
+          if ! printf '%s' "$ROLLBACK" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::rollback_sha256 must be the sha256 of the binary production runs today (64 lowercase hex). Without it the staging verification is not bound to the binary these hosts would actually roll back to."
+            exit 1
+          fi
+
       - name: Require staging verification
         env:
           VERIFIED: ${{ inputs.staging_verified }}
@@ -105,12 +118,39 @@ jobs:
       # Steps rather than jobs — a second job on the production environment
       # would double any approval gate. use4 is unguarded, so a missing
       # region fails the deploy rather than skipping the primary cell.
+      # Both cells are checked before either is changed: a second cell found
+      # on an unexpected binary should stop the rollout, not be discovered
+      # after the first has already been swapped.
+      - name: Preflight the use4 cell
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VERSION: ${{ inputs.version }}
+          EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION" --preflight-only
+
+      - name: Preflight the usw cell
+        if: vars.GCP_REGION_USW != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USW }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VERSION: ${{ inputs.version }}
+          EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION" --preflight-only
+
       - name: Install on the use4 cell
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VERSION: ${{ inputs.version }}
+          EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION"
@@ -122,6 +162,7 @@ jobs:
           GCP_REGION: ${{ vars.GCP_REGION_USW }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VERSION: ${{ inputs.version }}
+          EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION"

@@ -120,6 +120,31 @@ class RegionTest(unittest.TestCase):
         self.assertIn("GCP_REGION is unset", err.getvalue())
 
 
+class ExpectedDigestTest(unittest.TestCase):
+    def test_a_malformed_expected_digest_is_refused(self):
+        # A pinned rollback digest that is not a digest would otherwise be
+        # compared against real ones and never match, or worse be empty and
+        # silently skip the binding entirely.
+        import io
+        import contextlib
+        env = {
+            "GCP_PROJECT": "p", "VMD_LABEL": "l", "GCP_REGION": "us-east4",
+            "EXPECTED_CURRENT_SHA256": "not-a-digest",
+        }
+        with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                unittest.mock.patch("sys.argv", ["x", "--version", "v1"]), \
+                unittest.mock.patch.object(
+                    deploy_firecracker, "fetch_release", return_value=("/tmp/x", "a" * 64)), \
+                unittest.mock.patch.object(
+                    deploy_firecracker, "list_instances",
+                    return_value=[{"name": "h", "zone": "us-east4-a"}]):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = deploy_firecracker.main()
+        self.assertEqual(rc, 1)
+        self.assertIn("not a sha256 digest", err.getvalue())
+
+
 class DigestTest(unittest.TestCase):
     def test_sha256_of_matches_hashlib(self):
         with tempfile.NamedTemporaryFile(delete=False) as f:
