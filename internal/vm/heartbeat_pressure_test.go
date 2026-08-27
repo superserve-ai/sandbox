@@ -1276,16 +1276,15 @@ func awaitBackfill(t *testing.T, done <-chan string) {
 	t.Helper()
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("allocation backfill never ran — an undeclared VM keeps a zero size and publishes as free capacity")
 	}
 }
 
 // A destroy that lands while the probe is in flight must not have its
-// record resurrected: the durable write is conditional, and the
-// instance-identity check ends the work first. Without both, a torn-down
-// VM comes back as a Running record that the reconciler then has to
-// chase.
+// record resurrected. Recovery writes no record at all, which is what
+// makes this impossible rather than merely unlikely — a conditional
+// write would still land on a REPLACEMENT that reused the id.
 func TestBackfillDoesNotResurrectDestroyedRecords(t *testing.T) {
 	dir := t.TempDir()
 	st, err := OpenStateStore(filepath.Join(dir, "state.db"))
@@ -1337,8 +1336,8 @@ func TestBackfillDoesNotResurrectDestroyedRecords(t *testing.T) {
 }
 
 // An id reused by an in-place replace must not have the OLD instance's
-// probe write over the replacement: identity is checked by pointer, not
-// by id.
+// probe touch the replacement — neither its record nor its in-memory
+// size. Identity is checked by pointer, never by id.
 func TestBackfillDoesNotOverwriteAReplacementUnderTheSameID(t *testing.T) {
 	dir := t.TempDir()
 	st, err := OpenStateStore(filepath.Join(dir, "state.db"))
@@ -1573,5 +1572,169 @@ func TestJitterDurationOnlyExtends(t *testing.T) {
 	}
 	if got := jitterDuration(0); got != 0 {
 		t.Fatalf("jitterDuration(0) = %v, want 0", got)
+	}
+}
+
+// The invariant that removes the id-reuse race entirely: recovery never
+// writes a durable record. An identity check followed by a separate
+// write is a window — the instance can be replaced in between, and a
+// conditional write would then land on the successor, overwriting its
+// pid, socket and network state with the old run's. No write, no window.
+func TestBackfillNeverWritesDurableState(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		return 4, 8192, nil
+	})
+
+	m := &Manager{log: zerolog.Nop(), state: st, vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	inst := &VMInstance{ID: "legacy", Status: StatusRunning, SocketPath: "/run/fc.sock"}
+	m.vms[inst.ID] = inst
+	m.indexVM(inst.ID, inst)
+	if ok := m.persistState(inst); !ok {
+		t.Fatal("seed persist failed")
+	}
+
+	m.backfillMachineConfigAsync(inst)
+	awaitBackfill(t, done)
+
+	// In memory the size is recovered...
+	inst.mu.RLock()
+	vcpu, mem := inst.Config.VCPU, inst.Config.MemoryMiB
+	inst.mu.RUnlock()
+	if vcpu != 4 || mem != 8192 {
+		t.Fatalf("allocation not recovered in memory: %d/%d", vcpu, mem)
+	}
+	// ...but the record is untouched, and a later legitimate write (a
+	// pause, a status change) is what carries it durably.
+	rec, err := st.Get(inst.ID)
+	if err != nil || rec == nil {
+		t.Fatalf("record missing: %v", err)
+	}
+	if rec.VCPU != 0 || rec.MemoryMiB != 0 {
+		t.Fatalf("recovery wrote the record (%d/%d); that write can land on a replacement that reused the id",
+			rec.VCPU, rec.MemoryMiB)
+	}
+}
+
+// A settled paused VM and a provably dead error record are charged NO
+// memory, so flagging them unknown would report a host as unable to
+// describe itself over VMs that hold nothing — and a consumer would
+// refuse to place on a host that is in fact idle.
+func TestUnknownAllocationCountsOnlyChargedVMs(t *testing.T) {
+	// Past the post-restart settle window, where "could not tell" still
+	// counts by design; this test is about VMs that are conclusively
+	// holding nothing.
+	origStart := vmProcessStart
+	vmProcessStart = time.Now().Add(-time.Hour)
+	defer func() { vmProcessStart = origStart }()
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	// Unsized and settled: paused with no live process, plus an error
+	// record whose process provably never launched. Neither is charged.
+	for _, id := range []string{"settled-paused", "dead-error"} {
+		status := StatusPaused
+		if id == "dead-error" {
+			status = StatusError
+		}
+		inst := &VMInstance{ID: id, Status: status}
+		m.vms[id] = inst
+		m.indexVM(id, inst)
+	}
+	m.reattachComplete.Store(true)
+
+	if p := m.CapacityPressure(); p.UnknownAllocationVMs != 0 {
+		t.Fatalf("unknown allocations = %d over VMs that hold nothing, want 0", p.UnknownAllocationVMs)
+	}
+
+	// A running unsized VM IS charged (as zero), so it must count.
+	live := &VMInstance{ID: "live", Status: StatusRunning}
+	m.vms[live.ID] = live
+	m.indexVM(live.ID, live)
+	if p := m.CapacityPressure(); p.UnknownAllocationVMs != 1 {
+		t.Fatalf("unknown allocations = %d, want 1 for the charged unsized VM", p.UnknownAllocationVMs)
+	}
+}
+
+// Unreachable sockets must not starve the pool: the worker slot is held
+// for the probe only, never across the backoff, or a handful of dead VMs
+// would block every recoverable one behind them.
+func TestBackfillRetriesDoNotStarveThePool(t *testing.T) {
+	probed := make(chan struct{}, 64)
+	done := stubMachineConfigProbe(t, func(_ context.Context, socket string) (uint32, uint32, error) {
+		if socket == "/run/good.sock" {
+			return 2, 1024, nil
+		}
+		probed <- struct{}{}
+		return 0, 0, fmt.Errorf("connection refused")
+	})
+	// Long relative to the deadline below, so holding a slot across it is
+	// visible; at the millisecond backoff the other tests use, both
+	// shapes look identical.
+	machineConfigProbeBackoff = 2 * time.Second
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	stuck := make([]*VMInstance, 0, machineConfigRecoveryWorkers)
+	m.mu.Lock()
+	for i := 0; i < machineConfigRecoveryWorkers; i++ {
+		inst := &VMInstance{ID: fmt.Sprintf("stuck-%d", i), Status: StatusRunning, SocketPath: "/run/dead.sock"}
+		m.vms[inst.ID] = inst
+		m.indexVM(inst.ID, inst)
+		stuck = append(stuck, inst)
+	}
+	good := &VMInstance{ID: "good", Status: StatusRunning, SocketPath: "/run/good.sock"}
+	m.vms[good.ID] = good
+	m.indexVM(good.ID, good)
+	m.mu.Unlock()
+
+	for _, inst := range stuck {
+		m.backfillMachineConfigAsync(inst)
+	}
+	// Every unreachable VM must have REACHED its probe before the
+	// recoverable one is offered: otherwise the good VM can win a free
+	// slot by scheduling luck and the pool's behavior is never tested.
+	for i := 0; i < machineConfigRecoveryWorkers; i++ {
+		select {
+		case <-probed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("unreachable VMs never reached their probes")
+		}
+	}
+	m.backfillMachineConfigAsync(good)
+
+	recovered := make(chan struct{})
+	go func() {
+		for {
+			good.mu.RLock()
+			ok := good.Config.MemoryMiB == 1024
+			good.mu.RUnlock()
+			if ok {
+				close(recovered)
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	select {
+	case <-recovered:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("a recoverable VM never got a worker slot; retries are holding the pool")
+	}
+
+	// Retire the stuck VMs so their loops end and the seams restore
+	// without a live goroutine still reading them.
+	m.mu.Lock()
+	for _, inst := range stuck {
+		delete(m.vms, inst.ID)
+		m.unindexVM(inst.ID)
+	}
+	m.mu.Unlock()
+	for i := 0; i < machineConfigRecoveryWorkers+1; i++ {
+		awaitBackfill(t, done)
 	}
 }

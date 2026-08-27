@@ -184,6 +184,7 @@ type hostView struct {
 	PressureAllocatedVcpus     *int64  `json:"pressure_allocated_vcpus"`
 	CapacityMemoryMib          int     `json:"capacity_memory_mib"`
 	CapacityVcpus              int     `json:"capacity_vcpus"`
+	PressureUnknownAllocation  *int    `json:"pressure_unknown_allocation_vms"`
 	PressureReportedAt         *string `json:"pressure_reported_at"`
 }
 
@@ -245,7 +246,10 @@ func (c client) list() error {
 	// number must read zero before retirement is even discussable.
 	// ALLOC is the vmd-reported live allocation against configured
 	// capacity (mem MiB, vcpus); P_AGE is the pressure report's age. "-"
-	// means the host has never published pressure.
+	// means the host has never published pressure. A trailing "+N?" on
+	// ALLOC counts live VMs the host could not size — the allocation is
+	// an undercount by that many VMs, so the host has LESS free capacity
+	// than the numbers suggest.
 	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED\tUNBACKED\tALLOC\tP_AGE")
 	for _, h := range out.Hosts {
 		beat := "never"
@@ -263,6 +267,14 @@ func (c client) list() error {
 			alloc = fmt.Sprintf("%d/%dMiB %d/%dcpu",
 				*h.PressureAllocatedMemoryMib, h.CapacityMemoryMib,
 				*h.PressureAllocatedVcpus, h.CapacityVcpus)
+			// A host that cannot size some of its VMs is reporting LESS
+			// allocation than it holds, so the number above must not be
+			// read as the whole story. Marked inline rather than in its
+			// own column: it qualifies ALLOC, and it is almost always
+			// absent.
+			if h.PressureUnknownAllocation != nil && *h.PressureUnknownAllocation > 0 {
+				alloc += fmt.Sprintf(" +%d?", *h.PressureUnknownAllocation)
+			}
 		}
 		if h.PressureReportedAt != nil {
 			if t, err := time.Parse(time.RFC3339, *h.PressureReportedAt); err == nil {

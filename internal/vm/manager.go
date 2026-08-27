@@ -3183,6 +3183,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		defer close(persistDone)
 		optimisticOK = m.persistState(inst)
 	}()
+	// Callers declare the allocation, so this normally does nothing at
+	// all — backfillMachineConfigAsync returns immediately once the size
+	// is known, spawning nothing. It covers the rollout window where a
+	// NEW daemon takes restores from a control plane that predates the
+	// declared-allocation contract: without it those VMs would stay
+	// unsized until the daemon next restarts. Gated on publication so a
+	// host doing no accounting never pays for it, and detached either
+	// way — it must not join the readiness wait below.
+	if m.pressureAccounting {
+		m.backfillMachineConfigAsync(inst)
+	}
 
 	tBoxdStart := time.Now()
 	// Same window as first boot: a restore that has to fault its memory and
@@ -3558,12 +3569,6 @@ func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
 		if machineConfigBackfillDone != nil {
 			defer machineConfigBackfillDone(inst.ID)
 		}
-		// Queue for a worker slot. Waiting here rather than before the
-		// goroutine keeps the caller (reattach) free to finish its pass:
-		// the recoveries drain behind it at their own pace.
-		machineConfigRecoverySem <- struct{}{}
-		defer func() { <-machineConfigRecoverySem }()
-
 		backoff := machineConfigProbeBackoff
 		for {
 			// Identity, not liveness: a destroy that already removed
@@ -3579,9 +3584,15 @@ func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
 				return // a declared allocation landed while we retried
 			}
 
+			// The slot is held for the PROBE only, never across the
+			// backoff below: a handful of permanently unreachable
+			// sockets would otherwise sit in the pool sleeping and
+			// starve every recoverable VM behind them.
+			machineConfigRecoverySem <- struct{}{}
 			ctx, cancel := context.WithTimeout(context.Background(), machineConfigProbeTimeout)
 			vcpu, memoryMiB, err := machineConfigProbe(ctx, socket)
 			cancel()
+			<-machineConfigRecoverySem
 			if err == nil && vcpu > 0 && memoryMiB > 0 {
 				m.applyMachineConfig(inst, vcpu, memoryMiB)
 				return
@@ -3604,36 +3615,37 @@ func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
 	}()
 }
 
-// applyMachineConfig records a probed allocation, but only while the
-// instance is still the one the id names and still lacks a declared
-// size. The durable write is conditional (PutIfPresent) so a destroy
-// that deleted the record between the check and the write cannot see it
-// resurrected as Running.
+// applyMachineConfig records a probed allocation in memory, and only
+// while the instance is still the one the id names and still lacks a
+// declared size.
+//
+// Deliberately does NOT persist. A durable write here cannot be made
+// safe against id reuse: PutIfPresent refuses a deleted record, but a
+// REPLACEMENT under the same id has a live record, so a write that
+// passed its identity check a moment earlier would land on the
+// successor and overwrite its pid, socket, ip and tap with the old
+// run's — and the next restart would reattach to that. Closing the
+// window would mean holding the fleet lock across the write, which
+// stalls every concurrent create; a generation counter on the record is
+// more machinery than a shrinking population of legacy records
+// justifies.
+//
+// So the size lives in memory until something with a legitimate reason
+// to write the record carries it (a pause, a status change). If nothing
+// does before a restart, reattach simply probes again — bounded and
+// jittered, and correct either way.
 func (m *Manager) applyMachineConfig(inst *VMInstance, vcpu, memoryMiB uint32) {
 	if !m.instanceIsCurrent(inst) {
 		return
 	}
 	inst.mu.Lock()
+	defer inst.mu.Unlock()
 	if inst.Config.VCPU > 0 && inst.Config.MemoryMiB > 0 {
 		// A declared allocation won the race; it outranks a probe of a
 		// socket that may by now belong to a different run.
-		inst.mu.Unlock()
 		return
 	}
 	inst.Config.VCPU, inst.Config.MemoryMiB = vcpu, memoryMiB
-	inst.mu.Unlock()
-
-	// Re-check after the mutation: the durable write must not run for an
-	// instance a destroy has since retired.
-	if !m.instanceIsCurrent(inst) {
-		return
-	}
-	if _, err := m.persistStateIfPresent(inst); err != nil {
-		// The in-memory sizes still stand; the next restart re-learns
-		// them through reattach's own backfill.
-		m.log.Warn().Err(err).Str("vm_id", inst.ID).
-			Msg("recovered allocation not persisted; it will be re-learned after a restart")
-	}
 }
 
 // releaseBuildAlloc returns a build's memory/vCPU pressure counters at
@@ -5458,13 +5470,12 @@ func (m *Manager) CapacityPressure() HostPressure {
 		inst.mu.RLock()
 		status, vcpu, mem := inst.Status, inst.Config.VCPU, inst.Config.MemoryMiB
 		inst.mu.RUnlock()
-		// Flagged at the point the size is read, before any branch
-		// decides whether to charge it: a VM whose allocation is unknown
-		// contributes zero to the totals wherever it lands, and the
-		// count is what stops that zero from reading as free capacity.
-		if vcpu == 0 || mem == 0 {
-			p.UnknownAllocationVMs++
-		}
+		// Unknown-size accounting happens at the CHARGE points below,
+		// never here: a settled paused VM or a provably dead error
+		// record is charged nothing whatever its size, so flagging it
+		// unknown would report a host as indescribable over VMs that
+		// hold nothing.
+		unsized := vcpu == 0 || mem == 0
 		switch status {
 		case StatusRunning:
 			p.RunningSandboxes++
@@ -5486,6 +5497,9 @@ func (m *Manager) CapacityPressure() HostPressure {
 			if m.vmPossiblyLive(snap.id) {
 				p.AllocatedMemoryMib += int64(mem)
 				p.AllocatedVcpus += int64(vcpu)
+				if unsized {
+					p.UnknownAllocationVMs++
+				}
 			}
 			continue
 		case StatusError:
@@ -5507,6 +5521,9 @@ func (m *Manager) CapacityPressure() HostPressure {
 		}
 		p.AllocatedMemoryMib += int64(mem)
 		p.AllocatedVcpus += int64(vcpu)
+		if unsized {
+			p.UnknownAllocationVMs++
+		}
 	}
 	// In-flight template builds run in a subprocess and never enter the
 	// instance map, but their memory and CPU are as real as any

@@ -265,6 +265,10 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        hp.provisioning_sandboxes AS pressure_provisioning_sandboxes,
        hp.used_net_slots AS pressure_used_net_slots,
        hp.warm_net_slots AS pressure_warm_net_slots,
+       -- Non-zero means the allocation columns above are a known
+       -- undercount, so an operator can tell an idle host from one that
+       -- cannot yet describe itself.
+       hp.unknown_allocation_vms AS pressure_unknown_allocation_vms,
        hp.reported_at AS pressure_reported_at
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id

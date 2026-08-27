@@ -379,6 +379,7 @@ func (h *Handlers) HostList(c *gin.Context) {
 		PressureProvisioning       *int32  `json:"pressure_provisioning_sandboxes"`
 		PressureUsedNetSlots       *int32  `json:"pressure_used_net_slots"`
 		PressureWarmNetSlots       *int32  `json:"pressure_warm_net_slots"`
+		PressureUnknownAllocation  *int32  `json:"pressure_unknown_allocation_vms"`
 		PressureReportedAt         *string `json:"pressure_reported_at"`
 	}
 	hosts := make([]hostView, 0, len(rows))
@@ -407,6 +408,7 @@ func (h *Handlers) HostList(c *gin.Context) {
 		v.PressureProvisioning = r.PressureProvisioningSandboxes
 		v.PressureUsedNetSlots = r.PressureUsedNetSlots
 		v.PressureWarmNetSlots = r.PressureWarmNetSlots
+		v.PressureUnknownAllocation = r.PressureUnknownAllocationVms
 		if r.PressureReportedAt.Valid {
 			s := r.PressureReportedAt.Time.UTC().Format(time.RFC3339)
 			v.PressureReportedAt = &s
