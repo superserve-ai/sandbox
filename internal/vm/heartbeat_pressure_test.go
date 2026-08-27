@@ -1173,13 +1173,13 @@ func TestCompleteBuildDropsReplacedWorkerResult(t *testing.T) {
 	}
 }
 
-// The bug this pins: the production control plane sends no resource
-// limits on RestoreSnapshot, so a restored VM's VMConfig is empty and
-// pressure counted it as running while adding ZERO memory and vCPUs — a
-// host full of restored sandboxes published as idle. The fixture starts
-// with the empty config the adapter really builds, because a fixture
-// that declares its own sizes assumes away the very defect.
-func TestPressureCountsRestoredVMsWithUndeclaredSizes(t *testing.T) {
+// A VM whose allocation was never declared adds ZERO memory and vCPUs to
+// the totals — the same as no VM at all — so a host holding them would
+// publish as idle while running real workloads. Recovery is what closes
+// that, and the fixture deliberately starts from the empty config such a
+// record really carries: one that declared its own sizes would assume
+// away the condition under test.
+func TestPressureCountsVMsWithUndeclaredSizes(t *testing.T) {
 	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
 		return 4, 8192, nil // what Firecracker reports for the restored VM
 	})
