@@ -136,19 +136,15 @@ if [ "$(sha256sum < "$live" | cut -d' ' -f1)" = "$digest" ]; then
   exit 0
 fi
 
-# Name the backup after the digest it preserves, not the version being
-# installed. A per-version name is wrong the second time a version is
-# deployed: `cp -n` would keep the older file and the predecessor it should
-# have saved would be lost. Keyed by content, an existing file with this name
-# already holds these exact bytes, so skipping the copy is correct.
+# Named after the digest it preserves, not the version installed: a
+# per-version name is wrong on redeploy, where `cp -n` keeps the older file
+# and the real predecessor is lost.
 backup="$live.pre-$(sha256sum < "$live" | cut -c1-12).bak"
 
-# Backup CHAINED to install: a failed backup must not be followed by an
-# install that overwrites the binary it was meant to preserve. `cp -n`, not
-# `--update=none`, which needs coreutils >= 9.3.
-# The install writes alongside and renames: writing to the live path exposes
-# a half-written binary to a launching sandbox, and fails with ETXTBSY while
-# one is running from it. A rename in the same directory is atomic.
+# Chained: a failed backup must not be followed by an install that
+# overwrites what it should have preserved. `cp -n`, not `--update=none`
+# (needs coreutils >= 9.3). Writes alongside and renames — writing to the
+# live path exposes a half-written binary and fails with ETXTBSY.
 incoming="$live.incoming"
 sudo rm -f "$incoming"
 sudo cp -n "$live" "$backup" \\
@@ -191,9 +187,8 @@ def main() -> int:
 
     project = os.environ["GCP_PROJECT"]
     label = os.environ["VMD_LABEL"]
-    # Required, not optional: cells share a project and a label, so an unset
-    # region silently widens discovery to every cell at once instead of the
-    # one being deployed.
+    # Required: cells share a project and a label, so an unset region widens
+    # discovery to every cell at once.
     region = os.environ.get("GCP_REGION", "").strip()
     if not region:
         print("GCP_REGION is unset — refusing to deploy without a region", file=sys.stderr)
