@@ -191,6 +191,8 @@ func lifecycleResult(status int) string {
 		return telemetry.ResultConflict
 	case status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout:
 		return telemetry.ResultTimeout
+	case status >= 400 && status < 500:
+		return telemetry.ResultClientError
 	default:
 		return telemetry.ResultError
 	}

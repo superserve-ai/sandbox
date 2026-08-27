@@ -151,6 +151,54 @@ func (ns NullTemplateStatus) Value() (driver.Value, error) {
 	return string(ns.TemplateStatus), nil
 }
 
+type AbuseRestriction struct {
+	ID            uuid.UUID          `json:"id"`
+	SubjectType   string             `json:"subject_type"`
+	SubjectValue  string             `json:"subject_value"`
+	SubjectUserID pgtype.UUID        `json:"subject_user_id"`
+	SubjectTeamID pgtype.UUID        `json:"subject_team_id"`
+	Action        string             `json:"action"`
+	Source        string             `json:"source"`
+	Reason        string             `json:"reason"`
+	Evidence      []byte             `json:"evidence"`
+	CreatedBy     pgtype.UUID        `json:"created_by"`
+	CreatedAt     time.Time          `json:"created_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
+	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+	ReleasedAt    pgtype.Timestamptz `json:"released_at"`
+	ReleasedBy    pgtype.UUID        `json:"released_by"`
+}
+
+type AbuseStateChange struct {
+	ID         int64       `json:"id"`
+	TeamID     pgtype.UUID `json:"team_id"`
+	Generation int64       `json:"generation"`
+	Reason     string      `json:"reason"`
+	CreatedAt  time.Time   `json:"created_at"`
+}
+
+type AbuseTeamTrust struct {
+	TeamID    uuid.UUID          `json:"team_id"`
+	Verified  bool               `json:"verified"`
+	Source    string             `json:"source"`
+	Reason    *string            `json:"reason"`
+	Evidence  []byte             `json:"evidence"`
+	CreatedAt time.Time          `json:"created_at"`
+	UpdatedAt time.Time          `json:"updated_at"`
+	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type AbuseTrustedIdentity struct {
+	ID           uuid.UUID          `json:"id"`
+	AuthProvider string             `json:"auth_provider"`
+	Domain       string             `json:"domain"`
+	Source       string             `json:"source"`
+	Evidence     []byte             `json:"evidence"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	RevokedAt    pgtype.Timestamptz `json:"revoked_at"`
+}
+
 type Activity struct {
 	ID           uuid.UUID   `json:"id"`
 	SandboxID    pgtype.UUID `json:"sandbox_id"`
