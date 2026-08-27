@@ -1,7 +1,8 @@
-# Fleet-wide lifecycle paging is owned by this root alongside the production
-# fleet dashboards. It is intentionally not instantiated in each regional
-# root: the underlying Managed Prometheus metrics span the project, and
-# duplicating these policies per region would create duplicate incidents.
+# Fleet-wide lifecycle paging is owned by this static us-central1 root alongside
+# the production fleet dashboards. us-central1 identifies the Terraform state
+# owner only; the underlying Managed Prometheus metrics span the project. The
+# policies are intentionally not instantiated in each regional root, because
+# duplicating them would create duplicate incidents.
 module "sandbox_lifecycle_alerts" {
   source = "../../../modules/observability"
 
