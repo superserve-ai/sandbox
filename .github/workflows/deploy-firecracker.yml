@@ -2,8 +2,15 @@
 #
 # Builds nothing: it installs a release built once in the fork, so every host
 # runs identical bytes. Production never deploys without staging first, same
-# discipline as the other deploys here. A swap only affects VMs launched
-# after it, so it is safe to run during traffic.
+# discipline as the other deploys here.
+#
+# A running sandbox is unaffected — its process is already executing and keeps
+# the old inode across the rename. A PAUSED one is not: it has no process, and
+# resuming it launches a fresh Firecracker from this path, so the new binary
+# must be able to restore a snapshot the old one wrote. Snapshot formats are
+# versioned and an incompatible one is refused, which is why production
+# requires that pause-then-resume-across-the-upgrade has been proven on
+# staging rather than only that new sandboxes work.
 
 name: Deploy Firecracker
 
@@ -22,6 +29,11 @@ on:
         options:
           - staging
           - production
+      snapshot_compat_verified:
+        description: 'Production only: a sandbox paused BEFORE this version was installed on staging was resumed successfully AFTER'
+        required: false
+        default: false
+        type: boolean
 
 # One rollout at a time: overlapping dispatches could interleave their
 # per-host loops and leave a cell on mixed digests, both reporting success.
@@ -67,6 +79,18 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
+      # Deploying only proves new sandboxes work. The paused fleet resumes
+      # under this binary, so refuse until a resume ACROSS the upgrade has
+      # actually been observed on staging: pause a sandbox, install, resume it.
+      - name: Require the cross-upgrade resume check
+        env:
+          VERIFIED: ${{ inputs.snapshot_compat_verified }}
+        run: |
+          if [ "$VERIFIED" != "true" ]; then
+            echo "::error::snapshot_compat_verified is not set — pause a sandbox on staging BEFORE installing this version, resume it AFTER, and confirm it works before deploying to production"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: google-github-actions/auth@v2

@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import unittest.mock
 import os
 import tempfile
 import unittest
@@ -80,6 +81,33 @@ class InstallScriptSafetyTest(unittest.TestCase):
         # Re-running must not manufacture a second backup of a binary that is
         # already the target.
         self.assertIn("already at $digest", self.script)
+
+
+    def test_backup_is_named_after_the_digest_it_preserves(self):
+        # A per-version name is wrong the second time a version is deployed:
+        # `cp -n` keeps the older file and the real predecessor is lost.
+        self.assertRegex(
+            self.commands,
+            r'backup="\$live\.pre-\$\(sha256sum < "\$live"',
+            "the backup name must derive from the live binary's digest",
+        )
+        self.assertNotIn("pre-v1.2.3.bak", self.commands)
+
+
+class RegionTest(unittest.TestCase):
+    def test_an_unset_region_is_refused(self):
+        # Cells share a project and a label, so no region means every cell at
+        # once rather than the one being deployed.
+        import io
+        import contextlib
+        env = {"GCP_PROJECT": "p", "VMD_LABEL": "l", "GCP_REGION": "  "}
+        with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                unittest.mock.patch("sys.argv", ["x", "--version", "v1"]):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = deploy_firecracker.main()
+        self.assertEqual(rc, 1)
+        self.assertIn("GCP_REGION is unset", err.getvalue())
 
 
 class DigestTest(unittest.TestCase):

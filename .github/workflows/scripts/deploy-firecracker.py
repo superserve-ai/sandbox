@@ -96,24 +96,20 @@ def list_instances(project, region, label):
     # Scope by zone basename rather than in the gcloud filter: matching zone
     # URIs in a filter is easy to get subtly wrong, and a deploy that silently
     # skips a host is exactly the drift this script exists to prevent.
-    if region:
-        instances = [
-            i for i in instances if i["zone"].split("/")[-1].startswith(f"{region}-")
-        ]
-    return instances
+    return [
+        i for i in instances if i["zone"].split("/")[-1].startswith(f"{region}-")
+    ]
 
 
 def install_script(version, digest):
     """The remote half of a swap, in the order the checks have to happen."""
     staged = f"/tmp/firecracker-{version}"
-    backup = f"{INSTALL_PATH}.pre-{version}.bak"
     return f"""
 set -euo pipefail
 
 staged={shlex.quote(staged)}
 live={shlex.quote(INSTALL_PATH)}
 stock={shlex.quote(STOCK_BACKUP)}
-backup={shlex.quote(backup)}
 digest={shlex.quote(digest)}
 
 # Rollback floor. Without it a bad swap has nowhere to fall back to, so
@@ -139,6 +135,13 @@ if [ "$(sha256sum < "$live" | cut -d' ' -f1)" = "$digest" ]; then
   rm -f "$staged"
   exit 0
 fi
+
+# Name the backup after the digest it preserves, not the version being
+# installed. A per-version name is wrong the second time a version is
+# deployed: `cp -n` would keep the older file and the predecessor it should
+# have saved would be lost. Keyed by content, an existing file with this name
+# already holds these exact bytes, so skipping the copy is correct.
+backup="$live.pre-$(sha256sum < "$live" | cut -c1-12).bak"
 
 # Backup CHAINED to install: a failed backup must not be followed by an
 # install that overwrites the binary it was meant to preserve. `cp -n`, not
@@ -187,14 +190,20 @@ def main() -> int:
     args = ap.parse_args()
 
     project = os.environ["GCP_PROJECT"]
-    region = os.environ.get("GCP_REGION", "")
     label = os.environ["VMD_LABEL"]
+    # Required, not optional: cells share a project and a label, so an unset
+    # region silently widens discovery to every cell at once instead of the
+    # one being deployed.
+    region = os.environ.get("GCP_REGION", "").strip()
+    if not region:
+        print("GCP_REGION is unset — refusing to deploy without a region", file=sys.stderr)
+        return 1
 
     with tempfile.TemporaryDirectory() as workdir:
         binary, digest = fetch_release(args.version, workdir)
 
         instances = list_instances(project, region, label)
-        where = f"{project} ({region})" if region else project
+        where = f"{project} ({region})"
         if not instances:
             print(f"No instances with label {label} found in {where}", file=sys.stderr)
             return 1
