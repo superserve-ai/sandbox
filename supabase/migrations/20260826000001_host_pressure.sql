@@ -36,6 +36,13 @@ CREATE TABLE host_pressure (
     net_slot_ceiling        int NOT NULL,
     max_network_slots       int NOT NULL DEFAULT 0,
     max_sandboxes           int NOT NULL DEFAULT 0,
+    -- Live VMs whose allocation the host could not determine (records
+    -- predating the declared-allocation contract, still recovering).
+    -- Non-zero means allocated_memory_mib/allocated_vcpus are an
+    -- UNDERCOUNT: an unsized VM adds zero, which is indistinguishable
+    -- from free capacity. Placement must treat such a host as not fully
+    -- described rather than idle.
+    unknown_allocation_vms  int NOT NULL DEFAULT 0,
     reported_at             timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT host_pressure_non_negative CHECK (
@@ -44,7 +51,7 @@ CREATE TABLE host_pressure (
         AND allocated_vcpus >= 0 AND used_net_slots >= 0
         AND provisioning_net_slots >= 0 AND warm_net_slots >= 0
         AND net_slot_ceiling >= 0 AND max_network_slots >= 0
-        AND max_sandboxes >= 0
+        AND max_sandboxes >= 0 AND unknown_allocation_vms >= 0
     )
 );
 

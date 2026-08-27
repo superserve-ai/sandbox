@@ -842,14 +842,16 @@ INSERT INTO host_pressure (
     host_id, running_sandboxes, provisioning_sandboxes, paused_sandboxes,
     allocated_memory_mib, allocated_vcpus,
     used_net_slots, provisioning_net_slots, warm_net_slots,
-    net_slot_ceiling, max_network_slots, max_sandboxes, reported_at
+    net_slot_ceiling, max_network_slots, max_sandboxes, unknown_allocation_vms,
+    reported_at
 )
 SELECT h.id, $1, $2, $3,
        $4, $5,
        $6, $7, $8,
-       $9, $10, $11, now()
+       $9, $10, $11, $12,
+       now()
 FROM host h
-WHERE h.id = $12 AND h.vmd_addr = $13
+WHERE h.id = $13 AND h.vmd_addr = $14
 FOR SHARE
 ON CONFLICT (host_id) DO UPDATE SET
     running_sandboxes = EXCLUDED.running_sandboxes,
@@ -863,6 +865,7 @@ ON CONFLICT (host_id) DO UPDATE SET
     net_slot_ceiling = EXCLUDED.net_slot_ceiling,
     max_network_slots = EXCLUDED.max_network_slots,
     max_sandboxes = EXCLUDED.max_sandboxes,
+    unknown_allocation_vms = EXCLUDED.unknown_allocation_vms,
     reported_at = EXCLUDED.reported_at
 `
 
@@ -878,6 +881,7 @@ type UpsertHostPressureParams struct {
 	NetSlotCeiling        int32  `json:"net_slot_ceiling"`
 	MaxNetworkSlots       int32  `json:"max_network_slots"`
 	MaxSandboxes          int32  `json:"max_sandboxes"`
+	UnknownAllocationVms  int32  `json:"unknown_allocation_vms"`
 	HostID                string `json:"host_id"`
 	VmdAddr               string `json:"vmd_addr"`
 }
@@ -909,6 +913,7 @@ func (q *Queries) UpsertHostPressure(ctx context.Context, arg UpsertHostPressure
 		arg.NetSlotCeiling,
 		arg.MaxNetworkSlots,
 		arg.MaxSandboxes,
+		arg.UnknownAllocationVms,
 		arg.HostID,
 		arg.VmdAddr,
 	)

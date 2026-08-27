@@ -396,6 +396,7 @@ type HostPressure struct {
 	NetSlotCeiling        int32     `json:"net_slot_ceiling"`
 	MaxNetworkSlots       int32     `json:"max_network_slots"`
 	MaxSandboxes          int32     `json:"max_sandboxes"`
+	UnknownAllocationVms  int32     `json:"unknown_allocation_vms"`
 	ReportedAt            time.Time `json:"reported_at"`
 }
 

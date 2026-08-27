@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1448,5 +1449,129 @@ func TestBackfillStopsRetryingOnceTheVMIsGone(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if got := attempts.Load(); got != settled {
 		t.Fatalf("probe kept retrying after the VM was gone: %d then %d", settled, got)
+	}
+}
+
+// An unsized VM adds zero to the allocation totals, which is exactly
+// what an ABSENT VM adds — so without a separate signal a host full of
+// legacy records publishes as idle. The count is what makes the
+// undercount visible to whoever reads the report.
+func TestPressureReportsUnknownAllocations(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	sized := &VMInstance{ID: "sized", Status: StatusRunning, Config: VMConfig{VCPU: 2, MemoryMiB: 1024}}
+	legacy := &VMInstance{ID: "legacy", Status: StatusRunning} // pre-contract record
+	for _, inst := range []*VMInstance{sized, legacy} {
+		m.vms[inst.ID] = inst
+		m.indexVM(inst.ID, inst)
+	}
+	m.reattachComplete.Store(true)
+
+	p := m.CapacityPressure()
+	if p.RunningSandboxes != 2 {
+		t.Fatalf("running = %d, want 2", p.RunningSandboxes)
+	}
+	if p.AllocatedMemoryMib != 1024 || p.AllocatedVcpus != 2 {
+		t.Fatalf("allocation = %d MiB / %d vcpu, want only the sized VM's", p.AllocatedMemoryMib, p.AllocatedVcpus)
+	}
+	if p.UnknownAllocationVMs != 1 {
+		t.Fatalf("unknown allocations = %d, want 1 — the undercount must be visible, not silent",
+			p.UnknownAllocationVMs)
+	}
+
+	// Fully described hosts say so with a zero, so a reader can tell
+	// "nothing unknown" from "never reported".
+	legacy.mu.Lock()
+	legacy.Config = VMConfig{VCPU: 1, MemoryMiB: 512}
+	legacy.mu.Unlock()
+	if p := m.CapacityPressure(); p.UnknownAllocationVMs != 0 {
+		t.Fatalf("unknown allocations = %d after both VMs were sized, want 0", p.UnknownAllocationVMs)
+	}
+}
+
+// Reattach can find hundreds of legacy records; recovering them all at
+// once would fire hundreds of concurrent Firecracker calls exactly when
+// the daemon is busiest. The pool bounds that.
+func TestBackfillRecoveryIsBounded(t *testing.T) {
+	var mu sync.Mutex
+	inFlight, peak := 0, 0
+	release := make(chan struct{})
+	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		mu.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
+		<-release
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return 2, 1024, nil
+	})
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	const total = machineConfigRecoveryWorkers * 5
+	insts := make([]*VMInstance, 0, total)
+	// Publish every instance BEFORE any recovery starts: the workers read
+	// the map under m.mu, so the test must not mutate it alongside them.
+	m.mu.Lock()
+	for i := 0; i < total; i++ {
+		inst := &VMInstance{ID: fmt.Sprintf("legacy-%d", i), Status: StatusRunning, SocketPath: "/run/fc.sock"}
+		m.vms[inst.ID] = inst
+		m.indexVM(inst.ID, inst)
+		insts = append(insts, inst)
+	}
+	m.mu.Unlock()
+	for _, inst := range insts {
+		m.backfillMachineConfigAsync(inst)
+	}
+
+	// Let the pool saturate, then assert it never exceeded its budget.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		saturated := inFlight >= machineConfigRecoveryWorkers
+		mu.Unlock()
+		if saturated || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(release)
+	for i := 0; i < total; i++ {
+		awaitBackfill(t, done)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if peak > machineConfigRecoveryWorkers {
+		t.Fatalf("peak concurrent probes = %d, want at most %d", peak, machineConfigRecoveryWorkers)
+	}
+	if peak == 0 {
+		t.Fatal("no probe ever ran; the bound was not exercised")
+	}
+}
+
+// Jitter only ever lengthens a wait: it exists to spread a fleet's
+// retries, and must never shorten the backoff into a tighter loop.
+func TestJitterDurationOnlyExtends(t *testing.T) {
+	const base = time.Second
+	sawDifferent := false
+	for i := 0; i < 200; i++ {
+		got := jitterDuration(base)
+		if got < base {
+			t.Fatalf("jittered wait %v is shorter than the backoff %v", got, base)
+		}
+		if got > base+base/2 {
+			t.Fatalf("jittered wait %v exceeds the 1.5x bound", got)
+		}
+		if got != base {
+			sawDifferent = true
+		}
+	}
+	if !sawDifferent {
+		t.Fatal("jitter never varied the wait; a fleet would still retry in lockstep")
+	}
+	if got := jitterDuration(0); got != 0 {
+		t.Fatalf("jitterDuration(0) = %v, want 0", got)
 	}
 }

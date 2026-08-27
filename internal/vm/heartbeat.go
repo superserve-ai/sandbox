@@ -185,6 +185,9 @@ type pressureRequest struct {
 	NetSlotCeiling        int32  `json:"net_slot_ceiling"`
 	MaxNetworkSlots       int32  `json:"max_network_slots,omitempty"`
 	MaxSandboxes          int32  `json:"max_sandboxes,omitempty"`
+	// Omitted when zero so a control plane that predates the field is
+	// unaffected; a fully described host sends nothing extra.
+	UnknownAllocationVMs int32 `json:"unknown_allocation_vms,omitempty"`
 }
 
 // sendPressure publishes the capacity summary, best-effort. Runs only
@@ -223,6 +226,7 @@ func sendPressure(ctx context.Context, client *http.Client, cfg HeartbeatConfig,
 		NetSlotCeiling:        p.NetSlotCeiling,
 		MaxNetworkSlots:       cfg.MaxNetworkSlots,
 		MaxSandboxes:          cfg.MaxSandboxes,
+		UnknownAllocationVMs:  p.UnknownAllocationVMs,
 	})
 	if err != nil {
 		log.Error().Err(err).Msg("failed to encode pressure body")

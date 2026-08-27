@@ -438,6 +438,10 @@ type pressureReport struct {
 	NetSlotCeiling        int32  `json:"net_slot_ceiling"`
 	MaxNetworkSlots       int32  `json:"max_network_slots"`
 	MaxSandboxes          int32  `json:"max_sandboxes"`
+	// Live VMs whose allocation the host could not determine. Non-zero
+	// means the allocation totals are an UNDERCOUNT, so a consumer must
+	// not read the difference as free capacity.
+	UnknownAllocationVMs int32 `json:"unknown_allocation_vms"`
 }
 
 func (r pressureReport) valid() bool {
@@ -446,7 +450,8 @@ func (r pressureReport) valid() bool {
 		r.PausedSandboxes >= 0 && r.AllocatedMemoryMib >= 0 &&
 		r.AllocatedVcpus >= 0 && r.UsedNetSlots >= 0 &&
 		r.ProvisioningNetSlots >= 0 && r.WarmNetSlots >= 0 &&
-		r.NetSlotCeiling >= 0 && r.MaxNetworkSlots >= 0 && r.MaxSandboxes >= 0
+		r.NetSlotCeiling >= 0 && r.MaxNetworkSlots >= 0 && r.MaxSandboxes >= 0 &&
+		r.UnknownAllocationVMs >= 0
 }
 
 // HostReportPressure handles PUT /internal/hosts/:host_id/pressure — the
@@ -485,6 +490,7 @@ func (h *Handlers) HostReportPressure(c *gin.Context) {
 		NetSlotCeiling:        req.NetSlotCeiling,
 		MaxNetworkSlots:       req.MaxNetworkSlots,
 		MaxSandboxes:          req.MaxSandboxes,
+		UnknownAllocationVms:  req.UnknownAllocationVMs,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("host_id", hostID).Msg("UpsertHostPressure failed")

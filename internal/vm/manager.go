@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"os"
 	"os/exec"
@@ -3460,6 +3461,20 @@ const machineConfigProbeMaxBackoff = 30 * time.Second
 // seconds — nothing in production reassigns it.
 var machineConfigProbeBackoff = time.Second
 
+// machineConfigRecoveryWorkers bounds how many legacy records recover at
+// once. Reattach can find hundreds of zero-sized records, and one
+// goroutine each would fire hundreds of concurrent Firecracker API calls
+// at the moment the daemon is busiest — exactly when creates are racing
+// the same startup. A small pool converges just as surely, only slower,
+// and the gate that matters (publication) already waits for reattach
+// rather than for these.
+const machineConfigRecoveryWorkers = 4
+
+// machineConfigRecoverySem admits that bounded number of recoveries.
+// Package-level because reattach and any future caller must share one
+// budget — a per-call limiter would bound nothing.
+var machineConfigRecoverySem = make(chan struct{}, machineConfigRecoveryWorkers)
+
 // machineConfigProbe fetches a running VM's real vCPU/memory allocation
 // from Firecracker. Seam so tests can exercise the backfill without a
 // live microVM.
@@ -3480,6 +3495,16 @@ var machineConfigProbe = func(ctx context.Context, socketPath string) (vcpu, mem
 // exits. Test seam only (nil in production), so tests can join the
 // detached work instead of sleeping — same pattern as reattachHook.
 var machineConfigBackfillDone func(vmID string)
+
+// jitterDuration spreads a retry interval across [d, 1.5d). Deliberately
+// one-sided: never shorter than the backoff it was given, so jitter can
+// only relieve a thundering herd, never tighten a retry loop.
+func jitterDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return d + time.Duration(rand.Int64N(int64(d/2)+1))
+}
 
 // instanceIsCurrent reports whether id still names THIS exact instance.
 // Pointer identity, never the id alone: an id can be reused by an
@@ -3533,6 +3558,12 @@ func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
 		if machineConfigBackfillDone != nil {
 			defer machineConfigBackfillDone(inst.ID)
 		}
+		// Queue for a worker slot. Waiting here rather than before the
+		// goroutine keeps the caller (reattach) free to finish its pass:
+		// the recoveries drain behind it at their own pace.
+		machineConfigRecoverySem <- struct{}{}
+		defer func() { <-machineConfigRecoverySem }()
+
 		backoff := machineConfigProbeBackoff
 		for {
 			// Identity, not liveness: a destroy that already removed
@@ -3559,9 +3590,13 @@ func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
 			// allocation is visible as a host that looks emptier than it
 			// is, while a guessed one would be wrong in a direction
 			// nothing can detect. Retry instead.
-			m.log.Warn().Err(err).Str("vm_id", inst.ID).Dur("retry_in", backoff).
+			// Jittered: a fleet that restarts together (a deploy) would
+			// otherwise re-probe in lockstep, and every host's retries
+			// would land on its Firecrackers at the same instant.
+			wait := jitterDuration(backoff)
+			m.log.Warn().Err(err).Str("vm_id", inst.ID).Dur("retry_in", wait).
 				Msg("could not read machine configuration; allocation stays uncounted until a retry succeeds")
-			time.Sleep(backoff)
+			time.Sleep(wait)
 			if backoff < machineConfigProbeMaxBackoff {
 				backoff *= 2
 			}
@@ -5052,6 +5087,18 @@ type HostPressure struct {
 	ProvisioningNetSlots  int32 // pool refill workers building/delivering
 	WarmNetSlots          int32 // fully built, claimable now
 	NetSlotCeiling        int32 // IP-scheme hard bound, not an operator knob
+	// UnknownAllocationVMs counts VMs charged to this host whose size is
+	// not known — records that predate the declared-allocation contract
+	// and whose recovery has not landed yet.
+	//
+	// It exists because an unsized VM is indistinguishable, in the
+	// allocation totals alone, from no VM at all: its memory adds zero,
+	// so the host reads as having that capacity free. That is the exact
+	// failure this feature is meant to prevent, so the undercount is
+	// published rather than hidden, and a consumer that cares about
+	// memory must treat a host reporting any unknowns as not fully
+	// described rather than as idle.
+	UnknownAllocationVMs int32
 }
 
 // builderProc identifies a surviving builder by pid AND its kernel
@@ -5411,6 +5458,13 @@ func (m *Manager) CapacityPressure() HostPressure {
 		inst.mu.RLock()
 		status, vcpu, mem := inst.Status, inst.Config.VCPU, inst.Config.MemoryMiB
 		inst.mu.RUnlock()
+		// Flagged at the point the size is read, before any branch
+		// decides whether to charge it: a VM whose allocation is unknown
+		// contributes zero to the totals wherever it lands, and the
+		// count is what stops that zero from reading as free capacity.
+		if vcpu == 0 || mem == 0 {
+			p.UnknownAllocationVMs++
+		}
 		switch status {
 		case StatusRunning:
 			p.RunningSandboxes++

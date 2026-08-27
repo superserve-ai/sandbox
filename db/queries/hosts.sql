@@ -324,12 +324,14 @@ INSERT INTO host_pressure (
     host_id, running_sandboxes, provisioning_sandboxes, paused_sandboxes,
     allocated_memory_mib, allocated_vcpus,
     used_net_slots, provisioning_net_slots, warm_net_slots,
-    net_slot_ceiling, max_network_slots, max_sandboxes, reported_at
+    net_slot_ceiling, max_network_slots, max_sandboxes, unknown_allocation_vms,
+    reported_at
 )
 SELECT h.id, @running_sandboxes, @provisioning_sandboxes, @paused_sandboxes,
        @allocated_memory_mib, @allocated_vcpus,
        @used_net_slots, @provisioning_net_slots, @warm_net_slots,
-       @net_slot_ceiling, @max_network_slots, @max_sandboxes, now()
+       @net_slot_ceiling, @max_network_slots, @max_sandboxes, @unknown_allocation_vms,
+       now()
 FROM host h
 WHERE h.id = @host_id AND h.vmd_addr = @vmd_addr
 -- FOR SHARE serializes the address check against an identity reclaim
@@ -351,6 +353,7 @@ ON CONFLICT (host_id) DO UPDATE SET
     net_slot_ceiling = EXCLUDED.net_slot_ceiling,
     max_network_slots = EXCLUDED.max_network_slots,
     max_sandboxes = EXCLUDED.max_sandboxes,
+    unknown_allocation_vms = EXCLUDED.unknown_allocation_vms,
     reported_at = EXCLUDED.reported_at;
 
 -- name: DeleteHostPressure :exec
