@@ -3448,10 +3448,21 @@ func (m *Manager) recordRepresentedOrGone(id string) bool {
 	return false
 }
 
-// machineConfigProbeTimeout bounds the allocation probe. Generous for a
+// machineConfigProbeTimeout bounds one allocation probe. Generous for a
 // local unix-socket call because nothing waits on it: the only cost of a
 // slow probe is one VM staying uncounted for a beat.
 const machineConfigProbeTimeout = 5 * time.Second
+
+// machineConfigProbeMaxBackoff caps the retry interval. A transient
+// socket failure must not leave a live VM permanently uncounted — the
+// backfill runs once per restore/reattach, so if its only attempt lost,
+// every later sample would keep publishing that VM's memory as free.
+const machineConfigProbeMaxBackoff = 30 * time.Second
+
+// machineConfigProbeBackoff is the first retry interval. A var, not a
+// const, so tests can drive the retry path without sleeping for real
+// seconds — nothing in production reassigns it.
+var machineConfigProbeBackoff = time.Second
 
 // machineConfigProbe fetches a running VM's real vCPU/memory allocation
 // from Firecracker. Seam so tests can exercise the backfill without a
@@ -3474,6 +3485,17 @@ var machineConfigProbe = func(ctx context.Context, socketPath string) (vcpu, mem
 // detached work instead of sleeping — same pattern as reattachHook.
 var machineConfigBackfillDone func(vmID string)
 
+// instanceIsCurrent reports whether id still names THIS exact instance.
+// Pointer identity, never the id alone: an id can be reused by an
+// in-place replace, and work started for the old instance must not act
+// on its successor's behalf.
+func (m *Manager) instanceIsCurrent(inst *VMInstance) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cur, ok := m.vms[inst.ID]
+	return ok && cur == inst
+}
+
 // backfillMachineConfigAsync fills in a VM's allocation when the caller
 // did not declare one, so capacity accounting describes the real
 // machine rather than an empty request.
@@ -3492,6 +3514,14 @@ var machineConfigBackfillDone func(vmID string)
 // pay for accounting. The published numbers are a beat late at worst —
 // the sample runs every 30 seconds and a missed one under-reports a
 // single VM until the next.
+//
+// Retries until it succeeds or the instance stops being current,
+// because a single transient socket error would otherwise leave a live
+// VM advertising its memory as free for the rest of its life. Every
+// step re-checks instance identity (see instanceIsCurrent) so a
+// destroyed or replaced VM ends the work at once, and the durable write
+// is conditional so it can never recreate a record a concurrent destroy
+// removed, nor overwrite a successor that reused the id.
 func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
 	if inst == nil {
 		return
@@ -3507,32 +3537,72 @@ func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
 		if machineConfigBackfillDone != nil {
 			defer machineConfigBackfillDone(inst.ID)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), machineConfigProbeTimeout)
-		defer cancel()
-		vcpu, memoryMiB, err := machineConfigProbe(ctx, socket)
-		if err != nil || vcpu == 0 || memoryMiB == 0 {
-			// Leave the zeros rather than invent a size: an
-			// under-reported allocation is visible as a host that looks
-			// emptier than it is, while a guessed one would be wrong in
-			// a direction nothing can detect.
-			m.log.Warn().Err(err).Str("vm_id", inst.ID).
-				Msg("could not read machine configuration; allocation stays uncounted for this VM")
-			return
+		backoff := machineConfigProbeBackoff
+		for {
+			// Identity, not liveness: a destroy that already removed
+			// this instance ends the work, and so does an in-place
+			// replace that put a different instance under the id.
+			if !m.instanceIsCurrent(inst) {
+				return
+			}
+			inst.mu.RLock()
+			resolved := inst.Config.VCPU > 0 && inst.Config.MemoryMiB > 0
+			inst.mu.RUnlock()
+			if resolved {
+				return // a declared allocation landed while we retried
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), machineConfigProbeTimeout)
+			vcpu, memoryMiB, err := machineConfigProbe(ctx, socket)
+			cancel()
+			if err == nil && vcpu > 0 && memoryMiB > 0 {
+				m.applyMachineConfig(inst, vcpu, memoryMiB)
+				return
+			}
+			// Never invent a size on failure: an under-reported
+			// allocation is visible as a host that looks emptier than it
+			// is, while a guessed one would be wrong in a direction
+			// nothing can detect. Retry instead.
+			m.log.Warn().Err(err).Str("vm_id", inst.ID).Dur("retry_in", backoff).
+				Msg("could not read machine configuration; allocation stays uncounted until a retry succeeds")
+			time.Sleep(backoff)
+			if backoff < machineConfigProbeMaxBackoff {
+				backoff *= 2
+			}
 		}
-		inst.mu.Lock()
-		// Re-check under the write lock: a concurrent replace may have
-		// declared real limits while the probe was in flight, and the
-		// declared value wins over a probe of a socket that may by then
-		// belong to a different run.
-		if inst.Config.VCPU == 0 || inst.Config.MemoryMiB == 0 {
-			inst.Config.VCPU, inst.Config.MemoryMiB = vcpu, memoryMiB
-		}
-		inst.mu.Unlock()
-		// Persist so a restart reattaches the real sizes instead of
-		// re-learning them (and so records written before this existed
-		// heal on their next reattach).
-		m.persistState(inst)
 	}()
+}
+
+// applyMachineConfig records a probed allocation, but only while the
+// instance is still the one the id names and still lacks a declared
+// size. The durable write is conditional (PutIfPresent) so a destroy
+// that deleted the record between the check and the write cannot see it
+// resurrected as Running.
+func (m *Manager) applyMachineConfig(inst *VMInstance, vcpu, memoryMiB uint32) {
+	if !m.instanceIsCurrent(inst) {
+		return
+	}
+	inst.mu.Lock()
+	if inst.Config.VCPU > 0 && inst.Config.MemoryMiB > 0 {
+		// A declared allocation won the race; it outranks a probe of a
+		// socket that may by now belong to a different run.
+		inst.mu.Unlock()
+		return
+	}
+	inst.Config.VCPU, inst.Config.MemoryMiB = vcpu, memoryMiB
+	inst.mu.Unlock()
+
+	// Re-check after the mutation: the durable write must not run for an
+	// instance a destroy has since retired.
+	if !m.instanceIsCurrent(inst) {
+		return
+	}
+	if _, err := m.persistStateIfPresent(inst); err != nil {
+		// The in-memory sizes still stand; the next restart re-learns
+		// them through reattach's own backfill.
+		m.log.Warn().Err(err).Str("vm_id", inst.ID).
+			Msg("recovered allocation not persisted; it will be re-learned after a restart")
+	}
 }
 
 // releaseBuildAlloc returns a build's memory/vCPU pressure counters at

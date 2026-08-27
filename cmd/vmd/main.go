@@ -198,6 +198,21 @@ func hostInterfaceAddress(interfaceName string) (string, error) {
 	return "", fmt.Errorf("no IPv4 address found on interface %q", interfaceName)
 }
 
+// publishesCapacityPressure reports whether this daemon should publish
+// capacity pressure — and therefore whether the manager should do the
+// pressure-only startup accounting at all.
+//
+// Both halves are required. The advertise address must be the EXPLICIT
+// operator setting rather than the address the heartbeat resolves: that
+// one falls back to the host interface, so every host has one, and
+// publication must stay opt-in per host. The control-plane URL matters
+// because without it the heartbeat never starts, so nothing would ever
+// read the accounting — a host configured that way would pay for the
+// startup scan and publish to no one.
+func publishesCapacityPressure(advertiseAddr, controlPlaneURL string) bool {
+	return advertiseAddr != "" && controlPlaneURL != ""
+}
+
 func advertisedVMDAddr(interfaceName string, grpcPort int, explicit string) (string, error) {
 	if explicit != "" {
 		if _, _, err := net.SplitHostPort(explicit); err != nil {
@@ -807,13 +822,17 @@ func main() {
 	log.Info().Bool("systemd_dbus", systemdDBus).Msg("systemd unit-operations transport")
 
 	// Capacity pressure is published only by a host whose advertise
-	// address was set EXPLICITLY by an operator. Deliberately not the
-	// resolved address the heartbeat sends: that one falls back to the
-	// host interface, so every host has one, and publication must stay
-	// opt-in per host. Named once here because it also decides whether
-	// the manager does pressure-only startup accounting at all — on a
-	// host that never publishes, none of that work should run.
-	publishesPressure := cfg.VMDAdvertiseAddr != ""
+	// address was set EXPLICITLY by an operator AND that has somewhere
+	// to publish to. Deliberately not the resolved address the heartbeat
+	// sends: that one falls back to the host interface, so every host
+	// has one, and publication must stay opt-in per host. The
+	// control-plane URL belongs in the same condition because without it
+	// the heartbeat never starts, so nothing would ever read the
+	// accounting this flag turns on. Named once here because it also
+	// decides whether the manager does pressure-only startup accounting
+	// at all — on a host that never publishes, none of that work should
+	// run.
+	publishesPressure := publishesCapacityPressure(cfg.VMDAdvertiseAddr, cfg.ControlPlaneURL)
 
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:                      cfg.FirecrackerBin,

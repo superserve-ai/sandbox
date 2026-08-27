@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1256,11 +1257,16 @@ func TestBackfillLeavesSizeUnknownWhenProbeFails(t *testing.T) {
 func stubMachineConfigProbe(t *testing.T, probe func(context.Context, string) (uint32, uint32, error)) <-chan string {
 	t.Helper()
 	done := make(chan string, 4)
-	prevProbe, prevDone := machineConfigProbe, machineConfigBackfillDone
+	prevProbe, prevDone, prevBackoff := machineConfigProbe, machineConfigBackfillDone, machineConfigProbeBackoff
 	machineConfigProbe = probe
 	machineConfigBackfillDone = func(vmID string) { done <- vmID }
+	// Retries are exercised for their behavior, not their timing: a real
+	// backoff would make the retry tests take seconds and let cleanup
+	// restore these seams while a goroutine is still looping.
+	machineConfigProbeBackoff = time.Millisecond
 	t.Cleanup(func() {
 		machineConfigProbe, machineConfigBackfillDone = prevProbe, prevDone
+		machineConfigProbeBackoff = prevBackoff
 	})
 	return done
 }
@@ -1271,5 +1277,176 @@ func awaitBackfill(t *testing.T, done <-chan string) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("allocation backfill never ran — an undeclared VM keeps a zero size and publishes as free capacity")
+	}
+}
+
+// A destroy that lands while the probe is in flight must not have its
+// record resurrected: the durable write is conditional, and the
+// instance-identity check ends the work first. Without both, a torn-down
+// VM comes back as a Running record that the reconciler then has to
+// chase.
+func TestBackfillDoesNotResurrectDestroyedRecords(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	release, entered := make(chan struct{}), make(chan struct{})
+	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		close(entered)
+		<-release // hold the probe open so the destroy wins the race
+		return 4, 8192, nil
+	})
+
+	m := &Manager{log: zerolog.Nop(), state: st, vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	inst := &VMInstance{ID: "doomed", Status: StatusRunning, SocketPath: "/run/fc.sock"}
+	m.vms[inst.ID] = inst
+	m.indexVM(inst.ID, inst)
+	if ok := m.persistState(inst); !ok {
+		t.Fatal("seed persist failed")
+	}
+
+	m.backfillMachineConfigAsync(inst)
+	// The probe must be IN FLIGHT before the destroy, or the goroutine
+	// exits at its first identity check and the write this test is about
+	// never happens — a pass that proves nothing.
+	<-entered
+
+	// The destroy: instance gone from the map, record deleted.
+	m.mu.Lock()
+	delete(m.vms, inst.ID)
+	m.unindexVM(inst.ID)
+	m.mu.Unlock()
+	if err := st.Delete(inst.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	close(release)
+	awaitBackfill(t, done)
+
+	rec, err := st.Get(inst.ID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if rec != nil {
+		t.Fatalf("backfill resurrected a destroyed VM's record: %+v", rec)
+	}
+}
+
+// An id reused by an in-place replace must not have the OLD instance's
+// probe write over the replacement: identity is checked by pointer, not
+// by id.
+func TestBackfillDoesNotOverwriteAReplacementUnderTheSameID(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	release, entered := make(chan struct{}), make(chan struct{})
+	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		close(entered)
+		<-release
+		return 4, 8192, nil // the OLD instance's shape
+	})
+
+	m := &Manager{log: zerolog.Nop(), state: st, vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	old := &VMInstance{ID: "reused", Status: StatusRunning, SocketPath: "/run/fc.sock"}
+	m.vms[old.ID] = old
+	m.indexVM(old.ID, old)
+	m.backfillMachineConfigAsync(old)
+	<-entered // the old instance's probe must be in flight before the replace
+
+	// The replace: a different instance takes the id, with its own size.
+	replacement := &VMInstance{ID: "reused", Status: StatusRunning, SocketPath: "/run/fc2.sock",
+		Config: VMConfig{VCPU: 1, MemoryMiB: 512}}
+	m.mu.Lock()
+	m.vms[replacement.ID] = replacement
+	m.indexVM(replacement.ID, replacement)
+	m.mu.Unlock()
+	if ok := m.persistState(replacement); !ok {
+		t.Fatal("replacement persist failed")
+	}
+
+	close(release)
+	awaitBackfill(t, done)
+
+	rec, err := st.Get(replacement.ID)
+	if err != nil || rec == nil {
+		t.Fatalf("replacement record missing: %v", err)
+	}
+	if rec.VCPU != 1 || rec.MemoryMiB != 512 {
+		t.Fatalf("old instance's probe overwrote the replacement: %d/%d", rec.VCPU, rec.MemoryMiB)
+	}
+	replacement.mu.RLock()
+	defer replacement.mu.RUnlock()
+	if replacement.Config.VCPU != 1 || replacement.Config.MemoryMiB != 512 {
+		t.Fatalf("replacement's in-memory size clobbered: %d/%d",
+			replacement.Config.VCPU, replacement.Config.MemoryMiB)
+	}
+}
+
+// A transient probe failure must not leave a live VM uncounted forever:
+// the backfill retries while the instance is still current, so one bad
+// socket read cannot make the host advertise that memory as free for the
+// VM's whole lifetime.
+func TestBackfillRetriesTransientProbeFailures(t *testing.T) {
+	var attempts atomic.Int32
+	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		if attempts.Add(1) < 3 {
+			return 0, 0, fmt.Errorf("connection refused")
+		}
+		return 2, 2048, nil
+	})
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	inst := &VMInstance{ID: "flaky", Status: StatusRunning, SocketPath: "/run/fc.sock"}
+	m.vms[inst.ID] = inst
+	m.indexVM(inst.ID, inst)
+
+	m.backfillMachineConfigAsync(inst)
+	awaitBackfill(t, done)
+
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	if inst.Config.VCPU != 2 || inst.Config.MemoryMiB != 2048 {
+		t.Fatalf("allocation not recovered after transient failures: %d/%d",
+			inst.Config.VCPU, inst.Config.MemoryMiB)
+	}
+	if got := attempts.Load(); got < 3 {
+		t.Fatalf("probe attempts = %d, want the retries that recovered it", got)
+	}
+}
+
+// Retrying must stop when the VM goes away, or a destroyed VM's backfill
+// spins for the life of the process.
+func TestBackfillStopsRetryingOnceTheVMIsGone(t *testing.T) {
+	var attempts atomic.Int32
+	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		attempts.Add(1)
+		return 0, 0, fmt.Errorf("connection refused")
+	})
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	inst := &VMInstance{ID: "vanishing", Status: StatusRunning, SocketPath: "/run/fc.sock"}
+	m.vms[inst.ID] = inst
+	m.indexVM(inst.ID, inst)
+	m.backfillMachineConfigAsync(inst)
+
+	// Let the first attempt fail, then retire the instance.
+	time.Sleep(50 * time.Millisecond)
+	m.mu.Lock()
+	delete(m.vms, inst.ID)
+	m.unindexVM(inst.ID)
+	m.mu.Unlock()
+
+	awaitBackfill(t, done)
+	settled := attempts.Load()
+	time.Sleep(200 * time.Millisecond)
+	if got := attempts.Load(); got != settled {
+		t.Fatalf("probe kept retrying after the VM was gone: %d then %d", settled, got)
 	}
 }
