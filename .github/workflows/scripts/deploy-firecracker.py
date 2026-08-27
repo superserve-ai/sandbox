@@ -81,11 +81,10 @@ def fetch_release(version, workdir):
     return binary, digest
 
 
-def list_instances(project, region, label, running_only=True):
-    status = " AND status=RUNNING" if running_only else ""
+def list_instances(project, region, label):
     result = subprocess.run(
         ["gcloud", "compute", "instances", "list", f"--project={project}",
-         f"--filter=labels.{label}{status}",
+         f"--filter=labels.{label} AND status=RUNNING",
          "--format=csv[no-heading](name,zone)"],
         capture_output=True, text=True, check=True,
     )
@@ -105,6 +104,44 @@ def list_instances(project, region, label, running_only=True):
     ]
 
 
+def current_digest(inst, project):
+    """The digest a host is running right now, read without changing anything."""
+    name, zone = inst["name"], inst["zone"]
+    r = run_or_die(
+        ["gcloud", "compute", "ssh", name, f"--zone={zone}", f"--project={project}",
+         "--quiet", "--tunnel-through-iap", "--command",
+         f"sha256sum < {shlex.quote(INSTALL_PATH)} | cut -d' ' -f1"],
+        f"[{name}] read installed digest",
+    )
+    return (r.stdout or "").strip().splitlines()[-1].strip()
+
+
+def preflight(instances, project, expected):
+    """Require every host to be on the same digest before any is changed.
+
+    The rollback a deployment was verified against on staging is only the one
+    that exists here if the cell is actually uniform; a host that has drifted
+    would fall back to a binary nobody tested against. Checked across the whole
+    cell first, so drift stops the rollout instead of being discovered halfway.
+    """
+    digests = {}
+    for inst in instances:
+        digests[inst["name"]] = current_digest(inst, project)
+    for name, d in sorted(digests.items()):
+        print(f"  {name}: currently {d}")
+
+    distinct = set(digests.values())
+    if len(distinct) > 1:
+        raise RuntimeError(
+            "hosts are not on a single version, so the rollback target is not "
+            "the one staging verified: " + ", ".join(f"{n}={d}" for n, d in sorted(digests.items()))
+        )
+    if expected and distinct and expected not in distinct:
+        raise RuntimeError(
+            f"hosts are on {distinct.pop()}, not the expected {expected}"
+        )
+
+
 def install_script(version, digest):
     """The remote half of a swap, in the order the checks have to happen."""
     staged = f"/tmp/firecracker-{version}"
@@ -119,6 +156,9 @@ digest={shlex.quote(digest)}
 # Rollback floor. Without it a bad swap has nowhere to fall back to, so
 # refuse before touching anything.
 test -f "$stock" || {{ echo "stock backup $stock missing — abort"; exit 1; }}
+# Existence is not usability: a truncated or non-executable floor leaves the
+# host with no deep rollback at all.
+"$stock" --version >/dev/null 2>&1 || {{ echo "stock backup $stock does not run — abort"; exit 1; }}
 
 # The bytes that arrived are the bytes that were built.
 echo "$digest  $staged" | sha256sum -c -
@@ -218,17 +258,11 @@ def main() -> int:
         instances = list_instances(project, region, label)
         where = f"{project} ({region})"
 
-        # Discovery is RUNNING-only — a stopped host cannot be reached — so a
-        # cold standby keeps whatever binary it has. Name it, or promotion
-        # quietly puts an untracked binary into service.
-        for inst in list_instances(project, region, label, running_only=False):
-            if inst not in instances:
-                print(f"NOTE: {inst['name']} is not running and was skipped — "
-                      f"install {args.version} on it before promoting it")
         if not instances:
             print(f"No instances with label {label} found in {where}", file=sys.stderr)
             return 1
         print(f"Installing {args.version} on {len(instances)} instance(s) in {where}")
+        preflight(instances, project, os.environ.get("EXPECTED_CURRENT_SHA256", "").strip())
 
         # Sequential, and stopping on the first failure: a swap only affects
         # VMs launched after it, so there is nothing to gain from racing, and

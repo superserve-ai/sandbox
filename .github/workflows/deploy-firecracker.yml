@@ -3,6 +3,10 @@
 # Builds nothing: it installs a release built once in the fork, so every host
 # runs identical bytes. Production never deploys without staging first.
 #
+# Host discovery matches the vmd deploy exactly, so standby hosts are out of
+# scope here for the same reasons they are there; a promoted standby needs the
+# current release installed and verified before it serves traffic.
+#
 # Running sandboxes are unaffected; PAUSED ones are not. Resuming one launches
 # a fresh Firecracker from this path, so snapshots have to survive the swap in
 # both directions — the new binary must read what the old one wrote, and a
