@@ -1170,3 +1170,106 @@ func TestCompleteBuildDropsReplacedWorkerResult(t *testing.T) {
 		t.Fatalf("replacement's own completion did not land (status %s)", status)
 	}
 }
+
+// The bug this pins: the production control plane sends no resource
+// limits on RestoreSnapshot, so a restored VM's VMConfig is empty and
+// pressure counted it as running while adding ZERO memory and vCPUs — a
+// host full of restored sandboxes published as idle. The fixture starts
+// with the empty config the adapter really builds, because a fixture
+// that declares its own sizes assumes away the very defect.
+func TestPressureCountsRestoredVMsWithUndeclaredSizes(t *testing.T) {
+	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		return 4, 8192, nil // what Firecracker reports for the restored VM
+	})
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	inst := &VMInstance{ID: "restored", Status: StatusRunning, SocketPath: "/run/fc.sock"}
+	m.vms[inst.ID] = inst
+	m.indexVM(inst.ID, inst)
+	if inst.Config.VCPU != 0 || inst.Config.MemoryMiB != 0 {
+		t.Fatal("fixture must start with an undeclared allocation")
+	}
+
+	m.backfillMachineConfigAsync(inst)
+	awaitBackfill(t, done)
+
+	m.reattachComplete.Store(true)
+	p := m.CapacityPressure()
+	if p.RunningSandboxes != 1 {
+		t.Fatalf("running = %d, want 1", p.RunningSandboxes)
+	}
+	if p.AllocatedMemoryMib != 8192 || p.AllocatedVcpus != 4 {
+		t.Fatalf("allocation = %d MiB / %d vcpu, want 8192/4 — a restored VM must not publish as free capacity",
+			p.AllocatedMemoryMib, p.AllocatedVcpus)
+	}
+}
+
+// A declared allocation is authoritative: no probe, no overwrite.
+func TestBackfillSkipsVMsThatDeclaredTheirSize(t *testing.T) {
+	probed := make(chan struct{}, 1)
+	stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		probed <- struct{}{}
+		return 99, 99, nil
+	})
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	inst := &VMInstance{ID: "declared", Status: StatusRunning, SocketPath: "/run/fc.sock",
+		Config: VMConfig{VCPU: 2, MemoryMiB: 1024}}
+	m.backfillMachineConfigAsync(inst)
+
+	select {
+	case <-probed:
+		t.Fatal("probed a VM whose allocation was already declared")
+	case <-time.After(200 * time.Millisecond):
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	if inst.Config.VCPU != 2 || inst.Config.MemoryMiB != 1024 {
+		t.Fatalf("declared allocation overwritten: %d/%d", inst.Config.VCPU, inst.Config.MemoryMiB)
+	}
+}
+
+// A failed probe must leave the zeros rather than invent a size: an
+// under-count shows up as a host that looks emptier than it is, while a
+// guess is wrong in a direction nothing can detect.
+func TestBackfillLeavesSizeUnknownWhenProbeFails(t *testing.T) {
+	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		return 0, 0, fmt.Errorf("connection refused")
+	})
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	inst := &VMInstance{ID: "unreachable", Status: StatusRunning, SocketPath: "/run/fc.sock"}
+	m.backfillMachineConfigAsync(inst)
+	awaitBackfill(t, done)
+
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	if inst.Config.VCPU != 0 || inst.Config.MemoryMiB != 0 {
+		t.Fatalf("invented an allocation after a failed probe: %d/%d", inst.Config.VCPU, inst.Config.MemoryMiB)
+	}
+}
+
+// stubMachineConfigProbe swaps the probe seam and returns a channel that
+// fires when the backfill goroutine exits. Restoring the seams is
+// deferred to cleanup AFTER that join, so the package-level swap never
+// races the detached work.
+func stubMachineConfigProbe(t *testing.T, probe func(context.Context, string) (uint32, uint32, error)) <-chan string {
+	t.Helper()
+	done := make(chan string, 4)
+	prevProbe, prevDone := machineConfigProbe, machineConfigBackfillDone
+	machineConfigProbe = probe
+	machineConfigBackfillDone = func(vmID string) { done <- vmID }
+	t.Cleanup(func() {
+		machineConfigProbe, machineConfigBackfillDone = prevProbe, prevDone
+	})
+	return done
+}
+
+func awaitBackfill(t *testing.T, done <-chan string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("allocation backfill never ran — an undeclared VM keeps a zero size and publishes as free capacity")
+	}
+}

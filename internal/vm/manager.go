@@ -33,6 +33,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/shellquote"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
+	"github.com/superserve-ai/sandbox/internal/vm/fc/client/operations"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
@@ -3181,6 +3182,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		defer close(persistDone)
 		optimisticOK = m.persistState(inst)
 	}()
+	// The vCPUs are live, so Firecracker answers its API: recover the
+	// allocation this restore was never told (see the helper). Detached
+	// — it must not join the readiness wait below.
+	m.backfillMachineConfigAsync(inst)
 
 	tBoxdStart := time.Now()
 	// Same window as first boot: a restore that has to fault its memory and
@@ -3441,6 +3446,93 @@ func (m *Manager) recordRepresentedOrGone(id string) bool {
 		// genuinely stuck case. Re-observe.
 	}
 	return false
+}
+
+// machineConfigProbeTimeout bounds the allocation probe. Generous for a
+// local unix-socket call because nothing waits on it: the only cost of a
+// slow probe is one VM staying uncounted for a beat.
+const machineConfigProbeTimeout = 5 * time.Second
+
+// machineConfigProbe fetches a running VM's real vCPU/memory allocation
+// from Firecracker. Seam so tests can exercise the backfill without a
+// live microVM.
+var machineConfigProbe = func(ctx context.Context, socketPath string) (vcpu, memoryMiB uint32, err error) {
+	params := operations.NewGetMachineConfigurationParamsWithContext(ctx)
+	resp, err := newFCClient(socketPath).Operations.GetMachineConfiguration(params)
+	if err != nil {
+		return 0, 0, err
+	}
+	cfg := resp.GetPayload()
+	if cfg == nil || cfg.VcpuCount == nil || cfg.MemSizeMib == nil {
+		return 0, 0, fmt.Errorf("machine configuration incomplete")
+	}
+	return uint32(*cfg.VcpuCount), uint32(*cfg.MemSizeMib), nil
+}
+
+// machineConfigBackfillDone, when set, fires as each backfill goroutine
+// exits. Test seam only (nil in production), so tests can join the
+// detached work instead of sleeping — same pattern as reattachHook.
+var machineConfigBackfillDone func(vmID string)
+
+// backfillMachineConfigAsync fills in a VM's allocation when the caller
+// did not declare one, so capacity accounting describes the real
+// machine rather than an empty request.
+//
+// The restore RPC carries resource limits only when the caller chooses
+// to send them, and the production control plane does not: it recovers
+// the sandbox's shape from its own row instead (the zero-check in its
+// create/resume handlers). That leaves VMConfig empty on a VM that is
+// nonetheless holding real memory, and anything sizing the host from
+// the instance map would count it as free — a host running hundreds of
+// restored sandboxes would publish a near-zero allocation and read as
+// idle. Firecracker itself is the authority here, so ask it.
+//
+// Runs OFF the caller's path, always: the probe is a unix-socket round
+// trip to a VM that just restored, and create/resume latency may never
+// pay for accounting. The published numbers are a beat late at worst —
+// the sample runs every 30 seconds and a missed one under-reports a
+// single VM until the next.
+func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
+	if inst == nil {
+		return
+	}
+	inst.mu.RLock()
+	socket, known := inst.SocketPath, inst.Config.VCPU > 0 && inst.Config.MemoryMiB > 0
+	inst.mu.RUnlock()
+	if known || socket == "" {
+		return
+	}
+	go func() {
+		defer sentrylog.Recover("machine-config-backfill")
+		if machineConfigBackfillDone != nil {
+			defer machineConfigBackfillDone(inst.ID)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), machineConfigProbeTimeout)
+		defer cancel()
+		vcpu, memoryMiB, err := machineConfigProbe(ctx, socket)
+		if err != nil || vcpu == 0 || memoryMiB == 0 {
+			// Leave the zeros rather than invent a size: an
+			// under-reported allocation is visible as a host that looks
+			// emptier than it is, while a guessed one would be wrong in
+			// a direction nothing can detect.
+			m.log.Warn().Err(err).Str("vm_id", inst.ID).
+				Msg("could not read machine configuration; allocation stays uncounted for this VM")
+			return
+		}
+		inst.mu.Lock()
+		// Re-check under the write lock: a concurrent replace may have
+		// declared real limits while the probe was in flight, and the
+		// declared value wins over a probe of a socket that may by then
+		// belong to a different run.
+		if inst.Config.VCPU == 0 || inst.Config.MemoryMiB == 0 {
+			inst.Config.VCPU, inst.Config.MemoryMiB = vcpu, memoryMiB
+		}
+		inst.mu.Unlock()
+		// Persist so a restart reattaches the real sizes instead of
+		// re-learning them (and so records written before this existed
+		// heal on their next reattach).
+		m.persistState(inst)
+	}()
 }
 
 // releaseBuildAlloc returns a build's memory/vCPU pressure counters at
@@ -4104,6 +4196,14 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	m.vms[rec.ID] = inst
 	m.indexVM(rec.ID, inst)
 	m.mu.Unlock()
+
+	// Records written before the allocation was recoverable carry zeros,
+	// and a paused VM holds no Firecracker to ask — so heal the running
+	// ones here. Detached, and a no-op for every record that already
+	// knows its size.
+	if rec.Status == StatusRunning {
+		m.backfillMachineConfigAsync(inst)
+	}
 
 	// Commit only if a concurrent DestroyVM didn't delete the record during
 	// reattach (the gate is open, so deletes race the background pass); otherwise
