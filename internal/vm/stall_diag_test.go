@@ -222,34 +222,34 @@ func TestPerfStubIsNotTreatedAsUsable(t *testing.T) {
 	}
 }
 
-func TestOnlyGuestSamplesAreReported(t *testing.T) {
-	// A host address reported as a guest RIP would be resolved against guest
-	// symbols and yield confident nonsense — worse than reporting nothing.
-	sample := "" +
-		"    ffffffff810a2b40 [guest.kernel.kallsyms]\n" +
-		"    ffffffff810a2b40 [guest.kernel.kallsyms]\n" +
-		"    00007f9c0a1b2c3d /usr/local/bin/firecracker\n" +
-		"    ffffffff81abcdef [kernel.kallsyms]\n"
+func TestKvmEntryLinesYieldPerVcpuRIPs(t *testing.T) {
+	// The tracepoint stream interleaves entries from every vCPU with other
+	// kvm events. Only kvm_entry lines carry a guest RIP; counting anything
+	// else (kvm_exit reasons, msr writes) would corrupt the histogram, and
+	// losing the vcpu id would merge the spinning vCPU's cluster with the
+	// halted one's — the distinction is the entire finding.
+	// First three lines are verbatim perf-script output from a production
+	// host; the comma variant covers kernels whose print format includes it.
+	out := "" +
+		"       fc_vcpu 1  599500 [039] 1377662.550600: kvm:kvm_entry:  vcpu 1 rip 0xffffffff81036706\n" +
+		"       fc_vcpu 1  599500 [039] 1377662.550637: kvm:kvm_entry:  vcpu 1 rip 0xffffffff81036706\n" +
+		"       fc_vcpu 0  599499 [002] 1377662.550644: kvm:kvm_entry:  vcpu 0 rip 0xffffffff815cf36e\n" +
+		" fc_vcpu 1 2335220 [069] 12345.679150: kvm:kvm_entry: vcpu 1, rip 0xffffffff81036706\n" +
+		" fc_vcpu 1 2335220 [069] 12345.679200: kvm:kvm_exit: reason EXTERNAL_INTERRUPT rip 0xffffffff81036706 info1 0\n" +
+		" fc_vcpu 1 2335220 [069] 12345.679300: kvm:kvm_msr: msr_write 6e0 = 0x1fb1e5ac1f9\n"
 
-	var guest, host int
-	for _, m := range guestSampleLine.FindAllStringSubmatch(sample, -1) {
-		if guestDSO(m[2]) {
-			guest++
-		} else {
-			host++
-		}
+	counts := map[string]int{}
+	for _, m := range kvmEntryLine.FindAllStringSubmatch(out, -1) {
+		counts["v"+m[1]+":"+m[2]]++
 	}
-	if guest != 2 {
-		t.Fatalf("guest samples = %d, want 2", guest)
+	if counts["v1:ffffffff81036706"] != 3 {
+		t.Fatalf("spinning vCPU cluster = %d, want 3 (both print formats must count)", counts["v1:ffffffff81036706"])
 	}
-	if host != 2 {
-		t.Fatalf("host samples = %d, want 2 (they must be recognized and excluded)", host)
+	if counts["v0:ffffffff815cf36e"] != 1 {
+		t.Fatalf("halted vCPU entry = %d, want 1", counts["v0:ffffffff815cf36e"])
 	}
-	if guestDSO("/usr/local/bin/firecracker") || guestDSO("[kernel.kallsyms]") {
-		t.Fatal("host dso classified as guest")
-	}
-	if !guestDSO("[guest.kernel.kallsyms]") {
-		t.Fatal("guest dso not recognized")
+	if len(counts) != 2 {
+		t.Fatalf("non-entry events leaked into the histogram: %v", counts)
 	}
 }
 
