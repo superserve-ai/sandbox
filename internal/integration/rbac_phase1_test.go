@@ -65,6 +65,8 @@ func TestRbacSeedData(t *testing.T) {
 		"platform:team_users:write",
 		"platform:team_roles:write",
 		"platform:billing:write",
+		"platform:abuse:read",
+		"platform:abuse:write",
 	}
 	var gotPerms []string
 	rows, err = testPool.Query(ctx, `SELECT name FROM permissions ORDER BY name`)
@@ -100,6 +102,8 @@ func TestRbacSeedData(t *testing.T) {
 			"platform:team_users:write",
 			"platform:team_roles:write",
 			"platform:billing:write",
+			"platform:abuse:read",
+			"platform:abuse:write",
 			"billing:read",
 			"billing:write",
 			"users:read",

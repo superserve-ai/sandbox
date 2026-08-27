@@ -32,6 +32,7 @@ on:
       # matches no path is not a skipped job but no job at all. The
       # deploy-trigger-coverage CI check enforces this against `go list -deps`.
       - 'cmd/controlplane/**'
+      - 'internal/abuse/**'
       - 'internal/analytics/**'
       - 'internal/api/**'
       - 'internal/auth/**'
