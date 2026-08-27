@@ -1,14 +1,9 @@
 # Deploy Firecracker — the VMM binary on the sandbox hosts.
 #
-# Unlike the other deploys this one builds nothing: it installs a published
-# release built once in the fork, so every host ends up running provably
-# identical bytes. Production never deploys without staging first, same
-# discipline as the other deploys here.
-#
-# A swap only affects VMs launched after it — running and paused sandboxes
-# keep the process and artifacts they already have — so this is safe to run
-# during traffic, and a cell stays on mixed versions until its sandboxes
-# recycle.
+# Builds nothing: it installs a release built once in the fork, so every host
+# runs identical bytes. Production never deploys without staging first, same
+# discipline as the other deploys here. A swap only affects VMs launched
+# after it, so it is safe to run during traffic.
 
 name: Deploy Firecracker
 
@@ -28,9 +23,8 @@ on:
           - staging
           - production
 
-# One rollout at a time, and never cancelled: two overlapping dispatches for
-# different versions could interleave their per-host loops and leave a cell on
-# mixed digests, with both runs reporting success.
+# One rollout at a time: overlapping dispatches could interleave their
+# per-host loops and leave a cell on mixed digests, both reporting success.
 concurrency:
   group: deploy-firecracker
   cancel-in-progress: false
@@ -54,10 +48,8 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      # The dispatch input reaches the script through the environment, never
-      # through the run body: `${{ }}` is substituted before bash parses the
-      # script, so an interpolated tag could close the quoting and run
-      # arbitrary commands on a job that has already authenticated to GCP.
+      # Input goes through the environment, not the run body: `${{ }}` is
+      # substituted before bash parses, so a tag could inject commands.
       - name: Install
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
@@ -84,15 +76,11 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      # Production is two cells, and each is discovered by its own region: a
-      # single run scoped to one region would filter the other cell out
-      # entirely and still report success, leaving it on the old binary.
-      # Both are steps in this job rather than separate jobs, because a second
-      # job referencing the production environment would double any approval
-      # gate.
-      #
-      # use4 is the primary and is unguarded: a missing GCP_REGION_USE4 must
-      # fail the deploy rather than silently skip the primary cell.
+      # Two cells, each discovered by its own region: one run scoped to a
+      # single region would filter the other out and still report success.
+      # Steps rather than jobs — a second job on the production environment
+      # would double any approval gate. use4 is unguarded, so a missing
+      # region fails the deploy rather than skipping the primary cell.
       - name: Install on the use4 cell
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}

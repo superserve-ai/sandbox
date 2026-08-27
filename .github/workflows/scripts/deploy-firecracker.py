@@ -140,17 +140,12 @@ if [ "$(sha256sum < "$live" | cut -d' ' -f1)" = "$digest" ]; then
   exit 0
 fi
 
-# Back up, then install, CHAINED: if the backup fails the install must not
-# run, or it overwrites the very binary the backup was meant to preserve.
-# `cp -n` rather than `--update=none`, which needs coreutils >= 9.3 and so
-# fails outright on the older hosts.
-#
-# The install itself writes a temporary file alongside the live one and
-# renames it into place. Writing to the live pathname directly would expose a
-# window where a launching sandbox execs a half-written binary, and would fail
-# outright with ETXTBSY while any sandbox is running from it. A rename within
-# the same directory is atomic: processes already running keep the old inode,
-# and every exec after it sees a complete binary.
+# Backup CHAINED to install: a failed backup must not be followed by an
+# install that overwrites the binary it was meant to preserve. `cp -n`, not
+# `--update=none`, which needs coreutils >= 9.3.
+# The install writes alongside and renames: writing to the live path exposes
+# a half-written binary to a launching sandbox, and fails with ETXTBSY while
+# one is running from it. A rename in the same directory is atomic.
 incoming="$live.incoming"
 sudo rm -f "$incoming"
 sudo cp -n "$live" "$backup" \\
