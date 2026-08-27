@@ -105,46 +105,63 @@ def list_instances(project, region, label):
     ]
 
 
-def current_digest(inst, project):
-    """The digest a host is running right now, read without changing anything."""
+def host_digests(inst, project, expected):
+    """What a host is running, and whether it still holds a backup of
+    `expected`. Read-only, and one round trip rather than two."""
     name, zone = inst["name"], inst["zone"]
+    probe = f"""
+        live=$(sha256sum < {shlex.quote(INSTALL_PATH)} | cut -d' ' -f1)
+        backup={shlex.quote(INSTALL_PATH)}.pre-{expected[:12]}.bak
+        if [ -f "$backup" ]; then
+          echo "$live $(sha256sum < "$backup" | cut -d' ' -f1)"
+        else
+          echo "$live none"
+        fi
+    """
     r = run_or_die(
         ["gcloud", "compute", "ssh", name, f"--zone={zone}", f"--project={project}",
-         "--quiet", "--tunnel-through-iap", "--command",
-         f"sha256sum < {shlex.quote(INSTALL_PATH)} | cut -d' ' -f1"],
+         "--quiet", "--tunnel-through-iap", "--command", probe],
         f"[{name}] read installed digest",
     )
-    return (r.stdout or "").strip().splitlines()[-1].strip()
+    live, backup = (r.stdout or "").strip().splitlines()[-1].split()
+    return live, (None if backup == "none" else backup)
 
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
-def preflight(instances, project, expected):
-    """Require every host to be on the same digest before any is changed.
+def host_state(live, backup, expected, target):
+    """Whether a host is in a state this rollout may proceed from.
 
-    The rollback a deployment was verified against on staging is only the one
-    that exists here if the cell is actually uniform; a host that has drifted
-    would fall back to a binary nobody tested against. Checked across the whole
-    cell first, so drift stops the rollout instead of being discovered halfway.
+    Two are acceptable, which is what lets a partly-finished rollout be
+    retried: a host still on the verified rollback binary, or one already on
+    the target — provided it still holds a correct backup of that rollback
+    binary, so it has not lost the way back. Anything else is a host nobody
+    verified against, and the rollout stops rather than guessing.
     """
-    digests = {}
-    for inst in instances:
-        digests[inst["name"]] = current_digest(inst, project)
-    for name, d in sorted(digests.items()):
-        print(f"  {name}: currently {d}")
+    if live == expected:
+        return True, "on the rollback binary"
+    if live == target:
+        if backup == expected:
+            return True, "already on the target"
+        return False, (
+            f"is on the target but its backup of {expected[:12]} is "
+            + ("missing" if backup is None else f"wrong ({backup[:12]})")
+        )
+    return False, f"is on {live[:12]}, neither the rollback nor the target"
 
-    distinct = set(digests.values())
-    if len(distinct) > 1:
-        raise RuntimeError(
-            "hosts are not on a single version, so the rollback target is not "
-            "the one staging verified: " + ", ".join(f"{n}={d}" for n, d in sorted(digests.items()))
-        )
-    if expected and distinct and expected not in distinct:
-        raise RuntimeError(
-            f"hosts are on {distinct.pop()}, not the expected {expected}"
-        )
-    return digests
+
+def preflight(instances, project, expected, target):
+    """Check every host before any of them is changed."""
+    problems = []
+    for inst in instances:
+        live, backup = host_digests(inst, project, expected)
+        ok, why = host_state(live, backup, expected, target)
+        print(f"  {inst['name']}: {why}")
+        if not ok:
+            problems.append(f"{inst['name']} {why}")
+    if problems:
+        raise RuntimeError("; ".join(problems))
 
 
 def install_script(version, digest):
@@ -276,7 +293,12 @@ def main() -> int:
             print(f"EXPECTED_CURRENT_SHA256 is not a sha256 digest: {expected!r}",
                   file=sys.stderr)
             return 1
-        preflight(instances, project, expected)
+        if expected:
+            preflight(instances, project, expected, digest)
+        elif args.preflight_only:
+            print("EXPECTED_CURRENT_SHA256 is unset — nothing to preflight against",
+                  file=sys.stderr)
+            return 1
         if args.preflight_only:
             print("preflight only — nothing installed")
             return 0

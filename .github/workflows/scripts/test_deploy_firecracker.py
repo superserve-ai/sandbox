@@ -120,6 +120,39 @@ class RegionTest(unittest.TestCase):
         self.assertIn("GCP_REGION is unset", err.getvalue())
 
 
+class PreflightStateTest(unittest.TestCase):
+    """A rollout that stopped halfway must still be completable."""
+
+    A = "a" * 64   # the verified rollback binary
+    B = "b" * 64   # the target release
+    C = "c" * 64   # anything else
+
+    def test_a_host_not_yet_updated_is_accepted(self):
+        ok, _ = deploy_firecracker.host_state(self.A, None, self.A, self.B)
+        self.assertTrue(ok)
+
+    def test_a_host_already_updated_is_accepted_when_it_can_still_roll_back(self):
+        # The retry case: the first cell installed, the second failed. Both
+        # states have to pass or the rollout can never be finished.
+        ok, _ = deploy_firecracker.host_state(self.B, self.A, self.A, self.B)
+        self.assertTrue(ok)
+
+    def test_an_updated_host_that_lost_its_backup_is_refused(self):
+        ok, why = deploy_firecracker.host_state(self.B, None, self.A, self.B)
+        self.assertFalse(ok)
+        self.assertIn("missing", why)
+
+    def test_an_updated_host_with_a_wrong_backup_is_refused(self):
+        ok, why = deploy_firecracker.host_state(self.B, self.C, self.A, self.B)
+        self.assertFalse(ok)
+        self.assertIn("wrong", why)
+
+    def test_an_unknown_binary_is_refused(self):
+        ok, why = deploy_firecracker.host_state(self.C, self.A, self.A, self.B)
+        self.assertFalse(ok)
+        self.assertIn("neither", why)
+
+
 class ExpectedDigestTest(unittest.TestCase):
     def test_a_malformed_expected_digest_is_refused(self):
         # A pinned rollback digest that is not a digest would otherwise be
