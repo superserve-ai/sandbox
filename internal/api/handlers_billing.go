@@ -161,6 +161,17 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 
 	now := time.Now().UTC()
 	periodStart, periodEnd := billing.CurrentBillingPeriod(now)
+	account, accountErr := h.DB.GetTeamBillingAccount(c.Request.Context(), teamID)
+	if accountErr != nil && !errors.Is(accountErr, pgx.ErrNoRows) {
+		log.Error().Err(accountErr).Str("team_id", teamID.String()).Msg("load billing account failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if accountErr == nil && account.CommercialBillingAnchor.Valid {
+		if start, end, anchored := billing.AnniversaryPeriod(account.CommercialBillingAnchor.Time, now); anchored {
+			periodStart, periodEnd = start, end
+		}
+	}
 	period, err := h.DB.GetActiveTeamBillingPeriod(c.Request.Context(), teamID)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -168,7 +179,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
-	} else {
+	} else if !(accountErr == nil && account.CommercialBillingAnchor.Valid) {
 		periodStart = period.PeriodStart
 		periodEnd = period.PeriodEnd
 	}
@@ -177,7 +188,6 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		usage         db.GetTeamBillingUsageRow
 		pricingRows   []db.ListActivePricingRatesForTeamCurrentRow
 		creditBalance pgtype.Numeric
-		account       db.GetTeamBillingAccountRow
 	)
 	g, ctx := errgroup.WithContext(c.Request.Context())
 	g.Go(func() error {
@@ -214,13 +224,6 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	})
 	if err := g.Wait(); err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing summary dependency fetch failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
-	account, err = h.DB.GetTeamBillingAccount(c.Request.Context(), teamID)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("load billing account failed")
 		respondError(c, ErrInternal)
 		return
 	}

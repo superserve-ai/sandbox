@@ -750,6 +750,11 @@ type TeamBillingAccount struct {
 	TrialEndedAt                    pgtype.Timestamptz `json:"trial_ended_at"`
 	StripeActivationCreditGrantedAt pgtype.Timestamptz `json:"stripe_activation_credit_granted_at"`
 	StripeActivationCreditGrantID   *string            `json:"stripe_activation_credit_grant_id"`
+	// Authoritative Superserve commercial billing start. May predate Stripe subscription creation and must not be overwritten by Checkout time.
+	CommercialBillingAnchor pgtype.Timestamptz `json:"commercial_billing_anchor"`
+	CheckoutInitializingAt  pgtype.Timestamptz `json:"checkout_initializing_at"`
+	CheckoutAnchorSnapshot  pgtype.Timestamptz `json:"checkout_anchor_snapshot"`
+	CheckoutSessionID       *string            `json:"checkout_session_id"`
 }
 
 type TeamBillingPeriod struct {

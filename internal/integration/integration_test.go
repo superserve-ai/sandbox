@@ -1847,6 +1847,179 @@ func TestIntegration_GetBillingSummaryUsesActiveBillingPeriod(t *testing.T) {
 	}
 }
 
+func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+	reportingStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	reportingEnd := reportingStart.AddDate(0, 1, 0)
+	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	}); err != nil {
+		t.Fatalf("claim commercial billing anchor: %v", err)
+	}
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: reportingStart,
+		PeriodEnd:   reportingEnd,
+		Status:      "open",
+	}); err != nil {
+		t.Fatalf("upsert reporting billing period: %v", err)
+	}
+
+	w := do(r, "GET", "/billing/summary", ownerKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("billing summary with commercial anchor: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	body := mustJSON(t, w)
+	period, ok := body["billing_period"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("billing_period not an object: %v", body["billing_period"])
+	}
+	gotStart, err := time.Parse(time.RFC3339, period["start"].(string))
+	if err != nil {
+		t.Fatalf("parse billing period start: %v", err)
+	}
+	if !gotStart.Equal(anchor) {
+		t.Fatalf("billing summary period start = %s, want %s", gotStart, anchor)
+	}
+	gotEnd, err := time.Parse(time.RFC3339, period["end"].(string))
+	if err != nil {
+		t.Fatalf("parse billing period end: %v", err)
+	}
+	if !gotEnd.Equal(anchor.AddDate(0, 1, 0)) {
+		t.Fatalf("billing summary period end = %s, want %s", gotEnd, anchor.AddDate(0, 1, 0))
+	}
+}
+
+func TestIntegration_ClaimTeamCommercialBillingAnchorIsIdempotentAndConflictSafe(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _ := seedTeamAndKeyWithRole(t, "viewer")
+	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+
+	got, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	})
+	if err != nil {
+		t.Fatalf("first commercial billing anchor claim: %v", err)
+	}
+	if !got.Equal(anchor) {
+		t.Fatalf("first commercial billing anchor claim = %s, want %s", got, anchor)
+	}
+
+	retry, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	})
+	if err != nil {
+		t.Fatalf("idempotent commercial billing anchor claim: %v", err)
+	}
+	if !retry.Equal(anchor) {
+		t.Fatalf("idempotent commercial billing anchor claim = %s, want %s", retry, anchor)
+	}
+
+	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor.Add(time.Hour),
+	}); err == nil {
+		t.Fatal("conflicting commercial billing anchor claim succeeded, want failure")
+	}
+
+	account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load team billing account: %v", err)
+	}
+	if !account.CommercialBillingAnchor.Valid {
+		t.Fatal("commercial billing anchor was not persisted")
+	}
+	if !account.CommercialBillingAnchor.Time.Equal(anchor) {
+		t.Fatalf("commercial billing anchor = %s, want %s", account.CommercialBillingAnchor.Time, anchor)
+	}
+}
+
+func TestIntegration_ClaimTeamCommercialBillingAnchorPreservesLegacyPeriod(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _ := seedTeamAndKeyWithRole(t, "viewer")
+	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+	legacyStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	legacyEnd := legacyStart.AddDate(0, 1, 0)
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: legacyStart,
+		PeriodEnd:   legacyEnd,
+		Status:      "open",
+	}); err != nil {
+		t.Fatalf("seed legacy billing period: %v", err)
+	}
+
+	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	}); err != nil {
+		t.Fatalf("claim commercial billing anchor: %v", err)
+	}
+
+	var status string
+	var finalizedAt *time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT status, finalized_at
+		FROM team_billing_period
+		WHERE team_id = $1 AND period_start = $2 AND period_end = $3
+	`, teamID, legacyStart, legacyEnd).Scan(&status, &finalizedAt); err != nil {
+		t.Fatalf("load reconciled legacy billing period: %v", err)
+	}
+	if status != "open" || finalizedAt != nil {
+		t.Fatalf("legacy billing period status/finalized_at = %q/%v, want open/null", status, finalizedAt)
+	}
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: anchor,
+		PeriodEnd:   anchor.AddDate(0, 1, 0),
+		Status:      "open",
+	}); err == nil {
+		t.Fatal("overlapping anniversary billing period insert succeeded, want failure")
+	}
+}
+
+func TestIntegration_UpsertTeamBillingPeriodRejectsOverlap(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _ := seedTeamAndKeyWithRole(t, "viewer")
+	firstStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	firstEnd := firstStart.AddDate(0, 1, 0)
+	secondStart := firstStart.Add(20 * 24 * time.Hour)
+	secondEnd := secondStart.AddDate(0, 1, 0)
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: firstStart,
+		PeriodEnd:   firstEnd,
+		Status:      "open",
+	}); err != nil {
+		t.Fatalf("seed first billing period: %v", err)
+	}
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: secondStart,
+		PeriodEnd:   secondEnd,
+		Status:      "open",
+	}); err == nil {
+		t.Fatal("overlapping billing period insert succeeded, want failure")
+	} else {
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23P01" {
+			t.Fatalf("overlapping billing period error = %v, want PostgreSQL 23P01", err)
+		}
+	}
+}
+
 func TestIntegration_GetBillingSummaryDeniesUserAdmin(t *testing.T) {
 	_, apiKey, _ := seedTeamAndKeyWithRole(t, "user_admin")
 	r := newRouter(t)

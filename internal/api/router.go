@@ -149,6 +149,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/billing", h.ListPlatformBilling)
 		internal.GET("/teams/:team_id/billing/usage", h.GetPlatformTeamBillingUsage)
 		internal.GET("/teams/:team_id/billing/periods", h.ListPlatformTeamBillingPeriods)
+		internal.POST("/billing/cutover", h.EstablishBillingCutover)
+		internal.POST("/teams/:team_id/billing/anchor", h.EstablishCommercialBillingAnchor)
 		internal.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetPlatformTeamBillingExportPreview)
 		internal.POST("/teams/:team_id/billing/periods/:period_id/approve", h.ApproveTeamBillingPeriod)
 		internal.POST("/teams/:team_id/billing/periods/:period_id/export", h.ExportTeamBillingPeriod)

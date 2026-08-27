@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -82,6 +83,30 @@ func (r *stripeMeterEventRoundTripper) RoundTrip(req *http.Request) (*http.Respo
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(strings.NewReader("{}")),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+type stripeCheckoutSessionRoundTripper struct {
+	backdateStartDate string
+	clientReferenceID string
+}
+
+func (r *stripeCheckoutSessionRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	form, err := url.ParseQuery(string(body))
+	if err != nil {
+		return nil, err
+	}
+	r.backdateStartDate = form.Get("subscription_data[backdate_start_date]")
+	r.clientReferenceID = form.Get("client_reference_id")
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`{"id":"cs_test_123","url":"https://checkout.stripe.test/session"}`)),
 		Header:     make(http.Header),
 		Request:    req,
 	}, nil
@@ -172,6 +197,88 @@ func TestStripeReportMeterEventUsesSeparateIdentifierAndIdempotencyKey(t *testin
 	}
 	if transport.identifier == transport.idempotencyKey {
 		t.Fatal("logical identifier and HTTP idempotency key must be distinct")
+	}
+}
+
+func TestStripeCreateCheckoutSessionSendsBackdateStartDate(t *testing.T) {
+	transport := &stripeCheckoutSessionRoundTripper{}
+	client := &stripeHTTPClient{
+		baseURL:    "https://stripe.example.test",
+		secretKey:  "sk_test_example",
+		apiVersion: "2025-06-30",
+		httpClient: &http.Client{Transport: transport},
+	}
+	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+	if _, err := client.CreateCheckoutSession(t.Context(), StripeCreateCheckoutSessionParams{
+		CustomerID:        "cus_example",
+		SuccessURL:        "https://app.superserve.test/billing/success",
+		CancelURL:         "https://app.superserve.test/billing/cancel",
+		ClientReferenceID: "team_example",
+		PriceIDs:          []string{"price_cpu"},
+		BackdateStartDate: &anchor,
+		IdempotencyKey:    "checkout:test",
+	}); err != nil {
+		t.Fatalf("create checkout session: %v", err)
+	}
+	if transport.backdateStartDate != strconv.FormatInt(anchor.Unix(), 10) {
+		t.Fatalf("subscription backdate_start_date = %q, want %d", transport.backdateStartDate, anchor.Unix())
+	}
+	if transport.clientReferenceID != "team_example" {
+		t.Fatalf("client reference id = %q, want %q", transport.clientReferenceID, "team_example")
+	}
+}
+
+func TestCheckoutSessionIdempotencyKeyIncludesBackdateStartDate(t *testing.T) {
+	teamID := uuid.MustParse("00000000-0000-0000-0000-000000000042")
+	customerID := "cus_example"
+	successURL := "https://app.superserve.test/billing/success"
+	cancelURL := "https://app.superserve.test/billing/cancel"
+	priceIDs := []string{"price_cpu"}
+	first := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs, nil)
+	if got := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs, nil); got != first {
+		t.Fatalf("same checkout payload produced %q, want %q", got, first)
+	}
+	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+	withAnchor := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs, &anchor)
+	if withAnchor == first {
+		t.Fatal("checkout idempotency key ignored backdate start date")
+	}
+	if got := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs, &anchor); got != withAnchor {
+		t.Fatalf("same checkout payload with backdate produced %q, want %q", got, withAnchor)
+	}
+}
+
+func TestStripeSubscriptionPeriodBoundsPrefersItemBounds(t *testing.T) {
+	obj := stripeSubscriptionObject{
+		CurrentPeriodStart: 100,
+		CurrentPeriodEnd:   200,
+		Items: stripeSubscriptionObjectItems{
+			Data: []stripeSubscriptionItem{{
+				CurrentPeriodStart: 300,
+				CurrentPeriodEnd:   400,
+			}},
+		},
+	}
+	start, end, ok := stripeSubscriptionPeriodBounds(obj)
+	if !ok {
+		t.Fatal("expected item-level subscription period bounds")
+	}
+	if start != 300 || end != 400 {
+		t.Fatalf("subscription period bounds = (%d, %d), want (300, 400)", start, end)
+	}
+}
+
+func TestStripeSubscriptionPeriodBoundsFallsBackToTopLevel(t *testing.T) {
+	obj := stripeSubscriptionObject{
+		CurrentPeriodStart: 100,
+		CurrentPeriodEnd:   200,
+	}
+	start, end, ok := stripeSubscriptionPeriodBounds(obj)
+	if !ok {
+		t.Fatal("expected top-level subscription period bounds")
+	}
+	if start != 100 || end != 200 {
+		t.Fatalf("subscription period bounds = (%d, %d), want (100, 200)", start, end)
 	}
 }
 

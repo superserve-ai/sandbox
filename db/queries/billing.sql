@@ -426,11 +426,29 @@ FOR UPDATE;
 
 -- name: UpsertTeamBillingPeriod :one
 INSERT INTO team_billing_period (team_id, period_start, period_end, status)
-VALUES (
+SELECT
     sqlc.arg(team_id),
     sqlc.arg(period_start),
     sqlc.arg(period_end),
     sqlc.arg(status)
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM team_billing_period billed
+    WHERE billed.team_id = sqlc.arg(team_id)
+      AND (billed.period_start, billed.period_end) <>
+          (sqlc.arg(period_start), sqlc.arg(period_end))
+      AND (
+          billed.status = 'exported'
+          OR billed.exported_at IS NOT NULL
+          OR (
+              billed.finalized_at IS NOT NULL
+              AND (billed.blocked_reason IS NULL OR billed.blocked_reason NOT IN (
+                  'reporting_only_calendar_period', 'discarded_before_billing_cutover'
+              ))
+          )
+      )
+      AND tstzrange(billed.period_start, billed.period_end, '[)') &&
+          tstzrange(sqlc.arg(period_start), sqlc.arg(period_end), '[)')
 )
 ON CONFLICT (team_id, period_start, period_end) DO UPDATE
 SET status = CASE
@@ -582,12 +600,12 @@ WHERE billing_period_anomaly.id = sqlc.arg(id)
 RETURNING *;
 
 -- name: GetTeamBillingAccount :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, commercial_billing_anchor, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, checkout_initializing_at, checkout_session_id
 FROM team_billing_account
 WHERE team_id = sqlc.arg(team_id);
 
 -- name: GetTeamBillingAccountByStripeCustomerID :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, commercial_billing_anchor, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, checkout_initializing_at, checkout_session_id
 FROM team_billing_account
 WHERE stripe_customer_id = sqlc.arg(stripe_customer_id);
 
@@ -599,6 +617,55 @@ SET stripe_customer_id = EXCLUDED.stripe_customer_id,
     updated_at = now()
 RETURNING *;
 
+-- name: ClaimTeamCommercialBillingAnchor :one
+SELECT claim_team_commercial_billing_anchor(sqlc.arg(team_id), sqlc.arg(anchor))::timestamptz AS commercial_billing_anchor;
+
+-- name: BeginTeamBillingCheckout :one
+UPDATE team_billing_account
+SET checkout_initializing_at = now(),
+    checkout_anchor_snapshot = commercial_billing_anchor,
+    checkout_session_id = NULL,
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+  AND (checkout_initializing_at IS NULL OR checkout_initializing_at < now() - interval '32 minutes')
+RETURNING *;
+
+-- name: FinishTeamBillingCheckout :exec
+UPDATE team_billing_account
+SET checkout_initializing_at = NULL,
+    checkout_anchor_snapshot = NULL,
+    checkout_session_id = NULL,
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id);
+
+-- name: FinishTeamBillingCheckoutIfStartedBefore :exec
+UPDATE team_billing_account
+SET checkout_initializing_at = NULL,
+    checkout_anchor_snapshot = NULL,
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+  AND checkout_initializing_at <= sqlc.arg(event_at)
+  AND checkout_session_id = sqlc.arg(session_id);
+
+-- name: SetTeamBillingCheckoutSession :exec
+UPDATE team_billing_account
+SET checkout_session_id = sqlc.arg(session_id), updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+  AND checkout_initializing_at IS NOT NULL;
+
+-- name: FinishTeamBillingCheckoutForSubscription :exec
+UPDATE team_billing_account
+SET checkout_initializing_at = NULL,
+    checkout_anchor_snapshot = NULL,
+    checkout_session_id = NULL,
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+  AND stripe_subscription_id = sqlc.arg(subscription_id)
+  AND checkout_initializing_at IS NOT NULL;
+
+-- name: EstablishBillingCutover :one
+SELECT establish_billing_cutover(sqlc.arg(cutover), sqlc.arg(preserved_team_ids)::uuid[])::int AS team_count;
+
 -- name: UpsertTeamBillingAccountSubscription :one
 INSERT INTO team_billing_account (
     team_id,
@@ -609,6 +676,7 @@ INSERT INTO team_billing_account (
     stripe_subscription_event_at,
     current_period_start,
     current_period_end,
+    commercial_billing_anchor,
     cancel_at_period_end
 )
 VALUES (
@@ -620,6 +688,7 @@ VALUES (
     sqlc.narg(stripe_subscription_event_at),
     sqlc.narg(current_period_start),
     sqlc.narg(current_period_end),
+    COALESCE(sqlc.narg(commercial_billing_anchor)::timestamptz, sqlc.narg(current_period_start)::timestamptz),
     COALESCE(sqlc.narg(cancel_at_period_end), false)
 )
 ON CONFLICT (team_id) DO UPDATE
@@ -630,6 +699,7 @@ SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_acco
     stripe_subscription_event_at = COALESCE(EXCLUDED.stripe_subscription_event_at, team_billing_account.stripe_subscription_event_at),
     current_period_start = COALESCE(EXCLUDED.current_period_start, team_billing_account.current_period_start),
     current_period_end = COALESCE(EXCLUDED.current_period_end, team_billing_account.current_period_end),
+    commercial_billing_anchor = COALESCE(team_billing_account.commercial_billing_anchor, EXCLUDED.commercial_billing_anchor),
     cancel_at_period_end = COALESCE(sqlc.narg(cancel_at_period_end), team_billing_account.cancel_at_period_end),
     updated_at = now()
 RETURNING *;
