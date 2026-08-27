@@ -1855,7 +1855,9 @@ type SlotPressureStats struct {
 // adoption on, potentially hundreds of adoption candidates that hold
 // real namespaces long before any refill worker touches them. The
 // refillActive floor covers workers that have not claimed an index yet.
-// One O(owned) walk of the map, at heartbeat cadence only.
+// Reads counters maintained at ownership transitions, never a walk: two
+// integer loads under the slot mutex, so the beat cannot hold the lock
+// that slot claims and network setup need.
 func (m *Manager) SlotPressure() SlotPressureStats {
 	st := SlotPressureStats{Ceiling: MaxSlots}
 	m.mu.Lock()

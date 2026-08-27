@@ -3954,10 +3954,11 @@ func TestCreateSandbox_InsertCarriesTemplateShape(t *testing.T) {
 }
 
 // Create must DECLARE the sandbox's allocation to vmd. Without it the
-// daemon cannot size the VM from the request and has to ask Firecracker
-// afterwards — one extra durable write per create, landing on the same
-// serialized writer the restore itself waits on. The declaration is what
-// keeps that work off the create path entirely.
+// daemon cannot size the VM from the request and falls back to asking
+// Firecracker afterwards — a socket probe and a goroutine per create,
+// with the VM counted as unsized until that lands. The declaration
+// keeps the normal path free of all of it; the fallback exists for the
+// hosts and rollout windows that have no declaration to use.
 func TestCreateSandboxDeclaresResourceLimitsToVMD(t *testing.T) {
 	teamID := uuid.New()
 	sandboxID := uuid.New()

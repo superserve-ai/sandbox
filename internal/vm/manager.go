@@ -3537,11 +3537,13 @@ func (m *Manager) instanceIsCurrent(inst *VMInstance) bool {
 // zero reads as free capacity — a host full of such VMs would publish
 // as idle. Firecracker knows the real shape, so ask it.
 //
-// Deliberately NOT on the restore path. Probing every restore would add
-// a unix-socket round trip and, worse, one more durable write per
-// create onto Bolt's single writer — the same writer the restore itself
-// waits on, so under bursts those extra writes surface as create tail
-// latency. Startup-only recovery has no such caller to slow down.
+// Called from restore and from reattach, but it costs nothing in the
+// normal case: callers declare the allocation, so the size is already
+// known and this returns before starting anything. What remains is the
+// two cases that have no declaration — records written before the
+// contract existed, and restores from a control plane that predates it
+// (the mixed-version window during a rollout). Both are gated on
+// publication: a host doing no capacity accounting never runs this.
 //
 // The published numbers are a beat late at worst — the sample runs
 // every 30 seconds and a missed one under-reports a single VM until the
@@ -3551,9 +3553,9 @@ func (m *Manager) instanceIsCurrent(inst *VMInstance) bool {
 // because a single transient socket error would otherwise leave a live
 // VM advertising its memory as free for the rest of its life. Every
 // step re-checks instance identity (see instanceIsCurrent) so a
-// destroyed or replaced VM ends the work at once, and the durable write
-// is conditional so it can never recreate a record a concurrent destroy
-// removed, nor overwrite a successor that reused the id.
+// destroyed or replaced VM ends the work at once, the worker slot is
+// held for the probe alone so unreachable VMs cannot starve recoverable
+// ones, and nothing is written durably (see applyMachineConfig).
 func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
 	if inst == nil {
 		return

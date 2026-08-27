@@ -525,11 +525,10 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 		PreviewPolicyRevision: previewPolicyRevision,
 		EnvVars:               envVars,
 		// Declared so the daemon can size this VM without asking
-		// Firecracker after the fact — that probe would land one extra
-		// durable write per restore on the same serialized writer the
-		// restore itself waits on, which shows up as create tail
-		// latency under bursts. Omitted (zero) only by callers that do
-		// not know the shape.
+		// Firecracker after the fact: undeclared, every restore costs a
+		// socket probe and a goroutine on the host, and the VM is
+		// counted as unsized until that lands. Omitted (zero) only by
+		// callers that do not know the shape.
 		ResourceLimits: restoreResourceLimits(limits),
 	})
 	if err != nil {
