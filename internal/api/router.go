@@ -116,6 +116,17 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	{
 		operator.GET("/hosts", h.HostList)
 		operator.POST("/hosts/:host_id/status", h.HostUpdateStatus)
+		// Abuse controls require the operator credential; the host-shared
+		// internal token must not be sufficient to grant or remove trust.
+		operator.GET("/abuse/teams/:team_id/trust", h.GetPlatformAbuseTeamTrust)
+		operator.PUT("/abuse/teams/:team_id/trust", h.SetPlatformAbuseTeamTrust)
+		operator.GET("/abuse/restrictions", h.ListPlatformAbuseRestrictions)
+		operator.POST("/abuse/restrictions", h.CreatePlatformAbuseRestriction)
+		operator.POST("/abuse/restrictions/:restriction_id/release", h.ReleasePlatformAbuseRestriction)
+		operator.POST("/abuse/refresh", h.RecordPlatformAbuseRefresh)
+		operator.GET("/abuse/trusted-identities", h.ListPlatformAbuseTrustedIdentities)
+		operator.POST("/abuse/trusted-identities", h.AddPlatformAbuseTrustedIdentity)
+		operator.POST("/abuse/trusted-identities/:identity_id/revoke", h.RevokePlatformAbuseTrustedIdentity)
 	}
 
 	// Internal endpoints — authenticated via a shared token (not per-team
