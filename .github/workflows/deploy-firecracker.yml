@@ -28,6 +28,13 @@ on:
           - staging
           - production
 
+# One rollout at a time, and never cancelled: two overlapping dispatches for
+# different versions could interleave their per-host loops and leave a cell on
+# mixed digests, with both runs reporting success.
+concurrency:
+  group: deploy-firecracker
+  cancel-in-progress: false
+
 permissions:
   contents: read
   id-token: write
@@ -47,15 +54,19 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Install ${{ inputs.version }}
+      # The dispatch input reaches the script through the environment, never
+      # through the run body: `${{ }}` is substituted before bash parses the
+      # script, so an interpolated tag could close the quoting and run
+      # arbitrary commands on a job that has already authenticated to GCP.
+      - name: Install
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 .github/workflows/scripts/deploy-firecracker.py \
-            --version '${{ inputs.version }}'
+          python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION"
 
   deploy-production:
     name: Production
@@ -73,12 +84,32 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Install ${{ inputs.version }}
+      # Production is two cells, and each is discovered by its own region: a
+      # single run scoped to one region would filter the other cell out
+      # entirely and still report success, leaving it on the old binary.
+      # Both are steps in this job rather than separate jobs, because a second
+      # job referencing the production environment would double any approval
+      # gate.
+      #
+      # use4 is the primary and is unguarded: a missing GCP_REGION_USE4 must
+      # fail the deploy rather than silently skip the primary cell.
+      - name: Install on the use4 cell
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 .github/workflows/scripts/deploy-firecracker.py \
-            --version '${{ inputs.version }}'
+          python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION"
+
+      - name: Install on the usw cell
+        if: vars.GCP_REGION_USW != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USW }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION"

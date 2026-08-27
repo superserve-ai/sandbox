@@ -144,8 +144,18 @@ fi
 # run, or it overwrites the very binary the backup was meant to preserve.
 # `cp -n` rather than `--update=none`, which needs coreutils >= 9.3 and so
 # fails outright on the older hosts.
+#
+# The install itself writes a temporary file alongside the live one and
+# renames it into place. Writing to the live pathname directly would expose a
+# window where a launching sandbox execs a half-written binary, and would fail
+# outright with ETXTBSY while any sandbox is running from it. A rename within
+# the same directory is atomic: processes already running keep the old inode,
+# and every exec after it sees a complete binary.
+incoming="$live.incoming"
+sudo rm -f "$incoming"
 sudo cp -n "$live" "$backup" \\
-  && sudo install -m 0755 "$staged" "$live"
+  && sudo install -m 0755 "$staged" "$incoming" \\
+  && sudo mv -f "$incoming" "$live"
 
 # Prove the swap landed, and that what landed still runs here.
 installed=$(sha256sum < "$live" | cut -d' ' -f1)

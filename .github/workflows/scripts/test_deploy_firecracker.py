@@ -34,6 +34,26 @@ class InstallScriptSafetyTest(unittest.TestCase):
             "backup must be &&-chained to the install",
         )
 
+    def test_replaces_the_live_binary_by_rename(self):
+        # Writing to the live pathname directly exposes a window where a
+        # launching sandbox execs a half-written binary, and fails with
+        # ETXTBSY while any sandbox is running from it.
+        self.assertRegex(
+            self.commands,
+            r'install -m 0755 "\$staged" "\$incoming"',
+            "install must write a temporary file, not the live path",
+        )
+        self.assertRegex(
+            self.commands,
+            r'mv -f "\$incoming" "\$live"',
+            "the temporary file must be renamed over the live path",
+        )
+        self.assertNotRegex(
+            self.commands,
+            r'install -m 0755 "\$staged" "\$live"',
+            "must never install straight onto the live path",
+        )
+
     def test_backup_does_not_use_update_none(self):
         # `--update=none` needs coreutils >= 9.3 and fails on the older hosts.
         self.assertNotIn("--update=none", self.commands)
