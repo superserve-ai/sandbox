@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,6 +94,25 @@ type CapacityRanker struct {
 
 	mu    sync.RWMutex
 	cache map[string]rankerCacheEntry
+	// gen advances whenever the candidate set is refreshed, and keys the
+	// memo below so a stale ranking can never outlive the rows it was
+	// computed from.
+	gen  uint64
+	memo map[rankMemoKey]rankMemoEntry
+}
+
+// rankMemoKey identifies a ranking that would produce the same answer:
+// the same candidate set, the same capability filter, the same shape.
+type rankMemoKey struct {
+	capabilities string
+	memoryMib    int32
+	vcpus        int32
+	allowedHosts string
+}
+
+type rankMemoEntry struct {
+	gen    uint64
+	result RankResult
 }
 
 const defaultRankerCacheTTL = 30 * time.Second
@@ -114,6 +134,8 @@ func (r *CapacityRanker) ttl() time.Duration {
 func (r *CapacityRanker) Invalidate() {
 	r.mu.Lock()
 	r.cache = nil
+	r.gen++
+	r.memo = nil
 	r.mu.Unlock()
 }
 
@@ -124,6 +146,28 @@ func (r *CapacityRanker) Rank(ctx context.Context, req RankRequest) (RankResult,
 	rows, err := r.candidates(ctx, req.RequiredCapabilities)
 	if err != nil {
 		return RankResult{}, err
+	}
+
+	// Ranking is O(fleet) in both time and allocation, and creates
+	// repeat a handful of shapes — the default size, one per template —
+	// against a candidate set that only changes when it is refreshed. So
+	// memoize per (candidate generation, shape): a fleet-sized pass runs
+	// once per refresh per distinct shape, not once per sample. Without
+	// this a large fleet turns a steady sample rate into steady GC
+	// pressure for a measurement nothing depends on.
+	capKey, _ := capabilityCacheKey(req.RequiredCapabilities)
+	memoKey := rankMemoKey{
+		capabilities: capKey,
+		memoryMib:    req.MemoryMib,
+		vcpus:        req.Vcpus,
+		allowedHosts: strings.Join(req.AllowedHosts, "\x00"),
+	}
+	r.mu.RLock()
+	entry, hit := r.memo[memoKey]
+	gen := r.gen
+	r.mu.RUnlock()
+	if hit && entry.gen == gen {
+		return entry.result, nil
 	}
 	if len(req.AllowedHosts) > 0 {
 		allowed := make(map[string]bool, len(req.AllowedHosts))
@@ -139,18 +183,26 @@ func (r *CapacityRanker) Rank(ctx context.Context, req RankRequest) (RankResult,
 		rows = filtered
 	}
 
+	// Composition describes the FLEET, so all four counts are taken over
+	// the same population: every capability-matching host, before any
+	// viability or region filtering. Counting described hosts after those
+	// filters while counting legacy and stale before them would make the
+	// gauges incomparable — a low described count would mean "wrong
+	// region" as readily as "not publishing", which is the opposite of
+	// what a readiness signal is for.
 	var result RankResult
 	var eligible []db.ListCapacityCandidatesRow
 	for _, row := range rows {
 		switch {
 		case !row.PressureCapable:
-			// A host that never publishes cannot be compared on
-			// pressure at all; counted so the shadow can report how
-			// much of the fleet is still invisible to ranking.
 			result.Legacy++
 		case !row.ReportedAt.Valid || time.Since(row.ReportedAt.Time) >= PressureFreshnessSecs*time.Second:
 			result.Stale++
+		case row.UnknownAllocationVms > 0:
+			result.UnderDescribed++
+			eligible = append(eligible, row)
 		default:
+			result.Described++
 			eligible = append(eligible, row)
 		}
 	}
@@ -175,7 +227,6 @@ func (r *CapacityRanker) Rank(ctx context.Context, req RankRequest) (RankResult,
 	// carries unsized VMs until its pre-declaration sandboxes cycle out,
 	// so excluding them would empty the set on day one.
 	described, underDescribed := splitByDescription(eligible)
-	result.Described, result.UnderDescribed = len(described), len(underDescribed)
 
 	order, band := rankCandidates(described, req)
 	underOrder, underBand := rankCandidates(underDescribed, req)
@@ -195,6 +246,15 @@ func (r *CapacityRanker) Rank(ctx context.Context, req RankRequest) (RankResult,
 	for _, row := range band {
 		result.TopBand = append(result.TopBand, row.ID)
 	}
+
+	r.mu.Lock()
+	if r.gen == gen { // a refresh mid-rank invalidates this answer
+		if r.memo == nil {
+			r.memo = make(map[rankMemoKey]rankMemoEntry)
+		}
+		r.memo[memoKey] = rankMemoEntry{gen: gen, result: result}
+	}
+	r.mu.Unlock()
 	return result, nil
 }
 
@@ -219,6 +279,10 @@ func (r *CapacityRanker) candidates(ctx context.Context, required []string) ([]d
 		r.cache = make(map[string]rankerCacheEntry)
 	}
 	r.cache[key] = rankerCacheEntry{rows: rows, cachedAt: time.Now()}
+	// New rows, so every memoized ranking is now answering from stale
+	// data; bump the generation rather than walk the memo.
+	r.gen++
+	r.memo = nil
 	r.mu.Unlock()
 	return rows, nil
 }
@@ -302,11 +366,18 @@ func rankCandidates(eligible []db.ListCapacityCandidatesRow, req RankRequest) (o
 			out = append(out, c.row)
 		}
 	}
-	band = make([]db.ListCapacityCandidatesRow, 0, len(warmBand)+len(coldBand))
-	for _, group := range [][]scored{warmBand, coldBand} {
-		for _, c := range group {
-			band = append(band, c.row)
-		}
+	// The band is the set the ranker would actually draw from, which is
+	// NOT every host within the score tolerance: warm hosts are ordered
+	// ahead of cold ones, so while any warm host is available a cold one
+	// is never chosen. Including cold hosts here would report agreement
+	// for a placement the ranker would never have made.
+	drawn := warmBand
+	if len(drawn) == 0 {
+		drawn = coldBand
+	}
+	band = make([]db.ListCapacityCandidatesRow, 0, len(drawn))
+	for _, c := range drawn {
+		band = append(band, c.row)
 	}
 	return out, band
 }

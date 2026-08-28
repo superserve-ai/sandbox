@@ -654,3 +654,26 @@ func BenchmarkRecordLatencyPhase(b *testing.B) {
 		r.RecordLatencyPhase(ctx, p)
 	}
 }
+
+// The metric's accepted labels must match what the scheduler emits.
+// These drifted once — the evaluator moved to in_band/out_of_band while
+// the recorder still accepted same/different — and every meaningful
+// result was exported as "other", so the metric looked healthy while
+// measuring nothing. The constants live in different packages, so this
+// pins the contract from the recorder's side.
+func TestShadowLabelsAcceptWhatTheSchedulerEmits(t *testing.T) {
+	for _, v := range []string{"ranked", "no_candidates", "error"} {
+		if got := normalizeShadowResult(v); got != v {
+			t.Errorf("result %q normalized to %q; the emitter's value must survive", v, got)
+		}
+	}
+	for _, v := range []string{"in_band", "out_of_band", "unknown"} {
+		if got := normalizeShadowAgreement(v); got != v {
+			t.Errorf("agreement %q normalized to %q; the emitter's value must survive", v, got)
+		}
+	}
+	// Anything unrecognized is still collapsed, so cardinality stays bounded.
+	if got := normalizeShadowAgreement("something-new"); got != "other" {
+		t.Errorf("unknown agreement normalized to %q, want other", got)
+	}
+}

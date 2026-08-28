@@ -515,3 +515,96 @@ func TestRankerStillPrefersViableLocalHosts(t *testing.T) {
 		t.Fatalf("order = %v, want the local host", res.Order)
 	}
 }
+
+// The band must be what the ranker would actually draw from. Warm hosts
+// are ordered ahead of cold ones, so while a warm host is available a
+// cold one is never chosen — reporting a cold placement as agreement
+// would overstate how often ranking and live placement concur.
+func TestRankerBandExcludesColdHostsWhenWarmExist(t *testing.T) {
+	warm := candidate("warm")
+	warm.WarmNetSlots = 4
+	cold := candidate("cold")
+
+	r := &CapacityRanker{DB: db.New(&rankerMock{rows: []db.ListCapacityCandidatesRow{warm, cold}})}
+	res, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.TopBand) != 1 || res.TopBand[0] != "warm" {
+		t.Fatalf("band = %v, want only the warm host: a cold host is never drawn while warm ones exist", res.TopBand)
+	}
+	// Cold hosts remain rankable — they are simply behind.
+	if len(res.Order) != 2 {
+		t.Fatalf("order = %v, want both hosts present", res.Order)
+	}
+}
+
+// Fleet composition must partition ONE population: every
+// capability-matching host, before viability or region filtering.
+// Counting described hosts after those filters would make a low count
+// mean "wrong region" as readily as "not publishing".
+func TestRankerCompositionCoversTheWholeFleet(t *testing.T) {
+	local := candidate("local-full")
+	local.Region = "region-a"
+	local.MaxSandboxes = 10
+	local.RunningSandboxes = 10 // viable? no. described? yes.
+
+	remote := candidate("remote")
+	remote.Region = "region-b" // filtered out by region preference
+
+	unsized := candidate("unsized")
+	unsized.Region = "region-a"
+	unsized.UnknownAllocationVms = 1
+
+	r := &CapacityRanker{
+		DB:     db.New(&rankerMock{rows: []db.ListCapacityCandidatesRow{local, remote, unsized}}),
+		Region: "region-a",
+	}
+	res, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total := res.Described + res.UnderDescribed + res.Legacy + res.Stale; total != 3 {
+		t.Fatalf("composition covers %d hosts, want all 3: %+v", total, res)
+	}
+	if res.Described != 2 || res.UnderDescribed != 1 {
+		t.Fatalf("composition = %+v, want 2 described and 1 under-described regardless of filtering", res)
+	}
+}
+
+// Ranking is O(fleet); creates repeat a handful of shapes against a
+// candidate set that changes only on refresh. Memoizing per generation
+// keeps a steady sample rate from becoming steady CPU and GC pressure.
+func TestRankerMemoizesWithinACandidateGeneration(t *testing.T) {
+	rows := []db.ListCapacityCandidatesRow{candidate("a"), candidate("b")}
+	r := &CapacityRanker{DB: db.New(&rankerMock{rows: rows}), TTL: time.Minute}
+
+	first, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		got, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Order) != len(first.Order) || got.Order[0] != first.Order[0] {
+			t.Fatalf("memoized ranking changed: %v then %v", first.Order, got.Order)
+		}
+	}
+
+	// A different shape is a different question, so it ranks afresh.
+	other, err := r.Rank(context.Background(), RankRequest{MemoryMib: 32 * 1024, Vcpus: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other.Order) == 0 {
+		t.Fatal("a distinct request shape must still be ranked")
+	}
+
+	// Invalidation must not serve the old answer.
+	r.Invalidate()
+	if _, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1}); err != nil {
+		t.Fatalf("rank after invalidate: %v", err)
+	}
+}

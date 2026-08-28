@@ -320,6 +320,27 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 	}
 }
 
+// normalizeShadowResult and normalizeShadowAgreement keep metric labels
+// bounded. Extracted so the accepted values can be tested against the
+// emitter's: when these drifted apart, every meaningful agreement was
+// silently exported as "other" and the metric looked healthy while
+// measuring nothing.
+func normalizeShadowResult(v string) string {
+	switch v {
+	case "ranked", "no_candidates", "error":
+		return v
+	}
+	return "other"
+}
+
+func normalizeShadowAgreement(v string) string {
+	switch v {
+	case "in_band", "out_of_band", "unknown":
+		return v
+	}
+	return "other"
+}
+
 // RecordCapacityShadow emits the shadow evaluation. The host-composition
 // gauges are what tell an operator whether the fleet is ready for
 // enforcement: enabling admission while most hosts are legacy or stale
@@ -328,18 +349,7 @@ func (r *OTelRecorder) RecordCapacityShadow(ctx context.Context, c CapacityShado
 	if r == nil {
 		return
 	}
-	result := c.Result
-	switch result {
-	case "ranked", "no_candidates", "error":
-	default:
-		result = "other"
-	}
-	agreement := c.Agreement
-	switch agreement {
-	case "same", "different", "unknown":
-	default:
-		agreement = "other"
-	}
+	result, agreement := normalizeShadowResult(c.Result), normalizeShadowAgreement(c.Agreement)
 	r.capacityShadowDuration.Record(ctx, c.Duration.Seconds(), metric.WithAttributes(r.attrs(
 		attribute.String("result", result),
 		attribute.String("agreement", agreement),

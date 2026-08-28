@@ -155,7 +155,7 @@ type LatencyPhase struct {
 // a bounded enum owned by the scheduler.
 type CapacityShadow struct {
 	Result    string // ranked | no_candidates | error
-	Agreement string // same | different | unknown
+	Agreement string // in_band | out_of_band | unknown
 	// Fleet composition as the ranker saw it, for readiness tracking.
 	Described      int
 	UnderDescribed int
