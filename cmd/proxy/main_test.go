@@ -61,6 +61,29 @@ func TestProxyHealthAdvertisesPreviewTokensOnlyWithAuthSeed(t *testing.T) {
 	}
 }
 
+func TestProxyHealthReportsFilesEnabled(t *testing.T) {
+	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
+	for _, enabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "disabled", true: "enabled"}[enabled], func(t *testing.T) {
+			h := proxy.NewHandler([]string{"sandbox.test"}, nil, zerolog.Nop()).WithAuth(seed)
+			if enabled {
+				h.WithFiles()
+			}
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/health", nil)
+			req.Host = "127.0.0.1:5007"
+			newProxyMux(h).ServeHTTP(w, req)
+			var health proxyHealthResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &health); err != nil {
+				t.Fatalf("decode health response: %v", err)
+			}
+			if health.FilesEnabled != enabled {
+				t.Fatalf("files_enabled = %v, want %v", health.FilesEnabled, enabled)
+			}
+		})
+	}
+}
+
 func TestProxyDomains(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -7,6 +7,14 @@ import (
 	"context"
 )
 
+// ResourceLimits is a sandbox's declared allocation, passed to restore so
+// the daemon never has to discover it. Zero fields mean "not declared" —
+// accepted for compatibility, and the daemon recovers them itself.
+type ResourceLimits struct {
+	VCPU      uint32
+	MemoryMiB uint32
+}
+
 // PortPolicy is the control-plane representation of one published preview
 // port. Tokenized wire modes require a positive TokenVersion; raw private and
 // public policies leave TokenVersion at zero.
@@ -54,7 +62,14 @@ type Client interface {
 	// previewProtocol echoes the vmd's preview-policy attestation from the
 	// response; empty means the vmd predates preview publication and ignored
 	// the request's policy fields.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, err error)
+	//
+	// limits declares the sandbox's allocation. The caller knows it (the
+	// sandbox row, or the template it was built from) and a restore does
+	// NOT otherwise reveal it: the snapshot carries the sizes inside
+	// Firecracker, so a daemon told nothing has to ask Firecracker
+	// afterwards to describe its own host honestly. Declaring it here
+	// keeps that probe off the create path entirely.
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits ResourceLimits) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, err error)
 	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
 	// running sandbox's boxd. Idempotent.
 	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error

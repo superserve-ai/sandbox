@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -24,7 +25,11 @@ type LocalHTTPServer struct {
 	mgr    *Manager
 	log    zerolog.Logger
 	server *http.Server
+	ready  *atomic.Bool
 }
+
+// SetReadySignal records when the resolver has started serving requests.
+func (s *LocalHTTPServer) SetReadySignal(ready *atomic.Bool) { s.ready = ready }
 
 // NewLocalHTTPServer creates a LocalHTTPServer backed by the given Manager.
 func NewLocalHTTPServer(mgr *Manager, log zerolog.Logger) *LocalHTTPServer {
@@ -67,6 +72,10 @@ func (s *LocalHTTPServer) ListenAndServe(ctx context.Context, addr string) error
 // caller guarantees the listener is loopback-only.
 func (s *LocalHTTPServer) Serve(ctx context.Context, lis net.Listener) error {
 	s.log.Info().Str("addr", lis.Addr().String()).Msg("local HTTP server listening")
+	if s.ready != nil {
+		s.ready.Store(true)
+		defer s.ready.Store(false)
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
