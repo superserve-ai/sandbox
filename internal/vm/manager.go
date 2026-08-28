@@ -2,6 +2,7 @@ package vm
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
@@ -3536,17 +3537,33 @@ func (m *Manager) instanceIsCurrent(inst *VMInstance) bool {
 	return ok && cur == inst
 }
 
-// machineConfigRecoveryQueueDepth bounds the pending set. Overflow is
-// dropped rather than queued without limit: recovery is best-effort, and
-// the next restart re-discovers whatever was missed.
-const machineConfigRecoveryQueueDepth = 4096
-
 // recoveryItem is one VM awaiting an allocation probe, with the time its
-// next attempt becomes due.
+// next attempt becomes due and the backoff that produced it.
 type recoveryItem struct {
 	inst    *VMInstance
 	dueAt   time.Time
 	backoff time.Duration
+	index   int // heap position, maintained by container/heap
+}
+
+// recoveryHeap orders pending probes by due time, so the dispatcher
+// reaches the next one in O(log n) instead of scanning. A slice scan
+// that deleted from the middle held the recovery lock for O(n) per
+// dispatch — O(n²) to drain a restart's backlog — and that lock is also
+// taken by resume, so draining could delay a lifecycle operation.
+type recoveryHeap []*recoveryItem
+
+func (h recoveryHeap) Len() int           { return len(h) }
+func (h recoveryHeap) Less(i, j int) bool { return h[i].dueAt.Before(h[j].dueAt) }
+func (h recoveryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i]; h[i].index = i; h[j].index = j }
+func (h *recoveryHeap) Push(x any)        { it := x.(*recoveryItem); it.index = len(*h); *h = append(*h, it) }
+func (h *recoveryHeap) Pop() any {
+	old := *h
+	n := len(old)
+	it := old[n-1]
+	old[n-1] = nil
+	*h = old[:n-1]
+	return it
 }
 
 // machineConfigRecovery probes VMs whose allocation nobody declared, on
@@ -3559,13 +3576,22 @@ type recoveryItem struct {
 // Here the cost is constant: machineConfigRecoveryWorkers probing
 // goroutines plus one timer, whatever the fleet size.
 //
-// Retries never sleep on a worker. A failed probe goes back to the
-// pending set with a jittered due time and the worker takes the next
-// item, so a handful of permanently unreachable sockets cannot starve
-// the VMs that would answer.
+// Retries never sleep on a worker. A failed probe goes back to the heap
+// with a longer, jittered due time and the worker takes the next item,
+// so a handful of permanently unreachable sockets cannot starve the VMs
+// that would answer.
+//
+// tracked is what bounds the queue, rather than a depth limit that
+// would have to drop VMs: one entry per instance, so the pending set
+// cannot exceed the host's own VM count however many times recovery is
+// requested for the same VM. Dropping was the wrong shape — recovered
+// sizes are memory-only by design, so a restart re-queues exactly the
+// population that overflowed and would overflow again, leaving a host
+// permanently under-described.
 type machineConfigRecovery struct {
 	mu      sync.Mutex
-	pending []recoveryItem
+	pending recoveryHeap
+	tracked map[*VMInstance]struct{} // queued or in flight; dedupes re-requests
 	ready   chan recoveryItem
 	wake    chan struct{}
 	started bool
@@ -3594,19 +3620,21 @@ func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
 		m.recovery.started = true
 		m.recovery.ready = make(chan recoveryItem)
 		m.recovery.wake = make(chan struct{}, 1)
+		m.recovery.tracked = make(map[*VMInstance]struct{})
 		for i := 0; i < machineConfigRecoveryWorkers; i++ {
 			go m.recoveryWorker()
 		}
 		go m.recoveryDispatcher()
 	}
-	if len(m.recovery.pending) >= machineConfigRecoveryQueueDepth {
+	if _, dup := m.recovery.tracked[inst]; dup {
+		// Already queued or being probed — a resume of a VM reattach
+		// already picked up, say. One entry per instance is what keeps
+		// the pending set bounded by the fleet.
 		m.recovery.mu.Unlock()
-		m.log.Warn().Str("vm_id", inst.ID).
-			Msg("allocation recovery queue full; this VM stays uncounted until the next restart")
-		m.recoveryFinished(inst.ID)
 		return
 	}
-	m.recovery.pending = append(m.recovery.pending, recoveryItem{inst: inst, backoff: machineConfigProbeBackoff})
+	m.recovery.tracked[inst] = struct{}{}
+	heap.Push(&m.recovery.pending, &recoveryItem{inst: inst, backoff: machineConfigProbeBackoff})
 	m.recovery.mu.Unlock()
 	m.nudgeRecovery()
 }
@@ -3636,25 +3664,22 @@ func (m *Manager) nudgeRecovery() {
 func (m *Manager) recoveryDispatcher() {
 	defer sentrylog.Recover("machine-config-recovery-dispatcher")
 	for {
-		now := time.Now()
 		var next *recoveryItem
 		var sleep time.Duration
 		m.recovery.mu.Lock()
-		for i, item := range m.recovery.pending {
-			if !item.dueAt.After(now) {
-				due := item
-				next = &due
-				m.recovery.pending = append(m.recovery.pending[:i], m.recovery.pending[i+1:]...)
-				break
-			}
-			if d := item.dueAt.Sub(now); sleep == 0 || d < sleep {
-				sleep = d
+		if len(m.recovery.pending) > 0 {
+			if top := m.recovery.pending[0]; !top.dueAt.After(time.Now()) {
+				next = heap.Pop(&m.recovery.pending).(*recoveryItem)
+			} else {
+				sleep = time.Until(top.dueAt)
 			}
 		}
-		idle := len(m.recovery.pending) == 0
+		idle := len(m.recovery.pending) == 0 && next == nil
 		m.recovery.mu.Unlock()
 
 		if next != nil {
+			// tracked keeps this instance marked while in flight, so a
+			// concurrent request cannot queue a second copy.
 			m.recovery.ready <- *next
 			continue
 		}
@@ -3679,7 +3704,7 @@ func (m *Manager) recoveryWorker() {
 		if !m.recoveryEligible(inst) {
 			// Destroyed, replaced, paused, or a declared size landed
 			// while it waited — all of them end the work.
-			m.recoveryFinished(inst.ID)
+			m.recoveryFinished(inst)
 			continue
 		}
 		inst.mu.RLock()
@@ -3691,7 +3716,7 @@ func (m *Manager) recoveryWorker() {
 		cancel()
 		if err == nil && vcpu > 0 && memoryMiB > 0 {
 			m.applyMachineConfig(inst, vcpu, memoryMiB)
-			m.recoveryFinished(inst.ID)
+			m.recoveryFinished(inst)
 			continue
 		}
 		// Never invent a size on failure: an under-reported allocation
@@ -3717,7 +3742,7 @@ func (m *Manager) requeueRecovery(item recoveryItem, probeErr error) {
 	}
 	wait := jitterDuration(backoff)
 	m.recovery.mu.Lock()
-	m.recovery.pending = append(m.recovery.pending, recoveryItem{
+	heap.Push(&m.recovery.pending, &recoveryItem{
 		inst: item.inst, dueAt: time.Now().Add(wait), backoff: backoff,
 	})
 	m.recovery.mu.Unlock()
@@ -3726,9 +3751,14 @@ func (m *Manager) requeueRecovery(item recoveryItem, probeErr error) {
 	m.nudgeRecovery()
 }
 
-func (m *Manager) recoveryFinished(vmID string) {
+// recoveryFinished releases an instance's tracking slot so a later
+// request (a resume after it paused, say) can queue it again.
+func (m *Manager) recoveryFinished(inst *VMInstance) {
+	m.recovery.mu.Lock()
+	delete(m.recovery.tracked, inst)
+	m.recovery.mu.Unlock()
 	if machineConfigBackfillDone != nil {
-		machineConfigBackfillDone(vmID)
+		machineConfigBackfillDone(inst.ID)
 	}
 }
 

@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"container/heap"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1280,7 +1281,10 @@ func TestBackfillLeavesSizeUnknownWhenProbeFails(t *testing.T) {
 // races the detached work.
 func stubMachineConfigProbe(t *testing.T, probe func(context.Context, string) (uint32, uint32, error)) <-chan string {
 	t.Helper()
-	done := make(chan string, 4)
+	// Generously buffered: completions are signalled from the enqueue
+	// path as well as from workers, so a small buffer would let a test
+	// block itself rather than reach its assertion.
+	done := make(chan string, 4096)
 	prevProbe, prevDone, prevBackoff := machineConfigProbe, machineConfigBackfillDone, machineConfigProbeBackoff
 	machineConfigProbe = probe
 	machineConfigBackfillDone = func(vmID string) { done <- vmID }
@@ -1862,11 +1866,10 @@ func TestBackfillBackoffEscalatesAcrossFailures(t *testing.T) {
 	var seen []time.Duration
 	for i := 0; i < 8; i++ {
 		m.requeueRecovery(item, fmt.Errorf("connection refused"))
-		// Dispatch it: the item leaves pending, exactly as the real
-		// dispatcher does before a worker ever probes it.
+		// Dispatch it exactly as the real dispatcher does — pop it off
+		// the heap — so the retry state exists only in the item.
 		m.recovery.mu.Lock()
-		item = m.recovery.pending[len(m.recovery.pending)-1]
-		m.recovery.pending = nil
+		item = *heap.Pop(&m.recovery.pending).(*recoveryItem)
 		m.recovery.mu.Unlock()
 		seen = append(seen, item.backoff)
 	}
@@ -1881,5 +1884,98 @@ func TestBackfillBackoffEscalatesAcrossFailures(t *testing.T) {
 	}
 	if last := seen[len(seen)-1]; last != machineConfigProbeMaxBackoff {
 		t.Fatalf("backoff settled at %v, want the %v ceiling", last, machineConfigProbeMaxBackoff)
+	}
+}
+
+// One entry per instance, however many times recovery is requested.
+// Without dedupe a VM that reattach queued and a resume re-requested
+// would be probed twice concurrently, and the pending set could exceed
+// the fleet it is supposed to be bounded by.
+func TestBackfillDedupesRepeatedRequests(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	probes := 0
+	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		mu.Lock()
+		probes++
+		mu.Unlock()
+		<-release
+		return 2, 1024, nil
+	})
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	inst := &VMInstance{ID: "legacy", Status: StatusRunning, SocketPath: "/run/fc.sock"}
+	m.vms[inst.ID] = inst
+	m.indexVM(inst.ID, inst)
+
+	for i := 0; i < 25; i++ {
+		m.backfillMachineConfigAsync(inst)
+	}
+	m.recovery.mu.Lock()
+	queued := len(m.recovery.pending) + len(m.recovery.tracked)
+	m.recovery.mu.Unlock()
+	if queued > 2 { // one heap entry plus its tracking mark, at most
+		t.Fatalf("25 requests produced %d queue entries; one per instance is what bounds the set", queued)
+	}
+
+	close(release)
+	awaitBackfill(t, done)
+	mu.Lock()
+	defer mu.Unlock()
+	if probes != 1 {
+		t.Fatalf("probed %d times for one VM, want 1", probes)
+	}
+}
+
+// A VM must never be abandoned. The queue is bounded by deduplication
+// rather than a depth cap that drops entries: recovered sizes are
+// memory-only, so a dropped VM would be re-queued identically after a
+// restart and dropped again, leaving its host under-described forever.
+func TestBackfillQueuesEveryVMWithoutDropping(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	done := stubMachineConfigProbe(t, func(_ context.Context, socket string) (uint32, uint32, error) {
+		<-release
+		mu.Lock()
+		seen[socket] = true
+		mu.Unlock()
+		return 2, 1024, nil
+	})
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	const fleet = 600
+	insts := make([]*VMInstance, 0, fleet)
+	m.mu.Lock()
+	for i := 0; i < fleet; i++ {
+		inst := &VMInstance{ID: fmt.Sprintf("legacy-%d", i), Status: StatusRunning,
+			SocketPath: fmt.Sprintf("/run/fc-%d.sock", i)}
+		m.vms[inst.ID] = inst
+		m.indexVM(inst.ID, inst)
+		insts = append(insts, inst)
+	}
+	m.mu.Unlock()
+	for _, inst := range insts {
+		m.backfillMachineConfigAsync(inst)
+	}
+
+	m.recovery.mu.Lock()
+	tracked := len(m.recovery.tracked)
+	m.recovery.mu.Unlock()
+	if tracked != fleet {
+		t.Fatalf("tracked %d of %d VMs; the rest were dropped and would never be recovered", tracked, fleet)
+	}
+
+	close(release)
+	for i := 0; i < fleet; i++ {
+		awaitBackfill(t, done)
+	}
+	for _, inst := range insts {
+		inst.mu.RLock()
+		sized := inst.Config.MemoryMiB == 1024
+		inst.mu.RUnlock()
+		if !sized {
+			t.Fatalf("%s never recovered its allocation", inst.ID)
+		}
 	}
 }
