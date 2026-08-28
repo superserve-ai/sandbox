@@ -142,8 +142,11 @@ jobs:
         run: |
           python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION" --preflight-only
 
+      # Gated on whether the cell exists, not on the value that scopes it: a
+      # region left unset must abort in the script, not skip the cell and
+      # report success with it still on the old binary.
       - name: Preflight the usw cell
-        if: vars.GCP_REGION_USW != ''
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USW }}
@@ -168,7 +171,7 @@ jobs:
           python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION"
 
       - name: Install on the usw cell
-        if: vars.GCP_REGION_USW != ''
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USW }}
