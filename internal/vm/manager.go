@@ -2220,12 +2220,20 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 		return false, RestoreSnapshot(socketPath, snapshotPath, memPath, "")
 	}
 
-	// No prefetch access log: only template builds record one (next to the template
-	// snapshot), pause snapshots don't — so resume-side prefetch is future work.
+	// Resume prefetch: the pause snapshot has no access log, but the layered base is
+	// a template whose access.log sits next to it — reuse it. Key off basePath, not
+	// memPath (memPath here is the per-VM diff overlay, whose dir has no log).
+	accessLogPath := ""
+	if basePath != "" && m.cfg.UffdPrefetchEnabled {
+		candidate := filepath.Join(filepath.Dir(basePath), accessLogFilename)
+		if _, err := os.Stat(candidate); err == nil {
+			accessLogPath = candidate
+		}
+	}
 	// basePath non-empty ⇒ layered restore (memPath is the diff overlay over basePath).
 	trackDirty := m.cfg.IncrementalSnapshotEnabled
 	return trackDirty, RestoreSnapshotUffdInternalWithOverrides(
-		socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
+		socketPath, snapshotPath, memPath, basePath, accessLogPath, "", "eth0", netInfo.TAPDevice, "", trackDirty,
 		m.cfg.HandlerDeathAbortEnabled,
 	)
 }
