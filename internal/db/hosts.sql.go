@@ -415,6 +415,10 @@ SELECT h.id, h.region, h.capacity_memory_mib, h.capacity_vcpus,
        COALESCE(hp.net_slot_ceiling, 0)::int AS net_slot_ceiling,
        COALESCE(hp.max_network_slots, 0)::int AS max_network_slots,
        COALESCE(hp.max_sandboxes, 0)::int AS max_sandboxes,
+       -- Live VMs the host could not size. Non-zero means its allocation
+       -- columns are a known undercount, so ranking must not read the
+       -- shortfall as free memory.
+       COALESCE(hp.unknown_allocation_vms, 0)::int AS unknown_allocation_vms,
        -- The fence counters, maintained on the pressure row itself
        -- (see ReserveHostCapacity): reading them here means the cached
        -- candidate view ranks and pre-filters on the same numbers the
@@ -466,6 +470,7 @@ type ListCapacityCandidatesRow struct {
 	NetSlotCeiling        int32              `json:"net_slot_ceiling"`
 	MaxNetworkSlots       int32              `json:"max_network_slots"`
 	MaxSandboxes          int32              `json:"max_sandboxes"`
+	UnknownAllocationVms  int32              `json:"unknown_allocation_vms"`
 	ChargedCount          int32              `json:"charged_count"`
 	ChargedMemoryMib      int64              `json:"charged_memory_mib"`
 	ChargedVcpus          int64              `json:"charged_vcpus"`
@@ -511,6 +516,7 @@ func (q *Queries) ListCapacityCandidates(ctx context.Context, arg ListCapacityCa
 			&i.NetSlotCeiling,
 			&i.MaxNetworkSlots,
 			&i.MaxSandboxes,
+			&i.UnknownAllocationVms,
 			&i.ChargedCount,
 			&i.ChargedMemoryMib,
 			&i.ChargedVcpus,

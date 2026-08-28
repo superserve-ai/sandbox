@@ -47,7 +47,8 @@ func (r *candidateRows) Scan(dest ...any) error {
 		row.ProvisioningSandboxes, row.PausedSandboxes, row.AllocatedMemoryMib,
 		row.AllocatedVcpus, row.UsedNetSlots, row.ProvisioningNetSlots,
 		row.WarmNetSlots, row.NetSlotCeiling, row.MaxNetworkSlots,
-		row.MaxSandboxes, row.ChargedCount, row.ChargedMemoryMib,
+		row.MaxSandboxes, row.UnknownAllocationVms,
+		row.ChargedCount, row.ChargedMemoryMib,
 		row.ChargedVcpus, row.ActiveSandboxCount,
 	}
 	if len(dest) != len(vals) {
@@ -579,5 +580,87 @@ func TestLeastLoadedPlaceSandboxHasNoReservationHooks(t *testing.T) {
 	}
 	if p.Confirm != nil || p.Abort != nil {
 		t.Fatal("legacy placement exposed reservation hooks")
+	}
+}
+
+// A host reporting unsized VMs is under-described: its allocation
+// columns are a known undercount, so it looks emptier than it is.
+// Ranking must never let that shortfall win against a host whose
+// numbers are complete — otherwise the scheduler systematically prefers
+// exactly the hosts whose true load it cannot see.
+func TestCapacityPrefersFullyDescribedHosts(t *testing.T) {
+	// The under-described host reports almost no memory used, which
+	// would make it the obvious winner on the numbers alone.
+	unsized := candidate("under-described")
+	unsized.AllocatedMemoryMib = 512
+	unsized.UnknownAllocationVms = 3
+
+	described := candidate("described")
+	described.AllocatedMemoryMib = 32 * 1024 // genuinely half full
+
+	for i := 0; i < 25; i++ {
+		m := &capacityMock{
+			rows:  []db.ListCapacityCandidatesRow{unsized, described},
+			admit: func(string) bool { return true },
+		}
+		s := newCapacityScheduler(m)
+		p, err := placeOnce(t, s)
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		if p.HostID != "described" {
+			t.Fatalf("placed on the under-described host; its allocation is an undercount, not free capacity")
+		}
+	}
+}
+
+// Under-described hosts stay USABLE — they are ordered behind, not
+// excluded. Every host carries unsized VMs until its pre-declaration
+// sandboxes cycle out, so excluding them would empty the candidate set
+// the day this is first enabled.
+func TestCapacityStillPlacesWhenEveryHostIsUnderDescribed(t *testing.T) {
+	a := candidate("a")
+	a.UnknownAllocationVms = 2
+	b := candidate("b")
+	b.UnknownAllocationVms = 5
+
+	seen := map[string]int{}
+	for i := 0; i < 40; i++ {
+		m := &capacityMock{
+			rows:  []db.ListCapacityCandidatesRow{a, b},
+			admit: func(string) bool { return true },
+		}
+		s := newCapacityScheduler(m)
+		p, err := placeOnce(t, s)
+		if err != nil {
+			t.Fatalf("iteration %d: placement failed with only under-described hosts: %v", i, err)
+		}
+		seen[p.HostID]++
+	}
+	if len(seen) != 2 {
+		t.Fatalf("only %v was ever chosen; under-described hosts must stay in rotation", seen)
+	}
+}
+
+// The tiering must not override a hard limit: a fully-described host
+// that is genuinely full still loses to an under-described one with
+// room, because exhausted capacity is a fact and an undercount is only
+// an uncertainty.
+func TestCapacityFallsBackToUnderDescribedWhenDescribedIsFull(t *testing.T) {
+	full := candidate("described-full")
+	full.MaxSandboxes = 10
+	full.RunningSandboxes = 10
+
+	spare := candidate("under-described-spare")
+	spare.UnknownAllocationVms = 1
+
+	m := &capacityMock{
+		rows:  []db.ListCapacityCandidatesRow{full, spare},
+		admit: func(string) bool { return true },
+	}
+	s := newCapacityScheduler(m)
+	p, err := placeOnce(t, s)
+	if err != nil || p.HostID != "under-described-spare" {
+		t.Fatalf("got (%q, %v), want the under-described host with room", p.HostID, err)
 	}
 }

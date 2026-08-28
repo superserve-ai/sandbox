@@ -285,7 +285,12 @@ var errCapacityExhausted = errors.New("capacity exhausted")
 
 // placeCapacity runs the fenced admission over the ranked candidates.
 func (s *CapacityAware) placeCapacity(ctx context.Context, req PlacementRequest, eligible []db.ListCapacityCandidatesRow) (Placement, PlacementObservation, error) {
-	order := rankCandidates(eligible, req)
+	// Fully-described hosts first, under-described ones only behind them
+	// (see splitByDescription): their memory numbers are a known
+	// undercount, so they must never win a ranking against a host whose
+	// numbers are complete.
+	described, underDescribed := splitByDescription(eligible)
+	order := append(rankCandidates(described, req), rankCandidates(underDescribed, req)...)
 	obs := PlacementObservation{Mode: "capacity"}
 	if len(order) == 0 {
 		// The cached view already knew every eligible host was full, so
@@ -296,6 +301,7 @@ func (s *CapacityAware) placeCapacity(ctx context.Context, req PlacementRequest,
 		obs.Reason = rejectionReason(eligible[0], req)
 		return Placement{}, obs, errCapacityExhausted
 	}
+
 	for _, cand := range order {
 		if obs.Attempts >= admissionMaxAttempts {
 			break
@@ -477,6 +483,36 @@ func rankCandidates(eligible []db.ListCapacityCandidatesRow, req PlacementReques
 		}
 	}
 	return out
+}
+
+// splitByDescription separates hosts that fully know their own
+// allocation from those reporting unsized VMs.
+//
+// An unsized VM contributes zero memory and zero vCPUs to its host's
+// report, which is indistinguishable from no VM at all — so an
+// under-described host's memory ratio is an UNDERCOUNT and it looks
+// emptier than it is. Ranking on that number as though it were a
+// measurement would systematically prefer exactly the hosts whose true
+// load is unknown.
+//
+// The answer is order, not exclusion. Exclusion would be wrong twice
+// over: the shortfall is confined to memory and vCPUs (sandbox and slot
+// counts stay exact whatever a VM's size), and every host carries
+// unsized VMs until its pre-declaration sandboxes cycle out — so
+// excluding them would empty the candidate set on the day this is first
+// enabled. Fully-described hosts are simply tried first; an
+// under-described host is used only when the described ones cannot take
+// the sandbox, and then still ranked sensibly among its peers by the
+// counts that remain trustworthy.
+func splitByDescription(rows []db.ListCapacityCandidatesRow) (described, underDescribed []db.ListCapacityCandidatesRow) {
+	for _, row := range rows {
+		if row.UnknownAllocationVms > 0 {
+			underDescribed = append(underDescribed, row)
+		} else {
+			described = append(described, row)
+		}
+	}
+	return described, underDescribed
 }
 
 // fitsCached mirrors the admission statement's hard checks against the
