@@ -1216,6 +1216,7 @@ func main() {
 	// Bind and serve BEFORE the reattach so a restart doesn't refuse connections
 	// during it; requests are gated Unavailable until startupReady flips.
 	startupReady := &atomic.Bool{}
+	localHTTPReady := &atomic.Bool{}
 	notReady := func() error {
 		return status.Error(codes.Unavailable, "vmd is starting up (reattaching VMs), retry shortly")
 	}
@@ -1614,6 +1615,8 @@ func main() {
 				PressureReady:   pressureReady,
 				MaxSandboxes:    envInt32Fatal(log, "VMD_MAX_SANDBOXES"),
 				MaxNetworkSlots: envInt32Fatal(log, "VMD_MAX_NETWORK_SLOTS"),
+				LifecycleReady:  startupReady.Load,
+				ResolverReady:   func() bool { return startupReady.Load() && localHTTPReady.Load() },
 			}, log)
 			return nil
 		})
@@ -1637,6 +1640,7 @@ func main() {
 	// Listens on localhost:9090. The edge proxy queries this to resolve
 	// instanceID → vmIP before forwarding data-plane traffic.
 	localHTTP := vm.NewLocalHTTPServer(mgr, log)
+	localHTTP.SetReadySignal(localHTTPReady)
 	lc.start("local http server", func() error {
 		if localLis != nil {
 			return localHTTP.Serve(ctx, localLis)

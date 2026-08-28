@@ -44,6 +44,16 @@ const (
 	// depends on, HostCapabilityPortTokens.
 	HostCapabilityPortBrowserAuth = "preview_port_browser_auth_v1"
 
+	// Host operational capabilities describe technical host abilities and are
+	// published independently from control-plane status and capacity.
+	HostCapabilityCanCreate       = "can_create"
+	HostCapabilityCanResume       = "can_resume"
+	HostCapabilityCanPause        = "can_pause"
+	HostCapabilityCanDestroy      = "can_destroy"
+	HostCapabilityCanProxyTraffic = "can_proxy_traffic"
+	HostCapabilityCanReadFiles    = "can_read_files"
+	HostCapabilityCanWriteFiles   = "can_write_files"
+
 	// Published preview ports exclude privileged ports and boxd's reserved
 	// service port. Keeping this vocabulary shared prevents the API, VMD,
 	// and durable schema from disagreeing about what can be published.
