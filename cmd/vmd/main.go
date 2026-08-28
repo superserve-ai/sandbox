@@ -198,6 +198,21 @@ func hostInterfaceAddress(interfaceName string) (string, error) {
 	return "", fmt.Errorf("no IPv4 address found on interface %q", interfaceName)
 }
 
+// publishesCapacityPressure reports whether this daemon should publish
+// capacity pressure — and therefore whether the manager should do the
+// pressure-only startup accounting at all.
+//
+// Both halves are required. The advertise address must be the EXPLICIT
+// operator setting rather than the address the heartbeat resolves: that
+// one falls back to the host interface, so every host has one, and
+// publication must stay opt-in per host. The control-plane URL matters
+// because without it the heartbeat never starts, so nothing would ever
+// read the accounting — a host configured that way would pay for the
+// startup scan and publish to no one.
+func publishesCapacityPressure(advertiseAddr, controlPlaneURL string) bool {
+	return advertiseAddr != "" && controlPlaneURL != ""
+}
+
 func advertisedVMDAddr(interfaceName string, grpcPort int, explicit string) (string, error) {
 	if explicit != "" {
 		if _, _, err := net.SplitHostPort(explicit); err != nil {
@@ -806,6 +821,19 @@ func main() {
 	vm.SetSystemdDBusEnabled(systemdDBus)
 	log.Info().Bool("systemd_dbus", systemdDBus).Msg("systemd unit-operations transport")
 
+	// Capacity pressure is published only by a host whose advertise
+	// address was set EXPLICITLY by an operator AND that has somewhere
+	// to publish to. Deliberately not the resolved address the heartbeat
+	// sends: that one falls back to the host interface, so every host
+	// has one, and publication must stay opt-in per host. The
+	// control-plane URL belongs in the same condition because without it
+	// the heartbeat never starts, so nothing would ever read the
+	// accounting this flag turns on. Named once here because it also
+	// decides whether the manager does pressure-only startup accounting
+	// at all — on a host that never publishes, none of that work should
+	// run.
+	publishesPressure := publishesCapacityPressure(cfg.VMDAdvertiseAddr, cfg.ControlPlaneURL)
+
 	mgr, err := vm.NewManager(vm.ManagerConfig{
 		FirecrackerBin:                      cfg.FirecrackerBin,
 		JailerBin:                           cfg.JailerBin,
@@ -840,6 +868,7 @@ func main() {
 		LaunchViaLauncherNS:                 launchViaLauncherNS,
 		LauncherNSPath:                      os.Getenv("VMD_LAUNCHER_NS_PATH"),
 		DirectSpawn:                         envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
+		PressureAccounting:                  publishesPressure,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
@@ -1529,6 +1558,15 @@ func main() {
 				Int32("configured_vcpus", vcpus).Int32("physical_vcpus", physCPU).
 				Msg("configured schedulable capacity exceeds physical capacity — check for a units mistake")
 		}
+		// Builders orphaned by the previous daemon (deploy restarts kill
+		// only the main process) hold unsizable build-VM memory; the
+		// pressure gate stays closed until the async discovery completes
+		// and every survivor exits. Skipped when pressure publication is
+		// not configured: the /proc walk buys nothing for a host that
+		// never publishes.
+		if publishesPressure {
+			mgr.ScanSurvivingBuildersAsync(cfg.TemplateBuilderBin)
+		}
 		proxyHealthURL := os.Getenv("PROXY_HEALTH_URL")
 		if proxyHealthURL == "" {
 			proxyHealthURL = "http://127.0.0.1:5007/health"
@@ -1544,6 +1582,18 @@ func main() {
 			log.Warn().Err(err).Str("proxy_health_url", proxyHealthURL).
 				Msg("unable to derive advertised proxy address; heartbeat will omit host self-description")
 		}
+		// Pressure publication is wired ONLY on the explicit advertise
+		// setting — never on the resolved vmdAddr, which now falls back
+		// to deriving an address from the host interface. Keying on the
+		// resolved address would turn publication on for every host in
+		// the fleet the moment this lands, when it must stay opt-in per
+		// host. Left nil, the publisher sends nothing.
+		var pressureSample func() vm.HostPressure
+		var pressureReady func() bool
+		if publishesPressure {
+			pressureSample = mgr.CapacityPressure
+			pressureReady = mgr.PressureReady
+		}
 		lc.start("heartbeat", func() error {
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
 				ControlPlaneURL:   cfg.ControlPlaneURL,
@@ -1556,6 +1606,14 @@ func main() {
 				Region:            cfg.HostRegion,
 				CapacityMemoryMib: memoryMib,
 				CapacityVcpus:     vcpus,
+				// Live capacity pressure, published to its own best-effort
+				// endpoint after each successful heartbeat; in-memory
+				// counters only. The limits are operator admission knobs;
+				// 0 (unset) means no cap.
+				Pressure:        pressureSample,
+				PressureReady:   pressureReady,
+				MaxSandboxes:    envInt32Fatal(log, "VMD_MAX_SANDBOXES"),
+				MaxNetworkSlots: envInt32Fatal(log, "VMD_MAX_NETWORK_SLOTS"),
 			}, log)
 			return nil
 		})

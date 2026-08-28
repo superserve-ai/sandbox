@@ -66,6 +66,18 @@ func (q *Queries) CreateHost(ctx context.Context, arg CreateHostParams) (Host, e
 	return i, err
 }
 
+const deleteHostPressure = `-- name: DeleteHostPressure :exec
+DELETE FROM host_pressure WHERE host_id = $1
+`
+
+// Clears stored pressure when a host identity is reclaimed by a new
+// machine: the old machine's numbers are meaningless for the new
+// holder, and stale pressure must not survive into its tenure.
+func (q *Queries) DeleteHostPressure(ctx context.Context, hostID string) error {
+	_, err := q.db.Exec(ctx, deleteHostPressure, hostID)
+	return err
+}
+
 const getHost = `-- name: GetHost :one
 SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host WHERE id = $1
 `
@@ -465,30 +477,54 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
                      JOIN snapshot snap ON snap.id = s2.snapshot_id
                      WHERE bg.sandbox_id = s2.id
                        AND bg.covered_snapshot_id = snap.id
-                       AND bg.covered_snapshot_generation = snap.generation)), 0)::int AS paused_unbacked_count
+                       AND bg.covered_snapshot_generation = snap.generation)), 0)::int AS paused_unbacked_count,
+       -- Live pressure, when the host publishes it (NULL otherwise): the
+       -- vmd-reported allocation view, alongside the DB-derived counts
+       -- above. hp is 1:1 by primary key, so it cannot multiply the
+       -- sandbox join's count rows.
+       hp.allocated_memory_mib AS pressure_allocated_memory_mib,
+       hp.allocated_vcpus AS pressure_allocated_vcpus,
+       hp.running_sandboxes AS pressure_running_sandboxes,
+       hp.provisioning_sandboxes AS pressure_provisioning_sandboxes,
+       hp.used_net_slots AS pressure_used_net_slots,
+       hp.warm_net_slots AS pressure_warm_net_slots,
+       -- Non-zero means the allocation columns above are a known
+       -- undercount, so an operator can tell an idle host from one that
+       -- cannot yet describe itself.
+       hp.unknown_allocation_vms AS pressure_unknown_allocation_vms,
+       hp.reported_at AS pressure_reported_at
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
+LEFT JOIN host_pressure hp ON hp.host_id = h.id
 WHERE $1::text IS NULL OR h.id = $1
-GROUP BY h.id
+GROUP BY h.id, hp.host_id
 ORDER BY h.created_at ASC
 `
 
 type ListHostsAdminRow struct {
-	ID                  string             `json:"id"`
-	VmdAddr             string             `json:"vmd_addr"`
-	ProxyAddr           string             `json:"proxy_addr"`
-	Region              string             `json:"region"`
-	Status              string             `json:"status"`
-	CapacityMemoryMib   int32              `json:"capacity_memory_mib"`
-	CapacityVcpus       int32              `json:"capacity_vcpus"`
-	LastHeartbeatAt     pgtype.Timestamptz `json:"last_heartbeat_at"`
-	CreatedAt           time.Time          `json:"created_at"`
-	UpdatedAt           time.Time          `json:"updated_at"`
-	RunningCount        int32              `json:"running_count"`
-	TransitionalCount   int32              `json:"transitional_count"`
-	PausedCount         int32              `json:"paused_count"`
-	BuildingCount       int32              `json:"building_count"`
-	PausedUnbackedCount int32              `json:"paused_unbacked_count"`
+	ID                            string             `json:"id"`
+	VmdAddr                       string             `json:"vmd_addr"`
+	ProxyAddr                     string             `json:"proxy_addr"`
+	Region                        string             `json:"region"`
+	Status                        string             `json:"status"`
+	CapacityMemoryMib             int32              `json:"capacity_memory_mib"`
+	CapacityVcpus                 int32              `json:"capacity_vcpus"`
+	LastHeartbeatAt               pgtype.Timestamptz `json:"last_heartbeat_at"`
+	CreatedAt                     time.Time          `json:"created_at"`
+	UpdatedAt                     time.Time          `json:"updated_at"`
+	RunningCount                  int32              `json:"running_count"`
+	TransitionalCount             int32              `json:"transitional_count"`
+	PausedCount                   int32              `json:"paused_count"`
+	BuildingCount                 int32              `json:"building_count"`
+	PausedUnbackedCount           int32              `json:"paused_unbacked_count"`
+	PressureAllocatedMemoryMib    *int64             `json:"pressure_allocated_memory_mib"`
+	PressureAllocatedVcpus        *int64             `json:"pressure_allocated_vcpus"`
+	PressureRunningSandboxes      *int32             `json:"pressure_running_sandboxes"`
+	PressureProvisioningSandboxes *int32             `json:"pressure_provisioning_sandboxes"`
+	PressureUsedNetSlots          *int32             `json:"pressure_used_net_slots"`
+	PressureWarmNetSlots          *int32             `json:"pressure_warm_net_slots"`
+	PressureUnknownAllocationVms  *int32             `json:"pressure_unknown_allocation_vms"`
+	PressureReportedAt            pgtype.Timestamptz `json:"pressure_reported_at"`
 }
 
 // Operator view (hostctl): every host regardless of status, with live
@@ -524,6 +560,14 @@ func (q *Queries) ListHostsAdmin(ctx context.Context, id *string) ([]ListHostsAd
 			&i.PausedCount,
 			&i.BuildingCount,
 			&i.PausedUnbackedCount,
+			&i.PressureAllocatedMemoryMib,
+			&i.PressureAllocatedVcpus,
+			&i.PressureRunningSandboxes,
+			&i.PressureProvisioningSandboxes,
+			&i.PressureUsedNetSlots,
+			&i.PressureWarmNetSlots,
+			&i.PressureUnknownAllocationVms,
+			&i.PressureReportedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -797,4 +841,90 @@ func (q *Queries) UpdateHostStatus(ctx context.Context, arg UpdateHostStatusPara
 		&i.IdentityBound,
 	)
 	return i, err
+}
+
+const upsertHostPressure = `-- name: UpsertHostPressure :execrows
+INSERT INTO host_pressure (
+    host_id, running_sandboxes, provisioning_sandboxes, paused_sandboxes,
+    allocated_memory_mib, allocated_vcpus,
+    used_net_slots, provisioning_net_slots, warm_net_slots,
+    net_slot_ceiling, max_network_slots, max_sandboxes, unknown_allocation_vms,
+    reported_at
+)
+SELECT h.id, $1, $2, $3,
+       $4, $5,
+       $6, $7, $8,
+       $9, $10, $11, $12,
+       now()
+FROM host h
+WHERE h.id = $13 AND h.vmd_addr = $14
+FOR SHARE
+ON CONFLICT (host_id) DO UPDATE SET
+    running_sandboxes = EXCLUDED.running_sandboxes,
+    provisioning_sandboxes = EXCLUDED.provisioning_sandboxes,
+    paused_sandboxes = EXCLUDED.paused_sandboxes,
+    allocated_memory_mib = EXCLUDED.allocated_memory_mib,
+    allocated_vcpus = EXCLUDED.allocated_vcpus,
+    used_net_slots = EXCLUDED.used_net_slots,
+    provisioning_net_slots = EXCLUDED.provisioning_net_slots,
+    warm_net_slots = EXCLUDED.warm_net_slots,
+    net_slot_ceiling = EXCLUDED.net_slot_ceiling,
+    max_network_slots = EXCLUDED.max_network_slots,
+    max_sandboxes = EXCLUDED.max_sandboxes,
+    unknown_allocation_vms = EXCLUDED.unknown_allocation_vms,
+    reported_at = EXCLUDED.reported_at
+`
+
+type UpsertHostPressureParams struct {
+	RunningSandboxes      int32  `json:"running_sandboxes"`
+	ProvisioningSandboxes int32  `json:"provisioning_sandboxes"`
+	PausedSandboxes       int32  `json:"paused_sandboxes"`
+	AllocatedMemoryMib    int64  `json:"allocated_memory_mib"`
+	AllocatedVcpus        int64  `json:"allocated_vcpus"`
+	UsedNetSlots          int32  `json:"used_net_slots"`
+	ProvisioningNetSlots  int32  `json:"provisioning_net_slots"`
+	WarmNetSlots          int32  `json:"warm_net_slots"`
+	NetSlotCeiling        int32  `json:"net_slot_ceiling"`
+	MaxNetworkSlots       int32  `json:"max_network_slots"`
+	MaxSandboxes          int32  `json:"max_sandboxes"`
+	UnknownAllocationVms  int32  `json:"unknown_allocation_vms"`
+	HostID                string `json:"host_id"`
+	VmdAddr               string `json:"vmd_addr"`
+}
+
+// Records a host's live pressure report, identity-fenced: the write
+// lands only while the report's vmd_addr matches the host row, so a
+// daemon whose identity was reclaimed cannot overwrite the new
+// holder's numbers (mirrors the heartbeat's reclaim semantics). 0 rows
+// = unknown host or address mismatch; the handler disambiguates.
+// Last-write-wins wholesale, reported_at from the DATABASE clock: this
+// pair is the reconciliation contract (see the host_pressure table
+// comment).
+// FOR SHARE serializes the address check against an identity reclaim
+// (which takes the row FOR UPDATE): without it this statement could
+// evaluate the old address from its snapshot and insert stale pressure
+// AFTER the reclaim committed its delete. Locked, either the reclaim
+// waits for this write (then deletes it), or this write waits and
+// re-evaluates against the new address (then matches nothing).
+func (q *Queries) UpsertHostPressure(ctx context.Context, arg UpsertHostPressureParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertHostPressure,
+		arg.RunningSandboxes,
+		arg.ProvisioningSandboxes,
+		arg.PausedSandboxes,
+		arg.AllocatedMemoryMib,
+		arg.AllocatedVcpus,
+		arg.UsedNetSlots,
+		arg.ProvisioningNetSlots,
+		arg.WarmNetSlots,
+		arg.NetSlotCeiling,
+		arg.MaxNetworkSlots,
+		arg.MaxSandboxes,
+		arg.UnknownAllocationVms,
+		arg.HostID,
+		arg.VmdAddr,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

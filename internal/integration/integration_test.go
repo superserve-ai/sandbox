@@ -304,7 +304,7 @@ func (s *stubVMD) PauseInstance(_ context.Context, _, _, pauseToken string) (str
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string) (string, uint32, uint32, string, error) {
+func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string, _ vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
 	return "10.0.0.1", 1, 1024, preview.HostCapabilityPorts, nil
 }
 func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {
