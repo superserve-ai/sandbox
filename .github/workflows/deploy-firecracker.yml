@@ -70,12 +70,19 @@ jobs:
 
       # Input goes through the environment, not the run body: `${{ }}` is
       # substituted before bash parses, so a tag could inject commands.
+      # The pinned digests are empty on a staging-only dispatch, where they are
+      # what this run discovers. On a production dispatch they are set, and
+      # staging is then held to the same predecessor production is moving off
+      # — otherwise the "paused before, resumed after" test would have been run
+      # against whatever staging happened to be on.
       - name: Install
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VERSION: ${{ inputs.version }}
+          EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
+          TARGET_SHA256: ${{ inputs.target_sha256 }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION"
