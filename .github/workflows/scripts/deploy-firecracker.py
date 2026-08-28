@@ -55,7 +55,7 @@ def sha256_of(path):
     return h.hexdigest()
 
 
-def fetch_release(version, workdir):
+def fetch_release(version, workdir, expected_digest=""):
     """Download and unpack the release, returning (binary_path, sha256).
 
     The digest is taken from the unpacked binary and cross-checked against the
@@ -77,6 +77,14 @@ def fetch_release(version, workdir):
     if digest != published:
         raise RuntimeError(
             f"release {version} digest mismatch: unpacked {digest}, published {published}"
+        )
+    # Release assets can be replaced after the fact, and each cell downloads
+    # independently, so agreeing with the checksum published beside them only
+    # proves the pair is self-consistent. Pinning the digest verified on
+    # staging is what stops untested bytes reaching production.
+    if expected_digest and digest != expected_digest:
+        raise RuntimeError(
+            f"release {version} is {digest}, not the verified {expected_digest}"
         )
     print(f"{version}: sha256 {digest}")
     return binary, digest
@@ -139,16 +147,19 @@ def host_state(live, backup, expected, target):
     binary, so it has not lost the way back. Anything else is a host nobody
     verified against, and the rollout stops rather than guessing.
     """
-    if live == expected:
-        return True, "on the rollback binary"
     if live == target:
-        if backup == expected:
-            return True, "already on the target"
-        return False, (
-            f"is on the target but its backup of {expected[:12]} is "
-            + ("missing" if backup is None else f"wrong ({backup[:12]})")
-        )
-    return False, f"is on {live[:12]}, neither the rollback nor the target"
+        # Nothing to do here, whichever direction this is. A host that was
+        # never updated is already at the target during a rollback, and would
+        # have no backup of the binary it never ran; requiring one would let
+        # an untouched host block the rollback of the hosts that were changed.
+        note = "already on the target"
+        if backup != expected:
+            note += "; no local backup of {} (break-glass only — a rollback " \
+                    "installs a release)".format(expected[:12])
+        return True, note
+    if live == expected:
+        return True, "on the expected binary"
+    return False, f"is on {live[:12]}, neither the expected binary nor the target"
 
 
 def preflight(instances, project, expected, target):
@@ -279,7 +290,11 @@ def main() -> int:
         return 1
 
     with tempfile.TemporaryDirectory() as workdir:
-        binary, digest = fetch_release(args.version, workdir)
+        target = os.environ.get("TARGET_SHA256", "").strip()
+        if target and not HEX64.match(target):
+            print(f"TARGET_SHA256 is not a sha256 digest: {target!r}", file=sys.stderr)
+            return 1
+        binary, digest = fetch_release(args.version, workdir, target)
 
         instances = list_instances(project, region, label)
         where = f"{project} ({region})"

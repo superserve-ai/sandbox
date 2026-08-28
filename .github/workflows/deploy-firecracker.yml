@@ -29,6 +29,10 @@ on:
         options:
           - staging
           - production
+      target_sha256:
+        description: 'Production only: sha256 of the binary verified on staging — pins production to those exact bytes'
+        required: false
+        type: string
       rollback_sha256:
         description: 'Production only: sha256 of the binary production runs today — the one staging verified rolling back to'
         required: false
@@ -86,12 +90,17 @@ jobs:
       # Installing proves only that the binary loads. Snapshot formats are
       # versioned, and the swap sits between what was written before it and
       # what is resumed after — in both directions, rollback included.
-      - name: Require the rollback digest
+      - name: Require the pinned digests
         env:
           ROLLBACK: ${{ inputs.rollback_sha256 }}
+          TARGET: ${{ inputs.target_sha256 }}
         run: |
           if ! printf '%s' "$ROLLBACK" | grep -qE '^[0-9a-f]{64}$'; then
             echo "::error::rollback_sha256 must be the sha256 of the binary production runs today (64 lowercase hex). Without it the staging verification is not bound to the binary these hosts would actually roll back to."
+            exit 1
+          fi
+          if ! printf '%s' "$TARGET" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::target_sha256 must be the sha256 verified on staging (64 lowercase hex). Release assets can be replaced, so without it production is not bound to the bytes that were tested."
             exit 1
           fi
 
@@ -128,6 +137,7 @@ jobs:
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VERSION: ${{ inputs.version }}
           EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
+          TARGET_SHA256: ${{ inputs.target_sha256 }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION" --preflight-only
@@ -140,6 +150,7 @@ jobs:
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VERSION: ${{ inputs.version }}
           EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
+          TARGET_SHA256: ${{ inputs.target_sha256 }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION" --preflight-only
@@ -151,6 +162,7 @@ jobs:
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VERSION: ${{ inputs.version }}
           EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
+          TARGET_SHA256: ${{ inputs.target_sha256 }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION"
@@ -163,6 +175,7 @@ jobs:
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VERSION: ${{ inputs.version }}
           EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
+          TARGET_SHA256: ${{ inputs.target_sha256 }}
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION"

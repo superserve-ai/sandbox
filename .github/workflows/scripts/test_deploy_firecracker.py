@@ -137,15 +137,23 @@ class PreflightStateTest(unittest.TestCase):
         ok, _ = deploy_firecracker.host_state(self.B, self.A, self.A, self.B)
         self.assertTrue(ok)
 
-    def test_an_updated_host_that_lost_its_backup_is_refused(self):
+    def test_a_host_at_the_target_passes_without_a_local_backup(self):
+        # During a ROLLBACK the untouched hosts are already at the target and
+        # never had the binary being rolled back from, so they cannot hold a
+        # backup of it. Demanding one would let them block the rollback of the
+        # hosts that were actually changed.
         ok, why = deploy_firecracker.host_state(self.B, None, self.A, self.B)
-        self.assertFalse(ok)
-        self.assertIn("missing", why)
+        self.assertTrue(ok)
+        self.assertIn("break-glass", why)
 
-    def test_an_updated_host_with_a_wrong_backup_is_refused(self):
-        ok, why = deploy_firecracker.host_state(self.B, self.C, self.A, self.B)
-        self.assertFalse(ok)
-        self.assertIn("wrong", why)
+    def test_a_rollback_across_a_partly_updated_cell_is_accepted(self):
+        # Rolling back from B to A: the updated host is on B (the expected
+        # binary), the untouched one is already on A (the target). Both must
+        # pass or the rollback cannot run.
+        updated, _ = deploy_firecracker.host_state(self.B, self.A, self.B, self.A)
+        untouched, _ = deploy_firecracker.host_state(self.A, None, self.B, self.A)
+        self.assertTrue(updated)
+        self.assertTrue(untouched)
 
     def test_an_unknown_binary_is_refused(self):
         ok, why = deploy_firecracker.host_state(self.C, self.A, self.A, self.B)
