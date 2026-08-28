@@ -116,6 +116,16 @@ func newFCClient(socketPath string) *fcclient.Firecracker {
 
 func strPtr(s string) *string { return &s }
 func boolPtr(b bool) *bool    { return &b }
+
+// omitFalse returns nil for false so the field is left out of the request body.
+// These params are deserialized with deny_unknown_fields, so a Firecracker
+// binary predating the field rejects the whole request instead of ignoring it.
+func omitFalse(b bool) *bool {
+	if !b {
+		return nil
+	}
+	return &b
+}
 func int64Ptr(i int64) *int64 { return &i }
 
 // vmHostname returns a short hostname for a VM.
@@ -310,7 +320,7 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 			MemFilePath:   &memPath,
 			SnapshotType:  models.SnapshotCreateParamsSnapshotTypeFull,
 			BlockDeltaDir: blockDeltaDir,
-			Flatten:       mode == SnapshotFlatten,
+			Flatten:       omitFalse(mode == SnapshotFlatten),
 		},
 	}); err != nil {
 		return fmt.Errorf("create snapshot: %w", err)
@@ -542,7 +552,7 @@ func RestoreSnapshotUffdInternalWithOverrides(
 				BasePath:            basePath,
 				AccessLogPath:       accessLogPath,
 				RecordTo:            recordToPath,
-				AbortOnHandlerDeath: abortOnHandlerDeath,
+				AbortOnHandlerDeath: omitFalse(abortOnHandlerDeath),
 			},
 			// Arms dirty-page tracking so the next pause can write an incremental
 			// (Diff) snapshot instead of a Full one.
