@@ -680,6 +680,9 @@ func main() {
 	verifySnapshotEnabled := envOrDefault("VMD_VERIFY_SNAPSHOT_ENABLED", "false") == "true"
 	incrementalSnapshotEnabled := envOrDefault("VMD_INCREMENTAL_SNAPSHOT", "false") == "true"
 	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
+	// Off by default: it only does anything for a snapshot whose guest corrects
+	// its own wall clock, and forcing legacy is the way back if one misbehaves.
+	guestClockFreezeEnabled := envOrDefault("VMD_GUEST_CLOCK_FREEZE", "false") == "true"
 	// Tri-state: "auto" (default) lets vmd enforce only after its convergence
 	// sweep proves every layered overlay has a presence side-car; "always"
 	// forces enforcement (fresh migration-target hosts); "never" is the
@@ -852,6 +855,7 @@ func main() {
 		VerifySnapshotEnabled:               verifySnapshotEnabled,
 		IncrementalSnapshotEnabled:          incrementalSnapshotEnabled,
 		HandlerDeathAbortEnabled:            handlerDeathAbortEnabled,
+		GuestClockFreezeEnabled:             guestClockFreezeEnabled,
 		RequirePresenceSidecar:              requirePresenceSidecar,
 		PausedNetworkReclaimEnabled:         pausedNetworkReclaimEnabled,
 		PausedNetworkSlotHeadroomPercent:    pausedNetworkSlotHeadroomPercent,
@@ -1410,6 +1414,14 @@ func main() {
 
 	// pool_start: StartPool (async fill), adoption wiring, launcher-ns setup.
 	st.mark("pool_start", true, -1)
+
+	// Keeps the Firecracker clock-option capability in step with the binary on
+	// disk: the deploy replaces it in place without restarting this daemon, so an
+	// answer read once would go stale on the next rollout in either direction.
+	// Reads no instance state, and probing execs a process, so it runs on its own
+	// off every lifecycle path. Restores before the first probe answers take
+	// legacy behaviour — slower, correct.
+	mgr.WatchFirecrackerCapability(ctx, log)
 
 	// ---- Background full reattach ----
 	// Off the critical path (requests load their VM on demand); proactively

@@ -116,10 +116,14 @@ type VMInstance struct {
 	DiskPath       string
 	SnapshotPath   string
 	MemFilePath    string
-	CreatedAt      time.Time
-	Metadata       map[string]string
-	TeamID         string // owning team; carried for data-plane usage attribution
-	OwnerID        string // creating user; empty when unknown
+	// CorrectsWallClock records whether this guest fixes its own wall clock on
+	// wake, resolved once when it was restored. Cached so pause never has to go
+	// to the filesystem to find out.
+	CorrectsWallClock bool
+	CreatedAt         time.Time
+	Metadata          map[string]string
+	TeamID            string // owning team; carried for data-plane usage attribution
+	OwnerID           string // creating user; empty when unknown
 	// PausedAt records when this VM last entered the paused state. It drives
 	// oldest-first pressure reclamation. Zero means the field is unset on a
 	// legacy record; callers fall back to CreatedAt and then place any fully
@@ -318,6 +322,13 @@ type ManagerConfig struct {
 	// page fault). The dead VM then surfaces via the unit-inactive → reconciler path
 	// rather than hanging silently. Independent of the snapshot flags. Default false.
 	HandlerDeathAbortEnabled bool
+
+	// GuestClockFreezeEnabled lets a restore ask Firecracker to freeze the guest's
+	// monotonic clock across the snapshot instead of advancing it by the time the
+	// snapshot sat unused. Only takes effect for a snapshot whose guest can correct
+	// its own wall clock on wake; everything else stays on legacy behaviour whatever
+	// this says. Default false.
+	GuestClockFreezeEnabled bool
 
 	// RequirePresenceSidecar controls refusing a layered UFFD restore whose
 	// overlay has no .presence side-car next to it. Without the side-car,
@@ -638,6 +649,15 @@ type Manager struct {
 	// serial, and per-record stop budgets would otherwise stack into
 	// minutes of postponed reconciliation.
 	reattachStopDeadline atomic.Value // time.Time
+
+	// clockRealtimeCapable records whether the Firecracker binary this manager
+	// launches understands the per-restore clock flag. Probed once in the
+	// background at startup — the probe execs a process, which belongs neither on
+	// the restore path nor on the restart path. Atomic and demotable: the deploy
+	// swaps the binary in place without restarting vmd, so a rollback can put an
+	// older Firecracker under a running daemon, and the first restore it refuses
+	// clears this for good.
+	clockRealtimeCapable atomic.Bool
 }
 
 // trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
@@ -1501,6 +1521,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	dirtyTracked := inst.DirtyTracked
 	instBaseMem := inst.BaseMemPath
 	instMemFile := inst.MemFilePath
+	correctsWallClock := inst.CorrectsWallClock
 	diskPath := inst.DiskPath
 	diskBasePath := inst.Config.BasePath
 	inst.mu.RUnlock()
@@ -1517,6 +1538,21 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// drop the prior overlay's pages, so fall back to a Full (complete) image.
 	overlayPath := filepath.Join(snapshotDir, "mem.diff")
 	fullPath := filepath.Join(snapshotDir, "mem.snap")
+
+	// Clear any wall-clock marker before the image exists, and refuse the pause if
+	// it cannot be cleared. vmd reuses memory paths, so a marker left beside a
+	// replaced image would let this guest be restored with a frozen clock without
+	// ever having shown it can correct one — a guest running on a stale clock,
+	// which is worse than a failed pause the caller can retry. Both candidate
+	// paths are cleared because the layered branch can still fall back to Full.
+	if !correctsWallClock {
+		for _, candidate := range []string{overlayPath, fullPath} {
+			if merr := os.Remove(clockFreezeMarkerPath(candidate)); merr != nil && !os.IsNotExist(merr) {
+				return "", "", nil, m.handleVMError(vmID, fmt.Errorf(
+					"clear stale wall-clock marker for %q: %w", candidate, merr))
+			}
+		}
+	}
 	layered := m.cfg.IncrementalSnapshotEnabled && dirtyTracked && instBaseMem != "" &&
 		(instMemFile == instBaseMem || overlayPath == instMemFile)
 	baseMemPath := ""
@@ -1575,6 +1611,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 				// .base gone the restore is refused regardless.
 				_ = os.Remove(layeredBaseSidecarPath(memPath))
 				_ = os.Remove(presence.SidecarPath(memPath))
+				_ = os.Remove(clockFreezeMarkerPath(memPath))
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
 			}
 			m.verifyPresenceRefreshed(memPath, saveStart, log)
@@ -1603,6 +1640,17 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 				snapshotDur = time.Since(tSnapshot)
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 			}
+		}
+	}
+
+	// A resume reads the marker beside THIS image, so without it every resume drops
+	// back to legacy. Only the write lands here: the unsafe direction was already
+	// handled above, before the image existed. Best-effort by design — a marker
+	// that fails to write costs a slower resume, never a wrong clock.
+	if correctsWallClock {
+		if merr := os.WriteFile(clockFreezeMarkerPath(memPath), nil, 0o644); merr != nil {
+			log.Warn().Err(merr).Str("path", clockFreezeMarkerPath(memPath)).
+				Msg("pause: wall-clock marker write failed; resume falls back to legacy clock behaviour")
 		}
 	}
 
@@ -1781,6 +1829,11 @@ func freshenFirstPassOverlay(overlayPath string) error {
 	// rewrites it on the upcoming save, so this mainly keeps the fallback-to-Full
 	// path from leaving a bitmap that describes a file that no longer exists.
 	if err := os.Remove(presence.SidecarPath(overlayPath)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	// Same reasoning for the wall-clock marker: the fresh overlay has not been
+	// shown to come from a guest that corrects its own clock.
+	if err := os.Remove(clockFreezeMarkerPath(overlayPath)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
@@ -2079,10 +2132,25 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	tRestore = time.Now()
 	var dirtyTracked bool
 	var restoreErr error
+	// Nil unless the real restore path ran and asked for a frozen clock; the test
+	// hook leaves it nil, which is also what the log should say.
+	var resumeClockFrozen bool
+	// A property of the guest alone — whether this host can act on it is decided
+	// separately, so an older binary does not erase it.
+	//
+	// An ordinary resume reloads the exact image this VM was paused into, and that
+	// pause recorded the property beside it and in the durable record. The record
+	// is therefore already the answer, and asking the filesystem again would put
+	// metadata I/O on the resume path for a fact we hold. Only an explicit
+	// override, which supplies an image this VM was not paused into, has to look.
+	inst.mu.RLock()
+	recordedCorrects, pausedMemPath := inst.CorrectsWallClock, inst.MemFilePath
+	inst.mu.RUnlock()
+	resumeCorrectsWallClock := resumeWallClockProperty(memPath, basePath, pausedMemPath, recordedCorrects)
 	if m.restoreForResumeHook != nil {
 		dirtyTracked, restoreErr = m.restoreForResumeHook(socketPath, snapshotPath, memPath, basePath, netInfo)
 	} else {
-		dirtyTracked, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
+		dirtyTracked, resumeClockFrozen, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo, m.clockPolicyFor(resumeCorrectsWallClock))
 	}
 	tRestoreDone = time.Now()
 	if restoreErr != nil {
@@ -2137,6 +2205,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.Status = StatusRunning
 	inst.Unverified = false
 	inst.DirtyTracked = dirtyTracked
+	inst.CorrectsWallClock = resumeCorrectsWallClock
 	inst.PausedAt = time.Time{}
 	// Record the file actually resumed from (callers may pass an explicit path
 	// that differs from the cached one) so the next pause's diff baseline matches
@@ -2169,6 +2238,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		Int64("fc_start_ms", tFcDone.Sub(tFcStart).Milliseconds()).
 		Int64("restore_ms", tRestoreDone.Sub(tRestore).Milliseconds()).
 		Int64("total_ms", time.Since(tEntry).Milliseconds()).
+		Bool("guest_clock_frozen", resumeClockFrozen).
 		Msg("VM resumed from snapshot")
 
 	// Telemetry only: measure how long boxd takes to become reachable after
@@ -2207,7 +2277,9 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 // tap is present, else File. A layered overlay (basePath set) requires UFFD. Reports
 // whether dirty-page tracking was armed so the caller can decide if the next pause
 // may write a Diff.
-func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo) (dirtyTracked bool, err error) {
+// clockPolicy is resolved by the caller so the resume log can report what was
+// asked for without stat-ing the marker a second time.
+func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo, clockPolicy *bool) (dirtyTracked, clockFrozen bool, err error) {
 	useUffd := m.cfg.ResumeUffdEnabled && m.cfg.UffdEnabled && netInfo != nil && netInfo.TAPDevice != ""
 	if !useUffd {
 		// A layered overlay can only be served by the UFFD layered backend. If this
@@ -2215,19 +2287,25 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 		// than load the sparse overlay via the File backend, which would read the
 		// base's pages as zero holes.
 		if basePath != "" {
-			return false, fmt.Errorf("layered overlay %q requires UFFD resume (resume-uffd + uffd + tap); refusing File-backend restore", memPath)
+			return false, false, fmt.Errorf("layered overlay %q requires UFFD resume (resume-uffd + uffd + tap); refusing File-backend restore", memPath)
 		}
-		return false, RestoreSnapshot(socketPath, snapshotPath, memPath, "")
+		used, rerr := m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+			return RestoreSnapshot(socketPath, snapshotPath, memPath, "", clock)
+		})
+		return false, used, rerr
 	}
 
 	// No prefetch access log: only template builds record one (next to the template
 	// snapshot), pause snapshots don't — so resume-side prefetch is future work.
 	// basePath non-empty ⇒ layered restore (memPath is the diff overlay over basePath).
 	trackDirty := m.cfg.IncrementalSnapshotEnabled
-	return trackDirty, RestoreSnapshotUffdInternalWithOverrides(
-		socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
-		m.cfg.HandlerDeathAbortEnabled,
-	)
+	used, rerr := m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+		return RestoreSnapshotUffdInternalWithOverrides(
+			socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
+			m.cfg.HandlerDeathAbortEnabled, clock,
+		)
+	})
+	return trackDirty, used, rerr
 }
 
 // VerifySnapshot loads vmID's snapshot without resuming, re-snapshots the frozen
@@ -2379,6 +2457,20 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	snapshotPath = filepath.Join(snapshotDir, "vmstate.snap")
 	memPath = filepath.Join(snapshotDir, "mem.snap")
 
+	// Before the snapshot, not after: CreateSnapshot consumes Firecracker's dirty
+	// bitmap and leaves the VM paused, so returning past that point would skip
+	// clearing DirtyTracked and the unpause below. Failing here has done nothing
+	// yet.
+	//
+	// This path holds no vm-op lock, so any provenance read here could describe a
+	// state a concurrent pause or resume has already moved on from. An ad-hoc
+	// image is therefore never marked: restores from it take legacy behaviour,
+	// which is slower and always correct. Callers may also hand in a directory
+	// that already holds an image, so clear rather than assume.
+	if merr := os.Remove(clockFreezeMarkerPath(memPath)); merr != nil && !os.IsNotExist(merr) {
+		return "", "", fmt.Errorf("clear wall-clock marker for ad-hoc snapshot %q: %w", memPath, merr)
+	}
+
 	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 		return "", "", fmt.Errorf("create snapshot: %w", err)
 	}
@@ -2456,7 +2548,14 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 		// .base: VMD reuses mem paths, and a stale bitmap next to a future
 		// same-size overlay passes Firecracker's geometry checks and silently
 		// resolves pages against the wrong layer.
-		for _, sidecar := range []string{layeredBaseSidecarPath(memPath), presence.SidecarPath(memPath)} {
+		// The wall-clock marker goes with them: left behind, it would let a future
+		// image at this reused path be restored with a frozen clock on a guest that
+		// never proved it can correct one.
+		for _, sidecar := range []string{
+			layeredBaseSidecarPath(memPath),
+			presence.SidecarPath(memPath),
+			clockFreezeMarkerPath(memPath),
+		} {
 			if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
 				m.log.Warn().Err(err).Str("path", sidecar).Msg("remove mem side-car")
 			}
@@ -2912,6 +3011,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// retried on a different slot; the failed slot is torn down. inPlace resumes
 	// reuse a specific VM's own slot and never retry.
 	const maxRestoreAttempts = 3
+	// Resolved inside the loop (memPath can change between attempts) but read
+	// after it, when the instance records what was actually restored.
+	var restoreCorrectsWallClock bool
 	for attempt = 1; ; attempt++ {
 		tAttemptStart = time.Now()
 		if attempt > 1 {
@@ -3037,6 +3139,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// pages read as zero holes).
 		sidecarBase, hasSidecar := readLayeredBase(memPath)
 		overlayNeedsLayered := isOverlayMemFile(memPath) || hasSidecar
+		// One evaluation per restore: this is the only filesystem look-up, and the
+		// policy, the log line, and the cached instance property all read it.
+		// A property of the guest alone — whether this host can act on it is
+		// decided separately, so an older binary does not erase it.
+		restoreCorrectsWallClock = guestCorrectsWallClock(memPath, sidecarBase)
+		clockPolicy := m.clockPolicyFor(restoreCorrectsWallClock)
+		clockFrozen := false
 		switch {
 		case overlayNeedsLayered && !(useUffd && m.cfg.ResumeUffdEnabled):
 			attemptErr = fmt.Errorf(
@@ -3084,21 +3193,32 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				inst.mu.Unlock()
 			}
 			if attemptErr == nil {
-				attemptErr = RestoreSnapshotUffdInternalWithOverrides(
-					socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
-					m.cfg.HandlerDeathAbortEnabled,
-				)
+				clockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+					return RestoreSnapshotUffdInternalWithOverrides(
+						socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
+						m.cfg.HandlerDeathAbortEnabled, clock,
+					)
+				})
 			}
 		case inPlace:
-			attemptErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
+			clockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+				return RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir, clock)
+			})
 		default:
 			// UFFD disabled but fresh restore — File backend with network overrides.
-			attemptErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
+			clockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+				return RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir, clock)
+			})
 		}
 		log.Info().
 			Int64("load_snapshot_ms", time.Since(tFcReady).Milliseconds()).
 			Bool("ok", attemptErr == nil).
 			Int("attempt", attempt).
+			// Which clock policy this restore actually asked for. Without it the
+			// only symptom of the gates disagreeing is a readiness number that
+			// looks the same as before, which is indistinguishable from the
+			// feature being off.
+			Bool("guest_clock_frozen", clockFrozen).
 			Msg("snapshot loaded")
 		// Failed attempts included: a slow failing load (tap-busy retry,
 		// terminal failure) must appear in the distribution, not vanish.
@@ -3189,6 +3309,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.Status = StatusRunning
 	inst.Unverified = true
 	inst.PausedAt = time.Time{}
+	// Cached so the next pause knows whether this guest fixes its own wall clock
+	// without going back to the filesystem to ask.
+	inst.CorrectsWallClock = restoreCorrectsWallClock
 	inst.mu.Unlock()
 	persistDone := make(chan struct{})
 	optimisticOK := false
