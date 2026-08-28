@@ -3786,6 +3786,45 @@ func TestListSandboxFiles_Success(t *testing.T) {
 	}
 }
 
+func TestListSandboxFiles_DefaultPath(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
+
+	var gotPath string
+	vmd := &stubVMD{
+		listDirFn: func(_ context.Context, id, path string) ([]vmdclient.DirEntry, error) {
+			gotPath = path
+			return []vmdclient.DirEntry{
+				{Name: "home", IsDir: true, Size: 4096, ModifiedUnix: 1700000000},
+			}, nil
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sandboxes/"+sandboxID.String()+"/files", nil)
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if gotPath != "/" {
+		t.Errorf("ListDir path = %q, want %q", gotPath, "/")
+	}
+}
+
 // A missing directory must surface as 404, never 410 Gone: listing must not
 // mistake a boxd "not found" for a dead VM and mark the sandbox failed.
 func TestListSandboxFiles_NotFoundIsNotFatal(t *testing.T) {

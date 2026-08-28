@@ -755,3 +755,76 @@ func TestServeDirAsZip_AbortsOnCanceledContext(t *testing.T) {
 		t.Fatalf("zip walk wrote %d entries after the context was canceled; want 0 (aborted)", len(zr.File))
 	}
 }
+
+func TestFilesystemService_ListDir_Root(t *testing.T) {
+	svc := &filesystemService{}
+	resp, err := svc.ListDir(context.Background(), connect.NewRequest(&pb.ListDirRequest{Path: "/"}))
+	if err != nil {
+		t.Fatalf("ListDir(/): %v", err)
+	}
+	if len(resp.Msg.GetEntries()) == 0 {
+		t.Errorf("got 0 entries for /, expected directory entries")
+	}
+}
+
+func TestFilesystemService_Stat_Root(t *testing.T) {
+	svc := &filesystemService{}
+	resp, err := svc.Stat(context.Background(), connect.NewRequest(&pb.StatRequest{Path: "/"}))
+	if err != nil {
+		t.Fatalf("Stat(/): %v", err)
+	}
+	if !resp.Msg.GetIsDir() {
+		t.Errorf("Stat(/) IsDir = false, want true")
+	}
+}
+
+func TestFileDownload_JSON_RootDir(t *testing.T) {
+	w := zipFilesGet(t, "/", "json")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body.String())
+	}
+	listing := parseListing(t, w.Body.Bytes())
+	if len(listing.Entries) == 0 {
+		t.Errorf("got 0 entries for /, expected directory entries")
+	}
+}
+
+func TestFileDownload_Zip_RootDir_Rejected(t *testing.T) {
+	w := zipFilesGet(t, "/", "zip")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "refusing to archive root directory") {
+		t.Errorf("got body %q, want 'refusing to archive root directory'", w.Body.String())
+	}
+}
+
+func TestFileUpload_RootDir_Rejected(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/files?path=/", strings.NewReader("data"))
+	w := httptest.NewRecorder()
+	handleFiles(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "cannot upload to root directory") {
+		t.Errorf("got body %q, want 'cannot upload to root directory'", w.Body.String())
+	}
+}
+
+func TestFilesystemService_Mutations_RootRejected(t *testing.T) {
+	svc := &filesystemService{}
+	ctx := context.Background()
+
+	if _, err := svc.MakeDir(ctx, connect.NewRequest(&pb.MakeDirRequest{Path: "/"})); err == nil {
+		t.Error("MakeDir(/) succeeded, want error")
+	}
+	if _, err := svc.Remove(ctx, connect.NewRequest(&pb.RemoveRequest{Path: "/"})); err == nil {
+		t.Error("Remove(/) succeeded, want error")
+	}
+	if _, err := svc.Move(ctx, connect.NewRequest(&pb.MoveRequest{Source: "/", Destination: "/tmp/dst"})); err == nil {
+		t.Error("Move(src=/) succeeded, want error")
+	}
+	if _, err := svc.Move(ctx, connect.NewRequest(&pb.MoveRequest{Source: "/tmp/src", Destination: "/"})); err == nil {
+		t.Error("Move(dst=/) succeeded, want error")
+	}
+}
