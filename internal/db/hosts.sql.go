@@ -394,6 +394,133 @@ func (q *Queries) ListActiveHostsByLoad(ctx context.Context, requiredCapabilitie
 	return items, nil
 }
 
+const listCapacityCandidates = `-- name: ListCapacityCandidates :many
+SELECT h.id, h.region, h.capacity_memory_mib, h.capacity_vcpus,
+       EXISTS (
+         SELECT 1 FROM host_capability hc
+         WHERE hc.host_id = h.id
+           AND hc.capability = $1::text
+           AND hc.heartbeat_at = h.last_heartbeat_at
+       ) AS pressure_capable,
+       hp.reported_at,
+       COALESCE(hp.running_sandboxes, 0)::int AS running_sandboxes,
+       COALESCE(hp.provisioning_sandboxes, 0)::int AS provisioning_sandboxes,
+       COALESCE(hp.paused_sandboxes, 0)::int AS paused_sandboxes,
+       COALESCE(hp.allocated_memory_mib, 0)::bigint AS allocated_memory_mib,
+       COALESCE(hp.allocated_vcpus, 0)::bigint AS allocated_vcpus,
+       COALESCE(hp.used_net_slots, 0)::int AS used_net_slots,
+       COALESCE(hp.provisioning_net_slots, 0)::int AS provisioning_net_slots,
+       COALESCE(hp.warm_net_slots, 0)::int AS warm_net_slots,
+       COALESCE(hp.net_slot_ceiling, 0)::int AS net_slot_ceiling,
+       COALESCE(hp.max_network_slots, 0)::int AS max_network_slots,
+       COALESCE(hp.max_sandboxes, 0)::int AS max_sandboxes,
+       -- Live VMs the host could not size. Non-zero means the allocation
+       -- columns are a known undercount, so ranking must not read the
+       -- shortfall as free memory.
+       COALESCE(hp.unknown_allocation_vms, 0)::int AS unknown_allocation_vms,
+       COALESCE((
+         SELECT COUNT(*) FROM sandbox s
+         WHERE s.host_id = h.id
+           AND s.status IN ('active', 'starting')
+           AND s.destroyed_at IS NULL
+       ), 0)::int AS active_sandbox_count
+FROM host h
+LEFT JOIN host_pressure hp ON hp.host_id = h.id
+WHERE h.status = 'active'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM unnest($2::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
+`
+
+type ListCapacityCandidatesParams struct {
+	PressureCapability   string   `json:"pressure_capability"`
+	RequiredCapabilities []string `json:"required_capabilities"`
+}
+
+type ListCapacityCandidatesRow struct {
+	ID                    string             `json:"id"`
+	Region                string             `json:"region"`
+	CapacityMemoryMib     int32              `json:"capacity_memory_mib"`
+	CapacityVcpus         int32              `json:"capacity_vcpus"`
+	PressureCapable       bool               `json:"pressure_capable"`
+	ReportedAt            pgtype.Timestamptz `json:"reported_at"`
+	RunningSandboxes      int32              `json:"running_sandboxes"`
+	ProvisioningSandboxes int32              `json:"provisioning_sandboxes"`
+	PausedSandboxes       int32              `json:"paused_sandboxes"`
+	AllocatedMemoryMib    int64              `json:"allocated_memory_mib"`
+	AllocatedVcpus        int64              `json:"allocated_vcpus"`
+	UsedNetSlots          int32              `json:"used_net_slots"`
+	ProvisioningNetSlots  int32              `json:"provisioning_net_slots"`
+	WarmNetSlots          int32              `json:"warm_net_slots"`
+	NetSlotCeiling        int32              `json:"net_slot_ceiling"`
+	MaxNetworkSlots       int32              `json:"max_network_slots"`
+	MaxSandboxes          int32              `json:"max_sandboxes"`
+	UnknownAllocationVms  int32              `json:"unknown_allocation_vms"`
+	ActiveSandboxCount    int32              `json:"active_sandbox_count"`
+}
+
+// Candidate hosts for capacity ranking, cached control-plane-side: every
+// active host passing the capability filter, with its newest pressure
+// report and the legacy sandbox count.
+//
+// Read ONLY by the background shadow evaluator, never by a request. The
+// create path does no query of its own; ranking works from whatever this
+// last returned.
+//
+// Freshness and eligibility policy live in the ranker; this query only
+// distinguishes "capable" (advertised capacity_pressure_v1 on the
+// CURRENT heartbeat, so a capability from a previous boot cannot vouch
+// for this one) and reports raw timestamps.
+//
+// A scalar subquery, not a second join, for the sandbox count: joining
+// two child tables would cross-multiply the per-host rows.
+func (q *Queries) ListCapacityCandidates(ctx context.Context, arg ListCapacityCandidatesParams) ([]ListCapacityCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listCapacityCandidates, arg.PressureCapability, arg.RequiredCapabilities)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCapacityCandidatesRow{}
+	for rows.Next() {
+		var i ListCapacityCandidatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Region,
+			&i.CapacityMemoryMib,
+			&i.CapacityVcpus,
+			&i.PressureCapable,
+			&i.ReportedAt,
+			&i.RunningSandboxes,
+			&i.ProvisioningSandboxes,
+			&i.PausedSandboxes,
+			&i.AllocatedMemoryMib,
+			&i.AllocatedVcpus,
+			&i.UsedNetSlots,
+			&i.ProvisioningNetSlots,
+			&i.WarmNetSlots,
+			&i.NetSlotCeiling,
+			&i.MaxNetworkSlots,
+			&i.MaxSandboxes,
+			&i.UnknownAllocationVms,
+			&i.ActiveSandboxCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listHosts = `-- name: ListHosts :many
 SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host
 ORDER BY created_at ASC

@@ -265,6 +265,30 @@ func run() error {
 	sched := &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
 	handlers.Scheduler = sched
 
+	// Capacity ranking, measurement only. Placement stays exactly as it
+	// was: this observes a sample of creates and reports what ranking
+	// WOULD have chosen, so the scoring can be judged against real
+	// traffic before anything is allowed to depend on it. Enforcement
+	// needs a host-side admission gate that does not exist yet, so there
+	// is deliberately no flag here that makes ranking decide anything.
+	if cfg.SchedulerCapacityShadow {
+		ranker := &scheduler.CapacityRanker{DB: queries, Region: api.SandboxIDRegion()}
+		shadow := scheduler.NewShadowEvaluator(ranker, func(obs scheduler.ShadowObservation) {
+			recorder.RecordCapacityShadow(context.Background(), telemetry.CapacityShadow{
+				Result:         obs.Result,
+				Agreement:      obs.Agreement,
+				Described:      obs.Described,
+				UnderDescribed: obs.UnderDescribed,
+				Legacy:         obs.Legacy,
+				Stale:          obs.Stale,
+				Duration:       obs.Duration,
+			})
+		})
+		handlers.Shadow = shadow
+		go shadow.Run(ctx)
+		log.Info().Msg("capacity ranking shadow evaluation enabled (measurement only; placement unchanged)")
+	}
+
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
 	// Launch the timeout reaper. This goroutine destroys sandboxes whose

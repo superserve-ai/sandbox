@@ -81,6 +81,8 @@ type OTelRecorder struct {
 	vmdCalls                 metric.Int64Counter
 	vmdDuration              metric.Float64Histogram
 	hostResolutionDuration   metric.Float64Histogram
+	capacityShadowDuration   metric.Float64Histogram
+	capacityShadowHosts      metric.Int64Gauge
 	hostVCPU                 metric.Int64Gauge
 	hostMemoryMiB            metric.Int64Gauge
 	hostSandboxes            metric.Int64Gauge
@@ -166,6 +168,13 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	}
 	if r.hostResolutionDuration, err = meter.Float64Histogram("host_resolution_duration_seconds",
 		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.capacityShadowDuration, err = meter.Float64Histogram("capacity_shadow_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.capacityShadowHosts, err = meter.Int64Gauge("capacity_shadow_hosts"); err != nil {
 		return nil, err
 	}
 	if r.vmdDuration, err = meter.Float64Histogram("vmd_call_duration_seconds",
@@ -308,6 +317,42 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 	r.vmdCalls.Add(ctx, 1, opt)
 	if c.Duration > 0 {
 		r.vmdDuration.Record(ctx, c.Duration.Seconds(), opt)
+	}
+}
+
+// RecordCapacityShadow emits the shadow evaluation. The host-composition
+// gauges are what tell an operator whether the fleet is ready for
+// enforcement: enabling admission while most hosts are legacy or stale
+// would rank on numbers that barely exist.
+func (r *OTelRecorder) RecordCapacityShadow(ctx context.Context, c CapacityShadow) {
+	if r == nil {
+		return
+	}
+	result := c.Result
+	switch result {
+	case "ranked", "no_candidates", "error":
+	default:
+		result = "other"
+	}
+	agreement := c.Agreement
+	switch agreement {
+	case "same", "different", "unknown":
+	default:
+		agreement = "other"
+	}
+	r.capacityShadowDuration.Record(ctx, c.Duration.Seconds(), metric.WithAttributes(r.attrs(
+		attribute.String("result", result),
+		attribute.String("agreement", agreement),
+	)...))
+	for kind, n := range map[string]int{
+		"described":       c.Described,
+		"under_described": c.UnderDescribed,
+		"legacy":          c.Legacy,
+		"stale":           c.Stale,
+	} {
+		r.capacityShadowHosts.Record(ctx, int64(n), metric.WithAttributes(r.attrs(
+			attribute.String("kind", kind),
+		)...))
 	}
 }
 
