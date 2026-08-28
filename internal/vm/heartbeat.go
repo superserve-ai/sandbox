@@ -39,7 +39,6 @@ type HeartbeatConfig struct {
 	Region            string
 	CapacityMemoryMib int32
 	CapacityVcpus     int32
-
 	// Pressure, when set, is sampled after each SUCCESSFUL heartbeat and
 	// published to the separate best-effort pressure endpoint — never
 	// inside the heartbeat body, so no pressure outcome can ever affect
@@ -57,6 +56,10 @@ type HeartbeatConfig struct {
 	// limits published alongside pressure; 0 means unset (no cap).
 	MaxSandboxes    int32
 	MaxNetworkSlots int32
+	// LifecycleReady gates lifecycle capability publication until VMD is ready.
+	LifecycleReady func() bool
+	// ResolverReady gates proxy, file, and preview capability publication.
+	ResolverReady func() bool
 }
 
 // pressureProbeEvery is how many beats a publisher that found the
@@ -274,8 +277,26 @@ type heartbeatRequest struct {
 }
 
 type proxyHealthResponse struct {
-	Capabilities []string `json:"capabilities"`
+	Capabilities  []string `json:"capabilities"`
+	FilesEnabled  bool     `json:"files_enabled"`
+	ResolverReady bool     `json:"resolver_ready"`
 }
+
+type proxyHealthState struct {
+	PreviewCapabilities []string
+	FilesEnabled        bool
+	ResolverReady       bool
+}
+
+const (
+	capabilityCanCreate       = preview.HostCapabilityCanCreate
+	capabilityCanResume       = preview.HostCapabilityCanResume
+	capabilityCanPause        = preview.HostCapabilityCanPause
+	capabilityCanDestroy      = preview.HostCapabilityCanDestroy
+	capabilityCanProxyTraffic = preview.HostCapabilityCanProxyTraffic
+	capabilityCanReadFiles    = preview.HostCapabilityCanReadFiles
+	capabilityCanWriteFiles   = preview.HostCapabilityCanWriteFiles
+)
 
 type heartbeatStorageCache struct {
 	mu           sync.RWMutex
@@ -336,12 +357,28 @@ func (c *heartbeatStorageCache) store(measurements []heartbeatStorageMeasurement
 
 func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token, proxyHealthURL string, storage []heartbeatStorageMeasurement, log zerolog.Logger) (bool, bool) {
 	started := time.Now()
-	capabilities, err := proxyPreviewCapabilities(ctx, client, proxyHealthURL)
+	proxyState, err := proxyHealthCapabilities(ctx, client, proxyHealthURL)
 	if err != nil {
 		log.Warn().Err(err).
+			Str("host_id", cfg.HostID).
 			Dur("duration", time.Since(started)).
-			Msg("proxy capability probe failed; advertising no preview capabilities")
-		capabilities = nil
+			Msg("proxy health probe failed; advertising no proxy or file capabilities")
+		proxyState = proxyHealthState{}
+	}
+	capabilities := make([]string, 0, 7)
+	lifecycleReady := cfg.LifecycleReady != nil && cfg.LifecycleReady()
+	resolverReady := cfg.ResolverReady != nil && cfg.ResolverReady()
+	if lifecycleReady {
+		capabilities = append(capabilities, capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy)
+	}
+	if err == nil {
+		if resolverReady && proxyState.ResolverReady {
+			capabilities = append(capabilities, capabilityCanProxyTraffic)
+			if proxyState.FilesEnabled {
+				capabilities = append(capabilities, capabilityCanReadFiles, capabilityCanWriteFiles)
+			}
+		}
+		capabilities = append(capabilities, proxyState.PreviewCapabilities...)
 	}
 	return postHeartbeat(ctx, client, cfg, url, token, capabilities, storage, log, started)
 }
@@ -498,34 +535,39 @@ func measureOverlayStorage(runDir string) ([]heartbeatStorageMeasurement, error)
 }
 
 func proxyPreviewCapabilities(ctx context.Context, client *http.Client, healthURL string) ([]string, error) {
+	state, err := proxyHealthCapabilities(ctx, client, healthURL)
+	return state.PreviewCapabilities, err
+}
+
+func proxyHealthCapabilities(ctx context.Context, client *http.Client, healthURL string) (proxyHealthState, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, healthURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("build proxy health request: %w", err)
+		return proxyHealthState{}, fmt.Errorf("build proxy health request: %w", err)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request proxy health: %w", err)
+		return proxyHealthState{}, fmt.Errorf("request proxy health: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil, fmt.Errorf("proxy health returned %d", resp.StatusCode)
+		return proxyHealthState{}, fmt.Errorf("proxy health returned %d", resp.StatusCode)
 	}
 	var health proxyHealthResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&health); err != nil {
 		if err == io.EOF {
-			return nil, nil
+			return proxyHealthState{}, nil
 		}
-		return nil, fmt.Errorf("decode proxy health: %w", err)
+		return proxyHealthState{}, fmt.Errorf("decode proxy health: %w", err)
 	}
 	advertised := make(map[string]bool, len(health.Capabilities))
 	for _, capability := range health.Capabilities {
 		advertised[capability] = true
 	}
 	if !advertised[preview.HostCapabilityPorts] {
-		return nil, nil
+		return proxyHealthState{FilesEnabled: health.FilesEnabled, ResolverReady: health.ResolverReady}, nil
 	}
 	out := []string{preview.HostCapabilityPorts}
 	if advertised[preview.HostCapabilityPortAccess] {
@@ -537,5 +579,5 @@ func proxyPreviewCapabilities(ctx context.Context, client *http.Client, healthUR
 			}
 		}
 	}
-	return out, nil
+	return proxyHealthState{PreviewCapabilities: out, FilesEnabled: health.FilesEnabled, ResolverReady: health.ResolverReady}, nil
 }

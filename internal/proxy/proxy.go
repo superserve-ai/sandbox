@@ -172,6 +172,19 @@ func (h *Handler) PreviewCapabilities() []string {
 	return capabilities
 }
 
+// FilesEnabled reports whether the authenticated /files bridge is enabled.
+// It is a read-only snapshot used by the local health endpoint; it performs
+// no sandbox I/O.
+func (h *Handler) FilesEnabled() bool {
+	return h.filesEnabled
+}
+
+// ResolverReady verifies the configured resolver endpoint without touching a sandbox.
+func (h *Handler) ResolverReady(ctx context.Context) bool {
+	resolver, ok := h.resolver.(interface{ Ready(context.Context) error })
+	return ok && resolver.Ready(ctx) == nil
+}
+
 // WithAnalytics enables data-plane usage events (exec/files).
 func (h *Handler) WithAnalytics(a *analytics.Client) *Handler {
 	h.analytics = a
