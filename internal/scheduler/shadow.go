@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
@@ -15,6 +16,19 @@ import (
 // measurement that changes no behavior.
 const shadowQueueDepth = 64
 
+// shadowSampleInterval is the minimum gap between accepted samples: an
+// explicit rate limit, because the queue alone is not one.
+//
+// A bounded queue only samples once the worker falls BEHIND. While it
+// keeps up it accepts everything, and each accepted sample costs a
+// fleet-sized ranking pass and a handful of metric writes — background
+// work, but proportional to create rate, which is exactly what a
+// high-churn host cannot afford. Ten samples a second is far more than
+// enough to characterize placement behavior.
+// A var, not a const, so tests can drive many samples through without
+// sleeping; nothing in production reassigns it.
+var shadowSampleInterval = 100 * time.Millisecond
+
 // ShadowObservation is one evaluated sample, for metrics. Every field is
 // a bounded enum or a small int; nothing here is per-sandbox or
 // per-tenant.
@@ -22,9 +36,15 @@ type ShadowObservation struct {
 	// Result: "ranked" (a host would have been chosen), "no_candidates"
 	// (nothing rankable), or "error" (the refresh failed).
 	Result string
-	// Agreement compares the ranking's first choice against the host the
-	// live scheduler actually picked: "same", "different", or "unknown"
-	// when there was nothing to compare.
+	// Agreement says whether the host the live scheduler picked was among
+	// the ones ranking considered equally good: "in_band",
+	// "out_of_band", or "unknown" when there was nothing to compare.
+	//
+	// Judged against the BAND, never against the ranking's first choice.
+	// That first choice is drawn at random from the comparable set, so
+	// comparing against it would report disagreement (N-1)/N of the time
+	// for N equally good hosts — measuring the shuffle rather than the
+	// placement.
 	Agreement string
 	// Counts of what the ranker saw, so the fleet's readiness for
 	// enforcement is visible before anything depends on it.
@@ -66,6 +86,11 @@ type ShadowEvaluator struct {
 	Observe func(ShadowObservation)
 
 	samples chan shadowSample
+	// lastSampled is the wall clock of the last accepted sample, as
+	// UnixNano. Atomic rather than a mutex so the reject path — the
+	// common one — is a load and a compare, with nothing a request can
+	// block on.
+	lastSampled atomic.Int64
 }
 
 // NewShadowEvaluator builds an evaluator with its queue ready. Run must
@@ -86,8 +111,15 @@ func (s *ShadowEvaluator) Offer(requiredCapabilities []string, memoryMib, vcpus 
 	if s == nil || s.samples == nil {
 		return
 	}
-	// The slice is copied because the caller's may be reused or mutated
-	// after this returns; everything else is a value.
+	// Decide BEFORE building anything. The rejected path is the common
+	// one by design, and it must not allocate: copying the capability
+	// slice first would cost every create a heap allocation to produce a
+	// message that is immediately thrown away.
+	if !s.admitSample() {
+		return
+	}
+	// Copied only now: the caller's slice may be reused or mutated after
+	// this returns, and from here the sample outlives the request.
 	caps := append([]string(nil), requiredCapabilities...)
 	select {
 	case s.samples <- shadowSample{
@@ -97,8 +129,21 @@ func (s *ShadowEvaluator) Offer(requiredCapabilities []string, memoryMib, vcpus 
 		chosenHost:           chosenHost,
 	}:
 	default:
-		// Queue full: drop. Sampling under load is the intent.
+		// Worker still busy with the previous sample; drop rather than
+		// wait. Nothing downstream needs completeness.
 	}
+}
+
+// admitSample reports whether enough time has passed to take another
+// sample, advancing the clock when it does. Compare-and-swap so that
+// concurrent creates cannot both pass the same window.
+func (s *ShadowEvaluator) admitSample() bool {
+	now := time.Now().UnixNano()
+	last := s.lastSampled.Load()
+	if now-last < int64(shadowSampleInterval) {
+		return false
+	}
+	return s.lastSampled.CompareAndSwap(last, now)
 }
 
 // Run drains and evaluates samples until ctx is cancelled. One worker:
@@ -140,10 +185,12 @@ func (s *ShadowEvaluator) evaluate(ctx context.Context, sample shadowSample) {
 	default:
 		obs.Result = "ranked"
 		if sample.chosenHost != "" {
-			if result.Order[0] == sample.chosenHost {
-				obs.Agreement = "same"
-			} else {
-				obs.Agreement = "different"
+			obs.Agreement = "out_of_band"
+			for _, id := range result.TopBand {
+				if id == sample.chosenHost {
+					obs.Agreement = "in_band"
+					break
+				}
 			}
 		}
 	}

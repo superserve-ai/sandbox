@@ -46,7 +46,7 @@ func (r *candidateRows) Scan(dest ...any) error {
 		row.ProvisioningSandboxes, row.PausedSandboxes, row.AllocatedMemoryMib,
 		row.AllocatedVcpus, row.UsedNetSlots, row.ProvisioningNetSlots,
 		row.WarmNetSlots, row.NetSlotCeiling, row.MaxNetworkSlots,
-		row.MaxSandboxes, row.UnknownAllocationVms, row.ActiveSandboxCount,
+		row.MaxSandboxes, row.UnknownAllocationVms,
 	}
 	if len(dest) != len(vals) {
 		return fmt.Errorf("scan arity: got %d dests, have %d values", len(dest), len(vals))
@@ -130,6 +130,12 @@ func candidate(id string) db.ListCapacityCandidatesRow {
 
 func newShadow(t *testing.T, m *rankerMock) (*ShadowEvaluator, chan ShadowObservation) {
 	t.Helper()
+	// Most tests exercise behavior, not pacing, so the rate limit is
+	// removed for them; TestShadowRateLimitsSamples covers it directly.
+	prev := shadowSampleInterval
+	shadowSampleInterval = 0
+	t.Cleanup(func() { shadowSampleInterval = prev })
+
 	obs := make(chan ShadowObservation, 64)
 	s := NewShadowEvaluator(&CapacityRanker{DB: db.New(m)}, func(o ShadowObservation) { obs <- o })
 	return s, obs
@@ -204,15 +210,16 @@ func TestShadowReportsAgreementWithLivePlacement(t *testing.T) {
 	// The live scheduler picked the loaded host; ranking prefers idle.
 	s.Offer(nil, 512, 1, "loaded")
 	o := awaitObservation(t, obs)
-	if o.Result != "ranked" || o.Agreement != "different" {
-		t.Fatalf("observation = %+v, want ranked/different", o)
+	if o.Result != "ranked" || o.Agreement != "out_of_band" {
+		t.Fatalf("observation = %+v, want ranked/out_of_band", o)
 	}
 
-	// And when the live choice matches, that is reported too.
+	// A choice inside the comparable set is agreement, even though the
+	// ranking's own first pick is drawn from that set at random.
 	s.Offer(nil, 512, 1, "idle")
 	o = awaitObservation(t, obs)
-	if o.Agreement != "same" {
-		t.Fatalf("agreement = %q, want same", o.Agreement)
+	if o.Agreement != "in_band" {
+		t.Fatalf("agreement = %q, want in_band", o.Agreement)
 	}
 }
 
@@ -398,5 +405,113 @@ func TestRankerHonorsAllowedHosts(t *testing.T) {
 	res := rank(t, rows, RankRequest{MemoryMib: 512, Vcpus: 1, AllowedHosts: []string{"h2"}})
 	if len(res.Order) != 1 || res.Order[0] != "h2" {
 		t.Fatalf("order = %v, want only h2", res.Order)
+	}
+}
+
+// Agreement must be judged against the whole comparable band, not the
+// ranking's first choice. With equally good hosts that first choice is a
+// random draw, so comparing against it would report disagreement for
+// (N-1)/N of perfectly good placements — measuring the shuffle instead
+// of the placement.
+func TestShadowAgreementIsBandMembershipNotTheShuffle(t *testing.T) {
+	rows := []db.ListCapacityCandidatesRow{candidate("a"), candidate("b"), candidate("c")}
+	m := &rankerMock{rows: rows}
+	s, obs := newShadow(t, m)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+
+	// Every host is equally good, so every live choice must read as
+	// agreement — every time, not one third of the time.
+	for i := 0; i < 30; i++ {
+		for _, host := range []string{"a", "b", "c"} {
+			s.Offer(nil, 512, 1, host)
+			if o := awaitObservation(t, obs); o.Agreement != "in_band" {
+				t.Fatalf("host %s reported %q; comparable hosts must all count as agreement", host, o.Agreement)
+			}
+		}
+	}
+}
+
+// The queue alone is not a rate limiter: while the worker keeps up it
+// accepts everything, and each sample costs a fleet-sized ranking pass.
+func TestShadowRateLimitsSamples(t *testing.T) {
+	m := &rankerMock{rows: []db.ListCapacityCandidatesRow{candidate("h1")}}
+	s, obs := newShadow(t, m)
+	shadowSampleInterval = 50 * time.Millisecond // restored by newShadow's cleanup
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+
+	for i := 0; i < 500; i++ {
+		s.Offer(nil, 512, 1, "h1")
+	}
+	// One sample admitted for the whole burst; the rest are refused
+	// before anything is built.
+	awaitObservation(t, obs)
+	select {
+	case o := <-obs:
+		t.Fatalf("a second sample was admitted within one interval: %+v", o)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+// The refusal path is the common one, so it must not allocate: building
+// a message only to drop it would cost every create a heap allocation.
+func TestShadowOfferDoesNotAllocateWhenRefused(t *testing.T) {
+	m := &rankerMock{rows: []db.ListCapacityCandidatesRow{candidate("h1")}}
+	s, _ := newShadow(t, m)
+	shadowSampleInterval = time.Hour // admit the first, refuse the rest
+
+	caps := []string{"preview_ports_v1"}
+	s.Offer(caps, 512, 1, "h1") // consumes the one allowed sample
+
+	allocs := testing.AllocsPerRun(200, func() {
+		s.Offer(caps, 512, 1, "h1")
+	})
+	if allocs > 0 {
+		t.Fatalf("refused offer allocates %.1f times per call; it must decide before building the sample", allocs)
+	}
+}
+
+// Region preference must not hide viable hosts: filtering by region
+// before dropping full hosts lets one full local host mask every remote
+// host with room, leaving nothing rankable.
+func TestRankerFallsBackToRemoteWhenLocalIsFull(t *testing.T) {
+	local := candidate("local-full")
+	local.Region = "region-a"
+	local.MaxSandboxes = 10
+	local.RunningSandboxes = 10
+
+	remote := candidate("remote-room")
+	remote.Region = "region-b"
+
+	r := &CapacityRanker{DB: db.New(&rankerMock{rows: []db.ListCapacityCandidatesRow{local, remote}}), Region: "region-a"}
+	res, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Order) != 1 || res.Order[0] != "remote-room" {
+		t.Fatalf("order = %v; a full local host must not hide a viable remote one", res.Order)
+	}
+}
+
+// ...while a viable local host still wins over a remote one.
+func TestRankerStillPrefersViableLocalHosts(t *testing.T) {
+	local := candidate("local")
+	local.Region = "region-a"
+	local.RunningSandboxes = 50 // more loaded, still preferred
+
+	remote := candidate("remote")
+	remote.Region = "region-b"
+
+	r := &CapacityRanker{DB: db.New(&rankerMock{rows: []db.ListCapacityCandidatesRow{local, remote}}), Region: "region-a"}
+	res, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Order) != 1 || res.Order[0] != "local" {
+		t.Fatalf("order = %v, want the local host", res.Order)
 	}
 }

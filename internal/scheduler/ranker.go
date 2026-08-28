@@ -56,6 +56,15 @@ type RankResult struct {
 	// Order is the hosts worth trying, best first. Empty when nothing is
 	// rankable.
 	Order []string
+	// TopBand is every host within the tolerance of the best score —
+	// the set that is equally good on pressure grounds, from which
+	// Order[0] was drawn at random.
+	//
+	// Judging a placement against Order[0] alone would be judging it
+	// against a coin toss: with N comparable hosts it disagrees (N-1)/N
+	// of the time even when the choice was perfect. Band membership is
+	// the meaningful question.
+	TopBand []string
 	// Described counts candidates whose pressure is fresh and complete;
 	// UnderDescribed counts those reporting VMs they could not size.
 	Described      int
@@ -145,7 +154,17 @@ func (r *CapacityRanker) Rank(ctx context.Context, req RankRequest) (RankResult,
 			eligible = append(eligible, row)
 		}
 	}
-	eligible = preferRegion(eligible, r.Region)
+	// Viability BEFORE region. Filtering by region first lets a single
+	// full local host hide every remote host with room: the local set is
+	// non-empty, so remote candidates are discarded, and then the local
+	// one is dropped for being full — leaving nothing.
+	viable := eligible[:0:0]
+	for _, row := range eligible {
+		if fits(row, req) {
+			viable = append(viable, row)
+		}
+	}
+	eligible = preferRegion(viable, r.Region)
 
 	// Fully-described hosts first. An unsized VM contributes zero memory
 	// and zero vCPUs to its host's report, which is indistinguishable
@@ -158,10 +177,23 @@ func (r *CapacityRanker) Rank(ctx context.Context, req RankRequest) (RankResult,
 	described, underDescribed := splitByDescription(eligible)
 	result.Described, result.UnderDescribed = len(described), len(underDescribed)
 
-	order := append(rankCandidates(described, req), rankCandidates(underDescribed, req)...)
+	order, band := rankCandidates(described, req)
+	underOrder, underBand := rankCandidates(underDescribed, req)
+	order = append(order, underOrder...)
+	if len(band) == 0 {
+		// Nothing fully described: the acceptable set is the
+		// under-described band, since that is all there is to choose
+		// from.
+		band = underBand
+	}
+
 	result.Order = make([]string, 0, len(order))
 	for _, row := range order {
 		result.Order = append(result.Order, row.ID)
+	}
+	result.TopBand = make([]string, 0, len(band))
+	for _, row := range band {
+		result.TopBand = append(result.TopBand, row.ID)
 	}
 	return result, nil
 }
@@ -226,20 +258,17 @@ func preferRegion(rows []db.ListCapacityCandidatesRow, region string) []db.ListC
 // dropped, survivors are scored by dominant pressure, the tolerance band
 // around the best score is shuffled (with warm-slot hosts ahead within
 // it), and out-of-band hosts follow in score order.
-func rankCandidates(eligible []db.ListCapacityCandidatesRow, req RankRequest) []db.ListCapacityCandidatesRow {
+func rankCandidates(eligible []db.ListCapacityCandidatesRow, req RankRequest) (order, band []db.ListCapacityCandidatesRow) {
 	type scored struct {
 		row   db.ListCapacityCandidatesRow
 		score float64
 	}
 	candidates := make([]scored, 0, len(eligible))
 	for _, row := range eligible {
-		if !fits(row, req) {
-			continue
-		}
 		candidates = append(candidates, scored{row: row, score: dominantScore(row, req)})
 	}
 	if len(candidates) == 0 {
-		return nil
+		return nil, nil
 	}
 	best := candidates[0].score
 	for _, c := range candidates[1:] {
@@ -273,7 +302,13 @@ func rankCandidates(eligible []db.ListCapacityCandidatesRow, req RankRequest) []
 			out = append(out, c.row)
 		}
 	}
-	return out
+	band = make([]db.ListCapacityCandidatesRow, 0, len(warmBand)+len(coldBand))
+	for _, group := range [][]scored{warmBand, coldBand} {
+		for _, c := range group {
+			band = append(band, c.row)
+		}
+	}
+	return out, band
 }
 
 // fits reports whether a host is under its OPERATOR limits with room for

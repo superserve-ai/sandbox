@@ -417,13 +417,7 @@ SELECT h.id, h.region, h.capacity_memory_mib, h.capacity_vcpus,
        -- Live VMs the host could not size. Non-zero means the allocation
        -- columns are a known undercount, so ranking must not read the
        -- shortfall as free memory.
-       COALESCE(hp.unknown_allocation_vms, 0)::int AS unknown_allocation_vms,
-       COALESCE((
-         SELECT COUNT(*) FROM sandbox s
-         WHERE s.host_id = h.id
-           AND s.status IN ('active', 'starting')
-           AND s.destroyed_at IS NULL
-       ), 0)::int AS active_sandbox_count
+       COALESCE(hp.unknown_allocation_vms, 0)::int AS unknown_allocation_vms
 FROM host h
 LEFT JOIN host_pressure hp ON hp.host_id = h.id
 WHERE h.status = 'active'
@@ -463,7 +457,6 @@ type ListCapacityCandidatesRow struct {
 	MaxNetworkSlots       int32              `json:"max_network_slots"`
 	MaxSandboxes          int32              `json:"max_sandboxes"`
 	UnknownAllocationVms  int32              `json:"unknown_allocation_vms"`
-	ActiveSandboxCount    int32              `json:"active_sandbox_count"`
 }
 
 // Candidate hosts for capacity ranking, cached control-plane-side: every
@@ -509,7 +502,6 @@ func (q *Queries) ListCapacityCandidates(ctx context.Context, arg ListCapacityCa
 			&i.MaxNetworkSlots,
 			&i.MaxSandboxes,
 			&i.UnknownAllocationVms,
-			&i.ActiveSandboxCount,
 		); err != nil {
 			return nil, err
 		}
