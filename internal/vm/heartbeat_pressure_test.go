@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1233,22 +1234,44 @@ func TestBackfillSkipsVMsThatDeclaredTheirSize(t *testing.T) {
 
 // A failed probe must leave the zeros rather than invent a size: an
 // under-count shows up as a host that looks emptier than it is, while a
-// guess is wrong in a direction nothing can detect.
+// guess is wrong in a direction nothing can detect. The VM stays queued
+// for another attempt, so no completion arrives while it remains
+// eligible — that is the point of retrying.
 func TestBackfillLeavesSizeUnknownWhenProbeFails(t *testing.T) {
+	probed := make(chan struct{}, 8)
 	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		select {
+		case probed <- struct{}{}:
+		default:
+		}
 		return 0, 0, fmt.Errorf("connection refused")
 	})
 
 	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
 	inst := &VMInstance{ID: "unreachable", Status: StatusRunning, SocketPath: "/run/fc.sock"}
+	m.vms[inst.ID] = inst
+	m.indexVM(inst.ID, inst)
 	m.backfillMachineConfigAsync(inst)
-	awaitBackfill(t, done)
 
-	inst.mu.RLock()
-	defer inst.mu.RUnlock()
-	if inst.Config.VCPU != 0 || inst.Config.MemoryMiB != 0 {
-		t.Fatalf("invented an allocation after a failed probe: %d/%d", inst.Config.VCPU, inst.Config.MemoryMiB)
+	select {
+	case <-probed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the probe never ran")
 	}
+	inst.mu.RLock()
+	vcpu, mem := inst.Config.VCPU, inst.Config.MemoryMiB
+	inst.mu.RUnlock()
+	if vcpu != 0 || mem != 0 {
+		t.Fatalf("invented an allocation after a failed probe: %d/%d", vcpu, mem)
+	}
+
+	// Retire it so the retry loop lets go and the seams restore without
+	// live work still reading them.
+	m.mu.Lock()
+	delete(m.vms, inst.ID)
+	m.unindexVM(inst.ID)
+	m.mu.Unlock()
+	awaitBackfill(t, done)
 }
 
 // stubMachineConfigProbe swaps the probe seam and returns a channel that
@@ -1736,5 +1759,86 @@ func TestBackfillRetriesDoNotStarveThePool(t *testing.T) {
 	m.mu.Unlock()
 	for i := 0; i < machineConfigRecoveryWorkers+1; i++ {
 		awaitBackfill(t, done)
+	}
+}
+
+// Recovery must cost a FIXED number of goroutines, not one per unsized
+// VM: a restart with a large legacy fleet would otherwise create
+// thousands, each mostly asleep between retries. Bounding the probes is
+// not the same as bounding the workers.
+func TestBackfillWorkersAreFixedRegardlessOfFleetSize(t *testing.T) {
+	release := make(chan struct{})
+	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		<-release
+		return 2, 1024, nil
+	})
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	const fleet = 500
+	insts := make([]*VMInstance, 0, fleet)
+	m.mu.Lock()
+	for i := 0; i < fleet; i++ {
+		inst := &VMInstance{ID: fmt.Sprintf("legacy-%d", i), Status: StatusRunning, SocketPath: "/run/fc.sock"}
+		m.vms[inst.ID] = inst
+		m.indexVM(inst.ID, inst)
+		insts = append(insts, inst)
+	}
+	m.mu.Unlock()
+
+	before := runtime.NumGoroutine()
+	for _, inst := range insts {
+		m.backfillMachineConfigAsync(inst)
+	}
+	// Let everything that is going to start, start.
+	time.Sleep(200 * time.Millisecond)
+	growth := runtime.NumGoroutine() - before
+	// Workers + dispatcher, plus slack for the runtime's own scheduling.
+	if limit := machineConfigRecoveryWorkers + 8; growth > limit {
+		t.Fatalf("recovery grew the goroutine count by %d for %d VMs (limit %d); it must not scale with the fleet",
+			growth, fleet, limit)
+	}
+
+	close(release)
+	for i := 0; i < fleet; i++ {
+		awaitBackfill(t, done)
+	}
+}
+
+// A paused VM has no Firecracker listening, so probing one retries
+// against a dead socket forever. Reattach skips paused records for that
+// reason — which leaves resume as the only moment a legacy paused VM can
+// be sized, and it must take it.
+func TestBackfillSkipsPausedVMsAndResumeRecoversThem(t *testing.T) {
+	probed := make(chan string, 4)
+	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		probed <- "probed"
+		return 2, 2048, nil
+	})
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	paused := &VMInstance{ID: "paused-legacy", Status: StatusPaused, SocketPath: "/run/fc.sock"}
+	m.vms[paused.ID] = paused
+	m.indexVM(paused.ID, paused)
+
+	m.backfillMachineConfigAsync(paused)
+	select {
+	case <-probed:
+		t.Fatal("probed a paused VM; its Firecracker is gone and the retry would never end")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Resume makes it askable again, and recovery must then size it —
+	// otherwise it stays unknown for life and its host stays
+	// under-described.
+	paused.mu.Lock()
+	paused.Status = StatusRunning
+	paused.mu.Unlock()
+	m.backfillMachineConfigAsync(paused)
+	awaitBackfill(t, done)
+
+	paused.mu.RLock()
+	defer paused.mu.RUnlock()
+	if paused.Config.VCPU != 2 || paused.Config.MemoryMiB != 2048 {
+		t.Fatalf("resumed VM never recovered its size: %d/%d", paused.Config.VCPU, paused.Config.MemoryMiB)
 	}
 }

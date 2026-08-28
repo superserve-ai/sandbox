@@ -544,6 +544,10 @@ type Manager struct {
 	// existed. Set once before ReattachAll; never mutated after.
 	pressureAccounting bool
 
+	// recovery probes allocations for VMs nobody declared a size for.
+	// Fixed worker set; see machineConfigRecovery.
+	recovery machineConfigRecovery
+
 	// vmStopUnconfirmed marks VMs whose stop could not be confirmed
 	// dead, in EITHER supervision mode and from EITHER origin — a pause
 	// whose stop failed, or a failed spawn whose cleanup could not prove
@@ -2144,6 +2148,15 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	if cerr := m.commitResumeState(inst); cerr != nil {
 		return nil, cerr
 	}
+	// A legacy paused record is the one case reattach cannot recover:
+	// it skips paused VMs because a paused VM has no Firecracker to ask.
+	// Resume is when one becomes askable again, so without this such a
+	// VM would stay unsized for the rest of its life and keep its host
+	// permanently under-described. No-op for every VM whose size is
+	// known, which after the declared-allocation contract is all of them.
+	if m.pressureAccounting {
+		m.backfillMachineConfigAsync(inst)
+	}
 	needsNetworkCleanup = false
 	// Resume-side phase parity with the create path's "restoring snapshot"
 	// line; wait_boxd_ms arrives async on the probe log below. prep spans
@@ -3481,11 +3494,6 @@ var machineConfigProbeBackoff = time.Second
 // rather than for these.
 const machineConfigRecoveryWorkers = 4
 
-// machineConfigRecoverySem admits that bounded number of recoveries.
-// Package-level because reattach and any future caller must share one
-// budget — a per-call limiter would bound nothing.
-var machineConfigRecoverySem = make(chan struct{}, machineConfigRecoveryWorkers)
-
 // machineConfigProbe fetches a running VM's real vCPU/memory allocation
 // from Firecracker. Seam so tests can exercise the backfill without a
 // live microVM.
@@ -3528,93 +3536,199 @@ func (m *Manager) instanceIsCurrent(inst *VMInstance) bool {
 	return ok && cur == inst
 }
 
-// backfillMachineConfigAsync fills in a VM's allocation when the caller
-// did not declare one, so capacity accounting describes the real
-// machine rather than an empty request.
-//
-// Restores declare their allocation, so this is the recovery path for
-// records that predate that contract: they hold zeros, and a VM sized
-// zero reads as free capacity — a host full of such VMs would publish
-// as idle. Firecracker knows the real shape, so ask it.
-//
-// Called from restore and from reattach, but it costs nothing in the
-// normal case: callers declare the allocation, so the size is already
-// known and this returns before starting anything. What remains is the
-// two cases that have no declaration — records written before the
-// contract existed, and restores from a control plane that predates it
-// (the mixed-version window during a rollout). Both are gated on
-// publication: a host doing no capacity accounting never runs this.
-//
-// The published numbers are a beat late at worst — the sample runs
-// every 30 seconds and a missed one under-reports a single VM until the
-// next.
-//
-// Retries until it succeeds or the instance stops being current,
-// because a single transient socket error would otherwise leave a live
-// VM advertising its memory as free for the rest of its life. Every
-// step re-checks instance identity (see instanceIsCurrent) so a
-// destroyed or replaced VM ends the work at once, the worker slot is
-// held for the probe alone so unreachable VMs cannot starve recoverable
-// ones, and nothing is written durably (see applyMachineConfig).
-func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
-	if inst == nil {
-		return
-	}
-	inst.mu.RLock()
-	socket, known := inst.SocketPath, inst.Config.VCPU > 0 && inst.Config.MemoryMiB > 0
-	inst.mu.RUnlock()
-	if known || socket == "" {
-		return
-	}
-	go func() {
-		defer sentrylog.Recover("machine-config-backfill")
-		if machineConfigBackfillDone != nil {
-			defer machineConfigBackfillDone(inst.ID)
-		}
-		backoff := machineConfigProbeBackoff
-		for {
-			// Identity, not liveness: a destroy that already removed
-			// this instance ends the work, and so does an in-place
-			// replace that put a different instance under the id.
-			if !m.instanceIsCurrent(inst) {
-				return
-			}
-			inst.mu.RLock()
-			resolved := inst.Config.VCPU > 0 && inst.Config.MemoryMiB > 0
-			inst.mu.RUnlock()
-			if resolved {
-				return // a declared allocation landed while we retried
-			}
+// machineConfigRecoveryQueueDepth bounds the pending set. Overflow is
+// dropped rather than queued without limit: recovery is best-effort, and
+// the next restart re-discovers whatever was missed.
+const machineConfigRecoveryQueueDepth = 4096
 
-			// The slot is held for the PROBE only, never across the
-			// backoff below: a handful of permanently unreachable
-			// sockets would otherwise sit in the pool sleeping and
-			// starve every recoverable VM behind them.
-			machineConfigRecoverySem <- struct{}{}
-			ctx, cancel := context.WithTimeout(context.Background(), machineConfigProbeTimeout)
-			vcpu, memoryMiB, err := machineConfigProbe(ctx, socket)
-			cancel()
-			<-machineConfigRecoverySem
-			if err == nil && vcpu > 0 && memoryMiB > 0 {
-				m.applyMachineConfig(inst, vcpu, memoryMiB)
-				return
+// recoveryItem is one VM awaiting an allocation probe, with the time its
+// next attempt becomes due.
+type recoveryItem struct {
+	inst    *VMInstance
+	dueAt   time.Time
+	backoff time.Duration
+}
+
+// machineConfigRecovery probes VMs whose allocation nobody declared, on
+// a FIXED set of workers rather than a goroutine per VM.
+//
+// The goroutine-per-VM shape it replaces looked bounded — a semaphore
+// capped concurrent probes — but a restart with a large legacy fleet
+// still created one goroutine per unsized VM, each mostly asleep between
+// retries. Bounding the probes is not the same as bounding the workers.
+// Here the cost is constant: machineConfigRecoveryWorkers probing
+// goroutines plus one timer, whatever the fleet size.
+//
+// Retries never sleep on a worker. A failed probe goes back to the
+// pending set with a jittered due time and the worker takes the next
+// item, so a handful of permanently unreachable sockets cannot starve
+// the VMs that would answer.
+type machineConfigRecovery struct {
+	mu      sync.Mutex
+	pending []recoveryItem
+	ready   chan *VMInstance
+	wake    chan struct{}
+	started bool
+}
+
+// backfillMachineConfigAsync queues a VM for allocation recovery when
+// the caller did not declare one, so capacity accounting describes the
+// real machine rather than an empty request.
+//
+// Restores and resumes declare their allocation, so this is the recovery
+// path for the cases that have none: records written before that
+// contract existed, and lifecycle calls from a control plane that
+// predates it (the mixed-version window during a rollout). A VM sized
+// zero reads as free capacity — a host full of them would publish as
+// idle — and Firecracker knows the real shape, so ask it.
+//
+// Costs nothing in the normal case: the size is already known, and this
+// returns without queueing anything. Gated by callers on publication, so
+// a host doing no capacity accounting never runs it.
+func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
+	if inst == nil || !m.recoveryEligible(inst) {
+		return
+	}
+	m.recovery.mu.Lock()
+	if !m.recovery.started {
+		m.recovery.started = true
+		m.recovery.ready = make(chan *VMInstance)
+		m.recovery.wake = make(chan struct{}, 1)
+		for i := 0; i < machineConfigRecoveryWorkers; i++ {
+			go m.recoveryWorker()
+		}
+		go m.recoveryDispatcher()
+	}
+	if len(m.recovery.pending) >= machineConfigRecoveryQueueDepth {
+		m.recovery.mu.Unlock()
+		m.log.Warn().Str("vm_id", inst.ID).
+			Msg("allocation recovery queue full; this VM stays uncounted until the next restart")
+		m.recoveryFinished(inst.ID)
+		return
+	}
+	m.recovery.pending = append(m.recovery.pending, recoveryItem{inst: inst, backoff: machineConfigProbeBackoff})
+	m.recovery.mu.Unlock()
+	m.nudgeRecovery()
+}
+
+// recoveryEligible reports whether a VM still needs and can answer a
+// probe. Size unknown, still the instance the id names, and RUNNING:
+// a paused VM has no Firecracker listening, so probing one would retry
+// against a dead socket for the rest of its life.
+func (m *Manager) recoveryEligible(inst *VMInstance) bool {
+	inst.mu.RLock()
+	unsized := inst.Config.VCPU == 0 || inst.Config.MemoryMiB == 0
+	running := inst.Status == StatusRunning || inst.Status == StatusCreating
+	hasSocket := inst.SocketPath != ""
+	inst.mu.RUnlock()
+	return unsized && running && hasSocket && m.instanceIsCurrent(inst)
+}
+
+func (m *Manager) nudgeRecovery() {
+	select {
+	case m.recovery.wake <- struct{}{}:
+	default:
+	}
+}
+
+// recoveryDispatcher moves due items onto the ready channel and sleeps
+// until the next one comes due. One goroutine for the whole fleet.
+func (m *Manager) recoveryDispatcher() {
+	defer sentrylog.Recover("machine-config-recovery-dispatcher")
+	for {
+		now := time.Now()
+		var next *VMInstance
+		var sleep time.Duration
+		m.recovery.mu.Lock()
+		for i, item := range m.recovery.pending {
+			if !item.dueAt.After(now) {
+				next = item.inst
+				m.recovery.pending = append(m.recovery.pending[:i], m.recovery.pending[i+1:]...)
+				break
 			}
-			// Never invent a size on failure: an under-reported
-			// allocation is visible as a host that looks emptier than it
-			// is, while a guessed one would be wrong in a direction
-			// nothing can detect. Retry instead.
-			// Jittered: a fleet that restarts together (a deploy) would
-			// otherwise re-probe in lockstep, and every host's retries
-			// would land on its Firecrackers at the same instant.
-			wait := jitterDuration(backoff)
-			m.log.Warn().Err(err).Str("vm_id", inst.ID).Dur("retry_in", wait).
-				Msg("could not read machine configuration; allocation stays uncounted until a retry succeeds")
-			time.Sleep(wait)
-			if backoff < machineConfigProbeMaxBackoff {
-				backoff *= 2
+			if d := item.dueAt.Sub(now); sleep == 0 || d < sleep {
+				sleep = d
 			}
 		}
-	}()
+		idle := len(m.recovery.pending) == 0
+		m.recovery.mu.Unlock()
+
+		if next != nil {
+			m.recovery.ready <- next
+			continue
+		}
+		if idle {
+			<-m.recovery.wake // nothing pending; park until something is queued
+			continue
+		}
+		select {
+		case <-time.After(sleep):
+		case <-m.recovery.wake:
+		}
+	}
+}
+
+// recoveryWorker probes one VM at a time and never sleeps: a failure
+// returns the VM to the pending set with a longer, jittered due time so
+// the worker is free for the next candidate.
+func (m *Manager) recoveryWorker() {
+	defer sentrylog.Recover("machine-config-recovery-worker")
+	for inst := range m.recovery.ready {
+		if !m.recoveryEligible(inst) {
+			// Destroyed, replaced, paused, or a declared size landed
+			// while it waited — all of them end the work.
+			m.recoveryFinished(inst.ID)
+			continue
+		}
+		inst.mu.RLock()
+		socket := inst.SocketPath
+		inst.mu.RUnlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), machineConfigProbeTimeout)
+		vcpu, memoryMiB, err := machineConfigProbe(ctx, socket)
+		cancel()
+		if err == nil && vcpu > 0 && memoryMiB > 0 {
+			m.applyMachineConfig(inst, vcpu, memoryMiB)
+			m.recoveryFinished(inst.ID)
+			continue
+		}
+		// Never invent a size on failure: an under-reported allocation
+		// is visible as a host that looks emptier than it is, while a
+		// guessed one would be wrong in a direction nothing can detect.
+		m.requeueRecovery(inst, err)
+	}
+}
+
+// requeueRecovery schedules the next attempt, doubling the backoff to a
+// ceiling and jittering it so a fleet that restarted together does not
+// re-probe in lockstep.
+func (m *Manager) requeueRecovery(inst *VMInstance, probeErr error) {
+	m.recovery.mu.Lock()
+	backoff := machineConfigProbeBackoff
+	for i, item := range m.recovery.pending {
+		if item.inst == inst {
+			backoff = item.backoff
+			m.recovery.pending = append(m.recovery.pending[:i], m.recovery.pending[i+1:]...)
+			break
+		}
+	}
+	if backoff < machineConfigProbeMaxBackoff {
+		backoff *= 2
+	}
+	wait := jitterDuration(backoff)
+	m.recovery.pending = append(m.recovery.pending, recoveryItem{
+		inst: inst, dueAt: time.Now().Add(wait), backoff: backoff,
+	})
+	m.recovery.mu.Unlock()
+	m.log.Warn().Err(probeErr).Str("vm_id", inst.ID).Dur("retry_in", wait).
+		Msg("could not read machine configuration; allocation stays uncounted until a retry succeeds")
+	m.nudgeRecovery()
+}
+
+func (m *Manager) recoveryFinished(vmID string) {
+	if machineConfigBackfillDone != nil {
+		machineConfigBackfillDone(vmID)
+	}
 }
 
 // applyMachineConfig records a probed allocation in memory, and only
