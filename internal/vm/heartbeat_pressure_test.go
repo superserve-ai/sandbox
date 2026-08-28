@@ -1979,3 +1979,96 @@ func TestBackfillQueuesEveryVMWithoutDropping(t *testing.T) {
 		}
 	}
 }
+
+// The lost-wakeup race: a worker decides to discard a paused VM, a
+// resume makes it running and requests recovery, that request is deduped
+// against the tracking entry the worker is about to delete, and the VM
+// is left running, unsized, and queued nowhere.
+//
+// Driven through recoveryFinished, which is where the two steps meet:
+// finishing a VM that is eligible RIGHT NOW must leave it queued, not
+// merely untracked.
+func TestBackfillRequeuesAVMThatBecameEligibleWhileFinishing(t *testing.T) {
+	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		return 2, 1024, nil
+	})
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	inst := &VMInstance{ID: "resumed-mid-discard", Status: StatusRunning, SocketPath: "/run/fc.sock"}
+	m.vms[inst.ID] = inst
+	m.indexVM(inst.ID, inst)
+
+	// Stand in for "a worker holds this item and is about to discard it":
+	// tracked, nothing queued.
+	m.recovery.mu.Lock()
+	if m.recovery.tracked == nil {
+		m.recovery.tracked = make(map[*VMInstance]struct{})
+	}
+	m.recovery.tracked[inst] = struct{}{}
+	m.recovery.mu.Unlock()
+
+	// The resume already happened: the VM is running and unsized, and its
+	// enqueue was deduped away against that tracking entry.
+	m.recoveryFinished(inst)
+
+	m.recovery.mu.Lock()
+	_, tracked := m.recovery.tracked[inst]
+	queued := len(m.recovery.pending)
+	m.recovery.mu.Unlock()
+	if !tracked || queued == 0 {
+		t.Fatalf("a VM eligible at finish time was dropped (tracked=%v queued=%d); it would stay unsized until the next restart",
+			tracked, queued)
+	}
+
+	// Let the re-queued work finish before returning: this test started
+	// a worker pool, and leaving a probe in flight would have cleanup
+	// swap the package-level seams underneath it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		inst.mu.RLock()
+		sized := inst.Config.MemoryMiB == 1024
+		inst.mu.RUnlock()
+		if sized {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the re-queued VM was never probed")
+		}
+		select {
+		case <-done:
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// The counterpart: a VM whose probe succeeded is no longer eligible, so
+// finishing it must NOT re-queue — otherwise every successful recovery
+// would loop back into the queue forever.
+func TestBackfillDoesNotRequeueAfterSuccess(t *testing.T) {
+	stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		return 2, 1024, nil
+	})
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	inst := &VMInstance{ID: "sized", Status: StatusRunning, SocketPath: "/run/fc.sock",
+		Config: VMConfig{VCPU: 2, MemoryMiB: 1024}}
+	m.vms[inst.ID] = inst
+	m.indexVM(inst.ID, inst)
+
+	m.recovery.mu.Lock()
+	if m.recovery.tracked == nil {
+		m.recovery.tracked = make(map[*VMInstance]struct{})
+	}
+	m.recovery.tracked[inst] = struct{}{}
+	m.recovery.mu.Unlock()
+
+	m.recoveryFinished(inst)
+
+	m.recovery.mu.Lock()
+	_, tracked := m.recovery.tracked[inst]
+	queued := len(m.recovery.pending)
+	m.recovery.mu.Unlock()
+	if tracked || queued != 0 {
+		t.Fatalf("a sized VM was re-queued (tracked=%v queued=%d); recovery would never settle", tracked, queued)
+	}
+}

@@ -3751,8 +3751,21 @@ func (m *Manager) requeueRecovery(item recoveryItem, probeErr error) {
 	m.nudgeRecovery()
 }
 
-// recoveryFinished releases an instance's tracking slot so a later
-// request (a resume after it paused, say) can queue it again.
+// recoveryFinished releases an instance's tracking slot, then re-queues
+// it if it is eligible again.
+//
+// The re-check is not an optimization; it closes a lost-wakeup race.
+// Deciding to discard an item and releasing its tracking entry are
+// separate steps, and a resume landing between them finds the instance
+// still tracked, so its request is deduped away — against an entry this
+// function is about to delete. The VM would be left running, unsized,
+// and queued nowhere until the next daemon restart. Re-checking after
+// the delete means the last writer wins either way: if the resume
+// queued it, this is a no-op against the fresh tracking entry; if the
+// resume was deduped, this queues it.
+//
+// A VM whose probe SUCCEEDED is no longer eligible (its size is known),
+// so the common path stops inside the eligibility check.
 func (m *Manager) recoveryFinished(inst *VMInstance) {
 	m.recovery.mu.Lock()
 	delete(m.recovery.tracked, inst)
@@ -3760,6 +3773,7 @@ func (m *Manager) recoveryFinished(inst *VMInstance) {
 	if machineConfigBackfillDone != nil {
 		machineConfigBackfillDone(inst.ID)
 	}
+	m.backfillMachineConfigAsync(inst)
 }
 
 // applyMachineConfig records a probed allocation in memory, and only
