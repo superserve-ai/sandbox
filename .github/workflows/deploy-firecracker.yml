@@ -1,0 +1,191 @@
+# Deploy Firecracker — the VMM binary on the sandbox hosts.
+#
+# Builds nothing: it installs a release built once in the fork, so every host
+# runs identical bytes. Production never deploys without staging first.
+#
+# Host discovery matches the vmd deploy exactly, so standby hosts are out of
+# scope here for the same reasons they are there; a promoted standby needs the
+# current release installed and verified before it serves traffic.
+#
+# Running sandboxes are unaffected; PAUSED ones are not. Resuming one launches
+# a fresh Firecracker from this path, so snapshots have to survive the swap in
+# both directions — the new binary must read what the old one wrote, and a
+# rollback must read what the new one wrote. Hence the staging gate below.
+
+name: Deploy Firecracker
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to install (e.g. v1.15.0-ss1)'
+        required: true
+        type: string
+      environment:
+        description: 'Target environment (staging always runs first)'
+        required: false
+        default: staging
+        type: choice
+        options:
+          - staging
+          - production
+      target_sha256:
+        description: 'Production only: sha256 of the binary verified on staging — pins production to those exact bytes'
+        required: false
+        type: string
+      rollback_sha256:
+        description: 'Production only: sha256 of the binary production runs today — the one staging verified rolling back to'
+        required: false
+        type: string
+      staging_verified:
+        description: 'Production only: on staging, (1) a fresh sandbox created under this version works, (2) a sandbox paused before the install resumed after it, and (3) a sandbox paused under this version resumes under the version you would roll back to'
+        required: false
+        default: false
+        type: boolean
+
+# One rollout at a time: overlapping dispatches could interleave their
+# per-host loops and leave a cell on mixed digests, both reporting success.
+concurrency:
+  group: deploy-firecracker
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy-staging:
+    name: Staging
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # Input goes through the environment, not the run body: `${{ }}` is
+      # substituted before bash parses, so a tag could inject commands.
+      # The pinned digests are empty on a staging-only dispatch, where they are
+      # what this run discovers. On a production dispatch they are set, and
+      # staging is then held to the same predecessor production is moving off
+      # — otherwise the "paused before, resumed after" test would have been run
+      # against whatever staging happened to be on.
+      - name: Install
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VERSION: ${{ inputs.version }}
+          EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
+          TARGET_SHA256: ${{ inputs.target_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION"
+
+  deploy-production:
+    name: Production
+    if: inputs.environment == 'production'
+    needs: [deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      # Installing proves only that the binary loads. Snapshot formats are
+      # versioned, and the swap sits between what was written before it and
+      # what is resumed after — in both directions, rollback included.
+      - name: Require the pinned digests
+        env:
+          ROLLBACK: ${{ inputs.rollback_sha256 }}
+          TARGET: ${{ inputs.target_sha256 }}
+        run: |
+          if ! printf '%s' "$ROLLBACK" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::rollback_sha256 must be the sha256 of the binary production runs today (64 lowercase hex). Without it the staging verification is not bound to the binary these hosts would actually roll back to."
+            exit 1
+          fi
+          if ! printf '%s' "$TARGET" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::target_sha256 must be the sha256 verified on staging (64 lowercase hex). Release assets can be replaced, so without it production is not bound to the bytes that were tested."
+            exit 1
+          fi
+
+      - name: Require staging verification
+        env:
+          VERIFIED: ${{ inputs.staging_verified }}
+        run: |
+          if [ "$VERIFIED" != "true" ]; then
+            echo "::error::staging_verified is not set. On staging, confirm all three before deploying to production: (1) a fresh sandbox created under this version works; (2) a sandbox paused BEFORE the install resumes AFTER it; (3) a sandbox paused under this version resumes under the version you would roll back to — otherwise the rollout is forward-only and rollback will strand those sandboxes."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # Two cells, each discovered by its own region: one run scoped to a
+      # single region would filter the other out and still report success.
+      # Steps rather than jobs — a second job on the production environment
+      # would double any approval gate. use4 is unguarded, so a missing
+      # region fails the deploy rather than skipping the primary cell.
+      # Both cells are checked before either is changed: a second cell found
+      # on an unexpected binary should stop the rollout, not be discovered
+      # after the first has already been swapped.
+      - name: Preflight the use4 cell
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VERSION: ${{ inputs.version }}
+          EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
+          TARGET_SHA256: ${{ inputs.target_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION" --preflight-only
+
+      # Gated on whether the cell exists, not on the value that scopes it: a
+      # region left unset must abort in the script, not skip the cell and
+      # report success with it still on the old binary.
+      - name: Preflight the usw cell
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USW }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VERSION: ${{ inputs.version }}
+          EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
+          TARGET_SHA256: ${{ inputs.target_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION" --preflight-only
+
+      - name: Install on the use4 cell
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VERSION: ${{ inputs.version }}
+          EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
+          TARGET_SHA256: ${{ inputs.target_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION"
+
+      - name: Install on the usw cell
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION_USW }}
+          VMD_LABEL: ${{ vars.VMD_LABEL }}
+          VERSION: ${{ inputs.version }}
+          EXPECTED_CURRENT_SHA256: ${{ inputs.rollback_sha256 }}
+          TARGET_SHA256: ${{ inputs.target_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/workflows/scripts/deploy-firecracker.py --version "$VERSION"
