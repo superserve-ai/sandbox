@@ -14,16 +14,17 @@ import (
 )
 
 const activateTeamBilling = `-- name: ActivateTeamBilling :exec
-SELECT activate_team_billing($1, $2)
+SELECT activate_team_billing($1, $2::uuid, $3)
 `
 
 type ActivateTeamBillingParams struct {
-	TeamID        uuid.UUID `json:"team_id"`
-	StripeGrantID string    `json:"stripe_grant_id"`
+	TeamID        uuid.UUID   `json:"team_id"`
+	UserID        pgtype.UUID `json:"user_id"`
+	StripeGrantID string      `json:"stripe_grant_id"`
 }
 
 func (q *Queries) ActivateTeamBilling(ctx context.Context, arg ActivateTeamBillingParams) error {
-	_, err := q.db.Exec(ctx, activateTeamBilling, arg.TeamID, arg.StripeGrantID)
+	_, err := q.db.Exec(ctx, activateTeamBilling, arg.TeamID, arg.UserID, arg.StripeGrantID)
 	return err
 }
 
@@ -164,14 +165,8 @@ func (q *Queries) AssignTeamPricingPlan(ctx context.Context, arg AssignTeamPrici
 }
 
 const beginTeamBillingCheckout = `-- name: BeginTeamBillingCheckout :one
-UPDATE team_billing_account
-SET checkout_initializing_at = now(),
-    checkout_anchor_snapshot = commercial_billing_anchor,
-    checkout_session_id = NULL,
-    updated_at = now()
-WHERE team_id = $1
-  AND (checkout_initializing_at IS NULL OR checkout_initializing_at < now() - interval '32 minutes')
-RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id
+UPDATE team_billing_account SET checkout_initializing_at = now(), checkout_anchor_snapshot = commercial_billing_anchor, checkout_session_id = NULL, updated_at = now()
+WHERE team_id = $1 AND (checkout_initializing_at IS NULL OR checkout_initializing_at < now() - interval '32 minutes') RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at
 `
 
 func (q *Queries) BeginTeamBillingCheckout(ctx context.Context, teamID uuid.UUID) (TeamBillingAccount, error) {
@@ -196,6 +191,11 @@ func (q *Queries) BeginTeamBillingCheckout(ctx context.Context, teamID uuid.UUID
 		&i.CheckoutInitializingAt,
 		&i.CheckoutAnchorSnapshot,
 		&i.CheckoutSessionID,
+		&i.StripeActivationUserID,
+		&i.StripeActivationCreditReservedAt,
+		&i.StripeActivationCreditReservationEventID,
+		&i.StripeCheckoutActorID,
+		&i.StripeCheckoutActorClaimedAt,
 	)
 	return i, err
 }
@@ -245,6 +245,61 @@ func (q *Queries) BlockTeamBillingPeriod(ctx context.Context, arg BlockTeamBilli
 		&i.GrossChargesUsd,
 		&i.CreditsAppliedUsd,
 		&i.NetInvoiceAmountUsd,
+	)
+	return i, err
+}
+
+const claimStripeCheckoutActor = `-- name: ClaimStripeCheckoutActor :one
+UPDATE team_billing_account
+SET stripe_checkout_actor_id = CASE
+        WHEN stripe_checkout_actor_id IS NULL
+          OR stripe_checkout_actor_claimed_at < now() - interval '24 hours'
+        THEN $1
+        ELSE stripe_checkout_actor_id
+    END,
+    stripe_checkout_actor_claimed_at = CASE
+        WHEN stripe_checkout_actor_id IS NULL
+          OR stripe_checkout_actor_claimed_at < now() - interval '24 hours'
+        THEN now()
+        ELSE stripe_checkout_actor_claimed_at
+    END,
+    updated_at = now()
+WHERE team_id = $2
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at
+`
+
+type ClaimStripeCheckoutActorParams struct {
+	ActorID pgtype.UUID `json:"actor_id"`
+	TeamID  uuid.UUID   `json:"team_id"`
+}
+
+func (q *Queries) ClaimStripeCheckoutActor(ctx context.Context, arg ClaimStripeCheckoutActorParams) (TeamBillingAccount, error) {
+	row := q.db.QueryRow(ctx, claimStripeCheckoutActor, arg.ActorID, arg.TeamID)
+	var i TeamBillingAccount
+	err := row.Scan(
+		&i.TeamID,
+		&i.StripeCustomerID,
+		&i.StripeSubscriptionID,
+		&i.StripeSubscriptionStatus,
+		&i.CurrentPeriodStart,
+		&i.CurrentPeriodEnd,
+		&i.CancelAtPeriodEnd,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.StripeInvoiceStatus,
+		&i.StripeSubscriptionEventAt,
+		&i.TrialEndedAt,
+		&i.StripeActivationCreditGrantedAt,
+		&i.StripeActivationCreditGrantID,
+		&i.CommercialBillingAnchor,
+		&i.CheckoutInitializingAt,
+		&i.CheckoutAnchorSnapshot,
+		&i.CheckoutSessionID,
+		&i.StripeActivationUserID,
+		&i.StripeActivationCreditReservedAt,
+		&i.StripeActivationCreditReservationEventID,
+		&i.StripeCheckoutActorID,
+		&i.StripeCheckoutActorClaimedAt,
 	)
 	return i, err
 }
@@ -446,12 +501,7 @@ func (q *Queries) EstablishBillingCutover(ctx context.Context, arg EstablishBill
 }
 
 const finishTeamBillingCheckout = `-- name: FinishTeamBillingCheckout :exec
-UPDATE team_billing_account
-SET checkout_initializing_at = NULL,
-    checkout_anchor_snapshot = NULL,
-    checkout_session_id = NULL,
-    updated_at = now()
-WHERE team_id = $1
+UPDATE team_billing_account SET checkout_initializing_at = NULL, checkout_anchor_snapshot = NULL, checkout_session_id = NULL, updated_at = now() WHERE team_id = $1
 `
 
 func (q *Queries) FinishTeamBillingCheckout(ctx context.Context, teamID uuid.UUID) error {
@@ -460,14 +510,7 @@ func (q *Queries) FinishTeamBillingCheckout(ctx context.Context, teamID uuid.UUI
 }
 
 const finishTeamBillingCheckoutForSubscription = `-- name: FinishTeamBillingCheckoutForSubscription :exec
-UPDATE team_billing_account
-SET checkout_initializing_at = NULL,
-    checkout_anchor_snapshot = NULL,
-    checkout_session_id = NULL,
-    updated_at = now()
-WHERE team_id = $1
-  AND stripe_subscription_id = $2
-  AND checkout_initializing_at IS NOT NULL
+UPDATE team_billing_account SET checkout_initializing_at = NULL, checkout_anchor_snapshot = NULL, checkout_session_id = NULL, updated_at = now() WHERE team_id = $1 AND stripe_subscription_id = $2 AND checkout_initializing_at IS NOT NULL
 `
 
 type FinishTeamBillingCheckoutForSubscriptionParams struct {
@@ -477,27 +520,6 @@ type FinishTeamBillingCheckoutForSubscriptionParams struct {
 
 func (q *Queries) FinishTeamBillingCheckoutForSubscription(ctx context.Context, arg FinishTeamBillingCheckoutForSubscriptionParams) error {
 	_, err := q.db.Exec(ctx, finishTeamBillingCheckoutForSubscription, arg.TeamID, arg.SubscriptionID)
-	return err
-}
-
-const finishTeamBillingCheckoutIfStartedBefore = `-- name: FinishTeamBillingCheckoutIfStartedBefore :exec
-UPDATE team_billing_account
-SET checkout_initializing_at = NULL,
-    checkout_anchor_snapshot = NULL,
-    updated_at = now()
-WHERE team_id = $1
-  AND checkout_initializing_at <= $2
-  AND checkout_session_id = $3
-`
-
-type FinishTeamBillingCheckoutIfStartedBeforeParams struct {
-	TeamID    uuid.UUID          `json:"team_id"`
-	EventAt   pgtype.Timestamptz `json:"event_at"`
-	SessionID *string            `json:"session_id"`
-}
-
-func (q *Queries) FinishTeamBillingCheckoutIfStartedBefore(ctx context.Context, arg FinishTeamBillingCheckoutIfStartedBeforeParams) error {
-	_, err := q.db.Exec(ctx, finishTeamBillingCheckoutIfStartedBefore, arg.TeamID, arg.EventAt, arg.SessionID)
 	return err
 }
 
@@ -595,6 +617,22 @@ func (q *Queries) GetBillingUsageExportByIdentifier(ctx context.Context, stripeM
 	return i, err
 }
 
+const getLegacyStripeActivationUser = `-- name: GetLegacyStripeActivationUser :one
+SELECT tm.profile_id AS user_id
+FROM team_member tm
+WHERE tm.team_id = $1
+  AND tm.role IN ('owner', 'team_owner')
+ORDER BY tm.joined_at, tm.profile_id
+LIMIT 1
+`
+
+func (q *Queries) GetLegacyStripeActivationUser(ctx context.Context, teamID uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getLegacyStripeActivationUser, teamID)
+	var user_id uuid.UUID
+	err := row.Scan(&user_id)
+	return user_id, err
+}
+
 const getStripeWebhookEvent = `-- name: GetStripeWebhookEvent :one
 SELECT event_id, event_type, payload, received_at, processed_at, last_error, updated_at
 FROM stripe_webhook_event
@@ -660,29 +698,34 @@ func (q *Queries) GetTeamActivePricingPlan(ctx context.Context, teamID uuid.UUID
 }
 
 const getTeamBillingAccount = `-- name: GetTeamBillingAccount :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, commercial_billing_anchor, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, checkout_initializing_at, checkout_session_id
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, commercial_billing_anchor, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, checkout_initializing_at, checkout_session_id, stripe_activation_user_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id
 FROM team_billing_account
 WHERE team_id = $1
 `
 
 type GetTeamBillingAccountRow struct {
-	TeamID                          uuid.UUID          `json:"team_id"`
-	StripeCustomerID                *string            `json:"stripe_customer_id"`
-	StripeSubscriptionID            *string            `json:"stripe_subscription_id"`
-	StripeSubscriptionStatus        *string            `json:"stripe_subscription_status"`
-	StripeInvoiceStatus             *string            `json:"stripe_invoice_status"`
-	StripeSubscriptionEventAt       pgtype.Timestamptz `json:"stripe_subscription_event_at"`
-	CurrentPeriodStart              pgtype.Timestamptz `json:"current_period_start"`
-	CurrentPeriodEnd                pgtype.Timestamptz `json:"current_period_end"`
-	CommercialBillingAnchor         pgtype.Timestamptz `json:"commercial_billing_anchor"`
-	CancelAtPeriodEnd               bool               `json:"cancel_at_period_end"`
-	CreatedAt                       time.Time          `json:"created_at"`
-	UpdatedAt                       time.Time          `json:"updated_at"`
-	TrialEndedAt                    pgtype.Timestamptz `json:"trial_ended_at"`
-	StripeActivationCreditGrantedAt pgtype.Timestamptz `json:"stripe_activation_credit_granted_at"`
-	StripeActivationCreditGrantID   *string            `json:"stripe_activation_credit_grant_id"`
-	CheckoutInitializingAt          pgtype.Timestamptz `json:"checkout_initializing_at"`
-	CheckoutSessionID               *string            `json:"checkout_session_id"`
+	TeamID                                   uuid.UUID          `json:"team_id"`
+	StripeCustomerID                         *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID                     *string            `json:"stripe_subscription_id"`
+	StripeSubscriptionStatus                 *string            `json:"stripe_subscription_status"`
+	StripeInvoiceStatus                      *string            `json:"stripe_invoice_status"`
+	StripeSubscriptionEventAt                pgtype.Timestamptz `json:"stripe_subscription_event_at"`
+	CurrentPeriodStart                       pgtype.Timestamptz `json:"current_period_start"`
+	CurrentPeriodEnd                         pgtype.Timestamptz `json:"current_period_end"`
+	CommercialBillingAnchor                  pgtype.Timestamptz `json:"commercial_billing_anchor"`
+	CancelAtPeriodEnd                        bool               `json:"cancel_at_period_end"`
+	CreatedAt                                time.Time          `json:"created_at"`
+	UpdatedAt                                time.Time          `json:"updated_at"`
+	TrialEndedAt                             pgtype.Timestamptz `json:"trial_ended_at"`
+	StripeActivationCreditGrantedAt          pgtype.Timestamptz `json:"stripe_activation_credit_granted_at"`
+	StripeActivationCreditGrantID            *string            `json:"stripe_activation_credit_grant_id"`
+	CheckoutInitializingAt                   pgtype.Timestamptz `json:"checkout_initializing_at"`
+	CheckoutSessionID                        *string            `json:"checkout_session_id"`
+	StripeActivationUserID                   pgtype.UUID        `json:"stripe_activation_user_id"`
+	StripeCheckoutActorID                    pgtype.UUID        `json:"stripe_checkout_actor_id"`
+	StripeCheckoutActorClaimedAt             pgtype.Timestamptz `json:"stripe_checkout_actor_claimed_at"`
+	StripeActivationCreditReservedAt         pgtype.Timestamptz `json:"stripe_activation_credit_reserved_at"`
+	StripeActivationCreditReservationEventID *string            `json:"stripe_activation_credit_reservation_event_id"`
 }
 
 func (q *Queries) GetTeamBillingAccount(ctx context.Context, teamID uuid.UUID) (GetTeamBillingAccountRow, error) {
@@ -706,34 +749,44 @@ func (q *Queries) GetTeamBillingAccount(ctx context.Context, teamID uuid.UUID) (
 		&i.StripeActivationCreditGrantID,
 		&i.CheckoutInitializingAt,
 		&i.CheckoutSessionID,
+		&i.StripeActivationUserID,
+		&i.StripeCheckoutActorID,
+		&i.StripeCheckoutActorClaimedAt,
+		&i.StripeActivationCreditReservedAt,
+		&i.StripeActivationCreditReservationEventID,
 	)
 	return i, err
 }
 
 const getTeamBillingAccountByStripeCustomerID = `-- name: GetTeamBillingAccountByStripeCustomerID :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, commercial_billing_anchor, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, checkout_initializing_at, checkout_session_id
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, commercial_billing_anchor, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, checkout_initializing_at, checkout_session_id, stripe_activation_user_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id
 FROM team_billing_account
 WHERE stripe_customer_id = $1
 `
 
 type GetTeamBillingAccountByStripeCustomerIDRow struct {
-	TeamID                          uuid.UUID          `json:"team_id"`
-	StripeCustomerID                *string            `json:"stripe_customer_id"`
-	StripeSubscriptionID            *string            `json:"stripe_subscription_id"`
-	StripeSubscriptionStatus        *string            `json:"stripe_subscription_status"`
-	StripeInvoiceStatus             *string            `json:"stripe_invoice_status"`
-	StripeSubscriptionEventAt       pgtype.Timestamptz `json:"stripe_subscription_event_at"`
-	CurrentPeriodStart              pgtype.Timestamptz `json:"current_period_start"`
-	CurrentPeriodEnd                pgtype.Timestamptz `json:"current_period_end"`
-	CommercialBillingAnchor         pgtype.Timestamptz `json:"commercial_billing_anchor"`
-	CancelAtPeriodEnd               bool               `json:"cancel_at_period_end"`
-	CreatedAt                       time.Time          `json:"created_at"`
-	UpdatedAt                       time.Time          `json:"updated_at"`
-	TrialEndedAt                    pgtype.Timestamptz `json:"trial_ended_at"`
-	StripeActivationCreditGrantedAt pgtype.Timestamptz `json:"stripe_activation_credit_granted_at"`
-	StripeActivationCreditGrantID   *string            `json:"stripe_activation_credit_grant_id"`
-	CheckoutInitializingAt          pgtype.Timestamptz `json:"checkout_initializing_at"`
-	CheckoutSessionID               *string            `json:"checkout_session_id"`
+	TeamID                                   uuid.UUID          `json:"team_id"`
+	StripeCustomerID                         *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID                     *string            `json:"stripe_subscription_id"`
+	StripeSubscriptionStatus                 *string            `json:"stripe_subscription_status"`
+	StripeInvoiceStatus                      *string            `json:"stripe_invoice_status"`
+	StripeSubscriptionEventAt                pgtype.Timestamptz `json:"stripe_subscription_event_at"`
+	CurrentPeriodStart                       pgtype.Timestamptz `json:"current_period_start"`
+	CurrentPeriodEnd                         pgtype.Timestamptz `json:"current_period_end"`
+	CommercialBillingAnchor                  pgtype.Timestamptz `json:"commercial_billing_anchor"`
+	CancelAtPeriodEnd                        bool               `json:"cancel_at_period_end"`
+	CreatedAt                                time.Time          `json:"created_at"`
+	UpdatedAt                                time.Time          `json:"updated_at"`
+	TrialEndedAt                             pgtype.Timestamptz `json:"trial_ended_at"`
+	StripeActivationCreditGrantedAt          pgtype.Timestamptz `json:"stripe_activation_credit_granted_at"`
+	StripeActivationCreditGrantID            *string            `json:"stripe_activation_credit_grant_id"`
+	CheckoutInitializingAt                   pgtype.Timestamptz `json:"checkout_initializing_at"`
+	CheckoutSessionID                        *string            `json:"checkout_session_id"`
+	StripeActivationUserID                   pgtype.UUID        `json:"stripe_activation_user_id"`
+	StripeCheckoutActorID                    pgtype.UUID        `json:"stripe_checkout_actor_id"`
+	StripeCheckoutActorClaimedAt             pgtype.Timestamptz `json:"stripe_checkout_actor_claimed_at"`
+	StripeActivationCreditReservedAt         pgtype.Timestamptz `json:"stripe_activation_credit_reserved_at"`
+	StripeActivationCreditReservationEventID *string            `json:"stripe_activation_credit_reservation_event_id"`
 }
 
 func (q *Queries) GetTeamBillingAccountByStripeCustomerID(ctx context.Context, stripeCustomerID *string) (GetTeamBillingAccountByStripeCustomerIDRow, error) {
@@ -757,6 +810,11 @@ func (q *Queries) GetTeamBillingAccountByStripeCustomerID(ctx context.Context, s
 		&i.StripeActivationCreditGrantID,
 		&i.CheckoutInitializingAt,
 		&i.CheckoutSessionID,
+		&i.StripeActivationUserID,
+		&i.StripeCheckoutActorID,
+		&i.StripeCheckoutActorClaimedAt,
+		&i.StripeActivationCreditReservedAt,
+		&i.StripeActivationCreditReservationEventID,
 	)
 	return i, err
 }
@@ -1052,6 +1110,22 @@ func (q *Queries) GrantTeamCredit(ctx context.Context, arg GrantTeamCreditParams
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const hasSignupTrialCredit = `-- name: HasSignupTrialCredit :one
+SELECT EXISTS (
+    SELECT 1
+    FROM team_credit_grant
+    WHERE team_id = $1
+      AND reason = 'signup trial credit'
+) AS has_signup_trial
+`
+
+func (q *Queries) HasSignupTrialCredit(ctx context.Context, teamID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasSignupTrialCredit, teamID)
+	var has_signup_trial bool
+	err := row.Scan(&has_signup_trial)
+	return has_signup_trial, err
 }
 
 const isFeatureEnabledForTeam = `-- name: IsFeatureEnabledForTeam :one
@@ -2035,6 +2109,87 @@ func (q *Queries) RefreshTeamTrialEligibility(ctx context.Context, teamID uuid.U
 	return err
 }
 
+const releaseStripeCheckoutActor = `-- name: ReleaseStripeCheckoutActor :exec
+UPDATE team_billing_account
+SET stripe_checkout_actor_id = NULL,
+    stripe_checkout_actor_claimed_at = NULL,
+    updated_at = now()
+WHERE team_id = $1
+  AND stripe_checkout_actor_id = $2
+`
+
+type ReleaseStripeCheckoutActorParams struct {
+	TeamID  uuid.UUID   `json:"team_id"`
+	ActorID pgtype.UUID `json:"actor_id"`
+}
+
+func (q *Queries) ReleaseStripeCheckoutActor(ctx context.Context, arg ReleaseStripeCheckoutActorParams) error {
+	_, err := q.db.Exec(ctx, releaseStripeCheckoutActor, arg.TeamID, arg.ActorID)
+	return err
+}
+
+const releaseStripePromotion = `-- name: ReleaseStripePromotion :exec
+SELECT release_stripe_promotion($1::uuid, $2::uuid)
+`
+
+type ReleaseStripePromotionParams struct {
+	TeamID uuid.UUID `json:"team_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) ReleaseStripePromotion(ctx context.Context, arg ReleaseStripePromotionParams) error {
+	_, err := q.db.Exec(ctx, releaseStripePromotion, arg.TeamID, arg.UserID)
+	return err
+}
+
+const releaseStripePromotionForEvent = `-- name: ReleaseStripePromotionForEvent :exec
+SELECT release_stripe_promotion_for_event($1::uuid, $2::uuid, $3)
+`
+
+type ReleaseStripePromotionForEventParams struct {
+	TeamID  uuid.UUID `json:"team_id"`
+	UserID  uuid.UUID `json:"user_id"`
+	EventID string    `json:"event_id"`
+}
+
+func (q *Queries) ReleaseStripePromotionForEvent(ctx context.Context, arg ReleaseStripePromotionForEventParams) error {
+	_, err := q.db.Exec(ctx, releaseStripePromotionForEvent, arg.TeamID, arg.UserID, arg.EventID)
+	return err
+}
+
+const reserveStripePromotion = `-- name: ReserveStripePromotion :one
+SELECT reserve_stripe_promotion($1::uuid, $2::uuid) AS reserved
+`
+
+type ReserveStripePromotionParams struct {
+	TeamID uuid.UUID `json:"team_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) ReserveStripePromotion(ctx context.Context, arg ReserveStripePromotionParams) (bool, error) {
+	row := q.db.QueryRow(ctx, reserveStripePromotion, arg.TeamID, arg.UserID)
+	var reserved bool
+	err := row.Scan(&reserved)
+	return reserved, err
+}
+
+const reserveStripePromotionForEvent = `-- name: ReserveStripePromotionForEvent :one
+SELECT reserve_stripe_promotion_for_event($1::uuid, $2::uuid, $3) AS reserved
+`
+
+type ReserveStripePromotionForEventParams struct {
+	TeamID  uuid.UUID `json:"team_id"`
+	UserID  uuid.UUID `json:"user_id"`
+	EventID string    `json:"event_id"`
+}
+
+func (q *Queries) ReserveStripePromotionForEvent(ctx context.Context, arg ReserveStripePromotionForEventParams) (bool, error) {
+	row := q.db.QueryRow(ctx, reserveStripePromotionForEvent, arg.TeamID, arg.UserID, arg.EventID)
+	var reserved bool
+	err := row.Scan(&reserved)
+	return reserved, err
+}
+
 const resolveBillingPeriodAnomaly = `-- name: ResolveBillingPeriodAnomaly :one
 UPDATE billing_period_anomaly
 SET resolved_at = now(),
@@ -2135,10 +2290,7 @@ func (q *Queries) SetFeatureFlag(ctx context.Context, arg SetFeatureFlagParams) 
 }
 
 const setTeamBillingCheckoutSession = `-- name: SetTeamBillingCheckoutSession :exec
-UPDATE team_billing_account
-SET checkout_session_id = $1, updated_at = now()
-WHERE team_id = $2
-  AND checkout_initializing_at IS NOT NULL
+UPDATE team_billing_account SET checkout_session_id = $1, updated_at = now() WHERE team_id = $2 AND checkout_initializing_at IS NOT NULL
 `
 
 type SetTeamBillingCheckoutSessionParams struct {
@@ -2177,6 +2329,36 @@ func (q *Queries) SetTeamFeatureFlag(ctx context.Context, arg SetTeamFeatureFlag
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const stripePromotionEligible = `-- name: StripePromotionEligible :one
+WITH locks AS (
+    SELECT lock_stripe_promotion($1::uuid, $2::uuid) AS locked
+)
+SELECT COALESCE(
+    (NOT EXISTS (
+    SELECT 1 FROM team_billing_account tba
+    WHERE tba.team_id = $1::uuid
+      AND (stripe_activation_credit_grant_id IS NOT NULL
+           OR stripe_activation_credit_granted_at IS NOT NULL))
+    AND ($2::uuid IS NULL OR NOT EXISTS (
+    SELECT 1 FROM user_promotion_entitlement upe
+    WHERE upe.user_id = $2::uuid
+      AND (upe.stripe_redemption_at IS NOT NULL OR upe.stripe_redemption_reserved_team_id IS NOT NULL)
+    ))), false)::boolean AS eligible
+FROM locks
+`
+
+type StripePromotionEligibleParams struct {
+	TeamID uuid.UUID   `json:"team_id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+func (q *Queries) StripePromotionEligible(ctx context.Context, arg StripePromotionEligibleParams) (bool, error) {
+	row := q.db.QueryRow(ctx, stripePromotionEligible, arg.TeamID, arg.UserID)
+	var eligible bool
+	err := row.Scan(&eligible)
+	return eligible, err
 }
 
 const updateBillingUsageExportStatus = `-- name: UpdateBillingUsageExportStatus :one
@@ -2275,7 +2457,7 @@ VALUES ($1, $2)
 ON CONFLICT (team_id) DO UPDATE
 SET stripe_customer_id = EXCLUDED.stripe_customer_id,
     updated_at = now()
-RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at
 `
 
 type UpsertTeamBillingAccountCustomerParams struct {
@@ -2305,6 +2487,11 @@ func (q *Queries) UpsertTeamBillingAccountCustomer(ctx context.Context, arg Upse
 		&i.CheckoutInitializingAt,
 		&i.CheckoutAnchorSnapshot,
 		&i.CheckoutSessionID,
+		&i.StripeActivationUserID,
+		&i.StripeActivationCreditReservedAt,
+		&i.StripeActivationCreditReservationEventID,
+		&i.StripeCheckoutActorID,
+		&i.StripeCheckoutActorClaimedAt,
 	)
 	return i, err
 }
@@ -2319,7 +2506,6 @@ INSERT INTO team_billing_account (
     stripe_subscription_event_at,
     current_period_start,
     current_period_end,
-    commercial_billing_anchor,
     cancel_at_period_end
 )
 VALUES (
@@ -2331,8 +2517,7 @@ VALUES (
     $6,
     $7,
     $8,
-    COALESCE($9::timestamptz, $7::timestamptz),
-    COALESCE($10, false)
+    COALESCE($9, false)
 )
 ON CONFLICT (team_id) DO UPDATE
 SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_account.stripe_customer_id),
@@ -2342,10 +2527,9 @@ SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_acco
     stripe_subscription_event_at = COALESCE(EXCLUDED.stripe_subscription_event_at, team_billing_account.stripe_subscription_event_at),
     current_period_start = COALESCE(EXCLUDED.current_period_start, team_billing_account.current_period_start),
     current_period_end = COALESCE(EXCLUDED.current_period_end, team_billing_account.current_period_end),
-    commercial_billing_anchor = COALESCE(team_billing_account.commercial_billing_anchor, EXCLUDED.commercial_billing_anchor),
-    cancel_at_period_end = COALESCE($10, team_billing_account.cancel_at_period_end),
+    cancel_at_period_end = COALESCE($9, team_billing_account.cancel_at_period_end),
     updated_at = now()
-RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at
 `
 
 type UpsertTeamBillingAccountSubscriptionParams struct {
@@ -2357,7 +2541,6 @@ type UpsertTeamBillingAccountSubscriptionParams struct {
 	StripeSubscriptionEventAt pgtype.Timestamptz `json:"stripe_subscription_event_at"`
 	CurrentPeriodStart        pgtype.Timestamptz `json:"current_period_start"`
 	CurrentPeriodEnd          pgtype.Timestamptz `json:"current_period_end"`
-	CommercialBillingAnchor   pgtype.Timestamptz `json:"commercial_billing_anchor"`
 	CancelAtPeriodEnd         interface{}        `json:"cancel_at_period_end"`
 }
 
@@ -2371,7 +2554,6 @@ func (q *Queries) UpsertTeamBillingAccountSubscription(ctx context.Context, arg 
 		arg.StripeSubscriptionEventAt,
 		arg.CurrentPeriodStart,
 		arg.CurrentPeriodEnd,
-		arg.CommercialBillingAnchor,
 		arg.CancelAtPeriodEnd,
 	)
 	var i TeamBillingAccount
@@ -2394,35 +2576,22 @@ func (q *Queries) UpsertTeamBillingAccountSubscription(ctx context.Context, arg 
 		&i.CheckoutInitializingAt,
 		&i.CheckoutAnchorSnapshot,
 		&i.CheckoutSessionID,
+		&i.StripeActivationUserID,
+		&i.StripeActivationCreditReservedAt,
+		&i.StripeActivationCreditReservationEventID,
+		&i.StripeCheckoutActorID,
+		&i.StripeCheckoutActorClaimedAt,
 	)
 	return i, err
 }
 
 const upsertTeamBillingPeriod = `-- name: UpsertTeamBillingPeriod :one
 INSERT INTO team_billing_period (team_id, period_start, period_end, status)
-SELECT
+VALUES (
     $1,
     $2,
     $3,
     $4
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM team_billing_period billed
-    WHERE billed.team_id = $1
-      AND (billed.period_start, billed.period_end) <>
-          ($2, $3)
-      AND (
-          billed.status = 'exported'
-          OR billed.exported_at IS NOT NULL
-          OR (
-              billed.finalized_at IS NOT NULL
-              AND (billed.blocked_reason IS NULL OR billed.blocked_reason NOT IN (
-                  'reporting_only_calendar_period', 'discarded_before_billing_cutover'
-              ))
-          )
-      )
-      AND tstzrange(billed.period_start, billed.period_end, '[)') &&
-          tstzrange($2, $3, '[)')
 )
 ON CONFLICT (team_id, period_start, period_end) DO UPDATE
 SET status = CASE

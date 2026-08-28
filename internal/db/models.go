@@ -751,10 +751,15 @@ type TeamBillingAccount struct {
 	StripeActivationCreditGrantedAt pgtype.Timestamptz `json:"stripe_activation_credit_granted_at"`
 	StripeActivationCreditGrantID   *string            `json:"stripe_activation_credit_grant_id"`
 	// Authoritative Superserve commercial billing start. May predate Stripe subscription creation and must not be overwritten by Checkout time.
-	CommercialBillingAnchor pgtype.Timestamptz `json:"commercial_billing_anchor"`
-	CheckoutInitializingAt  pgtype.Timestamptz `json:"checkout_initializing_at"`
-	CheckoutAnchorSnapshot  pgtype.Timestamptz `json:"checkout_anchor_snapshot"`
-	CheckoutSessionID       *string            `json:"checkout_session_id"`
+	CommercialBillingAnchor                  pgtype.Timestamptz `json:"commercial_billing_anchor"`
+	CheckoutInitializingAt                   pgtype.Timestamptz `json:"checkout_initializing_at"`
+	CheckoutAnchorSnapshot                   pgtype.Timestamptz `json:"checkout_anchor_snapshot"`
+	CheckoutSessionID                        *string            `json:"checkout_session_id"`
+	StripeActivationUserID                   pgtype.UUID        `json:"stripe_activation_user_id"`
+	StripeActivationCreditReservedAt         pgtype.Timestamptz `json:"stripe_activation_credit_reserved_at"`
+	StripeActivationCreditReservationEventID *string            `json:"stripe_activation_credit_reservation_event_id"`
+	StripeCheckoutActorID                    pgtype.UUID        `json:"stripe_checkout_actor_id"`
+	StripeCheckoutActorClaimedAt             pgtype.Timestamptz `json:"stripe_checkout_actor_claimed_at"`
 }
 
 type TeamBillingPeriod struct {
@@ -911,6 +916,18 @@ type TemplateBuild struct {
 	UpdatedAt     time.Time           `json:"updated_at"`
 }
 
+type UserPromotionEntitlement struct {
+	UserID                         uuid.UUID          `json:"user_id"`
+	SignupTrialClaimedAt           pgtype.Timestamptz `json:"signup_trial_claimed_at"`
+	SignupTrialTeamID              pgtype.UUID        `json:"signup_trial_team_id"`
+	StripeRedemptionAt             pgtype.Timestamptz `json:"stripe_redemption_at"`
+	StripeRedemptionTeamID         pgtype.UUID        `json:"stripe_redemption_team_id"`
+	StripeRedemptionReservedTeamID pgtype.UUID        `json:"stripe_redemption_reserved_team_id"`
+	StripeRedemptionReservedAt     pgtype.Timestamptz `json:"stripe_redemption_reserved_at"`
+	CreatedAt                      time.Time          `json:"created_at"`
+	UpdatedAt                      time.Time          `json:"updated_at"`
+}
+
 type UserRoleAssignment struct {
 	ID        uuid.UUID          `json:"id"`
 	UserID    uuid.UUID          `json:"user_id"`
@@ -922,4 +939,11 @@ type UserRoleAssignment struct {
 	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
 	CreatedAt time.Time          `json:"created_at"`
 	UpdatedAt time.Time          `json:"updated_at"`
+}
+
+type UserSignupTrialClaim struct {
+	UserID    uuid.UUID   `json:"user_id"`
+	ClaimedAt time.Time   `json:"claimed_at"`
+	TeamID    pgtype.UUID `json:"team_id"`
+	CreatedAt time.Time   `json:"created_at"`
 }

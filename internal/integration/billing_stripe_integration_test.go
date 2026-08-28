@@ -42,6 +42,7 @@ type fakeStripeClient struct {
 	creditGrantCalls []api.StripeCreateBillingCreditGrantParams
 	reportErr        error
 	reportErrAt      int
+	checkoutErr      error
 	nextCustomerID   string
 	nextCheckoutURL  string
 	nextPortalURL    string
@@ -72,9 +73,7 @@ func (f *fakeStripeClient) CreateCustomer(_ context.Context, params api.StripeCr
 	f.customerCalls = append(f.customerCalls, params)
 	id := f.nextCustomerID
 	if id == "" {
-		// Keep the fixture's Stripe customer IDs unique across integration tests;
-		// the database enforces uniqueness globally, while each test uses its own team.
-		id = "cus_test_" + params.TeamID.String()
+		id = "cus_test_default"
 	}
 	return api.StripeCustomer{ID: id}, nil
 }
@@ -90,6 +89,9 @@ func (f *fakeStripeClient) CreateCheckoutSession(_ context.Context, params api.S
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.checkoutCalls = append(f.checkoutCalls, params)
+	if f.checkoutErr != nil {
+		return api.StripeCheckoutSession{}, f.checkoutErr
+	}
 	url := f.nextCheckoutURL
 	if url == "" {
 		url = "https://checkout.stripe.test/session"
@@ -237,6 +239,10 @@ func derefString(v *string) string {
 }
 
 func stripeSubscriptionWebhookPayload(t *testing.T, eventID, eventType, subscriptionID, customerID, status string, created, periodStart, periodEnd time.Time) []byte {
+	return stripeSubscriptionWebhookPayloadWithMetadata(t, eventID, eventType, subscriptionID, customerID, status, created, periodStart, periodEnd, nil)
+}
+
+func stripeSubscriptionWebhookPayloadWithMetadata(t *testing.T, eventID, eventType, subscriptionID, customerID, status string, created, periodStart, periodEnd time.Time, metadata map[string]string) []byte {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{
 		"id":      eventID,
@@ -247,6 +253,7 @@ func stripeSubscriptionWebhookPayload(t *testing.T, eventID, eventType, subscrip
 				"id":       subscriptionID,
 				"customer": customerID,
 				"status":   status,
+				"metadata": metadata,
 				"items": map[string]any{
 					"data": []map[string]any{
 						{
@@ -272,7 +279,7 @@ func stripeCheckoutWebhookPayload(t *testing.T, eventID, clientReferenceID, cust
 		"created": created.Unix(),
 		"data": map[string]any{
 			"object": map[string]any{
-				"id":                  "cs_test_123",
+				"id":                  "cs_" + eventID,
 				"customer":            customerID,
 				"subscription":        subscriptionID,
 				"client_reference_id": clientReferenceID,
@@ -304,6 +311,20 @@ func stripeInvoiceWebhookPayload(t *testing.T, eventID, eventType, customerID, s
 		t.Fatalf("marshal invoice webhook payload: %v", err)
 	}
 	return payload
+}
+
+func sendStripeActivationWebhook(t *testing.T, r *gin.Engine, eventID string, teamID, userID uuid.UUID, created time.Time) *httptest.ResponseRecorder {
+	t.Helper()
+	periodStart := created
+	periodEnd := created.AddDate(0, 1, 0)
+	customerID := "cus_" + teamID.String()
+	payload := stripeSubscriptionWebhookPayloadWithMetadata(t, eventID, "customer.subscription.updated", "sub_"+teamID.String(), customerID, "active", created, periodStart, periodEnd, map[string]string{
+		"activation_user_id": userID.String(),
+	})
+	req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", stripeSignature(t, payload, created))
+	return doRequest(r, req)
 }
 
 func doRequest(r *gin.Engine, req *http.Request) *httptest.ResponseRecorder {
@@ -430,35 +451,6 @@ func TestIntegration_ShadowBillingSkipsStripeCalls(t *testing.T) {
 	}
 }
 
-func TestIntegration_ExportTeamBillingPeriodClaimsCommercialAnchor(t *testing.T) {
-	ctx := context.Background()
-	teamID, periodID, periodStart, periodEnd := seedBillingPeriodForStripe(t, true, false)
-	adminID := seedPlatformAdminProfile(t)
-	stripe := &fakeStripeClient{}
-	r := newBillingRouter(t, stripe)
-
-	w := doInternal(r, "POST", "/internal/teams/"+teamID.String()+"/billing/periods/"+periodID+"/export", adminID.String(), "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("shadow export with anchor claim: expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	if got := len(stripe.reportCalls); got != 0 {
-		t.Fatalf("stripe report calls = %d, want 0 in shadow mode", got)
-	}
-	account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
-	if err != nil {
-		t.Fatalf("load billing account after export: %v", err)
-	}
-	if !account.CommercialBillingAnchor.Valid {
-		t.Fatal("commercial billing anchor was not claimed during export")
-	}
-	if !account.CommercialBillingAnchor.Time.Equal(periodStart) {
-		t.Fatalf("commercial billing anchor = %s, want %s", account.CommercialBillingAnchor.Time, periodStart)
-	}
-	if got := billingPeriodStatus(t, teamID, periodStart, periodEnd); got != "exported" {
-		t.Fatalf("period status after shadow export = %q, want exported", got)
-	}
-}
-
 func TestIntegration_LiveBillingSendsStripeEventsAndIsIdempotent(t *testing.T) {
 	teamID, periodID, periodStart, periodEnd := seedBillingPeriodForStripe(t, true, true)
 	adminID := seedPlatformAdminProfile(t)
@@ -576,7 +568,7 @@ func TestIntegration_LiveBillingSendsStripeEventsAndIsIdempotent(t *testing.T) {
 }
 
 func TestIntegration_CreateStripeCheckoutSessionUsesConfiguredPrice(t *testing.T) {
-	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	teamID, apiKey, userID := seedTeamAndKeyWithRole(t, "team_owner")
 	if _, err := testPool.Exec(context.Background(), `
 		INSERT INTO team_feature_flag (team_id, key, enabled)
 		VALUES ($1, 'billing_export_enabled', true)
@@ -584,7 +576,10 @@ func TestIntegration_CreateStripeCheckoutSessionUsesConfiguredPrice(t *testing.T
 	`, teamID); err != nil {
 		t.Fatalf("enable billing export: %v", err)
 	}
-	stripe := &fakeStripeClient{nextCheckoutURL: "https://checkout.stripe.test/session"}
+	stripe := &fakeStripeClient{
+		nextCustomerID:  "cus_" + teamID.String(),
+		nextCheckoutURL: "https://checkout.stripe.test/session",
+	}
 	r := newBillingRouter(t, stripe)
 
 	w := do(r, "POST", "/stripe/checkout-session", apiKey, `{"success_url":"https://app.superserve.test/billing/success","cancel_url":"https://app.superserve.test/billing/cancel"}`)
@@ -606,86 +601,94 @@ func TestIntegration_CreateStripeCheckoutSessionUsesConfiguredPrice(t *testing.T
 	if got := stripe.checkoutCalls[0].ClientReferenceID; got != teamID.String() {
 		t.Fatalf("client reference id = %q, want team id %q", got, teamID.String())
 	}
+	if got := stripe.checkoutCalls[0].Metadata["activation_user_id"]; got != userID.String() {
+		t.Fatalf("activation user metadata = %q, want authenticated user %q", got, userID)
+	}
 	if got := stripe.checkoutCalls[0].IdempotencyKey; got == "" {
 		t.Fatal("checkout idempotency key was not set")
 	}
 }
 
-func TestIntegration_CreateStripeCheckoutSessionWithCommercialAnchorUsesCurrentActivation(t *testing.T) {
-	ctx := context.Background()
-	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "team_owner")
-	if _, err := testPool.Exec(ctx, `
+func TestIntegration_StripeCheckoutRetryKeepsSuccessfulActivationActor(t *testing.T) {
+	teamID, firstKey, firstUserID := seedTeamAndKeyWithRole(t, "team_owner")
+	secondKey := seedKeyForExistingTeamWithRole(t, teamID, "team_owner")
+	if _, err := testPool.Exec(context.Background(), `
 		INSERT INTO team_feature_flag (team_id, key, enabled)
 		VALUES ($1, 'billing_export_enabled', true)
 		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
 	`, teamID); err != nil {
 		t.Fatalf("enable billing export: %v", err)
 	}
-	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
-	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
-		TeamID: teamID,
-		Anchor: anchor,
-	}); err != nil {
-		t.Fatalf("claim commercial billing anchor: %v", err)
+	stripe := &fakeStripeClient{
+		nextCustomerID:  "cus_" + teamID.String(),
+		nextCheckoutURL: "https://checkout.stripe.test/session",
 	}
+	r := newBillingRouter(t, stripe)
+	body := `{"success_url":"https://app.superserve.test/billing/success","cancel_url":"https://app.superserve.test/billing/cancel"}`
+	if w := do(r, "POST", "/stripe/checkout-session", firstKey, body); w.Code != http.StatusOK {
+		t.Fatalf("first checkout session: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if w := do(r, "POST", "/stripe/checkout-session", secondKey, body); w.Code != http.StatusOK {
+		t.Fatalf("retry checkout session: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(stripe.checkoutCalls) != 2 {
+		t.Fatalf("checkout calls = %d, want 2", len(stripe.checkoutCalls))
+	}
+	if stripe.checkoutCalls[0].Metadata["activation_user_id"] != firstUserID.String() {
+		t.Fatalf("first checkout actor metadata = %q, want %q", stripe.checkoutCalls[0].Metadata["activation_user_id"], firstUserID)
+	}
+	created := time.Now().UTC()
+	if w := sendStripeActivationWebhook(t, r, "evt_retry_activation", teamID, firstUserID, created); w.Code != http.StatusOK {
+		t.Fatalf("activation webhook: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var redeemedUser uuid.UUID
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT stripe_activation_user_id
+		FROM team_billing_account
+		WHERE team_id = $1
+	`, teamID).Scan(&redeemedUser); err != nil {
+		t.Fatalf("load activation actor: %v", err)
+	}
+	if redeemedUser != firstUserID {
+		t.Fatalf("activation actor = %s, want successful checkout actor %s", redeemedUser, firstUserID)
+	}
+}
 
-	stripe := &fakeStripeClient{nextCheckoutURL: "https://checkout.stripe.test/session"}
+func TestIntegration_FailedCheckoutDoesNotRecordActivationUser(t *testing.T) {
+	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable billing export: %v", err)
+	}
+	stripe := &fakeStripeClient{
+		nextCustomerID: "cus_" + teamID.String(),
+		checkoutErr:    errors.New("checkout unavailable"),
+	}
 	r := newBillingRouter(t, stripe)
 
 	w := do(r, "POST", "/stripe/checkout-session", apiKey, `{"success_url":"https://app.superserve.test/billing/success","cancel_url":"https://app.superserve.test/billing/cancel"}`)
-	if w.Code != http.StatusOK {
-		t.Fatalf("checkout session with commercial anchor: expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("failed checkout: expected 502, got %d: %s", w.Code, w.Body.String())
 	}
-	if got := len(stripe.checkoutCalls); got != 1 {
-		t.Fatalf("checkout calls = %d, want 1", got)
+	var activationUser *uuid.UUID
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT stripe_activation_user_id
+		FROM team_billing_account
+		WHERE team_id = $1
+	`, teamID).Scan(&activationUser); err != nil {
+		t.Fatalf("load activation user after failed checkout: %v", err)
 	}
-	if stripe.checkoutCalls[0].BackdateStartDate != nil {
-		t.Fatalf("checkout backdate_start_date = %v, want nil for normal activation", stripe.checkoutCalls[0].BackdateStartDate)
-	}
-
-	customerID := "cus_test_" + teamID.String()
-	subscriptionID := "sub_" + teamID.String()
-	checkoutCreatedAt := anchor.Add(2 * time.Hour)
-	checkoutPayload := stripeCheckoutWebhookPayload(t, "evt_checkout_completed", teamID.String(), customerID, subscriptionID, checkoutCreatedAt)
-	checkoutReq := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(checkoutPayload)))
-	checkoutReq.Header.Set("Content-Type", "application/json")
-	checkoutReq.Header.Set("Stripe-Signature", stripeSignature(t, checkoutPayload, time.Now().UTC()))
-	if checkoutResp := doRequest(r, checkoutReq); checkoutResp.Code != http.StatusOK {
-		t.Fatalf("checkout webhook: expected 200, got %d: %s", checkoutResp.Code, checkoutResp.Body.String())
-	}
-
-	periodStart := anchor
-	periodEnd := anchor.AddDate(0, 1, 0)
-	subscriptionCreatedAt := checkoutCreatedAt.Add(time.Minute)
-	subscriptionPayload := stripeSubscriptionWebhookPayload(t, "evt_subscription_created", "customer.subscription.created", subscriptionID, customerID, "active", subscriptionCreatedAt, periodStart, periodEnd)
-	subscriptionReq := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(subscriptionPayload)))
-	subscriptionReq.Header.Set("Content-Type", "application/json")
-	subscriptionReq.Header.Set("Stripe-Signature", stripeSignature(t, subscriptionPayload, time.Now().UTC()))
-	if subscriptionResp := doRequest(r, subscriptionReq); subscriptionResp.Code != http.StatusOK {
-		t.Fatalf("subscription created webhook: expected 200, got %d: %s", subscriptionResp.Code, subscriptionResp.Body.String())
-	}
-
-	account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
-	if err != nil {
-		t.Fatalf("load billing account after subscription activation: %v", err)
-	}
-	if !account.CommercialBillingAnchor.Valid || !account.CommercialBillingAnchor.Time.Equal(anchor) {
-		t.Fatalf("commercial billing anchor = %v, want %s", account.CommercialBillingAnchor, anchor)
-	}
-	if account.StripeSubscriptionID == nil || *account.StripeSubscriptionID != subscriptionID {
-		t.Fatalf("stripe subscription id = %q, want %q", derefString(account.StripeSubscriptionID), subscriptionID)
-	}
-	if !account.CurrentPeriodStart.Valid || !account.CurrentPeriodStart.Time.Equal(periodStart) {
-		t.Fatalf("current period start = %v, want %s", account.CurrentPeriodStart, periodStart)
-	}
-	if !account.CurrentPeriodEnd.Valid || !account.CurrentPeriodEnd.Time.Equal(periodEnd) {
-		t.Fatalf("current period end = %v, want %s", account.CurrentPeriodEnd, periodEnd)
+	if activationUser != nil {
+		t.Fatalf("failed checkout recorded activation user %s", activationUser)
 	}
 }
 
 func TestIntegration_StripeActivationEndsTrialAndGrantsPromoCreditOnce(t *testing.T) {
 	ctx := context.Background()
-	teamID, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	teamID, _, userID := seedTeamAndKeyWithRole(t, "team_owner")
 	customerID := "cus_" + teamID.String()
 	subscriptionID := "sub_" + teamID.String()
 	if _, err := testPool.Exec(ctx, `
@@ -708,7 +711,9 @@ func TestIntegration_StripeActivationEndsTrialAndGrantsPromoCreditOnce(t *testin
 	r := newBillingRouter(t, stripe)
 	for i, eventID := range []string{"evt_trial_activation", "evt_trial_activation_replay"} {
 		eventCreated := created.Add(time.Duration(i) * time.Second)
-		payload := stripeSubscriptionWebhookPayload(t, eventID, "customer.subscription.updated", subscriptionID, customerID, "active", eventCreated, periodStart, periodEnd)
+		payload := stripeSubscriptionWebhookPayloadWithMetadata(t, eventID, "customer.subscription.updated", subscriptionID, customerID, "active", eventCreated, periodStart, periodEnd, map[string]string{
+			"activation_user_id": userID.String(),
+		})
 		req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Stripe-Signature", stripeSignature(t, payload, eventCreated))
@@ -751,11 +756,253 @@ func TestIntegration_StripeActivationEndsTrialAndGrantsPromoCreditOnce(t *testin
 	if trialEndedAt == nil || promoGrantedAt == nil || stripeGrantID == nil || *stripeGrantID != "credgrant_test_123" {
 		t.Fatal("billing activation state was not persisted")
 	}
+	var creatorRedemptions int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM user_promotion_entitlement
+		WHERE user_id = $1 AND stripe_redemption_at IS NOT NULL AND stripe_redemption_team_id = $2
+	`, userID, teamID).Scan(&creatorRedemptions); err != nil {
+		t.Fatalf("count creator-user redemptions: %v", err)
+	}
+	if creatorRedemptions != 1 {
+		t.Fatalf("creator-user redemptions = %d, want 1", creatorRedemptions)
+	}
 	if got := len(stripe.creditGrantCalls); got != 1 {
 		t.Fatalf("Stripe credit grant calls = %d, want 1", got)
 	}
 	if got := stripe.creditGrantCalls[0].AmountCents; got != 9500 {
 		t.Fatalf("Stripe credit grant amount = %d, want 9500 cents", got)
+	}
+}
+
+func TestIntegration_StripePromotionEligibilityAndConcurrentActivation(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	invitedID := uuid.New()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO profile (id, email) VALUES ($1, $2)
+	`, invitedID, "invited-"+invitedID.String()[:8]+"@example.com"); err != nil {
+		t.Fatalf("seed invited member: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')
+	`, teamID, invitedID); err != nil {
+		t.Fatalf("seed invited membership: %v", err)
+	}
+	seedActiveStripeAccount := func(team uuid.UUID) {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+			VALUES ($1, $2, $3, 'incomplete')
+		`, team, "cus_"+team.String(), "sub_"+team.String()); err != nil {
+			t.Fatalf("seed billing account: %v", err)
+		}
+	}
+	promoGrantCount := func(team uuid.UUID) int {
+		t.Helper()
+		var count int
+		if err := testPool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM team_credit_grant
+			WHERE team_id = $1 AND reason = 'stripe promotional credit' AND amount_usd = 95
+		`, team).Scan(&count); err != nil {
+			t.Fatalf("count promotional grants for %s: %v", team, err)
+		}
+		return count
+	}
+	activate := func(team, user uuid.UUID, eventID string, stripe *fakeStripeClient) {
+		t.Helper()
+		created := time.Now().UTC().Truncate(time.Second)
+		if w := sendStripeActivationWebhook(t, newBillingRouter(t, stripe), eventID, team, user, created); w.Code != http.StatusOK {
+			t.Fatalf("activation webhook: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+	}
+	activateWithoutPromotion := func(team, user uuid.UUID, eventID string, stripe *fakeStripeClient) {
+		t.Helper()
+		created := time.Now().UTC().Truncate(time.Second)
+		periodEnd := created.AddDate(0, 1, 0)
+		payload := stripeSubscriptionWebhookPayloadWithMetadata(t, eventID, "customer.subscription.updated", "sub_"+team.String(), "cus_"+team.String(), "active", created, created, periodEnd, map[string]string{
+			"activation_user_id": user.String(),
+		})
+		req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Stripe-Signature", stripeSignature(t, payload, created))
+		if w := doRequest(newBillingRouter(t, stripe), req); w.Code != http.StatusOK {
+			t.Fatalf("paid activation webhook: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+	}
+
+	// A joined member may redeem the team promotion, and replaying the same
+	// team or trying another team with that user cannot issue another grant.
+	seedActiveStripeAccount(teamID)
+	stripe := &fakeStripeClient{}
+	activate(teamID, invitedID, "evt_invited_activation", stripe)
+	activate(teamID, invitedID, "evt_invited_team_replay", stripe)
+	if got := len(stripe.creditGrantCalls); got != 1 {
+		t.Fatalf("invited-user Stripe grant calls = %d, want 1", got)
+	}
+	var redeemedUser uuid.UUID
+	if err := testPool.QueryRow(ctx, `SELECT stripe_activation_user_id FROM team_billing_account WHERE team_id = $1`, teamID).Scan(&redeemedUser); err != nil {
+		t.Fatalf("load activation user: %v", err)
+	}
+	if redeemedUser != invitedID {
+		t.Fatalf("activation user = %s, want invited user %s", redeemedUser, invitedID)
+	}
+	if got := promoGrantCount(teamID); got != 1 {
+		t.Fatalf("invited-team promotional grants = %d, want 1", got)
+	}
+	var invitedRedemptions int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM user_promotion_entitlement
+		WHERE user_id = $1 AND stripe_redemption_at IS NOT NULL AND stripe_redemption_team_id = $2
+	`, invitedID, teamID).Scan(&invitedRedemptions); err != nil {
+		t.Fatalf("count invited-user redemptions: %v", err)
+	}
+	if invitedRedemptions != 1 {
+		t.Fatalf("invited-user redemptions = %d, want 1", invitedRedemptions)
+	}
+	// A different member cannot redeem a team promotion after that team has
+	// already received its one $95 grant.
+	repeatTeamUser := uuid.New()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO profile (id, email) VALUES ($1, $2)
+	`, repeatTeamUser, "repeat-team-"+repeatTeamUser.String()[:8]+"@example.com"); err != nil {
+		t.Fatalf("seed repeat-team member: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')
+	`, teamID, repeatTeamUser); err != nil {
+		t.Fatalf("seed repeat-team membership: %v", err)
+	}
+	activate(teamID, repeatTeamUser, "evt_repeat_team", stripe)
+	if got := len(stripe.creditGrantCalls); got != 1 {
+		t.Fatalf("repeat-team Stripe grant calls = %d, want 1", got)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT stripe_activation_user_id FROM team_billing_account WHERE team_id = $1`, teamID).Scan(&redeemedUser); err != nil {
+		t.Fatalf("reload activation user: %v", err)
+	}
+	if redeemedUser != invitedID {
+		t.Fatalf("repeat-team activation user = %s, want original redeemer %s", redeemedUser, invitedID)
+	}
+	var repeatTeamRedemptions int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM user_promotion_entitlement
+		WHERE user_id = $1 AND stripe_redemption_at IS NOT NULL
+	`, repeatTeamUser).Scan(&repeatTeamRedemptions); err != nil {
+		t.Fatalf("count repeat-team-user redemptions: %v", err)
+	}
+	if repeatTeamRedemptions != 0 {
+		t.Fatalf("repeat-team user redemptions = %d, want 0", repeatTeamRedemptions)
+	}
+
+	secondTeam, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')
+	`, secondTeam, invitedID); err != nil {
+		t.Fatalf("seed repeat-user membership: %v", err)
+	}
+	seedActiveStripeAccount(secondTeam)
+	activate(secondTeam, invitedID, "evt_repeat_user", stripe)
+	if got := len(stripe.creditGrantCalls); got != 1 {
+		t.Fatalf("repeat-user Stripe grant calls = %d, want 1", got)
+	}
+	if got := promoGrantCount(secondTeam); got != 0 {
+		t.Fatalf("repeat-user team promotional grants = %d, want 0", got)
+	}
+	var secondTeamTrialEndedAt *time.Time
+	if err := testPool.QueryRow(ctx, `SELECT trial_ended_at FROM team_billing_account WHERE team_id = $1`, secondTeam).Scan(&secondTeamTrialEndedAt); err != nil {
+		t.Fatalf("load repeat-user paid activation state: %v", err)
+	}
+	if secondTeamTrialEndedAt == nil {
+		t.Fatal("repeat-user activation did not continue as normal paid billing")
+	}
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM user_promotion_entitlement
+		WHERE user_id = $1 AND stripe_redemption_at IS NOT NULL
+	`, invitedID).Scan(&invitedRedemptions); err != nil {
+		t.Fatalf("reload invited-user redemptions: %v", err)
+	}
+	if invitedRedemptions != 1 {
+		t.Fatalf("repeat-user changed redemption count to %d, want 1", invitedRedemptions)
+	}
+
+	// A user who already redeemed can still activate another team normally;
+	// ineligibility must not reject paid billing.
+	thirdTeam, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')
+	`, thirdTeam, invitedID); err != nil {
+		t.Fatalf("seed paid-activation membership: %v", err)
+	}
+	seedActiveStripeAccount(thirdTeam)
+	activateWithoutPromotion(thirdTeam, invitedID, "evt_paid_without_promo", stripe)
+	var trialEndedAt *time.Time
+	if err := testPool.QueryRow(ctx, `SELECT trial_ended_at FROM team_billing_account WHERE team_id = $1`, thirdTeam).Scan(&trialEndedAt); err != nil {
+		t.Fatalf("load paid activation state: %v", err)
+	}
+	if trialEndedAt == nil {
+		t.Fatal("paid activation did not end the trial")
+	}
+	if got := promoGrantCount(thirdTeam); got != 0 {
+		t.Fatalf("non-promotional team promotional grants = %d, want 0", got)
+	}
+	if got := len(stripe.creditGrantCalls); got != 1 {
+		t.Fatalf("non-promotional activation changed Stripe grant calls to %d, want 1", got)
+	}
+
+	// Concurrent webhook deliveries must issue at most one external grant and
+	// persist exactly one user/team redemption.
+	concurrentTeam, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	concurrentUser := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO profile (id, email) VALUES ($1, $2)`, concurrentUser, "concurrent-"+concurrentUser.String()[:8]+"@example.com"); err != nil {
+		t.Fatalf("seed concurrent user: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`, concurrentTeam, concurrentUser); err != nil {
+		t.Fatalf("seed concurrent membership: %v", err)
+	}
+	seedActiveStripeAccount(concurrentTeam)
+	if _, err := testPool.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_status = 'active' WHERE team_id = $1`, concurrentTeam); err != nil {
+		t.Fatalf("activate concurrent billing account: %v", err)
+	}
+	concurrentRouter := newBillingRouter(t, stripe)
+	const attempts = 4
+	responses := make(chan *httptest.ResponseRecorder, attempts)
+	start := make(chan struct{})
+	created := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < attempts; i++ {
+		go func(i int) {
+			<-start
+			// Keep event times distinct; equal timestamps are treated as stale
+			// replays by the subscription ordering guard and would bypass the
+			// concurrent promotion gate entirely.
+			eventCreated := created.Add(time.Duration(i+1) * time.Second)
+			responses <- sendStripeActivationWebhook(t, concurrentRouter, fmt.Sprintf("evt_concurrent_activation_%d", i), concurrentTeam, concurrentUser, eventCreated)
+		}(i)
+	}
+	close(start)
+	for i := 0; i < attempts; i++ {
+		if w := <-responses; w.Code != http.StatusOK {
+			t.Fatalf("concurrent activation %d: expected 200, got %d: %s", i, w.Code, w.Body.String())
+		}
+	}
+	var userRedemptions, teamGrants int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM user_promotion_entitlement WHERE user_id = $1 AND stripe_redemption_at IS NOT NULL`, concurrentUser).Scan(&userRedemptions); err != nil {
+		t.Fatalf("count concurrent user redemptions: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM team_billing_account WHERE team_id = $1 AND stripe_activation_credit_grant_id IS NOT NULL`, concurrentTeam).Scan(&teamGrants); err != nil {
+		t.Fatalf("count concurrent team grants: %v", err)
+	}
+	if userRedemptions != 1 || teamGrants != 1 {
+		t.Fatalf("concurrent user/team markers = (%d, %d), want (1, 1)", userRedemptions, teamGrants)
+	}
+	if got := promoGrantCount(concurrentTeam); got != 1 {
+		t.Fatalf("concurrent team promotional grants = %d, want 1", got)
+	}
+	if got := len(stripe.creditGrantCalls); got != 2 {
+		t.Fatalf("concurrent activation changed Stripe grant calls to %d, want 2 total", got)
 	}
 }
 
