@@ -111,11 +111,15 @@ type rankMemoKey struct {
 }
 
 type rankMemoEntry struct {
-	gen    uint64
-	result RankResult
+	gen  uint64
+	plan *rankPlan
 }
 
 const defaultRankerCacheTTL = 30 * time.Second
+
+// rankerFillTimeout bounds one candidate refresh, matching the live
+// scheduler's cache-fill bound.
+const rankerFillTimeout = 5 * time.Second
 
 type rankerCacheEntry struct {
 	rows     []db.ListCapacityCandidatesRow
@@ -139,22 +143,53 @@ func (r *CapacityRanker) Invalidate() {
 	r.mu.Unlock()
 }
 
+// rankedHost is one candidate with everything that does NOT depend on
+// the clock or on chance precomputed: its score for a given request
+// shape, whether it fits, whether it has warm inventory, and the instant
+// its pressure report goes stale.
+type rankedHost struct {
+	id        string
+	region    string
+	capable   bool
+	described bool
+	viable    bool
+	warm      bool
+	score     float64
+	staleAt   time.Time // zero when the host has never reported
+}
+
+// rankPlan is the memoized, deterministic half of a ranking: valid for
+// one candidate generation and one request shape.
+//
+// Freshness and randomness are deliberately NOT in here. Caching a
+// freshness verdict would keep calling a host described for up to a full
+// refresh interval after its report aged out, and caching the shuffled
+// order would hand every decision in that interval the same host —
+// defeating the load spreading the shuffle exists to provide.
+type rankPlan struct {
+	hosts []rankedHost
+}
+
 // Rank orders hosts for a request. The candidate set comes from cache;
 // when it is missing or expired this refreshes it, which means Rank
 // performs I/O and must only be called from a background worker.
 func (r *CapacityRanker) Rank(ctx context.Context, req RankRequest) (RankResult, error) {
-	rows, err := r.candidates(ctx, req.RequiredCapabilities)
+	plan, err := r.plan(ctx, req)
 	if err != nil {
 		return RankResult{}, err
 	}
+	return rankFromPlan(plan, r.Region), nil
+}
 
-	// Ranking is O(fleet) in both time and allocation, and creates
-	// repeat a handful of shapes — the default size, one per template —
-	// against a candidate set that only changes when it is refreshed. So
-	// memoize per (candidate generation, shape): a fleet-sized pass runs
-	// once per refresh per distinct shape, not once per sample. Without
-	// this a large fleet turns a steady sample rate into steady GC
-	// pressure for a measurement nothing depends on.
+// plan returns the deterministic ranking data for this generation and
+// shape, computing it once and reusing it: scoring and fitting are
+// O(fleet) with real allocation, and creates repeat a handful of shapes.
+func (r *CapacityRanker) plan(ctx context.Context, req RankRequest) (*rankPlan, error) {
+	rows, err := r.candidates(ctx, req.RequiredCapabilities)
+	if err != nil {
+		return nil, err
+	}
+
 	capKey, _ := capabilityCacheKey(req.RequiredCapabilities)
 	memoKey := rankMemoKey{
 		capabilities: capKey,
@@ -167,8 +202,9 @@ func (r *CapacityRanker) Rank(ctx context.Context, req RankRequest) (RankResult,
 	gen := r.gen
 	r.mu.RUnlock()
 	if hit && entry.gen == gen {
-		return entry.result, nil
+		return entry.plan, nil
 	}
+
 	if len(req.AllowedHosts) > 0 {
 		allowed := make(map[string]bool, len(req.AllowedHosts))
 		for _, id := range req.AllowedHosts {
@@ -183,6 +219,41 @@ func (r *CapacityRanker) Rank(ctx context.Context, req RankRequest) (RankResult,
 		rows = filtered
 	}
 
+	plan := &rankPlan{hosts: make([]rankedHost, 0, len(rows))}
+	for _, row := range rows {
+		h := rankedHost{
+			id:        row.ID,
+			region:    row.Region,
+			capable:   row.PressureCapable,
+			described: row.UnknownAllocationVms == 0,
+			viable:    fits(row, req),
+			warm:      hasWarmSlot(row),
+			score:     dominantScore(row, req),
+		}
+		if row.ReportedAt.Valid {
+			h.staleAt = row.ReportedAt.Time.Add(PressureFreshnessSecs * time.Second)
+		}
+		plan.hosts = append(plan.hosts, h)
+	}
+
+	r.mu.Lock()
+	if r.gen == gen { // a refresh mid-plan invalidates this one
+		if r.memo == nil {
+			r.memo = make(map[rankMemoKey]rankMemoEntry)
+		}
+		r.memo[memoKey] = rankMemoEntry{gen: gen, plan: plan}
+	}
+	r.mu.Unlock()
+	return plan, nil
+}
+
+// rankFromPlan applies everything that must be decided fresh: whether
+// each report is still within its freshness window, and which of the
+// comparable hosts to put first.
+func rankFromPlan(plan *rankPlan, region string) RankResult {
+	now := time.Now()
+	var result RankResult
+
 	// Composition describes the FLEET, so all four counts are taken over
 	// the same population: every capability-matching host, before any
 	// viability or region filtering. Counting described hosts after those
@@ -190,72 +261,127 @@ func (r *CapacityRanker) Rank(ctx context.Context, req RankRequest) (RankResult,
 	// gauges incomparable — a low described count would mean "wrong
 	// region" as readily as "not publishing", which is the opposite of
 	// what a readiness signal is for.
-	var result RankResult
-	var eligible []db.ListCapacityCandidatesRow
-	for _, row := range rows {
+	eligible := make([]rankedHost, 0, len(plan.hosts))
+	for _, h := range plan.hosts {
 		switch {
-		case !row.PressureCapable:
+		case !h.capable:
 			result.Legacy++
-		case !row.ReportedAt.Valid || time.Since(row.ReportedAt.Time) >= PressureFreshnessSecs*time.Second:
+		case h.staleAt.IsZero() || !now.Before(h.staleAt):
 			result.Stale++
-		case row.UnknownAllocationVms > 0:
-			result.UnderDescribed++
-			eligible = append(eligible, row)
-		default:
+		case h.described:
 			result.Described++
-			eligible = append(eligible, row)
+			eligible = append(eligible, h)
+		default:
+			result.UnderDescribed++
+			eligible = append(eligible, h)
 		}
 	}
+
 	// Viability BEFORE region. Filtering by region first lets a single
 	// full local host hide every remote host with room: the local set is
 	// non-empty, so remote candidates are discarded, and then the local
 	// one is dropped for being full — leaving nothing.
 	viable := eligible[:0:0]
-	for _, row := range eligible {
-		if fits(row, req) {
-			viable = append(viable, row)
+	for _, h := range eligible {
+		if h.viable {
+			viable = append(viable, h)
 		}
 	}
-	eligible = preferRegion(viable, r.Region)
+	eligible = preferRegionHosts(viable, region)
 
 	// Fully-described hosts first. An unsized VM contributes zero memory
 	// and zero vCPUs to its host's report, which is indistinguishable
-	// from no VM at all — so an under-described host's ratios are an
-	// UNDERCOUNT and it looks emptier than it is. Ordering, not
-	// exclusion: the shortfall is confined to memory and vCPUs (sandbox
-	// and slot counts stay exact whatever a VM's size), and every host
-	// carries unsized VMs until its pre-declaration sandboxes cycle out,
-	// so excluding them would empty the set on day one.
-	described, underDescribed := splitByDescription(eligible)
+	// from no VM at all — so an under-described host looks emptier than
+	// it is. Ordering, not exclusion: the shortfall is confined to memory
+	// and vCPUs, and every host carries unsized VMs until its
+	// pre-declaration sandboxes cycle out.
+	var described, underDescribed []rankedHost
+	for _, h := range eligible {
+		if h.described {
+			described = append(described, h)
+		} else {
+			underDescribed = append(underDescribed, h)
+		}
+	}
 
-	order, band := rankCandidates(described, req)
-	underOrder, underBand := rankCandidates(underDescribed, req)
+	order, band := orderHosts(described)
+	underOrder, underBand := orderHosts(underDescribed)
 	order = append(order, underOrder...)
 	if len(band) == 0 {
-		// Nothing fully described: the acceptable set is the
-		// under-described band, since that is all there is to choose
-		// from.
 		band = underBand
 	}
+	result.Order, result.TopBand = order, band
+	return result
+}
 
-	result.Order = make([]string, 0, len(order))
-	for _, row := range order {
-		result.Order = append(result.Order, row.ID)
+// orderHosts sorts one tier best-first and reports the band it drew
+// from. The shuffle happens here, per call: a frozen order would send
+// every decision in a generation to the same host.
+func orderHosts(hosts []rankedHost) (order, band []string) {
+	if len(hosts) == 0 {
+		return nil, nil
 	}
-	result.TopBand = make([]string, 0, len(band))
-	for _, row := range band {
-		result.TopBand = append(result.TopBand, row.ID)
-	}
-
-	r.mu.Lock()
-	if r.gen == gen { // a refresh mid-rank invalidates this answer
-		if r.memo == nil {
-			r.memo = make(map[rankMemoKey]rankMemoEntry)
+	best := hosts[0].score
+	for _, h := range hosts[1:] {
+		if h.score < best {
+			best = h.score
 		}
-		r.memo[memoKey] = rankMemoEntry{gen: gen, result: result}
 	}
-	r.mu.Unlock()
-	return result, nil
+
+	var warmBand, coldBand, rest []rankedHost
+	for _, h := range hosts {
+		switch {
+		case h.score > best+pressureScoreTolerance:
+			rest = append(rest, h)
+		case h.warm:
+			warmBand = append(warmBand, h)
+		default:
+			coldBand = append(coldBand, h)
+		}
+	}
+	rand.Shuffle(len(warmBand), func(i, j int) { warmBand[i], warmBand[j] = warmBand[j], warmBand[i] })
+	rand.Shuffle(len(coldBand), func(i, j int) { coldBand[i], coldBand[j] = coldBand[j], coldBand[i] })
+	sort.SliceStable(rest, func(i, j int) bool { return rest[i].score < rest[j].score })
+
+	order = make([]string, 0, len(hosts))
+	for _, group := range [][]rankedHost{warmBand, coldBand, rest} {
+		for _, h := range group {
+			order = append(order, h.id)
+		}
+	}
+
+	// The band is the set the ranker would actually draw from, which is
+	// NOT every host within the score tolerance: warm hosts are ordered
+	// ahead of cold ones, so while any warm host is available a cold one
+	// is never chosen.
+	drawn := warmBand
+	if len(drawn) == 0 {
+		drawn = coldBand
+	}
+	band = make([]string, 0, len(drawn))
+	for _, h := range drawn {
+		band = append(band, h.id)
+	}
+	return order, band
+}
+
+// preferRegionHosts keeps only same-region hosts when any exist;
+// otherwise the full set stands (a remote host beats nowhere to put the
+// sandbox).
+func preferRegionHosts(hosts []rankedHost, region string) []rankedHost {
+	if region == "" || len(hosts) == 0 {
+		return hosts
+	}
+	local := hosts[:0:0]
+	for _, h := range hosts {
+		if h.region == region {
+			local = append(local, h)
+		}
+	}
+	if len(local) > 0 {
+		return local
+	}
+	return hosts
 }
 
 func (r *CapacityRanker) candidates(ctx context.Context, required []string) ([]db.ListCapacityCandidatesRow, error) {
@@ -267,6 +393,11 @@ func (r *CapacityRanker) candidates(ctx context.Context, required []string) ([]d
 		return entry.rows, nil
 	}
 
+	// Bounded like the live scheduler's cache fill: a background worker
+	// with no deadline would sit on a wedged database indefinitely,
+	// holding the sample it was evaluating and stalling every later one.
+	ctx, cancel := context.WithTimeout(ctx, rankerFillTimeout)
+	defer cancel()
 	rows, err := r.DB.ListCapacityCandidates(ctx, db.ListCapacityCandidatesParams{
 		PressureCapability:   HostCapabilityCapacityPressure,
 		RequiredCapabilities: normalized,
@@ -285,101 +416,6 @@ func (r *CapacityRanker) candidates(ctx context.Context, required []string) ([]d
 	r.memo = nil
 	r.mu.Unlock()
 	return rows, nil
-}
-
-// splitByDescription separates hosts that fully know their own
-// allocation from those reporting unsized VMs.
-func splitByDescription(rows []db.ListCapacityCandidatesRow) (described, underDescribed []db.ListCapacityCandidatesRow) {
-	for _, row := range rows {
-		if row.UnknownAllocationVms > 0 {
-			underDescribed = append(underDescribed, row)
-		} else {
-			described = append(described, row)
-		}
-	}
-	return described, underDescribed
-}
-
-// preferRegion keeps only same-region rows when any exist; otherwise the
-// full set stands (a remote host beats nowhere to put the sandbox).
-func preferRegion(rows []db.ListCapacityCandidatesRow, region string) []db.ListCapacityCandidatesRow {
-	if region == "" || len(rows) == 0 {
-		return rows
-	}
-	var local []db.ListCapacityCandidatesRow
-	for _, row := range rows {
-		if row.Region == region {
-			local = append(local, row)
-		}
-	}
-	if len(local) > 0 {
-		return local
-	}
-	return rows
-}
-
-// rankCandidates orders hosts best-first: obviously-full hosts are
-// dropped, survivors are scored by dominant pressure, the tolerance band
-// around the best score is shuffled (with warm-slot hosts ahead within
-// it), and out-of-band hosts follow in score order.
-func rankCandidates(eligible []db.ListCapacityCandidatesRow, req RankRequest) (order, band []db.ListCapacityCandidatesRow) {
-	type scored struct {
-		row   db.ListCapacityCandidatesRow
-		score float64
-	}
-	candidates := make([]scored, 0, len(eligible))
-	for _, row := range eligible {
-		candidates = append(candidates, scored{row: row, score: dominantScore(row, req)})
-	}
-	if len(candidates) == 0 {
-		return nil, nil
-	}
-	best := candidates[0].score
-	for _, c := range candidates[1:] {
-		if c.score < best {
-			best = c.score
-		}
-	}
-
-	// Inside the band every host is an equally good target on pressure
-	// grounds, so warm-slot availability decides — but only as a
-	// partition, and each partition is shuffled: preferring warmth must
-	// not reintroduce a deterministic first choice.
-	var warmBand, coldBand, rest []scored
-	for _, c := range candidates {
-		switch {
-		case c.score > best+pressureScoreTolerance:
-			rest = append(rest, c)
-		case hasWarmSlot(c.row):
-			warmBand = append(warmBand, c)
-		default:
-			coldBand = append(coldBand, c)
-		}
-	}
-	rand.Shuffle(len(warmBand), func(i, j int) { warmBand[i], warmBand[j] = warmBand[j], warmBand[i] })
-	rand.Shuffle(len(coldBand), func(i, j int) { coldBand[i], coldBand[j] = coldBand[j], coldBand[i] })
-	sort.SliceStable(rest, func(i, j int) bool { return rest[i].score < rest[j].score })
-
-	out := make([]db.ListCapacityCandidatesRow, 0, len(candidates))
-	for _, group := range [][]scored{warmBand, coldBand, rest} {
-		for _, c := range group {
-			out = append(out, c.row)
-		}
-	}
-	// The band is the set the ranker would actually draw from, which is
-	// NOT every host within the score tolerance: warm hosts are ordered
-	// ahead of cold ones, so while any warm host is available a cold one
-	// is never chosen. Including cold hosts here would report agreement
-	// for a placement the ranker would never have made.
-	drawn := warmBand
-	if len(drawn) == 0 {
-		drawn = coldBand
-	}
-	band = make([]db.ListCapacityCandidatesRow, 0, len(drawn))
-	for _, c := range drawn {
-		band = append(band, c.row)
-	}
-	return out, band
 }
 
 // fits reports whether a host is under its OPERATOR limits with room for

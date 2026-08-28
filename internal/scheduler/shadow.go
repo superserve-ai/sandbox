@@ -46,6 +46,14 @@ type ShadowObservation struct {
 	// for N equally good hosts — measuring the shuffle rather than the
 	// placement.
 	Agreement string
+	// Profile names the capability set this sample ranked against.
+	//
+	// Public and private creates rank DIFFERENT host populations, and
+	// the composition counts are last-value gauges: without a label
+	// separating them, whichever profile sampled last overwrites the
+	// other and readiness reads as whatever the most recent create
+	// happened to need.
+	Profile string
 	// Counts of what the ranker saw, so the fleet's readiness for
 	// enforcement is visible before anything depends on it.
 	Described      int
@@ -54,6 +62,20 @@ type ShadowObservation struct {
 	Stale          int
 	// Duration of the ranking pass itself, off the request path.
 	Duration time.Duration
+}
+
+// capabilityProfile names a capability set with a short, bounded label.
+// The sets are code-defined and few, so an unrecognized one is folded
+// into "other" rather than becoming unbounded metric cardinality.
+func capabilityProfile(caps []string) string {
+	switch len(caps) {
+	case 0:
+		return "none"
+	case 1:
+		return "basic"
+	default:
+		return "extended"
+	}
 }
 
 // shadowSample is one create's shape, captured on the request path. Kept
@@ -169,6 +191,7 @@ func (s *ShadowEvaluator) evaluate(ctx context.Context, sample shadowSample) {
 		Vcpus:                sample.vcpus,
 	})
 	obs := ShadowObservation{
+		Profile:        capabilityProfile(sample.requiredCapabilities),
 		Described:      result.Described,
 		UnderDescribed: result.UnderDescribed,
 		Legacy:         result.Legacy,

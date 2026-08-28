@@ -325,6 +325,14 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 // emitter's: when these drifted apart, every meaningful agreement was
 // silently exported as "other" and the metric looked healthy while
 // measuring nothing.
+func normalizeShadowProfile(v string) string {
+	switch v {
+	case "none", "basic", "extended":
+		return v
+	}
+	return "other"
+}
+
 func normalizeShadowResult(v string) string {
 	switch v {
 	case "ranked", "no_candidates", "error":
@@ -362,6 +370,7 @@ func (r *OTelRecorder) RecordCapacityShadow(ctx context.Context, c CapacityShado
 	} {
 		r.capacityShadowHosts.Record(ctx, int64(n), metric.WithAttributes(r.attrs(
 			attribute.String("kind", kind),
+			attribute.String("profile", normalizeShadowProfile(c.Profile)),
 		)...))
 	}
 }

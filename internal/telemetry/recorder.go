@@ -156,6 +156,10 @@ type LatencyPhase struct {
 type CapacityShadow struct {
 	Result    string // ranked | no_candidates | error
 	Agreement string // in_band | out_of_band | unknown
+	// Profile separates the host populations different capability sets
+	// rank against; the composition gauges below are last-value, so
+	// without it one profile silently overwrites another.
+	Profile string
 	// Fleet composition as the ranker saw it, for readiness tracking.
 	Described      int
 	UnderDescribed int

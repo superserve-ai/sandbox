@@ -573,38 +573,126 @@ func TestRankerCompositionCoversTheWholeFleet(t *testing.T) {
 }
 
 // Ranking is O(fleet); creates repeat a handful of shapes against a
-// candidate set that changes only on refresh. Memoizing per generation
-// keeps a steady sample rate from becoming steady CPU and GC pressure.
+// candidate set that changes only on refresh. Memoization must reuse the
+// expensive, DETERMINISTIC half — scoring, fitting, classification —
+// while leaving freshness and ordering to each call.
+//
+// Note what is deliberately NOT asserted: that repeated calls return the
+// same order. An identical order would mean the shuffle was cached,
+// which is the load-concentration bug this must avoid.
 func TestRankerMemoizesWithinACandidateGeneration(t *testing.T) {
 	rows := []db.ListCapacityCandidatesRow{candidate("a"), candidate("b")}
-	r := &CapacityRanker{DB: db.New(&rankerMock{rows: rows}), TTL: time.Minute}
+	m := &rankerMock{rows: rows}
+	r := &CapacityRanker{DB: db.New(m), TTL: time.Hour}
 
-	first, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
 	for i := 0; i < 50; i++ {
-		got, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
+		res, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(got.Order) != len(first.Order) || got.Order[0] != first.Order[0] {
-			t.Fatalf("memoized ranking changed: %v then %v", first.Order, got.Order)
+		// The SET is stable even though the order is not.
+		if len(res.Order) != 2 {
+			t.Fatalf("call %d ranked %v, want both hosts", i, res.Order)
 		}
 	}
+	if got := m.queryCount(); got != 1 {
+		t.Fatalf("candidate queries = %d across 50 rankings, want 1", got)
+	}
 
-	// A different shape is a different question, so it ranks afresh.
-	other, err := r.Rank(context.Background(), RankRequest{MemoryMib: 32 * 1024, Vcpus: 16})
+	// A different shape is a different question, so it plans afresh —
+	// still without re-querying, since the candidate set is cached.
+	if _, err := r.Rank(context.Background(), RankRequest{MemoryMib: 32 * 1024, Vcpus: 16}); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.queryCount(); got != 1 {
+		t.Fatalf("candidate queries = %d after a new shape, want 1", got)
+	}
+
+	// Invalidation must discard both the rows and the plans built from
+	// them, so the next call re-queries.
+	r.Invalidate()
+	if _, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.queryCount(); got != 2 {
+		t.Fatalf("candidate queries = %d after invalidate, want 2", got)
+	}
+}
+
+// Memoization must not cache a freshness verdict. A report that was
+// fresh when the plan was built goes stale on its own clock, and a
+// cached "described" would keep a silent host eligible for up to a full
+// refresh interval.
+func TestRankerRecomputesFreshnessAcrossMemoizedCalls(t *testing.T) {
+	// Fresh now, stale in 40ms.
+	host := candidate("expiring")
+	host.ReportedAt = pgtype.Timestamptz{
+		Time:  time.Now().Add(-(PressureFreshnessSecs*time.Second - 40*time.Millisecond)),
+		Valid: true,
+	}
+
+	r := &CapacityRanker{DB: db.New(&rankerMock{rows: []db.ListCapacityCandidatesRow{host}}), TTL: time.Hour}
+
+	res, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(other.Order) == 0 {
-		t.Fatal("a distinct request shape must still be ranked")
+	if res.Described != 1 || len(res.Order) != 1 {
+		t.Fatalf("before expiry: %+v, want the host described and ranked", res)
 	}
 
-	// Invalidation must not serve the old answer.
-	r.Invalidate()
-	if _, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1}); err != nil {
-		t.Fatalf("rank after invalidate: %v", err)
+	time.Sleep(80 * time.Millisecond)
+
+	// Same generation, same shape — served from the memo — but the
+	// report has now aged out.
+	res, err = r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Stale != 1 || res.Described != 0 || len(res.Order) != 0 {
+		t.Fatalf("after expiry: %+v, want the host counted stale and dropped from the order", res)
+	}
+}
+
+// Memoization must not freeze the shuffle. The randomization exists to
+// spread load; a cached order would send every decision in a generation
+// to the same host, which is exactly the concentration it prevents.
+func TestRankerRandomizesEvenWhenMemoized(t *testing.T) {
+	rows := []db.ListCapacityCandidatesRow{candidate("a"), candidate("b"), candidate("c")}
+	r := &CapacityRanker{DB: db.New(&rankerMock{rows: rows}), TTL: time.Hour}
+
+	firsts := map[string]int{}
+	for i := 0; i < 200; i++ {
+		res, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		firsts[res.Order[0]]++
+	}
+	if len(firsts) != 3 {
+		t.Fatalf("only %v ever ranked first across 200 memoized calls; the shuffle is frozen", firsts)
+	}
+}
+
+// The composition gauges are last-value, so samples ranking different
+// host populations must carry a label that keeps them apart.
+func TestShadowLabelsSamplesByCapabilityProfile(t *testing.T) {
+	m := &rankerMock{rows: []db.ListCapacityCandidatesRow{candidate("h1")}}
+	s, obs := newShadow(t, m)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+
+	s.Offer([]string{"preview_ports_v1"}, 512, 1, "h1")
+	basic := awaitObservation(t, obs)
+
+	s.Offer([]string{"preview_ports_v1", "preview_port_tokens_v1", "preview_port_browser_auth_v1"}, 512, 1, "h1")
+	extended := awaitObservation(t, obs)
+
+	if basic.Profile == "" || extended.Profile == "" {
+		t.Fatalf("profiles missing: %q and %q", basic.Profile, extended.Profile)
+	}
+	if basic.Profile == extended.Profile {
+		t.Fatalf("both capability sets reported profile %q; their gauges would overwrite each other", basic.Profile)
 	}
 }

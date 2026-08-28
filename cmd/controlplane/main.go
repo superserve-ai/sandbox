@@ -277,6 +277,7 @@ func run() error {
 			recorder.RecordCapacityShadow(context.Background(), telemetry.CapacityShadow{
 				Result:         obs.Result,
 				Agreement:      obs.Agreement,
+				Profile:        obs.Profile,
 				Described:      obs.Described,
 				UnderDescribed: obs.UnderDescribed,
 				Legacy:         obs.Legacy,
