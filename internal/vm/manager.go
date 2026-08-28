@@ -3566,7 +3566,7 @@ type recoveryItem struct {
 type machineConfigRecovery struct {
 	mu      sync.Mutex
 	pending []recoveryItem
-	ready   chan *VMInstance
+	ready   chan recoveryItem
 	wake    chan struct{}
 	started bool
 }
@@ -3592,7 +3592,7 @@ func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
 	m.recovery.mu.Lock()
 	if !m.recovery.started {
 		m.recovery.started = true
-		m.recovery.ready = make(chan *VMInstance)
+		m.recovery.ready = make(chan recoveryItem)
 		m.recovery.wake = make(chan struct{}, 1)
 		for i := 0; i < machineConfigRecoveryWorkers; i++ {
 			go m.recoveryWorker()
@@ -3637,12 +3637,13 @@ func (m *Manager) recoveryDispatcher() {
 	defer sentrylog.Recover("machine-config-recovery-dispatcher")
 	for {
 		now := time.Now()
-		var next *VMInstance
+		var next *recoveryItem
 		var sleep time.Duration
 		m.recovery.mu.Lock()
 		for i, item := range m.recovery.pending {
 			if !item.dueAt.After(now) {
-				next = item.inst
+				due := item
+				next = &due
 				m.recovery.pending = append(m.recovery.pending[:i], m.recovery.pending[i+1:]...)
 				break
 			}
@@ -3654,7 +3655,7 @@ func (m *Manager) recoveryDispatcher() {
 		m.recovery.mu.Unlock()
 
 		if next != nil {
-			m.recovery.ready <- next
+			m.recovery.ready <- *next
 			continue
 		}
 		if idle {
@@ -3673,7 +3674,8 @@ func (m *Manager) recoveryDispatcher() {
 // the worker is free for the next candidate.
 func (m *Manager) recoveryWorker() {
 	defer sentrylog.Recover("machine-config-recovery-worker")
-	for inst := range m.recovery.ready {
+	for item := range m.recovery.ready {
+		inst := item.inst
 		if !m.recoveryEligible(inst) {
 			// Destroyed, replaced, paused, or a declared size landed
 			// while it waited — all of them end the work.
@@ -3695,32 +3697,31 @@ func (m *Manager) recoveryWorker() {
 		// Never invent a size on failure: an under-reported allocation
 		// is visible as a host that looks emptier than it is, while a
 		// guessed one would be wrong in a direction nothing can detect.
-		m.requeueRecovery(inst, err)
+		m.requeueRecovery(item, err)
 	}
 }
 
 // requeueRecovery schedules the next attempt, doubling the backoff to a
 // ceiling and jittering it so a fleet that restarted together does not
 // re-probe in lockstep.
-func (m *Manager) requeueRecovery(inst *VMInstance, probeErr error) {
-	m.recovery.mu.Lock()
-	backoff := machineConfigProbeBackoff
-	for i, item := range m.recovery.pending {
-		if item.inst == inst {
-			backoff = item.backoff
-			m.recovery.pending = append(m.recovery.pending[:i], m.recovery.pending[i+1:]...)
-			break
-		}
+func (m *Manager) requeueRecovery(item recoveryItem, probeErr error) {
+	backoff := item.backoff
+	if backoff <= 0 {
+		backoff = machineConfigProbeBackoff
 	}
 	if backoff < machineConfigProbeMaxBackoff {
 		backoff *= 2
+		if backoff > machineConfigProbeMaxBackoff {
+			backoff = machineConfigProbeMaxBackoff
+		}
 	}
 	wait := jitterDuration(backoff)
+	m.recovery.mu.Lock()
 	m.recovery.pending = append(m.recovery.pending, recoveryItem{
-		inst: inst, dueAt: time.Now().Add(wait), backoff: backoff,
+		inst: item.inst, dueAt: time.Now().Add(wait), backoff: backoff,
 	})
 	m.recovery.mu.Unlock()
-	m.log.Warn().Err(probeErr).Str("vm_id", inst.ID).Dur("retry_in", wait).
+	m.log.Warn().Err(probeErr).Str("vm_id", item.inst.ID).Dur("retry_in", wait).
 		Msg("could not read machine configuration; allocation stays uncounted until a retry succeeds")
 	m.nudgeRecovery()
 }

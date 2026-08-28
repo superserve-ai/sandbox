@@ -1842,3 +1842,44 @@ func TestBackfillSkipsPausedVMsAndResumeRecoversThem(t *testing.T) {
 		t.Fatalf("resumed VM never recovered its size: %d/%d", paused.Config.VCPU, paused.Config.MemoryMiB)
 	}
 }
+
+// Backoff must ESCALATE across failures, not restart each time. This
+// mirrors the real cycle: the dispatcher REMOVES an item from pending
+// before handing it to a worker, so by the time the probe fails the
+// retry state exists only in the item itself. Recovering it by looking
+// pending up finds nothing, silently pinning every retry at the opening
+// interval — unreachable VMs would then be probed every couple of
+// seconds for the life of the process.
+func TestBackfillBackoffEscalatesAcrossFailures(t *testing.T) {
+	prev := machineConfigProbeBackoff
+	machineConfigProbeBackoff = time.Second
+	defer func() { machineConfigProbeBackoff = prev }()
+
+	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+	inst := &VMInstance{ID: "unreachable", Status: StatusRunning, SocketPath: "/run/fc.sock"}
+
+	item := recoveryItem{inst: inst, backoff: machineConfigProbeBackoff}
+	var seen []time.Duration
+	for i := 0; i < 8; i++ {
+		m.requeueRecovery(item, fmt.Errorf("connection refused"))
+		// Dispatch it: the item leaves pending, exactly as the real
+		// dispatcher does before a worker ever probes it.
+		m.recovery.mu.Lock()
+		item = m.recovery.pending[len(m.recovery.pending)-1]
+		m.recovery.pending = nil
+		m.recovery.mu.Unlock()
+		seen = append(seen, item.backoff)
+	}
+
+	if seen[0] != 2*time.Second || seen[1] != 4*time.Second {
+		t.Fatalf("backoff did not escalate after dispatch: %v", seen)
+	}
+	for i := 1; i < len(seen); i++ {
+		if seen[i] < seen[i-1] {
+			t.Fatalf("backoff went backwards at attempt %d: %v", i, seen)
+		}
+	}
+	if last := seen[len(seen)-1]; last != machineConfigProbeMaxBackoff {
+		t.Fatalf("backoff settled at %v, want the %v ceiling", last, machineConfigProbeMaxBackoff)
+	}
+}
