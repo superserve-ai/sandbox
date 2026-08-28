@@ -24,7 +24,7 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 		switch r.URL.Path {
 		case "/health":
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(proxyHealthResponse{Capabilities: []string{
+			_ = json.NewEncoder(w).Encode(proxyHealthResponse{FilesEnabled: true, ResolverReady: true, Capabilities: []string{
 				preview.HostCapabilityPorts, preview.HostCapabilityPortAccess,
 				preview.HostCapabilityPortTokens, preview.HostCapabilityPortBrowserAuth,
 			}})
@@ -43,6 +43,8 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 
 	sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{
 		HostID:            "host-a",
+		LifecycleReady:    func() bool { return true },
+		ResolverReady:     func() bool { return true },
 		VMDAddr:           "10.0.0.2:50051",
 		ProxyAddr:         "10.0.0.2:5007",
 		Region:            "region-a",
@@ -57,6 +59,9 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 		t.Fatalf("authorization = %q", gotAuthorization)
 	}
 	want := []string{
+		capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy,
+		capabilityCanProxyTraffic,
+		capabilityCanReadFiles, capabilityCanWriteFiles,
 		preview.HostCapabilityPorts, preview.HostCapabilityPortAccess,
 		preview.HostCapabilityPortTokens, preview.HostCapabilityPortBrowserAuth,
 	}
@@ -179,11 +184,12 @@ func TestSendHeartbeatOmitsCapabilityForOldOrUnavailableProxy(t *testing.T) {
 		name         string
 		healthStatus int
 		healthBody   string
+		want         []string
 	}{
-		{name: "old proxy empty health", healthStatus: http.StatusOK},
-		{name: "proxy unavailable", healthStatus: http.StatusServiceUnavailable},
-		{name: "wrong protocol", healthStatus: http.StatusOK, healthBody: `{"capabilities":["other"]}`},
-		{name: "access without base", healthStatus: http.StatusOK, healthBody: `{"capabilities":["preview_port_access_v1"]}`},
+		{name: "old proxy empty health", healthStatus: http.StatusOK, want: []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy}},
+		{name: "proxy unavailable", healthStatus: http.StatusServiceUnavailable, want: []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy}},
+		{name: "wrong protocol", healthStatus: http.StatusOK, healthBody: `{"capabilities":["other"]}`, want: []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy}},
+		{name: "access without base", healthStatus: http.StatusOK, healthBody: `{"capabilities":["preview_port_access_v1"]}`, want: []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy}},
 	}
 
 	for _, tt := range tests {
@@ -205,11 +211,62 @@ func TestSendHeartbeatOmitsCapabilityForOldOrUnavailableProxy(t *testing.T) {
 			}))
 			defer server.Close()
 
-			sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a"}, server.URL+"/internal/hosts/host-a/heartbeat", "", server.URL+"/health", nil, zerolog.Nop())
-			if len(got.Capabilities) != 0 {
-				t.Fatalf("capabilities = %#v, want empty", got.Capabilities)
+			sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a", LifecycleReady: func() bool { return true }, ResolverReady: func() bool { return true }}, server.URL+"/internal/hosts/host-a/heartbeat", "", server.URL+"/health", nil, zerolog.Nop())
+			if !reflect.DeepEqual(got.Capabilities, tt.want) {
+				t.Fatalf("capabilities = %#v, want %#v", got.Capabilities, tt.want)
 			}
 		})
+	}
+}
+
+func TestSendHeartbeatOmitsLifecycleCapabilitiesBeforeReady(t *testing.T) {
+	var got heartbeatRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_ = json.NewEncoder(w).Encode(proxyHealthResponse{})
+			return
+		}
+		if r.URL.Path == "/heartbeat" {
+			_ = json.NewDecoder(r.Body).Decode(&got)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{
+		HostID: "host-a", LifecycleReady: func() bool { return false },
+	}, server.URL+"/heartbeat", "", server.URL+"/health", nil, zerolog.Nop())
+
+	if reflect.DeepEqual(got.Capabilities, []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy}) {
+		t.Fatalf("lifecycle capabilities = %#v, want omitted before readiness", got.Capabilities)
+	}
+	for _, capability := range got.Capabilities {
+		if capability == capabilityCanCreate || capability == capabilityCanResume || capability == capabilityCanPause || capability == capabilityCanDestroy {
+			t.Fatalf("lifecycle capability %q published before readiness", capability)
+		}
+	}
+}
+
+func TestSendHeartbeatKeepsLifecycleCapabilitiesWhenResolverIsNotReady(t *testing.T) {
+	var got heartbeatRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_ = json.NewEncoder(w).Encode(proxyHealthResponse{})
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{
+		HostID: "host-a", LifecycleReady: func() bool { return true }, ResolverReady: func() bool { return false },
+	}, server.URL+"/heartbeat", "", server.URL+"/health", nil, zerolog.Nop())
+	want := []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy}
+	if !reflect.DeepEqual(got.Capabilities, want) {
+		t.Fatalf("capabilities = %#v, want %#v", got.Capabilities, want)
 	}
 }
 
@@ -336,7 +393,7 @@ func TestSendHeartbeatRetriesWithoutStorageOnCompatibilityError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ok, accepted := sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a"}, server.URL+"/heartbeat", "", server.URL+"/health", []heartbeatStorageMeasurement{{SandboxID: "sandbox-a", AllocatedBytes: 1}}, zerolog.Nop())
+	ok, accepted := sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a", LifecycleReady: func() bool { return true }, ResolverReady: func() bool { return true }}, server.URL+"/heartbeat", "", server.URL+"/health", []heartbeatStorageMeasurement{{SandboxID: "sandbox-a", AllocatedBytes: 1}}, zerolog.Nop())
 	if !ok {
 		t.Fatal("heartbeat should succeed after retrying without storage")
 	}
