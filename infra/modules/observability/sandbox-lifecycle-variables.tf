@@ -19,7 +19,7 @@ variable "lifecycle_latency_alerts" {
 }
 
 variable "failed_sandbox_alert_enabled" {
-  description = "Create the fleet-wide alert that fires when any sandbox lifecycle transition reports a non-success result in the preceding five minutes."
+  description = "Create the fleet-wide alert that fires when any sandbox lifecycle transition reports an error, timeout, or client_error in the preceding five minutes; conflict results are excluded as expected concurrency/idempotency outcomes."
   type        = bool
   default     = false
 }
