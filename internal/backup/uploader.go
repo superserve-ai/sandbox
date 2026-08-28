@@ -100,6 +100,17 @@ type Uploader struct {
 	// StagingRoot is the hard-link staging tree; finished tasks get
 	// their staged generation removed. Empty disables staging cleanup.
 	StagingRoot string
+	// PauseStagingRoot is the pause RPC path's own always-local staging
+	// tree (see vm.Manager.pauseStagingRoot), swept for residue the same
+	// way as StagingRoot: a promotion that crashed or failed between
+	// landing a generation here and cleaning it up leaves an entry with
+	// no pending journal task, same signature as any other orphan.
+	// Unlike LegacyStagingRoot this tree is never retired or removed —
+	// new pauses keep writing here for as long as staging is enabled —
+	// so only the sweep runs, never the emptied-directory removal.
+	// Empty, or equal to StagingRoot (the default, unconfigured case),
+	// skips the extra pass: StagingRoot's own sweep already covers it.
+	PauseStagingRoot string
 	// Now overrides the wall clock in tests; nil means time.Now. Used
 	// for failure-time backoff, where the drain-start time would let a
 	// late failure retry immediately.
@@ -271,6 +282,19 @@ func (u *Uploader) drainLoop(ctx context.Context, tick time.Duration, sweeper, s
 			lastSweep = u.clock()
 			SweepStaging(u.StagingRoot, u.Journal, u.Log)
 			u.sweepLegacyStaging()
+			// PauseStagingRoot is always the snapshot-dir default (see
+			// ResolveStagingRoot), which equals StagingRoot itself on any
+			// host with no BACKUP_STAGING_DIR override — the sweep above
+			// already covers that case, and walking the same tree again
+			// here would cost a second full scan for no new coverage.
+			// LegacyStagingRoot is always the OLDER, run-dir-adjacent
+			// default (a different, unrelated tree, and possibly already
+			// cleared to "" once sweepLegacyStaging fully drains it), so
+			// comparing against it too is just defense against a host
+			// aliasing the two on purpose.
+			if u.PauseStagingRoot != "" && u.PauseStagingRoot != u.StagingRoot && u.PauseStagingRoot != u.LegacyStagingRoot {
+				SweepStaging(u.PauseStagingRoot, u.Journal, u.Log)
+			}
 		}
 	}
 }

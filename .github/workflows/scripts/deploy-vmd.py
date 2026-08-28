@@ -32,6 +32,18 @@ Env vars:
                        /mnt/localssd: the journal is written to continuously
                        while backups drain, and the root disk is small
                        enough that it can fill and stall the uploader.
+  BACKUP_STAGING_DIR   optional — path for the backup uploader's staging
+                       tree (vmd's default lives inside SNAPSHOT_DIR).
+                       Upserted into vmd.env when set; empty = skip. Set
+                       this to a path on a dedicated background-data disk
+                       (not the local-SSD array): every staged file is
+                       read twice before it leaves the host (digest
+                       pre-check, then the upload stream), and on the
+                       array also serving live VM disk I/O that read
+                       traffic contends directly with tenant workloads.
+                       Same real-mount precondition as BACKUP_JOURNAL_PATH
+                       below — refuses to deploy rather than silently
+                       staging onto the root disk.
   BACKUP_UPLOAD_CONCURRENCY
                        optional — number of parallel drain workers in the
                        backup uploader. Upserted into vmd.env when set;
@@ -178,6 +190,7 @@ def main() -> int:
     backup_bucket = os.environ.get("BACKUP_BUCKET", "")
     backup_upload_concurrency = os.environ.get("BACKUP_UPLOAD_CONCURRENCY", "")
     backup_journal_path = os.environ.get("BACKUP_JOURNAL_PATH", "")
+    backup_staging_dir = os.environ.get("BACKUP_STAGING_DIR", "")
     backup_backfill = os.environ.get("BACKUP_BACKFILL", "")
     otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
     control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
@@ -201,6 +214,8 @@ def main() -> int:
     q_backup_workers_line = shlex.quote(f"BACKUP_UPLOAD_CONCURRENCY={backup_upload_concurrency}")
     q_backup_journal = shlex.quote(backup_journal_path)
     q_backup_journal_line = shlex.quote(f"BACKUP_JOURNAL_PATH={backup_journal_path}")
+    q_backup_staging = shlex.quote(backup_staging_dir)
+    q_backup_staging_line = shlex.quote(f"BACKUP_STAGING_DIR={backup_staging_dir}")
     q_otel = shlex.quote(otel_environment)
     q_otel_enabled_line = shlex.quote("OTEL_METRICS_ENABLED=true")
     q_otel_env_line = shlex.quote(f"OTEL_ENVIRONMENT={otel_environment}")
@@ -373,6 +388,30 @@ def main() -> int:
                 BJ_JOURNAL_DIR="$(dirname {q_backup_journal})"
                 if [ ! -d "$BJ_JOURNAL_DIR" ]; then
                     sudo install -d -m 0700 "$BJ_JOURNAL_DIR"
+                fi
+            fi
+
+            # Same precondition as BACKUP_JOURNAL_PATH above, for the same
+            # reason: a transiently unmounted background-data disk must
+            # fail the deploy here, not silently stage backup uploads onto
+            # the root disk. Unlike the journal (a file path, whose parent
+            # is what can be a mountpoint), this setting names a
+            # directory that can itself BE the mountpoint — the walk
+            # starts at the configured path itself, not its parent, so a
+            # value like /mnt/backup-staging is checked directly instead
+            # of incorrectly evaluating /mnt. vmd creates the staging
+            # directory itself (os.MkdirAll in cmd/vmd/main.go) on every
+            # startup regardless of what backs it, so on a fresh host
+            # before vmd's first run this still falls back to the nearest
+            # existing ancestor, same as the journal check.
+            if [ -n {q_backup_staging} ]; then
+                BS_ANCESTOR={q_backup_staging}
+                while [ ! -d "$BS_ANCESTOR" ] && [ "$BS_ANCESTOR" != "/" ]; do
+                    BS_ANCESTOR="$(dirname "$BS_ANCESTOR")"
+                done
+                if [ "$(sudo stat -c %d "$BS_ANCESTOR")" = "$(sudo stat -c %d /)" ]; then
+                    echo "ERROR: $BS_ANCESTOR is on the root filesystem, not a separate mount; refusing to deploy" >&2
+                    exit 1
                 fi
             fi
 
@@ -597,6 +636,20 @@ def main() -> int:
             if [ -n {q_backup_workers} ]; then
                 sudo sed -i '/^BACKUP_UPLOAD_CONCURRENCY=/d' /etc/sandbox/vmd.env
                 echo {q_backup_workers_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Upsert BACKUP_STAGING_DIR (moves the backup uploader's staging
+            # tree off whatever disk serves live VM I/O). Empty = skip,
+            # leaving vmd's SNAPSHOT_DIR-based default in place. Unlike
+            # BACKUP_JOURNAL_PATH below, this needs no stop-and-migrate
+            # step: vmd creates the new tree itself on startup, staged
+            # files already on disk stay reachable through the journal's
+            # absolute paths regardless of this value, and vmd's own
+            # legacy-staging sweep drains whatever tree was previously
+            # live once the config change takes effect.
+            if [ -n {q_backup_staging} ]; then
+                sudo sed -i '/^BACKUP_STAGING_DIR=/d' /etc/sandbox/vmd.env
+                echo {q_backup_staging_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
             # BACKUP_JOURNAL_PATH (moves the backup uploader's BoltDB journal
