@@ -639,16 +639,27 @@ def main() -> int:
             fi
 
             # Upsert BACKUP_STAGING_DIR (moves the backup uploader's staging
-            # tree off whatever disk serves live VM I/O). Empty = skip,
-            # leaving vmd's SNAPSHOT_DIR-based default in place. Unlike
+            # tree off whatever disk serves live VM I/O). Empty = leave it
+            # unset, on vmd's SNAPSHOT_DIR-based default. Unlike
             # BACKUP_JOURNAL_PATH below, this needs no stop-and-migrate
             # step: vmd creates the new tree itself on startup, staged
             # files already on disk stay reachable through the journal's
             # absolute paths regardless of this value, and vmd's own
             # legacy-staging sweep drains whatever tree was previously
             # live once the config change takes effect.
+            #
+            # The delete runs unconditionally, outside the empty-value
+            # guard: pre-this-var vmd binaries treat BACKUP_STAGING_DIR as
+            # the SINGLE staging root (this deploy's split into an
+            # always-local pause-path tree plus a configurable
+            # uploader-visible tree is new). A rollback that drops this
+            # workflow var but leaves a stale line in vmd.env from an
+            # earlier deploy would silently move pause-hot-path staging
+            # onto the dedicated disk on the old binary — the exact
+            # latency regression this split exists to avoid. Unset must
+            # actively clear host state, not just skip writing new state.
+            sudo sed -i '/^BACKUP_STAGING_DIR=/d' /etc/sandbox/vmd.env
             if [ -n {q_backup_staging} ]; then
-                sudo sed -i '/^BACKUP_STAGING_DIR=/d' /etc/sandbox/vmd.env
                 echo {q_backup_staging_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
