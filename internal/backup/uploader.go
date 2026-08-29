@@ -302,8 +302,16 @@ func (u *Uploader) drainLoop(ctx context.Context, tick time.Duration, sweeper, s
 			// default (a different, unrelated tree, and possibly already
 			// cleared to "" once sweepLegacyStaging fully drains it), so
 			// comparing against it too is just defense against a host
-			// aliasing the two on purpose.
-			if u.PauseStagingRoot != "" && u.PauseStagingRoot != u.StagingRoot && u.PauseStagingRoot != u.LegacyStagingRoot {
+			// aliasing the two on purpose. Overlap, not plain inequality:
+			// a BACKUP_STAGING_DIR configured as an ancestor or descendant
+			// of the pause-path default would otherwise make this sweep
+			// (or the StagingRoot sweep above, from the other direction)
+			// misinterpret the nested tree's layout — a live pause-staged
+			// VM directory can read as a stale generation ready for
+			// removal past the grace period.
+			if u.PauseStagingRoot != "" &&
+				!StagingRootsOverlap(u.PauseStagingRoot, u.StagingRoot) &&
+				!StagingRootsOverlap(u.PauseStagingRoot, u.LegacyStagingRoot) {
 				SweepStaging(u.PauseStagingRoot, u.Journal, u.Log)
 			}
 		}
