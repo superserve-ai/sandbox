@@ -103,6 +103,26 @@ type VMDResolver struct {
 	group singleflight.Group
 }
 
+// Ready verifies that the configured VMD endpoint is reachable. A 404 is
+// expected for the synthetic instance, but still proves the resolver path.
+func (r *VMDResolver) Ready(ctx context.Context) error {
+	probeCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, r.vmdAddr+"/instances/__healthcheck__", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("resolver probe returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // WithPreviewTokens declares that the owning proxy handler has a valid seed
 // and can enforce HostCapabilityPortTokens. Configure it once at startup.
 func (r *VMDResolver) WithPreviewTokens() *VMDResolver {

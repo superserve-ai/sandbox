@@ -82,6 +82,27 @@ jobs:
       - name: Go vet
         run: go vet ./...
 
+  fc-client-check:
+    name: FC Client Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify the Firecracker client matches the spec
+        run: |
+          go generate ./internal/vm/fc/...
+          # Porcelain, not diff: a spec change that adds a definition generates a
+          # new file, which is untracked and so invisible to git diff.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Firecracker client is out of date. Run 'go generate ./internal/vm/fc/...' and commit the result."
+            git status --porcelain
+            exit 1
+          fi
+
   sqlc-check:
     name: sqlc Check
     runs-on: ubuntu-latest

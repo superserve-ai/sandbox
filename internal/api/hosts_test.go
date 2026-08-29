@@ -141,6 +141,7 @@ func TestHostHeartbeatReclaimEvictsCachedClient(t *testing.T) {
 			execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
 				switch {
 				case strings.Contains(sql, "-- name: UpdateHostAddresses :exec"),
+					strings.Contains(sql, "-- name: DeleteHostPressure :exec"),
 					strings.Contains(sql, "-- name: SyncHostCapabilities :exec"):
 					return pgconn.NewCommandTag("UPDATE 1"), nil
 				default:

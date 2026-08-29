@@ -176,9 +176,16 @@ type hostView struct {
 	TransitionalCount int     `json:"transitional_count"`
 	PausedCount       int     `json:"paused_count"`
 	BuildingCount     int     `json:"building_count"`
-	// Pointer: a control plane predating coverage reporting omits the field,
-	// and "unknown" must never render as a safety-relevant 0.
-	PausedUnbacked *int `json:"paused_unbacked_count"`
+	// Pointers throughout: nil means the control plane (or host) never
+	// produced the value — shown as "-"/unknown so absence never reads
+	// as a plausible, safety-relevant zero.
+	PausedUnbacked             *int    `json:"paused_unbacked_count"`
+	PressureAllocatedMemoryMib *int64  `json:"pressure_allocated_memory_mib"`
+	PressureAllocatedVcpus     *int64  `json:"pressure_allocated_vcpus"`
+	CapacityMemoryMib          int     `json:"capacity_memory_mib"`
+	CapacityVcpus              int     `json:"capacity_vcpus"`
+	PressureUnknownAllocation  *int    `json:"pressure_unknown_allocation_vms"`
+	PressureReportedAt         *string `json:"pressure_reported_at"`
 }
 
 func (c client) hostsPath(path string) ([]hostView, error) {
@@ -237,7 +244,13 @@ func (c client) list() error {
 	// irrecoverable subset — paused sandboxes with no durable backup copy
 	// anywhere; retiring the machine destroys those outright, so that
 	// number must read zero before retirement is even discussable.
-	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED\tUNBACKED")
+	// ALLOC is the vmd-reported live allocation against configured
+	// capacity (mem MiB, vcpus); P_AGE is the pressure report's age. "-"
+	// means the host has never published pressure. A trailing "+N?" on
+	// ALLOC counts live VMs the host could not size — the allocation is
+	// an undercount by that many VMs, so the host has LESS free capacity
+	// than the numbers suggest.
+	fmt.Fprintln(w, "ID\tSTATUS\tREGION\tVMD_ADDR\tHEARTBEAT\tRUNNING\tBUSY\tBUILDS\tPAUSED\tUNBACKED\tALLOC\tP_AGE")
 	for _, h := range out.Hosts {
 		beat := "never"
 		if h.LastHeartbeatAt != nil {
@@ -249,8 +262,27 @@ func (c client) list() error {
 		if h.PausedUnbacked != nil {
 			unbacked = fmt.Sprintf("%d", *h.PausedUnbacked)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\n",
-			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount, unbacked)
+		alloc, pAge := "-", "-"
+		if h.PressureAllocatedMemoryMib != nil && h.PressureAllocatedVcpus != nil {
+			alloc = fmt.Sprintf("%d/%dMiB %d/%dcpu",
+				*h.PressureAllocatedMemoryMib, h.CapacityMemoryMib,
+				*h.PressureAllocatedVcpus, h.CapacityVcpus)
+			// A host that cannot size some of its VMs is reporting LESS
+			// allocation than it holds, so the number above must not be
+			// read as the whole story. Marked inline rather than in its
+			// own column: it qualifies ALLOC, and it is almost always
+			// absent.
+			if h.PressureUnknownAllocation != nil && *h.PressureUnknownAllocation > 0 {
+				alloc += fmt.Sprintf(" +%d?", *h.PressureUnknownAllocation)
+			}
+		}
+		if h.PressureReportedAt != nil {
+			if t, err := time.Parse(time.RFC3339, *h.PressureReportedAt); err == nil {
+				pAge = fmt.Sprintf("%ds", int(time.Since(t).Seconds()))
+			}
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
+			h.ID, h.Status, h.Region, h.VMDAddr, beat, h.RunningCount, h.TransitionalCount, h.BuildingCount, h.PausedCount, unbacked, alloc, pAge)
 	}
 	return w.Flush()
 }
