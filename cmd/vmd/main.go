@@ -1091,17 +1091,24 @@ func main() {
 		// the uploader's periodic sweep rather than drained here: the
 		// trees can be fleet-sized, and startup readiness (pause/resume/
 		// create all wait on it) must not block on an unbounded filesystem
-		// walk. Recording today's root is unconditional and idempotent;
-		// sweepRetiredStaging is what drops a retired one from the set,
+		// walk. sweepRetiredStaging is what drops a retired root from the set,
 		// and only once removal actually confirms empty, so an
 		// interrupted drain resumes on a later boot instead of losing
 		// track of the config change.
-		if err := journal.RecordStagingRoot(stagingRoot); err != nil {
-			log.Warn().Err(err).Msg("record staging root failed; a future root change may not be detected")
+		allRoots, rootsErr := journal.StagingRoots()
+		if rootsErr != nil {
+			log.Warn().Err(rootsErr).Msg("read staging roots failed; retired custom roots (if any) not tracked this boot")
 		}
-		if allRoots, err := journal.StagingRoots(); err != nil {
-			log.Warn().Err(err).Msg("read staging roots failed; retired custom roots (if any) not tracked this boot")
-		} else {
+		// A durable write (BoltDB transaction, fsync included) on every
+		// startup would tax the common case — an unchanged root, by far
+		// most boots — on a path pause/resume/create readiness waits on.
+		// Skip it whenever the read above already found this root present.
+		if rootsErr == nil && !slices.Contains(allRoots, stagingRoot) {
+			if err := journal.RecordStagingRoot(stagingRoot); err != nil {
+				log.Warn().Err(err).Msg("record staging root failed; a future root change may not be detected")
+			}
+		}
+		if rootsErr == nil {
 			for _, root := range allRoots {
 				// Plain inequality is not enough here: a change between an
 				// ancestor and descendant path (or the same directory under
