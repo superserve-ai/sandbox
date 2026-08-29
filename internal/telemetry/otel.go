@@ -103,6 +103,17 @@ type OTelRecorder struct {
 	dbEmptyAcquire           metric.Int64Counter
 	dbCanceledAcquire        metric.Int64Counter
 	dbAcquireDurationSeconds metric.Float64Counter
+	abuseDenyEntries         metric.Int64Gauge
+	abuseDenyCapacity        metric.Int64Gauge
+	abuseTrustedTeams        metric.Int64Gauge
+	abuseUtilization         metric.Float64Gauge
+	abuseTTLEvictions        metric.Int64Counter
+	abuseCapacityEvictions   metric.Int64Counter
+	abuseAdmissionRejections metric.Int64Counter
+	abuseStatsMu             sync.Mutex
+	lastAbuseTTLEvictions    uint64
+	lastAbuseCapacityEvicts  uint64
+	lastAbuseAdmissionReject uint64
 	phaseDuration            metric.Float64Histogram
 	pausedNetworkSlotsTotal  metric.Int64Gauge
 	pausedNetworkSlotsUsed   metric.Int64Gauge
@@ -222,6 +233,27 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.dbAcquireDurationSeconds, err = meter.Float64Counter("db_pool_acquire_duration_seconds_total"); err != nil {
+		return nil, err
+	}
+	if r.abuseDenyEntries, err = meter.Int64Gauge("abuse_enforcement_deny_entries"); err != nil {
+		return nil, err
+	}
+	if r.abuseDenyCapacity, err = meter.Int64Gauge("abuse_enforcement_deny_capacity"); err != nil {
+		return nil, err
+	}
+	if r.abuseTrustedTeams, err = meter.Int64Gauge("abuse_enforcement_trusted_teams"); err != nil {
+		return nil, err
+	}
+	if r.abuseUtilization, err = meter.Float64Gauge("abuse_enforcement_utilization"); err != nil {
+		return nil, err
+	}
+	if r.abuseTTLEvictions, err = meter.Int64Counter("abuse_enforcement_ttl_evictions_total"); err != nil {
+		return nil, err
+	}
+	if r.abuseCapacityEvictions, err = meter.Int64Counter("abuse_enforcement_capacity_evictions_total"); err != nil {
+		return nil, err
+	}
+	if r.abuseAdmissionRejections, err = meter.Int64Counter("abuse_enforcement_admission_rejections_total"); err != nil {
 		return nil, err
 	}
 	if r.pausedNetworkSlotsTotal, err = meter.Int64Gauge("vmd_network_slots_total"); err != nil {
@@ -481,6 +513,41 @@ func (r *OTelRecorder) RecordDBPoolStats(ctx context.Context, s DBPoolStats) {
 	if s.AcquireDurationSecondsDelta > 0 {
 		r.dbAcquireDurationSeconds.Add(ctx, s.AcquireDurationSecondsDelta, opt)
 	}
+}
+
+func (r *OTelRecorder) RecordAbuseEnforcementStats(ctx context.Context, s AbuseEnforcementStats) {
+	if r == nil {
+		return
+	}
+	opt := metric.WithAttributes(r.selfAttrs()...)
+	r.abuseStatsMu.Lock()
+	ttlDelta := counterDelta(s.TTLEvictions, &r.lastAbuseTTLEvictions)
+	capacityDelta := counterDelta(s.CapacityEvictions, &r.lastAbuseCapacityEvicts)
+	rejectionDelta := counterDelta(s.AdmissionRejections, &r.lastAbuseAdmissionReject)
+	r.abuseStatsMu.Unlock()
+	r.abuseDenyEntries.Record(ctx, s.DenyEntries, opt)
+	r.abuseDenyCapacity.Record(ctx, s.DenyCapacity, opt)
+	r.abuseTrustedTeams.Record(ctx, s.TrustedTeams, opt)
+	r.abuseUtilization.Record(ctx, s.Utilization, opt)
+	if ttlDelta > 0 {
+		r.abuseTTLEvictions.Add(ctx, int64(ttlDelta), opt)
+	}
+	if capacityDelta > 0 {
+		r.abuseCapacityEvictions.Add(ctx, int64(capacityDelta), opt)
+	}
+	if rejectionDelta > 0 {
+		r.abuseAdmissionRejections.Add(ctx, int64(rejectionDelta), opt)
+	}
+}
+
+func counterDelta(current uint64, previous *uint64) uint64 {
+	if current < *previous {
+		*previous = current
+		return current
+	}
+	delta := current - *previous
+	*previous = current
+	return delta
 }
 
 // RecordLauncherState emits vmd_launcher_ready as 1/0. Alert on it: a sustained

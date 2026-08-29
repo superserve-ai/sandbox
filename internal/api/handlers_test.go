@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/abuse"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -396,6 +397,9 @@ func setupTestRouter(h *Handlers, teamID string) *gin.Engine {
 	r.Use(func(c *gin.Context) {
 		if teamID != "" {
 			c.Set("team_id", teamID)
+		}
+		if domain := c.GetHeader("X-Identity-Domain"); domain != "" {
+			c.Set("identity_domain", domain)
 		}
 		c.Next()
 	})
@@ -2047,6 +2051,203 @@ func TestResumeSandbox_ActivityLogFailure_StillReturns200(t *testing.T) {
 
 func createSandboxReq(body string) *http.Request {
 	return httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(body))
+}
+
+func TestCreateSandbox_AbuseEnforcementDeniesBeforeMutation(t *testing.T) {
+	teamID := uuid.New()
+	var dbQueried, dbExecuted, vmdCalled bool
+	scheduler := &stubScheduler{hostID: "host-1", err: fmt.Errorf("scheduler should not be called")}
+	vmd := &stubVMD{
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			vmdCalled = true
+			return "", fmt.Errorf("vmd should not be called")
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			dbQueried = true
+			return errorRow(fmt.Errorf("create path should not query DB: %s", sql))
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			dbExecuted = true
+			return pgconn.CommandTag{}, fmt.Errorf("create path should not exec DB: %s", sql)
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Scheduler: scheduler}
+	h.abuseEnforcement.SetMode(abuseEnforcementModeEnforce)
+	h.abuseEnforcement.Replace(teamID, false, abuseEnforcementRestriction{
+		SubjectType: "team",
+		Actions:     []abuse.Action{abuse.ActionCreate},
+	})
+
+	req := createSandboxReq(`{"name":"my-sandbox"}`)
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusForbidden, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	if code := errorCode(body); code != "abuse_quarantine" {
+		t.Fatalf("error code = %q, want %q", code, "abuse_quarantine")
+	}
+	if dbQueried || dbExecuted {
+		t.Fatal("create denial should not reach the DB")
+	}
+	if len(scheduler.required) != 0 {
+		t.Fatal("create denial should not select a host")
+	}
+	if vmdCalled {
+		t.Fatal("create denial should not call VMD")
+	}
+}
+
+func TestCreateSandbox_DomainAbuseEnforcementDeniesBeforeMutation(t *testing.T) {
+	teamID := uuid.New()
+	var dbQueried, dbExecuted, vmdCalled bool
+	scheduler := &stubScheduler{hostID: "host-1", err: fmt.Errorf("scheduler should not be called")}
+	vmd := &stubVMD{
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			vmdCalled = true
+			return "", fmt.Errorf("vmd should not be called")
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			dbQueried = true
+			return errorRow(fmt.Errorf("create path should not query DB: %s", sql))
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			dbExecuted = true
+			return pgconn.CommandTag{}, fmt.Errorf("create path should not exec DB: %s", sql)
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Scheduler: scheduler}
+	h.abuseEnforcement.SetMode(abuseEnforcementModeEnforce)
+	h.abuseEnforcement.Replace(teamID, false, abuseEnforcementRestriction{
+		SubjectType: "domain",
+		Value:       "pilot-team.example",
+		Actions:     []abuse.Action{abuse.ActionCreate},
+	})
+
+	req := createSandboxReq(`{"name":"my-sandbox"}`)
+	req.Header.Set("X-Identity-Domain", "pilot-team.example")
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusForbidden, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	if code := errorCode(body); code != "abuse_quarantine" {
+		t.Fatalf("error code = %q, want %q", code, "abuse_quarantine")
+	}
+	if dbQueried || dbExecuted {
+		t.Fatal("create denial should not reach the DB")
+	}
+	if len(scheduler.required) != 0 {
+		t.Fatal("create denial should not select a host")
+	}
+	if vmdCalled {
+		t.Fatal("create denial should not call VMD")
+	}
+}
+
+func TestResumeSandbox_AbuseEnforcementDeniesBeforeMutation(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+	var dbQueried, dbExecuted, vmdCalled bool
+	vmd := &stubVMD{
+		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
+			vmdCalled = true
+			return "", fmt.Errorf("vmd should not be called")
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			dbQueried = true
+			return errorRow(fmt.Errorf("resume path should not query DB: %s", sql))
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			dbExecuted = true
+			return pgconn.CommandTag{}, fmt.Errorf("resume path should not exec DB: %s", sql)
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	h.abuseEnforcement.SetMode(abuseEnforcementModeEnforce)
+	h.abuseEnforcement.Replace(teamID, false, abuseEnforcementRestriction{
+		SubjectType: "team",
+		Actions:     []abuse.Action{abuse.ActionResume},
+	})
+
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusForbidden, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	if code := errorCode(body); code != "abuse_quarantine" {
+		t.Fatalf("error code = %q, want %q", code, "abuse_quarantine")
+	}
+	if dbQueried || dbExecuted {
+		t.Fatal("resume denial should not reach the DB")
+	}
+	if vmdCalled {
+		t.Fatal("resume denial should not call VMD")
+	}
+}
+
+func TestResumeSandbox_DomainAbuseEnforcementDeniesBeforeMutation(t *testing.T) {
+	teamID := uuid.New()
+	sandboxID := uuid.New()
+	var dbQueried, dbExecuted, vmdCalled bool
+	vmd := &stubVMD{
+		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
+			vmdCalled = true
+			return "", fmt.Errorf("vmd should not be called")
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			dbQueried = true
+			return errorRow(fmt.Errorf("resume path should not query DB: %s", sql))
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			dbExecuted = true
+			return pgconn.CommandTag{}, fmt.Errorf("resume path should not exec DB: %s", sql)
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	h.abuseEnforcement.SetMode(abuseEnforcementModeEnforce)
+	h.abuseEnforcement.Replace(teamID, false, abuseEnforcementRestriction{
+		SubjectType: "domain",
+		Value:       "pilot-team.example",
+		Actions:     []abuse.Action{abuse.ActionResume},
+	})
+
+	req := resumeRequest(sandboxID.String())
+	req.Header.Set("X-Identity-Domain", "pilot-team.example")
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusForbidden, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	if code := errorCode(body); code != "abuse_quarantine" {
+		t.Fatalf("error code = %q, want %q", code, "abuse_quarantine")
+	}
+	if dbQueried || dbExecuted {
+		t.Fatal("resume denial should not reach the DB")
+	}
+	if vmdCalled {
+		t.Fatal("resume denial should not call VMD")
+	}
 }
 
 func TestCreateSandbox_Success(t *testing.T) {
@@ -3730,6 +3931,131 @@ func TestFailSandboxAfterBootUsesDetachedCleanupOnSandboxHost(t *testing.T) {
 	}
 	if dbCalls != 2 {
 		t.Errorf("cleanup DB writes = %d, want status update + secret cleanup", dbCalls)
+	}
+}
+
+func TestActivateSandbox_PausedAbuseEnforcementDeniesBeforeResume(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+
+	var (
+		dbQueries    int
+		dbExecuted   bool
+		resumeCalled bool
+	)
+	vmd := &stubVMD{
+		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
+			resumeCalled = true
+			return "", fmt.Errorf("resume should not be called")
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			dbQueries++
+			if dbQueries > 1 {
+				return errorRow(fmt.Errorf("paused auto-resume should stop before extra DB work: %s", sql))
+			}
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			dbExecuted = true
+			return pgconn.CommandTag{}, fmt.Errorf("paused auto-resume should not exec DB: %s", sql)
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	h.abuseEnforcement.SetMode(abuseEnforcementModeEnforce)
+	h.abuseEnforcement.Replace(teamID, false, abuseEnforcementRestriction{
+		SubjectType: "team",
+		Actions:     []abuse.Action{abuse.ActionResume},
+	})
+
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusForbidden, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	if code := errorCode(body); code != "abuse_quarantine" {
+		t.Fatalf("error code = %q, want %q", code, "abuse_quarantine")
+	}
+	if dbQueries != 1 {
+		t.Fatalf("DB queries = %d, want 1 initial sandbox lookup", dbQueries)
+	}
+	if dbExecuted {
+		t.Fatal("paused auto-resume denial should not execute DB mutation")
+	}
+	if resumeCalled {
+		t.Fatal("paused auto-resume denial should not call VMD")
+	}
+}
+
+func TestListSandboxFiles_PausedAbuseEnforcementDeniesBeforeResume(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+
+	var (
+		dbQueries  int
+		dbExecuted bool
+		listCalled bool
+	)
+	vmd := &stubVMD{
+		listDirFn: func(context.Context, string, string) ([]vmdclient.DirEntry, error) {
+			listCalled = true
+			return nil, fmt.Errorf("list dir should not be called")
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			dbQueries++
+			if dbQueries > 1 {
+				return errorRow(fmt.Errorf("paused auto-resume should stop before extra DB work: %s", sql))
+			}
+			if strings.Contains(sql, "FROM sandbox") {
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			dbExecuted = true
+			return pgconn.CommandTag{}, fmt.Errorf("paused auto-resume should not exec DB: %s", sql)
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	h.abuseEnforcement.SetMode(abuseEnforcementModeEnforce)
+	h.abuseEnforcement.Replace(teamID, false, abuseEnforcementRestriction{
+		SubjectType: "team",
+		Actions:     []abuse.Action{abuse.ActionResume},
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/sandboxes/"+sandboxID.String()+"/files?path=/", nil)
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusForbidden, w.Body.String())
+	}
+	body := parseJSON(t, w)
+	if code := errorCode(body); code != "abuse_quarantine" {
+		t.Fatalf("error code = %q, want %q", code, "abuse_quarantine")
+	}
+	if dbQueries != 1 {
+		t.Fatalf("DB queries = %d, want 1 initial sandbox lookup", dbQueries)
+	}
+	if dbExecuted {
+		t.Fatal("paused auto-resume denial should not execute DB mutation")
+	}
+	if listCalled {
+		t.Fatal("paused auto-resume denial should not call VMD")
 	}
 }
 

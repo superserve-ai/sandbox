@@ -106,6 +106,14 @@ type DBPoolStats struct {
 	AcquireDurationSecondsDelta float64
 }
 
+type AbuseEnforcementStats struct {
+	DenyEntries, DenyCapacity, TrustedTeams int64
+	Utilization                             float64
+	TTLEvictions, CapacityEvictions         uint64
+	AdmissionRejections                     uint64
+	AlertLevel                              string
+}
+
 // PausedNetworkPressure records a pressure-controller snapshot and any reclaim
 // activity performed during that pass.
 type PausedNetworkPressure struct {
@@ -190,6 +198,7 @@ type Recorder interface {
 	RecordHostCapacity(context.Context, HostCapacity)
 	RecordBackupCoverage(context.Context, []BackupCoverage)
 	RecordDBPoolStats(context.Context, DBPoolStats)
+	RecordAbuseEnforcementStats(context.Context, AbuseEnforcementStats)
 	RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)
 	RecordLauncherState(context.Context, LauncherState)
 	RecordLatencyPhase(context.Context, LatencyPhase)
@@ -217,6 +226,7 @@ func (noopRecorder) RecordCapacityShadow(context.Context, CapacityShadow)       
 func (noopRecorder) RecordHostCapacity(context.Context, HostCapacity)                       {}
 func (noopRecorder) RecordBackupCoverage(context.Context, []BackupCoverage)                 {}
 func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)                         {}
+func (noopRecorder) RecordAbuseEnforcementStats(context.Context, AbuseEnforcementStats)     {}
 func (noopRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)     {}
 func (noopRecorder) RecordLauncherState(context.Context, LauncherState)                     {}
 func (noopRecorder) RecordLatencyPhase(context.Context, LatencyPhase)                       {}

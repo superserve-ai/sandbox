@@ -186,7 +186,7 @@ func RateLimit(ctx context.Context, cfg RateLimitConfig) gin.HandlerFunc {
 	limiter.startCleanup(ctx, cfg)
 
 	return func(c *gin.Context) {
-		key := c.ClientIP()
+		key := clientIP(c)
 		if enforceLimit(c, limiter.get(key), cfg) {
 			c.Next()
 		}
@@ -215,7 +215,7 @@ func TeamRateLimit(ctx context.Context, cfg RateLimitConfig) gin.HandlerFunc {
 			}
 		}
 		if key == "" {
-			key = "ip:" + c.ClientIP()
+			key = "ip:" + clientIP(c)
 		}
 		if enforceLimit(c, limiter.get(key), cfg) {
 			c.Next()

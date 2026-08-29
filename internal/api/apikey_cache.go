@@ -52,15 +52,16 @@ func apiKeyCacheTTLFromEnv() time.Duration {
 }
 
 type apiKeyCacheEntry struct {
-	id         string
-	teamID     string
-	name       string
-	scopes     []string
-	createdBy  pgtype.UUID
-	expiresAt  pgtype.Timestamptz
-	fetchedAt  time.Time
-	lastTouch  time.Time
-	refreshing bool // a stale-serve refresh is in flight; armed by get, cleared by put/refreshFailed
+	id             string
+	teamID         string
+	name           string
+	scopes         []string
+	createdBy      pgtype.UUID
+	identityDomain pgtype.Text
+	expiresAt      pgtype.Timestamptz
+	fetchedAt      time.Time
+	lastTouch      time.Time
+	refreshing     bool // a stale-serve refresh is in flight; armed by get, cleared by put/refreshFailed
 }
 
 type apiKeyCache struct {

@@ -20,6 +20,12 @@ variable "notification_channel_ids" {
   default     = []
 }
 
+variable "abuse_enforcement_alerts_enabled" {
+  description = "Whether to create abuse-enforcement cache pressure alerts."
+  type        = bool
+  default     = false
+}
+
 variable "compute_instance_cpu_alerts" {
   description = "CPU saturation alerts keyed by a stable logical name."
   type = map(object({
