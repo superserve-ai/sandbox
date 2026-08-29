@@ -285,9 +285,13 @@ func (j *Journal) GetStagingRoot() (root string, ok bool, err error) {
 }
 
 // PutStagingRoot records root as the current staging root, overwriting
-// whatever was recorded before. Call once per boot after resolving the
-// root, so the NEXT boot can detect a config change and sweep whatever
-// this one abandons.
+// whatever was recorded before. Callers must only advance this once
+// root is actually in effect with nothing left in a prior root: cmd/vmd
+// calls it directly on the no-drift boot path, and
+// Uploader.sweepRetiredStaging calls it only after confirming a
+// retired custom root emptied, so an interrupted drain keeps being
+// detected on later boots instead of the config change going
+// untracked.
 func (j *Journal) PutStagingRoot(root string) error {
 	return j.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(stagingRootBucket).Put(stagingRootKey, []byte(root))

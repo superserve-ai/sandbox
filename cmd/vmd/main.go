@@ -1086,22 +1086,20 @@ func main() {
 		// about the one fixed pre-split default, not whatever custom root
 		// an operator had actually configured, so without this the
 		// abandoned tree's successfully-uploaded files would never be
-		// reclaimed. One sweep per boot keeps it draining; a tree that
-		// doesn't fully empty here gets another pass next restart.
+		// reclaimed. Handed to the uploader's periodic sweep rather than
+		// drained here: the tree can be fleet-sized, and startup readiness
+		// (pause/resume/create all wait on it) must not block on an
+		// unbounded filesystem walk. sweepRetiredStaging only advances the
+		// journal's recorded root once removal actually confirms empty, so
+		// an interrupted drain resumes on a later boot instead of losing
+		// track of the config change.
 		if prevRoot, ok, err := journal.GetStagingRoot(); err != nil {
-			log.Warn().Err(err).Msg("read previous staging root failed; retired custom root (if any) not swept this boot")
+			log.Warn().Err(err).Msg("read previous staging root failed; retired custom root (if any) not tracked this boot")
 		} else if ok && prevRoot != "" && prevRoot != stagingRoot && prevRoot != legacyStaging {
-			ps := backup.SweepStaging(prevRoot, journal, log.With().Str("component", "backup").Logger())
-			log.Info().Str("path", prevRoot).
-				Int("sandboxes", ps.Sandboxes).Int("generations", ps.Generations).
-				Msg("staging root changed since last boot; swept the retired custom root")
-			ss.Sandboxes += ps.Sandboxes
-			ss.Generations += ps.Generations
-			ss.Bases += ps.Bases
-			ss.Pending += ps.Pending
-		}
-		if err := journal.PutStagingRoot(stagingRoot); err != nil {
-			log.Warn().Err(err).Msg("persist staging root failed; a future root change may not sweep this one")
+			uploader.RetiredStagingRoot = prevRoot
+			log.Info().Str("path", prevRoot).Msg("staging root changed since last boot; retired custom root queued for background drain")
+		} else if err := journal.PutStagingRoot(stagingRoot); err != nil {
+			log.Warn().Err(err).Msg("persist staging root failed; a future root change may not be detected")
 		}
 		// pauseStagingRoot gets no startup sweep of its own here: on a
 		// host with no BACKUP_STAGING_DIR override it IS stagingRoot
