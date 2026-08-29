@@ -826,6 +826,19 @@ func ResolveStagingRoot(override, snapshotDir, runDir string) (root, legacy stri
 // unusual choice operationally (dedicated staging disks are typically
 // siblings, not nested); until the general fix lands, that specific
 // transition needs a manual cleanup of the stranded entries.
+//
+// Also known and accepted: this is a purely lexical comparison after
+// filepath.Clean, not a filesystem-identity check. Two configured
+// paths that reach the same directory through a symlink read as
+// non-overlapping, so a change between such spellings would retire a
+// tree that is still the live target — deployment convention here is
+// mounting a dedicated disk directly at the configured path, not
+// symlinking to it, which keeps this from applying to the actual
+// rollout this function exists for. Resolving through
+// filepath.EvalSymlinks would close the gap generally but has its own
+// sharp edge (a path that doesn't exist yet, the common case for a
+// freshly-configured root, errors rather than resolving), so it is
+// deferred rather than added speculatively.
 func StagingRootsOverlap(a, b string) bool {
 	if a == "" || b == "" {
 		return false

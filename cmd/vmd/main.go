@@ -1116,9 +1116,19 @@ func main() {
 				// sweepRetiredStaging would walk live, referenced entries
 				// reachable through the active root's own tree and delete
 				// them as apparent orphans past the grace period.
+				//
+				// pauseStagingRoot must be excluded too, not just
+				// stagingRoot: it is fixed at the SNAPSHOT_DIR default
+				// regardless of BACKUP_STAGING_DIR (see its own comment
+				// above), so a host's first boot with the override unset
+				// records that default, and enabling the override on a
+				// LATER boot must not then treat the still-live pause-path
+				// tree as retired just because it stopped being the
+				// uploader's own root.
 				if root == stagingRoot ||
 					backup.StagingRootsOverlap(root, stagingRoot) ||
-					backup.StagingRootsOverlap(root, legacyStaging) {
+					backup.StagingRootsOverlap(root, legacyStaging) ||
+					backup.StagingRootsOverlap(root, pauseStagingRoot) {
 					continue
 				}
 				uploader.RetiredStagingRoots = append(uploader.RetiredStagingRoots, root)
