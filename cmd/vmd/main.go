@@ -1079,6 +1079,30 @@ func main() {
 			ss.Bases += ls.Bases
 			ss.Pending += ls.Pending
 		}
+		// A recorded root that differs from both today's resolution and the
+		// hardcoded pre-split legacy path is a retired CUSTOM root — most
+		// often a rollback that cleared BACKUP_STAGING_DIR after it had
+		// pointed at a dedicated disk. ResolveStagingRoot only ever knows
+		// about the one fixed pre-split default, not whatever custom root
+		// an operator had actually configured, so without this the
+		// abandoned tree's successfully-uploaded files would never be
+		// reclaimed. One sweep per boot keeps it draining; a tree that
+		// doesn't fully empty here gets another pass next restart.
+		if prevRoot, ok, err := journal.GetStagingRoot(); err != nil {
+			log.Warn().Err(err).Msg("read previous staging root failed; retired custom root (if any) not swept this boot")
+		} else if ok && prevRoot != "" && prevRoot != stagingRoot && prevRoot != legacyStaging {
+			ps := backup.SweepStaging(prevRoot, journal, log.With().Str("component", "backup").Logger())
+			log.Info().Str("path", prevRoot).
+				Int("sandboxes", ps.Sandboxes).Int("generations", ps.Generations).
+				Msg("staging root changed since last boot; swept the retired custom root")
+			ss.Sandboxes += ps.Sandboxes
+			ss.Generations += ps.Generations
+			ss.Bases += ps.Bases
+			ss.Pending += ps.Pending
+		}
+		if err := journal.PutStagingRoot(stagingRoot); err != nil {
+			log.Warn().Err(err).Msg("persist staging root failed; a future root change may not sweep this one")
+		}
 		// pauseStagingRoot gets no startup sweep of its own here: on a
 		// host with no BACKUP_STAGING_DIR override it IS stagingRoot
 		// (already covered above), and on a host with one configured, a

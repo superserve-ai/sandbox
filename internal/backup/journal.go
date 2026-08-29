@@ -221,7 +221,18 @@ var (
 	// ack of the SAME generation overwrites the completion value without
 	// touching this record, and the mismatch re-seeds the newer instant.
 	seededBucket = []byte("backup_outbox_seeded")
+	// stagingRootBucket holds the single most recently resolved staging
+	// root (BACKUP_STAGING_DIR or its default), under stagingRootKey. It
+	// exists so a config change away from a custom root — a rollback in
+	// particular — can be detected and the abandoned tree swept, rather
+	// than leaked forever: ResolveStagingRoot's hardcoded legacy path only
+	// ever covers the one fixed pre-split default, not whatever custom
+	// root an operator had actually configured.
+	stagingRootBucket = []byte("backup_staging_root")
 )
+
+// stagingRootKey is the bucket's only entry.
+var stagingRootKey = []byte("current")
 
 // verifiedRetention bounds how long verification history is kept. Long
 // enough to cover any plausible re-enqueue of an unchanged generation;
@@ -247,7 +258,7 @@ const claimTTL = time.Hour
 // caller owns the bolt DB; sharing vmd's state DB keeps one fsync domain.
 func NewJournal(db *bolt.DB) (*Journal, error) {
 	err := db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket, outboxBucket, completionsBucket, seededBucket} {
+		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket, outboxBucket, completionsBucket, seededBucket, stagingRootBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -258,6 +269,29 @@ func NewJournal(db *bolt.DB) (*Journal, error) {
 		return nil, fmt.Errorf("create journal bucket: %w", err)
 	}
 	return &Journal{db: db, claims: make(map[string]claim)}, nil
+}
+
+// GetStagingRoot returns the staging root recorded by the previous call
+// to PutStagingRoot, or ok=false on first boot (nothing recorded yet).
+func (j *Journal) GetStagingRoot() (root string, ok bool, err error) {
+	err = j.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(stagingRootBucket).Get(stagingRootKey)
+		if v != nil {
+			root, ok = string(v), true
+		}
+		return nil
+	})
+	return root, ok, err
+}
+
+// PutStagingRoot records root as the current staging root, overwriting
+// whatever was recorded before. Call once per boot after resolving the
+// root, so the NEXT boot can detect a config change and sweep whatever
+// this one abandons.
+func (j *Journal) PutStagingRoot(root string) error {
+	return j.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(stagingRootBucket).Put(stagingRootKey, []byte(root))
+	})
 }
 
 // readyAt is when the task becomes runnable: its enqueue time until a

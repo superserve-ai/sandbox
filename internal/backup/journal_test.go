@@ -846,3 +846,29 @@ func TestOutboxDepthExcludesSeedMarker(t *testing.T) {
 		t.Fatalf("pending after seed marker = %d err=%v, want 0", len(pending), err)
 	}
 }
+
+func TestStagingRootFirstBootHasNothingRecorded(t *testing.T) {
+	j, _ := testJournal(t)
+	if _, ok, err := j.GetStagingRoot(); err != nil || ok {
+		t.Fatalf("GetStagingRoot on a fresh journal = ok=%v err=%v, want ok=false", ok, err)
+	}
+}
+
+func TestStagingRootRoundTripsAndOverwrites(t *testing.T) {
+	j, _ := testJournal(t)
+	if err := j.PutStagingRoot("/mnt/backup-data/backup-staging"); err != nil {
+		t.Fatal(err)
+	}
+	if root, ok, err := j.GetStagingRoot(); err != nil || !ok || root != "/mnt/backup-data/backup-staging" {
+		t.Fatalf("GetStagingRoot = %q ok=%v err=%v, want /mnt/backup-data/backup-staging", root, ok, err)
+	}
+	// A later boot with a different (or cleared) root overwrites, not
+	// accumulates — GetStagingRoot always answers with the single most
+	// recent value, which is what the rollback-detection comparison needs.
+	if err := j.PutStagingRoot(""); err != nil {
+		t.Fatal(err)
+	}
+	if root, ok, err := j.GetStagingRoot(); err != nil || !ok || root != "" {
+		t.Fatalf("GetStagingRoot after clearing = %q ok=%v err=%v, want empty string, ok=true", root, ok, err)
+	}
+}
