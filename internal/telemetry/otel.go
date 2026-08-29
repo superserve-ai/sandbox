@@ -325,6 +325,12 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 // emitter's: when these drifted apart, every meaningful agreement was
 // silently exported as "other" and the metric looked healthy while
 // measuring nothing.
+// shadowPublishesComposition reports whether a result carries real
+// counts. A failed ranking counted nothing, and composition is a
+// last-value gauge, so its zeros would erase readiness until the next
+// success. "no_candidates" is a genuine answer and does publish.
+func shadowPublishesComposition(result string) bool { return result != "error" }
+
 func normalizeShadowProfile(v string) string {
 	switch v {
 	case "none", "basic", "extended":
@@ -358,10 +364,18 @@ func (r *OTelRecorder) RecordCapacityShadow(ctx context.Context, c CapacityShado
 		return
 	}
 	result, agreement := normalizeShadowResult(c.Result), normalizeShadowAgreement(c.Agreement)
+	profile := normalizeShadowProfile(c.Profile)
+	// The agreement histogram carries the profile too: without it,
+	// traffic from the dominant capability profile drowns out poor
+	// agreement on another.
 	r.capacityShadowDuration.Record(ctx, c.Duration.Seconds(), metric.WithAttributes(r.attrs(
 		attribute.String("result", result),
 		attribute.String("agreement", agreement),
+		attribute.String("profile", profile),
 	)...))
+	if !shadowPublishesComposition(result) {
+		return
+	}
 	for kind, n := range map[string]int{
 		"described":       c.Described,
 		"under_described": c.UnderDescribed,
@@ -370,7 +384,7 @@ func (r *OTelRecorder) RecordCapacityShadow(ctx context.Context, c CapacityShado
 	} {
 		r.capacityShadowHosts.Record(ctx, int64(n), metric.WithAttributes(r.attrs(
 			attribute.String("kind", kind),
-			attribute.String("profile", normalizeShadowProfile(c.Profile)),
+			attribute.String("profile", profile),
 		)...))
 	}
 }

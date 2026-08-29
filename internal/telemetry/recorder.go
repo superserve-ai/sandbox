@@ -161,6 +161,9 @@ type CapacityShadow struct {
 	// without it one profile silently overwrites another.
 	Profile string
 	// Fleet composition as the ranker saw it, for readiness tracking.
+	// Meaningful ONLY when Result is not "error": a failed ranking saw
+	// nothing, and publishing its zeros into a last-value gauge would
+	// make the fleet read as empty because the database blinked.
 	Described      int
 	UnderDescribed int
 	Legacy         int

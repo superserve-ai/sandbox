@@ -386,16 +386,18 @@ func TestRankerDropsHostsAtTheirLimit(t *testing.T) {
 // point every replica at the same host.
 func TestRankerRandomizesAmongComparableHosts(t *testing.T) {
 	rows := []db.ListCapacityCandidatesRow{candidate("a"), candidate("b"), candidate("c")}
-	firsts := map[string]int{}
+	chosen := map[string]int{}
 	for i := 0; i < 200; i++ {
 		res := rank(t, rows, RankRequest{MemoryMib: 512, Vcpus: 1})
-		if len(res.Order) == 0 {
-			t.Fatal("nothing ranked")
+		if res.Chosen == "" {
+			t.Fatal("nothing chosen")
 		}
-		firsts[res.Order[0]]++
+		chosen[res.Chosen]++
 	}
-	if len(firsts) != 3 {
-		t.Fatalf("only %v ever ranked first; comparable hosts must not have a fixed order", firsts)
+	// The ORDER is deterministic by design — spreading comes from the
+	// per-decision choice, which is what a placement path would use.
+	if len(chosen) != 3 {
+		t.Fatalf("only %v was ever chosen; comparable hosts must share the load", chosen)
 	}
 }
 
@@ -661,16 +663,19 @@ func TestRankerRandomizesEvenWhenMemoized(t *testing.T) {
 	rows := []db.ListCapacityCandidatesRow{candidate("a"), candidate("b"), candidate("c")}
 	r := &CapacityRanker{DB: db.New(&rankerMock{rows: rows}), TTL: time.Hour}
 
-	firsts := map[string]int{}
+	chosen := map[string]int{}
 	for i := 0; i < 200; i++ {
 		res, err := r.Rank(context.Background(), RankRequest{MemoryMib: 512, Vcpus: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
-		firsts[res.Order[0]]++
+		if res.Chosen == "" {
+			t.Fatalf("call %d chose nothing from band %v", i, res.TopBand)
+		}
+		chosen[res.Chosen]++
 	}
-	if len(firsts) != 3 {
-		t.Fatalf("only %v ever ranked first across 200 memoized calls; the shuffle is frozen", firsts)
+	if len(chosen) != 3 {
+		t.Fatalf("only %v was ever chosen across 200 memoized calls; the choice is frozen", chosen)
 	}
 }
 

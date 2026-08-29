@@ -57,9 +57,17 @@ type RankResult struct {
 	// Order is the hosts worth trying, best first. Empty when nothing is
 	// rankable.
 	Order []string
+	// Chosen is this decision's host: drawn at random from TopBand, and
+	// the ONLY part of a ranking that varies between calls against the
+	// same candidate set. Empty when nothing is rankable.
+	//
+	// Randomizing the choice rather than the whole ordering is what lets
+	// the expensive part be cached: spreading load needs one random pick
+	// per decision, not a reshuffled list per decision.
+	Chosen string
 	// TopBand is every host within the tolerance of the best score —
 	// the set that is equally good on pressure grounds, from which
-	// Order[0] was drawn at random.
+	// Chosen is drawn.
 	//
 	// Judging a placement against Order[0] alone would be judging it
 	// against a coin toss: with N comparable hosts it disagrees (N-1)/N
@@ -113,6 +121,12 @@ type rankMemoKey struct {
 type rankMemoEntry struct {
 	gen  uint64
 	plan *rankPlan
+	// snapshot is the classification computed from the plan: counts,
+	// band and order. Deterministic given the plan and the CLOCK, so it
+	// is reused until the earliest moment the clock could change it.
+	snapshot   RankResult
+	validUntil time.Time
+	hasSnap    bool
 }
 
 const defaultRankerCacheTTL = 30 * time.Second
@@ -174,20 +188,54 @@ type rankPlan struct {
 // when it is missing or expired this refreshes it, which means Rank
 // performs I/O and must only be called from a background worker.
 func (r *CapacityRanker) Rank(ctx context.Context, req RankRequest) (RankResult, error) {
-	plan, err := r.plan(ctx, req)
+	key, plan, gen, err := r.plan(ctx, req)
 	if err != nil {
 		return RankResult{}, err
 	}
-	return rankFromPlan(plan, r.Region), nil
+
+	now := time.Now()
+	r.mu.RLock()
+	entry, ok := r.memo[key]
+	fresh := ok && entry.gen == gen && entry.hasSnap && now.Before(entry.validUntil)
+	snapshot := entry.snapshot
+	r.mu.RUnlock()
+
+	if !fresh {
+		// Scanning, partitioning, sorting and allocating over the fleet
+		// is the expensive half — at ten samples a second it is what
+		// turns a large fleet into steady GC pressure. It only has to
+		// happen when the answer could actually differ: on a candidate
+		// refresh, or when the next report crosses its freshness
+		// boundary.
+		snapshot, validUntil := rankFromPlan(plan, r.Region, now)
+		r.mu.Lock()
+		if e, ok := r.memo[key]; ok && e.gen == gen {
+			e.snapshot, e.validUntil, e.hasSnap = snapshot, validUntil, true
+			r.memo[key] = e
+		}
+		r.mu.Unlock()
+		return withChoice(snapshot), nil
+	}
+	return withChoice(snapshot), nil
+}
+
+// withChoice draws this decision's host. The snapshot's slices are
+// shared with the cache and must be treated as read-only; only the
+// scalar choice differs per call.
+func withChoice(res RankResult) RankResult {
+	if len(res.TopBand) > 0 {
+		res.Chosen = res.TopBand[rand.IntN(len(res.TopBand))]
+	}
+	return res
 }
 
 // plan returns the deterministic ranking data for this generation and
 // shape, computing it once and reusing it: scoring and fitting are
 // O(fleet) with real allocation, and creates repeat a handful of shapes.
-func (r *CapacityRanker) plan(ctx context.Context, req RankRequest) (*rankPlan, error) {
+func (r *CapacityRanker) plan(ctx context.Context, req RankRequest) (rankMemoKey, *rankPlan, uint64, error) {
 	rows, err := r.candidates(ctx, req.RequiredCapabilities)
 	if err != nil {
-		return nil, err
+		return rankMemoKey{}, nil, 0, err
 	}
 
 	capKey, _ := capabilityCacheKey(req.RequiredCapabilities)
@@ -202,7 +250,7 @@ func (r *CapacityRanker) plan(ctx context.Context, req RankRequest) (*rankPlan, 
 	gen := r.gen
 	r.mu.RUnlock()
 	if hit && entry.gen == gen {
-		return entry.plan, nil
+		return memoKey, entry.plan, gen, nil
 	}
 
 	if len(req.AllowedHosts) > 0 {
@@ -244,15 +292,21 @@ func (r *CapacityRanker) plan(ctx context.Context, req RankRequest) (*rankPlan, 
 		r.memo[memoKey] = rankMemoEntry{gen: gen, plan: plan}
 	}
 	r.mu.Unlock()
-	return plan, nil
+	return memoKey, plan, gen, nil
 }
 
 // rankFromPlan applies everything that must be decided fresh: whether
 // each report is still within its freshness window, and which of the
 // comparable hosts to put first.
-func rankFromPlan(plan *rankPlan, region string) RankResult {
-	now := time.Now()
+// rankFromPlan classifies the plan as of now, and reports the instant
+// that classification could first change — the earliest freshness
+// expiry among the hosts it counted as fresh. Nothing else in it moves
+// without a candidate refresh.
+func rankFromPlan(plan *rankPlan, region string, now time.Time) (RankResult, time.Time) {
 	var result RankResult
+	// Far enough out that "no fresh host can expire" reads as "valid
+	// until the next refresh", which is what bounds it in practice.
+	validUntil := now.Add(24 * time.Hour)
 
 	// Composition describes the FLEET, so all four counts are taken over
 	// the same population: every capability-matching host, before any
@@ -271,9 +325,15 @@ func rankFromPlan(plan *rankPlan, region string) RankResult {
 		case h.described:
 			result.Described++
 			eligible = append(eligible, h)
+			if h.staleAt.Before(validUntil) {
+				validUntil = h.staleAt
+			}
 		default:
 			result.UnderDescribed++
 			eligible = append(eligible, h)
+			if h.staleAt.Before(validUntil) {
+				validUntil = h.staleAt
+			}
 		}
 	}
 
@@ -311,7 +371,7 @@ func rankFromPlan(plan *rankPlan, region string) RankResult {
 		band = underBand
 	}
 	result.Order, result.TopBand = order, band
-	return result
+	return result, validUntil
 }
 
 // orderHosts sorts one tier best-first and reports the band it drew
@@ -339,8 +399,9 @@ func orderHosts(hosts []rankedHost) (order, band []string) {
 			coldBand = append(coldBand, h)
 		}
 	}
-	rand.Shuffle(len(warmBand), func(i, j int) { warmBand[i], warmBand[j] = warmBand[j], warmBand[i] })
-	rand.Shuffle(len(coldBand), func(i, j int) { coldBand[i], coldBand[j] = coldBand[j], coldBand[i] })
+	// Deterministic throughout: load spreading comes from drawing Chosen
+	// out of the band per decision, not from reshuffling this list. That
+	// is what lets the whole classification be cached.
 	sort.SliceStable(rest, func(i, j int) bool { return rest[i].score < rest[j].score })
 
 	order = make([]string, 0, len(hosts))

@@ -677,3 +677,19 @@ func TestShadowLabelsAcceptWhatTheSchedulerEmits(t *testing.T) {
 		t.Errorf("unknown agreement normalized to %q, want other", got)
 	}
 }
+
+// A failed ranking counted nothing, and composition is a last-value
+// gauge — so publishing its zeros would report an empty fleet until the
+// next successful sample. A database blip must not look like a fleet
+// that vanished.
+func TestCapacityShadowSkipsCompositionOnError(t *testing.T) {
+	if !shadowPublishesComposition("ranked") {
+		t.Error("a successful ranking must publish composition")
+	}
+	if !shadowPublishesComposition("no_candidates") {
+		t.Error("an empty-but-successful ranking must publish composition: zero hosts is a real answer")
+	}
+	if shadowPublishesComposition("error") {
+		t.Error("a failed ranking must not publish composition; its zeros would erase readiness")
+	}
+}
