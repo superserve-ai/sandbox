@@ -658,6 +658,17 @@ def main() -> int:
             # onto the dedicated disk on the old binary — the exact
             # latency regression this split exists to avoid. Unset must
             # actively clear host state, not just skip writing new state.
+            #
+            # This protects the common rollback shape: the current script
+            # redeploys with the workflow var dropped. It does NOT protect
+            # a rollback that also reverts deploy-vmd.py itself to a
+            # revision before this line existed — that restores the old
+            # skip-on-empty behavior along with it, by construction (the
+            # fix lives in the file being reverted). No change to this
+            # script can close that gap; treat "revert deploy-vmd.py past
+            # this commit" as carrying the known cost of a manual
+            # `sed -i '/^BACKUP_STAGING_DIR=/d' /etc/sandbox/vmd.env`
+            # sweep across affected hosts first.
             sudo sed -i '/^BACKUP_STAGING_DIR=/d' /etc/sandbox/vmd.env
             if [ -n {q_backup_staging} ]; then
                 echo {q_backup_staging_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null

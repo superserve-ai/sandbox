@@ -1095,7 +1095,15 @@ func main() {
 		// track of the config change.
 		if prevRoot, ok, err := journal.GetStagingRoot(); err != nil {
 			log.Warn().Err(err).Msg("read previous staging root failed; retired custom root (if any) not tracked this boot")
-		} else if ok && prevRoot != "" && prevRoot != stagingRoot && prevRoot != legacyStaging {
+		} else if ok && prevRoot != "" &&
+			!backup.StagingRootsOverlap(prevRoot, stagingRoot) &&
+			!backup.StagingRootsOverlap(prevRoot, legacyStaging) {
+			// Plain inequality is not enough here: a change between an
+			// ancestor and descendant path (or the same directory under an
+			// aliased spelling) is not a retirement — sweepRetiredStaging
+			// would walk live, referenced entries reachable through the
+			// active root's own tree and delete them as apparent orphans
+			// past the grace period.
 			uploader.RetiredStagingRoot = prevRoot
 			log.Info().Str("path", prevRoot).Msg("staging root changed since last boot; retired custom root queued for background drain")
 		} else if err := journal.PutStagingRoot(stagingRoot); err != nil {

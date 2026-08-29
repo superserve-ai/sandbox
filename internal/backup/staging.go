@@ -797,10 +797,24 @@ func ResolveStagingRoot(override, snapshotDir, runDir string) (root, legacy stri
 	// entirely outside it: equality or containment (either direction,
 	// aliased spellings included) means the operator pointed staging at
 	// the old location and nothing may treat it as retired.
-	if root == legacy ||
-		strings.HasPrefix(root, legacy+string(os.PathSeparator)) ||
-		strings.HasPrefix(legacy, root+string(os.PathSeparator)) {
+	if StagingRootsOverlap(root, legacy) {
 		legacy = ""
 	}
 	return root, legacy
+}
+
+// StagingRootsOverlap reports whether a and b name the same directory or
+// one contains the other. A retirement candidate that overlaps the
+// active root this way is not actually retired: sweepRetiredStaging (or
+// the legacy sweep) would walk live, referenced entries reachable
+// through the active root's own directory tree and, past the grace
+// period, delete them as apparent orphans.
+func StagingRootsOverlap(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	return a == b ||
+		strings.HasPrefix(a, b+string(os.PathSeparator)) ||
+		strings.HasPrefix(b, a+string(os.PathSeparator))
 }
