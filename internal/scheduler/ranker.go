@@ -121,6 +121,8 @@ type rankMemoKey struct {
 type rankMemoEntry struct {
 	gen  uint64
 	plan *rankPlan
+	// lastUsed drives eviction when the memo is full.
+	lastUsed time.Time
 	// snapshot is the classification computed from the plan: counts,
 	// band and order. Deterministic given the plan and the CLOCK, so it
 	// is reused until the earliest moment the clock could change it.
@@ -134,6 +136,19 @@ const defaultRankerCacheTTL = 30 * time.Second
 // rankerFillTimeout bounds one candidate refresh, matching the live
 // scheduler's cache-fill bound.
 const rankerFillTimeout = 5 * time.Second
+
+// rankMemoCapacity bounds how many request shapes are remembered at
+// once. Each entry holds a per-host plan, so without a cap the memo
+// grows as hosts × distinct shapes — and shapes are caller-supplied
+// (every template size is one), so varied or adversarial traffic could
+// retain a large multiple of the fleet indefinitely.
+//
+// Real traffic uses a handful of shapes, so a small cap is effectively
+// never reached; what it guarantees is that unusual traffic degrades
+// into recomputation rather than unbounded memory. Recomputation is
+// itself bounded: evaluation runs on one worker at the sampler's rate,
+// never on a request.
+const rankMemoCapacity = 32
 
 type rankerCacheEntry struct {
 	rows     []db.ListCapacityCandidatesRow
@@ -250,6 +265,12 @@ func (r *CapacityRanker) plan(ctx context.Context, req RankRequest) (rankMemoKey
 	gen := r.gen
 	r.mu.RUnlock()
 	if hit && entry.gen == gen {
+		r.mu.Lock()
+		if e, ok := r.memo[memoKey]; ok && e.gen == gen {
+			e.lastUsed = time.Now()
+			r.memo[memoKey] = e
+		}
+		r.mu.Unlock()
 		return memoKey, entry.plan, gen, nil
 	}
 
@@ -289,10 +310,31 @@ func (r *CapacityRanker) plan(ctx context.Context, req RankRequest) (rankMemoKey
 		if r.memo == nil {
 			r.memo = make(map[rankMemoKey]rankMemoEntry)
 		}
-		r.memo[memoKey] = rankMemoEntry{gen: gen, plan: plan}
+		r.evictIfFullLocked(memoKey)
+		r.memo[memoKey] = rankMemoEntry{gen: gen, plan: plan, lastUsed: time.Now()}
 	}
 	r.mu.Unlock()
 	return memoKey, plan, gen, nil
+}
+
+// evictIfFullLocked makes room for key, dropping the least recently used
+// shape. Linear scan: the map is capped at a few dozen entries, so the
+// scan is cheaper than maintaining an ordering structure.
+func (r *CapacityRanker) evictIfFullLocked(key rankMemoKey) {
+	if len(r.memo) < rankMemoCapacity {
+		return
+	}
+	if _, replacing := r.memo[key]; replacing {
+		return // overwriting an existing shape frees its own slot
+	}
+	var oldestKey rankMemoKey
+	var oldest time.Time
+	for k, e := range r.memo {
+		if oldest.IsZero() || e.lastUsed.Before(oldest) {
+			oldestKey, oldest = k, e.lastUsed
+		}
+	}
+	delete(r.memo, oldestKey)
 }
 
 // rankFromPlan applies everything that must be decided fresh: whether

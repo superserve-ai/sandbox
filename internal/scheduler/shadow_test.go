@@ -701,3 +701,62 @@ func TestShadowLabelsSamplesByCapabilityProfile(t *testing.T) {
 		t.Fatalf("both capability sets reported profile %q; their gauges would overwrite each other", basic.Profile)
 	}
 }
+
+// Shapes are caller-supplied — every template size is one — and each
+// memo entry holds a per-host plan, so an unbounded memo grows as
+// hosts × shapes. Varied traffic must degrade into recomputation, never
+// into unbounded memory.
+func TestRankerMemoIsBounded(t *testing.T) {
+	rows := make([]db.ListCapacityCandidatesRow, 0, 50)
+	for i := 0; i < 50; i++ {
+		rows = append(rows, candidate(fmt.Sprintf("h%d", i)))
+	}
+	r := &CapacityRanker{DB: db.New(&rankerMock{rows: rows}), TTL: time.Hour}
+
+	// Far more distinct shapes than the cap allows.
+	for i := 0; i < rankMemoCapacity*10; i++ {
+		if _, err := r.Rank(context.Background(), RankRequest{MemoryMib: int32(512 + i), Vcpus: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.mu.RLock()
+	size := len(r.memo)
+	r.mu.RUnlock()
+	if size > rankMemoCapacity {
+		t.Fatalf("memo holds %d shapes, cap is %d; memory would grow with traffic diversity", size, rankMemoCapacity)
+	}
+}
+
+// Eviction must be least-recently-used, so a hot shape is not thrown out
+// by a burst of one-off ones — that would turn the common path into a
+// permanent miss.
+func TestRankerMemoKeepsTheHotShape(t *testing.T) {
+	rows := []db.ListCapacityCandidatesRow{candidate("a"), candidate("b")}
+	m := &rankerMock{rows: rows}
+	r := &CapacityRanker{DB: db.New(m), TTL: time.Hour}
+
+	hot := RankRequest{MemoryMib: 512, Vcpus: 1}
+	if _, err := r.Rank(context.Background(), hot); err != nil {
+		t.Fatal(err)
+	}
+
+	// A wave of unique shapes, keeping the hot one in use throughout.
+	// The hot shape is touched BEFORE each new insert, and the loop ends
+	// on an insert — otherwise the final touch would put it back in the
+	// map and the assertion would hold under any eviction policy.
+	for i := 0; i < rankMemoCapacity*3; i++ {
+		if _, err := r.Rank(context.Background(), hot); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.Rank(context.Background(), RankRequest{MemoryMib: int32(4096 + i), Vcpus: 2}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r.mu.RLock()
+	_, stillCached := r.memo[rankMemoKey{memoryMib: 512, vcpus: 1}]
+	r.mu.RUnlock()
+	if !stillCached {
+		t.Fatal("the continuously used shape was evicted; eviction must be least-recently-used")
+	}
+}
