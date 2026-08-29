@@ -794,3 +794,19 @@ func TestRankerFreshnessIgnoresClockSkew(t *testing.T) {
 		}
 	}
 }
+
+// The capability name is a wire contract between two packages that
+// cannot share a constant: the daemon must not import the control
+// plane, and internal/vm is linux-only so this package cannot import it
+// either. Each side therefore pins the literal, and a rename on either
+// side breaks one of the two tests rather than silently classifying
+// every publishing host as legacy.
+//
+// The daemon's half is TestSendHeartbeatAdvertisesCapacityPressureWhenPublishing.
+func TestCapacityPressureCapabilityMatchesTheDaemonsWireName(t *testing.T) {
+	const advertisedByVMD = "capacity_pressure_v1"
+	if HostCapabilityCapacityPressure != advertisedByVMD {
+		t.Fatalf("ranker looks for %q but vmd advertises %q; every publishing host would read as legacy",
+			HostCapabilityCapacityPressure, advertisedByVMD)
+	}
+}
