@@ -733,6 +733,21 @@ func (u *Uploader) sweepLegacyStaging() {
 // dedicated staging disk's root typically is) returns EBUSY from
 // rmdir/unlink no matter how empty its contents are, which must not
 // read as "still draining" forever.
+//
+// Known gap, accepted rather than solved here: a retired root that is a
+// currently-UNMOUNTED disk reads identically to a genuinely drained
+// one — ReadDir sees the bare (empty) mountpoint directory either way,
+// and there is no portable signal from here that distinguishes "this
+// path was never a distinct mount" from "this path is a mount that
+// just isn't attached right now." Resolving that needs vmd to know
+// which paths are EXPECTED to be mounts (cross-referencing /proc/mounts
+// or equivalent against deploy-time config) and is out of scope for a
+// staging-tree sweep. Detaching a retired staging disk before it has
+// fully drained is an operational hazard this function cannot defend
+// against; the runbook for retiring a dedicated staging disk must
+// confirm the drain completed (RetiredStagingRoots empty, or the
+// "retired custom staging tree drained" log line seen) before the disk
+// is detached.
 func stagingRootDrained(path string) bool {
 	entries, err := os.ReadDir(path)
 	if err != nil {
