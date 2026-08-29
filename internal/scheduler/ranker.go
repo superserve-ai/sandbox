@@ -184,7 +184,11 @@ type rankedHost struct {
 	viable    bool
 	warm      bool
 	score     float64
-	staleAt   time.Time // zero when the host has never reported
+	// ageAtFetch is how old this host's report was when the candidate
+	// query ran, as measured by the DATABASE's clock. Freshness adds the
+	// locally-measured time since that fetch, so the comparison never
+	// depends on the two clocks agreeing.
+	ageAtFetch time.Duration
 }
 
 // rankPlan is the memoized, deterministic half of a ranking: valid for
@@ -197,6 +201,9 @@ type rankedHost struct {
 // defeating the load spreading the shuffle exists to provide.
 type rankPlan struct {
 	hosts []rankedHost
+	// fetchedAt is when the candidate rows were read, on the local
+	// clock. Only ever used to measure elapsed time since the fetch.
+	fetchedAt time.Time
 }
 
 // Rank orders hosts for a request. The candidate set comes from cache;
@@ -288,7 +295,10 @@ func (r *CapacityRanker) plan(ctx context.Context, req RankRequest) (rankMemoKey
 		rows = filtered
 	}
 
-	plan := &rankPlan{hosts: make([]rankedHost, 0, len(rows))}
+	plan := &rankPlan{
+		hosts:     make([]rankedHost, 0, len(rows)),
+		fetchedAt: r.fetchedAt(req.RequiredCapabilities),
+	}
 	for _, row := range rows {
 		h := rankedHost{
 			id:        row.ID,
@@ -299,9 +309,7 @@ func (r *CapacityRanker) plan(ctx context.Context, req RankRequest) (rankMemoKey
 			warm:      hasWarmSlot(row),
 			score:     dominantScore(row, req),
 		}
-		if row.ReportedAt.Valid {
-			h.staleAt = row.ReportedAt.Time.Add(PressureFreshnessSecs * time.Second)
-		}
+		h.ageAtFetch = time.Duration(row.ReportAgeSeconds * float64(time.Second))
 		plan.hosts = append(plan.hosts, h)
 	}
 
@@ -357,24 +365,35 @@ func rankFromPlan(plan *rankPlan, region string, now time.Time) (RankResult, tim
 	// gauges incomparable — a low described count would mean "wrong
 	// region" as readily as "not publishing", which is the opposite of
 	// what a readiness signal is for.
+	// Age as of NOW: what the database measured at fetch time, plus the
+	// time elapsed locally since. Both are durations, so a clock offset
+	// between this process and Postgres cannot make a current report
+	// look stale or an expired one look current.
+	sinceFetch := now.Sub(plan.fetchedAt)
+	if sinceFetch < 0 {
+		sinceFetch = 0
+	}
+	freshness := PressureFreshnessSecs * time.Second
+
 	eligible := make([]rankedHost, 0, len(plan.hosts))
 	for _, h := range plan.hosts {
+		age := h.ageAtFetch + sinceFetch
 		switch {
 		case !h.capable:
 			result.Legacy++
-		case h.staleAt.IsZero() || !now.Before(h.staleAt):
+		case age >= freshness:
 			result.Stale++
 		case h.described:
 			result.Described++
 			eligible = append(eligible, h)
-			if h.staleAt.Before(validUntil) {
-				validUntil = h.staleAt
+			if expiry := now.Add(freshness - age); expiry.Before(validUntil) {
+				validUntil = expiry
 			}
 		default:
 			result.UnderDescribed++
 			eligible = append(eligible, h)
-			if h.staleAt.Before(validUntil) {
-				validUntil = h.staleAt
+			if expiry := now.Add(freshness - age); expiry.Before(validUntil) {
+				validUntil = expiry
 			}
 		}
 	}
@@ -485,6 +504,18 @@ func preferRegionHosts(hosts []rankedHost, region string) []rankedHost {
 		return local
 	}
 	return hosts
+}
+
+// fetchedAt reports when the cached rows for this capability set were
+// read, on the local clock.
+func (r *CapacityRanker) fetchedAt(required []string) time.Time {
+	key, _ := capabilityCacheKey(required)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if entry, ok := r.cache[key]; ok {
+		return entry.cachedAt
+	}
+	return time.Now()
 }
 
 func (r *CapacityRanker) candidates(ctx context.Context, required []string) ([]db.ListCapacityCandidatesRow, error) {

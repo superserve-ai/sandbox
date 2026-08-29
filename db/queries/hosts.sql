@@ -390,6 +390,19 @@ SELECT h.id, h.region, h.capacity_memory_mib, h.capacity_vcpus,
            AND hc.heartbeat_at = h.last_heartbeat_at
        ) AS pressure_capable,
        hp.reported_at,
+       -- Report AGE, computed by the database against its own clock.
+       --
+       -- reported_at is stamped by the database, so comparing it to a
+       -- control-plane time.Now() mixes two clocks: a control plane
+       -- ahead of Postgres would call every current report stale, and
+       -- one behind would keep ranking expired ones. Handing back an
+       -- age instead means only DURATIONS cross the boundary — the
+       -- caller adds its own locally-measured elapsed time since the
+       -- fetch, which needs no agreement about what time it is.
+       --
+       -- Hosts that never reported get an age no freshness window can
+       -- accept.
+       COALESCE(EXTRACT(EPOCH FROM (now() - hp.reported_at)), 1e9)::float8 AS report_age_seconds,
        COALESCE(hp.running_sandboxes, 0)::int AS running_sandboxes,
        COALESCE(hp.provisioning_sandboxes, 0)::int AS provisioning_sandboxes,
        COALESCE(hp.paused_sandboxes, 0)::int AS paused_sandboxes,

@@ -42,7 +42,7 @@ func (r *candidateRows) Scan(dest ...any) error {
 	row := r.rows[r.idx-1]
 	vals := []any{
 		row.ID, row.Region, row.CapacityMemoryMib, row.CapacityVcpus,
-		row.PressureCapable, row.ReportedAt, row.RunningSandboxes,
+		row.PressureCapable, row.ReportedAt, row.ReportAgeSeconds, row.RunningSandboxes,
 		row.ProvisioningSandboxes, row.PausedSandboxes, row.AllocatedMemoryMib,
 		row.AllocatedVcpus, row.UsedNetSlots, row.ProvisioningNetSlots,
 		row.WarmNetSlots, row.NetSlotCeiling, row.MaxNetworkSlots,
@@ -61,6 +61,8 @@ func (r *candidateRows) Scan(dest ...any) error {
 			*d = v.(int64)
 		case *bool:
 			*d = v.(bool)
+		case *float64:
+			*d = v.(float64)
 		case *pgtype.Timestamptz:
 			*d = v.(pgtype.Timestamptz)
 		default:
@@ -123,6 +125,7 @@ func candidate(id string) db.ListCapacityCandidatesRow {
 		CapacityVcpus:     64,
 		PressureCapable:   true,
 		ReportedAt:        pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		ReportAgeSeconds:  1, // fresh, as the database measured it
 		MaxSandboxes:      100,
 		NetSlotCeiling:    200,
 	}
@@ -233,11 +236,11 @@ func TestShadowReportsFleetComposition(t *testing.T) {
 	unsized.UnknownAllocationVms = 2
 
 	stale := candidate("stale")
-	stale.ReportedAt = pgtype.Timestamptz{Time: time.Now().Add(-10 * time.Minute), Valid: true}
+	stale.ReportAgeSeconds = 600
 
 	legacy := candidate("legacy")
 	legacy.PressureCapable = false
-	legacy.ReportedAt = pgtype.Timestamptz{}
+	legacy.ReportAgeSeconds = 1e9 // never reported
 
 	m := &rankerMock{rows: []db.ListCapacityCandidatesRow{fresh, unsized, stale, legacy}}
 	s, obs := newShadow(t, m)
@@ -353,7 +356,7 @@ func TestRankerExcludesStaleAndLegacyButCountsThem(t *testing.T) {
 	fresh := candidate("fresh")
 
 	stale := candidate("stale")
-	stale.ReportedAt = pgtype.Timestamptz{Time: time.Now().Add(-(PressureFreshnessSecs + 30) * time.Second), Valid: true}
+	stale.ReportAgeSeconds = PressureFreshnessSecs + 30
 
 	legacy := candidate("legacy")
 	legacy.PressureCapable = false
@@ -628,10 +631,8 @@ func TestRankerMemoizesWithinACandidateGeneration(t *testing.T) {
 func TestRankerRecomputesFreshnessAcrossMemoizedCalls(t *testing.T) {
 	// Fresh now, stale in 40ms.
 	host := candidate("expiring")
-	host.ReportedAt = pgtype.Timestamptz{
-		Time:  time.Now().Add(-(PressureFreshnessSecs*time.Second - 40*time.Millisecond)),
-		Valid: true,
-	}
+	// Fresh by 40ms, as the database measured it at fetch time.
+	host.ReportAgeSeconds = float64(PressureFreshnessSecs) - 0.04
 
 	r := &CapacityRanker{DB: db.New(&rankerMock{rows: []db.ListCapacityCandidatesRow{host}}), TTL: time.Hour}
 
@@ -758,5 +759,38 @@ func TestRankerMemoKeepsTheHotShape(t *testing.T) {
 	r.mu.RUnlock()
 	if !stillCached {
 		t.Fatal("the continuously used shape was evicted; eviction must be least-recently-used")
+	}
+}
+
+// Freshness must not depend on the control plane and Postgres agreeing
+// about what time it is. reported_at is stamped by the database, so a
+// control plane running ahead would call every current report stale, and
+// one running behind would keep ranking expired ones — corrupting both
+// the shadow's choices and the readiness gauges.
+//
+// Simulated by a row whose absolute timestamp is wildly wrong in each
+// direction while the database-measured age says otherwise. The age is
+// what must win.
+func TestRankerFreshnessIgnoresClockSkew(t *testing.T) {
+	for _, skew := range []time.Duration{-2 * time.Hour, 2 * time.Hour} {
+		fresh := candidate("fresh")
+		// An absolute stamp a clock-comparing implementation would
+		// misread, paired with an age the database vouches for.
+		fresh.ReportedAt = pgtype.Timestamptz{Time: time.Now().Add(skew), Valid: true}
+		fresh.ReportAgeSeconds = 5
+
+		res := rank(t, []db.ListCapacityCandidatesRow{fresh}, RankRequest{MemoryMib: 512, Vcpus: 1})
+		if res.Described != 1 || res.Stale != 0 {
+			t.Fatalf("skew %v: %+v — a 5s-old report must read fresh whatever the clocks say", skew, res)
+		}
+
+		stale := candidate("stale")
+		stale.ReportedAt = pgtype.Timestamptz{Time: time.Now().Add(skew), Valid: true}
+		stale.ReportAgeSeconds = PressureFreshnessSecs + 10
+
+		res = rank(t, []db.ListCapacityCandidatesRow{stale}, RankRequest{MemoryMib: 512, Vcpus: 1})
+		if res.Stale != 1 || res.Described != 0 {
+			t.Fatalf("skew %v: %+v — an expired report must read stale whatever the clocks say", skew, res)
+		}
 	}
 }
