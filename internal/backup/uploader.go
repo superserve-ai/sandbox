@@ -97,14 +97,16 @@ type Uploader struct {
 	// directory itself is removed; deleting it eagerly would destroy
 	// staged copies that queued tasks still need.
 	LegacyStagingRoot string
-	// RetiredStagingRoot is a staging root abandoned by a BACKUP_STAGING_DIR
-	// config change (most often a rollback), as opposed to
+	// RetiredStagingRoots are staging roots abandoned by BACKUP_STAGING_DIR
+	// config changes (most often a rollback), as opposed to
 	// LegacyStagingRoot's one fixed pre-split default. Swept the same way,
-	// but unlike LegacyStagingRoot its identity is also durable in the
-	// journal (Journal.PutStagingRoot): only a confirmed-empty removal
-	// clears that record, so an interrupted drain resumes on the next boot
-	// instead of the config change going untracked.
-	RetiredStagingRoot string
+	// but unlike LegacyStagingRoot each identity is also durable in the
+	// journal (Journal.RecordStagingRoot): only a confirmed-empty removal
+	// drops an entry, so an interrupted drain resumes on a later boot
+	// instead of the config change going untracked. A slice, not a single
+	// value, because two config changes within one drain window must not
+	// make the earlier one's entries untrackable.
+	RetiredStagingRoots []string
 	// StagingRoot is the hard-link staging tree; finished tasks get
 	// their staged generation removed. Empty disables staging cleanup.
 	StagingRoot string
@@ -725,30 +727,55 @@ func (u *Uploader) sweepLegacyStaging() {
 	}
 }
 
-// sweepRetiredStaging drains a staging root abandoned by a
+// stagingRootDrained reports whether path holds nothing worth keeping:
+// gone entirely, or present but empty. Deliberately independent of
+// os.Remove's own success: a root that is itself a mount point (as a
+// dedicated staging disk's root typically is) returns EBUSY from
+// rmdir/unlink no matter how empty its contents are, which must not
+// read as "still draining" forever.
+func stagingRootDrained(path string) bool {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return os.IsNotExist(err)
+	}
+	return len(entries) == 0
+}
+
+// sweepRetiredStaging drains every staging root abandoned by a
 // BACKUP_STAGING_DIR change, same draining discipline as
-// sweepLegacyStaging. The journal's recorded root only advances to
-// StagingRoot once removal actually succeeds: a drain that doesn't
-// finish this pass leaves the journal still pointing at the retired
-// root, so a restart before this next runs detects the same drift and
-// resumes the sweep instead of losing track of it.
+// sweepLegacyStaging. Each root's journal record only drops once it is
+// confirmed drained: one still-referenced entry (or several config
+// changes stacked within one drain window) leaves it recorded and in
+// RetiredStagingRoots, so a restart before this next runs detects the
+// same drift and resumes the sweep instead of losing track of it.
 func (u *Uploader) sweepRetiredStaging() {
-	if u.RetiredStagingRoot == "" {
+	if len(u.RetiredStagingRoots) == 0 {
 		return
 	}
-	SweepStaging(u.RetiredStagingRoot, u.Journal, u.Log)
-	_ = os.Remove(filepath.Join(u.RetiredStagingRoot, "bases"))
-	if err := os.Remove(u.RetiredStagingRoot); err != nil {
-		return
+	remaining := u.RetiredStagingRoots[:0]
+	for _, root := range u.RetiredStagingRoots {
+		SweepStaging(root, u.Journal, u.Log)
+		// Non-recursive: succeeds only once the shared-base subdirectory
+		// itself is empty, same as the top-level check below.
+		_ = os.Remove(filepath.Join(root, "bases"))
+		if !stagingRootDrained(root) {
+			remaining = append(remaining, root)
+			continue
+		}
+		// Best-effort: a mount-point root can never be rmdir'd, and a root
+		// some other process already removed returns ENOENT either way —
+		// stagingRootDrained already established there is nothing left to
+		// lose by dropping the record regardless of this outcome.
+		_ = os.Remove(root)
+		if err := u.Journal.RemoveStagingRoot(root); err != nil {
+			u.Log.Warn().Err(err).Str("path", root).
+				Msg("retired staging tree drained, but clearing its journal record failed; a future config change may not be detected")
+			remaining = append(remaining, root)
+			continue
+		}
+		u.Log.Info().Str("path", root).Msg("retired custom staging tree drained")
 	}
-	path := u.RetiredStagingRoot
-	if err := u.Journal.PutStagingRoot(u.StagingRoot); err != nil {
-		u.Log.Warn().Err(err).Str("path", path).
-			Msg("retired staging tree drained and removed, but persisting the current root failed; a future config change may not be detected")
-		return
-	}
-	u.Log.Info().Str("path", path).Msg("retired custom staging tree drained and removed")
-	u.RetiredStagingRoot = ""
+	u.RetiredStagingRoots = remaining
 }
 
 // objectName routes an object into the task owner's prefix. Both owners

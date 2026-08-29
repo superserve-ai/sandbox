@@ -847,28 +847,45 @@ func TestOutboxDepthExcludesSeedMarker(t *testing.T) {
 	}
 }
 
-func TestStagingRootFirstBootHasNothingRecorded(t *testing.T) {
+func TestStagingRootsEmptyOnFirstBoot(t *testing.T) {
 	j, _ := testJournal(t)
-	if _, ok, err := j.GetStagingRoot(); err != nil || ok {
-		t.Fatalf("GetStagingRoot on a fresh journal = ok=%v err=%v, want ok=false", ok, err)
+	if roots, err := j.StagingRoots(); err != nil || len(roots) != 0 {
+		t.Fatalf("StagingRoots on a fresh journal = %v err=%v, want empty", roots, err)
 	}
 }
 
-func TestStagingRootRoundTripsAndOverwrites(t *testing.T) {
+func TestStagingRootsRecordIsIdempotentAndRemoveDrops(t *testing.T) {
 	j, _ := testJournal(t)
-	if err := j.PutStagingRoot("/mnt/backup-data/backup-staging"); err != nil {
+	for i := 0; i < 2; i++ { // recording twice must not duplicate
+		if err := j.RecordStagingRoot("/mnt/backup-data/backup-staging"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.RecordStagingRoot("/mnt/backup-data-2/backup-staging"); err != nil {
 		t.Fatal(err)
 	}
-	if root, ok, err := j.GetStagingRoot(); err != nil || !ok || root != "/mnt/backup-data/backup-staging" {
-		t.Fatalf("GetStagingRoot = %q ok=%v err=%v, want /mnt/backup-data/backup-staging", root, ok, err)
-	}
-	// A later boot with a different (or cleared) root overwrites, not
-	// accumulates — GetStagingRoot always answers with the single most
-	// recent value, which is what the rollback-detection comparison needs.
-	if err := j.PutStagingRoot(""); err != nil {
+	roots, err := j.StagingRoots()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if root, ok, err := j.GetStagingRoot(); err != nil || !ok || root != "" {
-		t.Fatalf("GetStagingRoot after clearing = %q ok=%v err=%v, want empty string, ok=true", root, ok, err)
+	want := map[string]bool{"/mnt/backup-data/backup-staging": true, "/mnt/backup-data-2/backup-staging": true}
+	if len(roots) != len(want) {
+		t.Fatalf("StagingRoots = %v, want exactly %v", roots, want)
+	}
+	for _, r := range roots {
+		if !want[r] {
+			t.Fatalf("unexpected root %q in %v", r, roots)
+		}
+	}
+
+	if err := j.RemoveStagingRoot("/mnt/backup-data/backup-staging"); err != nil {
+		t.Fatal(err)
+	}
+	roots, err = j.StagingRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 1 || roots[0] != "/mnt/backup-data-2/backup-staging" {
+		t.Fatalf("StagingRoots after removing one = %v, want only the other", roots)
 	}
 }

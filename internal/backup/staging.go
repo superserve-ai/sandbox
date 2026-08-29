@@ -809,6 +809,23 @@ func ResolveStagingRoot(override, snapshotDir, runDir string) (root, legacy stri
 // the legacy sweep) would walk live, referenced entries reachable
 // through the active root's own directory tree and, past the grace
 // period, delete them as apparent orphans.
+//
+// Known gap, accepted rather than solved here: suppressing retirement
+// entirely on overlap is safe (nothing gets wrongly deleted) but
+// incomplete for an ancestor-to-descendant change specifically — e.g.
+// BACKUP_STAGING_DIR moving from /mnt/staging to /mnt/staging/new.
+// Entries under the old ancestor but OUTSIDE the new descendant's
+// subtree are then swept by nothing (the active sweep only walks the
+// descendant; the retired-root sweep is suppressed for the whole
+// ancestor because it can't safely skip just the live subtree — the
+// walk assumes a fixed two-level sandbox-id/generation layout, which an
+// arbitrarily nested active root breaks). Closing this needs
+// SweepStaging itself to accept an exclusion path, which is a real
+// enough redesign to warrant its own change rather than growing here.
+// Reconfiguring to a path NESTED inside the current one is also an
+// unusual choice operationally (dedicated staging disks are typically
+// siblings, not nested); until the general fix lands, that specific
+// transition needs a manual cleanup of the stranded entries.
 func StagingRootsOverlap(a, b string) bool {
 	if a == "" || b == "" {
 		return false

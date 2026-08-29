@@ -2622,10 +2622,10 @@ func TestLegacyStagingDrainsThenRemoves(t *testing.T) {
 
 // A retired CUSTOM staging root (a BACKUP_STAGING_DIR change, most often
 // a rollback) drains the same way as the legacy default, but must also
-// keep the journal's recorded root pointed at the retired tree until a
-// drain actually empties it — otherwise a config change that outlives
-// one sweep pass is forgotten and the retired tree leaks forever.
-func TestRetiredStagingDrainsThenAdvancesJournalRecord(t *testing.T) {
+// keep it in the journal's recorded set until a drain actually empties
+// it — otherwise a config change that outlives one sweep pass is
+// forgotten and the retired tree leaks forever.
+func TestRetiredStagingDrainsThenDropsFromJournalRecord(t *testing.T) {
 	j, _ := testJournal(t)
 	retired := filepath.Join(t.TempDir(), "old-custom-root")
 	current := filepath.Join(t.TempDir(), "new-custom-root")
@@ -2649,25 +2649,27 @@ func TestRetiredStagingDrainsThenAdvancesJournalRecord(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(retired, "bases"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.PutStagingRoot(retired); err != nil {
+	if err := j.RecordStagingRoot(retired); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordStagingRoot(current); err != nil {
 		t.Fatal(err)
 	}
 
-	u := &Uploader{Journal: j, StagingRoot: current, RetiredStagingRoot: retired, Log: zerolog.Nop()}
+	u := &Uploader{Journal: j, StagingRoot: current, RetiredStagingRoots: []string{retired}, Log: zerolog.Nop()}
 	u.sweepRetiredStaging()
 	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
 		t.Fatalf("orphan survived the retired-root sweep (err %v)", err)
 	}
-	if u.RetiredStagingRoot == "" {
-		t.Fatal("retired root cleared while a referenced entry survives")
+	if len(u.RetiredStagingRoots) != 1 || u.RetiredStagingRoots[0] != retired {
+		t.Fatalf("RetiredStagingRoots = %v, want [%q] to remain while a referenced entry survives", u.RetiredStagingRoots, retired)
 	}
-	if root, ok, err := j.GetStagingRoot(); err != nil || !ok || root != retired {
-		t.Fatalf("journal record advanced past an undrained retired root: root=%q ok=%v err=%v, want %q",
-			root, ok, err, retired)
+	if roots, err := j.StagingRoots(); err != nil || !containsStr(roots, retired) {
+		t.Fatalf("journal dropped an undrained retired root: roots=%v err=%v, want %q present", roots, err, retired)
 	}
 
 	// Drain the reference; the next sweep empties the root, removes it,
-	// and only now may the journal record advance to the current root.
+	// and only now may the journal record drop it.
 	if _, err := j.Ack(Task{SandboxID: "sb-live", Generation: "gen-live", EnqueuedAt: time.Unix(1, 0)}, "", false); err != nil {
 		t.Fatal(err)
 	}
@@ -2678,23 +2680,94 @@ func TestRetiredStagingDrainsThenAdvancesJournalRecord(t *testing.T) {
 	if _, err := os.Stat(retired); !os.IsNotExist(err) {
 		t.Fatalf("retired root survived after draining (err %v)", err)
 	}
-	if u.RetiredStagingRoot != "" {
-		t.Fatal("retired root not cleared after removal")
+	if len(u.RetiredStagingRoots) != 0 {
+		t.Fatalf("RetiredStagingRoots = %v, want empty after removal", u.RetiredStagingRoots)
 	}
-	if root, ok, err := j.GetStagingRoot(); err != nil || !ok || root != current {
-		t.Fatalf("journal record after drain = %q ok=%v err=%v, want %q (the current root)", root, ok, err, current)
+	if roots, err := j.StagingRoots(); err != nil || containsStr(roots, retired) || !containsStr(roots, current) {
+		t.Fatalf("journal after drain = %v err=%v, want %q dropped and %q still present", roots, err, retired, current)
+	}
+}
+
+// Two config changes within one drain window (A to B, then B to C
+// before A empties) must not make B untrackable: both outstanding
+// retired roots drain independently.
+func TestSweepRetiredStagingDrainsMultipleRootsIndependently(t *testing.T) {
+	j, _ := testJournal(t)
+	rootA := filepath.Join(t.TempDir(), "root-a")
+	rootB := filepath.Join(t.TempDir(), "root-b")
+	old := time.Now().Add(-2 * time.Hour)
+
+	// Both are fully orphaned (no journal references), so a single sweep
+	// pass drains each independently.
+	for _, root := range []string{rootA, rootB} {
+		orphan := filepath.Join(root, "sb-dead", "gen-dead")
+		if err := os.MkdirAll(orphan, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(orphan, old, old); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(root, "bases"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.RecordStagingRoot(root); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	u := &Uploader{Journal: j, StagingRoot: "/current", RetiredStagingRoots: []string{rootA, rootB}, Log: zerolog.Nop()}
+	u.sweepRetiredStaging()
+	for _, root := range []string{rootA, rootB} {
+		if _, err := os.Stat(root); !os.IsNotExist(err) {
+			t.Fatalf("%s survived draining (err %v)", root, err)
+		}
+	}
+	if len(u.RetiredStagingRoots) != 0 {
+		t.Fatalf("RetiredStagingRoots = %v, want both drained and dropped", u.RetiredStagingRoots)
+	}
+	if roots, err := j.StagingRoots(); err != nil || containsStr(roots, rootA) || containsStr(roots, rootB) {
+		t.Fatalf("journal after draining both = %v err=%v, want neither present", roots, err)
+	}
+}
+
+// A mount-point staging root can never be rmdir'd (EBUSY) even once
+// logically empty, and stagingRootDrained must not mistake that for
+// "still draining" forever — emptiness is judged independently of
+// os.Remove's own success.
+func TestStagingRootDrainedIgnoresRemovalFailure(t *testing.T) {
+	dir := t.TempDir()
+	if !stagingRootDrained(dir) {
+		t.Fatal("empty directory should read as drained")
+	}
+	if !stagingRootDrained(filepath.Join(dir, "does-not-exist")) {
+		t.Fatal("a missing path should read as drained")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if stagingRootDrained(dir) {
+		t.Fatal("a non-empty directory should not read as drained")
 	}
 }
 
 // A boot with nothing retired must not touch the journal's recorded
-// root — that's main.go's job on the non-drift path, not the sweep's.
+// roots — that's main.go's job on the no-drift path, not the sweep's.
 func TestSweepRetiredStagingNoopWhenNothingRetired(t *testing.T) {
 	j, _ := testJournal(t)
 	u := &Uploader{Journal: j, StagingRoot: "/current", Log: zerolog.Nop()}
 	u.sweepRetiredStaging()
-	if _, ok, err := j.GetStagingRoot(); err != nil || ok {
-		t.Fatalf("GetStagingRoot after a no-op sweep = ok=%v err=%v, want ok=false", ok, err)
+	if roots, err := j.StagingRoots(); err != nil || len(roots) != 0 {
+		t.Fatalf("StagingRoots after a no-op sweep = %v err=%v, want empty", roots, err)
 	}
+}
+
+func containsStr(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // rendezvousStore blocks every Create until two have arrived: only a

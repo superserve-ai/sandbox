@@ -1079,35 +1079,44 @@ func main() {
 			ss.Bases += ls.Bases
 			ss.Pending += ls.Pending
 		}
-		// A recorded root that differs from both today's resolution and the
-		// hardcoded pre-split legacy path is a retired CUSTOM root — most
-		// often a rollback that cleared BACKUP_STAGING_DIR after it had
-		// pointed at a dedicated disk. ResolveStagingRoot only ever knows
-		// about the one fixed pre-split default, not whatever custom root
-		// an operator had actually configured, so without this the
-		// abandoned tree's successfully-uploaded files would never be
-		// reclaimed. Handed to the uploader's periodic sweep rather than
-		// drained here: the tree can be fleet-sized, and startup readiness
-		// (pause/resume/create all wait on it) must not block on an
-		// unbounded filesystem walk. sweepRetiredStaging only advances the
-		// journal's recorded root once removal actually confirms empty, so
-		// an interrupted drain resumes on a later boot instead of losing
+		// Every recorded root that differs from both today's resolution and
+		// the hardcoded pre-split legacy path is a retired CUSTOM root —
+		// most often a rollback that cleared BACKUP_STAGING_DIR after it
+		// had pointed at a dedicated disk, though more than one can be
+		// outstanding at once if a drain hasn't finished across several
+		// config changes. ResolveStagingRoot only ever knows about the one
+		// fixed pre-split default, not whatever custom root(s) an operator
+		// had actually configured, so without this the abandoned trees'
+		// successfully-uploaded files would never be reclaimed. Handed to
+		// the uploader's periodic sweep rather than drained here: the
+		// trees can be fleet-sized, and startup readiness (pause/resume/
+		// create all wait on it) must not block on an unbounded filesystem
+		// walk. Recording today's root is unconditional and idempotent;
+		// sweepRetiredStaging is what drops a retired one from the set,
+		// and only once removal actually confirms empty, so an
+		// interrupted drain resumes on a later boot instead of losing
 		// track of the config change.
-		if prevRoot, ok, err := journal.GetStagingRoot(); err != nil {
-			log.Warn().Err(err).Msg("read previous staging root failed; retired custom root (if any) not tracked this boot")
-		} else if ok && prevRoot != "" &&
-			!backup.StagingRootsOverlap(prevRoot, stagingRoot) &&
-			!backup.StagingRootsOverlap(prevRoot, legacyStaging) {
-			// Plain inequality is not enough here: a change between an
-			// ancestor and descendant path (or the same directory under an
-			// aliased spelling) is not a retirement — sweepRetiredStaging
-			// would walk live, referenced entries reachable through the
-			// active root's own tree and delete them as apparent orphans
-			// past the grace period.
-			uploader.RetiredStagingRoot = prevRoot
-			log.Info().Str("path", prevRoot).Msg("staging root changed since last boot; retired custom root queued for background drain")
-		} else if err := journal.PutStagingRoot(stagingRoot); err != nil {
-			log.Warn().Err(err).Msg("persist staging root failed; a future root change may not be detected")
+		if err := journal.RecordStagingRoot(stagingRoot); err != nil {
+			log.Warn().Err(err).Msg("record staging root failed; a future root change may not be detected")
+		}
+		if allRoots, err := journal.StagingRoots(); err != nil {
+			log.Warn().Err(err).Msg("read staging roots failed; retired custom roots (if any) not tracked this boot")
+		} else {
+			for _, root := range allRoots {
+				// Plain inequality is not enough here: a change between an
+				// ancestor and descendant path (or the same directory under
+				// an aliased spelling) is not a retirement —
+				// sweepRetiredStaging would walk live, referenced entries
+				// reachable through the active root's own tree and delete
+				// them as apparent orphans past the grace period.
+				if root == stagingRoot ||
+					backup.StagingRootsOverlap(root, stagingRoot) ||
+					backup.StagingRootsOverlap(root, legacyStaging) {
+					continue
+				}
+				uploader.RetiredStagingRoots = append(uploader.RetiredStagingRoots, root)
+				log.Info().Str("path", root).Msg("staging root changed since a previous boot; retired custom root queued for background drain")
+			}
 		}
 		// pauseStagingRoot gets no startup sweep of its own here: on a
 		// host with no BACKUP_STAGING_DIR override it IS stagingRoot

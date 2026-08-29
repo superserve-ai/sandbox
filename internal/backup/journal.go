@@ -221,18 +221,20 @@ var (
 	// ack of the SAME generation overwrites the completion value without
 	// touching this record, and the mismatch re-seeds the newer instant.
 	seededBucket = []byte("backup_outbox_seeded")
-	// stagingRootBucket holds the single most recently resolved staging
-	// root (BACKUP_STAGING_DIR or its default), under stagingRootKey. It
-	// exists so a config change away from a custom root — a rollback in
-	// particular — can be detected and the abandoned tree swept, rather
-	// than leaked forever: ResolveStagingRoot's hardcoded legacy path only
-	// ever covers the one fixed pre-split default, not whatever custom
-	// root an operator had actually configured.
+	// stagingRootBucket is a SET of every staging root (BACKUP_STAGING_DIR
+	// or its default) seen across boots, keyed by the root path itself
+	// (value unused). It exists so a config change away from a custom
+	// root — a rollback in particular — can be detected and the abandoned
+	// tree swept, rather than leaked forever: ResolveStagingRoot's
+	// hardcoded legacy path only ever covers the one fixed pre-split
+	// default, not whatever custom root an operator had actually
+	// configured. A set, not a single "last seen" value, because two
+	// config changes within one drain window (A to B, then B to C before
+	// A empties) must not make B's entries untrackable — every root not
+	// yet confirmed drained stays in the set until RemoveStagingRoot
+	// removes it, however many are outstanding at once.
 	stagingRootBucket = []byte("backup_staging_root")
 )
-
-// stagingRootKey is the bucket's only entry.
-var stagingRootKey = []byte("current")
 
 // verifiedRetention bounds how long verification history is kept. Long
 // enough to cover any plausible re-enqueue of an unchanged generation;
@@ -271,30 +273,36 @@ func NewJournal(db *bolt.DB) (*Journal, error) {
 	return &Journal{db: db, claims: make(map[string]claim)}, nil
 }
 
-// GetStagingRoot returns the staging root recorded by the previous call
-// to PutStagingRoot, or ok=false on first boot (nothing recorded yet).
-func (j *Journal) GetStagingRoot() (root string, ok bool, err error) {
+// StagingRoots returns every staging root recorded across boots, in no
+// particular order. Empty on first boot (nothing recorded yet).
+func (j *Journal) StagingRoots() (roots []string, err error) {
 	err = j.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(stagingRootBucket).Get(stagingRootKey)
-		if v != nil {
-			root, ok = string(v), true
-		}
-		return nil
+		return tx.Bucket(stagingRootBucket).ForEach(func(k, _ []byte) error {
+			roots = append(roots, string(k))
+			return nil
+		})
 	})
-	return root, ok, err
+	return roots, err
 }
 
-// PutStagingRoot records root as the current staging root, overwriting
-// whatever was recorded before. Callers must only advance this once
-// root is actually in effect with nothing left in a prior root: cmd/vmd
-// calls it directly on the no-drift boot path, and
-// Uploader.sweepRetiredStaging calls it only after confirming a
-// retired custom root emptied, so an interrupted drain keeps being
-// detected on later boots instead of the config change going
-// untracked.
-func (j *Journal) PutStagingRoot(root string) error {
+// RecordStagingRoot adds root to the recorded set; a no-op if it is
+// already present. Call once per boot with whatever root just resolved,
+// unconditionally — recording is cheap and idempotent, unlike removal,
+// which must only happen once a root is confirmed to hold nothing.
+func (j *Journal) RecordStagingRoot(root string) error {
 	return j.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(stagingRootBucket).Put(stagingRootKey, []byte(root))
+		return tx.Bucket(stagingRootBucket).Put([]byte(root), []byte{1})
+	})
+}
+
+// RemoveStagingRoot drops root from the recorded set. Callers must only
+// call this once root is confirmed to hold nothing: Uploader.
+// sweepRetiredStaging calls it after removing the now-empty directory,
+// never before, so an interrupted drain leaves root in the set and gets
+// detected and retried on a later boot instead of going untracked.
+func (j *Journal) RemoveStagingRoot(root string) error {
+	return j.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(stagingRootBucket).Delete([]byte(root))
 	})
 }
 
