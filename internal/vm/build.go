@@ -161,10 +161,18 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 		"--slot-index", fmt.Sprint(slotIndex),
 		// Resolved here, not in the subprocess: launchLauncherPath applies the
 		// same readiness and pin-mounted gates a VM launch does, and returns ""
-		// to fall back to the legacy entry. A build that entered a stale pin
-		// would launch into the wrong mount view.
+		// to fall back to the legacy entry. The subprocess re-checks the pin
+		// immediately before it launches, since a build can spend minutes
+		// pulling an image before it gets there.
 		"--launcher-ns", m.launchLauncherPath(buildVMID),
 	)
+	// The build creates its own slot, so it must use the same backend as this
+	// daemon: on the shell backend its slot setup forks `ip netns exec`
+	// repeatedly, and each of those clones the host mount table and stalls
+	// every concurrent launch — the cost the netlink backend exists to remove.
+	if m.netMgr.UsesNetlinkSlotOps() {
+		cmd.Args = append(cmd.Args, "--netlink-slot-ops")
+	}
 
 	// Stdout carries structured NDJSON build events — parse and forward
 	// to the build log buffer so SSE subscribers see real-time progress.

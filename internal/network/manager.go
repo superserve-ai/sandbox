@@ -234,6 +234,13 @@ func WithNetlinkSlotOps() ManagerOption {
 	return func(m *Manager) { m.useNetlinkOps = true }
 }
 
+// UsesNetlinkSlotOps reports whether this Manager runs slot operations over
+// netlink. It exists so a process that spawns a helper building its own slots
+// (template-builder) can select the same backend: a helper left on the shell
+// backend keeps forking `ip netns exec` per slot operation, and those clones
+// block every concurrent launch on the host, not just its own.
+func (m *Manager) UsesNetlinkSlotOps() bool { return m.useNetlinkOps }
+
 // WithExactSlot pins the Manager to exactly slot idx: it claims that one index
 // or fails with ErrNoSlots, never advancing to idx+1. A template-builder
 // subprocess uses this to build precisely the slot vmd reserved for it via

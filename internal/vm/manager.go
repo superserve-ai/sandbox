@@ -194,6 +194,9 @@ type vmNetworkManager interface {
 	UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []string) error
 	TeardownVMOrNamespace(vmID, fallbackNamespace string)
 	TeardownVM(vmID string)
+	// UsesNetlinkSlotOps lets the build path hand the same backend to
+	// template-builder, which creates its own slot in its own process.
+	UsesNetlinkSlotOps() bool
 }
 
 type sandboxNetworkRules struct {
