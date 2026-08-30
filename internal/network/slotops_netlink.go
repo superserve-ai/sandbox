@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"runtime"
 	"strconv"
 	"syscall"
@@ -22,6 +21,28 @@ import (
 // global mount lock — the only mount operations left in a slot's lifetime are
 // the namespace bind mount at create and its unmount at delete.
 type netlinkSlotOps struct {
+	// Namespace lifecycle deliberately stays on iproute2. Creating a named
+	// namespace is the one slot operation whose mount work is irreducible —
+	// it must bind-mount the namespace under /run/netns — and it happens
+	// once per slot. The namespace-scoped operations this backend does
+	// replace run several times per build and clone the mount table on every
+	// call, so converting creation trades away the smaller cost and takes on
+	// the harder correctness problem below.
+	//
+	// It also costs correctness. `ip netns add` initializes /run/netns as a
+	// shared mount and serializes that initialization under flock, and
+	// `ip netns del` unlinks the name even when the unmount fails; a
+	// hand-rolled equivalent has to reproduce both or it strands slots. And
+	// creation is the one operation that cannot use inNamespace's
+	// restore-or-terminate discipline, because the namespace does not exist
+	// until the call that enters it — so its failure paths are the only ones
+	// that can hand a tainted thread back to the scheduler.
+	//
+	// Embedding the shell backend keeps those two operations on the code
+	// iproute2 has hardened, and confines this backend to what it is for:
+	// replacing the namespace-scoped `ip netns exec` invocations.
+	shellSlotOps
+
 	mtu int
 }
 
@@ -131,50 +152,8 @@ func onHost(ctx context.Context, fn func(h *netlink.Handle) error) error {
 	return runWithHandle(ctx, fn)
 }
 
-func (o *netlinkSlotOps) AddNamespace(ctx context.Context, ns string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	errCh := make(chan error, 1)
-	go func() {
-		runtime.LockOSThread()
-
-		hostNS, err := netns.Get()
-		if err != nil {
-			runtime.UnlockOSThread()
-			errCh <- fmt.Errorf("get current netns: %w", err)
-			return
-		}
-		defer hostNS.Close()
-
-		// NewNamed creates the namespace, bind-mounts it under the run
-		// directory, and leaves the calling thread inside it — hence the
-		// same restore-or-terminate discipline as inNamespace.
-		newNS, err := netns.NewNamed(ns)
-		if err != nil {
-			runtime.UnlockOSThread()
-			errCh <- fmt.Errorf("create namespace: %w", err)
-			return
-		}
-		newNS.Close()
-
-		if err := netns.Set(hostNS); err != nil {
-			errCh <- fmt.Errorf("restore host netns after creating %q: %w", ns, err)
-			return
-		}
-
-		runtime.UnlockOSThread()
-		errCh <- nil
-	}()
-	return <-errCh
-}
-
-func (o *netlinkSlotOps) DelNamespace(_ context.Context, ns string) error {
-	if err := netns.DeleteNamed(ns); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("delete namespace %q: %w", ns, err)
-	}
-	return nil
-}
+// AddNamespace and DelNamespace are inherited from the embedded shellSlotOps;
+// see the type comment for why namespace lifecycle stays on iproute2.
 
 func (o *netlinkSlotOps) BuildSlotVeth(ctx context.Context, ns, veth, vpeer, vpeerCIDR string) error {
 	return inNamespace(ctx, ns, func(h *netlink.Handle) error {

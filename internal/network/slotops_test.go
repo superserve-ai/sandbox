@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -155,6 +156,21 @@ func TestFakeCoversInterface(t *testing.T) {
 	var ops slotNetOps = &fakeSlotOps{}
 	if err := ops.AddNamespace(context.Background(), "x"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Namespace create/delete must stay on iproute2: it initializes /run/netns as
+// a shared mount under flock, and unlinks the name even when the unmount
+// fails. Creation is also the one slot operation that cannot use
+// inNamespace's restore-or-terminate discipline — the namespace does not
+// exist until the call that enters it — so a hand-rolled version's failure
+// paths are the only ones that can return a thread to the scheduler still
+// inside a sandbox namespace. Structural check only: it pins the delegation,
+// not the absence of a shadowing method.
+func TestNetlinkBackendDelegatesNamespaceLifecycle(t *testing.T) {
+	f, ok := reflect.TypeOf(netlinkSlotOps{}).FieldByName("shellSlotOps")
+	if !ok || !f.Anonymous {
+		t.Fatal("netlinkSlotOps must embed shellSlotOps so AddNamespace/DelNamespace stay on iproute2")
 	}
 }
 
