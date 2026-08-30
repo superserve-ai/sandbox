@@ -37,11 +37,29 @@ func (s BuildStatus) IsTerminal() bool {
 type buildRecord struct {
 	BuildVMID  string
 	TemplateID string
-	Status     BuildStatus
-	Result     *BuildTemplateResult // populated on ready
-	Error      string               // populated on failed/cancelled
-	StartedAt  time.Time
-	EndedAt    time.Time // zero until terminal
+	// VCPU and MemoryMiB are the build VM's resource allocation, recorded
+	// so capacity pressure can count in-flight builds: the subprocess VM
+	// never enters the instance map, but its memory and CPU are as real
+	// as any sandbox's.
+	VCPU      uint32
+	MemoryMiB uint32
+	// AllocReleased marks that this build's memory/vCPU pressure counters
+	// have been returned: the last build VM (subprocess, then the
+	// access-pattern recorder) is gone, even though the worker may keep
+	// hashing artifacts for minutes. Guarded by buildsMu.
+	AllocReleased bool
+	// RecorderLive marks the window in which THIS build's access-pattern
+	// recorder VM is expected in the instance map and covered by the
+	// build's counters. Recorder ids carry only the template, so without
+	// this phase bit a recorder LEAKED by an earlier build would be
+	// re-hidden by any later build of the same template. Guarded by
+	// buildsMu; cleared together with the allocation release.
+	RecorderLive bool
+	Status       BuildStatus
+	Result       *BuildTemplateResult // populated on ready
+	Error        string               // populated on failed/cancelled
+	StartedAt    time.Time
+	EndedAt      time.Time // zero until terminal
 
 	// cancel stops the goroutine running the build. Calling it under a
 	// non-terminal status transitions the record to cancelled once the
@@ -79,7 +97,7 @@ func (m *Manager) initBuildRegistry() {
 // registerBuild inserts a new record in the registry. Fails if a build
 // with the same ID is already in-flight — the caller is expected to pick a
 // unique buildVMID per BuildTemplate invocation.
-func (m *Manager) registerBuild(buildVMID, templateID string, cancel context.CancelFunc) (*buildRecord, error) {
+func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB uint32, cancel context.CancelFunc) (*buildRecord, error) {
 	m.initBuildRegistry()
 	// An adoption reconcile for this template+build may be mid-flight
 	// with stamped-metadata writes pending; cancel it and AWAIT its exit
@@ -104,12 +122,19 @@ func (m *Manager) registerBuild(buildVMID, templateID string, cancel context.Can
 	rec := &buildRecord{
 		BuildVMID:  buildVMID,
 		TemplateID: templateID,
+		VCPU:       vcpu,
+		MemoryMiB:  memoryMiB,
 		Status:     BuildStatusRunning,
 		StartedAt:  time.Now(),
 		cancel:     cancel,
 		logs:       newBuildLogBuffer(),
 	}
 	m.builds[buildVMID] = rec
+	// Pressure counters pair with the worker-exit release in
+	// buildTemplateWorker; see the field comment on buildPressureCount.
+	m.buildPressureCount.Add(1)
+	m.buildPressureMem.Add(int64(memoryMiB))
+	m.buildPressureVcpus.Add(int64(vcpu))
 	return rec, nil
 }
 
@@ -135,11 +160,22 @@ func (m *Manager) setBuildStatus(buildVMID string, newStatus BuildStatus) bool {
 // or to failed with the error. Idempotent: if the record is already
 // terminal (e.g. cancelled before snapshot finished), the earlier terminal
 // status wins and this call is a no-op.
-func (m *Manager) completeBuild(buildVMID string, result *BuildTemplateResult, buildErr error) {
+func (m *Manager) completeBuild(buildVMID string, worker *buildRecord, result *BuildTemplateResult, buildErr error) {
 	m.buildsMu.Lock()
 	rec, ok := m.builds[buildVMID]
 	if !ok {
 		m.buildsMu.Unlock()
+		return
+	}
+	if rec != worker {
+		// The id was re-registered while this worker ran (a cancelled
+		// build retried before its worker exited): this completion
+		// belongs to the REPLACED generation, and publishing it would
+		// stamp the old result onto the new build's record as a frozen
+		// terminal state the new worker could never overwrite.
+		m.buildsMu.Unlock()
+		m.log.Warn().Str("build_vm_id", buildVMID).
+			Msg("dropping completion from a replaced build worker")
 		return
 	}
 	if rec.Status.IsTerminal() {

@@ -432,7 +432,7 @@ func TestRegisterBuildCancelsInFlightReconcile(t *testing.T) {
 	// Registration must cancel the reconcile and return once it exits.
 	done := make(chan error, 1)
 	go func() {
-		_, err := m.registerBuild("build-tpl", "tpl", func() {})
+		_, err := m.registerBuild("build-tpl", "tpl", 1, 1024, func() {})
 		done <- err
 	}()
 	// The blocked hook ignores cancellation, so release it shortly

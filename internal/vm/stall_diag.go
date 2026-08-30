@@ -35,11 +35,9 @@ const (
 	stallDiagSettle     = 2 * time.Second
 	stallDiagPerfWindow = 3 * time.Second
 
-	// A stall means the host may already be struggling, so the profile is
-	// deliberately coarse: ~100 Hz is ample to identify a loop the guest has
-	// been spinning in for seconds, and the size cap bounds the write even if
-	// the rate assumption is ever wrong.
-	stallDiagPerfHz      = "97"
+	// kvm_entry fires per VM entry — a few thousand per second on a spinning
+	// vCPU — so the size cap bounds the recording even if a guest exits far
+	// more often than any observed stall.
 	stallDiagPerfMaxSize = "32M"
 
 	// Caps the battery so it can never outlive the readiness window and
@@ -440,33 +438,33 @@ func perfIsUsable(parent context.Context) bool {
 	}
 	// A command that ran gives a deterministic answer: the distribution stub
 	// prints an "install linux-tools-<kernel>" notice instead of profiling.
+	// Only the positive verdict is cached — perf can be installed out-of-band
+	// under a running daemon, and re-probing a stub costs one cheap
+	// subprocess per stall.
 	ok := !strings.Contains(string(out), "linux-tools")
-	perfUsable.Store(&ok)
+	if ok {
+		perfUsable.Store(&ok)
+	}
 	return ok
 }
 
-// guestSampleLine matches a perf script line of the form "<ip> <dso>", where
-// the dso identifies which address space the sample came from.
-var guestSampleLine = regexp.MustCompile(`(?m)^\s*([0-9a-f]{6,16})\s+(\S.*)$`)
+// kvmEntryLine matches one perf-script kvm:kvm_entry event, capturing which
+// vCPU entered guest mode and the guest RIP it entered at. The comma between
+// the fields is optional: the tracepoint's print format differs across kernel
+// versions ("vcpu 0 rip 0x..." vs "vcpu 0, rip 0x...").
+var kvmEntryLine = regexp.MustCompile(`kvm_entry:\s+vcpu (\d+),?\s+rip 0x([0-9a-f]+)`)
 
-// guestDSO reports whether a perf dso field denotes guest address space.
-// perf labels guest samples with a guest-specific dso; anything else is a
-// host address inside Firecracker or the kernel.
-func guestDSO(dso string) bool {
-	return strings.Contains(strings.ToLower(dso), "guest")
-}
-
-// sampleGuestIPs profiles the stalled VM and returns distinct GUEST
-// instruction pointers, most frequent first.
+// sampleGuestIPs records where the guest is executing and returns distinct
+// per-vCPU guest instruction pointers, most frequent first, each rendered as
+// "v<cpu>:<rip>:<count>".
 //
-// Two things make this trustworthy rather than merely plausible. It records
-// through `perf kvm --guest`, which is the interface built for guest
-// profiling — plain `perf record` on the pid samples the host side and would
-// hand back Firecracker and KVM addresses. And it keeps only samples perf
-// attributes to guest address space, so an address is either provably from
-// the guest or absent: reporting a host address as a guest RIP would send a
-// reader to resolve it against guest symbols and arrive at confident
-// nonsense, which is worse than reporting nothing.
+// It reads the kvm:kvm_entry tracepoint rather than sampling with the PMU:
+// KVM logs the guest RIP on every VM entry, entirely host-side, so this works
+// where guest PMU sampling is not virtualized and `perf kvm --guest record`
+// returns zero samples. A stalled vCPU still enters thousands of times a
+// second — the host timer tick alone forces exits — so the address it spins
+// at clusters sharply, and the halted vCPU's wake/halt cycle shows up as a
+// separate, sparser cluster under its own vcpu id.
 //
 // Addresses rather than symbols because the shipped guest kernel is stripped;
 // resolution happens offline against a kallsyms dump from a live guest of the
@@ -481,24 +479,22 @@ func sampleGuestIPs(ctx context.Context, pid int) []string {
 	}
 	defer os.RemoveAll(tmp)
 	data := filepath.Join(tmp, "perf.data")
-	rec := exec.CommandContext(ctx, "perf", "kvm", "--guest", "record",
-		"-F", stallDiagPerfHz, "--max-size", stallDiagPerfMaxSize,
+	rec := exec.CommandContext(ctx, "perf", "record", "-e", "kvm:kvm_entry",
+		"--max-size", stallDiagPerfMaxSize,
 		"-p", strconv.Itoa(pid), "-o", data, "--", "sleep",
 		strconv.Itoa(int(stallDiagPerfWindow/time.Second)))
 	if err := rec.Run(); err != nil {
 		return nil
 	}
-	script := exec.CommandContext(ctx, "perf", "script", "-i", data, "-F", "ip,dso")
+	script := exec.CommandContext(ctx, "perf", "script", "-i", data)
 	out, err := script.Output()
 	if err != nil {
 		return nil
 	}
 
 	counts := map[string]int{}
-	for _, m := range guestSampleLine.FindAllStringSubmatch(string(out), -1) {
-		if guestDSO(m[2]) {
-			counts[m[1]]++
-		}
+	for _, m := range kvmEntryLine.FindAllStringSubmatch(string(out), -1) {
+		counts["v"+m[1]+":"+m[2]]++
 	}
 	ips := make([]string, 0, len(counts))
 	for ip := range counts {

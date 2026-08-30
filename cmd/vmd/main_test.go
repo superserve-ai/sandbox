@@ -260,3 +260,30 @@ func TestShutdownAbortsOnCloserFailure(t *testing.T) {
 		run(t, func(context.Context) error { select {} }) // ponytail: never returns
 	})
 }
+
+// Pressure accounting is opt-in on BOTH halves: an operator-set
+// advertise address and a control plane to publish to. A host with an
+// address but no control-plane URL never starts a heartbeat, so turning
+// the accounting on would buy a startup scan whose results nothing
+// reads.
+func TestPublishesCapacityPressureRequiresBothHalves(t *testing.T) {
+	cases := []struct {
+		name            string
+		advertiseAddr   string
+		controlPlaneURL string
+		want            bool
+	}{
+		{"both set", "10.0.0.2:50051", "http://cp:8080", true},
+		{"no advertise address", "", "http://cp:8080", false},
+		{"no control plane", "10.0.0.2:50051", "", false},
+		{"neither", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := publishesCapacityPressure(tc.advertiseAddr, tc.controlPlaneURL); got != tc.want {
+				t.Fatalf("publishesCapacityPressure(%q, %q) = %v, want %v",
+					tc.advertiseAddr, tc.controlPlaneURL, got, tc.want)
+			}
+		})
+	}
+}
