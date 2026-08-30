@@ -159,6 +159,11 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 		"--boxd", m.cfg.BoxdBinaryPath,
 		"--host-interface", m.cfg.HostInterface,
 		"--slot-index", fmt.Sprint(slotIndex),
+		// Resolved here, not in the subprocess: launchLauncherPath applies the
+		// same readiness and pin-mounted gates a VM launch does, and returns ""
+		// to fall back to the legacy entry. A build that entered a stale pin
+		// would launch into the wrong mount view.
+		"--launcher-ns", m.launchLauncherPath(buildVMID),
 	)
 
 	// Stdout carries structured NDJSON build events — parse and forward
