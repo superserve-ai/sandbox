@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -135,6 +136,14 @@ type Manager struct {
 	ops slotNetOps
 	// useNetlinkOps selects the netlink backend at construction.
 	useNetlinkOps bool
+
+	// foregroundOps counts in-flight network operations a caller is actively
+	// waiting on — SetupVM (create) and EnsureVMSlot (resume) — so
+	// background producers can yield the RTNL lock to them. Deliberately
+	// NOT counted: reattach (only ever called by the background startup
+	// pass) and cleanup (shared with the reconciler's continuous reaping).
+	// Advisory only; nothing blocks on it.
+	foregroundOps atomic.Int64
 
 	mu      sync.Mutex
 	devices map[string]*VMNetInfo
@@ -384,6 +393,8 @@ func (m *Manager) SetProxyPorts(http, tls, other uint16) {
 // The host reaches the VM at hostIP:<port>. NAT inside the namespace
 // translates to 169.254.0.21:<port>. No guest IP reconfig needed.
 func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNetInfo, error) {
+	m.foregroundOps.Add(1)
+	defer m.foregroundOps.Add(-1)
 	// Try the pre-allocated pool first; fall back to on-demand setup.
 	if m.pool != nil {
 		if info := m.pool.Claim(vmID); info != nil {
@@ -615,6 +626,10 @@ func (m *Manager) CleanupVM(vmID string) { m.cleanupVM(vmID, true) }
 func (m *Manager) TeardownVM(vmID string) { m.cleanupVM(vmID, false) }
 
 func (m *Manager) cleanupVM(vmID string, recycle bool) {
+	// Not counted in foregroundOps: reached from request destroys AND from
+	// the reconciler's background reaping through the same entry points, and
+	// the reconciler churns continuously — counting it would keep producers
+	// yielding to background work.
 	m.mu.Lock()
 	info, ok := m.devices[vmID]
 	if ok {
@@ -798,6 +813,9 @@ func (m *Manager) Forget(vmID string) {
 // customer's subsequent UpdateFirewallRules calls apply to the existing
 // kernel state.
 func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
+	// Not counted in foregroundOps: the only caller is the startup reattach
+	// pass, which is itself background work — counting it would make the
+	// producers yield to each other.
 	idx, ok := slotFromNamespace(namespace)
 	if !ok {
 		return fmt.Errorf("reattach %s: cannot parse slot from namespace %q", vmID, namespace)
@@ -887,6 +905,8 @@ func (m *Manager) ReserveSlotsAbove(reservations map[string]string) {
 // so a rebuild preserves the VM's network identity. Per-customer egress
 // rules are NOT restored here; the caller reapplies them.
 func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, macAddress string) (*VMNetInfo, error) {
+	m.foregroundOps.Add(1)
+	defer m.foregroundOps.Add(-1)
 	idx, ok := slotFromNamespace(namespace)
 	if !ok {
 		return nil, fmt.Errorf("ensure %s: cannot parse slot from namespace %q", vmID, namespace)
