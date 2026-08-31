@@ -898,11 +898,9 @@ func (p *Pool) adoptFromReceipt(ctx context.Context, candidates []int) (remainin
 			defer workers.Done()
 			defer sentrylog.Recover("netpool-receipt-adopt")
 			for idx := range work {
-				// Metered like every other background slot path — "fast"
-				// is per-slot cost, not license to burst RTNL: on a clean
-				// restart this is the path that adopts most of the fleet.
-				// A refused token means shutdown; the index stays claimed
-				// for the next boot, like a mid-pass shutdown.
+				// Metered: on a clean restart this path adopts most of the
+				// fleet. A refused token means shutdown; the index stays
+				// claimed for the next boot, like a mid-pass shutdown.
 				var slot *preallocSlot
 				var timedOut bool
 				if !p.withBGSlot(ctx, func() {
