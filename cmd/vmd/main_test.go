@@ -104,7 +104,7 @@ func TestAdvertisedAddrsShareOneHostLookup(t *testing.T) {
 	resolved := 0
 	hostIP := func() (string, error) {
 		resolved++
-		return "10.2.0.3", nil
+		return "10.0.0.3", nil
 	}
 	memo := func() func() (string, error) {
 		var once sync.Once
@@ -124,10 +124,10 @@ func TestAdvertisedAddrsShareOneHostLookup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("advertisedProxyAddr: %v", err)
 	}
-	if vmdAddr != "10.2.0.3:50051" {
+	if vmdAddr != "10.0.0.3:50051" {
 		t.Fatalf("advertisedVMDAddr = %q, want derived host address", vmdAddr)
 	}
-	if proxyAddr != "10.2.0.3:5007" {
+	if proxyAddr != "10.0.0.3:5007" {
 		t.Fatalf("advertisedProxyAddr = %q, want derived host address", proxyAddr)
 	}
 	if resolved != 1 {
