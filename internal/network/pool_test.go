@@ -1355,20 +1355,27 @@ func TestBGSlotBudgetRampsAfterGate(t *testing.T) {
 // background budget for the rest of the process's life.
 func TestWithBGSlotReturnsTokenOnPanic(t *testing.T) {
 	p := &Pool{
+		mgr:       &Manager{}, // yieldToForeground reads its counters
 		log:       zerolog.Nop(),
 		stopCh:    make(chan struct{}),
 		bgSlotSem: make(chan struct{}, 1),
 	}
 	p.bgSlotSem <- struct{}{} // full budget: one token
 
+	ran := false
 	func() {
 		defer func() {
-			if recover() == nil {
-				t.Fatal("expected the panic to propagate")
+			// Specifically fn's panic — anything else means the panic fired
+			// before the token was even acquired and the test proved nothing.
+			if r := recover(); r != "boom" {
+				t.Fatalf("recovered %v, want the fn panic", r)
 			}
 		}()
-		p.withBGSlot(context.Background(), func() { panic("boom") })
+		p.withBGSlot(context.Background(), func() { ran = true; panic("boom") })
 	}()
+	if !ran {
+		t.Fatal("fn never ran — the token was never at risk")
+	}
 
 	select {
 	case <-p.bgSlotSem:
