@@ -1170,3 +1170,106 @@ func BenchmarkClaimWaitBurst(b *testing.B) {
 		close(p.stopCh)
 	}
 }
+
+// The start gate holds fleet-sized background work until the daemon is ready
+// to serve. It must release on the gate, and it must not strand a worker when
+// the daemon shuts down before readiness is ever announced.
+func TestPoolWaitForStart(t *testing.T) {
+	newPool := func(gate <-chan struct{}) *Pool {
+		return &Pool{log: zerolog.Nop(), stopCh: make(chan struct{}), startGate: gate}
+	}
+
+	t.Run("nil gate is already open", func(t *testing.T) {
+		if !newPool(nil).waitForStart(context.Background()) {
+			t.Fatal("nil gate must not block")
+		}
+	})
+
+	t.Run("closed gate releases", func(t *testing.T) {
+		gate := make(chan struct{})
+		close(gate)
+		if !newPool(gate).waitForStart(context.Background()) {
+			t.Fatal("closed gate must release")
+		}
+	})
+
+	t.Run("releases when the gate opens later", func(t *testing.T) {
+		gate := make(chan struct{})
+		p := newPool(gate)
+		done := make(chan bool, 1)
+		go func() { done <- p.waitForStart(context.Background()) }()
+		select {
+		case <-done:
+			t.Fatal("released before the gate opened")
+		case <-time.After(20 * time.Millisecond):
+		}
+		close(gate)
+		select {
+		case ok := <-done:
+			if !ok {
+				t.Fatal("waitForStart reported failure after the gate opened")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("still parked after the gate opened")
+		}
+	})
+
+	t.Run("stop releases the waiter", func(t *testing.T) {
+		p := newPool(make(chan struct{})) // never opened
+		done := make(chan bool, 1)
+		go func() { done <- p.waitForStart(context.Background()) }()
+		close(p.stopCh)
+		select {
+		case ok := <-done:
+			if ok {
+				t.Fatal("stop must report the gate never opened")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("shutdown before readiness stranded a worker")
+		}
+	})
+
+	t.Run("context cancellation releases the waiter", func(t *testing.T) {
+		p := newPool(make(chan struct{})) // never opened
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan bool, 1)
+		go func() { done <- p.waitForStart(ctx) }()
+		cancel()
+		select {
+		case ok := <-done:
+			if ok {
+				t.Fatal("cancellation must report the gate never opened")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("cancellation stranded a worker")
+		}
+	})
+}
+
+// A gated pool must not advertise itself as producing before it can produce:
+// a claimant that sees a producer waits for it, and nothing is built until
+// the gate opens. Declaring early would trade a bounded inline build for a
+// stall on a worker that has not started.
+func TestGatedRefillDeclaresNoProducerBeforeRelease(t *testing.T) {
+	p := &Pool{log: zerolog.Nop(), stopCh: make(chan struct{}), startGate: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.wg.Add(1)
+	go p.refillLoop(ctx)
+
+	time.Sleep(20 * time.Millisecond)
+	if got := p.refillActive.Load(); got != 0 {
+		t.Fatalf("refillActive = %d while gated, want 0", got)
+	}
+
+	cancel()
+	waited := make(chan struct{})
+	go func() { p.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("gated worker did not exit on cancellation")
+	}
+	if got := p.refillActive.Load(); got != 0 {
+		t.Fatalf("refillActive = %d after exit, want 0", got)
+	}
+}

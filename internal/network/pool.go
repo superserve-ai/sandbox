@@ -30,6 +30,13 @@ type PoolConfig struct {
 	// and the next process adopts the slots via AdoptOrphanSlots. Off by
 	// default (legacy teardown).
 	AbandonOnStop bool
+	// StartGate holds the refill and adoption workers until it is closed.
+	// Both walk the whole slot inventory over netlink, and every netlink
+	// operation takes the kernel's single global RTNL lock — so while they
+	// run, any other caller needing that lock queues behind them. Deferring
+	// them until the daemon can serve requests keeps work proportional to
+	// the fleet off the startup path. Nil starts them immediately.
+	StartGate <-chan struct{}
 }
 
 // Pool pre-allocates network namespaces, veth pairs, TAP devices, and
@@ -45,8 +52,11 @@ type Pool struct {
 	fresh    chan *preallocSlot // pre-allocated from scratch
 	recycled chan *preallocSlot // returned from destroyed sandboxes
 	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	drainMu  sync.RWMutex
+	// startGate delays the refill and adoption workers; see PoolConfig.
+	// Nil means "already open".
+	startGate <-chan struct{}
+	wg        sync.WaitGroup
+	drainMu   sync.RWMutex
 	// refillDrainGate is closed while the controller is draining warm inventory.
 	// Refill workers select on it before handing a built slot to the pool so a
 	// send that was already blocked when drain started can still abort instead
@@ -230,6 +240,7 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		fresh:             make(chan *preallocSlot, newSize),
 		recycled:          make(chan *preallocSlot, recycleSize),
 		stopCh:            make(chan struct{}),
+		startGate:         cfg.StartGate,
 		refillDrainGate:   make(chan struct{}),
 		resetTapOnRecycle: cfg.ResetTapOnRecycle,
 		abandonOnStop:     cfg.AbandonOnStop,
@@ -255,11 +266,37 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		// inline build against the imminent refill (the same synchronous
 		// publication StartAdoption makes for its phase). The worker inherits
 		// the declaration and relinquishes it on backoff, pause, or exit.
-		p.refillActive.Add(1)
+		//
+		// Behind a start gate the refill is NOT imminent — nothing is built
+		// until the gate opens — so the declaration would make a claimant
+		// wait on a producer that has not started. There the worker declares
+		// itself once it is past the gate and genuinely producing, and a
+		// claimant arriving first correctly takes the bounded inline path.
+		if p.startGate == nil {
+			p.refillActive.Add(1)
+		}
 		go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
 	}
 
 	return p
+}
+
+// waitForStart blocks until the start gate opens. It reports false when the
+// pool was stopped or the context cancelled while waiting, so a daemon that
+// shuts down before the gate opens never leaves a worker parked on it.
+// A nil gate is already open.
+func (p *Pool) waitForStart(ctx context.Context) bool {
+	if p.startGate == nil {
+		return true
+	}
+	select {
+	case <-p.startGate:
+		return true
+	case <-p.stopCh:
+		return false
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // Claim takes a slot from the pool and assigns it to the given VM ID.
@@ -975,6 +1012,13 @@ func (p *Pool) StartAdoption(ctx context.Context) bool {
 	go func() {
 		defer p.wg.Done()
 		defer sentrylog.Recover("netpool-adopt")
+		if !p.waitForStart(ctx) {
+			// Nothing was scanned, so the phase must not stay latched at
+			// scanning — a claimant would wait on a pass that will never run.
+			p.adoptPhase.Store(adoptPhaseIdle)
+			p.signalProgress()
+			return
+		}
 		p.AdoptOrphanSlots(ctx)
 	}()
 	return true
@@ -1181,14 +1225,23 @@ const (
 
 func (p *Pool) refillLoop(ctx context.Context) {
 	defer p.wg.Done()
+	if !p.waitForStart(ctx) {
+		return
+	}
+	// Past the gate the worker is genuinely producing, so it publishes the
+	// declaration StartPool skipped (see there for why a gated pool must not
+	// declare it up front). Ungated, StartPool already published it.
+	if p.startGate != nil {
+		p.refillActive.Add(1)
+	}
 	// The worker's active declaration is continuous across successful
 	// iterations — decrementing between two builds would let a delivery
 	// broadcast wake claimants into the instant where the count reads zero,
 	// and they would bail to inline builds against a producer that is
 	// committed to its next slot. Zero is exposed only at backoff, pause,
 	// and shutdown, when the pool genuinely promises nothing. The initial
-	// declaration was published synchronously by StartPool; this loop only
-	// ever relinquishes and re-acquires it.
+	// declaration was published synchronously by StartPool (or, when gated,
+	// just above); this loop only ever relinquishes and re-acquires it.
 	active := true
 	deactivate := func() {
 		if active {
