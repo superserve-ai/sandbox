@@ -625,6 +625,9 @@ func main() {
 	// chain even when no ports are configured (so disabling the feature
 	// clears stale drops). template-builder must not pass this.
 	netMgrOpts := []network.ManagerOption{network.WithEgressPortChainOwner()}
+	if envOrDefault("VMD_NETLINK_SLOT_OPS", "false") == "true" {
+		netMgrOpts = append(netMgrOpts, network.WithNetlinkSlotOps())
+	}
 	if blocklistPath != "" {
 		blCfg, err := blocklist.LoadConfig(blocklistPath)
 		if err != nil {

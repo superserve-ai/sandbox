@@ -27,6 +27,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2
 	github.com/posthog/posthog-go v1.14.0
 	github.com/rs/zerolog v1.34.0
+	github.com/vishvananda/netlink v1.3.1
 	github.com/vishvananda/netns v0.0.5
 	go.etcd.io/bbolt v1.4.3
 	go.opentelemetry.io/otel v1.44.0
