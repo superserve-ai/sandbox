@@ -1413,13 +1413,6 @@ func main() {
 	// never opens it; every waiter also selects on context cancellation, so
 	// none of them are left parked.
 	postReady := make(chan struct{})
-	deferFleetWork := envOrDefault("VMD_DEFER_FLEET_WORK_UNTIL_READY", "true") != "false"
-	var poolStartGate <-chan struct{}
-	if deferFleetWork {
-		poolStartGate = postReady
-	} else {
-		close(postReady)
-	}
 
 	// ---- Pre-allocate network slots ----
 	// Warm buffer of network namespaces so creation claims off the hot path.
@@ -1430,7 +1423,7 @@ func main() {
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
 		NewSize:           netPoolFresh,
 		RecycleSize:       netPoolRecycle,
-		StartGate:         poolStartGate,
+		StartGate:         postReady,
 		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
 		AbandonOnStop:     adoptNetPool,
 	})
@@ -1760,9 +1753,7 @@ func main() {
 	// journald's rate limit. Anything published after this point can be
 	// dropped; the readiness line cannot, because the deploy readiness check
 	// reads it from the journal.
-	if deferFleetWork {
-		close(postReady)
-	}
+	close(postReady)
 
 	// Leak gauge for network namespaces — independent of the launcher path.
 	// Started AFTER readiness (and so after StartPool): its immediate first
