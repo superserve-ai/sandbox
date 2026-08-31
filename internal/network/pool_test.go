@@ -1254,7 +1254,7 @@ func TestGatedRefillDeclaresNoProducerBeforeRelease(t *testing.T) {
 	p := &Pool{log: zerolog.Nop(), stopCh: make(chan struct{}), startGate: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	p.wg.Add(1)
-	go p.refillLoop(ctx)
+	go p.refillLoop(ctx, 0)
 
 	time.Sleep(20 * time.Millisecond)
 	if got := p.refillActive.Load(); got != 0 {
@@ -1271,5 +1271,45 @@ func TestGatedRefillDeclaresNoProducerBeforeRelease(t *testing.T) {
 	}
 	if got := p.refillActive.Load(); got != 0 {
 		t.Fatalf("refillActive = %d after exit, want 0", got)
+	}
+}
+
+// A gated adoption pass holds the duplicate-start guard but must not read as
+// a producer while parked: a claimant that trusts it waits out the adoption
+// budget on work that has not begun.
+func TestGatedAdoptionNotProducingBeforeRelease(t *testing.T) {
+	gate := make(chan struct{})
+	p := &Pool{
+		log:               zerolog.Nop(),
+		stopCh:            make(chan struct{}),
+		startGate:         gate,
+		adoptEscapeStreak: defaultAdoptEscapeStreak,
+	}
+
+	if !p.StartAdoption(context.Background()) {
+		t.Fatal("first StartAdoption must claim the pass")
+	}
+	if p.StartAdoption(context.Background()) {
+		t.Fatal("duplicate StartAdoption must be refused while parked")
+	}
+	if p.adoptionTrusted() {
+		t.Fatal("a parked adoption pass must not be trusted")
+	}
+	if p.producing() {
+		t.Fatal("a parked adoption pass must not read as producing")
+	}
+
+	// Shutdown before the gate ever opens: the pass must resolve to idle so
+	// nothing later waits on it — and a fresh start must be claimable again.
+	close(p.stopCh)
+	waited := make(chan struct{})
+	go func() { p.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("parked adoption did not exit on stop")
+	}
+	if got := p.adoptPhase.Load(); got != adoptPhaseIdle {
+		t.Fatalf("adoptPhase = %d after stop, want idle", got)
 	}
 }

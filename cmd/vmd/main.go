@@ -213,19 +213,19 @@ func publishesCapacityPressure(advertiseAddr, controlPlaneURL string) bool {
 	return advertiseAddr != "" && controlPlaneURL != ""
 }
 
-// hostIPOnce memoizes hostInterfaceAddress. Both advertised endpoints derive
-// from the same interface, and the lookup dumps the host's interface and
-// address tables — tables that grow with every VM and pooled slot on the box
-// — so it runs at most once per process, and not at all when both endpoints
-// are configured explicitly.
-func hostIPOnce(interfaceName string) func() (string, error) {
+// hostIPOnce memoizes a host-address resolver. Both advertised endpoints
+// derive from the same interface, and the lookup dumps the host's interface
+// and address tables — tables that grow with every VM and pooled slot on the
+// box — so it runs at most once per process, and not at all when both
+// endpoints are configured explicitly.
+func hostIPOnce(resolve func() (string, error)) func() (string, error) {
 	var (
 		once sync.Once
 		ip   string
 		err  error
 	)
 	return func() (string, error) {
-		once.Do(func() { ip, err = hostInterfaceAddress(interfaceName) })
+		once.Do(func() { ip, err = resolve() })
 		return ip, err
 	}
 }
@@ -1623,7 +1623,7 @@ func main() {
 		// grows with the fleet. hostIP resolves at most once, and only if
 		// something actually needs it: two explicit advertise settings
 		// resolve nothing at all.
-		hostIP := hostIPOnce(cfg.HostInterface)
+		hostIP := hostIPOnce(func() (string, error) { return hostInterfaceAddress(cfg.HostInterface) })
 		// Pressure publication is wired ONLY on the explicit advertise
 		// setting — never on the resolved vmdAddr, which now falls back
 		// to deriving an address from the host interface. Keying on the

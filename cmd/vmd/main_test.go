@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -106,15 +105,7 @@ func TestAdvertisedAddrsShareOneHostLookup(t *testing.T) {
 		resolved++
 		return "10.0.0.3", nil
 	}
-	memo := func() func() (string, error) {
-		var once sync.Once
-		var ip string
-		var err error
-		return func() (string, error) {
-			once.Do(func() { ip, err = hostIP() })
-			return ip, err
-		}
-	}()
+	memo := hostIPOnce(hostIP)
 
 	vmdAddr, err := advertisedVMDAddr(memo, 50051, "")
 	if err != nil {
