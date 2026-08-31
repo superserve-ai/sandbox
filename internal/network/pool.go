@@ -352,28 +352,28 @@ func (p *Pool) yieldToForeground(ctx context.Context) {
 	}
 }
 
-// acquireBGSlot takes one background-concurrency token (and yields to any
-// in-flight foreground work first). Reports false on shutdown/cancellation.
-// A nil semaphore meters nothing — tests and legacy construction.
-func (p *Pool) acquireBGSlot(ctx context.Context) bool {
+// withBGSlot runs fn under one background-concurrency token, yielding to any
+// in-flight foreground work first. Reports false — without running fn — on
+// shutdown or cancellation. The token is released even when fn panics: the
+// workers' panic recovery keeps the daemon up, and a token leaked past it
+// would shrink the budget for the rest of the process's life. A nil
+// semaphore meters nothing — tests and legacy construction.
+func (p *Pool) withBGSlot(ctx context.Context, fn func()) bool {
 	p.yieldToForeground(ctx)
 	if p.bgSlotSem == nil {
+		fn()
 		return true
 	}
 	select {
 	case <-p.bgSlotSem:
-		return true
 	case <-p.stopCh:
 		return false
 	case <-ctx.Done():
 		return false
 	}
-}
-
-func (p *Pool) releaseBGSlot() {
-	if p.bgSlotSem != nil {
-		p.bgSlotSem <- struct{}{}
-	}
+	defer func() { p.bgSlotSem <- struct{}{} }()
+	fn()
+	return true
 }
 
 // rampBGSlots grants the background concurrency budget: everything at once
@@ -898,7 +898,18 @@ func (p *Pool) adoptFromReceipt(ctx context.Context, candidates []int) (remainin
 			defer workers.Done()
 			defer sentrylog.Recover("netpool-receipt-adopt")
 			for idx := range work {
-				slot, timedOut := p.fastAdoptVouched(idx, nsSet, vethSet, occupied)
+				// Metered like every other background slot path — "fast"
+				// is per-slot cost, not license to burst RTNL: on a clean
+				// restart this is the path that adopts most of the fleet.
+				// A refused token means shutdown; the index stays claimed
+				// for the next boot, like a mid-pass shutdown.
+				var slot *preallocSlot
+				var timedOut bool
+				if !p.withBGSlot(ctx, func() {
+					slot, timedOut = p.fastAdoptVouched(idx, nsSet, vethSet, occupied)
+				}) {
+					continue
+				}
 				if timedOut {
 					// The abandoned validator may still be mutating this
 					// namespace; the index must not re-enter ANY path this
@@ -1050,16 +1061,15 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 				defer workers.Done()
 				defer sentrylog.Recover("netpool-adopt")
 				for idx := range work {
-					// Metered by the shared background budget; a failed
-					// acquire means shutdown — the slot stays claimed in
+					// Metered by the shared background budget; a refused
+					// token means shutdown — the slot stays claimed in
 					// the kernel, the same abandoned state a mid-pass
 					// shutdown leaves for the next boot to adopt.
-					if !p.acquireBGSlot(ctx) {
+					if !p.withBGSlot(ctx, func() {
+						p.adoptOne(ctx, idx, &nAdopted, &nInvalid, &nSkipped, &nTimeouts)
+					}) {
 						nSkipped.Add(1)
-						continue
 					}
-					p.adoptOne(ctx, idx, &nAdopted, &nInvalid, &nSkipped, &nTimeouts)
-					p.releaseBGSlot()
 				}
 			}()
 		}
@@ -1441,11 +1451,11 @@ func (p *Pool) refillStep(ctx context.Context, deactivate func()) refillOutcome 
 	// Metered: the build is the RTNL-heavy part. The token is returned
 	// before the delivery send below — a worker parked on a full pool must
 	// not hold concurrency budget the other producers could use.
-	if !p.acquireBGSlot(ctx) {
+	var slot *preallocSlot
+	var err error
+	if !p.withBGSlot(ctx, func() { slot, err = p.allocate(ctx) }) {
 		return refillStopped
 	}
-	slot, err := p.allocate(ctx)
-	p.releaseBGSlot()
 	if err != nil {
 		if ctx.Err() != nil {
 			return refillStopped

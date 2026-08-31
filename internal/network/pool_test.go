@@ -1349,3 +1349,30 @@ func TestBGSlotBudgetRampsAfterGate(t *testing.T) {
 		t.Fatal("ramp feeder did not exit on stop")
 	}
 }
+
+// A panic inside metered work must not leak the token: the workers' panic
+// recovery keeps the daemon alive, and a leaked token would shrink the
+// background budget for the rest of the process's life.
+func TestWithBGSlotReturnsTokenOnPanic(t *testing.T) {
+	p := &Pool{
+		log:       zerolog.Nop(),
+		stopCh:    make(chan struct{}),
+		bgSlotSem: make(chan struct{}, 1),
+	}
+	p.bgSlotSem <- struct{}{} // full budget: one token
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected the panic to propagate")
+			}
+		}()
+		p.withBGSlot(context.Background(), func() { panic("boom") })
+	}()
+
+	select {
+	case <-p.bgSlotSem:
+	default:
+		t.Fatal("token not returned after panic")
+	}
+}
