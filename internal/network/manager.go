@@ -138,16 +138,11 @@ type Manager struct {
 	useNetlinkOps bool
 
 	// foregroundOps counts in-flight network operations a caller is actively
-	// waiting on: SetupVM (create) and EnsureVMSlot (resume rebuilding its
-	// retained slot). Background producers consult it to yield: every
-	// network mutation on the host serializes on the kernel's single RTNL
-	// lock, so a slot build running flat-out adds latency to whatever
-	// request-path operation is holding a caller open. Deliberately NOT
-	// counted: reattach (only ever called by the background startup pass)
-	// and cleanup (shared by request destroys and the reconciler's
-	// continuous background reaping — counting it would keep producers
-	// yielding to background churn). The counter is advisory — nothing
-	// blocks on it — and costs one atomic add per operation.
+	// waiting on — SetupVM (create) and EnsureVMSlot (resume) — so
+	// background producers can yield the RTNL lock to them. Deliberately
+	// NOT counted: reattach (only ever called by the background startup
+	// pass) and cleanup (shared with the reconciler's continuous reaping).
+	// Advisory only; nothing blocks on it.
 	foregroundOps atomic.Int64
 
 	mu      sync.Mutex

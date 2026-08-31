@@ -30,12 +30,10 @@ type PoolConfig struct {
 	// and the next process adopts the slots via AdoptOrphanSlots. Off by
 	// default (legacy teardown).
 	AbandonOnStop bool
-	// StartGate holds the refill and adoption workers until it is closed.
-	// Both walk the whole slot inventory over netlink, and every netlink
-	// operation takes the kernel's single global RTNL lock — so while they
-	// run, any other caller needing that lock queues behind them. Deferring
-	// them until the daemon can serve requests keeps work proportional to
-	// the fleet off the startup path. Nil starts them immediately.
+	// StartGate holds the refill and adoption workers until it is closed,
+	// keeping their RTNL-heavy inventory walks off the startup path (see
+	// the fleet-sized background work comment in cmd/vmd). Nil starts them
+	// immediately.
 	StartGate <-chan struct{}
 }
 
@@ -59,12 +57,9 @@ type Pool struct {
 	// never yield to the foreground while it is non-zero (the foreground is
 	// waiting on them).
 	claimWaiters atomic.Int64
-	// bgSlotSem meters concurrent background slot operations (adoption and
-	// refill share it). A gated pool starts it at one token and ramps to
-	// full over refillRampStep intervals, so the post-restart RTNL load
-	// arrives gradually across BOTH producers rather than as a burst of
-	// every worker at once. Nil (tests, ungated legacy construction) meters
-	// nothing.
+	// bgSlotSem is the shared concurrency budget for background slot work
+	// (adoption and refill together); rampBGSlots grants it. Nil meters
+	// nothing (tests).
 	bgSlotSem chan struct{}
 	wg        sync.WaitGroup
 	drainMu   sync.RWMutex
@@ -291,12 +286,9 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		// inline build against the imminent refill (the same synchronous
 		// publication StartAdoption makes for its phase). The worker inherits
 		// the declaration and relinquishes it on backoff, pause, or exit.
-		//
-		// Behind a start gate the refill is NOT imminent — nothing is built
-		// until the gate opens — so the declaration would make a claimant
-		// wait on a producer that has not started. There the worker declares
-		// itself once it is past the gate and genuinely producing, and a
-		// claimant arriving first correctly takes the bounded inline path.
+		// Behind a start gate the refill is NOT imminent, so the worker
+		// declares itself only once past the gate; a claimant arriving
+		// first correctly takes the bounded inline path.
 		if p.startGate == nil {
 			p.refillActive.Add(1)
 		}
@@ -326,12 +318,10 @@ func (p *Pool) waitForStart(ctx context.Context) bool {
 
 const (
 	// refillRampStep is the interval at which a gated pool's background
-	// concurrency budget (bgSlotSem) grows by one token after the gate
-	// opens. The gate opens at the same instant the daemon begins serving,
-	// and every slot operation competes with request-path work for the
-	// kernel's single RTNL lock — granting the whole budget at once would
-	// aim that contention exactly at the post-restart burst. Ungated pools
-	// (no restart in progress) get the full budget immediately.
+	// concurrency budget grows by one token after the gate opens — the gate
+	// opens the instant the daemon begins serving, so the budget arrives
+	// gradually instead of as a burst aimed at the first requests. Ungated
+	// pools get the full budget immediately.
 	refillRampStep = 2 * time.Second
 	// yieldPoll and yieldCapPerOp bound the foreground-priority pause a
 	// producer takes between slots. The cap keeps continuous request

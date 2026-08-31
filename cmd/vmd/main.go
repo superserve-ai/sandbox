@@ -1455,9 +1455,8 @@ func main() {
 	go func() {
 		defer sentrylog.Recover("startup reattach")
 		// Held until readiness: requests load their VM on demand, so nothing
-		// waits on this pass, while running it during startup both contends
-		// for RTNL and emits one line per record — enough, on a large host,
-		// to push the readiness line past journald's rate limit.
+		// waits on this pass (see the fleet-sized background work comment
+		// above for why it must not run during startup).
 		select {
 		case <-postReady:
 		case <-ctx.Done():
@@ -1748,11 +1747,9 @@ func main() {
 	startupReady.Store(true)
 	st.mark("ready", true, -1)
 	log.Info().Msg("startup complete — gRPC serving requests")
-	// Released only after the readiness line is emitted: the work behind it
-	// logs per record, and on a large host that burst is enough to exhaust
-	// journald's rate limit. Anything published after this point can be
-	// dropped; the readiness line cannot, because the deploy readiness check
-	// reads it from the journal.
+	// Released only after the readiness line is emitted: the deploy
+	// readiness check reads that line from the journal, so nothing the
+	// background work logs may come ahead of it.
 	close(postReady)
 
 	// Leak gauge for network namespaces — independent of the launcher path.
