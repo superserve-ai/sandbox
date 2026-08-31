@@ -137,13 +137,17 @@ type Manager struct {
 	// useNetlinkOps selects the netlink backend at construction.
 	useNetlinkOps bool
 
-	// foregroundOps counts in-flight request-path network operations
-	// (SetupVM, ReattachVM, cleanup). Background producers consult it to
-	// yield: every network mutation on the host serializes on the kernel's
-	// single RTNL lock, so a slot build running flat-out adds latency to
-	// whatever request-path operation is holding a caller open. The counter
-	// is advisory — nothing blocks on it — and it costs one atomic add per
-	// operation.
+	// foregroundOps counts in-flight network operations a caller is actively
+	// waiting on: SetupVM (create) and EnsureVMSlot (resume rebuilding its
+	// retained slot). Background producers consult it to yield: every
+	// network mutation on the host serializes on the kernel's single RTNL
+	// lock, so a slot build running flat-out adds latency to whatever
+	// request-path operation is holding a caller open. Deliberately NOT
+	// counted: reattach (only ever called by the background startup pass)
+	// and cleanup (shared by request destroys and the reconciler's
+	// continuous background reaping — counting it would keep producers
+	// yielding to background churn). The counter is advisory — nothing
+	// blocks on it — and costs one atomic add per operation.
 	foregroundOps atomic.Int64
 
 	mu      sync.Mutex
@@ -627,8 +631,10 @@ func (m *Manager) CleanupVM(vmID string) { m.cleanupVM(vmID, true) }
 func (m *Manager) TeardownVM(vmID string) { m.cleanupVM(vmID, false) }
 
 func (m *Manager) cleanupVM(vmID string, recycle bool) {
-	m.foregroundOps.Add(1)
-	defer m.foregroundOps.Add(-1)
+	// Not counted in foregroundOps: reached from request destroys AND from
+	// the reconciler's background reaping through the same entry points, and
+	// the reconciler churns continuously — counting it would keep producers
+	// yielding to background work.
 	m.mu.Lock()
 	info, ok := m.devices[vmID]
 	if ok {
@@ -812,8 +818,9 @@ func (m *Manager) Forget(vmID string) {
 // customer's subsequent UpdateFirewallRules calls apply to the existing
 // kernel state.
 func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
-	m.foregroundOps.Add(1)
-	defer m.foregroundOps.Add(-1)
+	// Not counted in foregroundOps: the only caller is the startup reattach
+	// pass, which is itself background work — counting it would make the
+	// producers yield to each other.
 	idx, ok := slotFromNamespace(namespace)
 	if !ok {
 		return fmt.Errorf("reattach %s: cannot parse slot from namespace %q", vmID, namespace)
@@ -903,6 +910,8 @@ func (m *Manager) ReserveSlotsAbove(reservations map[string]string) {
 // so a rebuild preserves the VM's network identity. Per-customer egress
 // rules are NOT restored here; the caller reapplies them.
 func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, macAddress string) (*VMNetInfo, error) {
+	m.foregroundOps.Add(1)
+	defer m.foregroundOps.Add(-1)
 	idx, ok := slotFromNamespace(namespace)
 	if !ok {
 		return nil, fmt.Errorf("ensure %s: cannot parse slot from namespace %q", vmID, namespace)

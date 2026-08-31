@@ -4518,12 +4518,11 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			inst.Supervision = fresh.Supervision
 			inst.mu.Unlock()
 		}
-		// Debug, not Info: paused records dominate a large host's store, and
-		// one line per record is enough volume to trip journald's rate limit
-		// and suppress whatever the daemon logs next — including request
-		// errors. The pass already logs its count up front and its totals on
-		// completion; per-record detail is for debugging, not the journal.
-		log.Debug().Msg("reattached paused VM")
+		// Deliberately no per-record log: paused records dominate a large
+		// host's store, and one line per record is enough volume to trip
+		// journald's rate limit and suppress whatever the daemon logs next —
+		// including request errors. The pass logs its count up front and its
+		// totals on completion; anomalies on this path log above.
 	} else {
 		// Only a deletion undoes the reattach (see persistStateIfPresent).
 		if wrote, perr := m.persistStateIfPresent(inst); perr == nil && !wrote {

@@ -1254,7 +1254,7 @@ func TestGatedRefillDeclaresNoProducerBeforeRelease(t *testing.T) {
 	p := &Pool{log: zerolog.Nop(), stopCh: make(chan struct{}), startGate: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	p.wg.Add(1)
-	go p.refillLoop(ctx, 0)
+	go p.refillLoop(ctx)
 
 	time.Sleep(20 * time.Millisecond)
 	if got := p.refillActive.Load(); got != 0 {
@@ -1311,5 +1311,41 @@ func TestGatedAdoptionNotProducingBeforeRelease(t *testing.T) {
 	}
 	if got := p.adoptPhase.Load(); got != adoptPhaseIdle {
 		t.Fatalf("adoptPhase = %d after stop, want idle", got)
+	}
+}
+
+// The background concurrency budget stays at zero while the gate is closed,
+// grants its first token promptly on release, and its feeder joins cleanly on
+// stop mid-ramp.
+func TestBGSlotBudgetRampsAfterGate(t *testing.T) {
+	gate := make(chan struct{})
+	p := &Pool{
+		log:       zerolog.Nop(),
+		stopCh:    make(chan struct{}),
+		startGate: gate,
+		bgSlotSem: make(chan struct{}, 3),
+	}
+	p.wg.Add(1)
+	go p.rampBGSlots(context.Background(), 3)
+
+	time.Sleep(20 * time.Millisecond)
+	if got := len(p.bgSlotSem); got != 0 {
+		t.Fatalf("budget = %d tokens while gated, want 0", got)
+	}
+
+	close(gate)
+	select {
+	case <-p.bgSlotSem:
+	case <-time.After(time.Second):
+		t.Fatal("no token granted after the gate opened")
+	}
+
+	close(p.stopCh)
+	waited := make(chan struct{})
+	go func() { p.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("ramp feeder did not exit on stop")
 	}
 }
