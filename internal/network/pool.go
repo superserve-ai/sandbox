@@ -360,6 +360,17 @@ func (p *Pool) yieldToForeground(ctx context.Context) {
 // semaphore meters nothing — tests and legacy construction.
 func (p *Pool) withBGSlot(ctx context.Context, fn func()) bool {
 	p.yieldToForeground(ctx)
+	// Checked before the select: with a token and a cancellation both
+	// ready, select would pick arms at random and could start one more
+	// operation into a shutdown.
+	select {
+	case <-p.stopCh:
+		return false
+	default:
+	}
+	if ctx.Err() != nil {
+		return false
+	}
 	if p.bgSlotSem == nil {
 		fn()
 		return true
