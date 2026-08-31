@@ -7,6 +7,7 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -140,6 +141,84 @@ func (q *Queries) GetSnapshotByID(ctx context.Context, id uuid.UUID) (Snapshot, 
 		&i.Generation,
 		&i.Name,
 		&i.PauseToken,
+	)
+	return i, err
+}
+
+const getSnapshotForResume = `-- name: GetSnapshotForResume :one
+SELECT s.id, s.sandbox_id, s.team_id, s.path, s.size_bytes, s.trigger,
+       s.created_at, s.mem_path, s.generation, s.name, s.pause_token,
+       COALESCE((SELECT bg.generation FROM backup_generation bg
+        WHERE bg.sandbox_id = s.sandbox_id
+          AND bg.covered_snapshot_id = s.id
+          AND bg.covered_snapshot_generation = s.generation
+        ORDER BY bg.reported_at DESC
+        LIMIT 1), ''::text)::text AS covered_backup_generation
+FROM snapshot s
+WHERE s.id = $1 AND s.team_id = $2
+`
+
+type GetSnapshotForResumeParams struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+}
+
+type GetSnapshotForResumeRow struct {
+	ID                      uuid.UUID `json:"id"`
+	SandboxID               uuid.UUID `json:"sandbox_id"`
+	TeamID                  uuid.UUID `json:"team_id"`
+	Path                    string    `json:"path"`
+	SizeBytes               int64     `json:"size_bytes"`
+	Trigger                 string    `json:"trigger"`
+	CreatedAt               time.Time `json:"created_at"`
+	MemPath                 *string   `json:"mem_path"`
+	Generation              int64     `json:"generation"`
+	Name                    *string   `json:"name"`
+	PauseToken              *string   `json:"pause_token"`
+	CoveredBackupGeneration string    `json:"covered_backup_generation"`
+}
+
+// GetSnapshot's resume-path variant: the same team-scoped snapshot row,
+// plus the sandbox's backup generation VERIFIED to cover this exact
+// snapshot, in one round trip rather than a second query on resume's
+// latency-sensitive path.
+//
+// CoveredBackupGeneration is deliberately NOT "the sandbox's latest
+// backup" (that can be a stale, unrelated generation from a pause the
+// current one has already superseded — see paused_unbacked_count's
+// identical join in hosts.sql for the same reasoning). The
+// covered_snapshot_id/covered_snapshot_generation link is written by the
+// report handler under the sandbox row lock only once a report's
+// manifest is verified against THIS snapshot row, so a match here names
+// a generation actually safe to restore for it. NULL — no report has
+// verified coverage of this pause yet — is the common case and means
+// fetch-before-resume has nothing to offer for this resume, not an
+// error.
+//
+// Scalar subquery, not a JOIN: backup_generation's real uniqueness is
+// (sandbox_id, bucket, generation), not the covered_snapshot link, so a
+// JOIN could in principle multiply this :one query's row count; LIMIT 1
+// keeps the contract regardless. COALESCE to ” rather than leaving the
+// subquery NULL: sqlc can't infer this expression's nullability, so an
+// un-coalesced NULL would generate a non-pointer string field pgx then
+// fails to scan a NULL into — ” is also this codebase's existing "no
+// generation" sentinel, so callers need no NULL-specific handling.
+func (q *Queries) GetSnapshotForResume(ctx context.Context, arg GetSnapshotForResumeParams) (GetSnapshotForResumeRow, error) {
+	row := q.db.QueryRow(ctx, getSnapshotForResume, arg.ID, arg.TeamID)
+	var i GetSnapshotForResumeRow
+	err := row.Scan(
+		&i.ID,
+		&i.SandboxID,
+		&i.TeamID,
+		&i.Path,
+		&i.SizeBytes,
+		&i.Trigger,
+		&i.CreatedAt,
+		&i.MemPath,
+		&i.Generation,
+		&i.Name,
+		&i.PauseToken,
+		&i.CoveredBackupGeneration,
 	)
 	return i, err
 }

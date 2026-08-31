@@ -19,6 +19,8 @@ func TestBackupRecorderNilSafe(t *testing.T) {
 	r.RecordHashDuration(ctx, time.Second)
 	r.RecordStageDuration(ctx, time.Second)
 	r.RecordPauseHookDuration(ctx, time.Second)
+	r.RecordFetch(ctx, true, time.Second)
+	r.AddFetchBytes(ctx, 1024)
 	r.AddNotifyFailure(ctx)
 	r.RecordSample(ctx, BackupSample{Enabled: true})
 	if err := r.Shutdown(ctx); err != nil {

@@ -382,6 +382,26 @@ message ResumeVMRequest {
   map<string, string> env_vars = 5;          // Re-inject env vars after resume.
   reserved 6;                                 // was secrets_broker (SecretsBrokerConfig)
   reserved "secrets_broker";
+  // Generation and FcSha256 below ride proto/vmdpb's unknown-field
+  // compatibility shim (see resume_compat.go, the same pattern
+  // build_status_compat.go uses for GetBuildStatusResponse) rather than
+  // a full protoc regeneration, so this change doesn't collide with
+  // other already-declared-but-not-yet-regenerated fields in this file.
+  //
+  // Generation is the backup generation the control plane's coverage
+  // record believes is durable for this sandbox, e.g. from a
+  // LatestSandboxBackup lookup. Set only when the caller wants
+  // fetch-before-resume available; empty means "use whatever's on local
+  // disk, fail the normal way if it's missing". Naming the exact
+  // generation up front means a host with fetch-before-resume enabled
+  // never has to list the bucket to guess one on the resume hot path.
+  string generation = 7;
+  // FcSha256 would let a fetching host verify a generation was captured
+  // with a Firecracker build compatible with its own before trusting a
+  // cross-host restore. Left empty: nothing in this system attests a
+  // host's build today, so a fetching host cannot yet act on this field
+  // and treats it as absent rather than refusing every fetch.
+  string fc_sha256 = 8;
 }
 
 message ResumeVMResponse {

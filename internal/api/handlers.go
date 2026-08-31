@@ -853,19 +853,27 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
-	snapshot, err := h.DB.GetSnapshot(c.Request.Context(), db.GetSnapshotParams{
+	// GetSnapshotForResume folds in the sandbox's backup generation
+	// verified to cover THIS snapshot (see its doc comment) so naming a
+	// fetch-before-resume generation costs no extra round trip beyond the
+	// snapshot lookup this path already needed.
+	snapshot, err := h.DB.GetSnapshotForResume(c.Request.Context(), db.GetSnapshotForResumeParams{
 		ID:     sandbox.SnapshotID.Bytes,
 		TeamID: teamID,
 	})
 	if err != nil {
-		l.Error().Err(err).Msg("DB GetSnapshot failed")
+		l.Error().Err(err).Msg("DB GetSnapshotForResume failed")
 		revertToPaused()
 		respondError(c, ErrInternal)
 		return "", false
 	}
 
 	snapshotPath := snapshot.Path
-	memPath := resolveMemPath(snapshot)
+	memPath := resolveMemPath(snapshot.Path, snapshot.MemPath)
+	// "" (the common case: no report has verified a backup against this
+	// exact pause yet) tells a fetch-before-resume-enabled vmd host there
+	// is nothing to fetch, identical to today's behavior.
+	resumeGeneration := snapshot.CoveredBackupGeneration
 
 	// Overlay-mode sandboxes need basePath for the mount-namespace symlink.
 	// Read sandbox.base_path first (pinned at create) so a template rebuild
@@ -902,7 +910,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdBootTimeout)
 	defer bootCancel()
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), sandbox.HostID, func(ctx context.Context) (string, uint32, uint32, error) {
-		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig)
+		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig, resumeGeneration)
 	})
 	if err != nil {
 		if isVMDNotFound(err) {
@@ -1113,14 +1121,17 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	return currentPolicy.Access, true
 }
 
-// resolveMemPath returns the memory snapshot path from a Snapshot record.
-// Uses the stored mem_path column if set, otherwise falls back to the
-// convention of placing mem.snap alongside the vmstate snapshot.
-func resolveMemPath(snap db.Snapshot) string {
-	if snap.MemPath != nil && *snap.MemPath != "" {
-		return *snap.MemPath
+// resolveMemPath returns the memory snapshot path given a snapshot row's
+// path and mem_path column (both GetSnapshot and GetSnapshotForResume
+// carry these, under different row types, hence the plain-value
+// signature instead of a Snapshot record). Uses the stored mem_path
+// column if set, otherwise falls back to the convention of placing
+// mem.snap alongside the vmstate snapshot.
+func resolveMemPath(path string, memPath *string) string {
+	if memPath != nil && *memPath != "" {
+		return *memPath
 	}
-	return filepath.Join(filepath.Dir(snap.Path), "mem.snap")
+	return filepath.Join(filepath.Dir(path), "mem.snap")
 }
 
 // persistedEgressConfig mirrors the jsonb shape stored in sandbox.network_config.

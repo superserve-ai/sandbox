@@ -88,6 +88,9 @@ type BackupRecorder struct {
 	stageDuration     metric.Float64Histogram
 	uploadDuration    metric.Float64Histogram
 	pauseHookDuration metric.Float64Histogram
+	fetches           metric.Int64Counter
+	fetchBytes        metric.Int64Counter
+	fetchDuration     metric.Float64Histogram
 }
 
 // Explicit histogram boundaries: the SDK defaults top out at 10 and were
@@ -181,6 +184,16 @@ func NewBackupRecorderWithProvider(provider *sdkmetric.MeterProvider, cfg Backup
 		metric.WithExplicitBucketBoundaries(backupFastBuckets...)); err != nil {
 		return nil, err
 	}
+	if r.fetches, err = meter.Int64Counter("backup_fetch_total"); err != nil {
+		return nil, err
+	}
+	if r.fetchBytes, err = meter.Int64Counter("backup_fetch_bytes_total"); err != nil {
+		return nil, err
+	}
+	if r.fetchDuration, err = meter.Float64Histogram("backup_fetch_duration_seconds",
+		metric.WithExplicitBucketBoundaries(backupSlowBuckets...)); err != nil {
+		return nil, err
+	}
 	return r, nil
 }
 
@@ -237,6 +250,37 @@ func (r *BackupRecorder) RecordPauseHookDuration(ctx context.Context, d time.Dur
 		return
 	}
 	r.pauseHookDuration.Record(ctx, d.Seconds(), metric.WithAttributes(r.attrs()...))
+}
+
+// RecordFetch counts one fetch-before-resume attempt (a resume that found
+// its snapshot missing on local disk and restored it from the bucket
+// instead of hard-failing) and its wall time, split by outcome so a spike
+// of failed fetches — e.g. a reconnect storm outrunning the semaphore's
+// deadline budget — is visible next to the warm-resume baseline this rides
+// alongside in the resume phase timings.
+func (r *BackupRecorder) RecordFetch(ctx context.Context, ok bool, d time.Duration) {
+	if r == nil {
+		return
+	}
+	result := "failed"
+	if ok {
+		result = "succeeded"
+	}
+	opt := metric.WithAttributes(r.attrs(attribute.String("result", result))...)
+	r.fetches.Add(ctx, 1, opt)
+	if d >= 0 {
+		r.fetchDuration.Record(ctx, d.Seconds(), opt)
+	}
+}
+
+// AddFetchBytes counts apparent bytes a resume fetch restored from the
+// bucket (a partial failure still counts whatever was placed on disk
+// before it gave up).
+func (r *BackupRecorder) AddFetchBytes(ctx context.Context, n int64) {
+	if r == nil || n <= 0 {
+		return
+	}
+	r.fetchBytes.Add(ctx, n, metric.WithAttributes(r.attrs()...))
 }
 
 // AddNotifyFailure counts one failed completion-notification delivery

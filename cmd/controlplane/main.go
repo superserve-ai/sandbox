@@ -468,12 +468,16 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir, pa
 	return resp.SnapshotPath, resp.MemFilePath, manifest, acked, nil
 }
 
-func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, networkConfig []byte) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, networkConfig []byte, generation string) (string, uint32, uint32, error) {
 	req := &vmdpb.ResumeVMRequest{
 		VmId:         vmID,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
 	}
+	// Rides the unknown-field compatibility shim (see
+	// proto/vmdpb/resume_compat.go); "" is the common case (fetch-before-resume
+	// off, or no durable backup on record) and SetGeneration is a no-op for it.
+	req.SetGeneration(generation)
 	if len(networkConfig) > 0 {
 		var persisted struct {
 			Egress struct {

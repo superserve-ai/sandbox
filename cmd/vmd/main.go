@@ -1031,6 +1031,24 @@ func main() {
 			log.Fatal().Err(err).Msg("failed to create GCS client for backup")
 		}
 		lc.addCloser("backup gcs client", func(_ context.Context) error { return gcsClient.Close() })
+
+		// ---- Fetch-before-resume ----
+		// Off by default: a resume whose local disk already holds the
+		// paused sandbox's artifacts (the overwhelming common case) never
+		// touches this. When enabled, a resume that finds them missing —
+		// host replaced, data disk wiped — restores the generation the
+		// control plane names from this same bucket instead of hard-failing.
+		// Reuses gcsClient/bucket rather than a second client: fetch reads
+		// from exactly the bucket this host's own uploads (if any) write to.
+		if os.Getenv("VMD_FETCH_ON_RESUME") == "true" {
+			fetchConcurrency, _ := strconv.Atoi(envOrDefault("VMD_FETCH_ON_RESUME_CONCURRENCY", "4"))
+			if fetchConcurrency < 1 {
+				fetchConcurrency = 4
+			}
+			mgr.SetResumeFetch(backup.NewGCSReader(gcsClient, bucket), fetchConcurrency)
+			log.Info().Int("concurrency", fetchConcurrency).Msg("fetch-on-resume enabled")
+		}
+
 		mbps, _ := strconv.Atoi(envOrDefault("BACKUP_BANDWIDTH_MBPS", "100"))
 		if mbps <= 0 {
 			mbps = 100
