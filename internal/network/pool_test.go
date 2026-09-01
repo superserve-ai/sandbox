@@ -1383,3 +1383,559 @@ func TestWithBGSlotReturnsTokenOnPanic(t *testing.T) {
 		t.Fatal("token not returned after panic")
 	}
 }
+
+// Adoption owns the startup deficit; refill is the fallback. While a boot
+// adoption pass is planned but unresolved, a refill worker must not get past
+// the handoff — otherwise both producers solve the same deficit and refill
+// rebuilds, at full cost, the very slots adoption is restoring.
+func TestRefillDefersToStartupAdoption(t *testing.T) {
+	newPool := func() *Pool {
+		return &Pool{
+			log:                 zerolog.Nop(),
+			stopCh:              make(chan struct{}),
+			startGate:           make(chan struct{}),
+			startupAdoptionDone: make(chan struct{}),
+			adoptEscapeStreak:   defaultAdoptEscapeStreak,
+		}
+	}
+
+	t.Run("no pass planned: immediate", func(t *testing.T) {
+		p := newPool()
+		if !p.waitForStartupAdoption(context.Background()) {
+			t.Fatal("refill must proceed when no boot adoption was planned")
+		}
+	})
+
+	t.Run("nil handoff channel: immediate", func(t *testing.T) {
+		p := &Pool{log: zerolog.Nop(), stopCh: make(chan struct{})}
+		p.startupAdoptionPlanned.Store(true)
+		if !p.waitForStartupAdoption(context.Background()) {
+			t.Fatal("a pool without a handoff channel has no waiters to hold")
+		}
+	})
+
+	t.Run("planned pass holds refill until resolved", func(t *testing.T) {
+		p := newPool()
+		if !p.StartAdoption(context.Background()) {
+			t.Fatal("StartAdoption must claim the pass")
+		}
+		done := make(chan bool, 1)
+		go func() { done <- p.waitForStartupAdoption(context.Background()) }()
+		select {
+		case <-done:
+			t.Fatal("refill released while the pass was still parked")
+		case <-time.After(20 * time.Millisecond):
+		}
+		// The pass is parked behind the never-opened gate; stopping resolves
+		// the handoff through the unconditional defer.
+		close(p.stopCh)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("handoff never resolved after the pass exited")
+		}
+	})
+
+	t.Run("refill worker allocates nothing before handoff", func(t *testing.T) {
+		gate := make(chan struct{})
+		p := newPool()
+		p.startGate = gate
+		p.startupAdoptionPlanned.Store(true)
+		ctx, cancel := context.WithCancel(context.Background())
+		p.wg.Add(1)
+		go p.refillLoop(ctx)
+
+		close(gate) // gate opens; handoff still unresolved
+		time.Sleep(20 * time.Millisecond)
+		// Past the handoff the worker's first act is declaring refillActive;
+		// zero means it never reached the build loop, so no allocation was
+		// possible.
+		if got := p.refillActive.Load(); got != 0 {
+			t.Fatalf("refillActive = %d while adoption unresolved, want 0", got)
+		}
+
+		cancel()
+		waited := make(chan struct{})
+		go func() { p.wg.Wait(); close(waited) }()
+		select {
+		case <-waited:
+		case <-time.After(time.Second):
+			t.Fatal("parked refill worker did not exit on cancellation")
+		}
+	})
+
+	t.Run("cancellation resolves the handoff", func(t *testing.T) {
+		p := newPool()
+		ctx, cancel := context.WithCancel(context.Background())
+		if !p.StartAdoption(ctx) {
+			t.Fatal("StartAdoption must claim the pass")
+		}
+		cancel() // pass parked behind the gate exits via ctx
+		select {
+		case <-p.startupAdoptionDone:
+		case <-time.After(time.Second):
+			t.Fatal("handoff unresolved after cancellation")
+		}
+		// Idempotent: repeated finishes must not panic.
+		p.finishStartupAdoption()
+		p.finishStartupAdoption()
+	})
+}
+
+// stubPoolAllocate replaces fresh slot construction with a counter that
+// returns inert slots (nil info short-circuits every cleanup path), so tests
+// can measure exactly how many builds refill performs.
+func stubPoolAllocate(t *testing.T) *atomic.Int64 {
+	t.Helper()
+	var builds atomic.Int64
+	old := poolAllocateFunc
+	poolAllocateFunc = func(p *Pool, ctx context.Context) (*preallocSlot, error) {
+		builds.Add(1)
+		return &preallocSlot{idx: int(builds.Load())}, nil
+	}
+	t.Cleanup(func() { poolAllocateFunc = old })
+	return &builds
+}
+
+// The incident regression: after a recovery pass that restores the whole
+// pool, refill must build at most one in-hand slot per worker — never the
+// pool-sized burst the producer race caused. With K slots consumed during
+// recovery, the bound is K plus the worker count.
+func TestRefillBuildsOnlyTheDeficitAfterAdoption(t *testing.T) {
+	const capacity, workers, claimed = 8, 4, 3
+	for _, tc := range []struct {
+		name     string
+		consume  int
+		maxBuild int64
+	}{
+		{"perfect recovery, no claims", 0, workers},
+		{"perfect recovery, K claims", claimed, claimed + workers},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			builds := stubPoolAllocate(t)
+			gate := make(chan struct{})
+			p := &Pool{
+				mgr:                 &Manager{}, // yieldToForeground reads its counters
+				log:                 zerolog.Nop(),
+				newSize:             capacity,
+				fresh:               make(chan *preallocSlot, capacity),
+				recycled:            make(chan *preallocSlot, capacity),
+				stopCh:              make(chan struct{}),
+				startGate:           gate,
+				startupAdoptionDone: make(chan struct{}),
+				refillDrainGate:     make(chan struct{}),
+				adoptEscapeStreak:   defaultAdoptEscapeStreak,
+			}
+			p.startupAdoptionPlanned.Store(true)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			for i := 0; i < workers; i++ {
+				p.wg.Add(1)
+				go p.refillLoop(ctx)
+			}
+
+			close(gate)
+			time.Sleep(20 * time.Millisecond)
+			if got := builds.Load(); got != 0 {
+				t.Fatalf("refill built %d slots before the handoff, want 0", got)
+			}
+
+			// The recovery pass restores the full pool, minus what claims
+			// consumed while it ran, then hands off.
+			for i := 0; i < capacity-tc.consume; i++ {
+				p.fresh <- &preallocSlot{idx: 1000 + i}
+			}
+			p.finishStartupAdoption()
+
+			deadline := time.After(2 * time.Second)
+			for len(p.fresh) < capacity {
+				select {
+				case <-deadline:
+					t.Fatalf("pool never refilled: fresh=%d builds=%d", len(p.fresh), builds.Load())
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+			time.Sleep(50 * time.Millisecond) // let parked overshoot settle
+			if got := builds.Load(); got > tc.maxBuild {
+				t.Fatalf("refill built %d slots, want <= %d", got, tc.maxBuild)
+			}
+
+			close(p.stopCh)
+			waited := make(chan struct{})
+			go func() { p.wg.Wait(); close(waited) }()
+			select {
+			case <-waited:
+			case <-time.After(2 * time.Second):
+				t.Fatal("workers did not join after stop")
+			}
+		})
+	}
+
+	// The receiptless-restart shape: full adoption places everything it
+	// recovers into the recycled channel, and none of it into fresh. That
+	// inventory serves claims just as well, so refill must build nothing.
+	t.Run("recovery into recycled only", func(t *testing.T) {
+		builds := stubPoolAllocate(t)
+		gate := make(chan struct{})
+		p := &Pool{
+			mgr:                 &Manager{},
+			log:                 zerolog.Nop(),
+			newSize:             capacity,
+			fresh:               make(chan *preallocSlot, capacity),
+			recycled:            make(chan *preallocSlot, capacity),
+			stopCh:              make(chan struct{}),
+			startGate:           gate,
+			startupAdoptionDone: make(chan struct{}),
+			refillDrainGate:     make(chan struct{}),
+			adoptEscapeStreak:   defaultAdoptEscapeStreak,
+		}
+		p.startupAdoptionPlanned.Store(true)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		for i := 0; i < workers; i++ {
+			p.wg.Add(1)
+			go p.refillLoop(ctx)
+		}
+
+		close(gate)
+		for i := 0; i < capacity; i++ {
+			p.recycled <- &preallocSlot{idx: 2000 + i, adopted: true}
+		}
+		p.finishStartupAdoption()
+
+		time.Sleep(100 * time.Millisecond)
+		if got := builds.Load(); got != 0 {
+			t.Fatalf("refill built %d slots atop a fully recycled recovery, want 0", got)
+		}
+		if got := len(p.fresh); got != 0 {
+			t.Fatalf("fresh holds %d slots, want 0 — inventory already at target", got)
+		}
+
+		close(p.stopCh)
+		waited := make(chan struct{})
+		go func() { p.wg.Wait(); close(waited) }()
+		select {
+		case <-waited:
+		case <-time.After(2 * time.Second):
+			t.Fatal("workers did not join after stop")
+		}
+	})
+}
+
+// A claim that opens a deficit must wake held refill workers immediately —
+// not on the next hold poll — so a claimant arriving behind a burst finds a
+// producer instead of falling back to an inline build.
+func TestClaimWakesHeldRefillWorkers(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	builds := stubPoolAllocate(t)
+
+	const capacity = 2
+	p := &Pool{
+		mgr:               m,
+		log:               zerolog.Nop(),
+		newSize:           capacity,
+		fresh:             make(chan *preallocSlot, capacity),
+		recycled:          make(chan *preallocSlot, capacity),
+		stopCh:            make(chan struct{}),
+		refillWake:        make(chan struct{}, 1),
+		refillDrainGate:   make(chan struct{}),
+		adoptEscapeStreak: defaultAdoptEscapeStreak,
+	}
+	for i := 0; i < capacity; i++ {
+		ns := fmt.Sprintf("ns-%d", i)
+		touchNS(t, dir, ns)
+		m.assignSlotLocked(i, poolOwner)
+		p.fresh <- &preallocSlot{idx: i, info: &VMNetInfo{Namespace: ns}}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.refillActive.Add(1) // ungated declaration, mirroring StartPool
+	p.wg.Add(1)
+	go p.refillLoop(ctx)
+
+	time.Sleep(30 * time.Millisecond) // worker reaches the hold at target
+	if got := builds.Load(); got != 0 {
+		t.Fatalf("refill built %d slots at target, want 0", got)
+	}
+	// Held is visible to claimants but NOT to the provisioning floor: a
+	// claimant racing the wake must see a producer, while the heartbeat
+	// must not report a settled worker as in-flight work.
+	if got := p.refillHeld.Load(); got != 1 {
+		t.Fatalf("refillHeld = %d while held at target, want 1", got)
+	}
+	if got := p.refillActive.Load(); got != 0 {
+		t.Fatalf("refillActive = %d while held at target, want 0 (held is not provisioning)", got)
+	}
+	if !p.producing() {
+		t.Fatal("held worker must still read as a producer to claimants")
+	}
+
+	if info := p.Claim("vm-wake"); info == nil {
+		t.Fatal("claim from a stocked pool failed")
+	}
+	deadline := time.After(200 * time.Millisecond) // well under refillHoldPoll
+	for builds.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("no build within 200ms of the deficit — the wake never fired")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	close(p.stopCh)
+	waited := make(chan struct{})
+	go func() { p.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not join after stop")
+	}
+}
+
+// A drain deeper than one slot must wake held workers in proportion: every
+// deficit-opening claim deposits its own wake token, so a burst releases the
+// crew rather than one worker. A coalescing single-token channel would
+// serialize refill behind one worker for up to a hold poll, exactly when
+// concurrency matters most.
+func TestEachDeficitClaimDepositsAWakeToken(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+
+	const capacity, crew = 4, 3
+	p := &Pool{
+		mgr:               m,
+		log:               zerolog.Nop(),
+		newSize:           capacity,
+		fresh:             make(chan *preallocSlot, capacity),
+		recycled:          make(chan *preallocSlot, capacity),
+		stopCh:            make(chan struct{}),
+		refillWake:        make(chan struct{}, crew),
+		refillDrainGate:   make(chan struct{}),
+		adoptEscapeStreak: defaultAdoptEscapeStreak,
+	}
+	for i := 0; i < capacity; i++ {
+		ns := fmt.Sprintf("ns-%d", i)
+		touchNS(t, dir, ns)
+		m.assignSlotLocked(i, poolOwner)
+		p.fresh <- &preallocSlot{idx: i, info: &VMNetInfo{Namespace: ns}}
+	}
+
+	// No workers running: the tokens accumulate, making the per-claim
+	// deposit directly observable.
+	for i := 0; i < capacity; i++ {
+		if info := p.Claim(fmt.Sprintf("vm-drain-%d", i)); info == nil {
+			t.Fatalf("claim %d from a stocked pool failed", i)
+		}
+	}
+	// Every claim opened or deepened the deficit; each must have deposited
+	// a token, saturating the crew-sized channel — not coalescing to one.
+	if got := len(p.refillWake); got != crew {
+		t.Fatalf("wake tokens = %d after draining the pool, want %d (one per held worker)", got, crew)
+	}
+}
+
+// A claimant that outlived a trusted adoption pass gets the pool budget
+// re-anchored at the handoff: its wait so far was spent on adoption, and
+// backdating the shorter refill budget to its arrival would make it bail to
+// an inline build at the exact moment refill becomes available.
+func TestClaimBudgetReanchorsAtHandoff(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+
+	p := &Pool{
+		mgr:                 m,
+		log:                 zerolog.Nop(),
+		newSize:             2,
+		fresh:               make(chan *preallocSlot, 2),
+		recycled:            make(chan *preallocSlot, 2),
+		stopCh:              make(chan struct{}),
+		startGate:           make(chan struct{}),
+		startupAdoptionDone: make(chan struct{}),
+		adoptEscapeStreak:   defaultAdoptEscapeStreak,
+	}
+	p.startupAdoptionPlanned.Store(true)
+	p.adoptPhase.Store(adoptPhaseScanning) // trusted pass under way
+
+	got := make(chan *VMNetInfo, 1)
+	go func() { got <- p.ClaimWait(context.Background(), "vm-late") }()
+
+	// The claimant waits out more than the whole pool budget under the
+	// trusted pass, then the pass hands off with the pool still empty.
+	time.Sleep(poolClaimWaitBudget + 200*time.Millisecond)
+	p.finishStartupAdoption() // bridge up, resolvedAt stamped
+	p.adoptPhase.Store(adoptPhaseIdle)
+	p.signalProgress()
+
+	// Refill "delivers" shortly after the handoff — well inside the
+	// re-anchored pool budget, far outside the backdated one.
+	time.Sleep(300 * time.Millisecond)
+	touchNS(t, dir, "ns-late")
+	m.assignSlotLocked(1, poolOwner)
+	p.fresh <- &preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-late"}}
+	p.signalProgress()
+
+	select {
+	case info := <-got:
+		if info == nil {
+			t.Fatal("claimant bailed to inline build — pool budget was not re-anchored at the handoff")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("claimant never returned")
+	}
+}
+
+// An ungated pool's workers start immediately and read the adoption plan
+// exactly once, so the plan must arrive through PoolConfig — a plan set only
+// inside StartAdoption lands after their check and the handoff silently
+// stops applying.
+func TestConfigPlannedAdoptionParksUngatedRefill(t *testing.T) {
+	builds := stubPoolAllocate(t)
+	m := newTestManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := m.StartPool(ctx, PoolConfig{NewSize: 2, RecycleSize: 2, PlanStartupAdoption: true})
+	defer p.Stop()
+
+	time.Sleep(30 * time.Millisecond)
+	if got := builds.Load(); got != 0 {
+		t.Fatalf("ungated refill built %d slots despite a planned adoption, want 0", got)
+	}
+
+	p.finishStartupAdoption()
+	deadline := time.After(2 * time.Second)
+	for builds.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("refill never resumed after the handoff resolved")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// The producer role must transfer atomically from the claimants' viewpoint:
+// the instant the handoff resolves — before any released worker is scheduled
+// — producing() must already be true, or a claimant woken by adoption's
+// completion takes an inline build against workers that are already waking.
+func TestHandoffBridgesProducerVisibility(t *testing.T) {
+	p := &Pool{
+		log:                 zerolog.Nop(),
+		stopCh:              make(chan struct{}),
+		startGate:           make(chan struct{}),
+		startupAdoptionDone: make(chan struct{}),
+		adoptEscapeStreak:   defaultAdoptEscapeStreak,
+	}
+	p.startupAdoptionPlanned.Store(true)
+
+	if p.producing() {
+		t.Fatal("nothing declared yet — must not read as producing")
+	}
+	p.finishStartupAdoption()
+	if !p.producing() {
+		t.Fatal("handoff resolved with zero scheduled workers — the bridge must hold producer visibility")
+	}
+
+	// The first worker to declare itself takes over from the bridge.
+	p.refillActive.Add(1)
+	p.refillHandoffBridge.Store(0)
+	if !p.producing() {
+		t.Fatal("declared worker must carry production after the bridge drops")
+	}
+}
+
+// A pass that trips the no-yield escape loses claimant trust; it must lose
+// its hold on the fallback producer at the same moment, or every create for
+// the remainder of a fleet-sized pass builds inline.
+func TestEscapeStreakReleasesTheHandoff(t *testing.T) {
+	p := &Pool{
+		log:                 zerolog.Nop(),
+		stopCh:              make(chan struct{}),
+		startGate:           make(chan struct{}),
+		startupAdoptionDone: make(chan struct{}),
+		adoptEscapeStreak:   3,
+	}
+	p.startupAdoptionPlanned.Store(true)
+
+	for i := 0; i < 2; i++ {
+		p.adoptYieldedNothing()
+		select {
+		case <-p.startupAdoptionDone:
+			t.Fatalf("handoff released after %d misses, before the escape streak", i+1)
+		default:
+		}
+	}
+	p.adoptYieldedNothing() // trips the escape
+	select {
+	case <-p.startupAdoptionDone:
+	default:
+		t.Fatal("escape streak tripped but the handoff stayed unresolved")
+	}
+}
+
+// Discarding a phantom slot opens a deficit exactly like a successful claim;
+// it must deposit a wake token too, or held workers sleep out the hold poll
+// while a claimant waits on them.
+func TestPhantomDiscardDepositsAWakeToken(t *testing.T) {
+	withTestNetnsDir(t) // no ns file: the pooled slot is a phantom
+	m := newTestManager()
+
+	p := &Pool{
+		mgr:               m,
+		log:               zerolog.Nop(),
+		newSize:           1,
+		fresh:             make(chan *preallocSlot, 1),
+		recycled:          make(chan *preallocSlot, 1),
+		stopCh:            make(chan struct{}),
+		refillWake:        make(chan struct{}, 1),
+		adoptEscapeStreak: defaultAdoptEscapeStreak,
+	}
+	m.assignSlotLocked(1, poolOwner)
+	p.fresh <- &preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"}
+
+	if got := p.Claim("vm-x"); got != nil {
+		t.Fatalf("expected nil (only a phantom available), got %+v", got)
+	}
+	if got := len(p.refillWake); got != 1 {
+		t.Fatalf("wake tokens = %d after a phantom discard, want 1", got)
+	}
+}
+
+// StartAdoption's planned-flag write must be race-safe against concurrent
+// handoff readers — the interleaving an ungated pool's already-running
+// workers produce. The readers here call waitForStartupAdoption directly
+// (the adoption pass itself stays parked behind an unopened gate), so this
+// validates the concurrent flag access, not the full ungated StartPool flow.
+func TestStartAdoptionPlannedFlagIsRaceSafe(t *testing.T) {
+	p := &Pool{
+		log:                 zerolog.Nop(),
+		stopCh:              make(chan struct{}),
+		startGate:           make(chan struct{}), // never opened: the pass parks harmlessly
+		startupAdoptionDone: make(chan struct{}),
+		adoptEscapeStreak:   defaultAdoptEscapeStreak,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var readers sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			p.waitForStartupAdoption(ctx) // races the Store below
+		}()
+	}
+	if !p.StartAdoption(ctx) {
+		t.Fatal("StartAdoption must claim the pass")
+	}
+	cancel() // releases any reader that observed the flag set
+	readers.Wait()
+
+	close(p.stopCh)
+	waited := make(chan struct{})
+	go func() { p.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked adoption did not join after stop")
+	}
+}
