@@ -797,10 +797,54 @@ func ResolveStagingRoot(override, snapshotDir, runDir string) (root, legacy stri
 	// entirely outside it: equality or containment (either direction,
 	// aliased spellings included) means the operator pointed staging at
 	// the old location and nothing may treat it as retired.
-	if root == legacy ||
-		strings.HasPrefix(root, legacy+string(os.PathSeparator)) ||
-		strings.HasPrefix(legacy, root+string(os.PathSeparator)) {
+	if StagingRootsOverlap(root, legacy) {
 		legacy = ""
 	}
 	return root, legacy
+}
+
+// StagingRootsOverlap reports whether a and b name the same directory or
+// one contains the other. A retirement candidate that overlaps the
+// active root this way is not actually retired: sweepRetiredStaging (or
+// the legacy sweep) would walk live, referenced entries reachable
+// through the active root's own directory tree and, past the grace
+// period, delete them as apparent orphans.
+//
+// Known gap, accepted rather than solved here: suppressing retirement
+// entirely on overlap is safe (nothing gets wrongly deleted) but
+// incomplete for an ancestor-to-descendant change specifically — e.g.
+// BACKUP_STAGING_DIR moving from /mnt/staging to /mnt/staging/new.
+// Entries under the old ancestor but OUTSIDE the new descendant's
+// subtree are then swept by nothing (the active sweep only walks the
+// descendant; the retired-root sweep is suppressed for the whole
+// ancestor because it can't safely skip just the live subtree — the
+// walk assumes a fixed two-level sandbox-id/generation layout, which an
+// arbitrarily nested active root breaks). Closing this needs
+// SweepStaging itself to accept an exclusion path, which is a real
+// enough redesign to warrant its own change rather than growing here.
+// Reconfiguring to a path NESTED inside the current one is also an
+// unusual choice operationally (dedicated staging disks are typically
+// siblings, not nested); until the general fix lands, that specific
+// transition needs a manual cleanup of the stranded entries.
+//
+// Also known and accepted: this is a purely lexical comparison after
+// filepath.Clean, not a filesystem-identity check. Two configured
+// paths that reach the same directory through a symlink read as
+// non-overlapping, so a change between such spellings would retire a
+// tree that is still the live target — deployment convention here is
+// mounting a dedicated disk directly at the configured path, not
+// symlinking to it, which keeps this from applying to the actual
+// rollout this function exists for. Resolving through
+// filepath.EvalSymlinks would close the gap generally but has its own
+// sharp edge (a path that doesn't exist yet, the common case for a
+// freshly-configured root, errors rather than resolving), so it is
+// deferred rather than added speculatively.
+func StagingRootsOverlap(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	return a == b ||
+		strings.HasPrefix(a, b+string(os.PathSeparator)) ||
+		strings.HasPrefix(b, a+string(os.PathSeparator))
 }

@@ -27,6 +27,11 @@ prior bring-ups:
   failures from missing egress are confusing to diagnose.
 - Build the RAID array and mount it at the same path
   (`/mnt/localssd`), with the same `/var/lib/sandbox` layout.
+- Format and mount the attached background-data disk (Terraform reattaches
+  it to the new instance; formatting and the fstab entry are not
+  Terraform-managed) at the same path (`/mnt/sandbox-data`) before
+  deploying vmd — the backup journal and staging tree both live there and
+  a missing mount silently falls through to the root disk.
 - Deploy vmd via the normal workflow. Set `HOST_ID` to the DB row id of
   the DEAD host only at the remap step below, never while the old row
   still points at live state elsewhere.

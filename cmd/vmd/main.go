@@ -213,21 +213,38 @@ func publishesCapacityPressure(advertiseAddr, controlPlaneURL string) bool {
 	return advertiseAddr != "" && controlPlaneURL != ""
 }
 
-func advertisedVMDAddr(interfaceName string, grpcPort int, explicit string) (string, error) {
+// hostIPOnce memoizes a host-address resolver. Both advertised endpoints
+// derive from the same interface, and the lookup dumps the host's interface
+// and address tables — tables that grow with every VM and pooled slot on the
+// box — so it runs at most once per process, and not at all when both
+// endpoints are configured explicitly.
+func hostIPOnce(resolve func() (string, error)) func() (string, error) {
+	var (
+		once sync.Once
+		ip   string
+		err  error
+	)
+	return func() (string, error) {
+		once.Do(func() { ip, err = resolve() })
+		return ip, err
+	}
+}
+
+func advertisedVMDAddr(hostIP func() (string, error), grpcPort int, explicit string) (string, error) {
 	if explicit != "" {
 		if _, _, err := net.SplitHostPort(explicit); err != nil {
 			return "", err
 		}
 		return explicit, nil
 	}
-	ip, err := hostInterfaceAddress(interfaceName)
+	ip, err := hostIP()
 	if err != nil {
 		return "", err
 	}
 	return net.JoinHostPort(ip, strconv.Itoa(grpcPort)), nil
 }
 
-func advertisedProxyAddr(interfaceName, proxyHealthURL, explicit string) (string, error) {
+func advertisedProxyAddr(hostIP func() (string, error), proxyHealthURL, explicit string) (string, error) {
 	if explicit != "" {
 		if _, _, err := net.SplitHostPort(explicit); err != nil {
 			return "", err
@@ -246,7 +263,7 @@ func advertisedProxyAddr(interfaceName, proxyHealthURL, explicit string) (string
 		return "", err
 	}
 	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-		ip, err := hostInterfaceAddress(interfaceName)
+		ip, err := hostIP()
 		if err != nil {
 			return "", err
 		}
@@ -1089,11 +1106,32 @@ func main() {
 		st.mark("backup_setup", true, -1)
 		// Staging pins enqueued artifacts so sandbox teardown cannot
 		// erase a queued generation; the sweep clears residue from
-		// crashes between staging and enqueue. The tree lives inside
-		// SNAPSHOT_DIR by default: that keeps it on the same filesystem
-		// as the artifacts it snapshots, so reflink cloning works and
-		// capacity scales with the artifact array instead of the OS
-		// disk. BACKUP_STAGING_DIR overrides for exotic layouts.
+		// crashes between staging and enqueue. Two roots, not one:
+		//
+		//   - pauseStagingRoot is where the pause RPC path stages inline
+		//     (see vm.Manager.pauseStagingRoot / SetPauseStagingRoot),
+		//     always inside SNAPSHOT_DIR so it shares a filesystem with
+		//     the artifacts it clones — reflink works, and the base pin
+		//     it hard-links never crosses filesystems. This is fixed,
+		//     never affected by BACKUP_STAGING_DIR: moving it would turn
+		//     every pause's inline copy into real cross-filesystem I/O
+		//     on the pause RPC path, and the pin into a broken cross-
+		//     device link.
+		//   - stagingRoot is where a finished generation ends up for the
+		//     uploader to hash and stream from (BACKUP_STAGING_DIR
+		//     overrides it). Every staged file is read twice before it
+		//     leaves the host (digest pre-check, then the upload
+		//     stream), and on a host serving live VM disk I/O off the
+		//     same array that read traffic is direct contention with
+		//     tenant workloads — the reason to move it. The detached
+		//     worker promotes a finished generation from
+		//     pauseStagingRoot into stagingRoot once hashed (off the RPC
+		//     path), at the cost of reflink there, which never crosses
+		//     filesystems.
+		pauseStagingRoot, _ := backup.ResolveStagingRoot("", cfg.SnapshotDir, cfg.RunDir)
+		if err := os.MkdirAll(pauseStagingRoot, 0o700); err != nil {
+			log.Fatal().Err(err).Str("path", pauseStagingRoot).Msg("failed to create pause staging dir")
+		}
 		stagingRoot, legacyStaging := backup.ResolveStagingRoot(
 			os.Getenv("BACKUP_STAGING_DIR"), cfg.SnapshotDir, cfg.RunDir)
 		if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
@@ -1121,6 +1159,70 @@ func main() {
 			ss.Bases += ls.Bases
 			ss.Pending += ls.Pending
 		}
+		// Every recorded root that differs from both today's resolution and
+		// the hardcoded pre-split legacy path is a retired CUSTOM root —
+		// most often a rollback that cleared BACKUP_STAGING_DIR after it
+		// had pointed at a dedicated disk, though more than one can be
+		// outstanding at once if a drain hasn't finished across several
+		// config changes. ResolveStagingRoot only ever knows about the one
+		// fixed pre-split default, not whatever custom root(s) an operator
+		// had actually configured, so without this the abandoned trees'
+		// successfully-uploaded files would never be reclaimed. Handed to
+		// the uploader's periodic sweep rather than drained here: the
+		// trees can be fleet-sized, and startup readiness (pause/resume/
+		// create all wait on it) must not block on an unbounded filesystem
+		// walk. sweepRetiredStaging is what drops a retired root from the set,
+		// and only once removal actually confirms empty, so an
+		// interrupted drain resumes on a later boot instead of losing
+		// track of the config change.
+		allRoots, rootsErr := journal.StagingRoots()
+		if rootsErr != nil {
+			log.Warn().Err(rootsErr).Msg("read staging roots failed; retired custom roots (if any) not tracked this boot")
+		}
+		// A durable write (BoltDB transaction, fsync included) on every
+		// startup would tax the common case — an unchanged root, by far
+		// most boots — on a path pause/resume/create readiness waits on.
+		// Skip it whenever the read above already found this root present.
+		if rootsErr == nil && !slices.Contains(allRoots, stagingRoot) {
+			if err := journal.RecordStagingRoot(stagingRoot); err != nil {
+				log.Warn().Err(err).Msg("record staging root failed; a future root change may not be detected")
+			}
+		}
+		if rootsErr == nil {
+			for _, root := range allRoots {
+				// Plain inequality is not enough here: a change between an
+				// ancestor and descendant path (or the same directory under
+				// an aliased spelling) is not a retirement —
+				// sweepRetiredStaging would walk live, referenced entries
+				// reachable through the active root's own tree and delete
+				// them as apparent orphans past the grace period.
+				//
+				// pauseStagingRoot must be excluded too, not just
+				// stagingRoot: it is fixed at the SNAPSHOT_DIR default
+				// regardless of BACKUP_STAGING_DIR (see its own comment
+				// above), so a host's first boot with the override unset
+				// records that default, and enabling the override on a
+				// LATER boot must not then treat the still-live pause-path
+				// tree as retired just because it stopped being the
+				// uploader's own root.
+				if root == stagingRoot ||
+					backup.StagingRootsOverlap(root, stagingRoot) ||
+					backup.StagingRootsOverlap(root, legacyStaging) ||
+					backup.StagingRootsOverlap(root, pauseStagingRoot) {
+					continue
+				}
+				uploader.RetiredStagingRoots = append(uploader.RetiredStagingRoots, root)
+				log.Info().Str("path", root).Msg("staging root changed since a previous boot; retired custom root queued for background drain")
+			}
+		}
+		// pauseStagingRoot gets no startup sweep of its own here: on a
+		// host with no BACKUP_STAGING_DIR override it IS stagingRoot
+		// (already covered above), and on a host with one configured, a
+		// promotion's rare crash-or-fail residue there is not required
+		// for serving reattach-ready — the periodic sweep in the
+		// uploader's drain loop (see PauseStagingRoot on Uploader)
+		// reaches it soon enough without extending this synchronous
+		// startup scan.
 		st.emit(func() {
 			log.Info().Int("renewed_markers", renewedMarkers).Int("sandboxes", ss.Sandboxes).
 				Int("generations", ss.Generations).Int("bases", ss.Bases).Int("pending", ss.Pending).
@@ -1128,7 +1230,9 @@ func main() {
 		})
 		st.mark("backup_staging_scan", true, -1)
 		uploader.StagingRoot = stagingRoot
+		uploader.PauseStagingRoot = pauseStagingRoot
 		mgr.SetBackupStaging(stagingRoot)
+		mgr.SetPauseStagingRoot(pauseStagingRoot)
 		mgr.SetBackupEnqueue(journal.Enqueue)
 		mgr.SetBackupCovered(func(t backup.Task) (bool, error) {
 			// Coverage is per bucket: a completed generation elsewhere
@@ -1412,6 +1516,22 @@ func main() {
 		mgr.StartMountCountSampler(ctx, time.Minute)
 	}
 
+	// ---- Fleet-sized background work ----
+	// Slot refill, slot adoption, and the full reattach each walk the whole
+	// inventory: their cost grows with records, slots, and interfaces, while
+	// everything before readiness is bounded. Run concurrently with startup
+	// they compete for the kernel's single global RTNL lock and delay the
+	// readiness the daemon is trying to announce, and their per-record logs
+	// can bury the readiness line under journald's rate limit. Holding them
+	// behind readiness keeps startup proportional to nothing but itself.
+	//
+	// Requests cannot be served during the wait — the gRPC interceptors
+	// reject everything with Unavailable until startupReady flips — so the
+	// deferral delays no caller. A daemon that shuts down before readiness
+	// never opens it; every waiter also selects on context cancellation, so
+	// none of them are left parked.
+	postReady := make(chan struct{})
+
 	// ---- Pre-allocate network slots ----
 	// Warm buffer of network namespaces so creation claims off the hot path.
 	// StartPool returns immediately and fills in the background, so the gate
@@ -1421,6 +1541,7 @@ func main() {
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
 		NewSize:           netPoolFresh,
 		RecycleSize:       netPoolRecycle,
+		StartGate:         postReady,
 		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
 		AbandonOnStop:     adoptNetPool,
 	})
@@ -1451,6 +1572,14 @@ func main() {
 	// service — a completing lc service trips lifecycle shutdown.
 	go func() {
 		defer sentrylog.Recover("startup reattach")
+		// Held until readiness: requests load their VM on demand, so nothing
+		// waits on this pass (see the fleet-sized background work comment
+		// above for why it must not run during startup).
+		select {
+		case <-postReady:
+		case <-ctx.Done():
+			return
+		}
 		// O(N) reattach, off the critical path — timed here (not via the
 		// single-goroutine marks) and flagged concurrent, distinct message, so
 		// its phase_ms is never summed into the partition. count sizes a
@@ -1606,17 +1735,12 @@ func main() {
 		if proxyHealthURL == "" {
 			proxyHealthURL = "http://127.0.0.1:5007/health"
 		}
-		vmdAddr, err := advertisedVMDAddr(cfg.HostInterface, cfg.GRPCPort, cfg.VMDAdvertiseAddr)
-		if err != nil {
-			log.Warn().Err(err).Str("host_interface", cfg.HostInterface).
-				Int("grpc_port", cfg.GRPCPort).
-				Msg("unable to resolve advertised VMD address; heartbeat will omit host self-description")
-		}
-		proxyAddr, err := advertisedProxyAddr(cfg.HostInterface, proxyHealthURL, cfg.ProxyAdvertiseAddr)
-		if err != nil {
-			log.Warn().Err(err).Str("proxy_health_url", proxyHealthURL).
-				Msg("unable to derive advertised proxy address; heartbeat will omit host self-description")
-		}
+		// Both endpoints derive from one host-interface lookup, and that
+		// lookup dumps the host's interface and address tables — whose size
+		// grows with the fleet. hostIP resolves at most once, and only if
+		// something actually needs it: two explicit advertise settings
+		// resolve nothing at all.
+		hostIP := hostIPOnce(func() (string, error) { return hostInterfaceAddress(cfg.HostInterface) })
 		// Pressure publication is wired ONLY on the explicit advertise
 		// setting — never on the resolved vmdAddr, which now falls back
 		// to deriving an address from the host interface. Keying on the
@@ -1630,6 +1754,21 @@ func main() {
 			pressureReady = mgr.PressureReady
 		}
 		lc.start("heartbeat", func() error {
+			// Resolved here rather than on the startup goroutine: the lookup
+			// is fleet-sized, and its only consumer is this heartbeat. A
+			// failure still omits self-description and warns; it has never
+			// been a reason to hold up readiness.
+			vmdAddr, err := advertisedVMDAddr(hostIP, cfg.GRPCPort, cfg.VMDAdvertiseAddr)
+			if err != nil {
+				log.Warn().Err(err).Str("host_interface", cfg.HostInterface).
+					Int("grpc_port", cfg.GRPCPort).
+					Msg("unable to resolve advertised VMD address; heartbeat will omit host self-description")
+			}
+			proxyAddr, err := advertisedProxyAddr(hostIP, proxyHealthURL, cfg.ProxyAdvertiseAddr)
+			if err != nil {
+				log.Warn().Err(err).Str("proxy_health_url", proxyHealthURL).
+					Msg("unable to derive advertised proxy address; heartbeat will omit host self-description")
+			}
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
 				ControlPlaneURL:   cfg.ControlPlaneURL,
 				HostID:            cfg.HostID,
@@ -1726,6 +1865,10 @@ func main() {
 	startupReady.Store(true)
 	st.mark("ready", true, -1)
 	log.Info().Msg("startup complete — gRPC serving requests")
+	// Released only after the readiness line is emitted: the deploy
+	// readiness check reads that line from the journal, so nothing the
+	// background work logs may come ahead of it.
+	close(postReady)
 
 	// Leak gauge for network namespaces — independent of the launcher path.
 	// Started AFTER readiness (and so after StartPool): its immediate first

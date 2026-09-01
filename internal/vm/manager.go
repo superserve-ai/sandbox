@@ -378,9 +378,22 @@ type Manager struct {
 	// backupEnqueue hands finalized pause manifests to the durability
 	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
 	backupEnqueue func(backup.Task) error
-	// backupStaging is the uploader's hard-link staging tree; empty
-	// means artifacts upload from their original paths.
+	// backupStaging is the uploader-visible staging tree: where a
+	// finished generation ends up for the uploader to hash and stream
+	// from, and where the at-rest/backfill worker path (StageTask)
+	// snapshots mutable originals directly, since that path never runs
+	// on the pause RPC path. Empty means artifacts upload from their
+	// original paths. See SetBackupStaging.
 	backupStaging string
+	// pauseStagingRoot is the pause RPC path's own inline staging tree
+	// (see backupPause / StagePending): always on the same filesystem as
+	// SnapshotDir, regardless of where backupStaging points, so the
+	// synchronous pause path's reflink attempts and its base-pin hard
+	// link never have to cross filesystems. A finished generation is
+	// promoted from here into backupStaging off the RPC path (see
+	// enqueueStagedPending) before it is enqueued. Empty disables inline
+	// pause-time staging. See SetPauseStagingRoot.
+	pauseStagingRoot string
 	// unitDead overrides the systemd unit-dead probe in tests; nil means
 	// the real probe. See vmConfirmedAtRest.
 	unitDead func(ctx context.Context, vmID string) bool
@@ -4648,7 +4661,11 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			inst.Supervision = fresh.Supervision
 			inst.mu.Unlock()
 		}
-		log.Info().Msg("reattached paused VM")
+		// Deliberately no per-record log: paused records dominate a large
+		// host's store, and one line per record is enough volume to trip
+		// journald's rate limit and suppress whatever the daemon logs next —
+		// including request errors. The pass logs its count up front and its
+		// totals on completion; anomalies on this path log above.
 	} else {
 		// Only a deletion undoes the reattach (see persistStateIfPresent).
 		if wrote, perr := m.persistStateIfPresent(inst); perr == nil && !wrote {

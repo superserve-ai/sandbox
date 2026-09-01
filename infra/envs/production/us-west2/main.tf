@@ -308,6 +308,68 @@ module "sandbox_host" {
   }
 }
 
+# Background-data disk, separate from the local-SSD array serving live VM
+# disk I/O: pause-backup staging reads every staged file twice before it
+# leaves the host (digest pre-check, then the upload stream), and on this
+# host both reads would otherwise land on the same array as tenant reads.
+# Other background workloads (logs, metrics) are candidates for the same
+# disk later; only backup staging (BACKUP_STAGING_DIR, wired in
+# deploy-vmd.yml) uses it today. One per host, primary and standby alike
+# (see sandbox_data_b below): the deploy label — and so the
+# BACKUP_STAGING_DIR-configured deploy step — follows active_sandbox_host
+# to whichever host is actually serving, and deploy-vmd.py's mount
+# precondition refuses to deploy onto a host missing this device, so a
+# promotion must never find the newly-active host without one.
+#
+# Sized for real headroom rather than steady-state drain: this cell's
+# peak pause rate runs on the order of 1.3k generations/hour at ~12MB
+# packed each, so a fully stalled uploader fills roughly 15.6GB/hour.
+# 1024GB absorbs that for ~65 hours (~2.7 days) before the disk itself
+# becomes the constraint. hyperdisk-balanced, not pd-balanced: this is a
+# Z3 metal host, which rejects standard Persistent Disk types the same
+# way it rejects the API-default pd-standard boot disk.
+resource "google_compute_disk" "sandbox_data" {
+  project = local.project_id
+  name    = "superserve-vmd-usw2-sandbox-data"
+  zone    = local.zone
+  type    = "hyperdisk-balanced"
+  size    = 1024
+
+  labels = merge(local.common_labels, {
+    component = "vmd"
+    purpose   = "sandbox-data"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# No deletion_policy here (unlike staging's equivalent block, which
+# pins a provider major version new enough to support it): the
+# google_compute_attached_disk resource under this file's pinned
+# provider constraint (~> 6.0, resolving as of this writing to the
+# latest 6.x release) exposes no such argument — confirmed against the
+# provider's own schema, not assumed — so setting it fails
+# terraform validate outright. The disk survives instance
+# deletion/replacement regardless: attaching it through this resource
+# (the API's attachDisk call) rather than as an instance-creation-time
+# disk means GCP does not auto-delete it when the instance goes away,
+# and prevent_destroy above already stops Terraform from deleting the
+# disk resource itself — sufficient on its own to preserve the data.
+# Deliberately NOT prevent_destroy here too: this attachment is keyed
+# on the instance's self link, so the documented host-recreation flow
+# (host-dr-runbook.md) replaces it whenever the instance is rebuilt, and
+# prevent_destroy on the attachment would block that replacement.
+resource "google_compute_attached_disk" "sandbox_data" {
+  project     = local.project_id
+  zone        = local.zone
+  disk        = google_compute_disk.sandbox_data.id
+  instance    = module.sandbox_host.instance_self_link
+  device_name = "superserve-sandbox-data"
+  mode        = "READ_WRITE"
+}
+
 # Cold standby for the cell, normally kept stopped. Promotion = start this
 # host, then set active_sandbox_host = "standby" and apply: the switch routes
 # the control plane here and moves the deploy-fleet label off the primary.
@@ -342,6 +404,41 @@ module "sandbox_host_b" {
     enable-osconfig = "TRUE"
     enable-oslogin  = "TRUE"
   }
+}
+
+# The standby's own background-data disk — see sandbox_data above for
+# why every host carrying the "vmd" deploy label needs one, and for why
+# hyperdisk-balanced (this is a Z3 metal host too). Sized the same as
+# the primary's: on promotion this host takes over the same traffic, so
+# the same headroom math applies.
+resource "google_compute_disk" "sandbox_data_b" {
+  project = local.project_id
+  name    = "superserve-vmd-usw2-2-sandbox-data"
+  zone    = local.zone
+  type    = "hyperdisk-balanced"
+  size    = 1024
+
+  labels = merge(local.common_labels, {
+    component = "vmd"
+    purpose   = "sandbox-data"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# See sandbox_data's attachment above for why there's no deletion_policy
+# here (unsupported under this file's pinned ~> 6.0 provider), why the
+# disk is safe without it, and why prevent_destroy stays off this
+# attachment specifically (it must be replaceable across host rebuilds).
+resource "google_compute_attached_disk" "sandbox_data_b" {
+  project     = local.project_id
+  zone        = local.zone
+  disk        = google_compute_disk.sandbox_data_b.id
+  instance    = module.sandbox_host_b.instance_self_link
+  device_name = "superserve-sandbox-data"
+  mode        = "READ_WRITE"
 }
 
 module "observability" {
