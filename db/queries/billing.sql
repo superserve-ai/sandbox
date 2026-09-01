@@ -1,3 +1,33 @@
+-- name: UpdateHostSandboxStorageMeasurements :execrows
+-- Apply trusted host-side overlay allocations without rewriting history.
+-- statement_timestamp() is stable for the whole statement, so closing and
+-- opening an interval use the exact same measurement boundary.
+WITH measurements AS MATERIALIZED (
+    SELECT unnest(sqlc.arg(sandbox_ids)::uuid[]) AS sandbox_id,
+           unnest(sqlc.arg(disk_mib)::int[]) AS disk_mib
+), eligible AS MATERIALIZED (
+    SELECT s.id, s.team_id, m.disk_mib
+    FROM measurements m
+    JOIN sandbox s ON s.id = m.sandbox_id
+    WHERE s.host_id = sqlc.arg(host_id)
+      AND s.destroyed_at IS NULL
+      AND feature_enabled('billing_metrics_write', s.team_id)
+), closed AS (
+    UPDATE sandbox_storage_interval i
+    SET ended_at = statement_timestamp(), end_reason = 'measurement'
+    FROM eligible e
+    WHERE i.sandbox_id = e.id
+      AND i.team_id = e.team_id
+      AND i.ended_at IS NULL
+      AND i.disk_mib IS DISTINCT FROM e.disk_mib
+    RETURNING i.sandbox_id, i.team_id
+)
+INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
+SELECT e.id, e.team_id, e.disk_mib, statement_timestamp()
+FROM eligible e
+LEFT JOIN closed c ON c.sandbox_id = e.id AND c.team_id = e.team_id
+ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING;
+
 -- name: GetTeamBillingUsage :one
 -- Allocated usage for one team clipped to [period_start, period_end).
 WITH compute AS (
@@ -20,15 +50,66 @@ WITH compute AS (
       AND i.started_at < LEAST(now(), sqlc.arg(period_end))
       AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
 ),
+artifact_bounds AS (
+    SELECT
+        s.id,
+        s.team_id,
+        s.snapshot_id,
+        s.template_id,
+        s.base_path,
+        s.delta_path,
+        s.destroyed_at,
+        first_interval.started_at AS billing_started_at
+    FROM sandbox s
+    LEFT JOIN LATERAL (
+        SELECT MIN(i.started_at) AS started_at
+        FROM sandbox_storage_interval i
+        WHERE i.sandbox_id = s.id
+          AND i.team_id = s.team_id
+    ) first_interval ON true
+    WHERE s.team_id = sqlc.arg(team_id)
+      AND first_interval.started_at IS NOT NULL
+      AND first_interval.started_at < LEAST(now(), sqlc.arg(period_end))
+      AND s.created_at < LEAST(now(), sqlc.arg(period_end))
+      AND COALESCE(s.destroyed_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
+),
+artifact_ranges AS (
+    SELECT p.path,
+           MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
+           range_agg(tstzrange(
+               GREATEST(s.billing_started_at, sqlc.arg(period_start)),
+               LEAST(COALESCE(s.destroyed_at, now()), sqlc.arg(period_end)), '[)'
+           )) AS retained_ranges
+    FROM artifact_bounds s
+    LEFT JOIN template t ON t.id = s.template_id
+    CROSS JOIN LATERAL unnest(ARRAY[
+        s.base_path,
+        s.delta_path,
+        CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END
+    ]) AS p(path)
+    LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
+      AND am.path = p.path
+    WHERE p.path IS NOT NULL
+    GROUP BY p.path
+),
+artifact_storage AS (
+    SELECT FLOOR(COALESCE(SUM(artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0))::numeric AS mib_seconds
+    FROM artifact_ranges ar
+    CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
+),
 storage AS (
+    -- Overlay intervals are per sandbox; template artifacts are a separate
+    -- distinct-path set so shared bases and deltas are never multiplied by
+    -- the number of sandboxes that pin them.
     SELECT COALESCE(SUM(
         EXTRACT(EPOCH FROM (
             LEAST(COALESCE(i.ended_at, now()), sqlc.arg(period_end))
             - GREATEST(i.started_at, sqlc.arg(period_start))
         )) * i.disk_mib
-    ), 0)::numeric AS storage_mib_seconds
-    FROM sandbox_storage_interval i
-    WHERE i.team_id = sqlc.arg(team_id)
+    ), 0)::numeric + COALESCE(MAX(artifact_storage.mib_seconds), 0) AS storage_mib_seconds
+    FROM artifact_storage
+    LEFT JOIN sandbox_storage_interval i ON
+      i.team_id = sqlc.arg(team_id)
       AND sqlc.arg(period_start) < LEAST(now(), sqlc.arg(period_end))
       AND i.started_at < LEAST(now(), sqlc.arg(period_end))
       AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
@@ -73,15 +154,55 @@ WITH compute AS (
       AND i.started_at < LEAST(now(), sqlc.arg(period_end))
       AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
 ),
+artifact_bounds AS (
+    SELECT
+        s.id,
+        s.team_id,
+        s.snapshot_id,
+        s.template_id,
+        s.base_path,
+        s.delta_path,
+        s.destroyed_at,
+        first_interval.started_at AS billing_started_at
+    FROM sandbox s
+    LEFT JOIN LATERAL (
+        SELECT MIN(i.started_at) AS started_at
+        FROM sandbox_storage_interval i
+        WHERE i.sandbox_id = s.id
+          AND i.team_id = s.team_id
+    ) first_interval ON true
+    WHERE s.team_id = sqlc.arg(team_id)
+      AND first_interval.started_at IS NOT NULL
+      AND first_interval.started_at < LEAST(now(), sqlc.arg(period_end))
+      AND s.created_at < LEAST(now(), sqlc.arg(period_end))
+      AND COALESCE(s.destroyed_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
+),
+artifact_storage AS (
+    SELECT FLOOR(COALESCE(SUM(ar.artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0))::numeric AS mib_seconds
+    FROM (
+        SELECT p.path,
+               MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
+               range_agg(tstzrange(GREATEST(s.billing_started_at, sqlc.arg(period_start)), LEAST(COALESCE(s.destroyed_at, now()), sqlc.arg(period_end)), '[)')) AS retained_ranges
+        FROM artifact_bounds s
+        LEFT JOIN template t ON t.id = s.template_id
+        CROSS JOIN LATERAL unnest(ARRAY[s.base_path, s.delta_path, CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END]) AS p(path)
+        LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
+          AND am.path = p.path
+        WHERE p.path IS NOT NULL
+        GROUP BY p.path
+    ) ar
+    CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
+),
 storage AS (
     SELECT COALESCE(SUM(
         EXTRACT(EPOCH FROM (
             LEAST(COALESCE(i.ended_at, now()), sqlc.arg(period_end))
             - GREATEST(i.started_at, sqlc.arg(period_start))
         )) * i.disk_mib
-    ), 0)::numeric AS storage_mib_seconds
-    FROM sandbox_storage_interval i
-    WHERE i.team_id = sqlc.arg(team_id)
+    ), 0)::numeric + COALESCE(MAX(artifact_storage.mib_seconds), 0) AS storage_mib_seconds
+    FROM artifact_storage
+    LEFT JOIN sandbox_storage_interval i ON
+      i.team_id = sqlc.arg(team_id)
       AND sqlc.arg(period_start) < LEAST(now(), sqlc.arg(period_end))
       AND i.started_at < LEAST(now(), sqlc.arg(period_end))
       AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
@@ -181,15 +302,55 @@ WITH compute AS (
       AND sqlc.arg(hour_start) < LEAST(billing_request_now(), sqlc.arg(hour_end))
       AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
 ),
+artifact_bounds AS (
+    SELECT
+        s.id,
+        s.team_id,
+        s.snapshot_id,
+        s.template_id,
+        s.base_path,
+        s.delta_path,
+        s.destroyed_at,
+        first_interval.started_at AS billing_started_at
+    FROM sandbox s
+    LEFT JOIN LATERAL (
+        SELECT MIN(i.started_at) AS started_at
+        FROM sandbox_storage_interval i
+        WHERE i.sandbox_id = s.id
+          AND i.team_id = s.team_id
+    ) first_interval ON true
+    WHERE s.team_id = sqlc.arg(team_id)
+      AND first_interval.started_at IS NOT NULL
+      AND first_interval.started_at < LEAST(billing_request_now(), sqlc.arg(hour_end))
+      AND s.created_at < LEAST(billing_request_now(), sqlc.arg(hour_end))
+      AND COALESCE(s.destroyed_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
+),
+artifact_storage AS (
+    SELECT FLOOR(COALESCE(SUM(ar.artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0))::numeric AS mib_seconds
+    FROM (
+        SELECT p.path,
+               MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
+               range_agg(tstzrange(GREATEST(s.billing_started_at, sqlc.arg(hour_start)), LEAST(COALESCE(s.destroyed_at, billing_request_now()), sqlc.arg(hour_end)), '[)')) AS retained_ranges
+        FROM artifact_bounds s
+        LEFT JOIN template t ON t.id = s.template_id
+        CROSS JOIN LATERAL unnest(ARRAY[s.base_path, s.delta_path, CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END]) AS p(path)
+        LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
+          AND am.path = p.path
+        WHERE p.path IS NOT NULL
+        GROUP BY p.path
+    ) ar
+    CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
+),
 storage AS (
     SELECT COALESCE(SUM(
         EXTRACT(EPOCH FROM (
             LEAST(COALESCE(i.ended_at, billing_request_now()), sqlc.arg(hour_end))
             - GREATEST(i.started_at, sqlc.arg(hour_start))
         )) * i.disk_mib
-    ), 0)::numeric AS storage_mib_seconds
-    FROM sandbox_storage_interval i
-    WHERE i.team_id = sqlc.arg(team_id)
+    ), 0)::numeric + COALESCE(MAX(artifact_storage.mib_seconds), 0) AS storage_mib_seconds
+    FROM artifact_storage
+    LEFT JOIN sandbox_storage_interval i ON
+      i.team_id = sqlc.arg(team_id)
       AND i.started_at < sqlc.arg(hour_end)
       AND sqlc.arg(hour_start) < LEAST(billing_request_now(), sqlc.arg(hour_end))
       AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)

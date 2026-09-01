@@ -174,7 +174,9 @@ func main() {
 }
 
 type proxyHealthResponse struct {
-	Capabilities []string `json:"capabilities"`
+	Capabilities  []string `json:"capabilities"`
+	FilesEnabled  bool     `json:"files_enabled"`
+	ResolverReady bool     `json:"resolver_ready"`
 }
 
 func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
@@ -186,7 +188,9 @@ func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(proxyHealthResponse{
-			Capabilities: proxyHandler.PreviewCapabilities(),
+			Capabilities:  proxyHandler.PreviewCapabilities(),
+			FilesEnabled:  proxyHandler.FilesEnabled(),
+			ResolverReady: proxyHandler.ResolverReady(r.Context()),
 		})
 	})
 	mux.Handle("/", proxyHandler)

@@ -13,7 +13,7 @@ import (
 )
 
 func TestSafeResultBoundsValues(t *testing.T) {
-	for _, result := range []string{ResultSuccess, ResultError, ResultConflict, ResultTimeout} {
+	for _, result := range []string{ResultSuccess, ResultError, ResultConflict, ResultTimeout, ResultClientError} {
 		if got := safeResult(result); got != result {
 			t.Fatalf("safeResult(%q) = %q", result, got)
 		}

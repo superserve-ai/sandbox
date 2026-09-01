@@ -919,7 +919,10 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			fctx, fcancel := context.WithTimeout(bootCtx, vmdBootTimeout)
 			// The echo is not consulted here: the post-restore policy reapply
 			// below is this path's attestation.
-			ipAddress, actualVcpu, actualMemMiB, _, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, nil)
+			ipAddress, actualVcpu, actualMemMiB, _, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, nil,
+				// The row is authoritative for a sandbox that already
+				// exists; declaring it spares the daemon a probe.
+				vmdclient.ResourceLimits{VCPU: uint32(sandbox.VcpuCount), MemoryMiB: uint32(sandbox.MemoryMib)})
 			fcancel()
 			if err != nil {
 				l.Error().Err(err).Msg("VMD RestoreSnapshot fallback failed")
@@ -2459,7 +2462,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// overwrites the capture with the attempt that produced the returned VM.
 	var previewProtocol string
 	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryTransientBoot(c.Request.Context(), sandboxID.String(), hostID, func(ctx context.Context) (string, uint32, uint32, error) {
-		ip, vcpu, memMiB, protocol, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars)
+		ip, vcpu, memMiB, protocol, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars,
+			// Same shape the sandbox row is being inserted with (the
+			// template's, or the defaults) — declared so the daemon
+			// never has to ask Firecracker for it afterwards.
+			vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB)})
 		previewProtocol = protocol
 		return ip, vcpu, memMiB, err
 	})

@@ -1450,12 +1450,15 @@ definitions:
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
           process's guest memory page faults (Uffd), or
-          3) Path to the snapshot memory file backing guest RAM (UffdInternal).
+          3) Path to the snapshot memory file backing guest RAM (UffdInternal). In a
+          layered UffdInternal restore this is the overlay (diff) file; pages absent
+          from it are served from base_path.
       base_path:
         type: string
         description: Optional base (template) memory file for a layered UffdInternal
           restore. When set, a page is served from backend_path if present there,
-          else from this base. Only meaningful when backend_type is UffdInternal.
+          else from this base. Only meaningful when backend_type is UffdInternal;
+          ignored otherwise.
       access_log_path:
         type: string
         description: Optional path to a recorded page-access trace replayed as
@@ -1623,9 +1626,12 @@ definitions:
         type: boolean
         default: false
         description:
-          If true, bake each overlay block device's dirty blocks into its
-          base.ext4 in place and zero the side-car bitmap. Only safe at
-          template-creation time. Requires block_delta_dir.
+          If true, each overlay block device's dirty blocks are baked into its
+          base.ext4 in place and the side-car bitmap is born zero. Restores
+          create an empty per-VM overlay (no apply_delta replay). Only safe at
+          template-creation time — mutates base.ext4, would corrupt any other
+          live VM reading the same base. Must be paired with block_delta_dir;
+          requests with flatten=true and an unset block_delta_dir are rejected.
       expected_session_id:
         type: string
         description:
@@ -1715,6 +1721,22 @@ definitions:
           Directory containing block device delta files for cloning. Each
           overlay device looks for {drive_id}.delta in this directory and
           applies it to a fresh overlay on restore.
+      clock_realtime:
+        type: boolean
+        # Nullable so generated clients model this as an optional pointer rather than a
+        # plain boolean. The three states must survive the wire: a client that renders
+        # `false` as an omitted field would silently request legacy behaviour instead.
+        x-nullable: true
+        description:
+          "[x86_64 only] When set to true, passes KVM_CLOCK_REALTIME to
+          KVM_SET_CLOCK on restore, advancing kvmclock by the wall-clock time
+          elapsed since the snapshot was taken; this fails if the snapshot does
+          not carry that flag. When false, kvmclock resumes from where it was at
+          snapshot time. Omit the field to restore the flags the snapshot itself
+          carries, which is the behaviour that predates this option and the only
+          one valid for every snapshot. There is deliberately no default: omission
+          is a distinct third behaviour, not a synonym for either value. This option
+          may be extended to other clock sources and CPU architectures in the future."
 
 
   TokenBucket:

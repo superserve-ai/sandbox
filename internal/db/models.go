@@ -151,6 +151,54 @@ func (ns NullTemplateStatus) Value() (driver.Value, error) {
 	return string(ns.TemplateStatus), nil
 }
 
+type AbuseRestriction struct {
+	ID            uuid.UUID          `json:"id"`
+	SubjectType   string             `json:"subject_type"`
+	SubjectValue  string             `json:"subject_value"`
+	SubjectUserID pgtype.UUID        `json:"subject_user_id"`
+	SubjectTeamID pgtype.UUID        `json:"subject_team_id"`
+	Action        string             `json:"action"`
+	Source        string             `json:"source"`
+	Reason        string             `json:"reason"`
+	Evidence      []byte             `json:"evidence"`
+	CreatedBy     pgtype.UUID        `json:"created_by"`
+	CreatedAt     time.Time          `json:"created_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
+	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+	ReleasedAt    pgtype.Timestamptz `json:"released_at"`
+	ReleasedBy    pgtype.UUID        `json:"released_by"`
+}
+
+type AbuseStateChange struct {
+	ID         int64       `json:"id"`
+	TeamID     pgtype.UUID `json:"team_id"`
+	Generation int64       `json:"generation"`
+	Reason     string      `json:"reason"`
+	CreatedAt  time.Time   `json:"created_at"`
+}
+
+type AbuseTeamTrust struct {
+	TeamID    uuid.UUID          `json:"team_id"`
+	Verified  bool               `json:"verified"`
+	Source    string             `json:"source"`
+	Reason    *string            `json:"reason"`
+	Evidence  []byte             `json:"evidence"`
+	CreatedAt time.Time          `json:"created_at"`
+	UpdatedAt time.Time          `json:"updated_at"`
+	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type AbuseTrustedIdentity struct {
+	ID           uuid.UUID          `json:"id"`
+	AuthProvider string             `json:"auth_provider"`
+	Domain       string             `json:"domain"`
+	Source       string             `json:"source"`
+	Evidence     []byte             `json:"evidence"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	RevokedAt    pgtype.Timestamptz `json:"revoked_at"`
+}
+
 type Activity struct {
 	ID           uuid.UUID   `json:"id"`
 	SandboxID    pgtype.UUID `json:"sandbox_id"`
@@ -227,17 +275,18 @@ type ApiKey struct {
 }
 
 type ArtifactManifest struct {
-	ID          uuid.UUID   `json:"id"`
-	SnapshotID  pgtype.UUID `json:"snapshot_id"`
-	TemplateID  pgtype.UUID `json:"template_id"`
-	FileName    string      `json:"file_name"`
-	Path        string      `json:"path"`
-	SizeBytes   int64       `json:"size_bytes"`
-	Sha256      string      `json:"sha256"`
-	BasePath    *string     `json:"base_path"`
-	GuestKernel *string     `json:"guest_kernel"`
-	VmdVersion  *string     `json:"vmd_version"`
-	CreatedAt   time.Time   `json:"created_at"`
+	ID             uuid.UUID   `json:"id"`
+	SnapshotID     pgtype.UUID `json:"snapshot_id"`
+	TemplateID     pgtype.UUID `json:"template_id"`
+	FileName       string      `json:"file_name"`
+	Path           string      `json:"path"`
+	SizeBytes      int64       `json:"size_bytes"`
+	Sha256         string      `json:"sha256"`
+	BasePath       *string     `json:"base_path"`
+	GuestKernel    *string     `json:"guest_kernel"`
+	VmdVersion     *string     `json:"vmd_version"`
+	CreatedAt      time.Time   `json:"created_at"`
+	AllocatedBytes int64       `json:"allocated_bytes"`
 }
 
 type AuditLog struct {
@@ -380,6 +429,23 @@ type HostCapability struct {
 	Capability  string    `json:"capability"`
 	HeartbeatAt time.Time `json:"heartbeat_at"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+type HostPressure struct {
+	HostID                string    `json:"host_id"`
+	RunningSandboxes      int32     `json:"running_sandboxes"`
+	ProvisioningSandboxes int32     `json:"provisioning_sandboxes"`
+	PausedSandboxes       int32     `json:"paused_sandboxes"`
+	AllocatedMemoryMib    int64     `json:"allocated_memory_mib"`
+	AllocatedVcpus        int64     `json:"allocated_vcpus"`
+	UsedNetSlots          int32     `json:"used_net_slots"`
+	ProvisioningNetSlots  int32     `json:"provisioning_net_slots"`
+	WarmNetSlots          int32     `json:"warm_net_slots"`
+	NetSlotCeiling        int32     `json:"net_slot_ceiling"`
+	MaxNetworkSlots       int32     `json:"max_network_slots"`
+	MaxSandboxes          int32     `json:"max_sandboxes"`
+	UnknownAllocationVms  int32     `json:"unknown_allocation_vms"`
+	ReportedAt            time.Time `json:"reported_at"`
 }
 
 type NetFlow struct {

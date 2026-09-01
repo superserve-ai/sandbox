@@ -196,11 +196,22 @@ type VMRecord struct {
 	// unconsumed baseline — that atomic check, not this field, is the
 	// correctness boundary, so a stale value costs one rejected RPC and a Full
 	// pause, never a corrupt overlay.
-	DirtyTrackingSessionID string            `json:"dirty_tracking_session_id,omitempty"`
-	CreatedAt              time.Time         `json:"created_at"`
-	Metadata               map[string]string `json:"metadata,omitempty"`
-	VCPU                   uint32            `json:"vcpu"`
-	MemoryMiB              uint32            `json:"memory_mib"`
+	DirtyTrackingSessionID string `json:"dirty_tracking_session_id,omitempty"`
+	// CorrectsWallClock records whether this guest fixes its own wall clock on
+	// wake. Persisted because it is a property of the running guest, not of this
+	// daemon: without it a reattached VM would look incapable after a restart and
+	// its next pause would strip a marker that was valid, demoting every later
+	// resume.
+	//
+	// Tri-state on purpose. A binary that predates this field drops it when it
+	// rewrites a record, so after a rollback and re-upgrade the field is absent
+	// again — decoding that silence as false would ignore a marker still on disk
+	// and delete it at the next pause. Nil means "ask the disk".
+	CorrectsWallClock *bool             `json:"corrects_wall_clock,omitempty"`
+	CreatedAt         time.Time         `json:"created_at"`
+	Metadata          map[string]string `json:"metadata,omitempty"`
+	VCPU              uint32            `json:"vcpu"`
+	MemoryMiB         uint32            `json:"memory_mib"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
 	// dual-symlink mount namespace). DeltaDir is intentionally NOT
@@ -886,6 +897,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		MemFilePath:                inst.MemFilePath,
 		BaseMemPath:                inst.BaseMemPath,
 		DirtyTrackingSessionID:     inst.DirtyTrackingSessionID,
+		CorrectsWallClock:          inst.CorrectsWallClock,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
@@ -959,25 +971,25 @@ func toInstance(rec VMRecord) *VMInstance {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
 	return &VMInstance{
-		ID:                     rec.ID,
-		PID:                    rec.PID,
-		SocketPath:             rec.SocketPath,
-		VsockPath:              rec.VsockPath,
-		IP:                     rec.IP,
-		TAPDevice:              rec.TAPDevice,
-		MACAddress:             rec.MACAddress,
-		Status:                 rec.Status,
-		Unverified:             rec.Unverified,
-		RevivalPending:         rec.RevivalPending,
-		RevivedDisk:            rec.RevivedDisk,
-		TeardownPending:        rec.TeardownPending,
-		RunDirID:               rec.RunDirID,
-		Namespace:              rec.Namespace,
-		DiskPath:               rec.DiskPath,
-		SnapshotPath:           rec.SnapshotPath,
-		MemFilePath:            rec.MemFilePath,
-		BaseMemPath:            rec.BaseMemPath,
-		DirtyTrackingSessionID: rec.DirtyTrackingSessionID,
+		ID:                         rec.ID,
+		PID:                        rec.PID,
+		SocketPath:                 rec.SocketPath,
+		VsockPath:                  rec.VsockPath,
+		IP:                         rec.IP,
+		TAPDevice:                  rec.TAPDevice,
+		MACAddress:                 rec.MACAddress,
+		Status:                     rec.Status,
+		Unverified:                 rec.Unverified,
+		RevivalPending:             rec.RevivalPending,
+		RevivedDisk:                rec.RevivedDisk,
+		TeardownPending:            rec.TeardownPending,
+		RunDirID:                   rec.RunDirID,
+		Namespace:                  rec.Namespace,
+		DiskPath:                   rec.DiskPath,
+		SnapshotPath:               rec.SnapshotPath,
+		MemFilePath:                rec.MemFilePath,
+		BaseMemPath:                rec.BaseMemPath,
+		DirtyTrackingSessionID:     rec.DirtyTrackingSessionID,
 		// Optimistic re-arm for an adopted running VM: the surviving FC's
 		// bitmap is intact, and the pause-time token check is the correctness
 		// boundary — if anything consumed the bitmap since the session was
@@ -985,6 +997,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		// Records without a session (flag off, or armed pre-flag) stay
 		// untracked and pause Full, exactly as before.
 		DirtyTracked:               rec.Status == StatusRunning && rec.DirtyTrackingSessionID != "",
+		CorrectsWallClock:          rec.CorrectsWallClock,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,

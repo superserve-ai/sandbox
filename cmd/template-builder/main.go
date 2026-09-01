@@ -45,6 +45,8 @@ func main() {
 	boxdBin := flag.String("boxd", "", "path to boxd binary")
 	hostIface := flag.String("host-interface", "ens4", "host network interface")
 	slotIndex := flag.Int("slot-index", 200, "network slot index (must not collide with vmd)")
+	launcherNS := flag.String("launcher-ns", "", "path to vmd's pruned launcher mount-namespace pin; empty selects the legacy `ip netns exec` launch")
+	netlinkOps := flag.Bool("netlink-slot-ops", false, "build this VM's network slot over netlink instead of forking iproute2")
 	timeout := flag.Duration("timeout", 15*time.Minute, "build timeout")
 	flag.Parse()
 
@@ -83,6 +85,8 @@ func main() {
 		boxdBin:     *boxdBin,
 		hostIface:   *hostIface,
 		slotIndex:   *slotIndex,
+		launcherNS:  *launcherNS,
+		netlinkOps:  *netlinkOps,
 	})
 	if err != nil {
 		// Emit a user-visible error (stable code + user-friendly message)
@@ -175,6 +179,8 @@ type buildConfig struct {
 	boxdBin     string
 	hostIface   string
 	slotIndex   int
+	launcherNS  string
+	netlinkOps  bool
 }
 
 func runBuild(ctx context.Context, cfg buildConfig) error {
@@ -227,7 +233,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 
 	// Single slot, no pool, no egress proxy — build VMs don't need them.
-	netMgr, netInfo, cleanup, err := setupNetwork(ctx, cfg.hostIface, cfg.slotIndex, buildVMID)
+	netMgr, netInfo, cleanup, err := setupNetwork(ctx, cfg.hostIface, cfg.slotIndex, buildVMID, cfg.netlinkOps)
 	if err != nil {
 		return fmt.Errorf("setup network: %w", err)
 	}
@@ -257,7 +263,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		GatewayIP:  network.VMGatewayIP,
 	}
 
-	pid, err := startFirecracker(ctx, cfg.fcBin, socketPath, fcCfg, netInfo.Namespace, cfg.runDir, perVMOverlay, basePath)
+	pid, err := startFirecracker(ctx, cfg.fcBin, socketPath, fcCfg, netInfo.Namespace, cfg.runDir, perVMOverlay, basePath, cfg.launcherNS)
 	if err != nil {
 		return fmt.Errorf("start firecracker: %w", err)
 	}
@@ -365,14 +371,22 @@ func fsyncBuildArtifacts(snapDir string, paths ...string) error {
 // Network setup (single slot, no pool)
 // ---------------------------------------------------------------------------
 
-func setupNetwork(ctx context.Context, hostIface string, slotIndex int, vmID string) (*network.Manager, *network.VMNetInfo, func(), error) {
+func setupNetwork(ctx context.Context, hostIface string, slotIndex int, vmID string, netlinkOps bool) (*network.Manager, *network.VMNetInfo, func(), error) {
 	log := newLogger("network")
 	// template-builder inherits HOST_ID from the VMD process that launches it.
-	mgr, err := network.NewManager(ctx, hostIface, log,
+	opts := []network.ManagerOption{
 		network.WithExactSlot(slotIndex),
 		network.WithHostID(os.Getenv("HOST_ID")),
 		network.WithHTTPProxyPort(0), // no egress proxy for builds
-	)
+	}
+	// Mirrors the daemon's backend. Building this one slot over iproute2 forks
+	// `ip netns exec` several times, and each fork clones the host mount table
+	// under the global mount lock — stalling unrelated sandbox launches for as
+	// long as it takes. A build must not be able to do that to the fleet.
+	if netlinkOps {
+		opts = append(opts, network.WithNetlinkSlotOps())
+	}
+	mgr, err := network.NewManager(ctx, hostIface, log, opts...)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("new network manager: %w", err)
 	}
@@ -395,17 +409,34 @@ func setupNetwork(ctx context.Context, hostIface string, slotIndex int, vmID str
 // Firecracker launch
 // ---------------------------------------------------------------------------
 
-func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.FirecrackerConfig, netNS, runDir, perVMOverlay, basePath string) (int, error) {
+func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.FirecrackerConfig, netNS, runDir, perVMOverlay, basePath, launcherNS string) (int, error) {
 	// Same magic-path setup as vmd's restore — symlinked paths must match
 	// on both sides so the snapshot's baked drive paths resolve.
 	templateDir := vm.TemplateMagicDir(runDir)
 	baseLink := vm.TemplateMagicBasePath(runDir)
 	overlayLink := vm.TemplateMagicOverlayPath(runDir)
+	// Same namespace entry as vmd's launch, from the same resolver: with a
+	// launcher pin the following `unshare -m` clones that pruned table
+	// instead of the host's full one, so a build no longer holds the global
+	// mount lock long enough to stall concurrent sandbox launches. Entry
+	// carries its own sysfs obligation — see LaunchNamespaceEntry.
+	//
+	// Re-checked HERE rather than trusted from the flag: vmd validated the
+	// pin when it spawned this process, but a build pulls and runs an image
+	// first, and across those minutes the daemon can restart and rebuild or
+	// detach the pin. Entering a path that is no longer a pin fails a
+	// perfectly healthy build, so a stale one degrades to the legacy entry.
+	if launcherNS != "" && !vm.LauncherPinUsable(launcherNS) {
+		emitInternal("stderr", "launcher pin no longer mounted; using the legacy namespace entry")
+		launcherNS = ""
+	}
+	entry := vm.LaunchNamespaceEntry(netNS, launcherNS)
 	script := fmt.Sprintf(
-		"mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && ln -s %q %q && exec %q --api-sock %q --id %q",
-		templateDir, basePath, baseLink, perVMOverlay, overlayLink, fcBin, socketPath, cfg.VMID,
+		"mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && ln -s %q %q%s && exec %q --api-sock %q --id %q",
+		templateDir, basePath, baseLink, perVMOverlay, overlayLink, entry.SysfsSetup, fcBin, socketPath, cfg.VMID,
 	)
-	cmd := exec.Command("ip", "netns", "exec", netNS, "unshare", "-m", "--", "sh", "-c", script)
+	argv := append(append([]string{}, entry.Argv...), "unshare", "-m", "--", "sh", "-c", script)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	// Surface shell errors from the mount/symlink prelude — without this,
 	// a failure before exec'ing firecracker shows up as an opaque
 	// wait-for-socket timeout. Inherits up to vmd's journald via the

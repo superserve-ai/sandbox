@@ -25,6 +25,7 @@ import (
 )
 
 type fakeNetMgr struct {
+	netlinkSlotOps  bool
 	setupInfo       map[string]*network.VMNetInfo
 	setupCalls      []string
 	cleanupVMCalls  []string
@@ -85,7 +86,8 @@ func (f *fakeNetMgr) GetVMNetInfo(string) *network.VMNetInfo { return nil }
 
 func (f *fakeNetMgr) NetnsStats() (int, int, int) { return f.netnsTotal, f.ownedSlots, f.orphaned }
 
-func (f *fakeNetMgr) PoolStats() (int, int, bool) { return f.poolFresh, f.poolRecycled, f.poolEnabled }
+func (f *fakeNetMgr) PoolStats() (int, int, bool)             { return f.poolFresh, f.poolRecycled, f.poolEnabled }
+func (f *fakeNetMgr) SlotPressure() network.SlotPressureStats { return network.SlotPressureStats{} }
 
 func (f *fakeNetMgr) NamespaceForPID(int) string { return "" }
 
@@ -137,6 +139,8 @@ func (f *fakeNetMgr) TeardownVM(vmID string) {
 	}
 	f.teardownCalls = append(f.teardownCalls, vmID)
 }
+
+func (f *fakeNetMgr) UsesNetlinkSlotOps() bool { return f.netlinkSlotOps }
 
 func (f *fakeNetMgr) TeardownVMOrNamespace(vmID, fallbackNamespace string) {
 	if f.beforeRelease != nil {

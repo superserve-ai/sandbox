@@ -44,6 +44,88 @@ func TestLoadConfigRequiresExplicitHostID(t *testing.T) {
 	}
 }
 
+func TestLoadConfigUsesHeartbeatOverrides(t *testing.T) {
+	t.Setenv("KERNEL_PATH", "/tmp/kernel")
+	t.Setenv("BASE_ROOTFS_PATH", "/tmp/rootfs")
+	t.Setenv("HOST_ID", "host-a")
+	t.Setenv("VMD_ADVERTISE_ADDR", "10.0.0.2:50051")
+	t.Setenv("PROXY_ADVERTISE_ADDR", "10.0.0.2:5007")
+	t.Setenv("HOST_REGION", "region-explicit")
+	t.Setenv("SANDBOX_ID_REGION", "region-fallback")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.VMDAdvertiseAddr != "10.0.0.2:50051" {
+		t.Fatalf("cfg.VMDAdvertiseAddr = %q, want explicit override", cfg.VMDAdvertiseAddr)
+	}
+	if cfg.ProxyAdvertiseAddr != "10.0.0.2:5007" {
+		t.Fatalf("cfg.ProxyAdvertiseAddr = %q, want explicit override", cfg.ProxyAdvertiseAddr)
+	}
+	if cfg.HostRegion != "region-explicit" {
+		t.Fatalf("cfg.HostRegion = %q, want explicit override", cfg.HostRegion)
+	}
+}
+
+func TestAdvertisedAddrsPreferExplicitOverrides(t *testing.T) {
+	// The host lookup dumps fleet-sized kernel tables, so explicit settings
+	// must satisfy both endpoints without it ever running.
+	resolved := 0
+	hostIP := func() (string, error) {
+		resolved++
+		return "", fmt.Errorf("host lookup must not run when both addresses are explicit")
+	}
+
+	vmdAddr, err := advertisedVMDAddr(hostIP, 50051, "10.0.0.2:50051")
+	if err != nil {
+		t.Fatalf("advertisedVMDAddr: %v", err)
+	}
+	if vmdAddr != "10.0.0.2:50051" {
+		t.Fatalf("advertisedVMDAddr = %q, want explicit override", vmdAddr)
+	}
+
+	proxyAddr, err := advertisedProxyAddr(hostIP, "http://127.0.0.1:5007/health", "10.0.0.2:5007")
+	if err != nil {
+		t.Fatalf("advertisedProxyAddr: %v", err)
+	}
+	if proxyAddr != "10.0.0.2:5007" {
+		t.Fatalf("advertisedProxyAddr = %q, want explicit override", proxyAddr)
+	}
+	if resolved != 0 {
+		t.Fatalf("host interface resolved %d times, want 0", resolved)
+	}
+}
+
+// Both endpoints derive from the same interface; the lookup behind them must
+// run once no matter how many callers need it.
+func TestAdvertisedAddrsShareOneHostLookup(t *testing.T) {
+	resolved := 0
+	hostIP := func() (string, error) {
+		resolved++
+		return "10.0.0.3", nil
+	}
+	memo := hostIPOnce(hostIP)
+
+	vmdAddr, err := advertisedVMDAddr(memo, 50051, "")
+	if err != nil {
+		t.Fatalf("advertisedVMDAddr: %v", err)
+	}
+	proxyAddr, err := advertisedProxyAddr(memo, "http://127.0.0.1:5007/health", "")
+	if err != nil {
+		t.Fatalf("advertisedProxyAddr: %v", err)
+	}
+	if vmdAddr != "10.0.0.3:50051" {
+		t.Fatalf("advertisedVMDAddr = %q, want derived host address", vmdAddr)
+	}
+	if proxyAddr != "10.0.0.3:5007" {
+		t.Fatalf("advertisedProxyAddr = %q, want derived host address", proxyAddr)
+	}
+	if resolved != 1 {
+		t.Fatalf("host interface resolved %d times, want 1", resolved)
+	}
+}
+
 func TestParseSecretsProxyAddr(t *testing.T) {
 	t.Parallel()
 
@@ -217,4 +299,31 @@ func TestShutdownAbortsOnCloserFailure(t *testing.T) {
 	t.Run("wedged, ignores ctx", func(t *testing.T) {
 		run(t, func(context.Context) error { select {} }) // ponytail: never returns
 	})
+}
+
+// Pressure accounting is opt-in on BOTH halves: an operator-set
+// advertise address and a control plane to publish to. A host with an
+// address but no control-plane URL never starts a heartbeat, so turning
+// the accounting on would buy a startup scan whose results nothing
+// reads.
+func TestPublishesCapacityPressureRequiresBothHalves(t *testing.T) {
+	cases := []struct {
+		name            string
+		advertiseAddr   string
+		controlPlaneURL string
+		want            bool
+	}{
+		{"both set", "10.0.0.2:50051", "http://cp:8080", true},
+		{"no advertise address", "", "http://cp:8080", false},
+		{"no control plane", "10.0.0.2:50051", "", false},
+		{"neither", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := publishesCapacityPressure(tc.advertiseAddr, tc.controlPlaneURL); got != tc.want {
+				t.Fatalf("publishesCapacityPressure(%q, %q) = %v, want %v",
+					tc.advertiseAddr, tc.controlPlaneURL, got, tc.want)
+			}
+		})
+	}
 }

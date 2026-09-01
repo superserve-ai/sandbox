@@ -846,3 +846,46 @@ func TestOutboxDepthExcludesSeedMarker(t *testing.T) {
 		t.Fatalf("pending after seed marker = %d err=%v, want 0", len(pending), err)
 	}
 }
+
+func TestStagingRootsEmptyOnFirstBoot(t *testing.T) {
+	j, _ := testJournal(t)
+	if roots, err := j.StagingRoots(); err != nil || len(roots) != 0 {
+		t.Fatalf("StagingRoots on a fresh journal = %v err=%v, want empty", roots, err)
+	}
+}
+
+func TestStagingRootsRecordIsIdempotentAndRemoveDrops(t *testing.T) {
+	j, _ := testJournal(t)
+	for i := 0; i < 2; i++ { // recording twice must not duplicate
+		if err := j.RecordStagingRoot("/mnt/backup-data/backup-staging"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.RecordStagingRoot("/mnt/backup-data-2/backup-staging"); err != nil {
+		t.Fatal(err)
+	}
+	roots, err := j.StagingRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"/mnt/backup-data/backup-staging": true, "/mnt/backup-data-2/backup-staging": true}
+	if len(roots) != len(want) {
+		t.Fatalf("StagingRoots = %v, want exactly %v", roots, want)
+	}
+	for _, r := range roots {
+		if !want[r] {
+			t.Fatalf("unexpected root %q in %v", r, roots)
+		}
+	}
+
+	if err := j.RemoveStagingRoot("/mnt/backup-data/backup-staging"); err != nil {
+		t.Fatal(err)
+	}
+	roots, err = j.StagingRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 1 || roots[0] != "/mnt/backup-data-2/backup-staging" {
+		t.Fatalf("StagingRoots after removing one = %v, want only the other", roots)
+	}
+}

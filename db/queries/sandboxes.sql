@@ -561,17 +561,26 @@ fresh AS (
   SELECT unnest(@manifest_file_names::text[]) AS file_name,
          unnest(@manifest_paths::text[])      AS path,
          unnest(@manifest_sizes::bigint[])    AS size_bytes,
+         unnest(@manifest_allocated_bytes::bigint[]) AS allocated_bytes,
          unnest(@manifest_digests::text[])    AS sha256,
          unnest(@manifest_base_paths::text[]) AS base_path
 ),
 kept AS (
-  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
-  SELECT u.snap_id, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
+  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256, base_path)
+  SELECT u.snap_id, f.file_name, f.path, f.size_bytes,
+         CASE WHEN f.allocated_bytes IS NULL OR f.allocated_bytes < 0 THEN
+                COALESCE((SELECT am.allocated_bytes
+                          FROM artifact_manifest am
+                          WHERE am.snapshot_id = u.snap_id
+                            AND am.file_name = f.file_name), 0)
+              ELSE COALESCE(f.allocated_bytes, 0) END,
+         f.sha256, NULLIF(f.base_path, '')
   FROM upserted u CROSS JOIN fresh f
   ON CONFLICT (snapshot_id, file_name) WHERE snapshot_id IS NOT NULL
   DO UPDATE SET
       path = EXCLUDED.path,
       size_bytes = EXCLUDED.size_bytes,
+      allocated_bytes = EXCLUDED.allocated_bytes,
       sha256 = EXCLUDED.sha256,
       base_path = EXCLUDED.base_path,
       created_at = now()
@@ -644,12 +653,21 @@ fresh AS (
   SELECT unnest(@manifest_file_names::text[]) AS file_name,
          unnest(@manifest_paths::text[])      AS path,
          unnest(@manifest_sizes::bigint[])    AS size_bytes,
+         unnest(@manifest_allocated_bytes::bigint[]) AS allocated_bytes,
          unnest(@manifest_digests::text[])    AS sha256,
          unnest(@manifest_base_paths::text[]) AS base_path
 ),
 manifested AS (
-  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
-  SELECT i.snap_id, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
+  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256, base_path)
+  SELECT i.snap_id, f.file_name, f.path, f.size_bytes,
+         CASE WHEN f.allocated_bytes IS NULL OR f.allocated_bytes < 0 THEN
+                COALESCE((SELECT am.allocated_bytes
+                          FROM artifact_manifest am
+                          JOIN sandbox sb ON sb.snapshot_id = am.snapshot_id
+                          WHERE sb.id = @id
+                            AND am.file_name = f.file_name), 0)
+              ELSE COALESCE(f.allocated_bytes, 0) END,
+         f.sha256, NULLIF(f.base_path, '')
   FROM inserted i CROSS JOIN fresh f
   RETURNING id
 )

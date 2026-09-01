@@ -39,13 +39,16 @@ type BuildTemplateRequest struct {
 
 // BuildTemplateResult is returned on success.
 type BuildTemplateResult struct {
-	SnapshotPath   string
-	MemFilePath    string
-	RootfsPath     string
-	BasePath       string // overlay-mode templates only
-	DeltaPath      string // overlay-mode templates only
-	ResolvedDigest string // sha256:... of the resolved base image
-	SizeBytes      int64  // on-disk rootfs size
+	SnapshotPath         string
+	MemFilePath          string
+	RootfsPath           string
+	BasePath             string // overlay-mode templates only
+	DeltaPath            string // overlay-mode templates only
+	ResolvedDigest       string // sha256:... of the resolved base image
+	SizeBytes            int64  // on-disk rootfs size
+	RootfsAllocatedBytes int64
+	BaseAllocatedBytes   int64
+	DeltaAllocatedBytes  int64
 }
 
 // BuildTemplate starts a template build asynchronously and returns the
@@ -85,12 +88,13 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 	// ending. CancelBuild is what stops it.
 	buildCtx, cancel := context.WithCancel(context.Background())
 
-	if _, err := m.registerBuild(buildVMID, req.TemplateID, cancel); err != nil {
+	rec, err := m.registerBuild(buildVMID, req.TemplateID, req.VCPU, req.MemoryMiB, cancel)
+	if err != nil {
 		cancel()
 		return "", err
 	}
 
-	go func() { defer sentrylog.Recover("build-worker"); m.buildTemplateWorker(buildCtx, buildVMID, req) }()
+	go func() { defer sentrylog.Recover("build-worker"); m.buildTemplateWorker(buildCtx, buildVMID, req, rec) }()
 
 	return buildVMID, nil
 }
@@ -98,15 +102,24 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 // buildTemplateWorker is the goroutine body. Runs one build end-to-end and
 // records the outcome in the registry. Never returns an error — all failures
 // are logged and surfaced via completeBuild so GetBuildStatus sees them.
-func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req BuildTemplateRequest) {
-	result, err := m.buildTemplateSync(ctx, buildVMID, req)
-	m.completeBuild(buildVMID, result, err)
+func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req BuildTemplateRequest, rec *buildRecord) {
+	// The WORKFLOW count holds until the worker returns (the build stays
+	// provisioning through its artifact hashing), but the memory/vCPU
+	// allocation releases when the last build VM exits — normally at the
+	// sync point inside buildTemplateSync, with this deferred call as the
+	// safety net for early error returns. Releasing allocation at worker
+	// return would publish a full VM's memory during a hash-only interval
+	// that can run for minutes.
+	defer m.buildPressureCount.Add(-1)
+	defer m.releaseBuildAlloc(rec, req.VCPU, req.MemoryMiB)
+	result, err := m.buildTemplateSync(ctx, buildVMID, req, rec)
+	m.completeBuild(buildVMID, rec, result, err)
 }
 
 // buildTemplateSync delegates the build to the template-builder subprocess.
 // The subprocess owns its own network, Firecracker process, and boxd
 // connection — completely isolated from vmd's sandbox state.
-func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req BuildTemplateRequest) (*BuildTemplateResult, error) {
+func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req BuildTemplateRequest, rec *buildRecord) (*BuildTemplateResult, error) {
 	log := m.log.With().Str("template_id", req.TemplateID).Str("build_vm_id", buildVMID).Str("from", req.Spec.From).Logger()
 	log.Info().Msg("starting template build (subprocess)")
 	buildStart := time.Now()
@@ -146,7 +159,20 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 		"--boxd", m.cfg.BoxdBinaryPath,
 		"--host-interface", m.cfg.HostInterface,
 		"--slot-index", fmt.Sprint(slotIndex),
+		// Resolved here, not in the subprocess: launchLauncherPath applies the
+		// same readiness and pin-mounted gates a VM launch does, and returns ""
+		// to fall back to the legacy entry. The subprocess re-checks the pin
+		// immediately before it launches, since a build can spend minutes
+		// pulling an image before it gets there.
+		"--launcher-ns", m.launchLauncherPath(buildVMID),
 	)
+	// The build creates its own slot, so it must use the same backend as this
+	// daemon: on the shell backend its slot setup forks `ip netns exec`
+	// repeatedly, and each of those clones the host mount table and stalls
+	// every concurrent launch — the cost the netlink backend exists to remove.
+	if m.netMgr.UsesNetlinkSlotOps() {
+		cmd.Args = append(cmd.Args, "--netlink-slot-ops")
+	}
 
 	// Stdout carries structured NDJSON build events — parse and forward
 	// to the build log buffer so SSE subscribers see real-time progress.
@@ -183,12 +209,18 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	if err != nil {
 		return nil, fmt.Errorf("read build meta: %w", err)
 	}
+	populateBuildAllocations(result)
 
 	// Best-effort: a missing access.log just means sandboxes fall back
 	// to sequential prefetch. The "build-" prefix must remain so isBuildVM
 	// skips persistence + reconciler for this throwaway VM.
 	if m.cfg.UffdEnabled && m.cfg.UffdPrefetchEnabled {
 		recordingVMID := "build-record-" + req.TemplateID
+		// The recorder-coverage window: from here until the allocation
+		// release below, this build's counters own the recorder id.
+		m.buildsMu.Lock()
+		rec.RecorderLive = true
+		m.buildsMu.Unlock()
 		accessLogPath := filepath.Join(snapshotDir, accessLogFilename)
 		recCfg := VMConfig{
 			VCPU:      req.VCPU,
@@ -205,7 +237,11 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	// the build's ns-<idx>/veth-<idx> reservation guards nothing anymore.
 	// Release it before the hashing below: holding a network slot through
 	// minutes of disk reads would shrink sandbox capacity for no reason.
+	// The memory/vCPU pressure allocation returns at the same moment and
+	// for the same reason: every build VM is gone (a recorder whose
+	// teardown failed is counted by the instance loop from here on).
 	releaseSlot()
+	m.releaseBuildAlloc(rec, req.VCPU, req.MemoryMiB)
 
 	// Durability: hash the finished artifact set (access.log included when
 	// recorded above), stamp the digests into build.meta.json, and enqueue
@@ -222,6 +258,21 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 
 	log.Info().Dur("total", time.Since(buildStart)).Msg("template build complete")
 	return result, nil
+}
+
+func physicalAllocatedBytes(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+	return stat.Blocks * 512
 }
 
 // backupBuildArtifacts makes a finished build's artifact set durable: hash

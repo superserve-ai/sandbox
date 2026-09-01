@@ -7,6 +7,14 @@ import (
 	"context"
 )
 
+// ResourceLimits is a sandbox's declared allocation, passed to restore so
+// the daemon never has to discover it. Zero fields mean "not declared" —
+// accepted for compatibility, and the daemon recovers them itself.
+type ResourceLimits struct {
+	VCPU      uint32
+	MemoryMiB uint32
+}
+
 // PortPolicy is the control-plane representation of one published preview
 // port. Tokenized wire modes require a positive TokenVersion; raw private and
 // public policies leave TokenVersion at zero.
@@ -22,8 +30,10 @@ type ManifestEntry struct {
 	FileName  string
 	Path      string
 	SizeBytes int64
-	SHA256    string
-	BasePath  string
+	// -1 means the host could not read allocation metadata; zero is valid.
+	AllocatedBytes int64
+	SHA256         string
+	BasePath       string
 }
 
 // Client defines the subset of the VM daemon gRPC interface used by the
@@ -52,7 +62,14 @@ type Client interface {
 	// previewProtocol echoes the vmd's preview-policy attestation from the
 	// response; empty means the vmd predates preview publication and ignored
 	// the request's policy fields.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, err error)
+	//
+	// limits declares the sandbox's allocation. The caller knows it (the
+	// sandbox row, or the template it was built from) and a restore does
+	// NOT otherwise reveal it: the snapshot carries the sizes inside
+	// Firecracker, so a daemon told nothing has to ask Firecracker
+	// afterwards to describe its own host honestly. Declaring it here
+	// keeps that probe off the create path entirely.
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits ResourceLimits) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, err error)
 	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
 	// running sandbox's boxd. Idempotent.
 	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error
@@ -183,16 +200,20 @@ type BuildLogEvent struct {
 // BuildStatusResult is the decoded form of vmdpb.GetBuildStatusResponse.
 // Status values: "running", "snapshotting", "ready", "failed", "cancelled".
 type BuildStatusResult struct {
-	NotFound       bool
-	Status         string
-	SnapshotPath   string // populated on ready
-	MemFilePath    string // populated on ready
-	RootfsPath     string // populated on ready
-	BasePath       string // populated on ready, overlay-mode templates only
-	DeltaPath      string // populated on ready, overlay-mode templates only
-	ResolvedDigest string // populated on ready
-	SizeBytes      int64  // populated on ready
-	ErrorMessage   string // populated on failed/cancelled
-	StartedAtUnix  int64
-	EndedAtUnix    int64
+	NotFound                bool
+	Status                  string
+	SnapshotPath            string // populated on ready
+	MemFilePath             string // populated on ready
+	RootfsPath              string // populated on ready
+	BasePath                string // populated on ready, overlay-mode templates only
+	DeltaPath               string // populated on ready, overlay-mode templates only
+	ResolvedDigest          string // populated on ready
+	SizeBytes               int64  // populated on ready
+	RootfsAllocatedBytes    int64  // populated on ready
+	BaseAllocatedBytes      int64  // populated on ready
+	DeltaAllocatedBytes     int64  // populated on ready
+	AllocatedBytesSupported bool   // true when the daemon populated allocation fields
+	ErrorMessage            string // populated on failed/cancelled
+	StartedAtUnix           int64
+	EndedAtUnix             int64
 }

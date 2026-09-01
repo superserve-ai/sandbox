@@ -25,6 +25,7 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
@@ -452,11 +453,12 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir, pa
 	manifest := make([]vmdclient.ManifestEntry, 0, len(resp.GetManifest()))
 	for _, e := range resp.GetManifest() {
 		manifest = append(manifest, vmdclient.ManifestEntry{
-			FileName:  e.GetFileName(),
-			Path:      e.GetPath(),
-			SizeBytes: e.GetSizeBytes(),
-			SHA256:    e.GetSha256(),
-			BasePath:  e.GetBasePath(),
+			FileName:       e.GetFileName(),
+			Path:           e.GetPath(),
+			SizeBytes:      e.GetSizeBytes(),
+			SHA256:         e.GetSha256(),
+			BasePath:       e.GetBasePath(),
+			AllocatedBytes: artifactManifestAllocatedBytes(e),
 		})
 	}
 	acked := ""
@@ -509,7 +511,7 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. For
 // sandboxes with secrets the caller passes envVars=nil and pushes env via
 // InjectSandboxEnv after minting a JWT against the returned source IP.
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string) (string, uint32, uint32, string, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
 		VmId:                  vmID,
 		SnapshotPath:          snapshotPath,
@@ -522,6 +524,12 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 		PreviewPorts:          previewPortsToProto(previewPorts),
 		PreviewPolicyRevision: previewPolicyRevision,
 		EnvVars:               envVars,
+		// Declared so the daemon can size this VM without asking
+		// Firecracker after the fact: undeclared, every restore costs a
+		// socket probe and a goroutine on the host, and the VM is
+		// counted as unsized until that lands. Omitted (zero) only by
+		// callers that do not know the shape.
+		ResourceLimits: restoreResourceLimits(limits),
 	})
 	if err != nil {
 		return "", 0, 0, "", fmt.Errorf("gRPC RestoreSnapshot: %w", err)
@@ -532,6 +540,20 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 		mem = rl.GetMemoryMib()
 	}
 	return resp.IpAddress, vcpu, mem, resp.GetPreviewProtocol(), nil
+}
+
+// restoreResourceLimits maps a declared allocation onto the request
+// field, and stays nil when nothing was declared: an empty message would
+// be indistinguishable from "declared as zero" on the daemon side, where
+// zero is exactly the signal that means "recover this yourself".
+func restoreResourceLimits(limits vmdclient.ResourceLimits) *vmdpb.ResourceLimits {
+	if limits.VCPU == 0 || limits.MemoryMiB == 0 {
+		return nil
+	}
+	return &vmdpb.ResourceLimits{
+		VcpuCount: limits.VCPU,
+		MemoryMib: limits.MemoryMiB,
+	}
 }
 
 func previewPortsToProto(ports map[int32]vmdclient.PortPolicy) []*vmdpb.PreviewPort {
@@ -730,19 +752,46 @@ func (c *grpcVMDClient) GetBuildStatus(ctx context.Context, buildVMID string) (v
 		return vmdclient.BuildStatusResult{}, fmt.Errorf("gRPC GetBuildStatus: %w", err)
 	}
 	return vmdclient.BuildStatusResult{
-		NotFound:       resp.GetNotFound(),
-		Status:         resp.GetStatus(),
-		SnapshotPath:   resp.GetSnapshotPath(),
-		MemFilePath:    resp.GetMemFilePath(),
-		RootfsPath:     resp.GetRootfsPath(),
-		BasePath:       resp.GetBasePath(),
-		DeltaPath:      resp.GetDeltaPath(),
-		ResolvedDigest: resp.GetResolvedDigest(),
-		SizeBytes:      resp.GetSizeBytes(),
-		ErrorMessage:   resp.GetErrorMessage(),
-		StartedAtUnix:  resp.GetStartedAtUnix(),
-		EndedAtUnix:    resp.GetEndedAtUnix(),
+		NotFound:                resp.GetNotFound(),
+		Status:                  resp.GetStatus(),
+		SnapshotPath:            resp.GetSnapshotPath(),
+		MemFilePath:             resp.GetMemFilePath(),
+		RootfsPath:              resp.GetRootfsPath(),
+		BasePath:                resp.GetBasePath(),
+		DeltaPath:               resp.GetDeltaPath(),
+		ResolvedDigest:          resp.GetResolvedDigest(),
+		SizeBytes:               resp.GetSizeBytes(),
+		RootfsAllocatedBytes:    resp.GetRootfsAllocatedBytes(),
+		BaseAllocatedBytes:      resp.GetBaseAllocatedBytes(),
+		DeltaAllocatedBytes:     resp.GetDeltaAllocatedBytes(),
+		AllocatedBytesSupported: resp.GetAllocatedBytesSupported(),
+		ErrorMessage:            resp.GetErrorMessage(),
+		StartedAtUnix:           resp.GetStartedAtUnix(),
+		EndedAtUnix:             resp.GetEndedAtUnix(),
 	}, nil
+}
+
+func artifactManifestAllocatedBytes(entry *vmdpb.ArtifactManifestEntry) int64 {
+	if entry == nil {
+		return -1
+	}
+	unknown := entry.ProtoReflect().GetUnknown()
+	for len(unknown) > 0 {
+		num, typ, n := protowire.ConsumeTag(unknown)
+		if n < 0 {
+			break
+		}
+		unknown = unknown[n:]
+		value, n := protowire.ConsumeVarint(unknown)
+		if n < 0 {
+			break
+		}
+		unknown = unknown[n:]
+		if num == 6 && typ == protowire.VarintType {
+			return int64(value)
+		}
+	}
+	return -1
 }
 
 func (c *grpcVMDClient) CancelBuild(ctx context.Context, buildVMID string) error {

@@ -304,7 +304,7 @@ func (s *stubVMD) PauseInstance(_ context.Context, _, _, pauseToken string) (str
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte) (string, uint32, uint32, error) {
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string) (string, uint32, uint32, string, error) {
+func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string, _ vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
 	return "10.0.0.1", 1, 1024, preview.HostCapabilityPorts, nil
 }
 func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {
@@ -1488,6 +1488,18 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 		t.Fatalf("test clock is too close to the billing period start: start=%s end=%s", start, end)
 	}
 	seconds := end.Sub(start).Seconds()
+	// Billable usage is clamped to the current period, so the seeded window
+	// collapses to minutes just after a period rolls over. Size the credit
+	// from the closed intervals rather than hardcoding an amount: a fixed
+	// credit only stays below the charges for most of the month, and exceeds
+	// them at the start of one, leaving credit unspent and flipping every
+	// assertion that expects it fully consumed.
+	closedCompute := 2 * seconds * 0.000014
+	closedMemory := 2 * seconds * 0.0000045
+	creditUSD := math.Round((closedCompute+closedMemory)/2*1e6) / 1e6
+	if creditUSD <= 0 {
+		t.Fatalf("seeded window is too short to bill against: seconds=%v", seconds)
+	}
 	openStart := now.Add(-15 * time.Minute)
 	if openStart.Before(periodStart) {
 		openStart = periodStart
@@ -1530,8 +1542,8 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	}
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
-		VALUES ($1, 0.100000, 0.100000, 'integration test credit')
-	`, teamID); err != nil {
+		VALUES ($1, $2, $2, 'integration test credit')
+	`, teamID, creditUSD); err != nil {
 		t.Fatalf("seed billing credit: %v", err)
 	}
 
@@ -1556,8 +1568,6 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	if !ok {
 		t.Fatalf("cost_breakdown_usd not an object: %v", body["cost_breakdown_usd"])
 	}
-	closedCompute := 2 * seconds * 0.000014
-	closedMemory := 2 * seconds * 0.0000045
 	minOpenSeconds := requestStarted.Sub(openStart).Seconds()
 	maxOpenSeconds := requestFinished.Sub(openStart).Seconds()
 	if minOpenSeconds < 0 {
@@ -1574,10 +1584,16 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	assertFloatNear(t, storage, 0)
 
 	currentCharges := body["current_charges_usd"].(float64)
-	creditsApplied := math.Min(currentCharges, 0.1)
+	// Everything below assumes the credit is fully consumed — including the
+	// later payment_setup_required check, which only holds once no credit
+	// remains. Fail here with the reason rather than there with a bare false.
+	if currentCharges <= creditUSD {
+		t.Fatalf("charges %v do not exceed the seeded credit %v, so it cannot be fully consumed", currentCharges, creditUSD)
+	}
+	creditsApplied := math.Min(currentCharges, creditUSD)
 	assertFloatNear(t, currentCharges, compute+memory)
 	assertFloatNear(t, body["credits_applied_usd"].(float64), creditsApplied)
-	assertFloatNear(t, body["credits_remaining_usd"].(float64), 0.1-creditsApplied)
+	assertFloatNear(t, body["credits_remaining_usd"].(float64), creditUSD-creditsApplied)
 	assertFloatNear(t, body["expected_invoice_amount_usd"].(float64), currentCharges-creditsApplied)
 
 	resources, ok := body["resources"].([]interface{})
@@ -3204,6 +3220,201 @@ func TestIntegration_GetTeamBillingUsage(t *testing.T) {
 	}
 	if got := numericFloat64(t, rollup.StorageMibSeconds); got != 245_760 {
 		t.Fatalf("rollup storage MiB seconds = %v, want 245760", got)
+	}
+}
+
+func TestIntegration_GetTeamBillingUsageDeduplicatesSharedArtifact(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	var sandboxIDs []uuid.UUID
+	for _, name := range []string{"shared-artifact-a", "shared-artifact-b"} {
+		cw := do(r, "POST", "/sandboxes", apiKey, fmt.Sprintf(`{"name":%q}`, name))
+		if cw.Code != http.StatusCreated {
+			t.Fatalf("create %s: %d %s", name, cw.Code, cw.Body.String())
+		}
+		sandboxIDs = append(sandboxIDs, uuid.MustParse(mustJSON(t, cw)["id"].(string)))
+	}
+
+	periodStart := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Minute)
+	periodEnd := periodStart.Add(time.Minute)
+	const artifactPath = "/tmp/test/shared-rootfs.ext4"
+	const artifactBytes = int64(8 * 1024 * 1024)
+	for i, sandboxID := range sandboxIDs {
+		if _, err := testPool.Exec(ctx, `
+			UPDATE sandbox
+			SET created_at = $2, base_path = NULL, delta_path = NULL
+			WHERE id = $1 AND team_id = $3
+		`, sandboxID, periodStart, teamID); err != nil {
+			t.Fatalf("prepare sandbox %d: %v", i, err)
+		}
+		var snapshotID uuid.UUID
+		if err := testPool.QueryRow(ctx, `
+			INSERT INTO snapshot (sandbox_id, team_id, path, trigger)
+			VALUES ($1, $2, $3, 'pause')
+			RETURNING id
+		`, sandboxID, teamID, fmt.Sprintf("/tmp/test/snapshot-%d", i)).Scan(&snapshotID); err != nil {
+			t.Fatalf("seed snapshot %d: %v", i, err)
+		}
+		if _, err := testPool.Exec(ctx, `UPDATE sandbox SET snapshot_id = $2 WHERE id = $1`, sandboxID, snapshotID); err != nil {
+			t.Fatalf("link snapshot %d: %v", i, err)
+		}
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, snapshotID, fmt.Sprintf("rootfs-%d.ext4", i), artifactPath, artifactBytes, artifactBytes, strings.Repeat("0", 64)); err != nil {
+			t.Fatalf("seed artifact manifest %d: %v", i, err)
+		}
+		if _, err := testPool.Exec(ctx, `
+			UPDATE sandbox_storage_interval
+			SET started_at = $2, ended_at = $3, end_reason = 'deleted', disk_mib = 1
+			WHERE sandbox_id = $1 AND ended_at IS NULL
+		`, sandboxID, periodStart.Add(10*time.Second), periodStart.Add(20*time.Second)); err != nil {
+			t.Fatalf("set overlay interval %d: %v", i, err)
+		}
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE template SET rootfs_path = $1, size_bytes = $2 WHERE name = 'superserve/base'`, artifactPath, artifactBytes); err != nil {
+		t.Fatalf("set shared template artifact: %v", err)
+	}
+
+	usage, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("get team billing usage: %v", err)
+	}
+	if got, want := numericFloat64(t, usage.StorageGibSeconds), float64(artifactBytes/1024/1024*50+20)/1024; got != want {
+		t.Fatalf("storage GiB seconds = %v, want %v", got, want)
+	}
+}
+
+func TestIntegration_GetTeamBillingUsageStartsArtifactRetentionAtStorageBoundary(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-artifact-boundary"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	periodStart := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Minute)
+	periodEnd := periodStart.Add(time.Minute)
+	const artifactPath = "/tmp/test/boundary-rootfs.ext4"
+	const artifactBytes = int64(8 * 1024 * 1024)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox
+		SET created_at = $2, base_path = NULL, delta_path = NULL
+		WHERE id = $1 AND team_id = $3
+	`, sandboxID, periodStart, teamID); err != nil {
+		t.Fatalf("prepare sandbox: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, periodStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set storage boundary: %v", err)
+	}
+	var snapshotID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO snapshot (sandbox_id, team_id, path, trigger)
+		VALUES ($1, $2, $3, 'pause')
+		RETURNING id
+	`, sandboxID, teamID, "/tmp/test/boundary-snapshot").Scan(&snapshotID); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET snapshot_id = $2 WHERE id = $1`, sandboxID, snapshotID); err != nil {
+		t.Fatalf("link snapshot: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256)
+		VALUES ($1, 'boundary-rootfs.ext4', $2, $3, $4, $5)
+	`, snapshotID, artifactPath, artifactBytes, artifactBytes, strings.Repeat("0", 64)); err != nil {
+		t.Fatalf("seed artifact manifest: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE template SET rootfs_path = $1, size_bytes = $2 WHERE name = 'superserve/base'`, artifactPath, artifactBytes); err != nil {
+		t.Fatalf("set template artifact: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $2, end_reason = 'deleted', disk_mib = 1
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, periodStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("close overlay interval at boundary: %v", err)
+	}
+
+	usage, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("get team billing usage: %v", err)
+	}
+	if got, want := numericFloat64(t, usage.StorageGibSeconds), float64(artifactBytes/1024/1024*30)/1024; got != want {
+		t.Fatalf("storage GiB seconds = %v, want %v", got, want)
+	}
+}
+
+func TestIntegration_GetTeamBillingUsageExcludesUnmeasuredArtifact(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-unmeasured-artifact"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	periodStart := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Minute)
+	periodEnd := periodStart.Add(time.Minute)
+	const artifactPath = "/tmp/test/unmeasured-rootfs.ext4"
+	const logicalArtifactBytes = int64(64 * 1024 * 1024)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox
+		SET created_at = $2, base_path = NULL, delta_path = NULL
+		WHERE id = $1 AND team_id = $3
+	`, sandboxID, periodStart, teamID); err != nil {
+		t.Fatalf("prepare sandbox: %v", err)
+	}
+	var snapshotID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO snapshot (sandbox_id, team_id, path, trigger)
+		VALUES ($1, $2, $3, 'pause')
+		RETURNING id
+	`, sandboxID, teamID, "/tmp/test/unmeasured-snapshot").Scan(&snapshotID); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET snapshot_id = $2 WHERE id = $1`, sandboxID, snapshotID); err != nil {
+		t.Fatalf("link snapshot: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256)
+		VALUES ($1, 'unmeasured-rootfs.ext4', $2, $3, $4)
+	`, snapshotID, artifactPath, logicalArtifactBytes, strings.Repeat("0", 64)); err != nil {
+		t.Fatalf("seed unmeasured artifact: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE template SET rootfs_path = $1, size_bytes = $2 WHERE name = 'superserve/base'`, artifactPath, logicalArtifactBytes); err != nil {
+		t.Fatalf("set template artifact: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'deleted', disk_mib = 2
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, periodStart.Add(10*time.Second), periodStart.Add(20*time.Second)); err != nil {
+		t.Fatalf("set overlay interval: %v", err)
+	}
+
+	usage, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("get team billing usage: %v", err)
+	}
+	if got, want := numericFloat64(t, usage.StorageGibSeconds), float64(2*10)/1024; got != want {
+		t.Fatalf("storage GiB seconds = %v, want %v; logical artifact size must not be used", got, want)
 	}
 }
 
@@ -5719,6 +5930,50 @@ func TestIntegration_FinalizePause_StaleFinalizeCannotOverwriteManifest(t *testi
 	}
 }
 
+func TestIntegration_FinalizePause_UnavailableAllocationKeepsPriorMeasurement(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"manifest-allocation-retention"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+	mem := "/snapshots/" + sid + "/mem.snap"
+	finalize := func(allocatedBytes int64) uuid.UUID {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+			t.Fatalf("force pausing: %v", err)
+		}
+		snapID, err := testQueries.FinalizePause(ctx, db.FinalizePauseParams{
+			ID: sandboxID, TeamID: teamID, Path: "/snapshots/" + sid + "/vmstate.snap",
+			MemPath: &mem, Trigger: "pause", ManifestFileNames: []string{"rootfs.ext4"},
+			ManifestPaths: []string{"/snapshots/" + sid + "/rootfs.ext4"}, ManifestSizes: []int64{4096},
+			ManifestAllocatedBytes: []int64{allocatedBytes}, ManifestDigests: []string{strings.Repeat("a", 64)},
+			ManifestBasePaths: []string{""},
+		})
+		if err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+		return snapID
+	}
+
+	snapID := finalize(8192)
+	updatedSnapID := finalize(-1)
+	if updatedSnapID != snapID {
+		t.Fatalf("finalize allocated a new snapshot %s; want conflict update of %s", updatedSnapID, snapID)
+	}
+	manifest, err := testQueries.ListSnapshotManifest(ctx, pgtype.UUID{Bytes: snapID, Valid: true})
+	if err != nil {
+		t.Fatalf("list manifest: %v", err)
+	}
+	if len(manifest) != 1 || manifest[0].AllocatedBytes != 8192 {
+		t.Fatalf("allocated_bytes = %+v, want retained 8192", manifest)
+	}
+}
+
 // The generations expand ships with the legacy unique index retained:
 // finalizes upsert in place (generation advancing) until the contract phase
 // drops the index, at which point the same binary starts inserting real
@@ -5833,6 +6088,83 @@ func TestIntegration_FinalizePause_GenerationModes(t *testing.T) {
 	}
 	if lastSize != 4096 {
 		t.Fatalf("partial-manifest generation size = %d, want prior size 4096 carried forward", lastSize)
+	}
+	// A failed host allocation sample on a new generation carries the prior
+	// head's allocation forward.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	allocationPath := "/snapshots/" + sid + "/overlay.ext4"
+	if _, err := testQueries.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
+		ID: sandboxID, TeamID: teamID, Path: "p7", MemPath: &memPath, SizeBytes: 4096, Trigger: "pause",
+		ManifestFileNames: []string{"overlay.ext4"}, ManifestPaths: []string{allocationPath},
+		ManifestSizes: []int64{4096}, ManifestAllocatedBytes: []int64{8192},
+		ManifestDigests: []string{strings.Repeat("c", 64)}, ManifestBasePaths: []string{""},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	failedAllocationHead, err := testQueries.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
+		ID: sandboxID, TeamID: teamID, Path: "p8", MemPath: &memPath, SizeBytes: 4096, Trigger: "pause",
+		ManifestFileNames: []string{"overlay.ext4"}, ManifestPaths: []string{allocationPath},
+		ManifestSizes: []int64{4096}, ManifestAllocatedBytes: []int64{-1},
+		ManifestDigests: []string{strings.Repeat("d", 64)}, ManifestBasePaths: []string{""},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var retainedAllocation int64
+	if err := testPool.QueryRow(ctx,
+		`SELECT allocated_bytes FROM artifact_manifest WHERE snapshot_id = $1 AND file_name = 'overlay.ext4'`, failedAllocationHead).
+		Scan(&retainedAllocation); err != nil {
+		t.Fatal(err)
+	}
+	if retainedAllocation != 8192 {
+		t.Fatalf("failed allocation = %d, want prior 8192", retainedAllocation)
+	}
+	// An omitted allocation sample is also unavailable and must retain the
+	// prior generation's physical allocation rather than becoming zero.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	nilAllocationHead, err := testQueries.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
+		ID: sandboxID, TeamID: teamID, Path: "p8b", MemPath: &memPath, SizeBytes: 4096, Trigger: "pause",
+		ManifestFileNames: []string{"overlay.ext4"}, ManifestPaths: []string{allocationPath},
+		ManifestSizes:   []int64{4096},
+		ManifestDigests: []string{strings.Repeat("d", 64)}, ManifestBasePaths: []string{""},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(ctx,
+		`SELECT allocated_bytes FROM artifact_manifest WHERE snapshot_id = $1 AND file_name = 'overlay.ext4'`, nilAllocationHead).
+		Scan(&retainedAllocation); err != nil {
+		t.Fatal(err)
+	}
+	if retainedAllocation != 8192 {
+		t.Fatalf("omitted allocation = %d, want prior 8192", retainedAllocation)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	zeroAllocationHead, err := testQueries.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
+		ID: sandboxID, TeamID: teamID, Path: "p9", MemPath: &memPath, SizeBytes: 4096, Trigger: "pause",
+		ManifestFileNames: []string{"overlay.ext4"}, ManifestPaths: []string{allocationPath},
+		ManifestSizes: []int64{4096}, ManifestAllocatedBytes: []int64{0},
+		ManifestDigests: []string{strings.Repeat("e", 64)}, ManifestBasePaths: []string{""},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(ctx,
+		`SELECT allocated_bytes FROM artifact_manifest WHERE snapshot_id = $1 AND file_name = 'overlay.ext4'`, zeroAllocationHead).
+		Scan(&retainedAllocation); err != nil {
+		t.Fatal(err)
+	}
+	if retainedAllocation != 0 {
+		t.Fatalf("successful zero allocation = %d, want 0", retainedAllocation)
 	}
 	// A stale finalize is still rejected whole in generations mode.
 	mem := "/snapshots/" + sid + "/mem.snap"
