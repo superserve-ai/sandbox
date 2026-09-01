@@ -273,10 +273,14 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 		// Position-relative insertion would reintroduce the races this design
 		// removed, so refuse and leave the call to the operator.
 		if spec.headGuarded[key] {
-			lastTerm := -1
+			// Everything above our LAST terminal rule is demoted by the head
+			// inserts. With no vmd terminal rule present at all — the first
+			// rollout — every existing rule is above the enforcement about
+			// to be created, so the whole chain is scanned.
+			lastTerm := len(got)
 			for i, g := range got {
 				for _, w := range want {
-					if securityRule(key, w) && ruleEqual(w.args, g) && i > lastTerm {
+					if securityRule(key, w) && ruleEqual(w.args, g) {
 						lastTerm = i
 					}
 				}
