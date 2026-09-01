@@ -498,6 +498,9 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 				Int("slot", slot.idx).
 				Msg("pool: discarded phantom slot (kernel netns missing)")
 			p.cleanup(slot)
+			// The discard opened a deficit just like a successful claim
+			// would; held workers must hear about this one too.
+			p.wakeRefillOnDeficit()
 			continue
 		}
 		tNsChecked := time.Now()
@@ -509,15 +512,7 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 		p.mgr.mu.Unlock()
 		tDone := time.Now()
 
-		// A successful claim may have opened a deficit; nudge any worker
-		// held at the inventory target. Non-blocking single-token send —
-		// nanoseconds on the claim path, never a wait.
-		if p.refillWake != nil && len(p.fresh)+len(p.recycled) < p.newSize {
-			select {
-			case p.refillWake <- struct{}{}:
-			default:
-			}
-		}
+		p.wakeRefillOnDeficit()
 
 		p.log.Info().
 			Str("vm_id", vmID).
@@ -1185,6 +1180,13 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 
 	p.adoptPhase.Store(adoptPhaseIdle)
 	p.signalProgress()
+	// Inventory work is done — release refill BEFORE the stray-veth sweep.
+	// The sweep's per-interface deletions can block for seconds and deliver
+	// nothing a claimant could wait for; holding the handoff across it
+	// would leave the pool with no producer at all while requests are
+	// already being served. The goroutine's deferred finish stays as the
+	// backstop for every other exit path.
+	p.finishStartupAdoption()
 	p.mgr.SweepStrayHostVeths()
 	// Emitted on every completion path — including the receipt fast path
 	// adopting all slots, or no orphans at all — so startup timing always has
@@ -1274,6 +1276,19 @@ func (p *Pool) finishStartupAdoption() {
 			}
 		}()
 	})
+}
+
+// wakeRefillOnDeficit nudges workers held at the inventory target when a
+// popped slot — claimed or discarded as a phantom — has opened a deficit.
+// Non-blocking send, nanoseconds on the claim path; extra nudges beyond the
+// crew-sized capacity drop.
+func (p *Pool) wakeRefillOnDeficit() {
+	if p.refillWake != nil && len(p.fresh)+len(p.recycled) < p.newSize {
+		select {
+		case p.refillWake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // waitForStartupAdoption blocks a refill worker until the boot adoption pass

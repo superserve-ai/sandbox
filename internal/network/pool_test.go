@@ -1728,6 +1728,34 @@ func TestEachDeficitClaimDepositsAWakeToken(t *testing.T) {
 	}
 }
 
+// Discarding a phantom slot opens a deficit exactly like a successful claim;
+// it must deposit a wake token too, or held workers sleep out the hold poll
+// while a claimant waits on them.
+func TestPhantomDiscardDepositsAWakeToken(t *testing.T) {
+	withTestNetnsDir(t) // no ns file: the pooled slot is a phantom
+	m := newTestManager()
+
+	p := &Pool{
+		mgr:               m,
+		log:               zerolog.Nop(),
+		newSize:           1,
+		fresh:             make(chan *preallocSlot, 1),
+		recycled:          make(chan *preallocSlot, 1),
+		stopCh:            make(chan struct{}),
+		refillWake:        make(chan struct{}, 1),
+		adoptEscapeStreak: defaultAdoptEscapeStreak,
+	}
+	m.assignSlotLocked(1, poolOwner)
+	p.fresh <- &preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"}
+
+	if got := p.Claim("vm-x"); got != nil {
+		t.Fatalf("expected nil (only a phantom available), got %+v", got)
+	}
+	if got := len(p.refillWake); got != 1 {
+		t.Fatalf("wake tokens = %d after a phantom discard, want 1", got)
+	}
+}
+
 // StartAdoption's planned-flag write must be race-safe against concurrent
 // handoff readers — the interleaving an ungated pool's already-running
 // workers produce. The readers here call waitForStartupAdoption directly
