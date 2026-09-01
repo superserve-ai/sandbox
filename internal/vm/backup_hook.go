@@ -303,6 +303,11 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 		m.healPendingBackup(pb, log)
 		return
 	}
+	// The same at-rest proof that admits the backup is what an overlay
+	// stranded by this pause's Full fallback was waiting for.
+	if inst := m.trackedInstance(pb.VMID); inst != nil {
+		reclaimStrandedOverlay(inst, log)
+	}
 	if pb.DiskBasePath != "" {
 		// The base dependency's identity must be the PAUSE-TIME one: a
 		// base replaced or rebuilt at the same path after the pause

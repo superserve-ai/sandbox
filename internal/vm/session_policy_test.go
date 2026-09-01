@@ -186,9 +186,38 @@ func TestPauseVM_MismatchFallsBackToFullAndKeepsOverlayUntilStop(t *testing.T) {
 	}
 	assertOverlayIntact(t, overlay)
 	inst.mu.RLock()
-	defer inst.mu.RUnlock()
-	if inst.Status != StatusPaused || inst.BaseMemPath != "" || inst.DirtyTrackingSessionID != "" {
+	st, base, session, stranded := inst.Status, inst.BaseMemPath, inst.DirtyTrackingSessionID, inst.StrandedOverlay
+	inst.mu.RUnlock()
+	if st != StatusPaused || base != "" || session != "" {
 		t.Fatalf("paused state not recorded as standalone: %+v", inst)
+	}
+	// The deferral is durable, so a vmd restart cannot forget the file.
+	if stranded != overlay {
+		t.Fatalf("stranded overlay not recorded, got %q", stranded)
+	}
+	if rec, err := m.state.Get("vm-1"); err != nil || rec == nil || rec.StrandedOverlay != overlay {
+		t.Fatalf("stranded overlay not persisted: rec=%+v err=%v", rec, err)
+	}
+
+	// The next step to prove the VM at rest — here a retried pause — reclaims
+	// it and clears the deferral durably. The fake never writes the Full's
+	// artifacts, which the retry expects on disk.
+	for _, p := range []string{filepath.Join(dir, "mem.snap"), filepath.Join(dir, "vmstate.snap")} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.unitDead = func(context.Context, string) bool { return true }
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", dir, "tok-test"); err != nil {
+		t.Fatalf("retried pause: %v", err)
+	}
+	for _, p := range []string{overlay, layeredBaseSidecarPath(overlay), presence.SidecarPath(overlay)} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("%s must be reclaimed once the VM is at rest (err=%v)", filepath.Base(p), err)
+		}
+	}
+	if rec, _ := m.state.Get("vm-1"); rec == nil || rec.StrandedOverlay != "" {
+		t.Fatalf("deferral must clear durably after reclaim, got %+v", rec)
 	}
 }
 

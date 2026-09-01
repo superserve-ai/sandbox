@@ -152,6 +152,11 @@ type VMInstance struct {
 	// (overlay + base). Cleared when a pause falls back to a standalone Full.
 	BaseMemPath string
 
+	// StrandedOverlay is an overlay a Full fallback left unreferenced while
+	// the process serving it could not be confirmed stopped; persisted, and
+	// reclaimed by the first later step that proves the VM at rest.
+	StrandedOverlay string
+
 	// DirtyTracked is true when the current Firecracker run was loaded with
 	// dirty-page tracking armed (set on incremental UFFD resume). Gates whether
 	// the next pause may write a Diff snapshot. Not persisted: it describes the
@@ -1509,6 +1514,15 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		if !fileExists(snapshotPath) || !fileExists(memPath) {
 			return "", "", nil, status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
 		}
+		// Rest is probed before the re-record below, so an overlay the
+		// original pause deferred is reclaimed and the cleared deferral
+		// lands in that same write.
+		atRest := m.vmConfirmedAtRest(ctx, vmID)
+		if atRest {
+			// Rest is now proven: the earlier unconfirmed stop resolved.
+			m.vmStopUnconfirmed.Delete(vmID)
+			reclaimStrandedOverlay(inst, log)
+		}
 		// The paused status may only exist in memory: the original pause sets it
 		// before persisting, so a failed write leaves the durable record reading
 		// Running behind a stopped unit — which the next reattach cleans up as
@@ -1527,9 +1541,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		// that skip through a status the at-rest checks trust, so it
 		// backs up only once the unit is confirmed dead.
 		var manifest []ManifestEntry
-		if m.vmConfirmedAtRest(ctx, vmID) {
-			// Rest is now proven: the earlier unconfirmed stop resolved.
-			m.vmStopUnconfirmed.Delete(vmID)
+		if atRest {
 			manifest = m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, pauseToken, log)
 		} else {
 			log.Warn().Msg("pause backup skipped on retry: unit not confirmed dead")
@@ -1798,23 +1810,30 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 
 	// Reclaim an overlay a layered→Full fallback stranded. Only after a
 	// confirmed stop: until the FC process is dead its UFFD handler still
-	// serves guest pages from this file. Best-effort — a failed remove leaks
-	// disk, never correctness — but an unconfirmed stop must skip it, and
-	// then the file is leaked deliberately rather than yanked from under a
-	// possibly-live guest.
+	// serves guest pages from this file. An unconfirmed stop instead records
+	// the path on the instance, so the first later step that proves the VM
+	// at rest (a retried pause, the reconciler, a resume) reclaims it rather
+	// than leaking a guest-sized file for the sandbox's lifetime.
+	stranded := ""
 	if orphanedOverlay != "" {
 		if stopConfirmed {
-			_ = os.Remove(orphanedOverlay)
-			_ = os.Remove(layeredBaseSidecarPath(orphanedOverlay))
-			_ = os.Remove(presence.SidecarPath(orphanedOverlay))
-			_ = os.Remove(clockFreezeMarkerPath(orphanedOverlay))
+			removeOverlayArtifacts(orphanedOverlay)
 		} else {
+			stranded = orphanedOverlay
 			log.Warn().Str("path", orphanedOverlay).
-				Msg("pause: stranded overlay not reclaimed (stop unconfirmed)")
+				Msg("pause: stranded overlay deferred (stop unconfirmed); reclaimed once the VM is at rest")
 		}
 	}
 
 	inst.mu.Lock()
+	if stopConfirmed && inst.StrandedOverlay != "" {
+		// An earlier pause's deferral resolves with this confirmed stop.
+		removeOverlayArtifacts(inst.StrandedOverlay)
+		inst.StrandedOverlay = ""
+	}
+	if stranded != "" {
+		inst.StrandedOverlay = stranded
+	}
 	inst.Status = StatusPaused
 	inst.SnapshotPath = snapshotPath
 	inst.MemFilePath = memPath
