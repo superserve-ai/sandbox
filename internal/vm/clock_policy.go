@@ -178,6 +178,12 @@ func (m *Manager) clockPolicyFor(correctsWallClock bool) *bool {
 // caller logging the outcome describes what happened rather than what was asked
 // for — after a fallback those differ.
 func (m *Manager) restoreWithClockFallback(policy *bool, restore func(clockRealtime *bool) error) (usedPolicy bool, err error) {
+	// A refusal seen by any earlier attempt — including this restore's own
+	// session fallback, which re-enters here — already settled the answer;
+	// spend no request rediscovering it.
+	if policy != nil && !m.clockRealtimeCapable.Load() {
+		policy = nil
+	}
 	err = restore(policy)
 	if policy == nil || !isUnknownClockFieldErr(err) {
 		return policy != nil && err == nil, err

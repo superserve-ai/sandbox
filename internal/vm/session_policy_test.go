@@ -352,6 +352,39 @@ func TestRestoreForResume_UnknownSessionFieldFallsBack(t *testing.T) {
 	}
 }
 
+// A rollback to a binary that supports neither feature costs exactly one
+// request per refused field, never a retry of a field already refused: the
+// clock is refused first (it serializes first), then the session, and the
+// third attempt carries neither.
+func TestRestoreForResume_DoubleRollbackRetriesEachFieldOnce(t *testing.T) {
+	fc := startSnapshotAPIFake(t, func(_, body string) (int, string) {
+		switch {
+		case strings.Contains(body, `"clock_realtime"`):
+			return http.StatusBadRequest, unknownFieldPayload("clock_realtime")
+		case loadBodyHasSession(body):
+			return http.StatusBadRequest, unknownFieldPayload("tracking_session_id")
+		}
+		return http.StatusNoContent, ""
+	})
+	m := resumeManager(t, true)
+	m.clockRealtimeCapable.Store(true)
+	freeze := false
+	_, armed, usedClock, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze)
+	if err != nil || armed != "" || usedClock {
+		t.Fatalf("the bare retry must succeed with nothing armed, got err=%v armed=%q clock=%v", err, armed, usedClock)
+	}
+	bodies := fc.snapshotBodies()
+	if len(bodies) != 3 {
+		t.Fatalf("want exactly 3 requests (both, session-only, neither), got %d: %v", len(bodies), bodies)
+	}
+	if strings.Contains(bodies[2], `"clock_realtime"`) || loadBodyHasSession(bodies[2]) {
+		t.Fatalf("the final attempt must carry neither field: %s", bodies[2])
+	}
+	if m.clockRealtimeCapable.Load() || m.dirtyTrackingSessionCapable.Load() {
+		t.Fatal("both refusals must clear their capabilities")
+	}
+}
+
 // The matcher covers both endpoints' field names and nothing else.
 func TestIsUnknownSessionFieldErr(t *testing.T) {
 	for _, field := range []string{"tracking_session_id", "expected_session_id", "expected_generation"} {

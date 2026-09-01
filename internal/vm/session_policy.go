@@ -17,6 +17,10 @@ func (m *Manager) sessionArmingEnabled() bool {
 // raised before any guest state is touched. Returns the session actually
 // armed — empty after a fallback, so the caller records none.
 func (m *Manager) restoreWithSessionFallback(sessionID string, restore func(sessionID string) (usedPolicy bool, err error)) (armed string, usedPolicy bool, err error) {
+	// A refusal another restore already took settles it for this one too.
+	if sessionID != "" && !m.dirtyTrackingSessionCapable.Load() {
+		sessionID = ""
+	}
 	usedPolicy, err = restore(sessionID)
 	if sessionID == "" || !isUnknownSessionFieldErr(err) {
 		return sessionID, usedPolicy, err
