@@ -1548,10 +1548,19 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		// top of a stocked recycled channel duplicates, at full price,
 		// inventory the pool already holds. Matters most after a
 		// receiptless restart, where full adoption places everything it
-		// recovers into recycled. Held workers are not producers; claims
-		// draining the surplus reopen building within a poll tick.
+		// recovers into recycled.
+		//
+		// Held workers STAY declared active — the same truthfulness as a
+		// worker parked on a full channel with a slot in hand: one wake
+		// from producing. Deactivating here would open a window where a
+		// burst drains the pool and the next claimant reads zero producers
+		// before any woken worker re-declares, sending it to an inline
+		// build against workers already waking.
 		if len(p.fresh)+len(p.recycled) >= p.newSize {
-			deactivate()
+			if !active {
+				active = true
+				p.refillActive.Add(1)
+			}
 			select {
 			case <-p.refillWake: // a claim opened a deficit
 			case <-time.After(refillHoldPoll):

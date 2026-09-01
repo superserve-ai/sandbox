@@ -1658,6 +1658,11 @@ func TestClaimWakesHeldRefillWorkers(t *testing.T) {
 	if got := builds.Load(); got != 0 {
 		t.Fatalf("refill built %d slots at target, want 0", got)
 	}
+	// Held is still declared: a claimant racing the wake must see a
+	// producer, not fall back to an inline build.
+	if got := p.refillActive.Load(); got != 1 {
+		t.Fatalf("refillActive = %d while held at target, want 1", got)
+	}
 
 	if info := p.Claim("vm-wake"); info == nil {
 		t.Fatal("claim from a stocked pool failed")
