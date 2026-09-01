@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -427,5 +428,63 @@ func TestHeartbeatStorageCacheRetriesUnchangedSamplesAfterInterval(t *testing.T)
 	}
 	if !cache.shouldSend(version, now.Add(overlayStorageSampleInterval)) {
 		t.Fatal("unchanged measurements must be retried after the retry interval")
+	}
+}
+
+// A publishing host must SAY so on its heartbeat. The control plane's
+// three-state classification keys on this capability: without it, a host
+// that publishes pressure is indistinguishable from a daemon that never
+// will, so its reports are never consulted and capacity ranking sees an
+// empty fleet.
+//
+// The consumer-side constant lives in internal/scheduler, which this
+// package cannot import — hence the literal, and hence a test on each
+// side of the contract.
+func TestSendHeartbeatAdvertisesCapacityPressureWhenPublishing(t *testing.T) {
+	capabilitiesFor := func(cfg HeartbeatConfig) []string {
+		t.Helper()
+		var got heartbeatRequest
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/health":
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(proxyHealthResponse{})
+			default:
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+					t.Errorf("decode heartbeat: %v", err)
+				}
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+		defer server.Close()
+
+		cfg.HostID = "host-a"
+		sendHeartbeat(context.Background(), server.Client(), cfg,
+			server.URL+"/internal/hosts/host-a/heartbeat", "shared", server.URL+"/health", nil, zerolog.Nop())
+		return got.Capabilities
+	}
+
+	publishing := capabilitiesFor(HeartbeatConfig{
+		VMDAddr:  "10.0.0.2:50051",
+		Pressure: func() HostPressure { return HostPressure{} },
+	})
+	if !slices.Contains(publishing, capabilityCapacityPressure) {
+		t.Fatalf("capabilities = %v, missing %q; every publishing host would read as legacy",
+			publishing, capabilityCapacityPressure)
+	}
+
+	// Not publishing: no advertisement, so the control plane keeps
+	// treating it as a daemon that does not report.
+	silent := capabilitiesFor(HeartbeatConfig{VMDAddr: "10.0.0.2:50051"})
+	if slices.Contains(silent, capabilityCapacityPressure) {
+		t.Fatalf("capabilities = %v; a host that publishes nothing must not claim to", silent)
+	}
+
+	// Configured to publish but with no advertised address: the report
+	// has no identity to fence on, so publication never happens and the
+	// capability must not be claimed either.
+	unaddressed := capabilitiesFor(HeartbeatConfig{Pressure: func() HostPressure { return HostPressure{} }})
+	if slices.Contains(unaddressed, capabilityCapacityPressure) {
+		t.Fatalf("capabilities = %v; without an advertised address nothing is published", unaddressed)
 	}
 }
