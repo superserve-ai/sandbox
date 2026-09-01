@@ -1570,6 +1570,56 @@ func TestRefillBuildsOnlyTheDeficitAfterAdoption(t *testing.T) {
 			}
 		})
 	}
+
+	// The receiptless-restart shape: full adoption places everything it
+	// recovers into the recycled channel, and none of it into fresh. That
+	// inventory serves claims just as well, so refill must build nothing.
+	t.Run("recovery into recycled only", func(t *testing.T) {
+		builds := stubPoolAllocate(t)
+		gate := make(chan struct{})
+		p := &Pool{
+			mgr:                 &Manager{},
+			log:                 zerolog.Nop(),
+			newSize:             capacity,
+			fresh:               make(chan *preallocSlot, capacity),
+			recycled:            make(chan *preallocSlot, capacity),
+			stopCh:              make(chan struct{}),
+			startGate:           gate,
+			startupAdoptionDone: make(chan struct{}),
+			refillDrainGate:     make(chan struct{}),
+			adoptEscapeStreak:   defaultAdoptEscapeStreak,
+		}
+		p.startupAdoptionPlanned.Store(true)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		for i := 0; i < workers; i++ {
+			p.wg.Add(1)
+			go p.refillLoop(ctx)
+		}
+
+		close(gate)
+		for i := 0; i < capacity; i++ {
+			p.recycled <- &preallocSlot{idx: 2000 + i, adopted: true}
+		}
+		p.finishStartupAdoption()
+
+		time.Sleep(100 * time.Millisecond)
+		if got := builds.Load(); got != 0 {
+			t.Fatalf("refill built %d slots atop a fully recycled recovery, want 0", got)
+		}
+		if got := len(p.fresh); got != 0 {
+			t.Fatalf("fresh holds %d slots, want 0 — inventory already at target", got)
+		}
+
+		close(p.stopCh)
+		waited := make(chan struct{})
+		go func() { p.wg.Wait(); close(waited) }()
+		select {
+		case <-waited:
+		case <-time.After(2 * time.Second):
+			t.Fatal("workers did not join after stop")
+		}
+	})
 }
 
 // StartAdoption's planned-flag write must be race-safe against concurrent

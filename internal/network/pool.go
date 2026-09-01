@@ -198,6 +198,10 @@ const (
 	// per-attempt luck, so retrying immediately burns a core and floods the
 	// log with thousands of identical lines a second without fixing anything.
 	refillFailureBackoff = 2 * time.Second
+	// refillHoldPoll is how often a held refill worker re-checks total warm
+	// inventory (see the hold in refillLoop). A claim draining the surplus
+	// resumes building within one tick.
+	refillHoldPoll = 500 * time.Millisecond
 	// refillConcurrency is the number of refill workers rebuilding the fresh
 	// pool. A single worker refills at one slot per build-time, which cannot
 	// catch a drained pool back up while claims keep arriving; builds stay
@@ -1513,6 +1517,25 @@ func (p *Pool) refillLoop(ctx context.Context) {
 			deactivate()
 			select {
 			case <-time.After(refillFailureBackoff):
+			case <-p.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
+		// The refill target is total warm inventory, not fresh-channel
+		// occupancy: a recovered slot sitting in recycled serves a claim
+		// exactly as well as a fresh build, so building "up to target" on
+		// top of a stocked recycled channel duplicates, at full price,
+		// inventory the pool already holds. Matters most after a
+		// receiptless restart, where full adoption places everything it
+		// recovers into recycled. Held workers are not producers; claims
+		// draining the surplus reopen building within a poll tick.
+		if len(p.fresh)+len(p.recycled) >= p.newSize {
+			deactivate()
+			select {
+			case <-time.After(refillHoldPoll):
 			case <-p.stopCh:
 				return
 			case <-ctx.Done():
