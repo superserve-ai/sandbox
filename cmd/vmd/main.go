@@ -1507,16 +1507,21 @@ func main() {
 	// below isn't held for the fill; creates fall back to on-demand until warm.
 	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "256"))
 	netPoolRecycle, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_RECYCLE_SIZE", "256"))
+	// One predicate decides both the plan and the call: PlanStartupAdoption
+	// parks refill behind a pass the caller promises to start, so the two
+	// must never diverge.
+	adoptionPlanned := adoptNetPool && slotsReserved && sweepSafe
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
-		NewSize:           netPoolFresh,
-		RecycleSize:       netPoolRecycle,
-		StartGate:         postReady,
-		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
-		AbandonOnStop:     adoptNetPool,
+		NewSize:             netPoolFresh,
+		RecycleSize:         netPoolRecycle,
+		StartGate:           postReady,
+		PlanStartupAdoption: adoptionPlanned,
+		ResetTapOnRecycle:   envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
+		AbandonOnStop:       adoptNetPool,
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 	switch {
-	case adoptNetPool && slotsReserved && sweepSafe:
+	case adoptionPlanned:
 		// Adopt the slots the previous run abandoned (or crashed out of):
 		// the pool starts warm within seconds instead of refilling from
 		// scratch. StartAdoption marks the pass underway before returning,
