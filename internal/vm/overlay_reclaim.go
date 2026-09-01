@@ -18,19 +18,29 @@ func removeOverlayArtifacts(overlay string) {
 }
 
 // reclaimStrandedOverlay removes the overlay a pause deferred because its
-// process could not be confirmed stopped. Callers invoke it only once the VM
-// is proven at rest — the file may still be serving guest pages until then.
-// It does not persist: the cleared field lands with the caller's next
-// record write, and a deferral that outlives the files only costs a no-op
-// remove on the next reclaim.
-func reclaimStrandedOverlay(inst *VMInstance, log zerolog.Logger) {
+// process could not be confirmed stopped, and clears the deferral durably.
+// Callers hold the vm-op lock and invoke it only once the VM is proven at
+// rest — the file may still be serving guest pages until then.
+//
+// A deferred path can be reused by a later pause before the deferral is
+// resolved (a crash between the reclaim and its persist replays the stale
+// marker). The artifact the record currently references is therefore never
+// removed: the marker is simply dropped, since the path is live again.
+func (m *Manager) reclaimStrandedOverlay(inst *VMInstance, log zerolog.Logger) {
 	inst.mu.Lock()
-	overlay := inst.StrandedOverlay
+	overlay, live := inst.StrandedOverlay, inst.MemFilePath
 	inst.StrandedOverlay = ""
 	inst.mu.Unlock()
 	if overlay == "" {
 		return
 	}
-	removeOverlayArtifacts(overlay)
-	log.Info().Str("path", overlay).Msg("reclaimed a stranded overlay")
+	if overlay == live {
+		log.Warn().Str("path", overlay).Msg("stranded overlay is the live artifact again; dropping the stale deferral")
+	} else {
+		removeOverlayArtifacts(overlay)
+		log.Info().Str("path", overlay).Msg("reclaimed a stranded overlay")
+	}
+	if _, err := m.persistStateIfPresent(inst); err != nil {
+		log.Warn().Err(err).Msg("stranded-overlay deferral cleared in memory only; a restart may replay it once")
+	}
 }

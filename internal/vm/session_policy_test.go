@@ -414,6 +414,35 @@ func TestRestoreForResume_DoubleRollbackRetriesEachFieldOnce(t *testing.T) {
 	}
 }
 
+// A stale deferral can name a path a later pause reused — a crash between a
+// reclaim and its persist replays the marker. The live artifact must never
+// be removed; the marker is dropped and the drop is persisted.
+func TestReclaimStrandedOverlay_NeverRemovesTheLiveArtifact(t *testing.T) {
+	dir := t.TempDir()
+	overlay := filepath.Join(dir, "mem.diff")
+	if err := os.WriteFile(overlay, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, MemFilePath: overlay, StrandedOverlay: overlay}); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusPaused, MemFilePath: overlay, StrandedOverlay: overlay}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+
+	m.reclaimStrandedOverlay(inst, zerolog.Nop())
+	if _, err := os.Stat(overlay); err != nil {
+		t.Fatalf("the live artifact must survive a stale deferral: %v", err)
+	}
+	if rec, _ := store.Get("vm-1"); rec == nil || rec.StrandedOverlay != "" {
+		t.Fatalf("the stale deferral must clear durably, got %+v", rec)
+	}
+}
+
 // The matcher covers both endpoints' field names and nothing else.
 func TestIsUnknownSessionFieldErr(t *testing.T) {
 	for _, field := range []string{"tracking_session_id", "expected_session_id", "expected_generation"} {

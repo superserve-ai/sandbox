@@ -1521,7 +1521,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		if atRest {
 			// Rest is now proven: the earlier unconfirmed stop resolved.
 			m.vmStopUnconfirmed.Delete(vmID)
-			reclaimStrandedOverlay(inst, log)
+			m.reclaimStrandedOverlay(inst, log)
 		}
 		// The paused status may only exist in memory: the original pause sets it
 		// before persisting, so a failed write leaves the durable record reading
@@ -1826,11 +1826,6 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	}
 
 	inst.mu.Lock()
-	if stopConfirmed && inst.StrandedOverlay != "" {
-		// An earlier pause's deferral resolves with this confirmed stop.
-		removeOverlayArtifacts(inst.StrandedOverlay)
-		inst.StrandedOverlay = ""
-	}
 	if stranded != "" {
 		inst.StrandedOverlay = stranded
 	}
@@ -1848,6 +1843,13 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// sandbox take the destructive relaunch gate for no reason.
 	inst.Unverified = false
 	inst.mu.Unlock()
+
+	// An earlier pause's deferral resolves with this confirmed stop. After
+	// the record fields above, so the guard against the live artifact sees
+	// the image this pause just wrote.
+	if stopConfirmed {
+		m.reclaimStrandedOverlay(inst, log)
+	}
 
 	// If-present, not Put: DestroyVM takes no vm-op lock (by design), and
 	// the detached stop widened the window where a destroy can land
