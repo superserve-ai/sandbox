@@ -69,7 +69,15 @@ func TestLoadConfigUsesHeartbeatOverrides(t *testing.T) {
 }
 
 func TestAdvertisedAddrsPreferExplicitOverrides(t *testing.T) {
-	vmdAddr, err := advertisedVMDAddr("does-not-matter", 50051, "10.0.0.2:50051")
+	// The host lookup dumps fleet-sized kernel tables, so explicit settings
+	// must satisfy both endpoints without it ever running.
+	resolved := 0
+	hostIP := func() (string, error) {
+		resolved++
+		return "", fmt.Errorf("host lookup must not run when both addresses are explicit")
+	}
+
+	vmdAddr, err := advertisedVMDAddr(hostIP, 50051, "10.0.0.2:50051")
 	if err != nil {
 		t.Fatalf("advertisedVMDAddr: %v", err)
 	}
@@ -77,12 +85,44 @@ func TestAdvertisedAddrsPreferExplicitOverrides(t *testing.T) {
 		t.Fatalf("advertisedVMDAddr = %q, want explicit override", vmdAddr)
 	}
 
-	proxyAddr, err := advertisedProxyAddr("does-not-matter", "http://127.0.0.1:5007/health", "10.0.0.2:5007")
+	proxyAddr, err := advertisedProxyAddr(hostIP, "http://127.0.0.1:5007/health", "10.0.0.2:5007")
 	if err != nil {
 		t.Fatalf("advertisedProxyAddr: %v", err)
 	}
 	if proxyAddr != "10.0.0.2:5007" {
 		t.Fatalf("advertisedProxyAddr = %q, want explicit override", proxyAddr)
+	}
+	if resolved != 0 {
+		t.Fatalf("host interface resolved %d times, want 0", resolved)
+	}
+}
+
+// Both endpoints derive from the same interface; the lookup behind them must
+// run once no matter how many callers need it.
+func TestAdvertisedAddrsShareOneHostLookup(t *testing.T) {
+	resolved := 0
+	hostIP := func() (string, error) {
+		resolved++
+		return "10.0.0.3", nil
+	}
+	memo := hostIPOnce(hostIP)
+
+	vmdAddr, err := advertisedVMDAddr(memo, 50051, "")
+	if err != nil {
+		t.Fatalf("advertisedVMDAddr: %v", err)
+	}
+	proxyAddr, err := advertisedProxyAddr(memo, "http://127.0.0.1:5007/health", "")
+	if err != nil {
+		t.Fatalf("advertisedProxyAddr: %v", err)
+	}
+	if vmdAddr != "10.0.0.3:50051" {
+		t.Fatalf("advertisedVMDAddr = %q, want derived host address", vmdAddr)
+	}
+	if proxyAddr != "10.0.0.3:5007" {
+		t.Fatalf("advertisedProxyAddr = %q, want derived host address", proxyAddr)
+	}
+	if resolved != 1 {
+		t.Fatalf("host interface resolved %d times, want 1", resolved)
 	}
 }
 

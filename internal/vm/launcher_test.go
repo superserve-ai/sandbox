@@ -94,6 +94,37 @@ func TestReadFCExecStamp(t *testing.T) {
 	}
 }
 
+// The two launch sites — vmd's start script and template-builder's build VM —
+// share LaunchNamespaceEntry so they cannot diverge on the entry mode or on
+// the sysfs remount it obliges. Skipping the remount under nsenter is silent:
+// the VM boots and /sys/class/net just shows the host's interfaces.
+func TestLaunchNamespaceEntry(t *testing.T) {
+	legacy := LaunchNamespaceEntry("ns-7", "")
+	if got := strings.Join(legacy.Argv, " "); got != "ip netns exec ns-7" {
+		t.Errorf("legacy argv = %q, want `ip netns exec ns-7`", got)
+	}
+	if legacy.SysfsSetup != "" {
+		t.Errorf("legacy entry must not remount /sys (ip netns exec already does); got %q", legacy.SysfsSetup)
+	}
+
+	pinned := LaunchNamespaceEntry("ns-7", "/run/vmd/launcher.mntns")
+	if got := strings.Join(pinned.Argv, " "); got != "nsenter --net=/run/netns/ns-7 --mount=/run/vmd/launcher.mntns --" {
+		t.Errorf("launcher argv = %q", got)
+	}
+	if !strings.Contains(pinned.SysfsSetup, "mount -t sysfs sysfs /sys") {
+		t.Errorf("launcher entry must remount /sys; got %q", pinned.SysfsSetup)
+	}
+	// The exec and shell renderings must describe the same entry, or the two
+	// launch sites take different paths from identical inputs. Compared with
+	// the shell quoting stripped, since only the shell form quotes the pin.
+	unquoted := strings.ReplaceAll(pinned.Shell, "'", "")
+	for _, a := range pinned.Argv {
+		if !strings.Contains(unquoted, a) {
+			t.Errorf("shell rendering %q missing argv element %q", pinned.Shell, a)
+		}
+	}
+}
+
 func TestFCStartScript_LegacyPath(t *testing.T) {
 	got := fcStartScript("ns-7", "", "SETUP",
 		"/usr/bin/firecracker", "/run/x/fc.sock", "vm-abc")

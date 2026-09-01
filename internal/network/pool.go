@@ -30,6 +30,11 @@ type PoolConfig struct {
 	// and the next process adopts the slots via AdoptOrphanSlots. Off by
 	// default (legacy teardown).
 	AbandonOnStop bool
+	// StartGate holds the refill and adoption workers until it is closed,
+	// keeping their RTNL-heavy inventory walks off the startup path (see
+	// the fleet-sized background work comment in cmd/vmd). Nil starts them
+	// immediately.
+	StartGate <-chan struct{}
 }
 
 // Pool pre-allocates network namespaces, veth pairs, TAP devices, and
@@ -45,8 +50,19 @@ type Pool struct {
 	fresh    chan *preallocSlot // pre-allocated from scratch
 	recycled chan *preallocSlot // returned from destroyed sandboxes
 	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	drainMu  sync.RWMutex
+	// startGate delays the refill and adoption workers; see PoolConfig.
+	// Nil means "already open".
+	startGate <-chan struct{}
+	// claimWaiters counts callers currently inside ClaimWait; producers
+	// never yield to the foreground while it is non-zero (the foreground is
+	// waiting on them).
+	claimWaiters atomic.Int64
+	// bgSlotSem is the shared concurrency budget for background slot work
+	// (adoption and refill together); rampBGSlots grants it. Nil meters
+	// nothing (tests).
+	bgSlotSem chan struct{}
+	wg        sync.WaitGroup
+	drainMu   sync.RWMutex
 	// refillDrainGate is closed while the controller is draining warm inventory.
 	// Refill workers select on it before handing a built slot to the pool so a
 	// send that was already blocked when drain started can still abort instead
@@ -201,6 +217,11 @@ var abandonStopWait = 10 * time.Second
 // Adoption pass phases (Pool.adoptPhase).
 const (
 	adoptPhaseIdle int32 = iota
+	// adoptPhasePending is a pass claimed but parked behind the start gate:
+	// it holds the duplicate-start guard without reading as a producer, so
+	// a claimant arriving before the gate opens builds inline instead of
+	// spending its wait budget on a pass that has not begun.
+	adoptPhasePending
 	adoptPhaseScanning
 	adoptPhaseVerifying
 )
@@ -230,6 +251,7 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		fresh:             make(chan *preallocSlot, newSize),
 		recycled:          make(chan *preallocSlot, recycleSize),
 		stopCh:            make(chan struct{}),
+		startGate:         cfg.StartGate,
 		refillDrainGate:   make(chan struct{}),
 		resetTapOnRecycle: cfg.ResetTapOnRecycle,
 		abandonOnStop:     cfg.AbandonOnStop,
@@ -248,6 +270,15 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 	if newSize < workers {
 		workers = newSize
 	}
+	// One shared concurrency budget across both background producers —
+	// adoption and refill — granted gradually after the gate (see
+	// rampBGSlots), so neither can burst the RTNL lock alone the moment the
+	// daemon starts serving. Created before any worker spawns so every
+	// reader sees the same channel.
+	p.bgSlotSem = make(chan struct{}, workers+adoptConcurrency)
+	p.wg.Add(1)
+	go func() { defer sentrylog.Recover("netpool-ramp"); p.rampBGSlots(ctx, workers+adoptConcurrency) }()
+
 	for i := 0; i < workers; i++ {
 		p.wg.Add(1)
 		// Declared active before the goroutine is even scheduled — a create
@@ -255,11 +286,136 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		// inline build against the imminent refill (the same synchronous
 		// publication StartAdoption makes for its phase). The worker inherits
 		// the declaration and relinquishes it on backoff, pause, or exit.
-		p.refillActive.Add(1)
+		// Behind a start gate the refill is NOT imminent, so the worker
+		// declares itself only once past the gate; a claimant arriving
+		// first correctly takes the bounded inline path.
+		if p.startGate == nil {
+			p.refillActive.Add(1)
+		}
 		go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
 	}
 
 	return p
+}
+
+// waitForStart blocks until the start gate opens. It reports false when the
+// pool was stopped or the context cancelled while waiting, so a daemon that
+// shuts down before the gate opens never leaves a worker parked on it.
+// A nil gate is already open.
+func (p *Pool) waitForStart(ctx context.Context) bool {
+	if p.startGate == nil {
+		return true
+	}
+	select {
+	case <-p.startGate:
+		return true
+	case <-p.stopCh:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
+const (
+	// refillRampStep is the interval at which a gated pool's background
+	// concurrency budget grows by one token after the gate opens — the gate
+	// opens the instant the daemon begins serving, so the budget arrives
+	// gradually instead of as a burst aimed at the first requests. Ungated
+	// pools get the full budget immediately.
+	refillRampStep = 2 * time.Second
+	// yieldPoll and yieldCapPerOp bound the foreground-priority pause a
+	// producer takes between slots. The cap keeps continuous request
+	// traffic from starving the producers: yielding is a courtesy with a
+	// ceiling, after which the producer proceeds regardless.
+	yieldPoll     = 25 * time.Millisecond
+	yieldCapPerOp = 500 * time.Millisecond
+)
+
+// yieldToForeground briefly pauses a background producer while request-path
+// network operations are in flight, giving their RTNL acquisitions priority
+// over slot production. It never yields while a claimant is waiting on the
+// pool: that foreground caller is waiting on this producer, and yielding to
+// it would be priority inversion. Bounded by yieldCapPerOp so producers
+// always make progress under sustained traffic; returns early on shutdown.
+func (p *Pool) yieldToForeground(ctx context.Context) {
+	deadline := time.Now().Add(yieldCapPerOp)
+	for p.mgr.foregroundOps.Load() > 0 &&
+		p.claimWaiters.Load() == 0 &&
+		time.Now().Before(deadline) {
+		select {
+		case <-time.After(yieldPoll):
+		case <-p.stopCh:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// withBGSlot runs fn under one background-concurrency token, yielding to any
+// in-flight foreground work first. Reports false — without running fn — on
+// shutdown or cancellation. The token is released even when fn panics: the
+// workers' panic recovery keeps the daemon up, and a token leaked past it
+// would shrink the budget for the rest of the process's life. A nil
+// semaphore meters nothing — tests and legacy construction.
+func (p *Pool) withBGSlot(ctx context.Context, fn func()) bool {
+	p.yieldToForeground(ctx)
+	// Checked before the select: with a token and a cancellation both
+	// ready, select would pick arms at random and could start one more
+	// operation into a shutdown.
+	select {
+	case <-p.stopCh:
+		return false
+	default:
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	if p.bgSlotSem == nil {
+		fn()
+		return true
+	}
+	select {
+	case <-p.bgSlotSem:
+	case <-p.stopCh:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+	defer func() { p.bgSlotSem <- struct{}{} }()
+	fn()
+	return true
+}
+
+// rampBGSlots grants the background concurrency budget: everything at once
+// for an ungated pool, one token per refillRampStep after the gate opens for
+// a gated one. Runs in the pool wait group so Stop joins it.
+func (p *Pool) rampBGSlots(ctx context.Context, total int) {
+	defer p.wg.Done()
+	if !p.waitForStart(ctx) {
+		return
+	}
+	granted := 0
+	if p.startGate == nil {
+		for ; granted < total; granted++ {
+			p.bgSlotSem <- struct{}{}
+		}
+		return
+	}
+	for granted < total {
+		p.bgSlotSem <- struct{}{}
+		granted++
+		if granted == total {
+			return
+		}
+		select {
+		case <-time.After(refillRampStep):
+		case <-p.stopCh:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // Claim takes a slot from the pool and assigns it to the given VM ID.
@@ -341,8 +497,12 @@ func (p *Pool) producing() bool {
 // adoptionTrusted reports whether claimants should treat the adoption pass as
 // a producer worth waiting on: a pass is running and hasn't tripped the
 // no-yield escape. Trust is reversible — a later delivery restores it.
+// A pending pass (parked behind the start gate) is not running and earns no
+// trust: nothing it could deliver exists yet.
 func (p *Pool) adoptionTrusted() bool {
-	return p.adoptPhase.Load() != adoptPhaseIdle && p.adoptStreak.Load() < p.adoptEscapeStreak
+	phase := p.adoptPhase.Load()
+	running := phase == adoptPhaseScanning || phase == adoptPhaseVerifying
+	return running && p.adoptStreak.Load() < p.adoptEscapeStreak
 }
 
 // progressCh returns the channel the next progress broadcast will close.
@@ -399,6 +559,11 @@ func (p *Pool) finalClaim(ctx context.Context, vmID string) *VMNetInfo {
 }
 
 func (p *Pool) ClaimWait(ctx context.Context, vmID string) *VMNetInfo {
+	// Declared for the producers' yield logic: while anyone is in here, the
+	// foreground is waiting on the pool itself, and producers must run flat
+	// out rather than politely yielding to the very caller they'd unblock.
+	p.claimWaiters.Add(1)
+	defer p.claimWaiters.Add(-1)
 	start := time.Now()
 	for {
 		// Checked before every claim attempt, not only in the select: a
@@ -744,7 +909,16 @@ func (p *Pool) adoptFromReceipt(ctx context.Context, candidates []int) (remainin
 			defer workers.Done()
 			defer sentrylog.Recover("netpool-receipt-adopt")
 			for idx := range work {
-				slot, timedOut := p.fastAdoptVouched(idx, nsSet, vethSet, occupied)
+				// Metered: on a clean restart this path adopts most of the
+				// fleet. A refused token means shutdown; the index stays
+				// claimed for the next boot, like a mid-pass shutdown.
+				var slot *preallocSlot
+				var timedOut bool
+				if !p.withBGSlot(ctx, func() {
+					slot, timedOut = p.fastAdoptVouched(idx, nsSet, vethSet, occupied)
+				}) {
+					continue
+				}
 				if timedOut {
 					// The abandoned validator may still be mutating this
 					// namespace; the index must not re-enter ANY path this
@@ -896,7 +1070,15 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 				defer workers.Done()
 				defer sentrylog.Recover("netpool-adopt")
 				for idx := range work {
-					p.adoptOne(ctx, idx, &nAdopted, &nInvalid, &nSkipped, &nTimeouts)
+					// Metered by the shared background budget; a refused
+					// token means shutdown — the slot stays claimed in
+					// the kernel, the same abandoned state a mid-pass
+					// shutdown leaves for the next boot to adopt.
+					if !p.withBGSlot(ctx, func() {
+						p.adoptOne(ctx, idx, &nAdopted, &nInvalid, &nSkipped, &nTimeouts)
+					}) {
+						nSkipped.Add(1)
+					}
 				}
 			}()
 		}
@@ -967,7 +1149,15 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 // builds against the imminent churn. The pass is tracked in the pool wait
 // group so Stop cannot outlive its state. A duplicate start is a no-op.
 func (p *Pool) StartAdoption(ctx context.Context) bool {
-	if !p.adoptPhase.CompareAndSwap(adoptPhaseIdle, adoptPhaseScanning) {
+	// A gated pass enters pending, not scanning: it holds the duplicate-start
+	// guard, but producing()/adoptionTrusted() ignore it, so no claimant
+	// spends its wait budget on work parked behind the gate. The pass
+	// promotes itself to scanning only once it is genuinely running.
+	claimed := adoptPhaseScanning
+	if p.startGate != nil {
+		claimed = adoptPhasePending
+	}
+	if !p.adoptPhase.CompareAndSwap(adoptPhaseIdle, claimed) {
 		p.log.Warn().Msg("pool: adoption already running — duplicate start ignored")
 		return false
 	}
@@ -975,6 +1165,14 @@ func (p *Pool) StartAdoption(ctx context.Context) bool {
 	go func() {
 		defer p.wg.Done()
 		defer sentrylog.Recover("netpool-adopt")
+		if !p.waitForStart(ctx) {
+			// Nothing was scanned, so the phase must not stay latched — a
+			// later StartAdoption (or direct pass) must find it idle.
+			p.adoptPhase.Store(adoptPhaseIdle)
+			p.signalProgress()
+			return
+		}
+		p.adoptPhase.CompareAndSwap(adoptPhasePending, adoptPhaseScanning)
 		p.AdoptOrphanSlots(ctx)
 	}()
 	return true
@@ -1181,14 +1379,23 @@ const (
 
 func (p *Pool) refillLoop(ctx context.Context) {
 	defer p.wg.Done()
+	if !p.waitForStart(ctx) {
+		return
+	}
+	// Past the gate the worker is genuinely producing, so it publishes the
+	// declaration StartPool skipped (see there for why a gated pool must not
+	// declare it up front). Ungated, StartPool already published it.
+	if p.startGate != nil {
+		p.refillActive.Add(1)
+	}
 	// The worker's active declaration is continuous across successful
 	// iterations — decrementing between two builds would let a delivery
 	// broadcast wake claimants into the instant where the count reads zero,
 	// and they would bail to inline builds against a producer that is
 	// committed to its next slot. Zero is exposed only at backoff, pause,
 	// and shutdown, when the pool genuinely promises nothing. The initial
-	// declaration was published synchronously by StartPool; this loop only
-	// ever relinquishes and re-acquires it.
+	// declaration was published synchronously by StartPool (or, when gated,
+	// just above); this loop only ever relinquishes and re-acquires it.
 	active := true
 	deactivate := func() {
 		if active {
@@ -1250,7 +1457,14 @@ func (p *Pool) refillLoop(ctx context.Context) {
 // it before tearing the doomed slot down, because cleanup can block for
 // seconds and a discarding worker is not a producer anyone should wait on.
 func (p *Pool) refillStep(ctx context.Context, deactivate func()) refillOutcome {
-	slot, err := p.allocate(ctx)
+	// Metered: the build is the RTNL-heavy part. The token is returned
+	// before the delivery send below — a worker parked on a full pool must
+	// not hold concurrency budget the other producers could use.
+	var slot *preallocSlot
+	var err error
+	if !p.withBGSlot(ctx, func() { slot, err = p.allocate(ctx) }) {
+		return refillStopped
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return refillStopped

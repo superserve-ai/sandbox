@@ -1170,3 +1170,216 @@ func BenchmarkClaimWaitBurst(b *testing.B) {
 		close(p.stopCh)
 	}
 }
+
+// The start gate holds fleet-sized background work until the daemon is ready
+// to serve. It must release on the gate, and it must not strand a worker when
+// the daemon shuts down before readiness is ever announced.
+func TestPoolWaitForStart(t *testing.T) {
+	newPool := func(gate <-chan struct{}) *Pool {
+		return &Pool{log: zerolog.Nop(), stopCh: make(chan struct{}), startGate: gate}
+	}
+
+	t.Run("nil gate is already open", func(t *testing.T) {
+		if !newPool(nil).waitForStart(context.Background()) {
+			t.Fatal("nil gate must not block")
+		}
+	})
+
+	t.Run("closed gate releases", func(t *testing.T) {
+		gate := make(chan struct{})
+		close(gate)
+		if !newPool(gate).waitForStart(context.Background()) {
+			t.Fatal("closed gate must release")
+		}
+	})
+
+	t.Run("releases when the gate opens later", func(t *testing.T) {
+		gate := make(chan struct{})
+		p := newPool(gate)
+		done := make(chan bool, 1)
+		go func() { done <- p.waitForStart(context.Background()) }()
+		select {
+		case <-done:
+			t.Fatal("released before the gate opened")
+		case <-time.After(20 * time.Millisecond):
+		}
+		close(gate)
+		select {
+		case ok := <-done:
+			if !ok {
+				t.Fatal("waitForStart reported failure after the gate opened")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("still parked after the gate opened")
+		}
+	})
+
+	t.Run("stop releases the waiter", func(t *testing.T) {
+		p := newPool(make(chan struct{})) // never opened
+		done := make(chan bool, 1)
+		go func() { done <- p.waitForStart(context.Background()) }()
+		close(p.stopCh)
+		select {
+		case ok := <-done:
+			if ok {
+				t.Fatal("stop must report the gate never opened")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("shutdown before readiness stranded a worker")
+		}
+	})
+
+	t.Run("context cancellation releases the waiter", func(t *testing.T) {
+		p := newPool(make(chan struct{})) // never opened
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan bool, 1)
+		go func() { done <- p.waitForStart(ctx) }()
+		cancel()
+		select {
+		case ok := <-done:
+			if ok {
+				t.Fatal("cancellation must report the gate never opened")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("cancellation stranded a worker")
+		}
+	})
+}
+
+// A gated pool must not advertise itself as producing before it can produce:
+// a claimant that sees a producer waits for it, and nothing is built until
+// the gate opens. Declaring early would trade a bounded inline build for a
+// stall on a worker that has not started.
+func TestGatedRefillDeclaresNoProducerBeforeRelease(t *testing.T) {
+	p := &Pool{log: zerolog.Nop(), stopCh: make(chan struct{}), startGate: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.wg.Add(1)
+	go p.refillLoop(ctx)
+
+	time.Sleep(20 * time.Millisecond)
+	if got := p.refillActive.Load(); got != 0 {
+		t.Fatalf("refillActive = %d while gated, want 0", got)
+	}
+
+	cancel()
+	waited := make(chan struct{})
+	go func() { p.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("gated worker did not exit on cancellation")
+	}
+	if got := p.refillActive.Load(); got != 0 {
+		t.Fatalf("refillActive = %d after exit, want 0", got)
+	}
+}
+
+// A gated adoption pass holds the duplicate-start guard but must not read as
+// a producer while parked: a claimant that trusts it waits out the adoption
+// budget on work that has not begun.
+func TestGatedAdoptionNotProducingBeforeRelease(t *testing.T) {
+	gate := make(chan struct{})
+	p := &Pool{
+		log:               zerolog.Nop(),
+		stopCh:            make(chan struct{}),
+		startGate:         gate,
+		adoptEscapeStreak: defaultAdoptEscapeStreak,
+	}
+
+	if !p.StartAdoption(context.Background()) {
+		t.Fatal("first StartAdoption must claim the pass")
+	}
+	if p.StartAdoption(context.Background()) {
+		t.Fatal("duplicate StartAdoption must be refused while parked")
+	}
+	if p.adoptionTrusted() {
+		t.Fatal("a parked adoption pass must not be trusted")
+	}
+	if p.producing() {
+		t.Fatal("a parked adoption pass must not read as producing")
+	}
+
+	// Shutdown before the gate ever opens: the pass must resolve to idle so
+	// nothing later waits on it — and a fresh start must be claimable again.
+	close(p.stopCh)
+	waited := make(chan struct{})
+	go func() { p.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("parked adoption did not exit on stop")
+	}
+	if got := p.adoptPhase.Load(); got != adoptPhaseIdle {
+		t.Fatalf("adoptPhase = %d after stop, want idle", got)
+	}
+}
+
+// The background concurrency budget stays at zero while the gate is closed,
+// grants its first token promptly on release, and its feeder joins cleanly on
+// stop mid-ramp.
+func TestBGSlotBudgetRampsAfterGate(t *testing.T) {
+	gate := make(chan struct{})
+	p := &Pool{
+		log:       zerolog.Nop(),
+		stopCh:    make(chan struct{}),
+		startGate: gate,
+		bgSlotSem: make(chan struct{}, 3),
+	}
+	p.wg.Add(1)
+	go p.rampBGSlots(context.Background(), 3)
+
+	time.Sleep(20 * time.Millisecond)
+	if got := len(p.bgSlotSem); got != 0 {
+		t.Fatalf("budget = %d tokens while gated, want 0", got)
+	}
+
+	close(gate)
+	select {
+	case <-p.bgSlotSem:
+	case <-time.After(time.Second):
+		t.Fatal("no token granted after the gate opened")
+	}
+
+	close(p.stopCh)
+	waited := make(chan struct{})
+	go func() { p.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("ramp feeder did not exit on stop")
+	}
+}
+
+// A panic inside metered work must not leak the token: the workers' panic
+// recovery keeps the daemon alive, and a leaked token would shrink the
+// background budget for the rest of the process's life.
+func TestWithBGSlotReturnsTokenOnPanic(t *testing.T) {
+	p := &Pool{
+		mgr:       &Manager{}, // yieldToForeground reads its counters
+		log:       zerolog.Nop(),
+		stopCh:    make(chan struct{}),
+		bgSlotSem: make(chan struct{}, 1),
+	}
+	p.bgSlotSem <- struct{}{} // full budget: one token
+
+	ran := false
+	func() {
+		defer func() {
+			// Specifically fn's panic — anything else means the panic fired
+			// before the token was even acquired and the test proved nothing.
+			if r := recover(); r != "boom" {
+				t.Fatalf("recovered %v, want the fn panic", r)
+			}
+		}()
+		p.withBGSlot(context.Background(), func() { ran = true; panic("boom") })
+	}()
+	if !ran {
+		t.Fatal("fn never ran — the token was never at risk")
+	}
+
+	select {
+	case <-p.bgSlotSem:
+	default:
+		t.Fatal("token not returned after panic")
+	}
+}
