@@ -1735,6 +1735,56 @@ func TestEachDeficitClaimDepositsAWakeToken(t *testing.T) {
 	}
 }
 
+// A claimant that outlived a trusted adoption pass gets the pool budget
+// re-anchored at the handoff: its wait so far was spent on adoption, and
+// backdating the shorter refill budget to its arrival would make it bail to
+// an inline build at the exact moment refill becomes available.
+func TestClaimBudgetReanchorsAtHandoff(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+
+	p := &Pool{
+		mgr:                 m,
+		log:                 zerolog.Nop(),
+		newSize:             2,
+		fresh:               make(chan *preallocSlot, 2),
+		recycled:            make(chan *preallocSlot, 2),
+		stopCh:              make(chan struct{}),
+		startGate:           make(chan struct{}),
+		startupAdoptionDone: make(chan struct{}),
+		adoptEscapeStreak:   defaultAdoptEscapeStreak,
+	}
+	p.startupAdoptionPlanned.Store(true)
+	p.adoptPhase.Store(adoptPhaseScanning) // trusted pass under way
+
+	got := make(chan *VMNetInfo, 1)
+	go func() { got <- p.ClaimWait(context.Background(), "vm-late") }()
+
+	// The claimant waits out more than the whole pool budget under the
+	// trusted pass, then the pass hands off with the pool still empty.
+	time.Sleep(poolClaimWaitBudget + 200*time.Millisecond)
+	p.finishStartupAdoption() // bridge up, resolvedAt stamped
+	p.adoptPhase.Store(adoptPhaseIdle)
+	p.signalProgress()
+
+	// Refill "delivers" shortly after the handoff — well inside the
+	// re-anchored pool budget, far outside the backdated one.
+	time.Sleep(300 * time.Millisecond)
+	touchNS(t, dir, "ns-late")
+	m.assignSlotLocked(1, poolOwner)
+	p.fresh <- &preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-late"}}
+	p.signalProgress()
+
+	select {
+	case info := <-got:
+		if info == nil {
+			t.Fatal("claimant bailed to inline build — pool budget was not re-anchored at the handoff")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("claimant never returned")
+	}
+}
+
 // An ungated pool's workers start immediately and read the adoption plan
 // exactly once, so the plan must arrive through PoolConfig — a plan set only
 // inside StartAdoption lands after their check and the handoff silently

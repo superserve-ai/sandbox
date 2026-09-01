@@ -85,6 +85,11 @@ type Pool struct {
 	// parked). Refill measures the remaining deficit only after it.
 	startupAdoptionDone chan struct{}
 	startupAdoptionOnce sync.Once
+	// startupAdoptionResolvedAt is the handoff instant (unix nanos, zero
+	// until resolved). ClaimWait re-anchors the pool budget here for
+	// claimants that had been waiting on adoption — see the budget
+	// computation for why.
+	startupAdoptionResolvedAt atomic.Int64
 	// refillHandoffBridge keeps producing() true across the instant of the
 	// handoff on a gated pool: the channel close releases the workers, but
 	// until the scheduler runs one, refillActive is still zero — and a
@@ -532,6 +537,11 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 			// queueing behind it.
 			p.wakeRefillOnDeficit()
 			p.cleanup(slot)
+			// And again after cleanup: at the slot ceiling, the early wake
+			// can rouse workers into an allocator that still owns this
+			// index — they fail into backoff, and without a second nudge
+			// nothing tells them the index just became reusable.
+			p.wakeRefillOnDeficit()
 			continue
 		}
 		tNsChecked := time.Now()
@@ -667,10 +677,21 @@ func (p *Pool) ClaimWait(ctx context.Context, vmID string) *VMNetInfo {
 			return p.finalClaim(ctx, vmID)
 		}
 		budget := poolClaimWaitBudget
+		anchor := start
 		if p.adoptionTrusted() {
 			budget = adoptionClaimWaitBudget
+		} else if ns := p.startupAdoptionResolvedAt.Load(); ns > 0 {
+			// A claimant that outlived the adoption pass must not have its
+			// (shorter) pool budget backdated to its own arrival: the wait
+			// so far was spent on adoption, and refill only became the
+			// producer at the handoff. Re-anchoring there gives the
+			// released workers the pool budget they were promised instead
+			// of a bill that is already overdrawn.
+			if resolved := time.Unix(0, ns); resolved.After(anchor) {
+				anchor = resolved
+			}
 		}
-		remaining := budget - time.Since(start)
+		remaining := budget - time.Since(anchor)
 		if remaining <= 0 {
 			return p.finalClaim(ctx, vmID)
 		}
@@ -1313,6 +1334,7 @@ func (p *Pool) finishStartupAdoption() {
 		// so the count is exact; an ungated boot may include a build that
 		// was already in flight at the reset — harmless overcount.
 		p.postHandoffBuilds.Store(0)
+		p.startupAdoptionResolvedAt.Store(time.Now().UnixNano())
 		close(p.startupAdoptionDone)
 		p.log.Info().Dur("held_refill_for", time.Since(p.startupAdoptionBegan)).
 			Msg("pool: startup adoption handoff resolved — refill released")
@@ -1738,9 +1760,14 @@ func (p *Pool) refillStep(ctx context.Context, deactivate func()) refillOutcome 
 }
 
 // pauseAfterFailure waits out the retry backoff, reporting false when the pool
-// is shutting down and the caller should give up instead of retrying.
+// is shutting down and the caller should give up instead of retrying. A wake
+// cuts the backoff short: it means pool state changed under the failure — a
+// claim opened a deficit or a discarded slot's index became reusable — and
+// the failure's cause may be gone with it.
 func (p *Pool) pauseAfterFailure(ctx context.Context) bool {
 	select {
+	case <-p.refillWake:
+		return true
 	case <-time.After(refillFailureBackoff):
 		return true
 	case <-p.stopCh:
