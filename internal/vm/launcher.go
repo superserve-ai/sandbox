@@ -121,6 +121,15 @@ const nsfsMagic = 0x6e736673
 // deleted one errors). One syscall, no fork — cheap and non-flaky enough for the
 // per-launch hot path, unlike launcherNSValid's nsenter exec, which stays the
 // deep check for boot and the sampler.
+// LauncherPinUsable reports whether pinPath still carries a live
+// mount-namespace pin. Exported for callers that resolve a pin path well
+// before they use it — a template build can spend minutes pulling an image
+// between vmd handing it the path and the launch that enters it, and in that
+// window the daemon can restart, rebuild, or detach the pin. Entering a path
+// that is no longer a pin fails the launch; re-checking here lets the caller
+// fall back to the legacy entry instead.
+func LauncherPinUsable(pinPath string) bool { return pinIsMounted(pinPath) }
+
 func pinIsMounted(pinPath string) bool {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(pinPath, &st); err != nil {
