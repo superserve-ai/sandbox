@@ -42,6 +42,22 @@ func isUnknownClockFieldErr(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), unknownClockFieldMarker)
 }
 
+// The guarded-session fields carry the same rollback hazard, on both
+// endpoints: load takes tracking_session_id, create takes expected_session_id.
+const (
+	unknownTrackingSessionFieldMarker = "unknown field `tracking_session_id`"
+	unknownExpectedSessionFieldMarker = "unknown field `expected_session_id`"
+)
+
+func isUnknownSessionFieldErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, unknownTrackingSessionFieldMarker) ||
+		strings.Contains(msg, unknownExpectedSessionFieldMarker)
+}
+
 func isTornSnapshotErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), tornSnapshotMarker)
 }

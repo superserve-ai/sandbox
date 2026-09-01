@@ -696,6 +696,9 @@ type Manager struct {
 	// older Firecracker under a running daemon, and the first restore it refuses
 	// clears this for good.
 	clockRealtimeCapable atomic.Bool
+	// dirtyTrackingSessionCapable is the same probe for the guarded-session
+	// fields, demoted on the first refusal exactly like the clock flag.
+	dirtyTrackingSessionCapable atomic.Bool
 }
 
 // trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
@@ -1649,27 +1652,29 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
 			saveStart := time.Now()
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath, trackingSessionID); err != nil {
-				if errors.Is(err, ErrDirtyTrackingMismatch) {
-					// The rejection happened before Firecracker touched the
-					// bitmap or the overlay, so one Full pause is the safe
-					// degradation. The vCPUs are already paused; CreateSnapshot's
-					// own pause PATCH is idempotent. An ACCUMULATING overlay
-					// (this VM resumed from mem.diff) is not pre-work though —
-					// it holds the prior pauses' pages and is about to become
-					// unreferenced; mark it for reclaim once the VM stops.
-					log.Warn().Str("vm_id", vmID).
-						Msg("pause: dirty-tracking session mismatch; falling back to full snapshot")
-					_ = os.Remove(layeredBaseSidecarPath(memPath))
-					_ = os.Remove(presence.SidecarPath(memPath))
-					_ = os.Remove(clockFreezeMarkerPath(memPath))
-					if instMemFile == overlayPath {
-						orphanedOverlay = overlayPath
-					}
+				if errors.Is(err, ErrDirtyTrackingMismatch) || m.sessionRejectedAtPause(err) {
+					// Rejected before Firecracker touched the bitmap or the
+					// overlay, so one Full pause is the safe degradation (the
+					// vCPUs are already paused; CreateSnapshot's pause PATCH is
+					// idempotent). Nothing is removed until that Full has
+					// landed: if it fails the VM keeps running and the overlay
+					// with its sidecars is still the valid artifact.
+					log.Warn().Err(err).Str("vm_id", vmID).
+						Msg("pause: guarded diff rejected; falling back to full snapshot")
 					snapshotType = "full"
 					memPath, baseMemPath = fullPath, ""
 					if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 						snapshotDur = time.Since(tSnapshot)
 						return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+					}
+					if instMemFile == overlayPath {
+						// The accumulating overlay is now stranded; reclaimed
+						// with its sidecars after the stop.
+						orphanedOverlay = overlayPath
+					} else {
+						// First pass: only the .base sidecar written above
+						// exists, for an overlay that never followed.
+						_ = os.Remove(layeredBaseSidecarPath(overlayPath))
 					}
 				} else {
 					snapshotDur = time.Since(tSnapshot)
@@ -1712,11 +1717,11 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			snapshotType = "diff"
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating diff snapshot")
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath, trackingSessionID); err != nil {
-				if errors.Is(err, ErrDirtyTrackingMismatch) {
+				if errors.Is(err, ErrDirtyTrackingMismatch) || m.sessionRejectedAtPause(err) {
 					// Rejected before the bitmap or mem.snap was touched; a
 					// Full dump to the same path is the safe degradation.
-					log.Warn().Str("vm_id", vmID).
-						Msg("pause: dirty-tracking session mismatch; falling back to full snapshot")
+					log.Warn().Err(err).Str("vm_id", vmID).
+						Msg("pause: guarded diff rejected; falling back to full snapshot")
 					snapshotType = "full"
 					if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 						snapshotDur = time.Since(tSnapshot)
@@ -1803,6 +1808,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			_ = os.Remove(orphanedOverlay)
 			_ = os.Remove(layeredBaseSidecarPath(orphanedOverlay))
 			_ = os.Remove(presence.SidecarPath(orphanedOverlay))
+			_ = os.Remove(clockFreezeMarkerPath(orphanedOverlay))
 		} else {
 			log.Warn().Str("path", orphanedOverlay).
 				Msg("pause: stranded overlay not reclaimed (stop unconfirmed)")
@@ -2413,16 +2419,18 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 	// basePath non-empty ⇒ layered restore (memPath is the diff overlay over basePath).
 	trackDirty := m.cfg.IncrementalSnapshotEnabled
 	sessionID := ""
-	if trackDirty && m.cfg.DirtyTrackingSessionEnabled {
+	if trackDirty && m.sessionArmingEnabled() {
 		sessionID = newTrackingSessionID()
 	}
-	used, rerr := m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
-		return RestoreSnapshotUffdInternalWithOverrides(
-			socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
-			m.cfg.HandlerDeathAbortEnabled, sessionID, clock,
-		)
+	armed, used, rerr := m.restoreWithSessionFallback(sessionID, func(sid string) (bool, error) {
+		return m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+			return RestoreSnapshotUffdInternalWithOverrides(
+				socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
+				m.cfg.HandlerDeathAbortEnabled, sid, clock,
+			)
+		})
 	})
-	return trackDirty, sessionID, used, rerr
+	return trackDirty, armed, used, rerr
 }
 
 // newTrackingSessionID mints the random token a dirty-tracking session is
@@ -3323,7 +3331,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				// here, so canLayered holds — serve the overlay over its recorded base.
 				basePath = sidecarBase
 				armLayered = m.cfg.IncrementalSnapshotEnabled
-				if armLayered && m.cfg.DirtyTrackingSessionEnabled {
+				if armLayered && m.sessionArmingEnabled() {
 					trackingSessionID = newTrackingSessionID()
 				}
 				inst.mu.Lock()
@@ -3335,7 +3343,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				attemptErr = fmt.Errorf("layered overlay %q has no base sidecar; refusing standalone restore", memPath)
 			case m.cfg.IncrementalSnapshotEnabled && canLayered && recordToPath == "" && isTemplate:
 				armLayered = true
-				if m.cfg.DirtyTrackingSessionEnabled {
+				if m.sessionArmingEnabled() {
 					trackingSessionID = newTrackingSessionID()
 				}
 				inst.mu.Lock()
@@ -3345,12 +3353,20 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				inst.mu.Unlock()
 			}
 			if attemptErr == nil {
-				clockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
-					return RestoreSnapshotUffdInternalWithOverrides(
-						socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
-						m.cfg.HandlerDeathAbortEnabled, trackingSessionID, clock,
-					)
+				var armed string
+				armed, clockFrozen, attemptErr = m.restoreWithSessionFallback(trackingSessionID, func(sid string) (bool, error) {
+					return m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+						return RestoreSnapshotUffdInternalWithOverrides(
+							socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
+							m.cfg.HandlerDeathAbortEnabled, sid, clock,
+						)
+					})
 				})
+				if armed != trackingSessionID {
+					inst.mu.Lock()
+					inst.DirtyTrackingSessionID = armed
+					inst.mu.Unlock()
+				}
 			}
 		case inPlace:
 			clockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
@@ -4717,11 +4733,9 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	inst := toInstance(rec)
 	// The flag is the circuit breaker, so a persisted token must not survive
 	// turning it off: toInstance re-arms optimistically from the record alone
-	// (it is pure, with no view of config). Without this, a host restarted
-	// with the flag off would keep sending guarded pauses — and against a
-	// rolled-back Firecracker that predates guarded snapshots, the unknown
-	// field fails the pause outright instead of degrading to Full, which is
-	// exactly the blast radius the flag exists to close.
+	// (it is pure, with no view of config). The capability is deliberately
+	// not consulted here — the watcher may not have answered yet at startup,
+	// and a token that meets an older binary degrades to Full at pause time.
 	if !m.cfg.DirtyTrackingSessionEnabled {
 		inst.DirtyTracked = false
 		inst.DirtyTrackingSessionID = ""
