@@ -296,6 +296,22 @@ const (
 	capabilityCanProxyTraffic = preview.HostCapabilityCanProxyTraffic
 	capabilityCanReadFiles    = preview.HostCapabilityCanReadFiles
 	capabilityCanWriteFiles   = preview.HostCapabilityCanWriteFiles
+
+	// capabilityCapacityPressure marks a heartbeat from a daemon that
+	// publishes capacity pressure for this host.
+	//
+	// It is the wire contract the control plane keys its three-state
+	// classification on: a host that advertises this but has no fresh
+	// report is treated as one whose publisher broke or is still
+	// converging, while a host that never advertises it is simply a
+	// daemon that does not publish. Without it every publishing host is
+	// indistinguishable from a legacy one.
+	//
+	// Must match the consumer-side constant
+	// (internal/scheduler.HostCapabilityCapacityPressure); the two live
+	// in different packages because the daemon does not import the
+	// control plane.
+	capabilityCapacityPressure = "capacity_pressure_v1"
 )
 
 type heartbeatStorageCache struct {
@@ -379,6 +395,15 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 			}
 		}
 		capabilities = append(capabilities, proxyState.PreviewCapabilities...)
+	}
+	if cfg.Pressure != nil && cfg.VMDAddr != "" {
+		// Advertised under exactly the condition sendPressure publishes
+		// — deliberately NOT gated on PressureReady, which is the
+		// transient startup gate. "Capable, but no fresh report yet" is
+		// precisely how a host whose accounting is still converging
+		// should read to a consumer: not describable, and not silently
+		// mistaken for a daemon that never publishes.
+		capabilities = append(capabilities, capabilityCapacityPressure)
 	}
 	return postHeartbeat(ctx, client, cfg, url, token, capabilities, storage, log, started)
 }

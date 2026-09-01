@@ -32,6 +32,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/scheduler"
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
@@ -139,8 +140,12 @@ type Handlers struct {
 	DB        *db.Queries
 	Pool      *pgxpool.Pool // required by paths that need their own transaction (e.g. build-concurrency admission)
 	Config    *config.Config
-	Hosts     HostRegistry      // when set, routes VMD calls via host_id
-	Scheduler Scheduler         // when set, picks host on create
+	Hosts     HostRegistry // when set, routes VMD calls via host_id
+	Scheduler Scheduler    // when set, picks host on create
+	// Shadow, when set, receives a sample of creates for capacity
+	// ranking that influences nothing. Offering is a non-blocking
+	// channel send; see ShadowEvaluator.
+	Shadow    *scheduler.ShadowEvaluator
 	Analytics *analytics.Client // when set, emits product-usage events; nil is a no-op
 	Encryptor secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
 	Signer    *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
@@ -2319,6 +2324,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	insertVcpu, insertMemMiB := int32(defaultVcpu), int32(defaultMemoryMi)
 	if templateID.Valid && templateVcpu > 0 && templateMemMiB > 0 {
 		insertVcpu, insertMemMiB = int32(templateVcpu), int32(templateMemMiB)
+	}
+
+	// Hand this create to capacity ranking for measurement only: the
+	// host is already chosen above and nothing here can change it. The
+	// call is a bounded non-blocking channel send — it does no ranking,
+	// no query, and takes no lock a request can wait on, so a stalled or
+	// backed-up evaluator drops samples instead of appearing in create
+	// latency.
+	if h.Shadow != nil {
+		h.Shadow.Offer(requiredCapabilities, insertMemMiB, insertVcpu, hostID)
 	}
 
 	type insertResult struct {
