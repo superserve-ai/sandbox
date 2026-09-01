@@ -1455,9 +1455,12 @@ func main() {
 	// Keeps the Firecracker clock-option capability in step with the binary on
 	// disk: the deploy replaces it in place without restarting this daemon, so an
 	// answer read once would go stale on the next rollout in either direction.
-	// Reads no instance state, and probing execs a process, so it runs on its own
-	// off every lifecycle path. Restores before the first probe answers take
-	// legacy behaviour — slower, correct.
+	//
+	// One exec, then one every few minutes — bounded, touches no fleet-sized
+	// collection and no allocator lock, so it does not belong behind the
+	// readiness barrier below. Started here rather than after it so the answer
+	// is settled by the time requests are accepted, instead of the first restore
+	// racing the probe and silently taking legacy behaviour.
 	mgr.WatchFirecrackerCapability(ctx, log)
 
 	// ---- Background full reattach ----
