@@ -325,21 +325,25 @@ func ruleCannotMatchSandboxIngress(tokens []string) bool {
 }
 
 // ruleCannotMatchSandboxTraffic is the two-direction form for the tail
-// promotion guard and chain resolution: exempt when the rule provably
-// matches neither veth direction, or when its (non-negated) source range is
-// disjoint from vmIPRange — sandbox flows at NAT time always carry a source
-// inside it, so e.g. another agent's own-range MASQUERADE can never touch
-// sandbox traffic regardless of position.
+// promotion guard and chain resolution. Each direction is proven separately:
+// a disjoint address range only ever excludes the direction where the
+// sandbox is on that side of the flow. Sandbox-ORIGINATED traffic always
+// carries a vmIPRange source (pre-MASQUERADE), so a disjoint -s excludes it
+// — another agent's own-range MASQUERADE can never touch it regardless of
+// position. Sandbox-BOUND traffic carries the sandbox in the DESTINATION and
+// an arbitrary remote source, so only a disjoint -d (never -s) excludes that
+// direction.
 func ruleCannotMatchSandboxTraffic(tokens []string) bool {
-	if ruleCannotMatchVethVia(tokens, "-i") && ruleCannotMatchVethVia(tokens, "-o") {
-		return true
-	}
-	return sourceDisjointFromVMRange(tokens)
+	originated := ruleCannotMatchVethVia(tokens, "-i") || rangeDisjointFromVMRange(tokens, "-s")
+	bound := ruleCannotMatchVethVia(tokens, "-o") || rangeDisjointFromVMRange(tokens, "-d")
+	return originated && bound
 }
 
-func sourceDisjointFromVMRange(tokens []string) bool {
+// rangeDisjointFromVMRange reports whether the rule's non-negated address
+// constraint on flag ("-s" or "-d") is provably disjoint from vmIPRange.
+func rangeDisjointFromVMRange(tokens []string, flag string) bool {
 	for i, t := range tokens {
-		if t != "-s" {
+		if t != flag {
 			continue
 		}
 		if (i > 0 && tokens[i-1] == "!") || i+1 >= len(tokens) {

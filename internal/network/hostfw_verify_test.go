@@ -438,6 +438,28 @@ func TestVerifyHeadGuard(t *testing.T) {
 			t.Fatalf("ok=%v class=%s", ok, class)
 		}
 	})
+	t.Run("source-disjoint accept above the block still guards the sandbox-bound direction", func(t *testing.T) {
+		// -s outside vmIPRange proves nothing about traffic INTO a sandbox
+		// (the sandbox is the destination; the source is any remote): an
+		// unconstrained-output accept above the jumps can still act on
+		// sandbox-bound flows and must classify, not slip the exemption.
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		rules["filter/FORWARD"] = append([][]string{{"-s", "8.8.8.8/32", "-j", "ACCEPT"}}, fw...)
+		if ok, class := mustVerify(t, renderDump(rules, chains), spec); ok || class != "preceded" {
+			t.Fatalf("ok=%v class=%s, want preceded", ok, class)
+		}
+	})
+	t.Run("both directions provably excluded is fine", func(t *testing.T) {
+		// Originated excluded by -i br0, bound excluded by a disjoint -d:
+		// harmless in both directions, so no repair is demanded.
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		rules["filter/FORWARD"] = append([][]string{{"-i", "br0", "-d", "8.8.8.8/32", "-j", "ACCEPT"}}, fw...)
+		if ok, class := mustVerify(t, renderDump(rules, chains), spec); !ok {
+			t.Fatalf("direction-excluded foreign accept flagged: %s", class)
+		}
+	})
 	t.Run("stricter veth DROP above the block is fine", func(t *testing.T) {
 		rules, chains := specKernel(spec, nil)
 		fw := rules["filter/FORWARD"]
