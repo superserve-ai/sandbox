@@ -22,6 +22,8 @@ import (
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 // ensureHostFirewall verifies the host ruleset and installs/repairs only on
@@ -35,6 +37,11 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 		if ip := net.ParseIP(secretsProxyDst); ip == nil || ip.To4() == nil {
 			return fmt.Errorf("invalid secretsProxyDst %q (must be IPv4)", secretsProxyDst)
 		}
+	}
+	if _, ipnet, err := net.ParseCIDR(vmIPRange); err != nil {
+		return fmt.Errorf("vmIPRange %s invalid: %w", vmIPRange, err)
+	} else if !ipnet.Contains(net.ParseIP(hostIPForSlot(0))) || !ipnet.Contains(net.ParseIP(hostIPForSlot(MaxSlots-1))) {
+		return fmt.Errorf("vmIPRange %s does not cover the full slot allocation range", vmIPRange)
 	}
 	spec := hostFWSpecFor(hostIface, httpProxyPort, tlsProxyPort, dnsRedirectPort, secretsProxyDst, secretsProxyPort, blockedPorts, manageOwnedChains)
 
@@ -94,21 +101,39 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 		}
 	}
 
-	// Slow path: the installer, byte-for-byte today's behavior.
+	// Slow path. Non-owners run the presence-only installer (the MASQUERADE):
+	// they never mutate shared-chain ordering — their partial spec omits the
+	// daemon's jumps, so "canonicalizing" it could hoist an ACCEPT above the
+	// daemon's drops.
+	//
+	// The OWNER never blind-installs: every shared-chain change is planned by
+	// repairSharedOrdering from a snapshot taken UNDER THE LOCK, so the
+	// foreign-rule safety analysis (pinned trees, observers, unknown control
+	// flow) runs before any mutation — including the very first rollout,
+	// where the entry jumps are missing and a bare insert-at-head would
+	// silently demote whatever sits there. The owned chains rebuild first
+	// (atomic, touching no shared chain) so the jumps the plan inserts always
+	// reference existing chains.
 	tRepair := time.Now()
-	if err := installHostFirewallFn(hostIface, httpProxyPort, tlsProxyPort, dnsRedirectPort, secretsProxyDst, secretsProxyPort, blockedPorts, manageOwnedChains, log); err != nil {
+	var predicted map[string][][]string
+	if manageOwnedChains {
+		out, err := dumpIPTables(ctx)
+		if err != nil {
+			return fmt.Errorf("host firewall pre-plan dump: %w", err)
+		}
+		d, perr := parseIPTablesSave(out)
+		if perr != nil {
+			return fmt.Errorf("host firewall pre-plan parse: %w", perr)
+		}
+		if err := rebuildOwnedChains(ctx, spec); err != nil {
+			return err
+		}
+		if predicted, err = repairSharedOrdering(ctx, d, spec); err != nil {
+			return fmt.Errorf("host firewall ordering: %w", err)
+		}
+	} else if err := installHostFirewallFn(hostIface, httpProxyPort, tlsProxyPort, dnsRedirectPort, secretsProxyDst, secretsProxyPort, blockedPorts, false, log); err != nil {
 		return err
 	}
-
-	// The installer is idempotent-by-presence, so a pre-existing rule in an
-	// ineffective position (or a duplicate, or a foreign rule above the
-	// entry jumps) survives it. The OWNER repairs those and must then pass
-	// verification before serving. Non-owners never mutate shared-chain
-	// ordering: their partial spec omits the daemon's jumps, so
-	// "canonicalizing" it could hoist an ACCEPT above the daemon's drops —
-	// they install (presence only, today's behavior) and leave ordering to
-	// the daemon.
-	var predicted map[string][][]string
 	for pass := 0; ; pass++ {
 		out, err := dumpIPTables(ctx)
 		if err != nil {
@@ -267,11 +292,28 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 						break
 					}
 				}
-				if !isOurs && !staleVMDRule(spec, key, g, want) && !unmarkedTwin(g, want) && !ruleCannotMatchSandboxIngress(g) {
-					switch disp := foreignDisposition(g); disp {
-					case "observer", "strict":
-						return nil, fmt.Errorf("foreign %s rule above a vmd terminal rule in %s (%s) — head-inserting ours would starve it of matching traffic; refusing", disp, key, strings.Join(g, " "))
+				if isOurs || staleVMDRule(spec, key, g, want) || unmarkedTwin(g, want) || ruleCannotMatchSandboxTraffic(g) {
+					continue
+				}
+				// A transfer into a foreign chain moves that whole tree
+				// below vmd's terminal enforcement. Resolved from this
+				// dump: safe trees cannot act on sandbox traffic,
+				// permissive trees lose only their bypass ACCEPTs (the
+				// point of the repair); pinned trees carry strict or
+				// observer policy the demotion would starve, and unknown
+				// control flow is never reordered past.
+				if tgt, ok := controlTransferTarget(d, table, g); ok {
+					switch chainSandboxDisposition(d, spec.hostIface, table, tgt, 0, map[string]bool{}) {
+					case "safe", "permissive":
+						continue
 					}
+					return nil, fmt.Errorf("pinned or ambiguous foreign chain transfer above a vmd terminal rule in %s (%s) — demoting it would change that tree's effective policy; refusing", key, strings.Join(g, " "))
+				}
+				switch disp := foreignDisposition(g); disp {
+				case "observer", "strict":
+					return nil, fmt.Errorf("foreign %s rule above a vmd terminal rule in %s (%s) — head-inserting ours would starve it of matching traffic; refusing", disp, key, strings.Join(g, " "))
+				case "ambiguous":
+					return nil, fmt.Errorf("ambiguous foreign rule above a vmd terminal rule in %s (%s) — refusing to reorder past unknown control flow", key, strings.Join(g, " "))
 				}
 			}
 		}
@@ -368,6 +410,39 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 		}
 	}
 	return predicted, nil
+}
+
+// StartHostFWSampler periodically re-verifies the host firewall and repairs
+// drift, so protection does not decay between vmd restarts: another agent
+// restarting later (dockerd re-inserting its jumps at position 1) would
+// otherwise leave a bypass standing until the next boot. Each tick is the
+// same ensure path as startup — one read-only dump when intact, the locked
+// plan-and-repair when not. Failures are logged loudly, never fatal: a
+// serving daemon cannot fail-closed the way a startup can, and the next tick
+// retries. Owner only; non-owners have no reconciliation to run.
+func (m *Manager) StartHostFWSampler(ctx context.Context, every time.Duration) {
+	if !m.ownsEgressPortChain {
+		return
+	}
+	log := m.log.With().Str("component", "host_fw").Logger()
+	go func() {
+		defer sentrylog.Recover("hostfw sampler")
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			if err := ensureHostFirewall(ctx, m.hostInterface, m.httpProxyPort, m.tlsProxyPort,
+				m.dnsRedirectPort, m.secretsProxyDst, m.secretsProxyPort, m.blockedEgressPorts,
+				m.ownsEgressPortChain, log); err != nil {
+				log.Error().Err(err).
+					Msg("periodic host firewall reconciliation failed — enforcement may be degraded until resolved")
+			}
+		}
+	}()
 }
 
 // installHostFirewallFn is a test seam over the real installer, so the

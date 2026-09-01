@@ -96,72 +96,14 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 		return fmt.Errorf("init iptables: %w", err)
 	}
 
-	// Owner: rebuild the owned chains ATOMICALLY, one iptables-restore
-	// transaction per table. The live entry jumps keep referencing these
-	// chains throughout the slow path, so a flush-and-repopulate through
-	// individual commands would open a window where sandbox traffic falls
-	// through an empty chain into the foreign FORWARD rules — and a failure
-	// mid-repopulation would strand it there. A declared chain inside a
-	// --noflush restore is created-or-flushed and refilled in a single
-	// commit; on error the previous contents remain. Each chain gets an
-	// explicit -F inside the transaction — --noflush preserves existing
-	// contents on the legacy backend, so relying on the declaration alone to
-	// clear a pre-existing chain would append after stale rules there.
-	// Contents come from the same spec the verifier checks, so the two
-	// cannot drift.
+	// Owner topology — the owned chains and the shared-chain entry jumps —
+	// is NOT installed here. Shared-chain ordering must be planned from a
+	// locked pre-mutation snapshot so foreign policy is never silently
+	// demoted; ensureHostFirewall owns that sequence (rebuildOwnedChains +
+	// repairSharedOrdering). A blind insert-at-head from this installer was
+	// exactly the bypass the planner exists to prevent.
 	if manageOwnedChains {
-		spec := hostFWSpecFor(hostIface, httpProxyPort, tlsProxyPort, dnsRedirectPort, secretsProxyDst, secretsProxyPort, blockedPorts, true)
-		for _, table := range []string{"filter", "nat"} {
-			var lines []string
-			var chains []string
-			for key := range spec.ownedChains {
-				if strings.HasPrefix(key, table+"/") {
-					chains = append(chains, strings.TrimPrefix(key, table+"/"))
-				}
-			}
-			sort.Strings(chains)
-			for _, chain := range chains {
-				lines = append(lines, ":"+chain+" - [0:0]")
-			}
-			for _, chain := range chains {
-				lines = append(lines, "-F "+chain)
-			}
-			for _, chain := range chains {
-				for _, w := range spec.ownedChains[table+"/"+chain] {
-					lines = append(lines, "-A "+chain+" "+emitRuleTokens(w.args))
-				}
-			}
-			input := "*" + table + "\n" + strings.Join(lines, "\n") + "\nCOMMIT\n"
-			if err := restoreIPTables(context.Background(), input); err != nil {
-				return fmt.Errorf("atomic %s owned-chain rebuild: %w", table, err)
-			}
-		}
-	}
-
-	// Entry jumps at the head of the shared chains, in-jump before
-	// out-jump. Everything sandbox-related is decided in the owned
-	// chains, so nothing below these jumps can act on sandbox traffic.
-	if manageOwnedChains {
-		jumps := []struct {
-			table, chain string
-			pos          int
-			args         []string
-		}{
-			{"filter", "FORWARD", 1, marked("-i", sandboxVethPattern, "-j", forwardChain)},
-			{"filter", "FORWARD", 2, marked("-o", sandboxVethPattern, "-j", forwardChain)},
-			{"nat", "PREROUTING", 1, marked("-i", sandboxVethPattern, "-j", preroutingChain)},
-		}
-		for _, j := range jumps {
-			exists, err := ipt.Exists(j.table, j.chain, j.args...)
-			if err != nil {
-				return fmt.Errorf("check %s/%s jump: %w", j.table, j.chain, err)
-			}
-			if !exists {
-				if err := ipt.Insert(j.table, j.chain, j.pos, j.args...); err != nil {
-					return fmt.Errorf("insert %s/%s jump: %w", j.table, j.chain, err)
-				}
-			}
-		}
+		return fmt.Errorf("owner install must go through ensureHostFirewall (planned shared-chain ordering)")
 	}
 
 	if err := ipt.AppendUnique("nat", "POSTROUTING", marked(
@@ -177,6 +119,48 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 			Uint16("secrets_proxy_port", secretsProxyPort).
 			Msg("host firewall ready (static prefix rules)")
 	}()
+	return nil
+}
+
+// rebuildOwnedChains rebuilds the vmd-owned chains ATOMICALLY, one
+// iptables-restore transaction per table. The live entry jumps keep
+// referencing these chains throughout the slow path, so a
+// flush-and-repopulate through individual commands would open a window where
+// sandbox traffic falls through an empty chain into the foreign FORWARD
+// rules — and a failure mid-repopulation would strand it there. A declared
+// chain inside a --noflush restore is created-or-flushed and refilled in a
+// single commit; on error the previous contents remain. Each chain gets an
+// explicit -F inside the transaction — --noflush preserves existing contents
+// on the legacy backend, so relying on the declaration alone to clear a
+// pre-existing chain would append after stale rules there. Contents come
+// from the same spec the verifier checks, so the two cannot drift. Touches
+// no shared chain. OWNER ONLY.
+func rebuildOwnedChains(ctx context.Context, spec hostFWSpec) error {
+	for _, table := range []string{"filter", "nat"} {
+		var lines []string
+		var chains []string
+		for key := range spec.ownedChains {
+			if strings.HasPrefix(key, table+"/") {
+				chains = append(chains, strings.TrimPrefix(key, table+"/"))
+			}
+		}
+		sort.Strings(chains)
+		for _, chain := range chains {
+			lines = append(lines, ":"+chain+" - [0:0]")
+		}
+		for _, chain := range chains {
+			lines = append(lines, "-F "+chain)
+		}
+		for _, chain := range chains {
+			for _, w := range spec.ownedChains[table+"/"+chain] {
+				lines = append(lines, "-A "+chain+" "+emitRuleTokens(w.args))
+			}
+		}
+		input := "*" + table + "\n" + strings.Join(lines, "\n") + "\nCOMMIT\n"
+		if err := restoreIPTables(ctx, input); err != nil {
+			return fmt.Errorf("atomic %s owned-chain rebuild: %w", table, err)
+		}
+	}
 	return nil
 }
 

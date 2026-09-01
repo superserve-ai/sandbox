@@ -248,6 +248,21 @@ func (k *fakeKernel) install(t *testing.T) func() {
 			line = strings.TrimSpace(line)
 			switch {
 			case line == "" || line == "COMMIT":
+			case strings.HasPrefix(line, ":"):
+				// Chain declaration: created if absent; --noflush semantics
+				// preserve contents (the code pairs it with an explicit -F).
+				name := strings.Fields(strings.TrimPrefix(line, ":"))[0]
+				key := table + "/" + name
+				present := false
+				for _, c := range k.chains {
+					if c == key {
+						present = true
+						break
+					}
+				}
+				if !present {
+					k.chains = append(k.chains, key)
+				}
 			case strings.HasPrefix(line, "*"):
 				table = line[1:]
 			case strings.HasPrefix(line, "-F "):
@@ -1311,6 +1326,146 @@ func dockerKernel(spec hostFWSpec) (map[string][][]string, []string) {
 	chains = append(chains, "filter/DOCKER-USER", "filter/DOCKER-FORWARD", "filter/DOCKER-CT",
 		"filter/DOCKER-INTERNAL", "filter/DOCKER-BRIDGE", "filter/DOCKER", "nat/DOCKER")
 	return rules, chains
+}
+
+// firstRolloutKernel is a host that has never run this vmd: no vmd rules, no
+// owned chains — only the built-in chains and whatever foreign content the
+// test seeds.
+func firstRolloutKernel(shared map[string][][]string, foreignChains map[string][][]string) *fakeKernel {
+	rules := map[string][][]string{}
+	chains := []string{"filter/FORWARD", "nat/PREROUTING", "nat/POSTROUTING"}
+	for key, rs := range shared {
+		rules[key] = rs
+	}
+	for key, rs := range foreignChains {
+		chains = append(chains, key)
+		rules[key] = rs
+	}
+	return &fakeKernel{rules: rules, chains: chains}
+}
+
+func ensureOwner(t *testing.T) error {
+	t.Helper()
+	origLock := hostFirewallLockPath
+	hostFirewallLockPath = t.TempDir() + "/hostfw.lock"
+	t.Cleanup(func() { hostFirewallLockPath = origLock })
+	iface, hp, tp, dp, sd, sp, bp := testSpecParams()
+	return ensureHostFirewall(context.Background(), iface, hp, tp, dp, sd, sp, bp, true, zerolog.Nop())
+}
+
+// The first-rollout regression: with the entry jumps entirely absent, the
+// shared-chain plan must run its foreign-rule safety analysis BEFORE any
+// insert. A blind insert-at-head here would demote foreign policy and then
+// verify "clean" — the analysis would never have run at all.
+func TestFirstRolloutPlansBeforeMutating(t *testing.T) {
+	t.Run("pinned operator chain above: refuse without shared mutation", func(t *testing.T) {
+		k := firstRolloutKernel(
+			map[string][][]string{"filter/FORWARD": {{"-j", "OPERATOR-POLICY"}}},
+			map[string][][]string{"filter/OPERATOR-POLICY": {{"-p", "tcp", "--dport", "22", "-j", "DROP"}}},
+		)
+		defer k.install(t)()
+		err := ensureOwner(t)
+		if err == nil || !strings.Contains(err.Error(), "pinned") {
+			t.Fatalf("want pinned-chain refusal, got: %v", err)
+		}
+		if got := k.rules["filter/FORWARD"]; len(got) != 1 || !slices.Equal(got[0], []string{"-j", "OPERATOR-POLICY"}) {
+			t.Fatalf("shared chain mutated despite refusal: %v", got)
+		}
+	})
+
+	t.Run("observer rule above: refuse", func(t *testing.T) {
+		k := firstRolloutKernel(
+			map[string][][]string{"filter/FORWARD": {{"-j", "LOG", "--log-prefix", "audit:"}}}, nil,
+		)
+		defer k.install(t)()
+		err := ensureOwner(t)
+		if err == nil || !strings.Contains(err.Error(), "observer") {
+			t.Fatalf("want observer refusal, got: %v", err)
+		}
+	})
+
+	t.Run("safe and permissive docker tree above: jumps head it, tree preserved", func(t *testing.T) {
+		k := firstRolloutKernel(
+			map[string][][]string{"filter/FORWARD": {{"-j", "DOCKER-USER"}, {"-i", "docker0", "-j", "ACCEPT"}}},
+			map[string][][]string{"filter/DOCKER-USER": {{"-j", "RETURN"}}},
+		)
+		defer k.install(t)()
+		if err := ensureOwner(t); err != nil {
+			t.Fatalf("first rollout over a movable tree failed: %v", err)
+		}
+		fw := k.rules["filter/FORWARD"]
+		if len(fw) < 4 || !hasVMDMarker(fw[0]) || !hasVMDMarker(fw[1]) {
+			t.Fatalf("vmd jumps not at head after first rollout: %v", fw)
+		}
+		foundUser, foundAccept := false, false
+		for _, r := range fw[2:] {
+			if slices.Equal(r, []string{"-j", "DOCKER-USER"}) {
+				foundUser = true
+			}
+			if ruleEqual([]string{"-i", "docker0", "-j", "ACCEPT"}, r) {
+				foundAccept = true
+			}
+		}
+		if !foundUser || !foundAccept {
+			t.Fatalf("foreign rules not preserved below the jumps: %v", fw)
+		}
+	})
+}
+
+// The reviewer's demotion repro: a chain whose reachable rules include an
+// unconstrained DROP is operator policy. Verification tolerates it in place
+// above the jumps; repair must refuse to move it — demoting it below the
+// terminal owned chain would silently flip its DROP to an ACCEPT.
+func TestPinnedOperatorChainToleratedInPlaceNeverDemoted(t *testing.T) {
+	spec := testSpec(true)
+	pinned := map[string][][]string{"filter/OPERATOR-POLICY": {{"-p", "tcp", "--dport", "22", "-j", "DROP"}}}
+
+	t.Run("in place above intact jumps: verify intact", func(t *testing.T) {
+		rules, chains := specKernel(spec, nil)
+		rules["filter/FORWARD"] = append([][]string{{"-j", "OPERATOR-POLICY"}}, rules["filter/FORWARD"]...)
+		for key, rs := range pinned {
+			chains = append(chains, key)
+			rules[key] = rs
+		}
+		if ok, class := mustVerify(t, renderDump(rules, chains), spec); !ok {
+			t.Fatalf("pinned chain in place flagged: %s", class)
+		}
+	})
+
+	t.Run("repair triggered by misorder: refuses to demote the pinned tree", func(t *testing.T) {
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		fw[0], fw[1] = fw[1], fw[0] // misorder our jumps to force repair
+		rules["filter/FORWARD"] = append([][]string{{"-j", "OPERATOR-POLICY"}}, fw...)
+		for key, rs := range pinned {
+			chains = append(chains, key)
+			rules[key] = rs
+		}
+		k := &fakeKernel{rules: rules, chains: chains}
+		defer k.install(t)()
+		d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+		if _, err := repairSharedOrdering(context.Background(), d, spec); err == nil || !strings.Contains(err.Error(), "pinned") {
+			t.Fatalf("want pinned refusal from repair, got: %v", err)
+		}
+	})
+
+	t.Run("docker-style third-interface DROP stays movable", func(t *testing.T) {
+		// Bridge-isolation DROPs are demotion-neutral: constrained to a
+		// third interface, they cannot match the flows the owned chain
+		// accepts, so their verdict is identical either side of ours.
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		fw[0], fw[1] = fw[1], fw[0]
+		rules["filter/FORWARD"] = append([][]string{{"-j", "ISOLATION"}}, fw...)
+		chains = append(chains, "filter/ISOLATION")
+		rules["filter/ISOLATION"] = [][]string{{"!", "-i", "docker0", "-o", "docker0", "-j", "DROP"}}
+		k := &fakeKernel{rules: rules, chains: chains}
+		defer k.install(t)()
+		d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+		if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+			t.Fatalf("neutral isolation tree refused: %v", err)
+		}
+	})
 }
 
 func TestDockerCohabitation(t *testing.T) {

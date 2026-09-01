@@ -313,17 +313,6 @@ func parseIPTablesSave(out string) (*parsedDump, error) {
 // the spec rules' relative order must equal the canonical order; unrelated
 // rules are ignored. Owned chains: contents must equal the spec exactly, in
 // order, with nothing extra.
-// ruleCannotMatchSandboxIngress conservatively decides whether a foreign rule
-// positioned above the vmd entry jumps is provably unable to match
-// sandbox-ORIGINATED (veth ingress) traffic: it must carry a non-negated
-// explicit input interface whose pattern cannot cover a veth device. Anything
-// else — no -i at all, a negation, a veth-covering prefix wildcard,
-// unparseable shapes — reads as capable, which at worst costs a repair pass,
-// never a bypass.
-func ruleCannotMatchSandboxIngress(tokens []string) bool {
-	return ruleCannotMatchVethVia(tokens, "-i")
-}
-
 // ruleCannotMatchSandboxTraffic is the two-direction form for the tail
 // promotion guard and chain resolution. Each direction is proven separately:
 // a disjoint address range only ever excludes the direction where the
@@ -417,39 +406,55 @@ func establishedOnlyAccept(tokens []string) bool {
 // chainSandboxDisposition resolves what a foreign chain can do to sandbox
 // (veth) traffic, from the dump alone — trust is derived from the ruleset,
 // never from a chain's name:
-//   - "safe": no reachable rule can change its fate (cannot match, observes,
-//     tightens, RETURNs, or is an established-only ACCEPT);
+//   - "safe": no reachable rule can act on sandbox traffic at all (cannot
+//     match, RETURNs, is inert, or is an established-only ACCEPT). Moving
+//     the chain's entry jump is provably behavior-neutral.
 //   - "permissive": the only reachable hazards are plain ACCEPTs — a PROVEN
 //     bypass, which repair converges by re-heading vmd's jumps above the
 //     transfer (this is how a dockerd restart that re-inserts its jumps at
-//     position 1 self-heals on the next vmd start);
+//     position 1 self-heals on the next vmd start). Demoting kills only the
+//     bypass, which is the point.
+//   - "pinned": the chain contains reachable strict (DROP/REJECT) or
+//     observer (LOG/MARK/...) policy. Harmless ABOVE vmd's enforcement —
+//     it only tightens or watches — but demoting it below the terminal
+//     owned chain would starve that policy of sandbox traffic, silently
+//     flipping an operator's DROP into an ACCEPT or blinding their audit
+//     trail. Verification tolerates it in place; repair must never move it.
 //   - "ambiguous": verdict-rewriting targets (NAT actions), unknown targets,
-//     cycles, or depth overruns — the caller fails closed.
-func chainSandboxDisposition(d *parsedDump, table, chain string, depth int, visiting map[string]bool) string {
+//     cycles, depth overruns — or a chain that BOTH bypasses and pins
+//     (repair could neither leave it nor move it) — the caller fails closed.
+func chainSandboxDisposition(d *parsedDump, hostIface, table, chain string, depth int, visiting map[string]bool) string {
 	key := table + "/" + chain
 	if depth > maxChainResolutionDepth || visiting[key] || !d.chains[key] {
 		return "ambiguous"
 	}
 	visiting[key] = true
 	defer delete(visiting, key)
-	res := "safe"
+	bypass, pinned := false, false
 	for _, g := range d.rules[key] {
 		if ruleCannotMatchSandboxTraffic(g) || establishedOnlyAccept(g) {
 			continue
 		}
 		if target, ok := controlTransferTarget(d, table, g); ok {
-			switch chainSandboxDisposition(d, table, target, depth+1, visiting) {
+			switch chainSandboxDisposition(d, hostIface, table, target, depth+1, visiting) {
 			case "ambiguous":
 				return "ambiguous"
 			case "permissive":
-				res = "permissive"
+				bypass = true
+			case "pinned":
+				pinned = true
 			}
 			continue
 		}
 		switch foreignDisposition(g) {
-		case "strict", "inert", "observer":
+		case "inert":
+		case "strict", "observer":
+			if strictDemotionNeutral(g, hostIface) {
+				continue
+			}
+			pinned = true
 		case "permissive":
-			res = "permissive"
+			bypass = true
 		default:
 			if jumpTarget(g) == "RETURN" {
 				continue
@@ -457,7 +462,57 @@ func chainSandboxDisposition(d *parsedDump, table, chain string, depth int, visi
 			return "ambiguous"
 		}
 	}
-	return res
+	switch {
+	case bypass && pinned:
+		return "ambiguous"
+	case bypass:
+		return "permissive"
+	case pinned:
+		return "pinned"
+	}
+	return "safe"
+}
+
+// strictDemotionNeutral reports whether a foreign strict rule keeps its
+// exact observable behavior when demoted below vmd's terminal owned chain.
+// True only for a plain DROP pinned to a third interface: the owned chain
+// ACCEPTs only veth↔hostIface flows and DROPs everything else, so a foreign
+// DROP that provably cannot match either accepted direction drops the same
+// traffic above or below ours (Docker's bridge-isolation DROPs are the
+// canonical case). A REJECT is never neutral — demoted behind our silent
+// DROP it stops answering — and neither is any DROP that could reach the
+// accepted flows, where demotion flips its verdict to ACCEPT.
+func strictDemotionNeutral(tokens []string, hostIface string) bool {
+	if jumpTarget(tokens) != "DROP" {
+		return false
+	}
+	return boundToThirdInterface(tokens, "-i", hostIface) || boundToThirdInterface(tokens, "-o", hostIface)
+}
+
+// boundToThirdInterface reports whether the rule carries a non-negated
+// explicit interface constraint on flag that can cover neither a veth device
+// nor the uplink — the two interfaces vmd's accepted flows use.
+func boundToThirdInterface(tokens []string, flag, hostIface string) bool {
+	for i, t := range tokens {
+		if t != flag {
+			continue
+		}
+		if (i > 0 && tokens[i-1] == "!") || i+1 >= len(tokens) {
+			return false
+		}
+		v := tokens[i+1]
+		if v == hostIface || strings.HasPrefix(v, "veth") {
+			return false
+		}
+		if strings.HasSuffix(v, "+") {
+			p := strings.TrimSuffix(v, "+")
+			if strings.HasPrefix("veth", p) || strings.HasPrefix(hostIface, p) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func ruleCannotMatchVethVia(tokens []string, flag string) bool {
@@ -782,8 +837,11 @@ func verifyHostFirewall(d *parsedDump, spec hostFWSpec) (ok bool, class string, 
 					// closed.
 					table, _, _ := strings.Cut(key, "/")
 					if t, ok := controlTransferTarget(d, table, got[i]); ok {
-						switch chainSandboxDisposition(d, table, t, 0, map[string]bool{}) {
-						case "safe":
+						switch chainSandboxDisposition(d, spec.hostIface, table, t, 0, map[string]bool{}) {
+						case "safe", "pinned":
+							// Safe cannot act on sandbox traffic; pinned only
+							// tightens or observes — both are fine IN PLACE.
+							// Repair separately refuses to move pinned trees.
 							continue
 						case "permissive":
 							return false, "preceded", key + ": " + strings.Join(got[i], " ")
