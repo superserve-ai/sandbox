@@ -35,6 +35,14 @@ type PoolConfig struct {
 	// the fleet-sized background work comment in cmd/vmd). Nil starts them
 	// immediately.
 	StartGate <-chan struct{}
+	// PlanStartupAdoption declares — before any refill worker spawns — that
+	// the caller will run StartAdoption, so refill defers to it (see
+	// startupAdoptionPlanned). Required for the handoff on an UNGATED pool:
+	// its workers start immediately and check the plan exactly once, so a
+	// plan established only inside StartAdoption arrives too late for them.
+	// A caller that sets this MUST call StartAdoption, or refill stays
+	// parked until shutdown.
+	PlanStartupAdoption bool
 }
 
 // Pool pre-allocates network namespaces, veth pairs, TAP devices, and
@@ -322,6 +330,12 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 	// serialize refill for up to a hold poll exactly when concurrency
 	// matters most.
 	p.refillWake = make(chan struct{}, workers)
+	// Settled before any worker spawns — the one ordering that works for
+	// ungated pools, whose workers read the plan immediately and only once.
+	if cfg.PlanStartupAdoption {
+		p.startupAdoptionPlanned.Store(true)
+		p.startupAdoptionBegan = time.Now()
+	}
 	// One shared concurrency budget across both background producers —
 	// adoption and refill — granted gradually after the gate (see
 	// rampBGSlots), so neither can burst the RTNL lock alone the moment the
@@ -1103,6 +1117,12 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 	// — the stray-veth sweep delivers nothing a claimant could wait for.
 	p.adoptPhase.CompareAndSwap(adoptPhaseIdle, adoptPhaseScanning)
 	defer func() {
+		// The handoff resolves BEFORE the idle phase is published: on a
+		// panic this deferred cleanup runs ahead of the caller's outer
+		// finish, and a claimant woken by the signalProgress below must
+		// see the bridge, not a gap with no producer at all. Idempotent —
+		// on the normal path the explicit pre-sweep finish already ran.
+		p.finishStartupAdoption()
 		p.adoptPhase.Store(adoptPhaseIdle)
 		p.adoptStreak.Store(0)
 		p.signalProgress()
@@ -1233,12 +1253,14 @@ func (p *Pool) StartAdoption(ctx context.Context) bool {
 		p.log.Warn().Msg("pool: adoption already running — duplicate start ignored")
 		return false
 	}
-	// Synchronous, before the goroutine and before the start gate can open:
-	// StartAdoption is a startup call and gated refill workers park on the
-	// gate until readiness, so the flag is settled before any of them can
-	// read it. finishStartupAdoption is the only release.
-	p.startupAdoptionPlanned.Store(true)
-	p.startupAdoptionBegan = time.Now()
+	// Synchronous, before the goroutine and before the start gate can open —
+	// sufficient for GATED pools, whose workers park on the gate until
+	// readiness. An ungated pool's workers are already past their one plan
+	// check by now; PoolConfig.PlanStartupAdoption is the only ordering
+	// that covers them. finishStartupAdoption is the only release.
+	if p.startupAdoptionPlanned.CompareAndSwap(false, true) {
+		p.startupAdoptionBegan = time.Now()
+	}
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()

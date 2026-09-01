@@ -1728,6 +1728,35 @@ func TestEachDeficitClaimDepositsAWakeToken(t *testing.T) {
 	}
 }
 
+// An ungated pool's workers start immediately and read the adoption plan
+// exactly once, so the plan must arrive through PoolConfig — a plan set only
+// inside StartAdoption lands after their check and the handoff silently
+// stops applying.
+func TestConfigPlannedAdoptionParksUngatedRefill(t *testing.T) {
+	builds := stubPoolAllocate(t)
+	m := newTestManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := m.StartPool(ctx, PoolConfig{NewSize: 2, RecycleSize: 2, PlanStartupAdoption: true})
+	defer p.Stop()
+
+	time.Sleep(30 * time.Millisecond)
+	if got := builds.Load(); got != 0 {
+		t.Fatalf("ungated refill built %d slots despite a planned adoption, want 0", got)
+	}
+
+	p.finishStartupAdoption()
+	deadline := time.After(2 * time.Second)
+	for builds.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("refill never resumed after the handoff resolved")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 // The producer role must transfer atomically from the claimants' viewpoint:
 // the instant the handoff resolves — before any released worker is scheduled
 // — producing() must already be true, or a claimant woken by adoption's
