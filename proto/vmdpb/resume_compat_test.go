@@ -3,6 +3,7 @@ package vmdpb
 import (
 	"testing"
 
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -65,5 +66,35 @@ func TestResumeVMRequestSetGenerationEmptyIsNoop(t *testing.T) {
 	req.SetGeneration("")
 	if len(req.ProtoReflect().GetUnknown()) != 0 {
 		t.Errorf("SetGeneration(\"\") wrote unknown field bytes, want none")
+	}
+}
+
+// A non-length-delimited unknown field ahead of ours in the wire (varint
+// field 9, mirroring how ArtifactManifestEntry.AllocatedBytes rides
+// unknown bytes elsewhere in this package) must not desync the scan: the
+// old implementation assumed every unknown field was length-delimited and
+// would either read garbage or miss field 7 entirely once one appeared.
+func TestResumeVMRequestGenerationSkipsNonBytesUnknownField(t *testing.T) {
+	req := &ResumeVMRequest{VmId: "vm-1"}
+	unknown := req.ProtoReflect().GetUnknown()
+	unknown = protowire.AppendTag(unknown, 9, protowire.VarintType)
+	unknown = protowire.AppendVarint(unknown, 123456)
+	req.ProtoReflect().SetUnknown(unknown)
+	req.SetGeneration("gen-after-varint")
+
+	if got := req.GetGeneration(); got != "gen-after-varint" {
+		t.Fatalf("GetGeneration() = %q, want %q (varint unknown field ahead of it desynced the scan)", got, "gen-after-varint")
+	}
+
+	wire, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var decoded ResumeVMRequest
+	if err := proto.Unmarshal(wire, &decoded); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if got := decoded.GetGeneration(); got != "gen-after-varint" {
+		t.Errorf("decoded GetGeneration() = %q, want %q", got, "gen-after-varint")
 	}
 }

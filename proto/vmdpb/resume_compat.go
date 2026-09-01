@@ -48,14 +48,25 @@ func resumeRequestString(x *ResumeVMRequest, field protowire.Number) string {
 			break
 		}
 		unknown = unknown[n:]
-		value, n := protowire.ConsumeBytes(unknown)
+		// Every unknown field must be consumed by ITS OWN wire type, not
+		// assumed length-delimited: a varint or fixed-width field ahead of
+		// ours in the set (any other unknown field this generated struct
+		// doesn't know about — see ArtifactManifestEntry.AllocatedBytes in
+		// grpc_adapter.go for another field riding unknown bytes the same
+		// way) would otherwise desync ConsumeBytes and either return
+		// garbage or silently miss a real value further along.
+		if num == field && typ == protowire.BytesType {
+			value, n := protowire.ConsumeBytes(unknown)
+			if n < 0 {
+				break
+			}
+			return string(value)
+		}
+		n = protowire.ConsumeFieldValue(num, typ, unknown)
 		if n < 0 {
 			break
 		}
 		unknown = unknown[n:]
-		if num == field && typ == protowire.BytesType {
-			return string(value)
-		}
 	}
 	return ""
 }
