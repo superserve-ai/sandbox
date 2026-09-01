@@ -63,18 +63,16 @@ type Pool struct {
 	bgSlotSem chan struct{}
 	// startupAdoptionPlanned hands the startup deficit to adoption: while a
 	// boot-time adoption pass is planned, refill workers wait for it to
-	// finish before building anything. Reusing an abandoned slot costs a
+	// resolve before building anything. Reusing an abandoned slot costs a
 	// few namespace entries; building one from scratch is a namespace, a
-	// veth pair, a tap, and a firewall program — so when both producers
-	// wake at the same gate, letting them race means refill duplicates, at
-	// full price, exactly the inventory adoption is already restoring.
-	// Written before the start gate opens (StartAdoption runs during
-	// startup; workers park on the gate until readiness), so gated workers
-	// always observe it; never written afterwards.
+	// veth pair, a tap, and a firewall program — so if both producers wake
+	// at the same gate, refill duplicates at full price exactly the
+	// inventory adoption is restoring. Written only by StartAdoption,
+	// before the start gate opens (see there); never afterwards.
 	startupAdoptionPlanned bool
-	// startupAdoptionDone is the one-shot handoff: closed when the boot
-	// adoption pass finishes — complete, aborted, cancelled, panicked, or
-	// never released. Refill measures the remaining deficit only after it.
+	// startupAdoptionDone is the one-shot handoff: closed on every exit of
+	// the boot adoption pass. Refill measures the remaining deficit only
+	// after it.
 	startupAdoptionDone chan struct{}
 	startupAdoptionOnce sync.Once
 	wg                  sync.WaitGroup
@@ -1178,11 +1176,10 @@ func (p *Pool) StartAdoption(ctx context.Context) bool {
 		p.log.Warn().Msg("pool: adoption already running — duplicate start ignored")
 		return false
 	}
-	// Synchronous, before the goroutine and — decisively — before the start
-	// gate can open: StartAdoption is a startup call, and gated refill
-	// workers park on the gate until readiness, so by the time any of them
-	// can read this flag it is settled. From here refill defers to this
-	// pass; finishStartupAdoption is the only release.
+	// Synchronous, before the goroutine and before the start gate can open:
+	// StartAdoption is a startup call and gated refill workers park on the
+	// gate until readiness, so the flag is settled before any of them can
+	// read it. finishStartupAdoption is the only release.
 	p.startupAdoptionPlanned = true
 	p.wg.Add(1)
 	go func() {
@@ -1216,10 +1213,9 @@ func (p *Pool) finishStartupAdoption() {
 }
 
 // waitForStartupAdoption blocks a refill worker until the boot adoption pass
-// has resolved, so the two producers never solve the same deficit twice:
-// adoption restores the previous run's slots at reuse cost while refill
-// would rebuild them at full cost. Immediate when no pass was planned (fresh
-// boot, adoption skipped, tests). Reports false on shutdown/cancellation.
+// has resolved (see startupAdoptionPlanned for why). Immediate when no pass
+// was planned — fresh boot, adoption skipped, tests. Reports false on
+// shutdown/cancellation.
 func (p *Pool) waitForStartupAdoption(ctx context.Context) bool {
 	if !p.startupAdoptionPlanned || p.startupAdoptionDone == nil {
 		return true
@@ -1439,10 +1435,9 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		return
 	}
 	// Adoption owns the startup deficit; refill is the fallback. Waiting
-	// here (still undeclared — a parked worker is not a producer) means the
-	// deficit refill eventually measures through the channels is the REAL
-	// one: what adoption could not restore, plus whatever claims consumed
-	// meanwhile. Skipped entirely when no boot adoption was planned.
+	// here — still undeclared, a parked worker is not a producer — means
+	// the deficit refill later measures through the channels is what
+	// adoption could not restore plus what claims consumed meanwhile.
 	if !p.waitForStartupAdoption(ctx) {
 		return
 	}
