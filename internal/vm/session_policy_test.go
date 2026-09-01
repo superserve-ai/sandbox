@@ -443,6 +443,47 @@ func TestReclaimStrandedOverlay_NeverRemovesTheLiveArtifact(t *testing.T) {
 	}
 }
 
+// A removal that fails keeps the deferral so the file is retried, never
+// silently leaked; once removal succeeds the deferral clears durably.
+func TestReclaimStrandedOverlay_KeepsTheDeferralUntilTheFileIsGone(t *testing.T) {
+	dir := t.TempDir()
+	// A non-empty directory at the overlay path makes os.Remove fail the way
+	// a transient filesystem error would.
+	overlay := filepath.Join(dir, "mem.diff")
+	if err := os.MkdirAll(filepath.Join(overlay, "busy"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, MemFilePath: filepath.Join(dir, "mem.snap"), StrandedOverlay: overlay}); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusPaused, MemFilePath: filepath.Join(dir, "mem.snap"), StrandedOverlay: overlay}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
+
+	m.reclaimStrandedOverlay(inst, zerolog.Nop())
+	if inst.StrandedOverlay != overlay {
+		t.Fatal("a failed removal must keep the deferral")
+	}
+	if rec, _ := store.Get("vm-1"); rec == nil || rec.StrandedOverlay != overlay {
+		t.Fatalf("a failed removal must keep the deferral durable, got %+v", rec)
+	}
+
+	if err := os.RemoveAll(filepath.Join(overlay, "busy")); err != nil {
+		t.Fatal(err)
+	}
+	m.reclaimStrandedOverlay(inst, zerolog.Nop())
+	if _, err := os.Stat(overlay); !os.IsNotExist(err) {
+		t.Fatalf("overlay must be gone once removal can succeed (err=%v)", err)
+	}
+	if rec, _ := store.Get("vm-1"); rec == nil || rec.StrandedOverlay != "" {
+		t.Fatalf("deferral must clear durably after a successful removal, got %+v", rec)
+	}
+}
+
 // The matcher covers both endpoints' field names and nothing else.
 func TestIsUnknownSessionFieldErr(t *testing.T) {
 	for _, field := range []string{"tracking_session_id", "expected_session_id", "expected_generation"} {

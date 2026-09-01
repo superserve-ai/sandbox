@@ -1816,12 +1816,16 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// than leaking a guest-sized file for the sandbox's lifetime.
 	stranded := ""
 	if orphanedOverlay != "" {
-		if stopConfirmed {
-			removeOverlayArtifacts(orphanedOverlay)
-		} else {
+		if !stopConfirmed {
 			stranded = orphanedOverlay
 			log.Warn().Str("path", orphanedOverlay).
 				Msg("pause: stranded overlay deferred (stop unconfirmed); reclaimed once the VM is at rest")
+		} else if err := removeOverlayArtifacts(orphanedOverlay); err != nil {
+			// A transient failure must not become a permanent leak: defer
+			// it exactly like an unconfirmed stop.
+			stranded = orphanedOverlay
+			log.Warn().Err(err).Str("path", orphanedOverlay).
+				Msg("pause: stranded overlay removal failed; deferred for a later attempt")
 		}
 	}
 
