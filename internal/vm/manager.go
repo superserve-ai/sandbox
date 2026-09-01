@@ -2027,12 +2027,20 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// (e.g. an operator's manual disk-recovery deletion — see the comment
 	// on the checks below).
 	//
-	// Deliberately best-effort beyond that gate: a fetch failure (or a
-	// generation whose manifest doesn't cover everything resume needs —
-	// see fetchGenerationForResume) falls through to the existing stat
-	// checks, which then fail with their normal, already-understood
-	// messages instead of a fetch-specific one masking the real
-	// precondition.
+	// A failed fetch must fail the resume outright, not fall through to
+	// the existing stat checks below: fetchGenerationForResume adopts its
+	// two artifacts independently (see its doc comment), so a failure
+	// partway through — e.g. vmstate.snap placed, then the rootfs copy
+	// fails on a full destination filesystem — can leave one freshly
+	// fetched file sitting next to the OTHER's stale pre-fetch content.
+	// The stat checks below only verify existence, not which generation a
+	// file's bytes belong to, so falling through could hand Firecracker a
+	// mismatched vmstate/disk pair instead of failing loudly. Whatever WAS
+	// adopted stays adopted (a later fetch attempt for the same
+	// generation just re-fetches whichever piece is still missing or
+	// still stale — restoreFile always writes fresh content, it never
+	// trusts what a name already holds), but this resume must not proceed
+	// on it.
 	if m.resumeFetch != nil && generation != "" && fileExists(memPath) &&
 		(!fileExists(snapshotPath) || !fileExists(rootfsPath)) {
 		tFetch = time.Now()
@@ -2043,12 +2051,11 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			m.backupMetrics.AddFetchBytes(ctx, bytesRestored)
 		}
 		if ferr != nil {
-			log.Warn().Err(ferr).Str("generation", generation).
-				Msg("resume: fetch-on-resume failed; continuing to the normal local-disk checks")
-		} else {
-			log.Info().Str("generation", generation).Int64("bytes", bytesRestored).
-				Msg("resume: fetched generation from backup bucket")
+			log.Warn().Err(ferr).Str("generation", generation).Msg("resume: fetch-on-resume failed")
+			return nil, fmt.Errorf("fetch generation %s for resume: %w", generation, ferr)
 		}
+		log.Info().Str("generation", generation).Int64("bytes", bytesRestored).
+			Msg("resume: fetched generation from backup bucket")
 	}
 
 	// Verify the snapshot files actually exist on disk. DB can claim

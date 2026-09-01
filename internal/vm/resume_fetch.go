@@ -14,6 +14,17 @@ import (
 	"github.com/superserve-ai/sandbox/internal/backup"
 )
 
+// resumeFetchVMStateName and resumeFetchRootfsName are the two artifact
+// names every backup generation's manifest carries them under (see
+// backup_hook.go's TaskFile naming) — fixed, not derived from the local
+// on-disk filename (which varies: overlay.ext4 for a layered sandbox,
+// rootfs.ext4 otherwise), since the manifest names describe what the
+// generation was staged and uploaded as, not this host's own layout.
+const (
+	resumeFetchVMStateName = "vmstate.snap"
+	resumeFetchRootfsName  = "rootfs.ext4"
+)
+
 // resumeFetchSource bundles what fetch-before-resume needs: read access to
 // the cell's backup bucket and a semaphore bounding how many restores run
 // at once. A reconnect storm after a host loss must not let every stranded
@@ -60,10 +71,13 @@ func (m *Manager) SetResumeFetch(reader backup.BlobReader, concurrency int) {
 //
 // A layered overlay's base image is similarly out of scope: bases are
 // fleet-wide template artifacts distributed by the existing template
-// pipeline, not per-sandbox generation content, and any shared-base entry
-// this generation's manifest carries is left in the scratch directory
-// (removed with it) rather than adopted — restoring a missing base is a
-// separate, existing gap this does not change.
+// pipeline, not per-sandbox generation content, so this asks
+// RestoreGenerationFiles for exactly the two names below and nothing
+// else — a shared base entry this generation's manifest carries is never
+// fetched at all, not fetched and discarded. Restoring a missing base is
+// a separate, existing gap this does not change, and bases can be
+// multi-GiB: paying to download and verify one on every resume just to
+// throw it away would be real, avoidable latency on this hot path.
 func (m *Manager) fetchGenerationForResume(ctx context.Context, vmID, generation, snapshotPath, rootfsPath string, log zerolog.Logger) (bytesRestored int64, err error) {
 	src := m.resumeFetch
 	if src == nil {
@@ -81,20 +95,22 @@ func (m *Manager) fetchGenerationForResume(ctx context.Context, vmID, generation
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
 		return 0, fmt.Errorf("create snapshot dir: %w", err)
 	}
-	// RestoreGeneration requires an empty destination (see its doc comment)
-	// and refuses to reuse one; a fresh scratch dir every attempt satisfies
-	// that without racing a concurrent resume of the same vmID onto shared
-	// state, and lives beside snapshotPath so placing vmstate.snap below is
-	// a same-filesystem rename.
+	// RestoreGenerationFiles requires an empty destination (see its doc
+	// comment) and refuses to reuse one; a fresh scratch dir every attempt
+	// satisfies that without racing a concurrent resume of the same vmID
+	// onto shared state, and lives beside snapshotPath so placing
+	// vmstate.snap below is a same-filesystem rename.
 	scratch, err := os.MkdirTemp(snapshotDir, ".fetch-*")
 	if err != nil {
 		return 0, fmt.Errorf("create fetch scratch dir: %w", err)
 	}
 	defer os.RemoveAll(scratch)
 
-	manifest, err := backup.RestoreGeneration(ctx, src.reader, vmID, generation, scratch, func(format string, args ...any) {
-		log.Debug().Str("generation", generation).Msgf("resume fetch: "+format, args...)
-	})
+	manifest, err := backup.RestoreGenerationFiles(ctx, src.reader, vmID, generation, scratch,
+		[]string{resumeFetchVMStateName, resumeFetchRootfsName},
+		func(format string, args ...any) {
+			log.Debug().Str("generation", generation).Msgf("resume fetch: "+format, args...)
+		})
 	if err != nil {
 		return 0, fmt.Errorf("restore generation %s: %w", generation, err)
 	}
@@ -102,13 +118,15 @@ func (m *Manager) fetchGenerationForResume(ctx context.Context, vmID, generation
 	for _, mf := range manifest.Files {
 		var dest string
 		switch mf.Name {
-		case "vmstate.snap":
+		case resumeFetchVMStateName:
 			dest = snapshotPath
-		case "rootfs.ext4":
+		case resumeFetchRootfsName:
 			dest = rootfsPath
 		default:
-			// Shared base entries and any future artifact kind: not one of
-			// resume's own local paths, left in scratch to be discarded.
+			// RestoreGenerationFiles only ever restores the two names
+			// requested above; manifest.Files still lists every entry the
+			// generation carries (unrestored ones included) purely as
+			// metadata, so this default is reachable and correctly a no-op.
 			continue
 		}
 		if err := adoptFetchedFile(scratch, mf.Name, dest); err != nil {
