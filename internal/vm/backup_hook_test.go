@@ -872,6 +872,7 @@ func TestBackupPausePathIsDiskSizeIndependent(t *testing.T) {
 		unitDead: func(context.Context, string) bool { return false }, // worker holds off; only the sync path runs
 	}
 	m.backupStaging = filepath.Join(dir, "staging")
+	m.pauseStagingRoot = m.backupStaging
 	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
 	awaitRehashWorkers(t, m, 1)
 
@@ -906,6 +907,7 @@ func TestFastResumeKeepsBackupViaInlineStaging(t *testing.T) {
 		unitDead: func(context.Context, string) bool { return false },
 	}
 	m.backupStaging = staging
+	m.pauseStagingRoot = m.backupStaging
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 	awaitRehashWorkers(t, m, 1)
 
@@ -932,6 +934,71 @@ func TestFastResumeKeepsBackupViaInlineStaging(t *testing.T) {
 	}
 }
 
+// When pauseStagingRoot and backupStaging point at different trees (an
+// operator-configured BACKUP_STAGING_DIR, in production), the pause RPC
+// path still stages inline under pauseStagingRoot, but the detached
+// worker promotes the finished generation into backupStaging before
+// enqueueing — that's what the uploader actually hashes and streams
+// from.
+//
+// enqueueStagedPending deliberately does NOT delete the local
+// (pauseStagingRoot) copy inline after a successful enqueue: the
+// journal dedupes same-generation enqueues by content, and a row that
+// was already Staged before this call keeps its OWN paths rather than
+// adopting the promoted ones (see Journal.Enqueue), so "enqueue
+// succeeded" is not proof the journal points at the promoted copy
+// rather than still at this local one. Cleanup is left to
+// pauseStagingRoot's own sweep, which is safe regardless: it only
+// reclaims a generation once the journal has no pending row for it at
+// all. This test locks in the promotion behavior and confirms the local
+// copy is left alone by the enqueue path itself.
+func TestEnqueueStagedPendingPromotesAcrossDifferentRoots(t *testing.T) {
+	dir := t.TempDir()
+	pauseRoot := filepath.Join(dir, "pause-local")
+	uploadRoot := filepath.Join(dir, "upload-visible")
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	if err := os.WriteFile(snap, []byte("vm state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(disk, []byte("pause-time disk bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return false },
+	}
+	m.pauseStagingRoot = pauseRoot
+	m.backupStaging = uploadRoot
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+	awaitRehashWorkers(t, m, 1)
+
+	m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-test", zerolog.Nop())
+
+	var gotGeneration string
+	select {
+	case task := <-tasks:
+		gotGeneration = task.Generation
+		uploadPrefix := uploadRoot + string(os.PathSeparator)
+		for _, f := range task.Files {
+			if !strings.HasPrefix(f.Path, uploadPrefix) {
+				t.Fatalf("file %s path = %s, want it under the upload-visible root %s", f.Name, f.Path, uploadRoot)
+			}
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("pause never enqueued from its promoted copies")
+	}
+
+	// The local copy must still be there immediately after enqueue: only
+	// the sweep (which checks the journal's actual current state, not a
+	// point-in-time success bit) is trusted to reclaim it.
+	if _, err := os.Stat(filepath.Join(pauseRoot, "vm-1", gotGeneration)); err != nil {
+		t.Fatalf("local pause-staging copy removed by the enqueue path itself: %v", err)
+	}
+}
+
 // A pin created at pause time keeps the base restorable past template
 // GC: destroy plus base deletion after the pause must still upload the
 // pause-time pair.
@@ -952,6 +1019,7 @@ func TestBasePinSurvivesBaseDeletion(t *testing.T) {
 		unitDead: func(context.Context, string) bool { return false },
 	}
 	m.backupStaging = staging
+	m.pauseStagingRoot = m.backupStaging
 	awaitRehashWorkers(t, m, 1)
 	// Hold the worker: enqueue blocks until the base is deleted.
 	proceed := make(chan struct{})
@@ -1036,6 +1104,7 @@ func TestBackupPauseCapturesBaseIdentityComparableToDiskBasePath(t *testing.T) {
 		unitDead: func(context.Context, string) bool { return false },
 	}
 	m.backupStaging = staging
+	m.pauseStagingRoot = m.backupStaging
 	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
 	// The detached worker consumes the marker asserted on below, so park it at
 	// its own per-VM busy guard: it heals the marker durably, then returns
@@ -1081,6 +1150,7 @@ func TestUnpinnedMissingBaseIsTerminal(t *testing.T) {
 	}
 	m := &Manager{state: st, unitDead: func(context.Context, string) bool { return false }}
 	m.backupStaging = filepath.Join(dir, "staging")
+	m.pauseStagingRoot = m.backupStaging
 	m.SetBackupEnqueue(func(task backup.Task) error { t.Fatal("must not enqueue"); return nil })
 
 	pb := PendingBackup{
@@ -1126,6 +1196,7 @@ func TestLostStagedCopiesFallBackToOriginals(t *testing.T) {
 		unitDead: func(context.Context, string) bool { return true },
 	}
 	m.backupStaging = filepath.Join(dir, "staging")
+	m.pauseStagingRoot = m.backupStaging
 	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
 
 	gone := filepath.Join(dir, "staging", "vm-1", "pending-tok")
@@ -1172,6 +1243,7 @@ func TestRetryPauseReusesExistingStagedMarker(t *testing.T) {
 		unitDead: func(context.Context, string) bool { return false }, // workers stall; we inspect dirs
 	}
 	m.backupStaging = staging
+	m.pauseStagingRoot = m.backupStaging
 	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
 	// Both pauses spawn a detached worker, and a worker that ran to completion
 	// would clean up the very staged dirs counted below. Park them at the
@@ -1764,6 +1836,7 @@ func TestMarkerReuseRotatesOwnershipWithPauseToken(t *testing.T) {
 		unitDead: func(context.Context, string) bool { return false },
 	}
 	m.backupStaging = staging
+	m.pauseStagingRoot = m.backupStaging
 	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
 	// Park the workers at the busy guard, as a still-running old worker
 	// would hold it in production.

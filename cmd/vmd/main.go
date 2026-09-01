@@ -1079,11 +1079,32 @@ func main() {
 		st.mark("backup_setup", true, -1)
 		// Staging pins enqueued artifacts so sandbox teardown cannot
 		// erase a queued generation; the sweep clears residue from
-		// crashes between staging and enqueue. The tree lives inside
-		// SNAPSHOT_DIR by default: that keeps it on the same filesystem
-		// as the artifacts it snapshots, so reflink cloning works and
-		// capacity scales with the artifact array instead of the OS
-		// disk. BACKUP_STAGING_DIR overrides for exotic layouts.
+		// crashes between staging and enqueue. Two roots, not one:
+		//
+		//   - pauseStagingRoot is where the pause RPC path stages inline
+		//     (see vm.Manager.pauseStagingRoot / SetPauseStagingRoot),
+		//     always inside SNAPSHOT_DIR so it shares a filesystem with
+		//     the artifacts it clones — reflink works, and the base pin
+		//     it hard-links never crosses filesystems. This is fixed,
+		//     never affected by BACKUP_STAGING_DIR: moving it would turn
+		//     every pause's inline copy into real cross-filesystem I/O
+		//     on the pause RPC path, and the pin into a broken cross-
+		//     device link.
+		//   - stagingRoot is where a finished generation ends up for the
+		//     uploader to hash and stream from (BACKUP_STAGING_DIR
+		//     overrides it). Every staged file is read twice before it
+		//     leaves the host (digest pre-check, then the upload
+		//     stream), and on a host serving live VM disk I/O off the
+		//     same array that read traffic is direct contention with
+		//     tenant workloads — the reason to move it. The detached
+		//     worker promotes a finished generation from
+		//     pauseStagingRoot into stagingRoot once hashed (off the RPC
+		//     path), at the cost of reflink there, which never crosses
+		//     filesystems.
+		pauseStagingRoot, _ := backup.ResolveStagingRoot("", cfg.SnapshotDir, cfg.RunDir)
+		if err := os.MkdirAll(pauseStagingRoot, 0o700); err != nil {
+			log.Fatal().Err(err).Str("path", pauseStagingRoot).Msg("failed to create pause staging dir")
+		}
 		stagingRoot, legacyStaging := backup.ResolveStagingRoot(
 			os.Getenv("BACKUP_STAGING_DIR"), cfg.SnapshotDir, cfg.RunDir)
 		if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
@@ -1111,6 +1132,70 @@ func main() {
 			ss.Bases += ls.Bases
 			ss.Pending += ls.Pending
 		}
+		// Every recorded root that differs from both today's resolution and
+		// the hardcoded pre-split legacy path is a retired CUSTOM root —
+		// most often a rollback that cleared BACKUP_STAGING_DIR after it
+		// had pointed at a dedicated disk, though more than one can be
+		// outstanding at once if a drain hasn't finished across several
+		// config changes. ResolveStagingRoot only ever knows about the one
+		// fixed pre-split default, not whatever custom root(s) an operator
+		// had actually configured, so without this the abandoned trees'
+		// successfully-uploaded files would never be reclaimed. Handed to
+		// the uploader's periodic sweep rather than drained here: the
+		// trees can be fleet-sized, and startup readiness (pause/resume/
+		// create all wait on it) must not block on an unbounded filesystem
+		// walk. sweepRetiredStaging is what drops a retired root from the set,
+		// and only once removal actually confirms empty, so an
+		// interrupted drain resumes on a later boot instead of losing
+		// track of the config change.
+		allRoots, rootsErr := journal.StagingRoots()
+		if rootsErr != nil {
+			log.Warn().Err(rootsErr).Msg("read staging roots failed; retired custom roots (if any) not tracked this boot")
+		}
+		// A durable write (BoltDB transaction, fsync included) on every
+		// startup would tax the common case — an unchanged root, by far
+		// most boots — on a path pause/resume/create readiness waits on.
+		// Skip it whenever the read above already found this root present.
+		if rootsErr == nil && !slices.Contains(allRoots, stagingRoot) {
+			if err := journal.RecordStagingRoot(stagingRoot); err != nil {
+				log.Warn().Err(err).Msg("record staging root failed; a future root change may not be detected")
+			}
+		}
+		if rootsErr == nil {
+			for _, root := range allRoots {
+				// Plain inequality is not enough here: a change between an
+				// ancestor and descendant path (or the same directory under
+				// an aliased spelling) is not a retirement —
+				// sweepRetiredStaging would walk live, referenced entries
+				// reachable through the active root's own tree and delete
+				// them as apparent orphans past the grace period.
+				//
+				// pauseStagingRoot must be excluded too, not just
+				// stagingRoot: it is fixed at the SNAPSHOT_DIR default
+				// regardless of BACKUP_STAGING_DIR (see its own comment
+				// above), so a host's first boot with the override unset
+				// records that default, and enabling the override on a
+				// LATER boot must not then treat the still-live pause-path
+				// tree as retired just because it stopped being the
+				// uploader's own root.
+				if root == stagingRoot ||
+					backup.StagingRootsOverlap(root, stagingRoot) ||
+					backup.StagingRootsOverlap(root, legacyStaging) ||
+					backup.StagingRootsOverlap(root, pauseStagingRoot) {
+					continue
+				}
+				uploader.RetiredStagingRoots = append(uploader.RetiredStagingRoots, root)
+				log.Info().Str("path", root).Msg("staging root changed since a previous boot; retired custom root queued for background drain")
+			}
+		}
+		// pauseStagingRoot gets no startup sweep of its own here: on a
+		// host with no BACKUP_STAGING_DIR override it IS stagingRoot
+		// (already covered above), and on a host with one configured, a
+		// promotion's rare crash-or-fail residue there is not required
+		// for serving reattach-ready — the periodic sweep in the
+		// uploader's drain loop (see PauseStagingRoot on Uploader)
+		// reaches it soon enough without extending this synchronous
+		// startup scan.
 		st.emit(func() {
 			log.Info().Int("renewed_markers", renewedMarkers).Int("sandboxes", ss.Sandboxes).
 				Int("generations", ss.Generations).Int("bases", ss.Bases).Int("pending", ss.Pending).
@@ -1118,7 +1203,9 @@ func main() {
 		})
 		st.mark("backup_staging_scan", true, -1)
 		uploader.StagingRoot = stagingRoot
+		uploader.PauseStagingRoot = pauseStagingRoot
 		mgr.SetBackupStaging(stagingRoot)
+		mgr.SetPauseStagingRoot(pauseStagingRoot)
 		mgr.SetBackupEnqueue(journal.Enqueue)
 		mgr.SetBackupCovered(func(t backup.Task) (bool, error) {
 			// Coverage is per bucket: a completed generation elsewhere
