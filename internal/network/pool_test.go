@@ -1686,6 +1686,48 @@ func TestClaimWakesHeldRefillWorkers(t *testing.T) {
 	}
 }
 
+// A drain deeper than one slot must wake held workers in proportion: every
+// deficit-opening claim deposits its own wake token, so a burst releases the
+// crew rather than one worker. A coalescing single-token channel would
+// serialize refill behind one worker for up to a hold poll, exactly when
+// concurrency matters most.
+func TestEachDeficitClaimDepositsAWakeToken(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+
+	const capacity, crew = 4, 3
+	p := &Pool{
+		mgr:               m,
+		log:               zerolog.Nop(),
+		newSize:           capacity,
+		fresh:             make(chan *preallocSlot, capacity),
+		recycled:          make(chan *preallocSlot, capacity),
+		stopCh:            make(chan struct{}),
+		refillWake:        make(chan struct{}, crew),
+		refillDrainGate:   make(chan struct{}),
+		adoptEscapeStreak: defaultAdoptEscapeStreak,
+	}
+	for i := 0; i < capacity; i++ {
+		ns := fmt.Sprintf("ns-%d", i)
+		touchNS(t, dir, ns)
+		m.assignSlotLocked(i, poolOwner)
+		p.fresh <- &preallocSlot{idx: i, info: &VMNetInfo{Namespace: ns}}
+	}
+
+	// No workers running: the tokens accumulate, making the per-claim
+	// deposit directly observable.
+	for i := 0; i < capacity; i++ {
+		if info := p.Claim(fmt.Sprintf("vm-drain-%d", i)); info == nil {
+			t.Fatalf("claim %d from a stocked pool failed", i)
+		}
+	}
+	// Every claim opened or deepened the deficit; each must have deposited
+	// a token, saturating the crew-sized channel — not coalescing to one.
+	if got := len(p.refillWake); got != crew {
+		t.Fatalf("wake tokens = %d after draining the pool, want %d (one per held worker)", got, crew)
+	}
+}
+
 // StartAdoption's planned-flag write must be race-safe against concurrent
 // handoff readers — the interleaving an ungated pool's already-running
 // workers produce. The readers here call waitForStartupAdoption directly

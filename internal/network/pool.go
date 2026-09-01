@@ -86,9 +86,9 @@ type Pool struct {
 	// refillWake nudges workers held at the inventory target the moment a
 	// claim creates a deficit, so refill responds to a drain immediately
 	// instead of on the next hold poll — and a claimant arriving behind a
-	// burst finds a producer, not an inline build. Capacity one: a single
-	// token restarts the crew, extra nudges drop. Nil (tests) falls back
-	// to the poll.
+	// burst finds a producer, not an inline build. One token of capacity
+	// per worker (see StartPool): deeper drains wake more of the crew.
+	// Nil (tests) falls back to the poll.
 	refillWake chan struct{}
 	wg         sync.WaitGroup
 	drainMu    sync.RWMutex
@@ -289,7 +289,6 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		recycled:            make(chan *preallocSlot, recycleSize),
 		stopCh:              make(chan struct{}),
 		startupAdoptionDone: make(chan struct{}),
-		refillWake:          make(chan struct{}, 1),
 		startGate:           cfg.StartGate,
 		refillDrainGate:     make(chan struct{}),
 		resetTapOnRecycle:   cfg.ResetTapOnRecycle,
@@ -309,6 +308,12 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 	if newSize < workers {
 		workers = newSize
 	}
+	// One wake token per worker: a burst that drains the pool sends one
+	// nudge per deficit-opening claim, so the whole held crew resumes in
+	// proportion to the drain instead of single file — a lone token would
+	// serialize refill for up to a hold poll exactly when concurrency
+	// matters most.
+	p.refillWake = make(chan struct{}, workers)
 	// One shared concurrency budget across both background producers —
 	// adoption and refill — granted gradually after the gate (see
 	// rampBGSlots), so neither can burst the RTNL lock alone the moment the
