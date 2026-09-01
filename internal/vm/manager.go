@@ -2041,8 +2041,22 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// still stale — restoreFile always writes fresh content, it never
 	// trusts what a name already holds), but this resume must not proceed
 	// on it.
+	//
+	// fileExists(markerPath) also joins the trigger: it's the durable sign
+	// that some EARLIER attempt started adopting this generation's files
+	// and never finished (crash, not just a returned error — a returned
+	// error is already covered by the hard-fail above). Without it, a
+	// crash between the two renames leaves both target paths existing —
+	// one fresh, one stale from before this vmID's fetch history began —
+	// and the plain existence check below would trust the pair. Scoped to
+	// hosts where fetch-before-resume is currently enabled and a
+	// generation is currently known (the marker can only ever have been
+	// written under those same conditions); a host that had the feature
+	// toggled off between an interrupted attempt and this resume is a
+	// narrower, operator-mediated scenario left unhandled here.
+	markerPath := resumeFetchMarkerPath(snapshotPath)
 	if m.resumeFetch != nil && generation != "" && fileExists(memPath) &&
-		(!fileExists(snapshotPath) || !fileExists(rootfsPath)) {
+		(fileExists(markerPath) || !fileExists(snapshotPath) || !fileExists(rootfsPath)) {
 		tFetch = time.Now()
 		bytesRestored, ferr := m.fetchGenerationForResume(ctx, vmID, generation, snapshotPath, rootfsPath, log)
 		tFetchDone = time.Now()
@@ -2052,7 +2066,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		}
 		if ferr != nil {
 			log.Warn().Err(ferr).Str("generation", generation).Msg("resume: fetch-on-resume failed")
-			return nil, fmt.Errorf("fetch generation %s for resume: %w", generation, ferr)
+			return nil, fetchResumeError(generation, ferr)
 		}
 		log.Info().Str("generation", generation).Int64("bytes", bytesRestored).
 			Msg("resume: fetched generation from backup bucket")
