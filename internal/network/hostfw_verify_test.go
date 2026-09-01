@@ -1231,10 +1231,10 @@ func TestRepairRefusesToPromoteTerminalNATBelowMasquerade(t *testing.T) {
 
 func TestConcurrentWriterDuringRepairDetected(t *testing.T) {
 	// A NON-cooperating writer inserting between the repair's snapshot dump
-	// and the next verification dump must fail startup: verification alone
-	// tolerates the rule (an observer), but the absolute-head inserts may
-	// have changed its effective position — only the prediction compare can
-	// tell.
+	// and the next verification dump is detected by the prediction compare
+	// — verification alone would tolerate the rule (an observer). Above tail
+	// plumbing nothing of the writer's was demoted, so the correction is a
+	// no-op and startup proceeds with the observer preserved in place.
 	spec := testSpec(true)
 	rules, chains := specKernel(spec, nil)
 	masq := marked("-s", "10.11.0.0/16", "-o", "eth0", "-j", "MASQUERADE")
@@ -1261,9 +1261,15 @@ func TestConcurrentWriterDuringRepairDetected(t *testing.T) {
 	defer func() { hostFirewallLockPath = origLock }()
 
 	iface, hp, tp, dp, sd, sp, bp := testSpecParams()
-	err := ensureHostFirewall(context.Background(), iface, hp, tp, dp, sd, sp, bp, true, zerolog.Nop())
-	if err == nil || !strings.Contains(err.Error(), "concurrent") {
-		t.Fatalf("concurrent writer not detected, got: %v", err)
+	if err := ensureHostFirewall(context.Background(), iface, hp, tp, dp, sd, sp, bp, true, zerolog.Nop()); err != nil {
+		t.Fatalf("observer landing above tail plumbing must not fail startup: %v", err)
+	}
+	post := k.rules["nat/POSTROUTING"]
+	if len(post) == 0 || !slices.Equal(post[0], []string{"-s", "10.11.0.0/16", "-j", "LOG"}) {
+		t.Fatalf("concurrent writer's observer not preserved at the head: %v", post)
+	}
+	if ok, class := mustVerify(t, renderDump(k.rules, k.chains), spec); !ok {
+		t.Fatalf("not verified after the concurrent observer: %s", class)
 	}
 }
 
@@ -1413,50 +1419,131 @@ func TestFirstRolloutPlansBeforeMutating(t *testing.T) {
 }
 
 // A non-cooperating writer that lands a rule between the plan's snapshot and
-// its restore gets that rule demoted by the absolute-head inserts. Detection
-// alone is not enough: a later dump cannot tell the demoted rule from one
-// that was always below us, so a restart's verification would bless the
-// shadowing forever. The demotion must be undone — our rules rolled back,
-// the interloper classified from a fresh snapshot — and, being strict, it
-// must end up refused with the chain restored to the writer's ordering.
-func TestRacedInsertIsRolledBackNotShadowed(t *testing.T) {
+// its restore gets that rule demoted by the absolute-head inserts, and no
+// later dump can tell it apart from one that was always below us. The
+// recovery must undo the demotion WITHOUT removing enforcement: vmd's rules
+// move directly below the interloper in one transaction, and verification
+// then reads the strict rule as tolerated in place.
+func TestRacedInsertYieldsBelowInterloper(t *testing.T) {
+	interloper := []string{"-p", "tcp", "--dport", "22", "-j", "DROP"}
+	raceOnce := func(k *fakeKernel) func() {
+		raced := false
+		inner := restoreIPTables
+		restoreIPTables = func(ctx context.Context, input string) error {
+			if !raced && strings.HasPrefix(input, "*filter") && strings.Contains(input, "-I FORWARD 1") {
+				// The other writer got there first: its DROP is at the
+				// head when our head inserts land, so ours push it below.
+				raced = true
+				k.rules["filter/FORWARD"] = append([][]string{interloper}, k.rules["filter/FORWARD"]...)
+			}
+			return inner(ctx, input)
+		}
+		return func() { restoreIPTables = inner }
+	}
+	assertYielded := func(t *testing.T, k *fakeKernel, spec hostFWSpec) {
+		t.Helper()
+		fw := k.rules["filter/FORWARD"]
+		if len(fw) < 3 || !ruleEqual(interloper, fw[0]) {
+			t.Fatalf("foreign DROP not left at the head: %v", fw)
+		}
+		if !hasVMDMarker(fw[1]) || !hasVMDMarker(fw[2]) {
+			t.Fatalf("vmd jumps not directly below the interloper: %v", fw)
+		}
+		for _, key := range []string{"filter/FORWARD", "nat/PREROUTING", "nat/POSTROUTING"} {
+			for _, w := range spec.sharedOrdered[key] {
+				found := false
+				for _, g := range k.rules[key] {
+					if ruleEqual(w.args, g) {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("vmd rule missing from %s after the yield — enforcement lapsed: %v", key, w.args)
+				}
+			}
+		}
+		if ok, class := mustVerify(t, renderDump(k.rules, k.chains), spec); !ok {
+			t.Fatalf("yielded layout not verified: %s", class)
+		}
+	}
+
+	t.Run("first rollout", func(t *testing.T) {
+		spec := testSpec(true)
+		rules, chains := specKernel(spec, nil)
+		rules["filter/FORWARD"] = nil // jumps absent: the plan head-inserts
+		k := &fakeKernel{rules: rules, chains: chains}
+		defer k.install(t)()
+		defer raceOnce(k)()
+		if err := ensureOwner(t); err != nil {
+			t.Fatalf("ensure after a raced first rollout: %v", err)
+		}
+		assertYielded(t, k, spec)
+	})
+
+	t.Run("established host keeps enforcement throughout", func(t *testing.T) {
+		spec := testSpec(true)
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		fw[0], fw[1] = fw[1], fw[0] // misordered jumps force a repair
+		k := &fakeKernel{rules: rules, chains: chains}
+		defer k.install(t)()
+		defer raceOnce(k)()
+		// Every restore the repair issues must leave vmd's jumps present in
+		// FORWARD: a running sandbox must never see an interval without
+		// forwarding enforcement.
+		inner := restoreIPTables
+		restoreIPTables = func(ctx context.Context, input string) error {
+			err := inner(ctx, input)
+			if strings.HasPrefix(input, "*filter") {
+				present := 0
+				for _, g := range k.rules["filter/FORWARD"] {
+					if hasVMDMarker(g) {
+						present++
+					}
+				}
+				if present < 2 {
+					t.Errorf("vmd jumps absent from FORWARD after a restore — enforcement lapsed: %v", k.rules["filter/FORWARD"])
+				}
+			}
+			return err
+		}
+		defer func() { restoreIPTables = inner }()
+		if err := ensureOwner(t); err != nil {
+			t.Fatalf("ensure after a raced repair on an established host: %v", err)
+		}
+		assertYielded(t, k, spec)
+	})
+}
+
+// A writer that keeps mutating the chain under every correction exhausts the
+// budget: startup refuses — with vmd's rules still installed, never removed.
+func TestPersistentConcurrentWriterExhaustsCorrections(t *testing.T) {
 	spec := testSpec(true)
 	rules, chains := specKernel(spec, nil)
-	rules["filter/FORWARD"] = nil // jumps absent: the plan will head-insert
+	rules["filter/FORWARD"] = nil
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
-
-	interloper := []string{"-p", "tcp", "--dport", "22", "-j", "DROP"}
-	raced := false
 	inner := restoreIPTables
 	restoreIPTables = func(ctx context.Context, input string) error {
-		if !raced && strings.HasPrefix(input, "*filter") && strings.Contains(input, "-I FORWARD 1") {
-			// The other writer got there first: its DROP is at the head
-			// when our head inserts land, so ours push it below.
-			raced = true
-			k.rules["filter/FORWARD"] = append([][]string{interloper}, k.rules["filter/FORWARD"]...)
+		if strings.HasPrefix(input, "*filter") && strings.Contains(input, "-I FORWARD") {
+			k.rules["filter/FORWARD"] = append([][]string{{"-p", "tcp", "--dport", "22", "-j", "DROP"}}, k.rules["filter/FORWARD"]...)
 		}
 		return inner(ctx, input)
 	}
 	defer func() { restoreIPTables = inner }()
 
 	err := ensureOwner(t)
-	if err == nil || !strings.Contains(err.Error(), "raced") {
-		t.Fatalf("want refusal after rolling back the raced repair, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "concurrent") {
+		t.Fatalf("want budget-exhaustion refusal, got: %v", err)
 	}
-	fw := k.rules["filter/FORWARD"]
-	if len(fw) == 0 || !ruleEqual(interloper, fw[0]) {
-		t.Fatalf("foreign DROP not restored to the head after rollback: %v", fw)
-	}
-	for _, r := range fw {
-		if hasVMDMarker(r) {
-			t.Fatalf("vmd rule left in place after rollback — DROP would stay shadowed: %v", fw)
+	present := 0
+	for _, g := range k.rules["filter/FORWARD"] {
+		if hasVMDMarker(g) {
+			present++
 		}
 	}
-	// A restart must not bless this state: with our rules gone, verification
-	// reports the deficit rather than "intact".
-	if ok, class := mustVerify(t, renderDump(k.rules, k.chains), spec); ok || class == "" {
-		t.Fatalf("post-rollback state verified as intact (%s) — shadowing would persist across restarts", class)
+	if present != 2 {
+		t.Fatalf("vmd jumps = %d in FORWARD after refusal, want 2 — enforcement must stay installed", present)
 	}
 }
 
