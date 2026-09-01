@@ -1458,9 +1458,11 @@ func main() {
 	//
 	// One exec, then one every few minutes — bounded, touches no fleet-sized
 	// collection and no allocator lock, so it does not belong behind the
-	// readiness barrier below. Started here rather than after it so the answer
-	// is settled by the time requests are accepted, instead of the first restore
-	// racing the probe and silently taking legacy behaviour.
+	// readiness barrier below. Started early so it has normally answered long
+	// before the first request, but nothing orders the two: a restore that beats
+	// the first probe reads false and takes legacy behaviour — slower, never
+	// wrong, and corrected by the next probe. Blocking readiness on an exec to
+	// close that window would cost every restart more than it saves.
 	mgr.WatchFirecrackerCapability(ctx, log)
 
 	// ---- Background full reattach ----
