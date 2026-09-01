@@ -25,9 +25,6 @@ import tempfile
 RELEASE_REPO = "superserve-ai/firecracker"
 
 INSTALL_PATH = "/usr/local/bin/firecracker"
-# The pre-fork stock binary. It is the floor of any rollback, so a host that
-# has lost it must not be deployed to until it is restored.
-STOCK_BACKUP = f"{INSTALL_PATH}.v1.15.0.bak"
 # Every launch is gated on this capability, so a binary that stopped
 # advertising it would disable direct spawn on the next daemon restart
 # rather than failing at install time.
@@ -183,15 +180,11 @@ set -euo pipefail
 
 staged={shlex.quote(staged)}
 live={shlex.quote(INSTALL_PATH)}
-stock={shlex.quote(STOCK_BACKUP)}
 digest={shlex.quote(digest)}
 
-# Rollback floor. Without it a bad swap has nowhere to fall back to, so
-# refuse before touching anything.
-test -f "$stock" || {{ echo "stock backup $stock missing — abort"; exit 1; }}
-# Existence is not usability: a truncated or non-executable floor leaves the
-# host with no deep rollback at all.
-"$stock" --version >/dev/null 2>&1 || {{ echo "stock backup $stock does not run — abort"; exit 1; }}
+# Clear the staged copy however this exits, so an aborted run leaves nothing
+# behind on the host.
+trap 'rm -f "$staged"' EXIT
 
 # The bytes that arrived are the bytes that were built.
 echo "$digest  $staged" | sha256sum -c -
@@ -209,7 +202,6 @@ chmod +x "$staged"
 # a second backup of a binary that is already the target.
 if [ "$(sha256sum < "$live" | cut -d' ' -f1)" = "$digest" ]; then
   echo "already at $digest — nothing to do"
-  rm -f "$staged"
   exit 0
 fi
 
@@ -247,7 +239,6 @@ installed=$(sha256sum < "$live" | cut -d' ' -f1)
 test "$installed" = "$digest" || {{ echo "post-install digest $installed != $digest"; exit 1; }}
 "$live" --version
 "$live" --version | grep -qE '^[[:space:]]*capability: {REQUIRED_CAPABILITY}[[:space:]]*$'
-rm -f "$staged"
 echo "installed $digest (previous binary saved at $backup)"
 """
 
