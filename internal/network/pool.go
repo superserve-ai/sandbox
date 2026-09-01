@@ -526,10 +526,12 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 				Str("namespace", slot.info.Namespace).
 				Int("slot", slot.idx).
 				Msg("pool: discarded phantom slot (kernel netns missing)")
-			p.cleanup(slot)
 			// The discard opened a deficit just like a successful claim
-			// would; held workers must hear about this one too.
+			// would; held workers hear about it BEFORE the teardown below,
+			// which can block — replacement overlaps cleanup instead of
+			// queueing behind it.
 			p.wakeRefillOnDeficit()
+			p.cleanup(slot)
 			continue
 		}
 		tNsChecked := time.Now()
@@ -1640,8 +1642,11 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		// transition below publishes active BEFORE releasing held, so no
 		// claimant can observe the pool with neither.
 		if len(p.fresh)+len(p.recycled) >= p.newSize {
-			deactivate()
+			// Held is published BEFORE active is dropped: deactivate()
+			// broadcasts to claimants, and one woken by it must never see
+			// both counters at zero with a wake already queued.
 			p.refillHeld.Add(1)
+			deactivate()
 			for {
 				select {
 				case <-p.refillWake: // a claim opened a deficit
