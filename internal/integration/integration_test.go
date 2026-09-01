@@ -1488,6 +1488,18 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 		t.Fatalf("test clock is too close to the billing period start: start=%s end=%s", start, end)
 	}
 	seconds := end.Sub(start).Seconds()
+	// Billable usage is clamped to the current period, so the seeded window
+	// collapses to minutes just after a period rolls over. Size the credit
+	// from the closed intervals rather than hardcoding an amount: a fixed
+	// credit only stays below the charges for most of the month, and exceeds
+	// them at the start of one, leaving credit unspent and flipping every
+	// assertion that expects it fully consumed.
+	closedCompute := 2 * seconds * 0.000014
+	closedMemory := 2 * seconds * 0.0000045
+	creditUSD := math.Round((closedCompute+closedMemory)/2*1e6) / 1e6
+	if creditUSD <= 0 {
+		t.Fatalf("seeded window is too short to bill against: seconds=%v", seconds)
+	}
 	openStart := now.Add(-15 * time.Minute)
 	if openStart.Before(periodStart) {
 		openStart = periodStart
@@ -1530,8 +1542,8 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	}
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
-		VALUES ($1, 0.100000, 0.100000, 'integration test credit')
-	`, teamID); err != nil {
+		VALUES ($1, $2, $2, 'integration test credit')
+	`, teamID, creditUSD); err != nil {
 		t.Fatalf("seed billing credit: %v", err)
 	}
 
@@ -1556,8 +1568,6 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	if !ok {
 		t.Fatalf("cost_breakdown_usd not an object: %v", body["cost_breakdown_usd"])
 	}
-	closedCompute := 2 * seconds * 0.000014
-	closedMemory := 2 * seconds * 0.0000045
 	minOpenSeconds := requestStarted.Sub(openStart).Seconds()
 	maxOpenSeconds := requestFinished.Sub(openStart).Seconds()
 	if minOpenSeconds < 0 {
@@ -1574,10 +1584,16 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	assertFloatNear(t, storage, 0)
 
 	currentCharges := body["current_charges_usd"].(float64)
-	creditsApplied := math.Min(currentCharges, 0.1)
+	// Everything below assumes the credit is fully consumed — including the
+	// later payment_setup_required check, which only holds once no credit
+	// remains. Fail here with the reason rather than there with a bare false.
+	if currentCharges <= creditUSD {
+		t.Fatalf("charges %v do not exceed the seeded credit %v, so it cannot be fully consumed", currentCharges, creditUSD)
+	}
+	creditsApplied := math.Min(currentCharges, creditUSD)
 	assertFloatNear(t, currentCharges, compute+memory)
 	assertFloatNear(t, body["credits_applied_usd"].(float64), creditsApplied)
-	assertFloatNear(t, body["credits_remaining_usd"].(float64), 0.1-creditsApplied)
+	assertFloatNear(t, body["credits_remaining_usd"].(float64), creditUSD-creditsApplied)
 	assertFloatNear(t, body["expected_invoice_amount_usd"].(float64), currentCharges-creditsApplied)
 
 	resources, ok := body["resources"].([]interface{})
