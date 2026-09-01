@@ -8,12 +8,34 @@ one property whose violation reintroduces the incident.
 
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 SOURCE = Path(__file__).with_name("deploy-vmd.py").read_text()
+
+
+def _gnu_sed_env(tmp_dir):
+    # The rendered blocks below run through `sh -c` for real, and this
+    # script's `sed -i PATTERN FILE` (no backup-suffix argument) is GNU
+    # syntax — correct on the Linux deploy targets and the CI runner, but
+    # BSD sed (stock on macOS) parses the pattern as a mandatory backup
+    # suffix instead and silently no-ops. Shim `sed` to GNU sed (`gsed`
+    # via Homebrew) when running locally on macOS so these tests validate
+    # the same behavior contributors will see in CI, not a platform quirk.
+    gnu_sed = shutil.which("sed")
+    if gnu_sed:
+        version = subprocess.run([gnu_sed, "--version"], capture_output=True, text=True)
+        if "GNU sed" not in version.stdout:
+            gnu_sed = shutil.which("gsed")
+    if not gnu_sed or gnu_sed == shutil.which("sed"):
+        return dict(os.environ)
+    shim_dir = Path(tmp_dir) / "gnu-sed-shim"
+    shim_dir.mkdir()
+    (shim_dir / "sed").symlink_to(gnu_sed)
+    return dict(os.environ, PATH="%s:%s" % (shim_dir, os.environ["PATH"]))
 
 
 class DeployVmdOrderingTests(unittest.TestCase):
@@ -95,6 +117,78 @@ class DeployVmdOrderingTests(unittest.TestCase):
                     ["sh", "-c", query], env=env, capture_output=True, text=True
                 ).stdout
                 self.assertIn(expect, out, "exit=%d" % exit_code)
+
+
+class BackupStagingDirRollbackTests(unittest.TestCase):
+    # Regression guard for a rollback hazard: pre-this-var vmd binaries treat
+    # BACKUP_STAGING_DIR as the single staging root, so a stale line left
+    # behind by a prior deploy would silently move pause-hot-path staging
+    # onto the dedicated disk on a rolled-back binary. The upsert must clear
+    # stale host state even when the incoming value is empty, not just skip
+    # writing new state.
+
+    def _staging_dir_block(self):
+        match = re.search(
+            r"# Upsert BACKUP_STAGING_DIR.*?\n(?:.*\n)*?\s*fi\n", SOURCE
+        )
+        self.assertIsNotNone(match, "could not locate the BACKUP_STAGING_DIR upsert block")
+        return match.group(0)
+
+    def test_delete_is_not_gated_on_the_empty_value_guard(self):
+        # The sed delete must run unconditionally: only the append (echo/tee)
+        # may live inside `if [ -n ... ]; then ... fi`.
+        block = self._staging_dir_block()
+        guard = re.search(r"if \[ -n \{q_backup_staging\} \]; then\n(.*\n)*?\s*fi\n", block)
+        self.assertIsNotNone(guard, "expected an `if [ -n {q_backup_staging} ]` guard")
+        self.assertNotIn(
+            "sed -i",
+            guard.group(0),
+            "the sed delete must run before/outside the empty-value guard, "
+            "or an empty incoming value leaves a stale BACKUP_STAGING_DIR "
+            "line on the host",
+        )
+        self.assertIn("sed -i", block)
+
+    def test_empty_value_clears_a_stale_line_on_the_host(self):
+        # Behavioral: render the block with an empty incoming value against a
+        # fake vmd.env carrying a stale line from a prior deploy, and confirm
+        # the line is actually gone afterward.
+        block = self._staging_dir_block()
+        rendered = block.replace("{q_backup_staging}", "''").replace(
+            "{q_backup_staging_line}", "'unused'"
+        )
+        rendered = rendered.replace("sudo ", "")
+        with tempfile.TemporaryDirectory() as d:
+            env_file = Path(d) / "vmd.env"
+            env_file.write_text("BACKUP_STAGING_DIR=/mnt/localssd/backup-staging\nOTHER=1\n")
+            script = rendered.replace("/etc/sandbox/vmd.env", str(env_file))
+            result = subprocess.run(
+                ["sh", "-c", script], capture_output=True, text=True, env=_gnu_sed_env(d)
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("BACKUP_STAGING_DIR", env_file.read_text())
+            self.assertIn("OTHER=1", env_file.read_text())
+
+    def test_non_empty_value_replaces_a_stale_line_on_the_host(self):
+        # Companion behavioral case: a new value still upserts correctly
+        # (delete-then-append), not just delete-and-skip.
+        block = self._staging_dir_block()
+        rendered = block.replace("{q_backup_staging}", "'/mnt/new-disk/staging'").replace(
+            "{q_backup_staging_line}", "'BACKUP_STAGING_DIR=/mnt/new-disk/staging'"
+        )
+        rendered = rendered.replace("sudo ", "")
+        with tempfile.TemporaryDirectory() as d:
+            env_file = Path(d) / "vmd.env"
+            env_file.write_text("BACKUP_STAGING_DIR=/mnt/localssd/backup-staging\nOTHER=1\n")
+            script = rendered.replace("/etc/sandbox/vmd.env", str(env_file))
+            result = subprocess.run(
+                ["sh", "-c", script], capture_output=True, text=True, env=_gnu_sed_env(d)
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            content = env_file.read_text()
+            self.assertIn("BACKUP_STAGING_DIR=/mnt/new-disk/staging", content)
+            self.assertNotIn("/mnt/localssd/backup-staging", content)
+            self.assertIn("OTHER=1", content)
 
 
 if __name__ == "__main__":
