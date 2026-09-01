@@ -148,6 +148,7 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 		// with the restore and the absolute-position inserts may have changed
 		// its rule's effective position — refuse rather than serve a state
 		// that silently reordered someone else's rule.
+		changed := ""
 		for key, wantChain := range predicted {
 			gotChain := d.rules[key]
 			same := len(gotChain) == len(wantChain)
@@ -159,8 +160,45 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 				same = ruleEqual(wantChain[i], gotChain[i]) || slices.Equal(wantChain[i], gotChain[i])
 			}
 			if !same {
-				return fmt.Errorf("host firewall chain %s changed underneath the repair — concurrent non-cooperating writer; refusing to serve from a stale snapshot", key)
+				changed = key
+				break
 			}
+		}
+		if changed != "" {
+			// The absolute-head inserts may have demoted a rule the other
+			// writer placed between our snapshot and our restore — and no
+			// later dump can tell that rule apart from one that was always
+			// below us. Refusing to serve is not enough: the demotion
+			// itself must be undone, or the next verification would find
+			// vmd first, look no further, and leave the foreign rule
+			// shadowed for good. Rolling our own rules back out (exact
+			// rulespec deletes, which can only ever match a vmd rule)
+			// restores exactly the ordering that writer produced. Then one
+			// replan from a fresh snapshot: the interloper now sits above
+			// nothing of ours, so it is scanned and classified like any
+			// other foreign rule — tolerated, moved, or refused.
+			if rbErr := rollbackSharedRules(ctx, spec); rbErr != nil {
+				return fmt.Errorf("host firewall chain %s changed underneath the repair — concurrent non-cooperating writer; rollback of vmd rules failed: %w", changed, rbErr)
+			}
+			if pass > 0 {
+				return fmt.Errorf("host firewall chain %s changed underneath the repair again — concurrent non-cooperating writer; vmd rules rolled back, refusing to serve", changed)
+			}
+			go func() {
+				log.Warn().Str("chain", changed).
+					Msg("host firewall changed underneath the repair — rolled vmd rules back, replanning from a fresh snapshot")
+			}()
+			out, err := dumpIPTables(ctx)
+			if err != nil {
+				return fmt.Errorf("host firewall post-rollback dump: %w", err)
+			}
+			fresh, perr := parseIPTablesSave(out)
+			if perr != nil {
+				return fmt.Errorf("host firewall post-rollback parse: %w", perr)
+			}
+			if predicted, err = repairSharedOrdering(ctx, fresh, spec); err != nil {
+				return fmt.Errorf("host firewall ordering after rolling back a raced repair: %w", err)
+			}
+			continue
 		}
 		ok, class, detail := verifyHostFirewall(d, spec)
 		// Async: informational writes must not hold the lock (or startup)
@@ -192,6 +230,46 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 			return fmt.Errorf("host firewall ordering repair: %w", err)
 		}
 	}
+}
+
+// rollbackSharedRules deletes every copy of vmd's own rules from the shared
+// chains — exact-rulespec deletes, which can only ever match a vmd rule — so
+// a chain a non-cooperating writer changed under our plan returns to the
+// ordering that writer produced, minus us. Enforcement is absent until the
+// replan lands, but the caller is already refusing to serve; the alternative
+// is a foreign rule shadowed until an operator notices. OWNER ONLY.
+func rollbackSharedRules(ctx context.Context, spec hostFWSpec) error {
+	out, err := dumpIPTables(ctx)
+	if err != nil {
+		return fmt.Errorf("rollback dump: %w", err)
+	}
+	d, perr := parseIPTablesSave(out)
+	if perr != nil {
+		return fmt.Errorf("rollback parse: %w", perr)
+	}
+	perTable := map[string][]string{}
+	for key, want := range spec.sharedOrdered {
+		table, chain, _ := strings.Cut(key, "/")
+		for _, g := range d.rules[key] {
+			for _, w := range want {
+				if ruleEqual(w.args, g) {
+					perTable[table] = append(perTable[table], "-D "+chain+" "+emitRuleTokens(w.args))
+					break
+				}
+			}
+		}
+	}
+	for _, table := range []string{"filter", "nat"} {
+		lines := perTable[table]
+		if len(lines) == 0 {
+			continue
+		}
+		input := "*" + table + "\n" + strings.Join(lines, "\n") + "\nCOMMIT\n"
+		if err := restoreIPTables(ctx, input); err != nil {
+			return fmt.Errorf("atomic %s rollback: %w", table, err)
+		}
+	}
+	return nil
 }
 
 // repairSharedOrdering repositions the vmd rules in each wrong shared chain
@@ -424,6 +502,12 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 // plan-and-repair when not. Failures are logged loudly, never fatal: a
 // serving daemon cannot fail-closed the way a startup can, and the next tick
 // retries. Owner only; non-owners have no reconciliation to run.
+//
+// Accepted tradeoff: this is polling, so another agent can disturb the
+// shared-chain ordering for up to one interval before it is repaired.
+// Event-driven reconciliation (a netlink/nftables monitor) would close that
+// window and is the natural follow-up; the poll keeps this change free of a
+// new long-lived kernel subscription.
 func (m *Manager) StartHostFWSampler(ctx context.Context, every time.Duration) {
 	if !m.ownsEgressPortChain {
 		return

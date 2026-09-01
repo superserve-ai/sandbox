@@ -1412,6 +1412,54 @@ func TestFirstRolloutPlansBeforeMutating(t *testing.T) {
 	})
 }
 
+// A non-cooperating writer that lands a rule between the plan's snapshot and
+// its restore gets that rule demoted by the absolute-head inserts. Detection
+// alone is not enough: a later dump cannot tell the demoted rule from one
+// that was always below us, so a restart's verification would bless the
+// shadowing forever. The demotion must be undone — our rules rolled back,
+// the interloper classified from a fresh snapshot — and, being strict, it
+// must end up refused with the chain restored to the writer's ordering.
+func TestRacedInsertIsRolledBackNotShadowed(t *testing.T) {
+	spec := testSpec(true)
+	rules, chains := specKernel(spec, nil)
+	rules["filter/FORWARD"] = nil // jumps absent: the plan will head-insert
+	k := &fakeKernel{rules: rules, chains: chains}
+	defer k.install(t)()
+
+	interloper := []string{"-p", "tcp", "--dport", "22", "-j", "DROP"}
+	raced := false
+	inner := restoreIPTables
+	restoreIPTables = func(ctx context.Context, input string) error {
+		if !raced && strings.HasPrefix(input, "*filter") && strings.Contains(input, "-I FORWARD 1") {
+			// The other writer got there first: its DROP is at the head
+			// when our head inserts land, so ours push it below.
+			raced = true
+			k.rules["filter/FORWARD"] = append([][]string{interloper}, k.rules["filter/FORWARD"]...)
+		}
+		return inner(ctx, input)
+	}
+	defer func() { restoreIPTables = inner }()
+
+	err := ensureOwner(t)
+	if err == nil || !strings.Contains(err.Error(), "raced") {
+		t.Fatalf("want refusal after rolling back the raced repair, got: %v", err)
+	}
+	fw := k.rules["filter/FORWARD"]
+	if len(fw) == 0 || !ruleEqual(interloper, fw[0]) {
+		t.Fatalf("foreign DROP not restored to the head after rollback: %v", fw)
+	}
+	for _, r := range fw {
+		if hasVMDMarker(r) {
+			t.Fatalf("vmd rule left in place after rollback — DROP would stay shadowed: %v", fw)
+		}
+	}
+	// A restart must not bless this state: with our rules gone, verification
+	// reports the deficit rather than "intact".
+	if ok, class := mustVerify(t, renderDump(k.rules, k.chains), spec); ok || class == "" {
+		t.Fatalf("post-rollback state verified as intact (%s) — shadowing would persist across restarts", class)
+	}
+}
+
 // The reviewer's demotion repro: a chain whose reachable rules include an
 // unconstrained DROP is operator policy. Verification tolerates it in place
 // above the jumps; repair must refuse to move it — demoting it below the
