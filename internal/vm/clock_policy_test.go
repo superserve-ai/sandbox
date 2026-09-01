@@ -378,3 +378,44 @@ func TestWallClockMarkerPathMatchesInternal(t *testing.T) {
 		t.Fatalf("exported %q != internal %q", got, want)
 	}
 }
+
+// A freeze the guest could not complete must demote the pause to an unfrozen
+// image — never leave a marked image whose workload was running on the stale
+// clock — and must be bounded, since it sits on the pause path.
+func TestFreezeGuestForPause(t *testing.T) {
+	orig := boxdFreezeGuest
+	t.Cleanup(func() { boxdFreezeGuest = orig })
+	m := &Manager{log: zerolog.Nop()}
+
+	t.Run("frozen_keeps_the_marker", func(t *testing.T) {
+		boxdFreezeGuest = func(context.Context, string) error { return nil }
+		corrects, frozen := m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
+		if !corrects || !frozen {
+			t.Fatalf("got corrects=%v frozen=%v, want both true", corrects, frozen)
+		}
+	})
+
+	t.Run("refused_demotes_to_unfrozen", func(t *testing.T) {
+		boxdFreezeGuest = func(context.Context, string) error { return errors.New("504: budget") }
+		corrects, frozen := m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
+		if corrects || frozen {
+			t.Fatalf("got corrects=%v frozen=%v, want both false", corrects, frozen)
+		}
+	})
+
+	t.Run("call_is_bounded_by_the_budget", func(t *testing.T) {
+		var seen time.Duration
+		boxdFreezeGuest = func(ctx context.Context, _ string) error {
+			dl, ok := ctx.Deadline()
+			if !ok {
+				t.Fatal("freeze must carry a deadline; it sits on the pause path")
+			}
+			seen = time.Until(dl)
+			return nil
+		}
+		m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
+		if seen <= 0 || seen > guestFreezeBudget {
+			t.Errorf("deadline %v from now, want within (0, %v]", seen, guestFreezeBudget)
+		}
+	})
+}

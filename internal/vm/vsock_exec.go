@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
@@ -131,6 +132,67 @@ func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, h
 	}
 	return nil
 }
+
+// guestFreezeBudget bounds how long a pause waits for the guest to stop its
+// workload before snapshotting. A task in uninterruptible I/O cannot be
+// frozen until it returns, and this sits on the pause path, so the wait is
+// capped and a miss falls back to the unfrozen snapshot rather than stalling.
+const guestFreezeBudget = 2 * time.Second
+
+// postBoxdFreeze asks the guest to stop its workload ahead of a snapshot, so
+// the image is taken with nothing but the agent able to run on wake. boxd
+// undoes a freeze it could not complete within the budget before answering,
+// so a failure here never leaves a half-frozen guest behind.
+func postBoxdFreeze(ctx context.Context, vmIP string) error {
+	// Hand the guest a budget shorter than this call's own deadline, so it is
+	// the guest that gives up — and thaws — before the caller stops listening.
+	budget := guestFreezeBudget - 200*time.Millisecond
+	if dl, ok := ctx.Deadline(); ok {
+		if until := time.Until(dl) - 200*time.Millisecond; until < budget {
+			budget = until
+		}
+	}
+	if budget <= 0 {
+		return context.DeadlineExceeded
+	}
+	body, _ := json.Marshal(struct {
+		BudgetMs int64 `json:"budget_ms"`
+	}{budget.Milliseconds()})
+	return postBoxd(ctx, vmIP, "/freeze", body)
+}
+
+// postBoxdThaw lets a frozen workload run again — the undo for a freeze whose
+// snapshot did not happen.
+func postBoxdThaw(ctx context.Context, vmIP string) error {
+	return postBoxd(ctx, vmIP, "/thaw", nil)
+}
+
+func postBoxd(ctx context.Context, vmIP, path string, body []byte) error {
+	url := fmt.Sprintf("http://%s:%d%s", vmIP, boxdPort, path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create %s request: %w", path, err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := boxdHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	reply, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(reply)))
+	}
+	return nil
+}
+
+// Seams so the pause path can be tested without a guest.
+var (
+	boxdFreezeGuest = postBoxdFreeze
+	boxdThawGuest   = postBoxdThaw
+)
 
 // boxdFilesystemClient returns a Connect RPC client for boxd's
 // FilesystemService, used for metadata ops (Remove, Move, etc.) inside

@@ -75,3 +75,44 @@ func TestBoxdWallClockProven(t *testing.T) {
 		}
 	})
 }
+
+// A freeze that did not complete must never let the image be marked: the
+// helper's error is what demotes the template to the unfrozen path.
+func TestBoxdFreezeWorkload(t *testing.T) {
+	serve := func(t *testing.T, status int) func() {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(boxdPort))
+		if err != nil {
+			t.Skipf("port %d busy: %v", boxdPort, err)
+		}
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost || r.URL.Path != "/freeze" {
+				t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			}
+			w.WriteHeader(status)
+			w.Write([]byte("workload did not freeze within budget"))
+		}))
+		srv.Listener = ln
+		srv.Start()
+		return srv.Close
+	}
+
+	t.Run("frozen_is_ok", func(t *testing.T) {
+		defer serve(t, 200)()
+		if err := boxdFreezeWorkload(context.Background(), "127.0.0.1"); err != nil {
+			t.Fatalf("want nil, got %v", err)
+		}
+	})
+	t.Run("budget_exhausted_is_an_error_with_the_reason", func(t *testing.T) {
+		defer serve(t, 504)()
+		err := boxdFreezeWorkload(context.Background(), "127.0.0.1")
+		if err == nil || !strings.Contains(err.Error(), "504") || !strings.Contains(err.Error(), "budget") {
+			t.Fatalf("err = %v, want the status and the agent's reason", err)
+		}
+	})
+	t.Run("unreachable_is_an_error", func(t *testing.T) {
+		if err := boxdFreezeWorkload(context.Background(), "127.0.0.1"); err == nil {
+			t.Fatal("no agent must not read as frozen")
+		}
+	})
+}

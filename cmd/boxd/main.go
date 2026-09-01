@@ -119,11 +119,13 @@ func main() {
 	mux := http.NewServeMux()
 
 	ctx := &sandboxContext{}
+	fz := newFreezer(cgroupFS{dir: cgroupFreezerDir})
 
 	// Connect RPC services.
 	procService := &processService{
 		processes: &sync.Map{},
 		ctx:       ctx,
+		freezer:   fz,
 	}
 	mux.Handle(boxdpbconnect.NewProcessServiceHandler(procService))
 	mux.Handle(boxdpbconnect.NewFilesystemServiceHandler(&filesystemService{}))
@@ -131,8 +133,11 @@ func main() {
 	// Raw HTTP endpoints (file content transfer + health + init + exec).
 	mux.HandleFunc("/files", handleFiles)
 	mux.HandleFunc("/init", handleInit(ctx))
-	// Readiness includes a correct wall clock: see clock.go.
-	mux.HandleFunc("/health", handleHealth(newWallClock(newWallClockSource())))
+	// Readiness includes a correct wall clock, and thaws the workload once it
+	// is right: see clock.go and freezer.go.
+	mux.HandleFunc("/health", handleHealth(newWallClock(newWallClockSource()), fz))
+	mux.HandleFunc("/freeze", fz.handleFreeze)
+	mux.HandleFunc("/thaw", fz.handleThaw)
 	mux.HandleFunc("/exec", procService.handleExec)
 	mux.HandleFunc("/exec/stream", procService.handleExecStream)
 
@@ -156,15 +161,23 @@ func main() {
 // with a frozen clock is not ready until its clock is right. The template
 // builder reads the wall_clock field to decide whether an image may be marked
 // as correcting its own clock.
-func handleHealth(clock *wallClock) http.HandlerFunc {
+func handleHealth(clock *wallClock, fz *freezer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		wc, ready := clock.sync()
+		w.Header().Set("Content-Type", "application/json")
 		status := "ok"
-		if !ready {
+		if ready {
+			// The workload was frozen for the snapshot precisely so that nothing
+			// ran on the stale clock; now that it is right, let it run. Failure
+			// here is logged, not fatal: a frozen workload is visible (nothing
+			// makes progress), a wrong clock is not.
+			if err := fz.thaw(); err != nil {
+				log.Printf("freezer: thaw on ready failed: %v", err)
+			}
+		} else {
 			status = "clock"
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
-		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(struct {
 			Status    string          `json:"status"`
 			WallClock wallClockStatus `json:"wall_clock"`
@@ -281,6 +294,8 @@ func (c *sandboxContext) snapshot() (map[string]string, string, string) {
 }
 
 type processService struct {
+	// freezer holds the workload cgroup every spawned process is placed in.
+	freezer *freezer
 	boxdpbconnect.UnimplementedProcessServiceHandler
 	processes *sync.Map // pid → *runningProcess
 	ctx       *sandboxContext
@@ -589,13 +604,21 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eve
 		}
 	}
 
+	// A child exists from Start() until it is in the workload cgroup; hold
+	// the spawn lock across both so a freeze cannot run in that gap and
+	// miss it.
+	s.freezer.spawnLock()
 	if err := cmd.Start(); err != nil {
+		s.freezer.spawnUnlock()
 		return connect.NewError(connect.CodeInternal, err)
 	}
+	s.freezer.place(cmd.Process.Pid)
+	s.freezer.spawnUnlock()
 
 	pid := uint32(cmd.Process.Pid)
 	s.processes.Store(pid, &runningProcess{cmd: cmd, stdin: stdin})
 	defer s.processes.Delete(pid)
+	defer s.freezer.exited(cmd.Process.Pid)
 
 	if err := emit(&pb.ProcessEvent{
 		Event: &pb.ProcessEvent_Start{Start: &pb.StartEvent{Pid: pid}},

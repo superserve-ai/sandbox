@@ -361,6 +361,14 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null
 mkdir -p /dev/pts /home/user
 mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666 2>/dev/null
 
+# The freezer cgroup boxd places every spawned process in, so a snapshot can
+# be taken with the workload stopped and only boxd runnable on wake until the
+# wall clock has been corrected. v1: this kernel predates the v2 freezer.
+mount -t tmpfs cgroup_root /sys/fs/cgroup 2>/dev/null
+mkdir -p /sys/fs/cgroup/freezer
+mount -t cgroup -o freezer freezer /sys/fs/cgroup/freezer 2>/dev/null
+mkdir -p /sys/fs/cgroup/freezer/workload
+
 # Seed the kernel entropy pool. Firecracker VMs lack virtio-rng and
 # RDRAND, so getrandom() blocks until entropy is credited. The
 # seedentropy binary reads /proc/interrupts + clock and injects it

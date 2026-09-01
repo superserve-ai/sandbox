@@ -184,3 +184,19 @@ func (m *Manager) restoreWithClockFallback(policy *bool, restore func(clockRealt
 	}
 	return false, restore(nil)
 }
+
+// freezeGuestForPause asks a guest that corrects its own clock to stop its
+// workload ahead of the snapshot, and reports whether the image may still be
+// marked. A refused or timed-out freeze demotes this pause to an unfrozen
+// image: the guest has already thawed itself, so the only cost is a slower
+// wake for this one snapshot, and the marker cleared as a result is what makes
+// the supervisor restore it the slower, correct way.
+func (m *Manager) freezeGuestForPause(ctx context.Context, ip string, log zerolog.Logger) (corrects, frozen bool) {
+	fctx, cancel := context.WithTimeout(ctx, guestFreezeBudget)
+	defer cancel()
+	if err := boxdFreezeGuest(fctx, ip); err != nil {
+		log.Warn().Err(err).Msg("pause: guest workload not frozen; this image will wake the slower way")
+		return false, false
+	}
+	return true, true
+}

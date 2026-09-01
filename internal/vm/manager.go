@@ -1540,6 +1540,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	instBaseMem := inst.BaseMemPath
 	instMemFile := inst.MemFilePath
 	recordedCorrects := inst.CorrectsWallClock
+	instIP := inst.IP
 	diskPath := inst.DiskPath
 	diskBasePath := inst.Config.BasePath
 	inst.mu.RUnlock()
@@ -1569,6 +1570,33 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	correctsWallClock := recordedCorrects != nil && *recordedCorrects
 	if recordedCorrects == nil {
 		correctsWallClock = guestCorrectsWallClock(instMemFile, instBaseMem)
+	}
+
+	// A guest that will wake with its clock frozen must be snapshotted with its
+	// workload stopped, or its processes run on the stale clock until the agent
+	// corrects it. Ask before the image exists. A freeze that cannot complete
+	// inside the budget is not fatal: the guest thaws itself before answering,
+	// and this pause simply produces an unfrozen image — slower to wake, never
+	// wrong — which is what clearing the marker below then records.
+	guestFrozen := false
+	if correctsWallClock {
+		correctsWallClock, guestFrozen = m.freezeGuestForPause(ctx, instIP, log)
+	}
+	snapshotOK := false
+	if guestFrozen {
+		// A snapshot that fails leaves the VM running (see handleVMError), and a
+		// running VM with a frozen workload makes no progress. Undo it on every
+		// exit that is not a completed snapshot.
+		defer func() {
+			if snapshotOK {
+				return
+			}
+			tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			defer cancel()
+			if terr := boxdThawGuest(tctx, instIP); terr != nil {
+				log.Error().Err(terr).Msg("pause: snapshot failed and the guest workload could not be thawed")
+			}
+		}()
 	}
 	if !correctsWallClock {
 		for _, candidate := range []string{overlayPath, fullPath} {
@@ -1679,6 +1707,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		}
 	}
 
+	snapshotOK = true
+
 	// Stop the Firecracker process — snapshot is already on disk. A stop
 	// that fails must NOT fail the pause: the artifacts are valid and the
 	// record must reach Paused (a retry against a Running record would
@@ -1786,6 +1816,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 
 	log.Info().
 		Str("snapshot_type", snapshotType).
+		Bool("guest_frozen", guestFrozen).
 		Int64("snapshot_ms", snapshotDur.Milliseconds()).
 		Int64("stop_ms", stopDur.Milliseconds()).
 		Int64("pause_ms", time.Since(tPause).Milliseconds()).

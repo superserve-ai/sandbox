@@ -320,9 +320,19 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	// restored onto a stale one.
 	correctsWallClock, why := boxdWallClockProven(ctx, netInfo.HostIP)
 	if correctsWallClock {
-		emitInternal("system", "guest corrects its wall clock from the host: marking template")
+		// Stop the workload for the snapshot, so a sandbox created from this
+		// image wakes with nothing but the agent running until the clock is
+		// right. The build VM is discarded afterwards, so there is no thaw. A
+		// freeze that cannot complete demotes the template to the unfrozen
+		// restore path, exactly as a pause would.
+		if err := boxdFreezeWorkload(ctx, netInfo.HostIP); err != nil {
+			correctsWallClock, why = false, "workload freeze: "+err.Error()
+		}
+	}
+	if correctsWallClock {
+		emitInternal("system", "guest corrects its wall clock and froze its workload: marking template")
 	} else {
-		emitInternal("system", "guest cannot correct its wall clock (%s): template stays on legacy restore", why)
+		emitInternal("system", "template stays on the unfrozen restore path (%s)", why)
 	}
 
 	emitUser("system", "Saving template")
@@ -615,6 +625,28 @@ func boxdWallClockProven(ctx context.Context, vmIP string) (bool, string) {
 		return false, "source " + body.WallClock.Source
 	}
 	return true, ""
+}
+
+// boxdFreezeWorkload asks the guest agent to stop every process it spawned,
+// and waits for the agent to confirm they are all stopped. The agent undoes a
+// freeze it could not complete before answering, so an error here means the
+// guest is running normally and this image simply is not marked.
+func boxdFreezeWorkload(ctx context.Context, vmIP string) error {
+	url := fmt.Sprintf("http://%s:%d/freeze", vmIP, boxdPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /freeze: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST /freeze: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 // userEnv filters the build-time env map down to the keys set via `env`
