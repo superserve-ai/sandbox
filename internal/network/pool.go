@@ -1223,10 +1223,13 @@ func (p *Pool) finishStartupAdoption() {
 		return
 	}
 	p.startupAdoptionOnce.Do(func() {
-		close(p.startupAdoptionDone)
-		// Zeroed at the handoff so the summary below counts only builds
-		// after it, even on boots where refill ran alongside the pass.
+		// Zeroed BEFORE the close: the close wakes the refill workers, and
+		// a build landing between the two would be erased from the summary.
+		// On gated boots (production) workers are parked until the close,
+		// so the count is exact; an ungated boot may include a build that
+		// was already in flight at the reset — harmless overcount.
 		p.postHandoffBuilds.Store(0)
+		close(p.startupAdoptionDone)
 		p.log.Info().Dur("held_refill_for", time.Since(p.startupAdoptionBegan)).
 			Msg("pool: startup adoption handoff resolved — refill released")
 		// One delayed summary so a restart's log answers "did refill

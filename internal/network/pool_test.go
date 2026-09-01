@@ -1572,9 +1572,11 @@ func TestRefillBuildsOnlyTheDeficitAfterAdoption(t *testing.T) {
 	}
 }
 
-// On an ungated pool, StartAdoption's planned-flag write can land while
-// refill workers are already past the gate and reading it — the flag must be
-// race-safe under that interleaving (run with -race).
+// StartAdoption's planned-flag write must be race-safe against concurrent
+// handoff readers — the interleaving an ungated pool's already-running
+// workers produce. The readers here call waitForStartupAdoption directly
+// (the adoption pass itself stays parked behind an unopened gate), so this
+// validates the concurrent flag access, not the full ungated StartPool flow.
 func TestStartAdoptionPlannedFlagIsRaceSafe(t *testing.T) {
 	p := &Pool{
 		log:                 zerolog.Nop(),
