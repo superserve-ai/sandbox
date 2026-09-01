@@ -1408,7 +1408,7 @@ func TestRefillDefersToStartupAdoption(t *testing.T) {
 
 	t.Run("nil handoff channel: immediate", func(t *testing.T) {
 		p := &Pool{log: zerolog.Nop(), stopCh: make(chan struct{})}
-		p.startupAdoptionPlanned = true
+		p.startupAdoptionPlanned.Store(true)
 		if !p.waitForStartupAdoption(context.Background()) {
 			t.Fatal("a pool without a handoff channel has no waiters to hold")
 		}
@@ -1440,7 +1440,7 @@ func TestRefillDefersToStartupAdoption(t *testing.T) {
 		gate := make(chan struct{})
 		p := newPool()
 		p.startGate = gate
-		p.startupAdoptionPlanned = true
+		p.startupAdoptionPlanned.Store(true)
 		ctx, cancel := context.WithCancel(context.Background())
 		p.wg.Add(1)
 		go p.refillLoop(ctx)
@@ -1480,4 +1480,131 @@ func TestRefillDefersToStartupAdoption(t *testing.T) {
 		p.finishStartupAdoption()
 		p.finishStartupAdoption()
 	})
+}
+
+// stubPoolAllocate replaces fresh slot construction with a counter that
+// returns inert slots (nil info short-circuits every cleanup path), so tests
+// can measure exactly how many builds refill performs.
+func stubPoolAllocate(t *testing.T) *atomic.Int64 {
+	t.Helper()
+	var builds atomic.Int64
+	old := poolAllocateFunc
+	poolAllocateFunc = func(p *Pool, ctx context.Context) (*preallocSlot, error) {
+		builds.Add(1)
+		return &preallocSlot{idx: int(builds.Load())}, nil
+	}
+	t.Cleanup(func() { poolAllocateFunc = old })
+	return &builds
+}
+
+// The incident regression: after a recovery pass that restores the whole
+// pool, refill must build at most one in-hand slot per worker — never the
+// pool-sized burst the producer race caused. With K slots consumed during
+// recovery, the bound is K plus the worker count.
+func TestRefillBuildsOnlyTheDeficitAfterAdoption(t *testing.T) {
+	const capacity, workers, claimed = 8, 4, 3
+	for _, tc := range []struct {
+		name     string
+		consume  int
+		maxBuild int64
+	}{
+		{"perfect recovery, no claims", 0, workers},
+		{"perfect recovery, K claims", claimed, claimed + workers},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			builds := stubPoolAllocate(t)
+			gate := make(chan struct{})
+			p := &Pool{
+				mgr:                 &Manager{}, // yieldToForeground reads its counters
+				log:                 zerolog.Nop(),
+				newSize:             capacity,
+				fresh:               make(chan *preallocSlot, capacity),
+				recycled:            make(chan *preallocSlot, capacity),
+				stopCh:              make(chan struct{}),
+				startGate:           gate,
+				startupAdoptionDone: make(chan struct{}),
+				refillDrainGate:     make(chan struct{}),
+				adoptEscapeStreak:   defaultAdoptEscapeStreak,
+			}
+			p.startupAdoptionPlanned.Store(true)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			for i := 0; i < workers; i++ {
+				p.wg.Add(1)
+				go p.refillLoop(ctx)
+			}
+
+			close(gate)
+			time.Sleep(20 * time.Millisecond)
+			if got := builds.Load(); got != 0 {
+				t.Fatalf("refill built %d slots before the handoff, want 0", got)
+			}
+
+			// The recovery pass restores the full pool, minus what claims
+			// consumed while it ran, then hands off.
+			for i := 0; i < capacity-tc.consume; i++ {
+				p.fresh <- &preallocSlot{idx: 1000 + i}
+			}
+			p.finishStartupAdoption()
+
+			deadline := time.After(2 * time.Second)
+			for len(p.fresh) < capacity {
+				select {
+				case <-deadline:
+					t.Fatalf("pool never refilled: fresh=%d builds=%d", len(p.fresh), builds.Load())
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+			time.Sleep(50 * time.Millisecond) // let parked overshoot settle
+			if got := builds.Load(); got > tc.maxBuild {
+				t.Fatalf("refill built %d slots, want <= %d", got, tc.maxBuild)
+			}
+
+			close(p.stopCh)
+			waited := make(chan struct{})
+			go func() { p.wg.Wait(); close(waited) }()
+			select {
+			case <-waited:
+			case <-time.After(2 * time.Second):
+				t.Fatal("workers did not join after stop")
+			}
+		})
+	}
+}
+
+// On an ungated pool, StartAdoption's planned-flag write can land while
+// refill workers are already past the gate and reading it — the flag must be
+// race-safe under that interleaving (run with -race).
+func TestStartAdoptionPlannedFlagIsRaceSafe(t *testing.T) {
+	p := &Pool{
+		log:                 zerolog.Nop(),
+		stopCh:              make(chan struct{}),
+		startGate:           make(chan struct{}), // never opened: the pass parks harmlessly
+		startupAdoptionDone: make(chan struct{}),
+		adoptEscapeStreak:   defaultAdoptEscapeStreak,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var readers sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			p.waitForStartupAdoption(ctx) // races the Store below
+		}()
+	}
+	if !p.StartAdoption(ctx) {
+		t.Fatal("StartAdoption must claim the pass")
+	}
+	cancel() // releases any reader that observed the flag set
+	readers.Wait()
+
+	close(p.stopCh)
+	waited := make(chan struct{})
+	go func() { p.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked adoption did not join after stop")
+	}
 }

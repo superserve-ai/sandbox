@@ -67,16 +67,24 @@ type Pool struct {
 	// few namespace entries; building one from scratch is a namespace, a
 	// veth pair, a tap, and a firewall program — so if both producers wake
 	// at the same gate, refill duplicates at full price exactly the
-	// inventory adoption is restoring. Written only by StartAdoption,
-	// before the start gate opens (see there); never afterwards.
-	startupAdoptionPlanned bool
+	// inventory adoption is restoring. Written only by StartAdoption (see
+	// there); atomic because an ungated pool's workers may already be
+	// running when that write lands.
+	startupAdoptionPlanned atomic.Bool
 	// startupAdoptionDone is the one-shot handoff: closed on every exit of
 	// the boot adoption pass. Refill measures the remaining deficit only
 	// after it.
 	startupAdoptionDone chan struct{}
 	startupAdoptionOnce sync.Once
-	wg                  sync.WaitGroup
-	drainMu             sync.RWMutex
+	// startupAdoptionBegan and postHandoffBuilds record the handoff's two
+	// numbers of interest: how long recovery held refill, and how many
+	// fresh builds followed anyway. Together they make a restart's log
+	// prove (or disprove) that recovery restored the pool without refill
+	// duplicating it.
+	startupAdoptionBegan time.Time
+	postHandoffBuilds    atomic.Int64
+	wg                   sync.WaitGroup
+	drainMu              sync.RWMutex
 	// refillDrainGate is closed while the controller is draining warm inventory.
 	// Refill workers select on it before handing a built slot to the pool so a
 	// send that was already blocked when drain started can still abort instead
@@ -164,6 +172,10 @@ var pidsInNsFunc = pidsInNs
 // resetTapFunc is a seam over Manager.resetTap so tests can drive the
 // recycle-vs-teardown decision without building a real netns + tap device.
 var resetTapFunc = (*Manager).resetTap
+
+// poolAllocateFunc is a seam over Pool.allocate so tests can count and stub
+// fresh slot builds without kernel namespaces.
+var poolAllocateFunc = (*Pool).allocate
 
 const (
 	// defaultVerifyPollInterval trades a small amount of slot-reuse latency
@@ -1180,7 +1192,8 @@ func (p *Pool) StartAdoption(ctx context.Context) bool {
 	// StartAdoption is a startup call and gated refill workers park on the
 	// gate until readiness, so the flag is settled before any of them can
 	// read it. finishStartupAdoption is the only release.
-	p.startupAdoptionPlanned = true
+	p.startupAdoptionPlanned.Store(true)
+	p.startupAdoptionBegan = time.Now()
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -1209,7 +1222,28 @@ func (p *Pool) finishStartupAdoption() {
 	if p.startupAdoptionDone == nil {
 		return
 	}
-	p.startupAdoptionOnce.Do(func() { close(p.startupAdoptionDone) })
+	p.startupAdoptionOnce.Do(func() {
+		close(p.startupAdoptionDone)
+		// Zeroed at the handoff so the summary below counts only builds
+		// after it, even on boots where refill ran alongside the pass.
+		p.postHandoffBuilds.Store(0)
+		p.log.Info().Dur("held_refill_for", time.Since(p.startupAdoptionBegan)).
+			Msg("pool: startup adoption handoff resolved — refill released")
+		// One delayed summary so a restart's log answers "did refill
+		// duplicate the recovery?" without host forensics. Builds after
+		// a clean recovery should be near the claims consumed during it,
+		// bounded by the worker count — never hundreds.
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			select {
+			case <-time.After(time.Minute):
+				p.log.Info().Int64("fresh_builds", p.postHandoffBuilds.Load()).
+					Msg("pool: fresh builds in the first minute after adoption handoff")
+			case <-p.stopCh:
+			}
+		}()
+	})
 }
 
 // waitForStartupAdoption blocks a refill worker until the boot adoption pass
@@ -1217,7 +1251,7 @@ func (p *Pool) finishStartupAdoption() {
 // was planned — fresh boot, adoption skipped, tests. Reports false on
 // shutdown/cancellation.
 func (p *Pool) waitForStartupAdoption(ctx context.Context) bool {
-	if !p.startupAdoptionPlanned || p.startupAdoptionDone == nil {
+	if !p.startupAdoptionPlanned.Load() || p.startupAdoptionDone == nil {
 		return true
 	}
 	select {
@@ -1521,7 +1555,7 @@ func (p *Pool) refillStep(ctx context.Context, deactivate func()) refillOutcome 
 	// not hold concurrency budget the other producers could use.
 	var slot *preallocSlot
 	var err error
-	if !p.withBGSlot(ctx, func() { slot, err = p.allocate(ctx) }) {
+	if !p.withBGSlot(ctx, func() { slot, err = poolAllocateFunc(p, ctx) }) {
 		return refillStopped
 	}
 	if err != nil {
@@ -1531,6 +1565,7 @@ func (p *Pool) refillStep(ctx context.Context, deactivate func()) refillOutcome 
 		p.log.Error().Err(err).Msg("pool refill failed")
 		return refillFailed
 	}
+	p.postHandoffBuilds.Add(1)
 	if p.refillIsPaused() {
 		deactivate()
 		p.cleanup(slot)
