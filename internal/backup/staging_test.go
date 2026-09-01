@@ -30,3 +30,30 @@ func TestResolveStagingRoot(t *testing.T) {
 		}
 	}
 }
+
+// A BACKUP_STAGING_DIR change between an ancestor and descendant path
+// (or the same directory under an aliased spelling) is not a
+// retirement: the "old" and "new" roots share a live subtree, and
+// treating either as retired would let the background sweep walk
+// referenced entries through the other's tree and delete them as
+// apparent orphans.
+func TestStagingRootsOverlap(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"/mnt/disk/staging", "/mnt/disk/staging", true},
+		{"/mnt/disk/staging/", "/mnt/disk/staging", true},
+		{"/mnt/disk/staging", "/mnt/disk/staging/sub", true},
+		{"/mnt/disk/staging/sub", "/mnt/disk/staging", true},
+		{"/mnt/disk/staging", "/mnt/other/staging", false},
+		{"/mnt/disk/staging-2", "/mnt/disk/staging", false}, // shares a prefix, not a path component
+		{"", "/mnt/disk/staging", false},
+		{"/mnt/disk/staging", "", false},
+	}
+	for _, c := range cases {
+		if got := StagingRootsOverlap(c.a, c.b); got != c.want {
+			t.Errorf("StagingRootsOverlap(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}

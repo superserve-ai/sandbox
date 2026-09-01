@@ -16,10 +16,18 @@ import (
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
-// SetBackupStaging points the enqueue path at the uploader's hard-link
+// SetBackupStaging points the enqueue path at the uploader-visible
 // staging tree. Same startup-only pattern as SetBackupEnqueue.
 func (m *Manager) SetBackupStaging(dir string) {
 	m.backupStaging = dir
+}
+
+// SetPauseStagingRoot points the pause RPC path's own inline staging at
+// its always-local tree (see pauseStagingRoot), separate from
+// SetBackupStaging's uploader-visible root. Same startup-only pattern as
+// SetBackupEnqueue.
+func (m *Manager) SetPauseStagingRoot(dir string) {
+	m.pauseStagingRoot = dir
 }
 
 // SetBackupEnqueue installs the durability pipeline's enqueue hook. Called
@@ -130,8 +138,12 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 	// worker cannot mutate a snapshot, so even an instantly-resumed
 	// pause keeps its backup. Oversized or failed staging falls back to
 	// the marker-only path, whose worker requires the at-rest proof and
-	// concedes fast-resume pauses to supersession.
-	if m.backupStaging != "" {
+	// concedes fast-resume pauses to supersession. Gated on
+	// pauseStagingRoot, not backupStaging: this copy must stay on
+	// SnapshotDir's filesystem for reflink and the base pin's hard link
+	// to work, regardless of where backupStaging (the uploader-visible
+	// root) points — see SetPauseStagingRoot.
+	if m.pauseStagingRoot != "" {
 		// A control-plane retry of the same pause must not pay a second
 		// copy: reuse the existing marker (its staged files, base pin,
 		// and pause-time base identity) when one covers this snapshot.
@@ -157,7 +169,7 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 			return manifest
 		}
 		stageStart := time.Now()
-		dir, staged, err := backup.StagePending(ctx, m.backupStaging, vmID, pb.Token, diskBasePath, map[string]string{
+		dir, staged, err := backup.StagePending(ctx, m.pauseStagingRoot, vmID, pb.Token, diskBasePath, map[string]string{
 			"vmstate.snap": snapshotPath,
 			"rootfs.ext4":  diskPath,
 		})
@@ -549,13 +561,57 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 		return
 	}
 	pb = final
+	// Promote the finalized generation from the RPC path's always-local
+	// tree (pauseStagingRoot) into the uploader-visible tree it actually
+	// hashes and streams from (backupStaging) — which may be a
+	// different disk, moved there specifically to keep that repeated
+	// read traffic off the array serving live VM I/O. This runs off the
+	// RPC path (backupPause returned long ago), so paying a real
+	// cross-filesystem copy here is fine even though it would not be on
+	// the pause path itself. When the two roots are the same tree (the
+	// default, unconfigured case) StageTask's reuse-if-present check
+	// finds the destination already there and does no actual I/O.
+	uploadPaths := finalPaths
+	if m.backupStaging != "" {
+		promoted := &backup.Task{
+			SandboxID:  pb.VMID,
+			Generation: gen,
+			Files: []backup.TaskFile{
+				{Name: "vmstate.snap", Path: finalPaths["vmstate.snap"]},
+				{Name: "rootfs.ext4", Path: finalPaths["rootfs.ext4"]},
+			},
+		}
+		if err := backup.StageTask(m.backupStaging, promoted); err != nil {
+			log.Warn().Err(err).Str("vm_id", pb.VMID).
+				Msg("staged pause backup: promotion to upload-visible staging failed; keeping pending record")
+			return
+		}
+		uploadPaths = make(map[string]string, len(promoted.Files))
+		for _, f := range promoted.Files {
+			uploadPaths[f.Name] = f.Path
+		}
+	}
 	for i := range entries {
-		if p, ok := finalPaths[entries[i].FileName]; ok {
+		if p, ok := uploadPaths[entries[i].FileName]; ok {
 			entries[i].Path = p
 		}
 	}
 	if ok, _, _ := m.enqueueBackup(pb.VMID, entries, pb.backupPriority(), pb.PauseToken); ok {
 		m.deletePendingBackupIf(pb, log)
+		// Deliberately NOT cleaning up the local (pauseStagingRoot) copy
+		// here, even though it is usually redundant once promotion has
+		// landed a copy in the upload-visible tree: the journal dedupes
+		// same-generation enqueues by content, and a row that was already
+		// Staged (e.g. queued by a pre-promotion deploy, or a previous
+		// attempt at this exact generation) keeps ITS OWN paths rather
+		// than adopting this call's — enqueueBackup succeeding here is
+		// no proof the journal actually points at the promoted copy
+		// rather than still at this local one. pauseStagingRoot's own
+		// periodic sweep is the safe cleanup path: it only reclaims a
+		// generation once the journal has no pending row for it at all
+		// (SweepStaging's HasPending check), which by construction can't
+		// be true while any row — old paths or new — still needs a copy
+		// of this generation to exist somewhere.
 		return
 	}
 	m.retryEnqueue(pb, entries, log)
