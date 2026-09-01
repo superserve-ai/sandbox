@@ -313,6 +313,18 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 
 	// block_delta_dir → emits rootfs.delta so sandboxes can be created
 	// from this template's snapshot.
+	// Whether this image may be restored with its monotonic clock frozen hinges
+	// on the guest being able to correct its own wall clock afterwards. Ask the
+	// guest agent, now, in the exact state the snapshot captures — a marker
+	// written on faith would let a guest that cannot correct its clock be
+	// restored onto a stale one.
+	correctsWallClock, why := boxdWallClockProven(ctx, netInfo.HostIP)
+	if correctsWallClock {
+		emitInternal("system", "guest corrects its wall clock from the host: marking template")
+	} else {
+		emitInternal("system", "guest cannot correct its wall clock (%s): template stays on legacy restore", why)
+	}
+
 	emitUser("system", "Saving template")
 	snapPath := filepath.Join(snapDir, "vmstate.snap")
 	memPath := filepath.Join(snapDir, "mem.snap")
@@ -322,14 +334,24 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 	emitInternal("system", "snapshot captured")
 
+	// The marker is what lets a supervisor freeze this image's clock on
+	// restore; only written once the guest proved it can put the clock right.
+	markerPath := ""
+	if correctsWallClock {
+		markerPath = vm.WallClockMarkerPath(memPath)
+		if err := os.WriteFile(markerPath, nil, 0o644); err != nil {
+			return fmt.Errorf("write wall-clock marker: %w", err)
+		}
+	}
+
 	// Flush host page cache for each artifact so a sandbox cp'ing them
 	// later doesn't see sparse holes from still-dirty pages.
-	if err := fsyncBuildArtifacts(snapDir, snapPath, memPath, basePath, deltaPath); err != nil {
+	if err := fsyncBuildArtifacts(snapDir, snapPath, memPath, basePath, deltaPath, markerPath); err != nil {
 		return fmt.Errorf("fsync build artifacts: %w", err)
 	}
 	emitInternal("system", "artifacts fsynced")
 
-	writeBuildMeta(snapDir, snapPath, memPath, basePath, deltaPath, br)
+	writeBuildMeta(snapDir, snapPath, memPath, basePath, deltaPath, correctsWallClock, br)
 
 	return nil
 }
@@ -556,6 +578,43 @@ func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, d
 		return fmt.Errorf("POST /init: status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// boxdWallClockProven asks the guest agent whether it can read the host's
+// time — the precondition for restoring this image with a frozen clock. It
+// reports what /health says about the clock source, and a reason when not.
+// Any failure to ask reads as "not proven": the marker is only ever written on
+// evidence, never on its absence.
+func boxdWallClockProven(ctx context.Context, vmIP string) (bool, string) {
+	url := fmt.Sprintf("http://%s:%d/health", vmIP, boxdPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, err.Error()
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return false, "GET /health: " + err.Error()
+	}
+	defer resp.Body.Close()
+	var body struct {
+		WallClock struct {
+			Source string `json:"source"`
+			Error  string `json:"error"`
+		} `json:"wall_clock"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return false, "decode /health: " + err.Error()
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Sprintf("/health status %d: %s", resp.StatusCode, body.WallClock.Error)
+	}
+	if body.WallClock.Source != "ptp" {
+		if body.WallClock.Error != "" {
+			return false, body.WallClock.Error
+		}
+		return false, "source " + body.WallClock.Source
+	}
+	return true, ""
 }
 
 // userEnv filters the build-time env map down to the keys set via `env`
@@ -881,7 +940,7 @@ func createBuildOverlay(runDir, vmID, basePath string) (string, error) {
 // Build metadata
 // ---------------------------------------------------------------------------
 
-func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br builder.BuildRootfsResult) {
+func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, correctsWallClock bool, br builder.BuildRootfsResult) {
 	// rootfs_path stays in the schema for backwards compat with existing
 	// readers; supervisors that understand overlay use base_path/delta_path.
 	meta := struct {
@@ -894,16 +953,22 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br build
 		SizeBytes      int64  `json:"size_bytes"`
 		BuiltAt        string `json:"built_at"`
 		SwapMode       string `json:"swap_mode"` // see builder.SwapModeGuest
+		// CorrectsWallClock records that the guest proved, at build time, it can
+		// put its wall clock right from the host — the same fact the marker
+		// beside mem.snap carries, kept here so provenance survives a copy that
+		// drops side-car files.
+		CorrectsWallClock bool `json:"corrects_wall_clock"`
 	}{
-		SnapshotPath:   snapPath,
-		MemPath:        memPath,
-		RootfsPath:     basePath,
-		BasePath:       basePath,
-		DeltaPath:      deltaPath,
-		ResolvedDigest: br.ResolvedDigest,
-		SizeBytes:      br.SizeBytes,
-		BuiltAt:        time.Now().UTC().Format(time.RFC3339),
-		SwapMode:       builder.SwapModeGuest,
+		SnapshotPath:      snapPath,
+		MemPath:           memPath,
+		RootfsPath:        basePath,
+		BasePath:          basePath,
+		DeltaPath:         deltaPath,
+		ResolvedDigest:    br.ResolvedDigest,
+		SizeBytes:         br.SizeBytes,
+		BuiltAt:           time.Now().UTC().Format(time.RFC3339),
+		SwapMode:          builder.SwapModeGuest,
+		CorrectsWallClock: correctsWallClock,
 	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {

@@ -131,7 +131,8 @@ func main() {
 	// Raw HTTP endpoints (file content transfer + health + init + exec).
 	mux.HandleFunc("/files", handleFiles)
 	mux.HandleFunc("/init", handleInit(ctx))
-	mux.HandleFunc("/health", handleHealth)
+	// Readiness includes a correct wall clock: see clock.go.
+	mux.HandleFunc("/health", handleHealth(newWallClock(newWallClockSource())))
 	mux.HandleFunc("/exec", procService.handleExec)
 	mux.HandleFunc("/exec/stream", procService.handleExecStream)
 
@@ -150,9 +151,25 @@ func main() {
 	}
 }
 
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"status":"ok"}`)
+// handleHealth is what the supervisor polls to decide the guest is ready, so it
+// is where the wall clock is brought into line with the host: a guest restored
+// with a frozen clock is not ready until its clock is right. The template
+// builder reads the wall_clock field to decide whether an image may be marked
+// as correcting its own clock.
+func handleHealth(clock *wallClock) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		wc, ready := clock.sync()
+		status := "ok"
+		if !ready {
+			status = "clock"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(struct {
+			Status    string          `json:"status"`
+			WallClock wallClockStatus `json:"wall_clock"`
+		}{Status: status, WallClock: wc})
+	}
 }
 
 // handleInit updates boxd's in-memory sandbox context. Called at least

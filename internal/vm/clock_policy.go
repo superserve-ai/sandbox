@@ -87,9 +87,17 @@ func (m *Manager) WatchFirecrackerCapability(ctx context.Context, log zerolog.Lo
 	}()
 }
 
-// clockFreezeMarkerPath returns the marker path for a memory file.
-func clockFreezeMarkerPath(memPath string) string {
+// WallClockMarkerPath returns the path of the marker that records, beside a
+// memory image, that its guest corrects its own wall clock on wake. Exported
+// because the template builder writes it and vmd reads it: both must agree on
+// the name, and the suffix is defined in exactly one place.
+func WallClockMarkerPath(memPath string) string {
 	return memPath + clockFreezeMarkerSuffix
+}
+
+// clockFreezeMarkerPath is the internal spelling; see WallClockMarkerPath.
+func clockFreezeMarkerPath(memPath string) string {
+	return WallClockMarkerPath(memPath)
 }
 
 // snapshotCorrectsWallClock reports whether memPath's guest fixes its own wall

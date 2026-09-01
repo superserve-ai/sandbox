@@ -370,3 +370,11 @@ func TestResumeWallClockPropertyUnresolvedRecordConsultsTheMarker(t *testing.T) 
 		t.Error("unresolved with no marker must still be false")
 	}
 }
+
+// The builder writes the marker and vmd reads it, so the two spellings must
+// never drift apart.
+func TestWallClockMarkerPathMatchesInternal(t *testing.T) {
+	if got, want := WallClockMarkerPath("/x/mem.snap"), clockFreezeMarkerPath("/x/mem.snap"); got != want {
+		t.Fatalf("exported %q != internal %q", got, want)
+	}
+}
