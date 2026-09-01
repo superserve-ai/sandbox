@@ -72,10 +72,18 @@ type Pool struct {
 	// running when that write lands.
 	startupAdoptionPlanned atomic.Bool
 	// startupAdoptionDone is the one-shot handoff: closed on every exit of
-	// the boot adoption pass. Refill measures the remaining deficit only
-	// after it.
+	// the boot adoption pass, and early when the pass trips its no-yield
+	// escape (a distrusted pass must not keep the fallback producer
+	// parked). Refill measures the remaining deficit only after it.
 	startupAdoptionDone chan struct{}
 	startupAdoptionOnce sync.Once
+	// refillHandoffBridge keeps producing() true across the instant of the
+	// handoff on a gated pool: the channel close releases the workers, but
+	// until the scheduler runs one, refillActive is still zero — and a
+	// claimant woken in that window would take an inline build against
+	// workers already waking. Set by finishStartupAdoption, cleared by the
+	// first worker to declare itself.
+	refillHandoffBridge atomic.Int64
 	// startupAdoptionBegan and postHandoffBuilds record the handoff's two
 	// numbers of interest: how long recovery held refill, and how many
 	// fresh builds followed anyway. Together they make a restart's log
@@ -539,7 +547,12 @@ func (p *Pool) producing() bool {
 	}
 	// While the pressure controller has refill paused, in-flight workers'
 	// output is predestined for the discard arms — active or not, they can
-	// deliver nothing, so claimants must not wait on them.
+	// deliver nothing, so claimants must not wait on them. The handoff
+	// bridge counts as production for the same reason held workers do:
+	// refill is committed and moments away (see refillHandoffBridge).
+	if p.refillHandoffBridge.Load() > 0 {
+		return true
+	}
 	return p.refillActive.Load() > 0 && !p.refillIsPaused()
 }
 
@@ -1178,15 +1191,18 @@ func (p *Pool) AdoptOrphanSlots(ctx context.Context) (adopted, invalid, skipped 
 		invalid, skipped = nInvalid.Load(), nSkipped.Load()
 	}
 
+	// Inventory work is done — release refill BEFORE dropping the adoption
+	// phase and BEFORE the stray-veth sweep. Order matters twice over: the
+	// finish raises the handoff bridge, so a claimant woken by the
+	// signalProgress below sees a producer at every instant of the
+	// transfer; and the sweep's per-interface deletions can block for
+	// seconds while delivering nothing a claimant could wait for — holding
+	// the handoff across it would leave the pool with no producer at all
+	// while requests are already being served. The goroutine's deferred
+	// finish stays as the backstop for every other exit path.
+	p.finishStartupAdoption()
 	p.adoptPhase.Store(adoptPhaseIdle)
 	p.signalProgress()
-	// Inventory work is done — release refill BEFORE the stray-veth sweep.
-	// The sweep's per-interface deletions can block for seconds and deliver
-	// nothing a claimant could wait for; holding the handoff across it
-	// would leave the pool with no producer at all while requests are
-	// already being served. The goroutine's deferred finish stays as the
-	// backstop for every other exit path.
-	p.finishStartupAdoption()
 	p.mgr.SweepStrayHostVeths()
 	// Emitted on every completion path — including the receipt fast path
 	// adopting all slots, or no orphans at all — so startup timing always has
@@ -1252,6 +1268,13 @@ func (p *Pool) finishStartupAdoption() {
 		return
 	}
 	p.startupAdoptionOnce.Do(func() {
+		// The bridge is raised BEFORE the close: from the claimants' side
+		// the producer role must transfer atomically — adoption may stop
+		// counting the instant this returns, so refill has to already
+		// count. Gated only; an ungated pool's workers declared long ago.
+		if p.startGate != nil {
+			p.refillHandoffBridge.Store(1)
+		}
 		// Zeroed BEFORE the close: the close wakes the refill workers, and
 		// a build landing between the two would be erased from the summary.
 		// On gated boots (production) workers are parked until the close,
@@ -1325,6 +1348,13 @@ func (p *Pool) adoptYieldedNothing() {
 	if p.adoptStreak.Add(1) == p.adoptEscapeStreak {
 		p.log.Warn().Int64("consecutive_without_delivery", p.adoptEscapeStreak).
 			Msg("pool: adoption yielding no inventory — claimants no longer waiting on the pass")
+		// A pass claimants no longer trust must not keep the fallback
+		// producer parked either: on an invalid-heavy fleet the remainder
+		// of the pass can run for minutes, and every create in that span
+		// would otherwise build inline. Refill wakes now and the
+		// total-inventory hold keeps the two producers from overfilling
+		// if the pass later delivers again.
+		p.finishStartupAdoption()
 		p.signalProgress()
 	}
 }
@@ -1522,9 +1552,12 @@ func (p *Pool) refillLoop(ctx context.Context) {
 	}
 	// Past the gate the worker is genuinely producing, so it publishes the
 	// declaration StartPool skipped (see there for why a gated pool must not
-	// declare it up front). Ungated, StartPool already published it.
+	// declare it up front) and lowers the handoff bridge — its declaration
+	// now carries what the bridge was holding. Ungated, StartPool already
+	// published it.
 	if p.startGate != nil {
 		p.refillActive.Add(1)
+		p.refillHandoffBridge.Store(0)
 	}
 	// The worker's active declaration is continuous across successful
 	// iterations — decrementing between two builds would let a delivery

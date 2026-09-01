@@ -1728,6 +1728,65 @@ func TestEachDeficitClaimDepositsAWakeToken(t *testing.T) {
 	}
 }
 
+// The producer role must transfer atomically from the claimants' viewpoint:
+// the instant the handoff resolves — before any released worker is scheduled
+// — producing() must already be true, or a claimant woken by adoption's
+// completion takes an inline build against workers that are already waking.
+func TestHandoffBridgesProducerVisibility(t *testing.T) {
+	p := &Pool{
+		log:                 zerolog.Nop(),
+		stopCh:              make(chan struct{}),
+		startGate:           make(chan struct{}),
+		startupAdoptionDone: make(chan struct{}),
+		adoptEscapeStreak:   defaultAdoptEscapeStreak,
+	}
+	p.startupAdoptionPlanned.Store(true)
+
+	if p.producing() {
+		t.Fatal("nothing declared yet — must not read as producing")
+	}
+	p.finishStartupAdoption()
+	if !p.producing() {
+		t.Fatal("handoff resolved with zero scheduled workers — the bridge must hold producer visibility")
+	}
+
+	// The first worker to declare itself takes over from the bridge.
+	p.refillActive.Add(1)
+	p.refillHandoffBridge.Store(0)
+	if !p.producing() {
+		t.Fatal("declared worker must carry production after the bridge drops")
+	}
+}
+
+// A pass that trips the no-yield escape loses claimant trust; it must lose
+// its hold on the fallback producer at the same moment, or every create for
+// the remainder of a fleet-sized pass builds inline.
+func TestEscapeStreakReleasesTheHandoff(t *testing.T) {
+	p := &Pool{
+		log:                 zerolog.Nop(),
+		stopCh:              make(chan struct{}),
+		startGate:           make(chan struct{}),
+		startupAdoptionDone: make(chan struct{}),
+		adoptEscapeStreak:   3,
+	}
+	p.startupAdoptionPlanned.Store(true)
+
+	for i := 0; i < 2; i++ {
+		p.adoptYieldedNothing()
+		select {
+		case <-p.startupAdoptionDone:
+			t.Fatalf("handoff released after %d misses, before the escape streak", i+1)
+		default:
+		}
+	}
+	p.adoptYieldedNothing() // trips the escape
+	select {
+	case <-p.startupAdoptionDone:
+	default:
+		t.Fatal("escape streak tripped but the handoff stayed unresolved")
+	}
+}
+
 // Discarding a phantom slot opens a deficit exactly like a successful claim;
 // it must deposit a wake token too, or held workers sleep out the hold poll
 // while a claimant waits on them.
