@@ -1658,10 +1658,17 @@ func TestClaimWakesHeldRefillWorkers(t *testing.T) {
 	if got := builds.Load(); got != 0 {
 		t.Fatalf("refill built %d slots at target, want 0", got)
 	}
-	// Held is still declared: a claimant racing the wake must see a
-	// producer, not fall back to an inline build.
-	if got := p.refillActive.Load(); got != 1 {
-		t.Fatalf("refillActive = %d while held at target, want 1", got)
+	// Held is visible to claimants but NOT to the provisioning floor: a
+	// claimant racing the wake must see a producer, while the heartbeat
+	// must not report a settled worker as in-flight work.
+	if got := p.refillHeld.Load(); got != 1 {
+		t.Fatalf("refillHeld = %d while held at target, want 1", got)
+	}
+	if got := p.refillActive.Load(); got != 0 {
+		t.Fatalf("refillActive = %d while held at target, want 0 (held is not provisioning)", got)
+	}
+	if !p.producing() {
+		t.Fatal("held worker must still read as a producer to claimants")
 	}
 
 	if info := p.Claim("vm-wake"); info == nil {

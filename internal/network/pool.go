@@ -128,7 +128,14 @@ type Pool struct {
 	// slot. Workers declare themselves active for the whole construction-
 	// through-delivery span and inactive during backoff sleeps, so claimants
 	// read actual producer state instead of inferring liveness from timing.
+	// Also the heartbeat's provisioning floor (Manager.SlotPressure) — it
+	// must count real in-flight work only, never readiness to work.
 	refillActive atomic.Int64
+	// refillHeld counts workers parked at the inventory target: not
+	// building (so excluded from provisioning pressure), but one wake from
+	// it — so producing() counts them and claimants wait instead of
+	// building inline.
+	refillHeld atomic.Int64
 
 	// adoptPhase is the adoption pass's lifecycle: idle → scanning (orphan
 	// scan, zero output possible) → verifying (workers judging candidates) →
@@ -562,12 +569,13 @@ func (p *Pool) producing() bool {
 	// While the pressure controller has refill paused, in-flight workers'
 	// output is predestined for the discard arms — active or not, they can
 	// deliver nothing, so claimants must not wait on them. The handoff
-	// bridge counts as production for the same reason held workers do:
-	// refill is committed and moments away (see refillHandoffBridge).
+	// bridge and held workers count as production for the same reason:
+	// refill is committed and moments away (see refillHandoffBridge and
+	// refillHeld).
 	if p.refillHandoffBridge.Load() > 0 {
 		return true
 	}
-	return p.refillActive.Load() > 0 && !p.refillIsPaused()
+	return (p.refillActive.Load() > 0 || p.refillHeld.Load() > 0) && !p.refillIsPaused()
 }
 
 // adoptionTrusted reports whether claimants should treat the adoption pass as
@@ -1625,25 +1633,33 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		// receiptless restart, where full adoption places everything it
 		// recovers into recycled.
 		//
-		// Held workers STAY declared active — the same truthfulness as a
-		// worker parked on a full channel with a slot in hand: one wake
-		// from producing. Deactivating here would open a window where a
-		// burst drains the pool and the next claimant reads zero producers
-		// before any woken worker re-declares, sending it to an inline
-		// build against workers already waking.
+		// Held workers move to refillHeld, not refillActive: claimants
+		// still see a producer (producing() counts held — one wake from
+		// building), but the heartbeat's provisioning floor no longer
+		// reports settled workers as in-flight work. The held→active
+		// transition below publishes active BEFORE releasing held, so no
+		// claimant can observe the pool with neither.
 		if len(p.fresh)+len(p.recycled) >= p.newSize {
-			if !active {
-				active = true
-				p.refillActive.Add(1)
+			deactivate()
+			p.refillHeld.Add(1)
+			for {
+				select {
+				case <-p.refillWake: // a claim opened a deficit
+				case <-time.After(refillHoldPoll):
+				case <-p.stopCh:
+					p.refillHeld.Add(-1)
+					return
+				case <-ctx.Done():
+					p.refillHeld.Add(-1)
+					return
+				}
+				if len(p.fresh)+len(p.recycled) < p.newSize {
+					break
+				}
 			}
-			select {
-			case <-p.refillWake: // a claim opened a deficit
-			case <-time.After(refillHoldPoll):
-			case <-p.stopCh:
-				return
-			case <-ctx.Done():
-				return
-			}
+			active = true
+			p.refillActive.Add(1)
+			p.refillHeld.Add(-1)
 			continue
 		}
 		if !active {
