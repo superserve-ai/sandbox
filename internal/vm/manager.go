@@ -2064,8 +2064,36 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// the plain existence check below would trust the pair.
 	markerPath := resumeFetchMarkerPath(snapshotPath)
 	markerPending := fileExists(markerPath)
-	if m.resumeFetch != nil && generation != "" && fileExists(memPath) &&
-		(markerPending || !fileExists(snapshotPath) || !fileExists(rootfsPath)) {
+	filesIncomplete := markerPending || !fileExists(snapshotPath) || !fileExists(rootfsPath)
+
+	// Only evaluated when filesIncomplete — the ordinary warm resume
+	// (every artifact already present) never reaches this, so it costs
+	// that path nothing. memPath surviving while vmstate/rootfs did not
+	// is only safe to treat as this generation's memory if it
+	// demonstrably belongs to the SAME pause as whatever gets fetched:
+	// existence alone proves nothing (a stale mem.snap left over from an
+	// earlier local pause, paired with a freshly fetched, unrelated
+	// vmstate/disk generation, is exactly the mismatched-state risk this
+	// whole gate exists to prevent). There is no durable identity for
+	// memPath anywhere (it is never part of a backup generation — see
+	// fetchGenerationForResume), so inst.PausedAt — vmd's own locally
+	// recorded last-known pause instant for this vmID, which survives
+	// independently of the artifact files themselves — is the only
+	// local reference available: a legitimate memPath write happens at
+	// or shortly before that timestamp is recorded, so anything
+	// meaningfully OLDER did not come from the pause vmd itself last
+	// knew about. IsZero (a legacy record) means unverifiable, not
+	// stale: skip the check rather than block resume on something this
+	// host cannot actually judge.
+	var memStale bool
+	if filesIncomplete && fileExists(memPath) && !inst.PausedAt.IsZero() {
+		if fi, statErr := os.Stat(memPath); statErr == nil &&
+			fi.ModTime().Before(inst.PausedAt.Add(-resumeFetchMemStalenessSlop)) {
+			memStale = true
+		}
+	}
+
+	if m.resumeFetch != nil && generation != "" && fileExists(memPath) && !memStale && filesIncomplete {
 		tFetch = time.Now()
 		bytesRestored, ferr := m.fetchGenerationForResume(ctx, vmID, generation, snapshotPath, rootfsPath, log)
 		tFetchDone = time.Now()
@@ -2103,6 +2131,17 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"resume artifacts for %s are from an interrupted fetch of generation %q and cannot be trusted without re-fetching; enable fetch-before-resume with that generation available, or restore the artifacts manually",
 			vmID, string(pending))
+	}
+	// memStale is checked separately from markerPending (and after any
+	// fetch attempt, which never runs while it's true): a fetch cannot
+	// repair it — nothing durable records what memPath SHOULD be — so
+	// resume must refuse rather than fall through to the plain existence
+	// check below, which has no way to tell this apart from a genuinely
+	// current memPath.
+	if memStale {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"resume artifacts for %s: local memory image predates this host's last recorded pause of it and cannot be paired with a freshly fetched generation; restore the artifacts manually",
+			vmID)
 	}
 
 	// Verify the snapshot files actually exist on disk. DB can claim

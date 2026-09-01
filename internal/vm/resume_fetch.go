@@ -59,6 +59,16 @@ const resumeFetchBudget = 60 * time.Second
 // also named relative to a snapshot path elsewhere in this package.
 const resumeFetchPendingSuffix = ".fetch-pending"
 
+// resumeFetchMemStalenessSlop bounds how much earlier than vmd's own
+// recorded PausedAt a surviving memPath's mtime may be before
+// resumeVMLocked refuses to trust it as this pause's memory image (see
+// its use there). Generous on purpose: a legitimate memPath write
+// precedes PausedAt being recorded by however long CreateSnapshot's
+// Firecracker call plus vmd's own status-update bookkeeping take, and
+// this only needs to catch a mem.snap left over from a MEANINGFULLY
+// earlier pause, not shave a false-positive window down to the second.
+const resumeFetchMemStalenessSlop = 10 * time.Minute
+
 func resumeFetchMarkerPath(snapshotPath string) string {
 	return snapshotPath + resumeFetchPendingSuffix
 }
