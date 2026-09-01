@@ -337,9 +337,8 @@ type ManagerConfig struct {
 	// sends the token back on the pause's Diff request, letting a reattached
 	// (post-vmd-restart) VM keep its incremental pause: Firecracker validates
 	// the token atomically and a stale baseline degrades to one Full pause.
-	// Requires the forked Firecracker with guarded snapshot support — an older
-	// binary rejects the unknown load-snapshot field, so this flips on only
-	// after the FC fleet is uniform. Default false.
+	// Sessions are armed only when the binary also advertises the capability,
+	// so this is safe to enable ahead of the Firecracker rollout. Default false.
 	DirtyTrackingSessionEnabled bool
 
 	// HandlerDeathAbortEnabled tells the in-process UFFD handler to abort Firecracker

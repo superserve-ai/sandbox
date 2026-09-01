@@ -699,9 +699,9 @@ func main() {
 	resumeUffdEnabled := envOrDefault("VMD_RESUME_UFFD", "false") == "true"
 	verifySnapshotEnabled := envOrDefault("VMD_VERIFY_SNAPSHOT_ENABLED", "false") == "true"
 	incrementalSnapshotEnabled := envOrDefault("VMD_INCREMENTAL_SNAPSHOT", "false") == "true"
-	// Requires the forked Firecracker with guarded snapshot support fleet-wide:
-	// an older binary rejects the unknown load-snapshot field. Flip on only
-	// after the FC rollout completes; off is exactly today's behavior.
+	// Safe to enable ahead of the Firecracker rollout: sessions are armed only
+	// once the binary advertises the capability, and a rollback degrades to
+	// the unguarded behavior. Off is exactly today's behavior.
 	dirtyTrackingSessionEnabled := envOrDefault("VMD_DIRTY_TRACKING_SESSION", "false") == "true"
 	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
 	// Off by default: it only does anything for a snapshot whose guest corrects

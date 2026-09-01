@@ -219,7 +219,9 @@ func TestPauseVM_MismatchThenFullFailurePreservesOverlay(t *testing.T) {
 func TestPauseVM_UnknownSessionFieldFallsBackToFull(t *testing.T) {
 	fc := startSnapshotAPIFake(t, func(_, body string) (int, string) {
 		if isDiffRequest(body) {
-			return http.StatusBadRequest, unknownFieldPayload("expected_session_id")
+			// serde names the first unknown field, and the client serializes
+			// the generation before the id — this is what an old binary says.
+			return http.StatusBadRequest, unknownFieldPayload("expected_generation")
 		}
 		return http.StatusNoContent, ""
 	})
@@ -352,7 +354,7 @@ func TestRestoreForResume_UnknownSessionFieldFallsBack(t *testing.T) {
 
 // The matcher covers both endpoints' field names and nothing else.
 func TestIsUnknownSessionFieldErr(t *testing.T) {
-	for _, field := range []string{"tracking_session_id", "expected_session_id"} {
+	for _, field := range []string{"tracking_session_id", "expected_session_id", "expected_generation"} {
 		err := &fakeErr{"[PUT /snapshot/load][400] loadSnapshotBadRequest " + unknownFieldPayload(field)}
 		if !isUnknownSessionFieldErr(err) {
 			t.Fatalf("must match the %s refusal: %v", field, err)

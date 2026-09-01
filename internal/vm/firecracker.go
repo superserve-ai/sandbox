@@ -43,10 +43,14 @@ func isUnknownClockFieldErr(err error) bool {
 }
 
 // The guarded-session fields carry the same rollback hazard, on both
-// endpoints: load takes tracking_session_id, create takes expected_session_id.
+// endpoints: load takes tracking_session_id, create takes expected_session_id
+// and expected_generation. The refusal names only the FIRST unknown field in
+// the body, and the generated client serializes the generation before the
+// id, so an older binary reports expected_generation.
 const (
-	unknownTrackingSessionFieldMarker = "unknown field `tracking_session_id`"
-	unknownExpectedSessionFieldMarker = "unknown field `expected_session_id`"
+	unknownTrackingSessionFieldMarker    = "unknown field `tracking_session_id`"
+	unknownExpectedSessionFieldMarker    = "unknown field `expected_session_id`"
+	unknownExpectedGenerationFieldMarker = "unknown field `expected_generation`"
 )
 
 func isUnknownSessionFieldErr(err error) bool {
@@ -55,7 +59,8 @@ func isUnknownSessionFieldErr(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, unknownTrackingSessionFieldMarker) ||
-		strings.Contains(msg, unknownExpectedSessionFieldMarker)
+		strings.Contains(msg, unknownExpectedSessionFieldMarker) ||
+		strings.Contains(msg, unknownExpectedGenerationFieldMarker)
 }
 
 func isTornSnapshotErr(err error) bool {
