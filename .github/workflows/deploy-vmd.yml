@@ -193,6 +193,13 @@ jobs:
           # with no NVMe-backed local SSD (unlike use4/usw2), so this
           # points at its attached persistent disk instead of /mnt/localssd.
           BACKUP_JOURNAL_PATH: /mnt/sandbox-data/backup.db
+          # Keeps staged generations off whatever disk serves live VM I/O
+          # (here, the root disk, since staging has no local SSD): every
+          # staged file is read twice before upload (digest pre-check,
+          # then the stream), and that read traffic must not contend with
+          # tenant workloads. Shares the same attached disk as the backup
+          # journal above.
+          BACKUP_STAGING_DIR: /mnt/sandbox-data/backup-staging
           # Staging validates parallel drain first; production stays on
           # vmd's single-worker default until this soaks. Workers share
           # one bandwidth cap, so this raises task throughput only.
@@ -283,6 +290,16 @@ jobs:
           # continuously while backups drain and can stall the uploader
           # if the (small) root disk fills.
           BACKUP_JOURNAL_PATH: /mnt/localssd/backup.db
+          # BACKUP_STAGING_DIR (moves staged generations off the
+          # local-SSD array onto the host's dedicated background-data
+          # disk) is deliberately NOT set here yet. The Terraform disk
+          # is attached but not formatted or mounted — that step is
+          # manual (see host-dr-runbook.md) — and deploy-vmd.py's mount
+          # precondition refuses to deploy with this set against an
+          # absent mount, which would block every future deploy to this
+          # host until someone notices and preps it out of band. Enable
+          # once /mnt/sandbox-data is confirmed mounted here, matching
+          # the staged rollout below it validated on staging first.
           # Enables vmd's backup metrics exporter (host-local collector);
           # the cell's backup alert policies, including backup-disabled,
           # cannot fire without these series.
@@ -358,6 +375,19 @@ jobs:
           # continuously while backups drain and can stall the uploader
           # if the (small) root disk fills.
           BACKUP_JOURNAL_PATH: /mnt/localssd/backup.db
+          # BACKUP_STAGING_DIR (moves staged generations off the
+          # local-SSD array onto the host's dedicated background-data
+          # disk — at BACKUP_UPLOAD_CONCURRENCY workers below, the
+          # sharpest remaining contention risk against tenant VM disk
+          # I/O on that array) is deliberately NOT set here yet. The
+          # Terraform disk is attached but not formatted or mounted —
+          # that step is manual (see host-dr-runbook.md) — and
+          # deploy-vmd.py's mount precondition refuses to deploy with
+          # this set against an absent mount, which would block every
+          # future deploy to this host until someone notices and preps
+          # it out of band. Enable once /mnt/sandbox-data is confirmed
+          # mounted here, matching the staged rollout already used for
+          # BACKUP_UPLOAD_CONCURRENCY below (validated on staging first).
           # Drain workers to clear the cell's pause-backup backlog:
           # arrivals outpace the single-worker default here. Workers
           # share one bandwidth cap (task throughput rises, egress does
