@@ -313,15 +313,11 @@ func parseIPTablesSave(out string) (*parsedDump, error) {
 // the spec rules' relative order must equal the canonical order; unrelated
 // rules are ignored. Owned chains: contents must equal the spec exactly, in
 // order, with nothing extra.
-// ruleCannotMatchSandboxTraffic is the two-direction form for the tail
-// promotion guard and chain resolution. Each direction is proven separately:
-// a disjoint address range only ever excludes the direction where the
-// sandbox is on that side of the flow. Sandbox-ORIGINATED traffic always
-// carries a vmIPRange source (pre-MASQUERADE), so a disjoint -s excludes it
-// — another agent's own-range MASQUERADE can never touch it regardless of
-// position. Sandbox-BOUND traffic carries the sandbox in the DESTINATION and
-// an arbitrary remote source, so only a disjoint -d (never -s) excludes that
-// direction.
+// ruleCannotMatchSandboxTraffic proves each direction separately, because
+// a disjoint address range only excludes the direction where the sandbox is
+// on that side of the flow: sandbox-originated traffic always carries a
+// vmIPRange source (pre-MASQUERADE), sandbox-bound traffic carries it as the
+// destination with an arbitrary remote source.
 func ruleCannotMatchSandboxTraffic(tokens []string) bool {
 	originated := ruleCannotMatchVethVia(tokens, "-i") || rangeDisjointFromVMRange(tokens, "-s")
 	bound := ruleCannotMatchVethVia(tokens, "-o") || rangeDisjointFromVMRange(tokens, "-d")
@@ -414,15 +410,12 @@ func establishedOnlyAccept(tokens []string) bool {
 //     transfer (this is how a dockerd restart that re-inserts its jumps at
 //     position 1 self-heals on the next vmd start). Demoting kills only the
 //     bypass, which is the point.
-//   - "pinned": the chain contains reachable strict (DROP/REJECT) or
-//     observer (LOG/MARK/...) policy. Harmless ABOVE vmd's enforcement —
-//     it only tightens or watches — but demoting it below the terminal
-//     owned chain would starve that policy of sandbox traffic, silently
-//     flipping an operator's DROP into an ACCEPT or blinding their audit
-//     trail. Verification tolerates it in place; repair must never move it.
-//   - "ambiguous": verdict-rewriting targets (NAT actions), unknown targets,
-//     cycles, depth overruns — or a chain that BOTH bypasses and pins
-//     (repair could neither leave it nor move it) — the caller fails closed.
+//   - "pinned": reachable strict (DROP/REJECT) or observer (LOG/MARK/...)
+//     policy. Harmless above vmd's enforcement, but demoting it would starve
+//     that policy — an operator's DROP silently becomes an ACCEPT. Tolerated
+//     in place; never moved.
+//   - "ambiguous": NAT actions, unknown targets, cycles, depth overruns, or a
+//     chain that both bypasses and pins — the caller fails closed.
 func chainSandboxDisposition(d *parsedDump, hostIface, table, chain string, depth int, visiting map[string]bool) string {
 	key := table + "/" + chain
 	if depth > maxChainResolutionDepth || visiting[key] || !d.chains[key] {
@@ -473,15 +466,12 @@ func chainSandboxDisposition(d *parsedDump, hostIface, table, chain string, dept
 	return "safe"
 }
 
-// strictDemotionNeutral reports whether a foreign strict rule keeps its
-// exact observable behavior when demoted below vmd's terminal owned chain.
-// True only for a plain DROP pinned to a third interface: the owned chain
-// ACCEPTs only veth↔hostIface flows and DROPs everything else, so a foreign
-// DROP that provably cannot match either accepted direction drops the same
-// traffic above or below ours (Docker's bridge-isolation DROPs are the
-// canonical case). A REJECT is never neutral — demoted behind our silent
-// DROP it stops answering — and neither is any DROP that could reach the
-// accepted flows, where demotion flips its verdict to ACCEPT.
+// strictDemotionNeutral reports whether a foreign strict rule keeps its exact
+// behavior when demoted below vmd's terminal owned chain: only a plain DROP
+// pinned to a third interface, which cannot reach the veth↔hostIface flows
+// the owned chain accepts, so it drops the same traffic either side of ours
+// (Docker's bridge-isolation DROPs). A REJECT demoted behind our silent DROP
+// stops answering, so it is never neutral.
 func strictDemotionNeutral(tokens []string, hostIface string) bool {
 	if jumpTarget(tokens) != "DROP" {
 		return false

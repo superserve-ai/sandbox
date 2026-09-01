@@ -1,13 +1,12 @@
 package network
 
-// hostfw_ensure.go — the verify-then-skip front door for installHostFirewall.
-// Fast path: one iptables-save dump, verified in memory against the spec →
-// zero mutations, no iptables execs at all (iptables.New's version probe is
-// deferred to the slow path on purpose). Slow path: the unchanged installer,
-// plus an ordering/dedup repair for vmd rules the installer's AppendUnique
-// idempotence would leave in an ineffective position, then a mandatory
-// re-dump + re-verify. A repair that cannot converge fails startup — serving
-// with unverified enforcement is worse than not serving.
+// hostfw_ensure.go — the verify-then-skip front door for the host firewall.
+// Fast path: one iptables-save dump, verified in memory against the spec —
+// zero mutations, no other execs. Slow path (owner): rebuild the owned chains
+// atomically, plan every shared-chain change from a snapshot taken under the
+// writer lock, apply, then re-dump and re-verify. A repair that cannot
+// converge fails startup — serving with unverified enforcement is worse than
+// not serving.
 
 import (
 	"context"
@@ -101,19 +100,16 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 		}
 	}
 
-	// Slow path. Non-owners run the presence-only installer (the MASQUERADE):
-	// they never mutate shared-chain ordering — their partial spec omits the
+	// Slow path. Non-owners run the presence-only installer (the MASQUERADE)
+	// and never touch shared-chain ordering: their partial spec omits the
 	// daemon's jumps, so "canonicalizing" it could hoist an ACCEPT above the
 	// daemon's drops.
 	//
-	// The OWNER never blind-installs: every shared-chain change is planned by
-	// repairSharedOrdering from a snapshot taken UNDER THE LOCK, so the
-	// foreign-rule safety analysis (pinned trees, observers, unknown control
-	// flow) runs before any mutation — including the very first rollout,
-	// where the entry jumps are missing and a bare insert-at-head would
-	// silently demote whatever sits there. The owned chains rebuild first
-	// (atomic, touching no shared chain) so the jumps the plan inserts always
-	// reference existing chains.
+	// The owner never blind-installs: every shared-chain change is planned
+	// from a snapshot taken under the lock, so the foreign-rule analysis runs
+	// before any mutation — including a first rollout, where a bare
+	// insert-at-head would silently demote whatever sits there. Owned chains
+	// rebuild first so the planned jumps reference existing chains.
 	tRepair := time.Now()
 	var predicted map[string][][]string
 	if manageOwnedChains {
@@ -165,18 +161,13 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 			}
 		}
 		if changed != "" {
-			// The absolute-head inserts may have demoted a rule the other
-			// writer placed between our snapshot and our restore — and no
-			// later dump can tell that rule apart from one that was always
-			// below us. Refusing to serve is not enough: the demotion
-			// itself must be undone, or the next verification would find
-			// vmd first, look no further, and leave the foreign rule
-			// shadowed for good. Rolling our own rules back out (exact
-			// rulespec deletes, which can only ever match a vmd rule)
-			// restores exactly the ordering that writer produced. Then one
-			// replan from a fresh snapshot: the interloper now sits above
-			// nothing of ours, so it is scanned and classified like any
-			// other foreign rule — tolerated, moved, or refused.
+			// A rule the other writer placed between our snapshot and our
+			// restore was demoted by the head inserts, and no later dump
+			// can tell it apart from one that was always below us — so a
+			// refusal alone would leave it shadowed for good. Undo the
+			// demotion (roll our rules back out), then replan once from a
+			// fresh snapshot where the interloper is classified like any
+			// other foreign rule.
 			if rbErr := rollbackSharedRules(ctx, spec); rbErr != nil {
 				return fmt.Errorf("host firewall chain %s changed underneath the repair — concurrent non-cooperating writer; rollback of vmd rules failed: %w", changed, rbErr)
 			}
@@ -233,11 +224,9 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 }
 
 // rollbackSharedRules deletes every copy of vmd's own rules from the shared
-// chains — exact-rulespec deletes, which can only ever match a vmd rule — so
-// a chain a non-cooperating writer changed under our plan returns to the
-// ordering that writer produced, minus us. Enforcement is absent until the
-// replan lands, but the caller is already refusing to serve; the alternative
-// is a foreign rule shadowed until an operator notices. OWNER ONLY.
+// chains (exact-rulespec deletes only ever match a vmd rule), returning a
+// chain a non-cooperating writer changed under our plan to the ordering that
+// writer produced, minus us. OWNER ONLY.
 func rollbackSharedRules(ctx context.Context, spec hostFWSpec) error {
 	out, err := dumpIPTables(ctx)
 	if err != nil {
@@ -293,20 +282,11 @@ func rollbackSharedRules(ctx context.Context, spec hostFWSpec) error {
 // inserts — e.g. a fresh strict rule demoted below a terminal redirect —
 // with post-repair verification tolerating the result.
 //
-// A veth-capable AMBIGUOUS foreign rule above the entry jumps still
-// aborts without mutation: head-inserting our rules would demote its unknown
-// control flow below our enforcement, and that call is the operator's. The
-// same refusal covers foreign rules whose EFFECTIVE position repair would
-// change: an observer above any vmd terminal rule — a PREROUTING redirect or
-// a FORWARD drop — would be starved of the traffic it currently sees by the
-// head inserts, a strict rule above a PREROUTING redirect would be shadowed
-// by the terminal redirect, and a terminal-capable foreign rule below a vmd
-// nat plumbing rule would be promoted into the traffic ours handled first by
-// the tail re-append. Only a foreign DROP in FORWARD keeps its exact
-// observable behavior wherever it lands — a REJECT demoted below an
-// overlapping vmd DROP would stop answering, turning configured rejections
-// into silent drops, so it refuses like the rest.
-// OWNER ONLY.
+// Any foreign rule whose EFFECTIVE position the transaction would change —
+// demoted below our terminal rules by the head inserts, or promoted above
+// our plumbing by the tail re-append — is refused unless the move is
+// provably verdict-neutral; the checks below spell out each case. The call
+// on anything else is the operator's. OWNER ONLY.
 func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (map[string][][]string, error) {
 	predicted := map[string][][]string{}
 	perTable := map[string][]string{} // table → restore lines
@@ -341,15 +321,11 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 				staleLines = append(staleLines, "-D "+chain+" "+emitRuleTokens(g))
 			}
 		}
-		// Head-inserting our rules demotes everything currently above them
-		// below the entry jumps — which are TERMINAL for sandbox traffic
-		// (the owned chains end in a verdict). A demoted observer would be
-		// starved of the traffic it currently sees; a demoted strict rule
-		// would be shadowed into a no-op. Resolved-safe foreign transfers
-		// (another agent's head jumps) may move: they provably cannot change
-		// a sandbox verdict either side of ours.
-		// Position-relative insertion would reintroduce the races this design
-		// removed, so refuse and leave the call to the operator.
+		// The head inserts demote everything above them below the entry
+		// jumps, which are terminal for sandbox traffic: a demoted observer
+		// is starved, a demoted strict rule becomes a no-op. Refuse rather
+		// than insert position-relative, which would reintroduce the races
+		// this design removed.
 		if spec.headGuarded[key] {
 			// Everything above our LAST terminal rule is demoted by the head
 			// inserts. With no vmd terminal rule present at all — the first
@@ -377,13 +353,10 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 				if isOurs || staleVMDRule(spec, key, g, want) || unmarkedTwin(g, want) || ruleCannotMatchSandboxTraffic(g) {
 					continue
 				}
-				// A transfer into a foreign chain moves that whole tree
-				// below vmd's terminal enforcement. Resolved from this
-				// dump: safe trees cannot act on sandbox traffic,
-				// permissive trees lose only their bypass ACCEPTs (the
-				// point of the repair); pinned trees carry strict or
-				// observer policy the demotion would starve, and unknown
-				// control flow is never reordered past.
+				// A chain transfer moves its whole tree: safe and
+				// permissive trees may go (the latter loses only its
+				// bypass ACCEPTs — the point); pinned and ambiguous
+				// trees must not.
 				if tgt, ok := controlTransferTarget(d, table, g); ok {
 					switch chainSandboxDisposition(d, spec.hostIface, table, tgt, 0, map[string]bool{}) {
 					case "safe", "permissive":
@@ -495,19 +468,14 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 }
 
 // StartHostFWSampler periodically re-verifies the host firewall and repairs
-// drift, so protection does not decay between vmd restarts: another agent
-// restarting later (dockerd re-inserting its jumps at position 1) would
-// otherwise leave a bypass standing until the next boot. Each tick is the
-// same ensure path as startup — one read-only dump when intact, the locked
-// plan-and-repair when not. Failures are logged loudly, never fatal: a
-// serving daemon cannot fail-closed the way a startup can, and the next tick
-// retries. Owner only; non-owners have no reconciliation to run.
+// drift, so another agent restarting later (dockerd re-heading its jumps)
+// cannot leave a bypass standing until the next vmd boot. Each tick is the
+// startup ensure path: one read-only dump when intact, the locked
+// plan-and-repair when not. Failures log loudly and the next tick retries —
+// a serving daemon cannot fail closed the way a startup can. Owner only.
 //
-// Accepted tradeoff: this is polling, so another agent can disturb the
-// shared-chain ordering for up to one interval before it is repaired.
-// Event-driven reconciliation (a netlink/nftables monitor) would close that
-// window and is the natural follow-up; the poll keeps this change free of a
-// new long-lived kernel subscription.
+// Accepted tradeoff: polling leaves up to one interval of disturbed ordering;
+// event-driven reconciliation (an nftables monitor) is the follow-up.
 func (m *Manager) StartHostFWSampler(ctx context.Context, every time.Duration) {
 	if !m.ownsEgressPortChain {
 		return

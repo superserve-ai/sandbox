@@ -59,29 +59,14 @@ var vmdOwnedChains = map[string]bool{
 	preroutingChain:  true,
 }
 
-// installHostFirewall installs the rules that route all VM traffic through
-// the host. The owner builds the vmd-owned chains (flush + rebuild, so config
-// changes reconcile): SANDBOX_FORWARD with the UDP/443 DROP (kills QUIC
-// bypass of the SNI allowlist), the operator-configured egress port DROPs,
-// the MSS clamp, the veth+↔host-iface ACCEPTs, and a terminal DROP;
-// SANDBOX_PREROUTING with the optional guest DNS redirect, the HTTP/HTTPS
-// egress proxy REDIRECTs, and (when secretsProxyPort > 0) the secrets proxy
-// REDIRECT. The shared chains get only veth-scoped jumps into those, plus
-// the vmIPRange MASQUERADE. All operations are idempotent.
-//
-// blockedPorts come from the operator blocklist config — only ports 80/443
-// are redirected through the egress proxy, so anything else a VM dials goes
-// straight through FORWARD and must be dropped here.
-//
-// dnsRedirectPort, when non-zero, redirects all VM DNS (TCP and UDP dport
-// 53) to that port on the host, where the operator runs a resolver. The
-// redirect is transparent: it applies no matter which nameserver the guest
-// image has configured.
-//
-// manageOwnedChains gates ownership of the vmd-owned chains and their entry
-// jumps: only the vmd daemon reconciles them. Auxiliary managers (the
-// template-builder) pass false and install just the MASQUERADE — the daemon
-// on the same host provides the rest of the topology.
+// installHostFirewall is the NON-owner installer: an auxiliary manager (the
+// template-builder) installs just the vmIPRange MASQUERADE, and the daemon on
+// the same host provides the rest of the topology. The owner's chains —
+// SANDBOX_FORWARD (QUIC and operator-port DROPs, the MSS clamp, the
+// veth↔uplink ACCEPTs, a terminal DROP) and SANDBOX_PREROUTING (the DNS,
+// egress-proxy, and secrets-proxy REDIRECTs) — are built by
+// ensureHostFirewall, whose shared-chain ordering is planned rather than
+// blindly inserted. Idempotent.
 func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedirectPort uint16, secretsProxyDst string, secretsProxyPort uint16, blockedPorts []uint16, manageOwnedChains bool, log zerolog.Logger) error {
 	_, ipnet, err := net.ParseCIDR(vmIPRange)
 	if err != nil {
@@ -96,12 +81,9 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 		return fmt.Errorf("init iptables: %w", err)
 	}
 
-	// Owner topology — the owned chains and the shared-chain entry jumps —
-	// is NOT installed here. Shared-chain ordering must be planned from a
-	// locked pre-mutation snapshot so foreign policy is never silently
-	// demoted; ensureHostFirewall owns that sequence (rebuildOwnedChains +
-	// repairSharedOrdering). A blind insert-at-head from this installer was
-	// exactly the bypass the planner exists to prevent.
+	// Owner topology is never installed here: shared-chain ordering must be
+	// planned from a locked snapshot (ensureHostFirewall), and a blind
+	// insert-at-head is exactly the bypass that planning exists to prevent.
 	if manageOwnedChains {
 		return fmt.Errorf("owner install must go through ensureHostFirewall (planned shared-chain ordering)")
 	}
