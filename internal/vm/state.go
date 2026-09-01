@@ -199,7 +199,7 @@ type VMRecord struct {
 	// rewrites a record, so after a rollback and re-upgrade the field is absent
 	// again — decoding that silence as false would ignore a marker still on disk
 	// and delete it at the next pause. Nil means "ask the disk".
-	CorrectsWallClock *bool `json:"corrects_wall_clock,omitempty"`
+	CorrectsWallClock *bool             `json:"corrects_wall_clock,omitempty"`
 	CreatedAt         time.Time         `json:"created_at"`
 	Metadata          map[string]string `json:"metadata,omitempty"`
 	VCPU              uint32            `json:"vcpu"`
