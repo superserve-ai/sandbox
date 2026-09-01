@@ -228,18 +228,18 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 }
 
 // yieldToInterlopers repositions vmd's head rules in each changed chain to
-// sit directly BELOW whatever a non-cooperating writer inserted above the
-// first foreign rule the plan's snapshot already knew — one atomic
-// transaction per table, with vmd's rules never absent from a chain, so
-// running sandboxes keep their forwarding, redirects, and NAT throughout.
-// Below is the conservative side of an unknowable question: a rule the
-// writer inserted at the head landed above our rules from their point of
-// view, and one they appended behind us was never demoted at all; only the
-// former reaches here, and only "above us" leaves nothing of theirs
-// shadowed. Verification then classifies the interloper in place — a strict
-// or observer rule is tolerated there, a permissive one is a repairable
-// bypass, unknown control flow fails closed with our rules still installed.
-// Tail plumbing (the MASQUERADE) is never terminal for the writer's rule and
+// sit directly BELOW every foreign rule not provably below them before the
+// race — one atomic transaction per table, with vmd's rules never absent
+// from a chain, so running sandboxes keep their forwarding, redirects, and
+// NAT throughout. The anchor is vmd's own boundary in the snapshot: the
+// first foreign rule that sat after our last head rule. Anything a writer
+// inserted above that boundary — at the head, or between a known rule and
+// our jumps — reads identically to an insert just below us once our
+// transaction has moved us, so "above us" is the only placement that leaves
+// nothing of theirs shadowed. Verification then classifies the interloper in
+// place — strict or observer tolerated, permissive a repairable bypass,
+// unknown control flow fails closed with our rules still installed. Tail
+// plumbing (the MASQUERADE) is never terminal for the writer's rule and
 // stays where the transaction put it. OWNER ONLY.
 func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec hostFWSpec, changed []string) (map[string][][]string, error) {
 	predicted := map[string][][]string{}
@@ -255,10 +255,19 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 			}
 			return fwRule{}, false
 		}
-		known := map[string]bool{}
-		for _, g := range snapshot.rules[key] {
-			if _, mine := ours(g); !mine {
-				known[strings.Join(g, "\x00")] = true
+		// below: the foreign rules the snapshot proves were beneath our last
+		// head rule. Everything else in the current chain is treated as
+		// having been above us.
+		below := map[string]bool{}
+		lastHead := -1
+		for i, g := range snapshot.rules[key] {
+			if w, mine := ours(g); mine && headRule(key, w) {
+				lastHead = i
+			}
+		}
+		for i, g := range snapshot.rules[key] {
+			if _, mine := ours(g); !mine && i > lastHead {
+				below[strings.Join(g, "\x00")] = true
 			}
 		}
 		var lines []string
@@ -272,7 +281,7 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 		}
 		anchor := len(rest)
 		for i, g := range rest {
-			if _, mine := ours(g); !mine && known[strings.Join(g, "\x00")] {
+			if _, mine := ours(g); !mine && below[strings.Join(g, "\x00")] {
 				anchor = i
 				break
 			}

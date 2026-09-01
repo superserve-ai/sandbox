@@ -1480,6 +1480,42 @@ func TestRacedInsertYieldsBelowInterloper(t *testing.T) {
 		assertYielded(t, k, spec)
 	})
 
+	t.Run("insert between a known rule and the jumps", func(t *testing.T) {
+		// The writer's rule lands below a foreign rule we already knew and
+		// above our jumps. After our head inserts that reads exactly like
+		// an insert just below us — so the anchor must be our snapshot
+		// boundary, not the first known rule, or the DROP stays shadowed.
+		spec := testSpec(true)
+		rules, chains := specKernel(spec, nil)
+		harmless := []string{"-i", "br0", "-o", "br1", "-j", "ACCEPT"}
+		fw := rules["filter/FORWARD"]
+		fw[0], fw[1] = fw[1], fw[0] // misordered jumps force a repair
+		rules["filter/FORWARD"] = append([][]string{harmless}, fw...)
+		k := &fakeKernel{rules: rules, chains: chains}
+		defer k.install(t)()
+		raced := false
+		inner := restoreIPTables
+		restoreIPTables = func(ctx context.Context, input string) error {
+			if !raced && strings.HasPrefix(input, "*filter") && strings.Contains(input, "-I FORWARD 1") {
+				raced = true
+				cur := k.rules["filter/FORWARD"]
+				k.rules["filter/FORWARD"] = append([][]string{cur[0], interloper}, cur[1:]...)
+			}
+			return inner(ctx, input)
+		}
+		defer func() { restoreIPTables = inner }()
+		if err := ensureOwner(t); err != nil {
+			t.Fatalf("ensure after a position-2 race: %v", err)
+		}
+		fw = k.rules["filter/FORWARD"]
+		if len(fw) < 4 || !ruleEqual(harmless, fw[0]) || !ruleEqual(interloper, fw[1]) || !hasVMDMarker(fw[2]) || !hasVMDMarker(fw[3]) {
+			t.Fatalf("want [harmless, DROP, jump, jump], got %v", fw)
+		}
+		if ok, class := mustVerify(t, renderDump(k.rules, k.chains), spec); !ok {
+			t.Fatalf("yielded layout not verified: %s", class)
+		}
+	})
+
 	t.Run("established host keeps enforcement throughout", func(t *testing.T) {
 		spec := testSpec(true)
 		rules, chains := specKernel(spec, nil)
