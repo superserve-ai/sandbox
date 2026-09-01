@@ -29,6 +29,19 @@ var ErrTornSnapshot = errors.New("torn snapshot (overlay side-car empty)")
 // at runtime.
 const tornSnapshotMarker = "(torn snapshot save)"
 
+// A Firecracker that predates the clock option rejects the whole request rather
+// than ignoring the field, because it deserializes these params with
+// deny_unknown_fields. The deploy swaps the binary in place without restarting
+// vmd, so a rollback can put an older Firecracker under a running daemon — this
+// is how that is recognised and degraded to legacy instead of failing restores.
+// Lower-case; matching is case-insensitive so a casing drift cannot silently
+// disable the fallback.
+const unknownClockFieldMarker = "unknown field `clock_realtime`"
+
+func isUnknownClockFieldErr(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), unknownClockFieldMarker)
+}
+
 func isTornSnapshotErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), tornSnapshotMarker)
 }
@@ -473,7 +486,7 @@ func SnapshotPausedVM(socketPath, snapshotPath, memPath string) error {
 // RestoreSnapshot loads a snapshot and resumes the VM. Non-empty blockDeltaDir
 // hydrates a fresh per-VM overlay from <dir>/<drive_id>.delta — pass empty
 // for in-place resume (existing overlay already carries state).
-func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string) error {
+func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, clockRealtime *bool) error {
 	fc := newFCClient(socketPath)
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: context.Background(),
@@ -486,6 +499,8 @@ func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string) er
 			ResumeVM:         true,
 			NetworkOverrides: []*models.NetworkOverride{}, // Empty, not nil — Firecracker rejects null.
 			BlockDeltaDir:    blockDeltaDir,
+			// nil ⇒ omitted ⇒ Firecracker restores the flags the snapshot carries.
+			ClockRealtime: clockRealtime,
 		},
 	}); err != nil {
 		if isTornSnapshotErr(err) {
@@ -498,7 +513,7 @@ func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string) er
 
 // RestoreSnapshotWithOverrides loads a snapshot, overrides the network TAP
 // device, and resumes the VM. See RestoreSnapshot for blockDeltaDir semantics.
-func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, tapDevice, blockDeltaDir string) error {
+func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, tapDevice, blockDeltaDir string, clockRealtime *bool) error {
 	fc := newFCClient(socketPath)
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: context.Background(),
@@ -513,6 +528,8 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 				{IfaceID: &ifaceID, HostDevName: &tapDevice},
 			},
 			BlockDeltaDir: blockDeltaDir,
+			// nil ⇒ omitted ⇒ Firecracker restores the flags the snapshot carries.
+			ClockRealtime: clockRealtime,
 		},
 	}); err != nil {
 		if isTornSnapshotErr(err) {
@@ -535,6 +552,7 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 func RestoreSnapshotUffdInternalWithOverrides(
 	socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
 	trackDirty, abortOnHandlerDeath bool,
+	clockRealtime *bool,
 ) error {
 	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -562,6 +580,8 @@ func RestoreSnapshotUffdInternalWithOverrides(
 				{IfaceID: &ifaceID, HostDevName: &tapDevice},
 			},
 			BlockDeltaDir: blockDeltaDir,
+			// nil ⇒ omitted ⇒ Firecracker restores the flags the snapshot carries.
+			ClockRealtime: clockRealtime,
 		},
 	}); err != nil {
 		if isTornSnapshotErr(err) {
