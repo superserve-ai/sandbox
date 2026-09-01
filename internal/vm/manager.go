@@ -2042,21 +2042,17 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// trusts what a name already holds), but this resume must not proceed
 	// on it.
 	//
-	// fileExists(markerPath) also joins the trigger: it's the durable sign
-	// that some EARLIER attempt started adopting this generation's files
-	// and never finished (crash, not just a returned error — a returned
-	// error is already covered by the hard-fail above). Without it, a
-	// crash between the two renames leaves both target paths existing —
-	// one fresh, one stale from before this vmID's fetch history began —
-	// and the plain existence check below would trust the pair. Scoped to
-	// hosts where fetch-before-resume is currently enabled and a
-	// generation is currently known (the marker can only ever have been
-	// written under those same conditions); a host that had the feature
-	// toggled off between an interrupted attempt and this resume is a
-	// narrower, operator-mediated scenario left unhandled here.
+	// markerPending joins the trigger: it's the durable sign that some
+	// EARLIER attempt started adopting this generation's files and never
+	// finished (crash, not just a returned error — a returned error is
+	// already covered by the hard-fail above). Without it, a crash
+	// between the two renames leaves both target paths existing — one
+	// fresh, one stale from before this vmID's fetch history began — and
+	// the plain existence check below would trust the pair.
 	markerPath := resumeFetchMarkerPath(snapshotPath)
+	markerPending := fileExists(markerPath)
 	if m.resumeFetch != nil && generation != "" && fileExists(memPath) &&
-		(fileExists(markerPath) || !fileExists(snapshotPath) || !fileExists(rootfsPath)) {
+		(markerPending || !fileExists(snapshotPath) || !fileExists(rootfsPath)) {
 		tFetch = time.Now()
 		bytesRestored, ferr := m.fetchGenerationForResume(ctx, vmID, generation, snapshotPath, rootfsPath, log)
 		tFetchDone = time.Now()
@@ -2070,6 +2066,30 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		}
 		log.Info().Str("generation", generation).Int64("bytes", bytesRestored).
 			Msg("resume: fetched generation from backup bucket")
+		// A successful fetch just adopted both files together in this
+		// same call, so THIS resume knows the pair is consistent
+		// regardless of whether the marker file itself got cleaned up
+		// (its removal is best-effort — see fetchGenerationForResume). A
+		// marker that outlives a successful fetch only costs a future
+		// resume one harmless, unnecessary re-fetch, never a wrong trust
+		// decision here.
+		markerPending = false
+	}
+	// A marker this attempt could not repair — fetch-before-resume is
+	// currently disabled, or the control plane named no generation this
+	// time — must still block resume rather than let the checks below
+	// treat a possibly-mismatched pair as trustworthy. This is
+	// deliberately UNCONDITIONAL (not scoped to m.resumeFetch != nil):
+	// the marker can only ever have been written while fetch was enabled,
+	// but nothing requires it to still be enabled by the time a later
+	// resume finds the leftover, and existence checks alone cannot tell
+	// "interrupted mid-adoption" apart from "a completely ordinary local
+	// pause" once both files are present.
+	if markerPending {
+		pending, _ := os.ReadFile(markerPath)
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"resume artifacts for %s are from an interrupted fetch of generation %q and cannot be trusted without re-fetching; enable fetch-before-resume with that generation available, or restore the artifacts manually",
+			vmID, string(pending))
 	}
 
 	// Verify the snapshot files actually exist on disk. DB can claim
