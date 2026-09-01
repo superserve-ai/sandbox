@@ -1383,3 +1383,101 @@ func TestWithBGSlotReturnsTokenOnPanic(t *testing.T) {
 		t.Fatal("token not returned after panic")
 	}
 }
+
+// Adoption owns the startup deficit; refill is the fallback. While a boot
+// adoption pass is planned but unresolved, a refill worker must not get past
+// the handoff — otherwise both producers solve the same deficit and refill
+// rebuilds, at full cost, the very slots adoption is restoring.
+func TestRefillDefersToStartupAdoption(t *testing.T) {
+	newPool := func() *Pool {
+		return &Pool{
+			log:                 zerolog.Nop(),
+			stopCh:              make(chan struct{}),
+			startGate:           make(chan struct{}),
+			startupAdoptionDone: make(chan struct{}),
+			adoptEscapeStreak:   defaultAdoptEscapeStreak,
+		}
+	}
+
+	t.Run("no pass planned: immediate", func(t *testing.T) {
+		p := newPool()
+		if !p.waitForStartupAdoption(context.Background()) {
+			t.Fatal("refill must proceed when no boot adoption was planned")
+		}
+	})
+
+	t.Run("nil handoff channel: immediate", func(t *testing.T) {
+		p := &Pool{log: zerolog.Nop(), stopCh: make(chan struct{})}
+		p.startupAdoptionPlanned = true
+		if !p.waitForStartupAdoption(context.Background()) {
+			t.Fatal("a pool without a handoff channel has no waiters to hold")
+		}
+	})
+
+	t.Run("planned pass holds refill until resolved", func(t *testing.T) {
+		p := newPool()
+		if !p.StartAdoption(context.Background()) {
+			t.Fatal("StartAdoption must claim the pass")
+		}
+		done := make(chan bool, 1)
+		go func() { done <- p.waitForStartupAdoption(context.Background()) }()
+		select {
+		case <-done:
+			t.Fatal("refill released while the pass was still parked")
+		case <-time.After(20 * time.Millisecond):
+		}
+		// The pass is parked behind the never-opened gate; stopping resolves
+		// the handoff through the unconditional defer.
+		close(p.stopCh)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("handoff never resolved after the pass exited")
+		}
+	})
+
+	t.Run("refill worker allocates nothing before handoff", func(t *testing.T) {
+		gate := make(chan struct{})
+		p := newPool()
+		p.startGate = gate
+		p.startupAdoptionPlanned = true
+		ctx, cancel := context.WithCancel(context.Background())
+		p.wg.Add(1)
+		go p.refillLoop(ctx)
+
+		close(gate) // gate opens; handoff still unresolved
+		time.Sleep(20 * time.Millisecond)
+		// Past the handoff the worker's first act is declaring refillActive;
+		// zero means it never reached the build loop, so no allocation was
+		// possible.
+		if got := p.refillActive.Load(); got != 0 {
+			t.Fatalf("refillActive = %d while adoption unresolved, want 0", got)
+		}
+
+		cancel()
+		waited := make(chan struct{})
+		go func() { p.wg.Wait(); close(waited) }()
+		select {
+		case <-waited:
+		case <-time.After(time.Second):
+			t.Fatal("parked refill worker did not exit on cancellation")
+		}
+	})
+
+	t.Run("cancellation resolves the handoff", func(t *testing.T) {
+		p := newPool()
+		ctx, cancel := context.WithCancel(context.Background())
+		if !p.StartAdoption(ctx) {
+			t.Fatal("StartAdoption must claim the pass")
+		}
+		cancel() // pass parked behind the gate exits via ctx
+		select {
+		case <-p.startupAdoptionDone:
+		case <-time.After(time.Second):
+			t.Fatal("handoff unresolved after cancellation")
+		}
+		// Idempotent: repeated finishes must not panic.
+		p.finishStartupAdoption()
+		p.finishStartupAdoption()
+	})
+}

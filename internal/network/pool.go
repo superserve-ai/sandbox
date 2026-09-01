@@ -61,8 +61,24 @@ type Pool struct {
 	// (adoption and refill together); rampBGSlots grants it. Nil meters
 	// nothing (tests).
 	bgSlotSem chan struct{}
-	wg        sync.WaitGroup
-	drainMu   sync.RWMutex
+	// startupAdoptionPlanned hands the startup deficit to adoption: while a
+	// boot-time adoption pass is planned, refill workers wait for it to
+	// finish before building anything. Reusing an abandoned slot costs a
+	// few namespace entries; building one from scratch is a namespace, a
+	// veth pair, a tap, and a firewall program — so when both producers
+	// wake at the same gate, letting them race means refill duplicates, at
+	// full price, exactly the inventory adoption is already restoring.
+	// Written before the start gate opens (StartAdoption runs during
+	// startup; workers park on the gate until readiness), so gated workers
+	// always observe it; never written afterwards.
+	startupAdoptionPlanned bool
+	// startupAdoptionDone is the one-shot handoff: closed when the boot
+	// adoption pass finishes — complete, aborted, cancelled, panicked, or
+	// never released. Refill measures the remaining deficit only after it.
+	startupAdoptionDone chan struct{}
+	startupAdoptionOnce sync.Once
+	wg                  sync.WaitGroup
+	drainMu             sync.RWMutex
 	// refillDrainGate is closed while the controller is draining warm inventory.
 	// Refill workers select on it before handing a built slot to the pool so a
 	// send that was already blocked when drain started can still abort instead
@@ -245,17 +261,18 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 	}
 
 	p := &Pool{
-		mgr:               m,
-		log:               m.log.With().Str("component", "net_pool").Logger(),
-		newSize:           newSize,
-		fresh:             make(chan *preallocSlot, newSize),
-		recycled:          make(chan *preallocSlot, recycleSize),
-		stopCh:            make(chan struct{}),
-		startGate:         cfg.StartGate,
-		refillDrainGate:   make(chan struct{}),
-		resetTapOnRecycle: cfg.ResetTapOnRecycle,
-		abandonOnStop:     cfg.AbandonOnStop,
-		resetSem:          make(chan struct{}, resetTapConcurrency),
+		mgr:                 m,
+		log:                 m.log.With().Str("component", "net_pool").Logger(),
+		newSize:             newSize,
+		fresh:               make(chan *preallocSlot, newSize),
+		recycled:            make(chan *preallocSlot, recycleSize),
+		stopCh:              make(chan struct{}),
+		startupAdoptionDone: make(chan struct{}),
+		startGate:           cfg.StartGate,
+		refillDrainGate:     make(chan struct{}),
+		resetTapOnRecycle:   cfg.ResetTapOnRecycle,
+		abandonOnStop:       cfg.AbandonOnStop,
+		resetSem:            make(chan struct{}, resetTapConcurrency),
 	}
 	p.adoptEscapeStreak = defaultAdoptEscapeStreak
 	m.pool = p
@@ -1161,10 +1178,20 @@ func (p *Pool) StartAdoption(ctx context.Context) bool {
 		p.log.Warn().Msg("pool: adoption already running — duplicate start ignored")
 		return false
 	}
+	// Synchronous, before the goroutine and — decisively — before the start
+	// gate can open: StartAdoption is a startup call, and gated refill
+	// workers park on the gate until readiness, so by the time any of them
+	// can read this flag it is settled. From here refill defers to this
+	// pass; finishStartupAdoption is the only release.
+	p.startupAdoptionPlanned = true
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
 		defer sentrylog.Recover("netpool-adopt")
+		// Unconditional: every exit — completion, abort, cancellation,
+		// panic, or a gate that never opened — must release the refill
+		// workers waiting on the handoff.
+		defer p.finishStartupAdoption()
 		if !p.waitForStart(ctx) {
 			// Nothing was scanned, so the phase must not stay latched — a
 			// later StartAdoption (or direct pass) must find it idle.
@@ -1176,6 +1203,35 @@ func (p *Pool) StartAdoption(ctx context.Context) bool {
 		p.AdoptOrphanSlots(ctx)
 	}()
 	return true
+}
+
+// finishStartupAdoption resolves the startup handoff to refill. Idempotent;
+// safe to call on every adoption exit path. A nil channel (pool constructed
+// directly, outside StartPool) has no waiters and needs no resolution.
+func (p *Pool) finishStartupAdoption() {
+	if p.startupAdoptionDone == nil {
+		return
+	}
+	p.startupAdoptionOnce.Do(func() { close(p.startupAdoptionDone) })
+}
+
+// waitForStartupAdoption blocks a refill worker until the boot adoption pass
+// has resolved, so the two producers never solve the same deficit twice:
+// adoption restores the previous run's slots at reuse cost while refill
+// would rebuild them at full cost. Immediate when no pass was planned (fresh
+// boot, adoption skipped, tests). Reports false on shutdown/cancellation.
+func (p *Pool) waitForStartupAdoption(ctx context.Context) bool {
+	if !p.startupAdoptionPlanned || p.startupAdoptionDone == nil {
+		return true
+	}
+	select {
+	case <-p.startupAdoptionDone:
+		return true
+	case <-p.stopCh:
+		return false
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // adoptDelivered and adoptYieldedNothing maintain the pass's trust streak
@@ -1380,6 +1436,14 @@ const (
 func (p *Pool) refillLoop(ctx context.Context) {
 	defer p.wg.Done()
 	if !p.waitForStart(ctx) {
+		return
+	}
+	// Adoption owns the startup deficit; refill is the fallback. Waiting
+	// here (still undeclared — a parked worker is not a producer) means the
+	// deficit refill eventually measures through the channels is the REAL
+	// one: what adoption could not restore, plus whatever claims consumed
+	// meanwhile. Skipped entirely when no boot adoption was planned.
+	if !p.waitForStartupAdoption(ctx) {
 		return
 	}
 	// Past the gate the worker is genuinely producing, so it publishes the
