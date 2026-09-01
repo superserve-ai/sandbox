@@ -19,15 +19,14 @@ import (
 // swagger:model Error
 type Error struct {
 
+	// Stable machine-readable discriminator, present only for error classes clients must handle distinctly (fault_message is free-form and not a stable contract). Currently defined value — DirtyTrackingSessionMismatch: a guarded snapshot request's expected session token did not match the live dirty-tracking session; the dirty bitmap and output files were not touched, and a Full snapshot of the same paused VM is the safe fallback.
+	//
+	// Read Only: true
+	ErrorKind string `json:"error_kind,omitempty"`
+
 	// A description of the error condition
 	// Read Only: true
 	FaultMessage string `json:"fault_message,omitempty"`
-
-	// Stable machine-readable discriminator, present only for error classes
-	// clients must handle distinctly (fault_message is free-form and not a
-	// stable contract). Fork extension.
-	// Read Only: true
-	ErrorKind string `json:"error_kind,omitempty"`
 }
 
 // Validate validates this error
@@ -39,6 +38,10 @@ func (m *Error) Validate(formats strfmt.Registry) error {
 func (m *Error) ContextValidate(ctx context.Context, formats strfmt.Registry) error {
 	var res []error
 
+	if err := m.contextValidateErrorKind(ctx, formats); err != nil {
+		res = append(res, err)
+	}
+
 	if err := m.contextValidateFaultMessage(ctx, formats); err != nil {
 		res = append(res, err)
 	}
@@ -46,6 +49,15 @@ func (m *Error) ContextValidate(ctx context.Context, formats strfmt.Registry) er
 	if len(res) > 0 {
 		return errors.CompositeValidationError(res...)
 	}
+	return nil
+}
+
+func (m *Error) contextValidateErrorKind(ctx context.Context, formats strfmt.Registry) error {
+
+	if err := validate.ReadOnly(ctx, "error_kind", "body", m.ErrorKind); err != nil {
+		return err
+	}
+
 	return nil
 }
 

@@ -1634,12 +1634,18 @@ definitions:
           requests with flatten=true and an unset block_delta_dir are rejected.
       expected_session_id:
         type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[A-Za-z0-9_-]+$"
         description:
           Expected dirty-tracking session id for a guarded snapshot. When set
           (together with expected_generation), the snapshot is created only if
           the token matches the session installed at snapshot-load time; a
           mismatch is rejected with error_kind DirtyTrackingSessionMismatch
-          before the dirty bitmap or any output file is touched.
+          before the dirty bitmap or any output file is touched. Must be
+          supplied together with expected_generation; a value that violates
+          the shape constraints, or either field on its own, is rejected as a
+          plain bad request, not a mismatch.
       expected_generation:
         type: integer
         format: int64
@@ -1686,11 +1692,20 @@ definitions:
           Enable dirty page tracking to improve space efficiency of diff snapshots
       tracking_session_id:
         type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[A-Za-z0-9_-]+$"
         description:
-          Caller-chosen dirty-tracking session id. Only meaningful with
-          track_dirty_pages; installs a (session_id, generation=0) token that
-          guarded snapshot requests (expected_session_id/expected_generation on
-          PUT /snapshot/create) can later compare against.
+          Caller-chosen dirty-tracking session id. Requires track_dirty_pages
+          (rejected as a bad request otherwise); installs a (session_id,
+          generation=0) token that guarded snapshot requests
+          (expected_session_id/expected_generation on PUT /snapshot/create)
+          can later compare against. MUST be freshly generated for every load
+          (a random nonce or UUID), never a stable identifier such as a VM
+          name - every new process re-arms at generation 0, so a reused id
+          would let a token persisted from an earlier process validate against
+          a dirty bitmap it never described. Support is advertised by the
+          dirty-tracking-session capability in the --version output.
       mem_file_path:
         type: string
         description:
