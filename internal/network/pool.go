@@ -83,8 +83,15 @@ type Pool struct {
 	// duplicating it.
 	startupAdoptionBegan time.Time
 	postHandoffBuilds    atomic.Int64
-	wg                   sync.WaitGroup
-	drainMu              sync.RWMutex
+	// refillWake nudges workers held at the inventory target the moment a
+	// claim creates a deficit, so refill responds to a drain immediately
+	// instead of on the next hold poll — and a claimant arriving behind a
+	// burst finds a producer, not an inline build. Capacity one: a single
+	// token restarts the crew, extra nudges drop. Nil (tests) falls back
+	// to the poll.
+	refillWake chan struct{}
+	wg         sync.WaitGroup
+	drainMu    sync.RWMutex
 	// refillDrainGate is closed while the controller is draining warm inventory.
 	// Refill workers select on it before handing a built slot to the pool so a
 	// send that was already blocked when drain started can still abort instead
@@ -282,6 +289,7 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		recycled:            make(chan *preallocSlot, recycleSize),
 		stopCh:              make(chan struct{}),
 		startupAdoptionDone: make(chan struct{}),
+		refillWake:          make(chan struct{}, 1),
 		startGate:           cfg.StartGate,
 		refillDrainGate:     make(chan struct{}),
 		resetTapOnRecycle:   cfg.ResetTapOnRecycle,
@@ -495,6 +503,16 @@ func (p *Pool) Claim(vmID string) *VMNetInfo {
 		p.mgr.assignSlotLocked(slot.idx, vmID)
 		p.mgr.mu.Unlock()
 		tDone := time.Now()
+
+		// A successful claim may have opened a deficit; nudge any worker
+		// held at the inventory target. Non-blocking single-token send —
+		// nanoseconds on the claim path, never a wait.
+		if p.refillWake != nil && len(p.fresh)+len(p.recycled) < p.newSize {
+			select {
+			case p.refillWake <- struct{}{}:
+			default:
+			}
+		}
 
 		p.log.Info().
 			Str("vm_id", vmID).
@@ -1535,6 +1553,7 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		if len(p.fresh)+len(p.recycled) >= p.newSize {
 			deactivate()
 			select {
+			case <-p.refillWake: // a claim opened a deficit
 			case <-time.After(refillHoldPoll):
 			case <-p.stopCh:
 				return

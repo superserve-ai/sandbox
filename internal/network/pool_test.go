@@ -1622,6 +1622,65 @@ func TestRefillBuildsOnlyTheDeficitAfterAdoption(t *testing.T) {
 	})
 }
 
+// A claim that opens a deficit must wake held refill workers immediately —
+// not on the next hold poll — so a claimant arriving behind a burst finds a
+// producer instead of falling back to an inline build.
+func TestClaimWakesHeldRefillWorkers(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	builds := stubPoolAllocate(t)
+
+	const capacity = 2
+	p := &Pool{
+		mgr:               m,
+		log:               zerolog.Nop(),
+		newSize:           capacity,
+		fresh:             make(chan *preallocSlot, capacity),
+		recycled:          make(chan *preallocSlot, capacity),
+		stopCh:            make(chan struct{}),
+		refillWake:        make(chan struct{}, 1),
+		refillDrainGate:   make(chan struct{}),
+		adoptEscapeStreak: defaultAdoptEscapeStreak,
+	}
+	for i := 0; i < capacity; i++ {
+		ns := fmt.Sprintf("ns-%d", i)
+		touchNS(t, dir, ns)
+		m.assignSlotLocked(i, poolOwner)
+		p.fresh <- &preallocSlot{idx: i, info: &VMNetInfo{Namespace: ns}}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.refillActive.Add(1) // ungated declaration, mirroring StartPool
+	p.wg.Add(1)
+	go p.refillLoop(ctx)
+
+	time.Sleep(30 * time.Millisecond) // worker reaches the hold at target
+	if got := builds.Load(); got != 0 {
+		t.Fatalf("refill built %d slots at target, want 0", got)
+	}
+
+	if info := p.Claim("vm-wake"); info == nil {
+		t.Fatal("claim from a stocked pool failed")
+	}
+	deadline := time.After(200 * time.Millisecond) // well under refillHoldPoll
+	for builds.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("no build within 200ms of the deficit — the wake never fired")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	close(p.stopCh)
+	waited := make(chan struct{})
+	go func() { p.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not join after stop")
+	}
+}
+
 // StartAdoption's planned-flag write must be race-safe against concurrent
 // handoff readers — the interleaving an ungated pool's already-running
 // workers produce. The readers here call waitForStartupAdoption directly
