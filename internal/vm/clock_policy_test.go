@@ -222,11 +222,12 @@ func TestRestoreWithClockFallbackReportsPolicyUsed(t *testing.T) {
 // resume after that.
 func TestCorrectsWallClockSurvivesRecordRoundTrip(t *testing.T) {
 	for _, corrects := range []bool{true, false} {
-		rec := toRecord(&VMInstance{ID: "vm", CorrectsWallClock: corrects})
-		if rec.CorrectsWallClock != corrects {
+		rec := toRecord(&VMInstance{ID: "vm", CorrectsWallClock: &corrects})
+		if rec.CorrectsWallClock == nil || *rec.CorrectsWallClock != corrects {
 			t.Fatalf("toRecord dropped the property: got %v, want %v", rec.CorrectsWallClock, corrects)
 		}
-		if got := toInstance(rec).CorrectsWallClock; got != corrects {
+		got := toInstance(rec).CorrectsWallClock
+		if got == nil || *got != corrects {
 			t.Errorf("toInstance dropped the property: got %v, want %v", got, corrects)
 		}
 	}
@@ -239,8 +240,10 @@ func TestCorrectsWallClockAbsentFromOldRecordIsFalse(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"id":"vm"}`), &rec); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if rec.CorrectsWallClock {
-		t.Error("a record without the field must read as not-correcting")
+	// Unresolved, not "no": a binary predating the field drops it on rewrite, so
+	// reading that silence as false would strip a marker that is still valid.
+	if rec.CorrectsWallClock != nil {
+		t.Errorf("a record without the field must decode as unresolved, got %v", *rec.CorrectsWallClock)
 	}
 }
 
@@ -255,12 +258,12 @@ func TestResumeWallClockProperty(t *testing.T) {
 			t.Fatalf("seed marker: %v", err)
 		}
 		// Marker says yes, record says no. The record wins ⇒ no stat happened.
-		if resumeWallClockProperty(mem, "", mem, false) {
+		if resumeWallClockProperty(mem, "", mem, boolPtr(false)) {
 			t.Error("want the recorded value; a marker on disk means the record was not used")
 		}
 		// And the inverse: no marker on disk, record says yes.
 		bare := filepath.Join(t.TempDir(), "mem.snap")
-		if !resumeWallClockProperty(bare, "", bare, true) {
+		if !resumeWallClockProperty(bare, "", bare, boolPtr(true)) {
 			t.Error("want the recorded value even with no marker beside the image")
 		}
 	})
@@ -273,14 +276,14 @@ func TestResumeWallClockProperty(t *testing.T) {
 		if err := os.WriteFile(clockFreezeMarkerPath(override), nil, 0o644); err != nil {
 			t.Fatalf("seed marker: %v", err)
 		}
-		if !resumeWallClockProperty(override, "", filepath.Join(dir, "mem.snap"), false) {
+		if !resumeWallClockProperty(override, "", filepath.Join(dir, "mem.snap"), boolPtr(false)) {
 			t.Error("want the marker consulted when the image is not the paused one")
 		}
 	})
 
 	t.Run("override_without_a_marker_stays_legacy", func(t *testing.T) {
 		dir := t.TempDir()
-		if resumeWallClockProperty(filepath.Join(dir, "restored.snap"), "", filepath.Join(dir, "mem.snap"), true) {
+		if resumeWallClockProperty(filepath.Join(dir, "restored.snap"), "", filepath.Join(dir, "mem.snap"), boolPtr(true)) {
 			t.Error("a stale record must not carry over to a different image")
 		}
 	})
@@ -347,4 +350,23 @@ func TestWatchFirecrackerCapability(t *testing.T) {
 			t.Error("capability true with no binary configured")
 		}
 	})
+}
+
+// A rollback to a binary without the record field, then an upgrade back, leaves
+// the field absent. Reading that silence as "no" would ignore the marker still
+// beside the image and delete it at the next pause — a permanent demotion.
+func TestResumeWallClockPropertyUnresolvedRecordConsultsTheMarker(t *testing.T) {
+	mem := filepath.Join(t.TempDir(), "mem.snap")
+	if err := os.WriteFile(clockFreezeMarkerPath(mem), nil, 0o644); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+	// Same image, but the record lost the answer.
+	if !resumeWallClockProperty(mem, "", mem, nil) {
+		t.Error("an unresolved record must fall back to the marker, not read as false")
+	}
+
+	bare := filepath.Join(t.TempDir(), "mem.snap")
+	if resumeWallClockProperty(bare, "", bare, nil) {
+		t.Error("unresolved with no marker must still be false")
+	}
 }

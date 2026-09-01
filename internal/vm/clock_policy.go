@@ -120,10 +120,13 @@ func guestCorrectsWallClock(instMemFile, instBaseMem string) bool {
 // is already the answer and the resume path need not go to disk for it. Only an
 // explicit override, supplying an image this VM was never paused into, has to
 // look, because the record then describes a different artifact.
-func resumeWallClockProperty(memPath, basePath, pausedMemPath string, recorded bool) bool {
-	if memPath == pausedMemPath {
-		return recorded
+func resumeWallClockProperty(memPath, basePath, pausedMemPath string, recorded *bool) bool {
+	if memPath == pausedMemPath && recorded != nil {
+		return *recorded
 	}
+	// Either a different image than this VM was paused into, or a record that
+	// never carried the answer — a rollback to a binary without the field drops
+	// it on rewrite, and its silence must not be read as "no".
 	return guestCorrectsWallClock(memPath, basePath)
 }
 

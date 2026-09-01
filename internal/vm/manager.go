@@ -118,8 +118,10 @@ type VMInstance struct {
 	MemFilePath    string
 	// CorrectsWallClock records whether this guest fixes its own wall clock on
 	// wake, resolved once when it was restored. Cached so pause never has to go
-	// to the filesystem to find out.
-	CorrectsWallClock bool
+	// to the filesystem to find out. Nil means unresolved — a record written by a
+	// binary that predates the field drops it on round-trip, and treating that
+	// silence as "no" would strip a marker that is still valid.
+	CorrectsWallClock *bool
 	CreatedAt         time.Time
 	Metadata          map[string]string
 	TeamID            string // owning team; carried for data-plane usage attribution
@@ -1537,7 +1539,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	dirtyTracked := inst.DirtyTracked
 	instBaseMem := inst.BaseMemPath
 	instMemFile := inst.MemFilePath
-	correctsWallClock := inst.CorrectsWallClock
+	recordedCorrects := inst.CorrectsWallClock
 	diskPath := inst.DiskPath
 	diskBasePath := inst.Config.BasePath
 	inst.mu.RUnlock()
@@ -1561,6 +1563,13 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// ever having shown it can correct one — a guest running on a stale clock,
 	// which is worse than a failed pause the caller can retry. Both candidate
 	// paths are cleared because the layered branch can still fall back to Full.
+	//
+	// An unresolved record (nil) means the answer was lost, not that it is no —
+	// go and look, or this pause would delete a marker that is still valid.
+	correctsWallClock := recordedCorrects != nil && *recordedCorrects
+	if recordedCorrects == nil {
+		correctsWallClock = guestCorrectsWallClock(instMemFile, instBaseMem)
+	}
 	if !correctsWallClock {
 		for _, candidate := range []string{overlayPath, fullPath} {
 			if merr := os.Remove(clockFreezeMarkerPath(candidate)); merr != nil && !os.IsNotExist(merr) {
@@ -2221,7 +2230,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.Status = StatusRunning
 	inst.Unverified = false
 	inst.DirtyTracked = dirtyTracked
-	inst.CorrectsWallClock = resumeCorrectsWallClock
+	inst.CorrectsWallClock = &resumeCorrectsWallClock
 	inst.PausedAt = time.Time{}
 	// Record the file actually resumed from (callers may pass an explicit path
 	// that differs from the cached one) so the next pause's diff baseline matches
@@ -3027,9 +3036,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// retried on a different slot; the failed slot is torn down. inPlace resumes
 	// reuse a specific VM's own slot and never retry.
 	const maxRestoreAttempts = 3
-	// Resolved inside the loop (memPath can change between attempts) but read
-	// after it, when the instance records what was actually restored.
-	var restoreCorrectsWallClock bool
+	// Both are functions of memPath alone, which no attempt reassigns, so they are
+	// resolved once here rather than per attempt: a tap-busy retry would otherwise
+	// repeat the sidecar read and the marker probe, and both would sit after
+	// Firecracker and networking have started, on user-visible restore latency.
+	sidecarBase, hasSidecar := readLayeredBase(memPath)
+	restoreCorrectsWallClock := guestCorrectsWallClock(memPath, sidecarBase)
 	for attempt = 1; ; attempt++ {
 		tAttemptStart = time.Now()
 		if attempt > 1 {
@@ -3153,13 +3165,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// disabled / inPlace / resume-UFFD off it fails loud instead of falling to the
 		// File backend, which would load the sparse overlay as a full image (the base's
 		// pages read as zero holes).
-		sidecarBase, hasSidecar := readLayeredBase(memPath)
 		overlayNeedsLayered := isOverlayMemFile(memPath) || hasSidecar
-		// One evaluation per restore: this is the only filesystem look-up, and the
-		// policy, the log line, and the cached instance property all read it.
-		// A property of the guest alone — whether this host can act on it is
-		// decided separately, so an older binary does not erase it.
-		restoreCorrectsWallClock = guestCorrectsWallClock(memPath, sidecarBase)
+		// Whether this host can act on the guest's property is decided separately,
+		// so an older binary does not erase it.
 		clockPolicy := m.clockPolicyFor(restoreCorrectsWallClock)
 		clockFrozen := false
 		switch {
@@ -3327,7 +3335,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.PausedAt = time.Time{}
 	// Cached so the next pause knows whether this guest fixes its own wall clock
 	// without going back to the filesystem to ask.
-	inst.CorrectsWallClock = restoreCorrectsWallClock
+	inst.CorrectsWallClock = &restoreCorrectsWallClock
 	inst.mu.Unlock()
 	persistDone := make(chan struct{})
 	optimisticOK := false

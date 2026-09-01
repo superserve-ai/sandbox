@@ -193,9 +193,13 @@ type VMRecord struct {
 	// wake. Persisted because it is a property of the running guest, not of this
 	// daemon: without it a reattached VM would look incapable after a restart and
 	// its next pause would strip a marker that was valid, demoting every later
-	// resume. Absent/false on older records means "not shown to correct", which
-	// is the safe reading.
-	CorrectsWallClock bool              `json:"corrects_wall_clock,omitempty"`
+	// resume.
+	//
+	// Tri-state on purpose. A binary that predates this field drops it when it
+	// rewrites a record, so after a rollback and re-upgrade the field is absent
+	// again — decoding that silence as false would ignore a marker still on disk
+	// and delete it at the next pause. Nil means "ask the disk".
+	CorrectsWallClock *bool `json:"corrects_wall_clock,omitempty"`
 	CreatedAt         time.Time         `json:"created_at"`
 	Metadata          map[string]string `json:"metadata,omitempty"`
 	VCPU              uint32            `json:"vcpu"`
