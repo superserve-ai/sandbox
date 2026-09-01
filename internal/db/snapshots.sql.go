@@ -203,6 +203,19 @@ type GetSnapshotForResumeRow struct {
 // un-coalesced NULL would generate a non-pointer string field pgx then
 // fails to scan a NULL into — ” is also this codebase's existing "no
 // generation" sentinel, so callers need no NULL-specific handling.
+//
+// Not filtered by bucket: a covered generation reported under a bucket
+// other than the one the target vmd host currently reads from (a cell's
+// BACKUP_BUCKET rotated since that report landed) can still be named
+// here even though that host cannot fetch it. This is an accepted, known
+// gap — cells are architecturally single-bucket for their lifetime today
+// (see the multi-region cell design), so a rotation is a rare, deliberate
+// operation, and the failure mode is a clean, already-understood
+// FailedPrecondition on the fetch attempt (see fetchResumeError), not a
+// silent wrong restore. Closing it properly needs the resume RPC to
+// carry the covered bucket too and vmd to validate against its own
+// configured one — worth doing if bucket rotation becomes a real
+// occurrence, not attempted here.
 func (q *Queries) GetSnapshotForResume(ctx context.Context, arg GetSnapshotForResumeParams) (GetSnapshotForResumeRow, error) {
 	row := q.db.QueryRow(ctx, getSnapshotForResume, arg.ID, arg.TeamID)
 	var i GetSnapshotForResumeRow

@@ -28,16 +28,24 @@ const (
 	resumeFetchRootfsName  = "rootfs.ext4"
 )
 
-// resumeFetchBudget bounds one fetch-before-resume attempt, detached from
-// the RPC's own deadline (see fetchGenerationForResume) rather than
-// borrowed from it: the boot RPC's ~45s deadline was sized for Firecracker
-// startup and the readiness gate, not a network restore of a disk image
-// that can be tens of GiB. Sized like this codebase's other large-artifact
-// background budgets (pauseRehashBudget, buildHashBudget in manifest.go):
-// generous enough that a healthy fetch always finishes inside it, short
-// enough that a genuinely stuck one still surfaces as a failure rather
-// than pinning a semaphore slot forever.
-const resumeFetchBudget = 10 * time.Minute
+// resumeFetchBudget defensively upper-bounds one fetch-before-resume
+// attempt for a caller whose context carries no deadline at all (a
+// WithTimeout child can only ever shorten a parent's deadline, never
+// lengthen it — see fetchGenerationForResume). It is NOT the fetch's real
+// budget: the resume RPC's own deadline (vmdBootTimeout, ~45s) always
+// wins in practice, and deliberately so. A fetch is NOT detached from the
+// caller's cancellation: this vmID's lifecycle lock is held for the
+// whole RPC (see resumeVMLocked's doc comment), and the control plane's
+// retry waits on that same lock for only its own boot deadline — a fetch
+// left running past the point every caller has given up on it would just
+// make that retry queue on a lock the abandoned first attempt still
+// holds, with no one left to observe whichever outcome eventually lands.
+// A resume that needs to fetch an artifact too large to complete inside
+// the existing boot deadline fails here, cleanly and retryably (see
+// fetchResumeError) — decoupling large-artifact prefetch from the
+// synchronous resume RPC into its own background operation is future
+// work this does not attempt.
+const resumeFetchBudget = 60 * time.Second
 
 // resumeFetchPendingSuffix names the sidecar marker fetchGenerationForResume
 // writes before touching either target path and clears only once both are
@@ -126,14 +134,12 @@ func (m *Manager) fetchGenerationForResume(ctx context.Context, vmID, generation
 	}
 	defer func() { <-src.sem }()
 
-	// Detached from the caller's cancellation and given its own generous
-	// budget (resumeFetchBudget): a client that gives up on the RPC must
-	// not truncate a download that's otherwise on track. resumeVMLocked's
-	// own doc comment already establishes why this is safe — a retry
-	// waits on the same vm-op lock and adopts whatever this attempt
-	// eventually produces, live VM or freshly fetched files, instead of
-	// racing it.
-	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resumeFetchBudget)
+	// Bound by the caller's own deadline, not detached from it — see
+	// resumeFetchBudget for why. This WithTimeout can only shorten ctx's
+	// existing deadline (vmdBootTimeout, ~45s in practice), never extend
+	// it past what the RPC — and the vm-op lock this whole call sits
+	// under — actually has left.
+	fctx, cancel := context.WithTimeout(ctx, resumeFetchBudget)
 	defer cancel()
 
 	snapshotDir := filepath.Dir(snapshotPath)
@@ -144,10 +150,18 @@ func (m *Manager) fetchGenerationForResume(ctx context.Context, vmID, generation
 	// Written before either target path is touched; see
 	// resumeFetchPendingSuffix for why. Left in place on every error path
 	// below (including a context timeout) — its whole job is to persist
-	// across exactly those failures.
+	// across exactly those failures. Its own directory entry is synced
+	// right away too: the marker's fsync (inside writeFetchPendingMarker)
+	// only covers its content, and a crash before the entry itself is
+	// durable would make the marker vanish along with whatever it was
+	// meant to survive — the same directory-entry gap the sync before the
+	// final marker removal below closes for the adopted files.
 	markerPath := resumeFetchMarkerPath(snapshotPath)
 	if err := writeFetchPendingMarker(markerPath, generation); err != nil {
 		return 0, fmt.Errorf("write fetch marker: %w", err)
+	}
+	if err := syncDir(snapshotDir); err != nil {
+		return 0, fmt.Errorf("sync marker dir: %w", err)
 	}
 
 	// RestoreGenerationFiles requires an empty destination (see its doc
@@ -189,16 +203,56 @@ func (m *Manager) fetchGenerationForResume(ctx context.Context, vmID, generation
 		}
 		bytesRestored += mf.Size
 	}
-	// Both artifacts are durably in place: the pair is consistent again,
-	// so the marker that would force a future attempt to distrust plain
-	// existence can go. Best-effort: a failure to remove it only costs a
-	// future resume an unnecessary (but harmless — adoptFetchedFile always
-	// overwrites) refetch, never a correctness problem the way leaving a
-	// STALE marker after a genuine failure would be reversed.
+	// A rename is only durable once its containing directory's own entry
+	// update is flushed — os.Rename alone doesn't guarantee that, and each
+	// file's own fsync (inside restoreFile/copyAcrossDevices) covers only
+	// its CONTENT, not the directory entry that makes the new name
+	// visible after a crash. Sync both target directories BEFORE clearing
+	// the marker: if power is lost between an unsynced rename and here,
+	// the marker must still be findable afterward, or a future resume
+	// would trust a rename that may not have survived. dedupe in case
+	// snapshotPath and rootfsPath ever end up in the same directory.
+	syncedDirs := map[string]bool{}
+	for _, dest := range []string{snapshotPath, rootfsPath} {
+		dir := filepath.Dir(dest)
+		if syncedDirs[dir] {
+			continue
+		}
+		if err := syncDir(dir); err != nil {
+			return bytesRestored, fmt.Errorf("sync %s: %w", dir, err)
+		}
+		syncedDirs[dir] = true
+	}
+	// Both artifacts are now DURABLY in place: the pair is consistent
+	// again, so the marker that would force a future attempt to distrust
+	// plain existence can go. Best-effort: a failure to remove it only
+	// costs a future resume an unnecessary (but harmless — adoptFetchedFile
+	// always overwrites) refetch, never a correctness problem the way
+	// leaving a stale marker after a genuine failure would be reversed —
+	// so this is deliberately not fatal, but the removal itself is synced
+	// too, or the same crash-durability gap would apply to it: a marker
+	// whose removal didn't survive a crash is exactly the safe direction
+	// (an unnecessary refetch), but let a completed removal report itself
+	// completed only once it actually is.
 	if rerr := os.Remove(markerPath); rerr != nil && !os.IsNotExist(rerr) {
 		log.Warn().Err(rerr).Str("generation", generation).Msg("resume fetch: clear pending marker failed")
+	} else if rerr := syncDir(filepath.Dir(markerPath)); rerr != nil {
+		log.Warn().Err(rerr).Str("generation", generation).Msg("resume fetch: sync marker dir after clear failed")
 	}
 	return bytesRestored, nil
+}
+
+// syncDir opens dir and fsyncs it, the standard way to make a prior
+// rename or unlink's directory-entry change durable — content fsyncs on
+// the files themselves cover their bytes, not the name that makes them
+// visible after a crash.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // writeFetchPendingMarker creates or overwrites the marker with the
