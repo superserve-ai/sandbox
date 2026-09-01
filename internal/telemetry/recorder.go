@@ -148,6 +148,36 @@ type LatencyPhase struct {
 	Duration time.Duration
 }
 
+// CapacityShadow is one shadow ranking evaluation: what capacity-based
+// placement WOULD have chosen, measured against what the live scheduler
+// actually did, plus how much of the fleet is describable at all.
+// Emitted from a background worker, never from a request. Every label is
+// a bounded enum owned by the scheduler.
+type CapacityShadow struct {
+	Result    string // ranked | no_candidates | error
+	Agreement string // in_band | out_of_band | unknown
+	// Profile separates the host populations different capability sets
+	// rank against; the composition gauges below are last-value, so
+	// without it one profile silently overwrites another.
+	Profile string
+	// Fleet composition as the ranker saw it, for readiness tracking.
+	// Meaningful ONLY when Result is not "error": a failed ranking saw
+	// nothing, and publishing its zeros into a last-value gauge would
+	// make the fleet read as empty because the database blinked.
+	Described      int
+	UnderDescribed int
+	Legacy         int
+	Stale          int
+	Duration       time.Duration
+	// Refresh marks a periodic composition re-read rather than a sampled
+	// create. It publishes the gauges above and nothing else: there is
+	// no create behind it, so it has no placement to agree or disagree
+	// with, and counting it in the agreement histogram would dilute that
+	// signal with synthetic observations during exactly the quiet
+	// periods this refresh exists to cover.
+	Refresh bool
+}
+
 // Recorder is the operational metrics boundary. Implementations should emit
 // OpenTelemetry metrics through a collector; callers should not write ad hoc
 // operational metrics into Postgres.
@@ -156,6 +186,7 @@ type Recorder interface {
 	RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait)
 	RecordVMDCall(context.Context, VMDCall)
 	RecordHostResolution(context.Context, HostResolution)
+	RecordCapacityShadow(context.Context, CapacityShadow)
 	RecordHostCapacity(context.Context, HostCapacity)
 	RecordBackupCoverage(context.Context, []BackupCoverage)
 	RecordDBPoolStats(context.Context, DBPoolStats)
@@ -182,6 +213,7 @@ func (noopRecorder) RecordSandboxTransition(context.Context, SandboxTransition) 
 func (noopRecorder) RecordSandboxResumeSettleWait(context.Context, SandboxResumeSettleWait) {}
 func (noopRecorder) RecordVMDCall(context.Context, VMDCall)                                 {}
 func (noopRecorder) RecordHostResolution(context.Context, HostResolution)                   {}
+func (noopRecorder) RecordCapacityShadow(context.Context, CapacityShadow)                   {}
 func (noopRecorder) RecordHostCapacity(context.Context, HostCapacity)                       {}
 func (noopRecorder) RecordBackupCoverage(context.Context, []BackupCoverage)                 {}
 func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)                         {}

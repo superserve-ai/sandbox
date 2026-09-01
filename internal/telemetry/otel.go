@@ -81,6 +81,8 @@ type OTelRecorder struct {
 	vmdCalls                 metric.Int64Counter
 	vmdDuration              metric.Float64Histogram
 	hostResolutionDuration   metric.Float64Histogram
+	capacityShadowDuration   metric.Float64Histogram
+	capacityShadowHosts      metric.Int64Gauge
 	hostVCPU                 metric.Int64Gauge
 	hostMemoryMiB            metric.Int64Gauge
 	hostSandboxes            metric.Int64Gauge
@@ -166,6 +168,13 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	}
 	if r.hostResolutionDuration, err = meter.Float64Histogram("host_resolution_duration_seconds",
 		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.capacityShadowDuration, err = meter.Float64Histogram("capacity_shadow_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.capacityShadowHosts, err = meter.Int64Gauge("capacity_shadow_hosts"); err != nil {
 		return nil, err
 	}
 	if r.vmdDuration, err = meter.Float64Histogram("vmd_call_duration_seconds",
@@ -308,6 +317,81 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 	r.vmdCalls.Add(ctx, 1, opt)
 	if c.Duration > 0 {
 		r.vmdDuration.Record(ctx, c.Duration.Seconds(), opt)
+	}
+}
+
+// normalizeShadowResult and normalizeShadowAgreement keep metric labels
+// bounded. Extracted so the accepted values can be tested against the
+// emitter's: when these drifted apart, every meaningful agreement was
+// silently exported as "other" and the metric looked healthy while
+// measuring nothing.
+// shadowPublishesComposition reports whether a result carries real
+// counts. A failed ranking counted nothing, and composition is a
+// last-value gauge, so its zeros would erase readiness until the next
+// success. "no_candidates" is a genuine answer and does publish.
+func shadowPublishesComposition(result string) bool { return result != "error" }
+
+func normalizeShadowProfile(v string) string {
+	switch v {
+	case "none", "basic", "extended":
+		return v
+	}
+	return "other"
+}
+
+func normalizeShadowResult(v string) string {
+	switch v {
+	case "ranked", "no_candidates", "error":
+		return v
+	}
+	return "other"
+}
+
+func normalizeShadowAgreement(v string) string {
+	switch v {
+	case "in_band", "out_of_band", "unknown":
+		return v
+	}
+	return "other"
+}
+
+// RecordCapacityShadow emits the shadow evaluation. The host-composition
+// gauges are what tell an operator whether the fleet is ready for
+// enforcement: enabling admission while most hosts are legacy or stale
+// would rank on numbers that barely exist.
+func (r *OTelRecorder) RecordCapacityShadow(ctx context.Context, c CapacityShadow) {
+	if r == nil {
+		return
+	}
+	result, agreement := normalizeShadowResult(c.Result), normalizeShadowAgreement(c.Agreement)
+	profile := normalizeShadowProfile(c.Profile)
+	// A periodic refresh republishes composition only. It has no create
+	// behind it, so it belongs in neither the agreement breakdown nor
+	// the duration distribution — both describe sampled traffic, and
+	// refreshes are densest precisely when traffic is absent.
+	if !c.Refresh {
+		// The agreement histogram carries the profile too: without it,
+		// traffic from the dominant capability profile drowns out poor
+		// agreement on another.
+		r.capacityShadowDuration.Record(ctx, c.Duration.Seconds(), metric.WithAttributes(r.attrs(
+			attribute.String("result", result),
+			attribute.String("agreement", agreement),
+			attribute.String("profile", profile),
+		)...))
+	}
+	if !shadowPublishesComposition(result) {
+		return
+	}
+	for kind, n := range map[string]int{
+		"described":       c.Described,
+		"under_described": c.UnderDescribed,
+		"legacy":          c.Legacy,
+		"stale":           c.Stale,
+	} {
+		r.capacityShadowHosts.Record(ctx, int64(n), metric.WithAttributes(r.attrs(
+			attribute.String("kind", kind),
+			attribute.String("profile", profile),
+		)...))
 	}
 }
 
