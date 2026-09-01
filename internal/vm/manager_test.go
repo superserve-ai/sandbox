@@ -25,6 +25,7 @@ import (
 )
 
 type fakeNetMgr struct {
+	netlinkSlotOps  bool
 	setupInfo       map[string]*network.VMNetInfo
 	setupCalls      []string
 	cleanupVMCalls  []string
@@ -138,6 +139,8 @@ func (f *fakeNetMgr) TeardownVM(vmID string) {
 	}
 	f.teardownCalls = append(f.teardownCalls, vmID)
 }
+
+func (f *fakeNetMgr) UsesNetlinkSlotOps() bool { return f.netlinkSlotOps }
 
 func (f *fakeNetMgr) TeardownVMOrNamespace(vmID, fallbackNamespace string) {
 	if f.beforeRelease != nil {

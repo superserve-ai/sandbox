@@ -194,6 +194,9 @@ type vmNetworkManager interface {
 	UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []string) error
 	TeardownVMOrNamespace(vmID, fallbackNamespace string)
 	TeardownVM(vmID string)
+	// UsesNetlinkSlotOps lets the build path hand the same backend to
+	// template-builder, which creates its own slot in its own process.
+	UsesNetlinkSlotOps() bool
 }
 
 type sandboxNetworkRules struct {
@@ -4528,7 +4531,11 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			inst.Supervision = fresh.Supervision
 			inst.mu.Unlock()
 		}
-		log.Info().Msg("reattached paused VM")
+		// Deliberately no per-record log: paused records dominate a large
+		// host's store, and one line per record is enough volume to trip
+		// journald's rate limit and suppress whatever the daemon logs next —
+		// including request errors. The pass logs its count up front and its
+		// totals on completion; anomalies on this path log above.
 	} else {
 		// Only a deletion undoes the reattach (see persistStateIfPresent).
 		if wrote, perr := m.persistStateIfPresent(inst); perr == nil && !wrote {
@@ -6590,6 +6597,53 @@ func fcSetupCmds(templateDir, basePath, perVMRootfs string) string {
 		shellquote.Single(templateDir), shellquote.Single(perVMRootfs), shellquote.Single(rootfsLink))
 }
 
+// LaunchNSEntry is how a Firecracker launch enters its VM's network
+// namespace, in both the forms the two launch sites need: vmd renders a shell
+// script, template-builder execs an argv directly.
+type LaunchNSEntry struct {
+	// Argv enters the namespace as an exec prefix.
+	Argv []string
+	// Shell is the same prefix rendered into a `sh -c` script.
+	Shell string
+	// SysfsSetup is extra shell the caller MUST append to its in-namespace
+	// setup commands. `ip netns exec` remounts /sys inside the namespace;
+	// nsenter does not, so a launcher-pin entry that omits this leaves
+	// /sys/class/net showing the host's interfaces instead of the VM's tap.
+	// Empty for the legacy entry, which already gets the remount.
+	SysfsSetup string
+}
+
+// LaunchNamespaceEntry resolves how a launch enters netNS.
+//
+// launcherNSPath == "" selects the legacy `ip netns exec`, which clones the
+// FULL host mount table into a throwaway mount namespace on every call — the
+// cost the launcher pin exists to avoid. A non-empty path enters the pruned
+// launcher mount namespace instead, so the following `unshare -m` clones that
+// small table rather than the host's.
+//
+// Both launch sites go through here because the entry mode and the sysfs
+// remount are coupled: picking nsenter without adding SysfsSetup is a silent
+// correctness bug, not a performance one.
+func LaunchNamespaceEntry(netNS, launcherNSPath string) LaunchNSEntry {
+	if launcherNSPath == "" {
+		return LaunchNSEntry{
+			Argv:  []string{"ip", "netns", "exec", netNS},
+			Shell: fmt.Sprintf("ip netns exec %s", netNS),
+		}
+	}
+	return LaunchNSEntry{
+		Argv: []string{
+			"nsenter",
+			"--net=/run/netns/" + netNS,
+			"--mount=" + launcherNSPath,
+			"--",
+		},
+		Shell: fmt.Sprintf("nsenter --net=/run/netns/%s --mount=%s --",
+			netNS, shellquote.Single(launcherNSPath)),
+		SysfsSetup: " && mount -t sysfs sysfs /sys",
+	}
+}
+
 // fcStartScript renders the per-VM start.sh that systemd's ExecStart runs.
 //
 // launcherNSPath == "" → legacy: `ip netns exec <ns> unshare -m …`.
@@ -6599,15 +6653,10 @@ func fcSetupCmds(templateDir, basePath, perVMRootfs string) string {
 // netns resolves even though the launcher has /run/netns pruned — which is why
 // `ip netns exec` (resolves the netns from inside the mount ns) can't be used.
 func fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID string) string {
-	prefix := fmt.Sprintf("ip netns exec %s", netNS)
-	sysfs := ""
-	if launcherNSPath != "" {
-		prefix = fmt.Sprintf("nsenter --net=/run/netns/%s --mount=%s --", netNS, shellquote.Single(launcherNSPath))
-		// nsenter, unlike `ip netns exec`, doesn't remount /sys, so /sys/class/net
-		// would show the host's interfaces, not the VM's tap. Remount a netns-aware
-		// sysfs inside the per-VM ns (after make-rprivate, so it can't reach the host).
-		sysfs = " && mount -t sysfs sysfs /sys"
-	}
+	// Entry mode and its sysfs obligation come from the shared resolver, so
+	// this script and template-builder's build VM cannot drift on them.
+	entry := LaunchNamespaceEntry(netNS, launcherNSPath)
+	prefix, sysfs := entry.Shell, entry.SysfsSetup
 	// Each value is single-quoted, then the whole inner script is single-quoted as
 	// the `sh -c` arg — two shellquote.Single layers, so a caller-influenced path
 	// (base_path, perVMRootfs) can't close a quote and inject shell as root.

@@ -213,21 +213,38 @@ func publishesCapacityPressure(advertiseAddr, controlPlaneURL string) bool {
 	return advertiseAddr != "" && controlPlaneURL != ""
 }
 
-func advertisedVMDAddr(interfaceName string, grpcPort int, explicit string) (string, error) {
+// hostIPOnce memoizes a host-address resolver. Both advertised endpoints
+// derive from the same interface, and the lookup dumps the host's interface
+// and address tables — tables that grow with every VM and pooled slot on the
+// box — so it runs at most once per process, and not at all when both
+// endpoints are configured explicitly.
+func hostIPOnce(resolve func() (string, error)) func() (string, error) {
+	var (
+		once sync.Once
+		ip   string
+		err  error
+	)
+	return func() (string, error) {
+		once.Do(func() { ip, err = resolve() })
+		return ip, err
+	}
+}
+
+func advertisedVMDAddr(hostIP func() (string, error), grpcPort int, explicit string) (string, error) {
 	if explicit != "" {
 		if _, _, err := net.SplitHostPort(explicit); err != nil {
 			return "", err
 		}
 		return explicit, nil
 	}
-	ip, err := hostInterfaceAddress(interfaceName)
+	ip, err := hostIP()
 	if err != nil {
 		return "", err
 	}
 	return net.JoinHostPort(ip, strconv.Itoa(grpcPort)), nil
 }
 
-func advertisedProxyAddr(interfaceName, proxyHealthURL, explicit string) (string, error) {
+func advertisedProxyAddr(hostIP func() (string, error), proxyHealthURL, explicit string) (string, error) {
 	if explicit != "" {
 		if _, _, err := net.SplitHostPort(explicit); err != nil {
 			return "", err
@@ -246,7 +263,7 @@ func advertisedProxyAddr(interfaceName, proxyHealthURL, explicit string) (string
 		return "", err
 	}
 	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-		ip, err := hostInterfaceAddress(interfaceName)
+		ip, err := hostIP()
 		if err != nil {
 			return "", err
 		}
@@ -625,6 +642,9 @@ func main() {
 	// chain even when no ports are configured (so disabling the feature
 	// clears stale drops). template-builder must not pass this.
 	netMgrOpts := []network.ManagerOption{network.WithEgressPortChainOwner()}
+	if envOrDefault("VMD_NETLINK_SLOT_OPS", "false") == "true" {
+		netMgrOpts = append(netMgrOpts, network.WithNetlinkSlotOps())
+	}
 	if blocklistPath != "" {
 		blCfg, err := blocklist.LoadConfig(blocklistPath)
 		if err != nil {
@@ -1465,6 +1485,22 @@ func main() {
 		mgr.StartMountCountSampler(ctx, time.Minute)
 	}
 
+	// ---- Fleet-sized background work ----
+	// Slot refill, slot adoption, and the full reattach each walk the whole
+	// inventory: their cost grows with records, slots, and interfaces, while
+	// everything before readiness is bounded. Run concurrently with startup
+	// they compete for the kernel's single global RTNL lock and delay the
+	// readiness the daemon is trying to announce, and their per-record logs
+	// can bury the readiness line under journald's rate limit. Holding them
+	// behind readiness keeps startup proportional to nothing but itself.
+	//
+	// Requests cannot be served during the wait — the gRPC interceptors
+	// reject everything with Unavailable until startupReady flips — so the
+	// deferral delays no caller. A daemon that shuts down before readiness
+	// never opens it; every waiter also selects on context cancellation, so
+	// none of them are left parked.
+	postReady := make(chan struct{})
+
 	// ---- Pre-allocate network slots ----
 	// Warm buffer of network namespaces so creation claims off the hot path.
 	// StartPool returns immediately and fills in the background, so the gate
@@ -1474,6 +1510,7 @@ func main() {
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
 		NewSize:           netPoolFresh,
 		RecycleSize:       netPoolRecycle,
+		StartGate:         postReady,
 		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
 		AbandonOnStop:     adoptNetPool,
 	})
@@ -1504,6 +1541,14 @@ func main() {
 	// service — a completing lc service trips lifecycle shutdown.
 	go func() {
 		defer sentrylog.Recover("startup reattach")
+		// Held until readiness: requests load their VM on demand, so nothing
+		// waits on this pass (see the fleet-sized background work comment
+		// above for why it must not run during startup).
+		select {
+		case <-postReady:
+		case <-ctx.Done():
+			return
+		}
 		// O(N) reattach, off the critical path — timed here (not via the
 		// single-goroutine marks) and flagged concurrent, distinct message, so
 		// its phase_ms is never summed into the partition. count sizes a
@@ -1659,17 +1704,12 @@ func main() {
 		if proxyHealthURL == "" {
 			proxyHealthURL = "http://127.0.0.1:5007/health"
 		}
-		vmdAddr, err := advertisedVMDAddr(cfg.HostInterface, cfg.GRPCPort, cfg.VMDAdvertiseAddr)
-		if err != nil {
-			log.Warn().Err(err).Str("host_interface", cfg.HostInterface).
-				Int("grpc_port", cfg.GRPCPort).
-				Msg("unable to resolve advertised VMD address; heartbeat will omit host self-description")
-		}
-		proxyAddr, err := advertisedProxyAddr(cfg.HostInterface, proxyHealthURL, cfg.ProxyAdvertiseAddr)
-		if err != nil {
-			log.Warn().Err(err).Str("proxy_health_url", proxyHealthURL).
-				Msg("unable to derive advertised proxy address; heartbeat will omit host self-description")
-		}
+		// Both endpoints derive from one host-interface lookup, and that
+		// lookup dumps the host's interface and address tables — whose size
+		// grows with the fleet. hostIP resolves at most once, and only if
+		// something actually needs it: two explicit advertise settings
+		// resolve nothing at all.
+		hostIP := hostIPOnce(func() (string, error) { return hostInterfaceAddress(cfg.HostInterface) })
 		// Pressure publication is wired ONLY on the explicit advertise
 		// setting — never on the resolved vmdAddr, which now falls back
 		// to deriving an address from the host interface. Keying on the
@@ -1683,6 +1723,21 @@ func main() {
 			pressureReady = mgr.PressureReady
 		}
 		lc.start("heartbeat", func() error {
+			// Resolved here rather than on the startup goroutine: the lookup
+			// is fleet-sized, and its only consumer is this heartbeat. A
+			// failure still omits self-description and warns; it has never
+			// been a reason to hold up readiness.
+			vmdAddr, err := advertisedVMDAddr(hostIP, cfg.GRPCPort, cfg.VMDAdvertiseAddr)
+			if err != nil {
+				log.Warn().Err(err).Str("host_interface", cfg.HostInterface).
+					Int("grpc_port", cfg.GRPCPort).
+					Msg("unable to resolve advertised VMD address; heartbeat will omit host self-description")
+			}
+			proxyAddr, err := advertisedProxyAddr(hostIP, proxyHealthURL, cfg.ProxyAdvertiseAddr)
+			if err != nil {
+				log.Warn().Err(err).Str("proxy_health_url", proxyHealthURL).
+					Msg("unable to derive advertised proxy address; heartbeat will omit host self-description")
+			}
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
 				ControlPlaneURL:   cfg.ControlPlaneURL,
 				HostID:            cfg.HostID,
@@ -1779,6 +1834,10 @@ func main() {
 	startupReady.Store(true)
 	st.mark("ready", true, -1)
 	log.Info().Msg("startup complete — gRPC serving requests")
+	// Released only after the readiness line is emitted: the deploy
+	// readiness check reads that line from the journal, so nothing the
+	// background work logs may come ahead of it.
+	close(postReady)
 
 	// Leak gauge for network namespaces — independent of the launcher path.
 	// Started AFTER readiness (and so after StartPool): its immediate first
