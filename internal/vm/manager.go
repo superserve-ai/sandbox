@@ -1572,21 +1572,16 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		correctsWallClock = guestCorrectsWallClock(instMemFile, instBaseMem)
 	}
 
-	// A guest that will wake with its clock frozen must be snapshotted with its
-	// workload stopped, or its processes run on the stale clock until the agent
-	// corrects it. Ask before the image exists. A freeze that cannot complete
-	// inside the budget is not fatal: the guest thaws itself before answering,
-	// and this pause simply produces an unfrozen image — slower to wake, never
-	// wrong — which is what clearing the marker below then records.
+	// Freeze the workload before the image exists, or it wakes on the stale
+	// clock. A freeze that cannot complete demotes this pause to an unfrozen
+	// image; the guest has already thawed itself.
 	guestFrozen := false
 	if correctsWallClock {
 		correctsWallClock, guestFrozen = m.freezeGuestForPause(ctx, instIP, log)
 	}
 	snapshotOK := false
 	if guestFrozen {
-		// A snapshot that fails leaves the VM running (see handleVMError), and a
-		// running VM with a frozen workload makes no progress. Undo it on every
-		// exit that is not a completed snapshot.
+		// A failed snapshot leaves the VM running; do not leave it frozen.
 		defer func() {
 			if snapshotOK {
 				return

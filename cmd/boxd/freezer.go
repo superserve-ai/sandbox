@@ -15,29 +15,19 @@ import (
 	"time"
 )
 
-// Correcting the wall clock on wake (clock.go) closes most of the problem with
-// a frozen restore, but not all of it: between the vCPUs resuming and boxd's
-// first health check, the customer's processes are already running on the
-// stale clock. The freezer cgroup closes that gap. Every process boxd spawns
-// is placed in one cgroup; the supervisor asks boxd to freeze it just before a
-// snapshot, so the image is taken with the workload stopped and only boxd
-// runnable. On wake nothing but boxd runs until the clock is right, and the
-// health check that reports ready is what thaws it.
-//
-// The guest kernel predates the cgroup v2 freezer, so this is the v1 one,
-// mounted by the init script at cgroupFreezerDir.
+// Between the vCPUs resuming and the first health check, the workload would
+// run on the stale clock. So every process boxd spawns lives in one freezer
+// cgroup, the supervisor freezes it just before a snapshot, and the health
+// check that reports ready thaws it. cgroup v1: the guest kernel predates v2.
 
 // cgroupFreezerDir is the workload cgroup the init script creates.
 const cgroupFreezerDir = "/sys/fs/cgroup/freezer/workload"
 
-// defaultFreezeBudget bounds how long a freeze may wait for every task to stop.
-// A task in uninterruptible I/O cannot be frozen until it returns, and the
-// supervisor is holding a pause open while it waits — so on timeout the freeze
-// is undone and reported as failed, and the supervisor takes the slower path.
+// defaultFreezeBudget bounds the wait for every task to stop; a task in
+// uninterruptible I/O cannot be frozen until it returns.
 const defaultFreezeBudget = 2 * time.Second
 
-// freezerFS is the cgroup as a handful of files, so the sequencing can be
-// tested against a fake that stalls in FREEZING for a while.
+// freezerFS is the cgroup as files, so sequencing is testable against a fake.
 type freezerFS interface {
 	readState() (string, error)
 	writeState(string) error
@@ -61,25 +51,19 @@ func (c cgroupFS) addProc(pid int) error {
 
 type freezer struct {
 	fs freezerFS
-	// mu serialises a freeze against in-flight spawns: a child exists from
-	// Start() until place() puts it in the cgroup, and a freeze that ran in
-	// that gap would miss it. Spawns hold it shared, a freeze exclusively.
+	// mu: spawns hold it shared from Start() until placement; a freeze holds
+	// it exclusively, so it cannot run in that gap and miss a child.
 	mu sync.RWMutex
-	// unplaced holds the pid of every live process that could not be put in
-	// the cgroup. While any exists a freeze would leave it running on the
-	// stale clock, so the freeze refuses and the supervisor takes the slower
-	// path. Entries leave when the process exits.
+	// unplaced: live pids that could not be put in the cgroup. A freeze is
+	// refused while any exist, since they would keep running.
 	unplaced sync.Map
 	warned   sync.Once
 }
 
 func newFreezer(fs freezerFS) *freezer { return &freezer{fs: fs} }
 
-// A nil *freezer means no freezer is configured: every operation is a no-op
-// and a freeze is refused, exactly as when the cgroup is absent. Spawning and
-// readiness must keep working in that state, so the methods below accept nil.
+// A nil *freezer means none is configured: no-ops, and a freeze is refused.
 
-// spawnLock brackets Start()-then-place() so a freeze cannot run between them.
 func (f *freezer) spawnLock() {
 	if f != nil {
 		f.mu.RLock()
@@ -92,9 +76,6 @@ func (f *freezer) spawnUnlock() {
 	}
 }
 
-// available reports whether the cgroup exists at all. An image whose init did
-// not mount the freezer has nothing to freeze; every operation degrades to the
-// slower path rather than failing the guest.
 func (f *freezer) available() bool {
 	if f == nil {
 		return false
@@ -103,8 +84,7 @@ func (f *freezer) available() bool {
 	return err == nil
 }
 
-// place puts a just-started process in the workload cgroup. Called with the
-// spawn lock held shared so a freeze cannot run between Start() and here.
+// place puts a just-started process in the workload cgroup.
 func (f *freezer) place(pid int) {
 	if f == nil {
 		return
@@ -117,17 +97,15 @@ func (f *freezer) place(pid int) {
 	}
 }
 
-// exited forgets a process that place() could not put in the cgroup.
 func (f *freezer) exited(pid int) {
 	if f != nil {
 		f.unplaced.Delete(pid)
 	}
 }
 
-// freeze stops every process in the cgroup and waits until the kernel reports
-// them all stopped, or the context expires — in which case it thaws what it
-// started and reports failure, so the caller never snapshots a half-frozen
-// workload believing it is safe.
+// freeze stops the cgroup and waits until the kernel reports every task
+// stopped. On timeout it thaws what it started and fails, so a caller never
+// snapshots a half-frozen workload.
 func (f *freezer) freeze(ctx context.Context) error {
 	if f == nil {
 		return errors.New("no freezer configured")
@@ -150,9 +128,7 @@ func (f *freezer) freeze(ctx context.Context) error {
 	if err := f.fs.writeState("FROZEN"); err != nil {
 		return fmt.Errorf("request freeze: %w", err)
 	}
-	// The state file reads FREEZING until every task has stopped; poll densely
-	// at first so a workload that stops in a millisecond is not charged the
-	// poll interval, then back off.
+	// FREEZING until every task has stopped; poll densely, then back off.
 	interval := time.Millisecond
 	for {
 		st, err := f.fs.readState()
@@ -173,9 +149,7 @@ func (f *freezer) freeze(ctx context.Context) error {
 	}
 }
 
-// thaw lets the workload run. Idempotent and best-effort by design: the only
-// callers are the ready path, which must not fail readiness over it, and the
-// supervisor undoing a freeze after a snapshot that did not happen.
+// thaw lets the workload run. Idempotent; a no-op without a cgroup.
 func (f *freezer) thaw() error {
 	if !f.available() {
 		return nil
@@ -190,13 +164,8 @@ func (f *freezer) thaw() error {
 	return f.fs.writeState("THAWED")
 }
 
-// POST /freeze — stop the workload ahead of a snapshot.
-//
-//	{"budget_ms": 2000}   // optional
-//
-// 200 when every task is stopped; 503 when this guest cannot freeze (no
-// cgroup, or a process outside it); 504 when the budget ran out, in which case
-// the workload has already been thawed again.
+// POST /freeze {"budget_ms": N}: 200 frozen; 503 cannot freeze; 504 budget
+// exhausted (already thawed again).
 func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -228,7 +197,7 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// POST /thaw — undo a freeze whose snapshot did not happen.
+// POST /thaw: undo a freeze whose snapshot did not happen.
 func (f *freezer) handleThaw(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")

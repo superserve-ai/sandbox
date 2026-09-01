@@ -313,18 +313,11 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 
 	// block_delta_dir → emits rootfs.delta so sandboxes can be created
 	// from this template's snapshot.
-	// Whether this image may be restored with its monotonic clock frozen hinges
-	// on the guest being able to correct its own wall clock afterwards. Ask the
-	// guest agent, now, in the exact state the snapshot captures — a marker
-	// written on faith would let a guest that cannot correct its clock be
-	// restored onto a stale one.
+	// Ask the guest, in the state the snapshot captures, whether it can correct
+	// its wall clock and freeze its workload; only then may the image be marked.
 	correctsWallClock, why := boxdWallClockProven(ctx, netInfo.HostIP)
 	if correctsWallClock {
-		// Stop the workload for the snapshot, so a sandbox created from this
-		// image wakes with nothing but the agent running until the clock is
-		// right. The build VM is discarded afterwards, so there is no thaw. A
-		// freeze that cannot complete demotes the template to the unfrozen
-		// restore path, exactly as a pause would.
+		// The build VM is discarded afterwards, so no thaw.
 		if err := boxdFreezeWorkload(ctx, netInfo.HostIP); err != nil {
 			correctsWallClock, why = false, "workload freeze: "+err.Error()
 		}
@@ -344,8 +337,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 	emitInternal("system", "snapshot captured")
 
-	// The marker is what lets a supervisor freeze this image's clock on
-	// restore; only written once the guest proved it can put the clock right.
+	// The marker lets a supervisor freeze this image's clock on restore.
 	markerPath := ""
 	if correctsWallClock {
 		markerPath = vm.WallClockMarkerPath(memPath)
@@ -590,11 +582,8 @@ func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, d
 	return nil
 }
 
-// boxdWallClockProven asks the guest agent whether it can read the host's
-// time — the precondition for restoring this image with a frozen clock. It
-// reports what /health says about the clock source, and a reason when not.
-// Any failure to ask reads as "not proven": the marker is only ever written on
-// evidence, never on its absence.
+// boxdWallClockProven reports whether the guest can read host time, and why
+// not. Any failure to ask reads as not proven.
 func boxdWallClockProven(ctx context.Context, vmIP string) (bool, string) {
 	url := fmt.Sprintf("http://%s:%d/health", vmIP, boxdPort)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -627,10 +616,8 @@ func boxdWallClockProven(ctx context.Context, vmIP string) (bool, string) {
 	return true, ""
 }
 
-// boxdFreezeWorkload asks the guest agent to stop every process it spawned,
-// and waits for the agent to confirm they are all stopped. The agent undoes a
-// freeze it could not complete before answering, so an error here means the
-// guest is running normally and this image simply is not marked.
+// boxdFreezeWorkload asks the guest to stop its workload for the snapshot. The
+// guest undoes a freeze it could not complete, so an error means it is running.
 func boxdFreezeWorkload(ctx context.Context, vmIP string) error {
 	url := fmt.Sprintf("http://%s:%d/freeze", vmIP, boxdPort)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
@@ -985,10 +972,7 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, corrects
 		SizeBytes      int64  `json:"size_bytes"`
 		BuiltAt        string `json:"built_at"`
 		SwapMode       string `json:"swap_mode"` // see builder.SwapModeGuest
-		// CorrectsWallClock records that the guest proved, at build time, it can
-		// put its wall clock right from the host — the same fact the marker
-		// beside mem.snap carries, kept here so provenance survives a copy that
-		// drops side-car files.
+		// Same fact as the marker beside mem.snap; kept here for provenance.
 		CorrectsWallClock bool `json:"corrects_wall_clock"`
 	}{
 		SnapshotPath:      snapPath,

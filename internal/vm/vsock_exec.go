@@ -133,19 +133,13 @@ func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, h
 	return nil
 }
 
-// guestFreezeBudget bounds how long a pause waits for the guest to stop its
-// workload before snapshotting. A task in uninterruptible I/O cannot be
-// frozen until it returns, and this sits on the pause path, so the wait is
-// capped and a miss falls back to the unfrozen snapshot rather than stalling.
+// guestFreezeBudget caps how long a pause waits for the guest to freeze its
+// workload; a miss falls back to an unfrozen snapshot rather than stalling.
 const guestFreezeBudget = 2 * time.Second
 
-// postBoxdFreeze asks the guest to stop its workload ahead of a snapshot, so
-// the image is taken with nothing but the agent able to run on wake. boxd
-// undoes a freeze it could not complete within the budget before answering,
-// so a failure here never leaves a half-frozen guest behind.
+// postBoxdFreeze asks the guest to stop its workload ahead of a snapshot.
 func postBoxdFreeze(ctx context.Context, vmIP string) error {
-	// Hand the guest a budget shorter than this call's own deadline, so it is
-	// the guest that gives up — and thaws — before the caller stops listening.
+	// The guest's budget is shorter than ours, so it gives up and thaws first.
 	budget := guestFreezeBudget - 200*time.Millisecond
 	if dl, ok := ctx.Deadline(); ok {
 		if until := time.Until(dl) - 200*time.Millisecond; until < budget {
@@ -161,8 +155,7 @@ func postBoxdFreeze(ctx context.Context, vmIP string) error {
 	return postBoxd(ctx, vmIP, "/freeze", body)
 }
 
-// postBoxdThaw lets a frozen workload run again — the undo for a freeze whose
-// snapshot did not happen.
+// postBoxdThaw undoes a freeze whose snapshot did not happen.
 func postBoxdThaw(ctx context.Context, vmIP string) error {
 	return postBoxd(ctx, vmIP, "/thaw", nil)
 }

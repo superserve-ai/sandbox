@@ -133,8 +133,6 @@ func main() {
 	// Raw HTTP endpoints (file content transfer + health + init + exec).
 	mux.HandleFunc("/files", handleFiles)
 	mux.HandleFunc("/init", handleInit(ctx))
-	// Readiness includes a correct wall clock, and thaws the workload once it
-	// is right: see clock.go and freezer.go.
 	mux.HandleFunc("/health", handleHealth(newWallClock(newWallClockSource()), fz))
 	mux.HandleFunc("/freeze", fz.handleFreeze)
 	mux.HandleFunc("/thaw", fz.handleThaw)
@@ -156,21 +154,14 @@ func main() {
 	}
 }
 
-// handleHealth is what the supervisor polls to decide the guest is ready, so it
-// is where the wall clock is brought into line with the host: a guest restored
-// with a frozen clock is not ready until its clock is right. The template
-// builder reads the wall_clock field to decide whether an image may be marked
-// as correcting its own clock.
+// handleHealth is what the supervisor polls for readiness, so it is where the
+// wall clock is corrected and the workload thawed once the clock is right.
 func handleHealth(clock *wallClock, fz *freezer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		wc, ready := clock.sync()
 		w.Header().Set("Content-Type", "application/json")
 		status := "ok"
 		if ready {
-			// The workload was frozen for the snapshot precisely so that nothing
-			// ran on the stale clock; now that it is right, let it run. Failure
-			// here is logged, not fatal: a frozen workload is visible (nothing
-			// makes progress), a wrong clock is not.
 			if err := fz.thaw(); err != nil {
 				log.Printf("freezer: thaw on ready failed: %v", err)
 			}
@@ -604,9 +595,7 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eve
 		}
 	}
 
-	// A child exists from Start() until it is in the workload cgroup; hold
-	// the spawn lock across both so a freeze cannot run in that gap and
-	// miss it.
+	// Spawn lock held across Start() and placement so a freeze cannot miss the child.
 	s.freezer.spawnLock()
 	if err := cmd.Start(); err != nil {
 		s.freezer.spawnUnlock()

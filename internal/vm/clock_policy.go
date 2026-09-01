@@ -87,10 +87,8 @@ func (m *Manager) WatchFirecrackerCapability(ctx context.Context, log zerolog.Lo
 	}()
 }
 
-// WallClockMarkerPath returns the path of the marker that records, beside a
-// memory image, that its guest corrects its own wall clock on wake. Exported
-// because the template builder writes it and vmd reads it: both must agree on
-// the name, and the suffix is defined in exactly one place.
+// WallClockMarkerPath is the marker beside a memory image whose guest corrects
+// its own wall clock on wake. Written by the template builder, read by vmd.
 func WallClockMarkerPath(memPath string) string {
 	return memPath + clockFreezeMarkerSuffix
 }
@@ -185,12 +183,8 @@ func (m *Manager) restoreWithClockFallback(policy *bool, restore func(clockRealt
 	return false, restore(nil)
 }
 
-// freezeGuestForPause asks a guest that corrects its own clock to stop its
-// workload ahead of the snapshot, and reports whether the image may still be
-// marked. A refused or timed-out freeze demotes this pause to an unfrozen
-// image: the guest has already thawed itself, so the only cost is a slower
-// wake for this one snapshot, and the marker cleared as a result is what makes
-// the supervisor restore it the slower, correct way.
+// freezeGuestForPause freezes the workload ahead of a snapshot and reports
+// whether the image may still be marked. A miss demotes it to unfrozen.
 func (m *Manager) freezeGuestForPause(ctx context.Context, ip string, log zerolog.Logger) (corrects, frozen bool) {
 	fctx, cancel := context.WithTimeout(ctx, guestFreezeBudget)
 	defer cancel()
