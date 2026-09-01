@@ -1040,13 +1040,26 @@ func main() {
 		// control plane names from this same bucket instead of hard-failing.
 		// Reuses gcsClient/bucket rather than a second client: fetch reads
 		// from exactly the bucket this host's own uploads (if any) write to.
+		//
+		// Deployment prerequisite this flag does NOT itself satisfy: the
+		// deployed vmd host identity is normally granted objectCreator on
+		// the backup bucket ONLY (create, no read — see
+		// infra/modules/backup-storage/main.tf), by deliberate design, since
+		// that identity is shared across cells and a read grant there would
+		// let a compromised host read every cell's backups. Every fetch
+		// attempt will fail with a permission error until that identity (or
+		// a narrower, separately reviewed reader path) is actually granted
+		// read — flipping this env var alone does not arrange that. The
+		// warning below exists so a misconfigured rollout fails loud at
+		// startup instead of silently as a wall of per-resume errors later.
 		if os.Getenv("VMD_FETCH_ON_RESUME") == "true" {
 			fetchConcurrency, _ := strconv.Atoi(envOrDefault("VMD_FETCH_ON_RESUME_CONCURRENCY", "4"))
 			if fetchConcurrency < 1 {
 				fetchConcurrency = 4
 			}
 			mgr.SetResumeFetch(backup.NewGCSReader(gcsClient, bucket), fetchConcurrency)
-			log.Info().Int("concurrency", fetchConcurrency).Msg("fetch-on-resume enabled")
+			log.Warn().Int("concurrency", fetchConcurrency).Str("bucket", bucket).
+				Msg("fetch-on-resume enabled: requires this host's identity to have read access to the backup bucket, which the default IAM grant (objectCreator, write-only) does not include — every fetch fails until that's separately arranged")
 		}
 
 		mbps, _ := strconv.Atoi(envOrDefault("BACKUP_BANDWIDTH_MBPS", "100"))

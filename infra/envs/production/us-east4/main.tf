@@ -422,8 +422,15 @@ module "observability" {
 
 # Durability tier for the host's local-SSD artifacts (sandbox snapshots,
 # template builds). The vmd host runs as the shared api-runner SA, so that SA
-# is the writer: create+read on this bucket, never delete — deletes belong to
-# the module's dedicated GC identity, which nothing on the host runs as.
+# is the writer: create-only on this bucket (see the module — objectCreator,
+# no read, no delete, no overwrite), never delete — deletes belong to the
+# module's dedicated GC identity, which nothing on the host runs as. Reads
+# are reserved for the module's dedicated restore identity; a vmd feature
+# that needs to READ from this bucket (fetch-before-resume) is not
+# functional against this grant and needs its own, separately reviewed
+# identity or read path — extending the shared writer identity to read
+# would undo the isolation this module exists to provide (the identity is
+# shared across cells, so read here is read of every cell's backups).
 module "backup_storage" {
   source = "../../../modules/backup-storage"
 
