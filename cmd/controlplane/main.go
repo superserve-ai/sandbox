@@ -283,6 +283,7 @@ func run() error {
 				Legacy:         obs.Legacy,
 				Stale:          obs.Stale,
 				Duration:       obs.Duration,
+				Refresh:        obs.Refresh,
 			})
 		})
 		handlers.Shadow = shadow

@@ -365,14 +365,20 @@ func (r *OTelRecorder) RecordCapacityShadow(ctx context.Context, c CapacityShado
 	}
 	result, agreement := normalizeShadowResult(c.Result), normalizeShadowAgreement(c.Agreement)
 	profile := normalizeShadowProfile(c.Profile)
-	// The agreement histogram carries the profile too: without it,
-	// traffic from the dominant capability profile drowns out poor
-	// agreement on another.
-	r.capacityShadowDuration.Record(ctx, c.Duration.Seconds(), metric.WithAttributes(r.attrs(
-		attribute.String("result", result),
-		attribute.String("agreement", agreement),
-		attribute.String("profile", profile),
-	)...))
+	// A periodic refresh republishes composition only. It has no create
+	// behind it, so it belongs in neither the agreement breakdown nor
+	// the duration distribution — both describe sampled traffic, and
+	// refreshes are densest precisely when traffic is absent.
+	if !c.Refresh {
+		// The agreement histogram carries the profile too: without it,
+		// traffic from the dominant capability profile drowns out poor
+		// agreement on another.
+		r.capacityShadowDuration.Record(ctx, c.Duration.Seconds(), metric.WithAttributes(r.attrs(
+			attribute.String("result", result),
+			attribute.String("agreement", agreement),
+			attribute.String("profile", profile),
+		)...))
+	}
 	if !shadowPublishesComposition(result) {
 		return
 	}

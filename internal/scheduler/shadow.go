@@ -29,6 +29,25 @@ const shadowQueueDepth = 64
 // sleeping; nothing in production reassigns it.
 var shadowSampleInterval = 100 * time.Millisecond
 
+// shadowRefreshInterval is how often the worker re-reads fleet
+// composition on its own, independent of create traffic.
+//
+// The composition gauges are last-value: once written they are
+// republished on every export interval until something overwrites them,
+// so a profile that stops receiving creates does not go absent — it
+// keeps reporting a snapshot that ages silently. Since these gauges are
+// the readiness signal for enabling enforcement, a stale "every host
+// describable" is the exact reading that would wrongly greenlight it
+// after hosts had gone stale.
+//
+// Shorter than PressureFreshnessSecs so a host crossing from fresh to
+// stale is visible within one freshness window rather than at the mercy
+// of the next create. The cost is one ranking pass per capability
+// profile per interval — at most a handful of queries a minute, on the
+// background worker, and only when shadow evaluation is enabled at all.
+// A var so tests need not wait a minute.
+var shadowRefreshInterval = 60 * time.Second
+
 // ShadowObservation is one evaluated sample, for metrics. Every field is
 // a bounded enum or a small int; nothing here is per-sandbox or
 // per-tenant.
@@ -62,6 +81,11 @@ type ShadowObservation struct {
 	Stale          int
 	// Duration of the ranking pass itself, off the request path.
 	Duration time.Duration
+	// Refresh marks a periodic composition re-read rather than a
+	// sampled create, so the consumer can publish the counts above
+	// without folding a synthetic observation into agreement or
+	// duration statistics that describe real traffic.
+	Refresh bool
 }
 
 // capabilityProfile names a capability set with a short, bounded label.
@@ -113,6 +137,15 @@ type ShadowEvaluator struct {
 	// common one — is a load and a compare, with nothing a request can
 	// block on.
 	lastSampled atomic.Int64
+	// lastByProfile remembers one representative sample per capability
+	// profile so the periodic refresh can re-rank the same host
+	// populations that real traffic ranks against. Written and read only
+	// by the worker goroutine, so it needs no lock — Offer never touches
+	// it.
+	//
+	// Bounded by the number of profiles capabilityProfile can return,
+	// which is a fixed three, so this cannot grow with traffic.
+	lastByProfile map[string]shadowSample
 }
 
 // NewShadowEvaluator builds an evaluator with its queue ready. Run must
@@ -120,9 +153,10 @@ type ShadowEvaluator struct {
 // then drops, which is harmless.
 func NewShadowEvaluator(ranker *CapacityRanker, observe func(ShadowObservation)) *ShadowEvaluator {
 	return &ShadowEvaluator{
-		Ranker:  ranker,
-		Observe: observe,
-		samples: make(chan shadowSample, shadowQueueDepth),
+		Ranker:        ranker,
+		Observe:       observe,
+		samples:       make(chan shadowSample, shadowQueueDepth),
+		lastByProfile: make(map[string]shadowSample),
 	}
 }
 
@@ -173,18 +207,41 @@ func (s *ShadowEvaluator) admitSample() bool {
 // refresh serialized without a lock a request could ever contend.
 func (s *ShadowEvaluator) Run(ctx context.Context) {
 	defer sentrylog.Recover("capacity-shadow-evaluator")
+	refresh := time.NewTicker(shadowRefreshInterval)
+	defer refresh.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case sample := <-s.samples:
-			s.evaluate(ctx, sample)
+			s.evaluate(ctx, sample, false)
+		case <-refresh.C:
+			s.refreshComposition(ctx)
 		}
 	}
 }
 
-func (s *ShadowEvaluator) evaluate(ctx context.Context, sample shadowSample) {
+// refreshComposition re-ranks each profile seen so far and republishes
+// what the fleet looks like now, so readiness does not silently freeze
+// at whatever the last create happened to observe.
+//
+// Only profiles with a prior sample are refreshed: a profile no create
+// has ever used has no gauge to go stale, and inventing one would report
+// readiness for traffic that does not exist.
+func (s *ShadowEvaluator) refreshComposition(ctx context.Context) {
+	for _, sample := range s.lastByProfile {
+		s.evaluate(ctx, sample, true)
+	}
+}
+
+func (s *ShadowEvaluator) evaluate(ctx context.Context, sample shadowSample, refresh bool) {
 	started := time.Now()
+	if !refresh {
+		// Remembered before ranking, so a profile whose every ranking
+		// fails is still refreshed later rather than dropping out of the
+		// rotation on its first bad query.
+		s.lastByProfile[capabilityProfile(sample.requiredCapabilities)] = sample
+	}
 	result, err := s.Ranker.Rank(ctx, RankRequest{
 		RequiredCapabilities: sample.requiredCapabilities,
 		MemoryMib:            sample.memoryMib,
@@ -198,6 +255,7 @@ func (s *ShadowEvaluator) evaluate(ctx context.Context, sample shadowSample) {
 		Stale:          result.Stale,
 		Duration:       time.Since(started),
 		Agreement:      "unknown",
+		Refresh:        refresh,
 	}
 	switch {
 	case err != nil:
@@ -207,7 +265,11 @@ func (s *ShadowEvaluator) evaluate(ctx context.Context, sample shadowSample) {
 		obs.Result = "no_candidates"
 	default:
 		obs.Result = "ranked"
-		if sample.chosenHost != "" {
+		// A refresh reuses an old sample's chosen host, which the live
+		// scheduler picked against a fleet that has since moved on.
+		// Scoring agreement off it would compare this ranking to a
+		// placement decision that is no longer being made.
+		if !refresh && sample.chosenHost != "" {
 			obs.Agreement = "out_of_band"
 			for _, id := range result.TopBand {
 				if id == sample.chosenHost {

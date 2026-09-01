@@ -112,6 +112,14 @@ func (m *rankerMock) queryCount() int {
 	return m.queries
 }
 
+// setRows changes what the fleet looks like mid-test, for cases that need
+// the world to move underneath a running evaluator.
+func (m *rankerMock) setRows(rows []db.ListCapacityCandidatesRow) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rows = rows
+}
+
 type errRow struct{ err error }
 
 func (r errRow) Scan(...any) error { return r.err }
@@ -808,5 +816,71 @@ func TestCapacityPressureCapabilityMatchesTheDaemonsWireName(t *testing.T) {
 	if HostCapabilityCapacityPressure != advertisedByVMD {
 		t.Fatalf("ranker looks for %q but vmd advertises %q; every publishing host would read as legacy",
 			HostCapabilityCapacityPressure, advertisedByVMD)
+	}
+}
+
+// The composition gauges are last-value: once written they are
+// republished on every export interval until something overwrites them.
+// So a profile that stops receiving creates does not go quiet — it keeps
+// reporting a snapshot that ages silently, and since these counts are the
+// readiness signal for enabling enforcement, a frozen "every host
+// describable" is exactly the reading that would greenlight it after the
+// fleet had gone stale. Composition must therefore be re-read on a timer,
+// not only when a create happens to arrive.
+func TestShadowRefreshesCompositionWithoutCreateTraffic(t *testing.T) {
+	m := &rankerMock{rows: []db.ListCapacityCandidatesRow{candidate("h1"), candidate("h2")}}
+	s, obs := newShadow(t, m)
+	// Production refreshes less often than the candidate cache lives, so
+	// a refresh always re-reads; keep that relationship here rather than
+	// letting the refresh replay cached rows and pass vacuously.
+	s.Ranker.TTL = time.Millisecond
+	prev := shadowRefreshInterval
+	shadowRefreshInterval = 20 * time.Millisecond
+	t.Cleanup(func() { shadowRefreshInterval = prev })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+
+	s.Offer(nil, 512, 1, "h1")
+	if first := awaitObservation(t, obs); first.Described != 2 {
+		t.Fatalf("described = %d, want 2 before the fleet changes", first.Described)
+	}
+
+	// The fleet moves with no creates in flight: one host's publisher
+	// stops, so its report ages past the freshness window.
+	stale := candidate("h2")
+	stale.ReportAgeSeconds = PressureFreshnessSecs + 10
+	m.setRows([]db.ListCapacityCandidatesRow{candidate("h1"), stale})
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case o := <-obs:
+			if !o.Refresh {
+				t.Fatalf("observation without Refresh set, but no create was offered: %+v", o)
+			}
+			if o.Described != 1 || o.Stale != 1 {
+				continue // an earlier tick may still report the pre-change fleet
+			}
+			// A refresh has no create behind it, so it must not claim
+			// agreement with a placement decision.
+			if o.Agreement != "unknown" {
+				t.Fatalf("refresh agreement = %q, want unknown; it has no live placement to compare against", o.Agreement)
+			}
+			return
+		case <-deadline:
+			t.Fatal("composition never refreshed without create traffic; the readiness gauges would report the pre-change fleet indefinitely")
+		}
+	}
+}
+
+// Guards the relationship the refresh depends on: a refresh interval at or
+// below the candidate cache TTL would re-serve cached rows and republish
+// the same numbers, looking like a refresh while refreshing nothing.
+func TestShadowRefreshOutlivesTheCandidateCache(t *testing.T) {
+	if shadowRefreshInterval <= defaultRankerCacheTTL {
+		t.Fatalf("refresh interval %v must exceed the candidate cache TTL %v, or refreshes replay cached rows",
+			shadowRefreshInterval, defaultRankerCacheTTL)
 	}
 }

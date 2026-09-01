@@ -169,6 +169,13 @@ type CapacityShadow struct {
 	Legacy         int
 	Stale          int
 	Duration       time.Duration
+	// Refresh marks a periodic composition re-read rather than a sampled
+	// create. It publishes the gauges above and nothing else: there is
+	// no create behind it, so it has no placement to agree or disagree
+	// with, and counting it in the agreement histogram would dilute that
+	// signal with synthetic observations during exactly the quiet
+	// periods this refresh exists to cover.
+	Refresh bool
 }
 
 // Recorder is the operational metrics boundary. Implementations should emit
