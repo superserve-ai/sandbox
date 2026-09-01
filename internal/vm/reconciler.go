@@ -859,11 +859,12 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			log.Warn().Str("vm_id", id).Str("drift", "systemd_active_db_paused").
 				Msg("live unit for paused sandbox — stopping")
 			err := r.mgr.stopVM(ctx, id, supervisionOf[id])
-			if err == nil {
-				// A clean stop is a confirmed one (both supervisors block until
-				// the process is gone): the at-rest proof an overlay deferred
-				// by a Full fallback was waiting for, on hosts with no backup
-				// worker to prove it otherwise.
+			// A nil stop can still leave a unit deactivating (an expired stop
+			// wait settles as success), so only the at-rest probe proves the
+			// process gone — the proof an overlay deferred by a Full fallback
+			// waits for on hosts with no backup worker to supply it. A
+			// transitional unit is left for the next pass.
+			if err == nil && r.mgr.vmConfirmedAtRest(ctx, id) {
 				r.mgr.vmStopUnconfirmed.Delete(id)
 				if inst := r.mgr.trackedInstance(id); inst != nil {
 					r.mgr.reclaimStrandedOverlay(inst, log)

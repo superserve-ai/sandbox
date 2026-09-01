@@ -1814,12 +1814,18 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// the path on the instance, so the first later step that proves the VM
 	// at rest (a retried pause, the reconciler, a resume) reclaims it rather
 	// than leaking a guest-sized file for the sandbox's lifetime.
+	// stopConfirmed is the RPC's notion of a finished stop, which deliberately
+	// includes a still-deactivating unit. Unlinking an overlay the process may
+	// still serve pages from, and backing up bytes that may still change, both
+	// need the stronger fully-down claim — one probe, on a detached ctx since
+	// the caller's may be spent, answers for both.
+	atRest := stopConfirmed && m.vmConfirmedAtRest(probeCtx(), vmID)
 	stranded := ""
 	if orphanedOverlay != "" {
-		if !stopConfirmed {
+		if !atRest {
 			stranded = orphanedOverlay
 			log.Warn().Str("path", orphanedOverlay).
-				Msg("pause: stranded overlay deferred (stop unconfirmed); reclaimed once the VM is at rest")
+				Msg("pause: stranded overlay deferred (VM not yet at rest); reclaimed once it is")
 		} else if err := removeOverlayArtifacts(orphanedOverlay); err != nil {
 			// A transient failure must not become a permanent leak: defer
 			// it exactly like an unconfirmed stop.
@@ -1848,10 +1854,10 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	inst.Unverified = false
 	inst.mu.Unlock()
 
-	// An earlier pause's deferral resolves with this confirmed stop. After
-	// the record fields above, so the guard against the live artifact sees
-	// the image this pause just wrote.
-	if stopConfirmed {
+	// An earlier pause's deferral resolves with this proven rest. After the
+	// record fields above, so the guard against the live artifact sees the
+	// image this pause just wrote.
+	if atRest {
 		m.reclaimStrandedOverlay(inst, log)
 	}
 
@@ -1881,12 +1887,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// Firecracker keeps writing the overlay, and the recorded StatusPaused
 	// would satisfy the rehash's at-rest proof while the bytes are live. A
 	// later retry pause backs the artifacts up once the unit is truly dead.
-	// stopConfirmed alone is the RPC's notion of a finished stop, which
-	// deliberately includes a still-deactivating unit; hashing needs the
-	// stronger fully-down claim, so the gate reconfirms with the same
-	// probe the at-rest proof uses — on a detached probe ctx, since the
-	// caller's may be spent (the stop above detached for exactly that).
-	if stopConfirmed && m.vmConfirmedAtRest(probeCtx(), vmID) {
+	// Gated on the fully-down claim probed above, not on stopConfirmed alone.
+	if atRest {
 		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, pauseToken, log)
 	} else if m.backupEnqueue != nil {
 		log.Warn().Msg("pause backup deferred: unit not confirmed fully down, bytes may still be changing")
