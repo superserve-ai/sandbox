@@ -49,7 +49,7 @@ var base = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 func TestWallClockWithinToleranceIsUntouched(t *testing.T) {
 	src := &fakeSource{host: base.Add(200 * time.Millisecond)}
 	c := clockUnder(src, base)
-	st, ready := c.sync()
+	st, ready := c.sync(false)
 	if !ready {
 		t.Fatal("want ready")
 	}
@@ -67,7 +67,7 @@ func TestWallClockFrozenRestoreIsCorrected(t *testing.T) {
 	stale := 10 * 24 * time.Hour
 	src := &fakeSource{host: base.Add(stale)}
 	c := clockUnder(src, base)
-	st, ready := c.sync()
+	st, ready := c.sync(true)
 	if !ready {
 		t.Fatalf("want ready after correction; status %+v", st)
 	}
@@ -79,13 +79,13 @@ func TestWallClockFrozenRestoreIsCorrected(t *testing.T) {
 	}
 }
 
-// No trusted source is not fatal: only a guest proven at build time to have one
-// is ever marked, so a runtime failure is an anomaly to surface, not a reason
-// to strand the sandbox unready.
+// No trusted source on a guest that was not frozen — a fresh boot, or a legacy
+// restore where kvm-clock moved the clock — has nothing to fix and is ready.
+// The frozen case is TestWallClockMustCorrectWithoutSourceIsNotReady.
 func TestWallClockUnavailableSourceDegradesToReady(t *testing.T) {
 	src := &fakeSource{hostErr: errors.New("open /dev/ptp0: no such file")}
 	c := clockUnder(src, base)
-	st, ready := c.sync()
+	st, ready := c.sync(false)
 	if !ready {
 		t.Fatal("unavailable source must not block readiness")
 	}
@@ -100,7 +100,7 @@ func TestWallClockFailedCorrectionIsNotReady(t *testing.T) {
 	t.Run("set_errors", func(t *testing.T) {
 		src := &fakeSource{host: base.Add(time.Hour), setErr: errors.New("EPERM")}
 		c := clockUnder(src, base)
-		st, ready := c.sync()
+		st, ready := c.sync(true)
 		if ready {
 			t.Fatal("a failed correction must not report ready")
 		}
@@ -111,7 +111,7 @@ func TestWallClockFailedCorrectionIsNotReady(t *testing.T) {
 	t.Run("set_silently_ignored", func(t *testing.T) {
 		src := &fakeSource{host: base.Add(time.Hour), ineffective: true}
 		c := clockUnder(src, base)
-		_, ready := c.sync()
+		_, ready := c.sync(true)
 		if ready {
 			t.Fatal("a set that moved nothing must be caught by the re-read, not trusted")
 		}
@@ -122,12 +122,37 @@ func TestWallClockFailedCorrectionIsNotReady(t *testing.T) {
 func TestWallClockToleranceBoundary(t *testing.T) {
 	src := &fakeSource{host: base.Add(wallClockTolerance)}
 	c := clockUnder(src, base)
-	if _, ready := c.sync(); !ready || src.setTo != nil {
+	if _, ready := c.sync(false); !ready || src.setTo != nil {
 		t.Errorf("at exactly the tolerance: ready=%v stepped=%v, want ready and untouched", ready, src.setTo != nil)
 	}
 	src2 := &fakeSource{host: base.Add(wallClockTolerance + time.Millisecond)}
 	c2 := clockUnder(src2, base)
-	if _, ready := c2.sync(); !ready || src2.setTo == nil {
+	if _, ready := c2.sync(false); !ready || src2.setTo == nil {
 		t.Errorf("just past the tolerance: ready=%v stepped=%v, want ready and stepped", ready, src2.setTo != nil)
+	}
+}
+
+// A frozen-clock restore with no host time must not report ready: there is no
+// legacy to fall back to, the clock is simply stale.
+func TestWallClockMustCorrectWithoutSourceIsNotReady(t *testing.T) {
+	src := &fakeSource{hostErr: errors.New("open /dev/ptp0: no such file")}
+	c := clockUnder(src, base)
+	if _, ready := c.sync(true); ready {
+		t.Fatal("must-correct with no source reported ready")
+	}
+	// Same guest, but not a frozen restore: nothing to fix, ready as-is.
+	if _, ready := c.sync(false); !ready {
+		t.Fatal("fresh boot with no source must be ready")
+	}
+}
+
+func TestVerifySetProvesPermission(t *testing.T) {
+	ok := &fakeSource{host: base}
+	if err := clockUnder(ok, base).verifySet(); err != nil {
+		t.Errorf("verifySet: %v", err)
+	}
+	denied := &fakeSource{host: base, setErr: errors.New("EPERM")}
+	if err := clockUnder(denied, base).verifySet(); err == nil {
+		t.Error("verifySet must surface a refused set")
 	}
 }

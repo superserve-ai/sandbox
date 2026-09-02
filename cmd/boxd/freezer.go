@@ -27,11 +27,18 @@ const cgroupFreezerDir = "/sys/fs/cgroup/freezer/workload"
 // uninterruptible I/O cannot be frozen until it returns.
 const defaultFreezeBudget = 2 * time.Second
 
+// placementWait bounds the wait for a spawned process to appear in the cgroup.
+var placementWait = 50 * time.Millisecond
+
+// errThawUnconfirmed: a thaw was attempted and could not be confirmed.
+var errThawUnconfirmed = errors.New("thaw not confirmed")
+
 // freezerFS is the cgroup as files, so sequencing is testable against a fake.
 type freezerFS interface {
 	readState() (string, error)
 	writeState(string) error
-	addProc(pid int) error
+	// procCgroup returns the freezer cgroup path of a live process, e.g. "/workload".
+	procCgroup(pid int) (string, error)
 }
 
 type cgroupFS struct{ dir string }
@@ -45,22 +52,33 @@ func (c cgroupFS) writeState(s string) error {
 	return os.WriteFile(filepath.Join(c.dir, "freezer.state"), []byte(s), 0)
 }
 
-func (c cgroupFS) addProc(pid int) error {
-	return os.WriteFile(filepath.Join(c.dir, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0)
+func (c cgroupFS) procCgroup(pid int) (string, error) {
+	b, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cgroup"))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		// hierarchy-ID:controllers:path
+		if i := strings.Index(line, ":freezer:"); i >= 0 {
+			return line[i+len(":freezer:"):], nil
+		}
+	}
+	return "", errors.New("no freezer hierarchy")
 }
 
 type freezer struct {
-	fs freezerFS
-	// mu: spawns hold it shared from Start() until placement; a freeze holds
-	// it exclusively, so it cannot run in that gap and miss a child.
+	fs  freezerFS
+	dir string
+	// mu: spawns hold it shared from Start() until placement is confirmed; a
+	// freeze holds it exclusively, so it cannot run in that gap.
 	mu sync.RWMutex
-	// unplaced: live pids that could not be put in the cgroup. A freeze is
-	// refused while any exist, since they would keep running.
+	// unplaced: live pids not confirmed in the cgroup. A freeze is refused
+	// while any exist, since they would keep running.
 	unplaced sync.Map
 	warned   sync.Once
 }
 
-func newFreezer(fs freezerFS) *freezer { return &freezer{fs: fs} }
+func newFreezer(fs freezerFS, dir string) *freezer { return &freezer{fs: fs, dir: dir} }
 
 // A nil *freezer means none is configured: no-ops, and a freeze is refused.
 
@@ -76,24 +94,94 @@ func (f *freezer) spawnUnlock() {
 	}
 }
 
+// mounted: absent (degrade) versus present but unreadable (error).
+func (f *freezer) mounted() (bool, error) {
+	if f == nil {
+		return false, nil
+	}
+	_, err := f.fs.readState()
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 func (f *freezer) available() bool {
+	ok, _ := f.mounted()
+	return ok
+}
+
+// wrap makes the command join the cgroup before exec, so descendants inherit
+// it. Passthrough without a cgroup.
+func (f *freezer) wrap(name string, args []string) (string, []string) {
+	if !f.available() {
+		return name, args
+	}
+	// $0 is the command, "$@" its arguments; the shell's pid becomes the
+	// command's pid on exec. A failed write is left to confirmPlaced to catch.
+	script := "echo $$ > " + filepath.Join(f.dir, "cgroup.procs") + " 2>/dev/null; exec \"$0\" \"$@\""
+	return "/bin/sh", append([]string{"-c", script, name}, args...)
+}
+
+// confirmPlaced waits for a just-started process to appear in the cgroup.
+// Called with the spawn lock held shared.
+func (f *freezer) confirmPlaced(pid int) {
+	if f == nil || !f.available() {
+		return
+	}
+	want := "/" + filepath.Base(f.dir)
+	deadline := time.Now().Add(placementWait)
+	var last string
+	var lastErr error
+	for {
+		last, lastErr = f.fs.procCgroup(pid)
+		if lastErr == nil && last == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	f.unplaced.Store(pid, struct{}{})
+	f.warned.Do(func() {
+		log.Printf("freezer: pid %d not in %s (in %q, err %v); freezes refused while it runs", pid, want, last, lastErr)
+	})
+}
+
+// isFrozen: a frozen workload on wake means a frozen-clock restore, so the
+// clock must be corrected before anything runs.
+func (f *freezer) isFrozen() bool {
 	if f == nil {
 		return false
 	}
-	_, err := f.fs.readState()
-	return err == nil
+	st, err := f.fs.readState()
+	return err == nil && st != "THAWED"
 }
 
-// place puts a just-started process in the workload cgroup.
-func (f *freezer) place(pid int) {
-	if f == nil {
-		return
-	}
-	if err := f.fs.addProc(pid); err != nil {
-		f.unplaced.Store(pid, struct{}{})
-		f.warned.Do(func() {
-			log.Printf("freezer: could not place pid %d in %s; freezes will be refused while it runs: %v", pid, cgroupFreezerDir, err)
-		})
+// wakeLoop corrects the clock and thaws a frozen workload without depending
+// on /health being polled.
+func (f *freezer) wakeLoop(ctx context.Context, clock *wallClock, tick time.Duration) {
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if !f.isFrozen() {
+			continue
+		}
+		if _, ready := clock.sync(true); ready {
+			if err := f.thaw(); err != nil {
+				log.Printf("freezer: thaw after clock correction failed: %v", err)
+			}
+		}
 	}
 }
 
@@ -103,9 +191,8 @@ func (f *freezer) exited(pid int) {
 	}
 }
 
-// freeze stops the cgroup and waits until the kernel reports every task
-// stopped. On timeout it thaws what it started and fails, so a caller never
-// snapshots a half-frozen workload.
+// freeze stops the cgroup and waits for every task to stop. On timeout it
+// thaws; an unconfirmed thaw wraps errThawUnconfirmed.
 func (f *freezer) freeze(ctx context.Context) error {
 	if f == nil {
 		return errors.New("no freezer configured")
@@ -113,7 +200,9 @@ func (f *freezer) freeze(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if !f.available() {
+	if ok, err := f.mounted(); err != nil {
+		return fmt.Errorf("freezer cgroup: %w", err)
+	} else if !ok {
 		return errors.New("freezer cgroup unavailable")
 	}
 	var stragglers []string
@@ -133,39 +222,66 @@ func (f *freezer) freeze(ctx context.Context) error {
 	for {
 		st, err := f.fs.readState()
 		if err != nil {
-			_ = f.fs.writeState("THAWED")
-			return fmt.Errorf("read freezer state: %w", err)
+			return f.undo(fmt.Errorf("read freezer state: %w", err))
 		}
 		if st == "FROZEN" {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
-			_ = f.fs.writeState("THAWED")
-			return fmt.Errorf("workload did not freeze within budget (state %q): %w", st, ctx.Err())
+			return f.undo(fmt.Errorf("workload did not freeze within budget (state %q): %w", st, ctx.Err()))
 		case <-time.After(interval):
 		}
 		interval = min(interval*2, 10*time.Millisecond)
 	}
 }
 
-// thaw lets the workload run. Idempotent; a no-op without a cgroup.
+// undo thaws after a failed freeze and folds an unconfirmed thaw into the error.
+func (f *freezer) undo(cause error) error {
+	if terr := f.thawLocked(); terr != nil {
+		return fmt.Errorf("%w; %w: %v", cause, errThawUnconfirmed, terr)
+	}
+	return cause
+}
+
+// thaw lets the workload run and confirms it did. A no-op without a cgroup.
 func (f *freezer) thaw() error {
-	if !f.available() {
+	if f == nil {
 		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.thawLocked()
+}
+
+func (f *freezer) thawLocked() error {
+	ok, err := f.mounted()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if st, err := f.fs.readState(); err != nil {
+		return err
+	} else if st == "THAWED" {
+		return nil
+	}
+	if err := f.fs.writeState("THAWED"); err != nil {
+		return err
 	}
 	st, err := f.fs.readState()
 	if err != nil {
 		return err
 	}
-	if st == "THAWED" {
-		return nil
+	if st != "THAWED" {
+		return fmt.Errorf("state %q after thaw", st)
 	}
-	return f.fs.writeState("THAWED")
+	return nil
 }
 
 // POST /freeze {"budget_ms": N}: 200 frozen; 503 cannot freeze; 504 budget
-// exhausted (already thawed again).
+// exhausted and thawed again; 500 budget exhausted and thaw unconfirmed.
 func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -187,7 +303,10 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 
 	if err := f.freeze(ctx); err != nil {
 		code := http.StatusServiceUnavailable
-		if errors.Is(err, context.DeadlineExceeded) {
+		switch {
+		case errors.Is(err, errThawUnconfirmed):
+			code = http.StatusInternalServerError
+		case errors.Is(err, context.DeadlineExceeded):
 			code = http.StatusGatewayTimeout
 		}
 		log.Printf("freezer: freeze refused: %v", err)
@@ -197,7 +316,7 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// POST /thaw: undo a freeze whose snapshot did not happen.
+// POST /thaw: 200 only once the workload is confirmed running.
 func (f *freezer) handleThaw(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")

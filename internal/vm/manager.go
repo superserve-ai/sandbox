@@ -328,6 +328,10 @@ type ManagerConfig struct {
 	// rather than hanging silently. Independent of the snapshot flags. Default false.
 	HandlerDeathAbortEnabled bool
 
+	// GuestFreezeBudget bounds the pause-side wait for a guest to stop its
+	// workload before a frozen-clock snapshot. Zero means the default.
+	GuestFreezeBudget time.Duration
+
 	// GuestClockFreezeEnabled lets a restore ask Firecracker to freeze the guest's
 	// monotonic clock across the snapshot instead of advancing it by the time the
 	// snapshot sat unused. Only takes effect for a snapshot whose guest can correct
@@ -676,6 +680,9 @@ type Manager struct {
 	// older Firecracker under a running daemon, and the first restore it refuses
 	// clears this for good.
 	clockRealtimeCapable atomic.Bool
+	// guestClockUnready latches this host to unfrozen restores after a guest
+	// reported it could not correct its clock. See noteGuestClockUnready.
+	guestClockUnready atomic.Bool
 }
 
 // trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
@@ -1444,11 +1451,15 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// burns seconds and then fails must land in the pause distributions —
 	// those are among the slowest pauses. The already-paused retry guard
 	// (before tSnapshot) still deliberately emits nothing.
+	var freezeDur time.Duration
 	defer func() {
 		if tSnapshot.IsZero() {
 			return
 		}
 		phases := map[string]time.Duration{"total": time.Since(tPause)}
+		if freezeDur > 0 {
+			phases["freeze"] = freezeDur
+		}
 		if snapshotDur > 0 {
 			phases["snapshot"] = snapshotDur
 		} else {
@@ -1572,13 +1583,20 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		correctsWallClock = guestCorrectsWallClock(instMemFile, instBaseMem)
 	}
 
-	// Freeze the workload before the image exists, or it wakes on the stale
-	// clock. A freeze that cannot complete demotes this pause to an unfrozen
-	// image; the guest has already thawed itself.
+	// Freeze the workload before the image exists — only when the restore would
+	// freeze the clock; otherwise the freeze buys nothing.
 	guestFrozen := false
-	if correctsWallClock {
-		correctsWallClock, guestFrozen = m.freezeGuestForPause(ctx, instIP, log)
+	if correctsWallClock && m.cfg.GuestClockFreezeEnabled && m.clockRealtimeCapable.Load() && !m.guestClockUnready.Load() {
+		tFreeze := time.Now()
+		var ferr error
+		guestFrozen, ferr = m.freezeGuestForPause(ctx, instIP, log)
+		freezeDur = time.Since(tFreeze)
+		if ferr != nil {
+			return "", "", nil, m.handleVMError(vmID, ferr)
+		}
 	}
+	// The marker means "frozen image": an unfrozen one restores the unfrozen way.
+	correctsWallClock = guestFrozen
 	snapshotOK := false
 	if guestFrozen {
 		// A failed snapshot leaves the VM running; do not leave it frozen.
@@ -1812,6 +1830,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	log.Info().
 		Str("snapshot_type", snapshotType).
 		Bool("guest_frozen", guestFrozen).
+		Int64("freeze_ms", freezeDur.Milliseconds()).
 		Int64("snapshot_ms", snapshotDur.Milliseconds()).
 		Int64("stop_ms", stopDur.Milliseconds()).
 		Int64("pause_ms", time.Since(tPause).Milliseconds()).
@@ -2306,6 +2325,9 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := probe(probeCtx, vmIP, 30*time.Second); err != nil {
+			if errors.Is(err, ErrGuestClockUnready) {
+				m.noteGuestClockUnready(log, err)
+			}
 			log.Warn().Err(err).
 				Int64("wait_boxd_ms", time.Since(probeStart).Milliseconds()).
 				Msg("boxd not reachable after resume")
@@ -3411,6 +3433,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	err := m.waitForBoxd(ctx, hostIP, readiness)
 	stopDiag()
 	if err != nil {
+		if errors.Is(err, ErrGuestClockUnready) {
+			m.noteGuestClockUnready(log, err)
+		}
 		// Emit the exhausted readiness wait immediately, before teardown, so
 		// the sample measures the probe (not unit stop + resource release +
 		// persist join) and the concurrent-destroy return below can't skip it.

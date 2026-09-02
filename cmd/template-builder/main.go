@@ -585,7 +585,8 @@ func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, d
 // boxdWallClockProven reports whether the guest can read host time, and why
 // not. Any failure to ask reads as not proven.
 func boxdWallClockProven(ctx context.Context, vmIP string) (bool, string) {
-	url := fmt.Sprintf("http://%s:%d/health", vmIP, boxdPort)
+	// verify=settime: prove the clock can be set, not just read.
+	url := fmt.Sprintf("http://%s:%d/health?verify=settime", vmIP, boxdPort)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false, err.Error()
@@ -597,8 +598,9 @@ func boxdWallClockProven(ctx context.Context, vmIP string) (bool, string) {
 	defer resp.Body.Close()
 	var body struct {
 		WallClock struct {
-			Source string `json:"source"`
-			Error  string `json:"error"`
+			Source    string `json:"source"`
+			SettimeOK bool   `json:"settime_ok"`
+			Error     string `json:"error"`
 		} `json:"wall_clock"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
@@ -612,6 +614,12 @@ func boxdWallClockProven(ctx context.Context, vmIP string) (bool, string) {
 			return false, body.WallClock.Error
 		}
 		return false, "source " + body.WallClock.Source
+	}
+	if !body.WallClock.SettimeOK {
+		if body.WallClock.Error != "" {
+			return false, body.WallClock.Error
+		}
+		return false, "clock cannot be set"
 	}
 	return true, ""
 }

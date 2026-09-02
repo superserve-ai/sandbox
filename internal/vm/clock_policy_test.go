@@ -379,31 +379,45 @@ func TestWallClockMarkerPathMatchesInternal(t *testing.T) {
 	}
 }
 
-// A freeze the guest could not complete must demote the pause to an unfrozen
-// image — never leave a marked image whose workload was running on the stale
-// clock — and must be bounded, since it sits on the pause path.
+// A freeze that did not confirm is ambiguous, so the guest is thawed and that
+// thaw must confirm before the pause continues unfrozen. Bounded, since it sits
+// on the pause path.
 func TestFreezeGuestForPause(t *testing.T) {
-	orig := boxdFreezeGuest
-	t.Cleanup(func() { boxdFreezeGuest = orig })
+	origF, origT := boxdFreezeGuest, boxdThawGuest
+	t.Cleanup(func() { boxdFreezeGuest, boxdThawGuest = origF, origT })
 	m := &Manager{log: zerolog.Nop()}
 
-	t.Run("frozen_keeps_the_marker", func(t *testing.T) {
+	t.Run("frozen", func(t *testing.T) {
 		boxdFreezeGuest = func(context.Context, string) error { return nil }
-		corrects, frozen := m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
-		if !corrects || !frozen {
-			t.Fatalf("got corrects=%v frozen=%v, want both true", corrects, frozen)
+		thawed := false
+		boxdThawGuest = func(context.Context, string) error { thawed = true; return nil }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
+		if err != nil || !frozen || thawed {
+			t.Fatalf("frozen=%v err=%v thawed=%v; want frozen, no error, no thaw", frozen, err, thawed)
 		}
 	})
 
-	t.Run("refused_demotes_to_unfrozen", func(t *testing.T) {
+	t.Run("refused_then_thaw_confirmed_demotes", func(t *testing.T) {
 		boxdFreezeGuest = func(context.Context, string) error { return errors.New("504: budget") }
-		corrects, frozen := m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
-		if corrects || frozen {
-			t.Fatalf("got corrects=%v frozen=%v, want both false", corrects, frozen)
+		thawed := false
+		boxdThawGuest = func(context.Context, string) error { thawed = true; return nil }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
+		if err != nil || frozen || !thawed {
+			t.Fatalf("frozen=%v err=%v thawed=%v; want unfrozen, no error, thaw issued", frozen, err, thawed)
+		}
+	})
+
+	t.Run("thaw_unconfirmed_aborts_the_pause", func(t *testing.T) {
+		boxdFreezeGuest = func(context.Context, string) error { return errors.New("connection reset") }
+		boxdThawGuest = func(context.Context, string) error { return errors.New("500: thaw not confirmed") }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
+		if err == nil || frozen {
+			t.Fatalf("frozen=%v err=%v; want an error that aborts the pause", frozen, err)
 		}
 	})
 
 	t.Run("call_is_bounded_by_the_budget", func(t *testing.T) {
+		m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{GuestFreezeBudget: 300 * time.Millisecond}}
 		var seen time.Duration
 		boxdFreezeGuest = func(ctx context.Context, _ string) error {
 			dl, ok := ctx.Deadline()
@@ -414,8 +428,22 @@ func TestFreezeGuestForPause(t *testing.T) {
 			return nil
 		}
 		m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
-		if seen <= 0 || seen > guestFreezeBudget {
-			t.Errorf("deadline %v from now, want within (0, %v]", seen, guestFreezeBudget)
+		if seen <= 0 || seen > 300*time.Millisecond {
+			t.Errorf("deadline %v from now, want within (0, 300ms]", seen)
 		}
 	})
+}
+
+// A host whose guests cannot correct their clocks must stop asking for frozen
+// restores, so the caller's retry takes the path that does not depend on it.
+func TestGuestClockUnreadyLatchesHostToLegacy(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{GuestClockFreezeEnabled: true}}
+	m.clockRealtimeCapable.Store(true)
+	if m.clockPolicyFor(true) == nil {
+		t.Fatal("precondition: policy should freeze before the latch")
+	}
+	m.noteGuestClockUnready(zerolog.Nop(), errors.New("no ptp"))
+	if m.clockPolicyFor(true) != nil {
+		t.Error("policy still freezes after the host was latched")
+	}
 }

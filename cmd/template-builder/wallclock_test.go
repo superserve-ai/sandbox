@@ -23,8 +23,8 @@ func TestBoxdWallClockProven(t *testing.T) {
 			t.Skipf("port %d busy: %v", boxdPort, err)
 		}
 		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/health" {
-				t.Errorf("unexpected path %s", r.URL.Path)
+			if r.URL.Path != "/health" || r.URL.Query().Get("verify") != "settime" {
+				t.Errorf("unexpected request %s: the build must ask the clock to be proven settable", r.URL.RequestURI())
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -42,8 +42,9 @@ func TestBoxdWallClockProven(t *testing.T) {
 		want   bool
 		reason string // substring expected in the reason when not proven
 	}{
-		{"ptp_readable_is_proven", 200, `{"status":"ok","wall_clock":{"source":"ptp"}}`, true, ""},
-		{"ptp_with_prior_correction_is_proven", 200, `{"status":"ok","wall_clock":{"source":"ptp","corrected_ms":86400000}}`, true, ""},
+		{"ptp_and_settable_is_proven", 200, `{"status":"ok","wall_clock":{"source":"ptp","settime_ok":true}}`, true, ""},
+		{"ptp_with_prior_correction_is_proven", 200, `{"status":"ok","wall_clock":{"source":"ptp","corrected_ms":86400000,"settime_ok":true}}`, true, ""},
+		{"ptp_but_not_settable_is_not", 200, `{"status":"ok","wall_clock":{"source":"ptp","error":"settime: EPERM"}}`, false, "EPERM"},
 		{"unavailable_source_is_not", 200, `{"status":"ok","wall_clock":{"source":"unavailable","error":"open /dev/ptp0: no such file"}}`, false, "ptp0"},
 		{"not_ready_is_not", 503, `{"status":"clock","wall_clock":{"source":"ptp","error":"set: EPERM"}}`, false, "503"},
 		{"missing_field_is_not", 200, `{"status":"ok"}`, false, "source"},

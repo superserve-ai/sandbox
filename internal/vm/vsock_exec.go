@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,6 +34,14 @@ var boxdHTTPClient = &http.Client{
 // early probes must be dense; the cap keeps the steady-state cost of a slow
 // boot negligible. Probes ride the host↔guest veth, so each costs well
 // under a millisecond.
+// ErrGuestClockUnready: the guest cannot correct its clock or thaw; waiting
+// longer cannot help.
+var ErrGuestClockUnready = errors.New("guest clock could not be corrected")
+
+// clockUnreadyPolls is how many consecutive such answers make it final: the
+// first may be mid-correction.
+const clockUnreadyPolls = 3
+
 func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) error {
 	url := fmt.Sprintf("http://%s:%d/health", vmIP, boxdPort)
 	deadline := time.Now().Add(timeout)
@@ -44,6 +53,7 @@ func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) 
 	const maxProbeInterval = 10 * time.Millisecond
 	interval := time.Millisecond
 	var lastErr error
+	clockUnready := 0
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -52,12 +62,26 @@ func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) 
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		resp, err := client.Do(req)
 		if err == nil {
-			io.Copy(io.Discard, resp.Body)
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return nil
 			}
 			err = fmt.Errorf("unexpected status %d", resp.StatusCode)
+			if resp.StatusCode == http.StatusServiceUnavailable {
+				var reply struct {
+					Status    string `json:"status"`
+					WallClock struct {
+						Error string `json:"error"`
+					} `json:"wall_clock"`
+				}
+				if json.Unmarshal(body, &reply) == nil && (reply.Status == "clock" || reply.Status == "thaw") {
+					clockUnready++
+					if clockUnready >= clockUnreadyPolls {
+						return fmt.Errorf("%w (%s: %s)", ErrGuestClockUnready, reply.Status, reply.WallClock.Error)
+					}
+				}
+			}
 		}
 		lastErr = err
 
@@ -133,25 +157,19 @@ func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, h
 	return nil
 }
 
-// guestFreezeBudget caps how long a pause waits for the guest to freeze its
-// workload; a miss falls back to an unfrozen snapshot rather than stalling.
-const guestFreezeBudget = 2 * time.Second
-
 // postBoxdFreeze asks the guest to stop its workload ahead of a snapshot.
 func postBoxdFreeze(ctx context.Context, vmIP string) error {
 	// The guest's budget is shorter than ours, so it gives up and thaws first.
-	budget := guestFreezeBudget - 200*time.Millisecond
+	var body []byte
 	if dl, ok := ctx.Deadline(); ok {
-		if until := time.Until(dl) - 200*time.Millisecond; until < budget {
-			budget = until
+		budget := time.Until(dl) - 200*time.Millisecond
+		if budget <= 0 {
+			return context.DeadlineExceeded
 		}
+		body, _ = json.Marshal(struct {
+			BudgetMs int64 `json:"budget_ms"`
+		}{budget.Milliseconds()})
 	}
-	if budget <= 0 {
-		return context.DeadlineExceeded
-	}
-	body, _ := json.Marshal(struct {
-		BudgetMs int64 `json:"budget_ms"`
-	}{budget.Milliseconds()})
 	return postBoxd(ctx, vmIP, "/freeze", body)
 }
 

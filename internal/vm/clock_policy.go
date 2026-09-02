@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"time"
 
@@ -152,7 +153,7 @@ func resumeWallClockProperty(memPath, basePath, pausedMemPath string, recorded *
 // It never returns true: advancing the guest clock by elapsed wall time is the
 // behaviour being fixed, so nothing here should be able to ask for it.
 func (m *Manager) clockPolicyFor(correctsWallClock bool) *bool {
-	if !m.cfg.GuestClockFreezeEnabled || !correctsWallClock || !m.clockRealtimeCapable.Load() {
+	if !m.cfg.GuestClockFreezeEnabled || !correctsWallClock || !m.clockRealtimeCapable.Load() || m.guestClockUnready.Load() {
 		return nil
 	}
 	freeze := false
@@ -183,14 +184,36 @@ func (m *Manager) restoreWithClockFallback(policy *bool, restore func(clockRealt
 	return false, restore(nil)
 }
 
-// freezeGuestForPause freezes the workload ahead of a snapshot and reports
-// whether the image may still be marked. A miss demotes it to unfrozen.
-func (m *Manager) freezeGuestForPause(ctx context.Context, ip string, log zerolog.Logger) (corrects, frozen bool) {
-	fctx, cancel := context.WithTimeout(ctx, guestFreezeBudget)
-	defer cancel()
-	if err := boxdFreezeGuest(fctx, ip); err != nil {
-		log.Warn().Err(err).Msg("pause: guest workload not frozen; this image will wake the slower way")
-		return false, false
+// defaultGuestFreezeBudget bounds the pause-side wait for the guest to stop
+// its workload. Only ever paid when the restore would freeze the clock.
+const defaultGuestFreezeBudget = 500 * time.Millisecond
+
+// freezeGuestForPause freezes the workload ahead of a snapshot. A failed freeze
+// is ambiguous, so the guest is thawed and that must confirm, else the pause aborts.
+func (m *Manager) freezeGuestForPause(ctx context.Context, ip string, log zerolog.Logger) (frozen bool, err error) {
+	budget := m.cfg.GuestFreezeBudget
+	if budget <= 0 {
+		budget = defaultGuestFreezeBudget
 	}
-	return true, true
+	fctx, cancel := context.WithTimeout(ctx, budget)
+	ferr := boxdFreezeGuest(fctx, ip)
+	cancel()
+	if ferr == nil {
+		return true, nil
+	}
+	tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer tcancel()
+	if terr := boxdThawGuest(tctx, ip); terr != nil {
+		return false, fmt.Errorf("guest workload state unknown after failed freeze (%v); thaw not confirmed: %w", ferr, terr)
+	}
+	log.Warn().Err(ferr).Msg("pause: guest workload not frozen; this image will wake the slower way")
+	return false, nil
+}
+
+// noteGuestClockUnready latches this host to unfrozen restores: host time is a
+// host property, so the caller's retry takes the path that does not need it.
+func (m *Manager) noteGuestClockUnready(log zerolog.Logger, cause error) {
+	if m.guestClockUnready.CompareAndSwap(false, true) {
+		log.Error().Err(cause).Msg("guest could not correct its clock; this host will restore with the clock unfrozen until vmd restarts")
+	}
 }

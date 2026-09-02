@@ -366,6 +366,8 @@ mount -t tmpfs cgroup_root /sys/fs/cgroup 2>/dev/null
 mkdir -p /sys/fs/cgroup/freezer
 mount -t cgroup -o freezer freezer /sys/fs/cgroup/freezer 2>/dev/null
 mkdir -p /sys/fs/cgroup/freezer/workload
+# A process joins the cgroup itself, as whatever user it runs as.
+chmod 666 /sys/fs/cgroup/freezer/workload/cgroup.procs /sys/fs/cgroup/freezer/workload/tasks 2>/dev/null
 
 # Seed the kernel entropy pool. Firecracker VMs lack virtio-rng and
 # RDRAND, so getrandom() blocks until entropy is credited. The
