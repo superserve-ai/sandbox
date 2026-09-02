@@ -1514,15 +1514,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		if !fileExists(snapshotPath) || !fileExists(memPath) {
 			return "", "", nil, status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
 		}
-		// Rest is probed before the re-record below, so an overlay the
-		// original pause deferred is reclaimed and the cleared deferral
-		// lands in that same write.
 		atRest := m.vmConfirmedAtRest(ctx, vmID)
-		if atRest {
-			// Rest is now proven: the earlier unconfirmed stop resolved.
-			m.vmStopUnconfirmed.Delete(vmID)
-			m.reclaimStrandedOverlays(inst, log)
-		}
 		// The paused status may only exist in memory: the original pause sets it
 		// before persisting, so a failed write leaves the durable record reading
 		// Running behind a stopped unit — which the next reattach cleans up as
@@ -1542,6 +1534,11 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		// backs up only once the unit is confirmed dead.
 		var manifest []ManifestEntry
 		if atRest {
+			// Rest is now proven: the earlier unconfirmed stop resolved. Any
+			// overlay the original pause deferred is reclaimed only now,
+			// after the re-record above made the replacement image durable.
+			m.vmStopUnconfirmed.Delete(vmID)
+			m.reclaimStrandedOverlays(inst, log)
 			manifest = m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, pauseToken, log)
 		} else {
 			log.Warn().Msg("pause backup skipped on retry: unit not confirmed dead")
@@ -1808,38 +1805,27 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		m.vmStopUnconfirmed.Delete(vmID)
 	}
 
-	// Reclaim an overlay a layered→Full fallback stranded. Only after a
-	// confirmed stop: until the FC process is dead its UFFD handler still
-	// serves guest pages from this file. An unconfirmed stop instead records
-	// the path on the instance, so the first later step that proves the VM
-	// at rest (a retried pause, the reconciler, a resume) reclaims it rather
-	// than leaking a guest-sized file for the sandbox's lifetime.
-	// stopConfirmed is the RPC's notion of a finished stop, which deliberately
-	// includes a still-deactivating unit. Unlinking an overlay the process may
-	// still serve pages from, and backing up bytes that may still change, both
-	// need the stronger fully-down claim — one probe, on a detached ctx since
-	// the caller's may be spent, answers for both.
+	// An overlay a layered→Full fallback stranded is never removed here, only
+	// recorded as a deferral: the durable record still names it as the live
+	// image until the paused record below lands, and a crash between an
+	// early unlink and that write would leave a Running record pointing at
+	// nothing. The reclaim runs after the write, and only once the VM is
+	// proven at rest — stopConfirmed is the RPC's notion of a finished stop,
+	// which deliberately includes a still-deactivating unit whose UFFD
+	// handler may still serve pages from the file. The same fully-down probe
+	// gates the backup below, on a detached ctx since the caller's may be
+	// spent.
 	atRest := stopConfirmed && m.vmConfirmedAtRest(probeCtx(), vmID)
-	stranded := ""
 	if orphanedOverlay != "" {
-		if !atRest {
-			stranded = orphanedOverlay
-			log.Warn().Str("path", orphanedOverlay).
-				Msg("pause: stranded overlay deferred (VM not yet at rest); reclaimed once it is")
-		} else if err := removeOverlayArtifacts(orphanedOverlay); err != nil {
-			// A transient failure must not become a permanent leak: defer
-			// it exactly like an unconfirmed stop.
-			stranded = orphanedOverlay
-			log.Warn().Err(err).Str("path", orphanedOverlay).
-				Msg("pause: stranded overlay removal failed; deferred for a later attempt")
-		}
+		log.Warn().Str("path", orphanedOverlay).Bool("at_rest", atRest).
+			Msg("pause: overlay stranded by the Full fallback; reclaimed once the paused record is durable and the VM is at rest")
 	}
 
 	inst.mu.Lock()
-	if stranded != "" && !hasStrandedOverlay(inst, stranded) {
+	if orphanedOverlay != "" && !hasStrandedOverlay(inst, orphanedOverlay) {
 		// Appended, never replaced: an earlier deferral this run's resume
 		// displaced is still owed its reclaim.
-		inst.StrandedOverlays = append(inst.StrandedOverlays, stranded)
+		inst.StrandedOverlays = append(inst.StrandedOverlays, orphanedOverlay)
 	}
 	inst.Status = StatusPaused
 	inst.SnapshotPath = snapshotPath
@@ -1856,13 +1842,6 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	inst.Unverified = false
 	inst.mu.Unlock()
 
-	// An earlier pause's deferral resolves with this proven rest. After the
-	// record fields above, so the guard against the live artifact sees the
-	// image this pause just wrote.
-	if atRest {
-		m.reclaimStrandedOverlays(inst, log)
-	}
-
 	// If-present, not Put: DestroyVM takes no vm-op lock (by design), and
 	// the detached stop widened the window where a destroy can land
 	// mid-pause — a plain Put would resurrect the deleted record.
@@ -1875,6 +1854,13 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	case !wrote:
 		log.Warn().Msg("record deleted during pause stop — destroy owns the teardown")
 		return "", "", nil, status.Errorf(codes.NotFound, "vm %s destroyed during pause", vmID)
+	}
+
+	// Every deferral — this pause's and any earlier one — resolves now that
+	// the record naming the replacement image is durable, if the VM is at
+	// rest. The guard against the live artifact sees the image just written.
+	if atRest {
+		m.reclaimStrandedOverlays(inst, log)
 	}
 
 	// Hash the durable artifacts once the unit is stopped and the files are

@@ -221,6 +221,51 @@ func TestPauseVM_MismatchFallsBackToFullAndKeepsOverlayUntilStop(t *testing.T) {
 	}
 }
 
+// The overlay a Full fallback strands is the image the durable record still
+// names until the paused record lands; unlinking it first would leave a
+// Running record pointing at nothing after a crash. The reclaim must sit
+// after the persist in PauseVM, and nothing else in that function may remove
+// overlay artifacts.
+func TestPauseVM_ReclaimsStrandedOverlayOnlyAfterThePausedRecordPersists(t *testing.T) {
+	src, err := os.ReadFile("manager.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn := string(src)
+	start := strings.Index(fn, "func (m *Manager) PauseVM(")
+	if start < 0 {
+		t.Fatal("PauseVM not found")
+	}
+	end := strings.Index(fn[start:], "\nfunc ")
+	if end < 0 {
+		t.Fatal("could not bound PauseVM")
+	}
+	body := fn[start : start+end]
+	// Both the retried-pause branch and the main path reclaim; each reclaim
+	// must be preceded by its own persist of the record naming the
+	// replacement image.
+	const persistCall, reclaimCall = "m.persistStateIfPresent(inst)", "m.reclaimStrandedOverlays(inst, log)"
+	reclaims := 0
+	for rest, off := body, 0; ; {
+		i := strings.Index(rest, reclaimCall)
+		if i < 0 {
+			break
+		}
+		reclaims++
+		if strings.Count(body[:off+i], persistCall) < reclaims {
+			t.Fatalf("reclaim #%d in PauseVM is not preceded by its own persist of the paused record", reclaims)
+		}
+		off += i + len(reclaimCall)
+		rest = body[off:]
+	}
+	if reclaims < 2 {
+		t.Fatalf("expected the retry branch and the main path to each reclaim, found %d", reclaims)
+	}
+	if strings.Contains(body, "removeOverlayArtifacts(") {
+		t.Fatal("PauseVM must not remove overlay artifacts directly; only the post-persist reclaim may")
+	}
+}
+
 // A second deferral before the first resolves is appended, never replaces
 // it: both guest-sized files stay owed to the reclaim paths.
 func TestPauseVM_SecondDeferralKeepsTheFirst(t *testing.T) {
