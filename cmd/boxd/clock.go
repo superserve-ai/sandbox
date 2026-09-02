@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -81,6 +82,24 @@ func (c *wallClock) sync(mustCorrect bool) (status wallClockStatus, ready bool) 
 	status.CorrectedMs = delta.Milliseconds()
 	log.Printf("wall clock: corrected by %v from host time", delta)
 	return status, true
+}
+
+// status reports the clock without touching it.
+func (c *wallClock) status() wallClockStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	host, err := c.src.hostTime()
+	if err != nil {
+		return wallClockStatus{Source: "unavailable", Error: err.Error()}
+	}
+	return wallClockStatus{Source: "ptp", CorrectedMs: 0, Error: offTolerance(host.Sub(c.now()))}
+}
+
+func offTolerance(delta time.Duration) string {
+	if delta.Abs() <= wallClockTolerance {
+		return ""
+	}
+	return fmt.Sprintf("%v off host", delta)
 }
 
 // verifySet proves the guest may set its clock, by setting it to itself. Used

@@ -134,10 +134,10 @@ func main() {
 	mux.HandleFunc("/files", handleFiles)
 	mux.HandleFunc("/init", handleInit(ctx))
 	clock := newWallClock(newWallClockSource())
-	go fz.wakeLoop(context.Background(), clock, 250*time.Millisecond)
 	mux.HandleFunc("/health", handleHealth(clock, fz))
 	mux.HandleFunc("/freeze", fz.handleFreeze)
 	mux.HandleFunc("/thaw", fz.handleThaw)
+	mux.HandleFunc("/wake", handleWake(clock, fz))
 	mux.HandleFunc("/exec", procService.handleExec)
 	mux.HandleFunc("/exec/stream", procService.handleExecStream)
 
@@ -158,33 +158,23 @@ func main() {
 
 // handleHealth is what the supervisor polls for readiness, so it is where the
 // wall clock is corrected and the workload thawed once the clock is right.
-// A frozen workload means a frozen-clock restore, so an uncorrectable clock is
-// not ready. ?verify=settime proves the clock can be set. Ready requires thawed.
+// /health reports and never releases the workload: only /wake does that, and
+// only the supervisor sends it. ?verify=settime proves the clock can be set.
 func handleHealth(clock *wallClock, fz *freezer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		wc, ready := clock.sync(fz.isFrozen())
-		w.Header().Set("Content-Type", "application/json")
-		status := "ok"
-		if ready && q.Get("verify") == "settime" {
+		wc := clock.status()
+		if r.URL.Query().Get("verify") == "settime" {
 			if err := clock.verifySet(); err != nil {
 				wc.Error = "settime: " + err.Error()
 			} else {
 				wc.SettimeOK = true
 			}
 		}
-		if ready {
-			if err := fz.thaw(); err != nil {
-				log.Printf("freezer: thaw on ready failed: %v", err)
-				ready, status = false, "thaw"
-				wc.Error = "thaw: " + err.Error()
-			}
-		} else {
-			status = "clock"
+		status := "ok"
+		if fz.isFrozen() {
+			status = "frozen"
 		}
-		if !ready {
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(struct {
 			Status    string          `json:"status"`
 			WallClock wallClockStatus `json:"wall_clock"`
@@ -538,18 +528,15 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 
 	s.freezer.spawnLock()
 	tty, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: cols, Rows: rows})
+	s.freezer.spawnUnlock()
 	if err != nil {
-		s.freezer.spawnUnlock()
 		return connect.NewError(connect.CodeInternal, fmt.Errorf("start pty: %w", err))
 	}
-	s.freezer.confirmPlaced(cmd.Process.Pid)
-	s.freezer.spawnUnlock()
 	defer tty.Close()
 
 	pid := uint32(cmd.Process.Pid)
 	s.processes.Store(pid, &runningProcess{cmd: cmd, tty: tty})
 	defer s.processes.Delete(pid)
-	defer s.freezer.exited(cmd.Process.Pid)
 
 	// Send start event.
 	if err := emit(&pb.ProcessEvent{
@@ -619,17 +606,15 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eve
 
 	// Spawn lock held across Start() and placement so a freeze cannot miss the child.
 	s.freezer.spawnLock()
-	if err := cmd.Start(); err != nil {
-		s.freezer.spawnUnlock()
+	err = cmd.Start()
+	s.freezer.spawnUnlock()
+	if err != nil {
 		return connect.NewError(connect.CodeInternal, err)
 	}
-	s.freezer.confirmPlaced(cmd.Process.Pid)
-	s.freezer.spawnUnlock()
 
 	pid := uint32(cmd.Process.Pid)
 	s.processes.Store(pid, &runningProcess{cmd: cmd, stdin: stdin})
 	defer s.processes.Delete(pid)
-	defer s.freezer.exited(cmd.Process.Pid)
 
 	if err := emit(&pb.ProcessEvent{
 		Event: &pb.ProcessEvent_Start{Start: &pb.StartEvent{Pid: pid}},

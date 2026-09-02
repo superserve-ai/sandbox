@@ -2242,6 +2242,24 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
+	// A frozen-clock restore is not resumed until the guest has corrected its
+	// clock and released its workload. If it cannot, retry this same resume
+	// the unfrozen way — the host is latched, so the recursion takes that path.
+	var frozenWake time.Duration
+	if resumeClockFrozen {
+		tWake := time.Now()
+		werr := boxdWakeGuest(context.WithoutCancel(ctx), netInfo.HostIP, boxdResumeReadyBudget, true)
+		frozenWake = time.Since(tWake)
+		if werr != nil {
+			m.stopUnitDuringRestoreError(vmID)
+			if errors.Is(werr, ErrGuestClockUnready) {
+				m.noteGuestClockUnready(log, werr)
+				return m.resumeVMLocked(ctx, vmID, snapshotPath, memPath, networkRules)
+			}
+			return nil, status.Errorf(codes.Unavailable, "guest did not wake after frozen restore: %v", werr)
+		}
+	}
+
 	inst.mu.RLock()
 	wasUnverified := inst.Unverified
 	inst.mu.RUnlock()
@@ -2319,15 +2337,18 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// exec-503 incidents.
 	probeStart := time.Now()
 	vmIP := inst.IP
-	probe := boxdHealthProbe
+	if resumeClockFrozen {
+		log.Info().Int64("wait_boxd_ms", frozenWake.Milliseconds()).Msg("guest awake after frozen resume")
+		m.recordPhases("resume", "", map[string]time.Duration{"wait_boxd": frozenWake})
+	}
 	go func() {
+		if resumeClockFrozen {
+			return
+		}
 		defer sentrylog.Recover("resume-boxd-probe")
 		probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := probe(probeCtx, vmIP, 30*time.Second); err != nil {
-			if errors.Is(err, ErrGuestClockUnready) {
-				m.noteGuestClockUnready(log, err)
-			}
+		if err := boxdWakeGuest(probeCtx, vmIP, 30*time.Second, false); err != nil {
 			log.Warn().Err(err).
 				Int64("wait_boxd_ms", time.Since(probeStart).Milliseconds()).
 				Msg("boxd not reachable after resume")
@@ -3090,6 +3111,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// Firecracker and networking have started, on user-visible restore latency.
 	sidecarBase, hasSidecar := readLayeredBase(memPath)
 	restoreCorrectsWallClock := guestCorrectsWallClock(memPath, sidecarBase)
+	var restoreClockFrozen bool
 	for attempt = 1; ; attempt++ {
 		tAttemptStart = time.Now()
 		if attempt > 1 {
@@ -3217,7 +3239,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Whether this host can act on the guest's property is decided separately,
 		// so an older binary does not erase it.
 		clockPolicy := m.clockPolicyFor(restoreCorrectsWallClock)
-		clockFrozen := false
+		restoreClockFrozen = false
 		switch {
 		case overlayNeedsLayered && !(useUffd && m.cfg.ResumeUffdEnabled):
 			attemptErr = fmt.Errorf(
@@ -3265,7 +3287,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				inst.mu.Unlock()
 			}
 			if attemptErr == nil {
-				clockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+				restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
 					return RestoreSnapshotUffdInternalWithOverrides(
 						socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
 						m.cfg.HandlerDeathAbortEnabled, clock,
@@ -3273,12 +3295,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				})
 			}
 		case inPlace:
-			clockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+			restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
 				return RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir, clock)
 			})
 		default:
 			// UFFD disabled but fresh restore — File backend with network overrides.
-			clockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+			restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
 				return RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir, clock)
 			})
 		}
@@ -3290,7 +3312,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// only symptom of the gates disagreeing is a readiness number that
 			// looks the same as before, which is indistinguishable from the
 			// feature being off.
-			Bool("guest_clock_frozen", clockFrozen).
+			Bool("guest_clock_frozen", restoreClockFrozen).
 			Msg("snapshot loaded")
 		// Failed attempts included: a slow failing load (tap-busy retry,
 		// terminal failure) must appear in the distribution, not vanish.
@@ -3430,7 +3452,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// while it runs. Cancelled on the healthy path, where the whole cost is a
 	// timer that never fires.
 	stopDiag := m.armEarlyStallDiagnostics(vmID, pid)
-	err := m.waitForBoxd(ctx, hostIP, readiness)
+	err := boxdWakeGuest(ctx, hostIP, readiness, restoreClockFrozen)
 	stopDiag()
 	if err != nil {
 		if errors.Is(err, ErrGuestClockUnready) {

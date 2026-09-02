@@ -34,9 +34,13 @@ var boxdHTTPClient = &http.Client{
 // early probes must be dense; the cap keeps the steady-state cost of a slow
 // boot negligible. Probes ride the host↔guest veth, so each costs well
 // under a millisecond.
-// ErrGuestClockUnready: the guest cannot correct its clock or thaw; waiting
-// longer cannot help.
+// ErrGuestClockUnready: the guest cannot correct its clock; waiting longer
+// cannot help, and this host should restore the unfrozen way.
 var ErrGuestClockUnready = errors.New("guest clock could not be corrected")
+
+// ErrGuestThawFailed: the guest corrected its clock but could not release its
+// workload. Not a clock problem; retrying unfrozen would not help.
+var ErrGuestThawFailed = errors.New("guest workload could not be released")
 
 // clockUnreadyPolls is how many consecutive such answers make it final: the
 // first may be mid-correction.
@@ -53,7 +57,6 @@ func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) 
 	const maxProbeInterval = 10 * time.Millisecond
 	interval := time.Millisecond
 	var lastErr error
-	clockUnready := 0
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -62,26 +65,12 @@ func waitForHTTPHealth(ctx context.Context, vmIP string, timeout time.Duration) 
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		resp, err := client.Do(req)
 		if err == nil {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return nil
 			}
 			err = fmt.Errorf("unexpected status %d", resp.StatusCode)
-			if resp.StatusCode == http.StatusServiceUnavailable {
-				var reply struct {
-					Status    string `json:"status"`
-					WallClock struct {
-						Error string `json:"error"`
-					} `json:"wall_clock"`
-				}
-				if json.Unmarshal(body, &reply) == nil && (reply.Status == "clock" || reply.Status == "thaw") {
-					clockUnready++
-					if clockUnready >= clockUnreadyPolls {
-						return fmt.Errorf("%w (%s: %s)", ErrGuestClockUnready, reply.Status, reply.WallClock.Error)
-					}
-				}
-			}
 		}
 		lastErr = err
 
@@ -199,10 +188,72 @@ func postBoxd(ctx context.Context, vmIP, path string, body []byte) error {
 	return nil
 }
 
-// Seams so the pause path can be tested without a guest.
+// waitForGuestWake tells a restored guest to correct its clock and release its
+// workload, and waits for it to confirm. clockFrozen is the policy the restore
+// used, so the guest knows whether correction is required. Returns
+// ErrGuestClockUnready as soon as the guest reports it cannot, so the caller
+// can retry the restore the unfrozen way instead of waiting out the budget.
+func waitForGuestWake(ctx context.Context, vmIP string, timeout time.Duration, clockFrozen bool) error {
+	url := fmt.Sprintf("http://%s:%d/wake", vmIP, boxdPort)
+	body, _ := json.Marshal(struct {
+		ClockFrozen bool `json:"clock_frozen"`
+	}{clockFrozen})
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+	const maxProbeInterval = 10 * time.Millisecond
+	interval := time.Millisecond
+	var lastErr error
+	clockUnready := 0
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err == nil {
+			reply, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+			err = fmt.Errorf("unexpected status %d", resp.StatusCode)
+			if resp.StatusCode == http.StatusServiceUnavailable {
+				var r struct {
+					Status    string `json:"status"`
+					WallClock struct {
+						Error string `json:"error"`
+					} `json:"wall_clock"`
+				}
+				if json.Unmarshal(reply, &r) == nil && (r.Status == "clock" || r.Status == "thaw") {
+					if clockUnready++; clockUnready >= clockUnreadyPolls {
+						sentinel := ErrGuestClockUnready
+						if r.Status == "thaw" {
+							sentinel = ErrGuestThawFailed
+						}
+						return fmt.Errorf("%w (%s)", sentinel, r.WallClock.Error)
+					}
+				}
+			}
+		}
+		lastErr = err
+		time.Sleep(interval)
+		interval = min(interval*2, maxProbeInterval)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("guest not awake after %s: %w", timeout, lastErr)
+	}
+	return fmt.Errorf("guest not awake after %s", timeout)
+}
+
+// Seams so the pause and restore paths can be tested without a guest.
 var (
 	boxdFreezeGuest = postBoxdFreeze
 	boxdThawGuest   = postBoxdThaw
+	boxdWakeGuest   = waitForGuestWake
 )
 
 // boxdFilesystemClient returns a Connect RPC client for boxd's

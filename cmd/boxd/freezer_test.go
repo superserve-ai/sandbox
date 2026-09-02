@@ -17,13 +17,12 @@ import (
 type fakeCgroup struct {
 	mu        sync.Mutex
 	state     string
-	missing   bool  // no cgroup at all (ENOENT)
-	readErr   error // cgroup present but unreadable
-	stallFor  int   // reads that report FREEZING before FROZEN
-	neverDone bool  // stays FREEZING regardless
-	stuckThaw bool  // THAWED writes are ignored
+	missing   bool
+	readErr   error
+	stallFor  int
+	neverDone bool
+	stuckThaw bool
 	writes    []string
-	procs     map[int]string // pid -> freezer path
 }
 
 func (f *fakeCgroup) readState() (string, error) {
@@ -65,77 +64,94 @@ func (f *fakeCgroup) writeState(s string) error {
 	return nil
 }
 
-func (f *fakeCgroup) procCgroup(pid int) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	p, ok := f.procs[pid]
-	if !ok {
-		return "", errors.New("no such process")
-	}
-	return p, nil
-}
-
-func newFake() *fakeCgroup { return &fakeCgroup{state: "THAWED", procs: map[int]string{}} }
+func newFake() *fakeCgroup { return &fakeCgroup{state: "THAWED"} }
 
 const testDir = "/sys/fs/cgroup/freezer/workload"
+
+func bg() context.Context { return context.Background() }
 
 func TestFreezeWaitsForEveryTaskToStop(t *testing.T) {
 	cg := newFake()
 	cg.stallFor = 3
 	fz := newFreezer(cg, testDir)
-	if err := fz.freeze(context.Background()); err != nil {
+	if err := fz.freeze(bg()); err != nil {
 		t.Fatalf("freeze: %v", err)
 	}
-	if st, _ := cg.readState(); st != "FROZEN" {
-		t.Errorf("state %q, want FROZEN", st)
+	if !fz.isFrozen() {
+		t.Error("want frozen")
 	}
 }
 
-// A workload that never fully stops must be left running: the supervisor
-// falls back to the slower snapshot.
+// A frozen workload stays frozen until the supervisor says otherwise. Nothing
+// inside the guest may release it — from inside, "about to be snapshotted" and
+// "just restored" are indistinguishable.
+func TestFrozenStaysFrozenUntilTold(t *testing.T) {
+	cg := newFake()
+	fz := newFreezer(cg, testDir)
+	if err := fz.freeze(bg()); err != nil {
+		t.Fatal(err)
+	}
+	// Health may be polled any number of times in the window before the
+	// snapshot; it must never thaw.
+	clock := clockUnder(&fakeSource{host: base}, base)
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		handleHealth(clock, fz)(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+		if rec.Code != 200 {
+			t.Fatalf("health %d while frozen, want 200 (it reports, it does not gate)", rec.Code)
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	if !fz.isFrozen() {
+		t.Fatal("workload thawed without a /thaw or /wake")
+	}
+	for _, w := range cg.writes {
+		if w == "THAWED" {
+			t.Fatal("something wrote THAWED on its own")
+		}
+	}
+}
+
 func TestFreezeTimeoutThawsAndFails(t *testing.T) {
 	cg := newFake()
 	cg.neverDone = true
 	fz := newFreezer(cg, testDir)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	ctx, cancel := context.WithTimeout(bg(), 30*time.Millisecond)
 	defer cancel()
 	err := fz.freeze(ctx)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want deadline exceeded", err)
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errThawUnconfirmed) {
+		t.Fatalf("err = %v, want deadline exceeded with a confirmed thaw", err)
 	}
-	if errors.Is(err, errThawUnconfirmed) {
-		t.Fatalf("thaw was confirmed, error must not claim otherwise: %v", err)
-	}
-	if last := cg.writes[len(cg.writes)-1]; last != "THAWED" {
-		t.Errorf("last write %q, want THAWED", last)
+	if fz.isFrozen() {
+		t.Error("still frozen after a failed freeze")
 	}
 }
 
-// If the undo itself cannot be confirmed, the caller must be told the state
-// is unknown rather than "running again".
 func TestFreezeTimeoutWithUnconfirmedThawSaysSo(t *testing.T) {
 	cg := newFake()
 	cg.neverDone = true
 	cg.stuckThaw = true
 	fz := newFreezer(cg, testDir)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(bg(), 20*time.Millisecond)
 	defer cancel()
-	err := fz.freeze(ctx)
-	if !errors.Is(err, errThawUnconfirmed) {
+	if err := fz.freeze(ctx); !errors.Is(err, errThawUnconfirmed) {
 		t.Fatalf("err = %v, want errThawUnconfirmed", err)
 	}
 }
 
-// The trampoline joins the cgroup before exec, so the command's pid — and
-// every descendant — is inside from the first instruction of customer code.
-func TestWrapJoinsCgroupBeforeExec(t *testing.T) {
+// The trampoline joins the cgroup before exec and refuses to run the command
+// if it cannot: a process outside the cgroup would survive a freeze.
+func TestWrapJoinsCgroupOrDoesNotRun(t *testing.T) {
 	fz := newFreezer(newFake(), testDir)
 	name, args := fz.wrap("/usr/bin/python3", []string{"-c", "print(1)", "a b"})
 	if name != "/bin/sh" || len(args) < 3 || args[0] != "-c" {
 		t.Fatalf("wrap = %s %v, want /bin/sh -c …", name, args)
 	}
-	if !strings.Contains(args[1], "cgroup.procs") || !strings.Contains(args[1], `exec "$0" "$@"`) {
-		t.Errorf("script %q must write the pid then exec $0 $@", args[1])
+	if !strings.Contains(args[1], "cgroup.procs && exec \"$0\" \"$@\"") {
+		t.Errorf("script %q must join with && so a failed placement never execs", args[1])
+	}
+	if strings.Contains(args[1], "2>/dev/null") {
+		t.Errorf("script %q must not hide a placement failure", args[1])
 	}
 	if args[2] != "/usr/bin/python3" || args[3] != "-c" || args[4] != "print(1)" || args[5] != "a b" {
 		t.Errorf("argv not preserved: %v", args[2:])
@@ -146,48 +162,15 @@ func TestWrapIsPassthroughWithoutCgroup(t *testing.T) {
 	cg := newFake()
 	cg.missing = true
 	fz := newFreezer(cg, testDir)
-	name, args := fz.wrap("/bin/true", []string{"x"})
-	if name != "/bin/true" || len(args) != 1 || args[0] != "x" {
+	if name, args := fz.wrap("/bin/true", []string{"x"}); name != "/bin/true" || len(args) != 1 || args[0] != "x" {
 		t.Errorf("wrap = %s %v, want passthrough", name, args)
 	}
 }
 
-func TestConfirmPlaced(t *testing.T) {
-	orig := placementWait
-	placementWait = 20 * time.Millisecond
-	t.Cleanup(func() { placementWait = orig })
-
-	t.Run("in_cgroup_is_fine", func(t *testing.T) {
-		cg := newFake()
-		cg.procs[7] = "/workload"
-		fz := newFreezer(cg, testDir)
-		fz.confirmPlaced(7)
-		if err := fz.freeze(context.Background()); err != nil {
-			t.Fatalf("freeze after a placed process: %v", err)
-		}
-	})
-	// A process that never showed up in the cgroup would keep running through
-	// a freeze; refuse until it exits.
-	t.Run("outside_refuses_freezes_until_exit", func(t *testing.T) {
-		cg := newFake()
-		cg.procs[8] = "/"
-		fz := newFreezer(cg, testDir)
-		fz.confirmPlaced(8)
-		if err := fz.freeze(context.Background()); err == nil || !strings.Contains(err.Error(), "8") {
-			t.Fatalf("freeze = %v, want refusal naming pid 8", err)
-		}
-		fz.exited(8)
-		if err := fz.freeze(context.Background()); err != nil {
-			t.Fatalf("freeze after the straggler exited: %v", err)
-		}
-	})
-}
-
-// Readiness is gated on thaw, so thaw must confirm, not assume.
 func TestThawConfirmsOrFails(t *testing.T) {
 	cg := newFake()
 	fz := newFreezer(cg, testDir)
-	if err := fz.freeze(context.Background()); err != nil {
+	if err := fz.freeze(bg()); err != nil {
 		t.Fatal(err)
 	}
 	cg.stuckThaw = true
@@ -204,61 +187,24 @@ func TestThawConfirmsOrFails(t *testing.T) {
 }
 
 // Absent and unreadable are different: absent degrades, unreadable errors.
-func TestMountedDistinguishesAbsentFromBroken(t *testing.T) {
+func TestAbsentCgroupDegradesButBrokenErrors(t *testing.T) {
 	missing := newFake()
 	missing.missing = true
-	if err := newFreezer(missing, testDir).thaw(); err != nil {
+	fz := newFreezer(missing, testDir)
+	if fz.available() {
+		t.Error("absent cgroup reported available")
+	}
+	if err := fz.thaw(); err != nil {
 		t.Errorf("thaw without cgroup: %v, want nil", err)
 	}
+	if err := fz.freeze(bg()); err == nil {
+		t.Error("freeze without cgroup must be refused")
+	}
 	broken := newFake()
+	bfz := newFreezer(broken, testDir)
 	broken.readErr = errors.New("EIO")
-	if err := newFreezer(broken, testDir).thaw(); err == nil {
+	if err := bfz.thaw(); err == nil {
 		t.Error("thaw on an unreadable cgroup must not report success")
-	}
-	if err := newFreezer(broken, testDir).freeze(context.Background()); err == nil {
-		t.Error("freeze on an unreadable cgroup must be refused")
-	}
-}
-
-// On wake with a frozen workload, the loop corrects the clock and thaws
-// without anyone polling /health.
-func TestWakeLoopThawsOnceClockIsRight(t *testing.T) {
-	cg := newFake()
-	fz := newFreezer(cg, testDir)
-	if err := fz.freeze(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	src := &fakeSource{host: base.Add(48 * time.Hour)}
-	clock := clockUnder(src, base)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go fz.wakeLoop(ctx, clock, time.Millisecond)
-	deadline := time.Now().Add(2 * time.Second)
-	for fz.isFrozen() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if fz.isFrozen() {
-		t.Fatal("workload never thawed")
-	}
-	if src.setTo == nil {
-		t.Error("clock was never corrected before the thaw")
-	}
-}
-
-// Frozen workload, no host time: stay frozen. Serving would mean a stale clock.
-func TestWakeLoopStaysFrozenWithoutHostTime(t *testing.T) {
-	cg := newFake()
-	fz := newFreezer(cg, testDir)
-	if err := fz.freeze(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	src := &fakeSource{hostErr: errors.New("no ptp")}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go fz.wakeLoop(ctx, clockUnder(src, base), time.Millisecond)
-	time.Sleep(30 * time.Millisecond)
-	if !fz.isFrozen() {
-		t.Fatal("thawed with an uncorrectable clock")
 	}
 }
 
@@ -308,7 +254,7 @@ func TestFreezeEndpointStatusCodes(t *testing.T) {
 	t.Run("thaw_unconfirmed_is_500", func(t *testing.T) {
 		cg := newFake()
 		fz := newFreezer(cg, testDir)
-		_ = fz.freeze(context.Background())
+		_ = fz.freeze(bg())
 		cg.stuckThaw = true
 		if got := post(fz, "/thaw", ""); got != 500 {
 			t.Errorf("status %d, want 500", got)
@@ -319,9 +265,7 @@ func TestFreezeEndpointStatusCodes(t *testing.T) {
 func TestNilFreezerIsANoOp(t *testing.T) {
 	var f *freezer
 	f.spawnLock()
-	f.confirmPlaced(1)
 	f.spawnUnlock()
-	f.exited(1)
 	if f.available() || f.isFrozen() {
 		t.Error("nil freezer must be neither available nor frozen")
 	}
@@ -331,7 +275,7 @@ func TestNilFreezerIsANoOp(t *testing.T) {
 	if err := f.thaw(); err != nil {
 		t.Errorf("thaw on nil: %v", err)
 	}
-	if err := f.freeze(context.Background()); err == nil {
+	if err := f.freeze(bg()); err == nil {
 		t.Error("freeze on nil must be refused")
 	}
 }
