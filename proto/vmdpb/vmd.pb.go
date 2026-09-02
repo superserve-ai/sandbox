@@ -521,9 +521,14 @@ type GetBuildStatusResponse struct {
 	// Present when the caller's build_vm_id is unknown on this host.
 	// Supervisors treat "unknown on this host" as a hard failure since vmd
 	// doesn't survive across restarts for in-memory registry.
-	NotFound      bool `protobuf:"varint,10,opt,name=not_found,json=notFound,proto3" json:"not_found,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	NotFound bool `protobuf:"varint,10,opt,name=not_found,json=notFound,proto3" json:"not_found,omitempty"`
+	// Host-side physical allocation for the reported template artifacts.
+	RootfsAllocatedBytes    int64 `protobuf:"varint,13,opt,name=rootfs_allocated_bytes,json=rootfsAllocatedBytes,proto3" json:"rootfs_allocated_bytes,omitempty"`
+	BaseAllocatedBytes      int64 `protobuf:"varint,14,opt,name=base_allocated_bytes,json=baseAllocatedBytes,proto3" json:"base_allocated_bytes,omitempty"`
+	DeltaAllocatedBytes     int64 `protobuf:"varint,15,opt,name=delta_allocated_bytes,json=deltaAllocatedBytes,proto3" json:"delta_allocated_bytes,omitempty"`
+	AllocatedBytesSupported bool  `protobuf:"varint,16,opt,name=allocated_bytes_supported,json=allocatedBytesSupported,proto3" json:"allocated_bytes_supported,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *GetBuildStatusResponse) Reset() {
@@ -636,6 +641,34 @@ func (x *GetBuildStatusResponse) GetEndedAtUnix() int64 {
 func (x *GetBuildStatusResponse) GetNotFound() bool {
 	if x != nil {
 		return x.NotFound
+	}
+	return false
+}
+
+func (x *GetBuildStatusResponse) GetRootfsAllocatedBytes() int64 {
+	if x != nil {
+		return x.RootfsAllocatedBytes
+	}
+	return 0
+}
+
+func (x *GetBuildStatusResponse) GetBaseAllocatedBytes() int64 {
+	if x != nil {
+		return x.BaseAllocatedBytes
+	}
+	return 0
+}
+
+func (x *GetBuildStatusResponse) GetDeltaAllocatedBytes() int64 {
+	if x != nil {
+		return x.DeltaAllocatedBytes
+	}
+	return 0
+}
+
+func (x *GetBuildStatusResponse) GetAllocatedBytesSupported() bool {
+	if x != nil {
+		return x.AllocatedBytesSupported
 	}
 	return false
 }
@@ -1584,14 +1617,16 @@ func (x *PauseVMResponse) GetPauseToken() string {
 // (logical name + host path), integrity (sha256 + size), and, for overlay
 // files, the base file the artifact depends on to be restorable.
 type ArtifactManifestEntry struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	FileName      string                 `protobuf:"bytes,1,opt,name=file_name,json=fileName,proto3" json:"file_name,omitempty"` // logical name, e.g. "rootfs.ext4", "vmstate.snap"
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`                         // absolute path on the host
-	SizeBytes     int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
-	Sha256        string                 `protobuf:"bytes,4,opt,name=sha256,proto3" json:"sha256,omitempty"`                     // lowercase hex
-	BasePath      string                 `protobuf:"bytes,5,opt,name=base_path,json=basePath,proto3" json:"base_path,omitempty"` // overlay dependency ("" when self-contained)
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	FileName  string                 `protobuf:"bytes,1,opt,name=file_name,json=fileName,proto3" json:"file_name,omitempty"` // logical name, e.g. "rootfs.ext4", "vmstate.snap"
+	Path      string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`                         // absolute path on the host
+	SizeBytes int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	Sha256    string                 `protobuf:"bytes,4,opt,name=sha256,proto3" json:"sha256,omitempty"`                     // lowercase hex
+	BasePath  string                 `protobuf:"bytes,5,opt,name=base_path,json=basePath,proto3" json:"base_path,omitempty"` // overlay dependency ("" when self-contained)
+	// -1 means allocation metadata was unavailable; zero is a valid measurement.
+	AllocatedBytes int64 `protobuf:"varint,6,opt,name=allocated_bytes,json=allocatedBytes,proto3" json:"allocated_bytes,omitempty"` // host physical allocation (st_blocks * 512)
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ArtifactManifestEntry) Reset() {
@@ -1657,6 +1692,13 @@ func (x *ArtifactManifestEntry) GetBasePath() string {
 		return x.BasePath
 	}
 	return ""
+}
+
+func (x *ArtifactManifestEntry) GetAllocatedBytes() int64 {
+	if x != nil {
+		return x.AllocatedBytes
+	}
+	return 0
 }
 
 type ResumeVMRequest struct {
@@ -3802,7 +3844,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x15BuildTemplateResponse\x12\x1e\n" +
 	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"7\n" +
 	"\x15GetBuildStatusRequest\x12\x1e\n" +
-	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\xac\x03\n" +
+	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\x84\x05\n" +
 	"\x16GetBuildStatusResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
@@ -3819,7 +3861,11 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x0fstarted_at_unix\x18\b \x01(\x03R\rstartedAtUnix\x12\"\n" +
 	"\rended_at_unix\x18\t \x01(\x03R\vendedAtUnix\x12\x1b\n" +
 	"\tnot_found\x18\n" +
-	" \x01(\bR\bnotFound\"4\n" +
+	" \x01(\bR\bnotFound\x124\n" +
+	"\x16rootfs_allocated_bytes\x18\r \x01(\x03R\x14rootfsAllocatedBytes\x120\n" +
+	"\x14base_allocated_bytes\x18\x0e \x01(\x03R\x12baseAllocatedBytes\x122\n" +
+	"\x15delta_allocated_bytes\x18\x0f \x01(\x03R\x13deltaAllocatedBytes\x12:\n" +
+	"\x19allocated_bytes_supported\x18\x10 \x01(\bR\x17allocatedBytesSupported\"4\n" +
 	"\x12CancelBuildRequest\x12\x1e\n" +
 	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\x15\n" +
 	"\x13CancelBuildResponse\"8\n" +
@@ -3894,14 +3940,15 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12D\n" +
 	"\bmanifest\x18\x04 \x03(\v2(.superserve.vmd.v1.ArtifactManifestEntryR\bmanifest\x12\x1f\n" +
 	"\vpause_token\x18\x05 \x01(\tR\n" +
-	"pauseToken\"\x9c\x01\n" +
+	"pauseToken\"\xc5\x01\n" +
 	"\x15ArtifactManifestEntry\x12\x1b\n" +
 	"\tfile_name\x18\x01 \x01(\tR\bfileName\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x12\x16\n" +
 	"\x06sha256\x18\x04 \x01(\tR\x06sha256\x12\x1b\n" +
-	"\tbase_path\x18\x05 \x01(\tR\bbasePath\"\xdf\x02\n" +
+	"\tbase_path\x18\x05 \x01(\tR\bbasePath\x12'\n" +
+	"\x0fallocated_bytes\x18\x06 \x01(\x03R\x0eallocatedBytes\"\xdf\x02\n" +
 	"\x0fResumeVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +

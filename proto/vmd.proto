@@ -198,6 +198,7 @@ message GetBuildStatusResponse {
   int64 rootfs_allocated_bytes = 13;
   int64 base_allocated_bytes = 14;
   int64 delta_allocated_bytes = 15;
+  bool allocated_bytes_supported = 16;
 }
 
 message CancelBuildRequest {
