@@ -130,15 +130,15 @@ func guestCorrectsWallClock(instMemFile, instBaseMem string) bool {
 		(instBaseMem != "" && snapshotCorrectsWallClock(instBaseMem))
 }
 
-// resumeWallClockProperty returns whether the guest being resumed corrects its
-// own wall clock, preferring the durable record to the filesystem.
+// imageWorkloadFrozen returns whether the image being resumed holds a frozen
+// workload, preferring the durable record to the filesystem.
 //
 // An ordinary resume reloads the exact image the VM was paused into, and that
-// pause wrote the property to the record and the marker together — so the record
-// is already the answer and the resume path need not go to disk for it. Only an
+// pause wrote the fact to the record and the marker together — so the record is
+// already the answer and the resume path need not go to disk for it. Only an
 // explicit override, supplying an image this VM was never paused into, has to
 // look, because the record then describes a different artifact.
-func resumeWallClockProperty(memPath, basePath, pausedMemPath string, recorded *bool) bool {
+func imageWorkloadFrozen(memPath, basePath, pausedMemPath string, recorded *bool) bool {
 	if memPath == pausedMemPath && recorded != nil {
 		return *recorded
 	}
@@ -148,10 +148,11 @@ func resumeWallClockProperty(memPath, basePath, pausedMemPath string, recorded *
 	return guestCorrectsWallClock(memPath, basePath)
 }
 
-// clockPolicyFor turns the resolved guest property into a restore policy.
+// clockPolicyFor turns the resolved image fact into a restore policy.
 //
-// Two independent facts meet here, and only here: whether the guest fixes its
-// own wall clock, which is a property of the image and is recorded with it, and
+// Two independent facts meet here, and only here: whether the image holds a
+// frozen workload from a guest that fixes its own wall clock, which is a
+// property of the image and is recorded with it, and
 // whether this host's Firecracker can be asked to freeze the clock, which is a
 // property of the binary and changes under a running daemon. Keeping them apart
 // is what lets a host with an older binary restore a marked guest the legacy way
@@ -163,8 +164,8 @@ func resumeWallClockProperty(memPath, basePath, pausedMemPath string, recorded *
 //
 // It never returns true: advancing the guest clock by elapsed wall time is the
 // behaviour being fixed, so nothing here should be able to ask for it.
-func (m *Manager) clockPolicyFor(correctsWallClock bool) *bool {
-	if !m.cfg.GuestClockFreezeEnabled || !correctsWallClock || !m.clockRealtimeCapable.Load() || m.guestClockUnready.Load() {
+func (m *Manager) clockPolicyFor(workloadFrozen bool) *bool {
+	if !m.cfg.GuestClockFreezeEnabled || !workloadFrozen || !m.clockRealtimeCapable.Load() || m.guestClockUnready.Load() {
 		return nil
 	}
 	freeze := false

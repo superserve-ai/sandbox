@@ -124,6 +124,11 @@ type VMInstance struct {
 	// binary that predates the field drops it on round-trip, and treating that
 	// silence as "no" would strip a marker that is still valid.
 	CorrectsWallClock *bool
+	// SnapshotWorkloadFrozen records whether the image this VM was last paused
+	// into holds a frozen workload — the marker beside it, cached. A pause that
+	// froze nothing clears it while CorrectsWallClock stands: the guest still
+	// can, this image just was not. Tri-state like CorrectsWallClock.
+	SnapshotWorkloadFrozen *bool
 	// WakePending / ClockFrozen: see VMRecord.
 	WakePending bool
 	ClockFrozen bool
@@ -1633,7 +1638,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		}
 	}
 	// The marker means "frozen image": an unfrozen one restores the unfrozen way.
-	correctsWallClock = guestFrozen
+	// What the guest can do is not rewritten by what this pause did.
 	snapshotOK := false
 	if guestFrozen {
 		// A failed snapshot leaves the VM running; do not leave it frozen.
@@ -1648,7 +1653,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			}
 		}()
 	}
-	if !correctsWallClock {
+	if !guestFrozen {
 		for _, candidate := range []string{overlayPath, fullPath} {
 			if merr := os.Remove(clockFreezeMarkerPath(candidate)); merr != nil && !os.IsNotExist(merr) {
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf(
@@ -1799,7 +1804,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// back to legacy. Only the write lands here: the unsafe direction was already
 	// handled above, before the image existed. Best-effort by design — a marker
 	// that fails to write costs a slower resume, never a wrong clock.
-	if correctsWallClock {
+	if guestFrozen {
 		if merr := os.WriteFile(clockFreezeMarkerPath(memPath), nil, 0o644); merr != nil {
 			log.Warn().Err(merr).Str("path", clockFreezeMarkerPath(memPath)).
 				Msg("pause: wall-clock marker write failed; resume falls back to legacy clock behaviour")
@@ -1881,6 +1886,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	inst.BaseMemPath = baseMemPath   // template base for a layered overlay; "" when standalone
 	inst.DirtyTracked = false        // FC process is stopping; a fresh resume re-arms tracking.
 	inst.DirtyTrackingSessionID = "" // the session dies with the FC run
+	inst.SnapshotWorkloadFrozen = &guestFrozen
 	inst.PausedAt = time.Now()
 	// The crash-window marker describes a RUNNING record persisted before
 	// readiness was proven; a successful pause proves the guest was live and
@@ -2271,14 +2277,14 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	}
 
 	var (
-		pid                     int
-		basePath                string
-		dirtyTracked            bool
-		trackingSessionID       string
-		restoreErr              error
-		resumeClockFrozen       bool
-		resumeCorrectsWallClock bool
-		syncWake                time.Duration
+		pid                  int
+		basePath             string
+		dirtyTracked         bool
+		trackingSessionID    string
+		restoreErr           error
+		resumeClockFrozen    bool
+		resumeWorkloadFrozen bool
+		syncWake             time.Duration
 	)
 	// Two passes at most: a frozen-clock restore whose guest cannot correct its
 	// clock is relaunched unfrozen. Only Firecracker is torn down between
@@ -2337,13 +2343,13 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// metadata I/O on the resume path for a fact we hold. Only an explicit
 		// override, which supplies an image this VM was not paused into, has to look.
 		inst.mu.RLock()
-		recordedCorrects, pausedMemPath := inst.CorrectsWallClock, inst.MemFilePath
+		recordedFrozen, pausedMemPath := inst.SnapshotWorkloadFrozen, inst.MemFilePath
 		inst.mu.RUnlock()
-		resumeCorrectsWallClock = resumeWallClockProperty(memPath, basePath, pausedMemPath, recordedCorrects)
+		resumeWorkloadFrozen = imageWorkloadFrozen(memPath, basePath, pausedMemPath, recordedFrozen)
 		if m.restoreForResumeHook != nil {
 			dirtyTracked, trackingSessionID, restoreErr = m.restoreForResumeHook(socketPath, snapshotPath, memPath, basePath, netInfo)
 		} else {
-			dirtyTracked, trackingSessionID, resumeClockFrozen, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo, m.clockPolicyFor(resumeCorrectsWallClock))
+			dirtyTracked, trackingSessionID, resumeClockFrozen, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo, m.clockPolicyFor(resumeWorkloadFrozen))
 		}
 		tRestoreDone = time.Now()
 		if restoreErr != nil {
@@ -2369,7 +2375,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// released it, correcting its clock first if that was frozen too. If it
 		// cannot, the second pass relaunches with the clock running — the host is
 		// latched, so the policy resolves to legacy — and still owes the release.
-		if resumeCorrectsWallClock {
+		if resumeWorkloadFrozen {
 			tWake := time.Now()
 			werr := boxdWakeGuest(context.WithoutCancel(ctx), netInfo.HostIP, boxdResumeReadyBudget, resumeClockFrozen)
 			syncWake = time.Since(tWake)
@@ -2419,7 +2425,12 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.Unverified = false
 	inst.DirtyTracked = dirtyTracked
 	inst.DirtyTrackingSessionID = trackingSessionID
-	inst.CorrectsWallClock = &resumeCorrectsWallClock
+	inst.SnapshotWorkloadFrozen = &resumeWorkloadFrozen
+	if resumeWorkloadFrozen {
+		// Only a guest that corrects its clock is ever frozen into an image.
+		corrects := true
+		inst.CorrectsWallClock = &corrects
+	}
 	inst.PausedAt = time.Time{}
 	// Record the file actually resumed from (callers may pass an explicit path
 	// that differs from the cached one) so the next pause's diff baseline matches
@@ -2465,12 +2476,12 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	vmIP := inst.IP
 	// Resolved here: the goroutine outlives the call, and tests swap the seam.
 	wake := boxdWakeGuest
-	if resumeCorrectsWallClock {
+	if resumeWorkloadFrozen {
 		log.Info().Int64("wait_boxd_ms", syncWake.Milliseconds()).Msg("guest awake after resume")
 		m.recordPhases("resume", "", map[string]time.Duration{"wait_boxd": syncWake})
 	}
 	go func() {
-		if resumeCorrectsWallClock {
+		if resumeWorkloadFrozen {
 			return
 		}
 		defer sentrylog.Recover("resume-boxd-probe")
@@ -3368,6 +3379,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Cached so the next pause knows whether this guest fixes its own wall
 		// clock without going back to the filesystem to ask.
 		inst.CorrectsWallClock = &restoreCorrectsWallClock
+		inst.SnapshotWorkloadFrozen = &restoreCorrectsWallClock
 		inst.WakePending = true
 		inst.ClockFrozen = clockPolicy != nil
 		inst.mu.Unlock()

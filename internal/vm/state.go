@@ -214,6 +214,11 @@ type VMRecord struct {
 	// again — decoding that silence as false would ignore a marker still on disk
 	// and delete it at the next pause. Nil means "ask the disk".
 	CorrectsWallClock *bool `json:"corrects_wall_clock,omitempty"`
+	// SnapshotWorkloadFrozen: the image this VM was last paused into holds a
+	// frozen workload. Set by every pause, so a pause that froze nothing cannot
+	// leave an older "frozen" answer for the next resume to act on. Tri-state
+	// for the same reason as CorrectsWallClock.
+	SnapshotWorkloadFrozen *bool `json:"snapshot_workload_frozen,omitempty"`
 	// WakePending: restored but the guest has not yet been told to correct its
 	// clock and release its workload. Written with the Running record, so a
 	// daemon that crashes between the two completes the wake on recovery
@@ -912,6 +917,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		StrandedOverlays:           append([]string(nil), inst.StrandedOverlays...),
 		DirtyTrackingSessionID:     inst.DirtyTrackingSessionID,
 		CorrectsWallClock:          inst.CorrectsWallClock,
+		SnapshotWorkloadFrozen:     inst.SnapshotWorkloadFrozen,
 		WakePending:                inst.WakePending,
 		ClockFrozen:                inst.ClockFrozen,
 		CreatedAt:                  inst.CreatedAt,
@@ -1015,6 +1021,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		// untracked and pause Full, exactly as before.
 		DirtyTracked:               rec.Status == StatusRunning && rec.DirtyTrackingSessionID != "",
 		CorrectsWallClock:          rec.CorrectsWallClock,
+		SnapshotWorkloadFrozen:     rec.SnapshotWorkloadFrozen,
 		WakePending:                rec.WakePending,
 		ClockFrozen:                rec.ClockFrozen,
 		CreatedAt:                  rec.CreatedAt,

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -143,13 +144,14 @@ func TestVerifyBoxdReadyCompletesAPendingWake(t *testing.T) {
 // The wake state must survive a daemon restart, or recovery cannot know it
 // owes one.
 func TestWakeStateSurvivesRecordRoundTrip(t *testing.T) {
-	rec := toRecord(&VMInstance{ID: "vm", WakePending: true, ClockFrozen: true})
-	if !rec.WakePending || !rec.ClockFrozen {
+	frozen := true
+	rec := toRecord(&VMInstance{ID: "vm", WakePending: true, ClockFrozen: true, SnapshotWorkloadFrozen: &frozen})
+	if !rec.WakePending || !rec.ClockFrozen || rec.SnapshotWorkloadFrozen == nil || !*rec.SnapshotWorkloadFrozen {
 		t.Fatalf("toRecord dropped wake state: %+v", rec)
 	}
 	got := toInstance(rec)
-	if !got.WakePending || !got.ClockFrozen {
-		t.Errorf("toInstance dropped wake state: pending=%v frozen=%v", got.WakePending, got.ClockFrozen)
+	if !got.WakePending || !got.ClockFrozen || got.SnapshotWorkloadFrozen == nil || !*got.SnapshotWorkloadFrozen {
+		t.Errorf("toInstance dropped wake state: pending=%v frozen=%v image=%v", got.WakePending, got.ClockFrozen, got.SnapshotWorkloadFrozen)
 	}
 }
 
@@ -205,11 +207,11 @@ func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	corrects := true
+	frozen := true
 	inst := &VMInstance{
 		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
 		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs,
-		CorrectsWallClock: &corrects,
+		SnapshotWorkloadFrozen: &frozen,
 	}
 	mgr := &Manager{
 		log:    zerolog.Nop(),
@@ -468,5 +470,81 @@ func TestRestoreLegacyRetrySeesDurableClockPolicy(t *testing.T) {
 	defer inst.mu.RUnlock()
 	if inst.ClockFrozen {
 		t.Error("instance still claims a frozen clock")
+	}
+}
+
+// A guest that can correct its clock, paused without freezing, must be resumed
+// the legacy way: the image fact says unfrozen even though the guest fact says
+// capable, and only the image fact may freeze a clock or owe a wake.
+func TestResumeOfUnfrozenPauseDoesNotFreezeOrWake(t *testing.T) {
+	origWake := boxdWakeGuest
+	t.Cleanup(func() { boxdWakeGuest = origWake })
+	// The detached readiness probe after the commit may poll the wake endpoint;
+	// a wake before the commit, or one claiming a frozen clock, may not happen.
+	var mu sync.Mutex
+	var beforeCommit, frozenWakes int
+	var inst *VMInstance
+	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool) error {
+		inst.mu.RLock()
+		st := inst.Status
+		inst.mu.RUnlock()
+		mu.Lock()
+		defer mu.Unlock()
+		if st != StatusRunning {
+			beforeCommit++
+		}
+		if frozen {
+			frozenWakes++
+		}
+		return nil
+	}
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	rootfs := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snapPath, memPath, rootfs} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	corrects, frozen := true, false
+	inst = &VMInstance{
+		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
+		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs,
+		CorrectsWallClock: &corrects, SnapshotWorkloadFrozen: &frozen,
+	}
+	mgr := &Manager{
+		log:    zerolog.Nop(),
+		cfg:    ManagerConfig{RunDir: dir, GuestClockFreezeEnabled: true},
+		netMgr: &fakeNetMgr{},
+		vms:    map[string]*VMInstance{"vm-1": inst},
+	}
+	mgr.clockRealtimeCapable.Store(true)
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		return 4321, SupervisionUnit, nil
+	}
+	mgr.restoreForResumeHook = func(string, string, string, string, *network.VMNetInfo) (bool, string, error) { return false, "", nil }
+
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	mu.Lock()
+	if beforeCommit != 0 || frozenWakes != 0 {
+		t.Errorf("wakes before commit=%d claiming frozen=%d; an unfrozen image owes neither", beforeCommit, frozenWakes)
+	}
+	mu.Unlock()
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	if inst.CorrectsWallClock == nil || !*inst.CorrectsWallClock {
+		t.Error("the guest fact must survive an unfrozen resume")
+	}
+	if inst.SnapshotWorkloadFrozen == nil || *inst.SnapshotWorkloadFrozen {
+		t.Error("the image fact must say unfrozen")
 	}
 }

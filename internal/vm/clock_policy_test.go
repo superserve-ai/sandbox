@@ -291,12 +291,12 @@ func TestResumeWallClockProperty(t *testing.T) {
 			t.Fatalf("seed marker: %v", err)
 		}
 		// Marker says yes, record says no. The record wins ⇒ no stat happened.
-		if resumeWallClockProperty(mem, "", mem, boolPtr(false)) {
+		if imageWorkloadFrozen(mem, "", mem, boolPtr(false)) {
 			t.Error("want the recorded value; a marker on disk means the record was not used")
 		}
 		// And the inverse: no marker on disk, record says yes.
 		bare := filepath.Join(t.TempDir(), "mem.snap")
-		if !resumeWallClockProperty(bare, "", bare, boolPtr(true)) {
+		if !imageWorkloadFrozen(bare, "", bare, boolPtr(true)) {
 			t.Error("want the recorded value even with no marker beside the image")
 		}
 	})
@@ -309,14 +309,14 @@ func TestResumeWallClockProperty(t *testing.T) {
 		if err := os.WriteFile(clockFreezeMarkerPath(override), nil, 0o644); err != nil {
 			t.Fatalf("seed marker: %v", err)
 		}
-		if !resumeWallClockProperty(override, "", filepath.Join(dir, "mem.snap"), boolPtr(false)) {
+		if !imageWorkloadFrozen(override, "", filepath.Join(dir, "mem.snap"), boolPtr(false)) {
 			t.Error("want the marker consulted when the image is not the paused one")
 		}
 	})
 
 	t.Run("override_without_a_marker_stays_legacy", func(t *testing.T) {
 		dir := t.TempDir()
-		if resumeWallClockProperty(filepath.Join(dir, "restored.snap"), "", filepath.Join(dir, "mem.snap"), boolPtr(true)) {
+		if imageWorkloadFrozen(filepath.Join(dir, "restored.snap"), "", filepath.Join(dir, "mem.snap"), boolPtr(true)) {
 			t.Error("a stale record must not carry over to a different image")
 		}
 	})
@@ -396,12 +396,12 @@ func TestResumeWallClockPropertyUnresolvedRecordConsultsTheMarker(t *testing.T) 
 		t.Fatalf("seed marker: %v", err)
 	}
 	// Same image, but the record lost the answer.
-	if !resumeWallClockProperty(mem, "", mem, nil) {
+	if !imageWorkloadFrozen(mem, "", mem, nil) {
 		t.Error("an unresolved record must fall back to the marker, not read as false")
 	}
 
 	bare := filepath.Join(t.TempDir(), "mem.snap")
-	if resumeWallClockProperty(bare, "", bare, nil) {
+	if imageWorkloadFrozen(bare, "", bare, nil) {
 		t.Error("unresolved with no marker must still be false")
 	}
 }
