@@ -1269,6 +1269,17 @@ definitions:
         type: string
         description: A description of the error condition
         readOnly: true
+      error_kind:
+        type: string
+        description: >
+          Stable machine-readable discriminator, present only for error classes
+          clients must handle distinctly (fault_message is free-form and not a
+          stable contract). Currently defined value —
+          DirtyTrackingSessionMismatch: a guarded snapshot request's expected
+          session token did not match the live dirty-tracking session; the
+          dirty bitmap and output files were not touched, and a Full snapshot
+          of the same paused VM is the safe fallback.
+        readOnly: true
 
   FullVmConfiguration:
     type: object
@@ -1621,6 +1632,29 @@ definitions:
           template-creation time — mutates base.ext4, would corrupt any other
           live VM reading the same base. Must be paired with block_delta_dir;
           requests with flatten=true and an unset block_delta_dir are rejected.
+      expected_session_id:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[A-Za-z0-9_-]+$"
+        description:
+          Expected dirty-tracking session id for a guarded snapshot. When set
+          (together with expected_generation), the snapshot is created only if
+          the token matches the session installed at snapshot-load time; a
+          mismatch is rejected with error_kind DirtyTrackingSessionMismatch
+          before the dirty bitmap or any output file is touched. Must be
+          supplied together with expected_generation; a value that violates
+          the shape constraints, or either field on its own, is rejected as a
+          plain bad request, not a mismatch.
+      expected_generation:
+        type: integer
+        format: int64
+        minimum: 0
+        description:
+          Expected dirty-bitmap generation accompanying expected_session_id.
+          The generation starts at 0 when tracking is armed and increments on
+          every snapshot attempt (any type consumes or resets the bitmap,
+          including attempts that fail midway).
 
   NetworkOverride:
     type: object
@@ -1656,6 +1690,22 @@ definitions:
         type: boolean
         description:
           Enable dirty page tracking to improve space efficiency of diff snapshots
+      tracking_session_id:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[A-Za-z0-9_-]+$"
+        description:
+          Caller-chosen dirty-tracking session id. Requires track_dirty_pages
+          (rejected as a bad request otherwise); installs a (session_id,
+          generation=0) token that guarded snapshot requests
+          (expected_session_id/expected_generation on PUT /snapshot/create)
+          can later compare against. MUST be freshly generated for every load
+          (a random nonce or UUID), never a stable identifier such as a VM
+          name - every new process re-arms at generation 0, so a reused id
+          would let a token persisted from an earlier process validate against
+          a dirty bitmap it never described. Support is advertised by the
+          dirty-tracking-session capability in the --version output.
       mem_file_path:
         type: string
         description:

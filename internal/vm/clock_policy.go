@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -46,31 +47,41 @@ const firecrackerCapabilityProbeTimeout = 5 * time.Second
 // taking the slow path until the daemon happened to restart for another reason.
 const firecrackerCapabilityRefreshInterval = 5 * time.Minute
 
-// WatchFirecrackerCapability keeps the cached clock-option capability in step
-// with the binary on disk.
+// WatchFirecrackerCapability keeps the cached binary capabilities — the clock
+// option and the guarded dirty-tracking session — in step with the binary on
+// disk.
 //
 // Runs entirely off the lifecycle paths: probing execs a process, which belongs
-// on neither a restore nor a restart. Until the first probe answers, the
-// capability reads false and restores take legacy behaviour — slower, correct.
+// on neither a restore nor a restart. Until the first probe answers, every
+// capability reads false and restores take the older behaviour — slower, correct.
 func (m *Manager) WatchFirecrackerCapability(ctx context.Context, log zerolog.Logger) {
 	if m.cfg.FirecrackerBin == "" {
 		return
 	}
+	// One --version exec answers for every capability. A change is logged;
+	// an absent capability is only worth saying when someone asked for the
+	// behaviour, and only once — an older binary is the normal state until
+	// the fork's release is rolled out.
+	track := func(first bool, caps map[string]bool, cap string, cached *atomic.Bool, wanted bool, changed, lacking string) {
+		ok := caps[cap]
+		if cached.Swap(ok) != ok {
+			log.Info().Bool("capable", ok).Str("bin", m.cfg.FirecrackerBin).Msg(changed)
+			return
+		}
+		if first && !ok && wanted {
+			log.Warn().Str("bin", m.cfg.FirecrackerBin).Msg(lacking)
+		}
+	}
 	probe := func(first bool) {
 		pctx, cancel := context.WithTimeout(ctx, firecrackerCapabilityProbeTimeout)
 		defer cancel()
-		ok := firecrackerAdvertisesCap(pctx, m.cfg.FirecrackerBin, clockRealtimeCap)
-		if m.clockRealtimeCapable.Swap(ok) != ok {
-			log.Info().Bool("capable", ok).Str("bin", m.cfg.FirecrackerBin).
-				Msg("firecracker clock-option capability changed")
-			return
-		}
-		// Only worth saying when someone asked for the behaviour: an older binary
-		// is the normal state until the fork's release is rolled out.
-		if first && !ok && m.cfg.GuestClockFreezeEnabled {
-			log.Warn().Str("bin", m.cfg.FirecrackerBin).
-				Msg("firecracker lacks the clock option; guest clock freeze stays off")
-		}
+		caps := firecrackerAdvertisedCaps(pctx, m.cfg.FirecrackerBin)
+		track(first, caps, clockRealtimeCap, &m.clockRealtimeCapable, m.cfg.GuestClockFreezeEnabled,
+			"firecracker clock-option capability changed",
+			"firecracker lacks the clock option; guest clock freeze stays off")
+		track(first, caps, dirtyTrackingSessionCap, &m.dirtyTrackingSessionCapable, m.cfg.DirtyTrackingSessionEnabled,
+			"firecracker dirty-tracking session capability changed",
+			"firecracker lacks the dirty-tracking session; guarded pauses stay off")
 	}
 	go func() {
 		probe(true)
@@ -167,6 +178,12 @@ func (m *Manager) clockPolicyFor(correctsWallClock bool) *bool {
 // caller logging the outcome describes what happened rather than what was asked
 // for — after a fallback those differ.
 func (m *Manager) restoreWithClockFallback(policy *bool, restore func(clockRealtime *bool) error) (usedPolicy bool, err error) {
+	// A refusal seen by any earlier attempt — including this restore's own
+	// session fallback, which re-enters here — already settled the answer;
+	// spend no request rediscovering it.
+	if policy != nil && !m.clockRealtimeCapable.Load() {
+		policy = nil
+	}
 	err = restore(policy)
 	if policy == nil || !isUnknownClockFieldErr(err) {
 		return policy != nil && err == nil, err

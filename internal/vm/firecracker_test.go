@@ -2,6 +2,7 @@ package vm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/superserve-ai/sandbox/internal/vm/fc/client/operations"
+	"github.com/superserve-ai/sandbox/internal/vm/fc/models"
 )
 
 // TestCreateSnapshot_FlattenFieldInJSONBody asserts that the Go-side enum
@@ -200,7 +204,7 @@ func TestRestoreSnapshot_AbortOnHandlerDeathInJSONBody(t *testing.T) {
 
 			if err := RestoreSnapshotUffdInternalWithOverrides(
 				socketPath, "/tmp/snap", "/tmp/mem", "", "", "", "eth0", "tap0", "",
-				false, tc.abort, nil,
+				false, tc.abort, "", nil,
 			); err != nil {
 				t.Fatalf("RestoreSnapshotUffdInternalWithOverrides: %v", err)
 			}
@@ -290,7 +294,7 @@ func TestRestoreSnapshot_ClockRealtimeInJSONBody(t *testing.T) {
 
 			if err := RestoreSnapshotUffdInternalWithOverrides(
 				socketPath, "/tmp/snap", "/tmp/mem", "", "", "", "eth0", "tap0", "",
-				false, false, tc.policy,
+				false, false, "", tc.policy,
 			); err != nil {
 				t.Fatalf("RestoreSnapshotUffdInternalWithOverrides: %v", err)
 			}
@@ -356,5 +360,30 @@ func TestIsLayeredInvalidErr(t *testing.T) {
 	}
 	if isLayeredInvalidErr(nil) {
 		t.Error("isLayeredInvalidErr(nil) = true, want false")
+	}
+}
+
+// The mismatch matcher keys on the fork's stable error_kind discriminator,
+// not the free-form fault message; an unparsed body still matches via the
+// serialized discriminator, and other 400s never do.
+func TestIsDirtyTrackingMismatchErr(t *testing.T) {
+	typed := operations.NewCreateSnapshotBadRequest()
+	typed.Payload = &models.Error{
+		FaultMessage: "Dirty-tracking session mismatch: the live dirty bitmap is not the baseline the caller armed",
+		ErrorKind:    "DirtyTrackingSessionMismatch",
+	}
+	if !isDirtyTrackingMismatchErr(fmt.Errorf("create diff snapshot: %w", typed)) {
+		t.Fatal("typed payload with the discriminator must match")
+	}
+	other := operations.NewCreateSnapshotBadRequest()
+	other.Payload = &models.Error{FaultMessage: "Cannot write memory file: disk full"}
+	if isDirtyTrackingMismatchErr(fmt.Errorf("create diff snapshot: %w", other)) {
+		t.Fatal("a 400 without the discriminator must not match")
+	}
+	if !isDirtyTrackingMismatchErr(errors.New(`unexpected body: {"error_kind":"DirtyTrackingSessionMismatch"}`)) {
+		t.Fatal("serialized discriminator in an unparsed body must match")
+	}
+	if isDirtyTrackingMismatchErr(errors.New("plain failure")) || isDirtyTrackingMismatchErr(nil) {
+		t.Fatal("unrelated errors and nil must not match")
 	}
 }
