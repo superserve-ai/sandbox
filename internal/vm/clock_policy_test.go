@@ -132,7 +132,7 @@ func TestRestoreWithClockFallback(t *testing.T) {
 
 		var sent []*bool
 		freeze := false
-		used, err := m.restoreWithClockFallback(&freeze, func(clock *bool) error {
+		used, err := m.restoreWithClockFallback(&freeze, nil, func(clock *bool) error {
 			sent = append(sent, clock)
 			if clock != nil {
 				return unknownField
@@ -165,7 +165,7 @@ func TestRestoreWithClockFallback(t *testing.T) {
 		boom := errors.New("load snapshot: connection refused")
 		calls := 0
 		freeze := false
-		used, err := m.restoreWithClockFallback(&freeze, func(*bool) error {
+		used, err := m.restoreWithClockFallback(&freeze, nil, func(*bool) error {
 			calls++
 			return boom
 		})
@@ -188,7 +188,7 @@ func TestRestoreWithClockFallback(t *testing.T) {
 		m := &Manager{log: zerolog.Nop()}
 		m.clockRealtimeCapable.Store(true)
 		calls := 0
-		_, err := m.restoreWithClockFallback(nil, func(*bool) error {
+		_, err := m.restoreWithClockFallback(nil, nil, func(*bool) error {
 			calls++
 			return unknownField
 		})
@@ -199,6 +199,38 @@ func TestRestoreWithClockFallback(t *testing.T) {
 			t.Errorf("calls = %d, want 1", calls)
 		}
 	})
+
+	// The step runs after the refusal and before the retry, and a retry it
+	// could not precede is not run at all.
+	t.Run("legacy_retry_runs_only_after_the_step", func(t *testing.T) {
+		m := &Manager{log: zerolog.Nop()}
+		m.clockRealtimeCapable.Store(true)
+		freeze := false
+		var order []string
+		_, err := m.restoreWithClockFallback(&freeze, func() error {
+			order = append(order, "step")
+			return nil
+		}, func(clock *bool) error {
+			if clock != nil {
+				order = append(order, "policy")
+				return unknownField
+			}
+			order = append(order, "legacy")
+			return nil
+		})
+		if err != nil || len(order) != 3 || order[0] != "policy" || order[1] != "step" || order[2] != "legacy" {
+			t.Fatalf("err=%v order=%v, want policy, step, legacy", err, order)
+		}
+		stepErr := errors.New("record not durable")
+		calls := 0
+		_, err = m.restoreWithClockFallback(&freeze, func() error { return stepErr }, func(*bool) error {
+			calls++
+			return unknownField
+		})
+		if !errors.Is(err, stepErr) || calls != 1 {
+			t.Fatalf("err=%v calls=%d, want the step's error and no retry", err, calls)
+		}
+	})
 }
 
 // A successful restore that kept the policy must report it, or rollout
@@ -207,7 +239,7 @@ func TestRestoreWithClockFallbackReportsPolicyUsed(t *testing.T) {
 	m := &Manager{log: zerolog.Nop()}
 	m.clockRealtimeCapable.Store(true)
 	freeze := false
-	used, err := m.restoreWithClockFallback(&freeze, func(*bool) error { return nil })
+	used, err := m.restoreWithClockFallback(&freeze, nil, func(*bool) error { return nil })
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}

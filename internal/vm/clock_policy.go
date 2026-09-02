@@ -173,13 +173,21 @@ func (m *Manager) clockPolicyFor(correctsWallClock bool) *bool {
 // Reports whether the restore that succeeded actually carried the policy, so a
 // caller logging the outcome describes what happened rather than what was asked
 // for — after a fallback those differ.
-func (m *Manager) restoreWithClockFallback(policy *bool, restore func(clockRealtime *bool) error) (usedPolicy bool, err error) {
+// beforeLegacy, if set, runs between the refusal and the retry, which is
+// skipped if it fails. The restore path makes the changed policy durable there,
+// so a crash after the legacy load cannot recover the guest as clock-frozen.
+func (m *Manager) restoreWithClockFallback(policy *bool, beforeLegacy func() error, restore func(clockRealtime *bool) error) (usedPolicy bool, err error) {
 	err = restore(policy)
 	if policy == nil || !isUnknownClockFieldErr(err) {
 		return policy != nil && err == nil, err
 	}
 	if m.clockRealtimeCapable.CompareAndSwap(true, false) {
 		m.log.Warn().Msg("firecracker rejected the clock option; falling back to legacy clock behaviour for every restore")
+	}
+	if beforeLegacy != nil {
+		if err := beforeLegacy(); err != nil {
+			return false, err
+		}
 	}
 	return false, restore(nil)
 }

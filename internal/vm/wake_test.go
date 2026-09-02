@@ -332,8 +332,8 @@ func TestRestoreInPlaceClockFallbackKeepsOverlayAndSlot(t *testing.T) {
 	if got, _ := os.ReadFile(overlay); string(got) != data {
 		t.Fatalf("overlay = %q, want the original contents", got)
 	}
-	if len(fake.setupCalls) != 1 || len(fake.teardownCalls) != 0 || len(fake.cleanupCalls) != 0 {
-		t.Fatalf("network setup=%v teardown=%v cleanup=%v; the slot must be kept", fake.setupCalls, fake.teardownCalls, fake.cleanupCalls)
+	if len(fake.setupCalls) != 1 || len(fake.teardownCalls) != 0 || len(fake.cleanupVMCalls) != 0 {
+		t.Fatalf("network setup=%v teardown=%v cleanup=%v; the slot must be kept", fake.setupCalls, fake.teardownCalls, fake.cleanupVMCalls)
 	}
 	mgr.mu.RLock()
 	tracked := mgr.vms["vm-1"] == inst
@@ -351,5 +351,122 @@ func TestRestoreInPlaceClockFallbackKeepsOverlayAndSlot(t *testing.T) {
 	}
 	if !mgr.guestClockUnready.Load() {
 		t.Error("host not latched")
+	}
+}
+
+// The vCPUs must not run ahead of the record that owes their wake: a restore
+// whose record cannot be made durable fails before the load.
+func TestRestoreAbortsBeforeLoadWithoutDurableWakeRecord(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	rw, err := OpenStateStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rw.Close()
+	store, err := OpenStateStoreReadOnly(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	basePath := filepath.Join(dir, "base.ext4")
+	for _, p := range []string{snapPath, memPath, basePath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := &fakeNetMgr{}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		cfg:        ManagerConfig{RunDir: dir},
+		netMgr:     fake,
+		state:      store,
+		vms:        map[string]*VMInstance{},
+		restoreSem: make(chan struct{}, 1),
+	}
+	launches := 0
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		launches++
+		return 4321, SupervisionUnit, nil
+	}
+	mgr.restoreSnapshotHook = func(string, string, string, *bool) error {
+		t.Error("snapshot loaded without a durable wake record")
+		return nil
+	}
+
+	_, err = mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath, DeltaDir: filepath.Join(dir, "delta")}, nil, "team", "owner", "", nil, 0)
+	if err == nil || launches != 1 {
+		t.Fatalf("err=%v launches=%d, want a failure after one launch", err, launches)
+	}
+	if len(fake.cleanupVMCalls) != 1 {
+		t.Errorf("cleanup calls = %v, want the slot released", fake.cleanupVMCalls)
+	}
+}
+
+// When Firecracker refuses the clock option, the record must say the clock ran
+// before the legacy retry can run the vCPUs.
+func TestRestoreLegacyRetrySeesDurableClockPolicy(t *testing.T) {
+	origWake := boxdWakeGuest
+	t.Cleanup(func() { boxdWakeGuest = origWake })
+	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool) error {
+		if frozen {
+			t.Error("the legacy restore ran the clock; the wake must say so")
+		}
+		return nil
+	}
+
+	dir := t.TempDir()
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	basePath := filepath.Join(dir, "base.ext4")
+	for _, p := range []string{snapPath, memPath, basePath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(WallClockMarkerPath(memPath), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		cfg:        ManagerConfig{RunDir: dir, GuestClockFreezeEnabled: true},
+		netMgr:     &fakeNetMgr{},
+		state:      store,
+		vms:        map[string]*VMInstance{},
+		restoreSem: make(chan struct{}, 1),
+	}
+	mgr.clockRealtimeCapable.Store(true)
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		return 4321, SupervisionUnit, nil
+	}
+	unknownField := errors.New("load snapshot: [PUT /snapshot/load][400] Bad Request: unknown field `clock_realtime`")
+	var durableAtRetry *VMRecord
+	mgr.restoreSnapshotHook = func(_, _, _ string, clock *bool) error {
+		if clock != nil {
+			return unknownField
+		}
+		durableAtRetry, _ = store.Get("vm-1")
+		return nil
+	}
+
+	inst, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath, DeltaDir: filepath.Join(dir, "delta")}, nil, "team", "owner", "", nil, 0)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if durableAtRetry == nil || durableAtRetry.ClockFrozen || !durableAtRetry.WakePending {
+		t.Fatalf("record at the legacy retry = %+v, want durable, clock running, wake owed", durableAtRetry)
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	if inst.ClockFrozen {
+		t.Error("instance still claims a frozen clock")
 	}
 }

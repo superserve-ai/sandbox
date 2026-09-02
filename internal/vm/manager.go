@@ -2355,6 +2355,8 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// exec-503 incidents.
 	probeStart := time.Now()
 	vmIP := inst.IP
+	// Resolved here: the goroutine outlives the call, and tests swap the seam.
+	wake := boxdWakeGuest
 	if resumeCorrectsWallClock {
 		log.Info().Int64("wait_boxd_ms", syncWake.Milliseconds()).Msg("guest awake after resume")
 		m.recordPhases("resume", "", map[string]time.Duration{"wait_boxd": syncWake})
@@ -2366,7 +2368,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		defer sentrylog.Recover("resume-boxd-probe")
 		probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := boxdWakeGuest(probeCtx, vmIP, 30*time.Second, false); err != nil {
+		if err := wake(probeCtx, vmIP, 30*time.Second, false); err != nil {
 			log.Warn().Err(err).
 				Int64("wait_boxd_ms", time.Since(probeStart).Milliseconds()).
 				Msg("boxd not reachable after resume")
@@ -2401,7 +2403,7 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 		if basePath != "" {
 			return false, false, fmt.Errorf("layered overlay %q requires UFFD resume (resume-uffd + uffd + tap); refusing File-backend restore", memPath)
 		}
-		used, rerr := m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+		used, rerr := m.restoreWithClockFallback(clockPolicy, nil, func(clock *bool) error {
 			return RestoreSnapshot(socketPath, snapshotPath, memPath, "", clock)
 		})
 		return false, used, rerr
@@ -2411,7 +2413,7 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 	// snapshot), pause snapshots don't — so resume-side prefetch is future work.
 	// basePath non-empty ⇒ layered restore (memPath is the diff overlay over basePath).
 	trackDirty := m.cfg.IncrementalSnapshotEnabled
-	used, rerr := m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+	used, rerr := m.restoreWithClockFallback(clockPolicy, nil, func(clock *bool) error {
 		return RestoreSnapshotUffdInternalWithOverrides(
 			socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
 			m.cfg.HandlerDeathAbortEnabled, clock,
@@ -3259,6 +3261,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("start firecracker: %w", startErr)
 		}
+		if !optimisticOK {
+			optimisticOK = m.persistState(inst)
+		}
+		if !optimisticOK {
+			// Fail closed: the vCPUs must not run ahead of the record that
+			// owes their wake.
+			tFailBoundary = time.Now()
+			m.stopUnitDuringRestoreError(vmID)
+			m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("vm %s: wake record could not be made durable before the load", vmID)
+		}
 		publishLaunchPID(inst, pid, supervision)
 		tFcReady = time.Now()
 
@@ -3305,10 +3319,21 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// File backend, which would load the sparse overlay as a full image (the base's
 		// pages read as zero holes).
 		overlayNeedsLayered := isOverlayMemFile(memPath) || hasSidecar
+		// If this Firecracker refuses the option, the record must say the clock
+		// ran before the legacy retry can run the vCPUs.
+		demote := func() error {
+			inst.mu.Lock()
+			inst.ClockFrozen = false
+			inst.mu.Unlock()
+			if !m.persistState(inst) {
+				return fmt.Errorf("vm %s: clock policy could not be made durable before the legacy restore", vmID)
+			}
+			return nil
+		}
 		restoreClockFrozen = false
 		switch {
 		case m.restoreSnapshotHook != nil:
-			restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+			restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
 				return m.restoreSnapshotHook(socketPath, snapshotPath, memPath, clock)
 			})
 		case overlayNeedsLayered && !(useUffd && m.cfg.ResumeUffdEnabled):
@@ -3357,7 +3382,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				inst.mu.Unlock()
 			}
 			if attemptErr == nil {
-				restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+				restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
 					return RestoreSnapshotUffdInternalWithOverrides(
 						socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
 						m.cfg.HandlerDeathAbortEnabled, clock,
@@ -3365,12 +3390,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				})
 			}
 		case inPlace:
-			restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+			restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
 				return RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir, clock)
 			})
 		default:
 			// UFFD disabled but fresh restore — File backend with network overrides.
-			restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, func(clock *bool) error {
+			restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
 				return RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir, clock)
 			})
 		}
