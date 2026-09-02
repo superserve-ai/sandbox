@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // A guest that reports it cannot correct its clock must fail the wait fast and
@@ -73,3 +75,75 @@ func TestWaitForGuestWakeReadyIsNil(t *testing.T) {
 }
 
 func jsonDecode(r *http.Request, v any) error { return json.NewDecoder(r.Body).Decode(v) }
+
+// A record that still owes a wake must get one on recovery — with the policy
+// its restore used — never a health poll, which would take a stopped workload
+// for a ready sandbox.
+func TestVerifyBoxdReadyCompletesAPendingWake(t *testing.T) {
+	origWake, origAdopt := boxdWakeGuest, adoptionBoxdReady
+	t.Cleanup(func() { boxdWakeGuest, adoptionBoxdReady = origWake, origAdopt })
+	m := &Manager{log: zerolog.Nop()}
+
+	t.Run("pending_wake_is_sent_with_its_policy", func(t *testing.T) {
+		var sawFrozen *bool
+		boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool) error {
+			sawFrozen = &frozen
+			return nil
+		}
+		adoptionBoxdReady = func(context.Context, *Manager, string) error {
+			t.Fatal("a pending wake must not be verified by health")
+			return nil
+		}
+		inst := &VMInstance{ID: "vm", WakePending: true, ClockFrozen: true}
+		if err := m.verifyBoxdReady(context.Background(), "10.0.0.2", inst); err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if sawFrozen == nil || !*sawFrozen {
+			t.Error("wake not sent, or sent without the frozen policy")
+		}
+		if inst.WakePending {
+			t.Error("WakePending still set after a completed wake")
+		}
+	})
+
+	t.Run("no_pending_wake_uses_health", func(t *testing.T) {
+		boxdWakeGuest = func(context.Context, string, time.Duration, bool) error {
+			t.Fatal("no wake owed; must not send one")
+			return nil
+		}
+		called := false
+		adoptionBoxdReady = func(context.Context, *Manager, string) error { called = true; return nil }
+		if err := m.verifyBoxdReady(context.Background(), "10.0.0.2", &VMInstance{ID: "vm"}); err != nil || !called {
+			t.Fatalf("err=%v called=%v; want health verification", err, called)
+		}
+	})
+
+	t.Run("uncorrectable_clock_latches_the_host_and_fails", func(t *testing.T) {
+		m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{GuestClockFreezeEnabled: true}}
+		m.clockRealtimeCapable.Store(true)
+		boxdWakeGuest = func(context.Context, string, time.Duration, bool) error { return ErrGuestClockUnready }
+		inst := &VMInstance{ID: "vm", WakePending: true, ClockFrozen: true}
+		if err := m.verifyBoxdReady(context.Background(), "10.0.0.2", inst); !errors.Is(err, ErrGuestClockUnready) {
+			t.Fatalf("err = %v, want ErrGuestClockUnready", err)
+		}
+		if !inst.WakePending {
+			t.Error("a failed wake must leave WakePending set")
+		}
+		if m.clockPolicyFor(true) != nil {
+			t.Error("host not latched to unfrozen restores")
+		}
+	})
+}
+
+// The wake state must survive a daemon restart, or recovery cannot know it
+// owes one.
+func TestWakeStateSurvivesRecordRoundTrip(t *testing.T) {
+	rec := toRecord(&VMInstance{ID: "vm", WakePending: true, ClockFrozen: true})
+	if !rec.WakePending || !rec.ClockFrozen {
+		t.Fatalf("toRecord dropped wake state: %+v", rec)
+	}
+	got := toInstance(rec)
+	if !got.WakePending || !got.ClockFrozen {
+		t.Errorf("toInstance dropped wake state: pending=%v frozen=%v", got.WakePending, got.ClockFrozen)
+	}
+}

@@ -199,11 +199,18 @@ type VMRecord struct {
 	// rewrites a record, so after a rollback and re-upgrade the field is absent
 	// again — decoding that silence as false would ignore a marker still on disk
 	// and delete it at the next pause. Nil means "ask the disk".
-	CorrectsWallClock *bool             `json:"corrects_wall_clock,omitempty"`
-	CreatedAt         time.Time         `json:"created_at"`
-	Metadata          map[string]string `json:"metadata,omitempty"`
-	VCPU              uint32            `json:"vcpu"`
-	MemoryMiB         uint32            `json:"memory_mib"`
+	CorrectsWallClock *bool `json:"corrects_wall_clock,omitempty"`
+	// WakePending: restored but the guest has not yet been told to correct its
+	// clock and release its workload. Written with the Running record, so a
+	// daemon that crashes between the two completes the wake on recovery
+	// instead of verifying a stopped workload as ready. ClockFrozen is the
+	// policy that restore used, which the wake must carry.
+	WakePending bool              `json:"wake_pending,omitempty"`
+	ClockFrozen bool              `json:"clock_frozen,omitempty"`
+	CreatedAt   time.Time         `json:"created_at"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	VCPU        uint32            `json:"vcpu"`
+	MemoryMiB   uint32            `json:"memory_mib"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
 	// dual-symlink mount namespace). DeltaDir is intentionally NOT
@@ -889,6 +896,8 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		MemFilePath:                inst.MemFilePath,
 		BaseMemPath:                inst.BaseMemPath,
 		CorrectsWallClock:          inst.CorrectsWallClock,
+		WakePending:                inst.WakePending,
+		ClockFrozen:                inst.ClockFrozen,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
@@ -981,6 +990,8 @@ func toInstance(rec VMRecord) *VMInstance {
 		MemFilePath:                rec.MemFilePath,
 		BaseMemPath:                rec.BaseMemPath,
 		CorrectsWallClock:          rec.CorrectsWallClock,
+		WakePending:                rec.WakePending,
+		ClockFrozen:                rec.ClockFrozen,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,

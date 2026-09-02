@@ -97,8 +97,8 @@ func TestFrozenStaysFrozenUntilTold(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		rec := httptest.NewRecorder()
 		handleHealth(clock, fz)(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
-		if rec.Code != 200 {
-			t.Fatalf("health %d while frozen, want 200 (it reports, it does not gate)", rec.Code)
+		if rec.Code != 503 {
+			t.Fatalf("health %d while frozen, want 503 (not ready, and it must not release)", rec.Code)
 		}
 	}
 	time.Sleep(20 * time.Millisecond)

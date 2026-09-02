@@ -122,10 +122,13 @@ type VMInstance struct {
 	// binary that predates the field drops it on round-trip, and treating that
 	// silence as "no" would strip a marker that is still valid.
 	CorrectsWallClock *bool
-	CreatedAt         time.Time
-	Metadata          map[string]string
-	TeamID            string // owning team; carried for data-plane usage attribution
-	OwnerID           string // creating user; empty when unknown
+	// WakePending / ClockFrozen: see VMRecord.
+	WakePending bool
+	ClockFrozen bool
+	CreatedAt   time.Time
+	Metadata    map[string]string
+	TeamID      string // owning team; carried for data-plane usage attribution
+	OwnerID     string // creating user; empty when unknown
 	// PausedAt records when this VM last entered the paused state. It drives
 	// oldest-first pressure reclamation. Zero means the field is unset on a
 	// legacy record; callers fall back to CreatedAt and then place any fully
@@ -2051,7 +2054,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// relaunches over a possibly-live guest. Evidence decides, with the
 		// gate restore adoption uses; success heals the marker durably.
 		tVerify = time.Now()
-		verr := m.verifyBoxdReady(ctx, existing.IP)
+		verr := m.verifyBoxdReady(ctx, existing.IP, existing)
 		verifyDur += time.Since(tVerify)
 		tVerify = time.Time{}
 		if verr != nil {
@@ -2159,105 +2162,117 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		return nil, err
 	}
 
-	tFcStart = time.Now()
-	inst.mu.RLock()
-	resumeExisting := inst.Supervision
-	inst.mu.RUnlock()
-	// freshUnit=false: a resume replaces a paused VM's slot, never a brand-new
-	// unit, so it must always run the linger query.
-	pid, resumeSupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, nsName, resumeExisting, true, false)
-	// Stamp before the error branch too: a cgroup launch that forked FC but
-	// failed socket-readiness (kill unconfirmed) leaves a live process, so the
-	// instance must say cgroup for a later destroy to kill it, not no-op a unit.
-	inst.mu.Lock()
-	inst.Supervision = resumeSupervision
-	inst.mu.Unlock()
-	if err != nil {
-		return nil, fmt.Errorf("start firecracker for restore: %w", err)
-	}
-	tFcDone = time.Now()
+	var (
+		pid                     int
+		basePath                string
+		dirtyTracked            bool
+		restoreErr              error
+		resumeClockFrozen       bool
+		resumeCorrectsWallClock bool
+		frozenWake              time.Duration
+	)
+	// Two passes at most: a frozen-clock restore whose guest cannot correct its
+	// clock is relaunched unfrozen. Only Firecracker is torn down between
+	// passes; the slot, the network, and this frame's cleanup are kept.
+	for pass := 0; ; pass++ {
+		tFcStart = time.Now()
+		inst.mu.RLock()
+		resumeExisting := inst.Supervision
+		inst.mu.RUnlock()
+		// freshUnit=false: a resume replaces a paused VM's slot, never a brand-new
+		// unit, so it must always run the linger query.
+		var resumeSupervision = resumeExisting
+		var err error
+		pid, resumeSupervision, err = m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, nsName, resumeExisting, true, false)
+		// Stamp before the error branch too: a cgroup launch that forked FC but
+		// failed socket-readiness (kill unconfirmed) leaves a live process, so the
+		// instance must say cgroup for a later destroy to kill it, not no-op a unit.
+		inst.mu.Lock()
+		inst.Supervision = resumeSupervision
+		inst.mu.Unlock()
+		if err != nil {
+			return nil, fmt.Errorf("start firecracker for restore: %w", err)
+		}
+		tFcDone = time.Now()
 
-	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
-	// A base is needed only when memPath is itself a diff overlay. Keying on memPath
-	// (not the cached BaseMemPath) means a standalone/override resume clears any
-	// stale base, so the next pause won't wrongly diff against the old template.
-	//
-	// The .base sidecar is authoritative for THIS overlay, so prefer it — the cached
-	// BaseMemPath only matches the cached overlay (inst.MemFilePath) and would supply
-	// the wrong base for an explicit override of a different mem.diff. Fall back to
-	// the cached base only when the sidecar is missing and this is the cached overlay.
-	basePath := ""
-	if isOverlayMemFile(memPath) {
-		if b, ok := readLayeredBase(memPath); ok {
-			basePath = b
-		} else if memPath == inst.MemFilePath {
-			basePath = inst.BaseMemPath
-		}
-		if basePath == "" {
-			m.stopUnitDuringRestoreError(vmID)
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
-		}
-	}
-	tRestore = time.Now()
-	var dirtyTracked bool
-	var restoreErr error
-	// Nil unless the real restore path ran and asked for a frozen clock; the test
-	// hook leaves it nil, which is also what the log should say.
-	var resumeClockFrozen bool
-	// A property of the guest alone — whether this host can act on it is decided
-	// separately, so an older binary does not erase it.
-	//
-	// An ordinary resume reloads the exact image this VM was paused into, and that
-	// pause recorded the property beside it and in the durable record. The record
-	// is therefore already the answer, and asking the filesystem again would put
-	// metadata I/O on the resume path for a fact we hold. Only an explicit
-	// override, which supplies an image this VM was not paused into, has to look.
-	inst.mu.RLock()
-	recordedCorrects, pausedMemPath := inst.CorrectsWallClock, inst.MemFilePath
-	inst.mu.RUnlock()
-	resumeCorrectsWallClock := resumeWallClockProperty(memPath, basePath, pausedMemPath, recordedCorrects)
-	if m.restoreForResumeHook != nil {
-		dirtyTracked, restoreErr = m.restoreForResumeHook(socketPath, snapshotPath, memPath, basePath, netInfo)
-	} else {
-		dirtyTracked, resumeClockFrozen, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo, m.clockPolicyFor(resumeCorrectsWallClock))
-	}
-	tRestoreDone = time.Now()
-	if restoreErr != nil {
-		// Firecracker is already running; stop the unit before returning or it leaks.
-		m.stopUnitDuringRestoreError(vmID)
-		if errors.Is(restoreErr, ErrTornSnapshot) {
-			return nil, status.Errorf(codes.DataLoss,
-				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
-				snapshotPath, restoreErr)
-		}
-		if errors.Is(restoreErr, ErrLayeredInvalidSnapshot) {
-			// Permanent: the overlay/base pairing is structurally invalid, so retrying
-			// the layered restore can't succeed. FailedPrecondition tells the caller not
-			// to retry (vs the generic Internal below, which it may).
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"snapshot %q has an invalid layered overlay/base pairing; do not retry: %v",
-				snapshotPath, restoreErr)
-		}
-		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
-	}
-
-	// A frozen-clock restore is not resumed until the guest has corrected its
-	// clock and released its workload. If it cannot, retry this same resume
-	// the unfrozen way — the host is latched, so the recursion takes that path.
-	var frozenWake time.Duration
-	if resumeClockFrozen {
-		tWake := time.Now()
-		werr := boxdWakeGuest(context.WithoutCancel(ctx), netInfo.HostIP, boxdResumeReadyBudget, true)
-		frozenWake = time.Since(tWake)
-		if werr != nil {
-			m.stopUnitDuringRestoreError(vmID)
-			if errors.Is(werr, ErrGuestClockUnready) {
-				m.noteGuestClockUnready(log, werr)
-				return m.resumeVMLocked(ctx, vmID, snapshotPath, memPath, networkRules)
+		log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
+		// A base is needed only when memPath is itself a diff overlay. Keying on memPath
+		// (not the cached BaseMemPath) means a standalone/override resume clears any
+		// stale base, so the next pause won't wrongly diff against the old template.
+		//
+		// The .base sidecar is authoritative for THIS overlay, so prefer it — the cached
+		// BaseMemPath only matches the cached overlay (inst.MemFilePath) and would supply
+		// the wrong base for an explicit override of a different mem.diff. Fall back to
+		// the cached base only when the sidecar is missing and this is the cached overlay.
+		basePath = ""
+		if isOverlayMemFile(memPath) {
+			if b, ok := readLayeredBase(memPath); ok {
+				basePath = b
+			} else if memPath == inst.MemFilePath {
+				basePath = inst.BaseMemPath
 			}
-			return nil, status.Errorf(codes.Unavailable, "guest did not wake after frozen restore: %v", werr)
+			if basePath == "" {
+				m.stopUnitDuringRestoreError(vmID)
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
+			}
 		}
+		tRestore = time.Now()
+		resumeClockFrozen = false
+		// A property of the guest alone — whether this host can act on it is decided
+		// separately, so an older binary does not erase it.
+		//
+		// An ordinary resume reloads the exact image this VM was paused into, and that
+		// pause recorded the property beside it and in the durable record. The record
+		// is therefore already the answer, and asking the filesystem again would put
+		// metadata I/O on the resume path for a fact we hold. Only an explicit
+		// override, which supplies an image this VM was not paused into, has to look.
+		inst.mu.RLock()
+		recordedCorrects, pausedMemPath := inst.CorrectsWallClock, inst.MemFilePath
+		inst.mu.RUnlock()
+		resumeCorrectsWallClock = resumeWallClockProperty(memPath, basePath, pausedMemPath, recordedCorrects)
+		if m.restoreForResumeHook != nil {
+			dirtyTracked, restoreErr = m.restoreForResumeHook(socketPath, snapshotPath, memPath, basePath, netInfo)
+		} else {
+			dirtyTracked, resumeClockFrozen, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo, m.clockPolicyFor(resumeCorrectsWallClock))
+		}
+		tRestoreDone = time.Now()
+		if restoreErr != nil {
+			// Firecracker is already running; stop the unit before returning or it leaks.
+			m.stopUnitDuringRestoreError(vmID)
+			if errors.Is(restoreErr, ErrTornSnapshot) {
+				return nil, status.Errorf(codes.DataLoss,
+					"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
+					snapshotPath, restoreErr)
+			}
+			if errors.Is(restoreErr, ErrLayeredInvalidSnapshot) {
+				// Permanent: the overlay/base pairing is structurally invalid, so retrying
+				// the layered restore can't succeed. FailedPrecondition tells the caller not
+				// to retry (vs the generic Internal below, which it may).
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"snapshot %q has an invalid layered overlay/base pairing; do not retry: %v",
+					snapshotPath, restoreErr)
+			}
+			return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
+		}
+
+		// A frozen-clock restore is not resumed until the guest has corrected its
+		// clock and released its workload. If it cannot, the second pass relaunches
+		// unfrozen: the host is latched, so the policy resolves to legacy.
+		if resumeClockFrozen {
+			tWake := time.Now()
+			werr := boxdWakeGuest(context.WithoutCancel(ctx), netInfo.HostIP, boxdResumeReadyBudget, true)
+			frozenWake = time.Since(tWake)
+			if werr != nil {
+				m.stopUnitDuringRestoreError(vmID)
+				if errors.Is(werr, ErrGuestClockUnready) && pass == 0 {
+					m.noteGuestClockUnready(log, werr)
+					continue
+				}
+				return nil, status.Errorf(codes.Unavailable, "guest did not wake after frozen restore: %v", werr)
+			}
+		}
+		break
 	}
 
 	inst.mu.RLock()
@@ -2273,7 +2288,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// snapshot, so this teardown discards nothing of value — but only a
 		// GENUINE verdict may reach it; see verifyBoxdReady.
 		tVerify = time.Now()
-		verr := m.verifyBoxdReady(ctx, netInfo.HostIP)
+		verr := m.verifyBoxdReady(ctx, netInfo.HostIP, inst)
 		verifyDur += time.Since(tVerify)
 		tVerify = time.Time{}
 		if verr != nil {
@@ -2838,7 +2853,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// passes. Verified records adopt without this gate: readiness was
 			// proven once, and a wedged boxd here must not demote a live VM.
 			tVerify := time.Now()
-			err := m.verifyBoxdReady(ctx, existing.IP)
+			err := m.verifyBoxdReady(ctx, existing.IP, existing)
 			// Emitted here, success and failure alike: this branch returns
 			// before the phase defer below is registered, and a crash-window
 			// adoption can wait out the whole probe budget.
@@ -3406,6 +3421,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// Cached so the next pause knows whether this guest fixes its own wall clock
 	// without going back to the filesystem to ask.
 	inst.CorrectsWallClock = &restoreCorrectsWallClock
+	// Persisted with Running: a crash before the wake below must complete it on
+	// recovery, not verify a stopped workload as ready.
+	inst.WakePending = true
+	inst.ClockFrozen = restoreClockFrozen
 	inst.mu.Unlock()
 	persistDone := make(chan struct{})
 	optimisticOK := false
@@ -3455,8 +3474,29 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	err := boxdWakeGuest(ctx, hostIP, readiness, restoreClockFrozen)
 	stopDiag()
 	if err != nil {
-		if errors.Is(err, ErrGuestClockUnready) {
+		if errors.Is(err, ErrGuestClockUnready) && restoreClockFrozen {
 			m.noteGuestClockUnready(log, err)
+			m.recordPhases("restore", "", map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
+			m.stopUnitDuringRestoreError(vmID)
+			m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
+			<-persistDone
+			inst.mu.RLock()
+			retained := inst.TeardownPending != ""
+			inst.mu.RUnlock()
+			if !retained {
+				// Nothing of this attempt survives, so the caller's retry is a fresh
+				// create — with the host latched, an unfrozen one. A retained
+				// instance (process not proven dead) belongs to the reconciler.
+				m.mu.Lock()
+				if m.vms[vmID] == inst {
+					delete(m.vms, vmID)
+				}
+				m.mu.Unlock()
+				m.deleteState(vmID)
+				return nil, fmt.Errorf("restore %s: %w", vmID, err)
+			}
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("restore %s: guest clock uncorrectable; instance retained for the reconciler: %v", vmID, err)
 		}
 		// Emit the exhausted readiness wait immediately, before teardown, so
 		// the sample measures the probe (not unit stop + resource release +
@@ -3577,6 +3617,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	inst.mu.Lock()
 	inst.Unverified = false
+	inst.WakePending = false
 	inst.mu.Unlock()
 	// Persist-then-verify: checking AFTER the write leaves no window — a
 	// concurrent DestroyVM either erased the record itself or is caught here,
@@ -7610,8 +7651,27 @@ var adoptionBoxdReady = func(ctx context.Context, m *Manager, ip string) error {
 // of it, so an inherited ctx always expires first and every attempt would end
 // "no verdict", leaving the record unchanged for the next attempt to repeat.
 // The wall-clock bound inside waitForBoxd still caps the wait.
-func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string) error {
-	return adoptionBoxdReady(context.WithoutCancel(callerCtx), m, ip)
+// verifyBoxdReady re-establishes readiness for a record whose readiness was
+// never proven. A record still owing a wake gets one, with the policy its
+// restore used: a health poll would accept a stopped workload as ready.
+func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string, inst *VMInstance) error {
+	ctx := context.WithoutCancel(callerCtx)
+	inst.mu.RLock()
+	pending, frozen := inst.WakePending, inst.ClockFrozen
+	inst.mu.RUnlock()
+	if !pending {
+		return adoptionBoxdReady(ctx, m, ip)
+	}
+	if err := boxdWakeGuest(ctx, ip, 30*time.Second, frozen); err != nil {
+		if errors.Is(err, ErrGuestClockUnready) {
+			m.noteGuestClockUnready(m.log.With().Str("vm_id", inst.ID).Logger(), err)
+		}
+		return err
+	}
+	inst.mu.Lock()
+	inst.WakePending = false
+	inst.mu.Unlock()
+	return nil
 }
 
 // commitResumeState persists a resumed instance and verifies the VM was not

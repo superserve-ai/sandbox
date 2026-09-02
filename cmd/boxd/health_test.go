@@ -105,8 +105,8 @@ func TestHealthNeverMutates(t *testing.T) {
 	_ = fz.freeze(bg())
 	src := &fakeSource{host: base.Add(time.Hour)}
 	code, body := health(clockUnder(src, base), fz, "")
-	if code != 200 || body["status"] != "frozen" {
-		t.Fatalf("code %d body %v, want 200 frozen", code, body)
+	if code != 503 || body["status"] != "frozen" {
+		t.Fatalf("code %d body %v, want 503 frozen — a stopped workload is not ready", code, body)
 	}
 	if src.setTo != nil {
 		t.Error("health stepped the clock")

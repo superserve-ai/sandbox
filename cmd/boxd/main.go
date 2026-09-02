@@ -158,8 +158,9 @@ func main() {
 
 // handleHealth is what the supervisor polls for readiness, so it is where the
 // wall clock is corrected and the workload thawed once the clock is right.
-// /health reports and never releases the workload: only /wake does that, and
-// only the supervisor sends it. ?verify=settime proves the clock can be set.
+// /health never releases the workload — only /wake does — and reports 503
+// while it is stopped, so no supervisor can take a frozen guest for a ready
+// one. ?verify=settime proves the clock can be set.
 func handleHealth(clock *wallClock, fz *freezer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		wc := clock.status()
@@ -171,10 +172,13 @@ func handleHealth(clock *wallClock, fz *freezer) http.HandlerFunc {
 			}
 		}
 		status := "ok"
-		if fz.isFrozen() {
-			status = "frozen"
-		}
 		w.Header().Set("Content-Type", "application/json")
+		if fz.isFrozen() {
+			// Not ready: a stopped workload must never read as a ready sandbox,
+			// least of all to a supervisor that does not know to send /wake.
+			status = "frozen"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
 		json.NewEncoder(w).Encode(struct {
 			Status    string          `json:"status"`
 			WallClock wallClockStatus `json:"wall_clock"`

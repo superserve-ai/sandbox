@@ -315,7 +315,14 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	// from this template's snapshot.
 	// Ask the guest, in the state the snapshot captures, whether it can correct
 	// its wall clock and freeze its workload; only then may the image be marked.
-	correctsWallClock, why := boxdWallClockProven(ctx, netInfo.HostIP)
+	// A frozen image is only safe under a supervisor that speaks /wake; an
+	// older one reads a stopped workload as a ready sandbox. So freezing at
+	// build is a separate switch, thrown only once every supervisor has been
+	// upgraded — and never rolled back below that once frozen images exist.
+	correctsWallClock, why := false, "template workload freezing not enabled"
+	if os.Getenv("TEMPLATE_FREEZE_WORKLOAD") == "true" {
+		correctsWallClock, why = boxdWallClockProven(ctx, netInfo.HostIP)
+	}
 	if correctsWallClock {
 		// The build VM is discarded afterwards, so no thaw.
 		if err := boxdFreezeWorkload(ctx, netInfo.HostIP); err != nil {

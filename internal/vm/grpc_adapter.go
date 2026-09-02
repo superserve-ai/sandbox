@@ -54,11 +54,11 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 	entries := make([]*vmdpb.ArtifactManifestEntry, 0, len(manifest))
 	for _, e := range manifest {
 		entry := &vmdpb.ArtifactManifestEntry{
-			FileName:  e.FileName,
-			Path:      e.Path,
-			SizeBytes: e.SizeBytes,
-			Sha256:    e.SHA256,
-			BasePath:  e.BasePath,
+			FileName:       e.FileName,
+			Path:           e.Path,
+			SizeBytes:      e.SizeBytes,
+			Sha256:         e.SHA256,
+			BasePath:       e.BasePath,
 			AllocatedBytes: e.AllocatedBytes,
 		}
 		entries = append(entries, entry)
