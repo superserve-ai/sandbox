@@ -129,3 +129,21 @@ func TestHealthVerifySettime(t *testing.T) {
 		t.Errorf("settime_ok reported despite EPERM: %v", body)
 	}
 }
+
+// A wake that does not say whether the clock was frozen releases nothing.
+func TestWakeWithoutClockFrozenIsRefused(t *testing.T) {
+	for _, body := range []string{"", "{}", "not json", `{"clock_frozen":"yes"}`} {
+		cg := newFake()
+		fz := newFreezer(cg, testDir)
+		_ = fz.freeze(bg())
+		src := &fakeSource{host: base.Add(48 * time.Hour)}
+		rec := httptest.NewRecorder()
+		handleWake(clockUnder(src, base), fz)(rec, httptest.NewRequest(http.MethodPost, "/wake", strings.NewReader(body)))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("body %q: code %d, want 400", body, rec.Code)
+		}
+		if !fz.isFrozen() || src.setTo != nil {
+			t.Errorf("body %q: frozen=%v clockSet=%v; a refused wake must change nothing", body, fz.isFrozen(), src.setTo != nil)
+		}
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -237,12 +238,15 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			ClockFrozen bool `json:"clock_frozen"`
+			ClockFrozen *bool `json:"clock_frozen"`
 		}
-		if r.Body != nil {
-			_ = json.NewDecoder(r.Body).Decode(&body)
+		if r.Body == nil || json.NewDecoder(r.Body).Decode(&body) != nil || body.ClockFrozen == nil {
+			// A wake that does not say whether the clock was frozen releases
+			// nothing.
+			http.Error(w, "clock_frozen required", http.StatusBadRequest)
+			return
 		}
-		wc, ready := clock.sync(body.ClockFrozen)
+		wc, ready := clock.sync(*body.ClockFrozen)
 		status := "ok"
 		if ready {
 			if err := fz.thaw(); err != nil {
@@ -261,5 +265,42 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 			Status    string          `json:"status"`
 			WallClock wallClockStatus `json:"wall_clock"`
 		}{Status: status, WallClock: wc})
+	}
+}
+
+// The lifecycle routes are the supervisor's, on a listener every process in
+// the sandbox can reach. A connection from one of the guest's own addresses is
+// refused. A root process can still bind another address, so this guards
+// against accident, not a boundary.
+var localAddrs = net.InterfaceAddrs
+
+func fromGuest(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+		return true
+	}
+	addrs, err := localAddrs()
+	if err != nil {
+		return true
+	}
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func hostOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if fromGuest(r.RemoteAddr) {
+			http.Error(w, "supervisor only", http.StatusForbidden)
+			return
+		}
+		next(w, r)
 	}
 }

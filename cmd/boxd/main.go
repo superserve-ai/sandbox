@@ -135,9 +135,9 @@ func main() {
 	mux.HandleFunc("/init", handleInit(ctx))
 	clock := newWallClock(newWallClockSource())
 	mux.HandleFunc("/health", handleHealth(clock, fz))
-	mux.HandleFunc("/freeze", fz.handleFreeze)
-	mux.HandleFunc("/thaw", fz.handleThaw)
-	mux.HandleFunc("/wake", handleWake(clock, fz))
+	mux.HandleFunc("/freeze", hostOnly(fz.handleFreeze))
+	mux.HandleFunc("/thaw", hostOnly(fz.handleThaw))
+	mux.HandleFunc("/wake", hostOnly(handleWake(clock, fz)))
 	mux.HandleFunc("/exec", procService.handleExec)
 	mux.HandleFunc("/exec/stream", procService.handleExecStream)
 
