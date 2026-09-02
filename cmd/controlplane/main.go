@@ -25,7 +25,6 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
-	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
@@ -484,7 +483,7 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir, pa
 			SizeBytes:      e.GetSizeBytes(),
 			SHA256:         e.GetSha256(),
 			BasePath:       e.GetBasePath(),
-			AllocatedBytes: artifactManifestAllocatedBytes(e),
+			AllocatedBytes: e.GetAllocatedBytes(),
 		})
 	}
 	acked := ""
@@ -795,29 +794,6 @@ func (c *grpcVMDClient) GetBuildStatus(ctx context.Context, buildVMID string) (v
 		StartedAtUnix:           resp.GetStartedAtUnix(),
 		EndedAtUnix:             resp.GetEndedAtUnix(),
 	}, nil
-}
-
-func artifactManifestAllocatedBytes(entry *vmdpb.ArtifactManifestEntry) int64 {
-	if entry == nil {
-		return -1
-	}
-	unknown := entry.ProtoReflect().GetUnknown()
-	for len(unknown) > 0 {
-		num, typ, n := protowire.ConsumeTag(unknown)
-		if n < 0 {
-			break
-		}
-		unknown = unknown[n:]
-		value, n := protowire.ConsumeVarint(unknown)
-		if n < 0 {
-			break
-		}
-		unknown = unknown[n:]
-		if num == 6 && typ == protowire.VarintType {
-			return int64(value)
-		}
-	}
-	return -1
 }
 
 func (c *grpcVMDClient) CancelBuild(ctx context.Context, buildVMID string) error {
