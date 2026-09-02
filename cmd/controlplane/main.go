@@ -498,6 +498,12 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 		VmId:         vmID,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
+		// Fixed here rather than taken from the caller: this RPC only ever
+		// resumes. Declared all the same, because a daemon enforcing local
+		// capacity refuses an undeclared intent on every boot path, and a
+		// client that set it on one path but not the other would fail on
+		// whichever it forgot.
+		AdmissionIntent: vmdpb.AdmissionIntent_ADMISSION_INTENT_RESUME,
 	}
 	if len(networkConfig) > 0 {
 		var persisted struct {
@@ -536,7 +542,7 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. For
 // sandboxes with secrets the caller passes envVars=nil and pushes env via
 // InjectSandboxEnv after minting a JWT against the returned source IP.
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits vmdclient.ResourceLimits, intent vmdclient.AdmissionIntent) (string, uint32, uint32, string, error) {
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
 		VmId:                  vmID,
 		SnapshotPath:          snapshotPath,
@@ -555,6 +561,10 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 		// counted as unsized until that lands. Omitted (zero) only by
 		// callers that do not know the shape.
 		ResourceLimits: restoreResourceLimits(limits),
+		// Declared, never inferred: this same RPC serves both a create
+		// and the stateless-resume fallback below, and a daemon
+		// enforcing capacity has no way to tell them apart.
+		AdmissionIntent: admissionIntentToProto(intent),
 	})
 	if err != nil {
 		return "", 0, 0, "", fmt.Errorf("gRPC RestoreSnapshot: %w", err)
@@ -936,4 +946,18 @@ func (s *deadHostClientStream) RecvMsg(m any) error {
 		s.onDead()
 	}
 	return err
+}
+
+// admissionIntentToProto maps the control plane's intent onto the wire
+// enum. The two are separate types so call sites in internal/api do not
+// depend on generated protobuf code; this is the only place they meet.
+func admissionIntentToProto(i vmdclient.AdmissionIntent) vmdpb.AdmissionIntent {
+	switch i {
+	case vmdclient.IntentCreate:
+		return vmdpb.AdmissionIntent_ADMISSION_INTENT_CREATE
+	case vmdclient.IntentResume:
+		return vmdpb.AdmissionIntent_ADMISSION_INTENT_RESUME
+	default:
+		return vmdpb.AdmissionIntent_ADMISSION_INTENT_UNSPECIFIED
+	}
 }

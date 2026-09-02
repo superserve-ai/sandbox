@@ -927,7 +927,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			ipAddress, actualVcpu, actualMemMiB, _, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, nil,
 				// The row is authoritative for a sandbox that already
 				// exists; declaring it spares the daemon a probe.
-				vmdclient.ResourceLimits{VCPU: uint32(sandbox.VcpuCount), MemoryMiB: uint32(sandbox.MemoryMib)})
+				vmdclient.ResourceLimits{VCPU: uint32(sandbox.VcpuCount), MemoryMiB: uint32(sandbox.MemoryMib)},
+				// A resume, not a create: this fallback runs for a sandbox that
+				// already exists and is bound to this host. Declaring CREATE here
+				// would charge it a second time and let a full host refuse a
+				// sandbox that has nowhere else to go.
+				vmdclient.IntentResume)
 			fcancel()
 			if err != nil {
 				l.Error().Err(err).Msg("VMD RestoreSnapshot fallback failed")
@@ -2481,7 +2486,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			// Same shape the sandbox row is being inserted with (the
 			// template's, or the defaults) — declared so the daemon
 			// never has to ask Firecracker for it afterwards.
-			vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB)})
+			vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB)},
+			// A genuine create: this sandbox does not exist yet, so a host
+			// enforcing capacity may refuse it and the control plane may
+			// place it elsewhere. The stateless-resume fallback shares this
+			// RPC and declares RESUME instead.
+			vmdclient.IntentCreate)
 		previewProtocol = protocol
 		return ip, vcpu, memMiB, err
 	})
