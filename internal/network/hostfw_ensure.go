@@ -255,19 +255,24 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 			}
 			return fwRule{}, false
 		}
-		// below: the foreign rules the snapshot proves were beneath our last
-		// head rule. Everything else in the current chain is treated as
-		// having been above us.
-		below := map[string]bool{}
+		// suffix: the foreign rules the snapshot proves were beneath our
+		// last head rule, IN ORDER — occurrence matters, since identical
+		// foreign rules can sit on both sides of the boundary. With no
+		// head of ours in the snapshot there is no boundary to prove, and
+		// the suffix stays empty: every current foreign rule reads as
+		// above us.
+		var suffix [][]string
 		lastHead := -1
 		for i, g := range snapshot.rules[key] {
 			if w, mine := ours(g); mine && headRule(key, w) {
 				lastHead = i
 			}
 		}
-		for i, g := range snapshot.rules[key] {
-			if _, mine := ours(g); !mine && i > lastHead {
-				below[strings.Join(g, "\x00")] = true
+		if lastHead >= 0 {
+			for _, g := range snapshot.rules[key][lastHead+1:] {
+				if _, mine := ours(g); !mine {
+					suffix = append(suffix, g)
+				}
 			}
 		}
 		var lines []string
@@ -279,11 +284,27 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 			}
 			rest = append(rest, g)
 		}
+		// Right-align the suffix against the current chain: scanning from
+		// the end pairs each suffix rule with its LATEST occurrence, so a
+		// duplicate sitting above the boundary is never mistaken for the
+		// one below it, and the anchor is the latest position that still
+		// keeps every provably-below rule beneath us. If the suffix cannot
+		// be aligned at all (a rule of it vanished), nothing is provable
+		// and ours go below everything.
 		anchor := len(rest)
-		for i, g := range rest {
-			if _, mine := ours(g); !mine && below[strings.Join(g, "\x00")] {
-				anchor = i
-				break
+		if len(suffix) > 0 {
+			si := len(suffix) - 1
+			for ri := len(rest) - 1; ri >= 0 && si >= 0; ri-- {
+				if _, mine := ours(rest[ri]); mine || !slices.Equal(rest[ri], suffix[si]) {
+					continue
+				}
+				if si == 0 {
+					anchor = ri
+				}
+				si--
+			}
+			if si >= 0 {
+				anchor = len(rest)
 			}
 		}
 		var heads [][]string

@@ -1516,6 +1516,75 @@ func TestRacedInsertYieldsBelowInterloper(t *testing.T) {
 		}
 	})
 
+	t.Run("duplicate harmless rule on both sides of the boundary", func(t *testing.T) {
+		// The same harmless rule sits above AND below our jumps. A
+		// token-set anchor would pick the upper occurrence and re-head us
+		// above the writer's DROP; occurrence-aware alignment must pick the
+		// lower one so the DROP stays above us.
+		spec := testSpec(true)
+		rules, chains := specKernel(spec, nil)
+		dup := []string{"-i", "br0", "-o", "br1", "-j", "ACCEPT"}
+		fw := rules["filter/FORWARD"]
+		fw[0], fw[1] = fw[1], fw[0] // misordered jumps force a repair
+		rules["filter/FORWARD"] = append(append([][]string{dup}, fw...), dup)
+		k := &fakeKernel{rules: rules, chains: chains}
+		defer k.install(t)()
+		raced := false
+		inner := restoreIPTables
+		restoreIPTables = func(ctx context.Context, input string) error {
+			if !raced && strings.HasPrefix(input, "*filter") && strings.Contains(input, "-I FORWARD 1") {
+				raced = true
+				cur := k.rules["filter/FORWARD"]
+				k.rules["filter/FORWARD"] = append([][]string{cur[0], interloper}, cur[1:]...)
+			}
+			return inner(ctx, input)
+		}
+		defer func() { restoreIPTables = inner }()
+		if err := ensureOwner(t); err != nil {
+			t.Fatalf("ensure after a race beside duplicate foreign rules: %v", err)
+		}
+		fw = k.rules["filter/FORWARD"]
+		want := "[dup, DROP, jump, jump, dup]"
+		if len(fw) != 5 || !ruleEqual(dup, fw[0]) || !ruleEqual(interloper, fw[1]) || !hasVMDMarker(fw[2]) || !hasVMDMarker(fw[3]) || !ruleEqual(dup, fw[4]) {
+			t.Fatalf("want %s, got %v", want, fw)
+		}
+		if ok, class := mustVerify(t, renderDump(k.rules, k.chains), spec); !ok {
+			t.Fatalf("yielded layout not verified: %s", class)
+		}
+	})
+
+	t.Run("first rollout beside a known harmless rule", func(t *testing.T) {
+		// No head of ours exists yet, so nothing is provably below us: the
+		// writer's DROP inserted after the known rule must end up above
+		// our jumps, not beneath them.
+		spec := testSpec(true)
+		rules, chains := specKernel(spec, nil)
+		known := []string{"-i", "br0", "-o", "br1", "-j", "ACCEPT"}
+		rules["filter/FORWARD"] = [][]string{known}
+		k := &fakeKernel{rules: rules, chains: chains}
+		defer k.install(t)()
+		raced := false
+		inner := restoreIPTables
+		restoreIPTables = func(ctx context.Context, input string) error {
+			if !raced && strings.HasPrefix(input, "*filter") && strings.Contains(input, "-I FORWARD 1") {
+				raced = true
+				k.rules["filter/FORWARD"] = append(k.rules["filter/FORWARD"], interloper)
+			}
+			return inner(ctx, input)
+		}
+		defer func() { restoreIPTables = inner }()
+		if err := ensureOwner(t); err != nil {
+			t.Fatalf("ensure after a raced first rollout beside a known rule: %v", err)
+		}
+		fw := k.rules["filter/FORWARD"]
+		if len(fw) != 4 || !ruleEqual(known, fw[0]) || !ruleEqual(interloper, fw[1]) || !hasVMDMarker(fw[2]) || !hasVMDMarker(fw[3]) {
+			t.Fatalf("want [known, DROP, jump, jump], got %v", fw)
+		}
+		if ok, class := mustVerify(t, renderDump(k.rules, k.chains), spec); !ok {
+			t.Fatalf("yielded layout not verified: %s", class)
+		}
+	})
+
 	t.Run("established host keeps enforcement throughout", func(t *testing.T) {
 		spec := testSpec(true)
 		rules, chains := specKernel(spec, nil)
