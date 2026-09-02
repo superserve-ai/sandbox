@@ -279,17 +279,23 @@ func checkRollbackGuard(script, dropIn string) error {
 // any exec or read error reads as absent, so arming never proceeds on an
 // unverifiable binary. Runs once at arm time, not on the launch path.
 func firecrackerAdvertisesCap(ctx context.Context, fcBin, cap string) bool {
+	return firecrackerAdvertisedCaps(ctx, fcBin)[cap]
+}
+
+// firecrackerAdvertisedCaps returns every capability the binary lists, from a
+// single --version exec; an exec or read error reads as none.
+func firecrackerAdvertisedCaps(ctx context.Context, fcBin string) map[string]bool {
+	caps := map[string]bool{}
 	out, err := exec.CommandContext(ctx, fcBin, "--version").Output()
 	if err != nil {
-		return false
+		return caps
 	}
-	want := "capability: " + cap
 	for _, line := range strings.Split(string(out), "\n") {
-		if strings.TrimSpace(line) == want {
-			return true
+		if name, ok := strings.CutPrefix(strings.TrimSpace(line), "capability: "); ok {
+			caps[name] = true
 		}
 	}
-	return false
+	return caps
 }
 
 // unitStringProperty reads a unit property via D-Bus (Unit interface unless

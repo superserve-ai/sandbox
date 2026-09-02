@@ -699,6 +699,10 @@ func main() {
 	resumeUffdEnabled := envOrDefault("VMD_RESUME_UFFD", "false") == "true"
 	verifySnapshotEnabled := envOrDefault("VMD_VERIFY_SNAPSHOT_ENABLED", "false") == "true"
 	incrementalSnapshotEnabled := envOrDefault("VMD_INCREMENTAL_SNAPSHOT", "false") == "true"
+	// Safe to enable ahead of the Firecracker rollout: sessions are armed only
+	// once the binary advertises the capability, and a rollback degrades to
+	// the unguarded behavior. Off is exactly today's behavior.
+	dirtyTrackingSessionEnabled := envOrDefault("VMD_DIRTY_TRACKING_SESSION", "false") == "true"
 	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
 	// Off by default: it only does anything for a snapshot whose guest corrects
 	// its own wall clock, and forcing legacy is the way back if one misbehaves.
@@ -882,6 +886,7 @@ func main() {
 		ResumeUffdEnabled:                   resumeUffdEnabled,
 		VerifySnapshotEnabled:               verifySnapshotEnabled,
 		IncrementalSnapshotEnabled:          incrementalSnapshotEnabled,
+		DirtyTrackingSessionEnabled:         dirtyTrackingSessionEnabled,
 		HandlerDeathAbortEnabled:            handlerDeathAbortEnabled,
 		GuestClockFreezeEnabled:             guestClockFreezeEnabled,
 		GuestFreezeBudget:                   guestFreezeBudget,

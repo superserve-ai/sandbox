@@ -303,6 +303,17 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 		m.healPendingBackup(pb, log)
 		return
 	}
+	// The same at-rest proof that admits the backup is what an overlay
+	// stranded by this pause's Full fallback was waiting for. Under the
+	// vm-op lock so the record write cannot race a lifecycle op; a held
+	// lock means one is in flight and will resolve the deferral itself, or
+	// the sweep retries.
+	if unlock, ok := m.tryLockVMOp(pb.VMID); ok {
+		if inst := m.trackedInstance(pb.VMID); inst != nil {
+			m.reclaimStrandedOverlays(inst, log)
+		}
+		unlock()
+	}
 	if pb.DiskBasePath != "" {
 		// The base dependency's identity must be the PAUSE-TIME one: a
 		// base replaced or rebuilt at the same path after the pause

@@ -48,6 +48,12 @@ type SnapshotLoadParams struct {
 
 	// Enable dirty page tracking to improve space efficiency of diff snapshots
 	TrackDirtyPages bool `json:"track_dirty_pages,omitempty"`
+
+	// Caller-chosen dirty-tracking session id. Requires track_dirty_pages (rejected as a bad request otherwise); installs a (session_id, generation=0) token that guarded snapshot requests (expected_session_id/expected_generation on PUT /snapshot/create) can later compare against. MUST be freshly generated for every load (a random nonce or UUID), never a stable identifier such as a VM name - every new process re-arms at generation 0, so a reused id would let a token persisted from an earlier process validate against a dirty bitmap it never described. Support is advertised by the dirty-tracking-session capability in the --version output.
+	// Max Length: 128
+	// Min Length: 1
+	// Pattern: ^[A-Za-z0-9_-]+$
+	TrackingSessionID string `json:"tracking_session_id,omitempty"`
 }
 
 // Validate validates this snapshot load params
@@ -63,6 +69,10 @@ func (m *SnapshotLoadParams) Validate(formats strfmt.Registry) error {
 	}
 
 	if err := m.validateSnapshotPath(formats); err != nil {
+		res = append(res, err)
+	}
+
+	if err := m.validateTrackingSessionID(formats); err != nil {
 		res = append(res, err)
 	}
 
@@ -128,6 +138,26 @@ func (m *SnapshotLoadParams) validateNetworkOverrides(formats strfmt.Registry) e
 func (m *SnapshotLoadParams) validateSnapshotPath(formats strfmt.Registry) error {
 
 	if err := validate.Required("snapshot_path", "body", m.SnapshotPath); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (m *SnapshotLoadParams) validateTrackingSessionID(formats strfmt.Registry) error {
+	if swag.IsZero(m.TrackingSessionID) { // not required
+		return nil
+	}
+
+	if err := validate.MinLength("tracking_session_id", "body", m.TrackingSessionID, 1); err != nil {
+		return err
+	}
+
+	if err := validate.MaxLength("tracking_session_id", "body", m.TrackingSessionID, 128); err != nil {
+		return err
+	}
+
+	if err := validate.Pattern("tracking_session_id", "body", m.TrackingSessionID, `^[A-Za-z0-9_-]+$`); err != nil {
 		return err
 	}
 

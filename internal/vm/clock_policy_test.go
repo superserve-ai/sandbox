@@ -222,6 +222,7 @@ func TestRestoreWithClockFallback(t *testing.T) {
 			t.Fatalf("err=%v order=%v, want policy, step, legacy", err, order)
 		}
 		stepErr := errors.New("record not durable")
+		m.clockRealtimeCapable.Store(true)
 		calls := 0
 		_, err = m.restoreWithClockFallback(&freeze, func() error { return stepErr }, func(*bool) error {
 			calls++
@@ -333,6 +334,7 @@ func TestWatchFirecrackerCapability(t *testing.T) {
 		body := "#!/bin/sh\necho 'Firecracker v1.15.0'\n"
 		if advertises {
 			body += "echo 'capability: " + clockRealtimeCap + "'\n"
+			body += "echo 'capability: " + dirtyTrackingSessionCap + "'\n"
 		}
 		if err := os.WriteFile(bin, []byte(body), 0o755); err != nil {
 			t.Fatalf("write fake firecracker: %v", err)
@@ -344,12 +346,13 @@ func TestWatchFirecrackerCapability(t *testing.T) {
 		t.Helper()
 		deadline := time.Now().Add(3 * time.Second)
 		for time.Now().Before(deadline) {
-			if m.clockRealtimeCapable.Load() == want {
+			// One probe answers for both; they must move together.
+			if m.clockRealtimeCapable.Load() == want && m.dirtyTrackingSessionCapable.Load() == want {
 				return
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
-		t.Fatalf("capability never became %v", want)
+		t.Fatalf("capabilities never both became %v", want)
 	}
 
 	t.Run("promotes_when_the_binary_advertises", func(t *testing.T) {
@@ -367,7 +370,7 @@ func TestWatchFirecrackerCapability(t *testing.T) {
 		m.WatchFirecrackerCapability(ctx, zerolog.Nop())
 		// Give the first probe room to run before concluding it stayed false.
 		time.Sleep(200 * time.Millisecond)
-		if m.clockRealtimeCapable.Load() {
+		if m.clockRealtimeCapable.Load() || m.dirtyTrackingSessionCapable.Load() {
 			t.Error("capability true for a binary that does not advertise it")
 		}
 	})

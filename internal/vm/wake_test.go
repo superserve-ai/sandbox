@@ -220,7 +220,7 @@ func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
 	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
 		return 4321, SupervisionUnit, nil
 	}
-	mgr.restoreForResumeHook = func(string, string, string, string, *network.VMNetInfo) (bool, error) { return false, nil }
+	mgr.restoreForResumeHook = func(string, string, string, string, *network.VMNetInfo) (bool, string, error) { return false, "", nil }
 	wakes := 0
 	var sawFrozen bool
 	var statusAtWake VMStatus
