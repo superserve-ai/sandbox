@@ -7,11 +7,16 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/network"
 )
 
 // A guest that reports it cannot correct its clock must fail the wait fast and
@@ -145,5 +150,206 @@ func TestWakeStateSurvivesRecordRoundTrip(t *testing.T) {
 	got := toInstance(rec)
 	if !got.WakePending || !got.ClockFrozen {
 		t.Errorf("toInstance dropped wake state: pending=%v frozen=%v", got.WakePending, got.ClockFrozen)
+	}
+}
+
+// A guest from before the wake protocol answers /wake with 404. With nothing
+// frozen its health is its readiness; with a frozen clock nothing but /wake
+// may vouch for it.
+func TestWaitForGuestWakeLegacyGuest(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(boxdPort))
+	if err != nil {
+		t.Skipf("port %d busy: %v", boxdPort, err)
+	}
+	var healthPolls atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" && r.Method == http.MethodGet {
+			healthPolls.Add(1)
+			w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	srv.Listener = ln
+	srv.Start()
+	defer srv.Close()
+
+	if err := waitForGuestWake(context.Background(), "127.0.0.1", 2*time.Second, false); err != nil {
+		t.Fatalf("unfrozen: want readiness from /health, got %v", err)
+	}
+	if healthPolls.Load() == 0 {
+		t.Fatal("unfrozen: /health was never consulted")
+	}
+	healthPolls.Store(0)
+	if err := waitForGuestWake(context.Background(), "127.0.0.1", 300*time.Millisecond, true); err == nil {
+		t.Fatal("frozen: a guest without /wake must not be verified by /health")
+	}
+	if n := healthPolls.Load(); n != 0 {
+		t.Fatalf("frozen: /health polled %d times", n)
+	}
+}
+
+// An image holding a frozen workload owes a wake before the resume commits,
+// whether or not this restore froze the clock — with the policy off, the
+// workload is still stopped in the image.
+func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
+	origWake := boxdWakeGuest
+	t.Cleanup(func() { boxdWakeGuest = origWake })
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	rootfs := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snapPath, memPath, rootfs} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	corrects := true
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
+		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs,
+		CorrectsWallClock: &corrects,
+	}
+	mgr := &Manager{
+		log:    zerolog.Nop(),
+		cfg:    ManagerConfig{RunDir: dir},
+		netMgr: &fakeNetMgr{},
+		vms:    map[string]*VMInstance{"vm-1": inst},
+	}
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		return 4321, SupervisionUnit, nil
+	}
+	mgr.restoreForResumeHook = func(string, string, string, string, *network.VMNetInfo) (bool, error) { return false, nil }
+	wakes := 0
+	var sawFrozen bool
+	var statusAtWake VMStatus
+	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool) error {
+		wakes++
+		sawFrozen = frozen
+		inst.mu.RLock()
+		statusAtWake = inst.Status
+		inst.mu.RUnlock()
+		return nil
+	}
+
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if wakes != 1 {
+		t.Fatalf("wakes = %d, want exactly one synchronous wake", wakes)
+	}
+	if sawFrozen {
+		t.Error("the clock was not frozen; the wake must say so")
+	}
+	if statusAtWake == StatusRunning {
+		t.Error("Running was committed before the workload was released")
+	}
+}
+
+// An in-place restore whose guest cannot correct a frozen clock relaunches
+// with the clock running on the overlay, slot and record it already owns.
+// Recreating the overlay would truncate it.
+func TestRestoreInPlaceClockFallbackKeepsOverlayAndSlot(t *testing.T) {
+	origWake, origDead := boxdWakeGuest, vmDeadForRetry
+	t.Cleanup(func() { boxdWakeGuest, vmDeadForRetry = origWake, origDead })
+	vmDeadForRetry = func(*Manager, string) bool { return true }
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	basePath := filepath.Join(dir, "base.ext4")
+	for _, p := range []string{snapPath, memPath, basePath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(WallClockMarkerPath(memPath), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	overlay := filepath.Join(dir, "vm-1", "overlay.ext4")
+	if err := os.MkdirAll(filepath.Dir(overlay), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const data = "customer data"
+	if err := os.WriteFile(overlay, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeNetMgr{}
+	prev := &VMInstance{
+		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
+		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: overlay,
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		cfg:        ManagerConfig{RunDir: dir, GuestClockFreezeEnabled: true},
+		netMgr:     fake,
+		vms:        map[string]*VMInstance{"vm-1": prev},
+		restoreSem: make(chan struct{}, 1),
+	}
+	mgr.clockRealtimeCapable.Store(true)
+	launches := 0
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		launches++
+		return 4321, SupervisionUnit, nil
+	}
+	var policies []*bool
+	mgr.restoreSnapshotHook = func(_, _, _ string, clock *bool) error {
+		policies = append(policies, clock)
+		return nil
+	}
+	wakes := 0
+	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool) error {
+		wakes++
+		if wakes == 1 {
+			if !frozen {
+				t.Error("first wake must carry the frozen policy")
+			}
+			return ErrGuestClockUnready
+		}
+		if frozen {
+			t.Error("the relaunch must run the clock")
+		}
+		return nil
+	}
+
+	inst, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath}, nil, "team", "owner", "", nil, 0)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if launches != 2 || wakes != 2 {
+		t.Fatalf("launches=%d wakes=%d, want 2 and 2", launches, wakes)
+	}
+	if len(policies) != 2 || policies[0] == nil || *policies[0] || policies[1] != nil {
+		t.Fatalf("clock policies = %v, want frozen then legacy", policies)
+	}
+	if got, _ := os.ReadFile(overlay); string(got) != data {
+		t.Fatalf("overlay = %q, want the original contents", got)
+	}
+	if len(fake.setupCalls) != 1 || len(fake.teardownCalls) != 0 || len(fake.cleanupCalls) != 0 {
+		t.Fatalf("network setup=%v teardown=%v cleanup=%v; the slot must be kept", fake.setupCalls, fake.teardownCalls, fake.cleanupCalls)
+	}
+	mgr.mu.RLock()
+	tracked := mgr.vms["vm-1"] == inst
+	mgr.mu.RUnlock()
+	if !tracked {
+		t.Fatal("instance was untracked between passes")
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	if inst.Status != StatusRunning || inst.WakePending || inst.ClockFrozen {
+		t.Errorf("status=%v wakePending=%v clockFrozen=%v", inst.Status, inst.WakePending, inst.ClockFrozen)
+	}
+	if inst.CorrectsWallClock == nil || !*inst.CorrectsWallClock {
+		t.Error("the image property must survive the fallback")
+	}
+	if !mgr.guestClockUnready.Load() {
+		t.Error("host not latched")
 	}
 }
