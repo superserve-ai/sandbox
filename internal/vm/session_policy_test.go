@@ -484,6 +484,55 @@ func TestReclaimStrandedOverlay_KeepsTheDeferralUntilTheFileIsGone(t *testing.T)
 	}
 }
 
+// The reconciler sweep reclaims deferred overlays for VMs already at rest
+// with nothing else left to observe them, skips a VM that is not at rest,
+// and never blocks on one whose lifecycle op is in flight.
+func TestSweepStrandedOverlays_ReclaimsOnlyVMsAtRest(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	mk := func(id string) (*VMInstance, string) {
+		overlay := filepath.Join(dir, id+".mem.diff")
+		if err := os.WriteFile(overlay, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Put(VMRecord{ID: id, Status: StatusPaused, MemFilePath: filepath.Join(dir, id+".mem.snap"), StrandedOverlay: overlay}); err != nil {
+			t.Fatal(err)
+		}
+		return &VMInstance{ID: id, Status: StatusPaused, MemFilePath: filepath.Join(dir, id+".mem.snap"), StrandedOverlay: overlay}, overlay
+	}
+	atRest, atRestOverlay := mk("vm-rest")
+	live, liveOverlay := mk("vm-live")
+	busy, busyOverlay := mk("vm-busy")
+	m := &Manager{
+		log: zerolog.Nop(), state: store,
+		vms:      map[string]*VMInstance{"vm-rest": atRest, "vm-live": live, "vm-busy": busy},
+		unitDead: func(_ context.Context, id string) bool { return id != "vm-live" },
+	}
+	unlockBusy, err := m.lockVMOp(context.Background(), "vm-busy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlockBusy()
+
+	m.sweepStrandedOverlays(context.Background(), zerolog.Nop())
+
+	if _, err := os.Stat(atRestOverlay); !os.IsNotExist(err) {
+		t.Fatalf("at-rest VM's overlay must be reclaimed (err=%v)", err)
+	}
+	if rec, _ := store.Get("vm-rest"); rec == nil || rec.StrandedOverlay != "" {
+		t.Fatalf("at-rest VM's deferral must clear durably, got %+v", rec)
+	}
+	for name, p := range map[string]string{"not at rest": liveOverlay, "op in flight": busyOverlay} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("%s: overlay must be kept: %v", name, err)
+		}
+	}
+}
+
 // The matcher covers both endpoints' field names and nothing else.
 func TestIsUnknownSessionFieldErr(t *testing.T) {
 	for _, field := range []string{"tracking_session_id", "expected_session_id", "expected_generation"} {

@@ -884,6 +884,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 
 	r.reapUnverifiedOrphans(ctx, log, dbSandboxes, active, supervisionOf, now)
 
+	// Overlays a Full fallback deferred whose VM has since come to rest with
+	// no lifecycle op or backup worker left to notice (see Drift 7 for the
+	// still-active case).
+	r.mgr.sweepStrandedOverlays(ctx, log)
+
 	// Rollback drain: with direct spawn disarmed, paused cgroup records are
 	// demoted back to unit supervision so the fleet converges to a state an
 	// older binary can manage (see demotePausedCgroupRecords).
