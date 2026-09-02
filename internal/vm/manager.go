@@ -4071,6 +4071,8 @@ type machineConfigRecovery struct {
 	tracked map[*VMInstance]struct{} // queued or in flight; dedupes re-requests
 	ready   chan recoveryItem
 	wake    chan struct{}
+	probe   func(context.Context, string) (uint32, uint32, error)
+	done    func(string)
 	started bool
 }
 
@@ -4095,6 +4097,8 @@ func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
 	m.recovery.mu.Lock()
 	if !m.recovery.started {
 		m.recovery.started = true
+		m.recovery.probe = machineConfigProbe
+		m.recovery.done = machineConfigBackfillDone
 		m.recovery.ready = make(chan recoveryItem)
 		m.recovery.wake = make(chan struct{}, 1)
 		m.recovery.tracked = make(map[*VMInstance]struct{})
@@ -4189,7 +4193,7 @@ func (m *Manager) recoveryWorker() {
 		inst.mu.RUnlock()
 
 		ctx, cancel := context.WithTimeout(context.Background(), machineConfigProbeTimeout)
-		vcpu, memoryMiB, err := machineConfigProbe(ctx, socket)
+		vcpu, memoryMiB, err := m.recovery.probe(ctx, socket)
 		cancel()
 		if err == nil && vcpu > 0 && memoryMiB > 0 {
 			m.applyMachineConfig(inst, vcpu, memoryMiB)
@@ -4247,8 +4251,8 @@ func (m *Manager) recoveryFinished(inst *VMInstance) {
 	m.recovery.mu.Lock()
 	delete(m.recovery.tracked, inst)
 	m.recovery.mu.Unlock()
-	if machineConfigBackfillDone != nil {
-		machineConfigBackfillDone(inst.ID)
+	if m.recovery.done != nil {
+		m.recovery.done(inst.ID)
 	}
 	m.backfillMachineConfigAsync(inst)
 }
