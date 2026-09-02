@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"os"
+	"slices"
 
 	"github.com/rs/zerolog"
 
@@ -23,39 +24,56 @@ func removeOverlayArtifacts(overlay string) error {
 	return nil
 }
 
-// reclaimStrandedOverlay removes the overlay a pause deferred because its
-// process could not be confirmed stopped, and clears the deferral durably.
-// Callers hold the vm-op lock and invoke it only once the VM is proven at
-// rest — the file may still be serving guest pages until then. A removal
-// that fails keeps the deferral, so a transient filesystem error costs a
-// retry rather than a permanent leak.
+// hasStrandedOverlay reports whether overlay is already deferred. Caller holds
+// inst.mu.
+func hasStrandedOverlay(inst *VMInstance, overlay string) bool {
+	return slices.Contains(inst.StrandedOverlays, overlay)
+}
+
+// reclaimStrandedOverlays removes the overlays pauses deferred because their
+// process could not be confirmed stopped, and clears each resolved deferral
+// durably. Callers hold the vm-op lock and invoke it only once the VM is
+// proven at rest — a file may still be serving guest pages until then. A
+// removal that fails keeps that deferral, so a transient filesystem error
+// costs a retry rather than a permanent leak.
 //
 // A deferred path can be reused by a later pause before the deferral is
 // resolved (a crash between the reclaim and its persist replays the stale
 // marker). The artifact the record currently references is therefore never
-// removed: the marker is simply dropped, since the path is live again.
-func (m *Manager) reclaimStrandedOverlay(inst *VMInstance, log zerolog.Logger) {
+// removed: that marker is simply dropped, since the path is live again.
+func (m *Manager) reclaimStrandedOverlays(inst *VMInstance, log zerolog.Logger) {
 	inst.mu.RLock()
-	overlay, live := inst.StrandedOverlay, inst.MemFilePath
+	pending, live := append([]string(nil), inst.StrandedOverlays...), inst.MemFilePath
 	inst.mu.RUnlock()
-	if overlay == "" {
+	if len(pending) == 0 {
 		return
 	}
-	if overlay == live {
-		log.Warn().Str("path", overlay).Msg("stranded overlay is the live artifact again; dropping the stale deferral")
-	} else if err := removeOverlayArtifacts(overlay); err != nil {
-		log.Warn().Err(err).Str("path", overlay).Msg("stranded overlay not reclaimed; deferral kept for a later attempt")
+	var kept []string
+	for _, overlay := range pending {
+		switch {
+		case overlay == live:
+			log.Warn().Str("path", overlay).Msg("stranded overlay is the live artifact again; dropping the stale deferral")
+		case removeOverlayArtifacts(overlay) != nil:
+			log.Warn().Str("path", overlay).Msg("stranded overlay not reclaimed; deferral kept for a later attempt")
+			kept = append(kept, overlay)
+		default:
+			log.Info().Str("path", overlay).Msg("reclaimed a stranded overlay")
+		}
+	}
+	if len(kept) == len(pending) {
 		return
-	} else {
-		log.Info().Str("path", overlay).Msg("reclaimed a stranded overlay")
 	}
 	inst.mu.Lock()
-	if inst.StrandedOverlay == overlay {
-		inst.StrandedOverlay = ""
+	// Deferrals added since the snapshot above are unresolved and stay.
+	for _, overlay := range inst.StrandedOverlays {
+		if !slices.Contains(pending, overlay) {
+			kept = append(kept, overlay)
+		}
 	}
+	inst.StrandedOverlays = kept
 	inst.mu.Unlock()
 	if _, err := m.persistStateIfPresent(inst); err != nil {
-		log.Warn().Err(err).Msg("stranded-overlay deferral cleared in memory only; a restart may replay it once")
+		log.Warn().Err(err).Msg("stranded-overlay deferrals cleared in memory only; a restart may replay them once")
 	}
 }
 
@@ -69,7 +87,7 @@ func (m *Manager) sweepStrandedOverlays(ctx context.Context, log zerolog.Logger)
 	m.mu.RLock()
 	for _, inst := range m.vms {
 		inst.mu.RLock()
-		if inst.Status == StatusPaused && inst.StrandedOverlay != "" {
+		if inst.Status == StatusPaused && len(inst.StrandedOverlays) > 0 {
 			candidates = append(candidates, inst)
 		}
 		inst.mu.RUnlock()
@@ -89,7 +107,7 @@ func (m *Manager) sweepStrandedOverlays(ctx context.Context, log zerolog.Logger)
 		paused := inst.Status == StatusPaused
 		inst.mu.RUnlock()
 		if paused && m.vmConfirmedAtRest(ctx, inst.ID) {
-			m.reclaimStrandedOverlay(inst, log.With().Str("vm_id", inst.ID).Logger())
+			m.reclaimStrandedOverlays(inst, log.With().Str("vm_id", inst.ID).Logger())
 		}
 		unlock()
 	}

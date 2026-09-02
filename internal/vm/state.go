@@ -189,11 +189,12 @@ type VMRecord struct {
 	// base. Without it, resume would load the overlay standalone and read the
 	// base's pages as zero holes.
 	BaseMemPath string `json:"base_mem_path,omitempty"`
-	// An overlay a layered→Full fallback left unreferenced while the process
-	// that still served pages from it could not be confirmed stopped.
-	// Persisted so it is reclaimed once any later step proves the VM at rest,
-	// instead of leaking a guest-sized file for the sandbox's lifetime.
-	StrandedOverlay string `json:"stranded_overlay,omitempty"`
+	// Overlays a layered→Full fallback left unreferenced while the process
+	// that still served pages from them could not be confirmed stopped.
+	// Persisted so each is reclaimed once a later step proves the VM at rest,
+	// instead of leaking a guest-sized file for the sandbox's lifetime. A
+	// list: a second fallback before the first resolves must not forget it.
+	StrandedOverlays []string `json:"stranded_overlays,omitempty"`
 	// The random token the running FC's dirty tracking was armed with (guarded
 	// pause flag on). Persisted so reattach after a vmd restart can keep the
 	// next pause incremental: the pause's Diff request carries the token back
@@ -901,7 +902,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		SnapshotPath:               inst.SnapshotPath,
 		MemFilePath:                inst.MemFilePath,
 		BaseMemPath:                inst.BaseMemPath,
-		StrandedOverlay:            inst.StrandedOverlay,
+		StrandedOverlays:           append([]string(nil), inst.StrandedOverlays...),
 		DirtyTrackingSessionID:     inst.DirtyTrackingSessionID,
 		CorrectsWallClock:          inst.CorrectsWallClock,
 		CreatedAt:                  inst.CreatedAt,
@@ -995,7 +996,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		SnapshotPath:           rec.SnapshotPath,
 		MemFilePath:            rec.MemFilePath,
 		BaseMemPath:            rec.BaseMemPath,
-		StrandedOverlay:        rec.StrandedOverlay,
+		StrandedOverlays:       append([]string(nil), rec.StrandedOverlays...),
 		DirtyTrackingSessionID: rec.DirtyTrackingSessionID,
 		// Optimistic re-arm for an adopted running VM: the surviving FC's
 		// bitmap is intact, and the pause-time token check is the correctness

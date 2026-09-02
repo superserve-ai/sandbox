@@ -867,7 +867,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			if err == nil && r.mgr.vmConfirmedAtRest(ctx, id) {
 				r.mgr.vmStopUnconfirmed.Delete(id)
 				if inst := r.mgr.trackedInstance(id); inst != nil {
-					r.mgr.reclaimStrandedOverlay(inst, log)
+					r.mgr.reclaimStrandedOverlays(inst, log)
 				}
 			}
 			unlockOp()

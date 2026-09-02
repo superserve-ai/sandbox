@@ -186,16 +186,16 @@ func TestPauseVM_MismatchFallsBackToFullAndKeepsOverlayUntilStop(t *testing.T) {
 	}
 	assertOverlayIntact(t, overlay)
 	inst.mu.RLock()
-	st, base, session, stranded := inst.Status, inst.BaseMemPath, inst.DirtyTrackingSessionID, inst.StrandedOverlay
+	st, base, session, stranded := inst.Status, inst.BaseMemPath, inst.DirtyTrackingSessionID, append([]string(nil), inst.StrandedOverlays...)
 	inst.mu.RUnlock()
 	if st != StatusPaused || base != "" || session != "" {
 		t.Fatalf("paused state not recorded as standalone: %+v", inst)
 	}
 	// The deferral is durable, so a vmd restart cannot forget the file.
-	if stranded != overlay {
+	if len(stranded) != 1 || stranded[0] != overlay {
 		t.Fatalf("stranded overlay not recorded, got %q", stranded)
 	}
-	if rec, err := m.state.Get("vm-1"); err != nil || rec == nil || rec.StrandedOverlay != overlay {
+	if rec, err := m.state.Get("vm-1"); err != nil || rec == nil || len(rec.StrandedOverlays) != 1 || rec.StrandedOverlays[0] != overlay {
 		t.Fatalf("stranded overlay not persisted: rec=%+v err=%v", rec, err)
 	}
 
@@ -216,8 +216,30 @@ func TestPauseVM_MismatchFallsBackToFullAndKeepsOverlayUntilStop(t *testing.T) {
 			t.Fatalf("%s must be reclaimed once the VM is at rest (err=%v)", filepath.Base(p), err)
 		}
 	}
-	if rec, _ := m.state.Get("vm-1"); rec == nil || rec.StrandedOverlay != "" {
+	if rec, _ := m.state.Get("vm-1"); rec == nil || len(rec.StrandedOverlays) != 0 {
 		t.Fatalf("deferral must clear durably after reclaim, got %+v", rec)
+	}
+}
+
+// A second deferral before the first resolves is appended, never replaces
+// it: both guest-sized files stay owed to the reclaim paths.
+func TestPauseVM_SecondDeferralKeepsTheFirst(t *testing.T) {
+	fc := startSnapshotAPIFake(t, func(_, body string) (int, string) {
+		if isDiffRequest(body) {
+			return http.StatusBadRequest, mismatchPayload
+		}
+		return http.StatusNoContent, ""
+	})
+	m, inst, dir, overlay := layeredPauseFixture(t, fc)
+	earlier := filepath.Join(dir, "earlier.mem.diff")
+	inst.StrandedOverlays = []string{earlier}
+
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", dir, "tok-test"); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := m.state.Get("vm-1")
+	if rec == nil || len(rec.StrandedOverlays) != 2 || rec.StrandedOverlays[0] != earlier || rec.StrandedOverlays[1] != overlay {
+		t.Fatalf("both deferrals must be retained in order, got %+v", rec)
 	}
 }
 
@@ -428,17 +450,17 @@ func TestReclaimStrandedOverlay_NeverRemovesTheLiveArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, MemFilePath: overlay, StrandedOverlay: overlay}); err != nil {
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, MemFilePath: overlay, StrandedOverlays: []string{overlay}}); err != nil {
 		t.Fatal(err)
 	}
-	inst := &VMInstance{ID: "vm-1", Status: StatusPaused, MemFilePath: overlay, StrandedOverlay: overlay}
+	inst := &VMInstance{ID: "vm-1", Status: StatusPaused, MemFilePath: overlay, StrandedOverlays: []string{overlay}}
 	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
 
-	m.reclaimStrandedOverlay(inst, zerolog.Nop())
+	m.reclaimStrandedOverlays(inst, zerolog.Nop())
 	if _, err := os.Stat(overlay); err != nil {
 		t.Fatalf("the live artifact must survive a stale deferral: %v", err)
 	}
-	if rec, _ := store.Get("vm-1"); rec == nil || rec.StrandedOverlay != "" {
+	if rec, _ := store.Get("vm-1"); rec == nil || len(rec.StrandedOverlays) != 0 {
 		t.Fatalf("the stale deferral must clear durably, got %+v", rec)
 	}
 }
@@ -458,28 +480,28 @@ func TestReclaimStrandedOverlay_KeepsTheDeferralUntilTheFileIsGone(t *testing.T)
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, MemFilePath: filepath.Join(dir, "mem.snap"), StrandedOverlay: overlay}); err != nil {
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, MemFilePath: filepath.Join(dir, "mem.snap"), StrandedOverlays: []string{overlay}}); err != nil {
 		t.Fatal(err)
 	}
-	inst := &VMInstance{ID: "vm-1", Status: StatusPaused, MemFilePath: filepath.Join(dir, "mem.snap"), StrandedOverlay: overlay}
+	inst := &VMInstance{ID: "vm-1", Status: StatusPaused, MemFilePath: filepath.Join(dir, "mem.snap"), StrandedOverlays: []string{overlay}}
 	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": inst}}
 
-	m.reclaimStrandedOverlay(inst, zerolog.Nop())
-	if inst.StrandedOverlay != overlay {
+	m.reclaimStrandedOverlays(inst, zerolog.Nop())
+	if len(inst.StrandedOverlays) != 1 || inst.StrandedOverlays[0] != overlay {
 		t.Fatal("a failed removal must keep the deferral")
 	}
-	if rec, _ := store.Get("vm-1"); rec == nil || rec.StrandedOverlay != overlay {
+	if rec, _ := store.Get("vm-1"); rec == nil || len(rec.StrandedOverlays) != 1 {
 		t.Fatalf("a failed removal must keep the deferral durable, got %+v", rec)
 	}
 
 	if err := os.RemoveAll(filepath.Join(overlay, "busy")); err != nil {
 		t.Fatal(err)
 	}
-	m.reclaimStrandedOverlay(inst, zerolog.Nop())
+	m.reclaimStrandedOverlays(inst, zerolog.Nop())
 	if _, err := os.Stat(overlay); !os.IsNotExist(err) {
 		t.Fatalf("overlay must be gone once removal can succeed (err=%v)", err)
 	}
-	if rec, _ := store.Get("vm-1"); rec == nil || rec.StrandedOverlay != "" {
+	if rec, _ := store.Get("vm-1"); rec == nil || len(rec.StrandedOverlays) != 0 {
 		t.Fatalf("deferral must clear durably after a successful removal, got %+v", rec)
 	}
 }
@@ -499,10 +521,10 @@ func TestSweepStrandedOverlays_ReclaimsOnlyVMsAtRest(t *testing.T) {
 		if err := os.WriteFile(overlay, []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.Put(VMRecord{ID: id, Status: StatusPaused, MemFilePath: filepath.Join(dir, id+".mem.snap"), StrandedOverlay: overlay}); err != nil {
+		if err := store.Put(VMRecord{ID: id, Status: StatusPaused, MemFilePath: filepath.Join(dir, id+".mem.snap"), StrandedOverlays: []string{overlay}}); err != nil {
 			t.Fatal(err)
 		}
-		return &VMInstance{ID: id, Status: StatusPaused, MemFilePath: filepath.Join(dir, id+".mem.snap"), StrandedOverlay: overlay}, overlay
+		return &VMInstance{ID: id, Status: StatusPaused, MemFilePath: filepath.Join(dir, id+".mem.snap"), StrandedOverlays: []string{overlay}}, overlay
 	}
 	atRest, atRestOverlay := mk("vm-rest")
 	live, liveOverlay := mk("vm-live")
@@ -523,7 +545,7 @@ func TestSweepStrandedOverlays_ReclaimsOnlyVMsAtRest(t *testing.T) {
 	if _, err := os.Stat(atRestOverlay); !os.IsNotExist(err) {
 		t.Fatalf("at-rest VM's overlay must be reclaimed (err=%v)", err)
 	}
-	if rec, _ := store.Get("vm-rest"); rec == nil || rec.StrandedOverlay != "" {
+	if rec, _ := store.Get("vm-rest"); rec == nil || len(rec.StrandedOverlays) != 0 {
 		t.Fatalf("at-rest VM's deferral must clear durably, got %+v", rec)
 	}
 	for name, p := range map[string]string{"not at rest": liveOverlay, "op in flight": busyOverlay} {

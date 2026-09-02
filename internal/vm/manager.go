@@ -152,10 +152,10 @@ type VMInstance struct {
 	// (overlay + base). Cleared when a pause falls back to a standalone Full.
 	BaseMemPath string
 
-	// StrandedOverlay is an overlay a Full fallback left unreferenced while
-	// the process serving it could not be confirmed stopped; persisted, and
-	// reclaimed by the first later step that proves the VM at rest.
-	StrandedOverlay string
+	// StrandedOverlays are overlays a Full fallback left unreferenced while
+	// the process serving them could not be confirmed stopped; persisted,
+	// and each reclaimed by the first later step that proves the VM at rest.
+	StrandedOverlays []string
 
 	// DirtyTracked is true when the current Firecracker run was loaded with
 	// dirty-page tracking armed (set on incremental UFFD resume). Gates whether
@@ -1521,7 +1521,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		if atRest {
 			// Rest is now proven: the earlier unconfirmed stop resolved.
 			m.vmStopUnconfirmed.Delete(vmID)
-			m.reclaimStrandedOverlay(inst, log)
+			m.reclaimStrandedOverlays(inst, log)
 		}
 		// The paused status may only exist in memory: the original pause sets it
 		// before persisting, so a failed write leaves the durable record reading
@@ -1836,8 +1836,10 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	}
 
 	inst.mu.Lock()
-	if stranded != "" {
-		inst.StrandedOverlay = stranded
+	if stranded != "" && !hasStrandedOverlay(inst, stranded) {
+		// Appended, never replaced: an earlier deferral this run's resume
+		// displaced is still owed its reclaim.
+		inst.StrandedOverlays = append(inst.StrandedOverlays, stranded)
 	}
 	inst.Status = StatusPaused
 	inst.SnapshotPath = snapshotPath
@@ -1858,7 +1860,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// record fields above, so the guard against the live artifact sees the
 	// image this pause just wrote.
 	if atRest {
-		m.reclaimStrandedOverlay(inst, log)
+		m.reclaimStrandedOverlays(inst, log)
 	}
 
 	// If-present, not Put: DestroyVM takes no vm-op lock (by design), and

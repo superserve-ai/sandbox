@@ -310,7 +310,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 	// the sweep retries.
 	if unlock, ok := m.tryLockVMOp(pb.VMID); ok {
 		if inst := m.trackedInstance(pb.VMID); inst != nil {
-			m.reclaimStrandedOverlay(inst, log)
+			m.reclaimStrandedOverlays(inst, log)
 		}
 		unlock()
 	}
