@@ -111,6 +111,11 @@ func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req
 	// return would publish a full VM's memory during a hash-only interval
 	// that can run for minutes.
 	defer m.buildPressureCount.Add(-1)
+	// Pairs with registerBuild's AdmitBuild. Released at worker return, not
+	// at cancellation: a cancelled build's subprocess is still alive and
+	// still holding capacity until the worker actually exits. Same boundary
+	// as the workflow count above, for the same reason.
+	defer m.admission.Release(buildVMID)
 	defer m.releaseBuildAlloc(rec, req.VCPU, req.MemoryMiB)
 	result, err := m.buildTemplateSync(ctx, buildVMID, req, rec)
 	m.completeBuild(buildVMID, rec, result, err)

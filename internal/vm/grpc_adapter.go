@@ -53,11 +53,11 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 	entries := make([]*vmdpb.ArtifactManifestEntry, 0, len(manifest))
 	for _, e := range manifest {
 		entry := &vmdpb.ArtifactManifestEntry{
-			FileName:  e.FileName,
-			Path:      e.Path,
-			SizeBytes: e.SizeBytes,
-			Sha256:    e.SHA256,
-			BasePath:  e.BasePath,
+			FileName:       e.FileName,
+			Path:           e.Path,
+			SizeBytes:      e.SizeBytes,
+			Sha256:         e.SHA256,
+			BasePath:       e.BasePath,
 			AllocatedBytes: e.AllocatedBytes,
 		}
 		entries = append(entries, entry)
@@ -83,6 +83,15 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		return nil, err
 	}
 	defer unlockOp()
+
+	// A resume is never refused on the operator's sandbox limit — it is
+	// bound to this host and has nowhere else to go — but it is still
+	// charged, so the host's own count reflects the load it is carrying.
+	// Inside the op lock, so a resume racing its own retry cannot be
+	// charged by one attempt and released by the other.
+	if err := admissionError(a.mgr.AdmissionGate().Admit(req.GetVmId(), intentFromProto(req.GetAdmissionIntent()))); err != nil {
+		return nil, err
+	}
 
 	var resumeNetworkRules *sandboxNetworkRules
 	if netCfg := req.GetSandboxNetwork(); netCfg != nil {
@@ -178,6 +187,16 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	}
 	if previewPortsContainTokenizedAccess(previewPorts) && req.GetPreviewPolicyRevision() <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "tokenized preview policy requires a positive preview_policy_revision")
+	}
+
+	// Admission before any launch work: a local gate exists to refuse in
+	// microseconds, before Firecracker, the filesystem or the network have
+	// been touched. The intent is the caller's because this RPC serves both
+	// a genuine create and the caller's stateless-resume fallback, and the
+	// daemon cannot tell those apart — the fallback is taken precisely when
+	// this daemon has no record of the sandbox.
+	if err := admissionError(a.mgr.AdmissionGate().Admit(req.GetVmId(), intentFromProto(req.GetAdmissionIntent()))); err != nil {
+		return nil, err
 	}
 
 	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())

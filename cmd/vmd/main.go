@@ -893,6 +893,13 @@ func main() {
 		LauncherNSPath:                      os.Getenv("VMD_LAUNCHER_NS_PATH"),
 		DirectSpawn:                         envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
 		PressureAccounting:                  publishesPressure,
+		// Host-local capacity admission. Its own setting, deliberately not
+		// derived from VMD_MAX_SANDBOXES being set: that value is already
+		// configured on production hosts to feed pressure publication, so
+		// inferring enablement from it would switch enforcement on across
+		// the whole fleet the moment this ships.
+		LocalAdmission: envOrDefault("VMD_LOCAL_ADMISSION_ENABLED", "false") == "true",
+		MaxSandboxes:   int(envInt32Fatal(log, "VMD_MAX_SANDBOXES")),
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
@@ -1583,6 +1590,12 @@ func main() {
 		if reattached > 0 || stale > 0 {
 			log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
 		}
+		// Opens host-local admission once the daemon knows what this host
+		// is already carrying. Started here rather than before serving
+		// begins because the listening socket survives a restart: calls
+		// can already be queued on it, and the gate refuses them until
+		// this completes rather than admitting against an empty ledger.
+		mgr.StartAdmission(ctx)
 		// After the instance map is rebuilt: pauses that still owed their
 		// backup enqueue when the previous process exited get their
 		// rehash re-run, and completed template builds whose generation

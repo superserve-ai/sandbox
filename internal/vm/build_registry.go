@@ -119,6 +119,15 @@ func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB ui
 	if existing, ok := m.builds[buildVMID]; ok && !existing.Status.IsTerminal() {
 		return nil, fmt.Errorf("build %s already in flight", buildVMID)
 	}
+	// Charged before the record exists, so a refused build never enters the
+	// registry and needs no unwinding. Builds hold a sandbox token because
+	// their pressure is published as provisioning sandboxes and placement
+	// ranks against that number — exempting them here would enforce a
+	// different limit than the one the scheduler believes in. Released at
+	// worker exit; see buildTemplateWorker.
+	if err := m.admission.AdmitBuild(buildVMID); err != nil {
+		return nil, err
+	}
 	rec := &buildRecord{
 		BuildVMID:  buildVMID,
 		TemplateID: templateID,
