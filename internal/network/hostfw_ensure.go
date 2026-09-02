@@ -114,10 +114,9 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	tRepair := time.Now()
 	var predicted map[string][][]string
 	// snapshot is the dump the last shared-chain transaction was planned
-	// from; a raced writer's rule is whatever the next dump holds that this
-	// one did not. corrections bounds the transactions that may follow the
-	// plan (an ordering repair, a yield to an interloper) before startup
-	// gives up — with vmd's rules always left installed.
+	// from. corrections bounds the follow-up transactions (an ordering
+	// repair, a yield) before startup gives up — vmd's rules always stay
+	// installed.
 	var snapshot *parsedDump
 	corrections := 2
 	if manageOwnedChains {
@@ -169,14 +168,11 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 			}
 		}
 		if len(changed) > 0 {
-			// A rule the other writer placed between our snapshot and our
-			// restore was demoted by the head inserts, and no later dump
-			// can tell it apart from one that was always below us — a
-			// refusal alone would leave it shadowed for good. Undo the
-			// demotion without ever removing enforcement: move our head
-			// rules directly below the interloper, in one transaction, and
-			// let verification classify it like any other foreign rule
-			// above us.
+			// The head inserts demoted a rule the other writer placed after
+			// our snapshot, and no later dump can tell it apart from one
+			// that was always below us — a refusal alone would leave it
+			// shadowed for good. Undo the demotion without ever removing
+			// enforcement (see yieldToInterlopers).
 			if corrections == 0 {
 				return fmt.Errorf("host firewall chain %s changed underneath the repair again — concurrent non-cooperating writer; vmd rules left installed, refusing to serve", changed[0])
 			}
@@ -227,20 +223,15 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	}
 }
 
-// yieldToInterlopers repositions vmd's head rules in each changed chain to
-// sit directly BELOW every foreign rule not provably below them before the
-// race — one atomic transaction per table, with vmd's rules never absent
-// from a chain, so running sandboxes keep their forwarding, redirects, and
-// NAT throughout. The anchor is vmd's own boundary in the snapshot: the
-// first foreign rule that sat after our last head rule. Anything a writer
-// inserted above that boundary — at the head, or between a known rule and
-// our jumps — reads identically to an insert just below us once our
-// transaction has moved us, so "above us" is the only placement that leaves
-// nothing of theirs shadowed. Verification then classifies the interloper in
-// place — strict or observer tolerated, permissive a repairable bypass,
-// unknown control flow fails closed with our rules still installed. Tail
-// plumbing (the MASQUERADE) is never terminal for the writer's rule and
-// stays where the transaction put it. OWNER ONLY.
+// yieldToInterlopers moves vmd's head rules in each changed chain directly
+// BELOW every foreign rule not provably below them before the race — one
+// atomic transaction per table, vmd's rules never absent, so running
+// sandboxes keep their enforcement throughout. Once our transaction has
+// moved us, a rule the writer inserted anywhere above our old position
+// reads identically to one inserted just below it, so "above us" is the
+// only placement that shadows nothing of theirs; verification then
+// classifies the interloper in place like any other foreign rule. Tail
+// plumbing (the MASQUERADE) stays where the transaction put it. OWNER ONLY.
 func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec hostFWSpec, changed []string) (map[string][][]string, error) {
 	predicted := map[string][][]string{}
 	perTable := map[string][]string{}
@@ -256,11 +247,9 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 			return fwRule{}, false
 		}
 		// suffix: the foreign rules the snapshot proves were beneath our
-		// last head rule, IN ORDER — occurrence matters, since identical
-		// foreign rules can sit on both sides of the boundary. With no
-		// head of ours in the snapshot there is no boundary to prove, and
-		// the suffix stays empty: every current foreign rule reads as
-		// above us.
+		// last head rule, in order (identical rules can sit on both sides
+		// of the boundary). No head of ours in the snapshot means no
+		// boundary to prove: everything reads as above us.
 		var suffix [][]string
 		lastHead := -1
 		for i, g := range snapshot.rules[key] {
@@ -284,13 +273,11 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 			}
 			rest = append(rest, g)
 		}
-		// Right-align the suffix against the current chain: scanning from
-		// the end pairs each suffix rule with its LATEST occurrence, so a
-		// duplicate sitting above the boundary is never mistaken for the
-		// one below it, and the anchor is the latest position that still
-		// keeps every provably-below rule beneath us. If the suffix cannot
-		// be aligned at all (a rule of it vanished), nothing is provable
-		// and ours go below everything.
+		// Right-align the suffix against the current chain so each rule
+		// pairs with its LATEST occurrence — a duplicate above the boundary
+		// is never mistaken for the one below it — giving the latest anchor
+		// that keeps every provably-below rule beneath us. A suffix that
+		// cannot be aligned (a rule vanished) proves nothing: ours go last.
 		anchor := len(rest)
 		if len(suffix) > 0 {
 			si := len(suffix) - 1
