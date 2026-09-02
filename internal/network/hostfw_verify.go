@@ -260,6 +260,9 @@ func emitRuleTokens(tokens []string) string {
 type parsedDump struct {
 	rules  map[string][][]string
 	chains map[string]bool
+	// handles pairs each shared-chain rule with its nf_tables handle, where
+	// the backend has them (see snapshotSharedChains).
+	handles map[string][]uint64
 }
 
 // parseIPTablesSave strictly parses iptables-save output. Only line shapes it

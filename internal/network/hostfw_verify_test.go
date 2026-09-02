@@ -234,12 +234,44 @@ type fakeKernel struct {
 	chains   []string
 	restores int
 	inputs   []string
+	// handles mirrors rules: each rule's nf_tables handle, assigned on
+	// insert and never reused. noHandles models iptables-legacy.
+	handles   map[string][]uint64
+	next      uint64
+	noHandles bool
+}
+
+func (k *fakeKernel) insertAt(key string, at int, rule []string) {
+	rs, hs := k.rules[key], k.handles[key]
+	k.next++
+	k.rules[key] = append(rs[:at:at], append([][]string{rule}, rs[at:]...)...)
+	k.handles[key] = append(hs[:at:at], append([]uint64{k.next}, hs[at:]...)...)
+}
+
+func (k *fakeKernel) deleteAt(key string, at int) {
+	k.rules[key] = append(k.rules[key][:at:at], k.rules[key][at+1:]...)
+	k.handles[key] = append(k.handles[key][:at:at], k.handles[key][at+1:]...)
 }
 
 func (k *fakeKernel) install(t *testing.T) func() {
 	t.Helper()
-	origDump, origRestore := dumpIPTables, restoreIPTables
+	if k.handles == nil {
+		k.handles = map[string][]uint64{}
+		for key, rs := range k.rules {
+			for range rs {
+				k.next++
+				k.handles[key] = append(k.handles[key], k.next)
+			}
+		}
+	}
+	origDump, origRestore, origHandles := dumpIPTables, restoreIPTables, listRuleHandles
 	dumpIPTables = func(context.Context) (string, error) { return renderDump(k.rules, k.chains), nil }
+	listRuleHandles = func(table, chain string) ([]uint64, error) {
+		if k.noHandles {
+			return nil, fmt.Errorf("fake kernel: legacy backend")
+		}
+		return slices.Clone(k.handles[table+"/"+chain]), nil
+	}
 	restoreIPTables = func(_ context.Context, input string) error {
 		k.restores++
 		k.inputs = append(k.inputs, input)
@@ -267,6 +299,7 @@ func (k *fakeKernel) install(t *testing.T) func() {
 				table = line[1:]
 			case strings.HasPrefix(line, "-F "):
 				k.rules[table+"/"+strings.TrimPrefix(line, "-F ")] = nil
+				k.handles[table+"/"+strings.TrimPrefix(line, "-F ")] = nil
 			case strings.HasPrefix(line, "-D "):
 				fields := strings.Fields(line)
 				key := table + "/" + fields[1]
@@ -274,7 +307,7 @@ func (k *fakeKernel) install(t *testing.T) func() {
 				found := false
 				for i, r := range k.rules[key] {
 					if ruleEqual(spec, r) {
-						k.rules[key] = append(k.rules[key][:i:i], k.rules[key][i+1:]...)
+						k.deleteAt(key, i)
 						found = true
 						break
 					}
@@ -289,20 +322,18 @@ func (k *fakeKernel) install(t *testing.T) func() {
 				if err != nil || n < 1 || n > len(k.rules[key])+1 {
 					return fmt.Errorf("fake kernel: bad -I position: %q", line)
 				}
-				rule := append([]string(nil), fields[3:]...)
-				rs := k.rules[key]
-				k.rules[key] = append(rs[:n-1:n-1], append([][]string{rule}, rs[n-1:]...)...)
+				k.insertAt(key, n-1, append([]string(nil), fields[3:]...))
 			case strings.HasPrefix(line, "-A "):
 				fields := strings.Fields(line)
 				key := table + "/" + fields[1]
-				k.rules[key] = append(k.rules[key], fields[2:])
+				k.insertAt(key, len(k.rules[key]), fields[2:])
 			default:
 				return fmt.Errorf("fake kernel: unsupported restore line %q", line)
 			}
 		}
 		return nil
 	}
-	return func() { dumpIPTables, restoreIPTables = origDump, origRestore }
+	return func() { dumpIPTables, restoreIPTables, listRuleHandles = origDump, origRestore, origHandles }
 }
 
 func TestRepairCanonicalizesMisorderAndDuplicates(t *testing.T) {
@@ -1264,7 +1295,7 @@ func TestConcurrentWriterDuringRepairDetected(t *testing.T) {
 		}
 		if !raced && strings.HasPrefix(input, "*nat") {
 			raced = true
-			k.rules["nat/POSTROUTING"] = append([][]string{{"-s", "10.11.0.0/16", "-j", "LOG"}}, k.rules["nat/POSTROUTING"]...)
+			k.insertAt("nat/POSTROUTING", 0, []string{"-s", "10.11.0.0/16", "-j", "LOG"})
 		}
 		return nil
 	}
@@ -1450,7 +1481,7 @@ func TestRacedInsertYieldsBelowInterloper(t *testing.T) {
 				// The other writer got there first: its DROP is at the
 				// head when our head inserts land, so ours push it below.
 				raced = true
-				k.rules["filter/FORWARD"] = append([][]string{interloper}, k.rules["filter/FORWARD"]...)
+				k.insertAt("filter/FORWARD", 0, interloper)
 			}
 			return inner(ctx, input)
 		}
@@ -1514,8 +1545,7 @@ func TestRacedInsertYieldsBelowInterloper(t *testing.T) {
 		restoreIPTables = func(ctx context.Context, input string) error {
 			if !raced && strings.HasPrefix(input, "*filter") && strings.Contains(input, "-I FORWARD 1") {
 				raced = true
-				cur := k.rules["filter/FORWARD"]
-				k.rules["filter/FORWARD"] = append([][]string{cur[0], interloper}, cur[1:]...)
+				k.insertAt("filter/FORWARD", 1, interloper)
 			}
 			return inner(ctx, input)
 		}
@@ -1550,8 +1580,7 @@ func TestRacedInsertYieldsBelowInterloper(t *testing.T) {
 		restoreIPTables = func(ctx context.Context, input string) error {
 			if !raced && strings.HasPrefix(input, "*filter") && strings.Contains(input, "-I FORWARD 1") {
 				raced = true
-				cur := k.rules["filter/FORWARD"]
-				k.rules["filter/FORWARD"] = append([][]string{cur[0], interloper}, cur[1:]...)
+				k.insertAt("filter/FORWARD", 1, interloper)
 			}
 			return inner(ctx, input)
 		}
@@ -1584,7 +1613,7 @@ func TestRacedInsertYieldsBelowInterloper(t *testing.T) {
 		restoreIPTables = func(ctx context.Context, input string) error {
 			if !raced && strings.HasPrefix(input, "*filter") && strings.Contains(input, "-I FORWARD 1") {
 				raced = true
-				k.rules["filter/FORWARD"] = append(k.rules["filter/FORWARD"], interloper)
+				k.insertAt("filter/FORWARD", len(k.rules["filter/FORWARD"]), interloper)
 			}
 			return inner(ctx, input)
 		}
@@ -1599,6 +1628,55 @@ func TestRacedInsertYieldsBelowInterloper(t *testing.T) {
 		if ok, class := mustVerify(t, renderDump(k.rules, k.chains), spec); !ok {
 			t.Fatalf("yielded layout not verified: %s", class)
 		}
+	})
+
+	t.Run("identical re-insert seen only by its handle", func(t *testing.T) {
+		// The writer deletes its DROP and re-adds it at the head during
+		// the repair window. After our head inserts the chain reads
+		// exactly as predicted — only the DROP's handle is new — so
+		// content alone would serve with the DROP demoted.
+		spec := testSpec(true)
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		fw[0], fw[1] = fw[1], fw[0] // misordered jumps force a repair
+		rules["filter/FORWARD"] = append(fw, interloper)
+		k := &fakeKernel{rules: rules, chains: chains}
+		defer k.install(t)()
+		raced := false
+		inner := restoreIPTables
+		restoreIPTables = func(ctx context.Context, input string) error {
+			if !raced && strings.HasPrefix(input, "*filter") && strings.Contains(input, "-I FORWARD 1") {
+				raced = true
+				k.deleteAt("filter/FORWARD", len(k.rules["filter/FORWARD"])-1)
+				k.insertAt("filter/FORWARD", 0, interloper)
+			}
+			return inner(ctx, input)
+		}
+		defer func() { restoreIPTables = inner }()
+		if err := ensureOwner(t); err != nil {
+			t.Fatalf("ensure after an identical re-insert: %v", err)
+		}
+		fw = k.rules["filter/FORWARD"]
+		if len(fw) != 3 || !ruleEqual(interloper, fw[0]) || !hasVMDMarker(fw[1]) || !hasVMDMarker(fw[2]) {
+			t.Fatalf("want [DROP, jump, jump], got %v", fw)
+		}
+		if ok, class := mustVerify(t, renderDump(k.rules, k.chains), spec); !ok {
+			t.Fatalf("yielded layout not verified: %s", class)
+		}
+	})
+
+	t.Run("legacy backend without handles", func(t *testing.T) {
+		spec := testSpec(true)
+		rules, chains := specKernel(spec, nil)
+		fw := rules["filter/FORWARD"]
+		fw[0], fw[1] = fw[1], fw[0] // misordered jumps force a repair
+		k := &fakeKernel{rules: rules, chains: chains, noHandles: true}
+		defer k.install(t)()
+		defer raceOnce(k)()
+		if err := ensureOwner(t); err != nil {
+			t.Fatalf("ensure after a race on a legacy backend: %v", err)
+		}
+		assertYielded(t, k, spec)
 	})
 
 	t.Run("established host keeps enforcement throughout", func(t *testing.T) {
@@ -1647,7 +1725,7 @@ func TestPersistentConcurrentWriterExhaustsCorrections(t *testing.T) {
 	inner := restoreIPTables
 	restoreIPTables = func(ctx context.Context, input string) error {
 		if strings.HasPrefix(input, "*filter") && strings.Contains(input, "-I FORWARD") {
-			k.rules["filter/FORWARD"] = append([][]string{{"-p", "tcp", "--dport", "22", "-j", "DROP"}}, k.rules["filter/FORWARD"]...)
+			k.insertAt("filter/FORWARD", 0, []string{"-p", "tcp", "--dport", "22", "-j", "DROP"})
 		}
 		return inner(ctx, input)
 	}

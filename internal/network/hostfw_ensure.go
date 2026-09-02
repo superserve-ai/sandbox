@@ -120,13 +120,9 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	var snapshot *parsedDump
 	corrections := 2
 	if manageOwnedChains {
-		out, err := dumpIPTables(ctx)
+		d, err := snapshotSharedChains(ctx, spec, log)
 		if err != nil {
-			return fmt.Errorf("host firewall pre-plan dump: %w", err)
-		}
-		d, perr := parseIPTablesSave(out)
-		if perr != nil {
-			return fmt.Errorf("host firewall pre-plan parse: %w", perr)
+			return fmt.Errorf("host firewall pre-plan snapshot: %w", err)
 		}
 		if err := rebuildOwnedChains(ctx, spec); err != nil {
 			return err
@@ -139,19 +135,26 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 		return err
 	}
 	for pass := 0; ; pass++ {
-		out, err := dumpIPTables(ctx)
-		if err != nil {
-			return fmt.Errorf("host firewall post-install dump: %w", err)
+		var d *parsedDump
+		var err error
+		if manageOwnedChains {
+			d, err = snapshotSharedChains(ctx, spec, log)
+		} else {
+			var out string
+			if out, err = dumpIPTables(ctx); err == nil {
+				d, err = parseIPTablesSave(out)
+			}
 		}
-		d, perr := parseIPTablesSave(out)
-		if perr != nil {
-			return fmt.Errorf("host firewall post-install parse: %w", perr)
+		if err != nil {
+			return fmt.Errorf("host firewall post-install snapshot: %w", err)
 		}
 		// A repaired chain must contain exactly what the repair's snapshot
-		// predicted. Any deviation means a non-cooperating writer interleaved
-		// with the restore and the absolute-position inserts may have changed
-		// its rule's effective position — refuse rather than serve a state
-		// that silently reordered someone else's rule.
+		// predicted, rule handles included: a non-cooperating writer that
+		// interleaved with the restore may have had its rule's effective
+		// position changed by the absolute-position inserts — even one
+		// that deleted and re-added its rule identically, which content
+		// alone cannot see. Refuse rather than serve a state that silently
+		// reordered someone else's rule.
 		var changed []string
 		for key, wantChain := range predicted {
 			gotChain := d.rules[key]
@@ -163,7 +166,7 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 				// exact token equality decides what canonicalization cannot.
 				same = ruleEqual(wantChain[i], gotChain[i]) || slices.Equal(wantChain[i], gotChain[i])
 			}
-			if !same {
+			if !same || chainRewritten(snapshot, d, key, spec) {
 				changed = append(changed, key)
 			}
 		}
@@ -247,38 +250,59 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 		}
 		// suffix: the foreign rules the snapshot proves were beneath our
 		// last rule, in order (identical rules can sit on both sides of
-		// the boundary). No rule of ours in the snapshot means no boundary
-		// to prove: everything reads as above us.
+		// the boundary), by handle where the backend has them. No rule of
+		// ours in the snapshot means no boundary to prove: everything reads
+		// as above us.
 		var suffix [][]string
+		below := map[uint64]bool{}
 		lastOwn := -1
 		for i, g := range snapshot.rules[key] {
 			if _, mine := ours(g); mine {
 				lastOwn = i
 			}
 		}
+		sh := snapshot.handles[key]
 		if lastOwn >= 0 {
-			for _, g := range snapshot.rules[key][lastOwn+1:] {
-				if _, mine := ours(g); !mine {
-					suffix = append(suffix, g)
+			for i := lastOwn + 1; i < len(snapshot.rules[key]); i++ {
+				g := snapshot.rules[key][i]
+				if _, mine := ours(g); mine {
+					continue
+				}
+				suffix = append(suffix, g)
+				if sh != nil {
+					below[sh[i]] = true
 				}
 			}
 		}
 		var lines []string
 		var rest [][]string
-		for _, g := range current.rules[key] {
+		var restHandles []uint64
+		for i, g := range current.rules[key] {
 			if w, mine := ours(g); mine {
 				lines = append(lines, "-D "+chain+" "+emitRuleTokens(w.args))
 				continue
 			}
 			rest = append(rest, g)
+			if ch := current.handles[key]; ch != nil {
+				restHandles = append(restHandles, ch[i])
+			}
 		}
-		// Right-align the suffix against the current chain so each rule
+		// With handles the provably-below rules are named exactly: the
+		// anchor is the first of them still present. Without them,
+		// right-align the suffix against the current chain so each rule
 		// pairs with its LATEST occurrence — a duplicate above the boundary
 		// is never mistaken for the one below it — giving the latest anchor
 		// that keeps every provably-below rule beneath us. A suffix that
 		// cannot be aligned (a rule vanished) proves nothing: ours go last.
 		anchor := len(rest)
-		if len(suffix) > 0 {
+		if sh != nil && restHandles != nil {
+			for i, h := range restHandles {
+				if below[h] {
+					anchor = i
+					break
+				}
+			}
+		} else if len(suffix) > 0 {
 			si := len(suffix) - 1
 			for ri := len(rest) - 1; ri >= 0 && si >= 0; ri-- {
 				if _, mine := ours(rest[ri]); mine || !slices.Equal(rest[ri], suffix[si]) {
@@ -317,6 +341,22 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 		}
 	}
 	return predicted, nil
+}
+
+// ownRule reports whether a dump rule is one of the spec's own rules.
+func ownRule(g []string, want []fwRule) bool {
+	for _, w := range want {
+		if ruleEqual(w.args, g) {
+			return true
+		}
+	}
+	return false
+}
+
+// foreignRule reports whether a dump rule is neither vmd's nor a stale vmd
+// rule — the rules a shared-chain transaction leaves exactly in place.
+func foreignRule(spec hostFWSpec, key string, g []string, want []fwRule) bool {
+	return !ownRule(g, want) && !staleVMDRule(spec, key, g, want)
 }
 
 // repairSharedOrdering repositions the vmd rules in each wrong shared chain
@@ -362,28 +402,13 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 		}
 		table, chain, _ := strings.Cut(key, "/")
 		got := d.rules[key]
-		ownRule := func(g []string) bool {
-			for _, w := range want {
-				if ruleEqual(w.args, g) {
-					return true
-				}
-			}
-			return false
-		}
 		// Reconcile stale managed rules (a previous configuration's
 		// redirects): deleted by their exact dump rulespec — they are vmd's
 		// own rules from an older parameterization, the shared-chain analog
 		// of the owned chains' flush-and-rebuild reconciliation.
 		var staleLines []string
 		for _, g := range got {
-			isOurs := false
-			for _, w := range want {
-				if ruleEqual(w.args, g) {
-					isOurs = true
-					break
-				}
-			}
-			if !isOurs && staleVMDRule(spec, key, g, want) {
+			if !ownRule(g, want) && staleVMDRule(spec, key, g, want) {
 				staleLines = append(staleLines, "-D "+chain+" "+emitRuleTokens(g))
 			}
 		}
@@ -409,7 +434,7 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 				if i >= lastTerm {
 					break
 				}
-				if ownRule(g) || staleVMDRule(spec, key, g, want) || unmarkedTwin(g, want) || ruleCannotMatchSandboxTraffic(g) {
+				if !foreignRule(spec, key, g, want) || unmarkedTwin(g, want) || ruleCannotMatchSandboxTraffic(g) {
 					continue
 				}
 				// A chain transfer moves its whole tree: safe and
@@ -439,10 +464,9 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 				}
 			}
 		}
-		foreign := func(g []string) bool { return !ownRule(g) && !staleVMDRule(spec, key, g, want) }
 		var remainder [][]string
 		for _, g := range got {
-			if foreign(g) {
+			if foreignRule(spec, key, g, want) {
 				remainder = append(remainder, g)
 			}
 		}
@@ -468,7 +492,7 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 			pos := len(layout)
 			survivors := 0
 			for _, g := range got {
-				if !foreign(g) {
+				if !foreignRule(spec, key, g, want) {
 					pos = len(heads) + survivors
 					break
 				}
