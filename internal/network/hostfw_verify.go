@@ -586,7 +586,7 @@ func jumpTarget(args []string) string {
 }
 
 // headRule reports whether repair re-inserts a spec rule at the chain head —
-// exactly the enforcement rules; plumbing (the MASQUERADE) is re-appended.
+// exactly the enforcement rules; plumbing (the MASQUERADE) keeps its place.
 func headRule(key string, w fwRule) bool {
 	return securityRule(key, w)
 }

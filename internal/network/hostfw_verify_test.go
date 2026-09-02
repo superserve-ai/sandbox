@@ -1189,52 +1189,66 @@ func TestForeignRulesBelowJumpsSurviveRepairInPlace(t *testing.T) {
 	}
 }
 
-func TestRepairRefusesToPromoteTerminalNATBelowMasquerade(t *testing.T) {
+// Replacing plumbing must put it back where its first copy stood: a foreign
+// rule beneath our MASQUERADE sees no sandbox traffic (the MASQUERADE is
+// terminal for it), and appending the replacement at the tail would promote
+// that rule into live traffic — a terminal NAT would change the mapping, an
+// observer's side effects would start firing.
+func TestTailReplacementPreservesPosition(t *testing.T) {
 	spec := testSpec(true)
 	masq := marked("-s", "10.11.0.0/16", "-o", "eth0", "-j", "MASQUERADE")
 	snat := []string{"-s", "10.11.0.0/16", "-o", "eth0", "-j", "SNAT", "--to-source", "192.0.2.7"}
+	mark := []string{"-s", "10.11.0.0/16", "-j", "MARK", "--set-xmark", "0x1/0xffffffff"}
+	stale := marked("-s", "10.11.0.0/16", "-o", "eth1", "-j", "MASQUERADE")
 
-	// Foreign terminal NAT below our effective MASQUERADE: re-appending ours
-	// would promote it into traffic ours handled first — refuse.
-	rules, chains := specKernel(spec, nil)
-	rules["nat/POSTROUTING"] = append(rules["nat/POSTROUTING"], snat, masq) // dup forces repair
-	d, _ := parseIPTablesSave(renderDump(rules, chains))
-	if _, err := repairSharedOrdering(context.Background(), d, spec); err == nil {
-		t.Fatal("repair promoted a foreign terminal NAT rule past the MASQUERADE")
+	run := func(t *testing.T, post [][]string, want [][]string) {
+		t.Helper()
+		rules, chains := specKernel(spec, nil)
+		rules["nat/POSTROUTING"] = post
+		k := &fakeKernel{rules: rules, chains: chains}
+		defer k.install(t)()
+		d, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+		if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
+			t.Fatalf("repair: %v", err)
+		}
+		got := k.rules["nat/POSTROUTING"]
+		if len(got) != len(want) {
+			t.Fatalf("POSTROUTING = %v, want %v", got, want)
+		}
+		for i := range want {
+			if !ruleEqual(want[i], got[i]) && !slices.Equal(want[i], got[i]) {
+				t.Fatalf("POSTROUTING[%d] = %v, want %v (full: %v)", i, got[i], want[i], got)
+			}
+		}
+		nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
+		if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
+			t.Fatalf("post-repair verify failed: %s %s", class, detail)
+		}
 	}
 
-	// The same rule ABOVE ours is already effective; repair keeps that
-	// relative order and proceeds.
-	rules, chains = specKernel(spec, nil)
-	rules["nat/POSTROUTING"] = append([][]string{snat}, append(rules["nat/POSTROUTING"], masq)...)
-	k := &fakeKernel{rules: rules, chains: chains}
-	defer k.install(t)()
-	d, _ = parseIPTablesSave(renderDump(k.rules, k.chains))
-	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
-		t.Fatalf("repair refused with foreign NAT already above: %v", err)
-	}
-	nd, _ := parseIPTablesSave(renderDump(k.rules, k.chains))
-	if ok, class, detail := verifyHostFirewall(nd, spec); !ok {
-		t.Fatalf("post-repair verify failed: %s %s", class, detail)
-	}
-
-	// An observer below ours cannot change a verdict: repair proceeds.
-	rules, chains = specKernel(spec, nil)
-	rules["nat/POSTROUTING"] = append(rules["nat/POSTROUTING"], []string{"-s", "10.11.0.0/16", "-j", "LOG"}, masq)
-	k2 := &fakeKernel{rules: rules, chains: chains}
-	defer k2.install(t)()
-	d, _ = parseIPTablesSave(renderDump(k2.rules, k2.chains))
-	if _, err := repairSharedOrdering(context.Background(), d, spec); err != nil {
-		t.Fatalf("repair refused with observer below: %v", err)
-	}
+	t.Run("duplicate with terminal NAT beneath: NAT stays beneath", func(t *testing.T) {
+		run(t, [][]string{masq, snat, masq}, [][]string{masq, snat})
+	})
+	t.Run("duplicate with observer beneath: observer stays unreached", func(t *testing.T) {
+		run(t, [][]string{masq, mark, masq}, [][]string{masq, mark})
+	})
+	t.Run("stale plumbing replaced in place", func(t *testing.T) {
+		run(t, [][]string{stale, mark}, [][]string{masq, mark})
+	})
+	t.Run("foreign NAT already above stays above", func(t *testing.T) {
+		run(t, [][]string{snat, masq, masq}, [][]string{snat, masq})
+	})
+	t.Run("no copy present: appended", func(t *testing.T) {
+		run(t, [][]string{mark}, [][]string{mark, masq})
+	})
 }
 
 func TestConcurrentWriterDuringRepairDetected(t *testing.T) {
 	// A NON-cooperating writer inserting between the repair's snapshot dump
 	// and the next verification dump is detected by the prediction compare
-	// — verification alone would tolerate the rule (an observer). Above tail
-	// plumbing nothing of the writer's was demoted, so the correction is a
-	// no-op and startup proceeds with the observer preserved in place.
+	// — verification alone would tolerate the rule (an observer). The
+	// yield moves our plumbing back below it and startup proceeds with the
+	// observer preserved at the head.
 	spec := testSpec(true)
 	rules, chains := specKernel(spec, nil)
 	masq := marked("-s", "10.11.0.0/16", "-o", "eth0", "-j", "MASQUERADE")
@@ -1243,11 +1257,13 @@ func TestConcurrentWriterDuringRepairDetected(t *testing.T) {
 	k := &fakeKernel{rules: rules, chains: chains}
 	defer k.install(t)()
 	fakeRestore := restoreIPTables
+	raced := false
 	restoreIPTables = func(ctx context.Context, input string) error {
 		if err := fakeRestore(ctx, input); err != nil {
 			return err
 		}
-		if strings.HasPrefix(input, "*nat") {
+		if !raced && strings.HasPrefix(input, "*nat") {
+			raced = true
 			k.rules["nat/POSTROUTING"] = append([][]string{{"-s", "10.11.0.0/16", "-j", "LOG"}}, k.rules["nat/POSTROUTING"]...)
 		}
 		return nil

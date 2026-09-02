@@ -223,15 +223,14 @@ func ensureHostFirewall(ctx context.Context, hostIface string, httpProxyPort, tl
 	}
 }
 
-// yieldToInterlopers moves vmd's head rules in each changed chain directly
-// BELOW every foreign rule not provably below them before the race — one
-// atomic transaction per table, vmd's rules never absent, so running
-// sandboxes keep their enforcement throughout. Once our transaction has
-// moved us, a rule the writer inserted anywhere above our old position
-// reads identically to one inserted just below it, so "above us" is the
-// only placement that shadows nothing of theirs; verification then
-// classifies the interloper in place like any other foreign rule. Tail
-// plumbing (the MASQUERADE) stays where the transaction put it. OWNER ONLY.
+// yieldToInterlopers moves vmd's rules in each changed chain directly BELOW
+// every foreign rule not provably below them before the race — one atomic
+// transaction per table, vmd's rules never absent, so running sandboxes
+// keep their enforcement throughout. Once our transaction has moved us, a
+// rule the writer inserted anywhere above our old position reads
+// identically to one inserted just below it, so "above us" is the only
+// placement that shadows nothing of theirs; verification then classifies
+// the interloper in place like any other foreign rule. OWNER ONLY.
 func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec hostFWSpec, changed []string) (map[string][][]string, error) {
 	predicted := map[string][][]string{}
 	perTable := map[string][]string{}
@@ -247,18 +246,18 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 			return fwRule{}, false
 		}
 		// suffix: the foreign rules the snapshot proves were beneath our
-		// last head rule, in order (identical rules can sit on both sides
-		// of the boundary). No head of ours in the snapshot means no
-		// boundary to prove: everything reads as above us.
+		// last rule, in order (identical rules can sit on both sides of
+		// the boundary). No rule of ours in the snapshot means no boundary
+		// to prove: everything reads as above us.
 		var suffix [][]string
-		lastHead := -1
+		lastOwn := -1
 		for i, g := range snapshot.rules[key] {
-			if w, mine := ours(g); mine && headRule(key, w) {
-				lastHead = i
+			if _, mine := ours(g); mine {
+				lastOwn = i
 			}
 		}
-		if lastHead >= 0 {
-			for _, g := range snapshot.rules[key][lastHead+1:] {
+		if lastOwn >= 0 {
+			for _, g := range snapshot.rules[key][lastOwn+1:] {
 				if _, mine := ours(g); !mine {
 					suffix = append(suffix, g)
 				}
@@ -267,7 +266,7 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 		var lines []string
 		var rest [][]string
 		for _, g := range current.rules[key] {
-			if w, mine := ours(g); mine && headRule(key, w) {
+			if w, mine := ours(g); mine {
 				lines = append(lines, "-D "+chain+" "+emitRuleTokens(w.args))
 				continue
 			}
@@ -294,17 +293,15 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 				anchor = len(rest)
 			}
 		}
-		var heads [][]string
+		var own [][]string
 		for _, w := range want {
-			if headRule(key, w) {
-				heads = append(heads, w.args)
-			}
+			own = append(own, w.args)
 		}
-		for i, h := range heads {
+		for i, h := range own {
 			lines = append(lines, fmt.Sprintf("-I %s %d %s", chain, anchor+1+i, emitRuleTokens(h)))
 		}
 		layout := append([][]string{}, rest[:anchor]...)
-		layout = append(layout, heads...)
+		layout = append(layout, own...)
 		layout = append(layout, rest[anchor:]...)
 		predicted[key] = layout
 		perTable[table] = append(perTable[table], lines...)
@@ -332,7 +329,8 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 //     rulespec delete can only ever match a vmd rule;
 //   - security rules (drops, owned-chain jumps, PREROUTING redirects)
 //     re-inserted at head positions 1..k, so they run before anything else;
-//   - plumbing (the MASQUERADE) re-appended at the tail.
+//   - plumbing (the MASQUERADE) re-inserted where its first copy stood, so
+//     nothing beneath it is promoted into the traffic it handles first.
 //
 // Because the restore rebuilds each chain from the verification dump's
 // snapshot, repair also returns the exact per-chain contents that snapshot
@@ -343,11 +341,10 @@ func yieldToInterlopers(ctx context.Context, snapshot, current *parsedDump, spec
 // inserts — e.g. a fresh strict rule demoted below a terminal redirect —
 // with post-repair verification tolerating the result.
 //
-// Any foreign rule whose EFFECTIVE position the transaction would change —
-// demoted below our terminal rules by the head inserts, or promoted above
-// our plumbing by the tail re-append — is refused unless the move is
-// provably verdict-neutral; the checks below spell out each case. The call
-// on anything else is the operator's. OWNER ONLY.
+// Any foreign rule the head inserts would demote below our terminal rules
+// is refused unless the move is provably verdict-neutral; the checks below
+// spell out each case. The call on anything else is the operator's. OWNER
+// ONLY.
 func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (map[string][][]string, error) {
 	predicted := map[string][][]string{}
 	perTable := map[string][]string{} // table → restore lines
@@ -365,6 +362,14 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 		}
 		table, chain, _ := strings.Cut(key, "/")
 		got := d.rules[key]
+		ownRule := func(g []string) bool {
+			for _, w := range want {
+				if ruleEqual(w.args, g) {
+					return true
+				}
+			}
+			return false
+		}
 		// Reconcile stale managed rules (a previous configuration's
 		// redirects): deleted by their exact dump rulespec — they are vmd's
 		// own rules from an older parameterization, the shared-chain analog
@@ -404,14 +409,7 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 				if i >= lastTerm {
 					break
 				}
-				isOurs := false
-				for _, w := range want {
-					if ruleEqual(w.args, g) {
-						isOurs = true
-						break
-					}
-				}
-				if isOurs || staleVMDRule(spec, key, g, want) || unmarkedTwin(g, want) || ruleCannotMatchSandboxTraffic(g) {
+				if ownRule(g) || staleVMDRule(spec, key, g, want) || unmarkedTwin(g, want) || ruleCannotMatchSandboxTraffic(g) {
 					continue
 				}
 				// A chain transfer moves its whole tree: safe and
@@ -433,50 +431,6 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 				}
 			}
 		}
-		// Plumbing is re-appended at the tail, which promotes any foreign rule
-		// currently sitting below our effective copy — rules our terminal
-		// plumbing made unreachable would begin seeing traffic. Refuse when
-		// the promoted rule could change a verdict: in nat, anything
-		// terminal-capable (a promoted SNAT/MASQUERADE/ACCEPT changes the
-		// mapping ours applied first; a strict rule below only ever tightens
-		// what NAT already skipped); in filter, a strict or unknown rule
-		// (promoted above our ACCEPTs it starts blocking sandbox traffic —
-		// while a promoted ACCEPT is verdict-identical to ours). Inert and
-		// observer rules never change a verdict.
-		for _, w := range want {
-			if headRule(key, w) {
-				continue
-			}
-			first := -1
-			for i, g := range got {
-				if ruleEqual(w.args, g) {
-					first = i
-					break
-				}
-			}
-			if first == -1 {
-				continue
-			}
-			for _, g := range got[first+1:] {
-				isOurs := false
-				for _, o := range want {
-					if ruleEqual(o.args, g) {
-						isOurs = true
-						break
-					}
-				}
-				if isOurs || staleVMDRule(spec, key, g, want) || unmarkedTwin(g, want) || ruleCannotMatchSandboxTraffic(g) {
-					continue
-				}
-				disp := foreignDisposition(g)
-				tolerated := disp == "inert" || disp == "observer" ||
-					(table == "nat" && disp == "strict") ||
-					(table == "filter" && disp == "permissive")
-				if !tolerated {
-					return nil, fmt.Errorf("foreign %s rule below a vmd rule in %s (%s) — re-appending ours would promote it; refusing", disp, key, strings.Join(g, " "))
-				}
-			}
-		}
 		lines := staleLines
 		for _, w := range want {
 			for _, g := range got {
@@ -485,34 +439,45 @@ func repairSharedOrdering(ctx context.Context, d *parsedDump, spec hostFWSpec) (
 				}
 			}
 		}
+		foreign := func(g []string) bool { return !ownRule(g) && !staleVMDRule(spec, key, g, want) }
 		var remainder [][]string
 		for _, g := range got {
-			isOurs := false
-			for _, w := range want {
-				if ruleEqual(w.args, g) {
-					isOurs = true
-					break
-				}
-			}
-			if !isOurs && !staleVMDRule(spec, key, g, want) {
+			if foreign(g) {
 				remainder = append(remainder, g)
 			}
 		}
 		headPos := 0
-		var heads, tailRules [][]string
-		var tail []string
+		var heads [][]string
 		for _, w := range want {
 			if headRule(key, w) {
 				headPos++
 				lines = append(lines, fmt.Sprintf("-I %s %d %s", chain, headPos, emitRuleTokens(w.args)))
 				heads = append(heads, w.args)
-			} else {
-				tail = append(tail, "-A "+chain+" "+emitRuleTokens(w.args))
-				tailRules = append(tailRules, w.args)
 			}
 		}
-		lines = append(lines, tail...)
-		predicted[key] = append(append(heads, remainder...), tailRules...)
+		// Plumbing goes back exactly where its first copy (current or
+		// stale) stood, measured in surviving foreign rules, so nothing
+		// beneath it is ever promoted into the traffic it handles first.
+		// With no copy present it is appended: there was nothing below it
+		// to promote.
+		layout := append(append([][]string{}, heads...), remainder...)
+		for _, w := range want {
+			if headRule(key, w) {
+				continue
+			}
+			pos := len(layout)
+			survivors := 0
+			for _, g := range got {
+				if !foreign(g) {
+					pos = len(heads) + survivors
+					break
+				}
+				survivors++
+			}
+			lines = append(lines, fmt.Sprintf("-I %s %d %s", chain, pos+1, emitRuleTokens(w.args)))
+			layout = append(layout[:pos:pos], append([][]string{w.args}, layout[pos:]...)...)
+		}
+		predicted[key] = layout
 		perTable[table] = append(perTable[table], lines...)
 	}
 	for _, table := range []string{"filter", "nat"} {
