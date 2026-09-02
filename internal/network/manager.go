@@ -83,6 +83,14 @@ const MaxSlots = 65000
 // ErrNoSlots is returned when no network slots are available.
 var ErrNoSlots = fmt.Errorf("no available network slots (max %d concurrent VMs)", MaxSlots)
 
+// ErrOperatorSlotLimit is returned when this host has minted as many slot
+// indexes as the operator allows. Distinct from ErrNoSlots on purpose: the
+// kernel range is not exhausted and nothing here is broken, so a caller
+// that can place the work on another host should, while one that cannot —
+// a resume, which reuses its recorded index and never reaches this — is
+// never affected.
+var ErrOperatorSlotLimit = fmt.Errorf("host at its configured network-slot limit")
+
 // reclaimCooldown bounds how often a claim at the ceiling rescans for unused
 // indexes. The scan is cheap but pointless to repeat while nothing has been
 // released, and a host at the ceiling is exactly when claims arrive fastest.
@@ -157,6 +165,9 @@ type Manager struct {
 	nextSlot   int   // next new slot (used when freeSlots is empty)
 	maxSlot    int   // new-slot ceiling; meaningful only when slotPinned (WithExactSlot)
 	slotPinned bool  // WithExactSlot: allocate exactly maxSlot or fail, never advance
+	// operatorMaxSlots caps minted indexes as operator policy, below the
+	// kernel ceiling. Zero means unlimited. See WithOperatorSlotLimit.
+	operatorMaxSlots int
 
 	// slotOwner is the single source of truth for slot allocation AND identity:
 	// slotOwner[idx] == the current owner of slot index idx, one of
@@ -233,6 +244,26 @@ type ManagerOption func(*Manager)
 // WithHostID supplies the persisted VMD host identity for network-operation logs.
 func WithHostID(hostID string) ManagerOption {
 	return func(m *Manager) { m.hostID = hostID }
+}
+
+// WithOperatorSlotLimit caps how many slot indexes this host will mint, as
+// operator policy below the kernel ceiling. Zero — the default — means no
+// policy limit and leaves behavior exactly as it was.
+//
+// Enforced inside this allocator rather than by a separate admission
+// counter because the allocator already owns the authoritative
+// slot-to-owner ledger; a second counter would be a copy of that ledger,
+// free to drift from it. Every path that mints an index — sandbox creates,
+// pool refill, template builders — arrives through the same claim, so one
+// check covers all three instead of three checks that must be kept in
+// agreement.
+//
+// Reusing a recycled or warm slot is deliberately not capped: it transfers
+// ownership of an index this host already prepared and does not grow the
+// host's footprint. That is also why resume is unaffected — it reuses the
+// index recorded in its namespace and never mints a new one.
+func WithOperatorSlotLimit(limit int) ManagerOption {
+	return func(m *Manager) { m.operatorMaxSlots = limit }
 }
 
 // WithNetlinkSlotOps selects the netlink backend for slot network operations
@@ -1173,6 +1204,15 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 				}
 				m.mu.Unlock()
 				return 0, ErrNoSlots
+			}
+			// Operator policy, checked only on the mint path and only
+			// after the reclaim attempt above: recycling an index this
+			// host already prepared is not growth, so a host at its policy
+			// limit can still reuse what it has. Inside the allocator lock,
+			// so concurrent claims cannot both pass the same check.
+			if m.operatorMaxSlots > 0 && !m.slotPinned && m.nextSlot > m.operatorMaxSlots {
+				m.mu.Unlock()
+				return 0, ErrOperatorSlotLimit
 			}
 			idx = m.nextSlot
 			m.nextSlot++

@@ -677,6 +677,15 @@ func main() {
 		log.Info().Uint64("port", port).Msg("guest DNS redirect enabled")
 	}
 
+	// Host-local capacity admission. Read once and shared by the three
+	// places that must agree: the gate itself, the slot allocator policy,
+	// and the capability this host advertises. Its own setting, never
+	// inferred from VMD_MAX_SANDBOXES or VMD_MAX_NETWORK_SLOTS being set —
+	// those are already configured on production hosts to feed pressure
+	// publication, so deriving enablement from them would switch
+	// enforcement on fleet-wide the moment this ships.
+	localAdmission := envOrDefault("VMD_LOCAL_ADMISSION_ENABLED", "false") == "true"
+
 	// ---- Network manager + host firewall ----
 	// preliminary: sentry init, config parse, tool lookups, dir creation, and
 	// egress/DNS option wiring — everything before the network manager builds.
@@ -684,6 +693,15 @@ func main() {
 	netMgrOpts = append(netMgrOpts,
 		network.WithHostID(cfg.HostID),
 		network.WithSecretsProxyAddr(cfg.SecretsProxySandboxDst, cfg.SecretsProxySandboxPort))
+	// Slot policy travels with local admission, not on its own: the two are
+	// halves of one limit, and a host that enforces sandbox counts while
+	// minting slots without bound is enforcing neither. Left unset — and so
+	// unlimited — on any host that has not opted in, whatever
+	// VMD_MAX_NETWORK_SLOTS happens to say for pressure publication.
+	if localAdmission {
+		netMgrOpts = append(netMgrOpts,
+			network.WithOperatorSlotLimit(int(envInt32Fatal(log, "VMD_MAX_NETWORK_SLOTS"))))
+	}
 	netMgr, err := network.NewManager(ctx, cfg.HostInterface, log, netMgrOpts...)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize network manager")
@@ -898,7 +916,7 @@ func main() {
 		// configured on production hosts to feed pressure publication, so
 		// inferring enablement from it would switch enforcement on across
 		// the whole fleet the moment this ships.
-		LocalAdmission: envOrDefault("VMD_LOCAL_ADMISSION_ENABLED", "false") == "true",
+		LocalAdmission: localAdmission,
 		MaxSandboxes:   int(envInt32Fatal(log, "VMD_MAX_SANDBOXES")),
 	}, netMgr, log)
 	if err != nil {
@@ -1788,8 +1806,11 @@ func main() {
 				// endpoint after each successful heartbeat; in-memory
 				// counters only. The limits are operator admission knobs;
 				// 0 (unset) means no cap.
-				Pressure:        pressureSample,
-				PressureReady:   pressureReady,
+				Pressure:      pressureSample,
+				PressureReady: pressureReady,
+				// Advertised so placement can tell a host that enforces its
+				// own limits from one that only reports its load.
+				LocalAdmission:  localAdmission,
 				MaxSandboxes:    envInt32Fatal(log, "VMD_MAX_SANDBOXES"),
 				MaxNetworkSlots: envInt32Fatal(log, "VMD_MAX_NETWORK_SLOTS"),
 				LifecycleReady:  startupReady.Load,

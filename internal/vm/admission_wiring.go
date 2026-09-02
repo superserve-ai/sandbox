@@ -48,6 +48,7 @@ func (m *Manager) StartAdmission(ctx context.Context) {
 				m.admission.Open()
 				m.log.Info().Int("charged", m.admission.Charged()).
 					Msg("host-local admission open")
+				go m.auditAdmissionLoop(ctx)
 				return
 			}
 			select {
@@ -135,6 +136,29 @@ func (m *Manager) deleteRecord(vmID string) error {
 	}
 	m.admission.Release(vmID)
 	return nil
+}
+
+// admissionAuditInterval is how often the ledger is checked against
+// observed load. Slow on purpose: an undercount is a bug, not an expected
+// condition, and each pass walks the fleet. Frequent enough that a leak is
+// caught in minutes rather than at the next restart.
+var admissionAuditInterval = 2 * time.Minute
+
+// auditAdmissionLoop re-checks the ledger for as long as the daemon runs.
+// Its own goroutine because the check walks the fleet and must never sit on
+// a request path, and because closing the gate mid-audit has to be able to
+// happen without a caller waiting on it.
+func (m *Manager) auditAdmissionLoop(ctx context.Context) {
+	ticker := time.NewTicker(admissionAuditInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.AuditAdmission()
+		}
+	}
 }
 
 // AuditAdmission compares the gate's ledger against an independently

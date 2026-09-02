@@ -7,6 +7,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/admission"
+	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -53,6 +54,11 @@ func admissionError(err error) error {
 		return status.Error(codes.Unavailable, err.Error())
 	case errors.Is(err, admission.ErrIntentRequired):
 		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, network.ErrOperatorSlotLimit):
+		// Policy exhaustion, not kernel exhaustion: the host is fine and
+		// the sandbox is placeable elsewhere, so it carries the same code
+		// as a sandbox-count refusal rather than reading as a host fault.
+		return status.Error(codes.ResourceExhausted, err.Error())
 	default:
 		return err
 	}
