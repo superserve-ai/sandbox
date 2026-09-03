@@ -320,8 +320,8 @@ func TestFreezeTokenTable(t *testing.T) {
 
 func TestNilFreezerIsANoOp(t *testing.T) {
 	var f *freezer
-	f.spawnLock()
-	f.spawnUnlock()
+	_ = f.beginSpawn()
+	f.endSpawn()
 	if f.available() || f.isFrozen() {
 		t.Error("nil freezer must be neither available nor frozen")
 	}
@@ -377,12 +377,14 @@ func TestPlacementIsAcknowledgedBeforeSpawnReturns(t *testing.T) {
 	name, args, placed := fz.wrap("/bin/sh", []string{"-c", "exit 0"})
 	cmd := exec.Command(name, args...)
 	placed.attach(cmd)
-	fz.spawnLock()
+	if err := fz.beginSpawn(); err != nil {
+		t.Fatal(err)
+	}
 	err := cmd.Start()
 	if err == nil {
 		err = fz.confirmPlacement(cmd, placed)
 	}
-	fz.spawnUnlock()
+	fz.endSpawn()
 	if err != nil {
 		t.Fatalf("placed spawn: %v", err)
 	}
@@ -450,5 +452,52 @@ func TestFailedSpawnReleasesPlacementAndReapsTheChild(t *testing.T) {
 	}
 	if placed.r != nil || placed.w != nil {
 		t.Error("pipe not released after a failed placement")
+	}
+}
+
+// No process starts while the workload is frozen: it would spend its first
+// moments outside the cgroup, exactly where a snapshot must not find it.
+func TestSpawnIsRefusedWhileFrozen(t *testing.T) {
+	fz := newFreezer(newFake(), testDir)
+	if err := fz.beginSpawn(); err != nil {
+		t.Fatal(err)
+	}
+	fz.endSpawn()
+	if err := fz.freeze(bg(), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fz.beginSpawn(); !errors.Is(err, errWorkloadFrozen) {
+		if err == nil {
+			fz.endSpawn()
+		}
+		t.Fatalf("spawn while frozen: err=%v, want errWorkloadFrozen", err)
+	}
+	if err := fz.thaw("t1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fz.beginSpawn(); err != nil {
+		t.Fatalf("spawn after thaw: %v", err)
+	}
+	fz.endSpawn()
+}
+
+// boxd learns of the freezer from the init script, never by probing: with
+// nothing set it is unavailable and touches no file; set, the mount is
+// confirmed, and a claimed-but-missing one fails closed.
+func TestFreezerFromEnv(t *testing.T) {
+	t.Setenv(freezerEnv, "")
+	if fz := freezerFromEnv(); fz.available() {
+		t.Fatal("freezer available with nothing set")
+	}
+	dir := t.TempDir()
+	t.Setenv(freezerEnv, dir)
+	if fz := freezerFromEnv(); fz.available() {
+		t.Fatal("a claimed freezer with no state file must fail closed")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "freezer.state"), []byte("THAWED\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if fz := freezerFromEnv(); !fz.available() || fz.dir != dir {
+		t.Fatal("a mounted freezer named by the init script must be used")
 	}
 }

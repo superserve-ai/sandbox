@@ -29,9 +29,6 @@ import (
 // to be snapshotted" and "just restored" look identical. cgroup v1: the guest
 // kernel predates v2.
 
-// cgroupFreezerDir is the workload cgroup the init script creates.
-const cgroupFreezerDir = "/sys/fs/cgroup/freezer/workload"
-
 // defaultFreezeBudget bounds the wait for every task to stop; a task in
 // uninterruptible I/O cannot be frozen until it returns.
 const defaultFreezeBudget = 2 * time.Second
@@ -78,6 +75,10 @@ var (
 	errTokenConflict = errors.New("another freeze is active")
 )
 
+// newFreezer wraps a cgroup the init script mounted. It is only asked for
+// when the image says one exists (see freezerFromEnv); the read confirms the
+// mount, so an image that claims a freezer it does not have fails closed —
+// freezing is refused, and the builder never marks it.
 func newFreezer(fs freezerFS, dir string) *freezer {
 	f := &freezer{fs: fs, dir: dir}
 	if fs != nil {
@@ -87,19 +88,45 @@ func newFreezer(fs freezerFS, dir string) *freezer {
 	return f
 }
 
+// freezerEnv is set by the guest init script when it mounts the workload
+// freezer, so boxd never probes the filesystem to find out: an image without
+// the freezer starts exactly as it always did.
+const freezerEnv = "BOXD_WORKLOAD_FREEZER"
+
+func freezerFromEnv() *freezer {
+	dir := os.Getenv(freezerEnv)
+	if dir == "" {
+		return newFreezer(nil, "")
+	}
+	return newFreezer(cgroupFS{dir: dir}, dir)
+}
+
 // A nil *freezer means none is configured: passthrough, and a freeze is refused.
 
 func (f *freezer) available() bool { return f != nil && f.mounted }
 
-// Without a cgroup there is nothing a freeze could miss, so a spawn takes no
-// lock at all and the exec path is what it was before the freezer existed.
-func (f *freezer) spawnLock() {
-	if f.available() {
-		f.mu.RLock()
+var errWorkloadFrozen = errors.New("workload is frozen for a snapshot; no new process can start until it is released")
+
+// beginSpawn admits a spawn: it holds the spawn lock shared until endSpawn,
+// and refuses while the workload is frozen. A process started after the
+// freeze returned would spend its first moments outside the cgroup, and a
+// snapshot taken then would capture it running — to run on the stale clock
+// after restore. Without a cgroup there is nothing a freeze could miss, so a
+// spawn takes no lock at all and the exec path is what it was before the
+// freezer existed.
+func (f *freezer) beginSpawn() error {
+	if !f.available() {
+		return nil
 	}
+	f.mu.RLock()
+	if f.frozen.Load() {
+		f.mu.RUnlock()
+		return errWorkloadFrozen
+	}
+	return nil
 }
 
-func (f *freezer) spawnUnlock() {
+func (f *freezer) endSpawn() {
 	if f.available() {
 		f.mu.RUnlock()
 	}

@@ -384,6 +384,8 @@ mount -t cgroup -o freezer freezer /sys/fs/cgroup/freezer 2>/dev/null
 mkdir -p /sys/fs/cgroup/freezer/workload
 # A process joins the cgroup itself, as whatever user it runs as.
 chmod 666 /sys/fs/cgroup/freezer/workload/cgroup.procs /sys/fs/cgroup/freezer/workload/tasks 2>/dev/null
+# Tell boxd where the freezer is, so it never has to look.
+export BOXD_WORKLOAD_FREEZER=/sys/fs/cgroup/freezer/workload
 
 `
 

@@ -119,7 +119,7 @@ func main() {
 	mux := http.NewServeMux()
 
 	ctx := &sandboxContext{}
-	fz := newFreezer(cgroupFS{dir: cgroupFreezerDir}, cgroupFreezerDir)
+	fz := freezerFromEnv()
 
 	// Connect RPC services.
 	procService := &processService{
@@ -562,12 +562,15 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, placed *pl
 
 	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
 
-	s.freezer.spawnLock()
+	if err := s.freezer.beginSpawn(); err != nil {
+		placed.close()
+		return connect.NewError(connect.CodeUnavailable, err)
+	}
 	tty, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: cols, Rows: rows})
 	if perr := s.freezer.confirmPlacement(cmd, placed); err == nil {
 		err = perr
 	}
-	s.freezer.spawnUnlock()
+	s.freezer.endSpawn()
 	if err != nil {
 		if tty != nil {
 			tty.Close()
@@ -649,12 +652,15 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, placed *
 
 	// Spawn lock held across Start() and the wrapper's placement report, so
 	// a freeze cannot miss the child.
-	s.freezer.spawnLock()
+	if err := s.freezer.beginSpawn(); err != nil {
+		placed.close()
+		return connect.NewError(connect.CodeUnavailable, err)
+	}
 	err = cmd.Start()
 	if perr := s.freezer.confirmPlacement(cmd, placed); err == nil {
 		err = perr
 	}
-	s.freezer.spawnUnlock()
+	s.freezer.endSpawn()
 	if err != nil {
 		reapKilled(cmd)
 		return connect.NewError(connect.CodeInternal, err)
