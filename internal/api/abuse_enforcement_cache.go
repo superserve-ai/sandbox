@@ -147,13 +147,14 @@ func (c *abuseEnforcementCache) Replace(teamID uuid.UUID, trusted bool, restrict
 	// Admission must not charge restrictions that are already expired. Stats
 	// may be disabled, so reclaim them synchronously before sizing a write.
 	c.pruneExpiredRestrictionsLocked(time.Now())
+	admissionNow := time.Now()
 	if trusted {
 		c.trustedTeams[teamID] = struct{}{}
 	} else {
 		delete(c.trustedTeams, teamID)
 	}
 	previousCost := entryCost(c.entries[teamID])
-	candidateCost := restrictionCost(teamID, restrictions)
+	candidateCost := restrictionCost(teamID, restrictions, admissionNow)
 	if candidateCost > c.capacity() {
 		c.admissionRejections.Add(1)
 		return
@@ -175,7 +176,7 @@ func (c *abuseEnforcementCache) Replace(teamID uuid.UUID, trusted bool, restrict
 	}
 	for _, r := range restrictions {
 		st := strings.ToLower(r.SubjectType)
-		if !r.ExpiresAt.IsZero() && !time.Now().Before(r.ExpiresAt) {
+		if !r.ExpiresAt.IsZero() && !admissionNow.Before(r.ExpiresAt) {
 			continue
 		}
 		actions := normalizedLifecycleActions(r.Actions)
@@ -265,6 +266,7 @@ func (c *abuseEnforcementCache) Update(teamID uuid.UUID, trusted *bool, restrict
 		c.trustedTeams = make(map[uuid.UUID]struct{})
 	}
 	c.pruneExpiredRestrictionsLocked(time.Now())
+	admissionNow := time.Now()
 	if trusted != nil {
 		if *trusted {
 			c.trustedTeams[teamID] = struct{}{}
@@ -273,7 +275,7 @@ func (c *abuseEnforcementCache) Update(teamID uuid.UUID, trusted *bool, restrict
 		}
 	}
 	current := c.entries[teamID]
-	delta := restrictionDelta(teamID, current, restrictions)
+	delta := restrictionDelta(teamID, current, restrictions, admissionNow)
 	if entryCost(current)+delta > c.capacity() {
 		c.admissionRejections.Add(1)
 		return
@@ -320,7 +322,7 @@ func (c *abuseEnforcementCache) Update(teamID uuid.UUID, trusted *bool, restrict
 	// primitive used when a reconciler has a complete snapshot.
 	for _, r := range restrictions {
 		st := strings.ToLower(r.SubjectType)
-		if !r.ExpiresAt.IsZero() && !time.Now().Before(r.ExpiresAt) {
+		if !r.ExpiresAt.IsZero() && !admissionNow.Before(r.ExpiresAt) {
 			continue
 		}
 		actions := normalizedLifecycleActions(r.Actions)
@@ -833,10 +835,10 @@ func entryCost(entry abuseEnforcementEntry) int {
 	return len(entry.team) + len(entry.user) + len(entry.ip) + len(entry.domain)
 }
 
-func restrictionCost(teamID uuid.UUID, restrictions []abuseEnforcementRestriction) int {
+func restrictionCost(teamID uuid.UUID, restrictions []abuseEnforcementRestriction, now time.Time) int {
 	keys := make(map[string]struct{})
 	for _, r := range restrictions {
-		st, entries, ok := normalizedRestrictionEntries(teamID, r)
+		st, entries, ok := normalizedRestrictionEntriesAt(teamID, r, now)
 		if !ok {
 			continue
 		}
@@ -847,11 +849,11 @@ func restrictionCost(teamID uuid.UUID, restrictions []abuseEnforcementRestrictio
 	return len(keys)
 }
 
-func restrictionDelta(teamID uuid.UUID, current abuseEnforcementEntry, restrictions []abuseEnforcementRestriction) int {
+func restrictionDelta(teamID uuid.UUID, current abuseEnforcementEntry, restrictions []abuseEnforcementRestriction, now time.Time) int {
 	seen := make(map[string]struct{})
 	delta := 0
 	for _, r := range restrictions {
-		st, entries, ok := normalizedRestrictionEntries(teamID, r)
+		st, entries, ok := normalizedRestrictionEntriesAt(teamID, r, now)
 		if !ok {
 			continue
 		}
@@ -881,7 +883,11 @@ func restrictionDelta(teamID uuid.UUID, current abuseEnforcementEntry, restricti
 }
 
 func normalizedRestrictionEntries(teamID uuid.UUID, r abuseEnforcementRestriction) (string, []string, bool) {
-	if !r.ExpiresAt.IsZero() && !time.Now().Before(r.ExpiresAt) {
+	return normalizedRestrictionEntriesAt(teamID, r, time.Now())
+}
+
+func normalizedRestrictionEntriesAt(teamID uuid.UUID, r abuseEnforcementRestriction, now time.Time) (string, []string, bool) {
+	if !r.ExpiresAt.IsZero() && !now.Before(r.ExpiresAt) {
 		return "", nil, false
 	}
 	st := strings.ToLower(r.SubjectType)
