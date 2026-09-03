@@ -8,9 +8,10 @@ import (
 )
 
 // The whole point of the gate: N racers against room for K admit exactly K.
-// The design this replaced failed precisely here — 20 concurrent admissions
-// against room for 3 let 8 through — so this is written against the real
-// gate under real concurrency, not a serialized approximation of it.
+// Written against the real gate under real concurrency rather than a
+// serialized approximation, because a limit that is checked and then
+// committed in two steps passes every sequential test and still overshoots
+// under load — which is the only way this failure ever shows up.
 func TestAdmissionGateAdmitsExactlyItsLimitUnderRace(t *testing.T) {
 	const limit, racers = 3, 20
 	g := NewGate(true, limit)

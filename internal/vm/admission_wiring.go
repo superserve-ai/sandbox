@@ -9,11 +9,8 @@ import (
 
 // admissionReadyPoll is how often the readiness transition re-checks
 // whether the daemon has finished working out what it is carrying.
-//
-// Startup-only and bounded by reattach, so a short interval costs a handful
-// of atomic loads across a window that is already dominated by reattaching
-// VMs. Long enough not to spin, short enough that a host is not refusing
-// creates for meaningfully longer than it must.
+// Startup-only and bounded by reattach, so the cost is a handful of atomic
+// loads across a window already dominated by reattaching VMs.
 var admissionReadyPoll = 250 * time.Millisecond
 
 // AdmissionGate exposes the gate for the RPC surface and for drain.
@@ -27,9 +24,6 @@ func (m *Manager) AdmissionGate() *admission.Gate { return m.admission }
 // reattach completes, and a gate that reconstructed lazily on the first one
 // would either block that request behind fleet-sized work or admit it
 // against an empty ledger. Both are worse than refusing briefly.
-//
-// A no-op when the gate is disabled, so a host that never opted in does not
-// grow a goroutine for a feature it is not running.
 func (m *Manager) StartAdmission(ctx context.Context) {
 	if !m.admission.Enabled() {
 		return
