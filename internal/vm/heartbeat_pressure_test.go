@@ -1703,7 +1703,9 @@ func TestBackfillRetriesDoNotStarveThePool(t *testing.T) {
 	// Long relative to the deadline below, so holding a slot across it is
 	// visible; at the millisecond backoff the other tests use, both
 	// shapes look identical.
-	machineConfigProbeBackoff = 2 * time.Second
+	// Keep the jittered retry (which is at most 1.5x the doubled backoff)
+	// inside awaitBackfill's five-second join deadline.
+	machineConfigProbeBackoff = 1500 * time.Millisecond
 
 	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
 	stuck := make([]*VMInstance, 0, machineConfigRecoveryWorkers)
