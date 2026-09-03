@@ -1657,9 +1657,8 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 // paused, and never flip status to active.
 // A resume that gets the VM up but then fails to reapply egress rules must
 // re-pause the VM (preserving the overlay), never destroy it.
-// The separate egress push only runs on the stateless fallback: the resume
-// request itself carries the rules and the daemon applies them before the
-// VM starts, so this drives ResumeInstance to NotFound to reach the push.
+// A post-stage failure re-pauses the VM before replying; the phase series
+// must report that compensation as revert, not as post time.
 func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
@@ -1671,12 +1670,13 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
 	}
 
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
+
 	var destroyCalled, pauseCalled, updateNetworkCalled, finalizeCalled, activateCalled int32
 	vmd := &stubVMD{
 		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
-			return "", status.Error(codes.NotFound, "vm absent after vmd restart")
-		},
-		restoreFn: func(context.Context, string, string, string) (string, error) {
 			return "10.0.0.5", nil
 		},
 		destroyFn: func(context.Context, string, bool) error {
@@ -1739,14 +1739,24 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 	if got := atomic.LoadInt32(&activateCalled); got != 0 {
 		t.Errorf("ActivateSandbox calls = %d, want 0 (network failed before commit)", got)
 	}
+	phases := map[string]bool{}
+	for _, p := range rec.phases {
+		if p.Op == "resume" {
+			phases[p.Phase] = true
+		}
+	}
+	for _, want := range []string{"claim", "vmd", "post", "revert"} {
+		if !phases[want] {
+			t.Errorf("failed resume must record phase %q; got %v", want, phases)
+		}
+	}
 }
 
-// A tracked resume carries the egress rules in the ResumeInstance request
-// and the daemon applies them before Firecracker starts; the control plane
-// must not spend a second host round trip re-sending the same rules. The
-// phase emission is asserted here too: claim, vmd, and post must land for
-// a successful resume alongside the caller-owned total.
-func TestResumeSandbox_TrackedResumeCarriesRulesAndSkipsReapply(t *testing.T) {
+// A successful resume records claim, vmd, and post alongside the
+// caller-owned total, and no revert. The persisted egress rules ride the
+// ResumeInstance request itself, which is what will let the post-boot
+// replay go once the daemon acknowledges applying them.
+func TestResumeSandbox_EmitsPhasesAndCarriesRulesInResumeRequest(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
@@ -1762,16 +1772,11 @@ func TestResumeSandbox_TrackedResumeCarriesRulesAndSkipsReapply(t *testing.T) {
 	SetTelemetryRecorder(rec)
 	t.Cleanup(func() { SetTelemetryRecorder(nil) })
 
-	var updateNetworkCalled int32
 	var resumeNetworkConfig []byte
 	vmd := &stubVMD{
 		resumeFn: func(_ context.Context, _, _, _ string, networkConfig []byte) (string, error) {
 			resumeNetworkConfig = networkConfig
 			return "10.0.0.5", nil
-		},
-		updateNetworkFn: func(context.Context, string, []string, []string, []string) error {
-			atomic.AddInt32(&updateNetworkCalled, 1)
-			return nil
 		},
 	}
 
@@ -1803,9 +1808,6 @@ func TestResumeSandbox_TrackedResumeCarriesRulesAndSkipsReapply(t *testing.T) {
 	if len(resumeNetworkConfig) == 0 {
 		t.Fatal("ResumeInstance must carry the persisted egress rules")
 	}
-	if got := atomic.LoadInt32(&updateNetworkCalled); got != 0 {
-		t.Errorf("UpdateSandboxNetwork calls = %d, want 0 (rules already applied by the resume request)", got)
-	}
 	got := map[string]bool{}
 	for _, p := range rec.phases {
 		if p.Op == "resume" && p.HostID == "host-a" {
@@ -1816,6 +1818,9 @@ func TestResumeSandbox_TrackedResumeCarriesRulesAndSkipsReapply(t *testing.T) {
 		if !got[want] {
 			t.Errorf("resume phase %q not recorded; got %v", want, got)
 		}
+	}
+	if got["revert"] {
+		t.Error("a successful resume must not record a revert phase")
 	}
 }
 

@@ -766,29 +766,44 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// the histograms too (create's discipline): claim is everything before
 	// the boot RPC (policy reads, the resuming claim, snapshot lookup); vmd
 	// is the boot RPC with its retry and the stateless fallback; post is
-	// the policy/egress/secret reapply. A stage that errored before its
-	// end-stamp reports its elapsed time. total stays with the callers,
-	// which own the request-level clock.
+	// the policy/egress/secret reapply. Every stage is stamped the moment
+	// its work returns, success or not, and a compensation that runs before
+	// the reply (revert to paused, re-pause) is reported as its own revert
+	// phase: a re-pause snapshots the guest and must not read as post time.
+	// total stays with the callers, which own the request-level clock.
 	tStart := time.Now()
-	var tVmdStart, tVmdEnd, tPostDone time.Time
+	var tVmdStart, tVmdEnd, tPostStart, tPostDone, tRevertStart time.Time
+	// markRevert is called only on the synchronous failure paths; the
+	// detached activate goroutine compensates after the reply and must not
+	// touch these stamps.
+	markRevert := func() {
+		if tRevertStart.IsZero() {
+			tRevertStart = time.Now()
+		}
+	}
 	defer func() {
+		stageEnd := time.Now()
+		if !tRevertStart.IsZero() {
+			stageEnd = tRevertStart
+		}
 		phases := map[string]time.Duration{}
-		if !tVmdStart.IsZero() {
-			phases["claim"] = tVmdStart.Sub(tStart)
+		if tVmdStart.IsZero() {
+			phases["claim"] = stageEnd.Sub(tStart)
 		} else {
-			phases["claim"] = time.Since(tStart)
+			phases["claim"] = tVmdStart.Sub(tStart)
 		}
-		switch {
-		case !tVmdEnd.IsZero():
+		if !tVmdEnd.IsZero() {
 			phases["vmd"] = tVmdEnd.Sub(tVmdStart)
-		case !tVmdStart.IsZero():
-			phases["vmd"] = time.Since(tVmdStart)
 		}
-		switch {
-		case !tPostDone.IsZero():
-			phases["post"] = tPostDone.Sub(tVmdEnd)
-		case !tVmdEnd.IsZero():
-			phases["post"] = time.Since(tVmdEnd)
+		if !tPostStart.IsZero() {
+			if tPostDone.IsZero() {
+				phases["post"] = stageEnd.Sub(tPostStart)
+			} else {
+				phases["post"] = tPostDone.Sub(tPostStart)
+			}
+		}
+		if !tRevertStart.IsZero() {
+			phases["revert"] = time.Since(tRevertStart)
 		}
 		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID, phases)
 	}()
@@ -895,6 +910,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	})
 	if err != nil {
 		l.Error().Err(err).Msg("DB GetSnapshot failed")
+		markRevert()
 		revertToPaused()
 		respondError(c, ErrInternal)
 		return "", false
@@ -922,6 +938,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("resolve VMD for resume failed")
+		markRevert()
 		revertToPaused()
 		respondError(c, ErrInternal)
 		return "", false
@@ -935,20 +952,15 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// retry, and the stateless fallback all draw down the same 2×vmdTimeout
 	// budget, so a resume holds the row mid-transition for a bounded window
 	// no matter which path it walks.
-
-	// stateless records that the VM came up through the RestoreSnapshot
-	// fallback rather than ResumeInstance; post-boot steps the resume request
-	// already carries (egress rules) are only replayed on that path.
-	stateless := false
 	tVmdStart = time.Now()
 	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdBootTimeout)
 	defer bootCancel()
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), sandbox.HostID, func(ctx context.Context) (string, uint32, uint32, error) {
 		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig)
 	})
+	tVmdEnd = time.Now()
 	if err != nil {
 		if isVMDNotFound(err) {
-			stateless = true
 			l.Warn().Err(err).
 				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
@@ -967,12 +979,14 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 				// exists; declaring it spares the daemon a probe.
 				vmdclient.ResourceLimits{VCPU: uint32(sandbox.VcpuCount), MemoryMiB: uint32(sandbox.MemoryMib)})
 			fcancel()
+			tVmdEnd = time.Now()
 			if err != nil {
 				l.Error().Err(err).Msg("VMD RestoreSnapshot fallback failed")
 				// Deliberately no destroy for a boot that may land late: the
 				// row reverts to paused, so a follow-up resume on this ID
 				// adopts the live VM (instant resume), and the reconciler
 				// reaps the paused-row/active-VM state if no retry comes.
+				markRevert()
 				revertToPaused()
 				respondError(c, ErrInternal)
 				return "", false
@@ -980,12 +994,13 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		} else {
 			l.Error().Err(err).Msg("VMD ResumeInstance failed")
 			// Same deliberate no-destroy as the fallback branch above.
+			markRevert()
 			revertToPaused()
 			respondError(c, ErrInternal)
 			return "", false
 		}
 	}
-	tVmdEnd = time.Now()
+	tPostStart = time.Now()
 
 	// Older vmd builds may return 0 for vcpu/mem on both the Resume and
 	// Restore paths (ResourceLimits field was added later). Fall back to
@@ -1059,11 +1074,17 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// the stateless restore while VMD returns NotFound to the mutation push; this
 	// final authoritative snapshot closes that window. If a later mutation wins,
 	// VMD's monotonic revision check rejects this older snapshot.
-	currentPolicy, policyErr := h.loadPreviewPolicySnapshot(postCtx, sandboxID, teamID)
-	if policyErr != nil {
-		l.Error().Err(policyErr).Msg("reload preview policy after resume failed")
+	// failPost is the post-stage failure path: the VM is up, so the row is
+	// re-paused rather than destroyed (see pauseAndRevert).
+	failPost := func(err error, msg string) {
+		markRevert()
+		l.Error().Err(err).Msg(msg)
 		pauseAndRevert()
 		respondError(c, ErrInternal)
+	}
+	currentPolicy, policyErr := h.loadPreviewPolicySnapshot(postCtx, sandboxID, teamID)
+	if policyErr != nil {
+		failPost(policyErr, "reload preview policy after resume failed")
 		return "", false
 	}
 	// A private publication may have changed while the VM was restoring. Gate
@@ -1072,6 +1093,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// concurrently-added browser policy on a downgraded host.
 	if currentPolicy.requiresBrowserCapability() {
 		if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
+			markRevert()
 			pauseAndRevert()
 			h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
 			return "", false
@@ -1084,25 +1106,20 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// never take this fallback.
 			l.Warn().Msg("vmd lacks preview policy update for legacy resume")
 		} else {
-			l.Error().Err(policyErr).Msg("reapply preview policy after resume failed")
-			pauseAndRevert()
-			respondError(c, ErrInternal)
+			failPost(policyErr, "reapply preview policy after resume failed")
 			return "", false
 		}
 	}
 
-	// Egress rules must be in place before committing to 'active' so
-	// "active ⇒ rules applied" holds by construction. ResumeInstance carries
-	// them and the daemon applies them before Firecracker starts, so only
-	// the stateless fallback, whose restore request has no egress field,
-	// needs the separate push.
-	if stateless {
-		if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
-			l.Error().Err(err).Msg("reapply network config on resume failed")
-			pauseAndRevert()
-			respondError(c, ErrInternal)
-			return "", false
-		}
+	// Apply egress rules before committing to 'active' so "active ⇒ rules
+	// applied" holds by construction. ResumeInstance carries the same rules,
+	// but the daemon's retry-adoption branch returns a running VM without
+	// applying them and its in-memory proxy rules do not survive a restart,
+	// so this replay stays until the daemon applies rules on adoption and
+	// acknowledges it in the response.
+	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+		failPost(err, "reapply network config on resume failed")
+		return "", false
 	}
 
 	// Re-apply the current binding set before committing to 'active', so a secret
@@ -1116,16 +1133,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	if sandbox.HadSecretBindings == nil || *sandbox.HadSecretBindings {
 		meta, merr := h.loadSecretBindingMeta(postCtx, sandboxID)
 		if merr != nil {
-			l.Error().Err(merr).Msg("load secret bindings on resume failed")
-			pauseAndRevert()
-			respondError(c, ErrInternal)
+			failPost(merr, "load secret bindings on resume failed")
 			return "", false
 		}
 		if len(meta) > 0 {
 			if aerr := h.applySecretBindings(postCtx, *sandbox, meta); aerr != nil {
-				l.Error().Err(aerr).Msg("reapply secret bindings on resume failed")
-				pauseAndRevert()
-				respondError(c, ErrInternal)
+				failPost(aerr, "reapply secret bindings on resume failed")
 				return "", false
 			}
 		}
@@ -1167,12 +1180,6 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// ActivateSandbox's CTE opens the sandbox_active_interval row (async).
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": sandboxID.String()})
-	l.Info().
-		Int64("claim_ms", tVmdStart.Sub(tStart).Milliseconds()).
-		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
-		Int64("post_ms", tPostDone.Sub(tVmdEnd).Milliseconds()).
-		Bool("stateless", stateless).
-		Msg("ResumeSandbox phases")
 	return currentPolicy.Access, true
 }
 
