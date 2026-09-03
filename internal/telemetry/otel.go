@@ -529,15 +529,11 @@ func (r *OTelRecorder) RecordAbuseEnforcementStats(ctx context.Context, s AbuseE
 	r.abuseDenyCapacity.Record(ctx, s.DenyCapacity, opt)
 	r.abuseTrustedTeams.Record(ctx, s.TrustedTeams, opt)
 	r.abuseUtilization.Record(ctx, s.Utilization, opt)
-	if ttlDelta > 0 {
-		r.abuseTTLEvictions.Add(ctx, int64(ttlDelta), opt)
-	}
-	if capacityDelta > 0 {
-		r.abuseCapacityEvictions.Add(ctx, int64(capacityDelta), opt)
-	}
-	if rejectionDelta > 0 {
-		r.abuseAdmissionRejections.Add(ctx, int64(rejectionDelta), opt)
-	}
+	// Record zero deltas too: this establishes the counter series before the
+	// first event, allowing alerts to observe the subsequent 0→1 transition.
+	r.abuseTTLEvictions.Add(ctx, int64(ttlDelta), opt)
+	r.abuseCapacityEvictions.Add(ctx, int64(capacityDelta), opt)
+	r.abuseAdmissionRejections.Add(ctx, int64(rejectionDelta), opt)
 }
 
 func counterDelta(current uint64, previous *uint64) uint64 {
