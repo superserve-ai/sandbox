@@ -1666,11 +1666,40 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 
 func TestIntegration_NewTeamReceivesSignupTrialCredit(t *testing.T) {
 	ctx := context.Background()
-	team, err := testQueries.CreateTeam(ctx, "trial-credit-"+uuid.NewString()[:8])
+	userID := uuid.New()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO profile (id, email)
+		VALUES ($1, $2)
+	`, userID, "trial-credit-"+uuid.NewString()[:8]+"@example.com"); err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+	// A prior $95 redemption must not consume the user's separate $5 claim.
+	stripeTeam, err := testQueries.CreateTeam(ctx, "trial-credit-stripe-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatalf("create Stripe redemption team: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO user_promotion_entitlement (user_id, stripe_redemption_at, stripe_redemption_team_id)
+		VALUES ($1, now(), $2)
+	`, userID, stripeTeam.ID); err != nil {
+		t.Fatalf("seed Stripe redemption: %v", err)
+	}
+	// Membership in an existing team (including an invited-team flow) must not
+	// consume the creator's personal signup trial.
+	joinedTeam, err := testQueries.CreateTeam(ctx, "trial-credit-joined-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatalf("create joined team: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_memberships (team_id, user_id, status)
+		VALUES ($1, $2, 'active')
+	`, joinedTeam.ID, userID); err != nil {
+		t.Fatalf("create membership: %v", err)
+	}
+	teamID, err := provisionTeamForUser(ctx, userID, "trial-credit-"+uuid.NewString()[:8])
 	if err != nil {
 		t.Fatalf("create team: %v", err)
 	}
-	teamID := team.ID
 
 	var amount, remaining float64
 	if err := testPool.QueryRow(ctx, `
@@ -1683,6 +1712,207 @@ func TestIntegration_NewTeamReceivesSignupTrialCredit(t *testing.T) {
 	if amount != 5 || remaining != 5 {
 		t.Fatalf("signup trial credit = (%v, %v), want (5, 5)", amount, remaining)
 	}
+	var ownerMemberships, ownerAssignments int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM team_member legacy
+		JOIN team_memberships membership
+		  ON membership.team_id = legacy.team_id
+		 AND membership.user_id = legacy.profile_id
+		WHERE legacy.team_id = $1 AND legacy.profile_id = $2
+		  AND legacy.role = 'owner' AND membership.status = 'active'
+	`, teamID, userID).Scan(&ownerMemberships); err != nil {
+		t.Fatalf("check creator provisioning chain: %v", err)
+	}
+	if ownerMemberships != 1 {
+		t.Fatalf("creator provisioning chain rows = %d, want 1", ownerMemberships)
+	}
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM user_role_assignments assignment
+		JOIN roles role ON role.id = assignment.role_id
+		WHERE assignment.team_id = $1 AND assignment.user_id = $2
+		  AND assignment.scope_type = 'team' AND assignment.revoked_at IS NULL
+		  AND role.name = 'team_owner'
+	`, teamID, userID).Scan(&ownerAssignments); err != nil {
+		t.Fatalf("check creator role assignment: %v", err)
+	}
+	if ownerAssignments != 1 {
+		t.Fatalf("creator role assignments = %d, want 1", ownerAssignments)
+	}
+	var claimedTeamID, redeemedTeamID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		SELECT c.team_id, e.stripe_redemption_team_id
+		FROM user_signup_trial_claim c
+		JOIN user_promotion_entitlement e ON e.user_id = c.user_id
+		WHERE c.user_id = $1
+	`, userID).Scan(&claimedTeamID, &redeemedTeamID); err != nil {
+		t.Fatalf("load independent promotion claims: %v", err)
+	}
+	if claimedTeamID != teamID || redeemedTeamID != stripeTeam.ID {
+		t.Fatalf("promotion claims = (%s, %s), want (%s, %s)", claimedTeamID, redeemedTeamID, teamID, stripeTeam.ID)
+	}
+	var joinedGrantCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'signup trial credit'
+	`, joinedTeam.ID).Scan(&joinedGrantCount); err != nil {
+		t.Fatalf("count joined-team signup trial grants: %v", err)
+	}
+	if joinedGrantCount != 0 {
+		t.Fatalf("joined-team signup trial grant count = %d, want 0", joinedGrantCount)
+	}
+
+	// A second team for the same user must not receive another grant.
+	secondTeamID, err := provisionTeamForUser(ctx, userID, "trial-credit-second-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatalf("create second team: %v", err)
+	}
+	var grantCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM team_credit_grant
+		WHERE team_id IN ($1, $2) AND reason = 'signup trial credit'
+	`, teamID, secondTeamID).Scan(&grantCount); err != nil {
+		t.Fatalf("count signup trial grants: %v", err)
+	}
+	if grantCount != 1 {
+		t.Fatalf("signup trial grant count = %d, want 1", grantCount)
+	}
+
+	// A failed claim (the profile FK is invalid) must roll back the team row.
+	failedName := "trial-credit-rollback-" + uuid.NewString()[:8]
+	if _, err := provisionTeamForUser(ctx, uuid.New(), failedName); err == nil {
+		t.Fatal("create with invalid profile: expected error")
+	}
+	var rolledBackCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM team WHERE name = $1`, failedName).Scan(&rolledBackCount); err != nil {
+		t.Fatalf("check rolled-back team: %v", err)
+	}
+	if rolledBackCount != 0 {
+		t.Fatalf("rolled-back team count = %d, want 0", rolledBackCount)
+	}
+
+	// A failure after the claim RPC, while the provisioning chain is still in
+	// flight, must roll back both the team and the user's entitlement.
+	rollbackUser := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO profile (id, email) VALUES ($1, $2)`, rollbackUser, "trial-credit-chain-rollback-"+uuid.NewString()[:8]+"@example.com"); err != nil {
+		t.Fatalf("create rollback profile: %v", err)
+	}
+	failedChainName := "trial-credit-chain-rollback-" + uuid.NewString()[:8]
+	if _, err := provisionTeamForUserAfterClaimFailure(ctx, rollbackUser, failedChainName); err == nil {
+		t.Fatal("failed provisioning chain: expected error")
+	}
+	var chainRollbackCount, chainClaimCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM team WHERE name = $1`, failedChainName).Scan(&chainRollbackCount); err != nil {
+		t.Fatalf("check chain-rolled-back team: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM user_signup_trial_claim WHERE user_id = $1`, rollbackUser).Scan(&chainClaimCount); err != nil {
+		t.Fatalf("check preserved signup claim: %v", err)
+	}
+	if chainRollbackCount != 0 || chainClaimCount != 0 {
+		t.Fatalf("post-claim rollback state = (team %d, claims %d), want (0, 0)", chainRollbackCount, chainClaimCount)
+	}
+
+	// Concurrent provisioning for a fresh user must still produce one claim
+	// and one grant, even though every team insert succeeds.
+	concurrentUser := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO profile (id, email) VALUES ($1, $2)`, concurrentUser, "trial-credit-concurrent-"+uuid.NewString()[:8]+"@example.com"); err != nil {
+		t.Fatalf("create concurrent profile: %v", err)
+	}
+	const concurrentCreates = 4
+	errs := make(chan error, concurrentCreates)
+	for i := 0; i < concurrentCreates; i++ {
+		go func() {
+			_, err := provisionTeamForUser(context.Background(), concurrentUser, "trial-credit-concurrent-owned-"+uuid.NewString()[:8])
+			errs <- err
+		}()
+	}
+	for i := 0; i < concurrentCreates; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent team creation: %v", err)
+		}
+	}
+	var entitlementCount, concurrentGrantCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM user_signup_trial_claim WHERE user_id = $1`, concurrentUser).Scan(&entitlementCount); err != nil {
+		t.Fatalf("count concurrent entitlement: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM team_credit_grant g JOIN user_signup_trial_claim c ON c.team_id = g.team_id WHERE c.user_id = $1 AND g.reason = 'signup trial credit'`, concurrentUser).Scan(&concurrentGrantCount); err != nil {
+		t.Fatalf("count concurrent grants: %v", err)
+	}
+	if entitlementCount != 1 || concurrentGrantCount != 1 {
+		t.Fatalf("concurrent entitlement/grant counts = (%d, %d), want (1, 1)", entitlementCount, concurrentGrantCount)
+	}
+}
+
+// This is the repository's provisioning boundary: callers establish the
+// user/profile context, then invoke the generated query that creates the team
+// and claims its promotion.
+func provisionTeamForUser(ctx context.Context, userID uuid.UUID, name string) (uuid.UUID, error) {
+	return provisionTeamForUserWithFailure(ctx, userID, name, false)
+}
+
+func provisionTeamForUserWithFailure(ctx context.Context, userID uuid.UUID, name string, failAfterMembership bool) (uuid.UUID, error) {
+	// Match the console provisioning boundary: the claim RPC commits before
+	// the RBAC chain, and a later failure is unwound explicitly.
+	team, err := testQueries.CreateTeamForUser(ctx, db.CreateTeamForUserParams{
+		Name:   name,
+		UserID: userID,
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	unwind := func() {
+		// Reverse dependency order, including the claim and grant created by the
+		// RPC, so a failed chain cannot consume the user's entitlement.
+		for _, statement := range []string{
+			`DELETE FROM user_role_assignments WHERE team_id = $1`,
+			`DELETE FROM team_memberships WHERE team_id = $1`,
+			`DELETE FROM team_member WHERE team_id = $1`,
+			`DELETE FROM team_credit_grant WHERE team_id = $1`,
+			`DELETE FROM team_trial_eligibility_cache WHERE team_id = $1`,
+			`DELETE FROM user_signup_trial_claim WHERE team_id = $1`,
+			`UPDATE user_promotion_entitlement SET signup_trial_claimed_at = NULL, signup_trial_team_id = NULL, updated_at = now() WHERE signup_trial_team_id = $1`,
+			`DELETE FROM team WHERE id = $1`,
+		} {
+			if _, cleanupErr := testPool.Exec(ctx, statement, team.ID); cleanupErr != nil {
+				return
+			}
+		}
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_member (team_id, profile_id, role)
+		VALUES ($1, $2, 'owner')
+	`, team.ID, userID); err != nil {
+		unwind()
+		return uuid.Nil, err
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_memberships (team_id, user_id, status)
+		VALUES ($1, $2, 'active')
+	`, team.ID, userID); err != nil {
+		unwind()
+		return uuid.Nil, err
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO user_role_assignments (user_id, role_id, scope_type, team_id)
+		SELECT $1, id, 'team', $2
+		FROM roles
+		WHERE name = 'team_owner'
+	`, userID, team.ID); err != nil {
+		unwind()
+		return uuid.Nil, err
+	}
+	if failAfterMembership {
+		// Simulate a later provisioning failure after the claim and RBAC chain
+		// have been written, as the console's compensating unwind must handle.
+		unwind()
+		return team.ID, fmt.Errorf("simulated provisioning chain failure")
+	}
+	return team.ID, nil
+}
+
+func provisionTeamForUserAfterClaimFailure(ctx context.Context, userID uuid.UUID, name string) (uuid.UUID, error) {
+	return provisionTeamForUserWithFailure(ctx, userID, name, true)
 }
 
 func TestIntegration_CreateSandboxBlockedWhenTrialCreditIsExhausted(t *testing.T) {

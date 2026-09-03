@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"net/http"
@@ -13,6 +14,23 @@ import (
 
 	"github.com/google/uuid"
 )
+
+func TestStripePromotionReservationErrorsKeepCleanupIdentityAfterAttempt(t *testing.T) {
+	teamID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	userID := uuid.MustParse("00000000-0000-0000-0000-000000000002")
+	original := errors.New("finalization failed")
+	err := wrapStripePromotionReservationError(original, true, teamID, userID)
+	var grantErr *stripePromotionGrantError
+	if !errors.As(err, &grantErr) {
+		t.Fatal("post-reservation failure lost cleanup identity")
+	}
+	if grantErr.TeamID != teamID || grantErr.UserID != userID {
+		t.Fatalf("cleanup identity = %s/%s, want %s/%s", grantErr.TeamID, grantErr.UserID, teamID, userID)
+	}
+	if !errors.Is(err, original) {
+		t.Fatal("wrapped failure did not preserve original error")
+	}
+}
 
 func TestStripeMeterErrorDetailsExtractsThinEventRequest(t *testing.T) {
 	payload := json.RawMessage(`{"developer_message_summary":"There is 1 invalid event","reason":{"error_types":[{"sample_errors":[{"error_message":"invalid customer","request":{"idempotency_key":"meter-event:test"}}]}]}}`)
@@ -139,6 +157,15 @@ func TestStripeMeterEventIdempotencyKeySeparatesPayloadFromIdentifier(t *testing
 	}
 	if got := stripeMeterEventIdempotencyKey(identifier, "memory_gib_hours", "cus_example", "1.000000000000", 3); got == first {
 		t.Fatal("changed timestamp reused the same idempotency key")
+	}
+}
+
+func TestCheckoutSessionIdempotencyKeyIsIndependentOfActor(t *testing.T) {
+	teamID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	first := checkoutSessionIdempotencyKey(teamID, "cus_example", "https://example.com/success", "https://example.com/cancel", []string{"price_basic"})
+	second := checkoutSessionIdempotencyKey(teamID, "cus_example", "https://example.com/success", "https://example.com/cancel", []string{"price_basic"})
+	if first != second {
+		t.Fatalf("checkout idempotency key changed between billing actors: %q != %q", first, second)
 	}
 }
 

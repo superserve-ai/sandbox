@@ -28,6 +28,14 @@ FROM eligible e
 LEFT JOIN closed c ON c.sandbox_id = e.id AND c.team_id = e.team_id
 ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING;
 
+-- name: GetLegacyStripeActivationUser :one
+SELECT tm.profile_id AS user_id
+FROM team_member tm
+WHERE tm.team_id = sqlc.arg(team_id)
+  AND tm.role IN ('owner', 'team_owner')
+ORDER BY tm.joined_at, tm.profile_id
+LIMIT 1;
+
 -- name: GetTeamBillingUsage :one
 -- Allocated usage for one team clipped to [period_start, period_end).
 WITH compute AS (
@@ -426,29 +434,11 @@ FOR UPDATE;
 
 -- name: UpsertTeamBillingPeriod :one
 INSERT INTO team_billing_period (team_id, period_start, period_end, status)
-SELECT
+VALUES (
     sqlc.arg(team_id),
     sqlc.arg(period_start),
     sqlc.arg(period_end),
     sqlc.arg(status)
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM team_billing_period billed
-    WHERE billed.team_id = sqlc.arg(team_id)
-      AND (billed.period_start, billed.period_end) <>
-          (sqlc.arg(period_start), sqlc.arg(period_end))
-      AND (
-          billed.status = 'exported'
-          OR billed.exported_at IS NOT NULL
-          OR (
-              billed.finalized_at IS NOT NULL
-              AND (billed.blocked_reason IS NULL OR billed.blocked_reason NOT IN (
-                  'reporting_only_calendar_period', 'discarded_before_billing_cutover'
-              ))
-          )
-      )
-      AND tstzrange(billed.period_start, billed.period_end, '[)') &&
-          tstzrange(sqlc.arg(period_start), sqlc.arg(period_end), '[)')
 )
 ON CONFLICT (team_id, period_start, period_end) DO UPDATE
 SET status = CASE
@@ -600,14 +590,59 @@ WHERE billing_period_anomaly.id = sqlc.arg(id)
 RETURNING *;
 
 -- name: GetTeamBillingAccount :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, commercial_billing_anchor, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, checkout_initializing_at, checkout_session_id
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, commercial_billing_anchor, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, checkout_initializing_at, checkout_session_id, stripe_activation_user_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id
 FROM team_billing_account
 WHERE team_id = sqlc.arg(team_id);
 
 -- name: GetTeamBillingAccountByStripeCustomerID :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, commercial_billing_anchor, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, checkout_initializing_at, checkout_session_id
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, commercial_billing_anchor, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, checkout_initializing_at, checkout_session_id, stripe_activation_user_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id
 FROM team_billing_account
 WHERE stripe_customer_id = sqlc.arg(stripe_customer_id);
+
+-- name: ClaimTeamCommercialBillingAnchor :one
+SELECT claim_team_commercial_billing_anchor(sqlc.arg(team_id), sqlc.arg(anchor))::timestamptz AS commercial_billing_anchor;
+
+-- name: EstablishBillingCutover :one
+SELECT establish_billing_cutover(sqlc.arg(cutover), sqlc.arg(preserved_team_ids)::uuid[])::int AS team_count;
+
+-- name: BeginTeamBillingCheckout :one
+UPDATE team_billing_account SET checkout_initializing_at = now(), checkout_anchor_snapshot = commercial_billing_anchor, checkout_session_id = NULL, updated_at = now()
+WHERE team_id = sqlc.arg(team_id) AND (checkout_initializing_at IS NULL OR checkout_initializing_at < now() - interval '32 minutes') RETURNING *;
+
+-- name: FinishTeamBillingCheckout :exec
+UPDATE team_billing_account SET checkout_initializing_at = NULL, checkout_anchor_snapshot = NULL, checkout_session_id = NULL, updated_at = now() WHERE team_id = sqlc.arg(team_id);
+
+-- name: SetTeamBillingCheckoutSession :exec
+UPDATE team_billing_account SET checkout_session_id = sqlc.arg(session_id), updated_at = now() WHERE team_id = sqlc.arg(team_id) AND checkout_initializing_at IS NOT NULL;
+
+-- name: FinishTeamBillingCheckoutForSubscription :exec
+UPDATE team_billing_account SET checkout_initializing_at = NULL, checkout_anchor_snapshot = NULL, checkout_session_id = NULL, updated_at = now() WHERE team_id = sqlc.arg(team_id) AND stripe_subscription_id = sqlc.arg(subscription_id) AND checkout_initializing_at IS NOT NULL;
+
+-- name: ClaimStripeCheckoutActor :one
+UPDATE team_billing_account
+SET stripe_checkout_actor_id = CASE
+        WHEN stripe_checkout_actor_id IS NULL
+          OR stripe_checkout_actor_claimed_at < now() - interval '24 hours'
+        THEN sqlc.arg(actor_id)
+        ELSE stripe_checkout_actor_id
+    END,
+    stripe_checkout_actor_claimed_at = CASE
+        WHEN stripe_checkout_actor_id IS NULL
+          OR stripe_checkout_actor_claimed_at < now() - interval '24 hours'
+        THEN now()
+        ELSE stripe_checkout_actor_claimed_at
+    END,
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+RETURNING *;
+
+-- name: ReleaseStripeCheckoutActor :exec
+UPDATE team_billing_account
+SET stripe_checkout_actor_id = NULL,
+    stripe_checkout_actor_claimed_at = NULL,
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+  AND stripe_checkout_actor_id = sqlc.arg(actor_id);
 
 -- name: UpsertTeamBillingAccountCustomer :one
 INSERT INTO team_billing_account (team_id, stripe_customer_id)
@@ -616,55 +651,6 @@ ON CONFLICT (team_id) DO UPDATE
 SET stripe_customer_id = EXCLUDED.stripe_customer_id,
     updated_at = now()
 RETURNING *;
-
--- name: ClaimTeamCommercialBillingAnchor :one
-SELECT claim_team_commercial_billing_anchor(sqlc.arg(team_id), sqlc.arg(anchor))::timestamptz AS commercial_billing_anchor;
-
--- name: BeginTeamBillingCheckout :one
-UPDATE team_billing_account
-SET checkout_initializing_at = now(),
-    checkout_anchor_snapshot = commercial_billing_anchor,
-    checkout_session_id = NULL,
-    updated_at = now()
-WHERE team_id = sqlc.arg(team_id)
-  AND (checkout_initializing_at IS NULL OR checkout_initializing_at < now() - interval '32 minutes')
-RETURNING *;
-
--- name: FinishTeamBillingCheckout :exec
-UPDATE team_billing_account
-SET checkout_initializing_at = NULL,
-    checkout_anchor_snapshot = NULL,
-    checkout_session_id = NULL,
-    updated_at = now()
-WHERE team_id = sqlc.arg(team_id);
-
--- name: FinishTeamBillingCheckoutIfStartedBefore :exec
-UPDATE team_billing_account
-SET checkout_initializing_at = NULL,
-    checkout_anchor_snapshot = NULL,
-    updated_at = now()
-WHERE team_id = sqlc.arg(team_id)
-  AND checkout_initializing_at <= sqlc.arg(event_at)
-  AND checkout_session_id = sqlc.arg(session_id);
-
--- name: SetTeamBillingCheckoutSession :exec
-UPDATE team_billing_account
-SET checkout_session_id = sqlc.arg(session_id), updated_at = now()
-WHERE team_id = sqlc.arg(team_id)
-  AND checkout_initializing_at IS NOT NULL;
-
--- name: FinishTeamBillingCheckoutForSubscription :exec
-UPDATE team_billing_account
-SET checkout_initializing_at = NULL,
-    checkout_anchor_snapshot = NULL,
-    checkout_session_id = NULL,
-    updated_at = now()
-WHERE team_id = sqlc.arg(team_id)
-  AND stripe_subscription_id = sqlc.arg(subscription_id)
-  AND checkout_initializing_at IS NOT NULL;
-
--- name: EstablishBillingCutover :one
-SELECT establish_billing_cutover(sqlc.arg(cutover), sqlc.arg(preserved_team_ids)::uuid[])::int AS team_count;
 
 -- name: UpsertTeamBillingAccountSubscription :one
 INSERT INTO team_billing_account (
@@ -676,7 +662,6 @@ INSERT INTO team_billing_account (
     stripe_subscription_event_at,
     current_period_start,
     current_period_end,
-    commercial_billing_anchor,
     cancel_at_period_end
 )
 VALUES (
@@ -688,7 +673,6 @@ VALUES (
     sqlc.narg(stripe_subscription_event_at),
     sqlc.narg(current_period_start),
     sqlc.narg(current_period_end),
-    COALESCE(sqlc.narg(commercial_billing_anchor)::timestamptz, sqlc.narg(current_period_start)::timestamptz),
     COALESCE(sqlc.narg(cancel_at_period_end), false)
 )
 ON CONFLICT (team_id) DO UPDATE
@@ -699,7 +683,6 @@ SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_acco
     stripe_subscription_event_at = COALESCE(EXCLUDED.stripe_subscription_event_at, team_billing_account.stripe_subscription_event_at),
     current_period_start = COALESCE(EXCLUDED.current_period_start, team_billing_account.current_period_start),
     current_period_end = COALESCE(EXCLUDED.current_period_end, team_billing_account.current_period_end),
-    commercial_billing_anchor = COALESCE(team_billing_account.commercial_billing_anchor, EXCLUDED.commercial_billing_anchor),
     cancel_at_period_end = COALESCE(sqlc.narg(cancel_at_period_end), team_billing_account.cancel_at_period_end),
     updated_at = now()
 RETURNING *;
@@ -1009,6 +992,14 @@ WHERE team_id = sqlc.arg(team_id)
   AND remaining_usd > 0
   AND (expires_at IS NULL OR expires_at > now());
 
+-- name: HasSignupTrialCredit :one
+SELECT EXISTS (
+    SELECT 1
+    FROM team_credit_grant
+    WHERE team_id = sqlc.arg(team_id)
+      AND reason = 'signup trial credit'
+) AS has_signup_trial;
+
 -- name: IsTeamSandboxBillingEligible :one
 SELECT team_sandbox_billing_eligible(sqlc.arg(team_id)) AS eligible;
 
@@ -1053,7 +1044,36 @@ ORDER BY team_id
 LIMIT sqlc.arg(batch_limit);
 
 -- name: ActivateTeamBilling :exec
-SELECT activate_team_billing(sqlc.arg(team_id), sqlc.arg(stripe_grant_id));
+SELECT activate_team_billing(sqlc.arg(team_id), sqlc.narg(user_id)::uuid, sqlc.arg(stripe_grant_id));
+
+-- name: StripePromotionEligible :one
+WITH locks AS (
+    SELECT lock_stripe_promotion(sqlc.arg(team_id)::uuid, sqlc.narg(user_id)::uuid) AS locked
+)
+SELECT COALESCE(
+    (NOT EXISTS (
+    SELECT 1 FROM team_billing_account tba
+    WHERE tba.team_id = sqlc.arg(team_id)::uuid
+      AND (stripe_activation_credit_grant_id IS NOT NULL
+           OR stripe_activation_credit_granted_at IS NOT NULL))
+    AND (sqlc.narg(user_id)::uuid IS NULL OR NOT EXISTS (
+    SELECT 1 FROM user_promotion_entitlement upe
+    WHERE upe.user_id = sqlc.narg(user_id)::uuid
+      AND (upe.stripe_redemption_at IS NOT NULL OR upe.stripe_redemption_reserved_team_id IS NOT NULL)
+    ))), false)::boolean AS eligible
+FROM locks;
+
+-- name: ReserveStripePromotion :one
+SELECT reserve_stripe_promotion(sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid) AS reserved;
+
+-- name: ReleaseStripePromotion :exec
+SELECT release_stripe_promotion(sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid);
+
+-- name: ReserveStripePromotionForEvent :one
+SELECT reserve_stripe_promotion_for_event(sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid, sqlc.arg(event_id)) AS reserved;
+
+-- name: ReleaseStripePromotionForEvent :exec
+SELECT release_stripe_promotion_for_event(sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid, sqlc.arg(event_id));
 
 -- name: ListTeamCreditGrants :many
 SELECT *

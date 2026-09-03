@@ -17,8 +17,42 @@ VALUES ($1)
 RETURNING id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region
 `
 
+// Internal/system-team creation only. Authenticated user provisioning must
+// use CreateTeamForUser so the user-keyed signup-trial claim is applied.
 func (q *Queries) CreateTeam(ctx context.Context, name string) (Team, error) {
 	row := q.db.QueryRow(ctx, createTeam, name)
+	var i Team
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.BuildConcurrency,
+		&i.MaxTemplateVcpu,
+		&i.MaxTemplateMemoryMib,
+		&i.MaxTemplateDiskMib,
+		&i.MaxTemplates,
+		&i.MaxSandboxes,
+		&i.ActiveSandboxCount,
+		&i.CredentialStoreKind,
+		&i.CredentialStoreConfig,
+		&i.UnmatchedHostPolicy,
+		&i.HomeRegion,
+	)
+	return i, err
+}
+
+const createTeamForUser = `-- name: CreateTeamForUser :one
+SELECT id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region FROM create_team_with_signup_trial($1, $2)
+`
+
+type CreateTeamForUserParams struct {
+	Name   string    `json:"name"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) CreateTeamForUser(ctx context.Context, arg CreateTeamForUserParams) (Team, error) {
+	row := q.db.QueryRow(ctx, createTeamForUser, arg.Name, arg.UserID)
 	var i Team
 	err := row.Scan(
 		&i.ID,

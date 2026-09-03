@@ -1,7 +1,12 @@
 -- name: CreateTeam :one
+-- Internal/system-team creation only. Authenticated user provisioning must
+-- use CreateTeamForUser so the user-keyed signup-trial claim is applied.
 INSERT INTO team (name)
 VALUES ($1)
 RETURNING *;
+
+-- name: CreateTeamForUser :one
+SELECT * FROM create_team_with_signup_trial(sqlc.arg(name), sqlc.arg(user_id));
 
 -- name: GetTeam :one
 SELECT * FROM team
