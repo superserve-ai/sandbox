@@ -787,10 +787,23 @@ func TestReattachCompletesOwedWakesBeforeServing(t *testing.T) {
 	})
 
 	t.Run("startup_pass_queues_and_the_pool_resolves", func(t *testing.T) {
-		mgr, _ := newStore(t)
+		mgr, store := newStore(t)
+		// The startup pass checks the unit is live before anything else; make
+		// it so, with the API socket present, as the other startup-pass tests do.
+		origDown := vmUnitFullyDown
+		vmUnitFullyDown = func(string) bool { return false }
+		t.Cleanup(func() { vmUnitFullyDown = origDown })
+		socket := filepath.Join(t.TempDir(), "firecracker.sock")
+		if err := os.WriteFile(socket, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		rec, _ := store.Get("vm-1")
+		rec.SocketPath = socket
+		if err := store.Put(*rec); err != nil {
+			t.Fatal(err)
+		}
 		wakes := 0
 		boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { wakes++; return nil }
-		rec, _ := mgr.state.Get("vm-1")
 		if inst, ok := mgr.reattachRecord(context.Background(), *rec, true); inst != nil || ok {
 			t.Fatal("the startup pass must not publish a guest that owes a wake")
 		}
