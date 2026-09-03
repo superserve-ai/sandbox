@@ -16,11 +16,18 @@ const (
 	// without the operator opting in. Every request is admitted; the
 	// ledger is not consulted and not maintained.
 	StateDisabled State = iota
-	// StateReconstructing is where an enabled gate starts. The socket
-	// is inherited across a restart and can deliver queued requests before
-	// reattach finishes, so this state must be the initial one rather than
-	// something entered later — there is no instant at which an enabled
-	// gate is both open and ignorant.
+	// StateReconstructing is where an enabled gate starts, and where it
+	// returns whenever its ledger can no longer be trusted.
+	//
+	// It admits and charges without enforcing. The daemon does not know
+	// what it is holding yet, and the two ways to handle that are not
+	// symmetric: the RPC server serves throughout a restart, so refusing
+	// would deny every create and resume for the length of the rebuild —
+	// a window this host did not have before local admission existed —
+	// while admitting is no worse than a host with no limit configured,
+	// which is what every host was until now. Charging is what makes it
+	// safe: those tokens outlive the rebuild, so the ledger is already
+	// correct when the gate opens.
 	StateReconstructing
 	// StateOpen admits within the operator's limits.
 	StateOpen
@@ -69,8 +76,10 @@ var ErrIntentRequired = fmt.Errorf("admission intent required: caller must decla
 // either strand a placeable sandbox or invite retries of a genuine fault.
 var ErrHostAtCapacity = fmt.Errorf("host at configured sandbox capacity")
 
-// ErrNotReady rejects work that arrives before the gate knows what
-// the host is carrying, or after a drain has closed it.
+// ErrNotReady refuses a new sandbox on a host being drained. Rebuilding is
+// deliberately NOT one of its causes: a host that does not yet know what it
+// holds admits and charges instead, because refusing there would deny work
+// the host has room for and could serve.
 var ErrNotReady = fmt.Errorf("host not accepting new sandboxes")
 
 // admissionToken is one host-owned charge. Tokens are keyed by id, which is
@@ -243,21 +252,6 @@ func (g *Gate) Open() {
 	}
 }
 
-// Close returns an enabled gate to reconstructing. Used by drain and by an
-// audit that finds the ledger undercounting: in both cases the safe move is
-// to stop admitting until the count can be rebuilt, never to keep serving
-// from a ledger known to be wrong.
-func (g *Gate) Close() {
-	if g == nil {
-		return
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.state != StateDisabled {
-		g.state = StateReconstructing
-	}
-}
-
 // Drain closes the gate to new sandboxes. Existing tokens stay charged, so
 // the pending count a drain waits on is the daemon's own and not an
 // estimate made elsewhere.
@@ -299,14 +293,34 @@ func (g *Gate) Admit(id string, intent Intent) error {
 		// let finish.
 		return nil
 	}
-	if g.state != StateOpen {
-		if intent == IntentResume && g.state == StateDraining {
+	switch g.state {
+	case StateReconstructing:
+		// Charge, but do not enforce. The daemon does not yet know what it
+		// is holding, and the two ways to handle that are not symmetric:
+		// refusing would deny every create and resume for the whole
+		// rebuild — a window this host did not have before local admission
+		// existed, since the RPC server serves throughout it — while
+		// admitting is no worse than the behavior of a host with no limit
+		// configured at all, which is what every host was until now.
+		//
+		// Charging matters as much as admitting: these tokens carry a
+		// generation above the rebuild's snapshot, so they survive it and
+		// the ledger is already correct the moment the gate opens.
+		g.gen++
+		g.tokens[id] = admissionToken{gen: g.gen}
+		return nil
+	case StateDraining:
+		if intent == IntentResume {
 			// A drain stops new placement, not the return of sandboxes
 			// this host already owns.
 			g.gen++
 			g.tokens[id] = admissionToken{gen: g.gen}
 			return nil
 		}
+		// Creates ARE refused here, unlike during a rebuild: a drain is a
+		// deliberate operator action to move work off this host, so
+		// refusing is the whole point rather than a side effect of
+		// ignorance.
 		return ErrNotReady
 	}
 	if intent == IntentCreate && g.maxSandboxes > 0 && len(g.tokens) >= g.maxSandboxes {
@@ -344,7 +358,14 @@ func (g *Gate) AdmitBuild(id string, owner any) error {
 		}
 		return nil
 	}
-	if g.state != StateOpen {
+	switch g.state {
+	case StateReconstructing:
+		// Same reasoning as Admit: charge without enforcing rather than
+		// fail builds for the length of a rebuild.
+		g.gen++
+		g.tokens[id] = admissionToken{build: true, gen: g.gen, owner: owner}
+		return nil
+	case StateDraining:
 		return ErrNotReady
 	}
 	if g.maxSandboxes > 0 && len(g.tokens) >= g.maxSandboxes {
