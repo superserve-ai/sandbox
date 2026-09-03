@@ -138,25 +138,48 @@ func TestAdmissionGateDisabledIsInertEvenWithLimitsSet(t *testing.T) {
 	}
 }
 
-// The socket survives a restart and can deliver queued requests before
-// reattach finishes. An enabled gate must therefore start closed — if it
-// admits during reconstruction it is admitting against an empty count,
-// which is no limit at all.
-func TestAdmissionGateStartsClosedAndRefusesUntilOpened(t *testing.T) {
-	g := NewGate(true, 10)
+// An enabled gate starts in reconstructing, because a restarted daemon does
+// not yet know what it is holding.
+//
+// It must NOT refuse during that window. The RPC server serves throughout a
+// restart, so work that arrives mid-rebuild succeeds today; refusing it
+// would convert every deploy into a create-and-resume outage on this host.
+// Admitting instead is no worse than a host with no limit configured, which
+// is what every host was before this existed.
+func TestAdmissionGateAdmitsWhileReconstructing(t *testing.T) {
+	g := NewGate(true, 1) // a limit of one, deliberately already "exceeded"
 	if got := g.State(); got != StateReconstructing {
 		t.Fatalf("initial state %v, want reconstructing", got)
 	}
-	if err := g.Admit("sb-1", IntentCreate); !errors.Is(err, ErrNotReady) {
-		t.Fatalf("admitted before reconstruction finished: %v", err)
+	for _, id := range []string{"sb-1", "sb-2", "sb-3"} {
+		if err := g.Admit(id, IntentCreate); err != nil {
+			t.Fatalf("%s refused during reconstruction: %v; a restart would deny every create", id, err)
+		}
 	}
-	g.Reconstruct(g.BeginReconstruct(), []string{"survivor-1", "survivor-2"}, []string{"build-1"})
+	if err := g.Admit("sb-4", IntentResume); err != nil {
+		t.Fatalf("resume refused during reconstruction: %v", err)
+	}
+}
+
+// Admitting during the rebuild is only safe because those admissions are
+// still CHARGED — they carry a generation above the rebuild's snapshot, so
+// they survive it and the ledger is correct the instant the gate opens.
+// Were they admitted uncharged, the host would open believing it had room
+// it had already given away.
+func TestAdmissionGateChargesWorkAdmittedWhileReconstructing(t *testing.T) {
+	g := NewGate(true, 10)
+	since := g.BeginReconstruct()
+	if err := g.Admit("arrived-during-rebuild", IntentCreate); err != nil {
+		t.Fatal(err)
+	}
+	g.Reconstruct(since, []string{"survivor-1", "survivor-2"}, []string{"build-1"})
 	g.Open()
-	if got := g.Charged(); got != 3 {
-		t.Fatalf("reconstructed ledger holds %d, want 3 (two sandboxes and a builder)", got)
+
+	if !g.Holds("arrived-during-rebuild") {
+		t.Fatal("work admitted during the rebuild was not charged; the gate opens over-committed")
 	}
-	if err := g.Admit("sb-1", IntentCreate); err != nil {
-		t.Fatalf("refused after opening: %v", err)
+	if got := g.Charged(); got != 4 {
+		t.Fatalf("charged %d, want 4 (two survivors, a builder, and the in-flight create)", got)
 	}
 }
 

@@ -20,11 +20,12 @@ func (m *Manager) AdmissionGate() *admission.Gate { return m.admission }
 // StartAdmission brings the gate into service once the daemon knows what
 // this host is already running, and never before.
 //
-// Runs as a background transition rather than from a request, because the
-// listening socket survives a restart: queued calls can arrive before
-// reattach completes, and a gate that reconstructed lazily on the first one
-// would either block that request behind fleet-sized work or admit it
-// against an empty ledger. Both are worse than refusing briefly.
+// Runs as a background transition rather than from a request. The RPC
+// server serves throughout a restart, so a create can arrive before reattach
+// finishes; a gate that rebuilt lazily on that first request would block it
+// behind fleet-sized work. Until this completes the gate admits and charges
+// without enforcing, so the wait costs correctness of the limit rather than
+// availability of the host.
 func (m *Manager) StartAdmission(ctx context.Context) {
 	if !m.admission.Enabled() {
 		return
@@ -40,11 +41,13 @@ func (m *Manager) StartAdmission(ctx context.Context) {
 			// one more thing to keep in agreement with the first.
 			if m.PressureReady() {
 				if err := m.reconstructAdmission(); err != nil {
-					// Stay closed and come back on the next tick. Refusing
-					// creates for another interval is recoverable; opening
-					// against a ledger we know is incomplete is not.
+					// Stay in the permissive rebuild state and retry on the
+					// next tick. Not enforcing for another interval is
+					// recoverable; opening against a ledger known to be
+					// incomplete would enforce a limit lower than reality
+					// and refuse creates this host has room for.
 					m.log.Error().Err(err).
-						Msg("admission reconstruction failed; gate stays closed, retrying")
+						Msg("admission reconstruction failed; not yet enforcing, retrying")
 					break
 				}
 				m.admission.Open()
@@ -193,22 +196,19 @@ func (m *Manager) AuditAdmission() {
 	}
 	p := m.CapacityPressure()
 	observed := int(p.RunningSandboxes + p.ProvisioningSandboxes + p.PausedSandboxes)
-	undercount := m.admission.AuditUndercount(observed)
-	if undercount {
+	if m.admission.AuditUndercount(observed) {
+		// Logged, not answered by closing the gate. Closing would drop this
+		// host into the permissive rebuild state, which enforces nothing —
+		// exactly the condition an undercount already describes. The
+		// rebuild below is the actual fix, it derives from authoritative
+		// state rather than adjusting, and it completes in a store read.
 		m.log.Error().Int("observed", observed).Int("charged", m.admission.Charged()).
-			Msg("admission ledger undercounts live sandboxes; closing gate to rebuild")
-		m.admission.Close()
+			Msg("admission ledger undercounts live sandboxes; rebuilding")
 	}
 	if err := m.reconstructAdmission(); err != nil {
-		// A failed rebuild leaves the gate however this call found it: still
-		// open when nothing was known to be wrong, and closed when it was.
-		// Reopening on a rebuild that failed would restore service on a
-		// ledger no more trustworthy than the one that triggered this.
-		m.log.Error().Err(err).Bool("undercount", undercount).
-			Msg("admission rebuild failed")
-		return
-	}
-	if undercount {
-		m.admission.Open()
+		// The previous ledger stands. Stale and enforcing beats fresh and
+		// empty: an incomplete rebuild would hand back a count lower than
+		// the truth, which is the over-admission this exists to prevent.
+		m.log.Error().Err(err).Msg("admission rebuild failed; keeping the existing ledger")
 	}
 }
