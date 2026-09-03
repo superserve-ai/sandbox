@@ -184,13 +184,29 @@ func postBoxdFreeze(ctx context.Context, vmIP, token string) (freezeEcho, error)
 	return echo, nil
 }
 
-// postBoxdThaw undoes a freeze whose snapshot did not happen.
+// postBoxdThaw undoes a freeze whose snapshot did not happen. A refusal that
+// the token names no freeze the guest holds is ErrGuestTokenMismatch.
 func postBoxdThaw(ctx context.Context, vmIP, token string) error {
 	body, _ := json.Marshal(struct {
 		Token string `json:"token"`
 	}{token})
 	_, err := postBoxd(ctx, vmIP, "/thaw", body)
+	var se *boxdStatusError
+	if errors.As(err, &se) && se.Code == http.StatusConflict {
+		return fmt.Errorf("%w: %s", ErrGuestTokenMismatch, se.Body)
+	}
 	return err
+}
+
+// boxdStatusError is a non-200 answer from the guest agent.
+type boxdStatusError struct {
+	Path string
+	Code int
+	Body string
+}
+
+func (e *boxdStatusError) Error() string {
+	return fmt.Sprintf("POST %s: status %d: %s", e.Path, e.Code, e.Body)
 }
 
 func postBoxd(ctx context.Context, vmIP, path string, body []byte) ([]byte, error) {
@@ -209,7 +225,7 @@ func postBoxd(ctx context.Context, vmIP, path string, body []byte) ([]byte, erro
 	defer resp.Body.Close()
 	reply, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("POST %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(reply)))
+		return nil, &boxdStatusError{Path: path, Code: resp.StatusCode, Body: strings.TrimSpace(string(reply))}
 	}
 	return reply, nil
 }

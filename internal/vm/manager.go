@@ -134,10 +134,12 @@ type VMInstance struct {
 	ClockFrozen bool
 	// FreezeToken is the token the image's freeze carries; a wake must present it.
 	FreezeToken string
-	CreatedAt   time.Time
-	Metadata    map[string]string
-	TeamID      string // owning team; carried for data-plane usage attribution
-	OwnerID     string // creating user; empty when unknown
+	// ArtifactID names the manifest this record describes.
+	ArtifactID string
+	CreatedAt  time.Time
+	Metadata   map[string]string
+	TeamID     string // owning team; carried for data-plane usage attribution
+	OwnerID    string // creating user; empty when unknown
 	// PausedAt records when this VM last entered the paused state. It drives
 	// oldest-first pressure reclamation. Zero means the field is unset on a
 	// legacy record; callers fall back to CreatedAt and then place any fully
@@ -719,6 +721,10 @@ type Manager struct {
 	// guestClockUnready latches this host to unfrozen restores after a guest
 	// reported it could not correct its clock. See noteGuestClockUnready.
 	guestClockUnready atomic.Bool
+	// pendingWakes are reattached records that owe a wake, held back from
+	// m.vms until the startup pool completes it. See queuePendingWake.
+	pendingWakeMu sync.Mutex
+	pendingWakes  map[string]*pendingWake
 	// dirtyTrackingSessionCapable is the same probe for the guarded-session
 	// fields, demoted on the first refusal exactly like the clock flag.
 	dirtyTrackingSessionCapable atomic.Bool
@@ -1631,20 +1637,21 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		correctsWallClock = man != nil && man.GuestCorrectsClock
 	}
 	// The token this freeze carries; the guest keeps it across the snapshot and
-	// the wake must present it.
-	freezeToken := ""
+	// the wake must present it. The artifact id names the manifest this pause
+	// will write, in the intent and in the record alike.
+	freezeToken, artifactID := "", ""
 	if correctsWallClock {
-		freezeToken = NewFreezeToken()
+		freezeToken, artifactID = NewFreezeToken(), NewArtifactID()
 	}
 
-	// Only a pause that may touch a wall-clock manifest records its intent (see
-	// pause_intent.go); a pause of an image without one rewrites nothing a
-	// restore would trust. Written under the freeze round trip.
-	var intentDone chan error
+	// Only a pause that may freeze the guest or touch a wall-clock manifest
+	// records its intent (see pause_intent.go). Durable BEFORE the freeze: a
+	// crash after it must find the token, or the guest stays frozen with
+	// nobody able to release it.
 	if correctsWallClock {
-		done := make(chan error, 1)
-		intentDone = done
-		go func() { done <- writePauseIntent(snapshotDir, vmID) }()
+		if err := writePauseIntent(snapshotDir, pauseIntent{VMID: vmID, FreezeToken: freezeToken, ArtifactID: artifactID}); err != nil {
+			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record pause intent: %w", err))
+		}
 	}
 	// Freeze the workload before the image exists — only when the restore would
 	// freeze the clock; otherwise the freeze buys nothing.
@@ -1673,11 +1680,6 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 				log.Error().Err(terr).Msg("pause: snapshot failed and the guest workload could not be thawed")
 			}
 		}()
-	}
-	if intentDone != nil {
-		if err := <-intentDone; err != nil {
-			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record pause intent: %w", err))
-		}
 	}
 	if !guestFrozen {
 		for _, candidate := range []string{overlayPath, fullPath} {
@@ -1831,7 +1833,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// with nothing owing it a wake, so that write failure fails the pause; an
 	// unfrozen image only loses a cache the record still carries.
 	if correctsWallClock {
-		man := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: NewArtifactID(), WorkloadFrozen: guestFrozen, GuestCorrectsClock: true}
+		man := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: artifactID, WorkloadFrozen: guestFrozen, GuestCorrectsClock: true}
 		if guestFrozen {
 			man.FreezeToken = freezeToken
 		}
@@ -1923,6 +1925,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	if guestFrozen {
 		inst.FreezeToken = freezeToken
 	}
+	inst.ArtifactID = artifactID
 	inst.PausedAt = time.Now()
 	// The crash-window marker describes a RUNNING record persisted before
 	// readiness was proven; a successful pause proves the guest was live and
@@ -1946,12 +1949,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		return "", "", nil, status.Errorf(codes.NotFound, "vm %s destroyed during pause", vmID)
 	}
 	// The image, its manifest and the record are all durable: the rewrite is
-	// complete. A marker that cannot be removed keeps refusing restores, which
-	// is the safe failure — an operator removes it once the artifacts are known
-	// good.
-	if intentDone != nil {
+	// complete. An intent that cannot be removed now names the artifact the
+	// record does, which is how the next resume tells it from an interrupted
+	// one and clears it itself.
+	if correctsWallClock {
 		if err := clearPauseIntent(snapshotDir); err != nil {
-			log.Error().Err(err).Str("dir", snapshotDir).Msg("pause: intent marker could not be cleared; restores of this image are refused until it is removed")
+			log.Warn().Err(err).Str("dir", snapshotDir).Msg("pause: intent marker could not be cleared; the next resume clears it")
 		}
 	}
 
@@ -2269,9 +2272,11 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		}
 		return nil, status.Errorf(codes.FailedPrecondition, "stat mem file %s: %v", memPath, err)
 	}
-	if pauseIntentPresent(filepath.Dir(memPath)) {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"image %q: a pause was interrupted while rewriting it; refusing resume until it is inspected", memPath)
+	inst.mu.RLock()
+	recordedArtifact := inst.ArtifactID
+	inst.mu.RUnlock()
+	if blocked, why := pauseIntentBlocks(filepath.Dir(memPath), recordedArtifact); blocked {
+		return nil, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing resume until it is inspected", memPath, why)
 	}
 	// Presence gate for layered overlays. Deterministic from a stat, so it
 	// belongs here with the other precondition checks — a post-boot refusal
@@ -3257,9 +3262,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
 	}
-	if pauseIntentPresent(filepath.Dir(memPath)) {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"image %q: a pause was interrupted while rewriting it; refusing restore until it is inspected", memPath)
+	// An in-place restore may meet the leftover of a pause that completed; any
+	// other intent means an interrupted rewrite.
+	knownArtifact := ""
+	m.mu.RLock()
+	if prev := m.vms[vmID]; prev != nil {
+		prev.mu.RLock()
+		knownArtifact = prev.ArtifactID
+		prev.mu.RUnlock()
+	}
+	m.mu.RUnlock()
+	if blocked, why := pauseIntentBlocks(filepath.Dir(memPath), knownArtifact); blocked {
+		return nil, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing restore until it is inspected", memPath, why)
 	}
 	// What the image says about its guest, read once: whether its workload is
 	// frozen (and so owes a wake with this token) and whether the guest
@@ -3272,9 +3286,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	restoreCorrectsWallClock := manifest != nil && manifest.WorkloadFrozen
 	restoreGuestCorrects := manifest != nil && manifest.GuestCorrectsClock
-	restoreToken := ""
+	restoreToken, restoreArtifactID := "", ""
 	if manifest != nil {
-		restoreToken = manifest.FreezeToken
+		restoreToken, restoreArtifactID = manifest.FreezeToken, manifest.ArtifactID
 	}
 
 	// Sampled before this attempt creates the rundir: a pre-existing rundir
@@ -3483,6 +3497,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.CorrectsWallClock = &restoreGuestCorrects
 		inst.SnapshotWorkloadFrozen = &restoreCorrectsWallClock
 		inst.FreezeToken = restoreToken
+		inst.ArtifactID = restoreArtifactID
 		inst.mu.Unlock()
 		// Only a frozen image owes a wake, so only then must the record say so
 		// before the vCPUs can run (see persistWakeOwed). An unfrozen image
@@ -4572,6 +4587,7 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 			stale++
 		}
 	}
+	reattached += m.drainPendingWakes(ctx)
 
 	// Reconstruct unconfirmed-stop markers the previous process took to
 	// its grave: vmStopUnconfirmed is in-memory, so a restart after a
@@ -4794,6 +4810,19 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		return inst, true
 	}
 	m.mu.RUnlock()
+	// A request arriving while the startup pass still owes this VM its wake
+	// waits for that outcome rather than adopting a frozen guest.
+	if pw := m.pendingWake(rec.ID); pw != nil && !cleanupStale {
+		select {
+		case <-pw.done:
+			m.mu.RLock()
+			inst, ok := m.vms[rec.ID]
+			m.mu.RUnlock()
+			return inst, ok
+		case <-ctx.Done():
+			return nil, false
+		}
+	}
 
 	log := m.log.With().Str("vm_id", rec.ID).Logger()
 
@@ -5075,6 +5104,30 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	if inst.Namespace != "" && inst.IP != "" {
 		if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
 			log.Error().Err(err).Msg("reattach: restore network state failed")
+		}
+	}
+
+	// A live guest may still owe something from the process that died: a
+	// pause that froze it and never finished, or a restore that never woke
+	// it. Neither may be served as Running until resolved.
+	if rec.Status == StatusRunning && !m.recoverPauseIntent(ctx, inst, log) {
+		rec.Status = StatusError
+		inst.mu.Lock()
+		inst.Status = StatusError
+		inst.mu.Unlock()
+	}
+	if rec.Status == StatusRunning && inst.WakePending {
+		if cleanupStale {
+			// The startup pass queues it; the pool after the pass completes
+			// the wake, bounded, and publishes the outcome.
+			m.queuePendingWake(inst)
+			return nil, false
+		}
+		if !m.completeOwedWake(ctx, inst, log) {
+			rec.Status = StatusError
+			inst.mu.Lock()
+			inst.Status = StatusError
+			inst.mu.Unlock()
 		}
 	}
 
@@ -8069,6 +8122,133 @@ func (m *Manager) persistWakeOwed(inst *VMInstance, predicted Supervision, clock
 			ok = m.persistState(inst)
 		}
 		return ok
+	}
+}
+
+// pendingWake is a reattached instance that owes its guest a wake. The startup
+// pass finds them faster than a wake can be completed, so they are queued and
+// resolved by a bounded pool after the pass; a request for one waits on done.
+type pendingWake struct {
+	inst *VMInstance
+	done chan struct{}
+}
+
+const wakeRecoveryWorkers = 4
+
+func (m *Manager) pendingWake(id string) *pendingWake {
+	m.pendingWakeMu.Lock()
+	defer m.pendingWakeMu.Unlock()
+	return m.pendingWakes[id]
+}
+
+func (m *Manager) queuePendingWake(inst *VMInstance) {
+	m.pendingWakeMu.Lock()
+	defer m.pendingWakeMu.Unlock()
+	if m.pendingWakes == nil {
+		m.pendingWakes = map[string]*pendingWake{}
+	}
+	if _, queued := m.pendingWakes[inst.ID]; !queued {
+		m.pendingWakes[inst.ID] = &pendingWake{inst: inst, done: make(chan struct{})}
+	}
+}
+
+// drainPendingWakes completes every queued wake through a bounded pool and
+// publishes each outcome: Running once woken, Error otherwise — never a frozen
+// guest presented as ready. Returns how many were published Running.
+func (m *Manager) drainPendingWakes(ctx context.Context) int {
+	m.pendingWakeMu.Lock()
+	queued := make([]*pendingWake, 0, len(m.pendingWakes))
+	for _, pw := range m.pendingWakes {
+		queued = append(queued, pw)
+	}
+	m.pendingWakeMu.Unlock()
+	if len(queued) == 0 {
+		return 0
+	}
+	var woken atomic.Int32
+	sem := make(chan struct{}, wakeRecoveryWorkers)
+	var wg sync.WaitGroup
+	for _, pw := range queued {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(pw *pendingWake) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer sentrylog.Recover("wake-recovery")
+			log := m.log.With().Str("vm_id", pw.inst.ID).Logger()
+			if m.completeOwedWake(ctx, pw.inst, log) {
+				woken.Add(1)
+			} else {
+				pw.inst.mu.Lock()
+				pw.inst.Status = StatusError
+				pw.inst.mu.Unlock()
+			}
+			m.publishRecovered(pw.inst)
+			m.pendingWakeMu.Lock()
+			delete(m.pendingWakes, pw.inst.ID)
+			m.pendingWakeMu.Unlock()
+			close(pw.done)
+		}(pw)
+	}
+	wg.Wait()
+	return int(woken.Load())
+}
+
+// completeOwedWake sends the wake a reattached record still owes. True once
+// the guest is awake; false leaves the instance owing it, for Error.
+func (m *Manager) completeOwedWake(ctx context.Context, inst *VMInstance, log zerolog.Logger) bool {
+	if err := m.verifyBoxdReady(ctx, inst.IP, inst); err != nil {
+		log.Error().Err(err).Msg("reattach: guest still owes its wake and could not be woken; parking as error")
+		return false
+	}
+	inst.mu.Lock()
+	inst.Unverified = false
+	inst.mu.Unlock()
+	log.Info().Msg("reattach: completed the wake a restore owed this guest")
+	return true
+}
+
+// recoverPauseIntent releases a guest that a pause froze and then died
+// before finishing. True when nothing is owed or the guest is released;
+// false when a frozen guest could not be released and must not be served.
+func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log zerolog.Logger) bool {
+	dir := filepath.Join(m.cfg.SnapshotDir, inst.ID)
+	in, err := readPauseIntent(dir)
+	if err != nil {
+		log.Error().Err(err).Msg("reattach: pause intent unreadable; parking as error")
+		return false
+	}
+	if in == nil {
+		return true
+	}
+	if in.FreezeToken != "" && inst.IP != "" {
+		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		terr := boxdThawGuest(tctx, inst.IP, in.FreezeToken)
+		cancel()
+		// A token the guest never froze under means the crash came before
+		// the freeze: nothing to release.
+		if terr != nil && !errors.Is(terr, ErrGuestTokenMismatch) {
+			log.Error().Err(terr).Msg("reattach: a pause left this guest frozen and it could not be released; parking as error")
+			return false
+		}
+		log.Warn().Msg("reattach: released a guest an interrupted pause had frozen")
+	}
+	if cerr := clearPauseIntent(dir); cerr != nil {
+		log.Warn().Err(cerr).Msg("reattach: interrupted pause's intent could not be cleared; the next pause rewrites it")
+	}
+	return true
+}
+
+// publishRecovered publishes an instance the wake pool resolved, durably.
+func (m *Manager) publishRecovered(inst *VMInstance) {
+	m.mu.Lock()
+	if _, present := m.vms[inst.ID]; !present {
+		m.vms[inst.ID] = inst
+		m.indexVM(inst.ID, inst)
+	}
+	m.mu.Unlock()
+	if wrote, perr := m.persistStateIfPresent(inst); perr == nil && !wrote {
+		m.undoReattach(inst.ID)
 	}
 }
 

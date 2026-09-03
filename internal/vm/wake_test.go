@@ -149,12 +149,12 @@ func TestVerifyBoxdReadyCompletesAPendingWake(t *testing.T) {
 // owes one.
 func TestWakeStateSurvivesRecordRoundTrip(t *testing.T) {
 	frozen := true
-	rec := toRecord(&VMInstance{ID: "vm", WakePending: true, ClockFrozen: true, SnapshotWorkloadFrozen: &frozen, FreezeToken: "tok"})
-	if !rec.WakePending || !rec.ClockFrozen || rec.SnapshotWorkloadFrozen == nil || !*rec.SnapshotWorkloadFrozen || rec.FreezeToken != "tok" {
+	rec := toRecord(&VMInstance{ID: "vm", WakePending: true, ClockFrozen: true, SnapshotWorkloadFrozen: &frozen, FreezeToken: "tok", ArtifactID: "a"})
+	if !rec.WakePending || !rec.ClockFrozen || rec.SnapshotWorkloadFrozen == nil || !*rec.SnapshotWorkloadFrozen || rec.FreezeToken != "tok" || rec.ArtifactID != "a" {
 		t.Fatalf("toRecord dropped wake state: %+v", rec)
 	}
 	got := toInstance(rec)
-	if !got.WakePending || !got.ClockFrozen || got.SnapshotWorkloadFrozen == nil || !*got.SnapshotWorkloadFrozen || got.FreezeToken != "tok" {
+	if !got.WakePending || !got.ClockFrozen || got.SnapshotWorkloadFrozen == nil || !*got.SnapshotWorkloadFrozen || got.FreezeToken != "tok" || got.ArtifactID != "a" {
 		t.Errorf("toInstance dropped wake state: pending=%v frozen=%v image=%v", got.WakePending, got.ClockFrozen, got.SnapshotWorkloadFrozen)
 	}
 }
@@ -585,10 +585,10 @@ func TestInterruptedPauseRefusesResumeAndRestore(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := writePauseIntent(dir, "vm-1"); err != nil {
+	if err := writePauseIntent(dir, pauseIntent{VMID: "vm-1", FreezeToken: "tok", ArtifactID: "interrupted"}); err != nil {
 		t.Fatal(err)
 	}
-	if !pauseIntentPresent(dir) {
+	if blocked, _ := pauseIntentBlocks(dir, "other"); !blocked {
 		t.Fatal("intent not visible after write")
 	}
 	launched := false
@@ -626,9 +626,195 @@ func TestInterruptedPauseRefusesResumeAndRestore(t *testing.T) {
 		t.Fatalf("restore: err=%v launched=%v, want FailedPrecondition before launch", cerr, launched)
 	}
 
-	if err := clearPauseIntent(dir); err != nil || pauseIntentPresent(dir) {
-		t.Fatalf("clear: err=%v present=%v", err, pauseIntentPresent(dir))
+	if err := clearPauseIntent(dir); err != nil {
+		t.Fatalf("clear: %v", err)
 	}
+	if blocked, _ := pauseIntentBlocks(dir, ""); blocked {
+		t.Fatal("still blocked after clear")
+	}
+}
+
+// A pause that completed but could not remove its intent leaves one naming the
+// artifact the record already describes; the next resume clears it and goes on.
+func TestCompletedPauseIntentClearsItself(t *testing.T) {
+	origWake := boxdWakeGuest
+	t.Cleanup(func() { boxdWakeGuest = origWake })
+	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return nil }
+	dir := t.TempDir()
+	snapPath, memPath, rootfs := filepath.Join(dir, "vm.snap"), filepath.Join(dir, "mem.snap"), filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snapPath, memPath, rootfs} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writePauseIntent(dir, pauseIntent{VMID: "vm-1", FreezeToken: "tok", ArtifactID: "done"}); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
+		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs, ArtifactID: "done",
+	}
+	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir}, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}}
+	launched := false
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		launched = true
+		return 4321, SupervisionUnit, nil
+	}
+	mgr.restoreForResumeHook = func(string, string, string, string, *network.VMNetInfo) (bool, string, error) { return false, "", nil }
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil || !launched {
+		t.Fatalf("resume: err=%v launched=%v, want the completed pause's intent cleared and the resume to proceed", err, launched)
+	}
+	if _, err := os.Stat(pauseIntentPath(dir)); !os.IsNotExist(err) {
+		t.Error("intent still present after the resume")
+	}
+}
+
+// A guest a crashed pause left frozen is released on reattach with the token
+// the intent carries; a token the guest never froze under means the crash came
+// first, and nothing is owed. A guest that cannot be released is not served.
+func TestReattachReleasesAGuestAnInterruptedPauseFroze(t *testing.T) {
+	origThaw := boxdThawGuest
+	t.Cleanup(func() { boxdThawGuest = origThaw })
+	cases := []struct {
+		name       string
+		thaw       error
+		wantStatus VMStatus
+		wantIntent bool
+	}{
+		{"released", nil, StatusRunning, false},
+		{"never_frozen", fmt.Errorf("%w: status token", ErrGuestTokenMismatch), StatusRunning, false},
+		{"unreachable", errors.New("connection refused"), StatusError, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { store.Close() })
+			vmDir := filepath.Join(dir, "vm-1")
+			if err := os.MkdirAll(vmDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := writePauseIntent(vmDir, pauseIntent{VMID: "vm-1", FreezeToken: "tok", ArtifactID: "a"}); err != nil {
+				t.Fatal(err)
+			}
+			rec := VMRecord{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionUnit, IP: "10.0.0.2"}
+			if err := store.Put(rec); err != nil {
+				t.Fatal(err)
+			}
+			var sawToken string
+			boxdThawGuest = func(_ context.Context, _ string, token string) error { sawToken = token; return tc.thaw }
+			mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
+			inst := mgr.reattachByID("vm-1", false)
+			if inst == nil || sawToken != "tok" {
+				t.Fatalf("inst=%v token=%q, want the record published and the intent's token presented", inst, sawToken)
+			}
+			inst.mu.RLock()
+			st := inst.Status
+			inst.mu.RUnlock()
+			if st != tc.wantStatus {
+				t.Errorf("status %v, want %v", st, tc.wantStatus)
+			}
+			_, serr := os.Stat(pauseIntentPath(vmDir))
+			if present := serr == nil; present != tc.wantIntent {
+				t.Errorf("intent present=%v, want %v", present, tc.wantIntent)
+			}
+		})
+	}
+}
+
+// A record that owes a wake is not served until the wake completes: a request
+// arriving through the lazy path completes it inline, the startup pass queues it
+// for the pool, and a request during that wait sees the pool's outcome.
+func TestReattachCompletesOwedWakesBeforeServing(t *testing.T) {
+	origWake := boxdWakeGuest
+	t.Cleanup(func() { boxdWakeGuest = origWake })
+	newStore := func(t *testing.T) (*Manager, *StateStore) {
+		t.Helper()
+		dir := t.TempDir()
+		store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { store.Close() })
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", Supervision: SupervisionUnit, IP: "10.0.0.2"}); err != nil {
+			t.Fatal(err)
+		}
+		return &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}, store
+	}
+
+	t.Run("lazy_path_wakes_inline", func(t *testing.T) {
+		mgr, store := newStore(t)
+		var sawFrozen bool
+		var sawToken string
+		boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool, token string) error {
+			sawFrozen, sawToken = frozen, token
+			return nil
+		}
+		inst := mgr.reattachByID("vm-1", false)
+		if inst == nil || !sawFrozen || sawToken != "tok" {
+			t.Fatalf("inst=%v frozen=%v token=%q, want the wake sent with the record's policy and token", inst, sawFrozen, sawToken)
+		}
+		inst.mu.RLock()
+		defer inst.mu.RUnlock()
+		if inst.Status != StatusRunning || inst.WakePending || inst.Unverified {
+			t.Errorf("status=%v wakePending=%v unverified=%v", inst.Status, inst.WakePending, inst.Unverified)
+		}
+		if rec, _ := store.Get("vm-1"); rec == nil || rec.WakePending {
+			t.Error("the completed wake was not made durable")
+		}
+	})
+
+	t.Run("lazy_path_parks_a_guest_that_will_not_wake", func(t *testing.T) {
+		mgr, _ := newStore(t)
+		boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return errors.New("no answer") }
+		inst := mgr.reattachByID("vm-1", false)
+		if inst == nil {
+			t.Fatal("a parked record must still be tracked, as Error")
+		}
+		inst.mu.RLock()
+		defer inst.mu.RUnlock()
+		if inst.Status != StatusError {
+			t.Errorf("status %v, want Error", inst.Status)
+		}
+	})
+
+	t.Run("startup_pass_queues_and_the_pool_resolves", func(t *testing.T) {
+		mgr, _ := newStore(t)
+		wakes := 0
+		boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { wakes++; return nil }
+		rec, _ := mgr.state.Get("vm-1")
+		if inst, ok := mgr.reattachRecord(context.Background(), *rec, true); inst != nil || ok {
+			t.Fatal("the startup pass must not publish a guest that owes a wake")
+		}
+		if mgr.pendingWake("vm-1") == nil {
+			t.Fatal("not queued")
+		}
+		// A request during the wait sees the pool's outcome.
+		got := make(chan *VMInstance, 1)
+		go func() { got <- mgr.reattachByID("vm-1", false) }()
+		if n := mgr.drainPendingWakes(context.Background()); n != 1 || wakes != 1 {
+			t.Fatalf("drained=%d wakes=%d, want one guest woken once", n, wakes)
+		}
+		select {
+		case inst := <-got:
+			if inst == nil || inst.WakePending {
+				t.Fatalf("request got %v, want the woken instance", inst)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("request never saw the pool's outcome")
+		}
+		if mgr.pendingWake("vm-1") != nil {
+			t.Error("still queued after resolution")
+		}
+	})
 }
 
 // A wake the guest refuses as belonging to another freeze means the image and

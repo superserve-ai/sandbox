@@ -227,6 +227,7 @@ type VMRecord struct {
 	WakePending bool              `json:"wake_pending,omitempty"`
 	ClockFrozen bool              `json:"clock_frozen,omitempty"`
 	FreezeToken string            `json:"freeze_token,omitempty"`
+	ArtifactID  string            `json:"artifact_id,omitempty"`
 	CreatedAt   time.Time         `json:"created_at"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	VCPU        uint32            `json:"vcpu"`
@@ -921,6 +922,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		SnapshotWorkloadFrozen:     inst.SnapshotWorkloadFrozen,
 		WakePending:                inst.WakePending,
 		FreezeToken:                inst.FreezeToken,
+		ArtifactID:                 inst.ArtifactID,
 		ClockFrozen:                inst.ClockFrozen,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
@@ -1026,6 +1028,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		SnapshotWorkloadFrozen:     rec.SnapshotWorkloadFrozen,
 		WakePending:                rec.WakePending,
 		FreezeToken:                rec.FreezeToken,
+		ArtifactID:                 rec.ArtifactID,
 		ClockFrozen:                rec.ClockFrozen,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,
