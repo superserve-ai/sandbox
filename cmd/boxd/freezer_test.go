@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -655,5 +658,60 @@ func TestFreezingReadsUnreadyFromTheFirstRequest(t *testing.T) {
 	defer cancel()
 	if err := fz.freeze(ctx, "t1"); !errors.Is(err, context.DeadlineExceeded) || fz.isFrozen() {
 		t.Fatalf("rolled-back freeze: err=%v frozen=%v, want the deadline and ready again", err, fz.isFrozen())
+	}
+}
+
+// A freeze that gives up on its budget withdraws at once: a spawn arriving
+// after it is not held behind a writer nobody wants any more.
+func TestAbandonedFreezeHoldsNoSpawnOff(t *testing.T) {
+	fz := newFreezer(newFake(), testDir)
+	if err := fz.beginSpawn(); err != nil {
+		t.Fatal(err)
+	}
+	defer fz.endSpawn()
+	ctx, cancel := context.WithTimeout(bg(), 20*time.Millisecond)
+	defer cancel()
+	if err := fz.freeze(ctx, "t1"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("freeze under a held guard: %v, want the budget to expire", err)
+	}
+	started := make(chan error, 1)
+	go func() {
+		err := fz.beginSpawn()
+		if err == nil {
+			fz.endSpawn()
+		}
+		started <- err
+	}()
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatalf("spawn after an abandoned freeze: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("spawn held off by a freeze that already gave up")
+	}
+}
+
+// Diagnostics never block a request and never pile up goroutines, however
+// many lifecycle retries emit them.
+func TestDiagnosticsNeverBlockOrPileUp(t *testing.T) {
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	diagf("warm")
+	before := runtime.NumGoroutine()
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 10000; i++ {
+			diagf("diagnostic %d", i)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("diagnostics blocked the caller")
+	}
+	if after := runtime.NumGoroutine(); after > before+1 {
+		t.Fatalf("goroutines %d before, %d after", before, after)
 	}
 }

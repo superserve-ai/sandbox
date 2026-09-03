@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -60,7 +59,7 @@ type freezer struct {
 	// mounted is fixed at startup: init mounts the cgroup before boxd runs.
 	mounted bool
 	// mu: spawns hold it shared across Start(); a freeze holds it exclusively.
-	mu sync.RWMutex
+	mu spawnGuard
 	// frozen mirrors the state this freezer last confirmed, so health can
 	// answer without a file read or waiting on a freeze in progress.
 	frozen atomic.Bool
@@ -276,25 +275,15 @@ func (f *freezer) freeze(ctx context.Context, token string) error {
 
 // lockWithin takes the write side of the spawn guard, giving up when ctx
 // ends first. A spawn in flight holds the guard for as long as its placement
-// takes. An abandoned attempt records its token as released at once, so the
-// caller's follow-up thaw with it is answered as done.
+// takes. An abandoned attempt withdraws at once, holding no spawn off, and
+// records its token as released so the caller's follow-up thaw with it is
+// answered as done.
 func (f *freezer) lockWithin(ctx context.Context, token string) error {
-	locked := make(chan struct{})
-	go func() {
-		f.mu.Lock()
-		close(locked)
-	}()
-	select {
-	case <-locked:
-		return nil
-	case <-ctx.Done():
+	if err := f.mu.LockContext(ctx); err != nil {
 		f.last.Store(token)
-		go func() {
-			<-locked
-			f.mu.Unlock()
-		}()
-		return fmt.Errorf("spawn in flight past the freeze budget: %w", ctx.Err())
+		return fmt.Errorf("spawn in flight past the freeze budget: %w", err)
 	}
+	return nil
 }
 
 // undo rolls back a freeze that did not complete. The token is remembered as
@@ -434,7 +423,7 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, context.DeadlineExceeded):
 			code = http.StatusGatewayTimeout
 		}
-		go log.Printf("freezer: freeze refused: %v", err)
+		diagf("freezer: freeze refused: %v", err)
 		http.Error(w, err.Error(), code)
 		return
 	}
@@ -518,7 +507,7 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 		status := "ok"
 		if ready {
 			if err := fz.thaw(body.Token); err != nil {
-				go log.Printf("freezer: thaw on wake failed: %v", err)
+				diagf("freezer: thaw on wake failed: %v", err)
 				ready, status = false, "thaw"
 				wc.Error = "thaw: " + err.Error()
 			}
@@ -535,7 +524,7 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 		// The diagnostic never delays the answer: the response is only
 		// flushed when this handler returns.
 		if wc.CorrectedMs != 0 {
-			go log.Printf("wall clock: corrected by %dms from host time", wc.CorrectedMs)
+			diagf("wall clock: corrected by %dms from host time", wc.CorrectedMs)
 		}
 	}
 }
