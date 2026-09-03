@@ -1488,6 +1488,10 @@ func TestResumeSandbox_PersistentPausing_409(t *testing.T) {
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPausing}
 
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
+
 	var reads int32
 	mock := &mockDBTX{
 		queryRowFn: func(context.Context, string, ...any) pgx.Row {
@@ -1501,6 +1505,22 @@ func TestResumeSandbox_PersistentPausing_409(t *testing.T) {
 
 	if w.Code != http.StatusConflict {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+	// The whole settle window is lookup time; a 409 must not censor it.
+	var lookup, total time.Duration
+	for _, p := range rec.phases {
+		if p.Op != "resume" {
+			continue
+		}
+		switch p.Phase {
+		case "lookup":
+			lookup = p.Duration
+		case "total":
+			total = p.Duration
+		}
+	}
+	if lookup < pausingSettleWindow || lookup != total {
+		t.Errorf("lookup = %v, total = %v; a settle-window 409 must record lookup = total >= %v", lookup, total, pausingSettleWindow)
 	}
 	// A fixed 50ms poll over this 1s window would read ~20 times; the
 	// backed-off poll (50ms doubling up to 500ms) should land around 6 and

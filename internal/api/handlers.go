@@ -1340,11 +1340,14 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	// settle window and then 409s is among the slowest resume requests and
 	// must land in the total distribution. Transition counts/results come
 	// from the SandboxLifecycleTelemetry middleware; this emits total and
-	// lookup, which ends at the resume claim and includes any settle wait.
+	// lookup, which ends at the resume claim, or at the reply when the
+	// request never gets there, so a settle-window 409 lands in lookup too.
 	// HostID is empty until the row loads.
 	defer func() {
 		phases := map[string]time.Duration{"total": time.Since(tResume)}
-		if !tLookupDone.IsZero() {
+		if tLookupDone.IsZero() {
+			phases["lookup"] = phases["total"]
+		} else {
 			phases["lookup"] = tLookupDone.Sub(tResume)
 		}
 		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID, phases)
