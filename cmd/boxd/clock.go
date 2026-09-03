@@ -84,7 +84,6 @@ func (c *wallClock) sync(mustCorrect bool) (status wallClockStatus, ready bool) 
 	}
 
 	status.CorrectedMs = delta.Milliseconds()
-	log.Printf("wall clock: corrected by %v from host time", delta)
 	return status, true
 }
 

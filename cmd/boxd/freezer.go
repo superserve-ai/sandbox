@@ -67,7 +67,8 @@ type freezer struct {
 	// freeze it is releasing; it lives here, so it is in the snapshot. last
 	// is the token of the freeze most recently released, so a repeated
 	// request after success is answered the same way.
-	token, last string
+	token string
+	last  atomic.Value // string: the token most recently released
 }
 
 var (
@@ -222,13 +223,21 @@ func (f *freezer) freeze(ctx context.Context, token string) error {
 	if !f.available() {
 		return errors.New("freezer cgroup unavailable")
 	}
-	f.mu.Lock()
+	if err := f.lockWithin(ctx, token); err != nil {
+		return err
+	}
 	defer f.mu.Unlock()
 	if f.frozen.Load() {
 		if token == f.token {
 			return nil
 		}
 		return errTokenConflict
+	}
+	// The budget covers the wait for the guard too: a caller that has given
+	// up must not find its workload stopped after all.
+	if err := ctx.Err(); err != nil {
+		f.last.Store(token)
+		return fmt.Errorf("budget spent before the freeze began: %w", err)
 	}
 
 	if err := f.fs.writeState("FROZEN"); err != nil {
@@ -255,6 +264,29 @@ func (f *freezer) freeze(ctx context.Context, token string) error {
 	}
 }
 
+// lockWithin takes the write side of the spawn guard, giving up when ctx
+// ends first. A spawn in flight holds the guard for as long as its placement
+// takes. An abandoned attempt records its token as released at once, so the
+// caller's follow-up thaw with it is answered as done.
+func (f *freezer) lockWithin(ctx context.Context, token string) error {
+	locked := make(chan struct{})
+	go func() {
+		f.mu.Lock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+		return nil
+	case <-ctx.Done():
+		f.last.Store(token)
+		go func() {
+			<-locked
+			f.mu.Unlock()
+		}()
+		return fmt.Errorf("spawn in flight past the freeze budget: %w", ctx.Err())
+	}
+}
+
 // undo rolls back a freeze that did not complete. The token is remembered as
 // released, so the supervisor's own follow-up thaw with it is answered as
 // already done rather than refused.
@@ -262,7 +294,8 @@ func (f *freezer) undo(token string, cause error) error {
 	if terr := f.thawLocked(); terr != nil {
 		return fmt.Errorf("%w; %w: %v", cause, errThawUnconfirmed, terr)
 	}
-	f.last, f.token = token, ""
+	f.last.Store(token)
+	f.token = ""
 	return cause
 }
 
@@ -276,7 +309,7 @@ func (f *freezer) thaw(token string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.frozen.Load() {
-		if token == f.last && token != "" {
+		if f.released(token) {
 			return nil
 		}
 		return errTokenMismatch
@@ -287,7 +320,8 @@ func (f *freezer) thaw(token string) error {
 	if err := f.thawLocked(); err != nil {
 		return err
 	}
-	f.last, f.token = f.token, ""
+	f.last.Store(f.token)
+	f.token = ""
 	return nil
 }
 
@@ -301,7 +335,13 @@ func (f *freezer) holds(token string) bool {
 	if f.frozen.Load() {
 		return token == f.token
 	}
-	return token != "" && token == f.last
+	return f.released(token)
+}
+
+// released reports whether token names the most recently released freeze.
+func (f *freezer) released(token string) bool {
+	last, _ := f.last.Load().(string)
+	return token != "" && token == last
 }
 
 func (f *freezer) thawLocked() error {
@@ -463,6 +503,10 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 			Status    string          `json:"status"`
 			WallClock wallClockStatus `json:"wall_clock"`
 		}{Status: status, WallClock: wc})
+		// Logged only once the workload runs and the supervisor has its answer.
+		if wc.CorrectedMs != 0 {
+			log.Printf("wall clock: corrected by %dms from host time", wc.CorrectedMs)
+		}
 	}
 }
 

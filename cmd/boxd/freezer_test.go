@@ -529,3 +529,47 @@ func TestRefusedSpawnOpensNothing(t *testing.T) {
 			cmd.Stdin, cmd.Stdout, cmd.Stderr, placed.r, placed.w)
 	}
 }
+
+// The freeze budget covers waiting for a spawn in flight: the freeze gives
+// up on time, touches nothing, and its token counts as released once the
+// spawn finishes, so the supervisor's follow-up thaw is answered as done.
+func TestFreezeBudgetCoversTheSpawnGuard(t *testing.T) {
+	fs := newFake()
+	fz := newFreezer(fs, testDir)
+	if err := fz.beginSpawn(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(bg(), 30*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := fz.freeze(ctx, "t1")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("freeze under a held guard: %v, want the budget to expire", err)
+	}
+	if waited := time.Since(start); waited > 500*time.Millisecond {
+		t.Fatalf("freeze waited %v for the guard, past its budget", waited)
+	}
+	if st, _ := fs.readState(); st != "THAWED" || fz.isFrozen() {
+		t.Fatalf("abandoned freeze touched the cgroup: state=%q frozen=%v", st, fz.isFrozen())
+	}
+	fz.endSpawn()
+	if err := fz.thaw("t1"); err != nil {
+		t.Fatalf("follow-up thaw of the abandoned token: %v", err)
+	}
+	if err := fz.thaw("t2"); !errors.Is(err, errTokenMismatch) {
+		t.Fatalf("thaw of an unknown token: %v, want errTokenMismatch", err)
+	}
+
+	// A budget already spent when the guard frees never writes FROZEN.
+	spent, cancel := context.WithCancel(bg())
+	cancel()
+	if err := fz.freeze(spent, "t3"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("freeze with a spent budget: %v", err)
+	}
+	if st, _ := fs.readState(); st != "THAWED" {
+		t.Fatalf("spent budget still wrote the cgroup: state=%q", st)
+	}
+	if err := fz.thaw("t3"); err != nil {
+		t.Fatalf("follow-up thaw after a spent budget: %v", err)
+	}
+}
