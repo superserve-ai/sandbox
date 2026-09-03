@@ -2,8 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"math"
 	"net/http"
 	"strconv"
@@ -188,13 +186,7 @@ func RateLimit(ctx context.Context, cfg RateLimitConfig) gin.HandlerFunc {
 	limiter.startCleanup(ctx, cfg)
 
 	return func(c *gin.Context) {
-		key := "ip:unverified"
-		if ip := clientIP(c); ip != "" {
-			key = "ip:" + ip
-		} else if apiKey := c.GetHeader("X-API-Key"); apiKey != "" {
-			hash := sha256.Sum256([]byte(apiKey))
-			key = "api-key:" + hex.EncodeToString(hash[:])
-		}
+		key := preAuthLimiterKey(c)
 		if enforceLimit(c, limiter.get(key), cfg) {
 			c.Next()
 		}
@@ -223,16 +215,21 @@ func TeamRateLimit(ctx context.Context, cfg RateLimitConfig) gin.HandlerFunc {
 			}
 		}
 		if key == "" {
-			key = "ip:unverified"
-			if ip := clientIP(c); ip != "" {
-				key = "ip:" + ip
-			} else if apiKey := c.GetHeader("X-API-Key"); apiKey != "" {
-				hash := sha256.Sum256([]byte(apiKey))
-				key = "api-key:" + hex.EncodeToString(hash[:])
-			}
+			key = preAuthLimiterKey(c)
 		}
 		if enforceLimit(c, limiter.get(key), cfg) {
 			c.Next()
 		}
 	}
+}
+
+// preAuthLimiterKey returns the only identity trusted before authentication.
+// When verified client IP is unavailable, all pre-auth traffic intentionally
+// shares one bounded degraded bucket; never key this limiter from X-API-Key or
+// another unauthenticated header, which would let attackers manufacture keys.
+func preAuthLimiterKey(c *gin.Context) string {
+	if ip := clientIP(c); ip != "" {
+		return "ip:" + ip
+	}
+	return "ip:unverified"
 }
