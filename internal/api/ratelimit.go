@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"math"
 	"net/http"
 	"strconv"
@@ -186,7 +188,13 @@ func RateLimit(ctx context.Context, cfg RateLimitConfig) gin.HandlerFunc {
 	limiter.startCleanup(ctx, cfg)
 
 	return func(c *gin.Context) {
-		key := clientIP(c)
+		key := "ip:unverified"
+		if ip := clientIP(c); ip != "" {
+			key = "ip:" + ip
+		} else if apiKey := c.GetHeader("X-API-Key"); apiKey != "" {
+			hash := sha256.Sum256([]byte(apiKey))
+			key = "api-key:" + hex.EncodeToString(hash[:])
+		}
 		if enforceLimit(c, limiter.get(key), cfg) {
 			c.Next()
 		}
@@ -215,7 +223,13 @@ func TeamRateLimit(ctx context.Context, cfg RateLimitConfig) gin.HandlerFunc {
 			}
 		}
 		if key == "" {
-			key = "ip:" + clientIP(c)
+			key = "ip:unverified"
+			if ip := clientIP(c); ip != "" {
+				key = "ip:" + ip
+			} else if apiKey := c.GetHeader("X-API-Key"); apiKey != "" {
+				hash := sha256.Sum256([]byte(apiKey))
+				key = "api-key:" + hex.EncodeToString(hash[:])
+			}
 		}
 		if enforceLimit(c, limiter.get(key), cfg) {
 			c.Next()

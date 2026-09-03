@@ -28,7 +28,9 @@ func TestResolveClientIP(t *testing.T) {
 			if tc.xff != "" {
 				r.Header.Set("X-Forwarded-For", tc.xff)
 			}
-			if got := resolveClientIP(r, map[string]string{"valid": "198.51.100.7", "attacker prefixed": "198.51.100.7", "ipv6": "2001:db8::7", "public peer spoof": "198.51.100.7", "direct run app": "198.51.100.7", "no xff": "198.51.100.7", "wrong lb": "198.51.100.7", "malformed": "198.51.100.7"}[tc.name]); got != tc.want {
+			got, verified := resolveClientIP(r, map[string]string{"valid": "198.51.100.7", "attacker prefixed": "198.51.100.7", "ipv6": "2001:db8::7", "public peer spoof": "198.51.100.7", "direct run app": "198.51.100.7", "no xff": "198.51.100.7", "wrong lb": "198.51.100.7", "malformed": "198.51.100.7"}[tc.name])
+			wantVerified := tc.name == "valid" || tc.name == "attacker prefixed" || tc.name == "ipv6"
+			if got != tc.want || verified != wantVerified {
 				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})

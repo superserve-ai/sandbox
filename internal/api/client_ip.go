@@ -10,14 +10,14 @@ import (
 
 const clientIPContextKey = "verified_client_ip"
 
-func resolveClientIP(r *http.Request, forwardingRuleIP string) string {
+func resolveClientIP(r *http.Request, forwardingRuleIP string) (string, bool) {
 	remote := r.RemoteAddr
 	if host, _, err := net.SplitHostPort(remote); err == nil {
 		remote = host
 	}
 	remoteIP := net.ParseIP(strings.TrimSpace(remote))
 	if remoteIP == nil || forwardingRuleIP == "" {
-		return remote
+		return remote, false
 	}
 	// Cloud Run's direct service hostname is not an LB ingress path and must
 	// never be allowed to self-assert the forwarding-rule suffix. For
@@ -26,24 +26,24 @@ func resolveClientIP(r *http.Request, forwardingRuleIP string) string {
 	// 1.1 google; the backend hop's RemoteAddr is not documented as private
 	// for serverless NEGs.
 	if strings.HasSuffix(strings.ToLower(r.Host), ".run.app") {
-		return remote
+		return remote, false
 	}
 	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("Via")), "1.1 google") {
-		return remote
+		return remote, false
 	}
 	lb := net.ParseIP(strings.TrimSpace(forwardingRuleIP))
 	if lb == nil {
-		return remote
+		return remote, false
 	}
 	parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
 	if len(parts) < 2 {
-		return remote
+		return remote, false
 	}
 	client, terminal := net.ParseIP(strings.TrimSpace(parts[len(parts)-2])), net.ParseIP(strings.TrimSpace(parts[len(parts)-1]))
 	if client == nil || terminal == nil || !terminal.Equal(lb) {
-		return remote
+		return remote, false
 	}
-	return client.String()
+	return client.String(), true
 }
 
 func clientIP(c *gin.Context) string {
@@ -52,12 +52,14 @@ func clientIP(c *gin.Context) string {
 			return ip
 		}
 	}
-	return resolveClientIP(c.Request, "")
+	return ""
 }
 
 func verifiedClientIPMiddleware(forwardingRuleIP string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Set(clientIPContextKey, resolveClientIP(c.Request, forwardingRuleIP))
+		if ip, verified := resolveClientIP(c.Request, forwardingRuleIP); verified {
+			c.Set(clientIPContextKey, ip)
+		}
 		c.Next()
 	}
 }
