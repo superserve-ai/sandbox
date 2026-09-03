@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -8,7 +9,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // WallClockManifest sits beside a memory image and says what a supervisor may
@@ -38,10 +44,10 @@ const WallClockManifestVersion = 1
 const WakeProtocolCapability = "wake-protocol-1"
 
 // wakeProtocolEvidencePath is written the first time this daemon reads a
-// manifest: this host has restored or paused an image that only a vmd with
-// the wake protocol can handle, and the host-resident guard refuses any other
-// from then on. Best-effort and once; a host without the directory is not a
-// fleet host.
+// manifest — on restore, on pause, or in the templates it holds: this host has
+// images only a vmd with the wake protocol can handle, and the host-resident
+// guard refuses any other from then on. Best-effort and once; a host without
+// the directory is not a fleet host.
 var wakeProtocolEvidencePath = "/var/lib/sandbox/wake-protocol-evidence"
 
 var wakeProtocolEvidenceOnce sync.Once
@@ -147,4 +153,49 @@ func imageManifest(memPath, basePath string) (*WallClockManifest, error) {
 		return m, err
 	}
 	return ReadWallClockManifest(basePath)
+}
+
+// WatchTemplateManifests keeps the wake-protocol evidence in step with the
+// templates this host holds. Templates are seeded while the daemon runs, so
+// the first frozen one to land is what raises the rollback floor here — no
+// restore has to happen first, and nothing is configured anywhere. A
+// directory listing every few minutes, off every request path.
+func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger) {
+	if m.cfg.SnapshotDir == "" {
+		return
+	}
+	scan := func() {
+		if n := m.scanTemplateManifests(); n > 0 && !wakeProtocolEvidenceLogged.Swap(true) {
+			log.Info().Int("templates", n).Msg("this host holds images that owe a wake; a vmd without the wake protocol is refused from now on")
+		}
+	}
+	go func() {
+		scan()
+		t := time.NewTicker(firecrackerCapabilityRefreshInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				scan()
+			}
+		}
+	}()
+}
+
+var wakeProtocolEvidenceLogged atomic.Bool
+
+// scanTemplateManifests reads every template manifest under the snapshot
+// directory (which records the evidence as a side effect) and returns how
+// many it found.
+func (m *Manager) scanTemplateManifests() int {
+	matches, _ := filepath.Glob(filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, "*", "*"+clockFreezeMarkerSuffix))
+	n := 0
+	for _, path := range matches {
+		if man, err := ReadWallClockManifest(strings.TrimSuffix(path, clockFreezeMarkerSuffix)); err == nil && man != nil {
+			n++
+		}
+	}
+	return n
 }

@@ -199,9 +199,6 @@ def main() -> int:
     # Empty = skip, so a fleet-wide deploy never writes a redirect to a host
     # whose resolver isn't on this port. Set per host/region to match unbound.
     dns_redirect_port = os.environ.get("VMD_DNS_REDIRECT_PORT", "")
-    # Capability the fleet must not fall below once frozen images exist
-    # anywhere (they move between hosts). Empty means no floor.
-    protocol_floor = os.environ.get("VMD_PROTOCOL_FLOOR", "")
 
     # Pre-quote every value injected into the remote shell script. These come
     # from CI secrets / Secret Manager and must be treated as arbitrary text:
@@ -226,7 +223,6 @@ def main() -> int:
     q_cpu_line = shlex.quote(f"CONTROL_PLANE_URL={control_plane_url}")
     q_dns = shlex.quote(dns_redirect_port)
     q_dns_line = shlex.quote(f"VMD_DNS_REDIRECT_PORT={dns_redirect_port}")
-    q_floor = shlex.quote(protocol_floor)
     q_paused_reclaim = shlex.quote(os.environ.get("VMD_PAUSED_NETWORK_RECLAIM", ""))
     q_paused_reclaim_line = shlex.quote(
         f"VMD_PAUSED_NETWORK_RECLAIM={os.environ.get('VMD_PAUSED_NETWORK_RECLAIM', '')}"
@@ -457,21 +453,14 @@ def main() -> int:
                 echo "host drained — proceeding with downgrade"
             fi
 
-            # Wake-protocol floor: authoritative here, at the deploy level, and
-            # recorded on the host so the start guard enforces it against a
-            # rollback by an older script. A host that has itself restored an
-            # image that owes a wake refuses regardless of the floor.
-            if [ -n {q_floor} ] && ! grep -qa {q_floor} {extract_dir}/bin/vmd; then
-                echo "ERROR: incoming vmd lacks {q_floor}; the deploy floor forbids installing it" >&2
-                exit 1
-            fi
+            # Wake-protocol floor: the daemon writes this evidence the first
+            # time it sees an image that owes a wake (restored, paused, or
+            # seeded among the templates), and from then on a vmd without the
+            # protocol would leave such images stopped. Same check as the
+            # host-resident start guard, applied before the binary lands.
             if [ -e /var/lib/sandbox/wake-protocol-evidence ] && ! grep -qa wake-protocol-1 {extract_dir}/bin/vmd; then
-                echo "ERROR: this host has restored images that owe a wake; refusing a vmd without the wake protocol" >&2
+                echo "ERROR: this host holds images that owe a wake; refusing a vmd without the wake protocol" >&2
                 exit 1
-            fi
-            if [ -n {q_floor} ]; then
-                sudo install -d -m 0755 /etc/sandbox
-                echo {q_floor} | sudo tee /etc/sandbox/wake-protocol-floor > /dev/null
             fi
 
             # Install vmd + template-builder binaries.

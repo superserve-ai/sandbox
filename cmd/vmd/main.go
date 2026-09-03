@@ -1573,6 +1573,7 @@ func main() {
 	// wrong, and corrected by the next probe. Blocking readiness on an exec to
 	// close that window would cost every restart more than it saves.
 	mgr.WatchFirecrackerCapability(ctx, log)
+	mgr.WatchTemplateManifests(ctx, log)
 
 	// ---- Background full reattach ----
 	// Off the critical path (requests load their VM on demand); proactively

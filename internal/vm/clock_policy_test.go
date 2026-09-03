@@ -543,3 +543,32 @@ func TestReadingAManifestLeavesWakeProtocolEvidence(t *testing.T) {
 		t.Fatalf("evidence = %q, %v; want the capability name", b, err)
 	}
 }
+
+// Templates seeded on this host are evidence too: the first frozen one to
+// land raises the rollback floor without a restore having happened.
+func TestTemplateManifestsLeaveEvidence(t *testing.T) {
+	dir := t.TempDir()
+	orig := wakeProtocolEvidencePath
+	wakeProtocolEvidencePath = filepath.Join(dir, "evidence")
+	wakeProtocolEvidenceOnce = sync.Once{}
+	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceOnce = sync.Once{} })
+
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
+	if n := m.scanTemplateManifests(); n != 0 {
+		t.Fatalf("found %d manifests in an empty tree", n)
+	}
+	if _, err := os.Stat(wakeProtocolEvidencePath); !os.IsNotExist(err) {
+		t.Fatal("no templates is not evidence")
+	}
+	tpl := filepath.Join(dir, TemplatesDirName, "tpl")
+	if err := os.MkdirAll(tpl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seedFrozenManifest(t, filepath.Join(tpl, "mem.snap"), "tok")
+	if n := m.scanTemplateManifests(); n != 1 {
+		t.Fatalf("found %d manifests, want 1", n)
+	}
+	if _, err := os.Stat(wakeProtocolEvidencePath); err != nil {
+		t.Fatalf("evidence not written after a frozen template landed: %v", err)
+	}
+}

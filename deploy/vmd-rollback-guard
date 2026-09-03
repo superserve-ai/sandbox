@@ -17,18 +17,15 @@ BIN="${1:-/usr/local/bin/vmd}"
 
 # Wake-protocol floor. An image whose workload was frozen for its snapshot
 # owes a wake that only a vmd speaking the protocol can give; any other vmd
-# restores it and leaves it stopped. Two pieces of evidence, either blocks:
-# this host has read such an image's manifest (written by the daemon), or the
-# deploy pipeline installed the floor because frozen images exist somewhere
-# in the fleet and they move between hosts.
+# restores it and leaves it stopped. The daemon writes the evidence file the
+# first time it sees such an image's manifest — restored, paused, or seeded
+# among this host's templates — so the floor rises on its own and only when
+# there is something to protect.
 WAKE_EVIDENCE=/var/lib/sandbox/wake-protocol-evidence
-WAKE_FLOOR=/etc/sandbox/wake-protocol-floor
-if ! grep -qa wake-protocol-1 "$BIN" 2>/dev/null; then
-    if [ -e "$WAKE_EVIDENCE" ] || [ -e "$WAKE_FLOOR" ]; then
-        echo "vmd-rollback-guard: REFUSING to start a vmd without the wake protocol: images that owe a wake exist (${WAKE_EVIDENCE} or ${WAKE_FLOOR} present)" >&2
-        echo "vmd-rollback-guard: deploy a wake-capable build; the floor comes down only by removing both files once no frozen image can be restored here" >&2
-        exit 1
-    fi
+if [ -e "$WAKE_EVIDENCE" ] && ! grep -qa wake-protocol-1 "$BIN" 2>/dev/null; then
+    echo "vmd-rollback-guard: REFUSING to start a vmd without the wake protocol: this host holds images that owe a wake (${WAKE_EVIDENCE})" >&2
+    echo "vmd-rollback-guard: deploy a wake-capable build; remove ${WAKE_EVIDENCE} only once no frozen image can be restored here" >&2
+    exit 1
 fi
 
 # The capable vmd records its RESOLVED state path at a fixed location at
