@@ -13,6 +13,20 @@ func StartAbuseEnforcementTelemetry(ctx context.Context, cache *abuseEnforcement
 		return
 	}
 	go func() {
+		record := func() {
+			s := cache.Stats()
+			level := ""
+			if s.AdmissionRejections > 0 || s.CapacityEvictions > 0 || s.Utilization >= .9 {
+				level = "critical"
+			} else if s.Utilization >= .7 {
+				level = "high"
+			}
+			currentTelemetryRecorder().RecordAbuseEnforcementStats(ctx, telemetry.AbuseEnforcementStats{
+				DenyEntries: int64(s.DenyEntries), DenyCapacity: int64(s.DenyCapacity), TrustedTeams: int64(s.TrustedTeams),
+				Utilization: s.Utilization, TTLEvictions: s.TTLEvictions, CapacityEvictions: s.CapacityEvictions, AdmissionRejections: s.AdmissionRejections, AlertLevel: level,
+			})
+		}
+		record()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -20,17 +34,7 @@ func StartAbuseEnforcementTelemetry(ctx context.Context, cache *abuseEnforcement
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s := cache.Stats()
-				level := ""
-				if s.AdmissionRejections > 0 || s.CapacityEvictions > 0 || s.Utilization >= .9 {
-					level = "critical"
-				} else if s.Utilization >= .7 {
-					level = "high"
-				}
-				currentTelemetryRecorder().RecordAbuseEnforcementStats(ctx, telemetry.AbuseEnforcementStats{
-					DenyEntries: int64(s.DenyEntries), DenyCapacity: int64(s.DenyCapacity), TrustedTeams: int64(s.TrustedTeams),
-					Utilization: s.Utilization, TTLEvictions: s.TTLEvictions, CapacityEvictions: s.CapacityEvictions, AdmissionRejections: s.AdmissionRejections, AlertLevel: level,
-				})
+				record()
 			}
 		}
 	}()

@@ -106,7 +106,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		lookup := func(qctx context.Context) (apiKeyCacheEntry, error) {
 			var e apiKeyCacheEntry
 			err := pool.QueryRow(qctx,
-				"SELECT ak.id, ak.team_id, ak.name, ak.scopes, ak.created_by, ak.expires_at, p.email, p.provider, EXISTS (SELECT 1 FROM abuse_trusted_identities ati WHERE lower(ati.auth_provider) = lower(p.provider) AND lower(ati.domain) = lower(split_part(p.email, '@', 2)) AND ati.revoked_at IS NULL) FROM api_key ak LEFT JOIN profile p ON p.id = ak.created_by WHERE ak.key_hash = $1 AND ak.revoked_at IS NULL AND (ak.expires_at IS NULL OR ak.expires_at > now())",
+				"SELECT ak.id, ak.team_id, ak.name, ak.scopes, ak.created_by, ak.expires_at, p.email, p.provider, EXISTS (SELECT 1 FROM abuse_trusted_identities ati WHERE ati.auth_provider = lower(p.provider) AND ati.domain = lower(split_part(p.email, '@', 2)) AND ati.revoked_at IS NULL) FROM api_key ak LEFT JOIN profile p ON p.id = ak.created_by WHERE ak.key_hash = $1 AND ak.revoked_at IS NULL AND (ak.expires_at IS NULL OR ak.expires_at > now())",
 				keyHash,
 			).Scan(&e.id, &e.teamID, &e.name, &e.scopes, &e.createdBy, &e.expiresAt, &e.identityDomain, &e.authProvider, &e.trustedIdentity)
 			if err != nil {
