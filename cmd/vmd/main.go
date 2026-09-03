@@ -561,8 +561,11 @@ func main() {
 		switch os.Args[1] {
 		case "capabilities":
 			// Advertised so rollback tooling can detect a downgrade to a binary
-			// that lacks cgroup supervision. Env-free by design.
+			// that lacks cgroup supervision, or the wake protocol frozen images
+			// depend on. Env-free by design; the literals are what the deploy
+			// guard greps the binary for, so they must stay verbatim.
 			fmt.Println("cgroup-supervision")
+			fmt.Println(vm.WakeProtocolCapability)
 			return
 		case "drain-check":
 			os.Exit(runDrainCheck())

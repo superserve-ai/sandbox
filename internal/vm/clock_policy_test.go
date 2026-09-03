@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -513,5 +515,31 @@ func seedFrozenManifest(t *testing.T, memPath, token string) {
 	t.Helper()
 	if err := WriteWallClockManifest(memPath, WallClockManifest{Version: WallClockManifestVersion, ArtifactID: "a", WorkloadFrozen: true, GuestCorrectsClock: true, FreezeToken: token}); err != nil {
 		t.Fatalf("seed manifest: %v", err)
+	}
+}
+
+// Reading a manifest is the host's evidence that it has handled an image only
+// a wake-capable vmd can; the guard refuses older binaries from then on.
+func TestReadingAManifestLeavesWakeProtocolEvidence(t *testing.T) {
+	dir := t.TempDir()
+	orig := wakeProtocolEvidencePath
+	wakeProtocolEvidencePath = filepath.Join(dir, "evidence")
+	wakeProtocolEvidenceOnce = sync.Once{}
+	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceOnce = sync.Once{} })
+
+	mem := filepath.Join(dir, "mem.snap")
+	if _, err := ReadWallClockManifest(mem); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(wakeProtocolEvidencePath); !os.IsNotExist(err) {
+		t.Fatal("an absent manifest is not evidence")
+	}
+	seedFrozenManifest(t, mem, "tok")
+	if _, err := ReadWallClockManifest(mem); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(wakeProtocolEvidencePath)
+	if err != nil || strings.TrimSpace(string(b)) != WakeProtocolCapability {
+		t.Fatalf("evidence = %q, %v; want the capability name", b, err)
 	}
 }

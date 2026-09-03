@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // WallClockManifest sits beside a memory image and says what a supervisor may
@@ -31,6 +32,28 @@ type WallClockManifest struct {
 }
 
 const WallClockManifestVersion = 1
+
+// WakeProtocolCapability is the string a vmd that speaks this manifest and its
+// wake protocol carries; rollback tooling greps binaries for it.
+const WakeProtocolCapability = "wake-protocol-1"
+
+// wakeProtocolEvidencePath is written the first time this daemon reads a
+// manifest: this host has restored or paused an image that only a vmd with
+// the wake protocol can handle, and the host-resident guard refuses any other
+// from then on. Best-effort and once; a host without the directory is not a
+// fleet host.
+var wakeProtocolEvidencePath = "/var/lib/sandbox/wake-protocol-evidence"
+
+var wakeProtocolEvidenceOnce sync.Once
+
+func noteWakeProtocolEvidence() {
+	wakeProtocolEvidenceOnce.Do(func() {
+		if _, err := os.Stat(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
+			return
+		}
+		_ = os.WriteFile(wakeProtocolEvidencePath, []byte(WakeProtocolCapability+"\n"), 0o644)
+	})
+}
 
 var ErrWallClockManifest = errors.New("wall-clock manifest unreadable")
 
@@ -65,6 +88,7 @@ func ReadWallClockManifest(memPath string) (*WallClockManifest, error) {
 	if m.WorkloadFrozen && m.FreezeToken == "" {
 		return nil, fmt.Errorf("%w: %s: frozen workload without a freeze token", ErrWallClockManifest, WallClockMarkerPath(memPath))
 	}
+	noteWakeProtocolEvidence()
 	return &m, nil
 }
 
