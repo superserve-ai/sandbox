@@ -1826,12 +1826,10 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		}
 	}
 
-	// A resume reads the manifest beside THIS image. Only the write lands here:
-	// the unsafe direction was already handled above, before the image existed.
-	// A frozen workload without its manifest could be restored on another host
-	// with nothing owing it a wake, so that write failure fails the pause (the
-	// deferred thaw releases the guest); an unfrozen image just loses the cached
-	// capability, which the record still carries.
+	// The manifest lands only after the image exists; the stale one was cleared
+	// before. A frozen workload without its manifest could be restored elsewhere
+	// with nothing owing it a wake, so that write failure fails the pause; an
+	// unfrozen image only loses a cache the record still carries.
 	if correctsWallClock {
 		man := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: NewArtifactID(), WorkloadFrozen: guestFrozen, GuestCorrectsClock: true}
 		if guestFrozen {
@@ -3475,17 +3473,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// so an older binary does not erase it; and per attempt, since a relaunch
 		// after an uncorrectable clock finds the host latched.
 		clockPolicy := m.clockPolicyFor(restoreCorrectsWallClock)
-		// Running goes durable BEFORE the load can run the vCPUs, overlapped
-		// with the launch rather than the wake: a crash after the load must
-		// find a record that owes a wake, or recovery could adopt an older
-		// verified record over a guest whose workload is still frozen.
-		// Readiness is still verified below and still fails the restore; the
-		// control plane hands out no usable sandbox until this RPC returns.
-		// This deliberately adopts the resume path's weaker guarantee — resume
-		// has always published Running before readiness. The status is set
-		// directly: setStatus would persist synchronously, on the launch path.
-		// The mode is the launch's expected choice; a launch that lands in
-		// another re-persists before anything can outlive it.
 		predictedSupervision := SupervisionUnit
 		if m.cgroupLaunch(existingSupervision) {
 			predictedSupervision = SupervisionCgroup
@@ -3498,8 +3485,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.FreezeToken = restoreToken
 		inst.mu.Unlock()
 		// Only a frozen image owes a wake, so only then must the record say so
-		// before the vCPUs can run. An unfrozen image keeps the older ordering
-		// below, unchanged.
+		// before the vCPUs can run (see persistWakeOwed). An unfrozen image
+		// keeps the older ordering below, unchanged.
 		var joinWakeOwed func(Supervision) bool
 		if restoreCorrectsWallClock {
 			joinWakeOwed = m.persistWakeOwed(inst, predictedSupervision, clockPolicy != nil)
@@ -3699,11 +3686,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		restoreErr = attemptErr
 
 		if restoreErr == nil {
-			// An unfrozen image publishes Running after the load, with the
-			// write overlapping the readiness wait. The window is not routable —
-			// the control plane hands out no usable sandbox until this RPC
-			// returns — and a crash here leaves an unverified record, which
-			// adoption re-verifies before trusting.
+			// An unfrozen image publishes Running after the load, the write
+			// overlapping the readiness wait; a crash here leaves an unverified
+			// record, which adoption re-verifies before trusting.
 			var persistDone chan struct{}
 			if !restoreCorrectsWallClock {
 				inst.mu.Lock()
