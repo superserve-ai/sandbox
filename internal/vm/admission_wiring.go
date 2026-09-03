@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/admission"
@@ -38,7 +39,14 @@ func (m *Manager) StartAdmission(ctx context.Context) {
 			// rather than duplicated — a second readiness rule would be
 			// one more thing to keep in agreement with the first.
 			if m.PressureReady() {
-				m.reconstructAdmission()
+				if err := m.reconstructAdmission(); err != nil {
+					// Stay closed and come back on the next tick. Refusing
+					// creates for another interval is recoverable; opening
+					// against a ledger we know is incomplete is not.
+					m.log.Error().Err(err).
+						Msg("admission reconstruction failed; gate stays closed, retrying")
+					break
+				}
 				m.admission.Open()
 				m.log.Info().Int("charged", m.admission.Charged()).
 					Msg("host-local admission open")
@@ -55,7 +63,7 @@ func (m *Manager) StartAdmission(ctx context.Context) {
 }
 
 // reconstructAdmission seeds the ledger from everything this host is
-// holding capacity for.
+// holding capacity for, and reports whether it managed to.
 //
 // Persisted records, not live instances: a sandbox paused on this host owns
 // its slot for its whole host-owned lifetime, and it has no live instance to
@@ -63,20 +71,24 @@ func (m *Manager) StartAdmission(ctx context.Context) {
 // the paused sandboxes it is still responsible for, rather than treating a
 // restart as a way to forget them.
 //
-// A store read failure leaves the gate closed. That refuses creates until
-// the next attempt, which is the safe direction: opening on a partial ledger
-// would admit against a count known to be too low.
-func (m *Manager) reconstructAdmission() {
+// The error is the contract. A caller that opened the gate anyway would be
+// opening an empty or partial ledger, which is not a weaker limit but no
+// limit at all — the failure mode this whole gate exists to prevent. Every
+// caller must leave the gate closed and try again.
+//
+// The generation is taken BEFORE the store read and handed back after, so a
+// create admitted while the read was in flight keeps its charge instead of
+// being erased by a snapshot that predates it.
+func (m *Manager) reconstructAdmission() error {
 	if !m.admission.Enabled() {
-		return
+		return nil
 	}
+	since := m.admission.BeginReconstruct()
 	var sandboxIDs []string
 	if m.state != nil {
 		records, err := m.state.All()
 		if err != nil {
-			m.log.Error().Err(err).
-				Msg("admission reconstruction could not read persisted records; gate stays closed")
-			return
+			return fmt.Errorf("read persisted vm records: %w", err)
 		}
 		for _, rec := range records {
 			// Builds are counted from the live registry below. A
@@ -89,7 +101,8 @@ func (m *Manager) reconstructAdmission() {
 			sandboxIDs = append(sandboxIDs, rec.ID)
 		}
 	}
-	m.admission.Reconstruct(sandboxIDs, m.liveBuildIDs())
+	m.admission.Reconstruct(since, sandboxIDs, m.liveBuildIDs())
+	return nil
 }
 
 // liveBuildIDs returns builds whose subprocess may still hold capacity.
@@ -155,27 +168,47 @@ func (m *Manager) auditAdmissionLoop(ctx context.Context) {
 	}
 }
 
-// AuditAdmission compares the gate's ledger against an independently
-// observed sandbox count and closes the gate if the ledger is behind.
+// AuditAdmission re-derives the ledger from the daemon's authoritative
+// state, and treats an undercount as urgent enough to stop admitting first.
 //
-// One-directional, and that is the whole design. The observation is an
-// eventually consistent sample: it can be taken before a just-admitted
-// sandbox materializes, so seeing fewer than the ledger holds is ordinary
-// and must never lower the count. Seeing more means something is running
-// that nothing is charging for — a real correctness bug — and the answer is
-// to stop admitting and rebuild, not to quietly adopt the sample.
+// Two different problems, handled differently:
+//
+// An UNDERCOUNT — more running than charged — means the host may be
+// admitting against a limit it has already exceeded, so the gate closes
+// before the rebuild rather than after. The comparison is one-directional
+// for that decision: capacity pressure is an eventually consistent sample
+// that can be taken before a just-admitted sandbox materializes, so seeing
+// FEWER than the ledger holds is ordinary and must never close the gate.
+//
+// An OVERCOUNT — a token whose work is long gone — is the opposite: it
+// silently shrinks the host until a restart, and no sampled comparison can
+// safely detect it. The unconditional rebuild is what collects those,
+// because it derives the ledger from persisted records and the live build
+// registry rather than adjusting it. That is safe to run while open only
+// because the rebuild is generation-bound: anything admitted while it reads
+// survives, so an in-flight create cannot lose its charge to it.
 func (m *Manager) AuditAdmission() {
 	if !m.admission.Enabled() {
 		return
 	}
 	p := m.CapacityPressure()
 	observed := int(p.RunningSandboxes + p.ProvisioningSandboxes + p.PausedSandboxes)
-	if !m.admission.AuditUndercount(observed) {
+	undercount := m.admission.AuditUndercount(observed)
+	if undercount {
+		m.log.Error().Int("observed", observed).Int("charged", m.admission.Charged()).
+			Msg("admission ledger undercounts live sandboxes; closing gate to rebuild")
+		m.admission.Close()
+	}
+	if err := m.reconstructAdmission(); err != nil {
+		// A failed rebuild leaves the gate however this call found it: still
+		// open when nothing was known to be wrong, and closed when it was.
+		// Reopening on a rebuild that failed would restore service on a
+		// ledger no more trustworthy than the one that triggered this.
+		m.log.Error().Err(err).Bool("undercount", undercount).
+			Msg("admission rebuild failed")
 		return
 	}
-	m.log.Error().Int("observed", observed).Int("charged", m.admission.Charged()).
-		Msg("admission ledger undercounts live sandboxes; closing gate to reconstruct")
-	m.admission.Close()
-	m.reconstructAdmission()
-	m.admission.Open()
+	if undercount {
+		m.admission.Open()
+	}
 }
