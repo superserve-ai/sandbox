@@ -135,6 +135,7 @@ func main() {
 	mux.HandleFunc("/init", handleInit(ctx))
 	clock := newWallClock(newWallClockSource())
 	mux.HandleFunc("/health", handleHealth(clock, fz))
+	mux.HandleFunc("/verify-clock", hostOnly(handleVerifyClock(clock, fz)))
 	mux.HandleFunc("/freeze", hostOnly(fz.handleFreeze))
 	mux.HandleFunc("/thaw", hostOnly(fz.handleThaw))
 	mux.HandleFunc("/wake", hostOnly(handleWake(clock, fz)))
@@ -163,12 +164,14 @@ func main() {
 // one. ?verify=settime proves the clock can be set.
 func handleHealth(clock *wallClock, fz *freezer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		wc := clock.status()
-		if r.URL.Query().Get("verify") == "settime" {
-			wc = clock.verifySet()
+		w.Header().Set("Content-Type", "application/json")
+		if !fz.available() {
+			// No freezer: the answer this endpoint has always given, with
+			// nothing new on the path — no lock, no clock, no encoder.
+			fmt.Fprintf(w, `{"status":"ok"}`)
+			return
 		}
 		status := "ok"
-		w.Header().Set("Content-Type", "application/json")
 		if fz.isFrozen() {
 			// Not ready: a stopped workload must never read as a ready sandbox,
 			// least of all to a supervisor that does not know to send /wake.
@@ -178,7 +181,31 @@ func handleHealth(clock *wallClock, fz *freezer) http.HandlerFunc {
 		json.NewEncoder(w).Encode(struct {
 			Status    string          `json:"status"`
 			WallClock wallClockStatus `json:"wall_clock"`
-		}{Status: status, WallClock: wc})
+		}{Status: status, WallClock: clock.status()})
+	}
+}
+
+// handleVerifyClock proves, for the template builder, that the host clock is
+// readable and the guest may set its own. Supervisor-only, and absent without
+// a freezer: proving the clock is only ever the first half of proving an image
+// can be frozen, and a guest without the cgroup must never be able to have
+// its clock set through this route.
+func handleVerifyClock(clock *wallClock, fz *freezer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !fz.available() {
+			http.Error(w, "no workload freezer in this image", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(struct {
+			Status    string          `json:"status"`
+			WallClock wallClockStatus `json:"wall_clock"`
+		}{Status: "ok", WallClock: clock.verifySet()})
 	}
 }
 
@@ -492,6 +519,14 @@ func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, e
 	return s.startPTY(ctx, cmd, placed, msg, emit, &timedOut)
 }
 
+// reapKilled waits for a child the placement check killed, so it does not
+// linger as a zombie; a child that never started has nothing to reap.
+func reapKilled(cmd *exec.Cmd) {
+	if cmd.Process != nil {
+		_ = cmd.Wait()
+	}
+}
+
 // timeoutExitCode matches GNU coreutils `timeout(1)`.
 const timeoutExitCode int32 = 124
 
@@ -529,14 +564,15 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, placed *pl
 
 	s.freezer.spawnLock()
 	tty, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: cols, Rows: rows})
-	if err == nil {
-		err = s.freezer.confirmPlacement(cmd, placed)
+	if perr := s.freezer.confirmPlacement(cmd, placed); err == nil {
+		err = perr
 	}
 	s.freezer.spawnUnlock()
 	if err != nil {
 		if tty != nil {
 			tty.Close()
 		}
+		reapKilled(cmd)
 		return connect.NewError(connect.CodeInternal, fmt.Errorf("start pty: %w", err))
 	}
 	defer tty.Close()
@@ -615,11 +651,12 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, placed *
 	// a freeze cannot miss the child.
 	s.freezer.spawnLock()
 	err = cmd.Start()
-	if err == nil {
-		err = s.freezer.confirmPlacement(cmd, placed)
+	if perr := s.freezer.confirmPlacement(cmd, placed); err == nil {
+		err = perr
 	}
 	s.freezer.spawnUnlock()
 	if err != nil {
+		reapKilled(cmd)
 		return connect.NewError(connect.CodeInternal, err)
 	}
 

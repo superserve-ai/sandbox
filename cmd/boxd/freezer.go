@@ -140,28 +140,47 @@ func (f *freezer) wrap(name string, args []string) (string, []string, *placement
 	return "/bin/sh", append([]string{"-c", script, name}, args...), &placement{r: r, w: w}
 }
 
-// confirmPlacement waits, under the spawn lock, for the wrapper's report. A
-// process that never reports is killed: it may be running outside the cgroup.
+// close releases both ends; safe on nil and after a partial close.
+func (p *placement) close() {
+	if p == nil {
+		return
+	}
+	if p.w != nil {
+		p.w.Close()
+		p.w = nil
+	}
+	if p.r != nil {
+		p.r.Close()
+		p.r = nil
+	}
+}
+
+// confirmPlacement waits, under the spawn lock, for the wrapper's report, and
+// releases the pipe whatever happened — called after every Start, failed or
+// not. A process that never reports is killed: it may be running outside the
+// cgroup. Without a freezer there is nothing to confirm and nothing to hold.
 func (f *freezer) confirmPlacement(cmd *exec.Cmd, p *placement) error {
 	if !f.available() {
+		p.close()
+		return nil
+	}
+	defer p.close()
+	if cmd.Process == nil {
+		// Start failed: nothing runs, nothing to place.
 		return nil
 	}
 	if p == nil {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
+		_ = cmd.Process.Kill()
 		return errNotPlaced
 	}
 	p.w.Close()
-	defer p.r.Close()
+	p.w = nil
 	_ = p.r.SetReadDeadline(time.Now().Add(2 * time.Second))
 	var b [1]byte
 	if n, err := p.r.Read(b[:]); n == 1 && b[0] == '1' && err == nil {
 		return nil
 	}
-	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
+	_ = cmd.Process.Kill()
 	return errNotPlaced
 }
 

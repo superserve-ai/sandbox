@@ -408,3 +408,47 @@ func TestPlacementIsAcknowledgedBeforeSpawnReturns(t *testing.T) {
 	}
 	_ = cmd.Wait()
 }
+
+// A failed spawn releases the placement pipe, and a child the confirmation
+// killed is reaped rather than left as a zombie.
+func TestFailedSpawnReleasesPlacementAndReapsTheChild(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "freezer.state"), []byte("THAWED\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "cgroup.procs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fz := newFreezer(cgroupFS{dir: dir}, dir)
+
+	// Start fails: nothing to place, both pipe ends closed.
+	name, args, placed := fz.wrap("/nonexistent/binary", nil)
+	cmd := exec.Command(name, args...)
+	cmd.Path = "/nonexistent/binary"
+	placed.attach(cmd)
+	err := cmd.Start()
+	if perr := fz.confirmPlacement(cmd, placed); err == nil {
+		err = perr
+	}
+	if err == nil || placed.r != nil || placed.w != nil {
+		t.Fatalf("err=%v r=%v w=%v; want the start failure with the pipe released", err, placed.r, placed.w)
+	}
+
+	// Placement fails: the child is killed and reaped.
+	name, args, placed = fz.wrap("/bin/sh", []string{"-c", "sleep 30"})
+	cmd = exec.Command(name, args...)
+	placed.attach(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fz.confirmPlacement(cmd, placed); !errors.Is(err, errNotPlaced) {
+		t.Fatalf("err=%v, want errNotPlaced", err)
+	}
+	reapKilled(cmd)
+	if cmd.ProcessState == nil || cmd.ProcessState.Exited() && cmd.ProcessState.Success() {
+		t.Fatalf("child not reaped as killed: %v", cmd.ProcessState)
+	}
+	if placed.r != nil || placed.w != nil {
+		t.Error("pipe not released after a failed placement")
+	}
+}

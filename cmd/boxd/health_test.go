@@ -129,17 +129,53 @@ func TestHealthNeverMutates(t *testing.T) {
 	}
 }
 
-func TestHealthVerifySettime(t *testing.T) {
+func verifyClock(clock *wallClock, fz *freezer) (int, map[string]any) {
+	rec := httptest.NewRecorder()
+	handleVerifyClock(clock, fz)(rec, httptest.NewRequest(http.MethodPost, "/verify-clock", nil))
+	var out map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	return rec.Code, out
+}
+
+// Verification is its own route: it proves the clock can be set, only where a
+// freezer exists, and health never does it.
+func TestVerifyClockIsItsOwnRoute(t *testing.T) {
 	fz := newFreezer(newFake(), testDir)
-	_, body := health(clockUnder(&fakeSource{host: base}, base), fz, "?verify=settime")
+	src := &fakeSource{host: base}
+	code, body := verifyClock(clockUnder(src, base), fz)
 	wc, _ := body["wall_clock"].(map[string]any)
-	if wc["settime_ok"] != true {
-		t.Errorf("settime_ok missing: %v", body)
+	if code != 200 || wc["settime_ok"] != true {
+		t.Errorf("code %d body %v, want proven", code, body)
 	}
-	_, body = health(clockUnder(&fakeSource{host: base, setErr: errors.New("EPERM")}, base), fz, "?verify=settime")
+	denied := &fakeSource{host: base, setErr: errors.New("EPERM")}
+	_, body = verifyClock(clockUnder(denied, base), fz)
 	wc, _ = body["wall_clock"].(map[string]any)
 	if wc["settime_ok"] == true {
 		t.Errorf("settime_ok reported despite EPERM: %v", body)
+	}
+	// Health with a verify query does nothing of the kind.
+	probe := &fakeSource{host: base}
+	if _, body := health(clockUnder(probe, base), fz, "?verify=settime"); probe.setTo != nil {
+		t.Errorf("health set the clock: %v", body)
+	}
+	// No freezer: the route does not exist for this image.
+	missing := newFake()
+	missing.missing = true
+	if code, _ := verifyClock(clockUnder(&fakeSource{host: base}, base), newFreezer(missing, testDir)); code != http.StatusNotFound {
+		t.Errorf("without a freezer: code %d, want 404", code)
+	}
+}
+
+// Without a freezer, health is the answer it has always been: the legacy
+// body, no lock, no clock, no larger encoding.
+func TestHealthWithoutFreezerIsLegacy(t *testing.T) {
+	missing := newFake()
+	missing.missing = true
+	fz := newFreezer(missing, testDir)
+	rec := httptest.NewRecorder()
+	handleHealth(clockUnder(&fakeSource{hostErr: errors.New("no ptp")}, base), fz)(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != 200 || rec.Body.String() != `{"status":"ok"}` {
+		t.Fatalf("code %d body %q, want the legacy body exactly", rec.Code, rec.Body.String())
 	}
 }
 
