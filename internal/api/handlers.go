@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -48,6 +49,9 @@ type abuseDecisionLog struct {
 }
 
 var abuseDecisionLogs = make(chan abuseDecisionLog, 256)
+var lastAbuseDecisionLog atomic.Int64
+
+const abuseDecisionLogInterval = 10 * time.Second
 
 func init() {
 	go func() {
@@ -63,6 +67,11 @@ func init() {
 }
 
 func enqueueAbuseDecisionLog(event abuseDecisionLog) {
+	now := time.Now().UnixNano()
+	last := lastAbuseDecisionLog.Load()
+	if now-last < abuseDecisionLogInterval.Nanoseconds() || !lastAbuseDecisionLog.CompareAndSwap(last, now) {
+		return
+	}
 	select {
 	case abuseDecisionLogs <- event:
 	default:
