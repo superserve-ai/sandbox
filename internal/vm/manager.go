@@ -725,6 +725,9 @@ type Manager struct {
 	// m.vms until the startup pool completes it. See queuePendingWake.
 	pendingWakeMu sync.Mutex
 	pendingWakes  map[string]*pendingWake
+	// reattachDeferred marks ids whose startup reattach was left to the
+	// request holding their lifecycle lock; see reattachByID.
+	reattachDeferred sync.Map
 	// dirtyTrackingSessionCapable is the same probe for the guarded-session
 	// fields, demoted on the first refusal exactly like the clock flag.
 	dirtyTrackingSessionCapable atomic.Bool
@@ -5147,6 +5150,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			unlock, ok := m.tryLockVMOp(inst.ID)
 			if !ok {
 				log.Info().Msg("reattach: a request holds this VM's lock; leaving its owed wake to that request")
+				m.reattachDeferred.Store(inst.ID, struct{}{})
 				return nil, false
 			}
 			m.queuePendingWake(inst, unlock)
@@ -5255,7 +5259,7 @@ func (m *Manager) reattachByID(vmID string, cleanupStale bool) *VMInstance {
 	if m.state == nil {
 		return nil
 	}
-	v, _, _ := m.reattachSF.Do(vmID, func() (any, error) {
+	v, err, _ := m.reattachSF.Do(vmID, func() (any, error) {
 		m.mu.RLock()
 		inst, ok := m.vms[vmID]
 		m.mu.RUnlock()
@@ -5274,11 +5278,34 @@ func (m *Manager) reattachByID(vmID string, cleanupStale bool) *VMInstance {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		got, _ := m.reattachRecord(ctx, *rec, cleanupStale)
+		if got == nil {
+			if _, deferred := m.reattachDeferred.LoadAndDelete(vmID); deferred {
+				return (*VMInstance)(nil), errReattachDeferred
+			}
+		}
 		return got, nil
 	})
+	if errors.Is(err, errReattachDeferred) && !cleanupStale {
+		// The startup pass found this VM's lifecycle lock held and left its
+		// owed wake to whoever holds it — which is a caller that joined this
+		// very flight. That caller must not read the deferral as "no such
+		// VM": it performs the reattach itself, completing the wake inline.
+		rec, gerr := m.state.Get(vmID)
+		if gerr != nil || rec == nil {
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), boxdResumeReadyBudget+5*time.Second)
+		defer cancel()
+		got, _ := m.reattachRecord(ctx, *rec, false)
+		return got
+	}
 	inst, _ := v.(*VMInstance)
 	return inst
 }
+
+// errReattachDeferred: the startup pass left a VM's owed wake to the request
+// holding its lifecycle lock. See reattachByID.
+var errReattachDeferred = errors.New("reattach deferred to the lifecycle lock holder")
 
 // SweepStartupOrphanNamespaces removes host network namespaces (ns-N / veth-N)
 // that no live BoltDB record claims — leaked by crashed template builds or a

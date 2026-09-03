@@ -573,6 +573,32 @@ func TestTemplateManifestsLeaveEvidence(t *testing.T) {
 	}
 }
 
+// Starting the daemon recognises evidence and never creates it: with both
+// switches off the floor must stay down, or the daemon could not be rolled back.
+func TestStartupRecognisesButNeverRaisesTheFloor(t *testing.T) {
+	dir := t.TempDir()
+	orig := wakeProtocolEvidencePath
+	wakeProtocolEvidencePath = filepath.Join(dir, "evidence")
+	wakeProtocolEvidenceDone.Store(false)
+	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceDone.Store(false) })
+	m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.WatchTemplateManifests(ctx, zerolog.Nop())
+	cancel()
+	if recognizeWakeProtocolFloor() {
+		t.Fatal("floor raised by a daemon that holds no frozen image")
+	}
+	if _, err := os.Stat(wakeProtocolEvidencePath); !os.IsNotExist(err) {
+		t.Fatal("startup created evidence")
+	}
+	if err := os.WriteFile(wakeProtocolEvidencePath, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !recognizeWakeProtocolFloor() {
+		t.Fatal("existing evidence not recognised")
+	}
+}
+
 // Evidence already on disk satisfies the floor without rewriting it.
 func TestExistingWakeProtocolEvidenceNeedsNoWrite(t *testing.T) {
 	dir := t.TempDir()

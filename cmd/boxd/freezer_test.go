@@ -329,3 +329,26 @@ func TestNilFreezerIsANoOp(t *testing.T) {
 		t.Error("freeze on nil must be refused")
 	}
 }
+
+// A freeze that ran out of budget was rolled back by boxd itself; the
+// supervisor's follow-up thaw with the same token must succeed, or a normal
+// timeout turns into a failed pause.
+func TestTimedOutFreezeAcceptsItsOwnThaw(t *testing.T) {
+	cg := newFake()
+	cg.neverDone = true
+	fz := newFreezer(cg, testDir)
+	ctx, cancel := context.WithTimeout(bg(), 20*time.Millisecond)
+	defer cancel()
+	if err := fz.freeze(ctx, "t1"); err == nil {
+		t.Fatal("freeze must report the timeout")
+	}
+	if fz.isFrozen() {
+		t.Fatal("not rolled back")
+	}
+	if err := fz.thaw("t1"); err != nil {
+		t.Fatalf("follow-up thaw with the timed-out freeze's token: %v", err)
+	}
+	if err := fz.thaw("t2"); err == nil {
+		t.Fatal("a different token must still be refused")
+	}
+}

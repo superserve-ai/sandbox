@@ -142,7 +142,7 @@ func (f *freezer) freeze(ctx context.Context, token string) error {
 	for {
 		st, err := f.fs.readState()
 		if err != nil {
-			return f.undo(fmt.Errorf("read freezer state: %w", err))
+			return f.undo(token, fmt.Errorf("read freezer state: %w", err))
 		}
 		if st == "FROZEN" {
 			f.frozen.Store(true)
@@ -151,17 +151,21 @@ func (f *freezer) freeze(ctx context.Context, token string) error {
 		}
 		select {
 		case <-ctx.Done():
-			return f.undo(fmt.Errorf("workload did not freeze within budget (state %q): %w", st, ctx.Err()))
+			return f.undo(token, fmt.Errorf("workload did not freeze within budget (state %q): %w", st, ctx.Err()))
 		case <-time.After(interval):
 		}
 		interval = min(interval*2, 10*time.Millisecond)
 	}
 }
 
-func (f *freezer) undo(cause error) error {
+// undo rolls back a freeze that did not complete. The token is remembered as
+// released, so the supervisor's own follow-up thaw with it is answered as
+// already done rather than refused.
+func (f *freezer) undo(token string, cause error) error {
 	if terr := f.thawLocked(); terr != nil {
 		return fmt.Errorf("%w; %w: %v", cause, errThawUnconfirmed, terr)
 	}
+	f.last, f.token = token, ""
 	return cause
 }
 

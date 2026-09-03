@@ -1042,3 +1042,65 @@ func useTempFloor(t *testing.T) {
 	wakeProtocolEvidenceDone.Store(false)
 	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceDone.Store(false) })
 }
+
+// The eager pass and a request share one flight per VM. When the pass finds
+// the request holding the lifecycle lock and leaves the wake to it, the
+// request must not read that as "no such VM": it reattaches itself.
+func TestRequestJoiningADeferredStartupFlightReattachesItself(t *testing.T) {
+	origWake, origHook := boxdWakeGuest, reattachHook
+	t.Cleanup(func() { boxdWakeGuest, reattachHook = origWake, origHook })
+	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return nil }
+
+	dir := t.TempDir()
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	socket := filepath.Join(dir, "firecracker.sock")
+	if err := os.WriteFile(socket, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", Supervision: SupervisionUnit, IP: "10.0.0.2", SocketPath: socket}); err != nil {
+		t.Fatal(err)
+	}
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false }
+	t.Cleanup(func() { vmUnitFullyDown = origDown })
+	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
+
+	// The request holds the lock, as restore and resume do before reattaching.
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	// Hold the eager flight open at its start until the request has joined it.
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	reattachHook = func(string) { once.Do(func() { close(started); <-release }) }
+	eager := make(chan *VMInstance, 1)
+	go func() { eager <- mgr.reattachByID("vm-1", true) }()
+	<-started
+	lazy := make(chan *VMInstance, 1)
+	go func() { lazy <- mgr.reattachByID("vm-1", false) }()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	if got := <-eager; got != nil {
+		t.Fatalf("eager pass published %v over a locked VM", got)
+	}
+	select {
+	case got := <-lazy:
+		if got == nil {
+			t.Fatal("the request read the deferral as a missing VM")
+		}
+		got.mu.RLock()
+		defer got.mu.RUnlock()
+		if got.Status != StatusRunning || got.WakePending {
+			t.Errorf("status=%v wakePending=%v, want woken and Running", got.Status, got.WakePending)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never got its instance")
+	}
+}

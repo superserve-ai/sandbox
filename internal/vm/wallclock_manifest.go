@@ -67,21 +67,28 @@ func noteWakeProtocolEvidence() {
 	_ = ensureWakeProtocolFloor()
 }
 
+// recognizeWakeProtocolFloor notes evidence a previous process made durable.
+// It never writes: only an image that owes a wake raises the floor.
+func recognizeWakeProtocolFloor() bool {
+	if wakeProtocolEvidenceDone.Load() {
+		return true
+	}
+	if st, err := os.Stat(wakeProtocolEvidencePath); err == nil && st.Size() > 0 {
+		wakeProtocolEvidenceDone.Store(true)
+		return true
+	}
+	return false
+}
+
 // ensureWakeProtocolFloor is the form a restore of an image that owes a wake
 // must pass before it launches anything: durable once, then free.
 func ensureWakeProtocolFloor() error {
-	if wakeProtocolEvidenceDone.Load() {
+	if recognizeWakeProtocolFloor() {
 		return nil
 	}
 	wakeProtocolEvidenceMu.Lock()
 	defer wakeProtocolEvidenceMu.Unlock()
-	if wakeProtocolEvidenceDone.Load() {
-		return nil
-	}
-	// Evidence a previous process already made durable satisfies the floor;
-	// only the first genuinely new witness on a host pays the write.
-	if st, err := os.Stat(wakeProtocolEvidencePath); err == nil && st.Size() > 0 {
-		wakeProtocolEvidenceDone.Store(true)
+	if recognizeWakeProtocolFloor() {
 		return nil
 	}
 	if err := RaiseWakeProtocolFloor(); err != nil {
@@ -217,10 +224,12 @@ func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger
 	if m.cfg.SnapshotDir == "" {
 		return
 	}
-	// Before any request: evidence from a previous process is recognised
-	// without a write, so the first frozen operation after a restart pays
-	// nothing.
-	_ = ensureWakeProtocolFloor()
+	// Before any request: evidence a previous process made durable is
+	// recognised, so the first frozen operation after a restart pays nothing.
+	// Only recognised — starting a vmd creates no evidence, or the daemon
+	// would raise the floor on every host with both switches off and block a
+	// rollback of itself.
+	recognizeWakeProtocolFloor()
 	scan := func() {
 		if n := m.scanTemplateManifests(); n > 0 && !wakeProtocolEvidenceLogged.Swap(true) {
 			log.Info().Int("templates", n).Msg("this host holds images that owe a wake; a vmd without the wake protocol is refused from now on")
