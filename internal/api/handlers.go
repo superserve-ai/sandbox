@@ -727,11 +727,18 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			}
 			// The resume returns the post-restore access it pushed to VMD, so
 			// the response reports exactly what the VM enforces.
+			// lookup runs from the auth boundary to here: the row read and any
+			// starting/resuming settle wait above. total is unchanged and
+			// measures the resume work alone, so on this path it excludes
+			// lookup, where the explicit endpoint's total includes it. This
+			// route is not a lifecycle op for the auth middleware, so claiming
+			// the series here silences nothing.
+			tAuth := PhaseStart(c)
 			tResume := time.Now()
 			resumedAccess, ok := h.resumePausedSandbox(c, &sandbox, teamID)
 			// Emitted for failures too — auto-resume totals must not censor.
 			RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
-				map[string]time.Duration{"total": time.Since(tResume)})
+				map[string]time.Duration{"total": time.Since(tResume), "lookup": tResume.Sub(tAuth)})
 			if !ok {
 				return nil, ""
 			}
@@ -1341,14 +1348,22 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	tResume := PhaseStart(c)
 	var sandbox db.Sandbox
+	var tLookupDone time.Time
 	// Registered before ANY return: a resume that burns the whole pausing
 	// settle window and then 409s is among the slowest resume requests and
 	// must land in the total distribution. Transition counts/results come
-	// from the SandboxLifecycleTelemetry middleware; this emits only the
-	// phase-series total. HostID is empty until the row loads.
+	// from the SandboxLifecycleTelemetry middleware; this emits the
+	// phase-series total and lookup. lookup runs from the auth boundary to
+	// the resume claim (auth, the row read, and any pausing-settle wait,
+	// which RecordResumeSettleWait also reports on its own), so lookup +
+	// claim + vmd + post + revert partitions total. HostID is empty until
+	// the row loads.
 	defer func() {
-		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
-			map[string]time.Duration{"total": time.Since(tResume)})
+		phases := map[string]time.Duration{"total": time.Since(tResume)}
+		if !tLookupDone.IsZero() {
+			phases["lookup"] = tLookupDone.Sub(tResume)
+		}
+		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID, phases)
 	}()
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
@@ -1448,6 +1463,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
+	tLookupDone = time.Now()
 	if _, ok := h.resumePausedSandbox(c, &sandbox, teamID); !ok {
 		return
 	}

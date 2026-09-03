@@ -1752,7 +1752,7 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 	}
 }
 
-// A successful resume records claim, vmd, and post alongside the
+// A successful resume records lookup, claim, vmd, and post alongside the
 // caller-owned total, and no revert. The persisted egress rules ride the
 // ResumeInstance request itself, which is what will let the post-boot
 // replay go once the daemon acknowledges applying them.
@@ -1814,7 +1814,7 @@ func TestResumeSandbox_EmitsPhasesAndCarriesRulesInResumeRequest(t *testing.T) {
 			got[p.Phase] = true
 		}
 	}
-	for _, want := range []string{"claim", "vmd", "post", "total"} {
+	for _, want := range []string{"lookup", "claim", "vmd", "post", "total"} {
 		if !got[want] {
 			t.Errorf("resume phase %q not recorded; got %v", want, got)
 		}
