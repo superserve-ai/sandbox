@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1075,14 +1076,20 @@ func TestRequestJoiningADeferredStartupFlightReattachesItself(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	// Hold the eager flight open at its start until the request has joined it.
+	// Hold the eager flight open at its start until the requests have joined
+	// it, counting every reattach that runs.
 	started, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	reattachHook = func(string) { once.Do(func() { close(started); <-release }) }
+	var reattaches atomic.Int32
+	reattachHook = func(string) {
+		reattaches.Add(1)
+		once.Do(func() { close(started); <-release })
+	}
 	eager := make(chan *VMInstance, 1)
 	go func() { eager <- mgr.reattachByID("vm-1", true) }()
 	<-started
-	lazy := make(chan *VMInstance, 1)
+	lazy := make(chan *VMInstance, 2)
+	go func() { lazy <- mgr.reattachByID("vm-1", false) }()
 	go func() { lazy <- mgr.reattachByID("vm-1", false) }()
 	time.Sleep(50 * time.Millisecond)
 	close(release)
@@ -1090,17 +1097,32 @@ func TestRequestJoiningADeferredStartupFlightReattachesItself(t *testing.T) {
 	if got := <-eager; got != nil {
 		t.Fatalf("eager pass published %v over a locked VM", got)
 	}
-	select {
-	case got := <-lazy:
-		if got == nil {
-			t.Fatal("the request read the deferral as a missing VM")
+	var got []*VMInstance
+	for i := 0; i < 2; i++ {
+		select {
+		case inst := <-lazy:
+			got = append(got, inst)
+		case <-time.After(5 * time.Second):
+			t.Fatal("a request never got its instance")
 		}
-		got.mu.RLock()
-		defer got.mu.RUnlock()
-		if got.Status != StatusRunning || got.WakePending {
-			t.Errorf("status=%v wakePending=%v, want woken and Running", got.Status, got.WakePending)
+	}
+	for _, inst := range got {
+		if inst == nil {
+			t.Fatal("a request read the deferral as a missing VM")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the request never got its instance")
+		inst.mu.RLock()
+		st, pending := inst.Status, inst.WakePending
+		inst.mu.RUnlock()
+		if st != StatusRunning || pending {
+			t.Errorf("status=%v wakePending=%v, want woken and Running", st, pending)
+		}
+	}
+	if got[0] != got[1] {
+		t.Error("the two requests got different instances")
+	}
+	// The eager attempt plus exactly one shared recovery: joiners never each
+	// run their own against the same guest.
+	if n := reattaches.Load(); n != 2 {
+		t.Errorf("reattaches = %d, want 2 (eager + one shared retry)", n)
 	}
 }

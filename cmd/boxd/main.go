@@ -463,8 +463,9 @@ func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, e
 		resolvedCmd = p
 	}
 
-	launch, launchArgs := s.freezer.wrap(resolvedCmd, args)
+	launch, launchArgs, placed := s.freezer.wrap(resolvedCmd, args)
 	cmd := exec.CommandContext(cmdCtx, launch, launchArgs...)
+	placed.attach(cmd)
 	cmd.Dir = cwd
 	cmd.Env = childEnv
 	if cred != nil {
@@ -486,9 +487,9 @@ func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, e
 			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		cmd.WaitDelay = time.Second
-		return s.startPipes(ctx, cmd, emit, &timedOut, wantStdin)
+		return s.startPipes(ctx, cmd, placed, emit, &timedOut, wantStdin)
 	}
-	return s.startPTY(ctx, cmd, msg, emit, &timedOut)
+	return s.startPTY(ctx, cmd, placed, msg, emit, &timedOut)
 }
 
 // timeoutExitCode matches GNU coreutils `timeout(1)`.
@@ -514,7 +515,7 @@ func finalExitCode(ps *os.ProcessState, timedOut bool) int32 {
 	return 137
 }
 
-func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.StartRequest, emit eventEmitter, timedOut *atomic.Bool) error {
+func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, placed *placement, msg *pb.StartRequest, emit eventEmitter, timedOut *atomic.Bool) error {
 	cols := uint16(msg.GetPty().GetSize().GetCols())
 	rows := uint16(msg.GetPty().GetSize().GetRows())
 	if cols == 0 {
@@ -528,8 +529,14 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 
 	s.freezer.spawnLock()
 	tty, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: cols, Rows: rows})
+	if err == nil {
+		err = s.freezer.confirmPlacement(cmd, placed)
+	}
 	s.freezer.spawnUnlock()
 	if err != nil {
+		if tty != nil {
+			tty.Close()
+		}
 		return connect.NewError(connect.CodeInternal, fmt.Errorf("start pty: %w", err))
 	}
 	defer tty.Close()
@@ -583,7 +590,7 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 	})
 }
 
-func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eventEmitter, timedOut *atomic.Bool, wantStdin bool) error {
+func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, placed *placement, emit eventEmitter, timedOut *atomic.Bool, wantStdin bool) error {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return connect.NewError(connect.CodeInternal, err)
@@ -604,9 +611,13 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eve
 		}
 	}
 
-	// Spawn lock held across Start() and placement so a freeze cannot miss the child.
+	// Spawn lock held across Start() and the wrapper's placement report, so
+	// a freeze cannot miss the child.
 	s.freezer.spawnLock()
 	err = cmd.Start()
+	if err == nil {
+		err = s.freezer.confirmPlacement(cmd, placed)
+	}
 	s.freezer.spawnUnlock()
 	if err != nil {
 		return connect.NewError(connect.CodeInternal, err)

@@ -102,11 +102,11 @@ func (m *Manager) WatchFirecrackerCapability(ctx context.Context, log zerolog.Lo
 // explicit override, supplying an image this VM was never paused into, has to
 // look, because the record then describes a different artifact. An unreadable
 // manifest is an error the caller must refuse on.
-func imageWorkloadFrozen(memPath, basePath, pausedMemPath string, recordedFrozen *bool, recordedToken string) (frozen bool, token string, err error) {
+func imageWorkloadFrozen(memPath, pausedMemPath string, recordedFrozen *bool, recordedToken string) (frozen bool, token string, err error) {
 	if memPath == pausedMemPath && recordedFrozen != nil {
 		return *recordedFrozen, recordedToken, nil
 	}
-	m, err := imageManifest(memPath, basePath)
+	m, err := imageManifest(memPath)
 	if err != nil || m == nil {
 		return false, "", err
 	}

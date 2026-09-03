@@ -1633,7 +1633,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// go and look, or this pause would delete a marker that is still valid.
 	correctsWallClock := recordedCorrects != nil && *recordedCorrects
 	if recordedCorrects == nil {
-		man, merr := imageManifest(instMemFile, instBaseMem)
+		man, merr := imageManifest(instMemFile)
 		if merr != nil {
 			log.Warn().Err(merr).Msg("pause: wall-clock manifest unreadable; this image will not be frozen")
 		}
@@ -1839,19 +1839,17 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	}
 
 	// The manifest lands only after the image exists; the stale one was cleared
-	// before. A frozen workload without its manifest could be restored elsewhere
-	// with nothing owing it a wake, so that write failure fails the pause; an
-	// unfrozen image only loses a cache the record still carries.
+	// before.
 	if correctsWallClock {
 		man := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: artifactID, WorkloadFrozen: guestFrozen, GuestCorrectsClock: true}
 		if guestFrozen {
 			man.FreezeToken = freezeToken
 		}
+		// Mandatory either way: an overlay that lost its manifest would read
+		// as legacy on another host, and a frozen one would then never be
+		// woken; the deferred thaw releases a frozen guest on this failure.
 		if merr := WriteWallClockManifest(memPath, man); merr != nil {
-			if guestFrozen {
-				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("write wall-clock manifest for frozen image: %w", merr))
-			}
-			log.Warn().Err(merr).Str("path", clockFreezeMarkerPath(memPath)).Msg("pause: wall-clock manifest write failed")
+			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("write wall-clock manifest: %w", merr))
 		}
 	}
 
@@ -2371,7 +2369,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.mu.RLock()
 	recordedFrozen, recordedToken, pausedMemPath, entryUnverified := inst.SnapshotWorkloadFrozen, inst.FreezeToken, inst.MemFilePath, inst.Unverified
 	inst.mu.RUnlock()
-	resumeWorkloadFrozen, resumeToken, merr := imageWorkloadFrozen(memPath, basePath, pausedMemPath, recordedFrozen, recordedToken)
+	resumeWorkloadFrozen, resumeToken, merr := imageWorkloadFrozen(memPath, pausedMemPath, recordedFrozen, recordedToken)
 	if merr != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
 	}
@@ -3295,7 +3293,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// corrects its clock. A manifest this binary cannot trust refuses the
 	// restore here, before anything is launched.
 	sidecarBase, hasSidecar := readLayeredBase(memPath)
-	manifest, merr := imageManifest(memPath, sidecarBase)
+	manifest, merr := imageManifest(memPath)
 	if merr != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
 	}
@@ -5287,17 +5285,23 @@ func (m *Manager) reattachByID(vmID string, cleanupStale bool) *VMInstance {
 	})
 	if errors.Is(err, errReattachDeferred) && !cleanupStale {
 		// The startup pass found this VM's lifecycle lock held and left its
-		// owed wake to whoever holds it — which is a caller that joined this
-		// very flight. That caller must not read the deferral as "no such
-		// VM": it performs the reattach itself, completing the wake inline.
-		rec, gerr := m.state.Get(vmID)
-		if gerr != nil || rec == nil {
-			return nil
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), boxdResumeReadyBudget+5*time.Second)
-		defer cancel()
-		got, _ := m.reattachRecord(ctx, *rec, false)
-		return got
+		// owed wake to whoever holds it — a caller that joined this very
+		// flight. That caller must not read the deferral as "no such VM": it
+		// reattaches itself, completing the wake inline. Through a flight of
+		// its own, so every joiner of the deferred one shares a single
+		// recovery instead of each running one against the same guest.
+		v2, _, _ := m.reattachSF.Do(vmID+"\x00retry", func() (any, error) {
+			rec, gerr := m.state.Get(vmID)
+			if gerr != nil || rec == nil {
+				return (*VMInstance)(nil), nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), boxdResumeReadyBudget+5*time.Second)
+			defer cancel()
+			got, _ := m.reattachRecord(ctx, *rec, false)
+			return got, nil
+		})
+		inst, _ := v2.(*VMInstance)
+		return inst
 	}
 	inst, _ := v.(*VMInstance)
 	return inst

@@ -206,13 +206,12 @@ func randomHex() string {
 }
 
 // imageManifest is the manifest that governs a restore of memPath: its own,
-// or its layered base's when it is a first pass off a template.
-func imageManifest(memPath, basePath string) (*WallClockManifest, error) {
-	m, err := ReadWallClockManifest(memPath)
-	if err != nil || m != nil || basePath == "" {
-		return m, err
-	}
-	return ReadWallClockManifest(basePath)
+// and only its own. An overlay never inherits its base's: a paused overlay
+// without a manifest of its own is a legacy image, whatever the template it
+// was cut from says, or a running workload could be restored under a frozen
+// clock.
+func imageManifest(memPath string) (*WallClockManifest, error) {
+	return ReadWallClockManifest(memPath)
 }
 
 // WatchTemplateManifests keeps the wake-protocol evidence in step with the

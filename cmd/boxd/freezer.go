@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -102,16 +103,64 @@ func (f *freezer) spawnUnlock() {
 	}
 }
 
-// wrap makes the command join the cgroup before exec, and refuse to run if it
-// cannot: a process outside the cgroup would survive a freeze. The shell's pid
-// becomes the command's on exec, so every descendant inherits the placement.
-// Passthrough without a cgroup.
-func (f *freezer) wrap(name string, args []string) (string, []string) {
-	if !f.available() {
-		return name, args
+// placement is the pipe over which the wrapper reports that it joined the
+// cgroup. The spawn lock is held until that report arrives: Start returning
+// only proves the shell exists, not that it has placed itself, and a freeze in
+// that gap would snapshot a workload running outside the cgroup.
+type placement struct {
+	r, w *os.File
+}
+
+// attach hands the wrapper its end of the pipe as fd 3.
+func (p *placement) attach(cmd *exec.Cmd) {
+	if p != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, p.w)
 	}
-	script := "echo $$ > " + filepath.Join(f.dir, "cgroup.procs") + " && exec \"$0\" \"$@\""
-	return "/bin/sh", append([]string{"-c", script, name}, args...)
+}
+
+var errNotPlaced = errors.New("workload process did not join the freezer cgroup")
+
+// wrap makes the command join the cgroup before exec, report it, and refuse to
+// run if it cannot: a process outside the cgroup would survive a freeze. The
+// shell's pid becomes the command's on exec, so every descendant inherits the
+// placement. Passthrough without a cgroup.
+func (f *freezer) wrap(name string, args []string) (string, []string, *placement) {
+	if !f.available() {
+		return name, args, nil
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		// Without a pipe the placement cannot be confirmed; the wrapper still
+		// refuses to run unplaced, and confirmPlacement refuses the spawn.
+		return "/bin/sh", []string{"-c", "exit 1"}, nil
+	}
+	script := "echo $$ > " + filepath.Join(f.dir, "cgroup.procs") + " && printf 1 >&3 && exec 3>&- && exec \"$0\" \"$@\""
+	return "/bin/sh", append([]string{"-c", script, name}, args...), &placement{r: r, w: w}
+}
+
+// confirmPlacement waits, under the spawn lock, for the wrapper's report. A
+// process that never reports is killed: it may be running outside the cgroup.
+func (f *freezer) confirmPlacement(cmd *exec.Cmd, p *placement) error {
+	if !f.available() {
+		return nil
+	}
+	if p == nil {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		return errNotPlaced
+	}
+	p.w.Close()
+	defer p.r.Close()
+	_ = p.r.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var b [1]byte
+	if n, err := p.r.Read(b[:]); n == 1 && b[0] == '1' && err == nil {
+		return nil
+	}
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	return errNotPlaced
 }
 
 func (f *freezer) isFrozen() bool {

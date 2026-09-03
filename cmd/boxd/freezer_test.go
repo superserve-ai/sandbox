@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -143,12 +145,16 @@ func TestFreezeTimeoutWithUnconfirmedThawSaysSo(t *testing.T) {
 // if it cannot: a process outside the cgroup would survive a freeze.
 func TestWrapJoinsCgroupOrDoesNotRun(t *testing.T) {
 	fz := newFreezer(newFake(), testDir)
-	name, args := fz.wrap("/usr/bin/python3", []string{"-c", "print(1)", "a b"})
-	if name != "/bin/sh" || len(args) < 3 || args[0] != "-c" {
-		t.Fatalf("wrap = %s %v, want /bin/sh -c …", name, args)
+	name, args, placed := fz.wrap("/usr/bin/python3", []string{"-c", "print(1)", "a b"})
+	if placed != nil {
+		placed.r.Close()
+		placed.w.Close()
 	}
-	if !strings.Contains(args[1], "cgroup.procs && exec \"$0\" \"$@\"") {
-		t.Errorf("script %q must join with && so a failed placement never execs", args[1])
+	if name != "/bin/sh" || len(args) < 3 || args[0] != "-c" || placed == nil {
+		t.Fatalf("wrap = %s %v placed=%v, want /bin/sh -c … with a placement pipe", name, args, placed != nil)
+	}
+	if !strings.Contains(args[1], "cgroup.procs && printf 1 >&3 && exec 3>&- && exec \"$0\" \"$@\"") {
+		t.Errorf("script %q must join, report, and only then exec", args[1])
 	}
 	if strings.Contains(args[1], "2>/dev/null") {
 		t.Errorf("script %q must not hide a placement failure", args[1])
@@ -162,8 +168,8 @@ func TestWrapIsPassthroughWithoutCgroup(t *testing.T) {
 	cg := newFake()
 	cg.missing = true
 	fz := newFreezer(cg, testDir)
-	if name, args := fz.wrap("/bin/true", []string{"x"}); name != "/bin/true" || len(args) != 1 || args[0] != "x" {
-		t.Errorf("wrap = %s %v, want passthrough", name, args)
+	if name, args, placed := fz.wrap("/bin/true", []string{"x"}); name != "/bin/true" || len(args) != 1 || args[0] != "x" || placed != nil {
+		t.Errorf("wrap = %s %v placed=%v, want passthrough", name, args, placed != nil)
 	}
 }
 
@@ -319,7 +325,7 @@ func TestNilFreezerIsANoOp(t *testing.T) {
 	if f.available() || f.isFrozen() {
 		t.Error("nil freezer must be neither available nor frozen")
 	}
-	if name, args := f.wrap("/bin/true", nil); name != "/bin/true" || args != nil {
+	if name, args, _ := f.wrap("/bin/true", nil); name != "/bin/true" || args != nil {
 		t.Error("nil freezer must not wrap")
 	}
 	if err := f.thaw("t1"); err != nil {
@@ -351,4 +357,54 @@ func TestTimedOutFreezeAcceptsItsOwnThaw(t *testing.T) {
 	if err := fz.thaw("t2"); err == nil {
 		t.Fatal("a different token must still be refused")
 	}
+}
+
+// The spawn is not complete until the wrapper has joined the cgroup and said
+// so; a wrapper that cannot join never runs the command and is not left alive.
+func TestPlacementIsAcknowledgedBeforeSpawnReturns(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "freezer.state"), []byte("THAWED\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fz := newFreezer(cgroupFS{dir: dir}, dir)
+	if !fz.available() {
+		t.Fatal("freezer not available over the temp cgroup")
+	}
+
+	name, args, placed := fz.wrap("/bin/sh", []string{"-c", "exit 0"})
+	cmd := exec.Command(name, args...)
+	placed.attach(cmd)
+	fz.spawnLock()
+	err := cmd.Start()
+	if err == nil {
+		err = fz.confirmPlacement(cmd, placed)
+	}
+	fz.spawnUnlock()
+	if err != nil {
+		t.Fatalf("placed spawn: %v", err)
+	}
+	_ = cmd.Wait()
+	if b, _ := os.ReadFile(filepath.Join(dir, "cgroup.procs")); strings.TrimSpace(string(b)) == "" {
+		t.Error("wrapper did not write its pid before reporting")
+	}
+
+	// cgroup.procs unwritable (a directory): the wrapper cannot join, reports
+	// nothing, and the spawn is refused with the process dead.
+	os.Remove(filepath.Join(dir, "cgroup.procs"))
+	if err := os.Mkdir(filepath.Join(dir, "cgroup.procs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	name, args, placed = fz.wrap("/bin/sh", []string{"-c", "sleep 30"})
+	cmd = exec.Command(name, args...)
+	placed.attach(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fz.confirmPlacement(cmd, placed); !errors.Is(err, errNotPlaced) {
+		t.Fatalf("unplaced spawn: err=%v, want errNotPlaced", err)
+	}
+	_ = cmd.Wait()
 }

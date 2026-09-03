@@ -86,22 +86,22 @@ func TestImageManifest(t *testing.T) {
 
 	t.Run("own_image", func(t *testing.T) {
 		mem := frozen(t, filepath.Join(t.TempDir(), "mem.snap"))
-		m, err := imageManifest(mem, "")
+		m, err := imageManifest(mem)
 		if err != nil || m == nil || !m.WorkloadFrozen || m.FreezeToken != "tok" {
 			t.Fatalf("m=%+v err=%v", m, err)
 		}
 	})
-	t.Run("layered_base", func(t *testing.T) {
+	t.Run("overlay_never_inherits_its_frozen_base", func(t *testing.T) {
 		dir := t.TempDir()
-		base := frozen(t, filepath.Join(dir, "template.snap"))
-		m, err := imageManifest(filepath.Join(dir, "mem.diff"), base)
-		if err != nil || m == nil || !m.GuestCorrectsClock {
-			t.Fatalf("m=%+v err=%v", m, err)
+		frozen(t, filepath.Join(dir, "template.snap"))
+		m, err := imageManifest(filepath.Join(dir, "mem.diff"))
+		if err != nil || m != nil {
+			t.Fatalf("m=%+v err=%v, want legacy: a paused overlay without its own manifest may hold a running workload", m, err)
 		}
 	})
 	t.Run("absent_is_legacy", func(t *testing.T) {
 		dir := t.TempDir()
-		m, err := imageManifest(filepath.Join(dir, "mem.snap"), filepath.Join(dir, "base.snap"))
+		m, err := imageManifest(filepath.Join(dir, "mem.snap"))
 		if err != nil || m != nil {
 			t.Fatalf("m=%+v err=%v, want nil, nil", m, err)
 		}
@@ -112,7 +112,7 @@ func TestImageManifest(t *testing.T) {
 			if err := os.WriteFile(WallClockMarkerPath(mem), []byte(body), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := imageManifest(mem, ""); !errors.Is(err, ErrWallClockManifest) {
+			if _, err := imageManifest(mem); !errors.Is(err, ErrWallClockManifest) {
 				t.Errorf("%s: err=%v, want ErrWallClockManifest", name, err)
 			}
 		}
@@ -304,12 +304,12 @@ func TestResumeWallClockProperty(t *testing.T) {
 		mem := filepath.Join(t.TempDir(), "mem.snap")
 		seedFrozenManifest(t, mem, "disk")
 		// Manifest says yes, record says no. The record wins ⇒ no read happened.
-		if frozen, _, err := imageWorkloadFrozen(mem, "", mem, boolPtr(false), ""); err != nil || frozen {
+		if frozen, _, err := imageWorkloadFrozen(mem, mem, boolPtr(false), ""); err != nil || frozen {
 			t.Errorf("want the recorded value; a manifest on disk means the record was not used (frozen=%v err=%v)", frozen, err)
 		}
 		// And the inverse: no manifest on disk, record says yes, with its token.
 		bare := filepath.Join(t.TempDir(), "mem.snap")
-		if frozen, tok, err := imageWorkloadFrozen(bare, "", bare, boolPtr(true), "rec"); err != nil || !frozen || tok != "rec" {
+		if frozen, tok, err := imageWorkloadFrozen(bare, bare, boolPtr(true), "rec"); err != nil || !frozen || tok != "rec" {
 			t.Errorf("want the recorded value and token even with no manifest (frozen=%v tok=%q err=%v)", frozen, tok, err)
 		}
 	})
@@ -320,14 +320,14 @@ func TestResumeWallClockProperty(t *testing.T) {
 		dir := t.TempDir()
 		override := filepath.Join(dir, "restored.snap")
 		seedFrozenManifest(t, override, "disk")
-		if frozen, tok, err := imageWorkloadFrozen(override, "", filepath.Join(dir, "mem.snap"), boolPtr(false), "rec"); err != nil || !frozen || tok != "disk" {
+		if frozen, tok, err := imageWorkloadFrozen(override, filepath.Join(dir, "mem.snap"), boolPtr(false), "rec"); err != nil || !frozen || tok != "disk" {
 			t.Errorf("want the manifest consulted when the image is not the paused one (frozen=%v tok=%q err=%v)", frozen, tok, err)
 		}
 	})
 
 	t.Run("override_without_a_marker_stays_legacy", func(t *testing.T) {
 		dir := t.TempDir()
-		if frozen, _, err := imageWorkloadFrozen(filepath.Join(dir, "restored.snap"), "", filepath.Join(dir, "mem.snap"), boolPtr(true), "rec"); err != nil || frozen {
+		if frozen, _, err := imageWorkloadFrozen(filepath.Join(dir, "restored.snap"), filepath.Join(dir, "mem.snap"), boolPtr(true), "rec"); err != nil || frozen {
 			t.Errorf("a stale record must not carry over to a different image (frozen=%v err=%v)", frozen, err)
 		}
 	})
@@ -405,12 +405,12 @@ func TestResumeWallClockPropertyUnresolvedRecordConsultsTheMarker(t *testing.T) 
 	mem := filepath.Join(t.TempDir(), "mem.snap")
 	seedFrozenManifest(t, mem, "disk")
 	// Same image, but the record lost the answer.
-	if frozen, tok, err := imageWorkloadFrozen(mem, "", mem, nil, ""); err != nil || !frozen || tok != "disk" {
+	if frozen, tok, err := imageWorkloadFrozen(mem, mem, nil, ""); err != nil || !frozen || tok != "disk" {
 		t.Errorf("an unresolved record must fall back to the manifest, not read as false (frozen=%v tok=%q err=%v)", frozen, tok, err)
 	}
 
 	bare := filepath.Join(t.TempDir(), "mem.snap")
-	if frozen, _, err := imageWorkloadFrozen(bare, "", bare, nil, ""); err != nil || frozen {
+	if frozen, _, err := imageWorkloadFrozen(bare, bare, nil, ""); err != nil || frozen {
 		t.Errorf("unresolved with no manifest must still be false (frozen=%v err=%v)", frozen, err)
 	}
 }

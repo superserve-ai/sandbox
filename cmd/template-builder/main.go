@@ -327,6 +327,15 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	// from it must present it. Minted here, kept by the guest in the snapshot.
 	freezeToken := vm.NewFreezeToken()
 	if correctsWallClock {
+		// The rollback floor rises before the first frozen artifact can exist
+		// on this host: a supervisor without the wake protocol must never be
+		// installed over one, so a floor that cannot be made durable fails
+		// the build rather than freeze anything.
+		if err := vm.RaiseWakeProtocolFloor(); err != nil {
+			return fmt.Errorf("raise wake-protocol floor: %w", err)
+		}
+	}
+	if correctsWallClock {
 		// A freeze whose answer was lost may still have frozen the guest, and
 		// an image with a stopped workload and no manifest would never be
 		// woken. So a failed freeze is followed by a thaw with the same
@@ -358,13 +367,6 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	// guest corrects its clock, and which token the wake must present.
 	markerPath := ""
 	if correctsWallClock {
-		// The rollback floor rises before the first frozen artifact exists on
-		// this host: a supervisor without the wake protocol must never be
-		// installed over it, so a floor that cannot be made durable fails the
-		// build rather than publishing an image nothing may be rolled back under.
-		if err := vm.RaiseWakeProtocolFloor(); err != nil {
-			return fmt.Errorf("raise wake-protocol floor: %w", err)
-		}
 		markerPath = vm.WallClockMarkerPath(memPath)
 		man := vm.WallClockManifest{
 			Version: vm.WallClockManifestVersion, ArtifactID: vm.NewArtifactID(),
