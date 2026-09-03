@@ -246,16 +246,6 @@ func TestAbsentCgroupDegradesButBrokenErrors(t *testing.T) {
 }
 
 func TestFreezeEndpointStatusCodes(t *testing.T) {
-	post := func(fz *freezer, path, body string) int {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
-		if path == "/freeze" {
-			fz.handleFreeze(rec, req)
-		} else {
-			fz.handleThaw(rec, req)
-		}
-		return rec.Code
-	}
 	t.Run("frozen_is_200_and_echoes", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		fz := newFreezer(newFake(), testDir)
@@ -313,16 +303,6 @@ func TestFreezeEndpointStatusCodes(t *testing.T) {
 // token while one is active conflicts, a thaw or wake repeated after success
 // succeeds, and a missing or different token is refused without changing state.
 func TestFreezeTokenTable(t *testing.T) {
-	post := func(fz *freezer, path, body string) int {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
-		if path == "/freeze" {
-			fz.handleFreeze(rec, req)
-		} else {
-			fz.handleThaw(rec, req)
-		}
-		return rec.Code
-	}
 	fz := newFreezer(newFake(), testDir)
 	steps := []struct {
 		path, body string
@@ -598,4 +578,38 @@ func TestFreezeBudgetCoversTheSpawnGuard(t *testing.T) {
 	if err := fz.thaw("t3"); err != nil {
 		t.Fatalf("follow-up thaw after a spent budget: %v", err)
 	}
+}
+
+// A body the handler cannot decode whole never reaches the cgroup, even when
+// the fields it did decode would have been enough.
+func TestMalformedLifecycleBodiesAreRefused(t *testing.T) {
+	cg := newFake()
+	fz := newFreezer(cg, testDir)
+	if got := post(fz, "/freeze", `{"token":"t1","budget_ms":"bad"}`); got != 400 || fz.isFrozen() {
+		t.Fatalf("malformed freeze: code %d frozen %v, want 400 and nothing touched", got, fz.isFrozen())
+	}
+	if st, _ := cg.readState(); st != "THAWED" {
+		t.Fatalf("malformed freeze reached the cgroup: state %q", st)
+	}
+	if got := post(fz, "/freeze", `{"token":"t1"}`); got != 200 || !fz.isFrozen() {
+		t.Fatalf("well-formed freeze: code %d frozen %v", got, fz.isFrozen())
+	}
+	if got := post(fz, "/thaw", `{"token":["t1"]}`); got != 400 || !fz.isFrozen() {
+		t.Fatalf("malformed thaw: code %d frozen %v, want 400 and still frozen", got, fz.isFrozen())
+	}
+	if got := post(fz, "/thaw", `{"token":"t1"}`); got != 200 || fz.isFrozen() {
+		t.Fatalf("well-formed thaw: code %d frozen %v", got, fz.isFrozen())
+	}
+}
+
+// post sends a lifecycle request straight to its handler and reports the status.
+func post(fz *freezer, path, body string) int {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	if path == "/freeze" {
+		fz.handleFreeze(rec, req)
+	} else {
+		fz.handleThaw(rec, req)
+	}
+	return rec.Code
 }

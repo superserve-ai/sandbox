@@ -392,11 +392,10 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 		BudgetMs int64  `json:"budget_ms"`
 		Token    string `json:"token"`
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
-	}
-	if body.Token == "" {
-		http.Error(w, "token required", http.StatusBadRequest)
+	// A body that does not decode whole is refused before anything moves,
+	// whatever fields it did fill.
+	if r.Body == nil || json.NewDecoder(r.Body).Decode(&body) != nil || body.Token == "" {
+		http.Error(w, "well-formed body with token required", http.StatusBadRequest)
 		return
 	}
 	if body.BudgetMs > 0 {
@@ -447,11 +446,10 @@ func (f *freezer) handleThaw(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Token string `json:"token"`
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
-	}
-	if body.Token == "" {
-		http.Error(w, "token required", http.StatusBadRequest)
+	// A body that does not decode whole is refused before anything moves,
+	// whatever fields it did fill.
+	if r.Body == nil || json.NewDecoder(r.Body).Decode(&body) != nil || body.Token == "" {
+		http.Error(w, "well-formed body with token required", http.StatusBadRequest)
 		return
 	}
 	if err := f.thaw(body.Token); err != nil {
