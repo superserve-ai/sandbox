@@ -217,8 +217,9 @@ func (f *freezer) isFrozen() bool {
 }
 
 // freeze stops the cgroup and waits for every task to stop. On timeout it
-// thaws; an unconfirmed thaw wraps errThawUnconfirmed. Repeating a freeze
-// with its own token succeeds; a different token while one is active conflicts.
+// thaws; if that cannot be confirmed it stays frozen under the token and wraps
+// errThawUnconfirmed. Repeating a freeze with its own token succeeds; a
+// different token while one is active conflicts.
 func (f *freezer) freeze(ctx context.Context, token string) error {
 	if !f.available() {
 		return errors.New("freezer cgroup unavailable")
@@ -228,15 +229,21 @@ func (f *freezer) freeze(ctx context.Context, token string) error {
 	}
 	defer f.mu.Unlock()
 	if f.frozen.Load() {
-		if token == f.token {
+		if token != f.token {
+			return errTokenConflict
+		}
+		// Only a cgroup that reads FROZEN is a repeat; one left unconfirmed
+		// by an earlier rollback is tried again.
+		if st, err := f.fs.readState(); err == nil && st == "FROZEN" {
 			return nil
 		}
-		return errTokenConflict
 	}
 	// The budget covers the wait for the guard too: a caller that has given
 	// up must not find its workload stopped after all.
 	if err := ctx.Err(); err != nil {
-		f.last.Store(token)
+		if !f.frozen.Load() {
+			f.last.Store(token)
+		}
 		return fmt.Errorf("budget spent before the freeze began: %w", err)
 	}
 
@@ -289,9 +296,13 @@ func (f *freezer) lockWithin(ctx context.Context, token string) error {
 
 // undo rolls back a freeze that did not complete. The token is remembered as
 // released, so the supervisor's own follow-up thaw with it is answered as
-// already done rather than refused.
+// already done rather than refused. A rollback that cannot be confirmed leaves
+// boxd frozen under the token: nothing spawns, health says so, and the
+// supervisor's thaw retries the cgroup until it answers.
 func (f *freezer) undo(token string, cause error) error {
 	if terr := f.thawLocked(); terr != nil {
+		f.frozen.Store(true)
+		f.token = token
 		return fmt.Errorf("%w; %w: %v", cause, errThawUnconfirmed, terr)
 	}
 	f.last.Store(token)

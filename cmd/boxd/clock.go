@@ -55,7 +55,8 @@ func (c *wallClock) sync(mustCorrect bool) (status wallClockStatus, ready bool) 
 	if err != nil {
 		if !c.warnedNoSrc {
 			c.warnedNoSrc = true
-			log.Printf("wall clock: host time unavailable: %v", err)
+			// Diagnostics never wait on stderr: sync answers a wake.
+			go log.Printf("wall clock: host time unavailable: %v", err)
 		}
 		return wallClockStatus{Source: "unavailable", Error: err.Error()}, !mustCorrect
 	}
@@ -68,7 +69,7 @@ func (c *wallClock) sync(mustCorrect bool) (status wallClockStatus, ready bool) 
 
 	if err := c.src.set(host); err != nil {
 		status.Error = "set: " + err.Error()
-		log.Printf("wall clock: %v off host, correction failed: %v", delta, err)
+		go log.Printf("wall clock: %v off host, correction failed: %v", delta, err)
 		return status, false
 	}
 	// Re-read: a set that silently did nothing must read as not-ready.
@@ -79,7 +80,7 @@ func (c *wallClock) sync(mustCorrect bool) (status wallClockStatus, ready bool) 
 	}
 	if host2.Sub(c.now()).Abs() > wallClockTolerance {
 		status.Error = "still outside tolerance after correction"
-		log.Printf("wall clock: %v off host, still outside tolerance after correction", delta)
+		go log.Printf("wall clock: %v off host, still outside tolerance after correction", delta)
 		return status, false
 	}
 

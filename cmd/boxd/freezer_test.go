@@ -144,6 +144,32 @@ func TestFreezeTimeoutWithUnconfirmedThawSaysSo(t *testing.T) {
 	if err := fz.freeze(ctx, "t1"); !errors.Is(err, errThawUnconfirmed) {
 		t.Fatalf("err = %v, want errThawUnconfirmed", err)
 	}
+	// The cgroup may still be stopped: boxd stays frozen under the token, so
+	// nothing spawns, a repeat freeze does not claim success, and the thaw
+	// retries the cgroup until it answers.
+	if !fz.isFrozen() || !fz.holds("t1") {
+		t.Fatalf("after an unconfirmed rollback: frozen=%v holds=%v, want both", fz.isFrozen(), fz.holds("t1"))
+	}
+	if err := fz.beginSpawn(); !errors.Is(err, errWorkloadFrozen) {
+		if err == nil {
+			fz.endSpawn()
+		}
+		t.Fatalf("spawn after an unconfirmed rollback: %v, want errWorkloadFrozen", err)
+	}
+	ctx2, cancel2 := context.WithTimeout(bg(), 20*time.Millisecond)
+	defer cancel2()
+	if err := fz.freeze(ctx2, "t1"); err == nil {
+		t.Fatal("repeat freeze claimed success over an unconfirmed cgroup")
+	}
+	if err := fz.thaw("t1"); err == nil || !fz.isFrozen() {
+		t.Fatalf("thaw of a stuck cgroup: err=%v frozen=%v, want an error and still frozen", err, fz.isFrozen())
+	}
+	cg.mu.Lock()
+	cg.stuckThaw = false
+	cg.mu.Unlock()
+	if err := fz.thaw("t1"); err != nil || fz.isFrozen() {
+		t.Fatalf("thaw once the cgroup answers: err=%v frozen=%v, want released", err, fz.isFrozen())
+	}
 }
 
 // The trampoline joins the cgroup before exec and refuses to run the command
