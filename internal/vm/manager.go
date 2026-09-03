@@ -132,6 +132,8 @@ type VMInstance struct {
 	// WakePending / ClockFrozen: see VMRecord.
 	WakePending bool
 	ClockFrozen bool
+	// FreezeToken is the token the image's freeze carries; a wake must present it.
+	FreezeToken string
 	CreatedAt   time.Time
 	Metadata    map[string]string
 	TeamID      string // owning team; carried for data-plane usage attribution
@@ -1622,7 +1624,17 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// go and look, or this pause would delete a marker that is still valid.
 	correctsWallClock := recordedCorrects != nil && *recordedCorrects
 	if recordedCorrects == nil {
-		correctsWallClock = guestCorrectsWallClock(instMemFile, instBaseMem)
+		man, merr := imageManifest(instMemFile, instBaseMem)
+		if merr != nil {
+			log.Warn().Err(merr).Msg("pause: wall-clock manifest unreadable; this image will not be frozen")
+		}
+		correctsWallClock = man != nil && man.GuestCorrectsClock
+	}
+	// The token this freeze carries; the guest keeps it across the snapshot and
+	// the wake must present it.
+	freezeToken := ""
+	if correctsWallClock {
+		freezeToken = NewFreezeToken()
 	}
 
 	// Only a pause that may touch a wall-clock manifest records its intent (see
@@ -1640,7 +1652,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	if correctsWallClock && m.cfg.GuestClockFreezeEnabled && m.clockRealtimeCapable.Load() && !m.guestClockUnready.Load() {
 		tFreeze := time.Now()
 		var ferr error
-		guestFrozen, ferr = m.freezeGuestForPause(ctx, instIP, log)
+		guestFrozen, ferr = m.freezeGuestForPause(ctx, instIP, freezeToken, log)
 		freezeDur = time.Since(tFreeze)
 		if ferr != nil {
 			return "", "", nil, m.handleVMError(vmID, ferr)
@@ -1657,7 +1669,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			}
 			tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 			defer cancel()
-			if terr := boxdThawGuest(tctx, instIP); terr != nil {
+			if terr := boxdThawGuest(tctx, instIP, freezeToken); terr != nil {
 				log.Error().Err(terr).Msg("pause: snapshot failed and the guest workload could not be thawed")
 			}
 		}()
@@ -1814,14 +1826,22 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		}
 	}
 
-	// A resume reads the marker beside THIS image, so without it every resume drops
-	// back to legacy. Only the write lands here: the unsafe direction was already
-	// handled above, before the image existed. Best-effort by design — a marker
-	// that fails to write costs a slower resume, never a wrong clock.
-	if guestFrozen {
-		if merr := os.WriteFile(clockFreezeMarkerPath(memPath), nil, 0o644); merr != nil {
-			log.Warn().Err(merr).Str("path", clockFreezeMarkerPath(memPath)).
-				Msg("pause: wall-clock marker write failed; resume falls back to legacy clock behaviour")
+	// A resume reads the manifest beside THIS image. Only the write lands here:
+	// the unsafe direction was already handled above, before the image existed.
+	// A frozen workload without its manifest could be restored on another host
+	// with nothing owing it a wake, so that write failure fails the pause (the
+	// deferred thaw releases the guest); an unfrozen image just loses the cached
+	// capability, which the record still carries.
+	if correctsWallClock {
+		man := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: NewArtifactID(), WorkloadFrozen: guestFrozen, GuestCorrectsClock: true}
+		if guestFrozen {
+			man.FreezeToken = freezeToken
+		}
+		if merr := WriteWallClockManifest(memPath, man); merr != nil {
+			if guestFrozen {
+				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("write wall-clock manifest for frozen image: %w", merr))
+			}
+			log.Warn().Err(merr).Str("path", clockFreezeMarkerPath(memPath)).Msg("pause: wall-clock manifest write failed")
 		}
 	}
 
@@ -1901,6 +1921,10 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	inst.DirtyTracked = false        // FC process is stopping; a fresh resume re-arms tracking.
 	inst.DirtyTrackingSessionID = "" // the session dies with the FC run
 	inst.SnapshotWorkloadFrozen = &guestFrozen
+	inst.FreezeToken = ""
+	if guestFrozen {
+		inst.FreezeToken = freezeToken
+	}
 	inst.PausedAt = time.Now()
 	// The crash-window marker describes a RUNNING record persisted before
 	// readiness was proven; a successful pause proves the guest was live and
@@ -2332,9 +2356,12 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// metadata I/O on the resume path for a fact we hold. Only an explicit
 	// override, which supplies an image this VM was not paused into, has to look.
 	inst.mu.RLock()
-	recordedFrozen, pausedMemPath, entryUnverified := inst.SnapshotWorkloadFrozen, inst.MemFilePath, inst.Unverified
+	recordedFrozen, recordedToken, pausedMemPath, entryUnverified := inst.SnapshotWorkloadFrozen, inst.FreezeToken, inst.MemFilePath, inst.Unverified
 	inst.mu.RUnlock()
-	resumeWorkloadFrozen := imageWorkloadFrozen(memPath, basePath, pausedMemPath, recordedFrozen)
+	resumeWorkloadFrozen, resumeToken, merr := imageWorkloadFrozen(memPath, basePath, pausedMemPath, recordedFrozen, recordedToken)
+	if merr != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
+	}
 
 	var (
 		pid               int
@@ -2445,13 +2472,19 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// latched, so the policy resolves to legacy — and still owes the release.
 		if resumeWorkloadFrozen {
 			tWake := time.Now()
-			werr := boxdWakeGuest(context.WithoutCancel(ctx), netInfo.HostIP, boxdResumeReadyBudget, resumeClockFrozen)
+			werr := boxdWakeGuest(context.WithoutCancel(ctx), netInfo.HostIP, boxdResumeReadyBudget, resumeClockFrozen, resumeToken)
 			syncWake = time.Since(tWake)
 			if werr != nil {
 				m.stopUnitDuringRestoreError(vmID)
 				if errors.Is(werr, ErrGuestClockUnready) && pass == 0 {
 					m.noteGuestClockUnready(log, werr)
 					continue
+				}
+				if errors.Is(werr, ErrGuestTokenMismatch) {
+					// This image and its record describe different snapshots.
+					// Durably Error, never retried: the artifacts are retained.
+					m.setStatus(vmID, StatusError)
+					return nil, status.Errorf(codes.FailedPrecondition, "image %q: %v", memPath, werr)
 				}
 				return nil, status.Errorf(codes.Unavailable, "guest did not wake after restore: %v", werr)
 			}
@@ -2494,6 +2527,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.DirtyTracked = dirtyTracked
 	inst.DirtyTrackingSessionID = trackingSessionID
 	inst.SnapshotWorkloadFrozen = &resumeWorkloadFrozen
+	inst.FreezeToken = resumeToken
 	if resumeWorkloadFrozen {
 		// Only a guest that corrects its clock is ever frozen into an image.
 		corrects := true
@@ -3229,6 +3263,21 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"image %q: a pause was interrupted while rewriting it; refusing restore until it is inspected", memPath)
 	}
+	// What the image says about its guest, read once: whether its workload is
+	// frozen (and so owes a wake with this token) and whether the guest
+	// corrects its clock. A manifest this binary cannot trust refuses the
+	// restore here, before anything is launched.
+	sidecarBase, hasSidecar := readLayeredBase(memPath)
+	manifest, merr := imageManifest(memPath, sidecarBase)
+	if merr != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
+	}
+	restoreCorrectsWallClock := manifest != nil && manifest.WorkloadFrozen
+	restoreGuestCorrects := manifest != nil && manifest.GuestCorrectsClock
+	restoreToken := ""
+	if manifest != nil {
+		restoreToken = manifest.FreezeToken
+	}
 
 	// Sampled before this attempt creates the rundir: a pre-existing rundir
 	// means a prior attempt on this host reached start.sh (and possibly
@@ -3354,8 +3403,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// resolved once here rather than per attempt: a tap-busy retry would otherwise
 	// repeat the sidecar read and the marker probe, and both would sit after
 	// Firecracker and networking have started, on user-visible restore latency.
-	sidecarBase, hasSidecar := readLayeredBase(memPath)
-	restoreCorrectsWallClock := guestCorrectsWallClock(memPath, sidecarBase)
 	var (
 		restoreClockFrozen bool
 		clockRetried       bool
@@ -3446,8 +3493,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Cached so the next pause knows whether this guest fixes its own wall
 		// clock without going back to the filesystem to ask.
 		inst.mu.Lock()
-		inst.CorrectsWallClock = &restoreCorrectsWallClock
+		inst.CorrectsWallClock = &restoreGuestCorrects
 		inst.SnapshotWorkloadFrozen = &restoreCorrectsWallClock
+		inst.FreezeToken = restoreToken
 		inst.mu.Unlock()
 		// Only a frozen image owes a wake, so only then must the record say so
 		// before the vCPUs can run. An unfrozen image keeps the older ordering
@@ -3698,7 +3746,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// timer that never fires.
 			stopDiag := m.armEarlyStallDiagnostics(vmID, pid)
 			if restoreCorrectsWallClock {
-				wakeErr = boxdWakeGuest(ctx, hostIP, readiness, restoreClockFrozen)
+				wakeErr = boxdWakeGuest(ctx, hostIP, readiness, restoreClockFrozen, restoreToken)
 			} else {
 				wakeErr = boxdHealthProbe(ctx, hostIP, readiness)
 			}
@@ -3900,6 +3948,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// sibling destroy-race path. A generic error here reads as
 			// transient and the control plane retries a destroyed sandbox.
 			return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
+		}
+		if errors.Is(err, ErrGuestTokenMismatch) {
+			// The artifacts are retained for inspection; nothing retries this.
+			return nil, status.Errorf(codes.FailedPrecondition, "image %q: %v", memPath, err)
 		}
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
@@ -7978,12 +8030,12 @@ var adoptionBoxdReady = func(ctx context.Context, m *Manager, ip string) error {
 func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string, inst *VMInstance) error {
 	ctx := context.WithoutCancel(callerCtx)
 	inst.mu.RLock()
-	pending, frozen := inst.WakePending, inst.ClockFrozen
+	pending, frozen, token := inst.WakePending, inst.ClockFrozen, inst.FreezeToken
 	inst.mu.RUnlock()
 	if !pending {
 		return adoptionBoxdReady(ctx, m, ip)
 	}
-	if err := boxdWakeGuest(ctx, ip, 30*time.Second, frozen); err != nil {
+	if err := boxdWakeGuest(ctx, ip, 30*time.Second, frozen, token); err != nil {
 		if errors.Is(err, ErrGuestClockUnready) {
 			m.noteGuestClockUnready(m.log.With().Str("vm_id", inst.ID).Logger(), err)
 		}

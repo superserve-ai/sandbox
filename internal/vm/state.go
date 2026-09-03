@@ -226,6 +226,7 @@ type VMRecord struct {
 	// policy that restore used, which the wake must carry.
 	WakePending bool              `json:"wake_pending,omitempty"`
 	ClockFrozen bool              `json:"clock_frozen,omitempty"`
+	FreezeToken string            `json:"freeze_token,omitempty"`
 	CreatedAt   time.Time         `json:"created_at"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	VCPU        uint32            `json:"vcpu"`
@@ -919,6 +920,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		CorrectsWallClock:          inst.CorrectsWallClock,
 		SnapshotWorkloadFrozen:     inst.SnapshotWorkloadFrozen,
 		WakePending:                inst.WakePending,
+		FreezeToken:                inst.FreezeToken,
 		ClockFrozen:                inst.ClockFrozen,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
@@ -1023,6 +1025,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		CorrectsWallClock:          rec.CorrectsWallClock,
 		SnapshotWorkloadFrozen:     rec.SnapshotWorkloadFrozen,
 		WakePending:                rec.WakePending,
+		FreezeToken:                rec.FreezeToken,
 		ClockFrozen:                rec.ClockFrozen,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,

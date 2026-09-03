@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -50,7 +51,7 @@ func TestWaitForGuestWakeFailsFastOnUncorrectableClock(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	err = waitForGuestWake(context.Background(), "127.0.0.1", 10*time.Second, true)
+	err = waitForGuestWake(context.Background(), "127.0.0.1", 10*time.Second, true, "tok")
 	if !errors.Is(err, ErrGuestClockUnready) {
 		t.Fatalf("err = %v, want ErrGuestClockUnready", err)
 	}
@@ -76,7 +77,7 @@ func TestWaitForGuestWakeReadyIsNil(t *testing.T) {
 	srv.Listener = ln
 	srv.Start()
 	defer srv.Close()
-	if err := waitForGuestWake(context.Background(), "127.0.0.1", 2*time.Second, false); err != nil {
+	if err := waitForGuestWake(context.Background(), "127.0.0.1", 2*time.Second, false, "tok"); err != nil {
 		t.Fatalf("want nil, got %v", err)
 	}
 }
@@ -93,20 +94,22 @@ func TestVerifyBoxdReadyCompletesAPendingWake(t *testing.T) {
 
 	t.Run("pending_wake_is_sent_with_its_policy", func(t *testing.T) {
 		var sawFrozen *bool
-		boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool) error {
+		var sawToken string
+		boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool, token string) error {
 			sawFrozen = &frozen
+			sawToken = token
 			return nil
 		}
 		adoptionBoxdReady = func(context.Context, *Manager, string) error {
 			t.Fatal("a pending wake must not be verified by health")
 			return nil
 		}
-		inst := &VMInstance{ID: "vm", WakePending: true, ClockFrozen: true}
+		inst := &VMInstance{ID: "vm", WakePending: true, ClockFrozen: true, FreezeToken: "tok"}
 		if err := m.verifyBoxdReady(context.Background(), "10.0.0.2", inst); err != nil {
 			t.Fatalf("verify: %v", err)
 		}
-		if sawFrozen == nil || !*sawFrozen {
-			t.Error("wake not sent, or sent without the frozen policy")
+		if sawFrozen == nil || !*sawFrozen || sawToken != "tok" {
+			t.Error("wake not sent, or sent without the frozen policy and the record's token")
 		}
 		if inst.WakePending {
 			t.Error("WakePending still set after a completed wake")
@@ -114,7 +117,7 @@ func TestVerifyBoxdReadyCompletesAPendingWake(t *testing.T) {
 	})
 
 	t.Run("no_pending_wake_uses_health", func(t *testing.T) {
-		boxdWakeGuest = func(context.Context, string, time.Duration, bool) error {
+		boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error {
 			t.Fatal("no wake owed; must not send one")
 			return nil
 		}
@@ -128,7 +131,7 @@ func TestVerifyBoxdReadyCompletesAPendingWake(t *testing.T) {
 	t.Run("uncorrectable_clock_latches_the_host_and_fails", func(t *testing.T) {
 		m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{GuestClockFreezeEnabled: true}}
 		m.clockRealtimeCapable.Store(true)
-		boxdWakeGuest = func(context.Context, string, time.Duration, bool) error { return ErrGuestClockUnready }
+		boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return ErrGuestClockUnready }
 		inst := &VMInstance{ID: "vm", WakePending: true, ClockFrozen: true}
 		if err := m.verifyBoxdReady(context.Background(), "10.0.0.2", inst); !errors.Is(err, ErrGuestClockUnready) {
 			t.Fatalf("err = %v, want ErrGuestClockUnready", err)
@@ -146,12 +149,12 @@ func TestVerifyBoxdReadyCompletesAPendingWake(t *testing.T) {
 // owes one.
 func TestWakeStateSurvivesRecordRoundTrip(t *testing.T) {
 	frozen := true
-	rec := toRecord(&VMInstance{ID: "vm", WakePending: true, ClockFrozen: true, SnapshotWorkloadFrozen: &frozen})
-	if !rec.WakePending || !rec.ClockFrozen || rec.SnapshotWorkloadFrozen == nil || !*rec.SnapshotWorkloadFrozen {
+	rec := toRecord(&VMInstance{ID: "vm", WakePending: true, ClockFrozen: true, SnapshotWorkloadFrozen: &frozen, FreezeToken: "tok"})
+	if !rec.WakePending || !rec.ClockFrozen || rec.SnapshotWorkloadFrozen == nil || !*rec.SnapshotWorkloadFrozen || rec.FreezeToken != "tok" {
 		t.Fatalf("toRecord dropped wake state: %+v", rec)
 	}
 	got := toInstance(rec)
-	if !got.WakePending || !got.ClockFrozen || got.SnapshotWorkloadFrozen == nil || !*got.SnapshotWorkloadFrozen {
+	if !got.WakePending || !got.ClockFrozen || got.SnapshotWorkloadFrozen == nil || !*got.SnapshotWorkloadFrozen || got.FreezeToken != "tok" {
 		t.Errorf("toInstance dropped wake state: pending=%v frozen=%v image=%v", got.WakePending, got.ClockFrozen, got.SnapshotWorkloadFrozen)
 	}
 }
@@ -190,7 +193,7 @@ func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
 	mgr.restoreForResumeHook = func(string, string, string, string, *network.VMNetInfo) (bool, string, error) { return false, "", nil }
 	wakes := 0
 	var sawFrozen, owedAtWake bool
-	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool) error {
+	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool, _ string) error {
 		wakes++
 		sawFrozen = frozen
 		inst.mu.RLock()
@@ -290,9 +293,7 @@ func TestRestoreInPlaceClockFallbackKeepsOverlayAndSlot(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(WallClockMarkerPath(memPath), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	seedFrozenManifest(t, memPath, "tok")
 	overlay := filepath.Join(dir, "vm-1", "overlay.ext4")
 	if err := os.MkdirAll(filepath.Dir(overlay), 0o755); err != nil {
 		t.Fatal(err)
@@ -326,8 +327,11 @@ func TestRestoreInPlaceClockFallbackKeepsOverlayAndSlot(t *testing.T) {
 		return nil
 	}
 	wakes := 0
-	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool) error {
+	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool, token string) error {
 		wakes++
+		if token != "tok" {
+			t.Errorf("wake %d carried token %q, want the manifest's", wakes, token)
+		}
 		if wakes == 1 {
 			if !frozen {
 				t.Error("first wake must carry the frozen policy")
@@ -401,9 +405,7 @@ func TestRestoreAbortsBeforeLoadWithoutDurableWakeRecord(t *testing.T) {
 	}
 	// Only a frozen image owes a wake, and so only a frozen image has a record
 	// that must be durable before the load.
-	if err := os.WriteFile(WallClockMarkerPath(memPath), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	seedFrozenManifest(t, memPath, "tok")
 	fake := &fakeNetMgr{}
 	mgr := &Manager{
 		log:        zerolog.Nop(),
@@ -437,7 +439,7 @@ func TestRestoreAbortsBeforeLoadWithoutDurableWakeRecord(t *testing.T) {
 func TestRestoreLegacyRetrySeesDurableClockPolicy(t *testing.T) {
 	origWake := boxdWakeGuest
 	t.Cleanup(func() { boxdWakeGuest = origWake })
-	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool) error {
+	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool, _ string) error {
 		if frozen {
 			t.Error("the legacy restore ran the clock; the wake must say so")
 		}
@@ -458,9 +460,7 @@ func TestRestoreLegacyRetrySeesDurableClockPolicy(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(WallClockMarkerPath(memPath), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	seedFrozenManifest(t, memPath, "tok")
 	mgr := &Manager{
 		log:        zerolog.Nop(),
 		cfg:        ManagerConfig{RunDir: dir, GuestClockFreezeEnabled: true},
@@ -508,7 +508,7 @@ func TestResumeOfUnfrozenPauseDoesNotFreezeOrWake(t *testing.T) {
 	var mu sync.Mutex
 	var beforeCommit, frozenWakes int
 	var inst *VMInstance
-	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool) error {
+	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool, _ string) error {
 		inst.mu.RLock()
 		st := inst.Status
 		inst.mu.RUnlock()
@@ -629,4 +629,93 @@ func TestInterruptedPauseRefusesResumeAndRestore(t *testing.T) {
 	if err := clearPauseIntent(dir); err != nil || pauseIntentPresent(dir) {
 		t.Fatalf("clear: err=%v present=%v", err, pauseIntentPresent(dir))
 	}
+}
+
+// A wake the guest refuses as belonging to another freeze means the image and
+// its record describe different snapshots. The restore fails as a
+// precondition, the VM is durably Error, and the artifacts stay for inspection.
+func TestTokenMismatchFailsRestoreAndResumeWithoutRetry(t *testing.T) {
+	origWake, origDead := boxdWakeGuest, vmDeadForRetry
+	t.Cleanup(func() { boxdWakeGuest, vmDeadForRetry = origWake, origDead })
+	vmDeadForRetry = func(*Manager, string) bool { return true }
+	wakes := 0
+	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error {
+		wakes++
+		return fmt.Errorf("%w: status token", ErrGuestTokenMismatch)
+	}
+	newDir := func(t *testing.T) (dir, snapPath, memPath string) {
+		dir = t.TempDir()
+		snapPath, memPath = filepath.Join(dir, "vm.snap"), filepath.Join(dir, "mem.snap")
+		for _, p := range []string{snapPath, memPath, filepath.Join(dir, "base.ext4")} {
+			if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		seedFrozenManifest(t, memPath, "tok")
+		return dir, snapPath, memPath
+	}
+
+	t.Run("restore", func(t *testing.T) {
+		dir, snapPath, memPath := newDir(t)
+		mgr := &Manager{
+			log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir, GuestClockFreezeEnabled: true}, netMgr: &fakeNetMgr{},
+			vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1),
+		}
+		mgr.clockRealtimeCapable.Store(true)
+		mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+			return 4321, SupervisionUnit, nil
+		}
+		mgr.restoreSnapshotHook = func(string, string, string, *bool) error { return nil }
+		wakes = 0
+		_, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: filepath.Join(dir, "base.ext4"), DeltaDir: filepath.Join(dir, "delta")}, nil, "team", "owner", "", nil, 0)
+		if status.Code(err) != codes.FailedPrecondition || wakes != 1 {
+			t.Fatalf("err=%v wakes=%d, want FailedPrecondition after one wake", err, wakes)
+		}
+		for _, p := range []string{snapPath, memPath, WallClockMarkerPath(memPath)} {
+			if _, serr := os.Stat(p); serr != nil {
+				t.Errorf("artifact %s not retained: %v", p, serr)
+			}
+		}
+		mgr.mu.RLock()
+		inst := mgr.vms["vm-1"]
+		mgr.mu.RUnlock()
+		if inst != nil {
+			inst.mu.RLock()
+			st := inst.Status
+			inst.mu.RUnlock()
+			if st != StatusError {
+				t.Errorf("status %v, want Error", st)
+			}
+		}
+	})
+
+	t.Run("resume", func(t *testing.T) {
+		dir, snapPath, memPath := newDir(t)
+		frozen := true
+		inst := &VMInstance{
+			ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
+			SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: filepath.Join(dir, "base.ext4"),
+			SnapshotWorkloadFrozen: &frozen, FreezeToken: "tok",
+		}
+		mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir}, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}}
+		mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+			return 4321, SupervisionUnit, nil
+		}
+		mgr.restoreForResumeHook = func(string, string, string, string, *network.VMNetInfo) (bool, string, error) { return false, "", nil }
+		unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unlock()
+		wakes = 0
+		_, rerr := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
+		if status.Code(rerr) != codes.FailedPrecondition || wakes != 1 {
+			t.Fatalf("err=%v wakes=%d, want FailedPrecondition after one wake", rerr, wakes)
+		}
+		inst.mu.RLock()
+		defer inst.mu.RUnlock()
+		if inst.Status != StatusError {
+			t.Errorf("status %v, want Error and not reverted to Paused", inst.Status)
+		}
+	})
 }

@@ -3,7 +3,6 @@ package vm
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync/atomic"
 	"time"
 
@@ -28,12 +27,6 @@ const (
 	// clockRealtimeCap is what a Firecracker build advertises when it accepts a
 	// per-restore clock policy. A binary that does not is left on legacy.
 	clockRealtimeCap = "clock-realtime-flag"
-
-	// clockFreezeMarkerSuffix names the marker written beside a memory file whose
-	// guest corrects its wall clock on wake. Presence is the whole signal; the
-	// contents are not read, so the file can carry provenance for an operator
-	// without this becoming a format to parse on the restore path.
-	clockFreezeMarkerSuffix = ".wallclock"
 )
 
 // firecrackerCapabilityProbeTimeout bounds one --version exec.
@@ -99,53 +92,25 @@ func (m *Manager) WatchFirecrackerCapability(ctx context.Context, log zerolog.Lo
 	}()
 }
 
-// WallClockMarkerPath is the marker beside a memory image whose guest corrects
-// its own wall clock on wake. Written by the template builder, read by vmd.
-func WallClockMarkerPath(memPath string) string {
-	return memPath + clockFreezeMarkerSuffix
-}
-
-// clockFreezeMarkerPath is the internal spelling; see WallClockMarkerPath.
-func clockFreezeMarkerPath(memPath string) string {
-	return WallClockMarkerPath(memPath)
-}
-
-// snapshotCorrectsWallClock reports whether memPath's guest fixes its own wall
-// clock on wake, and so can safely have its monotonic clock frozen.
-func snapshotCorrectsWallClock(memPath string) bool {
-	if memPath == "" {
-		return false
-	}
-	_, err := os.Stat(clockFreezeMarkerPath(memPath))
-	// Any error — absent, unreadable, a racing delete — reads as "cannot".
-	// Absence of proof is not proof, and the safe answer is the slow one.
-	return err == nil
-}
-
-// guestCorrectsWallClock reports whether the guest now being paused fixes its
-// own wall clock, judged from the images it was restored from: its own memory
-// file, or the layered base beneath it when this is a first pass off a template.
-func guestCorrectsWallClock(instMemFile, instBaseMem string) bool {
-	return snapshotCorrectsWallClock(instMemFile) ||
-		(instBaseMem != "" && snapshotCorrectsWallClock(instBaseMem))
-}
-
 // imageWorkloadFrozen returns whether the image being resumed holds a frozen
-// workload, preferring the durable record to the filesystem.
+// workload, and the token its wake must present, preferring the durable record
+// to the filesystem.
 //
 // An ordinary resume reloads the exact image the VM was paused into, and that
-// pause wrote the fact to the record and the marker together — so the record is
-// already the answer and the resume path need not go to disk for it. Only an
+// pause wrote the facts to the record and the manifest together — so the record
+// is already the answer and the resume path need not go to disk for it. Only an
 // explicit override, supplying an image this VM was never paused into, has to
-// look, because the record then describes a different artifact.
-func imageWorkloadFrozen(memPath, basePath, pausedMemPath string, recorded *bool) bool {
-	if memPath == pausedMemPath && recorded != nil {
-		return *recorded
+// look, because the record then describes a different artifact. An unreadable
+// manifest is an error the caller must refuse on.
+func imageWorkloadFrozen(memPath, basePath, pausedMemPath string, recordedFrozen *bool, recordedToken string) (frozen bool, token string, err error) {
+	if memPath == pausedMemPath && recordedFrozen != nil {
+		return *recordedFrozen, recordedToken, nil
 	}
-	// Either a different image than this VM was paused into, or a record that
-	// never carried the answer — a rollback to a binary without the field drops
-	// it on rewrite, and its silence must not be read as "no".
-	return guestCorrectsWallClock(memPath, basePath)
+	m, err := imageManifest(memPath, basePath)
+	if err != nil || m == nil {
+		return false, "", err
+	}
+	return m.WorkloadFrozen, m.FreezeToken, nil
 }
 
 // clockPolicyFor turns the resolved image fact into a restore policy.
@@ -221,20 +186,24 @@ const defaultGuestFreezeBudget = 500 * time.Millisecond
 
 // freezeGuestForPause freezes the workload ahead of a snapshot. A failed freeze
 // is ambiguous, so the guest is thawed and that must confirm, else the pause aborts.
-func (m *Manager) freezeGuestForPause(ctx context.Context, ip string, log zerolog.Logger) (frozen bool, err error) {
+func (m *Manager) freezeGuestForPause(ctx context.Context, ip, token string, log zerolog.Logger) (frozen bool, err error) {
 	budget := m.cfg.GuestFreezeBudget
 	if budget <= 0 {
 		budget = defaultGuestFreezeBudget
 	}
 	fctx, cancel := context.WithTimeout(ctx, budget)
-	ferr := boxdFreezeGuest(fctx, ip)
+	echo, ferr := boxdFreezeGuest(fctx, ip, token)
 	cancel()
+	if ferr == nil && (echo.Token != token || echo.Version != WallClockManifestVersion) {
+		// The guest froze, but not as this protocol understands it: release it.
+		ferr = fmt.Errorf("freeze reply names protocol %d token %q, asked %d %q", echo.Version, echo.Token, WallClockManifestVersion, token)
+	}
 	if ferr == nil {
 		return true, nil
 	}
 	tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer tcancel()
-	if terr := boxdThawGuest(tctx, ip); terr != nil {
+	if terr := boxdThawGuest(tctx, ip, token); terr != nil {
 		return false, fmt.Errorf("guest workload state unknown after failed freeze (%v); thaw not confirmed: %w", ferr, terr)
 	}
 	log.Warn().Err(ferr).Msg("pause: guest workload not frozen; this image will wake the slower way")

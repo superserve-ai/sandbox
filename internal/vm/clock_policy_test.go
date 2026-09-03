@@ -73,47 +73,61 @@ func TestClockPolicyForSeparatesGuestFromBinary(t *testing.T) {
 	}
 }
 
-// A pause must carry the marker forward, or every resume silently drops back to
-// legacy — the slower half of the bug this exists to fix.
-func TestGuestCorrectsWallClock(t *testing.T) {
-	mark := func(t *testing.T, path string) string {
+// The manifest beside an image governs its restore: its own first, then its
+// layered base's; absent means legacy; anything unreadable is an error the
+// caller refuses on rather than a guess.
+func TestImageManifest(t *testing.T) {
+	frozen := func(t *testing.T, path string) string {
 		t.Helper()
-		if err := os.WriteFile(clockFreezeMarkerPath(path), nil, 0o644); err != nil {
-			t.Fatalf("write marker: %v", err)
-		}
+		seedFrozenManifest(t, path, "tok")
 		return path
 	}
 
-	t.Run("own_memory_file_marked", func(t *testing.T) {
-		dir := t.TempDir()
-		mem := mark(t, filepath.Join(dir, "mem.snap"))
-		if !guestCorrectsWallClock(mem, "") {
-			t.Error("want true when the VM's own image is marked")
+	t.Run("own_image", func(t *testing.T) {
+		mem := frozen(t, filepath.Join(t.TempDir(), "mem.snap"))
+		m, err := imageManifest(mem, "")
+		if err != nil || m == nil || !m.WorkloadFrozen || m.FreezeToken != "tok" {
+			t.Fatalf("m=%+v err=%v", m, err)
 		}
 	})
-
-	// First layered pass: the VM loaded straight off the template base, so the
-	// base is what carries the marker.
-	t.Run("layered_base_marked", func(t *testing.T) {
+	t.Run("layered_base", func(t *testing.T) {
 		dir := t.TempDir()
-		base := mark(t, filepath.Join(dir, "template.snap"))
-		if !guestCorrectsWallClock(filepath.Join(dir, "mem.diff"), base) {
-			t.Error("want true when the layered base is marked")
+		base := frozen(t, filepath.Join(dir, "template.snap"))
+		m, err := imageManifest(filepath.Join(dir, "mem.diff"), base)
+		if err != nil || m == nil || !m.GuestCorrectsClock {
+			t.Fatalf("m=%+v err=%v", m, err)
 		}
 	})
-
-	t.Run("neither_marked", func(t *testing.T) {
+	t.Run("absent_is_legacy", func(t *testing.T) {
 		dir := t.TempDir()
-		if guestCorrectsWallClock(filepath.Join(dir, "mem.snap"), filepath.Join(dir, "base.snap")) {
-			t.Error("want false when nothing is marked")
+		m, err := imageManifest(filepath.Join(dir, "mem.snap"), filepath.Join(dir, "base.snap"))
+		if err != nil || m != nil {
+			t.Fatalf("m=%+v err=%v, want nil, nil", m, err)
 		}
 	})
-
-	// An empty base is the non-layered case, not a path to probe.
-	t.Run("empty_base_is_not_marked", func(t *testing.T) {
-		dir := t.TempDir()
-		if guestCorrectsWallClock(filepath.Join(dir, "mem.snap"), "") {
-			t.Error("want false for an unmarked VM with no base")
+	t.Run("unreadable_is_refused", func(t *testing.T) {
+		for name, body := range map[string]string{"empty": "", "garbage": "{", "future": `{"version":2}`, "frozen_without_token": `{"version":1,"workload_frozen":true}`} {
+			mem := filepath.Join(t.TempDir(), "mem.snap")
+			if err := os.WriteFile(WallClockMarkerPath(mem), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := imageManifest(mem, ""); !errors.Is(err, ErrWallClockManifest) {
+				t.Errorf("%s: err=%v, want ErrWallClockManifest", name, err)
+			}
+		}
+	})
+	t.Run("write_is_atomic_and_readable", func(t *testing.T) {
+		mem := filepath.Join(t.TempDir(), "mem.snap")
+		want := WallClockManifest{Version: 1, ArtifactID: NewArtifactID(), WorkloadFrozen: false, GuestCorrectsClock: true}
+		if err := WriteWallClockManifest(mem, want); err != nil {
+			t.Fatal(err)
+		}
+		got, err := ReadWallClockManifest(mem)
+		if err != nil || got == nil || *got != want {
+			t.Fatalf("got=%+v err=%v want=%+v", got, err, want)
+		}
+		if _, err := os.Stat(WallClockMarkerPath(mem) + ".tmp"); !os.IsNotExist(err) {
+			t.Error("temp file left behind")
 		}
 	})
 }
@@ -287,17 +301,15 @@ func TestCorrectsWallClockAbsentFromOldRecordIsFalse(t *testing.T) {
 func TestResumeWallClockProperty(t *testing.T) {
 	t.Run("same_image_trusts_the_record_over_the_disk", func(t *testing.T) {
 		mem := filepath.Join(t.TempDir(), "mem.snap")
-		if err := os.WriteFile(clockFreezeMarkerPath(mem), nil, 0o644); err != nil {
-			t.Fatalf("seed marker: %v", err)
+		seedFrozenManifest(t, mem, "disk")
+		// Manifest says yes, record says no. The record wins ⇒ no read happened.
+		if frozen, _, err := imageWorkloadFrozen(mem, "", mem, boolPtr(false), ""); err != nil || frozen {
+			t.Errorf("want the recorded value; a manifest on disk means the record was not used (frozen=%v err=%v)", frozen, err)
 		}
-		// Marker says yes, record says no. The record wins ⇒ no stat happened.
-		if imageWorkloadFrozen(mem, "", mem, boolPtr(false)) {
-			t.Error("want the recorded value; a marker on disk means the record was not used")
-		}
-		// And the inverse: no marker on disk, record says yes.
+		// And the inverse: no manifest on disk, record says yes, with its token.
 		bare := filepath.Join(t.TempDir(), "mem.snap")
-		if !imageWorkloadFrozen(bare, "", bare, boolPtr(true)) {
-			t.Error("want the recorded value even with no marker beside the image")
+		if frozen, tok, err := imageWorkloadFrozen(bare, "", bare, boolPtr(true), "rec"); err != nil || !frozen || tok != "rec" {
+			t.Errorf("want the recorded value and token even with no manifest (frozen=%v tok=%q err=%v)", frozen, tok, err)
 		}
 	})
 
@@ -306,18 +318,16 @@ func TestResumeWallClockProperty(t *testing.T) {
 	t.Run("override_image_reads_the_marker", func(t *testing.T) {
 		dir := t.TempDir()
 		override := filepath.Join(dir, "restored.snap")
-		if err := os.WriteFile(clockFreezeMarkerPath(override), nil, 0o644); err != nil {
-			t.Fatalf("seed marker: %v", err)
-		}
-		if !imageWorkloadFrozen(override, "", filepath.Join(dir, "mem.snap"), boolPtr(false)) {
-			t.Error("want the marker consulted when the image is not the paused one")
+		seedFrozenManifest(t, override, "disk")
+		if frozen, tok, err := imageWorkloadFrozen(override, "", filepath.Join(dir, "mem.snap"), boolPtr(false), "rec"); err != nil || !frozen || tok != "disk" {
+			t.Errorf("want the manifest consulted when the image is not the paused one (frozen=%v tok=%q err=%v)", frozen, tok, err)
 		}
 	})
 
 	t.Run("override_without_a_marker_stays_legacy", func(t *testing.T) {
 		dir := t.TempDir()
-		if imageWorkloadFrozen(filepath.Join(dir, "restored.snap"), "", filepath.Join(dir, "mem.snap"), boolPtr(true)) {
-			t.Error("a stale record must not carry over to a different image")
+		if frozen, _, err := imageWorkloadFrozen(filepath.Join(dir, "restored.snap"), "", filepath.Join(dir, "mem.snap"), boolPtr(true), "rec"); err != nil || frozen {
+			t.Errorf("a stale record must not carry over to a different image (frozen=%v err=%v)", frozen, err)
 		}
 	})
 }
@@ -392,17 +402,15 @@ func TestWatchFirecrackerCapability(t *testing.T) {
 // beside the image and delete it at the next pause — a permanent demotion.
 func TestResumeWallClockPropertyUnresolvedRecordConsultsTheMarker(t *testing.T) {
 	mem := filepath.Join(t.TempDir(), "mem.snap")
-	if err := os.WriteFile(clockFreezeMarkerPath(mem), nil, 0o644); err != nil {
-		t.Fatalf("seed marker: %v", err)
-	}
+	seedFrozenManifest(t, mem, "disk")
 	// Same image, but the record lost the answer.
-	if !imageWorkloadFrozen(mem, "", mem, nil) {
-		t.Error("an unresolved record must fall back to the marker, not read as false")
+	if frozen, tok, err := imageWorkloadFrozen(mem, "", mem, nil, ""); err != nil || !frozen || tok != "disk" {
+		t.Errorf("an unresolved record must fall back to the manifest, not read as false (frozen=%v tok=%q err=%v)", frozen, tok, err)
 	}
 
 	bare := filepath.Join(t.TempDir(), "mem.snap")
-	if imageWorkloadFrozen(bare, "", bare, nil) {
-		t.Error("unresolved with no marker must still be false")
+	if frozen, _, err := imageWorkloadFrozen(bare, "", bare, nil, ""); err != nil || frozen {
+		t.Errorf("unresolved with no manifest must still be false (frozen=%v err=%v)", frozen, err)
 	}
 }
 
@@ -423,29 +431,47 @@ func TestFreezeGuestForPause(t *testing.T) {
 	m := &Manager{log: zerolog.Nop()}
 
 	t.Run("frozen", func(t *testing.T) {
-		boxdFreezeGuest = func(context.Context, string) error { return nil }
+		boxdFreezeGuest = func(_ context.Context, _, token string) (freezeEcho, error) {
+			return freezeEcho{Version: 1, Token: token}, nil
+		}
 		thawed := false
-		boxdThawGuest = func(context.Context, string) error { thawed = true; return nil }
-		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
+		boxdThawGuest = func(context.Context, string, string) error { thawed = true; return nil }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
 		if err != nil || !frozen || thawed {
 			t.Fatalf("frozen=%v err=%v thawed=%v; want frozen, no error, no thaw", frozen, err, thawed)
 		}
 	})
 
 	t.Run("refused_then_thaw_confirmed_demotes", func(t *testing.T) {
-		boxdFreezeGuest = func(context.Context, string) error { return errors.New("504: budget") }
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			return freezeEcho{}, errors.New("504: budget")
+		}
 		thawed := false
-		boxdThawGuest = func(context.Context, string) error { thawed = true; return nil }
-		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
+		boxdThawGuest = func(context.Context, string, string) error { thawed = true; return nil }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
 		if err != nil || frozen || !thawed {
 			t.Fatalf("frozen=%v err=%v thawed=%v; want unfrozen, no error, thaw issued", frozen, err, thawed)
 		}
 	})
 
+	t.Run("echo_naming_another_protocol_or_token_demotes", func(t *testing.T) {
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			return freezeEcho{Version: 1, Token: "other"}, nil
+		}
+		thawed := false
+		boxdThawGuest = func(_ context.Context, _, token string) error { thawed = token == "tok"; return nil }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
+		if err != nil || frozen || !thawed {
+			t.Fatalf("frozen=%v err=%v thawed=%v; a guest that froze under another token must be released with ours", frozen, err, thawed)
+		}
+	})
+
 	t.Run("thaw_unconfirmed_aborts_the_pause", func(t *testing.T) {
-		boxdFreezeGuest = func(context.Context, string) error { return errors.New("connection reset") }
-		boxdThawGuest = func(context.Context, string) error { return errors.New("500: thaw not confirmed") }
-		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			return freezeEcho{}, errors.New("connection reset")
+		}
+		boxdThawGuest = func(context.Context, string, string) error { return errors.New("500: thaw not confirmed") }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
 		if err == nil || frozen {
 			t.Fatalf("frozen=%v err=%v; want an error that aborts the pause", frozen, err)
 		}
@@ -454,15 +480,15 @@ func TestFreezeGuestForPause(t *testing.T) {
 	t.Run("call_is_bounded_by_the_budget", func(t *testing.T) {
 		m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{GuestFreezeBudget: 300 * time.Millisecond}}
 		var seen time.Duration
-		boxdFreezeGuest = func(ctx context.Context, _ string) error {
+		boxdFreezeGuest = func(ctx context.Context, _, token string) (freezeEcho, error) {
 			dl, ok := ctx.Deadline()
 			if !ok {
 				t.Fatal("freeze must carry a deadline; it sits on the pause path")
 			}
 			seen = time.Until(dl)
-			return nil
+			return freezeEcho{Version: 1, Token: token}, nil
 		}
-		m.freezeGuestForPause(context.Background(), "10.0.0.2", zerolog.Nop())
+		m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
 		if seen <= 0 || seen > 300*time.Millisecond {
 			t.Errorf("deadline %v from now, want within (0, 300ms]", seen)
 		}
@@ -480,5 +506,12 @@ func TestGuestClockUnreadyLatchesHostToLegacy(t *testing.T) {
 	m.noteGuestClockUnready(zerolog.Nop(), errors.New("no ptp"))
 	if m.clockPolicyFor(true) != nil {
 		t.Error("policy still freezes after the host was latched")
+	}
+}
+
+func seedFrozenManifest(t *testing.T, memPath, token string) {
+	t.Helper()
+	if err := WriteWallClockManifest(memPath, WallClockManifest{Version: WallClockManifestVersion, ArtifactID: "a", WorkloadFrozen: true, GuestCorrectsClock: true, FreezeToken: token}); err != nil {
+		t.Fatalf("seed manifest: %v", err)
 	}
 }
