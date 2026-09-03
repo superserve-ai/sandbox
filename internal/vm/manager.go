@@ -2276,16 +2276,70 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		return nil, err
 	}
 
+	// A base is needed only when memPath is itself a diff overlay. Keying on memPath
+	// (not the cached BaseMemPath) means a standalone/override resume clears any
+	// stale base, so the next pause won't wrongly diff against the old template.
+	//
+	// The .base sidecar is authoritative for THIS overlay, so prefer it — the cached
+	// BaseMemPath only matches the cached overlay (inst.MemFilePath) and would supply
+	// the wrong base for an explicit override of a different mem.diff. Fall back to
+	// the cached base only when the sidecar is missing and this is the cached overlay.
+	basePath := ""
+	if isOverlayMemFile(memPath) {
+		if b, ok := readLayeredBase(memPath); ok {
+			basePath = b
+		} else if memPath == inst.MemFilePath {
+			basePath = inst.BaseMemPath
+		}
+		if basePath == "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
+		}
+	}
+	// A property of the image alone — whether this host can act on it is decided
+	// separately, so an older binary does not erase it.
+	//
+	// An ordinary resume reloads the exact image this VM was paused into, and that
+	// pause recorded the fact beside it and in the durable record. The record is
+	// therefore already the answer, and asking the filesystem again would put
+	// metadata I/O on the resume path for a fact we hold. Only an explicit
+	// override, which supplies an image this VM was not paused into, has to look.
+	inst.mu.RLock()
+	recordedFrozen, pausedMemPath, entryUnverified := inst.SnapshotWorkloadFrozen, inst.MemFilePath, inst.Unverified
+	inst.mu.RUnlock()
+	resumeWorkloadFrozen := imageWorkloadFrozen(memPath, basePath, pausedMemPath, recordedFrozen)
+
 	var (
-		pid                  int
-		basePath             string
-		dirtyTracked         bool
-		trackingSessionID    string
-		restoreErr           error
-		resumeClockFrozen    bool
-		resumeWorkloadFrozen bool
-		syncWake             time.Duration
+		pid               int
+		dirtyTracked      bool
+		trackingSessionID string
+		restoreErr        error
+		resumeClockFrozen bool
+		syncWake          time.Duration
 	)
+	// A frozen image publishes Running with a wake owed before each launch (see
+	// persistWakeOwed). A resume that then fails leaves that record claiming a
+	// guest that never came back: put the sandbox back to Paused, unless a
+	// failure path already gave a more specific verdict.
+	published, committed := false, false
+	defer func() {
+		if !published || committed {
+			return
+		}
+		inst.mu.Lock()
+		revert := inst.Status == StatusRunning && inst.Unverified
+		if revert {
+			inst.Status = StatusPaused
+			inst.Unverified = entryUnverified
+			inst.WakePending = false
+			inst.ClockFrozen = false
+		}
+		inst.mu.Unlock()
+		if revert {
+			// Best-effort: an undurable revert is re-derived by the next attempt.
+			_, _ = m.persistStateIfPresent(inst)
+		}
+	}()
 	// Two passes at most: a frozen-clock restore whose guest cannot correct its
 	// clock is relaunched unfrozen. Only Firecracker is torn down between
 	// passes; the slot, the network, and this frame's cleanup are kept.
@@ -2294,6 +2348,16 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		inst.mu.RLock()
 		resumeExisting := inst.Supervision
 		inst.mu.RUnlock()
+		resumePolicy := m.clockPolicyFor(resumeWorkloadFrozen)
+		var joinWakeOwed func(Supervision) bool
+		if resumeWorkloadFrozen {
+			predicted := SupervisionUnit
+			if m.cgroupLaunch(resumeExisting) {
+				predicted = SupervisionCgroup
+			}
+			joinWakeOwed = m.persistWakeOwed(inst, predicted, resumePolicy != nil)
+			published = true
+		}
 		// freshUnit=false: a resume replaces a paused VM's slot, never a brand-new
 		// unit, so it must always run the linger query.
 		var resumeSupervision = resumeExisting
@@ -2305,51 +2369,28 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		inst.mu.Lock()
 		inst.Supervision = resumeSupervision
 		inst.mu.Unlock()
+		durable := true
+		if joinWakeOwed != nil {
+			durable = joinWakeOwed(resumeSupervision)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("start firecracker for restore: %w", err)
+		}
+		if !durable && !m.persistState(inst) {
+			// Fail closed: the vCPUs must not run ahead of the record that
+			// owes their wake.
+			m.stopUnitDuringRestoreError(vmID)
+			return nil, fmt.Errorf("vm %s: wake record could not be made durable before the load", vmID)
 		}
 		tFcDone = time.Now()
 
 		log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
-		// A base is needed only when memPath is itself a diff overlay. Keying on memPath
-		// (not the cached BaseMemPath) means a standalone/override resume clears any
-		// stale base, so the next pause won't wrongly diff against the old template.
-		//
-		// The .base sidecar is authoritative for THIS overlay, so prefer it — the cached
-		// BaseMemPath only matches the cached overlay (inst.MemFilePath) and would supply
-		// the wrong base for an explicit override of a different mem.diff. Fall back to
-		// the cached base only when the sidecar is missing and this is the cached overlay.
-		basePath = ""
-		if isOverlayMemFile(memPath) {
-			if b, ok := readLayeredBase(memPath); ok {
-				basePath = b
-			} else if memPath == inst.MemFilePath {
-				basePath = inst.BaseMemPath
-			}
-			if basePath == "" {
-				m.stopUnitDuringRestoreError(vmID)
-				return nil, status.Errorf(codes.FailedPrecondition,
-					"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
-			}
-		}
 		tRestore = time.Now()
 		resumeClockFrozen = false
-		// A property of the guest alone — whether this host can act on it is decided
-		// separately, so an older binary does not erase it.
-		//
-		// An ordinary resume reloads the exact image this VM was paused into, and that
-		// pause recorded the property beside it and in the durable record. The record
-		// is therefore already the answer, and asking the filesystem again would put
-		// metadata I/O on the resume path for a fact we hold. Only an explicit
-		// override, which supplies an image this VM was not paused into, has to look.
-		inst.mu.RLock()
-		recordedFrozen, pausedMemPath := inst.SnapshotWorkloadFrozen, inst.MemFilePath
-		inst.mu.RUnlock()
-		resumeWorkloadFrozen = imageWorkloadFrozen(memPath, basePath, pausedMemPath, recordedFrozen)
 		if m.restoreForResumeHook != nil {
 			dirtyTracked, trackingSessionID, restoreErr = m.restoreForResumeHook(socketPath, snapshotPath, memPath, basePath, netInfo)
 		} else {
-			dirtyTracked, trackingSessionID, resumeClockFrozen, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo, m.clockPolicyFor(resumeWorkloadFrozen))
+			dirtyTracked, trackingSessionID, resumeClockFrozen, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo, resumePolicy)
 		}
 		tRestoreDone = time.Now()
 		if restoreErr != nil {
@@ -2387,14 +2428,14 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 				}
 				return nil, status.Errorf(codes.Unavailable, "guest did not wake after restore: %v", werr)
 			}
+			inst.mu.Lock()
+			inst.WakePending = false
+			inst.mu.Unlock()
 		}
 		break
 	}
 
-	inst.mu.RLock()
-	wasUnverified := inst.Unverified
-	inst.mu.RUnlock()
-	if wasUnverified {
+	if entryUnverified {
 		// The relaunch of an unverified crash-window record verifies readiness
 		// synchronously (as its adoption above does): clearing the marker
 		// blind would let a same-artifact restore retry adopt an unready VM without
@@ -2443,6 +2484,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	if cerr := m.commitResumeState(inst); cerr != nil {
 		return nil, cerr
 	}
+	committed = true
 	// A legacy paused record is the one case reattach cannot recover:
 	// it skips paused VMs because a paused VM has no Firecracker to ask.
 	// Resume is when one becomes askable again, so without this such a
@@ -3288,7 +3330,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		clockRetried       bool
 		wakeErr            error
 		tBoxdStart         time.Time
-		persistDone        chan struct{}
 		optimisticOK       bool
 	)
 	for attempt = 1; ; attempt++ {
@@ -3371,25 +3412,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if m.cgroupLaunch(existingSupervision) {
 			predictedSupervision = SupervisionCgroup
 		}
-		inst.mu.Lock()
-		inst.Status = StatusRunning
-		inst.Unverified = true
-		inst.PausedAt = time.Time{}
-		inst.Supervision = predictedSupervision
 		// Cached so the next pause knows whether this guest fixes its own wall
 		// clock without going back to the filesystem to ask.
+		inst.mu.Lock()
 		inst.CorrectsWallClock = &restoreCorrectsWallClock
 		inst.SnapshotWorkloadFrozen = &restoreCorrectsWallClock
-		inst.WakePending = true
-		inst.ClockFrozen = clockPolicy != nil
 		inst.mu.Unlock()
-		done := make(chan struct{})
-		persistDone = done
-		go func() {
-			defer sentrylog.Recover("restore-persist")
-			defer close(done)
-			optimisticOK = m.persistState(inst)
-		}()
+		joinWakeOwed := m.persistWakeOwed(inst, predictedSupervision, clockPolicy != nil)
 		m.beginLaunchAttempt(inst)
 		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace || priorRunDir, freshUnit && attempt == 1)
 		// Stamp the chosen mode NOW, before the error branch: a launch that
@@ -3403,11 +3432,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Joined before the load: the record must owe the wake before the
 		// vCPUs can run. Normally it landed under the launch.
 		tJoin := time.Now()
-		<-persistDone
+		optimisticOK = joinWakeOwed(supervision)
 		persistJoin := time.Since(tJoin)
-		if supervision != predictedSupervision {
-			optimisticOK = m.persistState(inst)
-		}
 		if startErr != nil {
 			tFailBoundary = time.Now()
 			m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
@@ -3756,7 +3782,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		go func() {
 			defer sentrylog.Recover("restore-error-persist")
-			<-persistDone
 			// The identity check and the Error write must be atomic against
 			// a same-ID retry, which serializes on the lifecycle lock: held
 			// here, the map entry cannot be replaced between check and
@@ -3820,7 +3845,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// secs_since_template_restore reflects real warmth for either backend.
 	m.markTemplateRestored(warmthPath)
 
-	<-persistDone
 	if !optimisticOK && !m.persistState(inst) {
 		// The record could not be made durable, so the VM would be invisible
 		// to the next reattach — a zombie unit after any vmd restart. Fail
@@ -7911,6 +7935,39 @@ func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string, inst *VM
 // detached from the caller. Checking AFTER the write leaves no window: the
 // destroy either erased the record itself or is caught here, and we erase our
 // own resurrecting write rather than hand back a destroyed VM.
+// persistWakeOwed publishes Running with a wake owed and starts the durable
+// write so it overlaps the launch. A crash after the load must find a record
+// that owes a wake, or recovery could adopt an older verified record over a
+// guest whose workload is still frozen. The returned join waits for the
+// write, re-persists if the launch landed in another supervision mode, and
+// reports whether the record is durable; the caller must not load the
+// snapshot otherwise. The status is set directly: setStatus would persist
+// synchronously, on the launch path.
+func (m *Manager) persistWakeOwed(inst *VMInstance, predicted Supervision, clockFrozen bool) (join func(actual Supervision) bool) {
+	inst.mu.Lock()
+	inst.Status = StatusRunning
+	inst.Unverified = true
+	inst.PausedAt = time.Time{}
+	inst.Supervision = predicted
+	inst.WakePending = true
+	inst.ClockFrozen = clockFrozen
+	inst.mu.Unlock()
+	done := make(chan struct{})
+	ok := false
+	go func() {
+		defer sentrylog.Recover("wake-owed-persist")
+		defer close(done)
+		ok = m.persistState(inst)
+	}()
+	return func(actual Supervision) bool {
+		<-done
+		if !ok || actual != predicted {
+			ok = m.persistState(inst)
+		}
+		return ok
+	}
+}
+
 func (m *Manager) commitResumeState(inst *VMInstance) error {
 	// A successful relaunch retires any parked-teardown marker: the process
 	// below this record is now the live one it manages.

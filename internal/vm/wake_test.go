@@ -224,13 +224,12 @@ func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
 	}
 	mgr.restoreForResumeHook = func(string, string, string, string, *network.VMNetInfo) (bool, string, error) { return false, "", nil }
 	wakes := 0
-	var sawFrozen bool
-	var statusAtWake VMStatus
+	var sawFrozen, owedAtWake bool
 	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool) error {
 		wakes++
 		sawFrozen = frozen
 		inst.mu.RLock()
-		statusAtWake = inst.Status
+		owedAtWake = inst.WakePending && inst.Unverified
 		inst.mu.RUnlock()
 		return nil
 	}
@@ -249,8 +248,63 @@ func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
 	if sawFrozen {
 		t.Error("the clock was not frozen; the wake must say so")
 	}
-	if statusAtWake == StatusRunning {
-		t.Error("Running was committed before the workload was released")
+	if !owedAtWake {
+		t.Error("the record must owe the wake while the workload is still frozen")
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	if inst.Status != StatusRunning || inst.Unverified || inst.WakePending {
+		t.Errorf("after resume: status=%v unverified=%v wakePending=%v", inst.Status, inst.Unverified, inst.WakePending)
+	}
+}
+
+// A frozen resume that fails after publishing its wake-owed record puts the
+// sandbox back to Paused, so the record does not advertise a guest that never
+// came back.
+func TestFrozenResumeFailureRevertsToPaused(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	rootfs := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snapPath, memPath, rootfs} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	frozen := true
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
+		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs,
+		SnapshotWorkloadFrozen: &frozen,
+	}
+	mgr := &Manager{
+		log:    zerolog.Nop(),
+		cfg:    ManagerConfig{RunDir: dir},
+		netMgr: &fakeNetMgr{},
+		vms:    map[string]*VMInstance{"vm-1": inst},
+	}
+	var owedAtLaunch bool
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		inst.mu.RLock()
+		owedAtLaunch = inst.Status == StatusRunning && inst.WakePending
+		inst.mu.RUnlock()
+		return 0, SupervisionUnit, errors.New("launch failed")
+	}
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err == nil {
+		t.Fatal("want the launch failure")
+	}
+	if !owedAtLaunch {
+		t.Error("the wake-owed record must be published before the launch")
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	if inst.Status != StatusPaused || inst.WakePending || inst.Unverified {
+		t.Errorf("after failure: status=%v wakePending=%v unverified=%v, want Paused and nothing owed", inst.Status, inst.WakePending, inst.Unverified)
 	}
 }
 
