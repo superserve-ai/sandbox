@@ -5139,9 +5139,17 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	}
 	if rec.Status == StatusRunning && inst.WakePending {
 		if cleanupStale {
-			// The startup pass queues it; the pool after the pass completes
-			// the wake, bounded, and publishes the outcome.
-			m.queuePendingWake(inst)
+			// The startup pass queues it for the pool after the pass, holding
+			// the VM's lifecycle lock from here until the pool publishes the
+			// outcome: a restore or resume for this id waits on that lock,
+			// never on the pool. If a request already holds the lock, its own
+			// lazy reattach completes the wake inline; nothing to queue.
+			unlock, ok := m.tryLockVMOp(inst.ID)
+			if !ok {
+				log.Info().Msg("reattach: a request holds this VM's lock; leaving its owed wake to that request")
+				return nil, false
+			}
+			m.queuePendingWake(inst, unlock)
 			return nil, false
 		}
 		if !m.completeOwedWake(ctx, inst, log) {
@@ -8150,6 +8158,9 @@ func (m *Manager) persistWakeOwed(inst *VMInstance, predicted Supervision, clock
 type pendingWake struct {
 	inst *VMInstance
 	done chan struct{}
+	// unlock releases the VM's lifecycle lock, held since the startup pass
+	// queued it, once the outcome is published.
+	unlock func()
 }
 
 const wakeRecoveryWorkers = 4
@@ -8160,15 +8171,17 @@ func (m *Manager) pendingWake(id string) *pendingWake {
 	return m.pendingWakes[id]
 }
 
-func (m *Manager) queuePendingWake(inst *VMInstance) {
+func (m *Manager) queuePendingWake(inst *VMInstance, unlock func()) {
 	m.pendingWakeMu.Lock()
 	defer m.pendingWakeMu.Unlock()
 	if m.pendingWakes == nil {
 		m.pendingWakes = map[string]*pendingWake{}
 	}
-	if _, queued := m.pendingWakes[inst.ID]; !queued {
-		m.pendingWakes[inst.ID] = &pendingWake{inst: inst, done: make(chan struct{})}
+	if _, queued := m.pendingWakes[inst.ID]; queued {
+		unlock()
+		return
 	}
+	m.pendingWakes[inst.ID] = &pendingWake{inst: inst, done: make(chan struct{}), unlock: unlock}
 }
 
 // drainPendingWakes completes every queued wake through a bounded pool and
@@ -8199,18 +8212,12 @@ func (m *Manager) drainPendingWakes(ctx context.Context) int {
 				delete(m.pendingWakes, pw.inst.ID)
 				m.pendingWakeMu.Unlock()
 				close(pw.done)
+				pw.unlock()
 			}()
 			log := m.log.With().Str("vm_id", pw.inst.ID).Logger()
-			// Under the VM's lifecycle lock: a restore or resume for this id
-			// that arrived meanwhile serializes behind the wake instead of
-			// racing it, and one that won the lock first owns the VM — this
-			// instance is then stale and is abandoned, never persisted.
-			unlock, err := m.lockVMOp(ctx, pw.inst.ID)
-			if err != nil {
-				log.Warn().Err(err).Msg("reattach: wake recovery abandoned; the next request re-derives the record")
-				return
-			}
-			defer unlock()
+			// The lifecycle lock has been held since the startup pass queued
+			// this VM, so no restore or resume for the id can have run
+			// meanwhile; the map check below is belt and braces.
 			m.mu.RLock()
 			_, taken := m.vms[pw.inst.ID]
 			m.mu.RUnlock()

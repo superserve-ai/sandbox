@@ -559,7 +559,8 @@ func TestTemplateManifestsLeaveEvidence(t *testing.T) {
 	if _, err := os.Stat(wakeProtocolEvidencePath); !os.IsNotExist(err) {
 		t.Fatal("no templates is not evidence")
 	}
-	tpl := filepath.Join(dir, TemplatesDirName, "tpl")
+	// The builder's layout: templates/<template>/<build>/mem.snap.
+	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
 	if err := os.MkdirAll(tpl, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -569,6 +570,24 @@ func TestTemplateManifestsLeaveEvidence(t *testing.T) {
 	}
 	if _, err := os.Stat(wakeProtocolEvidencePath); err != nil {
 		t.Fatalf("evidence not written after a frozen template landed: %v", err)
+	}
+}
+
+// Evidence already on disk satisfies the floor without rewriting it.
+func TestExistingWakeProtocolEvidenceNeedsNoWrite(t *testing.T) {
+	dir := t.TempDir()
+	orig := wakeProtocolEvidencePath
+	wakeProtocolEvidencePath = filepath.Join(dir, "evidence")
+	wakeProtocolEvidenceDone.Store(false)
+	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceDone.Store(false) })
+	if err := os.WriteFile(wakeProtocolEvidencePath, []byte("older-process\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWakeProtocolFloor(); err != nil || !wakeProtocolEvidenceDone.Load() {
+		t.Fatalf("err=%v done=%v", err, wakeProtocolEvidenceDone.Load())
+	}
+	if b, _ := os.ReadFile(wakeProtocolEvidencePath); string(b) != "older-process\n" {
+		t.Errorf("existing evidence rewritten: %q", b)
 	}
 }
 

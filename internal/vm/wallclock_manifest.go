@@ -78,6 +78,12 @@ func ensureWakeProtocolFloor() error {
 	if wakeProtocolEvidenceDone.Load() {
 		return nil
 	}
+	// Evidence a previous process already made durable satisfies the floor;
+	// only the first genuinely new witness on a host pays the write.
+	if st, err := os.Stat(wakeProtocolEvidencePath); err == nil && st.Size() > 0 {
+		wakeProtocolEvidenceDone.Store(true)
+		return nil
+	}
 	if err := RaiseWakeProtocolFloor(); err != nil {
 		return err
 	}
@@ -211,6 +217,10 @@ func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger
 	if m.cfg.SnapshotDir == "" {
 		return
 	}
+	// Before any request: evidence from a previous process is recognised
+	// without a write, so the first frozen operation after a restart pays
+	// nothing.
+	_ = ensureWakeProtocolFloor()
 	scan := func() {
 		if n := m.scanTemplateManifests(); n > 0 && !wakeProtocolEvidenceLogged.Swap(true) {
 			log.Info().Int("templates", n).Msg("this host holds images that owe a wake; a vmd without the wake protocol is refused from now on")
@@ -237,7 +247,12 @@ var wakeProtocolEvidenceLogged atomic.Bool
 // directory (which records the evidence as a side effect) and returns how
 // many it found.
 func (m *Manager) scanTemplateManifests() int {
-	matches, _ := filepath.Glob(filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, "*", "*"+clockFreezeMarkerSuffix))
+	// Templates live at templates/<template>/<build>/; the shallower pattern
+	// is kept so a flattened layout could never hide one.
+	root := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)
+	deep, _ := filepath.Glob(filepath.Join(root, "*", "*", "*"+clockFreezeMarkerSuffix))
+	shallow, _ := filepath.Glob(filepath.Join(root, "*", "*"+clockFreezeMarkerSuffix))
+	matches := append(deep, shallow...)
 	n := 0
 	for _, path := range matches {
 		if man, err := ReadWallClockManifest(strings.TrimSuffix(path, clockFreezeMarkerSuffix)); err == nil && man != nil {

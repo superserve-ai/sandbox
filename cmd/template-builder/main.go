@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -326,8 +327,15 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	// from it must present it. Minted here, kept by the guest in the snapshot.
 	freezeToken := vm.NewFreezeToken()
 	if correctsWallClock {
-		// The build VM is discarded afterwards, so no thaw.
+		// A freeze whose answer was lost may still have frozen the guest, and
+		// an image with a stopped workload and no manifest would never be
+		// woken. So a failed freeze is followed by a thaw with the same
+		// token: released, or never frozen, means the image is unfrozen and
+		// the build goes on the older way; anything else fails the build.
 		if err := boxdFreezeWorkload(ctx, netInfo.HostIP, freezeToken); err != nil {
+			if terr := boxdThawWorkload(ctx, netInfo.HostIP, freezeToken); terr != nil && !errors.Is(terr, errNoSuchFreeze) {
+				return fmt.Errorf("workload freeze failed (%v) and the guest could not be released (%v); refusing to snapshot a workload in an unknown state", err, terr)
+			}
 			correctsWallClock, why = false, "workload freeze: "+err.Error()
 		}
 	}
@@ -679,6 +687,38 @@ func boxdFreezeWorkload(ctx context.Context, vmIP, token string) error {
 		return fmt.Errorf("POST /freeze: guest speaks protocol %d and holds token %q, asked %d %q", echo.Version, echo.Token, vm.WallClockManifestVersion, token)
 	}
 	return nil
+}
+
+// errNoSuchFreeze: the guest holds no freeze under that token, so there was
+// nothing to release — the freeze never took.
+var errNoSuchFreeze = errors.New("guest holds no freeze under this token")
+
+// boxdThawWorkload releases a freeze whose outcome is unknown. 200 released;
+// 409 errNoSuchFreeze; anything else leaves the state unknown.
+func boxdThawWorkload(ctx context.Context, vmIP, token string) error {
+	url := fmt.Sprintf("http://%s:%d/thaw", vmIP, boxdPort)
+	payload, _ := json.Marshal(struct {
+		Token string `json:"token"`
+	}{token})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /thaw: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return nil
+	case http.StatusConflict:
+		return errNoSuchFreeze
+	default:
+		return fmt.Errorf("POST /thaw: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 }
 
 // userEnv filters the build-time env map down to the keys set via `env`

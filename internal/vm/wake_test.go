@@ -815,6 +815,11 @@ func TestReattachCompletesOwedWakesBeforeServing(t *testing.T) {
 		if mgr.pendingWake("vm-1") == nil {
 			t.Fatal("not queued")
 		}
+		// The lifecycle lock is held for the worker: a restore for this id
+		// would wait on it, not on the pool.
+		if _, ok := mgr.tryLockVMOp("vm-1"); ok {
+			t.Fatal("lifecycle lock not reserved while the wake is pending")
+		}
 		// A request during the wait sees the pool's outcome.
 		got := make(chan *VMInstance, 1)
 		go func() { got <- mgr.reattachByID("vm-1", false) }()
@@ -832,6 +837,32 @@ func TestReattachCompletesOwedWakesBeforeServing(t *testing.T) {
 		if mgr.pendingWake("vm-1") != nil {
 			t.Error("still queued after resolution")
 		}
+		if unlock, ok := mgr.tryLockVMOp("vm-1"); !ok {
+			t.Error("lifecycle lock not released after the pool published")
+		} else {
+			unlock()
+		}
+	})
+
+	t.Run("startup_pass_leaves_a_locked_vm_to_its_request", func(t *testing.T) {
+		mgr, store := newStore(t)
+		origDown := vmUnitFullyDown
+		vmUnitFullyDown = func(string) bool { return false }
+		t.Cleanup(func() { vmUnitFullyDown = origDown })
+		socket := filepath.Join(t.TempDir(), "firecracker.sock")
+		if err := os.WriteFile(socket, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		rec, _ := store.Get("vm-1")
+		rec.SocketPath = socket
+		unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unlock()
+		if inst, ok := mgr.reattachRecord(context.Background(), *rec, true); inst != nil || ok || mgr.pendingWake("vm-1") != nil {
+			t.Fatalf("inst=%v ok=%v queued=%v; a VM whose lock a request holds must not be queued", inst, ok, mgr.pendingWake("vm-1") != nil)
+		}
 	})
 
 	t.Run("pool_abandons_an_instance_a_request_replaced", func(t *testing.T) {
@@ -842,7 +873,11 @@ func TestReattachCompletesOwedWakesBeforeServing(t *testing.T) {
 		}
 		rec, _ := store.Get("vm-1")
 		stale := toInstance(*rec)
-		mgr.queuePendingWake(stale)
+		unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		mgr.queuePendingWake(stale, unlock)
 		// A request won the id first: the replacement owns map and record.
 		replacement := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionUnit, IP: "10.0.0.9"}
 		mgr.vms["vm-1"] = replacement

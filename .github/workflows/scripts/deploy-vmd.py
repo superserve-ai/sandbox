@@ -461,7 +461,7 @@ def main() -> int:
             if ! grep -qa wake-protocol-1 {extract_dir}/bin/vmd; then
                 SNAPSHOTS=$(sed -n 's/^SNAPSHOT_DIR=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -n 1 | tr -d '"')
                 SNAPSHOTS="${{SNAPSHOTS:-/var/lib/sandbox/snapshots}}"
-                if [ -e /var/lib/sandbox/wake-protocol-evidence ] || grep -lqs '"workload_frozen":true' "$SNAPSHOTS"/templates/*/*.wallclock "$SNAPSHOTS"/*/*.wallclock 2>/dev/null; then
+                if [ -e /var/lib/sandbox/wake-protocol-evidence ] || grep -lqs '"workload_frozen":true' "$SNAPSHOTS"/templates/*/*/*.wallclock "$SNAPSHOTS"/templates/*/*.wallclock "$SNAPSHOTS"/*/*.wallclock 2>/dev/null; then
                     echo "ERROR: this host holds images that owe a wake; refusing a vmd without the wake protocol" >&2
                     exit 1
                 fi

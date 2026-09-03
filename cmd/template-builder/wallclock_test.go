@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -128,6 +129,50 @@ func TestBoxdFreezeWorkload(t *testing.T) {
 	t.Run("unreachable_is_an_error", func(t *testing.T) {
 		if err := boxdFreezeWorkload(context.Background(), "127.0.0.1", "tok"); err == nil {
 			t.Fatal("no agent must not read as frozen")
+		}
+	})
+}
+
+// After a freeze whose answer was lost, the build releases the guest with the
+// same token before going on unfrozen; only a release that neither confirmed
+// nor said "no such freeze" leaves the state unknown.
+func TestBoxdThawWorkload(t *testing.T) {
+	serve := func(t *testing.T, status int) func() {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(boxdPort))
+		if err != nil {
+			t.Skipf("port %d busy: %v", boxdPort, err)
+		}
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Token string `json:"token"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if r.URL.Path != "/thaw" || body.Token != "tok" {
+				t.Errorf("unexpected %s with token %q", r.URL.Path, body.Token)
+			}
+			w.WriteHeader(status)
+		}))
+		srv.Listener = ln
+		srv.Start()
+		return srv.Close
+	}
+	t.Run("released", func(t *testing.T) {
+		defer serve(t, 200)()
+		if err := boxdThawWorkload(context.Background(), "127.0.0.1", "tok"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("never_frozen", func(t *testing.T) {
+		defer serve(t, 409)()
+		if err := boxdThawWorkload(context.Background(), "127.0.0.1", "tok"); !errors.Is(err, errNoSuchFreeze) {
+			t.Fatalf("err = %v, want errNoSuchFreeze", err)
+		}
+	})
+	t.Run("unknown_state", func(t *testing.T) {
+		defer serve(t, 500)()
+		if err := boxdThawWorkload(context.Background(), "127.0.0.1", "tok"); err == nil || errors.Is(err, errNoSuchFreeze) {
+			t.Fatalf("err = %v, want an error that fails the build", err)
 		}
 	})
 }
