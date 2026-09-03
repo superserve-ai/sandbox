@@ -144,6 +144,9 @@ func (c *abuseEnforcementCache) Replace(teamID uuid.UUID, trusted bool, restrict
 	if c.trustedTeams == nil {
 		c.trustedTeams = make(map[uuid.UUID]struct{})
 	}
+	// Admission must not charge restrictions that are already expired. Stats
+	// may be disabled, so reclaim them synchronously before sizing a write.
+	c.pruneExpiredRestrictionsLocked(time.Now())
 	if trusted {
 		c.trustedTeams[teamID] = struct{}{}
 	} else {
@@ -261,6 +264,7 @@ func (c *abuseEnforcementCache) Update(teamID uuid.UUID, trusted *bool, restrict
 	if c.trustedTeams == nil {
 		c.trustedTeams = make(map[uuid.UUID]struct{})
 	}
+	c.pruneExpiredRestrictionsLocked(time.Now())
 	if trusted != nil {
 		if *trusted {
 			c.trustedTeams[teamID] = struct{}{}

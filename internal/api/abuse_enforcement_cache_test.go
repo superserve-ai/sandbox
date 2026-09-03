@@ -456,6 +456,29 @@ func TestAbuseEnforcementCacheRestrictionExpiry(t *testing.T) {
 	}
 }
 
+func TestAbuseEnforcementCacheUpdatePrunesExpiredCapacity(t *testing.T) {
+	owner := uuid.New()
+	var c abuseEnforcementCache
+	c.SetCapacity(1)
+	c.Replace(owner, false, abuseEnforcementRestriction{
+		SubjectType: "ip",
+		Value:       "192.0.2.50",
+		Actions:     []abuse.Action{abuse.ActionCreate},
+		ExpiresAt:   time.Now().Add(-time.Second),
+	})
+	c.Update(owner, nil, abuseEnforcementRestriction{
+		SubjectType: "ip",
+		Value:       "192.0.2.51",
+		Actions:     []abuse.Action{abuse.ActionCreate},
+	})
+	if got := c.Stats().AdmissionRejections; got != 0 {
+		t.Fatalf("admission rejections = %d, want 0", got)
+	}
+	if _, ok := c.entries[owner].ip["192.0.2.51|create"]; !ok {
+		t.Fatal("fresh restriction should be admitted after pruning expired state")
+	}
+}
+
 func TestAbuseEnforcementCacheActionWildcard(t *testing.T) {
 	team := uuid.New()
 	var c abuseEnforcementCache
