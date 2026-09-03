@@ -1625,6 +1625,15 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		correctsWallClock = guestCorrectsWallClock(instMemFile, instBaseMem)
 	}
 
+	// Only a pause that may touch a wall-clock manifest records its intent (see
+	// pause_intent.go); a pause of an image without one rewrites nothing a
+	// restore would trust. Written under the freeze round trip.
+	var intentDone chan error
+	if correctsWallClock {
+		done := make(chan error, 1)
+		intentDone = done
+		go func() { done <- writePauseIntent(snapshotDir, vmID) }()
+	}
 	// Freeze the workload before the image exists — only when the restore would
 	// freeze the clock; otherwise the freeze buys nothing.
 	guestFrozen := false
@@ -1652,6 +1661,11 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 				log.Error().Err(terr).Msg("pause: snapshot failed and the guest workload could not be thawed")
 			}
 		}()
+	}
+	if intentDone != nil {
+		if err := <-intentDone; err != nil {
+			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record pause intent: %w", err))
+		}
 	}
 	if !guestFrozen {
 		for _, candidate := range []string{overlayPath, fullPath} {
@@ -1908,6 +1922,15 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	case !wrote:
 		log.Warn().Msg("record deleted during pause stop — destroy owns the teardown")
 		return "", "", nil, status.Errorf(codes.NotFound, "vm %s destroyed during pause", vmID)
+	}
+	// The image, its manifest and the record are all durable: the rewrite is
+	// complete. A marker that cannot be removed keeps refusing restores, which
+	// is the safe failure — an operator removes it once the artifacts are known
+	// good.
+	if intentDone != nil {
+		if err := clearPauseIntent(snapshotDir); err != nil {
+			log.Error().Err(err).Str("dir", snapshotDir).Msg("pause: intent marker could not be cleared; restores of this image are refused until it is removed")
+		}
 	}
 
 	// Every deferral — this pause's and any earlier one — resolves now that
@@ -2223,6 +2246,10 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			return nil, status.Errorf(codes.FailedPrecondition, "memory file missing on host: %s", memPath)
 		}
 		return nil, status.Errorf(codes.FailedPrecondition, "stat mem file %s: %v", memPath, err)
+	}
+	if pauseIntentPresent(filepath.Dir(memPath)) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"image %q: a pause was interrupted while rewriting it; refusing resume until it is inspected", memPath)
 	}
 	// Presence gate for layered overlays. Deterministic from a stat, so it
 	// belongs here with the other precondition checks — a post-boot refusal
@@ -3197,6 +3224,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
+	}
+	if pauseIntentPresent(filepath.Dir(memPath)) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"image %q: a pause was interrupted while rewriting it; refusing restore until it is inspected", memPath)
 	}
 
 	// Sampled before this attempt creates the rundir: a pre-existing rundir

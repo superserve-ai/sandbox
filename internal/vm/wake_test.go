@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/network"
 )
@@ -568,5 +570,63 @@ func TestResumeOfUnfrozenPauseDoesNotFreezeOrWake(t *testing.T) {
 	}
 	if inst.SnapshotWorkloadFrozen == nil || *inst.SnapshotWorkloadFrozen {
 		t.Error("the image fact must say unfrozen")
+	}
+}
+
+// An interrupted pause leaves its intent marker beside the image, and nothing
+// launches over such an image until it is inspected.
+func TestInterruptedPauseRefusesResumeAndRestore(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	rootfs := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snapPath, memPath, rootfs} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writePauseIntent(dir, "vm-1"); err != nil {
+		t.Fatal(err)
+	}
+	if !pauseIntentPresent(dir) {
+		t.Fatal("intent not visible after write")
+	}
+	launched := false
+	launch := func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		launched = true
+		return 4321, SupervisionUnit, nil
+	}
+
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
+		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs,
+	}
+	mgr := &Manager{
+		log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir}, netMgr: &fakeNetMgr{},
+		vms: map[string]*VMInstance{"vm-1": inst}, restoreSem: make(chan struct{}, 1),
+	}
+	mgr.launchFirecrackerHook = launch
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rerr := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
+	unlock()
+	if status.Code(rerr) != codes.FailedPrecondition || launched {
+		t.Fatalf("resume: err=%v launched=%v, want FailedPrecondition before launch", rerr, launched)
+	}
+
+	fresh := &Manager{
+		log: zerolog.Nop(), cfg: ManagerConfig{RunDir: t.TempDir()}, netMgr: &fakeNetMgr{},
+		vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1),
+	}
+	fresh.launchFirecrackerHook = launch
+	_, cerr := fresh.RestoreVMSnapshot(context.Background(), "vm-2", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
+	if status.Code(cerr) != codes.FailedPrecondition || launched {
+		t.Fatalf("restore: err=%v launched=%v, want FailedPrecondition before launch", cerr, launched)
+	}
+
+	if err := clearPauseIntent(dir); err != nil || pauseIntentPresent(dir) {
+		t.Fatalf("clear: err=%v present=%v", err, pauseIntentPresent(dir))
 	}
 }
