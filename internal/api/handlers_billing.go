@@ -63,7 +63,16 @@ type billingSummaryResponse struct {
 	ResourcesByKey           map[string]billingSummaryResource `json:"resources_by_key,omitempty"`
 	BillingPeriod            billingSummaryPeriod              `json:"billing_period"`
 	PricingTier              billingSummaryPricingTier         `json:"pricing_tier"`
+	Trial                    *billingTrialBalance              `json:"trial,omitempty"`
 	CalculatedAt             time.Time                         `json:"calculated_at"`
+}
+
+type billingTrialBalance struct {
+	GrantUSD     float64 `json:"grant_usd"`
+	ConsumedUSD  float64 `json:"consumed_usd"`
+	RemainingUSD float64 `json:"remaining_usd"`
+	State        string  `json:"state"`
+	Eligible     bool    `json:"eligible"`
 }
 
 type billingSummaryCostBreakdown struct {
@@ -188,6 +197,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		usage         db.GetTeamBillingUsageRow
 		pricingRows   []db.ListActivePricingRatesForTeamCurrentRow
 		creditBalance pgtype.Numeric
+		trialBalance  db.GetTeamTrialBalanceRow
 	)
 	g, ctx := errgroup.WithContext(c.Request.Context())
 	g.Go(func() error {
@@ -199,6 +209,14 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		})
 		if err != nil {
 			return fmt.Errorf("get team billing usage: %w", err)
+		}
+		return nil
+	})
+	g.Go(func() error {
+		var err error
+		trialBalance, err = h.DB.GetTeamTrialBalance(ctx, teamID)
+		if err != nil {
+			return fmt.Errorf("get team trial balance: %w", err)
 		}
 		return nil
 	})
@@ -226,6 +244,29 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing summary dependency fetch failed")
 		respondError(c, ErrInternal)
 		return
+	}
+	grantUSD, err := numericFloat64(trialBalance.GrantUsd)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert trial grant failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	consumedUSD, err := numericFloat64(trialBalance.ConsumedUsd)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert trial consumption failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	remainingUSD, err := numericFloat64(trialBalance.RemainingUsd)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert trial remaining failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if (trialBalance.State == "active" && remainingUSD <= 0) ||
+		(trialBalance.State == "exhausted" && remainingUSD > 0) {
+		log.Error().Str("team_id", teamID.String()).Str("state", trialBalance.State).
+			Float64("remaining_usd", remainingUSD).Msg("billing trial balance inconsistent")
 	}
 
 	storageBillingEnabled, err := h.billingStorageBillingEnabled(c.Request.Context(), teamID)
@@ -341,6 +382,16 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 			PlanKey:  pricingCatalog.PlanKey,
 			PlanName: pricingCatalog.PlanName,
 			Currency: pricingCatalog.Currency,
+		},
+		// Always include the structured trial result so clients can distinguish
+		// an account with no applicable signup grant from an omitted/unknown
+		// billing field. The no_grant state carries zero monetary values.
+		Trial: &billingTrialBalance{
+			GrantUSD:     grantUSD,
+			ConsumedUSD:  consumedUSD,
+			RemainingUSD: remainingUSD,
+			State:        trialBalance.State,
+			Eligible:     trialBalance.Eligible,
 		},
 		CalculatedAt: now,
 	})
