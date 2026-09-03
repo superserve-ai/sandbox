@@ -503,9 +503,10 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 			Status    string          `json:"status"`
 			WallClock wallClockStatus `json:"wall_clock"`
 		}{Status: status, WallClock: wc})
-		// Logged only once the workload runs and the supervisor has its answer.
+		// The diagnostic never delays the answer: the response is only
+		// flushed when this handler returns.
 		if wc.CorrectedMs != 0 {
-			log.Printf("wall clock: corrected by %dms from host time", wc.CorrectedMs)
+			go log.Printf("wall clock: corrected by %dms from host time", wc.CorrectedMs)
 		}
 	}
 }
