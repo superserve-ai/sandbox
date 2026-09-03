@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,11 +12,12 @@ import (
 )
 
 func wake(clock *wallClock, fz *freezer, clockFrozen bool) (int, map[string]any) {
+	return wakeWith(clock, fz, clockFrozen, "t1")
+}
+
+func wakeWith(clock *wallClock, fz *freezer, clockFrozen bool, token string) (int, map[string]any) {
 	rec := httptest.NewRecorder()
-	body := `{"clock_frozen":false}`
-	if clockFrozen {
-		body = `{"clock_frozen":true}`
-	}
+	body := fmt.Sprintf(`{"clock_frozen":%v,"token":%q}`, clockFrozen, token)
 	handleWake(clock, fz)(rec, httptest.NewRequest(http.MethodPost, "/wake", strings.NewReader(body)))
 	var out map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
@@ -35,7 +37,7 @@ func health(clock *wallClock, fz *freezer, query string) (int, map[string]any) {
 func TestWakeFrozenRestoreCorrectsThenThaws(t *testing.T) {
 	cg := newFake()
 	fz := newFreezer(cg, testDir)
-	_ = fz.freeze(bg())
+	_ = fz.freeze(bg(), "t1")
 	src := &fakeSource{host: base.Add(48 * time.Hour)}
 	code, body := wake(clockUnder(src, base), fz, true)
 	if code != 200 || body["status"] != "ok" {
@@ -54,7 +56,7 @@ func TestWakeFrozenRestoreCorrectsThenThaws(t *testing.T) {
 func TestWakeFrozenRestoreWithoutHostTimeStaysFrozen(t *testing.T) {
 	cg := newFake()
 	fz := newFreezer(cg, testDir)
-	_ = fz.freeze(bg())
+	_ = fz.freeze(bg(), "t1")
 	code, body := wake(clockUnder(&fakeSource{hostErr: errors.New("no ptp")}, base), fz, true)
 	if code != 503 || body["status"] != "clock" {
 		t.Fatalf("code %d body %v, want 503 clock", code, body)
@@ -69,7 +71,7 @@ func TestWakeFrozenRestoreWithoutHostTimeStaysFrozen(t *testing.T) {
 func TestWakeUnfrozenRestoreReleasesEvenWithoutHostTime(t *testing.T) {
 	cg := newFake()
 	fz := newFreezer(cg, testDir)
-	_ = fz.freeze(bg())
+	_ = fz.freeze(bg(), "t1")
 	code, _ := wake(clockUnder(&fakeSource{hostErr: errors.New("no ptp")}, base), fz, false)
 	if code != 200 || fz.isFrozen() {
 		t.Fatalf("code %d frozen %v, want 200 and released", code, fz.isFrozen())
@@ -79,7 +81,7 @@ func TestWakeUnfrozenRestoreReleasesEvenWithoutHostTime(t *testing.T) {
 func TestWakeUnreadyWhenThawCannotBeConfirmed(t *testing.T) {
 	cg := newFake()
 	fz := newFreezer(cg, testDir)
-	_ = fz.freeze(bg())
+	_ = fz.freeze(bg(), "t1")
 	cg.stuckThaw = true
 	code, body := wake(clockUnder(&fakeSource{host: base}, base), fz, true)
 	if code != 503 || body["status"] != "thaw" {
@@ -87,14 +89,25 @@ func TestWakeUnreadyWhenThawCannotBeConfirmed(t *testing.T) {
 	}
 }
 
-// A guest that was never frozen — fresh boot — wakes ready with nothing to do.
-func TestWakeIsIdempotentAndHarmlessWhenNotFrozen(t *testing.T) {
+// A wake repeated with its own token after success is answered the same way;
+// any other token names no freeze this guest holds and changes nothing.
+func TestWakeIsIdempotentForItsTokenOnly(t *testing.T) {
 	fz := newFreezer(newFake(), testDir)
+	_ = fz.freeze(bg(), "t1")
 	clock := clockUnder(&fakeSource{host: base}, base)
+	if code, body := wakeWith(clock, fz, false, "t2"); code != 409 || body["status"] != "token" || !fz.isFrozen() {
+		t.Fatalf("wrong token: code %d body %v frozen %v, want 409 token and still frozen", code, body, fz.isFrozen())
+	}
 	for i := 0; i < 3; i++ {
-		if code, _ := wake(clock, fz, false); code != 200 {
+		if code, _ := wakeWith(clock, fz, false, "t1"); code != 200 {
 			t.Fatalf("wake %d: code %d, want 200", i, code)
 		}
+	}
+	if code, _ := wakeWith(clock, fz, false, "t2"); code != 409 {
+		t.Fatalf("stale token after release: code %d, want 409", code)
+	}
+	if code, _ := wakeWith(clock, newFreezer(newFake(), testDir), false, "t1"); code != 409 {
+		t.Fatalf("never frozen: code %d, want 409", code)
 	}
 }
 
@@ -102,7 +115,7 @@ func TestWakeIsIdempotentAndHarmlessWhenNotFrozen(t *testing.T) {
 func TestHealthNeverMutates(t *testing.T) {
 	cg := newFake()
 	fz := newFreezer(cg, testDir)
-	_ = fz.freeze(bg())
+	_ = fz.freeze(bg(), "t1")
 	src := &fakeSource{host: base.Add(time.Hour)}
 	code, body := health(clockUnder(src, base), fz, "")
 	if code != 503 || body["status"] != "frozen" {
@@ -132,10 +145,10 @@ func TestHealthVerifySettime(t *testing.T) {
 
 // A wake that does not say whether the clock was frozen releases nothing.
 func TestWakeWithoutClockFrozenIsRefused(t *testing.T) {
-	for _, body := range []string{"", "{}", "not json", `{"clock_frozen":"yes"}`} {
+	for _, body := range []string{"", "{}", "not json", `{"clock_frozen":"yes","token":"t1"}`, `{"token":"t1"}`, `{"clock_frozen":true}`} {
 		cg := newFake()
 		fz := newFreezer(cg, testDir)
-		_ = fz.freeze(bg())
+		_ = fz.freeze(bg(), "t1")
 		src := &fakeSource{host: base.Add(48 * time.Hour)}
 		rec := httptest.NewRecorder()
 		handleWake(clockUnder(src, base), fz)(rec, httptest.NewRequest(http.MethodPost, "/wake", strings.NewReader(body)))

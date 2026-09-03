@@ -65,7 +65,17 @@ type freezer struct {
 	// frozen mirrors the state this freezer last confirmed, so health can
 	// answer without a file read or waiting on a freeze in progress.
 	frozen atomic.Bool
+	// token is the supervisor's proof that a thaw or wake belongs to the
+	// freeze it is releasing; it lives here, so it is in the snapshot. last
+	// is the token of the freeze most recently released, so a repeated
+	// request after success is answered the same way.
+	token, last string
 }
+
+var (
+	errTokenMismatch = errors.New("freeze token mismatch")
+	errTokenConflict = errors.New("another freeze is active")
+)
 
 func newFreezer(fs freezerFS, dir string) *freezer {
 	f := &freezer{fs: fs, dir: dir}
@@ -109,13 +119,20 @@ func (f *freezer) isFrozen() bool {
 }
 
 // freeze stops the cgroup and waits for every task to stop. On timeout it
-// thaws; an unconfirmed thaw wraps errThawUnconfirmed.
-func (f *freezer) freeze(ctx context.Context) error {
+// thaws; an unconfirmed thaw wraps errThawUnconfirmed. Repeating a freeze
+// with its own token succeeds; a different token while one is active conflicts.
+func (f *freezer) freeze(ctx context.Context, token string) error {
 	if !f.available() {
 		return errors.New("freezer cgroup unavailable")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.frozen.Load() {
+		if token == f.token {
+			return nil
+		}
+		return errTokenConflict
+	}
 
 	if err := f.fs.writeState("FROZEN"); err != nil {
 		return fmt.Errorf("request freeze: %w", err)
@@ -129,6 +146,7 @@ func (f *freezer) freeze(ctx context.Context) error {
 		}
 		if st == "FROZEN" {
 			f.frozen.Store(true)
+			f.token = token
 			return nil
 		}
 		select {
@@ -147,14 +165,42 @@ func (f *freezer) undo(cause error) error {
 	return cause
 }
 
-// thaw lets the workload run and confirms it did. A no-op without a cgroup.
-func (f *freezer) thaw() error {
+// thaw lets the workload run and confirms it did, for the freeze the token
+// names. Repeating it after success succeeds; any other token is refused
+// without changing state. A no-op without a cgroup.
+func (f *freezer) thaw(token string) error {
 	if !f.available() {
 		return nil
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.thawLocked()
+	if !f.frozen.Load() {
+		if token == f.last && token != "" {
+			return nil
+		}
+		return errTokenMismatch
+	}
+	if token != f.token {
+		return errTokenMismatch
+	}
+	if err := f.thawLocked(); err != nil {
+		return err
+	}
+	f.last, f.token = f.token, ""
+	return nil
+}
+
+// holds reports whether token names the active freeze, or the last released one.
+func (f *freezer) holds(token string) bool {
+	if !f.available() {
+		return false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.frozen.Load() {
+		return token == f.token
+	}
+	return token != "" && token == f.last
 }
 
 func (f *freezer) thawLocked() error {
@@ -179,8 +225,10 @@ func (f *freezer) thawLocked() error {
 	return nil
 }
 
-// POST /freeze {"budget_ms": N}: 200 frozen; 503 cannot freeze; 504 budget
-// exhausted and thawed again; 500 budget exhausted and thaw unconfirmed.
+// POST /freeze {"budget_ms": N, "token": T}: 200 frozen, with the protocol
+// version, capability and token echoed; 400 no token; 409 another freeze is
+// active; 503 cannot freeze; 504 budget exhausted and thawed again; 500 budget
+// exhausted and thaw unconfirmed.
 func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -189,10 +237,15 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 	}
 	budget := defaultFreezeBudget
 	var body struct {
-		BudgetMs int64 `json:"budget_ms"`
+		BudgetMs int64  `json:"budget_ms"`
+		Token    string `json:"token"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	if body.Token == "" {
+		http.Error(w, "token required", http.StatusBadRequest)
+		return
 	}
 	if body.BudgetMs > 0 {
 		budget = time.Duration(body.BudgetMs) * time.Millisecond
@@ -200,9 +253,11 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), budget)
 	defer cancel()
 
-	if err := f.freeze(ctx); err != nil {
+	if err := f.freeze(ctx, body.Token); err != nil {
 		code := http.StatusServiceUnavailable
 		switch {
+		case errors.Is(err, errTokenConflict):
+			code = http.StatusConflict
 		case errors.Is(err, errThawUnconfirmed):
 			code = http.StatusInternalServerError
 		case errors.Is(err, context.DeadlineExceeded):
@@ -212,27 +267,58 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), code)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(freezeReply{Version: protocolVersion, Capability: protocolCapability, Token: body.Token})
 }
 
-// POST /thaw: the snapshot did not happen. 200 only once confirmed running.
+// protocolVersion is the wake protocol this boxd speaks; the supervisor
+// refuses an image whose manifest names one it does not understand.
+const (
+	protocolVersion    = 1
+	protocolCapability = "wake"
+)
+
+type freezeReply struct {
+	Version    int    `json:"version"`
+	Capability string `json:"capability"`
+	Token      string `json:"token"`
+}
+
+// POST /thaw {"token": T}: the snapshot did not happen. 200 only once
+// confirmed running; 409 the token names no freeze this guest holds.
 func (f *freezer) handleThaw(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := f.thaw(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	var body struct {
+		Token string `json:"token"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	if body.Token == "" {
+		http.Error(w, "token required", http.StatusBadRequest)
+		return
+	}
+	if err := f.thaw(body.Token); err != nil {
+		code := http.StatusInternalServerError
+		if errors.Is(err, errTokenMismatch) {
+			code = http.StatusConflict
+		}
+		http.Error(w, err.Error(), code)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 }
 
-// POST /wake {"clock_frozen": bool}: the supervisor restored this guest.
-// Correct the clock — required if it was restored frozen — then release the
-// workload. 200 ready; 503 with status "clock" or "thaw" otherwise, workload
-// left stopped. Idempotent: a woken guest answers 200 again.
+// POST /wake {"clock_frozen": bool, "token": T}: the supervisor restored this
+// guest. Correct the clock — required if it was restored frozen — then release
+// the workload. 200 ready; 409 with status "token" when the token names no
+// freeze this guest holds, nothing changed; 503 with status "clock" or "thaw"
+// otherwise, workload left stopped. Idempotent: a woken guest answers 200 again
+// to the same token.
 func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -241,18 +327,27 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			ClockFrozen *bool `json:"clock_frozen"`
+			ClockFrozen *bool  `json:"clock_frozen"`
+			Token       string `json:"token"`
 		}
-		if r.Body == nil || json.NewDecoder(r.Body).Decode(&body) != nil || body.ClockFrozen == nil {
-			// A wake that does not say whether the clock was frozen releases
-			// nothing.
-			http.Error(w, "clock_frozen required", http.StatusBadRequest)
+		if r.Body == nil || json.NewDecoder(r.Body).Decode(&body) != nil || body.ClockFrozen == nil || body.Token == "" {
+			// A wake that does not say whether the clock was frozen, or whose
+			// freeze it belongs to, releases nothing.
+			http.Error(w, "clock_frozen and token required", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if !fz.holds(body.Token) {
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(struct {
+				Status string `json:"status"`
+			}{"token"})
 			return
 		}
 		wc, ready := clock.sync(*body.ClockFrozen)
 		status := "ok"
 		if ready {
-			if err := fz.thaw(); err != nil {
+			if err := fz.thaw(body.Token); err != nil {
 				log.Printf("freezer: thaw on wake failed: %v", err)
 				ready, status = false, "thaw"
 				wc.Error = "thaw: " + err.Error()
@@ -260,7 +355,6 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 		} else {
 			status = "clock"
 		}
-		w.Header().Set("Content-Type", "application/json")
 		if !ready {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}

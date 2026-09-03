@@ -74,7 +74,7 @@ func TestFreezeWaitsForEveryTaskToStop(t *testing.T) {
 	cg := newFake()
 	cg.stallFor = 3
 	fz := newFreezer(cg, testDir)
-	if err := fz.freeze(bg()); err != nil {
+	if err := fz.freeze(bg(), "t1"); err != nil {
 		t.Fatalf("freeze: %v", err)
 	}
 	if !fz.isFrozen() {
@@ -88,7 +88,7 @@ func TestFreezeWaitsForEveryTaskToStop(t *testing.T) {
 func TestFrozenStaysFrozenUntilTold(t *testing.T) {
 	cg := newFake()
 	fz := newFreezer(cg, testDir)
-	if err := fz.freeze(bg()); err != nil {
+	if err := fz.freeze(bg(), "t1"); err != nil {
 		t.Fatal(err)
 	}
 	// Health may be polled any number of times in the window before the
@@ -118,7 +118,7 @@ func TestFreezeTimeoutThawsAndFails(t *testing.T) {
 	fz := newFreezer(cg, testDir)
 	ctx, cancel := context.WithTimeout(bg(), 30*time.Millisecond)
 	defer cancel()
-	err := fz.freeze(ctx)
+	err := fz.freeze(ctx, "t1")
 	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errThawUnconfirmed) {
 		t.Fatalf("err = %v, want deadline exceeded with a confirmed thaw", err)
 	}
@@ -134,7 +134,7 @@ func TestFreezeTimeoutWithUnconfirmedThawSaysSo(t *testing.T) {
 	fz := newFreezer(cg, testDir)
 	ctx, cancel := context.WithTimeout(bg(), 20*time.Millisecond)
 	defer cancel()
-	if err := fz.freeze(ctx); !errors.Is(err, errThawUnconfirmed) {
+	if err := fz.freeze(ctx, "t1"); !errors.Is(err, errThawUnconfirmed) {
 		t.Fatalf("err = %v, want errThawUnconfirmed", err)
 	}
 }
@@ -170,15 +170,15 @@ func TestWrapIsPassthroughWithoutCgroup(t *testing.T) {
 func TestThawConfirmsOrFails(t *testing.T) {
 	cg := newFake()
 	fz := newFreezer(cg, testDir)
-	if err := fz.freeze(bg()); err != nil {
+	if err := fz.freeze(bg(), "t1"); err != nil {
 		t.Fatal(err)
 	}
 	cg.stuckThaw = true
-	if err := fz.thaw(); err == nil {
+	if err := fz.thaw("t1"); err == nil {
 		t.Fatal("thaw that changed nothing must fail")
 	}
 	cg.stuckThaw = false
-	if err := fz.thaw(); err != nil {
+	if err := fz.thaw("t1"); err != nil {
 		t.Fatalf("thaw: %v", err)
 	}
 	if fz.isFrozen() {
@@ -194,16 +194,16 @@ func TestAbsentCgroupDegradesButBrokenErrors(t *testing.T) {
 	if fz.available() {
 		t.Error("absent cgroup reported available")
 	}
-	if err := fz.thaw(); err != nil {
+	if err := fz.thaw("t1"); err != nil {
 		t.Errorf("thaw without cgroup: %v, want nil", err)
 	}
-	if err := fz.freeze(bg()); err == nil {
+	if err := fz.freeze(bg(), "t1"); err == nil {
 		t.Error("freeze without cgroup must be refused")
 	}
 	broken := newFake()
 	bfz := newFreezer(broken, testDir)
 	broken.readErr = errors.New("EIO")
-	if err := bfz.thaw(); err == nil {
+	if err := bfz.thaw("t1"); err == nil {
 		t.Error("thaw on an unreadable cgroup must not report success")
 	}
 }
@@ -219,22 +219,30 @@ func TestFreezeEndpointStatusCodes(t *testing.T) {
 		}
 		return rec.Code
 	}
-	t.Run("frozen_is_200", func(t *testing.T) {
-		if got := post(newFreezer(newFake(), testDir), "/freeze", ""); got != 200 {
-			t.Errorf("status %d, want 200", got)
+	t.Run("frozen_is_200_and_echoes", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		fz := newFreezer(newFake(), testDir)
+		fz.handleFreeze(rec, httptest.NewRequest(http.MethodPost, "/freeze", strings.NewReader(`{"token":"t1"}`)))
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"token":"t1"`) || !strings.Contains(rec.Body.String(), `"version":1`) {
+			t.Errorf("status %d body %s, want 200 echoing version and token", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("no_token_is_400", func(t *testing.T) {
+		if got := post(newFreezer(newFake(), testDir), "/freeze", ""); got != 400 {
+			t.Errorf("status %d, want 400", got)
 		}
 	})
 	t.Run("no_cgroup_is_503", func(t *testing.T) {
 		cg := newFake()
 		cg.missing = true
-		if got := post(newFreezer(cg, testDir), "/freeze", ""); got != 503 {
+		if got := post(newFreezer(cg, testDir), "/freeze", `{"token":"t1"}`); got != 503 {
 			t.Errorf("status %d, want 503", got)
 		}
 	})
 	t.Run("budget_exhausted_is_504", func(t *testing.T) {
 		cg := newFake()
 		cg.neverDone = true
-		if got := post(newFreezer(cg, testDir), "/freeze", `{"budget_ms":20}`); got != 504 {
+		if got := post(newFreezer(cg, testDir), "/freeze", `{"budget_ms":20,"token":"t1"}`); got != 504 {
 			t.Errorf("status %d, want 504", got)
 		}
 	})
@@ -242,24 +250,66 @@ func TestFreezeEndpointStatusCodes(t *testing.T) {
 		cg := newFake()
 		cg.neverDone = true
 		cg.stuckThaw = true
-		if got := post(newFreezer(cg, testDir), "/freeze", `{"budget_ms":20}`); got != 500 {
+		if got := post(newFreezer(cg, testDir), "/freeze", `{"budget_ms":20,"token":"t1"}`); got != 500 {
 			t.Errorf("status %d, want 500", got)
 		}
 	})
 	t.Run("thaw_confirmed_is_200", func(t *testing.T) {
-		if got := post(newFreezer(newFake(), testDir), "/thaw", ""); got != 200 {
+		fz := newFreezer(newFake(), testDir)
+		_ = fz.freeze(bg(), "t1")
+		if got := post(fz, "/thaw", `{"token":"t1"}`); got != 200 {
 			t.Errorf("status %d, want 200", got)
 		}
 	})
 	t.Run("thaw_unconfirmed_is_500", func(t *testing.T) {
 		cg := newFake()
 		fz := newFreezer(cg, testDir)
-		_ = fz.freeze(bg())
+		_ = fz.freeze(bg(), "t1")
 		cg.stuckThaw = true
-		if got := post(fz, "/thaw", ""); got != 500 {
+		if got := post(fz, "/thaw", `{"token":"t1"}`); got != 500 {
 			t.Errorf("status %d, want 500", got)
 		}
 	})
+}
+
+// The token table: a freeze repeated with its own token succeeds, a second
+// token while one is active conflicts, a thaw or wake repeated after success
+// succeeds, and a missing or different token is refused without changing state.
+func TestFreezeTokenTable(t *testing.T) {
+	post := func(fz *freezer, path, body string) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		if path == "/freeze" {
+			fz.handleFreeze(rec, req)
+		} else {
+			fz.handleThaw(rec, req)
+		}
+		return rec.Code
+	}
+	fz := newFreezer(newFake(), testDir)
+	steps := []struct {
+		path, body string
+		want       int
+		frozen     bool
+	}{
+		{"/thaw", `{"token":"t1"}`, 409, false},
+		{"/freeze", `{"token":"t1"}`, 200, true},
+		{"/freeze", `{"token":"t1"}`, 200, true},
+		{"/freeze", `{"token":"t2"}`, 409, true},
+		{"/thaw", `{"token":"t2"}`, 409, true},
+		{"/thaw", ``, 400, true},
+		{"/thaw", `{"token":"t1"}`, 200, false},
+		{"/thaw", `{"token":"t1"}`, 200, false},
+		{"/thaw", `{"token":"t2"}`, 409, false},
+		{"/freeze", `{"token":"t2"}`, 200, true},
+		{"/thaw", `{"token":"t1"}`, 409, true},
+		{"/thaw", `{"token":"t2"}`, 200, false},
+	}
+	for i, st := range steps {
+		if got := post(fz, st.path, st.body); got != st.want || fz.isFrozen() != st.frozen {
+			t.Fatalf("step %d %s %s: code %d frozen %v, want %d %v", i, st.path, st.body, got, fz.isFrozen(), st.want, st.frozen)
+		}
+	}
 }
 
 func TestNilFreezerIsANoOp(t *testing.T) {
@@ -272,10 +322,10 @@ func TestNilFreezerIsANoOp(t *testing.T) {
 	if name, args := f.wrap("/bin/true", nil); name != "/bin/true" || args != nil {
 		t.Error("nil freezer must not wrap")
 	}
-	if err := f.thaw(); err != nil {
+	if err := f.thaw("t1"); err != nil {
 		t.Errorf("thaw on nil: %v", err)
 	}
-	if err := f.freeze(bg()); err == nil {
+	if err := f.freeze(bg(), "t1"); err == nil {
 		t.Error("freeze on nil must be refused")
 	}
 }
