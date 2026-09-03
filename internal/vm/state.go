@@ -213,11 +213,25 @@ type VMRecord struct {
 	// rewrites a record, so after a rollback and re-upgrade the field is absent
 	// again — decoding that silence as false would ignore a marker still on disk
 	// and delete it at the next pause. Nil means "ask the disk".
-	CorrectsWallClock *bool             `json:"corrects_wall_clock,omitempty"`
-	CreatedAt         time.Time         `json:"created_at"`
-	Metadata          map[string]string `json:"metadata,omitempty"`
-	VCPU              uint32            `json:"vcpu"`
-	MemoryMiB         uint32            `json:"memory_mib"`
+	CorrectsWallClock *bool `json:"corrects_wall_clock,omitempty"`
+	// SnapshotWorkloadFrozen: the image this VM was last paused into holds a
+	// frozen workload. Set by every pause, so a pause that froze nothing cannot
+	// leave an older "frozen" answer for the next resume to act on. Tri-state
+	// for the same reason as CorrectsWallClock.
+	SnapshotWorkloadFrozen *bool `json:"snapshot_workload_frozen,omitempty"`
+	// WakePending: restored but the guest has not yet been told to correct its
+	// clock and release its workload. Written with the Running record, so a
+	// daemon that crashes between the two completes the wake on recovery
+	// instead of verifying a stopped workload as ready. ClockFrozen is the
+	// policy that restore used, which the wake must carry.
+	WakePending bool              `json:"wake_pending,omitempty"`
+	ClockFrozen bool              `json:"clock_frozen,omitempty"`
+	FreezeToken string            `json:"freeze_token,omitempty"`
+	ArtifactID  string            `json:"artifact_id,omitempty"`
+	CreatedAt   time.Time         `json:"created_at"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	VCPU        uint32            `json:"vcpu"`
+	MemoryMiB   uint32            `json:"memory_mib"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
 	// dual-symlink mount namespace). DeltaDir is intentionally NOT
@@ -905,6 +919,11 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		StrandedOverlays:           append([]string(nil), inst.StrandedOverlays...),
 		DirtyTrackingSessionID:     inst.DirtyTrackingSessionID,
 		CorrectsWallClock:          inst.CorrectsWallClock,
+		SnapshotWorkloadFrozen:     inst.SnapshotWorkloadFrozen,
+		WakePending:                inst.WakePending,
+		FreezeToken:                inst.FreezeToken,
+		ArtifactID:                 inst.ArtifactID,
+		ClockFrozen:                inst.ClockFrozen,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
@@ -1006,6 +1025,11 @@ func toInstance(rec VMRecord) *VMInstance {
 		// untracked and pause Full, exactly as before.
 		DirtyTracked:               rec.Status == StatusRunning && rec.DirtyTrackingSessionID != "",
 		CorrectsWallClock:          rec.CorrectsWallClock,
+		SnapshotWorkloadFrozen:     rec.SnapshotWorkloadFrozen,
+		WakePending:                rec.WakePending,
+		FreezeToken:                rec.FreezeToken,
+		ArtifactID:                 rec.ArtifactID,
+		ClockFrozen:                rec.ClockFrozen,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,

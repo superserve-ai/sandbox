@@ -2,7 +2,7 @@ package vm
 
 import (
 	"context"
-	"os"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -27,12 +27,6 @@ const (
 	// clockRealtimeCap is what a Firecracker build advertises when it accepts a
 	// per-restore clock policy. A binary that does not is left on legacy.
 	clockRealtimeCap = "clock-realtime-flag"
-
-	// clockFreezeMarkerSuffix names the marker written beside a memory file whose
-	// guest corrects its wall clock on wake. Presence is the whole signal; the
-	// contents are not read, so the file can carry provenance for an operator
-	// without this becoming a format to parse on the restore path.
-	clockFreezeMarkerSuffix = ".wallclock"
 )
 
 // firecrackerCapabilityProbeTimeout bounds one --version exec.
@@ -98,53 +92,32 @@ func (m *Manager) WatchFirecrackerCapability(ctx context.Context, log zerolog.Lo
 	}()
 }
 
-// clockFreezeMarkerPath returns the marker path for a memory file.
-func clockFreezeMarkerPath(memPath string) string {
-	return memPath + clockFreezeMarkerSuffix
-}
-
-// snapshotCorrectsWallClock reports whether memPath's guest fixes its own wall
-// clock on wake, and so can safely have its monotonic clock frozen.
-func snapshotCorrectsWallClock(memPath string) bool {
-	if memPath == "" {
-		return false
-	}
-	_, err := os.Stat(clockFreezeMarkerPath(memPath))
-	// Any error — absent, unreadable, a racing delete — reads as "cannot".
-	// Absence of proof is not proof, and the safe answer is the slow one.
-	return err == nil
-}
-
-// guestCorrectsWallClock reports whether the guest now being paused fixes its
-// own wall clock, judged from the images it was restored from: its own memory
-// file, or the layered base beneath it when this is a first pass off a template.
-func guestCorrectsWallClock(instMemFile, instBaseMem string) bool {
-	return snapshotCorrectsWallClock(instMemFile) ||
-		(instBaseMem != "" && snapshotCorrectsWallClock(instBaseMem))
-}
-
-// resumeWallClockProperty returns whether the guest being resumed corrects its
-// own wall clock, preferring the durable record to the filesystem.
+// imageWorkloadFrozen returns whether the image being resumed holds a frozen
+// workload, and the token its wake must present, preferring the durable record
+// to the filesystem.
 //
 // An ordinary resume reloads the exact image the VM was paused into, and that
-// pause wrote the property to the record and the marker together — so the record
+// pause wrote the facts to the record and the manifest together — so the record
 // is already the answer and the resume path need not go to disk for it. Only an
 // explicit override, supplying an image this VM was never paused into, has to
-// look, because the record then describes a different artifact.
-func resumeWallClockProperty(memPath, basePath, pausedMemPath string, recorded *bool) bool {
-	if memPath == pausedMemPath && recorded != nil {
-		return *recorded
+// look, because the record then describes a different artifact. An unreadable
+// manifest is an error the caller must refuse on.
+func imageWorkloadFrozen(memPath, pausedMemPath string, recordedFrozen *bool, recordedToken string) (frozen bool, token string, err error) {
+	if memPath == pausedMemPath && recordedFrozen != nil {
+		return *recordedFrozen, recordedToken, nil
 	}
-	// Either a different image than this VM was paused into, or a record that
-	// never carried the answer — a rollback to a binary without the field drops
-	// it on rewrite, and its silence must not be read as "no".
-	return guestCorrectsWallClock(memPath, basePath)
+	m, err := imageManifest(memPath)
+	if err != nil || m == nil {
+		return false, "", err
+	}
+	return m.WorkloadFrozen, m.FreezeToken, nil
 }
 
-// clockPolicyFor turns the resolved guest property into a restore policy.
+// clockPolicyFor turns the resolved image fact into a restore policy.
 //
-// Two independent facts meet here, and only here: whether the guest fixes its
-// own wall clock, which is a property of the image and is recorded with it, and
+// Two independent facts meet here, and only here: whether the image holds a
+// frozen workload from a guest that fixes its own wall clock, which is a
+// property of the image and is recorded with it, and
 // whether this host's Firecracker can be asked to freeze the clock, which is a
 // property of the binary and changes under a running daemon. Keeping them apart
 // is what lets a host with an older binary restore a marked guest the legacy way
@@ -156,8 +129,8 @@ func resumeWallClockProperty(memPath, basePath, pausedMemPath string, recorded *
 //
 // It never returns true: advancing the guest clock by elapsed wall time is the
 // behaviour being fixed, so nothing here should be able to ask for it.
-func (m *Manager) clockPolicyFor(correctsWallClock bool) *bool {
-	if !m.cfg.GuestClockFreezeEnabled || !correctsWallClock || !m.clockRealtimeCapable.Load() {
+func (m *Manager) clockPolicyFor(workloadFrozen bool) *bool {
+	if !m.cfg.GuestClockFreezeEnabled || !workloadFrozen || !m.clockRealtimeCapable.Load() || m.guestClockUnready.Load() {
 		return nil
 	}
 	freeze := false
@@ -177,11 +150,19 @@ func (m *Manager) clockPolicyFor(correctsWallClock bool) *bool {
 // Reports whether the restore that succeeded actually carried the policy, so a
 // caller logging the outcome describes what happened rather than what was asked
 // for — after a fallback those differ.
-func (m *Manager) restoreWithClockFallback(policy *bool, restore func(clockRealtime *bool) error) (usedPolicy bool, err error) {
+// beforeLegacy, if set, runs before the legacy restore, which is skipped if it
+// fails. The restore path makes the changed policy durable there, so a crash
+// after the legacy load cannot recover the guest as clock-frozen.
+func (m *Manager) restoreWithClockFallback(policy *bool, beforeLegacy func() error, restore func(clockRealtime *bool) error) (usedPolicy bool, err error) {
 	// A refusal seen by any earlier attempt — including this restore's own
 	// session fallback, which re-enters here — already settled the answer;
 	// spend no request rediscovering it.
 	if policy != nil && !m.clockRealtimeCapable.Load() {
+		if beforeLegacy != nil {
+			if err := beforeLegacy(); err != nil {
+				return false, err
+			}
+		}
 		policy = nil
 	}
 	err = restore(policy)
@@ -191,5 +172,48 @@ func (m *Manager) restoreWithClockFallback(policy *bool, restore func(clockRealt
 	if m.clockRealtimeCapable.CompareAndSwap(true, false) {
 		m.log.Warn().Msg("firecracker rejected the clock option; falling back to legacy clock behaviour for every restore")
 	}
+	if beforeLegacy != nil {
+		if err := beforeLegacy(); err != nil {
+			return false, err
+		}
+	}
 	return false, restore(nil)
+}
+
+// defaultGuestFreezeBudget bounds the pause-side wait for the guest to stop
+// its workload. Only ever paid when the restore would freeze the clock.
+const defaultGuestFreezeBudget = 500 * time.Millisecond
+
+// freezeGuestForPause freezes the workload ahead of a snapshot. A failed freeze
+// is ambiguous, so the guest is thawed and that must confirm, else the pause aborts.
+func (m *Manager) freezeGuestForPause(ctx context.Context, ip, token string, log zerolog.Logger) (frozen bool, err error) {
+	budget := m.cfg.GuestFreezeBudget
+	if budget <= 0 {
+		budget = defaultGuestFreezeBudget
+	}
+	fctx, cancel := context.WithTimeout(ctx, budget)
+	echo, ferr := boxdFreezeGuest(fctx, ip, token)
+	cancel()
+	if ferr == nil && (echo.Token != token || echo.Version != WallClockManifestVersion) {
+		// The guest froze, but not as this protocol understands it: release it.
+		ferr = fmt.Errorf("freeze reply names protocol %d token %q, asked %d %q", echo.Version, echo.Token, WallClockManifestVersion, token)
+	}
+	if ferr == nil {
+		return true, nil
+	}
+	tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer tcancel()
+	if terr := boxdThawGuest(tctx, ip, token); terr != nil {
+		return false, fmt.Errorf("guest workload state unknown after failed freeze (%v); thaw not confirmed: %w", ferr, terr)
+	}
+	log.Warn().Err(ferr).Msg("pause: guest workload not frozen; this image will wake the slower way")
+	return false, nil
+}
+
+// noteGuestClockUnready latches this host to unfrozen restores: host time is a
+// host property, so the caller's retry takes the path that does not need it.
+func (m *Manager) noteGuestClockUnready(log zerolog.Logger, cause error) {
+	if m.guestClockUnready.CompareAndSwap(false, true) {
+		log.Error().Err(cause).Msg("guest could not correct its clock; this host will restore with the clock unfrozen until vmd restarts")
+	}
 }
