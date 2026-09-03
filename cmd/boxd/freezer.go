@@ -470,9 +470,37 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 // the sandbox can reach. A connection from one of the guest's own addresses is
 // refused. A root process can still bind another address, so this guards
 // against accident, not a boundary.
-var localAddrs = net.InterfaceAddrs
+//
+// The guest's addresses are fixed at boot, so they are read once, on the first
+// lifecycle request, and the wake path never enumerates interfaces.
+type hostGate struct {
+	addrs func() ([]net.Addr, error)
+	mu    sync.Mutex
+	ips   []net.IP
+	known bool
+}
 
-func fromGuest(remoteAddr string) bool {
+func newHostGate() *hostGate { return &hostGate{addrs: net.InterfaceAddrs} }
+
+func (g *hostGate) guestIPs() ([]net.IP, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.known {
+		addrs, err := g.addrs()
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok {
+				g.ips = append(g.ips, n.IP)
+			}
+		}
+		g.known = true
+	}
+	return g.ips, nil
+}
+
+func (g *hostGate) fromGuest(remoteAddr string) bool {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
 		return true
@@ -481,21 +509,21 @@ func fromGuest(remoteAddr string) bool {
 	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
 		return true
 	}
-	addrs, err := localAddrs()
+	ips, err := g.guestIPs()
 	if err != nil {
 		return true
 	}
-	for _, a := range addrs {
-		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(ip) {
+	for _, own := range ips {
+		if own.Equal(ip) {
 			return true
 		}
 	}
 	return false
 }
 
-func hostOnly(next http.HandlerFunc) http.HandlerFunc {
+func (g *hostGate) only(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if fromGuest(r.RemoteAddr) {
+		if g.fromGuest(r.RemoteAddr) {
 			http.Error(w, "supervisor only", http.StatusForbidden)
 			return
 		}
