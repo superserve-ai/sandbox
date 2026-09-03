@@ -982,6 +982,45 @@ func snapshotRow(s db.Snapshot) *mockRow {
 	}}
 }
 
+// claimResumeRow mocks ClaimResume's RETURNING: the sandbox columns, then
+// the joined snapshot paths, policy, aggregated ports, and template base
+// path. A nil snap models a missing snapshot row.
+func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, ports ...publishedPortResponse) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		if err := sandboxRow(sb).scanFn(dest[:26]...); err != nil {
+			return err
+		}
+		var snapPath, snapMemPath *string
+		if snap != nil {
+			p := snap.Path
+			snapPath, snapMemPath = &p, snap.MemPath
+		}
+		*dest[26].(**string) = snapPath
+		*dest[27].(**string) = snapMemPath
+		if access == "" {
+			access = preview.AccessLegacyPublic
+		}
+		*dest[28].(*string) = access
+		*dest[29].(*string) = access
+		*dest[30].(*int64) = revision
+		numbers, accesses, versions := []int32{}, []string{}, []int64{}
+		for _, port := range ports {
+			version := port.TokenVersion
+			if version == 0 {
+				version = 1
+			}
+			numbers = append(numbers, port.Port)
+			accesses = append(accesses, port.Access)
+			versions = append(versions, version)
+		}
+		*dest[31].(*[]int32) = numbers
+		*dest[32].(*[]string) = accesses
+		*dest[33].(*[]int64) = versions
+		*dest[34].(**string) = nil
+		return nil
+	}}
+}
+
 // finalizePauseRow mocks the single-column RETURNING of FinalizePause.
 func finalizePauseRow(snapshotID uuid.UUID) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
@@ -1059,7 +1098,7 @@ func TestResumeSandbox_LegacyPolicyToleratesOldVMD(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb) // BeginResume RETURNING *
+				return claimResumeRow(sb, &snap, preview.AccessLegacyPublic, 0)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -1109,7 +1148,6 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
 	}
 
-	var policyReads int
 	var restored, reconciled previewPolicySnapshot
 	vmd := &stubVMD{
 		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
@@ -1130,17 +1168,11 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 			case strings.Contains(sql, "-- name: GetSandbox :one"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
-				policyReads++
-				if policyReads == 1 {
-					return previewPolicyRow(preview.AccessPublic, 7)
-				}
 				return previewPolicyRow(preview.AccessPublic, 8)
 			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
 				return scalarBoolRow(true)
-			case strings.Contains(sql, "-- name: BeginResume :one"):
-				return sandboxRow(sb)
-			case strings.Contains(sql, "-- name: GetSnapshot :one"):
-				return snapshotRow(snap)
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRow(sb, &snap, preview.AccessPublic, 7, publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
 			default:
 				return activityRow()
 			}
@@ -1148,9 +1180,6 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 			switch {
 			case strings.Contains(sql, "-- name: ListPublishedPorts :many"):
-				if policyReads == 1 {
-					return previewPortRows(3000), nil
-				}
 				return previewPortRows(8080), nil
 			case strings.Contains(sql, "-- name: ListSandboxSecretBindingMeta :many"):
 				return emptyRows{}, nil
@@ -1225,10 +1254,10 @@ func TestResumeSandbox_PrivatePolicyRequiresBrowserChainAndRestoresBrowserPorts(
 			case strings.Contains(sql, "-- name: AdvanceSandboxPreviewPolicy :one"):
 				revisionBumps++
 				return previewPolicyRow(preview.AccessPrivate, 8)
-			case strings.Contains(sql, "-- name: BeginResume :one"):
-				return sandboxRow(sb)
-			case strings.Contains(sql, "-- name: GetSnapshot :one"):
-				return snapshotRow(snap)
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRow(sb, &snap, preview.AccessPrivate, 8, publishedPortResponse{
+					Port: 3000, Access: preview.AccessPrivate, TokenVersion: 12,
+				})
 			default:
 				return activityRow()
 			}
@@ -1298,7 +1327,7 @@ func TestResumeSandbox_ReappliesSecretBindings(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -1435,7 +1464,7 @@ func TestResumeSandbox_SettlesPausingToPaused(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
 			case strings.Contains(sql, "FROM sandbox"):
@@ -1652,7 +1681,7 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			default:
@@ -1720,7 +1749,7 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 				atomic.AddInt32(&finalizeCalled, 1)
 				return uuidRow(snapshotID)
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
 			case strings.Contains(sql, "FROM sandbox"):
@@ -1802,7 +1831,7 @@ func TestResumeSandbox_EmitsPhasesAndCarriesRulesInResumeRequest(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
 			case strings.Contains(sql, "FROM sandbox"):
@@ -1867,7 +1896,7 @@ func TestResumeSandbox_NoBindingsSkipsBindingRead(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -1938,7 +1967,7 @@ func TestResumeSandbox_ActivateFailure_PausesNotDestroys(t *testing.T) {
 				atomic.AddInt32(&finalizeCalled, 1)
 				return uuidRow(snapshotID)
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
 			case strings.Contains(sql, "FROM sandbox"):
@@ -2042,7 +2071,7 @@ func TestActivateSandbox_PausedResumesAndReturns200(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -2189,7 +2218,7 @@ func TestResumeSandbox_ActivityLogFailure_StillReturns200(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):

@@ -543,6 +543,118 @@ func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]Cla
 	return items, nil
 }
 
+const claimResume = `-- name: ClaimResume :one
+UPDATE sandbox
+SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
+FROM (
+  SELECT sb.id,
+         s.path AS snap_path,
+         s.mem_path AS snap_mem_path,
+         COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
+         COALESCE(p.access, 'legacy_public')::text AS wire_access,
+         COALESCE(p.revision, 0)::bigint AS revision,
+         COALESCE(pp.ports, '{}')::int[] AS port_numbers,
+         COALESCE(pp.accesses, '{}')::text[] AS port_accesses,
+         COALESCE(pp.token_versions, '{}')::bigint[] AS port_token_versions,
+         t.base_path AS template_base_path
+  FROM sandbox sb
+  LEFT JOIN snapshot s ON s.id = sb.snapshot_id AND s.team_id = sb.team_id
+  LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = sb.id
+  LEFT JOIN template t ON t.id = sb.template_id
+  LEFT JOIN LATERAL (
+    SELECT array_agg(pp.port ORDER BY pp.port) AS ports,
+           array_agg(pp.access ORDER BY pp.port) AS accesses,
+           array_agg(g.token_version ORDER BY pp.port) AS token_versions
+    FROM sandbox_published_port pp
+    JOIN sandbox_preview_port_token_generation g
+      ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
+    WHERE pp.sandbox_id = sb.id AND g.token_version > 0
+  ) pp ON true
+  WHERE sb.id = $2 AND sb.team_id = $3
+) x
+WHERE sandbox.id = x.id
+  AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
+  AND EXISTS (SELECT pg_advisory_xact_lock(hashtext($1::text)::bigint))
+RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcpu_count, sandbox.memory_mib, sandbox.host_id, sandbox.ip_address, sandbox.pid, sandbox.snapshot_id, sandbox.created_at, sandbox.updated_at, sandbox.destroyed_at, sandbox.network_config, sandbox.timeout_seconds, sandbox.metadata, sandbox.template_id, sandbox.snapshot_path, sandbox.mem_path, sandbox.base_path, sandbox.delta_path, sandbox.disk_mib, sandbox.auto_delete_seconds, sandbox.auto_delete_at, sandbox.failed_at, sandbox.had_secret_bindings,
+          x.snap_path, x.snap_mem_path,
+          x.access, x.wire_access, x.revision,
+          x.port_numbers, x.port_accesses, x.port_token_versions,
+          x.template_base_path
+`
+
+type ClaimResumeParams struct {
+	LockKey string    `json:"lock_key"`
+	ID      uuid.UUID `json:"id"`
+	TeamID  uuid.UUID `json:"team_id"`
+}
+
+type ClaimResumeRow struct {
+	Sandbox           Sandbox  `json:"sandbox"`
+	SnapPath          *string  `json:"snap_path"`
+	SnapMemPath       *string  `json:"snap_mem_path"`
+	Access            string   `json:"access"`
+	WireAccess        string   `json:"wire_access"`
+	Revision          int64    `json:"revision"`
+	PortNumbers       []int32  `json:"port_numbers"`
+	PortAccesses      []string `json:"port_accesses"`
+	PortTokenVersions []int64  `json:"port_token_versions"`
+	TemplateBasePath  *string  `json:"template_base_path"`
+}
+
+// The resume claim and everything the boot RPC needs in one round trip:
+// paused→resuming, the snapshot's artifact paths, the preview policy with
+// its published ports, and the template base path for rows that predate
+// base_path pinning. The advisory lock is the one attach and detach take
+// before re-reading status. It is acquired before the row is updated and
+// released at statement end, so the returned row and the binding set agree:
+// a mutation holding the lock lands first and shows in the row, or arrives
+// later and sees 'resuming'. The side joins are LEFT so a missing snapshot
+// row (NULL snap_path) or a legacy sandbox with no policy row still returns
+// the claimed row for the caller to handle. 0 rows means another resume
+// claimed it or it is not paused.
+func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (ClaimResumeRow, error) {
+	row := q.db.QueryRow(ctx, claimResume, arg.LockKey, arg.ID, arg.TeamID)
+	var i ClaimResumeRow
+	err := row.Scan(
+		&i.Sandbox.ID,
+		&i.Sandbox.TeamID,
+		&i.Sandbox.Name,
+		&i.Sandbox.Status,
+		&i.Sandbox.VcpuCount,
+		&i.Sandbox.MemoryMib,
+		&i.Sandbox.HostID,
+		&i.Sandbox.IpAddress,
+		&i.Sandbox.Pid,
+		&i.Sandbox.SnapshotID,
+		&i.Sandbox.CreatedAt,
+		&i.Sandbox.UpdatedAt,
+		&i.Sandbox.DestroyedAt,
+		&i.Sandbox.NetworkConfig,
+		&i.Sandbox.TimeoutSeconds,
+		&i.Sandbox.Metadata,
+		&i.Sandbox.TemplateID,
+		&i.Sandbox.SnapshotPath,
+		&i.Sandbox.MemPath,
+		&i.Sandbox.BasePath,
+		&i.Sandbox.DeltaPath,
+		&i.Sandbox.DiskMib,
+		&i.Sandbox.AutoDeleteSeconds,
+		&i.Sandbox.AutoDeleteAt,
+		&i.Sandbox.FailedAt,
+		&i.Sandbox.HadSecretBindings,
+		&i.SnapPath,
+		&i.SnapMemPath,
+		&i.Access,
+		&i.WireAccess,
+		&i.Revision,
+		&i.PortNumbers,
+		&i.PortAccesses,
+		&i.PortTokenVersions,
+		&i.TemplateBasePath,
+	)
+	return i, err
+}
+
 const countActiveSandboxesAtBasePath = `-- name: CountActiveSandboxesAtBasePath :one
 SELECT COUNT(*)::bigint FROM sandbox
 WHERE base_path = $1 AND destroyed_at IS NULL
