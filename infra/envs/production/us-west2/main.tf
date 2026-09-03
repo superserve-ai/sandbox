@@ -14,14 +14,6 @@ terraform {
   }
 }
 
-// The API's external HTTPS load balancer is managed by the primary API cell;
-// read its reserved forwarding-rule address without creating a second owner
-// for the global resource. sandbox-proxy-ip is the edge proxy address, not
-// the API forwarding rule.
-data "google_compute_global_address" "api_forwarding_rule" {
-  name = "api-superserve-use4-ip"
-}
-
 provider "google" {
   project = local.project_id
   region  = local.region
@@ -205,16 +197,15 @@ module "api" {
   cpu_idle          = true
 
   env = {
-    API_PORT                       = "8080"
-    EDGE_PROXY_DOMAIN              = "usw-sandbox.superserve.ai"
-    EXTERNAL_LB_FORWARDING_RULE_IP = data.google_compute_global_address.api_forwarding_rule.address
-    SANDBOX_ID_REGION              = "usw"
-    SUPABASE_URL                   = var.supabase_url
-    SECRETS_SIGNING_KEY_ID         = "v1"
-    ALLOW_EPHEMERAL_SEED           = "0"
-    DB_MAX_CONNS                   = "15"
-    VMD_GRPC_ADDRESS               = format("%s:50051", local.active_vmd_ip)
-    KMS_KEY_RESOURCE               = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+    API_PORT               = "8080"
+    EDGE_PROXY_DOMAIN      = "usw-sandbox.superserve.ai"
+    SANDBOX_ID_REGION      = "usw"
+    SUPABASE_URL           = var.supabase_url
+    SECRETS_SIGNING_KEY_ID = "v1"
+    ALLOW_EPHEMERAL_SEED   = "0"
+    DB_MAX_CONNS           = "15"
+    VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
+    KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
 
     # Control-plane OTLP metrics export, matching us-east4. The host-local
     # superserve-otel-collector receives OTLP on :4318 and forwards to Google
