@@ -58,6 +58,7 @@ type apiKeyCacheEntry struct {
 	scopes         []string
 	createdBy      pgtype.UUID
 	identityDomain pgtype.Text
+	authProvider   pgtype.Text
 	expiresAt      pgtype.Timestamptz
 	fetchedAt      time.Time
 	lastTouch      time.Time

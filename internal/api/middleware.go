@@ -106,9 +106,9 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		lookup := func(qctx context.Context) (apiKeyCacheEntry, error) {
 			var e apiKeyCacheEntry
 			err := pool.QueryRow(qctx,
-				"SELECT ak.id, ak.team_id, ak.name, ak.scopes, ak.created_by, ak.expires_at, p.email FROM api_key ak LEFT JOIN profile p ON p.id = ak.created_by WHERE ak.key_hash = $1 AND ak.revoked_at IS NULL AND (ak.expires_at IS NULL OR ak.expires_at > now())",
+				"SELECT ak.id, ak.team_id, ak.name, ak.scopes, ak.created_by, ak.expires_at, p.email, p.provider FROM api_key ak LEFT JOIN profile p ON p.id = ak.created_by WHERE ak.key_hash = $1 AND ak.revoked_at IS NULL AND (ak.expires_at IS NULL OR ak.expires_at > now())",
 				keyHash,
-			).Scan(&e.id, &e.teamID, &e.name, &e.scopes, &e.createdBy, &e.expiresAt, &e.identityDomain)
+			).Scan(&e.id, &e.teamID, &e.name, &e.scopes, &e.createdBy, &e.expiresAt, &e.identityDomain, &e.authProvider)
 			if err != nil {
 				return apiKeyCacheEntry{}, err
 			}
@@ -216,6 +216,9 @@ func setAPIKeyContext(c *gin.Context, entry apiKeyCacheEntry) {
 		if identity != "" {
 			c.Set("identity_domain", identity)
 		}
+	}
+	if entry.authProvider.Valid && strings.TrimSpace(entry.authProvider.String) != "" {
+		c.Set("auth_provider", strings.TrimSpace(entry.authProvider.String))
 	}
 }
 

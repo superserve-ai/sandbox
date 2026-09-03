@@ -1284,11 +1284,13 @@ func (h *Handlers) allowAbuseAction(c *gin.Context, teamID uuid.UUID, action abu
 		userID = *actor
 	}
 	allowed, matched := h.abuseEnforcement.Evaluate(abuseEnforcementRequest{
-		TeamID: teamID,
-		UserID: userID,
-		IP:     clientIP(c),
-		Domain: requestDomainFromContext(c),
-		Action: action,
+		TeamID:          teamID,
+		UserID:          userID,
+		IP:              clientIP(c),
+		Domain:          requestDomainFromContext(c),
+		AuthProvider:    requestAuthProviderFromContext(c),
+		TrustedIdentity: requestTrustedIdentityFromContext(c),
+		Action:          action,
 	})
 	if matched && !allowed {
 		enqueueAbuseDecisionLog(abuseDecisionLog{teamID: teamID, action: action})
@@ -1299,6 +1301,18 @@ func (h *Handlers) allowAbuseAction(c *gin.Context, teamID uuid.UUID, action abu
 		enqueueAbuseDecisionLog(abuseDecisionLog{teamID: teamID, action: action, allowed: true})
 	}
 	return true
+}
+
+func requestAuthProviderFromContext(c *gin.Context) string {
+	raw, _ := c.Get("auth_provider")
+	provider, _ := raw.(string)
+	return strings.TrimSpace(provider)
+}
+
+func requestTrustedIdentityFromContext(c *gin.Context) bool {
+	trusted, _ := c.Get("trusted_identity")
+	v, _ := trusted.(bool)
+	return v
 }
 
 func requestDomainFromContext(c *gin.Context) string {

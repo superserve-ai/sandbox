@@ -39,11 +39,13 @@ const (
 )
 
 type abuseEnforcementRequest struct {
-	TeamID uuid.UUID
-	UserID uuid.UUID
-	IP     string
-	Domain string
-	Action abuse.Action
+	TeamID          uuid.UUID
+	UserID          uuid.UUID
+	IP              string
+	Domain          string
+	AuthProvider    string
+	TrustedIdentity bool
+	Action          abuse.Action
 }
 
 type abuseEnforcementRestriction struct {
@@ -413,6 +415,9 @@ func (c *abuseEnforcementCache) Invalidate(teamID uuid.UUID) {
 // Evaluate returns allowed and whether a restriction matched. It performs no
 // I/O and bounds work to the indexed subjects for the request.
 func (c *abuseEnforcementCache) Evaluate(req abuseEnforcementRequest) (bool, bool) {
+	if req.TrustedIdentity {
+		return true, false
+	}
 	s := c.published.Load()
 	if s == nil {
 		return true, false
