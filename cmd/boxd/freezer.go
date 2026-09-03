@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -247,8 +248,11 @@ func (f *freezer) freeze(ctx context.Context, token string) error {
 		return fmt.Errorf("budget spent before the freeze began: %w", err)
 	}
 
+	// Unready from the first request: tasks stop while the cgroup still
+	// reads FREEZING, and health reads this flag alone.
+	f.frozen.Store(true)
 	if err := f.fs.writeState("FROZEN"); err != nil {
-		return fmt.Errorf("request freeze: %w", err)
+		return f.undo(token, fmt.Errorf("request freeze: %w", err))
 	}
 	// FREEZING until every task has stopped; poll densely, then back off.
 	interval := time.Millisecond
@@ -258,7 +262,6 @@ func (f *freezer) freeze(ctx context.Context, token string) error {
 			return f.undo(token, fmt.Errorf("read freezer state: %w", err))
 		}
 		if st == "FROZEN" {
-			f.frozen.Store(true)
 			f.token = token
 			return nil
 		}
@@ -377,6 +380,23 @@ func (f *freezer) thawLocked() error {
 	return nil
 }
 
+// decodeBody reads one JSON object and nothing else: a body with trailing
+// data, or one that does not decode whole, is an error.
+func decodeBody(r *http.Request, v any) error {
+	if r.Body == nil {
+		return errors.New("body required")
+	}
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("trailing data after the body")
+	}
+	return nil
+}
+
 // POST /freeze {"budget_ms": N, "token": T}: 200 frozen, with the protocol
 // version, capability and token echoed; 400 no token; 409 another freeze is
 // active; 503 cannot freeze; 504 budget exhausted and thawed again; 500 budget
@@ -394,7 +414,7 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 	}
 	// A body that does not decode whole is refused before anything moves,
 	// whatever fields it did fill.
-	if r.Body == nil || json.NewDecoder(r.Body).Decode(&body) != nil || body.Token == "" {
+	if decodeBody(r, &body) != nil || body.Token == "" {
 		http.Error(w, "well-formed body with token required", http.StatusBadRequest)
 		return
 	}
@@ -414,7 +434,7 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, context.DeadlineExceeded):
 			code = http.StatusGatewayTimeout
 		}
-		log.Printf("freezer: freeze refused: %v", err)
+		go log.Printf("freezer: freeze refused: %v", err)
 		http.Error(w, err.Error(), code)
 		return
 	}
@@ -448,7 +468,7 @@ func (f *freezer) handleThaw(w http.ResponseWriter, r *http.Request) {
 	}
 	// A body that does not decode whole is refused before anything moves,
 	// whatever fields it did fill.
-	if r.Body == nil || json.NewDecoder(r.Body).Decode(&body) != nil || body.Token == "" {
+	if decodeBody(r, &body) != nil || body.Token == "" {
 		http.Error(w, "well-formed body with token required", http.StatusBadRequest)
 		return
 	}
@@ -480,7 +500,7 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 			ClockFrozen *bool  `json:"clock_frozen"`
 			Token       string `json:"token"`
 		}
-		if r.Body == nil || json.NewDecoder(r.Body).Decode(&body) != nil || body.ClockFrozen == nil || body.Token == "" {
+		if decodeBody(r, &body) != nil || body.ClockFrozen == nil || body.Token == "" {
 			// A wake that does not say whether the clock was frozen, or whose
 			// freeze it belongs to, releases nothing.
 			http.Error(w, "clock_frozen and token required", http.StatusBadRequest)
@@ -498,7 +518,7 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 		status := "ok"
 		if ready {
 			if err := fz.thaw(body.Token); err != nil {
-				log.Printf("freezer: thaw on wake failed: %v", err)
+				go log.Printf("freezer: thaw on wake failed: %v", err)
 				ready, status = false, "thaw"
 				wc.Error = "thaw: " + err.Error()
 			}

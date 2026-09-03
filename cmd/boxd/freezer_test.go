@@ -30,6 +30,7 @@ type fakeCgroup struct {
 	neverDone bool
 	stuckThaw bool
 	writes    []string
+	onPoll    func() // called on each poll that reads FREEZING
 }
 
 func (f *fakeCgroup) readState() (string, error) {
@@ -42,11 +43,13 @@ func (f *fakeCgroup) readState() (string, error) {
 		return "", f.readErr
 	}
 	if f.state == "FREEZING" {
-		if f.neverDone {
-			return "FREEZING", nil
-		}
-		if f.stallFor > 0 {
-			f.stallFor--
+		if f.neverDone || f.stallFor > 0 {
+			if f.stallFor > 0 {
+				f.stallFor--
+			}
+			if f.onPoll != nil {
+				f.onPoll()
+			}
 			return "FREEZING", nil
 		}
 		f.state = "FROZEN"
@@ -588,6 +591,9 @@ func TestMalformedLifecycleBodiesAreRefused(t *testing.T) {
 	if got := post(fz, "/freeze", `{"token":"t1","budget_ms":"bad"}`); got != 400 || fz.isFrozen() {
 		t.Fatalf("malformed freeze: code %d frozen %v, want 400 and nothing touched", got, fz.isFrozen())
 	}
+	if got := post(fz, "/freeze", `{"token":"t1"} garbage`); got != 400 || fz.isFrozen() {
+		t.Fatalf("freeze with trailing data: code %d frozen %v, want 400 and nothing touched", got, fz.isFrozen())
+	}
 	if st, _ := cg.readState(); st != "THAWED" {
 		t.Fatalf("malformed freeze reached the cgroup: state %q", st)
 	}
@@ -596,6 +602,14 @@ func TestMalformedLifecycleBodiesAreRefused(t *testing.T) {
 	}
 	if got := post(fz, "/thaw", `{"token":["t1"]}`); got != 400 || !fz.isFrozen() {
 		t.Fatalf("malformed thaw: code %d frozen %v, want 400 and still frozen", got, fz.isFrozen())
+	}
+	if got := post(fz, "/thaw", `{"token":"t1"}{"token":"t1"}`); got != 400 || !fz.isFrozen() {
+		t.Fatalf("thaw with a second object: code %d frozen %v, want 400 and still frozen", got, fz.isFrozen())
+	}
+	rec := httptest.NewRecorder()
+	handleWake(clockUnder(&fakeSource{}, time.Now()), fz)(rec, httptest.NewRequest(http.MethodPost, "/wake", strings.NewReader(`{"clock_frozen":false,"token":"t1"} x`)))
+	if rec.Code != 400 || !fz.isFrozen() {
+		t.Fatalf("wake with trailing data: code %d frozen %v, want 400 and still frozen", rec.Code, fz.isFrozen())
 	}
 	if got := post(fz, "/thaw", `{"token":"t1"}`); got != 200 || fz.isFrozen() {
 		t.Fatalf("well-formed thaw: code %d frozen %v", got, fz.isFrozen())
@@ -612,4 +626,34 @@ func post(fz *freezer, path, body string) int {
 		fz.handleThaw(rec, req)
 	}
 	return rec.Code
+}
+
+// From the first request to stop, health must not read ready: tasks are
+// stopping while the cgroup still reads FREEZING. A rolled-back freeze reads
+// ready again only once its thaw is confirmed.
+func TestFreezingReadsUnreadyFromTheFirstRequest(t *testing.T) {
+	cg := newFake()
+	cg.stallFor = 3
+	fz := newFreezer(cg, testDir)
+	readyWhileFreezing := false
+	cg.onPoll = func() {
+		if !fz.isFrozen() {
+			readyWhileFreezing = true
+		}
+	}
+	if err := fz.freeze(bg(), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if readyWhileFreezing {
+		t.Fatal("read ready while the cgroup was FREEZING")
+	}
+
+	cg = newFake()
+	cg.neverDone = true
+	fz = newFreezer(cg, testDir)
+	ctx, cancel := context.WithTimeout(bg(), 20*time.Millisecond)
+	defer cancel()
+	if err := fz.freeze(ctx, "t1"); !errors.Is(err, context.DeadlineExceeded) || fz.isFrozen() {
+		t.Fatalf("rolled-back freeze: err=%v frozen=%v, want the deadline and ready again", err, fz.isFrozen())
+	}
 }
