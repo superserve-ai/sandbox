@@ -762,6 +762,37 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	sandboxID := sandbox.ID
 	l := sandboxLogger(sandboxID.String(), sandbox.HostID)
 
+	// Phase stamps, registered before ANY return so failed resumes land in
+	// the histograms too (create's discipline): claim is everything before
+	// the boot RPC (policy reads, the resuming claim, snapshot lookup); vmd
+	// is the boot RPC with its retry and the stateless fallback; post is
+	// the policy/egress/secret reapply. A stage that errored before its
+	// end-stamp reports its elapsed time. total stays with the callers,
+	// which own the request-level clock.
+	tStart := time.Now()
+	var tVmdStart, tVmdEnd, tPostDone time.Time
+	defer func() {
+		phases := map[string]time.Duration{}
+		if !tVmdStart.IsZero() {
+			phases["claim"] = tVmdStart.Sub(tStart)
+		} else {
+			phases["claim"] = time.Since(tStart)
+		}
+		switch {
+		case !tVmdEnd.IsZero():
+			phases["vmd"] = tVmdEnd.Sub(tVmdStart)
+		case !tVmdStart.IsZero():
+			phases["vmd"] = time.Since(tVmdStart)
+		}
+		switch {
+		case !tPostDone.IsZero():
+			phases["post"] = tPostDone.Sub(tVmdEnd)
+		case !tVmdEnd.IsZero():
+			phases["post"] = time.Since(tVmdEnd)
+		}
+		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID, phases)
+	}()
+
 	if !sandbox.SnapshotID.Valid {
 		l.Error().Msg("paused sandbox has no snapshot_id")
 		respondError(c, ErrInternal)
@@ -904,6 +935,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// retry, and the stateless fallback all draw down the same 2×vmdTimeout
 	// budget, so a resume holds the row mid-transition for a bounded window
 	// no matter which path it walks.
+
+	// stateless records that the VM came up through the RestoreSnapshot
+	// fallback rather than ResumeInstance; post-boot steps the resume request
+	// already carries (egress rules) are only replayed on that path.
+	stateless := false
+	tVmdStart = time.Now()
 	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdBootTimeout)
 	defer bootCancel()
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), sandbox.HostID, func(ctx context.Context) (string, uint32, uint32, error) {
@@ -911,6 +948,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	})
 	if err != nil {
 		if isVMDNotFound(err) {
+			stateless = true
 			l.Warn().Err(err).
 				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
@@ -947,6 +985,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			return "", false
 		}
 	}
+	tVmdEnd = time.Now()
 
 	// Older vmd builds may return 0 for vcpu/mem on both the Resume and
 	// Restore paths (ResourceLimits field was added later). Fall back to
@@ -1052,33 +1091,46 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
-	// Apply egress rules before committing to 'active' so "active ⇒ rules
-	// applied" holds by construction.
-	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
-		l.Error().Err(err).Msg("reapply network config on resume failed")
-		pauseAndRevert()
-		respondError(c, ErrInternal)
-		return "", false
-	}
-
-	// Re-apply the current binding set before committing to 'active', so a secret
-	// attached or detached while paused takes effect — the snapshot froze the old
-	// JWT. Skipped when there are no bindings, keeping the secret-less resume a
-	// single round trip. The fresh IP binds the re-minted JWT.
-	sandbox.IpAddress = ipAddr
-	if meta, merr := h.loadSecretBindingMeta(postCtx, sandboxID); merr != nil {
-		l.Error().Err(merr).Msg("load secret bindings on resume failed")
-		pauseAndRevert()
-		respondError(c, ErrInternal)
-		return "", false
-	} else if len(meta) > 0 {
-		if aerr := h.applySecretBindings(postCtx, *sandbox, meta); aerr != nil {
-			l.Error().Err(aerr).Msg("reapply secret bindings on resume failed")
+	// Egress rules must be in place before committing to 'active' so
+	// "active ⇒ rules applied" holds by construction. ResumeInstance carries
+	// them and the daemon applies them before Firecracker starts, so only
+	// the stateless fallback, whose restore request has no egress field,
+	// needs the separate push.
+	if stateless {
+		if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+			l.Error().Err(err).Msg("reapply network config on resume failed")
 			pauseAndRevert()
 			respondError(c, ErrInternal)
 			return "", false
 		}
 	}
+
+	// Re-apply the current binding set before committing to 'active', so a secret
+	// attached or detached while paused takes effect — the snapshot froze the old
+	// JWT. The fresh IP binds the re-minted JWT. had_secret_bindings is set by
+	// trigger on the first attach and never cleared, and the claim read it
+	// under the advisory lock attach takes, so a false proves the binding set
+	// is empty and the secret-less resume skips the read entirely. NULL
+	// predates the column and reads as unknown.
+	sandbox.IpAddress = ipAddr
+	if sandbox.HadSecretBindings == nil || *sandbox.HadSecretBindings {
+		meta, merr := h.loadSecretBindingMeta(postCtx, sandboxID)
+		if merr != nil {
+			l.Error().Err(merr).Msg("load secret bindings on resume failed")
+			pauseAndRevert()
+			respondError(c, ErrInternal)
+			return "", false
+		}
+		if len(meta) > 0 {
+			if aerr := h.applySecretBindings(postCtx, *sandbox, meta); aerr != nil {
+				l.Error().Err(aerr).Msg("reapply secret bindings on resume failed")
+				pauseAndRevert()
+				respondError(c, ErrInternal)
+				return "", false
+			}
+		}
+	}
+	tPostDone = time.Now()
 
 	// Fire-and-forget: the resuming→active bookkeeping write is off the hot
 	// path. BeginResume's claim owns the row and every other transition is
@@ -1115,6 +1167,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// ActivateSandbox's CTE opens the sandbox_active_interval row (async).
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": sandboxID.String()})
+	l.Info().
+		Int64("claim_ms", tVmdStart.Sub(tStart).Milliseconds()).
+		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
+		Int64("post_ms", tPostDone.Sub(tVmdEnd).Milliseconds()).
+		Bool("stateless", stateless).
+		Msg("ResumeSandbox phases")
 	return currentPolicy.Access, true
 }
 
