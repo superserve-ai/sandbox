@@ -1753,9 +1753,7 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 }
 
 // A successful resume records lookup, claim, vmd, and post alongside the
-// caller-owned total, and no revert. The persisted egress rules ride the
-// ResumeInstance request itself, which is what will let the post-boot
-// replay go once the daemon acknowledges applying them.
+// caller-owned total, and no revert; the egress rules ride the request.
 func TestResumeSandbox_EmitsPhasesAndCarriesRulesInResumeRequest(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
@@ -1824,9 +1822,8 @@ func TestResumeSandbox_EmitsPhasesAndCarriesRulesInResumeRequest(t *testing.T) {
 	}
 }
 
-// had_secret_bindings=false proves the binding set is empty, so the resume
-// must not spend a round trip on the binding read or a guest round trip on
-// an inject.
+// had_secret_bindings=false proves the binding set is empty: no binding
+// read, no inject.
 func TestResumeSandbox_NoBindingsSkipsBindingRead(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()

@@ -727,12 +727,9 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			}
 			// The resume returns the post-restore access it pushed to VMD, so
 			// the response reports exactly what the VM enforces.
-			// lookup runs from the auth boundary to here: the row read and any
-			// starting/resuming settle wait above. total is unchanged and
-			// measures the resume work alone, so on this path it excludes
-			// lookup, where the explicit endpoint's total includes it. This
-			// route is not a lifecycle op for the auth middleware, so claiming
-			// the series here silences nothing.
+			// lookup ends here, from the auth boundary. total covers the resume
+			// work alone on this path (the explicit endpoint's includes lookup).
+			// The route is not a lifecycle op, so PhaseStart silences nothing.
 			tAuth := PhaseStart(c)
 			tResume := time.Now()
 			resumedAccess, ok := h.resumePausedSandbox(c, &sandbox, teamID)
@@ -769,20 +766,15 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	sandboxID := sandbox.ID
 	l := sandboxLogger(sandboxID.String(), sandbox.HostID)
 
-	// Phase stamps, registered before ANY return so failed resumes land in
-	// the histograms too (create's discipline): claim is everything before
-	// the boot RPC (policy reads, the resuming claim, snapshot lookup); vmd
-	// is the boot RPC with its retry and the stateless fallback; post is
-	// the policy/egress/secret reapply. Every stage is stamped the moment
-	// its work returns, success or not, and a compensation that runs before
-	// the reply (revert to paused, re-pause) is reported as its own revert
-	// phase: a re-pause snapshots the guest and must not read as post time.
-	// total stays with the callers, which own the request-level clock.
+	// Registered before ANY return so failed resumes land in the histograms
+	// too. claim = before the boot RPC, vmd = the boot RPC (retry and
+	// stateless fallback included), post = the reapply steps, revert = any
+	// compensation run before the reply, kept separate because a re-pause
+	// snapshots the guest. total is emitted by the callers.
 	tStart := time.Now()
 	var tVmdStart, tVmdEnd, tPostStart, tPostDone, tRevertStart time.Time
-	// markRevert is called only on the synchronous failure paths; the
-	// detached activate goroutine compensates after the reply and must not
-	// touch these stamps.
+	// Synchronous failure paths only: the detached activate goroutine
+	// compensates after the reply and must not touch these stamps.
 	markRevert := func() {
 		if tRevertStart.IsZero() {
 			tRevertStart = time.Now()
@@ -1081,8 +1073,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// the stateless restore while VMD returns NotFound to the mutation push; this
 	// final authoritative snapshot closes that window. If a later mutation wins,
 	// VMD's monotonic revision check rejects this older snapshot.
-	// failPost is the post-stage failure path: the VM is up, so the row is
-	// re-paused rather than destroyed (see pauseAndRevert).
+	// Post-stage failure: the VM is up, so re-pause rather than destroy.
 	failPost := func(err error, msg string) {
 		markRevert()
 		l.Error().Err(err).Msg(msg)
@@ -1120,10 +1111,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 
 	// Apply egress rules before committing to 'active' so "active ⇒ rules
 	// applied" holds by construction. ResumeInstance carries the same rules,
-	// but the daemon's retry-adoption branch returns a running VM without
-	// applying them and its in-memory proxy rules do not survive a restart,
-	// so this replay stays until the daemon applies rules on adoption and
-	// acknowledges it in the response.
+	// but the daemon's retry adoption returns a running VM without applying
+	// them, and its proxy rules do not survive a restart.
 	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
 		failPost(err, "reapply network config on resume failed")
 		return "", false
@@ -1131,11 +1120,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 
 	// Re-apply the current binding set before committing to 'active', so a secret
 	// attached or detached while paused takes effect — the snapshot froze the old
-	// JWT. The fresh IP binds the re-minted JWT. had_secret_bindings is set by
-	// trigger on the first attach and never cleared, and the claim read it
-	// under the advisory lock attach takes, so a false proves the binding set
-	// is empty and the secret-less resume skips the read entirely. NULL
-	// predates the column and reads as unknown.
+	// JWT. The fresh IP binds the re-minted JWT. had_secret_bindings is
+	// trigger-set on first attach, never cleared, and was read under the lock
+	// attach takes, so false proves an empty set; NULL predates the column.
 	sandbox.IpAddress = ipAddr
 	if sandbox.HadSecretBindings == nil || *sandbox.HadSecretBindings {
 		meta, merr := h.loadSecretBindingMeta(postCtx, sandboxID)
@@ -1352,12 +1339,9 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	// Registered before ANY return: a resume that burns the whole pausing
 	// settle window and then 409s is among the slowest resume requests and
 	// must land in the total distribution. Transition counts/results come
-	// from the SandboxLifecycleTelemetry middleware; this emits the
-	// phase-series total and lookup. lookup runs from the auth boundary to
-	// the resume claim (auth, the row read, and any pausing-settle wait,
-	// which RecordResumeSettleWait also reports on its own), so lookup +
-	// claim + vmd + post + revert partitions total. HostID is empty until
-	// the row loads.
+	// from the SandboxLifecycleTelemetry middleware; this emits total and
+	// lookup, which ends at the resume claim and includes any settle wait.
+	// HostID is empty until the row loads.
 	defer func() {
 		phases := map[string]time.Duration{"total": time.Since(tResume)}
 		if !tLookupDone.IsZero() {
