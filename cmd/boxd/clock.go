@@ -35,10 +35,13 @@ type wallClock struct {
 
 	mu          sync.Mutex
 	warnedNoSrc bool
+	// last is what health reports: the outcome of the most recent sync or
+	// verification, so a health poll never touches the device.
+	last wallClockStatus
 }
 
 func newWallClock(src wallClockSource) *wallClock {
-	return &wallClock{src: src, now: time.Now}
+	return &wallClock{src: src, now: time.Now, last: wallClockStatus{Source: "unprobed"}}
 }
 
 // sync brings CLOCK_REALTIME within tolerance of the host. mustCorrect means
@@ -46,6 +49,7 @@ func newWallClock(src wallClockSource) *wallClock {
 func (c *wallClock) sync(mustCorrect bool) (status wallClockStatus, ready bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	defer func() { c.last = status }()
 
 	host, err := c.src.hostTime()
 	if err != nil {
@@ -84,15 +88,11 @@ func (c *wallClock) sync(mustCorrect bool) (status wallClockStatus, ready bool) 
 	return status, true
 }
 
-// status reports the clock without touching it.
+// status reports the last known state without touching the device.
 func (c *wallClock) status() wallClockStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	host, err := c.src.hostTime()
-	if err != nil {
-		return wallClockStatus{Source: "unavailable", Error: err.Error()}
-	}
-	return wallClockStatus{Source: "ptp", CorrectedMs: 0, Error: offTolerance(host.Sub(c.now()))}
+	return c.last
 }
 
 func offTolerance(delta time.Duration) string {
@@ -102,10 +102,22 @@ func offTolerance(delta time.Duration) string {
 	return fmt.Sprintf("%v off host", delta)
 }
 
-// verifySet proves the guest may set its clock, by setting it to itself. Used
-// at build time, where the clock is already right and sync never exercises set.
-func (c *wallClock) verifySet() error {
+// verifySet proves the host clock is readable and the guest may set its own,
+// by setting it to itself. Used at build time, where the clock is already
+// right and sync never exercises set.
+func (c *wallClock) verifySet() (status wallClockStatus) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.src.set(c.now())
+	defer func() { c.last = status }()
+	host, err := c.src.hostTime()
+	if err != nil {
+		return wallClockStatus{Source: "unavailable", Error: err.Error()}
+	}
+	status = wallClockStatus{Source: "ptp", Error: offTolerance(host.Sub(c.now()))}
+	if err := c.src.set(c.now()); err != nil {
+		status.Error = "settime: " + err.Error()
+		return status
+	}
+	status.SettimeOK = true
+	return status
 }

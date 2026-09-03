@@ -2517,7 +2517,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	probeStart := time.Now()
 	vmIP := inst.IP
 	// Resolved here: the goroutine outlives the call, and tests swap the seam.
-	wake := boxdWakeGuest
+	probe := boxdHealthProbe
 	if resumeWorkloadFrozen {
 		log.Info().Int64("wait_boxd_ms", syncWake.Milliseconds()).Msg("guest awake after resume")
 		m.recordPhases("resume", "", map[string]time.Duration{"wait_boxd": syncWake})
@@ -2529,7 +2529,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		defer sentrylog.Recover("resume-boxd-probe")
 		probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := wake(probeCtx, vmIP, 30*time.Second, false); err != nil {
+		if err := probe(probeCtx, vmIP, 30*time.Second); err != nil {
 			log.Warn().Err(err).
 				Int64("wait_boxd_ms", time.Since(probeStart).Milliseconds()).
 				Msg("boxd not reachable after resume")
@@ -3418,7 +3418,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.CorrectsWallClock = &restoreCorrectsWallClock
 		inst.SnapshotWorkloadFrozen = &restoreCorrectsWallClock
 		inst.mu.Unlock()
-		joinWakeOwed := m.persistWakeOwed(inst, predictedSupervision, clockPolicy != nil)
+		// Only a frozen image owes a wake, so only then must the record say so
+		// before the vCPUs can run. An unfrozen image keeps the older ordering
+		// below, unchanged.
+		var joinWakeOwed func(Supervision) bool
+		if restoreCorrectsWallClock {
+			joinWakeOwed = m.persistWakeOwed(inst, predictedSupervision, clockPolicy != nil)
+		}
 		m.beginLaunchAttempt(inst)
 		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace || priorRunDir, freshUnit && attempt == 1)
 		// Stamp the chosen mode NOW, before the error branch: a launch that
@@ -3432,18 +3438,21 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Joined before the load: the record must owe the wake before the
 		// vCPUs can run. Normally it landed under the launch.
 		tJoin := time.Now()
-		optimisticOK = joinWakeOwed(supervision)
-		persistJoin := time.Since(tJoin)
+		var persistJoin time.Duration
+		if joinWakeOwed != nil {
+			optimisticOK = joinWakeOwed(supervision)
+			persistJoin = time.Since(tJoin)
+		}
 		if startErr != nil {
 			tFailBoundary = time.Now()
 			m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
 			m.setStatus(vmID, StatusError)
 			return nil, fmt.Errorf("start firecracker: %w", startErr)
 		}
-		if !optimisticOK {
+		if joinWakeOwed != nil && !optimisticOK {
 			optimisticOK = m.persistState(inst)
 		}
-		if !optimisticOK {
+		if joinWakeOwed != nil && !optimisticOK {
 			// Fail closed: the vCPUs must not run ahead of the record that
 			// owes their wake.
 			tFailBoundary = time.Now()
@@ -3611,6 +3620,26 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		restoreErr = attemptErr
 
 		if restoreErr == nil {
+			// An unfrozen image publishes Running after the load, with the
+			// write overlapping the readiness wait. The window is not routable —
+			// the control plane hands out no usable sandbox until this RPC
+			// returns — and a crash here leaves an unverified record, which
+			// adoption re-verifies before trusting.
+			var persistDone chan struct{}
+			if !restoreCorrectsWallClock {
+				inst.mu.Lock()
+				inst.Status = StatusRunning
+				inst.Unverified = true
+				inst.PausedAt = time.Time{}
+				inst.mu.Unlock()
+				done := make(chan struct{})
+				persistDone = done
+				go func() {
+					defer sentrylog.Recover("restore-persist")
+					defer close(done)
+					optimisticOK = m.persistState(inst)
+				}()
+			}
 			tBoxdStart = time.Now()
 			// Same window as first boot: a restore that has to fault its memory and
 			// overlay from cold storage (first resume of a migrated VM, page cache
@@ -3637,8 +3666,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// while it runs. Cancelled on the healthy path, where the whole cost is a
 			// timer that never fires.
 			stopDiag := m.armEarlyStallDiagnostics(vmID, pid)
-			wakeErr = boxdWakeGuest(ctx, hostIP, readiness, restoreClockFrozen)
+			if restoreCorrectsWallClock {
+				wakeErr = boxdWakeGuest(ctx, hostIP, readiness, restoreClockFrozen)
+			} else {
+				wakeErr = boxdHealthProbe(ctx, hostIP, readiness)
+			}
 			stopDiag()
+			if persistDone != nil {
+				<-persistDone
+			}
 			if wakeErr == nil || clockRetried || !restoreClockFrozen || !errors.Is(wakeErr, ErrGuestClockUnready) {
 				break
 			}

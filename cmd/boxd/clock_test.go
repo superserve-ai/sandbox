@@ -147,12 +147,16 @@ func TestWallClockMustCorrectWithoutSourceIsNotReady(t *testing.T) {
 }
 
 func TestVerifySetProvesPermission(t *testing.T) {
-	ok := &fakeSource{host: base}
-	if err := clockUnder(ok, base).verifySet(); err != nil {
-		t.Errorf("verifySet: %v", err)
+	ok := clockUnder(&fakeSource{host: base}, base)
+	if st := ok.verifySet(); st.Source != "ptp" || !st.SettimeOK || st.Error != "" {
+		t.Errorf("verifySet: %+v", st)
+	}
+	// What was proven is what health reports afterwards, without another read.
+	if st := ok.status(); !st.SettimeOK {
+		t.Errorf("status after verify: %+v", st)
 	}
 	denied := &fakeSource{host: base, setErr: errors.New("EPERM")}
-	if err := clockUnder(denied, base).verifySet(); err == nil {
-		t.Error("verifySet must surface a refused set")
+	if st := clockUnder(denied, base).verifySet(); st.SettimeOK || st.Error == "" {
+		t.Errorf("verifySet must surface a refused set: %+v", st)
 	}
 }

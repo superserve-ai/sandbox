@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -61,6 +62,9 @@ type freezer struct {
 	mounted bool
 	// mu: spawns hold it shared across Start(); a freeze holds it exclusively.
 	mu sync.RWMutex
+	// frozen mirrors the state this freezer last confirmed, so health can
+	// answer without a file read or waiting on a freeze in progress.
+	frozen atomic.Bool
 }
 
 func newFreezer(fs freezerFS, dir string) *freezer {
@@ -101,11 +105,7 @@ func (f *freezer) wrap(name string, args []string) (string, []string) {
 }
 
 func (f *freezer) isFrozen() bool {
-	if !f.available() {
-		return false
-	}
-	st, err := f.fs.readState()
-	return err == nil && st != "THAWED"
+	return f.available() && f.frozen.Load()
 }
 
 // freeze stops the cgroup and waits for every task to stop. On timeout it
@@ -128,6 +128,7 @@ func (f *freezer) freeze(ctx context.Context) error {
 			return f.undo(fmt.Errorf("read freezer state: %w", err))
 		}
 		if st == "FROZEN" {
+			f.frozen.Store(true)
 			return nil
 		}
 		select {
@@ -162,6 +163,7 @@ func (f *freezer) thawLocked() error {
 		return err
 	}
 	if st == "THAWED" {
+		f.frozen.Store(false)
 		return nil
 	}
 	if err := f.fs.writeState("THAWED"); err != nil {
@@ -173,6 +175,7 @@ func (f *freezer) thawLocked() error {
 	if st != "THAWED" {
 		return fmt.Errorf("state %q after thaw", st)
 	}
+	f.frozen.Store(false)
 	return nil
 }
 

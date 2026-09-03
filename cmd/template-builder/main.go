@@ -215,6 +215,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		BoxdBinaryPath:           cfg.boxdBin,
 		MaxUncompressedSizeBytes: int64(cfg.diskMiB) * 1024 * 1024,
 		ProxyCACertPath:          proxyCA,
+		FreezeWorkload:           os.Getenv("TEMPLATE_FREEZE_WORKLOAD") == "true",
 	})
 	if err != nil {
 		return fmt.Errorf("create builder: %w", err)

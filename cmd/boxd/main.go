@@ -165,11 +165,7 @@ func handleHealth(clock *wallClock, fz *freezer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		wc := clock.status()
 		if r.URL.Query().Get("verify") == "settime" {
-			if err := clock.verifySet(); err != nil {
-				wc.Error = "settime: " + err.Error()
-			} else {
-				wc.SettimeOK = true
-			}
+			wc = clock.verifySet()
 		}
 		status := "ok"
 		w.Header().Set("Content-Type", "application/json")

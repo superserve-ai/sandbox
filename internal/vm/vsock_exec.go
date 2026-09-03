@@ -195,7 +195,6 @@ func postBoxd(ctx context.Context, vmIP, path string, body []byte) error {
 // can retry the restore the unfrozen way instead of waiting out the budget.
 func waitForGuestWake(ctx context.Context, vmIP string, timeout time.Duration, clockFrozen bool) error {
 	url := fmt.Sprintf("http://%s:%d/wake", vmIP, boxdPort)
-	healthURL := fmt.Sprintf("http://%s:%d/health", vmIP, boxdPort)
 	body, _ := json.Marshal(struct {
 		ClockFrozen bool `json:"clock_frozen"`
 	}{clockFrozen})
@@ -208,31 +207,18 @@ func waitForGuestWake(ctx context.Context, vmIP string, timeout time.Duration, c
 	interval := time.Millisecond
 	var lastErr error
 	clockUnready := 0
-	// A guest from before this protocol has no /wake. Nothing in it is frozen,
-	// so its health is its readiness — unless this restore froze the clock,
-	// which only /wake can correct.
-	legacy := false
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		var req *http.Request
-		if legacy {
-			req, _ = http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
-		} else {
-			req, _ = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-		}
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
 		resp, err := client.Do(req)
 		if err == nil {
 			reply, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return nil
-			}
-			if !legacy && !clockFrozen && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed) {
-				legacy = true
-				continue
 			}
 			err = fmt.Errorf("unexpected status %d", resp.StatusCode)
 			if resp.StatusCode == http.StatusServiceUnavailable {

@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -152,42 +151,6 @@ func TestWakeStateSurvivesRecordRoundTrip(t *testing.T) {
 	got := toInstance(rec)
 	if !got.WakePending || !got.ClockFrozen || got.SnapshotWorkloadFrozen == nil || !*got.SnapshotWorkloadFrozen {
 		t.Errorf("toInstance dropped wake state: pending=%v frozen=%v image=%v", got.WakePending, got.ClockFrozen, got.SnapshotWorkloadFrozen)
-	}
-}
-
-// A guest from before the wake protocol answers /wake with 404. With nothing
-// frozen its health is its readiness; with a frozen clock nothing but /wake
-// may vouch for it.
-func TestWaitForGuestWakeLegacyGuest(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(boxdPort))
-	if err != nil {
-		t.Skipf("port %d busy: %v", boxdPort, err)
-	}
-	var healthPolls atomic.Int32
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" && r.Method == http.MethodGet {
-			healthPolls.Add(1)
-			w.Write([]byte(`{"status":"ok"}`))
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	srv.Listener = ln
-	srv.Start()
-	defer srv.Close()
-
-	if err := waitForGuestWake(context.Background(), "127.0.0.1", 2*time.Second, false); err != nil {
-		t.Fatalf("unfrozen: want readiness from /health, got %v", err)
-	}
-	if healthPolls.Load() == 0 {
-		t.Fatal("unfrozen: /health was never consulted")
-	}
-	healthPolls.Store(0)
-	if err := waitForGuestWake(context.Background(), "127.0.0.1", 300*time.Millisecond, true); err == nil {
-		t.Fatal("frozen: a guest without /wake must not be verified by /health")
-	}
-	if n := healthPolls.Load(); n != 0 {
-		t.Fatalf("frozen: /health polled %d times", n)
 	}
 }
 
@@ -433,6 +396,11 @@ func TestRestoreAbortsBeforeLoadWithoutDurableWakeRecord(t *testing.T) {
 		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Only a frozen image owes a wake, and so only a frozen image has a record
+	// that must be durable before the load.
+	if err := os.WriteFile(WallClockMarkerPath(memPath), nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
 	fake := &fakeNetMgr{}
 	mgr := &Manager{
