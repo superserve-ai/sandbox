@@ -19,15 +19,16 @@ func resolveClientIP(r *http.Request, forwardingRuleIP string) string {
 	if remoteIP == nil || forwardingRuleIP == "" {
 		return remote
 	}
-	// Only an internal transport peer may assert the load-balancer XFF
-	// contract. A public peer can reach the service directly and forge a
-	// syntactically valid forwarding-rule suffix.
-	if !remoteIP.IsPrivate() {
+	// Cloud Run's direct service hostname is not an LB ingress path and must
+	// never be allowed to self-assert the forwarding-rule suffix. For
+	// internal-and-cloud-load-balancing ingress, the documented marker that
+	// the request was proxied by Google's Application Load Balancer is Via:
+	// 1.1 google; the backend hop's RemoteAddr is not documented as private
+	// for serverless NEGs.
+	if strings.HasSuffix(strings.ToLower(r.Host), ".run.app") {
 		return remote
 	}
-	// Cloud Run's direct service hostname is not an LB ingress path and must
-	// never be allowed to self-assert the forwarding-rule suffix.
-	if strings.HasSuffix(strings.ToLower(r.Host), ".run.app") {
+	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("Via")), "1.1 google") {
 		return remote
 	}
 	lb := net.ParseIP(strings.TrimSpace(forwardingRuleIP))

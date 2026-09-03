@@ -19,6 +19,9 @@ func TestResolveClientIP(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r := httptest.NewRequest("GET", "https://service.run.app/", nil)
 			r.RemoteAddr, r.Header = tc.remote, make(map[string][]string)
+			if tc.name != "public peer spoof" && tc.name != "direct run app" {
+				r.Header.Set("Via", "1.1 google")
+			}
 			if tc.name != "direct run app" {
 				r.Host = "api.example.test"
 			}
