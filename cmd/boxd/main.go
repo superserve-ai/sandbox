@@ -136,6 +136,11 @@ func main() {
 	clock := newWallClock(newWallClockSource())
 	mux.HandleFunc("/health", handleHealth(clock, fz))
 	gate := newHostGate()
+	if fz.available() {
+		// Read at boot, off the request path, so no lifecycle request
+		// enumerates interfaces.
+		go gate.guestIPs()
+	}
 	mux.HandleFunc("/verify-clock", gate.only(handleVerifyClock(clock, fz)))
 	mux.HandleFunc("/freeze", gate.only(fz.handleFreeze))
 	mux.HandleFunc("/thaw", gate.only(fz.handleThaw))
