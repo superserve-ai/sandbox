@@ -1545,7 +1545,7 @@ func (r *Reconciler) markStale(vmID string) error {
 	// Delete from BoltDB first. Deleting from the map before BoltDB would
 	// cause ReattachAll to resurrect the stale record on next restart, so a
 	// failure here abandons the whole cleanup rather than half-applying it.
-	if err := r.mgr.state.Delete(vmID); err != nil {
+	if err := r.mgr.deleteRecord(vmID); err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to delete stale state")
 		return err
 	}

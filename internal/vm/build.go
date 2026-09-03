@@ -115,7 +115,7 @@ func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req
 	// at cancellation: a cancelled build's subprocess is still alive and
 	// still holding capacity until the worker actually exits. Same boundary
 	// as the workflow count above, for the same reason.
-	defer m.admission.Release(buildVMID)
+	defer m.admission.ReleaseOwned(buildVMID, rec)
 	defer m.releaseBuildAlloc(rec, req.VCPU, req.MemoryMiB)
 	result, err := m.buildTemplateSync(ctx, buildVMID, req, rec)
 	m.completeBuild(buildVMID, rec, result, err)

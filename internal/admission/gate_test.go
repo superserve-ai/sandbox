@@ -15,7 +15,7 @@ import (
 func TestAdmissionGateAdmitsExactlyItsLimitUnderRace(t *testing.T) {
 	const limit, racers = 3, 20
 	g := NewGate(true, limit)
-	g.Reconstruct(nil, nil)
+	g.Reconstruct(g.BeginReconstruct(), nil, nil)
 	g.Open()
 
 	var wg sync.WaitGroup
@@ -57,7 +57,7 @@ func TestAdmissionGateAdmitsExactlyItsLimitUnderRace(t *testing.T) {
 // buys is that an already-charged id is re-admitted when a newcomer is not.
 func TestAdmissionGateReadmitsAnOwnedSandboxAtCapacity(t *testing.T) {
 	g := NewGate(true, 2)
-	g.Reconstruct(nil, nil)
+	g.Reconstruct(g.BeginReconstruct(), nil, nil)
 	g.Open()
 
 	if err := g.Admit("sb-1", IntentCreate); err != nil {
@@ -86,7 +86,7 @@ func TestAdmissionGateReadmitsAnOwnedSandboxAtCapacity(t *testing.T) {
 // apply to it. A create at the same limit is still refused.
 func TestAdmissionGateNeverRefusesResumeOnOperatorLimit(t *testing.T) {
 	g := NewGate(true, 1)
-	g.Reconstruct(nil, nil)
+	g.Reconstruct(g.BeginReconstruct(), nil, nil)
 	g.Open()
 
 	if err := g.Admit("sb-1", IntentCreate); err != nil {
@@ -108,7 +108,7 @@ func TestAdmissionGateNeverRefusesResumeOnOperatorLimit(t *testing.T) {
 // "resume" lets a real create past the limit — so an enabled gate refuses.
 func TestAdmissionGateRefusesUnspecifiedIntentWhenEnabled(t *testing.T) {
 	g := NewGate(true, 10)
-	g.Reconstruct(nil, nil)
+	g.Reconstruct(g.BeginReconstruct(), nil, nil)
 	g.Open()
 
 	if err := g.Admit("sb-1", IntentUnspecified); !errors.Is(err, ErrIntentRequired) {
@@ -150,7 +150,7 @@ func TestAdmissionGateStartsClosedAndRefusesUntilOpened(t *testing.T) {
 	if err := g.Admit("sb-1", IntentCreate); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("admitted before reconstruction finished: %v", err)
 	}
-	g.Reconstruct([]string{"survivor-1", "survivor-2"}, []string{"build-1"})
+	g.Reconstruct(g.BeginReconstruct(), []string{"survivor-1", "survivor-2"}, []string{"build-1"})
 	g.Open()
 	if got := g.Charged(); got != 3 {
 		t.Fatalf("reconstructed ledger holds %d, want 3 (two sandboxes and a builder)", got)
@@ -166,10 +166,10 @@ func TestAdmissionGateStartsClosedAndRefusesUntilOpened(t *testing.T) {
 // one placement believes in.
 func TestAdmissionGateCountsBuildersAgainstTheSandboxLimit(t *testing.T) {
 	g := NewGate(true, 2)
-	g.Reconstruct(nil, nil)
+	g.Reconstruct(g.BeginReconstruct(), nil, nil)
 	g.Open()
 
-	if err := g.AdmitBuild("build-1"); err != nil {
+	if err := g.AdmitBuild("build-1", "worker-1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := g.Admit("sb-1", IntentCreate); err != nil {
@@ -182,7 +182,7 @@ func TestAdmissionGateCountsBuildersAgainstTheSandboxLimit(t *testing.T) {
 	// Separate from the assertion above, which only proves the builder's
 	// token is counted when something else asks for room — it would still
 	// pass if AdmitBuild never checked the limit at all.
-	if err := g.AdmitBuild("build-2"); !errors.Is(err, ErrHostAtCapacity) {
+	if err := g.AdmitBuild("build-2", "worker-2"); !errors.Is(err, ErrHostAtCapacity) {
 		t.Fatalf("build admitted past the limit: got %v, want ErrHostAtCapacity", err)
 	}
 }
@@ -192,7 +192,7 @@ func TestAdmissionGateCountsBuildersAgainstTheSandboxLimit(t *testing.T) {
 // create still completes.
 func TestAdmissionGateDrainRefusesNewButNotOwned(t *testing.T) {
 	g := NewGate(true, 10)
-	g.Reconstruct([]string{"existing"}, nil)
+	g.Reconstruct(g.BeginReconstruct(), []string{"existing"}, nil)
 	g.Open()
 	if err := g.Admit("in-flight", IntentCreate); err != nil {
 		t.Fatal(err)
@@ -215,7 +215,7 @@ func TestAdmissionGateDrainRefusesNewButNotOwned(t *testing.T) {
 // sandbox has since claimed.
 func TestAdmissionGateReleaseIsIdempotent(t *testing.T) {
 	g := NewGate(true, 2)
-	g.Reconstruct(nil, nil)
+	g.Reconstruct(g.BeginReconstruct(), nil, nil)
 	g.Open()
 
 	if err := g.Admit("sb-1", IntentCreate); err != nil {
@@ -240,7 +240,7 @@ func TestAdmissionGateReleaseIsIdempotent(t *testing.T) {
 // gate is not charging for, which is a correctness bug.
 func TestAdmissionGateAuditOnlyReactsToUndercount(t *testing.T) {
 	g := NewGate(true, 10)
-	g.Reconstruct([]string{"a", "b", "c"}, nil)
+	g.Reconstruct(g.BeginReconstruct(), []string{"a", "b", "c"}, nil)
 	g.Open()
 
 	if g.AuditUndercount(1) {
@@ -251,5 +251,87 @@ func TestAdmissionGateAuditOnlyReactsToUndercount(t *testing.T) {
 	}
 	if !g.AuditUndercount(4) {
 		t.Fatal("audit missed an undercount: a VM is running that the gate is not charging for")
+	}
+}
+
+// A rebuild reads a persistent store, which takes time, and the gate keeps
+// admitting owned work while it reads. A create admitted in that window is
+// absent from the snapshot the rebuild is holding — so a rebuild that
+// replaced the ledger wholesale would drop its charge and let the host
+// over-admit by exactly the number of creates in flight.
+func TestReconstructKeepsTokensChargedWhileItWasReading(t *testing.T) {
+	g := NewGate(true, 10)
+	g.Reconstruct(g.BeginReconstruct(), []string{"old"}, nil)
+	g.Open()
+
+	// A rebuild begins: it captures the generation, then reads its store.
+	since := g.BeginReconstruct()
+
+	// Mid-read, a create is admitted. It cannot appear in what the rebuild
+	// is about to hand back, because that snapshot predates it.
+	if err := g.Admit("in-flight", IntentCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	// The rebuild commits what it saw: only the old sandbox.
+	g.Reconstruct(since, []string{"old"}, nil)
+
+	if !g.Holds("in-flight") {
+		t.Fatal("a create admitted during the rebuild lost its charge; the host would over-admit by one per in-flight create")
+	}
+	if !g.Holds("old") {
+		t.Fatal("the rebuild dropped a sandbox it observed")
+	}
+	if got := g.Charged(); got != 2 {
+		t.Fatalf("charged %d, want 2", got)
+	}
+}
+
+// A rebuild is authoritative for everything that predates it: a token whose
+// work is gone must not survive, or the host shrinks silently until restart.
+func TestReconstructDropsTokensItsSnapshotDoesNotContain(t *testing.T) {
+	g := NewGate(true, 10)
+	g.Reconstruct(g.BeginReconstruct(), []string{"stale-1", "stale-2", "live"}, nil)
+	g.Open()
+
+	// The store now reports only one of them; the other two are gone.
+	g.Reconstruct(g.BeginReconstruct(), []string{"live"}, nil)
+
+	if g.Holds("stale-1") || g.Holds("stale-2") {
+		t.Fatal("a rebuild kept tokens its authoritative source no longer lists; leaked capacity never returns")
+	}
+	if got := g.Charged(); got != 1 {
+		t.Fatalf("charged %d, want 1", got)
+	}
+}
+
+// A build id can be re-registered while the previous worker is still
+// winding down, and that outgoing worker releases on its way out. Releasing
+// by id alone would free the REPLACEMENT's charge and let the host
+// over-admit for as long as the replacement runs.
+func TestReleaseOwnedIgnoresASupersededHolder(t *testing.T) {
+	g := NewGate(true, 10)
+	g.Reconstruct(g.BeginReconstruct(), nil, nil)
+	g.Open()
+
+	first := "worker-a"
+	second := "worker-b"
+	if err := g.AdmitBuild("build-1", first); err != nil {
+		t.Fatal(err)
+	}
+	// The id is re-registered under a new worker before the old one exits.
+	if err := g.AdmitBuild("build-1", second); err != nil {
+		t.Fatal(err)
+	}
+	// The outgoing worker finally exits and releases.
+	g.ReleaseOwned("build-1", first)
+
+	if !g.Holds("build-1") {
+		t.Fatal("a superseded worker's release freed the replacement's charge")
+	}
+	// The replacement's own release does take effect.
+	g.ReleaseOwned("build-1", second)
+	if g.Holds("build-1") {
+		t.Fatal("the owning worker's release did not free its charge")
 	}
 }

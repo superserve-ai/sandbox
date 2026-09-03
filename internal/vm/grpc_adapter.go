@@ -106,7 +106,10 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 	}
 	inst, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
 	if err != nil {
-		return nil, err
+		// A resume reuses its recorded index and should never reach the
+		// operator's slot limit, but it can exhaust the kernel range —
+		// map here so that surfaces as capacity rather than Unknown.
+		return nil, admissionError(err)
 	}
 
 	// Resume is a no-op for secrets: the agent's HTTPS_PROXY (with its JWT) and
@@ -201,7 +204,12 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 
 	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
 	if err != nil {
-		return nil, err
+		// Mapped on the way out too, not only around the gate above: the
+		// operator's slot limit is enforced inside the allocator, so it
+		// surfaces from deep in the launch rather than from admission.
+		// Returned raw it would reach the caller as Unknown — unretryable,
+		// and indistinguishable from a genuine host fault.
+		return nil, admissionError(err)
 	}
 
 	// Env vars are pushed in a separate InjectSandboxEnv call so the control

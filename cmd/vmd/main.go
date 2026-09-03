@@ -1747,10 +1747,14 @@ func main() {
 		// Builders orphaned by the previous daemon (deploy restarts kill
 		// only the main process) hold unsizable build-VM memory; the
 		// pressure gate stays closed until the async discovery completes
-		// and every survivor exits. Skipped when pressure publication is
-		// not configured: the /proc walk buys nothing for a host that
-		// never publishes.
-		if publishesPressure {
+		// and every survivor exits.
+		//
+		// Needed by local admission as well as by publication, and for a
+		// sharper reason: admission reconstruction counts builders from
+		// the live registry, which a survivor is absent from until this
+		// scan finds it. Skipping the walk on a host that enforces limits
+		// would open the gate blind to work already running.
+		if publishesPressure || localAdmission {
 			mgr.ScanSurvivingBuildersAsync(cfg.TemplateBuilderBin)
 		}
 		proxyHealthURL := os.Getenv("PROXY_HEALTH_URL")

@@ -83,6 +83,17 @@ type admissionToken struct {
 	// limit, so a gate that ignored builds would enforce a different
 	// limit than the one ranking believes in.
 	build bool
+	// gen is the generation this token was charged in. A rebuild replaces
+	// only tokens that existed when its snapshot of the world was taken;
+	// anything charged later is newer than the snapshot and survives, or
+	// a create admitted mid-rebuild would silently lose its charge.
+	gen uint64
+	// owner identifies WHICH holder charged this token, for ids that can
+	// be re-registered while a previous holder is still shutting down.
+	// Releasing by id alone would let the outgoing holder drop the
+	// incoming one's charge; a release must match the owner that took it.
+	// Nil for sandboxes, whose id is held by one lifecycle at a time.
+	owner any
 }
 
 // Gate enforces the operator's concurrent-sandbox limit locally.
@@ -106,6 +117,11 @@ type Gate struct {
 	// maxSandboxes is the operator's limit. Zero means unlimited, matching
 	// how the pressure publisher already reads VMD_MAX_SANDBOXES.
 	maxSandboxes int
+	// gen increments on every charge. A rebuild reads it before consulting
+	// its slower source of truth and passes it back, which is what lets
+	// the rebuild tell "this token predates my snapshot, replace it" from
+	// "this was charged while I was reading, keep it".
+	gen uint64
 }
 
 // NewGate builds a gate. An enabled gate starts reconstructing and
@@ -160,7 +176,32 @@ func (g *Gate) Charged() int {
 // unknown ids would carry forward exactly the phantom charges reconstruction
 // exists to clear. Safe only because callers run it while the gate is closed
 // — Open is what publishes the result.
-func (g *Gate) Reconstruct(sandboxIDs, buildIDs []string) {
+// BeginReconstruct marks the point a rebuild starts reading the world, and
+// returns the generation to hand back to Reconstruct.
+//
+// Rebuilding is not instantaneous — it reads a persistent store — and the
+// gate keeps admitting owned work while it runs. Without this marker a
+// rebuild would replace the ledger wholesale and discard any token charged
+// while it was reading, so a create admitted mid-rebuild would proceed
+// uncharged and the host would over-admit by exactly that many.
+func (g *Gate) BeginReconstruct() uint64 {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.gen
+}
+
+// Reconstruct replaces the ledger with what the caller observed, keeping
+// any token charged after its snapshot began.
+//
+// since must come from BeginReconstruct, taken BEFORE the caller read its
+// source of truth. Tokens at or below it predate the snapshot and are
+// authoritative from the snapshot; tokens above it were charged while the
+// caller was reading, are absent from what it saw, and must survive — they
+// are in-flight work, not stale residue.
+func (g *Gate) Reconstruct(since uint64, sandboxIDs, buildIDs []string) {
 	if g == nil {
 		return
 	}
@@ -171,10 +212,18 @@ func (g *Gate) Reconstruct(sandboxIDs, buildIDs []string) {
 	}
 	tokens := make(map[string]admissionToken, len(sandboxIDs)+len(buildIDs))
 	for _, id := range sandboxIDs {
-		tokens[id] = admissionToken{}
+		tokens[id] = admissionToken{gen: g.gen}
 	}
 	for _, id := range buildIDs {
-		tokens[id] = admissionToken{build: true}
+		tokens[id] = admissionToken{build: true, gen: g.gen}
+	}
+	// Carry forward everything charged since the snapshot started. Also
+	// keeps the newer token when both sides have the id: the live charge
+	// knows its owner, the reconstructed one does not.
+	for id, tok := range g.tokens {
+		if tok.gen > since {
+			tokens[id] = tok
+		}
 	}
 	g.tokens = tokens
 }
@@ -254,7 +303,8 @@ func (g *Gate) Admit(id string, intent Intent) error {
 		if intent == IntentResume && g.state == StateDraining {
 			// A drain stops new placement, not the return of sandboxes
 			// this host already owns.
-			g.tokens[id] = admissionToken{}
+			g.gen++
+			g.tokens[id] = admissionToken{gen: g.gen}
 			return nil
 		}
 		return ErrNotReady
@@ -262,7 +312,8 @@ func (g *Gate) Admit(id string, intent Intent) error {
 	if intent == IntentCreate && g.maxSandboxes > 0 && len(g.tokens) >= g.maxSandboxes {
 		return ErrHostAtCapacity
 	}
-	g.tokens[id] = admissionToken{}
+	g.gen++
+	g.tokens[id] = admissionToken{gen: g.gen}
 	return nil
 }
 
@@ -270,7 +321,11 @@ func (g *Gate) Admit(id string, intent Intent) error {
 // is no resume equivalent — but they are refused for the same reason
 // creates are, because their pressure is published as provisioning
 // sandboxes and counted against this same limit.
-func (g *Gate) AdmitBuild(id string) error {
+// owner identifies the holder taking the charge, and must be presented
+// again to release it. A build id can be re-registered while the previous
+// worker is still winding down, so a release that matched on id alone would
+// let the outgoing worker drop the incoming one's charge.
+func (g *Gate) AdmitBuild(id string, owner any) error {
 	if g == nil {
 		return nil
 	}
@@ -279,7 +334,14 @@ func (g *Gate) AdmitBuild(id string) error {
 	if g.state == StateDisabled {
 		return nil
 	}
-	if _, held := g.tokens[id]; held {
+	if existing, held := g.tokens[id]; held {
+		// Re-admitting the same id under a NEW owner is a replacement, not
+		// a retry: take ownership so the outgoing holder's release cannot
+		// match, while the count stays put because the id is unchanged.
+		if existing.owner != owner {
+			g.gen++
+			g.tokens[id] = admissionToken{build: true, gen: g.gen, owner: owner}
+		}
 		return nil
 	}
 	if g.state != StateOpen {
@@ -288,7 +350,8 @@ func (g *Gate) AdmitBuild(id string) error {
 	if g.maxSandboxes > 0 && len(g.tokens) >= g.maxSandboxes {
 		return ErrHostAtCapacity
 	}
-	g.tokens[id] = admissionToken{build: true}
+	g.gen++
+	g.tokens[id] = admissionToken{build: true, gen: g.gen, owner: owner}
 	return nil
 }
 
@@ -303,6 +366,25 @@ func (g *Gate) Release(id string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	delete(g.tokens, id)
+}
+
+// ReleaseOwned drops id's token only if owner still holds it.
+//
+// The guard is the point: an id can be re-registered while its previous
+// holder is still shutting down, and that outgoing holder will release on
+// its way out. Releasing by id alone would free the INCOMING holder's
+// charge and let the host over-admit by one for as long as the replacement
+// runs. A mismatch means someone else owns the id now, so there is nothing
+// here to give back.
+func (g *Gate) ReleaseOwned(id string, owner any) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if tok, held := g.tokens[id]; held && tok.owner == owner {
+		delete(g.tokens, id)
+	}
 }
 
 // Holds reports whether id is charged, for reconciliation and tests.
