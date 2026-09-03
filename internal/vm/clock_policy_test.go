@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -524,8 +523,8 @@ func TestReadingAManifestLeavesWakeProtocolEvidence(t *testing.T) {
 	dir := t.TempDir()
 	orig := wakeProtocolEvidencePath
 	wakeProtocolEvidencePath = filepath.Join(dir, "evidence")
-	wakeProtocolEvidenceOnce = sync.Once{}
-	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceOnce = sync.Once{} })
+	wakeProtocolEvidenceDone.Store(false)
+	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceDone.Store(false) })
 
 	mem := filepath.Join(dir, "mem.snap")
 	if _, err := ReadWallClockManifest(mem); err != nil {
@@ -550,8 +549,8 @@ func TestTemplateManifestsLeaveEvidence(t *testing.T) {
 	dir := t.TempDir()
 	orig := wakeProtocolEvidencePath
 	wakeProtocolEvidencePath = filepath.Join(dir, "evidence")
-	wakeProtocolEvidenceOnce = sync.Once{}
-	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceOnce = sync.Once{} })
+	wakeProtocolEvidenceDone.Store(false)
+	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceDone.Store(false) })
 
 	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
 	if n := m.scanTemplateManifests(); n != 0 {
@@ -570,5 +569,39 @@ func TestTemplateManifestsLeaveEvidence(t *testing.T) {
 	}
 	if _, err := os.Stat(wakeProtocolEvidencePath); err != nil {
 		t.Fatalf("evidence not written after a frozen template landed: %v", err)
+	}
+}
+
+// A floor write that fails is retried by the next manifest read, never
+// remembered as done.
+func TestWakeProtocolEvidenceRetriesAfterFailure(t *testing.T) {
+	dir := t.TempDir()
+	orig := wakeProtocolEvidencePath
+	// A path inside a directory that exists but is a file: the write fails.
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wakeProtocolEvidencePath = filepath.Join(blocker, "evidence")
+	wakeProtocolEvidenceDone.Store(false)
+	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceDone.Store(false) })
+
+	mem := filepath.Join(dir, "mem.snap")
+	seedFrozenManifest(t, mem, "tok")
+	if _, err := ReadWallClockManifest(mem); err != nil {
+		t.Fatal(err)
+	}
+	if wakeProtocolEvidenceDone.Load() {
+		t.Fatal("a failed write must not be remembered as done")
+	}
+	wakeProtocolEvidencePath = filepath.Join(dir, "evidence")
+	if _, err := ReadWallClockManifest(mem); err != nil {
+		t.Fatal(err)
+	}
+	if !wakeProtocolEvidenceDone.Load() {
+		t.Fatal("the retry did not land")
+	}
+	if _, err := os.Stat(wakeProtocolEvidencePath); err != nil {
+		t.Fatalf("evidence missing after retry: %v", err)
 	}
 }

@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -50,15 +49,43 @@ const WakeProtocolCapability = "wake-protocol-1"
 // the directory is not a fleet host.
 var wakeProtocolEvidencePath = "/var/lib/sandbox/wake-protocol-evidence"
 
-var wakeProtocolEvidenceOnce sync.Once
+// wakeProtocolEvidenceDone is set only once the write is durable, so a failed
+// attempt is retried by the next manifest read rather than forgotten.
+var wakeProtocolEvidenceDone atomic.Bool
 
 func noteWakeProtocolEvidence() {
-	wakeProtocolEvidenceOnce.Do(func() {
-		if _, err := os.Stat(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
-			return
-		}
-		_ = os.WriteFile(wakeProtocolEvidencePath, []byte(WakeProtocolCapability+"\n"), 0o644)
-	})
+	if wakeProtocolEvidenceDone.Load() {
+		return
+	}
+	if _, err := os.Stat(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
+		return
+	}
+	if RaiseWakeProtocolFloor() == nil {
+		wakeProtocolEvidenceDone.Store(true)
+	}
+}
+
+// RaiseWakeProtocolFloor durably records that this host holds, or is about to
+// hold, an image that owes a wake. The template builder calls it before it
+// publishes a frozen image, so the floor is up before the artifact exists;
+// the daemon calls it on every manifest it reads.
+func RaiseWakeProtocolFloor() error {
+	f, err := os.OpenFile(wakeProtocolEvidencePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(WakeProtocolCapability + "\n"); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(wakeProtocolEvidencePath))
 }
 
 var ErrWallClockManifest = errors.New("wall-clock manifest unreadable")

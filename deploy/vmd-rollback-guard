@@ -21,11 +21,22 @@ BIN="${1:-/usr/local/bin/vmd}"
 # first time it sees such an image's manifest — restored, paused, or seeded
 # among this host's templates — so the floor rises on its own and only when
 # there is something to protect.
+# The templates themselves are the second witness, so an image that landed
+# moments ago, before the daemon's scan or the builder's write, still blocks.
 WAKE_EVIDENCE=/var/lib/sandbox/wake-protocol-evidence
-if [ -e "$WAKE_EVIDENCE" ] && ! grep -qa wake-protocol-1 "$BIN" 2>/dev/null; then
-    echo "vmd-rollback-guard: REFUSING to start a vmd without the wake protocol: this host holds images that owe a wake (${WAKE_EVIDENCE})" >&2
-    echo "vmd-rollback-guard: deploy a wake-capable build; remove ${WAKE_EVIDENCE} only once no frozen image can be restored here" >&2
-    exit 1
+SNAPSHOTS=$(sed -n 's/^SNAPSHOT_DIR=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -n 1 | tr -d '"')
+SNAPSHOTS="${SNAPSHOTS:-/var/lib/sandbox/snapshots}"
+if ! grep -qa wake-protocol-1 "$BIN" 2>/dev/null; then
+    wake_evidence=""
+    [ -e "$WAKE_EVIDENCE" ] && wake_evidence="$WAKE_EVIDENCE"
+    if [ -z "$wake_evidence" ] && grep -lqs '"workload_frozen":true' "$SNAPSHOTS"/templates/*/*.wallclock 2>/dev/null; then
+        wake_evidence="frozen template manifest under ${SNAPSHOTS}/templates"
+    fi
+    if [ -n "$wake_evidence" ]; then
+        echo "vmd-rollback-guard: REFUSING to start a vmd without the wake protocol: this host holds images that owe a wake (${wake_evidence})" >&2
+        echo "vmd-rollback-guard: deploy a wake-capable build; the floor comes down only once no frozen image can be restored here" >&2
+        exit 1
+    fi
 fi
 
 # The capable vmd records its RESOLVED state path at a fixed location at

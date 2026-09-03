@@ -350,6 +350,13 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	// guest corrects its clock, and which token the wake must present.
 	markerPath := ""
 	if correctsWallClock {
+		// The rollback floor rises before the first frozen artifact exists on
+		// this host: a supervisor without the wake protocol must never be
+		// installed over it, so a floor that cannot be made durable fails the
+		// build rather than publishing an image nothing may be rolled back under.
+		if err := vm.RaiseWakeProtocolFloor(); err != nil {
+			return fmt.Errorf("raise wake-protocol floor: %w", err)
+		}
 		markerPath = vm.WallClockMarkerPath(memPath)
 		man := vm.WallClockManifest{
 			Version: vm.WallClockManifestVersion, ArtifactID: vm.NewArtifactID(),
