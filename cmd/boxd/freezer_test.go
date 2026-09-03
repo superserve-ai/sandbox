@@ -10,8 +10,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"connectrpc.com/connect"
+
+	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
 // fakeCgroup behaves like the v1 freezer: a FROZEN request reads FREEZING for
@@ -499,5 +504,28 @@ func TestFreezerFromEnv(t *testing.T) {
 	}
 	if fz := freezerFromEnv(); !fz.available() || fz.dir != dir {
 		t.Fatal("a mounted freezer named by the init script must be used")
+	}
+}
+
+// A spawn refused during a freeze opens nothing: the guard comes before the
+// stdio pipes, so a refusal cannot leave a descriptor behind.
+func TestRefusedSpawnOpensNothing(t *testing.T) {
+	fz := newFreezer(newFake(), testDir)
+	if err := fz.freeze(bg(), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	s := newProcessService()
+	s.freezer = fz
+	emit := func(*pb.ProcessEvent) error { return nil }
+	name, args, placed := fz.wrap("/bin/sh", []string{"-c", "true"})
+	cmd := exec.Command(name, args...)
+	placed.attach(cmd)
+	err := s.startPipes(bg(), cmd, placed, emit, new(atomic.Bool), true)
+	if connect.CodeOf(err) != connect.CodeUnavailable {
+		t.Fatalf("spawn while frozen: %v", err)
+	}
+	if cmd.Stdin != nil || cmd.Stdout != nil || cmd.Stderr != nil || placed.r != nil || placed.w != nil {
+		t.Fatalf("refused spawn left descriptors open: stdin=%v stdout=%v stderr=%v placement=%v/%v",
+			cmd.Stdin, cmd.Stdout, cmd.Stderr, placed.r, placed.w)
 	}
 }

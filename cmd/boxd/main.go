@@ -630,13 +630,25 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, placed *pl
 }
 
 func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, placed *placement, emit eventEmitter, timedOut *atomic.Bool, wantStdin bool) error {
+	// Spawn guard taken before anything is opened and held across Start()
+	// and the wrapper's placement report, so a refusal leaks nothing and a
+	// freeze cannot miss the child.
+	if err := s.freezer.beginSpawn(); err != nil {
+		placed.close()
+		return connect.NewError(connect.CodeUnavailable, err)
+	}
+	abandon := func(err error) error {
+		s.freezer.endSpawn()
+		placed.close()
+		return connect.NewError(connect.CodeInternal, err)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return connect.NewError(connect.CodeInternal, err)
+		return abandon(err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return connect.NewError(connect.CodeInternal, err)
+		return abandon(err)
 	}
 
 	// Only open a stdin pipe when the caller can feed it (the streaming RPC).
@@ -646,16 +658,10 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, placed *
 	if wantStdin {
 		stdin, err = cmd.StdinPipe()
 		if err != nil {
-			return connect.NewError(connect.CodeInternal, err)
+			return abandon(err)
 		}
 	}
 
-	// Spawn lock held across Start() and the wrapper's placement report, so
-	// a freeze cannot miss the child.
-	if err := s.freezer.beginSpawn(); err != nil {
-		placed.close()
-		return connect.NewError(connect.CodeUnavailable, err)
-	}
 	err = cmd.Start()
 	if perr := s.freezer.confirmPlacement(cmd, placed); err == nil {
 		err = perr
