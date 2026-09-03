@@ -163,6 +163,7 @@ func TestWakeStateSurvivesRecordRoundTrip(t *testing.T) {
 // whether or not this restore froze the clock — with the policy off, the
 // workload is still stopped in the image.
 func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
+	useTempFloor(t)
 	origWake := boxdWakeGuest
 	t.Cleanup(func() { boxdWakeGuest = origWake })
 
@@ -230,6 +231,7 @@ func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
 // sandbox back to Paused, so the record does not advertise a guest that never
 // came back.
 func TestFrozenResumeFailureRevertsToPaused(t *testing.T) {
+	useTempFloor(t)
 	dir := t.TempDir()
 	snapPath := filepath.Join(dir, "vm.snap")
 	memPath := filepath.Join(dir, "mem.snap")
@@ -280,6 +282,7 @@ func TestFrozenResumeFailureRevertsToPaused(t *testing.T) {
 // with the clock running on the overlay, slot and record it already owns.
 // Recreating the overlay would truncate it.
 func TestRestoreInPlaceClockFallbackKeepsOverlayAndSlot(t *testing.T) {
+	useTempFloor(t)
 	origWake, origDead := boxdWakeGuest, vmDeadForRetry
 	t.Cleanup(func() { boxdWakeGuest, vmDeadForRetry = origWake, origDead })
 	vmDeadForRetry = func(*Manager, string) bool { return true }
@@ -382,6 +385,7 @@ func TestRestoreInPlaceClockFallbackKeepsOverlayAndSlot(t *testing.T) {
 // The vCPUs must not run ahead of the record that owes their wake: a restore
 // whose record cannot be made durable fails before the load.
 func TestRestoreAbortsBeforeLoadWithoutDurableWakeRecord(t *testing.T) {
+	useTempFloor(t)
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "state.db")
 	rw, err := OpenStateStore(dbPath)
@@ -437,6 +441,7 @@ func TestRestoreAbortsBeforeLoadWithoutDurableWakeRecord(t *testing.T) {
 // When Firecracker refuses the clock option, the record must say the clock ran
 // before the legacy retry can run the vCPUs.
 func TestRestoreLegacyRetrySeesDurableClockPolicy(t *testing.T) {
+	useTempFloor(t)
 	origWake := boxdWakeGuest
 	t.Cleanup(func() { boxdWakeGuest = origWake })
 	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, frozen bool, _ string) error {
@@ -828,12 +833,85 @@ func TestReattachCompletesOwedWakesBeforeServing(t *testing.T) {
 			t.Error("still queued after resolution")
 		}
 	})
+
+	t.Run("pool_abandons_an_instance_a_request_replaced", func(t *testing.T) {
+		mgr, store := newStore(t)
+		boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error {
+			t.Error("a replaced instance must not be woken")
+			return nil
+		}
+		rec, _ := store.Get("vm-1")
+		stale := toInstance(*rec)
+		mgr.queuePendingWake(stale)
+		// A request won the id first: the replacement owns map and record.
+		replacement := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionUnit, IP: "10.0.0.9"}
+		mgr.vms["vm-1"] = replacement
+		if err := store.Put(toRecord(replacement)); err != nil {
+			t.Fatal(err)
+		}
+		if n := mgr.drainPendingWakes(context.Background()); n != 0 {
+			t.Fatalf("drained %d, want the stale instance abandoned", n)
+		}
+		if mgr.vms["vm-1"] != replacement {
+			t.Error("the replacement was displaced")
+		}
+		if got, _ := store.Get("vm-1"); got == nil || got.IP != "10.0.0.9" || got.WakePending {
+			t.Errorf("record = %+v; the stale instance must not be persisted over the replacement", got)
+		}
+	})
+}
+
+// A frozen image is only restored once the rollback floor is durable on this
+// host; a floor that cannot be written refuses the restore before any launch.
+func TestFrozenRestoreRequiresTheFloor(t *testing.T) {
+	origPath := wakeProtocolEvidencePath
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wakeProtocolEvidencePath = filepath.Join(blocker, "evidence")
+	wakeProtocolEvidenceDone.Store(false)
+	t.Cleanup(func() { wakeProtocolEvidencePath = origPath; wakeProtocolEvidenceDone.Store(false) })
+
+	dir := t.TempDir()
+	snapPath, memPath, rootfs := filepath.Join(dir, "vm.snap"), filepath.Join(dir, "mem.snap"), filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snapPath, memPath, rootfs} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedFrozenManifest(t, memPath, "tok")
+	launched := false
+	launch := func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		launched = true
+		return 4321, SupervisionUnit, nil
+	}
+	frozen := true
+	inst := &VMInstance{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs, SnapshotWorkloadFrozen: &frozen, FreezeToken: "tok"}
+	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir}, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, restoreSem: make(chan struct{}, 1)}
+	mgr.launchFirecrackerHook = launch
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rerr := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
+	unlock()
+	if status.Code(rerr) != codes.Unavailable || launched {
+		t.Fatalf("resume: err=%v launched=%v, want Unavailable before launch", rerr, launched)
+	}
+	fresh := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: t.TempDir()}, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1)}
+	fresh.launchFirecrackerHook = launch
+	_, cerr := fresh.RestoreVMSnapshot(context.Background(), "vm-2", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
+	if status.Code(cerr) != codes.Unavailable || launched {
+		t.Fatalf("restore: err=%v launched=%v, want Unavailable before launch", cerr, launched)
+	}
 }
 
 // A wake the guest refuses as belonging to another freeze means the image and
 // its record describe different snapshots. The restore fails as a
 // precondition, the VM is durably Error, and the artifacts stay for inspection.
 func TestTokenMismatchFailsRestoreAndResumeWithoutRetry(t *testing.T) {
+	useTempFloor(t)
 	origWake, origDead := boxdWakeGuest, vmDeadForRetry
 	t.Cleanup(func() { boxdWakeGuest, vmDeadForRetry = origWake, origDead })
 	vmDeadForRetry = func(*Manager, string) bool { return true }
@@ -917,4 +995,15 @@ func TestTokenMismatchFailsRestoreAndResumeWithoutRetry(t *testing.T) {
 			t.Errorf("status %v, want Error and not reverted to Paused", inst.Status)
 		}
 	})
+}
+
+// useTempFloor points the rollback-floor evidence at a temp file: a frozen
+// restore refuses to launch until the floor is durable, and the test host has
+// no fleet directory to record it in.
+func useTempFloor(t *testing.T) {
+	t.Helper()
+	orig := wakeProtocolEvidencePath
+	wakeProtocolEvidencePath = filepath.Join(t.TempDir(), "evidence")
+	wakeProtocolEvidenceDone.Store(false)
+	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceDone.Store(false) })
 }

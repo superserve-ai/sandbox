@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -50,25 +51,44 @@ const WakeProtocolCapability = "wake-protocol-1"
 var wakeProtocolEvidencePath = "/var/lib/sandbox/wake-protocol-evidence"
 
 // wakeProtocolEvidenceDone is set only once the write is durable, so a failed
-// attempt is retried by the next manifest read rather than forgotten.
-var wakeProtocolEvidenceDone atomic.Bool
+// attempt is retried rather than forgotten; the mutex makes concurrent first
+// restores share one write instead of each paying the fsync.
+var (
+	wakeProtocolEvidenceDone atomic.Bool
+	wakeProtocolEvidenceMu   sync.Mutex
+)
 
+// noteWakeProtocolEvidence is the best-effort form, for manifests read where
+// nothing is about to act on them (a pause, the template scan).
 func noteWakeProtocolEvidence() {
-	if wakeProtocolEvidenceDone.Load() {
-		return
-	}
 	if _, err := os.Stat(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
 		return
 	}
-	if RaiseWakeProtocolFloor() == nil {
-		wakeProtocolEvidenceDone.Store(true)
+	_ = ensureWakeProtocolFloor()
+}
+
+// ensureWakeProtocolFloor is the form a restore of an image that owes a wake
+// must pass before it launches anything: durable once, then free.
+func ensureWakeProtocolFloor() error {
+	if wakeProtocolEvidenceDone.Load() {
+		return nil
 	}
+	wakeProtocolEvidenceMu.Lock()
+	defer wakeProtocolEvidenceMu.Unlock()
+	if wakeProtocolEvidenceDone.Load() {
+		return nil
+	}
+	if err := RaiseWakeProtocolFloor(); err != nil {
+		return err
+	}
+	wakeProtocolEvidenceDone.Store(true)
+	return nil
 }
 
 // RaiseWakeProtocolFloor durably records that this host holds, or is about to
 // hold, an image that owes a wake. The template builder calls it before it
 // publishes a frozen image, so the floor is up before the artifact exists;
-// the daemon calls it on every manifest it reads.
+// the daemon calls it before it restores one and on every manifest it reads.
 func RaiseWakeProtocolFloor() error {
 	f, err := os.OpenFile(wakeProtocolEvidencePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {

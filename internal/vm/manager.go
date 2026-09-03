@@ -1636,6 +1636,13 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		}
 		correctsWallClock = man != nil && man.GuestCorrectsClock
 	}
+	// Recovery after a crash looks for a pause's intent in this VM's own
+	// snapshot directory and nowhere else, so a pause into a caller-supplied
+	// directory freezes nothing and writes no manifest: the older path, correct.
+	if correctsWallClock && snapshotDir != filepath.Join(m.cfg.SnapshotDir, vmID) {
+		log.Info().Str("dir", snapshotDir).Msg("pause: custom snapshot directory; pausing unfrozen")
+		correctsWallClock = false
+	}
 	// The token this freeze carries; the guest keeps it across the snapshot and
 	// the wake must present it. The artifact id names the manifest this pause
 	// will write, in the intent and in the record alike.
@@ -2364,6 +2371,11 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	resumeWorkloadFrozen, resumeToken, merr := imageWorkloadFrozen(memPath, basePath, pausedMemPath, recordedFrozen, recordedToken)
 	if merr != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
+	}
+	if resumeWorkloadFrozen {
+		if err := ensureWakeProtocolFloor(); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "image %q owes a wake and the rollback floor could not be recorded on this host: %v", memPath, err)
+		}
 	}
 
 	var (
@@ -3286,6 +3298,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	restoreCorrectsWallClock := manifest != nil && manifest.WorkloadFrozen
 	restoreGuestCorrects := manifest != nil && manifest.GuestCorrectsClock
+	if restoreCorrectsWallClock {
+		// The floor rises before this host acts on an image that owes a wake,
+		// or a rollback could later meet the image with nothing to witness it.
+		if err := ensureWakeProtocolFloor(); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "image %q owes a wake and the rollback floor could not be recorded on this host: %v", memPath, err)
+		}
+	}
 	restoreToken, restoreArtifactID := "", ""
 	if manifest != nil {
 		restoreToken, restoreArtifactID = manifest.FreezeToken, manifest.ArtifactID
@@ -4811,15 +4830,19 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	}
 	m.mu.RUnlock()
 	// A request arriving while the startup pass still owes this VM its wake
-	// waits for that outcome rather than adopting a frozen guest.
+	// waits for that outcome rather than adopting a frozen guest — for as
+	// long as a wake can take, not the flight's own short budget: giving up
+	// early would report a live VM as missing and invite a replacement.
 	if pw := m.pendingWake(rec.ID); pw != nil && !cleanupStale {
+		wait := time.NewTimer(boxdResumeReadyBudget + 5*time.Second)
+		defer wait.Stop()
 		select {
 		case <-pw.done:
 			m.mu.RLock()
 			inst, ok := m.vms[rec.ID]
 			m.mu.RUnlock()
 			return inst, ok
-		case <-ctx.Done():
+		case <-wait.C:
 			return nil, false
 		}
 	}
@@ -5112,9 +5135,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// it. Neither may be served as Running until resolved.
 	if rec.Status == StatusRunning && !m.recoverPauseIntent(ctx, inst, log) {
 		rec.Status = StatusError
-		inst.mu.Lock()
-		inst.Status = StatusError
-		inst.mu.Unlock()
+		m.parkUnservable(inst)
 	}
 	if rec.Status == StatusRunning && inst.WakePending {
 		if cleanupStale {
@@ -5125,9 +5146,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		}
 		if !m.completeOwedWake(ctx, inst, log) {
 			rec.Status = StatusError
-			inst.mu.Lock()
-			inst.Status = StatusError
-			inst.mu.Unlock()
+			m.parkUnservable(inst)
 		}
 	}
 
@@ -8175,19 +8194,36 @@ func (m *Manager) drainPendingWakes(ctx context.Context) int {
 			defer wg.Done()
 			defer func() { <-sem }()
 			defer sentrylog.Recover("wake-recovery")
+			defer func() {
+				m.pendingWakeMu.Lock()
+				delete(m.pendingWakes, pw.inst.ID)
+				m.pendingWakeMu.Unlock()
+				close(pw.done)
+			}()
 			log := m.log.With().Str("vm_id", pw.inst.ID).Logger()
+			// Under the VM's lifecycle lock: a restore or resume for this id
+			// that arrived meanwhile serializes behind the wake instead of
+			// racing it, and one that won the lock first owns the VM — this
+			// instance is then stale and is abandoned, never persisted.
+			unlock, err := m.lockVMOp(ctx, pw.inst.ID)
+			if err != nil {
+				log.Warn().Err(err).Msg("reattach: wake recovery abandoned; the next request re-derives the record")
+				return
+			}
+			defer unlock()
+			m.mu.RLock()
+			_, taken := m.vms[pw.inst.ID]
+			m.mu.RUnlock()
+			if taken {
+				log.Info().Msg("reattach: a request replaced this VM before its wake completed; recovery instance abandoned")
+				return
+			}
 			if m.completeOwedWake(ctx, pw.inst, log) {
 				woken.Add(1)
 			} else {
-				pw.inst.mu.Lock()
-				pw.inst.Status = StatusError
-				pw.inst.mu.Unlock()
+				m.parkUnservable(pw.inst)
 			}
 			m.publishRecovered(pw.inst)
-			m.pendingWakeMu.Lock()
-			delete(m.pendingWakes, pw.inst.ID)
-			m.pendingWakeMu.Unlock()
-			close(pw.done)
 		}(pw)
 	}
 	wg.Wait()
@@ -8239,17 +8275,33 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 	return true
 }
 
-// publishRecovered publishes an instance the wake pool resolved, durably.
+// publishRecovered publishes an instance the wake pool resolved, durably —
+// only if nothing else took the id meanwhile: the record belongs to whoever
+// owns the map entry, and a stale instance must never write over it.
 func (m *Manager) publishRecovered(inst *VMInstance) {
 	m.mu.Lock()
-	if _, present := m.vms[inst.ID]; !present {
-		m.vms[inst.ID] = inst
-		m.indexVM(inst.ID, inst)
+	if _, present := m.vms[inst.ID]; present {
+		m.mu.Unlock()
+		return
 	}
+	m.vms[inst.ID] = inst
+	m.indexVM(inst.ID, inst)
 	m.mu.Unlock()
 	if wrote, perr := m.persistStateIfPresent(inst); perr == nil && !wrote {
 		m.undoReattach(inst.ID)
 	}
+}
+
+// parkUnservable stops a guest whose state recovery could not settle — a
+// freeze it could not release, a wake it did not answer — and marks it Error.
+// Stopped first, and confirmed as far as the stop can confirm: a guest in an
+// unknown state must not keep running behind an Error record until a grace
+// period reaps it.
+func (m *Manager) parkUnservable(inst *VMInstance) {
+	m.stopUnitDuringRestoreError(inst.ID)
+	inst.mu.Lock()
+	inst.Status = StatusError
+	inst.mu.Unlock()
 }
 
 func (m *Manager) commitResumeState(inst *VMInstance) error {
