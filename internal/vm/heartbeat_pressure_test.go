@@ -1301,9 +1301,14 @@ func stubMachineConfigProbe(t *testing.T, probe func(context.Context, string) (u
 
 func awaitBackfill(t *testing.T, done <-chan string) {
 	t.Helper()
+	awaitBackfillWithin(t, done, 5*time.Second)
+}
+
+func awaitBackfillWithin(t *testing.T, done <-chan string, budget time.Duration) {
+	t.Helper()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(budget):
 		t.Fatal("allocation backfill never ran — an undeclared VM keeps a zero size and publishes as free capacity")
 	}
 }
@@ -1754,7 +1759,11 @@ func TestBackfillRetriesDoNotStarveThePool(t *testing.T) {
 	}
 
 	// Retire the stuck VMs so their loops end and the seams restore
-	// without a live goroutine still reading them.
+	// without a live goroutine still reading them. Each stuck VM notices
+	// its retirement at its next attempt, and that attempt is due a doubled
+	// backoff plus jitter after the failed probe — four to six seconds at
+	// the backoff above — so the wait here must cover that, not the
+	// default budget sized for millisecond retries.
 	m.mu.Lock()
 	for _, inst := range stuck {
 		delete(m.vms, inst.ID)
@@ -1762,7 +1771,7 @@ func TestBackfillRetriesDoNotStarveThePool(t *testing.T) {
 	}
 	m.mu.Unlock()
 	for i := 0; i < machineConfigRecoveryWorkers+1; i++ {
-		awaitBackfill(t, done)
+		awaitBackfillWithin(t, done, 15*time.Second)
 	}
 }
 
