@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -80,7 +81,7 @@ func TestBoxdWallClockProven(t *testing.T) {
 // A freeze that did not complete must never let the image be marked: the
 // helper's error is what demotes the template to the unfrozen path.
 func TestBoxdFreezeWorkload(t *testing.T) {
-	serve := func(t *testing.T, status int) func() {
+	serve := func(t *testing.T, status int, reply string) func() {
 		t.Helper()
 		ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(boxdPort))
 		if err != nil {
@@ -90,29 +91,42 @@ func TestBoxdFreezeWorkload(t *testing.T) {
 			if r.Method != http.MethodPost || r.URL.Path != "/freeze" {
 				t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 			}
+			var body struct {
+				Token string `json:"token"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.Token != "tok" {
+				t.Errorf("freeze carried token %q, want the builder's", body.Token)
+			}
 			w.WriteHeader(status)
-			w.Write([]byte("workload did not freeze within budget"))
+			w.Write([]byte(reply))
 		}))
 		srv.Listener = ln
 		srv.Start()
 		return srv.Close
 	}
 
-	t.Run("frozen_is_ok", func(t *testing.T) {
-		defer serve(t, 200)()
-		if err := boxdFreezeWorkload(context.Background(), "127.0.0.1"); err != nil {
+	t.Run("frozen_with_matching_echo_is_ok", func(t *testing.T) {
+		defer serve(t, 200, `{"version":1,"capability":"wake","token":"tok"}`)()
+		if err := boxdFreezeWorkload(context.Background(), "127.0.0.1", "tok"); err != nil {
 			t.Fatalf("want nil, got %v", err)
 		}
 	})
+	t.Run("echo_naming_another_token_or_protocol_is_an_error", func(t *testing.T) {
+		defer serve(t, 200, `{"version":1,"token":"other"}`)()
+		if err := boxdFreezeWorkload(context.Background(), "127.0.0.1", "tok"); err == nil {
+			t.Fatal("a guest holding another token must not mark the image")
+		}
+	})
 	t.Run("budget_exhausted_is_an_error_with_the_reason", func(t *testing.T) {
-		defer serve(t, 504)()
-		err := boxdFreezeWorkload(context.Background(), "127.0.0.1")
+		defer serve(t, 504, "workload did not freeze within budget")()
+		err := boxdFreezeWorkload(context.Background(), "127.0.0.1", "tok")
 		if err == nil || !strings.Contains(err.Error(), "504") || !strings.Contains(err.Error(), "budget") {
 			t.Fatalf("err = %v, want the status and the agent's reason", err)
 		}
 	})
 	t.Run("unreachable_is_an_error", func(t *testing.T) {
-		if err := boxdFreezeWorkload(context.Background(), "127.0.0.1"); err == nil {
+		if err := boxdFreezeWorkload(context.Background(), "127.0.0.1", "tok"); err == nil {
 			t.Fatal("no agent must not read as frozen")
 		}
 	})

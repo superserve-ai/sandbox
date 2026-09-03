@@ -324,9 +324,12 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	if os.Getenv("TEMPLATE_FREEZE_WORKLOAD") == "true" {
 		correctsWallClock, why = boxdWallClockProven(ctx, netInfo.HostIP)
 	}
+	// The token this image's freeze carries; every wake of a sandbox created
+	// from it must present it. Minted here, kept by the guest in the snapshot.
+	freezeToken := vm.NewFreezeToken()
 	if correctsWallClock {
 		// The build VM is discarded afterwards, so no thaw.
-		if err := boxdFreezeWorkload(ctx, netInfo.HostIP); err != nil {
+		if err := boxdFreezeWorkload(ctx, netInfo.HostIP, freezeToken); err != nil {
 			correctsWallClock, why = false, "workload freeze: "+err.Error()
 		}
 	}
@@ -345,12 +348,17 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 	emitInternal("system", "snapshot captured")
 
-	// The marker lets a supervisor freeze this image's clock on restore.
+	// The manifest tells a supervisor this image's workload is frozen, that its
+	// guest corrects its clock, and which token the wake must present.
 	markerPath := ""
 	if correctsWallClock {
 		markerPath = vm.WallClockMarkerPath(memPath)
-		if err := os.WriteFile(markerPath, nil, 0o644); err != nil {
-			return fmt.Errorf("write wall-clock marker: %w", err)
+		man := vm.WallClockManifest{
+			Version: vm.WallClockManifestVersion, ArtifactID: vm.NewArtifactID(),
+			WorkloadFrozen: true, GuestCorrectsClock: true, FreezeToken: freezeToken,
+		}
+		if err := vm.WriteWallClockManifest(memPath, man); err != nil {
+			return fmt.Errorf("write wall-clock manifest: %w", err)
 		}
 	}
 
@@ -634,12 +642,16 @@ func boxdWallClockProven(ctx context.Context, vmIP string) (bool, string) {
 
 // boxdFreezeWorkload asks the guest to stop its workload for the snapshot. The
 // guest undoes a freeze it could not complete, so an error means it is running.
-func boxdFreezeWorkload(ctx context.Context, vmIP string) error {
+func boxdFreezeWorkload(ctx context.Context, vmIP, token string) error {
 	url := fmt.Sprintf("http://%s:%d/freeze", vmIP, boxdPort)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	payload, _ := json.Marshal(struct {
+		Token string `json:"token"`
+	}{token})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
 		return fmt.Errorf("POST /freeze: %w", err)
@@ -648,6 +660,18 @@ func boxdFreezeWorkload(ctx context.Context, vmIP string) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("POST /freeze: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	// The reply names the protocol the guest speaks and the token it holds;
+	// an image is only marked when both are what this builder asked for.
+	var echo struct {
+		Version int    `json:"version"`
+		Token   string `json:"token"`
+	}
+	if err := json.Unmarshal(body, &echo); err != nil {
+		return fmt.Errorf("POST /freeze: reply: %w", err)
+	}
+	if echo.Version != vm.WallClockManifestVersion || echo.Token != token {
+		return fmt.Errorf("POST /freeze: guest speaks protocol %d and holds token %q, asked %d %q", echo.Version, echo.Token, vm.WallClockManifestVersion, token)
 	}
 	return nil
 }
