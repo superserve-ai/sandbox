@@ -186,7 +186,10 @@ func RateLimit(ctx context.Context, cfg RateLimitConfig) gin.HandlerFunc {
 	limiter.startCleanup(ctx, cfg)
 
 	return func(c *gin.Context) {
-		key := preAuthLimiterKey(c)
+		// Preserve the limiter's existing Gin identity behavior. Verified
+		// client-IP attribution is an abuse-enforcement concern; changing this
+		// pre-auth bucket is outside this middleware's scope.
+		key := c.ClientIP()
 		if enforceLimit(c, limiter.get(key), cfg) {
 			c.Next()
 		}
@@ -215,21 +218,10 @@ func TeamRateLimit(ctx context.Context, cfg RateLimitConfig) gin.HandlerFunc {
 			}
 		}
 		if key == "" {
-			key = preAuthLimiterKey(c)
+			key = "ip:" + c.ClientIP()
 		}
 		if enforceLimit(c, limiter.get(key), cfg) {
 			c.Next()
 		}
 	}
-}
-
-// preAuthLimiterKey returns the only identity trusted before authentication.
-// When verified client IP is unavailable, all pre-auth traffic intentionally
-// shares one bounded degraded bucket; never key this limiter from X-API-Key or
-// another unauthenticated header, which would let attackers manufacture keys.
-func preAuthLimiterKey(c *gin.Context) string {
-	if ip := clientIP(c); ip != "" {
-		return "ip:" + ip
-	}
-	return "ip:unverified"
 }

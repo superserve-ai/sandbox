@@ -177,10 +177,8 @@ module "api" {
   region                = local.region
   service_name          = "superserve-api-${local.resource_suffix}"
   service_account_email = data.google_service_account.api_runner.email
-  // No west API load balancer is provisioned yet; keep the service reachable
-  // until the dedicated LB and its verified client-IP trust anchor exist.
-  ingress = "INGRESS_TRAFFIC_ALL"
-  image   = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
+  ingress               = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
+  image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
 
   cpu_limit    = "2"
   memory_limit = "1Gi"

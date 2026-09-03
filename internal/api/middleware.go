@@ -237,7 +237,7 @@ func RequestLogger() gin.HandlerFunc {
 
 		latency := time.Since(start)
 		status := c.Writer.Status()
-		clientIP := clientIP(c)
+		clientIP := c.ClientIP()
 		method := c.Request.Method
 
 		if raw != "" {

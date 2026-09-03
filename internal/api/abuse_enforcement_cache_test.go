@@ -161,6 +161,27 @@ func TestAbuseEnforcementCacheGlobalIPMatchesUnseenTeam(t *testing.T) {
 	}
 }
 
+func TestAbuseEnforcementUnavailableIPFailsOpenOnlyForIPSubject(t *testing.T) {
+	team, user := uuid.New(), uuid.New()
+	var c abuseEnforcementCache
+	c.SetMode(abuseEnforcementModeEnforce)
+	c.Replace(team, false,
+		abuseEnforcementRestriction{SubjectType: "ip", Value: "192.0.2.10", Actions: []abuse.Action{abuse.ActionCreate}},
+		abuseEnforcementRestriction{SubjectType: "user", SubjectID: user, Actions: []abuse.Action{abuse.ActionResume}},
+		abuseEnforcementRestriction{SubjectType: "domain", Value: "example.test", Actions: []abuse.Action{abuse.ActionResume}},
+	)
+
+	if allowed, matched := c.Evaluate(abuseEnforcementRequest{TeamID: team, Action: abuse.ActionCreate}); !allowed || matched {
+		t.Fatal("an unavailable client IP must not match an IP restriction")
+	}
+	if allowed, matched := c.Evaluate(abuseEnforcementRequest{TeamID: team, UserID: user, Action: abuse.ActionResume}); allowed || !matched {
+		t.Fatal("user restrictions must still apply when client IP is unavailable")
+	}
+	if allowed, matched := c.Evaluate(abuseEnforcementRequest{TeamID: team, Domain: "example.test", Action: abuse.ActionResume}); allowed || !matched {
+		t.Fatal("domain restrictions must still apply when client IP is unavailable")
+	}
+}
+
 func TestAbuseEnforcementCacheReplaceAtCapacityKeepsExistingTeams(t *testing.T) {
 	var c abuseEnforcementCache
 	team := uuid.New()
