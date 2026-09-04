@@ -132,9 +132,10 @@ type VMInstance struct {
 	// that froze nothing clears it while CorrectsWallClock stands: the guest
 	// still can, this image just was not. Tri-state like CorrectsWallClock.
 	SnapshotWorkloadFrozen *bool
-	// WakePending / ClockFrozen: see VMRecord.
-	WakePending bool
-	ClockFrozen bool
+	// WakePending / ClockFrozen / WakeOwedFromPaused: see VMRecord.
+	WakePending        bool
+	ClockFrozen        bool
+	WakeOwedFromPaused bool
 	// FreezeToken is the token the image's freeze carries; a wake must present it.
 	FreezeToken string
 	CreatedAt   time.Time
@@ -1685,9 +1686,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			if snapshotOK {
 				return
 			}
-			tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-			defer cancel()
-			if terr := boxdThawGuest(tctx, instIP, freezeToken); terr != nil {
+			if terr := m.releaseFrozenGuest(ctx, socketPath, instIP, freezeToken); terr != nil {
 				log.Error().Err(terr).Msg("pause: snapshot failed and the guest workload could not be thawed")
 			}
 		}()
@@ -2404,6 +2403,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			inst.Unverified = entryUnverified
 			inst.WakePending = false
 			inst.ClockFrozen = false
+			inst.WakeOwedFromPaused = false
 		}
 		inst.mu.Unlock()
 		if revert {
@@ -2426,7 +2426,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			if m.cgroupLaunch(resumeExisting) {
 				predicted = SupervisionCgroup
 			}
-			joinWakeOwed = m.persistWakeOwed(inst, predicted, resumePolicy != nil)
+			joinWakeOwed = m.persistWakeOwed(inst, predicted, resumePolicy != nil, true)
 			published = true
 		}
 		// freshUnit=false: a resume replaces a paused VM's slot, never a brand-new
@@ -2507,6 +2507,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			}
 			inst.mu.Lock()
 			inst.WakePending = false
+			inst.WakeOwedFromPaused = false
 			inst.mu.Unlock()
 		}
 		break
@@ -3279,6 +3280,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.mu.RLock()
 	prev := m.vms[vmID]
 	m.mu.RUnlock()
+	restoreFromPaused := false
+	if prev != nil {
+		prev.mu.RLock()
+		restoreFromPaused = prev.Status == StatusPaused
+		prev.mu.RUnlock()
+	}
 	if prev != nil && wakeProtocolFloorRaised() {
 		prev.mu.RLock()
 		knownArtifact := prev.ArtifactID
@@ -3527,7 +3534,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// keeps the older ordering below, unchanged.
 		var joinWakeOwed func(Supervision) bool
 		if restoreWorkloadFrozen {
-			joinWakeOwed = m.persistWakeOwed(inst, predictedSupervision, clockPolicy != nil)
+			joinWakeOwed = m.persistWakeOwed(inst, predictedSupervision, clockPolicy != nil, restoreFromPaused)
 		}
 		m.beginLaunchAttempt(inst)
 		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace || priorRunDir, freshUnit && attempt == 1)
@@ -4000,6 +4007,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.mu.Lock()
 	inst.Unverified = false
 	inst.WakePending = false
+	inst.WakeOwedFromPaused = false
 	inst.mu.Unlock()
 	// Persist-then-verify: checking AFTER the write leaves no window — a
 	// concurrent DestroyVM either erased the record itself or is caught here,
@@ -5007,6 +5015,21 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			fullyDown = vmUnitFullyDown(rec.ID)
 		}
 		if fullyDown {
+			if rec.WakePending && rec.WakeOwedFromPaused {
+				// A resume that published its wake-owed record and died before
+				// its Firecracker launched. The paused image is intact, so the
+				// sandbox returns to Paused rather than being reaped as a
+				// failed create; the record is rewritten before it is read as
+				// Paused, so a second restart sees the same thing.
+				log.Warn().Msg("resume interrupted before its launch — record returns to Paused")
+				rec.Status = StatusPaused
+				rec.WakePending, rec.ClockFrozen, rec.WakeOwedFromPaused, rec.Unverified = false, false, false, false
+				if wrote, perr := m.state.PutIfPresent(rec); perr != nil || !wrote {
+					log.Warn().Err(perr).Bool("present", wrote).Msg("interrupted resume's record could not be returned to Paused")
+					return nil, false
+				}
+				return m.reattachRecord(ctx, rec, cleanupStale)
+			}
 			log.Warn().Msg("VM in BoltDB but not running — cleaning up stale record")
 			// Cold-booted VMs (old build path) ran with Setsid and no unit, so
 			// they survive vmd restarts as orphans holding TAP fds — SIGKILL by
@@ -8142,9 +8165,27 @@ func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string, inst *VM
 	}
 	inst.mu.Lock()
 	inst.WakePending = false
+	inst.WakeOwedFromPaused = false
 	inst.mu.Unlock()
 	return nil
 }
+
+// releaseFrozenGuest thaws a workload a pause froze, after making sure the
+// guest can answer: a snapshot pauses the vCPUs first, so a release after a
+// snapshot that then failed, or after a crash between the two, meets a guest
+// that cannot run boxd until Firecracker resumes it. The unpause is
+// best-effort — a guest never paused refuses it — and the thaw is the verdict.
+func (m *Manager) releaseFrozenGuest(ctx context.Context, socketPath, ip, token string) error {
+	if socketPath != "" {
+		_ = fcUnpauseVM(socketPath)
+	}
+	tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	return boxdThawGuest(tctx, ip, token)
+}
+
+// fcUnpauseVM is a seam over the Firecracker resume call.
+var fcUnpauseVM = UnpauseVM
 
 // persistWakeOwed publishes Running with a wake owed and starts the durable
 // write so it overlaps the launch. A crash after the load must find a record
@@ -8154,7 +8195,10 @@ func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string, inst *VM
 // reports whether the record is durable; the caller must not load the
 // snapshot otherwise. The status is set directly: setStatus would persist
 // synchronously, on the launch path.
-func (m *Manager) persistWakeOwed(inst *VMInstance, predicted Supervision, clockFrozen bool) (join func(actual Supervision) bool) {
+//
+// fromPaused says the record was Paused before this began, so recovery may
+// return it there; a create's record has nowhere to return to.
+func (m *Manager) persistWakeOwed(inst *VMInstance, predicted Supervision, clockFrozen, fromPaused bool) (join func(actual Supervision) bool) {
 	inst.mu.Lock()
 	inst.Status = StatusRunning
 	inst.Unverified = true
@@ -8162,6 +8206,7 @@ func (m *Manager) persistWakeOwed(inst *VMInstance, predicted Supervision, clock
 	inst.Supervision = predicted
 	inst.WakePending = true
 	inst.ClockFrozen = clockFrozen
+	inst.WakeOwedFromPaused = fromPaused
 	inst.mu.Unlock()
 	done := make(chan struct{})
 	ok := false
@@ -8297,9 +8342,7 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 		return true
 	}
 	if in.FreezeToken != "" && inst.IP != "" {
-		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-		terr := boxdThawGuest(tctx, inst.IP, in.FreezeToken)
-		cancel()
+		terr := m.releaseFrozenGuest(ctx, inst.SocketPath, inst.IP, in.FreezeToken)
 		// A token the guest never froze under means the crash came before
 		// the freeze: nothing to release.
 		if terr != nil && !errors.Is(terr, ErrGuestTokenMismatch) {
@@ -8332,14 +8375,20 @@ func (m *Manager) publishRecovered(inst *VMInstance) {
 }
 
 // parkUnservable stops a guest whose state recovery could not settle — a
-// freeze it could not release, a wake it did not answer — and marks it Error.
-// Stopped first, and confirmed as far as the stop can confirm: a guest in an
-// unknown state must not keep running behind an Error record until a grace
-// period reaps it.
+// freeze it could not release, a wake it did not answer. Stopped first, and
+// confirmed as far as the stop can confirm: a guest in an unknown state must
+// not keep running behind a record until a grace period reaps it. A resume
+// that never completed returns to Paused, as its own failure path would:
+// its image is intact and its workload never ran. Anything else is Error.
 func (m *Manager) parkUnservable(inst *VMInstance) {
 	m.stopUnitDuringRestoreError(inst.ID)
 	inst.mu.Lock()
-	inst.Status = StatusError
+	if inst.WakePending && inst.WakeOwedFromPaused {
+		inst.Status = StatusPaused
+		inst.WakePending, inst.ClockFrozen, inst.WakeOwedFromPaused, inst.Unverified = false, false, false, false
+	} else {
+		inst.Status = StatusError
+	}
 	inst.mu.Unlock()
 }
 

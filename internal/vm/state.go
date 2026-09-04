@@ -228,6 +228,11 @@ type VMRecord struct {
 	WakePending bool   `json:"wake_pending,omitempty"`
 	ClockFrozen bool   `json:"clock_frozen,omitempty"`
 	FreezeToken string `json:"freeze_token,omitempty"`
+	// WakeOwedFromPaused: the record owing the wake was Paused before this
+	// resume began, so its image is intact. A crash before the launch, or a
+	// wake that never completes, returns it to Paused; a create in the same
+	// state is a failed create and is reaped.
+	WakeOwedFromPaused bool `json:"wake_owed_from_paused,omitempty"`
 	// ArtifactID names the manifest beside the image this VM was last paused
 	// into; see VMInstance.
 	ArtifactID string            `json:"artifact_id,omitempty"`
@@ -927,6 +932,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		WakePending:                inst.WakePending,
 		ClockFrozen:                inst.ClockFrozen,
 		FreezeToken:                inst.FreezeToken,
+		WakeOwedFromPaused:         inst.WakeOwedFromPaused,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
@@ -1033,6 +1039,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		WakePending:                rec.WakePending,
 		ClockFrozen:                rec.ClockFrozen,
 		FreezeToken:                rec.FreezeToken,
+		WakeOwedFromPaused:         rec.WakeOwedFromPaused,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,
