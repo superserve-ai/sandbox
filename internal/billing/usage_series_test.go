@@ -29,3 +29,22 @@ func TestUsageSeriesBucketsWeek(t *testing.T) {
 		t.Fatalf("unexpected %#v", b)
 	}
 }
+
+func TestUsageSeriesBucketsFractionalDST(t *testing.T) {
+	loc, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := time.Date(2024, 10, 6, 0, 0, 0, 0, loc)
+	e := time.Date(2024, 10, 7, 0, 0, 0, 0, loc)
+	b, err := UsageSeriesBuckets(s, e, "hour", loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []int{0, 1, 2, 3, 4} {
+		got := b[i].Start.In(loc).Hour()
+		if got != want {
+			t.Fatalf("bucket %d starts at local hour %d, want %d", i, got, want)
+		}
+	}
+}
