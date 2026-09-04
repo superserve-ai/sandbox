@@ -813,66 +813,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return "", false
 	}
 
-	// Resolve the effective policy before claiming the sandbox. A missing
-	// side-table row is an older control plane's legacy sandbox; strict
-	// sandboxes may only resume while their host proves enforcement support.
-	// The snapshot is also the fallback payload if VMD lost its in-memory VM.
-	resumePolicy, err := h.loadPreviewPolicySnapshot(c.Request.Context(), sandboxID, teamID)
-	if err != nil {
-		l.Error().Err(err).Msg("load preview policy for resume failed")
-		respondError(c, ErrInternal)
-		return "", false
-	}
-	if resumePolicy.requiresBrowserCapability() {
-		if !h.requireHostPreviewPortBrowserAuth(c, sandbox.HostID) {
-			return "", false
-		}
-		// A Phase 2 VMD may still hold a raw-private snapshot at the previous
-		// revision. Advance under the sandbox row lock before restoring so the
-		// browser-authenticated per-port entries always have a strictly newer
-		// ordering key.
-		resumePolicy, err = h.applyPreviewMutationValidated(c.Request.Context(), sandboxID, teamID, func(*db.Queries) error {
-			return nil
-		}, func(q *db.Queries, _ previewPolicySnapshot) error {
-			return validateHostPreviewBrowserCapabilities(c.Request.Context(), q, sandbox.HostID)
-		})
-		if err != nil {
-			if !h.handlePreviewMutationResult(c, sandboxID, "ActivatePreviewBrowserAuthForResume", err) {
-				return "", false
-			}
-		}
-	} else if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireHostPreviewPorts(c, sandbox.HostID) {
-		return "", false
-	}
-	resumeVMDAccess := resumePolicy.vmdAccess()
-
-	// Serialize the paused→resuming claim with attach/detach via a DB advisory
-	// lock (held only for the claim). Both take the same lock and re-read status
-	// under it, so across API instances a mutation can't read a stale 'paused' and
-	// land a binding this resume won't pick up. Once the claim flips status to
-	// 'resuming', those handlers see it under the lock and reject with 409.
-	claimResume := func(q *db.Queries) (db.Sandbox, error) {
-		if h.Pool != nil {
-			if lerr := q.LockSandboxForSecretWrites(c.Request.Context(), sandboxID.String()); lerr != nil {
-				return db.Sandbox{}, lerr
-			}
-		}
-		return q.BeginResume(c.Request.Context(), db.BeginResumeParams{ID: sandboxID, TeamID: teamID})
-	}
-	var (
-		claimed db.Sandbox
-	)
-	if h.Pool == nil {
-		claimed, err = claimResume(h.DB)
-	} else {
-		var tx pgx.Tx
-		if tx, err = h.Pool.Begin(c.Request.Context()); err == nil {
-			defer tx.Rollback(c.Request.Context())
-			if claimed, err = claimResume(h.DB.WithTx(tx)); err == nil {
-				err = tx.Commit(c.Request.Context())
-			}
-		}
-	}
+	// One statement for the claim and the boot inputs; see ClaimResume.
+	claimed, err := h.DB.ClaimResume(c.Request.Context(), db.ClaimResumeParams{
+		ID:      sandboxID,
+		TeamID:  teamID,
+		LockKey: sandboxID.String(),
+	})
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			// Someone else is already resuming, or the sandbox is no longer
@@ -885,11 +831,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			h.respondQuotaExceeded(c, teamID)
 			return "", false
 		}
-		l.Error().Err(err).Msg("DB BeginResume failed")
+		l.Error().Err(err).Msg("DB ClaimResume failed")
 		respondError(c, ErrInternal)
 		return "", false
 	}
-	*sandbox = claimed
+	*sandbox = claimed.Sandbox
 
 	revertCtx := context.WithoutCancel(c.Request.Context())
 	revertToPaused := func() {
@@ -903,20 +849,55 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
-	snapshot, err := h.DB.GetSnapshot(c.Request.Context(), db.GetSnapshotParams{
-		ID:     sandbox.SnapshotID.Bytes,
-		TeamID: teamID,
-	})
-	if err != nil {
-		l.Error().Err(err).Msg("DB GetSnapshot failed")
+	// Strict sandboxes may only resume while their host proves enforcement
+	// support; a missing policy row is an older control plane's legacy
+	// sandbox. The policy rides the claim, so a refusal here reverts it. The
+	// snapshot is also the fallback payload if VMD lost its in-memory VM.
+	resumePolicy := previewPolicySnapshot{
+		Access:     claimed.Access,
+		WireAccess: claimed.WireAccess,
+		Revision:   claimed.Revision,
+		Ports:      claimedPortPolicies(claimed.PortNumbers, claimed.PortAccesses, claimed.PortTokenVersions),
+	}
+	if resumePolicy.requiresBrowserCapability() {
+		if !h.requireHostPreviewPortBrowserAuth(c, sandbox.HostID) {
+			markRevert()
+			revertToPaused()
+			return "", false
+		}
+		// A Phase 2 VMD may still hold a raw-private snapshot at the previous
+		// revision. Advance under the sandbox row lock before restoring so the
+		// browser-authenticated per-port entries always have a strictly newer
+		// ordering key.
+		resumePolicy, err = h.applyPreviewMutationValidated(c.Request.Context(), sandboxID, teamID, func(*db.Queries) error {
+			return nil
+		}, func(q *db.Queries, _ previewPolicySnapshot) error {
+			return validateHostPreviewBrowserCapabilities(c.Request.Context(), q, sandbox.HostID)
+		})
+		if err != nil {
+			if !h.handlePreviewMutationResult(c, sandboxID, "ActivatePreviewBrowserAuthForResume", err) {
+				markRevert()
+				revertToPaused()
+				return "", false
+			}
+		}
+	} else if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireHostPreviewPorts(c, sandbox.HostID) {
+		markRevert()
+		revertToPaused()
+		return "", false
+	}
+	resumeVMDAccess := resumePolicy.vmdAccess()
+
+	// NULL snap_path: the snapshot row is gone despite a set snapshot_id.
+	if claimed.SnapPath == nil {
+		l.Error().Msg("snapshot row missing for the paused sandbox")
 		markRevert()
 		revertToPaused()
 		respondError(c, ErrInternal)
 		return "", false
 	}
-
-	snapshotPath := snapshot.Path
-	memPath := resolveMemPath(snapshot)
+	snapshotPath := *claimed.SnapPath
+	memPath := resolveMemPath(db.Snapshot{Path: snapshotPath, MemPath: claimed.SnapMemPath})
 
 	// Overlay-mode sandboxes need basePath for the mount-namespace symlink.
 	// Read sandbox.base_path first (pinned at create) so a template rebuild
@@ -924,14 +905,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	var resumeBasePath string
 	if sandbox.BasePath != nil {
 		resumeBasePath = *sandbox.BasePath
-	} else if sandbox.TemplateID.Valid {
-		tpl, tplErr := h.DB.GetTemplateForOwner(c.Request.Context(), db.GetTemplateForOwnerParams{
-			ID:     sandbox.TemplateID.Bytes,
-			TeamID: teamID,
-		})
-		if tplErr == nil && tpl.BasePath != nil {
-			resumeBasePath = *tpl.BasePath
-		}
+	} else if claimed.TemplateBasePath != nil {
+		resumeBasePath = *claimed.TemplateBasePath
 	}
 
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
