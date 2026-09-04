@@ -137,9 +137,10 @@ func main() {
 	mux.HandleFunc("/health", handleHealth(clock, fz))
 	gate := newHostGate()
 	if fz.available() {
-		// Read at boot, off the request path, so no lifecycle request
-		// enumerates interfaces.
-		go gate.guestIPs()
+		// Read at boot, before the listener exists, so no lifecycle request
+		// enumerates interfaces or waits on the read. Once, in an image that
+		// is about to be frozen; a failed read is retried by the request.
+		gate.guestIPs()
 	}
 	mux.HandleFunc("/verify-clock", gate.only(handleVerifyClock(clock, fz)))
 	mux.HandleFunc("/freeze", gate.only(fz.handleFreeze))
