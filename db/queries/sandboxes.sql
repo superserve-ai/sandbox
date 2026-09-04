@@ -494,13 +494,18 @@ RETURNING *;
 -- The paused→resuming claim plus the boot inputs in one round trip:
 -- snapshot paths, preview policy with published ports, template base path.
 -- The advisory lock is the one attach/detach take before re-reading
--- status; taken before the update and held to statement end, so the
--- returned row already reflects a binding mutation that beat the claim.
+-- status; held to statement end, so the returned row already reflects a
+-- binding mutation that beat the claim. It rides a FROM item joined on
+-- the row key: the planner keeps a volatile target there, whereas an
+-- EXISTS subquery has its target list dropped and never takes the lock.
 -- LEFT joins keep the row when the snapshot or policy row is missing.
 -- 0 rows: not paused, or another resume claimed it.
 UPDATE sandbox
 SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
 FROM (
+  SELECT @id::uuid AS id
+  FROM (SELECT pg_advisory_xact_lock(hashtext(@lock_key::text)::bigint)) locked
+) lk, (
   SELECT sb.id,
          s.path AS snap_path,
          s.mem_path AS snap_mem_path,
@@ -526,9 +531,8 @@ FROM (
   ) pp ON true
   WHERE sb.id = @id AND sb.team_id = @team_id
 ) x
-WHERE sandbox.id = x.id
+WHERE sandbox.id = lk.id AND sandbox.id = x.id
   AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
-  AND EXISTS (SELECT pg_advisory_xact_lock(hashtext(@lock_key::text)::bigint))
 RETURNING sqlc.embed(sandbox),
           x.snap_path, x.snap_mem_path,
           x.access, x.wire_access, x.revision,
