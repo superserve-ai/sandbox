@@ -1488,6 +1488,10 @@ func TestResumeSandbox_PersistentPausing_409(t *testing.T) {
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPausing}
 
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
+
 	var reads int32
 	mock := &mockDBTX{
 		queryRowFn: func(context.Context, string, ...any) pgx.Row {
@@ -1501,6 +1505,22 @@ func TestResumeSandbox_PersistentPausing_409(t *testing.T) {
 
 	if w.Code != http.StatusConflict {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+	// The whole settle window is lookup time; a 409 must not censor it.
+	var lookup, total time.Duration
+	for _, p := range rec.phases {
+		if p.Op != "resume" {
+			continue
+		}
+		switch p.Phase {
+		case "lookup":
+			lookup = p.Duration
+		case "total":
+			total = p.Duration
+		}
+	}
+	if lookup < pausingSettleWindow || lookup != total {
+		t.Errorf("lookup = %v, total = %v; a settle-window 409 must record lookup = total >= %v", lookup, total, pausingSettleWindow)
 	}
 	// A fixed 50ms poll over this 1s window would read ~20 times; the
 	// backed-off poll (50ms doubling up to 500ms) should land around 6 and
@@ -1657,6 +1677,8 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 // paused, and never flip status to active.
 // A resume that gets the VM up but then fails to reapply egress rules must
 // re-pause the VM (preserving the overlay), never destroy it.
+// A post-stage failure re-pauses the VM before replying; the phase series
+// must report that compensation as revert, not as post time.
 func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
@@ -1667,6 +1689,10 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
 		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
 	}
+
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
 
 	var destroyCalled, pauseCalled, updateNetworkCalled, finalizeCalled, activateCalled int32
 	vmd := &stubVMD{
@@ -1732,6 +1758,147 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&activateCalled); got != 0 {
 		t.Errorf("ActivateSandbox calls = %d, want 0 (network failed before commit)", got)
+	}
+	phases := map[string]bool{}
+	for _, p := range rec.phases {
+		if p.Op == "resume" {
+			phases[p.Phase] = true
+		}
+	}
+	for _, want := range []string{"claim", "vmd", "post", "revert"} {
+		if !phases[want] {
+			t.Errorf("failed resume must record phase %q; got %v", want, phases)
+		}
+	}
+}
+
+// A successful resume records lookup, claim, vmd, and post alongside the
+// caller-owned total, and no revert; the egress rules ride the request.
+func TestResumeSandbox_EmitsPhasesAndCarriesRulesInResumeRequest(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HostID = "host-a"
+	sb.NetworkConfig = []byte(`{"egress":{"allowed_cidrs":["10.0.0.0/8"]}}`)
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
+	}
+
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
+
+	var resumeNetworkConfig []byte
+	vmd := &stubVMD{
+		resumeFn: func(_ context.Context, _, _, _ string, networkConfig []byte) (string, error) {
+			resumeNetworkConfig = networkConfig
+			return "10.0.0.5", nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+
+	if len(resumeNetworkConfig) == 0 {
+		t.Fatal("ResumeInstance must carry the persisted egress rules")
+	}
+	got := map[string]bool{}
+	for _, p := range rec.phases {
+		if p.Op == "resume" && p.HostID == "host-a" {
+			got[p.Phase] = true
+		}
+	}
+	for _, want := range []string{"lookup", "claim", "vmd", "post", "total"} {
+		if !got[want] {
+			t.Errorf("resume phase %q not recorded; got %v", want, got)
+		}
+	}
+	if got["revert"] {
+		t.Error("a successful resume must not record a revert phase")
+	}
+}
+
+// had_secret_bindings=false proves the binding set is empty: no binding
+// read, no inject.
+func TestResumeSandbox_NoBindingsSkipsBindingRead(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	noBindings := false
+	sb.HadSecretBindings = &noBindings
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+
+	var injectCalled bool
+	vmd := &stubVMD{
+		resumeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) { return "10.0.0.5", nil },
+		injectEnvFn: func(context.Context, string, map[string]string, string) error {
+			injectCalled = true
+			return nil
+		},
+	}
+
+	var bindingReads int32
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "ListSandboxSecretBindingMeta") {
+				atomic.AddInt32(&bindingReads, 1)
+			}
+			return &scanRows{}, nil
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Signer: newTestSigner(t, "v1")}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+	if got := atomic.LoadInt32(&bindingReads); got != 0 {
+		t.Errorf("ListSandboxSecretBindingMeta reads = %d, want 0", got)
+	}
+	if injectCalled {
+		t.Error("no bindings to reapply; InjectSandboxEnv must not be called")
 	}
 }
 

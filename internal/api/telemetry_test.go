@@ -16,6 +16,7 @@ import (
 
 type captureTelemetryRecorder struct {
 	transitions []telemetry.SandboxTransition
+	phases      []telemetry.LatencyPhase
 }
 
 func (r *captureTelemetryRecorder) RecordSandboxTransition(_ context.Context, t telemetry.SandboxTransition) {
@@ -24,8 +25,10 @@ func (r *captureTelemetryRecorder) RecordSandboxTransition(_ context.Context, t 
 
 func (r *captureTelemetryRecorder) RecordSandboxResumeSettleWait(context.Context, telemetry.SandboxResumeSettleWait) {
 }
-func (r *captureTelemetryRecorder) RecordVMDCall(context.Context, telemetry.VMDCall)           {}
-func (r *captureTelemetryRecorder) RecordLatencyPhase(context.Context, telemetry.LatencyPhase) {}
+func (r *captureTelemetryRecorder) RecordVMDCall(context.Context, telemetry.VMDCall) {}
+func (r *captureTelemetryRecorder) RecordLatencyPhase(_ context.Context, p telemetry.LatencyPhase) {
+	r.phases = append(r.phases, p)
+}
 func (r *captureTelemetryRecorder) RecordHostResolution(context.Context, telemetry.HostResolution) {
 }
 func (r *captureTelemetryRecorder) RecordCapacityShadow(context.Context, telemetry.CapacityShadow) {
