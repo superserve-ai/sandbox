@@ -213,11 +213,14 @@ type VMRecord struct {
 	// rewrites a record, so after a rollback and re-upgrade the field is absent
 	// again — decoding that silence as false would ignore a marker still on disk
 	// and delete it at the next pause. Nil means "ask the disk".
-	CorrectsWallClock *bool             `json:"corrects_wall_clock,omitempty"`
-	CreatedAt         time.Time         `json:"created_at"`
-	Metadata          map[string]string `json:"metadata,omitempty"`
-	VCPU              uint32            `json:"vcpu"`
-	MemoryMiB         uint32            `json:"memory_mib"`
+	CorrectsWallClock *bool `json:"corrects_wall_clock,omitempty"`
+	// ArtifactID names the manifest beside the image this VM was last paused
+	// into; see VMInstance.
+	ArtifactID string            `json:"artifact_id,omitempty"`
+	CreatedAt  time.Time         `json:"created_at"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	VCPU       uint32            `json:"vcpu"`
+	MemoryMiB  uint32            `json:"memory_mib"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
 	// dual-symlink mount namespace). DeltaDir is intentionally NOT
@@ -905,6 +908,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		StrandedOverlays:           append([]string(nil), inst.StrandedOverlays...),
 		DirtyTrackingSessionID:     inst.DirtyTrackingSessionID,
 		CorrectsWallClock:          inst.CorrectsWallClock,
+		ArtifactID:                 inst.ArtifactID,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
@@ -1006,6 +1010,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		// untracked and pause Full, exactly as before.
 		DirtyTracked:               rec.Status == StatusRunning && rec.DirtyTrackingSessionID != "",
 		CorrectsWallClock:          rec.CorrectsWallClock,
+		ArtifactID:                 rec.ArtifactID,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,

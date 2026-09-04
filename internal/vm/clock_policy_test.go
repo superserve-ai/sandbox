@@ -13,8 +13,9 @@ import (
 )
 
 // The policy must stay legacy — restore whatever the snapshot carries — unless
-// both the operator asked for the behaviour and the guest was shown to correct
-// its own wall clock. Freezing a guest that cannot leaves it on a stale clock.
+// both the operator asked for the behaviour and the image holds a frozen
+// workload from a guest shown to correct its own wall clock. Freezing the clock
+// of any other guest leaves it on a stale clock.
 func TestClockPolicyFor(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -78,8 +79,8 @@ func TestClockPolicyForSeparatesGuestFromBinary(t *testing.T) {
 func TestGuestCorrectsWallClock(t *testing.T) {
 	mark := func(t *testing.T, path string) string {
 		t.Helper()
-		if err := os.WriteFile(clockFreezeMarkerPath(path), nil, 0o644); err != nil {
-			t.Fatalf("write marker: %v", err)
+		if err := WriteWallClockManifest(path, WallClockManifest{Version: WallClockManifestVersion, ArtifactID: "a", GuestCorrectsClock: true}); err != nil {
+			t.Fatalf("write manifest: %v", err)
 		}
 		return path
 	}
@@ -93,7 +94,7 @@ func TestGuestCorrectsWallClock(t *testing.T) {
 	})
 
 	// First layered pass: the VM loaded straight off the template base, so the
-	// base is what carries the marker.
+	// base is what carries the manifest.
 	t.Run("layered_base_marked", func(t *testing.T) {
 		dir := t.TempDir()
 		base := mark(t, filepath.Join(dir, "template.snap"))
@@ -114,6 +115,17 @@ func TestGuestCorrectsWallClock(t *testing.T) {
 		dir := t.TempDir()
 		if guestCorrectsWallClock(filepath.Join(dir, "mem.snap"), "") {
 			t.Error("want false for an unmarked VM with no base")
+		}
+	})
+
+	// A manifest that cannot be read is not proof either way.
+	t.Run("unreadable_is_not_marked", func(t *testing.T) {
+		mem := filepath.Join(t.TempDir(), "mem.snap")
+		if err := os.WriteFile(WallClockMarkerPath(mem), []byte("{"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if guestCorrectsWallClock(mem, "") {
+			t.Error("an unreadable manifest must not read as proof")
 		}
 	})
 }
@@ -252,39 +264,66 @@ func TestCorrectsWallClockAbsentFromOldRecordIsFalse(t *testing.T) {
 // contradicts the record: if the record is used, the marker is irrelevant, which
 // is what proves the lookup was skipped.
 func TestResumeWallClockProperty(t *testing.T) {
+	seed := func(t *testing.T, mem string, m WallClockManifest) {
+		t.Helper()
+		m.Version = WallClockManifestVersion
+		if m.ArtifactID == "" {
+			m.ArtifactID = "a"
+		}
+		if err := WriteWallClockManifest(mem, m); err != nil {
+			t.Fatalf("seed manifest: %v", err)
+		}
+	}
 	t.Run("same_image_trusts_the_record_over_the_disk", func(t *testing.T) {
 		mem := filepath.Join(t.TempDir(), "mem.snap")
-		if err := os.WriteFile(clockFreezeMarkerPath(mem), nil, 0o644); err != nil {
-			t.Fatalf("seed marker: %v", err)
+		seed(t, mem, WallClockManifest{GuestCorrectsClock: true})
+		// Manifest says yes, record says no. The record wins ⇒ no read happened.
+		if corrects, _, err := resumeWallClockProperty(mem, mem, boolPtr(false)); corrects || err != nil {
+			t.Errorf("corrects=%v err=%v; want the recorded value, a manifest on disk means the record was not used", corrects, err)
 		}
-		// Marker says yes, record says no. The record wins ⇒ no stat happened.
-		if resumeWallClockProperty(mem, "", mem, boolPtr(false)) {
-			t.Error("want the recorded value; a marker on disk means the record was not used")
-		}
-		// And the inverse: no marker on disk, record says yes.
+		// And the inverse: no manifest on disk, record says yes.
 		bare := filepath.Join(t.TempDir(), "mem.snap")
-		if !resumeWallClockProperty(bare, "", bare, boolPtr(true)) {
-			t.Error("want the recorded value even with no marker beside the image")
+		if corrects, _, err := resumeWallClockProperty(bare, bare, boolPtr(true)); !corrects || err != nil {
+			t.Errorf("corrects=%v err=%v; want the recorded value even with no manifest beside the image", corrects, err)
 		}
 	})
 
 	// An override supplies an image this VM was never paused into, so the record
-	// describes a different artifact and the marker is the only evidence.
-	t.Run("override_image_reads_the_marker", func(t *testing.T) {
+	// describes a different artifact and the manifest is the only evidence.
+	t.Run("override_image_reads_the_manifest", func(t *testing.T) {
 		dir := t.TempDir()
 		override := filepath.Join(dir, "restored.snap")
-		if err := os.WriteFile(clockFreezeMarkerPath(override), nil, 0o644); err != nil {
-			t.Fatalf("seed marker: %v", err)
-		}
-		if !resumeWallClockProperty(override, "", filepath.Join(dir, "mem.snap"), boolPtr(false)) {
-			t.Error("want the marker consulted when the image is not the paused one")
+		seed(t, override, WallClockManifest{GuestCorrectsClock: true})
+		if corrects, frozen, err := resumeWallClockProperty(override, filepath.Join(dir, "mem.snap"), boolPtr(false)); !corrects || frozen || err != nil {
+			t.Errorf("corrects=%v frozen=%v err=%v; want the manifest consulted when the image is not the paused one", corrects, frozen, err)
 		}
 	})
 
-	t.Run("override_without_a_marker_stays_legacy", func(t *testing.T) {
+	t.Run("override_without_a_manifest_stays_legacy", func(t *testing.T) {
 		dir := t.TempDir()
-		if resumeWallClockProperty(filepath.Join(dir, "restored.snap"), "", filepath.Join(dir, "mem.snap"), boolPtr(true)) {
-			t.Error("a stale record must not carry over to a different image")
+		if corrects, frozen, err := resumeWallClockProperty(filepath.Join(dir, "restored.snap"), filepath.Join(dir, "mem.snap"), boolPtr(true)); corrects || frozen || err != nil {
+			t.Errorf("corrects=%v frozen=%v err=%v; a stale record must not carry over to a different image", corrects, frozen, err)
+		}
+	})
+
+	// A frozen workload and an untrusted manifest are both reported, so the
+	// caller can refuse before it launches anything.
+	t.Run("override_reports_a_frozen_workload", func(t *testing.T) {
+		dir := t.TempDir()
+		override := filepath.Join(dir, "restored.snap")
+		seed(t, override, WallClockManifest{GuestCorrectsClock: true, WorkloadFrozen: true, FreezeToken: "tok"})
+		if _, frozen, err := resumeWallClockProperty(override, filepath.Join(dir, "mem.snap"), nil); !frozen || err != nil {
+			t.Errorf("frozen=%v err=%v; want the frozen workload reported", frozen, err)
+		}
+	})
+	t.Run("override_with_an_untrusted_manifest_is_an_error", func(t *testing.T) {
+		dir := t.TempDir()
+		override := filepath.Join(dir, "restored.snap")
+		if err := os.WriteFile(WallClockMarkerPath(override), []byte(`{"version":2}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := resumeWallClockProperty(override, filepath.Join(dir, "mem.snap"), nil); !errors.Is(err, ErrWallClockManifest) {
+			t.Errorf("err=%v, want ErrWallClockManifest", err)
 		}
 	})
 }
@@ -357,18 +396,18 @@ func TestWatchFirecrackerCapability(t *testing.T) {
 // A rollback to a binary without the record field, then an upgrade back, leaves
 // the field absent. Reading that silence as "no" would ignore the marker still
 // beside the image and delete it at the next pause — a permanent demotion.
-func TestResumeWallClockPropertyUnresolvedRecordConsultsTheMarker(t *testing.T) {
+func TestResumeWallClockPropertyUnresolvedRecordConsultsTheManifest(t *testing.T) {
 	mem := filepath.Join(t.TempDir(), "mem.snap")
-	if err := os.WriteFile(clockFreezeMarkerPath(mem), nil, 0o644); err != nil {
-		t.Fatalf("seed marker: %v", err)
+	if err := WriteWallClockManifest(mem, WallClockManifest{Version: WallClockManifestVersion, ArtifactID: "a", GuestCorrectsClock: true}); err != nil {
+		t.Fatalf("seed manifest: %v", err)
 	}
 	// Same image, but the record lost the answer.
-	if !resumeWallClockProperty(mem, "", mem, nil) {
-		t.Error("an unresolved record must fall back to the marker, not read as false")
+	if corrects, _, err := resumeWallClockProperty(mem, mem, nil); !corrects || err != nil {
+		t.Errorf("corrects=%v err=%v; an unresolved record must fall back to the manifest, not read as false", corrects, err)
 	}
 
 	bare := filepath.Join(t.TempDir(), "mem.snap")
-	if resumeWallClockProperty(bare, "", bare, nil) {
-		t.Error("unresolved with no marker must still be false")
+	if corrects, _, err := resumeWallClockProperty(bare, bare, nil); corrects || err != nil {
+		t.Errorf("corrects=%v err=%v; unresolved with no manifest must still be false", corrects, err)
 	}
 }
