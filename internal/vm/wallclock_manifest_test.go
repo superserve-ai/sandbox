@@ -24,8 +24,9 @@ func isolateEvidence(t *testing.T, dir string) {
 	t.Helper()
 	orig := wakeProtocolEvidencePath
 	wakeProtocolEvidencePath = filepath.Join(dir, "evidence")
-	wakeProtocolEvidenceDone.Store(false)
-	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceDone.Store(false) })
+	resetEvidence := func() { wakeProtocolEvidenceSeen.Store(false); wakeProtocolEvidenceDurable.Store(false) }
+	resetEvidence()
+	t.Cleanup(func() { wakeProtocolEvidencePath = orig; resetEvidence() })
 }
 
 func TestImageManifest(t *testing.T) {
@@ -144,25 +145,32 @@ func TestRaiseWakeProtocolFloorIsDurable(t *testing.T) {
 	if err != nil || len(b) == 0 {
 		t.Fatalf("evidence = %q, %v; want a non-empty file", b, err)
 	}
-	wakeProtocolEvidenceDone.Store(false) // a fresh process
+	wakeProtocolEvidenceSeen.Store(false) // a fresh process
+	wakeProtocolEvidenceDurable.Store(false)
 	if !RecognizeWakeProtocolFloor() {
 		t.Fatal("a fresh process did not recognise the evidence")
 	}
-	// Created once: a second raise leaves the file as it is and no temp file
-	// behind; and existence alone is the fact, an empty file included, as it
-	// is for the host guard.
+	// Recognition is seeing, not proving: a raise after it must still make
+	// the file durable itself, without rewriting it, and only then count it.
+	if wakeProtocolEvidenceDurable.Load() {
+		t.Fatal("recognition counted the file as durable")
+	}
+	if err := RaiseWakeProtocolFloor(); err != nil || !wakeProtocolEvidenceDurable.Load() {
+		t.Fatalf("err=%v durable=%v; want the recognised file made durable by the raise", err, wakeProtocolEvidenceDurable.Load())
+	}
+	// Created once: existence alone is the fact, an empty file included, as
+	// it is for the host guard; a raise over it leaves it as it is and no
+	// temp file behind.
 	if err := os.WriteFile(wakeProtocolEvidencePath, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	wakeProtocolEvidenceDone.Store(false)
+	wakeProtocolEvidenceSeen.Store(false)
+	wakeProtocolEvidenceDurable.Store(false)
 	if !RecognizeWakeProtocolFloor() {
 		t.Fatal("an empty evidence file was not recognised")
 	}
-	// A raise over a file this process has not proven durable syncs the
-	// directory and counts it, without rewriting it.
-	wakeProtocolEvidenceDone.Store(false)
-	if err := RaiseWakeProtocolFloor(); err != nil || !wakeProtocolFloorRaised() {
-		t.Fatalf("err=%v raised=%v; want the existing file counted once its directory is synced", err, wakeProtocolFloorRaised())
+	if err := RaiseWakeProtocolFloor(); err != nil || !wakeProtocolFloorRaised() || !wakeProtocolEvidenceDurable.Load() {
+		t.Fatalf("err=%v raised=%v durable=%v; want the existing file counted once its directory is synced", err, wakeProtocolFloorRaised(), wakeProtocolEvidenceDurable.Load())
 	}
 	if b, _ := os.ReadFile(wakeProtocolEvidencePath); len(b) != 0 {
 		t.Errorf("existing evidence rewritten: %q", b)
@@ -175,7 +183,8 @@ func TestRaiseWakeProtocolFloorIsDurable(t *testing.T) {
 		t.Fatal(err)
 	}
 	wakeProtocolEvidencePath = filepath.Join(blocker, "evidence")
-	wakeProtocolEvidenceDone.Store(false)
+	wakeProtocolEvidenceSeen.Store(false)
+	wakeProtocolEvidenceDurable.Store(false)
 	if err := RaiseWakeProtocolFloor(); err == nil || wakeProtocolFloorRaised() {
 		t.Fatalf("err=%v raised=%v; a raise that cannot land must fail and not be remembered", err, wakeProtocolFloorRaised())
 	}

@@ -58,8 +58,8 @@ func TestPauseIntentBlocks(t *testing.T) {
 // down looks for none.
 func raiseFloorForTest(t *testing.T) {
 	t.Helper()
-	wakeProtocolEvidenceDone.Store(true)
-	t.Cleanup(func() { wakeProtocolEvidenceDone.Store(false) })
+	wakeProtocolEvidenceSeen.Store(true)
+	t.Cleanup(func() { wakeProtocolEvidenceSeen.Store(false) })
 }
 
 func TestInterruptedPauseRefusesResumeAndRestore(t *testing.T) {
