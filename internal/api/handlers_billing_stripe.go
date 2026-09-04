@@ -380,7 +380,10 @@ func (c *stripeHTTPClient) GetCustomerCreditBalance(ctx context.Context, custome
 	if !seenUSD {
 		return StripeCreditBalance{}, fmt.Errorf("stripe credit balance summary contained no usable usd balance")
 	}
-	return StripeCreditBalance{AvailableUSD: float64(cents) / 100, ObservedAt: time.Now().UTC(), IncludesCurrentPeriodUsage: true}, nil
+	// The credit balance summary is an aggregate grant balance only. Current
+	// period meter usage is exported separately when the period closes, so this
+	// read must not claim that active-period usage has already been reflected.
+	return StripeCreditBalance{AvailableUSD: float64(cents) / 100, ObservedAt: time.Now().UTC(), IncludesCurrentPeriodUsage: false}, nil
 }
 
 func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params StripeCreateCheckoutSessionParams) (StripeCheckoutSession, error) {

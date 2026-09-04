@@ -123,6 +123,9 @@ func TestStripeCreditBalanceAggregatesApplicableGrants(t *testing.T) {
 	if got.ObservedAt.IsZero() {
 		t.Fatal("expected observation timestamp")
 	}
+	if got.IncludesCurrentPeriodUsage {
+		t.Fatal("credit balance summary must not claim active-period usage is reflected")
+	}
 }
 
 func TestStripeCreditBalancePreservesKnownZero(t *testing.T) {
