@@ -48,6 +48,20 @@ type StripeBillingClient interface {
 	ReportMeterEvent(ctx context.Context, params StripeReportMeterEventParams) error
 }
 
+type StripeCreditBalance struct {
+	AvailableUSD float64
+	ObservedAt   time.Time
+	// IncludesCurrentPeriodUsage states whether Stripe has already applied or
+	// reserved this period's usage in AvailableUSD. The credit balance summary
+	// endpoint is post-application, so callers must not subtract local usage
+	// from it again.
+	IncludesCurrentPeriodUsage bool
+}
+
+type stripeCreditBalanceReader interface {
+	GetCustomerCreditBalance(context.Context, string) (StripeCreditBalance, error)
+}
+
 type stripeEventRetriever interface {
 	RetrieveEvent(ctx context.Context, eventID string) (json.RawMessage, error)
 }
@@ -325,6 +339,48 @@ func (c *stripeHTTPClient) CreateBillingCreditGrant(ctx context.Context, params 
 		return StripeBillingCreditGrant{}, err
 	}
 	return StripeBillingCreditGrant{ID: resp.ID}, nil
+}
+
+// GetCustomerCreditBalance reads Stripe's authoritative aggregate credit balance.
+func (c *stripeHTTPClient) GetCustomerCreditBalance(ctx context.Context, customerID string) (StripeCreditBalance, error) {
+	var resp struct {
+		Balances []struct {
+			AvailableBalance struct {
+				Monetary *struct {
+					Currency string `json:"currency"`
+					Value    int64  `json:"value"`
+				} `json:"monetary"`
+			} `json:"available_balance"`
+		} `json:"balances"`
+	}
+	// credit_balance_summary is Stripe's aggregate view: it applies the
+	// applicability filter and excludes expired grants server-side. Unlike the
+	// credit-grants list API, this response is not capped at the first page, so
+	// iterating every returned balance preserves credits when a customer has
+	// more than 100 grants.
+	path := "/v1/billing/credit_balance_summary?customer=" + url.QueryEscape(customerID) + "&filter[type]=applicability_scope"
+	if err := c.doForm(ctx, http.MethodGet, path, nil, &resp, ""); err != nil {
+		return StripeCreditBalance{}, err
+	}
+	var cents int64
+	seenUSD := false
+	for _, b := range resp.Balances {
+		// Stripe may omit the monetary object when a balance is not
+		// representable. Treat that as an unavailable read, not as a known
+		// zero: decoding a missing object into a value struct would silently
+		// turn malformed/partial responses into an authoritative zero.
+		if b.AvailableBalance.Monetary == nil {
+			continue
+		}
+		if b.AvailableBalance.Monetary.Currency == "usd" {
+			cents += b.AvailableBalance.Monetary.Value
+			seenUSD = true
+		}
+	}
+	if !seenUSD {
+		return StripeCreditBalance{}, fmt.Errorf("stripe credit balance summary contained no usable usd balance")
+	}
+	return StripeCreditBalance{AvailableUSD: float64(cents) / 100, ObservedAt: time.Now().UTC(), IncludesCurrentPeriodUsage: true}, nil
 }
 
 func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params StripeCreateCheckoutSessionParams) (StripeCheckoutSession, error) {

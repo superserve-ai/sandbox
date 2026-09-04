@@ -40,11 +40,22 @@ type fakeStripeClient struct {
 	portalCalls      []api.StripeCreateCustomerPortalSessionParams
 	customerCalls    []api.StripeCreateCustomerParams
 	creditGrantCalls []api.StripeCreateBillingCreditGrantParams
+	creditBalance    api.StripeCreditBalance
+	creditBalanceErr error
 	reportErr        error
 	reportErrAt      int
 	nextCustomerID   string
 	nextCheckoutURL  string
 	nextPortalURL    string
+}
+
+func (f *fakeStripeClient) GetCustomerCreditBalance(_ context.Context, _ string) (api.StripeCreditBalance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.creditBalanceErr != nil {
+		return api.StripeCreditBalance{}, f.creditBalanceErr
+	}
+	return f.creditBalance, nil
 }
 
 type thinEventStripeClient struct {
@@ -215,6 +226,106 @@ func seedBillingPeriodForStripe(t *testing.T, approved bool, exportEnabled bool)
 
 func apiPeriodID(start, end time.Time) string {
 	return start.Format(time.RFC3339) + "," + end.Format(time.RFC3339)
+}
+
+// TestIntegration_GetBillingSummaryStripeCredits exercises the Stripe-authoritative
+// branch with aggregate balances that differ from any local audit grant.
+func TestIntegration_GetBillingSummaryStripeCredits(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stripe float64
+		local  float64
+	}{
+		{name: "zero", stripe: 0, local: 95},
+		{name: "partial", stripe: 20.5, local: 95},
+		{name: "full", stripe: 95, local: 1},
+		{name: "multiple grants aggregate", stripe: 145, local: 95},
+		{name: "large grant", stripe: 12000, local: 95},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
+			viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+			if _, err := testPool.Exec(ctx, `
+				INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
+				VALUES ($1, $2, $2, 'audit-only local fixture')`, teamID, tc.local); err != nil {
+				t.Fatalf("seed local audit credit: %v", err)
+			}
+			stripe := &fakeStripeClient{creditBalance: api.StripeCreditBalance{AvailableUSD: tc.stripe, ObservedAt: time.Now().UTC(), IncludesCurrentPeriodUsage: false}}
+			w := do(newBillingRouter(t, stripe), "GET", "/billing/summary", viewerKey, "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+			body := mustJSON(t, w)
+			if body["credit_source"] != "stripe" || body["credit_status"] != "available" {
+				t.Fatalf("credit state = %v/%v, want stripe/available", body["credit_source"], body["credit_status"])
+			}
+			if got := body["stripe_credit_balance_usd"].(float64); math.Abs(got-tc.stripe) > 1e-9 {
+				t.Fatalf("stripe balance = %v, want %v", got, tc.stripe)
+			}
+			charges := body["current_charges_usd"].(float64)
+			wantApplied := math.Min(math.Max(charges, 0), math.Max(tc.stripe, 0))
+			wantRemaining := math.Max(tc.stripe-wantApplied, 0)
+			if got := body["stripe_credits_applied_usd"].(float64); math.Abs(got-wantApplied) > 1e-9 {
+				t.Fatalf("stripe applied = %v, want %v", got, wantApplied)
+			}
+			if got := body["stripe_remaining_credit_usd"].(float64); math.Abs(got-wantRemaining) > 1e-9 {
+				t.Fatalf("stripe remaining = %v, want %v", got, wantRemaining)
+			}
+			if _, ok := body["credits_remaining_usd"]; ok && body["credits_remaining_usd"] != nil {
+				t.Fatalf("post-activation local estimate should remain unavailable: %v", body["credits_remaining_usd"])
+			}
+		})
+	}
+}
+
+func TestIntegration_GetBillingSummaryStripeCreditReaderFailureDegrades(t *testing.T) {
+	teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
+	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+	stripe := &fakeStripeClient{creditBalanceErr: errors.New("credit balance unavailable")}
+	w := do(newBillingRouter(t, stripe), "GET", "/billing/summary", viewerKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	body := mustJSON(t, w)
+	if body["current_charges_usd"] == nil {
+		t.Fatal("expected non-Stripe charges when Stripe credit read fails")
+	}
+	for _, field := range []string{"stripe_credit_balance_usd", "credits_applied_usd", "credits_remaining_usd", "expected_invoice_amount_usd"} {
+		if value, ok := body[field]; ok && value != nil {
+			t.Fatalf("%s = %v, want null when Stripe credit is unavailable", field, value)
+		}
+	}
+	if body["credit_status"] != "unavailable" {
+		t.Fatalf("credit_status = %v, want unavailable", body["credit_status"])
+	}
+}
+
+func TestIntegration_GetBillingSummaryStripeCreditAlreadyReflectsCurrentPeriod(t *testing.T) {
+	teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
+	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+	stripe := &fakeStripeClient{creditBalance: api.StripeCreditBalance{AvailableUSD: 20, ObservedAt: time.Now().UTC(), IncludesCurrentPeriodUsage: true}}
+	w := do(newBillingRouter(t, stripe), "GET", "/billing/summary", viewerKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	body := mustJSON(t, w)
+	if body["stripe_credit_balance_usd"] != float64(20) {
+		t.Fatalf("stripe balance = %v, want 20", body["stripe_credit_balance_usd"])
+	}
+	if got := body["stripe_credits_applied_usd"].(float64); got != 0 {
+		t.Fatalf("stripe applied = %v, want 0", got)
+	}
+	if got := body["stripe_remaining_credit_usd"].(float64); got != 20 {
+		t.Fatalf("stripe remaining = %v, want 20", got)
+	}
+	// Stripe's available balance already reflects current-period usage; do not
+	// subtract it again in a local payable estimate.
+	for _, field := range []string{"credits_applied_usd", "credits_remaining_usd", "expected_invoice_amount_usd"} {
+		if value, ok := body[field]; ok && value != nil {
+			t.Fatalf("%s = %v, want null for Stripe-authoritative accounting", field, value)
+		}
+	}
 }
 
 func stripeSignature(t *testing.T, payload []byte, ts time.Time, secret ...string) string {

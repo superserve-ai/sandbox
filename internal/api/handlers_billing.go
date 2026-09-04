@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -55,9 +56,15 @@ type billingSummaryResponse struct {
 	PortalAvailable          bool                              `json:"portal_available"`
 	PaymentSetupRequired     bool                              `json:"payment_setup_required"`
 	CurrentChargesUSD        float64                           `json:"current_charges_usd"`
-	CreditsAppliedUSD        float64                           `json:"credits_applied_usd"`
-	CreditsRemainingUSD      float64                           `json:"credits_remaining_usd"`
-	ExpectedInvoiceAmountUSD float64                           `json:"expected_invoice_amount_usd"`
+	CreditsAppliedUSD        *float64                          `json:"credits_applied_usd"`
+	CreditsRemainingUSD      *float64                          `json:"credits_remaining_usd"`
+	ExpectedInvoiceAmountUSD *float64                          `json:"expected_invoice_amount_usd"`
+	StripeCreditBalanceUSD   *float64                          `json:"stripe_credit_balance_usd,omitempty"`
+	StripeCreditsAppliedUSD  *float64                          `json:"stripe_credits_applied_usd,omitempty"`
+	StripeRemainingCreditUSD *float64                          `json:"stripe_remaining_credit_usd,omitempty"`
+	CreditSource             string                            `json:"credit_source"`
+	CreditStatus             string                            `json:"credit_status"`
+	CreditObservedAt         *time.Time                        `json:"credit_observed_at,omitempty"`
 	CostBreakdownUSD         billingSummaryCostBreakdown       `json:"cost_breakdown_usd"`
 	Resources                []billingSummaryResource          `json:"resources"`
 	ResourcesByKey           map[string]billingSummaryResource `json:"resources_by_key,omitempty"`
@@ -190,7 +197,11 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		creditBalance pgtype.Numeric
 	)
 	g, ctx := errgroup.WithContext(c.Request.Context())
+	hasEstablishedSubscription := billingAccountHasEstablishedSubscription(account)
 	g.Go(func() error {
+		// Usage remains required for every account: Stripe owns credit state after
+		// activation, but current charges and the resource breakdown still come
+		// from the live Superserve usage rollup.
 		var err error
 		usage, err = h.DB.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
 			TeamID:      teamID,
@@ -214,14 +225,16 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		}
 		return nil
 	})
-	g.Go(func() error {
-		var err error
-		creditBalance, err = h.DB.GetTeamCreditBalance(ctx, teamID)
-		if err != nil {
-			return fmt.Errorf("get team credit balance: %w", err)
-		}
-		return nil
-	})
+	if !hasEstablishedSubscription {
+		g.Go(func() error {
+			var err error
+			creditBalance, err = h.DB.GetTeamCreditBalance(ctx, teamID)
+			if err != nil {
+				return fmt.Errorf("get team credit balance: %w", err)
+			}
+			return nil
+		})
+	}
 	if err := g.Wait(); err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing summary dependency fetch failed")
 		respondError(c, ErrInternal)
@@ -290,12 +303,14 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	}
 
 	creditsAvailable, err := numericFloat64(creditBalance)
-	if err != nil {
+	if err != nil && !hasEstablishedSubscription {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert credit balance failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	hasEstablishedSubscription := billingAccountHasEstablishedSubscription(account)
+	if hasEstablishedSubscription {
+		creditsAvailable = 0
+	}
 	checkoutAvailable := false
 	if canManageBilling && mode == billingModeLive && h.Stripe != nil && !hasEstablishedSubscription {
 		if _, err := billingCheckoutPriceIDs(resourceStates); err == nil {
@@ -316,6 +331,52 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		!hasEstablishedSubscription &&
 		charges.CreditsRemainingUSD <= 0
 	summaryResources := billingSummaryResourcesFromState(resourceStates, vcpuSeconds, memoryGibSeconds, storageGibSeconds, charges)
+	creditSource, creditStatus := "local_trial", "available"
+	var stripeBalance, stripeApplied, stripeRemaining *float64
+	var creditsApplied, creditsRemaining, expectedInvoice *float64
+	var observed *time.Time
+	if hasEstablishedSubscription {
+		creditSource, creditStatus = "stripe", "unavailable"
+		// Keep every credit-derived estimate unavailable until Stripe's
+		// authoritative balance has been read successfully. In particular, do
+		// not expose the local zero-credit arithmetic as a payable estimate when
+		// the Stripe dependency is unavailable.
+		if reader, ok := h.Stripe.(stripeCreditBalanceReader); ok && account.StripeCustomerID != nil {
+			cb, e := reader.GetCustomerCreditBalance(c.Request.Context(), *account.StripeCustomerID)
+			if e == nil {
+				v := cb.AvailableUSD
+				stripeBalance = &v
+				// Keep the applied amount clamped to both the current charges and
+				// the available balance. This is the same amount used for the
+				// derived remaining/payable values below.
+				available := math.Max(v, 0)
+				applied := math.Min(math.Max(charges.CurrentChargesUSD, 0), available)
+				// This endpoint returns Stripe's post-application balance. Keep
+				// estimates in that same accounting view; subtracting local gross
+				// usage here would charge the period twice.
+				if cb.IncludesCurrentPeriodUsage {
+					applied = 0
+					remaining := available
+					stripeApplied, stripeRemaining = &applied, &remaining
+				} else {
+					remaining := math.Max(v-applied, 0)
+					stripeApplied, stripeRemaining = &applied, &remaining
+				}
+				creditStatus = "available"
+				observed = &cb.ObservedAt
+			} else {
+				// Stripe is the source of truth after activation. Never fall back to
+				// the local pre-Stripe calculation when its balance read fails.
+				creditsApplied, creditsRemaining, expectedInvoice = nil, nil, nil
+				log.Warn().Err(e).Str("team_id", teamID.String()).Msg("stripe credit balance unavailable")
+			}
+		}
+	}
+	if !hasEstablishedSubscription {
+		creditsApplied = &charges.CreditsAppliedUSD
+		creditsRemaining = &charges.CreditsRemainingUSD
+		expectedInvoice = &charges.ExpectedInvoiceAmountUSD
+	}
 
 	setPrivateBillingCacheHeaders(c)
 	c.JSON(http.StatusOK, billingSummaryResponse{
@@ -326,9 +387,10 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		PortalAvailable:          canManageBilling && mode == billingModeLive && h.Stripe != nil && hasEstablishedSubscription,
 		PaymentSetupRequired:     paymentSetupRequired,
 		CurrentChargesUSD:        charges.CurrentChargesUSD,
-		CreditsAppliedUSD:        charges.CreditsAppliedUSD,
-		CreditsRemainingUSD:      charges.CreditsRemainingUSD,
-		ExpectedInvoiceAmountUSD: charges.ExpectedInvoiceAmountUSD,
+		CreditsAppliedUSD:        creditsApplied,
+		CreditsRemainingUSD:      creditsRemaining,
+		ExpectedInvoiceAmountUSD: expectedInvoice,
+		StripeCreditBalanceUSD:   stripeBalance, StripeCreditsAppliedUSD: stripeApplied, StripeRemainingCreditUSD: stripeRemaining, CreditSource: creditSource, CreditStatus: creditStatus, CreditObservedAt: observed,
 		CostBreakdownUSD: billingSummaryCostBreakdown{
 			Compute: charges.Breakdown.ComputeUSD,
 			Memory:  charges.Breakdown.MemoryUSD,
