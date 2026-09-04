@@ -73,7 +73,13 @@ func TestImageManifest(t *testing.T) {
 		}
 	})
 	t.Run("unreadable_is_refused", func(t *testing.T) {
-		for name, body := range map[string]string{"garbage": "{", "future": `{"version":2}`, "frozen_without_token": `{"version":1,"workload_frozen":true}`} {
+		for name, body := range map[string]string{
+			"garbage":                     "{",
+			"future":                      `{"version":2}`,
+			"no_artifact":                 `{"version":1,"guest_corrects_clock":true}`,
+			"frozen_without_token":        `{"version":1,"artifact_id":"a","workload_frozen":true,"guest_corrects_clock":true}`,
+			"frozen_guest_not_correcting": `{"version":1,"artifact_id":"a","workload_frozen":true,"freeze_token":"t"}`,
+		} {
 			mem := filepath.Join(t.TempDir(), "mem.snap")
 			if err := os.WriteFile(WallClockMarkerPath(mem), []byte(body), 0o644); err != nil {
 				t.Fatal(err)
@@ -142,6 +148,25 @@ func TestRaiseWakeProtocolFloorIsDurable(t *testing.T) {
 	if !RecognizeWakeProtocolFloor() {
 		t.Fatal("a fresh process did not recognise the evidence")
 	}
+	// Created once: a second raise leaves the file as it is and no temp file
+	// behind; and existence alone is the fact, an empty file included, as it
+	// is for the host guard.
+	if err := os.WriteFile(wakeProtocolEvidencePath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wakeProtocolEvidenceDone.Store(false)
+	if !RecognizeWakeProtocolFloor() {
+		t.Fatal("an empty evidence file was not recognised")
+	}
+	if err := RaiseWakeProtocolFloor(); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(wakeProtocolEvidencePath); len(b) != 0 {
+		t.Errorf("existing evidence rewritten: %q", b)
+	}
+	if left, _ := filepath.Glob(wakeProtocolEvidencePath + ".tmp.*"); len(left) != 0 {
+		t.Errorf("temp files left behind: %v", left)
+	}
 	blocker := filepath.Join(dir, "blocker")
 	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -168,6 +193,18 @@ func TestTemplateManifestIsReadOncePerDaemon(t *testing.T) {
 	seedFrozenManifest(t, tpl, "tok")
 	if man, err := m.imageManifestCached(tpl); err != nil || man != nil {
 		t.Fatalf("second read: man=%+v err=%v, want the first answer kept", man, err)
+	}
+	// A path that only looks like a template's is not one, and is not kept.
+	dotted := filepath.Join(dir, TemplatesDirName, "..", "vm-2", "mem.snap")
+	if err := os.MkdirAll(filepath.Dir(dotted), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if man, err := m.imageManifestCached(dotted); err != nil || man != nil {
+		t.Fatalf("dotted path, first read: man=%+v err=%v", man, err)
+	}
+	seedFrozenManifest(t, dotted, "tok")
+	if man, err := m.imageManifestCached(dotted); err != nil || man == nil {
+		t.Fatalf("dotted path, second read: man=%+v err=%v, want the disk consulted, not a cached answer", man, err)
 	}
 	other := filepath.Join(dir, "vm-1", "mem.snap")
 	if err := os.MkdirAll(filepath.Dir(other), 0o755); err != nil {

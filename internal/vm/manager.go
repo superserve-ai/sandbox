@@ -1998,18 +1998,18 @@ func readLayeredBase(memPath string) (string, bool) {
 // read once per daemon and every later create from it costs a map lookup.
 // Any other image is read each time. An error is not kept.
 func (m *Manager) imageManifestCached(memPath string) (*WallClockManifest, error) {
-	root := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName) + string(filepath.Separator)
-	if m.cfg.SnapshotDir == "" || !strings.HasPrefix(memPath, root) {
+	if !m.isTemplateMemPath(memPath) {
 		return imageManifest(memPath)
 	}
-	if v, ok := m.templateManifests.Load(memPath); ok {
+	key := filepath.Clean(memPath)
+	if v, ok := m.templateManifests.Load(key); ok {
 		return v.(*WallClockManifest), nil
 	}
 	man, err := imageManifest(memPath)
 	if err != nil {
 		return nil, err
 	}
-	m.templateManifests.Store(memPath, man)
+	m.templateManifests.Store(key, man)
 	return man, nil
 }
 

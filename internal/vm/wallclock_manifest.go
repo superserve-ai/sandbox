@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
@@ -52,12 +53,13 @@ const wakeProtocolEvidenceNote = "this host has held images that owe a wake\n"
 var wakeProtocolEvidenceDone atomic.Bool
 
 // RecognizeWakeProtocolFloor notes, at startup, evidence a previous process
-// made durable. It never writes.
+// made durable. It never writes. Existence is the fact, as it is for the
+// host guard: the file is only ever created whole, so its size says nothing.
 func RecognizeWakeProtocolFloor() bool {
 	if wakeProtocolEvidenceDone.Load() {
 		return true
 	}
-	if st, err := os.Stat(wakeProtocolEvidencePath); err == nil && st.Size() > 0 {
+	if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
 		wakeProtocolEvidenceDone.Store(true)
 		return true
 	}
@@ -72,20 +74,34 @@ func wakeProtocolFloorRaised() bool { return wakeProtocolEvidenceDone.Load() }
 // RaiseWakeProtocolFloor durably records that this host holds, or is about to
 // hold, an image that owes a wake. The template builder calls it before it
 // publishes a frozen image, so the floor is up before the artifact exists.
+// Created once and whole: an existing file is left as it is, and a new one
+// appears by rename, so no crash and no concurrent build can leave an empty
+// file that one reader honours and another does not.
 func RaiseWakeProtocolFloor() error {
-	f, err := os.OpenFile(wakeProtocolEvidencePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if RecognizeWakeProtocolFloor() {
+		return nil
+	}
+	tmp := wakeProtocolEvidencePath + ".tmp." + strconv.Itoa(os.Getpid())
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
 	if _, err := f.WriteString(wakeProtocolEvidenceNote); err != nil {
 		f.Close()
+		os.Remove(tmp)
 		return err
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
+		os.Remove(tmp)
 		return err
 	}
 	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, wakeProtocolEvidencePath); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	if err := syncDir(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
@@ -131,8 +147,14 @@ func ReadWallClockManifest(memPath string) (*WallClockManifest, error) {
 	if m.Version != WallClockManifestVersion {
 		return nil, fmt.Errorf("%w: %s: version %d, this supervisor speaks %d", ErrWallClockManifest, WallClockMarkerPath(memPath), m.Version, WallClockManifestVersion)
 	}
-	if m.WorkloadFrozen && m.FreezeToken == "" {
-		return nil, fmt.Errorf("%w: %s: frozen workload without a freeze token", ErrWallClockManifest, WallClockMarkerPath(memPath))
+	// The fields are protocol and recovery invariants: a manifest names its
+	// artifact, and a frozen workload carries the token its wake must present
+	// and comes from a guest that will correct its clock once woken.
+	if m.ArtifactID == "" {
+		return nil, fmt.Errorf("%w: %s: no artifact id", ErrWallClockManifest, WallClockMarkerPath(memPath))
+	}
+	if m.WorkloadFrozen && (m.FreezeToken == "" || !m.GuestCorrectsClock) {
+		return nil, fmt.Errorf("%w: %s: frozen workload without a freeze token, or from a guest that does not correct its clock", ErrWallClockManifest, WallClockMarkerPath(memPath))
 	}
 	return &m, nil
 }
