@@ -158,8 +158,11 @@ func TestRaiseWakeProtocolFloorIsDurable(t *testing.T) {
 	if !RecognizeWakeProtocolFloor() {
 		t.Fatal("an empty evidence file was not recognised")
 	}
-	if err := RaiseWakeProtocolFloor(); err != nil {
-		t.Fatal(err)
+	// A raise over a file this process has not proven durable syncs the
+	// directory and counts it, without rewriting it.
+	wakeProtocolEvidenceDone.Store(false)
+	if err := RaiseWakeProtocolFloor(); err != nil || !wakeProtocolFloorRaised() {
+		t.Fatalf("err=%v raised=%v; want the existing file counted once its directory is synced", err, wakeProtocolFloorRaised())
 	}
 	if b, _ := os.ReadFile(wakeProtocolEvidencePath); len(b) != 0 {
 		t.Errorf("existing evidence rewritten: %q", b)

@@ -78,7 +78,17 @@ func wakeProtocolFloorRaised() bool { return wakeProtocolEvidenceDone.Load() }
 // appears by rename, so no crash and no concurrent build can leave an empty
 // file that one reader honours and another does not.
 func RaiseWakeProtocolFloor() error {
-	if RecognizeWakeProtocolFloor() {
+	if wakeProtocolEvidenceDone.Load() {
+		return nil
+	}
+	if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
+		// Present, but not proven durable by this process: a raise whose
+		// directory sync failed leaves the file visible all the same. Sync
+		// the directory before this one counts it.
+		if err := syncDir(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
+			return err
+		}
+		wakeProtocolEvidenceDone.Store(true)
 		return nil
 	}
 	tmp := wakeProtocolEvidencePath + ".tmp." + strconv.Itoa(os.Getpid())
