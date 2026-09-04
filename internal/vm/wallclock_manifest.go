@@ -42,11 +42,13 @@ const WakeProtocolVersion = 1
 
 // wakeProtocolEvidencePath records that this host has held an image that
 // owes a wake, so the host-resident guard refuses a vmd without the wake
-// protocol from then on. Raised by the template builder before it publishes
-// a frozen image, and by a supervisor before it acts on one. A supervisor
-// that only starts creates none, or every host would raise the floor with
-// both switches off and block a rollback of itself. A host without the
-// directory is not a fleet host.
+// protocol from then on. It is the guard's only witness — a host holds far
+// too many images to walk at every start — so it is raised before such an
+// image can exist here: by the template builder before it publishes a frozen
+// template, by a supervisor before it freezes or restores one, and by any
+// import of one from elsewhere. A supervisor that only starts creates none,
+// or every host would raise the floor with both switches off and block a
+// rollback of itself. A host without the directory is not a fleet host.
 var wakeProtocolEvidencePath = "/var/lib/sandbox/wake-protocol-evidence"
 
 // wakeProtocolEvidenceNote is what the evidence file says. The guard only

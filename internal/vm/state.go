@@ -321,18 +321,6 @@ func WriteStateBreadcrumb(statePath string) error {
 	return writeStateBreadcrumbTo(StateBreadcrumbPath, statePath)
 }
 
-// SnapshotDirBreadcrumbPath is where the daemon records its resolved snapshot
-// directory at start, for the wake-floor guard: it reads this rather than
-// parsing env files, for the same reason the rollback guard reads the state
-// path. Absent means the daemon has never run on the host.
-const SnapshotDirBreadcrumbPath = "/var/lib/sandbox/vmd-snapshot-dir"
-
-// WriteSnapshotDirBreadcrumb records the resolved snapshot directory
-// atomically, as WriteStateBreadcrumb does.
-func WriteSnapshotDirBreadcrumb(snapshotDir string) error {
-	return writeStateBreadcrumbTo(SnapshotDirBreadcrumbPath, snapshotDir)
-}
-
 func writeStateBreadcrumbTo(at, statePath string) error {
 	if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
 		return fmt.Errorf("state breadcrumb dir: %w", err)

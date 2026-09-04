@@ -7,49 +7,33 @@
 #
 # An image whose workload was frozen for its snapshot owes a wake that only a
 # vmd speaking the protocol can give; any other vmd restores it and leaves it
-# stopped. Two witnesses, either blocks a vmd without the protocol: the
-# evidence file the daemon writes when it first acts on such an image, and
-# the images themselves — templates and paused sandboxes alike — so one that
-# landed moments ago still counts.
+# stopped. The one witness is the evidence file, which whatever puts such an
+# image on this host writes first: the template builder before it publishes
+# a frozen template, the daemon before it freezes or restores one, and any
+# import of one from elsewhere. Nothing here walks the snapshot trees: a host
+# holds far too many images for a walk at every start, so the witness has to
+# be there before the image is.
 set -u
 BIN="${1:-/usr/local/bin/vmd}"
+WAKE_EVIDENCE=/var/lib/sandbox/wake-protocol-evidence
 
-# A binary that carries the capability is admitted before anything else is
-# looked at: one pass over the binary, bounded by its size, and no walk of the
-# snapshot trees whatever they hold.
-if grep -qa wake-protocol-1 "$BIN" 2>/dev/null; then
+# One stat. Absent: no frozen image has ever been about to exist here, and
+# any vmd may start. A directory that exists but cannot be read is not
+# absence: refuse rather than guess.
+dir=$(dirname "$WAKE_EVIDENCE")
+if [ -d "$dir" ] && { [ ! -r "$dir" ] || [ ! -x "$dir" ]; }; then
+    echo "vmd-wake-floor-guard: cannot read ${dir}; refusing to start a vmd whose wake capability cannot be checked against it" >&2
+    exit 1
+fi
+if [ ! -e "$WAKE_EVIDENCE" ]; then
     exit 0
 fi
 
-refuse() {
-    echo "vmd-wake-floor-guard: REFUSING to start a vmd without the wake protocol: this host holds images that owe a wake ($1)" >&2
-    echo "vmd-wake-floor-guard: deploy a wake-capable build; the floor comes down only once no frozen image can be restored here" >&2
-    exit 1
-}
-
-# The daemon writes both witnesses' locations: the evidence file when it
-# first acts on such an image, and its resolved snapshot directory at every
-# start, read here rather than parsed out of env files, as the rollback guard
-# reads the state path. No breadcrumb means the daemon has never run here.
-WAKE_EVIDENCE=/var/lib/sandbox/wake-protocol-evidence
-SNAPSHOTS=$(head -n 1 /var/lib/sandbox/vmd-snapshot-dir 2>/dev/null)
-SNAPSHOTS="${SNAPSHOTS:-/var/lib/sandbox/snapshots}"
-[ -e "$WAKE_EVIDENCE" ] && refuse "$WAKE_EVIDENCE"
-
-# The walk runs only for a binary without the capability, so its cost lands
-# on a rollback, never on an ordinary start. find batches the paths itself,
-# so no argument list can overflow; grep's "no match" is folded into success
-# so that any other failure — an unreadable directory, a grep that could not
-# run — reaches rc, and a walk that cannot complete blocks rather than
-# reading as "nothing found".
-if [ -d "$SNAPSHOTS" ]; then
-    matches=$(find "$SNAPSHOTS" -mindepth 2 -maxdepth 4 -type f -name '*.wallclock' \
-        -exec sh -c 'grep -l "$0" "$@" || [ $? -eq 1 ]' '"workload_frozen":true' {} + 2>&1)
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
-        echo "vmd-wake-floor-guard: cannot tell whether ${SNAPSHOTS} holds a frozen image (${matches}); refusing to start a vmd without the wake protocol" >&2
-        exit 1
-    fi
-    [ -n "$matches" ] && refuse "frozen image manifest under ${SNAPSHOTS}"
+# Evidence present: only a binary carrying the capability may start. One
+# pass over the binary, bounded by its size; a grep that cannot run refuses.
+if grep -qa wake-protocol-1 "$BIN" 2>/dev/null; then
+    exit 0
 fi
-exit 0
+echo "vmd-wake-floor-guard: REFUSING to start a vmd without the wake protocol: this host holds images that owe a wake (${WAKE_EVIDENCE})" >&2
+echo "vmd-wake-floor-guard: deploy a wake-capable build; the floor comes down only once no frozen image can be restored here" >&2
+exit 1

@@ -1562,12 +1562,8 @@ func main() {
 	// close that window would cost every restart more than it saves.
 	mgr.WatchFirecrackerCapability(ctx, log)
 	// Evidence a previous process made durable is recognised; starting a vmd
-	// creates none. The snapshot directory is recorded for the guard that
-	// checks such evidence at every start.
+	// creates none.
 	vm.RecognizeWakeProtocolFloor()
-	if err := vm.WriteSnapshotDirBreadcrumb(cfg.SnapshotDir); err != nil {
-		log.Warn().Err(err).Msg("snapshot directory breadcrumb not written; the wake-floor guard falls back to the default location")
-	}
 
 	// ---- Background full reattach ----
 	// Off the critical path (requests load their VM on demand); proactively
