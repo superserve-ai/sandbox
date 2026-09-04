@@ -366,6 +366,8 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 				} else {
 					remaining := math.Max(v-applied, 0)
 					stripeApplied, stripeRemaining = &applied, &remaining
+					payable := stripeExpectedInvoiceAmount(charges.CurrentChargesUSD, applied)
+					expectedInvoice = &payable
 				}
 				creditStatus = "available"
 				observed = &cb.ObservedAt
@@ -411,6 +413,10 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		},
 		CalculatedAt: now,
 	})
+}
+
+func stripeExpectedInvoiceAmount(currentChargesUSD, appliedCreditUSD float64) float64 {
+	return math.Max(currentChargesUSD-appliedCreditUSD, 0)
 }
 
 func billingAccountHasStripeCreditState(account db.GetTeamBillingAccountRow) bool {

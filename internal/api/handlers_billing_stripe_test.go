@@ -185,6 +185,15 @@ func TestStripeCreditBalanceRejectsPartiallyMalformedBalances(t *testing.T) {
 	}
 }
 
+func TestStripeExpectedInvoiceAmountClampsPayableEstimate(t *testing.T) {
+	if got := stripeExpectedInvoiceAmount(30, 20); got != 10 {
+		t.Fatalf("expected payable estimate = %v, want 10", got)
+	}
+	if got := stripeExpectedInvoiceAmount(20, 30); got != 0 {
+		t.Fatalf("expected payable estimate = %v, want 0", got)
+	}
+}
+
 func (r *stripeCheckoutSessionRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
