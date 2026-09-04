@@ -52,7 +52,7 @@ var seedentropyBinary []byte
 //	/sbin/init                 (0755)  — shell wrapper that execs tini
 //
 // Returns the byte count of the boxd binary copied, for observability.
-func injectGuestAgent(rootfsDir, boxdBinaryPath string, logger *zerolog.Logger) (int64, error) {
+func injectGuestAgent(rootfsDir, boxdBinaryPath string, freezeWorkload bool, logger *zerolog.Logger) (int64, error) {
 	if boxdBinaryPath == "" {
 		return 0, fmt.Errorf("boxd binary path is empty")
 	}
@@ -95,7 +95,7 @@ func injectGuestAgent(rootfsDir, boxdBinaryPath string, logger *zerolog.Logger) 
 	}
 	initPath := filepath.Join(rootfsDir, "sbin/init")
 	_ = os.Remove(initPath)
-	if err := os.WriteFile(initPath, []byte(initScript), 0o755); err != nil {
+	if err := os.WriteFile(initPath, []byte(initScriptFor(freezeWorkload)), 0o755); err != nil {
 		return 0, fmt.Errorf("write /sbin/init: %w", err)
 	}
 	if err := os.Chmod(initPath, 0o755); err != nil {
@@ -347,7 +347,7 @@ options timeout:2 attempts:2
 //	to tini cleanly via exec (shell process is replaced, tini becomes PID 1).
 //
 // POSIX sh is assumed; all our allowed base images (debian, ubuntu) have it.
-const initScript = `#!/bin/sh
+const initScriptTemplate = `#!/bin/sh
 # Superserve template init — mounts essentials, then execs tini to become
 # PID 1 proper. See docs/INIT_STRATEGY.md for why this exists.
 
@@ -361,7 +361,7 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null
 mkdir -p /dev/pts /home/user
 mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666 2>/dev/null
 
-# Seed the kernel entropy pool. Firecracker VMs lack virtio-rng and
+%s# Seed the kernel entropy pool. Firecracker VMs lack virtio-rng and
 # RDRAND, so getrandom() blocks until entropy is credited. The
 # seedentropy binary reads /proc/interrupts + clock and injects it
 # via RNDADDENTROPY ioctl, unblocking TLS for pip/curl/etc.
@@ -373,6 +373,29 @@ mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666 2>/dev/null
 # boxd on graceful VM shutdown.
 exec /usr/local/bin/tini -- /usr/bin/boxd
 `
+
+// initFreezerBlock mounts the workload freezer. Only an image built to freeze
+// its workload carries it; without the mount boxd runs commands unwrapped, so
+// an image built with the switch off behaves exactly as before it existed.
+const initFreezerBlock = `# Freezer cgroup for the workload, so a snapshot can be taken with it stopped.
+mount -t tmpfs cgroup_root /sys/fs/cgroup 2>/dev/null
+mkdir -p /sys/fs/cgroup/freezer
+mount -t cgroup -o freezer freezer /sys/fs/cgroup/freezer 2>/dev/null
+mkdir -p /sys/fs/cgroup/freezer/workload
+# A process joins the cgroup itself, as whatever user it runs as.
+chmod 666 /sys/fs/cgroup/freezer/workload/cgroup.procs /sys/fs/cgroup/freezer/workload/tasks 2>/dev/null
+# Tell boxd where the freezer is, so it never has to look.
+export BOXD_WORKLOAD_FREEZER=/sys/fs/cgroup/freezer/workload
+
+`
+
+func initScriptFor(freezeWorkload bool) string {
+	block := ""
+	if freezeWorkload {
+		block = initFreezerBlock
+	}
+	return fmt.Sprintf(initScriptTemplate, block)
+}
 
 // copyFile copies src → dst, creating parent directories as needed. Overwrites
 // dst if it exists. Returns bytes written.
