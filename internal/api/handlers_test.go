@@ -982,9 +982,8 @@ func snapshotRow(s db.Snapshot) *mockRow {
 	}}
 }
 
-// claimResumeRow mocks ClaimResume's RETURNING: the sandbox columns, then
-// the joined snapshot paths, policy, aggregated ports, and template base
-// path. A nil snap models a missing snapshot row.
+// claimResumeRow mocks ClaimResume's RETURNING; a nil snap models a
+// missing snapshot row.
 func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, ports ...publishedPortResponse) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		if err := sandboxRow(sb).scanFn(dest[:26]...); err != nil {

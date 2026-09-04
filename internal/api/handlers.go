@@ -813,10 +813,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return "", false
 	}
 
-	// One round trip for the claim and everything the boot RPC needs: the
-	// advisory lock attach and detach take, paused→resuming, and the row with
-	// its snapshot paths, preview policy, published ports, and template base
-	// path (see ClaimResume).
+	// One statement for the claim and the boot inputs; see ClaimResume.
 	claimed, err := h.DB.ClaimResume(c.Request.Context(), db.ClaimResumeParams{
 		ID:      sandboxID,
 		TeamID:  teamID,

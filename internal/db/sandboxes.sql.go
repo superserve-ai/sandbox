@@ -601,17 +601,13 @@ type ClaimResumeRow struct {
 	TemplateBasePath  *string  `json:"template_base_path"`
 }
 
-// The resume claim and everything the boot RPC needs in one round trip:
-// paused→resuming, the snapshot's artifact paths, the preview policy with
-// its published ports, and the template base path for rows that predate
-// base_path pinning. The advisory lock is the one attach and detach take
-// before re-reading status. It is acquired before the row is updated and
-// released at statement end, so the returned row and the binding set agree:
-// a mutation holding the lock lands first and shows in the row, or arrives
-// later and sees 'resuming'. The side joins are LEFT so a missing snapshot
-// row (NULL snap_path) or a legacy sandbox with no policy row still returns
-// the claimed row for the caller to handle. 0 rows means another resume
-// claimed it or it is not paused.
+// The paused→resuming claim plus the boot inputs in one round trip:
+// snapshot paths, preview policy with published ports, template base path.
+// The advisory lock is the one attach/detach take before re-reading
+// status; taken before the update and held to statement end, so the
+// returned row already reflects a binding mutation that beat the claim.
+// LEFT joins keep the row when the snapshot or policy row is missing.
+// 0 rows: not paused, or another resume claimed it.
 func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (ClaimResumeRow, error) {
 	row := q.db.QueryRow(ctx, claimResume, arg.LockKey, arg.ID, arg.TeamID)
 	var i ClaimResumeRow
