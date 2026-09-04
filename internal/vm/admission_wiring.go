@@ -1,0 +1,214 @@
+package vm
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/superserve-ai/sandbox/internal/admission"
+)
+
+// admissionReadyPoll is how often the readiness transition re-checks
+// whether the daemon has finished working out what it is carrying.
+// Startup-only and bounded by reattach, so the cost is a handful of atomic
+// loads across a window already dominated by reattaching VMs.
+var admissionReadyPoll = 250 * time.Millisecond
+
+// AdmissionGate exposes the gate for the RPC surface and for drain.
+func (m *Manager) AdmissionGate() *admission.Gate { return m.admission }
+
+// StartAdmission brings the gate into service once the daemon knows what
+// this host is already running, and never before.
+//
+// Runs as a background transition rather than from a request. The RPC
+// server serves throughout a restart, so a create can arrive before reattach
+// finishes; a gate that rebuilt lazily on that first request would block it
+// behind fleet-sized work. Until this completes the gate admits and charges
+// without enforcing, so the wait costs correctness of the limit rather than
+// availability of the host.
+func (m *Manager) StartAdmission(ctx context.Context) {
+	if !m.admission.Enabled() {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(admissionReadyPoll)
+		defer ticker.Stop()
+		for {
+			// PressureReady is exactly this condition already: reattach
+			// complete, the surviving-builder scan finished, and no
+			// leftover build cgroup or unit still possibly alive. Reused
+			// rather than duplicated — a second readiness rule would be
+			// one more thing to keep in agreement with the first.
+			if m.PressureReady() {
+				if err := m.reconstructAdmission(); err != nil {
+					// Stay in the permissive rebuild state and retry on the
+					// next tick. Not enforcing for another interval is
+					// recoverable; opening against a ledger known to be
+					// incomplete would enforce a limit lower than reality
+					// and refuse creates this host has room for.
+					m.log.Error().Err(err).
+						Msg("admission reconstruction failed; not yet enforcing, retrying")
+					break
+				}
+				m.admission.Open()
+				m.log.Info().Int("charged", m.admission.Charged()).
+					Msg("host-local admission open")
+				go m.auditAdmissionLoop(ctx)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+// reconstructAdmission seeds the ledger from everything this host is
+// holding capacity for, and reports whether it managed to.
+//
+// Persisted records, not live instances: a sandbox paused on this host owns
+// its slot for its whole host-owned lifetime, and it has no live instance to
+// enumerate. Reading the store is what makes a restarted daemon charge for
+// the paused sandboxes it is still responsible for, rather than treating a
+// restart as a way to forget them.
+//
+// The error is the contract. A caller that opened the gate anyway would be
+// opening an empty or partial ledger, which is not a weaker limit but no
+// limit at all — the failure mode this whole gate exists to prevent. Every
+// caller must leave the gate closed and try again.
+//
+// The generation is taken BEFORE the store read and handed back after, so a
+// create admitted while the read was in flight keeps its charge instead of
+// being erased by a snapshot that predates it.
+func (m *Manager) reconstructAdmission() error {
+	if !m.admission.Enabled() {
+		return nil
+	}
+	since := m.admission.BeginReconstruct()
+	var sandboxIDs []string
+	if m.state != nil {
+		records, err := m.state.All()
+		if err != nil {
+			return fmt.Errorf("read persisted vm records: %w", err)
+		}
+		for _, rec := range records {
+			// Builds are counted from the live registry below. A
+			// build-prefixed record is either that same build — which
+			// would then be charged twice — or residue of one that has
+			// already exited and holds nothing.
+			if isBuildVM(rec.ID) {
+				continue
+			}
+			sandboxIDs = append(sandboxIDs, rec.ID)
+		}
+	}
+	m.admission.Reconstruct(since, sandboxIDs, m.liveBuildIDs())
+	return nil
+}
+
+// liveBuildIDs returns builds whose subprocess may still hold capacity.
+//
+// Terminal records are skipped: the registry retains them for status
+// polling long after the worker exits, so charging them would leak a token
+// per completed build until the daemon restarted.
+func (m *Manager) liveBuildIDs() []string {
+	m.buildsMu.Lock()
+	defer m.buildsMu.Unlock()
+	var ids []string
+	for id, rec := range m.builds {
+		if rec == nil || rec.Status.IsTerminal() {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// deleteRecord removes a VM's persisted record and releases the capacity it
+// was holding.
+//
+// The two belong together: the ledger is reconstructed from persisted
+// records, so a record that disappears without its token being released
+// leaves a charge no restart could explain and no audit could attribute.
+// Every caller that retires a record routes through here for that reason —
+// a release bolted onto each call site individually is one forgotten site
+// away from a slow capacity leak.
+//
+// Release is unconditional on the delete succeeding. A record that survives
+// a failed delete keeps its token, which is the fail-closed direction: the
+// host may under-admit briefly, but it cannot over-admit against a sandbox
+// still on disk.
+func (m *Manager) deleteRecord(vmID string) error {
+	if err := m.state.Delete(vmID); err != nil {
+		return err
+	}
+	m.admission.Release(vmID)
+	return nil
+}
+
+// admissionAuditInterval is how often the ledger is checked against
+// observed load. Slow on purpose: an undercount is a bug, not an expected
+// condition, and each pass walks the fleet. Frequent enough that a leak is
+// caught in minutes rather than at the next restart.
+var admissionAuditInterval = 2 * time.Minute
+
+// auditAdmissionLoop re-checks the ledger for as long as the daemon runs.
+// Its own goroutine because the check walks the fleet and must never sit on
+// a request path, and because closing the gate mid-audit has to be able to
+// happen without a caller waiting on it.
+func (m *Manager) auditAdmissionLoop(ctx context.Context) {
+	ticker := time.NewTicker(admissionAuditInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.AuditAdmission()
+		}
+	}
+}
+
+// AuditAdmission re-derives the ledger from the daemon's authoritative
+// state, and treats an undercount as urgent enough to stop admitting first.
+//
+// Two different problems, handled differently:
+//
+// An UNDERCOUNT — more running than charged — means the host may be
+// admitting against a limit it has already exceeded, so the gate closes
+// before the rebuild rather than after. The comparison is one-directional
+// for that decision: capacity pressure is an eventually consistent sample
+// that can be taken before a just-admitted sandbox materializes, so seeing
+// FEWER than the ledger holds is ordinary and must never close the gate.
+//
+// An OVERCOUNT — a token whose work is long gone — is the opposite: it
+// silently shrinks the host until a restart, and no sampled comparison can
+// safely detect it. The unconditional rebuild is what collects those,
+// because it derives the ledger from persisted records and the live build
+// registry rather than adjusting it. That is safe to run while open only
+// because the rebuild is generation-bound: anything admitted while it reads
+// survives, so an in-flight create cannot lose its charge to it.
+func (m *Manager) AuditAdmission() {
+	if !m.admission.Enabled() {
+		return
+	}
+	p := m.CapacityPressure()
+	observed := int(p.RunningSandboxes + p.ProvisioningSandboxes + p.PausedSandboxes)
+	if m.admission.AuditUndercount(observed) {
+		// Logged, not answered by closing the gate. Closing would drop this
+		// host into the permissive rebuild state, which enforces nothing —
+		// exactly the condition an undercount already describes. The
+		// rebuild below is the actual fix, it derives from authoritative
+		// state rather than adjusting, and it completes in a store read.
+		m.log.Error().Int("observed", observed).Int("charged", m.admission.Charged()).
+			Msg("admission ledger undercounts live sandboxes; rebuilding")
+	}
+	if err := m.reconstructAdmission(); err != nil {
+		// The previous ledger stands. Stale and enforcing beats fresh and
+		// empty: an incomplete rebuild would hand back a count lower than
+		// the truth, which is the over-admission this exists to prevent.
+		m.log.Error().Err(err).Msg("admission rebuild failed; keeping the existing ledger")
+	}
+}

@@ -119,6 +119,11 @@ func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB ui
 	if existing, ok := m.builds[buildVMID]; ok && !existing.Status.IsTerminal() {
 		return nil, fmt.Errorf("build %s already in flight", buildVMID)
 	}
+	// Builds hold a sandbox token because their pressure is published as
+	// provisioning sandboxes and placement ranks against that number —
+	// exempting them here would enforce a different limit than the one the
+	// scheduler believes in. Charged just below, once the record exists to
+	// own the charge; released at worker exit, see buildTemplateWorker.
 	rec := &buildRecord{
 		BuildVMID:  buildVMID,
 		TemplateID: templateID,
@@ -128,6 +133,17 @@ func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB ui
 		StartedAt:  time.Now(),
 		cancel:     cancel,
 		logs:       newBuildLogBuffer(),
+	}
+	// Charged against this record, not just the id: completeBuild already
+	// tolerates a replaced generation whose old worker is still winding
+	// down, and that outgoing worker releases on its way out. Keying the
+	// charge to the record makes its release a no-op once this one owns
+	// the id, instead of freeing the replacement's capacity.
+	if err := m.admission.AdmitBuild(buildVMID, rec); err != nil {
+		// Refused before publication, so a rejected build leaves no
+		// registry entry to unwind and no id a later retry has to work
+		// around.
+		return nil, err
 	}
 	m.builds[buildVMID] = rec
 	// Pressure counters pair with the worker-exit release in

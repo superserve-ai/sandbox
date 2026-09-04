@@ -29,6 +29,7 @@ on:
       # Every internal package the host binaries import must be listed, or a
       # change to it merges without deploying. Enforced by the
       # deploy-trigger-coverage CI check against `go list -deps`.
+      - 'internal/admission/**'
       - 'internal/backup/**'
       - 'internal/blocklist/**'
       - 'internal/builder/**'

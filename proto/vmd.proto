@@ -375,6 +375,28 @@ message ArtifactManifestEntry {
 // ResumeVM (wake from snapshot)
 // ---------------------------------------------------------------------------
 
+// Why a boot is happening, as the caller understands it. The daemon cannot
+// derive this: a sandbox that already exists may still arrive through the
+// snapshot-restore RPC — the caller's stateless fallback, taken precisely
+// when the daemon has no record of the VM — so neither the RPC used nor
+// "does this daemon remember the id" separates the two. Both inferences are
+// wrong in exactly the case that matters.
+enum AdmissionIntent {
+  // Sender predates this field. Follows legacy behavior while host-local
+  // admission is off, and is refused once it is on, so an unsafe version
+  // skew surfaces as an error rather than a silent guess in one direction.
+  ADMISSION_INTENT_UNSPECIFIED = 0;
+  // A sandbox that does not exist yet. Subject to the operator's
+  // concurrent-sandbox limit, and rejectable — the caller can place it on
+  // another host.
+  ADMISSION_INTENT_CREATE = 1;
+  // A sandbox that already exists and is bound to this host. Never refused
+  // on the operator's sandbox limit: it has nowhere else to go, and
+  // refusing it would strand a paused sandbox. Physical ceilings still
+  // apply.
+  ADMISSION_INTENT_RESUME = 2;
+}
+
 message ResumeVMRequest {
   string vm_id = 1;
   string snapshot_path = 2;
@@ -383,6 +405,11 @@ message ResumeVMRequest {
   map<string, string> env_vars = 5;          // Re-inject env vars after resume.
   reserved 6;                                 // was secrets_broker (SecretsBrokerConfig)
   reserved "secrets_broker";
+  // Declared rather than assumed even here, where RESUME is the only
+  // sensible value: the daemon refuses UNSPECIFIED under local admission,
+  // so a caller that sets the field on one boot path but not the other
+  // fails on whichever it forgot. One rule for every boot-capable RPC.
+  AdmissionIntent admission_intent = 7;
 }
 
 message ResumeVMResponse {
@@ -445,6 +472,10 @@ message RestoreSnapshotRequest {
   repeated PreviewPort preview_ports = 13;
   // Monotonic generation used to reject stale full-allowlist pushes.
   int64 preview_policy_revision = 14;
+  // CREATE for a new sandbox, RESUME when this RPC is serving the caller's
+  // stateless-resume fallback for a sandbox that already exists. The daemon
+  // has no way to tell those apart on its own — see AdmissionIntent.
+  AdmissionIntent admission_intent = 15;
 }
 
 message PreviewPort {

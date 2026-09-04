@@ -21,6 +21,71 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Why a boot is happening, as the caller understands it. The daemon cannot
+// derive this: a sandbox that already exists may still arrive through the
+// snapshot-restore RPC — the caller's stateless fallback, taken precisely
+// when the daemon has no record of the VM — so neither the RPC used nor
+// "does this daemon remember the id" separates the two. Both inferences are
+// wrong in exactly the case that matters.
+type AdmissionIntent int32
+
+const (
+	// Sender predates this field. Follows legacy behavior while host-local
+	// admission is off, and is refused once it is on, so an unsafe version
+	// skew surfaces as an error rather than a silent guess in one direction.
+	AdmissionIntent_ADMISSION_INTENT_UNSPECIFIED AdmissionIntent = 0
+	// A sandbox that does not exist yet. Subject to the operator's
+	// concurrent-sandbox limit, and rejectable — the caller can place it on
+	// another host.
+	AdmissionIntent_ADMISSION_INTENT_CREATE AdmissionIntent = 1
+	// A sandbox that already exists and is bound to this host. Never refused
+	// on the operator's sandbox limit: it has nowhere else to go, and
+	// refusing it would strand a paused sandbox. Physical ceilings still
+	// apply.
+	AdmissionIntent_ADMISSION_INTENT_RESUME AdmissionIntent = 2
+)
+
+// Enum value maps for AdmissionIntent.
+var (
+	AdmissionIntent_name = map[int32]string{
+		0: "ADMISSION_INTENT_UNSPECIFIED",
+		1: "ADMISSION_INTENT_CREATE",
+		2: "ADMISSION_INTENT_RESUME",
+	}
+	AdmissionIntent_value = map[string]int32{
+		"ADMISSION_INTENT_UNSPECIFIED": 0,
+		"ADMISSION_INTENT_CREATE":      1,
+		"ADMISSION_INTENT_RESUME":      2,
+	}
+)
+
+func (x AdmissionIntent) Enum() *AdmissionIntent {
+	p := new(AdmissionIntent)
+	*p = x
+	return p
+}
+
+func (x AdmissionIntent) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (AdmissionIntent) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_vmd_proto_enumTypes[0].Descriptor()
+}
+
+func (AdmissionIntent) Type() protoreflect.EnumType {
+	return &file_proto_vmd_proto_enumTypes[0]
+}
+
+func (x AdmissionIntent) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use AdmissionIntent.Descriptor instead.
+func (AdmissionIntent) EnumDescriptor() ([]byte, []int) {
+	return file_proto_vmd_proto_rawDescGZIP(), []int{0}
+}
+
 type VMStatus int32
 
 const (
@@ -63,11 +128,11 @@ func (x VMStatus) String() string {
 }
 
 func (VMStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_proto_vmd_proto_enumTypes[0].Descriptor()
+	return file_proto_vmd_proto_enumTypes[1].Descriptor()
 }
 
 func (VMStatus) Type() protoreflect.EnumType {
-	return &file_proto_vmd_proto_enumTypes[0]
+	return &file_proto_vmd_proto_enumTypes[1]
 }
 
 func (x VMStatus) Number() protoreflect.EnumNumber {
@@ -76,7 +141,7 @@ func (x VMStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use VMStatus.Descriptor instead.
 func (VMStatus) EnumDescriptor() ([]byte, []int) {
-	return file_proto_vmd_proto_rawDescGZIP(), []int{0}
+	return file_proto_vmd_proto_rawDescGZIP(), []int{1}
 }
 
 type BuildTemplateRequest struct {
@@ -1708,8 +1773,13 @@ type ResumeVMRequest struct {
 	MemFilePath    string                 `protobuf:"bytes,3,opt,name=mem_file_path,json=memFilePath,proto3" json:"mem_file_path,omitempty"`
 	SandboxNetwork *SandboxNetworkConfig  `protobuf:"bytes,4,opt,name=sandbox_network,json=sandboxNetwork,proto3" json:"sandbox_network,omitempty"`                                                      // Reapply egress rules after resume.
 	EnvVars        map[string]string      `protobuf:"bytes,5,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // Re-inject env vars after resume.
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Declared rather than assumed even here, where RESUME is the only
+	// sensible value: the daemon refuses UNSPECIFIED under local admission,
+	// so a caller that sets the field on one boot path but not the other
+	// fails on whichever it forgot. One rule for every boot-capable RPC.
+	AdmissionIntent AdmissionIntent `protobuf:"varint,7,opt,name=admission_intent,json=admissionIntent,proto3,enum=superserve.vmd.v1.AdmissionIntent" json:"admission_intent,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ResumeVMRequest) Reset() {
@@ -1775,6 +1845,13 @@ func (x *ResumeVMRequest) GetEnvVars() map[string]string {
 		return x.EnvVars
 	}
 	return nil
+}
+
+func (x *ResumeVMRequest) GetAdmissionIntent() AdmissionIntent {
+	if x != nil {
+		return x.AdmissionIntent
+	}
+	return AdmissionIntent_ADMISSION_INTENT_UNSPECIFIED
 }
 
 type ResumeVMResponse struct {
@@ -2004,8 +2081,12 @@ type RestoreSnapshotRequest struct {
 	PreviewPorts  []*PreviewPort `protobuf:"bytes,13,rep,name=preview_ports,json=previewPorts,proto3" json:"preview_ports,omitempty"`
 	// Monotonic generation used to reject stale full-allowlist pushes.
 	PreviewPolicyRevision int64 `protobuf:"varint,14,opt,name=preview_policy_revision,json=previewPolicyRevision,proto3" json:"preview_policy_revision,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// CREATE for a new sandbox, RESUME when this RPC is serving the caller's
+	// stateless-resume fallback for a sandbox that already exists. The daemon
+	// has no way to tell those apart on its own — see AdmissionIntent.
+	AdmissionIntent AdmissionIntent `protobuf:"varint,15,opt,name=admission_intent,json=admissionIntent,proto3,enum=superserve.vmd.v1.AdmissionIntent" json:"admission_intent,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RestoreSnapshotRequest) Reset() {
@@ -2127,6 +2208,13 @@ func (x *RestoreSnapshotRequest) GetPreviewPolicyRevision() int64 {
 		return x.PreviewPolicyRevision
 	}
 	return 0
+}
+
+func (x *RestoreSnapshotRequest) GetAdmissionIntent() AdmissionIntent {
+	if x != nil {
+		return x.AdmissionIntent
+	}
+	return AdmissionIntent_ADMISSION_INTENT_UNSPECIFIED
 }
 
 type PreviewPort struct {
@@ -3948,13 +4036,14 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x12\x16\n" +
 	"\x06sha256\x18\x04 \x01(\tR\x06sha256\x12\x1b\n" +
 	"\tbase_path\x18\x05 \x01(\tR\bbasePath\x12'\n" +
-	"\x0fallocated_bytes\x18\x06 \x01(\x03R\x0eallocatedBytes\"\xdf\x02\n" +
+	"\x0fallocated_bytes\x18\x06 \x01(\x03R\x0eallocatedBytes\"\xae\x03\n" +
 	"\x0fResumeVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12P\n" +
 	"\x0fsandbox_network\x18\x04 \x01(\v2'.superserve.vmd.v1.SandboxNetworkConfigR\x0esandboxNetwork\x12J\n" +
-	"\benv_vars\x18\x05 \x03(\v2/.superserve.vmd.v1.ResumeVMRequest.EnvVarsEntryR\aenvVars\x1a:\n" +
+	"\benv_vars\x18\x05 \x03(\v2/.superserve.vmd.v1.ResumeVMRequest.EnvVarsEntryR\aenvVars\x12M\n" +
+	"\x10admission_intent\x18\a \x01(\x0e2\".superserve.vmd.v1.AdmissionIntentR\x0fadmissionIntent\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x06\x10\aR\x0esecrets_broker\"\xc5\x01\n" +
@@ -3973,7 +4062,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12&\n" +
-	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xc0\x05\n" +
+	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\x8f\x06\n" +
 	"\x16RestoreSnapshotRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
@@ -3988,7 +4077,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\bowner_id\x18\v \x01(\tR\aownerId\x12%\n" +
 	"\x0epreview_access\x18\f \x01(\tR\rpreviewAccess\x12C\n" +
 	"\rpreview_ports\x18\r \x03(\v2\x1e.superserve.vmd.v1.PreviewPortR\fpreviewPorts\x126\n" +
-	"\x17preview_policy_revision\x18\x0e \x01(\x03R\x15previewPolicyRevision\x1a:\n" +
+	"\x17preview_policy_revision\x18\x0e \x01(\x03R\x15previewPolicyRevision\x12M\n" +
+	"\x10admission_intent\x18\x0f \x01(\x0e2\".superserve.vmd.v1.AdmissionIntentR\x0fadmissionIntent\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x04\x10\x05R\foverlay_path\"^\n" +
@@ -4106,7 +4196,11 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x1dInvalidateSandboxRulesRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\" \n" +
-	"\x1eInvalidateSandboxRulesResponse*\x96\x01\n" +
+	"\x1eInvalidateSandboxRulesResponse*m\n" +
+	"\x0fAdmissionIntent\x12 \n" +
+	"\x1cADMISSION_INTENT_UNSPECIFIED\x10\x00\x12\x1b\n" +
+	"\x17ADMISSION_INTENT_CREATE\x10\x01\x12\x1b\n" +
+	"\x17ADMISSION_INTENT_RESUME\x10\x02*\x96\x01\n" +
 	"\bVMStatus\x12\x19\n" +
 	"\x15VM_STATUS_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12VM_STATUS_CREATING\x10\x01\x12\x15\n" +
@@ -4152,152 +4246,155 @@ func file_proto_vmd_proto_rawDescGZIP() []byte {
 	return file_proto_vmd_proto_rawDescData
 }
 
-var file_proto_vmd_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_proto_vmd_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
 var file_proto_vmd_proto_msgTypes = make([]protoimpl.MessageInfo, 64)
 var file_proto_vmd_proto_goTypes = []any{
-	(VMStatus)(0),                              // 0: superserve.vmd.v1.VMStatus
-	(*BuildTemplateRequest)(nil),               // 1: superserve.vmd.v1.BuildTemplateRequest
-	(*BuildStep)(nil),                          // 2: superserve.vmd.v1.BuildStep
-	(*BuildEnvOp)(nil),                         // 3: superserve.vmd.v1.BuildEnvOp
-	(*BuildUserOp)(nil),                        // 4: superserve.vmd.v1.BuildUserOp
-	(*BuildTemplateResponse)(nil),              // 5: superserve.vmd.v1.BuildTemplateResponse
-	(*GetBuildStatusRequest)(nil),              // 6: superserve.vmd.v1.GetBuildStatusRequest
-	(*GetBuildStatusResponse)(nil),             // 7: superserve.vmd.v1.GetBuildStatusResponse
-	(*CancelBuildRequest)(nil),                 // 8: superserve.vmd.v1.CancelBuildRequest
-	(*CancelBuildResponse)(nil),                // 9: superserve.vmd.v1.CancelBuildResponse
-	(*StreamBuildLogsRequest)(nil),             // 10: superserve.vmd.v1.StreamBuildLogsRequest
-	(*BuildLogEvent)(nil),                      // 11: superserve.vmd.v1.BuildLogEvent
-	(*ResourceLimits)(nil),                     // 12: superserve.vmd.v1.ResourceLimits
-	(*NetworkConfig)(nil),                      // 13: superserve.vmd.v1.NetworkConfig
-	(*SandboxNetworkConfig)(nil),               // 14: superserve.vmd.v1.SandboxNetworkConfig
-	(*SandboxNetworkEgressConfig)(nil),         // 15: superserve.vmd.v1.SandboxNetworkEgressConfig
-	(*DestroyVMRequest)(nil),                   // 16: superserve.vmd.v1.DestroyVMRequest
-	(*DestroyVMResponse)(nil),                  // 17: superserve.vmd.v1.DestroyVMResponse
-	(*ReviveVMRequest)(nil),                    // 18: superserve.vmd.v1.ReviveVMRequest
-	(*ReviveVMResponse)(nil),                   // 19: superserve.vmd.v1.ReviveVMResponse
-	(*PauseVMRequest)(nil),                     // 20: superserve.vmd.v1.PauseVMRequest
-	(*PauseVMResponse)(nil),                    // 21: superserve.vmd.v1.PauseVMResponse
-	(*ArtifactManifestEntry)(nil),              // 22: superserve.vmd.v1.ArtifactManifestEntry
-	(*ResumeVMRequest)(nil),                    // 23: superserve.vmd.v1.ResumeVMRequest
-	(*ResumeVMResponse)(nil),                   // 24: superserve.vmd.v1.ResumeVMResponse
-	(*CreateSnapshotRequest)(nil),              // 25: superserve.vmd.v1.CreateSnapshotRequest
-	(*CreateSnapshotResponse)(nil),             // 26: superserve.vmd.v1.CreateSnapshotResponse
-	(*RestoreSnapshotRequest)(nil),             // 27: superserve.vmd.v1.RestoreSnapshotRequest
-	(*PreviewPort)(nil),                        // 28: superserve.vmd.v1.PreviewPort
-	(*RestoreSnapshotResponse)(nil),            // 29: superserve.vmd.v1.RestoreSnapshotResponse
-	(*InjectSandboxEnvRequest)(nil),            // 30: superserve.vmd.v1.InjectSandboxEnvRequest
-	(*InjectSandboxEnvResponse)(nil),           // 31: superserve.vmd.v1.InjectSandboxEnvResponse
-	(*DeleteSnapshotRequest)(nil),              // 32: superserve.vmd.v1.DeleteSnapshotRequest
-	(*DeleteSnapshotResponse)(nil),             // 33: superserve.vmd.v1.DeleteSnapshotResponse
-	(*DeleteSandboxSnapshotsRequest)(nil),      // 34: superserve.vmd.v1.DeleteSandboxSnapshotsRequest
-	(*DeleteSandboxSnapshotsResponse)(nil),     // 35: superserve.vmd.v1.DeleteSandboxSnapshotsResponse
-	(*DeleteTemplateArtifactsRequest)(nil),     // 36: superserve.vmd.v1.DeleteTemplateArtifactsRequest
-	(*DeleteTemplateArtifactsResponse)(nil),    // 37: superserve.vmd.v1.DeleteTemplateArtifactsResponse
-	(*DeleteBuildArtifactsRequest)(nil),        // 38: superserve.vmd.v1.DeleteBuildArtifactsRequest
-	(*DeleteBuildArtifactsResponse)(nil),       // 39: superserve.vmd.v1.DeleteBuildArtifactsResponse
-	(*ListBuildArtifactsRequest)(nil),          // 40: superserve.vmd.v1.ListBuildArtifactsRequest
-	(*BuildArtifactEntry)(nil),                 // 41: superserve.vmd.v1.BuildArtifactEntry
-	(*ListBuildArtifactsResponse)(nil),         // 42: superserve.vmd.v1.ListBuildArtifactsResponse
-	(*ListDirRequest)(nil),                     // 43: superserve.vmd.v1.ListDirRequest
-	(*ListDirResponse)(nil),                    // 44: superserve.vmd.v1.ListDirResponse
-	(*ListDirEntry)(nil),                       // 45: superserve.vmd.v1.ListDirEntry
-	(*GetVMInfoRequest)(nil),                   // 46: superserve.vmd.v1.GetVMInfoRequest
-	(*GetVMInfoResponse)(nil),                  // 47: superserve.vmd.v1.GetVMInfoResponse
-	(*SetupNetworkRequest)(nil),                // 48: superserve.vmd.v1.SetupNetworkRequest
-	(*SetupNetworkResponse)(nil),               // 49: superserve.vmd.v1.SetupNetworkResponse
-	(*UpdateSandboxNetworkRequest)(nil),        // 50: superserve.vmd.v1.UpdateSandboxNetworkRequest
-	(*UpdateSandboxNetworkResponse)(nil),       // 51: superserve.vmd.v1.UpdateSandboxNetworkResponse
-	(*UpdateSandboxPreviewPolicyRequest)(nil),  // 52: superserve.vmd.v1.UpdateSandboxPreviewPolicyRequest
-	(*UpdateSandboxPreviewPolicyResponse)(nil), // 53: superserve.vmd.v1.UpdateSandboxPreviewPolicyResponse
-	(*InvalidateSecretRequest)(nil),            // 54: superserve.vmd.v1.InvalidateSecretRequest
-	(*InvalidateSecretResponse)(nil),           // 55: superserve.vmd.v1.InvalidateSecretResponse
-	(*RevokeSandboxRequest)(nil),               // 56: superserve.vmd.v1.RevokeSandboxRequest
-	(*RevokeSandboxResponse)(nil),              // 57: superserve.vmd.v1.RevokeSandboxResponse
-	(*InvalidateSandboxRulesRequest)(nil),      // 58: superserve.vmd.v1.InvalidateSandboxRulesRequest
-	(*InvalidateSandboxRulesResponse)(nil),     // 59: superserve.vmd.v1.InvalidateSandboxRulesResponse
-	nil,                                        // 60: superserve.vmd.v1.ReviveVMRequest.EnvVarsEntry
-	nil,                                        // 61: superserve.vmd.v1.ResumeVMRequest.EnvVarsEntry
-	nil,                                        // 62: superserve.vmd.v1.RestoreSnapshotRequest.EnvVarsEntry
-	nil,                                        // 63: superserve.vmd.v1.InjectSandboxEnvRequest.EnvVarsEntry
-	nil,                                        // 64: superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
+	(AdmissionIntent)(0),                       // 0: superserve.vmd.v1.AdmissionIntent
+	(VMStatus)(0),                              // 1: superserve.vmd.v1.VMStatus
+	(*BuildTemplateRequest)(nil),               // 2: superserve.vmd.v1.BuildTemplateRequest
+	(*BuildStep)(nil),                          // 3: superserve.vmd.v1.BuildStep
+	(*BuildEnvOp)(nil),                         // 4: superserve.vmd.v1.BuildEnvOp
+	(*BuildUserOp)(nil),                        // 5: superserve.vmd.v1.BuildUserOp
+	(*BuildTemplateResponse)(nil),              // 6: superserve.vmd.v1.BuildTemplateResponse
+	(*GetBuildStatusRequest)(nil),              // 7: superserve.vmd.v1.GetBuildStatusRequest
+	(*GetBuildStatusResponse)(nil),             // 8: superserve.vmd.v1.GetBuildStatusResponse
+	(*CancelBuildRequest)(nil),                 // 9: superserve.vmd.v1.CancelBuildRequest
+	(*CancelBuildResponse)(nil),                // 10: superserve.vmd.v1.CancelBuildResponse
+	(*StreamBuildLogsRequest)(nil),             // 11: superserve.vmd.v1.StreamBuildLogsRequest
+	(*BuildLogEvent)(nil),                      // 12: superserve.vmd.v1.BuildLogEvent
+	(*ResourceLimits)(nil),                     // 13: superserve.vmd.v1.ResourceLimits
+	(*NetworkConfig)(nil),                      // 14: superserve.vmd.v1.NetworkConfig
+	(*SandboxNetworkConfig)(nil),               // 15: superserve.vmd.v1.SandboxNetworkConfig
+	(*SandboxNetworkEgressConfig)(nil),         // 16: superserve.vmd.v1.SandboxNetworkEgressConfig
+	(*DestroyVMRequest)(nil),                   // 17: superserve.vmd.v1.DestroyVMRequest
+	(*DestroyVMResponse)(nil),                  // 18: superserve.vmd.v1.DestroyVMResponse
+	(*ReviveVMRequest)(nil),                    // 19: superserve.vmd.v1.ReviveVMRequest
+	(*ReviveVMResponse)(nil),                   // 20: superserve.vmd.v1.ReviveVMResponse
+	(*PauseVMRequest)(nil),                     // 21: superserve.vmd.v1.PauseVMRequest
+	(*PauseVMResponse)(nil),                    // 22: superserve.vmd.v1.PauseVMResponse
+	(*ArtifactManifestEntry)(nil),              // 23: superserve.vmd.v1.ArtifactManifestEntry
+	(*ResumeVMRequest)(nil),                    // 24: superserve.vmd.v1.ResumeVMRequest
+	(*ResumeVMResponse)(nil),                   // 25: superserve.vmd.v1.ResumeVMResponse
+	(*CreateSnapshotRequest)(nil),              // 26: superserve.vmd.v1.CreateSnapshotRequest
+	(*CreateSnapshotResponse)(nil),             // 27: superserve.vmd.v1.CreateSnapshotResponse
+	(*RestoreSnapshotRequest)(nil),             // 28: superserve.vmd.v1.RestoreSnapshotRequest
+	(*PreviewPort)(nil),                        // 29: superserve.vmd.v1.PreviewPort
+	(*RestoreSnapshotResponse)(nil),            // 30: superserve.vmd.v1.RestoreSnapshotResponse
+	(*InjectSandboxEnvRequest)(nil),            // 31: superserve.vmd.v1.InjectSandboxEnvRequest
+	(*InjectSandboxEnvResponse)(nil),           // 32: superserve.vmd.v1.InjectSandboxEnvResponse
+	(*DeleteSnapshotRequest)(nil),              // 33: superserve.vmd.v1.DeleteSnapshotRequest
+	(*DeleteSnapshotResponse)(nil),             // 34: superserve.vmd.v1.DeleteSnapshotResponse
+	(*DeleteSandboxSnapshotsRequest)(nil),      // 35: superserve.vmd.v1.DeleteSandboxSnapshotsRequest
+	(*DeleteSandboxSnapshotsResponse)(nil),     // 36: superserve.vmd.v1.DeleteSandboxSnapshotsResponse
+	(*DeleteTemplateArtifactsRequest)(nil),     // 37: superserve.vmd.v1.DeleteTemplateArtifactsRequest
+	(*DeleteTemplateArtifactsResponse)(nil),    // 38: superserve.vmd.v1.DeleteTemplateArtifactsResponse
+	(*DeleteBuildArtifactsRequest)(nil),        // 39: superserve.vmd.v1.DeleteBuildArtifactsRequest
+	(*DeleteBuildArtifactsResponse)(nil),       // 40: superserve.vmd.v1.DeleteBuildArtifactsResponse
+	(*ListBuildArtifactsRequest)(nil),          // 41: superserve.vmd.v1.ListBuildArtifactsRequest
+	(*BuildArtifactEntry)(nil),                 // 42: superserve.vmd.v1.BuildArtifactEntry
+	(*ListBuildArtifactsResponse)(nil),         // 43: superserve.vmd.v1.ListBuildArtifactsResponse
+	(*ListDirRequest)(nil),                     // 44: superserve.vmd.v1.ListDirRequest
+	(*ListDirResponse)(nil),                    // 45: superserve.vmd.v1.ListDirResponse
+	(*ListDirEntry)(nil),                       // 46: superserve.vmd.v1.ListDirEntry
+	(*GetVMInfoRequest)(nil),                   // 47: superserve.vmd.v1.GetVMInfoRequest
+	(*GetVMInfoResponse)(nil),                  // 48: superserve.vmd.v1.GetVMInfoResponse
+	(*SetupNetworkRequest)(nil),                // 49: superserve.vmd.v1.SetupNetworkRequest
+	(*SetupNetworkResponse)(nil),               // 50: superserve.vmd.v1.SetupNetworkResponse
+	(*UpdateSandboxNetworkRequest)(nil),        // 51: superserve.vmd.v1.UpdateSandboxNetworkRequest
+	(*UpdateSandboxNetworkResponse)(nil),       // 52: superserve.vmd.v1.UpdateSandboxNetworkResponse
+	(*UpdateSandboxPreviewPolicyRequest)(nil),  // 53: superserve.vmd.v1.UpdateSandboxPreviewPolicyRequest
+	(*UpdateSandboxPreviewPolicyResponse)(nil), // 54: superserve.vmd.v1.UpdateSandboxPreviewPolicyResponse
+	(*InvalidateSecretRequest)(nil),            // 55: superserve.vmd.v1.InvalidateSecretRequest
+	(*InvalidateSecretResponse)(nil),           // 56: superserve.vmd.v1.InvalidateSecretResponse
+	(*RevokeSandboxRequest)(nil),               // 57: superserve.vmd.v1.RevokeSandboxRequest
+	(*RevokeSandboxResponse)(nil),              // 58: superserve.vmd.v1.RevokeSandboxResponse
+	(*InvalidateSandboxRulesRequest)(nil),      // 59: superserve.vmd.v1.InvalidateSandboxRulesRequest
+	(*InvalidateSandboxRulesResponse)(nil),     // 60: superserve.vmd.v1.InvalidateSandboxRulesResponse
+	nil,                                        // 61: superserve.vmd.v1.ReviveVMRequest.EnvVarsEntry
+	nil,                                        // 62: superserve.vmd.v1.ResumeVMRequest.EnvVarsEntry
+	nil,                                        // 63: superserve.vmd.v1.RestoreSnapshotRequest.EnvVarsEntry
+	nil,                                        // 64: superserve.vmd.v1.InjectSandboxEnvRequest.EnvVarsEntry
+	nil,                                        // 65: superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
 }
 var file_proto_vmd_proto_depIdxs = []int32{
-	2,  // 0: superserve.vmd.v1.BuildTemplateRequest.steps:type_name -> superserve.vmd.v1.BuildStep
-	3,  // 1: superserve.vmd.v1.BuildStep.env:type_name -> superserve.vmd.v1.BuildEnvOp
-	4,  // 2: superserve.vmd.v1.BuildStep.user:type_name -> superserve.vmd.v1.BuildUserOp
-	15, // 3: superserve.vmd.v1.SandboxNetworkConfig.egress:type_name -> superserve.vmd.v1.SandboxNetworkEgressConfig
-	60, // 4: superserve.vmd.v1.ReviveVMRequest.env_vars:type_name -> superserve.vmd.v1.ReviveVMRequest.EnvVarsEntry
-	22, // 5: superserve.vmd.v1.PauseVMResponse.manifest:type_name -> superserve.vmd.v1.ArtifactManifestEntry
-	14, // 6: superserve.vmd.v1.ResumeVMRequest.sandbox_network:type_name -> superserve.vmd.v1.SandboxNetworkConfig
-	61, // 7: superserve.vmd.v1.ResumeVMRequest.env_vars:type_name -> superserve.vmd.v1.ResumeVMRequest.EnvVarsEntry
-	12, // 8: superserve.vmd.v1.ResumeVMResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
-	12, // 9: superserve.vmd.v1.RestoreSnapshotRequest.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
-	13, // 10: superserve.vmd.v1.RestoreSnapshotRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
-	62, // 11: superserve.vmd.v1.RestoreSnapshotRequest.env_vars:type_name -> superserve.vmd.v1.RestoreSnapshotRequest.EnvVarsEntry
-	28, // 12: superserve.vmd.v1.RestoreSnapshotRequest.preview_ports:type_name -> superserve.vmd.v1.PreviewPort
-	12, // 13: superserve.vmd.v1.RestoreSnapshotResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
-	63, // 14: superserve.vmd.v1.InjectSandboxEnvRequest.env_vars:type_name -> superserve.vmd.v1.InjectSandboxEnvRequest.EnvVarsEntry
-	41, // 15: superserve.vmd.v1.ListBuildArtifactsResponse.entries:type_name -> superserve.vmd.v1.BuildArtifactEntry
-	45, // 16: superserve.vmd.v1.ListDirResponse.entries:type_name -> superserve.vmd.v1.ListDirEntry
-	0,  // 17: superserve.vmd.v1.GetVMInfoResponse.status:type_name -> superserve.vmd.v1.VMStatus
-	12, // 18: superserve.vmd.v1.GetVMInfoResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
-	64, // 19: superserve.vmd.v1.GetVMInfoResponse.metadata:type_name -> superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
-	13, // 20: superserve.vmd.v1.SetupNetworkRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
-	15, // 21: superserve.vmd.v1.UpdateSandboxNetworkRequest.egress:type_name -> superserve.vmd.v1.SandboxNetworkEgressConfig
-	28, // 22: superserve.vmd.v1.UpdateSandboxPreviewPolicyRequest.preview_ports:type_name -> superserve.vmd.v1.PreviewPort
-	16, // 23: superserve.vmd.v1.VMDaemon.DestroyVM:input_type -> superserve.vmd.v1.DestroyVMRequest
-	20, // 24: superserve.vmd.v1.VMDaemon.PauseVM:input_type -> superserve.vmd.v1.PauseVMRequest
-	23, // 25: superserve.vmd.v1.VMDaemon.ResumeVM:input_type -> superserve.vmd.v1.ResumeVMRequest
-	25, // 26: superserve.vmd.v1.VMDaemon.CreateSnapshot:input_type -> superserve.vmd.v1.CreateSnapshotRequest
-	27, // 27: superserve.vmd.v1.VMDaemon.RestoreSnapshot:input_type -> superserve.vmd.v1.RestoreSnapshotRequest
-	30, // 28: superserve.vmd.v1.VMDaemon.InjectSandboxEnv:input_type -> superserve.vmd.v1.InjectSandboxEnvRequest
-	32, // 29: superserve.vmd.v1.VMDaemon.DeleteSnapshot:input_type -> superserve.vmd.v1.DeleteSnapshotRequest
-	34, // 30: superserve.vmd.v1.VMDaemon.DeleteSandboxSnapshots:input_type -> superserve.vmd.v1.DeleteSandboxSnapshotsRequest
-	36, // 31: superserve.vmd.v1.VMDaemon.DeleteTemplateArtifacts:input_type -> superserve.vmd.v1.DeleteTemplateArtifactsRequest
-	38, // 32: superserve.vmd.v1.VMDaemon.DeleteBuildArtifacts:input_type -> superserve.vmd.v1.DeleteBuildArtifactsRequest
-	40, // 33: superserve.vmd.v1.VMDaemon.ListBuildArtifacts:input_type -> superserve.vmd.v1.ListBuildArtifactsRequest
-	43, // 34: superserve.vmd.v1.VMDaemon.ListDir:input_type -> superserve.vmd.v1.ListDirRequest
-	46, // 35: superserve.vmd.v1.VMDaemon.GetVMInfo:input_type -> superserve.vmd.v1.GetVMInfoRequest
-	48, // 36: superserve.vmd.v1.VMDaemon.SetupNetwork:input_type -> superserve.vmd.v1.SetupNetworkRequest
-	18, // 37: superserve.vmd.v1.VMDaemon.ReviveVM:input_type -> superserve.vmd.v1.ReviveVMRequest
-	50, // 38: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:input_type -> superserve.vmd.v1.UpdateSandboxNetworkRequest
-	52, // 39: superserve.vmd.v1.VMDaemon.UpdateSandboxPreviewPolicy:input_type -> superserve.vmd.v1.UpdateSandboxPreviewPolicyRequest
-	54, // 40: superserve.vmd.v1.VMDaemon.InvalidateSecret:input_type -> superserve.vmd.v1.InvalidateSecretRequest
-	56, // 41: superserve.vmd.v1.VMDaemon.RevokeSandbox:input_type -> superserve.vmd.v1.RevokeSandboxRequest
-	58, // 42: superserve.vmd.v1.VMDaemon.InvalidateSandboxRules:input_type -> superserve.vmd.v1.InvalidateSandboxRulesRequest
-	1,  // 43: superserve.vmd.v1.VMDaemon.BuildTemplate:input_type -> superserve.vmd.v1.BuildTemplateRequest
-	6,  // 44: superserve.vmd.v1.VMDaemon.GetBuildStatus:input_type -> superserve.vmd.v1.GetBuildStatusRequest
-	8,  // 45: superserve.vmd.v1.VMDaemon.CancelBuild:input_type -> superserve.vmd.v1.CancelBuildRequest
-	10, // 46: superserve.vmd.v1.VMDaemon.StreamBuildLogs:input_type -> superserve.vmd.v1.StreamBuildLogsRequest
-	17, // 47: superserve.vmd.v1.VMDaemon.DestroyVM:output_type -> superserve.vmd.v1.DestroyVMResponse
-	21, // 48: superserve.vmd.v1.VMDaemon.PauseVM:output_type -> superserve.vmd.v1.PauseVMResponse
-	24, // 49: superserve.vmd.v1.VMDaemon.ResumeVM:output_type -> superserve.vmd.v1.ResumeVMResponse
-	26, // 50: superserve.vmd.v1.VMDaemon.CreateSnapshot:output_type -> superserve.vmd.v1.CreateSnapshotResponse
-	29, // 51: superserve.vmd.v1.VMDaemon.RestoreSnapshot:output_type -> superserve.vmd.v1.RestoreSnapshotResponse
-	31, // 52: superserve.vmd.v1.VMDaemon.InjectSandboxEnv:output_type -> superserve.vmd.v1.InjectSandboxEnvResponse
-	33, // 53: superserve.vmd.v1.VMDaemon.DeleteSnapshot:output_type -> superserve.vmd.v1.DeleteSnapshotResponse
-	35, // 54: superserve.vmd.v1.VMDaemon.DeleteSandboxSnapshots:output_type -> superserve.vmd.v1.DeleteSandboxSnapshotsResponse
-	37, // 55: superserve.vmd.v1.VMDaemon.DeleteTemplateArtifacts:output_type -> superserve.vmd.v1.DeleteTemplateArtifactsResponse
-	39, // 56: superserve.vmd.v1.VMDaemon.DeleteBuildArtifacts:output_type -> superserve.vmd.v1.DeleteBuildArtifactsResponse
-	42, // 57: superserve.vmd.v1.VMDaemon.ListBuildArtifacts:output_type -> superserve.vmd.v1.ListBuildArtifactsResponse
-	44, // 58: superserve.vmd.v1.VMDaemon.ListDir:output_type -> superserve.vmd.v1.ListDirResponse
-	47, // 59: superserve.vmd.v1.VMDaemon.GetVMInfo:output_type -> superserve.vmd.v1.GetVMInfoResponse
-	49, // 60: superserve.vmd.v1.VMDaemon.SetupNetwork:output_type -> superserve.vmd.v1.SetupNetworkResponse
-	19, // 61: superserve.vmd.v1.VMDaemon.ReviveVM:output_type -> superserve.vmd.v1.ReviveVMResponse
-	51, // 62: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:output_type -> superserve.vmd.v1.UpdateSandboxNetworkResponse
-	53, // 63: superserve.vmd.v1.VMDaemon.UpdateSandboxPreviewPolicy:output_type -> superserve.vmd.v1.UpdateSandboxPreviewPolicyResponse
-	55, // 64: superserve.vmd.v1.VMDaemon.InvalidateSecret:output_type -> superserve.vmd.v1.InvalidateSecretResponse
-	57, // 65: superserve.vmd.v1.VMDaemon.RevokeSandbox:output_type -> superserve.vmd.v1.RevokeSandboxResponse
-	59, // 66: superserve.vmd.v1.VMDaemon.InvalidateSandboxRules:output_type -> superserve.vmd.v1.InvalidateSandboxRulesResponse
-	5,  // 67: superserve.vmd.v1.VMDaemon.BuildTemplate:output_type -> superserve.vmd.v1.BuildTemplateResponse
-	7,  // 68: superserve.vmd.v1.VMDaemon.GetBuildStatus:output_type -> superserve.vmd.v1.GetBuildStatusResponse
-	9,  // 69: superserve.vmd.v1.VMDaemon.CancelBuild:output_type -> superserve.vmd.v1.CancelBuildResponse
-	11, // 70: superserve.vmd.v1.VMDaemon.StreamBuildLogs:output_type -> superserve.vmd.v1.BuildLogEvent
-	47, // [47:71] is the sub-list for method output_type
-	23, // [23:47] is the sub-list for method input_type
-	23, // [23:23] is the sub-list for extension type_name
-	23, // [23:23] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	3,  // 0: superserve.vmd.v1.BuildTemplateRequest.steps:type_name -> superserve.vmd.v1.BuildStep
+	4,  // 1: superserve.vmd.v1.BuildStep.env:type_name -> superserve.vmd.v1.BuildEnvOp
+	5,  // 2: superserve.vmd.v1.BuildStep.user:type_name -> superserve.vmd.v1.BuildUserOp
+	16, // 3: superserve.vmd.v1.SandboxNetworkConfig.egress:type_name -> superserve.vmd.v1.SandboxNetworkEgressConfig
+	61, // 4: superserve.vmd.v1.ReviveVMRequest.env_vars:type_name -> superserve.vmd.v1.ReviveVMRequest.EnvVarsEntry
+	23, // 5: superserve.vmd.v1.PauseVMResponse.manifest:type_name -> superserve.vmd.v1.ArtifactManifestEntry
+	15, // 6: superserve.vmd.v1.ResumeVMRequest.sandbox_network:type_name -> superserve.vmd.v1.SandboxNetworkConfig
+	62, // 7: superserve.vmd.v1.ResumeVMRequest.env_vars:type_name -> superserve.vmd.v1.ResumeVMRequest.EnvVarsEntry
+	0,  // 8: superserve.vmd.v1.ResumeVMRequest.admission_intent:type_name -> superserve.vmd.v1.AdmissionIntent
+	13, // 9: superserve.vmd.v1.ResumeVMResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
+	13, // 10: superserve.vmd.v1.RestoreSnapshotRequest.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
+	14, // 11: superserve.vmd.v1.RestoreSnapshotRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
+	63, // 12: superserve.vmd.v1.RestoreSnapshotRequest.env_vars:type_name -> superserve.vmd.v1.RestoreSnapshotRequest.EnvVarsEntry
+	29, // 13: superserve.vmd.v1.RestoreSnapshotRequest.preview_ports:type_name -> superserve.vmd.v1.PreviewPort
+	0,  // 14: superserve.vmd.v1.RestoreSnapshotRequest.admission_intent:type_name -> superserve.vmd.v1.AdmissionIntent
+	13, // 15: superserve.vmd.v1.RestoreSnapshotResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
+	64, // 16: superserve.vmd.v1.InjectSandboxEnvRequest.env_vars:type_name -> superserve.vmd.v1.InjectSandboxEnvRequest.EnvVarsEntry
+	42, // 17: superserve.vmd.v1.ListBuildArtifactsResponse.entries:type_name -> superserve.vmd.v1.BuildArtifactEntry
+	46, // 18: superserve.vmd.v1.ListDirResponse.entries:type_name -> superserve.vmd.v1.ListDirEntry
+	1,  // 19: superserve.vmd.v1.GetVMInfoResponse.status:type_name -> superserve.vmd.v1.VMStatus
+	13, // 20: superserve.vmd.v1.GetVMInfoResponse.resource_limits:type_name -> superserve.vmd.v1.ResourceLimits
+	65, // 21: superserve.vmd.v1.GetVMInfoResponse.metadata:type_name -> superserve.vmd.v1.GetVMInfoResponse.MetadataEntry
+	14, // 22: superserve.vmd.v1.SetupNetworkRequest.network_config:type_name -> superserve.vmd.v1.NetworkConfig
+	16, // 23: superserve.vmd.v1.UpdateSandboxNetworkRequest.egress:type_name -> superserve.vmd.v1.SandboxNetworkEgressConfig
+	29, // 24: superserve.vmd.v1.UpdateSandboxPreviewPolicyRequest.preview_ports:type_name -> superserve.vmd.v1.PreviewPort
+	17, // 25: superserve.vmd.v1.VMDaemon.DestroyVM:input_type -> superserve.vmd.v1.DestroyVMRequest
+	21, // 26: superserve.vmd.v1.VMDaemon.PauseVM:input_type -> superserve.vmd.v1.PauseVMRequest
+	24, // 27: superserve.vmd.v1.VMDaemon.ResumeVM:input_type -> superserve.vmd.v1.ResumeVMRequest
+	26, // 28: superserve.vmd.v1.VMDaemon.CreateSnapshot:input_type -> superserve.vmd.v1.CreateSnapshotRequest
+	28, // 29: superserve.vmd.v1.VMDaemon.RestoreSnapshot:input_type -> superserve.vmd.v1.RestoreSnapshotRequest
+	31, // 30: superserve.vmd.v1.VMDaemon.InjectSandboxEnv:input_type -> superserve.vmd.v1.InjectSandboxEnvRequest
+	33, // 31: superserve.vmd.v1.VMDaemon.DeleteSnapshot:input_type -> superserve.vmd.v1.DeleteSnapshotRequest
+	35, // 32: superserve.vmd.v1.VMDaemon.DeleteSandboxSnapshots:input_type -> superserve.vmd.v1.DeleteSandboxSnapshotsRequest
+	37, // 33: superserve.vmd.v1.VMDaemon.DeleteTemplateArtifacts:input_type -> superserve.vmd.v1.DeleteTemplateArtifactsRequest
+	39, // 34: superserve.vmd.v1.VMDaemon.DeleteBuildArtifacts:input_type -> superserve.vmd.v1.DeleteBuildArtifactsRequest
+	41, // 35: superserve.vmd.v1.VMDaemon.ListBuildArtifacts:input_type -> superserve.vmd.v1.ListBuildArtifactsRequest
+	44, // 36: superserve.vmd.v1.VMDaemon.ListDir:input_type -> superserve.vmd.v1.ListDirRequest
+	47, // 37: superserve.vmd.v1.VMDaemon.GetVMInfo:input_type -> superserve.vmd.v1.GetVMInfoRequest
+	49, // 38: superserve.vmd.v1.VMDaemon.SetupNetwork:input_type -> superserve.vmd.v1.SetupNetworkRequest
+	19, // 39: superserve.vmd.v1.VMDaemon.ReviveVM:input_type -> superserve.vmd.v1.ReviveVMRequest
+	51, // 40: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:input_type -> superserve.vmd.v1.UpdateSandboxNetworkRequest
+	53, // 41: superserve.vmd.v1.VMDaemon.UpdateSandboxPreviewPolicy:input_type -> superserve.vmd.v1.UpdateSandboxPreviewPolicyRequest
+	55, // 42: superserve.vmd.v1.VMDaemon.InvalidateSecret:input_type -> superserve.vmd.v1.InvalidateSecretRequest
+	57, // 43: superserve.vmd.v1.VMDaemon.RevokeSandbox:input_type -> superserve.vmd.v1.RevokeSandboxRequest
+	59, // 44: superserve.vmd.v1.VMDaemon.InvalidateSandboxRules:input_type -> superserve.vmd.v1.InvalidateSandboxRulesRequest
+	2,  // 45: superserve.vmd.v1.VMDaemon.BuildTemplate:input_type -> superserve.vmd.v1.BuildTemplateRequest
+	7,  // 46: superserve.vmd.v1.VMDaemon.GetBuildStatus:input_type -> superserve.vmd.v1.GetBuildStatusRequest
+	9,  // 47: superserve.vmd.v1.VMDaemon.CancelBuild:input_type -> superserve.vmd.v1.CancelBuildRequest
+	11, // 48: superserve.vmd.v1.VMDaemon.StreamBuildLogs:input_type -> superserve.vmd.v1.StreamBuildLogsRequest
+	18, // 49: superserve.vmd.v1.VMDaemon.DestroyVM:output_type -> superserve.vmd.v1.DestroyVMResponse
+	22, // 50: superserve.vmd.v1.VMDaemon.PauseVM:output_type -> superserve.vmd.v1.PauseVMResponse
+	25, // 51: superserve.vmd.v1.VMDaemon.ResumeVM:output_type -> superserve.vmd.v1.ResumeVMResponse
+	27, // 52: superserve.vmd.v1.VMDaemon.CreateSnapshot:output_type -> superserve.vmd.v1.CreateSnapshotResponse
+	30, // 53: superserve.vmd.v1.VMDaemon.RestoreSnapshot:output_type -> superserve.vmd.v1.RestoreSnapshotResponse
+	32, // 54: superserve.vmd.v1.VMDaemon.InjectSandboxEnv:output_type -> superserve.vmd.v1.InjectSandboxEnvResponse
+	34, // 55: superserve.vmd.v1.VMDaemon.DeleteSnapshot:output_type -> superserve.vmd.v1.DeleteSnapshotResponse
+	36, // 56: superserve.vmd.v1.VMDaemon.DeleteSandboxSnapshots:output_type -> superserve.vmd.v1.DeleteSandboxSnapshotsResponse
+	38, // 57: superserve.vmd.v1.VMDaemon.DeleteTemplateArtifacts:output_type -> superserve.vmd.v1.DeleteTemplateArtifactsResponse
+	40, // 58: superserve.vmd.v1.VMDaemon.DeleteBuildArtifacts:output_type -> superserve.vmd.v1.DeleteBuildArtifactsResponse
+	43, // 59: superserve.vmd.v1.VMDaemon.ListBuildArtifacts:output_type -> superserve.vmd.v1.ListBuildArtifactsResponse
+	45, // 60: superserve.vmd.v1.VMDaemon.ListDir:output_type -> superserve.vmd.v1.ListDirResponse
+	48, // 61: superserve.vmd.v1.VMDaemon.GetVMInfo:output_type -> superserve.vmd.v1.GetVMInfoResponse
+	50, // 62: superserve.vmd.v1.VMDaemon.SetupNetwork:output_type -> superserve.vmd.v1.SetupNetworkResponse
+	20, // 63: superserve.vmd.v1.VMDaemon.ReviveVM:output_type -> superserve.vmd.v1.ReviveVMResponse
+	52, // 64: superserve.vmd.v1.VMDaemon.UpdateSandboxNetwork:output_type -> superserve.vmd.v1.UpdateSandboxNetworkResponse
+	54, // 65: superserve.vmd.v1.VMDaemon.UpdateSandboxPreviewPolicy:output_type -> superserve.vmd.v1.UpdateSandboxPreviewPolicyResponse
+	56, // 66: superserve.vmd.v1.VMDaemon.InvalidateSecret:output_type -> superserve.vmd.v1.InvalidateSecretResponse
+	58, // 67: superserve.vmd.v1.VMDaemon.RevokeSandbox:output_type -> superserve.vmd.v1.RevokeSandboxResponse
+	60, // 68: superserve.vmd.v1.VMDaemon.InvalidateSandboxRules:output_type -> superserve.vmd.v1.InvalidateSandboxRulesResponse
+	6,  // 69: superserve.vmd.v1.VMDaemon.BuildTemplate:output_type -> superserve.vmd.v1.BuildTemplateResponse
+	8,  // 70: superserve.vmd.v1.VMDaemon.GetBuildStatus:output_type -> superserve.vmd.v1.GetBuildStatusResponse
+	10, // 71: superserve.vmd.v1.VMDaemon.CancelBuild:output_type -> superserve.vmd.v1.CancelBuildResponse
+	12, // 72: superserve.vmd.v1.VMDaemon.StreamBuildLogs:output_type -> superserve.vmd.v1.BuildLogEvent
+	49, // [49:73] is the sub-list for method output_type
+	25, // [25:49] is the sub-list for method input_type
+	25, // [25:25] is the sub-list for extension type_name
+	25, // [25:25] is the sub-list for extension extendee
+	0,  // [0:25] is the sub-list for field type_name
 }
 
 func init() { file_proto_vmd_proto_init() }
@@ -4316,7 +4413,7 @@ func file_proto_vmd_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vmd_proto_rawDesc), len(file_proto_vmd_proto_rawDesc)),
-			NumEnums:      1,
+			NumEnums:      2,
 			NumMessages:   64,
 			NumExtensions: 0,
 			NumServices:   1,

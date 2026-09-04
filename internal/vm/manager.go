@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/admission"
 	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/presence"
@@ -398,6 +399,19 @@ type ManagerConfig struct {
 	// skipped when false, so a host that never publishes runs the
 	// startup path it ran before the feature existed.
 	PressureAccounting bool
+
+	// LocalAdmission enables host-local capacity admission.
+	//
+	// Its own setting, deliberately not derived from MaxSandboxes being
+	// non-zero: that limit is already set on production hosts to feed
+	// pressure publication, so inferring enablement from it would turn
+	// enforcement on across the fleet the moment this ships.
+	LocalAdmission bool
+
+	// MaxSandboxes is the operator's concurrent-sandbox limit, consulted
+	// only when LocalAdmission is set. Zero means unlimited, matching how
+	// the pressure publisher already reads the same operator value.
+	MaxSandboxes int
 }
 
 // ---------------------------------------------------------------------------
@@ -597,6 +611,13 @@ type Manager struct {
 	// publishes runs exactly the startup path it ran before the feature
 	// existed. Set once before ReattachAll; never mutated after.
 	pressureAccounting bool
+
+	// admission enforces the operator's concurrent-sandbox limit on this
+	// host. Nil unless the operator opted in, and every method on the gate
+	// is a no-op on a nil receiver, so the enforcement points below read
+	// identically whether or not the feature is on — inertness is a
+	// property of the gate, not of a branch at each call site.
+	admission *admission.Gate
 
 	// recovery probes allocations for VMs nobody declared a size for.
 	// Fixed worker set; see machineConfigRecovery.
@@ -840,6 +861,7 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 		}
 	}
 	m := &Manager{
+		admission:          admission.NewGate(cfg.LocalAdmission, cfg.MaxSandboxes),
 		forensicsOK:        forensicsQuarantineOK,
 		cfg:                cfg,
 		netMgr:             netMgr,
@@ -4663,7 +4685,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				sigkillPID(rec.PID, 500*time.Millisecond)
 				log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
 			}
-			m.state.Delete(rec.ID)
+			m.deleteRecord(rec.ID)
 			// Free this record's namespace/slot directly instead of a broad
 			// re-sweep (which would also delete the warm pool's netns).
 			m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
@@ -4727,7 +4749,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 					}
 				}
 				if confirmed {
-					if derr := m.state.Delete(rec.ID); derr == nil {
+					if derr := m.deleteRecord(rec.ID); derr == nil {
 						m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
 						return nil, false
 					} else {
@@ -6438,7 +6460,7 @@ func (m *Manager) deleteState(vmID string) {
 		}
 		return
 	}
-	if err := m.state.Delete(vmID); err != nil {
+	if err := m.deleteRecord(vmID); err != nil {
 		m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to delete VM state from BoltDB")
 	}
 }

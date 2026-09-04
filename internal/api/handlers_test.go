@@ -36,6 +36,7 @@ import (
 
 type stubVMD struct {
 	restoreLimits    vmdclient.ResourceLimits
+	restoreIntent    vmdclient.AdmissionIntent
 	destroyFn        func(ctx context.Context, id string, force bool) error
 	pauseFn          func(ctx context.Context, id, snapshotDir string) (string, string, error)
 	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte) (string, error)
@@ -88,8 +89,9 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string, limits vmdclient.ResourceLimits, intent vmdclient.AdmissionIntent) (string, uint32, uint32, string, error) {
 	s.restoreLimits = limits
+	s.restoreIntent = intent
 	protocol := preview.HostCapabilityPorts
 	if s.restorePreviewProtocol != nil {
 		protocol = *s.restorePreviewProtocol
@@ -1183,6 +1185,15 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 	if _, ok := reconciled.Ports[8080]; !ok || len(reconciled.Ports) != 1 {
 		t.Fatalf("reconciled ports = %#v, want {8080}", reconciled.Ports)
 	}
+	// This path reaches vmd through the CREATE rpc, but it is a resume: the
+	// sandbox exists and is bound to this host. Declaring CREATE here would
+	// charge it a second time on a capacity-enforcing host, and let a full
+	// host refuse a sandbox that has nowhere else to go. The daemon cannot
+	// catch the mistake — it takes this path precisely when it has no
+	// record of the sandbox — so the assertion has to live here.
+	if vmd.restoreIntent != vmdclient.IntentResume {
+		t.Errorf("stateless-resume fallback declared intent %v, want IntentResume", vmd.restoreIntent)
+	}
 }
 
 func TestResumeSandbox_PrivatePolicyRequiresBrowserChainAndRestoresBrowserPorts(t *testing.T) {
@@ -2137,6 +2148,13 @@ func TestCreateSandbox_Success(t *testing.T) {
 	}
 	if v := body["memory_mib"].(float64); v == 0 {
 		t.Error("memory_mib is 0 — VMD's reported value was not propagated to the response")
+	}
+	// A create must say so. The same RPC also serves the stateless-resume
+	// fallback, and a host enforcing local capacity refuses a boot whose
+	// intent is unset — so an undeclared create is not a cosmetic omission,
+	// it is a create that cannot land on an enforcing host.
+	if vmd.restoreIntent != vmdclient.IntentCreate {
+		t.Errorf("restore intent = %v, want IntentCreate", vmd.restoreIntent)
 	}
 }
 

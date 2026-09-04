@@ -69,7 +69,15 @@ type Client interface {
 	// Firecracker, so a daemon told nothing has to ask Firecracker
 	// afterwards to describe its own host honestly. Declaring it here
 	// keeps that probe off the create path entirely.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits ResourceLimits) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, err error)
+	//
+	// intent says whether this call is creating a sandbox or resuming one
+	// that already exists. It must be declared because THIS method serves
+	// both: it is the create path and it is the stateless-resume fallback,
+	// and the daemon cannot tell them apart — the fallback is taken
+	// precisely when the daemon has no record of the sandbox. A host
+	// enforcing local capacity refuses a call that leaves it unset rather
+	// than guessing, since both guesses are silently wrong.
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits ResourceLimits, intent AdmissionIntent) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, err error)
 	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
 	// running sandbox's boxd. Idempotent.
 	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error
@@ -217,3 +225,24 @@ type BuildStatusResult struct {
 	StartedAtUnix           int64
 	EndedAtUnix             int64
 }
+
+// AdmissionIntent tells a capacity-enforcing daemon why a boot is
+// happening. Defined here rather than reused from the generated protobuf so
+// the control plane's own call sites do not depend on wire types; the gRPC
+// client maps it across the boundary.
+type AdmissionIntent int
+
+const (
+	// IntentUnspecified is the zero value and is never sent deliberately.
+	// A daemon enforcing local capacity refuses it, which is what makes a
+	// caller that forgot to declare its intent fail loudly instead of
+	// being guessed at.
+	IntentUnspecified AdmissionIntent = iota
+	// IntentCreate is a sandbox that does not exist yet, and so may be
+	// refused and placed on another host.
+	IntentCreate
+	// IntentResume is a sandbox that already exists on this host. Never
+	// refused on the operator's sandbox limit: it is bound here and has
+	// nowhere else to go.
+	IntentResume
+)

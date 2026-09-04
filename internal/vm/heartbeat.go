@@ -52,6 +52,11 @@ type HeartbeatConfig struct {
 	// instance map (the control plane keeps the previous report; its age
 	// is the staleness signal). Nil means always ready.
 	PressureReady func() bool
+	// LocalAdmission declares that this daemon enforces the operator's
+	// capacity limits itself. Advertised as a capability so placement can
+	// tell an enforcing host from one that merely reports its load. False
+	// on every host that has not opted in, which is the default.
+	LocalAdmission bool
 	// MaxSandboxes and MaxNetworkSlots are operator-configured admission
 	// limits published alongside pressure; 0 means unset (no cap).
 	MaxSandboxes    int32
@@ -312,6 +317,23 @@ const (
 	// in different packages because the daemon does not import the
 	// control plane.
 	capabilityCapacityPressure = "capacity_pressure_v1"
+
+	// capabilityLocalAdmission marks a daemon that enforces the operator's
+	// capacity limits itself, refusing creates it has no room for.
+	//
+	// Separate from capacity_pressure_v1 because the two are independently
+	// deployable and a host can do the first without the second: publishing
+	// what it is carrying says nothing about whether it will refuse
+	// anything. Placement needs to tell them apart — only a host that
+	// admits locally can be relied on to hold a limit, and only such a host
+	// answers a create with a capacity refusal the caller is meant to retry
+	// elsewhere.
+	//
+	// Advertised whenever the gate is enabled, not only once it is open:
+	// "enforcing, but still reconstructing" is a state the control plane
+	// should see as enforcing-and-currently-refusing, never mistake for a
+	// daemon that does not enforce at all.
+	capabilityLocalAdmission = "local_admission_v1"
 )
 
 type heartbeatStorageCache struct {
@@ -404,6 +426,9 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 		// should read to a consumer: not describable, and not silently
 		// mistaken for a daemon that never publishes.
 		capabilities = append(capabilities, capabilityCapacityPressure)
+	}
+	if cfg.LocalAdmission {
+		capabilities = append(capabilities, capabilityLocalAdmission)
 	}
 	return postHeartbeat(ctx, client, cfg, url, token, capabilities, storage, log, started)
 }
