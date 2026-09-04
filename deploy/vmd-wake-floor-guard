@@ -1,0 +1,34 @@
+#!/bin/sh
+# Host-resident wake-protocol floor for superserve-vmd, invoked from its own
+# systemd drop-in at every service start. It lives in a file and a drop-in of
+# its own, which deploy scripts from before it never install or overwrite:
+# rolling back to such a revision replaces the other guard with that
+# revision's copy, but leaves this one exactly as it is.
+#
+# An image whose workload was frozen for its snapshot owes a wake that only a
+# vmd speaking the protocol can give; any other vmd restores it and leaves it
+# stopped. Two witnesses, either blocks a vmd without the protocol: the
+# evidence file the daemon writes when it first restores, pauses or holds such
+# an image, and the images themselves — templates and paused sandboxes alike —
+# so one that landed moments ago still counts.
+set -u
+BIN="${1:-/usr/local/bin/vmd}"
+
+if grep -qa wake-protocol-1 "$BIN" 2>/dev/null; then
+    exit 0
+fi
+
+WAKE_EVIDENCE=/var/lib/sandbox/wake-protocol-evidence
+SNAPSHOTS=$(sed -n 's/^SNAPSHOT_DIR=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -n 1 | tr -d '"')
+SNAPSHOTS="${SNAPSHOTS:-/var/lib/sandbox/snapshots}"
+wake_evidence=""
+[ -e "$WAKE_EVIDENCE" ] && wake_evidence="$WAKE_EVIDENCE"
+if [ -z "$wake_evidence" ] && grep -lqs '"workload_frozen":true' "$SNAPSHOTS"/templates/*/*/*.wallclock "$SNAPSHOTS"/templates/*/*.wallclock "$SNAPSHOTS"/*/*.wallclock 2>/dev/null; then
+    wake_evidence="frozen image manifest under ${SNAPSHOTS}"
+fi
+if [ -n "$wake_evidence" ]; then
+    echo "vmd-wake-floor-guard: REFUSING to start a vmd without the wake protocol: this host holds images that owe a wake (${wake_evidence})" >&2
+    echo "vmd-wake-floor-guard: deploy a wake-capable build; the floor comes down only once no frozen image can be restored here" >&2
+    exit 1
+fi
+exit 0

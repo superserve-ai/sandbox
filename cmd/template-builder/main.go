@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -181,6 +182,11 @@ type buildConfig struct {
 	slotIndex   int
 	launcherNS  string
 	netlinkOps  bool
+	// freezeWorkload builds the image with its workload freezer and, once the
+	// guest has proven it corrects its clock, snapshots it frozen. Set by
+	// nothing yet: a frozen image is only safe under a supervisor that can wake
+	// it, so the switch arrives with that supervisor.
+	freezeWorkload bool
 }
 
 func runBuild(ctx context.Context, cfg buildConfig) error {
@@ -215,6 +221,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		BoxdBinaryPath:           cfg.boxdBin,
 		MaxUncompressedSizeBytes: int64(cfg.diskMiB) * 1024 * 1024,
 		ProxyCACertPath:          proxyCA,
+		FreezeWorkload:           cfg.freezeWorkload,
 	})
 	if err != nil {
 		return fmt.Errorf("create builder: %w", err)
@@ -311,6 +318,43 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		return fmt.Errorf("guest sync: %w", err)
 	}
 
+	// Ask the guest, in the state the snapshot captures, whether it can correct
+	// its wall clock and freeze its workload; only then may the image be marked.
+	correctsWallClock, why := false, "template workload freezing not enabled"
+	if cfg.freezeWorkload {
+		correctsWallClock, why = boxdWallClockProven(ctx, netInfo.HostIP)
+	}
+	// The token this image's freeze carries; every wake of a sandbox created
+	// from it must present it. Minted here, kept by the guest in the snapshot.
+	freezeToken := vm.NewFreezeToken()
+	if correctsWallClock {
+		// The rollback floor rises before the first frozen artifact can exist
+		// on this host: a supervisor without the wake protocol must never be
+		// installed over one, so a floor that cannot be made durable fails
+		// the build rather than freeze anything.
+		if err := vm.RaiseWakeProtocolFloor(); err != nil {
+			return fmt.Errorf("raise wake-protocol floor: %w", err)
+		}
+	}
+	if correctsWallClock {
+		// A freeze whose answer was lost may still have frozen the guest, and
+		// an image with a stopped workload and no manifest would never be
+		// woken. So a failed freeze is followed by a thaw with the same
+		// token: released, or never frozen, means the image is unfrozen and
+		// the build goes on the older way; anything else fails the build.
+		if err := boxdFreezeWorkload(ctx, netInfo.HostIP, freezeToken); err != nil {
+			if terr := boxdThawWorkload(ctx, netInfo.HostIP, freezeToken); terr != nil && !errors.Is(terr, errNoSuchFreeze) {
+				return fmt.Errorf("workload freeze failed (%v) and the guest could not be released (%v); refusing to snapshot a workload in an unknown state", err, terr)
+			}
+			correctsWallClock, why = false, "workload freeze: "+err.Error()
+		}
+	}
+	if correctsWallClock {
+		emitInternal("system", "guest corrects its wall clock and froze its workload: marking template")
+	} else {
+		emitInternal("system", "template stays on the unfrozen restore path (%s)", why)
+	}
+
 	// block_delta_dir → emits rootfs.delta so sandboxes can be created
 	// from this template's snapshot.
 	emitUser("system", "Saving template")
@@ -322,14 +366,28 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 	emitInternal("system", "snapshot captured")
 
+	// The manifest tells a supervisor this image's workload is frozen, that its
+	// guest corrects its clock, and which token the wake must present.
+	markerPath := ""
+	if correctsWallClock {
+		markerPath = vm.WallClockMarkerPath(memPath)
+		man := vm.WallClockManifest{
+			Version: vm.WallClockManifestVersion, ArtifactID: vm.NewArtifactID(),
+			WorkloadFrozen: true, GuestCorrectsClock: true, FreezeToken: freezeToken,
+		}
+		if err := vm.WriteWallClockManifest(memPath, man); err != nil {
+			return fmt.Errorf("write wall-clock manifest: %w", err)
+		}
+	}
+
 	// Flush host page cache for each artifact so a sandbox cp'ing them
 	// later doesn't see sparse holes from still-dirty pages.
-	if err := fsyncBuildArtifacts(snapDir, snapPath, memPath, basePath, deltaPath); err != nil {
+	if err := fsyncBuildArtifacts(snapDir, snapPath, memPath, basePath, deltaPath, markerPath); err != nil {
 		return fmt.Errorf("fsync build artifacts: %w", err)
 	}
 	emitInternal("system", "artifacts fsynced")
 
-	writeBuildMeta(snapDir, snapPath, memPath, basePath, deltaPath, br)
+	writeBuildMeta(snapDir, snapPath, memPath, basePath, deltaPath, correctsWallClock, br)
 
 	return nil
 }
@@ -556,6 +614,118 @@ func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, d
 		return fmt.Errorf("POST /init: status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// boxdWallClockProven reports whether the guest can read host time and set
+// its own clock, and why not. Any failure to ask reads as not proven.
+func boxdWallClockProven(ctx context.Context, vmIP string) (bool, string) {
+	url := fmt.Sprintf("http://%s:%d/verify-clock", vmIP, boxdPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return false, err.Error()
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return false, "POST /verify-clock: " + err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, "no workload freezer in this image"
+	}
+	var body struct {
+		WallClock struct {
+			Source    string `json:"source"`
+			SettimeOK bool   `json:"settime_ok"`
+			Error     string `json:"error"`
+		} `json:"wall_clock"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return false, "decode /verify-clock: " + err.Error()
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Sprintf("/verify-clock status %d: %s", resp.StatusCode, body.WallClock.Error)
+	}
+	if body.WallClock.Source != "ptp" {
+		if body.WallClock.Error != "" {
+			return false, body.WallClock.Error
+		}
+		return false, "source " + body.WallClock.Source
+	}
+	if !body.WallClock.SettimeOK {
+		if body.WallClock.Error != "" {
+			return false, body.WallClock.Error
+		}
+		return false, "clock cannot be set"
+	}
+	return true, ""
+}
+
+// boxdFreezeWorkload asks the guest to stop its workload for the snapshot. The
+// guest undoes a freeze it could not complete, so an error means it is running.
+func boxdFreezeWorkload(ctx context.Context, vmIP, token string) error {
+	url := fmt.Sprintf("http://%s:%d/freeze", vmIP, boxdPort)
+	payload, _ := json.Marshal(struct {
+		Token string `json:"token"`
+	}{token})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /freeze: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST /freeze: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	// The reply names the protocol the guest speaks and the token it holds;
+	// an image is only marked when both are what this builder asked for.
+	var echo struct {
+		Version int    `json:"version"`
+		Token   string `json:"token"`
+	}
+	if err := json.Unmarshal(body, &echo); err != nil {
+		return fmt.Errorf("POST /freeze: reply: %w", err)
+	}
+	if echo.Version != vm.WallClockManifestVersion || echo.Token != token {
+		return fmt.Errorf("POST /freeze: guest speaks protocol %d and holds token %q, asked %d %q", echo.Version, echo.Token, vm.WallClockManifestVersion, token)
+	}
+	return nil
+}
+
+// errNoSuchFreeze: the guest holds no freeze under that token, so there was
+// nothing to release — the freeze never took.
+var errNoSuchFreeze = errors.New("guest holds no freeze under this token")
+
+// boxdThawWorkload releases a freeze whose outcome is unknown. 200 released;
+// 409 errNoSuchFreeze; anything else leaves the state unknown.
+func boxdThawWorkload(ctx context.Context, vmIP, token string) error {
+	url := fmt.Sprintf("http://%s:%d/thaw", vmIP, boxdPort)
+	payload, _ := json.Marshal(struct {
+		Token string `json:"token"`
+	}{token})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /thaw: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return nil
+	case http.StatusConflict:
+		return errNoSuchFreeze
+	default:
+		return fmt.Errorf("POST /thaw: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 }
 
 // userEnv filters the build-time env map down to the keys set via `env`
@@ -881,7 +1051,7 @@ func createBuildOverlay(runDir, vmID, basePath string) (string, error) {
 // Build metadata
 // ---------------------------------------------------------------------------
 
-func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br builder.BuildRootfsResult) {
+func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, correctsWallClock bool, br builder.BuildRootfsResult) {
 	// rootfs_path stays in the schema for backwards compat with existing
 	// readers; supervisors that understand overlay use base_path/delta_path.
 	meta := struct {
@@ -894,16 +1064,19 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br build
 		SizeBytes      int64  `json:"size_bytes"`
 		BuiltAt        string `json:"built_at"`
 		SwapMode       string `json:"swap_mode"` // see builder.SwapModeGuest
+		// Same fact as the manifest beside mem.snap; kept here for provenance.
+		CorrectsWallClock bool `json:"corrects_wall_clock"`
 	}{
-		SnapshotPath:   snapPath,
-		MemPath:        memPath,
-		RootfsPath:     basePath,
-		BasePath:       basePath,
-		DeltaPath:      deltaPath,
-		ResolvedDigest: br.ResolvedDigest,
-		SizeBytes:      br.SizeBytes,
-		BuiltAt:        time.Now().UTC().Format(time.RFC3339),
-		SwapMode:       builder.SwapModeGuest,
+		SnapshotPath:      snapPath,
+		MemPath:           memPath,
+		RootfsPath:        basePath,
+		BasePath:          basePath,
+		DeltaPath:         deltaPath,
+		ResolvedDigest:    br.ResolvedDigest,
+		SizeBytes:         br.SizeBytes,
+		BuiltAt:           time.Now().UTC().Format(time.RFC3339),
+		SwapMode:          builder.SwapModeGuest,
+		CorrectsWallClock: correctsWallClock,
 	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
