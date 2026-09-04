@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,7 +83,14 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 
 	buildVMID := req.BuildVMID
 	if buildVMID == "" {
-		buildVMID = "build-" + req.TemplateID
+		buildVMID = defaultBuildVMID(req.TemplateID)
+	}
+	// A published template is immutable: its directory is what every sandbox
+	// created from it, and every paused overlay layered on it, refers to. A
+	// build never lands on one; a rebuild is a new build id and a new
+	// directory, which is how the control plane names its builds anyway.
+	if err := m.prepareBuildDir(req.TemplateID, buildVMID); err != nil {
+		return "", err
 	}
 
 	// Fresh context so the build survives the caller's HTTP request
@@ -97,6 +106,31 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 	go func() { defer sentrylog.Recover("build-worker"); m.buildTemplateWorker(buildCtx, buildVMID, req, rec) }()
 
 	return buildVMID, nil
+}
+
+// defaultBuildVMID names a build whose caller supplied no id: unique, so it
+// can never land where a published template already is.
+func defaultBuildVMID(templateID string) string {
+	return "build-" + templateID + "-" + randomHex()[:8]
+}
+
+// prepareBuildDir refuses a build into a directory that holds a published
+// template, and clears one a crashed build left unpublished: its files —
+// a snapshot, a wall-clock manifest — must not survive beside the new
+// build's. Published means the builder wrote its metadata, which it does
+// last.
+func (m *Manager) prepareBuildDir(templateID, buildVMID string) error {
+	dir := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, templateID, buildVMID)
+	if _, err := os.Stat(filepath.Join(dir, buildMetaFilename)); err == nil {
+		return status.Errorf(codes.AlreadyExists, "template %s build %s is already published at %s; a rebuild needs a new build id", templateID, buildVMID, dir)
+	}
+	if _, err := os.Stat(dir); err == nil {
+		m.log.Warn().Str("dir", dir).Msg("build: clearing the leftovers of an unpublished build")
+		if err := os.RemoveAll(dir); err != nil {
+			return fmt.Errorf("clear unpublished build directory %s: %w", dir, err)
+		}
+	}
+	return nil
 }
 
 // buildTemplateWorker is the goroutine body. Runs one build end-to-end and

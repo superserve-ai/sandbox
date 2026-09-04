@@ -545,9 +545,6 @@ type Manager struct {
 	// restoreSem bounds concurrent RestoreVMSnapshot operations. Buffered
 	// channel; capacity = effective MaxConcurrentRestores.
 	restoreSem chan struct{}
-	// templateManifests keeps the manifest beside each template image this
-	// daemon has restored from; see imageManifestCached.
-	templateManifests sync.Map
 
 	// tplLastRestore: last restore time per template mem file, for the
 	// secs_since_template_restore phase tag (a page-cache warmth proxy).
@@ -1993,26 +1990,6 @@ func readLayeredBase(memPath string) (string, bool) {
 	return base, base != ""
 }
 
-// imageManifestCached is imageManifest with the answer kept for a template
-// image: a template build is immutable once published, so its manifest is
-// read once per daemon and every later create from it costs a map lookup.
-// Any other image is read each time. An error is not kept.
-func (m *Manager) imageManifestCached(memPath string) (*WallClockManifest, error) {
-	if !m.isTemplateMemPath(memPath) {
-		return imageManifest(memPath)
-	}
-	key := filepath.Clean(memPath)
-	if v, ok := m.templateManifests.Load(key); ok {
-		return v.(*WallClockManifest), nil
-	}
-	man, err := imageManifest(memPath)
-	if err != nil {
-		return nil, err
-	}
-	m.templateManifests.Store(key, man)
-	return man, nil
-}
-
 // isOverlayMemFile reports whether memPath names a layered diff overlay (which
 // must be restored over a base, never standalone).
 func isOverlayMemFile(memPath string) bool {
@@ -3115,11 +3092,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			return nil, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing restore until it is inspected", memPath, why)
 		}
 	}
-	// What the image says about its guest, read once: whether its workload is
-	// frozen, and whether the guest corrects its clock. A manifest this binary
-	// cannot trust, or a frozen workload it cannot wake, refuses the restore
-	// here, before anything is launched.
-	manifest, merr := m.imageManifestCached(memPath)
+	// What the image says about its guest, read once per restore: whether its
+	// workload is frozen, and whether the guest corrects its clock. Read from
+	// the disk every time, never remembered by path: a template directory is
+	// meant to be immutable, but a cache here would turn any exception into a
+	// frozen image restored the old way, with its workload never released.
+	// One small open beside the sidecar read this path already does. A
+	// manifest this binary cannot trust, or a frozen workload it cannot wake,
+	// refuses the restore here, before anything is launched.
+	manifest, merr := imageManifest(memPath)
 	if merr != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
 	}

@@ -190,44 +190,26 @@ func TestRaiseWakeProtocolFloorIsDurable(t *testing.T) {
 	}
 }
 
-// A template build is immutable once published, so its manifest is read once
-// per daemon; any other image is read every time.
-func TestTemplateManifestIsReadOncePerDaemon(t *testing.T) {
+// A template image replaced at the same path is seen as it is now, in both
+// directions: nothing remembers a manifest by path.
+func TestTemplateManifestIsReadOnEveryRestore(t *testing.T) {
 	dir := t.TempDir()
-	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
 	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1", "mem.snap")
 	if err := os.MkdirAll(filepath.Dir(tpl), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if man, err := m.imageManifestCached(tpl); err != nil || man != nil {
-		t.Fatalf("first read: man=%+v err=%v, want legacy", man, err)
+	if man, err := imageManifest(tpl); err != nil || man != nil {
+		t.Fatalf("legacy: man=%+v err=%v", man, err)
 	}
 	seedFrozenManifest(t, tpl, "tok")
-	if man, err := m.imageManifestCached(tpl); err != nil || man != nil {
-		t.Fatalf("second read: man=%+v err=%v, want the first answer kept", man, err)
+	if man, err := imageManifest(tpl); err != nil || man == nil || !man.WorkloadFrozen {
+		t.Fatalf("legacy replaced by frozen: man=%+v err=%v, want the frozen manifest seen", man, err)
 	}
-	// A path that only looks like a template's is not one, and is not kept.
-	dotted := filepath.Join(dir, TemplatesDirName, "..", "vm-2", "mem.snap")
-	if err := os.MkdirAll(filepath.Dir(dotted), 0o755); err != nil {
+	if err := os.Remove(WallClockMarkerPath(tpl)); err != nil {
 		t.Fatal(err)
 	}
-	if man, err := m.imageManifestCached(dotted); err != nil || man != nil {
-		t.Fatalf("dotted path, first read: man=%+v err=%v", man, err)
-	}
-	seedFrozenManifest(t, dotted, "tok")
-	if man, err := m.imageManifestCached(dotted); err != nil || man == nil {
-		t.Fatalf("dotted path, second read: man=%+v err=%v, want the disk consulted, not a cached answer", man, err)
-	}
-	other := filepath.Join(dir, "vm-1", "mem.snap")
-	if err := os.MkdirAll(filepath.Dir(other), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if man, err := m.imageManifestCached(other); err != nil || man != nil {
-		t.Fatalf("paused image, first read: man=%+v err=%v", man, err)
-	}
-	seedFrozenManifest(t, other, "tok")
-	if man, err := m.imageManifestCached(other); err != nil || man == nil || !man.WorkloadFrozen {
-		t.Fatalf("paused image, second read: man=%+v err=%v, want the disk consulted", man, err)
+	if man, err := imageManifest(tpl); err != nil || man != nil {
+		t.Fatalf("frozen replaced by legacy: man=%+v err=%v, want legacy seen", man, err)
 	}
 }
 
