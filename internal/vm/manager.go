@@ -545,6 +545,9 @@ type Manager struct {
 	// restoreSem bounds concurrent RestoreVMSnapshot operations. Buffered
 	// channel; capacity = effective MaxConcurrentRestores.
 	restoreSem chan struct{}
+	// templateManifests keeps the manifest beside each template image this
+	// daemon has restored from; see imageManifestCached.
+	templateManifests sync.Map
 
 	// tplLastRestore: last restore time per template mem file, for the
 	// secs_since_template_restore phase tag (a page-cache warmth proxy).
@@ -1990,6 +1993,26 @@ func readLayeredBase(memPath string) (string, bool) {
 	return base, base != ""
 }
 
+// imageManifestCached is imageManifest with the answer kept for a template
+// image: a template build is immutable once published, so its manifest is
+// read once per daemon and every later create from it costs a map lookup.
+// Any other image is read each time. An error is not kept.
+func (m *Manager) imageManifestCached(memPath string) (*WallClockManifest, error) {
+	root := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName) + string(filepath.Separator)
+	if m.cfg.SnapshotDir == "" || !strings.HasPrefix(memPath, root) {
+		return imageManifest(memPath)
+	}
+	if v, ok := m.templateManifests.Load(memPath); ok {
+		return v.(*WallClockManifest), nil
+	}
+	man, err := imageManifest(memPath)
+	if err != nil {
+		return nil, err
+	}
+	m.templateManifests.Store(memPath, man)
+	return man, nil
+}
+
 // isOverlayMemFile reports whether memPath names a layered diff overlay (which
 // must be restored over a base, never standalone).
 func isOverlayMemFile(memPath string) bool {
@@ -2182,12 +2205,15 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// the record already holds the answer; only an override, or a record that
 	// lost it, goes to disk. An intent left beside the image by a pause that was
 	// interrupted, a manifest this binary cannot trust, or a frozen workload it
-	// cannot wake, each refuse the resume here.
+	// cannot wake, each refuse the resume here. An intent exists only on a
+	// host whose floor is up; elsewhere nothing is looked for.
 	inst.mu.RLock()
 	recordedCorrects, pausedMemPath, recordedArtifact := inst.CorrectsWallClock, inst.MemFilePath, inst.ArtifactID
 	inst.mu.RUnlock()
-	if blocked, why := pauseIntentBlocks(filepath.Dir(memPath), recordedArtifact); blocked {
-		return nil, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing resume until it is inspected", memPath, why)
+	if wakeProtocolFloorRaised() {
+		if blocked, why := pauseIntentBlocks(filepath.Dir(memPath), recordedArtifact); blocked {
+			return nil, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing resume until it is inspected", memPath, why)
+		}
 	}
 	resumeCorrectsWallClock, resumeWorkloadFrozen, merr := resumeWallClockProperty(memPath, pausedMemPath, recordedCorrects)
 	if merr != nil {
@@ -3074,24 +3100,26 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
 	}
-	// An in-place restore may meet the leftover of a pause that completed; any
-	// other intent means an interrupted rewrite.
-	knownArtifact := ""
+	// An in-place restore of a VM this daemon knows may meet the leftover of a
+	// pause that completed; any other intent means an interrupted rewrite. A
+	// template holds no intent, and no host whose floor is down holds one, so
+	// a create looks for nothing.
 	m.mu.RLock()
-	if prev := m.vms[vmID]; prev != nil {
-		prev.mu.RLock()
-		knownArtifact = prev.ArtifactID
-		prev.mu.RUnlock()
-	}
+	prev := m.vms[vmID]
 	m.mu.RUnlock()
-	if blocked, why := pauseIntentBlocks(filepath.Dir(memPath), knownArtifact); blocked {
-		return nil, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing restore until it is inspected", memPath, why)
+	if prev != nil && wakeProtocolFloorRaised() {
+		prev.mu.RLock()
+		knownArtifact := prev.ArtifactID
+		prev.mu.RUnlock()
+		if blocked, why := pauseIntentBlocks(filepath.Dir(memPath), knownArtifact); blocked {
+			return nil, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing restore until it is inspected", memPath, why)
+		}
 	}
 	// What the image says about its guest, read once: whether its workload is
 	// frozen, and whether the guest corrects its clock. A manifest this binary
 	// cannot trust, or a frozen workload it cannot wake, refuses the restore
 	// here, before anything is launched.
-	manifest, merr := imageManifest(memPath)
+	manifest, merr := m.imageManifestCached(memPath)
 	if merr != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
 	}

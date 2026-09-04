@@ -701,7 +701,10 @@ func boxdFreezeWorkload(ctx context.Context, vmIP, token string) error {
 var errNoSuchFreeze = errors.New("guest holds no freeze under this token")
 
 // boxdThawWorkload releases a freeze whose outcome is unknown. 200 released;
-// 409 errNoSuchFreeze; anything else leaves the state unknown.
+// 409 with the guest reporting a running workload errNoSuchFreeze; anything
+// else leaves the state unknown. A 409 alone is not proof: the guest answers
+// it both when it holds no freeze under the token and when it holds one under
+// another, and only its own report tells those apart.
 func boxdThawWorkload(ctx context.Context, vmIP, token string) error {
 	url := fmt.Sprintf("http://%s:%d/thaw", vmIP, boxdPort)
 	payload, _ := json.Marshal(struct {
@@ -722,10 +725,38 @@ func boxdThawWorkload(ctx context.Context, vmIP, token string) error {
 	case http.StatusOK:
 		return nil
 	case http.StatusConflict:
+		if err := boxdWorkloadRunning(ctx, vmIP); err != nil {
+			return fmt.Errorf("POST /thaw: %s; %w", strings.TrimSpace(string(body)), err)
+		}
 		return errNoSuchFreeze
 	default:
 		return fmt.Errorf("POST /thaw: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+}
+
+// boxdWorkloadRunning asks the guest whether its workload runs. Anything but
+// a plain ok is not proof that it does.
+func boxdWorkloadRunning(ctx context.Context, vmIP string) error {
+	url := fmt.Sprintf("http://%s:%d/health", vmIP, boxdPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("GET /health: %w", err)
+	}
+	defer resp.Body.Close()
+	var health struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		return fmt.Errorf("decode /health: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK || health.Status != "ok" {
+		return fmt.Errorf("guest reports %q (status %d), not a running workload", health.Status, resp.StatusCode)
+	}
+	return nil
 }
 
 // userEnv filters the build-time env map down to the keys set via `env`

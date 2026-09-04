@@ -57,8 +57,23 @@ func TestImageManifest(t *testing.T) {
 			t.Fatalf("m=%+v err=%v, want nil, nil", m, err)
 		}
 	})
+	// The zero-byte marker an earlier supervisor wrote carries no manifest:
+	// the image is restored the older way, never refused.
+	t.Run("empty_marker_is_legacy", func(t *testing.T) {
+		mem := filepath.Join(t.TempDir(), "mem.snap")
+		if err := os.WriteFile(WallClockMarkerPath(mem), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		m, err := imageManifest(mem)
+		if err != nil || m != nil {
+			t.Fatalf("m=%+v err=%v, want nil, nil", m, err)
+		}
+		if guestCorrectsWallClock(mem, "") {
+			t.Fatal("an empty marker is not proof the guest corrects its clock")
+		}
+	})
 	t.Run("unreadable_is_refused", func(t *testing.T) {
-		for name, body := range map[string]string{"empty": "", "garbage": "{", "future": `{"version":2}`, "frozen_without_token": `{"version":1,"workload_frozen":true}`} {
+		for name, body := range map[string]string{"garbage": "{", "future": `{"version":2}`, "frozen_without_token": `{"version":1,"workload_frozen":true}`} {
 			mem := filepath.Join(t.TempDir(), "mem.snap")
 			if err := os.WriteFile(WallClockMarkerPath(mem), []byte(body), 0o644); err != nil {
 				t.Fatal(err)
@@ -90,68 +105,15 @@ func TestWallClockMarkerPathMatchesInternal(t *testing.T) {
 	}
 }
 
-// The first manifest read on a host leaves evidence for the deploy guard; an
-// absent manifest is not one.
-func TestReadingAManifestLeavesWakeProtocolEvidence(t *testing.T) {
-	dir := t.TempDir()
-	isolateEvidence(t, dir)
-
-	mem := filepath.Join(dir, "mem.snap")
-	if _, err := ReadWallClockManifest(mem); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(wakeProtocolEvidencePath); !os.IsNotExist(err) {
-		t.Fatal("an absent manifest is not evidence")
-	}
-	seedFrozenManifest(t, mem, "tok")
-	if _, err := ReadWallClockManifest(mem); err != nil {
-		t.Fatal(err)
-	}
-	b, err := os.ReadFile(wakeProtocolEvidencePath)
-	if err != nil || len(b) == 0 {
-		t.Fatalf("evidence = %q, %v; want a non-empty file", b, err)
-	}
-}
-
-// Templates are seeded while the daemon runs; the first frozen one to land
-// raises the floor here, at the builder's real layout depth.
-func TestTemplateManifestsLeaveEvidence(t *testing.T) {
-	dir := t.TempDir()
-	isolateEvidence(t, dir)
-
-	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
-	if n := m.scanTemplateManifests(); n != 0 {
-		t.Fatalf("found %d manifests in an empty tree", n)
-	}
-	if _, err := os.Stat(wakeProtocolEvidencePath); !os.IsNotExist(err) {
-		t.Fatal("no templates is not evidence")
-	}
-	// The builder's layout: templates/<template>/<build>/mem.snap.
-	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
-	if err := os.MkdirAll(tpl, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	seedFrozenManifest(t, filepath.Join(tpl, "mem.snap"), "tok")
-	if n := m.scanTemplateManifests(); n != 1 {
-		t.Fatalf("found %d manifests, want 1", n)
-	}
-	if _, err := os.Stat(wakeProtocolEvidencePath); err != nil {
-		t.Fatalf("evidence not written after a frozen template landed: %v", err)
-	}
-}
-
 // Starting a daemon creates no evidence — or every host with the switches off
 // would raise the floor and block a rollback of itself — but evidence a
-// previous process made durable is recognised.
+// previous process made durable is recognised, and only then are pause
+// intents looked for.
 func TestStartupRecognisesButNeverRaisesTheFloor(t *testing.T) {
 	dir := t.TempDir()
 	isolateEvidence(t, dir)
-	m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}}
-	ctx, cancel := context.WithCancel(context.Background())
-	m.WatchTemplateManifests(ctx, zerolog.Nop())
-	cancel()
-	if recognizeWakeProtocolFloor() {
-		t.Fatal("floor raised by a daemon that holds no frozen image")
+	if RecognizeWakeProtocolFloor() || wakeProtocolFloorRaised() {
+		t.Fatal("floor raised on a host that holds no frozen image")
 	}
 	if _, err := os.Stat(wakeProtocolEvidencePath); !os.IsNotExist(err) {
 		t.Fatal("startup created evidence")
@@ -159,54 +121,64 @@ func TestStartupRecognisesButNeverRaisesTheFloor(t *testing.T) {
 	if err := os.WriteFile(wakeProtocolEvidencePath, []byte("x\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if !recognizeWakeProtocolFloor() {
+	if !RecognizeWakeProtocolFloor() || !wakeProtocolFloorRaised() {
 		t.Fatal("existing evidence not recognised")
 	}
 }
 
-func TestExistingWakeProtocolEvidenceNeedsNoWrite(t *testing.T) {
+// The builder raises the floor before it publishes a frozen image; a later
+// process finds it durable, and a raise that cannot land is an error.
+func TestRaiseWakeProtocolFloorIsDurable(t *testing.T) {
 	dir := t.TempDir()
 	isolateEvidence(t, dir)
-	if err := os.WriteFile(wakeProtocolEvidencePath, []byte("older-process\n"), 0o644); err != nil {
+	if err := RaiseWakeProtocolFloor(); err != nil {
 		t.Fatal(err)
 	}
-	if err := ensureWakeProtocolFloor(); err != nil || !wakeProtocolEvidenceDone.Load() {
-		t.Fatalf("err=%v done=%v", err, wakeProtocolEvidenceDone.Load())
+	b, err := os.ReadFile(wakeProtocolEvidencePath)
+	if err != nil || len(b) == 0 {
+		t.Fatalf("evidence = %q, %v; want a non-empty file", b, err)
 	}
-	if b, _ := os.ReadFile(wakeProtocolEvidencePath); string(b) != "older-process\n" {
-		t.Errorf("existing evidence rewritten: %q", b)
+	wakeProtocolEvidenceDone.Store(false) // a fresh process
+	if !RecognizeWakeProtocolFloor() {
+		t.Fatal("a fresh process did not recognise the evidence")
 	}
-}
-
-func TestWakeProtocolEvidenceRetriesAfterFailure(t *testing.T) {
-	dir := t.TempDir()
-	orig := wakeProtocolEvidencePath
-	// A path inside a directory that exists but is a file: the write fails.
 	blocker := filepath.Join(dir, "blocker")
 	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	wakeProtocolEvidencePath = filepath.Join(blocker, "evidence")
 	wakeProtocolEvidenceDone.Store(false)
-	t.Cleanup(func() { wakeProtocolEvidencePath = orig; wakeProtocolEvidenceDone.Store(false) })
+	if err := RaiseWakeProtocolFloor(); err == nil || wakeProtocolFloorRaised() {
+		t.Fatalf("err=%v raised=%v; a raise that cannot land must fail and not be remembered", err, wakeProtocolFloorRaised())
+	}
+}
 
-	mem := filepath.Join(dir, "mem.snap")
-	seedFrozenManifest(t, mem, "tok")
-	if _, err := ReadWallClockManifest(mem); err != nil {
+// A template build is immutable once published, so its manifest is read once
+// per daemon; any other image is read every time.
+func TestTemplateManifestIsReadOncePerDaemon(t *testing.T) {
+	dir := t.TempDir()
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
+	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1", "mem.snap")
+	if err := os.MkdirAll(filepath.Dir(tpl), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if wakeProtocolEvidenceDone.Load() {
-		t.Fatal("a failed write must not be remembered as done")
+	if man, err := m.imageManifestCached(tpl); err != nil || man != nil {
+		t.Fatalf("first read: man=%+v err=%v, want legacy", man, err)
 	}
-	wakeProtocolEvidencePath = filepath.Join(dir, "evidence")
-	if _, err := ReadWallClockManifest(mem); err != nil {
+	seedFrozenManifest(t, tpl, "tok")
+	if man, err := m.imageManifestCached(tpl); err != nil || man != nil {
+		t.Fatalf("second read: man=%+v err=%v, want the first answer kept", man, err)
+	}
+	other := filepath.Join(dir, "vm-1", "mem.snap")
+	if err := os.MkdirAll(filepath.Dir(other), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if !wakeProtocolEvidenceDone.Load() {
-		t.Fatal("the retry did not land")
+	if man, err := m.imageManifestCached(other); err != nil || man != nil {
+		t.Fatalf("paused image, first read: man=%+v err=%v", man, err)
 	}
-	if _, err := os.Stat(wakeProtocolEvidencePath); err != nil {
-		t.Fatalf("evidence missing after retry: %v", err)
+	seedFrozenManifest(t, other, "tok")
+	if man, err := m.imageManifestCached(other); err != nil || man == nil || !man.WorkloadFrozen {
+		t.Fatalf("paused image, second read: man=%+v err=%v, want the disk consulted", man, err)
 	}
 }
 
