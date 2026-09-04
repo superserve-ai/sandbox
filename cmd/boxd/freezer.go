@@ -78,6 +78,7 @@ type freezer struct {
 var (
 	errTokenMismatch = errors.New("freeze token mismatch")
 	errTokenConflict = errors.New("another freeze is active")
+	errTokenReused   = errors.New("freeze token already used")
 )
 
 // newFreezer wraps a cgroup the init script mounted. It is only asked for
@@ -223,7 +224,9 @@ func (f *freezer) isFrozen() bool {
 // freeze stops the cgroup and waits for every task to stop. On timeout it
 // thaws; if that cannot be confirmed it stays frozen under the token and wraps
 // errThawUnconfirmed. Repeating a freeze with its own token succeeds; a
-// different token while one is active conflicts.
+// different token while one is active conflicts. A token names one freeze:
+// once released it is refused, so a delayed wake or thaw for the old freeze
+// can never release a later one. A retry after a failure mints a new token.
 func (f *freezer) freeze(ctx context.Context, token string) error {
 	if !f.available() {
 		return errors.New("freezer cgroup unavailable")
@@ -241,6 +244,9 @@ func (f *freezer) freeze(ctx context.Context, token string) error {
 		if st, err := f.fs.readState(); err == nil && st == "FROZEN" {
 			return nil
 		}
+	}
+	if !f.frozen.Load() && f.released(token) {
+		return errTokenReused
 	}
 	// The budget covers the wait for the guard too: a caller that has given
 	// up must not find its workload stopped after all.
@@ -450,7 +456,7 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 	if err := f.freeze(ctx, body.Token); err != nil {
 		code := http.StatusServiceUnavailable
 		switch {
-		case errors.Is(err, errTokenConflict):
+		case errors.Is(err, errTokenConflict), errors.Is(err, errTokenReused):
 			code = http.StatusConflict
 		case errors.Is(err, errThawUnconfirmed):
 			code = http.StatusInternalServerError

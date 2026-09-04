@@ -116,11 +116,15 @@ func TestWakeIsIdempotentForItsTokenOnly(t *testing.T) {
 	if code, body := wakeWith(clock, fz, true, "t1"); code != 200 || body["status"] != "ok" {
 		t.Fatalf("retry with the clock unreadable: code %d body %v, want 200 ok", code, body)
 	}
-	// A new freeze under the same token is a new wake, not a retry.
+	// The next freeze needs a new token; a delayed wake for the old one is
+	// refused against it and changes nothing.
 	src.hostErr = nil
-	_ = fz.freeze(bg(), "t1")
-	if code, _ := wakeWith(clock, fz, false, "t1"); code != 200 || fz.isFrozen() {
-		t.Fatalf("wake after a new freeze: code %d frozen %v, want 200 and released", code, fz.isFrozen())
+	_ = fz.freeze(bg(), "t3")
+	if code, _ := wakeWith(clock, fz, true, "t1"); code != 409 || !fz.isFrozen() {
+		t.Fatalf("stale wake against a new freeze: code %d frozen %v, want 409 and still frozen", code, fz.isFrozen())
+	}
+	if code, _ := wakeWith(clock, fz, false, "t3"); code != 200 || fz.isFrozen() {
+		t.Fatalf("wake of the new freeze: code %d frozen %v, want 200 and released", code, fz.isFrozen())
 	}
 }
 
