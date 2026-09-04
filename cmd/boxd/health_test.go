@@ -160,11 +160,16 @@ func TestVerifyClockIsItsOwnRoute(t *testing.T) {
 	if code != 200 || wc["settime_ok"] != true {
 		t.Errorf("code %d body %v, want proven", code, body)
 	}
+	// Not proven is a failure in the status code too, not only in the body.
 	denied := &fakeSource{host: base, setErr: errors.New("EPERM")}
-	_, body = verifyClock(clockUnder(denied, base), fz)
+	code, body = verifyClock(clockUnder(denied, base), fz)
 	wc, _ = body["wall_clock"].(map[string]any)
-	if wc["settime_ok"] == true {
-		t.Errorf("settime_ok reported despite EPERM: %v", body)
+	if code != http.StatusServiceUnavailable || body["status"] != "clock" || wc["settime_ok"] == true {
+		t.Errorf("EPERM: code %d body %v, want 503 clock and not proven", code, body)
+	}
+	unreadable := &fakeSource{hostErr: errors.New("no ptp")}
+	if code, body := verifyClock(clockUnder(unreadable, base), fz); code != http.StatusServiceUnavailable || body["status"] != "clock" {
+		t.Errorf("no host time: code %d body %v, want 503 clock", code, body)
 	}
 	// Health with a verify query does nothing of the kind.
 	probe := &fakeSource{host: base}

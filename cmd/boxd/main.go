@@ -209,10 +209,18 @@ func handleVerifyClock(clock *wallClock, fz *freezer) http.HandlerFunc {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		wc := clock.verifySet()
+		status := "ok"
+		if !wc.SettimeOK {
+			// Not proven is a failure, in the status code too: a caller that
+			// reads only the code must not mark this guest as correcting.
+			status = "clock"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
 		json.NewEncoder(w).Encode(struct {
 			Status    string          `json:"status"`
 			WallClock wallClockStatus `json:"wall_clock"`
-		}{Status: "ok", WallClock: clock.verifySet()})
+		}{Status: status, WallClock: wc})
 	}
 }
 
