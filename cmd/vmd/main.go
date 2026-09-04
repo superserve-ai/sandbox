@@ -561,8 +561,11 @@ func main() {
 		switch os.Args[1] {
 		case "capabilities":
 			// Advertised so rollback tooling can detect a downgrade to a binary
-			// that lacks cgroup supervision. Env-free by design.
+			// that lacks cgroup supervision, or the wake protocol frozen images
+			// depend on. Env-free by design; the literals are what the deploy
+			// guard greps the binary for, so they must stay verbatim.
 			fmt.Println("cgroup-supervision")
+			fmt.Println(vm.WakeProtocolCapability)
 			return
 		case "drain-check":
 			os.Exit(runDrainCheck())
@@ -707,6 +710,14 @@ func main() {
 	// Off by default: it only does anything for a snapshot whose guest corrects
 	// its own wall clock, and forcing legacy is the way back if one misbehaves.
 	guestClockFreezeEnabled := envOrDefault("VMD_GUEST_CLOCK_FREEZE", "false") == "true"
+	// Pause-side wait for the guest to stop its workload before a frozen-clock
+	// snapshot; only paid when the restore would freeze the clock.
+	guestFreezeBudget := 500 * time.Millisecond
+	if v := envOrDefault("VMD_GUEST_FREEZE_BUDGET_MS", ""); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			guestFreezeBudget = time.Duration(ms) * time.Millisecond
+		}
+	}
 	// Tri-state: "auto" (default) lets vmd enforce only after its convergence
 	// sweep proves every layered overlay has a presence side-car; "always"
 	// forces enforcement (fresh migration-target hosts); "never" is the
@@ -881,6 +892,7 @@ func main() {
 		DirtyTrackingSessionEnabled:         dirtyTrackingSessionEnabled,
 		HandlerDeathAbortEnabled:            handlerDeathAbortEnabled,
 		GuestClockFreezeEnabled:             guestClockFreezeEnabled,
+		GuestFreezeBudget:                   guestFreezeBudget,
 		RequirePresenceSidecar:              requirePresenceSidecar,
 		PausedNetworkReclaimEnabled:         pausedNetworkReclaimEnabled,
 		PausedNetworkSlotHeadroomPercent:    pausedNetworkSlotHeadroomPercent,
@@ -1564,6 +1576,7 @@ func main() {
 	// Evidence a previous process made durable is recognised; starting a vmd
 	// creates none.
 	vm.RecognizeWakeProtocolFloor()
+	mgr.WatchTemplateManifests(ctx, log)
 
 	// ---- Background full reattach ----
 	// Off the critical path (requests load their VM on demand); proactively
