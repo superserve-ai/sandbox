@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -10,7 +11,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // WallClockManifest sits beside a memory image and says what a supervisor may
@@ -34,6 +39,10 @@ type WallClockManifest struct {
 }
 
 const WallClockManifestVersion = 1
+
+// WakeProtocolCapability is the string a vmd that can wake a frozen image
+// carries; the host guard and the deploy check grep the binary for it.
+const WakeProtocolCapability = "wake-protocol-1"
 
 // wakeProtocolEvidencePath records that this host has held an image that
 // owes a wake, so the host-resident guard refuses a vmd without the wake
@@ -76,6 +85,31 @@ func RecognizeWakeProtocolFloor() bool {
 // pause intent is only ever written on a host whose floor is up, so on any
 // other host the checks for one are skipped, at no cost.
 func wakeProtocolFloorRaised() bool { return wakeProtocolEvidenceSeen.Load() }
+
+// wakeProtocolEvidenceMu makes concurrent first raises share one write
+// instead of each paying the sync.
+var wakeProtocolEvidenceMu sync.Mutex
+
+// ensureWakeProtocolFloor is the form a supervisor uses before it acts on an
+// image that owes a wake — freezing one, restoring one: durable once, then
+// free. Never on a request path for an image that owes nothing.
+func ensureWakeProtocolFloor() error {
+	if wakeProtocolEvidenceDurable.Load() {
+		return nil
+	}
+	wakeProtocolEvidenceMu.Lock()
+	defer wakeProtocolEvidenceMu.Unlock()
+	return RaiseWakeProtocolFloor()
+}
+
+// noteWakeProtocolEvidence is the best-effort form, for the template scan: a
+// host without the directory is not a fleet host.
+func noteWakeProtocolEvidence() {
+	if _, err := os.Stat(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
+		return
+	}
+	_ = ensureWakeProtocolFloor()
+}
 
 // RaiseWakeProtocolFloor durably records that this host holds, or is about to
 // hold, an image that owes a wake. The template builder calls it before it
@@ -232,4 +266,56 @@ func randomHex() string {
 // clock.
 func imageManifest(memPath string) (*WallClockManifest, error) {
 	return ReadWallClockManifest(memPath)
+}
+
+// WatchTemplateManifests keeps the wake-protocol evidence in step with the
+// templates this host holds. Templates are seeded while the daemon runs, so
+// the first frozen one to land is what raises the rollback floor here — no
+// restore has to happen first. A directory listing at start and every few
+// minutes, off every request path.
+func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger) {
+	if m.cfg.SnapshotDir == "" {
+		return
+	}
+	scan := func() {
+		if n := m.scanTemplateManifests(); n > 0 && !wakeProtocolEvidenceLogged.Swap(true) {
+			log.Info().Int("templates", n).Msg("this host holds images that owe a wake; a vmd without the wake protocol is refused from now on")
+		}
+	}
+	go func() {
+		scan()
+		t := time.NewTicker(firecrackerCapabilityRefreshInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				scan()
+			}
+		}
+	}()
+}
+
+var wakeProtocolEvidenceLogged atomic.Bool
+
+// scanTemplateManifests reads every template manifest under the snapshot
+// directory, raises the floor for each frozen one, and returns how many
+// frozen ones it found.
+func (m *Manager) scanTemplateManifests() int {
+	// Templates live at templates/<template>/<build>/; the shallower pattern
+	// is kept so a flattened layout could never hide one.
+	root := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)
+	deep, _ := filepath.Glob(filepath.Join(root, "*", "*", "*"+clockFreezeMarkerSuffix))
+	shallow, _ := filepath.Glob(filepath.Join(root, "*", "*"+clockFreezeMarkerSuffix))
+	n := 0
+	for _, path := range append(deep, shallow...) {
+		man, err := ReadWallClockManifest(strings.TrimSuffix(path, clockFreezeMarkerSuffix))
+		if err != nil || man == nil || !man.WorkloadFrozen {
+			continue
+		}
+		n++
+		noteWakeProtocolEvidence()
+	}
+	return n
 }

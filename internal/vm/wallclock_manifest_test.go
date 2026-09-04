@@ -213,11 +213,15 @@ func TestTemplateManifestIsReadOnEveryRestore(t *testing.T) {
 	}
 }
 
-// An image whose workload is frozen owes a wake this supervisor cannot give:
-// both resume and restore refuse it before anything is launched, rather than
-// restore it with its workload stopped for good.
-func TestFrozenImageIsRefusedBeforeLaunch(t *testing.T) {
-	isolateEvidence(t, t.TempDir())
+// A frozen image is only restored once the rollback floor is durable on this
+// host; a floor that cannot be written refuses the restore before any launch.
+func TestFrozenRestoreRequiresTheFloor(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	isolateEvidence(t, blocker) // a path inside a file: the raise cannot land
+
 	dir := t.TempDir()
 	snapPath, memPath, rootfs := filepath.Join(dir, "vm.snap"), filepath.Join(dir, "mem.snap"), filepath.Join(dir, "rootfs.ext4")
 	for _, p := range []string{snapPath, memPath, rootfs} {
@@ -231,8 +235,8 @@ func TestFrozenImageIsRefusedBeforeLaunch(t *testing.T) {
 		launched = true
 		return 4321, SupervisionUnit, nil
 	}
-	// A record that lost the answer goes to the disk, and the disk says frozen.
-	inst := &VMInstance{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs}
+	frozen := true
+	inst := &VMInstance{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs, SnapshotWorkloadFrozen: &frozen, FreezeToken: "tok"}
 	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir}, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, restoreSem: make(chan struct{}, 1)}
 	mgr.launchFirecrackerHook = launch
 	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
@@ -241,13 +245,75 @@ func TestFrozenImageIsRefusedBeforeLaunch(t *testing.T) {
 	}
 	_, rerr := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 	unlock()
-	if status.Code(rerr) != codes.FailedPrecondition || launched {
-		t.Fatalf("resume: err=%v launched=%v, want FailedPrecondition before launch", rerr, launched)
+	if status.Code(rerr) != codes.Unavailable || launched {
+		t.Fatalf("resume: err=%v launched=%v, want Unavailable before launch", rerr, launched)
 	}
 	fresh := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: t.TempDir()}, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1)}
 	fresh.launchFirecrackerHook = launch
 	_, cerr := fresh.RestoreVMSnapshot(context.Background(), "vm-2", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
-	if status.Code(cerr) != codes.FailedPrecondition || launched {
-		t.Fatalf("restore: err=%v launched=%v, want FailedPrecondition before launch", cerr, launched)
+	if status.Code(cerr) != codes.Unavailable || launched {
+		t.Fatalf("restore: err=%v launched=%v, want Unavailable before launch", cerr, launched)
+	}
+}
+
+// Templates are seeded while the daemon runs; the first frozen one to land
+// raises the floor here, at the builder's real layout depth. An unfrozen
+// manifest raises nothing.
+func TestTemplateManifestsLeaveEvidence(t *testing.T) {
+	dir := t.TempDir()
+	isolateEvidence(t, dir)
+
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
+	if n := m.scanTemplateManifests(); n != 0 {
+		t.Fatalf("found %d frozen manifests in an empty tree", n)
+	}
+	// The builder's layout: templates/<template>/<build>/mem.snap.
+	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
+	if err := os.MkdirAll(tpl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteWallClockManifest(filepath.Join(tpl, "mem.snap"), WallClockManifest{Version: WallClockManifestVersion, ArtifactID: "a", GuestCorrectsClock: true}); err != nil {
+		t.Fatal(err)
+	}
+	if n := m.scanTemplateManifests(); n != 0 || wakeProtocolFloorRaised() {
+		t.Fatalf("n=%d raised=%v; an unfrozen manifest is not evidence", n, wakeProtocolFloorRaised())
+	}
+	seedFrozenManifest(t, filepath.Join(tpl, "mem.snap"), "tok")
+	if n := m.scanTemplateManifests(); n != 1 {
+		t.Fatalf("found %d frozen manifests, want 1", n)
+	}
+	if _, err := os.Stat(wakeProtocolEvidencePath); err != nil {
+		t.Fatalf("evidence not written after a frozen template landed: %v", err)
+	}
+}
+
+// The daemon's own raise is durable once and then free; a raise that cannot
+// land is not remembered, so the next one tries again.
+func TestEnsureWakeProtocolFloor(t *testing.T) {
+	dir := t.TempDir()
+	isolateEvidence(t, dir)
+	if err := os.WriteFile(wakeProtocolEvidencePath, []byte("older-process\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWakeProtocolFloor(); err != nil || !wakeProtocolEvidenceDurable.Load() {
+		t.Fatalf("err=%v durable=%v", err, wakeProtocolEvidenceDurable.Load())
+	}
+	if b, _ := os.ReadFile(wakeProtocolEvidencePath); string(b) != "older-process\n" {
+		t.Errorf("existing evidence rewritten: %q", b)
+	}
+
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wakeProtocolEvidencePath = filepath.Join(blocker, "evidence")
+	wakeProtocolEvidenceSeen.Store(false)
+	wakeProtocolEvidenceDurable.Store(false)
+	if err := ensureWakeProtocolFloor(); err == nil || wakeProtocolEvidenceDurable.Load() {
+		t.Fatalf("err=%v durable=%v; a failed raise must not be remembered as done", err, wakeProtocolEvidenceDurable.Load())
+	}
+	wakeProtocolEvidencePath = filepath.Join(dir, "evidence2")
+	if err := ensureWakeProtocolFloor(); err != nil || !wakeProtocolEvidenceDurable.Load() {
+		t.Fatalf("retry: err=%v durable=%v", err, wakeProtocolEvidenceDurable.Load())
 	}
 }

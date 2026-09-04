@@ -496,6 +496,36 @@ func UnpauseVM(socketPath string) error {
 	return nil
 }
 
+// UnpauseVMContext resumes a paused VM's vCPUs within ctx. A bare request over
+// a context-honouring dial, as VMState: it runs on failure and recovery paths,
+// where a stuck API must not hang the caller. A VM that is not paused refuses
+// it, which callers treat as nothing to do.
+func UnpauseVMContext(ctx context.Context, socketPath string) error {
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", socketPath)
+		},
+		DisableKeepAlives: true,
+	}
+	defer tr.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, "http://localhost/vm", strings.NewReader(`{"state":"Resumed"}`))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		return fmt.Errorf("unpause VM: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("unpause VM: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
 // LoadSnapshotNoResume loads a snapshot but leaves the vCPUs paused — used to
 // re-snapshot it (SnapshotPausedVM) and verify the memory round-trips. The TAP
 // override mirrors RestoreSnapshot* so device restore succeeds.
