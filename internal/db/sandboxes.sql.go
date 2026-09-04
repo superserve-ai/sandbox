@@ -547,6 +547,9 @@ const claimResume = `-- name: ClaimResume :one
 UPDATE sandbox
 SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
 FROM (
+  SELECT $1::uuid AS id
+  FROM (SELECT pg_advisory_xact_lock(hashtext($2::text)::bigint)) locked
+) lk, (
   SELECT sb.id,
          s.path AS snap_path,
          s.mem_path AS snap_mem_path,
@@ -570,11 +573,10 @@ FROM (
       ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
     WHERE pp.sandbox_id = sb.id AND g.token_version > 0
   ) pp ON true
-  WHERE sb.id = $2 AND sb.team_id = $3
+  WHERE sb.id = $1 AND sb.team_id = $3
 ) x
-WHERE sandbox.id = x.id
+WHERE sandbox.id = lk.id AND sandbox.id = x.id
   AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
-  AND EXISTS (SELECT pg_advisory_xact_lock(hashtext($1::text)::bigint))
 RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcpu_count, sandbox.memory_mib, sandbox.host_id, sandbox.ip_address, sandbox.pid, sandbox.snapshot_id, sandbox.created_at, sandbox.updated_at, sandbox.destroyed_at, sandbox.network_config, sandbox.timeout_seconds, sandbox.metadata, sandbox.template_id, sandbox.snapshot_path, sandbox.mem_path, sandbox.base_path, sandbox.delta_path, sandbox.disk_mib, sandbox.auto_delete_seconds, sandbox.auto_delete_at, sandbox.failed_at, sandbox.had_secret_bindings,
           x.snap_path, x.snap_mem_path,
           x.access, x.wire_access, x.revision,
@@ -583,8 +585,8 @@ RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcp
 `
 
 type ClaimResumeParams struct {
-	LockKey string    `json:"lock_key"`
 	ID      uuid.UUID `json:"id"`
+	LockKey string    `json:"lock_key"`
 	TeamID  uuid.UUID `json:"team_id"`
 }
 
@@ -604,12 +606,14 @@ type ClaimResumeRow struct {
 // The paused→resuming claim plus the boot inputs in one round trip:
 // snapshot paths, preview policy with published ports, template base path.
 // The advisory lock is the one attach/detach take before re-reading
-// status; taken before the update and held to statement end, so the
-// returned row already reflects a binding mutation that beat the claim.
+// status; held to statement end, so the returned row already reflects a
+// binding mutation that beat the claim. It rides a FROM item joined on
+// the row key: the planner keeps a volatile target there, whereas an
+// EXISTS subquery has its target list dropped and never takes the lock.
 // LEFT joins keep the row when the snapshot or policy row is missing.
 // 0 rows: not paused, or another resume claimed it.
 func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (ClaimResumeRow, error) {
-	row := q.db.QueryRow(ctx, claimResume, arg.LockKey, arg.ID, arg.TeamID)
+	row := q.db.QueryRow(ctx, claimResume, arg.ID, arg.LockKey, arg.TeamID)
 	var i ClaimResumeRow
 	err := row.Scan(
 		&i.Sandbox.ID,
