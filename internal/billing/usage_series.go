@@ -39,11 +39,14 @@ func UsageSeriesBuckets(start, end time.Time, granularity string, loc *time.Loca
 		switch granularity {
 		case "hour":
 			// Prefer the next local wall-clock hour, but retain the repeated
-			// hour on fall-back by using elapsed time when its local hour repeats.
+			// hour on fall-back by using elapsed time across a backward offset
+			// transition (including fractional transitions such as Lord Howe).
 			elapsed := cur.Add(time.Hour)
 			cl := cur.In(loc)
 			el := elapsed.In(loc)
-			if el.Hour() == cl.Hour() && el.Minute() == cl.Minute() {
+			_, curOffset := cl.Zone()
+			_, elapsedOffset := el.Zone()
+			if elapsedOffset < curOffset {
 				next = elapsed
 			} else {
 				next = time.Date(cl.Year(), cl.Month(), cl.Day(), cl.Hour()+1, 0, 0, 0, loc)

@@ -48,3 +48,27 @@ func TestUsageSeriesBucketsFractionalDST(t *testing.T) {
 		}
 	}
 }
+
+func TestUsageSeriesBucketsFractionalFallBack(t *testing.T) {
+	loc, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The 30-minute fall-back occurs between 01:00 DST and 01:30 standard
+	// time. Both wall-clock intervals must remain represented.
+	s := time.Date(2024, 4, 7, 0, 0, 0, 0, loc)
+	e := time.Date(2024, 4, 7, 3, 0, 0, 0, loc)
+	b, err := UsageSeriesBuckets(s, e, "hour", loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) != 4 {
+		t.Fatalf("got %d buckets, want 4", len(b))
+	}
+	if got := b[1].End.Sub(b[1].Start); got != time.Hour {
+		t.Fatalf("repeated-hour bucket duration %s, want 1h", got)
+	}
+	if b[2].Start.Equal(b[1].Start) || b[2].Start.In(loc).Format("15:04") != "01:30" {
+		t.Fatalf("next bucket starts at %s, want distinct 01:30", b[2].Start.In(loc))
+	}
+}

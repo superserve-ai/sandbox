@@ -445,16 +445,18 @@ func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
 			return
 		}
 		cc, mc, sc := cpu*vcpuRate, mem*memRate, storage*storageRate
-		if !cpuState.Billable {
-			cc = 0
+		// Resource costs remain informational even when a resource is tracked but
+		// excluded from billing. Apply billability only to the billed total.
+		billedTotal := 0.0
+		if cpuState.Billable {
+			billedTotal += cc
 		}
-		if !memoryState.Billable {
-			mc = 0
+		if memoryState.Billable {
+			billedTotal += mc
 		}
-		if !storageState.Billable {
-			sc = 0
+		if storageState.Billable {
+			billedTotal += sc
 		}
-		billedTotal := cc + mc + sc
 		result = append(result, billingUsageSeriesBucket{Start: b.Start, End: b.End, CPU: billingUsageSeriesResource{cpu, cc, cpuState.Tracked, cpuState.Billable}, Memory: billingUsageSeriesResource{mem, mc, memoryState.Tracked, memoryState.Billable}, Storage: billingUsageSeriesResource{storage, sc, storageState.Tracked, storageState.Billable}, BilledTotalUSD: billedTotal})
 	}
 	setPrivateBillingCacheHeaders(c)
