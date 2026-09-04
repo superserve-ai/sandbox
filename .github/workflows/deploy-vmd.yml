@@ -48,6 +48,8 @@ on:
       - 'deploy/superserve-vms.service'
       - 'deploy/vmd-rollback-guard'
       - 'deploy/superserve-vmd-rollback-guard.conf'
+      - 'deploy/vmd-wake-floor-guard'
+      - 'deploy/superserve-vmd-wake-floor-guard.conf'
       - 'deploy/superserve-vmd-start-generation.conf'
       - 'deploy/superserve-secretsproxy.service'
       - 'deploy/firecracker@.service'
