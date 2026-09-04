@@ -977,3 +977,128 @@ func TestRequestJoiningADeferredStartupFlightReattachesItself(t *testing.T) {
 		t.Errorf("reattaches = %d, want 2 (eager + one shared retry)", n)
 	}
 }
+
+// A resume publishes its wake-owed record before it launches Firecracker. A
+// crash in that window must not reap the sandbox as a failed create: the
+// paused image is intact, so the record returns to Paused. A create's record
+// in the same state has nowhere to return to and is reaped as before.
+func TestInterruptedResumeReturnsToPaused(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return true }
+	t.Cleanup(func() { vmUnitFullyDown = origDown })
+	for _, tc := range []struct {
+		name       string
+		fromPaused bool
+		wantKept   bool
+	}{
+		{"resume_returns_to_paused", true, true},
+		{"create_is_reaped", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { store.Close() })
+			snapPath, memPath := filepath.Join(dir, "vm.snap"), filepath.Join(dir, "mem.snap")
+			for _, p := range []string{snapPath, memPath} {
+				if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeOwedFromPaused: tc.fromPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath}
+			if err := store.Put(rec); err != nil {
+				t.Fatal(err)
+			}
+			mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
+			inst, _ := mgr.reattachRecord(context.Background(), rec, true)
+			got, _ := store.Get("vm-1")
+			if !tc.wantKept {
+				if got != nil {
+					t.Fatalf("record kept: %+v; a failed create must be reaped", got)
+				}
+				return
+			}
+			if got == nil || got.Status != StatusPaused || got.WakePending || got.Unverified || got.WakeOwedFromPaused {
+				t.Fatalf("record = %+v, want Paused with nothing owed", got)
+			}
+			if inst != nil {
+				inst.mu.RLock()
+				defer inst.mu.RUnlock()
+				if inst.Status != StatusPaused {
+					t.Errorf("instance status %v, want Paused", inst.Status)
+				}
+			}
+		})
+	}
+}
+
+// A reattached resume whose guest will not wake goes back to Paused with
+// nothing owed, as the resume's own failure path would. (A create in the
+// same state is parked as Error with its wake still owed; see the lazy-path
+// test above.)
+func TestUnwakeableReattachedResumeReturnsToPaused(t *testing.T) {
+	origWake := boxdWakeGuest
+	t.Cleanup(func() { boxdWakeGuest = origWake })
+	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return errors.New("no answer") }
+	dir := t.TempDir()
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeOwedFromPaused: true, Supervision: SupervisionUnit, IP: "10.0.0.2"}); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
+	inst := mgr.reattachByID("vm-1", false)
+	if inst == nil {
+		t.Fatal("a parked record must still be tracked")
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	if inst.Status != StatusPaused || inst.WakePending || inst.WakeOwedFromPaused {
+		t.Errorf("status=%v wakePending=%v fromPaused=%v, want Paused and nothing owed", inst.Status, inst.WakePending, inst.WakeOwedFromPaused)
+	}
+	if rec, _ := store.Get("vm-1"); rec == nil || rec.Status != StatusPaused || rec.WakePending {
+		t.Errorf("record = %+v, want Paused and durable", rec)
+	}
+}
+
+// A snapshot pauses the vCPUs before it writes, so a release after a
+// snapshot that then failed, or after a crash between the two, must resume
+// Firecracker before the guest can answer the thaw.
+func TestReleaseOfAFrozenGuestUnpausesFirecrackerFirst(t *testing.T) {
+	origUnpause, origThaw := fcUnpauseVM, boxdThawGuest
+	t.Cleanup(func() { fcUnpauseVM, boxdThawGuest = origUnpause, origThaw })
+	var order []string
+	fcUnpauseVM = func(socket string) error { order = append(order, "unpause:"+socket); return nil }
+	boxdThawGuest = func(_ context.Context, _, token string) error { order = append(order, "thaw:"+token); return nil }
+	m := &Manager{log: zerolog.Nop()}
+	if err := m.releaseFrozenGuest(context.Background(), "/run/vm.sock", "10.0.0.2", "tok"); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 2 || order[0] != "unpause:/run/vm.sock" || order[1] != "thaw:tok" {
+		t.Fatalf("order = %v, want the unpause before the thaw", order)
+	}
+	// Recovery after a crash takes the same path, with the record's socket.
+	raiseFloorForTest(t)
+	dir := t.TempDir()
+	vmDir := filepath.Join(dir, "vm-1")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePauseIntent(vmDir, pauseIntent{VMID: "vm-1", FreezeToken: "tok", ArtifactID: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	order = nil
+	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}}
+	inst := &VMInstance{ID: "vm-1", IP: "10.0.0.2", SocketPath: "/run/vm-1.sock"}
+	if !mgr.recoverPauseIntent(context.Background(), inst, zerolog.Nop()) {
+		t.Fatal("recovery reported the guest could not be released")
+	}
+	if len(order) != 2 || order[0] != "unpause:/run/vm-1.sock" || order[1] != "thaw:tok" {
+		t.Fatalf("recovery order = %v, want the unpause before the thaw", order)
+	}
+}
