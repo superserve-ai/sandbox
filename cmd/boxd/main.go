@@ -138,8 +138,10 @@ func main() {
 	gate := newHostGate()
 	if fz.available() {
 		// Read at boot, before the listener exists, so no lifecycle request
-		// enumerates interfaces or waits on the read. Once, in an image that
-		// is about to be frozen; a failed read is retried by the request.
+		// enumerates interfaces or waits on the read. Synchronous on purpose:
+		// one netlink dump, microseconds, and only when an image with the
+		// freezer boots, which happens at its build; a restore never boots.
+		// A failed read is retried by the request.
 		gate.guestIPs()
 	}
 	mux.HandleFunc("/verify-clock", gate.only(handleVerifyClock(clock, fz)))

@@ -70,8 +70,9 @@ type freezer struct {
 	token string
 	last  atomic.Value // string: the token most recently released
 	// woken is the token whose wake completed, so a retry of a wake whose
-	// answer was lost is answered as done rather than corrected again.
-	woken atomic.Value // string
+	// answer was lost is answered as done rather than corrected again. Written
+	// only under mu, in the same step as the release it belongs to.
+	woken string
 }
 
 var (
@@ -270,7 +271,7 @@ func (f *freezer) freeze(ctx context.Context, token string) error {
 				return f.undo(token, fmt.Errorf("workload froze after the budget was spent: %w", err))
 			}
 			f.token = token
-			f.woken.Store("")
+			f.woken = ""
 			return nil
 		}
 		select {
@@ -311,20 +312,26 @@ func (f *freezer) undo(token string, cause error) error {
 	return cause
 }
 
-// thaw lets the workload run and confirms it did, for the freeze the token
+// release lets the workload run and confirms it did, for the freeze the token
 // names. Repeating it after success succeeds; any other token is refused
-// without changing state. A no-op without a cgroup.
-func (f *freezer) thaw(token string) error {
+// without changing state. A no-op without a cgroup. With woke, the wake for
+// this token is recorded as completed in the same step as the release, so a
+// retry of it is answered as done and a later freeze under the same token,
+// however soon, starts afresh rather than being mistaken for that retry.
+func (f *freezer) release(token string, woke bool) error {
 	if !f.available() {
 		return nil
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.frozen.Load() {
-		if f.released(token) {
-			return nil
+		if !f.released(token) {
+			return errTokenMismatch
 		}
-		return errTokenMismatch
+		if woke {
+			f.woken = token
+		}
+		return nil
 	}
 	if token != f.token {
 		return errTokenMismatch
@@ -334,8 +341,15 @@ func (f *freezer) thaw(token string) error {
 	}
 	f.last.Store(f.token)
 	f.token = ""
+	if woke {
+		f.woken = token
+	}
 	return nil
 }
+
+// thaw releases the freeze the token names, as a plain thaw: no wake is
+// recorded.
+func (f *freezer) thaw(token string) error { return f.release(token, false) }
 
 // holds reports whether token names the active freeze, or the last released one.
 func (f *freezer) holds(token string) bool {
@@ -350,13 +364,15 @@ func (f *freezer) holds(token string) bool {
 	return f.released(token)
 }
 
-// completeWake records that token's wake finished: the clock is corrected and
-// the workload runs. wakeDone answers a retry of it without doing it again.
-func (f *freezer) completeWake(token string) { f.woken.Store(token) }
-
+// wakeDone reports whether token's wake already completed, so a retry of it
+// is answered without doing it again.
 func (f *freezer) wakeDone(token string) bool {
-	woken, _ := f.woken.Load().(string)
-	return token != "" && token == woken
+	if !f.available() {
+		return false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return token != "" && token == f.woken
 }
 
 // released reports whether token names the most recently released freeze.
@@ -533,12 +549,10 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 		wc, ready := clock.sync(*body.ClockFrozen)
 		status := "ok"
 		if ready {
-			if err := fz.thaw(body.Token); err != nil {
+			if err := fz.release(body.Token, true); err != nil {
 				diagf("freezer: thaw on wake failed: %v", err)
 				ready, status = false, "thaw"
 				wc.Error = "thaw: " + err.Error()
-			} else {
-				fz.completeWake(body.Token)
 			}
 		} else {
 			status = "clock"

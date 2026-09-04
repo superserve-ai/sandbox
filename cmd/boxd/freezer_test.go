@@ -743,3 +743,34 @@ func TestFreezeSpentDuringTheConfirmingReadRollsBack(t *testing.T) {
 		t.Fatalf("follow-up thaw: %v", err)
 	}
 }
+
+// Wake completion is recorded in the same step as the release, so a new
+// freeze under the same token, however soon after, is not mistaken for a
+// retry of the wake that released the old one.
+func TestWakeCompletionIsTiedToTheRelease(t *testing.T) {
+	fz := newFreezer(newFake(), testDir)
+	if err := fz.freeze(bg(), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if fz.wakeDone("t1") {
+		t.Fatal("wake done before any wake")
+	}
+	if err := fz.thaw("t1"); err != nil || fz.wakeDone("t1") {
+		t.Fatalf("plain thaw: err=%v done=%v, want released and no wake recorded", err, fz.wakeDone("t1"))
+	}
+	if err := fz.release("t1", true); err != nil || !fz.wakeDone("t1") {
+		t.Fatalf("wake of a released token: err=%v done=%v, want recorded", err, fz.wakeDone("t1"))
+	}
+	if err := fz.freeze(bg(), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if fz.wakeDone("t1") {
+		t.Fatal("a new freeze under the token must start afresh")
+	}
+	if err := fz.release("t1", true); err != nil || fz.isFrozen() || !fz.wakeDone("t1") {
+		t.Fatalf("wake of the new freeze: err=%v frozen=%v done=%v, want released and recorded", err, fz.isFrozen(), fz.wakeDone("t1"))
+	}
+	if err := fz.release("t2", true); !errors.Is(err, errTokenMismatch) || !fz.wakeDone("t1") {
+		t.Fatalf("wake with another token: err=%v, want refused with t1 still recorded", err)
+	}
+}
