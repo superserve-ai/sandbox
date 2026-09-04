@@ -97,7 +97,7 @@ func (m *Manager) initBuildRegistry() {
 // registerBuild inserts a new record in the registry. Fails if a build
 // with the same ID is already in-flight — the caller is expected to pick a
 // unique buildVMID per BuildTemplate invocation.
-func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB uint32, cancel context.CancelFunc) (*buildRecord, error) {
+func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB uint32, cancel context.CancelFunc, prepare func() error) (*buildRecord, error) {
 	m.initBuildRegistry()
 	// An adoption reconcile for this template+build may be mid-flight
 	// with stamped-metadata writes pending; cancel it and AWAIT its exit
@@ -118,6 +118,13 @@ func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB ui
 	defer m.buildsMu.Unlock()
 	if existing, ok := m.builds[buildVMID]; ok && !existing.Status.IsTerminal() {
 		return nil, fmt.Errorf("build %s already in flight", buildVMID)
+	}
+	// Under the lock, so nothing can claim the id between the check above
+	// and whatever prepare removes.
+	if prepare != nil {
+		if err := prepare(); err != nil {
+			return nil, err
+		}
 	}
 	rec := &buildRecord{
 		BuildVMID:  buildVMID,

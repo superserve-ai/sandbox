@@ -274,17 +274,32 @@ func TestResumeWallClockProperty(t *testing.T) {
 			t.Fatalf("seed manifest: %v", err)
 		}
 	}
-	t.Run("same_image_trusts_the_record_over_the_disk", func(t *testing.T) {
+	t.Run("same_image_trusts_a_record_that_carries_the_image_fact", func(t *testing.T) {
 		mem := filepath.Join(t.TempDir(), "mem.snap")
-		seed(t, mem, WallClockManifest{GuestCorrectsClock: true})
-		// Manifest says yes, record says no. The record wins ⇒ no read happened.
-		if corrects, _, err := resumeWallClockProperty(mem, mem, boolPtr(false)); corrects || err != nil {
-			t.Errorf("corrects=%v err=%v; want the recorded value, a manifest on disk means the record was not used", corrects, err)
+		seed(t, mem, WallClockManifest{GuestCorrectsClock: true, WorkloadFrozen: true, FreezeToken: "tok"})
+		// Manifest says frozen, record says not. The record wins ⇒ no read happened.
+		if corrects, frozen, err := resumeWallClockProperty(mem, mem, boolPtr(true), boolPtr(false)); !corrects || frozen || err != nil {
+			t.Errorf("corrects=%v frozen=%v err=%v; want the recorded facts, a manifest on disk means the record was not used", corrects, frozen, err)
 		}
-		// And the inverse: no manifest on disk, record says yes.
+		// A guest that cannot correct its clock is never frozen: no read either.
+		if corrects, frozen, err := resumeWallClockProperty(mem, mem, boolPtr(false), nil); corrects || frozen || err != nil {
+			t.Errorf("corrects=%v frozen=%v err=%v; want the record's no without a read", corrects, frozen, err)
+		}
+		// And the inverse: no manifest on disk, record says frozen.
 		bare := filepath.Join(t.TempDir(), "mem.snap")
-		if corrects, _, err := resumeWallClockProperty(bare, bare, boolPtr(true)); !corrects || err != nil {
-			t.Errorf("corrects=%v err=%v; want the recorded value even with no manifest beside the image", corrects, err)
+		if corrects, frozen, err := resumeWallClockProperty(bare, bare, boolPtr(true), boolPtr(true)); !corrects || !frozen || err != nil {
+			t.Errorf("corrects=%v frozen=%v err=%v; want the recorded facts even with no manifest beside the image", corrects, frozen, err)
+		}
+	})
+
+	// The guest's capability does not encode the image fact: a record that
+	// carries the first but not the second reads the manifest, and a frozen
+	// one is reported rather than assumed away.
+	t.Run("same_image_without_the_image_fact_reads_the_manifest", func(t *testing.T) {
+		mem := filepath.Join(t.TempDir(), "mem.snap")
+		seed(t, mem, WallClockManifest{GuestCorrectsClock: true, WorkloadFrozen: true, FreezeToken: "tok"})
+		if corrects, frozen, err := resumeWallClockProperty(mem, mem, boolPtr(true), nil); !corrects || !frozen || err != nil {
+			t.Errorf("corrects=%v frozen=%v err=%v; want the frozen workload seen", corrects, frozen, err)
 		}
 	})
 
@@ -294,7 +309,7 @@ func TestResumeWallClockProperty(t *testing.T) {
 		dir := t.TempDir()
 		override := filepath.Join(dir, "restored.snap")
 		seed(t, override, WallClockManifest{GuestCorrectsClock: true})
-		if corrects, frozen, err := resumeWallClockProperty(override, filepath.Join(dir, "mem.snap"), boolPtr(false)); !corrects || frozen || err != nil {
+		if corrects, frozen, err := resumeWallClockProperty(override, filepath.Join(dir, "mem.snap"), boolPtr(false), boolPtr(false)); !corrects || frozen || err != nil {
 			t.Errorf("corrects=%v frozen=%v err=%v; want the manifest consulted when the image is not the paused one", corrects, frozen, err)
 		}
 	})
@@ -310,7 +325,7 @@ func TestResumeWallClockProperty(t *testing.T) {
 		if err := os.WriteFile(layeredBaseSidecarPath(overlay), []byte(base+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		corrects, frozen, err := resumeWallClockProperty(overlay, filepath.Join(dir, "mem.diff"), nil)
+		corrects, frozen, err := resumeWallClockProperty(overlay, filepath.Join(dir, "mem.diff"), nil, nil)
 		if !corrects || frozen || err != nil {
 			t.Errorf("corrects=%v frozen=%v err=%v; want the base's capability and no inherited freeze", corrects, frozen, err)
 		}
@@ -318,7 +333,7 @@ func TestResumeWallClockProperty(t *testing.T) {
 
 	t.Run("override_without_a_manifest_stays_legacy", func(t *testing.T) {
 		dir := t.TempDir()
-		if corrects, frozen, err := resumeWallClockProperty(filepath.Join(dir, "restored.snap"), filepath.Join(dir, "mem.snap"), boolPtr(true)); corrects || frozen || err != nil {
+		if corrects, frozen, err := resumeWallClockProperty(filepath.Join(dir, "restored.snap"), filepath.Join(dir, "mem.snap"), boolPtr(true), boolPtr(true)); corrects || frozen || err != nil {
 			t.Errorf("corrects=%v frozen=%v err=%v; a stale record must not carry over to a different image", corrects, frozen, err)
 		}
 	})
@@ -329,7 +344,7 @@ func TestResumeWallClockProperty(t *testing.T) {
 		dir := t.TempDir()
 		override := filepath.Join(dir, "restored.snap")
 		seed(t, override, WallClockManifest{GuestCorrectsClock: true, WorkloadFrozen: true, FreezeToken: "tok"})
-		if _, frozen, err := resumeWallClockProperty(override, filepath.Join(dir, "mem.snap"), nil); !frozen || err != nil {
+		if _, frozen, err := resumeWallClockProperty(override, filepath.Join(dir, "mem.snap"), nil, nil); !frozen || err != nil {
 			t.Errorf("frozen=%v err=%v; want the frozen workload reported", frozen, err)
 		}
 	})
@@ -339,7 +354,7 @@ func TestResumeWallClockProperty(t *testing.T) {
 		if err := os.WriteFile(WallClockMarkerPath(override), []byte(`{"version":2}`), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := resumeWallClockProperty(override, filepath.Join(dir, "mem.snap"), nil); !errors.Is(err, ErrWallClockManifest) {
+		if _, _, err := resumeWallClockProperty(override, filepath.Join(dir, "mem.snap"), nil, nil); !errors.Is(err, ErrWallClockManifest) {
 			t.Errorf("err=%v, want ErrWallClockManifest", err)
 		}
 	})
@@ -419,12 +434,12 @@ func TestResumeWallClockPropertyUnresolvedRecordConsultsTheManifest(t *testing.T
 		t.Fatalf("seed manifest: %v", err)
 	}
 	// Same image, but the record lost the answer.
-	if corrects, _, err := resumeWallClockProperty(mem, mem, nil); !corrects || err != nil {
+	if corrects, _, err := resumeWallClockProperty(mem, mem, nil, nil); !corrects || err != nil {
 		t.Errorf("corrects=%v err=%v; an unresolved record must fall back to the manifest, not read as false", corrects, err)
 	}
 
 	bare := filepath.Join(t.TempDir(), "mem.snap")
-	if corrects, _, err := resumeWallClockProperty(bare, bare, nil); corrects || err != nil {
+	if corrects, _, err := resumeWallClockProperty(bare, bare, nil, nil); corrects || err != nil {
 		t.Errorf("corrects=%v err=%v; unresolved with no manifest must still be false", corrects, err)
 	}
 }

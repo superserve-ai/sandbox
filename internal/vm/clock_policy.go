@@ -109,19 +109,25 @@ func guestCorrectsWallClock(instMemFile, instBaseMem string) bool {
 }
 
 // resumeWallClockProperty returns what the image being resumed says about its
-// guest, preferring the durable record to the filesystem.
+// guest and its workload, preferring the durable record to the filesystem.
 //
 // An ordinary resume reloads the exact image the VM was paused into, and that
-// pause wrote the property to the record and the manifest together — so the
-// record is already the answer and the resume path need not go to disk for it.
-// Only an explicit override, supplying an image this VM was never paused into,
-// or a record that never carried the answer (a rollback to a binary without the
-// field drops it on rewrite, and its silence must not be read as "no") has to
-// look. That read also says whether the image holds a frozen workload, which
-// the caller must refuse: a manifest this binary cannot trust is an error.
-func resumeWallClockProperty(memPath, pausedMemPath string, recorded *bool) (correctsWallClock, workloadFrozen bool, err error) {
-	if memPath == pausedMemPath && recorded != nil {
-		return *recorded, false, nil
+// pause wrote the facts to the record and the manifest together — so the
+// record is already the answer and the resume path need not go to disk for
+// it. The image fact is what decides: a record that carries it answers, and a
+// guest that cannot correct its clock is never frozen, so its record answers
+// too. Only an explicit override, supplying an image this VM was never paused
+// into, or a record that never carried the fact (a rollback to a binary
+// without the field drops it on rewrite, and its silence must not be read as
+// "no") has to look. A manifest this binary cannot trust is an error.
+func resumeWallClockProperty(memPath, pausedMemPath string, recordedCorrects, recordedFrozen *bool) (correctsWallClock, workloadFrozen bool, err error) {
+	if memPath == pausedMemPath {
+		if recordedFrozen != nil {
+			return recordedCorrects != nil && *recordedCorrects, *recordedFrozen, nil
+		}
+		if recordedCorrects != nil && !*recordedCorrects {
+			return false, false, nil
+		}
 	}
 	m, err := imageManifest(memPath)
 	if err != nil {

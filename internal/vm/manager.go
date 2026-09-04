@@ -127,10 +127,12 @@ type VMInstance struct {
 	// ArtifactID names the manifest beside the image this VM was last paused
 	// into, so a pause intent left beside it can be told from an interrupted one.
 	ArtifactID string
-	CreatedAt  time.Time
-	Metadata   map[string]string
-	TeamID     string // owning team; carried for data-plane usage attribution
-	OwnerID    string // creating user; empty when unknown
+	// SnapshotWorkloadFrozen: see VMRecord.
+	SnapshotWorkloadFrozen *bool
+	CreatedAt              time.Time
+	Metadata               map[string]string
+	TeamID                 string // owning team; carried for data-plane usage attribution
+	OwnerID                string // creating user; empty when unknown
 	// PausedAt records when this VM last entered the paused state. It drives
 	// oldest-first pressure reclamation. Zero means the field is unset on a
 	// legacy record; callers fall back to CreatedAt and then place any fully
@@ -1755,11 +1757,13 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// A resume reads the manifest beside THIS image, so without it every resume
 	// drops back to legacy. Only the write lands here: the unsafe direction was
 	// already handled above, before the image existed. Best-effort by design — a
-	// manifest that fails to write costs a slower resume, never a wrong clock.
+	// manifest that fails to write, or is lost to a crash, costs a slower
+	// resume, never a wrong clock — so it is written without durability
+	// barriers: nothing on the pause path waits on a sync for it.
 	if correctsWallClock {
 		artifact := NewArtifactID()
 		man := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: artifact, GuestCorrectsClock: true}
-		if merr := WriteWallClockManifest(memPath, man); merr != nil {
+		if merr := writeWallClockManifestLazy(memPath, man); merr != nil {
 			log.Warn().Err(merr).Str("path", WallClockMarkerPath(memPath)).
 				Msg("pause: wall-clock manifest write failed; resume falls back to legacy clock behaviour")
 		} else {
@@ -1842,6 +1846,10 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	inst.BaseMemPath = baseMemPath   // template base for a layered overlay; "" when standalone
 	inst.DirtyTracked = false        // FC process is stopping; a fresh resume re-arms tracking.
 	inst.DirtyTrackingSessionID = "" // the session dies with the FC run
+	// This supervisor freezes nothing, and says so: a resume of this image
+	// trusts the record and reads no manifest.
+	imageFrozen := false
+	inst.SnapshotWorkloadFrozen = &imageFrozen
 	inst.PausedAt = time.Now()
 	// The crash-window marker describes a RUNNING record persisted before
 	// readiness was proven; a successful pause proves the guest was live and
@@ -2185,14 +2193,15 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// cannot wake, each refuse the resume here. An intent exists only on a
 	// host whose floor is up; elsewhere nothing is looked for.
 	inst.mu.RLock()
-	recordedCorrects, pausedMemPath, recordedArtifact := inst.CorrectsWallClock, inst.MemFilePath, inst.ArtifactID
+	recordedCorrects, recordedFrozen := inst.CorrectsWallClock, inst.SnapshotWorkloadFrozen
+	pausedMemPath, recordedArtifact := inst.MemFilePath, inst.ArtifactID
 	inst.mu.RUnlock()
 	if wakeProtocolFloorRaised() {
 		if blocked, why := pauseIntentBlocks(filepath.Dir(memPath), recordedArtifact); blocked {
 			return nil, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing resume until it is inspected", memPath, why)
 		}
 	}
-	resumeCorrectsWallClock, resumeWorkloadFrozen, merr := resumeWallClockProperty(memPath, pausedMemPath, recordedCorrects)
+	resumeCorrectsWallClock, resumeWorkloadFrozen, merr := resumeWallClockProperty(memPath, pausedMemPath, recordedCorrects, recordedFrozen)
 	if merr != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
 	}
@@ -2360,6 +2369,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.DirtyTracked = dirtyTracked
 	inst.DirtyTrackingSessionID = trackingSessionID
 	inst.CorrectsWallClock = &resumeCorrectsWallClock
+	inst.SnapshotWorkloadFrozen = &resumeWorkloadFrozen
 	inst.PausedAt = time.Time{}
 	// Record the file actually resumed from (callers may pass an explicit path
 	// that differs from the cached one) so the next pause's diff baseline matches
@@ -3544,9 +3554,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.Status = StatusRunning
 	inst.Unverified = true
 	inst.PausedAt = time.Time{}
-	// Cached so the next pause knows whether this guest fixes its own wall clock
+	// Cached so the next pause knows what this guest and this image are
 	// without going back to the filesystem to ask.
 	inst.CorrectsWallClock = &restoreCorrectsWallClock
+	restoreWorkloadFrozen := false // a frozen image was refused above
+	inst.SnapshotWorkloadFrozen = &restoreWorkloadFrozen
 	inst.mu.Unlock()
 	persistDone := make(chan struct{})
 	optimisticOK := false

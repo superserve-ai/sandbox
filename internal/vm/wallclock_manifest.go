@@ -183,9 +183,22 @@ func ReadWallClockManifest(memPath string) (*WallClockManifest, error) {
 	return &m, nil
 }
 
-// WriteWallClockManifest publishes the manifest atomically: a reader sees the
-// previous one or this one, never a partial file.
+// WriteWallClockManifest publishes the manifest atomically and durably: a
+// reader sees the previous one or this one, never a partial file, and a crash
+// after the return cannot lose it. For a frozen manifest, which must outlive
+// a crash or its workload is never released.
 func WriteWallClockManifest(memPath string, m WallClockManifest) error {
+	return writeWallClockManifest(memPath, m, true)
+}
+
+// writeWallClockManifestLazy publishes atomically but with no durability
+// barrier, for a manifest whose loss costs only a slower resume: an unfrozen
+// one. Nothing on a lifecycle path waits on a sync for it.
+func writeWallClockManifestLazy(memPath string, m WallClockManifest) error {
+	return writeWallClockManifest(memPath, m, false)
+}
+
+func writeWallClockManifest(memPath string, m WallClockManifest, durable bool) error {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -201,10 +214,12 @@ func WriteWallClockManifest(memPath string, m WallClockManifest) error {
 		os.Remove(tmp)
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
+	if durable {
+		if err := f.Sync(); err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return err
+		}
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
@@ -213,6 +228,9 @@ func WriteWallClockManifest(memPath string, m WallClockManifest) error {
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
 		return err
+	}
+	if !durable {
+		return nil
 	}
 	return syncDir(filepath.Dir(path))
 }

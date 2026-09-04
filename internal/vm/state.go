@@ -214,6 +214,11 @@ type VMRecord struct {
 	// again — decoding that silence as false would ignore a marker still on disk
 	// and delete it at the next pause. Nil means "ask the disk".
 	CorrectsWallClock *bool `json:"corrects_wall_clock,omitempty"`
+	// SnapshotWorkloadFrozen: the image this VM was last paused into holds a
+	// frozen workload. Set by every pause, so a pause that froze nothing
+	// cannot leave an older answer for the next resume to act on. Tri-state
+	// for the same reason as CorrectsWallClock; nil means "ask the disk".
+	SnapshotWorkloadFrozen *bool `json:"snapshot_workload_frozen,omitempty"`
 	// ArtifactID names the manifest beside the image this VM was last paused
 	// into; see VMInstance.
 	ArtifactID string            `json:"artifact_id,omitempty"`
@@ -921,6 +926,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		DirtyTrackingSessionID:     inst.DirtyTrackingSessionID,
 		CorrectsWallClock:          inst.CorrectsWallClock,
 		ArtifactID:                 inst.ArtifactID,
+		SnapshotWorkloadFrozen:     inst.SnapshotWorkloadFrozen,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
@@ -1023,6 +1029,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		DirtyTracked:               rec.Status == StatusRunning && rec.DirtyTrackingSessionID != "",
 		CorrectsWallClock:          rec.CorrectsWallClock,
 		ArtifactID:                 rec.ArtifactID,
+		SnapshotWorkloadFrozen:     rec.SnapshotWorkloadFrozen,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,

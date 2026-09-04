@@ -103,6 +103,14 @@ func TestImageManifest(t *testing.T) {
 		if _, err := os.Stat(WallClockMarkerPath(mem) + ".tmp"); !os.IsNotExist(err) {
 			t.Error("temp file left behind")
 		}
+		// The lazy form is the same file, minus the barriers.
+		lazy := filepath.Join(t.TempDir(), "mem.snap")
+		if err := writeWallClockManifestLazy(lazy, want); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := ReadWallClockManifest(lazy); err != nil || got == nil || *got != want {
+			t.Fatalf("lazy: got=%+v err=%v want=%+v", got, err, want)
+		}
 	})
 }
 

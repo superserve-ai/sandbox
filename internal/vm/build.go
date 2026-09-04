@@ -85,19 +85,20 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 	if buildVMID == "" {
 		buildVMID = defaultBuildVMID(req.TemplateID)
 	}
-	// A published template is immutable: its directory is what every sandbox
-	// created from it, and every paused overlay layered on it, refers to. A
-	// build never lands on one; a rebuild is a new build id and a new
-	// directory, which is how the control plane names its builds anyway.
-	if err := m.prepareBuildDir(req.TemplateID, buildVMID); err != nil {
-		return "", err
-	}
-
 	// Fresh context so the build survives the caller's HTTP request
 	// ending. CancelBuild is what stops it.
 	buildCtx, cancel := context.WithCancel(context.Background())
 
-	rec, err := m.registerBuild(buildVMID, req.TemplateID, req.VCPU, req.MemoryMiB, cancel)
+	// A published template is immutable: its directory is what every sandbox
+	// created from it, and every paused overlay layered on it, refers to. A
+	// build never lands on one; a rebuild is a new build id and a new
+	// directory, which is how the control plane names its builds anyway. The
+	// directory is prepared under the registry's lock, once the id is known
+	// to be free: a retry of an id still in flight is refused there, before
+	// it could remove the running build's files.
+	rec, err := m.registerBuild(buildVMID, req.TemplateID, req.VCPU, req.MemoryMiB, cancel, func() error {
+		return m.prepareBuildDir(req.TemplateID, buildVMID)
+	})
 	if err != nil {
 		cancel()
 		return "", err

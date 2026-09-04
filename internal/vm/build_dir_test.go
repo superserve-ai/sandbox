@@ -53,4 +53,34 @@ func TestBuildsNeverOverwriteAPublishedTemplate(t *testing.T) {
 	if err := m.prepareBuildDir("tpl", "build-3"); err != nil {
 		t.Fatalf("fresh build: %v", err)
 	}
+
+	// A retry of an id still in flight is refused by the registry before the
+	// directory is touched: the running build's files survive.
+	inflight := filepath.Join(dir, TemplatesDirName, "tpl", "build-4")
+	if err := os.MkdirAll(inflight, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inflight, "mem.snap"), []byte("half written"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.builds = map[string]*buildRecord{}
+	if _, err := m.registerBuild("build-4", "tpl", 1, 512, func() {}, func() error { return m.prepareBuildDir("tpl", "build-4") }); err != nil {
+		t.Fatalf("first registration: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(inflight, "mem.snap")); !os.IsNotExist(err) {
+		t.Fatal("unpublished leftovers survived the registration that claimed the id")
+	}
+	// The running build recreates its directory and writes into it.
+	if err := os.MkdirAll(inflight, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inflight, "mem.snap"), []byte("half written"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.registerBuild("build-4", "tpl", 1, 512, func() {}, func() error { return m.prepareBuildDir("tpl", "build-4") }); err == nil {
+		t.Fatal("a retry of an id in flight was accepted")
+	}
+	if _, err := os.Stat(filepath.Join(inflight, "mem.snap")); err != nil {
+		t.Fatal("the retry removed the running build's files")
+	}
 }

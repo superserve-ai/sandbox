@@ -160,7 +160,7 @@ func TestCapacityPressureCountsInstancesAndBuilds(t *testing.T) {
 	}
 	// One in-flight build; a completed one has already released its
 	// counters at worker exit and contributes nothing.
-	if _, err := m.registerBuild("b1", "tpl", 2, 4096, func() {}); err != nil {
+	if _, err := m.registerBuild("b1", "tpl", 2, 4096, func() {}, nil); err != nil {
 		t.Fatal(err)
 	}
 	seedPressureIndex(m)
@@ -238,7 +238,7 @@ func TestCapacityPressureCountsErrorVMAllocations(t *testing.T) {
 // (indefinitely retained) registry.
 func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{}, builds: map[string]*buildRecord{}}
-	rec, err := m.registerBuild("b1", "tpl", 2, 4096, func() {})
+	rec, err := m.registerBuild("b1", "tpl", 2, 4096, func() {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +594,7 @@ func TestFindSurvivingBuildersExcludesOwnChildren(t *testing.T) {
 // closed like any other unrepresented Firecracker.
 func TestBuildAllocCoversDistinguishesLeftovers(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{}, builds: map[string]*buildRecord{}}
-	rec, err := m.registerBuild("build-row-uuid-1", "tpl-a", 1, 1024, func() {})
+	rec, err := m.registerBuild("build-row-uuid-1", "tpl-a", 1, 1024, func() {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -671,7 +671,7 @@ func TestCapacityPressureSkipsBuildInstances(t *testing.T) {
 		},
 		builds: map[string]*buildRecord{},
 	}
-	recA, err := m.registerBuild("build-tpl-a", "tpl-a", 2, 4096, func() {})
+	recA, err := m.registerBuild("build-tpl-a", "tpl-a", 2, 4096, func() {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -883,7 +883,7 @@ func TestReattachMarkerReconstructionDoesNotHoldFleetLock(t *testing.T) {
 // or the replacement build's allocation is silently hidden for life.
 func TestReleaseBuildAllocIsGenerationKeyed(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{}, builds: map[string]*buildRecord{}}
-	recOld, err := m.registerBuild("build-b1", "tpl", 2, 4096, func() {})
+	recOld, err := m.registerBuild("build-b1", "tpl", 2, 4096, func() {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -891,7 +891,7 @@ func TestReleaseBuildAllocIsGenerationKeyed(t *testing.T) {
 		t.Fatal("cancel failed")
 	}
 	// Reuse: a new build replaces the terminal record under the same id.
-	recNew, err := m.registerBuild("build-b1", "tpl", 4, 8192, func() {})
+	recNew, err := m.registerBuild("build-b1", "tpl", 4, 8192, func() {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -956,7 +956,7 @@ func TestLeakedRecorderNotHiddenByLaterBuild(t *testing.T) {
 		},
 		builds: map[string]*buildRecord{},
 	}
-	recA, err := m.registerBuild("build-a", "tpl-a", 2, 4096, func() {})
+	recA, err := m.registerBuild("build-a", "tpl-a", 2, 4096, func() {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -971,7 +971,7 @@ func TestLeakedRecorderNotHiddenByLaterBuild(t *testing.T) {
 	m.buildPressureCount.Add(-1)
 
 	// Build B for the same template starts (not yet recording).
-	if _, err := m.registerBuild("build-b", "tpl-a", 4, 8192, func() {}); err != nil {
+	if _, err := m.registerBuild("build-b", "tpl-a", 4, 8192, func() {}, nil); err != nil {
 		t.Fatal(err)
 	}
 	seedPressureIndex(m)
@@ -1146,14 +1146,14 @@ func TestPressureReadyReopensAfterPredecessorBuildUnitExits(t *testing.T) {
 // state (which the replacement's own worker could then never overwrite).
 func TestCompleteBuildDropsReplacedWorkerResult(t *testing.T) {
 	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, builds: map[string]*buildRecord{}}
-	recOld, err := m.registerBuild("build-x", "tpl", 1, 1024, func() {})
+	recOld, err := m.registerBuild("build-x", "tpl", 1, 1024, func() {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !m.setBuildStatus("build-x", BuildStatusCancelled) {
 		t.Fatal("cancel failed")
 	}
-	recNew, err := m.registerBuild("build-x", "tpl", 1, 1024, func() {})
+	recNew, err := m.registerBuild("build-x", "tpl", 1, 1024, func() {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
