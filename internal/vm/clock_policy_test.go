@@ -299,6 +299,23 @@ func TestResumeWallClockProperty(t *testing.T) {
 		}
 	})
 
+	// An overlay without a manifest of its own holds no frozen workload, but
+	// its guest came from the template beneath it: the capability is read
+	// from there, never the frozen fact.
+	t.Run("override_overlay_takes_the_capability_from_its_base_only", func(t *testing.T) {
+		dir := t.TempDir()
+		base := filepath.Join(dir, "template.snap")
+		seed(t, base, WallClockManifest{GuestCorrectsClock: true, WorkloadFrozen: true, FreezeToken: "tok"})
+		overlay := filepath.Join(dir, "restored.diff")
+		if err := os.WriteFile(layeredBaseSidecarPath(overlay), []byte(base+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		corrects, frozen, err := resumeWallClockProperty(overlay, filepath.Join(dir, "mem.diff"), nil)
+		if !corrects || frozen || err != nil {
+			t.Errorf("corrects=%v frozen=%v err=%v; want the base's capability and no inherited freeze", corrects, frozen, err)
+		}
+	})
+
 	t.Run("override_without_a_manifest_stays_legacy", func(t *testing.T) {
 		dir := t.TempDir()
 		if corrects, frozen, err := resumeWallClockProperty(filepath.Join(dir, "restored.snap"), filepath.Join(dir, "mem.snap"), boolPtr(true)); corrects || frozen || err != nil {

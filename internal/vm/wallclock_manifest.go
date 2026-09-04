@@ -35,6 +35,11 @@ type WallClockManifest struct {
 
 const WallClockManifestVersion = 1
 
+// WakeProtocolVersion is the wire protocol the guest agent names in its freeze
+// echo. A different version space from the manifest's: the two are both 1
+// today by coincidence, and a bump to either must not pass for the other.
+const WakeProtocolVersion = 1
+
 // wakeProtocolEvidencePath records that this host has held an image that
 // owes a wake, so the host-resident guard refuses a vmd without the wake
 // protocol from then on. Raised by the template builder before it publishes

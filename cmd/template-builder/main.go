@@ -690,8 +690,8 @@ func boxdFreezeWorkload(ctx context.Context, vmIP, token string) error {
 	if err := json.Unmarshal(body, &echo); err != nil {
 		return fmt.Errorf("POST /freeze: reply: %w", err)
 	}
-	if echo.Version != vm.WallClockManifestVersion || echo.Token != token {
-		return fmt.Errorf("POST /freeze: guest speaks protocol %d and holds token %q, asked %d %q", echo.Version, echo.Token, vm.WallClockManifestVersion, token)
+	if echo.Version != vm.WakeProtocolVersion || echo.Token != token {
+		return fmt.Errorf("POST /freeze: guest speaks protocol %d and holds token %q, asked %d %q", echo.Version, echo.Token, vm.WakeProtocolVersion, token)
 	}
 	return nil
 }

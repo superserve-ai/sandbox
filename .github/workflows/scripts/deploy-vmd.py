@@ -469,18 +469,12 @@ def main() -> int:
                 echo "host drained — proceeding with downgrade"
             fi
 
-            # Wake-protocol floor: the daemon writes this evidence the first
-            # time it sees an image that owes a wake (restored, paused, or
-            # seeded among the templates), and from then on a vmd without the
-            # protocol would leave such images stopped. Same check as the
-            # host-resident start guard, applied before the binary lands.
-            SNAPSHOTS=$(sed -n 's/^SNAPSHOT_DIR=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -n 1 | tr -d '"')
-            SNAPSHOTS="${{SNAPSHOTS:-/var/lib/sandbox/snapshots}}"
-            if [ -e /var/lib/sandbox/wake-protocol-evidence ] || grep -lqs '"workload_frozen":true' "$SNAPSHOTS"/templates/*/*/*.wallclock "$SNAPSHOTS"/templates/*/*.wallclock "$SNAPSHOTS"/*/*.wallclock 2>/dev/null; then
-                if ! grep -qa wake-protocol-1 {extract_dir}/bin/vmd; then
-                    echo "ERROR: this host holds images that owe a wake; refusing a vmd without the wake protocol" >&2
-                    exit 1
-                fi
+            # Wake-protocol floor: the guard the service runs at every start,
+            # applied to the new binary before it lands. One source for what
+            # it checks; see deploy/vmd-wake-floor-guard.
+            if ! sh {extract_dir}/deploy/vmd-wake-floor-guard {extract_dir}/bin/vmd; then
+                echo "ERROR: the wake-protocol floor guard rejects this vmd; refusing to install it" >&2
+                exit 1
             fi
 
             # Install vmd + template-builder binaries.

@@ -32,6 +32,8 @@ class DeployVmdBundleTests(unittest.TestCase):
         self.assertRegex(SOURCE, r"\{install_dir\}/vmd-wake-floor-guard")
 
     def test_downgrade_is_checked_before_the_binary_lands(self):
-        check = SOURCE.index("wake-protocol-1")
+        # The deploy runs the bundled guard against the new binary, so the
+        # check has one source, and it runs before the binary is installed.
+        check = SOURCE.index("deploy/vmd-wake-floor-guard {extract_dir}/bin/vmd")
         install = SOURCE.index("sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd")
         self.assertLess(check, install)

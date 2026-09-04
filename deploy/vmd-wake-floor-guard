@@ -15,9 +15,13 @@ set -u
 BIN="${1:-/usr/local/bin/vmd}"
 
 # Witnesses first: a host that holds no such image pays a stat and a glob at
-# each start, and the binary is scanned only when one exists.
+# each start, and the binary is scanned only when one exists. The daemon
+# writes both witnesses' locations: the evidence file when it first acts on
+# such an image, and its resolved snapshot directory at every start, read
+# here rather than parsed out of env files, as the rollback guard reads the
+# state path. No breadcrumb means the daemon has never run here.
 WAKE_EVIDENCE=/var/lib/sandbox/wake-protocol-evidence
-SNAPSHOTS=$(sed -n 's/^SNAPSHOT_DIR=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -n 1 | tr -d '"')
+SNAPSHOTS=$(head -n 1 /var/lib/sandbox/vmd-snapshot-dir 2>/dev/null)
 SNAPSHOTS="${SNAPSHOTS:-/var/lib/sandbox/snapshots}"
 wake_evidence=""
 [ -e "$WAKE_EVIDENCE" ] && wake_evidence="$WAKE_EVIDENCE"

@@ -124,10 +124,21 @@ func resumeWallClockProperty(memPath, pausedMemPath string, recorded *bool) (cor
 		return *recorded, false, nil
 	}
 	m, err := imageManifest(memPath)
-	if err != nil || m == nil {
+	if err != nil {
 		return false, false, err
 	}
-	return m.GuestCorrectsClock, m.WorkloadFrozen, nil
+	if m != nil {
+		return m.GuestCorrectsClock, m.WorkloadFrozen, nil
+	}
+	// No manifest of its own: the image holds no frozen workload, which an
+	// overlay never inherits, but its guest came from the template beneath
+	// it, so the capability is read from there, as the pause-time check does.
+	if base, ok := readLayeredBase(memPath); ok {
+		if bm, berr := imageManifest(base); berr == nil && bm != nil {
+			return bm.GuestCorrectsClock, false, nil
+		}
+	}
+	return false, false, nil
 }
 
 // clockPolicyFor turns the resolved image fact into a restore policy.
