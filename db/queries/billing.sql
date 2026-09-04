@@ -1119,7 +1119,7 @@ WITH buckets AS (
  WHERE p.path IS NOT NULL AND s.started_at < LEAST(now(),b.bucket_end) AND COALESCE(sb.destroyed_at,LEAST(now(),b.bucket_end)) > b.bucket_start
  GROUP BY b.bucket_start,b.bucket_end,p.path
 ), artifact_storage AS (
- SELECT bucket_start,bucket_end,FLOOR(COALESCE(SUM(artifact_mib*EXTRACT(EPOCH FROM (upper(r)-lower(r)))),0))::numeric AS mib_seconds
+ SELECT bucket_start,bucket_end,COALESCE(SUM(artifact_mib*EXTRACT(EPOCH FROM (upper(r)-lower(r)))),0)::numeric AS mib_seconds
  FROM artifact_ranges CROSS JOIN LATERAL unnest(retained_ranges) AS ranges(r) GROUP BY bucket_start,bucket_end
 ), storage AS (
  SELECT b.bucket_start,b.bucket_end,

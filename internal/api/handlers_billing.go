@@ -415,6 +415,10 @@ func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
 		return v
 	}
 	vcpuRate, memRate, storageRate := rate("vcpu"), rate("memory_gib"), rate("storage_gib")
+	resourceState := make(map[string]billingResourceState, len(states))
+	for _, state := range states {
+		resourceState[state.ResourceKey] = state
+	}
 	result := make([]billingUsageSeriesBucket, 0, len(buckets))
 	ctx := c.Request.Context()
 	starts, ends := make([]time.Time, len(buckets)), make([]time.Time, len(buckets))
@@ -433,20 +437,25 @@ func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
 		cpu, _ := numericFloat64(u.VcpuSeconds)
 		mem, _ := numericFloat64(u.MemoryGibSeconds)
 		storage, _ := numericFloat64(u.StorageGibSeconds)
-		cc, mc, sc := cpu*vcpuRate, mem*memRate, storage*storageRate
-		// Keep the billed total aligned with the summary pricing authority: storage
-		// becomes part of gross billed usage only when its billing state is enabled.
-		charges := billing.CalculateSummaryCharges(cpu, mem, storage, vcpuRate, memRate, storageRate, 0, storageEnabled)
-		billedTotal := charges.CurrentChargesUSD
-		expectedBilledTotal := cc + mc
-		if storageEnabled {
-			expectedBilledTotal += sc
-		}
-		if billedTotal != expectedBilledTotal {
+		cpuState, cpuOK := resourceState["vcpu"]
+		memoryState, memoryOK := resourceState["memory_gib"]
+		storageState, storageOK := resourceState["storage_gib"]
+		if !cpuOK || !memoryOK || !storageOK {
 			respondError(c, ErrInternal)
 			return
 		}
-		result = append(result, billingUsageSeriesBucket{Start: b.Start, End: b.End, CPU: billingUsageSeriesResource{cpu, cc, true, true}, Memory: billingUsageSeriesResource{mem, mc, true, true}, Storage: billingUsageSeriesResource{storage, sc, true, storageEnabled}, BilledTotalUSD: billedTotal})
+		cc, mc, sc := cpu*vcpuRate, mem*memRate, storage*storageRate
+		if !cpuState.Billable {
+			cc = 0
+		}
+		if !memoryState.Billable {
+			mc = 0
+		}
+		if !storageState.Billable {
+			sc = 0
+		}
+		billedTotal := cc + mc + sc
+		result = append(result, billingUsageSeriesBucket{Start: b.Start, End: b.End, CPU: billingUsageSeriesResource{cpu, cc, cpuState.Tracked, cpuState.Billable}, Memory: billingUsageSeriesResource{mem, mc, memoryState.Tracked, memoryState.Billable}, Storage: billingUsageSeriesResource{storage, sc, storageState.Tracked, storageState.Billable}, BilledTotalUSD: billedTotal})
 	}
 	setPrivateBillingCacheHeaders(c)
 	c.JSON(http.StatusOK, gin.H{"start": start, "end": end, "granularity": c.Query("granularity"), "timezone": c.Query("timezone"), "buckets": result})
