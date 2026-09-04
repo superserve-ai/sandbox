@@ -332,9 +332,6 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		creditsAvailable,
 		storageBillingEnabled,
 	)
-	paymentSetupRequired := mode == billingModeLive &&
-		!hasEstablishedSubscription &&
-		charges.CreditsRemainingUSD <= 0
 	summaryResources := billingSummaryResourcesFromState(resourceStates, vcpuSeconds, memoryGibSeconds, storageGibSeconds, charges)
 	creditSource, creditStatus := "local_trial", "available"
 	var stripeBalance, stripeApplied, stripeRemaining *float64
@@ -383,6 +380,19 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		creditsApplied = &charges.CreditsAppliedUSD
 		creditsRemaining = &charges.CreditsRemainingUSD
 		expectedInvoice = &charges.ExpectedInvoiceAmountUSD
+	}
+	// Stripe is authoritative for activated accounts, so determine whether
+	// payment setup is required only after its remaining balance has been read.
+	paymentSetupRequired := false
+	if hasStripeCreditState {
+		// An unavailable Stripe balance cannot establish whether setup is
+		// required; specifically, do not fall back to the local zero-credit
+		// arithmetic used while Stripe is authoritative.
+		paymentSetupRequired = stripeRemaining != nil && *stripeRemaining <= 0 &&
+			mode == billingModeLive && !hasEstablishedSubscription
+	} else {
+		paymentSetupRequired = mode == billingModeLive &&
+			!hasEstablishedSubscription && charges.CreditsRemainingUSD <= 0
 	}
 
 	setPrivateBillingCacheHeaders(c)
