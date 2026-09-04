@@ -1,16 +1,18 @@
 package network
 
 // hostfw.go installs the host-level iptables rules that route VM traffic.
-// Rules match by interface-prefix (veth+) and subnet (vmIPRange) and assume
-// vmd owns the host's filter/FORWARD, nat/PREROUTING, and nat/POSTROUTING
-// chains. On a cohabitated host (Docker, kubelet, ...) veth+ would catch
-// foreign interfaces; rules would need to move into vmd-owned custom chains.
+// Rules match by interface-prefix (veth+) and subnet (vmIPRange) and live in
+// vmd-owned chains: the shared built-in chains carry only veth-scoped jumps
+// into them (plus the source-scoped MASQUERADE), so on a cohabitated host
+// (Docker, kubelet, ...) the other agents' rules and vmd's cannot interfere.
 
 import (
 	"context"
 	"fmt"
 	"net"
 	"os/exec"
+	"sort"
+	"strings"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/rs/zerolog"
@@ -30,28 +32,41 @@ const portDropChain = "SANDBOX_EGRESS_PORTS"
 // REDIRECT behind.
 const dnsRedirectChain = "SANDBOX_DNS_REDIRECT"
 
-// installHostFirewall installs the static rules that route all VM traffic
-// through the host: UDP/443 DROP (kills QUIC bypass of the SNI allowlist),
-// operator-configured egress port DROPs, MSS clamp, FORWARD ACCEPT between
-// veth+ and the host iface, MASQUERADE for vmIPRange to the host iface,
-// REDIRECT HTTP/HTTPS from veth+ to the egress proxy, an optional REDIRECT
-// of all guest DNS to an operator-run resolver, and (when secretsProxyPort > 0)
-// REDIRECT secretsProxyDst:secretsProxyPort to the local secretsproxy daemon.
-// All operations are idempotent.
-//
-// blockedPorts come from the operator blocklist config — only ports 80/443
-// are redirected through the egress proxy, so anything else a VM dials goes
-// straight through FORWARD and must be dropped here.
-//
-// dnsRedirectPort, when non-zero, redirects all VM DNS (TCP and UDP dport
-// 53) to that port on the host, where the operator runs a resolver. The
-// redirect is transparent: it applies no matter which nameserver the guest
-// image has configured.
-//
-// manageOwnedChains gates ownership of the shared vmd-owned chains
-// (SANDBOX_EGRESS_PORTS, SANDBOX_DNS_REDIRECT): only the vmd daemon
-// reconciles them. Auxiliary managers pass false so a concurrent template
-// build does not flush the daemon's rules.
+// forwardChain is the vmd-owned filter chain that fully decides sandbox
+// forwarding. FORWARD keeps only two veth-scoped jumps into it; the chain
+// ends in an unconditional DROP, so sandbox traffic never falls back into
+// FORWARD where another agent's rules could act on it.
+const forwardChain = "SANDBOX_FORWARD"
+
+// preroutingChain is the vmd-owned nat chain holding the guest-facing
+// redirects (DNS resolver, HTTP/TLS egress proxy, secrets proxy), entered
+// via a single veth-scoped jump at the head of PREROUTING.
+const preroutingChain = "SANDBOX_PREROUTING"
+
+// sandboxVethPattern matches exactly vmd's own interfaces (veth-<slot>) and
+// nothing else. A bare veth+ would also capture other agents' veth-named
+// interfaces (Docker's auto-generated vethXXXX ports, hand-made pairs) and
+// pull their traffic into the sandbox chains — through to the terminal DROP.
+const sandboxVethPattern = "veth-+"
+
+// vmdOwnedChains names every chain vmd creates and reconciles. A rule that
+// jumps into one of them is vmd's regardless of marker: the chain namespace
+// itself is ours.
+var vmdOwnedChains = map[string]bool{
+	portDropChain:    true,
+	dnsRedirectChain: true,
+	forwardChain:     true,
+	preroutingChain:  true,
+}
+
+// installHostFirewall is the NON-owner installer: an auxiliary manager (the
+// template-builder) installs just the vmIPRange MASQUERADE, and the daemon on
+// the same host provides the rest of the topology. The owner's chains —
+// SANDBOX_FORWARD (QUIC and operator-port DROPs, the MSS clamp, the
+// veth↔uplink ACCEPTs, a terminal DROP) and SANDBOX_PREROUTING (the DNS,
+// egress-proxy, and secrets-proxy REDIRECTs) — are built by
+// ensureHostFirewall, whose shared-chain ordering is planned rather than
+// blindly inserted. Idempotent.
 func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedirectPort uint16, secretsProxyDst string, secretsProxyPort uint16, blockedPorts []uint16, manageOwnedChains bool, log zerolog.Logger) error {
 	_, ipnet, err := net.ParseCIDR(vmIPRange)
 	if err != nil {
@@ -66,130 +81,106 @@ func installHostFirewall(hostIface string, httpProxyPort, tlsProxyPort, dnsRedir
 		return fmt.Errorf("init iptables: %w", err)
 	}
 
-	// UDP/443 DROP must precede the veth+ ACCEPT below so QUIC traffic
-	// (which would bypass the SNI allowlist) is dropped before the broad
-	// ACCEPT terminates the chain walk. This rule is static.
-	udpDrop := []string{"-i", "veth+", "-p", "udp", "--dport", "443", "-j", "DROP"}
-	exists, err := ipt.Exists("filter", "FORWARD", udpDrop...)
-	if err != nil {
-		return fmt.Errorf("check veth+ UDP/443 DROP: %w", err)
-	}
-	if !exists {
-		if err := ipt.Insert("filter", "FORWARD", 1, udpDrop...); err != nil {
-			return fmt.Errorf("insert veth+ UDP/443 DROP: %w", err)
-		}
-	}
-
-	// Operator-configured egress port drops live in a vmd-owned chain so the
-	// live ruleset stays in sync with config. ClearChain creates-or-flushes,
-	// so a port removed from blockedPorts since the last start is dropped
-	// from the chain instead of lingering in FORWARD forever. The chain is
-	// entered via a single jump for veth+ traffic, placed before the ACCEPT.
-	//
-	// Only the chain owner (vmd) touches it. An auxiliary manager flushing
-	// the shared chain would wipe the daemon's port drops for the duration
-	// of, e.g., a template build.
+	// Owner topology is never installed here: shared-chain ordering must be
+	// planned from a locked snapshot (ensureHostFirewall), and a blind
+	// insert-at-head is exactly the bypass that planning exists to prevent.
 	if manageOwnedChains {
-		if err := ipt.ClearChain("filter", portDropChain); err != nil {
-			return fmt.Errorf("reset %s chain: %w", portDropChain, err)
-		}
-		dropPorts := blockedPorts
-		if dnsRedirectPort > 0 {
-			// The DNS redirect below only captures plain DNS on port 53.
-			// Encrypted DNS on its dedicated port (DoT/DoQ, 853) would
-			// silently sidestep the operator's resolver, so it is dropped
-			// whenever the redirect is active.
-			dropPorts = append(append([]uint16(nil), blockedPorts...), 853)
-		}
-		for _, port := range dropPorts {
-			for _, proto := range []string{"tcp", "udp"} {
-				if err := ipt.AppendUnique("filter", portDropChain,
-					"-p", proto, "--dport", fmt.Sprintf("%d", port), "-j", "DROP"); err != nil {
-					return fmt.Errorf("add %s/%d DROP to %s: %w", proto, port, portDropChain, err)
-				}
-			}
-		}
-		portJump := []string{"-i", "veth+", "-j", portDropChain}
-		exists, err = ipt.Exists("filter", "FORWARD", portJump...)
-		if err != nil {
-			return fmt.Errorf("check %s jump: %w", portDropChain, err)
-		}
-		if !exists {
-			if err := ipt.Insert("filter", "FORWARD", 1, portJump...); err != nil {
-				return fmt.Errorf("insert %s jump: %w", portDropChain, err)
-			}
-		}
-
-		// Guest DNS redirect, in its own vmd-owned nat chain. The jump is
-		// installed unconditionally; with the feature off the chain is
-		// empty and the jump is a no-op, which is also what reconciles
-		// away a redirect removed from config.
-		if err := ipt.ClearChain("nat", dnsRedirectChain); err != nil {
-			return fmt.Errorf("reset %s chain: %w", dnsRedirectChain, err)
-		}
-		for _, args := range dnsRedirectRules(dnsRedirectPort) {
-			if err := ipt.AppendUnique("nat", dnsRedirectChain, args...); err != nil {
-				return fmt.Errorf("add DNS redirect to %s: %w", dnsRedirectChain, err)
-			}
-		}
-		dnsJump := []string{"-i", "veth+", "-j", dnsRedirectChain}
-		exists, err = ipt.Exists("nat", "PREROUTING", dnsJump...)
-		if err != nil {
-			return fmt.Errorf("check %s jump: %w", dnsRedirectChain, err)
-		}
-		if !exists {
-			if err := ipt.Insert("nat", "PREROUTING", 1, dnsJump...); err != nil {
-				return fmt.Errorf("insert %s jump: %w", dnsRedirectChain, err)
-			}
-		}
+		return fmt.Errorf("owner install must go through ensureHostFirewall (planned shared-chain ordering)")
 	}
 
-	if err := ipt.AppendUnique("filter", "FORWARD",
-		"-o", hostIface,
-		"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-		"-j", "TCPMSS", "--clamp-mss-to-pmtu",
-	); err != nil {
-		return fmt.Errorf("add MSS clamp: %w", err)
+	if err := ipt.AppendUnique("nat", "POSTROUTING", marked(
+		"-s", vmIPRange, "-o", hostIface, "-j", "MASQUERADE")...); err != nil {
+		return fmt.Errorf("add MASQUERADE: %w", err)
 	}
+	// Async: callers may hold the cooperating-writer lock; an informational
+	// write must not extend the hold.
+	go func() {
+		log.Info().
+			Str("host_iface", hostIface).
+			Str("secrets_proxy_dst", secretsProxyDst).
+			Uint16("secrets_proxy_port", secretsProxyPort).
+			Msg("host firewall ready (static prefix rules)")
+	}()
+	return nil
+}
 
-	type rule struct {
-		table, chain string
-		args         []string
+// rebuildOwnedChains rebuilds the vmd-owned chains ATOMICALLY, one
+// iptables-restore transaction per table. The live entry jumps keep
+// referencing these chains throughout the slow path, so a
+// flush-and-repopulate through individual commands would open a window where
+// sandbox traffic falls through an empty chain into the foreign FORWARD
+// rules — and a failure mid-repopulation would strand it there. A declared
+// chain inside a --noflush restore is created-or-flushed and refilled in a
+// single commit; on error the previous contents remain. Each chain gets an
+// explicit -F inside the transaction — --noflush preserves existing contents
+// on the legacy backend, so relying on the declaration alone to clear a
+// pre-existing chain would append after stale rules there. Contents come
+// from the same spec the verifier checks, so the two cannot drift. Touches
+// no shared chain. OWNER ONLY.
+func rebuildOwnedChains(ctx context.Context, spec hostFWSpec) error {
+	for _, table := range []string{"filter", "nat"} {
+		var lines []string
+		var chains []string
+		for key := range spec.ownedChains {
+			if strings.HasPrefix(key, table+"/") {
+				chains = append(chains, strings.TrimPrefix(key, table+"/"))
+			}
+		}
+		sort.Strings(chains)
+		for _, chain := range chains {
+			lines = append(lines, ":"+chain+" - [0:0]")
+		}
+		for _, chain := range chains {
+			lines = append(lines, "-F "+chain)
+		}
+		for _, chain := range chains {
+			for _, w := range spec.ownedChains[table+"/"+chain] {
+				lines = append(lines, "-A "+chain+" "+emitRuleTokens(w.args))
+			}
+		}
+		input := "*" + table + "\n" + strings.Join(lines, "\n") + "\nCOMMIT\n"
+		if err := restoreIPTables(ctx, input); err != nil {
+			return fmt.Errorf("atomic %s owned-chain rebuild: %w", table, err)
+		}
 	}
-	rules := []rule{
-		{"filter", "FORWARD", []string{"-i", "veth+", "-o", hostIface, "-j", "ACCEPT"}},
-		{"filter", "FORWARD", []string{"-i", hostIface, "-o", "veth+", "-j", "ACCEPT"}},
-		{"nat", "POSTROUTING", []string{"-s", vmIPRange, "-o", hostIface, "-j", "MASQUERADE"}},
+	return nil
+}
+
+// forwardChainRules returns SANDBOX_FORWARD's exact contents. The entry
+// jumps scope traffic to veth ingress or egress, so the rules themselves
+// need no veth match beyond direction.
+func forwardChainRules(hostIface string) [][]string {
+	return [][]string{
+		{"-i", sandboxVethPattern, "-j", portDropChain},
+		{"-i", sandboxVethPattern, "-p", "udp", "--dport", "443", "-j", "DROP"},
+		{"-o", hostIface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"},
+		{"-i", sandboxVethPattern, "-o", hostIface, "-j", "ACCEPT"},
+		{"-i", hostIface, "-o", sandboxVethPattern, "-j", "ACCEPT"},
+		{"-j", "DROP"},
 	}
+}
+
+// preroutingChainRules returns SANDBOX_PREROUTING's exact contents: the DNS
+// redirect jump (a no-op when the feature is off — its chain is empty), then
+// the egress proxy REDIRECTs, then the secrets proxy REDIRECT.
+func preroutingChainRules(httpProxyPort, tlsProxyPort uint16, secretsProxyDst string, secretsProxyPort uint16) ([][]string, error) {
+	rules := [][]string{{"-j", dnsRedirectChain}}
 	if httpProxyPort > 0 {
-		rules = append(rules, rule{"nat", "PREROUTING",
-			[]string{"-i", "veth+", "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", httpProxyPort)}})
+		rules = append(rules, []string{"-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", httpProxyPort)})
 	}
 	if tlsProxyPort > 0 {
-		rules = append(rules, rule{"nat", "PREROUTING",
-			[]string{"-i", "veth+", "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", tlsProxyPort)}})
+		rules = append(rules, []string{"-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", tlsProxyPort)})
 	}
 	if secretsProxyPort > 0 {
 		if ip := net.ParseIP(secretsProxyDst); ip == nil || ip.To4() == nil {
-			return fmt.Errorf("invalid secretsProxyDst %q (must be IPv4)", secretsProxyDst)
+			return nil, fmt.Errorf("invalid secretsProxyDst %q (must be IPv4)", secretsProxyDst)
 		}
-		// -d narrows the match so we don't intercept unrelated dport-9443 traffic.
-		rules = append(rules, rule{"nat", "PREROUTING",
-			[]string{"-i", "veth+", "-p", "tcp", "-d", secretsProxyDst, "--dport", fmt.Sprintf("%d", secretsProxyPort),
-				"-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", secretsProxyPort)}})
+		// -d narrows the match so we don't intercept unrelated traffic to
+		// the same port.
+		rules = append(rules, []string{"-p", "tcp", "-d", secretsProxyDst, "--dport", fmt.Sprintf("%d", secretsProxyPort),
+			"-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", secretsProxyPort)})
 	}
-	for _, r := range rules {
-		if err := ipt.AppendUnique(r.table, r.chain, r.args...); err != nil {
-			return fmt.Errorf("add %s/%s rule: %w", r.table, r.chain, err)
-		}
-	}
-
-	log.Info().
-		Str("host_iface", hostIface).
-		Str("secrets_proxy_dst", secretsProxyDst).
-		Uint16("secrets_proxy_port", secretsProxyPort).
-		Msg("host firewall ready (static prefix rules)")
-	return nil
+	return rules, nil
 }
 
 // dnsRedirectRules returns the nat rules for the guest DNS redirect: all TCP

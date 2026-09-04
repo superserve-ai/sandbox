@@ -1872,6 +1872,12 @@ func main() {
 	// with pool fill, reattach, or a first slot-allocating request pre-ready.
 	mgr.StartNetnsLeakSampler(ctx, time.Minute)
 
+	// Periodic host-firewall reconciliation: another agent restarting while
+	// vmd serves (dockerd re-heading its jumps) must not leave a bypass
+	// standing until the next vmd restart. Intact ticks cost one read-only
+	// dump; drift runs the same locked plan-and-repair as startup.
+	netMgr.StartHostFWSampler(ctx, time.Minute)
+
 	// ---- Wait for signal or service failure ----
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
