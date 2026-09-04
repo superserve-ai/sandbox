@@ -243,10 +243,11 @@ func TestFrozenResumeFailureRevertsToPaused(t *testing.T) {
 		}
 	}
 	frozen := true
+	pausedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	inst := &VMInstance{
 		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
 		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs,
-		SnapshotWorkloadFrozen: &frozen,
+		SnapshotWorkloadFrozen: &frozen, PausedAt: pausedAt,
 	}
 	mgr := &Manager{
 		log:    zerolog.Nop(),
@@ -276,6 +277,9 @@ func TestFrozenResumeFailureRevertsToPaused(t *testing.T) {
 	defer inst.mu.RUnlock()
 	if inst.Status != StatusPaused || inst.WakePending || inst.Unverified {
 		t.Errorf("after failure: status=%v wakePending=%v unverified=%v, want Paused and nothing owed", inst.Status, inst.WakePending, inst.Unverified)
+	}
+	if !inst.PausedAt.Equal(pausedAt) {
+		t.Errorf("PausedAt = %v, want the original %v kept for the reclaim order", inst.PausedAt, pausedAt)
 	}
 }
 
@@ -1007,7 +1011,8 @@ func TestInterruptedResumeReturnsToPaused(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeOwedFromPaused: tc.fromPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath}
+			pausedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+			rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeOwedFromPaused: tc.fromPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath, PausedAt: pausedAt}
 			if err := store.Put(rec); err != nil {
 				t.Fatal(err)
 			}
@@ -1022,6 +1027,9 @@ func TestInterruptedResumeReturnsToPaused(t *testing.T) {
 			}
 			if got == nil || got.Status != StatusPaused || got.WakePending || got.Unverified || got.WakeOwedFromPaused {
 				t.Fatalf("record = %+v, want Paused with nothing owed", got)
+			}
+			if !got.PausedAt.Equal(pausedAt) {
+				t.Errorf("PausedAt = %v, want the original %v kept for the reclaim order", got.PausedAt, pausedAt)
 			}
 			if inst != nil {
 				inst.mu.RLock()
@@ -1073,7 +1081,13 @@ func TestReleaseOfAFrozenGuestUnpausesFirecrackerFirst(t *testing.T) {
 	origUnpause, origThaw := fcUnpauseVM, boxdThawGuest
 	t.Cleanup(func() { fcUnpauseVM, boxdThawGuest = origUnpause, origThaw })
 	var order []string
-	fcUnpauseVM = func(socket string) error { order = append(order, "unpause:"+socket); return nil }
+	fcUnpauseVM = func(ctx context.Context, socket string) error {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("the unpause must be bounded: a stuck Firecracker API must not hang cleanup or recovery")
+		}
+		order = append(order, "unpause:"+socket)
+		return nil
+	}
 	boxdThawGuest = func(_ context.Context, _, token string) error { order = append(order, "thaw:"+token); return nil }
 	m := &Manager{log: zerolog.Nop()}
 	if err := m.releaseFrozenGuest(context.Background(), "/run/vm.sock", "10.0.0.2", "tok"); err != nil {
@@ -1101,4 +1115,76 @@ func TestReleaseOfAFrozenGuestUnpausesFirecrackerFirst(t *testing.T) {
 	if len(order) != 2 || order[0] != "unpause:/run/vm-1.sock" || order[1] != "thaw:tok" {
 		t.Fatalf("recovery order = %v, want the unpause before the thaw", order)
 	}
+}
+
+// A stuck Firecracker API bounds the release: the unpause gives up on its
+// own budget and the thaw is still attempted.
+func TestReleaseOfAFrozenGuestIsBoundedByAStuckFirecracker(t *testing.T) {
+	origUnpause, origThaw := fcUnpauseVM, boxdThawGuest
+	t.Cleanup(func() { fcUnpauseVM, boxdThawGuest = origUnpause, origThaw })
+	fcUnpauseVM = func(ctx context.Context, _ string) error { <-ctx.Done(); return ctx.Err() }
+	thawed := false
+	boxdThawGuest = func(context.Context, string, string) error { thawed = true; return nil }
+	m := &Manager{log: zerolog.Nop()}
+	start := time.Now()
+	if err := m.releaseFrozenGuest(context.Background(), "/run/vm.sock", "10.0.0.2", "tok"); err != nil || !thawed {
+		t.Fatalf("err=%v thawed=%v; want the thaw attempted after the unpause gave up", err, thawed)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("release took %v; the unpause must be bounded", took)
+	}
+}
+
+// A token mismatch is terminal. The Error a resume writes owes nothing, so a
+// restart does not return it to Paused; a reattached wake the guest refuses
+// as another freeze's is Error, not Paused, however the resume began.
+func TestTokenMismatchStaysErrorThroughRecovery(t *testing.T) {
+	origWake, origDown := boxdWakeGuest, vmUnitFullyDown
+	t.Cleanup(func() { boxdWakeGuest, vmUnitFullyDown = origWake, origDown })
+
+	t.Run("error_record_with_no_unit_is_not_returned_to_paused", func(t *testing.T) {
+		vmUnitFullyDown = func(string) bool { return true }
+		dir := t.TempDir()
+		store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { store.Close() })
+		// What an older write could have left: Error, yet still owing.
+		rec := VMRecord{ID: "vm-1", Status: StatusError, WakePending: true, WakeOwedFromPaused: true, FreezeToken: "tok", Supervision: SupervisionUnit}
+		if err := store.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+		mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
+		mgr.reattachRecord(context.Background(), rec, true)
+		if got, _ := store.Get("vm-1"); got != nil && got.Status == StatusPaused {
+			t.Fatalf("record = %+v; a terminal Error must not become Paused", got)
+		}
+	})
+
+	t.Run("refused_wake_on_a_reattached_resume_is_error", func(t *testing.T) {
+		vmUnitFullyDown = func(string) bool { return false }
+		boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error {
+			return fmt.Errorf("%w: status token", ErrGuestTokenMismatch)
+		}
+		dir := t.TempDir()
+		store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { store.Close() })
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeOwedFromPaused: true, Supervision: SupervisionUnit, IP: "10.0.0.2"}); err != nil {
+			t.Fatal(err)
+		}
+		mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
+		inst := mgr.reattachByID("vm-1", false)
+		if inst == nil {
+			t.Fatal("a parked record must still be tracked")
+		}
+		inst.mu.RLock()
+		defer inst.mu.RUnlock()
+		if inst.Status != StatusError {
+			t.Errorf("status %v, want Error: a refused wake is terminal even for a resume", inst.Status)
+		}
+	})
 }
