@@ -1700,10 +1700,14 @@ func TestBackfillRetriesDoNotStarveThePool(t *testing.T) {
 		probed <- struct{}{}
 		return 0, 0, fmt.Errorf("connection refused")
 	})
-	// Long relative to the deadline below, so holding a slot across it is
-	// visible; at the millisecond backoff the other tests use, both
-	// shapes look identical.
-	machineConfigProbeBackoff = 2 * time.Second
+	// Long relative to the 500ms recovery deadline below, so a pool that
+	// held slots across a backoff would visibly starve the good VM; at the
+	// millisecond backoff the other tests use, both shapes look identical.
+	// Not longer: a failed probe requeues at DOUBLE this, jittered up to
+	// +50%, and the retired stuck VMs only exit once that comes due — the
+	// final awaitBackfill's 5s deadline must clear the worst case (3s here)
+	// with margin, or the join races cleanup's seam restore.
+	machineConfigProbeBackoff = time.Second
 
 	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
 	stuck := make([]*VMInstance, 0, machineConfigRecoveryWorkers)
