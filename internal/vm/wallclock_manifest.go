@@ -48,19 +48,25 @@ var wakeProtocolEvidencePath = "/var/lib/sandbox/wake-protocol-evidence"
 // asks whether the file exists; the note is for whoever finds it.
 const wakeProtocolEvidenceNote = "this host has held images that owe a wake\n"
 
-// wakeProtocolEvidenceDone is set once evidence is known durable, whether a
-// previous process wrote it or this one did.
-var wakeProtocolEvidenceDone atomic.Bool
+// Two facts about the evidence, kept apart: seen, the file is visible, which
+// is what turns the pause-intent checks on; and durable, this process has
+// itself synced the directory that holds it. A file left visible by a raise
+// whose directory sync failed is seen but not durable, and the next raise
+// must repair that rather than trust it.
+var (
+	wakeProtocolEvidenceSeen    atomic.Bool
+	wakeProtocolEvidenceDurable atomic.Bool
+)
 
 // RecognizeWakeProtocolFloor notes, at startup, evidence a previous process
-// made durable. It never writes. Existence is the fact, as it is for the
-// host guard: the file is only ever created whole, so its size says nothing.
+// left. It never writes. Existence is the fact, as it is for the host guard:
+// the file is only ever created whole, so its size says nothing.
 func RecognizeWakeProtocolFloor() bool {
-	if wakeProtocolEvidenceDone.Load() {
+	if wakeProtocolEvidenceSeen.Load() {
 		return true
 	}
 	if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
-		wakeProtocolEvidenceDone.Store(true)
+		wakeProtocolEvidenceSeen.Store(true)
 		return true
 	}
 	return false
@@ -69,7 +75,7 @@ func RecognizeWakeProtocolFloor() bool {
 // wakeProtocolFloorRaised reports what startup recognised, without I/O. A
 // pause intent is only ever written on a host whose floor is up, so on any
 // other host the checks for one are skipped, at no cost.
-func wakeProtocolFloorRaised() bool { return wakeProtocolEvidenceDone.Load() }
+func wakeProtocolFloorRaised() bool { return wakeProtocolEvidenceSeen.Load() }
 
 // RaiseWakeProtocolFloor durably records that this host holds, or is about to
 // hold, an image that owes a wake. The template builder calls it before it
@@ -78,17 +84,19 @@ func wakeProtocolFloorRaised() bool { return wakeProtocolEvidenceDone.Load() }
 // appears by rename, so no crash and no concurrent build can leave an empty
 // file that one reader honours and another does not.
 func RaiseWakeProtocolFloor() error {
-	if wakeProtocolEvidenceDone.Load() {
+	if wakeProtocolEvidenceDurable.Load() {
 		return nil
 	}
 	if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
-		// Present, but not proven durable by this process: a raise whose
-		// directory sync failed leaves the file visible all the same. Sync
-		// the directory before this one counts it.
+		// Visible, but not proven durable by this process: a raise whose
+		// directory sync failed leaves the file visible all the same, and
+		// startup recognition proves nothing. Sync the directory before
+		// this one counts it.
 		if err := syncDir(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
 			return err
 		}
-		wakeProtocolEvidenceDone.Store(true)
+		wakeProtocolEvidenceSeen.Store(true)
+		wakeProtocolEvidenceDurable.Store(true)
 		return nil
 	}
 	tmp := wakeProtocolEvidencePath + ".tmp." + strconv.Itoa(os.Getpid())
@@ -117,7 +125,8 @@ func RaiseWakeProtocolFloor() error {
 	if err := syncDir(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
 		return err
 	}
-	wakeProtocolEvidenceDone.Store(true)
+	wakeProtocolEvidenceSeen.Store(true)
+	wakeProtocolEvidenceDurable.Store(true)
 	return nil
 }
 
