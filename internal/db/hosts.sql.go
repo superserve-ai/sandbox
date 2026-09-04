@@ -244,27 +244,29 @@ func (q *Queries) HostHasCapabilities(ctx context.Context, arg HostHasCapabiliti
 
 const hostHasCapabilitiesUnlocked = `-- name: HostHasCapabilitiesUnlocked :one
 WITH target_host AS MATERIALIZED (
-  SELECT id, last_heartbeat_at
+  SELECT id, vmd_addr, last_heartbeat_at
   FROM host
   WHERE id = $2
     AND status = 'active'
     AND last_heartbeat_at IS NOT NULL
 )
-SELECT EXISTS (
-  SELECT 1
-  FROM target_host h
-  WHERE NOT EXISTS (
+SELECT
+  EXISTS (
     SELECT 1
-    FROM unnest($1::text[]) AS required(capability)
+    FROM target_host h
     WHERE NOT EXISTS (
       SELECT 1
-      FROM host_capability hc
-      WHERE hc.host_id = h.id
-        AND hc.capability = required.capability
-        AND hc.heartbeat_at = h.last_heartbeat_at
+      FROM unnest($1::text[]) AS required(capability)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM host_capability hc
+        WHERE hc.host_id = h.id
+          AND hc.capability = required.capability
+          AND hc.heartbeat_at = h.last_heartbeat_at
+      )
     )
-  )
-)
+  ) AS has_capabilities,
+  COALESCE((SELECT vmd_addr FROM target_host), '')::text AS vmd_addr
 `
 
 type HostHasCapabilitiesUnlockedParams struct {
@@ -272,15 +274,25 @@ type HostHasCapabilitiesUnlockedParams struct {
 	HostID               string   `json:"host_id"`
 }
 
+type HostHasCapabilitiesUnlockedRow struct {
+	HasCapabilities bool   `json:"has_capabilities"`
+	VmdAddr         string `json:"vmd_addr"`
+}
+
 // HostHasCapabilities without the row lock, for standalone pre-flight reads
 // outside a mutation transaction: omitting the lock keeps concurrent checks
 // from serializing behind the host's heartbeat writer. Transactional callers
 // that must pin the host across a commit use HostHasCapabilities.
-func (q *Queries) HostHasCapabilitiesUnlocked(ctx context.Context, arg HostHasCapabilitiesUnlockedParams) (bool, error) {
+//
+// Also returns the host's VMD address (empty when the host is not active):
+// the pre-flight already reads the row, so the caller can record it as the
+// address verification the host registry would otherwise perform with a
+// read of its own.
+func (q *Queries) HostHasCapabilitiesUnlocked(ctx context.Context, arg HostHasCapabilitiesUnlockedParams) (HostHasCapabilitiesUnlockedRow, error) {
 	row := q.db.QueryRow(ctx, hostHasCapabilitiesUnlocked, arg.RequiredCapabilities, arg.HostID)
-	var exists bool
-	err := row.Scan(&exists)
-	return exists, err
+	var i HostHasCapabilitiesUnlockedRow
+	err := row.Scan(&i.HasCapabilities, &i.VmdAddr)
+	return i, err
 }
 
 const listActiveHosts = `-- name: ListActiveHosts :many

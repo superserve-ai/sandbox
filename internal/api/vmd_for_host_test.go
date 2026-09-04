@@ -21,7 +21,8 @@ func (f *routeFakeRegistry) ClientFor(context.Context, string) (vmdclient.Client
 
 // Invalidate keeps the fake compatible with the registry interface as it
 // grows an eviction method.
-func (f *routeFakeRegistry) Invalidate(string) {}
+func (f *routeFakeRegistry) Invalidate(string)                            {}
+func (f *routeFakeRegistry) MarkVerified(context.Context, string, string) {}
 
 // A sandbox row referencing an unregistered host is a hard error, never a
 // silent fallback to the default client: with more than one host the

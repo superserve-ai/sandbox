@@ -700,3 +700,55 @@ func TestObserveRecordsPerResolutionNotPerWaiter(t *testing.T) {
 		t.Fatalf("sample = %+v, want cold/success (the canceled waiter must not record an error)", samples[0])
 	}
 }
+
+// A caller that has just read the host row hands the address to the
+// registry: a cached client at that address has its lease renewed without a
+// row read of its own, so the dispatch that follows never blocks on one.
+func TestMarkVerifiedRenewsLeaseWithoutRead(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // cold: read + dial
+		t.Fatalf("prime: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond) // lease due; ClientFor alone would read again
+
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor after MarkVerified: %v", err)
+	}
+	if n := store.readCount(); n != 1 {
+		t.Fatalf("reads = %d, want 1 (MarkVerified must renew the lease without a read)", n)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+}
+
+// With no client yet, MarkVerified resolves up front (one read, one dial) so
+// the first dispatch on a fresh process finds a verified client waiting.
+func TestMarkVerifiedColdResolvesOnce(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	if n := store.readCount(); n != 1 {
+		t.Fatalf("reads = %d, want 1", n)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+}

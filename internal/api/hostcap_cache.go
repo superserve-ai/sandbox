@@ -22,11 +22,14 @@ const hostCapQueryTimeout = 5 * time.Second
 
 // hostCapCache is an in-process, TTL-bounded, positive-only cache of host
 // capability attestations, fronting HostHasCapabilitiesUnlocked on the
-// standalone pre-flight paths. Same shape as apiKeyCache: only affirmative
-// results are cached (a missing capability or an error always re-reads, so a
-// capability 409 is always fresh), an expired entry is served for a short
-// grace while one background flight refreshes it, and concurrent misses
-// coalesce. The fail-closed gates (transactional validation, VMD's post-boot
+// standalone pre-flight paths. The read behind it is the one host-row read a
+// create pays when nothing is cached: it also returns the host's address,
+// which is handed to the host registry as that host's verification, so the
+// dispatch that follows does not read the row again. Same shape as
+// apiKeyCache: only affirmative results are cached (a missing capability or
+// an error always re-reads, so a capability 409 is always fresh), an expired
+// entry is served for a short grace while one background flight refreshes
+// it, and concurrent misses coalesce. The fail-closed gates (transactional validation, VMD's post-boot
 // attestation) do not go through this cache. Cardinality is hosts ×
 // capability sets; puts sweep expired entries, so memory tracks the active
 // fleet.
@@ -136,7 +139,7 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 		start := time.Now()
 		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostCapQueryTimeout)
 		defer cancel()
-		has, err := h.DB.HostHasCapabilitiesUnlocked(qctx, params)
+		has, err := h.readHostCaps(qctx, params)
 		switch {
 		case err != nil:
 		case has:
@@ -157,6 +160,19 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 	}
 }
 
+// readHostCaps performs the pre-flight read and, on an affirmative answer,
+// records the address it returned with the host registry.
+func (h *Handlers) readHostCaps(ctx context.Context, params db.HostHasCapabilitiesUnlockedParams) (bool, error) {
+	row, err := h.DB.HostHasCapabilitiesUnlocked(ctx, params)
+	if err != nil {
+		return false, err
+	}
+	if row.HasCapabilities && h.Hosts != nil {
+		h.Hosts.MarkVerified(ctx, params.HostID, row.VmdAddr)
+	}
+	return row.HasCapabilities, nil
+}
+
 func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string, capabilities []string) (bool, error) {
 	c := &h.hostCaps
 	c.init()
@@ -168,7 +184,7 @@ func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string,
 		// unbounded read here would silently break that arithmetic.
 		qctx, cancel := context.WithTimeout(ctx, hostCapQueryTimeout)
 		defer cancel()
-		return h.DB.HostHasCapabilitiesUnlocked(qctx, params)
+		return h.readHostCaps(qctx, params)
 	}
 	sorted := append([]string(nil), capabilities...)
 	sort.Strings(sorted)

@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -400,22 +400,45 @@ func TestInvalidateBeatsInFlightRefresh(t *testing.T) {
 	}
 }
 
-func TestLoadHostsPastGraceBlocksInsteadOfServingStale(t *testing.T) {
+// However old the cached set is, a select serves it without waiting on the
+// DB: an instance that has been idle for an hour must not pay a blocking
+// load on its next create, and the refresh rides behind the request.
+func TestLoadHostsAnyAgeServesStaleAndRefreshesBehind(t *testing.T) {
 	store := &hostStore{}
 	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
 	if _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("prime: %v", err)
 	}
 
-	// Way past ttl+grace (refreshes never landed): must block on a fresh
-	// load, not keep serving a possibly-dead host list.
+	// Hold the refresh (query 2) so a select that blocked on it would hang.
+	store.block = make(chan struct{})
+	store.blockOnCall = 2
 	setCachedAtForTest(t, s, nil, time.Now().Add(-time.Hour))
 
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {
-		t.Fatalf("past-grace select: %v", err)
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.SelectHost(context.Background(), nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("stale select: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("select blocked on the refresh instead of serving the stale set")
 	}
-	if n := store.calls.Load(); n != 2 {
-		t.Fatalf("past-grace select must reload synchronously, got %d queries", n)
+	close(store.block)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for s.refreshing.Load() || store.calls.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("background refresh never landed, calls=%d", store.calls.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if _, cachedAt, cached := readCacheForTest(s, nil); !cached || time.Since(cachedAt) > time.Minute {
+		t.Fatal("refresh must restore a fresh cachedAt")
 	}
 }
 
@@ -441,11 +464,11 @@ func TestBlockingReloadNotClobberedBySlowRefresh(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 
-	// Age past grace: the next call reloads synchronously (query 3) and must
+	// Invalidate: the next call reloads synchronously (query 3) and must
 	// retire the still-hanging refresh so its older result cannot land on top.
-	setCachedAtForTest(t, s, nil, time.Now().Add(-time.Hour))
+	s.Invalidate()
 	if _, err := s.SelectHost(context.Background(), nil); err != nil {
-		t.Fatalf("past-grace select: %v", err)
+		t.Fatalf("post-invalidate select: %v", err)
 	}
 	close(store.block) // the pre-reload refresh now returns
 

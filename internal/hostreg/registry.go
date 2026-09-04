@@ -309,3 +309,27 @@ func (r *Registry) Invalidate(hostID string) {
 	r.gens[hostID]++
 	r.mu.Unlock()
 }
+
+// MarkVerified records a host row read the caller has just performed and
+// the address it saw, so the dispatch that follows finds a verified client
+// instead of blocking on a row read of its own. A cached client at the same
+// address has its lease renewed in place. No client yet, or a moved address,
+// resolves now (row read plus dial) under the usual generation guards; a
+// resolution failure is logged and leaves ClientFor to fail closed as before.
+func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
+	if addr == "" {
+		return
+	}
+	r.mu.Lock()
+	if e, ok := r.clients[hostID]; ok && e.addr == addr {
+		now := time.Now()
+		e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
+		r.clients[hostID] = e
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+	if _, err := r.resolveClient(ctx, hostID); err != nil {
+		log.Warn().Err(err).Str("host_id", hostID).Msg("host client resolution after row verification failed")
+	}
+}
