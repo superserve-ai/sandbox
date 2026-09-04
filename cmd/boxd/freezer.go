@@ -69,6 +69,9 @@ type freezer struct {
 	// request after success is answered the same way.
 	token string
 	last  atomic.Value // string: the token most recently released
+	// woken is the token whose wake completed, so a retry of a wake whose
+	// answer was lost is answered as done rather than corrected again.
+	woken atomic.Value // string
 }
 
 var (
@@ -261,7 +264,13 @@ func (f *freezer) freeze(ctx context.Context, token string) error {
 			return f.undo(token, fmt.Errorf("read freezer state: %w", err))
 		}
 		if st == "FROZEN" {
+			// The budget covers this read too: a caller that has given up
+			// must not find its workload stopped after all.
+			if err := ctx.Err(); err != nil {
+				return f.undo(token, fmt.Errorf("workload froze after the budget was spent: %w", err))
+			}
 			f.token = token
+			f.woken.Store("")
 			return nil
 		}
 		select {
@@ -339,6 +348,15 @@ func (f *freezer) holds(token string) bool {
 		return token == f.token
 	}
 	return f.released(token)
+}
+
+// completeWake records that token's wake finished: the clock is corrected and
+// the workload runs. wakeDone answers a retry of it without doing it again.
+func (f *freezer) completeWake(token string) { f.woken.Store(token) }
+
+func (f *freezer) wakeDone(token string) bool {
+	woken, _ := f.woken.Load().(string)
+	return token != "" && token == woken
 }
 
 // released reports whether token names the most recently released freeze.
@@ -503,6 +521,15 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 			}{"token"})
 			return
 		}
+		if fz.wakeDone(body.Token) {
+			// A retry of a wake that completed: its answer was lost, not its
+			// effect. The clock is not corrected again.
+			json.NewEncoder(w).Encode(struct {
+				Status    string          `json:"status"`
+				WallClock wallClockStatus `json:"wall_clock"`
+			}{Status: "ok", WallClock: clock.status()})
+			return
+		}
 		wc, ready := clock.sync(*body.ClockFrozen)
 		status := "ok"
 		if ready {
@@ -510,6 +537,8 @@ func handleWake(clock *wallClock, fz *freezer) http.HandlerFunc {
 				diagf("freezer: thaw on wake failed: %v", err)
 				ready, status = false, "thaw"
 				wc.Error = "thaw: " + err.Error()
+			} else {
+				fz.completeWake(body.Token)
 			}
 		} else {
 			status = "clock"

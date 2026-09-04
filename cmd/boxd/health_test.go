@@ -94,7 +94,8 @@ func TestWakeUnreadyWhenThawCannotBeConfirmed(t *testing.T) {
 func TestWakeIsIdempotentForItsTokenOnly(t *testing.T) {
 	fz := newFreezer(newFake(), testDir)
 	_ = fz.freeze(bg(), "t1")
-	clock := clockUnder(&fakeSource{host: base}, base)
+	src := &fakeSource{host: base}
+	clock := clockUnder(src, base)
 	if code, body := wakeWith(clock, fz, false, "t2"); code != 409 || body["status"] != "token" || !fz.isFrozen() {
 		t.Fatalf("wrong token: code %d body %v frozen %v, want 409 token and still frozen", code, body, fz.isFrozen())
 	}
@@ -108,6 +109,18 @@ func TestWakeIsIdempotentForItsTokenOnly(t *testing.T) {
 	}
 	if code, _ := wakeWith(clock, newFreezer(newFake(), testDir), false, "t1"); code != 409 {
 		t.Fatalf("never frozen: code %d, want 409", code)
+	}
+	// A retry after its answer was lost is answered as done even when the
+	// host clock cannot be read now: the effect was not lost.
+	src.hostErr = errors.New("no ptp")
+	if code, body := wakeWith(clock, fz, true, "t1"); code != 200 || body["status"] != "ok" {
+		t.Fatalf("retry with the clock unreadable: code %d body %v, want 200 ok", code, body)
+	}
+	// A new freeze under the same token is a new wake, not a retry.
+	src.hostErr = nil
+	_ = fz.freeze(bg(), "t1")
+	if code, _ := wakeWith(clock, fz, false, "t1"); code != 200 || fz.isFrozen() {
+		t.Fatalf("wake after a new freeze: code %d frozen %v, want 200 and released", code, fz.isFrozen())
 	}
 }
 

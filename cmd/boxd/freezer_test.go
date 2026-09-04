@@ -33,7 +33,8 @@ type fakeCgroup struct {
 	neverDone bool
 	stuckThaw bool
 	writes    []string
-	onPoll    func() // called on each poll that reads FREEZING
+	onPoll    func()             // called on each poll that reads FREEZING
+	onWrite   func(state string) // called on each state write
 }
 
 func (f *fakeCgroup) readState() (string, error) {
@@ -67,6 +68,9 @@ func (f *fakeCgroup) writeState(s string) error {
 		return os.ErrNotExist
 	}
 	f.writes = append(f.writes, s)
+	if f.onWrite != nil {
+		f.onWrite(s)
+	}
 	switch {
 	case s == "FROZEN":
 		f.state = "FREEZING"
@@ -713,5 +717,29 @@ func TestDiagnosticsNeverBlockOrPileUp(t *testing.T) {
 	}
 	if after := runtime.NumGoroutine(); after > before+1 {
 		t.Fatalf("goroutines %d before, %d after", before, after)
+	}
+}
+
+// The budget covers the read that confirms FROZEN: a caller whose budget ran
+// out while the cgroup was settling finds its workload running, not stopped.
+func TestFreezeSpentDuringTheConfirmingReadRollsBack(t *testing.T) {
+	cg := newFake()
+	fz := newFreezer(cg, testDir)
+	ctx, cancel := context.WithCancel(bg())
+	defer cancel()
+	cg.onWrite = func(state string) {
+		if state == "FROZEN" {
+			cancel() // spent after the request, before the confirming read
+		}
+	}
+	err := fz.freeze(ctx, "t1")
+	if !errors.Is(err, context.Canceled) || fz.isFrozen() {
+		t.Fatalf("err=%v frozen=%v, want the spent budget reported and the workload running", err, fz.isFrozen())
+	}
+	if st, _ := cg.readState(); st != "THAWED" {
+		t.Fatalf("cgroup left %q", st)
+	}
+	if err := fz.thaw("t1"); err != nil {
+		t.Fatalf("follow-up thaw: %v", err)
 	}
 }
