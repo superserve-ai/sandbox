@@ -370,7 +370,7 @@ func (c *stripeHTTPClient) GetCustomerCreditBalance(ctx context.Context, custome
 		// zero: decoding a missing object into a value struct would silently
 		// turn malformed/partial responses into an authoritative zero.
 		if b.AvailableBalance.Monetary == nil {
-			continue
+			return StripeCreditBalance{}, fmt.Errorf("stripe credit balance summary contained an unrepresentable balance")
 		}
 		if b.AvailableBalance.Monetary.Currency == "usd" {
 			cents += b.AvailableBalance.Monetary.Value

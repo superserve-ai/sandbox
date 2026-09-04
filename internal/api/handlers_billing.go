@@ -198,6 +198,11 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	)
 	g, ctx := errgroup.WithContext(c.Request.Context())
 	hasEstablishedSubscription := billingAccountHasEstablishedSubscription(account)
+	// Stripe remains authoritative for credit state after activation, including
+	// when the subscription has since been canceled. Keep this separate from
+	// the active-subscription predicate so canceled accounts can still use
+	// checkout/portal semantics based on their current status.
+	hasStripeCreditState := billingAccountHasStripeCreditState(account)
 	g.Go(func() error {
 		// Usage remains required for every account: Stripe owns credit state after
 		// activation, but current charges and the resource breakdown still come
@@ -225,7 +230,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		}
 		return nil
 	})
-	if !hasEstablishedSubscription {
+	if !hasStripeCreditState {
 		g.Go(func() error {
 			var err error
 			creditBalance, err = h.DB.GetTeamCreditBalance(ctx, teamID)
@@ -303,12 +308,12 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	}
 
 	creditsAvailable, err := numericFloat64(creditBalance)
-	if err != nil && !hasEstablishedSubscription {
+	if err != nil && !hasStripeCreditState {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert credit balance failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	if hasEstablishedSubscription {
+	if hasStripeCreditState {
 		creditsAvailable = 0
 	}
 	checkoutAvailable := false
@@ -335,7 +340,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	var stripeBalance, stripeApplied, stripeRemaining *float64
 	var creditsApplied, creditsRemaining, expectedInvoice *float64
 	var observed *time.Time
-	if hasEstablishedSubscription {
+	if hasStripeCreditState {
 		creditSource, creditStatus = "stripe", "unavailable"
 		// Keep every credit-derived estimate unavailable until Stripe's
 		// authoritative balance has been read successfully. In particular, do
@@ -372,7 +377,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 			}
 		}
 	}
-	if !hasEstablishedSubscription {
+	if !hasStripeCreditState {
 		creditsApplied = &charges.CreditsAppliedUSD
 		creditsRemaining = &charges.CreditsRemainingUSD
 		expectedInvoice = &charges.ExpectedInvoiceAmountUSD
@@ -406,6 +411,19 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		},
 		CalculatedAt: now,
 	})
+}
+
+func billingAccountHasStripeCreditState(account db.GetTeamBillingAccountRow) bool {
+	if billingAccountHasEstablishedSubscription(account) {
+		return true
+	}
+	if account.StripeCustomerID == nil || strings.TrimSpace(*account.StripeCustomerID) == "" {
+		return false
+	}
+	if account.StripeActivationCreditGrantID != nil && strings.TrimSpace(*account.StripeActivationCreditGrantID) != "" {
+		return true
+	}
+	return account.TrialEndedAt.Valid
 }
 
 func (h *Handlers) requireBillingRead(c *gin.Context) (uuid.UUID, bool) {

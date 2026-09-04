@@ -177,6 +177,14 @@ func TestStripeCreditBalanceRejectsMissingMonetaryBalance(t *testing.T) {
 	}
 }
 
+func TestStripeCreditBalanceRejectsPartiallyMalformedBalances(t *testing.T) {
+	transport := &stripeCreditBalanceRoundTripper{body: `{"balances":[{"available_balance":{"monetary":{"currency":"usd","value":2000}}},{"available_balance":{}}]}`}
+	client := &stripeHTTPClient{baseURL: "https://stripe.example.test", secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: &http.Client{Transport: transport}}
+	if _, err := client.GetCustomerCreditBalance(t.Context(), "cus_example"); err == nil {
+		t.Fatal("expected partially malformed balance response to be unavailable")
+	}
+}
+
 func (r *stripeCheckoutSessionRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
