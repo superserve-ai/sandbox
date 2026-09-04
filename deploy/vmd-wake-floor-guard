@@ -14,10 +14,8 @@
 set -u
 BIN="${1:-/usr/local/bin/vmd}"
 
-if grep -qa wake-protocol-1 "$BIN" 2>/dev/null; then
-    exit 0
-fi
-
+# Witnesses first: a host that holds no such image pays a stat and a glob at
+# each start, and the binary is scanned only when one exists.
 WAKE_EVIDENCE=/var/lib/sandbox/wake-protocol-evidence
 SNAPSHOTS=$(sed -n 's/^SNAPSHOT_DIR=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -n 1 | tr -d '"')
 SNAPSHOTS="${SNAPSHOTS:-/var/lib/sandbox/snapshots}"
@@ -25,6 +23,12 @@ wake_evidence=""
 [ -e "$WAKE_EVIDENCE" ] && wake_evidence="$WAKE_EVIDENCE"
 if [ -z "$wake_evidence" ] && grep -lqs '"workload_frozen":true' "$SNAPSHOTS"/templates/*/*/*.wallclock "$SNAPSHOTS"/templates/*/*.wallclock "$SNAPSHOTS"/*/*.wallclock 2>/dev/null; then
     wake_evidence="frozen image manifest under ${SNAPSHOTS}"
+fi
+if [ -z "$wake_evidence" ]; then
+    exit 0
+fi
+if grep -qa wake-protocol-1 "$BIN" 2>/dev/null; then
+    exit 0
 fi
 if [ -n "$wake_evidence" ]; then
     echo "vmd-wake-floor-guard: REFUSING to start a vmd without the wake protocol: this host holds images that owe a wake (${wake_evidence})" >&2

@@ -138,13 +138,20 @@ func TestBoxdFreezeWorkload(t *testing.T) {
 // same token before going on unfrozen; only a release that neither confirmed
 // nor said "no such freeze" leaves the state unknown.
 func TestBoxdThawWorkload(t *testing.T) {
-	serve := func(t *testing.T, status int) func() {
+	// thawStatus answers /thaw; healthStatus and healthBody answer the /health
+	// the builder asks after a 409, since a 409 alone proves nothing.
+	serve := func(t *testing.T, thawStatus, healthStatus int, healthBody string) func() {
 		t.Helper()
 		ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(boxdPort))
 		if err != nil {
 			t.Skipf("port %d busy: %v", boxdPort, err)
 		}
 		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/health" {
+				w.WriteHeader(healthStatus)
+				w.Write([]byte(healthBody))
+				return
+			}
 			var body struct {
 				Token string `json:"token"`
 			}
@@ -152,26 +159,38 @@ func TestBoxdThawWorkload(t *testing.T) {
 			if r.URL.Path != "/thaw" || body.Token != "tok" {
 				t.Errorf("unexpected %s with token %q", r.URL.Path, body.Token)
 			}
-			w.WriteHeader(status)
+			w.WriteHeader(thawStatus)
 		}))
 		srv.Listener = ln
 		srv.Start()
 		return srv.Close
 	}
 	t.Run("released", func(t *testing.T) {
-		defer serve(t, 200)()
+		defer serve(t, 200, 500, "")()
 		if err := boxdThawWorkload(context.Background(), "127.0.0.1", "tok"); err != nil {
 			t.Fatal(err)
 		}
 	})
-	t.Run("never_frozen", func(t *testing.T) {
-		defer serve(t, 409)()
+	t.Run("never_frozen_and_running", func(t *testing.T) {
+		defer serve(t, 409, 200, `{"status":"ok","wall_clock":{"source":"ptp"}}`)()
 		if err := boxdThawWorkload(context.Background(), "127.0.0.1", "tok"); !errors.Is(err, errNoSuchFreeze) {
 			t.Fatalf("err = %v, want errNoSuchFreeze", err)
 		}
 	})
+	t.Run("frozen_under_another_token", func(t *testing.T) {
+		defer serve(t, 409, 503, `{"status":"frozen","wall_clock":{"source":"ptp"}}`)()
+		if err := boxdThawWorkload(context.Background(), "127.0.0.1", "tok"); err == nil || errors.Is(err, errNoSuchFreeze) {
+			t.Fatalf("err = %v, want an error that fails the build: the workload is stopped", err)
+		}
+	})
+	t.Run("running_unproven", func(t *testing.T) {
+		defer serve(t, 409, 200, `not json`)()
+		if err := boxdThawWorkload(context.Background(), "127.0.0.1", "tok"); err == nil || errors.Is(err, errNoSuchFreeze) {
+			t.Fatalf("err = %v, want an error that fails the build", err)
+		}
+	})
 	t.Run("unknown_state", func(t *testing.T) {
-		defer serve(t, 500)()
+		defer serve(t, 500, 200, `{"status":"ok"}`)()
 		if err := boxdThawWorkload(context.Background(), "127.0.0.1", "tok"); err == nil || errors.Is(err, errNoSuchFreeze) {
 			t.Fatalf("err = %v, want an error that fails the build", err)
 		}

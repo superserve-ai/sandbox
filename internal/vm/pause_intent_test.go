@@ -54,7 +54,16 @@ func TestPauseIntentBlocks(t *testing.T) {
 	})
 }
 
+// The floor is up on any host that holds an intent; a host whose floor is
+// down looks for none.
+func raiseFloorForTest(t *testing.T) {
+	t.Helper()
+	wakeProtocolEvidenceDone.Store(true)
+	t.Cleanup(func() { wakeProtocolEvidenceDone.Store(false) })
+}
+
 func TestInterruptedPauseRefusesResumeAndRestore(t *testing.T) {
+	raiseFloorForTest(t)
 	dir := t.TempDir()
 	snapPath := filepath.Join(dir, "vm.snap")
 	memPath := filepath.Join(dir, "mem.snap")
@@ -95,12 +104,14 @@ func TestInterruptedPauseRefusesResumeAndRestore(t *testing.T) {
 		t.Fatalf("resume: err=%v launched=%v, want FailedPrecondition before launch", rerr, launched)
 	}
 
+	// An in-place restore of the same VM meets the intent too.
+	known := &VMInstance{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs}
 	fresh := &Manager{
 		log: zerolog.Nop(), cfg: ManagerConfig{RunDir: t.TempDir()}, netMgr: &fakeNetMgr{},
-		vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1),
+		vms: map[string]*VMInstance{"vm-1": known}, restoreSem: make(chan struct{}, 1),
 	}
 	fresh.launchFirecrackerHook = launch
-	_, cerr := fresh.RestoreVMSnapshot(context.Background(), "vm-2", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
+	_, cerr := fresh.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
 	if status.Code(cerr) != codes.FailedPrecondition || launched {
 		t.Fatalf("restore: err=%v launched=%v, want FailedPrecondition before launch", cerr, launched)
 	}
@@ -113,7 +124,42 @@ func TestInterruptedPauseRefusesResumeAndRestore(t *testing.T) {
 	}
 }
 
+// A host whose floor is down has never written an intent, so its resumes
+// look for none: an intent placed there by hand is not consulted.
+func TestFloorDownLooksForNoIntent(t *testing.T) {
+	dir := t.TempDir()
+	snapPath, memPath, rootfs := filepath.Join(dir, "vm.snap"), filepath.Join(dir, "mem.snap"), filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snapPath, memPath, rootfs} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writePauseIntent(dir, pauseIntent{VMID: "vm-1", ArtifactID: "interrupted"}); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs}
+	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir}, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}}
+	launched := false
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		launched = true
+		return 4321, SupervisionUnit, nil
+	}
+	mgr.restoreForResumeHook = func(string, string, string, string, *network.VMNetInfo) (bool, string, error) { return false, "", nil }
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil || !launched {
+		t.Fatalf("resume: err=%v launched=%v, want the resume to proceed without looking", err, launched)
+	}
+	if _, err := os.Stat(pauseIntentPath(dir)); err != nil {
+		t.Error("the intent was touched on a host whose floor is down")
+	}
+}
+
 func TestCompletedPauseIntentClearsItself(t *testing.T) {
+	raiseFloorForTest(t)
 	dir := t.TempDir()
 	snapPath, memPath, rootfs := filepath.Join(dir, "vm.snap"), filepath.Join(dir, "mem.snap"), filepath.Join(dir, "rootfs.ext4")
 	for _, p := range []string{snapPath, memPath, rootfs} {

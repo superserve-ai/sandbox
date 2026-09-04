@@ -1,7 +1,6 @@
 package vm
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -10,11 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
-	"time"
-
-	"github.com/rs/zerolog"
 )
 
 // WallClockManifest sits beside a memory image and says what a supervisor may
@@ -39,37 +34,26 @@ type WallClockManifest struct {
 
 const WallClockManifestVersion = 1
 
-// wakeProtocolEvidenceNote is what the evidence file says. The host guard
-// only asks whether the file exists; the note is for whoever finds it.
-const wakeProtocolEvidenceNote = "this host has held images that owe a wake\n"
-
-// wakeProtocolEvidencePath is written the first time this daemon reads a
-// manifest — on restore, on pause, or in the templates it holds: this host has
-// images only a vmd with the wake protocol can handle, and the host-resident
-// guard refuses any other from then on. Best-effort and once; a host without
-// the directory is not a fleet host.
+// wakeProtocolEvidencePath records that this host has held an image that
+// owes a wake, so the host-resident guard refuses a vmd without the wake
+// protocol from then on. Raised by the template builder before it publishes
+// a frozen image, and by a supervisor before it acts on one. A supervisor
+// that only starts creates none, or every host would raise the floor with
+// both switches off and block a rollback of itself. A host without the
+// directory is not a fleet host.
 var wakeProtocolEvidencePath = "/var/lib/sandbox/wake-protocol-evidence"
 
-// wakeProtocolEvidenceDone is set only once the write is durable, so a failed
-// attempt is retried rather than forgotten; the mutex makes concurrent first
-// restores share one write instead of each paying the fsync.
-var (
-	wakeProtocolEvidenceDone atomic.Bool
-	wakeProtocolEvidenceMu   sync.Mutex
-)
+// wakeProtocolEvidenceNote is what the evidence file says. The guard only
+// asks whether the file exists; the note is for whoever finds it.
+const wakeProtocolEvidenceNote = "this host has held images that owe a wake\n"
 
-// noteWakeProtocolEvidence is the best-effort form, for manifests read where
-// nothing is about to act on them (a pause, the template scan).
-func noteWakeProtocolEvidence() {
-	if _, err := os.Stat(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
-		return
-	}
-	_ = ensureWakeProtocolFloor()
-}
+// wakeProtocolEvidenceDone is set once evidence is known durable, whether a
+// previous process wrote it or this one did.
+var wakeProtocolEvidenceDone atomic.Bool
 
-// recognizeWakeProtocolFloor notes evidence a previous process made durable.
-// It never writes: only an image that owes a wake raises the floor.
-func recognizeWakeProtocolFloor() bool {
+// RecognizeWakeProtocolFloor notes, at startup, evidence a previous process
+// made durable. It never writes.
+func RecognizeWakeProtocolFloor() bool {
 	if wakeProtocolEvidenceDone.Load() {
 		return true
 	}
@@ -80,28 +64,14 @@ func recognizeWakeProtocolFloor() bool {
 	return false
 }
 
-// ensureWakeProtocolFloor is the form a restore of an image that owes a wake
-// must pass before it launches anything: durable once, then free.
-func ensureWakeProtocolFloor() error {
-	if recognizeWakeProtocolFloor() {
-		return nil
-	}
-	wakeProtocolEvidenceMu.Lock()
-	defer wakeProtocolEvidenceMu.Unlock()
-	if recognizeWakeProtocolFloor() {
-		return nil
-	}
-	if err := RaiseWakeProtocolFloor(); err != nil {
-		return err
-	}
-	wakeProtocolEvidenceDone.Store(true)
-	return nil
-}
+// wakeProtocolFloorRaised reports what startup recognised, without I/O. A
+// pause intent is only ever written on a host whose floor is up, so on any
+// other host the checks for one are skipped, at no cost.
+func wakeProtocolFloorRaised() bool { return wakeProtocolEvidenceDone.Load() }
 
 // RaiseWakeProtocolFloor durably records that this host holds, or is about to
 // hold, an image that owes a wake. The template builder calls it before it
-// publishes a frozen image, so the floor is up before the artifact exists;
-// the daemon calls it before it restores one and on every manifest it reads.
+// publishes a frozen image, so the floor is up before the artifact exists.
 func RaiseWakeProtocolFloor() error {
 	f, err := os.OpenFile(wakeProtocolEvidencePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -118,7 +88,11 @@ func RaiseWakeProtocolFloor() error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return syncDir(filepath.Dir(wakeProtocolEvidencePath))
+	if err := syncDir(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
+		return err
+	}
+	wakeProtocolEvidenceDone.Store(true)
+	return nil
 }
 
 var ErrWallClockManifest = errors.New("wall-clock manifest unreadable")
@@ -144,6 +118,12 @@ func ReadWallClockManifest(memPath string) (*WallClockManifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrWallClockManifest, err)
 	}
+	// An empty file is the marker an earlier supervisor left beside an image
+	// whose guest corrects its clock. It carries no manifest: the image is
+	// restored the older way, and the next pause replaces or removes it.
+	if len(strings.TrimSpace(string(b))) == 0 {
+		return nil, nil
+	}
 	var m WallClockManifest
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, fmt.Errorf("%w: %s: %v", ErrWallClockManifest, WallClockMarkerPath(memPath), err)
@@ -154,7 +134,6 @@ func ReadWallClockManifest(memPath string) (*WallClockManifest, error) {
 	if m.WorkloadFrozen && m.FreezeToken == "" {
 		return nil, fmt.Errorf("%w: %s: frozen workload without a freeze token", ErrWallClockManifest, WallClockMarkerPath(memPath))
 	}
-	noteWakeProtocolEvidence()
 	return &m, nil
 }
 
@@ -212,60 +191,4 @@ func randomHex() string {
 // clock.
 func imageManifest(memPath string) (*WallClockManifest, error) {
 	return ReadWallClockManifest(memPath)
-}
-
-// WatchTemplateManifests keeps the wake-protocol evidence in step with the
-// templates this host holds. Templates are seeded while the daemon runs, so
-// the first frozen one to land is what raises the rollback floor here — no
-// restore has to happen first, and nothing is configured anywhere. A
-// directory listing every few minutes, off every request path.
-func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger) {
-	if m.cfg.SnapshotDir == "" {
-		return
-	}
-	// Before any request: evidence a previous process made durable is
-	// recognised, so the first frozen operation after a restart pays nothing.
-	// Only recognised — starting a vmd creates no evidence, or the daemon
-	// would raise the floor on every host with both switches off and block a
-	// rollback of itself.
-	recognizeWakeProtocolFloor()
-	scan := func() {
-		if n := m.scanTemplateManifests(); n > 0 && !wakeProtocolEvidenceLogged.Swap(true) {
-			log.Info().Int("templates", n).Msg("this host holds images that owe a wake; a vmd without the wake protocol is refused from now on")
-		}
-	}
-	go func() {
-		scan()
-		t := time.NewTicker(firecrackerCapabilityRefreshInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				scan()
-			}
-		}
-	}()
-}
-
-var wakeProtocolEvidenceLogged atomic.Bool
-
-// scanTemplateManifests reads every template manifest under the snapshot
-// directory (which records the evidence as a side effect) and returns how
-// many it found.
-func (m *Manager) scanTemplateManifests() int {
-	// Templates live at templates/<template>/<build>/; the shallower pattern
-	// is kept so a flattened layout could never hide one.
-	root := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)
-	deep, _ := filepath.Glob(filepath.Join(root, "*", "*", "*"+clockFreezeMarkerSuffix))
-	shallow, _ := filepath.Glob(filepath.Join(root, "*", "*"+clockFreezeMarkerSuffix))
-	matches := append(deep, shallow...)
-	n := 0
-	for _, path := range matches {
-		if man, err := ReadWallClockManifest(strings.TrimSuffix(path, clockFreezeMarkerSuffix)); err == nil && man != nil {
-			n++
-		}
-	}
-	return n
 }
