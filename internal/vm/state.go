@@ -219,6 +219,15 @@ type VMRecord struct {
 	// cannot leave an older answer for the next resume to act on. Tri-state
 	// for the same reason as CorrectsWallClock; nil means "ask the disk".
 	SnapshotWorkloadFrozen *bool `json:"snapshot_workload_frozen,omitempty"`
+	// WakePending: restored but the guest has not yet been told to correct its
+	// clock and release its workload. Written with the Running record, so a
+	// daemon that crashes between the two completes the wake on recovery
+	// instead of verifying a stopped workload as ready. ClockFrozen is the
+	// policy that restore used, which the wake must carry. FreezeToken is the
+	// token the image's freeze carries; a wake or thaw must present it.
+	WakePending bool   `json:"wake_pending,omitempty"`
+	ClockFrozen bool   `json:"clock_frozen,omitempty"`
+	FreezeToken string `json:"freeze_token,omitempty"`
 	// ArtifactID names the manifest beside the image this VM was last paused
 	// into; see VMInstance.
 	ArtifactID string            `json:"artifact_id,omitempty"`
@@ -915,6 +924,9 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		CorrectsWallClock:          inst.CorrectsWallClock,
 		ArtifactID:                 inst.ArtifactID,
 		SnapshotWorkloadFrozen:     inst.SnapshotWorkloadFrozen,
+		WakePending:                inst.WakePending,
+		ClockFrozen:                inst.ClockFrozen,
+		FreezeToken:                inst.FreezeToken,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
@@ -1018,6 +1030,9 @@ func toInstance(rec VMRecord) *VMInstance {
 		CorrectsWallClock:          rec.CorrectsWallClock,
 		ArtifactID:                 rec.ArtifactID,
 		SnapshotWorkloadFrozen:     rec.SnapshotWorkloadFrozen,
+		WakePending:                rec.WakePending,
+		ClockFrozen:                rec.ClockFrozen,
+		FreezeToken:                rec.FreezeToken,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,
