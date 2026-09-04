@@ -358,7 +358,7 @@ func (c *stripeHTTPClient) GetCustomerCreditBalance(ctx context.Context, custome
 	// credit-grants list API, this response is not capped at the first page, so
 	// iterating every returned balance preserves credits when a customer has
 	// more than 100 grants.
-	path := "/v1/billing/credit_balance_summary?customer=" + url.QueryEscape(customerID) + "&filter[type]=applicability_scope"
+	path := "/v1/billing/credit_balance_summary?customer=" + url.QueryEscape(customerID) + "&filter[type]=applicability_scope&filter[applicability_scope][price_type]=metered"
 	if err := c.doForm(ctx, http.MethodGet, path, nil, &resp, ""); err != nil {
 		return StripeCreditBalance{}, err
 	}

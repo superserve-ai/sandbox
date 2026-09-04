@@ -100,7 +100,7 @@ type stripeCreditBalanceRoundTripper struct {
 }
 
 func (r *stripeCreditBalanceRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Path != "/v1/billing/credit_balance_summary" || req.URL.Query().Get("customer") != "cus_example" || req.URL.Query().Get("filter[type]") != "applicability_scope" {
+	if req.URL.Path != "/v1/billing/credit_balance_summary" || req.URL.Query().Get("customer") != "cus_example" || req.URL.Query().Get("filter[type]") != "applicability_scope" || req.URL.Query().Get("filter[applicability_scope][price_type]") != "metered" {
 		return nil, fmt.Errorf("unexpected credit balance request: %s", req.URL.String())
 	}
 	status := r.status
