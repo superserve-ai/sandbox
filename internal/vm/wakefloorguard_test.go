@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,6 +70,8 @@ func (w *wakeGuardWorld) binary(name string, capable bool) string {
 	return p
 }
 
+func strconvItoa(i int) string { return fmt.Sprintf("%d", i) }
+
 func (w *wakeGuardWorld) run(bin string) (ok bool, out string) {
 	w.t.Helper()
 	res, err := exec.Command("sh", w.guard, bin).CombinedOutput()
@@ -114,6 +117,31 @@ func TestWakeFloorGuard(t *testing.T) {
 		seedFrozenManifest(t, filepath.Join(tpl, "mem.snap"), "tok")
 		if ok, out := w.run(w.binary("vmd", false)); ok || !strings.Contains(out, "frozen image manifest") {
 			t.Fatalf("incapable binary admitted over a frozen template: ok=%v %s", ok, out)
+		}
+		if ok, out := w.run(w.binary("new-vmd", true)); !ok {
+			t.Fatalf("capable binary refused: %s", out)
+		}
+	})
+	// The walk is batched, so a host with many images neither overflows an
+	// argument list nor admits a binary by accident; one frozen image among
+	// thousands still refuses it.
+	t.Run("thousands_of_images_are_walked_whole", func(t *testing.T) {
+		w := newWakeGuardWorld(t)
+		for i := 0; i < 3000; i++ {
+			sb := filepath.Join(w.snapshots, "vm-"+strconvItoa(i))
+			if err := os.MkdirAll(sb, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeWallClockManifestLazy(filepath.Join(sb, "mem.snap"), WallClockManifest{Version: WallClockManifestVersion, ArtifactID: "a", GuestCorrectsClock: true}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if ok, out := w.run(w.binary("vmd", false)); !ok {
+			t.Fatalf("refused with only unfrozen images: %s", out)
+		}
+		seedFrozenManifest(t, filepath.Join(w.snapshots, "vm-1500", "mem.snap"), "tok")
+		if ok, _ := w.run(w.binary("vmd", false)); ok {
+			t.Fatal("incapable binary admitted over one frozen image among thousands")
 		}
 		if ok, out := w.run(w.binary("new-vmd", true)); !ok {
 			t.Fatalf("capable binary refused: %s", out)

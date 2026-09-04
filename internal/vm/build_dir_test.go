@@ -54,6 +54,38 @@ func TestBuildsNeverOverwriteAPublishedTemplate(t *testing.T) {
 		t.Fatalf("fresh build: %v", err)
 	}
 
+	// An id that is not a single directory name can point the cleanup
+	// anywhere: refused before anything is looked at, and nothing is removed.
+	for _, ids := range [][2]string{{"..", "build-1"}, {"tpl", ".."}, {"tpl", "."}, {"", "build-1"}, {"tpl", ""}, {"tpl", "x/../.."}, {"a/b", "build-1"}, {"tpl", "../../vm-1"}} {
+		if err := m.prepareBuildDir(ids[0], ids[1]); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("ids %q: err=%v, want InvalidArgument", ids, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(published, buildMetaFilename)); err != nil {
+		t.Fatal("the published template was removed by a traversing id")
+	}
+
+	// Metadata a crash tore is not a published template: the retry clears
+	// the leftovers and goes on.
+	torn := filepath.Join(dir, TemplatesDirName, "tpl", "build-5")
+	if err := os.MkdirAll(torn, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{"", "{\"snapshot_path\": \"/x"} {
+		if err := os.WriteFile(filepath.Join(torn, buildMetaFilename), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.prepareBuildDir("tpl", "build-5"); err != nil {
+			t.Fatalf("torn metadata %q: err=%v, want the leftovers cleared", body, err)
+		}
+		if _, err := os.Stat(torn); !os.IsNotExist(err) {
+			t.Fatalf("torn metadata %q: leftovers kept", body)
+		}
+		if err := os.MkdirAll(torn, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	// A retry of an id still in flight is refused by the registry before the
 	// directory is touched: the running build's files survive.
 	inflight := filepath.Join(dir, TemplatesDirName, "tpl", "build-4")

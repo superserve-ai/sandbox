@@ -387,7 +387,13 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 	emitInternal("system", "artifacts fsynced")
 
-	writeBuildMeta(snapDir, snapPath, memPath, basePath, deltaPath, correctsWallClock, br)
+	// Published last, and whole: the metadata is what tells a supervisor the
+	// directory holds a template, so it appears by rename once everything
+	// else is durable, and a build whose metadata cannot land has not been
+	// published.
+	if err := writeBuildMeta(snapDir, snapPath, memPath, basePath, deltaPath, correctsWallClock, br); err != nil {
+		return fmt.Errorf("publish build metadata: %w", err)
+	}
 
 	return nil
 }
@@ -1082,7 +1088,7 @@ func createBuildOverlay(runDir, vmID, basePath string) (string, error) {
 // Build metadata
 // ---------------------------------------------------------------------------
 
-func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, correctsWallClock bool, br builder.BuildRootfsResult) {
+func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, correctsWallClock bool, br builder.BuildRootfsResult) error {
 	// rootfs_path stays in the schema for backwards compat with existing
 	// readers; supervisors that understand overlay use base_path/delta_path.
 	meta := struct {
@@ -1111,9 +1117,38 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, corrects
 	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(filepath.Join(dir, "build.meta.json"), data, 0o644)
+	final := filepath.Join(dir, "build.meta.json")
+	tmp := final + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // ---------------------------------------------------------------------------

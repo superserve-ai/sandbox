@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -115,21 +118,49 @@ func defaultBuildVMID(templateID string) string {
 	return "build-" + templateID + "-" + randomHex()[:8]
 }
 
+// validBuildPathSegment reports whether an id names exactly one directory
+// level: no separators, no "." or "..", nothing that could point the build
+// directory, or its cleanup, anywhere but templates/<template>/<build>.
+func validBuildPathSegment(id string) bool {
+	return id != "" && id != "." && id != ".." && len(id) <= 255 &&
+		!strings.ContainsAny(id, "/\\\x00") && filepath.Base(id) == id
+}
+
 // prepareBuildDir refuses a build into a directory that holds a published
 // template, and clears one a crashed build left unpublished: its files —
 // a snapshot, a wall-clock manifest — must not survive beside the new
-// build's. Published means the builder wrote its metadata, which it does
-// last.
+// build's. Published means the builder's metadata reads whole; a torn or
+// empty file from an interrupted write is leftovers, not a template. Any
+// other failure to read it blocks the build rather than deciding either way.
 func (m *Manager) prepareBuildDir(templateID, buildVMID string) error {
-	dir := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName, templateID, buildVMID)
-	if _, err := os.Stat(filepath.Join(dir, buildMetaFilename)); err == nil {
-		return status.Errorf(codes.AlreadyExists, "template %s build %s is already published at %s; a rebuild needs a new build id", templateID, buildVMID, dir)
+	if !validBuildPathSegment(templateID) || !validBuildPathSegment(buildVMID) {
+		return status.Errorf(codes.InvalidArgument, "template %q build %q: ids must name a single directory each", templateID, buildVMID)
 	}
-	if _, err := os.Stat(dir); err == nil {
-		m.log.Warn().Str("dir", dir).Msg("build: clearing the leftovers of an unpublished build")
-		if err := os.RemoveAll(dir); err != nil {
-			return fmt.Errorf("clear unpublished build directory %s: %w", dir, err)
+	root := filepath.Clean(filepath.Join(m.cfg.SnapshotDir, TemplatesDirName))
+	dir := filepath.Join(root, templateID, buildVMID)
+	if filepath.Dir(filepath.Dir(dir)) != root {
+		return status.Errorf(codes.InvalidArgument, "template %q build %q: not a build directory", templateID, buildVMID)
+	}
+	_, merr := readBuildMetaJSON(dir)
+	var syntax *json.SyntaxError
+	var typed *json.UnmarshalTypeError
+	switch {
+	case merr == nil:
+		return status.Errorf(codes.AlreadyExists, "template %s build %s is already published at %s; a rebuild needs a new build id", templateID, buildVMID, dir)
+	case errors.Is(merr, fs.ErrNotExist), errors.As(merr, &syntax), errors.As(merr, &typed):
+		// Nothing published here: no metadata, or metadata a crash tore.
+	default:
+		return fmt.Errorf("read build metadata in %s: %w", dir, merr)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
 		}
+		return fmt.Errorf("stat build directory %s: %w", dir, err)
+	}
+	m.log.Warn().Str("dir", dir).Msg("build: clearing the leftovers of an unpublished build")
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("clear unpublished build directory %s: %w", dir, err)
 	}
 	return nil
 }
