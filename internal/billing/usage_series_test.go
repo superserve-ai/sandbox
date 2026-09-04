@@ -30,6 +30,25 @@ func TestUsageSeriesBucketsWeek(t *testing.T) {
 	}
 }
 
+func TestUsageSeriesBucketsSkippedCivilDate(t *testing.T) {
+	loc, err := time.LoadLocation("Pacific/Apia")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := time.Date(2011, 12, 29, 12, 0, 0, 0, loc)
+	e := time.Date(2012, 1, 1, 0, 0, 0, 0, loc)
+	b, err := UsageSeriesBuckets(s, e, "day", loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) != 2 {
+		t.Fatalf("got %d buckets, want 2", len(b))
+	}
+	if !b[0].Start.Before(b[0].End) || !b[1].Start.Before(b[1].End) {
+		t.Fatalf("non-progressing bucket: %#v", b)
+	}
+}
+
 func TestUsageSeriesBucketsFractionalDST(t *testing.T) {
 	loc, err := time.LoadLocation("Australia/Lord_Howe")
 	if err != nil {

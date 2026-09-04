@@ -7,6 +7,35 @@ import (
 
 type UsageBucket struct{ Start, End time.Time }
 
+// advanceCalendar returns the next calendar boundary, accounting for civil
+// dates that do not exist in a timezone (for example, a skipped day).
+func advanceCalendar(cur time.Time, granularity string) time.Time {
+	var next time.Time
+	switch granularity {
+	case "day":
+		next = cur.AddDate(0, 0, 1)
+	case "week":
+		next = cur.AddDate(0, 0, 7)
+	case "month":
+		next = cur.AddDate(0, 1, 0)
+	}
+	if next.After(cur) {
+		return next
+	}
+	// AddDate can normalize a skipped civil date back to cur. Scan subsequent
+	// local dates until a valid boundary is found.
+	cl := cur.In(cur.Location())
+	for days := 1; days <= 370; days++ {
+		candidate := time.Date(cl.Year(), cl.Month(), cl.Day()+days, 0, 0, 0, 0, cur.Location())
+		if candidate.After(cur) {
+			return candidate
+		}
+	}
+	// A timezone should not have more than a year of skipped dates; retain a
+	// progress guarantee even if one is encountered.
+	return cur.Add(24 * time.Hour)
+}
+
 // UsageSeriesBuckets returns clipped, half-open calendar buckets in loc.
 func UsageSeriesBuckets(start, end time.Time, granularity string, loc *time.Location) ([]UsageBucket, error) {
 	if !start.Before(end) {
@@ -57,11 +86,11 @@ func UsageSeriesBuckets(start, end time.Time, granularity string, loc *time.Loca
 				}
 			}
 		case "day":
-			next = cur.AddDate(0, 0, 1)
+			next = advanceCalendar(cur, granularity)
 		case "week":
-			next = cur.AddDate(0, 0, 7)
+			next = advanceCalendar(cur, granularity)
 		case "month":
-			next = cur.AddDate(0, 1, 0)
+			next = advanceCalendar(cur, granularity)
 		}
 		bs, be := cur, next
 		if bs.Before(start) {
