@@ -115,6 +115,20 @@ func TestInterruptedPauseRefusesResumeAndRestore(t *testing.T) {
 	if status.Code(cerr) != codes.FailedPrecondition || launched {
 		t.Fatalf("restore: err=%v launched=%v, want FailedPrecondition before launch", cerr, launched)
 	}
+	// And so does a restore of the image under a new id, with no artifact
+	// that could clear the intent as completed.
+	unknown := &Manager{
+		log: zerolog.Nop(), cfg: ManagerConfig{RunDir: t.TempDir()}, netMgr: &fakeNetMgr{},
+		vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1),
+	}
+	unknown.launchFirecrackerHook = launch
+	_, uerr := unknown.RestoreVMSnapshot(context.Background(), "vm-2", snapPath, memPath, VMConfig{}, nil, "team", "owner", "", nil, 0)
+	if status.Code(uerr) != codes.FailedPrecondition || launched {
+		t.Fatalf("restore under a new id: err=%v launched=%v, want FailedPrecondition before launch", uerr, launched)
+	}
+	if _, err := os.Stat(pauseIntentPath(dir)); err != nil {
+		t.Fatal("a restore under a new id cleared the intent")
+	}
 
 	if err := clearPauseIntent(dir); err != nil {
 		t.Fatalf("clear: %v", err)

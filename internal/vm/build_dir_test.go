@@ -115,4 +115,21 @@ func TestBuildsNeverOverwriteAPublishedTemplate(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(inflight, "mem.snap")); err != nil {
 		t.Fatal("the retry removed the running build's files")
 	}
+
+	// A cancelled build is terminal before its worker has exited: its id
+	// stays reserved, and its files untouched, until the worker is gone.
+	m.cancelBuildRecord("build-4", "cancelled by caller")
+	if _, err := m.registerBuild("build-4", "tpl", 1, 512, func() {}, func() error { return m.prepareBuildDir("tpl", "build-4") }); err == nil {
+		t.Fatal("a retry took the id of a cancelled build whose worker had not exited")
+	}
+	if _, err := os.Stat(filepath.Join(inflight, "mem.snap")); err != nil {
+		t.Fatal("the retry removed the cancelled build's files while its worker was alive")
+	}
+	close(m.builds["build-4"].workerDone)
+	if _, err := m.registerBuild("build-4", "tpl", 1, 512, func() {}, func() error { return m.prepareBuildDir("tpl", "build-4") }); err != nil {
+		t.Fatalf("retry after the worker exited: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(inflight, "mem.snap")); !os.IsNotExist(err) {
+		t.Fatal("the retry after exit kept the cancelled build's leftovers")
+	}
 }

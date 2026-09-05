@@ -190,7 +190,13 @@ type buildConfig struct {
 }
 
 func runBuild(ctx context.Context, cfg buildConfig) error {
-	buildVMID := "build-" + cfg.templateID
+	// The build id names the runtime: the socket, overlay and network of
+	// this build alone, so two builds of one template can run side by side.
+	// The template-derived name remains for a caller that supplies no id.
+	buildVMID := cfg.buildID
+	if buildVMID == "" {
+		buildVMID = "build-" + cfg.templateID
+	}
 	// Per-build subdir — rebuilds don't disturb existing sandboxes.
 	rootfsDir := filepath.Join(cfg.runDir, vm.TemplatesDirName, cfg.templateID, cfg.buildID)
 	basePath := filepath.Join(rootfsDir, "base.ext4")

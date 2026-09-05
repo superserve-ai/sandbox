@@ -176,6 +176,9 @@ func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req
 	// safety net for early error returns. Releasing allocation at worker
 	// return would publish a full VM's memory during a hash-only interval
 	// that can run for minutes.
+	// Last to run: the id stays reserved until this worker, and the
+	// subprocess it waited for, are gone.
+	defer close(rec.workerDone)
 	defer m.buildPressureCount.Add(-1)
 	defer m.releaseBuildAlloc(rec, req.VCPU, req.MemoryMiB)
 	result, err := m.buildTemplateSync(ctx, buildVMID, req, rec)
@@ -251,10 +254,10 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 30 * time.Second
 
-	// Build VM's working dir. template-builder names it "build-<templateID>"
-	// (not vmd's buildVMID), so we clean that exact path. Done here because
-	// template-builder's own defer can't run on SIGKILL.
-	defer os.RemoveAll(filepath.Join(m.cfg.RunDir, "build-"+req.TemplateID))
+	// Build VM's working dir, named by this build's id so it is this
+	// build's alone. Cleaned here because template-builder's own defer
+	// cannot run on SIGKILL.
+	defer os.RemoveAll(filepath.Join(m.cfg.RunDir, buildVMID))
 
 	if err := cmd.Run(); err != nil {
 		// Prefer the structured reason the subprocess emitted on its way

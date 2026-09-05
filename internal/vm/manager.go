@@ -554,7 +554,7 @@ type Manager struct {
 	tplLastRestore map[string]time.Time
 
 	// builds tracks in-flight and completed template builds. Keyed by
-	// build VM id (which is also "build-" + templateID). Entries survive
+	// build VM id. Entries survive
 	// until process exit so late pollers can read terminal outcomes.
 	buildsMu sync.RWMutex
 	builds   map[string]*buildRecord
@@ -3088,16 +3088,21 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 	}
 	// An in-place restore of a VM this daemon knows may meet the leftover of a
-	// pause that completed; any other intent means an interrupted rewrite. A
-	// template holds no intent, and no host whose floor is down holds one, so
-	// a create looks for nothing.
-	m.mu.RLock()
-	prev := m.vms[vmID]
-	m.mu.RUnlock()
-	if prev != nil && wakeProtocolFloorRaised() {
-		prev.mu.RLock()
-		knownArtifact := prev.ArtifactID
-		prev.mu.RUnlock()
+	// pause that completed; any other intent means an interrupted rewrite.
+	// An image restored under a new id checks with no known artifact, so an
+	// intent beside it can never be cleared as completed. No host whose floor
+	// is down holds an intent, so today a create looks for nothing; on a host
+	// whose floor is up it pays one lookup that a template never answers.
+	if wakeProtocolFloorRaised() {
+		knownArtifact := ""
+		m.mu.RLock()
+		prev := m.vms[vmID]
+		m.mu.RUnlock()
+		if prev != nil {
+			prev.mu.RLock()
+			knownArtifact = prev.ArtifactID
+			prev.mu.RUnlock()
+		}
 		if blocked, why := pauseIntentBlocks(filepath.Dir(memPath), knownArtifact); blocked {
 			return nil, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing restore until it is inspected", memPath, why)
 		}

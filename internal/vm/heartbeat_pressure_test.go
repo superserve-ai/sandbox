@@ -877,10 +877,10 @@ func TestReattachMarkerReconstructionDoesNotHoldFleetLock(t *testing.T) {
 	}
 }
 
-// A terminal build id may be re-registered while the OLD worker still
-// runs its deferred cleanup: the release must act on the generation that
-// incremented the counters, never on whatever record the id now names —
-// or the replacement build's allocation is silently hidden for life.
+// The id stays reserved until the old worker exits, and the release is
+// still keyed to the generation that incremented the counters, never to
+// whatever record the id now names — or a late release would hide the
+// replacement build's allocation for life.
 func TestReleaseBuildAllocIsGenerationKeyed(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{}, builds: map[string]*buildRecord{}}
 	recOld, err := m.registerBuild("build-b1", "tpl", 2, 4096, func() {}, nil)
@@ -890,7 +890,9 @@ func TestReleaseBuildAllocIsGenerationKeyed(t *testing.T) {
 	if !m.setBuildStatus("build-b1", BuildStatusCancelled) {
 		t.Fatal("cancel failed")
 	}
-	// Reuse: a new build replaces the terminal record under the same id.
+	// Reuse: once the old worker has exited, a new build replaces the
+	// terminal record under the same id.
+	close(recOld.workerDone)
 	recNew, err := m.registerBuild("build-b1", "tpl", 4, 8192, func() {}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1153,6 +1155,7 @@ func TestCompleteBuildDropsReplacedWorkerResult(t *testing.T) {
 	if !m.setBuildStatus("build-x", BuildStatusCancelled) {
 		t.Fatal("cancel failed")
 	}
+	close(recOld.workerDone)
 	recNew, err := m.registerBuild("build-x", "tpl", 1, 1024, func() {}, nil)
 	if err != nil {
 		t.Fatal(err)
