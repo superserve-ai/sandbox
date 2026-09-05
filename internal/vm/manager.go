@@ -7048,6 +7048,25 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	replacingLive := !freshUnit && unitLingering(ctx, systemdUnitName(vmID))
 	lingerCheckMs := time.Since(tLinger).Milliseconds()
 
+	// An unconfirmed stop for this unit may still be sitting in PID1's job
+	// queue — issued for an incarnation that no longer exists, executing
+	// against whatever holds the name when it lands. Launching now hands it
+	// the fresh VM: under a congested PID1 a timed-out launch's cleanup stop
+	// has killed the retry's just-adopted VM mid-restore. Settle first, and
+	// fail rather than launch over a stop that never settles — nothing has
+	// been enqueued yet, so this failure needs no cleanup of its own.
+	if unitStopUnconfirmed(systemdUnitName(vmID)) {
+		tSettle := time.Now()
+		m.log.Warn().Str("vm_id", vmID).
+			Msg("unconfirmed stop outstanding for unit — waiting for it to settle before launch")
+		if err := waitUnitStopSettle(ctx, systemdUnitName(vmID)); err != nil {
+			return 0, fmt.Errorf("launch blocked: %w", err)
+		}
+		m.log.Info().Str("vm_id", vmID).
+			Int64("settle_wait_ms", time.Since(tSettle).Milliseconds()).
+			Msg("outstanding stop settled — launching")
+	}
+
 	tStartUnit := time.Now()
 	if err := restartUnit(ctx, systemdUnitName(vmID)); err != nil {
 		// A failed unit start (D-Bus round trip or systemctl fallback eating

@@ -123,3 +123,59 @@ func TestProcessSettleWindowCoversOrphanSweep(t *testing.T) {
 			processSettleWindow, min)
 	}
 }
+
+// The launch gate must hold a launch while a recorded stop is unconfirmed —
+// a stop still in PID1's queue executes against whatever holds the unit name
+// when it lands — and must fail closed rather than launch over one that never
+// settles. Nothing is enqueued before the gate, so its failure needs no
+// cleanup.
+func TestWaitUnitStopSettle(t *testing.T) {
+	origPoll := unitStopSettlePoll
+	unitStopSettlePoll = 5 * time.Millisecond
+	defer func() { unitStopSettlePoll = origPoll }()
+
+	t.Run("no recorded stop passes immediately", func(t *testing.T) {
+		if err := waitUnitStopSettle(context.Background(), "settle-none.service"); err != nil {
+			t.Fatalf("no outstanding stop must not block a launch: %v", err)
+		}
+	})
+
+	t.Run("confirmation releases the gate", func(t *testing.T) {
+		unit := "settle-confirm.service"
+		recordUnitStop(unit)
+		defer confirmUnitStopped(unit)
+		go func() {
+			time.Sleep(20 * time.Millisecond) // the stop job completes
+			confirmUnitStopped(unit)
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := waitUnitStopSettle(ctx, unit); err != nil {
+			t.Fatalf("a confirmed stop must release the launch: %v", err)
+		}
+	})
+
+	t.Run("an unsettled stop fails the launch, not the other way around", func(t *testing.T) {
+		unit := "settle-never.service"
+		recordUnitStop(unit)
+		defer confirmUnitStopped(unit)
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		err := waitUnitStopSettle(ctx, unit)
+		if err == nil {
+			t.Fatal("launching over an unsettled stop hands the new VM to the old incarnation's cleanup")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("the failure must carry the ctx verdict, got %v", err)
+		}
+	})
+}
+
+func TestUnitStopUnconfirmedExcludesSettleWindow(t *testing.T) {
+	// The gate must key on RECORDED stops only: unitMaybeWindingDown reads
+	// true for every unit during the young-process window, and gating on it
+	// would stall all launches for minutes after a vmd restart.
+	if unitStopUnconfirmed("never-touched.service") {
+		t.Fatal("a unit with no recorded stop must not read as unconfirmed")
+	}
+}
