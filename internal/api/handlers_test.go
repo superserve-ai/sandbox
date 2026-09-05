@@ -1990,6 +1990,44 @@ func TestActivateSandbox_SettlesStartingToActive(t *testing.T) {
 	}
 }
 
+// When the client disconnects while the handler is in the settle-poll loop
+// (sandbox stuck in 'starting'), the select on ctx.Done() must fire and the
+// handler must abort without sleeping out the full poll interval.
+func TestActivateSandbox_ClientDisconnectDuringSettle(t *testing.T) {
+	prev := activateSettleWindow
+	activateSettleWindow = 30 * time.Second // large enough that the test would time out if Sleep ran
+	defer func() { activateSettleWindow = prev }()
+
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusStarting}
+
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := activateRequest(sandboxID.String()).WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	// Cancel the request context just before serving — simulates client disconnect.
+	cancel()
+
+	start := time.Now()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+	elapsed := time.Since(start)
+
+	// The handler must return well within one full settle window (30s).
+	// A realistic upper bound for a cancel-aware select is a few milliseconds.
+	if elapsed > 5*time.Second {
+		t.Errorf("handler took %v after client disconnect; expected near-instant abort", elapsed)
+	}
+	if w.Body.Len() > 0 {
+		t.Errorf("body length = %d, want 0 (no response should be written on client disconnect)", w.Body.Len())
+	}
+}
+
 func TestActivateSandbox_InvalidUUID(t *testing.T) {
 	teamID := uuid.New()
 	h := &Handlers{VMD: &stubVMD{}, DB: db.New(&mockDBTX{})}

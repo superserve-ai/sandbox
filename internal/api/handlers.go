@@ -742,7 +742,11 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			// concurrent create/resume finishing); wait for the flip
 			// rather than 409 the owner's own follow-up.
 			if time.Now().Before(deadline) {
-				time.Sleep(activateSettlePoll)
+				select {
+				case <-time.After(activateSettlePoll):
+				case <-c.Request.Context().Done():
+					return nil, ""
+				}
 				continue
 			}
 			respondError(c, ErrInvalidState)
