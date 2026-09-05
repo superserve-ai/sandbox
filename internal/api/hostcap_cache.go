@@ -169,12 +169,13 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 // readHostCaps performs the pre-flight read and, on an affirmative answer,
 // records the address it returned with the host registry.
 func (h *Handlers) readHostCaps(ctx context.Context, params db.HostHasCapabilitiesUnlockedParams) (bool, error) {
+	readAt := time.Now()
 	row, err := h.DB.HostHasCapabilitiesUnlocked(ctx, params)
 	if err != nil {
 		return false, err
 	}
 	if row.HasCapabilities && h.Hosts != nil {
-		h.Hosts.MarkVerified(ctx, params.HostID, row.VmdAddr)
+		h.Hosts.MarkVerified(ctx, params.HostID, row.VmdAddr, readAt)
 	}
 	return row.HasCapabilities, nil
 }

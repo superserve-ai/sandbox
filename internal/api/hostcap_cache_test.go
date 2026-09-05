@@ -41,7 +41,7 @@ func (v *verifyRecorder) ClientFor(context.Context, string) (vmdclient.Client, e
 	return nil, fmt.Errorf("not used in this test")
 }
 func (v *verifyRecorder) Invalidate(string) {}
-func (v *verifyRecorder) MarkVerified(_ context.Context, hostID, addr string) {
+func (v *verifyRecorder) MarkVerified(_ context.Context, hostID, addr string, _ time.Time) {
 	v.mu.Lock()
 	v.verified = append(v.verified, hostID+"="+addr)
 	v.mu.Unlock()

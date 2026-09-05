@@ -718,7 +718,7 @@ func TestMarkVerifiedRenewsLeaseWithoutRead(t *testing.T) {
 	}
 	time.Sleep(2 * time.Millisecond) // lease due; ClientFor alone would read again
 
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", time.Now())
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("ClientFor after MarkVerified: %v", err)
 	}
@@ -741,7 +741,7 @@ func TestMarkVerifiedColdResolvesOnce(t *testing.T) {
 	}
 	r := New(db.New(store), dial)
 
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", time.Now())
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("ClientFor: %v", err)
 	}
@@ -764,7 +764,7 @@ func TestMarkVerifiedMovedAddressFailsClosedWhenReadFails(t *testing.T) {
 	}
 
 	store.setFailRead(true)
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051")
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", time.Now())
 	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
 		t.Fatal("ClientFor served the client at the old address after the row reported a move")
 	}
@@ -785,7 +785,7 @@ func TestMarkVerifiedMovedAddressRedials(t *testing.T) {
 	}
 
 	store.setAddr("10.0.0.2:50051")
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051")
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", time.Now())
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("ClientFor after move: %v", err)
 	}
@@ -798,10 +798,10 @@ func TestMarkVerifiedMovedAddressRedials(t *testing.T) {
 }
 
 // A cold lookup that read the row before the host moved must not publish
-// that older address over a verification that observed the move while the
-// lookup was still dialing: MarkVerified supersedes it even with no client
-// cached, so the lookup re-reads and the newest address is what settles.
-func TestMarkVerifiedSupersedesColdLookupThatReadTheOldAddress(t *testing.T) {
+// that older address over a report that observed the move while the lookup
+// was still dialing: the newer report contradicts what the lookup read, so
+// the lookup re-reads and the newest address is what settles.
+func TestMarkVerifiedNewerReportSupersedesColdLookup(t *testing.T) {
 	store := &hostDB{addr: "10.0.0.1:50051"}
 	var mu sync.Mutex
 	var dialed []string
@@ -826,25 +826,14 @@ func TestMarkVerifiedSupersedesColdLookupThatReadTheOldAddress(t *testing.T) {
 	}()
 	<-dialStarted // the lookup read .1 and is dialing it
 	store.setAddr("10.0.0.2:50051")
+	reportAt := time.Now() // began after the lookup's read: it is the newer observation
 
 	verified := make(chan struct{})
 	go func() {
-		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051") // joins the lookup in flight
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", reportAt) // joins the lookup in flight
 		close(verified)
 	}()
-	deadline := time.Now().Add(2 * time.Second)
-	for { // MarkVerified bumps the generation before it joins; wait for that
-		r.mu.RLock()
-		gen := r.gens["host-a"]
-		r.mu.RUnlock()
-		if gen > 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("MarkVerified never superseded the in-flight lookup")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitForLatest(t, r, "host-a", "10.0.0.2:50051")
 	close(dialRelease)
 
 	if err := <-lookup; err != nil {
@@ -857,28 +846,22 @@ func TestMarkVerifiedSupersedesColdLookupThatReadTheOldAddress(t *testing.T) {
 	if len(got) != 2 || got[0] != "10.0.0.1:50051" || got[1] != "10.0.0.2:50051" {
 		t.Fatalf("dial sequence = %v, want [.1 discarded, .2 published]", got)
 	}
-	r.mu.RLock()
-	settled := r.clients["host-a"].addr
-	r.mu.RUnlock()
-	if settled != "10.0.0.2:50051" {
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
 		t.Fatalf("settled address = %q, want the newer .2", settled)
 	}
 }
 
-// Concurrent verifications that all report the same, unchanged address must
-// coalesce: a cold lookup has two attempts, and if every report superseded
-// it the lookup would fail with a spurious address flap on a healthy host.
-func TestConcurrentSameAddressVerificationsDoNotStarveColdLookup(t *testing.T) {
+// Concurrent reports of the same, unchanged address must cost a cold lookup
+// nothing: equal addresses never conflict, so the lookup publishes on its
+// first attempt and the registry never re-reads or re-dials for them.
+func TestConcurrentSameAddressReportsDoNotDisturbColdLookup(t *testing.T) {
 	store := &hostDB{addr: "10.0.0.1:50051"}
-	var mu sync.Mutex
-	var dialed []string
+	var dials atomic.Int64
 	dialStarted := make(chan struct{})
 	dialRelease := make(chan struct{})
 	var once sync.Once
 	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
-		mu.Lock()
-		dialed = append(dialed, addr)
-		mu.Unlock()
+		dials.Add(1)
 		once.Do(func() {
 			close(dialStarted)
 			<-dialRelease // hold the first dial open while the reports land
@@ -899,41 +882,175 @@ func TestConcurrentSameAddressVerificationsDoNotStarveColdLookup(t *testing.T) {
 		verified.Add(1)
 		go func() {
 			defer verified.Done()
-			r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
+			r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", time.Now())
 		}()
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for { // the first report supersedes the lookup; the others must not
-		r.mu.RLock()
-		gen := r.gens["host-a"]
-		r.mu.RUnlock()
-		if gen > 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("no report superseded the in-flight lookup")
-		}
-		time.Sleep(time.Millisecond)
-	}
 	for i := 0; i < 100; i++ {
-		runtime.Gosched() // let the remaining reports reach their (no-op) check
+		runtime.Gosched() // let the reports reach the registry before the dial returns
 	}
 	close(dialRelease)
 
 	if err := <-lookup; err != nil {
-		t.Fatalf("ClientFor: %v (equivalent reports must not exhaust the lookup)", err)
+		t.Fatalf("ClientFor: %v (equivalent reports must not disturb the lookup)", err)
 	}
 	verified.Wait()
-	r.mu.RLock()
-	gen, settled := r.gens["host-a"], r.clients["host-a"].addr
-	r.mu.RUnlock()
-	if gen != 1 {
-		t.Fatalf("generation bumps = %d, want exactly 1 for three reports of one address", gen)
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("dials = %d, want 1 (no report contradicted the lookup's read)", n)
 	}
-	if settled != "10.0.0.1:50051" {
+	if n := store.readCount(); n != 1 {
+		t.Fatalf("reads = %d, want 1", n)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.1:50051" {
 		t.Fatalf("settled address = %q", settled)
 	}
-	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
-		t.Fatalf("post-settle ClientFor: %v", err)
+}
+
+// An address the registry has held before is not an already-handled report:
+// the cached client moved to .2 through an ordinary refresh, an older lookup
+// has read .2 and not yet acted on it, and a newer read reports the host
+// back at .1. The report must win, whatever the registry has seen
+// historically: the older lookup re-reads instead of publishing .2 again.
+func TestMarkVerifiedReusedAddressStillSupersedesOlderLookup(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // .1
+		t.Fatalf("prime: %v", err)
+	}
+	store.setAddr("10.0.0.2:50051")
+	time.Sleep(2 * time.Millisecond)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // refresh adopts .2
+		t.Fatalf("refresh: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("after refresh settled = %q, want .2", settled)
+	}
+
+	// Lease due again: the next lookup reads .2 and is held inside that read
+	// (the store captured .2 before it blocked), so it has not acted on it.
+	time.Sleep(2 * time.Millisecond)
+	gate := make(chan struct{})
+	store.setGate(gate)
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.readCount() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("older lookup never reached its read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.setAddr("10.0.0.1:50051") // the host returns to .1 while that read is held
+	reportAt := time.Now()
+	verified := make(chan struct{})
+	go func() {
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", reportAt)
+		close(verified)
+	}()
+	waitForLatest(t, r, "host-a", "10.0.0.1:50051")
+	store.setGate(nil)
+	close(gate) // the older read returns .2, which is now contradicted
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	<-verified
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.1:50051" {
+		t.Fatalf("settled address = %q, want the newer .1 (an older lookup of .2 must not win)", settled)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	if len(got) != 3 || got[2] != "10.0.0.1:50051" {
+		t.Fatalf("dial sequence = %v, want [.1, .2, .1 re-read and published]", got)
+	}
+}
+
+// The renew-in-place shortcut is not exempt: the cached client is at .1, an
+// older lookup read the host at .2 and is dialing, and a newer read reports
+// .1 again. Renewing .1 is right, but the older lookup must not then publish
+// .2 over it.
+func TestMarkVerifiedSameAddressStillSupersedesOlderConflictingLookup(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dialStarted := make(chan struct{})
+	dialRelease := make(chan struct{})
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		if addr == "10.0.0.2:50051" {
+			close(dialStarted)
+			<-dialRelease
+		}
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // .1
+		t.Fatalf("prime: %v", err)
+	}
+	store.setAddr("10.0.0.2:50051")
+	time.Sleep(2 * time.Millisecond)
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a") // reads .2, dials it
+		lookup <- err
+	}()
+	<-dialStarted
+	store.setAddr("10.0.0.1:50051")
+	reportAt := time.Now()
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", reportAt) // matches the cached client: renews
+	close(dialRelease)
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.1:50051" {
+		t.Fatalf("settled address = %q, want .1 (the older .2 lookup must re-read, not publish)", settled)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	// The re-read finds .1 already cached and renews it: no third dial.
+	if len(got) != 2 || got[1] != "10.0.0.2:50051" {
+		t.Fatalf("dial sequence = %v, want [.1, .2 discarded]", got)
+	}
+}
+
+func settledAddr(r *Registry, hostID string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.clients[hostID].addr
+}
+
+// waitForLatest blocks until the registry's newest observation of hostID is
+// addr, i.e. the report under test has been recorded.
+func waitForLatest(t *testing.T, r *Registry, hostID, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		r.mu.RLock()
+		got := r.latest[hostID].addr
+		r.mu.RUnlock()
+		if got == addr {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("report of %s never recorded (latest is %q)", addr, got)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

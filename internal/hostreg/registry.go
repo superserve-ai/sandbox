@@ -18,6 +18,12 @@ import (
 // wires it to Invalidate.
 type DialFunc func(hostID, addr string, onDead func()) (vmdclient.Client, error)
 
+// observation is one read of a host row's address and when that read began.
+type observation struct {
+	addr string
+	at   time.Time
+}
+
 // addrRecheckTTL bounds how long a cached client can be dispatched through
 // without its address being re-verified against the host row. An address
 // change (a host identity reclaimed by a re-provisioned machine) is only
@@ -77,13 +83,16 @@ type Registry struct {
 	// always land mid-resolve and be observed. Grows one counter per host
 	// id ever seen (fleet-bounded).
 	gens map[string]uint64
-	// observed is the address most recently reported to MarkVerified per
-	// host. Equivalent reports coalesce on it: only a report that differs
-	// from the last one supersedes a resolution in flight, so concurrent
-	// verifications of one unchanged address cannot exhaust that
-	// resolution's attempts between them.
-	observed map[string]string
-	resolve  singleflight.Group // one row-read/dial resolution in flight per host
+	// latest is the newest observation of each host's row address, from a
+	// resolution's own read or from a caller's MarkVerified, ordered by when
+	// the read STARTED. A resolution publishes only what no newer read
+	// contradicts, and a caller's report lands only if no newer read
+	// contradicts it, so an older read can never overwrite a newer one
+	// whichever side it came from — including when an address returns to
+	// an earlier value. Equal addresses never conflict, so equivalent
+	// reports cost a resolution in flight nothing.
+	latest  map[string]observation
+	resolve singleflight.Group // one row-read/dial resolution in flight per host
 	// refreshing holds hosts with a refresh-ahead goroutine in flight.
 	// Singleflight dedupes the underlying read but not the goroutines
 	// waiting on it — without this guard, every warm call in the refresh
@@ -94,11 +103,11 @@ type Registry struct {
 // New creates a Registry backed by the host table.
 func New(queries *db.Queries, dial DialFunc) *Registry {
 	return &Registry{
-		db:       queries,
-		dial:     dial,
-		clients:  make(map[string]entry),
-		gens:     make(map[string]uint64),
-		observed: make(map[string]string),
+		db:      queries,
+		dial:    dial,
+		clients: make(map[string]entry),
+		gens:    make(map[string]uint64),
+		latest:  make(map[string]observation),
 	}
 }
 
@@ -207,6 +216,7 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 			prev, hadPrev := r.clients[hostID]
 			r.mu.RUnlock()
 
+			readAt := time.Now()
 			host, err := r.db.GetHost(vctx, hostID)
 			if err != nil {
 				// Dispatching a cached client on a failed read is only safe
@@ -249,6 +259,11 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				r.mu.Unlock()
 				continue // invalidated mid-read; re-read the row
 			}
+			if r.contradictedLocked(hostID, host.VmdAddr, readAt) {
+				r.mu.Unlock()
+				continue // a newer read saw the host elsewhere; re-read the row
+			}
+			r.recordLocked(hostID, host.VmdAddr, readAt)
 			if e, ok := r.clients[hostID]; ok && e.addr == host.VmdAddr {
 				now := time.Now()
 				e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
@@ -280,6 +295,10 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				// as it stands now.
 				r.mu.Unlock()
 				continue
+			}
+			if r.contradictedLocked(hostID, host.VmdAddr, readAt) {
+				r.mu.Unlock()
+				continue // the address moved on while we dialed; re-read the row
 			}
 			now := time.Now()
 			r.clients[hostID] = entry{
@@ -313,35 +332,38 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 func (r *Registry) Invalidate(hostID string) {
 	r.mu.Lock()
 	delete(r.clients, hostID)
-	delete(r.observed, hostID)
+	delete(r.latest, hostID)
 	r.gens[hostID]++
 	r.mu.Unlock()
 }
 
-// MarkVerified records a host row read the caller has just performed and
-// the address it saw, so the dispatch that follows finds a verified client
-// instead of blocking on a row read of its own. A cached client at the same
-// address has its lease renewed in place. Otherwise the host is resolved now
-// (row read plus dial): a cached client at a DIFFERENT address is dropped
-// first — the row just said the host moved, so that client must not survive
-// as a within-lease fallback should the resolution fail to read — and the
-// first report of an address the registry has not seen bumps the host's
-// generation, so a resolution already in flight that read the row BEFORE
-// this observation discards what it read and reads again instead of
-// publishing an older address over the newer one. Further reports of the
-// same address join that resolution without bumping again. A resolution
-// failure is logged and leaves ClientFor to fail closed.
-func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
+// MarkVerified records a host row read the caller has just performed — the
+// address it saw and when the read began — so the dispatch that follows
+// finds a verified client instead of blocking on a row read of its own. A
+// report a newer read already contradicts is dropped: that read governs. A
+// cached client at the reported address has its lease renewed in place.
+// Otherwise the host is resolved now (row read plus dial); a cached client
+// at a DIFFERENT address is dropped first, since the row just said the host
+// moved and that client must not survive as a within-lease fallback should
+// the resolution fail to read. A resolution already in flight that read an
+// older, different address re-reads before publishing (see latest), so this
+// report is never overwritten by it. A resolution failure is logged and
+// leaves ClientFor to fail closed.
+func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string, readAt time.Time) {
 	if addr == "" {
 		return
 	}
 	r.mu.Lock()
+	if r.contradictedLocked(hostID, addr, readAt) {
+		r.mu.Unlock()
+		return
+	}
+	r.recordLocked(hostID, addr, readAt)
 	if e, ok := r.clients[hostID]; ok {
 		if e.addr == addr {
 			now := time.Now()
 			e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
 			r.clients[hostID] = e
-			r.observed[hostID] = addr
 			r.mu.Unlock()
 			return
 		}
@@ -349,12 +371,23 @@ func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
 			Msg("host address changed; dropping the cached client before re-resolving")
 		delete(r.clients, hostID)
 	}
-	if r.observed[hostID] != addr {
-		r.observed[hostID] = addr
-		r.gens[hostID]++
-	}
 	r.mu.Unlock()
 	if _, err := r.resolveClient(ctx, hostID); err != nil {
 		log.Warn().Err(err).Str("host_id", hostID).Msg("host client resolution after row verification failed")
+	}
+}
+
+// contradictedLocked reports whether a read of addr that began at readAt is
+// contradicted by a newer read that saw a different address. Caller holds mu.
+func (r *Registry) contradictedLocked(hostID, addr string, readAt time.Time) bool {
+	l, ok := r.latest[hostID]
+	return ok && l.at.After(readAt) && l.addr != addr
+}
+
+// recordLocked keeps an observation when it is at least as new as the one
+// held. Caller holds mu.
+func (r *Registry) recordLocked(hostID, addr string, readAt time.Time) {
+	if l, ok := r.latest[hostID]; !ok || !readAt.Before(l.at) {
+		r.latest[hostID] = observation{addr: addr, at: readAt}
 	}
 }

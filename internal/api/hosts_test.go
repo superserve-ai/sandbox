@@ -112,7 +112,7 @@ func (f *fakeHostRegistry) ClientFor(context.Context, string) (vmdclient.Client,
 func (f *fakeHostRegistry) Invalidate(hostID string) {
 	f.invalidated = append(f.invalidated, hostID)
 }
-func (f *fakeHostRegistry) MarkVerified(context.Context, string, string) {}
+func (f *fakeHostRegistry) MarkVerified(context.Context, string, string, time.Time) {}
 
 // Reclaiming a silent holder's identity rewrites vmd_addr, so the cached
 // client for that host id must be evicted — it still dials the old machine
