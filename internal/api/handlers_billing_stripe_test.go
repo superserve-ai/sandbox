@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -91,6 +92,106 @@ func (r *stripeMeterEventRoundTripper) RoundTrip(req *http.Request) (*http.Respo
 type stripeCheckoutSessionRoundTripper struct {
 	backdateStartDate string
 	clientReferenceID string
+}
+
+type stripeCreditBalanceRoundTripper struct {
+	status int
+	body   string
+}
+
+func (r *stripeCreditBalanceRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Path != "/v1/billing/credit_balance_summary" || req.URL.Query().Get("customer") != "cus_example" || req.URL.Query().Get("filter[type]") != "applicability_scope" || req.URL.Query().Get("filter[applicability_scope][price_type]") != "metered" {
+		return nil, fmt.Errorf("unexpected credit balance request: %s", req.URL.String())
+	}
+	status := r.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(r.body)), Header: make(http.Header), Request: req}, nil
+}
+
+func TestStripeCreditBalanceAggregatesApplicableGrants(t *testing.T) {
+	transport := &stripeCreditBalanceRoundTripper{body: `{"balances":[{"available_balance":{"monetary":{"currency":"usd","value":2000}}},{"available_balance":{"monetary":{"currency":"usd","value":1200000}}},{"available_balance":{"monetary":{"currency":"eur","value":9000}}}]}`}
+	client := &stripeHTTPClient{baseURL: "https://stripe.example.test", secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: &http.Client{Transport: transport}}
+	got, err := client.GetCustomerCreditBalance(t.Context(), "cus_example")
+	if err != nil {
+		t.Fatalf("get credit balance: %v", err)
+	}
+	if got.AvailableUSD != 12020 {
+		t.Fatalf("available credit = %v, want 12020", got.AvailableUSD)
+	}
+	if got.ObservedAt.IsZero() {
+		t.Fatal("expected observation timestamp")
+	}
+	if got.IncludesCurrentPeriodUsage {
+		t.Fatal("credit balance summary must not claim active-period usage is reflected")
+	}
+}
+
+func TestStripeCreditBalancePreservesKnownZero(t *testing.T) {
+	transport := &stripeCreditBalanceRoundTripper{body: `{"balances":[{"available_balance":{"monetary":{"currency":"usd","value":0}}}]}`}
+	client := &stripeHTTPClient{baseURL: "https://stripe.example.test", secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: &http.Client{Transport: transport}}
+	got, err := client.GetCustomerCreditBalance(t.Context(), "cus_example")
+	if err != nil {
+		t.Fatalf("get credit balance: %v", err)
+	}
+	if got.AvailableUSD != 0 {
+		t.Fatalf("available credit = %v, want 0", got.AvailableUSD)
+	}
+}
+
+func TestStripeCreditBalanceDoesNotTruncateAggregateBalances(t *testing.T) {
+	var balances strings.Builder
+	balances.WriteString(`{"balances":[`)
+	for i := 0; i < 101; i++ {
+		if i > 0 {
+			balances.WriteByte(',')
+		}
+		balances.WriteString(`{"available_balance":{"monetary":{"currency":"usd","value":100}}}`)
+	}
+	balances.WriteString(`]}`)
+	transport := &stripeCreditBalanceRoundTripper{body: balances.String()}
+	client := &stripeHTTPClient{baseURL: "https://stripe.example.test", secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: &http.Client{Transport: transport}}
+	got, err := client.GetCustomerCreditBalance(t.Context(), "cus_example")
+	if err != nil {
+		t.Fatalf("get credit balance: %v", err)
+	}
+	if got.AvailableUSD != 101 {
+		t.Fatalf("available credit = %v, want 101", got.AvailableUSD)
+	}
+}
+
+func TestStripeCreditBalancePropagatesFetchFailure(t *testing.T) {
+	transport := &stripeCreditBalanceRoundTripper{status: http.StatusBadGateway, body: `{"error":"unavailable"}`}
+	client := &stripeHTTPClient{baseURL: "https://stripe.example.test", secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: &http.Client{Transport: transport}}
+	if _, err := client.GetCustomerCreditBalance(t.Context(), "cus_example"); err == nil {
+		t.Fatal("expected fetch failure")
+	}
+}
+
+func TestStripeCreditBalanceRejectsMissingMonetaryBalance(t *testing.T) {
+	transport := &stripeCreditBalanceRoundTripper{body: `{"balances":[{"available_balance":{}}]}`}
+	client := &stripeHTTPClient{baseURL: "https://stripe.example.test", secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: &http.Client{Transport: transport}}
+	if _, err := client.GetCustomerCreditBalance(t.Context(), "cus_example"); err == nil {
+		t.Fatal("expected malformed balance response to be unavailable")
+	}
+}
+
+func TestStripeCreditBalanceRejectsPartiallyMalformedBalances(t *testing.T) {
+	transport := &stripeCreditBalanceRoundTripper{body: `{"balances":[{"available_balance":{"monetary":{"currency":"usd","value":2000}}},{"available_balance":{}}]}`}
+	client := &stripeHTTPClient{baseURL: "https://stripe.example.test", secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: &http.Client{Transport: transport}}
+	if _, err := client.GetCustomerCreditBalance(t.Context(), "cus_example"); err == nil {
+		t.Fatal("expected partially malformed balance response to be unavailable")
+	}
+}
+
+func TestStripeExpectedInvoiceAmountClampsPayableEstimate(t *testing.T) {
+	if got := stripeExpectedInvoiceAmount(30, 20); got != 10 {
+		t.Fatalf("expected payable estimate = %v, want 10", got)
+	}
+	if got := stripeExpectedInvoiceAmount(20, 30); got != 0 {
+		t.Fatalf("expected payable estimate = %v, want 0", got)
+	}
 }
 
 func (r *stripeCheckoutSessionRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
