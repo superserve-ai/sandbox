@@ -1100,3 +1100,41 @@ VALUES (
     sqlc.narg(created_by)
 )
 RETURNING *;
+
+-- name: GetTeamBillingUsageSeries :many
+-- Allocated usage for each requested bucket, clipped exactly to bucket bounds.
+WITH buckets AS (
+ SELECT starts.bucket_start, ends.bucket_end
+ FROM unnest(sqlc.arg(period_starts)::timestamptz[]) WITH ORDINALITY starts(bucket_start,n)
+ JOIN unnest(sqlc.arg(period_ends)::timestamptz[]) WITH ORDINALITY ends(bucket_end,n) USING (n)
+), compute AS (
+ SELECT b.bucket_start,b.bucket_end,
+   COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at,now()),b.bucket_end)-GREATEST(i.started_at,b.bucket_start)))*i.vcpu_count),0)::numeric vcpu_seconds,
+   COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at,now()),b.bucket_end)-GREATEST(i.started_at,b.bucket_start)))*i.memory_mib),0)::numeric memory_mib_seconds
+ FROM buckets b LEFT JOIN sandbox_compute_billing_interval i ON i.team_id=sqlc.arg(team_id)
+  AND i.started_at < LEAST(now(),b.bucket_end) AND COALESCE(i.ended_at,LEAST(now(),b.bucket_end)) > b.bucket_start
+ GROUP BY b.bucket_start,b.bucket_end
+), artifact_ranges AS (
+ SELECT b.bucket_start,b.bucket_end,p.path,
+   MAX(COALESCE(NULLIF(am.allocated_bytes,0),0))::numeric/1048576.0 AS artifact_mib,
+   range_agg(tstzrange(GREATEST(s.started_at,b.bucket_start),LEAST(COALESCE(sb.destroyed_at,now()),b.bucket_end),'[)')) AS retained_ranges
+ FROM buckets b
+ JOIN sandbox_storage_interval s ON s.team_id=sqlc.arg(team_id)
+ JOIN sandbox sb ON sb.id=s.sandbox_id
+ LEFT JOIN template t ON t.id=sb.template_id
+ CROSS JOIN LATERAL unnest(ARRAY[sb.base_path,sb.delta_path,CASE WHEN sb.base_path IS NULL AND sb.delta_path IS NULL THEN t.rootfs_path END]) AS p(path)
+ LEFT JOIN artifact_manifest am ON (am.snapshot_id=sb.snapshot_id OR am.template_id=t.id) AND am.path=p.path
+ WHERE p.path IS NOT NULL AND s.started_at < LEAST(now(),b.bucket_end) AND COALESCE(sb.destroyed_at,LEAST(now(),b.bucket_end)) > b.bucket_start
+ GROUP BY b.bucket_start,b.bucket_end,p.path
+), artifact_storage AS (
+ SELECT bucket_start,bucket_end,COALESCE(SUM(artifact_mib*EXTRACT(EPOCH FROM (upper(r)-lower(r)))),0)::numeric AS mib_seconds
+ FROM artifact_ranges CROSS JOIN LATERAL unnest(retained_ranges) AS ranges(r) GROUP BY bucket_start,bucket_end
+), storage AS (
+ SELECT b.bucket_start,b.bucket_end,
+   COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at,now()),b.bucket_end)-GREATEST(i.started_at,b.bucket_start)))*i.disk_mib),0)::numeric + COALESCE(MAX(a.mib_seconds),0) AS storage_mib_seconds
+ FROM buckets b LEFT JOIN sandbox_storage_interval i ON i.team_id=sqlc.arg(team_id)
+  AND i.started_at < LEAST(now(),b.bucket_end) AND COALESCE(i.ended_at,LEAST(now(),b.bucket_end)) > b.bucket_start
+ LEFT JOIN artifact_storage a ON a.bucket_start=b.bucket_start AND a.bucket_end=b.bucket_end GROUP BY b.bucket_start,b.bucket_end
+)
+SELECT sqlc.arg(team_id)::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds
+FROM compute c JOIN storage s USING(bucket_start,bucket_end) ORDER BY c.bucket_start;

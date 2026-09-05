@@ -138,6 +138,67 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /billing/usage-series:
+    get:
+      operationId: getBillingUsageSeries
+      tags: [Billing]
+      summary: Get timezone-aware billing usage chart buckets
+      description: |
+        Returns zero-filled local-calendar buckets for the half-open [start,end)
+        range. `timezone` must be an IANA timezone name (for example,
+        `America/Chicago`). The response is limited to 400 buckets. Every
+        request requires the authenticated team's `billing:read` permission.
+        `billed_total_usd` is gross CPU and memory usage cost before credits,
+        taxes, or payments; storage `cost_usd` is an informational equivalent
+        while storage remains tracked-only and is excluded from that total.
+      parameters:
+        - name: start
+          in: query
+          required: true
+          description: Absolute range start (inclusive).
+          schema: {type: string, format: date-time}
+        - name: end
+          in: query
+          required: true
+          description: Absolute range end (exclusive); must be after `start`.
+          schema: {type: string, format: date-time}
+        - name: granularity
+          in: query
+          required: true
+          description: Local calendar bucket size. Weeks start Monday at 00:00.
+          schema: {type: string, enum: [hour, day, week, month]}
+        - name: timezone
+          in: query
+          required: true
+          description: IANA timezone used for calendar boundaries and DST rules.
+          schema: {type: string, example: America/Chicago}
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Usage series
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingUsageSeriesResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          description: Pricing is not available for the authenticated team's active plan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /billing/pricing:
     get:
       operationId: getBillingPricing
@@ -2419,6 +2480,64 @@ components:
         url:
           type: string
           format: uri
+
+    BillingUsageSeriesResource:
+      type: object
+      description: Usage and backend-priced cost for one resource in a bucket. Usage units are resource-specific (vCPU-seconds, GiB-seconds, or tracked storage GiB-seconds).
+      required: [usage, cost_usd, tracked, billable]
+      properties:
+        usage:
+          type: number
+          format: double
+        cost_usd:
+          type: number
+          format: double
+        tracked:
+          type: boolean
+        billable:
+          type: boolean
+
+    BillingUsageSeriesBucket:
+      type: object
+      description: A half-open [start,end) absolute interval, clipped at the requested range edges.
+      required: [start, end, cpu, memory, storage, billed_total_usd]
+      properties:
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        cpu:
+          $ref: "#/components/schemas/BillingUsageSeriesResource"
+        memory:
+          $ref: "#/components/schemas/BillingUsageSeriesResource"
+        storage:
+          $ref: "#/components/schemas/BillingUsageSeriesResource"
+        billed_total_usd:
+          type: number
+          format: double
+
+    BillingUsageSeriesResponse:
+      type: object
+      description: Ordered, continuous series of at most 400 timezone-aware buckets.
+      required: [start, end, granularity, timezone, buckets]
+      properties:
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        granularity:
+          type: string
+          enum: [hour, day, week, month]
+        timezone:
+          type: string
+        buckets:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingUsageSeriesBucket"
 
     BillingExportPreviewResponse:
       type: object

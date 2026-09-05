@@ -397,6 +397,136 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	})
 }
 
+type billingUsageSeriesResource struct {
+	Usage    float64 `json:"usage"`
+	CostUSD  float64 `json:"cost_usd"`
+	Tracked  bool    `json:"tracked"`
+	Billable bool    `json:"billable"`
+}
+type billingUsageSeriesBucket struct {
+	Start          time.Time                  `json:"start"`
+	End            time.Time                  `json:"end"`
+	CPU            billingUsageSeriesResource `json:"cpu"`
+	Memory         billingUsageSeriesResource `json:"memory"`
+	Storage        billingUsageSeriesResource `json:"storage"`
+	BilledTotalUSD float64                    `json:"billed_total_usd"`
+}
+
+func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
+	teamID, ok := h.requireBillingRead(c)
+	if !ok {
+		return
+	}
+	start, err := time.Parse(time.RFC3339Nano, c.Query("start"))
+	if err != nil {
+		respondErrorMsg(c, "invalid_request", "invalid start timestamp", http.StatusBadRequest)
+		return
+	}
+	end, err := time.Parse(time.RFC3339Nano, c.Query("end"))
+	if err != nil {
+		respondErrorMsg(c, "invalid_request", "invalid end timestamp", http.StatusBadRequest)
+		return
+	}
+	timezone, err := billingUsageSeriesTimezone(c.Query("timezone"))
+	if err != nil {
+		if strings.TrimSpace(c.Query("timezone")) == "" {
+			respondErrorMsg(c, "invalid_request", "timezone is required", http.StatusBadRequest)
+		} else {
+			respondErrorMsg(c, "invalid_request", "invalid timezone", http.StatusBadRequest)
+		}
+		return
+	}
+	loc := timezone
+	buckets, err := billing.UsageSeriesBuckets(start, end, c.Query("granularity"), loc)
+	if err != nil {
+		respondErrorMsg(c, "invalid_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	rates, err := h.DB.ListActivePricingRatesForTeamCurrent(c.Request.Context(), teamID)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	storageEnabled, err := h.billingStorageBillingEnabled(c.Request.Context(), teamID)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	states := h.billingResourceStates(storageEnabled)
+	catalog, ok := h.billingRateCatalog(pricingRatesFromTeamCurrentRows(rates), teamID.String(), states)
+	if !ok {
+		respondPricingUnavailable(c)
+		return
+	}
+	rate := func(key string) float64 {
+		v, e := numericFloat64(catalog.RateByResource[key].PriceUsd)
+		if e != nil {
+			return 0
+		}
+		return v
+	}
+	vcpuRate, memRate, storageRate := rate("vcpu"), rate("memory_gib"), rate("storage_gib")
+	resourceState := make(map[string]billingResourceState, len(states))
+	for _, state := range states {
+		resourceState[state.ResourceKey] = state
+	}
+	result := make([]billingUsageSeriesBucket, 0, len(buckets))
+	ctx := c.Request.Context()
+	starts, ends := make([]time.Time, len(buckets)), make([]time.Time, len(buckets))
+	for i, b := range buckets {
+		starts[i], ends[i] = b.Start, b.End
+	}
+	// Aggregate all buckets in one bounded set-oriented query; do not invoke the
+	// full-team usage scan independently for each bucket.
+	usageRows, e := h.DB.GetTeamBillingUsageSeries(ctx, db.GetTeamBillingUsageSeriesParams{TeamID: teamID, PeriodStarts: starts, PeriodEnds: ends})
+	if e != nil || len(usageRows) != len(buckets) {
+		respondError(c, ErrInternal)
+		return
+	}
+	for i, b := range buckets {
+		u := usageRows[i]
+		cpu, _ := numericFloat64(u.VcpuSeconds)
+		mem, _ := numericFloat64(u.MemoryGibSeconds)
+		storage, _ := numericFloat64(u.StorageGibSeconds)
+		cpuState, cpuOK := resourceState["vcpu"]
+		memoryState, memoryOK := resourceState["memory_gib"]
+		storageState, storageOK := resourceState["storage_gib"]
+		if !cpuOK || !memoryOK || !storageOK {
+			respondError(c, ErrInternal)
+			return
+		}
+		cc, mc, sc := cpu*vcpuRate, mem*memRate, storage*storageRate
+		// Resource costs remain informational even when a resource is tracked but
+		// excluded from billing. Apply billability only to the billed total.
+		billedTotal := 0.0
+		if cpuState.Billable {
+			billedTotal += cc
+		}
+		if memoryState.Billable {
+			billedTotal += mc
+		}
+		if storageState.Billable {
+			billedTotal += sc
+		}
+		result = append(result, billingUsageSeriesBucket{Start: b.Start, End: b.End, CPU: billingUsageSeriesResource{cpu, cc, cpuState.Tracked, cpuState.Billable}, Memory: billingUsageSeriesResource{mem, mc, memoryState.Tracked, memoryState.Billable}, Storage: billingUsageSeriesResource{storage, sc, storageState.Tracked, storageState.Billable}, BilledTotalUSD: billedTotal})
+	}
+	setPrivateBillingCacheHeaders(c)
+	c.JSON(http.StatusOK, gin.H{"start": start, "end": end, "granularity": c.Query("granularity"), "timezone": c.Query("timezone"), "buckets": result})
+}
+
+func billingUsageSeriesTimezone(raw string) (*time.Location, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, errors.New("timezone is required")
+	}
+	// Local is a process-dependent alias, not an IANA timezone name. Accepting
+	// it would make bucket boundaries vary with the server's TZ configuration.
+	if raw == "Local" {
+		return nil, errors.New("invalid timezone")
+	}
+	return time.LoadLocation(raw)
+}
+
 func (h *Handlers) requireBillingRead(c *gin.Context) (uuid.UUID, bool) {
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
