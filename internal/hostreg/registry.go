@@ -76,8 +76,14 @@ type Registry struct {
 	// address. The mutex is never held across I/O, so an invalidation can
 	// always land mid-resolve and be observed. Grows one counter per host
 	// id ever seen (fleet-bounded).
-	gens    map[string]uint64
-	resolve singleflight.Group // one row-read/dial resolution in flight per host
+	gens map[string]uint64
+	// observed is the address most recently reported to MarkVerified per
+	// host. Equivalent reports coalesce on it: only a report that differs
+	// from the last one supersedes a resolution in flight, so concurrent
+	// verifications of one unchanged address cannot exhaust that
+	// resolution's attempts between them.
+	observed map[string]string
+	resolve  singleflight.Group // one row-read/dial resolution in flight per host
 	// refreshing holds hosts with a refresh-ahead goroutine in flight.
 	// Singleflight dedupes the underlying read but not the goroutines
 	// waiting on it — without this guard, every warm call in the refresh
@@ -88,10 +94,11 @@ type Registry struct {
 // New creates a Registry backed by the host table.
 func New(queries *db.Queries, dial DialFunc) *Registry {
 	return &Registry{
-		db:      queries,
-		dial:    dial,
-		clients: make(map[string]entry),
-		gens:    make(map[string]uint64),
+		db:       queries,
+		dial:     dial,
+		clients:  make(map[string]entry),
+		gens:     make(map[string]uint64),
+		observed: make(map[string]string),
 	}
 }
 
@@ -306,6 +313,7 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 func (r *Registry) Invalidate(hostID string) {
 	r.mu.Lock()
 	delete(r.clients, hostID)
+	delete(r.observed, hostID)
 	r.gens[hostID]++
 	r.mu.Unlock()
 }
@@ -316,12 +324,13 @@ func (r *Registry) Invalidate(hostID string) {
 // address has its lease renewed in place. Otherwise the host is resolved now
 // (row read plus dial): a cached client at a DIFFERENT address is dropped
 // first — the row just said the host moved, so that client must not survive
-// as a within-lease fallback should the resolution fail to read — and in
-// both that case and the no-client case the host's generation is bumped, so
-// a resolution already in flight that read the row BEFORE this observation
-// discards what it read and reads again instead of publishing an older
-// address over the newer one. A resolution failure is logged and leaves
-// ClientFor to fail closed.
+// as a within-lease fallback should the resolution fail to read — and the
+// first report of an address the registry has not seen bumps the host's
+// generation, so a resolution already in flight that read the row BEFORE
+// this observation discards what it read and reads again instead of
+// publishing an older address over the newer one. Further reports of the
+// same address join that resolution without bumping again. A resolution
+// failure is logged and leaves ClientFor to fail closed.
 func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
 	if addr == "" {
 		return
@@ -332,6 +341,7 @@ func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
 			now := time.Now()
 			e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
 			r.clients[hostID] = e
+			r.observed[hostID] = addr
 			r.mu.Unlock()
 			return
 		}
@@ -339,7 +349,10 @@ func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
 			Msg("host address changed; dropping the cached client before re-resolving")
 		delete(r.clients, hostID)
 	}
-	r.gens[hostID]++
+	if r.observed[hostID] != addr {
+		r.observed[hostID] = addr
+		r.gens[hostID]++
+	}
 	r.mu.Unlock()
 	if _, err := r.resolveClient(ctx, hostID); err != nil {
 		log.Warn().Err(err).Str("host_id", hostID).Msg("host client resolution after row verification failed")

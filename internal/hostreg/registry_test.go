@@ -864,3 +864,76 @@ func TestMarkVerifiedSupersedesColdLookupThatReadTheOldAddress(t *testing.T) {
 		t.Fatalf("settled address = %q, want the newer .2", settled)
 	}
 }
+
+// Concurrent verifications that all report the same, unchanged address must
+// coalesce: a cold lookup has two attempts, and if every report superseded
+// it the lookup would fail with a spurious address flap on a healthy host.
+func TestConcurrentSameAddressVerificationsDoNotStarveColdLookup(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dialStarted := make(chan struct{})
+	dialRelease := make(chan struct{})
+	var once sync.Once
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		once.Do(func() {
+			close(dialStarted)
+			<-dialRelease // hold the first dial open while the reports land
+		})
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	<-dialStarted
+
+	var verified sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		verified.Add(1)
+		go func() {
+			defer verified.Done()
+			r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
+		}()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for { // the first report supersedes the lookup; the others must not
+		r.mu.RLock()
+		gen := r.gens["host-a"]
+		r.mu.RUnlock()
+		if gen > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no report superseded the in-flight lookup")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for i := 0; i < 100; i++ {
+		runtime.Gosched() // let the remaining reports reach their (no-op) check
+	}
+	close(dialRelease)
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v (equivalent reports must not exhaust the lookup)", err)
+	}
+	verified.Wait()
+	r.mu.RLock()
+	gen, settled := r.gens["host-a"], r.clients["host-a"].addr
+	r.mu.RUnlock()
+	if gen != 1 {
+		t.Fatalf("generation bumps = %d, want exactly 1 for three reports of one address", gen)
+	}
+	if settled != "10.0.0.1:50051" {
+		t.Fatalf("settled address = %q", settled)
+	}
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("post-settle ClientFor: %v", err)
+	}
+}
