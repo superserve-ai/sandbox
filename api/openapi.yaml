@@ -2570,6 +2570,7 @@ components:
         - resources
         - billing_period
         - pricing_tier
+        - trial
         - calculated_at
       properties:
         mode:
@@ -2645,6 +2646,8 @@ components:
           $ref: "#/components/schemas/BillingSummaryPeriod"
         pricing_tier:
           $ref: "#/components/schemas/BillingSummaryPricingTier"
+        trial:
+          $ref: "#/components/schemas/BillingTrialBalance"
         calculated_at:
           type: string
           format: date-time
@@ -2770,6 +2773,25 @@ components:
         currency:
           type: string
           example: USD
+
+    BillingTrialBalance:
+      type: object
+      required: [grant_usd, consumed_usd, remaining_usd, state, eligible]
+      properties:
+        grant_usd:
+          type: number
+          format: double
+        consumed_usd:
+          type: number
+          format: double
+        remaining_usd:
+          type: number
+          format: double
+        state:
+          type: string
+          enum: [no_grant, active, exhausted, expired, ended_by_billing_activation]
+        eligible:
+          type: boolean
 
     BillingExportPreviewItem:
       type: object
