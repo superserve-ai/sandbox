@@ -51,8 +51,14 @@ type Client interface {
 	// what came back, or it would demand of reports an identity the host
 	// can never produce.
 	PauseInstance(ctx context.Context, instanceID, snapshotDir, pauseToken string) (snapshotPath, memPath string, manifest []ManifestEntry, ackedToken string, err error)
-	// ResumeInstance restores a paused VM.
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// ResumeInstance restores a paused VM. generation is the backup
+	// generation VERIFIED to cover the sandbox's current snapshot, if any
+	// (e.g. from db.GetSnapshotForResume's covered_backup_generation) —
+	// it lets a vmd host with fetch-before-resume enabled restore
+	// artifacts missing from local disk instead of hard-failing; "" is
+	// always safe to pass and matches pre-fetch behavior exactly (a vmd
+	// host with the feature off ignores it).
+	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte, generation string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
 	// in-memory map but the snapshot files are still on disk). basePath +

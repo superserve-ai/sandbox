@@ -51,6 +51,9 @@ type stubVMD struct {
 	// nil echoes the current capability. Point at "" to model a vmd from
 	// before the echo existed.
 	restorePreviewProtocol *string
+	// lastResumeGeneration captures the generation ResumeInstance was last
+	// called with, so tests can assert whether a fetch generation was named.
+	lastResumeGeneration string
 }
 
 type stubScheduler struct {
@@ -81,7 +84,8 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir, pauseToken
 	}
 	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
-func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte) (string, uint32, uint32, error) {
+func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte, generation string) (string, uint32, uint32, error) {
+	s.lastResumeGeneration = generation
 	if s.resumeFn != nil {
 		ip, err := s.resumeFn(ctx, id, snapshotPath, memPath, networkConfig)
 		return ip, 1, 1024, err
@@ -352,6 +356,26 @@ func notFoundRow() *mockRow {
 func idRow(id uuid.UUID) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = id
+		return nil
+	}}
+}
+
+// snapshotForResumeRow returns a mockRow matching GetSnapshotForResumeRow's
+// Scan order: the same 8 leading columns snapshotRow fills (id, sandbox_id,
+// team_id, path, size_bytes, trigger, created_at, mem_path), then
+// generation/name/pause_token (left unset, as snapshotRow also leaves
+// them), then the covered-backup-generation column this query adds.
+func snapshotForResumeRow(s db.Snapshot, coveredGeneration string) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = s.ID
+		*dest[1].(*uuid.UUID) = s.SandboxID
+		*dest[2].(*uuid.UUID) = s.TeamID
+		*dest[3].(*string) = s.Path
+		*dest[4].(*int64) = s.SizeBytes
+		*dest[5].(*string) = s.Trigger
+		*dest[6].(*time.Time) = s.CreatedAt
+		*dest[7].(**string) = s.MemPath
+		*dest[11].(*string) = coveredGeneration
 		return nil
 	}}
 }
@@ -1098,6 +1122,51 @@ func TestResumeSandbox_LegacyPolicyToleratesOldVMD(t *testing.T) {
 	}
 }
 
+// TestResumeSandbox_NamesLatestBackupGeneration verifies resumePausedSandbox
+// threads the sandbox's latest durable backup generation into
+// VMD.ResumeInstance, so a fetch-before-resume-enabled host knows exactly
+// what to restore if its local disk is missing the snapshot.
+func TestResumeSandbox_NamesLatestBackupGeneration(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", SizeBytes: 1024, Trigger: "pause",
+	}
+
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotForResumeRow(snap, "gen-xyz")
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if vmd.lastResumeGeneration != "gen-xyz" {
+		t.Errorf("ResumeInstance generation = %q, want %q", vmd.lastResumeGeneration, "gen-xyz")
+	}
+}
+
 func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
@@ -1139,8 +1208,8 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: BeginResume :one"):
 				return sandboxRow(sb)
-			case strings.Contains(sql, "-- name: GetSnapshot :one"):
-				return snapshotRow(snap)
+			case strings.Contains(sql, "-- name: GetSnapshotForResume :one"):
+				return snapshotForResumeRow(snap, "")
 			default:
 				return activityRow()
 			}
@@ -1227,8 +1296,8 @@ func TestResumeSandbox_PrivatePolicyRequiresBrowserChainAndRestoresBrowserPorts(
 				return previewPolicyRow(preview.AccessPrivate, 8)
 			case strings.Contains(sql, "-- name: BeginResume :one"):
 				return sandboxRow(sb)
-			case strings.Contains(sql, "-- name: GetSnapshot :one"):
-				return snapshotRow(snap)
+			case strings.Contains(sql, "-- name: GetSnapshotForResume :one"):
+				return snapshotForResumeRow(snap, "")
 			default:
 				return activityRow()
 			}

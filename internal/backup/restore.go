@@ -159,6 +159,48 @@ type ProgressFunc func(format string, args ...any)
 // directory as restored. Artifact entries named manifest.json are
 // rejected up front so the marker can never collide.
 func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation, destDir string, progress ProgressFunc) (*GenerationManifest, error) {
+	return restoreGeneration(ctx, r, sandboxID, generation, destDir, nil, progress)
+}
+
+// RestoreGenerationFiles restores only the manifest entries named in names
+// into destDir — no shared base object, and no other artifact this
+// generation happens to carry, is ever fetched, written, or verified for
+// an entry not named. The manifest is still retrieved and its identity and
+// content-addressed key verified in full (see fetchManifest): that
+// derivation is metadata-only over the manifest's own recorded digests and
+// touches no packed bytes, so narrowing the write set never weakens what
+// the generation's key vouches for.
+//
+// Built for a latency-sensitive caller that needs a few specific artifacts
+// durably restorable without paying to restore everything a generation
+// carries — e.g. a layered overlay's shared base image, which can be
+// multi-GiB and which fetch-before-resume deliberately leaves for its own
+// separate, existing recovery path rather than downloading and discarding
+// it on every resume. destDir holds exactly the requested, verified files
+// on success. Unlike RestoreGeneration, no completion marker is written:
+// a directory missing artifacts by design must never be mistaken for a
+// complete, verified generation by a consumer that trusts the marker.
+//
+// A name absent from the manifest is silently skipped, not an error: a
+// caller asking for an artifact this generation never carried is better
+// served by its own after-the-fact check (resume's existing per-file stat
+// gates, for fetch-before-resume) than a hard failure here.
+func RestoreGenerationFiles(ctx context.Context, r BlobReader, sandboxID, generation, destDir string, names []string, progress ProgressFunc) (*GenerationManifest, error) {
+	only := make(map[string]bool, len(names))
+	for _, n := range names {
+		only[n] = true
+	}
+	return restoreGeneration(ctx, r, sandboxID, generation, destDir, only, progress)
+}
+
+// restoreGeneration is the shared implementation behind RestoreGeneration
+// (only == nil, every manifest entry) and RestoreGenerationFiles (only
+// non-nil, exactly the named entries). See both doc comments for the
+// contract; nothing about fetchManifest's identity/key verification or the
+// all-or-nothing failure cleanup below changes based on which is used —
+// only which entries get restoreFile/verifyFile calls, and whether the
+// completion marker gets written at the end.
+func restoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation, destDir string, only map[string]bool, progress ProgressFunc) (*GenerationManifest, error) {
 	report := func(format string, args ...any) {
 		if progress != nil {
 			progress(format, args...)
@@ -174,6 +216,9 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 		return nil, err
 	}
 	defer root.Close()
+	wanted := func(mf ManifestFile) bool {
+		return only == nil || only[mf.Name]
+	}
 	var created []string
 	fail := func(err error) (*GenerationManifest, error) {
 		var cleanupErrs []string
@@ -188,6 +233,9 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 		return nil, err
 	}
 	for _, mf := range manifest.Files {
+		if !wanted(mf) {
+			continue
+		}
 		// The bucket is shared across the cell; never let a manifest name
 		// escape destDir.
 		if err := validSegment(mf.Name); err != nil {
@@ -206,10 +254,24 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 	// verification cannot leave earlier files implicitly blessed: either
 	// the whole set passes or the whole set is gone.
 	for _, mf := range manifest.Files {
+		if !wanted(mf) {
+			continue
+		}
 		if err := verifyFile(ctx, root, mf); err != nil {
 			return fail(fmt.Errorf("verify %s: %w", mf.Name, err))
 		}
 		report("verified %s sha256 %s", mf.Name, mf.SHA256)
+	}
+	if only != nil {
+		// A partial restore stops here: see RestoreGenerationFiles for why
+		// it must not write the completion marker RestoreGeneration's full
+		// restore does below, and why that's safe to skip rather than a
+		// gap — each restored file was already fsynced individually by
+		// restoreFile, and this caller doesn't rely on directory-level
+		// crash atomicity for a destDir it is about to consume and delete
+		// within the same process run.
+		report("restore complete: %d of %d files restored (partial by request)", len(created), len(manifest.Files))
+		return manifest, nil
 	}
 	madeMarker, err := writeRestoreMarker(root, manifest)
 	if madeMarker {

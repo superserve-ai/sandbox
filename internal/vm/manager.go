@@ -465,6 +465,12 @@ type Manager struct {
 	// backupMetrics optionally observes backup hook timings; nil (metrics
 	// disabled) is safe at every call site. See SetBackupMetrics.
 	backupMetrics *telemetry.BackupRecorder
+	// resumeFetch enables fetch-before-resume when non-nil: a resume whose
+	// local disk is missing the paused sandbox's artifacts restores them
+	// from the cell bucket first instead of hard-failing. Nil (the
+	// VMD_FETCH_ON_RESUME-off default) leaves resume pinned to hosts that
+	// already hold the snapshot. See SetResumeFetch.
+	resumeFetch *resumeFetchSource
 	// launchFirecrackerHook is a test seam. When set, launchFirecracker
 	// delegates to it instead of the platform-specific implementation.
 	launchFirecrackerHook func(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error)
@@ -2017,10 +2023,10 @@ func fileExists(path string) bool {
 // this returning and those steps acting on it. The gRPC adapter is the sole
 // caller and owns that lock scope; there is deliberately no self-locking
 // wrapper, which would release the lock before those steps and reopen the race.
-func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string, networkRules *sandboxNetworkRules) (*VMInstance, error) {
+func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string, networkRules *sandboxNetworkRules, generation string) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
-	var tSlot, tVerify, tFcStart, tFcDone, tRestore, tRestoreDone time.Time
+	var tSlot, tVerify, tFcStart, tFcDone, tRestore, tRestoreDone, tFetch, tFetchDone time.Time
 	var verifyDur time.Duration
 	needsNetworkCleanup := false
 	defer func() {
@@ -2039,7 +2045,17 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			// Died mid-probe; count the elapsed verification time.
 			verifyDur += time.Since(tVerify)
 		}
-		if tSlot.IsZero() && verifyDur == 0 {
+		// Elapsed fallback mirrors the other stages: a fetch that's still
+		// running (or died) when this defer fires must not vanish from the
+		// distributions any more than a died ensure_slot or restore would.
+		var fetchDur time.Duration
+		switch {
+		case !tFetchDone.IsZero():
+			fetchDur = tFetchDone.Sub(tFetch)
+		case !tFetch.IsZero():
+			fetchDur = time.Since(tFetch)
+		}
+		if tSlot.IsZero() && verifyDur == 0 && fetchDur == 0 {
 			return
 		}
 		phases := map[string]time.Duration{
@@ -2052,11 +2068,21 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		if verifyDur > 0 {
 			phases["verify"] = verifyDur
 		}
+		// fetch runs before the slot claim (a missing generation must be
+		// materialized before anything else about resume makes sense), so
+		// it needs its own zero-tSlot exit path here too, same as verify.
+		if fetchDur > 0 {
+			phases["fetch"] = fetchDur
+		}
 		if tSlot.IsZero() {
 			m.recordPhases("resume", "", phases)
 			return
 		}
-		phases["prep"] = tSlot.Sub(tEntry)
+		// prep excludes fetch: fetch is bounded by its own semaphore and
+		// scales with generation size, which would otherwise drown the
+		// signal prep exists to isolate (lock queueing and the local
+		// precondition checks).
+		phases["prep"] = tSlot.Sub(tEntry) - fetchDur
 		switch {
 		case !tFcDone.IsZero():
 			phases["fc_start"] = tFcDone.Sub(tFcStart)
@@ -2145,6 +2171,147 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		}
 	}
 
+	rundirKey := vmID
+	if inst.RunDirID != "" {
+		rundirKey = inst.RunDirID
+	}
+
+	// The VM's rootfs is at its rundir. Start Firecracker in a mount namespace
+	// that maps this rootfs to the template's fixed path (which the snapshot
+	// references).
+	rootfsPath := inst.DiskPath
+	if rootfsPath == "" {
+		fname := "rootfs.ext4"
+		if inst.Config.BasePath != "" {
+			fname = "overlay.ext4"
+		}
+		rootfsPath = filepath.Join(m.cfg.RunDir, rundirKey, fname)
+	}
+
+	// Fetch-before-resume (VMD_FETCH_ON_RESUME): a host missing its local
+	// copy of this generation's disk and/or vmstate can restore them from
+	// the cell bucket instead of hard-failing the checks below, PROVIDED
+	// the control plane named a generation to fetch. m.resumeFetch is nil
+	// unless the host opted in, so this is a no-op everywhere else.
+	//
+	// Gated on memPath already being present: the guest memory image is
+	// never part of a sandbox's backup generation (see
+	// fetchGenerationForResume's doc comment), so when it's ALSO missing —
+	// a fully replaced host, the scenario a wiped NVMe describes — no
+	// fetch here can make resume succeed, and attempting one would only
+	// spend a bounded fetch slot and however long the restore takes on
+	// work that cannot avoid the memPath failure below regardless. That
+	// matters most exactly when it's likely to happen: a reconnect storm
+	// after a host loss, where every stranded resume would otherwise queue
+	// on the semaphore for nothing. Fetch instead helps the narrower case
+	// where memPath survived locally but the disk or vmstate did not
+	// (e.g. an operator's manual disk-recovery deletion — see the comment
+	// on the checks below).
+	//
+	// A failed fetch must fail the resume outright, not fall through to
+	// the existing stat checks below: fetchGenerationForResume adopts its
+	// two artifacts independently (see its doc comment), so a failure
+	// partway through — e.g. vmstate.snap placed, then the rootfs copy
+	// fails on a full destination filesystem — can leave one freshly
+	// fetched file sitting next to the OTHER's stale pre-fetch content.
+	// The stat checks below only verify existence, not which generation a
+	// file's bytes belong to, so falling through could hand Firecracker a
+	// mismatched vmstate/disk pair instead of failing loudly. Whatever WAS
+	// adopted stays adopted (a later fetch attempt for the same
+	// generation just re-fetches whichever piece is still missing or
+	// still stale — restoreFile always writes fresh content, it never
+	// trusts what a name already holds), but this resume must not proceed
+	// on it.
+	//
+	// markerPending joins the trigger: it's the durable sign that some
+	// EARLIER attempt started adopting this generation's files and never
+	// finished (crash, not just a returned error — a returned error is
+	// already covered by the hard-fail above). Without it, a crash
+	// between the two renames leaves both target paths existing — one
+	// fresh, one stale from before this vmID's fetch history began — and
+	// the plain existence check below would trust the pair.
+	markerPath := resumeFetchMarkerPath(snapshotPath)
+	markerPending := fileExists(markerPath)
+	filesIncomplete := markerPending || !fileExists(snapshotPath) || !fileExists(rootfsPath)
+
+	// Only evaluated when filesIncomplete — the ordinary warm resume
+	// (every artifact already present) never reaches this, so it costs
+	// that path nothing. memPath surviving while vmstate/rootfs did not
+	// is only safe to treat as this generation's memory if it
+	// demonstrably belongs to the SAME pause as whatever gets fetched:
+	// existence alone proves nothing (a stale mem.snap left over from an
+	// earlier local pause, paired with a freshly fetched, unrelated
+	// vmstate/disk generation, is exactly the mismatched-state risk this
+	// whole gate exists to prevent). There is no durable identity for
+	// memPath anywhere (it is never part of a backup generation — see
+	// fetchGenerationForResume), so inst.PausedAt — vmd's own locally
+	// recorded last-known pause instant for this vmID, which survives
+	// independently of the artifact files themselves — is the only
+	// local reference available: a legitimate memPath write happens at
+	// or shortly before that timestamp is recorded, so anything
+	// meaningfully OLDER did not come from the pause vmd itself last
+	// knew about. IsZero (a legacy record) means unverifiable, not
+	// stale: skip the check rather than block resume on something this
+	// host cannot actually judge.
+	var memStale bool
+	if filesIncomplete && fileExists(memPath) && !inst.PausedAt.IsZero() {
+		if fi, statErr := os.Stat(memPath); statErr == nil &&
+			fi.ModTime().Before(inst.PausedAt.Add(-resumeFetchMemStalenessSlop)) {
+			memStale = true
+		}
+	}
+
+	if m.resumeFetch != nil && generation != "" && fileExists(memPath) && !memStale && filesIncomplete {
+		tFetch = time.Now()
+		bytesRestored, ferr := m.fetchGenerationForResume(ctx, vmID, generation, snapshotPath, rootfsPath, log)
+		tFetchDone = time.Now()
+		if m.backupMetrics != nil {
+			m.backupMetrics.RecordFetch(ctx, ferr == nil, tFetchDone.Sub(tFetch))
+			m.backupMetrics.AddFetchBytes(ctx, bytesRestored)
+		}
+		if ferr != nil {
+			log.Warn().Err(ferr).Str("generation", generation).Msg("resume: fetch-on-resume failed")
+			return nil, fetchResumeError(generation, ferr)
+		}
+		log.Info().Str("generation", generation).Int64("bytes", bytesRestored).
+			Msg("resume: fetched generation from backup bucket")
+		// A successful fetch just adopted both files together in this
+		// same call, so THIS resume knows the pair is consistent
+		// regardless of whether the marker file itself got cleaned up
+		// (its removal is best-effort — see fetchGenerationForResume). A
+		// marker that outlives a successful fetch only costs a future
+		// resume one harmless, unnecessary re-fetch, never a wrong trust
+		// decision here.
+		markerPending = false
+	}
+	// A marker this attempt could not repair — fetch-before-resume is
+	// currently disabled, or the control plane named no generation this
+	// time — must still block resume rather than let the checks below
+	// treat a possibly-mismatched pair as trustworthy. This is
+	// deliberately UNCONDITIONAL (not scoped to m.resumeFetch != nil):
+	// the marker can only ever have been written while fetch was enabled,
+	// but nothing requires it to still be enabled by the time a later
+	// resume finds the leftover, and existence checks alone cannot tell
+	// "interrupted mid-adoption" apart from "a completely ordinary local
+	// pause" once both files are present.
+	if markerPending {
+		pending, _ := os.ReadFile(markerPath)
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"resume artifacts for %s are from an interrupted fetch of generation %q and cannot be trusted without re-fetching; enable fetch-before-resume with that generation available, or restore the artifacts manually",
+			vmID, string(pending))
+	}
+	// memStale is checked separately from markerPending (and after any
+	// fetch attempt, which never runs while it's true): a fetch cannot
+	// repair it — nothing durable records what memPath SHOULD be — so
+	// resume must refuse rather than fall through to the plain existence
+	// check below, which has no way to tell this apart from a genuinely
+	// current memPath.
+	if memStale {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"resume artifacts for %s: local memory image predates this host's last recorded pause of it and cannot be paired with a freshly fetched generation; restore the artifacts manually",
+			vmID)
+	}
+
 	// Verify the snapshot files actually exist on disk. DB can claim
 	// "ready" but the files be missing — common scenarios:
 	//   - vmd host replaced; new host has no cached snapshots
@@ -2164,9 +2331,28 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	}
 	if _, err := os.Stat(memPath); err != nil {
 		if os.IsNotExist(err) {
+			// The guest memory image is never part of a sandbox's backup
+			// generation (collectPauseManifest omits it deliberately — see
+			// its doc comment), so a fetch above cannot have produced it:
+			// this failure is expected and unchanged on a host that never
+			// held memPath in the first place, fetch-before-resume or not.
 			return nil, status.Errorf(codes.FailedPrecondition, "memory file missing on host: %s", memPath)
 		}
 		return nil, status.Errorf(codes.FailedPrecondition, "stat mem file %s: %v", memPath, err)
+	}
+	// The disk image was never stat-checked here before fetch-before-resume
+	// existed: resume was hard-pinned to the origin host, where rootfsPath
+	// going missing independently of snapshotPath/memPath (all local
+	// artifacts of the same disk) wasn't a reachable failure. A fetch can
+	// now fail partway through — vmstate.snap placed, rootfs.ext4 not —
+	// and without this check that would sail past every precondition here
+	// straight into launchFirecracker with a missing block device instead
+	// of the clear, already-understood FailedPrecondition this gives it.
+	if _, err := os.Stat(rootfsPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, status.Errorf(codes.FailedPrecondition, "disk image missing on host: %s", rootfsPath)
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "stat disk image %s: %v", rootfsPath, err)
 	}
 	// Presence gate for layered overlays. Deterministic from a stat, so it
 	// belongs here with the other precondition checks — a post-boot refusal
@@ -2176,23 +2362,6 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
-	}
-
-	rundirKey := vmID
-	if inst.RunDirID != "" {
-		rundirKey = inst.RunDirID
-	}
-
-	// The VM's rootfs is at its rundir. Start Firecracker in a mount namespace
-	// that maps this rootfs to the template's fixed path (which the snapshot
-	// references).
-	rootfsPath := inst.DiskPath
-	if rootfsPath == "" {
-		fname := "rootfs.ext4"
-		if inst.Config.BasePath != "" {
-			fname = "overlay.ext4"
-		}
-		rootfsPath = filepath.Join(m.cfg.RunDir, rundirKey, fname)
 	}
 
 	vmDir := filepath.Join(m.cfg.RunDir, rundirKey)
