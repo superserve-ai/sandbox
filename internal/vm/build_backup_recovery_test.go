@@ -53,7 +53,7 @@ func TestReconcileDropsWhenRebuildActive(t *testing.T) {
 		return nil
 	})
 	// A new build for the same id is in flight.
-	if _, err := m.registerBuild("build-tpl", "tpl", 1, 1024, nil); err != nil {
+	if _, err := m.registerBuild("build-tpl", "tpl", 1, 1024, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

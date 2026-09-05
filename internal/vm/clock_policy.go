@@ -2,7 +2,6 @@ package vm
 
 import (
 	"context"
-	"os"
 	"sync/atomic"
 	"time"
 
@@ -27,12 +26,6 @@ const (
 	// clockRealtimeCap is what a Firecracker build advertises when it accepts a
 	// per-restore clock policy. A binary that does not is left on legacy.
 	clockRealtimeCap = "clock-realtime-flag"
-
-	// clockFreezeMarkerSuffix names the marker written beside a memory file whose
-	// guest corrects its wall clock on wake. Presence is the whole signal; the
-	// contents are not read, so the file can carry provenance for an operator
-	// without this becoming a format to parse on the restore path.
-	clockFreezeMarkerSuffix = ".wallclock"
 )
 
 // firecrackerCapabilityProbeTimeout bounds one --version exec.
@@ -98,57 +91,71 @@ func (m *Manager) WatchFirecrackerCapability(ctx context.Context, log zerolog.Lo
 	}()
 }
 
-// clockFreezeMarkerPath returns the marker path for a memory file.
-func clockFreezeMarkerPath(memPath string) string {
-	return memPath + clockFreezeMarkerSuffix
-}
-
-// snapshotCorrectsWallClock reports whether memPath's guest fixes its own wall
-// clock on wake, and so can safely have its monotonic clock frozen.
-func snapshotCorrectsWallClock(memPath string) bool {
-	if memPath == "" {
-		return false
-	}
-	_, err := os.Stat(clockFreezeMarkerPath(memPath))
-	// Any error — absent, unreadable, a racing delete — reads as "cannot".
-	// Absence of proof is not proof, and the safe answer is the slow one.
-	return err == nil
-}
-
 // guestCorrectsWallClock reports whether the guest now being paused fixes its
 // own wall clock, judged from the images it was restored from: its own memory
 // file, or the layered base beneath it when this is a first pass off a template.
+// Any manifest that cannot be read counts as no: absence of proof is not proof,
+// and the safe answer is the slow one.
 func guestCorrectsWallClock(instMemFile, instBaseMem string) bool {
-	return snapshotCorrectsWallClock(instMemFile) ||
-		(instBaseMem != "" && snapshotCorrectsWallClock(instBaseMem))
+	for _, p := range []string{instMemFile, instBaseMem} {
+		if p == "" {
+			continue
+		}
+		if m, err := imageManifest(p); err == nil && m != nil && m.GuestCorrectsClock {
+			return true
+		}
+	}
+	return false
 }
 
-// resumeWallClockProperty returns whether the guest being resumed corrects its
-// own wall clock, preferring the durable record to the filesystem.
+// resumeWallClockProperty returns what the image being resumed says about its
+// guest and its workload, preferring the durable record to the filesystem.
 //
 // An ordinary resume reloads the exact image the VM was paused into, and that
-// pause wrote the property to the record and the marker together — so the record
-// is already the answer and the resume path need not go to disk for it. Only an
-// explicit override, supplying an image this VM was never paused into, has to
-// look, because the record then describes a different artifact.
-func resumeWallClockProperty(memPath, basePath, pausedMemPath string, recorded *bool) bool {
-	if memPath == pausedMemPath && recorded != nil {
-		return *recorded
+// pause wrote the facts to the record and the manifest together — so the
+// record is already the answer and the resume path need not go to disk for
+// it. The image fact is what decides: a record that carries it answers, and a
+// guest that cannot correct its clock is never frozen, so its record answers
+// too. Only an explicit override, supplying an image this VM was never paused
+// into, or a record that never carried the fact (a rollback to a binary
+// without the field drops it on rewrite, and its silence must not be read as
+// "no") has to look. A manifest this binary cannot trust is an error.
+func resumeWallClockProperty(memPath, pausedMemPath string, recordedCorrects, recordedFrozen *bool) (correctsWallClock, workloadFrozen bool, err error) {
+	if memPath == pausedMemPath {
+		if recordedFrozen != nil {
+			return recordedCorrects != nil && *recordedCorrects, *recordedFrozen, nil
+		}
+		if recordedCorrects != nil && !*recordedCorrects {
+			return false, false, nil
+		}
 	}
-	// Either a different image than this VM was paused into, or a record that
-	// never carried the answer — a rollback to a binary without the field drops
-	// it on rewrite, and its silence must not be read as "no".
-	return guestCorrectsWallClock(memPath, basePath)
+	m, err := imageManifest(memPath)
+	if err != nil {
+		return false, false, err
+	}
+	if m != nil {
+		return m.GuestCorrectsClock, m.WorkloadFrozen, nil
+	}
+	// No manifest of its own: the image holds no frozen workload, which an
+	// overlay never inherits, but its guest came from the template beneath
+	// it, so the capability is read from there, as the pause-time check does.
+	if base, ok := readLayeredBase(memPath); ok {
+		if bm, berr := imageManifest(base); berr == nil && bm != nil {
+			return bm.GuestCorrectsClock, false, nil
+		}
+	}
+	return false, false, nil
 }
 
-// clockPolicyFor turns the resolved guest property into a restore policy.
+// clockPolicyFor turns the resolved image fact into a restore policy.
 //
-// Two independent facts meet here, and only here: whether the guest fixes its
-// own wall clock, which is a property of the image and is recorded with it, and
-// whether this host's Firecracker can be asked to freeze the clock, which is a
-// property of the binary and changes under a running daemon. Keeping them apart
-// is what lets a host with an older binary restore a marked guest the legacy way
-// while leaving its marker intact for a host that can honour it.
+// Two independent facts meet here, and only here: whether the image holds a
+// frozen workload from a guest that fixes its own wall clock, which is a
+// property of the image and is recorded with it, and whether this host's
+// Firecracker can be asked to freeze the clock, which is a property of the
+// binary and changes under a running daemon. Keeping them apart is what lets a
+// host with an older binary restore a marked guest the legacy way while leaving
+// its manifest intact for a host that can honour it.
 //
 // nil means "restore the flags the snapshot itself carries" — the behaviour that
 // predates the flag, and the only one valid for every snapshot. A non-nil false
@@ -156,8 +163,8 @@ func resumeWallClockProperty(memPath, basePath, pausedMemPath string, recorded *
 //
 // It never returns true: advancing the guest clock by elapsed wall time is the
 // behaviour being fixed, so nothing here should be able to ask for it.
-func (m *Manager) clockPolicyFor(correctsWallClock bool) *bool {
-	if !m.cfg.GuestClockFreezeEnabled || !correctsWallClock || !m.clockRealtimeCapable.Load() {
+func (m *Manager) clockPolicyFor(workloadFrozen bool) *bool {
+	if !m.cfg.GuestClockFreezeEnabled || !workloadFrozen || !m.clockRealtimeCapable.Load() {
 		return nil
 	}
 	freeze := false
