@@ -14,23 +14,27 @@
 # holds far too many images for a walk at every start, so the witness has to
 # be there before the image is.
 set -u
+LC_ALL=C
+export LC_ALL
 BIN="${1:-/usr/local/bin/vmd}"
 WAKE_EVIDENCE=/var/lib/sandbox/wake-protocol-evidence
 
-# One stat. Absent: no frozen image has ever been about to exist here, and
-# any vmd may start. A directory that exists but cannot be read is not
-# absence: refuse rather than guess.
-dir=$(dirname "$WAKE_EVIDENCE")
-if [ -d "$dir" ] && { [ ! -r "$dir" ] || [ ! -x "$dir" ]; }; then
-    echo "vmd-wake-floor-guard: cannot read ${dir}; refusing to start a vmd whose wake capability cannot be checked against it" >&2
-    exit 1
-fi
-if [ ! -e "$WAKE_EVIDENCE" ]; then
-    exit 0
+# One lookup. Only a lookup that says the file does not exist admits any vmd:
+# no frozen image has ever been about to exist here. A lookup that fails any
+# other way — an ancestor that cannot be traversed, a symlink loop — is not
+# absence, and is treated as presence: only a binary that can wake such
+# images may start. (A test for existence alone cannot tell the two apart.)
+lookup=$(stat -L "$WAKE_EVIDENCE" 2>&1 >/dev/null)
+if [ $? -ne 0 ]; then
+    case "$lookup" in
+        *"No such file or directory"*) exit 0 ;;
+        *) echo "vmd-wake-floor-guard: cannot look up ${WAKE_EVIDENCE} (${lookup}); only a wake-capable vmd may start" >&2 ;;
+    esac
 fi
 
-# Evidence present: only a binary carrying the capability may start. One
-# pass over the binary, bounded by its size; a grep that cannot run refuses.
+# Evidence present, or unknowable: only a binary carrying the capability may
+# start. One pass over the binary, bounded by its size; a grep that cannot
+# run refuses.
 if grep -qa wake-protocol-1 "$BIN" 2>/dev/null; then
     exit 0
 fi

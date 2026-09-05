@@ -88,6 +88,20 @@ func TestWakeFloorGuard(t *testing.T) {
 			t.Fatalf("capable binary refused: %s", out)
 		}
 	})
+	// A lookup that fails any other way than "no such file" is not absence:
+	// an incapable binary is refused, a capable one still starts.
+	t.Run("an_unknowable_marker_refuses_an_incapable_binary", func(t *testing.T) {
+		w := newWakeGuardWorld(t)
+		if err := os.Symlink(w.evidence, w.evidence); err != nil { // a loop
+			t.Fatal(err)
+		}
+		if ok, out := w.run(w.binary("old-vmd", false)); ok || !strings.Contains(out, "cannot look up") {
+			t.Fatalf("incapable binary admitted over an unknowable marker: ok=%v %s", ok, out)
+		}
+		if ok, out := w.run(w.binary("new-vmd", true)); !ok {
+			t.Fatalf("capable binary refused over an unknowable marker: %s", out)
+		}
+	})
 	t.Run("evidence_with_a_missing_binary_refuses", func(t *testing.T) {
 		w := newWakeGuardWorld(t)
 		if err := os.WriteFile(w.evidence, nil, 0o644); err != nil {
