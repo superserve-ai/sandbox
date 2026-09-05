@@ -313,20 +313,29 @@ func (r *Registry) Invalidate(hostID string) {
 // MarkVerified records a host row read the caller has just performed and
 // the address it saw, so the dispatch that follows finds a verified client
 // instead of blocking on a row read of its own. A cached client at the same
-// address has its lease renewed in place. No client yet, or a moved address,
-// resolves now (row read plus dial) under the usual generation guards; a
-// resolution failure is logged and leaves ClientFor to fail closed as before.
+// address has its lease renewed in place. A cached client at a DIFFERENT
+// address is dropped first — the row just said the host moved, so that
+// client must not survive as a within-lease fallback should the resolution
+// below fail to read — and then, as with no client at all, the host is
+// resolved now (row read plus dial) under the usual generation guards. A
+// resolution failure is logged and leaves ClientFor to fail closed.
 func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
 	if addr == "" {
 		return
 	}
 	r.mu.Lock()
-	if e, ok := r.clients[hostID]; ok && e.addr == addr {
-		now := time.Now()
-		e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
-		r.clients[hostID] = e
-		r.mu.Unlock()
-		return
+	if e, ok := r.clients[hostID]; ok {
+		if e.addr == addr {
+			now := time.Now()
+			e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
+			r.clients[hostID] = e
+			r.mu.Unlock()
+			return
+		}
+		log.Warn().Str("host_id", hostID).Str("old_addr", e.addr).Str("new_addr", addr).
+			Msg("host address changed; dropping the cached client before re-resolving")
+		delete(r.clients, hostID)
+		r.gens[hostID]++
 	}
 	r.mu.Unlock()
 	if _, err := r.resolveClient(ctx, hostID); err != nil {

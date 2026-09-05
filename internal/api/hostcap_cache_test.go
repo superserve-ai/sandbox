@@ -245,3 +245,20 @@ func TestHostCapCacheDisabled(t *testing.T) {
 		t.Fatalf("DB reads = %d, want 3 (TTL=0 must disable caching)", got)
 	}
 }
+
+// The TTL is the drain admission bound, so configuration can shorten or
+// disable it but never stretch it past the cap.
+func TestHostCapCacheTTLClamped(t *testing.T) {
+	for raw, want := range map[string]time.Duration{
+		"":    defaultHostCapCacheTTL,
+		"5s":  5 * time.Second,
+		"0":   0,
+		"10m": maxHostCapCacheTTL,
+		"bad": defaultHostCapCacheTTL,
+	} {
+		t.Setenv("HOST_CAPABILITY_CACHE_TTL", raw)
+		if got := hostCapCacheTTLFromEnv(); got != want {
+			t.Fatalf("HOST_CAPABILITY_CACHE_TTL=%q: ttl = %v, want %v", raw, got, want)
+		}
+	}
+}

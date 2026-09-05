@@ -34,16 +34,22 @@ const hostCapQueryTimeout = 5 * time.Second
 // capability sets; puts sweep expired entries, so memory tracks the active
 // fleet.
 const (
-	// The TTL also bounds how long a just-fenced host or dropped capability
-	// can keep passing this pre-flight (the create path already tolerates the
-	// scheduler cache's 30s for placement).
+	// The TTL bounds how long a just-fenced host or dropped capability can
+	// keep passing this pre-flight. That bound is load-bearing for drains:
+	// the scheduler's candidate set is served at any age, so this cache is
+	// what stops a replica admitting creates onto a host that left rotation.
+	// hostctl's drain convergence window is derived from TTL + grace + the
+	// query bound, which is why the TTL is capped below.
 	defaultHostCapCacheTTL = 10 * time.Second
+	maxHostCapCacheTTL     = 30 * time.Second
 	hostCapCacheStaleGrace = 2 * time.Second
 )
 
 // hostCapCacheTTLFromEnv reads HOST_CAPABILITY_CACHE_TTL (a Go duration,
-// e.g. "30s"). Unset or unparsable falls back to the default; a non-positive
-// duration disables caching.
+// e.g. "5s"). Unset or unparsable falls back to the default; a non-positive
+// duration disables caching; anything above maxHostCapCacheTTL is clamped to
+// it, so an operator can shorten the admission bound but not stretch it past
+// what drain --wait budgets for.
 func hostCapCacheTTLFromEnv() time.Duration {
 	raw := os.Getenv("HOST_CAPABILITY_CACHE_TTL")
 	if raw == "" {
@@ -53,7 +59,7 @@ func hostCapCacheTTLFromEnv() time.Duration {
 	if err != nil {
 		return defaultHostCapCacheTTL
 	}
-	return d
+	return min(d, maxHostCapCacheTTL)
 }
 
 type hostCapEntry struct {

@@ -159,6 +159,13 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	startGen := s.gen
 	s.mu.RUnlock()
 
+	// An expired set that cannot place anything is reloaded in line rather
+	// than served: serving it would refuse a create the DB may already be
+	// able to place, and the refresh behind that refusal would only help the
+	// next one.
+	if cached && time.Since(entry.cachedAt) >= s.ttl() && s.cannotPlace(entry) {
+		cached = false
+	}
 	if cached {
 		if time.Since(entry.cachedAt) >= s.ttl() && s.refreshing.CompareAndSwap(false, true) {
 			// Detached: the refresh outlives the triggering request. On error the
@@ -191,8 +198,8 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Double-check: another blocked caller may have loaded this capability
-	// set while we waited.
-	if entry, ok := s.cache[key]; ok {
+	// set while we waited; an expired unplaceable one is what we replace.
+	if entry, ok := s.cache[key]; ok && !(time.Since(entry.cachedAt) >= s.ttl() && s.cannotPlace(entry)) {
 		return entry, nil
 	}
 	fillCtx, fillCancel := context.WithTimeout(ctx, hostsFillTimeout)
@@ -209,6 +216,18 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	}
 	s.cache[key] = fresh
 	return fresh, nil
+}
+
+// cannotPlace reports whether SelectHost would refuse every create from this
+// entry: no candidates, and no default-host fallback that would apply.
+func (s *LeastLoaded) cannotPlace(e hostCacheEntry) bool {
+	if len(e.hosts) > 0 {
+		return false
+	}
+	if s.DefaultHostID == "" {
+		return true
+	}
+	return e.defaultStatus != "missing" && e.defaultStatus != "active"
 }
 
 func capabilityCacheKey(capabilities []string) (string, []string) {

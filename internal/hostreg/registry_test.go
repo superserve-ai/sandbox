@@ -752,3 +752,47 @@ func TestMarkVerifiedColdResolvesOnce(t *testing.T) {
 		t.Fatalf("dials = %d, want 1", dials.Load())
 	}
 }
+
+// The row just reported a new address: the client at the old one must not
+// survive as a within-lease fallback when the re-resolution's read fails.
+func TestMarkVerifiedMovedAddressFailsClosedWhenReadFails(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	store.setFailRead(true)
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051")
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("ClientFor served the client at the old address after the row reported a move")
+	}
+}
+
+// A moved address re-resolves: one read, one fresh dial, and the next
+// dispatch goes to the new machine without a further read.
+func TestMarkVerifiedMovedAddressRedials(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		dialed = append(dialed, addr)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	store.setAddr("10.0.0.2:50051")
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051")
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor after move: %v", err)
+	}
+	if want := []string{"10.0.0.1:50051", "10.0.0.2:50051"}; fmt.Sprint(dialed) != fmt.Sprint(want) {
+		t.Fatalf("dialed = %v, want %v", dialed, want)
+	}
+	if n := store.readCount(); n != 2 {
+		t.Fatalf("reads = %d, want 2 (prime + the move's re-resolution)", n)
+	}
+}

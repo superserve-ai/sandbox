@@ -2087,18 +2087,17 @@ func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (h
 		return "", false
 	}
 	SetTelemetryHostID(c, hostID)
-	if h.Scheduler != nil {
-		eligible, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
-		if err == nil && !eligible {
-			log.Warn().Str("host_id", hostID).Msg("scheduled host failed the pre-flight; reloading candidates and selecting again")
-			h.Scheduler.Invalidate()
-			if hostID, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
-				return "", false
-			}
-			SetTelemetryHostID(c, hostID)
+	eligible, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
+	if err == nil && !eligible && h.Scheduler != nil {
+		log.Warn().Str("host_id", hostID).Msg("scheduled host failed the pre-flight; reloading candidates and selecting again")
+		h.Scheduler.Invalidate()
+		if hostID, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
+			return "", false
 		}
+		SetTelemetryHostID(c, hostID)
+		eligible, err = h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
 	}
-	if !h.requireHostPreviewCapabilities(c, hostID, requiredCapabilities...) {
+	if !h.respondHostCapabilityResult(c, hostID, requiredCapabilities, eligible, err) {
 		return "", false
 	}
 	return hostID, true

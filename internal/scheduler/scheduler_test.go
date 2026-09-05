@@ -192,9 +192,10 @@ func TestLeastLoadedCachesCandidateSetsByCanonicalCapabilities(t *testing.T) {
 
 // hostStore is a fake db.DBTX serving one host row per Query and counting calls.
 type hostStore struct {
-	calls       atomic.Int64
-	block       chan struct{} // non-nil: Query waits until closed
-	blockOnCall int64         // 0 = block every call; N = block only the Nth
+	calls          atomic.Int64
+	block          chan struct{} // non-nil: Query waits until closed
+	blockOnCall    int64         // 0 = block every call; N = block only the Nth
+	emptyUntilCall int64         // calls up to and including this one return no hosts
 }
 
 func (h *hostStore) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
@@ -206,7 +207,7 @@ func (h *hostStore) Query(context.Context, string, ...interface{}) (pgx.Rows, er
 	if h.block != nil && (h.blockOnCall == 0 || n == h.blockOnCall) {
 		<-h.block
 	}
-	return &hostRows{id: fmt.Sprintf("host-%d", n)}, nil
+	return &hostRows{id: fmt.Sprintf("host-%d", n), done: n <= h.emptyUntilCall}, nil
 }
 
 // hostRows yields a single minimal host row whose ID names the query that
@@ -485,5 +486,25 @@ func TestBlockingReloadNotClobberedBySlowRefresh(t *testing.T) {
 	}
 	if id != "host-3" {
 		t.Fatalf("older refresh clobbered the blocking reload: cached %s, want host-3", id)
+	}
+}
+
+// A cached set with nothing to place on is not served past its TTL: the
+// next select reloads in line and places on what the DB has now, instead of
+// refusing the create and only refreshing behind the refusal.
+func TestLoadHostsExpiredEmptySetReloadsInline(t *testing.T) {
+	store := &hostStore{emptyUntilCall: 1}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	if _, err := s.SelectHost(context.Background(), nil); err == nil {
+		t.Fatal("prime: expected no hosts available")
+	}
+	setCachedAtForTest(t, s, nil, time.Now().Add(-2*time.Minute))
+
+	id, err := s.SelectHost(context.Background(), nil)
+	if err != nil || id != "host-2" {
+		t.Fatalf("expired empty select = (%q, %v), want (host-2, nil)", id, err)
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("queries = %d, want 2 (one in-line reload)", n)
 	}
 }
