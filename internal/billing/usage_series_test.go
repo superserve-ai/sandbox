@@ -91,3 +91,23 @@ func TestUsageSeriesBucketsFractionalFallBack(t *testing.T) {
 		t.Fatalf("next bucket starts at %s, want distinct 01:30", b[2].Start.In(loc))
 	}
 }
+
+func TestUsageSeriesBucketsRepeatedHourStartPreservesOccurrence(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Paris")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Start during the first occurrence of the repeated 02:00 hour.
+	s := time.Date(2026, 10, 25, 0, 30, 0, 0, time.UTC)
+	e := s.Add(2 * time.Hour)
+	b, err := UsageSeriesBuckets(s, e, "hour", loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) == 0 || !b[0].Start.Equal(s) {
+		t.Fatalf("first bucket starts at %s, want %s", b[0].Start, s)
+	}
+	if got := b[0].End.Sub(b[0].Start); got != 30*time.Minute {
+		t.Fatalf("first bucket duration %s, want 30m", got)
+	}
+}

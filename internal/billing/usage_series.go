@@ -51,6 +51,15 @@ func UsageSeriesBuckets(start, end time.Time, granularity string, loc *time.Loca
 	local := start.In(loc)
 	if granularity == "hour" {
 		cur = time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), 0, 0, 0, loc)
+		// time.Date resolves an ambiguous wall-clock hour to one occurrence
+		// (typically the later, standard-time occurrence). Preserve the
+		// occurrence represented by start when that choice would place the
+		// bucket boundary after start.
+		if cur.After(start) {
+			_, startOffset := start.In(loc).Zone()
+			_, curOffset := cur.In(loc).Zone()
+			cur = cur.Add(time.Duration(curOffset-startOffset) * time.Second)
+		}
 	} else if granularity == "day" {
 		cur = time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc)
 	} else if granularity == "week" {
