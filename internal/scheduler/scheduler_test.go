@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -192,9 +192,10 @@ func TestLeastLoadedCachesCandidateSetsByCanonicalCapabilities(t *testing.T) {
 
 // hostStore is a fake db.DBTX serving one host row per Query and counting calls.
 type hostStore struct {
-	calls       atomic.Int64
-	block       chan struct{} // non-nil: Query waits until closed
-	blockOnCall int64         // 0 = block every call; N = block only the Nth
+	calls          atomic.Int64
+	block          chan struct{} // non-nil: Query waits until closed
+	blockOnCall    int64         // 0 = block every call; N = block only the Nth
+	emptyUntilCall int64         // calls up to and including this one return no hosts
 }
 
 func (h *hostStore) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
@@ -206,7 +207,7 @@ func (h *hostStore) Query(context.Context, string, ...interface{}) (pgx.Rows, er
 	if h.block != nil && (h.blockOnCall == 0 || n == h.blockOnCall) {
 		<-h.block
 	}
-	return &hostRows{id: fmt.Sprintf("host-%d", n)}, nil
+	return &hostRows{id: fmt.Sprintf("host-%d", n), done: n <= h.emptyUntilCall}, nil
 }
 
 // hostRows yields a single minimal host row whose ID names the query that
@@ -400,22 +401,45 @@ func TestInvalidateBeatsInFlightRefresh(t *testing.T) {
 	}
 }
 
-func TestLoadHostsPastGraceBlocksInsteadOfServingStale(t *testing.T) {
+// However old the cached set is, a select serves it without waiting on the
+// DB: an instance that has been idle for an hour must not pay a blocking
+// load on its next create, and the refresh rides behind the request.
+func TestLoadHostsAnyAgeServesStaleAndRefreshesBehind(t *testing.T) {
 	store := &hostStore{}
 	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
 	if _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("prime: %v", err)
 	}
 
-	// Way past ttl+grace (refreshes never landed): must block on a fresh
-	// load, not keep serving a possibly-dead host list.
+	// Hold the refresh (query 2) so a select that blocked on it would hang.
+	store.block = make(chan struct{})
+	store.blockOnCall = 2
 	setCachedAtForTest(t, s, nil, time.Now().Add(-time.Hour))
 
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {
-		t.Fatalf("past-grace select: %v", err)
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.SelectHost(context.Background(), nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("stale select: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("select blocked on the refresh instead of serving the stale set")
 	}
-	if n := store.calls.Load(); n != 2 {
-		t.Fatalf("past-grace select must reload synchronously, got %d queries", n)
+	close(store.block)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for s.refreshing.Load() || store.calls.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("background refresh never landed, calls=%d", store.calls.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if _, cachedAt, cached := readCacheForTest(s, nil); !cached || time.Since(cachedAt) > time.Minute {
+		t.Fatal("refresh must restore a fresh cachedAt")
 	}
 }
 
@@ -441,11 +465,11 @@ func TestBlockingReloadNotClobberedBySlowRefresh(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 
-	// Age past grace: the next call reloads synchronously (query 3) and must
+	// Invalidate: the next call reloads synchronously (query 3) and must
 	// retire the still-hanging refresh so its older result cannot land on top.
-	setCachedAtForTest(t, s, nil, time.Now().Add(-time.Hour))
+	s.Invalidate()
 	if _, err := s.SelectHost(context.Background(), nil); err != nil {
-		t.Fatalf("past-grace select: %v", err)
+		t.Fatalf("post-invalidate select: %v", err)
 	}
 	close(store.block) // the pre-reload refresh now returns
 
@@ -462,5 +486,25 @@ func TestBlockingReloadNotClobberedBySlowRefresh(t *testing.T) {
 	}
 	if id != "host-3" {
 		t.Fatalf("older refresh clobbered the blocking reload: cached %s, want host-3", id)
+	}
+}
+
+// A cached set with nothing to place on is not served past its TTL: the
+// next select reloads in line and places on what the DB has now, instead of
+// refusing the create and only refreshing behind the refusal.
+func TestLoadHostsExpiredEmptySetReloadsInline(t *testing.T) {
+	store := &hostStore{emptyUntilCall: 1}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	if _, err := s.SelectHost(context.Background(), nil); err == nil {
+		t.Fatal("prime: expected no hosts available")
+	}
+	setCachedAtForTest(t, s, nil, time.Now().Add(-2*time.Minute))
+
+	id, err := s.SelectHost(context.Background(), nil)
+	if err != nil || id != "host-2" {
+		t.Fatalf("expired empty select = (%q, %v), want (host-2, nil)", id, err)
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("queries = %d, want 2 (one in-line reload)", n)
 	}
 }

@@ -55,16 +55,25 @@ type stubVMD struct {
 
 type stubScheduler struct {
 	hostID   string
+	hosts    []string // when set, served in order ahead of hostID
 	err      error
 	required []string
+	selects  int
+	drops    int
 }
 
 func (s *stubScheduler) SelectHost(_ context.Context, required []string) (string, error) {
 	s.required = append([]string(nil), required...)
+	s.selects++
+	if len(s.hosts) > 0 {
+		id := s.hosts[0]
+		s.hosts = s.hosts[1:]
+		return id, s.err
+	}
 	return s.hostID, s.err
 }
 
-func (s *stubScheduler) Invalidate() {}
+func (s *stubScheduler) Invalidate() { s.drops++ }
 
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
 	if s.destroyFn != nil {
@@ -2252,8 +2261,47 @@ func TestCreateSandbox_RechecksCapabilitiesAfterSchedulerSelection(t *testing.T)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
 	}
-	if checks != 1 || inserted || restored {
-		t.Fatalf("post-selection result: checks=%d inserted=%v restored=%v", checks, inserted, restored)
+	// A rejected host drops the cached candidate set and selection runs once
+	// more on a fresh load; the same host coming back is re-checked and the
+	// create fails before any insert or boot.
+	if checks != 2 || scheduler.selects != 2 || scheduler.drops != 1 || inserted || restored {
+		t.Fatalf("post-selection result: checks=%d selects=%d drops=%d inserted=%v restored=%v",
+			checks, scheduler.selects, scheduler.drops, inserted, restored)
+	}
+}
+
+// A stale candidate set can name a host that has since left rotation. The
+// pre-flight rejects it, the set is dropped, and the create lands on the
+// host a fresh load returns instead of failing.
+func TestPlaceCreateReselectsWhenPreflightRejectsHost(t *testing.T) {
+	scheduler := &stubScheduler{hosts: []string{"host-gone", "host-live"}}
+	var checked []string
+	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+		if !strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			return errorRow(fmt.Errorf("unexpected query: %s", sql))
+		}
+		hostID := args[1].(string)
+		checked = append(checked, hostID)
+		return &mockRow{scanFn: func(dest ...any) error {
+			*dest[0].(*bool) = hostID == "host-live"
+			*dest[1].(*string) = "10.0.0.5:50051"
+			return nil
+		}}
+	}}
+	h := &Handlers{DB: db.New(mock), Scheduler: scheduler}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+
+	hostID, ok := h.placeCreate(c, []string{preview.HostCapabilityPorts})
+	if !ok || hostID != "host-live" {
+		t.Fatalf("placeCreate = (%q, %v), want (host-live, true); body: %s", hostID, ok, w.Body.String())
+	}
+	if scheduler.selects != 2 || scheduler.drops != 1 {
+		t.Fatalf("selects=%d drops=%d, want 2 and 1", scheduler.selects, scheduler.drops)
+	}
+	if !reflect.DeepEqual(checked, []string{"host-gone", "host-live"}) {
+		t.Fatalf("pre-flight reads = %v, want [host-gone host-live] (the live host's second check hits the cache)", checked)
 	}
 }
 
@@ -4000,5 +4048,50 @@ func TestCreateSandboxDeclaresResourceLimitsToVMD(t *testing.T) {
 	if vmd.restoreLimits.VCPU != uint32(tpl.Vcpu) || vmd.restoreLimits.MemoryMiB != uint32(tpl.MemoryMib) {
 		t.Fatalf("declared allocation = %d/%d, want the shape the row is inserted with (%d/%d)",
 			vmd.restoreLimits.VCPU, vmd.restoreLimits.MemoryMiB, tpl.Vcpu, tpl.MemoryMib)
+	}
+}
+
+// One pre-flight read per selected host, even with the cache disabled: the
+// result of the check is what the response is built from, not a second read.
+func TestPlaceCreateChecksCapabilitiesOncePerHost(t *testing.T) {
+	t.Setenv("HOST_CAPABILITY_CACHE_TTL", "0")
+	for _, tc := range []struct {
+		name       string
+		readErr    error
+		wantOK     bool
+		wantStatus int
+	}{
+		{name: "eligible", wantOK: true, wantStatus: http.StatusOK},
+		{name: "read fails", readErr: fmt.Errorf("connection reset"), wantStatus: http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reads int
+			mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+				if !strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+					return errorRow(fmt.Errorf("unexpected query: %s", sql))
+				}
+				reads++
+				if tc.readErr != nil {
+					return errorRow(tc.readErr)
+				}
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*bool) = true
+					*dest[1].(*string) = "10.0.0.5:50051"
+					return nil
+				}}
+			}}
+			h := &Handlers{DB: db.New(mock), Scheduler: &stubScheduler{hostID: "host-live"}}
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+
+			_, ok := h.placeCreate(c, []string{preview.HostCapabilityPorts})
+			if ok != tc.wantOK || w.Code != tc.wantStatus {
+				t.Fatalf("placeCreate ok=%v status=%d, want ok=%v status=%d", ok, w.Code, tc.wantOK, tc.wantStatus)
+			}
+			if reads != 1 {
+				t.Fatalf("pre-flight reads = %d, want 1", reads)
+			}
+		})
 	}
 }

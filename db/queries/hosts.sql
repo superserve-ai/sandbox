@@ -141,28 +141,35 @@ SELECT EXISTS (
 -- outside a mutation transaction: omitting the lock keeps concurrent checks
 -- from serializing behind the host's heartbeat writer. Transactional callers
 -- that must pin the host across a commit use HostHasCapabilities.
+--
+-- Also returns the host's VMD address (empty when the host is not active):
+-- the pre-flight already reads the row, so the caller can record it as the
+-- address verification the host registry would otherwise perform with a
+-- read of its own.
 WITH target_host AS MATERIALIZED (
-  SELECT id, last_heartbeat_at
+  SELECT id, vmd_addr, last_heartbeat_at
   FROM host
   WHERE id = sqlc.arg('host_id')
     AND status = 'active'
     AND last_heartbeat_at IS NOT NULL
 )
-SELECT EXISTS (
-  SELECT 1
-  FROM target_host h
-  WHERE NOT EXISTS (
+SELECT
+  EXISTS (
     SELECT 1
-    FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+    FROM target_host h
     WHERE NOT EXISTS (
       SELECT 1
-      FROM host_capability hc
-      WHERE hc.host_id = h.id
-        AND hc.capability = required.capability
-        AND hc.heartbeat_at = h.last_heartbeat_at
+      FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM host_capability hc
+        WHERE hc.host_id = h.id
+          AND hc.capability = required.capability
+          AND hc.heartbeat_at = h.last_heartbeat_at
+      )
     )
-  )
-);
+  ) AS has_capabilities,
+  COALESCE((SELECT vmd_addr FROM target_host), '')::text AS vmd_addr;
 
 -- name: MarkHostUnhealthy :exec
 UPDATE host

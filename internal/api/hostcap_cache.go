@@ -22,25 +22,34 @@ const hostCapQueryTimeout = 5 * time.Second
 
 // hostCapCache is an in-process, TTL-bounded, positive-only cache of host
 // capability attestations, fronting HostHasCapabilitiesUnlocked on the
-// standalone pre-flight paths. Same shape as apiKeyCache: only affirmative
-// results are cached (a missing capability or an error always re-reads, so a
-// capability 409 is always fresh), an expired entry is served for a short
-// grace while one background flight refreshes it, and concurrent misses
-// coalesce. The fail-closed gates (transactional validation, VMD's post-boot
+// standalone pre-flight paths. The read behind it is the one host-row read a
+// create pays when nothing is cached: it also returns the host's address,
+// which is handed to the host registry as that host's verification, so the
+// dispatch that follows does not read the row again. Same shape as
+// apiKeyCache: only affirmative results are cached (a missing capability or
+// an error always re-reads, so a capability 409 is always fresh), an expired
+// entry is served for a short grace while one background flight refreshes
+// it, and concurrent misses coalesce. The fail-closed gates (transactional validation, VMD's post-boot
 // attestation) do not go through this cache. Cardinality is hosts ×
 // capability sets; puts sweep expired entries, so memory tracks the active
 // fleet.
 const (
-	// The TTL also bounds how long a just-fenced host or dropped capability
-	// can keep passing this pre-flight (the create path already tolerates the
-	// scheduler cache's 30s for placement).
+	// The TTL bounds how long a just-fenced host or dropped capability can
+	// keep passing this pre-flight. That bound is load-bearing for drains:
+	// the scheduler's candidate set is served at any age, so this cache is
+	// what stops a replica admitting creates onto a host that left rotation.
+	// hostctl's drain convergence window is derived from TTL + grace + the
+	// query bound, which is why the TTL is capped below.
 	defaultHostCapCacheTTL = 10 * time.Second
+	maxHostCapCacheTTL     = 30 * time.Second
 	hostCapCacheStaleGrace = 2 * time.Second
 )
 
 // hostCapCacheTTLFromEnv reads HOST_CAPABILITY_CACHE_TTL (a Go duration,
-// e.g. "30s"). Unset or unparsable falls back to the default; a non-positive
-// duration disables caching.
+// e.g. "5s"). Unset or unparsable falls back to the default; a non-positive
+// duration disables caching; anything above maxHostCapCacheTTL is clamped to
+// it, so an operator can shorten the admission bound but not stretch it past
+// what drain --wait budgets for.
 func hostCapCacheTTLFromEnv() time.Duration {
 	raw := os.Getenv("HOST_CAPABILITY_CACHE_TTL")
 	if raw == "" {
@@ -50,7 +59,7 @@ func hostCapCacheTTLFromEnv() time.Duration {
 	if err != nil {
 		return defaultHostCapCacheTTL
 	}
-	return d
+	return min(d, maxHostCapCacheTTL)
 }
 
 type hostCapEntry struct {
@@ -136,7 +145,7 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 		start := time.Now()
 		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostCapQueryTimeout)
 		defer cancel()
-		has, err := h.DB.HostHasCapabilitiesUnlocked(qctx, params)
+		has, err := h.readHostCaps(qctx, params)
 		switch {
 		case err != nil:
 		case has:
@@ -157,6 +166,20 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 	}
 }
 
+// readHostCaps performs the pre-flight read and, on an affirmative answer,
+// records the address it returned with the host registry.
+func (h *Handlers) readHostCaps(ctx context.Context, params db.HostHasCapabilitiesUnlockedParams) (bool, error) {
+	readAt := time.Now()
+	row, err := h.DB.HostHasCapabilitiesUnlocked(ctx, params)
+	if err != nil {
+		return false, err
+	}
+	if row.HasCapabilities && h.Hosts != nil {
+		h.Hosts.MarkVerified(ctx, params.HostID, row.VmdAddr, readAt)
+	}
+	return row.HasCapabilities, nil
+}
+
 func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string, capabilities []string) (bool, error) {
 	c := &h.hostCaps
 	c.init()
@@ -168,7 +191,7 @@ func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string,
 		// unbounded read here would silently break that arithmetic.
 		qctx, cancel := context.WithTimeout(ctx, hostCapQueryTimeout)
 		defer cancel()
-		return h.DB.HostHasCapabilitiesUnlocked(qctx, params)
+		return h.readHostCaps(qctx, params)
 	}
 	sorted := append([]string(nil), capabilities...)
 	sort.Strings(sorted)

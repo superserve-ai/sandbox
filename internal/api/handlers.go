@@ -132,6 +132,10 @@ type HostRegistry interface {
 	// re-reads the host row. Callers that change a host's address must
 	// invalidate, or RPCs keep flowing to the previous machine.
 	Invalidate(hostID string)
+	// MarkVerified records a host row read the caller has just performed —
+	// the address it saw and when the read began — so the next ClientFor
+	// need not read the row itself.
+	MarkVerified(ctx context.Context, hostID, addr string, readAt time.Time)
 }
 
 // Handlers holds shared dependencies for all route handlers.
@@ -2050,6 +2054,56 @@ func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uui
 	return out
 }
 
+// selectCreateHost picks the host for a new sandbox: the scheduler when one
+// is wired, else the configured default. Writes the error response and
+// returns ok=false when no host is available.
+func (h *Handlers) selectCreateHost(c *gin.Context, requiredCapabilities []string) (hostID string, ok bool) {
+	switch {
+	case h.Scheduler != nil:
+		hostID, err := h.Scheduler.SelectHost(c.Request.Context(), requiredCapabilities)
+		if err != nil {
+			log.Error().Err(err).Msg("scheduler SelectHost failed")
+			respondErrorMsg(c, "service_unavailable", "No hosts available", http.StatusServiceUnavailable)
+			return "", false
+		}
+		return hostID, true
+	case h.Config != nil && h.Config.DefaultHostID != "":
+		return h.Config.DefaultHostID, true
+	default:
+		return "default", true
+	}
+}
+
+// placeCreate selects a host and re-attests it after placement. The
+// scheduler's candidate set is a cached hint that may be arbitrarily stale;
+// the pre-flight reads the chosen host's current status and capabilities
+// (one row read when nothing is cached, and it doubles as the registry's
+// address verification). When that read rejects the host, the candidate set
+// is dropped and selection runs once more on a fresh load before the request
+// fails, so a host that left rotation costs one extra read, never a failed
+// create. VMD's post-boot policy attestation remains the fail-closed gate.
+// Writes the error response and returns ok=false on failure.
+func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (hostID string, ok bool) {
+	if hostID, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
+		return "", false
+	}
+	SetTelemetryHostID(c, hostID)
+	eligible, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
+	if err == nil && !eligible && h.Scheduler != nil {
+		log.Warn().Str("host_id", hostID).Msg("scheduled host failed the pre-flight; reloading candidates and selecting again")
+		h.Scheduler.Invalidate()
+		if hostID, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
+			return "", false
+		}
+		SetTelemetryHostID(c, hostID)
+		eligible, err = h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
+	}
+	if !h.respondHostCapabilityResult(c, hostID, requiredCapabilities, eligible, err) {
+		return "", false
+	}
+	return hostID, true
+}
+
 func (h *Handlers) CreateSandbox(c *gin.Context) {
 	tHandler := time.Now()
 	// total is based on the auth boundary so it covers a slow cache miss;
@@ -2269,29 +2323,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if previewAccess == preview.AccessPrivate {
 		requiredCapabilities = previewBrowserCapabilities()
 	}
-	if h.Scheduler != nil {
-		hostID, err = h.Scheduler.SelectHost(c.Request.Context(), requiredCapabilities)
-		if err != nil {
-			log.Error().Err(err).Msg("scheduler SelectHost failed")
-			respondErrorMsg(c, "service_unavailable", "No hosts available", http.StatusServiceUnavailable)
-			return
-		}
-	} else if h.Config != nil && h.Config.DefaultHostID != "" {
-		hostID = h.Config.DefaultHostID
-	} else {
-		hostID = "default"
-	}
-	SetTelemetryHostID(c, hostID)
-
-	// Re-attest after placement. The scheduler cache and the default-host path
-	// are only hints; this re-check is fresher (attestation-cache TTL vs the
-	// scheduler's candidate TTL), and VMD's post-boot policy attestation
-	// remains the fail-closed gate.
-	if previewAccess == preview.AccessPrivate {
-		if !h.requireHostPreviewPortBrowserAuth(c, hostID) {
-			return
-		}
-	} else if !h.requireHostPreviewPorts(c, hostID) {
+	var placed bool
+	if hostID, placed = h.placeCreate(c, requiredCapabilities); !placed {
 		return
 	}
 

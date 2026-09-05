@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 // capMockHandlers returns a Handlers whose DB answers every capability read
@@ -21,11 +24,49 @@ func capMockHandlers(reads *atomic.Int64, answer *atomic.Bool) *Handlers {
 			reads.Add(1)
 			return &mockRow{scanFn: func(dest ...any) error {
 				*(dest[0].(*bool)) = answer.Load()
+				*(dest[1].(*string)) = "10.0.0.9:50051"
 				return nil
 			}}
 		},
 	}
 	return &Handlers{DB: db.New(mock)}
+}
+
+type verifyRecorder struct {
+	mu       sync.Mutex
+	verified []string
+}
+
+func (v *verifyRecorder) ClientFor(context.Context, string) (vmdclient.Client, error) {
+	return nil, fmt.Errorf("not used in this test")
+}
+func (v *verifyRecorder) Invalidate(string) {}
+func (v *verifyRecorder) MarkVerified(_ context.Context, hostID, addr string, _ time.Time) {
+	v.mu.Lock()
+	v.verified = append(v.verified, hostID+"="+addr)
+	v.mu.Unlock()
+}
+
+// The pre-flight read is also the host registry's address verification: an
+// affirmative answer hands the address over, a negative one does not.
+func TestHostCapReadVerifiesRegistryAddress(t *testing.T) {
+	var reads atomic.Int64
+	var answer atomic.Bool
+	answer.Store(true)
+	h := capMockHandlers(&reads, &answer)
+	reg := &verifyRecorder{}
+	h.Hosts = reg
+
+	if ok, err := h.hostHasCapabilitiesCached(context.Background(), "host-a", []string{"preview_ports_v1"}); err != nil || !ok {
+		t.Fatalf("positive: ok=%v err=%v", ok, err)
+	}
+	answer.Store(false)
+	if ok, err := h.hostHasCapabilitiesCached(context.Background(), "host-b", []string{"preview_ports_v1"}); err != nil || ok {
+		t.Fatalf("negative: ok=%v err=%v", ok, err)
+	}
+	if want := []string{"host-a=10.0.0.9:50051"}; !reflect.DeepEqual(reg.verified, want) {
+		t.Fatalf("verified = %v, want %v", reg.verified, want)
+	}
 }
 
 // A positive attestation must be served from cache within the TTL — the
@@ -202,5 +243,22 @@ func TestHostCapCacheDisabled(t *testing.T) {
 	}
 	if got := reads.Load(); got != 3 {
 		t.Fatalf("DB reads = %d, want 3 (TTL=0 must disable caching)", got)
+	}
+}
+
+// The TTL is the drain admission bound, so configuration can shorten or
+// disable it but never stretch it past the cap.
+func TestHostCapCacheTTLClamped(t *testing.T) {
+	for raw, want := range map[string]time.Duration{
+		"":    defaultHostCapCacheTTL,
+		"5s":  5 * time.Second,
+		"0":   0,
+		"10m": maxHostCapCacheTTL,
+		"bad": defaultHostCapCacheTTL,
+	} {
+		t.Setenv("HOST_CAPABILITY_CACHE_TTL", raw)
+		if got := hostCapCacheTTLFromEnv(); got != want {
+			t.Fatalf("HOST_CAPABILITY_CACHE_TTL=%q: ttl = %v, want %v", raw, got, want)
+		}
 	}
 }

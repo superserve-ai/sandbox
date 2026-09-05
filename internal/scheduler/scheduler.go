@@ -25,11 +25,11 @@ type Scheduler interface {
 const defaultCacheTTL = 30 * time.Second
 
 // hostsFillTimeout bounds every candidate-set fill, blocking and background
-// alike. This is a published contract, not just hygiene: a fill that reads
-// the host set before a drain commits and finishes after it stamps a
-// pre-drain view as fresh, so the drain's total staleness budget is
-// TTL + grace + THIS bound. hostctl's drain convergence window is derived
-// from that sum — widening this widens what --wait must cover.
+// alike. The candidate set is a placement hint served at any age; what keeps
+// a drained or retired host from taking a create is the per-create host
+// pre-flight (status and capabilities read fresh within its own TTL), so
+// this bound is hygiene for the fill itself rather than part of the drain
+// convergence budget.
 const hostsFillTimeout = 5 * time.Second
 
 // LeastLoaded picks the active host with the fewest running sandboxes
@@ -120,17 +120,6 @@ func (s *LeastLoaded) SelectHost(ctx context.Context, requiredCapabilities []str
 	return hosts[b].ID, nil
 }
 
-// hostsStaleGrace bounds how long an expired candidate set keeps being served
-// while refreshes run (or fail) in the background. Host health flows through
-// the DB, and every capability set is keyed independently, so persistent
-// refresh failures degrade to blocking loads instead of serving stale hosts
-// forever.
-const hostsStaleGrace = 30 * time.Second
-
-// loadHosts serves a cached capability-specific candidate set — stale
-// included, up to hostsStaleGrace — and refreshes it in the background once
-// the TTL lapses. The first call for a set, a post-Invalidate call, and any
-// call past the grace window block on a fresh load.
 // fillEntry loads the candidate set and, when it comes back empty, resolves
 // the default host's status in the same fill — one query per cache fill, not
 // one per create. Status changes reach the cache through Invalidate.
@@ -154,6 +143,15 @@ func (s *LeastLoaded) fillEntry(ctx context.Context, normalized []string) (hostC
 	return entry, nil
 }
 
+// loadHosts serves a cached capability-specific candidate set at any age and
+// refreshes it in the background once the TTL lapses. Only the first call for
+// a set and a post-Invalidate call block on a fresh load. A request that
+// finds the set expired never waits for the DB: it serves what it has and
+// the refresh rides along behind it. Serving a stale set is safe because the
+// create path re-reads the chosen host's status and capabilities before
+// dispatch and re-selects after an Invalidate when that read rejects it, so
+// a host that left rotation is at most one bounded pre-flight away from
+// being dropped, however old this cache is.
 func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []string) (hostCacheEntry, error) {
 	key, normalized := capabilityCacheKey(requiredCapabilities)
 	s.mu.RLock()
@@ -161,7 +159,11 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	startGen := s.gen
 	s.mu.RUnlock()
 
-	if cached && time.Since(entry.cachedAt) >= s.ttl()+hostsStaleGrace {
+	// An expired set that cannot place anything is reloaded in line rather
+	// than served: serving it would refuse a create the DB may already be
+	// able to place, and the refresh behind that refusal would only help the
+	// next one.
+	if cached && time.Since(entry.cachedAt) >= s.ttl() && s.cannotPlace(entry) {
 		cached = false
 	}
 	if cached {
@@ -195,15 +197,11 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Double-check: another blocked caller may have reloaded this capability
-	// set while we waited. A past-grace entry is what we are here to replace.
-	if entry, ok := s.cache[key]; ok && time.Since(entry.cachedAt) < s.ttl()+hostsStaleGrace {
+	// Double-check: another blocked caller may have loaded this capability
+	// set while we waited; an expired unplaceable one is what we replace.
+	if entry, ok := s.cache[key]; ok && !(time.Since(entry.cachedAt) >= s.ttl() && s.cannotPlace(entry)) {
 		return entry, nil
 	}
-	// Bound the blocking fill like the background refresh: fill duration
-	// extends how long a pre-drain read of the host set can be stamped as
-	// fresh after the drain commits, so ops tooling (hostctl --wait) can
-	// only budget for it if it has a hard ceiling.
 	fillCtx, fillCancel := context.WithTimeout(ctx, hostsFillTimeout)
 	fresh, err := s.fillEntry(fillCtx, normalized)
 	fillCancel()
@@ -218,6 +216,18 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	}
 	s.cache[key] = fresh
 	return fresh, nil
+}
+
+// cannotPlace reports whether SelectHost would refuse every create from this
+// entry: no candidates, and no default-host fallback that would apply.
+func (s *LeastLoaded) cannotPlace(e hostCacheEntry) bool {
+	if len(e.hosts) > 0 {
+		return false
+	}
+	if s.DefaultHostID == "" {
+		return true
+	}
+	return e.defaultStatus != "missing" && e.defaultStatus != "active"
 }
 
 func capabilityCacheKey(capabilities []string) (string, []string) {
