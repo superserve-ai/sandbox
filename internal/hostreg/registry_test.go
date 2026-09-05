@@ -796,3 +796,71 @@ func TestMarkVerifiedMovedAddressRedials(t *testing.T) {
 		t.Fatalf("reads = %d, want 2 (prime + the move's re-resolution)", n)
 	}
 }
+
+// A cold lookup that read the row before the host moved must not publish
+// that older address over a verification that observed the move while the
+// lookup was still dialing: MarkVerified supersedes it even with no client
+// cached, so the lookup re-reads and the newest address is what settles.
+func TestMarkVerifiedSupersedesColdLookupThatReadTheOldAddress(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dialStarted := make(chan struct{})
+	dialRelease := make(chan struct{})
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		if addr == "10.0.0.1:50051" {
+			close(dialStarted)
+			<-dialRelease // hold the cold dial open while the move is observed
+		}
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	<-dialStarted // the lookup read .1 and is dialing it
+	store.setAddr("10.0.0.2:50051")
+
+	verified := make(chan struct{})
+	go func() {
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051") // joins the lookup in flight
+		close(verified)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for { // MarkVerified bumps the generation before it joins; wait for that
+		r.mu.RLock()
+		gen := r.gens["host-a"]
+		r.mu.RUnlock()
+		if gen > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("MarkVerified never superseded the in-flight lookup")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(dialRelease)
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	<-verified
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != "10.0.0.1:50051" || got[1] != "10.0.0.2:50051" {
+		t.Fatalf("dial sequence = %v, want [.1 discarded, .2 published]", got)
+	}
+	r.mu.RLock()
+	settled := r.clients["host-a"].addr
+	r.mu.RUnlock()
+	if settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want the newer .2", settled)
+	}
+}
