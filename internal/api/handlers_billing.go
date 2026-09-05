@@ -468,6 +468,11 @@ func billingUsageSeriesTimezone(raw string) (*time.Location, error) {
 	if raw == "" {
 		return nil, errors.New("timezone is required")
 	}
+	// Local is a process-dependent alias, not an IANA timezone name. Accepting
+	// it would make bucket boundaries vary with the server's TZ configuration.
+	if raw == "Local" {
+		return nil, errors.New("invalid timezone")
+	}
 	return time.LoadLocation(raw)
 }
 
