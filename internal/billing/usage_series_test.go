@@ -111,3 +111,39 @@ func TestUsageSeriesBucketsRepeatedHourStartPreservesOccurrence(t *testing.T) {
 		t.Fatalf("first bucket duration %s, want 30m", got)
 	}
 }
+
+func TestUsageSeriesBucketsRepeatedMidnightPreservesOccurrence(t *testing.T) {
+	loc, err := time.LoadLocation("Antarctica/Vostok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first local midnight on this rollback occurs at 17:00Z; time.Date
+	// otherwise resolves it to the later 19:00Z occurrence.
+	start := time.Date(2023, 12, 17, 17, 30, 0, 0, time.UTC)
+	end := time.Date(2023, 12, 17, 19, 0, 0, 0, time.UTC)
+	for _, granularity := range []string{"day", "week"} {
+		b, err := UsageSeriesBuckets(start, end, granularity, loc)
+		if err != nil {
+			t.Fatalf("%s: %v", granularity, err)
+		}
+		if len(b) == 0 || !b[0].Start.Equal(start) || !b[0].End.Equal(end) {
+			t.Fatalf("%s: got %#v, want first bucket clipped to first midnight occurrence", granularity, b)
+		}
+	}
+}
+
+func TestUsageSeriesBucketsMultiHourForwardJump(t *testing.T) {
+	loc, err := time.LoadLocation("Antarctica/Casey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2020, 10, 3, 16, 30, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	b, err := UsageSeriesBuckets(start, end, "hour", loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) == 0 || !b[0].Start.Equal(start) {
+		t.Fatalf("got %#v, want a clipped bucket for the partially present local hour", b)
+	}
+}

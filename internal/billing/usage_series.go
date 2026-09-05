@@ -7,6 +7,19 @@ import (
 
 type UsageBucket struct{ Start, End time.Time }
 
+// preserveCalendarOccurrence keeps a calendar boundary in the occurrence of
+// the containing wall-clock date represented by start. time.Date chooses one
+// side of an ambiguous midnight; that choice can otherwise move the boundary
+// past start during a rollback.
+func preserveCalendarOccurrence(boundary, start time.Time) time.Time {
+	if !boundary.After(start) {
+		return boundary
+	}
+	_, startOffset := start.In(boundary.Location()).Zone()
+	_, boundaryOffset := boundary.In(boundary.Location()).Zone()
+	return boundary.Add(time.Duration(boundaryOffset-startOffset) * time.Second)
+}
+
 // advanceCalendar returns the next calendar boundary, accounting for civil
 // dates that do not exist in a timezone (for example, a skipped day).
 func advanceCalendar(cur time.Time, granularity string) time.Time {
@@ -59,6 +72,13 @@ func UsageSeriesBuckets(start, end time.Time, granularity string, loc *time.Loca
 			_, startOffset := start.In(loc).Zone()
 			_, curOffset := cur.In(loc).Zone()
 			cur = cur.Add(time.Duration(curOffset-startOffset) * time.Second)
+			// A forward transition can skip multiple wall-clock hours. In that
+			// case both values may share the new offset, so the offset correction
+			// above is insufficient; walk elapsed hourly boundaries back to the
+			// latest one not after start.
+			for cur.After(start) {
+				cur = cur.Add(-time.Hour)
+			}
 		}
 	} else if granularity == "day" {
 		cur = time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc)
@@ -69,6 +89,9 @@ func UsageSeriesBuckets(start, end time.Time, granularity string, loc *time.Loca
 		}
 	} else {
 		cur = time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, loc)
+	}
+	if granularity != "hour" {
+		cur = preserveCalendarOccurrence(cur, start)
 	}
 	// Include the containing calendar bucket, then continue until the range ends.
 	out := make([]UsageBucket, 0, 32)
