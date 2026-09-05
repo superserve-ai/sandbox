@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -105,9 +106,9 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		lookup := func(qctx context.Context) (apiKeyCacheEntry, error) {
 			var e apiKeyCacheEntry
 			err := pool.QueryRow(qctx,
-				"SELECT id, team_id, name, scopes, created_by, expires_at FROM api_key WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
+				"SELECT ak.id, ak.team_id, ak.name, ak.scopes, ak.created_by, ak.expires_at, p.email, p.provider, EXISTS (SELECT 1 FROM abuse_trusted_identities ati WHERE ati.auth_provider = lower(p.provider) AND ati.domain = lower(split_part(p.email, '@', 2)) AND ati.revoked_at IS NULL) FROM api_key ak LEFT JOIN profile p ON p.id = ak.created_by WHERE ak.key_hash = $1 AND ak.revoked_at IS NULL AND (ak.expires_at IS NULL OR ak.expires_at > now())",
 				keyHash,
-			).Scan(&e.id, &e.teamID, &e.name, &e.scopes, &e.createdBy, &e.expiresAt)
+			).Scan(&e.id, &e.teamID, &e.name, &e.scopes, &e.createdBy, &e.expiresAt, &e.identityDomain, &e.authProvider, &e.trustedIdentity)
 			if err != nil {
 				return apiKeyCacheEntry{}, err
 			}
@@ -206,6 +207,21 @@ func setAPIKeyContext(c *gin.Context, entry apiKeyCacheEntry) {
 	c.Set("team_id", entry.teamID)
 	if entry.createdBy.Valid && entry.name != consoleImpersonationKeyName {
 		c.Set("actor_id", uuid.UUID(entry.createdBy.Bytes))
+	}
+	if entry.identityDomain.Valid {
+		identity := strings.TrimSpace(entry.identityDomain.String)
+		if at := strings.LastIndexByte(identity, '@'); at >= 0 {
+			identity = identity[at+1:]
+		}
+		if identity != "" {
+			c.Set("identity_domain", identity)
+		}
+	}
+	if entry.authProvider.Valid && strings.TrimSpace(entry.authProvider.String) != "" {
+		c.Set("auth_provider", strings.TrimSpace(entry.authProvider.String))
+	}
+	if entry.trustedIdentity {
+		c.Set("trusted_identity", true)
 	}
 }
 

@@ -24,7 +24,8 @@ func (r *captureRecorder) RecordHostCapacity(context.Context, HostCapacity) {}
 
 func (r *captureRecorder) RecordBackupCoverage(context.Context, []BackupCoverage) {}
 
-func (r *captureRecorder) RecordDBPoolStats(context.Context, DBPoolStats) {}
+func (r *captureRecorder) RecordDBPoolStats(context.Context, DBPoolStats)                     {}
+func (r *captureRecorder) RecordAbuseEnforcementStats(context.Context, AbuseEnforcementStats) {}
 
 func (r *captureRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure) {}
 

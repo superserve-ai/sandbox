@@ -8,11 +8,13 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,6 +28,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/superserve-ai/sandbox/internal/abuse"
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/authz"
@@ -38,6 +41,42 @@ import (
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
+
+type abuseDecisionLog struct {
+	teamID  uuid.UUID
+	action  abuse.Action
+	allowed bool
+}
+
+var abuseDecisionLogs = make(chan abuseDecisionLog, 256)
+var lastAbuseDecisionLog atomic.Int64
+
+const abuseDecisionLogInterval = 10 * time.Second
+
+func init() {
+	go func() {
+		for event := range abuseDecisionLogs {
+			entry := log.With().Str("team_id", event.teamID.String()).Str("action", string(event.action)).Logger()
+			if event.allowed {
+				entry.Info().Msg("sandbox action would be denied by abuse enforcement cache")
+			} else {
+				entry.Warn().Msg("sandbox action denied by abuse enforcement cache")
+			}
+		}
+	}()
+}
+
+func enqueueAbuseDecisionLog(event abuseDecisionLog) {
+	now := time.Now().UnixNano()
+	last := lastAbuseDecisionLog.Load()
+	if now-last < abuseDecisionLogInterval.Nanoseconds() || !lastAbuseDecisionLog.CompareAndSwap(last, now) {
+		return
+	}
+	select {
+	case abuseDecisionLogs <- event:
+	default:
+	}
+}
 
 // VMDClient is the interface for talking to a VM daemon.
 type VMDClient = vmdclient.Client
@@ -184,6 +223,10 @@ type Handlers struct {
 	// billingElig caches the per-team eligibility gate consulted on every
 	// create/resume (see billing_elig_cache.go). Zero value is ready to use.
 	billingElig billingEligCache
+
+	// abuseEnforcement is a process-local, fail-open cache populated by async
+	// abuse reconciliation. It must remain free of database or network reads.
+	abuseEnforcement abuseEnforcementCache
 
 	// activationRecheck coalesces the per-team post-activation eligibility
 	// recheck: a 100-create burst asks the same question 100 times.
@@ -722,6 +765,9 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		case db.SandboxStatusActive:
 			return &sandbox, row.Access
 		case db.SandboxStatusPaused:
+			if !h.allowAbuseAction(c, teamID, abuse.ActionResume) {
+				return nil, ""
+			}
 			if !h.requireBillingEligible(c, teamID) {
 				return nil, ""
 			}
@@ -1192,8 +1238,9 @@ func (h *Handlers) reapplyNetworkConfig(ctx context.Context, vmd VMDClient, sand
 
 func (h *Handlers) Health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"status":  "ok",
-		"version": "0.1.0",
+		"status":   "ok",
+		"version":  "0.1.0",
+		"revision": os.Getenv("K_REVISION"),
 	})
 }
 
@@ -1238,6 +1285,59 @@ func actorIDFromContext(c *gin.Context) *uuid.UUID {
 		return nil
 	}
 	return &id
+}
+
+func (h *Handlers) allowAbuseAction(c *gin.Context, teamID uuid.UUID, action abuse.Action) bool {
+	userID := uuid.Nil
+	if actor := actorIDFromContext(c); actor != nil {
+		userID = *actor
+	}
+	allowed, matched := h.abuseEnforcement.Evaluate(abuseEnforcementRequest{
+		TeamID:          teamID,
+		UserID:          userID,
+		IP:              clientIP(c),
+		Domain:          requestDomainFromContext(c),
+		AuthProvider:    requestAuthProviderFromContext(c),
+		TrustedIdentity: requestTrustedIdentityFromContext(c),
+		Action:          action,
+	})
+	if matched && !allowed {
+		enqueueAbuseDecisionLog(abuseDecisionLog{teamID: teamID, action: action})
+		respondError(c, NewAppError("abuse_quarantine", "This action is not allowed.", http.StatusForbidden))
+		return false
+	}
+	if matched && allowed {
+		enqueueAbuseDecisionLog(abuseDecisionLog{teamID: teamID, action: action, allowed: true})
+	}
+	return true
+}
+
+func requestAuthProviderFromContext(c *gin.Context) string {
+	raw, _ := c.Get("auth_provider")
+	provider, _ := raw.(string)
+	return strings.TrimSpace(provider)
+}
+
+func requestTrustedIdentityFromContext(c *gin.Context) bool {
+	trusted, _ := c.Get("trusted_identity")
+	v, _ := trusted.(bool)
+	return v
+}
+
+func requestDomainFromContext(c *gin.Context) string {
+	// API-key auth does not currently expose an identity domain. Do not derive
+	// this from Request.Host: it is the transport destination, not identity.
+	// Reconciliation can materialize domain restrictions into team/user entries.
+	raw, _ := c.Get("identity_domain")
+	domain, ok := raw.(string)
+	if !ok || strings.TrimSpace(domain) == "" {
+		return ""
+	}
+	domain, err := abuse.NormalizeDomain(domain)
+	if err != nil {
+		return ""
+	}
+	return domain
 }
 
 // ownerIDFromContext returns the actor's UUID as a string, or "" when unknown.
@@ -1295,6 +1395,9 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 	if !h.requireTeamSandboxWrite(c, teamID) {
+		return
+	}
+	if !h.allowAbuseAction(c, teamID, abuse.ActionResume) {
 		return
 	}
 	if !h.requireBillingEligible(c, teamID) {
@@ -2197,6 +2300,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 	if !h.requireTeamSandboxWrite(c, teamID) {
+		return
+	}
+	if !h.allowAbuseAction(c, teamID, abuse.ActionCreate) {
 		return
 	}
 	if !h.requireBillingEligible(c, teamID) {

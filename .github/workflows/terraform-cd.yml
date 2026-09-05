@@ -523,7 +523,19 @@ jobs:
             echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
             exit 1
           fi
-          curl -sf "$(echo "$DESC" | jq -r '.status.url')/health" >/dev/null
+          LB_IP=$(gcloud compute addresses describe api-superserve-use4-ip \
+            --global --project "${{ vars.GCP_PROJECT }}" --format='value(address)')
+          if [ -z "$LB_IP" ]; then
+            echo "::error::us-east4 API forwarding-rule address is empty"
+            exit 1
+          fi
+          HEALTH=$(curl --fail --silent --show-error \
+            --resolve "api.superserve.ai:443:$LB_IP" \
+            "https://api.superserve.ai/health")
+          if ! jq -e --arg revision "$LATEST" '.revision == $revision' <<<"$HEALTH" >/dev/null; then
+            echo "::error::load balancer health endpoint is not serving deployed revision $LATEST: $HEALTH"
+            exit 1
+          fi
 
       - name: Smoke test production/us-east4
         run: |

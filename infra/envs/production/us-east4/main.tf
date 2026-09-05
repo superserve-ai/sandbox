@@ -14,6 +14,10 @@ terraform {
   }
 }
 
+data "google_compute_global_address" "api_forwarding_rule" {
+  name = "api-superserve-use4-ip"
+}
+
 provider "google" {
   project = local.project_id
   region  = local.region
@@ -153,6 +157,7 @@ module "api" {
   region                = local.region
   service_name          = "superserve-api-${local.resource_suffix}"
   service_account_email = data.google_service_account.api_runner.email
+  ingress               = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
   # First create must reference a tag that actually exists, or the initial
   # revision never goes ready and the apply fails. The other regions can carry
   # a ":replace-me" placeholder only because their services already exist and
@@ -179,13 +184,14 @@ module "api" {
   cpu_idle          = true
 
   env = {
-    API_PORT               = "8080"
-    EDGE_PROXY_DOMAIN      = "sandbox.superserve.ai"
-    SUPABASE_URL           = var.supabase_url
-    SECRETS_SIGNING_KEY_ID = "v1"
-    ALLOW_EPHEMERAL_SEED   = "0"
-    DB_MAX_CONNS           = "15"
-    VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
+    API_PORT                       = "8080"
+    EDGE_PROXY_DOMAIN              = "sandbox.superserve.ai"
+    EXTERNAL_LB_FORWARDING_RULE_IP = data.google_compute_global_address.api_forwarding_rule.address
+    SUPABASE_URL                   = var.supabase_url
+    SECRETS_SIGNING_KEY_ID         = "v1"
+    ALLOW_EPHEMERAL_SEED           = "0"
+    DB_MAX_CONNS                   = "15"
+    VMD_GRPC_ADDRESS               = format("%s:50051", local.active_vmd_ip)
     # The cell host's identity, alongside the address above. Same value as
     # metrics_host_id.
     DEFAULT_HOST_ID  = local.metrics_host_id
@@ -408,9 +414,10 @@ resource "google_compute_attached_disk" "sandbox_data" {
 module "observability" {
   source = "../../../modules/observability"
 
-  project_id               = local.project_id
-  environment              = local.environment
-  notification_channel_ids = var.notification_channel_ids
+  project_id                       = local.project_id
+  environment                      = local.environment
+  notification_channel_ids         = var.notification_channel_ids
+  abuse_enforcement_alerts_enabled = false
   compute_instance_cpu_alerts = {
     sandbox_host_b = {
       display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / CPU saturation"
