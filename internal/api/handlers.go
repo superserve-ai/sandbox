@@ -1173,22 +1173,18 @@ type persistedEgressConfig struct {
 
 // egressConfigJSON splits the request's egress entries into CIDRs and domains
 // and marshals the network_config jsonb shape persisted on the sandbox row.
-func egressConfigJSON(network *networkConfigRequest) (allowedCIDRs, allowedDomains []string, raw []byte) {
-	for _, entry := range network.AllowOut {
-		if isIPOrCIDR(entry) {
-			allowedCIDRs = append(allowedCIDRs, entry)
-		} else {
-			allowedDomains = append(allowedDomains, entry)
-		}
-	}
+// Entries are normalized (a bare IP becomes a /32) so what is persisted is
+// exactly what VMD can apply; see splitEgressEntries.
+func egressConfigJSON(network *networkConfigRequest) (allowedCIDRs, deniedCIDRs, allowedDomains []string, raw []byte) {
+	allowedCIDRs, deniedCIDRs, allowedDomains = splitEgressEntries(network.AllowOut, network.DenyOut)
 	raw, _ = json.Marshal(map[string]any{
 		"egress": map[string]any{
 			"allowed_cidrs":   allowedCIDRs,
-			"denied_cidrs":    network.DenyOut,
+			"denied_cidrs":    deniedCIDRs,
 			"allowed_domains": allowedDomains,
 		},
 	})
-	return allowedCIDRs, allowedDomains, raw
+	return allowedCIDRs, deniedCIDRs, allowedDomains, raw
 }
 
 // reapplyNetworkConfig reads the sandbox's persisted egress config and pushes
@@ -2698,7 +2694,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// rule fetch sees them before the agent can issue a proxied request. The
 	// nftables push happens later (it needs the booted VM); the DB write does not.
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
-		_, _, networkConfig := egressConfigJSON(req.Network)
+		_, _, _, networkConfig := egressConfigJSON(req.Network)
 		if err := h.DB.UpdateSandboxNetworkConfig(postCtx, db.UpdateSandboxNetworkConfigParams{
 			ID:            sandbox.ID,
 			NetworkConfig: networkConfig,
@@ -2753,6 +2749,23 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				l.Warn().Err(err).Msg("prime egress rules cache failed (fetch fallback)")
 			}
 		}()
+	}
+
+	// Network rules stay blocking: a 201 must imply "egress rules applied",
+	// so the client can't reach the sandbox before its policy is in place.
+	// This runs before the row goes active, and a failure tears the VM down.
+	// A sandbox that boots without the egress policy it was asked for would
+	// otherwise run with the default allow-all and still report success.
+	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+		// network_config was persisted above (before env injection); this
+		// only pushes the nftables rules, which need the booted VM.
+		allowedCIDRs, deniedCIDRs, allowedDomains, _ := egressConfigJSON(req.Network)
+		if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, deniedCIDRs, allowedDomains); err != nil {
+			l.Error().Err(err).Msg("failed to apply network rules at creation")
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+			respondError(c, ErrInternal)
+			return
+		}
 	}
 
 	// Single atomic transition: starting → active with real resources
@@ -2841,16 +2854,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		billingCancel()
 	})
 
-	// Network rules stay blocking: a 201 must imply "egress rules applied",
-	// so the client can't reach the sandbox before its policy is in place.
-	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
-		// network_config was persisted above (before env injection); this
-		// only pushes the nftables rules, which need the booted VM.
-		allowedCIDRs, allowedDomains, _ := egressConfigJSON(req.Network)
-		if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
-			l.Error().Err(err).Msg("failed to apply network rules at creation")
-		}
-	}
 	tPostDone = time.Now()
 
 	var createdMeta []byte
@@ -3278,15 +3281,8 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 	}
 
 	if body.Network != nil {
-		// Separate CIDRs and domains from allow_out.
-		var allowedCIDRs, allowedDomains []string
-		for _, entry := range body.Network.AllowOut {
-			if isIPOrCIDR(entry) {
-				allowedCIDRs = append(allowedCIDRs, entry)
-			} else {
-				allowedDomains = append(allowedDomains, entry)
-			}
-		}
+		// Separate CIDRs and domains from allow_out and normalize every CIDR.
+		allowedCIDRs, deniedCIDRs, allowedDomains := splitEgressEntries(body.Network.AllowOut, body.Network.DenyOut)
 
 		// Resolve the VMD client for this sandbox's host.
 		vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
@@ -3299,7 +3295,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		// Apply rules to the running VM via VMD.
 		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 		defer vmdCancel()
-		if err := vmd.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.Network.DenyOut, allowedDomains); err != nil {
+		if err := vmd.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, deniedCIDRs, allowedDomains); err != nil {
 			l.Error().Err(err).Msg("VMD UpdateSandboxNetwork failed")
 			respondError(c, ErrInternal)
 			return
@@ -3309,7 +3305,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		networkConfig, _ := json.Marshal(map[string]any{
 			"egress": map[string]any{
 				"allowed_cidrs":   allowedCIDRs,
-				"denied_cidrs":    body.Network.DenyOut,
+				"denied_cidrs":    deniedCIDRs,
 				"allowed_domains": allowedDomains,
 			},
 		})
@@ -3524,6 +3520,44 @@ func isIPOrCIDR(s string) bool {
 		return true
 	}
 	return false
+}
+
+// normalizeCIDR canonicalizes an IP or CIDR entry for the firewall. A bare
+// address becomes a single-host prefix ("1.1.1.1" -> "1.1.1.1/32"). The API
+// accepts both forms, but VMD's rule builder only parses prefixes, so an
+// entry that validates here and fails there would leave the sandbox with no
+// rules at all. Domains and unparseable strings are returned unchanged.
+func normalizeCIDR(s string) string {
+	if addr, err := netip.ParseAddr(s); err == nil {
+		// An IPv4-mapped address (::ffff:a.b.c.d) passes validation as v4 but
+		// would otherwise become a /128 the IPv4-only firewall skips.
+		addr = addr.Unmap()
+		return netip.PrefixFrom(addr, addr.BitLen()).String()
+	}
+	if prefix, err := netip.ParsePrefix(s); err == nil {
+		if prefix.Addr().Is4In6() && prefix.Bits() >= 96 {
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		return prefix.String()
+	}
+	return s
+}
+
+// splitEgressEntries separates allow_out into CIDRs and domains and
+// normalizes every CIDR (allow and deny) so the persisted config and the
+// rules pushed to VMD are the same canonical strings.
+func splitEgressEntries(allowOut, denyOut []string) (allowedCIDRs, deniedCIDRs, allowedDomains []string) {
+	for _, entry := range allowOut {
+		if isIPOrCIDR(entry) {
+			allowedCIDRs = append(allowedCIDRs, normalizeCIDR(entry))
+		} else {
+			allowedDomains = append(allowedDomains, entry)
+		}
+	}
+	for _, entry := range denyOut {
+		deniedCIDRs = append(deniedCIDRs, normalizeCIDR(entry))
+	}
+	return allowedCIDRs, deniedCIDRs, allowedDomains
 }
 
 // validateEgressRules enforces the rules shared between CreateSandbox and

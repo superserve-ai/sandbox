@@ -721,7 +721,21 @@ func cidrsToElements(cidrs []string) ([]nftables.SetElement, error) {
 	for _, cidr := range cidrs {
 		prefix, err := netip.ParsePrefix(cidr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
+			// Accept a bare address as a single-host prefix. The API
+			// normalizes these before they get here, but rows persisted
+			// before that normalization (and any other caller) must still
+			// apply cleanly rather than fail the whole rule set.
+			addr, addrErr := netip.ParseAddr(cidr)
+			if addrErr != nil {
+				return nil, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
+			}
+			addr = addr.Unmap()
+			prefix = netip.PrefixFrom(addr, addr.BitLen())
+		}
+		if prefix.Addr().Is4In6() && prefix.Bits() >= 96 {
+			// IPv4-mapped prefixes are IPv4 rules in disguise; apply them
+			// rather than dropping them with the real IPv6 entries.
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
 		}
 		if !prefix.Addr().Is4() {
 			continue
