@@ -375,19 +375,19 @@ jobs:
           # continuously while backups drain and can stall the uploader
           # if the (small) root disk fills.
           BACKUP_JOURNAL_PATH: /mnt/localssd/backup.db
-          # BACKUP_STAGING_DIR (moves staged generations off the
-          # local-SSD array onto the host's dedicated background-data
-          # disk — at BACKUP_UPLOAD_CONCURRENCY workers below, the
-          # sharpest remaining contention risk against tenant VM disk
-          # I/O on that array) is deliberately NOT set here yet. The
-          # Terraform disk is attached but not formatted or mounted —
-          # that step is manual (see host-dr-runbook.md) — and
-          # deploy-vmd.py's mount precondition refuses to deploy with
-          # this set against an absent mount, which would block every
-          # future deploy to this host until someone notices and preps
-          # it out of band. Enable once /mnt/sandbox-data is confirmed
-          # mounted here, matching the staged rollout already used for
-          # BACKUP_UPLOAD_CONCURRENCY below (validated on staging first).
+          # Moves staged generations off the local-SSD array onto the
+          # host's dedicated background-data disk — at
+          # BACKUP_UPLOAD_CONCURRENCY workers below, the sharpest
+          # contention risk against tenant VM disk I/O on that array,
+          # confirmed live in production: pause snapshot writes to
+          # md0 stalled from ~3s to 27-135s under a concurrent backfill
+          # sweep, exceeding the control plane's deadline and failing
+          # pauses outright. The disk is formatted (XFS) and mounted at
+          # /mnt/sandbox-data (fstab, not the staging host's migration
+          # unit — this disk holds only backup staging, nothing to
+          # migrate). deploy-vmd.py's mount precondition would refuse
+          # this deploy outright if that were not true.
+          BACKUP_STAGING_DIR: /mnt/sandbox-data/backup-staging
           # Drain workers to clear the cell's pause-backup backlog:
           # arrivals outpace the single-worker default here. Workers
           # share one bandwidth cap (task throughput rises, egress does
