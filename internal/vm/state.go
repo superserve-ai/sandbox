@@ -233,6 +233,13 @@ type VMRecord struct {
 	// record names, until the commit. A resume from an override that dies
 	// between the two returns to Paused with its own image and token intact.
 	WakeToken string `json:"wake_token,omitempty"`
+	// WakeSnapshotPath / WakeMemPath name the image the owed wake is for when
+	// it is not the one the record names: a resume from an override. A wake
+	// completed by recovery commits them as the record's image, so a retry of
+	// that resume finds the sandbox up instead of relaunching it; a wake that
+	// fails drops them and the record keeps its own image.
+	WakeSnapshotPath string `json:"wake_snapshot_path,omitempty"`
+	WakeMemPath      string `json:"wake_mem_path,omitempty"`
 	// WakeOwedFromPaused: the record owing the wake was Paused before this
 	// resume began, so its image is intact. A crash before the launch, or a
 	// wake that never completes, returns it to Paused; a create in the same
@@ -938,6 +945,8 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		ClockFrozen:                inst.ClockFrozen,
 		FreezeToken:                inst.FreezeToken,
 		WakeToken:                  inst.WakeToken,
+		WakeSnapshotPath:           inst.WakeSnapshotPath,
+		WakeMemPath:                inst.WakeMemPath,
 		WakeOwedFromPaused:         inst.WakeOwedFromPaused,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
@@ -1046,6 +1055,8 @@ func toInstance(rec VMRecord) *VMInstance {
 		ClockFrozen:                rec.ClockFrozen,
 		FreezeToken:                rec.FreezeToken,
 		WakeToken:                  rec.WakeToken,
+		WakeSnapshotPath:           rec.WakeSnapshotPath,
+		WakeMemPath:                rec.WakeMemPath,
 		WakeOwedFromPaused:         rec.WakeOwedFromPaused,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,

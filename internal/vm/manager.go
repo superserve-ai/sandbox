@@ -135,12 +135,14 @@ type VMInstance struct {
 	WakeOwedFromPaused bool
 	// FreezeToken is the token the image's freeze carries; a wake must present it.
 	FreezeToken string
-	// WakeToken: see VMRecord.
-	WakeToken string
-	CreatedAt time.Time
-	Metadata  map[string]string
-	TeamID    string // owning team; carried for data-plane usage attribution
-	OwnerID   string // creating user; empty when unknown
+	// WakeToken, WakeSnapshotPath, WakeMemPath: see VMRecord.
+	WakeToken        string
+	WakeSnapshotPath string
+	WakeMemPath      string
+	CreatedAt        time.Time
+	Metadata         map[string]string
+	TeamID           string // owning team; carried for data-plane usage attribution
+	OwnerID          string // creating user; empty when unknown
 	// PausedAt records when this VM last entered the paused state. It drives
 	// oldest-first pressure reclamation. Zero means the field is unset on a
 	// legacy record; callers fall back to CreatedAt and then place any fully
@@ -2422,7 +2424,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// next. The in-flight token goes with it.
 		restamped := inst.IP != entryIP || inst.Namespace != entryNS || inst.WakeToken != ""
 		inst.SocketPath, inst.IP, inst.TAPDevice, inst.MACAddress, inst.Namespace = entrySocket, entryIP, entryTAP, entryMAC, entryNS
-		inst.WakeToken = ""
+		inst.dropWakeImage()
 		inst.mu.Unlock()
 		if !revert && !restamped {
 			return
@@ -2472,6 +2474,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			inst.MACAddress = netInfo.MACAddress
 			inst.Namespace = nsName
 			inst.WakeToken = resumeToken
+			inst.WakeSnapshotPath, inst.WakeMemPath = snapshotPath, memPath
 			inst.mu.Unlock()
 			joinWakeOwed = m.persistWakeOwed(inst, predicted, resumePolicy != nil, true)
 			published = true
@@ -2549,7 +2552,8 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 					// Durably Error, never retried: the artifacts are retained,
 					// and nothing is owed, so recovery cannot return it to Paused.
 					inst.mu.Lock()
-					inst.WakePending, inst.WakeOwedFromPaused, inst.WakeToken = false, false, ""
+					inst.WakePending, inst.WakeOwedFromPaused = false, false
+					inst.dropWakeImage()
 					inst.mu.Unlock()
 					m.setStatus(vmID, StatusError)
 					return nil, status.Errorf(codes.FailedPrecondition, "image %q: %v", memPath, werr)
@@ -2598,7 +2602,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.CorrectsWallClock = &resumeCorrectsWallClock
 	inst.SnapshotWorkloadFrozen = &resumeWorkloadFrozen
 	inst.FreezeToken = resumeToken
-	inst.WakeToken = ""
+	inst.dropWakeImage()
 	inst.PausedAt = time.Time{}
 	// Record the file actually resumed from (callers may pass an explicit path
 	// that differs from the cached one) so the next pause's diff baseline matches
@@ -3958,7 +3962,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// Terminal: the Error written below must not owe a wake, or
 			// recovery would read it as a resume to return to Paused.
 			inst.mu.Lock()
-			inst.WakePending, inst.WakeOwedFromPaused, inst.WakeToken = false, false, ""
+			inst.WakePending, inst.WakeOwedFromPaused = false, false
+			inst.dropWakeImage()
 			inst.mu.Unlock()
 		}
 		// Emit the exhausted readiness wait immediately, before teardown, so
@@ -4089,7 +4094,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.Unverified = false
 	inst.WakePending = false
 	inst.WakeOwedFromPaused = false
-	inst.WakeToken = ""
+	inst.dropWakeImage()
 	// A frozen image kept its pause timestamp through the launch, so a
 	// failure could return it to Paused in its place in the reclaim order.
 	inst.PausedAt = time.Time{}
@@ -5109,7 +5114,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				log.Warn().Msg("resume interrupted before its launch — record returns to Paused")
 				rec.Status = StatusPaused
 				rec.WakePending, rec.ClockFrozen, rec.WakeOwedFromPaused, rec.Unverified = false, false, false, false
-				rec.WakeToken = ""
+				rec.WakeToken, rec.WakeSnapshotPath, rec.WakeMemPath = "", "", ""
 				if wrote, perr := m.state.PutIfPresent(rec); perr != nil || !wrote {
 					log.Warn().Err(perr).Bool("present", wrote).Msg("interrupted resume's record could not be returned to Paused")
 					return nil, false
@@ -8239,6 +8244,7 @@ func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string, inst *VM
 	ctx := context.WithoutCancel(callerCtx)
 	inst.mu.RLock()
 	pending, frozen, token := inst.WakePending, inst.ClockFrozen, inst.WakeToken
+	wakeSnap, wakeMem := inst.WakeSnapshotPath, inst.WakeMemPath
 	inst.mu.RUnlock()
 	if !pending {
 		return adoptionBoxdReady(ctx, m, ip)
@@ -8249,12 +8255,40 @@ func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string, inst *VM
 		}
 		return err
 	}
+	// The image this wake was owed for is the one running now. A resume
+	// from an override that died before its commit commits here, as its own
+	// commit would have: a retry of it then finds the sandbox up instead of
+	// relaunching over it. Its facts come from its manifest; one read, on
+	// the recovery path only.
+	var image *WallClockManifest
+	if wakeMem != "" {
+		image, _ = imageManifest(wakeMem)
+	}
 	inst.mu.Lock()
 	inst.WakePending = false
 	inst.WakeOwedFromPaused = false
-	inst.WakeToken = ""
+	if wakeMem != "" {
+		inst.SnapshotPath, inst.MemFilePath, inst.FreezeToken = wakeSnap, wakeMem, token
+		inst.BaseMemPath, _ = readLayeredBase(wakeMem)
+		frozen := true
+		inst.SnapshotWorkloadFrozen = &frozen
+		inst.CorrectsWallClock = nil // unresolved: the next pause asks the disk
+		if image != nil {
+			corrects := image.GuestCorrectsClock
+			inst.CorrectsWallClock = &corrects
+			inst.SnapshotWorkloadFrozen = &image.WorkloadFrozen
+			inst.ArtifactID = image.ArtifactID
+		}
+	}
+	inst.dropWakeImage()
 	inst.mu.Unlock()
 	return nil
+}
+
+// dropWakeImage forgets the image an owed wake was for. The caller holds
+// inst.mu.
+func (inst *VMInstance) dropWakeImage() {
+	inst.WakeToken, inst.WakeSnapshotPath, inst.WakeMemPath = "", "", ""
 }
 
 // releaseFrozenGuest thaws a workload a pause froze, after making sure the
@@ -8485,7 +8519,7 @@ func (m *Manager) parkUnservable(inst *VMInstance, terminal bool) {
 	if !terminal && inst.WakePending && inst.WakeOwedFromPaused {
 		inst.Status = StatusPaused
 		inst.WakePending, inst.ClockFrozen, inst.WakeOwedFromPaused, inst.Unverified = false, false, false, false
-		inst.WakeToken = ""
+		inst.dropWakeImage()
 	} else {
 		inst.Status = StatusError
 	}

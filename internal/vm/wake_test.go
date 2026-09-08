@@ -1075,7 +1075,7 @@ func TestInterruptedResumeReturnsToPaused(t *testing.T) {
 			// What a resume from an override leaves if vmd dies before its
 			// launch: the record's own image and token, and the override's
 			// token in flight.
-			rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "rec", WakeToken: "disk", WakeOwedFromPaused: tc.fromPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath, PausedAt: pausedAt}
+			rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "rec", WakeToken: "disk", WakeSnapshotPath: filepath.Join(dir, "other-vm.snap"), WakeMemPath: filepath.Join(dir, "other.snap"), WakeOwedFromPaused: tc.fromPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath, PausedAt: pausedAt}
 			if err := store.Put(rec); err != nil {
 				t.Fatal(err)
 			}
@@ -1091,8 +1091,8 @@ func TestInterruptedResumeReturnsToPaused(t *testing.T) {
 			if got == nil || got.Status != StatusPaused || got.WakePending || got.Unverified || got.WakeOwedFromPaused {
 				t.Fatalf("record = %+v, want Paused with nothing owed", got)
 			}
-			if got.FreezeToken != "rec" || got.WakeToken != "" {
-				t.Errorf("tokens freeze=%q wake=%q; want the record's own token kept and the in-flight one dropped", got.FreezeToken, got.WakeToken)
+			if got.FreezeToken != "rec" || got.WakeToken != "" || got.MemFilePath != memPath || got.WakeMemPath != "" {
+				t.Errorf("record = %+v; want its own image and token kept and the in-flight image dropped", got)
 			}
 			if !got.PausedAt.Equal(pausedAt) {
 				t.Errorf("PausedAt = %v, want the original %v kept for the reclaim order", got.PausedAt, pausedAt)
@@ -1414,5 +1414,71 @@ func TestFrozenResumeRollbackThatCannotPersistKeepsTheSlot(t *testing.T) {
 	defer inst.mu.RUnlock()
 	if inst.Status != StatusPaused {
 		t.Errorf("status %v, want Paused in memory", inst.Status)
+	}
+}
+
+// A resume from an override that died after loading the override and before
+// its commit: recovery wakes the override's guest, and the record must then
+// name the override as its image, or a retry of the same resume would miss
+// the already-running check and relaunch over the recovered guest.
+func TestRecoveredOverrideResumeCommitsTheImageItWoke(t *testing.T) {
+	useTempFloor(t)
+	origWake, origDown := boxdWakeGuest, vmUnitFullyDown
+	t.Cleanup(func() { boxdWakeGuest, vmUnitFullyDown = origWake, origDown })
+	vmUnitFullyDown = func(string) bool { return false }
+
+	dir := t.TempDir()
+	own := filepath.Join(dir, "mem.snap")
+	ownSnap := filepath.Join(dir, "vm.snap")
+	override := filepath.Join(dir, "other.snap")
+	overrideSnap := filepath.Join(dir, "other-vm.snap")
+	for _, p := range []string{own, ownSnap, override, overrideSnap} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedFrozenManifest(t, override, "disk")
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	rec := VMRecord{
+		ID: "vm-1", Status: StatusRunning, Unverified: true, Supervision: SupervisionUnit, IP: "10.0.0.2",
+		SnapshotPath: ownSnap, MemFilePath: own, FreezeToken: "rec",
+		WakePending: true, ClockFrozen: true, WakeOwedFromPaused: true,
+		WakeToken: "disk", WakeSnapshotPath: overrideSnap, WakeMemPath: override,
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	var sawToken string
+	boxdWakeGuest = func(_ context.Context, _ string, _ time.Duration, _ bool, token string) error {
+		sawToken = token
+		return nil
+	}
+	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
+	inst := mgr.reattachByID("vm-1", false)
+	if inst == nil || sawToken != "disk" {
+		t.Fatalf("inst=%v token=%q, want the override's guest woken with its token", inst, sawToken)
+	}
+	got, _ := store.Get("vm-1")
+	if got == nil || got.Status != StatusRunning || got.WakePending || got.MemFilePath != override || got.SnapshotPath != overrideSnap || got.FreezeToken != "disk" || got.WakeMemPath != "" || got.WakeToken != "" {
+		t.Fatalf("record = %+v; want the override committed as the record's image, nothing in flight", got)
+	}
+
+	// The lost reply's retry names the override: the sandbox is already up.
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		t.Fatal("the retry relaunched a recovered guest")
+		return 0, SupervisionUnit, nil
+	}
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	again, err := mgr.resumeVMLocked(context.Background(), "vm-1", overrideSnap, override, nil)
+	if err != nil || again != inst {
+		t.Fatalf("retry: err=%v same=%v; want the running instance returned as is", err, again == inst)
 	}
 }
