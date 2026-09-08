@@ -1423,9 +1423,11 @@ func TestFrozenResumeRollbackThatCannotPersistKeepsTheSlot(t *testing.T) {
 // the already-running check and relaunch over the recovered guest.
 func TestRecoveredOverrideResumeCommitsTheImageItWoke(t *testing.T) {
 	useTempFloor(t)
-	origWake, origDown := boxdWakeGuest, vmUnitFullyDown
-	t.Cleanup(func() { boxdWakeGuest, vmUnitFullyDown = origWake, origDown })
+	origWake, origDown, origDead := boxdWakeGuest, vmUnitFullyDown, vmDeadForRetry
+	t.Cleanup(func() { boxdWakeGuest, vmUnitFullyDown, vmDeadForRetry = origWake, origDown, origDead })
+	// The recovered guest's process is alive for the retry's liveness check.
 	vmUnitFullyDown = func(string) bool { return false }
+	vmDeadForRetry = func(*Manager, string) bool { return false }
 
 	dir := t.TempDir()
 	own := filepath.Join(dir, "mem.snap")
