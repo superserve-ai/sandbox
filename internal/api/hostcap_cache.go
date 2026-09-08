@@ -22,34 +22,29 @@ const hostCapQueryTimeout = 5 * time.Second
 
 // hostCapCache is an in-process, TTL-bounded, positive-only cache of host
 // capability attestations, fronting HostHasCapabilitiesUnlocked on the
-// standalone pre-flight paths. The read behind it is the one host-row read a
-// create pays when nothing is cached: it also returns the host's address,
-// which is handed to the host registry as that host's verification, so the
+// standalone pre-flight paths. The read behind it also returns the host's
+// address, handed to the host registry as that host's verification, so the
 // dispatch that follows does not read the row again. Same shape as
 // apiKeyCache: only affirmative results are cached (a missing capability or
 // an error always re-reads, so a capability 409 is always fresh), an expired
 // entry is served for a short grace while one background flight refreshes
-// it, and concurrent misses coalesce. The fail-closed gates (transactional validation, VMD's post-boot
-// attestation) do not go through this cache. Cardinality is hosts ×
-// capability sets; puts sweep expired entries, so memory tracks the active
-// fleet.
+// it, and concurrent misses coalesce. The fail-closed gates (transactional
+// validation, VMD's post-boot attestation) do not go through this cache.
+// Cardinality is hosts × capability sets; puts sweep expired entries, so
+// memory tracks the active fleet.
 const (
-	// The TTL bounds how long a just-fenced host or dropped capability can
-	// keep passing this pre-flight. That bound is load-bearing for drains:
-	// the scheduler's candidate set is served at any age, so this cache is
-	// what stops a replica admitting creates onto a host that left rotation.
-	// hostctl's drain convergence window is derived from TTL + grace + the
-	// query bound, which is why the TTL is capped below.
+	// The TTL bounds how long a fenced host or dropped capability can keep
+	// passing this pre-flight. With the scheduler's candidate set served at
+	// any age, this is the bound hostctl's drain convergence is derived from
+	// (TTL + grace + query bound), hence the cap below.
 	defaultHostCapCacheTTL = 10 * time.Second
 	maxHostCapCacheTTL     = 30 * time.Second
 	hostCapCacheStaleGrace = 2 * time.Second
 )
 
-// hostCapCacheTTLFromEnv reads HOST_CAPABILITY_CACHE_TTL (a Go duration,
-// e.g. "5s"). Unset or unparsable falls back to the default; a non-positive
-// duration disables caching; anything above maxHostCapCacheTTL is clamped to
-// it, so an operator can shorten the admission bound but not stretch it past
-// what drain --wait budgets for.
+// hostCapCacheTTLFromEnv reads HOST_CAPABILITY_CACHE_TTL (a Go duration).
+// Unset or unparsable falls back to the default, non-positive disables
+// caching, and anything above maxHostCapCacheTTL is clamped to it.
 func hostCapCacheTTLFromEnv() time.Duration {
 	raw := os.Getenv("HOST_CAPABILITY_CACHE_TTL")
 	if raw == "" {

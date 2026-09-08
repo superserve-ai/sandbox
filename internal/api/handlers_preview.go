@@ -346,10 +346,9 @@ func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string,
 	return h.respondHostCapabilityResult(c, hostID, capabilities, hasCapabilities, err)
 }
 
-// respondHostCapabilityResult turns a pre-flight outcome into the response:
-// an error is a 500, a rejection a 409 with diagnostics gathered off the
-// request. Returns true when the host passed. Split from the check so a
-// caller that already holds a result never pays the read twice.
+// respondHostCapabilityResult turns a pre-flight outcome into the response
+// (error → 500, rejection → 409 with diagnostics gathered off the request)
+// and returns true when the host passed.
 func (h *Handlers) respondHostCapabilityResult(c *gin.Context, hostID string, capabilities []string, hasCapabilities bool, err error) bool {
 	if err != nil {
 		log.Error().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).Msg("DB HostHasCapabilities failed")

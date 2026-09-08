@@ -284,10 +284,8 @@ type HostHasCapabilitiesUnlockedRow struct {
 // from serializing behind the host's heartbeat writer. Transactional callers
 // that must pin the host across a commit use HostHasCapabilities.
 //
-// Also returns the host's VMD address (empty when the host is not active):
-// the pre-flight already reads the row, so the caller can record it as the
-// address verification the host registry would otherwise perform with a
-// read of its own.
+// Also returns the host's VMD address (empty when the host is not active),
+// so the caller can record this read as the registry's address verification.
 func (q *Queries) HostHasCapabilitiesUnlocked(ctx context.Context, arg HostHasCapabilitiesUnlockedParams) (HostHasCapabilitiesUnlockedRow, error) {
 	row := q.db.QueryRow(ctx, hostHasCapabilitiesUnlocked, arg.RequiredCapabilities, arg.HostID)
 	var i HostHasCapabilitiesUnlockedRow

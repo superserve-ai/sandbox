@@ -25,11 +25,9 @@ type Scheduler interface {
 const defaultCacheTTL = 30 * time.Second
 
 // hostsFillTimeout bounds every candidate-set fill, blocking and background
-// alike. The candidate set is a placement hint served at any age; what keeps
-// a drained or retired host from taking a create is the per-create host
-// pre-flight (status and capabilities read fresh within its own TTL), so
-// this bound is hygiene for the fill itself rather than part of the drain
-// convergence budget.
+// alike. The candidate set is a placement hint; the per-create host
+// pre-flight is what keeps a drained host from taking a create, so this
+// bound is not part of the drain convergence budget.
 const hostsFillTimeout = 5 * time.Second
 
 // LeastLoaded picks the active host with the fewest running sandboxes
@@ -143,15 +141,11 @@ func (s *LeastLoaded) fillEntry(ctx context.Context, normalized []string) (hostC
 	return entry, nil
 }
 
-// loadHosts serves a cached capability-specific candidate set at any age and
-// refreshes it in the background once the TTL lapses. Only the first call for
-// a set and a post-Invalidate call block on a fresh load. A request that
-// finds the set expired never waits for the DB: it serves what it has and
-// the refresh rides along behind it. Serving a stale set is safe because the
-// create path re-reads the chosen host's status and capabilities before
-// dispatch and re-selects after an Invalidate when that read rejects it, so
-// a host that left rotation is at most one bounded pre-flight away from
-// being dropped, however old this cache is.
+// loadHosts serves the cached candidate set at any age and refreshes it in
+// the background once the TTL lapses; only the first call for a set and a
+// post-Invalidate call block on a load. Serving stale is safe because the
+// create path re-reads the chosen host before dispatch and re-selects after
+// an Invalidate when that read rejects it.
 func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []string) (hostCacheEntry, error) {
 	key, normalized := capabilityCacheKey(requiredCapabilities)
 	s.mu.RLock()
@@ -159,10 +153,8 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	startGen := s.gen
 	s.mu.RUnlock()
 
-	// An expired set that cannot place anything is reloaded in line rather
-	// than served: serving it would refuse a create the DB may already be
-	// able to place, and the refresh behind that refusal would only help the
-	// next one.
+	// An expired set with nothing to place on is reloaded in line: serving
+	// it would refuse a create the DB may already be able to place.
 	if cached && time.Since(entry.cachedAt) >= s.ttl() && s.cannotPlace(entry) {
 		cached = false
 	}

@@ -2073,15 +2073,12 @@ func (h *Handlers) selectCreateHost(c *gin.Context, requiredCapabilities []strin
 	}
 }
 
-// placeCreate selects a host and re-attests it after placement. The
-// scheduler's candidate set is a cached hint that may be arbitrarily stale;
-// the pre-flight reads the chosen host's current status and capabilities
-// (one row read when nothing is cached, and it doubles as the registry's
-// address verification). When that read rejects the host, the candidate set
-// is dropped and selection runs once more on a fresh load before the request
-// fails, so a host that left rotation costs one extra read, never a failed
-// create. VMD's post-boot policy attestation remains the fail-closed gate.
-// Writes the error response and returns ok=false on failure.
+// placeCreate selects a host and re-attests it: the candidate set may be
+// arbitrarily stale, so the pre-flight reads the chosen host's status and
+// capabilities (one row read when uncached, which also verifies its address
+// for the registry). A rejected host drops the candidate set and selection
+// runs once more before the request fails. Writes the error response and
+// returns ok=false on failure.
 func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (hostID string, ok bool) {
 	if hostID, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
 		return "", false

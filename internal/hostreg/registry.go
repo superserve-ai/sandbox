@@ -77,25 +77,16 @@ type Registry struct {
 	// always land mid-resolve and be observed. Grows one counter per host
 	// id ever seen (fleet-bounded).
 	gens map[string]uint64
-	// reported is the address a caller most recently handed to MarkVerified
-	// per host, reportSeq counts those reports, and reportConflictSeq is the
-	// sequence number of the latest report that DISAGREED with the one
-	// before it. Two row reads cannot be ordered from this side — a query
-	// that started first can execute last — so a report and a resolution's
-	// own read are never ranked on timing. Instead a resolution treats the
-	// reports that arrive WHILE its read is in flight as ambiguous: after
-	// the read returns it reads again before publishing if the latest such
-	// report disagrees with what the read saw, OR if those reports disagreed
-	// among themselves — a stale report that happens to echo the read must
-	// not erase an earlier one that contradicted it. The same check runs
-	// after the dial, for reports that arrive then. Identical reports set no
-	// conflict, so concurrent equivalent reports cannot starve a resolution;
-	// only a genuine conflict costs a re-read, and the fresh
-	// generation-guarded read is the sole authority.
-	// A report that contradicts the CACHED client drops it on the spot, and
-	// so does a conflict detected by a resolution, so nothing — the
-	// resolution's own within-lease fallback included — dispatches through
-	// a doubted address; if the confirming read fails, dispatch fails closed.
+	// reported is the address a caller most recently handed to MarkVerified,
+	// reportSeq counts those reports, and reportConflictSeq is the sequence of
+	// the latest report that disagreed with the one before it. Reads cannot be
+	// ordered from this side (a query that starts first can execute last), so
+	// a resolution never ranks a report against its own read by time. Reports
+	// that arrive while its read is in flight leave the address in doubt when
+	// the latest disagrees with the read or they disagreed among themselves;
+	// a doubted address drops its cached client and is re-read before anything
+	// publishes, so a failed confirmation fails closed. Identical reports set
+	// no conflict.
 	reported          map[string]string
 	reportSeq         map[string]uint64
 	reportConflictSeq map[string]uint64
@@ -269,11 +260,8 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				continue // invalidated mid-read; re-read the row
 			}
 			if r.reportedConflictLocked(hostID, seqAtRead, host.VmdAddr) {
-				// A report during the read disagrees with it: the address is
-				// in doubt. Drop any cached client NOW, before the re-read —
-				// if that read fails, neither this resolution's within-lease
-				// fallback nor any concurrent ClientFor may dispatch through
-				// an address a read has contradicted.
+				// In doubt: drop the cached client before the re-read so a
+				// failed confirmation fails closed for every caller.
 				delete(r.clients, hostID)
 				r.mu.Unlock()
 				continue
@@ -355,16 +343,11 @@ func (r *Registry) Invalidate(hostID string) {
 	r.mu.Unlock()
 }
 
-// MarkVerified records a host row read the caller has just performed and
-// the address it saw, so the dispatch that follows finds a verified client
-// instead of blocking on a row read of its own. The report is recorded for
-// any resolution in flight to check against (see reported). A cached client
-// at the reported address has its lease renewed in place. A cached client at
-// a DIFFERENT address is dropped — the row just said the host moved, and
-// that client must not survive as a within-lease fallback should the fresh
-// read fail — the generation is bumped so the resolution re-reads, and the
-// host is resolved now. A resolution failure is logged and leaves ClientFor
-// to fail closed.
+// MarkVerified records a host row read the caller has just performed and the
+// address it saw, so the dispatch that follows does not read the row itself.
+// A cached client at that address has its lease renewed; one at a different
+// address is dropped, never kept as a fallback, and the host is resolved now.
+// A resolution failure is logged and leaves ClientFor to fail closed.
 func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
 	if addr == "" {
 		return

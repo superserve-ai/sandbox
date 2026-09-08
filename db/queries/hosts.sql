@@ -142,10 +142,8 @@ SELECT EXISTS (
 -- from serializing behind the host's heartbeat writer. Transactional callers
 -- that must pin the host across a commit use HostHasCapabilities.
 --
--- Also returns the host's VMD address (empty when the host is not active):
--- the pre-flight already reads the row, so the caller can record it as the
--- address verification the host registry would otherwise perform with a
--- read of its own.
+-- Also returns the host's VMD address (empty when the host is not active),
+-- so the caller can record this read as the registry's address verification.
 WITH target_host AS MATERIALIZED (
   SELECT id, vmd_addr, last_heartbeat_at
   FROM host
