@@ -1498,22 +1498,27 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	var snapshotType string
 	var tSnapshot time.Time
 	var snapshotDur, stopDur time.Duration
-	// Deferred, gated on snapshot work having begun: a CreateSnapshot that
-	// burns seconds and then fails must land in the pause distributions —
-	// those are among the slowest pauses. The already-paused retry guard
-	// (before tSnapshot) still deliberately emits nothing.
+	// Deferred, gated on freeze or snapshot work having begun: a freeze that
+	// fails, or a CreateSnapshot that burns seconds and then fails, must land
+	// in the pause distributions — those are the pauses worth seeing. The
+	// already-paused retry guard (before either) still deliberately emits
+	// nothing.
 	var freezeDur time.Duration
+	var tFreeze time.Time
 	defer func() {
-		if tSnapshot.IsZero() {
+		if tSnapshot.IsZero() && tFreeze.IsZero() {
 			return
 		}
 		phases := map[string]time.Duration{"total": time.Since(tPause)}
+		if freezeDur == 0 && !tFreeze.IsZero() {
+			freezeDur = time.Since(tFreeze) // died inside the freeze
+		}
 		if freezeDur > 0 {
 			phases["freeze"] = freezeDur
 		}
 		if snapshotDur > 0 {
 			phases["snapshot"] = snapshotDur
-		} else {
+		} else if !tSnapshot.IsZero() {
 			phases["snapshot"] = time.Since(tSnapshot)
 		}
 		if stopDur > 0 {
@@ -1607,6 +1612,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	instBaseMem := inst.BaseMemPath
 	instMemFile := inst.MemFilePath
 	recordedCorrects := inst.CorrectsWallClock
+	recordedArtifact := inst.ArtifactID
 	instIP := inst.IP
 	diskPath := inst.DiskPath
 	diskBasePath := inst.Config.BasePath
@@ -1659,8 +1665,24 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// able to release it.
 	willFreeze := correctsWallClock && m.cfg.GuestClockFreezeEnabled && m.clockRealtimeCapable.Load() && !m.guestClockUnready.Load()
 	if willFreeze {
+		tFreeze = time.Now()
 		if err := ensureWakeProtocolFloor(); err != nil {
 			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record the rollback floor before freezing: %w", err))
+		}
+		// An intent already here may name a freeze an earlier pause left in
+		// place: its reply lost and its thaw unconfirmed. That token is the
+		// only way to release the guest, so it is resolved before a new one
+		// replaces it; a pause refused here keeps it. The leftover of a pause
+		// that completed names this record's artifact and is simply rewritten.
+		prior, perr := readPauseIntent(snapshotDir)
+		if perr != nil {
+			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("read the earlier pause intent: %w", perr))
+		}
+		if prior != nil && prior.FreezeToken != "" && prior.ArtifactID != recordedArtifact {
+			if rerr := m.releaseOrConfirmRunning(ctx, "", instIP, prior.FreezeToken); rerr != nil {
+				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("an earlier pause's freeze could not be released: %w", rerr))
+			}
+			log.Warn().Msg("pause: released a guest an earlier pause had left frozen")
 		}
 		if err := writePauseIntent(snapshotDir, pauseIntent{VMID: vmID, FreezeToken: freezeToken, ArtifactID: artifactID}); err != nil {
 			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record pause intent: %w", err))
@@ -1670,7 +1692,6 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// freeze the clock; otherwise the freeze buys nothing.
 	guestFrozen := false
 	if willFreeze {
-		tFreeze := time.Now()
 		var ferr error
 		guestFrozen, ferr = m.freezeGuestForPause(ctx, instIP, freezeToken, log)
 		freezeDur = time.Since(tFreeze)
@@ -8310,6 +8331,20 @@ func (m *Manager) releaseFrozenGuest(ctx context.Context, socketPath, ip, token 
 	return boxdThawGuest(tctx, ip, token)
 }
 
+// releaseOrConfirmRunning releases a workload frozen under token or, when the
+// guest holds no freeze under it, confirms the workload runs: a thaw refused
+// for one token says nothing about a freeze under an earlier one, and only a
+// workload confirmed running owes nothing.
+func (m *Manager) releaseOrConfirmRunning(ctx context.Context, socketPath, ip, token string) error {
+	err := m.releaseFrozenGuest(ctx, socketPath, ip, token)
+	if errors.Is(err, ErrGuestTokenMismatch) {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		err = boxdGuestRunning(rctx, ip)
+		cancel()
+	}
+	return err
+}
+
 // fcUnpauseVM is a seam over the Firecracker resume call.
 var fcUnpauseVM = UnpauseVMContext
 
@@ -8468,15 +8503,7 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 		return true
 	}
 	if in.FreezeToken != "" && inst.IP != "" {
-		terr := m.releaseFrozenGuest(ctx, inst.SocketPath, inst.IP, in.FreezeToken)
-		if errors.Is(terr, ErrGuestTokenMismatch) {
-			// A token the guest never froze under means the crash came before
-			// the freeze, unless the guest is still frozen under an earlier
-			// one: only a workload confirmed running owes nothing.
-			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-			terr = boxdGuestRunning(rctx, inst.IP)
-			cancel()
-		}
+		terr := m.releaseOrConfirmRunning(ctx, inst.SocketPath, inst.IP, in.FreezeToken)
 		if terr != nil {
 			log.Error().Err(terr).Msg("reattach: a pause left this guest frozen and it could not be released; parking as error")
 			return false

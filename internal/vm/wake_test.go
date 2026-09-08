@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -1482,5 +1483,160 @@ func TestRecoveredOverrideResumeCommitsTheImageItWoke(t *testing.T) {
 	again, err := mgr.resumeVMLocked(context.Background(), "vm-1", overrideSnap, override, nil)
 	if err != nil || again != inst {
 		t.Fatalf("retry: err=%v same=%v; want the running instance returned as is", err, again == inst)
+	}
+}
+
+// A pause whose freeze reply was lost and whose thaw could not be confirmed
+// leaves the guest frozen under its token, recorded in the intent. A retry
+// must resolve that freeze before it writes an intent with a new token, or
+// the old token, the only way to release the guest, is gone.
+func TestPauseResolvesAnEarlierFreezeBeforeReplacingItsIntent(t *testing.T) {
+	useTempFloor(t)
+	origF, origT, origR, origDown := boxdFreezeGuest, boxdThawGuest, boxdGuestRunning, vmUnitFullyDown
+	t.Cleanup(func() {
+		boxdFreezeGuest, boxdThawGuest, boxdGuestRunning, vmUnitFullyDown = origF, origT, origR, origDown
+	})
+	vmUnitFullyDown = func(string) bool { return false }
+
+	newPause := func(t *testing.T) (*Manager, string) {
+		t.Helper()
+		fc := startSnapshotAPIFake(t, nil)
+		dir := t.TempDir()
+		vmDir := filepath.Join(dir, "vm-1")
+		if err := os.MkdirAll(vmDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		memSnap := filepath.Join(vmDir, "mem.snap")
+		if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// What the earlier pause left: its intent, under its token.
+		if err := writePauseIntent(vmDir, pauseIntent{VMID: "vm-1", FreezeToken: "A", ArtifactID: "earlier"}); err != nil {
+			t.Fatal(err)
+		}
+		corrects := true
+		inst := &VMInstance{
+			ID: "vm-1", Status: StatusRunning, Supervision: SupervisionUnit, IP: "10.0.0.2",
+			SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects, ArtifactID: "current",
+		}
+		m := &Manager{
+			log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst},
+			cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir, GuestClockFreezeEnabled: true},
+		}
+		m.clockRealtimeCapable.Store(true)
+		return m, vmDir
+	}
+
+	t.Run("an_unconfirmed_release_refuses_the_pause_and_keeps_the_token", func(t *testing.T) {
+		m, vmDir := newPause(t)
+		var thawed []string
+		boxdThawGuest = func(_ context.Context, _, token string) error {
+			thawed = append(thawed, token)
+			return errors.New("connection refused")
+		}
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			t.Error("a new freeze was sent while an earlier one was unresolved")
+			return freezeEcho{}, errors.New("unexpected")
+		}
+		if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
+			t.Fatal("want the pause refused")
+		}
+		if len(thawed) != 1 || thawed[0] != "A" {
+			t.Fatalf("thaws = %v, want exactly the earlier token presented", thawed)
+		}
+		in, err := readPauseIntent(vmDir)
+		if err != nil || in == nil || in.FreezeToken != "A" {
+			t.Fatalf("intent = %+v err=%v; the earlier token must survive a refused pause", in, err)
+		}
+	})
+
+	t.Run("a_confirmed_release_lets_the_pause_go_on_under_a_new_token", func(t *testing.T) {
+		m, vmDir := newPause(t)
+		var thawed []string
+		boxdThawGuest = func(_ context.Context, _, token string) error { thawed = append(thawed, token); return nil }
+		frozeUnder := ""
+		boxdFreezeGuest = func(_ context.Context, _, token string) (freezeEcho, error) {
+			frozeUnder = token
+			return freezeEcho{Version: WakeProtocolVersion, Token: token}, nil
+		}
+		boxdGuestRunning = func(context.Context, string) error { return nil }
+		_, _, _, _ = m.PauseVM(context.Background(), "vm-1", vmDir, "")
+		if len(thawed) == 0 || thawed[0] != "A" {
+			t.Fatalf("thaws = %v, want the earlier token released first", thawed)
+		}
+		if frozeUnder == "" || frozeUnder == "A" {
+			t.Fatalf("froze under %q, want a fresh token after the release", frozeUnder)
+		}
+		if in, _ := readPauseIntent(vmDir); in != nil && in.FreezeToken == "A" {
+			t.Fatal("the intent still names the released freeze")
+		}
+	})
+}
+
+// phaseSink records the latency phases a manager emits.
+type phaseSink struct {
+	telemetry.Recorder
+	mu     sync.Mutex
+	phases []telemetry.LatencyPhase
+}
+
+func (p *phaseSink) RecordLatencyPhase(_ context.Context, ph telemetry.LatencyPhase) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.phases = append(p.phases, ph)
+}
+
+func (p *phaseSink) has(op, phase string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, ph := range p.phases {
+		if ph.Op == op && ph.Phase == phase {
+			return true
+		}
+	}
+	return false
+}
+
+// A pause that fails inside its freeze is one of the pauses worth seeing:
+// its phases land in the distributions like a failed snapshot's do.
+func TestFailedFreezeLandsInPausePhases(t *testing.T) {
+	useTempFloor(t)
+	origF, origT, origDown := boxdFreezeGuest, boxdThawGuest, vmUnitFullyDown
+	t.Cleanup(func() { boxdFreezeGuest, boxdThawGuest, vmUnitFullyDown = origF, origT, origDown })
+	vmUnitFullyDown = func(string) bool { return false }
+	boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+		return freezeEcho{}, errors.New("connection reset")
+	}
+	boxdThawGuest = func(context.Context, string, string) error { return errors.New("connection refused") }
+
+	fc := startSnapshotAPIFake(t, nil)
+	dir := t.TempDir()
+	vmDir := filepath.Join(dir, "vm-1")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	memSnap := filepath.Join(vmDir, "mem.snap")
+	if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	corrects := true
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusRunning, Supervision: SupervisionUnit, IP: "10.0.0.2",
+		SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects,
+	}
+	sink := &phaseSink{}
+	m := &Manager{
+		log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, recorder: sink,
+		cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir, GuestClockFreezeEnabled: true},
+	}
+	m.clockRealtimeCapable.Store(true)
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
+		t.Fatal("want the pause to fail inside its freeze")
+	}
+	if !sink.has("pause", "freeze") || !sink.has("pause", "total") {
+		t.Fatalf("phases = %+v; want the failed pause's freeze and total recorded", sink.phases)
+	}
+	if sink.has("pause", "snapshot") {
+		t.Fatalf("phases = %+v; a pause that never snapshotted must not report a snapshot phase", sink.phases)
 	}
 }
