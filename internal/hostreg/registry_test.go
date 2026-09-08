@@ -761,10 +761,12 @@ func TestMarkVerifiedColdResolvesOnce(t *testing.T) {
 	}
 }
 
-// The row just reported a new address: the client at the old one is dropped
-// and the new address is dialed from the report itself, so even with the
-// row unreadable the next dispatch goes to the new machine, never the old.
-func TestMarkVerifiedMovedAddressDialsReportWithoutRead(t *testing.T) {
+// A report that disagrees with the cached client is itself in doubt — the
+// cached address came from a read too, and the two cannot be ordered — so
+// the old client is dropped and the row is read before either address is
+// dialed. With the row unreadable, dispatch fails closed; once it reads,
+// the registry lands on the row's answer.
+func TestMarkVerifiedMovedAddressReadsBeforeDialing(t *testing.T) {
 	store := &hostDB{addr: "10.0.0.1:50051"}
 	var dialed []string
 	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
@@ -778,17 +780,20 @@ func TestMarkVerifiedMovedAddressDialsReportWithoutRead(t *testing.T) {
 
 	store.setFailRead(true)
 	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051")
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("ClientFor dispatched while the moved address was unconfirmed and unreadable")
+	}
+	if len(dialed) != 1 {
+		t.Fatalf("dialed = %v, want only the priming dial until the row confirms", dialed)
+	}
+
+	store.setFailRead(false)
+	store.setAddr("10.0.0.2:50051")
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
-		t.Fatalf("ClientFor after move: %v", err)
+		t.Fatalf("ClientFor once readable: %v", err)
 	}
 	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
-		t.Fatalf("settled address = %q, want the reported .2", settled)
-	}
-	if want := []string{"10.0.0.1:50051", "10.0.0.2:50051"}; fmt.Sprint(dialed) != fmt.Sprint(want) {
-		t.Fatalf("dialed = %v, want %v", dialed, want)
-	}
-	if n := store.readCount(); n != 1 {
-		t.Fatalf("reads = %d, want 1 (prime only)", n)
+		t.Fatalf("settled address = %q, want .2", settled)
 	}
 }
 
@@ -814,8 +819,8 @@ func TestMarkVerifiedMovedAddressRedials(t *testing.T) {
 	if want := []string{"10.0.0.1:50051", "10.0.0.2:50051"}; fmt.Sprint(dialed) != fmt.Sprint(want) {
 		t.Fatalf("dialed = %v, want %v", dialed, want)
 	}
-	if n := store.readCount(); n != 1 {
-		t.Fatalf("reads = %d, want 1 (prime only; the move is dialed from the report)", n)
+	if n := store.readCount(); n != 2 {
+		t.Fatalf("reads = %d, want 2 (prime, and the move confirmed by a read)", n)
 	}
 }
 
@@ -1375,5 +1380,45 @@ func TestConflictingReportsDoNotHideEachOther(t *testing.T) {
 	mu.Unlock()
 	if len(got) != 1 || got[0] != "10.0.0.2:50051" {
 		t.Fatalf("dialed = %v, want only .2", got)
+	}
+}
+
+// Reports from unlocked reads can finish out of order across a move: a
+// report of .2 dials .2 cold, then a stale report of .1 arrives. The stale
+// report disagrees with the previous one, so it must not be dialed unread:
+// the row is read, still says .2, and .2 stays. A second stale .1 report
+// disagrees with the cached .2 and is likewise confirmed by a read, never
+// dialed.
+func TestSequentialConflictingReportsAreConfirmedByARead(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.2:50051"}
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		dialed = append(dialed, addr)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051") // cold: dialed from the report
+	if n := store.readCount(); n != 0 {
+		t.Fatalf("reads after the cold report = %d, want 0", n)
+	}
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // stale, out of order
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("after the stale report settled = %q, want .2 confirmed by the row", settled)
+	}
+	if n := store.readCount(); n != 1 {
+		t.Fatalf("reads after the stale report = %d, want 1 (the confirmation)", n)
+	}
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // stale again
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("after the second stale report settled = %q, want .2", settled)
+	}
+	for _, d := range dialed {
+		if d == "10.0.0.1:50051" {
+			t.Fatalf("dialed = %v; the stale address must never be dialed", dialed)
+		}
+	}
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor: %v", err)
 	}
 }
