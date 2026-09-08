@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -145,8 +146,8 @@ func TestIntegration_RevertResumeToPaused_KeepsPriorDeadline(t *testing.T) {
 
 	if err := testQueries.RevertResumeToPaused(ctx, db.RevertResumeToPausedParams{
 		ID: sandboxID, TeamID: teamID,
-		PriorAutoDeleteSeconds: claimed.Sandbox.AutoDeleteSeconds,
-		PriorAutoDeleteAt:      claimed.PriorAutoDeleteAt,
+		ClaimedUpdatedAt:  pgtype.Timestamptz{Time: claimed.Sandbox.UpdatedAt, Valid: true},
+		PriorAutoDeleteAt: claimed.PriorAutoDeleteAt,
 	}); err != nil {
 		t.Fatalf("revert: %v", err)
 	}
@@ -162,7 +163,7 @@ func TestIntegration_RevertResumeToPaused_KeepsPriorDeadline(t *testing.T) {
 
 // A window patched between the claim and a pre-daemon revert wins over the
 // deadline the claim saw: disabling auto-delete leaves no deadline, and a
-// new window arms a fresh deadline from it.
+// new or repeated window arms a fresh deadline from it.
 func TestIntegration_RevertResumeToPaused_PatchedWindowWins(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
@@ -188,8 +189,8 @@ func TestIntegration_RevertResumeToPaused_PatchedWindowWins(t *testing.T) {
 		}
 		if err := testQueries.RevertResumeToPaused(ctx, db.RevertResumeToPausedParams{
 			ID: sandboxID, TeamID: teamID,
-			PriorAutoDeleteSeconds: claimed.Sandbox.AutoDeleteSeconds,
-			PriorAutoDeleteAt:      claimed.PriorAutoDeleteAt,
+			ClaimedUpdatedAt:  pgtype.Timestamptz{Time: claimed.Sandbox.UpdatedAt, Valid: true},
+			PriorAutoDeleteAt: claimed.PriorAutoDeleteAt,
 		}); err != nil {
 			t.Fatalf("revert: %v", err)
 		}
@@ -212,13 +213,14 @@ func TestIntegration_RevertResumeToPaused_PatchedWindowWins(t *testing.T) {
 		t.Fatalf("disabled while resuming, after revert seconds=%v at=%v, want none", row.AutoDeleteSeconds, row.AutoDeleteAt.Time)
 	}
 
-	wider := int32(7200)
-	claimed := claimThenPatch(&wider)
-	row := read()
-	if row.AutoDeleteSeconds == nil || *row.AutoDeleteSeconds != wider {
-		t.Fatalf("after revert seconds=%v, want %d", row.AutoDeleteSeconds, wider)
-	}
-	if !row.AutoDeleteAt.Valid || !row.AutoDeleteAt.Time.After(time.Now()) || row.AutoDeleteAt.Time.Equal(claimed.PriorAutoDeleteAt.Time) {
-		t.Fatalf("widened while resuming, after revert at=%v, want a fresh deadline in the future", row.AutoDeleteAt.Time)
+	for _, window := range []int32{7200, 3600} {
+		claimed := claimThenPatch(&window)
+		row := read()
+		if row.AutoDeleteSeconds == nil || *row.AutoDeleteSeconds != window {
+			t.Fatalf("after revert seconds=%v, want %d", row.AutoDeleteSeconds, window)
+		}
+		if !row.AutoDeleteAt.Valid || !row.AutoDeleteAt.Time.After(time.Now()) || row.AutoDeleteAt.Time.Equal(claimed.PriorAutoDeleteAt.Time) {
+			t.Fatalf("window %d patched while resuming, after revert at=%v, want a fresh deadline in the future", window, row.AutoDeleteAt.Time)
+		}
 	}
 }

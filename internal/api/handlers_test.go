@@ -4210,8 +4210,7 @@ func TestResumeSandbox_CapabilityRefusalKeepsAutoDeleteDeadline(t *testing.T) {
 	sb.HostID = "host-without-ports-" + uuid.NewString()
 	deadline := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
 	sb.AutoDeleteAt = pgtype.Timestamptz{Time: deadline, Valid: true}
-	window := int32(3600)
-	sb.AutoDeleteSeconds = &window
+	sb.UpdatedAt = time.Now().UTC().Truncate(time.Microsecond)
 	snap := db.Snapshot{
 		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
 		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
@@ -4257,10 +4256,10 @@ func TestResumeSandbox_CapabilityRefusalKeepsAutoDeleteDeadline(t *testing.T) {
 		t.Fatal("refused resume reached the daemon")
 	}
 	if len(reverted) != 4 {
-		t.Fatalf("revert args = %v, want id, team, prior window, prior deadline", reverted)
+		t.Fatalf("revert args = %v, want id, team, claim updated_at, prior deadline", reverted)
 	}
-	if secs, ok := reverted[2].(*int32); !ok || secs == nil || *secs != window {
-		t.Fatalf("revert window = %v, want %d", reverted[2], window)
+	if at, ok := reverted[2].(pgtype.Timestamptz); !ok || !at.Valid || !at.Time.Equal(sb.UpdatedAt) {
+		t.Fatalf("revert claim updated_at = %v, want %v", reverted[2], sb.UpdatedAt)
 	}
 	got, ok := reverted[3].(pgtype.Timestamptz)
 	if !ok || !got.Valid || !got.Time.Equal(deadline) {

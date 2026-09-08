@@ -2489,12 +2489,13 @@ UPDATE sandbox
 SET status = 'paused',
     -- Re-arm the auto-delete deadline cleared by the claim; the sandbox is
     -- paused again, so it gets a fresh window. A resume refused before it
-    -- reached the daemon hands back the deadline and window the claim saw
-    -- instead, so retrying it cannot postpone deletion. A window patched
-    -- while the row was resuming wins: the patch left the deadline NULL for
-    -- the return to paused, so it is armed from the new window here.
+    -- reached the daemon hands back the deadline the claim saw instead, so
+    -- retrying it cannot postpone deletion. It is restored only while the
+    -- row is untouched since the claim: an auto-delete patch, even one that
+    -- repeats the value, bumps updated_at and leaves the deadline NULL for
+    -- the return to paused, so it is armed from the current window here.
     auto_delete_at = CASE
-      WHEN auto_delete_seconds IS NOT DISTINCT FROM $3::int
+      WHEN updated_at = $3::timestamptz
       THEN $4::timestamptz
       ELSE now() + make_interval(secs => auto_delete_seconds)
     END,
@@ -2503,10 +2504,10 @@ WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming'
 `
 
 type RevertResumeToPausedParams struct {
-	ID                     uuid.UUID          `json:"id"`
-	TeamID                 uuid.UUID          `json:"team_id"`
-	PriorAutoDeleteSeconds *int32             `json:"prior_auto_delete_seconds"`
-	PriorAutoDeleteAt      pgtype.Timestamptz `json:"prior_auto_delete_at"`
+	ID                uuid.UUID          `json:"id"`
+	TeamID            uuid.UUID          `json:"team_id"`
+	ClaimedUpdatedAt  pgtype.Timestamptz `json:"claimed_updated_at"`
+	PriorAutoDeleteAt pgtype.Timestamptz `json:"prior_auto_delete_at"`
 }
 
 // Compensate a failed resume attempt by flipping status back to 'paused'.
@@ -2516,7 +2517,7 @@ func (q *Queries) RevertResumeToPaused(ctx context.Context, arg RevertResumeToPa
 	_, err := q.db.Exec(ctx, revertResumeToPaused,
 		arg.ID,
 		arg.TeamID,
-		arg.PriorAutoDeleteSeconds,
+		arg.ClaimedUpdatedAt,
 		arg.PriorAutoDeleteAt,
 	)
 	return err
