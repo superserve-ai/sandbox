@@ -4357,7 +4357,10 @@ components:
           properties:
             error:
               type: object
+              required: [code, errno]
               properties:
+                code:
+                  const: sandbox_filesystem_error
                 errno:
                   type: string
                 path:
@@ -4433,7 +4436,7 @@ components:
       content:
         application/json:
           schema:
-            oneOf:
+            anyOf:
               - $ref: "#/components/schemas/Error"
               - $ref: "#/components/schemas/FilesystemError"
     ServiceUnavailable:
