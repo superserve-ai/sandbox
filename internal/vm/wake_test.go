@@ -1501,7 +1501,10 @@ func TestPauseResolvesAnEarlierFreezeBeforeReplacingItsIntent(t *testing.T) {
 	var unpaused []string
 	fcUnpauseVM = func(_ context.Context, socket string) error { unpaused = append(unpaused, socket); return nil }
 
-	newPause := func(t *testing.T) (*Manager, string) {
+	// Cgroup-supervised: an error on this path asks whether the VM is dead,
+	// and a cgroup the host never had reads as alive everywhere, while a
+	// unit systemd never had reads as dead where systemd is present.
+	newPause := func(t *testing.T) (*Manager, string, string) {
 		t.Helper()
 		fc := startSnapshotAPIFake(t, nil)
 		dir := t.TempDir()
@@ -1519,7 +1522,7 @@ func TestPauseResolvesAnEarlierFreezeBeforeReplacingItsIntent(t *testing.T) {
 		}
 		corrects := true
 		inst := &VMInstance{
-			ID: "vm-1", Status: StatusRunning, Supervision: SupervisionUnit, IP: "10.0.0.2",
+			ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2",
 			SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects, ArtifactID: "current",
 		}
 		m := &Manager{
@@ -1527,11 +1530,11 @@ func TestPauseResolvesAnEarlierFreezeBeforeReplacingItsIntent(t *testing.T) {
 			cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir, GuestClockFreezeEnabled: true},
 		}
 		m.clockRealtimeCapable.Store(true)
-		return m, vmDir
+		return m, vmDir, fc.socketPath
 	}
 
 	t.Run("an_unconfirmed_release_refuses_the_pause_and_keeps_the_token", func(t *testing.T) {
-		m, vmDir := newPause(t)
+		m, vmDir, socket := newPause(t)
 		unpaused = nil
 		var thawed []string
 		boxdThawGuest = func(_ context.Context, _, token string) error {
@@ -1550,7 +1553,7 @@ func TestPauseResolvesAnEarlierFreezeBeforeReplacingItsIntent(t *testing.T) {
 		}
 		// The earlier attempt may have left the vCPUs paused; the guest cannot
 		// answer until Firecracker resumes them.
-		if len(unpaused) != 1 || unpaused[0] != m.vms["vm-1"].SocketPath {
+		if len(unpaused) != 1 || unpaused[0] != socket {
 			t.Fatalf("unpause calls = %v, want one on the VM's socket before the thaw", unpaused)
 		}
 		in, err := readPauseIntent(vmDir)
@@ -1562,7 +1565,7 @@ func TestPauseResolvesAnEarlierFreezeBeforeReplacingItsIntent(t *testing.T) {
 	// A pause that will not freeze — a custom directory here — must still not
 	// publish a frozen guest as an unfrozen image.
 	t.Run("a_pause_that_will_not_freeze_resolves_it_or_is_refused", func(t *testing.T) {
-		m, vmDir := newPause(t)
+		m, vmDir, _ := newPause(t)
 		custom := t.TempDir()
 		boxdThawGuest = func(context.Context, string, string) error { return errors.New("connection refused") }
 		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
@@ -1584,7 +1587,7 @@ func TestPauseResolvesAnEarlierFreezeBeforeReplacingItsIntent(t *testing.T) {
 	})
 
 	t.Run("a_confirmed_release_lets_the_pause_go_on_under_a_new_token", func(t *testing.T) {
-		m, vmDir := newPause(t)
+		m, vmDir, _ := newPause(t)
 		var thawed []string
 		boxdThawGuest = func(_ context.Context, _, token string) error { thawed = append(thawed, token); return nil }
 		frozeUnder := ""
@@ -1693,7 +1696,7 @@ func TestAdHocSnapshotResolvesAnEarlierFreezeOrRefuses(t *testing.T) {
 	if err := writePauseIntent(vmDir, pauseIntent{VMID: "vm-1", FreezeToken: "A", ArtifactID: "earlier"}); err != nil {
 		t.Fatal(err)
 	}
-	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionUnit, IP: "10.0.0.2", SocketPath: fc.socketPath, ArtifactID: "current"}
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, ArtifactID: "current"}
 	m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
 
 	var thawed []string
