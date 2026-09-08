@@ -2414,6 +2414,17 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			_, _ = m.persistStateIfPresent(inst)
 		}
 	}()
+	// If this Firecracker refuses the clock option, the record must say the
+	// clock ran before the legacy retry can run the vCPUs.
+	demote := func() error {
+		inst.mu.Lock()
+		inst.ClockFrozen = false
+		inst.mu.Unlock()
+		if !m.persistState(inst) {
+			return fmt.Errorf("vm %s: clock policy could not be made durable before the legacy restore", vmID)
+		}
+		return nil
+	}
 	// Two passes at most: a frozen-clock restore whose guest cannot correct its
 	// clock is relaunched unfrozen. Only Firecracker is torn down between
 	// passes; the slot, the network, and this frame's cleanup are kept.
@@ -2429,6 +2440,17 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			if m.cgroupLaunch(resumeExisting) {
 				predicted = SupervisionCgroup
 			}
+			// The record recovery would act on must name this launch's guest:
+			// the slot this resume took and the token the image resolved to,
+			// stamped before the write that owes the wake, not after it.
+			inst.mu.Lock()
+			inst.SocketPath = socketPath
+			inst.IP = netInfo.HostIP
+			inst.TAPDevice = netInfo.TAPDevice
+			inst.MACAddress = netInfo.MACAddress
+			inst.Namespace = nsName
+			inst.FreezeToken = resumeToken
+			inst.mu.Unlock()
 			joinWakeOwed = m.persistWakeOwed(inst, predicted, resumePolicy != nil, true)
 			published = true
 		}
@@ -2464,7 +2486,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		if m.restoreForResumeHook != nil {
 			dirtyTracked, trackingSessionID, restoreErr = m.restoreForResumeHook(socketPath, snapshotPath, memPath, basePath, netInfo)
 		} else {
-			dirtyTracked, trackingSessionID, resumeClockFrozen, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo, resumePolicy)
+			dirtyTracked, trackingSessionID, resumeClockFrozen, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo, resumePolicy, demote)
 		}
 		tRestoreDone = time.Now()
 		if restoreErr != nil {
@@ -2635,8 +2657,9 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 // whether dirty-page tracking was armed so the caller can decide if the next pause
 // may write a Diff.
 // clockPolicy is resolved by the caller so the resume log can report what was
-// asked for without stat-ing the marker a second time.
-func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo, clockPolicy *bool) (dirtyTracked bool, trackingSessionID string, clockFrozen bool, err error) {
+// asked for without stat-ing the marker a second time; beforeLegacy runs
+// before the legacy retry if this Firecracker refuses the option.
+func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo, clockPolicy *bool, beforeLegacy func() error) (dirtyTracked bool, trackingSessionID string, clockFrozen bool, err error) {
 	useUffd := m.cfg.ResumeUffdEnabled && m.cfg.UffdEnabled && netInfo != nil && netInfo.TAPDevice != ""
 	if !useUffd {
 		// A layered overlay can only be served by the UFFD layered backend. If this
@@ -2646,7 +2669,7 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 		if basePath != "" {
 			return false, "", false, fmt.Errorf("layered overlay %q requires UFFD resume (resume-uffd + uffd + tap); refusing File-backend restore", memPath)
 		}
-		used, rerr := m.restoreWithClockFallback(clockPolicy, nil, func(clock *bool) error {
+		used, rerr := m.restoreWithClockFallback(clockPolicy, beforeLegacy, func(clock *bool) error {
 			return RestoreSnapshot(socketPath, snapshotPath, memPath, "", clock)
 		})
 		return false, "", used, rerr
@@ -2661,7 +2684,7 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 		sessionID = newTrackingSessionID()
 	}
 	armed, used, rerr := m.restoreWithSessionFallback(sessionID, func(sid string) (bool, error) {
-		return m.restoreWithClockFallback(clockPolicy, nil, func(clock *bool) error {
+		return m.restoreWithClockFallback(clockPolicy, beforeLegacy, func(clock *bool) error {
 			return RestoreSnapshotUffdInternalWithOverrides(
 				socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
 				m.cfg.HandlerDeathAbortEnabled, sid, clock,
@@ -3464,6 +3487,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		tBoxdStart         time.Time
 		optimisticOK       bool
 	)
+	// The Running write that overlaps the readiness wait; joined before the
+	// record is trusted, and by the failure worker before it writes Error.
+	var persistDone chan struct{}
 	for attempt = 1; ; attempt++ {
 		tAttemptStart = time.Now()
 		if attempt > 1 {
@@ -3746,7 +3772,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// An unfrozen image publishes Running after the load, the write
 			// overlapping the readiness wait; a crash here leaves an unverified
 			// record, which adoption re-verifies before trusting.
-			var persistDone chan struct{}
+			persistDone = nil
 			if !restoreWorkloadFrozen {
 				inst.mu.Lock()
 				inst.Status = StatusRunning
@@ -3793,10 +3819,15 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				wakeErr = boxdHealthProbe(ctx, hostIP, readiness)
 			}
 			stopDiag()
-			if persistDone != nil {
+			// The write overlapping the wait must land before the vCPUs are
+			// trusted or the same instance is relaunched. A failed restore
+			// joins it in its detached worker instead, so a stalled store
+			// delays neither the teardown nor the reply.
+			retryUnfrozen := wakeErr != nil && !clockRetried && restoreClockFrozen && errors.Is(wakeErr, ErrGuestClockUnready)
+			if (wakeErr == nil || retryUnfrozen) && persistDone != nil {
 				<-persistDone
 			}
-			if wakeErr == nil || clockRetried || !restoreClockFrozen || !errors.Is(wakeErr, ErrGuestClockUnready) {
+			if !retryUnfrozen {
 				break
 			}
 			// The guest could not correct a frozen clock. The host is latched now,
@@ -3946,6 +3977,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		go func() {
 			defer sentrylog.Recover("restore-error-persist")
+			// The optimistic Running write may still be in flight; it lands
+			// before the Error write below so it cannot overwrite it.
+			if persistDone != nil {
+				<-persistDone
+			}
 			// The identity check and the Error write must be atomic against
 			// a same-ID retry, which serializes on the lifecycle lock: held
 			// here, the map entry cannot be replaced between check and
@@ -8370,9 +8406,15 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 	}
 	if in.FreezeToken != "" && inst.IP != "" {
 		terr := m.releaseFrozenGuest(ctx, inst.SocketPath, inst.IP, in.FreezeToken)
-		// A token the guest never froze under means the crash came before
-		// the freeze: nothing to release.
-		if terr != nil && !errors.Is(terr, ErrGuestTokenMismatch) {
+		if errors.Is(terr, ErrGuestTokenMismatch) {
+			// A token the guest never froze under means the crash came before
+			// the freeze, unless the guest is still frozen under an earlier
+			// one: only a workload confirmed running owes nothing.
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			terr = boxdGuestRunning(rctx, inst.IP)
+			cancel()
+		}
+		if terr != nil {
 			log.Error().Err(terr).Msg("reattach: a pause left this guest frozen and it could not be released; parking as error")
 			return false
 		}

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -181,15 +182,26 @@ func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
 	inst := &VMInstance{
 		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
 		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs,
-		SnapshotWorkloadFrozen: &frozen,
+		SnapshotWorkloadFrozen: &frozen, FreezeToken: "tok",
+		IP: "10.9.9.9", // the slot of an earlier run; this resume takes a new one
 	}
+	fake := &fakeNetMgr{}
+	slot, _ := fake.SetupVM(context.Background(), "probe", nil)
 	mgr := &Manager{
 		log:    zerolog.Nop(),
 		cfg:    ManagerConfig{RunDir: dir},
-		netMgr: &fakeNetMgr{},
+		netMgr: fake,
 		vms:    map[string]*VMInstance{"vm-1": inst},
 	}
+	// The launch runs after the record owes the wake and before the guest is
+	// woken: what recovery would read after a crash here must already name
+	// this run's slot and token.
+	var ipAtLaunch, tokenAtLaunch string
+	var owedAtLaunch bool
 	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		inst.mu.RLock()
+		ipAtLaunch, tokenAtLaunch, owedAtLaunch = inst.IP, inst.FreezeToken, inst.WakePending
+		inst.mu.RUnlock()
 		return 4321, SupervisionUnit, nil
 	}
 	mgr.restoreForResumeHook = func(string, string, string, string, *network.VMNetInfo) (bool, string, error) { return false, "", nil }
@@ -220,6 +232,9 @@ func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
 	}
 	if !owedAtWake {
 		t.Error("the record must owe the wake while the workload is still frozen")
+	}
+	if !owedAtLaunch || ipAtLaunch != slot.HostIP || tokenAtLaunch != "tok" {
+		t.Errorf("at launch: owed=%v ip=%q token=%q; want the owed record to name this run's slot %q and token", owedAtLaunch, ipAtLaunch, tokenAtLaunch, slot.HostIP)
 	}
 	inst.mu.RLock()
 	defer inst.mu.RUnlock()
@@ -585,20 +600,24 @@ func TestResumeOfUnfrozenPauseDoesNotFreezeOrWake(t *testing.T) {
 
 // A guest a crashed pause left frozen is released on reattach with the token
 // the intent carries; a token the guest never froze under means the crash came
-// first, and nothing is owed. A guest that cannot be released is not served.
+// first, and nothing is owed, once the workload is confirmed running. A guest
+// that cannot be released, or is frozen under another token, is not served.
 func TestReattachReleasesAGuestAnInterruptedPauseFroze(t *testing.T) {
 	raiseFloorForTest(t)
-	origThaw := boxdThawGuest
-	t.Cleanup(func() { boxdThawGuest = origThaw })
+	origThaw, origRunning := boxdThawGuest, boxdGuestRunning
+	t.Cleanup(func() { boxdThawGuest, boxdGuestRunning = origThaw, origRunning })
+	mismatch := fmt.Errorf("%w: status token", ErrGuestTokenMismatch)
 	cases := []struct {
 		name       string
 		thaw       error
+		running    error
 		wantStatus VMStatus
 		wantIntent bool
 	}{
-		{"released", nil, StatusRunning, false},
-		{"never_frozen", fmt.Errorf("%w: status token", ErrGuestTokenMismatch), StatusRunning, false},
-		{"unreachable", errors.New("connection refused"), StatusError, true},
+		{"released", nil, nil, StatusRunning, false},
+		{"never_frozen", mismatch, nil, StatusRunning, false},
+		{"frozen_under_another_token", mismatch, errors.New(`guest workload status "frozen"`), StatusError, true},
+		{"unreachable", errors.New("connection refused"), nil, StatusError, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -621,6 +640,7 @@ func TestReattachReleasesAGuestAnInterruptedPauseFroze(t *testing.T) {
 			}
 			var sawToken string
 			boxdThawGuest = func(_ context.Context, _ string, token string) error { sawToken = token; return tc.thaw }
+			boxdGuestRunning = func(context.Context, string) error { return tc.running }
 			mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
 			inst := mgr.reattachByID("vm-1", false)
 			if inst == nil || sawToken != "tok" {
@@ -1187,4 +1207,96 @@ func TestTokenMismatchStaysErrorThroughRecovery(t *testing.T) {
 			t.Errorf("status %v, want Error: a refused wake is terminal even for a resume", inst.Status)
 		}
 	})
+}
+
+// A failed create must not wait on the state store: the Running write that
+// overlaps the readiness wait is joined by the failure worker, off the reply.
+// The writer is held from inside the launch, once that write is the only one
+// left, and the guest never answers.
+func TestFailedRestoreDoesNotWaitOnTheStore(t *testing.T) {
+	useTempFloor(t)
+	origProbe, origDead := boxdHealthProbe, vmDeadForRetry
+	t.Cleanup(func() { boxdHealthProbe, vmDeadForRetry = origProbe, origDead })
+	vmDeadForRetry = func(*Manager, string) bool { return true }
+	boxdHealthProbe = func(context.Context, string, time.Duration) error { return errors.New("guest never answered") }
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	basePath := filepath.Join(dir, "base.ext4")
+	for _, p := range []string{snapPath, memPath, basePath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	held := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		time.Sleep(50 * time.Millisecond) // let the failure worker's write land before the store closes
+		store.Close()
+	})
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		cfg:        ManagerConfig{RunDir: dir},
+		netMgr:     &fakeNetMgr{},
+		vms:        map[string]*VMInstance{},
+		restoreSem: make(chan struct{}, 1),
+		state:      store,
+	}
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		go func() {
+			_ = store.db.Update(func(*bolt.Tx) error {
+				close(held)
+				<-release
+				return nil
+			})
+		}()
+		<-held
+		return 4321, SupervisionUnit, nil
+	}
+	mgr.restoreSnapshotHook = func(_, _, _ string, _ *bool) error { return nil }
+
+	start := time.Now()
+	_, rerr := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath}, nil, "team", "owner", "", nil, 0)
+	took := time.Since(start)
+	if rerr == nil {
+		t.Fatal("restore succeeded without a ready guest")
+	}
+	if took > 2*time.Second {
+		t.Fatalf("a failed restore took %v with the store held; the reply must not wait on it", took)
+	}
+	mgr.mu.RLock()
+	inst := mgr.vms["vm-1"]
+	mgr.mu.RUnlock()
+	if inst != nil {
+		inst.mu.RLock()
+		st := inst.Status
+		inst.mu.RUnlock()
+		if st != StatusError {
+			t.Fatalf("status %v after the failed restore, want Error before the reply", st)
+		}
+	}
+	// Once the store is free, the deferred write converges the record to
+	// Error: the Running write it joined first cannot land after it.
+	close(release)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rec, gerr := store.Get("vm-1")
+		if gerr == nil && rec != nil && rec.Status == StatusError {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("durable record never reached Error after the store was released: rec=%+v err=%v", rec, gerr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

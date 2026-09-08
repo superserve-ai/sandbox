@@ -299,7 +299,10 @@ func imageManifest(memPath string) (*WallClockManifest, error) {
 // restore has to happen first. A directory listing at start and every few
 // minutes, off every request path.
 func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger) {
-	if m.cfg.SnapshotDir == "" {
+	// Only a host that may act on frozen images watches for them. With the
+	// switch off this does no filesystem work at all; such a host's floor
+	// still rises at the first frozen image it restores.
+	if m.cfg.SnapshotDir == "" || !m.cfg.GuestClockFreezeEnabled {
 		return
 	}
 	scan := func() {

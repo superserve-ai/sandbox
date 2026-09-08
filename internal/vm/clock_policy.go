@@ -241,7 +241,13 @@ func (m *Manager) freezeGuestForPause(ctx context.Context, ip, token string, log
 	}
 	tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer tcancel()
-	if terr := boxdThawGuest(tctx, ip, token); terr != nil && !errors.Is(terr, ErrGuestTokenMismatch) {
+	terr := boxdThawGuest(tctx, ip, token)
+	if errors.Is(terr, ErrGuestTokenMismatch) {
+		// The guest holds no freeze under this token, which says nothing about
+		// an earlier one: only a workload confirmed running is unfrozen.
+		terr = boxdGuestRunning(tctx, ip)
+	}
+	if terr != nil {
 		return false, fmt.Errorf("guest workload state unknown after failed freeze (%v); thaw not confirmed: %w", ferr, terr)
 	}
 	log.Warn().Err(ferr).Msg("pause: guest workload not frozen; this image will wake the slower way")

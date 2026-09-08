@@ -436,8 +436,8 @@ func TestWatchFirecrackerCapability(t *testing.T) {
 }
 
 func TestFreezeGuestForPause(t *testing.T) {
-	origF, origT := boxdFreezeGuest, boxdThawGuest
-	t.Cleanup(func() { boxdFreezeGuest, boxdThawGuest = origF, origT })
+	origF, origT, origR := boxdFreezeGuest, boxdThawGuest, boxdGuestRunning
+	t.Cleanup(func() { boxdFreezeGuest, boxdThawGuest, boxdGuestRunning = origF, origT, origR })
 	m := &Manager{log: zerolog.Nop()}
 
 	t.Run("frozen", func(t *testing.T) {
@@ -465,7 +465,8 @@ func TestFreezeGuestForPause(t *testing.T) {
 	})
 
 	// A freeze the guest never took answers the follow-up thaw with a token
-	// mismatch: nothing to release, the pause goes on unfrozen.
+	// mismatch: once the workload is confirmed running there is nothing to
+	// release, and the pause goes on unfrozen.
 	t.Run("never_frozen_demotes", func(t *testing.T) {
 		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
 			return freezeEcho{}, errors.New("connection reset")
@@ -473,9 +474,27 @@ func TestFreezeGuestForPause(t *testing.T) {
 		boxdThawGuest = func(context.Context, string, string) error {
 			return fmt.Errorf("%w: status token", ErrGuestTokenMismatch)
 		}
+		boxdGuestRunning = func(context.Context, string) error { return nil }
 		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
 		if err != nil || frozen {
 			t.Fatalf("frozen=%v err=%v; want unfrozen and no error", frozen, err)
+		}
+	})
+
+	// The same mismatch from a guest still frozen under an earlier token must
+	// not be read as running: a snapshot of that guest marked unfrozen would
+	// never be woken. The pause aborts instead.
+	t.Run("mismatch_without_a_running_workload_aborts_the_pause", func(t *testing.T) {
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			return freezeEcho{}, errors.New("connection reset")
+		}
+		boxdThawGuest = func(context.Context, string, string) error {
+			return fmt.Errorf("%w: status token", ErrGuestTokenMismatch)
+		}
+		boxdGuestRunning = func(context.Context, string) error { return errors.New(`guest workload status "frozen"`) }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
+		if err == nil || frozen {
+			t.Fatalf("frozen=%v err=%v; want an error that aborts the pause", frozen, err)
 		}
 	})
 

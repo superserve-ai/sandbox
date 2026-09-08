@@ -198,6 +198,37 @@ func postBoxdThaw(ctx context.Context, vmIP, token string) error {
 	return err
 }
 
+// guestWorkloadRunning asks the guest whether its workload runs. Health
+// answers ok only while nothing is frozen, so a thaw refused for a token the
+// guest does not hold is read as "never frozen" only once this confirms it:
+// the guest may still be frozen under an earlier token.
+func guestWorkloadRunning(ctx context.Context, vmIP string) error {
+	url := fmt.Sprintf("http://%s:%d/health", vmIP, boxdPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("create /health request: %w", err)
+	}
+	resp, err := boxdHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("GET /health: %w", err)
+	}
+	defer resp.Body.Close()
+	reply, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if resp.StatusCode != http.StatusOK {
+		return &boxdStatusError{Path: "/health", Code: resp.StatusCode, Body: strings.TrimSpace(string(reply))}
+	}
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(reply, &body); err != nil {
+		return fmt.Errorf("decode /health: %w", err)
+	}
+	if body.Status != "ok" {
+		return fmt.Errorf("guest workload status %q", body.Status)
+	}
+	return nil
+}
+
 // boxdStatusError is a non-200 answer from the guest agent.
 type boxdStatusError struct {
 	Path string
@@ -299,9 +330,10 @@ func waitForGuestWake(ctx context.Context, vmIP string, timeout time.Duration, c
 
 // Seams so the pause and restore paths can be tested without a guest.
 var (
-	boxdFreezeGuest = postBoxdFreeze
-	boxdThawGuest   = postBoxdThaw
-	boxdWakeGuest   = waitForGuestWake
+	boxdFreezeGuest  = postBoxdFreeze
+	boxdThawGuest    = postBoxdThaw
+	boxdWakeGuest    = waitForGuestWake
+	boxdGuestRunning = guestWorkloadRunning
 )
 
 // boxdFilesystemClient returns a Connect RPC client for boxd's

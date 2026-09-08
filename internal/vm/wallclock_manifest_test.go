@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc/codes"
@@ -323,5 +324,39 @@ func TestEnsureWakeProtocolFloor(t *testing.T) {
 	wakeProtocolEvidencePath = filepath.Join(dir, "evidence2")
 	if err := ensureWakeProtocolFloor(); err != nil || !wakeProtocolEvidenceDurable.Load() {
 		t.Fatalf("retry: err=%v durable=%v", err, wakeProtocolEvidenceDurable.Load())
+	}
+}
+
+// A host with the switch off does no work for the watch: a frozen template
+// already on disk raises nothing until the switch is on.
+func TestTemplateWatchRunsOnlyWhenTheSwitchIsOn(t *testing.T) {
+	dir := t.TempDir()
+	isolateEvidence(t, dir)
+	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
+	if err := os.MkdirAll(tpl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seedFrozenManifest(t, filepath.Join(tpl, "mem.snap"), "tok")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	off := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
+	off.WatchTemplateManifests(ctx, zerolog.Nop())
+	time.Sleep(100 * time.Millisecond)
+	if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
+		t.Fatal("the watch scanned the templates with the switch off")
+	}
+
+	on := &Manager{cfg: ManagerConfig{SnapshotDir: dir, GuestClockFreezeEnabled: true}}
+	on.WatchTemplateManifests(ctx, zerolog.Nop())
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the watch never raised the floor with the switch on")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
