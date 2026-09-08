@@ -1564,6 +1564,52 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	if got := body["mode"].(string); got != "shadow" {
 		t.Fatalf("mode = %q, want shadow", got)
 	}
+	trial, ok := body["trial"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("trial = %v, want object", body["trial"])
+	}
+	for _, key := range []string{"grant_usd", "consumed_usd", "remaining_usd", "state", "eligible"} {
+		if _, present := trial[key]; !present {
+			t.Fatalf("trial missing %q: %v", key, trial)
+		}
+	}
+	state, ok := trial["state"].(string)
+	if !ok || (state != "no_grant" && state != "active" && state != "exhausted" && state != "expired" && state != "ended_by_billing_activation") {
+		t.Fatalf("trial state = %v, want a recognized lifecycle state", trial["state"])
+	}
+	if state == "no_grant" && (trial["grant_usd"] != float64(0) || trial["consumed_usd"] != float64(0) || trial["remaining_usd"] != float64(0)) {
+		t.Fatalf("no-grant trial = %v, want zero monetary values", trial)
+	}
+	// An expired signup grant is terminal and ineligible, distinct from a team
+	// that never received a signup grant.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, expires_at)
+		VALUES ($1, 1, 1, 'signup trial credit', now() + interval '1 hour')
+	`, teamID); err != nil {
+		t.Fatalf("seed signup trial grant for expiry: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE team_credit_grant
+		SET expires_at = now() - interval '1 second'
+		WHERE team_id = $1 AND reason = 'signup trial credit' AND expires_at IS NOT NULL
+	`, teamID); err != nil {
+		t.Fatalf("expire signup trial grant: %v", err)
+	}
+	expired := do(r, "GET", "/billing/summary", viewerKey, "")
+	if expired.Code != http.StatusOK {
+		t.Fatalf("expired trial summary: expected 200, got %d: %s", expired.Code, expired.Body.String())
+	}
+	expiredTrial, ok := mustJSON(t, expired)["trial"].(map[string]interface{})
+	if !ok || expiredTrial["state"] != "expired" || expiredTrial["eligible"] != false || expiredTrial["remaining_usd"] != float64(0) {
+		t.Fatalf("expired trial = %v, want expired, ineligible, and zero remaining", expiredTrial)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE team_credit_grant
+		SET expires_at = NULL, remaining_usd = 0
+		WHERE team_id = $1 AND reason = 'signup trial credit' AND expires_at IS NOT NULL
+	`, teamID); err != nil {
+		t.Fatalf("restore signup trial grant expiry: %v", err)
+	}
 	breakdown, ok := body["cost_breakdown_usd"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("cost_breakdown_usd not an object: %v", body["cost_breakdown_usd"])
@@ -1641,6 +1687,21 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	if got := liveBody["portal_available"].(bool); got {
 		t.Fatal("portal_available should be false before subscription is established")
 	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE team_billing_account
+		SET trial_ended_at = now(), stripe_subscription_status = 'active'
+		WHERE team_id = $1
+	`, teamID); err != nil {
+		t.Fatalf("mark subscription active: %v", err)
+	}
+	activated := do(liveRouter, "GET", "/billing/summary", ownerKey, "")
+	if activated.Code != http.StatusOK {
+		t.Fatalf("activated billing summary: expected 200, got %d: %s", activated.Code, activated.Body.String())
+	}
+	activatedTrial, ok := mustJSON(t, activated)["trial"].(map[string]interface{})
+	if !ok || activatedTrial["state"] != "ended_by_billing_activation" || activatedTrial["eligible"] != true || activatedTrial["remaining_usd"] != float64(0) {
+		t.Fatalf("activated trial = %v, want ended_by_billing_activation, eligible, and zero remaining", activatedTrial)
+	}
 
 	period, ok := body["billing_period"].(map[string]interface{})
 	if !ok {
@@ -1671,6 +1732,13 @@ func TestIntegration_NewTeamReceivesSignupTrialCredit(t *testing.T) {
 		t.Fatalf("create team: %v", err)
 	}
 	teamID := team.ID
+	profileID := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO profile (id, email) VALUES ($1, $2)`, profileID, profileID.String()+"@example.com"); err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`, teamID, profileID); err != nil {
+		t.Fatalf("create membership: %v", err)
+	}
 
 	var amount, remaining float64
 	if err := testPool.QueryRow(ctx, `
@@ -1682,6 +1750,42 @@ func TestIntegration_NewTeamReceivesSignupTrialCredit(t *testing.T) {
 	}
 	if amount != 5 || remaining != 5 {
 		t.Fatalf("signup trial credit = (%v, %v), want (5, 5)", amount, remaining)
+	}
+}
+
+func TestIntegration_ExpiredSignupTrialIsBillingIneligible(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, expires_at)
+		VALUES ($1, 5.000000, 5.000000, 'signup trial credit', now() - interval '1 second')
+	`, teamID); err != nil {
+		t.Fatalf("seed expired signup trial credit: %v", err)
+	}
+	eligible, err := testQueries.IsTeamSandboxBillingEligible(ctx, teamID)
+	if err != nil {
+		t.Fatalf("check expired signup trial eligibility: %v", err)
+	}
+	if eligible {
+		t.Fatal("expired signup trial should be billing-ineligible")
+	}
+}
+
+func TestIntegration_IncompleteStripeSubscriptionIsNotTrialEligible(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'incomplete')
+	`, teamID, "cus_"+teamID.String(), "sub_"+teamID.String()); err != nil {
+		t.Fatalf("seed incomplete subscription: %v", err)
+	}
+	balance, err := testQueries.GetTeamTrialBalance(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load trial balance: %v", err)
+	}
+	if balance.Eligible {
+		t.Fatal("incomplete Stripe subscription should not be trial-eligible")
 	}
 }
 

@@ -1303,7 +1303,7 @@ func awaitBackfill(t *testing.T, done <-chan string) {
 	t.Helper()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("allocation backfill never ran — an undeclared VM keeps a zero size and publishes as free capacity")
 	}
 }

@@ -1009,6 +1009,14 @@ WHERE team_id = sqlc.arg(team_id)
   AND remaining_usd > 0
   AND (expires_at IS NULL OR expires_at > now());
 
+-- name: GetTeamTrialBalance :one
+SELECT trial.grant_usd::numeric AS grant_usd,
+       trial.consumed_usd::numeric AS consumed_usd,
+       trial.remaining_usd::numeric AS remaining_usd,
+       trial.state::text AS state,
+       trial.eligible::boolean AS eligible
+FROM get_team_trial_balance(sqlc.arg(team_id)) AS trial;
+
 -- name: IsTeamSandboxBillingEligible :one
 SELECT team_sandbox_billing_eligible(sqlc.arg(team_id)) AS eligible;
 
