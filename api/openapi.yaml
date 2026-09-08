@@ -2570,6 +2570,7 @@ components:
         - resources
         - billing_period
         - pricing_tier
+        - trial
         - calculated_at
       properties:
         mode:
@@ -2593,6 +2594,7 @@ components:
         credits_applied_usd:
           type: number
           format: double
+          nullable: true
           description: Credits applied against the current period charges.
         # Phase 1 exposes float USD values for billing UI display. Invoice-grade
         # exports should use decimal/cents fields before becoming customer-visible
@@ -2600,11 +2602,36 @@ components:
         credits_remaining_usd:
           type: number
           format: double
+          nullable: true
           description: Credits still available after applying current period charges.
         expected_invoice_amount_usd:
           type: number
           format: double
+          nullable: true
           description: Expected invoice amount after credits.
+        stripe_credit_balance_usd:
+          type: number
+          format: double
+          nullable: true
+          description: Stripe-authoritative aggregate remaining credit; null when unavailable.
+        stripe_credits_applied_usd:
+          type: number
+          format: double
+          nullable: true
+        stripe_remaining_credit_usd:
+          type: number
+          format: double
+          nullable: true
+        credit_source:
+          type: string
+          enum: [local_trial, stripe]
+        credit_status:
+          type: string
+          enum: [available, unavailable]
+        credit_observed_at:
+          type: string
+          format: date-time
+          nullable: true
         cost_breakdown_usd:
           $ref: "#/components/schemas/BillingSummaryCostBreakdown"
         resources:
@@ -2619,6 +2646,8 @@ components:
           $ref: "#/components/schemas/BillingSummaryPeriod"
         pricing_tier:
           $ref: "#/components/schemas/BillingSummaryPricingTier"
+        trial:
+          $ref: "#/components/schemas/BillingTrialBalance"
         calculated_at:
           type: string
           format: date-time
@@ -2744,6 +2773,25 @@ components:
         currency:
           type: string
           example: USD
+
+    BillingTrialBalance:
+      type: object
+      required: [grant_usd, consumed_usd, remaining_usd, state, eligible]
+      properties:
+        grant_usd:
+          type: number
+          format: double
+        consumed_usd:
+          type: number
+          format: double
+        remaining_usd:
+          type: number
+          format: double
+        state:
+          type: string
+          enum: [no_grant, active, exhausted, expired, ended_by_billing_activation]
+        eligible:
+          type: boolean
 
     BillingExportPreviewItem:
       type: object

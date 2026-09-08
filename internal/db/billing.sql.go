@@ -1007,6 +1007,36 @@ func (q *Queries) GetTeamCreditBalance(ctx context.Context, teamID uuid.UUID) (p
 	return balance_usd, err
 }
 
+const getTeamTrialBalance = `-- name: GetTeamTrialBalance :one
+SELECT trial.grant_usd::numeric AS grant_usd,
+       trial.consumed_usd::numeric AS consumed_usd,
+       trial.remaining_usd::numeric AS remaining_usd,
+       trial.state::text AS state,
+       trial.eligible::boolean AS eligible
+FROM get_team_trial_balance($1) AS trial
+`
+
+type GetTeamTrialBalanceRow struct {
+	GrantUsd     pgtype.Numeric `json:"grant_usd"`
+	ConsumedUsd  pgtype.Numeric `json:"consumed_usd"`
+	RemainingUsd pgtype.Numeric `json:"remaining_usd"`
+	State        string         `json:"state"`
+	Eligible     bool           `json:"eligible"`
+}
+
+func (q *Queries) GetTeamTrialBalance(ctx context.Context, teamID uuid.UUID) (GetTeamTrialBalanceRow, error) {
+	row := q.db.QueryRow(ctx, getTeamTrialBalance, teamID)
+	var i GetTeamTrialBalanceRow
+	err := row.Scan(
+		&i.GrantUsd,
+		&i.ConsumedUsd,
+		&i.RemainingUsd,
+		&i.State,
+		&i.Eligible,
+	)
+	return i, err
+}
+
 const grantTeamCredit = `-- name: GrantTeamCredit :one
 INSERT INTO team_credit_grant (
     team_id, amount_usd, remaining_usd, reason, expires_at, created_by
