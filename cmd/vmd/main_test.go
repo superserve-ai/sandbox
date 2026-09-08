@@ -3,11 +3,16 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/superserve-ai/sandbox/internal/vm"
 )
 
 func TestLoadConfigRequiresExplicitHostID(t *testing.T) {
@@ -325,5 +330,45 @@ func TestPublishesCapacityPressureRequiresBothHalves(t *testing.T) {
 					tc.advertiseAddr, tc.controlPlaneURL, got, tc.want)
 			}
 		})
+	}
+}
+
+// The host guard greps the vmd binary for the wake-protocol capability. A
+// fabricated binary can only show the shell logic works; this shows a binary
+// linked from this package carries the literal the guard looks for. The test
+// binary links the same code that prints it, so it stands in for the build.
+func TestWakeFloorGuardAdmitsThisBinary(t *testing.T) {
+	const evidencePath = "/var/lib/sandbox/wake-protocol-evidence"
+	src, err := os.ReadFile(filepath.Join("..", "..", "deploy", "vmd-wake-floor-guard"))
+	if err != nil {
+		t.Fatalf("read guard script: %v", err)
+	}
+	if !strings.Contains(string(src), vm.WakeProtocolCapability) || !strings.Contains(string(src), evidencePath) {
+		t.Fatalf("guard script no longer greps for %q beside %q; update this test", vm.WakeProtocolCapability, evidencePath)
+	}
+	dir := t.TempDir()
+	evidence := filepath.Join(dir, "evidence")
+	if err := os.WriteFile(evidence, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	guard := filepath.Join(dir, "guard.sh")
+	if err := os.WriteFile(guard, []byte(strings.ReplaceAll(string(src), evidencePath, evidence)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sh", guard, self).CombinedOutput(); err != nil {
+		t.Fatalf("the guard refused a binary built from this package with the floor up: %v\n%s", err, out)
+	}
+	// The same guard must still refuse a binary without the literal, or the
+	// admission above proves nothing.
+	other := filepath.Join(dir, "older-vmd")
+	if err := os.WriteFile(other, []byte("not a wake-capable vmd\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("sh", guard, other).Run(); err == nil {
+		t.Fatal("the guard admitted a binary without the capability while the floor was up")
 	}
 }
