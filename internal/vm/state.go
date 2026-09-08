@@ -228,6 +228,11 @@ type VMRecord struct {
 	WakePending bool   `json:"wake_pending,omitempty"`
 	ClockFrozen bool   `json:"clock_frozen,omitempty"`
 	FreezeToken string `json:"freeze_token,omitempty"`
+	// WakeToken is the token the owed wake must present: that of the image
+	// being loaded, kept apart from FreezeToken, which describes the image the
+	// record names, until the commit. A resume from an override that dies
+	// between the two returns to Paused with its own image and token intact.
+	WakeToken string `json:"wake_token,omitempty"`
 	// WakeOwedFromPaused: the record owing the wake was Paused before this
 	// resume began, so its image is intact. A crash before the launch, or a
 	// wake that never completes, returns it to Paused; a create in the same
@@ -932,6 +937,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		WakePending:                inst.WakePending,
 		ClockFrozen:                inst.ClockFrozen,
 		FreezeToken:                inst.FreezeToken,
+		WakeToken:                  inst.WakeToken,
 		WakeOwedFromPaused:         inst.WakeOwedFromPaused,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
@@ -1039,6 +1045,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		WakePending:                rec.WakePending,
 		ClockFrozen:                rec.ClockFrozen,
 		FreezeToken:                rec.FreezeToken,
+		WakeToken:                  rec.WakeToken,
 		WakeOwedFromPaused:         rec.WakeOwedFromPaused,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,

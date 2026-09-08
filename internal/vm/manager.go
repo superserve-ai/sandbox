@@ -135,10 +135,12 @@ type VMInstance struct {
 	WakeOwedFromPaused bool
 	// FreezeToken is the token the image's freeze carries; a wake must present it.
 	FreezeToken string
-	CreatedAt   time.Time
-	Metadata    map[string]string
-	TeamID      string // owning team; carried for data-plane usage attribution
-	OwnerID     string // creating user; empty when unknown
+	// WakeToken: see VMRecord.
+	WakeToken string
+	CreatedAt time.Time
+	Metadata  map[string]string
+	TeamID    string // owning team; carried for data-plane usage attribution
+	OwnerID   string // creating user; empty when unknown
 	// PausedAt records when this VM last entered the paused state. It drives
 	// oldest-first pressure reclamation. Zero means the field is unset on a
 	// legacy record; callers fall back to CreatedAt and then place any fully
@@ -2293,9 +2295,10 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	recordedCorrects, recordedFrozen, recordedToken := inst.CorrectsWallClock, inst.SnapshotWorkloadFrozen, inst.FreezeToken
 	pausedMemPath, recordedArtifact, entryUnverified := inst.MemFilePath, inst.ArtifactID, inst.Unverified
 	// The identity the record carried in: a frozen resume stamps this run's
-	// slot and token on it before the launch, and a resume that does not
-	// commit hands them back, since its slot is released and the image the
-	// record names is still the one it was paused into.
+	// slot on it before the launch, and a resume that does not commit hands
+	// it back, since the slot is released. The token of the image being
+	// loaded rides WakeToken until the commit, so the record's own image and
+	// token stay paired whatever happens in between.
 	entrySocket, entryIP, entryTAP, entryMAC, entryNS := inst.SocketPath, inst.IP, inst.TAPDevice, inst.MACAddress, inst.Namespace
 	inst.mu.RUnlock()
 	if wakeProtocolFloorRaised() {
@@ -2416,15 +2419,21 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// Whatever verdict the record got, it must not keep this run's
 		// identity: the slot goes back to the pool once this returns, and a
 		// retry that found it here would claim whatever sandbox holds it
-		// next; the token belongs to an image it may not have resumed from.
-		restamped := inst.IP != entryIP || inst.Namespace != entryNS || inst.FreezeToken != recordedToken
+		// next. The in-flight token goes with it.
+		restamped := inst.IP != entryIP || inst.Namespace != entryNS || inst.WakeToken != ""
 		inst.SocketPath, inst.IP, inst.TAPDevice, inst.MACAddress, inst.Namespace = entrySocket, entryIP, entryTAP, entryMAC, entryNS
-		inst.FreezeToken = recordedToken
+		inst.WakeToken = ""
 		inst.mu.Unlock()
-		if revert || restamped {
-			// Durable before the deferred teardown releases the slot; an
-			// undurable revert is re-derived by the next attempt.
-			_, _ = m.persistStateIfPresent(inst)
+		if !revert && !restamped {
+			return
+		}
+		// Durable before the deferred teardown releases the slot. If the
+		// write fails the durable record still names the slot, so the slot
+		// stays this sandbox's until a write succeeds: leaked for now, never
+		// claimed from another sandbox after a restart.
+		if _, perr := m.persistStateIfPresent(inst); perr != nil {
+			needsNetworkCleanup = false
+			log.Error().Err(perr).Msg("resume rollback could not be made durable; keeping the network slot reserved for this sandbox")
 		}
 	}()
 	// If this Firecracker refuses the clock option, the record must say the
@@ -2462,7 +2471,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			inst.TAPDevice = netInfo.TAPDevice
 			inst.MACAddress = netInfo.MACAddress
 			inst.Namespace = nsName
-			inst.FreezeToken = resumeToken
+			inst.WakeToken = resumeToken
 			inst.mu.Unlock()
 			joinWakeOwed = m.persistWakeOwed(inst, predicted, resumePolicy != nil, true)
 			published = true
@@ -2540,7 +2549,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 					// Durably Error, never retried: the artifacts are retained,
 					// and nothing is owed, so recovery cannot return it to Paused.
 					inst.mu.Lock()
-					inst.WakePending, inst.WakeOwedFromPaused = false, false
+					inst.WakePending, inst.WakeOwedFromPaused, inst.WakeToken = false, false, ""
 					inst.mu.Unlock()
 					m.setStatus(vmID, StatusError)
 					return nil, status.Errorf(codes.FailedPrecondition, "image %q: %v", memPath, werr)
@@ -2589,6 +2598,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.CorrectsWallClock = &resumeCorrectsWallClock
 	inst.SnapshotWorkloadFrozen = &resumeWorkloadFrozen
 	inst.FreezeToken = resumeToken
+	inst.WakeToken = ""
 	inst.PausedAt = time.Time{}
 	// Record the file actually resumed from (callers may pass an explicit path
 	// that differs from the cached one) so the next pause's diff baseline matches
@@ -3579,6 +3589,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.SnapshotWorkloadFrozen = &restoreWorkloadFrozen
 		inst.FreezeToken = restoreToken
 		inst.ArtifactID = restoreArtifactID
+		if restoreWorkloadFrozen {
+			inst.WakeToken = restoreToken
+		}
 		inst.mu.Unlock()
 		// Only a frozen image owes a wake, so only then must the record say so
 		// before the vCPUs can run (see persistWakeOwed). An unfrozen image
@@ -3945,7 +3958,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// Terminal: the Error written below must not owe a wake, or
 			// recovery would read it as a resume to return to Paused.
 			inst.mu.Lock()
-			inst.WakePending, inst.WakeOwedFromPaused = false, false
+			inst.WakePending, inst.WakeOwedFromPaused, inst.WakeToken = false, false, ""
 			inst.mu.Unlock()
 		}
 		// Emit the exhausted readiness wait immediately, before teardown, so
@@ -4076,6 +4089,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	inst.Unverified = false
 	inst.WakePending = false
 	inst.WakeOwedFromPaused = false
+	inst.WakeToken = ""
 	// A frozen image kept its pause timestamp through the launch, so a
 	// failure could return it to Paused in its place in the reclaim order.
 	inst.PausedAt = time.Time{}
@@ -5095,6 +5109,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				log.Warn().Msg("resume interrupted before its launch — record returns to Paused")
 				rec.Status = StatusPaused
 				rec.WakePending, rec.ClockFrozen, rec.WakeOwedFromPaused, rec.Unverified = false, false, false, false
+				rec.WakeToken = ""
 				if wrote, perr := m.state.PutIfPresent(rec); perr != nil || !wrote {
 					log.Warn().Err(perr).Bool("present", wrote).Msg("interrupted resume's record could not be returned to Paused")
 					return nil, false
@@ -8223,7 +8238,7 @@ var adoptionBoxdReady = func(ctx context.Context, m *Manager, ip string) error {
 func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string, inst *VMInstance) error {
 	ctx := context.WithoutCancel(callerCtx)
 	inst.mu.RLock()
-	pending, frozen, token := inst.WakePending, inst.ClockFrozen, inst.FreezeToken
+	pending, frozen, token := inst.WakePending, inst.ClockFrozen, inst.WakeToken
 	inst.mu.RUnlock()
 	if !pending {
 		return adoptionBoxdReady(ctx, m, ip)
@@ -8237,6 +8252,7 @@ func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string, inst *VM
 	inst.mu.Lock()
 	inst.WakePending = false
 	inst.WakeOwedFromPaused = false
+	inst.WakeToken = ""
 	inst.mu.Unlock()
 	return nil
 }
@@ -8469,6 +8485,7 @@ func (m *Manager) parkUnservable(inst *VMInstance, terminal bool) {
 	if !terminal && inst.WakePending && inst.WakeOwedFromPaused {
 		inst.Status = StatusPaused
 		inst.WakePending, inst.ClockFrozen, inst.WakeOwedFromPaused, inst.Unverified = false, false, false, false
+		inst.WakeToken = ""
 	} else {
 		inst.Status = StatusError
 	}

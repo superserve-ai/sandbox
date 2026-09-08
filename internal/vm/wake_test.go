@@ -106,7 +106,7 @@ func TestVerifyBoxdReadyCompletesAPendingWake(t *testing.T) {
 			t.Fatal("a pending wake must not be verified by health")
 			return nil
 		}
-		inst := &VMInstance{ID: "vm", WakePending: true, ClockFrozen: true, FreezeToken: "tok"}
+		inst := &VMInstance{ID: "vm", WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeToken: "tok"}
 		if err := m.verifyBoxdReady(context.Background(), "10.0.0.2", inst); err != nil {
 			t.Fatalf("verify: %v", err)
 		}
@@ -151,7 +151,7 @@ func TestVerifyBoxdReadyCompletesAPendingWake(t *testing.T) {
 // owes one.
 func TestWakeStateSurvivesRecordRoundTrip(t *testing.T) {
 	frozen := true
-	rec := toRecord(&VMInstance{ID: "vm", WakePending: true, ClockFrozen: true, SnapshotWorkloadFrozen: &frozen, FreezeToken: "tok", ArtifactID: "a"})
+	rec := toRecord(&VMInstance{ID: "vm", WakePending: true, ClockFrozen: true, SnapshotWorkloadFrozen: &frozen, FreezeToken: "tok", WakeToken: "tok", ArtifactID: "a"})
 	if !rec.WakePending || !rec.ClockFrozen || rec.SnapshotWorkloadFrozen == nil || !*rec.SnapshotWorkloadFrozen || rec.FreezeToken != "tok" || rec.ArtifactID != "a" {
 		t.Fatalf("toRecord dropped wake state: %+v", rec)
 	}
@@ -200,7 +200,7 @@ func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
 	var owedAtLaunch bool
 	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
 		inst.mu.RLock()
-		ipAtLaunch, tokenAtLaunch, owedAtLaunch = inst.IP, inst.FreezeToken, inst.WakePending
+		ipAtLaunch, tokenAtLaunch, owedAtLaunch = inst.IP, inst.WakeToken, inst.WakePending
 		inst.mu.RUnlock()
 		return 4321, SupervisionUnit, nil
 	}
@@ -240,6 +240,9 @@ func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
 	defer inst.mu.RUnlock()
 	if inst.Status != StatusRunning || inst.Unverified || inst.WakePending {
 		t.Errorf("after resume: status=%v unverified=%v wakePending=%v", inst.Status, inst.Unverified, inst.WakePending)
+	}
+	if inst.FreezeToken != "tok" || inst.WakeToken != "" {
+		t.Errorf("after resume: freeze=%q wake=%q; want the committed token and nothing in flight", inst.FreezeToken, inst.WakeToken)
 	}
 }
 
@@ -292,10 +295,10 @@ func TestFrozenResumeFailureRevertsToPaused(t *testing.T) {
 	// The slot this run took goes back to the pool: the record must not keep
 	// naming it, or a retry would claim whatever sandbox holds it next.
 	inst.mu.RLock()
-	ip, ns, token := inst.IP, inst.Namespace, inst.FreezeToken
+	ip, ns, token, inflight := inst.IP, inst.Namespace, inst.FreezeToken, inst.WakeToken
 	inst.mu.RUnlock()
-	if ip != "10.9.9.9" || ns != "" || token != "rec" {
-		t.Errorf("after the failure: ip=%q ns=%q token=%q; want the entry identity back", ip, ns, token)
+	if ip != "10.9.9.9" || ns != "" || token != "rec" || inflight != "" {
+		t.Errorf("after the failure: ip=%q ns=%q token=%q inflight=%q; want the entry identity back and nothing in flight", ip, ns, token, inflight)
 	}
 
 	// An override resolves its token from its own manifest; a failed resume
@@ -309,7 +312,7 @@ func TestFrozenResumeFailureRevertsToPaused(t *testing.T) {
 	var tokenAtLaunch string
 	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
 		inst.mu.RLock()
-		tokenAtLaunch = inst.FreezeToken
+		tokenAtLaunch = inst.WakeToken
 		inst.mu.RUnlock()
 		return 0, SupervisionUnit, errors.New("launch failed")
 	}
@@ -317,13 +320,13 @@ func TestFrozenResumeFailureRevertsToPaused(t *testing.T) {
 		t.Fatal("want the launch failure")
 	}
 	inst.mu.RLock()
-	mem, token := inst.MemFilePath, inst.FreezeToken
+	mem, token, inflight := inst.MemFilePath, inst.FreezeToken, inst.WakeToken
 	inst.mu.RUnlock()
 	if tokenAtLaunch != "disk" {
-		t.Errorf("token at launch %q, want the override's", tokenAtLaunch)
+		t.Errorf("token in flight at launch %q, want the override's", tokenAtLaunch)
 	}
-	if mem != memPath || token != "rec" {
-		t.Errorf("after the failed override resume: mem=%q token=%q; want the record's own image and token", mem, token)
+	if mem != memPath || token != "rec" || inflight != "" {
+		t.Errorf("after the failed override resume: mem=%q token=%q inflight=%q; want the record's own image and token", mem, token, inflight)
 	}
 	inst.mu.RLock()
 	defer inst.mu.RUnlock()
@@ -711,7 +714,7 @@ func TestReattachCompletesOwedWakesBeforeServing(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { store.Close() })
-		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", Supervision: SupervisionUnit, IP: "10.0.0.2"}); err != nil {
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeToken: "tok", Supervision: SupervisionUnit, IP: "10.0.0.2"}); err != nil {
 			t.Fatal(err)
 		}
 		return &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}, store
@@ -974,7 +977,7 @@ func TestRequestJoiningADeferredStartupFlightReattachesItself(t *testing.T) {
 	if err := os.WriteFile(socket, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", Supervision: SupervisionUnit, IP: "10.0.0.2", SocketPath: socket}); err != nil {
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeToken: "tok", Supervision: SupervisionUnit, IP: "10.0.0.2", SocketPath: socket}); err != nil {
 		t.Fatal(err)
 	}
 	origDown := vmUnitFullyDown
@@ -1069,7 +1072,10 @@ func TestInterruptedResumeReturnsToPaused(t *testing.T) {
 				}
 			}
 			pausedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
-			rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeOwedFromPaused: tc.fromPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath, PausedAt: pausedAt}
+			// What a resume from an override leaves if vmd dies before its
+			// launch: the record's own image and token, and the override's
+			// token in flight.
+			rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "rec", WakeToken: "disk", WakeOwedFromPaused: tc.fromPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath, PausedAt: pausedAt}
 			if err := store.Put(rec); err != nil {
 				t.Fatal(err)
 			}
@@ -1084,6 +1090,9 @@ func TestInterruptedResumeReturnsToPaused(t *testing.T) {
 			}
 			if got == nil || got.Status != StatusPaused || got.WakePending || got.Unverified || got.WakeOwedFromPaused {
 				t.Fatalf("record = %+v, want Paused with nothing owed", got)
+			}
+			if got.FreezeToken != "rec" || got.WakeToken != "" {
+				t.Errorf("tokens freeze=%q wake=%q; want the record's own token kept and the in-flight one dropped", got.FreezeToken, got.WakeToken)
 			}
 			if !got.PausedAt.Equal(pausedAt) {
 				t.Errorf("PausedAt = %v, want the original %v kept for the reclaim order", got.PausedAt, pausedAt)
@@ -1113,7 +1122,7 @@ func TestUnwakeableReattachedResumeReturnsToPaused(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeOwedFromPaused: true, Supervision: SupervisionUnit, IP: "10.0.0.2"}); err != nil {
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeToken: "tok", WakeOwedFromPaused: true, Supervision: SupervisionUnit, IP: "10.0.0.2"}); err != nil {
 		t.Fatal(err)
 	}
 	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
@@ -1208,7 +1217,7 @@ func TestTokenMismatchStaysErrorThroughRecovery(t *testing.T) {
 		}
 		t.Cleanup(func() { store.Close() })
 		// What an older write could have left: Error, yet still owing.
-		rec := VMRecord{ID: "vm-1", Status: StatusError, WakePending: true, WakeOwedFromPaused: true, FreezeToken: "tok", Supervision: SupervisionUnit}
+		rec := VMRecord{ID: "vm-1", Status: StatusError, WakePending: true, WakeOwedFromPaused: true, FreezeToken: "tok", WakeToken: "tok", Supervision: SupervisionUnit}
 		if err := store.Put(rec); err != nil {
 			t.Fatal(err)
 		}
@@ -1230,7 +1239,7 @@ func TestTokenMismatchStaysErrorThroughRecovery(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { store.Close() })
-		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeOwedFromPaused: true, Supervision: SupervisionUnit, IP: "10.0.0.2"}); err != nil {
+		if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeToken: "tok", WakeOwedFromPaused: true, Supervision: SupervisionUnit, IP: "10.0.0.2"}); err != nil {
 			t.Fatal(err)
 		}
 		mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
@@ -1335,5 +1344,75 @@ func TestFailedRestoreDoesNotWaitOnTheStore(t *testing.T) {
 			t.Fatalf("durable record never reached Error after the store was released: rec=%+v err=%v", rec, gerr)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A rollback that cannot be made durable leaves a record naming this run's
+// slot. The slot then stays reserved for this sandbox rather than going back
+// to the pool, where the next sandbox to receive it could be claimed by a
+// retry after a restart.
+func TestFrozenResumeRollbackThatCannotPersistKeepsTheSlot(t *testing.T) {
+	useTempFloor(t)
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	rootfs := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snapPath, memPath, rootfs} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			store.Close()
+		}
+	})
+	frozen := true
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
+		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs,
+		SnapshotWorkloadFrozen: &frozen, FreezeToken: "rec",
+	}
+	if err := store.Put(toRecord(inst)); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeNetMgr{}
+	mgr := &Manager{
+		log:    zerolog.Nop(),
+		cfg:    ManagerConfig{RunDir: dir},
+		netMgr: fake,
+		vms:    map[string]*VMInstance{"vm-1": inst},
+		state:  store,
+	}
+	// The store dies under the resume: the launch fails and the rollback's
+	// write cannot land.
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		store.Close()
+		closed = true
+		return 0, SupervisionUnit, errors.New("launch failed")
+	}
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err == nil {
+		t.Fatal("want the launch failure")
+	}
+	if len(fake.setupCalls) != 1 {
+		t.Fatalf("setup calls = %v, want the slot taken once", fake.setupCalls)
+	}
+	if len(fake.teardownCalls) != 0 {
+		t.Fatalf("teardown calls = %v; the slot must stay reserved while the durable record still names it", fake.teardownCalls)
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	if inst.Status != StatusPaused {
+		t.Errorf("status %v, want Paused in memory", inst.Status)
 	}
 }
