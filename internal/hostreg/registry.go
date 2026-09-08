@@ -183,6 +183,14 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 // returning or caching the just-invalidated address. Concurrent callers for
 // one host share a single resolution.
 func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.Client, error) {
+	return r.resolveFrom(ctx, hostID, "")
+}
+
+// resolveFrom is resolveClient with an optional address the caller has just
+// read from the host row: the first attempt dials it instead of reading the
+// row again, under the same generation and report checks. A later attempt,
+// forced by a conflict, always reads.
+func (r *Registry) resolveFrom(ctx context.Context, hostID, knownAddr string) (vmdclient.Client, error) {
 	// DoChan rather than Do: the shared resolution keeps running on its
 	// detached context and still fills the cache, but each caller waits only
 	// as long as its own request lives — a canceled create/resume stops
@@ -217,37 +225,43 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 			seqAtRead := r.reportSeq[hostID]
 			r.mu.RUnlock()
 
-			host, err := r.db.GetHost(vctx, hostID)
-			if err != nil {
-				// Dispatching a cached client on a failed read is only safe
-				// while an entry exists NOW — checked after the read, not
-				// via the pre-read snapshot, so an invalidation that landed
-				// during the read is honored. Invalidated with an
-				// unreadable row: retry, then fail closed — the
-				// invalidation had a reason, and dispatching past it risks
-				// the machine that lost the identity.
-				r.mu.Lock()
-				e, ok := r.clients[hostID]
-				withinLease := ok && time.Since(e.verifiedAt) < r.unverifiedLease()
-				if withinLease {
-					// Bounded backoff: the next verification is due after
-					// the backoff, not before, and degraded suppresses
-					// refresh-ahead — so a failing DB is retried on the
-					// backoff's pace, never per call. verifiedAt (the lease
-					// clock) advances solely on successful reads, so
-					// sustained failure runs the lease out and fails closed.
-					e.nextCheckAt = time.Now().Add(r.verifyFailureBackoff())
-					e.degraded = true
-					r.clients[hostID] = e
+			var addr string
+			if attempt == 0 && knownAddr != "" {
+				addr = knownAddr
+			} else {
+				host, err := r.db.GetHost(vctx, hostID)
+				if err != nil {
+					// Dispatching a cached client on a failed read is only safe
+					// while an entry exists NOW — checked after the read, not
+					// via the pre-read snapshot, so an invalidation that landed
+					// during the read is honored. Invalidated with an
+					// unreadable row: retry, then fail closed — the
+					// invalidation had a reason, and dispatching past it risks
+					// the machine that lost the identity.
+					r.mu.Lock()
+					e, ok := r.clients[hostID]
+					withinLease := ok && time.Since(e.verifiedAt) < r.unverifiedLease()
+					if withinLease {
+						// Bounded backoff: the next verification is due after
+						// the backoff, not before, and degraded suppresses
+						// refresh-ahead — so a failing DB is retried on the
+						// backoff's pace, never per call. verifiedAt (the lease
+						// clock) advances solely on successful reads, so
+						// sustained failure runs the lease out and fails closed.
+						e.nextCheckAt = time.Now().Add(r.verifyFailureBackoff())
+						e.degraded = true
+						r.clients[hostID] = e
+					}
+					r.mu.Unlock()
+					if withinLease {
+						log.Warn().Err(err).Str("host_id", hostID).
+							Msg("host address verification failed; dispatching via cached client within lease")
+						return e.client, nil
+					}
+					lastErr = err
+					continue
 				}
-				r.mu.Unlock()
-				if withinLease {
-					log.Warn().Err(err).Str("host_id", hostID).
-						Msg("host address verification failed; dispatching via cached client within lease")
-					return e.client, nil
-				}
-				lastErr = err
-				continue
+				addr = host.VmdAddr
 			}
 
 			// If the cache holds an entry at the row's address — the common
@@ -259,7 +273,7 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				r.mu.Unlock()
 				continue // invalidated mid-read; re-read the row
 			}
-			if r.reportedConflictLocked(hostID, seqAtRead, host.VmdAddr) {
+			if r.reportedConflictLocked(hostID, seqAtRead, addr) {
 				// In doubt: drop the cached client before the re-read so a
 				// failed confirmation fails closed for every caller.
 				delete(r.clients, hostID)
@@ -267,7 +281,7 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				continue
 			}
 			seqAtDial := r.reportSeq[hostID]
-			if e, ok := r.clients[hostID]; ok && e.addr == host.VmdAddr {
+			if e, ok := r.clients[hostID]; ok && e.addr == addr {
 				now := time.Now()
 				e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
 				r.clients[hostID] = e
@@ -278,18 +292,18 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 
 			// No usable entry for the row's address: dial it. Covers first
 			// use, an address change, and an invalidated-but-unmoved host.
-			if hadPrev && prev.addr != host.VmdAddr {
+			if hadPrev && prev.addr != addr {
 				log.Warn().Str("host_id", hostID).Str("old_addr", prev.addr).
-					Str("new_addr", host.VmdAddr).
+					Str("new_addr", addr).
 					Msg("host address changed; re-dialing before dispatch")
 			}
-			c, err := r.dial(hostID, host.VmdAddr, func() { r.Invalidate(hostID) })
+			c, err := r.dial(hostID, addr, func() { r.Invalidate(hostID) })
 			if err != nil {
 				// No falling back to a previous client: failing loudly
 				// beats executing on a machine that may have lost the
 				// identity.
 				r.Invalidate(hostID)
-				return nil, fmt.Errorf("dial VMD at %s for host %q: %w", host.VmdAddr, hostID, err)
+				return nil, fmt.Errorf("dial VMD at %s for host %q: %w", addr, hostID, err)
 			}
 			r.mu.Lock()
 			if r.gens[hostID] != startGen {
@@ -299,7 +313,7 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				r.mu.Unlock()
 				continue
 			}
-			if r.reportedConflictLocked(hostID, seqAtDial, host.VmdAddr) {
+			if r.reportedConflictLocked(hostID, seqAtDial, addr) {
 				// Same as above, for a report that landed during the dial.
 				delete(r.clients, hostID)
 				r.mu.Unlock()
@@ -307,7 +321,7 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 			}
 			now := time.Now()
 			r.clients[hostID] = entry{
-				client: c, addr: host.VmdAddr,
+				client: c, addr: addr,
 				verifiedAt: now, nextCheckAt: now.Add(r.recheckTTL()),
 			}
 			r.mu.Unlock()
@@ -346,8 +360,9 @@ func (r *Registry) Invalidate(hostID string) {
 // MarkVerified records a host row read the caller has just performed and the
 // address it saw, so the dispatch that follows does not read the row itself.
 // A cached client at that address has its lease renewed; one at a different
-// address is dropped, never kept as a fallback, and the host is resolved now.
-// A resolution failure is logged and leaves ClientFor to fail closed.
+// address is dropped, never kept as a fallback, and the host is resolved now
+// from the reported address, with no second row read. A resolution failure
+// is logged and leaves ClientFor to fail closed.
 func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
 	if addr == "" {
 		return
@@ -373,7 +388,7 @@ func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
 		r.gens[hostID]++
 	}
 	r.mu.Unlock()
-	if _, err := r.resolveClient(ctx, hostID); err != nil {
+	if _, err := r.resolveFrom(ctx, hostID, addr); err != nil {
 		log.Warn().Err(err).Str("host_id", hostID).Msg("host client resolution after row verification failed")
 	}
 }

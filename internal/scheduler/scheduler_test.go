@@ -508,3 +508,25 @@ func TestLoadHostsExpiredEmptySetReloadsInline(t *testing.T) {
 		t.Fatalf("queries = %d, want 2 (one in-line reload)", n)
 	}
 }
+
+// A rejected host drops only the candidate sets that still name it. Once a
+// fresh load no longer includes it, further rejections of that host are
+// no-ops, so concurrent creates that all drew it share one reload.
+func TestRejectDropsOnlySetsStillNamingTheHost(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-1" {
+		t.Fatalf("prime = (%q, %v)", id, err)
+	}
+	s.Reject("host-1")
+	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" {
+		t.Fatalf("after reject = (%q, %v), want host-2 from a fresh load", id, err)
+	}
+	s.Reject("host-1") // the fresh set no longer names host-1: no-op
+	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" {
+		t.Fatalf("after stale reject = (%q, %v), want the cached host-2", id, err)
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("queries = %d, want 2 (one reload for the whole burst)", n)
+	}
+}

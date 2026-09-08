@@ -123,6 +123,9 @@ type Scheduler interface {
 	// Invalidate drops any cached host state so the next SelectHost
 	// reflects host status changes immediately.
 	Invalidate()
+	// Reject drops cached host state that still names hostID, which the
+	// create pre-flight has just refused; state loaded since is kept.
+	Reject(hostID string)
 }
 
 // HostRegistry resolves a host ID to a VMD client.
@@ -2076,9 +2079,9 @@ func (h *Handlers) selectCreateHost(c *gin.Context, requiredCapabilities []strin
 // placeCreate selects a host and re-attests it: the candidate set may be
 // arbitrarily stale, so the pre-flight reads the chosen host's status and
 // capabilities (one row read when uncached, which also verifies its address
-// for the registry). A rejected host drops the candidate set and selection
-// runs once more before the request fails. Writes the error response and
-// returns ok=false on failure.
+// for the registry). A rejected host drops the candidate sets still naming
+// it and selection runs once more before the request fails. Writes the error
+// response and returns ok=false on failure.
 func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (hostID string, ok bool) {
 	if hostID, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
 		return "", false
@@ -2086,8 +2089,8 @@ func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (h
 	SetTelemetryHostID(c, hostID)
 	eligible, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
 	if err == nil && !eligible && h.Scheduler != nil {
-		log.Warn().Str("host_id", hostID).Msg("scheduled host failed the pre-flight; reloading candidates and selecting again")
-		h.Scheduler.Invalidate()
+		log.Warn().Str("host_id", hostID).Msg("scheduled host failed the pre-flight; selecting again without it")
+		h.Scheduler.Reject(hostID)
 		if hostID, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
 			return "", false
 		}

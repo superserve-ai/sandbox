@@ -738,8 +738,8 @@ func TestMarkVerifiedRenewsLeaseWithoutRead(t *testing.T) {
 	}
 }
 
-// With no client yet, MarkVerified resolves up front (one read, one dial) so
-// the first dispatch on a fresh process finds a verified client waiting.
+// With no client yet, MarkVerified dials the reported address up front — no
+// row read of its own — so the first dispatch finds a verified client.
 func TestMarkVerifiedColdResolvesOnce(t *testing.T) {
 	store := &hostDB{addr: "10.0.0.1:50051"}
 	var dials atomic.Int64
@@ -753,19 +753,24 @@ func TestMarkVerifiedColdResolvesOnce(t *testing.T) {
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("ClientFor: %v", err)
 	}
-	if n := store.readCount(); n != 1 {
-		t.Fatalf("reads = %d, want 1", n)
+	if n := store.readCount(); n != 0 {
+		t.Fatalf("reads = %d, want 0 (the caller's read is the verification)", n)
 	}
 	if dials.Load() != 1 {
 		t.Fatalf("dials = %d, want 1", dials.Load())
 	}
 }
 
-// The row just reported a new address: the client at the old one must not
-// survive as a within-lease fallback when the re-resolution's read fails.
-func TestMarkVerifiedMovedAddressFailsClosedWhenReadFails(t *testing.T) {
+// The row just reported a new address: the client at the old one is dropped
+// and the new address is dialed from the report itself, so even with the
+// row unreadable the next dispatch goes to the new machine, never the old.
+func TestMarkVerifiedMovedAddressDialsReportWithoutRead(t *testing.T) {
 	store := &hostDB{addr: "10.0.0.1:50051"}
-	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		dialed = append(dialed, addr)
+		return nil, nil
+	}
 	r := New(db.New(store), dial)
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("prime: %v", err)
@@ -773,8 +778,17 @@ func TestMarkVerifiedMovedAddressFailsClosedWhenReadFails(t *testing.T) {
 
 	store.setFailRead(true)
 	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051")
-	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
-		t.Fatal("ClientFor served the client at the old address after the row reported a move")
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor after move: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want the reported .2", settled)
+	}
+	if want := []string{"10.0.0.1:50051", "10.0.0.2:50051"}; fmt.Sprint(dialed) != fmt.Sprint(want) {
+		t.Fatalf("dialed = %v, want %v", dialed, want)
+	}
+	if n := store.readCount(); n != 1 {
+		t.Fatalf("reads = %d, want 1 (prime only)", n)
 	}
 }
 
@@ -800,8 +814,8 @@ func TestMarkVerifiedMovedAddressRedials(t *testing.T) {
 	if want := []string{"10.0.0.1:50051", "10.0.0.2:50051"}; fmt.Sprint(dialed) != fmt.Sprint(want) {
 		t.Fatalf("dialed = %v, want %v", dialed, want)
 	}
-	if n := store.readCount(); n != 2 {
-		t.Fatalf("reads = %d, want 2 (prime + the move's re-resolution)", n)
+	if n := store.readCount(); n != 1 {
+		t.Fatalf("reads = %d, want 1 (prime only; the move is dialed from the report)", n)
 	}
 }
 
