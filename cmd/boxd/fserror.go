@@ -47,8 +47,8 @@ type fsErrorBody struct {
 // the filesystem itself carries its errno and the mount that served the
 // path; any other error keeps the plain `{"error": message}` body.
 func writeFSError(w http.ResponseWriter, path string, err error) {
-	var errno syscall.Errno
-	if !errors.As(err, &errno) || !fsErrnos[errno] {
+	errno, ok := fsErrno(err)
+	if !ok {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -62,6 +62,15 @@ func writeFSError(w http.ResponseWriter, path string, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusInternalServerError)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": body})
+}
+
+// fsErrno reports whether err was raised by the filesystem itself.
+func fsErrno(err error) (syscall.Errno, bool) {
+	var errno syscall.Errno
+	if errors.As(err, &errno) && fsErrnos[errno] {
+		return errno, true
+	}
+	return 0, false
 }
 
 // mountFor returns the mount serving path, or nil when unknown. Symlinks
