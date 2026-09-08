@@ -1029,9 +1029,10 @@ func TestMarkVerifiedSameAddressStillSupersedesOlderConflictingLookup(t *testing
 	mu.Lock()
 	got := append([]string(nil), dialed...)
 	mu.Unlock()
-	// The re-read finds .1 already cached and renews it: no third dial.
-	if len(got) != 2 || got[1] != "10.0.0.2:50051" {
-		t.Fatalf("dial sequence = %v, want [.1, .2 discarded]", got)
+	// The conflict dropped the cached .1 (it was in doubt), so the confirming
+	// re-read dials .1 afresh rather than renewing it: .2 is never published.
+	if len(got) != 3 || got[1] != "10.0.0.2:50051" || got[2] != "10.0.0.1:50051" {
+		t.Fatalf("dial sequence = %v, want [.1, .2 discarded, .1 re-dialed after confirmation]", got)
 	}
 }
 
@@ -1230,7 +1231,73 @@ func TestReportDuringReadAfterAddressReturns(t *testing.T) {
 	mu.Lock()
 	got := append([]string(nil), dialed...)
 	mu.Unlock()
-	if len(got) != 1 {
-		t.Fatalf("dialed = %v, want only the priming dial (.2 must never be dialed)", got)
+	// The conflict dropped the cached .1 (in doubt until confirmed), so the
+	// re-read dials .1 again; .2 is never dialed.
+	if len(got) != 2 || got[1] != "10.0.0.1:50051" {
+		t.Fatalf("dialed = %v, want [.1, .1 re-dialed after confirmation] and never .2", got)
+	}
+}
+
+// A conflict must not leave the doubted client behind as a fallback. The
+// cached client is at .1, a due read captures .2 and is held, a report of .1
+// renews the client, the held read returns .2 — a conflict — and the
+// confirming re-read then fails. Nothing may dispatch through .1: not this
+// resolution via its within-lease fallback, and not a concurrent request.
+// Once reads work again the registry lands on the row's answer.
+func TestConflictDropsCachedClientSoFailedConfirmationFailsClosed(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // .1
+		t.Fatalf("prime: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond) // lease due
+	store.setAddr("10.0.0.2:50051")
+	gate := make(chan struct{})
+	store.setGate(gate) // the recheck captures .2 and is held
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.readCount() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("recheck never reached its read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // renews .1
+	store.setFailRead(true)                                          // the confirming re-read will fail
+	store.setGate(nil)
+	close(gate) // the held read returns .2: a conflict
+
+	if err := <-lookup; err == nil {
+		t.Fatal("resolution returned a client after its confirming read failed; want fail closed")
+	}
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("a concurrent ClientFor was served the doubted client; want fail closed")
+	}
+	mu.Lock()
+	n := len(dialed)
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("dials = %d, want only the priming dial while the address is in doubt", n)
+	}
+
+	store.setFailRead(false)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor once reads work: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want .2 (the row's answer)", settled)
 	}
 }

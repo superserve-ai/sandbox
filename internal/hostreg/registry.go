@@ -88,8 +88,10 @@ type Registry struct {
 	// then). A report that agrees costs nothing, so concurrent equivalent
 	// reports cannot starve a resolution; only a genuine conflict costs a
 	// re-read, and the fresh generation-guarded read is the sole authority.
-	// A report that contradicts the CACHED client drops it on the spot, so
-	// nothing dispatches through it while that read is pending.
+	// A report that contradicts the CACHED client drops it on the spot, and
+	// so does a conflict detected by a resolution, so nothing — the
+	// resolution's own within-lease fallback included — dispatches through
+	// a doubted address; if the confirming read fails, dispatch fails closed.
 	reported  map[string]string
 	reportSeq map[string]uint64
 	resolve   singleflight.Group // one row-read/dial resolution in flight per host
@@ -261,8 +263,14 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				continue // invalidated mid-read; re-read the row
 			}
 			if r.reportedConflictLocked(hostID, seqAtRead, host.VmdAddr) {
+				// A report during the read disagrees with it: the address is
+				// in doubt. Drop any cached client NOW, before the re-read —
+				// if that read fails, neither this resolution's within-lease
+				// fallback nor any concurrent ClientFor may dispatch through
+				// an address a read has contradicted.
+				delete(r.clients, hostID)
 				r.mu.Unlock()
-				continue // a report during the read disagrees with it; re-read the row
+				continue
 			}
 			seqAtDial := r.reportSeq[hostID]
 			if e, ok := r.clients[hostID]; ok && e.addr == host.VmdAddr {
@@ -298,8 +306,10 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				continue
 			}
 			if r.reportedConflictLocked(hostID, seqAtDial, host.VmdAddr) {
+				// Same as above, for a report that landed during the dial.
+				delete(r.clients, hostID)
 				r.mu.Unlock()
-				continue // a report during the dial disagrees with the address dialed; re-read
+				continue
 			}
 			now := time.Now()
 			r.clients[hostID] = entry{
