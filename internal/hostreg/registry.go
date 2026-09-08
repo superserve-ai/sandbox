@@ -188,15 +188,24 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 // returning or caching the just-invalidated address. Concurrent callers for
 // one host share a single resolution.
 func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.Client, error) {
-	return r.resolveFrom(ctx, hostID, "")
+	return r.resolveFrom(ctx, hostID, "", 0)
+}
+
+// Generation is the host's current invalidation generation. A caller that
+// reads the host row captures it first and hands it to MarkVerified with
+// the address it read, so a read that predates a reclaim is never trusted.
+func (r *Registry) Generation(hostID string) uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.gens[hostID]
 }
 
 // resolveFrom is resolveClient with an optional address the caller has just
-// read from the host row: the first attempt dials it instead of reading the
-// row again, under the same generation and report checks, unless a report
-// conflict is still unconfirmed. A later attempt, forced by a conflict,
-// always reads.
-func (r *Registry) resolveFrom(ctx context.Context, hostID, knownAddr string) (vmdclient.Client, error) {
+// read from the host row, valid only while the host's generation is still
+// knownGen: the first attempt dials it instead of reading the row again,
+// under the same generation and report checks, unless a report conflict is
+// still unconfirmed. A later attempt, forced by a conflict, always reads.
+func (r *Registry) resolveFrom(ctx context.Context, hostID, knownAddr string, knownGen uint64) (vmdclient.Client, error) {
 	// DoChan rather than Do: the shared resolution keeps running on its
 	// detached context and still fills the cache, but each caller waits only
 	// as long as its own request lives — a canceled create/resume stops
@@ -235,7 +244,7 @@ func (r *Registry) resolveFrom(ctx context.Context, hostID, knownAddr string) (v
 			prev, hadPrev := r.clients[hostID]
 			seqAtRead := r.reportSeq[hostID]
 			seed := knownAddr
-			if attempt > 0 || r.unconfirmedConflictLocked(hostID) {
+			if attempt > 0 || startGen != knownGen || r.unconfirmedConflictLocked(hostID) {
 				seed = ""
 			}
 			r.mu.RUnlock()
@@ -380,20 +389,26 @@ func (r *Registry) Invalidate(hostID string) {
 	r.mu.Unlock()
 }
 
-// MarkVerified records a host row read the caller has just performed and the
-// address it saw, so the dispatch that follows does not read the row itself.
-// A cached client at that address has its lease renewed and a cold host is
-// dialed from the reported address with no second row read — unless the
-// report disagrees with the previous report or with the cached client, in
-// which case the row is read before anything is published, since either
-// side may be the stale one. A cached client at a different address is
-// dropped, never kept as a fallback. A resolution failure is logged and
-// leaves ClientFor to fail closed.
-func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
+// MarkVerified records a host row read the caller has just performed — the
+// address it saw and the Generation it captured before reading — so the
+// dispatch that follows does not read the row itself. A report from before
+// an invalidation is discarded: the reclaim that bumped the generation is
+// newer than what it read. Otherwise a cached client at that address has
+// its lease renewed and a cold host is dialed from the reported address with
+// no second row read — unless the report disagrees with the previous report
+// or with the cached client, in which case the row is read before anything
+// is published, since either side may be the stale one. A cached client at
+// a different address is dropped, never kept as a fallback. A resolution
+// failure is logged and leaves ClientFor to fail closed.
+func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string, readGen uint64) {
 	if addr == "" {
 		return
 	}
 	r.mu.Lock()
+	if r.gens[hostID] != readGen {
+		r.mu.Unlock()
+		return
+	}
 	seq := r.reportSeq[hostID] + 1
 	r.reportSeq[hostID] = seq
 	last, seen := r.reported[hostID]
@@ -414,8 +429,9 @@ func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
 		r.mu.Unlock()
 		return
 	}
+	gen := r.gens[hostID]
 	r.mu.Unlock()
-	if _, err := r.resolveFrom(ctx, hostID, addr); err != nil {
+	if _, err := r.resolveFrom(ctx, hostID, addr, gen); err != nil {
 		log.Warn().Err(err).Str("host_id", hostID).Msg("host client resolution after row verification failed")
 	}
 }

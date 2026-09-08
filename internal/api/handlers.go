@@ -135,9 +135,13 @@ type HostRegistry interface {
 	// re-reads the host row. Callers that change a host's address must
 	// invalidate, or RPCs keep flowing to the previous machine.
 	Invalidate(hostID string)
+	// Generation is the host's invalidation generation; capture it before
+	// reading the host row and pass it to MarkVerified with what was read.
+	Generation(hostID string) uint64
 	// MarkVerified records a host row read the caller has just performed and
 	// the address it saw, so the next ClientFor need not read the row itself.
-	MarkVerified(ctx context.Context, hostID, addr string)
+	// A read from before an invalidation (readGen stale) is discarded.
+	MarkVerified(ctx context.Context, hostID, addr string, readGen uint64)
 }
 
 // Handlers holds shared dependencies for all route handlers.

@@ -40,8 +40,9 @@ type verifyRecorder struct {
 func (v *verifyRecorder) ClientFor(context.Context, string) (vmdclient.Client, error) {
 	return nil, fmt.Errorf("not used in this test")
 }
-func (v *verifyRecorder) Invalidate(string) {}
-func (v *verifyRecorder) MarkVerified(_ context.Context, hostID, addr string) {
+func (v *verifyRecorder) Invalidate(string)        {}
+func (v *verifyRecorder) Generation(string) uint64 { return 0 }
+func (v *verifyRecorder) MarkVerified(_ context.Context, hostID, addr string, _ uint64) {
 	v.mu.Lock()
 	v.verified = append(v.verified, hostID+"="+addr)
 	v.mu.Unlock()

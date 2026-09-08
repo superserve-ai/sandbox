@@ -726,7 +726,7 @@ func TestMarkVerifiedRenewsLeaseWithoutRead(t *testing.T) {
 	}
 	time.Sleep(2 * time.Millisecond) // lease due; ClientFor alone would read again
 
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a"))
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("ClientFor after MarkVerified: %v", err)
 	}
@@ -749,7 +749,7 @@ func TestMarkVerifiedColdResolvesOnce(t *testing.T) {
 	}
 	r := New(db.New(store), dial)
 
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a"))
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("ClientFor: %v", err)
 	}
@@ -779,7 +779,7 @@ func TestMarkVerifiedMovedAddressReadsBeforeDialing(t *testing.T) {
 	}
 
 	store.setFailRead(true)
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051")
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a"))
 	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
 		t.Fatal("ClientFor dispatched while the moved address was unconfirmed and unreadable")
 	}
@@ -812,7 +812,7 @@ func TestMarkVerifiedMovedAddressRedials(t *testing.T) {
 	}
 
 	store.setAddr("10.0.0.2:50051")
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051")
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a"))
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("ClientFor after move: %v", err)
 	}
@@ -856,7 +856,7 @@ func TestMarkVerifiedNewerReportSupersedesColdLookup(t *testing.T) {
 
 	verified := make(chan struct{})
 	go func() {
-		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051") // joins the lookup in flight
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a")) // joins the lookup in flight
 		close(verified)
 	}()
 	waitForObserved(t, r, "host-a", "10.0.0.2:50051")
@@ -908,7 +908,7 @@ func TestConcurrentSameAddressReportsDoNotDisturbColdLookup(t *testing.T) {
 		verified.Add(1)
 		go func() {
 			defer verified.Done()
-			r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
+			r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a"))
 		}()
 	}
 	for i := 0; i < 100; i++ {
@@ -980,7 +980,7 @@ func TestMarkVerifiedReusedAddressStillSupersedesOlderLookup(t *testing.T) {
 	store.setAddr("10.0.0.1:50051") // the host returns to .1 while that read is held
 	verified := make(chan struct{})
 	go func() {
-		r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a"))
 		close(verified)
 	}()
 	waitForObserved(t, r, "host-a", "10.0.0.1:50051")
@@ -1036,7 +1036,7 @@ func TestMarkVerifiedSameAddressStillSupersedesOlderConflictingLookup(t *testing
 	}()
 	<-dialStarted
 	store.setAddr("10.0.0.1:50051")
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // matches the cached client: renews
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // matches the cached client: renews
 	close(dialRelease)
 
 	if err := <-lookup; err != nil {
@@ -1117,8 +1117,8 @@ func TestDelayedLookupThatReadsTheNewerAddressIsKept(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // executed first: still .1
-	store.setAddr("10.0.0.2:50051")                                  // the host moves
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // executed first: still .1
+	store.setAddr("10.0.0.2:50051")                                                          // the host moves
 	store.setDelay(nil)
 	close(delay) // the delayed read now executes and sees .2
 
@@ -1179,7 +1179,7 @@ func TestReportDuringColdReadForcesReRead(t *testing.T) {
 	store.setAddr("10.0.0.2:50051")
 	verified := make(chan struct{})
 	go func() {
-		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051") // joins the lookup in flight
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a")) // joins the lookup in flight
 		close(verified)
 	}()
 	waitForObserved(t, r, "host-a", "10.0.0.2:50051")
@@ -1236,8 +1236,8 @@ func TestReportDuringReadAfterAddressReturns(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	store.setAddr("10.0.0.1:50051")                                  // the host returns to .1
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // matches the cached client: renews
+	store.setAddr("10.0.0.1:50051")                                                          // the host returns to .1
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // matches the cached client: renews
 	store.setGate(nil)
 	close(gate) // the held read now returns .2
 
@@ -1294,8 +1294,8 @@ func TestConflictDropsCachedClientSoFailedConfirmationFailsClosed(t *testing.T) 
 		}
 		time.Sleep(time.Millisecond)
 	}
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // renews .1
-	store.setFailRead(true)                                          // the confirming re-read will fail
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // renews .1
+	store.setFailRead(true)                                                                  // the confirming re-read will fail
 	store.setGate(nil)
 	close(gate) // the held read returns .2: a conflict
 
@@ -1357,12 +1357,12 @@ func TestConflictingReportsDoNotHideEachOther(t *testing.T) {
 	reports.Add(2)
 	go func() {
 		defer reports.Done()
-		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051") // current
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a")) // current
 	}()
 	waitForObserved(t, r, "host-a", "10.0.0.2:50051")
 	go func() {
 		defer reports.Done()
-		r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // stale, delivered late
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // stale, delivered late
 	}()
 	waitForObserved(t, r, "host-a", "10.0.0.1:50051")
 	store.setGate(nil)
@@ -1398,18 +1398,18 @@ func TestSequentialConflictingReportsAreConfirmedByARead(t *testing.T) {
 	}
 	r := New(db.New(store), dial)
 
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051") // cold: dialed from the report
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a")) // cold: dialed from the report
 	if n := store.readCount(); n != 0 {
 		t.Fatalf("reads after the cold report = %d, want 0", n)
 	}
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // stale, out of order
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // stale, out of order
 	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
 		t.Fatalf("after the stale report settled = %q, want .2 confirmed by the row", settled)
 	}
 	if n := store.readCount(); n != 1 {
 		t.Fatalf("reads after the stale report = %d, want 1 (the confirmation)", n)
 	}
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // stale again
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // stale again
 	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
 		t.Fatalf("after the second stale report settled = %q, want .2", settled)
 	}
@@ -1434,5 +1434,39 @@ func TestOrdinaryLookupFailureUsesTwoReads(t *testing.T) {
 	}
 	if n := store.readCount(); n != 2 {
 		t.Fatalf("reads = %d, want 2", n)
+	}
+}
+
+// A report from before an invalidation is stale by construction: the
+// reclaim that bumped the generation is newer than whatever it read. The
+// caller captured the generation before its read, so the registry discards
+// the report and the next dispatch resolves from the row.
+func TestMarkVerifiedFromBeforeInvalidateIsDiscarded(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		dialed = append(dialed, addr)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	gen := r.Generation("host-a") // captured before a read that saw .1
+	store.setAddr("10.0.0.2:50051")
+	r.Invalidate("host-a")                                                // the reclaim to .2 commits
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", gen) // that read, delivered late
+	if _, ok := func() (entry, bool) { r.mu.RLock(); defer r.mu.RUnlock(); e, ok := r.clients["host-a"]; return e, ok }(); ok {
+		t.Fatal("a report from before the invalidation repopulated the client")
+	}
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want .2 from the row", settled)
+	}
+	if want := []string{"10.0.0.1:50051", "10.0.0.2:50051"}; fmt.Sprint(dialed) != fmt.Sprint(want) {
+		t.Fatalf("dialed = %v, want %v (the stale .1 must not be dialed again)", dialed, want)
 	}
 }
