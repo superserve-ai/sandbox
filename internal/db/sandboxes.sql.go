@@ -2489,25 +2489,36 @@ UPDATE sandbox
 SET status = 'paused',
     -- Re-arm the auto-delete deadline cleared by the claim; the sandbox is
     -- paused again, so it gets a fresh window. A resume refused before it
-    -- reached the daemon hands the prior deadline back instead, so retrying
-    -- it cannot postpone deletion.
-    auto_delete_at = COALESCE($3::timestamptz,
-                             now() + make_interval(secs => auto_delete_seconds)),
+    -- reached the daemon hands back the deadline and window the claim saw
+    -- instead, so retrying it cannot postpone deletion. A window patched
+    -- while the row was resuming wins: the patch left the deadline NULL for
+    -- the return to paused, so it is armed from the new window here.
+    auto_delete_at = CASE
+      WHEN auto_delete_seconds IS NOT DISTINCT FROM $3::int
+      THEN $4::timestamptz
+      ELSE now() + make_interval(secs => auto_delete_seconds)
+    END,
     updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming'
 `
 
 type RevertResumeToPausedParams struct {
-	ID                uuid.UUID          `json:"id"`
-	TeamID            uuid.UUID          `json:"team_id"`
-	PriorAutoDeleteAt pgtype.Timestamptz `json:"prior_auto_delete_at"`
+	ID                     uuid.UUID          `json:"id"`
+	TeamID                 uuid.UUID          `json:"team_id"`
+	PriorAutoDeleteSeconds *int32             `json:"prior_auto_delete_seconds"`
+	PriorAutoDeleteAt      pgtype.Timestamptz `json:"prior_auto_delete_at"`
 }
 
 // Compensate a failed resume attempt by flipping status back to 'paused'.
 // Guarded on status = 'resuming' so we never clobber a concurrent transition
 // (e.g., ActivateSandbox has already flipped to 'active').
 func (q *Queries) RevertResumeToPaused(ctx context.Context, arg RevertResumeToPausedParams) error {
-	_, err := q.db.Exec(ctx, revertResumeToPaused, arg.ID, arg.TeamID, arg.PriorAutoDeleteAt)
+	_, err := q.db.Exec(ctx, revertResumeToPaused,
+		arg.ID,
+		arg.TeamID,
+		arg.PriorAutoDeleteSeconds,
+		arg.PriorAutoDeleteAt,
+	)
 	return err
 }
 

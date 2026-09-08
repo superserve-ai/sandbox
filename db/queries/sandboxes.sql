@@ -550,10 +550,15 @@ UPDATE sandbox
 SET status = 'paused',
     -- Re-arm the auto-delete deadline cleared by the claim; the sandbox is
     -- paused again, so it gets a fresh window. A resume refused before it
-    -- reached the daemon hands the prior deadline back instead, so retrying
-    -- it cannot postpone deletion.
-    auto_delete_at = COALESCE(sqlc.narg('prior_auto_delete_at')::timestamptz,
-                             now() + make_interval(secs => auto_delete_seconds)),
+    -- reached the daemon hands back the deadline and window the claim saw
+    -- instead, so retrying it cannot postpone deletion. A window patched
+    -- while the row was resuming wins: the patch left the deadline NULL for
+    -- the return to paused, so it is armed from the new window here.
+    auto_delete_at = CASE
+      WHEN auto_delete_seconds IS NOT DISTINCT FROM sqlc.narg('prior_auto_delete_seconds')::int
+      THEN sqlc.narg('prior_auto_delete_at')::timestamptz
+      ELSE now() + make_interval(secs => auto_delete_seconds)
+    END,
     updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming';
 

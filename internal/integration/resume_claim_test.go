@@ -144,7 +144,9 @@ func TestIntegration_RevertResumeToPaused_KeepsPriorDeadline(t *testing.T) {
 	}
 
 	if err := testQueries.RevertResumeToPaused(ctx, db.RevertResumeToPausedParams{
-		ID: sandboxID, TeamID: teamID, PriorAutoDeleteAt: claimed.PriorAutoDeleteAt,
+		ID: sandboxID, TeamID: teamID,
+		PriorAutoDeleteSeconds: claimed.Sandbox.AutoDeleteSeconds,
+		PriorAutoDeleteAt:      claimed.PriorAutoDeleteAt,
 	}); err != nil {
 		t.Fatalf("revert: %v", err)
 	}
@@ -155,5 +157,68 @@ func TestIntegration_RevertResumeToPaused_KeepsPriorDeadline(t *testing.T) {
 	if row.Status != db.SandboxStatusPaused || !row.AutoDeleteAt.Valid || !row.AutoDeleteAt.Time.Equal(claimed.PriorAutoDeleteAt.Time) {
 		t.Fatalf("after revert status=%s auto_delete_at=%v, want paused with %v",
 			row.Status, row.AutoDeleteAt.Time, claimed.PriorAutoDeleteAt.Time)
+	}
+}
+
+// A window patched between the claim and a pre-daemon revert wins over the
+// deadline the claim saw: disabling auto-delete leaves no deadline, and a
+// new window arms a fresh deadline from it.
+func TestIntegration_RevertResumeToPaused_PatchedWindowWins(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	sandboxID := seedPausedSandbox(t, apiKey)
+
+	claimThenPatch := func(patched *int32) db.ClaimResumeRow {
+		t.Helper()
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET auto_delete_seconds = 3600, auto_delete_at = now() - interval '1 hour' WHERE id = $1`, sandboxID,
+		); err != nil {
+			t.Fatalf("seed window: %v", err)
+		}
+		claimed, err := testQueries.ClaimResume(ctx, db.ClaimResumeParams{
+			ID: sandboxID, TeamID: teamID, LockKey: sandboxID.String(),
+		})
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		if _, err := testQueries.UpdateSandboxAutoDelete(ctx, db.UpdateSandboxAutoDeleteParams{
+			ID: sandboxID, TeamID: teamID, AutoDeleteSeconds: patched,
+		}); err != nil {
+			t.Fatalf("patch window: %v", err)
+		}
+		if err := testQueries.RevertResumeToPaused(ctx, db.RevertResumeToPausedParams{
+			ID: sandboxID, TeamID: teamID,
+			PriorAutoDeleteSeconds: claimed.Sandbox.AutoDeleteSeconds,
+			PriorAutoDeleteAt:      claimed.PriorAutoDeleteAt,
+		}); err != nil {
+			t.Fatalf("revert: %v", err)
+		}
+		return claimed
+	}
+	read := func() db.Sandbox {
+		t.Helper()
+		row, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if row.Status != db.SandboxStatusPaused {
+			t.Fatalf("status = %s, want paused", row.Status)
+		}
+		return row
+	}
+
+	claimThenPatch(nil)
+	if row := read(); row.AutoDeleteSeconds != nil || row.AutoDeleteAt.Valid {
+		t.Fatalf("disabled while resuming, after revert seconds=%v at=%v, want none", row.AutoDeleteSeconds, row.AutoDeleteAt.Time)
+	}
+
+	wider := int32(7200)
+	claimed := claimThenPatch(&wider)
+	row := read()
+	if row.AutoDeleteSeconds == nil || *row.AutoDeleteSeconds != wider {
+		t.Fatalf("after revert seconds=%v, want %d", row.AutoDeleteSeconds, wider)
+	}
+	if !row.AutoDeleteAt.Valid || !row.AutoDeleteAt.Time.After(time.Now()) || row.AutoDeleteAt.Time.Equal(claimed.PriorAutoDeleteAt.Time) {
+		t.Fatalf("widened while resuming, after revert at=%v, want a fresh deadline in the future", row.AutoDeleteAt.Time)
 	}
 }
