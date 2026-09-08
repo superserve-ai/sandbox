@@ -551,6 +551,7 @@ FROM (
   FROM (SELECT pg_advisory_xact_lock(hashtext($2::text)::bigint)) locked
 ) lk, (
   SELECT sb.id,
+         sb.auto_delete_at AS prior_auto_delete_at,
          s.path AS snap_path,
          s.mem_path AS snap_mem_path,
          COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
@@ -581,7 +582,7 @@ RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcp
           x.snap_path, x.snap_mem_path,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
-          x.template_base_path
+          x.template_base_path, x.prior_auto_delete_at
 `
 
 type ClaimResumeParams struct {
@@ -591,16 +592,17 @@ type ClaimResumeParams struct {
 }
 
 type ClaimResumeRow struct {
-	Sandbox           Sandbox  `json:"sandbox"`
-	SnapPath          *string  `json:"snap_path"`
-	SnapMemPath       *string  `json:"snap_mem_path"`
-	Access            string   `json:"access"`
-	WireAccess        string   `json:"wire_access"`
-	Revision          int64    `json:"revision"`
-	PortNumbers       []int32  `json:"port_numbers"`
-	PortAccesses      []string `json:"port_accesses"`
-	PortTokenVersions []int64  `json:"port_token_versions"`
-	TemplateBasePath  *string  `json:"template_base_path"`
+	Sandbox           Sandbox            `json:"sandbox"`
+	SnapPath          *string            `json:"snap_path"`
+	SnapMemPath       *string            `json:"snap_mem_path"`
+	Access            string             `json:"access"`
+	WireAccess        string             `json:"wire_access"`
+	Revision          int64              `json:"revision"`
+	PortNumbers       []int32            `json:"port_numbers"`
+	PortAccesses      []string           `json:"port_accesses"`
+	PortTokenVersions []int64            `json:"port_token_versions"`
+	TemplateBasePath  *string            `json:"template_base_path"`
+	PriorAutoDeleteAt pgtype.Timestamptz `json:"prior_auto_delete_at"`
 }
 
 // The paused→resuming claim plus the boot inputs in one round trip:
@@ -611,6 +613,8 @@ type ClaimResumeRow struct {
 // the row key: the planner keeps a volatile target there, whereas an
 // EXISTS subquery has its target list dropped and never takes the lock.
 // LEFT joins keep the row when the snapshot or policy row is missing.
+// prior_auto_delete_at is the deadline the claim clears, handed back by a
+// revert that never reached the daemon.
 // 0 rows: not paused, or another resume claimed it.
 func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (ClaimResumeRow, error) {
 	row := q.db.QueryRow(ctx, claimResume, arg.ID, arg.LockKey, arg.TeamID)
@@ -651,6 +655,7 @@ func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (Claim
 		&i.PortAccesses,
 		&i.PortTokenVersions,
 		&i.TemplateBasePath,
+		&i.PriorAutoDeleteAt,
 	)
 	return i, err
 }
@@ -2482,23 +2487,27 @@ func (q *Queries) RevertPauseToActive(ctx context.Context, arg RevertPauseToActi
 const revertResumeToPaused = `-- name: RevertResumeToPaused :exec
 UPDATE sandbox
 SET status = 'paused',
-    -- Re-arm the auto-delete deadline cleared by BeginResume; the sandbox is
-    -- paused again, so it gets a fresh window.
-    auto_delete_at = now() + make_interval(secs => auto_delete_seconds),
+    -- Re-arm the auto-delete deadline cleared by the claim; the sandbox is
+    -- paused again, so it gets a fresh window. A resume refused before it
+    -- reached the daemon hands the prior deadline back instead, so retrying
+    -- it cannot postpone deletion.
+    auto_delete_at = COALESCE($3::timestamptz,
+                             now() + make_interval(secs => auto_delete_seconds)),
     updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming'
 `
 
 type RevertResumeToPausedParams struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
+	ID                uuid.UUID          `json:"id"`
+	TeamID            uuid.UUID          `json:"team_id"`
+	PriorAutoDeleteAt pgtype.Timestamptz `json:"prior_auto_delete_at"`
 }
 
 // Compensate a failed resume attempt by flipping status back to 'paused'.
 // Guarded on status = 'resuming' so we never clobber a concurrent transition
 // (e.g., ActivateSandbox has already flipped to 'active').
 func (q *Queries) RevertResumeToPaused(ctx context.Context, arg RevertResumeToPausedParams) error {
-	_, err := q.db.Exec(ctx, revertResumeToPaused, arg.ID, arg.TeamID)
+	_, err := q.db.Exec(ctx, revertResumeToPaused, arg.ID, arg.TeamID, arg.PriorAutoDeleteAt)
 	return err
 }
 

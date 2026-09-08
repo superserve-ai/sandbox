@@ -117,3 +117,43 @@ func TestIntegration_ClaimResume_HoldsAttachLock(t *testing.T) {
 		t.Fatal("ClaimResume did not take the attach advisory lock")
 	}
 }
+
+// A revert handed the prior deadline leaves it exactly as the claim found
+// it; only a revert without one re-arms a fresh window.
+func TestIntegration_RevertResumeToPaused_KeepsPriorDeadline(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	sandboxID := seedPausedSandbox(t, apiKey)
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET auto_delete_at = now() - interval '1 hour' WHERE id = $1`, sandboxID,
+	); err != nil {
+		t.Fatalf("seed deadline: %v", err)
+	}
+
+	claimed, err := testQueries.ClaimResume(ctx, db.ClaimResumeParams{
+		ID: sandboxID, TeamID: teamID, LockKey: sandboxID.String(),
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed.PriorAutoDeleteAt.Valid || !claimed.PriorAutoDeleteAt.Time.Before(time.Now()) {
+		t.Fatalf("claim returned prior deadline %v, want the past one it cleared", claimed.PriorAutoDeleteAt)
+	}
+	if claimed.Sandbox.AutoDeleteAt.Valid {
+		t.Fatalf("claim left auto_delete_at = %v, want cleared", claimed.Sandbox.AutoDeleteAt.Time)
+	}
+
+	if err := testQueries.RevertResumeToPaused(ctx, db.RevertResumeToPausedParams{
+		ID: sandboxID, TeamID: teamID, PriorAutoDeleteAt: claimed.PriorAutoDeleteAt,
+	}); err != nil {
+		t.Fatalf("revert: %v", err)
+	}
+	row, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if row.Status != db.SandboxStatusPaused || !row.AutoDeleteAt.Valid || !row.AutoDeleteAt.Time.Equal(claimed.PriorAutoDeleteAt.Time) {
+		t.Fatalf("after revert status=%s auto_delete_at=%v, want paused with %v",
+			row.Status, row.AutoDeleteAt.Time, claimed.PriorAutoDeleteAt.Time)
+	}
+}

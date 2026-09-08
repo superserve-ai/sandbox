@@ -841,10 +841,13 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	revertToPaused := func() {
 		rctx, rcancel := context.WithTimeout(revertCtx, asyncTimeout)
 		defer rcancel()
-		if err := h.DB.RevertResumeToPaused(rctx, db.RevertResumeToPausedParams{
-			ID:     sandboxID,
-			TeamID: teamID,
-		}); err != nil {
+		params := db.RevertResumeToPausedParams{ID: sandboxID, TeamID: teamID}
+		// Never reached the daemon: the deadline the claim cleared stands, so
+		// retrying a refused resume cannot postpone auto-delete.
+		if tVmdStart.IsZero() {
+			params.PriorAutoDeleteAt = claimed.PriorAutoDeleteAt
+		}
+		if err := h.DB.RevertResumeToPaused(rctx, params); err != nil {
 			l.Error().Err(err).Msg("RevertResumeToPaused failed — sandbox may be stuck in 'resuming'")
 		}
 	}

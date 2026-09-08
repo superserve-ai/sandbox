@@ -1016,6 +1016,7 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 		*dest[32].(*[]string) = accesses
 		*dest[33].(*[]int64) = versions
 		*dest[34].(**string) = nil
+		*dest[35].(*pgtype.Timestamptz) = sb.AutoDeleteAt
 		return nil
 	}}
 }
@@ -4195,5 +4196,69 @@ func TestCreateSandboxDeclaresResourceLimitsToVMD(t *testing.T) {
 	if vmd.restoreLimits.VCPU != uint32(tpl.Vcpu) || vmd.restoreLimits.MemoryMiB != uint32(tpl.MemoryMib) {
 		t.Fatalf("declared allocation = %d/%d, want the shape the row is inserted with (%d/%d)",
 			vmd.restoreLimits.VCPU, vmd.restoreLimits.MemoryMiB, tpl.Vcpu, tpl.MemoryMib)
+	}
+}
+
+// A resume the host capability gate refuses never reaches the daemon, so its
+// revert hands the claim's cleared deadline back rather than re-arming it;
+// otherwise retrying the refused resume would postpone auto-delete forever.
+func TestResumeSandbox_CapabilityRefusalKeepsAutoDeleteDeadline(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HostID = "host-without-ports-" + uuid.NewString()
+	deadline := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	sb.AutoDeleteAt = pgtype.Timestamptz{Time: deadline, Valid: true}
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
+	}
+
+	var reverted []any
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRow(sb, &snap, preview.AccessPublic, 3)
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return scalarBoolRow(false)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(context.Context, string, ...any) (pgx.Rows, error) {
+			return emptyRows{}, nil
+		},
+		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "-- name: RevertResumeToPaused :exec") {
+				reverted = args
+			}
+			return pgconn.NewCommandTag(""), nil
+		},
+	}
+	reached := false
+	vmd := &stubVMD{resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
+		reached = true
+		return "10.0.0.2", nil
+	}}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusConflict, w.Body.String())
+	}
+	if reached {
+		t.Fatal("refused resume reached the daemon")
+	}
+	if len(reverted) != 3 {
+		t.Fatalf("revert args = %v, want id, team, prior deadline", reverted)
+	}
+	got, ok := reverted[2].(pgtype.Timestamptz)
+	if !ok || !got.Valid || !got.Time.Equal(deadline) {
+		t.Fatalf("revert deadline = %v, want %v", reverted[2], deadline)
 	}
 }

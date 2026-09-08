@@ -499,6 +499,8 @@ RETURNING *;
 -- the row key: the planner keeps a volatile target there, whereas an
 -- EXISTS subquery has its target list dropped and never takes the lock.
 -- LEFT joins keep the row when the snapshot or policy row is missing.
+-- prior_auto_delete_at is the deadline the claim clears, handed back by a
+-- revert that never reached the daemon.
 -- 0 rows: not paused, or another resume claimed it.
 UPDATE sandbox
 SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
@@ -507,6 +509,7 @@ FROM (
   FROM (SELECT pg_advisory_xact_lock(hashtext(@lock_key::text)::bigint)) locked
 ) lk, (
   SELECT sb.id,
+         sb.auto_delete_at AS prior_auto_delete_at,
          s.path AS snap_path,
          s.mem_path AS snap_mem_path,
          COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
@@ -537,7 +540,7 @@ RETURNING sqlc.embed(sandbox),
           x.snap_path, x.snap_mem_path,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
-          x.template_base_path;
+          x.template_base_path, x.prior_auto_delete_at;
 
 -- name: RevertResumeToPaused :exec
 -- Compensate a failed resume attempt by flipping status back to 'paused'.
@@ -545,9 +548,12 @@ RETURNING sqlc.embed(sandbox),
 -- (e.g., ActivateSandbox has already flipped to 'active').
 UPDATE sandbox
 SET status = 'paused',
-    -- Re-arm the auto-delete deadline cleared by BeginResume; the sandbox is
-    -- paused again, so it gets a fresh window.
-    auto_delete_at = now() + make_interval(secs => auto_delete_seconds),
+    -- Re-arm the auto-delete deadline cleared by the claim; the sandbox is
+    -- paused again, so it gets a fresh window. A resume refused before it
+    -- reached the daemon hands the prior deadline back instead, so retrying
+    -- it cannot postpone deletion.
+    auto_delete_at = COALESCE(sqlc.narg('prior_auto_delete_at')::timestamptz,
+                             now() + make_interval(secs => auto_delete_seconds)),
     updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming';
 
