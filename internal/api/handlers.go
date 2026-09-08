@@ -841,15 +841,10 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	revertToPaused := func() {
 		rctx, rcancel := context.WithTimeout(revertCtx, asyncTimeout)
 		defer rcancel()
-		params := db.RevertResumeToPausedParams{ID: sandboxID, TeamID: teamID}
-		// Never reached the daemon: the deadline the claim cleared stands, so
-		// retrying a refused resume cannot postpone auto-delete. The claim's
-		// updated_at goes with it so a patch made meanwhile wins instead.
-		if tVmdStart.IsZero() {
-			params.PriorAutoDeleteAt = claimed.PriorAutoDeleteAt
-			params.ClaimedUpdatedAt = pgtype.Timestamptz{Time: claimed.Sandbox.UpdatedAt, Valid: true}
-		}
-		if err := h.DB.RevertResumeToPaused(rctx, params); err != nil {
+		if err := h.DB.RevertResumeToPaused(rctx, db.RevertResumeToPausedParams{
+			ID:     sandboxID,
+			TeamID: teamID,
+		}); err != nil {
 			l.Error().Err(err).Msg("RevertResumeToPaused failed — sandbox may be stuck in 'resuming'")
 		}
 	}
@@ -1776,7 +1771,9 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	if s.AutoDeleteSeconds != nil {
 		resp.AutoDeleteSeconds = s.AutoDeleteSeconds
 	}
-	if s.AutoDeleteAt.Valid {
+	// The deadline rides through a resume on the row; it is reported only
+	// while it can fire.
+	if s.Status == db.SandboxStatusPaused && s.AutoDeleteAt.Valid {
 		resp.AutoDeleteAt = &s.AutoDeleteAt.Time
 	}
 	if len(s.NetworkConfig) > 0 {

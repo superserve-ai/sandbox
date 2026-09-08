@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -119,9 +118,10 @@ func TestIntegration_ClaimResume_HoldsAttachLock(t *testing.T) {
 	}
 }
 
-// A revert handed the prior deadline leaves it exactly as the claim found
-// it; only a revert without one re-arms a fresh window.
-func TestIntegration_RevertResumeToPaused_KeepsPriorDeadline(t *testing.T) {
+// The claim leaves the auto-delete deadline on the row, and a revert leaves
+// it as it found it, so a resume that fails before reaching the daemon
+// cannot postpone deletion.
+func TestIntegration_ClaimResume_LeavesDeadlineForRevert(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
 	sandboxID := seedPausedSandbox(t, apiKey)
@@ -137,49 +137,42 @@ func TestIntegration_RevertResumeToPaused_KeepsPriorDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if !claimed.PriorAutoDeleteAt.Valid || !claimed.PriorAutoDeleteAt.Time.Before(time.Now()) {
-		t.Fatalf("claim returned prior deadline %v, want the past one it cleared", claimed.PriorAutoDeleteAt)
-	}
-	if claimed.Sandbox.AutoDeleteAt.Valid {
-		t.Fatalf("claim left auto_delete_at = %v, want cleared", claimed.Sandbox.AutoDeleteAt.Time)
+	if !claimed.Sandbox.AutoDeleteAt.Valid || !claimed.Sandbox.AutoDeleteAt.Time.Before(time.Now()) {
+		t.Fatalf("claim left auto_delete_at = %v, want the past deadline untouched", claimed.Sandbox.AutoDeleteAt)
 	}
 
-	if err := testQueries.RevertResumeToPaused(ctx, db.RevertResumeToPausedParams{
-		ID: sandboxID, TeamID: teamID,
-		ClaimedUpdatedAt:  pgtype.Timestamptz{Time: claimed.Sandbox.UpdatedAt, Valid: true},
-		PriorAutoDeleteAt: claimed.PriorAutoDeleteAt,
-	}); err != nil {
+	if err := testQueries.RevertResumeToPaused(ctx, db.RevertResumeToPausedParams{ID: sandboxID, TeamID: teamID}); err != nil {
 		t.Fatalf("revert: %v", err)
 	}
 	row, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if row.Status != db.SandboxStatusPaused || !row.AutoDeleteAt.Valid || !row.AutoDeleteAt.Time.Equal(claimed.PriorAutoDeleteAt.Time) {
+	if row.Status != db.SandboxStatusPaused || !row.AutoDeleteAt.Valid || !row.AutoDeleteAt.Time.Equal(claimed.Sandbox.AutoDeleteAt.Time) {
 		t.Fatalf("after revert status=%s auto_delete_at=%v, want paused with %v",
-			row.Status, row.AutoDeleteAt.Time, claimed.PriorAutoDeleteAt.Time)
+			row.Status, row.AutoDeleteAt.Time, claimed.Sandbox.AutoDeleteAt.Time)
 	}
 }
 
-// A window patched between the claim and a pre-daemon revert wins over the
-// deadline the claim saw: disabling auto-delete leaves no deadline, and a
-// new or repeated window arms a fresh deadline from it.
-func TestIntegration_RevertResumeToPaused_PatchedWindowWins(t *testing.T) {
+// An auto-delete patch made while the row is resuming leaves the deadline
+// NULL for the return to paused, so the revert arms it from the patched
+// window: disabling leaves no deadline, a new or repeated window arms a
+// fresh one.
+func TestIntegration_RevertResumeToPaused_ArmsPatchedWindow(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
 	sandboxID := seedPausedSandbox(t, apiKey)
 
-	claimThenPatch := func(patched *int32) db.ClaimResumeRow {
+	claimPatchRevert := func(patched *int32) {
 		t.Helper()
 		if _, err := testPool.Exec(ctx,
 			`UPDATE sandbox SET auto_delete_seconds = 3600, auto_delete_at = now() - interval '1 hour' WHERE id = $1`, sandboxID,
 		); err != nil {
 			t.Fatalf("seed window: %v", err)
 		}
-		claimed, err := testQueries.ClaimResume(ctx, db.ClaimResumeParams{
+		if _, err := testQueries.ClaimResume(ctx, db.ClaimResumeParams{
 			ID: sandboxID, TeamID: teamID, LockKey: sandboxID.String(),
-		})
-		if err != nil {
+		}); err != nil {
 			t.Fatalf("claim: %v", err)
 		}
 		if _, err := testQueries.UpdateSandboxAutoDelete(ctx, db.UpdateSandboxAutoDeleteParams{
@@ -187,14 +180,9 @@ func TestIntegration_RevertResumeToPaused_PatchedWindowWins(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("patch window: %v", err)
 		}
-		if err := testQueries.RevertResumeToPaused(ctx, db.RevertResumeToPausedParams{
-			ID: sandboxID, TeamID: teamID,
-			ClaimedUpdatedAt:  pgtype.Timestamptz{Time: claimed.Sandbox.UpdatedAt, Valid: true},
-			PriorAutoDeleteAt: claimed.PriorAutoDeleteAt,
-		}); err != nil {
+		if err := testQueries.RevertResumeToPaused(ctx, db.RevertResumeToPausedParams{ID: sandboxID, TeamID: teamID}); err != nil {
 			t.Fatalf("revert: %v", err)
 		}
-		return claimed
 	}
 	read := func() db.Sandbox {
 		t.Helper()
@@ -208,18 +196,18 @@ func TestIntegration_RevertResumeToPaused_PatchedWindowWins(t *testing.T) {
 		return row
 	}
 
-	claimThenPatch(nil)
+	claimPatchRevert(nil)
 	if row := read(); row.AutoDeleteSeconds != nil || row.AutoDeleteAt.Valid {
 		t.Fatalf("disabled while resuming, after revert seconds=%v at=%v, want none", row.AutoDeleteSeconds, row.AutoDeleteAt.Time)
 	}
 
 	for _, window := range []int32{7200, 3600} {
-		claimed := claimThenPatch(&window)
+		claimPatchRevert(&window)
 		row := read()
 		if row.AutoDeleteSeconds == nil || *row.AutoDeleteSeconds != window {
 			t.Fatalf("after revert seconds=%v, want %d", row.AutoDeleteSeconds, window)
 		}
-		if !row.AutoDeleteAt.Valid || !row.AutoDeleteAt.Time.After(time.Now()) || row.AutoDeleteAt.Time.Equal(claimed.PriorAutoDeleteAt.Time) {
+		if !row.AutoDeleteAt.Valid || !row.AutoDeleteAt.Time.After(time.Now()) {
 			t.Fatalf("window %d patched while resuming, after revert at=%v, want a fresh deadline in the future", window, row.AutoDeleteAt.Time)
 		}
 	}

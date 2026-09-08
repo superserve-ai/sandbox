@@ -1016,7 +1016,6 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 		*dest[32].(*[]string) = accesses
 		*dest[33].(*[]int64) = versions
 		*dest[34].(**string) = nil
-		*dest[35].(*pgtype.Timestamptz) = sb.AutoDeleteAt
 		return nil
 	}}
 }
@@ -4199,18 +4198,15 @@ func TestCreateSandboxDeclaresResourceLimitsToVMD(t *testing.T) {
 	}
 }
 
-// A resume the host capability gate refuses never reaches the daemon, so its
-// revert hands the claim's cleared deadline back rather than re-arming it;
-// otherwise retrying the refused resume would postpone auto-delete forever.
-func TestResumeSandbox_CapabilityRefusalKeepsAutoDeleteDeadline(t *testing.T) {
+// A resume the host capability gate refuses never reaches the daemon and
+// reverts the claim; the revert carries no deadline because the claim leaves
+// it on the row, so retrying the refused resume cannot postpone auto-delete.
+func TestResumeSandbox_CapabilityRefusalRevertsWithoutReachingDaemon(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
 	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
 	sb.HostID = "host-without-ports-" + uuid.NewString()
-	deadline := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
-	sb.AutoDeleteAt = pgtype.Timestamptz{Time: deadline, Valid: true}
-	sb.UpdatedAt = time.Now().UTC().Truncate(time.Microsecond)
 	snap := db.Snapshot{
 		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
 		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
@@ -4255,14 +4251,7 @@ func TestResumeSandbox_CapabilityRefusalKeepsAutoDeleteDeadline(t *testing.T) {
 	if reached {
 		t.Fatal("refused resume reached the daemon")
 	}
-	if len(reverted) != 4 {
-		t.Fatalf("revert args = %v, want id, team, claim updated_at, prior deadline", reverted)
-	}
-	if at, ok := reverted[2].(pgtype.Timestamptz); !ok || !at.Valid || !at.Time.Equal(sb.UpdatedAt) {
-		t.Fatalf("revert claim updated_at = %v, want %v", reverted[2], sb.UpdatedAt)
-	}
-	got, ok := reverted[3].(pgtype.Timestamptz)
-	if !ok || !got.Valid || !got.Time.Equal(deadline) {
-		t.Fatalf("revert deadline = %v, want %v", reverted[3], deadline)
+	if len(reverted) != 2 {
+		t.Fatalf("revert args = %v, want id and team only", reverted)
 	}
 }

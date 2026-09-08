@@ -222,6 +222,8 @@ WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL;
 WITH activated AS (
   UPDATE sandbox
   SET status = 'active',
+      -- The claim left the paused deadline on the row; it ends here.
+      auto_delete_at = NULL,
       vcpu_count = $2,
       memory_mib = $3,
       ip_address = $4,
@@ -499,17 +501,17 @@ RETURNING *;
 -- the row key: the planner keeps a volatile target there, whereas an
 -- EXISTS subquery has its target list dropped and never takes the lock.
 -- LEFT joins keep the row when the snapshot or policy row is missing.
--- prior_auto_delete_at is the deadline the claim clears, handed back by a
--- revert that never reached the daemon.
+-- The auto-delete deadline stays on the row: the reaper acts on paused rows
+-- only, a failed resume returns the row to paused with the deadline it had,
+-- and activation clears it.
 -- 0 rows: not paused, or another resume claimed it.
 UPDATE sandbox
-SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
+SET status = 'resuming', updated_at = now()
 FROM (
   SELECT @id::uuid AS id
   FROM (SELECT pg_advisory_xact_lock(hashtext(@lock_key::text)::bigint)) locked
 ) lk, (
   SELECT sb.id,
-         sb.auto_delete_at AS prior_auto_delete_at,
          s.path AS snap_path,
          s.mem_path AS snap_mem_path,
          COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
@@ -540,7 +542,7 @@ RETURNING sqlc.embed(sandbox),
           x.snap_path, x.snap_mem_path,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
-          x.template_base_path, x.prior_auto_delete_at;
+          x.template_base_path;
 
 -- name: RevertResumeToPaused :exec
 -- Compensate a failed resume attempt by flipping status back to 'paused'.
@@ -548,18 +550,11 @@ RETURNING sqlc.embed(sandbox),
 -- (e.g., ActivateSandbox has already flipped to 'active').
 UPDATE sandbox
 SET status = 'paused',
-    -- Re-arm the auto-delete deadline cleared by the claim; the sandbox is
-    -- paused again, so it gets a fresh window. A resume refused before it
-    -- reached the daemon hands back the deadline the claim saw instead, so
-    -- retrying it cannot postpone deletion. It is restored only while the
-    -- row is untouched since the claim: an auto-delete patch, even one that
-    -- repeats the value, bumps updated_at and leaves the deadline NULL for
-    -- the return to paused, so it is armed from the current window here.
-    auto_delete_at = CASE
-      WHEN updated_at = sqlc.narg('claimed_updated_at')::timestamptz
-      THEN sqlc.narg('prior_auto_delete_at')::timestamptz
-      ELSE now() + make_interval(secs => auto_delete_seconds)
-    END,
+    -- The claim leaves the deadline in place, so a failed resume returns the
+    -- row to paused with the deadline it had and retrying cannot postpone
+    -- deletion. An auto-delete patch made while resuming leaves the deadline
+    -- NULL for the return to paused, so it is armed from the window here.
+    auto_delete_at = COALESCE(auto_delete_at, now() + make_interval(secs => auto_delete_seconds)),
     updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming';
 

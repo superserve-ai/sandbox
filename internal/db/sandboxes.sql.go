@@ -18,6 +18,8 @@ const activateSandbox = `-- name: ActivateSandbox :exec
 WITH activated AS (
   UPDATE sandbox
   SET status = 'active',
+      -- The claim left the paused deadline on the row; it ends here.
+      auto_delete_at = NULL,
       vcpu_count = $2,
       memory_mib = $3,
       ip_address = $4,
@@ -545,13 +547,12 @@ func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]Cla
 
 const claimResume = `-- name: ClaimResume :one
 UPDATE sandbox
-SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
+SET status = 'resuming', updated_at = now()
 FROM (
   SELECT $1::uuid AS id
   FROM (SELECT pg_advisory_xact_lock(hashtext($2::text)::bigint)) locked
 ) lk, (
   SELECT sb.id,
-         sb.auto_delete_at AS prior_auto_delete_at,
          s.path AS snap_path,
          s.mem_path AS snap_mem_path,
          COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
@@ -582,7 +583,7 @@ RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcp
           x.snap_path, x.snap_mem_path,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
-          x.template_base_path, x.prior_auto_delete_at
+          x.template_base_path
 `
 
 type ClaimResumeParams struct {
@@ -592,17 +593,16 @@ type ClaimResumeParams struct {
 }
 
 type ClaimResumeRow struct {
-	Sandbox           Sandbox            `json:"sandbox"`
-	SnapPath          *string            `json:"snap_path"`
-	SnapMemPath       *string            `json:"snap_mem_path"`
-	Access            string             `json:"access"`
-	WireAccess        string             `json:"wire_access"`
-	Revision          int64              `json:"revision"`
-	PortNumbers       []int32            `json:"port_numbers"`
-	PortAccesses      []string           `json:"port_accesses"`
-	PortTokenVersions []int64            `json:"port_token_versions"`
-	TemplateBasePath  *string            `json:"template_base_path"`
-	PriorAutoDeleteAt pgtype.Timestamptz `json:"prior_auto_delete_at"`
+	Sandbox           Sandbox  `json:"sandbox"`
+	SnapPath          *string  `json:"snap_path"`
+	SnapMemPath       *string  `json:"snap_mem_path"`
+	Access            string   `json:"access"`
+	WireAccess        string   `json:"wire_access"`
+	Revision          int64    `json:"revision"`
+	PortNumbers       []int32  `json:"port_numbers"`
+	PortAccesses      []string `json:"port_accesses"`
+	PortTokenVersions []int64  `json:"port_token_versions"`
+	TemplateBasePath  *string  `json:"template_base_path"`
 }
 
 // The paused→resuming claim plus the boot inputs in one round trip:
@@ -613,8 +613,9 @@ type ClaimResumeRow struct {
 // the row key: the planner keeps a volatile target there, whereas an
 // EXISTS subquery has its target list dropped and never takes the lock.
 // LEFT joins keep the row when the snapshot or policy row is missing.
-// prior_auto_delete_at is the deadline the claim clears, handed back by a
-// revert that never reached the daemon.
+// The auto-delete deadline stays on the row: the reaper acts on paused rows
+// only, a failed resume returns the row to paused with the deadline it had,
+// and activation clears it.
 // 0 rows: not paused, or another resume claimed it.
 func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (ClaimResumeRow, error) {
 	row := q.db.QueryRow(ctx, claimResume, arg.ID, arg.LockKey, arg.TeamID)
@@ -655,7 +656,6 @@ func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (Claim
 		&i.PortAccesses,
 		&i.PortTokenVersions,
 		&i.TemplateBasePath,
-		&i.PriorAutoDeleteAt,
 	)
 	return i, err
 }
@@ -2487,39 +2487,25 @@ func (q *Queries) RevertPauseToActive(ctx context.Context, arg RevertPauseToActi
 const revertResumeToPaused = `-- name: RevertResumeToPaused :exec
 UPDATE sandbox
 SET status = 'paused',
-    -- Re-arm the auto-delete deadline cleared by the claim; the sandbox is
-    -- paused again, so it gets a fresh window. A resume refused before it
-    -- reached the daemon hands back the deadline the claim saw instead, so
-    -- retrying it cannot postpone deletion. It is restored only while the
-    -- row is untouched since the claim: an auto-delete patch, even one that
-    -- repeats the value, bumps updated_at and leaves the deadline NULL for
-    -- the return to paused, so it is armed from the current window here.
-    auto_delete_at = CASE
-      WHEN updated_at = $3::timestamptz
-      THEN $4::timestamptz
-      ELSE now() + make_interval(secs => auto_delete_seconds)
-    END,
+    -- The claim leaves the deadline in place, so a failed resume returns the
+    -- row to paused with the deadline it had and retrying cannot postpone
+    -- deletion. An auto-delete patch made while resuming leaves the deadline
+    -- NULL for the return to paused, so it is armed from the window here.
+    auto_delete_at = COALESCE(auto_delete_at, now() + make_interval(secs => auto_delete_seconds)),
     updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming'
 `
 
 type RevertResumeToPausedParams struct {
-	ID                uuid.UUID          `json:"id"`
-	TeamID            uuid.UUID          `json:"team_id"`
-	ClaimedUpdatedAt  pgtype.Timestamptz `json:"claimed_updated_at"`
-	PriorAutoDeleteAt pgtype.Timestamptz `json:"prior_auto_delete_at"`
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
 }
 
 // Compensate a failed resume attempt by flipping status back to 'paused'.
 // Guarded on status = 'resuming' so we never clobber a concurrent transition
 // (e.g., ActivateSandbox has already flipped to 'active').
 func (q *Queries) RevertResumeToPaused(ctx context.Context, arg RevertResumeToPausedParams) error {
-	_, err := q.db.Exec(ctx, revertResumeToPaused,
-		arg.ID,
-		arg.TeamID,
-		arg.ClaimedUpdatedAt,
-		arg.PriorAutoDeleteAt,
-	)
+	_, err := q.db.Exec(ctx, revertResumeToPaused, arg.ID, arg.TeamID)
 	return err
 }
 
