@@ -223,8 +223,13 @@ func (r *Registry) resolveFrom(ctx context.Context, hostID, knownAddr string) (v
 			defer func() { r.Observe(kind, time.Since(started), err) }()
 		}
 
+		// Two failed row reads end the resolution, as before this budget also
+		// covered a seeded first attempt and conflict-driven re-reads; those
+		// consume attempts but not read failures, so an outage still costs
+		// exactly two reads.
 		var lastErr error
-		for attempt := 0; attempt < 3; attempt++ {
+		readFailures := 0
+		for attempt := 0; attempt < 3 && readFailures < 2; attempt++ {
 			r.mu.RLock()
 			startGen := r.gens[hostID]
 			prev, hadPrev := r.clients[hostID]
@@ -269,6 +274,7 @@ func (r *Registry) resolveFrom(ctx context.Context, hostID, knownAddr string) (v
 						return e.client, nil
 					}
 					lastErr = err
+					readFailures++
 					continue
 				}
 				addr = host.VmdAddr

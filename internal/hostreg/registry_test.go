@@ -1422,3 +1422,17 @@ func TestSequentialConflictingReportsAreConfirmedByARead(t *testing.T) {
 		t.Fatalf("ClientFor: %v", err)
 	}
 }
+
+// An ordinary resolution against a failing row read costs two reads and no
+// more; the third attempt exists for a seeded dial or a conflict re-read.
+func TestOrdinaryLookupFailureUsesTwoReads(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051", failRead: true}
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("ClientFor succeeded against a failing row read")
+	}
+	if n := store.readCount(); n != 2 {
+		t.Fatalf("reads = %d, want 2", n)
+	}
+}
