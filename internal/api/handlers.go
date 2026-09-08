@@ -132,10 +132,9 @@ type HostRegistry interface {
 	// re-reads the host row. Callers that change a host's address must
 	// invalidate, or RPCs keep flowing to the previous machine.
 	Invalidate(hostID string)
-	// MarkVerified records a host row read the caller has just performed —
-	// the address it saw and when the read began — so the next ClientFor
-	// need not read the row itself.
-	MarkVerified(ctx context.Context, hostID, addr string, readAt time.Time)
+	// MarkVerified records a host row read the caller has just performed and
+	// the address it saw, so the next ClientFor need not read the row itself.
+	MarkVerified(ctx context.Context, hostID, addr string)
 }
 
 // Handlers holds shared dependencies for all route handlers.

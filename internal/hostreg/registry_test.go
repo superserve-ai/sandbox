@@ -23,7 +23,8 @@ type hostDB struct {
 	mu       sync.Mutex
 	addr     string
 	failRead bool
-	gate     chan struct{} // non-nil: QueryRow waits until closed
+	gate     chan struct{} // non-nil: QueryRow waits until closed (after capturing the address)
+	delay    chan struct{} // non-nil: QueryRow waits until closed BEFORE capturing the address
 	reads    atomic.Int64
 }
 
@@ -33,7 +34,8 @@ func (h *hostDB) setFailRead(v bool) {
 	h.failRead = v
 	h.mu.Unlock()
 }
-func (h *hostDB) setGate(c chan struct{}) { h.mu.Lock(); h.gate = c; h.mu.Unlock() }
+func (h *hostDB) setGate(c chan struct{})  { h.mu.Lock(); h.gate = c; h.mu.Unlock() }
+func (h *hostDB) setDelay(c chan struct{}) { h.mu.Lock(); h.delay = c; h.mu.Unlock() }
 
 type errRow struct{ err error }
 
@@ -49,6 +51,12 @@ func (h *hostDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
 }
 func (h *hostDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
 	h.reads.Add(1)
+	h.mu.Lock()
+	delay := h.delay
+	h.mu.Unlock()
+	if delay != nil {
+		<-delay // a query that started early but executes late
+	}
 	h.mu.Lock()
 	addr, fail, gate := h.addr, h.failRead, h.gate
 	h.mu.Unlock()
@@ -718,7 +726,7 @@ func TestMarkVerifiedRenewsLeaseWithoutRead(t *testing.T) {
 	}
 	time.Sleep(2 * time.Millisecond) // lease due; ClientFor alone would read again
 
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", time.Now())
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("ClientFor after MarkVerified: %v", err)
 	}
@@ -741,7 +749,7 @@ func TestMarkVerifiedColdResolvesOnce(t *testing.T) {
 	}
 	r := New(db.New(store), dial)
 
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", time.Now())
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("ClientFor: %v", err)
 	}
@@ -764,7 +772,7 @@ func TestMarkVerifiedMovedAddressFailsClosedWhenReadFails(t *testing.T) {
 	}
 
 	store.setFailRead(true)
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", time.Now())
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051")
 	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
 		t.Fatal("ClientFor served the client at the old address after the row reported a move")
 	}
@@ -785,7 +793,7 @@ func TestMarkVerifiedMovedAddressRedials(t *testing.T) {
 	}
 
 	store.setAddr("10.0.0.2:50051")
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", time.Now())
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051")
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("ClientFor after move: %v", err)
 	}
@@ -826,14 +834,13 @@ func TestMarkVerifiedNewerReportSupersedesColdLookup(t *testing.T) {
 	}()
 	<-dialStarted // the lookup read .1 and is dialing it
 	store.setAddr("10.0.0.2:50051")
-	reportAt := time.Now() // began after the lookup's read: it is the newer observation
 
 	verified := make(chan struct{})
 	go func() {
-		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", reportAt) // joins the lookup in flight
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051") // joins the lookup in flight
 		close(verified)
 	}()
-	waitForLatest(t, r, "host-a", "10.0.0.2:50051")
+	waitForObserved(t, r, "host-a", "10.0.0.2:50051")
 	close(dialRelease)
 
 	if err := <-lookup; err != nil {
@@ -882,7 +889,7 @@ func TestConcurrentSameAddressReportsDoNotDisturbColdLookup(t *testing.T) {
 		verified.Add(1)
 		go func() {
 			defer verified.Done()
-			r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", time.Now())
+			r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
 		}()
 	}
 	for i := 0; i < 100; i++ {
@@ -952,13 +959,12 @@ func TestMarkVerifiedReusedAddressStillSupersedesOlderLookup(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	store.setAddr("10.0.0.1:50051") // the host returns to .1 while that read is held
-	reportAt := time.Now()
 	verified := make(chan struct{})
 	go func() {
-		r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", reportAt)
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051")
 		close(verified)
 	}()
-	waitForLatest(t, r, "host-a", "10.0.0.1:50051")
+	waitForObserved(t, r, "host-a", "10.0.0.1:50051")
 	store.setGate(nil)
 	close(gate) // the older read returns .2, which is now contradicted
 
@@ -1011,8 +1017,7 @@ func TestMarkVerifiedSameAddressStillSupersedesOlderConflictingLookup(t *testing
 	}()
 	<-dialStarted
 	store.setAddr("10.0.0.1:50051")
-	reportAt := time.Now()
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", reportAt) // matches the cached client: renews
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // matches the cached client: renews
 	close(dialRelease)
 
 	if err := <-lookup; err != nil {
@@ -1036,14 +1041,14 @@ func settledAddr(r *Registry, hostID string) string {
 	return r.clients[hostID].addr
 }
 
-// waitForLatest blocks until the registry's newest observation of hostID is
+// waitForObserved blocks until the registry's last observation of hostID is
 // addr, i.e. the report under test has been recorded.
-func waitForLatest(t *testing.T, r *Registry, hostID, addr string) {
+func waitForObserved(t *testing.T, r *Registry, hostID, addr string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		r.mu.RLock()
-		got := r.latest[hostID].addr
+		got := r.observed[hostID]
 		r.mu.RUnlock()
 		if got == addr {
 			return
@@ -1052,5 +1057,68 @@ func waitForLatest(t *testing.T, r *Registry, hostID, addr string) {
 			t.Fatalf("report of %s never recorded (latest is %q)", addr, got)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// Start time says nothing about snapshot order: a row read that started
+// first can execute last. Here the registry's due recheck is delayed before
+// it reads, a capability read executed in the meantime reports the old
+// address, the host moves, and the delayed read then sees the NEW address.
+// That read is the newer snapshot and must be kept — nothing may discard it
+// on the grounds that another read "started later".
+func TestDelayedLookupThatReadsTheNewerAddressIsKept(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // .1
+		t.Fatalf("prime: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond) // lease due: the next ClientFor re-reads
+
+	delay := make(chan struct{})
+	store.setDelay(delay)
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.readCount() < 2 { // the recheck has started its read and is held before it
+		if time.Now().After(deadline) {
+			t.Fatal("recheck never reached its read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // executed first: still .1
+	store.setAddr("10.0.0.2:50051")                                  // the host moves
+	store.setDelay(nil)
+	close(delay) // the delayed read now executes and sees .2
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want .2 (the later-executed read is the newer snapshot)", settled)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	if len(got) != 2 || got[1] != "10.0.0.2:50051" {
+		t.Fatalf("dial sequence = %v, want [.1, .2]", got)
+	}
+	// And the next dispatch goes to .2 without another read.
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("post-settle ClientFor: %v", err)
+	}
+	if n := store.readCount(); n != 2 {
+		t.Fatalf("reads = %d, want 2", n)
 	}
 }
