@@ -1718,3 +1718,56 @@ func TestAdHocSnapshotResolvesAnEarlierFreezeOrRefuses(t *testing.T) {
 		t.Fatalf("intent = %+v; a resolved intent must be cleared", in)
 	}
 }
+
+// An ad-hoc snapshot takes the VM's lifecycle lock: while a pause is in
+// flight, its fresh intent must not be read as an abandoned freeze and the
+// guest that pause is freezing released. The snapshot waits for the pause.
+func TestAdHocSnapshotWaitsForAPauseInFlight(t *testing.T) {
+	useTempFloor(t)
+	raiseFloorForTest(t)
+	origT, origUnpause := boxdThawGuest, fcUnpauseVM
+	t.Cleanup(func() { boxdThawGuest, fcUnpauseVM = origT, origUnpause })
+	fcUnpauseVM = func(context.Context, string) error { return nil }
+	thaws := 0
+	boxdThawGuest = func(context.Context, string, string) error { thaws++; return nil }
+
+	fc := startSnapshotAPIFake(t, nil)
+	dir := t.TempDir()
+	vmDir := filepath.Join(dir, "vm-1")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, ArtifactID: "current"}
+	m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+
+	// A pause in flight: it holds the lock and has just recorded its intent.
+	unlock, err := m.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writePauseIntent(vmDir, pauseIntent{VMID: "vm-1", FreezeToken: "B", ArtifactID: "next"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, _, err := m.CreateVMSnapshot(ctx, "vm-1", filepath.Join(dir, "adhoc")); err == nil {
+		t.Fatal("the snapshot ran beside a pause in flight")
+	}
+	if thaws != 0 || len(fc.snapshotBodies()) != 0 {
+		t.Fatalf("thaws=%d requests=%d; the pause's guest must be left alone", thaws, len(fc.snapshotBodies()))
+	}
+	if in, _ := readPauseIntent(vmDir); in == nil || in.FreezeToken != "B" {
+		t.Fatal("the pause's intent was cleared by the snapshot")
+	}
+	// The pause completes: its intent names the record's artifact now.
+	inst.mu.Lock()
+	inst.ArtifactID = "next"
+	inst.mu.Unlock()
+	unlock()
+	if _, _, err := m.CreateVMSnapshot(context.Background(), "vm-1", filepath.Join(dir, "adhoc")); err != nil {
+		t.Fatalf("snapshot after the pause: %v", err)
+	}
+	if thaws != 0 {
+		t.Fatalf("thaws=%d; a completed pause's leftover intent is nothing to release", thaws)
+	}
+}

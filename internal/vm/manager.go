@@ -2893,6 +2893,15 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 
 // CreateVMSnapshot captures a point-in-time snapshot of a running VM.
 func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, err error) {
+	// Under the VM's lifecycle lock, like a pause: the intent read below must
+	// not take a pause in flight for an abandoned one and release the guest
+	// that pause is freezing, and the image is of a guest no concurrent
+	// lifecycle op is moving. Unrelated sandboxes are not serialized.
+	unlockOp, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return "", "", err
+	}
+	defer unlockOp()
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return "", "", err
@@ -2921,9 +2930,7 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	// clearing DirtyTracked and the unpause below. Failing here has done nothing
 	// yet.
 	//
-	// This path holds no vm-op lock, so any provenance read here could describe a
-	// state a concurrent pause or resume has already moved on from. An ad-hoc
-	// image is therefore never marked: restores from it take legacy behaviour,
+	// An ad-hoc image is never marked: restores from it take legacy behaviour,
 	// which is slower and always correct. Callers may also hand in a directory
 	// that already holds an image, so clear rather than assume.
 	if merr := os.Remove(clockFreezeMarkerPath(memPath)); merr != nil && !os.IsNotExist(merr) {
@@ -2941,9 +2948,8 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	// ad-hoc snapshot. Forces the next pause back to Full.
 	//
 	// Not persisted, deliberately: DirtyTracked is not in VMRecord, so a write
-	// here would duplicate the durable record while clobbering fields a
-	// concurrent lifecycle op just changed — this path holds no vm-op lock.
-	// Persisting from here needs that lock; see TestToRecordIgnoresDirtyTracked.
+	// here would only duplicate the durable record; see
+	// TestToRecordIgnoresDirtyTracked.
 	// The session id gets the same in-memory-only clear: skipping the guarded
 	// Diff it would fail saves one rejected RPC, and a stale PERSISTED session
 	// (this clear not landing durably before a vmd restart) is exactly what the
