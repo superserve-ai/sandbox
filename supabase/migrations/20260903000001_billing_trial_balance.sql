@@ -21,14 +21,14 @@ WITH account AS (
                        THEN COALESCE(grants.expires_end, now()) ELSE now() END) AS period_end
   FROM grants
 ), compute_usage AS (
-  SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at, bounds.period_end), bounds.period_end) - GREATEST(i.started_at, grants.started))) * i.vcpu_count), 0)::numeric AS cpu,
-         COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at, bounds.period_end), bounds.period_end) - GREATEST(i.started_at, grants.started))) * i.memory_mib / 1024.0), 0)::numeric AS memory
+  SELECT COALESCE(SUM(GREATEST(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at, bounds.period_end), bounds.period_end) - GREATEST(i.started_at, grants.started))), 0) * i.vcpu_count), 0)::numeric AS cpu,
+         COALESCE(SUM(GREATEST(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at, bounds.period_end), bounds.period_end) - GREATEST(i.started_at, grants.started))), 0) * i.memory_mib / 1024.0), 0)::numeric AS memory
   FROM sandbox_compute_billing_interval i, bounds, grants
   WHERE i.team_id = p_team_id AND i.started_at < bounds.period_end AND COALESCE(i.ended_at, bounds.period_end) > grants.started
 ), usage AS (
   SELECT compute_usage.cpu,
          compute_usage.memory,
-         COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at, bounds.period_end), bounds.period_end) - GREATEST(i.started_at, grants.started))) * i.disk_mib / 1024.0) FROM sandbox_storage_interval i, bounds WHERE i.team_id = p_team_id AND i.started_at < bounds.period_end AND COALESCE(i.ended_at, bounds.period_end) > grants.started), 0)::numeric AS storage
+         COALESCE((SELECT SUM(GREATEST(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at, bounds.period_end), bounds.period_end) - GREATEST(i.started_at, grants.started))), 0) * i.disk_mib / 1024.0) FROM sandbox_storage_interval i, bounds WHERE i.team_id = p_team_id AND i.started_at < bounds.period_end AND COALESCE(i.ended_at, bounds.period_end) > grants.started), 0)::numeric AS storage
   FROM compute_usage, grants
 ), ranked_rates AS (
   SELECT r.*, row_number() OVER (PARTITION BY r.resource, r.unit ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC) AS rate_rank
@@ -54,8 +54,10 @@ SELECT amount, consumed,
        WHEN active_count = 0 THEN 'expired'
        WHEN amount - consumed <= 0 THEN 'exhausted' ELSE 'active' END,
   CASE WHEN trial_ended_at IS NOT NULL OR stripe_subscription_status IS NOT NULL AND lower(stripe_subscription_status) IN ('active','trialing','past_due') THEN lower(COALESCE(stripe_subscription_status, '')) IN ('active','trialing','past_due')
-       WHEN historical_count = 0 THEN stripe_subscription_id IS NULL
+       WHEN historical_count = 0 THEN false
        WHEN active_count = 0 THEN false
+       -- Eligibility describes whether active credit may still be consumed;
+       -- the warning path separately requires a meaningful usage sample.
        ELSE amount - consumed > 0 END
 FROM calc;
 $$;

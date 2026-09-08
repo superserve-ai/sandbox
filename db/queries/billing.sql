@@ -1017,6 +1017,88 @@ SELECT trial.grant_usd::numeric AS grant_usd,
        trial.eligible::boolean AS eligible
 FROM get_team_trial_balance(sqlc.arg(team_id)) AS trial;
 
+-- Bounded recent sample for the advisory trial warning. The interval bounds
+-- keep this out of the reconciliation hot path's historical scan.
+-- name: GetRecentTrialBurnSample :one
+WITH selected_plan AS (
+  SELECT COALESCE((SELECT tpp.plan_key FROM team_pricing_plan tpp JOIN pricing_plan pp ON pp.key = tpp.plan_key
+    WHERE tpp.team_id = sqlc.arg(team_id) AND pp.active AND tpp.effective_from <= now()
+      AND (tpp.effective_to IS NULL OR tpp.effective_to > now())
+    ORDER BY tpp.effective_from DESC LIMIT 1), 'payg') AS plan_key
+), ranked_rates AS (
+  SELECT r.resource, r.price_usd,
+         row_number() OVER (PARTITION BY r.resource ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC) AS rate_rank
+  FROM pricing_rate r JOIN selected_plan p ON p.plan_key = r.plan_key
+  WHERE r.unit = 'second' AND r.effective_from <= now() AND (r.effective_to IS NULL OR r.effective_to > now())
+), rates AS (
+  SELECT COALESCE(MAX(price_usd) FILTER (WHERE resource = 'vcpu' AND rate_rank = 1), 0)::numeric AS vcpu,
+         COALESCE(MAX(price_usd) FILTER (WHERE resource = 'memory_gib' AND rate_rank = 1), 0)::numeric AS memory,
+         COALESCE(MAX(price_usd) FILTER (WHERE resource = 'storage_gib' AND rate_rank = 1), 0)::numeric AS storage
+  FROM ranked_rates
+), recent_compute AS MATERIALIZED (
+  SELECT GREATEST(b.started_at, now() - interval '6 hours') AS started_at,
+         b.ended_at, b.vcpu_count, b.memory_mib
+  FROM sandbox_compute_billing_interval b
+  WHERE b.team_id = sqlc.arg(team_id)
+    AND b.started_at < now()
+    AND COALESCE(b.ended_at, now()) > now() - interval '6 hours'
+  ORDER BY b.started_at DESC
+  LIMIT 128
+), compute AS (
+  -- Convert each resource's usage to USD before aggregating.  The raw
+  -- interval duration is vCPU-seconds and must never be exposed as spend.
+  SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (COALESCE(b.ended_at, now()) - b.started_at)) * (b.vcpu_count * COALESCE(rates.vcpu, 0) + b.memory_mib / 1024.0 * COALESCE(rates.memory, 0))), 0)::numeric AS amount,
+       MIN(b.started_at) AS started_at,
+       MAX(COALESCE(b.ended_at, now())) AS ended_at
+FROM recent_compute b
+ CROSS JOIN rates
+), recent_storage AS MATERIALIZED (
+  SELECT GREATEST(s.started_at, now() - interval '6 hours') AS started_at,
+         s.ended_at, s.disk_mib
+  FROM sandbox_storage_interval s
+  WHERE s.team_id = sqlc.arg(team_id)
+    AND s.started_at < now()
+    AND COALESCE(s.ended_at, now()) > now() - interval '6 hours'
+  ORDER BY s.started_at DESC
+  LIMIT 128
+), sample_bounds AS (
+  SELECT MIN(started_at) AS started_at,
+         MAX(ended_at) AS ended_at
+  FROM (
+    SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_compute
+    UNION ALL
+    SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_storage
+  ) intervals
+)
+SELECT (compute.amount + CASE WHEN feature_enabled('billing_storage_billing_enabled', sqlc.arg(team_id)) THEN COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (COALESCE(s.ended_at, now()) - s.started_at)) * s.disk_mib / 1024.0 * rates.storage) FROM recent_storage s CROSS JOIN rates), 0) ELSE 0 END)::numeric AS spent_usd,
+       sample_bounds.started_at, sample_bounds.ended_at,
+       EXTRACT(EPOCH FROM (sample_bounds.ended_at - sample_bounds.started_at))::numeric AS elapsed_seconds
+FROM compute, rates, sample_bounds;
+
+-- name: ClaimTrialCreditWarning :one
+-- A claimed row is never reclaimed after a timeout: the worker may have
+-- crashed after provider acceptance, so retrying could duplicate the email.
+INSERT INTO trial_credit_warning_state (team_id, status, claim_token, claimed_at)
+VALUES (sqlc.arg(team_id), 'claimed', gen_random_uuid(), now())
+ON CONFLICT (team_id) DO UPDATE
+SET status = 'claimed', claim_token = gen_random_uuid(), claimed_at = now(), updated_at = now()
+WHERE trial_credit_warning_state.status = 'pending'
+RETURNING COALESCE(claim_token, gen_random_uuid()) AS claim_token;
+
+-- name: CompleteTrialCreditWarning :exec
+UPDATE trial_credit_warning_state SET status = 'sent', sent_at = now(), updated_at = now()
+WHERE team_id = sqlc.arg(team_id) AND status = 'claimed' AND claim_token = sqlc.arg(claim_token);
+
+-- name: ReleaseTrialCreditWarning :exec
+UPDATE trial_credit_warning_state SET status = 'pending', claimed_at = NULL, updated_at = now()
+WHERE team_id = sqlc.arg(team_id) AND status = 'claimed' AND claim_token = sqlc.arg(claim_token);
+
+-- name: MarkTrialCreditWarningUnknown :exec
+-- An interrupted provider request may have been accepted. Do not reclaim it,
+-- because retrying would violate the one-warning invariant.
+UPDATE trial_credit_warning_state SET status = 'unknown', updated_at = now()
+WHERE team_id = sqlc.arg(team_id) AND status = 'claimed' AND claim_token = sqlc.arg(claim_token);
+
 -- name: IsTeamSandboxBillingEligible :one
 SELECT team_sandbox_billing_eligible(sqlc.arg(team_id)) AS eligible;
 

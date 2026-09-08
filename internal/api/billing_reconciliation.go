@@ -31,6 +31,12 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 		if len(teams) == 0 {
 			break
 		}
+		// Warning evaluation is advisory and must not occupy a reconciliation
+		// worker or extend the wait for the eligibility batch. The dispatcher
+		// applies its own process-wide cap and returns immediately when saturated.
+		for _, teamID := range teams {
+			tryDispatchTrialCreditWarning(h, context.WithoutCancel(ctx), teamID)
+		}
 		dispatchBounded(ctx, teams, 10, func(teamID uuid.UUID) {
 			if err := h.DB.RefreshTeamTrialEligibility(ctx, teamID); err != nil {
 				log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh trial eligibility failed")

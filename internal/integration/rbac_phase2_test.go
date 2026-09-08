@@ -11,6 +11,58 @@ import (
 	"github.com/superserve-ai/sandbox/internal/authz"
 )
 
+func TestListTrialCreditWarningRecipients(t *testing.T) {
+	ctx := context.Background()
+	teamID := mustCreateTeam(t, ctx, "rbac-warning-recipients-"+uuid.NewString()[:8])
+
+	owner := seedRBACProfile(t)
+	billingAdmin := seedRBACProfile(t)
+	duplicate := seedRBACProfile(t)
+	viewer := seedRBACProfile(t)
+	inactive := seedRBACProfile(t)
+	revoked := seedRBACProfile(t)
+
+	// Two eligible members intentionally share an address to verify query-level
+	// deduplication, while the owner exercises the owner-inclusive path.
+	if _, err := testPool.Exec(ctx, `UPDATE profile SET email = $1 WHERE id = ANY($2::uuid[])`,
+		"shared-billing@example.com", []uuid.UUID{billingAdmin, duplicate}); err != nil {
+		t.Fatalf("set duplicate profile emails: %v", err)
+	}
+	for _, user := range []uuid.UUID{owner, billingAdmin, duplicate, viewer, inactive, revoked} {
+		seedMembership(t, ctx, teamID, user)
+	}
+	seedTeamRoleAssignment(t, ctx, owner, mustRoleID(t, ctx, "team_owner"), teamID)
+	seedTeamRoleAssignment(t, ctx, billingAdmin, mustRoleID(t, ctx, "billing_admin"), teamID)
+	seedTeamRoleAssignment(t, ctx, duplicate, mustRoleID(t, ctx, "billing_admin"), teamID)
+	seedTeamRoleAssignment(t, ctx, viewer, mustRoleID(t, ctx, "viewer"), teamID)
+	seedTeamRoleAssignment(t, ctx, inactive, mustRoleID(t, ctx, "billing_admin"), teamID)
+	seedTeamRoleAssignment(t, ctx, revoked, mustRoleID(t, ctx, "billing_admin"), teamID)
+	if _, err := testPool.Exec(ctx, `UPDATE team_memberships SET status = 'inactive' WHERE team_id = $1 AND user_id = $2`, teamID, inactive); err != nil {
+		t.Fatalf("deactivate membership: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE user_role_assignments SET revoked_at = now() WHERE team_id = $1 AND user_id = $2`, teamID, revoked); err != nil {
+		t.Fatalf("revoke assignment: %v", err)
+	}
+
+	got, err := testQueries.ListTrialCreditWarningRecipients(ctx, teamID)
+	if err != nil {
+		t.Fatalf("ListTrialCreditWarningRecipients: %v", err)
+	}
+	want := map[string]int{"user-" + owner.String()[:8] + "@example.com": 1, "shared-billing@example.com": 1}
+	counts := make(map[string]int, len(got))
+	for _, email := range got {
+		counts[email]++
+	}
+	if len(counts) != len(want) {
+		t.Fatalf("recipients = %v, want exactly one of each %v", got, want)
+	}
+	for email, wantCount := range want {
+		if counts[email] != wantCount {
+			t.Errorf("recipient %q occurred %d times, want %d", email, counts[email], wantCount)
+		}
+	}
+}
+
 func TestRbacTeamPermissionDecisions(t *testing.T) {
 	ctx := context.Background()
 	svc := authz.New(testPool)
