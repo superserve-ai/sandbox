@@ -1771,3 +1771,45 @@ func TestAdHocSnapshotWaitsForAPauseInFlight(t *testing.T) {
 		t.Fatalf("thaws=%d; a completed pause's leftover intent is nothing to release", thaws)
 	}
 }
+
+// A pause whose stop of Firecracker fails records Paused over a process that
+// may still hold the guest, its workload frozen for the image the pause
+// published. An ad-hoc snapshot of it, never marked, would restore without a
+// wake: only a running VM may be snapshotted this way.
+func TestAdHocSnapshotRefusesAPausedVM(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false }
+	t.Cleanup(func() { vmUnitFullyDown = origDown })
+
+	fc := startSnapshotAPIFake(t, nil)
+	dir := t.TempDir()
+	vmDir := filepath.Join(dir, "vm-1")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	memSnap := filepath.Join(vmDir, "mem.snap")
+	if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Cgroup-supervised with no cgroup on this host: the pause's stop cannot
+	// be confirmed, which is the case where Firecracker may survive.
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap}
+	m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	inst.mu.RLock()
+	st := inst.Status
+	inst.mu.RUnlock()
+	if st != StatusPaused {
+		t.Fatalf("status after the pause %v, want Paused", st)
+	}
+	before := len(fc.snapshotBodies())
+	_, _, err := m.CreateVMSnapshot(context.Background(), "vm-1", filepath.Join(dir, "adhoc"))
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("err=%v, want FailedPrecondition for a paused VM", err)
+	}
+	if got := len(fc.snapshotBodies()); got != before {
+		t.Fatalf("snapshot requests went from %d to %d; a refused snapshot must send none", before, got)
+	}
+}

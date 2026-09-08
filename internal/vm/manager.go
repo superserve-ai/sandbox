@@ -2911,10 +2911,17 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID, fmt.Sprintf("snap-%d", time.Now().Unix()))
 	}
 	// An ad-hoc image is never marked, so it restores without a wake: it may
-	// only be taken of a guest no earlier pause left frozen.
+	// only be taken of a running guest no earlier pause left frozen. A paused
+	// record's Firecracker may have outlived a failed stop, its workload
+	// frozen for the image that pause published; an image of it from here
+	// would never be woken.
 	inst.mu.RLock()
+	adHocStatus := inst.Status
 	adHocSocket, adHocIP, adHocArtifact := inst.SocketPath, inst.IP, inst.ArtifactID
 	inst.mu.RUnlock()
+	if adHocStatus != StatusRunning {
+		return "", "", status.Errorf(codes.FailedPrecondition, "vm %s is %v; an ad-hoc snapshot needs a running VM", vmID, adHocStatus)
+	}
 	if err := m.resolveOutstandingFreeze(ctx, vmID, adHocSocket, adHocIP, adHocArtifact, m.log.With().Str("vm_id", vmID).Logger()); err != nil {
 		return "", "", err
 	}
