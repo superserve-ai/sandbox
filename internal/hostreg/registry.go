@@ -78,23 +78,28 @@ type Registry struct {
 	// id ever seen (fleet-bounded).
 	gens map[string]uint64
 	// reported is the address a caller most recently handed to MarkVerified
-	// per host, and reportSeq counts those reports. Two row reads cannot be
-	// ordered from this side — a query that started first can execute last
-	// — so a report and a resolution's own read are never ranked on timing.
-	// Instead a resolution treats any report that arrives WHILE its read is
-	// in flight as ambiguous: after the read returns it checks whether such
-	// a report disagrees with what the read saw and, if so, reads again
-	// before publishing (and again after the dial, for reports that arrive
-	// then). A report that agrees costs nothing, so concurrent equivalent
-	// reports cannot starve a resolution; only a genuine conflict costs a
-	// re-read, and the fresh generation-guarded read is the sole authority.
+	// per host, reportSeq counts those reports, and reportConflictSeq is the
+	// sequence number of the latest report that DISAGREED with the one
+	// before it. Two row reads cannot be ordered from this side — a query
+	// that started first can execute last — so a report and a resolution's
+	// own read are never ranked on timing. Instead a resolution treats the
+	// reports that arrive WHILE its read is in flight as ambiguous: after
+	// the read returns it reads again before publishing if the latest such
+	// report disagrees with what the read saw, OR if those reports disagreed
+	// among themselves — a stale report that happens to echo the read must
+	// not erase an earlier one that contradicted it. The same check runs
+	// after the dial, for reports that arrive then. Identical reports set no
+	// conflict, so concurrent equivalent reports cannot starve a resolution;
+	// only a genuine conflict costs a re-read, and the fresh
+	// generation-guarded read is the sole authority.
 	// A report that contradicts the CACHED client drops it on the spot, and
 	// so does a conflict detected by a resolution, so nothing — the
 	// resolution's own within-lease fallback included — dispatches through
 	// a doubted address; if the confirming read fails, dispatch fails closed.
-	reported  map[string]string
-	reportSeq map[string]uint64
-	resolve   singleflight.Group // one row-read/dial resolution in flight per host
+	reported          map[string]string
+	reportSeq         map[string]uint64
+	reportConflictSeq map[string]uint64
+	resolve           singleflight.Group // one row-read/dial resolution in flight per host
 	// refreshing holds hosts with a refresh-ahead goroutine in flight.
 	// Singleflight dedupes the underlying read but not the goroutines
 	// waiting on it — without this guard, every warm call in the refresh
@@ -105,12 +110,13 @@ type Registry struct {
 // New creates a Registry backed by the host table.
 func New(queries *db.Queries, dial DialFunc) *Registry {
 	return &Registry{
-		db:        queries,
-		dial:      dial,
-		clients:   make(map[string]entry),
-		gens:      make(map[string]uint64),
-		reported:  make(map[string]string),
-		reportSeq: make(map[string]uint64),
+		db:                queries,
+		dial:              dial,
+		clients:           make(map[string]entry),
+		gens:              make(map[string]uint64),
+		reported:          make(map[string]string),
+		reportSeq:         make(map[string]uint64),
+		reportConflictSeq: make(map[string]uint64),
 	}
 }
 
@@ -344,6 +350,7 @@ func (r *Registry) Invalidate(hostID string) {
 	r.mu.Lock()
 	delete(r.clients, hostID)
 	delete(r.reported, hostID)
+	delete(r.reportConflictSeq, hostID)
 	r.gens[hostID]++
 	r.mu.Unlock()
 }
@@ -363,6 +370,9 @@ func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
 		return
 	}
 	r.mu.Lock()
+	if last, seen := r.reported[hostID]; seen && last != addr {
+		r.reportConflictSeq[hostID] = r.reportSeq[hostID] + 1
+	}
 	r.reported[hostID] = addr
 	r.reportSeq[hostID]++
 	e, ok := r.clients[hostID]
@@ -385,8 +395,12 @@ func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string) {
 	}
 }
 
-// reportedConflictLocked reports whether a MarkVerified report arrived since
-// reportSeq was seq and disagrees with addr. Caller holds mu.
+// reportedConflictLocked reports whether the MarkVerified reports that
+// arrived since reportSeq was seq leave addr in doubt: the latest disagrees
+// with it, or they disagreed among themselves. Caller holds mu.
 func (r *Registry) reportedConflictLocked(hostID string, seq uint64, addr string) bool {
-	return r.reportSeq[hostID] != seq && r.reported[hostID] != addr
+	if r.reportSeq[hostID] == seq {
+		return false
+	}
+	return r.reported[hostID] != addr || r.reportConflictSeq[hostID] > seq
 }

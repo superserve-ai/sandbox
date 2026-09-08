@@ -1301,3 +1301,65 @@ func TestConflictDropsCachedClientSoFailedConfirmationFailsClosed(t *testing.T) 
 		t.Fatalf("settled address = %q, want .2 (the row's answer)", settled)
 	}
 }
+
+// Two reports that disagree with each other inside a read's window leave the
+// address in doubt even when the later one happens to echo the read. A cold
+// read captures .1 and is held; the host moves to .2 and a report says so;
+// a stale report of .1 arrives after it; the held read returns .1. The
+// registry must confirm rather than trust the echo, and lands on .2.
+func TestConflictingReportsDoNotHideEachOther(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	gate := make(chan struct{})
+	store.setGate(gate) // the cold read captures .1 and is held
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.readCount() < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("cold lookup never reached its read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.setAddr("10.0.0.2:50051")
+	var reports sync.WaitGroup
+	reports.Add(2)
+	go func() {
+		defer reports.Done()
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051") // current
+	}()
+	waitForObserved(t, r, "host-a", "10.0.0.2:50051")
+	go func() {
+		defer reports.Done()
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051") // stale, delivered late
+	}()
+	waitForObserved(t, r, "host-a", "10.0.0.1:50051")
+	store.setGate(nil)
+	close(gate) // the held read returns .1, matching the stale report
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	reports.Wait()
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want .2 (a stale echo must not hide the conflicting report)", settled)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "10.0.0.2:50051" {
+		t.Fatalf("dialed = %v, want only .2", got)
+	}
+}
