@@ -239,22 +239,20 @@ func capabilityCacheKey(capabilities []string) (string, []string) {
 
 // Invalidate drops all cached capability-specific candidate sets so the next
 // SelectHost reflects status or capability changes immediately.
-// Reject drops every cached candidate set that still lists hostID, because
-// the create pre-flight has just refused it. A set loaded since the host
-// left rotation no longer lists it and is kept, so a burst of creates that
-// all drew the same stale host reloads once, not once per create; a
+// Reject drops the cached candidate set for requiredCapabilities if it
+// still lists hostID, because the create pre-flight for that set has just
+// refused the host. Other capability sets are untouched: the rejection is
+// evidence about this set only, and evicting the rest would make unrelated
+// traffic refill each other's caches. A set loaded since the host left
+// rotation no longer lists it and is kept, so a burst of creates that all
+// drew the same stale host reloads once, not once per create; a
 // default-host fallback is never reloaded for this, see names.
-func (s *LeastLoaded) Reject(hostID string) {
+func (s *LeastLoaded) Reject(hostID string, requiredCapabilities []string) {
+	key, _ := capabilityCacheKey(requiredCapabilities)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	dropped := false
-	for key, entry := range s.cache {
-		if s.names(entry, hostID) {
-			delete(s.cache, key)
-			dropped = true
-		}
-	}
-	if dropped {
+	if entry, ok := s.cache[key]; ok && s.names(entry, hostID) {
+		delete(s.cache, key)
 		s.gen++
 	}
 }

@@ -123,9 +123,10 @@ type Scheduler interface {
 	// Invalidate drops any cached host state so the next SelectHost
 	// reflects host status changes immediately.
 	Invalidate()
-	// Reject drops cached host state that still names hostID, which the
-	// create pre-flight has just refused; state loaded since is kept.
-	Reject(hostID string)
+	// Reject drops the cached candidate set for requiredCapabilities if it
+	// still names hostID, which that set's pre-flight has just refused;
+	// state loaded since, and other capability sets, are kept.
+	Reject(hostID string, requiredCapabilities []string)
 }
 
 // HostRegistry resolves a host ID to a VMD client.
@@ -2095,7 +2096,7 @@ func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (h
 	if err == nil && !eligible && h.Scheduler != nil {
 		log.Warn().Str("host_id", hostID).Msg("scheduled host failed the pre-flight; selecting again without it")
 		rejected := hostID
-		h.Scheduler.Reject(hostID)
+		h.Scheduler.Reject(hostID, requiredCapabilities)
 		if hostID, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
 			return "", false
 		}

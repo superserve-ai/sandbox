@@ -518,15 +518,40 @@ func TestRejectDropsOnlySetsStillNamingTheHost(t *testing.T) {
 	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-1" {
 		t.Fatalf("prime = (%q, %v)", id, err)
 	}
-	s.Reject("host-1")
+	s.Reject("host-1", nil)
 	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" {
 		t.Fatalf("after reject = (%q, %v), want host-2 from a fresh load", id, err)
 	}
-	s.Reject("host-1") // the fresh set no longer names host-1: no-op
+	s.Reject("host-1", nil) // the fresh set no longer names host-1: no-op
 	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" {
 		t.Fatalf("after stale reject = (%q, %v), want the cached host-2", id, err)
 	}
 	if n := store.calls.Load(); n != 2 {
 		t.Fatalf("queries = %d, want 2 (one reload for the whole burst)", n)
+	}
+}
+
+// A rejection is scoped to the capability set that produced the selection:
+// rejecting a host for a private-only set leaves the public set cached.
+func TestRejectLeavesOtherCapabilitySetsCached(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	public := []string{"preview_ports_v1"}
+	private := []string{"preview_ports_v1", "preview_port_browser_auth_v1"}
+	if _, err := s.SelectHost(context.Background(), public); err != nil { // query 1: host-1
+		t.Fatalf("public prime: %v", err)
+	}
+	if _, err := s.SelectHost(context.Background(), private); err != nil { // query 2: host-2
+		t.Fatalf("private prime: %v", err)
+	}
+	s.Reject("host-2", private)
+	if _, err := s.SelectHost(context.Background(), public); err != nil {
+		t.Fatalf("public after private reject: %v", err)
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("queries = %d, want 2 (the public set must not be reloaded)", n)
+	}
+	if id, err := s.SelectHost(context.Background(), private); err != nil || id != "host-3" {
+		t.Fatalf("private after reject = (%q, %v), want host-3 from a fresh load", id, err)
 	}
 }
