@@ -1561,6 +1561,9 @@ func main() {
 	// wrong, and corrected by the next probe. Blocking readiness on an exec to
 	// close that window would cost every restart more than it saves.
 	mgr.WatchFirecrackerCapability(ctx, log)
+	// Evidence a previous process made durable is recognised; starting a vmd
+	// creates none.
+	vm.RecognizeWakeProtocolFloor()
 
 	// ---- Background full reattach ----
 	// Off the critical path (requests load their VM on demand); proactively

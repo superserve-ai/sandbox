@@ -127,6 +127,8 @@ preserving vmd's template cache.
 """
 
 import os
+import re
+import pathlib
 import shlex
 import subprocess
 import sys
@@ -165,6 +167,8 @@ BUNDLE_FILES = [
     "deploy/superserve-vms.service",
     "deploy/vmd-rollback-guard",
     "deploy/superserve-vmd-rollback-guard.conf",
+    "deploy/vmd-wake-floor-guard",
+    "deploy/superserve-vmd-wake-floor-guard.conf",
     "deploy/superserve-vmd-start-generation.conf",
     "deploy/superserve-secretsproxy.service",
     "deploy/firecracker@.service",
@@ -179,7 +183,19 @@ BUNDLE_FILES = [
 ]
 
 
+def check_bundle_parity() -> None:
+    """Every deploy/ file the remote script installs must ride in the bundle,
+    or the install fails on the host after the binaries were already copied.
+    Checked before any host is touched."""
+    src = pathlib.Path(__file__).read_text()
+    referenced = set(re.findall(r"\{extract_dir\}/(deploy/[A-Za-z0-9_.@-]+)", src))
+    missing = sorted(referenced - set(BUNDLE_FILES))
+    if missing:
+        sys.exit(f"deploy-vmd.py: installed by the remote script but not bundled: {missing}")
+
+
 def main() -> int:
+    check_bundle_parity()
     project = os.environ["GCP_PROJECT"]
     region = os.environ.get("GCP_REGION", "")
     label = os.environ.get("VMD_LABEL", "component=vmd")
@@ -453,6 +469,14 @@ def main() -> int:
                 echo "host drained — proceeding with downgrade"
             fi
 
+            # Wake-protocol floor: the guard the service runs at every start,
+            # applied to the new binary before it lands. One source for what
+            # it checks; see deploy/vmd-wake-floor-guard.
+            if ! sh {extract_dir}/deploy/vmd-wake-floor-guard {extract_dir}/bin/vmd; then
+                echo "ERROR: the wake-protocol floor guard rejects this vmd; refusing to install it" >&2
+                exit 1
+            fi
+
             # Install vmd + template-builder binaries.
             sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd
             sudo install -m 0755 {extract_dir}/bin/template-builder {install_dir}/template-builder
@@ -495,6 +519,11 @@ def main() -> int:
             sudo install -m 0755 {extract_dir}/deploy/vmd-rollback-guard {install_dir}/vmd-rollback-guard
             sudo install -d -m 0755 /etc/systemd/system/superserve-vmd.service.d
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-rollback-guard.conf /etc/systemd/system/superserve-vmd.service.d/10-rollback-guard.conf
+            # Wake-protocol floor: its own executable and drop-in, at paths no
+            # earlier deploy script knows, so a rollback that reinstalls that
+            # script's guard leaves this one in place. See vmd-wake-floor-guard.
+            sudo install -m 0755 {extract_dir}/deploy/vmd-wake-floor-guard {install_dir}/vmd-wake-floor-guard
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-wake-floor-guard.conf /etc/systemd/system/superserve-vmd.service.d/30-wake-floor-guard.conf
             # Start-generation stamp: proves receipt succession (see the
             # drop-in's header). A drop-in for the same reason as the guard
             # above — it must survive deploys of revisions that predate it.
