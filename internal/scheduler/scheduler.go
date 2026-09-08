@@ -239,10 +239,11 @@ func capabilityCacheKey(capabilities []string) (string, []string) {
 
 // Invalidate drops all cached capability-specific candidate sets so the next
 // SelectHost reflects status or capability changes immediately.
-// Reject drops every cached candidate set that still names hostID, because
+// Reject drops every cached candidate set that still lists hostID, because
 // the create pre-flight has just refused it. A set loaded since the host
-// left rotation no longer names it and is kept, so a burst of creates that
-// all drew the same stale host reloads once, not once per create.
+// left rotation no longer lists it and is kept, so a burst of creates that
+// all drew the same stale host reloads once, not once per create; a
+// default-host fallback is never reloaded for this, see names.
 func (s *LeastLoaded) Reject(hostID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -258,15 +259,17 @@ func (s *LeastLoaded) Reject(hostID string) {
 	}
 }
 
-// names reports whether SelectHost could hand out hostID from this entry.
+// names reports whether this entry's candidate set lists hostID. The
+// default-host fallback (an empty set) deliberately does not count: that
+// host is the one the capability-filtered load already excluded, so a
+// reload cannot change the answer and would only repeat the query.
 func (s *LeastLoaded) names(e hostCacheEntry, hostID string) bool {
 	for _, h := range e.hosts {
 		if h.ID == hostID {
 			return true
 		}
 	}
-	return len(e.hosts) == 0 && hostID == s.DefaultHostID &&
-		(e.defaultStatus == "missing" || e.defaultStatus == "active")
+	return false
 }
 
 func (s *LeastLoaded) Invalidate() {

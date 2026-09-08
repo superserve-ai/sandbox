@@ -2263,10 +2263,10 @@ func TestCreateSandbox_RechecksCapabilitiesAfterSchedulerSelection(t *testing.T)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
 	}
-	// A rejected host drops the cached candidate set and selection runs once
-	// more on a fresh load; the same host coming back is re-checked and the
+	// A rejected host is dropped from the cached candidates and selection
+	// runs once more; the same host coming back is not re-checked, and the
 	// create fails before any insert or boot.
-	if checks != 2 || scheduler.selects != 2 || scheduler.drops != 1 || inserted || restored {
+	if checks != 1 || scheduler.selects != 2 || scheduler.drops != 1 || inserted || restored {
 		t.Fatalf("post-selection result: checks=%d selects=%d drops=%d inserted=%v restored=%v",
 			checks, scheduler.selects, scheduler.drops, inserted, restored)
 	}
@@ -4095,5 +4095,38 @@ func TestPlaceCreateChecksCapabilitiesOncePerHost(t *testing.T) {
 				t.Fatalf("pre-flight reads = %d, want 1", reads)
 			}
 		})
+	}
+}
+
+// When reselection hands back the host that was just rejected — the
+// default-host fallback does this by design — the pre-flight is not run a
+// second time: the answer cannot change, and the create fails on the first.
+func TestPlaceCreateDoesNotRecheckAnUnchangedReselection(t *testing.T) {
+	scheduler := &stubScheduler{hostID: "only-host"}
+	reads := 0
+	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+		if strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			reads++
+			return &mockRow{scanFn: func(dest ...any) error {
+				*dest[0].(*bool) = false
+				*dest[1].(*string) = ""
+				return nil
+			}}
+		}
+		return &mockRow{scanFn: func(dest ...any) error { return nil }} // rejection diagnostics, off the request
+	}}
+	h := &Handlers{DB: db.New(mock), Scheduler: scheduler}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+
+	if _, ok := h.placeCreate(c, []string{preview.HostCapabilityPorts}); ok {
+		t.Fatal("placeCreate accepted a host that failed the pre-flight")
+	}
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", w.Code)
+	}
+	if reads != 1 || scheduler.selects != 2 {
+		t.Fatalf("pre-flight reads=%d selects=%d, want 1 and 2", reads, scheduler.selects)
 	}
 }

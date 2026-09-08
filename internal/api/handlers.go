@@ -2094,12 +2094,17 @@ func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (h
 	eligible, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
 	if err == nil && !eligible && h.Scheduler != nil {
 		log.Warn().Str("host_id", hostID).Msg("scheduled host failed the pre-flight; selecting again without it")
+		rejected := hostID
 		h.Scheduler.Reject(hostID)
 		if hostID, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
 			return "", false
 		}
-		SetTelemetryHostID(c, hostID)
-		eligible, err = h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
+		// The same host again (the default-host fallback) can only repeat
+		// the answer just given; don't pay the read twice.
+		if hostID != rejected {
+			SetTelemetryHostID(c, hostID)
+			eligible, err = h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
+		}
 	}
 	if !h.respondHostCapabilityResult(c, hostID, requiredCapabilities, eligible, err) {
 		return "", false
