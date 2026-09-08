@@ -1669,21 +1669,18 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		if err := ensureWakeProtocolFloor(); err != nil {
 			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record the rollback floor before freezing: %w", err))
 		}
-		// An intent already here may name a freeze an earlier pause left in
-		// place: its reply lost and its thaw unconfirmed. That token is the
-		// only way to release the guest, so it is resolved before a new one
-		// replaces it; a pause refused here keeps it. The leftover of a pause
-		// that completed names this record's artifact and is simply rewritten.
-		prior, perr := readPauseIntent(snapshotDir)
-		if perr != nil {
-			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("read the earlier pause intent: %w", perr))
-		}
-		if prior != nil && prior.FreezeToken != "" && prior.ArtifactID != recordedArtifact {
-			if rerr := m.releaseOrConfirmRunning(ctx, "", instIP, prior.FreezeToken); rerr != nil {
-				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("an earlier pause's freeze could not be released: %w", rerr))
-			}
-			log.Warn().Msg("pause: released a guest an earlier pause had left frozen")
-		}
+	}
+	// Whatever this pause plans, an image of this guest is published only
+	// once a freeze an earlier pause may have left is resolved: a custom
+	// directory, or a host that cannot freeze today, does not turn a frozen
+	// workload into an unfrozen image. A pause refused here leaves that
+	// intent, and its token, for the next attempt.
+	if err := m.resolveOutstandingFreeze(ctx, vmID, socketPath, instIP, recordedArtifact, log); err != nil {
+		return "", "", nil, m.handleVMError(vmID, err)
+	}
+	if willFreeze {
+		// Durable BEFORE the freeze: a crash after it must find the token,
+		// or the guest stays frozen with nobody able to release it.
 		if err := writePauseIntent(snapshotDir, pauseIntent{VMID: vmID, FreezeToken: freezeToken, ArtifactID: artifactID}); err != nil {
 			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record pause intent: %w", err))
 		}
@@ -2903,6 +2900,14 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 
 	if snapshotDir == "" {
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID, fmt.Sprintf("snap-%d", time.Now().Unix()))
+	}
+	// An ad-hoc image is never marked, so it restores without a wake: it may
+	// only be taken of a guest no earlier pause left frozen.
+	inst.mu.RLock()
+	adHocSocket, adHocIP, adHocArtifact := inst.SocketPath, inst.IP, inst.ArtifactID
+	inst.mu.RUnlock()
+	if err := m.resolveOutstandingFreeze(ctx, vmID, adHocSocket, adHocIP, adHocArtifact, m.log.With().Str("vm_id", vmID).Logger()); err != nil {
+		return "", "", err
 	}
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
 		return "", "", fmt.Errorf("create snapshot dir: %w", err)
@@ -8329,6 +8334,38 @@ func (m *Manager) releaseFrozenGuest(ctx context.Context, socketPath, ip, token 
 	tctx, cancel := context.WithTimeout(base, 2*time.Second)
 	defer cancel()
 	return boxdThawGuest(tctx, ip, token)
+}
+
+// resolveOutstandingFreeze releases, or confirms released, a workload an
+// earlier pause of this VM may have left frozen (its reply lost, its thaw
+// unconfirmed), before any image of the guest can be published as unfrozen.
+// The intent that pause left is the only holder of its token; it is cleared
+// once nothing is frozen under it, and kept when that cannot be shown. The
+// leftover of a pause that completed names this record's artifact and is
+// nothing to resolve. Intents exist only on a host whose floor is up, so a
+// host with the floor down looks for nothing.
+func (m *Manager) resolveOutstandingFreeze(ctx context.Context, vmID, socketPath, ip, recordedArtifact string, log zerolog.Logger) error {
+	if !wakeProtocolFloorRaised() {
+		return nil
+	}
+	dir := filepath.Join(m.cfg.SnapshotDir, vmID)
+	prior, err := readPauseIntent(dir)
+	if err != nil {
+		return fmt.Errorf("read the earlier pause intent: %w", err)
+	}
+	if prior == nil || prior.FreezeToken == "" || prior.ArtifactID == recordedArtifact {
+		return nil
+	}
+	// The vCPUs may still be paused from that pause's snapshot attempt; the
+	// guest cannot answer a thaw until Firecracker resumes them.
+	if err := m.releaseOrConfirmRunning(ctx, socketPath, ip, prior.FreezeToken); err != nil {
+		return fmt.Errorf("an earlier pause's freeze could not be released: %w", err)
+	}
+	log.Warn().Msg("released a guest an earlier pause had left frozen")
+	if err := clearPauseIntent(dir); err != nil {
+		return fmt.Errorf("clear the earlier pause intent: %w", err)
+	}
+	return nil
 }
 
 // releaseOrConfirmRunning releases a workload frozen under token or, when the
