@@ -92,9 +92,29 @@ func TestResolveByName(t *testing.T) {
 		filepath.Join(root, "real", "plain"):      filepath.Join(real, "plain"),
 	}
 	for in, want := range cases {
-		if got := resolveByName(in); got != want {
+		if got := resolveByName(in, nil); got != want {
 			t.Errorf("resolveByName(%q) = %q, want %q", in, got, want)
 		}
+	}
+
+	// A mount is never looked inside: a link within it stays unresolved,
+	// while a link from outside that points into it still lands there.
+	mnt := filepath.Join(root, "mnt")
+	if err := os.Mkdir(mnt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(mnt, "inner")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(mnt, "sub"), filepath.Join(root, "into")); err != nil {
+		t.Fatal(err)
+	}
+	mounts := []fsErrorMount{{Mountpoint: "/", Fstype: "ext4"}, {Mountpoint: mnt, Fstype: "fuse.example"}}
+	if got, want := resolveByName(filepath.Join(mnt, "inner", "f"), mounts), filepath.Join(mnt, "inner", "f"); got != want {
+		t.Errorf("walked inside the mount: got %q, want %q", got, want)
+	}
+	if got, want := resolveByName(filepath.Join(root, "into", "f"), mounts), filepath.Join(mnt, "sub", "f"); got != want {
+		t.Errorf("link into the mount: got %q, want %q", got, want)
 	}
 }
 
@@ -103,6 +123,7 @@ func TestMountForIn(t *testing.T) {
 40 22 0:35 / /mnt rw,relatime shared:2 - tmpfs tmpfs rw
 41 40 0:36 / /mnt/data rw,nosuid shared:3 master:1 - fuse.example example rw,user_id=0
 42 22 0:37 / /with\040space rw - nfs4 host:/x rw
+43 22 0:38 / /back\134slash rw - ext4 /dev/x rw
 `
 	cases := []struct {
 		path string
@@ -112,6 +133,7 @@ func TestMountForIn(t *testing.T) {
 		{"/mnt/data", &fsErrorMount{"/mnt/data", "fuse.example"}},
 		{"/mnt/datastore/f", &fsErrorMount{"/mnt", "tmpfs"}},
 		{"/with space/f", &fsErrorMount{"/with space", "nfs4"}},
+		{`/back\slash/f`, &fsErrorMount{`/back\slash`, "ext4"}},
 		{"/etc/hosts", &fsErrorMount{"/", "ext4"}},
 	}
 	for _, c := range cases {

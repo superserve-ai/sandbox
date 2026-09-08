@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -69,19 +70,24 @@ func writeFSError(w http.ResponseWriter, path string, err error) {
 }
 
 // mountFor returns the mount serving path, or nil when it cannot be
-// determined. Symlinks are followed by name only: the target of a link
-// into a mount is matched even when that mount no longer answers stat.
+// determined. Symlinks are followed by name only, and the walk stops at
+// the first mountpoint it enters, so a failing mount is identified without
+// ever being touched again.
 func mountFor(path string) *fsErrorMount {
 	data, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
 		return nil
 	}
-	return mountForIn(string(data), resolveByName(path))
+	mounts := parseMountinfo(string(data))
+	return longestMount(mounts, resolveByName(path, mounts))
 }
 
-// mountForIn picks the longest mountpoint in mountinfo that contains path.
 func mountForIn(mountinfo, path string) *fsErrorMount {
-	var best *fsErrorMount
+	return longestMount(parseMountinfo(mountinfo), path)
+}
+
+func parseMountinfo(mountinfo string) []fsErrorMount {
+	var mounts []fsErrorMount
 	for _, line := range strings.Split(mountinfo, "\n") {
 		fields := strings.Fields(line)
 		sep := -1
@@ -94,28 +100,75 @@ func mountForIn(mountinfo, path string) *fsErrorMount {
 		if len(fields) < 5 || sep < 0 || sep+1 >= len(fields) {
 			continue
 		}
-		mp := strings.ReplaceAll(fields[4], `\040`, " ")
-		if path != mp && !strings.HasPrefix(path, strings.TrimSuffix(mp, "/")+"/") {
-			continue
-		}
-		if best == nil || len(mp) > len(best.Mountpoint) {
-			best = &fsErrorMount{Mountpoint: mp, Fstype: fields[sep+1]}
+		mounts = append(mounts, fsErrorMount{Mountpoint: unescapeMountinfo(fields[4]), Fstype: fields[sep+1]})
+	}
+	return mounts
+}
+
+// longestMount picks the deepest mountpoint that contains path.
+func longestMount(mounts []fsErrorMount, path string) *fsErrorMount {
+	var best *fsErrorMount
+	for i := range mounts {
+		m := &mounts[i]
+		if pathWithin(path, m.Mountpoint) && (best == nil || len(m.Mountpoint) > len(best.Mountpoint)) {
+			best = m
 		}
 	}
 	return best
 }
 
-// resolveByName expands the symlinks in path using readlink alone. Unlike
-// filepath.EvalSymlinks it never stats a link's target, so a link pointing
-// into a broken mount still resolves to that mount's path; components that
-// cannot be inspected are kept as written.
-func resolveByName(path string) string {
+func pathWithin(path, dir string) bool {
+	return path == dir || strings.HasPrefix(path, strings.TrimSuffix(dir, "/")+"/")
+}
+
+// insideMount reports whether p sits at or below a mountpoint other than
+// the root filesystem.
+func insideMount(mounts []fsErrorMount, p string) bool {
+	for _, m := range mounts {
+		if m.Mountpoint != "/" && pathWithin(p, m.Mountpoint) {
+			return true
+		}
+	}
+	return false
+}
+
+// unescapeMountinfo decodes the octal escapes the kernel writes for special
+// characters in mountinfo fields, such as \040 for a space.
+func unescapeMountinfo(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) {
+			if n, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(n))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// resolveByName expands the symlinks in path using readlink alone, and
+// only for components outside any mount in mounts. Unlike
+// filepath.EvalSymlinks it never stats a link's target, and it never looks
+// inside a mount: once the path enters one, the rest is kept as written,
+// which is all the mount match needs and keeps a hung mount from stalling
+// the error response. Components that cannot be inspected are also kept.
+func resolveByName(path string, mounts []fsErrorMount) string {
 	path = filepath.Clean(path)
 	for hops := 0; hops < 40; hops++ {
 		parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
 		relinked := false
 		for i := range parts {
 			prefix := "/" + filepath.Join(parts[:i+1]...)
+			if insideMount(mounts, prefix) {
+				return path
+			}
 			fi, err := os.Lstat(prefix)
 			if err != nil {
 				return path
