@@ -262,7 +262,8 @@ func TestFrozenResumeFailureRevertsToPaused(t *testing.T) {
 	inst := &VMInstance{
 		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
 		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs,
-		SnapshotWorkloadFrozen: &frozen, PausedAt: pausedAt,
+		SnapshotWorkloadFrozen: &frozen, PausedAt: pausedAt, FreezeToken: "rec",
+		IP: "10.9.9.9", // an earlier run's slot, long released
 	}
 	mgr := &Manager{
 		log:    zerolog.Nop(),
@@ -287,6 +288,42 @@ func TestFrozenResumeFailureRevertsToPaused(t *testing.T) {
 	}
 	if !owedAtLaunch {
 		t.Error("the wake-owed record must be published before the launch")
+	}
+	// The slot this run took goes back to the pool: the record must not keep
+	// naming it, or a retry would claim whatever sandbox holds it next.
+	inst.mu.RLock()
+	ip, ns, token := inst.IP, inst.Namespace, inst.FreezeToken
+	inst.mu.RUnlock()
+	if ip != "10.9.9.9" || ns != "" || token != "rec" {
+		t.Errorf("after the failure: ip=%q ns=%q token=%q; want the entry identity back", ip, ns, token)
+	}
+
+	// An override resolves its token from its own manifest; a failed resume
+	// from it must hand the record's own token back with the record's image,
+	// or the next ordinary resume presents the wrong token.
+	override := filepath.Join(dir, "other.snap")
+	if err := os.WriteFile(override, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedFrozenManifest(t, override, "disk")
+	var tokenAtLaunch string
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		inst.mu.RLock()
+		tokenAtLaunch = inst.FreezeToken
+		inst.mu.RUnlock()
+		return 0, SupervisionUnit, errors.New("launch failed")
+	}
+	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", override, nil); err == nil {
+		t.Fatal("want the launch failure")
+	}
+	inst.mu.RLock()
+	mem, token := inst.MemFilePath, inst.FreezeToken
+	inst.mu.RUnlock()
+	if tokenAtLaunch != "disk" {
+		t.Errorf("token at launch %q, want the override's", tokenAtLaunch)
+	}
+	if mem != memPath || token != "rec" {
+		t.Errorf("after the failed override resume: mem=%q token=%q; want the record's own image and token", mem, token)
 	}
 	inst.mu.RLock()
 	defer inst.mu.RUnlock()

@@ -2292,6 +2292,11 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.mu.RLock()
 	recordedCorrects, recordedFrozen, recordedToken := inst.CorrectsWallClock, inst.SnapshotWorkloadFrozen, inst.FreezeToken
 	pausedMemPath, recordedArtifact, entryUnverified := inst.MemFilePath, inst.ArtifactID, inst.Unverified
+	// The identity the record carried in: a frozen resume stamps this run's
+	// slot and token on it before the launch, and a resume that does not
+	// commit hands them back, since its slot is released and the image the
+	// record names is still the one it was paused into.
+	entrySocket, entryIP, entryTAP, entryMAC, entryNS := inst.SocketPath, inst.IP, inst.TAPDevice, inst.MACAddress, inst.Namespace
 	inst.mu.RUnlock()
 	if wakeProtocolFloorRaised() {
 		if blocked, why := pauseIntentBlocks(filepath.Dir(memPath), recordedArtifact); blocked {
@@ -2408,9 +2413,17 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			inst.ClockFrozen = false
 			inst.WakeOwedFromPaused = false
 		}
+		// Whatever verdict the record got, it must not keep this run's
+		// identity: the slot goes back to the pool once this returns, and a
+		// retry that found it here would claim whatever sandbox holds it
+		// next; the token belongs to an image it may not have resumed from.
+		restamped := inst.IP != entryIP || inst.Namespace != entryNS || inst.FreezeToken != recordedToken
+		inst.SocketPath, inst.IP, inst.TAPDevice, inst.MACAddress, inst.Namespace = entrySocket, entryIP, entryTAP, entryMAC, entryNS
+		inst.FreezeToken = recordedToken
 		inst.mu.Unlock()
-		if revert {
-			// Best-effort: an undurable revert is re-derived by the next attempt.
+		if revert || restamped {
+			// Durable before the deferred teardown releases the slot; an
+			// undurable revert is re-derived by the next attempt.
 			_, _ = m.persistStateIfPresent(inst)
 		}
 	}()
