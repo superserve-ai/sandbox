@@ -237,12 +237,13 @@ func TestReaper_VMDFails(t *testing.T) {
 
 	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
 
-	// Both sandboxes are attempted once: a definite failure from the daemon
-	// is terminal, and only a timed-out or unreachable attempt is repeated.
-	if got := atomic.LoadInt32(&pauseCallCount); got != 2 {
-		t.Fatalf("expected 2 PauseInstance calls (one per sandbox), got %d", got)
+	// Both sandboxes are attempted, and each failure gets one recovery
+	// attempt (the host may have paused the VM before failing to record it),
+	// so 2 sandboxes × 2 attempts = 4 calls.
+	if got := atomic.LoadInt32(&pauseCallCount); got != 4 {
+		t.Fatalf("expected 4 PauseInstance calls (2 sandboxes × recovery attempt), got %d", got)
 	}
-	// A definite failure reverts to active.
+	// A failure the recovery attempt does not repair reverts to active.
 	if got := atomic.LoadInt32(&revertCallCount); got != 2 {
 		t.Fatalf("expected 2 revert-to-active calls, got %d", got)
 	}

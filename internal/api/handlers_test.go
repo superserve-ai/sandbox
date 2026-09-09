@@ -4282,12 +4282,16 @@ func TestPauseWithRetry_WaitsOutAPauseThatOutrunsItsAttempt(t *testing.T) {
 
 func TestPauseWithRetry_StopsOnADefiniteAnswer(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		err  error
+		name      string
+		err       error
+		wantCalls int32
 	}{
-		{"not found", status.Error(codes.NotFound, "gone")},
-		{"failed precondition", status.Error(codes.FailedPrecondition, "error state")},
-		{"internal", status.Error(codes.Internal, "snapshot failed")},
+		// The VM is gone: nothing to repair.
+		{"not found", status.Error(codes.NotFound, "gone"), 1},
+		// Refused twice is refused.
+		{"failed precondition", status.Error(codes.FailedPrecondition, "error state"), 2},
+		{"internal", status.Error(codes.Internal, "snapshot failed"), 2},
+		{"plain error", errors.New("record paused state: disk full"), 2},
 	} {
 		var calls atomic.Int32
 		vmd := &stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
@@ -4298,9 +4302,29 @@ func TestPauseWithRetry_StopsOnADefiniteAnswer(t *testing.T) {
 		if status.Code(err) != status.Code(tc.err) {
 			t.Fatalf("%s: err = %v, want %v", tc.name, err, tc.err)
 		}
-		if got := calls.Load(); got != 1 {
-			t.Fatalf("%s: attempts = %d, want 1", tc.name, got)
+		if got := calls.Load(); got != tc.wantCalls {
+			t.Fatalf("%s: attempts = %d, want %d", tc.name, got, tc.wantCalls)
 		}
+	}
+}
+
+func TestPauseWithRetry_RepairsAPauseTheHostFinishedButCouldNotRecord(t *testing.T) {
+	// The snapshot landed and the VM stopped, but recording the paused state
+	// failed. The repeat lands on the already-paused guard.
+	var calls atomic.Int32
+	vmd := &stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+		if calls.Add(1) == 1 {
+			return "", "", errors.New("record paused state for vm: write failed")
+		}
+		return "/snap/vmstate.snap", "/snap/mem.diff", nil
+	}}
+
+	snap, _, _, _, err := pauseUntilDecided(context.Background(), vmd, "vm-a", "tok", 10*time.Millisecond, time.Second)
+	if err != nil || snap == "" {
+		t.Fatalf("got %q, %v; want the recorded snapshot", snap, err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
 	}
 }
 

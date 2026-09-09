@@ -2903,8 +2903,10 @@ const (
 )
 
 // pauseWithRetry pauses a VM and keeps asking, each attempt parking behind
-// the pause in flight, until the host answers definitively. NotFound and
-// every other non-timeout error are terminal.
+// the pause in flight, until the host answers definitively. NotFound is
+// terminal. Any other failure gets one more attempt: the host may have
+// saved the snapshot and stopped the VM before failing to record it, and
+// the repeat lands on the already-paused guard and returns that snapshot.
 func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id, pauseToken string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
 	return pauseUntilDecided(reqCtx, vmd, id, pauseToken, pauseAttemptTimeout, pauseReconcileBudget)
 }
@@ -2914,12 +2916,23 @@ func pauseUntilDecided(reqCtx context.Context, vmd vmdclient.Client, id, pauseTo
 	// The first attempt follows the caller; later ones detach, since the
 	// client giving up must not leave the row drifting against the host.
 	ctx := reqCtx
+	recovered := false
 	for {
 		actx, cancel := context.WithTimeout(ctx, attempt)
 		snapshotPath, memPath, manifest, ackedToken, err = vmd.PauseInstance(actx, id, "", pauseToken)
 		cancel()
-		if err == nil || !pauseUndecided(err) || time.Now().After(deadline) {
+		switch {
+		case err == nil || isVMDNotFound(err):
 			return snapshotPath, memPath, manifest, ackedToken, err
+		case pauseUndecided(err):
+			if time.Now().After(deadline) {
+				return snapshotPath, memPath, manifest, ackedToken, err
+			}
+		default:
+			if recovered {
+				return snapshotPath, memPath, manifest, ackedToken, err
+			}
+			recovered = true
 		}
 		ctx = context.WithoutCancel(reqCtx)
 	}
