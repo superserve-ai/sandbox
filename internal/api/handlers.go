@@ -2874,7 +2874,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	resp := h.sandboxToResponseWithToken(sandbox)
 	resp.PreviewAccess = previewAccess
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
-		resp.Network = req.Network
+		// Echo the normalized rules, not the raw request, so the create
+		// response matches what a subsequent GET returns (bare IPs as /32).
+		allowedCIDRs, deniedCIDRs, allowedDomains := splitEgressEntries(req.Network.AllowOut, req.Network.DenyOut)
+		resp.Network = &networkConfigRequest{
+			AllowOut: append(allowedCIDRs, allowedDomains...),
+			DenyOut:  deniedCIDRs,
+		}
 	}
 	l.Info().
 		Int64("auth_ms", c.GetInt64("auth_ms")).

@@ -71,8 +71,22 @@ func TestIntegration_CreateSandbox_NetworkBareIPNormalized(t *testing.T) {
 		t.Errorf("VMD domains = %v, want %v", domains, want)
 	}
 
+	// The create response already carries the canonical form, so POST and a
+	// subsequent GET describe the resource identically.
+	created := mustJSON(t, cw)
+	createdNetwork, _ := created["network"].(map[string]interface{})
+	if createdNetwork == nil {
+		t.Fatalf("no network in create response: %s", cw.Body.String())
+	}
+	if got, want := stringsOf(createdNetwork["allow_out"]), []string{"203.0.113.7/32", "198.51.100.0/24", "api.example.com"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("create response allow_out = %v, want %v", got, want)
+	}
+	if got, want := stringsOf(createdNetwork["deny_out"]), []string{"0.0.0.0/0", "203.0.113.9/32"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("create response deny_out = %v, want %v", got, want)
+	}
+
 	// The read-back reflects the canonical form, and it is what a resume replays.
-	sid := mustJSON(t, cw)["id"].(string)
+	sid := created["id"].(string)
 	gw := do(r, "GET", "/sandboxes/"+sid, apiKey, "")
 	if gw.Code != http.StatusOK {
 		t.Fatalf("get: %d %s", gw.Code, gw.Body.String())
