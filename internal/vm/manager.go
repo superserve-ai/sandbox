@@ -728,6 +728,11 @@ type Manager struct {
 	// m.vms until the startup pool completes it. See queuePendingWake.
 	pendingWakeMu sync.Mutex
 	pendingWakes  map[string]*pendingWake
+	// wakeDrainStarted closes when the pool begins serving queued wakes,
+	// after the startup pass has scanned every record; a request waiting
+	// on a queued wake counts its bound from then, not from the scan.
+	wakeDrainStarted chan struct{}
+	wakeDrainBegun   bool
 	// reattachDeferred marks ids whose startup reattach was left to the
 	// request holding their lifecycle lock; see reattachByID.
 	reattachDeferred sync.Map
@@ -4975,14 +4980,25 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	// bounded pool, not the flight's own short budget: giving up early would
 	// report a live VM as missing and invite a replacement.
 	if pw := m.pendingWake(rec.ID); pw != nil && !cleanupStale {
-		wait := time.NewTimer(pendingWakeWaitBound(m.pendingWakeCount()))
-		defer wait.Stop()
-		select {
-		case <-pw.done:
+		published := func() (*VMInstance, bool) {
 			m.mu.RLock()
 			inst, ok := m.vms[rec.ID]
 			m.mu.RUnlock()
 			return inst, ok
+		}
+		// The pool starts only once the startup pass has scanned every
+		// record, and that scan is not bounded by the queue: wait for the
+		// pool to start, then for it to reach this wake.
+		select {
+		case <-pw.done:
+			return published()
+		case <-m.wakeDrainStartedCh():
+		}
+		wait := time.NewTimer(pendingWakeWaitBoundFor(m.pendingWakeCount()))
+		defer wait.Stop()
+		select {
+		case <-pw.done:
+			return published()
 		case <-wait.C:
 			return nil, false
 		}
@@ -8474,6 +8490,35 @@ func (m *Manager) pendingWakeCount() int {
 	return len(m.pendingWakes)
 }
 
+// wakeDrainStartedCh is closed once the pool has begun serving queued wakes.
+func (m *Manager) wakeDrainStartedCh() <-chan struct{} {
+	m.pendingWakeMu.Lock()
+	defer m.pendingWakeMu.Unlock()
+	if m.wakeDrainStarted == nil {
+		m.wakeDrainStarted = make(chan struct{})
+		if m.wakeDrainBegun {
+			close(m.wakeDrainStarted)
+		}
+	}
+	return m.wakeDrainStarted
+}
+
+func (m *Manager) noteWakeDrainStarted() {
+	m.pendingWakeMu.Lock()
+	defer m.pendingWakeMu.Unlock()
+	if m.wakeDrainBegun {
+		return
+	}
+	m.wakeDrainBegun = true
+	if m.wakeDrainStarted == nil {
+		m.wakeDrainStarted = make(chan struct{})
+	}
+	close(m.wakeDrainStarted)
+}
+
+// pendingWakeWaitBoundFor is a seam over pendingWakeWaitBound for tests.
+var pendingWakeWaitBoundFor = pendingWakeWaitBound
+
 // pendingWakeWaitBound is how long a request may wait for a queued wake: the
 // pool serves queued wakes wakeRecoveryWorkers at a time, each bounded by
 // the wake's own budget, so a wake queued behind n others is served within
@@ -8503,6 +8548,7 @@ func (m *Manager) queuePendingWake(inst *VMInstance, unlock func()) {
 // publishes each outcome: Running once woken, Error otherwise — never a frozen
 // guest presented as ready. Returns how many were published Running.
 func (m *Manager) drainPendingWakes(ctx context.Context) int {
+	m.noteWakeDrainStarted()
 	m.pendingWakeMu.Lock()
 	queued := make([]*pendingWake, 0, len(m.pendingWakes))
 	for _, pw := range m.pendingWakes {

@@ -1956,3 +1956,59 @@ func TestUnfrozenPauseKeepsTheOldManifestUntilItsSnapshotLands(t *testing.T) {
 		t.Fatalf("manifest=%+v err=%v; the replaced image is unfrozen and must carry no manifest", man, err)
 	}
 }
+
+// A request that meets a queued wake early in the startup pass waits for
+// the pool to start before its bound runs: the scan ahead of the pool is
+// not counted in the queue, and giving up during it would report a live,
+// recoverable VM as missing.
+func TestRequestForAQueuedWakeWaitsForThePoolToStart(t *testing.T) {
+	origWake, origBound := boxdWakeGuest, pendingWakeWaitBoundFor
+	t.Cleanup(func() { boxdWakeGuest, pendingWakeWaitBoundFor = origWake, origBound })
+	pendingWakeWaitBoundFor = func(int) time.Duration { return 50 * time.Millisecond }
+	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return nil }
+
+	dir := t.TempDir()
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeToken: "tok", Supervision: SupervisionUnit, IP: "10.0.0.2"}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.queuePendingWake(toInstance(rec), unlock)
+
+	type outcome struct {
+		inst *VMInstance
+		ok   bool
+	}
+	got := make(chan outcome, 1)
+	go func() {
+		inst, ok := mgr.reattachRecord(context.Background(), rec, false)
+		got <- outcome{inst, ok}
+	}()
+	// Well past the bound, the pool has not started: the request must still
+	// be waiting rather than have reported the VM missing.
+	select {
+	case o := <-got:
+		t.Fatalf("request returned inst=%v ok=%v before the pool started", o.inst, o.ok)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if n := mgr.drainPendingWakes(context.Background()); n != 1 {
+		t.Fatalf("drained %d, want the queued wake served", n)
+	}
+	select {
+	case o := <-got:
+		if o.inst == nil || !o.ok {
+			t.Fatalf("request got inst=%v ok=%v, want the recovered VM", o.inst, o.ok)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("request never returned after the pool served its wake")
+	}
+}
