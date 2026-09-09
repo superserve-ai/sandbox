@@ -25,10 +25,8 @@ type Scheduler interface {
 
 const defaultCacheTTL = 30 * time.Second
 
-// hostsFillTimeout bounds every candidate-set fill, blocking and background
-// alike. The candidate set is a placement hint; the per-create host
-// pre-flight is what keeps a drained host from taking a create, so this
-// bound is not part of the drain convergence budget.
+// hostsFillTimeout bounds every candidate-set fill. The set is only a
+// placement hint; the per-create pre-flight keeps drained hosts out.
 const hostsFillTimeout = 5 * time.Second
 
 // LeastLoaded picks the active host with the fewest running sandboxes
@@ -146,10 +144,9 @@ func (s *LeastLoaded) fillEntry(ctx context.Context, normalized []string) (hostC
 }
 
 // loadHosts serves the cached candidate set at any age and refreshes it in
-// the background once the TTL lapses; only the first call for a set and a
-// post-Invalidate call block on a load. Serving stale is safe because the
-// create path re-reads the chosen host before dispatch and re-selects after
-// an Invalidate when that read rejects it.
+// the background once the TTL lapses; only a cold set, an expired empty set
+// and a post-Invalidate call block on a load. Stale is safe: the create path
+// re-attests the chosen host and re-selects when that rejects it.
 func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []string) (hostCacheEntry, error) {
 	key, normalized := capabilityCacheKey(requiredCapabilities)
 	s.mu.RLock()
@@ -182,11 +179,9 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 		return entry, nil
 	}
 
-	// Blocking load: one fill per capability set and invalidation epoch at a
-	// time, run outside the mutex, so a slow fill for one set never stalls
-	// selects for the others. The epoch is part of the flight's identity so
-	// a caller arriving after an Invalidate never joins a fill that began
-	// before it and would hand back what that invalidation retired.
+	// Blocking load, one flight per capability set and invalidation epoch,
+	// run outside the mutex so a slow fill never stalls other sets. The epoch
+	// keeps a caller arriving after an Invalidate off an older flight.
 	ch := s.fills.DoChan(fmt.Sprintf("%s\x00%d", key, inv), func() (any, error) {
 		fillCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostsFillTimeout)
 		defer cancel()
@@ -213,13 +208,10 @@ func (s *LeastLoaded) claimRefresh(key string) bool {
 	return !busy
 }
 
-// publish caches fresh for key under a new generation, unless it is stale:
-// an Invalidate landed after the load began (invalidations moved past inv),
-// or, for a background refresh of the set stamped refreshOf, that set is no
-// longer the cached one — a rejection or a blocking fill replaced it with
-// something newer, which an older snapshot must not overwrite. A set that
-// is not cached is still returned, to be served to the request that loaded
-// it. refreshOf is 0 for a blocking fill.
+// publish caches fresh for key under a new generation unless it is stale: an
+// Invalidate landed after the load began, or, for a background refresh of
+// the set stamped refreshOf (0 for a blocking fill), that set has since been
+// replaced. A stale set is still returned to the request that loaded it.
 func (s *LeastLoaded) publish(key string, fresh hostCacheEntry, inv, refreshOf uint64) hostCacheEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -240,11 +232,9 @@ func (s *LeastLoaded) publish(key string, fresh hostCacheEntry, inv, refreshOf u
 	return fresh
 }
 
-// cannotPlace reports whether this entry has no candidates. An empty set is
-// reloaded in line once expired even when the default-host fallback would
-// apply: that fallback is a host the capability-filtered load excluded, the
-// create pre-flight refuses it, and a rejection cannot evict it — so a reload
-// is the only way a host that has since gained the capability gets found.
+// cannotPlace reports whether this entry has no candidates. Such a set is
+// reloaded in line once expired even when the default-host fallback applies:
+// a reload is the only way a host that has since gained the capability is found.
 func (s *LeastLoaded) cannotPlace(e hostCacheEntry) bool {
 	return len(e.hosts) == 0
 }
@@ -268,12 +258,8 @@ func capabilityCacheKey(capabilities []string) (string, []string) {
 // SelectHost reflects status or capability changes immediately.
 // Reject drops the cached candidate set for requiredCapabilities if it is
 // still the set (gen) that produced the selection and still lists hostID,
-// because the create pre-flight for that set has just refused the host. A
-// set loaded since is kept even if it lists the host again — it is fresh
-// evidence, and the host is re-attested from it — so a burst of creates
-// that all drew the same stale host reloads once, not once per create.
-// Other capability sets are untouched, and a default-host fallback is never
-// reloaded for this, see names.
+// whose pre-flight has just refused it. A set loaded since is kept, so a
+// burst that all drew the same stale host reloads once, not once per create.
 func (s *LeastLoaded) Reject(hostID string, requiredCapabilities []string, gen uint64) {
 	key, _ := capabilityCacheKey(requiredCapabilities)
 	s.mu.Lock()
@@ -283,10 +269,8 @@ func (s *LeastLoaded) Reject(hostID string, requiredCapabilities []string, gen u
 	}
 }
 
-// names reports whether this entry's candidate set lists hostID. The
-// default-host fallback (an empty set) deliberately does not count: that
-// host is the one the capability-filtered load already excluded, so a
-// reload cannot change the answer and would only repeat the query.
+// names reports whether this entry lists hostID. The default-host fallback
+// (an empty set) does not count: a reload could not change that answer.
 func (s *LeastLoaded) names(e hostCacheEntry, hostID string) bool {
 	for _, h := range e.hosts {
 		if h.ID == hostID {

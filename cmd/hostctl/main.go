@@ -77,11 +77,9 @@ func main() {
 // merely a few polls:
 //
 //	drainConvergence — when the last stale replica can still ADMIT a
-//	  create. The scheduler's candidate set is served at any age, so the
-//	  bound is the per-create host pre-flight: its cache TTL + grace (10s+2s
-//	  by default, TTL capped at 30s) + its 5s query bound + a 2s cold
-//	  registry resolve, at most 39s. The constant keeps its earlier, larger
-//	  value.
+//	  create: the per-create host pre-flight's cache TTL + grace + query
+//	  bound + a cold registry resolve, at most 39s. The constant keeps its
+//	  earlier, larger value.
 //	drainQuietWindow — continuous zeros required AFTER that: 2×30s boot
 //	  (incl. retry) + insert/cleanup visibility margin.
 const (

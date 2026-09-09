@@ -21,22 +21,15 @@ import (
 const hostCapQueryTimeout = 5 * time.Second
 
 // hostCapCache is an in-process, TTL-bounded, positive-only cache of host
-// capability attestations, fronting HostHasCapabilitiesUnlocked on the
-// standalone pre-flight paths. The read behind it also returns the host's
-// address, handed to the host registry as that host's verification, so the
-// dispatch that follows does not read the row again. Same shape as
-// apiKeyCache: only affirmative results are cached (a missing capability or
-// an error always re-reads, so a capability 409 is always fresh), an expired
-// entry is served for a short grace while one background flight refreshes
-// it, and concurrent misses coalesce. The fail-closed gates (transactional
-// validation, VMD's post-boot attestation) do not go through this cache.
-// Cardinality is hosts × capability sets; puts sweep expired entries, so
-// memory tracks the active fleet.
+// capability attestations fronting HostHasCapabilitiesUnlocked on the
+// pre-flight paths; the read behind it also hands the host's address to the
+// registry as its verification. Same shape as apiKeyCache: only affirmative
+// results are cached, an expired entry is served for a short grace while one
+// flight refreshes it, and concurrent misses coalesce. Puts sweep expired
+// entries, so memory tracks the active fleet.
 const (
-	// The TTL bounds how long a fenced host or dropped capability can keep
-	// passing this pre-flight. With the scheduler's candidate set served at
-	// any age, this is the bound hostctl's drain convergence is derived from
-	// (TTL + grace + query bound), hence the cap below.
+	// The TTL bounds how long a fenced host can keep passing this pre-flight
+	// and feeds hostctl's drain convergence, hence the cap.
 	defaultHostCapCacheTTL = 10 * time.Second
 	maxHostCapCacheTTL     = 30 * time.Second
 	hostCapCacheStaleGrace = 2 * time.Second

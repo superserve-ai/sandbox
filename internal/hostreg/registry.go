@@ -77,19 +77,13 @@ type Registry struct {
 	// always land mid-resolve and be observed. Grows one counter per host
 	// id ever seen (fleet-bounded).
 	gens map[string]uint64
-	// reported is the address a caller most recently handed to MarkVerified,
-	// reportSeq counts those reports, and reportConflictSeq is the sequence of
-	// the latest report that disagreed with the one before it. Reads cannot be
-	// ordered from this side (a query that starts first can execute last), so
-	// a resolution never ranks a report against its own read by time. Reports
-	// that arrive while its read is in flight leave the address in doubt when
-	// the latest disagrees with the read or they disagreed among themselves;
-	// a doubted address drops its cached client and is re-read before anything
-	// publishes, so a failed confirmation fails closed. Identical reports set
-	// no conflict. A report that disagrees with the previous report or with
-	// the cached client is itself in doubt: confirmedSeq is the report
-	// sequence as of the last row read that published, and while the latest
-	// conflict is newer than it, no report is dialed or renewed unread.
+	// reported is the address a caller last handed to MarkVerified, reportSeq
+	// counts those reports, reportConflictSeq is the sequence of the latest
+	// report that disagreed with the one before it, and confirmedSeq is the
+	// report sequence as of the last row read that published. Reads cannot be
+	// ordered by time, so a report that conflicts with an unconfirmed read or
+	// with the cached client keeps the host in doubt: it is re-read before
+	// anything publishes, never dialed or renewed unread.
 	reported          map[string]string
 	reportSeq         map[string]uint64
 	reportConflictSeq map[string]uint64
@@ -191,9 +185,8 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 	return r.resolveFrom(ctx, hostID, "", 0)
 }
 
-// Generation is the host's current invalidation generation. A caller that
-// reads the host row captures it first and hands it to MarkVerified with
-// the address it read, so a read that predates a reclaim is never trusted.
+// Generation is the host's current invalidation generation; a caller
+// captures it before reading the host row and hands it to MarkVerified.
 func (r *Registry) Generation(hostID string) uint64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -201,11 +194,8 @@ func (r *Registry) Generation(hostID string) uint64 {
 }
 
 // resolveFrom is resolveClient for a caller that has just reported knownAddr
-// (valid while the host's generation is still knownGen). The report is
-// never dialed unread — another replica may have committed a reclaim after
-// the caller's read, which no process-local state can see — but if a client
-// at that address is already cached by the time this runs, it is renewed
-// without a read; otherwise the row is read as usual.
+// (valid while the host's generation is still knownGen). The report is never
+// dialed unread; it only renews a client already cached at that address.
 func (r *Registry) resolveFrom(ctx context.Context, hostID, knownAddr string, knownGen uint64) (vmdclient.Client, error) {
 	// DoChan rather than Do: the shared resolution keeps running on its
 	// detached context and still fills the cache, but each caller waits only
@@ -233,10 +223,8 @@ func (r *Registry) resolveFrom(ctx context.Context, hostID, knownAddr string, kn
 			defer func() { r.Observe(kind, time.Since(started), err) }()
 		}
 
-		// Two failed row reads end the resolution, as before; the third
-		// attempt exists for a conflict-driven re-read, which consumes an
-		// attempt but not a read failure, so an outage still costs exactly
-		// two reads.
+		// Two failed row reads end the resolution; the third attempt is
+		// reserved for a conflict-driven re-read, which is not a failure.
 		var lastErr error
 		readFailures := 0
 		for attempt := 0; attempt < 3 && readFailures < 2; attempt++ {
@@ -382,18 +370,12 @@ func (r *Registry) Invalidate(hostID string) {
 	r.mu.Unlock()
 }
 
-// MarkVerified records a host row read the caller has just performed — the
-// address it saw and the Generation it captured before reading — so the
-// dispatch that follows does not read the row itself. A report from before
-// an invalidation is discarded: the reclaim that bumped the generation is
-// newer than what it read. Otherwise a cached client at that address has
-// its lease renewed, unless the report disagrees with the previous report
-// or with the cached client, in which case the row is read before anything
-// is published, since either side may be the stale one; a cached client at
-// a different address is dropped, never kept as a fallback. A cold host is
-// resolved with a row read: the reported address is never dialed unread,
-// because a reclaim committed on another replica after the caller's read is
-// invisible here. A resolution failure is logged and leaves ClientFor to
+// MarkVerified records a host row read the caller has just performed (the
+// address it saw, and the Generation captured before reading) so the dispatch
+// that follows does not read the row again. A report older than the host's
+// generation is discarded. A cached client at that address is renewed; every
+// other case re-reads the row, since a reclaim committed on another replica
+// after the caller's read is invisible here. Failures leave ClientFor to
 // fail closed.
 func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string, readGen uint64) {
 	if addr == "" {
@@ -418,12 +400,9 @@ func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string, readGe
 		delete(r.clients, hostID)
 		r.gens[hostID]++
 	} else if ok && !r.unconfirmedConflictLocked(hostID) {
-		// Renewing from the caller's read is exactly as safe as renewing
-		// from the recheck's own read: both are one row read that cannot be
-		// ordered against a reclaim committed on another replica, and both
-		// leave the same recheck-bounded window. Only a row version could
-		// order them; until one exists, this is the read the recheck would
-		// otherwise repeat.
+		// Renewing from the caller's read is as safe as from the recheck's
+		// own: both are one row read that cannot be ordered against a
+		// reclaim on another replica. Only a row version could order them.
 		now := time.Now()
 		e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
 		r.clients[hostID] = e
@@ -437,10 +416,8 @@ func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string, readGe
 	}
 }
 
-// renewIfCachedAt renews and returns the cached client at addr when one is
-// cached and no report conflict is unconfirmed. It lets a report that raced
-// a resolution which has since published that same address return without
-// a read of its own. Takes mu.
+// renewIfCachedAt renews and returns the cached client at addr, if one is
+// cached and no report conflict is unconfirmed. Takes mu.
 func (r *Registry) renewIfCachedAt(hostID, addr string) (vmdclient.Client, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

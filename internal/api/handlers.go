@@ -124,10 +124,8 @@ type Scheduler interface {
 	// Invalidate drops any cached host state so the next SelectHost
 	// reflects host status changes immediately.
 	Invalidate()
-	// Reject drops the candidate set gen (the one a SelectHost returned
-	// hostID from) if it is still cached and still names hostID, which its
-	// pre-flight has just refused; a set loaded since, and other capability
-	// sets, are kept.
+	// Reject drops the candidate set gen if it is still cached and still
+	// names hostID, whose pre-flight has just refused it.
 	Reject(hostID string, requiredCapabilities []string, gen uint64)
 }
 
@@ -2128,12 +2126,9 @@ func (h *Handlers) selectCreateHost(c *gin.Context, requiredCapabilities []strin
 	}
 }
 
-// placeCreate selects a host and re-attests it: the candidate set may be
-// arbitrarily stale, so the pre-flight reads the chosen host's status and
-// capabilities (one row read when uncached, which also verifies its address
-// for the registry). A rejected host drops the candidate sets still naming
-// it and selection runs once more before the request fails. Writes the error
-// response and returns ok=false on failure.
+// placeCreate selects a host and re-attests it, since the candidate set may
+// be stale. A host that fails the pre-flight is rejected from the set and
+// selection runs once more. Writes the error response on failure.
 func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (hostID string, ok bool) {
 	var gen uint64
 	if hostID, gen, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
@@ -2148,10 +2143,8 @@ func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (h
 		if hostID, gen, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
 			return "", false
 		}
-		// The same host from the same set (the default-host fallback) can
-		// only repeat the answer just given; the same host from a different
-		// set — whoever loaded it — may have regained eligibility and is
-		// checked again.
+		// The same host from the same set can only repeat the answer just
+		// given; from a newer set it may have regained eligibility.
 		if hostID != rejected || gen != rejectedGen {
 			SetTelemetryHostID(c, hostID)
 			eligible, err = h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
