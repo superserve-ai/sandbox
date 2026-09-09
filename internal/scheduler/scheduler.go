@@ -17,9 +17,10 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-// Scheduler selects a host for a new sandbox.
+// Scheduler selects a host for a new sandbox. gen identifies the candidate
+// set the selection came from, for Reject.
 type Scheduler interface {
-	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, err error)
+	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, gen uint64, err error)
 }
 
 const defaultCacheTTL = 30 * time.Second
@@ -56,6 +57,7 @@ type LeastLoaded struct {
 type hostCacheEntry struct {
 	hosts    []db.ListActiveHostsByLoadRow
 	cachedAt time.Time
+	gen      uint64 // the generation this set was loaded at; a Reject must carry it
 	// defaultStatus is the DefaultHostID row's status, resolved at fill time
 	// only when hosts is empty — so the fallback decision in SelectHost never
 	// queries on the per-create path. "missing" = no row (bootstrap mode,
@@ -70,10 +72,10 @@ func (s *LeastLoaded) ttl() time.Duration {
 	return defaultCacheTTL
 }
 
-func (s *LeastLoaded) SelectHost(ctx context.Context, requiredCapabilities []string) (string, error) {
+func (s *LeastLoaded) SelectHost(ctx context.Context, requiredCapabilities []string) (string, uint64, error) {
 	entry, err := s.loadHosts(ctx, requiredCapabilities)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	hosts := entry.hosts
 	if len(hosts) == 0 {
@@ -86,21 +88,21 @@ func (s *LeastLoaded) SelectHost(ctx context.Context, requiredCapabilities []str
 			// time (fillEntry); status changes invalidate the cache.
 			switch entry.defaultStatus {
 			case "missing": // unpopulated table: bootstrap path
-				return s.DefaultHostID, nil
+				return s.DefaultHostID, entry.gen, nil
 			case "active":
 				// Present but filtered out by capabilities; the create-time
 				// capability gate still enforces. Preserves prior behavior.
-				return s.DefaultHostID, nil
+				return s.DefaultHostID, entry.gen, nil
 			case "":
-				return "", fmt.Errorf("no active hosts available")
+				return "", 0, fmt.Errorf("no active hosts available")
 			default:
-				return "", fmt.Errorf("no active hosts available (default host is %s)", entry.defaultStatus)
+				return "", 0, fmt.Errorf("no active hosts available (default host is %s)", entry.defaultStatus)
 			}
 		}
-		return "", fmt.Errorf("no active hosts available")
+		return "", 0, fmt.Errorf("no active hosts available")
 	}
 	if len(hosts) == 1 {
-		return hosts[0].ID, nil
+		return hosts[0].ID, entry.gen, nil
 	}
 
 	// Power of two random choices: pick two random hosts, return the
@@ -113,9 +115,9 @@ func (s *LeastLoaded) SelectHost(ctx context.Context, requiredCapabilities []str
 		b++ // ensures b != a
 	}
 	if hosts[a].ActiveSandboxCount <= hosts[b].ActiveSandboxCount {
-		return hosts[a].ID, nil
+		return hosts[a].ID, entry.gen, nil
 	}
-	return hosts[b].ID, nil
+	return hosts[b].ID, entry.gen, nil
 }
 
 // fillEntry loads the candidate set and, when it comes back empty, resolves
@@ -179,6 +181,7 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 					if s.cache == nil {
 						s.cache = make(map[string]hostCacheEntry)
 					}
+					fresh.gen = startGen
 					s.cache[key] = fresh
 				}
 				s.mu.Unlock()
@@ -206,6 +209,7 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	if s.cache == nil {
 		s.cache = make(map[string]hostCacheEntry)
 	}
+	fresh.gen = s.gen
 	s.cache[key] = fresh
 	return fresh, nil
 }
@@ -236,20 +240,20 @@ func capabilityCacheKey(capabilities []string) (string, []string) {
 
 // Invalidate drops all cached capability-specific candidate sets so the next
 // SelectHost reflects status or capability changes immediately.
-// Reject drops the cached candidate set for requiredCapabilities if it
-// still lists hostID, because the create pre-flight for that set has just
-// refused the host. Other capability sets are untouched: the rejection is
-// evidence about this set only, and evicting the rest would make unrelated
-// traffic refill each other's caches. A set loaded since the host left
-// rotation no longer lists it and is kept, so a burst of creates that all
-// drew the same stale host reloads once, not once per create; a
-// default-host fallback is never reloaded for this, see names. Reports
-// whether a set was dropped, i.e. whether the next SelectHost loads fresh.
-func (s *LeastLoaded) Reject(hostID string, requiredCapabilities []string) bool {
+// Reject drops the cached candidate set for requiredCapabilities if it is
+// still the set (gen) that produced the selection and still lists hostID,
+// because the create pre-flight for that set has just refused the host. A
+// set loaded since is kept even if it lists the host again — it is fresh
+// evidence, and the host is re-attested from it — so a burst of creates
+// that all drew the same stale host reloads once, not once per create.
+// Other capability sets are untouched, and a default-host fallback is never
+// reloaded for this, see names. Reports whether a set was dropped, i.e.
+// whether the next SelectHost loads fresh.
+func (s *LeastLoaded) Reject(hostID string, requiredCapabilities []string, gen uint64) bool {
 	key, _ := capabilityCacheKey(requiredCapabilities)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if entry, ok := s.cache[key]; ok && s.names(entry, hostID) {
+	if entry, ok := s.cache[key]; ok && entry.gen == gen && s.names(entry, hostID) {
 		delete(s.cache, key)
 		s.gen++
 		return true

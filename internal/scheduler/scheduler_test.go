@@ -90,7 +90,8 @@ func TestSelectHostFallbackRefusesNonActiveDefault(t *testing.T) {
 	run := func(t *testing.T, row pgx.Row) (string, error) {
 		mock := &fallbackProbe{row: row}
 		s := &LeastLoaded{DB: db.New(mock), DefaultHostID: "default"}
-		return s.SelectHost(context.Background(), nil)
+		id, _, err := s.SelectHost(context.Background(), nil)
+		return id, err
 	}
 
 	for _, status := range []string{"provisioning", "draining", "unhealthy"} {
@@ -112,7 +113,7 @@ func TestSelectHostFallbackStatusIsCached(t *testing.T) {
 	mock := &fallbackProbe{row: schedulerErrorRow{err: pgx.ErrNoRows}}
 	s := &LeastLoaded{DB: db.New(mock), DefaultHostID: "default", TTL: time.Minute}
 	for i := 0; i < 5; i++ {
-		if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "default" {
+		if id, _, err := s.SelectHost(context.Background(), nil); err != nil || id != "default" {
 			t.Fatalf("select %d: got (%q, %v)", i, id, err)
 		}
 	}
@@ -142,7 +143,7 @@ func TestLeastLoadedQueryExcludesHostsWithoutPreviewEnforcement(t *testing.T) {
 	capture := &queryCapture{}
 	s := &LeastLoaded{DB: db.New(capture), DefaultHostID: "fallback"}
 	required := []string{preview.HostCapabilityPorts}
-	got, err := s.SelectHost(context.Background(), required)
+	got, _, err := s.SelectHost(context.Background(), required)
 	if err != nil {
 		t.Fatalf("SelectHost: %v", err)
 	}
@@ -171,7 +172,7 @@ func TestLeastLoadedCachesCandidateSetsByCanonicalCapabilities(t *testing.T) {
 		preview.HostCapabilityPorts, preview.HostCapabilityPortTokens, preview.HostCapabilityPortAccess,
 		preview.HostCapabilityPortBrowserAuth, preview.HostCapabilityPorts, preview.HostCapabilityPortTokens,
 	}} {
-		if got, err := s.SelectHost(ctx, required); err != nil || got != "fallback" {
+		if got, _, err := s.SelectHost(ctx, required); err != nil || got != "fallback" {
 			t.Fatalf("SelectHost(%v) = (%q, %v), want fallback", required, got, err)
 		}
 	}
@@ -197,6 +198,7 @@ type hostStore struct {
 	blockOnCall    int64         // 0 = block every call; N = block only the Nth
 	emptyUntilCall int64         // calls up to and including this one return no hosts
 	defaultRow     pgx.Row       // answer for the default-host row read on an empty fill
+	fixedID        string        // when set, every fill returns this host instead of host-N
 }
 
 func (h *hostStore) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
@@ -208,7 +210,11 @@ func (h *hostStore) Query(context.Context, string, ...interface{}) (pgx.Rows, er
 	if h.block != nil && (h.blockOnCall == 0 || n == h.blockOnCall) {
 		<-h.block
 	}
-	return &hostRows{id: fmt.Sprintf("host-%d", n), done: n <= h.emptyUntilCall}, nil
+	id := fmt.Sprintf("host-%d", n)
+	if h.fixedID != "" {
+		id = h.fixedID
+	}
+	return &hostRows{id: id, done: n <= h.emptyUntilCall}, nil
 }
 
 // hostRows yields a single minimal host row whose ID names the query that
@@ -269,7 +275,7 @@ func TestLoadHostsServesStaleAndRefreshesInBackground(t *testing.T) {
 	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
 
 	// First call blocks and fills the cache.
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("first select: %v", err)
 	}
 	if n := store.calls.Load(); n != 1 {
@@ -280,7 +286,7 @@ func TestLoadHostsServesStaleAndRefreshesInBackground(t *testing.T) {
 	// the stale list and refresh behind it.
 	setCachedAtForTest(t, s, nil, time.Now().Add(-s.ttl()-5*time.Second)) // stale, inside grace
 
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("stale select: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -297,7 +303,7 @@ func TestLoadHostsServesStaleAndRefreshesInBackground(t *testing.T) {
 	if !fresh {
 		t.Fatal("refresh must restore a fresh cachedAt")
 	}
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("post-refresh select: %v", err)
 	}
 	if n := store.calls.Load(); n != 2 {
@@ -308,7 +314,7 @@ func TestLoadHostsServesStaleAndRefreshesInBackground(t *testing.T) {
 func TestLoadHostsStaleServeDoesNotBlockOnSlowRefresh(t *testing.T) {
 	store := &hostStore{}
 	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("prime: %v", err)
 	}
 
@@ -320,7 +326,7 @@ func TestLoadHostsStaleServeDoesNotBlockOnSlowRefresh(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		for i := 0; i < 10; i++ {
-			_, _ = s.SelectHost(context.Background(), nil)
+			_, _, _ = s.SelectHost(context.Background(), nil)
 		}
 		close(done)
 	}()
@@ -347,12 +353,12 @@ func TestLoadHostsStaleServeDoesNotBlockOnSlowRefresh(t *testing.T) {
 func TestInvalidateForcesBlockingReload(t *testing.T) {
 	store := &hostStore{}
 	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("prime: %v", err)
 	}
 
 	s.Invalidate()
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("post-invalidate select: %v", err)
 	}
 	if n := store.calls.Load(); n != 2 {
@@ -363,14 +369,14 @@ func TestInvalidateForcesBlockingReload(t *testing.T) {
 func TestInvalidateBeatsInFlightRefresh(t *testing.T) {
 	store := &hostStore{}
 	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("prime: %v", err)
 	}
 
 	// Hold a background refresh in flight, then invalidate underneath it.
 	store.block = make(chan struct{})
 	setCachedAtForTest(t, s, nil, time.Now().Add(-s.ttl()-5*time.Second)) // stale, inside grace
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {    // triggers the refresh
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil { // triggers the refresh
 		t.Fatalf("stale select: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -408,7 +414,7 @@ func TestInvalidateBeatsInFlightRefresh(t *testing.T) {
 func TestLoadHostsAnyAgeServesStaleAndRefreshesBehind(t *testing.T) {
 	store := &hostStore{}
 	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("prime: %v", err)
 	}
 
@@ -419,7 +425,7 @@ func TestLoadHostsAnyAgeServesStaleAndRefreshesBehind(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.SelectHost(context.Background(), nil)
+		_, _, err := s.SelectHost(context.Background(), nil)
 		done <- err
 	}()
 	select {
@@ -447,7 +453,7 @@ func TestLoadHostsAnyAgeServesStaleAndRefreshesBehind(t *testing.T) {
 func TestBlockingReloadNotClobberedBySlowRefresh(t *testing.T) {
 	store := &hostStore{}
 	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
-	if _, err := s.SelectHost(context.Background(), nil); err != nil { // query 1
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil { // query 1
 		t.Fatalf("prime: %v", err)
 	}
 
@@ -455,7 +461,7 @@ func TestBlockingReloadNotClobberedBySlowRefresh(t *testing.T) {
 	store.block = make(chan struct{})
 	store.blockOnCall = 2
 	setCachedAtForTest(t, s, nil, time.Now().Add(-s.ttl()-5*time.Second)) // stale, inside grace
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {    // kicks the refresh
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil { // kicks the refresh
 		t.Fatalf("stale select: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -469,7 +475,7 @@ func TestBlockingReloadNotClobberedBySlowRefresh(t *testing.T) {
 	// Invalidate: the next call reloads synchronously (query 3) and must
 	// retire the still-hanging refresh so its older result cannot land on top.
 	s.Invalidate()
-	if _, err := s.SelectHost(context.Background(), nil); err != nil {
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("post-invalidate select: %v", err)
 	}
 	close(store.block) // the pre-reload refresh now returns
@@ -496,12 +502,12 @@ func TestBlockingReloadNotClobberedBySlowRefresh(t *testing.T) {
 func TestLoadHostsExpiredEmptySetReloadsInline(t *testing.T) {
 	store := &hostStore{emptyUntilCall: 1}
 	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
-	if _, err := s.SelectHost(context.Background(), nil); err == nil {
+	if _, _, err := s.SelectHost(context.Background(), nil); err == nil {
 		t.Fatal("prime: expected no hosts available")
 	}
 	setCachedAtForTest(t, s, nil, time.Now().Add(-2*time.Minute))
 
-	id, err := s.SelectHost(context.Background(), nil)
+	id, _, err := s.SelectHost(context.Background(), nil)
 	if err != nil || id != "host-2" {
 		t.Fatalf("expired empty select = (%q, %v), want (host-2, nil)", id, err)
 	}
@@ -516,19 +522,20 @@ func TestLoadHostsExpiredEmptySetReloadsInline(t *testing.T) {
 func TestRejectDropsOnlySetsStillNamingTheHost(t *testing.T) {
 	store := &hostStore{}
 	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
-	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-1" {
+	id, gen, err := s.SelectHost(context.Background(), nil)
+	if err != nil || id != "host-1" {
 		t.Fatalf("prime = (%q, %v)", id, err)
 	}
-	if !s.Reject("host-1", nil) {
+	if !s.Reject("host-1", nil, gen) {
 		t.Fatal("rejecting the cached host must drop its set")
 	}
-	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" {
+	if id, _, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" {
 		t.Fatalf("after reject = (%q, %v), want host-2 from a fresh load", id, err)
 	}
-	if s.Reject("host-1", nil) { // the fresh set no longer names host-1: no-op
-		t.Fatal("rejecting a host the fresh set does not list must not drop it")
+	if s.Reject("host-1", nil, gen) { // a late waiter with the old set: no-op
+		t.Fatal("a rejection carrying a superseded generation must not drop the fresh set")
 	}
-	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" {
+	if id, _, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" {
 		t.Fatalf("after stale reject = (%q, %v), want the cached host-2", id, err)
 	}
 	if n := store.calls.Load(); n != 2 {
@@ -543,20 +550,21 @@ func TestRejectLeavesOtherCapabilitySetsCached(t *testing.T) {
 	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
 	public := []string{"preview_ports_v1"}
 	private := []string{"preview_ports_v1", "preview_port_browser_auth_v1"}
-	if _, err := s.SelectHost(context.Background(), public); err != nil { // query 1: host-1
+	if _, _, err := s.SelectHost(context.Background(), public); err != nil { // query 1: host-1
 		t.Fatalf("public prime: %v", err)
 	}
-	if _, err := s.SelectHost(context.Background(), private); err != nil { // query 2: host-2
+	_, privGen, err := s.SelectHost(context.Background(), private) // query 2: host-2
+	if err != nil {
 		t.Fatalf("private prime: %v", err)
 	}
-	s.Reject("host-2", private)
-	if _, err := s.SelectHost(context.Background(), public); err != nil {
+	s.Reject("host-2", private, privGen)
+	if _, _, err := s.SelectHost(context.Background(), public); err != nil {
 		t.Fatalf("public after private reject: %v", err)
 	}
 	if n := store.calls.Load(); n != 2 {
 		t.Fatalf("queries = %d, want 2 (the public set must not be reloaded)", n)
 	}
-	if id, err := s.SelectHost(context.Background(), private); err != nil || id != "host-3" {
+	if id, _, err := s.SelectHost(context.Background(), private); err != nil || id != "host-3" {
 		t.Fatalf("private after reject = (%q, %v), want host-3 from a fresh load", id, err)
 	}
 }
@@ -567,15 +575,45 @@ func TestRejectLeavesOtherCapabilitySetsCached(t *testing.T) {
 func TestLoadHostsExpiredFilteredDefaultReloadsInline(t *testing.T) {
 	store := &hostStore{emptyUntilCall: 1, defaultRow: schedulerHostRow("default-host", "active")}
 	s := &LeastLoaded{DB: db.New(store), DefaultHostID: "default-host", TTL: time.Minute}
-	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "default-host" {
+	if id, _, err := s.SelectHost(context.Background(), nil); err != nil || id != "default-host" {
 		t.Fatalf("prime = (%q, %v), want the filtered default as fallback", id, err)
 	}
 	setCachedAtForTest(t, s, nil, time.Now().Add(-2*time.Minute))
-	id, err := s.SelectHost(context.Background(), nil)
+	id, _, err := s.SelectHost(context.Background(), nil)
 	if err != nil || id != "host-2" {
 		t.Fatalf("expired select = (%q, %v), want host-2 from an in-line reload", id, err)
 	}
 	if n := store.calls.Load(); n != 2 {
 		t.Fatalf("queries = %d, want 2", n)
+	}
+}
+
+// A fresh load may legitimately list the rejected host again (it regained
+// the capability). Waiters that shared the earlier negative pre-flight carry
+// the OLD set's generation, so their rejections cannot evict the fresh set:
+// the burst reloads once and the host is re-attested from the fresh set.
+func TestRejectWithSupersededGenerationKeepsTheFreshSet(t *testing.T) {
+	store := &hostStore{fixedID: "host-1"}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	_, oldGen, err := s.SelectHost(context.Background(), nil) // query 1
+	if err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	if !s.Reject("host-1", nil, oldGen) { // the first waiter drops the set
+		t.Fatal("first rejection must drop the set")
+	}
+	if id, _, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-1" { // query 2: fresh, lists host-1 again
+		t.Fatalf("reload = (%q, %v)", id, err)
+	}
+	for i := 0; i < 5; i++ { // the other waiters, still holding the old generation
+		if s.Reject("host-1", nil, oldGen) {
+			t.Fatalf("waiter %d evicted the fresh set with a superseded generation", i)
+		}
+	}
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
+		t.Fatalf("select after stale rejections: %v", err)
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("queries = %d, want 2 (one reload for the burst)", n)
 	}
 }

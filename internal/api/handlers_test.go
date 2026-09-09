@@ -66,19 +66,20 @@ type stubScheduler struct {
 	rejectDrops bool
 }
 
-func (s *stubScheduler) SelectHost(_ context.Context, required []string) (string, error) {
+func (s *stubScheduler) SelectHost(_ context.Context, required []string) (string, uint64, error) {
 	s.required = append([]string(nil), required...)
 	s.selects++
+	gen := uint64(s.selects) // each selection reads as its own candidate set
 	if len(s.hosts) > 0 {
 		id := s.hosts[0]
 		s.hosts = s.hosts[1:]
-		return id, s.err
+		return id, gen, s.err
 	}
-	return s.hostID, s.err
+	return s.hostID, gen, s.err
 }
 
 func (s *stubScheduler) Invalidate() { s.drops++ }
-func (s *stubScheduler) Reject(hostID string, _ []string) bool {
+func (s *stubScheduler) Reject(hostID string, _ []string, _ uint64) bool {
 	s.drops++
 	s.rejected = append(s.rejected, hostID)
 	return s.rejectDrops

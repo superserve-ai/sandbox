@@ -119,16 +119,17 @@ func (h *Handlers) respondQuotaExceeded(c *gin.Context, teamID uuid.UUID) {
 
 // Scheduler selects a host for new sandboxes.
 type Scheduler interface {
-	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, err error)
+	// SelectHost picks a host; gen identifies the candidate set it came from.
+	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, gen uint64, err error)
 	// Invalidate drops any cached host state so the next SelectHost
 	// reflects host status changes immediately.
 	Invalidate()
-	// Reject drops the cached candidate set for requiredCapabilities if it
-	// still names hostID, which that set's pre-flight has just refused;
-	// state loaded since, and other capability sets, are kept. Reports
-	// whether anything was dropped, i.e. whether the next SelectHost is a
-	// fresh load.
-	Reject(hostID string, requiredCapabilities []string) bool
+	// Reject drops the candidate set gen (the one a SelectHost returned
+	// hostID from) if it is still cached and still names hostID, which its
+	// pre-flight has just refused; a set loaded since, and other capability
+	// sets, are kept. Reports whether anything was dropped, i.e. whether the
+	// next SelectHost is a fresh load.
+	Reject(hostID string, requiredCapabilities []string, gen uint64) bool
 }
 
 // HostRegistry resolves a host ID to a VMD client.
@@ -2111,20 +2112,20 @@ func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uui
 // selectCreateHost picks the host for a new sandbox: the scheduler when one
 // is wired, else the configured default. Writes the error response and
 // returns ok=false when no host is available.
-func (h *Handlers) selectCreateHost(c *gin.Context, requiredCapabilities []string) (hostID string, ok bool) {
+func (h *Handlers) selectCreateHost(c *gin.Context, requiredCapabilities []string) (hostID string, gen uint64, ok bool) {
 	switch {
 	case h.Scheduler != nil:
-		hostID, err := h.Scheduler.SelectHost(c.Request.Context(), requiredCapabilities)
+		hostID, gen, err := h.Scheduler.SelectHost(c.Request.Context(), requiredCapabilities)
 		if err != nil {
 			log.Error().Err(err).Msg("scheduler SelectHost failed")
 			respondErrorMsg(c, "service_unavailable", "No hosts available", http.StatusServiceUnavailable)
-			return "", false
+			return "", 0, false
 		}
-		return hostID, true
+		return hostID, gen, true
 	case h.Config != nil && h.Config.DefaultHostID != "":
-		return h.Config.DefaultHostID, true
+		return h.Config.DefaultHostID, 0, true
 	default:
-		return "default", true
+		return "default", 0, true
 	}
 }
 
@@ -2135,7 +2136,8 @@ func (h *Handlers) selectCreateHost(c *gin.Context, requiredCapabilities []strin
 // it and selection runs once more before the request fails. Writes the error
 // response and returns ok=false on failure.
 func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (hostID string, ok bool) {
-	if hostID, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
+	var gen uint64
+	if hostID, gen, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
 		return "", false
 	}
 	SetTelemetryHostID(c, hostID)
@@ -2143,8 +2145,8 @@ func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (h
 	if err == nil && !eligible && h.Scheduler != nil {
 		log.Warn().Str("host_id", hostID).Msg("scheduled host failed the pre-flight; selecting again without it")
 		rejected := hostID
-		reloaded := h.Scheduler.Reject(hostID, requiredCapabilities)
-		if hostID, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
+		reloaded := h.Scheduler.Reject(hostID, requiredCapabilities, gen)
+		if hostID, _, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
 			return "", false
 		}
 		// The same host from an unchanged set (the default-host fallback)
