@@ -2534,7 +2534,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		if err != nil {
 			return nil, fmt.Errorf("start firecracker for restore: %w", err)
 		}
-		if !durable && !m.persistState(inst) {
+		if !durable && !m.persistWhileTracked(inst) {
 			// Fail closed: the vCPUs must not run ahead of the record that
 			// owes their wake.
 			m.stopUnitDuringRestoreError(vmID)
@@ -3692,7 +3692,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			return nil, fmt.Errorf("start firecracker: %w", startErr)
 		}
 		if joinWakeOwed != nil && !optimisticOK {
-			optimisticOK = m.persistState(inst)
+			optimisticOK = m.persistWhileTracked(inst)
 		}
 		if joinWakeOwed != nil && !optimisticOK {
 			// Fail closed: the vCPUs must not run ahead of the record that
@@ -7285,9 +7285,17 @@ func (m *Manager) releaseFailedRestore(vmID string, inPlace, tapBusy bool, clean
 // firecracker process leaks. Mode-aware: cgroup mode's kill waits for the
 // group to empty by construction (so the slot-recycle-races-tap concern the
 // unit path handles with a MainPID SIGKILL is already covered).
+// restoreErrorStopBudget bounds the stop of what a failed launch started,
+// and restoreErrorProcessWait the wait for its process to go, on the error
+// paths of restore and resume and in wake recovery.
+const (
+	restoreErrorStopBudget  = 10 * time.Second
+	restoreErrorProcessWait = 2 * time.Second
+)
+
 func (m *Manager) stopUnitDuringRestoreError(vmID string) {
 	supervision := m.supervisionForVM(vmID)
-	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	stopCtx, cancel := context.WithTimeout(context.Background(), restoreErrorStopBudget)
 	defer cancel()
 	stopErr := m.stopVM(stopCtx, vmID, supervision)
 	if stopErr != nil {
@@ -8485,15 +8493,35 @@ func (m *Manager) persistWakeOwed(inst *VMInstance, predicted Supervision, clock
 	go func() {
 		defer sentrylog.Recover("wake-owed-persist")
 		defer close(done)
-		ok = m.persistState(inst)
+		ok = m.persistWhileTracked(inst)
 	}()
 	return func(actual Supervision) bool {
 		<-done
 		if !ok || actual != predicted {
-			ok = m.persistState(inst)
+			ok = m.persistWhileTracked(inst)
 		}
 		return ok
 	}
+}
+
+// persistWhileTracked writes the record and then checks the instance still
+// owns its id. DestroyVM takes no lifecycle lock, so its record delete can
+// land on either side of this write; a write that landed after it would
+// resurrect a VM the user destroyed, and the early failure paths of a launch
+// never write again to notice. Checking AFTER the write leaves no window: a
+// destroy either erased the record itself or is caught here, and the write
+// is erased in turn. Reports false when the VM is gone, so the caller
+// aborts a launch that has nothing to run for.
+func (m *Manager) persistWhileTracked(inst *VMInstance) bool {
+	ok := m.persistState(inst)
+	m.mu.RLock()
+	tracked := m.vms[inst.ID] == inst
+	m.mu.RUnlock()
+	if !tracked {
+		m.deleteState(inst.ID)
+		return false
+	}
+	return ok
 }
 
 // pendingWake is a reattached instance that owes its guest a wake. The startup
@@ -8550,16 +8578,20 @@ func (m *Manager) noteWakeDrainStarted() {
 // pendingWakeWaitBoundFor is a seam over pendingWakeWaitBound for tests.
 var pendingWakeWaitBoundFor = pendingWakeWaitBound
 
+// wakeRecoveryRound is how long one queued wake can occupy a pool worker:
+// the wake's own budget and then, if it failed, the teardown of what was
+// launched — the bounded stop and the wait for its process — with a margin.
+const wakeRecoveryRound = boxdResumeReadyBudget + restoreErrorStopBudget + restoreErrorProcessWait + 5*time.Second
+
 // pendingWakeWaitBound is how long a request may wait for a queued wake: the
-// pool serves queued wakes wakeRecoveryWorkers at a time, each bounded by
-// the wake's own budget, so a wake queued behind n others is served within
-// that many rounds of it.
+// pool serves queued wakes wakeRecoveryWorkers at a time, each within a
+// round, so a wake queued behind n others is served within that many rounds.
 func pendingWakeWaitBound(queued int) time.Duration {
 	rounds := (queued + wakeRecoveryWorkers - 1) / wakeRecoveryWorkers
 	if rounds < 1 {
 		rounds = 1
 	}
-	return time.Duration(rounds) * (boxdResumeReadyBudget + 5*time.Second)
+	return time.Duration(rounds) * wakeRecoveryRound
 }
 
 func (m *Manager) queuePendingWake(inst *VMInstance, unlock func()) {

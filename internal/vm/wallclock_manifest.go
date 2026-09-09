@@ -317,10 +317,12 @@ func imageManifest(memPath string) (*WallClockManifest, error) {
 // The returned channel closes once the watcher has stopped, after ctx ends.
 func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger) (stopped <-chan struct{}) {
 	done := make(chan struct{})
-	// Only a host that may act on frozen images watches for them. With the
-	// switch off this does no filesystem work at all; such a host's floor
-	// still rises at the first frozen image it restores.
-	if m.cfg.SnapshotDir == "" || !m.cfg.GuestClockFreezeEnabled {
+	// Regardless of the freeze switch: a frozen template landing on a host
+	// that does not freeze is still one this daemon restores and wakes, and
+	// the floor must be up before any rollback could meet it, not only once
+	// a restore first does. The work is two globs and a manifest read per
+	// template, after readiness and off every request path.
+	if m.cfg.SnapshotDir == "" {
 		close(done)
 		return done
 	}

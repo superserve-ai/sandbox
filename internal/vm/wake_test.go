@@ -1868,7 +1868,10 @@ func TestAdHocSnapshotRefusesAPausedVM(t *testing.T) {
 // A request that meets a queued wake waits for the pool to reach it: behind
 // n others it is served within ceil(n/workers) rounds of a wake's budget.
 func TestPendingWakeWaitBoundCoversTheQueue(t *testing.T) {
-	round := boxdResumeReadyBudget + 5*time.Second
+	round := wakeRecoveryRound
+	if round <= boxdResumeReadyBudget+restoreErrorStopBudget {
+		t.Fatalf("round %v must cover the wake budget and a failed wake's teardown", round)
+	}
 	for _, tc := range []struct {
 		queued int
 		rounds int
@@ -2160,5 +2163,59 @@ func TestFrozenRestoreOfAPausedVMFailingItsWakeReturnsToPaused(t *testing.T) {
 			t.Fatalf("durable record never returned to Paused: rec=%+v err=%v", rec, gerr)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A destroy that lands around the wake-owed write must win: the write is
+// erased again and the launch aborted, never a record resurrected for a VM
+// the user destroyed.
+func TestDestroyDuringAFrozenResumeLeavesNoRecord(t *testing.T) {
+	useTempFloor(t)
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	rootfs := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snapPath, memPath, rootfs} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	frozen := true
+	inst := &VMInstance{
+		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
+		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: rootfs,
+		SnapshotWorkloadFrozen: &frozen, FreezeToken: "tok",
+	}
+	if err := store.Put(toRecord(inst)); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{
+		log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir}, netMgr: &fakeNetMgr{},
+		vms: map[string]*VMInstance{"vm-1": inst}, state: store,
+	}
+	// The destroy lands under the launch, after the wake-owed write began:
+	// the record is gone and the id no longer this instance's.
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		mgr.mu.Lock()
+		delete(mgr.vms, "vm-1")
+		mgr.mu.Unlock()
+		mgr.deleteState("vm-1")
+		return 0, SupervisionUnit, errors.New("launch failed")
+	}
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err == nil {
+		t.Fatal("want the resume to fail")
+	}
+	if rec, gerr := store.Get("vm-1"); gerr == nil && rec != nil {
+		t.Fatalf("record = %+v; a destroyed VM's record was resurrected by the wake-owed write", rec)
 	}
 }
