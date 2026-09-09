@@ -4255,3 +4255,98 @@ func TestResumeSandbox_CapabilityRefusalRevertsWithoutReachingDaemon(t *testing.
 		t.Fatalf("revert args = %v, want id and team only", reverted)
 	}
 }
+
+func TestPauseWithRetry_WaitsOutAPauseThatOutrunsItsAttempt(t *testing.T) {
+	var calls atomic.Int32
+	vmd := &stubVMD{pauseFn: func(ctx context.Context, _, _ string) (string, string, error) {
+		if calls.Add(1) < 3 {
+			// Still writing the snapshot: this attempt times out.
+			<-ctx.Done()
+			return "", "", status.Error(codes.DeadlineExceeded, "context deadline exceeded")
+		}
+		// Parked behind the lock, then handed the snapshot that landed.
+		return "/snap/vmstate.snap", "/snap/mem.diff", nil
+	}}
+
+	snap, mem, _, token, err := pauseUntilDecided(context.Background(), vmd, "vm-a", "tok", 10*time.Millisecond, time.Second)
+	if err != nil {
+		t.Fatalf("pause failed: %v", err)
+	}
+	if snap == "" || mem == "" || token != "tok" {
+		t.Fatalf("got %q %q %q, want the landed snapshot and the echoed token", snap, mem, token)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("attempts = %d, want 3", got)
+	}
+}
+
+func TestPauseWithRetry_StopsOnADefiniteAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"not found", status.Error(codes.NotFound, "gone")},
+		{"failed precondition", status.Error(codes.FailedPrecondition, "error state")},
+		{"internal", status.Error(codes.Internal, "snapshot failed")},
+	} {
+		var calls atomic.Int32
+		vmd := &stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+			calls.Add(1)
+			return "", "", tc.err
+		}}
+		_, _, _, _, err := pauseUntilDecided(context.Background(), vmd, "vm-a", "tok", 10*time.Millisecond, time.Second)
+		if status.Code(err) != status.Code(tc.err) {
+			t.Fatalf("%s: err = %v, want %v", tc.name, err, tc.err)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("%s: attempts = %d, want 1", tc.name, got)
+		}
+	}
+}
+
+func TestPauseWithRetry_GivesUpOnlyOnceTheBudgetIsSpent(t *testing.T) {
+	var calls atomic.Int32
+	vmd := &stubVMD{pauseFn: func(ctx context.Context, _, _ string) (string, string, error) {
+		calls.Add(1)
+		<-ctx.Done()
+		return "", "", status.Error(codes.DeadlineExceeded, "context deadline exceeded")
+	}}
+
+	start := time.Now()
+	_, _, _, _, err := pauseUntilDecided(context.Background(), vmd, "vm-a", "tok", 10*time.Millisecond, 60*time.Millisecond)
+	if !isVMDDeadline(err) {
+		t.Fatalf("err = %v, want the last timeout", err)
+	}
+	if got := calls.Load(); got < 2 {
+		t.Fatalf("attempts = %d, want the attempt repeated", got)
+	}
+	if time.Since(start) < 60*time.Millisecond {
+		t.Fatal("gave up before the budget was spent")
+	}
+}
+
+func TestPauseWithRetry_KeepsConvergingAfterTheCallerGivesUp(t *testing.T) {
+	reqCtx, giveUp := context.WithCancel(context.Background())
+	defer giveUp()
+	var calls atomic.Int32
+	vmd := &stubVMD{pauseFn: func(ctx context.Context, _, _ string) (string, string, error) {
+		if calls.Add(1) == 1 {
+			// The client walks away mid-pause.
+			giveUp()
+			<-ctx.Done()
+			return "", "", status.Error(codes.Canceled, "context canceled")
+		}
+		if ctx.Err() != nil {
+			return "", "", status.Error(codes.Canceled, "context canceled")
+		}
+		return "/snap/vmstate.snap", "/snap/mem.diff", nil
+	}}
+
+	snap, _, _, _, err := pauseUntilDecided(reqCtx, vmd, "vm-a", "tok", time.Second, time.Second)
+	if err != nil || snap == "" {
+		t.Fatalf("got %q, %v; want the pause to converge after the caller left", snap, err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+}

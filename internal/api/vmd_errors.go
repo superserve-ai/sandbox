@@ -74,6 +74,15 @@ func isVMDUnavailable(err error) bool {
 	return status.Code(err) == codes.Unavailable
 }
 
+// isVMDCanceled reports a call abandoned by the caller's context rather than
+// answered by the daemon.
+func isVMDCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.Canceled || errors.Is(err, context.Canceled)
+}
+
 // isVMDFileMissing returns true when vmd returned a FailedPrecondition
 // indicating a snapshot/mem file is missing on disk. The caller maps
 // this to a 503 with `host_state_missing` rather than a generic 500 so
