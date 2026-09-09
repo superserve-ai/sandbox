@@ -2012,3 +2012,79 @@ func TestRequestForAQueuedWakeWaitsForThePoolToStart(t *testing.T) {
 		t.Fatal("request never returned after the pool served its wake")
 	}
 }
+
+// An unfrozen pause whose manifest write fails must not leave an old frozen
+// manifest beside its new image: a restore would present that token to a
+// guest that already answered it and run the clock uncorrected. The stale
+// manifest goes, and the image reads as legacy.
+func TestUnfrozenPauseWhoseManifestWriteFailsLeavesNoStaleFrozenOne(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false }
+	t.Cleanup(func() { vmUnitFullyDown = origDown })
+
+	fc := startSnapshotAPIFake(t, nil)
+	dir := t.TempDir()
+	vmDir := filepath.Join(dir, "vm-1")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	memSnap := filepath.Join(vmDir, "mem.snap")
+	if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedFrozenManifest(t, memSnap, "A")
+	// The writer's temporary file cannot be created: a directory sits at its path.
+	if err := os.Mkdir(WallClockMarkerPath(memSnap)+".tmp", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	corrects := true
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects}
+	m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	if man, err := ReadWallClockManifest(memSnap); err != nil || man != nil {
+		t.Fatalf("manifest=%+v err=%v; the stale frozen manifest must be gone when the new one could not be written", man, err)
+	}
+}
+
+// A frozen pause's durable manifest write is timed as its own phase.
+func TestFrozenPauseRecordsTheManifestPhase(t *testing.T) {
+	useTempFloor(t)
+	raiseFloorForTest(t)
+	origF, origT, origDown := boxdFreezeGuest, boxdThawGuest, vmUnitFullyDown
+	t.Cleanup(func() { boxdFreezeGuest, boxdThawGuest, vmUnitFullyDown = origF, origT, origDown })
+	vmUnitFullyDown = func(string) bool { return false }
+	boxdFreezeGuest = func(_ context.Context, _, token string) (freezeEcho, error) {
+		return freezeEcho{Version: WakeProtocolVersion, Token: token}, nil
+	}
+	boxdThawGuest = func(context.Context, string, string) error { return nil }
+
+	fc := startSnapshotAPIFake(t, nil)
+	dir := t.TempDir()
+	vmDir := filepath.Join(dir, "vm-1")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	memSnap := filepath.Join(vmDir, "mem.snap")
+	if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	corrects := true
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects}
+	sink := &phaseSink{}
+	m := &Manager{
+		log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, recorder: sink,
+		cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir, GuestClockFreezeEnabled: true},
+	}
+	m.clockRealtimeCapable.Store(true)
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	if man, err := ReadWallClockManifest(memSnap); err != nil || man == nil || !man.WorkloadFrozen {
+		t.Fatalf("manifest=%+v err=%v; want the frozen image's manifest written", man, err)
+	}
+	if !sink.has("pause", "manifest") || !sink.has("pause", "freeze") {
+		t.Fatalf("phases = %+v; want the durable manifest write and the freeze recorded", sink.phases)
+	}
+}

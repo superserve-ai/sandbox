@@ -1508,7 +1508,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	// in the pause distributions — those are the pauses worth seeing. The
 	// already-paused retry guard (before either) still deliberately emits
 	// nothing.
-	var freezeDur time.Duration
+	var freezeDur, manifestDur time.Duration
 	var tFreeze time.Time
 	defer func() {
 		if tSnapshot.IsZero() && tFreeze.IsZero() {
@@ -1520,6 +1520,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		}
 		if freezeDur > 0 {
 			phases["freeze"] = freezeDur
+		}
+		if manifestDur > 0 {
+			phases["manifest"] = manifestDur
 		}
 		if snapshotDur > 0 {
 			phases["snapshot"] = snapshotDur
@@ -1870,10 +1873,22 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		man := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: artifactID, WorkloadFrozen: guestFrozen, GuestCorrectsClock: true}
 		if guestFrozen {
 			man.FreezeToken = freezeToken
-			if merr := WriteWallClockManifest(memPath, man); merr != nil {
+			// A file and a directory sync while the guest is stopped: timed
+			// as its own phase, so a storage stall here has a name.
+			tManifest := time.Now()
+			merr := WriteWallClockManifest(memPath, man)
+			manifestDur = time.Since(tManifest)
+			if merr != nil {
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("write wall-clock manifest: %w", merr))
 			}
 		} else if merr := writeWallClockManifestLazy(memPath, man); merr != nil {
+			// The image is unfrozen, so no manifest is safe for it; a stale
+			// frozen one is not: a restore would present its token to a guest
+			// that already answered it and run the clock uncorrected. The
+			// stale one goes, or the pause fails.
+			if rerr := os.Remove(clockFreezeMarkerPath(memPath)); rerr != nil && !os.IsNotExist(rerr) {
+				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("wall-clock manifest write failed (%v) and the stale one could not be cleared: %w", merr, rerr))
+			}
 			log.Warn().Err(merr).Str("path", WallClockMarkerPath(memPath)).
 				Msg("pause: wall-clock manifest write failed; resume falls back to legacy clock behaviour")
 		}
