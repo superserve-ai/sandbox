@@ -35,6 +35,7 @@ func capMockHandlers(reads *atomic.Int64, answer *atomic.Bool) *Handlers {
 type verifyRecorder struct {
 	mu       sync.Mutex
 	verified []string
+	err      error // returned by every MarkVerified
 }
 
 func (v *verifyRecorder) ClientFor(context.Context, string) (vmdclient.Client, error) {
@@ -42,10 +43,31 @@ func (v *verifyRecorder) ClientFor(context.Context, string) (vmdclient.Client, e
 }
 func (v *verifyRecorder) Invalidate(string)        {}
 func (v *verifyRecorder) Generation(string) uint64 { return 0 }
-func (v *verifyRecorder) MarkVerified(_ context.Context, hostID, addr string, _ uint64) {
+func (v *verifyRecorder) MarkVerified(_ context.Context, hostID, addr string, _ uint64) error {
 	v.mu.Lock()
 	v.verified = append(v.verified, hostID+"="+addr)
 	v.mu.Unlock()
+	return v.err
+}
+
+// A registry resolution that fails during the pre-flight fails the
+// pre-flight, uncached, so the create ends here instead of repeating the
+// same lookup at dispatch.
+func TestHostCapReadFailsWhenRegistryResolutionFails(t *testing.T) {
+	var reads atomic.Int64
+	var answer atomic.Bool
+	answer.Store(true)
+	h := capMockHandlers(&reads, &answer)
+	h.Hosts = &verifyRecorder{err: fmt.Errorf("row unreadable")}
+
+	for i := 0; i < 2; i++ {
+		if ok, err := h.hostHasCapabilitiesCached(context.Background(), "host-a", []string{"preview_ports_v1"}); err == nil || ok {
+			t.Fatalf("call %d: ok=%v err=%v, want the resolution error", i, ok, err)
+		}
+	}
+	if n := reads.Load(); n != 2 {
+		t.Fatalf("reads = %d, want 2 (a failed pre-flight is not cached)", n)
+	}
 }
 
 // The pre-flight read is also the host registry's address verification: an

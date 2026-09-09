@@ -374,17 +374,17 @@ func (r *Registry) Invalidate(hostID string) {
 // address it saw, and the Generation captured before reading) so the dispatch
 // that follows does not read the row again. A report older than the host's
 // generation is discarded. A cached client at that address is renewed; every
-// other case re-reads the row, since a reclaim committed on another replica
-// after the caller's read is invisible here. Failures leave ClientFor to
-// fail closed.
-func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string, readGen uint64) {
+// other case reads the row, since a reclaim committed on another replica
+// after the caller's read is invisible here, and that resolution's error is
+// returned so the caller fails without repeating it at dispatch.
+func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string, readGen uint64) error {
 	if addr == "" {
-		return
+		return nil
 	}
 	r.mu.Lock()
 	if r.gens[hostID] != readGen {
 		r.mu.Unlock()
-		return
+		return nil
 	}
 	seq := r.reportSeq[hostID] + 1
 	r.reportSeq[hostID] = seq
@@ -407,13 +407,12 @@ func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string, readGe
 		e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
 		r.clients[hostID] = e
 		r.mu.Unlock()
-		return
+		return nil
 	}
 	gen := r.gens[hostID]
 	r.mu.Unlock()
-	if _, err := r.resolveFrom(ctx, hostID, addr, gen); err != nil {
-		log.Warn().Err(err).Str("host_id", hostID).Msg("host client resolution after row verification failed")
-	}
+	_, err := r.resolveFrom(ctx, hostID, addr, gen)
+	return err
 }
 
 // renewIfCachedAt renews and returns the cached client at addr, if one is

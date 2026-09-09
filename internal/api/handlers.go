@@ -141,8 +141,10 @@ type HostRegistry interface {
 	Generation(hostID string) uint64
 	// MarkVerified records a host row read the caller has just performed and
 	// the address it saw, so the next ClientFor need not read the row itself.
-	// A read from before an invalidation (readGen stale) is discarded.
-	MarkVerified(ctx context.Context, hostID, addr string, readGen uint64)
+	// A read from before an invalidation (readGen stale) is discarded. The
+	// error of a resolution it had to run is returned, so the caller fails
+	// here instead of repeating the lookup at ClientFor.
+	MarkVerified(ctx context.Context, hostID, addr string, readGen uint64) error
 }
 
 // Handlers holds shared dependencies for all route handlers.

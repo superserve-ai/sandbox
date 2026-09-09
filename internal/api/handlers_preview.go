@@ -364,7 +364,7 @@ func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string,
 // and returns true when the host passed.
 func (h *Handlers) respondHostCapabilityResult(c *gin.Context, hostID string, capabilities []string, hasCapabilities bool, err error) bool {
 	if err != nil {
-		log.Error().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).Msg("DB HostHasCapabilities failed")
+		log.Error().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).Msg("host pre-flight failed")
 		respondError(c, ErrInternal)
 		return false
 	}

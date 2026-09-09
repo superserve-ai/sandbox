@@ -1471,3 +1471,18 @@ func TestMarkVerifiedFromBeforeInvalidateIsDiscarded(t *testing.T) {
 		t.Fatalf("dialed = %v, want %v (the stale .1 must not be dialed again)", dialed, want)
 	}
 }
+
+// A cold host whose row cannot be read fails MarkVerified with the
+// resolution's own read budget, and the error is returned so the caller
+// does not run the same resolution again at dispatch.
+func TestMarkVerifiedColdFailureIsReturned(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051", failRead: true}
+	r := New(db.New(store), func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil })
+
+	if err := r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")); err == nil {
+		t.Fatal("MarkVerified returned nil for an unreadable row")
+	}
+	if n := store.readCount(); n != 2 {
+		t.Fatalf("reads = %d, want 2 (one resolution's failure budget)", n)
+	}
+}

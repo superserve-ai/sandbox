@@ -155,7 +155,9 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 }
 
 // readHostCaps performs the pre-flight read and, on an affirmative answer,
-// records the address it returned with the host registry.
+// records the address it returned with the host registry. A registry
+// resolution failure fails the pre-flight, so the create does not repeat
+// that lookup at dispatch.
 func (h *Handlers) readHostCaps(ctx context.Context, params db.HostHasCapabilitiesUnlockedParams) (bool, error) {
 	var gen uint64
 	if h.Hosts != nil {
@@ -166,7 +168,9 @@ func (h *Handlers) readHostCaps(ctx context.Context, params db.HostHasCapabiliti
 		return false, err
 	}
 	if row.HasCapabilities && h.Hosts != nil {
-		h.Hosts.MarkVerified(ctx, params.HostID, row.VmdAddr, gen)
+		if err := h.Hosts.MarkVerified(ctx, params.HostID, row.VmdAddr, gen); err != nil {
+			return false, err
+		}
 	}
 	return row.HasCapabilities, nil
 }
