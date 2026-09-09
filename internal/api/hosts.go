@@ -18,7 +18,7 @@ const (
 	maxHostCapabilities     = 32
 	maxHostCapabilityLength = 64
 	maxHostFieldLength      = 256
-	maxHostStorageSamples   = 200000
+	maxHostStorageSamples   = 300000
 )
 
 type hostStorageMeasurement struct {
