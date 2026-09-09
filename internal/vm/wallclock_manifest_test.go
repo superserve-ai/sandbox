@@ -341,14 +341,20 @@ func TestTemplateWatchRunsOnlyWhenTheSwitchIsOn(t *testing.T) {
 	defer cancel()
 
 	off := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
-	off.WatchTemplateManifests(ctx, zerolog.Nop())
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-off.WatchTemplateManifests(ctx, zerolog.Nop()):
+	default:
+		t.Fatal("a watch with the switch off must start nothing")
+	}
 	if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
 		t.Fatal("the watch scanned the templates with the switch off")
 	}
 
 	on := &Manager{cfg: ManagerConfig{SnapshotDir: dir, GuestClockFreezeEnabled: true}}
-	on.WatchTemplateManifests(ctx, zerolog.Nop())
+	stopped := on.WatchTemplateManifests(ctx, zerolog.Nop())
+	// The watcher must be gone before the evidence path is restored by the
+	// cleanup, or it would read a path being rewritten under it.
+	defer func() { cancel(); <-stopped }()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {

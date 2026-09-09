@@ -314,12 +314,15 @@ func imageManifest(memPath string) (*WallClockManifest, error) {
 // the first frozen one to land is what raises the rollback floor here — no
 // restore has to happen first. A directory listing at start and every few
 // minutes, off every request path.
-func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger) {
+// The returned channel closes once the watcher has stopped, after ctx ends.
+func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger) (stopped <-chan struct{}) {
+	done := make(chan struct{})
 	// Only a host that may act on frozen images watches for them. With the
 	// switch off this does no filesystem work at all; such a host's floor
 	// still rises at the first frozen image it restores.
 	if m.cfg.SnapshotDir == "" || !m.cfg.GuestClockFreezeEnabled {
-		return
+		close(done)
+		return done
 	}
 	scan := func() {
 		if n := m.scanTemplateManifests(); n > 0 && !wakeProtocolEvidenceLogged.Swap(true) {
@@ -327,6 +330,7 @@ func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger
 		}
 	}
 	go func() {
+		defer close(done)
 		scan()
 		t := time.NewTicker(firecrackerCapabilityRefreshInterval)
 		defer t.Stop()
@@ -339,6 +343,7 @@ func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger
 			}
 		}
 	}()
+	return done
 }
 
 var wakeProtocolEvidenceLogged atomic.Bool
