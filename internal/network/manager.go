@@ -348,7 +348,7 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 	preNet := time.Since(tPreNet)
 
 	tFW := time.Now()
-	if err := installHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, mgr.dnsRedirectPort, mgr.secretsProxyDst, mgr.secretsProxyPort, mgr.blockedEgressPorts, mgr.ownsEgressPortChain, log.With().Str("component", "host_fw").Logger()); err != nil {
+	if err := ensureHostFirewall(ctx, hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, mgr.dnsRedirectPort, mgr.secretsProxyDst, mgr.secretsProxyPort, mgr.blockedEgressPorts, mgr.ownsEgressPortChain, log.With().Str("component", "host_fw").Logger()); err != nil {
 		return nil, fmt.Errorf("install host firewall: %w", err)
 	}
 	// Async: a backpressured log writer must not extend startup — the values
