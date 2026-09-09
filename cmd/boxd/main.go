@@ -1014,8 +1014,7 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 		if os.IsNotExist(err) {
 			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
 		} else {
-			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-			http.Error(w, string(errJSON), http.StatusInternalServerError)
+			writeFSError(w, path, err)
 		}
 		return
 	}
@@ -1047,9 +1046,13 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 	// TOCTOU swap, and the FIFO/device block-or-stream-forever holes.
 	realPath, err := resolveWithinBlocklist(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		_, fsErr := fsErrno(err)
+		switch {
+		case os.IsNotExist(err):
 			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
-		} else {
+		case fsErr:
+			writeFSError(w, path, err)
+		default:
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 		}
 		return
@@ -1062,7 +1065,7 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 		case errors.Is(err, errNotRegularFile):
 			writeJSONError(w, http.StatusBadRequest, "not a regular file")
 		default:
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeFSError(w, realPath, err)
 		}
 		return
 	}
@@ -1117,9 +1120,13 @@ func serveDirAsJSON(w http.ResponseWriter, dirPath string) {
 	// (export -> /proc, /sys, /dev) would otherwise be listed wholesale.
 	realPath, err := resolveWithinBlocklist(dirPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		_, fsErr := fsErrno(err)
+		switch {
+		case os.IsNotExist(err):
 			writeJSONError(w, http.StatusNotFound, "file not found")
-		} else {
+		case fsErr:
+			writeFSError(w, dirPath, err)
+		default:
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 		}
 		return
@@ -1129,7 +1136,7 @@ func serveDirAsJSON(w http.ResponseWriter, dirPath string) {
 		if os.IsNotExist(err) {
 			writeJSONError(w, http.StatusNotFound, "file not found")
 		} else {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeFSError(w, realPath, err)
 		}
 		return
 	}
@@ -1310,7 +1317,7 @@ func serveDirAsZip(ctx context.Context, w http.ResponseWriter, dirPath string) {
 		if os.IsNotExist(err) {
 			writeJSONError(w, http.StatusNotFound, "file not found")
 		} else {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeFSError(w, dirPath, err)
 		}
 		return
 	}
@@ -1325,7 +1332,7 @@ func serveDirAsZip(ctx context.Context, w http.ResponseWriter, dirPath string) {
 
 	parent, err := os.OpenRoot(realParent)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeFSError(w, realParent, err)
 		return
 	}
 	defer parent.Close()
@@ -1334,7 +1341,7 @@ func serveDirAsZip(ctx context.Context, w http.ResponseWriter, dirPath string) {
 		if os.IsNotExist(err) {
 			writeJSONError(w, http.StatusNotFound, "file not found")
 		} else {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeFSError(w, realDir, err)
 		}
 		return
 	} else if li.Mode()&fs.ModeSymlink != 0 {
@@ -1346,7 +1353,7 @@ func serveDirAsZip(ctx context.Context, w http.ResponseWriter, dirPath string) {
 	// validates it before we commit a 200 + headers and confines the walk.
 	root, err := parent.OpenRoot(base)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeFSError(w, realDir, err)
 		return
 	}
 	defer root.Close()
@@ -1570,15 +1577,15 @@ func isStaleHandle(err error) bool {
 	return errors.Is(err, syscall.ESTALE)
 }
 
-// writeFileAttempt performs one mkdir+open+write+close cycle, copying
-// body into the file. It's split out so handleFileUpload can retry the
-// whole sequence on ESTALE — the mkdir and the open can each
+// writeFileAttempt performs one parent-check+open+write+close cycle,
+// copying body into the file. It's split out so handleFileUpload can retry
+// the whole sequence on ESTALE — the parent lookup and the open can each
 // independently observe a stale handle on the same mount. body is an
 // io.Reader rather than a []byte so the same function serves both the
 // buffered (retryable) and streamed (large-upload) paths.
 func writeFileAttempt(path string, body io.Reader) (int64, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return 0, fmt.Errorf("mkdir: %w", err)
+	if err := ensureParentDir(path); err != nil {
+		return 0, fmt.Errorf("parent dir: %w", err)
 	}
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -1638,8 +1645,7 @@ func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
 			writeStorageFull(w, "")
 			return
 		}
-		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-		http.Error(w, string(errJSON), http.StatusInternalServerError)
+		writeFSError(w, path, err)
 		return
 	}
 
