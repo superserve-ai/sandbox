@@ -399,31 +399,54 @@ module "sandbox_host_b" {
   can_ip_forward = true
 
   metadata = {
+    # cloud-init runs bootcmd on every boot before any service starts, so
+    # the identity is already this host's own by the time vmd can launch.
+    # A daemon that came up under another host's HOST_ID would heartbeat
+    # as that host and reconcile its sandboxes; stopping it afterward is
+    # too late.
+    user-data = <<-EOT
+      #cloud-config
+      bootcmd:
+        - |
+          NAME=$(curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/name) || exit 0
+          for f in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
+            [ -f "$f" ] || continue
+            if grep -q '^HOST_ID=' "$f"; then
+              sed -i "s/^HOST_ID=.*/HOST_ID=$${NAME}/" "$f"
+            else
+              echo "HOST_ID=$${NAME}" >> "$f"
+            fi
+          done
+          mkdir -p /run/sandbox && touch /run/sandbox/host-identity-pinned
+    EOT
+
     startup-script = <<-EOT
       #!/bin/bash
-      # Runs on every boot. Everything here is idempotent.
+      # Runs on every boot, after services. Everything here is idempotent.
       set -euo pipefail
       exec > /var/log/startup-script.log 2>&1
 
       echo "=== Superserve VMD startup ==="
 
-      # Stop any vmd the image auto-started before this script ran: it may
-      # have read an env file carrying another host's HOST_ID, and a daemon
-      # under a borrowed identity reconciles that host's sandboxes. Nothing
-      # runs on a fresh host, so stopping costs nothing. Disabled too, so
-      # later boots never start it ahead of the pinning below; the deploy
-      # installs and enables the current units itself.
-      systemctl stop superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
-      systemctl disable superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
-
-      # HOST_ID is this host's identity in the host table and must be unique
-      # across the cell. Pin it to this instance's own name in every env
-      # file present — the image and the deploy have used different paths
-      # over time. Never create one: the deploy owns the current file, and
-      # a bare file here would shadow it.
       NAME=$(curl -sf -H 'Metadata-Flavor: Google' \
         http://metadata.google.internal/computeMetadata/v1/instance/name)
       HOST_IFACE=$(ip -4 route show default | awk '{print $5}' | head -1)
+      PREPARED=/var/lib/sandbox/.host-prepared
+
+      # Identity is pinned early by cloud-init (see user-data). If that did
+      # not run this boot, fall back to stopping whatever the image started
+      # — but only on the first boot, when nothing has been deployed yet.
+      # On later boots the units are the deploy's, and stopping them would
+      # take an active host offline until the next deploy.
+      if [ ! -e /run/sandbox/host-identity-pinned ] && [ ! -e "$PREPARED" ]; then
+        echo "identity was not pinned before services; stopping the image's vmd"
+        systemctl stop superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
+        systemctl disable superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
+      fi
+
+      # Same pin, repeated here so the file is right even if cloud-init is
+      # ever removed from the image. Only files that exist: the deploy owns
+      # the current one, and a bare file here would shadow it.
       for f in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
         [ -f "$f" ] || continue
         if grep -q '^HOST_ID=' "$f"; then
@@ -490,9 +513,11 @@ module "sandbox_host_b" {
       chmod 0666 /dev/kvm 2>/dev/null || true
       sysctl -w net.ipv4.ip_forward=1
 
-      # vmd is deliberately not started here. The first deploy installs the
-      # current units and env, and starts it under the pinned identity.
-      echo "=== host prepared; vmd starts with the first deploy ==="
+      # vmd is not started here. On the first boot the deploy installs the
+      # current units and starts it; on every later boot systemd already
+      # started the deployed units under the pinned identity.
+      mkdir -p "$(dirname "$PREPARED")" && touch "$PREPARED"
+      echo "=== host prepared ==="
     EOT
   }
 }
