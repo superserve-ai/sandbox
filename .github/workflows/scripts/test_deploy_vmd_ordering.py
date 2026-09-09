@@ -39,6 +39,18 @@ def _gnu_sed_env(tmp_dir):
 
 
 class DeployVmdOrderingTests(unittest.TestCase):
+    def test_no_bare_service_stop(self):
+        # The early service stop that opened the socket-activation window must
+        # never be unconditional/bare: every stop of the vmd service also stops
+        # superserve-vmd.socket (both-units form) so no connection can
+        # socket-activate an interim vmd during the window.
+        self.assertNotRegex(
+            SOURCE,
+            r"systemctl stop \{service\}",
+            "found a bare `systemctl stop {service}`; every service stop must "
+            "also stop superserve-vmd.socket",
+        )
+
 
     def test_ssh_key_created_before_parallel_fanout(self):
         # Per-host deploys run in parallel, and each `gcloud compute scp`
