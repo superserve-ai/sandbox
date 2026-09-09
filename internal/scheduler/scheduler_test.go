@@ -196,12 +196,13 @@ type hostStore struct {
 	block          chan struct{} // non-nil: Query waits until closed
 	blockOnCall    int64         // 0 = block every call; N = block only the Nth
 	emptyUntilCall int64         // calls up to and including this one return no hosts
+	defaultRow     pgx.Row       // answer for the default-host row read on an empty fill
 }
 
 func (h *hostStore) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, nil
 }
-func (h *hostStore) QueryRow(context.Context, string, ...interface{}) pgx.Row { return nil }
+func (h *hostStore) QueryRow(context.Context, string, ...interface{}) pgx.Row { return h.defaultRow }
 func (h *hostStore) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
 	n := h.calls.Add(1)
 	if h.block != nil && (h.blockOnCall == 0 || n == h.blockOnCall) {
@@ -557,5 +558,24 @@ func TestRejectLeavesOtherCapabilitySetsCached(t *testing.T) {
 	}
 	if id, err := s.SelectHost(context.Background(), private); err != nil || id != "host-3" {
 		t.Fatalf("private after reject = (%q, %v), want host-3 from a fresh load", id, err)
+	}
+}
+
+// An expired empty set whose fallback is a capability-filtered default host
+// reloads in line too: the fallback will be refused by the pre-flight, and
+// only a fresh load can find a host that has since gained the capability.
+func TestLoadHostsExpiredFilteredDefaultReloadsInline(t *testing.T) {
+	store := &hostStore{emptyUntilCall: 1, defaultRow: schedulerHostRow("default-host", "active")}
+	s := &LeastLoaded{DB: db.New(store), DefaultHostID: "default-host", TTL: time.Minute}
+	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "default-host" {
+		t.Fatalf("prime = (%q, %v), want the filtered default as fallback", id, err)
+	}
+	setCachedAtForTest(t, s, nil, time.Now().Add(-2*time.Minute))
+	id, err := s.SelectHost(context.Background(), nil)
+	if err != nil || id != "host-2" {
+		t.Fatalf("expired select = (%q, %v), want host-2 from an in-line reload", id, err)
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("queries = %d, want 2", n)
 	}
 }

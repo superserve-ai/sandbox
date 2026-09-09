@@ -418,6 +418,12 @@ func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string, readGe
 		delete(r.clients, hostID)
 		r.gens[hostID]++
 	} else if ok && !r.unconfirmedConflictLocked(hostID) {
+		// Renewing from the caller's read is exactly as safe as renewing
+		// from the recheck's own read: both are one row read that cannot be
+		// ordered against a reclaim committed on another replica, and both
+		// leave the same recheck-bounded window. Only a row version could
+		// order them; until one exists, this is the read the recheck would
+		// otherwise repeat.
 		now := time.Now()
 		e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
 		r.clients[hostID] = e

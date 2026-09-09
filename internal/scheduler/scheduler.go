@@ -210,16 +210,13 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	return fresh, nil
 }
 
-// cannotPlace reports whether SelectHost would refuse every create from this
-// entry: no candidates, and no default-host fallback that would apply.
+// cannotPlace reports whether this entry has no candidates. An empty set is
+// reloaded in line once expired even when the default-host fallback would
+// apply: that fallback is a host the capability-filtered load excluded, the
+// create pre-flight refuses it, and a rejection cannot evict it — so a reload
+// is the only way a host that has since gained the capability gets found.
 func (s *LeastLoaded) cannotPlace(e hostCacheEntry) bool {
-	if len(e.hosts) > 0 {
-		return false
-	}
-	if s.DefaultHostID == "" {
-		return true
-	}
-	return e.defaultStatus != "missing" && e.defaultStatus != "active"
+	return len(e.hosts) == 0
 }
 
 func capabilityCacheKey(capabilities []string) (string, []string) {
