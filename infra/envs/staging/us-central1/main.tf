@@ -364,6 +364,143 @@ module "sandbox_host" {
   }
 }
 
+# Second staging host, so a cell with two serving hosts can be rehearsed
+# before it exists anywhere else: placement spreading across hosts, taking a
+# host out of rotation, moving sandbox ownership between hosts, and the
+# data-plane forwarding that makes both hosts reachable. Same image and shape
+# as the first host so the two are interchangeable, and labeled component=vmd
+# from creation so every deploy that discovers hosts by label reaches both
+# without a relabel step.
+#
+# The host self-registers as provisioning and stays invisible to placement
+# until an operator activates it, so creating it changes nothing for the cell
+# until that deliberate step.
+module "sandbox_host_b" {
+  source = "../../../modules/sandbox-host"
+
+  project_id    = local.project_id
+  environment   = local.environment
+  region        = local.region
+  zone          = local.zone
+  instance_name = "superserve-vmd-staging-2"
+  machine_type  = "n2-standard-32"
+
+  subnet      = "projects/rayai-dev/regions/us-central1/subnetworks/superserve-subnet-05cb005"
+  internal_ip = "10.0.0.3"
+  tags        = ["superserve-vmd"]
+
+  labels = merge(local.sandbox_host_labels, {
+    component    = "vmd"
+    sandbox_role = "vmd"
+  })
+
+  service_account_email = module.iam.service_account_emails["superserve_api"]
+  boot_disk_image       = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
+  boot_disk_size_gb     = 200
+  # The first host runs on pd-ssd, but only because its disk predates this
+  # module and was imported: the module's own default is the API's
+  # pd-standard. Declared so the two hosts actually match.
+  boot_disk_type = "pd-ssd"
+  can_ip_forward = true
+
+  metadata = {
+    startup-script = <<-EOT
+      #!/bin/bash
+      # Runs on every boot. Everything here is idempotent.
+      set -euo pipefail
+      exec > /var/log/startup-script.log 2>&1
+
+      echo "=== Superserve VMD startup ==="
+
+      # The image ships an env file carrying the first host's identity, and
+      # the deploy pipeline only sets HOST_ID when none is present. Left
+      # alone, this host would heartbeat under a name already in use and be
+      # refused. Take this instance's own name from the metadata server.
+      NAME=$(curl -sf -H 'Metadata-Flavor: Google' \
+        http://metadata.google.internal/computeMetadata/v1/instance/name)
+      if grep -q '^HOST_ID=' /etc/sandbox/vmd.env; then
+        sed -i "s/^HOST_ID=.*/HOST_ID=$${NAME}/" /etc/sandbox/vmd.env
+      else
+        echo "HOST_ID=$${NAME}" >> /etc/sandbox/vmd.env
+      fi
+
+      HOST_IFACE=$(ip -4 route show default | awk '{print $5}' | head -1)
+      sed -i "s/^HOST_INTERFACE=.*/HOST_INTERFACE=$${HOST_IFACE}/" /etc/sandbox/vmd.env
+
+      # Background-data disk: backup journal and upload staging. Formatted
+      # once, when blank; mounted every boot. The vmd deploy refuses to run
+      # against a host where this path is not a real mount. A plain mount on
+      # purpose: the first host's migration tooling never completed a
+      # migration, and its effective state is exactly this.
+      DEV=/dev/disk/by-id/google-superserve-sandbox-data
+      for _ in $(seq 1 120); do [ -e "$DEV" ] && break; sleep 1; done
+      if [ -z "$(blkid -s TYPE -o value "$DEV" 2>/dev/null)" ]; then
+        mkfs.xfs -m crc=1,reflink=1 "$DEV"
+      fi
+      mkdir -p /mnt/sandbox-data
+      mountpoint -q /mnt/sandbox-data || mount -t xfs -o noatime,discard "$DEV" /mnt/sandbox-data
+      grep -q 'google-superserve-sandbox-data' /etc/fstab || \
+        echo "$DEV /mnt/sandbox-data xfs noatime,discard,nofail 0 2" >> /etc/fstab
+
+      # Runtime flags the first host carries as hand-installed drop-ins.
+      # Nothing deploys these, and without them the two hosts would launch
+      # and track VMs differently.
+      mkdir -p /etc/systemd/system/superserve-vmd.service.d
+      printf '[Service]\nEnvironment=VMD_DIRTY_TRACKING_SESSION=true\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/dirty-session.conf
+      printf '[Service]\nEnvironment=VMD_LAUNCH_VIA_LAUNCHER_NS=true\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/launcher.conf
+      printf '[Service]\nEnvironment=VMD_SYSTEMD_DBUS=true\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/sdbus.conf
+      printf '[Service]\nEnvironment=VMD_RECYCLE_TAP_RESET=true\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/tap-reset.conf
+      systemctl daemon-reload
+
+      modprobe kvm
+      modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null || true
+      chmod 0666 /dev/kvm 2>/dev/null || true
+      sysctl -w net.ipv4.ip_forward=1
+
+      # Best effort: the image's vmd may lack per-host files the deploy does
+      # not carry (egress blocklist, guest kernel, proxy CA). Those are
+      # copied from the first host before the first deploy, which then
+      # (re)starts vmd. A failure here must not fail the boot.
+      systemctl start superserve-vmd || true
+
+      echo "=== Superserve VMD started ==="
+    EOT
+  }
+}
+
+# The second host's own background-data disk, same shape as the first's.
+resource "google_compute_disk" "sandbox_data_b" {
+  project = local.project_id
+  name    = "superserve-vmd-staging-2-sandbox-data"
+  zone    = local.zone
+  type    = "pd-balanced"
+  size    = 500
+
+  labels = merge(local.common_labels, {
+    component = "vmd"
+    purpose   = "sandbox-data"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_compute_attached_disk" "sandbox_data_b" {
+  project     = local.project_id
+  zone        = local.zone
+  disk        = google_compute_disk.sandbox_data_b.id
+  instance    = module.sandbox_host_b.instance_self_link
+  device_name = "superserve-sandbox-data"
+  mode        = "READ_WRITE"
+
+  deletion_policy = "PREVENT"
+}
+
 module "observability" {
   source = "../../../modules/observability"
 
