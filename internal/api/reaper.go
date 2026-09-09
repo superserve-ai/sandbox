@@ -443,8 +443,11 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 	// retry as the user-facing boots — the background ctx never reads dead,
 	// which is right: a rollback landing late still beats marking the
 	// sandbox failed.
+	// No policy carried: the record keeps the one it has, which this
+	// rollback never changed.
 	ipAddr, _, _, _, err := retryTransientBoot(ctx, sbx.ID.String(), sbx.HostID, func(rctx context.Context) (string, uint32, uint32, error) {
-		return vmd.ResumeInstance(rctx, sbx.ID.String(), snapshotPath, memPath, sbx.NetworkConfig)
+		ip, vcpu, memMiB, _, rerr := vmd.ResumeInstance(rctx, sbx.ID.String(), snapshotPath, memPath, sbx.NetworkConfig, "", nil, 0)
+		return ip, vcpu, memMiB, rerr
 	})
 	if err != nil {
 		rl.Error().Err(err).Msg("reaper: rollback resume failed")

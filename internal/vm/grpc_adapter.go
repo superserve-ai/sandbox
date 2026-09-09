@@ -53,11 +53,11 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 	entries := make([]*vmdpb.ArtifactManifestEntry, 0, len(manifest))
 	for _, e := range manifest {
 		entry := &vmdpb.ArtifactManifestEntry{
-			FileName:  e.FileName,
-			Path:      e.Path,
-			SizeBytes: e.SizeBytes,
-			Sha256:    e.SHA256,
-			BasePath:  e.BasePath,
+			FileName:       e.FileName,
+			Path:           e.Path,
+			SizeBytes:      e.SizeBytes,
+			Sha256:         e.SHA256,
+			BasePath:       e.BasePath,
 			AllocatedBytes: e.AllocatedBytes,
 		}
 		entries = append(entries, entry)
@@ -95,7 +95,27 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			}
 		}
 	}
-	inst, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
+	// The preview policy rides the request (see vmd.proto). Stamped before the
+	// guest runs, through the same monotonic check a policy push takes, so a
+	// revision behind the record leaves the newer policy in place.
+	previewAccess := req.GetPreviewAccess()
+	if previewAccess != "" {
+		if previewAccess != preview.AccessLegacyPublic && previewAccess != preview.AccessPublic && previewAccess != preview.AccessPrivate {
+			return nil, status.Errorf(codes.InvalidArgument, "preview_access must be empty, %q, %q or %q, got %q", preview.AccessLegacyPublic, preview.AccessPublic, preview.AccessPrivate, previewAccess)
+		}
+		previewPorts, perr := previewPortsFromProto(req.GetPreviewPorts())
+		if perr != nil {
+			return nil, perr
+		}
+		if previewPortsContainTokenizedAccess(previewPorts) && req.GetPreviewPolicyRevision() <= 0 {
+			return nil, status.Error(codes.InvalidArgument, "tokenized preview policy requires a positive preview_policy_revision")
+		}
+		if err := a.mgr.UpdateSandboxPreviewPolicy(req.GetVmId(), previewAccess, previewPorts, req.GetPreviewPolicyRevision()); err != nil {
+			return nil, err
+		}
+	}
+
+	inst, rulesApplied, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +142,7 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
 
-	return &vmdpb.ResumeVMResponse{
+	resp := &vmdpb.ResumeVMResponse{
 		VmId:       inst.ID,
 		SocketPath: inst.SocketPath,
 		IpAddress:  inst.IP,
@@ -131,7 +151,13 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			VcpuCount: inst.Config.VCPU,
 			MemoryMib: inst.Config.MemoryMiB,
 		},
-	}, nil
+		NetworkRulesApplied: rulesApplied,
+	}
+	if previewAccess != "" {
+		// Attests the request's policy fields were applied (see vmd.proto).
+		resp.PreviewProtocol = preview.HostCapabilityPorts
+	}
+	return resp, nil
 }
 
 func (a *GRPCAdapter) CreateSnapshot(ctx context.Context, req *vmdpb.CreateSnapshotRequest) (*vmdpb.CreateSnapshotResponse, error) {

@@ -383,6 +383,13 @@ message ResumeVMRequest {
   map<string, string> env_vars = 5;          // Re-inject env vars after resume.
   reserved 6;                                 // was secrets_broker (SecretsBrokerConfig)
   reserved "secrets_broker";
+  // Preview policy stamped on the record before the guest runs, with the
+  // same fields and rules as RestoreSnapshotRequest. Empty preview_access
+  // means a sender from before these fields: the record keeps its policy
+  // and the response carries no attestation.
+  string preview_access = 7;
+  repeated PreviewPort preview_ports = 8;
+  int64 preview_policy_revision = 9;
 }
 
 message ResumeVMResponse {
@@ -391,6 +398,14 @@ message ResumeVMResponse {
   string ip_address = 3;
   uint32 pid = 4;
   ResourceLimits resource_limits = 5;
+  // Attests that the request's preview policy fields were applied; same
+  // value and rules as RestoreSnapshotResponse.preview_protocol. Empty
+  // means the request carried no policy or the vmd predates this field.
+  string preview_protocol = 6;
+  // True when the request's egress rules are fully in place on the VM,
+  // including one adopted from an earlier attempt. False means the caller
+  // must push them itself.
+  bool network_rules_applied = 7;
 }
 
 // ---------------------------------------------------------------------------

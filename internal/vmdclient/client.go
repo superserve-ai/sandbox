@@ -18,6 +18,16 @@ type ResourceLimits struct {
 // PortPolicy is the control-plane representation of one published preview
 // port. Tokenized wire modes require a positive TokenVersion; raw private and
 // public policies leave TokenVersion at zero.
+// ResumeAttestation is what a resume response proves the daemon applied.
+// PreviewProtocol is the value RestoreSnapshot echoes, empty for a daemon
+// from before the resume request carried the policy. NetworkRulesApplied is
+// true when the request's egress rules are fully in place, including on a VM
+// the daemon adopted from an earlier attempt.
+type ResumeAttestation struct {
+	PreviewProtocol     string
+	NetworkRulesApplied bool
+}
+
 type PortPolicy struct {
 	Access       string
 	TokenVersion int64
@@ -51,8 +61,10 @@ type Client interface {
 	// what came back, or it would demand of reports an identity the host
 	// can never produce.
 	PauseInstance(ctx context.Context, instanceID, snapshotDir, pauseToken string) (snapshotPath, memPath string, manifest []ManifestEntry, ackedToken string, err error)
-	// ResumeInstance restores a paused VM.
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// ResumeInstance restores a paused VM. The preview policy rides along so
+	// the daemon stamps it before the guest runs; the attestation reports
+	// what the daemon applied, with empty fields for a daemon from before it.
+	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64) (ipAddress string, actualVcpu, actualMemMiB uint32, attested ResumeAttestation, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
 	// in-memory map but the snapshot files are still on disk). basePath +

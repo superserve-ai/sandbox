@@ -247,7 +247,7 @@ func TestFrozenImageIsRefusedBeforeLaunch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, rerr := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
+	_, _, rerr := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 	unlock()
 	if status.Code(rerr) != codes.FailedPrecondition || launched {
 		t.Fatalf("resume: err=%v launched=%v, want FailedPrecondition before launch", rerr, launched)
