@@ -56,6 +56,7 @@ type LeastLoaded struct {
 
 type hostCacheEntry struct {
 	hosts    []db.ListActiveHostsByLoadRow
+	ids      map[string]struct{} // hosts by ID, so Reject checks membership without scanning under the lock
 	cachedAt time.Time
 	gen      uint64 // the generation this set was loaded at; a Reject must carry it
 	// defaultStatus is the DefaultHostID row's status, resolved at fill time
@@ -129,6 +130,12 @@ func (s *LeastLoaded) fillEntry(ctx context.Context, normalized []string) (hostC
 		return hostCacheEntry{}, fmt.Errorf("list active hosts by load: %w", err)
 	}
 	entry := hostCacheEntry{hosts: hosts, cachedAt: time.Now()}
+	if len(hosts) > 0 {
+		entry.ids = make(map[string]struct{}, len(hosts))
+		for _, h := range hosts {
+			entry.ids[h.ID] = struct{}{}
+		}
+	}
 	if len(hosts) == 0 && s.DefaultHostID != "" {
 		host, err := s.DB.GetHost(ctx, s.DefaultHostID)
 		switch {
@@ -272,12 +279,8 @@ func (s *LeastLoaded) Reject(hostID string, requiredCapabilities []string, gen u
 // names reports whether this entry lists hostID. The default-host fallback
 // (an empty set) does not count: a reload could not change that answer.
 func (s *LeastLoaded) names(e hostCacheEntry, hostID string) bool {
-	for _, h := range e.hosts {
-		if h.ID == hostID {
-			return true
-		}
-	}
-	return false
+	_, ok := e.ids[hostID]
+	return ok
 }
 
 func (s *LeastLoaded) Invalidate() {
