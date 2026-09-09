@@ -1213,16 +1213,17 @@ func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, 
 const secretEnvExpiryMargin = 24 * time.Hour
 
 // secretEnvFingerprint digests the environment as injected: the key that
-// signed the JWT, and the binding set with each secret's env key, proxy
-// token, and auth shape. A change to any of them changes the digest, so a
-// rotated signing key reads as a new environment; binding order does not.
-func secretEnvFingerprint(signingKeyID string, meta []SecretBindingMeta) string {
+// signed the JWT, by its material rather than its label, and the binding
+// set with each secret's env key, proxy token, and auth shape. A change to
+// any of them changes the digest, so a replaced signing key reads as a new
+// environment even under the same kid; binding order does not.
+func secretEnvFingerprint(signingKeyFingerprint string, meta []SecretBindingMeta) string {
 	items := append([]SecretBindingMeta(nil), meta...)
 	sort.Slice(items, func(i, j int) bool { return items[i].EnvKey < items[j].EnvKey })
 	encoded, err := json.Marshal(struct {
-		KeyID    string
-		Bindings []SecretBindingMeta
-	}{signingKeyID, items})
+		SigningKey string
+		Bindings   []SecretBindingMeta
+	}{signingKeyFingerprint, items})
 	if err != nil {
 		return ""
 	}
@@ -1230,20 +1231,20 @@ func secretEnvFingerprint(signingKeyID string, meta []SecretBindingMeta) string 
 	return hex.EncodeToString(sum[:])
 }
 
-// signerKeyID names the key minting JWTs now; empty without a signer, which
-// matches no recorded environment.
-func (h *Handlers) signerKeyID() string {
+// signerKeyFingerprint names the key minting JWTs now; empty without a
+// signer, which matches no recorded environment.
+func (h *Handlers) signerKeyFingerprint() string {
 	if h.Signer == nil {
 		return ""
 	}
-	return h.Signer.KeyID()
+	return h.Signer.KeyFingerprint()
 }
 
 // recordSecretEnv notes what the guest holds after a successful injection,
 // off the response path. A lost write only costs the next resume a
 // re-injection, so the write is not awaited.
 func (h *Handlers) recordSecretEnv(sandboxID uuid.UUID, sourceIP string, meta []SecretBindingMeta) {
-	fingerprint := secretEnvFingerprint(h.signerKeyID(), meta)
+	fingerprint := secretEnvFingerprint(h.signerKeyFingerprint(), meta)
 	if fingerprint == "" || len(meta) == 0 || h.Signer == nil {
 		return
 	}
@@ -1272,7 +1273,7 @@ func (h *Handlers) guestHoldsSecretEnv(sb db.Sandbox, snapshotAt pgtype.Timestam
 		!sb.SecretEnvInjectedAt.Valid || !sb.SecretEnvExpiresAt.Valid || !snapshotAt.Valid {
 		return false
 	}
-	return *sb.SecretEnvFingerprint == secretEnvFingerprint(h.signerKeyID(), meta) &&
+	return *sb.SecretEnvFingerprint == secretEnvFingerprint(h.signerKeyFingerprint(), meta) &&
 		*sb.SecretEnvIp == sb.IpAddress.String() &&
 		time.Now().Add(secretEnvExpiryMargin).Before(sb.SecretEnvExpiresAt.Time) &&
 		!snapshotAt.Time.Before(sb.SecretEnvInjectedAt.Time)

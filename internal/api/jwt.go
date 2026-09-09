@@ -2,7 +2,9 @@ package api
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -64,6 +66,9 @@ type SecretsClaims struct {
 type SecretsSigner struct {
 	priv ed25519.PrivateKey
 	kid  string
+	// fingerprint names the key material itself; the kid is a label that
+	// can stay put across a key replacement.
+	fingerprint string
 }
 
 // NewSecretsSigner builds a signer from a base64-encoded 32-byte Ed25519 seed.
@@ -80,11 +85,18 @@ func NewSecretsSigner(seedBase64, kid string) (*SecretsSigner, error) {
 	if len(seed) != ed25519.SeedSize {
 		return nil, fmt.Errorf("signing key seed has %d bytes, want %d", len(seed), ed25519.SeedSize)
 	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	sum := sha256.Sum256(priv.Public().(ed25519.PublicKey))
 	return &SecretsSigner{
-		priv: ed25519.NewKeyFromSeed(seed),
-		kid:  kid,
+		priv:        priv,
+		kid:         kid,
+		fingerprint: hex.EncodeToString(sum[:]),
 	}, nil
 }
+
+// KeyFingerprint digests the verification key. Two signers with the same
+// kid but different keys have different fingerprints.
+func (s *SecretsSigner) KeyFingerprint() string { return s.fingerprint }
 
 // Sign returns a serialized JWT with the supplied claims. iss, iat, exp are
 // filled in automatically; the caller supplies sandbox-specific fields.
