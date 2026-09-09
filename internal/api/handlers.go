@@ -2891,23 +2891,58 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // Sandbox Pause
 // ---------------------------------------------------------------------------
 
-// pauseWithRetry pauses a VM, retrying once on a non-NotFound failure. A
-// timed-out pause may have actually completed on the host, so reverting the
-// row to active would drift it against a paused VM; PauseVM is idempotent, so
-// the retry returns the recorded snapshot and the row converges to paused.
-// NotFound is terminal — the VM is genuinely gone.
+// A pause writes the guest's dirty memory before it answers, so one attempt
+// gets longer than other daemon calls, and a pause that outruns it is still
+// running on the host rather than failed. The daemon holds the VM's lock
+// until the snapshot lands and answers a repeat request with that snapshot,
+// so the row is only reverted once the host has given a definite answer or
+// the reconcile budget is spent.
+const (
+	pauseAttemptTimeout  = 60 * time.Second
+	pauseReconcileBudget = 10 * time.Minute
+)
+
+// pauseWithRetry pauses a VM and keeps asking, each attempt parking behind
+// the pause in flight, until the host answers definitively. NotFound is
+// terminal. Any other failure gets one more attempt: the host may have
+// saved the snapshot and stopped the VM before failing to record it, and
+// the repeat lands on the already-paused guard and returns that snapshot.
 func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id, pauseToken string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
-	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
-	snapshotPath, memPath, manifest, ackedToken, err = vmd.PauseInstance(ctx, id, "", pauseToken)
-	cancel()
-	if err == nil || isVMDNotFound(err) {
-		return snapshotPath, memPath, manifest, ackedToken, err
+	return pauseUntilDecided(reqCtx, vmd, id, pauseToken, pauseAttemptTimeout, pauseReconcileBudget)
+}
+
+func pauseUntilDecided(reqCtx context.Context, vmd vmdclient.Client, id, pauseToken string, attempt, budget time.Duration) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
+	deadline := time.Now().Add(budget)
+	// The first attempt follows the caller; later ones detach, since the
+	// client giving up must not leave the row drifting against the host.
+	ctx := reqCtx
+	recovered := false
+	for {
+		actx, cancel := context.WithTimeout(ctx, attempt)
+		snapshotPath, memPath, manifest, ackedToken, err = vmd.PauseInstance(actx, id, "", pauseToken)
+		cancel()
+		switch {
+		case err == nil || isVMDNotFound(err):
+			return snapshotPath, memPath, manifest, ackedToken, err
+		case pauseUndecided(err):
+			if time.Now().After(deadline) {
+				return snapshotPath, memPath, manifest, ackedToken, err
+			}
+		default:
+			if recovered {
+				return snapshotPath, memPath, manifest, ackedToken, err
+			}
+			recovered = true
+		}
+		ctx = context.WithoutCancel(reqCtx)
 	}
-	// Detach from the request ctx: the client's deadline may already have
-	// fired, but the reconciliation to a consistent state must still run.
-	rctx, rcancel := context.WithTimeout(context.WithoutCancel(reqCtx), vmdTimeout)
-	defer rcancel()
-	return vmd.PauseInstance(rctx, id, "", pauseToken)
+}
+
+// pauseUndecided reports whether err leaves the pause's outcome unknown: the
+// attempt ran out of time or the daemon could not be reached, as opposed to
+// the daemon answering.
+func pauseUndecided(err error) bool {
+	return isVMDDeadline(err) || isVMDUnavailable(err) || isVMDCanceled(err)
 }
 
 func (h *Handlers) PauseSandbox(c *gin.Context) {
