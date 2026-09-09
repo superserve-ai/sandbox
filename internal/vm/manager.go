@@ -4972,10 +4972,11 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	m.mu.RUnlock()
 	// A request arriving while the startup pass still owes this VM its wake
 	// waits for that outcome rather than adopting a frozen guest — for as
-	// long as a wake can take, not the flight's own short budget: giving up
-	// early would report a live VM as missing and invite a replacement.
+	// long as a wake can take behind everything queued ahead of it in the
+	// bounded pool, not the flight's own short budget: giving up early would
+	// report a live VM as missing and invite a replacement.
 	if pw := m.pendingWake(rec.ID); pw != nil && !cleanupStale {
-		wait := time.NewTimer(boxdResumeReadyBudget + 5*time.Second)
+		wait := time.NewTimer(pendingWakeWaitBound(m.pendingWakeCount()))
 		defer wait.Stop()
 		select {
 		case <-pw.done:
@@ -8452,6 +8453,24 @@ func (m *Manager) pendingWake(id string) *pendingWake {
 	m.pendingWakeMu.Lock()
 	defer m.pendingWakeMu.Unlock()
 	return m.pendingWakes[id]
+}
+
+func (m *Manager) pendingWakeCount() int {
+	m.pendingWakeMu.Lock()
+	defer m.pendingWakeMu.Unlock()
+	return len(m.pendingWakes)
+}
+
+// pendingWakeWaitBound is how long a request may wait for a queued wake: the
+// pool serves queued wakes wakeRecoveryWorkers at a time, each bounded by
+// the wake's own budget, so a wake queued behind n others is served within
+// that many rounds of it.
+func pendingWakeWaitBound(queued int) time.Duration {
+	rounds := (queued + wakeRecoveryWorkers - 1) / wakeRecoveryWorkers
+	if rounds < 1 {
+		rounds = 1
+	}
+	return time.Duration(rounds) * (boxdResumeReadyBudget + 5*time.Second)
 }
 
 func (m *Manager) queuePendingWake(inst *VMInstance, unlock func()) {

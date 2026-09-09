@@ -1864,3 +1864,49 @@ func TestAdHocSnapshotRefusesAPausedVM(t *testing.T) {
 		t.Fatalf("snapshot requests went from %d to %d; a refused snapshot must send none", before, got)
 	}
 }
+
+// A request that meets a queued wake waits for the pool to reach it: behind
+// n others it is served within ceil(n/workers) rounds of a wake's budget.
+func TestPendingWakeWaitBoundCoversTheQueue(t *testing.T) {
+	round := boxdResumeReadyBudget + 5*time.Second
+	for _, tc := range []struct {
+		queued int
+		rounds int
+	}{{0, 1}, {1, 1}, {wakeRecoveryWorkers, 1}, {wakeRecoveryWorkers + 1, 2}, {3*wakeRecoveryWorkers + 1, 4}} {
+		if got := pendingWakeWaitBound(tc.queued); got != time.Duration(tc.rounds)*round {
+			t.Errorf("queued=%d: bound %v, want %d rounds of %v", tc.queued, got, tc.rounds, round)
+		}
+	}
+}
+
+// A short freeze budget still reaches the guest as a positive budget: the
+// reserve for the reply scales down with it instead of consuming it whole.
+func TestFreezeRequestKeepsAPositiveGuestBudget(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(boxdPort))
+	if err != nil {
+		t.Skipf("port %d busy: %v", boxdPort, err)
+	}
+	var seen int64 = -1
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b struct {
+			BudgetMs int64  `json:"budget_ms"`
+			Token    string `json:"token"`
+		}
+		_ = jsonDecode(r, &b)
+		seen = b.BudgetMs
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"version":1,"capability":"wake","token":"` + b.Token + `"}`))
+	}))
+	srv.Listener = ln
+	srv.Start()
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	echo, err := postBoxdFreeze(ctx, "127.0.0.1", "tok")
+	if err != nil || echo.Token != "tok" {
+		t.Fatalf("echo=%+v err=%v; want the freeze sent and echoed under a 100ms budget", echo, err)
+	}
+	if seen <= 0 || seen >= 100 {
+		t.Fatalf("guest budget %dms, want positive and below the caller's 100ms", seen)
+	}
+}

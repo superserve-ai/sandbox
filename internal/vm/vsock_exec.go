@@ -166,11 +166,16 @@ func postBoxdFreeze(ctx context.Context, vmIP, token string) (freezeEcho, error)
 		Token    string `json:"token"`
 	}{Token: token}
 	if dl, ok := ctx.Deadline(); ok {
-		budget := time.Until(dl) - 200*time.Millisecond
+		// The reserve is what the guest's reply needs to reach us after it
+		// gives up; it never eats the whole budget, so a short budget still
+		// asks the guest for most of it rather than nothing.
+		remaining := time.Until(dl)
+		reserve := min(200*time.Millisecond, remaining/4)
+		budget := remaining - reserve
 		if budget <= 0 {
 			return freezeEcho{}, context.DeadlineExceeded
 		}
-		req.BudgetMs = budget.Milliseconds()
+		req.BudgetMs = max(budget.Milliseconds(), 1)
 	}
 	body, _ := json.Marshal(req)
 	reply, err := postBoxd(ctx, vmIP, "/freeze", body)
