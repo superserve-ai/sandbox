@@ -364,13 +364,9 @@ module "sandbox_host" {
   }
 }
 
-# Second staging host, so a cell with two serving hosts can be rehearsed
-# before it exists anywhere else: placement spreading across hosts, taking a
-# host out of rotation, moving sandbox ownership between hosts, and the
-# data-plane forwarding that makes both hosts reachable. Same image and shape
-# as the first host so the two are interchangeable, and labeled component=vmd
-# from creation so every deploy that discovers hosts by label reaches both
-# without a relabel step.
+# Second vmd host for the staging cell. Same image and shape as the first so
+# the two are interchangeable, and labeled component=vmd from creation so
+# every deploy that discovers hosts by label reaches both.
 #
 # The host self-registers as provisioning and stays invisible to placement
 # until an operator activates it, so creating it changes nothing for the cell
@@ -397,9 +393,8 @@ module "sandbox_host_b" {
   service_account_email = module.iam.service_account_emails["superserve_api"]
   boot_disk_image       = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
   boot_disk_size_gb     = 200
-  # The first host runs on pd-ssd, but only because its disk predates this
-  # module and was imported: the module's own default is the API's
-  # pd-standard. Declared so the two hosts actually match.
+  # Declared explicitly so both hosts use the same boot disk type; the
+  # module's own default is the API's pd-standard.
   boot_disk_type = "pd-ssd"
   can_ip_forward = true
 
@@ -412,10 +407,10 @@ module "sandbox_host_b" {
 
       echo "=== Superserve VMD startup ==="
 
-      # The image ships an env file carrying the first host's identity, and
-      # the deploy pipeline only sets HOST_ID when none is present. Left
-      # alone, this host would heartbeat under a name already in use and be
-      # refused. Take this instance's own name from the metadata server.
+      # HOST_ID is this host's identity in the host table and must be unique
+      # across the cell. The image's env file may already carry one, and a
+      # deploy only sets it when absent, so pin it to this instance's own
+      # name from the metadata server.
       NAME=$(curl -sf -H 'Metadata-Flavor: Google' \
         http://metadata.google.internal/computeMetadata/v1/instance/name)
       if grep -q '^HOST_ID=' /etc/sandbox/vmd.env; then
@@ -429,9 +424,7 @@ module "sandbox_host_b" {
 
       # Background-data disk: backup journal and upload staging. Formatted
       # once, when blank; mounted every boot. The vmd deploy refuses to run
-      # against a host where this path is not a real mount. A plain mount on
-      # purpose: the first host's migration tooling never completed a
-      # migration, and its effective state is exactly this.
+      # against a host where this path is not a real mount.
       DEV=/dev/disk/by-id/google-superserve-sandbox-data
       for _ in $(seq 1 120); do [ -e "$DEV" ] && break; sleep 1; done
       if [ -z "$(blkid -s TYPE -o value "$DEV" 2>/dev/null)" ]; then
@@ -442,9 +435,8 @@ module "sandbox_host_b" {
       grep -q 'google-superserve-sandbox-data' /etc/fstab || \
         echo "$DEV /mnt/sandbox-data xfs noatime,discard,nofail 0 2" >> /etc/fstab
 
-      # Runtime flags the first host carries as hand-installed drop-ins.
-      # Nothing deploys these, and without them the two hosts would launch
-      # and track VMs differently.
+      # Runtime flags this cell's hosts run with. Set here so both hosts
+      # launch and track VMs the same way.
       mkdir -p /etc/systemd/system/superserve-vmd.service.d
       printf '[Service]\nEnvironment=VMD_DIRTY_TRACKING_SESSION=true\n' \
         > /etc/systemd/system/superserve-vmd.service.d/dirty-session.conf
@@ -461,10 +453,9 @@ module "sandbox_host_b" {
       chmod 0666 /dev/kvm 2>/dev/null || true
       sysctl -w net.ipv4.ip_forward=1
 
-      # Best effort: the image's vmd may lack per-host files the deploy does
-      # not carry (egress blocklist, guest kernel, proxy CA). Those are
-      # copied from the first host before the first deploy, which then
-      # (re)starts vmd. A failure here must not fail the boot.
+      # Best effort: per-host files that arrive with the first deploy may
+      # not be present yet, and the deploy (re)starts vmd once they are. A
+      # failure here must not fail the boot.
       systemctl start superserve-vmd || true
 
       echo "=== Superserve VMD started ==="
