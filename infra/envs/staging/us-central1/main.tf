@@ -407,37 +407,71 @@ module "sandbox_host_b" {
 
       echo "=== Superserve VMD startup ==="
 
+      # Stop any vmd the image auto-started before this script ran: it may
+      # have read an env file carrying another host's HOST_ID, and a daemon
+      # under a borrowed identity reconciles that host's sandboxes. Nothing
+      # runs on a fresh host, so stopping costs nothing. Disabled too, so
+      # later boots never start it ahead of the pinning below; the deploy
+      # installs and enables the current units itself.
+      systemctl stop superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
+      systemctl disable superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
+
       # HOST_ID is this host's identity in the host table and must be unique
-      # across the cell. The image's env file may already carry one, and a
-      # deploy only sets it when absent, so pin it to this instance's own
-      # name from the metadata server.
+      # across the cell. Pin it to this instance's own name in every env
+      # file present — the image and the deploy have used different paths
+      # over time. Never create one: the deploy owns the current file, and
+      # a bare file here would shadow it.
       NAME=$(curl -sf -H 'Metadata-Flavor: Google' \
         http://metadata.google.internal/computeMetadata/v1/instance/name)
-      if grep -q '^HOST_ID=' /etc/sandbox/vmd.env; then
-        sed -i "s/^HOST_ID=.*/HOST_ID=$${NAME}/" /etc/sandbox/vmd.env
-      else
-        echo "HOST_ID=$${NAME}" >> /etc/sandbox/vmd.env
-      fi
-
       HOST_IFACE=$(ip -4 route show default | awk '{print $5}' | head -1)
-      sed -i "s/^HOST_INTERFACE=.*/HOST_INTERFACE=$${HOST_IFACE}/" /etc/sandbox/vmd.env
+      for f in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
+        [ -f "$f" ] || continue
+        if grep -q '^HOST_ID=' "$f"; then
+          sed -i "s/^HOST_ID=.*/HOST_ID=$${NAME}/" "$f"
+        else
+          echo "HOST_ID=$${NAME}" >> "$f"
+        fi
+        sed -i "s/^HOST_INTERFACE=.*/HOST_INTERFACE=$${HOST_IFACE}/" "$f"
+      done
 
-      # Background-data disk: backup journal and upload staging. Formatted
-      # once, when blank; mounted every boot. The vmd deploy refuses to run
-      # against a host where this path is not a real mount.
+      # Background-data disk: backup journal and upload staging. The disk is
+      # attached by a separate resource and can appear after this script
+      # runs, so the mount is a device-bound unit rather than a one-shot
+      # wait: it fires when the disk shows up, whenever that is, and again
+      # on every boot. Formats only a blank disk; mounts otherwise.
       DEV=/dev/disk/by-id/google-superserve-sandbox-data
-      for _ in $(seq 1 120); do [ -e "$DEV" ] && break; sleep 1; done
+      DEVUNIT=$(systemd-escape -p --suffix=device "$DEV")
+      cat > /usr/local/bin/sandbox-data-mount <<'SH'
+      #!/bin/bash
+      set -euo pipefail
+      DEV=/dev/disk/by-id/google-superserve-sandbox-data
       if [ -z "$(blkid -s TYPE -o value "$DEV" 2>/dev/null)" ]; then
         mkfs.xfs -m crc=1,reflink=1 "$DEV"
       fi
       mkdir -p /mnt/sandbox-data
       mountpoint -q /mnt/sandbox-data || mount -t xfs -o noatime,discard "$DEV" /mnt/sandbox-data
-      grep -q 'google-superserve-sandbox-data' /etc/fstab || \
-        echo "$DEV /mnt/sandbox-data xfs noatime,discard,nofail 0 2" >> /etc/fstab
+      SH
+      chmod 0755 /usr/local/bin/sandbox-data-mount
+      cat > /etc/systemd/system/sandbox-data.service <<UNIT
+      [Unit]
+      Description=Mount the sandbox background-data disk
+      BindsTo=$${DEVUNIT}
+      After=$${DEVUNIT}
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/sandbox-data-mount
+      [Install]
+      WantedBy=$${DEVUNIT}
+      UNIT
+      # vmd keeps its backup journal on that disk, so it must not start
+      # without it.
+      mkdir -p /etc/systemd/system/superserve-vmd.service.d
+      printf '[Unit]\nRequires=sandbox-data.service\nAfter=sandbox-data.service\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/sandbox-data.conf
 
       # Runtime flags this cell's hosts run with. Set here so both hosts
       # launch and track VMs the same way.
-      mkdir -p /etc/systemd/system/superserve-vmd.service.d
       printf '[Service]\nEnvironment=VMD_DIRTY_TRACKING_SESSION=true\n' \
         > /etc/systemd/system/superserve-vmd.service.d/dirty-session.conf
       printf '[Service]\nEnvironment=VMD_LAUNCH_VIA_LAUNCHER_NS=true\n' \
@@ -446,19 +480,19 @@ module "sandbox_host_b" {
         > /etc/systemd/system/superserve-vmd.service.d/sdbus.conf
       printf '[Service]\nEnvironment=VMD_RECYCLE_TAP_RESET=true\n' \
         > /etc/systemd/system/superserve-vmd.service.d/tap-reset.conf
+
       systemctl daemon-reload
+      systemctl enable sandbox-data.service
+      systemctl start --no-block sandbox-data.service
 
       modprobe kvm
       modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null || true
       chmod 0666 /dev/kvm 2>/dev/null || true
       sysctl -w net.ipv4.ip_forward=1
 
-      # Best effort: per-host files that arrive with the first deploy may
-      # not be present yet, and the deploy (re)starts vmd once they are. A
-      # failure here must not fail the boot.
-      systemctl start superserve-vmd || true
-
-      echo "=== Superserve VMD started ==="
+      # vmd is deliberately not started here. The first deploy installs the
+      # current units and env, and starts it under the pinned identity.
+      echo "=== host prepared; vmd starts with the first deploy ==="
     EOT
   }
 }
