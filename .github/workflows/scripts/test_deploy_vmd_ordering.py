@@ -51,6 +51,19 @@ class DeployVmdOrderingTests(unittest.TestCase):
             "also stop superserve-vmd.socket",
         )
 
+
+    def test_ssh_key_created_before_parallel_fanout(self):
+        # Per-host deploys run in parallel, and each `gcloud compute scp`
+        # generates the runner's SSH key if it is missing. Two hosts starting
+        # together race ssh-keygen and one fails before uploading anything.
+        # The key must exist before the pool starts, created locally so no
+        # single host's reachability gates the others.
+        keygen = SOURCE.find('"ssh-keygen", "-q"')
+        pool = SOURCE.find("ThreadPoolExecutor(max_workers=len(instances))")
+        self.assertNotEqual(keygen, -1, "local ssh-keygen priming is missing")
+        self.assertNotEqual(pool, -1, "parallel fan-out is missing")
+        self.assertLess(keygen, pool, "ssh key must exist before the parallel fan-out")
+
     def test_steady_state_stop_is_guarded_and_stops_both(self):
         # The steady-state early stop runs ONLY on a fresh socket migration
         # (socket inactive) or a socket-definition change, and stops BOTH units.
