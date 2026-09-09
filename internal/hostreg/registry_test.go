@@ -738,8 +738,9 @@ func TestMarkVerifiedRenewsLeaseWithoutRead(t *testing.T) {
 	}
 }
 
-// With no client yet, MarkVerified dials the reported address up front — no
-// row read of its own — so the first dispatch finds a verified client.
+// With no client yet, MarkVerified resolves up front — one row read, since a
+// reported address is never dialed unread — so the first dispatch finds a
+// verified client without reading again.
 func TestMarkVerifiedColdResolvesOnce(t *testing.T) {
 	store := &hostDB{addr: "10.0.0.1:50051"}
 	var dials atomic.Int64
@@ -753,8 +754,8 @@ func TestMarkVerifiedColdResolvesOnce(t *testing.T) {
 	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
 		t.Fatalf("ClientFor: %v", err)
 	}
-	if n := store.readCount(); n != 0 {
-		t.Fatalf("reads = %d, want 0 (the caller's read is the verification)", n)
+	if n := store.readCount(); n != 1 {
+		t.Fatalf("reads = %d, want 1 (the registry's own read; the report is not dialed unread)", n)
 	}
 	if dials.Load() != 1 {
 		t.Fatalf("dials = %d, want 1", dials.Load())
@@ -820,7 +821,7 @@ func TestMarkVerifiedMovedAddressRedials(t *testing.T) {
 		t.Fatalf("dialed = %v, want %v", dialed, want)
 	}
 	if n := store.readCount(); n != 2 {
-		t.Fatalf("reads = %d, want 2 (prime, and the move confirmed by a read)", n)
+		t.Fatalf("reads = %d, want 2 (prime, and the move read before dialing)", n)
 	}
 }
 
@@ -1398,16 +1399,16 @@ func TestSequentialConflictingReportsAreConfirmedByARead(t *testing.T) {
 	}
 	r := New(db.New(store), dial)
 
-	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a")) // cold: dialed from the report
-	if n := store.readCount(); n != 0 {
-		t.Fatalf("reads after the cold report = %d, want 0", n)
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a")) // cold: read, then dialed
+	if n := store.readCount(); n != 1 {
+		t.Fatalf("reads after the cold report = %d, want 1", n)
 	}
 	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // stale, out of order
 	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
 		t.Fatalf("after the stale report settled = %q, want .2 confirmed by the row", settled)
 	}
-	if n := store.readCount(); n != 1 {
-		t.Fatalf("reads after the stale report = %d, want 1 (the confirmation)", n)
+	if n := store.readCount(); n != 2 {
+		t.Fatalf("reads after the stale report = %d, want 2 (the confirmation)", n)
 	}
 	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // stale again
 	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
