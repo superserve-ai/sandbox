@@ -828,3 +828,32 @@ func TestExpiredSetsRefreshIndependently(t *testing.T) {
 		t.Fatalf("nil set = %q after its refresh, want host-3", id)
 	}
 }
+
+// Serving a set before its TTL lapses must not claim the refresh slot: the
+// set has to refresh once it does expire.
+func TestFreshHitDoesNotBlockLaterRefresh(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	for i := 0; i < 3; i++ { // query 1 primes; the rest are fresh hits
+		if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
+			t.Fatalf("select %d: %v", i, err)
+		}
+	}
+	if refreshInFlight(s) {
+		t.Fatal("a fresh hit left a refresh marker behind")
+	}
+	setCachedAtForTest(t, s, nil, time.Now().Add(-2*time.Minute))
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil { // stale serve; refresh (query 2) behind
+		t.Fatalf("stale select: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if id, _, _ := readCacheForTest(s, nil); id == "host-2" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expired set never refreshed, calls=%d", store.calls.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}

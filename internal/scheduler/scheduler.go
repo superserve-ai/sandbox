@@ -163,7 +163,7 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 		cached = false
 	}
 	if cached {
-		if _, busy := s.refreshing.LoadOrStore(key, struct{}{}); time.Since(entry.cachedAt) >= s.ttl() && !busy {
+		if time.Since(entry.cachedAt) >= s.ttl() && s.claimRefresh(key) {
 			// Detached: the refresh outlives the triggering request. On error the
 			// stale set stays servable and the next expired call retries.
 			qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostsFillTimeout)
@@ -205,6 +205,12 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	case <-ctx.Done():
 		return hostCacheEntry{}, ctx.Err()
 	}
+}
+
+// claimRefresh reserves the refresh slot for key; false if one is running.
+func (s *LeastLoaded) claimRefresh(key string) bool {
+	_, busy := s.refreshing.LoadOrStore(key, struct{}{})
+	return !busy
 }
 
 // publish caches fresh for key under a new generation, unless it is stale:
