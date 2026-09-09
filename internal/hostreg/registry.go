@@ -185,6 +185,10 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 	return r.resolveFrom(ctx, hostID, "", 0)
 }
 
+// ResolveTimeout bounds one host resolution (row read and dial). A caller
+// that waits on one budgets it separately from its own work.
+const ResolveTimeout = 2 * time.Second
+
 // Generation is the host's current invalidation generation; a caller
 // captures it before reading the host row and hands it to MarkVerified.
 func (r *Registry) Generation(hostID string) uint64 {
@@ -205,7 +209,7 @@ func (r *Registry) resolveFrom(ctx context.Context, hostID, knownAddr string, kn
 		// Detached context: singleflight followers share the leader's
 		// result, so the leader's per-request cancellation must not decide
 		// the resolution for everyone behind it.
-		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ResolveTimeout)
 		defer cancel()
 
 		// One observation per executed flight: kind fixed at flight start,

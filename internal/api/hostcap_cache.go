@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/hostreg"
 )
 
 // hostCapQueryTimeout bounds every capability lookup, cached-miss and
@@ -131,9 +132,7 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 	c := &h.hostCaps
 	ch := c.group.DoChan(key, func() (interface{}, error) {
 		start := time.Now()
-		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostCapQueryTimeout)
-		defer cancel()
-		has, err := h.readHostCaps(qctx, params)
+		has, err := h.readHostCaps(context.WithoutCancel(ctx), params)
 		switch {
 		case err != nil:
 		case has:
@@ -154,21 +153,26 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 	}
 }
 
-// readHostCaps performs the pre-flight read and, on an affirmative answer,
-// records the address it returned with the host registry. A registry
-// resolution failure fails the pre-flight, so the create does not repeat
-// that lookup at dispatch.
+// readHostCaps performs the pre-flight read under hostCapQueryTimeout and,
+// on an affirmative answer, records the address it returned with the host
+// registry under the registry's own bound, so a read that used most of its
+// budget cannot starve the resolution wait. A resolution failure fails the
+// pre-flight, so the create does not repeat that lookup at dispatch.
 func (h *Handlers) readHostCaps(ctx context.Context, params db.HostHasCapabilitiesUnlockedParams) (bool, error) {
 	var gen uint64
 	if h.Hosts != nil {
 		gen = h.Hosts.Generation(params.HostID) // before the read, so a reclaim during it is caught
 	}
-	row, err := h.DB.HostHasCapabilitiesUnlocked(ctx, params)
+	qctx, cancel := context.WithTimeout(ctx, hostCapQueryTimeout)
+	row, err := h.DB.HostHasCapabilitiesUnlocked(qctx, params)
+	cancel()
 	if err != nil {
 		return false, err
 	}
 	if row.HasCapabilities && h.Hosts != nil {
-		if err := h.Hosts.MarkVerified(ctx, params.HostID, row.VmdAddr, gen); err != nil {
+		rctx, cancel := context.WithTimeout(ctx, hostreg.ResolveTimeout)
+		defer cancel()
+		if err := h.Hosts.MarkVerified(rctx, params.HostID, row.VmdAddr, gen); err != nil {
 			return false, err
 		}
 	}
@@ -180,13 +184,7 @@ func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string,
 	c.init()
 	params := db.HostHasCapabilitiesUnlockedParams{HostID: hostID, RequiredCapabilities: capabilities}
 	if c.ttl <= 0 {
-		// Same bound as the cached fetch: this lookup sits between scheduler
-		// admission and the bounded boot work, and ops tooling (hostctl
-		// --wait) budgets a fixed post-admission margin for it — an
-		// unbounded read here would silently break that arithmetic.
-		qctx, cancel := context.WithTimeout(ctx, hostCapQueryTimeout)
-		defer cancel()
-		return h.readHostCaps(qctx, params)
+		return h.readHostCaps(ctx, params)
 	}
 	sorted := append([]string(nil), capabilities...)
 	sort.Strings(sorted)

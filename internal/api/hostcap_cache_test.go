@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/hostreg"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -33,9 +34,10 @@ func capMockHandlers(reads *atomic.Int64, answer *atomic.Bool) *Handlers {
 }
 
 type verifyRecorder struct {
-	mu       sync.Mutex
-	verified []string
-	err      error // returned by every MarkVerified
+	mu        sync.Mutex
+	verified  []string
+	remaining time.Duration // budget left on the last MarkVerified's context
+	err       error         // returned by every MarkVerified
 }
 
 func (v *verifyRecorder) ClientFor(context.Context, string) (vmdclient.Client, error) {
@@ -43,11 +45,32 @@ func (v *verifyRecorder) ClientFor(context.Context, string) (vmdclient.Client, e
 }
 func (v *verifyRecorder) Invalidate(string)        {}
 func (v *verifyRecorder) Generation(string) uint64 { return 0 }
-func (v *verifyRecorder) MarkVerified(_ context.Context, hostID, addr string, _ uint64) error {
+func (v *verifyRecorder) MarkVerified(ctx context.Context, hostID, addr string, _ uint64) error {
 	v.mu.Lock()
 	v.verified = append(v.verified, hostID+"="+addr)
+	if deadline, ok := ctx.Deadline(); ok {
+		v.remaining = time.Until(deadline)
+	}
 	v.mu.Unlock()
 	return v.err
+}
+
+// The registry wait gets the registry's own budget, not what is left of the
+// capability query's, so a read that ran long cannot starve the resolution.
+func TestHostCapReadGivesRegistryItsOwnBudget(t *testing.T) {
+	var reads atomic.Int64
+	var answer atomic.Bool
+	answer.Store(true)
+	h := capMockHandlers(&reads, &answer)
+	reg := &verifyRecorder{}
+	h.Hosts = reg
+
+	if ok, err := h.hostHasCapabilitiesCached(context.Background(), "host-a", []string{"preview_ports_v1"}); err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if got := reg.remaining; got <= hostreg.ResolveTimeout-time.Second || got > hostreg.ResolveTimeout {
+		t.Fatalf("registry wait budget = %v, want about %v", got, hostreg.ResolveTimeout)
+	}
 }
 
 // A registry resolution that fails during the pre-flight fails the
