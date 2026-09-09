@@ -1710,14 +1710,6 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			}
 		}()
 	}
-	if !guestFrozen {
-		for _, candidate := range []string{overlayPath, fullPath} {
-			if merr := os.Remove(clockFreezeMarkerPath(candidate)); merr != nil && !os.IsNotExist(merr) {
-				return "", "", nil, m.handleVMError(vmID, fmt.Errorf(
-					"clear stale wall-clock marker for %q: %w", candidate, merr))
-			}
-		}
-	}
 	layered := m.cfg.IncrementalSnapshotEnabled && dirtyTracked && instBaseMem != "" &&
 		(instMemFile == instBaseMem || overlayPath == instMemFile)
 	baseMemPath := ""
@@ -1857,13 +1849,18 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		}
 	}
 
-	// The manifest lands only after the image exists; the stale one was cleared
-	// before. A frozen image's manifest is mandatory and durable: an overlay
-	// that lost it would read as legacy on another host and its workload would
-	// never be woken, so the deferred thaw releases the guest on this failure.
-	// An unfrozen image's manifest only spares the next resume a slower path,
-	// so it is written without durability barriers and a failure is logged:
-	// nothing on the ordinary pause path waits on a sync for it.
+	// The manifest lands only after the image exists, and only beside the
+	// image this pause wrote: the manifest of an image it did not touch keeps
+	// describing that image, which is still the last good one if this pause
+	// failed or died before here. A frozen image's manifest is mandatory and
+	// durable: an overlay that lost it would read as legacy on another host
+	// and its workload would never be woken, so the deferred thaw releases
+	// the guest on this failure. An unfrozen image's manifest only spares the
+	// next resume a slower path, so it is written without durability barriers
+	// and a failure is logged: nothing on the ordinary pause path waits on a
+	// sync for it. A guest that cannot correct its clock gets no manifest, so
+	// one an earlier image left at this path is removed: a stale frozen one
+	// beside this unfrozen image would send a wake nothing answers.
 	if correctsWallClock {
 		man := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: artifactID, WorkloadFrozen: guestFrozen, GuestCorrectsClock: true}
 		if guestFrozen {
@@ -1875,6 +1872,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			log.Warn().Err(merr).Str("path", WallClockMarkerPath(memPath)).
 				Msg("pause: wall-clock manifest write failed; resume falls back to legacy clock behaviour")
 		}
+	} else if merr := os.Remove(clockFreezeMarkerPath(memPath)); merr != nil && !os.IsNotExist(merr) {
+		return "", "", nil, m.handleVMError(vmID, fmt.Errorf("clear stale wall-clock manifest for %q: %w", memPath, merr))
 	}
 
 	snapshotOK = true

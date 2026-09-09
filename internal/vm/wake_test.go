@@ -1910,3 +1910,49 @@ func TestFreezeRequestKeepsAPositiveGuestBudget(t *testing.T) {
 		t.Fatalf("guest budget %dms, want positive and below the caller's 100ms", seen)
 	}
 }
+
+// A pause that will not freeze leaves the manifest of the last good image in
+// place until its own snapshot has replaced that image: a pause that fails
+// first must not turn a frozen image into one a restore reads as legacy.
+func TestUnfrozenPauseKeepsTheOldManifestUntilItsSnapshotLands(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false }
+	t.Cleanup(func() { vmUnitFullyDown = origDown })
+
+	fail := true
+	fc := startSnapshotAPIFake(t, func(_, _ string) (int, string) {
+		if fail {
+			return http.StatusInternalServerError, `{"fault_message":"disk full"}`
+		}
+		return http.StatusNoContent, ""
+	})
+	dir := t.TempDir()
+	vmDir := filepath.Join(dir, "vm-1")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	memSnap := filepath.Join(vmDir, "mem.snap")
+	if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The image this VM was resumed from holds a frozen workload.
+	seedFrozenManifest(t, memSnap, "A")
+	corrects := false
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects}
+	m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
+		t.Fatal("want the snapshot failure")
+	}
+	if man, err := ReadWallClockManifest(memSnap); err != nil || man == nil || !man.WorkloadFrozen {
+		t.Fatalf("manifest=%+v err=%v; the last good image's manifest must survive a failed pause", man, err)
+	}
+
+	fail = false
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	if man, err := ReadWallClockManifest(memSnap); err != nil || man != nil {
+		t.Fatalf("manifest=%+v err=%v; the replaced image is unfrozen and must carry no manifest", man, err)
+	}
+}
