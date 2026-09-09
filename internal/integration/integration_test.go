@@ -295,6 +295,7 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 // values so that HTTP handlers can complete and write to the DB.
 type stubVMD struct {
 	updatePreviewFn func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
+	updateNetworkFn func(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 }
 
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
@@ -313,7 +314,10 @@ func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]str
 func (s *stubVMD) ListDir(_ context.Context, _, _ string) ([]vmdclient.DirEntry, error) {
 	return nil, nil
 }
-func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error {
+	if s.updateNetworkFn != nil {
+		return s.updateNetworkFn(ctx, instanceID, allowedCIDRs, deniedCIDRs, allowedDomains)
+	}
 	return nil
 }
 
