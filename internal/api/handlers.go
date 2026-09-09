@@ -127,9 +127,8 @@ type Scheduler interface {
 	// Reject drops the candidate set gen (the one a SelectHost returned
 	// hostID from) if it is still cached and still names hostID, which its
 	// pre-flight has just refused; a set loaded since, and other capability
-	// sets, are kept. Reports whether anything was dropped, i.e. whether the
-	// next SelectHost is a fresh load.
-	Reject(hostID string, requiredCapabilities []string, gen uint64) bool
+	// sets, are kept.
+	Reject(hostID string, requiredCapabilities []string, gen uint64)
 }
 
 // HostRegistry resolves a host ID to a VMD client.
@@ -2144,15 +2143,16 @@ func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (h
 	eligible, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
 	if err == nil && !eligible && h.Scheduler != nil {
 		log.Warn().Str("host_id", hostID).Msg("scheduled host failed the pre-flight; selecting again without it")
-		rejected := hostID
-		reloaded := h.Scheduler.Reject(hostID, requiredCapabilities, gen)
-		if hostID, _, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
+		rejected, rejectedGen := hostID, gen
+		h.Scheduler.Reject(hostID, requiredCapabilities, gen)
+		if hostID, gen, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
 			return "", false
 		}
-		// The same host from an unchanged set (the default-host fallback)
-		// can only repeat the answer just given; the same host from a fresh
-		// load may have regained eligibility and is checked again.
-		if hostID != rejected || reloaded {
+		// The same host from the same set (the default-host fallback) can
+		// only repeat the answer just given; the same host from a different
+		// set — whoever loaded it — may have regained eligibility and is
+		// checked again.
+		if hostID != rejected || gen != rejectedGen {
 			SetTelemetryHostID(c, hostID)
 			eligible, err = h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
 		}

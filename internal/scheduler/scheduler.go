@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -48,10 +49,12 @@ type LeastLoaded struct {
 	DefaultHostID string        // fallback when no host rows exist
 	TTL           time.Duration // 0 = use defaultCacheTTL
 
-	mu         sync.RWMutex
-	cache      map[string]hostCacheEntry
-	gen        uint64      // bumped by Invalidate and blocking reloads; discards refreshes that started earlier
-	refreshing atomic.Bool // one background refresh at a time across capability sets
+	mu            sync.RWMutex
+	cache         map[string]hostCacheEntry
+	gen           uint64             // stamped on every published set; a Reject carries the set's stamp
+	invalidations uint64             // bumped by Invalidate; a load begun before it is not cached
+	refreshing    atomic.Bool        // one background refresh at a time across capability sets
+	fills         singleflight.Group // one blocking fill per capability set at a time
 }
 
 type hostCacheEntry struct {
@@ -152,7 +155,7 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	key, normalized := capabilityCacheKey(requiredCapabilities)
 	s.mu.RLock()
 	entry, cached := s.cache[key]
-	startGen := s.gen
+	inv := s.invalidations
 	s.mu.RUnlock()
 
 	// An expired set with nothing to place on is reloaded in line: serving
@@ -174,44 +177,54 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 						Msg("host list refresh failed; serving stale until the grace window expires")
 					return
 				}
-				s.mu.Lock()
-				// Discard results from before the latest Invalidate or blocking
-				// reload so an older query cannot replace a newer candidate set.
-				if s.gen == startGen {
-					if s.cache == nil {
-						s.cache = make(map[string]hostCacheEntry)
-					}
-					fresh.gen = startGen
-					s.cache[key] = fresh
-				}
-				s.mu.Unlock()
+				s.publish(key, fresh, inv)
 			}()
 		}
 		return entry, nil
 	}
 
+	// Blocking load: one fill per capability set at a time, run outside the
+	// mutex, so a slow fill for one set never stalls selects for the others.
+	// The flight publishes on the leader's invalidation snapshot, the most
+	// conservative one; every waiter shares its result.
+	ch := s.fills.DoChan(key, func() (any, error) {
+		fillCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostsFillTimeout)
+		defer cancel()
+		fresh, err := s.fillEntry(fillCtx, normalized)
+		if err != nil {
+			return nil, err
+		}
+		return s.publish(key, fresh, inv), nil
+	})
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return hostCacheEntry{}, res.Err
+		}
+		return res.Val.(hostCacheEntry), nil
+	case <-ctx.Done():
+		return hostCacheEntry{}, ctx.Err()
+	}
+}
+
+// publish caches fresh for key under a new generation, unless an Invalidate
+// landed after the load began (invalidations moved past inv): a set read
+// before an invalidation may be what it invalidated, so it is served to the
+// request that loaded it but not cached. Returns the entry as it should be
+// served, stamped only if cached.
+func (s *LeastLoaded) publish(key string, fresh hostCacheEntry, inv uint64) hostCacheEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Double-check: another blocked caller may have loaded this capability
-	// set while we waited; an expired unplaceable one is what we replace.
-	if entry, ok := s.cache[key]; ok && !(time.Since(entry.cachedAt) >= s.ttl() && s.cannotPlace(entry)) {
-		return entry, nil
+	if s.invalidations != inv {
+		return fresh
 	}
-	fillCtx, fillCancel := context.WithTimeout(ctx, hostsFillTimeout)
-	fresh, err := s.fillEntry(fillCtx, normalized)
-	fillCancel()
-	if err != nil {
-		return hostCacheEntry{}, err
-	}
-	// Bump the generation so any older in-flight background refresh cannot
-	// land after this blocking load and replace it with an earlier snapshot.
 	s.gen++
+	fresh.gen = s.gen
 	if s.cache == nil {
 		s.cache = make(map[string]hostCacheEntry)
 	}
-	fresh.gen = s.gen
 	s.cache[key] = fresh
-	return fresh, nil
+	return fresh
 }
 
 // cannotPlace reports whether this entry has no candidates. An empty set is
@@ -247,18 +260,14 @@ func capabilityCacheKey(capabilities []string) (string, []string) {
 // evidence, and the host is re-attested from it — so a burst of creates
 // that all drew the same stale host reloads once, not once per create.
 // Other capability sets are untouched, and a default-host fallback is never
-// reloaded for this, see names. Reports whether a set was dropped, i.e.
-// whether the next SelectHost loads fresh.
-func (s *LeastLoaded) Reject(hostID string, requiredCapabilities []string, gen uint64) bool {
+// reloaded for this, see names.
+func (s *LeastLoaded) Reject(hostID string, requiredCapabilities []string, gen uint64) {
 	key, _ := capabilityCacheKey(requiredCapabilities)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entry, ok := s.cache[key]; ok && entry.gen == gen && s.names(entry, hostID) {
 		delete(s.cache, key)
-		s.gen++
-		return true
 	}
-	return false
 }
 
 // names reports whether this entry's candidate set lists hostID. The
@@ -276,7 +285,7 @@ func (s *LeastLoaded) names(e hostCacheEntry, hostID string) bool {
 
 func (s *LeastLoaded) Invalidate() {
 	s.mu.Lock()
-	s.gen++
+	s.invalidations++
 	s.cache = nil
 	s.mu.Unlock()
 }

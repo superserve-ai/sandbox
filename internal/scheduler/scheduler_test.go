@@ -526,15 +526,11 @@ func TestRejectDropsOnlySetsStillNamingTheHost(t *testing.T) {
 	if err != nil || id != "host-1" {
 		t.Fatalf("prime = (%q, %v)", id, err)
 	}
-	if !s.Reject("host-1", nil, gen) {
-		t.Fatal("rejecting the cached host must drop its set")
-	}
+	s.Reject("host-1", nil, gen)
 	if id, _, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" {
 		t.Fatalf("after reject = (%q, %v), want host-2 from a fresh load", id, err)
 	}
-	if s.Reject("host-1", nil, gen) { // a late waiter with the old set: no-op
-		t.Fatal("a rejection carrying a superseded generation must not drop the fresh set")
-	}
+	s.Reject("host-1", nil, gen) // a late waiter with the old set: no-op
 	if id, _, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" {
 		t.Fatalf("after stale reject = (%q, %v), want the cached host-2", id, err)
 	}
@@ -599,21 +595,94 @@ func TestRejectWithSupersededGenerationKeepsTheFreshSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prime: %v", err)
 	}
-	if !s.Reject("host-1", nil, oldGen) { // the first waiter drops the set
-		t.Fatal("first rejection must drop the set")
-	}
+	s.Reject("host-1", nil, oldGen)                                                          // the first waiter drops the set
 	if id, _, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-1" { // query 2: fresh, lists host-1 again
 		t.Fatalf("reload = (%q, %v)", id, err)
 	}
 	for i := 0; i < 5; i++ { // the other waiters, still holding the old generation
-		if s.Reject("host-1", nil, oldGen) {
-			t.Fatalf("waiter %d evicted the fresh set with a superseded generation", i)
-		}
+		s.Reject("host-1", nil, oldGen)
 	}
 	if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("select after stale rejections: %v", err)
 	}
 	if n := store.calls.Load(); n != 2 {
 		t.Fatalf("queries = %d, want 2 (one reload for the burst)", n)
+	}
+}
+
+// A blocking fill for one capability set runs outside the scheduler mutex:
+// while it is stuck on a slow query, selects for another set that is cached
+// and usable must not wait behind it.
+func TestBlockingFillDoesNotBlockOtherCapabilitySets(t *testing.T) {
+	store := &hostStore{emptyUntilCall: 1}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	setA, setB := []string{"a"}, []string{"b"}
+	if _, _, err := s.SelectHost(context.Background(), setA); err == nil { // query 1: empty, no host
+		t.Fatal("prime A: expected no hosts")
+	}
+	if id, _, err := s.SelectHost(context.Background(), setB); err != nil || id != "host-2" { // query 2
+		t.Fatalf("prime B = (%q, %v)", id, err)
+	}
+	setCachedAtForTest(t, s, setA, time.Now().Add(-2*time.Minute)) // A: expired and empty → in-line reload
+	store.block = make(chan struct{})
+	store.blockOnCall = 3 // hold A's reload
+	aDone := make(chan error, 1)
+	go func() {
+		_, _, err := s.SelectHost(context.Background(), setA)
+		aDone <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.calls.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("A's reload never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	bDone := make(chan string, 1)
+	go func() {
+		id, _, _ := s.SelectHost(context.Background(), setB)
+		bDone <- id
+	}()
+	select {
+	case id := <-bDone:
+		if id != "host-2" {
+			t.Fatalf("B during A's reload = %q, want the cached host-2", id)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a select for B blocked behind A's reload")
+	}
+	close(store.block)
+	if err := <-aDone; err != nil {
+		t.Fatalf("A after reload: %v", err)
+	}
+}
+
+// A background refresh publishes under a new generation: a rejection that
+// carries the stale set's generation cannot evict the refreshed set.
+func TestBackgroundRefreshPublishesANewGeneration(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	_, oldGen, err := s.SelectHost(context.Background(), nil) // query 1: host-1
+	if err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	setCachedAtForTest(t, s, nil, time.Now().Add(-2*time.Minute))
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil { // stale serve, refresh behind
+		t.Fatalf("stale select: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for s.refreshing.Load() || store.calls.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("refresh never landed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	s.Reject("host-1", nil, oldGen) // a late negative result from the old set
+	if id, gen, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" || gen == oldGen {
+		t.Fatalf("after stale reject = (%q, gen %d, %v), want the refreshed host-2 under a new generation", id, gen, err)
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("queries = %d, want 2 (the refreshed set must survive the stale rejection)", n)
 	}
 }

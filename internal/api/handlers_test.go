@@ -61,15 +61,18 @@ type stubScheduler struct {
 	selects  int
 	drops    int
 	rejected []string
-	// rejectDrops is what Reject reports: true means the next SelectHost is
-	// a fresh load, false the unchanged default-host fallback.
-	rejectDrops bool
+	// sameSet makes every selection come from one unchanged set, as the
+	// default-host fallback does; otherwise each is its own fresh set.
+	sameSet bool
 }
 
 func (s *stubScheduler) SelectHost(_ context.Context, required []string) (string, uint64, error) {
 	s.required = append([]string(nil), required...)
 	s.selects++
 	gen := uint64(s.selects) // each selection reads as its own candidate set
+	if s.sameSet {
+		gen = 0 // the unchanged default-host fallback
+	}
 	if len(s.hosts) > 0 {
 		id := s.hosts[0]
 		s.hosts = s.hosts[1:]
@@ -79,10 +82,9 @@ func (s *stubScheduler) SelectHost(_ context.Context, required []string) (string
 }
 
 func (s *stubScheduler) Invalidate() { s.drops++ }
-func (s *stubScheduler) Reject(hostID string, _ []string, _ uint64) bool {
+func (s *stubScheduler) Reject(hostID string, _ []string, _ uint64) {
 	s.drops++
 	s.rejected = append(s.rejected, hostID)
-	return s.rejectDrops
 }
 
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
@@ -2431,7 +2433,7 @@ func TestCreateSandbox_PrivateUsesBrowserCapablePlacementAndAttestation(t *testi
 
 func TestCreateSandbox_RechecksCapabilitiesAfterSchedulerSelection(t *testing.T) {
 	teamID := uuid.New()
-	scheduler := &stubScheduler{hostID: "rolled-back-host", rejectDrops: true}
+	scheduler := &stubScheduler{hostID: "rolled-back-host"}
 	var inserted, restored bool
 	var checks int
 	mock := &mockDBTX{
@@ -4305,7 +4307,7 @@ func TestPlaceCreateChecksCapabilitiesOncePerHost(t *testing.T) {
 // default-host fallback does this by design — the pre-flight is not run a
 // second time: the answer cannot change, and the create fails on the first.
 func TestPlaceCreateDoesNotRecheckAnUnchangedReselection(t *testing.T) {
-	scheduler := &stubScheduler{hostID: "only-host"}
+	scheduler := &stubScheduler{hostID: "only-host", sameSet: true}
 	reads := 0
 	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 		if strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
@@ -4396,7 +4398,7 @@ func TestResumeSandbox_CapabilityRefusalRevertsWithoutReachingDaemon(t *testing.
 // between the first pre-flight and the reload, so it is checked again and,
 // if it now passes, the create proceeds on it.
 func TestPlaceCreateRechecksTheSameHostAfterAFreshLoad(t *testing.T) {
-	scheduler := &stubScheduler{hostID: "flapping-host", rejectDrops: true}
+	scheduler := &stubScheduler{hostID: "flapping-host"}
 	reads := 0
 	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 		if !strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
