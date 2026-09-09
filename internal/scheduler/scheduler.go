@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -53,7 +52,7 @@ type LeastLoaded struct {
 	cache         map[string]hostCacheEntry
 	gen           uint64             // stamped on every published set; a Reject carries the set's stamp
 	invalidations uint64             // bumped by Invalidate; a load begun before it is not cached
-	refreshing    atomic.Bool        // one background refresh at a time across capability sets
+	refreshing    sync.Map           // capability keys with a background refresh in flight
 	fills         singleflight.Group // one blocking fill per capability set at a time
 }
 
@@ -164,17 +163,17 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 		cached = false
 	}
 	if cached {
-		if time.Since(entry.cachedAt) >= s.ttl() && s.refreshing.CompareAndSwap(false, true) {
+		if _, busy := s.refreshing.LoadOrStore(key, struct{}{}); time.Since(entry.cachedAt) >= s.ttl() && !busy {
 			// Detached: the refresh outlives the triggering request. On error the
 			// stale set stays servable and the next expired call retries.
 			qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostsFillTimeout)
 			go func() {
 				defer cancel()
-				defer s.refreshing.Store(false)
+				defer s.refreshing.Delete(key)
 				fresh, err := s.fillEntry(qctx, normalized)
 				if err != nil {
 					log.Warn().Err(err).Strs("required_capabilities", normalized).
-						Msg("host list refresh failed; serving stale until the grace window expires")
+						Msg("host list refresh failed; serving stale, the next expired call retries")
 					return
 				}
 				s.publish(key, fresh, inv, entry.gen)

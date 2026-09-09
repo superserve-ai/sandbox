@@ -256,6 +256,14 @@ func setCachedAtForTest(t *testing.T, s *LeastLoaded, capabilities []string, at 
 	s.cache[key] = entry
 }
 
+// refreshInFlight reports whether any capability set has a background
+// refresh running.
+func refreshInFlight(s *LeastLoaded) bool {
+	busy := false
+	s.refreshing.Range(func(_, _ any) bool { busy = true; return false })
+	return busy
+}
+
 func readCacheForTest(s *LeastLoaded, capabilities []string) (hostID string, cachedAt time.Time, ok bool) {
 	key, _ := capabilityCacheKey(capabilities)
 	s.mu.RLock()
@@ -395,7 +403,7 @@ func TestInvalidateBeatsInFlightRefresh(t *testing.T) {
 	deadline = time.Now().Add(2 * time.Second)
 	for {
 		_, _, resurrected := readCacheForTest(s, nil)
-		if !resurrected && !s.refreshing.Load() {
+		if !resurrected && !refreshInFlight(s) {
 			break // refresh finished and stored nothing
 		}
 		if resurrected {
@@ -439,7 +447,7 @@ func TestLoadHostsAnyAgeServesStaleAndRefreshesBehind(t *testing.T) {
 	close(store.block)
 
 	deadline := time.Now().Add(2 * time.Second)
-	for s.refreshing.Load() || store.calls.Load() < 2 {
+	for refreshInFlight(s) || store.calls.Load() < 2 {
 		if time.Now().After(deadline) {
 			t.Fatalf("background refresh never landed, calls=%d", store.calls.Load())
 		}
@@ -481,7 +489,7 @@ func TestBlockingReloadNotClobberedBySlowRefresh(t *testing.T) {
 	close(store.block) // the pre-reload refresh now returns
 
 	deadline = time.Now().Add(2 * time.Second)
-	for s.refreshing.Load() { // wait until the refresh goroutine finished
+	for refreshInFlight(s) { // wait until the refresh goroutine finished
 		if time.Now().After(deadline) {
 			t.Fatal("refresh goroutine never finished")
 		}
@@ -672,7 +680,7 @@ func TestBackgroundRefreshPublishesANewGeneration(t *testing.T) {
 		t.Fatalf("stale select: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for s.refreshing.Load() || store.calls.Load() < 2 {
+	for refreshInFlight(s) || store.calls.Load() < 2 {
 		if time.Now().After(deadline) {
 			t.Fatal("refresh never landed")
 		}
@@ -715,7 +723,7 @@ func TestOldRefreshCannotReplaceARejectionReload(t *testing.T) {
 	}
 	close(store.block) // the older refresh now returns host-2
 	deadline = time.Now().Add(2 * time.Second)
-	for s.refreshing.Load() {
+	for refreshInFlight(s) {
 		if time.Now().After(deadline) {
 			t.Fatal("refresh never finished")
 		}
@@ -766,5 +774,57 @@ func TestFillAfterInvalidateDoesNotJoinAnOlderFlight(t *testing.T) {
 	}
 	if id, _, _ := readCacheForTest(s, nil); id != "host-2" {
 		t.Fatalf("cached = %q, want host-2 (the pre-invalidate fill must not be cached)", id)
+	}
+}
+
+// Expired capability sets refresh independently: a slow refresh of one set
+// must not keep another expired set from refreshing.
+func TestExpiredSetsRefreshIndependently(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	gpu := []string{"gpu"}
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil { // query 1: host-1
+		t.Fatalf("prime nil: %v", err)
+	}
+	if _, _, err := s.SelectHost(context.Background(), gpu); err != nil { // query 2: host-2
+		t.Fatalf("prime gpu: %v", err)
+	}
+	setCachedAtForTest(t, s, nil, time.Now().Add(-2*time.Minute))
+	setCachedAtForTest(t, s, gpu, time.Now().Add(-2*time.Minute))
+	store.block = make(chan struct{})
+	store.blockOnCall = 3                                                 // hold the nil set's refresh
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil { // stale serve; refresh (query 3) blocks
+		t.Fatalf("stale nil select: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for store.calls.Load() < 3 { // the nil refresh is now held in the DB
+		if time.Now().After(deadline) {
+			t.Fatal("nil refresh never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, _, err := s.SelectHost(context.Background(), gpu); err != nil { // must start its own refresh: query 4
+		t.Fatalf("stale gpu select: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		if id, _, _ := readCacheForTest(s, gpu); id == "host-4" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("gpu set never refreshed while the nil refresh was held, calls=%d", store.calls.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(store.block)
+	deadline = time.Now().Add(2 * time.Second)
+	for refreshInFlight(s) {
+		if time.Now().After(deadline) {
+			t.Fatal("refreshes never finished")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if id, _, _ := readCacheForTest(s, nil); id != "host-3" {
+		t.Fatalf("nil set = %q after its refresh, want host-3", id)
 	}
 }
