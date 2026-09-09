@@ -360,3 +360,57 @@ func TestTemplateWatchRunsOnlyWhenTheSwitchIsOn(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// Recognised evidence is proven durable in the background at startup, so the
+// first request that needs the floor after a restart pays nothing; a host
+// without evidence primes nothing and raises nothing.
+func TestPrimeWakeProtocolFloor(t *testing.T) {
+	t.Run("recognised_evidence_becomes_durable_off_the_request_path", func(t *testing.T) {
+		dir := t.TempDir()
+		isolateEvidence(t, dir)
+		if err := os.WriteFile(wakeProtocolEvidencePath, []byte(wakeProtocolEvidenceNote), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if !RecognizeWakeProtocolFloor() || wakeProtocolEvidenceDurable.Load() {
+			t.Fatal("precondition: seen at startup, not yet durable")
+		}
+		PrimeWakeProtocolFloor(zerolog.Nop())
+		deadline := time.Now().Add(3 * time.Second)
+		for !wakeProtocolEvidenceDurable.Load() {
+			if time.Now().After(deadline) {
+				t.Fatal("priming never proved the recognised floor durable")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		// The request path then does no work and records no phase.
+		sink := &phaseSink{}
+		m := &Manager{recorder: sink}
+		if err := m.ensureWakeFloorTimed("restore"); err != nil || sink.has("restore", "wake_floor") {
+			t.Fatalf("err=%v phases=%+v; a durable floor must cost a request nothing", err, sink.phases)
+		}
+	})
+
+	t.Run("no_evidence_primes_nothing", func(t *testing.T) {
+		dir := t.TempDir()
+		isolateEvidence(t, dir)
+		if RecognizeWakeProtocolFloor() {
+			t.Fatal("precondition: nothing to recognise")
+		}
+		PrimeWakeProtocolFloor(zerolog.Nop())
+		time.Sleep(50 * time.Millisecond)
+		if _, err := os.Stat(wakeProtocolEvidencePath); err == nil || wakeProtocolEvidenceDurable.Load() {
+			t.Fatal("priming raised a floor on a host that had none")
+		}
+	})
+
+	// A request that does have to prove the floor attributes the cost.
+	t.Run("a_request_that_proves_it_records_the_phase", func(t *testing.T) {
+		dir := t.TempDir()
+		isolateEvidence(t, dir)
+		sink := &phaseSink{}
+		m := &Manager{recorder: sink}
+		if err := m.ensureWakeFloorTimed("pause"); err != nil || !sink.has("pause", "wake_floor") {
+			t.Fatalf("err=%v phases=%+v; the fallback must be timed as its own phase", err, sink.phases)
+		}
+	})
+}

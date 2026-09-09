@@ -88,6 +88,22 @@ func RecognizeWakeProtocolFloor() bool {
 	return false
 }
 
+// PrimeWakeProtocolFloor proves recognised evidence durable in the
+// background, so the first request that acts on an image owing a wake after
+// a restart finds the floor already durable instead of paying the directory
+// sync itself. A host without evidence primes nothing: the floor is never
+// raised here, only proven.
+func PrimeWakeProtocolFloor(log zerolog.Logger) {
+	if !wakeProtocolEvidenceSeen.Load() || wakeProtocolEvidenceDurable.Load() {
+		return
+	}
+	go func() {
+		if err := ensureWakeProtocolFloor(); err != nil {
+			log.Warn().Err(err).Msg("wake-protocol floor could not be proven durable at startup; the first frozen restore will retry")
+		}
+	}()
+}
+
 // wakeProtocolFloorRaised reports what startup recognised, without I/O. A
 // pause intent is only ever written on a host whose floor is up, so on any
 // other host the checks for one are skipped, at no cost.

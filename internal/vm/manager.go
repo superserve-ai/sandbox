@@ -1666,7 +1666,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	willFreeze := correctsWallClock && m.cfg.GuestClockFreezeEnabled && m.clockRealtimeCapable.Load() && !m.guestClockUnready.Load()
 	if willFreeze {
 		tFreeze = time.Now()
-		if err := ensureWakeProtocolFloor(); err != nil {
+		if err := m.ensureWakeFloorTimed("pause"); err != nil {
 			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record the rollback floor before freezing: %w", err))
 		}
 	}
@@ -2333,7 +2333,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	if resumeWorkloadFrozen {
 		// The floor rises before this host acts on an image that owes a wake,
 		// or a rollback could later meet the image with nothing to witness it.
-		if err := ensureWakeProtocolFloor(); err != nil {
+		if err := m.ensureWakeFloorTimed("resume"); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "image %q owes a wake and the rollback floor could not be recorded on this host: %v", memPath, err)
 		}
 	}
@@ -3412,7 +3412,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if restoreWorkloadFrozen {
 		// The floor rises before this host acts on an image that owes a wake,
 		// or a rollback could later meet the image with nothing to witness it.
-		if err := ensureWakeProtocolFloor(); err != nil {
+		if err := m.ensureWakeFloorTimed("restore"); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "image %q owes a wake and the rollback floor could not be recorded on this host: %v", memPath, err)
 		}
 	}
@@ -8329,6 +8329,20 @@ func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string, inst *VM
 // inst.mu.
 func (inst *VMInstance) dropWakeImage() {
 	inst.WakeToken, inst.WakeSnapshotPath, inst.WakeMemPath = "", "", ""
+}
+
+// ensureWakeFloorTimed is ensureWakeProtocolFloor on a request path: free
+// once the floor is durable, which startup priming normally makes it before
+// any request; when a request does have to prove it, the time it spent is
+// attributed to the operation as its own phase rather than hidden in it.
+func (m *Manager) ensureWakeFloorTimed(op string) error {
+	if wakeProtocolEvidenceDurable.Load() {
+		return nil
+	}
+	t := time.Now()
+	err := ensureWakeProtocolFloor()
+	m.recordPhases(op, "", map[string]time.Duration{"wake_floor": time.Since(t)})
+	return err
 }
 
 // releaseFrozenGuest thaws a workload a pause froze, after making sure the

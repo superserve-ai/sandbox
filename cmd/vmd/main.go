@@ -1576,6 +1576,7 @@ func main() {
 	// Evidence a previous process made durable is recognised; starting a vmd
 	// creates none.
 	vm.RecognizeWakeProtocolFloor()
+	vm.PrimeWakeProtocolFloor(log)
 	mgr.WatchTemplateManifests(ctx, log)
 
 	// ---- Background full reattach ----
