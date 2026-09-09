@@ -364,6 +364,193 @@ module "sandbox_host" {
   }
 }
 
+# Second vmd host for the staging cell. Same image and shape as the first so
+# the two are interchangeable, and labeled component=vmd from creation so
+# every deploy that discovers hosts by label reaches both.
+#
+# The host self-registers as provisioning and stays invisible to placement
+# until an operator activates it, so creating it changes nothing for the cell
+# until that deliberate step.
+module "sandbox_host_b" {
+  source = "../../../modules/sandbox-host"
+
+  project_id    = local.project_id
+  environment   = local.environment
+  region        = local.region
+  zone          = local.zone
+  instance_name = "superserve-vmd-staging-2"
+  machine_type  = "n2-standard-32"
+
+  subnet      = "projects/rayai-dev/regions/us-central1/subnetworks/superserve-subnet-05cb005"
+  internal_ip = "10.0.0.3"
+  tags        = ["superserve-vmd"]
+
+  labels = merge(local.sandbox_host_labels, {
+    component    = "vmd"
+    sandbox_role = "vmd"
+  })
+
+  service_account_email = module.iam.service_account_emails["superserve_api"]
+  boot_disk_image       = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
+  boot_disk_size_gb     = 200
+  # Declared explicitly so both hosts use the same boot disk type; the
+  # module's own default is the API's pd-standard.
+  boot_disk_type = "pd-ssd"
+  can_ip_forward = true
+
+  metadata = {
+    # cloud-init runs bootcmd on every boot before any service starts, so
+    # the identity is already this host's own by the time vmd can launch.
+    # A daemon that came up under another host's HOST_ID would heartbeat
+    # as that host and reconcile its sandboxes; stopping it afterward is
+    # too late.
+    user-data = <<-EOT
+      #cloud-config
+      bootcmd:
+        - |
+          NAME=$(curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/name) || exit 0
+          for f in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
+            [ -f "$f" ] || continue
+            if grep -q '^HOST_ID=' "$f"; then
+              sed -i "s/^HOST_ID=.*/HOST_ID=$${NAME}/" "$f"
+            else
+              echo "HOST_ID=$${NAME}" >> "$f"
+            fi
+          done
+          mkdir -p /run/sandbox && touch /run/sandbox/host-identity-pinned
+    EOT
+
+    startup-script = <<-EOT
+      #!/bin/bash
+      # Runs on every boot, after services. Everything here is idempotent.
+      set -euo pipefail
+      exec > /var/log/startup-script.log 2>&1
+
+      echo "=== Superserve VMD startup ==="
+
+      NAME=$(curl -sf -H 'Metadata-Flavor: Google' \
+        http://metadata.google.internal/computeMetadata/v1/instance/name)
+      HOST_IFACE=$(ip -4 route show default | awk '{print $5}' | head -1)
+      PREPARED=/var/lib/sandbox/.host-prepared
+
+      # Identity is pinned early by cloud-init (see user-data). If that did
+      # not run this boot, fall back to stopping whatever the image started
+      # — but only on the first boot, when nothing has been deployed yet.
+      # On later boots the units are the deploy's, and stopping them would
+      # take an active host offline until the next deploy.
+      if [ ! -e /run/sandbox/host-identity-pinned ] && [ ! -e "$PREPARED" ]; then
+        echo "identity was not pinned before services; stopping the image's vmd"
+        systemctl stop superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
+        systemctl disable superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
+      fi
+
+      # Same pin, repeated here so the file is right even if cloud-init is
+      # ever removed from the image. Only files that exist: the deploy owns
+      # the current one, and a bare file here would shadow it.
+      for f in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
+        [ -f "$f" ] || continue
+        if grep -q '^HOST_ID=' "$f"; then
+          sed -i "s/^HOST_ID=.*/HOST_ID=$${NAME}/" "$f"
+        else
+          echo "HOST_ID=$${NAME}" >> "$f"
+        fi
+        sed -i "s/^HOST_INTERFACE=.*/HOST_INTERFACE=$${HOST_IFACE}/" "$f"
+      done
+
+      # Background-data disk: backup journal and upload staging. The disk is
+      # attached by a separate resource and can appear after this script
+      # runs, so the mount is a device-bound unit rather than a one-shot
+      # wait: it fires when the disk shows up, whenever that is, and again
+      # on every boot. Formats only a blank disk; mounts otherwise.
+      DEV=/dev/disk/by-id/google-superserve-sandbox-data
+      DEVUNIT=$(systemd-escape -p --suffix=device "$DEV")
+      cat > /usr/local/bin/sandbox-data-mount <<'SH'
+      #!/bin/bash
+      set -euo pipefail
+      DEV=/dev/disk/by-id/google-superserve-sandbox-data
+      if [ -z "$(blkid -s TYPE -o value "$DEV" 2>/dev/null)" ]; then
+        mkfs.xfs -m crc=1,reflink=1 "$DEV"
+      fi
+      mkdir -p /mnt/sandbox-data
+      mountpoint -q /mnt/sandbox-data || mount -t xfs -o noatime,discard "$DEV" /mnt/sandbox-data
+      SH
+      chmod 0755 /usr/local/bin/sandbox-data-mount
+      cat > /etc/systemd/system/sandbox-data.service <<UNIT
+      [Unit]
+      Description=Mount the sandbox background-data disk
+      BindsTo=$${DEVUNIT}
+      After=$${DEVUNIT}
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/sandbox-data-mount
+      [Install]
+      WantedBy=$${DEVUNIT}
+      UNIT
+      # vmd keeps its backup journal on that disk, so it must not start
+      # without it.
+      mkdir -p /etc/systemd/system/superserve-vmd.service.d
+      printf '[Unit]\nRequires=sandbox-data.service\nAfter=sandbox-data.service\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/sandbox-data.conf
+
+      # Runtime flags this cell's hosts run with. Set here so both hosts
+      # launch and track VMs the same way.
+      printf '[Service]\nEnvironment=VMD_DIRTY_TRACKING_SESSION=true\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/dirty-session.conf
+      printf '[Service]\nEnvironment=VMD_LAUNCH_VIA_LAUNCHER_NS=true\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/launcher.conf
+      printf '[Service]\nEnvironment=VMD_SYSTEMD_DBUS=true\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/sdbus.conf
+      printf '[Service]\nEnvironment=VMD_RECYCLE_TAP_RESET=true\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/tap-reset.conf
+
+      systemctl daemon-reload
+      systemctl enable sandbox-data.service
+      systemctl start --no-block sandbox-data.service
+
+      modprobe kvm
+      modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null || true
+      chmod 0666 /dev/kvm 2>/dev/null || true
+      sysctl -w net.ipv4.ip_forward=1
+
+      # vmd is not started here. On the first boot the deploy installs the
+      # current units and starts it; on every later boot systemd already
+      # started the deployed units under the pinned identity.
+      mkdir -p "$(dirname "$PREPARED")" && touch "$PREPARED"
+      echo "=== host prepared ==="
+    EOT
+  }
+}
+
+# The second host's own background-data disk, same shape as the first's.
+resource "google_compute_disk" "sandbox_data_b" {
+  project = local.project_id
+  name    = "superserve-vmd-staging-2-sandbox-data"
+  zone    = local.zone
+  type    = "pd-balanced"
+  size    = 500
+
+  labels = merge(local.common_labels, {
+    component = "vmd"
+    purpose   = "sandbox-data"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_compute_attached_disk" "sandbox_data_b" {
+  project     = local.project_id
+  zone        = local.zone
+  disk        = google_compute_disk.sandbox_data_b.id
+  instance    = module.sandbox_host_b.instance_self_link
+  device_name = "superserve-sandbox-data"
+  mode        = "READ_WRITE"
+
+  deletion_policy = "PREVENT"
+}
+
 module "observability" {
   source = "../../../modules/observability"
 
