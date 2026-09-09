@@ -333,6 +333,23 @@ def main() -> int:
 
     print(f"Deploying VMD to {len(instances)} instance(s) in {where}")
 
+    # Prime the runner's gcloud SSH key with one sequential connection before
+    # the parallel fan-out. On a fresh runner the key does not exist, and
+    # every `gcloud compute scp`/`ssh` that finds it missing runs ssh-keygen
+    # to create it; two hosts starting together both do, and the loser fails
+    # with "google_compute_engine already exists" before its bundle is even
+    # uploaded. A single-host cell never raced this. Any host will do — the
+    # key is per runner, not per host, and OS Login registers it account-wide.
+    first = instances[0]
+    run_or_die(
+        [
+            "gcloud", "compute", "ssh", first["name"],
+            f"--zone={first['zone']}", f"--project={project}",
+            "--quiet", "--tunnel-through-iap", "--command", "true",
+        ],
+        f"[{first['name']}/{first['zone']}] prime ssh key",
+    )
+
     bundle_remote = f"/tmp/deploy-bundle-{sha}.tar.gz"
     extract_dir = f"/tmp/deploy-{sha}"
 
