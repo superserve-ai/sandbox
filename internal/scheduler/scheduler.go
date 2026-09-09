@@ -246,15 +246,18 @@ func capabilityCacheKey(capabilities []string) (string, []string) {
 // traffic refill each other's caches. A set loaded since the host left
 // rotation no longer lists it and is kept, so a burst of creates that all
 // drew the same stale host reloads once, not once per create; a
-// default-host fallback is never reloaded for this, see names.
-func (s *LeastLoaded) Reject(hostID string, requiredCapabilities []string) {
+// default-host fallback is never reloaded for this, see names. Reports
+// whether a set was dropped, i.e. whether the next SelectHost loads fresh.
+func (s *LeastLoaded) Reject(hostID string, requiredCapabilities []string) bool {
 	key, _ := capabilityCacheKey(requiredCapabilities)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entry, ok := s.cache[key]; ok && s.names(entry, hostID) {
 		delete(s.cache, key)
 		s.gen++
+		return true
 	}
+	return false
 }
 
 // names reports whether this entry's candidate set lists hostID. The

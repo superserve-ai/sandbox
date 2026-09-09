@@ -125,8 +125,10 @@ type Scheduler interface {
 	Invalidate()
 	// Reject drops the cached candidate set for requiredCapabilities if it
 	// still names hostID, which that set's pre-flight has just refused;
-	// state loaded since, and other capability sets, are kept.
-	Reject(hostID string, requiredCapabilities []string)
+	// state loaded since, and other capability sets, are kept. Reports
+	// whether anything was dropped, i.e. whether the next SelectHost is a
+	// fresh load.
+	Reject(hostID string, requiredCapabilities []string) bool
 }
 
 // HostRegistry resolves a host ID to a VMD client.
@@ -2141,13 +2143,14 @@ func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (h
 	if err == nil && !eligible && h.Scheduler != nil {
 		log.Warn().Str("host_id", hostID).Msg("scheduled host failed the pre-flight; selecting again without it")
 		rejected := hostID
-		h.Scheduler.Reject(hostID, requiredCapabilities)
+		reloaded := h.Scheduler.Reject(hostID, requiredCapabilities)
 		if hostID, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
 			return "", false
 		}
-		// The same host again (the default-host fallback) can only repeat
-		// the answer just given; don't pay the read twice.
-		if hostID != rejected {
+		// The same host from an unchanged set (the default-host fallback)
+		// can only repeat the answer just given; the same host from a fresh
+		// load may have regained eligibility and is checked again.
+		if hostID != rejected || reloaded {
 			SetTelemetryHostID(c, hostID)
 			eligible, err = h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
 		}

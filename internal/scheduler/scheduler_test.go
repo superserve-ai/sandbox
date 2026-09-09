@@ -518,11 +518,15 @@ func TestRejectDropsOnlySetsStillNamingTheHost(t *testing.T) {
 	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-1" {
 		t.Fatalf("prime = (%q, %v)", id, err)
 	}
-	s.Reject("host-1", nil)
+	if !s.Reject("host-1", nil) {
+		t.Fatal("rejecting the cached host must drop its set")
+	}
 	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" {
 		t.Fatalf("after reject = (%q, %v), want host-2 from a fresh load", id, err)
 	}
-	s.Reject("host-1", nil) // the fresh set no longer names host-1: no-op
+	if s.Reject("host-1", nil) { // the fresh set no longer names host-1: no-op
+		t.Fatal("rejecting a host the fresh set does not list must not drop it")
+	}
 	if id, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-2" {
 		t.Fatalf("after stale reject = (%q, %v), want the cached host-2", id, err)
 	}
