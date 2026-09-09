@@ -1213,10 +1213,11 @@ func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, 
 const secretEnvExpiryMargin = 24 * time.Hour
 
 // secretEnvFingerprint digests the environment as injected: the key that
-// signed the JWT, by its material rather than its label, and the binding
-// set with each secret's env key, proxy token, and auth shape. A change to
-// any of them changes the digest, so a replaced signing key reads as a new
-// environment even under the same kid; binding order does not.
+// signed the JWT, by both the kid a verifier looks it up under and its
+// material, and the binding set with each secret's env key, proxy token,
+// and auth shape. A change to any of them changes the digest, so a key
+// replaced under the same kid or relabeled under a new one reads as a new
+// environment; binding order does not.
 func secretEnvFingerprint(signingKeyFingerprint string, meta []SecretBindingMeta) string {
 	items := append([]SecretBindingMeta(nil), meta...)
 	sort.Slice(items, func(i, j int) bool { return items[i].EnvKey < items[j].EnvKey })

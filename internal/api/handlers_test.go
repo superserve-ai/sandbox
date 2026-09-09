@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -4556,9 +4557,10 @@ func TestResumeSandbox_GuestHoldsSecretEnvSkipsInjection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load meta: %v", err)
 	}
-	// Production pins the kid; a replaced key keeps the label, so the check
-	// must bind the key itself.
+	// The proxy looks the key up by kid. A replaced key keeps the label and
+	// a relabel keeps the key; either strands the snapshot's JWT.
 	signer, replaced := newTestSigner(t, "v1"), newTestSigner(t, "v1")
+	relabeled := sameKeyUnderKid(t, signer, "v2")
 	current := secretEnvFingerprint(signer.KeyFingerprint(), meta)
 	other := "0000"
 	injectedAt := time.Now().Add(-time.Hour)
@@ -4572,6 +4574,7 @@ func TestResumeSandbox_GuestHoldsSecretEnvSkipsInjection(t *testing.T) {
 	}{
 		{"guest holds the current environment", signer, func(*db.Sandbox, *db.Snapshot) {}, false},
 		{"signing key replaced under the same kid", replaced, func(*db.Sandbox, *db.Snapshot) {}, true},
+		{"signing key relabeled under a new kid", relabeled, func(*db.Sandbox, *db.Snapshot) {}, true},
 		{"bindings changed since injection", signer, func(sb *db.Sandbox, _ *db.Snapshot) { sb.SecretEnvFingerprint = &other }, true},
 		{"guest came back on another ip", signer, func(sb *db.Sandbox, _ *db.Snapshot) { sb.SecretEnvIp = &otherIP }, true},
 		{"snapshot predates the injection", signer, func(_ *db.Sandbox, snap *db.Snapshot) { snap.CreatedAt = injectedAt.Add(-time.Minute) }, true},
@@ -4658,6 +4661,9 @@ func TestSecretBindingFingerprint(t *testing.T) {
 	}
 	if newTestSigner(t, "v1").KeyFingerprint() == newTestSigner(t, "v1").KeyFingerprint() {
 		t.Fatal("two keys under the same kid must not share a fingerprint")
+	}
+	if s := newTestSigner(t, "v1"); s.KeyFingerprint() == sameKeyUnderKid(t, s, "v2").KeyFingerprint() {
+		t.Fatal("one key under two kids must not share a fingerprint")
 	}
 }
 
@@ -4746,4 +4752,14 @@ func TestActivateSandbox_ReportsPolicyTheDaemonKept(t *testing.T) {
 	if got := parseJSON(t, w)["preview_access"]; got != preview.AccessPrivate {
 		t.Fatalf("preview_access = %v, want the policy the daemon kept (%q)", got, preview.AccessPrivate)
 	}
+}
+
+// sameKeyUnderKid rebuilds a signer's key under another kid.
+func sameKeyUnderKid(t *testing.T, s *SecretsSigner, kid string) *SecretsSigner {
+	t.Helper()
+	relabeled, err := NewSecretsSigner(base64.StdEncoding.EncodeToString(s.priv.Seed()), kid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return relabeled
 }

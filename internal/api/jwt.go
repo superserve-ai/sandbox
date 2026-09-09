@@ -66,8 +66,10 @@ type SecretsClaims struct {
 type SecretsSigner struct {
 	priv ed25519.PrivateKey
 	kid  string
-	// fingerprint names the key material itself; the kid is a label that
-	// can stay put across a key replacement.
+	// fingerprint names the key as a verifier sees it: the kid it is served
+	// under and the key material. The label can stay put across a key
+	// replacement, and the key can stay put across a relabel; either
+	// change strands a JWT minted before it.
 	fingerprint string
 }
 
@@ -90,12 +92,12 @@ func NewSecretsSigner(seedBase64, kid string) (*SecretsSigner, error) {
 	return &SecretsSigner{
 		priv:        priv,
 		kid:         kid,
-		fingerprint: hex.EncodeToString(sum[:]),
+		fingerprint: kid + ":" + hex.EncodeToString(sum[:]),
 	}, nil
 }
 
-// KeyFingerprint digests the verification key. Two signers with the same
-// kid but different keys have different fingerprints.
+// KeyFingerprint names the verification key by kid and key digest. Signers
+// differing in either have different fingerprints.
 func (s *SecretsSigner) KeyFingerprint() string { return s.fingerprint }
 
 // Sign returns a serialized JWT with the supplied claims. iss, iat, exp are
