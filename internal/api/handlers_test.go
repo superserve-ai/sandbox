@@ -4454,9 +4454,10 @@ func TestResumeSandbox_AttestationDecidesReapply(t *testing.T) {
 		rulePushes   int
 		paused       bool
 	}{
-		{"attested policy and rules", vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, NetworkRulesApplied: true}, http.StatusOK, 0, 0, 0, false},
+		{"attested policy and rules", vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 7, NetworkRulesApplied: true}, http.StatusOK, 0, 0, 0, false},
 		{"daemon before the request carried either", vmdclient.ResumeAttestation{}, http.StatusOK, 1, 1, 1, false},
-		{"policy attested, rules not acked", vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts}, http.StatusOK, 0, 0, 1, false},
+		{"policy attested, rules not acked", vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 7}, http.StatusOK, 0, 0, 1, false},
+		{"record already held a newer policy", vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 9, NetworkRulesApplied: true}, http.StatusOK, 1, 0, 0, false},
 		{"unknown attestation", vmdclient.ResumeAttestation{PreviewProtocol: "preview_ports_v9", NetworkRulesApplied: true}, http.StatusInternalServerError, 0, 0, 0, true},
 	}
 	for _, tc := range cases {
@@ -4553,24 +4554,26 @@ func TestResumeSandbox_GuestHoldsSecretEnvSkipsInjection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load meta: %v", err)
 	}
-	current := secretBindingFingerprint(meta)
+	current := secretEnvFingerprint("v1", meta)
 	other := "0000"
 	injectedAt := time.Now().Add(-time.Hour)
 	ip, otherIP := "10.0.0.5", "10.0.0.9"
 
 	cases := []struct {
 		name       string
+		kid        string
 		set        func(sb *db.Sandbox, snap *db.Snapshot)
 		wantInject bool
 	}{
-		{"guest holds the current environment", func(*db.Sandbox, *db.Snapshot) {}, false},
-		{"bindings changed since injection", func(sb *db.Sandbox, _ *db.Snapshot) { sb.SecretEnvFingerprint = &other }, true},
-		{"guest came back on another ip", func(sb *db.Sandbox, _ *db.Snapshot) { sb.SecretEnvIp = &otherIP }, true},
-		{"snapshot predates the injection", func(_ *db.Sandbox, snap *db.Snapshot) { snap.CreatedAt = injectedAt.Add(-time.Minute) }, true},
-		{"jwt near expiry", func(sb *db.Sandbox, _ *db.Snapshot) {
+		{"guest holds the current environment", "v1", func(*db.Sandbox, *db.Snapshot) {}, false},
+		{"signing key rotated since injection", "v2", func(*db.Sandbox, *db.Snapshot) {}, true},
+		{"bindings changed since injection", "v1", func(sb *db.Sandbox, _ *db.Snapshot) { sb.SecretEnvFingerprint = &other }, true},
+		{"guest came back on another ip", "v1", func(sb *db.Sandbox, _ *db.Snapshot) { sb.SecretEnvIp = &otherIP }, true},
+		{"snapshot predates the injection", "v1", func(_ *db.Sandbox, snap *db.Snapshot) { snap.CreatedAt = injectedAt.Add(-time.Minute) }, true},
+		{"jwt near expiry", "v1", func(sb *db.Sandbox, _ *db.Snapshot) {
 			sb.SecretEnvExpiresAt = pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
 		}, true},
-		{"nothing recorded", func(sb *db.Sandbox, _ *db.Snapshot) {
+		{"nothing recorded", "v1", func(sb *db.Sandbox, _ *db.Snapshot) {
 			sb.SecretEnvFingerprint, sb.SecretEnvIp = nil, nil
 			sb.SecretEnvInjectedAt, sb.SecretEnvExpiresAt = pgtype.Timestamptz{}, pgtype.Timestamptz{}
 		}, true},
@@ -4614,7 +4617,7 @@ func TestResumeSandbox_GuestHoldsSecretEnvSkipsInjection(t *testing.T) {
 					return pgconn.NewCommandTag("UPDATE 1"), nil
 				},
 			}
-			h := &Handlers{VMD: vmd, DB: db.New(mock), Signer: newTestSigner(t, "v1")}
+			h := &Handlers{VMD: vmd, DB: db.New(mock), Signer: newTestSigner(t, tc.kid)}
 			w := httptest.NewRecorder()
 			setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
 			h.WaitAsyncBookkeeping()
@@ -4629,21 +4632,24 @@ func TestResumeSandbox_GuestHoldsSecretEnvSkipsInjection(t *testing.T) {
 	}
 }
 
-// The fingerprint names the binding set as injected: order does not matter,
-// a token change does.
+// The fingerprint names the environment as injected: binding order does
+// not matter; a token change or a signing-key rotation does.
 func TestSecretBindingFingerprint(t *testing.T) {
 	a := SecretBindingMeta{SecretID: uuid.New(), EnvKey: "A_KEY", AuthType: "bearer", ProxyToken: "tok-a", Hosts: []string{"a.example"}}
 	b := SecretBindingMeta{SecretID: uuid.New(), EnvKey: "B_KEY", AuthType: "bearer", ProxyToken: "tok-b", Hosts: []string{"b.example"}}
-	if secretBindingFingerprint([]SecretBindingMeta{a, b}) != secretBindingFingerprint([]SecretBindingMeta{b, a}) {
+	if secretEnvFingerprint("v1", []SecretBindingMeta{a, b}) != secretEnvFingerprint("v1", []SecretBindingMeta{b, a}) {
 		t.Fatal("fingerprint must not depend on binding order")
 	}
 	rotated := a
 	rotated.ProxyToken = "tok-a2"
-	if secretBindingFingerprint([]SecretBindingMeta{a}) == secretBindingFingerprint([]SecretBindingMeta{rotated}) {
+	if secretEnvFingerprint("v1", []SecretBindingMeta{a}) == secretEnvFingerprint("v1", []SecretBindingMeta{rotated}) {
 		t.Fatal("a rotated proxy token must change the fingerprint")
 	}
-	if secretBindingFingerprint([]SecretBindingMeta{a}) == secretBindingFingerprint([]SecretBindingMeta{a, b}) {
+	if secretEnvFingerprint("v1", []SecretBindingMeta{a}) == secretEnvFingerprint("v1", []SecretBindingMeta{a, b}) {
 		t.Fatal("an added binding must change the fingerprint")
+	}
+	if secretEnvFingerprint("v1", []SecretBindingMeta{a}) == secretEnvFingerprint("v2", []SecretBindingMeta{a}) {
+		t.Fatal("a rotated signing key must change the fingerprint")
 	}
 }
 
@@ -4674,7 +4680,7 @@ func TestApplySecretBindings_RecordsInjectedEnv(t *testing.T) {
 	if len(recorded) != 4 {
 		t.Fatalf("record args = %v, want id, fingerprint, ip, expiry", recorded)
 	}
-	if fp, ok := recorded[1].(*string); !ok || fp == nil || *fp != secretBindingFingerprint(meta) {
+	if fp, ok := recorded[1].(*string); !ok || fp == nil || *fp != secretEnvFingerprint("v1", meta) {
 		t.Fatalf("recorded fingerprint = %v, want the injected set's", recorded[1])
 	}
 	if ip, ok := recorded[2].(*string); !ok || ip == nil || *ip != "10.0.0.5" {
@@ -4683,5 +4689,53 @@ func TestApplySecretBindings_RecordsInjectedEnv(t *testing.T) {
 	expires, ok := recorded[3].(pgtype.Timestamptz)
 	if !ok || !expires.Valid || expires.Time.Before(time.Now().Add(SecretsJWTLifetime-time.Minute)) {
 		t.Fatalf("recorded expiry = %v, want about one JWT lifetime out", recorded[3])
+	}
+}
+
+// When the daemon's record already held a newer policy than the claim read,
+// the stamp leaves it in place and the activation reply must report that
+// policy rather than the claim's.
+func TestActivateSandbox_ReportsPolicyTheDaemonKept(t *testing.T) {
+	sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+
+	vmd := &stubVMD{
+		resumeAttest: vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 9, NetworkRulesApplied: true},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRow(sb, &snap, preview.AccessPublic, 7)
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+				return previewPolicyRow(preview.AccessPrivate, 9)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(context.Context, string, ...any) (pgx.Rows, error) { return emptyRows{}, nil },
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{
+		VMD:    vmd,
+		DB:     db.New(mock),
+		Config: &config.Config{SandboxAccessTokenSeed: []byte("test-seed-for-hmac-32-bytes-min!!")},
+	}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if got := parseJSON(t, w)["preview_access"]; got != preview.AccessPrivate {
+		t.Fatalf("preview_access = %v, want the policy the daemon kept (%q)", got, preview.AccessPrivate)
 	}
 }

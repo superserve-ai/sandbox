@@ -154,8 +154,12 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		NetworkRulesApplied: rulesApplied,
 	}
 	if previewAccess != "" {
-		// Attests the request's policy fields were applied (see vmd.proto).
+		// Attests the request's policy fields were applied, and which
+		// revision the record holds now (see vmd.proto).
 		resp.PreviewProtocol = preview.HostCapabilityPorts
+		inst.mu.RLock()
+		resp.PreviewPolicyRevision = inst.PreviewPolicyRevision
+		inst.mu.RUnlock()
 	}
 	return resp, nil
 }

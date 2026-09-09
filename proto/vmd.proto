@@ -406,6 +406,10 @@ message ResumeVMResponse {
   // including one adopted from an earlier attempt. False means the caller
   // must push them itself.
   bool network_rules_applied = 7;
+  // The policy revision the record holds after the stamp: the request's
+  // when it was applied, higher when the record already held a newer
+  // policy and kept it. Set only with preview_protocol.
+  int64 preview_policy_revision = 8;
 }
 
 // ---------------------------------------------------------------------------

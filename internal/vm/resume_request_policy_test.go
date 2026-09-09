@@ -118,6 +118,9 @@ func TestGRPCAdapterResumeVM_StampsAndAttestsPolicy(t *testing.T) {
 		if resp.GetPreviewProtocol() != preview.HostCapabilityPorts {
 			t.Fatalf("preview_protocol = %q, want %q", resp.GetPreviewProtocol(), preview.HostCapabilityPorts)
 		}
+		if resp.GetPreviewPolicyRevision() != 3 {
+			t.Fatalf("preview_policy_revision = %d, want the request's 3", resp.GetPreviewPolicyRevision())
+		}
 		if !resp.GetNetworkRulesApplied() {
 			t.Fatal("a request without rules must report nothing left to apply")
 		}
@@ -125,6 +128,24 @@ func TestGRPCAdapterResumeVM_StampsAndAttestsPolicy(t *testing.T) {
 		defer existing.mu.Unlock()
 		if existing.PreviewPolicyRevision != 3 || existing.PreviewAccess != preview.AccessPublic || existing.PreviewPorts[3000].Access != preview.AccessPublic {
 			t.Fatalf("record policy = %q rev %d ports %+v, want the request's", existing.PreviewAccess, existing.PreviewPolicyRevision, existing.PreviewPorts)
+		}
+	})
+	t.Run("record already newer keeps its policy and reports it", func(t *testing.T) {
+		a, existing := newAdapter(t)
+		existing.PreviewAccess, existing.PreviewPolicyRevision = preview.AccessPrivate, 5
+		resp, err := a.ResumeVM(context.Background(), &vmdpb.ResumeVMRequest{
+			VmId: "vm-1", PreviewAccess: preview.AccessPublic, PreviewPolicyRevision: 3,
+		})
+		if err != nil {
+			t.Fatalf("ResumeVM: %v", err)
+		}
+		if resp.GetPreviewProtocol() != preview.HostCapabilityPorts || resp.GetPreviewPolicyRevision() != 5 {
+			t.Fatalf("attestation = %q rev %d, want attested at the record's 5", resp.GetPreviewProtocol(), resp.GetPreviewPolicyRevision())
+		}
+		existing.mu.Lock()
+		defer existing.mu.Unlock()
+		if existing.PreviewAccess != preview.AccessPrivate || existing.PreviewPolicyRevision != 5 {
+			t.Fatalf("record policy = %q rev %d, want the newer one kept", existing.PreviewAccess, existing.PreviewPolicyRevision)
 		}
 	})
 	t.Run("no policy carried", func(t *testing.T) {

@@ -1820,8 +1820,12 @@ type ResumeVMResponse struct {
 	// including one adopted from an earlier attempt. False means the caller
 	// must push them itself.
 	NetworkRulesApplied bool `protobuf:"varint,7,opt,name=network_rules_applied,json=networkRulesApplied,proto3" json:"network_rules_applied,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// The policy revision the record holds after the stamp: the request's
+	// when it was applied, higher when the record already held a newer
+	// policy and kept it. Set only with preview_protocol.
+	PreviewPolicyRevision int64 `protobuf:"varint,8,opt,name=preview_policy_revision,json=previewPolicyRevision,proto3" json:"preview_policy_revision,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ResumeVMResponse) Reset() {
@@ -1901,6 +1905,13 @@ func (x *ResumeVMResponse) GetNetworkRulesApplied() bool {
 		return x.NetworkRulesApplied
 	}
 	return false
+}
+
+func (x *ResumeVMResponse) GetPreviewPolicyRevision() int64 {
+	if x != nil {
+		return x.PreviewPolicyRevision
+	}
+	return 0
 }
 
 type CreateSnapshotRequest struct {
@@ -4010,7 +4021,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x17preview_policy_revision\x18\t \x01(\x03R\x15previewPolicyRevision\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x06\x10\aR\x0esecrets_broker\"\xa4\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x06\x10\aR\x0esecrets_broker\"\xdc\x02\n" +
 	"\x10ResumeVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1f\n" +
 	"\vsocket_path\x18\x02 \x01(\tR\n" +
@@ -4020,7 +4031,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x03pid\x18\x04 \x01(\rR\x03pid\x12J\n" +
 	"\x0fresource_limits\x18\x05 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12)\n" +
 	"\x10preview_protocol\x18\x06 \x01(\tR\x0fpreviewProtocol\x122\n" +
-	"\x15network_rules_applied\x18\a \x01(\bR\x13networkRulesApplied\"O\n" +
+	"\x15network_rules_applied\x18\a \x01(\bR\x13networkRulesApplied\x126\n" +
+	"\x17preview_policy_revision\x18\b \x01(\x03R\x15previewPolicyRevision\"O\n" +
 	"\x15CreateSnapshotRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12!\n" +
 	"\fsnapshot_dir\x18\x02 \x01(\tR\vsnapshotDir\"\x9e\x01\n" +

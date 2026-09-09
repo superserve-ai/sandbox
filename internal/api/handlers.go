@@ -1119,7 +1119,16 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			return "", false
 		}
 	case attested.PreviewProtocol == preview.HostCapabilityPorts:
-		// Stamped before the guest ran.
+		// Stamped before the guest ran. A record that already held a newer
+		// policy kept it, and the reply must report that one.
+		if attested.PreviewPolicyRevision != resumePolicy.Revision {
+			currentPolicy, policyErr := h.loadPreviewPolicy(postCtx, sandboxID, teamID)
+			if policyErr != nil {
+				failPost(policyErr, "reload preview policy after resume failed")
+				return "", false
+			}
+			effectivePolicy = currentPolicy
+		}
 	case attested.PreviewProtocol == "":
 		// A daemon from before the resume request carried the policy. It may
 		// still enforce, so attest the way its generation supports. Remove
@@ -1160,7 +1169,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			failPost(merr, "load secret bindings on resume failed")
 			return "", false
 		}
-		if len(meta) > 0 && !guestHoldsSecretEnv(*sandbox, claimed.SnapCreatedAt, meta) {
+		if len(meta) > 0 && !h.guestHoldsSecretEnv(*sandbox, claimed.SnapCreatedAt, meta) {
 			if aerr := h.applySecretBindings(postCtx, *sandbox, meta); aerr != nil {
 				failPost(aerr, "reapply secret bindings on resume failed")
 				return "", false

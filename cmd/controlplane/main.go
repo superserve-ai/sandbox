@@ -533,8 +533,9 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 		actualMemMiB = rl.GetMemoryMib()
 	}
 	return resp.IpAddress, actualVcpu, actualMemMiB, vmdclient.ResumeAttestation{
-		PreviewProtocol:     resp.GetPreviewProtocol(),
-		NetworkRulesApplied: resp.GetNetworkRulesApplied(),
+		PreviewProtocol:       resp.GetPreviewProtocol(),
+		PreviewPolicyRevision: resp.GetPreviewPolicyRevision(),
+		NetworkRulesApplied:   resp.GetNetworkRulesApplied(),
 	}, nil
 }
 

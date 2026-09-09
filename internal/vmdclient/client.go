@@ -24,8 +24,12 @@ type ResourceLimits struct {
 // true when the request's egress rules are fully in place, including on a VM
 // the daemon adopted from an earlier attempt.
 type ResumeAttestation struct {
-	PreviewProtocol     string
-	NetworkRulesApplied bool
+	PreviewProtocol string
+	// PreviewPolicyRevision is the revision the daemon's record holds after
+	// the stamp; higher than the request's when the record already held a
+	// newer policy and kept it.
+	PreviewPolicyRevision int64
+	NetworkRulesApplied   bool
 }
 
 type PortPolicy struct {
