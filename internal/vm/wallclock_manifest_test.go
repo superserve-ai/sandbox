@@ -419,3 +419,39 @@ func TestPrimeWakeProtocolFloor(t *testing.T) {
 		}
 	})
 }
+
+// A frozen template that lands after the watch started is witnessed as it
+// lands, not at the next periodic scan: the floor is up within moments.
+func TestTemplateWatchWitnessesATemplateAsItLands(t *testing.T) {
+	dir := t.TempDir()
+	isolateEvidence(t, dir)
+	if err := os.MkdirAll(filepath.Join(dir, TemplatesDirName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
+	stopped := m.WatchTemplateManifests(ctx, zerolog.Nop())
+	defer func() { cancel(); <-stopped }()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
+		t.Fatal("nothing had landed yet")
+	}
+	// The copy: directories first, then the manifest, renamed into place.
+	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
+	if err := os.MkdirAll(tpl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	seedFrozenManifest(t, filepath.Join(tpl, "mem.snap"), "tok")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the frozen template that landed was not witnessed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

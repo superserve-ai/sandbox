@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/fsnotify/fsnotify"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -243,6 +244,20 @@ func WriteWallClockManifest(memPath string, m WallClockManifest) error {
 	return writeWallClockManifest(memPath, m, true)
 }
 
+// removeWallClockManifestDurably removes the manifest beside an image, if
+// any, and syncs its directory so a crash cannot bring it back beside an
+// image it does not describe. Nothing to remove is not an error.
+func removeWallClockManifestDurably(memPath string) error {
+	path := WallClockMarkerPath(memPath)
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
 // writeWallClockManifestLazy publishes atomically but with no durability
 // barrier, for a manifest whose loss costs only a slower resume: an unfrozen
 // one. Nothing on a lifecycle path waits on a sync for it.
@@ -334,6 +349,49 @@ func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger
 	go func() {
 		defer close(done)
 		scan()
+		// A template lands by copy, between scans. The tree is watched so a
+		// frozen one is witnessed as it lands, with the periodic scan as the
+		// fallback for anything the watch missed; a host that cannot watch
+		// keeps the scan alone.
+		root := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)
+		var events <-chan fsnotify.Event
+		var errs <-chan error
+		if w, werr := fsnotify.NewWatcher(); werr == nil {
+			defer w.Close()
+			watchTemplateTree(w, root)
+			events, errs = w.Events, w.Errors
+			// Anything that landed while the watches were being added.
+			scan()
+			t := time.NewTicker(firecrackerCapabilityRefreshInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					scan()
+				case ev := <-events:
+					if !ev.Has(fsnotify.Create) && !ev.Has(fsnotify.Rename) {
+						continue
+					}
+					if info, serr := os.Stat(ev.Name); serr == nil && info.IsDir() {
+						// A new template or build directory: watch it, and
+						// read what may already be inside.
+						watchTemplateTree(w, ev.Name)
+						scan()
+						continue
+					}
+					if strings.HasSuffix(ev.Name, clockFreezeMarkerSuffix) {
+						if n := m.noteTemplateManifest(ev.Name); n > 0 && !wakeProtocolEvidenceLogged.Swap(true) {
+							log.Info().Str("path", ev.Name).Msg("a frozen template landed; a vmd without the wake protocol is refused from now on")
+						}
+					}
+				case <-errs:
+				}
+			}
+		} else {
+			log.Warn().Err(werr).Msg("template tree cannot be watched; frozen templates are witnessed by the periodic scan alone")
+		}
 		t := time.NewTicker(firecrackerCapabilityRefreshInterval)
 		defer t.Stop()
 		for {
@@ -346,6 +404,44 @@ func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger
 		}
 	}()
 	return done
+}
+
+// watchTemplateTree watches dir and every directory beneath it to the depth
+// templates live at (templates/<template>/<build>); inotify watches are not
+// recursive, so each level is added, and what is already there is added now.
+func watchTemplateTree(w *fsnotify.Watcher, dir string) {
+	_ = w.Add(dir)
+	if rel, err := filepath.Rel(filepath.Dir(dir), dir); err != nil || rel == "" {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			sub := filepath.Join(dir, e.Name())
+			_ = w.Add(sub)
+			if subs, err := os.ReadDir(sub); err == nil {
+				for _, b := range subs {
+					if b.IsDir() {
+						_ = w.Add(filepath.Join(sub, b.Name()))
+					}
+				}
+			}
+		}
+	}
+}
+
+// noteTemplateManifest reads one manifest that just landed and raises the
+// floor for a frozen one. Returns 1 if it was frozen.
+func (m *Manager) noteTemplateManifest(path string) int {
+	man, err := ReadWallClockManifest(strings.TrimSuffix(path, clockFreezeMarkerSuffix))
+	if err != nil || man == nil || !man.WorkloadFrozen {
+		return 0
+	}
+	noteWakeProtocolEvidence()
+	return 1
 }
 
 var wakeProtocolEvidenceLogged atomic.Bool

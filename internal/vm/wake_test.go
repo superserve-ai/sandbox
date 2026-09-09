@@ -2219,3 +2219,37 @@ func TestDestroyDuringAFrozenResumeLeavesNoRecord(t *testing.T) {
 		t.Fatalf("record = %+v; a destroyed VM's record was resurrected by the wake-owed write", rec)
 	}
 }
+
+// An unfrozen pause that replaces an existing manifest replaces it durably
+// and times it: the one there may say frozen under a token already answered.
+func TestUnfrozenPauseReplacingAManifestDoesSoDurably(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false }
+	t.Cleanup(func() { vmUnitFullyDown = origDown })
+
+	fc := startSnapshotAPIFake(t, nil)
+	dir := t.TempDir()
+	vmDir := filepath.Join(dir, "vm-1")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	memSnap := filepath.Join(vmDir, "mem.snap")
+	if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedFrozenManifest(t, memSnap, "A")
+	corrects := true
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects}
+	sink := &phaseSink{}
+	m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, recorder: sink, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	man, err := ReadWallClockManifest(memSnap)
+	if err != nil || man == nil || man.WorkloadFrozen || man.FreezeToken != "" {
+		t.Fatalf("manifest=%+v err=%v; want the frozen manifest replaced by an unfrozen one", man, err)
+	}
+	if !sink.has("pause", "manifest") {
+		t.Fatalf("phases = %+v; a durable replacement must be timed", sink.phases)
+	}
+}

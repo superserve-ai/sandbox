@@ -1881,19 +1881,44 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			if merr != nil {
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("write wall-clock manifest: %w", merr))
 			}
-		} else if merr := writeWallClockManifestLazy(memPath, man); merr != nil {
-			// The image is unfrozen, so no manifest is safe for it; a stale
-			// frozen one is not: a restore would present its token to a guest
-			// that already answered it and run the clock uncorrected. The
-			// stale one goes, or the pause fails.
-			if rerr := os.Remove(clockFreezeMarkerPath(memPath)); rerr != nil && !os.IsNotExist(rerr) {
-				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("wall-clock manifest write failed (%v) and the stale one could not be cleared: %w", merr, rerr))
+		} else {
+			// Unfrozen. Where no manifest exists the write is lazy: lost to a
+			// crash, it costs the next resume a slower path, never a wrong
+			// clock. Where one exists it is REPLACED durably: the one there
+			// may say frozen under a token this guest already answered, and
+			// a crash that let it survive beside this image would have a
+			// restore present that token and run the clock uncorrected.
+			_, serr := os.Stat(clockFreezeMarkerPath(memPath))
+			replacing := serr == nil
+			var merr error
+			if replacing {
+				tManifest := time.Now()
+				merr = WriteWallClockManifest(memPath, man)
+				manifestDur = time.Since(tManifest)
+			} else {
+				merr = writeWallClockManifestLazy(memPath, man)
 			}
-			log.Warn().Err(merr).Str("path", WallClockMarkerPath(memPath)).
-				Msg("pause: wall-clock manifest write failed; resume falls back to legacy clock behaviour")
+			if merr != nil {
+				// No manifest is safe for an unfrozen image; a stale frozen
+				// one is not. The stale one goes, durably, or the pause fails.
+				if rerr := removeWallClockManifestDurably(memPath); rerr != nil {
+					return "", "", nil, m.handleVMError(vmID, fmt.Errorf("wall-clock manifest write failed (%v) and the stale one could not be cleared: %w", merr, rerr))
+				}
+				log.Warn().Err(merr).Str("path", WallClockMarkerPath(memPath)).
+					Msg("pause: wall-clock manifest write failed; resume falls back to legacy clock behaviour")
+			}
 		}
-	} else if merr := os.Remove(clockFreezeMarkerPath(memPath)); merr != nil && !os.IsNotExist(merr) {
-		return "", "", nil, m.handleVMError(vmID, fmt.Errorf("clear stale wall-clock manifest for %q: %w", memPath, merr))
+	} else {
+		// A guest that cannot correct its clock gets no manifest; one an
+		// earlier image left here goes, durably, for the reason above.
+		tManifest := time.Now()
+		merr := removeWallClockManifestDurably(memPath)
+		if d := time.Since(tManifest); d > time.Millisecond {
+			manifestDur = d
+		}
+		if merr != nil {
+			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("clear stale wall-clock manifest for %q: %w", memPath, merr))
+		}
 	}
 
 	snapshotOK = true
@@ -5031,7 +5056,10 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		case <-pw.done:
 			return published()
 		case <-wait.C:
-			return nil, false
+			// The pool may have published the VM and be held only in the
+			// durable write that follows, which no round bounds: a VM in
+			// the map is served.
+			return published()
 		}
 	}
 
