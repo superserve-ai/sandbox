@@ -69,6 +69,57 @@ func TestWaitForGuestWakeFailsFastOnUncorrectableClock(t *testing.T) {
 	}
 }
 
+// The verdict needs consecutive answers of one kind: an answer of another
+// kind, or another status, in between starts the count over, so a guest
+// that was recovering is not parked on failures that were not consecutive.
+func TestWaitForGuestWakeVerdictNeedsAConsecutiveStreak(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		answers []int // 0: clock, 1: thaw, 2: HTTP 500
+		want    error
+		calls   int
+	}{
+		{"a_thaw_answer_breaks_a_clock_streak", []int{0, 0, 1, 0, 0, 0}, ErrGuestClockUnready, 6},
+		{"another_status_breaks_the_streak", []int{1, 1, 2, 1, 1, 1}, ErrGuestThawFailed, 6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(boxdPort))
+			if err != nil {
+				t.Skipf("port %d busy: %v", boxdPort, err)
+			}
+			calls := 0
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				i := calls
+				calls++
+				if i >= len(tc.answers) {
+					i = len(tc.answers) - 1
+				}
+				w.Header().Set("Content-Type", "application/json")
+				switch tc.answers[i] {
+				case 0:
+					w.WriteHeader(http.StatusServiceUnavailable)
+					w.Write([]byte(`{"status":"clock","wall_clock":{"error":"no ptp"}}`))
+				case 1:
+					w.WriteHeader(http.StatusServiceUnavailable)
+					w.Write([]byte(`{"status":"thaw","wall_clock":{"error":"cgroup busy"}}`))
+				default:
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			srv.Listener = ln
+			srv.Start()
+			defer srv.Close()
+			err = waitForGuestWake(context.Background(), "127.0.0.1", 10*time.Second, true, "tok")
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			if calls != tc.calls {
+				t.Fatalf("verdict after %d answers, want %d: the streak must restart at the interruption", calls, tc.calls)
+			}
+		})
+	}
+}
+
 func TestWaitForGuestWakeReadyIsNil(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(boxdPort))
 	if err != nil {

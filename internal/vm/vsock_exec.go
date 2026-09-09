@@ -280,7 +280,12 @@ func waitForGuestWake(ctx context.Context, vmIP string, timeout time.Duration, c
 	const maxProbeInterval = 10 * time.Millisecond
 	interval := time.Millisecond
 	var lastErr error
-	clockUnready := 0
+	// Consecutive answers of one kind make the verdict; anything in between —
+	// a transport error, another status, a body that does not parse, or the
+	// other kind — starts the count over. The first may be mid-correction,
+	// and a verdict assembled from answers that were not consecutive would
+	// park a guest that was recovering.
+	streakKind, streak := "", 0
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -288,6 +293,7 @@ func waitForGuestWake(ctx context.Context, vmIP string, timeout time.Duration, c
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := client.Do(req)
+		kind, detail := "", ""
 		if err == nil {
 			reply, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 			resp.Body.Close()
@@ -308,14 +314,20 @@ func waitForGuestWake(ctx context.Context, vmIP string, timeout time.Duration, c
 					} `json:"wall_clock"`
 				}
 				if json.Unmarshal(reply, &r) == nil && (r.Status == "clock" || r.Status == "thaw") {
-					if clockUnready++; clockUnready >= clockUnreadyPolls {
-						sentinel := ErrGuestClockUnready
-						if r.Status == "thaw" {
-							sentinel = ErrGuestThawFailed
-						}
-						return fmt.Errorf("%w (%s)", sentinel, r.WallClock.Error)
-					}
+					kind, detail = r.Status, r.WallClock.Error
 				}
+			}
+		}
+		if kind != streakKind {
+			streakKind, streak = kind, 0
+		}
+		if kind != "" {
+			if streak++; streak >= clockUnreadyPolls {
+				sentinel := ErrGuestClockUnready
+				if kind == "thaw" {
+					sentinel = ErrGuestThawFailed
+				}
+				return fmt.Errorf("%w (%s)", sentinel, detail)
 			}
 		}
 		lastErr = err
