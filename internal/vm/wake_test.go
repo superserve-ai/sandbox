@@ -2088,3 +2088,77 @@ func TestFrozenPauseRecordsTheManifestPhase(t *testing.T) {
 		t.Fatalf("phases = %+v; want the durable manifest write and the freeze recorded", sink.phases)
 	}
 }
+
+// A restore of a VM from the image it was paused into whose wake merely does
+// not happen returns the record to Paused: the image is intact, and an Error
+// record owing nothing would be reaped as stale by the next restart. A wake
+// the guest refuses as another freeze's stays terminal.
+func TestFrozenRestoreOfAPausedVMFailingItsWakeReturnsToPaused(t *testing.T) {
+	useTempFloor(t)
+	origWake, origDead := boxdWakeGuest, vmDeadForRetry
+	t.Cleanup(func() { boxdWakeGuest, vmDeadForRetry = origWake, origDead })
+	vmDeadForRetry = func(*Manager, string) bool { return true }
+	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return errors.New("no answer") }
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	basePath := filepath.Join(dir, "base.ext4")
+	for _, p := range []string{snapPath, memPath, basePath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedFrozenManifest(t, memPath, "tok")
+	overlay := filepath.Join(dir, "vm-1", "overlay.ext4")
+	if err := os.MkdirAll(filepath.Dir(overlay), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(overlay, []byte("customer data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	pausedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	prev := &VMInstance{
+		ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit,
+		SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: overlay, PausedAt: pausedAt,
+	}
+	if err := store.Put(toRecord(prev)); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		cfg:        ManagerConfig{RunDir: dir, GuestClockFreezeEnabled: true},
+		netMgr:     &fakeNetMgr{},
+		vms:        map[string]*VMInstance{"vm-1": prev},
+		restoreSem: make(chan struct{}, 1),
+		state:      store,
+	}
+	mgr.clockRealtimeCapable.Store(true)
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		return 4321, SupervisionUnit, nil
+	}
+	mgr.restoreSnapshotHook = func(_, _, _ string, _ *bool) error { return nil }
+
+	if _, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath}, nil, "team", "owner", "", nil, 0); err == nil {
+		t.Fatal("want the wake failure")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rec, gerr := store.Get("vm-1")
+		if gerr == nil && rec != nil && rec.Status == StatusPaused {
+			if rec.WakePending || rec.WakeOwedFromPaused || rec.WakeToken != "" || !rec.PausedAt.Equal(pausedAt) {
+				t.Fatalf("record = %+v; want Paused owing nothing, in its place in the reclaim order", rec)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("durable record never returned to Paused: rec=%+v err=%v", rec, gerr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

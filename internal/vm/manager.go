@@ -3398,9 +3398,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	prev := m.vms[vmID]
 	m.mu.RUnlock()
 	restoreFromPaused := false
+	var prevPausedAt time.Time
 	if prev != nil {
 		prev.mu.RLock()
 		restoreFromPaused = prev.Status == StatusPaused
+		prevPausedAt = prev.PausedAt
 		prev.mu.RUnlock()
 	}
 	if wakeProtocolFloorRaised() {
@@ -3483,8 +3485,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		Supervision:  prevSupervision,
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
-		TeamID:       teamID,
-		OwnerID:      ownerID,
+		// Kept through the launch: a failure returns a restore from a paused
+		// record to Paused in its place in the reclaim order; the commit clears it.
+		PausedAt: prevPausedAt,
+		TeamID:   teamID,
+		OwnerID:  ownerID,
 
 		PreviewAccess:              previewAccess,
 		PreviewPorts:               clonePreviewPorts(previewPorts),
@@ -4016,11 +4021,22 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	if wakeErr != nil {
 		err := wakeErr
+		// The verdict this failure leaves behind. A wake the guest refused
+		// as another freeze's is terminal: Error, owing nothing, or recovery
+		// would read it as a resume to return to Paused. A wake that merely
+		// did not happen on an image the record was paused into leaves that
+		// image intact: the record returns to Paused, as a resume's failure
+		// does, rather than to an Error a restart would reap as stale.
+		verdict := StatusError
 		if errors.Is(err, ErrGuestTokenMismatch) {
-			// Terminal: the Error written below must not owe a wake, or
-			// recovery would read it as a resume to return to Paused.
 			inst.mu.Lock()
 			inst.WakePending, inst.WakeOwedFromPaused = false, false
+			inst.dropWakeImage()
+			inst.mu.Unlock()
+		} else if restoreFromPaused {
+			verdict = StatusPaused
+			inst.mu.Lock()
+			inst.WakePending, inst.ClockFrozen, inst.WakeOwedFromPaused, inst.Unverified = false, false, false, false
 			inst.dropWakeImage()
 			inst.mu.Unlock()
 		}
@@ -4057,11 +4073,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if stillTracked {
 			// Mark the failure in-memory BEFORE returning: only the durable
 			// write may be deferred. A same-ID retry that wins the lifecycle
-			// lock right after this RPC returns must see Error — a lingering
-			// Running/Unverified corpse would route it into re-verifying a
-			// stopped VM instead of relaunching.
+			// lock right after this RPC returns must see the verdict — a
+			// lingering Running/Unverified corpse would route it into
+			// re-verifying a stopped VM instead of relaunching.
 			inst.mu.Lock()
-			inst.Status = StatusError
+			inst.Status = verdict
 			inst.mu.Unlock()
 		}
 		go func() {
@@ -4100,7 +4116,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				// construction.
 				m.persistState(cur)
 			} else {
-				m.setStatus(vmID, StatusError)
+				m.setStatus(vmID, verdict)
 			}
 			// DestroyVM bypasses the lifecycle lock, so its record delete
 			// can interleave anywhere around EITHER write above and be

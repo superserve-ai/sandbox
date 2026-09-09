@@ -1577,7 +1577,6 @@ func main() {
 	// creates none.
 	vm.RecognizeWakeProtocolFloor()
 	vm.PrimeWakeProtocolFloor(log)
-	mgr.WatchTemplateManifests(ctx, log)
 
 	// ---- Background full reattach ----
 	// Off the critical path (requests load their VM on demand); proactively
@@ -1593,6 +1592,11 @@ func main() {
 		case <-ctx.Done():
 			return
 		}
+		// The template watch is fleet-sized filesystem work as well: two
+		// globs and a manifest read per template, so it starts here, after
+		// readiness. A frozen restore that arrives first raises the floor
+		// itself.
+		mgr.WatchTemplateManifests(ctx, log)
 		// O(N) reattach, off the critical path — timed here (not via the
 		// single-goroutine marks) and flagged concurrent, distinct message, so
 		// its phase_ms is never summed into the partition. count sizes a
