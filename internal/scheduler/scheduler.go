@@ -177,24 +177,25 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 						Msg("host list refresh failed; serving stale until the grace window expires")
 					return
 				}
-				s.publish(key, fresh, inv)
+				s.publish(key, fresh, inv, entry.gen)
 			}()
 		}
 		return entry, nil
 	}
 
-	// Blocking load: one fill per capability set at a time, run outside the
-	// mutex, so a slow fill for one set never stalls selects for the others.
-	// The flight publishes on the leader's invalidation snapshot, the most
-	// conservative one; every waiter shares its result.
-	ch := s.fills.DoChan(key, func() (any, error) {
+	// Blocking load: one fill per capability set and invalidation epoch at a
+	// time, run outside the mutex, so a slow fill for one set never stalls
+	// selects for the others. The epoch is part of the flight's identity so
+	// a caller arriving after an Invalidate never joins a fill that began
+	// before it and would hand back what that invalidation retired.
+	ch := s.fills.DoChan(fmt.Sprintf("%s\x00%d", key, inv), func() (any, error) {
 		fillCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostsFillTimeout)
 		defer cancel()
 		fresh, err := s.fillEntry(fillCtx, normalized)
 		if err != nil {
 			return nil, err
 		}
-		return s.publish(key, fresh, inv), nil
+		return s.publish(key, fresh, inv, 0), nil
 	})
 	select {
 	case res := <-ch:
@@ -207,16 +208,23 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	}
 }
 
-// publish caches fresh for key under a new generation, unless an Invalidate
-// landed after the load began (invalidations moved past inv): a set read
-// before an invalidation may be what it invalidated, so it is served to the
-// request that loaded it but not cached. Returns the entry as it should be
-// served, stamped only if cached.
-func (s *LeastLoaded) publish(key string, fresh hostCacheEntry, inv uint64) hostCacheEntry {
+// publish caches fresh for key under a new generation, unless it is stale:
+// an Invalidate landed after the load began (invalidations moved past inv),
+// or, for a background refresh of the set stamped refreshOf, that set is no
+// longer the cached one — a rejection or a blocking fill replaced it with
+// something newer, which an older snapshot must not overwrite. A set that
+// is not cached is still returned, to be served to the request that loaded
+// it. refreshOf is 0 for a blocking fill.
+func (s *LeastLoaded) publish(key string, fresh hostCacheEntry, inv, refreshOf uint64) hostCacheEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.invalidations != inv {
 		return fresh
+	}
+	if refreshOf != 0 {
+		if cur, ok := s.cache[key]; !ok || cur.gen != refreshOf {
+			return fresh
+		}
 	}
 	s.gen++
 	fresh.gen = s.gen

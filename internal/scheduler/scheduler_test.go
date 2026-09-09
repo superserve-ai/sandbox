@@ -686,3 +686,85 @@ func TestBackgroundRefreshPublishesANewGeneration(t *testing.T) {
 		t.Fatalf("queries = %d, want 2 (the refreshed set must survive the stale rejection)", n)
 	}
 }
+
+// A background refresh that started from a set later replaced by a
+// rejection reload must not land its older snapshot on top of the reload.
+func TestOldRefreshCannotReplaceARejectionReload(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	_, gen, err := s.SelectHost(context.Background(), nil) // query 1: host-1
+	if err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	setCachedAtForTest(t, s, nil, time.Now().Add(-2*time.Minute))
+	store.block = make(chan struct{})
+	store.blockOnCall = 2                                                 // hold the refresh
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil { // stale serve; refresh (query 2) starts and blocks
+		t.Fatalf("stale select: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for store.calls.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("refresh never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	s.Reject("host-1", nil, gen)                                                             // the served host failed its pre-flight
+	if id, _, err := s.SelectHost(context.Background(), nil); err != nil || id != "host-3" { // query 3: rejection reload
+		t.Fatalf("reload = (%q, %v), want host-3", id, err)
+	}
+	close(store.block) // the older refresh now returns host-2
+	deadline = time.Now().Add(2 * time.Second)
+	for s.refreshing.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("refresh never finished")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if id, _, _ := readCacheForTest(s, nil); id != "host-3" {
+		t.Fatalf("cached = %q after the old refresh landed, want host-3 kept", id)
+	}
+}
+
+// A create arriving after an Invalidate must not join a fill that began
+// before it: it starts its own, and gets what the DB says now.
+func TestFillAfterInvalidateDoesNotJoinAnOlderFlight(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	store.block = make(chan struct{})
+	store.blockOnCall = 1 // hold the cold fill
+	first := make(chan string, 1)
+	go func() {
+		id, _, _ := s.SelectHost(context.Background(), nil) // query 1, held
+		first <- id
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.calls.Load() < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("cold fill never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	s.Invalidate() // a host status change lands while that fill is in flight
+
+	second := make(chan string, 1)
+	go func() {
+		id, _, _ := s.SelectHost(context.Background(), nil) // must run its own fill: query 2
+		second <- id
+	}()
+	select {
+	case id := <-second:
+		if id != "host-2" {
+			t.Fatalf("post-invalidate select = %q, want host-2 from its own fill", id)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("post-invalidate select joined the older, held fill")
+	}
+	close(store.block)
+	if id := <-first; id != "host-1" {
+		t.Fatalf("pre-invalidate select = %q, want its own host-1", id)
+	}
+	if id, _, _ := readCacheForTest(s, nil); id != "host-2" {
+		t.Fatalf("cached = %q, want host-2 (the pre-invalidate fill must not be cached)", id)
+	}
+}
