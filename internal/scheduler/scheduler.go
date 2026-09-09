@@ -156,16 +156,7 @@ func (s *LeastLoaded) fillEntry(ctx context.Context, normalized []string) (hostC
 // re-attests the chosen host and re-selects when that rejects it.
 func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []string) (hostCacheEntry, error) {
 	key, normalized := capabilityCacheKey(requiredCapabilities)
-	s.mu.RLock()
-	entry, cached := s.cache[key]
-	inv := s.invalidations
-	s.mu.RUnlock()
-
-	// An expired set with nothing to place on is reloaded in line: serving
-	// it would refuse a create the DB may already be able to place.
-	if cached && time.Since(entry.cachedAt) >= s.ttl() && s.cannotPlace(entry) {
-		cached = false
-	}
+	entry, cached, inv := s.snapshot(key)
 	if cached {
 		if time.Since(entry.cachedAt) >= s.ttl() && s.claimRefresh(key) {
 			// Detached: the refresh outlives the triggering request. On error the
@@ -190,13 +181,7 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	// run outside the mutex so a slow fill never stalls other sets. The epoch
 	// keeps a caller arriving after an Invalidate off an older flight.
 	ch := s.fills.DoChan(fmt.Sprintf("%s\x00%d", key, inv), func() (any, error) {
-		fillCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostsFillTimeout)
-		defer cancel()
-		fresh, err := s.fillEntry(fillCtx, normalized)
-		if err != nil {
-			return nil, err
-		}
-		return s.publish(key, fresh, inv, 0), nil
+		return s.fill(ctx, key, normalized, inv)
 	})
 	select {
 	case res := <-ch:
@@ -207,6 +192,36 @@ func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []stri
 	case <-ctx.Done():
 		return hostCacheEntry{}, ctx.Err()
 	}
+}
+
+// snapshot returns the servable cached set for key, if any, and the current
+// invalidation epoch. An expired set with nothing to place on is not
+// servable: serving it would refuse a create the DB may already be able to
+// place, so it is reloaded in line instead.
+func (s *LeastLoaded) snapshot(key string) (entry hostCacheEntry, ok bool, inv uint64) {
+	s.mu.RLock()
+	entry, ok = s.cache[key]
+	inv = s.invalidations
+	s.mu.RUnlock()
+	if ok && time.Since(entry.cachedAt) >= s.ttl() && s.cannotPlace(entry) {
+		ok = false
+	}
+	return entry, ok, inv
+}
+
+// fill is one blocking load: it serves what an earlier flight for this key
+// published since the caller saw the miss, else reads the DB and publishes.
+func (s *LeastLoaded) fill(ctx context.Context, key string, normalized []string, inv uint64) (hostCacheEntry, error) {
+	if entry, ok, _ := s.snapshot(key); ok {
+		return entry, nil
+	}
+	fillCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostsFillTimeout)
+	defer cancel()
+	fresh, err := s.fillEntry(fillCtx, normalized)
+	if err != nil {
+		return hostCacheEntry{}, err
+	}
+	return s.publish(key, fresh, inv, 0), nil
 }
 
 // claimRefresh reserves the refresh slot for key; false if one is running.

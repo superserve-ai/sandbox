@@ -857,3 +857,40 @@ func TestFreshHitDoesNotBlockLaterRefresh(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// A caller that saw the miss just before an earlier flight for the same key
+// published must serve that entry, not run another DB fill.
+func TestLateFillServesWhatAnEarlierFlightPublished(t *testing.T) {
+	store := &hostStore{}
+	s := &LeastLoaded{DB: db.New(store), TTL: time.Minute}
+	key, normalized := capabilityCacheKey(nil)
+	_, _, inv := s.snapshot(key)                                          // the miss this caller saw
+	if _, _, err := s.SelectHost(context.Background(), nil); err != nil { // the earlier flight: query 1
+		t.Fatalf("prime: %v", err)
+	}
+	entry, err := s.fill(context.Background(), key, normalized, inv) // this caller's flight, started late
+	if err != nil {
+		t.Fatalf("fill: %v", err)
+	}
+	if got := store.calls.Load(); got != 1 {
+		t.Fatalf("DB fills = %d, want 1 (the late flight must serve the published set)", got)
+	}
+	if entry.hosts[0].ID != "host-1" {
+		t.Fatalf("late fill served %q, want host-1", entry.hosts[0].ID)
+	}
+
+	// An expired empty set is not a usable answer: the late flight reloads.
+	store.emptyUntilCall = 2
+	s.Invalidate()
+	_, _, inv = s.snapshot(key)
+	if _, _, err := s.SelectHost(context.Background(), nil); err == nil { // query 2: empty
+		t.Fatal("empty set placed a host")
+	}
+	setCachedAtForTest(t, s, nil, time.Now().Add(-2*time.Minute))
+	if _, err := s.fill(context.Background(), key, normalized, inv); err != nil { // query 3: host-3
+		t.Fatalf("fill after expired empty set: %v", err)
+	}
+	if got := store.calls.Load(); got != 3 {
+		t.Fatalf("DB fills = %d, want 3 (an expired empty set is reloaded)", got)
+	}
+}
