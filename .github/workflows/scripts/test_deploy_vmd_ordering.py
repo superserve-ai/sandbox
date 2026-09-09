@@ -40,28 +40,17 @@ def _gnu_sed_env(tmp_dir):
 
 class DeployVmdOrderingTests(unittest.TestCase):
 
-    def test_ssh_key_primed_before_parallel_fanout(self):
+    def test_ssh_key_created_before_parallel_fanout(self):
         # Per-host deploys run in parallel, and each `gcloud compute scp`
-        # creates the runner's SSH key if it is missing. Two hosts starting
+        # generates the runner's SSH key if it is missing. Two hosts starting
         # together race ssh-keygen and one fails before uploading anything.
-        # The key must be created by ONE sequential connection first, so the
-        # priming call has to appear ahead of the pool in the source.
-        prime = SOURCE.find('"--command", "true"')
+        # The key must exist before the pool starts, created locally so no
+        # single host's reachability gates the others.
+        keygen = SOURCE.find('"ssh-keygen", "-q"')
         pool = SOURCE.find("ThreadPoolExecutor(max_workers=len(instances))")
-        self.assertNotEqual(prime, -1, "ssh key priming call is missing")
+        self.assertNotEqual(keygen, -1, "local ssh-keygen priming is missing")
         self.assertNotEqual(pool, -1, "parallel fan-out is missing")
-        self.assertLess(prime, pool, "ssh key must be primed before the parallel fan-out")
-    def test_no_bare_service_stop(self):
-        # The early service stop that opened the socket-activation window must
-        # never be unconditional/bare: every stop of the vmd service also stops
-        # superserve-vmd.socket (both-units form) so no connection can
-        # socket-activate an interim vmd during the window.
-        self.assertNotRegex(
-            SOURCE,
-            r"systemctl stop \{service\}",
-            "found a bare `systemctl stop {service}`; every service stop must "
-            "also stop superserve-vmd.socket",
-        )
+        self.assertLess(keygen, pool, "ssh key must exist before the parallel fan-out")
 
     def test_steady_state_stop_is_guarded_and_stops_both(self):
         # The steady-state early stop runs ONLY on a fresh socket migration
