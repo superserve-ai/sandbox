@@ -28,7 +28,7 @@ func (s BuildStatus) IsTerminal() bool {
 }
 
 // buildRecord is the in-memory state of one build. The record is keyed in
-// Manager.builds by the build VM ID (which is also "build-" + templateID).
+// Manager.builds by the build VM ID.
 //
 // Records are kept indefinitely after terminal status so polling
 // consumers that come back late (e.g. supervisor after a control plane
@@ -70,6 +70,12 @@ type buildRecord struct {
 	// logs is the build's per-build log buffer. Publishers append; SSE /
 	// gRPC stream consumers subscribe. Closed on terminal status.
 	logs *buildLogBuffer
+
+	// workerDone is closed when the build's worker returns, after its
+	// subprocess has exited. A cancelled build is terminal before that, and
+	// its id stays reserved until then: a retry that took the id earlier
+	// would prepare a directory the old subprocess can still write to.
+	workerDone chan struct{}
 }
 
 // Snapshot is the client-visible read view of a buildRecord (no cancel fn).
@@ -97,7 +103,7 @@ func (m *Manager) initBuildRegistry() {
 // registerBuild inserts a new record in the registry. Fails if a build
 // with the same ID is already in-flight — the caller is expected to pick a
 // unique buildVMID per BuildTemplate invocation.
-func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB uint32, cancel context.CancelFunc) (*buildRecord, error) {
+func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB uint32, cancel context.CancelFunc, prepare func() error) (*buildRecord, error) {
 	m.initBuildRegistry()
 	// An adoption reconcile for this template+build may be mid-flight
 	// with stamped-metadata writes pending; cancel it and AWAIT its exit
@@ -116,8 +122,24 @@ func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB ui
 	}
 	m.buildsMu.Lock()
 	defer m.buildsMu.Unlock()
-	if existing, ok := m.builds[buildVMID]; ok && !existing.Status.IsTerminal() {
-		return nil, fmt.Errorf("build %s already in flight", buildVMID)
+	if existing, ok := m.builds[buildVMID]; ok {
+		if !existing.Status.IsTerminal() {
+			return nil, fmt.Errorf("build %s already in flight", buildVMID)
+		}
+		if existing.workerDone != nil {
+			select {
+			case <-existing.workerDone:
+			default:
+				return nil, fmt.Errorf("build %s is still shutting down; retry once it has exited", buildVMID)
+			}
+		}
+	}
+	// Under the lock, so nothing can claim the id between the check above
+	// and whatever prepare removes.
+	if prepare != nil {
+		if err := prepare(); err != nil {
+			return nil, err
+		}
 	}
 	rec := &buildRecord{
 		BuildVMID:  buildVMID,
@@ -128,6 +150,7 @@ func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB ui
 		StartedAt:  time.Now(),
 		cancel:     cancel,
 		logs:       newBuildLogBuffer(),
+		workerDone: make(chan struct{}),
 	}
 	m.builds[buildVMID] = rec
 	// Pressure counters pair with the worker-exit release in

@@ -1904,7 +1904,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
-          $ref: "#/components/responses/InternalError"
+          $ref: "#/components/responses/FilesInternalError"
 
     post:
       operationId: writeFile
@@ -1934,7 +1934,7 @@ paths:
         "507":
           $ref: "#/components/responses/StorageFull"
         "500":
-          $ref: "#/components/responses/InternalError"
+          $ref: "#/components/responses/FilesInternalError"
 
   /templates:
     get:
@@ -4343,6 +4343,35 @@ components:
               type: string
             message:
               type: string
+    FilesystemError:
+      description: >
+        Error envelope for a failure raised by the sandbox's own filesystem
+        rather than by the platform — typically a network or FUSE mount
+        attached inside the sandbox. `error.code` is
+        `sandbox_filesystem_error`; `errno` names the failure (for example
+        `ESTALE` or `EIO`) and `mount` identifies the mountpoint and
+        filesystem type that served the path.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            error:
+              type: object
+              required: [code, errno]
+              properties:
+                code:
+                  const: sandbox_filesystem_error
+                errno:
+                  type: string
+                path:
+                  type: string
+                mount:
+                  type: object
+                  properties:
+                    mountpoint:
+                      type: string
+                    fstype:
+                      type: string
 
   responses:
     BadRequest:
@@ -4398,6 +4427,18 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    FilesInternalError:
+      description: >
+        Internal server error. When `error.code` is
+        `sandbox_filesystem_error`, the sandbox's own filesystem rejected the
+        operation and the body also carries `errno`, `path`, and the `mount`
+        that served it.
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/Error"
+              - $ref: "#/components/schemas/FilesystemError"
     ServiceUnavailable:
       description: >
         The sandbox is not currently running (for example, paused) or is
