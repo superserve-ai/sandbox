@@ -18,7 +18,7 @@ type PeerStream interface {
 	CloseSend() error
 }
 
-// PeerClient is the small portion of the generated SS-470 client used by the pool.
+// PeerClient is the small portion of the generated peer-proxy client used by the pool.
 type PeerClient interface {
 	OpenPeerStream(context.Context) (PeerStream, error)
 }
@@ -68,17 +68,20 @@ func (c *generatedPeerClient) watchTransport() {
 }
 
 func (c *generatedPeerClient) OpenPeerStream(ctx context.Context) (PeerStream, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	s, err := c.client.Forward(ctx)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	return &generatedPeerStream{BidiStreamingClient: s}, nil
+	return &generatedPeerStream{BidiStreamingClient: s, cancel: cancel}, nil
 }
 
 type generatedPeerStream struct {
 	grpc.BidiStreamingClient[peerpb.PeerProxyFrame, peerpb.PeerProxyFrame]
 	mu      sync.Mutex
 	pending []byte
+	cancel  context.CancelFunc
 }
 
 func (s *generatedPeerStream) Read(p []byte) (int, error) {
@@ -106,7 +109,7 @@ func (s *generatedPeerStream) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
-func (s *generatedPeerStream) Close() error { return s.CloseSend() }
+func (s *generatedPeerStream) Close() error { s.cancel(); return nil }
 
 // PeerTransport opens streams through a bounded per-host pool.
 type PeerTransport interface {

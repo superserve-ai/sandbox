@@ -585,8 +585,8 @@ func TestRecordPeerEventEmitsLifecycleMetricsWithBoundedAttributes(t *testing.T)
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	t.Cleanup(func() { _ = provider.Shutdown(ctx) })
 	meter := provider.Meter(instrumentationName)
-	gauge := func(name string) metric.Int64Gauge {
-		v, err := meter.Int64Gauge(name)
+	gauge := func(name string) metric.Int64UpDownCounter {
+		v, err := meter.Int64UpDownCounter(name)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -608,6 +608,11 @@ func TestRecordPeerEventEmitsLifecycleMetricsWithBoundedAttributes(t *testing.T)
 	r.RecordPeerEvent(ctx, PeerEvent{Kind: "stream", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: 1})
 	r.RecordPeerEvent(ctx, PeerEvent{Kind: "handshake", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Duration: 250 * time.Millisecond})
 	r.RecordPeerEvent(ctx, PeerEvent{Kind: "drain", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Forced: true})
+	for _, kind := range []string{"connection", "stream"} {
+		for _, delta := range []int64{1, 1, -1} {
+			r.RecordPeerEvent(ctx, PeerEvent{Kind: kind, Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: delta})
+		}
+	}
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(ctx, &rm); err != nil {
 		t.Fatal(err)
@@ -624,6 +629,11 @@ func TestRecordPeerEventEmitsLifecycleMetricsWithBoundedAttributes(t *testing.T)
 					attrs = append(attrs, p.Attributes)
 				}
 			case metricdata.Sum[int64]:
+				if m.Name == "peer_connections" || m.Name == "peer_active_streams" {
+					if d.IsMonotonic || len(d.DataPoints) != 1 || d.DataPoints[0].Value != 2 {
+						t.Fatalf("incorrect active total: %+v", d)
+					}
+				}
 				for _, p := range d.DataPoints {
 					attrs = append(attrs, p.Attributes)
 				}
