@@ -24,7 +24,7 @@ type PeerPoolTelemetry interface {
 	PeerFailure()
 	PeerReconnect(result string)
 	PeerDrain(forced bool)
-	PeerHandshake(time.Duration)
+	PeerHandshake(time.Duration, string)
 }
 
 // RecorderPeerTelemetry adapts the shared telemetry Recorder to pool events.
@@ -54,21 +54,21 @@ func (t RecorderPeerTelemetry) PeerReconnect(result string) {
 	t.emitResult("reconnect", 0, false, result)
 }
 func (t RecorderPeerTelemetry) PeerDrain(f bool) { t.emit("drain", 0, f) }
-func (t RecorderPeerTelemetry) PeerHandshake(d time.Duration) {
+func (t RecorderPeerTelemetry) PeerHandshake(d time.Duration, result string) {
 	if t.Recorder == nil {
 		return
 	}
-	t.Recorder.RecordPeerEvent(context.Background(), telemetry.PeerEvent{Kind: "handshake", Duration: d, HostID: t.HostID, Region: t.Region, Result: telemetry.ResultSuccess})
+	t.Recorder.RecordPeerEvent(context.Background(), telemetry.PeerEvent{Kind: "handshake", Duration: d, HostID: t.HostID, Region: t.Region, Result: result})
 }
 
 type noopPeerTelemetry struct{}
 
-func (noopPeerTelemetry) PeerConnection(int)          {}
-func (noopPeerTelemetry) PeerStream(int)              {}
-func (noopPeerTelemetry) PeerFailure()                {}
-func (noopPeerTelemetry) PeerReconnect(string)        {}
-func (noopPeerTelemetry) PeerDrain(bool)              {}
-func (noopPeerTelemetry) PeerHandshake(time.Duration) {}
+func (noopPeerTelemetry) PeerConnection(int)                  {}
+func (noopPeerTelemetry) PeerStream(int)                      {}
+func (noopPeerTelemetry) PeerFailure()                        {}
+func (noopPeerTelemetry) PeerReconnect(string)                {}
+func (noopPeerTelemetry) PeerDrain(bool)                      {}
+func (noopPeerTelemetry) PeerHandshake(time.Duration, string) {}
 
 type peerPool struct {
 	mu     sync.Mutex
@@ -414,10 +414,15 @@ retry:
 		started := time.Now()
 		client, closer, e := h.parent.cfg.Dial(dialCtx, h.host, addr)
 		dialCancel()
-		h.parent.cfg.Telemetry.PeerHandshake(time.Since(started))
+		duration := time.Since(started)
 		h.mu.Lock()
 		h.dialing = false
 		h.dialCancel = nil
+		result := telemetry.ResultSuccess
+		if e != nil || h.closed || generation != h.endpointGeneration || addr != h.addr {
+			result = telemetry.ResultError
+		}
+		h.parent.cfg.Telemetry.PeerHandshake(duration, result)
 		// Shutdown may have started while the dial was out of lock.  A
 		// failed dial must not enter the reconnect/backoff path after the
 		// host has been closed, and a successful one must never be published.
@@ -757,8 +762,8 @@ func (s *countedPeerStream) Read(p []byte) (int, error) {
 }
 func (s *countedPeerStream) Write(p []byte) (int, error) {
 	n, e := s.PeerStream.Write(p)
-	if e != nil && e != io.EOF {
-		if !peerRPCError(e) {
+	if e != nil {
+		if e != io.EOF && !peerRPCError(e) {
 			s.host.markFailed(s.conn)
 		}
 		_ = s.Close()
