@@ -494,11 +494,14 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir, pa
 	return resp.SnapshotPath, resp.MemFilePath, manifest, acked, nil
 }
 
-func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, networkConfig []byte) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
 	req := &vmdpb.ResumeVMRequest{
-		VmId:         vmID,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
+		VmId:                  vmID,
+		SnapshotPath:          snapshotPath,
+		MemFilePath:           memPath,
+		PreviewAccess:         previewAccess,
+		PreviewPorts:          previewPortsToProto(previewPorts),
+		PreviewPolicyRevision: previewPolicyRevision,
 	}
 	if len(networkConfig) > 0 {
 		var persisted struct {
@@ -509,7 +512,7 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 			} `json:"egress"`
 		}
 		if err := json.Unmarshal(networkConfig, &persisted); err != nil {
-			return "", 0, 0, fmt.Errorf("parse persisted network_config: %w", err)
+			return "", 0, 0, vmdclient.ResumeAttestation{}, fmt.Errorf("parse persisted network_config: %w", err)
 		}
 		if len(persisted.Egress.AllowedCIDRs) != 0 || len(persisted.Egress.DeniedCIDRs) != 0 || len(persisted.Egress.AllowedDomains) != 0 {
 			req.SandboxNetwork = &vmdpb.SandboxNetworkConfig{
@@ -523,14 +526,18 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 	}
 	resp, err := c.client.ResumeVM(ctx, req)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("gRPC ResumeVM: %w", err)
+		return "", 0, 0, vmdclient.ResumeAttestation{}, fmt.Errorf("gRPC ResumeVM: %w", err)
 	}
 	var actualVcpu, actualMemMiB uint32
 	if rl := resp.GetResourceLimits(); rl != nil {
 		actualVcpu = rl.GetVcpuCount()
 		actualMemMiB = rl.GetMemoryMib()
 	}
-	return resp.IpAddress, actualVcpu, actualMemMiB, nil
+	return resp.IpAddress, actualVcpu, actualMemMiB, vmdclient.ResumeAttestation{
+		PreviewProtocol:       resp.GetPreviewProtocol(),
+		PreviewPolicyRevision: resp.GetPreviewPolicyRevision(),
+		NetworkRulesApplied:   resp.GetNetworkRulesApplied(),
+	}, nil
 }
 
 // RestoreSnapshot is the stateless restore path — VMD creates a fresh VM

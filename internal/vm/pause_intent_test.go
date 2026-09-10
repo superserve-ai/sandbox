@@ -98,7 +98,7 @@ func TestInterruptedPauseRefusesResumeAndRestore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, rerr := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
+	_, _, rerr := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 	unlock()
 	if status.Code(rerr) != codes.FailedPrecondition || launched {
 		t.Fatalf("resume: err=%v launched=%v, want FailedPrecondition before launch", rerr, launched)
@@ -164,7 +164,7 @@ func TestFloorDownLooksForNoIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil || !launched {
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil || !launched {
 		t.Fatalf("resume: err=%v launched=%v, want the resume to proceed without looking", err, launched)
 	}
 	if _, err := os.Stat(pauseIntentPath(dir)); err != nil {
@@ -200,7 +200,7 @@ func TestCompletedPauseIntentClearsItself(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil || !launched {
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil || !launched {
 		t.Fatalf("resume: err=%v launched=%v, want the completed pause's intent cleared and the resume to proceed", err, launched)
 	}
 	if _, err := os.Stat(pauseIntentPath(dir)); !os.IsNotExist(err) {

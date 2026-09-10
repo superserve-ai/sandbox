@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -210,5 +211,35 @@ func TestIntegration_RevertResumeToPaused_ArmsPatchedWindow(t *testing.T) {
 		if !row.AutoDeleteAt.Valid || !row.AutoDeleteAt.Time.After(time.Now()) {
 			t.Fatalf("window %d patched while resuming, after revert at=%v, want a fresh deadline in the future", window, row.AutoDeleteAt.Time)
 		}
+	}
+}
+
+// The claim carries the snapshot's timestamp, and the injection record
+// lands on the row: the two sides of the resume-time secrets reuse check.
+func TestIntegration_ClaimResume_CarriesSnapshotTimeAndSecretEnvRecord(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	sandboxID := seedPausedSandbox(t, apiKey)
+
+	fingerprint, ip := "abc123", "10.0.0.5"
+	if err := testQueries.RecordSandboxSecretEnv(ctx, db.RecordSandboxSecretEnvParams{
+		ID: sandboxID, SecretEnvFingerprint: &fingerprint, SecretEnvIp: &ip,
+		SecretEnvExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	claimed, err := testQueries.ClaimResume(ctx, db.ClaimResumeParams{
+		ID: sandboxID, TeamID: teamID, LockKey: sandboxID.String(),
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed.SnapCreatedAt.Valid || claimed.SnapCreatedAt.Time.After(time.Now()) {
+		t.Fatalf("snap_created_at = %v, want the pause's timestamp", claimed.SnapCreatedAt)
+	}
+	sb := claimed.Sandbox
+	if sb.SecretEnvFingerprint == nil || *sb.SecretEnvFingerprint != fingerprint || sb.SecretEnvIp == nil || *sb.SecretEnvIp != ip ||
+		!sb.SecretEnvInjectedAt.Valid || !sb.SecretEnvExpiresAt.Valid {
+		t.Fatalf("claimed row secret env = %v/%v/%v/%v, want the recorded values", sb.SecretEnvFingerprint, sb.SecretEnvIp, sb.SecretEnvInjectedAt, sb.SecretEnvExpiresAt)
 	}
 }

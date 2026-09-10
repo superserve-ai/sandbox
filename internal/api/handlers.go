@@ -916,12 +916,21 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	tVmdStart = time.Now()
 	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdBootTimeout)
 	defer bootCancel()
+	// The policy rides the request so the daemon stamps it before the guest
+	// runs; the attestation says what it applied. A retry that adopts the
+	// earlier attempt's VM attests the same way.
+	var attested vmdclient.ResumeAttestation
+	statelessFallback := false
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), sandbox.HostID, func(ctx context.Context) (string, uint32, uint32, error) {
-		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig)
+		ip, vcpu, memMiB, att, rerr := vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig, resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision)
+		attested = att
+		return ip, vcpu, memMiB, rerr
 	})
 	tVmdEnd = time.Now()
 	if err != nil {
 		if isVMDNotFound(err) {
+			statelessFallback = true
+			attested = vmdclient.ResumeAttestation{}
 			l.Warn().Err(err).
 				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
@@ -1031,10 +1040,6 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
-	// Re-read and push after the VM is present. A publication mutation can race
-	// the stateless restore while VMD returns NotFound to the mutation push; this
-	// final authoritative snapshot closes that window. If a later mutation wins,
-	// VMD's monotonic revision check rejects this older snapshot.
 	// Post-stage failure: the VM is up, so re-pause rather than destroy.
 	failPost := func(err error, msg string) {
 		markRevert()
@@ -1042,49 +1047,115 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		pauseAndRevert()
 		respondError(c, ErrInternal)
 	}
-	currentPolicy, policyErr := h.loadPreviewPolicySnapshot(postCtx, sandboxID, teamID)
-	if policyErr != nil {
-		failPost(policyErr, "reload preview policy after resume failed")
-		return "", false
+
+	// The policy the claim read rode the resume request. A mutation that
+	// raced the claim converges on the daemon's record: its push lands on
+	// the paused record, and the daemon keeps the higher revision of the two.
+	// Only a missing record loses that push, so the stateless fallback still
+	// re-reads and pushes after the VM is present, as does a daemon from
+	// before the request carried the policy.
+	effectivePolicy := resumePolicy
+	reapplyPolicy := func() bool {
+		currentPolicy, policyErr := h.loadPreviewPolicySnapshot(postCtx, sandboxID, teamID)
+		if policyErr != nil {
+			failPost(policyErr, "reload preview policy after resume failed")
+			return false
+		}
+		effectivePolicy = currentPolicy
+		// A private publication may have changed while the VM was restoring.
+		// Gate the reapply against the host's current browser heartbeat too;
+		// otherwise a resume that began public could activate a
+		// concurrently-added browser policy on a downgraded host.
+		if currentPolicy.requiresBrowserCapability() {
+			if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
+				markRevert()
+				pauseAndRevert()
+				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
+				return false
+			}
+		}
+		if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.vmdAccess(), currentPolicy.vmdPorts(), currentPolicy.Revision); policyErr != nil {
+			if currentPolicy.vmdAccess() == preview.AccessLegacyPublic && isVMDUnimplemented(policyErr) {
+				// Legacy sandboxes remain compatible with a VMD from before policy
+				// updates existed. Strict resumes were capability-gated above and may
+				// never take this fallback.
+				l.Warn().Msg("vmd lacks preview policy update for legacy resume")
+			} else {
+				failPost(policyErr, "reapply preview policy after resume failed")
+				return false
+			}
+		}
+		return true
 	}
-	// A private publication may have changed while the VM was restoring. Gate
-	// the final authoritative reapply against the host's current browser
-	// heartbeat too; otherwise a resume that began public could activate a
-	// concurrently-added browser policy on a downgraded host.
-	if currentPolicy.requiresBrowserCapability() {
-		if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
-			markRevert()
-			pauseAndRevert()
-			h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
+	switch {
+	case statelessFallback:
+		if !reapplyPolicy() {
 			return "", false
 		}
+	case attested.PreviewProtocol == preview.HostCapabilityPorts:
+		// Stamped before the guest ran, or a newer policy the record already
+		// held and kept. The database may be newer still: a mutation that
+		// committed after the claim and whose own push failed. One revision
+		// read proves what is current and names the policy the reply
+		// reports; only a daemon behind it gets the full read and push.
+		currentPolicy, policyErr := h.loadPreviewPolicy(postCtx, sandboxID, teamID)
+		if policyErr != nil {
+			failPost(policyErr, "reload preview policy after resume failed")
+			return "", false
+		}
+		effectivePolicy = currentPolicy
+		switch {
+		case currentPolicy.Revision > attested.PreviewPolicyRevision:
+			l.Warn().Int64("db_revision", currentPolicy.Revision).Int64("vmd_revision", attested.PreviewPolicyRevision).
+				Msg("daemon preview policy behind the database after resume; pushing")
+			if !reapplyPolicy() {
+				return "", false
+			}
+		case resumePolicy.requiresBrowserCapability():
+			// The policy is the claim's. The host's browser heartbeat can
+			// lapse during the boot, so re-check it before activation the
+			// way the reapply does; otherwise a resume could activate a
+			// browser policy on a downgraded host.
+			if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
+				markRevert()
+				pauseAndRevert()
+				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
+				return "", false
+			}
+		}
+	case attested.PreviewProtocol == "":
+		// A daemon from before the resume request carried the policy. It may
+		// still enforce, so attest the way its generation supports. Remove
+		// once the fleet echoes.
+		l.Warn().Msg("vmd resume response carries no preview attestation; attesting via the policy RPC (version skew)")
+		if !reapplyPolicy() {
+			return "", false
+		}
+	default:
+		// An unrecognized echo: fail closed rather than guess what it enforces.
+		failPost(fmt.Errorf("preview protocol %q", attested.PreviewProtocol), "VMD attested an unknown preview protocol at resume")
+		return "", false
 	}
-	if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.vmdAccess(), currentPolicy.vmdPorts(), currentPolicy.Revision); policyErr != nil {
-		if currentPolicy.vmdAccess() == preview.AccessLegacyPublic && isVMDUnimplemented(policyErr) {
-			// Legacy sandboxes remain compatible with a VMD from before policy
-			// updates existed. Strict resumes were capability-gated above and may
-			// never take this fallback.
-			l.Warn().Msg("vmd lacks preview policy update for legacy resume")
-		} else {
-			failPost(policyErr, "reapply preview policy after resume failed")
+
+	// Egress rules must be in place before the row commits to 'active'. The
+	// daemon applies the request's rules and says so, on a VM it adopted from
+	// an earlier attempt too; the stateless restore carries none, so that
+	// path and a daemon from before the ack get them pushed here.
+	if !attested.NetworkRulesApplied {
+		if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+			failPost(err, "reapply network config on resume failed")
 			return "", false
 		}
 	}
 
-	// Apply egress rules before committing to 'active' so "active ⇒ rules
-	// applied" holds by construction. ResumeInstance carries the same rules,
-	// but the daemon's retry adoption returns a running VM without applying
-	// them, and its proxy rules do not survive a restart.
-	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
-		failPost(err, "reapply network config on resume failed")
-		return "", false
-	}
-
-	// Re-apply the current binding set before committing to 'active', so a secret
-	// attached or detached while paused takes effect — the snapshot froze the old
-	// JWT. The fresh IP binds the re-minted JWT. had_secret_bindings is
-	// trigger-set on first attach, never cleared, and was read under the lock
-	// attach takes, so false proves an empty set; NULL predates the column.
+	// The current binding set must be in the guest before the row commits to
+	// 'active', so a secret attached or detached while paused takes effect.
+	// The snapshot froze the environment as last injected; when that is the
+	// current set, bound to the IP the guest came back on, with a JWT well
+	// within its life, the guest already holds it and the re-mint and guest
+	// round trip are skipped. had_secret_bindings is trigger-set on first
+	// attach, never cleared, and was read under the lock attach takes, so
+	// false proves an empty set; NULL predates the column.
 	sandbox.IpAddress = ipAddr
 	if sandbox.HadSecretBindings == nil || *sandbox.HadSecretBindings {
 		meta, merr := h.loadSecretBindingMeta(postCtx, sandboxID)
@@ -1092,7 +1163,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			failPost(merr, "load secret bindings on resume failed")
 			return "", false
 		}
-		if len(meta) > 0 {
+		if len(meta) > 0 && !h.guestHoldsSecretEnv(*sandbox, claimed.SnapCreatedAt, meta) {
 			if aerr := h.applySecretBindings(postCtx, *sandbox, meta); aerr != nil {
 				failPost(aerr, "reapply secret bindings on resume failed")
 				return "", false
@@ -1136,7 +1207,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// ActivateSandbox's CTE opens the sandbox_active_interval row (async).
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": sandboxID.String()})
-	return currentPolicy.Access, true
+	return effectivePolicy.Access, true
 }
 
 // resolveMemPath returns the memory snapshot path from a Snapshot record.
@@ -2751,6 +2822,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				respondError(c, ErrInternal)
 				return
 			}
+		}
+		if secretsJWT != "" {
+			h.recordSecretEnv(sandboxID, ipAddress, secretMeta)
 		}
 	}
 
