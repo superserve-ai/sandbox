@@ -12,7 +12,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+func TestTrialCreditWarningWithoutSenderSkipsDatabase(t *testing.T) {
+	// A query through this unconnected database would panic.
+	h := &Handlers{DB: db.New(nil)}
+	h.processTrialCreditWarning(context.Background(), uuid.New())
+}
 
 type recordingTrialWarningSender struct {
 	teamID    uuid.UUID
@@ -146,6 +154,15 @@ func TestTrialCreditWarningEmailUsesCoarseCopyAndAuthoritativeBalance(t *testing
 	}
 }
 
+func TestTrialCreditWarningEmailEscapesTeamName(t *testing.T) {
+	teamName := `<a href="https://example.com">pilot & 'team'</a><img src="https://example.com/image.png">`
+	body := trialCreditWarningHTML(teamName, 1.234)
+	want := `<p>Team: &lt;a href=&#34;https://example.com&#34;&gt;pilot &amp; &#39;team&#39;&lt;/a&gt;&lt;img src=&#34;https://example.com/image.png&#34;&gt;</p>`
+	if !strings.Contains(body, want) || strings.Contains(body, teamName) {
+		t.Fatalf("warning email must render the team name as escaped text: %s", body)
+	}
+}
+
 func TestNumericFloatPreservesDecimalScale(t *testing.T) {
 	got, err := numericFloat(pgtype.Numeric{Int: big.NewInt(12345), Exp: -3, Valid: true})
 	if err != nil || got != 12.345 {
@@ -259,5 +276,24 @@ func TestTrialCreditWarningRejectsSparseOrStaleSamples(t *testing.T) {
 	}
 	if trialCreditWarningEligible(1, now, trialBurnSample{SpentUSD: 10, Started: now.Add(-72 * time.Hour), Ended: now.Add(-48 * time.Hour)}) {
 		t.Fatal("stale sample must not trigger")
+	}
+}
+
+func TestTrialWarningProviderIdentityFollowsRecipient(t *testing.T) {
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	sender := &ResendTrialCreditWarningSender{endpoint: server.URL, client: server.Client()}
+	token := uuid.New()
+	for _, recipient := range []string{"first@example.com", "second@example.com", "second@example.com", "first@example.com"} {
+		if err := sender.sendEmailWithKey(context.Background(), []byte(`{}`), token, recipient); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(keys) != 4 || keys[0] == "" || keys[1] == "" || keys[0] == keys[1] || keys[0] != keys[3] || keys[1] != keys[2] {
+		t.Fatalf("provider keys must distinguish recipients and survive reordering: %v", keys)
 	}
 }

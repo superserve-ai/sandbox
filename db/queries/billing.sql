@@ -1060,6 +1060,7 @@ FROM recent_compute b
          s.ended_at, s.disk_mib
   FROM sandbox_storage_interval s
   WHERE s.team_id = sqlc.arg(team_id)
+    AND feature_enabled('billing_storage_billing_enabled', sqlc.arg(team_id))
     AND s.started_at < now()
     AND COALESCE(s.ended_at, now()) > now() - interval '6 hours'
   ORDER BY s.started_at DESC
@@ -1091,6 +1092,15 @@ RETURNING claim_token;
 -- name: CompleteTrialCreditWarning :exec
 UPDATE trial_credit_warning_state SET status = 'sent', sent_at = now(), updated_at = now()
 WHERE team_id = sqlc.arg(team_id) AND status = 'claimed' AND claim_token = sqlc.arg(claim_token);
+
+-- name: ListTrialCreditWarningDeliveries :many
+SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = sqlc.arg(team_id);
+
+-- name: RecordTrialCreditWarningDelivery :execrows
+INSERT INTO trial_credit_warning_delivery (team_id, recipient)
+SELECT s.team_id, sqlc.arg(recipient)::text FROM trial_credit_warning_state s
+WHERE s.team_id = sqlc.arg(team_id) AND s.status = 'claimed' AND s.claim_token = sqlc.arg(claim_token)
+ON CONFLICT (team_id, recipient) DO NOTHING;
 
 -- name: ReleaseTrialCreditWarning :exec
 UPDATE trial_credit_warning_state SET status = 'pending', claimed_at = NULL, updated_at = now()

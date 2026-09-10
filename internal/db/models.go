@@ -911,6 +911,12 @@ type TemplateBuild struct {
 	UpdatedAt     time.Time           `json:"updated_at"`
 }
 
+type TrialCreditWarningDelivery struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	Recipient string    `json:"recipient"`
+	SentAt    time.Time `json:"sent_at"`
+}
+
 type TrialCreditWarningState struct {
 	TeamID     uuid.UUID          `json:"team_id"`
 	Status     string             `json:"status"`

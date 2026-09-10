@@ -195,7 +195,9 @@ func run() error {
 	queries := dbq.New(dbPool)
 
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
-	handlers.TrialWarningSender = api.NewResendTrialCreditWarningSender(os.Getenv("RESEND_API_KEY"), os.Getenv("QUOTA_EMAIL_FROM"), queries)
+	if apiKey, from := os.Getenv("RESEND_API_KEY"), os.Getenv("QUOTA_EMAIL_FROM"); apiKey != "" && from != "" {
+		handlers.TrialWarningSender = api.NewResendTrialCreditWarningSender(apiKey, from, queries)
+	}
 	handlers.Pool = dbPool
 	handlers.Stripe = api.NewStripeBillingClient(cfg)
 

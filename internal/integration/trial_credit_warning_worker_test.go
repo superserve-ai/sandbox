@@ -15,6 +15,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -122,6 +124,115 @@ func TestTrialWarningWorkerProviderRetryAndCompletion(t *testing.T) {
 	if calls != len(responses) {
 		t.Fatalf("provider calls = %d, want %d (two rejections and one acceptance)", calls, len(responses))
 	}
+}
+
+func TestTrialWarningWorkerPartialDeliveryRetry(t *testing.T) {
+	ctx := context.Background()
+	team := seedWarningWorkerTeam(t)
+	for i := 0; i < 3; i++ {
+		owner := seedRBACProfile(t)
+		seedMembership(t, ctx, team, owner)
+		seedTeamRoleAssignment(t, ctx, owner, mustRoleID(t, ctx, "team_owner"), team)
+	}
+	calls := 0
+	accepted := map[string]int{}
+	var firstRecipient, firstKey, retryKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body struct{ To string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if calls == 1 {
+			firstRecipient, firstKey = body.To, r.Header.Get("Idempotency-Key")
+		}
+		if calls == 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if calls == 3 {
+			retryKey = r.Header.Get("Idempotency-Key")
+		}
+		accepted[body.To]++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	newHandler := func() *api.Handlers {
+		return &api.Handlers{DB: testQueries, TrialWarningSender: api.NewTrialCreditWarningSenderForTest(testQueries, server.URL, server.Client())}
+	}
+	api.ProcessTrialCreditWarningForTest(newHandler(), ctx, team)
+	if got := warningStatus(t, team); got != "pending" {
+		t.Fatalf("partial delivery status = %s, want pending", got)
+	}
+	delivered, err := testQueries.ListTrialCreditWarningDeliveries(ctx, team)
+	if err != nil || len(delivered) != 1 || delivered[0] != firstRecipient {
+		t.Fatalf("persisted recipients = %v, error = %v", delivered, err)
+	}
+	var releasedToken pgtype.UUID
+	if err := testPool.QueryRow(ctx, `SELECT claim_token FROM trial_credit_warning_state WHERE team_id=$1`, team).Scan(&releasedToken); err != nil {
+		t.Fatal(err)
+	}
+	// A new sender and claim must retain progress from the earlier attempt.
+	api.ProcessTrialCreditWarningForTest(newHandler(), ctx, team)
+	if got := warningStatus(t, team); got != "sent" {
+		t.Fatalf("retry status = %s, want sent", got)
+	}
+	var completedToken pgtype.UUID
+	if err := testPool.QueryRow(ctx, `SELECT claim_token FROM trial_credit_warning_state WHERE team_id=$1`, team).Scan(&completedToken); err != nil {
+		t.Fatal(err)
+	}
+	if !releasedToken.Valid || !completedToken.Valid || releasedToken == completedToken {
+		t.Fatal("retry must succeed with a different durable claim token")
+	}
+	api.ProcessTrialCreditWarningForTest(newHandler(), ctx, team)
+	if calls != 4 || len(accepted) != 3 || firstKey == "" || retryKey == "" || firstKey == retryKey {
+		t.Fatalf("calls=%d accepted=%v first key=%q retry key=%q", calls, accepted, firstKey, retryKey)
+	}
+	for recipient, count := range accepted {
+		if count != 1 {
+			t.Errorf("recipient %s accepted %d messages, want 1", recipient, count)
+		}
+	}
+	delivered, err = testQueries.ListTrialCreditWarningDeliveries(ctx, team)
+	if err != nil || len(delivered) != 3 {
+		t.Fatalf("completed recipients = %v, error = %v", delivered, err)
+	}
+}
+
+func TestTrialWarningWorkerDeliveryPersistenceFailureIsNotRetried(t *testing.T) {
+	ctx := context.Background()
+	team := seedWarningWorkerTeam(t)
+	owner := seedRBACProfile(t)
+	seedMembership(t, ctx, team, owner)
+	seedTeamRoleAssignment(t, ctx, owner, mustRoleID(t, ctx, "team_owner"), team)
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	q := db.New(warningDeliveryWriteFailure{testPool})
+	h := &api.Handlers{DB: q, TrialWarningSender: api.NewTrialCreditWarningSenderForTest(q, server.URL, server.Client())}
+	api.ProcessTrialCreditWarningForTest(h, ctx, team)
+	if got := warningStatus(t, team); got != "unknown" {
+		t.Fatalf("unrecorded acceptance status = %s, want unknown", got)
+	}
+	// Restore database writes before retrying to prove the durable team state
+	// suppresses duplication after the original persistence failure is gone.
+	h = &api.Handlers{DB: testQueries, TrialWarningSender: api.NewTrialCreditWarningSenderForTest(testQueries, server.URL, server.Client())}
+	api.ProcessTrialCreditWarningForTest(h, ctx, team)
+	if calls != 1 {
+		t.Fatalf("unrecorded acceptance retried: %d calls", calls)
+	}
+}
+
+type warningDeliveryWriteFailure struct{ *pgxpool.Pool }
+
+func (q warningDeliveryWriteFailure) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(sql, "-- name: RecordTrialCreditWarningDelivery") {
+		return pgconn.CommandTag{}, fmt.Errorf("delivery persistence unavailable")
+	}
+	return q.Pool.Exec(ctx, sql, args...)
 }
 
 type warningSenderFunc func(context.Context, uuid.UUID, float64) error

@@ -85,6 +85,18 @@ func TestTrialCreditWarningStateClaimCompleteRelease(t *testing.T) {
 		t.Fatal("claim after release reused the prior claim token")
 	}
 	// A stale worker must not be able to mutate the replacement generation.
+	rows, err := testQueries.RecordTrialCreditWarningDelivery(ctx, db.RecordTrialCreditWarningDeliveryParams{
+		TeamID: teamID, ClaimToken: retryToken, Recipient: "billing@example.com",
+	})
+	if err != nil || rows != 0 {
+		t.Fatalf("stale recipient delivery write = %d rows, error = %v", rows, err)
+	}
+	rows, err = testQueries.RecordTrialCreditWarningDelivery(ctx, db.RecordTrialCreditWarningDeliveryParams{
+		TeamID: teamID, ClaimToken: newToken, Recipient: "billing@example.com",
+	})
+	if err != nil || rows != 1 {
+		t.Fatalf("current recipient delivery write = %d rows, error = %v", rows, err)
+	}
 	if err := testQueries.ReleaseTrialCreditWarning(ctx, db.ReleaseTrialCreditWarningParams{TeamID: teamID, ClaimToken: retryToken}); err != nil {
 		t.Fatalf("stale release: %v", err)
 	}

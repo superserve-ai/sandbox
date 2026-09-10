@@ -669,6 +669,7 @@ FROM recent_compute b
          s.ended_at, s.disk_mib
   FROM sandbox_storage_interval s
   WHERE s.team_id = $1
+    AND feature_enabled('billing_storage_billing_enabled', $1)
     AND s.started_at < now()
     AND COALESCE(s.ended_at, now()) > now() - interval '6 hours'
   ORDER BY s.started_at DESC
@@ -1805,6 +1806,30 @@ func (q *Queries) ListTeamsWithActiveTrialSandboxes(ctx context.Context, arg Lis
 	return items, nil
 }
 
+const listTrialCreditWarningDeliveries = `-- name: ListTrialCreditWarningDeliveries :many
+SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = $1
+`
+
+func (q *Queries) ListTrialCreditWarningDeliveries(ctx context.Context, teamID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listTrialCreditWarningDeliveries, teamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var recipient string
+		if err := rows.Scan(&recipient); err != nil {
+			return nil, err
+		}
+		items = append(items, recipient)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUnresolvedBillingPeriodAnomalies = `-- name: ListUnresolvedBillingPeriodAnomalies :many
 SELECT id, team_id, period_start, period_end, severity, kind, sandbox_id, details, detected_at, resolved_at, resolved_by
 FROM billing_period_anomaly
@@ -2181,6 +2206,27 @@ func (q *Queries) RecordTeamCreditLedgerEntry(ctx context.Context, arg RecordTea
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const recordTrialCreditWarningDelivery = `-- name: RecordTrialCreditWarningDelivery :execrows
+INSERT INTO trial_credit_warning_delivery (team_id, recipient)
+SELECT s.team_id, $1::text FROM trial_credit_warning_state s
+WHERE s.team_id = $2 AND s.status = 'claimed' AND s.claim_token = $3
+ON CONFLICT (team_id, recipient) DO NOTHING
+`
+
+type RecordTrialCreditWarningDeliveryParams struct {
+	Recipient  string      `json:"recipient"`
+	TeamID     uuid.UUID   `json:"team_id"`
+	ClaimToken pgtype.UUID `json:"claim_token"`
+}
+
+func (q *Queries) RecordTrialCreditWarningDelivery(ctx context.Context, arg RecordTrialCreditWarningDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordTrialCreditWarningDelivery, arg.Recipient, arg.TeamID, arg.ClaimToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const refreshTeamTrialEligibility = `-- name: RefreshTeamTrialEligibility :exec
