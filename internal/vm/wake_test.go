@@ -2799,3 +2799,107 @@ func TestAdHocSnapshotKeepsTheOldManifestUntilItsSnapshotLands(t *testing.T) {
 		t.Fatalf("manifest=%+v err=%v; an ad-hoc image is never marked", man, err)
 	}
 }
+
+// A restore of a paused VM from a frozen image whose launch fails, after the
+// wake-owed record was published, returns the record to Paused: the image is
+// intact, and an Error record would be reaped as stale by the next restart.
+func TestFrozenRestoreOfAPausedVMFailingBeforeItsWakeReturnsToPaused(t *testing.T) {
+	useTempFloor(t)
+	origDead := vmDeadForRetry
+	t.Cleanup(func() { vmDeadForRetry = origDead })
+	vmDeadForRetry = func(*Manager, string) bool { return true }
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	basePath := filepath.Join(dir, "base.ext4")
+	for _, p := range []string{snapPath, memPath, basePath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedFrozenManifest(t, memPath, "tok")
+	overlay := filepath.Join(dir, "vm-1", "overlay.ext4")
+	if err := os.MkdirAll(filepath.Dir(overlay), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(overlay, []byte("customer data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	pausedAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	prev := &VMInstance{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath, DiskPath: overlay, PausedAt: pausedAt}
+	if err := store.Put(toRecord(prev)); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{
+		log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir, GuestClockFreezeEnabled: true}, netMgr: &fakeNetMgr{},
+		vms: map[string]*VMInstance{"vm-1": prev}, restoreSem: make(chan struct{}, 1), state: store,
+	}
+	mgr.clockRealtimeCapable.Store(true)
+	var owedAtLaunch bool
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		mgr.mu.RLock()
+		inst := mgr.vms["vm-1"]
+		mgr.mu.RUnlock()
+		inst.mu.RLock()
+		owedAtLaunch = inst.Status == StatusRunning && inst.WakePending && inst.WakeOwedFromPaused
+		inst.mu.RUnlock()
+		return 0, SupervisionUnit, errors.New("launch failed")
+	}
+	if _, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath}, nil, "team", "owner", "", nil, 0); err == nil {
+		t.Fatal("want the launch failure")
+	}
+	if !owedAtLaunch {
+		t.Fatal("precondition: the wake-owed record must have been published before the launch")
+	}
+	rec, gerr := store.Get("vm-1")
+	if gerr != nil || rec == nil || rec.Status != StatusPaused || rec.WakePending || rec.WakeOwedFromPaused || !rec.PausedAt.Equal(pausedAt) {
+		t.Fatalf("record = %+v err=%v; want Paused, owing nothing, in its place in the reclaim order", rec, gerr)
+	}
+}
+
+// An ad-hoc snapshot over a frozen image journals the rewrite before the
+// image is replaced: a restore refuses the directory while the old manifest
+// could still govern the new image, and the journal clears with the manifest.
+func TestAdHocSnapshotOverAFrozenImageJournalsTheRewrite(t *testing.T) {
+	useTempFloor(t)
+	raiseFloorForTest(t)
+	dir := t.TempDir()
+	snapDir := filepath.Join(dir, "adhoc")
+	if err := os.MkdirAll(snapDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	memPath := filepath.Join(snapDir, "mem.snap")
+	if err := os.WriteFile(memPath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedFrozenManifest(t, memPath, "A")
+	var journalledAtSnapshot, manifestAtSnapshot, blockedAtSnapshot bool
+	fc := startSnapshotAPIFake(t, func(_, _ string) (int, string) {
+		in, _ := readPauseIntent(snapDir)
+		journalledAtSnapshot = in != nil && in.FreezeToken == ""
+		man, _ := ReadWallClockManifest(memPath)
+		manifestAtSnapshot = man != nil && man.WorkloadFrozen
+		blockedAtSnapshot, _ = pauseIntentBlocks(snapDir, "")
+		return http.StatusNoContent, ""
+	})
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath}
+	m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+	if _, _, err := m.CreateVMSnapshot(context.Background(), "vm-1", snapDir); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if !journalledAtSnapshot || !manifestAtSnapshot || !blockedAtSnapshot {
+		t.Fatalf("at the snapshot: journalled=%v manifest=%v blocked=%v; the rewrite must be journalled while the old manifest still stands, and a restore refused", journalledAtSnapshot, manifestAtSnapshot, blockedAtSnapshot)
+	}
+	if in, _ := readPauseIntent(snapDir); in != nil {
+		t.Fatalf("journal = %+v after success; want it cleared with the manifest", in)
+	}
+	if man, err := ReadWallClockManifest(memPath); err != nil || man != nil {
+		t.Fatalf("manifest=%+v err=%v; an ad-hoc image is never marked", man, err)
+	}
+}

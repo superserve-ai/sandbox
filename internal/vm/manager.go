@@ -3003,6 +3003,20 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	snapshotPath = filepath.Join(snapshotDir, "vmstate.snap")
 	memPath = filepath.Join(snapshotDir, "mem.snap")
 
+	// A directory reused over a frozen image: the image is replaced before
+	// its manifest goes, and a crash or a failed resume in between would leave
+	// the old frozen manifest governing the new unfrozen image. The rewrite is
+	// journalled first, so a restore refuses the image until the manifest is
+	// gone; the journal is cleared with it. Only a host with frozen images
+	// can hold such a manifest.
+	journalled := false
+	if wakeProtocolFloorRaised() && m.frozenManifestAt(memPath) {
+		if err := writePauseIntent(snapshotDir, pauseIntent{VMID: vmID, ArtifactID: NewArtifactID()}); err != nil {
+			return "", "", fmt.Errorf("record the ad-hoc rewrite of %q: %w", memPath, err)
+		}
+		journalled = true
+	}
+
 	// Before the snapshot, not after: CreateSnapshot consumes Firecracker's dirty
 	// bitmap and leaves the VM paused, so returning past that point would skip
 	// clearing DirtyTracked and the unpause below. Failing here has done nothing
@@ -3048,6 +3062,11 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 		return "", "", fmt.Errorf("clear wall-clock manifest for ad-hoc snapshot %q: %w", memPath, merr)
 	} else if merr != nil {
 		m.log.Warn().Err(merr).Str("vm_id", vmID).Msg("ad-hoc snapshot: a stale marker could not be removed")
+	}
+	if journalled {
+		if err := clearPauseIntent(snapshotDir); err != nil {
+			return "", "", fmt.Errorf("clear the ad-hoc rewrite journal for %q: %w", memPath, err)
+		}
 	}
 
 	return snapshotPath, memPath, nil
@@ -3636,6 +3655,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// The Running write that overlaps the readiness wait; joined before the
 	// record is trusted, and by the failure worker before it writes Error.
 	var persistDone chan struct{}
+	// Whether a wake-owed record was published for an attempt: a failure
+	// before the wake then returns a restore from a paused record to Paused.
+	wakeOwedPublished := false
 	for attempt = 1; ; attempt++ {
 		tAttemptStart = time.Now()
 		if attempt > 1 {
@@ -3722,6 +3744,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		var joinWakeOwed func(Supervision) bool
 		if restoreWorkloadFrozen {
 			joinWakeOwed = m.persistWakeOwed(inst, predictedSupervision, clockPolicy != nil, restoreFromPaused)
+			wakeOwedPublished = true
 		}
 		m.beginLaunchAttempt(inst)
 		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace || priorRunDir, freshUnit && attempt == 1)
@@ -3744,7 +3767,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if startErr != nil {
 			tFailBoundary = time.Now()
 			m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
-			m.setStatus(vmID, StatusError)
+			m.setStatus(vmID, m.preWakeFailureStatus(inst, wakeOwedPublished && restoreFromPaused))
 			return nil, fmt.Errorf("start firecracker: %w", startErr)
 		}
 		if joinWakeOwed != nil && !optimisticOK {
@@ -3756,7 +3779,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			tFailBoundary = time.Now()
 			m.stopUnitDuringRestoreError(vmID)
 			m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
-			m.setStatus(vmID, StatusError)
+			m.setStatus(vmID, m.preWakeFailureStatus(inst, wakeOwedPublished && restoreFromPaused))
 			return nil, fmt.Errorf("vm %s: wake record could not be made durable before the load", vmID)
 		}
 		publishLaunchPID(inst, pid, supervision)
@@ -4031,7 +4054,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// cleanup or it leaks. See stopUnitDuringRestoreError comment.
 		m.stopUnitDuringRestoreError(vmID)
 		m.releaseFailedRestore(vmID, inPlace, isTapDeviceBusyErr(restoreErr), cleanupAfterRestoreFailure)
-		m.setStatus(vmID, StatusError)
+		m.setStatus(vmID, m.preWakeFailureStatus(inst, wakeOwedPublished && restoreFromPaused))
 		// armLayered may have set DirtyTracked=true on inst before the restore call;
 		// clear it on failure so a lingering instance can't later take a Diff against a
 		// baseline that never loaded. (The VM is StatusError + unit stopped, so this is
@@ -8490,6 +8513,21 @@ func (m *Manager) markUnservable(inst *VMInstance, log zerolog.Logger) {
 		log.Error().Err(err).Msg("pause: guest with an unconfirmed release could not be recorded as error")
 	}
 	log.Error().Msg("pause: guest workload may still be frozen and could not be released; recorded as error")
+}
+
+// preWakeFailureStatus is the status a restore failure before the wake
+// leaves. A wake-owed record published for a paused image returns to Paused,
+// owing nothing: the image is intact, and an Error record a restart would
+// reap as stale. Anything else is Error.
+func (m *Manager) preWakeFailureStatus(inst *VMInstance, returnToPaused bool) VMStatus {
+	if !returnToPaused {
+		return StatusError
+	}
+	inst.mu.Lock()
+	inst.WakePending, inst.ClockFrozen, inst.WakeOwedFromPaused, inst.Unverified = false, false, false, false
+	inst.dropWakeImage()
+	inst.mu.Unlock()
+	return StatusPaused
 }
 
 // abandonDirtyBaseline forgets a dirty-tracking baseline a snapshot consumed
