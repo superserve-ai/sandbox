@@ -29,6 +29,8 @@ on:
       # Every internal package the host binaries import must be listed, or a
       # change to it merges without deploying. Enforced by the
       # deploy-trigger-coverage CI check against `go list -deps`.
+      - 'internal/analytics/**'
+      - 'internal/auth/**'
       - 'internal/backup/**'
       - 'internal/blocklist/**'
       - 'internal/builder/**'
@@ -37,6 +39,7 @@ on:
       - 'internal/network/**'
       - 'internal/presence/**'
       - 'internal/preview/**'
+      - 'internal/proxy/**'
       - 'internal/secretsproxy/**'
       - 'internal/sentrylog/**'
       - 'internal/shellquote/**'
@@ -79,6 +82,7 @@ on:
 concurrency:
   group: deploy-vmd
   cancel-in-progress: false
+  queue: max
 
 jobs:
   # Failing CI must not reach production control-plane hosts. CI is a

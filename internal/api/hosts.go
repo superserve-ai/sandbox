@@ -184,6 +184,17 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 			log.Warn().Str("host_id", hostID).Str("vmd_addr", req.VMDAddr).
 				Msg("host identity reclaimed from a silent holder")
 		}
+		// A running host may change its advertised proxy endpoint (for
+		// example, when peer ingress is enabled) without changing its VMD
+		// address. Persist that transition as part of the heartbeat.
+		if req.VMDAddr != "" && req.VMDAddr == host.VmdAddr &&
+			req.describesHost() && req.ProxyAddr != host.ProxyAddr {
+			if err := q.UpdateHostProxyAddress(ctx, db.UpdateHostProxyAddressParams{
+				ID: hostID, ProxyAddr: req.ProxyAddr,
+			}); err != nil {
+				return "", "", err
+			}
+		}
 
 		row, err := q.UpdateHostHeartbeat(ctx, hostID)
 		if err != nil {

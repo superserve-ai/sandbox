@@ -267,7 +267,7 @@ func TestPreviewCredentialHeaderIsScrubbedBeforePublicAndPrivateUpstreams(t *tes
 	const sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
 	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
 	received := make(chan http.Header, 2)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		received <- r.Header.Clone()
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -613,7 +613,7 @@ func TestPrivatePreviewCORSPreflightNeverReachesUpstream(t *testing.T) {
 	const sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
 	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
 	upstreamCalled := make(chan struct{}, 1)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalled <- struct{}{}
 		http.Error(w, "private application response", http.StatusTeapot)
 	}))
@@ -751,7 +751,7 @@ func TestPreviewCredentialsAreScrubbedBeforePublicAndBrowserUpstreams(t *testing
 		rawQuery string
 	}
 	received := make(chan captured, 2)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		received <- captured{header: r.Header.Clone(), rawQuery: r.URL.RawQuery}
 		w.WriteHeader(http.StatusNoContent)
 	}))

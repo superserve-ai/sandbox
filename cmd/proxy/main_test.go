@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -132,5 +134,76 @@ func TestProxyDomains(t *testing.T) {
 				t.Errorf("proxyDomains() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPeerIngressDisabledWithoutCredentials(t *testing.T) {
+	if peerIngressEnabled("") {
+		t.Fatal("peer ingress enabled without a listen address")
+	}
+}
+
+func TestPeerIngressEnabledRequiresExplicitAddress(t *testing.T) {
+	if !peerIngressEnabled("192.0.2.10:5008") {
+		t.Fatal("peer ingress not enabled with an explicit listen address")
+	}
+}
+
+func TestLocalPeerTargetRejectsPublicAndRedirectListeners(t *testing.T) {
+	for _, target := range []string{"0.0.0.0:5010", "192.0.2.1:5010", "[::]:5010", "127.0.0.1:0", "127.0.0.1:5007", "127.0.0.1:5008"} {
+		t.Run(target, func(t *testing.T) {
+			ln, err := bindLocalPeerTarget(target, ":5007", ":5008")
+			if err == nil {
+				ln.Close()
+				t.Fatal("accepted non-local or shared peer target")
+			}
+		})
+	}
+}
+
+func TestLocalPeerTargetServesLocalHandler(t *testing.T) {
+	available, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := available.Addr().String()
+	available.Close()
+	ln, err := bindLocalPeerTarget(addr, ":5007", ":5008")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := proxy.NewHandler([]string{"sandbox.test"}, nil, zerolog.Nop())
+	srv := proxy.NewServer(addr, newProxyMux(h))
+	defer srv.Close()
+	go func() { _ = srv.Serve(ln) }()
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Get("http://" + addr + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var health proxyHealthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || len(health.Capabilities) == 0 {
+		t.Fatalf("local handler response = %d, %+v", resp.StatusCode, health)
+	}
+}
+
+func TestPeerListenerRejectsPublicAndRedirectPorts(t *testing.T) {
+	for _, tc := range []struct {
+		peer, public, redirect string
+		wantError              bool
+	}{
+		{"10.0.0.2:5008", ":5007", ":5008", true},
+		{"10.0.0.2:5007", ":5007", ":5008", true},
+		{"10.0.0.2:5009", ":5007", ":05009", true},
+		{"[fd00::2]:5008", "[::]:5007", "[::]:5008", true},
+		{"10.0.0.2:5009", ":5007", ":5008", false},
+	} {
+		if err := validatePeerListener(tc.peer, tc.public, tc.redirect); (err != nil) != tc.wantError {
+			t.Errorf("validatePeerListener(%q, %q, %q) = %v", tc.peer, tc.public, tc.redirect, err)
+		}
 	}
 }

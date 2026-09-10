@@ -104,6 +104,43 @@ func TestHostHeartbeatWithoutBodyClearsCapabilities(t *testing.T) {
 	}
 }
 
+func TestHostHeartbeatSyncsProxyAddressWithoutVMDChange(t *testing.T) {
+	var updated bool
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetHostForUpdate :one"):
+				return hostRow(db.Host{ID: args[0].(string), Status: "active", VmdAddr: "10.0.0.1:50051", ProxyAddr: "10.0.0.1:5007"})
+			case strings.Contains(sql, "-- name: UpdateHostHeartbeat :one"):
+				return hostRow(db.Host{ID: args[0].(string), Status: "active"})
+			default:
+				return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
+			}
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			switch {
+			case strings.Contains(sql, "-- name: UpdateHostProxyAddress :exec"):
+				updated = true
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			case strings.Contains(sql, "-- name: SyncHostCapabilities :exec"):
+				return pgconn.NewCommandTag("DELETE 1"), nil
+			case strings.Contains(sql, "-- name: BindHostIdentity :exec"):
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			default:
+				return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec: %s", sql)
+			}
+		},
+	}
+	h := &Handlers{DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	body := `{"vmd_addr":"10.0.0.1:50051","proxy_addr":"10.0.0.1:6007","region":"region-a","capacity_memory_mib":1024,"capacity_vcpus":8}`
+	req := httptest.NewRequest(http.MethodPost, "/internal/hosts/host-a/heartbeat", strings.NewReader(body))
+	setupHostHeartbeatRouter(h).ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !updated {
+		t.Fatalf("status = %d updated = %v, want 200/true; body: %s", w.Code, updated, w.Body.String())
+	}
+}
+
 type fakeHostRegistry struct{ invalidated []string }
 
 func (f *fakeHostRegistry) ClientFor(context.Context, string) (vmdclient.Client, error) {
