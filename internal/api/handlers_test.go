@@ -1457,8 +1457,13 @@ func TestResumeSandbox_NotPaused(t *testing.T) {
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
 
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row { return sandboxRow(sb) },
-		execFn:     func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "'resuming'") {
+				return notFoundRow() // not paused: the claim finds no row
+			}
+			return sandboxRow(sb)
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.NewCommandTag(""), nil },
 	}
 	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error { return nil }}
 
@@ -1499,6 +1504,9 @@ func TestResumeSandbox_SettlesPausingToPaused(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
+				if atomic.LoadInt32(&reads) < 2 {
+					return notFoundRow() // still pausing: nothing to claim yet
+				}
 				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
@@ -1558,7 +1566,10 @@ func TestResumeSandbox_PersistentPausing_409(t *testing.T) {
 
 	var reads int32
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "'resuming'") {
+				return notFoundRow() // never paused: nothing to claim
+			}
 			atomic.AddInt32(&reads, 1)
 			return sandboxRow(sb)
 		},
@@ -1618,7 +1629,10 @@ func TestResumeSandbox_PausingDivergesToActive_409(t *testing.T) {
 
 	var reads int32
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "'resuming'") {
+				return notFoundRow() // never paused: nothing to claim
+			}
 			status := db.SandboxStatusPausing
 			if atomic.AddInt32(&reads, 1) > 1 {
 				status = db.SandboxStatusActive // pause failed; async revert landed
@@ -1651,7 +1665,10 @@ func TestResumeSandbox_CanceledDuringSettle_StopsPolling(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var reads int32
 	mock := &mockDBTX{
-		queryRowFn: func(context.Context, string, ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "'resuming'") {
+				return notFoundRow() // still pausing: nothing to claim
+			}
 			atomic.AddInt32(&reads, 1)
 			cancel() // client goes away right after the first read
 			return sandboxRow(db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPausing})
@@ -4830,5 +4847,46 @@ func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *test
 	}
 	if !paused {
 		t.Fatal("the resumed VM must be re-paused, not left active on a downgraded host")
+	}
+}
+
+// The common case is a paused row, so the explicit endpoint claims it
+// without reading it first: the claim is the only statement to touch the
+// row before the boot.
+func TestResumeSandbox_ClaimsWithoutReadingTheRow(t *testing.T) {
+	sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+
+	rowReads := 0
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRow(sb, &snap, "", 0)
+			case strings.Contains(sql, "-- name: GetSandbox :one"):
+				rowReads++
+				return sandboxRow(sb)
+			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+				return previewPolicyRow(preview.AccessLegacyPublic, 0)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(context.Context, string, ...any) (pgx.Rows, error) { return emptyRows{}, nil },
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if rowReads != 0 {
+		t.Fatalf("row reads before the boot = %d, want none; the claim returns the row", rowReads)
 	}
 }
