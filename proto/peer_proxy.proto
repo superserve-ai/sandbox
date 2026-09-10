@@ -1,0 +1,5 @@
+syntax = "proto3";
+package superserve.peer.v1;
+option go_package = "github.com/superserve-ai/sandbox/proto/peerpb";
+service PeerProxy { rpc Forward(stream PeerProxyFrame) returns (stream PeerProxyFrame); }
+message PeerProxyFrame { bytes data = 1; }

@@ -44,6 +44,17 @@ type execWSTestEnv struct {
 	clientWS *websocket.Conn
 }
 
+func newIPv4TestServer(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback listener unavailable: %v", err)
+	}
+	s := &httptest.Server{Listener: ln, Config: &http.Server{Handler: h}}
+	s.Start()
+	return s
+}
+
 func newExecWSTestEnv(t *testing.T) *execWSTestEnv {
 	t.Helper()
 	fake := newFakeProcessService()
@@ -51,14 +62,18 @@ func newExecWSTestEnv(t *testing.T) *execWSTestEnv {
 	path, handler := boxdpbconnect.NewProcessServiceHandler(fake)
 	boxdMux := http.NewServeMux()
 	boxdMux.Handle(path, handler)
-	boxdSrv := httptest.NewUnstartedServer(h2c.NewHandler(boxdMux, &http2.Server{}))
+	boxdLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback listener unavailable: %v", err)
+	}
+	boxdSrv := &httptest.Server{Listener: boxdLn, Config: &http.Server{Handler: h2c.NewHandler(boxdMux, &http2.Server{})}}
 	boxdSrv.EnableHTTP2 = true
 	boxdSrv.Start()
 
 	procClient := boxdpbconnect.NewProcessServiceClient(boxdSrv.Client(), boxdSrv.URL)
 
 	h := &Handler{transports: newTransportCache(), log: zerolog.Nop()}
-	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	proxyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true,
 			CompressionMode:    websocket.CompressionDisabled,
@@ -71,7 +86,13 @@ func newExecWSTestEnv(t *testing.T) *execWSTestEnv {
 		// not the library's much smaller default.
 		ws.SetReadLimit(maxExecReadBytes)
 		h.bridgeExecWS(r.Context(), ws, procClient, "sbx-test")
-	}))
+	})
+	proxyLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback listener unavailable: %v", err)
+	}
+	proxySrv := &httptest.Server{Listener: proxyLn, Config: &http.Server{Handler: proxyHandler}}
+	proxySrv.Start()
 
 	wsURL := "ws" + strings.TrimPrefix(proxySrv.URL, "http")
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -340,9 +361,8 @@ func TestServeExecWS_ForeignOriginAccepted(t *testing.T) {
 	path, handler := boxdpbconnect.NewProcessServiceHandler(fake)
 	boxdMux := http.NewServeMux()
 	boxdMux.Handle(path, handler)
-	boxdSrv := httptest.NewUnstartedServer(h2c.NewHandler(boxdMux, &http2.Server{}))
+	boxdSrv := newIPv4TestServer(t, h2c.NewHandler(boxdMux, &http2.Server{}))
 	boxdSrv.EnableHTTP2 = true
-	boxdSrv.Start()
 	defer boxdSrv.Close()
 
 	seedKey := []byte("test-seed-key-that-is-at-least-32-bytes-long!!")
@@ -454,14 +474,13 @@ func TestExecWS_StreamErrorIsGenericized(t *testing.T) {
 	path, handler := boxdpbconnect.NewProcessServiceHandler(fake)
 	boxdMux := http.NewServeMux()
 	boxdMux.Handle(path, handler)
-	boxdSrv := httptest.NewUnstartedServer(h2c.NewHandler(boxdMux, &http2.Server{}))
+	boxdSrv := newIPv4TestServer(t, h2c.NewHandler(boxdMux, &http2.Server{}))
 	boxdSrv.EnableHTTP2 = true
-	boxdSrv.Start()
 	defer boxdSrv.Close()
 
 	procClient := boxdpbconnect.NewProcessServiceClient(boxdSrv.Client(), boxdSrv.URL)
 	h := &Handler{transports: newTransportCache(), log: zerolog.Nop()}
-	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	proxySrv := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true,
 			CompressionMode:    websocket.CompressionDisabled,

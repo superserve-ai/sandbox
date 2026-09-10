@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -55,6 +59,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	var peerErr <-chan error
+	peerRecorder := telemetry.NewNoopRecorder()
 
 	resolver := proxy.NewVMDResolver(vmdAddr)
 	proxyHandler := proxy.NewHandler(domains, resolver, log)
@@ -75,6 +81,7 @@ func main() {
 		if rerr != nil {
 			log.Error().Err(rerr).Msg("otel metrics init failed; proxy metrics disabled")
 		} else {
+			peerRecorder = rec
 			proxyHandler.WithTelemetry(rec)
 			defer func() {
 				// Bounded: a stalled collector must not hang proxy restarts
@@ -140,6 +147,59 @@ func main() {
 	// It only responds on non-sandbox hosts so the boxd-label lockdown isn't
 	// bypassed.
 	mux := newProxyMux(proxyHandler)
+	var localSrv *http.Server
+	var localErr <-chan error
+	if peerAddr := os.Getenv("PEER_PROXY_LISTEN_ADDR"); peerIngressEnabled(peerAddr) {
+		if err := validatePeerListener(peerAddr, addr, redirectAddr); err != nil {
+			log.Fatal().Err(err).Msg("invalid PEER_PROXY_LISTEN_ADDR")
+		}
+		cfg, err := (proxy.PeerTLSConfig{CertFile: os.Getenv("PEER_PROXY_CERT_FILE"), KeyFile: os.Getenv("PEER_PROXY_KEY_FILE"), CAFile: os.Getenv("PEER_PROXY_CA_FILE"), ExpectedSPIFFE: os.Getenv("PEER_PROXY_SPIFFE_URI"), Log: log}).Load()
+		if err != nil {
+			log.Fatal().Err(err).Msg("peer TLS setup failed")
+		}
+		streamLimit, err := strconv.ParseInt(envOrDefault("PEER_PROXY_MAX_STREAMS", "128"), 10, 32)
+		if err != nil || streamLimit <= 0 {
+			log.Fatal().Msg("PEER_PROXY_MAX_STREAMS must be a positive 32-bit integer")
+		}
+		target := envOrDefault("PEER_PROXY_TARGET_ADDR", "127.0.0.1:5010")
+		localListener, err := bindLocalPeerTarget(target, addr, redirectAddr)
+		if err != nil {
+			log.Fatal().Err(err).Msg("local peer target bind failed")
+		}
+		// Peer traffic terminates at the local handler, never the public router.
+		localSrv = proxy.NewServer(target, newProxyMux(proxyHandler))
+		localErrCh := make(chan error, 1)
+		localErr = localErrCh
+		go func() {
+			err := localSrv.Serve(localListener)
+			if err == http.ErrServerClosed {
+				err = nil
+			}
+			localErrCh <- err
+			if err != nil {
+				stop()
+			}
+		}()
+		// Bind synchronously so an enabled peer ingress cannot fail silently
+		// while the public listener continues serving without private routing.
+		peerListener, err := net.Listen("tcp", peerAddr)
+		if err != nil {
+			log.Fatal().Err(err).Msg("peer ingress bind failed")
+		}
+		errCh := make(chan error, 1)
+		peerErr = errCh
+		go func() {
+			err := proxy.ServePeerListenerWithRecorder(ctx, peerListener, cfg, target, log, peerRecorder, streamLimit)
+			// Always publish the result so shutdown supervision cannot race a
+			// failed Serve call and silently discard its error.
+			errCh <- err
+			if err != nil && ctx.Err() == nil {
+				// Cancel the shared lifecycle immediately; main will supervise
+				// the error after the public listener has shut down.
+				stop()
+			}
+		}()
+	}
 
 	// HTTP→HTTPS redirect listener with graceful shutdown.
 	redirectMux := http.NewServeMux()
@@ -164,14 +224,70 @@ func main() {
 	if err := proxy.ListenAndServe(ctx, addr, mux, log); err != nil {
 		log.Fatal().Err(err).Msg("proxy error")
 	}
+	if peerErr != nil {
+		if err := <-peerErr; err != nil {
+			log.Fatal().Err(err).Msg("peer ingress stopped")
+		}
+	}
 
 	// Shut down the redirect listener cleanly.
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutCancel()
 	_ = redirectSrv.Shutdown(shutCtx)
+	if localSrv != nil {
+		_ = localSrv.Shutdown(shutCtx)
+		if err := <-localErr; err != nil {
+			log.Fatal().Err(err).Msg("local peer target stopped")
+		}
+	}
 
 	log.Info().Msg("proxy stopped")
 }
+
+// bindLocalPeerTarget keeps peer traffic off the public routing and redirect ports.
+func bindLocalPeerTarget(target, publicAddr, redirectAddr string) (net.Listener, error) {
+	parsed, err := netip.ParseAddrPort(target)
+	if err != nil || !parsed.Addr().IsLoopback() || parsed.Port() == 0 {
+		return nil, fmt.Errorf("peer target must be a loopback IP with a nonzero port: %q", target)
+	}
+	if err := validateListenerPorts(target, publicAddr, redirectAddr); err != nil {
+		return nil, err
+	}
+	return net.Listen("tcp", target)
+}
+
+func validatePeerListener(peerAddr, publicAddr, redirectAddr string) error {
+	if !proxy.PrivateBind(peerAddr) {
+		return fmt.Errorf("peer ingress must bind a private interface: %q", peerAddr)
+	}
+	return validateListenerPorts(peerAddr, publicAddr, redirectAddr)
+}
+
+func validateListenerPorts(peerAddr, publicAddr, redirectAddr string) error {
+	_, peerPort, err := net.SplitHostPort(peerAddr)
+	if err != nil {
+		return err
+	}
+	peerNumber, err := net.LookupPort("tcp", peerPort)
+	if err != nil {
+		return err
+	}
+	for _, addr := range []string{publicAddr, redirectAddr} {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			continue
+		}
+		number, err := net.LookupPort("tcp", port)
+		if err == nil && number == peerNumber {
+			return fmt.Errorf("peer listener %q must use a distinct port from %q", peerAddr, addr)
+		}
+	}
+	return nil
+}
+
+// peerIngressEnabled keeps the optional listener gated solely by its explicit
+// address. Disabled proxy hosts must not attempt to load peer credentials.
+func peerIngressEnabled(addr string) bool { return addr != "" }
 
 type proxyHealthResponse struct {
 	Capabilities  []string `json:"capabilities"`

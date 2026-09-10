@@ -148,6 +148,18 @@ type LatencyPhase struct {
 	Duration time.Duration
 }
 
+// PeerIngress records bounded diagnostics for the private peer listener.
+// Event is one of listener_start, tls_auth, or stream; Result is a bounded
+// outcome such as success or error. No certificate details or stream payloads
+// belong in telemetry.
+type PeerIngress struct {
+	Event    string
+	Result   string
+	Region   string
+	HostID   string
+	Duration time.Duration
+}
+
 // CapacityShadow is one shadow ranking evaluation: what capacity-based
 // placement WOULD have chosen, measured against what the live scheduler
 // actually did, plus how much of the fleet is describable at all.
@@ -193,6 +205,7 @@ type Recorder interface {
 	RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)
 	RecordLauncherState(context.Context, LauncherState)
 	RecordLatencyPhase(context.Context, LatencyPhase)
+	RecordPeerIngress(context.Context, PeerIngress)
 }
 
 type noopRecorder struct{}
@@ -220,3 +233,4 @@ func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)             
 func (noopRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)     {}
 func (noopRecorder) RecordLauncherState(context.Context, LauncherState)                     {}
 func (noopRecorder) RecordLatencyPhase(context.Context, LatencyPhase)                       {}
+func (noopRecorder) RecordPeerIngress(context.Context, PeerIngress)                         {}

@@ -44,6 +44,13 @@ SET vmd_addr = $2, proxy_addr = $3, region = $4,
     status = 'provisioning', identity_bound = true, updated_at = now()
 WHERE id = $1;
 
+-- name: UpdateHostProxyAddress :exec
+-- Endpoint advertisement changes for the current holder must not alter
+-- lifecycle status; unlike address reclamation, this is not re-provisioning.
+UPDATE host
+SET proxy_addr = $2, updated_at = now()
+WHERE id = $1;
+
 -- name: BindHostIdentity :exec
 -- Opt-in: an existing (legacy) row whose holder sent a complete
 -- self-description at its current address enters identity-bound mode.
