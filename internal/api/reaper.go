@@ -457,7 +457,10 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxR
 // 'failed' under the same fence so the reaper does not loop.
 func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpiredSandboxRow, cause error, l zerolog.Logger) {
 	lease := pauseLease{id: sbx.PauseOpID, version: sbx.PauseOpLeaseVersion}
-	revertCtx, revertCancel := context.WithTimeout(ctx, asyncTimeout)
+	// Detached from cancellation: a shutdown that cut the host lookup short
+	// must not also cut this write short and hand a running VM to the
+	// terminal fallback below.
+	revertCtx, revertCancel := context.WithTimeout(context.WithoutCancel(ctx), asyncTimeout)
 	defer revertCancel()
 	n, err := h.DB.RevertPauseToActive(revertCtx, db.RevertPauseToActiveParams{
 		SandboxID:           sbx.ID,

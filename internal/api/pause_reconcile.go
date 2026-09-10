@@ -182,6 +182,10 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauseR
 		actor = &id
 	}
 	h.logSandboxActivity(ctx, row.ID, row.TeamID, actor, "sandbox", pauseActivity(trigger), "success", &row.Name, nil, nil)
+	if trigger == "pause" {
+		// The same product event the request path emits for its own finalize.
+		h.captureFor(actor, row.TeamID, "sandbox_paused", map[string]any{"sandbox_id": row.ID.String()})
+	}
 }
 
 // releasePauseLease hands an undecided pause back for a later attempt.

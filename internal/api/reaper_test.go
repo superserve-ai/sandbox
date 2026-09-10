@@ -588,3 +588,41 @@ func TestBillingPause_FreeWorkerStartsTheNextPause(t *testing.T) {
 		t.Fatalf("lists = %d, want one candidate scan for the pass", mock.lists.Load())
 	}
 }
+
+// A cancelled process context (shutdown) must not turn an undispatched claim
+// into a failed sandbox: the revert runs detached and lands, and the terminal
+// fallback is never reached.
+func TestRevertToActiveOrFail_SurvivesCancellation(t *testing.T) {
+	sbx := expiredRow("sbx")
+	sbx.PauseOpID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	sbx.PauseOpLeaseVersion = 1
+	var reverts, fails int32
+	h := newReaperHandlers(&reaperMockDBTX{queryRowFn: func(ctx context.Context, sql string, _ ...any) pgx.Row {
+		switch {
+		case strings.Contains(sql, "-- name: RevertPauseToActive :one"):
+			if ctx.Err() != nil {
+				t.Errorf("revert issued on a dead context: %v", ctx.Err())
+			}
+			atomic.AddInt32(&reverts, 1)
+			return &mockRow{scanFn: func(dest ...any) error {
+				*dest[0].(*int64) = 1
+				return nil
+			}}
+		case strings.Contains(sql, "-- name: MarkSandboxFailed :one"):
+			atomic.AddInt32(&fails, 1)
+			return &mockRow{scanFn: func(dest ...any) error {
+				*dest[0].(*int64) = 1
+				return nil
+			}}
+		}
+		return activityRow()
+	}}, &stubVMD{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.revertToActiveOrFail(ctx, sbx, context.Canceled, zerolog.Nop())
+
+	if atomic.LoadInt32(&reverts) != 1 || atomic.LoadInt32(&fails) != 0 {
+		t.Fatalf("reverts = %d, fails = %d; want the revert to land and no terminal fallback", reverts, fails)
+	}
+}
