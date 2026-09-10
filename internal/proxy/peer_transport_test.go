@@ -137,3 +137,68 @@ func TestPeerClientRejectsUntrustedOrWrongIdentity(t *testing.T) {
 		})
 	}
 }
+
+type echoPeerServer struct {
+	peerpb.UnimplementedPeerProxyServer
+}
+
+func (echoPeerServer) Forward(stream grpc.BidiStreamingServer[peerpb.PeerProxyFrame, peerpb.PeerProxyFrame]) error {
+	for {
+		frame, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		if err := stream.Send(frame); err != nil {
+			return err
+		}
+	}
+}
+func TestPeerPoolClosingStreamDoesNotFailSibling(t *testing.T) {
+	cfg := peerTestCredentials(t)
+	serverTLS, err := cfg.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	peerpb.RegisterPeerProxyServer(server, echoPeerServer{})
+	go server.Serve(listener)
+	defer server.Stop()
+	pool := NewPeerTransport(PeerPoolConfig{Dial: GRPCPeerDialer(cfg.LoadClient)})
+	defer pool.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	a, err := pool.OpenStream(ctx, "host", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := pool.OpenStream(ctx, "host", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	readDone := make(chan error, 1)
+	go func() { _, err := a.Read(make([]byte, 1)); readDone <- err }()
+	_ = a.Close()
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("read succeeded after close")
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if _, err := b.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	if _, err := b.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "x" {
+		t.Fatalf("payload = %q", buf)
+	}
+}

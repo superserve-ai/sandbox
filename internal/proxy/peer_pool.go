@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"io"
 	"math/rand"
 	"sync"
@@ -341,7 +343,7 @@ func (h *hostPool) open(ctx context.Context) (PeerStream, error) {
 				c.active--
 				// A caller cancellation/deadline is not evidence that the
 				// underlying transport failed. Keep the connection reusable.
-				if errors.Is(e, context.Canceled) || errors.Is(e, context.DeadlineExceeded) {
+				if peerCallerCanceled(e) {
 					c.mu.Unlock()
 					return nil, e
 				}
@@ -449,7 +451,7 @@ func (h *hostPool) open(ctx context.Context) (PeerStream, error) {
 		} else {
 			// Caller cancellation is not a transport failure and must not
 			// poison reconnect backoff for later callers.
-			if !errors.Is(e, context.Canceled) && !errors.Is(e, context.DeadlineExceeded) {
+			if !peerCallerCanceled(e) {
 				// Publish the retry deadline before waking coalesced callers so a
 				// failed dial cannot trigger an immediate second attempt.
 				h.setBackoffLocked()
@@ -459,7 +461,7 @@ func (h *hostPool) open(ctx context.Context) (PeerStream, error) {
 		h.dialDone = nil
 		h.mu.Unlock()
 		if e != nil {
-			if !errors.Is(e, context.Canceled) && !errors.Is(e, context.DeadlineExceeded) {
+			if !peerCallerCanceled(e) {
 				h.parent.cfg.Telemetry.PeerReconnect(telemetry.ResultError)
 			}
 			h.evictIfEmpty()
@@ -601,12 +603,12 @@ func (h *hostPool) scheduleDrain(c *peerConn) {
 	}
 	c.mu.Unlock()
 	if idle {
-		// There is nothing to drain. Reclaim the transport and its pool slot
-		// synchronously so an idle endpoint replacement cannot retain stale
-		// capacity until the drain deadline.
-		c.close()
-		h.remove(c)
-		h.parent.cfg.Telemetry.PeerDrain(false)
+		// The caller may hold h.mu during endpoint replacement.
+		go func() {
+			c.close()
+			h.remove(c)
+			h.parent.cfg.Telemetry.PeerDrain(false)
+		}()
 		return
 	}
 	go func() {
@@ -711,14 +713,14 @@ type countedPeerStream struct {
 
 func (s *countedPeerStream) Read(p []byte) (int, error) {
 	n, e := s.PeerStream.Read(p)
-	if e != nil && e != io.EOF {
+	if e != nil && e != io.EOF && !peerCallerCanceled(e) {
 		s.host.markFailed(s.conn)
 	}
 	return n, e
 }
 func (s *countedPeerStream) Write(p []byte) (int, error) {
 	n, e := s.PeerStream.Write(p)
-	if e != nil {
+	if e != nil && !peerCallerCanceled(e) {
 		s.host.markFailed(s.conn)
 	}
 	return n, e
@@ -751,4 +753,8 @@ func (s *countedPeerStream) Close() error {
 		}
 	})
 	return e
+}
+
+func peerCallerCanceled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.Canceled || status.Code(err) == codes.DeadlineExceeded
 }
