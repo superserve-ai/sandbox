@@ -50,6 +50,7 @@ class DeployProxyTests(unittest.TestCase):
         env = {
             "GCP_PROJECT": "example-project",
             "SHA": "12345678",
+            "DATABASE_URL": "postgres://postgres:postgres@localhost/sandbox_test",
             "PROXY_DOMAIN": "sandbox.example.test",
             "PEER_PROXY_LISTEN_ADDR": peer_addr,
             "PEER_IDENTITY_HOSTS": "example-host" if required_identity else "",
@@ -247,3 +248,15 @@ class DeployProxyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CombinedCredentialContractTests(unittest.TestCase):
+    def test_base_unit_leaves_mounting_to_identity_dropin(self):
+        unit = Path(__file__).resolve().parents[3] / "deploy" / "proxy.service"
+        self.assertNotIn("LoadCredential=", unit.read_text())
+
+    def test_client_only_deploy_mounts_runtime_credentials(self):
+        script = DeployProxyTests().generate_script("")
+        self.assertIn("LoadCredential=peer-key:/etc/peer/key.pem", script)
+        self.assertIn("peer_key_file=/run/credentials/proxy.service/peer-key", script)
+        self.assertIn("PEER_PROXY_KEY_FILE=$peer_key_file", script)

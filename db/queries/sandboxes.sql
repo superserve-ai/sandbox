@@ -99,7 +99,7 @@ SELECT * FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 
 -- name: GetSandboxRoute :one
-SELECT s.host_id, h.proxy_addr
+SELECT s.host_id, h.vmd_addr
 FROM sandbox s
 JOIN host h ON h.id = s.host_id
 WHERE s.id = $1 AND s.destroyed_at IS NULL;

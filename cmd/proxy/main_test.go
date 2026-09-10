@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"net"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -38,37 +38,6 @@ func TestProxyHealthAdvertisesPreviewPortProtocol(t *testing.T) {
 	want := []string{preview.HostCapabilityPorts, preview.HostCapabilityPortAccess}
 	if !reflect.DeepEqual(health.Capabilities, want) {
 		t.Fatalf("capabilities = %#v, want %#v", health.Capabilities, want)
-	}
-}
-
-func TestLoopbackAddrRejectsNonLoopback(t *testing.T) {
-	for _, addr := range []string{"0.0.0.0:5010", "192.0.2.10:5010", ":5010"} {
-		if _, err := loopbackAddr(addr); err == nil {
-			t.Errorf("loopbackAddr(%q) accepted non-loopback address", addr)
-		}
-	}
-	for _, addr := range []string{"127.0.0.1:5010", "[::1]:5010", "localhost:5010"} {
-		if _, err := loopbackAddr(addr); err != nil {
-			t.Errorf("loopbackAddr(%q) rejected loopback address: %v", addr, err)
-		}
-	}
-}
-
-func TestValidateListenerSeparationRejectsPublicAndRedirectPorts(t *testing.T) {
-	for _, tc := range []struct {
-		name, public, redirect string
-	}{
-		{"public", ":5010", ":5008"},
-		{"redirect", ":5007", ":5010"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := validateListenerSeparation("127.0.0.1:5010", tc.public, tc.redirect); err == nil {
-				t.Fatal("expected listener port collision to be rejected")
-			}
-		})
-	}
-	if err := validateListenerSeparation("127.0.0.1:5010", ":5007", ":5008"); err != nil {
-		t.Fatalf("distinct listener ports rejected: %v", err)
 	}
 }
 

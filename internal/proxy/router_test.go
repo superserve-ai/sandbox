@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -75,14 +76,24 @@ func TestBridgeRequestForwardsResponseBeforeUploadCompletes(t *testing.T) {
 
 type lifecyclePeerStream struct {
 	*io.PipeReader
-	upload bytes.Buffer
-	sent   chan struct{}
+	upload   bytes.Buffer
+	sent     chan struct{}
+	sentOnce sync.Once
 }
 
-func (s *lifecyclePeerStream) Write(p []byte) (int, error) { return s.upload.Write(p) }
+func (s *lifecyclePeerStream) Write(p []byte) (int, error) {
+	n, err := s.upload.Write(p)
+	req, parseErr := http.ReadRequest(bufio.NewReader(bytes.NewReader(s.upload.Bytes())))
+	if parseErr == nil {
+		body, bodyErr := io.ReadAll(req.Body)
+		if bodyErr == nil && int64(len(body)) == req.ContentLength {
+			s.sentOnce.Do(func() { close(s.sent) })
+		}
+	}
+	return n, err
+}
 func (s *lifecyclePeerStream) CloseSend() error {
-	close(s.sent)
-	return nil
+	return errors.New("HTTP upload must not half-close the destination")
 }
 
 type routePeerFunc func(context.Context, string, string) (PeerStream, error)
@@ -126,10 +137,10 @@ func TestRoutingHandlerPinsFailedStreamAndLooksUpNextRequest(t *testing.T) {
 		select {
 		case <-stream.sent:
 		case <-time.After(3 * time.Second):
-			t.Fatal("upload did not half-close")
+			t.Fatal("upload did not complete")
 		}
 
-		// The response remains readable after the upload has half-closed.
+		// The response remains readable after the framed upload completes.
 		forward := func(payload []byte) {
 			t.Helper()
 			written := make(chan error, 1)
