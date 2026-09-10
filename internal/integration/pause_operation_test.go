@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -78,13 +79,25 @@ func expireLease(t *testing.T, id uuid.UUID) {
 	}
 }
 
-func claimPending(t *testing.T) []db.ClaimPendingPausesRow {
+// claimPending does what a reconciler tick does: list the eligible rows,
+// then claim each one by id.
+func claimPending(t *testing.T) []db.ClaimPendingPauseRow {
 	t.Helper()
-	rows, err := testQueries.ClaimPendingPauses(context.Background(), db.ClaimPendingPausesParams{
-		LeaseSeconds: 60, MinAgeSeconds: 120, MaxRows: 10,
-	})
+	ctx := context.Background()
+	ids, err := testQueries.ListPendingPauses(ctx, db.ListPendingPausesParams{MinAgeSeconds: 120, MaxRows: 10})
 	if err != nil {
-		t.Fatalf("ClaimPendingPauses: %v", err)
+		t.Fatalf("ListPendingPauses: %v", err)
+	}
+	var rows []db.ClaimPendingPauseRow
+	for _, id := range ids {
+		row, err := testQueries.ClaimPendingPause(ctx, db.ClaimPendingPauseParams{ID: id, MinAgeSeconds: 120, LeaseSeconds: 60})
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("ClaimPendingPause: %v", err)
+		}
+		rows = append(rows, row)
 	}
 	return rows
 }
@@ -355,24 +368,23 @@ func TestIntegration_PauseOperation_ClaimIsExclusiveAcrossReplicas(t *testing.T)
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	rowsA, err := testQueries.WithTx(tx).ClaimPendingPauses(ctx, db.ClaimPendingPausesParams{
-		LeaseSeconds: 60, MinAgeSeconds: 120, MaxRows: 10,
-	})
-	if err != nil || len(rowsA) != 1 {
-		t.Fatalf("replica A claim = %+v, %v; want the row", rowsA, err)
+	rowA, err := testQueries.WithTx(tx).ClaimPendingPause(ctx, db.ClaimPendingPauseParams{ID: id, MinAgeSeconds: 120, LeaseSeconds: 60})
+	if err != nil || rowA.ID != id {
+		t.Fatalf("replica A claim = %+v, %v; want the row", rowA, err)
 	}
 
 	// Replica B skips the locked row rather than waiting on it.
 	done := make(chan int, 1)
 	go func() {
-		rows, err := testQueries.ClaimPendingPauses(ctx, db.ClaimPendingPausesParams{
-			LeaseSeconds: 60, MinAgeSeconds: 120, MaxRows: 10,
-		})
-		if err != nil {
+		_, err := testQueries.ClaimPendingPause(ctx, db.ClaimPendingPauseParams{ID: id, MinAgeSeconds: 120, LeaseSeconds: 60})
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			done <- 0
+		case err != nil:
 			done <- -1
-			return
+		default:
+			done <- 1
 		}
-		done <- len(rows)
 	}()
 	select {
 	case n := <-done:
@@ -401,18 +413,19 @@ func TestIntegration_PauseOperation_ReaperClaimMintsTheOperation(t *testing.T) {
 		teamID, testDefaultHostID).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := testQueries.ClaimExpiredSandboxes(context.Background(), db.ClaimExpiredSandboxesParams{Limit: 10, LeaseSeconds: 90})
+	ids, err := testQueries.ListExpiredSandboxes(context.Background(), 10)
 	if err != nil {
-		t.Fatalf("ClaimExpiredSandboxes: %v", err)
+		t.Fatalf("ListExpiredSandboxes: %v", err)
 	}
-	var claimed *db.ClaimExpiredSandboxesRow
-	for i := range rows {
-		if rows[i].ID == id {
-			claimed = &rows[i]
-		}
+	if !slices.Contains(ids, id) {
+		t.Fatalf("expired list %v does not include the sandbox", ids)
 	}
-	if claimed == nil || !claimed.PauseOpID.Valid || claimed.PauseOpLeaseVersion != 1 {
-		t.Fatalf("reaper claim = %+v, want the row with a minted operation at version 1", claimed)
+	claimed, err := testQueries.ClaimExpiredSandbox(context.Background(), db.ClaimExpiredSandboxParams{ID: id, LeaseSeconds: 90})
+	if err != nil || !claimed.PauseOpID.Valid || claimed.PauseOpLeaseVersion != 1 {
+		t.Fatalf("reaper claim = %+v, %v; want the row with a minted operation at version 1", claimed, err)
+	}
+	if _, err := testQueries.ClaimExpiredSandbox(context.Background(), db.ClaimExpiredSandboxParams{ID: id, LeaseSeconds: 90}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("second claim of a claimed row = %v, want no rows", err)
 	}
 	if got := readPauseOp(t, id); got.status != "pausing" || !got.leased || got.opID.Bytes != claimed.PauseOpID.Bytes {
 		t.Fatalf("after reaper claim: %+v", got)
@@ -439,17 +452,23 @@ func TestIntegration_PauseOperation_RetryOrderDoesNotStarveNewerRows(t *testing.
 	expireLease(t, healthy)
 
 	for wave := 0; wave < 12; wave++ {
-		rows, err := testQueries.ClaimPendingPauses(ctx, db.ClaimPendingPausesParams{LeaseSeconds: 75, MinAgeSeconds: 90, MaxRows: 4})
+		ids, err := testQueries.ListPendingPauses(ctx, db.ListPendingPausesParams{MinAgeSeconds: 90, MaxRows: 4})
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, row := range rows {
-			if row.ID == healthy {
-				if wave > 2 {
-					t.Fatalf("healthy row first claimed in wave %d, want within the third", wave)
-				}
-				return
+		if slices.Contains(ids, healthy) {
+			if wave > 2 {
+				t.Fatalf("healthy row first listed in wave %d, want within the third", wave)
 			}
+			return
+		}
+		var rows []db.ClaimPendingPauseRow
+		for _, id := range ids {
+			row, err := testQueries.ClaimPendingPause(ctx, db.ClaimPendingPauseParams{ID: id, MinAgeSeconds: 90, LeaseSeconds: 75})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rows = append(rows, row)
 		}
 		// Time passes: every lease moves closer to expiry, and the slow rows
 		// come back undecided with a retry delay.

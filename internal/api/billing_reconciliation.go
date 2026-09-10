@@ -3,8 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -113,36 +113,35 @@ func (h *Handlers) reconcileActivatedSandbox(ctx context.Context, teamID uuid.UU
 // saga runs in the background so webhook acknowledgement is not held on host
 // work. A later reconciliation can safely pick up any rows beyond the batch.
 func (h *Handlers) pauseBillingIneligibleTeam(ctx context.Context, teamID uuid.UUID) {
+	ids, err := h.DB.ListBillingIneligibleSandboxes(ctx, db.ListBillingIneligibleSandboxesParams{TeamID: teamID, Limit: billingPauseCap})
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: list ineligible sandboxes failed")
+		h.retryBillingEligibilityReconciliation(teamID)
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
 	// Claims stop with ctx; a pause already in flight finishes on its own
 	// detached budget.
 	cleanupCtx := context.WithoutCancel(ctx)
-	var claimed, failed atomic.Int32
-	claimEach(ctx, billingPauseWorkers, billingPauseCap, func(ctx context.Context, n int32) ([]db.ClaimBillingIneligibleSandboxesRow, error) {
-		rows, err := h.DB.ClaimBillingIneligibleSandboxes(ctx, db.ClaimBillingIneligibleSandboxesParams{
-			TeamID:       teamID,
-			Limit:        n,
-			LeaseSeconds: pauseLeaseSeconds,
-		})
-		if err != nil {
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: claim ineligible sandboxes failed")
-			failed.Store(1)
+	claimEach(ctx, billingPauseWorkers, ids, func(ctx context.Context, id uuid.UUID) (db.ClaimBillingIneligibleSandboxRow, error) {
+		row, err := h.DB.ClaimBillingIneligibleSandbox(ctx, db.ClaimBillingIneligibleSandboxParams{ID: id, TeamID: teamID, LeaseSeconds: pauseLeaseSeconds})
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			log.Error().Err(err).Str("sandbox_id", id.String()).Msg("billing: claim ineligible sandbox failed")
 		}
-		claimed.Add(int32(len(rows)))
-		return rows, err
-	}, func(sbx db.ClaimBillingIneligibleSandboxesRow, claimedAt time.Time) {
+		return row, err
+	}, func(sbx db.ClaimBillingIneligibleSandboxRow, claimedAt time.Time) {
 		itemCtx, itemCancel := context.WithTimeout(cleanupCtx, 2*time.Minute)
 		defer itemCancel()
 		h.pauseBillingIneligible(itemCtx, sbx, claimedAt, log.Logger)
 	})
-	if claimed.Load() >= billingPauseCap {
+	if int32(len(ids)) >= billingPauseCap {
 		log.Warn().Str("team_id", teamID.String()).Msg("billing: reconciliation batch limit reached")
 	}
-	// Anything paused or any claim failure gets a follow-up pass: rows that
-	// became ineligible meanwhile, or were left for the reconciler, are
-	// re-covered rather than assumed done.
-	if failed.Load() != 0 || claimed.Load() > 0 {
-		h.retryBillingEligibilityReconciliation(teamID)
-	}
+	// A follow-up pass re-covers rows that became ineligible meanwhile or
+	// were left for the reconciler, rather than assuming this one was enough.
+	h.retryBillingEligibilityReconciliation(teamID)
 }
 
 func (h *Handlers) retryBillingEligibilityReconciliation(teamID uuid.UUID) {

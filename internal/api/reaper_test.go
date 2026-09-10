@@ -25,61 +25,104 @@ import (
 // pgx.Rows stub
 // ---------------------------------------------------------------------------
 
-// stubRows implements pgx.Rows backed by a slice of ClaimExpiredSandboxesRow.
-type stubRows struct {
-	items []db.ClaimExpiredSandboxesRow
-	idx   int
-	err   error
+// idRows implements pgx.Rows over candidate ids, as the list queries return.
+type idRows struct {
+	ids []uuid.UUID
+	idx int
 }
 
-func newStubRows(items []db.ClaimExpiredSandboxesRow) *stubRows {
-	return &stubRows{items: items, idx: -1}
-}
+func newIDRows(ids []uuid.UUID) *idRows { return &idRows{ids: ids, idx: -1} }
 
-func (r *stubRows) Next() bool {
+func (r *idRows) Next() bool {
 	r.idx++
-	return r.idx < len(r.items)
+	return r.idx < len(r.ids)
 }
 
-func (r *stubRows) Scan(dest ...any) error {
-	row := r.items[r.idx]
-	*dest[0].(*uuid.UUID) = row.ID
-	*dest[1].(*uuid.UUID) = row.TeamID
-	*dest[2].(*string) = row.Name
-	*dest[3].(*pgtype.UUID) = row.SnapshotID
-	*dest[4].(*string) = row.HostID
-	*dest[6].(*pgtype.UUID) = row.PauseOpID
-	*dest[7].(*int64) = row.PauseOpLeaseVersion
-	*dest[8].(*pgtype.Timestamptz) = row.PauseOpLeaseUntil
+func (r *idRows) Scan(dest ...any) error {
+	*dest[0].(*uuid.UUID) = r.ids[r.idx]
 	return nil
 }
 
-func (r *stubRows) Close()                                       {}
-func (r *stubRows) Err() error                                   { return r.err }
-func (r *stubRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
-func (r *stubRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
-func (r *stubRows) Values() ([]any, error)                       { return nil, nil }
-func (r *stubRows) RawValues() [][]byte                          { return nil }
-func (r *stubRows) Conn() *pgx.Conn                              { return nil }
+func (r *idRows) Close()                                       {}
+func (r *idRows) Err() error                                   { return nil }
+func (r *idRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *idRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *idRows) Values() ([]any, error)                       { return nil, nil }
+func (r *idRows) RawValues() [][]byte                          { return nil }
+func (r *idRows) Conn() *pgx.Conn                              { return nil }
+
+// claimedRow is what a claim-by-id returns for a candidate.
+func claimedRow(c db.ClaimExpiredSandboxRow) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = c.ID
+		*dest[1].(*uuid.UUID) = c.TeamID
+		*dest[2].(*string) = c.Name
+		*dest[3].(*pgtype.UUID) = c.SnapshotID
+		*dest[4].(*string) = c.HostID
+		*dest[5].(*[]byte) = c.NetworkConfig
+		*dest[6].(*pgtype.UUID) = c.PauseOpID
+		*dest[7].(*int64) = c.PauseOpLeaseVersion
+		*dest[8].(*pgtype.Timestamptz) = c.PauseOpLeaseUntil
+		return nil
+	}}
+}
 
 // ---------------------------------------------------------------------------
 // DBTX mock for reaper tests
 // ---------------------------------------------------------------------------
 
-// reaperMockDBTX backs db.Queries for reaper tests.
-// queryFn handles ClaimExpiredSandboxes; queryRowFn handles CreateSnapshot and
-// CreateActivity (distinguished by SQL content); execFn handles status updates.
+// reaperMockDBTX backs db.Queries for reaper tests. candidates are served to
+// the list queries in order and to the claim-by-id queries once each, the way
+// a real claim is one-shot; queryFn/queryRowFn/execFn override the rest.
 type reaperMockDBTX struct {
 	queryFn    func(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	queryRowFn func(ctx context.Context, sql string, args ...any) pgx.Row
 	execFn     func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	candidates []db.ClaimExpiredSandboxRow
+
+	mu     sync.Mutex
+	taken  map[uuid.UUID]bool
+	lists  atomic.Int32
+	claims atomic.Int32
+}
+
+func isListSQL(sql string) bool {
+	return strings.Contains(sql, "-- name: ListExpiredSandboxes ") || strings.Contains(sql, "-- name: ListBillingIneligibleSandboxes ")
+}
+
+func isClaimSQL(sql string) bool {
+	return strings.Contains(sql, "-- name: ClaimExpiredSandbox ") || strings.Contains(sql, "-- name: ClaimBillingIneligibleSandbox ")
 }
 
 func (m *reaperMockDBTX) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	if m.queryFn != nil {
 		return m.queryFn(ctx, sql, args...)
 	}
-	return newStubRows(nil), nil
+	if isListSQL(sql) {
+		m.lists.Add(1)
+		ids := make([]uuid.UUID, 0, len(m.candidates))
+		for _, c := range m.candidates {
+			ids = append(ids, c.ID)
+		}
+		return newIDRows(ids), nil
+	}
+	return newIDRows(nil), nil
+}
+
+func (m *reaperMockDBTX) claim(id uuid.UUID) pgx.Row {
+	m.claims.Add(1)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.taken == nil {
+		m.taken = map[uuid.UUID]bool{}
+	}
+	for _, c := range m.candidates {
+		if c.ID == id && !m.taken[id] {
+			m.taken[id] = true
+			return claimedRow(c)
+		}
+	}
+	return notFoundRow()
 }
 
 func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
@@ -93,6 +136,9 @@ func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) 
 			return nil
 		}}
 	}
+	if isClaimSQL(sql) {
+		return m.claim(args[0].(uuid.UUID))
+	}
 	if m.queryRowFn != nil {
 		return m.queryRowFn(ctx, sql, args...)
 	}
@@ -102,9 +148,6 @@ func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) 
 	case strings.Contains(sql, "INSERT INTO snapshot"):
 		return reaperSnapshotRow()
 	case strings.Contains(sql, "FROM sandbox_active_interval"):
-		// GetMostRecentClosedSandboxIntervalActor — return ErrNoRows so the
-		// inherit-actor lookup falls through to NULL (no prior interval in
-		// these tests).
 		return notFoundRow()
 	}
 	return activityRow()
@@ -144,21 +187,8 @@ func newReaperHandlers(dbtx *reaperMockDBTX, vmd *stubVMD) *Handlers {
 	}
 }
 
-// rowsOnce serves rows to the first expired-sandbox claim and nothing to any
-// later one, as a real claim would once the rows are leased. Other queries
-// (the loops share the mock) get nothing.
-func rowsOnce(rows []db.ClaimExpiredSandboxesRow) func(context.Context, string, ...any) (pgx.Rows, error) {
-	var served int32
-	return func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
-		if !strings.Contains(sql, "-- name: ClaimExpiredSandboxes ") || atomic.AddInt32(&served, 1) > 1 {
-			return newStubRows(nil), nil
-		}
-		return newStubRows(rows), nil
-	}
-}
-
-func expiredRow(name string) db.ClaimExpiredSandboxesRow {
-	return db.ClaimExpiredSandboxesRow{
+func expiredRow(name string) db.ClaimExpiredSandboxRow {
+	return db.ClaimExpiredSandboxRow{
 		ID:     uuid.New(),
 		TeamID: uuid.New(),
 		Name:   name,
@@ -197,7 +227,7 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: rowsOnce([]db.ClaimExpiredSandboxesRow{row}),
+			candidates: []db.ClaimExpiredSandboxRow{row},
 			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 				if strings.Contains(sql, "upserted AS") {
 					atomic.AddInt32(&finalizeCalls, 1)
@@ -232,7 +262,7 @@ func TestReaper_VMDFails_ReconcilerLeavesPausing(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: rowsOnce([]db.ClaimExpiredSandboxesRow{row}),
+			candidates: []db.ClaimExpiredSandboxRow{row},
 			execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 				switch {
 				case strings.Contains(sql, "-- name: ReleasePauseLease :execrows"):
@@ -271,7 +301,7 @@ func TestReaper_VMDNotFound_ReconcilerMarksFailed(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: rowsOnce([]db.ClaimExpiredSandboxesRow{row}),
+			candidates: []db.ClaimExpiredSandboxRow{row},
 			queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 				if strings.Contains(sql, "-- name: MarkSandboxFailed :one") {
 					atomic.AddInt32(&fails, 1)
@@ -334,76 +364,38 @@ func TestReaper_DBError(t *testing.T) {
 // TestReaper_BatchSizeRespected verifies that the batch limit is passed to
 // ClaimExpiredSandboxes (the SQL enforces LIMIT, but we confirm the value
 // reaches the query layer).
-// Each worker claims one row at a time, and the batch size caps the tick:
-// 3 workers with a cap of 7 make 7 single-row claims.
-func TestReaper_ClaimsOnePerFreeWorker(t *testing.T) {
-	var mu sync.Mutex
-	var limits []int32
+// One candidate scan per tick; each worker then claims its own row at
+// dispatch time: 7 candidates with 3 workers is one list and 7 claims.
+func TestReaper_ScansOnceAndClaimsPerWorker(t *testing.T) {
+	rows := make([]db.ClaimExpiredSandboxRow, 7)
+	for i := range rows {
+		rows[i] = expiredRow("sbx")
+	}
 	var pauses int32
-
-	h := newReaperHandlers(
-		&reaperMockDBTX{
-			queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
-				if !strings.Contains(sql, "-- name: ClaimExpiredSandboxes ") {
-					return newStubRows(nil), nil
-				}
-				limit := args[0].(int32)
-				mu.Lock()
-				limits = append(limits, limit)
-				mu.Unlock()
-				rows := make([]db.ClaimExpiredSandboxesRow, limit)
-				for i := range rows {
-					rows[i] = expiredRow("sbx")
-				}
-				return newStubRows(rows), nil
-			},
-		},
-		&stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
-			atomic.AddInt32(&pauses, 1)
-			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
-		}},
-	)
+	mock := &reaperMockDBTX{candidates: rows}
+	h := newReaperHandlers(mock, &stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+		atomic.AddInt32(&pauses, 1)
+		return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+	}})
 
 	h.reapOnce(context.Background(), 7, 3, zerolog.Nop())
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(limits) != 7 {
-		t.Fatalf("claims = %v, want 7 of them", limits)
-	}
-	for _, l := range limits {
-		if l != 1 {
-			t.Fatalf("claim limits = %v, want one row each", limits)
-		}
-	}
-	if got := atomic.LoadInt32(&pauses); got != 7 {
-		t.Fatalf("pauses = %d, want the batch size 7", got)
+	if mock.lists.Load() != 1 || mock.claims.Load() != 7 || atomic.LoadInt32(&pauses) != 7 {
+		t.Fatalf("lists = %d, claims = %d, pauses = %d; want 1, 7, 7", mock.lists.Load(), mock.claims.Load(), pauses)
 	}
 }
 
-// A worker that finishes claims the next row while another is still on a
-// slow pause; one slow host never idles the rest.
+// A worker that finishes claims the next candidate while another is still on
+// a slow pause; one slow host never idles the rest.
 func TestReaper_FreeWorkerStartsTheNextPause(t *testing.T) {
-	rows := []db.ClaimExpiredSandboxesRow{expiredRow("slow"), expiredRow("fast"), expiredRow("next")}
-	var mu sync.Mutex
-	remaining := rows
+	rows := []db.ClaimExpiredSandboxRow{expiredRow("slow"), expiredRow("fast"), expiredRow("next")}
 	calls := make(chan string, 3)
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })
 
 	h := newReaperHandlers(
-		&reaperMockDBTX{queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
-			if !strings.Contains(sql, "-- name: ClaimExpiredSandboxes ") {
-				return newStubRows(nil), nil
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			n := min(int(args[0].(int32)), len(remaining))
-			claimed := remaining[:n]
-			remaining = remaining[n:]
-			return newStubRows(claimed), nil
-		}},
+		&reaperMockDBTX{candidates: rows},
 		&stubVMD{pauseFn: func(ctx context.Context, id, _ string) (string, string, error) {
 			calls <- id
 			if id == rows[0].ID.String() {
@@ -434,7 +426,7 @@ func TestReaper_FreeWorkerStartsTheNextPause(t *testing.T) {
 
 // assertAllStart reads one start per row from calls and fails if any row
 // never starts or an unknown id shows up. Starts arrive in any order.
-func assertAllStart(t *testing.T, calls <-chan string, rows []db.ClaimExpiredSandboxesRow, blocked string) {
+func assertAllStart(t *testing.T, calls <-chan string, rows []db.ClaimExpiredSandboxRow, blocked string) {
 	t.Helper()
 	want := make(map[string]bool, len(rows))
 	for _, r := range rows {
@@ -456,7 +448,7 @@ func assertAllStart(t *testing.T, calls <-chan string, rows []db.ClaimExpiredSan
 // TestReaper_ContextCancelledMidBatch verifies that the reaper stops
 // processing the batch when the context is cancelled.
 func TestReaper_ContextCancelledMidBatch(t *testing.T) {
-	rows := make([]db.ClaimExpiredSandboxesRow, 5)
+	rows := make([]db.ClaimExpiredSandboxRow, 5)
 	for i := range rows {
 		rows[i] = expiredRow("sbx")
 	}
@@ -466,7 +458,7 @@ func TestReaper_ContextCancelledMidBatch(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: rowsOnce(rows),
+			candidates: rows,
 		},
 		&stubVMD{pauseFn: func(_ context.Context, _ string, _ string) (string, string, error) {
 			if atomic.AddInt32(&pauseCount, 1) == 2 {
@@ -493,7 +485,7 @@ func TestReaper_LoopRunsImmediately(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: rowsOnce([]db.ClaimExpiredSandboxesRow{row}),
+			candidates: []db.ClaimExpiredSandboxRow{row},
 		},
 		&stubVMD{pauseFn: func(_ context.Context, _ string, _ string) (string, string, error) {
 			atomic.AddInt32(&pauseCalled, 1)
@@ -552,46 +544,32 @@ func TestReaper_SweepsRunOnStartupWithUnsetSweepInterval(t *testing.T) {
 	t.Fatal("snapshot sweep did not run on startup")
 }
 
-// The billing pass schedules like the reaper: a free worker claims the next
-// sandbox while another is still on a slow pause.
+// The billing pass schedules like the reaper: one list, then a free worker
+// claims the next sandbox while another is still on a slow pause.
 func TestBillingPause_FreeWorkerStartsTheNextPause(t *testing.T) {
 	teamID := uuid.New()
-	rows := make([]db.ClaimExpiredSandboxesRow, 11)
+	rows := make([]db.ClaimExpiredSandboxRow, 11)
 	for i := range rows {
 		rows[i] = expiredRow(fmt.Sprintf("billing-%d", i))
 		rows[i].TeamID = teamID
 	}
-	var mu sync.Mutex
-	remaining := rows
 	calls := make(chan string, len(rows))
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })
 
-	h := newReaperHandlers(
-		&reaperMockDBTX{queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
-			if !strings.Contains(sql, "-- name: ClaimBillingIneligibleSandboxes") {
-				return newStubRows(nil), nil
+	mock := &reaperMockDBTX{candidates: rows}
+	h := newReaperHandlers(mock, &stubVMD{pauseFn: func(ctx context.Context, id, _ string) (string, string, error) {
+		calls <- id
+		if id == rows[0].ID.String() {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return "", "", ctx.Err()
 			}
-			mu.Lock()
-			defer mu.Unlock()
-			n := min(int(args[1].(int32)), len(remaining))
-			claimed := remaining[:n]
-			remaining = remaining[n:]
-			return newStubRows(claimed), nil
-		}},
-		&stubVMD{pauseFn: func(ctx context.Context, id, _ string) (string, string, error) {
-			calls <- id
-			if id == rows[0].ID.String() {
-				select {
-				case <-release:
-				case <-ctx.Done():
-					return "", "", ctx.Err()
-				}
-			}
-			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
-		}},
-	)
+		}
+		return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+	}})
 
 	done := make(chan struct{})
 	go func() {
@@ -606,4 +584,7 @@ func TestBillingPause_FreeWorkerStartsTheNextPause(t *testing.T) {
 
 	// With the first row held, the eleventh must still start on a free worker.
 	assertAllStart(t, calls, rows, "one slow pause blocked the eleventh sandbox while workers were idle")
+	if mock.lists.Load() != 1 {
+		t.Fatalf("lists = %d, want one candidate scan for the pass", mock.lists.Load())
+	}
 }

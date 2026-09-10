@@ -141,7 +141,7 @@ func TestReconcilePause_ExpiredLeaseDoesNotDispatch(t *testing.T) {
 			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
 		},
 	}}
-	row := db.ClaimPendingPausesRow{ID: sandboxID, TeamID: teamID, PauseOpID: sb.PauseOpID, PauseOpLeaseVersion: 2}
+	row := db.ClaimPendingPauseRow{ID: sandboxID, TeamID: teamID, PauseOpID: sb.PauseOpID, PauseOpLeaseVersion: 2}
 
 	h.reconcilePause(context.Background(), row, time.Now().Add(-time.Second), zerolog.Nop())
 	if calls.Load() != 0 {
@@ -219,7 +219,7 @@ func TestReconcilePause_ResolutionCannotOutliveTheLease(t *testing.T) {
 		}}, nil
 	}}}
 
-	h.reconcilePause(context.Background(), db.ClaimPendingPausesRow{ID: sandboxID, TeamID: teamID, HostID: "host-1",
+	h.reconcilePause(context.Background(), db.ClaimPendingPauseRow{ID: sandboxID, TeamID: teamID, HostID: "host-1",
 		PauseOpID: sb.PauseOpID, PauseOpLeaseVersion: 1}, leaseUntil, zerolog.Nop())
 
 	if calls.Load() != 0 {

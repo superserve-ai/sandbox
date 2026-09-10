@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -229,46 +228,44 @@ dispatch:
 }
 
 func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism int, logger zerolog.Logger) {
-	claimEach(ctx, parallelism, batchSize, func(ctx context.Context, n int32) ([]db.ClaimExpiredSandboxesRow, error) {
-		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ids, err := h.DB.ListExpiredSandboxes(qctx, batchSize)
+	cancel()
+	if err != nil {
+		logger.Error().Err(err).Msg("reaper: ListExpiredSandboxes failed")
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
+	logger.Info().Int("count", len(ids)).Msg("reaper: pausing expired sandboxes")
+	claimEach(ctx, parallelism, ids, func(ctx context.Context, id uuid.UUID) (db.ClaimExpiredSandboxRow, error) {
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		rows, err := h.DB.ClaimExpiredSandboxes(qctx, db.ClaimExpiredSandboxesParams{Limit: n, LeaseSeconds: pauseLeaseSeconds})
-		if err != nil {
-			logger.Error().Err(err).Msg("reaper: ClaimExpiredSandboxes failed")
+		row, err := h.DB.ClaimExpiredSandbox(cctx, db.ClaimExpiredSandboxParams{ID: id, LeaseSeconds: pauseLeaseSeconds})
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			logger.Error().Err(err).Str("sandbox_id", id.String()).Msg("reaper: ClaimExpiredSandbox failed")
 		}
-		return rows, err
-	}, func(sbx db.ClaimExpiredSandboxesRow, claimedAt time.Time) {
+		return row, err
+	}, func(sbx db.ClaimExpiredSandboxRow, claimedAt time.Time) {
 		h.pauseExpired(ctx, sbx, claimedAt, logger)
 	})
 }
 
-// claimEach runs workers that each claim one row at a time and process it:
-// a slow row never idles the others, and no claimed row waits in a queue
-// burning its lease. Stops when a claim comes back empty or fails, when ctx
-// ends, or once limit claims have been made in this call.
-func claimEach[T any](ctx context.Context, workers int, limit int32, claim func(ctx context.Context, n int32) ([]T, error), process func(row T, claimedAt time.Time)) {
-	var claims atomic.Int32
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ctx.Err() == nil && claims.Add(1) <= limit {
-				claimedAt := time.Now()
-				rows, err := claim(ctx, 1)
-				if err != nil || len(rows) == 0 {
-					return
-				}
-				for _, row := range rows {
-					if ctx.Err() != nil {
-						return
-					}
-					process(row, claimedAt)
-				}
-			}
-		}()
-	}
-	wg.Wait()
+// claimEach hands candidate ids to at most workers goroutines. Each worker
+// claims its candidate at dispatch time (re-checked under lock, leased only
+// then) and runs it, so one candidate scan feeds every worker and no leased
+// row ever waits in a queue. A claim that comes back empty is skipped: another
+// replica took it, or it no longer qualifies.
+func claimEach[T any](ctx context.Context, workers int, ids []uuid.UUID, claim func(ctx context.Context, id uuid.UUID) (T, error), process func(row T, claimedAt time.Time)) {
+	dispatchBounded(ctx, ids, workers, func(id uuid.UUID) {
+		claimedAt := time.Now()
+		row, err := claim(ctx, id)
+		if err != nil {
+			return
+		}
+		process(row, claimedAt)
+	})
 }
 
 // sweepOrphanedSnapshotRows deletes snapshot rows for long-destroyed
@@ -359,14 +356,14 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 //   - Step 1 NotFound → VM is gone → mark 'failed' under the lease.
 //   - Step 1 any other error, or step 2 fails → release the lease; the
 //     reconciler retries (a stopped VM answers from the already-paused guard).
-func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, claimedAt time.Time, logger zerolog.Logger) {
+func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxRow, claimedAt time.Time, logger zerolog.Logger) {
 	leaseUntil := leaseDeadline(sbx.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
 	h.pauseClaimed(ctx, sbx, leaseUntil, "timeout", "timeout_pause", "timeout_paused", "reaper: sandbox paused due to timeout", logger)
 }
 
-func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBillingIneligibleSandboxesRow, claimedAt time.Time, logger zerolog.Logger) {
+func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBillingIneligibleSandboxRow, claimedAt time.Time, logger zerolog.Logger) {
 	leaseUntil := leaseDeadline(sbx.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
-	h.pauseClaimed(ctx, db.ClaimExpiredSandboxesRow{
+	h.pauseClaimed(ctx, db.ClaimExpiredSandboxRow{
 		ID:                  sbx.ID,
 		TeamID:              sbx.TeamID,
 		Name:                sbx.Name,
@@ -379,7 +376,7 @@ func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBilli
 	}, leaseUntil, "billing_ineligible", "billing_ineligible_pause", "billing_ineligible_paused", "billing: sandbox paused after eligibility loss", logger)
 }
 
-func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, leaseUntil time.Time, trigger, transition, activity, successMessage string, logger zerolog.Logger) {
+func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxRow, leaseUntil time.Time, trigger, transition, activity, successMessage string, logger zerolog.Logger) {
 	l := logger.With().
 		Str("sandbox_id", sbx.ID.String()).
 		Str("host_id", sbx.HostID).
@@ -458,7 +455,7 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxe
 // was dispatched, so 'active' is the truth. Never after a dispatch. The revert
 // is fenced to the claim's lease; if it cannot be written the sandbox is marked
 // 'failed' under the same fence so the reaper does not loop.
-func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, cause error, l zerolog.Logger) {
+func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpiredSandboxRow, cause error, l zerolog.Logger) {
 	lease := pauseLease{id: sbx.PauseOpID, version: sbx.PauseOpLeaseVersion}
 	revertCtx, revertCancel := context.WithTimeout(ctx, asyncTimeout)
 	defer revertCancel()
