@@ -296,9 +296,7 @@ func run() error {
 	// `timeout_seconds` hard cap has elapsed, regardless of state. Scoped
 	// to ctx so it exits on shutdown.
 	handlers.StartTimeoutReaper(ctx, api.DefaultReaperConfig())
-	if cfg.PauseReconcilerEnabled {
-		handlers.StartPauseReconciler(ctx)
-	}
+	handlers.StartPauseReconciler(ctx)
 
 	// Launch the template build supervisor. Drives template_build rows
 	// through pending → building → snapshotting → ready/failed by calling

@@ -6,7 +6,6 @@ import (
 	"context"
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -23,12 +22,11 @@ import (
 // the test's own row and compare host call counts between ticks rather than
 // expecting exact totals.
 
-func pauseHandlers(t *testing.T, vmd *stubVMD, reconciler bool) *api.Handlers {
+func pauseHandlers(t *testing.T, vmd *stubVMD) *api.Handlers {
 	t.Helper()
 	h := api.NewHandlers(vmd, testQueries, &config.Config{
-		SystemTeamID:           testSystemTeamID.String(),
-		DefaultHostID:          testDefaultHostID,
-		PauseReconcilerEnabled: reconciler,
+		SystemTeamID:  testSystemTeamID.String(),
+		DefaultHostID: testDefaultHostID,
 	})
 	h.Pool = testPool
 	registerTestHandlers(h)
@@ -52,7 +50,7 @@ func TestIntegration_PauseReconcile_FinishesAnAbandonedPause(t *testing.T) {
 	teamID, _ := seedTeamAndKey(t)
 	id, op := abandonedPause(t, teamID, "reconcile-finish")
 
-	pauseHandlers(t, &stubVMD{}, true).ReconcilePendingPausesOnce(context.Background(), zerolog.Nop())
+	pauseHandlers(t, &stubVMD{}).ReconcilePendingPausesOnce(context.Background(), zerolog.Nop())
 
 	if got := readPauseOp(t, id); got.status != "paused" || got.leased {
 		t.Fatalf("after reconcile: %+v, want paused with the lease cleared", got)
@@ -71,7 +69,7 @@ func TestIntegration_PauseReconcile_UndecidedIsRetriedAfterBackoff(t *testing.T)
 	teamID, _ := seedTeamAndKey(t)
 	id, op := abandonedPause(t, teamID, "reconcile-undecided")
 	vmd := undecidedHost()
-	h := pauseHandlers(t, vmd, true)
+	h := pauseHandlers(t, vmd)
 
 	h.ReconcilePendingPausesOnce(context.Background(), zerolog.Nop())
 	got := readPauseOp(t, id)
@@ -90,7 +88,7 @@ func TestIntegration_PauseReconcile_GoneFromResolvedHostFails(t *testing.T) {
 	teamID, _ := seedTeamAndKey(t)
 	id, _ := abandonedPause(t, teamID, "reconcile-gone")
 
-	pauseHandlers(t, &stubVMD{pauseErr: status.Error(codes.NotFound, "no such vm")}, true).
+	pauseHandlers(t, &stubVMD{pauseErr: status.Error(codes.NotFound, "no such vm")}).
 		ReconcilePendingPausesOnce(context.Background(), zerolog.Nop())
 
 	if got := readPauseOp(t, id); got.status != "failed" || got.leased {
@@ -106,7 +104,7 @@ func TestIntegration_PauseReconcile_FlagsAttentionPastThreshold(t *testing.T) {
 		t.Fatalf("age operation: %v", err)
 	}
 
-	pauseHandlers(t, undecidedHost(), true).ReconcilePendingPausesOnce(context.Background(), zerolog.Nop())
+	pauseHandlers(t, undecidedHost()).ReconcilePendingPausesOnce(context.Background(), zerolog.Nop())
 
 	if got := readPauseOp(t, id); got.status != "pausing" || !got.attention {
 		t.Fatalf("after aged undecided attempt: %+v, want still pausing and flagged", got)
@@ -125,7 +123,7 @@ func createActive(t *testing.T, r *gin.Engine, apiKey, name string) uuid.UUID {
 func TestIntegration_PauseHandler_UndecidedHostLeavesPausing(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	vmd := undecidedHost()
-	h := pauseHandlers(t, vmd, true)
+	h := pauseHandlers(t, vmd)
 	r := api.SetupRouter(t.Context(), h, testPool)
 	id := createActive(t, r, apiKey, "pause-undecided")
 
@@ -139,28 +137,5 @@ func TestIntegration_PauseHandler_UndecidedHostLeavesPausing(t *testing.T) {
 	}
 	if n := vmd.pauseCalls.Load(); n != 2 {
 		t.Fatalf("host attempts = %d, want the foreground's two", n)
-	}
-}
-
-func TestIntegration_PauseHandler_RevertsWhenReconcilerOff(t *testing.T) {
-	_, apiKey := seedTeamAndKey(t)
-	h := pauseHandlers(t, undecidedHost(), false)
-	r := api.SetupRouter(t.Context(), h, testPool)
-	id := createActive(t, r, apiKey, "pause-revert")
-
-	if pw := do(r, "POST", "/sandboxes/"+id.String()+"/pause", apiKey, ""); pw.Code != http.StatusInternalServerError {
-		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		got := readPauseOp(t, id)
-		if got.status == "active" && !got.opID.Valid {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("after failed pause with the reconciler off: %+v, want reverted to active", got)
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }

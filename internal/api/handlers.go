@@ -3032,15 +3032,15 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	l := sandboxLogger(sandboxID.String(), sandbox.HostID)
 
 	// BeginPause's CTE atomically closed the open active interval together
-	// with the status transition; nothing to do here. If the pause
-	// subsequently fails, the revert paths reopen a new interval.
+	// with the status transition; nothing to do here. If the host
+	// cannot be resolved, the revert reopens a new interval.
 
 	// Resolve the VMD client for this sandbox's host. BeginPause has
 	// already claimed 'pausing' and closed the billing interval, so a
-	// lookup failure — now a real path when the host row is missing —
-	// must compensate exactly like a daemon failure, or the sandbox is
-	// stuck in 'pausing' and unbilled even after the registration is
-	// repaired.
+	// lookup failure — a real path when the host row is missing — must
+	// revert, or the sandbox is stuck in 'pausing' and unbilled even after
+	// the registration is repaired. This is the only revert after
+	// BeginPause: nothing was dispatched, so the VM is known to be running.
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("resolve VMD for pause failed")
@@ -3065,20 +3065,13 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 			return
 		}
 
-		if h.pauseReconcileEnabled() {
-			// Timeout, unavailable, or any other error after dispatch says
-			// nothing about whether the VM still runs; the row stays
-			// 'pausing' and the reconciler asks the host again.
-			l.Warn().Err(err).Msg("VMD PauseInstance undecided — left pausing for reconciliation")
-			lease := pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}
-			releaseCtx := context.WithoutCancel(c.Request.Context())
-			h.asyncBookkeeping("release-pause-lease", func() { h.releasePauseLease(releaseCtx, sandboxID, lease, 0, l) })
-			respondError(c, ErrInternal)
-			return
-		}
-
-		l.Error().Err(err).Msg("VMD PauseInstance failed")
-		h.revertPauseAsync(c, sandboxID, teamID, l)
+		// Timeout, unavailable, or any other error after dispatch says
+		// nothing about whether the VM still runs; the row stays 'pausing'
+		// and the reconciler asks the host again (see pause_reconcile.go).
+		l.Warn().Err(err).Msg("VMD PauseInstance undecided — left pausing for reconciliation")
+		lease := pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}
+		releaseCtx := context.WithoutCancel(c.Request.Context())
+		h.asyncBookkeeping("release-pause-lease", func() { h.releasePauseLease(releaseCtx, sandboxID, lease, 0, l) })
 		respondError(c, ErrInternal)
 		return
 	}

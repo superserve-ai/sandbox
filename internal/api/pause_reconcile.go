@@ -45,10 +45,6 @@ type pauseLease struct {
 	version int64
 }
 
-func (h *Handlers) pauseReconcileEnabled() bool {
-	return h.Config != nil && h.Config.PauseReconcilerEnabled
-}
-
 func pauseRetryAfter() int32 { return 30 + rand.Int32N(30) }
 
 // StartPauseReconciler runs the reconcile loop until ctx ends. Own goroutine:

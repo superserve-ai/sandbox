@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"errors"
-	"net/netip"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,7 +16,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -210,52 +208,8 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 	}
 }
 
-// TestReaper_VMDFails verifies that a VMD pause error reverts status to active
-// and does not stop the reaper from processing subsequent sandboxes.
-func TestReaper_VMDFails(t *testing.T) {
-	rows := []db.ClaimExpiredSandboxesRow{expiredRow("sbx-a"), expiredRow("sbx-b")}
-	var pauseCallCount int32
-	var revertCallCount int32
-
-	h := newReaperHandlers(
-		&reaperMockDBTX{
-			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
-				return newStubRows(rows), nil
-			},
-			execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-				// Count revert-to-active calls (UpdateSandboxStatus with 'active').
-				if strings.Contains(sql, "status") {
-					for _, a := range args {
-						if s, ok := a.(db.SandboxStatus); ok && s == db.SandboxStatusActive {
-							atomic.AddInt32(&revertCallCount, 1)
-						}
-					}
-				}
-				return pgconn.CommandTag{}, nil
-			},
-		},
-		&stubVMD{pauseFn: func(_ context.Context, _ string, _ string) (string, string, error) {
-			atomic.AddInt32(&pauseCallCount, 1)
-			return "", "", errors.New("vmd: pause failed")
-		}},
-	)
-
-	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
-
-	// Both sandboxes are attempted, and pauseWithRetry retries each failure
-	// once (a timed-out pause may have completed on the host), so 2 sandboxes
-	// × 2 attempts = 4 calls.
-	if got := atomic.LoadInt32(&pauseCallCount); got != 4 {
-		t.Fatalf("expected 4 PauseInstance calls (2 sandboxes × retry), got %d", got)
-	}
-	// A failure that doesn't converge after the retry reverts to active.
-	if got := atomic.LoadInt32(&revertCallCount); got != 2 {
-		t.Fatalf("expected 2 revert-to-active calls, got %d", got)
-	}
-}
-
-// With the reconciler on, a pause the host never answered stays 'pausing'
-// with its lease handed back for the reconciler; nothing reverts the row.
+// A pause the host never answered stays 'pausing' with its lease handed back
+// for the reconciler; nothing reverts the row.
 func TestReaper_VMDFails_ReconcilerLeavesPausing(t *testing.T) {
 	row := expiredRow("sbx-a")
 	row.PauseOpID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
@@ -284,7 +238,6 @@ func TestReaper_VMDFails_ReconcilerLeavesPausing(t *testing.T) {
 			return "", "", status.Error(codes.DeadlineExceeded, "pause timed out")
 		}},
 	)
-	h.Config = &config.Config{PauseReconcilerEnabled: true}
 
 	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
 
@@ -333,7 +286,6 @@ func TestReaper_VMDNotFound_ReconcilerMarksFailed(t *testing.T) {
 			return "", "", status.Error(codes.NotFound, "no such vm")
 		}},
 	)
-	h.Config = &config.Config{PauseReconcilerEnabled: true}
 
 	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
 
@@ -497,54 +449,4 @@ func TestReaper_SweepsRunOnStartupWithUnsetSweepInterval(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("snapshot sweep did not run on startup")
-}
-
-// rollbackPausedVM must persist the resumed host/IP before it flips the row
-// back to active, otherwise the DB can keep advertising a recycled slot.
-func TestRollbackPausedVM_PersistsReplacementHostAndIP(t *testing.T) {
-	resumeIP := "10.11.0.99"
-	var callOrder []string
-	var gotHost string
-	var gotIP string
-	var gotPID *int32
-
-	h := &Handlers{
-		VMD: &stubVMD{resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
-			return resumeIP, nil
-		}},
-		DB: db.New(&reaperMockDBTX{
-			execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-				switch {
-				case strings.Contains(sql, "SET host_id = $2, ip_address = $3, pid = COALESCE($4, pid)"):
-					callOrder = append(callOrder, "host")
-					gotHost = args[1].(string)
-					gotIP = args[2].(*netip.Addr).String()
-					gotPID = args[3].(*int32)
-				case strings.Contains(sql, "SET status = $2"):
-					callOrder = append(callOrder, "status")
-				}
-				return pgconn.CommandTag{}, nil
-			},
-		}),
-	}
-
-	sbx := db.ClaimExpiredSandboxesRow{
-		ID:            uuid.New(),
-		TeamID:        uuid.New(),
-		HostID:        "host-1",
-		Name:          "sbx",
-		NetworkConfig: []byte(`{"allowed_cidrs":["10.0.0.0/8"]}`),
-	}
-
-	h.rollbackPausedVM(context.Background(), sbx, "/snapshots/vmstate.snap", "/snapshots/mem.snap", errors.New("pause write failed"), zerolog.Nop())
-
-	if gotHost != "host-1" || gotIP != resumeIP {
-		t.Fatalf("replacement host/IP = %q/%q, want host-1/%s", gotHost, gotIP, resumeIP)
-	}
-	if gotPID != nil {
-		t.Fatalf("replacement pid arg = %#v, want nil to preserve the existing PID", gotPID)
-	}
-	if strings.Join(callOrder, ",") != "host,status" {
-		t.Fatalf("rollback write order = %v, want host then status", callOrder)
-	}
 }
