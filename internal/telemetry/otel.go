@@ -79,6 +79,7 @@ type OTelRecorder struct {
 	resumeSettleWaitDuration metric.Float64Histogram
 	resumeSettleWaitReads    metric.Int64Histogram
 	vmdCalls                 metric.Int64Counter
+	routingOutcomes          metric.Int64Counter
 	vmdDuration              metric.Float64Histogram
 	hostResolutionDuration   metric.Float64Histogram
 	capacityShadowDuration   metric.Float64Histogram
@@ -170,6 +171,9 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.vmdCalls, err = meter.Int64Counter("vmd_call_total"); err != nil {
+		return nil, err
+	}
+	if r.routingOutcomes, err = meter.Int64Counter("proxy_routing_outcome_total"); err != nil {
 		return nil, err
 	}
 	if r.hostResolutionDuration, err = meter.Float64Histogram("host_resolution_duration_seconds",
@@ -372,6 +376,16 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 	if c.Duration > 0 {
 		r.vmdDuration.Record(ctx, c.Duration.Seconds(), opt)
 	}
+}
+
+func (r *OTelRecorder) RecordRoutingOutcome(ctx context.Context, o RoutingOutcome) {
+	if r == nil {
+		return
+	}
+	r.routingOutcomes.Add(ctx, 1, metric.WithAttributes(r.attrs(
+		attribute.String("outcome", safeRoutingOutcome(o.Outcome)),
+		attribute.String("host_id", safeHostID(o.HostID)),
+	)...))
 }
 
 // normalizeShadowResult and normalizeShadowAgreement keep metric labels
@@ -660,6 +674,15 @@ func safeResult(v string) string {
 		return v
 	default:
 		return ResultError
+	}
+}
+
+func safeRoutingOutcome(v string) string {
+	switch v {
+	case "local", "remote", "ownership_error", "peer_error":
+		return v
+	default:
+		return "ownership_error"
 	}
 }
 

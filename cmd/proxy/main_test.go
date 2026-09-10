@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -36,6 +38,81 @@ func TestProxyHealthAdvertisesPreviewPortProtocol(t *testing.T) {
 	want := []string{preview.HostCapabilityPorts, preview.HostCapabilityPortAccess}
 	if !reflect.DeepEqual(health.Capabilities, want) {
 		t.Fatalf("capabilities = %#v, want %#v", health.Capabilities, want)
+	}
+}
+
+func TestLoopbackAddrRejectsNonLoopback(t *testing.T) {
+	for _, addr := range []string{"0.0.0.0:5010", "192.0.2.10:5010", ":5010"} {
+		if _, err := loopbackAddr(addr); err == nil {
+			t.Errorf("loopbackAddr(%q) accepted non-loopback address", addr)
+		}
+	}
+	for _, addr := range []string{"127.0.0.1:5010", "[::1]:5010", "localhost:5010"} {
+		if _, err := loopbackAddr(addr); err != nil {
+			t.Errorf("loopbackAddr(%q) rejected loopback address: %v", addr, err)
+		}
+	}
+}
+
+func TestValidateListenerSeparationRejectsPublicAndRedirectPorts(t *testing.T) {
+	for _, tc := range []struct {
+		name, public, redirect string
+	}{
+		{"public", ":5010", ":5008"},
+		{"redirect", ":5007", ":5010"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateListenerSeparation("127.0.0.1:5010", tc.public, tc.redirect); err == nil {
+				t.Fatal("expected listener port collision to be rejected")
+			}
+		})
+	}
+	if err := validateListenerSeparation("127.0.0.1:5010", ":5007", ":5008"); err != nil {
+		t.Fatalf("distinct listener ports rejected: %v", err)
+	}
+}
+
+type listenerResolver struct{ calls int }
+
+func (r *listenerResolver) Lookup(context.Context, string) (proxy.InstanceInfo, error) {
+	r.calls++
+	return proxy.InstanceInfo{}, proxy.ErrInstanceNotFound
+}
+
+func (*listenerResolver) Invalidate(string) {}
+
+func TestDataPlaneListenerRoutingIsolation(t *testing.T) {
+	domains := []string{"sandbox.test"}
+	resolver := &listenerResolver{}
+	local := proxy.NewHandler(domains, resolver, zerolog.Nop())
+	ownershipCalls := 0
+	ownership := proxy.RouteLookupFunc(func(context.Context, string) (proxy.SandboxRoute, error) {
+		ownershipCalls++
+		return proxy.SandboxRoute{}, errors.New("ownership unavailable")
+	})
+	router := proxy.NewRoutingHandler(domains, "host-a", ownership, nil, local, zerolog.Nop())
+	publicMux, localMux := newDataPlaneMuxes(local, router)
+
+	for _, tc := range []struct {
+		name                     string
+		handler                  http.Handler
+		status, ownership, local int
+	}{
+		{"public", publicMux, http.StatusBadGateway, 1, 0},
+		{"peer target", localMux, http.StatusNotFound, 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ownershipCalls, resolver.calls = 0, 0
+			req := httptest.NewRequest(http.MethodGet, "http://8080-12345678-1234-1234-1234-123456789abc.sandbox.test/", nil)
+			w := httptest.NewRecorder()
+			tc.handler.ServeHTTP(w, req)
+			if w.Code != tc.status {
+				t.Fatalf("status = %d, want %d: %s", w.Code, tc.status, w.Body.String())
+			}
+			if ownershipCalls != tc.ownership || resolver.calls != tc.local {
+				t.Fatalf("ownership/local lookups = %d/%d, want %d/%d", ownershipCalls, resolver.calls, tc.ownership, tc.local)
+			}
+		})
 	}
 }
 
