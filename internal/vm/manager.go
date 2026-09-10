@@ -1877,6 +1877,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			merr := WriteWallClockManifest(memPath, man)
 			manifestDur = time.Since(tManifest)
 			if merr != nil {
+				// The deferred thaw resumes and releases the guest; the
+				// consumed baseline is dropped here so the retry is Full.
+				m.abandonDirtyBaseline(inst)
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("write wall-clock manifest: %w", merr))
 			}
 		} else {
@@ -1898,8 +1901,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 				// one is not. The stale one goes, durably, or the pause
 				// fails; a marker that was not a frozen manifest and will not
 				// go is harmless and only logged.
-				if frozen, rerr := removeWallClockManifest(memPath); rerr != nil && frozen {
-					return "", "", nil, m.failAfterSnapshot(vmID, socketPath, fmt.Errorf("wall-clock manifest write failed (%v) and the stale frozen one could not be cleared: %w", merr, rerr))
+				if blocking, rerr := removeWallClockManifest(memPath); rerr != nil && blocking {
+					return "", "", nil, m.failAfterSnapshot(inst, socketPath, fmt.Errorf("wall-clock manifest write failed (%v) and the stale one could not be cleared: %w", merr, rerr))
 				} else if rerr != nil {
 					log.Warn().Err(rerr).Str("path", WallClockMarkerPath(memPath)).Msg("pause: a stale marker could not be removed")
 				}
@@ -1909,16 +1912,16 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		}
 	} else {
 		// No manifest for a guest that cannot correct its clock; a stale one
-		// goes, durably. A marker that was never a frozen manifest and will
-		// not go is harmless. The vCPUs are paused from the snapshot on: a
+		// goes, durably. A marker that will not go fails the pause unless it
+		// is known harmless. The vCPUs are paused from the snapshot on: a
 		// failure here must not strand them.
 		tManifest := time.Now()
-		frozen, merr := removeWallClockManifest(memPath)
+		blocking, merr := removeWallClockManifest(memPath)
 		if d := time.Since(tManifest); d > time.Millisecond {
 			manifestDur = d
 		}
-		if merr != nil && frozen {
-			return "", "", nil, m.failAfterSnapshot(vmID, socketPath, fmt.Errorf("clear stale wall-clock manifest for %q: %w", memPath, merr))
+		if merr != nil && blocking {
+			return "", "", nil, m.failAfterSnapshot(inst, socketPath, fmt.Errorf("clear stale wall-clock manifest for %q: %w", memPath, merr))
 		} else if merr != nil {
 			log.Warn().Err(merr).Str("path", WallClockMarkerPath(memPath)).Msg("pause: a stale marker could not be removed")
 		}
@@ -8416,14 +8419,26 @@ func (m *Manager) ensureWakeFloorTimed(op string) error {
 
 // failAfterSnapshot is the error return for a pause that fails after its
 // snapshot: Firecracker left the vCPUs paused and the record says Running,
-// so the guest is resumed first, best-effort, before the error.
-func (m *Manager) failAfterSnapshot(vmID, socketPath string, err error) error {
+// so the guest is resumed first, best-effort, before the error. The snapshot
+// consumed the dirty bitmap, so the retry must be Full: a Diff would hold
+// only the pages dirtied since, and the abandoned overlay's would be lost.
+func (m *Manager) failAfterSnapshot(inst *VMInstance, socketPath string, err error) error {
+	m.abandonDirtyBaseline(inst)
 	uctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if uerr := fcUnpauseVM(uctx, socketPath); uerr != nil {
-		m.log.Error().Err(uerr).Str("vm_id", vmID).Msg("pause failed after its snapshot and the guest could not be resumed")
+		m.log.Error().Err(uerr).Str("vm_id", inst.ID).Msg("pause failed after its snapshot and the guest could not be resumed")
 	}
-	return m.handleVMError(vmID, err)
+	return m.handleVMError(inst.ID, err)
+}
+
+// abandonDirtyBaseline forgets a dirty-tracking baseline a snapshot consumed
+// and this pause then abandoned: the next pause must be Full.
+func (m *Manager) abandonDirtyBaseline(inst *VMInstance) {
+	inst.mu.Lock()
+	inst.DirtyTracked = false
+	inst.DirtyTrackingSessionID = ""
+	inst.mu.Unlock()
 }
 
 // frozenManifestAt reports whether any of the paths carries a manifest that
@@ -8726,6 +8741,17 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 		for _, name := range []string{"mem.diff", "mem.snap"} {
 			if _, err := removeWallClockManifest(filepath.Join(dir, name)); err != nil {
 				log.Error().Err(err).Msg("reattach: a stale frozen manifest beside an interrupted rewrite could not be removed; parking as error")
+				return false
+			}
+		}
+		// The snapshot may have paused the vCPUs before the crash: resume
+		// them and confirm the guest answers, or it is not served as running.
+		if inst.SocketPath != "" && inst.IP != "" {
+			uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			_ = fcUnpauseVM(uctx, inst.SocketPath)
+			cancel()
+			if err := boxdHealthProbe(context.WithoutCancel(ctx), inst.IP, 5*time.Second); err != nil {
+				log.Error().Err(err).Msg("reattach: guest did not answer after an interrupted rewrite; parking as error")
 				return false
 			}
 		}

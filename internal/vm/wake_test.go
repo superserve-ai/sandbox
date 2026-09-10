@@ -2261,9 +2261,11 @@ func TestUnfrozenPauseReplacingAManifestDoesSoDurably(t *testing.T) {
 func TestUnfrozenOverwriteOfAFrozenImageIsCoveredByAnIntent(t *testing.T) {
 	useTempFloor(t)
 	raiseFloorForTest(t)
-	origDown := vmUnitFullyDown
+	origDown, origUnpause, origProbe := vmUnitFullyDown, fcUnpauseVM, boxdHealthProbe
 	vmUnitFullyDown = func(string) bool { return false }
-	t.Cleanup(func() { vmUnitFullyDown = origDown })
+	fcUnpauseVM = func(context.Context, string) error { return nil }
+	boxdHealthProbe = func(context.Context, string, time.Duration) error { return nil }
+	t.Cleanup(func() { vmUnitFullyDown, fcUnpauseVM, boxdHealthProbe = origDown, origUnpause, origProbe })
 
 	fc := startSnapshotAPIFake(t, func(_, _ string) (int, string) {
 		return http.StatusInternalServerError, `{"fault_message":"disk full"}`
@@ -2353,16 +2355,93 @@ func TestPauseFailingAfterItsSnapshotResumesTheVCPUs(t *testing.T) {
 		}
 	}
 
-	t.Run("legacy_pause_survives_a_marker_that_will_not_go", func(t *testing.T) {
+	// A marker that will not go and cannot be read is not harmless: a restore
+	// would refuse the image. The pause is refused and the guest resumed.
+	t.Run("legacy_pause_refuses_an_unreadable_marker_that_will_not_go", func(t *testing.T) {
 		m, inst, vmDir, memSnap := newVM(t, false, false)
 		stuckMarker(t, memSnap)
-		if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err != nil {
-			t.Fatalf("pause: %v; a marker that was never a frozen manifest must not fail the pause", err)
+		unpaused = nil
+		if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
+			t.Fatal("want the pause refused: the image would carry a marker a restore cannot read")
+		}
+		if len(unpaused) != 1 || unpaused[0] != inst.SocketPath {
+			t.Fatalf("unpause calls = %v; the vCPUs must be resumed before the error returns", unpaused)
 		}
 		inst.mu.RLock()
 		defer inst.mu.RUnlock()
-		if inst.Status != StatusPaused {
-			t.Fatalf("status %v, want Paused", inst.Status)
+		if inst.Status != StatusRunning {
+			t.Fatalf("status %v, want Running", inst.Status)
+		}
+	})
+
+	// An empty marker that will not go is harmless: a restore reads it as
+	// legacy. The pause completes.
+	t.Run("legacy_pause_survives_an_empty_marker_that_will_not_go", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("needs a directory the process cannot write; root can")
+		}
+		dir := t.TempDir()
+		vmDir := filepath.Join(dir, "vm-1")
+		if err := os.MkdirAll(vmDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fc := startSnapshotAPIFake(t, func(_, _ string) (int, string) {
+			_ = os.Chmod(vmDir, 0o555)
+			return http.StatusNoContent, ""
+		})
+		t.Cleanup(func() { os.Chmod(vmDir, 0o755) })
+		memSnap := filepath.Join(vmDir, "mem.snap")
+		if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(WallClockMarkerPath(memSnap), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		corrects := false
+		inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects}
+		m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+		if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err != nil {
+			t.Fatalf("pause: %v; an empty marker reads as legacy and must not fail the pause", err)
+		}
+	})
+
+	// The snapshot consumed the dirty bitmap: a pause that fails after it
+	// leaves the retry no baseline, so the retry is Full, not another Diff.
+	t.Run("a_retry_after_a_failure_past_the_snapshot_is_full", func(t *testing.T) {
+		fc := startSnapshotAPIFake(t, nil)
+		dir := t.TempDir()
+		vmDir := filepath.Join(dir, "vm-1")
+		if err := os.MkdirAll(vmDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		memSnap := filepath.Join(vmDir, "mem.snap")
+		if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		corrects := true
+		inst := &VMInstance{
+			ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath,
+			MemFilePath: memSnap, CorrectsWallClock: &corrects, DirtyTracked: true, DirtyTrackingSessionID: "session-a",
+		}
+		m := &Manager{
+			log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst},
+			cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir, GuestClockFreezeEnabled: true, IncrementalSnapshotEnabled: true, DirtyTrackingSessionEnabled: true},
+		}
+		m.clockRealtimeCapable.Store(true)
+		m.dirtyTrackingSessionCapable.Store(true)
+		stuckMarker(t, memSnap) // the frozen manifest cannot land after the Diff
+		if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
+			t.Fatal("want the manifest failure")
+		}
+		if err := os.RemoveAll(WallClockMarkerPath(memSnap)); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		bodies := fc.snapshotBodies()
+		if len(bodies) != 2 || !isDiffRequest(bodies[0]) || isDiffRequest(bodies[1]) {
+			t.Fatalf("requests = %v; want a Diff that failed past the snapshot, then a Full retry", bodies)
 		}
 	})
 
@@ -2521,6 +2600,56 @@ func TestDormantHostAddsNothingToALegacyLifecycle(t *testing.T) {
 		}
 		if sink.has("restore", "wake_floor") {
 			t.Fatalf("phases = %+v; a legacy create proved a floor", sink.phases)
+		}
+	})
+}
+
+// Recovery of an intent without a token, an unfrozen rewrite the crash
+// interrupted after the snapshot paused the vCPUs, resumes them and confirms
+// the guest answers before the VM is served as running.
+func TestRecoveryOfAnUnfrozenRewriteResumesTheVCPUs(t *testing.T) {
+	useTempFloor(t)
+	raiseFloorForTest(t)
+	origUnpause, origProbe := fcUnpauseVM, boxdHealthProbe
+	t.Cleanup(func() { fcUnpauseVM, boxdHealthProbe = origUnpause, origProbe })
+	var unpaused []string
+	fcUnpauseVM = func(_ context.Context, socket string) error { unpaused = append(unpaused, socket); return nil }
+
+	newCase := func(t *testing.T) (*Manager, *VMInstance, string) {
+		t.Helper()
+		dir := t.TempDir()
+		vmDir := filepath.Join(dir, "vm-1")
+		if err := os.MkdirAll(vmDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := writePauseIntent(vmDir, pauseIntent{VMID: "vm-1", ArtifactID: "rewrite"}); err != nil {
+			t.Fatal(err)
+		}
+		inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: "/run/vm-1/firecracker.sock", ArtifactID: "current"}
+		m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+		return m, inst, vmDir
+	}
+
+	t.Run("resumed_and_answering", func(t *testing.T) {
+		m, inst, vmDir := newCase(t)
+		boxdHealthProbe = func(context.Context, string, time.Duration) error { return nil }
+		unpaused = nil
+		if !m.recoverPauseIntent(context.Background(), inst, zerolog.Nop()) {
+			t.Fatal("recovery must succeed once the guest answers")
+		}
+		if len(unpaused) != 1 || unpaused[0] != inst.SocketPath {
+			t.Fatalf("unpause calls = %v; the vCPUs the snapshot paused must be resumed", unpaused)
+		}
+		if in, _ := readPauseIntent(vmDir); in != nil {
+			t.Fatalf("intent = %+v; want it cleared", in)
+		}
+	})
+
+	t.Run("not_answering_is_not_served", func(t *testing.T) {
+		m, inst, _ := newCase(t)
+		boxdHealthProbe = func(context.Context, string, time.Duration) error { return errors.New("no answer") }
+		if m.recoverPauseIntent(context.Background(), inst, zerolog.Nop()) {
+			t.Fatal("a guest that does not answer after the resume must not be served as running")
 		}
 	})
 }

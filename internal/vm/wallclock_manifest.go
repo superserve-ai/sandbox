@@ -242,13 +242,15 @@ func WriteWallClockManifest(memPath string, m WallClockManifest) error {
 	return writeWallClockManifest(memPath, m, true)
 }
 
-// removeWallClockManifest removes the manifest beside an image, if any, and
-// reports whether it said frozen: one that did is removed with a directory
-// sync so a crash cannot bring it back; any other marker is simply removed.
-// Only a host whose floor is up reads before removing. Nothing to remove is
-// not an error.
-func removeWallClockManifest(memPath string) (frozen bool, err error) {
+// removeWallClockManifest removes the manifest beside an image, if any. One
+// that said frozen is removed with a directory sync so a crash cannot bring
+// it back; any other marker is simply removed. Only a host whose floor is up
+// reads before removing. Nothing to remove is not an error. A marker that
+// will not go is blocking unless it is known harmless: readable and not
+// frozen, or empty. One a restore could not read would refuse the image.
+func removeWallClockManifest(memPath string) (blocking bool, err error) {
 	path := WallClockMarkerPath(memPath)
+	frozen := false
 	if wakeProtocolFloorRaised() {
 		if man, rerr := ReadWallClockManifest(memPath); rerr == nil && man != nil && man.WorkloadFrozen {
 			frozen = true
@@ -258,7 +260,11 @@ func removeWallClockManifest(memPath string) (frozen bool, err error) {
 		if os.IsNotExist(err) {
 			return false, nil
 		}
-		return frozen, err
+		if frozen {
+			return true, err
+		}
+		man, rerr := ReadWallClockManifest(memPath)
+		return rerr != nil || (man != nil && man.WorkloadFrozen), err
 	}
 	if !frozen {
 		return false, nil
