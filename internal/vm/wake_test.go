@@ -2387,18 +2387,37 @@ func TestPauseFailingAfterItsSnapshotResumesTheVCPUs(t *testing.T) {
 		if os.Geteuid() == 0 {
 			t.Skip("needs a directory the process cannot write; root can")
 		}
-		m, _, vmDir, memSnap := newVM(t, false, false)
-		seedFrozenManifest(t, memSnap, "A")
-		if err := os.Chmod(vmDir, 0o555); err != nil {
+		dir := t.TempDir()
+		vmDir := filepath.Join(dir, "vm-1")
+		if err := os.MkdirAll(vmDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
+		// The directory turns read-only under the snapshot itself: the intent
+		// before it lands, the manifest's removal after it cannot.
+		fc := startSnapshotAPIFake(t, func(_, _ string) (int, string) {
+			_ = os.Chmod(vmDir, 0o555)
+			return http.StatusNoContent, ""
+		})
 		t.Cleanup(func() { os.Chmod(vmDir, 0o755) })
+		memSnap := filepath.Join(vmDir, "mem.snap")
+		if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seedFrozenManifest(t, memSnap, "A")
+		corrects := false
+		inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects}
+		m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
 		unpaused = nil
 		if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
 			t.Fatal("want the pause refused: a frozen manifest beside an unfrozen image cannot stay")
 		}
-		if len(unpaused) == 0 {
-			t.Fatal("the vCPUs must be resumed before the error returns")
+		if len(unpaused) == 0 || unpaused[0] != fc.socketPath {
+			t.Fatalf("unpause calls = %v; the vCPUs must be resumed before the error returns", unpaused)
+		}
+		inst.mu.RLock()
+		defer inst.mu.RUnlock()
+		if inst.Status != StatusRunning {
+			t.Fatalf("status %v, want Running: the pause did not commit", inst.Status)
 		}
 	})
 }
