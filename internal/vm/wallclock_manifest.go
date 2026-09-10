@@ -245,15 +245,24 @@ func WriteWallClockManifest(memPath string, m WallClockManifest) error {
 }
 
 // removeWallClockManifestDurably removes the manifest beside an image, if
-// any, and syncs its directory so a crash cannot bring it back beside an
-// image it does not describe. Nothing to remove is not an error.
+// any. One that said frozen is removed with a directory sync, so a crash
+// cannot bring it back beside an image it does not describe; any other
+// marker is simply removed, since its return would cost nothing but a
+// slower resume. Nothing to remove is not an error.
 func removeWallClockManifestDurably(memPath string) error {
 	path := WallClockMarkerPath(memPath)
+	frozen := false
+	if man, err := ReadWallClockManifest(memPath); err == nil && man != nil && man.WorkloadFrozen {
+		frozen = true
+	}
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
+	}
+	if !frozen {
+		return nil
 	}
 	return syncDir(filepath.Dir(path))
 }
@@ -332,12 +341,12 @@ func imageManifest(memPath string) (*WallClockManifest, error) {
 // The returned channel closes once the watcher has stopped, after ctx ends.
 func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger) (stopped <-chan struct{}) {
 	done := make(chan struct{})
-	// Regardless of the freeze switch: a frozen template landing on a host
-	// that does not freeze is still one this daemon restores and wakes, and
-	// the floor must be up before any rollback could meet it, not only once
-	// a restore first does. The work is two globs and a manifest read per
-	// template, after readiness and off every request path.
-	if m.cfg.SnapshotDir == "" {
+	// Only a host that may act on frozen images watches for them: with the
+	// switch off this does no filesystem work at all. A frozen template must
+	// not reach such a host in the first place; that is enforced where
+	// templates are admitted, and the guard's floor rises at the first
+	// frozen image a host does restore.
+	if m.cfg.SnapshotDir == "" || !m.cfg.GuestClockFreezeEnabled {
 		close(done)
 		return done
 	}

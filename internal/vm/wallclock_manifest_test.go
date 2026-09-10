@@ -327,11 +327,9 @@ func TestEnsureWakeProtocolFloor(t *testing.T) {
 	}
 }
 
-// A frozen template on disk raises the floor whether or not this host
-// freezes: the floor guards against a rollback meeting that template, which
-// does not depend on the switch. A host without a snapshot directory
-// watches nothing.
-func TestTemplateWatchRaisesTheFloorRegardlessOfTheSwitch(t *testing.T) {
+// A host with the switch off does no work for the watch: a frozen template
+// already on disk raises nothing until the switch is on.
+func TestTemplateWatchRunsOnlyWhenTheSwitchIsOn(t *testing.T) {
 	dir := t.TempDir()
 	isolateEvidence(t, dir)
 	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
@@ -342,15 +340,18 @@ func TestTemplateWatchRaisesTheFloorRegardlessOfTheSwitch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	none := &Manager{cfg: ManagerConfig{}}
+	off := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
 	select {
-	case <-none.WatchTemplateManifests(ctx, zerolog.Nop()):
+	case <-off.WatchTemplateManifests(ctx, zerolog.Nop()):
 	default:
-		t.Fatal("a host without a snapshot directory must start nothing")
+		t.Fatal("a watch with the switch off must start nothing")
+	}
+	if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
+		t.Fatal("the watch scanned the templates with the switch off")
 	}
 
-	off := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
-	stopped := off.WatchTemplateManifests(ctx, zerolog.Nop())
+	on := &Manager{cfg: ManagerConfig{SnapshotDir: dir, GuestClockFreezeEnabled: true}}
+	stopped := on.WatchTemplateManifests(ctx, zerolog.Nop())
 	// The watcher must be gone before the evidence path is restored by the
 	// cleanup, or it would read a path being rewritten under it.
 	defer func() { cancel(); <-stopped }()
@@ -360,7 +361,7 @@ func TestTemplateWatchRaisesTheFloorRegardlessOfTheSwitch(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the watch never raised the floor for a frozen template with the switch off")
+			t.Fatal("the watch never raised the floor with the switch on")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -430,7 +431,7 @@ func TestTemplateWatchWitnessesATemplateAsItLands(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir, GuestClockFreezeEnabled: true}}
 	stopped := m.WatchTemplateManifests(ctx, zerolog.Nop())
 	defer func() { cancel(); <-stopped }()
 	time.Sleep(50 * time.Millisecond)

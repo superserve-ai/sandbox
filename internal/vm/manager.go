@@ -1692,6 +1692,20 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		if err := writePauseIntent(snapshotDir, pauseIntent{VMID: vmID, FreezeToken: freezeToken, ArtifactID: artifactID}); err != nil {
 			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record pause intent: %w", err))
 		}
+	} else if wakeProtocolFloorRaised() && snapshotDir == filepath.Join(m.cfg.SnapshotDir, vmID) && m.frozenManifestAt(overlayPath, fullPath) {
+		// An unfrozen pause about to overwrite an image whose manifest says
+		// frozen: the image is rewritten before that manifest is replaced,
+		// and a crash between the two would leave a frozen manifest beside
+		// an image that is not. The intent names the rewrite, so a restore
+		// refuses the image until recovery has removed the stale manifest.
+		// Only a host with frozen images can hold such a manifest, so only
+		// there is this looked for.
+		if artifactID == "" {
+			artifactID = NewArtifactID()
+		}
+		if err := writePauseIntent(snapshotDir, pauseIntent{VMID: vmID, ArtifactID: artifactID}); err != nil {
+			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record pause intent: %w", err))
+		}
 	}
 	// Freeze the workload before the image exists — only when the restore would
 	// freeze the clock; otherwise the freeze buys nothing.
@@ -8427,6 +8441,21 @@ func (m *Manager) ensureWakeFloorTimed(op string) error {
 	return err
 }
 
+// frozenManifestAt reports whether any of the paths carries a manifest that
+// says frozen. A stat first: absent manifests, the common case, cost one
+// lookup each and no read.
+func (m *Manager) frozenManifestAt(paths ...string) bool {
+	for _, p := range paths {
+		if _, err := os.Stat(WallClockMarkerPath(p)); err != nil {
+			continue
+		}
+		if man, err := ReadWallClockManifest(p); err == nil && man != nil && man.WorkloadFrozen {
+			return true
+		}
+	}
+	return false
+}
+
 // releaseFrozenGuest thaws a workload a pause froze, after making sure the
 // guest can answer: a snapshot pauses the vCPUs first, so a release after a
 // snapshot that then failed, or after a crash between the two, meets a guest
@@ -8720,6 +8749,17 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 	}
 	if in == nil {
 		return true
+	}
+	if in.FreezeToken == "" {
+		// An unfrozen rewrite that was interrupted: the images here are
+		// unfrozen or torn, so a manifest beside them that says frozen is
+		// stale either way and must not outlive the intent.
+		for _, name := range []string{"mem.diff", "mem.snap"} {
+			if err := removeWallClockManifestDurably(filepath.Join(dir, name)); err != nil {
+				log.Error().Err(err).Msg("reattach: a stale frozen manifest beside an interrupted rewrite could not be removed; parking as error")
+				return false
+			}
+		}
 	}
 	if in.FreezeToken != "" && inst.IP != "" {
 		terr := m.releaseOrConfirmRunning(ctx, inst.SocketPath, inst.IP, in.FreezeToken)

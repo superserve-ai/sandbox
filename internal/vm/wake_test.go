@@ -2253,3 +2253,56 @@ func TestUnfrozenPauseReplacingAManifestDoesSoDurably(t *testing.T) {
 		t.Fatalf("phases = %+v; a durable replacement must be timed", sink.phases)
 	}
 }
+
+// An unfrozen pause that overwrites an image whose manifest says frozen
+// records an intent first: a crash between the rewrite and the manifest's
+// replacement then leaves an intent a restore refuses on, and recovery
+// removes the stale manifest before it clears the intent.
+func TestUnfrozenOverwriteOfAFrozenImageIsCoveredByAnIntent(t *testing.T) {
+	useTempFloor(t)
+	raiseFloorForTest(t)
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false }
+	t.Cleanup(func() { vmUnitFullyDown = origDown })
+
+	fc := startSnapshotAPIFake(t, func(_, _ string) (int, string) {
+		return http.StatusInternalServerError, `{"fault_message":"disk full"}`
+	})
+	dir := t.TempDir()
+	vmDir := filepath.Join(dir, "vm-1")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	memSnap := filepath.Join(vmDir, "mem.snap")
+	if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedFrozenManifest(t, memSnap, "A")
+	corrects := false
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects, ArtifactID: "current"}
+	m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+
+	// The rewrite dies (here: the snapshot fails) with the old manifest
+	// still beside the image, and the intent recorded.
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
+		t.Fatal("want the snapshot failure")
+	}
+	in, err := readPauseIntent(vmDir)
+	if err != nil || in == nil || in.FreezeToken != "" || in.ArtifactID == "" || in.ArtifactID == "current" {
+		t.Fatalf("intent = %+v err=%v; want an intent naming the rewrite, without a token", in, err)
+	}
+	if blocked, _ := pauseIntentBlocks(vmDir, "current"); !blocked {
+		t.Fatal("a restore of the image must be refused while the rewrite's intent stands")
+	}
+
+	// Recovery after a restart: the stale frozen manifest goes, then the intent.
+	if !m.recoverPauseIntent(context.Background(), inst, zerolog.Nop()) {
+		t.Fatal("recovery must succeed for a rewrite that froze nothing")
+	}
+	if man, err := ReadWallClockManifest(memSnap); err != nil || man != nil {
+		t.Fatalf("manifest=%+v err=%v; the stale frozen manifest must be removed before the intent is cleared", man, err)
+	}
+	if in, _ := readPauseIntent(vmDir); in != nil {
+		t.Fatalf("intent = %+v; want it cleared after recovery", in)
+	}
+}
