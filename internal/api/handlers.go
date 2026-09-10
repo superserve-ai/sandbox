@@ -119,10 +119,14 @@ func (h *Handlers) respondQuotaExceeded(c *gin.Context, teamID uuid.UUID) {
 
 // Scheduler selects a host for new sandboxes.
 type Scheduler interface {
-	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, err error)
+	// SelectHost picks a host; gen identifies the candidate set it came from.
+	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, gen uint64, err error)
 	// Invalidate drops any cached host state so the next SelectHost
 	// reflects host status changes immediately.
 	Invalidate()
+	// Reject drops the candidate set gen if it is still cached and still
+	// names hostID, whose pre-flight has just refused it.
+	Reject(hostID string, requiredCapabilities []string, gen uint64)
 }
 
 // HostRegistry resolves a host ID to a VMD client.
@@ -132,6 +136,15 @@ type HostRegistry interface {
 	// re-reads the host row. Callers that change a host's address must
 	// invalidate, or RPCs keep flowing to the previous machine.
 	Invalidate(hostID string)
+	// Generation is the host's invalidation generation; capture it before
+	// reading the host row and pass it to MarkVerified with what was read.
+	Generation(hostID string) uint64
+	// MarkVerified records a host row read the caller has just performed and
+	// the address it saw, so the next ClientFor need not read the row itself.
+	// A read from before an invalidation (readGen stale) is discarded. The
+	// error of a resolution it had to run is returned, so the caller fails
+	// here instead of repeating the lookup at ClientFor.
+	MarkVerified(ctx context.Context, hostID, addr string, readGen uint64) error
 }
 
 // Handlers holds shared dependencies for all route handlers.
@@ -2091,6 +2104,56 @@ func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uui
 	return out
 }
 
+// selectCreateHost picks the host for a new sandbox: the scheduler when one
+// is wired, else the configured default. Writes the error response and
+// returns ok=false when no host is available.
+func (h *Handlers) selectCreateHost(c *gin.Context, requiredCapabilities []string) (hostID string, gen uint64, ok bool) {
+	switch {
+	case h.Scheduler != nil:
+		hostID, gen, err := h.Scheduler.SelectHost(c.Request.Context(), requiredCapabilities)
+		if err != nil {
+			log.Error().Err(err).Msg("scheduler SelectHost failed")
+			respondErrorMsg(c, "service_unavailable", "No hosts available", http.StatusServiceUnavailable)
+			return "", 0, false
+		}
+		return hostID, gen, true
+	case h.Config != nil && h.Config.DefaultHostID != "":
+		return h.Config.DefaultHostID, 0, true
+	default:
+		return "default", 0, true
+	}
+}
+
+// placeCreate selects a host and re-attests it, since the candidate set may
+// be stale. A host that fails the pre-flight is rejected from the set and
+// selection runs once more. Writes the error response on failure.
+func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (hostID string, ok bool) {
+	var gen uint64
+	if hostID, gen, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
+		return "", false
+	}
+	SetTelemetryHostID(c, hostID)
+	eligible, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
+	if err == nil && !eligible && h.Scheduler != nil {
+		log.Warn().Str("host_id", hostID).Msg("scheduled host failed the pre-flight; selecting again without it")
+		rejected, rejectedGen := hostID, gen
+		h.Scheduler.Reject(hostID, requiredCapabilities, gen)
+		if hostID, gen, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
+			return "", false
+		}
+		// The same host from the same set can only repeat the answer just
+		// given; from a newer set it may have regained eligibility.
+		if hostID != rejected || gen != rejectedGen {
+			SetTelemetryHostID(c, hostID)
+			eligible, err = h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
+		}
+	}
+	if !h.respondHostCapabilityResult(c, hostID, requiredCapabilities, eligible, err) {
+		return "", false
+	}
+	return hostID, true
+}
+
 func (h *Handlers) CreateSandbox(c *gin.Context) {
 	tHandler := time.Now()
 	// total is based on the auth boundary so it covers a slow cache miss;
@@ -2310,29 +2373,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if previewAccess == preview.AccessPrivate {
 		requiredCapabilities = previewBrowserCapabilities()
 	}
-	if h.Scheduler != nil {
-		hostID, err = h.Scheduler.SelectHost(c.Request.Context(), requiredCapabilities)
-		if err != nil {
-			log.Error().Err(err).Msg("scheduler SelectHost failed")
-			respondErrorMsg(c, "service_unavailable", "No hosts available", http.StatusServiceUnavailable)
-			return
-		}
-	} else if h.Config != nil && h.Config.DefaultHostID != "" {
-		hostID = h.Config.DefaultHostID
-	} else {
-		hostID = "default"
-	}
-	SetTelemetryHostID(c, hostID)
-
-	// Re-attest after placement. The scheduler cache and the default-host path
-	// are only hints; this re-check is fresher (attestation-cache TTL vs the
-	// scheduler's candidate TTL), and VMD's post-boot policy attestation
-	// remains the fail-closed gate.
-	if previewAccess == preview.AccessPrivate {
-		if !h.requireHostPreviewPortBrowserAuth(c, hostID) {
-			return
-		}
-	} else if !h.requireHostPreviewPorts(c, hostID) {
+	var placed bool
+	if hostID, placed = h.placeCreate(c, requiredCapabilities); !placed {
 		return
 	}
 

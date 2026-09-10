@@ -356,8 +356,15 @@ func (h *Handlers) pushPreviewCredentialPolicy(ctx context.Context, sandbox db.S
 // transactional validateHostPreviewCapabilities on mutations.
 func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string, capabilities ...string) bool {
 	hasCapabilities, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, capabilities)
+	return h.respondHostCapabilityResult(c, hostID, capabilities, hasCapabilities, err)
+}
+
+// respondHostCapabilityResult turns a pre-flight outcome into the response
+// (error → 500, rejection → 409 with diagnostics gathered off the request)
+// and returns true when the host passed.
+func (h *Handlers) respondHostCapabilityResult(c *gin.Context, hostID string, capabilities []string, hasCapabilities bool, err error) bool {
 	if err != nil {
-		log.Error().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).Msg("DB HostHasCapabilities failed")
+		log.Error().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).Msg("host pre-flight failed")
 		respondError(c, ErrInternal)
 		return false
 	}

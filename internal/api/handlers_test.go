@@ -55,16 +55,37 @@ type stubVMD struct {
 
 type stubScheduler struct {
 	hostID   string
+	hosts    []string // when set, served in order ahead of hostID
 	err      error
 	required []string
+	selects  int
+	drops    int
+	rejected []string
+	// sameSet makes every selection come from one unchanged set, as the
+	// default-host fallback does; otherwise each is its own fresh set.
+	sameSet bool
 }
 
-func (s *stubScheduler) SelectHost(_ context.Context, required []string) (string, error) {
+func (s *stubScheduler) SelectHost(_ context.Context, required []string) (string, uint64, error) {
 	s.required = append([]string(nil), required...)
-	return s.hostID, s.err
+	s.selects++
+	gen := uint64(s.selects) // each selection reads as its own candidate set
+	if s.sameSet {
+		gen = 0 // the unchanged default-host fallback
+	}
+	if len(s.hosts) > 0 {
+		id := s.hosts[0]
+		s.hosts = s.hosts[1:]
+		return id, gen, s.err
+	}
+	return s.hostID, gen, s.err
 }
 
-func (s *stubScheduler) Invalidate() {}
+func (s *stubScheduler) Invalidate() { s.drops++ }
+func (s *stubScheduler) Reject(hostID string, _ []string, _ uint64) {
+	s.drops++
+	s.rejected = append(s.rejected, hostID)
+}
 
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
 	if s.destroyFn != nil {
@@ -2447,8 +2468,47 @@ func TestCreateSandbox_RechecksCapabilitiesAfterSchedulerSelection(t *testing.T)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
 	}
-	if checks != 1 || inserted || restored {
-		t.Fatalf("post-selection result: checks=%d inserted=%v restored=%v", checks, inserted, restored)
+	// A rejected host is dropped from the cached candidates and selection
+	// runs once more on a fresh load; the same host coming back from that
+	// load is re-checked, and the create fails before any insert or boot.
+	if checks != 2 || scheduler.selects != 2 || scheduler.drops != 1 || inserted || restored {
+		t.Fatalf("post-selection result: checks=%d selects=%d drops=%d inserted=%v restored=%v",
+			checks, scheduler.selects, scheduler.drops, inserted, restored)
+	}
+}
+
+// A stale candidate set can name a host that has since left rotation. The
+// pre-flight rejects it, the set is dropped, and the create lands on the
+// host a fresh load returns instead of failing.
+func TestPlaceCreateReselectsWhenPreflightRejectsHost(t *testing.T) {
+	scheduler := &stubScheduler{hosts: []string{"host-gone", "host-live"}}
+	var checked []string
+	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+		if !strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			return errorRow(fmt.Errorf("unexpected query: %s", sql))
+		}
+		hostID := args[1].(string)
+		checked = append(checked, hostID)
+		return &mockRow{scanFn: func(dest ...any) error {
+			*dest[0].(*bool) = hostID == "host-live"
+			*dest[1].(*string) = "10.0.0.5:50051"
+			return nil
+		}}
+	}}
+	h := &Handlers{DB: db.New(mock), Scheduler: scheduler}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+
+	hostID, ok := h.placeCreate(c, []string{preview.HostCapabilityPorts})
+	if !ok || hostID != "host-live" {
+		t.Fatalf("placeCreate = (%q, %v), want (host-live, true); body: %s", hostID, ok, w.Body.String())
+	}
+	if scheduler.selects != 2 || scheduler.drops != 1 {
+		t.Fatalf("selects=%d drops=%d, want 2 and 1", scheduler.selects, scheduler.drops)
+	}
+	if !reflect.DeepEqual(checked, []string{"host-gone", "host-live"}) {
+		t.Fatalf("pre-flight reads = %v, want [host-gone host-live] (the live host's second check hits the cache)", checked)
 	}
 }
 
@@ -4198,6 +4258,84 @@ func TestCreateSandboxDeclaresResourceLimitsToVMD(t *testing.T) {
 	}
 }
 
+// One pre-flight read per selected host, even with the cache disabled: the
+// result of the check is what the response is built from, not a second read.
+func TestPlaceCreateChecksCapabilitiesOncePerHost(t *testing.T) {
+	t.Setenv("HOST_CAPABILITY_CACHE_TTL", "0")
+	for _, tc := range []struct {
+		name       string
+		readErr    error
+		wantOK     bool
+		wantStatus int
+	}{
+		{name: "eligible", wantOK: true, wantStatus: http.StatusOK},
+		{name: "read fails", readErr: fmt.Errorf("connection reset"), wantStatus: http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reads int
+			mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+				if !strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+					return errorRow(fmt.Errorf("unexpected query: %s", sql))
+				}
+				reads++
+				if tc.readErr != nil {
+					return errorRow(tc.readErr)
+				}
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*bool) = true
+					*dest[1].(*string) = "10.0.0.5:50051"
+					return nil
+				}}
+			}}
+			h := &Handlers{DB: db.New(mock), Scheduler: &stubScheduler{hostID: "host-live"}}
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+
+			_, ok := h.placeCreate(c, []string{preview.HostCapabilityPorts})
+			if ok != tc.wantOK || w.Code != tc.wantStatus {
+				t.Fatalf("placeCreate ok=%v status=%d, want ok=%v status=%d", ok, w.Code, tc.wantOK, tc.wantStatus)
+			}
+			if reads != 1 {
+				t.Fatalf("pre-flight reads = %d, want 1", reads)
+			}
+		})
+	}
+}
+
+// When reselection hands back the host that was just rejected — the
+// default-host fallback does this by design — the pre-flight is not run a
+// second time: the answer cannot change, and the create fails on the first.
+func TestPlaceCreateDoesNotRecheckAnUnchangedReselection(t *testing.T) {
+	scheduler := &stubScheduler{hostID: "only-host", sameSet: true}
+	reads := 0
+	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+		if strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			reads++
+			return &mockRow{scanFn: func(dest ...any) error {
+				*dest[0].(*bool) = false
+				*dest[1].(*string) = ""
+				return nil
+			}}
+		}
+		return &mockRow{scanFn: func(dest ...any) error { return nil }} // rejection diagnostics, off the request
+	}}
+	h := &Handlers{DB: db.New(mock), Scheduler: scheduler}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+
+	if _, ok := h.placeCreate(c, []string{preview.HostCapabilityPorts}); ok {
+		t.Fatal("placeCreate accepted a host that failed the pre-flight")
+	}
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", w.Code)
+	}
+	if reads != 1 || scheduler.selects != 2 {
+		t.Fatalf("pre-flight reads=%d selects=%d, want 1 and 2", reads, scheduler.selects)
+	}
+}
+
 // A resume the host capability gate refuses never reaches the daemon and
 // reverts the claim; the revert carries no deadline because the claim leaves
 // it on the row, so retrying the refused resume cannot postpone auto-delete.
@@ -4253,5 +4391,37 @@ func TestResumeSandbox_CapabilityRefusalRevertsWithoutReachingDaemon(t *testing.
 	}
 	if len(reverted) != 2 {
 		t.Fatalf("revert args = %v, want id and team only", reverted)
+	}
+}
+
+// The same host coming back from a FRESH load may have regained eligibility
+// between the first pre-flight and the reload, so it is checked again and,
+// if it now passes, the create proceeds on it.
+func TestPlaceCreateRechecksTheSameHostAfterAFreshLoad(t *testing.T) {
+	scheduler := &stubScheduler{hostID: "flapping-host"}
+	reads := 0
+	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+		if !strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			return errorRow(fmt.Errorf("unexpected query: %s", sql))
+		}
+		reads++
+		pass := reads > 1 // eligible again by the second check
+		return &mockRow{scanFn: func(dest ...any) error {
+			*dest[0].(*bool) = pass
+			*dest[1].(*string) = "10.0.0.5:50051"
+			return nil
+		}}
+	}}
+	h := &Handlers{DB: db.New(mock), Scheduler: scheduler}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+
+	hostID, ok := h.placeCreate(c, []string{preview.HostCapabilityPorts})
+	if !ok || hostID != "flapping-host" {
+		t.Fatalf("placeCreate = (%q, %v), want (flapping-host, true); body: %s", hostID, ok, w.Body.String())
+	}
+	if reads != 2 || scheduler.selects != 2 {
+		t.Fatalf("pre-flight reads=%d selects=%d, want 2 and 2", reads, scheduler.selects)
 	}
 }

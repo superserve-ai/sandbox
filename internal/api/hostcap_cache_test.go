@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +13,8 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/hostreg"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 // capMockHandlers returns a Handlers whose DB answers every capability read
@@ -21,11 +25,94 @@ func capMockHandlers(reads *atomic.Int64, answer *atomic.Bool) *Handlers {
 			reads.Add(1)
 			return &mockRow{scanFn: func(dest ...any) error {
 				*(dest[0].(*bool)) = answer.Load()
+				*(dest[1].(*string)) = "10.0.0.9:50051"
 				return nil
 			}}
 		},
 	}
 	return &Handlers{DB: db.New(mock)}
+}
+
+type verifyRecorder struct {
+	mu        sync.Mutex
+	verified  []string
+	remaining time.Duration // budget left on the last MarkVerified's context
+	err       error         // returned by every MarkVerified
+}
+
+func (v *verifyRecorder) ClientFor(context.Context, string) (vmdclient.Client, error) {
+	return nil, fmt.Errorf("not used in this test")
+}
+func (v *verifyRecorder) Invalidate(string)        {}
+func (v *verifyRecorder) Generation(string) uint64 { return 0 }
+func (v *verifyRecorder) MarkVerified(ctx context.Context, hostID, addr string, _ uint64) error {
+	v.mu.Lock()
+	v.verified = append(v.verified, hostID+"="+addr)
+	if deadline, ok := ctx.Deadline(); ok {
+		v.remaining = time.Until(deadline)
+	}
+	v.mu.Unlock()
+	return v.err
+}
+
+// The registry wait gets the registry's own budget, not what is left of the
+// capability query's, so a read that ran long cannot starve the resolution.
+func TestHostCapReadGivesRegistryItsOwnBudget(t *testing.T) {
+	var reads atomic.Int64
+	var answer atomic.Bool
+	answer.Store(true)
+	h := capMockHandlers(&reads, &answer)
+	reg := &verifyRecorder{}
+	h.Hosts = reg
+
+	if ok, err := h.hostHasCapabilitiesCached(context.Background(), "host-a", []string{"preview_ports_v1"}); err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if got := reg.remaining; got <= hostreg.ResolveTimeout-time.Second || got > hostreg.ResolveTimeout {
+		t.Fatalf("registry wait budget = %v, want about %v", got, hostreg.ResolveTimeout)
+	}
+}
+
+// A registry resolution that fails during the pre-flight fails the
+// pre-flight, uncached, so the create ends here instead of repeating the
+// same lookup at dispatch.
+func TestHostCapReadFailsWhenRegistryResolutionFails(t *testing.T) {
+	var reads atomic.Int64
+	var answer atomic.Bool
+	answer.Store(true)
+	h := capMockHandlers(&reads, &answer)
+	h.Hosts = &verifyRecorder{err: fmt.Errorf("row unreadable")}
+
+	for i := 0; i < 2; i++ {
+		if ok, err := h.hostHasCapabilitiesCached(context.Background(), "host-a", []string{"preview_ports_v1"}); err == nil || ok {
+			t.Fatalf("call %d: ok=%v err=%v, want the resolution error", i, ok, err)
+		}
+	}
+	if n := reads.Load(); n != 2 {
+		t.Fatalf("reads = %d, want 2 (a failed pre-flight is not cached)", n)
+	}
+}
+
+// The pre-flight read is also the host registry's address verification: an
+// affirmative answer hands the address over, a negative one does not.
+func TestHostCapReadVerifiesRegistryAddress(t *testing.T) {
+	var reads atomic.Int64
+	var answer atomic.Bool
+	answer.Store(true)
+	h := capMockHandlers(&reads, &answer)
+	reg := &verifyRecorder{}
+	h.Hosts = reg
+
+	if ok, err := h.hostHasCapabilitiesCached(context.Background(), "host-a", []string{"preview_ports_v1"}); err != nil || !ok {
+		t.Fatalf("positive: ok=%v err=%v", ok, err)
+	}
+	answer.Store(false)
+	if ok, err := h.hostHasCapabilitiesCached(context.Background(), "host-b", []string{"preview_ports_v1"}); err != nil || ok {
+		t.Fatalf("negative: ok=%v err=%v", ok, err)
+	}
+	if want := []string{"host-a=10.0.0.9:50051"}; !reflect.DeepEqual(reg.verified, want) {
+		t.Fatalf("verified = %v, want %v", reg.verified, want)
+	}
 }
 
 // A positive attestation must be served from cache within the TTL — the
@@ -202,5 +289,22 @@ func TestHostCapCacheDisabled(t *testing.T) {
 	}
 	if got := reads.Load(); got != 3 {
 		t.Fatalf("DB reads = %d, want 3 (TTL=0 must disable caching)", got)
+	}
+}
+
+// The TTL is the drain admission bound, so configuration can shorten or
+// disable it but never stretch it past the cap.
+func TestHostCapCacheTTLClamped(t *testing.T) {
+	for raw, want := range map[string]time.Duration{
+		"":    defaultHostCapCacheTTL,
+		"5s":  5 * time.Second,
+		"0":   0,
+		"10m": maxHostCapCacheTTL,
+		"bad": defaultHostCapCacheTTL,
+	} {
+		t.Setenv("HOST_CAPABILITY_CACHE_TTL", raw)
+		if got := hostCapCacheTTLFromEnv(); got != want {
+			t.Fatalf("HOST_CAPABILITY_CACHE_TTL=%q: ttl = %v, want %v", raw, got, want)
+		}
 	}
 }
