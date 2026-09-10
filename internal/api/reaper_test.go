@@ -428,20 +428,28 @@ func TestReaper_FreeWorkerStartsTheNextPause(t *testing.T) {
 		h.WaitAsyncBookkeeping()
 	}()
 
-	for i := 0; i < 2; i++ {
-		select {
-		case <-calls:
-		case <-time.After(time.Second):
-			t.Fatal("first workers did not start")
-		}
+	// With the first row held, every row must still start.
+	assertAllStart(t, calls, rows, "one slow pause blocked the next sandbox while a worker was idle")
+}
+
+// assertAllStart reads one start per row from calls and fails if any row
+// never starts or an unknown id shows up. Starts arrive in any order.
+func assertAllStart(t *testing.T, calls <-chan string, rows []db.ClaimExpiredSandboxesRow, blocked string) {
+	t.Helper()
+	want := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		want[r.ID.String()] = true
 	}
-	select {
-	case id := <-calls:
-		if id != rows[2].ID.String() {
-			t.Fatalf("next pause = %s, want the third row", id)
+	for range rows {
+		select {
+		case id := <-calls:
+			if !want[id] {
+				t.Fatalf("unexpected pause %s", id)
+			}
+			delete(want, id)
+		case <-time.After(time.Second):
+			t.Fatalf("%s (%d never started)", blocked, len(want))
 		}
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("one slow pause blocked the next sandbox while a worker was idle")
 	}
 }
 
@@ -596,19 +604,6 @@ func TestBillingPause_FreeWorkerStartsTheNextPause(t *testing.T) {
 		h.WaitAsyncBookkeeping()
 	}()
 
-	for i := 0; i < 10; i++ {
-		select {
-		case <-calls:
-		case <-time.After(time.Second):
-			t.Fatal("initial billing pauses did not start")
-		}
-	}
-	select {
-	case id := <-calls:
-		if id != rows[10].ID.String() {
-			t.Fatalf("next pause = %s, want the eleventh row", id)
-		}
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("one slow pause blocked the eleventh sandbox while workers were idle")
-	}
+	// With the first row held, the eleventh must still start on a free worker.
+	assertAllStart(t, calls, rows, "one slow pause blocked the eleventh sandbox while workers were idle")
 }
