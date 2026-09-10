@@ -77,12 +77,9 @@ func main() {
 // merely a few polls:
 //
 //	drainConvergence — when the last stale replica can still ADMIT a
-//	  create: scheduler cache TTL + stale grace (30s+30s), PLUS the fill
-//	  bound (5s — a fill that reads the host set before the drain commits
-//	  and finishes after it stamps a pre-drain view as fresh at its END),
-//	  plus a 10s post-admission margin: the admitted create still runs the
-//	  capability lookup (5s bound, api.hostCapQueryTimeout) and a cold
-//	  registry resolve (2s bound) BEFORE its bounded boot begins.
+//	  create: the per-create host pre-flight's cache TTL + grace + query
+//	  bound + a cold registry resolve, at most 39s. The constant keeps its
+//	  earlier, larger value.
 //	drainQuietWindow — continuous zeros required AFTER that: 2×30s boot
 //	  (incl. retry) + insert/cleanup visibility margin.
 const (

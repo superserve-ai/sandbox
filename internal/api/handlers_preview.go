@@ -122,6 +122,19 @@ func publishedPortPolicies(ports []db.ListPublishedPortsRow) map[int32]vmdclient
 	return out
 }
 
+// claimedPortPolicies is publishedPortPolicies over the parallel arrays the
+// resume claim aggregates its ports into.
+func claimedPortPolicies(ports []int32, accesses []string, tokenVersions []int64) map[int32]vmdclient.PortPolicy {
+	rows := make([]db.ListPublishedPortsRow, 0, len(ports))
+	for i, port := range ports {
+		if i >= len(accesses) || i >= len(tokenVersions) {
+			break
+		}
+		rows = append(rows, db.ListPublishedPortsRow{Port: port, Access: accesses[i], TokenVersion: tokenVersions[i]})
+	}
+	return publishedPortPolicies(rows)
+}
+
 // vmdPorts strips credential generations from non-tokenized modes. The
 // control-plane snapshot retains them so API publication responses can report
 // the durable generation for public ports too, but public wire records have no
@@ -343,8 +356,15 @@ func (h *Handlers) pushPreviewCredentialPolicy(ctx context.Context, sandbox db.S
 // transactional validateHostPreviewCapabilities on mutations.
 func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string, capabilities ...string) bool {
 	hasCapabilities, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, capabilities)
+	return h.respondHostCapabilityResult(c, hostID, capabilities, hasCapabilities, err)
+}
+
+// respondHostCapabilityResult turns a pre-flight outcome into the response
+// (error → 500, rejection → 409 with diagnostics gathered off the request)
+// and returns true when the host passed.
+func (h *Handlers) respondHostCapabilityResult(c *gin.Context, hostID string, capabilities []string, hasCapabilities bool, err error) bool {
 	if err != nil {
-		log.Error().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).Msg("DB HostHasCapabilities failed")
+		log.Error().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).Msg("host pre-flight failed")
 		respondError(c, ErrInternal)
 		return false
 	}

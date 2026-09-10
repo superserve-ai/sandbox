@@ -119,10 +119,14 @@ func (h *Handlers) respondQuotaExceeded(c *gin.Context, teamID uuid.UUID) {
 
 // Scheduler selects a host for new sandboxes.
 type Scheduler interface {
-	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, err error)
+	// SelectHost picks a host; gen identifies the candidate set it came from.
+	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, gen uint64, err error)
 	// Invalidate drops any cached host state so the next SelectHost
 	// reflects host status changes immediately.
 	Invalidate()
+	// Reject drops the candidate set gen if it is still cached and still
+	// names hostID, whose pre-flight has just refused it.
+	Reject(hostID string, requiredCapabilities []string, gen uint64)
 }
 
 // HostRegistry resolves a host ID to a VMD client.
@@ -132,6 +136,15 @@ type HostRegistry interface {
 	// re-reads the host row. Callers that change a host's address must
 	// invalidate, or RPCs keep flowing to the previous machine.
 	Invalidate(hostID string)
+	// Generation is the host's invalidation generation; capture it before
+	// reading the host row and pass it to MarkVerified with what was read.
+	Generation(hostID string) uint64
+	// MarkVerified records a host row read the caller has just performed and
+	// the address it saw, so the next ClientFor need not read the row itself.
+	// A read from before an invalidation (readGen stale) is discarded. The
+	// error of a resolution it had to run is returned, so the caller fails
+	// here instead of repeating the lookup at ClientFor.
+	MarkVerified(ctx context.Context, hostID, addr string, readGen uint64) error
 }
 
 // Handlers holds shared dependencies for all route handlers.
@@ -727,11 +740,15 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			}
 			// The resume returns the post-restore access it pushed to VMD, so
 			// the response reports exactly what the VM enforces.
+			// lookup ends here, from the auth boundary. total covers the resume
+			// work alone on this path (the explicit endpoint's includes lookup).
+			// The route is not a lifecycle op, so PhaseStart silences nothing.
+			tAuth := PhaseStart(c)
 			tResume := time.Now()
 			resumedAccess, ok := h.resumePausedSandbox(c, &sandbox, teamID)
 			// Emitted for failures too — auto-resume totals must not censor.
 			RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
-				map[string]time.Duration{"total": time.Since(tResume)})
+				map[string]time.Duration{"total": time.Since(tResume), "lookup": tResume.Sub(tAuth)})
 			if !ok {
 				return nil, ""
 			}
@@ -762,72 +779,59 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	sandboxID := sandbox.ID
 	l := sandboxLogger(sandboxID.String(), sandbox.HostID)
 
+	// Registered before ANY return so failed resumes land in the histograms
+	// too. claim = before the boot RPC, vmd = the boot RPC (retry and
+	// stateless fallback included), post = the reapply steps, revert = any
+	// compensation run before the reply, kept separate because a re-pause
+	// snapshots the guest. total is emitted by the callers.
+	tStart := time.Now()
+	var tVmdStart, tVmdEnd, tPostStart, tPostDone, tRevertStart time.Time
+	// Synchronous failure paths only: the detached activate goroutine
+	// compensates after the reply and must not touch these stamps.
+	markRevert := func() {
+		if tRevertStart.IsZero() {
+			tRevertStart = time.Now()
+		}
+	}
+	defer func() {
+		stageEnd := time.Now()
+		if !tRevertStart.IsZero() {
+			stageEnd = tRevertStart
+		}
+		phases := map[string]time.Duration{}
+		if tVmdStart.IsZero() {
+			phases["claim"] = stageEnd.Sub(tStart)
+		} else {
+			phases["claim"] = tVmdStart.Sub(tStart)
+		}
+		if !tVmdEnd.IsZero() {
+			phases["vmd"] = tVmdEnd.Sub(tVmdStart)
+		}
+		if !tPostStart.IsZero() {
+			if tPostDone.IsZero() {
+				phases["post"] = stageEnd.Sub(tPostStart)
+			} else {
+				phases["post"] = tPostDone.Sub(tPostStart)
+			}
+		}
+		if !tRevertStart.IsZero() {
+			phases["revert"] = time.Since(tRevertStart)
+		}
+		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID, phases)
+	}()
+
 	if !sandbox.SnapshotID.Valid {
 		l.Error().Msg("paused sandbox has no snapshot_id")
 		respondError(c, ErrInternal)
 		return "", false
 	}
 
-	// Resolve the effective policy before claiming the sandbox. A missing
-	// side-table row is an older control plane's legacy sandbox; strict
-	// sandboxes may only resume while their host proves enforcement support.
-	// The snapshot is also the fallback payload if VMD lost its in-memory VM.
-	resumePolicy, err := h.loadPreviewPolicySnapshot(c.Request.Context(), sandboxID, teamID)
-	if err != nil {
-		l.Error().Err(err).Msg("load preview policy for resume failed")
-		respondError(c, ErrInternal)
-		return "", false
-	}
-	if resumePolicy.requiresBrowserCapability() {
-		if !h.requireHostPreviewPortBrowserAuth(c, sandbox.HostID) {
-			return "", false
-		}
-		// A Phase 2 VMD may still hold a raw-private snapshot at the previous
-		// revision. Advance under the sandbox row lock before restoring so the
-		// browser-authenticated per-port entries always have a strictly newer
-		// ordering key.
-		resumePolicy, err = h.applyPreviewMutationValidated(c.Request.Context(), sandboxID, teamID, func(*db.Queries) error {
-			return nil
-		}, func(q *db.Queries, _ previewPolicySnapshot) error {
-			return validateHostPreviewBrowserCapabilities(c.Request.Context(), q, sandbox.HostID)
-		})
-		if err != nil {
-			if !h.handlePreviewMutationResult(c, sandboxID, "ActivatePreviewBrowserAuthForResume", err) {
-				return "", false
-			}
-		}
-	} else if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireHostPreviewPorts(c, sandbox.HostID) {
-		return "", false
-	}
-	resumeVMDAccess := resumePolicy.vmdAccess()
-
-	// Serialize the paused→resuming claim with attach/detach via a DB advisory
-	// lock (held only for the claim). Both take the same lock and re-read status
-	// under it, so across API instances a mutation can't read a stale 'paused' and
-	// land a binding this resume won't pick up. Once the claim flips status to
-	// 'resuming', those handlers see it under the lock and reject with 409.
-	claimResume := func(q *db.Queries) (db.Sandbox, error) {
-		if h.Pool != nil {
-			if lerr := q.LockSandboxForSecretWrites(c.Request.Context(), sandboxID.String()); lerr != nil {
-				return db.Sandbox{}, lerr
-			}
-		}
-		return q.BeginResume(c.Request.Context(), db.BeginResumeParams{ID: sandboxID, TeamID: teamID})
-	}
-	var (
-		claimed db.Sandbox
-	)
-	if h.Pool == nil {
-		claimed, err = claimResume(h.DB)
-	} else {
-		var tx pgx.Tx
-		if tx, err = h.Pool.Begin(c.Request.Context()); err == nil {
-			defer tx.Rollback(c.Request.Context())
-			if claimed, err = claimResume(h.DB.WithTx(tx)); err == nil {
-				err = tx.Commit(c.Request.Context())
-			}
-		}
-	}
+	// One statement for the claim and the boot inputs; see ClaimResume.
+	claimed, err := h.DB.ClaimResume(c.Request.Context(), db.ClaimResumeParams{
+		ID:      sandboxID,
+		TeamID:  teamID,
+		LockKey: sandboxID.String(),
+	})
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			// Someone else is already resuming, or the sandbox is no longer
@@ -840,11 +844,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			h.respondQuotaExceeded(c, teamID)
 			return "", false
 		}
-		l.Error().Err(err).Msg("DB BeginResume failed")
+		l.Error().Err(err).Msg("DB ClaimResume failed")
 		respondError(c, ErrInternal)
 		return "", false
 	}
-	*sandbox = claimed
+	*sandbox = claimed.Sandbox
 
 	revertCtx := context.WithoutCancel(c.Request.Context())
 	revertToPaused := func() {
@@ -858,19 +862,55 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
-	snapshot, err := h.DB.GetSnapshot(c.Request.Context(), db.GetSnapshotParams{
-		ID:     sandbox.SnapshotID.Bytes,
-		TeamID: teamID,
-	})
-	if err != nil {
-		l.Error().Err(err).Msg("DB GetSnapshot failed")
+	// Strict sandboxes may only resume while their host proves enforcement
+	// support; a missing policy row is an older control plane's legacy
+	// sandbox. The policy rides the claim, so a refusal here reverts it. The
+	// snapshot is also the fallback payload if VMD lost its in-memory VM.
+	resumePolicy := previewPolicySnapshot{
+		Access:     claimed.Access,
+		WireAccess: claimed.WireAccess,
+		Revision:   claimed.Revision,
+		Ports:      claimedPortPolicies(claimed.PortNumbers, claimed.PortAccesses, claimed.PortTokenVersions),
+	}
+	if resumePolicy.requiresBrowserCapability() {
+		if !h.requireHostPreviewPortBrowserAuth(c, sandbox.HostID) {
+			markRevert()
+			revertToPaused()
+			return "", false
+		}
+		// A Phase 2 VMD may still hold a raw-private snapshot at the previous
+		// revision. Advance under the sandbox row lock before restoring so the
+		// browser-authenticated per-port entries always have a strictly newer
+		// ordering key.
+		resumePolicy, err = h.applyPreviewMutationValidated(c.Request.Context(), sandboxID, teamID, func(*db.Queries) error {
+			return nil
+		}, func(q *db.Queries, _ previewPolicySnapshot) error {
+			return validateHostPreviewBrowserCapabilities(c.Request.Context(), q, sandbox.HostID)
+		})
+		if err != nil {
+			if !h.handlePreviewMutationResult(c, sandboxID, "ActivatePreviewBrowserAuthForResume", err) {
+				markRevert()
+				revertToPaused()
+				return "", false
+			}
+		}
+	} else if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireHostPreviewPorts(c, sandbox.HostID) {
+		markRevert()
+		revertToPaused()
+		return "", false
+	}
+	resumeVMDAccess := resumePolicy.vmdAccess()
+
+	// NULL snap_path: the snapshot row is gone despite a set snapshot_id.
+	if claimed.SnapPath == nil {
+		l.Error().Msg("snapshot row missing for the paused sandbox")
+		markRevert()
 		revertToPaused()
 		respondError(c, ErrInternal)
 		return "", false
 	}
-
-	snapshotPath := snapshot.Path
-	memPath := resolveMemPath(snapshot)
+	snapshotPath := *claimed.SnapPath
+	memPath := resolveMemPath(db.Snapshot{Path: snapshotPath, MemPath: claimed.SnapMemPath})
 
 	// Overlay-mode sandboxes need basePath for the mount-namespace symlink.
 	// Read sandbox.base_path first (pinned at create) so a template rebuild
@@ -878,19 +918,14 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	var resumeBasePath string
 	if sandbox.BasePath != nil {
 		resumeBasePath = *sandbox.BasePath
-	} else if sandbox.TemplateID.Valid {
-		tpl, tplErr := h.DB.GetTemplateForOwner(c.Request.Context(), db.GetTemplateForOwnerParams{
-			ID:     sandbox.TemplateID.Bytes,
-			TeamID: teamID,
-		})
-		if tplErr == nil && tpl.BasePath != nil {
-			resumeBasePath = *tpl.BasePath
-		}
+	} else if claimed.TemplateBasePath != nil {
+		resumeBasePath = *claimed.TemplateBasePath
 	}
 
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("resolve VMD for resume failed")
+		markRevert()
 		revertToPaused()
 		respondError(c, ErrInternal)
 		return "", false
@@ -904,13 +939,24 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// retry, and the stateless fallback all draw down the same 2×vmdTimeout
 	// budget, so a resume holds the row mid-transition for a bounded window
 	// no matter which path it walks.
+	tVmdStart = time.Now()
 	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdBootTimeout)
 	defer bootCancel()
+	// The policy rides the request so the daemon stamps it before the guest
+	// runs; the attestation says what it applied. A retry that adopts the
+	// earlier attempt's VM attests the same way.
+	var attested vmdclient.ResumeAttestation
+	statelessFallback := false
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), sandbox.HostID, func(ctx context.Context) (string, uint32, uint32, error) {
-		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig)
+		ip, vcpu, memMiB, att, rerr := vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig, resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision)
+		attested = att
+		return ip, vcpu, memMiB, rerr
 	})
+	tVmdEnd = time.Now()
 	if err != nil {
 		if isVMDNotFound(err) {
+			statelessFallback = true
+			attested = vmdclient.ResumeAttestation{}
 			l.Warn().Err(err).
 				Msg("VMD ResumeInstance: VM not in map, falling back to stateless RestoreSnapshot")
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
@@ -929,12 +975,14 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 				// exists; declaring it spares the daemon a probe.
 				vmdclient.ResourceLimits{VCPU: uint32(sandbox.VcpuCount), MemoryMiB: uint32(sandbox.MemoryMib)})
 			fcancel()
+			tVmdEnd = time.Now()
 			if err != nil {
 				l.Error().Err(err).Msg("VMD RestoreSnapshot fallback failed")
 				// Deliberately no destroy for a boot that may land late: the
 				// row reverts to paused, so a follow-up resume on this ID
 				// adopts the live VM (instant resume), and the reconciler
 				// reaps the paused-row/active-VM state if no retry comes.
+				markRevert()
 				revertToPaused()
 				respondError(c, ErrInternal)
 				return "", false
@@ -942,11 +990,13 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		} else {
 			l.Error().Err(err).Msg("VMD ResumeInstance failed")
 			// Same deliberate no-destroy as the fallback branch above.
+			markRevert()
 			revertToPaused()
 			respondError(c, ErrInternal)
 			return "", false
 		}
 	}
+	tPostStart = time.Now()
 
 	// Older vmd builds may return 0 for vcpu/mem on both the Resume and
 	// Restore paths (ResourceLimits field was added later). Fall back to
@@ -1016,69 +1066,137 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
-	// Re-read and push after the VM is present. A publication mutation can race
-	// the stateless restore while VMD returns NotFound to the mutation push; this
-	// final authoritative snapshot closes that window. If a later mutation wins,
-	// VMD's monotonic revision check rejects this older snapshot.
-	currentPolicy, policyErr := h.loadPreviewPolicySnapshot(postCtx, sandboxID, teamID)
-	if policyErr != nil {
-		l.Error().Err(policyErr).Msg("reload preview policy after resume failed")
+	// Post-stage failure: the VM is up, so re-pause rather than destroy.
+	failPost := func(err error, msg string) {
+		markRevert()
+		l.Error().Err(err).Msg(msg)
 		pauseAndRevert()
 		respondError(c, ErrInternal)
-		return "", false
 	}
-	// A private publication may have changed while the VM was restoring. Gate
-	// the final authoritative reapply against the host's current browser
-	// heartbeat too; otherwise a resume that began public could activate a
-	// concurrently-added browser policy on a downgraded host.
-	if currentPolicy.requiresBrowserCapability() {
-		if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
-			pauseAndRevert()
-			h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
+
+	// The policy the claim read rode the resume request. A mutation that
+	// raced the claim converges on the daemon's record: its push lands on
+	// the paused record, and the daemon keeps the higher revision of the two.
+	// Only a missing record loses that push, so the stateless fallback still
+	// re-reads and pushes after the VM is present, as does a daemon from
+	// before the request carried the policy.
+	effectivePolicy := resumePolicy
+	reapplyPolicy := func() bool {
+		currentPolicy, policyErr := h.loadPreviewPolicySnapshot(postCtx, sandboxID, teamID)
+		if policyErr != nil {
+			failPost(policyErr, "reload preview policy after resume failed")
+			return false
+		}
+		effectivePolicy = currentPolicy
+		// A private publication may have changed while the VM was restoring.
+		// Gate the reapply against the host's current browser heartbeat too;
+		// otherwise a resume that began public could activate a
+		// concurrently-added browser policy on a downgraded host.
+		if currentPolicy.requiresBrowserCapability() {
+			if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
+				markRevert()
+				pauseAndRevert()
+				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
+				return false
+			}
+		}
+		if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.vmdAccess(), currentPolicy.vmdPorts(), currentPolicy.Revision); policyErr != nil {
+			if currentPolicy.vmdAccess() == preview.AccessLegacyPublic && isVMDUnimplemented(policyErr) {
+				// Legacy sandboxes remain compatible with a VMD from before policy
+				// updates existed. Strict resumes were capability-gated above and may
+				// never take this fallback.
+				l.Warn().Msg("vmd lacks preview policy update for legacy resume")
+			} else {
+				failPost(policyErr, "reapply preview policy after resume failed")
+				return false
+			}
+		}
+		return true
+	}
+	switch {
+	case statelessFallback:
+		if !reapplyPolicy() {
 			return "", false
 		}
+	case attested.PreviewProtocol == preview.HostCapabilityPorts:
+		// Stamped before the guest ran, or a newer policy the record already
+		// held and kept. The database may be newer still: a mutation that
+		// committed after the claim and whose own push failed. One revision
+		// read proves what is current and names the policy the reply
+		// reports; only a daemon behind it gets the full read and push.
+		currentPolicy, policyErr := h.loadPreviewPolicy(postCtx, sandboxID, teamID)
+		if policyErr != nil {
+			failPost(policyErr, "reload preview policy after resume failed")
+			return "", false
+		}
+		effectivePolicy = currentPolicy
+		switch {
+		case currentPolicy.Revision > attested.PreviewPolicyRevision:
+			l.Warn().Int64("db_revision", currentPolicy.Revision).Int64("vmd_revision", attested.PreviewPolicyRevision).
+				Msg("daemon preview policy behind the database after resume; pushing")
+			if !reapplyPolicy() {
+				return "", false
+			}
+		case resumePolicy.requiresBrowserCapability():
+			// The policy is the claim's. The host's browser heartbeat can
+			// lapse during the boot, so re-check it before activation the
+			// way the reapply does; otherwise a resume could activate a
+			// browser policy on a downgraded host.
+			if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
+				markRevert()
+				pauseAndRevert()
+				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
+				return "", false
+			}
+		}
+	case attested.PreviewProtocol == "":
+		// A daemon from before the resume request carried the policy. It may
+		// still enforce, so attest the way its generation supports. Remove
+		// once the fleet echoes.
+		l.Warn().Msg("vmd resume response carries no preview attestation; attesting via the policy RPC (version skew)")
+		if !reapplyPolicy() {
+			return "", false
+		}
+	default:
+		// An unrecognized echo: fail closed rather than guess what it enforces.
+		failPost(fmt.Errorf("preview protocol %q", attested.PreviewProtocol), "VMD attested an unknown preview protocol at resume")
+		return "", false
 	}
-	if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.vmdAccess(), currentPolicy.vmdPorts(), currentPolicy.Revision); policyErr != nil {
-		if currentPolicy.vmdAccess() == preview.AccessLegacyPublic && isVMDUnimplemented(policyErr) {
-			// Legacy sandboxes remain compatible with a VMD from before policy
-			// updates existed. Strict resumes were capability-gated above and may
-			// never take this fallback.
-			l.Warn().Msg("vmd lacks preview policy update for legacy resume")
-		} else {
-			l.Error().Err(policyErr).Msg("reapply preview policy after resume failed")
-			pauseAndRevert()
-			respondError(c, ErrInternal)
+
+	// Egress rules must be in place before the row commits to 'active'. The
+	// daemon applies the request's rules and says so, on a VM it adopted from
+	// an earlier attempt too; the stateless restore carries none, so that
+	// path and a daemon from before the ack get them pushed here.
+	if !attested.NetworkRulesApplied {
+		if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
+			failPost(err, "reapply network config on resume failed")
 			return "", false
 		}
 	}
 
-	// Apply egress rules before committing to 'active' so "active ⇒ rules
-	// applied" holds by construction.
-	if err := h.reapplyNetworkConfig(postCtx, vmd, sandboxID.String(), sandbox.NetworkConfig); err != nil {
-		l.Error().Err(err).Msg("reapply network config on resume failed")
-		pauseAndRevert()
-		respondError(c, ErrInternal)
-		return "", false
-	}
-
-	// Re-apply the current binding set before committing to 'active', so a secret
-	// attached or detached while paused takes effect — the snapshot froze the old
-	// JWT. Skipped when there are no bindings, keeping the secret-less resume a
-	// single round trip. The fresh IP binds the re-minted JWT.
+	// The current binding set must be in the guest before the row commits to
+	// 'active', so a secret attached or detached while paused takes effect.
+	// The snapshot froze the environment as last injected; when that is the
+	// current set, bound to the IP the guest came back on, with a JWT well
+	// within its life, the guest already holds it and the re-mint and guest
+	// round trip are skipped. had_secret_bindings is trigger-set on first
+	// attach, never cleared, and was read under the lock attach takes, so
+	// false proves an empty set; NULL predates the column.
 	sandbox.IpAddress = ipAddr
-	if meta, merr := h.loadSecretBindingMeta(postCtx, sandboxID); merr != nil {
-		l.Error().Err(merr).Msg("load secret bindings on resume failed")
-		pauseAndRevert()
-		respondError(c, ErrInternal)
-		return "", false
-	} else if len(meta) > 0 {
-		if aerr := h.applySecretBindings(postCtx, *sandbox, meta); aerr != nil {
-			l.Error().Err(aerr).Msg("reapply secret bindings on resume failed")
-			pauseAndRevert()
-			respondError(c, ErrInternal)
+	if sandbox.HadSecretBindings == nil || *sandbox.HadSecretBindings {
+		meta, merr := h.loadSecretBindingMeta(postCtx, sandboxID)
+		if merr != nil {
+			failPost(merr, "load secret bindings on resume failed")
 			return "", false
 		}
+		if len(meta) > 0 && !h.guestHoldsSecretEnv(*sandbox, claimed.SnapCreatedAt, meta) {
+			if aerr := h.applySecretBindings(postCtx, *sandbox, meta); aerr != nil {
+				failPost(aerr, "reapply secret bindings on resume failed")
+				return "", false
+			}
+		}
 	}
+	tPostDone = time.Now()
 
 	// Fire-and-forget: the resuming→active bookkeeping write is off the hot
 	// path. BeginResume's claim owns the row and every other transition is
@@ -1115,7 +1233,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// ActivateSandbox's CTE opens the sandbox_active_interval row (async).
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": sandboxID.String()})
-	return currentPolicy.Access, true
+	return effectivePolicy.Access, true
 }
 
 // resolveMemPath returns the memory snapshot path from a Snapshot record.
@@ -1139,22 +1257,18 @@ type persistedEgressConfig struct {
 
 // egressConfigJSON splits the request's egress entries into CIDRs and domains
 // and marshals the network_config jsonb shape persisted on the sandbox row.
-func egressConfigJSON(network *networkConfigRequest) (allowedCIDRs, allowedDomains []string, raw []byte) {
-	for _, entry := range network.AllowOut {
-		if isIPOrCIDR(entry) {
-			allowedCIDRs = append(allowedCIDRs, entry)
-		} else {
-			allowedDomains = append(allowedDomains, entry)
-		}
-	}
+// Entries are normalized (a bare IP becomes a /32) so what is persisted is
+// exactly what VMD can apply; see splitEgressEntries.
+func egressConfigJSON(network *networkConfigRequest) (allowedCIDRs, deniedCIDRs, allowedDomains []string, raw []byte) {
+	allowedCIDRs, deniedCIDRs, allowedDomains = splitEgressEntries(network.AllowOut, network.DenyOut)
 	raw, _ = json.Marshal(map[string]any{
 		"egress": map[string]any{
 			"allowed_cidrs":   allowedCIDRs,
-			"denied_cidrs":    network.DenyOut,
+			"denied_cidrs":    deniedCIDRs,
 			"allowed_domains": allowedDomains,
 		},
 	})
-	return allowedCIDRs, allowedDomains, raw
+	return allowedCIDRs, deniedCIDRs, allowedDomains, raw
 }
 
 // reapplyNetworkConfig reads the sandbox's persisted egress config and pushes
@@ -1276,14 +1390,22 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 func (h *Handlers) ResumeSandbox(c *gin.Context) {
 	tResume := PhaseStart(c)
 	var sandbox db.Sandbox
+	var tLookupDone time.Time
 	// Registered before ANY return: a resume that burns the whole pausing
 	// settle window and then 409s is among the slowest resume requests and
 	// must land in the total distribution. Transition counts/results come
-	// from the SandboxLifecycleTelemetry middleware; this emits only the
-	// phase-series total. HostID is empty until the row loads.
+	// from the SandboxLifecycleTelemetry middleware; this emits total and
+	// lookup, which ends at the resume claim, or at the reply when the
+	// request never gets there, so a settle-window 409 lands in lookup too.
+	// HostID is empty until the row loads.
 	defer func() {
-		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
-			map[string]time.Duration{"total": time.Since(tResume)})
+		phases := map[string]time.Duration{"total": time.Since(tResume)}
+		if tLookupDone.IsZero() {
+			phases["lookup"] = phases["total"]
+		} else {
+			phases["lookup"] = tLookupDone.Sub(tResume)
+		}
+		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID, phases)
 	}()
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
@@ -1383,6 +1505,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
+	tLookupDone = time.Now()
 	if _, ok := h.resumePausedSandbox(c, &sandbox, teamID); !ok {
 		return
 	}
@@ -1728,7 +1851,9 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	if s.AutoDeleteSeconds != nil {
 		resp.AutoDeleteSeconds = s.AutoDeleteSeconds
 	}
-	if s.AutoDeleteAt.Valid {
+	// The deadline rides through a resume on the row; it is reported only
+	// while it can fire.
+	if s.Status == db.SandboxStatusPaused && s.AutoDeleteAt.Valid {
 		resp.AutoDeleteAt = &s.AutoDeleteAt.Time
 	}
 	if len(s.NetworkConfig) > 0 {
@@ -2050,6 +2175,56 @@ func (h *Handlers) fetchSandboxSecretBindings(ctx context.Context, sandboxID uui
 	return out
 }
 
+// selectCreateHost picks the host for a new sandbox: the scheduler when one
+// is wired, else the configured default. Writes the error response and
+// returns ok=false when no host is available.
+func (h *Handlers) selectCreateHost(c *gin.Context, requiredCapabilities []string) (hostID string, gen uint64, ok bool) {
+	switch {
+	case h.Scheduler != nil:
+		hostID, gen, err := h.Scheduler.SelectHost(c.Request.Context(), requiredCapabilities)
+		if err != nil {
+			log.Error().Err(err).Msg("scheduler SelectHost failed")
+			respondErrorMsg(c, "service_unavailable", "No hosts available", http.StatusServiceUnavailable)
+			return "", 0, false
+		}
+		return hostID, gen, true
+	case h.Config != nil && h.Config.DefaultHostID != "":
+		return h.Config.DefaultHostID, 0, true
+	default:
+		return "default", 0, true
+	}
+}
+
+// placeCreate selects a host and re-attests it, since the candidate set may
+// be stale. A host that fails the pre-flight is rejected from the set and
+// selection runs once more. Writes the error response on failure.
+func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (hostID string, ok bool) {
+	var gen uint64
+	if hostID, gen, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
+		return "", false
+	}
+	SetTelemetryHostID(c, hostID)
+	eligible, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
+	if err == nil && !eligible && h.Scheduler != nil {
+		log.Warn().Str("host_id", hostID).Msg("scheduled host failed the pre-flight; selecting again without it")
+		rejected, rejectedGen := hostID, gen
+		h.Scheduler.Reject(hostID, requiredCapabilities, gen)
+		if hostID, gen, ok = h.selectCreateHost(c, requiredCapabilities); !ok {
+			return "", false
+		}
+		// The same host from the same set can only repeat the answer just
+		// given; from a newer set it may have regained eligibility.
+		if hostID != rejected || gen != rejectedGen {
+			SetTelemetryHostID(c, hostID)
+			eligible, err = h.hostHasCapabilitiesCached(c.Request.Context(), hostID, requiredCapabilities)
+		}
+	}
+	if !h.respondHostCapabilityResult(c, hostID, requiredCapabilities, eligible, err) {
+		return "", false
+	}
+	return hostID, true
+}
+
 func (h *Handlers) CreateSandbox(c *gin.Context) {
 	tHandler := time.Now()
 	// total is based on the auth boundary so it covers a slow cache miss;
@@ -2269,29 +2444,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if previewAccess == preview.AccessPrivate {
 		requiredCapabilities = previewBrowserCapabilities()
 	}
-	if h.Scheduler != nil {
-		hostID, err = h.Scheduler.SelectHost(c.Request.Context(), requiredCapabilities)
-		if err != nil {
-			log.Error().Err(err).Msg("scheduler SelectHost failed")
-			respondErrorMsg(c, "service_unavailable", "No hosts available", http.StatusServiceUnavailable)
-			return
-		}
-	} else if h.Config != nil && h.Config.DefaultHostID != "" {
-		hostID = h.Config.DefaultHostID
-	} else {
-		hostID = "default"
-	}
-	SetTelemetryHostID(c, hostID)
-
-	// Re-attest after placement. The scheduler cache and the default-host path
-	// are only hints; this re-check is fresher (attestation-cache TTL vs the
-	// scheduler's candidate TTL), and VMD's post-boot policy attestation
-	// remains the fail-closed gate.
-	if previewAccess == preview.AccessPrivate {
-		if !h.requireHostPreviewPortBrowserAuth(c, hostID) {
-			return
-		}
-	} else if !h.requireHostPreviewPorts(c, hostID) {
+	var placed bool
+	if hostID, placed = h.placeCreate(c, requiredCapabilities); !placed {
 		return
 	}
 
@@ -2653,7 +2807,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// rule fetch sees them before the agent can issue a proxied request. The
 	// nftables push happens later (it needs the booted VM); the DB write does not.
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
-		_, _, networkConfig := egressConfigJSON(req.Network)
+		_, _, _, networkConfig := egressConfigJSON(req.Network)
 		if err := h.DB.UpdateSandboxNetworkConfig(postCtx, db.UpdateSandboxNetworkConfigParams{
 			ID:            sandbox.ID,
 			NetworkConfig: networkConfig,
@@ -2695,6 +2849,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				return
 			}
 		}
+		if secretsJWT != "" {
+			h.recordSecretEnv(sandboxID, ipAddress, secretMeta)
+		}
 	}
 
 	// Prime the secrets proxy's egress-rules cache so the agent's first proxied
@@ -2708,6 +2865,23 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				l.Warn().Err(err).Msg("prime egress rules cache failed (fetch fallback)")
 			}
 		}()
+	}
+
+	// Network rules stay blocking: a 201 must imply "egress rules applied",
+	// so the client can't reach the sandbox before its policy is in place.
+	// This runs before the row goes active, and a failure tears the VM down.
+	// A sandbox that boots without the egress policy it was asked for would
+	// otherwise run with the default allow-all and still report success.
+	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+		// network_config was persisted above (before env injection); this
+		// only pushes the nftables rules, which need the booted VM.
+		allowedCIDRs, deniedCIDRs, allowedDomains, _ := egressConfigJSON(req.Network)
+		if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, deniedCIDRs, allowedDomains); err != nil {
+			l.Error().Err(err).Msg("failed to apply network rules at creation")
+			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+			respondError(c, ErrInternal)
+			return
+		}
 	}
 
 	// Single atomic transition: starting → active with real resources
@@ -2796,16 +2970,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		billingCancel()
 	})
 
-	// Network rules stay blocking: a 201 must imply "egress rules applied",
-	// so the client can't reach the sandbox before its policy is in place.
-	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
-		// network_config was persisted above (before env injection); this
-		// only pushes the nftables rules, which need the booted VM.
-		allowedCIDRs, allowedDomains, _ := egressConfigJSON(req.Network)
-		if err := vmd.UpdateSandboxNetwork(postCtx, sandbox.ID.String(), allowedCIDRs, req.Network.DenyOut, allowedDomains); err != nil {
-			l.Error().Err(err).Msg("failed to apply network rules at creation")
-		}
-	}
 	tPostDone = time.Now()
 
 	var createdMeta []byte
@@ -2826,7 +2990,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	resp := h.sandboxToResponseWithToken(sandbox)
 	resp.PreviewAccess = previewAccess
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
-		resp.Network = req.Network
+		// Echo the normalized rules, not the raw request, so the create
+		// response matches what a subsequent GET returns (bare IPs as /32).
+		allowedCIDRs, deniedCIDRs, allowedDomains := splitEgressEntries(req.Network.AllowOut, req.Network.DenyOut)
+		resp.Network = &networkConfigRequest{
+			AllowOut: append(allowedCIDRs, allowedDomains...),
+			DenyOut:  deniedCIDRs,
+		}
 	}
 	l.Info().
 		Int64("auth_ms", c.GetInt64("auth_ms")).
@@ -3233,15 +3403,8 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 	}
 
 	if body.Network != nil {
-		// Separate CIDRs and domains from allow_out.
-		var allowedCIDRs, allowedDomains []string
-		for _, entry := range body.Network.AllowOut {
-			if isIPOrCIDR(entry) {
-				allowedCIDRs = append(allowedCIDRs, entry)
-			} else {
-				allowedDomains = append(allowedDomains, entry)
-			}
-		}
+		// Separate CIDRs and domains from allow_out and normalize every CIDR.
+		allowedCIDRs, deniedCIDRs, allowedDomains := splitEgressEntries(body.Network.AllowOut, body.Network.DenyOut)
 
 		// Resolve the VMD client for this sandbox's host.
 		vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
@@ -3254,7 +3417,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		// Apply rules to the running VM via VMD.
 		vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
 		defer vmdCancel()
-		if err := vmd.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, body.Network.DenyOut, allowedDomains); err != nil {
+		if err := vmd.UpdateSandboxNetwork(vmdCtx, sandboxID.String(), allowedCIDRs, deniedCIDRs, allowedDomains); err != nil {
 			l.Error().Err(err).Msg("VMD UpdateSandboxNetwork failed")
 			respondError(c, ErrInternal)
 			return
@@ -3264,7 +3427,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		networkConfig, _ := json.Marshal(map[string]any{
 			"egress": map[string]any{
 				"allowed_cidrs":   allowedCIDRs,
-				"denied_cidrs":    body.Network.DenyOut,
+				"denied_cidrs":    deniedCIDRs,
 				"allowed_domains": allowedDomains,
 			},
 		})
@@ -3479,6 +3642,44 @@ func isIPOrCIDR(s string) bool {
 		return true
 	}
 	return false
+}
+
+// normalizeCIDR canonicalizes an IP or CIDR entry for the firewall. A bare
+// address becomes a single-host prefix ("1.1.1.1" -> "1.1.1.1/32"). The API
+// accepts both forms, but VMD's rule builder only parses prefixes, so an
+// entry that validates here and fails there would leave the sandbox with no
+// rules at all. Domains and unparseable strings are returned unchanged.
+func normalizeCIDR(s string) string {
+	if addr, err := netip.ParseAddr(s); err == nil {
+		// An IPv4-mapped address (::ffff:a.b.c.d) passes validation as v4 but
+		// would otherwise become a /128 the IPv4-only firewall skips.
+		addr = addr.Unmap()
+		return netip.PrefixFrom(addr, addr.BitLen()).String()
+	}
+	if prefix, err := netip.ParsePrefix(s); err == nil {
+		if prefix.Addr().Is4In6() && prefix.Bits() >= 96 {
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		return prefix.String()
+	}
+	return s
+}
+
+// splitEgressEntries separates allow_out into CIDRs and domains and
+// normalizes every CIDR (allow and deny) so the persisted config and the
+// rules pushed to VMD are the same canonical strings.
+func splitEgressEntries(allowOut, denyOut []string) (allowedCIDRs, deniedCIDRs, allowedDomains []string) {
+	for _, entry := range allowOut {
+		if isIPOrCIDR(entry) {
+			allowedCIDRs = append(allowedCIDRs, normalizeCIDR(entry))
+		} else {
+			allowedDomains = append(allowedDomains, entry)
+		}
+	}
+	for _, entry := range denyOut {
+		deniedCIDRs = append(deniedCIDRs, normalizeCIDR(entry))
+	}
+	return allowedCIDRs, deniedCIDRs, allowedDomains
 }
 
 // validateEgressRules enforces the rules shared between CreateSandbox and

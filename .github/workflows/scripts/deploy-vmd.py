@@ -333,6 +333,18 @@ def main() -> int:
 
     print(f"Deploying VMD to {len(instances)} instance(s) in {where}")
 
+    # Create the runner's gcloud SSH key up front if it is missing. gcloud
+    # generates it on first use, and with per-host deploys running in
+    # parallel two hosts can start together, both find it absent, and both
+    # run ssh-keygen; the loser fails with "already exists" before its bundle
+    # is uploaded. Generated locally rather than by connecting to one host
+    # first, so no single unreachable host can keep the others from being
+    # attempted.
+    key = os.path.expanduser("~/.ssh/google_compute_engine")
+    if not os.path.exists(key):
+        os.makedirs(os.path.dirname(key), mode=0o700, exist_ok=True)
+        run_or_die(["ssh-keygen", "-q", "-t", "rsa", "-N", "", "-f", key], "generate gcloud ssh key")
+
     bundle_remote = f"/tmp/deploy-bundle-{sha}.tar.gz"
     extract_dir = f"/tmp/deploy-{sha}"
 

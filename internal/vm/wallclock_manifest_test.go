@@ -252,7 +252,7 @@ func TestFrozenRestoreRequiresTheFloor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, rerr := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
+	_, _, rerr := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 	unlock()
 	if status.Code(rerr) != codes.Unavailable || launched {
 		t.Fatalf("resume: err=%v launched=%v, want Unavailable before launch", rerr, launched)

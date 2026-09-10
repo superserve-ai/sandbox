@@ -76,8 +76,19 @@ type Registry struct {
 	// address. The mutex is never held across I/O, so an invalidation can
 	// always land mid-resolve and be observed. Grows one counter per host
 	// id ever seen (fleet-bounded).
-	gens    map[string]uint64
-	resolve singleflight.Group // one row-read/dial resolution in flight per host
+	gens map[string]uint64
+	// reported is the address a caller last handed to MarkVerified, reportSeq
+	// counts those reports, reportConflictSeq is the sequence of the latest
+	// report that disagreed with the one before it, and confirmedSeq is the
+	// report sequence as of the last row read that published. Reads cannot be
+	// ordered by time, so a report that conflicts with an unconfirmed read or
+	// with the cached client keeps the host in doubt: it is re-read before
+	// anything publishes, never dialed or renewed unread.
+	reported          map[string]string
+	reportSeq         map[string]uint64
+	reportConflictSeq map[string]uint64
+	confirmedSeq      map[string]uint64
+	resolve           singleflight.Group // one row-read/dial resolution in flight per host
 	// refreshing holds hosts with a refresh-ahead goroutine in flight.
 	// Singleflight dedupes the underlying read but not the goroutines
 	// waiting on it — without this guard, every warm call in the refresh
@@ -88,10 +99,14 @@ type Registry struct {
 // New creates a Registry backed by the host table.
 func New(queries *db.Queries, dial DialFunc) *Registry {
 	return &Registry{
-		db:      queries,
-		dial:    dial,
-		clients: make(map[string]entry),
-		gens:    make(map[string]uint64),
+		db:                queries,
+		dial:              dial,
+		clients:           make(map[string]entry),
+		gens:              make(map[string]uint64),
+		reported:          make(map[string]string),
+		reportSeq:         make(map[string]uint64),
+		reportConflictSeq: make(map[string]uint64),
+		confirmedSeq:      make(map[string]uint64),
 	}
 }
 
@@ -167,6 +182,25 @@ func (r *Registry) ClientFor(ctx context.Context, hostID string) (vmdclient.Clie
 // returning or caching the just-invalidated address. Concurrent callers for
 // one host share a single resolution.
 func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.Client, error) {
+	return r.resolveFrom(ctx, hostID, "", 0)
+}
+
+// ResolveTimeout bounds one host resolution (row read and dial). A caller
+// that waits on one budgets it separately from its own work.
+const ResolveTimeout = 2 * time.Second
+
+// Generation is the host's current invalidation generation; a caller
+// captures it before reading the host row and hands it to MarkVerified.
+func (r *Registry) Generation(hostID string) uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.gens[hostID]
+}
+
+// resolveFrom is resolveClient for a caller that has just reported knownAddr
+// (valid while the host's generation is still knownGen). The report is never
+// dialed unread; it only renews a client already cached at that address.
+func (r *Registry) resolveFrom(ctx context.Context, hostID, knownAddr string, knownGen uint64) (vmdclient.Client, error) {
 	// DoChan rather than Do: the shared resolution keeps running on its
 	// detached context and still fills the cache, but each caller waits only
 	// as long as its own request lives — a canceled create/resume stops
@@ -175,7 +209,7 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 		// Detached context: singleflight followers share the leader's
 		// result, so the leader's per-request cancellation must not decide
 		// the resolution for everyone behind it.
-		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ResolveTimeout)
 		defer cancel()
 
 		// One observation per executed flight: kind fixed at flight start,
@@ -193,12 +227,21 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 			defer func() { r.Observe(kind, time.Since(started), err) }()
 		}
 
+		// Two failed row reads end the resolution; the third attempt is
+		// reserved for a conflict-driven re-read, which is not a failure.
 		var lastErr error
-		for attempt := 0; attempt < 2; attempt++ {
+		readFailures := 0
+		for attempt := 0; attempt < 3 && readFailures < 2; attempt++ {
 			r.mu.RLock()
 			startGen := r.gens[hostID]
 			prev, hadPrev := r.clients[hostID]
+			seqAtRead := r.reportSeq[hostID]
 			r.mu.RUnlock()
+			if attempt == 0 && knownAddr != "" && startGen == knownGen {
+				if c, ok := r.renewIfCachedAt(hostID, knownAddr); ok {
+					return c, nil
+				}
+			}
 
 			host, err := r.db.GetHost(vctx, hostID)
 			if err != nil {
@@ -230,8 +273,10 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 					return e.client, nil
 				}
 				lastErr = err
+				readFailures++
 				continue
 			}
+			addr := host.VmdAddr
 
 			// If the cache holds an entry at the row's address — the common
 			// case, or a replacement another caller dialed — return that
@@ -242,10 +287,19 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				r.mu.Unlock()
 				continue // invalidated mid-read; re-read the row
 			}
-			if e, ok := r.clients[hostID]; ok && e.addr == host.VmdAddr {
+			if r.reportedConflictLocked(hostID, seqAtRead, addr) {
+				// In doubt: drop the cached client before the re-read so a
+				// failed confirmation fails closed for every caller.
+				delete(r.clients, hostID)
+				r.mu.Unlock()
+				continue
+			}
+			seqAtDial := r.reportSeq[hostID]
+			if e, ok := r.clients[hostID]; ok && e.addr == addr {
 				now := time.Now()
 				e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
 				r.clients[hostID] = e
+				r.confirmLocked(hostID, seqAtRead)
 				r.mu.Unlock()
 				return e.client, nil
 			}
@@ -253,18 +307,18 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 
 			// No usable entry for the row's address: dial it. Covers first
 			// use, an address change, and an invalidated-but-unmoved host.
-			if hadPrev && prev.addr != host.VmdAddr {
+			if hadPrev && prev.addr != addr {
 				log.Warn().Str("host_id", hostID).Str("old_addr", prev.addr).
-					Str("new_addr", host.VmdAddr).
+					Str("new_addr", addr).
 					Msg("host address changed; re-dialing before dispatch")
 			}
-			c, err := r.dial(hostID, host.VmdAddr, func() { r.Invalidate(hostID) })
+			c, err := r.dial(hostID, addr, func() { r.Invalidate(hostID) })
 			if err != nil {
 				// No falling back to a previous client: failing loudly
 				// beats executing on a machine that may have lost the
 				// identity.
 				r.Invalidate(hostID)
-				return nil, fmt.Errorf("dial VMD at %s for host %q: %w", host.VmdAddr, hostID, err)
+				return nil, fmt.Errorf("dial VMD at %s for host %q: %w", addr, hostID, err)
 			}
 			r.mu.Lock()
 			if r.gens[hostID] != startGen {
@@ -274,11 +328,18 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 				r.mu.Unlock()
 				continue
 			}
+			if r.reportedConflictLocked(hostID, seqAtDial, addr) {
+				// Same as above, for a report that landed during the dial.
+				delete(r.clients, hostID)
+				r.mu.Unlock()
+				continue
+			}
 			now := time.Now()
 			r.clients[hostID] = entry{
-				client: c, addr: host.VmdAddr,
+				client: c, addr: addr,
 				verifiedAt: now, nextCheckAt: now.Add(r.recheckTTL()),
 			}
+			r.confirmLocked(hostID, seqAtRead)
 			r.mu.Unlock()
 			return c, nil
 		}
@@ -306,6 +367,94 @@ func (r *Registry) resolveClient(ctx context.Context, hostID string) (vmdclient.
 func (r *Registry) Invalidate(hostID string) {
 	r.mu.Lock()
 	delete(r.clients, hostID)
+	delete(r.reported, hostID)
+	delete(r.reportConflictSeq, hostID)
+	delete(r.confirmedSeq, hostID)
 	r.gens[hostID]++
 	r.mu.Unlock()
+}
+
+// MarkVerified records a host row read the caller has just performed (the
+// address it saw, and the Generation captured before reading) so the dispatch
+// that follows does not read the row again. A report older than the host's
+// generation is discarded. A cached client at that address is renewed; every
+// other case reads the row, since a reclaim committed on another replica
+// after the caller's read is invisible here, and that resolution's error is
+// returned so the caller fails without repeating it at dispatch.
+func (r *Registry) MarkVerified(ctx context.Context, hostID, addr string, readGen uint64) error {
+	if addr == "" {
+		return nil
+	}
+	r.mu.Lock()
+	if r.gens[hostID] != readGen {
+		r.mu.Unlock()
+		return nil
+	}
+	seq := r.reportSeq[hostID] + 1
+	r.reportSeq[hostID] = seq
+	last, seen := r.reported[hostID]
+	r.reported[hostID] = addr
+	e, ok := r.clients[hostID]
+	if (seen && last != addr) || (ok && e.addr != addr) {
+		r.reportConflictSeq[hostID] = seq
+	}
+	if ok && e.addr != addr {
+		log.Warn().Str("host_id", hostID).Str("old_addr", e.addr).Str("new_addr", addr).
+			Msg("host address changed; dropping the cached client before re-resolving")
+		delete(r.clients, hostID)
+		r.gens[hostID]++
+	} else if ok && !r.unconfirmedConflictLocked(hostID) {
+		// Renewing from the caller's read is as safe as from the recheck's
+		// own: both are one row read that cannot be ordered against a
+		// reclaim on another replica. Only a row version could order them.
+		now := time.Now()
+		e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
+		r.clients[hostID] = e
+		r.mu.Unlock()
+		return nil
+	}
+	gen := r.gens[hostID]
+	r.mu.Unlock()
+	_, err := r.resolveFrom(ctx, hostID, addr, gen)
+	return err
+}
+
+// renewIfCachedAt renews and returns the cached client at addr, if one is
+// cached and no report conflict is unconfirmed. Takes mu.
+func (r *Registry) renewIfCachedAt(hostID, addr string) (vmdclient.Client, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.clients[hostID]
+	if !ok || e.addr != addr || r.unconfirmedConflictLocked(hostID) {
+		return nil, false
+	}
+	now := time.Now()
+	e.verifiedAt, e.nextCheckAt, e.degraded = now, now.Add(r.recheckTTL()), false
+	r.clients[hostID] = e
+	return e.client, true
+}
+
+// unconfirmedConflictLocked reports whether the latest report conflict is
+// newer than the last row read that published. Caller holds mu.
+func (r *Registry) unconfirmedConflictLocked(hostID string) bool {
+	return r.reportConflictSeq[hostID] > r.confirmedSeq[hostID]
+}
+
+// confirmLocked records that a row read whose report snapshot was seq has
+// published: every conflict recorded at or before seq is settled by it.
+// Caller holds mu.
+func (r *Registry) confirmLocked(hostID string, seq uint64) {
+	if seq > r.confirmedSeq[hostID] {
+		r.confirmedSeq[hostID] = seq
+	}
+}
+
+// reportedConflictLocked reports whether the MarkVerified reports that
+// arrived since reportSeq was seq leave addr in doubt: the latest disagrees
+// with it, or they disagreed among themselves. Caller holds mu.
+func (r *Registry) reportedConflictLocked(hostID string, seq uint64, addr string) bool {
+	if r.reportSeq[hostID] == seq {
+		return false
+	}
+	return r.reported[hostID] != addr || r.reportConflictSeq[hostID] > seq
 }

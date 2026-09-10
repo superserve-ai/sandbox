@@ -273,7 +273,7 @@ func TestResumeWakesFrozenWorkloadBeforeCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil {
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	if wakes != 1 {
@@ -338,7 +338,7 @@ func TestFrozenResumeFailureRevertsToPaused(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err == nil {
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err == nil {
 		t.Fatal("want the launch failure")
 	}
 	if !owedAtLaunch {
@@ -368,7 +368,7 @@ func TestFrozenResumeFailureRevertsToPaused(t *testing.T) {
 		inst.mu.RUnlock()
 		return 0, SupervisionUnit, errors.New("launch failed")
 	}
-	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", override, nil); err == nil {
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", override, nil); err == nil {
 		t.Fatal("want the launch failure")
 	}
 	inst.mu.RLock()
@@ -672,7 +672,7 @@ func TestResumeOfUnfrozenPauseDoesNotFreezeOrWake(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil {
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	mu.Lock()
@@ -991,7 +991,7 @@ func TestTokenMismatchFailsRestoreAndResumeWithoutRetry(t *testing.T) {
 		}
 		defer unlock()
 		wakes = 0
-		_, rerr := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
+		_, _, rerr := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 		if status.Code(rerr) != codes.FailedPrecondition || wakes != 1 {
 			t.Fatalf("err=%v wakes=%d, want FailedPrecondition after one wake", rerr, wakes)
 		}
@@ -1453,7 +1453,7 @@ func TestFrozenResumeRollbackThatCannotPersistKeepsTheSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err == nil {
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err == nil {
 		t.Fatal("want the launch failure")
 	}
 	if len(fake.setupCalls) != 1 {
@@ -1531,7 +1531,7 @@ func TestRecoveredOverrideResumeCommitsTheImageItWoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	again, err := mgr.resumeVMLocked(context.Background(), "vm-1", overrideSnap, override, nil)
+	again, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", overrideSnap, override, nil)
 	if err != nil || again != inst {
 		t.Fatalf("retry: err=%v same=%v; want the running instance returned as is", err, again == inst)
 	}
@@ -2212,7 +2212,7 @@ func TestDestroyDuringAFrozenResumeLeavesNoRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err == nil {
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err == nil {
 		t.Fatal("want the resume to fail")
 	}
 	if rec, gerr := store.Get("vm-1"); gerr == nil && rec != nil {

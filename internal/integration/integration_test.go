@@ -295,14 +295,15 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 // values so that HTTP handlers can complete and write to the DB.
 type stubVMD struct {
 	updatePreviewFn func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
+	updateNetworkFn func(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 }
 
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
 func (s *stubVMD) PauseInstance(_ context.Context, _, _, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error) {
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
-func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte) (string, uint32, uint32, error) {
-	return "10.0.0.1", 1, 1024, nil
+func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte, _ string, _ map[int32]vmdclient.PortPolicy, _ int64) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
+	return "10.0.0.1", 1, 1024, vmdclient.ResumeAttestation{}, nil
 }
 func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string, _ vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
 	return "10.0.0.1", 1, 1024, preview.HostCapabilityPorts, nil
@@ -313,7 +314,10 @@ func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]str
 func (s *stubVMD) ListDir(_ context.Context, _, _ string) ([]vmdclient.DirEntry, error) {
 	return nil, nil
 }
-func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error {
+	if s.updateNetworkFn != nil {
+		return s.updateNetworkFn(ctx, instanceID, allowedCIDRs, deniedCIDRs, allowedDomains)
+	}
 	return nil
 }
 

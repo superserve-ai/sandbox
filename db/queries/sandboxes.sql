@@ -90,7 +90,7 @@ WITH tpl AS (
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
@@ -222,6 +222,8 @@ WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL;
 WITH activated AS (
   UPDATE sandbox
   SET status = 'active',
+      -- The claim left the paused deadline on the row; it ends here.
+      auto_delete_at = NULL,
       vcpu_count = $2,
       memory_mib = $3,
       ip_address = $4,
@@ -490,15 +492,81 @@ SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
 RETURNING *;
 
+-- name: ClaimResume :one
+-- The paused→resuming claim plus the boot inputs in one round trip:
+-- snapshot paths, preview policy with published ports, template base path.
+-- The advisory lock is the one attach/detach take before re-reading
+-- status; held to statement end, so the returned row already reflects a
+-- binding mutation that beat the claim. It rides a FROM item joined on
+-- the row key: the planner keeps a volatile target there, whereas an
+-- EXISTS subquery has its target list dropped and never takes the lock.
+-- LEFT joins keep the row when the snapshot or policy row is missing.
+-- The auto-delete deadline stays on the row: the reaper acts on paused rows
+-- only, a failed resume returns the row to paused with the deadline it had,
+-- and activation clears it.
+-- 0 rows: not paused, or another resume claimed it.
+UPDATE sandbox
+SET status = 'resuming', updated_at = now()
+FROM (
+  SELECT @id::uuid AS id
+  FROM (SELECT pg_advisory_xact_lock(hashtext(@lock_key::text)::bigint)) locked
+) lk, (
+  SELECT sb.id,
+         s.path AS snap_path,
+         s.mem_path AS snap_mem_path,
+         s.created_at AS snap_created_at,
+         COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
+         COALESCE(p.access, 'legacy_public')::text AS wire_access,
+         COALESCE(p.revision, 0)::bigint AS revision,
+         COALESCE(pp.ports, '{}')::int[] AS port_numbers,
+         COALESCE(pp.accesses, '{}')::text[] AS port_accesses,
+         COALESCE(pp.token_versions, '{}')::bigint[] AS port_token_versions,
+         t.base_path AS template_base_path
+  FROM sandbox sb
+  LEFT JOIN snapshot s ON s.id = sb.snapshot_id AND s.team_id = sb.team_id
+  LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = sb.id
+  LEFT JOIN template t ON t.id = sb.template_id
+  LEFT JOIN LATERAL (
+    SELECT array_agg(pp.port ORDER BY pp.port) AS ports,
+           array_agg(pp.access ORDER BY pp.port) AS accesses,
+           array_agg(g.token_version ORDER BY pp.port) AS token_versions
+    FROM sandbox_published_port pp
+    JOIN sandbox_preview_port_token_generation g
+      ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
+    WHERE pp.sandbox_id = sb.id AND g.token_version > 0
+  ) pp ON true
+  WHERE sb.id = @id AND sb.team_id = @team_id
+) x
+WHERE sandbox.id = lk.id AND sandbox.id = x.id
+  AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
+RETURNING sqlc.embed(sandbox),
+          x.snap_path, x.snap_mem_path, x.snap_created_at,
+          x.access, x.wire_access, x.revision,
+          x.port_numbers, x.port_accesses, x.port_token_versions,
+          x.template_base_path;
+
+-- name: RecordSandboxSecretEnv :exec
+-- Bookkeeping after a successful secrets injection: what the guest now
+-- holds, for the resume-time reuse check. Off the hot path; a lost write
+-- only costs one re-injection.
+UPDATE sandbox
+SET secret_env_fingerprint = $2,
+    secret_env_ip = $3,
+    secret_env_injected_at = now(),
+    secret_env_expires_at = $4
+WHERE id = $1 AND destroyed_at IS NULL;
+
 -- name: RevertResumeToPaused :exec
 -- Compensate a failed resume attempt by flipping status back to 'paused'.
 -- Guarded on status = 'resuming' so we never clobber a concurrent transition
 -- (e.g., ActivateSandbox has already flipped to 'active').
 UPDATE sandbox
 SET status = 'paused',
-    -- Re-arm the auto-delete deadline cleared by BeginResume; the sandbox is
-    -- paused again, so it gets a fresh window.
-    auto_delete_at = now() + make_interval(secs => auto_delete_seconds),
+    -- The claim leaves the deadline in place, so a failed resume returns the
+    -- row to paused with the deadline it had and retrying cannot postpone
+    -- deletion. An auto-delete patch made while resuming leaves the deadline
+    -- NULL for the return to paused, so it is armed from the window here.
+    auto_delete_at = COALESCE(auto_delete_at, now() + make_interval(secs => auto_delete_seconds)),
     updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming';
 

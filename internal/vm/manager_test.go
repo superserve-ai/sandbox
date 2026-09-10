@@ -1625,7 +1625,7 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
 
-	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
+	inst, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 	if err != nil {
 		t.Fatalf("retried resume of a healthy running VM should succeed, got %v", err)
 	}
@@ -1656,7 +1656,7 @@ func TestResumeVM_UnverifiedRecord_NotAdopted(t *testing.T) {
 
 	// The fallthrough fails on the missing snapshot files — the assertion is
 	// only that the corpse was not returned as a healthy VM.
-	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
+	inst, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 	if err == nil && inst == existing {
 		t.Fatal("an unverified record that fails verification must not be adopted")
 	}
@@ -1732,7 +1732,7 @@ func TestResumeVM_RebuildsNetworkSlotWhenNamespaceMissingAndCleansUpOnLaunchFail
 	}
 	defer unlock()
 
-	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", resumeRules); err == nil {
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", resumeRules); err == nil {
 		t.Fatal("expected launch failure")
 	}
 	if got := fake.setupCalls; len(got) != 1 || got[0] != "vm-1" {
@@ -2087,7 +2087,7 @@ func TestResumeVM_UnverifiedTarget_VerifiedAndAdopted(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
 
-	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
+	inst, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 	if err != nil {
 		t.Fatalf("verified adoption must succeed, got %v", err)
 	}
@@ -2180,7 +2180,7 @@ func TestResumeVM_UnverifiedRelaunchVerifiesReplacementIP(t *testing.T) {
 	}
 	defer unlock()
 
-	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil {
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil {
 		t.Fatalf("resumeVMLocked: %v", err)
 	}
 	if verifiedIP != "10.11.0.99" {
@@ -2412,7 +2412,7 @@ func TestResumeVM_CorpseVerdict_ClearsRunningBeforeRelaunch(t *testing.T) {
 	}
 	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
 
-	if _, err := m.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err == nil {
+	if _, _, err := m.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err == nil {
 		t.Fatal("a relaunch with missing artifacts must fail")
 	}
 	existing.mu.RLock()
@@ -2581,7 +2581,7 @@ func TestResumeVM_CorpseVerdictUnrecordable_RefusesRelaunch(t *testing.T) {
 	store.Close() // every later write fails — the store is broken
 
 	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
-	_, err = m.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
+	_, _, err = m.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 	if err == nil {
 		t.Fatal("an unrecordable verdict must fail the resume")
 	}

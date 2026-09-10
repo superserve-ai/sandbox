@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,10 +36,14 @@ import (
 )
 
 type stubVMD struct {
-	restoreLimits    vmdclient.ResourceLimits
-	destroyFn        func(ctx context.Context, id string, force bool) error
-	pauseFn          func(ctx context.Context, id, snapshotDir string) (string, string, error)
-	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte) (string, error)
+	restoreLimits vmdclient.ResourceLimits
+	destroyFn     func(ctx context.Context, id string, force bool) error
+	pauseFn       func(ctx context.Context, id, snapshotDir string) (string, string, error)
+	resumeFn      func(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte) (string, error)
+	// resumePolicyFn sees the policy the resume request carried; resumeAttest
+	// is what the stubbed daemon claims to have applied (zero = old daemon).
+	resumePolicyFn   func(access string, ports map[int32]vmdclient.PortPolicy, revision int64)
+	resumeAttest     vmdclient.ResumeAttestation
 	restoreFn        func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
 	restorePolicyFn  func(access string, ports map[int32]vmdclient.PortPolicy, revision int64)
 	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
@@ -55,16 +60,37 @@ type stubVMD struct {
 
 type stubScheduler struct {
 	hostID   string
+	hosts    []string // when set, served in order ahead of hostID
 	err      error
 	required []string
+	selects  int
+	drops    int
+	rejected []string
+	// sameSet makes every selection come from one unchanged set, as the
+	// default-host fallback does; otherwise each is its own fresh set.
+	sameSet bool
 }
 
-func (s *stubScheduler) SelectHost(_ context.Context, required []string) (string, error) {
+func (s *stubScheduler) SelectHost(_ context.Context, required []string) (string, uint64, error) {
 	s.required = append([]string(nil), required...)
-	return s.hostID, s.err
+	s.selects++
+	gen := uint64(s.selects) // each selection reads as its own candidate set
+	if s.sameSet {
+		gen = 0 // the unchanged default-host fallback
+	}
+	if len(s.hosts) > 0 {
+		id := s.hosts[0]
+		s.hosts = s.hosts[1:]
+		return id, gen, s.err
+	}
+	return s.hostID, gen, s.err
 }
 
-func (s *stubScheduler) Invalidate() {}
+func (s *stubScheduler) Invalidate() { s.drops++ }
+func (s *stubScheduler) Reject(hostID string, _ []string, _ uint64) {
+	s.drops++
+	s.rejected = append(s.rejected, hostID)
+}
 
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
 	if s.destroyFn != nil {
@@ -81,12 +107,15 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir, pauseToken
 	}
 	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
-func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte) (string, uint32, uint32, error) {
+func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
+	if s.resumePolicyFn != nil {
+		s.resumePolicyFn(previewAccess, previewPorts, previewPolicyRevision)
+	}
 	if s.resumeFn != nil {
 		ip, err := s.resumeFn(ctx, id, snapshotPath, memPath, networkConfig)
-		return ip, 1, 1024, err
+		return ip, 1, 1024, s.resumeAttest, err
 	}
-	return "10.0.0.1", 1, 1024, nil
+	return "10.0.0.1", 1, 1024, s.resumeAttest, nil
 }
 func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
 	s.restoreLimits = limits
@@ -268,9 +297,13 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[23].(*pgtype.Timestamptz) = s.AutoDeleteAt
 		*dest[24].(*pgtype.Timestamptz) = s.FailedAt
 		*dest[25].(**bool) = s.HadSecretBindings
-		if len(dest) == 27 {
+		*dest[26].(**string) = s.SecretEnvFingerprint
+		*dest[27].(**string) = s.SecretEnvIp
+		*dest[28].(*pgtype.Timestamptz) = s.SecretEnvInjectedAt
+		*dest[29].(*pgtype.Timestamptz) = s.SecretEnvExpiresAt
+		if len(dest) == 31 {
 			// GetSandboxWithPreviewPolicy: trailing COALESCE'd effective access.
-			*dest[26].(*string) = "legacy_public"
+			*dest[30].(*string) = "legacy_public"
 		}
 		return nil
 	}}
@@ -982,6 +1015,47 @@ func snapshotRow(s db.Snapshot) *mockRow {
 	}}
 }
 
+// claimResumeRow mocks ClaimResume's RETURNING; a nil snap models a
+// missing snapshot row.
+func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, ports ...publishedPortResponse) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		if err := sandboxRow(sb).scanFn(dest[:30]...); err != nil {
+			return err
+		}
+		var snapPath, snapMemPath *string
+		var snapCreatedAt pgtype.Timestamptz
+		if snap != nil {
+			p := snap.Path
+			snapPath, snapMemPath = &p, snap.MemPath
+			snapCreatedAt = pgtype.Timestamptz{Time: snap.CreatedAt, Valid: true}
+		}
+		*dest[30].(**string) = snapPath
+		*dest[31].(**string) = snapMemPath
+		*dest[32].(*pgtype.Timestamptz) = snapCreatedAt
+		if access == "" {
+			access = preview.AccessLegacyPublic
+		}
+		*dest[33].(*string) = access
+		*dest[34].(*string) = access
+		*dest[35].(*int64) = revision
+		numbers, accesses, versions := []int32{}, []string{}, []int64{}
+		for _, port := range ports {
+			version := port.TokenVersion
+			if version == 0 {
+				version = 1
+			}
+			numbers = append(numbers, port.Port)
+			accesses = append(accesses, port.Access)
+			versions = append(versions, version)
+		}
+		*dest[36].(*[]int32) = numbers
+		*dest[37].(*[]string) = accesses
+		*dest[38].(*[]int64) = versions
+		*dest[39].(**string) = nil
+		return nil
+	}}
+}
+
 // finalizePauseRow mocks the single-column RETURNING of FinalizePause.
 func finalizePauseRow(snapshotID uuid.UUID) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
@@ -1059,7 +1133,7 @@ func TestResumeSandbox_LegacyPolicyToleratesOldVMD(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb) // BeginResume RETURNING *
+				return claimResumeRow(sb, &snap, preview.AccessLegacyPublic, 0)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -1109,7 +1183,6 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
 	}
 
-	var policyReads int
 	var restored, reconciled previewPolicySnapshot
 	vmd := &stubVMD{
 		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
@@ -1130,17 +1203,11 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 			case strings.Contains(sql, "-- name: GetSandbox :one"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
-				policyReads++
-				if policyReads == 1 {
-					return previewPolicyRow(preview.AccessPublic, 7)
-				}
 				return previewPolicyRow(preview.AccessPublic, 8)
 			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
 				return scalarBoolRow(true)
-			case strings.Contains(sql, "-- name: BeginResume :one"):
-				return sandboxRow(sb)
-			case strings.Contains(sql, "-- name: GetSnapshot :one"):
-				return snapshotRow(snap)
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRow(sb, &snap, preview.AccessPublic, 7, publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
 			default:
 				return activityRow()
 			}
@@ -1148,9 +1215,6 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 			switch {
 			case strings.Contains(sql, "-- name: ListPublishedPorts :many"):
-				if policyReads == 1 {
-					return previewPortRows(3000), nil
-				}
 				return previewPortRows(8080), nil
 			case strings.Contains(sql, "-- name: ListSandboxSecretBindingMeta :many"):
 				return emptyRows{}, nil
@@ -1225,10 +1289,10 @@ func TestResumeSandbox_PrivatePolicyRequiresBrowserChainAndRestoresBrowserPorts(
 			case strings.Contains(sql, "-- name: AdvanceSandboxPreviewPolicy :one"):
 				revisionBumps++
 				return previewPolicyRow(preview.AccessPrivate, 8)
-			case strings.Contains(sql, "-- name: BeginResume :one"):
-				return sandboxRow(sb)
-			case strings.Contains(sql, "-- name: GetSnapshot :one"):
-				return snapshotRow(snap)
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRow(sb, &snap, preview.AccessPrivate, 8, publishedPortResponse{
+					Port: 3000, Access: preview.AccessPrivate, TokenVersion: 12,
+				})
 			default:
 				return activityRow()
 			}
@@ -1298,7 +1362,7 @@ func TestResumeSandbox_ReappliesSecretBindings(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -1435,7 +1499,7 @@ func TestResumeSandbox_SettlesPausingToPaused(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
 			case strings.Contains(sql, "FROM sandbox"):
@@ -1488,6 +1552,10 @@ func TestResumeSandbox_PersistentPausing_409(t *testing.T) {
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPausing}
 
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
+
 	var reads int32
 	mock := &mockDBTX{
 		queryRowFn: func(context.Context, string, ...any) pgx.Row {
@@ -1501,6 +1569,22 @@ func TestResumeSandbox_PersistentPausing_409(t *testing.T) {
 
 	if w.Code != http.StatusConflict {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusConflict)
+	}
+	// The whole settle window is lookup time; a 409 must not censor it.
+	var lookup, total time.Duration
+	for _, p := range rec.phases {
+		if p.Op != "resume" {
+			continue
+		}
+		switch p.Phase {
+		case "lookup":
+			lookup = p.Duration
+		case "total":
+			total = p.Duration
+		}
+	}
+	if lookup < pausingSettleWindow || lookup != total {
+		t.Errorf("lookup = %v, total = %v; a settle-window 409 must record lookup = total >= %v", lookup, total, pausingSettleWindow)
 	}
 	// A fixed 50ms poll over this 1s window would read ~20 times; the
 	// backed-off poll (50ms doubling up to 500ms) should land around 6 and
@@ -1632,7 +1716,7 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			default:
@@ -1657,6 +1741,8 @@ func TestResumeSandbox_VMDError(t *testing.T) {
 // paused, and never flip status to active.
 // A resume that gets the VM up but then fails to reapply egress rules must
 // re-pause the VM (preserving the overlay), never destroy it.
+// A post-stage failure re-pauses the VM before replying; the phase series
+// must report that compensation as revert, not as post time.
 func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
@@ -1667,6 +1753,10 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
 		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
 	}
+
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
 
 	var destroyCalled, pauseCalled, updateNetworkCalled, finalizeCalled, activateCalled int32
 	vmd := &stubVMD{
@@ -1694,7 +1784,7 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 				atomic.AddInt32(&finalizeCalled, 1)
 				return uuidRow(snapshotID)
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
 			case strings.Contains(sql, "FROM sandbox"):
@@ -1732,6 +1822,147 @@ func TestResumeSandbox_NetworkReapplyFailure_PausesNotDestroys(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&activateCalled); got != 0 {
 		t.Errorf("ActivateSandbox calls = %d, want 0 (network failed before commit)", got)
+	}
+	phases := map[string]bool{}
+	for _, p := range rec.phases {
+		if p.Op == "resume" {
+			phases[p.Phase] = true
+		}
+	}
+	for _, want := range []string{"claim", "vmd", "post", "revert"} {
+		if !phases[want] {
+			t.Errorf("failed resume must record phase %q; got %v", want, phases)
+		}
+	}
+}
+
+// A successful resume records lookup, claim, vmd, and post alongside the
+// caller-owned total, and no revert; the egress rules ride the request.
+func TestResumeSandbox_EmitsPhasesAndCarriesRulesInResumeRequest(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HostID = "host-a"
+	sb.NetworkConfig = []byte(`{"egress":{"allowed_cidrs":["10.0.0.0/8"]}}`)
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
+	}
+
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
+
+	var resumeNetworkConfig []byte
+	vmd := &stubVMD{
+		resumeFn: func(_ context.Context, _, _, _ string, networkConfig []byte) (string, error) {
+			resumeNetworkConfig = networkConfig
+			return "10.0.0.5", nil
+		},
+	}
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return claimResumeRow(sb, &snap, "", 0)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+
+	if len(resumeNetworkConfig) == 0 {
+		t.Fatal("ResumeInstance must carry the persisted egress rules")
+	}
+	got := map[string]bool{}
+	for _, p := range rec.phases {
+		if p.Op == "resume" && p.HostID == "host-a" {
+			got[p.Phase] = true
+		}
+	}
+	for _, want := range []string{"lookup", "claim", "vmd", "post", "total"} {
+		if !got[want] {
+			t.Errorf("resume phase %q not recorded; got %v", want, got)
+		}
+	}
+	if got["revert"] {
+		t.Error("a successful resume must not record a revert phase")
+	}
+}
+
+// had_secret_bindings=false proves the binding set is empty: no binding
+// read, no inject.
+func TestResumeSandbox_NoBindingsSkipsBindingRead(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	noBindings := false
+	sb.HadSecretBindings = &noBindings
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+
+	var injectCalled bool
+	vmd := &stubVMD{
+		resumeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) { return "10.0.0.5", nil },
+		injectEnvFn: func(context.Context, string, map[string]string, string) error {
+			injectCalled = true
+			return nil
+		},
+	}
+
+	var bindingReads int32
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return claimResumeRow(sb, &snap, "", 0)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "ListSandboxSecretBindingMeta") {
+				atomic.AddInt32(&bindingReads, 1)
+			}
+			return &scanRows{}, nil
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Signer: newTestSigner(t, "v1")}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+	if got := atomic.LoadInt32(&bindingReads); got != 0 {
+		t.Errorf("ListSandboxSecretBindingMeta reads = %d, want 0", got)
+	}
+	if injectCalled {
+		t.Error("no bindings to reapply; InjectSandboxEnv must not be called")
 	}
 }
 
@@ -1771,7 +2002,7 @@ func TestResumeSandbox_ActivateFailure_PausesNotDestroys(t *testing.T) {
 				atomic.AddInt32(&finalizeCalled, 1)
 				return uuidRow(snapshotID)
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM snapshot"):
 				return snapshotRow(snap)
 			case strings.Contains(sql, "FROM sandbox"):
@@ -1875,7 +2106,7 @@ func TestActivateSandbox_PausedResumesAndReturns200(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -2022,7 +2253,7 @@ func TestResumeSandbox_ActivityLogFailure_StillReturns200(t *testing.T) {
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
-				return sandboxRow(sb)
+				return claimResumeRow(sb, &snap, "", 0)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "FROM snapshot"):
@@ -2252,8 +2483,47 @@ func TestCreateSandbox_RechecksCapabilitiesAfterSchedulerSelection(t *testing.T)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
 	}
-	if checks != 1 || inserted || restored {
-		t.Fatalf("post-selection result: checks=%d inserted=%v restored=%v", checks, inserted, restored)
+	// A rejected host is dropped from the cached candidates and selection
+	// runs once more on a fresh load; the same host coming back from that
+	// load is re-checked, and the create fails before any insert or boot.
+	if checks != 2 || scheduler.selects != 2 || scheduler.drops != 1 || inserted || restored {
+		t.Fatalf("post-selection result: checks=%d selects=%d drops=%d inserted=%v restored=%v",
+			checks, scheduler.selects, scheduler.drops, inserted, restored)
+	}
+}
+
+// A stale candidate set can name a host that has since left rotation. The
+// pre-flight rejects it, the set is dropped, and the create lands on the
+// host a fresh load returns instead of failing.
+func TestPlaceCreateReselectsWhenPreflightRejectsHost(t *testing.T) {
+	scheduler := &stubScheduler{hosts: []string{"host-gone", "host-live"}}
+	var checked []string
+	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+		if !strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			return errorRow(fmt.Errorf("unexpected query: %s", sql))
+		}
+		hostID := args[1].(string)
+		checked = append(checked, hostID)
+		return &mockRow{scanFn: func(dest ...any) error {
+			*dest[0].(*bool) = hostID == "host-live"
+			*dest[1].(*string) = "10.0.0.5:50051"
+			return nil
+		}}
+	}}
+	h := &Handlers{DB: db.New(mock), Scheduler: scheduler}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+
+	hostID, ok := h.placeCreate(c, []string{preview.HostCapabilityPorts})
+	if !ok || hostID != "host-live" {
+		t.Fatalf("placeCreate = (%q, %v), want (host-live, true); body: %s", hostID, ok, w.Body.String())
+	}
+	if scheduler.selects != 2 || scheduler.drops != 1 {
+		t.Fatalf("selects=%d drops=%d, want 2 and 1", scheduler.selects, scheduler.drops)
+	}
+	if !reflect.DeepEqual(checked, []string{"host-gone", "host-live"}) {
+		t.Fatalf("pre-flight reads = %v, want [host-gone host-live] (the live host's second check hits the cache)", checked)
 	}
 }
 
@@ -4000,5 +4270,565 @@ func TestCreateSandboxDeclaresResourceLimitsToVMD(t *testing.T) {
 	if vmd.restoreLimits.VCPU != uint32(tpl.Vcpu) || vmd.restoreLimits.MemoryMiB != uint32(tpl.MemoryMib) {
 		t.Fatalf("declared allocation = %d/%d, want the shape the row is inserted with (%d/%d)",
 			vmd.restoreLimits.VCPU, vmd.restoreLimits.MemoryMiB, tpl.Vcpu, tpl.MemoryMib)
+	}
+}
+
+// One pre-flight read per selected host, even with the cache disabled: the
+// result of the check is what the response is built from, not a second read.
+func TestPlaceCreateChecksCapabilitiesOncePerHost(t *testing.T) {
+	t.Setenv("HOST_CAPABILITY_CACHE_TTL", "0")
+	for _, tc := range []struct {
+		name       string
+		readErr    error
+		wantOK     bool
+		wantStatus int
+	}{
+		{name: "eligible", wantOK: true, wantStatus: http.StatusOK},
+		{name: "read fails", readErr: fmt.Errorf("connection reset"), wantStatus: http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reads int
+			mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+				if !strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+					return errorRow(fmt.Errorf("unexpected query: %s", sql))
+				}
+				reads++
+				if tc.readErr != nil {
+					return errorRow(tc.readErr)
+				}
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*bool) = true
+					*dest[1].(*string) = "10.0.0.5:50051"
+					return nil
+				}}
+			}}
+			h := &Handlers{DB: db.New(mock), Scheduler: &stubScheduler{hostID: "host-live"}}
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+
+			_, ok := h.placeCreate(c, []string{preview.HostCapabilityPorts})
+			if ok != tc.wantOK || w.Code != tc.wantStatus {
+				t.Fatalf("placeCreate ok=%v status=%d, want ok=%v status=%d", ok, w.Code, tc.wantOK, tc.wantStatus)
+			}
+			if reads != 1 {
+				t.Fatalf("pre-flight reads = %d, want 1", reads)
+			}
+		})
+	}
+}
+
+// When reselection hands back the host that was just rejected — the
+// default-host fallback does this by design — the pre-flight is not run a
+// second time: the answer cannot change, and the create fails on the first.
+func TestPlaceCreateDoesNotRecheckAnUnchangedReselection(t *testing.T) {
+	scheduler := &stubScheduler{hostID: "only-host", sameSet: true}
+	reads := 0
+	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+		if strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			reads++
+			return &mockRow{scanFn: func(dest ...any) error {
+				*dest[0].(*bool) = false
+				*dest[1].(*string) = ""
+				return nil
+			}}
+		}
+		return &mockRow{scanFn: func(dest ...any) error { return nil }} // rejection diagnostics, off the request
+	}}
+	h := &Handlers{DB: db.New(mock), Scheduler: scheduler}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+
+	if _, ok := h.placeCreate(c, []string{preview.HostCapabilityPorts}); ok {
+		t.Fatal("placeCreate accepted a host that failed the pre-flight")
+	}
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", w.Code)
+	}
+	if reads != 1 || scheduler.selects != 2 {
+		t.Fatalf("pre-flight reads=%d selects=%d, want 1 and 2", reads, scheduler.selects)
+	}
+}
+
+// A resume the host capability gate refuses never reaches the daemon and
+// reverts the claim; the revert carries no deadline because the claim leaves
+// it on the row, so retrying the refused resume cannot postpone auto-delete.
+func TestResumeSandbox_CapabilityRefusalRevertsWithoutReachingDaemon(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HostID = "host-without-ports-" + uuid.NewString()
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
+	}
+
+	var reverted []any
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRow(sb, &snap, preview.AccessPublic, 3)
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return scalarBoolRow(false)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(context.Context, string, ...any) (pgx.Rows, error) {
+			return emptyRows{}, nil
+		},
+		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "-- name: RevertResumeToPaused :exec") {
+				reverted = args
+			}
+			return pgconn.NewCommandTag(""), nil
+		},
+	}
+	reached := false
+	vmd := &stubVMD{resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
+		reached = true
+		return "10.0.0.2", nil
+	}}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusConflict, w.Body.String())
+	}
+	if reached {
+		t.Fatal("refused resume reached the daemon")
+	}
+	if len(reverted) != 2 {
+		t.Fatalf("revert args = %v, want id and team only", reverted)
+	}
+}
+
+// The same host coming back from a FRESH load may have regained eligibility
+// between the first pre-flight and the reload, so it is checked again and,
+// if it now passes, the create proceeds on it.
+func TestPlaceCreateRechecksTheSameHostAfterAFreshLoad(t *testing.T) {
+	scheduler := &stubScheduler{hostID: "flapping-host"}
+	reads := 0
+	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+		if !strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			return errorRow(fmt.Errorf("unexpected query: %s", sql))
+		}
+		reads++
+		pass := reads > 1 // eligible again by the second check
+		return &mockRow{scanFn: func(dest ...any) error {
+			*dest[0].(*bool) = pass
+			*dest[1].(*string) = "10.0.0.5:50051"
+			return nil
+		}}
+	}}
+	h := &Handlers{DB: db.New(mock), Scheduler: scheduler}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+
+	hostID, ok := h.placeCreate(c, []string{preview.HostCapabilityPorts})
+	if !ok || hostID != "flapping-host" {
+		t.Fatalf("placeCreate = (%q, %v), want (flapping-host, true); body: %s", hostID, ok, w.Body.String())
+	}
+	if reads != 2 || scheduler.selects != 2 {
+		t.Fatalf("pre-flight reads=%d selects=%d, want 2 and 2", reads, scheduler.selects)
+	}
+}
+
+// The claim's policy rides the resume request. What the daemon attests
+// decides the post stage: an attested policy needs no re-read and push, an
+// acked rule set needs no replay, a daemon from before either gets both as
+// before, and an unknown attestation re-pauses rather than guessing.
+func TestResumeSandbox_AttestationDecidesReapply(t *testing.T) {
+	cases := []struct {
+		name         string
+		attest       vmdclient.ResumeAttestation
+		dbRevision   int64
+		wantCode     int
+		policyReads  int
+		policyPushes int
+		rulePushes   int
+		paused       bool
+	}{
+		{"attested policy and rules", vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 7, NetworkRulesApplied: true}, 7, http.StatusOK, 1, 0, 0, false},
+		{"daemon before the request carried either", vmdclient.ResumeAttestation{}, 7, http.StatusOK, 1, 1, 1, false},
+		{"policy attested, rules not acked", vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 7}, 7, http.StatusOK, 1, 0, 1, false},
+		{"record already held a newer policy", vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 9, NetworkRulesApplied: true}, 7, http.StatusOK, 1, 0, 0, false},
+		{"database ahead of the daemon after a failed push", vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 7, NetworkRulesApplied: true}, 9, http.StatusOK, 2, 1, 0, false},
+		{"unknown attestation", vmdclient.ResumeAttestation{PreviewProtocol: "preview_ports_v9", NetworkRulesApplied: true}, 7, http.StatusInternalServerError, 0, 0, 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
+			sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+			sb.NetworkConfig = []byte(`{"egress":{"allowed_cidrs":["10.0.0.0/8"]}}`)
+			snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+
+			var carriedAccess string
+			var carriedPorts map[int32]vmdclient.PortPolicy
+			var carriedRevision int64
+			policyReads, policyPushes, rulePushes := 0, 0, 0
+			paused := false
+			vmd := &stubVMD{
+				resumeAttest: tc.attest,
+				resumePolicyFn: func(access string, ports map[int32]vmdclient.PortPolicy, revision int64) {
+					carriedAccess, carriedPorts, carriedRevision = access, ports, revision
+				},
+				updatePreviewFn: func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error {
+					policyPushes++
+					return nil
+				},
+				updateNetworkFn: func(context.Context, string, []string, []string, []string) error {
+					rulePushes++
+					return nil
+				},
+				pauseFn: func(context.Context, string, string) (string, string, error) {
+					paused = true
+					return "/snapshots/test/vmstate.snap", "/snapshots/test/mem.snap", nil
+				},
+			}
+			mock := &mockDBTX{
+				queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+					switch {
+					case strings.Contains(sql, "-- name: ClaimResume :one"):
+						return claimResumeRow(sb, &snap, preview.AccessPublic, 7, publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
+					case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+						return scalarBoolRow(true)
+					case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+						policyReads++
+						return previewPolicyRow(preview.AccessPublic, tc.dbRevision)
+					case strings.Contains(sql, "FinalizePause"):
+						return uuidRow(snapshotID)
+					case strings.Contains(sql, "FROM sandbox"):
+						return sandboxRow(sb)
+					default:
+						return activityRow()
+					}
+				},
+				queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+					if strings.Contains(sql, "-- name: ListPublishedPorts :many") {
+						return previewPortRows(3000), nil
+					}
+					return emptyRows{}, nil
+				},
+				execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+					return pgconn.NewCommandTag("UPDATE 1"), nil
+				},
+			}
+			h := &Handlers{VMD: vmd, DB: db.New(mock)}
+			w := httptest.NewRecorder()
+			setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+			h.WaitAsyncBookkeeping()
+
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d: %s", w.Code, tc.wantCode, w.Body.String())
+			}
+			if carriedAccess != preview.AccessPublic || carriedRevision != 7 || carriedPorts[3000].Access != preview.AccessPublic {
+				t.Fatalf("resume request carried access=%q rev=%d ports=%v, want the claim's policy", carriedAccess, carriedRevision, carriedPorts)
+			}
+			if policyReads != tc.policyReads || policyPushes != tc.policyPushes || rulePushes != tc.rulePushes {
+				t.Fatalf("policy reads/pushes = %d/%d, rule pushes = %d; want %d/%d and %d", policyReads, policyPushes, rulePushes, tc.policyReads, tc.policyPushes, tc.rulePushes)
+			}
+			if paused != tc.paused {
+				t.Fatalf("re-paused = %v, want %v", paused, tc.paused)
+			}
+		})
+	}
+}
+
+// The guest keeps the injected environment across a pause. A resume skips
+// the re-mint and guest round trip only while the binding set, the guest
+// IP, the JWT's remaining life, and the snapshot's age all say the guest
+// holds the current environment; any doubt re-injects.
+func TestResumeSandbox_GuestHoldsSecretEnvSkipsInjection(t *testing.T) {
+	secretID := uuid.New()
+	metaRows := func() (pgx.Rows, error) {
+		return &scanRows{rows: []func(...any) error{bindingMetaRow(secretID, "ANTHROPIC_API_KEY", "bearer", "ssrv_proxy_x")}}, nil
+	}
+	// The fingerprint of exactly what the handler loads from that row.
+	probe := &Handlers{DB: db.New(&mockDBTX{queryFn: func(context.Context, string, ...any) (pgx.Rows, error) { return metaRows() }})}
+	meta, err := probe.loadSecretBindingMeta(context.Background(), uuid.New())
+	if err != nil {
+		t.Fatalf("load meta: %v", err)
+	}
+	// The proxy looks the key up by kid. A replaced key keeps the label and
+	// a relabel keeps the key; either strands the snapshot's JWT.
+	signer, replaced := newTestSigner(t, "v1"), newTestSigner(t, "v1")
+	relabeled := sameKeyUnderKid(t, signer, "v2")
+	current := secretEnvFingerprint(signer.KeyFingerprint(), meta)
+	other := "0000"
+	injectedAt := time.Now().Add(-time.Hour)
+	ip, otherIP := "10.0.0.5", "10.0.0.9"
+
+	cases := []struct {
+		name       string
+		signer     *SecretsSigner
+		set        func(sb *db.Sandbox, snap *db.Snapshot)
+		wantInject bool
+	}{
+		{"guest holds the current environment", signer, func(*db.Sandbox, *db.Snapshot) {}, false},
+		{"signing key replaced under the same kid", replaced, func(*db.Sandbox, *db.Snapshot) {}, true},
+		{"signing key relabeled under a new kid", relabeled, func(*db.Sandbox, *db.Snapshot) {}, true},
+		{"bindings changed since injection", signer, func(sb *db.Sandbox, _ *db.Snapshot) { sb.SecretEnvFingerprint = &other }, true},
+		{"guest came back on another ip", signer, func(sb *db.Sandbox, _ *db.Snapshot) { sb.SecretEnvIp = &otherIP }, true},
+		{"snapshot predates the injection", signer, func(_ *db.Sandbox, snap *db.Snapshot) { snap.CreatedAt = injectedAt.Add(-time.Minute) }, true},
+		{"jwt near expiry", signer, func(sb *db.Sandbox, _ *db.Snapshot) {
+			sb.SecretEnvExpiresAt = pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+		}, true},
+		{"nothing recorded", signer, func(sb *db.Sandbox, _ *db.Snapshot) {
+			sb.SecretEnvFingerprint, sb.SecretEnvIp = nil, nil
+			sb.SecretEnvInjectedAt, sb.SecretEnvExpiresAt = pgtype.Timestamptz{}, pgtype.Timestamptz{}
+		}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
+			sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+			had := true
+			sb.HadSecretBindings = &had
+			fp, envIP := current, ip
+			sb.SecretEnvFingerprint, sb.SecretEnvIp = &fp, &envIP
+			sb.SecretEnvInjectedAt = pgtype.Timestamptz{Time: injectedAt, Valid: true}
+			sb.SecretEnvExpiresAt = pgtype.Timestamptz{Time: time.Now().Add(30 * 24 * time.Hour), Valid: true}
+			snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause", CreatedAt: injectedAt.Add(time.Minute)}
+			tc.set(&sb, &snap)
+
+			injected := false
+			vmd := &stubVMD{
+				resumeFn:    func(context.Context, string, string, string, []byte) (string, error) { return ip, nil },
+				injectEnvFn: func(context.Context, string, map[string]string, string) error { injected = true; return nil },
+			}
+			mock := &mockDBTX{
+				queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+					switch {
+					case strings.Contains(sql, "-- name: ClaimResume :one"):
+						return claimResumeRow(sb, &snap, "", 0)
+					case strings.Contains(sql, "FROM sandbox"):
+						return sandboxRow(sb)
+					default:
+						return activityRow()
+					}
+				},
+				queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+					if strings.Contains(sql, "ListSandboxSecretBindingMeta") {
+						return metaRows()
+					}
+					return &scanRows{}, nil
+				},
+				execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+					return pgconn.NewCommandTag("UPDATE 1"), nil
+				},
+			}
+			h := &Handlers{VMD: vmd, DB: db.New(mock), Signer: tc.signer}
+			w := httptest.NewRecorder()
+			setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+			h.WaitAsyncBookkeeping()
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+			}
+			if injected != tc.wantInject {
+				t.Fatalf("injected = %v, want %v", injected, tc.wantInject)
+			}
+		})
+	}
+}
+
+// The fingerprint names the environment as injected: binding order does
+// not matter; a token change or a signing-key rotation does.
+func TestSecretBindingFingerprint(t *testing.T) {
+	a := SecretBindingMeta{SecretID: uuid.New(), EnvKey: "A_KEY", AuthType: "bearer", ProxyToken: "tok-a", Hosts: []string{"a.example"}}
+	b := SecretBindingMeta{SecretID: uuid.New(), EnvKey: "B_KEY", AuthType: "bearer", ProxyToken: "tok-b", Hosts: []string{"b.example"}}
+	if secretEnvFingerprint("v1", []SecretBindingMeta{a, b}) != secretEnvFingerprint("v1", []SecretBindingMeta{b, a}) {
+		t.Fatal("fingerprint must not depend on binding order")
+	}
+	rotated := a
+	rotated.ProxyToken = "tok-a2"
+	if secretEnvFingerprint("v1", []SecretBindingMeta{a}) == secretEnvFingerprint("v1", []SecretBindingMeta{rotated}) {
+		t.Fatal("a rotated proxy token must change the fingerprint")
+	}
+	if secretEnvFingerprint("v1", []SecretBindingMeta{a}) == secretEnvFingerprint("v1", []SecretBindingMeta{a, b}) {
+		t.Fatal("an added binding must change the fingerprint")
+	}
+	if secretEnvFingerprint("v1", []SecretBindingMeta{a}) == secretEnvFingerprint("v2", []SecretBindingMeta{a}) {
+		t.Fatal("a different signing key must change the fingerprint")
+	}
+	if newTestSigner(t, "v1").KeyFingerprint() == newTestSigner(t, "v1").KeyFingerprint() {
+		t.Fatal("two keys under the same kid must not share a fingerprint")
+	}
+	if s := newTestSigner(t, "v1"); s.KeyFingerprint() == sameKeyUnderKid(t, s, "v2").KeyFingerprint() {
+		t.Fatal("one key under two kids must not share a fingerprint")
+	}
+}
+
+// A successful injection records what the guest now holds, off the
+// response path, so the next resume can tell whether to inject again.
+func TestApplySecretBindings_RecordsInjectedEnv(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	addr := netip.MustParseAddr("10.0.0.5")
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "host-1", IpAddress: &addr}
+	meta := []SecretBindingMeta{{SecretID: uuid.New(), EnvKey: "A_KEY", AuthType: "bearer", ProxyToken: "tok-a", Hosts: []string{"a.example"}}}
+
+	var recorded []any
+	mock := &mockDBTX{
+		queryRowFn: func(context.Context, string, ...any) pgx.Row { return activityRow() },
+		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "-- name: RecordSandboxSecretEnv :exec") {
+				recorded = args
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Signer: newTestSigner(t, "v1")}
+	if err := h.applySecretBindings(context.Background(), sb, meta); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	h.WaitAsyncBookkeeping()
+
+	if len(recorded) != 4 {
+		t.Fatalf("record args = %v, want id, fingerprint, ip, expiry", recorded)
+	}
+	if fp, ok := recorded[1].(*string); !ok || fp == nil || *fp != secretEnvFingerprint(h.Signer.KeyFingerprint(), meta) {
+		t.Fatalf("recorded fingerprint = %v, want the injected set's", recorded[1])
+	}
+	if ip, ok := recorded[2].(*string); !ok || ip == nil || *ip != "10.0.0.5" {
+		t.Fatalf("recorded ip = %v, want the guest's", recorded[2])
+	}
+	expires, ok := recorded[3].(pgtype.Timestamptz)
+	if !ok || !expires.Valid || expires.Time.Before(time.Now().Add(SecretsJWTLifetime-time.Minute)) {
+		t.Fatalf("recorded expiry = %v, want about one JWT lifetime out", recorded[3])
+	}
+}
+
+// When the daemon's record already held a newer policy than the claim read,
+// the stamp leaves it in place and the activation reply must report that
+// policy rather than the claim's.
+func TestActivateSandbox_ReportsPolicyTheDaemonKept(t *testing.T) {
+	sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+
+	vmd := &stubVMD{
+		resumeAttest: vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 9, NetworkRulesApplied: true},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRow(sb, &snap, preview.AccessPublic, 7)
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+				return previewPolicyRow(preview.AccessPrivate, 9)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(context.Context, string, ...any) (pgx.Rows, error) { return emptyRows{}, nil },
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{
+		VMD:    vmd,
+		DB:     db.New(mock),
+		Config: &config.Config{SandboxAccessTokenSeed: []byte("test-seed-for-hmac-32-bytes-min!!")},
+	}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if got := parseJSON(t, w)["preview_access"]; got != preview.AccessPrivate {
+		t.Fatalf("preview_access = %v, want the policy the daemon kept (%q)", got, preview.AccessPrivate)
+	}
+}
+
+// sameKeyUnderKid rebuilds a signer's key under another kid.
+func sameKeyUnderKid(t *testing.T, s *SecretsSigner, kid string) *SecretsSigner {
+	t.Helper()
+	relabeled, err := NewSecretsSigner(base64.StdEncoding.EncodeToString(s.priv.Seed()), kid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return relabeled
+}
+
+// A browser policy is gated on the host's capability before the claim and
+// again before activation, since the heartbeat can lapse during the boot.
+// The second check runs even when nothing moved the policy meanwhile.
+func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *testing.T) {
+	sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HostID = "token-host-" + uuid.NewString()
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+	port := publishedPortResponse{Port: 3000, Access: preview.AccessPrivate, TokenVersion: 12}
+
+	paused := false
+	vmd := &stubVMD{
+		resumeAttest: vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 8, NetworkRulesApplied: true},
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			paused = true
+			return "/snapshots/test/vmstate.snap", "/snapshots/test/mem.snap", nil
+		},
+	}
+	// The pre-boot chain validates under the row lock and passes; the host
+	// has lost the capability by the time the post-boot check reads it.
+	lockedChecks := 0
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+				lockedChecks++
+				return scalarBoolRow(lockedChecks == 1)
+			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
+				return scalarUUIDRow(sandboxID)
+			case strings.Contains(sql, "-- name: AdvanceSandboxPreviewPolicy :one"), strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+				return previewPolicyRow(preview.AccessPrivate, 8)
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRow(sb, &snap, preview.AccessPrivate, 8, port)
+			case strings.Contains(sql, "FinalizePause"):
+				return uuidRow(snapshotID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "-- name: ListPublishedPorts :many") {
+				return previewPortPolicyRows(port), nil
+			}
+			return emptyRows{}, nil
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 for a host that lost browser capability during the boot: %s", w.Code, w.Body.String())
+	}
+	if lockedChecks != 2 {
+		t.Fatalf("authoritative capability checks = %d, want the pre-boot chain's and the post-boot one", lockedChecks)
+	}
+	if !paused {
+		t.Fatal("the resumed VM must be re-paused, not left active on a downgraded host")
 	}
 }
