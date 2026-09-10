@@ -31,6 +31,9 @@ func (r *DBOwnershipResolver) ResolveSandbox(ctx context.Context, id string) (Sa
 	defer cancel()
 	row, err := dbq.New(r.pool).GetSandboxRoute(lookupCtx, sandboxID)
 	if err != nil {
+		if lookupCtx.Err() != nil {
+			err = lookupCtx.Err()
+		}
 		return SandboxRoute{}, fmt.Errorf("resolve sandbox ownership: %w", err)
 	}
 	route, err := NormalizeSandboxRoute(SandboxRoute{HostID: strings.TrimSpace(row.HostID), ProxyAddr: strings.TrimSpace(row.ProxyAddr)})

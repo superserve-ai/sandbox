@@ -20,7 +20,8 @@ Env vars:
   DATABASE_URL               required — shared Postgres connection for ownership routing
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
-  PEER_PROXY_TARGET_ADDR     optional — loopback address for SS-470 peer ingress
+  PEER_PROXY_TARGET_ADDR     optional — loopback address for peer ingress
+  PEER_PROXY_SPIFFE_URI      required — authorized peer certificate URI
   SENTRY_DSN                 optional — Sentry DSN URL for error reporting
   PEER_IDENTITY_HOSTS        optional — comma-separated hosts requiring identity bootstrap
   PEER_PROXY_LISTEN_ADDR     optional — private mTLS listener (auto or private IP:port)
@@ -30,6 +31,7 @@ Env vars:
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -82,6 +84,10 @@ def main() -> int:
     peer_proxy_target_addr = os.environ.get("PEER_PROXY_TARGET_ADDR", "127.0.0.1:5010")
     if not re.fullmatch(r"(?:127\.0\.0\.1|localhost|\[::1\]):[0-9]{1,5}", peer_proxy_target_addr):
         print("ERROR: PEER_PROXY_TARGET_ADDR must be a loopback host:port", file=sys.stderr)
+        return 1
+    peer_spiffe_uri = os.environ.get("PEER_PROXY_SPIFFE_URI", "")
+    if not re.fullmatch(r"spiffe://[A-Za-z0-9./_:-]+", peer_spiffe_uri):
+        print("ERROR: PEER_PROXY_SPIFFE_URI is required and must be a SPIFFE URI", file=sys.stderr)
         return 1
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     peer_identity_hosts = set(filter(None, (host.strip() for host in
@@ -383,6 +389,7 @@ def main() -> int:
             REQUIRE_DATA_PLANE={require_data_plane}
             DATABASE_URL={shlex.quote(database_url)}
             PEER_PROXY_TARGET_ADDR={peer_proxy_target_addr}
+            PEER_PROXY_SPIFFE_URI={peer_spiffe_uri}
             SENTRY_DSN={sentry_dsn}
             PEER_PROXY_LISTEN_ADDR=$peer_listen_addr
             PEER_PROXY_TARGET_ADDR={peer_env['PEER_PROXY_TARGET_ADDR']}

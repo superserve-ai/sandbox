@@ -2,10 +2,12 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
@@ -44,7 +46,20 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid sandbox URL", http.StatusBadRequest)
 		return
 	}
+	started := time.Now()
 	route, err := h.ownership.ResolveSandbox(r.Context(), id)
+	if recorder, ok := h.recorder.(telemetry.OwnershipLookupRecorder); ok {
+		result := "success"
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			result = "timeout"
+		case errors.Is(err, context.Canceled):
+			result = "canceled"
+		case err != nil:
+			result = "error"
+		}
+		recorder.RecordOwnershipLookup(r.Context(), telemetry.OwnershipLookup{Duration: time.Since(started), Result: result})
+	}
 	if err != nil {
 		h.record(r.Context(), "ownership_error", "")
 		h.log.Warn().Str("route_outcome", "ownership_lookup_error").Err(err).Msg("sandbox ownership lookup failed")
@@ -93,20 +108,20 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 	if !ok {
 		return fmt.Errorf("response writer does not support hijacking")
 	}
-	conn, _, err := hj.Hijack()
+	conn, buffered, err := hj.Hijack()
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 	defer stream.Close()
-	// Emit headers first; copying the body in the pump below preserves streaming
-	// uploads and lets the peer respond before the request body is exhausted.
-	headers := new(http.Request)
-	*headers = *r
-	headers.Body = http.NoBody
-	headers.ContentLength = 0
-	if err := headers.Write(stream); err != nil {
-		return err
+	// Request.Write owns both headers and transfer framing, including chunked
+	// bodies and trailers. Run it alongside the response pump for early replies.
+	request := new(http.Request)
+	*request = *r
+	request.Header = r.Header.Clone()
+	upgrade := r.Header.Get("Upgrade") != ""
+	if !upgrade {
+		request.Close = true
 	}
 	// A half-close on the upload side must not tear down the download side.
 	// Conversely, once the peer finishes (or the request is cancelled), close
@@ -125,10 +140,14 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		if r.Body != nil {
-			_, _ = io.Copy(stream, r.Body)
+		if err := request.Write(stream); err != nil {
+			closeBoth()
+			return
 		}
-		// Signal end-of-input to the peer while retaining its response stream.
+		if upgrade {
+			// Hijack may have already buffered bytes after the HTTP request.
+			_, _ = io.Copy(stream, buffered.Reader)
+		}
 		_ = stream.CloseSend()
 	}()
 	go func() {
