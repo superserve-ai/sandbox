@@ -144,6 +144,9 @@ func (p *peerPool) Close() error {
 	for _, h := range hs {
 		h.mu.Lock()
 		h.closed = true
+		if h.dialCancel != nil {
+			h.dialCancel()
+		}
 		h.mu.Unlock()
 	}
 	for _, h := range hs {
@@ -161,6 +164,7 @@ type hostPool struct {
 	conns              []*peerConn
 	dialing            bool
 	dialDone           chan struct{}
+	dialCancel         context.CancelFunc
 	closed             bool
 	endpointGeneration uint64
 	failures           int
@@ -249,6 +253,9 @@ func (h *hostPool) replaceLocked(addr string) {
 	h.replacing = true
 	h.addr = addr
 	h.endpointGeneration++
+	if h.dialCancel != nil {
+		h.dialCancel()
+	}
 	h.failures = 0
 	h.retryAt = time.Time{}
 	// Detach the old endpoint connections from capacity accounting immediately.
@@ -286,6 +293,7 @@ func (h *hostPool) replaceLocked(addr string) {
 	h.mu.Unlock()
 }
 func (h *hostPool) open(ctx context.Context) (PeerStream, error) {
+retry:
 	for {
 		h.mu.Lock()
 		if h.closed {
@@ -307,21 +315,20 @@ func (h *hostPool) open(ctx context.Context) (PeerStream, error) {
 					h.mu.Lock()
 					c.mu.Lock()
 					stale := generation != h.endpointGeneration || c.draining
-					if stale {
-						c.active--
-					}
 					c.mu.Unlock()
 					h.mu.Unlock()
 					if stale {
+						h.releaseOpen(c)
 						_ = s.Close()
-						continue
+						continue retry
 					}
 					cs := &countedPeerStream{PeerStream: s, conn: c, host: h, tele: h.parent.cfg.Telemetry}
 					c.mu.Lock()
 					if c.draining || c.removed {
 						c.mu.Unlock()
+						h.releaseOpen(c)
 						_ = s.Close()
-						continue
+						continue retry
 					}
 					if c.streams == nil {
 						c.streams = make(map[*countedPeerStream]struct{})
@@ -339,16 +346,10 @@ func (h *hostPool) open(ctx context.Context) (PeerStream, error) {
 					h.parent.cfg.Telemetry.PeerStream(1)
 					return cs, nil
 				}
-				c.mu.Lock()
-				c.active--
-				// A caller cancellation/deadline is not evidence that the
-				// underlying transport failed. Keep the connection reusable.
-				if peerCallerCanceled(e) {
-					c.mu.Unlock()
+				h.releaseOpen(c)
+				if peerRPCError(e) {
 					return nil, e
 				}
-				c.draining = true
-				c.mu.Unlock()
 				// Opening a stream can fail before the connection is removed
 				// from the pool. Close the transport at this failure boundary so
 				// a failed open cannot retain its underlying socket or TLS state.
@@ -405,14 +406,18 @@ func (h *hostPool) open(ctx context.Context) (PeerStream, error) {
 		h.dialing = true
 		h.dialDone = make(chan struct{})
 		dialDone := h.dialDone
+		dialCtx, dialCancel := context.WithCancel(ctx)
+		h.dialCancel = dialCancel
 		addr := h.addr
 		generation := h.endpointGeneration
 		h.mu.Unlock()
 		started := time.Now()
-		client, closer, e := h.parent.cfg.Dial(ctx, h.host, addr)
+		client, closer, e := h.parent.cfg.Dial(dialCtx, h.host, addr)
+		dialCancel()
 		h.parent.cfg.Telemetry.PeerHandshake(time.Since(started))
 		h.mu.Lock()
 		h.dialing = false
+		h.dialCancel = nil
 		// Shutdown may have started while the dial was out of lock.  A
 		// failed dial must not enter the reconnect/backoff path after the
 		// host has been closed, and a successful one must never be published.
@@ -643,9 +648,30 @@ func (h *hostPool) scheduleDrain(c *peerConn) {
 		}
 	}()
 }
+func (h *hostPool) releaseOpen(c *peerConn) {
+	c.mu.Lock()
+	if c.active > 0 {
+		c.active--
+	}
+	reclaim := c.draining && c.active == 0 && !c.removed
+	if reclaim {
+		c.removed = true
+	}
+	c.mu.Unlock()
+	if reclaim {
+		c.close()
+		h.remove(c)
+		h.parent.cfg.Telemetry.PeerDrain(false)
+	}
+}
+
 func (h *hostPool) close(deadline time.Time) {
 	h.mu.Lock()
 	h.closed = true
+	if h.dialCancel != nil {
+		h.dialCancel()
+	}
+	dialDone := h.dialDone
 	cs := append([]*peerConn(nil), h.conns...)
 	for c := range h.retiredConns {
 		cs = append(cs, c)
@@ -654,6 +680,14 @@ func (h *hostPool) close(deadline time.Time) {
 		h.eviction.Stop()
 	}
 	h.mu.Unlock()
+	if dialDone != nil {
+		timer := time.NewTimer(max(time.Until(deadline), 0))
+		select {
+		case <-dialDone:
+		case <-timer.C:
+		}
+		timer.Stop()
+	}
 	for _, c := range cs {
 		c.mu.Lock()
 		c.draining = true
@@ -713,15 +747,21 @@ type countedPeerStream struct {
 
 func (s *countedPeerStream) Read(p []byte) (int, error) {
 	n, e := s.PeerStream.Read(p)
-	if e != nil && e != io.EOF && !peerCallerCanceled(e) {
-		s.host.markFailed(s.conn)
+	if e != nil {
+		if e != io.EOF && !peerRPCError(e) {
+			s.host.markFailed(s.conn)
+		}
+		_ = s.Close()
 	}
 	return n, e
 }
 func (s *countedPeerStream) Write(p []byte) (int, error) {
 	n, e := s.PeerStream.Write(p)
-	if e != nil && !peerCallerCanceled(e) {
-		s.host.markFailed(s.conn)
+	if e != nil && e != io.EOF {
+		if !peerRPCError(e) {
+			s.host.markFailed(s.conn)
+		}
+		_ = s.Close()
 	}
 	return n, e
 }
@@ -757,4 +797,14 @@ func (s *countedPeerStream) Close() error {
 
 func peerCallerCanceled(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.Canceled || status.Code(err) == codes.DeadlineExceeded
+}
+
+// A gRPC status belongs to one RPC. The connection watcher is authoritative
+// for transport failures; application statuses must not retire sibling RPCs.
+func peerRPCError(err error) bool {
+	if peerCallerCanceled(err) {
+		return true
+	}
+	_, ok := status.FromError(err)
+	return ok
 }
