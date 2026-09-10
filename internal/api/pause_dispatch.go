@@ -14,10 +14,8 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-// pauseAcceptBudget is how long a request that prefers an asynchronous answer
-// (Prefer: respond-async) waits for the host before it is told 'pausing' and
-// left to poll. Long enough that a normal pause still returns 204. A variable
-// so tests can shorten it.
+// pauseAcceptBudget is how long a Prefer: respond-async request waits for the
+// host before it is told 'pausing'. A variable so tests can shorten it.
 var pauseAcceptBudget = 20 * time.Second
 
 // prefersAsync reports whether the client asked for a 202 over a held
@@ -52,10 +50,8 @@ func respondPause(c *gin.Context, o pauseOutcome) {
 	}
 }
 
-// dispatchPause runs the host RPC for a claimed pause and the bookkeeping its
-// answer calls for. It knows nothing of the HTTP request: ctx is whatever the
-// caller is willing to wait on, every write runs detached, and the outcome is
-// the same whether or not anyone is still listening.
+// dispatchPause runs the host RPC for a claimed pause and records its answer.
+// It knows nothing of the HTTP request; every write runs detached.
 func (h *Handlers) dispatchPause(ctx context.Context, vmd VMDClient, sandbox db.BeginPauseRow, actorID *uuid.UUID, l zerolog.Logger) pauseOutcome {
 	sandboxID, teamID := sandbox.ID, sandbox.TeamID
 	// The pause's identity rides the RPC into the host's backup pipeline and

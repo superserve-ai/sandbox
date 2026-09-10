@@ -329,11 +329,9 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 // pauseExpired pauses one sandbox that was atomically claimed by
 // ClaimExpiredSandboxes (already marked 'pausing' in DB).
 //
-// Two systems are involved (VMD + Postgres), and once the pause is
-// dispatched nothing is undone: an error from the host does not prove the
-// VM still runs, so the row stays 'pausing' under its lease and the
-// reconciler (see pause_reconcile.go) asks the host again. The one revert is
-// a host that cannot be resolved before dispatch.
+// Once the pause is dispatched nothing is undone: an error from the host does
+// not prove the VM still runs, so the row stays 'pausing' under its lease for
+// the reconciler (see pause_reconcile.go).
 //
 // Order of operations:
 //  1. VMD PauseInstance — stops the VM, writes snapshot files to disk.
@@ -437,11 +435,9 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", activity, "success", &sbx.Name, nil, nil)
 }
 
-// revertToActiveOrFail undoes a claim whose host could not be resolved:
-// nothing was dispatched, so the VM is untouched and 'active' is the truth.
-// Never after a dispatch — an error then does not prove the VM still runs.
-// If the revert itself fails, we mark the sandbox 'failed' so the reaper
-// does not loop on it.
+// revertToActiveOrFail undoes a claim whose host could not be resolved: nothing
+// was dispatched, so 'active' is the truth. Never after a dispatch. If the
+// revert itself fails the sandbox is marked 'failed' so the reaper does not loop.
 //
 // `cause` is the original VMD error, propagated for terminal logging.
 func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, cause error, l zerolog.Logger) {

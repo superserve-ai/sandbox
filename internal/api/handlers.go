@@ -2943,8 +2943,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // ---------------------------------------------------------------------------
 
 // pauseLeaseSeconds is how long the caller that began a pause owns it before
-// a reconciler may take over: the foreground attempts plus a margin for their
-// bookkeeping.
+// the reconciler may take over: the foreground attempts plus a margin.
 const pauseLeaseSeconds int32 = 90
 
 // pauseWithRetry pauses a VM, retrying once on a non-NotFound failure. A
@@ -3035,12 +3034,9 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// with the status transition; nothing to do here. If the host
 	// cannot be resolved, the revert reopens a new interval.
 
-	// Resolve the VMD client for this sandbox's host. BeginPause has
-	// already claimed 'pausing' and closed the billing interval, so a
-	// lookup failure — a real path when the host row is missing — must
-	// revert, or the sandbox is stuck in 'pausing' and unbilled even after
-	// the registration is repaired. This is the only revert after
-	// BeginPause: nothing was dispatched, so the VM is known to be running.
+	// BeginPause already claimed 'pausing', so a host lookup failure must
+	// revert or the row is stuck. This is the only revert after BeginPause:
+	// nothing was dispatched, so the VM is known to be running.
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("resolve VMD for pause failed")
@@ -3059,9 +3055,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	}
 
 	// The caller will poll rather than hold the connection. The dispatch is
-	// detached from the request so a client that stops waiting does not
-	// abandon the host call: it finishes on its own bounded deadline and
-	// records its answer, and the reconciler covers what it cannot decide.
+	// detached so a client that stops waiting does not abandon the host call.
 	outcome := make(chan pauseOutcome, 1)
 	bg := context.WithoutCancel(c.Request.Context())
 	h.asyncBookkeeping("pause-dispatch", func() { outcome <- h.dispatchPause(bg, vmd, sandbox, actorID, l) })

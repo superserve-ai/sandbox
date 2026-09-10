@@ -17,21 +17,15 @@ import (
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
-// A pause whose caller gave up is not undone. The host may have finished it
-// after the caller's deadline, and a definite error after dispatch says
-// nothing about whether the VM is still running, so reverting the row to
-// 'active' is a guess. The row stays 'pausing' and this loop asks the host
-// again until it gets an answer it can act on: a snapshot, or NotFound from
-// the sandbox's resolved host. Everything else is retried.
+// A pause whose caller gave up is not undone: an error after dispatch does not
+// prove the VM still runs. The row stays 'pausing' and this loop asks the host
+// again until it answers with a snapshot or NotFound; anything else is retried.
 const (
 	pauseReconcileInterval = 30 * time.Second
-	// Claimable once the caller's whole lease has elapsed, so no caller
-	// attempt can still be in flight when the reconciler dispatches.
+	// Claimable only after the caller's whole lease, so its attempt is over.
 	pauseReconcileMinAge       = pauseLeaseSeconds
 	pauseReconcileLease  int32 = 75
-	// The RPC ends, one way or another, before the lease does, with room for
-	// the finalize write; a request outliving its lease could race the next
-	// holder.
+	// Must end before the lease does, leaving room for the finalize write.
 	pauseReconcileRPC           = 60 * time.Second
 	pauseReconcileBatch   int32 = 20
 	pauseReconcileWorkers       = 4

@@ -108,9 +108,8 @@ const beginPause = `-- name: BeginPause :one
 WITH paused AS (
   UPDATE sandbox
   SET status = 'pausing', updated_at = now(),
-      -- The pause's identity and the caller's lease on it; the lease is what
-      -- lets the caller's own finalize commit and keeps the reconciler off
-      -- the row until the caller has given up.
+      -- The pause's identity and the caller's lease on it, which keeps the
+      -- reconciler off the row until the caller has given up.
       pause_op_id = $1,
       pause_op_started_at = now(),
       pause_op_lease_until = now() + make_interval(secs => $2::int),
@@ -643,13 +642,10 @@ type ClaimPendingPausesRow struct {
 	PauseOpAttentionAt  pgtype.Timestamptz `json:"pause_op_attention_at"`
 }
 
-// Leases pauses whose caller has given up: rows still 'pausing' with an
-// expired or absent lease, old enough that the caller's own attempt is over.
-// SKIP LOCKED keeps replicas off each other's rows; the lease keeps them off
-// a row between claims. Only sandbox.updated_at is left alone: the lease is
-// the operation's own, and the paths keyed on updated_at must not see a
-// renewal as fresh activity. Rows without an operation predate this
-// contract and are not claimed.
+// Leases pauses whose caller has given up: still 'pausing', lease expired or
+// absent, old enough that the caller's own attempt is over. SKIP LOCKED keeps
+// replicas apart; updated_at is left alone so a lease renewal never reads as
+// activity. Rows without an operation predate this contract and are skipped.
 func (q *Queries) ClaimPendingPauses(ctx context.Context, arg ClaimPendingPausesParams) ([]ClaimPendingPausesRow, error) {
 	rows, err := q.db.Query(ctx, claimPendingPauses, arg.LeaseSeconds, arg.MinAgeSeconds, arg.MaxRows)
 	if err != nil {
@@ -1529,10 +1525,8 @@ WITH target AS (
   SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
     AND status IN ('pausing', 'resuming')
-    -- A finalize that names a pause operation commits only for that
-    -- operation under its current lease: a worker whose lease was
-    -- reclaimed, or a result from a pause the row has since moved past,
-    -- matches nothing. Callers without an operation keep the broad guard.
+    -- Fenced to the named operation's current lease; a reclaimed or stale
+    -- worker matches nothing. Callers without an operation keep the broad guard.
     AND ($3::uuid IS NULL
          OR (status = 'pausing'
              AND pause_op_id = $3::uuid
@@ -1687,10 +1681,8 @@ WITH target AS (
   SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
     AND status IN ('pausing', 'resuming')
-    -- A finalize that names a pause operation commits only for that
-    -- operation under its current lease: a worker whose lease was
-    -- reclaimed, or a result from a pause the row has since moved past,
-    -- matches nothing. Callers without an operation keep the broad guard.
+    -- Fenced to the named operation's current lease; a reclaimed or stale
+    -- worker matches nothing. Callers without an operation keep the broad guard.
     AND ($3::uuid IS NULL
          OR (status = 'pausing'
              AND pause_op_id = $3::uuid

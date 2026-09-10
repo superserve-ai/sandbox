@@ -1,14 +1,10 @@
--- A pause is a logical operation that outlives any single request: the host
--- may finish the snapshot after the caller's deadline, and the row must
--- converge to what the host did rather than be reverted on a guess. These
--- columns give each pause a stable identity (also its backup token), an
--- immutable start time, and a lease that says which worker may currently act
--- on it. Leases live here, never in updated_at, so renewing one cannot mask
--- the operation's age or disturb the paths keyed on updated_at.
+-- A pause outlives any single request: the host may finish after the caller's
+-- deadline, so the row converges to what the host did instead of being
+-- reverted. Each pause gets a stable identity (also its backup token), a start
+-- time, and a lease naming the worker that may act on it. The lease is kept
+-- apart from updated_at so renewals never read as activity.
 --
--- Nullable columns and a constant default: metadata-only on this Postgres
--- version, no table rewrite. The claim scan is served by the existing
--- idx_sandbox_status partial index; pausing rows are few.
+-- Nullable columns with a constant default: no table rewrite.
 
 ALTER TABLE sandbox
   ADD COLUMN IF NOT EXISTS pause_op_id uuid,
