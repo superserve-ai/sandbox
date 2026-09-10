@@ -1706,6 +1706,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		guestFrozen, ferr = m.freezeGuestForPause(ctx, instIP, freezeToken, log)
 		freezeDur = time.Since(tFreeze)
 		if ferr != nil {
+			// The guest may be frozen and could not be shown released: it
+			// must not be served as running. The intent keeps its token.
+			m.markUnservable(inst, log)
 			return "", "", nil, m.handleVMError(vmID, ferr)
 		}
 	}
@@ -1720,6 +1723,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			}
 			if terr := m.releaseFrozenGuest(ctx, socketPath, instIP, freezeToken); terr != nil {
 				log.Error().Err(terr).Msg("pause: snapshot failed and the guest workload could not be thawed")
+				m.markUnservable(inst, log)
 			}
 		}()
 	}
@@ -8442,6 +8446,19 @@ func (m *Manager) failAfterSnapshot(inst *VMInstance, socketPath string, err err
 	m.parkUnservable(inst, true)
 	_, _ = m.persistStateIfPresent(inst)
 	return fmt.Errorf("%w; the guest could not be resumed and was parked as error", err)
+}
+
+// markUnservable records, durably, that this guest's workload may be frozen
+// with no confirmed release: Error, so it is not served as running, with its
+// process, intent and artifacts kept for a release that still has the token.
+func (m *Manager) markUnservable(inst *VMInstance, log zerolog.Logger) {
+	inst.mu.Lock()
+	inst.Status = StatusError
+	inst.mu.Unlock()
+	if _, err := m.persistStateIfPresent(inst); err != nil {
+		log.Error().Err(err).Msg("pause: guest with an unconfirmed release could not be recorded as error")
+	}
+	log.Error().Msg("pause: guest workload may still be frozen and could not be released; recorded as error")
 }
 
 // abandonDirtyBaseline forgets a dirty-tracking baseline a snapshot consumed

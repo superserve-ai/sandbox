@@ -2686,3 +2686,71 @@ func TestRecoveryOfAnUnfrozenRewriteResumesTheVCPUs(t *testing.T) {
 		}
 	})
 }
+
+// A pause whose freeze cannot be undone with confidence leaves a guest that
+// may be frozen: it is recorded Error, not served as running, with its intent
+// and token kept for a later release.
+func TestPauseWithAnUnconfirmedThawRecordsTheGuestAsError(t *testing.T) {
+	useTempFloor(t)
+	raiseFloorForTest(t)
+	origF, origT, origR, origDown, origUnpause := boxdFreezeGuest, boxdThawGuest, boxdGuestRunning, vmUnitFullyDown, fcUnpauseVM
+	t.Cleanup(func() {
+		boxdFreezeGuest, boxdThawGuest, boxdGuestRunning, vmUnitFullyDown, fcUnpauseVM = origF, origT, origR, origDown, origUnpause
+	})
+	vmUnitFullyDown = func(string) bool { return false }
+	fcUnpauseVM = func(context.Context, string) error { return nil }
+	boxdThawGuest = func(context.Context, string, string) error { return errors.New("connection refused") }
+
+	newVM := func(t *testing.T) (*Manager, *VMInstance, string, string) {
+		t.Helper()
+		fc := startSnapshotAPIFake(t, nil)
+		dir := t.TempDir()
+		vmDir := filepath.Join(dir, "vm-1")
+		if err := os.MkdirAll(vmDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		memSnap := filepath.Join(vmDir, "mem.snap")
+		if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		corrects := true
+		inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects}
+		m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir, GuestClockFreezeEnabled: true}}
+		m.clockRealtimeCapable.Store(true)
+		return m, inst, vmDir, memSnap
+	}
+	check := func(t *testing.T, m *Manager, inst *VMInstance, vmDir string) {
+		t.Helper()
+		if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
+			t.Fatal("want the pause to fail")
+		}
+		inst.mu.RLock()
+		st := inst.Status
+		inst.mu.RUnlock()
+		if st != StatusError {
+			t.Fatalf("status %v, want Error: a guest that may be frozen must not be served as running", st)
+		}
+		if in, err := readPauseIntent(vmDir); err != nil || in == nil || in.FreezeToken == "" {
+			t.Fatalf("intent = %+v err=%v; the token must be kept for a later release", in, err)
+		}
+	}
+
+	t.Run("freeze_reply_lost_and_thaw_unconfirmed", func(t *testing.T) {
+		m, inst, vmDir, _ := newVM(t)
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			return freezeEcho{}, errors.New("connection reset")
+		}
+		check(t, m, inst, vmDir)
+	})
+
+	t.Run("manifest_unpublished_and_the_deferred_thaw_fails", func(t *testing.T) {
+		m, inst, vmDir, memSnap := newVM(t)
+		boxdFreezeGuest = func(_ context.Context, _, token string) (freezeEcho, error) {
+			return freezeEcho{Version: WakeProtocolVersion, Token: token}, nil
+		}
+		if err := os.MkdirAll(filepath.Join(WallClockMarkerPath(memSnap), "x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		check(t, m, inst, vmDir)
+	})
+}
