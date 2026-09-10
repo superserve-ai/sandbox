@@ -13,6 +13,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 const defaultSweepInterval = 10 * time.Minute
@@ -445,8 +446,10 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 	// sandbox failed.
 	// No policy carried: the record keeps the one it has, which this
 	// rollback never changed.
+	var attested vmdclient.ResumeAttestation
 	ipAddr, _, _, _, err := retryTransientBoot(ctx, sbx.ID.String(), sbx.HostID, func(rctx context.Context) (string, uint32, uint32, error) {
-		ip, vcpu, memMiB, _, rerr := vmd.ResumeInstance(rctx, sbx.ID.String(), snapshotPath, memPath, sbx.NetworkConfig, "", nil, 0)
+		ip, vcpu, memMiB, att, rerr := vmd.ResumeInstance(rctx, sbx.ID.String(), snapshotPath, memPath, sbx.NetworkConfig, "", nil, 0)
+		attested = att
 		return ip, vcpu, memMiB, rerr
 	})
 	if err != nil {
@@ -468,6 +471,17 @@ func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSand
 		rl.Error().Err(parseErr).Str("ip", ipAddr).Msg("reaper: rollback resume returned invalid IP")
 		h.markSandboxFailed(ctx, sbx, "rollback resume returned invalid IP after pause DB error", rl)
 		return
+	}
+
+	// A rollback that adopts a VM the earlier attempt left running can come
+	// back with only the firewall half of the egress rules in place. Push
+	// them before the row goes active, as the resume handler does.
+	if !attested.NetworkRulesApplied {
+		if err := h.reapplyNetworkConfig(ctx, vmd, sbx.ID.String(), sbx.NetworkConfig); err != nil {
+			rl.Error().Err(err).Msg("reaper: rollback egress rules replay failed")
+			h.markSandboxFailed(ctx, sbx, "rollback egress rules replay failed after pause DB error", rl)
+			return
+		}
 	}
 
 	// VM is running again — revert DB to active so reaper retries cleanly.

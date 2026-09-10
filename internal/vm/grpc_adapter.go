@@ -111,7 +111,15 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			return nil, status.Error(codes.InvalidArgument, "tokenized preview policy requires a positive preview_policy_revision")
 		}
 		if err := a.mgr.UpdateSandboxPreviewPolicy(req.GetVmId(), previewAccess, previewPorts, req.GetPreviewPolicyRevision()); err != nil {
-			return nil, err
+			if status.Code(err) != codes.FailedPrecondition {
+				return nil, err
+			}
+			// Same revision, different content: the record keeps what it
+			// enforces at that revision, as a restore would. Not fatal, since
+			// a resume refused here would be refused the same way on every
+			// retry; the attestation reports the record's revision.
+			a.mgr.log.Warn().Err(err).Str("vm_id", req.GetVmId()).
+				Msg("resume: preview policy differs from the record's at the same revision; keeping the record's")
 		}
 	}
 

@@ -148,6 +148,24 @@ func TestGRPCAdapterResumeVM_StampsAndAttestsPolicy(t *testing.T) {
 			t.Fatalf("record policy = %q rev %d, want the newer one kept", existing.PreviewAccess, existing.PreviewPolicyRevision)
 		}
 	})
+	t.Run("same revision, different content keeps the record", func(t *testing.T) {
+		a, existing := newAdapter(t)
+		existing.PreviewAccess, existing.PreviewPolicyRevision = preview.AccessPrivate, 3
+		resp, err := a.ResumeVM(context.Background(), &vmdpb.ResumeVMRequest{
+			VmId: "vm-1", PreviewAccess: preview.AccessPublic, PreviewPolicyRevision: 3,
+		})
+		if err != nil {
+			t.Fatalf("ResumeVM must not refuse a same-revision mismatch: %v", err)
+		}
+		if resp.GetPreviewProtocol() != preview.HostCapabilityPorts || resp.GetPreviewPolicyRevision() != 3 {
+			t.Fatalf("attestation = %q rev %d, want attested at the record's 3", resp.GetPreviewProtocol(), resp.GetPreviewPolicyRevision())
+		}
+		existing.mu.Lock()
+		defer existing.mu.Unlock()
+		if existing.PreviewAccess != preview.AccessPrivate {
+			t.Fatalf("record access = %q, want the record's private kept", existing.PreviewAccess)
+		}
+	})
 	t.Run("no policy carried", func(t *testing.T) {
 		a, existing := newAdapter(t)
 		resp, err := a.ResumeVM(context.Background(), &vmdpb.ResumeVMRequest{VmId: "vm-1"})

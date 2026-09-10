@@ -1130,10 +1130,22 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			return "", false
 		}
 		effectivePolicy = currentPolicy
-		if currentPolicy.Revision > attested.PreviewPolicyRevision {
+		switch {
+		case currentPolicy.Revision > attested.PreviewPolicyRevision:
 			l.Warn().Int64("db_revision", currentPolicy.Revision).Int64("vmd_revision", attested.PreviewPolicyRevision).
 				Msg("daemon preview policy behind the database after resume; pushing")
 			if !reapplyPolicy() {
+				return "", false
+			}
+		case resumePolicy.requiresBrowserCapability():
+			// The policy is the claim's. The host's browser heartbeat can
+			// lapse during the boot, so re-check it before activation the
+			// way the reapply does; otherwise a resume could activate a
+			// browser policy on a downgraded host.
+			if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
+				markRevert()
+				pauseAndRevert()
+				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
 				return "", false
 			}
 		}

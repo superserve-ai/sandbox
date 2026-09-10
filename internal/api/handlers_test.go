@@ -4763,3 +4763,72 @@ func sameKeyUnderKid(t *testing.T, s *SecretsSigner, kid string) *SecretsSigner 
 	}
 	return relabeled
 }
+
+// A browser policy is gated on the host's capability before the claim and
+// again before activation, since the heartbeat can lapse during the boot.
+// The second check runs even when nothing moved the policy meanwhile.
+func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *testing.T) {
+	sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HostID = "token-host-" + uuid.NewString()
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+	port := publishedPortResponse{Port: 3000, Access: preview.AccessPrivate, TokenVersion: 12}
+
+	paused := false
+	vmd := &stubVMD{
+		resumeAttest: vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 8, NetworkRulesApplied: true},
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			paused = true
+			return "/snapshots/test/vmstate.snap", "/snapshots/test/mem.snap", nil
+		},
+	}
+	// The pre-boot chain validates under the row lock and passes; the host
+	// has lost the capability by the time the post-boot check reads it.
+	lockedChecks := 0
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+				lockedChecks++
+				return scalarBoolRow(lockedChecks == 1)
+			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
+				return scalarUUIDRow(sandboxID)
+			case strings.Contains(sql, "-- name: AdvanceSandboxPreviewPolicy :one"), strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+				return previewPolicyRow(preview.AccessPrivate, 8)
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRow(sb, &snap, preview.AccessPrivate, 8, port)
+			case strings.Contains(sql, "FinalizePause"):
+				return uuidRow(snapshotID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "-- name: ListPublishedPorts :many") {
+				return previewPortPolicyRows(port), nil
+			}
+			return emptyRows{}, nil
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 for a host that lost browser capability during the boot: %s", w.Code, w.Body.String())
+	}
+	if lockedChecks != 2 {
+		t.Fatalf("authoritative capability checks = %d, want the pre-boot chain's and the post-boot one", lockedChecks)
+	}
+	if !paused {
+		t.Fatal("the resumed VM must be re-paused, not left active on a downgraded host")
+	}
+}
