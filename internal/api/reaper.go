@@ -233,7 +233,10 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism in
 	// Use a bounded timeout — if the DB is slow, skip this cycle rather
 	// than block the whole loop.
 	queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
-	expired, err := h.DB.ClaimExpiredSandboxes(queryCtx, batchSize)
+	expired, err := h.DB.ClaimExpiredSandboxes(queryCtx, db.ClaimExpiredSandboxesParams{
+		Limit:        batchSize,
+		LeaseSeconds: pauseLeaseSeconds,
+	})
 	queryCancel()
 	if err != nil {
 		logger.Error().Err(err).Msg("reaper: ClaimExpiredSandboxes failed")
@@ -376,9 +379,9 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		return
 	}
 
-	// Minted per pause; returns in the host's upload report to name this
-	// exact pause for coverage linkage.
-	pauseToken := uuid.NewString()
+	// The pause's identity, minted by the claim; returns in the host's upload
+	// report to name this exact pause for coverage linkage.
+	pauseToken := uuid.UUID(sbx.PauseOpID.Bytes).String()
 	snapshotPath, memPath, manifest, ackedPauseToken, err := pauseWithRetry(ctx, vmd, sbx.ID.String(), pauseToken)
 	if err != nil {
 		// Retry (see pauseWithRetry) didn't converge — the VM genuinely

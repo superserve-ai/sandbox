@@ -589,6 +589,14 @@ type Sandbox struct {
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
 	// True once any secret binding has existed for this sandbox; false when the sandbox was created without one; NULL for rows predating the column. Never cleared — a detached or failure-cleared binding may still have had a JWT minted against it. Destroy revokes unless this is false.
 	HadSecretBindings *bool `json:"had_secret_bindings"`
+	// Identity of the pause in flight, reused as the pause token across every attempt; NULL when no pause is pending.
+	PauseOpID        pgtype.UUID        `json:"pause_op_id"`
+	PauseOpStartedAt pgtype.Timestamptz `json:"pause_op_started_at"`
+	// Until when the worker holding pause_op_lease_version may act on the pause; expired or NULL means claimable.
+	PauseOpLeaseUntil   pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpLeaseVersion int64              `json:"pause_op_lease_version"`
+	// When a pause pending past its age threshold was flagged for an operator; set once.
+	PauseOpAttentionAt pgtype.Timestamptz `json:"pause_op_attention_at"`
 }
 
 type SandboxActiveInterval struct {

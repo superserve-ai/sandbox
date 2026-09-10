@@ -90,7 +90,7 @@ WITH tpl AS (
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
@@ -365,9 +365,14 @@ WITH failed AS (
   -- auto_delete_at is cleared: the deadline is only meaningful in 'paused',
   -- and a stale one would resurface (or instantly fire) if the sandbox is
   -- ever returned to 'paused' by a recovery path.
-  SET status = 'failed', auto_delete_at = NULL, updated_at = now()
+  SET status = 'failed', auto_delete_at = NULL, updated_at = now(),
+      pause_op_lease_until = NULL
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
     AND sandbox.status = sqlc.arg(observed_status)
+    -- A pause worker may only fail the operation it holds the lease on.
+    AND (sqlc.narg(pause_op_id)::uuid IS NULL
+         OR (sandbox.pause_op_id = sqlc.narg(pause_op_id)::uuid
+             AND sandbox.pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
   RETURNING id
 ),
 closed_active AS (
@@ -421,9 +426,17 @@ WHERE sandbox_id IN (SELECT id FROM failed)
 -- GetSandbox in the rare error path.
 WITH paused AS (
   UPDATE sandbox
-  SET status = 'pausing', updated_at = now()
-  WHERE sandbox.id = $1
-    AND sandbox.team_id = $2
+  SET status = 'pausing', updated_at = now(),
+      -- The pause's identity and the caller's lease on it; the lease is what
+      -- lets the caller's own finalize commit and keeps the reconciler off
+      -- the row until the caller has given up.
+      pause_op_id = sqlc.arg(pause_op_id),
+      pause_op_started_at = now(),
+      pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
+      pause_op_lease_version = pause_op_lease_version + 1,
+      pause_op_attention_at = NULL
+  WHERE sandbox.id = sqlc.arg(id)
+    AND sandbox.team_id = sqlc.arg(team_id)
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'active'
   RETURNING *
@@ -456,11 +469,17 @@ LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id;
 -- (delete, reaper failover), their transition wins and this returns 0.
 WITH reverted AS (
   UPDATE sandbox
-  SET status = 'active', updated_at = now()
+  SET status = 'active', updated_at = now(),
+      -- The pause is over: drop its identity so a result that arrives late
+      -- for it can no longer match this row.
+      pause_op_id = NULL, pause_op_lease_until = NULL
   WHERE sandbox.id = sqlc.arg(sandbox_id)
     AND sandbox.team_id = sqlc.arg(team_id)
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'pausing'
+    AND (sqlc.narg(pause_op_id)::uuid IS NULL
+         OR (sandbox.pause_op_id = sqlc.narg(pause_op_id)::uuid
+             AND sandbox.pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
   RETURNING id, team_id, vcpu_count, memory_mib
 ),
 opened_active AS (
@@ -576,6 +595,14 @@ WITH target AS (
   SELECT id, team_id FROM sandbox
   WHERE id = @id AND team_id = @team_id AND destroyed_at IS NULL
     AND status IN ('pausing', 'resuming')
+    -- A finalize that names a pause operation commits only for that
+    -- operation under its current lease: a worker whose lease was
+    -- reclaimed, or a result from a pause the row has since moved past,
+    -- matches nothing. Callers without an operation keep the broad guard.
+    AND (sqlc.narg(pause_op_id)::uuid IS NULL
+         OR (status = 'pausing'
+             AND pause_op_id = sqlc.narg(pause_op_id)::uuid
+             AND pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
   FOR UPDATE
 ),
 upserted AS (
@@ -654,10 +681,15 @@ SET snapshot_id = (SELECT snap_id FROM upserted),
     -- make_interval(NULL) propagates NULL, so an unset auto_delete_seconds
     -- leaves the deadline NULL (never deleted).
     auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
-    updated_at = now()
+    updated_at = now(),
+    pause_op_lease_until = NULL
 FROM upserted
 WHERE sandbox.id = @id AND sandbox.team_id = @team_id AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
+  AND (sqlc.narg(pause_op_id)::uuid IS NULL
+       OR (sandbox.status = 'pausing'
+           AND sandbox.pause_op_id = sqlc.narg(pause_op_id)::uuid
+           AND sandbox.pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
 RETURNING upserted.snap_id::uuid AS snapshot_id;
 
 -- name: HasLegacySnapshotUnique :one
@@ -685,6 +717,14 @@ WITH target AS (
   SELECT id, team_id FROM sandbox
   WHERE id = @id AND team_id = @team_id AND destroyed_at IS NULL
     AND status IN ('pausing', 'resuming')
+    -- A finalize that names a pause operation commits only for that
+    -- operation under its current lease: a worker whose lease was
+    -- reclaimed, or a result from a pause the row has since moved past,
+    -- matches nothing. Callers without an operation keep the broad guard.
+    AND (sqlc.narg(pause_op_id)::uuid IS NULL
+         OR (status = 'pausing'
+             AND pause_op_id = sqlc.narg(pause_op_id)::uuid
+             AND pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
   FOR UPDATE
 ),
 inserted AS (
@@ -731,10 +771,15 @@ UPDATE sandbox
 SET snapshot_id = (SELECT snap_id FROM inserted),
     status = 'paused',
     auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
-    updated_at = now()
+    updated_at = now(),
+    pause_op_lease_until = NULL
 FROM inserted
 WHERE sandbox.id = @id AND sandbox.team_id = @team_id AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
+  AND (sqlc.narg(pause_op_id)::uuid IS NULL
+       OR (sandbox.status = 'pausing'
+           AND sandbox.pause_op_id = sqlc.narg(pause_op_id)::uuid
+           AND sandbox.pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
 RETURNING inserted.snap_id::uuid AS snapshot_id;
 
 -- name: UpdateSandboxNetworkConfig :exec
@@ -917,10 +962,18 @@ expired AS (
 ),
 paused AS (
   UPDATE sandbox
-  SET status = 'pausing', updated_at = now()
+  SET status = 'pausing', updated_at = now(),
+      -- Same pause identity and lease as BeginPause; minted here since the
+      -- rows are chosen inside the statement.
+      pause_op_id = gen_random_uuid(),
+      pause_op_started_at = now(),
+      pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
+      pause_op_lease_version = sandbox.pause_op_lease_version + 1,
+      pause_op_attention_at = NULL
   FROM expired
   WHERE sandbox.id = expired.id
-  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id, sandbox.network_config
+  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id, sandbox.network_config,
+            sandbox.pause_op_id, sandbox.pause_op_lease_version
 ),
 closed_intervals AS (
   -- Same atomicity story as BeginPause: bundle the active-interval close
@@ -941,7 +994,8 @@ closed_billing_compute AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config,
+       p.pause_op_id, p.pause_op_lease_version
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
 
@@ -961,10 +1015,16 @@ WITH candidates AS (
   FOR UPDATE OF s SKIP LOCKED
 ), paused AS (
   UPDATE sandbox
-  SET status = 'pausing', updated_at = now()
+  SET status = 'pausing', updated_at = now(),
+      pause_op_id = gen_random_uuid(),
+      pause_op_started_at = now(),
+      pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
+      pause_op_lease_version = sandbox.pause_op_lease_version + 1,
+      pause_op_attention_at = NULL
   FROM candidates
   WHERE sandbox.id = candidates.id
-  RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config
+  RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config,
+            sandbox.pause_op_id, sandbox.pause_op_lease_version
 ), closed_intervals AS (
   UPDATE sandbox_active_interval
   SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
@@ -978,7 +1038,8 @@ WITH candidates AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config,
+       p.pause_op_id, p.pause_op_lease_version
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
 
@@ -1070,3 +1131,51 @@ closed_storage AS (
 )
 SELECT d.id, d.team_id, d.name, d.host_id, d.base_path, d.template_id
 FROM destroyed d;
+
+-- name: ClaimPendingPauses :many
+-- Leases pauses whose caller has given up: rows still 'pausing' with an
+-- expired or absent lease, old enough that the caller's own attempt is over.
+-- SKIP LOCKED keeps replicas off each other's rows; the lease keeps them off
+-- a row between claims. Only sandbox.updated_at is left alone: the lease is
+-- the operation's own, and the paths keyed on updated_at must not see a
+-- renewal as fresh activity. Rows without an operation predate this
+-- contract and are not claimed.
+WITH due AS (
+  SELECT id FROM sandbox
+  WHERE status = 'pausing' AND destroyed_at IS NULL
+    AND pause_op_id IS NOT NULL
+    AND (pause_op_lease_until IS NULL OR pause_op_lease_until < now())
+    AND pause_op_started_at < now() - make_interval(secs => sqlc.arg(min_age_seconds)::int)
+  ORDER BY pause_op_started_at ASC
+  LIMIT sqlc.arg(max_rows)
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE sandbox
+SET pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
+    pause_op_lease_version = sandbox.pause_op_lease_version + 1
+FROM due
+WHERE sandbox.id = due.id
+RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.host_id,
+          sandbox.pause_op_id, sandbox.pause_op_lease_version,
+          sandbox.pause_op_started_at, sandbox.pause_op_attention_at;
+
+-- name: ReleasePauseLease :execrows
+-- A worker gives its lease back, undecided, and says when the next attempt
+-- may start. Fenced on the lease it holds: a reclaimed lease releases
+-- nothing.
+UPDATE sandbox
+SET pause_op_lease_until = now() + make_interval(secs => sqlc.arg(retry_after_seconds)::int)
+WHERE id = sqlc.arg(id) AND destroyed_at IS NULL AND status = 'pausing'
+  AND pause_op_id = sqlc.arg(pause_op_id)
+  AND pause_op_lease_version = sqlc.arg(pause_op_lease_version);
+
+-- name: MarkPauseAttention :execrows
+-- Flags a pause pending past its age threshold for an operator, once. The
+-- operation itself is left exactly as it is: age is not evidence of the VM's
+-- state.
+UPDATE sandbox
+SET pause_op_attention_at = now()
+WHERE id = sqlc.arg(id) AND destroyed_at IS NULL AND status = 'pausing'
+  AND pause_op_id = sqlc.arg(pause_op_id)
+  AND pause_op_lease_version = sqlc.arg(pause_op_lease_version)
+  AND pause_op_attention_at IS NULL;

@@ -289,9 +289,14 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[23].(*pgtype.Timestamptz) = s.AutoDeleteAt
 		*dest[24].(*pgtype.Timestamptz) = s.FailedAt
 		*dest[25].(**bool) = s.HadSecretBindings
-		if len(dest) == 27 {
+		*dest[26].(*pgtype.UUID) = s.PauseOpID
+		*dest[27].(*pgtype.Timestamptz) = s.PauseOpStartedAt
+		*dest[28].(*pgtype.Timestamptz) = s.PauseOpLeaseUntil
+		*dest[29].(*int64) = s.PauseOpLeaseVersion
+		*dest[30].(*pgtype.Timestamptz) = s.PauseOpAttentionAt
+		if len(dest) == 32 {
 			// GetSandboxWithPreviewPolicy: trailing COALESCE'd effective access.
-			*dest[26].(*string) = "legacy_public"
+			*dest[31].(*string) = "legacy_public"
 		}
 		return nil
 	}}
@@ -1007,7 +1012,7 @@ func snapshotRow(s db.Snapshot) *mockRow {
 // missing snapshot row.
 func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, ports ...publishedPortResponse) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
-		if err := sandboxRow(sb).scanFn(dest[:26]...); err != nil {
+		if err := sandboxRow(sb).scanFn(dest[:31]...); err != nil {
 			return err
 		}
 		var snapPath, snapMemPath *string
@@ -1015,14 +1020,14 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 			p := snap.Path
 			snapPath, snapMemPath = &p, snap.MemPath
 		}
-		*dest[26].(**string) = snapPath
-		*dest[27].(**string) = snapMemPath
+		*dest[31].(**string) = snapPath
+		*dest[32].(**string) = snapMemPath
 		if access == "" {
 			access = preview.AccessLegacyPublic
 		}
-		*dest[28].(*string) = access
-		*dest[29].(*string) = access
-		*dest[30].(*int64) = revision
+		*dest[33].(*string) = access
+		*dest[34].(*string) = access
+		*dest[35].(*int64) = revision
 		numbers, accesses, versions := []int32{}, []string{}, []int64{}
 		for _, port := range ports {
 			version := port.TokenVersion
@@ -1033,10 +1038,10 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 			accesses = append(accesses, port.Access)
 			versions = append(versions, version)
 		}
-		*dest[31].(*[]int32) = numbers
-		*dest[32].(*[]string) = accesses
-		*dest[33].(*[]int64) = versions
-		*dest[34].(**string) = nil
+		*dest[36].(*[]int32) = numbers
+		*dest[37].(*[]string) = accesses
+		*dest[38].(*[]int64) = versions
+		*dest[39].(**string) = nil
 		return nil
 	}}
 }

@@ -111,8 +111,9 @@ func (h *Handlers) reconcileActivatedSandbox(ctx context.Context, teamID uuid.UU
 func (h *Handlers) pauseBillingIneligibleTeam(ctx context.Context, teamID uuid.UUID) {
 	for batch := 0; ; batch++ {
 		rows, err := h.DB.ClaimBillingIneligibleSandboxes(ctx, db.ClaimBillingIneligibleSandboxesParams{
-			TeamID: teamID,
-			Limit:  billingEligibilityPauseBatchSize,
+			TeamID:       teamID,
+			Limit:        billingEligibilityPauseBatchSize,
+			LeaseSeconds: pauseLeaseSeconds,
 		})
 		if err != nil {
 			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: claim ineligible sandboxes failed")

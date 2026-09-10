@@ -2942,6 +2942,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // Sandbox Pause
 // ---------------------------------------------------------------------------
 
+// pauseLeaseSeconds is how long the caller that began a pause owns it before
+// a reconciler may take over: the foreground attempts plus a margin for their
+// bookkeeping.
+const pauseLeaseSeconds int32 = 90
+
 // pauseWithRetry pauses a VM, retrying once on a non-NotFound failure. A
 // timed-out pause may have actually completed on the host, so reverting the
 // row to active would drift it against a paused VM; PauseVM is idempotent, so
@@ -2988,9 +2993,14 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// path. An empty result means the sandbox either doesn't exist, isn't
 	// ours, or isn't currently active — we do a cheap existence check to
 	// return the right error code (404 vs 409).
+	// The pause's identity is minted before it is claimed, so the same id
+	// names it in the row, in every host call, and as its backup token.
+	pauseOp := uuid.New()
 	sandbox, err := h.DB.BeginPause(c.Request.Context(), db.BeginPauseParams{
-		ID:     sandboxID,
-		TeamID: teamID,
+		ID:           sandboxID,
+		TeamID:       teamID,
+		PauseOpID:    pgtype.UUID{Bytes: pauseOp, Valid: true},
+		LeaseSeconds: pauseLeaseSeconds,
 	})
 	if err == nil {
 		pauseHostID = sandbox.HostID // label error outcomes past the claim too
@@ -3039,11 +3049,10 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	// Call VMD to pause and snapshot the VM.
-	// Minted per pause: rides the pause RPC into the host's backup
-	// pipeline and returns in the upload report, naming this exact pause
-	// for coverage linkage.
-	pauseToken := uuid.NewString()
+	// Call VMD to pause and snapshot the VM. The pause's identity rides the
+	// RPC into the host's backup pipeline and returns in the upload report,
+	// naming this exact pause for coverage linkage.
+	pauseToken := pauseOp.String()
 	snapshotPath, memPath, manifest, ackedPauseToken, err := pauseWithRetry(c.Request.Context(), vmd, sandboxID.String(), pauseToken)
 	if err != nil {
 		// VMD says the VM doesn't exist — it crashed or was removed out-of-band.
