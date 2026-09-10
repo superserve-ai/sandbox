@@ -3,12 +3,18 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"io"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/superserve-ai/sandbox/proto/peerpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
-	"io"
-	"sync"
+	"google.golang.org/grpc/stats"
 )
 
 // PeerStream is the opaque bidirectional stream exposed to forwarding callers.
@@ -26,48 +32,103 @@ type PeerClient interface {
 // PeerDialer establishes one authenticated persistent client connection.
 type PeerDialer func(context.Context, string, string) (PeerClient, io.Closer, error)
 
+const peerDialTimeout = 5 * time.Second
+
+var errPeerUnavailable = errors.New("peer connection unavailable")
+
 // GRPCPeerDialer returns a dialer backed by the generated peer-proxy client.
 // Credentials are loaded for each new connection and peer identity is checked
 // by the TLS config before the client is published to the pool.
 func GRPCPeerDialer(tlsConfig func() (*tls.Config, error)) PeerDialer {
 	return func(ctx context.Context, _ string, addr string) (PeerClient, io.Closer, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		cfg, err := tlsConfig()
 		if err != nil {
 			return nil, nil, err
 		}
-		conn, err := grpc.DialContext(ctx, addr, grpc.WithTransportCredentials(credentials.NewTLS(cfg)), grpc.WithBlock())
-		if err != nil {
-			return nil, nil, err
+		return dialGRPCPeer(ctx, addr, cfg, peerDialTimeout)
+	}
+}
+
+func dialGRPCPeer(ctx context.Context, addr string, cfg *tls.Config, timeout time.Duration) (PeerClient, io.Closer, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	c := &generatedPeerClient{done: make(chan struct{})}
+	var attempted atomic.Bool
+	conn, err := grpc.NewClient("passthrough:///"+addr,
+		grpc.WithTransportCredentials(credentials.NewTLS(cfg)),
+		grpc.WithIdleTimeout(0), grpc.WithDisableRetry(), grpc.WithStatsHandler(c),
+		grpc.WithContextDialer(func(dialCtx context.Context, target string) (net.Conn, error) {
+			// Reconnects must return to the pool for backoff and fresh credentials.
+			if !attempted.CompareAndSwap(false, true) {
+				c.fail()
+				return nil, errPeerUnavailable
+			}
+			return (&net.Dialer{}).DialContext(dialCtx, "tcp", target)
+		}),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	c.conn = conn
+	c.client = peerpb.NewPeerProxyClient(conn)
+	conn.Connect()
+	for {
+		if err := attemptCtx.Err(); err != nil {
+			_ = conn.Close()
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			// The attempt deadline is a peer failure, not the caller's cancellation.
+			return nil, nil, errPeerUnavailable
 		}
-		c := &generatedPeerClient{client: peerpb.NewPeerProxyClient(conn), conn: conn, done: make(chan struct{})}
-		go c.watchTransport()
-		return c, conn, nil
+		state := conn.GetState()
+		if state == connectivity.Ready {
+			return c, conn, nil
+		}
+		if state == connectivity.TransientFailure || state == connectivity.Shutdown {
+			_ = conn.Close()
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			return nil, nil, errPeerUnavailable
+		}
+		conn.WaitForStateChange(attemptCtx, state)
 	}
 }
 
 type generatedPeerClient struct {
-	client peerpb.PeerProxyClient
-	conn   *grpc.ClientConn
-	done   chan struct{}
+	client   peerpb.PeerProxyClient
+	conn     *grpc.ClientConn
+	done     chan struct{}
+	failOnce sync.Once
 }
 
 func (c *generatedPeerClient) Done() <-chan struct{} { return c.done }
-
-func (c *generatedPeerClient) watchTransport() {
-	for {
-		state := c.conn.GetState()
-		if state == connectivity.TransientFailure || state == connectivity.Shutdown {
-			close(c.done)
-			return
-		}
-		if !c.conn.WaitForStateChange(context.Background(), state) {
-			close(c.done)
-			return
-		}
+func (c *generatedPeerClient) fail()                 { c.failOnce.Do(func() { close(c.done) }) }
+func (*generatedPeerClient) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context {
+	return ctx
+}
+func (*generatedPeerClient) HandleRPC(context.Context, stats.RPCStats) {}
+func (*generatedPeerClient) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+	return ctx
+}
+func (c *generatedPeerClient) HandleConn(_ context.Context, event stats.ConnStats) {
+	// Connectivity can become IDLE on disconnect; ConnEnd records the actual
+	// transport loss without interpreting application-level RPC statuses.
+	if _, ok := event.(*stats.ConnEnd); ok {
+		c.fail()
 	}
 }
 
 func (c *generatedPeerClient) OpenPeerStream(ctx context.Context) (PeerStream, error) {
+	select {
+	case <-c.done:
+		return nil, errPeerUnavailable
+	default:
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	s, err := c.client.Forward(ctx)
 	if err != nil {
