@@ -743,6 +743,9 @@ func TestPeerPoolReclaimsStalePendingOpen(t *testing.T) {
 	go func() {
 		s, err := p.OpenStream(context.Background(), "host", "old")
 		if s != nil {
+			if s.(*countedPeerStream).conn.closer == oldCloser {
+				err = errors.New("pending open published the obsolete endpoint")
+			}
 			_ = s.Close()
 		}
 		done <- err
@@ -945,5 +948,124 @@ func TestPeerPoolForcedDrainCountsOnlyPublishedStreams(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func waitPeerWaiter(t *testing.T, h *hostPool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		waiting := h.changed != nil
+		h.mu.Unlock()
+		if waiting {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("caller did not subscribe to host changes")
+}
+
+func TestPeerPoolWakesWaiters(t *testing.T) {
+	for _, state := range []string{"backoff", "saturated"} {
+		for _, operation := range []string{"close", "replace", "cancel", "release"} {
+			if state == "backoff" && operation == "release" {
+				continue
+			}
+			t.Run(state+"/"+operation, func(t *testing.T) {
+				dial, dials, _ := testDialer()
+				p := NewPeerTransport(PeerPoolConfig{Dial: dial, MaxConnections: 1, StreamsPerConnection: 1, DrainTimeout: 10 * time.Millisecond}).(*peerPool)
+				defer p.Close()
+				first, err := p.OpenStream(context.Background(), "host", "old")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer first.Close()
+				h := p.hosts["host"]
+				if state == "backoff" {
+					h.markFailed(first.(*countedPeerStream).conn)
+					h.mu.Lock()
+					h.retryAt = time.Now().Add(time.Hour)
+					h.mu.Unlock()
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				done := make(chan error, 1)
+				go func() {
+					s, err := p.OpenStream(ctx, "host", "old")
+					if s != nil {
+						_ = s.Close()
+					}
+					done <- err
+				}()
+				waitPeerWaiter(t, h)
+				select {
+				case err := <-done:
+					t.Fatalf("waiter returned before state changed: %v", err)
+				default:
+				}
+				switch operation {
+				case "close":
+					_ = p.Close()
+				case "replace":
+					p.mu.Lock()
+					h.replaceLocked("new")
+					p.mu.Unlock()
+				case "cancel":
+					cancel()
+				case "release":
+					_ = first.Close()
+				}
+				select {
+				case err := <-done:
+					if (operation == "close" || operation == "cancel") != (err != nil) {
+						t.Fatalf("unexpected waiter result: %v", err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("state change did not wake caller")
+				}
+				if operation == "release" && dials.Load() != 1 {
+					t.Fatal("released capacity was not reused")
+				}
+			})
+		}
+	}
+}
+
+func TestPeerPoolAsyncFailureReleasesIdleStreamAccounting(t *testing.T) {
+	client := &failingTransportClient{done: make(chan struct{})}
+	metrics := &drainStreamTelemetry{drained: make(chan struct{}, 16)}
+	p := NewPeerTransport(PeerPoolConfig{Telemetry: metrics, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		return client, &countingCloser{}, nil
+	}})
+	defer p.Close()
+	var streams []PeerStream
+	for i := 0; i < 3; i++ {
+		s, err := p.OpenStream(context.Background(), "host", "addr")
+		if err != nil {
+			t.Fatal(err)
+		}
+		streams = append(streams, s)
+	}
+	client.fail()
+	deadline := time.Now().Add(time.Second)
+	for metrics.total.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := metrics.total.Load(); got != 0 {
+		t.Fatalf("failed idle streams still counted: %d", got)
+	}
+	c := streams[0].(*countedPeerStream).conn
+	c.mu.Lock()
+	active, published, registered := c.active, c.published, len(c.streams)
+	c.mu.Unlock()
+	if active != 0 || published != 0 || registered != 0 {
+		t.Fatalf("remaining accounting: active=%d published=%d registered=%d", active, published, registered)
+	}
+	for _, s := range streams {
+		_ = s.Close()
+	}
+	if metrics.total.Load() != 0 || metrics.negative.Load() {
+		t.Fatal("late closes double-decremented stream metrics")
 	}
 }
