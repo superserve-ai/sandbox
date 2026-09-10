@@ -14,7 +14,9 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-const billingEligibilityPauseBatchSize int32 = 50
+// One claim per dispatch wave: a claimed row that waits for a worker would
+// burn its pause lease in the queue.
+const billingEligibilityPauseBatchSize int32 = 10
 
 func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 	var after *uuid.UUID

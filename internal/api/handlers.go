@@ -328,16 +328,18 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 // two facts is unrepresentable. Runs detached from the caller's cancellation
 // (a client disconnect must not orphan the revert) while keeping trace
 // context.
-func (h *Handlers) revertPauseAsync(c *gin.Context, sandboxID, teamID uuid.UUID, l zerolog.Logger) {
+func (h *Handlers) revertPauseAsync(c *gin.Context, sandboxID, teamID uuid.UUID, lease pauseLease, l zerolog.Logger) {
 	revertCtx := context.WithoutCancel(c.Request.Context())
 	actorID := actorIDFromContext(c)
 	go func() {
 		ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
 		defer cancel()
 		n, err := h.DB.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
-			SandboxID: sandboxID,
-			TeamID:    teamID,
-			ActorID:   actorUUID(actorID),
+			SandboxID:           sandboxID,
+			TeamID:              teamID,
+			PauseOpID:           lease.id,
+			PauseOpLeaseVersion: &lease.version,
+			ActorID:             actorUUID(actorID),
 		})
 		if err != nil {
 			l.Error().Err(err).Msg("async pause revert failed")
@@ -617,34 +619,6 @@ func (h *Handlers) openSandboxInterval(reqCtx context.Context, sandboxID, teamID
 		ActorID:   actorUUID(actorID),
 	}); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("open sandbox_active_interval failed")
-	}
-}
-
-// openSandboxIntervalInheritActor opens an interval after a system-initiated
-// revert (e.g. reaper's pause-then-rollback) where the original actor was
-// lost. Looks up the most recently closed interval's actor and uses it as
-// the new open's actor_id; this keeps the sandbox contributing to WAU
-// across a brief outage instead of getting dropped by the view's "actor_id
-// IS NOT NULL" filter. Falls back to NULL if no prior closed interval
-// exists.
-//
-// Only the reaper revert paths use this. The user-facing handler paths
-// always have an explicit actor from the request context, so they call
-// openSandboxInterval directly.
-func (h *Handlers) openSandboxIntervalInheritActor(reqCtx context.Context, sandboxID, teamID uuid.UUID) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
-	defer cancel()
-	var actorID *uuid.UUID
-	if prior, err := h.DB.GetMostRecentClosedSandboxIntervalActor(ctx, sandboxID); err == nil && prior.Valid {
-		a := uuid.UUID(prior.Bytes)
-		actorID = &a
-	}
-	if err := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
-		SandboxID: sandboxID,
-		TeamID:    teamID,
-		ActorID:   actorUUID(actorID),
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("open sandbox_active_interval (inherit) failed")
 	}
 }
 
@@ -2946,22 +2920,24 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // the reconciler may take over: the foreground attempts plus a margin.
 const pauseLeaseSeconds int32 = 90
 
-// pauseWithRetry pauses a VM, retrying once on a non-NotFound failure. A
-// timed-out pause may have actually completed on the host, so reverting the
-// row to active would drift it against a paused VM; PauseVM is idempotent, so
-// the retry returns the recorded snapshot and the row converges to paused.
-// NotFound is terminal — the VM is genuinely gone.
-func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id, pauseToken string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
+// pauseWithRetry pauses a VM, retrying once on a non-NotFound failure: a
+// timed-out pause may have completed on the host, and PauseVM is idempotent,
+// so the retry returns the recorded snapshot. NotFound is terminal. The retry
+// re-resolves the host, whose address may have changed since the first try.
+func (h *Handlers) pauseWithRetry(reqCtx context.Context, vmd VMDClient, hostID, id, pauseToken string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
 	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
 	snapshotPath, memPath, manifest, ackedToken, err = vmd.PauseInstance(ctx, id, "", pauseToken)
 	cancel()
 	if err == nil || isVMDNotFound(err) {
 		return snapshotPath, memPath, manifest, ackedToken, err
 	}
-	// Detach from the request ctx: the client's deadline may already have
-	// fired, but the reconciliation to a consistent state must still run.
+	// Detached from the request: the client's deadline may already have
+	// fired, but the row must still converge.
 	rctx, rcancel := context.WithTimeout(context.WithoutCancel(reqCtx), vmdTimeout)
 	defer rcancel()
+	if fresh, rerr := h.vmdForHost(rctx, hostID); rerr == nil {
+		vmd = fresh
+	}
 	return vmd.PauseInstance(rctx, id, "", pauseToken)
 }
 
@@ -3040,7 +3016,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("resolve VMD for pause failed")
-		h.revertPauseAsync(c, sandboxID, teamID, l)
+		h.revertPauseAsync(c, sandboxID, teamID, pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}, l)
 		respondError(c, ErrInternal)
 		return
 	}
@@ -3050,7 +3026,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	actorID := actorIDFromContext(c)
 
 	if !prefersAsync(c) {
-		respondPause(c, h.dispatchPause(c.Request.Context(), vmd, sandbox, actorID, l))
+		respondPause(c, h.dispatchPause(c.Request.Context(), vmd, sandbox, actorID, l), false)
 		return
 	}
 
@@ -3063,10 +3039,9 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	defer timer.Stop()
 	select {
 	case o := <-outcome:
-		respondPause(c, o)
+		respondPause(c, o, true)
 	case <-timer.C:
-		c.Header("Retry-After", "1")
-		c.JSON(http.StatusAccepted, gin.H{"status": db.SandboxStatusPausing})
+		acceptPausing(c)
 	}
 }
 

@@ -4,8 +4,11 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 // The reconciler runs against the shared test database, so a tick may also
@@ -137,5 +141,123 @@ func TestIntegration_PauseHandler_UndecidedHostLeavesPausing(t *testing.T) {
 	}
 	if n := vmd.pauseCalls.Load(); n != 2 {
 		t.Fatalf("host attempts = %d, want the foreground's two", n)
+	}
+}
+
+// The host's answer lands after the row has moved on to a newer run: a
+// NotFound then must not fail what is now an active sandbox.
+func TestIntegration_PauseHandler_LateNotFoundCannotFailANewerState(t *testing.T) {
+	teamID, apiKey := seedTeamAndKey(t)
+	id := seedActiveSandbox(t, teamID, "late-notfound")
+	vmd := &stubVMD{pauseFn: func(ctx context.Context, _, _ string) (string, string, []vmdclient.ManifestEntry, string, error) {
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET status = 'active', pause_op_lease_version = pause_op_lease_version + 1 WHERE id = $1`, id); err != nil {
+			t.Error(err)
+		}
+		return "", "", nil, "", status.Error(codes.NotFound, "no such vm")
+	}}
+	h := pauseHandlers(t, vmd)
+	r := api.SetupRouter(t.Context(), h, testPool)
+
+	if pw := do(r, "POST", "/sandboxes/"+id.String()+"/pause", apiKey, ""); pw.Code != http.StatusGone {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+
+	if got := readPauseOp(t, id); got.status != "active" {
+		t.Fatalf("late NotFound changed the newer state to %s", got.status)
+	}
+}
+
+// Same race through the generation finalize path (no legacy unique index):
+// a snapshot that arrives after the row started resuming must not turn it
+// back into paused.
+func TestIntegration_PauseHandler_GenerationFinalizeCannotUndoAResume(t *testing.T) {
+	ctx := context.Background()
+	if _, err := testPool.Exec(ctx, `DROP INDEX IF EXISTS snapshot_sandbox_unique`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx,
+			`CREATE UNIQUE INDEX IF NOT EXISTS snapshot_sandbox_unique ON snapshot (sandbox_id)`); err != nil {
+			t.Error(err)
+		}
+	})
+	teamID, apiKey := seedTeamAndKey(t)
+	id := seedActiveSandbox(t, teamID, "late-finalize")
+	vmd := &stubVMD{pauseFn: func(ctx context.Context, _, token string) (string, string, []vmdclient.ManifestEntry, string, error) {
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET status = 'resuming', pause_op_lease_version = pause_op_lease_version + 1 WHERE id = $1`, id); err != nil {
+			t.Error(err)
+		}
+		return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, token, nil
+	}}
+	h := pauseHandlers(t, vmd)
+	r := api.SetupRouter(t.Context(), h, testPool)
+
+	if pw := do(r, "POST", "/sandboxes/"+id.String()+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+
+	if got := readPauseOp(t, id); got.status != "resuming" {
+		t.Fatalf("late finalize changed resuming to %s", got.status)
+	}
+}
+
+// A tick claims only what its workers can start at once. Rows it has not
+// claimed can be finished and resumed elsewhere meanwhile; none of them may
+// then receive a pause RPC from this tick.
+func TestIntegration_PauseReconcile_ClaimsOnlyWhatItCanDispatch(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	for i := 0; i < 20; i++ {
+		abandonedPause(t, teamID, fmt.Sprintf("reconcile-wave-%d", i))
+	}
+	started := make(chan uuid.UUID, 4)
+	release := make(chan struct{})
+	var calls, stale atomic.Int32
+	vmd := &stubVMD{pauseFn: func(ctx context.Context, id, token string) (string, string, []vmdclient.ManifestEntry, string, error) {
+		if calls.Add(1) <= 4 {
+			started <- uuid.MustParse(id)
+			<-release
+		} else {
+			var st string
+			if err := testPool.QueryRow(ctx, `SELECT status::text FROM sandbox WHERE id = $1`, id).Scan(&st); err != nil {
+				t.Error(err)
+			}
+			if st == "active" {
+				stale.Add(1)
+			}
+		}
+		return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, token, nil
+	}}
+	h := pauseHandlers(t, vmd)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ReconcilePendingPausesOnce(ctx, zerolog.Nop())
+	}()
+
+	var running []uuid.UUID
+	for i := 0; i < 4; i++ {
+		select {
+		case id := <-started:
+			running = append(running, id)
+		case <-time.After(5 * time.Second):
+			close(release)
+			t.Fatal("workers did not start")
+		}
+	}
+	// Everything not in flight is finished elsewhere and resumed.
+	_, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', pause_op_id = NULL, pause_op_lease_until = NULL
+		WHERE team_id = $1 AND NOT (id = ANY($2::uuid[]))`, teamID, running)
+	close(release)
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := stale.Load(); n != 0 {
+		t.Fatalf("%d pause RPCs went to sandboxes that were already running again", n)
 	}
 }

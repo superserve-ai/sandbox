@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -25,6 +26,7 @@ import (
 // integration test.
 func TestRevertPauseAsyncRestoresStatusAndInterval(t *testing.T) {
 	sandboxID, teamID := uuid.New(), uuid.New()
+	lease := pauseLease{id: pgtype.UUID{Bytes: uuid.New(), Valid: true}, version: 3}
 	var mu sync.Mutex
 	var reverted bool
 	mock := &mockDBTX{
@@ -34,8 +36,8 @@ func TestRevertPauseAsyncRestoresStatusAndInterval(t *testing.T) {
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			if args[0] != sandboxID || args[1] != teamID {
-				t.Errorf("revert args = %v, %v; want %v, %v", args[0], args[1], sandboxID, teamID)
+			if args[0] != sandboxID || args[1] != teamID || args[2] != lease.id || *(args[3].(*int64)) != lease.version {
+				t.Errorf("revert args = %v; want the sandbox, team, and the lease it holds", args)
 			}
 			reverted = true
 			return &mockRow{scanFn: func(dest ...any) error {
@@ -50,7 +52,7 @@ func TestRevertPauseAsyncRestoresStatusAndInterval(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest("POST", "/sandboxes/x/pause", nil)
 
-	h.revertPauseAsync(c, sandboxID, teamID, zerolog.Nop())
+	h.revertPauseAsync(c, sandboxID, teamID, lease, zerolog.Nop())
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {

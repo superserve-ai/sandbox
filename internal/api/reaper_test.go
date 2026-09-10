@@ -3,7 +3,9 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -141,6 +143,19 @@ func newReaperHandlers(dbtx *reaperMockDBTX, vmd *stubVMD) *Handlers {
 	}
 }
 
+// rowsOnce serves rows to the first expired-sandbox claim and nothing to any
+// later one, as a real claim would once the rows are leased. Other queries
+// (the loops share the mock) get nothing.
+func rowsOnce(rows []db.ClaimExpiredSandboxesRow) func(context.Context, string, ...any) (pgx.Rows, error) {
+	var served int32
+	return func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+		if !strings.Contains(sql, "-- name: ClaimExpiredSandboxes ") || atomic.AddInt32(&served, 1) > 1 {
+			return newStubRows(nil), nil
+		}
+		return newStubRows(rows), nil
+	}
+}
+
 func expiredRow(name string) db.ClaimExpiredSandboxesRow {
 	return db.ClaimExpiredSandboxesRow{
 		ID:     uuid.New(),
@@ -181,9 +196,7 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
-				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
-			},
+			queryFn: rowsOnce([]db.ClaimExpiredSandboxesRow{row}),
 			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 				if strings.Contains(sql, "upserted AS") {
 					atomic.AddInt32(&finalizeCalls, 1)
@@ -218,9 +231,7 @@ func TestReaper_VMDFails_ReconcilerLeavesPausing(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
-				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
-			},
+			queryFn: rowsOnce([]db.ClaimExpiredSandboxesRow{row}),
 			execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 				switch {
 				case strings.Contains(sql, "-- name: ReleasePauseLease :execrows"):
@@ -259,9 +270,7 @@ func TestReaper_VMDNotFound_ReconcilerMarksFailed(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
-				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
-			},
+			queryFn: rowsOnce([]db.ClaimExpiredSandboxesRow{row}),
 			queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 				if strings.Contains(sql, "-- name: MarkSandboxFailed :one") {
 					atomic.AddInt32(&fails, 1)
@@ -324,27 +333,42 @@ func TestReaper_DBError(t *testing.T) {
 // TestReaper_BatchSizeRespected verifies that the batch limit is passed to
 // ClaimExpiredSandboxes (the SQL enforces LIMIT, but we confirm the value
 // reaches the query layer).
-func TestReaper_BatchSizeRespected(t *testing.T) {
-	var capturedLimit int32
+// Each claim asks only for what the workers can start at once, and the
+// batch size caps a tick: 7 rows with 3 workers is three claims of 3, 3, 1.
+func TestReaper_ClaimsOnlyWhatItCanDispatch(t *testing.T) {
+	var mu sync.Mutex
+	var limits []int32
+	var pauses int32
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
 			queryFn: func(_ context.Context, _ string, args ...any) (pgx.Rows, error) {
-				if len(args) > 0 {
-					if v, ok := args[0].(int32); ok {
-						atomic.StoreInt32(&capturedLimit, v)
-					}
+				limit := args[0].(int32)
+				mu.Lock()
+				limits = append(limits, limit)
+				mu.Unlock()
+				rows := make([]db.ClaimExpiredSandboxesRow, limit)
+				for i := range rows {
+					rows[i] = expiredRow("sbx")
 				}
-				return newStubRows(nil), nil
+				return newStubRows(rows), nil
 			},
 		},
-		&stubVMD{},
+		&stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+			atomic.AddInt32(&pauses, 1)
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		}},
 	)
 
-	h.reapOnce(context.Background(), 7, 1, zerolog.Nop())
+	h.reapOnce(context.Background(), 7, 3, zerolog.Nop())
 
-	if got := atomic.LoadInt32(&capturedLimit); got != 7 {
-		t.Fatalf("expected batch size 7 passed to query, got %d", got)
+	mu.Lock()
+	defer mu.Unlock()
+	if fmt.Sprint(limits) != "[3 3 1]" {
+		t.Fatalf("claim limits = %v, want [3 3 1]", limits)
+	}
+	if got := atomic.LoadInt32(&pauses); got != 7 {
+		t.Fatalf("pauses = %d, want the batch size 7", got)
 	}
 }
 
@@ -361,9 +385,7 @@ func TestReaper_ContextCancelledMidBatch(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
-				return newStubRows(rows), nil
-			},
+			queryFn: rowsOnce(rows),
 		},
 		&stubVMD{pauseFn: func(_ context.Context, _ string, _ string) (string, string, error) {
 			if atomic.AddInt32(&pauseCount, 1) == 2 {
@@ -390,9 +412,7 @@ func TestReaper_LoopRunsImmediately(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
-				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
-			},
+			queryFn: rowsOnce([]db.ClaimExpiredSandboxesRow{row}),
 		},
 		&stubVMD{pauseFn: func(_ context.Context, _ string, _ string) (string, string, error) {
 			atomic.AddInt32(&pauseCalled, 1)

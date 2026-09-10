@@ -30,6 +30,9 @@ const (
 	pauseReconcileBatch   int32 = 20
 	pauseReconcileWorkers       = 4
 	pauseAttentionAfter         = 30 * time.Minute
+	// Allowance for clock skew between this process and the database when
+	// judging how much of a lease is left.
+	pauseLeaseSkew = 5 * time.Second
 )
 
 // pauseLease identifies the pause operation a worker holds; every terminal
@@ -60,30 +63,44 @@ func (h *Handlers) StartPauseReconciler(ctx context.Context) {
 	}()
 }
 
-// ReconcilePendingPausesOnce claims one batch of abandoned pauses and drives
-// each toward a decided state. Exported so tests can run a tick directly.
+// ReconcilePendingPausesOnce claims abandoned pauses, at most a batch per tick,
+// and drives each toward a decided state. Each claim takes only what can be
+// dispatched at once: a claimed row that waited for a worker would burn its
+// lease in the queue. Exported so tests can run a tick directly.
 func (h *Handlers) ReconcilePendingPausesOnce(ctx context.Context, logger zerolog.Logger) {
-	qctx, qcancel := context.WithTimeout(ctx, 10*time.Second)
-	rows, err := h.DB.ClaimPendingPauses(qctx, db.ClaimPendingPausesParams{
-		LeaseSeconds:  pauseReconcileLease,
-		MinAgeSeconds: pauseReconcileMinAge,
-		MaxRows:       pauseReconcileBatch,
-	})
-	qcancel()
-	if err != nil {
-		logger.Error().Err(err).Msg("pause reconcile: claim failed")
-		return
+	for claimed := 0; claimed < int(pauseReconcileBatch) && ctx.Err() == nil; {
+		want := min(pauseReconcileWorkers, int(pauseReconcileBatch)-claimed)
+		claimedAt := time.Now()
+		qctx, qcancel := context.WithTimeout(ctx, 10*time.Second)
+		rows, err := h.DB.ClaimPendingPauses(qctx, db.ClaimPendingPausesParams{
+			LeaseSeconds:  pauseReconcileLease,
+			MinAgeSeconds: pauseReconcileMinAge,
+			MaxRows:       int32(want),
+		})
+		qcancel()
+		if err != nil {
+			logger.Error().Err(err).Msg("pause reconcile: claim failed")
+			return
+		}
+		if len(rows) == 0 {
+			return
+		}
+		leaseUntil := claimedAt.Add(time.Duration(pauseReconcileLease) * time.Second)
+		logger.Info().Int("count", len(rows)).Msg("pause reconcile: retrying abandoned pauses")
+		dispatchBounded(ctx, rows, pauseReconcileWorkers, func(row db.ClaimPendingPausesRow) {
+			h.reconcilePause(ctx, row, leaseUntil, logger)
+		})
+		claimed += len(rows)
+		if len(rows) < want {
+			return
+		}
 	}
-	if len(rows) == 0 {
-		return
-	}
-	logger.Info().Int("count", len(rows)).Msg("pause reconcile: retrying abandoned pauses")
-	dispatchBounded(ctx, rows, pauseReconcileWorkers, func(row db.ClaimPendingPausesRow) {
-		h.reconcilePause(ctx, row, logger)
-	})
 }
 
-func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPausesRow, logger zerolog.Logger) {
+// reconcilePause makes one attempt on a claimed row. leaseUntil is when the
+// claim stops being this worker's: nothing is sent to the host unless the
+// whole attempt, finalize included, fits before then.
+func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPausesRow, leaseUntil time.Time, logger zerolog.Logger) {
 	lease := pauseLease{id: row.PauseOpID, version: row.PauseOpLeaseVersion}
 	l := logger.With().
 		Str("sandbox_id", row.ID.String()).
@@ -92,6 +109,12 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauses
 		Int64("lease_version", row.PauseOpLeaseVersion).
 		Logger()
 	started := time.Now()
+
+	budget := min(pauseReconcileRPC, time.Until(leaseUntil)-asyncTimeout-pauseLeaseSkew)
+	if budget <= 0 {
+		l.Warn().Msg("pause reconcile: lease too short to dispatch, skipping")
+		return
+	}
 
 	if row.PauseOpStartedAt.Valid && !row.PauseOpAttentionAt.Valid && time.Since(row.PauseOpStartedAt.Time) > pauseAttentionAfter {
 		h.flagPauseAttention(ctx, row.ID, lease, l)
@@ -106,14 +129,14 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauses
 		return
 	}
 
-	rctx, rcancel := context.WithTimeout(ctx, pauseReconcileRPC)
+	rctx, rcancel := context.WithTimeout(ctx, budget)
 	snapshotPath, memPath, manifest, ackedToken, err := vmd.PauseInstance(rctx, row.ID.String(), "", uuid.UUID(row.PauseOpID.Bytes).String())
 	rcancel()
 	if err != nil {
 		RecordSandboxTransition(ctx, "reconcile_pause", telemetry.ResultError, row.HostID, time.Since(started))
 		if isVMDNotFound(err) {
 			l.Warn().Err(err).Msg("pause reconcile: VM gone from its host, marking failed")
-			h.failPause(ctx, row.ID, lease, l)
+			h.failPause(ctx, row.ID, row.HostID, lease, l)
 			return
 		}
 		l.Warn().Err(err).Msg("pause reconcile: undecided, retrying later")
@@ -172,7 +195,8 @@ func (h *Handlers) releasePauseLease(ctx context.Context, id uuid.UUID, lease pa
 
 // failPause records that the sandbox's host has no VM to pause. Only the
 // lease holder may write it, and only while the row is still 'pausing'.
-func (h *Handlers) failPause(ctx context.Context, id uuid.UUID, lease pauseLease, l zerolog.Logger) {
+func (h *Handlers) failPause(ctx context.Context, id uuid.UUID, hostID string, lease pauseLease, l zerolog.Logger) {
+	started := time.Now()
 	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), asyncTimeout)
 	defer cancel()
 	n, err := h.DB.MarkSandboxFailed(fctx, db.MarkSandboxFailedParams{
@@ -182,6 +206,7 @@ func (h *Handlers) failPause(ctx context.Context, id uuid.UUID, lease pauseLease
 		PauseOpLeaseVersion: &lease.version,
 	})
 	if err != nil {
+		RecordSandboxTransition(ctx, "fail", telemetry.ResultError, hostID, time.Since(started))
 		l.Error().Err(err).Msg("mark pause failed write failed; the lease expires on its own")
 		return
 	}
@@ -189,6 +214,7 @@ func (h *Handlers) failPause(ctx context.Context, id uuid.UUID, lease pauseLease
 		l.Warn().Msg("mark pause failed skipped: lease no longer held")
 		return
 	}
+	RecordSandboxTransition(ctx, "fail", telemetry.ResultSuccess, hostID, time.Since(started))
 	if err := h.DB.DeleteSandboxSecrets(fctx, id); err != nil {
 		l.Warn().Err(err).Msg("clear secret bindings after failed pause failed")
 	}

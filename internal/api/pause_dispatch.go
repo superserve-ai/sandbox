@@ -39,15 +39,25 @@ const (
 	pauseUndecided                     // no answer; row left 'pausing' for the reconciler
 )
 
-func respondPause(c *gin.Context, o pauseOutcome) {
-	switch o {
-	case pauseDone:
+// respondPause answers a decided dispatch. An undecided one is still
+// 'pausing' and being reconciled: a client that asked for an asynchronous
+// answer is told so; anyone else keeps today's error.
+func respondPause(c *gin.Context, o pauseOutcome, async bool) {
+	switch {
+	case o == pauseDone:
 		c.Status(http.StatusNoContent)
-	case pauseGone:
+	case o == pauseGone:
 		respondError(c, ErrSandboxGone)
+	case async:
+		acceptPausing(c)
 	default:
 		respondError(c, ErrInternal)
 	}
+}
+
+func acceptPausing(c *gin.Context) {
+	c.Header("Retry-After", "1")
+	c.JSON(http.StatusAccepted, gin.H{"status": db.SandboxStatusPausing})
 }
 
 // dispatchPause runs the host RPC for a claimed pause and records its answer.
@@ -57,22 +67,22 @@ func (h *Handlers) dispatchPause(ctx context.Context, vmd VMDClient, sandbox db.
 	// The pause's identity rides the RPC into the host's backup pipeline and
 	// returns in the upload report, naming this exact pause.
 	pauseToken := uuid.UUID(sandbox.PauseOpID.Bytes).String()
-	snapshotPath, memPath, manifest, ackedPauseToken, err := pauseWithRetry(ctx, vmd, sandboxID.String(), pauseToken)
+	lease := pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}
+	snapshotPath, memPath, manifest, ackedPauseToken, err := h.pauseWithRetry(ctx, vmd, sandbox.HostID, sandboxID.String(), pauseToken)
 	if err != nil {
+		bg := context.WithoutCancel(ctx)
 		// The resolved host has no such VM: it crashed or was removed
 		// out-of-band, so 'active' was already a lie.
 		if isVMDNotFound(err) {
 			l.Warn().Err(err).Msg("VMD PauseInstance: VM unavailable, marking sandbox failed")
-			h.markSandboxFailedAsync(ctx, sandboxID, teamID, sandbox.HostID, false)
+			h.asyncBookkeeping("fail-pause", func() { h.failPause(bg, sandboxID, sandbox.HostID, lease, l) })
 			return pauseGone
 		}
 		// Timeout, unavailable, or any other error after dispatch says
 		// nothing about whether the VM still runs; the row stays 'pausing'
 		// and the reconciler asks the host again (see pause_reconcile.go).
 		l.Warn().Err(err).Msg("VMD PauseInstance undecided — left pausing for reconciliation")
-		lease := pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}
-		releaseCtx := context.WithoutCancel(ctx)
-		h.asyncBookkeeping("release-pause-lease", func() { h.releasePauseLease(releaseCtx, sandboxID, lease, 0, l) })
+		h.asyncBookkeeping("release-pause-lease", func() { h.releasePauseLease(bg, sandboxID, lease, 0, l) })
 		return pauseUndecided
 	}
 

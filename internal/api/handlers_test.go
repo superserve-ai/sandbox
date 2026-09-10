@@ -4247,7 +4247,7 @@ func TestPauseWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
 		}
 		return "/snap/vmstate.snap", "/snap/mem.snap", nil
 	}}
-	snap, mem, _, _, err := pauseWithRetry(context.Background(), vmd, "vm-1", "tok-test")
+	snap, mem, _, _, err := (&Handlers{VMD: vmd}).pauseWithRetry(context.Background(), vmd, "host-1", "vm-1", "tok-test")
 	if err != nil {
 		t.Fatalf("retry should recover a transient failure, got %v", err)
 	}
@@ -4266,7 +4266,7 @@ func TestPauseWithRetry_NotFoundIsTerminal(t *testing.T) {
 		calls++
 		return "", "", notFound
 	}}
-	_, _, _, _, err := pauseWithRetry(context.Background(), vmd, "vm-1", "tok-test")
+	_, _, _, _, err := (&Handlers{VMD: vmd}).pauseWithRetry(context.Background(), vmd, "host-1", "vm-1", "tok-test")
 	if !isVMDNotFound(err) {
 		t.Fatalf("expected NotFound to surface, got %v", err)
 	}
